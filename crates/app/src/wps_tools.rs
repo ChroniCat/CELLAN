@@ -141,7 +141,7 @@ impl SheetApp {
         };
         let sh = self.wb.sheet_mut(self.sheet_idx);
         if sh.filter.is_none() {
-            let reg = sheetcore::sort_filter::current_region(sh, r, c);
+            let reg = Self::current_region_fast(sh, r, c);
             if reg.2 <= reg.0 {
                 self.status = "数据区域太小，无法按值筛选".into();
                 return;
@@ -163,28 +163,118 @@ impl SheetApp {
         self.status = format!("已按所选值 \"{disp}\" 筛选");
     }
 
-    /// 选中行自动调整行高（批量）
+    /// 稀疏页感知的「当前区域」探测：与 `sheetcore::sort_filter::current_region` 语义完全一致，
+    /// 但优先探测锚点列/行并在大表上通过单遍稀疏 `iter_rect` 构建非空行列位图，消除百万行千万次 `sheet.get` 阻塞。
+    pub(crate) fn current_region_fast(
+        sheet: &sheetcore::Sheet,
+        r: u32,
+        c: u32,
+    ) -> (u32, u32, u32, u32) {
+        let (rr2, cc2) = sheet
+            .used_bounds()
+            .map(|(_, _, r2, c2)| (r2 + 1, c2 + 1))
+            .unwrap_or((r + 1, c + 1));
+        let rows = rr2.max(r + 1);
+        let cols = cc2.max(c + 1);
+        if u64::from(rows) * u64::from(cols) <= 16_384 {
+            return sheetcore::sort_filter::current_region(sheet, r, c);
+        }
+        // 懒加载全表非空行/列位图（仅当锚点列/行自身出现空洞需要跨列/跨行确认整行/整列全空时构建一次）
+        let bitmaps: std::cell::OnceCell<(Vec<u64>, Vec<u64>)> = std::cell::OnceCell::new();
+        let get_bitmaps = || {
+            bitmaps.get_or_init(|| {
+                let mut rb = vec![0u64; (rows as usize).div_ceil(64)];
+                let mut cb = vec![0u64; (cols as usize).div_ceil(64)];
+                for (key, _) in sheet.iter_rect((0, 0, rows - 1, cols - 1)) {
+                    rb[(key.row / 64) as usize] |= 1u64 << (key.row % 64);
+                    cb[(key.col / 64) as usize] |= 1u64 << (key.col % 64);
+                }
+                (rb, cb)
+            })
+        };
+        let row_non_empty = |rr: u32| -> bool {
+            if sheet.get(rr, c).is_some()
+                || (c != 0 && sheet.get(rr, 0).is_some())
+                || (c > 0 && sheet.get(rr, c - 1).is_some())
+                || (c + 1 < cols && sheet.get(rr, c + 1).is_some())
+            {
+                return true;
+            }
+            let (rb, _) = get_bitmaps();
+            (rb[(rr / 64) as usize] & (1u64 << (rr % 64))) != 0
+        };
+        let mut r1 = r;
+        while r1 > 0 && row_non_empty(r1 - 1) {
+            r1 -= 1;
+        }
+        let mut r2 = r;
+        while r2 + 1 < rows && row_non_empty(r2 + 1) {
+            r2 += 1;
+        }
+        let col_non_empty = |cc: u32| -> bool {
+            if sheet.get(r, cc).is_some() || sheet.get(r1, cc).is_some() {
+                return true;
+            }
+            let (_, cb) = get_bitmaps();
+            (cb[(cc / 64) as usize] & (1u64 << (cc % 64))) != 0
+        };
+        let mut c1 = c;
+        while c1 > 0 && col_non_empty(c1 - 1) {
+            c1 -= 1;
+        }
+        let mut c2 = c;
+        while c2 + 1 < cols && col_non_empty(c2 + 1) {
+            c2 += 1;
+        }
+        (r1, c1, r2, c2)
+    }
+
+    /// 选中行自动调整行高（批量：单遍稀疏区域扫描 + 字号单行缓存 + 单次 `rows.set_many` 重建）
     pub(crate) fn autofit_sel_rows(&mut self, ctx: &egui::Context) {
         let (r1, _, r2, _) = self.sel_rect();
         if r2 - r1 > 2000 {
             self.status = "选中行数过多，请缩小范围后再自适应行高".into();
             return;
         }
-        for r in r1..=r2 {
-            self.autofit_row(ctx, r);
+        if r1 == r2 {
+            self.autofit_row(ctx, r1);
+            return;
         }
+        let updates = self.compute_autofit_rows(ctx, r1, r2);
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.rows.set_many(updates);
+            sh.layout_dirty = true;
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("第 {}–{} 行行高已自适应", r1 + 1, r2 + 1);
     }
 
-    /// 选中列自动调整列宽（批量）
+    /// 选中列自动调整列宽（批量：共享二分 `MergeIndex` + O(1) 宽度上界粗筛 + 单次 `cols.set_many` 重建）
     pub(crate) fn autofit_sel_cols(&mut self, ctx: &egui::Context) {
         let (_, c1, _, c2) = self.sel_rect();
         if c2 - c1 > 500 {
             self.status = "选中列数过多，请缩小范围后再自适应列宽".into();
             return;
         }
-        for c in c1..=c2 {
-            self.autofit_col(ctx, c);
+        if c1 == c2 {
+            self.autofit_col(ctx, c1);
+            return;
         }
+        let updates = self.compute_autofit_cols(c1, c2);
+        {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.cols.set_many(updates);
+            sh.layout_dirty = true;
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!(
+            "{}–{} 列宽已自适应",
+            super::cell_name(0, c1).trim_end_matches('1'),
+            super::cell_name(0, c2).trim_end_matches('1')
+        );
     }
 
     /// WPS：高亮重复项（条件格式）

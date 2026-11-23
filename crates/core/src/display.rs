@@ -39,11 +39,41 @@ impl CellView {
 
 /// 合并区锚点：返回 (r1,c1,r2,c2)；不在合并区返回 None
 pub fn merge_span(sheet: &Sheet, r: u32, c: u32) -> Option<(u32, u32, u32, u32)> {
-    sheet
-        .merges
-        .iter()
-        .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
-        .copied()
+    let merges = &sheet.merges;
+    if merges.len() <= 8 {
+        return merges
+            .iter()
+            .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
+            .copied();
+    }
+    type Key = (
+        u64,
+        u64,
+        usize,
+        usize,
+        Option<(u32, u32, u32, u32)>,
+        Option<(u32, u32, u32, u32)>,
+    );
+    thread_local! {
+        static MERGE_TLS: std::cell::RefCell<(Option<Key>, crate::merges::MergeIndex)> =
+            std::cell::RefCell::new((None, crate::merges::MergeIndex::default()));
+    }
+    let key: Key = (
+        sheet.identity,
+        sheet.coordinate_revision(),
+        merges.as_ptr() as usize,
+        merges.len(),
+        merges.first().copied(),
+        merges.last().copied(),
+    );
+    MERGE_TLS.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        if guard.0 != Some(key) {
+            guard.1.refresh(merges);
+            guard.0 = Some(key);
+        }
+        guard.1.at(r, c)
+    })
 }
 
 /// 该格是否是合并区里被盖住的那部分（打印时跳过，只画锚点）
@@ -594,4 +624,74 @@ pub fn char_width(c: char, size: f32) -> f32 {
 /// 样式表里取样式（给需要直接读样式的调用方）
 pub fn style_of<'a>(styles: &'a StyleTable, sheet: &Sheet, r: u32, c: u32) -> &'a CellStyle {
     styles.get(sheet.style_of(r, c))
+}
+
+/// AutoFit 列宽的 O(1) 严格字符数上界（仅凭最大 UTF-8 字节长度与样式参数估算，零字符串分配与遍历）。
+/// 满足对任意长度 `<= max_utf8_bytes` 的字符串 `s`，返回值恒 `>= excel_autofit_chars_wrapped_at_size_font`。
+#[inline]
+pub fn autofit_chars_upper_bound(max_utf8_bytes: usize, bold: bool, indent: u8, size: f32) -> f32 {
+    let u = max_utf8_bytes as f32;
+    let sz = if size > 0.0 { size } else { 11.0 };
+    let scale = (sz / 11.0).max(1.0);
+    let base = if sz <= 12.01 {
+        2.2 + 1.15 * u
+    } else {
+        3.8 + 2.45 * u
+    };
+    let bold_ub = if bold {
+        (0.38 * scale).max(2.05 + 0.88 * (u - 12.0).max(0.0))
+    } else {
+        0.0
+    };
+    let indent_ub = indent as f32
+        * (3.05 * scale).max(3.55 + 0.15 * (u - 10.0).max(0.0));
+    base + bold_ub + indent_ub
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autofit_upper_bound_never_underestimates_any_font_or_size() {
+        let samples = [
+            "1",
+            "123456789012345",
+            "中",
+            "中文文字测试超长标题行",
+            "Order-2026-华东大区汇总\n第二行更长的备注说明ABC12345",
+        ];
+        for s in samples {
+            for size in [8.0, 9.0, 11.0, 12.0, 14.0, 18.0, 24.0, 36.0] {
+                for bold in [false, true] {
+                    for indent in [0u8, 1, 2, 4] {
+                        let ub = autofit_chars_upper_bound(s.len(), bold, indent, size);
+                        for font in ["等线", "宋体", "Arial"] {
+                            for wrap in [false, true] {
+                                let exact = excel_autofit_chars_wrapped_at_size_font(
+                                    s, bold, indent, wrap, size, font,
+                                );
+                                assert!(
+                                    ub + 1e-4 >= exact,
+                                    "upper bound {ub} < exact {exact} for {s:?} sz={size} bold={bold} indent={indent} font={font}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merge_span_uses_indexed_lookup_past_threshold() {
+        let mut sh = Sheet::new("M");
+        for i in 0..32u32 {
+            sh.merges.push((i * 3, 1, i * 3 + 1, 4));
+        }
+        assert_eq!(merge_span(&sh, 31, 2), Some((30, 1, 31, 4)));
+        assert_eq!(merge_span(&sh, 32, 2), None);
+        assert!(merge_covered(&sh, 31, 2));
+        assert!(!merge_covered(&sh, 30, 1));
+    }
 }

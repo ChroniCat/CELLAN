@@ -166,8 +166,57 @@ fn pending() -> &'static Mutex<HashSet<String>> {
 }
 
 static ACTIVE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READY_TO_INSTALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRIED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static ASYNC_LOADER: OnceLock<std::sync::mpsc::Sender<(Vec<String>, egui::Context)>> = OnceLock::new();
 
 pub fn generation() -> u64 { ACTIVE_GENERATION.load(std::sync::atomic::Ordering::Acquire) }
+
+/// 后台异步加载工作簿引用的系统字体（避免在 UI 主线程同步读盘 20MB+ `.ttc`/`.ttf`）。
+/// 已尝试过的字体（含不存在的系统字体）记入 `TRIED`，避免每 30 帧重复触发文件 I/O。
+pub fn request_async(names: &[String], ctx: &egui::Context) {
+    let mut to_load = Vec::new();
+    {
+        let Ok(mut tried) = TRIED.get_or_init(|| Mutex::new(HashSet::new())).lock() else {
+            return;
+        };
+        let already = loaded().lock().ok();
+        for n in names {
+            let key = norm(n);
+            if key.is_empty() {
+                continue;
+            }
+            if already.as_ref().is_some_and(|m| m.contains_key(&key)) {
+                tried.insert(key);
+                continue;
+            }
+            if tried.insert(key) {
+                to_load.push(n.clone());
+            }
+        }
+    }
+    if to_load.is_empty() {
+        return;
+    }
+    let tx = ASYNC_LOADER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<String>, egui::Context)>();
+        std::thread::spawn(move || {
+            while let Ok((batch, wake)) = rx.recv() {
+                if ensure(&batch) {
+                    READY_TO_INSTALL.store(true, std::sync::atomic::Ordering::Release);
+                    wake.request_repaint();
+                }
+            }
+        });
+        tx
+    });
+    let _ = tx.send((to_load, ctx.clone()));
+}
+
+/// 检查后台线程是否已完成新字体字节加载并等待挂载到 `egui::Context`。
+pub fn take_ready() -> bool {
+    READY_TO_INSTALL.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
 
 pub fn begin_frame() {
     let active = ACTIVE.get_or_init(|| Mutex::new(HashSet::new()));
@@ -183,30 +232,54 @@ pub fn ensure(names: &[String]) -> bool {
     if std::env::var("SC_FONT_LOG").is_ok() {
         eprintln!("[fonts] ensure enter {} names", names.len());
     }
-    let mut map = match loaded().lock() {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    let mut changed = false;
+    // 先在锁外完成磁盘读取与 TTC face 解析，缩短全局字体表持锁时间
+    let mut newly_loaded: Vec<(String, Loaded, Option<Loaded>)> = Vec::new();
     for n in names {
         let key = norm(n);
-        if key.is_empty() || map.contains_key(&key) {
+        if key.is_empty() {
             continue;
+        }
+        let already = loaded()
+            .lock()
+            .ok()
+            .is_some_and(|m| m.contains_key(&key));
+        if already {
+            if let Ok(mut t) = TRIED.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+                t.insert(key);
+            }
+            continue;
+        }
+        if let Ok(mut t) = TRIED.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+            t.insert(key.clone());
         }
         if let Some((data, index)) = load(n) {
             if std::env::var("SC_FONT_LOG").is_ok() {
                 eprintln!("[fonts] insert {} face {}", n, index);
             }
-            map.insert(key, Loaded { data, index });
+            let bold = load_bold(n).map(|(bd, bi)| Loaded { data: bd, index: bi });
+            newly_loaded.push((key, Loaded { data, index }, bold));
+        }
+    }
+    if newly_loaded.is_empty() {
+        return false;
+    }
+    let mut map = match loaded().lock() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let mut changed = false;
+    for (key, reg, bold) in newly_loaded {
+        if !map.contains_key(&key) {
+            map.insert(key.clone(), reg);
             changed = true;
         }
-        if let Some((data, index)) = load_bold(n) {
+        if let Some(bold_face) = bold {
             if let Ok(mut b) = BOLD_LOADED.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-                if !b.contains_key(&norm(n)) {
-                    b.insert(norm(n), Loaded { data, index });
+                if !b.contains_key(&key) {
+                    b.insert(key.clone(), bold_face);
                     changed = true;
                     if let Ok(mut fonts) = pending().lock() {
-                        fonts.insert(format!("bold:{}", norm(n)));
+                        fonts.insert(format!("bold:{key}"));
                     }
                 }
             }

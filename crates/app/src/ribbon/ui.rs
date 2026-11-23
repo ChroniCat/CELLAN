@@ -53,20 +53,37 @@ pub fn tab_file(app: &mut SheetApp, ui: &mut egui::Ui) {
     }
 }
 
+/// 零堆分配借用保护：绘制期间暂移只读 `Ribbon` 到栈字段，利用结构体字段拆分借用消除每帧 `Tab::clone()`，
+/// 并在作用域结束（含提前 `return`）时由 `Drop` 无条件归还至 `app.ribbon`。
+struct RibbonGuard<'a> {
+    app: &'a mut SheetApp,
+    ribbon: super::Ribbon,
+}
+
+impl<'a> RibbonGuard<'a> {
+    #[inline]
+    fn new(app: &'a mut SheetApp) -> Self {
+        let ribbon = std::mem::take(&mut app.ribbon);
+        Self { app, ribbon }
+    }
+}
+
+impl Drop for RibbonGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.app.ribbon = std::mem::take(&mut self.ribbon);
+    }
+}
+
 /// 页签行（开始…帮助）。上下文页签由调用方按需追加。
 pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
-    let tabs: Vec<(usize, String, String)> = app
-        .ribbon
-        .tabs
-        .iter()
-        .enumerate()
-        .skip(1)
-        .map(|(i, t)| (i, t.label.clone(), t.keytip.clone()))
-        .collect();
-    for (i, label, keytip) in tabs {
-        let resp = ui_kit::tab_ex(ui, &label, app.ribbon_tab == i, false);
+    let guard = RibbonGuard::new(app);
+    let ribbon = &guard.ribbon;
+    let app = &mut *guard.app;
+    for (i, t) in ribbon.tabs.iter().enumerate().skip(1) {
+        let resp = ui_kit::tab_ex(ui, &t.label, app.ribbon_tab == i, false);
         if app.keytips && app.keytip_tab.is_none() {
-            if let Some(ch) = keytip.chars().next() {
+            if let Some(ch) = t.keytip.chars().next() {
                 let r = resp.rect;
                 let b = Rect::from_center_size(
                     egui::pos2(r.center().x, r.top() + 6.0),
@@ -74,10 +91,11 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
                 );
                 ui.painter()
                     .rect_filled(b, 2.0, Color32::from_rgb(68, 68, 68));
+                let mut buf = [0u8; 4];
                 ui.painter().text(
                     b.center(),
                     Align2::CENTER_CENTER,
-                    ch.to_string(),
+                    ch.encode_utf8(&mut buf),
                     FontId::proportional(8.5),
                     Color32::WHITE,
                 );
@@ -100,15 +118,16 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
 
 /// 上下文页签（表设计 / 图表工具）：选中表格或图表时才出现。
 pub fn context_tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
+    let guard = RibbonGuard::new(app);
+    let ribbon = &guard.ribbon;
+    let app = &mut *guard.app;
     if app.table_at_sel().is_some() {
-        if let Some(c) = app
-            .ribbon
+        if let Some(c) = ribbon
             .context
             .iter()
             .find(|c| c.set_id == "TabSetTableTools")
         {
-            let label = c.tab.label.clone();
-            let r = ui_kit::tab_ex(ui, &label, app.ribbon_tab == 100, false);
+            let r = ui_kit::tab_ex(ui, &c.tab.label, app.ribbon_tab == 100, false);
             if r.clicked() {
                 app.ribbon_tab = 100;
                 app.ribbon_collapsed = false;
@@ -117,14 +136,12 @@ pub fn context_tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
         }
     }
     if app.chart_at_sel().is_some() {
-        if let Some(c) = app
-            .ribbon
+        if let Some(c) = ribbon
             .context
             .iter()
             .find(|c| c.set_id == "TabSetChartTools")
         {
-            let label = c.tab.label.clone();
-            let r = ui_kit::tab_ex(ui, &label, app.ribbon_tab == 101, false);
+            let r = ui_kit::tab_ex(ui, &c.tab.label, app.ribbon_tab == 101, false);
             if r.clicked() {
                 app.ribbon_tab = 101;
                 app.ribbon_collapsed = false;
@@ -134,14 +151,12 @@ pub fn context_tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
     }
     // 选中带迷你图的单元格才出现「迷你图工具」
     if app.spark_at_sel().is_some() {
-        if let Some(c) = app
-            .ribbon
+        if let Some(c) = ribbon
             .context
             .iter()
             .find(|c| c.set_id == "TabSetSparklineTools")
         {
-            let label = c.tab.label.clone();
-            let r = ui_kit::tab_ex(ui, &label, app.ribbon_tab == 102, false);
+            let r = ui_kit::tab_ex(ui, &c.tab.label, app.ribbon_tab == 102, false);
             if r.clicked() {
                 app.ribbon_tab = 102;
                 app.ribbon_collapsed = false;
@@ -173,34 +188,34 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
             app.ribbon_tab = 1;
         }
     }
+    let guard = RibbonGuard::new(app);
+    let ribbon = &guard.ribbon;
+    let app = &mut *guard.app;
     let tab = match app.ribbon_tab {
-        100 => app
-            .ribbon
+        100 => ribbon
             .context
             .iter()
             .find(|c| c.set_id == "TabSetTableTools")
-            .map(|c| c.tab.clone()),
-        101 => app
-            .ribbon
+            .map(|c| &c.tab),
+        101 => ribbon
             .context
             .iter()
             .find(|c| c.set_id == "TabSetChartTools")
-            .map(|c| c.tab.clone()),
-        102 => app
-            .ribbon
+            .map(|c| &c.tab),
+        102 => ribbon
             .context
             .iter()
             .find(|c| c.set_id == "TabSetSparklineTools")
-            .map(|c| c.tab.clone()),
-        n if n < app.ribbon.tabs.len() => Some(app.ribbon.tabs[n].clone()),
+            .map(|c| &c.tab),
+        n if n < ribbon.tabs.len() => Some(&ribbon.tabs[n]),
         _ => None,
     };
     let tab = match tab {
         Some(t) => t,
         None => {
             app.ribbon_tab = 1;
-            match app.ribbon.tabs.get(1) {
-                Some(t) => t.clone(),
+            match ribbon.tabs.get(1) {
+                Some(t) => t,
                 None => return,
             }
         }
