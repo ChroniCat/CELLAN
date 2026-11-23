@@ -269,7 +269,64 @@ impl SheetApp {
         }
     }
 
+    pub(super) fn enqueue_or_send_replace_broadcast(
+        &mut self,
+        sheets: &std::collections::BTreeMap<usize, (sheetcore::Sheet, Vec<(u32, u32)>)>,
+    ) {
+        while self.drain_replace_broadcast() {}
+        if self.peer.is_none() || self.net.is_none() {
+            return;
+        }
+        for (&si, (_, keys)) in sheets {
+            if !keys.is_empty() {
+                self.normal_page_breaks
+                    .replace_broadcast
+                    .push_back((si, keys.clone(), 0));
+            }
+        }
+        let _ = self.drain_replace_broadcast();
+    }
+
+    /// 按每帧 8,192 格预算流式生成并发送超大批量「全部替换」的协同 CRDT Op；仍有剩余分片时返回 `true`。
+    pub(super) fn drain_replace_broadcast(&mut self) -> bool {
+        if self.normal_page_breaks.replace_broadcast.is_empty() {
+            return false;
+        }
+        let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) else {
+            self.normal_page_breaks.replace_broadcast.clear();
+            return false;
+        };
+        const FRAME_BUDGET: usize = 16 * sheetcore::sync::LIVE_OP_BATCH; // 8,192 格/帧（< 1.5ms）
+        let blank = sheetcore::Cell::default();
+        let mut sent = 0usize;
+        while sent < FRAME_BUDGET {
+            let Some((si, keys, cursor)) = self.normal_page_breaks.replace_broadcast.front_mut() else {
+                break;
+            };
+            let si = *si;
+            let Some(sh) = self.wb.sheets.get(si) else {
+                self.normal_page_breaks.replace_broadcast.pop_front();
+                continue;
+            };
+            let end = (*cursor + sheetcore::sync::LIVE_OP_BATCH).min(keys.len());
+            if *cursor < end {
+                let ops: Vec<_> = keys[*cursor..end]
+                    .iter()
+                    .map(|&(r, c)| peer.local_set(si, r, c, sh.get(r, c).unwrap_or(&blank)))
+                    .collect();
+                sent += ops.len();
+                *cursor = end;
+                net.broadcast_ops(ops);
+            }
+            if *cursor >= keys.len() {
+                self.normal_page_breaks.replace_broadcast.pop_front();
+            }
+        }
+        !self.normal_page_breaks.replace_broadcast.is_empty()
+    }
+
     pub(super) fn poll_find_scan(&mut self) {
+        let _ = self.drain_replace_broadcast();
         let Some(scan) = &self.find_scan else { return };
         let current = self.navigation_query();
         if !scan.query.same_scope(&current) {
@@ -369,12 +426,7 @@ impl SheetApp {
             self.undo.push_prepared(history);
             if large {
                 if self.net.is_some() {
-                    for (&si, (_, keys)) in &plan.sheets {
-                        for chunk in keys.chunks(sheetcore::sync::LIVE_OP_BATCH) {
-                            let batch: Vec<_> = chunk.iter().map(|&(r,c)| (si,r,c)).collect();
-                            self.broadcast_cells(&batch);
-                        }
-                    }
+                    self.enqueue_or_send_replace_broadcast(&plan.sheets);
                 }
                 if plan.formula_edit || !self.deps_built || !self.deps.is_empty()
                     || self.wb.sheets.iter().any(|s| s.has_formulas() || !s.arrays.is_empty() || !s.spilled.is_empty()) {

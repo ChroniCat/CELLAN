@@ -380,9 +380,12 @@ impl SheetApp {
             self.retire_diagnostics();
         }
         let sheet = self.wb.sheet(self.sheet_idx);
+        let async_scan = sheet.len() > SYNC_LIMIT
+            || sheet.ignored_errors.len() > SYNC_LIMIT
+            || self.wb.names.len() > SYNC_LIMIT;
         // Completion wakes the UI. Its result is checked against live metadata,
         // so idle frames need no repeated name/format comparisons while it runs.
-        if sheet.len() > SYNC_LIMIT && self.diagnostics.worker.as_ref().is_some_and(|w| w.active.is_some()) {
+        if async_scan && self.diagnostics.worker.as_ref().is_some_and(|w| w.active.is_some()) {
             return;
         }
         let need_marks = self.ec.background
@@ -414,13 +417,13 @@ impl SheetApp {
             .pending
             .as_ref()
             .is_some_and(|(_, t)| t.elapsed().as_millis() >= 1_200);
-        let idle = sheet.len() <= SYNC_LIMIT
+        let idle = !async_scan
             || (self.editing.is_none() && (!recent_edit || pending_ready));
         if (need_marks || need_cycles) && !idle {
             ctx.request_repaint_after(std::time::Duration::from_millis(650));
             return;
         }
-        if (need_marks || need_cycles) && sheet.len() > SYNC_LIMIT {
+        if (need_marks || need_cycles) && async_scan {
             let mut book = Workbook::new_blank();
             let si = if need_cycles { self.sheet_idx } else { 0 };
             if need_cycles {

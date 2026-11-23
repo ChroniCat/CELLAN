@@ -27,43 +27,102 @@ pub(super) fn intersects_array(sheet: &Sheet, first: u32, last: u32) -> bool {
         })
 }
 
-/// Count locked rows rather than assuming unoccupied cells in a protected
-/// selection are writable. Explicit cells override row and then column defaults.
-fn has_locked_cells(wb: &Workbook, sheet: &Sheet, first: u32, last: u32) -> bool {
-    if sheet.protection.is_none() {
-        return false;
-    }
-    let is_locked = |id| wb.styles.get(id).locked;
-    let locked_rows = sheet
-        .row_styles
-        .iter()
-        .filter(|(r, id)| **r < ROWS && is_locked(**id))
-        .count() as i64;
-    let inherited_rows = sheet.row_styles.keys().filter(|&&r| r < ROWS).count() as i64;
-    let mut locked: Vec<_> = (first..=last)
-        .map(|c| {
-            let column = sheet.col_styles.get(&c).copied().unwrap_or(0);
-            locked_rows
-                + if is_locked(column) {
-                    i64::from(ROWS) - inherited_rows
-                } else {
-                    0
+/// Count locked cells in an arbitrary rectangle `rect = (r1, c1, r2, c2)` in O(explicit styles)
+/// rather than O(R * C). Explicit cell styles override row styles, which override column styles,
+/// which fall back to style 0.
+pub(crate) fn locked_count_in_rect(
+    wb: &Workbook,
+    sheet: &Sheet,
+    rect: (u32, u32, u32, u32),
+) -> u64 {
+    let (r1, c1) = (rect.0.min(rect.2).min(ROWS - 1), rect.1.min(rect.3).min(COLS - 1));
+    let (r2, c2) = (rect.0.max(rect.2).min(ROWS - 1), rect.1.max(rect.3).min(COLS - 1));
+    let total_rows = u64::from(r2 - r1 + 1);
+    let total_cols = u64::from(c2 - c1 + 1);
+    let area = total_rows * total_cols;
+    let is_locked = |id: u16| wb.styles.get(id).locked;
+    if area <= 256 {
+        let mut count = 0u64;
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                if is_locked(sheet.style_of(r, c)) {
+                    count += 1;
                 }
-        })
-        .collect();
+            }
+        }
+        return count;
+    }
+    let mut row_styled = 0i64;
+    let mut row_locked = 0i64;
+    for (&r, &id) in &sheet.row_styles {
+        if r >= r1 && r <= r2 {
+            row_styled += 1;
+            if is_locked(id) {
+                row_locked += 1;
+            }
+        }
+    }
+    let unhandled_rows = total_rows as i64 - row_styled;
+    let mut col_styled = 0i64;
+    let mut col_locked = 0i64;
+    for (&c, &id) in &sheet.col_styles {
+        if c >= c1 && c <= c2 {
+            col_styled += 1;
+            if is_locked(id) {
+                col_locked += 1;
+            }
+        }
+    }
+    let unhandled_cols = total_cols as i64 - col_styled;
+    let effective_locked_cols =
+        col_locked + if is_locked(0) { unhandled_cols } else { 0 };
+    let mut locked =
+        row_locked * (total_cols as i64) + unhandled_rows * effective_locked_cols;
     for (key, &explicit) in sheet.styles.iter() {
-        if key.row < ROWS && (first..=last).contains(&key.col) {
+        if key.row >= r1 && key.row <= r2 && key.col >= c1 && key.col <= c2 {
             let base = sheet
                 .row_styles
                 .get(&key.row)
                 .or_else(|| sheet.col_styles.get(&key.col))
                 .copied()
                 .unwrap_or(0);
-            locked[(key.col - first) as usize] +=
-                i64::from(is_locked(explicit)) - i64::from(is_locked(base));
+            locked += i64::from(is_locked(explicit)) - i64::from(is_locked(base));
         }
     }
-    locked.iter().any(|&n| n != 0)
+    locked.max(0) as u64
+}
+
+/// Sparse rectangle check: returns true if ANY cell in `rect` is locked on a protected sheet.
+pub(crate) fn rect_has_any_locked(
+    wb: &Workbook,
+    sheet: &Sheet,
+    rect: (u32, u32, u32, u32),
+) -> bool {
+    if sheet.protection.is_none() {
+        return false;
+    }
+    locked_count_in_rect(wb, sheet, rect) > 0
+}
+
+/// Sparse rectangle check: returns true if EVERY cell in `rect` is locked on a protected sheet.
+pub(crate) fn rect_all_locked(
+    wb: &Workbook,
+    sheet: &Sheet,
+    rect: (u32, u32, u32, u32),
+) -> bool {
+    if sheet.protection.is_none() {
+        return false;
+    }
+    let (r1, c1) = (rect.0.min(rect.2).min(ROWS - 1), rect.1.min(rect.3).min(COLS - 1));
+    let (r2, c2) = (rect.0.max(rect.2).min(ROWS - 1), rect.1.max(rect.3).min(COLS - 1));
+    let area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
+    locked_count_in_rect(wb, sheet, rect) == area
+}
+
+/// Count locked rows rather than assuming unoccupied cells in a protected
+/// selection are writable. Explicit cells override row and then column defaults.
+fn has_locked_cells(wb: &Workbook, sheet: &Sheet, first: u32, last: u32) -> bool {
+    rect_has_any_locked(wb, sheet, (0, first, ROWS - 1, last))
 }
 
 fn matching_style(from: &StyleTable, to: &StyleTable, id: u16) -> bool {

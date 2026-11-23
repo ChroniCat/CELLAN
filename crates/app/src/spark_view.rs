@@ -29,36 +29,43 @@ pub fn values(wb: &Workbook, sheet_idx: usize, sp: &Sparkline) -> Vec<Option<f64
         },
         None => wb.sheet(sheet_idx),
     };
+    const MAX_SPARK_POINTS: usize = 4096;
     let (r1, c1, r2, c2) = sp.rect;
-    let mut out = Vec::new();
-    // 单行 → 从左到右；单列 → 从上到下；多行多列按行优先（Excel 只允许单行/单列）
+    // 单行 → 从左到右；单列 → 从上到下；多行多列按行优先（Excel 只允许单行/单列，总点数上限统一封顶 4096）
     let rows = r2.saturating_sub(r1) + 1;
     let cols = c2.saturating_sub(c1) + 1;
+    let cap = (rows as usize)
+        .saturating_mul(cols as usize)
+        .min(MAX_SPARK_POINTS);
+    let mut out = Vec::with_capacity(cap);
     if rows > 1 && cols > 1 {
-        // 大区域截断，避免整列引用拖死绘制
-        for r in r1..=r2.min(r1 + 4095) {
+        'outer: for r in r1..=r2.min(r1 + 4095) {
             for c in c1..=c2.min(c1 + 255) {
+                if out.len() >= MAX_SPARK_POINTS {
+                    break 'outer;
+                }
                 out.push(num_at(sheet, r, c));
             }
         }
         return out;
     }
     if rows == 1 {
-        for c in c1..=c2.min(c1 + 4095) {
+        for c in c1..=c2.min(c1 + (MAX_SPARK_POINTS as u32 - 1)) {
             out.push(num_at(sheet, r1, c));
         }
     } else {
-        for r in r1..=r2.min(r1 + 4095) {
+        for r in r1..=r2.min(r1 + (MAX_SPARK_POINTS as u32 - 1)) {
             out.push(num_at(sheet, r, c1));
         }
     }
     out
 }
 
+#[inline]
 fn num_at(sheet: &sheetcore::Sheet, r: u32, c: u32) -> Option<f64> {
-    match sheet.value(r, c) {
-        sheetcore::Value::Number(n) => Some(n),
-        sheetcore::Value::Bool(b) => Some(if b { 1.0 } else { 0.0 }),
+    match &sheet.get(r, c)?.value {
+        sheetcore::Value::Number(n) => Some(*n),
+        sheetcore::Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
         _ => None,
     }
 }
