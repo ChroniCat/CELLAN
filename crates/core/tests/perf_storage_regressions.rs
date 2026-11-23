@@ -255,15 +255,21 @@ fn move_rows_sparse_cell_shift_and_cow_batch_undo() {
     assert_eq!(wb.sheets[0].style_of(19_999, 0), 3);
     assert_eq!(wb.sheets[0].value(5, 0), Value::Number(999_999.0));
 
-    // Direct push_cow_batch from before/after Sheet CoW snapshots
+    // Direct push_cow_batch from before/after Sheet CoW snapshots (including row_styles / col_styles!)
     let before_snap = wb.sheets[0].clone();
     wb.sheets[0].set(100, 2, txt("CoW直接快照"));
+    wb.sheets[0].set_row_style(10, 7);
+    wb.sheets[0].set_col_style(4, 9);
     let after_snap = wb.sheets[0].clone();
     stack.push_cow_batch("CoW快照编辑", 0, &before_snap, &after_snap, (0, 100, 2));
     stack.undo(&mut wb.sheets, |_, _, _, _| true).unwrap();
     assert_eq!(wb.sheets[0].value(100, 2), Value::Empty);
+    assert_eq!(wb.sheets[0].row_styles.get(&10), None);
+    assert_eq!(wb.sheets[0].col_styles.get(&4), None);
     stack.redo(&mut wb.sheets, |_, _, _, _| true).unwrap();
     assert_eq!(wb.sheets[0].value_ref(100, 2).as_str(), Some("CoW直接快照"));
+    assert_eq!(wb.sheets[0].row_styles.get(&10), Some(&7));
+    assert_eq!(wb.sheets[0].col_styles.get(&4), Some(&9));
 
     // Structural undo with foreign formula
     wb.sheets.push(Sheet::new("Summary"));
@@ -378,9 +384,28 @@ fn current_region_filter_sort_cf_dv_search_and_dedup_end_to_end() {
     let found = dv_idx.find(&wb.sheets[0].dv, 50, 0).unwrap().clone();
     assert!(dv::validate_wb(&wb, 0, &found, &Value::Text(Arc::from("研发")), 50, 0, |_, _, _| formula::FValue::Empty));
     assert!(!dv::validate_wb(&wb, 0, &found, &Value::Text(Arc::from("财务")), 50, 0, |_, _, _| formula::FValue::Empty));
-    // Mutating the referenced range invalidates the cached set via cell_revision()
+    // Mutating the referenced range invalidates the cached set via CellVersion (including across Undo/fork with equal revision!)
+    let baseline_sheet = wb.sheets[0].clone();
+    let baseline_rev = baseline_sheet.cell_revision();
     wb.sheets[0].set(3, 0, txt("财务"));
+    assert_eq!(wb.sheets[0].cell_revision(), baseline_rev + 1);
     assert!(dv::validate_wb(&wb, 0, &found, &Value::Text(Arc::from("财务")), 50, 0, |_, _, _| formula::FValue::Empty));
+    // Simulate Undo restoring `baseline_sheet` (forking lineage at `baseline_rev`), then editing to a new value at the SAME `baseline_rev + 1`!
+    wb.sheets[0] = baseline_sheet;
+    wb.sheets[0].set(3, 0, txt("法务"));
+    assert_eq!(wb.sheets[0].cell_revision(), baseline_rev + 1);
+    assert!(!dv::validate_wb(&wb, 0, &found, &Value::Text(Arc::from("财务")), 50, 0, |_, _, _| formula::FValue::Empty));
+    assert!(dv::validate_wb(&wb, 0, &found, &Value::Text(Arc::from("法务")), 50, 0, |_, _, _| formula::FValue::Empty));
+
+    // Case-insensitive cross-sheet list validation (`=sheet1!$A$2:$A$4`)
+    wb.sheets.push(Sheet::new("Entry"));
+    let cross_rule = DataValidation {
+        ranges: vec![(0, 0, 10, 0)],
+        kind: DvKind::List,
+        f1: "=sheet1!$A$2:$A$4".into(),
+        ..Default::default()
+    };
+    assert!(dv::validate_wb(&wb, 1, &cross_rule, &Value::Text(Arc::from("法务")), 0, 0, |_, _, _| formula::FValue::Empty));
 
     // 7) Zero-alloc & parallel search (including >32,768 cells path)
     let mut big_wb = Workbook::new_blank();

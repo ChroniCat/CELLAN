@@ -389,7 +389,7 @@ impl Entry {
             Self::Cells(_, a, _) if a.snap_before.is_none() && a.snap_after.is_none()
                 && a.merges.is_none() && a.shapes.is_none() && a.pictures.is_none()
                 && a.refresh_sizes.is_none() => Some(Box::new(a.deltas.iter().map(|d| (d.sheet, d.row, d.col)))),
-            Self::CowBatch(_, a) => {
+            Self::CowBatch(_, a) if a.row_style_deltas.is_empty() && a.col_style_deltas.is_empty() => {
                 let sheet = a.sheet;
                 Some(Box::new(
                     a.all_mask
@@ -429,6 +429,8 @@ struct CowBatchAction {
     after_cells: crate::store::Store,
     before_styles: crate::store::CellStyles,
     after_styles: crate::store::CellStyles,
+    row_style_deltas: Vec<(u32, u16, u16)>,
+    col_style_deltas: Vec<(u32, u16, u16)>,
     cell_mask: crate::model::CellJournal,
     style_mask: crate::model::CellJournal,
     all_mask: crate::model::CellJournal,
@@ -509,6 +511,8 @@ impl CowBatchAction {
                 after_cells,
                 before_styles,
                 after_styles,
+                row_style_deltas: Vec::new(),
+                col_style_deltas: Vec::new(),
                 cell_mask,
                 style_mask,
                 all_mask,
@@ -559,15 +563,51 @@ impl CowBatchAction {
             }
             let bs = before.style_of(k.row, k.col);
             let as_ = after.style_of(k.row, k.col);
-            if bs != as_ {
+            if bs != as_ || before.explicit_style_of(k.row, k.col) != after.explicit_style_of(k.row, k.col) {
                 style_mask.insert(k);
                 before_styles.insert(k, bs);
                 after_styles.insert(k, as_);
             }
         }
+        let mut row_style_deltas = Vec::new();
+        if before.row_styles != after.row_styles {
+            let mut rows: Vec<u32> = before
+                .row_styles
+                .keys()
+                .chain(after.row_styles.keys())
+                .copied()
+                .collect();
+            rows.sort_unstable();
+            rows.dedup();
+            for r in rows {
+                let b_id = before.row_styles.get(&r).copied().unwrap_or(0);
+                let a_id = after.row_styles.get(&r).copied().unwrap_or(0);
+                if b_id != a_id {
+                    row_style_deltas.push((r, b_id, a_id));
+                }
+            }
+        }
+        let mut col_style_deltas = Vec::new();
+        if before.col_styles != after.col_styles {
+            let mut cols: Vec<u32> = before
+                .col_styles
+                .keys()
+                .chain(after.col_styles.keys())
+                .copied()
+                .collect();
+            cols.sort_unstable();
+            cols.dedup();
+            for c in cols {
+                let b_id = before.col_styles.get(&c).copied().unwrap_or(0);
+                let a_id = after.col_styles.get(&c).copied().unwrap_or(0);
+                if b_id != a_id {
+                    col_style_deltas.push((c, b_id, a_id));
+                }
+            }
+        }
         let mut all_mask = cell_mask.clone();
         all_mask.union_from(&style_mask);
-        if all_mask.is_empty() {
+        if all_mask.is_empty() && row_style_deltas.is_empty() && col_style_deltas.is_empty() {
             return None;
         }
         let before_cells = if cell_mask.is_empty() {
@@ -584,6 +624,7 @@ impl CowBatchAction {
             + diff_heap
             + before_styles.payload_bytes()
             + after_styles.payload_bytes()
+            + (row_style_deltas.capacity() + col_style_deltas.capacity()) * std::mem::size_of::<(u32, u16, u16)>()
             + cell_mask.payload_bytes()
             + style_mask.payload_bytes()
             + all_mask.payload_bytes();
@@ -594,6 +635,8 @@ impl CowBatchAction {
                 after_cells,
                 before_styles,
                 after_styles,
+                row_style_deltas,
+                col_style_deltas,
                 cell_mask,
                 style_mask,
                 all_mask,
@@ -646,6 +689,8 @@ impl CowBatchAction {
             )
         };
         let blank = Cell::default();
+        // 1) Validate per-cell changes before mutating inherited row/col styles so `sheet.style_of` sees pre-replay state.
+        let mut accepted: Vec<(CellRef, bool, bool)> = Vec::new();
         for k in self.all_mask.iter() {
             if self.excluded.contains(&k) {
                 continue;
@@ -667,6 +712,48 @@ impl CowBatchAction {
                 self.permutation = None;
                 continue;
             }
+            accepted.push((k, has_cell, has_style));
+        }
+        // 2) Replay inherited row/column styles first so explicit `set_style(r, c, 0)` overrides behave identically.
+        let mut axis_replayed = false;
+        self.row_style_deltas.retain(|&(r, b_id, a_id)| {
+            let (exp, tgt) = if redo { (b_id, a_id) } else { (a_id, b_id) };
+            if sheet.row_styles.get(&r).copied().unwrap_or(0) != exp {
+                applied.skipped += 1;
+                return false;
+            }
+            sheet.set_row_style(r, tgt);
+            axis_replayed = true;
+            for (k, _) in sheet.iter_rect((r, 0, r, u32::MAX)) {
+                applied.touched.push((self.sheet, k.row, k.col));
+                applied.style_changes.push((self.sheet, k.row, k.col));
+            }
+            true
+        });
+        self.col_style_deltas.retain(|&(c, b_id, a_id)| {
+            let (exp, tgt) = if redo { (b_id, a_id) } else { (a_id, b_id) };
+            if sheet.col_styles.get(&c).copied().unwrap_or(0) != exp {
+                applied.skipped += 1;
+                return false;
+            }
+            sheet.set_col_style(c, tgt);
+            axis_replayed = true;
+            let mut col_cells = Vec::new();
+            for (base_row, slice) in sheet.cells().column_slices(0, u32::MAX, c) {
+                for (i, cell) in slice.iter().enumerate() {
+                    if !cell.is_blank() {
+                        col_cells.push(base_row + i as u32);
+                    }
+                }
+            }
+            for r in col_cells {
+                applied.touched.push((self.sheet, r, c));
+                applied.style_changes.push((self.sheet, r, c));
+            }
+            true
+        });
+        // 3) Replay accepted cell & explicit style changes.
+        for (k, has_cell, has_style) in accepted {
             if has_cell {
                 if let Some(tgt) = tgt_cells.get(k.row, k.col) {
                     sheet.set(k.row, k.col, tgt.clone());
@@ -681,10 +768,18 @@ impl CowBatchAction {
             }
             applied.touched.push((self.sheet, k.row, k.col));
         }
+        if axis_replayed {
+            applied.touched.sort_unstable();
+            applied.touched.dedup();
+            applied.style_changes.sort_unstable();
+            applied.style_changes.dedup();
+        }
         stamp.payload_bytes = stamp
             .payload_bytes
             .saturating_add(self.excluded.payload_bytes().saturating_sub(prev_excl_bytes));
-        let keep = self.excluded.len() < self.all_mask.len();
+        let keep = self.excluded.len() < self.all_mask.len()
+            || !self.row_style_deltas.is_empty()
+            || !self.col_style_deltas.is_empty();
         (applied, keep)
     }
 }

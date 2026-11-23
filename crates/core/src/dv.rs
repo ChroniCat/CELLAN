@@ -956,7 +956,7 @@ where
     validate_impl(dv, value, sheet, r, c, None, formula_eval)
 }
 
-type CachedRectSetKey = (u64, u64, (u32, u32, u32, u32));
+type CachedRectSetKey = (u64, crate::store::CellVersion, (u32, u32, u32, u32));
 
 fn cached_list_set_wb(
     wb: &crate::model::Workbook,
@@ -997,10 +997,13 @@ fn cached_list_set_wb(
     let (sheet_name, range) = split_sheet_prefix(&shifted);
     if let Some(rect) = parse_rect(&range) {
         let sheet = match sheet_name.as_deref() {
-            Some(n) if !n.is_empty() => wb.sheets.iter().find(|s| s.name == n)?,
+            Some(n) if !n.is_empty() => wb
+                .sheets
+                .iter()
+                .find(|s| s.name == n || s.name.eq_ignore_ascii_case(n))?,
             _ => wb.sheet(si),
         };
-        let key: CachedRectSetKey = (sheet.identity, sheet.cell_revision(), rect);
+        let key: CachedRectSetKey = (sheet.identity, sheet.cell_version().clone(), rect);
         thread_local! {
             static RECT_CACHE: std::cell::RefCell<Vec<(CachedRectSetKey, std::sync::Arc<std::collections::HashSet<String>>)>> =
                 const { std::cell::RefCell::new(Vec::new()) };
