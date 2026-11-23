@@ -54,19 +54,19 @@ impl fmt::Display for ErrKind {
     }
 }
 
-/// 二维数组（动态数组函数的返回值）
+/// 二维数组（动态数组函数的返回值，Arc 共享支持多线程零拷贝传递）
 #[derive(Clone, Debug, PartialEq)]
 pub struct Array {
     pub rows: usize,
     pub cols: usize,
-    pub data: std::rc::Rc<Vec<FValue>>,
+    pub data: std::sync::Arc<Vec<FValue>>,
 }
 
 impl Array {
     pub fn new(rows: usize, cols: usize, data: Vec<FValue>) -> Self {
-        Self::from_shared(rows, cols, std::rc::Rc::new(data))
+        Self::from_shared(rows, cols, std::sync::Arc::new(data))
     }
-    pub(super) fn from_shared(rows: usize, cols: usize, data: std::rc::Rc<Vec<FValue>>) -> Self {
+    pub(super) fn from_shared(rows: usize, cols: usize, data: std::sync::Arc<Vec<FValue>>) -> Self {
         Self { rows, cols, data }
     }
     pub fn get(&self, r: usize, c: usize) -> FValue {
@@ -85,27 +85,142 @@ impl Array {
     }
 }
 
+/// 词法环境帧：<=4 个局部变量（99% 的 LAMBDA/LET 调用）直接在栈上内联，零 HashMap 分配
+#[derive(Clone, Debug, PartialEq)]
+pub enum EnvFrame {
+    Small {
+        len: u8,
+        slots: [(std::sync::Arc<str>, FValue); 4],
+    },
+    Map(std::collections::HashMap<String, FValue>),
+}
+
+impl Default for EnvFrame {
+    fn default() -> Self {
+        Self::new_small()
+    }
+}
+
+impl EnvFrame {
+    #[inline]
+    pub fn new_small() -> Self {
+        let empty: std::sync::Arc<str> = "".into();
+        Self::Small {
+            len: 0,
+            slots: [
+                (empty.clone(), FValue::Empty),
+                (empty.clone(), FValue::Empty),
+                (empty.clone(), FValue::Empty),
+                (empty, FValue::Empty),
+            ],
+        }
+    }
+
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        if cap <= 4 {
+            Self::new_small()
+        } else {
+            Self::Map(std::collections::HashMap::with_capacity(cap))
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, name: &str) -> Option<&FValue> {
+        match self {
+            Self::Small { len, slots } => {
+                for i in (0..*len as usize).rev() {
+                    if slots[i].0.as_ref() == name || slots[i].0.eq_ignore_ascii_case(name) {
+                        return Some(&slots[i].1);
+                    }
+                }
+                None
+            }
+            Self::Map(m) => m.get(name).or_else(|| {
+                m.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v)
+            }),
+        }
+    }
+
+    #[inline]
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    #[inline]
+    pub fn insert_arc(&mut self, name: std::sync::Arc<str>, val: FValue) {
+        self.insert(name, val);
+    }
+
+    #[inline]
+    pub fn insert(&mut self, name: impl Into<std::sync::Arc<str>>, val: FValue) {
+        let name = name.into();
+        match self {
+            Self::Small { len, slots } => {
+                for i in 0..*len as usize {
+                    if slots[i].0.as_ref() == name.as_ref()
+                        || slots[i].0.eq_ignore_ascii_case(name.as_ref())
+                    {
+                        slots[i].1 = val;
+                        return;
+                    }
+                }
+                if (*len as usize) < 4 {
+                    slots[*len as usize] = (name, val);
+                    *len += 1;
+                } else {
+                    let mut map = std::collections::HashMap::with_capacity(8);
+                    for i in 0..4 {
+                        let (k, v) = std::mem::replace(
+                            &mut slots[i],
+                            ("".into(), FValue::Empty),
+                        );
+                        map.insert(k.to_string(), v);
+                    }
+                    map.insert(name.to_string(), val);
+                    *self = Self::Map(map);
+                }
+            }
+            Self::Map(m) => {
+                m.insert(name.to_string(), val);
+            }
+        }
+    }
+}
+
 /// 一等公民的 LAMBDA：LET(f, LAMBDA(x, x+1), f(1)) 需要把函数当值传
 #[derive(Clone, Debug, PartialEq)]
 pub struct LambdaVal {
-    pub params: Vec<String>,
+    pub params: Vec<std::sync::Arc<str>>,
     pub body: crate::formula::Node,
     /// 定义时捕获的环境（词法闭包：内层 LAMBDA 要能看见外层的参数）
-    pub env: Vec<std::collections::HashMap<String, FValue>>,
+    pub env: Vec<EnvFrame>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FValue {
     Empty,
     Number(f64),
-    Text(String),
+    Text(std::sync::Arc<str>),
     Bool(bool),
     Error(ErrKind),
-    Array(std::rc::Rc<Array>),
-    Lambda(std::rc::Rc<LambdaVal>),
+    Array(std::sync::Arc<Array>),
+    Lambda(std::sync::Arc<LambdaVal>),
 }
 
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<FValue>();
+};
+
 impl FValue {
+    #[inline]
+    pub fn text(s: impl Into<std::sync::Arc<str>>) -> Self {
+        FValue::Text(s.into())
+    }
+
     pub fn number(n: f64) -> Self {
         if n.is_nan() || n.is_infinite() {
             FValue::Error(ErrKind::Num)
@@ -126,7 +241,7 @@ impl FValue {
         }
     }
 
-    pub fn as_array(&self) -> Option<std::rc::Rc<Array>> {
+    pub fn as_array(&self) -> Option<std::sync::Arc<Array>> {
         match self {
             FValue::Array(a) => Some(a.clone()),
             _ => None,
@@ -143,7 +258,7 @@ impl FValue {
             FValue::Array(a) => a.get(0, 0).display(),
             FValue::Empty => String::new(),
             FValue::Number(n) => crate::model::format_number(*n),
-            FValue::Text(s) => s.clone(),
+            FValue::Text(s) => s.to_string(),
             FValue::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
             FValue::Error(e) => e.text().to_string(),
             FValue::Lambda(_) => "#FUNC!".into(),
@@ -185,11 +300,16 @@ impl FValue {
             FValue::Empty => Ok(false),
             FValue::Bool(b) => Ok(*b),
             FValue::Number(n) => Ok(*n != 0.0),
-            FValue::Text(s) => match s.trim().to_ascii_uppercase().as_str() {
-                "TRUE" => Ok(true),
-                "FALSE" => Ok(false),
-                _ => Err(ErrKind::Value),
-            },
+            FValue::Text(s) => {
+                let t = s.trim();
+                if t.eq_ignore_ascii_case("TRUE") {
+                    Ok(true)
+                } else if t.eq_ignore_ascii_case("FALSE") {
+                    Ok(false)
+                } else {
+                    Err(ErrKind::Value)
+                }
+            }
             FValue::Error(e) => Err(*e),
             FValue::Lambda(_) => Err(ErrKind::Value),
         }
@@ -217,7 +337,7 @@ impl FValue {
             (FValue::Text(x), FValue::Text(y)) => compare_text(x, y),
             (FValue::Bool(x), FValue::Bool(y)) => x.cmp(y),
             (FValue::Empty, FValue::Number(n)) => 0.0_f64.partial_cmp(n).unwrap_or(Ordering::Equal),
-            (FValue::Empty, FValue::Text(s)) => "".cmp(s.as_str()),
+            (FValue::Empty, FValue::Text(s)) => "".cmp(s.as_ref()),
             (FValue::Empty, FValue::Bool(b)) => false.cmp(b),
             (_, FValue::Empty) if !matches!(self, FValue::Empty) => return other.compare(self).map(Ordering::reverse),
             (FValue::Empty, _) => Ordering::Equal,

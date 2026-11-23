@@ -712,29 +712,37 @@ fn walk_wb_ext_node(wb: &Workbook, node: &crate::formula::Node, filters: &mut [B
     }
 }
 
-fn scan_formula_for_links(wb: &Workbook, f: &str, filters: &mut [BookFilter]) {
+fn scan_formula_for_links(
+    wb: &Workbook,
+    row: u32,
+    col: u32,
+    f: &str,
+    link_names_lower: &[String],
+    filters: &mut [BookFilter],
+) {
     if !f.contains('[') && !f.contains('!') {
         return;
     }
     // 普通表内公式（如 `=Sheet2!A1`）不含 `[`，若链接文件名也未出现在公式中则快速跳过
-    if !f.contains('[')
-        && !wb.links.iter().any(|l| {
-            let fnm = l.file_name();
-            !fnm.is_empty() && f.to_lowercase().contains(&fnm.to_lowercase())
-        })
-    {
-        return;
+    if !f.contains('[') {
+        if link_names_lower.is_empty() {
+            return;
+        }
+        let f_lower = f.to_lowercase();
+        if !link_names_lower.iter().any(|fnm| f_lower.contains(fnm)) {
+            return;
+        }
     }
     let raw = f.strip_prefix('=').unwrap_or(f);
-    let norm = crate::normalize_formula(raw);
-    match crate::formula::parse(&norm) {
-        Ok(node) => walk_wb_ext_node(wb, &node, filters),
-        Err(_) => {
-            for tok in books_in_formula(f) {
-                if let Some(li) = resolve_book(wb, &tok) {
-                    filters[li].any_ref = true;
-                    filters[li].fallback_all = true;
-                }
+    if crate::formula::with_compiled_node(raw, row, col, |node| {
+        walk_wb_ext_node(wb, node, filters);
+    })
+    .is_err()
+    {
+        for tok in books_in_formula(f) {
+            if let Some(li) = resolve_book(wb, &tok) {
+                filters[li].any_ref = true;
+                filters[li].fallback_all = true;
             }
         }
     }
@@ -746,18 +754,24 @@ pub fn build_book_filters(wb: &Workbook) -> Vec<BookFilter> {
     if filters.is_empty() {
         return filters;
     }
+    let link_names_lower: Vec<String> = wb
+        .links
+        .iter()
+        .map(|l| l.file_name().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
     for sheet in &wb.sheets {
-        for (_, cell) in sheet.iter() {
+        for (cref, cell) in sheet.formula_cells() {
             if let Some(f) = cell.formula.as_deref() {
-                scan_formula_for_links(wb, f, &mut filters);
+                scan_formula_for_links(wb, cref.row, cref.col, f, &link_names_lower, &mut filters);
             }
         }
         for dv in &sheet.dv {
             if dv.f1.starts_with('=') {
-                scan_formula_for_links(wb, &dv.f1, &mut filters);
+                scan_formula_for_links(wb, 0, 0, &dv.f1, &link_names_lower, &mut filters);
             }
             if dv.f2.starts_with('=') {
-                scan_formula_for_links(wb, &dv.f2, &mut filters);
+                scan_formula_for_links(wb, 0, 0, &dv.f2, &link_names_lower, &mut filters);
             }
         }
         for block in &sheet.cf.blocks {
@@ -765,34 +779,34 @@ pub fn build_book_filters(wb: &Workbook) -> Vec<BookFilter> {
                 match &rule.kind {
                     crate::cf::CfKind::CellIs { a, b, .. } => {
                         if a.starts_with('=') {
-                            scan_formula_for_links(wb, a, &mut filters);
+                            scan_formula_for_links(wb, 0, 0, a, &link_names_lower, &mut filters);
                         }
                         if b.starts_with('=') {
-                            scan_formula_for_links(wb, b, &mut filters);
+                            scan_formula_for_links(wb, 0, 0, b, &link_names_lower, &mut filters);
                         }
                     }
                     crate::cf::CfKind::Expr { formula, .. } => {
-                        scan_formula_for_links(wb, formula, &mut filters);
+                        scan_formula_for_links(wb, 0, 0, formula, &link_names_lower, &mut filters);
                     }
                     crate::cf::CfKind::Scale { points } => {
                         for (c, _) in points {
                             if !c.formula.is_empty() {
-                                scan_formula_for_links(wb, &c.formula, &mut filters);
+                                scan_formula_for_links(wb, 0, 0, &c.formula, &link_names_lower, &mut filters);
                             }
                         }
                     }
                     crate::cf::CfKind::Bar { min, max, .. } => {
                         if !min.formula.is_empty() {
-                            scan_formula_for_links(wb, &min.formula, &mut filters);
+                            scan_formula_for_links(wb, 0, 0, &min.formula, &link_names_lower, &mut filters);
                         }
                         if !max.formula.is_empty() {
-                            scan_formula_for_links(wb, &max.formula, &mut filters);
+                            scan_formula_for_links(wb, 0, 0, &max.formula, &link_names_lower, &mut filters);
                         }
                     }
                     crate::cf::CfKind::IconSet { thresholds, .. } => {
                         for c in thresholds {
                             if !c.formula.is_empty() {
-                                scan_formula_for_links(wb, &c.formula, &mut filters);
+                                scan_formula_for_links(wb, 0, 0, &c.formula, &link_names_lower, &mut filters);
                             }
                         }
                     }
@@ -802,7 +816,7 @@ pub fn build_book_filters(wb: &Workbook) -> Vec<BookFilter> {
         }
     }
     for (_, _, refers) in &wb.names {
-        scan_formula_for_links(wb, refers, &mut filters);
+        scan_formula_for_links(wb, 0, 0, refers, &link_names_lower, &mut filters);
     }
     filters
 }
@@ -1848,8 +1862,8 @@ pub fn break_link(wb: &mut Workbook, link_idx: usize) -> usize {
     let mut converted = 0usize;
     for sheet in wb.sheets.iter_mut() {
         let coords: Vec<crate::model::CellRef> = sheet
-            .iter()
-            .filter_map(|(c, cell)| cell.formula.as_ref().map(|_| c))
+            .formula_cells()
+            .map(|(c, _)| c)
             .collect();
         for cref in coords {
             let Some(orig) = sheet.get(cref.row, cref.col).and_then(|c| c.formula.clone()) else {

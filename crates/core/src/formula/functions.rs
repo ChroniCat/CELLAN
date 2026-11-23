@@ -57,7 +57,7 @@ pub(crate) fn numbers(args: &[Arg], from: usize) -> Result<Vec<f64>, ErrKind> {
 pub(crate) fn flatten_values(args: &[Arg], from: usize) -> Vec<FValue> {
     let mut out = Vec::new();
     for a in args.iter().skip(from) {
-        out.extend(a.values());
+        out.extend_from_slice(a.slice());
     }
     out
 }
@@ -143,6 +143,35 @@ fn clock_now() -> (i64, i32) {
     (secs, local_offset_seconds() as i32)
 }
 
+
+#[derive(Clone, Copy, Debug)]
+pub struct EvalCtx {
+    pub date_system: DateSystem,
+    pub now_snapshot: Option<f64>,
+}
+
+impl EvalCtx {
+    #[inline]
+    pub fn from_ambient() -> Self {
+        Self {
+            date_system: current_date_system(),
+            now_snapshot: now_snapshot(),
+        }
+    }
+
+    #[inline]
+    pub fn for_workbook(sys: DateSystem) -> Self {
+        Self {
+            date_system: sys,
+            now_snapshot: Some(now_snapshot().unwrap_or_else(|| now_serial_uncached_in(sys))),
+        }
+    }
+
+    #[inline]
+    pub fn now_serial(self) -> f64 {
+        self.now_snapshot.unwrap_or_else(|| now_serial_uncached_in(self.date_system))
+    }
+}
 
 /// 由 `Calc::new` 设置、`Calc::drop` 恢复
 pub fn set_current_date_system(sys: DateSystem) {
@@ -258,7 +287,7 @@ fn now_serial_uncached() -> f64 {
     now_serial_uncached_in(current_date_system())
 }
 
-fn now_serial_uncached_in(sys: DateSystem) -> f64 {
+pub(crate) fn now_serial_uncached_in(sys: DateSystem) -> f64 {
     let (secs, offset) = clock_now();
     let local_secs = secs as f64 + offset as f64;
     let serial_1900 = local_secs / 86_400.0 + 25_569.0;
@@ -282,39 +311,115 @@ pub(crate) fn now_serial() -> f64 {
 
 /// 预编译的筛选条件：解析一次，逐格比较不再分配
 pub(crate) struct Crit {
-    op: &'static str,
-    num: Option<f64>,
-    text: String,
-    wild: bool,
+    pub(super) op: &'static str,
+    pub(super) num: Option<f64>,
+    pub(super) text: String,
+    pub(super) wild: bool,
 }
 
-#[derive(Eq, PartialEq, Hash)]
-enum GroupValue {
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub(crate) enum GroupValue {
     Number(u64),
-    Text(String),
+    Text(std::sync::Arc<str>),
 }
 
 impl GroupValue {
-    // Equality scans use an epsilon. Hash integral keys only when *all* numeric
-    // data in that column are integral, so nearby fractions cannot be lost.
-    fn integer(n: f64) -> Option<Self> {
-        (n.fract() == 0.0).then(|| Self::Number(if n == 0.0 { 0 } else { n.to_bits() }))
+    #[inline]
+    fn canonical_bits(n: f64) -> u64 {
+        if n == 0.0 { 0 } else { n.to_bits() }
     }
 }
 
-/// Group a repeated set of literal SUMIFS/COUNTIFS ranges by equality criteria.
-/// Each function shares its group budget across a few recently used range sets.
-/// Inequalities, wildcards and fractional numeric keys keep the scan semantics.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupStats {
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+    pub count_num: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct BuiltGroups {
+    pub distinct_nums: Vec<Option<Vec<f64>>>,
+    pub map: std::collections::HashMap<Vec<GroupValue>, GroupStats>,
+}
+
+impl BuiltGroups {
+    pub(crate) fn answer(&self, function: u8, raw_criteria: &[Crit]) -> Option<FValue> {
+        let mut query = Vec::with_capacity(raw_criteria.len());
+        for (crit, distinct) in raw_criteria.iter().zip(&self.distinct_nums) {
+            if let Some(n) = crit.num {
+                if !n.is_finite() {
+                    return Some(Self::empty_answer(function));
+                }
+                let bits = match distinct {
+                    None => {
+                        if n.fract() != 0.0 {
+                            return Some(Self::empty_answer(function));
+                        }
+                        GroupValue::canonical_bits(n)
+                    }
+                    Some(vals) => {
+                        let pos = vals.partition_point(|v| *v - n < -f64::EPSILON);
+                        match vals.get(pos) {
+                            Some(&d) if (d - n).abs() <= f64::EPSILON => GroupValue::canonical_bits(d),
+                            _ => return Some(Self::empty_answer(function)),
+                        }
+                    }
+                };
+                query.push(GroupValue::Number(bits));
+            } else {
+                query.push(GroupValue::Text(crit.text.as_str().into()));
+            }
+        }
+        let Some(stats) = self.map.get(&query) else {
+            return Some(Self::empty_answer(function));
+        };
+        Some(match function {
+            1 => FValue::number(stats.count_num as f64),
+            2 | 3 => {
+                if stats.count_num == 0 {
+                    FValue::Error(ErrKind::Div0)
+                } else {
+                    FValue::number(stats.sum / stats.count_num as f64)
+                }
+            }
+            4 => FValue::number(if stats.count_num == 0 { 0.0 } else { stats.min }),
+            5 => FValue::number(if stats.count_num == 0 { 0.0 } else { stats.max }),
+            _ => FValue::number(stats.sum),
+        })
+    }
+
+    #[inline]
+    fn empty_answer(function: u8) -> FValue {
+        match function {
+            2 | 3 => FValue::Error(ErrKind::Div0),
+            _ => FValue::number(0.0),
+        }
+    }
+}
+
+/// Group a repeated set of literal SUMIFS/COUNTIFS/AVERAGEIFS/MINIFS/MAXIFS ranges by equality criteria.
+/// Each function slot shares its group budget across recently used range sets.
 #[derive(Default)]
 pub(super) struct GroupedCriteria {
     entries: std::collections::VecDeque<GroupedRange>,
 }
 
 struct GroupedRange {
-    ranges: Vec<super::RangeKey>,
+    val_range: Option<super::RangeKey>,
+    cond_ranges: Vec<super::RangeKey>,
     numeric: Vec<bool>,
     attempted: bool,
-    groups: Option<std::collections::HashMap<Vec<GroupValue>, f64>>,
+    groups: Option<std::sync::Arc<BuiltGroups>>,
+}
+
+#[inline]
+pub(crate) fn range_cell_len(r: super::RangeKey) -> usize {
+    if r.3 < r.1 || r.4 < r.2 {
+        return 0;
+    }
+    ((r.3 - r.1 + 1) as usize).saturating_mul((r.4 - r.2 + 1) as usize)
 }
 
 impl GroupedCriteria {
@@ -325,39 +430,106 @@ impl GroupedCriteria {
     #[cfg(test)]
     pub(super) fn entries_len(&self) -> usize { self.entries.len() }
 
-    pub(super) fn lookup(&mut self, key: &super::CriteriaKey, args: &[Arg]) -> Option<FValue> {
-        let sum = key.function == 0;
-        let criteria = args.get(usize::from(sum)..)?;
-        if criteria.is_empty() || criteria.len() % 2 != 0 || criteria[0].slice().len() < 256 {
+    pub(super) fn lookup_lazy(
+        &mut self,
+        key: &super::CriteriaKey,
+        shared_get: &mut dyn FnMut(Option<super::RangeKey>, &[super::RangeKey], &[bool]) -> Option<std::sync::Arc<BuiltGroups>>,
+        shared_put: &mut dyn FnMut(Option<super::RangeKey>, Vec<super::RangeKey>, Vec<bool>, std::sync::Arc<BuiltGroups>),
+        load_col: &mut dyn FnMut(super::RangeKey) -> Option<std::sync::Arc<Vec<FValue>>>,
+    ) -> Option<FValue> {
+        let (val_range, cond_ranges) = key.split_ranges()?;
+        if cond_ranges.len() != key.criteria.len() {
             return None;
         }
-        let mut query = Vec::with_capacity(key.criteria.len());
+        let min_len = cond_ranges
+            .iter()
+            .copied()
+            .chain(val_range)
+            .map(range_cell_len)
+            .min()?;
+        if min_len < 256 {
+            return None;
+        }
+        let mut parsed = Vec::with_capacity(key.criteria.len());
         let mut numeric = Vec::with_capacity(key.criteria.len());
         for text in &key.criteria {
             let crit = Crit::parse(text);
-            if !crit.indexable() { return None; }
+            if !crit.indexable() {
+                return None;
+            }
+            if let Some(n) = crit.num && !n.is_finite() {
+                return None;
+            }
             numeric.push(crit.num.is_some());
-            query.push(match crit.num {
-                Some(n) => GroupValue::integer(n)?,
-                None => GroupValue::Text(crit.text),
-            });
+            parsed.push(crit);
         }
-        let Some(slot) = self.entries.iter().position(|e| e.ranges == key.ranges && e.numeric == numeric) else {
-            if self.entries.len() == 4 { self.entries.pop_front(); }
+        if let Some(shared) = shared_get(val_range, cond_ranges, &numeric) {
+            if !self.entries.iter().any(|e| e.val_range == val_range && e.cond_ranges == cond_ranges && e.numeric == numeric) {
+                if self.entries.len() == 4 {
+                    self.entries.pop_front();
+                }
+                self.entries.push_back(GroupedRange {
+                    val_range,
+                    cond_ranges: cond_ranges.to_vec(),
+                    numeric,
+                    attempted: true,
+                    groups: Some(shared.clone()),
+                });
+            }
+            return shared.answer(key.function, &parsed);
+        }
+        let Some(slot) = self.entries.iter().position(|e| {
+            e.val_range == val_range && e.cond_ranges == cond_ranges && e.numeric == numeric
+        }) else {
+            if self.entries.len() == 4 {
+                self.entries.pop_front();
+            }
             self.entries.push_back(GroupedRange {
-                ranges: key.ranges.clone(), numeric, groups: None, attempted: false,
+                val_range,
+                cond_ranges: cond_ranges.to_vec(),
+                numeric,
+                groups: None,
+                attempted: false,
             });
             return None;
         };
         let mut entry = self.entries.remove(slot)?;
         if !entry.attempted {
+            let mut cols_owned = Vec::with_capacity(cond_ranges.len());
+            for &rk in cond_ranges {
+                let Some(col) = load_col(rk) else {
+                    self.entries.push_back(entry);
+                    return None;
+                };
+                cols_owned.push(col);
+            }
+            let amounts_owned = match val_range {
+                Some(vr) => {
+                    let Some(col) = load_col(vr) else {
+                        self.entries.push_back(entry);
+                        return None;
+                    };
+                    Some(col)
+                }
+                None => None,
+            };
             entry.attempted = true;
-            let columns: Vec<_> = criteria.chunks_exact(2).map(|pair| pair[0].slice()).collect();
-            let amounts = sum.then(|| args[0].slice());
-            let used: usize = self.entries.iter().filter_map(|e| e.groups.as_ref()).map(|g| g.len()).sum();
-            entry.groups = entry.build_groups(&columns, amounts, 65_536 - used);
+            let col_slices: Vec<&[FValue]> = cols_owned.iter().map(|c| c.as_slice()).collect();
+            let used: usize = self
+                .entries
+                .iter()
+                .filter_map(|e| e.groups.as_ref())
+                .map(|g| g.map.len())
+                .sum();
+            let built = entry
+                .build_groups(&col_slices, amounts_owned.as_deref().map(Vec::as_slice), 65_536usize.saturating_sub(used))
+                .map(std::sync::Arc::new);
+            if let Some(ref g) = built {
+                shared_put(entry.val_range, entry.cond_ranges.clone(), entry.numeric.clone(), g.clone());
+            }
+            entry.groups = built;
         }
-        let result = entry.groups.as_ref().map(|g| FValue::number(g.get(&query).copied().unwrap_or(0.0)));
+        let result = entry.groups.as_ref().and_then(|g| g.answer(key.function, &parsed));
         self.entries.push_back(entry);
         result
     }
@@ -365,37 +537,113 @@ impl GroupedCriteria {
 
 impl GroupedRange {
     fn build_groups(
-        &self, columns: &[&[FValue]], amounts: Option<&[FValue]>, limit: usize,
-    ) -> Option<std::collections::HashMap<Vec<GroupValue>, f64>> {
-        let rows = columns.iter().map(|col| col.len()).min()?.min(amounts.map_or(usize::MAX, |v| v.len()));
-        let mut groups = std::collections::HashMap::new();
+        &self,
+        columns: &[&[FValue]],
+        amounts: Option<&[FValue]>,
+        limit: usize,
+    ) -> Option<BuiltGroups> {
+        let rows = columns
+            .iter()
+            .map(|col| col.len())
+            .min()?
+            .min(amounts.map_or(usize::MAX, |v| v.len()));
+        let mut distinct_nums: Vec<Option<Vec<f64>>> = Vec::with_capacity(columns.len());
+        for (col, &is_num) in columns.iter().zip(&self.numeric) {
+            if !is_num {
+                distinct_nums.push(None);
+                continue;
+            }
+            let mut any_fract = false;
+            for v in &col[..rows] {
+                if let Ok(n) = v.to_number() {
+                    if !n.is_finite() {
+                        return None;
+                    }
+                    if n.fract() != 0.0 {
+                        any_fract = true;
+                    }
+                }
+            }
+            if !any_fract {
+                distinct_nums.push(None);
+            } else {
+                let mut vals = Vec::new();
+                for v in &col[..rows] {
+                    if let Ok(n) = v.to_number() {
+                        vals.push(if n == 0.0 { 0.0 } else { n });
+                    }
+                }
+                vals.sort_unstable_by(f64::total_cmp);
+                vals.dedup_by(|a, b| a.to_bits() == b.to_bits());
+                if vals.windows(2).any(|w| w[1] - w[0] <= 2.0 * f64::EPSILON) {
+                    return None;
+                }
+                distinct_nums.push(Some(vals));
+            }
+        }
+
+        let mut map: std::collections::HashMap<Vec<GroupValue>, GroupStats> = std::collections::HashMap::new();
         let mut key = Vec::with_capacity(columns.len());
         'row: for row in 0..rows {
             key.clear();
-            for (col, &numeric) in columns.iter().zip(&self.numeric) {
+            for (j, (col, &numeric)) in columns.iter().zip(&self.numeric).enumerate() {
                 let value = &col[row];
                 key.push(if numeric {
                     let Ok(n) = value.to_number() else { continue 'row };
-                    GroupValue::integer(n)?
+                    let canonical = if let Some(ref vals) = distinct_nums[j] {
+                        let c = if n == 0.0 { 0.0 } else { n };
+                        let idx = vals.binary_search_by(|x| x.total_cmp(&c)).ok()?;
+                        vals[idx]
+                    } else {
+                        n
+                    };
+                    GroupValue::Number(GroupValue::canonical_bits(canonical))
                 } else {
-                    let text = match value {
-                        FValue::Text(s) => s.to_lowercase(),
-                        FValue::Empty => String::new(),
-                        FValue::Bool(b) => b.to_string(),
-                        other => other.display().to_lowercase(),
+                    let text: std::sync::Arc<str> = match value {
+                        FValue::Text(s) => super::lookup_cache::lowercase_arc(s),
+                        FValue::Empty => "".into(),
+                        FValue::Bool(true) => "true".into(),
+                        FValue::Bool(false) => "false".into(),
+                        other => other.display().to_lowercase().into(),
                     };
                     GroupValue::Text(text)
                 });
             }
-            let add = amounts.map_or(1.0, |values| values[row].to_number().unwrap_or(0.0));
-            if let Some(total) = groups.get_mut(&key) {
-                *total += add;
+            let (add_sum, add_min, add_max, add_cnt) = match amounts {
+                None => (1.0, 1.0, 1.0, 1u32),
+                Some(values) => match values[row].to_number() {
+                    Ok(n) => (n, n, n, 1u32),
+                    Err(_) => (0.0, f64::INFINITY, f64::NEG_INFINITY, 0u32),
+                },
+            };
+            if let Some(stats) = map.get_mut(&key) {
+                stats.sum += add_sum;
+                if add_cnt > 0 {
+                    if stats.count_num == 0 {
+                        stats.min = add_min;
+                        stats.max = add_max;
+                    } else {
+                        stats.min = stats.min.min(add_min);
+                        stats.max = stats.max.max(add_max);
+                    }
+                    stats.count_num += add_cnt;
+                }
             } else {
-                if groups.len() >= limit { return None; }
-                groups.insert(std::mem::take(&mut key), add);
+                if map.len() >= limit {
+                    return None;
+                }
+                map.insert(
+                    std::mem::take(&mut key),
+                    GroupStats {
+                        sum: add_sum,
+                        min: if add_cnt > 0 { add_min } else { f64::INFINITY },
+                        max: if add_cnt > 0 { add_max } else { f64::NEG_INFINITY },
+                        count_num: add_cnt,
+                    },
+                );
             }
         }
-        Some(groups)
+        Some(BuiltGroups { distinct_nums, map })
     }
 }
 
@@ -409,7 +657,7 @@ pub(super) struct CountIndex {
 #[test]
 fn count_index_agrees_with_single_criterion_scan() {
     let data = vec![
-        FValue::Empty, FValue::Text(String::new()), FValue::Number(0.0), FValue::Number(-0.0),
+        FValue::Empty, FValue::Text("".into()), FValue::Number(0.0), FValue::Number(-0.0),
         FValue::Number(f64::EPSILON), FValue::Number(-f64::EPSILON), FValue::Number(1.5),
         FValue::Text(" 1.50 ".into()), FValue::Text("HELLO".into()), FValue::Text("Ä".into()),
         FValue::Text("ä".into()), FValue::Bool(true), FValue::Text("true".into()), FValue::Error(ErrKind::Value),
@@ -435,7 +683,7 @@ impl CountIndex {
                     if let Ok(n) = s.trim().parse::<f64>() {
                         if n.is_finite() { index.numbers.push((n, row)); }
                     }
-                    if s.is_ascii() { s.to_ascii_lowercase() } else { s.clone() }
+                    if s.is_ascii() { s.to_ascii_lowercase() } else { s.to_string() }
                 }
                 FValue::Bool(b) => b.to_string(),
                 FValue::Empty => String::new(),
@@ -540,22 +788,15 @@ impl Crit {
             op,
             num,
             text: rest.to_lowercase(),
-            wild: rest.contains('*') || rest.contains('?'),
+            wild: is_wildcard(rest),
         }
     }
 
     pub(crate) fn matches(&self, v: &FValue) -> bool {
-        // 条件匹配里的空白有自己的规则（Excel 16.0 实测）：
-        //   COUNTIF(空单元格,0)=0、(">0")=0、(">=0")=0 —— 数字条件默认跳过空白；
-        //   COUNTIF(空单元格,"<>0")=1 —— 只有「不等于某值」把空白算进来；
-        //   COUNTIF(空单元格,"")=1、("<>")=0。
-        // 这跟比较运算 =A1=0 为 TRUE 是两套上下文，不能共用一套强制转换。
         if matches!(v, FValue::Empty) && self.num.is_some() {
             return self.op == "<>";
         }
         if let Some(t) = self.num {
-            // Excel 16.0 实测：COUNTIF(range,">0") 只数真正的数字（文本 "5"、TRUE 都不算）；
-            // COUNTIF(range,5) 同时数数字 5 和文本 "5"；"<>x" 把非数字、布尔、错误都算进来。
             let n = match v {
                 FValue::Number(n) => *n,
                 FValue::Text(s) if self.op == "=" || self.op == "<>" => match s.trim().parse::<f64>() {
@@ -576,11 +817,11 @@ impl Crit {
         let eq = match v {
             FValue::Text(s) => {
                 if self.wild {
-                    wildcard_ci(s, &self.text)
+                    wildcard_match_ci(&self.text, s)
                 } else if self.text.is_ascii() {
                     s.eq_ignore_ascii_case(&self.text)
                 } else {
-                    s == &self.text
+                    s.as_ref() == self.text
                 }
             }
             FValue::Empty => self.text.is_empty(),
@@ -602,6 +843,7 @@ impl Crit {
             _ => eq,
         }
     }
+
     /// Legacy multi-condition functions coerce numeric text, blanks and booleans through
     /// to_number. Retain those rules when sharing the compiled criterion.
     pub(super) fn matches_coerced(&self, v: &FValue) -> bool {
@@ -615,7 +857,7 @@ impl Crit {
         }
         let display;
         let text = match v {
-            FValue::Text(s) => s.as_str(), FValue::Empty => "",
+            FValue::Text(s) => s.as_ref(), FValue::Empty => "",
             FValue::Bool(true) => "true", FValue::Bool(false) => "false",
             _ => { display = v.display(); &display }
         };
@@ -624,11 +866,7 @@ impl Crit {
 
     pub(super) fn matches_coerced_text(&self, text: &str) -> bool {
         if self.wild && matches!(self.op, "=" | "<>") {
-            let matched = if text.contains('Σ') {
-                wildcard_ci(&text.to_lowercase(), &self.text)
-            } else {
-                wildcard_ci(text, &self.text)
-            };
+            let matched = wildcard_match_ci(&self.text, text);
             return matched == (self.op == "=");
         }
         let order = super::value::compare_text(text, &self.text);
@@ -637,27 +875,144 @@ impl Crit {
             ">=" => !order.is_lt(), "<=" => !order.is_gt(), _ => order.is_eq(),
         }
     }
-
 }
 
-/// 大小写不敏感的通配符匹配，不分配字符串
-fn wildcard_ci(s: &str, pat: &str) -> bool {
-    let mut text = s.chars().flat_map(char::to_lowercase);
-    let mut pattern = pat.chars();
-    let mut star = None;
-    loop {
-        let next = text.clone().next();
-        match pattern.next() {
-            Some('*') => { star = Some((text.clone(), pattern.clone())); }
-            Some(c) if next.is_some_and(|ch| c == '?' || ch == c) => { text.next(); }
-            None if next.is_none() => return true,
-            _ => {
-                let Some((retry_text, retry_pattern)) = star.as_mut() else { return false };
-                if retry_text.next().is_none() { return false; }
-                text = retry_text.clone();
-                pattern = retry_pattern.clone();
+/// 统一零分配、线性双指针大小写不敏感通配符匹配：支持 `*`、`?` 与 `~` 转义，
+/// 无 `Vec<char>` 堆分配，无多重 `*` 指数级回溯，且保持希腊词尾 `Σ -> ς` 上下文语义。
+pub(crate) fn wildcard_match_ci(pat: &str, s: &str) -> bool {
+    if s.is_ascii() && pat.is_ascii() {
+        return wildcard_ascii_ci(s.as_bytes(), pat.as_bytes());
+    }
+    if s.contains('Σ') || pat.contains('Σ') {
+        let s_low = s.to_lowercase();
+        let p_low = pat.to_lowercase();
+        return wildcard_unicode_ci(&s_low, &p_low);
+    }
+    wildcard_unicode_ci(s, pat)
+}
+
+fn wildcard_ascii_ci(text: &[u8], pat: &[u8]) -> bool {
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti: usize = 0;
+    while ti < text.len() {
+        if pi < pat.len() {
+            match pat[pi] {
+                b'*' => {
+                    while pi < pat.len() && pat[pi] == b'*' {
+                        pi += 1;
+                    }
+                    if pi == pat.len() {
+                        return true;
+                    }
+                    star_pi = Some(pi);
+                    star_ti = ti;
+                    continue;
+                }
+                b'?' => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                b'~' => {
+                    let lit = if pi + 1 < pat.len() {
+                        pi += 2;
+                        pat[pi - 1]
+                    } else {
+                        pi += 1;
+                        b'~'
+                    };
+                    if text[ti].eq_ignore_ascii_case(&lit) {
+                        ti += 1;
+                        continue;
+                    }
+                }
+                c if text[ti].eq_ignore_ascii_case(&c) => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                _ => {}
             }
         }
+        if let Some(sp) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = sp;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+fn wildcard_unicode_ci(text: &str, pat: &str) -> bool {
+    let lower_fn: fn(char) -> std::char::ToLowercase = char::to_lowercase;
+    let mut t_it = text.chars().flat_map(lower_fn);
+    let mut p_it = pat.chars().flat_map(lower_fn);
+    let mut star: Option<(
+        std::iter::FlatMap<std::str::Chars<'_>, std::char::ToLowercase, fn(char) -> std::char::ToLowercase>,
+        std::iter::FlatMap<std::str::Chars<'_>, std::char::ToLowercase, fn(char) -> std::char::ToLowercase>,
+    )> = None;
+    loop {
+        let mut p_peek = p_it.clone();
+        match p_peek.next() {
+            Some('*') => {
+                p_it = p_peek;
+                loop {
+                    let mut next_p = p_it.clone();
+                    if next_p.next() == Some('*') {
+                        p_it = next_p;
+                    } else {
+                        break;
+                    }
+                }
+                if p_it.clone().next().is_none() {
+                    return true;
+                }
+                star = Some((t_it.clone(), p_it.clone()));
+                continue;
+            }
+            Some('?') => {
+                if t_it.next().is_some() {
+                    p_it = p_peek;
+                    continue;
+                }
+            }
+            Some('~') => {
+                let lit = p_peek.next().unwrap_or('~');
+                let mut t_peek = t_it.clone();
+                if t_peek.next() == Some(lit) {
+                    t_it = t_peek;
+                    p_it = p_peek;
+                    continue;
+                }
+            }
+            Some(pc) => {
+                let mut t_peek = t_it.clone();
+                if t_peek.next() == Some(pc) {
+                    t_it = t_peek;
+                    p_it = p_peek;
+                    continue;
+                }
+            }
+            None => {
+                if t_it.clone().next().is_none() {
+                    return true;
+                }
+            }
+        }
+        let Some((retry_t, retry_p)) = star.as_mut() else {
+            return false;
+        };
+        if retry_t.next().is_none() {
+            return false;
+        }
+        t_it = retry_t.clone();
+        p_it = retry_p.clone();
     }
 }
 
@@ -753,6 +1108,128 @@ fn approximate_match(data: &[FValue], len: usize, stride: usize, needle: &FValue
     search_sorted(data, len, stride, positions.as_deref(), needle, ascending)
 }
 
+pub(super) fn xlookup_search(
+    data: &[FValue],
+    len: usize,
+    stride: usize,
+    positions: Option<&[usize]>,
+    needle: &FValue,
+    match_mode: i64,
+    search_mode: i64,
+) -> Result<Option<usize>, ErrKind> {
+    use std::cmp::Ordering;
+    if !matches!(match_mode, -1..=2) || !matches!(search_mode, -2 | -1 | 1 | 2) {
+        return Err(ErrKind::Value);
+    }
+    if match_mode == 2 && search_mode.abs() == 2 {
+        return Err(ErrKind::Value);
+    }
+    if search_mode.abs() == 2 {
+        let ascending = search_mode == 2;
+        let Some(kind) = LookupKind::of(needle) else {
+            return Ok(None);
+        };
+        let owned_pos;
+        let pos = match positions {
+            Some(p) => Some(p),
+            None => {
+                owned_pos = kind.positions(data, len, stride);
+                owned_pos.as_deref()
+            }
+        };
+        let needle_cmp = if matches!(needle, FValue::Empty) {
+            &FValue::Number(0.0)
+        } else {
+            needle
+        };
+        let index = |i: usize| pos.map_or(i, |p| p[i]);
+        let count = pos.map_or(len, |p| p.len());
+        if count == 0 {
+            return Ok(None);
+        }
+        let (mut lo, mut hi) = (0usize, count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let Ok(ord) = data[index(mid) * stride].compare(needle_cmp) else {
+                return Ok(None);
+            };
+            let go_right = if ascending { ord.is_lt() } else { ord.is_gt() };
+            if go_right {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < count && matches!(data[index(lo) * stride].compare(needle_cmp), Ok(Ordering::Equal)) {
+            return Ok(Some(index(lo)));
+        }
+        return Ok(match (match_mode, ascending) {
+            (0, _) => None,
+            (-1, true) => lo.checked_sub(1).map(index),
+            (1, true) => (lo < count).then(|| index(lo)),
+            (-1, false) => (lo < count).then(|| index(lo)),
+            (1, false) => lo.checked_sub(1).map(index),
+            _ => None,
+        });
+    }
+
+    let forward = search_mode >= 0;
+    let needle_kind = LookupKind::of(needle);
+    let mut best: Option<(usize, &FValue)> = None;
+    for step in 0..len {
+        let i = if forward { step } else { len - 1 - step };
+        let Some(cell) = data.get(i * stride) else { continue };
+        if match_mode == 2 {
+            let hit = match (cell, needle) {
+                (FValue::Text(a), FValue::Text(b)) => wildcard_match_ci(b, a),
+                (FValue::Empty, FValue::Empty) => true,
+                (FValue::Empty, _) | (_, FValue::Empty) => false,
+                _ => matches!(cell.compare(needle), Ok(Ordering::Equal)),
+            };
+            if hit {
+                return Ok(Some(i));
+            }
+            continue;
+        }
+        if matches!(cell, FValue::Empty) != matches!(needle, FValue::Empty) {
+            continue;
+        }
+        if match_mode == 0 {
+            if matches!(cell.compare(needle), Ok(Ordering::Equal)) {
+                return Ok(Some(i));
+            }
+            continue;
+        }
+        if !matches!(needle, FValue::Empty) && LookupKind::of(cell) != needle_kind {
+            continue;
+        }
+        let Ok(ord) = cell.compare(needle) else { continue };
+        match ord {
+            Ordering::Equal => return Ok(Some(i)),
+            Ordering::Less if match_mode == -1 => {
+                let replace = match best {
+                    None => true,
+                    Some((_, prev)) => matches!(cell.compare(prev), Ok(Ordering::Greater)),
+                };
+                if replace {
+                    best = Some((i, cell));
+                }
+            }
+            Ordering::Greater if match_mode == 1 => {
+                let replace = match best {
+                    None => true,
+                    Some((_, prev)) => matches!(cell.compare(prev), Ok(Ordering::Less)),
+                };
+                if replace {
+                    best = Some((i, cell));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(best.map(|(i, _)| i))
+}
+
 pub(crate) fn range_get(a: &Arg, r: usize, c: usize) -> FValue {
     match a {
         Arg::Range { values, rows, cols } => {
@@ -802,10 +1279,24 @@ fn round_sig15(x: f64) -> f64 {
 }
 
 pub fn call(name: &str, args: &[Arg]) -> FValue {
-    call_or_else(name, args, &mut || FValue::Error(ErrKind::Name))
+    call_in(EvalCtx::from_ambient(), name, args)
 }
 
+pub(crate) fn call_in(ctx: EvalCtx, name: &str, args: &[Arg]) -> FValue {
+    call_or_else_in(ctx, name, args, &mut || FValue::Error(ErrKind::Name))
+}
+
+#[allow(dead_code)]
 pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -> FValue) -> FValue {
+    call_or_else_in(EvalCtx::from_ambient(), name, args, unknown)
+}
+
+pub(super) fn call_or_else_in(
+    ctx: EvalCtx,
+    name: &str,
+    args: &[Arg],
+    unknown: &mut dyn FnMut() -> FValue,
+) -> FValue {
     match name {
         // ---------------- 数学 / 三角
         "SUM" => r(|| {
@@ -1035,8 +1526,30 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
                     return Err(ErrKind::Value);
                 }
             }
+            let total = rows * cols;
+            if grids.len() == 2 && grids[0].0 == rows && grids[0].1 == cols && grids[1].0 == rows && grids[1].1 == cols {
+                let a = &grids[0].2[..total];
+                let b = &grids[1].2[..total];
+                let mut sum = 0.0;
+                for i in 0..total {
+                    sum += a[i].to_number().unwrap_or(0.0) * b[i].to_number().unwrap_or(0.0);
+                }
+                return Ok(FValue::number(sum));
+            }
+            if grids.len() == 3 && grids.iter().all(|(r, c, _)| *r == rows && *c == cols) {
+                let a = &grids[0].2[..total];
+                let b = &grids[1].2[..total];
+                let c = &grids[2].2[..total];
+                let mut sum = 0.0;
+                for i in 0..total {
+                    sum += a[i].to_number().unwrap_or(0.0)
+                        * b[i].to_number().unwrap_or(0.0)
+                        * c[i].to_number().unwrap_or(0.0);
+                }
+                return Ok(FValue::number(sum));
+            }
             let mut sum = 0.0;
-            for i in 0..rows * cols {
+            for i in 0..total {
                 let mut p = 1.0;
                 for (r, c, data) in &grids {
                     let idx = if *r == 1 && *c == 1 { 0 } else { i };
@@ -1087,17 +1600,17 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
             let base = f % 100;
             let sub = &args[1.min(args.len())..];
             Ok(match base {
-                1 => call("AVERAGE", sub),
-                2 => call("COUNT", sub),
-                3 => call("COUNTA", sub),
-                4 => call("MAX", sub),
-                5 => call("MIN", sub),
-                6 => call("PRODUCT", sub),
-                9 => call("SUM", sub),
-                7 => call("STDEV", sub),
-                8 => call("STDEVP", sub),
-                10 => call("VAR", sub),
-                11 => call("VARP", sub),
+                1 => call_in(ctx, "AVERAGE", sub),
+                2 => call_in(ctx, "COUNT", sub),
+                3 => call_in(ctx, "COUNTA", sub),
+                4 => call_in(ctx, "MAX", sub),
+                5 => call_in(ctx, "MIN", sub),
+                6 => call_in(ctx, "PRODUCT", sub),
+                9 => call_in(ctx, "SUM", sub),
+                7 => call_in(ctx, "STDEV", sub),
+                8 => call_in(ctx, "STDEVP", sub),
+                10 => call_in(ctx, "VAR", sub),
+                11 => call_in(ctx, "VARP", sub),
                 _ => FValue::Error(ErrKind::Value),
             })
         }),
@@ -1444,23 +1957,23 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
         "LEFT" => r(|| {
             let s = text(args, 0)?;
             let n = opt_num(args, 1, 1.0)?.max(0.0) as usize;
-            Ok(FValue::Text(s.chars().take(n).collect()))
+            Ok(FValue::Text(s.chars().take(n).collect::<String>().into()))
         }),
         "RIGHT" => r(|| {
             let s = text(args, 0)?;
             let n = opt_num(args, 1, 1.0)?.max(0.0) as usize;
             let len = s.chars().count();
             let skip = len.saturating_sub(n);
-            Ok(FValue::Text(s.chars().skip(skip).collect()))
+            Ok(FValue::Text(s.chars().skip(skip).collect::<String>().into()))
         }),
         "MID" => r(|| {
             let s = text(args, 0)?;
             let start = num(args, 1)?.max(1.0) as usize;
             let n = num(args, 2)?.max(0.0) as usize;
-            Ok(FValue::Text(s.chars().skip(start - 1).take(n).collect()))
+            Ok(FValue::Text(s.chars().skip(start - 1).take(n).collect::<String>().into()))
         }),
-        "LOWER" => r(|| Ok(FValue::Text(text(args, 0)?.to_lowercase()))),
-        "UPPER" => r(|| Ok(FValue::Text(text(args, 0)?.to_uppercase()))),
+        "LOWER" => r(|| Ok(FValue::Text(text(args, 0)?.to_lowercase().into()))),
+        "UPPER" => r(|| Ok(FValue::Text(text(args, 0)?.to_uppercase().into()))),
         "PROPER" => r(|| {
             let s = text(args, 0)?;
             let mut out = String::new();
@@ -1478,28 +1991,28 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
                     cap = true;
                 }
             }
-            Ok(FValue::Text(out.as_str().into()))
+            Ok(FValue::Text(out.into()))
         }),
         "TRIM" => r(|| {
             let s = text(args, 0)?;
             let parts: Vec<&str> = s.split_whitespace().collect();
-            Ok(FValue::Text(parts.join(" ")))
+            Ok(FValue::Text(parts.join(" ").into()))
         }),
         "CONCAT" | "CONCATENATE" => r(|| {
             let mut out = String::new();
             for a in args {
-                for v in a.values() {
+                for v in a.slice() {
                     out.push_str(&v.display());
                 }
             }
-            Ok(FValue::Text(out.as_str().into()))
+            Ok(FValue::Text(out.into()))
         }),
         "TEXTJOIN" => r(|| {
             let sep = text(args, 0)?;
             let ignore_empty = arg(args, 1).to_bool()?;
             let mut parts = Vec::new();
             for a in args.iter().skip(2) {
-                for v in a.values() {
+                for v in a.slice() {
                     let s = v.display();
                     if ignore_empty && s.is_empty() {
                         continue;
@@ -1507,7 +2020,7 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
                     parts.push(s);
                 }
             }
-            Ok(FValue::Text(parts.join(&sep)))
+            Ok(FValue::Text(parts.join(&sep).into()))
         }),
         "REPT" => r(|| {
             let s = text(args, 0)?;
@@ -1515,17 +2028,17 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
             if s.len() * n > 32_767 {
                 return Err(ErrKind::Value);
             }
-            Ok(FValue::Text(s.repeat(n)))
+            Ok(FValue::Text(s.repeat(n).into()))
         }),
         "SUBSTITUTE" => r(|| {
             let s = text(args, 0)?;
             let old = text(args, 1)?;
             let new = text(args, 2)?;
             if old.is_empty() {
-                return Ok(FValue::Text(s));
+                return Ok(FValue::Text(s.into()));
             }
             match args.get(3) {
-                None => Ok(FValue::Text(s.replace(&old, &new))),
+                None => Ok(FValue::Text(s.replace(&old, &new).into())),
                 Some(_) => {
                     let nth = num(args, 3)?.max(1.0) as usize;
                     let mut count = 0;
@@ -1538,13 +2051,13 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
                             out.push_str(&new);
                             rest = &rest[pos + old.len()..];
                             out.push_str(rest);
-                            return Ok(FValue::Text(out.as_str().into()));
+                            return Ok(FValue::Text(out.into()));
                         }
                         out.push_str(&old);
                         rest = &rest[pos + old.len()..];
                     }
                     out.push_str(rest);
-                    Ok(FValue::Text(out.as_str().into()))
+                    Ok(FValue::Text(out.into()))
                 }
             }
         }),
@@ -1557,7 +2070,7 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
             let mut out: String = chars.iter().take(start - 1).collect();
             out.push_str(&new);
             out.extend(chars.iter().skip((start - 1 + count).min(chars.len())));
-            Ok(FValue::Text(out.as_str().into()))
+            Ok(FValue::Text(out.into()))
         }),
         "FIND" | "SEARCH" => r(|| {
             let needle = text(args, 0)?;
@@ -1586,7 +2099,7 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
             if !(1..=255).contains(&n) {
                 return Err(ErrKind::Value);
             }
-            Ok(FValue::Text(((n as u8) as char).to_string()))
+            Ok(FValue::Text(((n as u8) as char).to_string().into()))
         }),
         "CODE" => r(|| {
             let s = text(args, 0)?;
@@ -1610,11 +2123,11 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
         "TEXT" => r(|| {
             let v = arg(args, 0);
             let fmt = text(args, 1)?;
-            Ok(FValue::Text(format_value(&v, &fmt)))
+            Ok(FValue::Text(format_value_in(ctx.date_system, &v, &fmt).into()))
         }),
         "T" => r(|| match arg(args, 0) {
             FValue::Text(s) => Ok(FValue::Text(s)),
-            _ => Ok(FValue::Text(String::new())),
+            _ => Ok(FValue::Text("".into())),
         }),
 
         // ---------------- 逻辑
@@ -1624,7 +2137,7 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
         "AND" => r(|| {
             let mut any = false;
             for a in args {
-                for v in a.values() {
+                for v in a.slice() {
                     if matches!(v, FValue::Empty) {
                         continue;
                     }
@@ -1642,7 +2155,7 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
         "OR" => r(|| {
             let mut any = false;
             for a in args {
-                for v in a.values() {
+                for v in a.slice() {
                     if matches!(v, FValue::Empty) {
                         continue;
                     }
@@ -1660,7 +2173,7 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
         "XOR" => r(|| {
             let mut t = false;
             for a in args {
-                for v in a.values() {
+                for v in a.slice() {
                     if matches!(v, FValue::Empty) {
                         continue;
                     }
@@ -1794,38 +2307,28 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
             let lookup = args.get(1).ok_or(ErrKind::Value)?;
             let match_type = opt_num(args, 2, if name == "MATCH" { 1.0 } else { 0.0 })?;
             let vals = lookup.slice();
-            if match_type == 0.0 {
-                for (i, v) in vals.iter().enumerate() {
-                    let hit = match (v, &needle) {
-                        (FValue::Text(a), FValue::Text(b)) if is_wildcard(b) => {
-                            wildcard_match_ci(b, a)
-                        }
-                        _ => matches!(v.compare(&needle), Ok(std::cmp::Ordering::Equal)),
-                    };
-                    if hit {
-                        return Ok(FValue::number((i + 1) as f64));
-                    }
-                }
-                return Err(ErrKind::Na);
-            }
             if name == "MATCH" {
-                return approximate_match(vals, vals.len(), 1, &needle, match_type > 0.0)
-                    .map(|i| FValue::number((i + 1) as f64)).ok_or(ErrKind::Na);
-            }
-            let mut last: Option<usize> = None;
-            for (i, v) in vals.iter().enumerate() {
-                if let Ok(o) = v.compare(&needle) {
-                    if match_type > 0.0 && o != std::cmp::Ordering::Greater {
-                        last = Some(i);
-                    } else if match_type < 0.0 && o != std::cmp::Ordering::Less {
-                        last = Some(i);
+                if match_type == 0.0 {
+                    for (i, v) in vals.iter().enumerate() {
+                        let hit = match (v, &needle) {
+                            (FValue::Text(a), FValue::Text(b)) if is_wildcard(b) => {
+                                wildcard_match_ci(b, a)
+                            }
+                            _ => matches!(v.compare(&needle), Ok(std::cmp::Ordering::Equal)),
+                        };
+                        if hit {
+                            return Ok(FValue::number((i + 1) as f64));
+                        }
                     }
+                    return Err(ErrKind::Na);
                 }
+                return approximate_match(vals, vals.len(), 1, &needle, match_type > 0.0)
+                    .map(|i| FValue::number((i + 1) as f64))
+                    .ok_or(ErrKind::Na);
             }
-            match last {
-                Some(i) => Ok(FValue::number((i + 1) as f64)),
-                None => Err(ErrKind::Na),
-            }
+            let search_mode = opt_num(args, 3, 1.0)?.trunc() as i64;
+            let hit = xlookup_search(vals, vals.len(), 1, None, &needle, match_type.trunc() as i64, search_mode)?;
+            hit.map(|i| FValue::number((i + 1) as f64)).ok_or(ErrKind::Na)
         }),
         "XLOOKUP" => r(|| {
             let needle = arg(args, 0);
@@ -1834,26 +2337,28 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
             }
             let lookup = args.get(1).ok_or(ErrKind::Value)?;
             let ret = args.get(2).ok_or(ErrKind::Value)?;
-            let vals = lookup.values();
+            let vals = lookup.slice();
+            let (l_rows, l_cols) = range_dims(lookup);
             let (rows, cols) = range_dims(ret);
-            let vertical = rows >= cols;
-            // 第 5 参数 match_mode：0 精确、2 通配符、-1/1 近似（近似未实现，按精确处理）
-            let match_mode = if args.len() > 4 { opt_num(args, 4, 0.0)? } else { 0.0 };
-            for (i, v) in vals.iter().enumerate() {
-                let hit = match (v, &needle) {
-                    (FValue::Text(a), FValue::Text(b))
-                        if match_mode == 2.0 && is_wildcard(b) =>
-                    {
-                        wildcard_match_ci(b, a)
+            let vertical = !(l_rows == 1 && l_cols > 1);
+            let match_mode = opt_num(args, 4, 0.0)?.trunc() as i64;
+            let search_mode = opt_num(args, 5, 1.0)?.trunc() as i64;
+            if let Some(i) = xlookup_search(vals, vals.len(), 1, None, &needle, match_mode, search_mode)? {
+                return Ok(if vertical {
+                    if cols <= 1 {
+                        range_get(ret, i, 0)
+                    } else {
+                        let row_data = (0..cols).map(|c| range_get(ret, i, c)).collect();
+                        FValue::Array(std::sync::Arc::new(super::value::Array::new(1, cols, row_data)))
                     }
-                    _ => matches!(v.compare(&needle), Ok(std::cmp::Ordering::Equal)),
-                };
-                if hit {
-                    return Ok(if vertical { range_get(ret, i, 0) } else { range_get(ret, 0, i) });
-                }
+                } else if rows <= 1 {
+                    range_get(ret, 0, i)
+                } else {
+                    let col_data = (0..rows).map(|r| range_get(ret, r, i)).collect();
+                    FValue::Array(std::sync::Arc::new(super::value::Array::new(rows, 1, col_data)))
+                });
             }
-            if let Some(4) = Some(args.len()).filter(|_| args.len() > 3) {
-                let _ = 4;
+            if args.len() > 3 {
                 let fallback = arg(args, 3);
                 if !matches!(fallback, FValue::Empty) {
                     return Ok(fallback);
@@ -1863,24 +2368,68 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
         }),
         "INDEX" => r(|| {
             let area = args.first().ok_or(ErrKind::Value)?;
-            let row = num(args, 1)?.max(0.0) as usize;
-            let col = if args.len() > 2 { num(args, 2)?.max(0.0) as usize } else { 0 };
+            let row_raw = num(args, 1)?;
+            if row_raw < 0.0 {
+                return Err(ErrKind::Value);
+            }
+            let row = row_raw.trunc() as usize;
             let (rows, cols) = range_dims(area);
-            if row == 0 && col > 0 && col <= cols {
-                return Ok(if rows == 1 { range_get(area, 0, col - 1) } else { range_get(area, 0, col - 1) });
+            let has_col = args.len() > 2;
+            let col = if has_col {
+                let col_raw = num(args, 2)?;
+                if col_raw < 0.0 {
+                    return Err(ErrKind::Value);
+                }
+                col_raw.trunc() as usize
+            } else {
+                0
+            };
+            if !has_col && rows == 1 && cols > 1 {
+                if row == 0 {
+                    let data = (0..cols).map(|c| range_get(area, 0, c)).collect();
+                    return Ok(FValue::Array(std::sync::Arc::new(super::value::Array::new(1, cols, data))));
+                }
+                return Ok(range_get(area, 0, row - 1));
             }
-            if col == 0 {
-                return Ok(range_get(area, row.saturating_sub(1), 0));
+            if row == 0 {
+                let target_c = if has_col {
+                    if col == 0 {
+                        let data = area.slice().to_vec();
+                        return Ok(FValue::Array(std::sync::Arc::new(super::value::Array::new(rows, cols, data))));
+                    }
+                    if col > cols {
+                        return Err(ErrKind::Ref);
+                    }
+                    col - 1
+                } else {
+                    0
+                };
+                if rows <= 1 {
+                    return Ok(range_get(area, 0, target_c));
+                }
+                let col_data = (0..rows).map(|r| range_get(area, r, target_c)).collect();
+                return Ok(FValue::Array(std::sync::Arc::new(super::value::Array::new(rows, 1, col_data))));
             }
-            Ok(range_get(area, row.saturating_sub(1), col.saturating_sub(1)))
+            if has_col && col == 0 {
+                if row > rows {
+                    return Err(ErrKind::Ref);
+                }
+                if cols <= 1 {
+                    return Ok(range_get(area, row - 1, 0));
+                }
+                let row_data = (0..cols).map(|c| range_get(area, row - 1, c)).collect();
+                return Ok(FValue::Array(std::sync::Arc::new(super::value::Array::new(1, cols, row_data))));
+            }
+            let target_c = if has_col { col - 1 } else { 0 };
+            Ok(range_get(area, row - 1, target_c))
         }),
         "LOOKUP" => r(|| {
             let needle = arg(args, 0);
-            let lookup_vals = args.get(1).ok_or(ErrKind::Value)?.values();
+            let lookup_vals = args.get(1).ok_or(ErrKind::Value)?.slice();
             let result_vals = args
                 .get(2)
-                .map(|a| a.values())
-                .unwrap_or_else(|| lookup_vals.clone());
+                .map(|a| a.slice())
+                .unwrap_or(lookup_vals);
             let mut last: Option<usize> = None;
             for (i, v) in lookup_vals.iter().enumerate() {
                 if let Ok(o) = v.compare(&needle) {
@@ -1896,8 +2445,8 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
         }),
 
         // ---------------- 日期时间
-        "TODAY" => FValue::number(now_serial().floor()),
-        "NOW" => FValue::number(now_serial()),
+        "TODAY" => FValue::number(ctx.now_serial().floor()),
+        "NOW" => FValue::number(ctx.now_serial()),
         "DATE" => r(|| {
             let y = int_arg(args, 0)? as i32;
             let m = int_arg(args, 1)? as i32;
@@ -1905,7 +2454,7 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
             // 允许月份、日期溢出（Excel 行为）
             let (y2, m2) = (y + (m - 1).div_euclid(12), (m - 1).rem_euclid(12) + 1);
             let m2 = m2 as u32;
-            let base = date_to_serial(y2, m2, 1).ok_or(ErrKind::Num)?;
+            let base = date_to_serial_in(ctx.date_system, y2, m2, 1).ok_or(ErrKind::Num)?;
             Ok(FValue::number(base + d as f64 - 1.0))
         }),
         "TIME" => r(|| {
@@ -1917,15 +2466,15 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
             ))
         }),
         "YEAR" => r(|| {
-            let (y, _, _) = serial_to_date(num(args, 0)?).ok_or(ErrKind::Num)?;
+            let (y, _, _) = serial_to_date_in(ctx.date_system, num(args, 0)?).ok_or(ErrKind::Num)?;
             Ok(FValue::number(y as f64))
         }),
         "MONTH" => r(|| {
-            let (_, m, _) = serial_to_date(num(args, 0)?).ok_or(ErrKind::Num)?;
+            let (_, m, _) = serial_to_date_in(ctx.date_system, num(args, 0)?).ok_or(ErrKind::Num)?;
             Ok(FValue::number(m as f64))
         }),
         "DAY" => r(|| {
-            let (_, _, d) = serial_to_date(num(args, 0)?).ok_or(ErrKind::Num)?;
+            let (_, _, d) = serial_to_date_in(ctx.date_system, num(args, 0)?).ok_or(ErrKind::Num)?;
             Ok(FValue::number(d as f64))
         }),
         "HOUR" => r(|| {
@@ -1955,20 +2504,20 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
         "EDATE" => r(|| {
             let serial = num(args, 0)?;
             let months = int_arg(args, 1)?;
-            let (y, m, d) = serial_to_date(serial).ok_or(ErrKind::Num)?;
+            let (y, m, d) = serial_to_date_in(ctx.date_system, serial).ok_or(ErrKind::Num)?;
             let total = y as i64 * 12 + (m as i64 - 1) + months;
             let (y2, m2) = (total.div_euclid(12) as i32, (total.rem_euclid(12) + 1) as u32);
             let d2 = d.min(days_in_month(y2, m2));
-            Ok(FValue::number(date_to_serial(y2, m2, d2).ok_or(ErrKind::Num)?))
+            Ok(FValue::number(date_to_serial_in(ctx.date_system, y2, m2, d2).ok_or(ErrKind::Num)?))
         }),
         "EOMONTH" => r(|| {
             let serial = num(args, 0)?;
             let months = int_arg(args, 1)?;
-            let (y, m, _) = serial_to_date(serial).ok_or(ErrKind::Num)?;
+            let (y, m, _) = serial_to_date_in(ctx.date_system, serial).ok_or(ErrKind::Num)?;
             let total = y as i64 * 12 + (m as i64 - 1) + months;
             let (y2, m2) = (total.div_euclid(12) as i32, (total.rem_euclid(12) + 1) as u32);
             Ok(FValue::number(
-                date_to_serial(y2, m2, days_in_month(y2, m2)).ok_or(ErrKind::Num)?,
+                date_to_serial_in(ctx.date_system, y2, m2, days_in_month(y2, m2)).ok_or(ErrKind::Num)?,
             ))
         }),
         "DAYS" => r(|| Ok(FValue::number(num(args, 0)?.floor() - num(args, 1)?.floor()))),
@@ -1976,8 +2525,8 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
             let a = num(args, 0)?.floor();
             let b = num(args, 1)?.floor();
             let unit = text(args, 2)?.to_ascii_uppercase();
-            let (y1, m1, d1) = serial_to_date(a).ok_or(ErrKind::Num)?;
-            let (y2, m2, d2) = serial_to_date(b).ok_or(ErrKind::Num)?;
+            let (y1, m1, d1) = serial_to_date_in(ctx.date_system, a).ok_or(ErrKind::Num)?;
+            let (y2, m2, d2) = serial_to_date_in(ctx.date_system, b).ok_or(ErrKind::Num)?;
             let v = match unit.as_str() {
                 "D" => b - a,
                 "M" => ((y2 - y1) * 12 + m2 as i32 - m1 as i32 - if d2 < d1 { 1 } else { 0 }) as f64,
@@ -1999,8 +2548,8 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
         }),
         "WEEKNUM" => r(|| {
             let serial = num(args, 0)?.floor();
-            let (y, _, _) = serial_to_date(serial).ok_or(ErrKind::Num)?;
-            let jan1 = date_to_serial(y, 1, 1).ok_or(ErrKind::Num)?;
+            let (y, _, _) = serial_to_date_in(ctx.date_system, serial).ok_or(ErrKind::Num)?;
+            let jan1 = date_to_serial_in(ctx.date_system, y, 1, 1).ok_or(ErrKind::Num)?;
             let offset = ((jan1 as i64 + 6) % 7) as f64; // 周日为一周开始
             Ok(FValue::number(((serial - jan1 + offset) / 7.0).floor() + 1.0))
         }),
@@ -2037,7 +2586,7 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
             let start = num(args, 0)?.floor();
             let end = num(args, 1)?.floor();
             let basis = opt_num(args, 2, 0.0)?.trunc() as i32;
-            year_fraction(start.min(end), start.max(end), basis).map(FValue::number)
+            year_fraction_in(ctx.date_system, start.min(end), start.max(end), basis).map(FValue::number)
         }),
 
         // ---------------- 财务
@@ -2180,7 +2729,7 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
         }),
 
         _ => crate::formula::array::call_array(name, args)
-            .or_else(|| crate::formula::extra::call_extra(name, args))
+            .or_else(|| crate::formula::extra::call_extra_in(ctx.date_system, name, args))
             .unwrap_or_else(unknown),
     }
 }
@@ -2235,15 +2784,15 @@ fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, t: f64) -> f64 {
     -(rate * (pv * p + fv)) / ((1.0 + rate * t) * (p - 1.0))
 }
 
-fn year_fraction(start: f64, end: f64, basis: i32) -> Result<f64, ErrKind> {
-    if start < 0.0 || end > date_to_serial(9999, 12, 31).ok_or(ErrKind::Num)? {
+fn year_fraction_in(sys: DateSystem, start: f64, end: f64, basis: i32) -> Result<f64, ErrKind> {
+    if start < 0.0 || end > date_to_serial_in(sys, 9999, 12, 31).ok_or(ErrKind::Num)? {
         return Err(ErrKind::Num);
     }
     let calendar = |serial| {
-        if serial == 0.0 && !current_date_system().is_1904() {
+        if serial == 0.0 && !sys.is_1904() {
             Ok((1900, 1, 0))
         } else {
-            serial_to_date(serial).ok_or(ErrKind::Num)
+            serial_to_date_in(sys, serial).ok_or(ErrKind::Num)
         }
     };
     let (y1, m1, d1) = calendar(start)?;
@@ -2404,26 +2953,6 @@ fn format_date_tokens(fmt: &str, y: i32, m: u32, d: u32) -> Option<String> {
     Some(out)
 }
 
-/// Excel 查找通配符：`*` 任意串、`?` 单字符、`~` 转义下一个字符；大小写不敏感。
-fn wildcard_match_ci(pat: &str, s: &str) -> bool {
-    fn go(p: &[char], t: &[char]) -> bool {
-        if p.is_empty() {
-            return t.is_empty();
-        }
-        match p[0] {
-            '*' => (0..=t.len()).any(|k| go(&p[1..], &t[k..])),
-            '?' => !t.is_empty() && go(&p[1..], &t[1..]),
-            '~' if p.len() > 1 => {
-                !t.is_empty() && t[0].eq_ignore_ascii_case(&p[1]) && go(&p[2..], &t[1..])
-            }
-            c => !t.is_empty() && t[0].eq_ignore_ascii_case(&c) && go(&p[1..], &t[1..]),
-        }
-    }
-    let p: Vec<char> = pat.chars().collect();
-    let t: Vec<char> = s.chars().collect();
-    go(&p, &t)
-}
-
 pub(crate) fn is_wildcard(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('~')
 }
@@ -2465,7 +2994,7 @@ fn strip_format_brackets(s: &str) -> String {
     out
 }
 
-fn format_value(v: &FValue, fmt: &str) -> String {
+fn format_value_in(sys: DateSystem, v: &FValue, fmt: &str) -> String {
     // TEXT 的分段语义：正数;负数;零;文本。文本值走第 4 段（@ 占位），
     // 没有第 4 段就原样返回；`[Red]`/`[$-409]` 这类标记先剥掉。
     let sections = split_format_sections(fmt);
@@ -2476,7 +3005,7 @@ fn format_value(v: &FValue, fmt: &str) -> String {
             strip_format_brackets(&sections[0])
         };
         let sec = sec.replace('"', "");
-        return if sec.contains('@') { sec.replace('@', t) } else { t.clone() };
+        return if sec.contains('@') { sec.replace('@', t) } else { t.to_string() };
     }
     if !matches!(v, FValue::Number(_) | FValue::Empty) {
         return v.display();
@@ -2507,7 +3036,7 @@ fn format_value(v: &FValue, fmt: &str) -> String {
     }
     // 常见占位符：0、0.00、#,##0、0%、0.00%、yyyy-mm-dd
     if fmt.chars().any(|c| matches!(c, 'y' | 'Y' | 'm' | 'M' | 'd' | 'D')) {
-        if let Some((y, m, d)) = serial_to_date(n) {
+        if let Some((y, m, d)) = serial_to_date_in(sys, n) {
             if let Some(out) = format_date_tokens(fmt, y, m, d) {
                 return format!("{sign}{out}");
             }
@@ -2599,7 +3128,7 @@ mod clock_and_serial60_tests {
 
     fn text(v: crate::formula::FValue) -> String {
         match v {
-            crate::formula::FValue::Text(s) => s,
+            crate::formula::FValue::Text(s) => s.to_string(),
             other => panic!("expected text, got {other:?}"),
         }
     }

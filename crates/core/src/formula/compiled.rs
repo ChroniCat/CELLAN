@@ -1,5 +1,5 @@
 //! Bounded syntax-only caches. Syntax never captures a workbook, evaluation state or a date system.
-use super::{ErrKind, FValue, Node, RefExpr, bin_scalar, parse, parse_a1};
+use super::{ErrKind, FValue, Node, RefExpr, bin_scalar, parse, parse_a1, parse_normalized};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -8,9 +8,9 @@ use std::{
 };
 
 type Parsed = Result<Arc<Node>, ErrKind>;
-const MAX_SOURCE: usize = 1024;
-const SHARDS: usize = 16;
-const PER_SHARD: usize = 128;
+const MAX_SOURCE: usize = 2048;
+const SHARDS: usize = 32;
+const PER_SHARD: usize = 1024;
 
 #[derive(Default)]
 struct Cache {
@@ -43,7 +43,10 @@ struct LastTemplate {
 thread_local! { static LAST: RefCell<LastTemplate> = RefCell::new(LastTemplate::default()); }
 
 fn parse_body(src: &str) -> Parsed {
-    parse(&crate::normalize_formula(src)).map(Arc::new)
+    let norm = crate::normalize_formula_cow(src);
+    let rows = crate::expand_whole_rows_cow(&norm);
+    let cols = crate::expand_whole_cols_cow(&rows);
+    parse_normalized(&cols).map(Arc::new)
 }
 
 fn template(src: &str, row: u32, col: u32) -> Option<Arc<Template>> {
@@ -51,8 +54,8 @@ fn template(src: &str, row: u32, col: u32) -> Option<Arc<Template>> {
         return None;
     }
     LAST.with_borrow_mut(|front| {
-        relative_key(src, row, col, &mut front.scratch)?;
-        if front.key == front.scratch {
+        relative_key_opts(src, row, col, true, &mut front.scratch)?;
+        if front.key == front.scratch && front.template.is_some() {
             return front.template.clone();
         }
         let shard = shard(&front.scratch);
@@ -68,14 +71,18 @@ fn template(src: &str, row: u32, col: u32) -> Option<Arc<Template>> {
                     node,
                 });
                 let mut cache = shard.write().unwrap();
-                if cache.relative.len() >= PER_SHARD {
-                    cache.relative.clear();
+                if let Some(existing) = cache.relative.get(&front.scratch) {
+                    existing.clone()
+                } else {
+                    if cache.relative.len() >= PER_SHARD {
+                        cache.relative.clear();
+                    }
+                    cache
+                        .relative
+                        .entry(front.scratch.clone())
+                        .or_insert(value)
+                        .clone()
                 }
-                cache
-                    .relative
-                    .entry(front.scratch.clone())
-                    .or_insert(value)
-                    .clone()
             }
         };
         std::mem::swap(&mut front.key, &mut front.scratch);
@@ -109,6 +116,9 @@ pub(super) fn compile_at(src: &str, row: u32, col: u32) -> Parsed {
         None => parse_body(src),
     };
     let mut cache = shard.write().unwrap();
+    if let Some(existing) = cache.exact.get(src) {
+        return existing.clone();
+    }
     if cache.exact.len() >= PER_SHARD {
         cache.exact.clear();
     }
@@ -127,7 +137,7 @@ thread_local! { static SHIFTED: RefCell<Vec<Shifted>> = const { RefCell::new(Vec
 /// Most callers only borrow syntax for one evaluation. Rebind an already allocated
 /// tree in place; take the slot out before visiting so nested formula evaluation
 /// cannot borrow the same tree. Owned/long-lived callers still use compile_at.
-pub(super) fn with_node<T>(
+pub(crate) fn with_node<T>(
     src: &str,
     row: u32,
     col: u32,
@@ -164,7 +174,7 @@ pub(super) fn with_node<T>(
     (slot.row, slot.col) = (row, col);
     let result = visit(&slot.tree);
     SHIFTED.with_borrow_mut(|slots| {
-        if slots.len() >= 4 {
+        if slots.len() >= 8 {
             slots.remove(0);
         }
         slots.push(slot);
@@ -174,7 +184,8 @@ pub(super) fn with_node<T>(
 
 fn projectable(node: &Node) -> bool {
     match node {
-        Node::Number(_) | Node::Ref(_) => true,
+        Node::Number(_) => true,
+        Node::Ref(r) => r.sheet.is_none() && r.sheet2.is_none() && r.book.is_none(),
         Node::Unary(_, n) | Node::Percent(n) => projectable(n),
         Node::Binary(_, a, b) => projectable(a) && projectable(b),
         _ => false,
@@ -255,25 +266,312 @@ impl BoundScalar {
     }
 }
 
-/// Encode ordinary same-sheet fill formulas with relative R1C1 offsets. Richer syntax
-/// goes through the exact-source cache to keep workbook names and implicit bounds intact.
+#[inline]
+fn col_letters_valid(s: &str) -> bool {
+    let mut c = 0u32;
+    for &b in s.as_bytes() {
+        if !b.is_ascii_alphabetic() {
+            return false;
+        }
+        c = c * 26 + u32::from(b.to_ascii_uppercase() - b'A' + 1);
+    }
+    (1..=16_384).contains(&c)
+}
+
+#[inline]
+fn strip_xlfn_prefix(word: &str) -> Option<&str> {
+    if word.len() > 12 && word.as_bytes()[..12].eq_ignore_ascii_case(b"_xlfn._xlws.") {
+        return Some(&word[12..]);
+    }
+    if word.len() > 6 && word.as_bytes()[..6].eq_ignore_ascii_case(b"_xlfn.") {
+        return Some(&word[6..]);
+    }
+    if word.len() >= 4 && word.as_bytes()[..4].eq_ignore_ascii_case(b"_xl") {
+        return None;
+    }
+    Some(word)
+}
+
+#[inline]
+fn scan_quoted_ident(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'\'') {
+        return None;
+    }
+    let mut j = start + 1;
+    loop {
+        let &b = bytes.get(j)?;
+        if b == b'[' || b == b']' {
+            return None;
+        }
+        if b == b'\'' {
+            if bytes.get(j + 1) == Some(&b'\'') {
+                j += 2;
+                continue;
+            }
+            return Some(j + 1);
+        }
+        j += 1;
+    }
+}
+
+/// Encode fill formulas with relative R1C1 offsets, supporting whitespace, string literals,
+/// TRUE/FALSE, scientific notation, cross-sheet qualifiers (`Sheet!`, `'My Sheet'!`, 3D),
+/// whole-column (`A:C`) and whole-row (`1:3`) references.
 fn relative_key(src: &str, row: u32, col: u32, out: &mut Vec<u8>) -> Option<()> {
+    relative_key_opts(src, row, col, false, out)
+}
+
+fn relative_key_opts(
+    src: &str,
+    row: u32,
+    col: u32,
+    extended: bool,
+    out: &mut Vec<u8>,
+) -> Option<()> {
     let bytes = src.as_bytes();
     out.clear();
-    let (mut i, mut saw_ref, mut need_ref, mut was_ref) = (0, false, false, false);
+    let (mut i, mut saw_ref, mut need_ref, mut was_ref, mut after_bang) =
+        (0usize, false, false, false, false);
     while i < bytes.len() {
-        let start = i;
         let byte = bytes[i];
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'$' | b'.' | b'_') {
+
+        // 1. Collapse ASCII whitespace
+        if matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+            if !extended || need_ref || after_bang {
+                return None;
+            }
+            out.push(b' ');
             i += 1;
-            while bytes
+            while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+                i += 1;
+            }
+            continue;
+        }
+
+        // 2. Double-quoted string literal "..."
+        if byte == b'"' {
+            if !extended || need_ref || after_bang {
+                return None;
+            }
+            let start = i;
+            i += 1;
+            loop {
+                let &c = bytes.get(i)?;
+                if c == b'"' {
+                    if bytes.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push(4);
+            out.extend_from_slice(&(i - start).to_le_bytes());
+            out.extend_from_slice(&bytes[start..i]);
+            was_ref = false;
+            continue;
+        }
+
+        // 3. Single-quoted sheet qualifier 'Sheet Name'! or 'First':'Last'!
+        if byte == b'\'' {
+            if !extended || need_ref || after_bang {
+                return None;
+            }
+            let start = i;
+            let mut end = scan_quoted_ident(bytes, start)?;
+            if bytes.get(end) == Some(&b':') {
+                if bytes.get(end + 1) == Some(&b'\'') {
+                    end = scan_quoted_ident(bytes, end + 1)?;
+                } else {
+                    let s2 = end + 1;
+                    let mut j = s2;
+                    while j < bytes.len()
+                        && (bytes[j].is_ascii_alphanumeric()
+                            || matches!(bytes[j], b'_' | b'.')
+                            || bytes[j] >= 0x80)
+                    {
+                        j += 1;
+                    }
+                    if j == s2 {
+                        return None;
+                    }
+                    end = j;
+                }
+            }
+            if bytes.get(end) != Some(&b'!') {
+                return None;
+            }
+            i = end + 1;
+            out.push(5);
+            out.extend_from_slice(&(i - start).to_le_bytes());
+            out.extend_from_slice(&bytes[start..i]);
+            after_bang = true;
+            was_ref = false;
+            continue;
+        }
+
+        // 4. Whole-row reference `1:3` / `$1:$3` (before numeric literal scan!)
+        if extended
+            && !need_ref
+            && (byte == b'$' || byte.is_ascii_digit())
+            && let Some((end, r1, r2, a_abs, b_abs)) = crate::match_rows_bytes(bytes, i)
+        {
+            if r1 > 1_048_576 || r2 > 1_048_576 {
+                return None;
+            }
+            let r1_0 = i64::from(r1) - 1;
+            let r2_0 = i64::from(r2) - 1;
+            out.push(2);
+            out.push(u8::from(a_abs) | (u8::from(b_abs) << 1));
+            out.extend_from_slice(&(if a_abs { r1_0 } else { r1_0 - i64::from(row) }).to_le_bytes());
+            out.extend_from_slice(&(if b_abs { r2_0 } else { r2_0 - i64::from(row) }).to_le_bytes());
+            // Whole-row expansion uses relative columns A..XFD, so pin template per column (dc == 0).
+            out.extend_from_slice(&col.to_le_bytes());
+            i = end;
+            saw_ref = true;
+            was_ref = false;
+            after_bang = false;
+            continue;
+        }
+
+        // 5. Whole-column reference `A:C` / `$A:$C`
+        if extended
+            && !need_ref
+            && (byte == b'$' || byte.is_ascii_alphabetic())
+            && let Some((end, first, second)) = crate::match_cols_bytes(src, i)
+        {
+            if !col_letters_valid(first) || !col_letters_valid(second) {
+                return None;
+            }
+            out.push(1);
+            out.push(first.len() as u8);
+            for &b in first.as_bytes() {
+                out.push(b.to_ascii_uppercase());
+            }
+            out.push(second.len() as u8);
+            for &b in second.as_bytes() {
+                out.push(b.to_ascii_uppercase());
+            }
+            i = end;
+            saw_ref = true;
+            was_ref = false;
+            after_bang = false;
+            continue;
+        }
+
+        // 6. Numeric literal (including scientific notation 1e3 / 1.5E-4)
+        if byte.is_ascii_digit() || (byte == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)) {
+            if need_ref || after_bang {
+                return None;
+            }
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            if extended && i < bytes.len() && matches!(bytes[i], b'e' | b'E') {
+                let save = i;
+                i += 1;
+                if i < bytes.len() && matches!(bytes[i], b'+' | b'-') {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i].is_ascii_digit() {
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                } else {
+                    i = save;
+                }
+            }
+            if bytes
                 .get(i)
-                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'$' | b'.' | b'_'))
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'$' | b'_' | b'.' | b'!' | b':'))
+            {
+                return None;
+            }
+            out.push(6);
+            out.extend_from_slice(&(i - start).to_le_bytes());
+            out.extend_from_slice(&bytes[start..i]);
+            was_ref = false;
+            continue;
+        }
+
+        // 7. Identifier / A1 ref / unquoted sheet qualifier / function call / TRUE / FALSE
+        if byte.is_ascii_alphabetic() || matches!(byte, b'$' | b'_') || (extended && byte >= 0x80) {
+            let start = i;
+            i += 1;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric()
+                    || matches!(bytes[i], b'$' | b'.' | b'_')
+                    || (extended && bytes[i] >= 0x80))
             {
                 i += 1;
             }
             let word = &src[start..i];
-            if bytes.get(i) != Some(&b'(')
+
+            // Unquoted sheet qualifier `Sheet1!A1` or 3D `Sheet1:Sheet3!A1`
+            if extended && !need_ref && !after_bang && !word.contains('$') {
+                if bytes.get(i) == Some(&b'!') {
+                    i += 1;
+                    out.push(5);
+                    out.extend_from_slice(&(i - start).to_le_bytes());
+                    out.extend_from_slice(&bytes[start..i]);
+                    after_bang = true;
+                    was_ref = false;
+                    continue;
+                }
+                if bytes.get(i) == Some(&b':') {
+                    let mut j = i + 1;
+                    while j < bytes.len()
+                        && (bytes[j].is_ascii_alphanumeric()
+                            || matches!(bytes[j], b'_' | b'.')
+                            || bytes[j] >= 0x80)
+                    {
+                        j += 1;
+                    }
+                    if j > i + 1 && bytes.get(j) == Some(&b'!') {
+                        i = j + 1;
+                        out.push(5);
+                        out.extend_from_slice(&(i - start).to_le_bytes());
+                        out.extend_from_slice(&bytes[start..i]);
+                        after_bang = true;
+                        was_ref = false;
+                        continue;
+                    }
+                }
+            }
+
+            // Function call `SUM(` / `_xlfn.XLOOKUP(` (with optional spaces before `(` in extended mode)
+            let mut open_pos = i;
+            if extended {
+                while open_pos < bytes.len() && matches!(bytes[open_pos], b' ' | b'\t') {
+                    open_pos += 1;
+                }
+            }
+            if bytes.get(open_pos) == Some(&b'(') {
+                if need_ref || after_bang || word.contains('$') {
+                    return None;
+                }
+                let fn_name = if extended {
+                    strip_xlfn_prefix(word)?
+                } else {
+                    if word.as_bytes().windows(3).any(|w| w.eq_ignore_ascii_case(b"_xl")) {
+                        return None;
+                    }
+                    word
+                };
+                out.push(7);
+                out.extend_from_slice(&fn_name.len().to_le_bytes());
+                for &b in fn_name.as_bytes() {
+                    out.push(b.to_ascii_uppercase());
+                }
+                was_ref = false;
+                continue;
+            }
+
+            // A1 Cell reference
+            if word.is_ascii()
                 && let Some(r) = parse_a1(word)
             {
                 if r.row >= 1_048_576 || r.col >= 16_384 {
@@ -298,52 +596,75 @@ fn relative_key(src: &str, row: u32, col: u32, out: &mut Vec<u8>) -> Option<()> 
                     .to_le_bytes(),
                 );
                 saw_ref = true;
-                was_ref = true;
+                was_ref = !need_ref;
                 need_ref = false;
+                after_bang = false;
                 continue;
             }
-            if need_ref {
-                return None;
-            }
-            // Avoid ambiguities involving names, scientific notation and whole columns.
-            if bytes.get(i) != Some(&b'(') && !word.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+
+            // Boolean literals TRUE / FALSE
+            if extended
+                && !need_ref
+                && !after_bang
+                && (word.eq_ignore_ascii_case("TRUE") || word.eq_ignore_ascii_case("FALSE"))
             {
-                return None;
+                out.push(3);
+                out.push(u8::from(word.len() == 4));
+                was_ref = false;
+                continue;
             }
-            out.extend_from_slice(word.as_bytes());
-        } else {
-            if need_ref
-                || !matches!(
-                    byte,
-                    b'+' | b'-'
-                        | b'*'
-                        | b'/'
-                        | b'^'
-                        | b'&'
-                        | b'%'
-                        | b'='
-                        | b'>'
-                        | b'<'
-                        | b','
-                        | b'('
-                        | b')'
-                        | b':'
-                )
-            {
-                return None;
-            }
-            if byte == b':' {
-                if !was_ref {
-                    return None;
-                }
-                need_ref = true;
-            }
-            out.push(byte);
-            i += 1;
+
+            return None;
         }
+
+        // 8. Spill operator `#` right after a single-cell reference (`A2#`)
+        if extended
+            && byte == b'#'
+            && was_ref
+            && !bytes
+                .get(i + 1)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'!' | b'_'))
+        {
+            out.push(b'#');
+            i += 1;
+            was_ref = false;
+            continue;
+        }
+
+        // 9. Operators and punctuation
+        if need_ref || after_bang {
+            return None;
+        }
+        let allowed_punct = matches!(
+            byte,
+            b'+' | b'-'
+                | b'*'
+                | b'/'
+                | b'^'
+                | b'&'
+                | b'%'
+                | b'='
+                | b'>'
+                | b'<'
+                | b','
+                | b'('
+                | b')'
+                | b':'
+        ) || (extended && byte == b'@');
+        if !allowed_punct {
+            return None;
+        }
+        if byte == b':' {
+            if !was_ref {
+                return None;
+            }
+            need_ref = true;
+        }
+        out.push(byte);
+        i += 1;
         was_ref = false;
     }
-    (saw_ref && !need_ref).then_some(())
+    (saw_ref && !need_ref && !after_bang).then_some(())
 }
 
 /// Reuse the parsed template for relative A1 rules. Extended references and strings

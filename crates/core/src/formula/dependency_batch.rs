@@ -1,29 +1,69 @@
-//! Evaluate broad dependency levels using the ordinary formula evaluator. A cell leaves
-//! the serial queue only after every observed formula input has a scalar from this pass.
+//! Multi-core topological formula evaluator.
+//!
+//! Key capabilities:
+//! - Zero `MAX_RANGE` limit: large literal ranges (`A:A`, `A1:Z100000`) add 0 edges and run
+//!   at Level 0 across all cores; ranges containing `> 64` formulas use Virtual Range Nodes
+//!   (`O(1)` edge per consumer instead of `O(N^2)` edges) + `SharedCalcCaches`.
+//! - Static defined names (`Node::Name` / `Node::ScopedName`) run in parallel.
+//! - Direct `FValue` transport (`Arc<str>`, `Arc<Array>`) without `Value <-> FValue` roundtrips.
+//! - Dynamic atomic work-stealing across up to 32 cores without wiping `Calc` caches on array/lambda cells.
+
 use super::{
-    Calc, FValue, Workbook, compiled,
+    Calc, FValue, SharedCalcCaches, Workbook, compiled,
     deps::{self, CellKey, Rect},
+    functions::EvalCtx,
     scalar_batch::Batch,
 };
-use crate::Value;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 const MIN_FORMULAS: usize = 2_048;
 const MIN_PER_WORKER: usize = 128;
-const MAX_INPUTS: usize = 2_048;
-const MAX_RANGE: i64 = 32_768;
+const DIRECT_RANGE_FORMULA_CAP: usize = 64;
+const WORK_CHUNK: usize = 64;
 
 struct FormulaIndex<'a> {
     keys: &'a [CellKey],
-    columns: Option<BTreeMap<(usize, u32), Vec<(u32, usize)>>>,
+    values: &'a [Option<FValue>],
+    by_sheet: Option<HashMap<usize, BTreeMap<u32, Vec<(u32, usize)>>>>,
+    virtual_map: HashMap<(usize, u32, u32, u32, u32), Option<usize>>,
+    virtual_defs: Vec<Vec<usize>>,
 }
 
-impl FormulaIndex<'_> {
+impl<'a> FormulaIndex<'a> {
+    fn new(keys: &'a [CellKey], values: &'a [Option<FValue>]) -> Self {
+        Self {
+            keys,
+            values,
+            by_sheet: None,
+            virtual_map: HashMap::new(),
+            virtual_defs: Vec::new(),
+        }
+    }
+
+    fn ensure_columns(&mut self) -> &HashMap<usize, BTreeMap<u32, Vec<(u32, usize)>>> {
+        let keys = self.keys;
+        self.by_sheet.get_or_insert_with(|| {
+            let mut sheets: HashMap<usize, BTreeMap<u32, Vec<(u32, usize)>>> = HashMap::new();
+            for (slot, &(sheet, row, col)) in keys.iter().enumerate() {
+                sheets
+                    .entry(sheet)
+                    .or_default()
+                    .entry(col)
+                    .or_default()
+                    .push((row, slot));
+            }
+            sheets
+        })
+    }
+
+    #[inline]
     fn point(&self, key: CellKey, out: &mut Vec<usize>) {
-        if let Ok(slot) = self.keys.binary_search(&key) {
+        if let Ok(slot) = self.keys.binary_search(&key)
+            && self.values[slot].is_none()
+        {
             out.push(slot);
         }
     }
@@ -33,48 +73,94 @@ impl FormulaIndex<'_> {
             if let (Ok(row), Ok(col)) = (u32::try_from(r.r1), u32::try_from(r.c1)) {
                 self.point((r.sheet, row, col), out);
             }
-            return out.len() <= MAX_INPUTS;
-        }
-        // Wide shared ranges are left to the serial Calc, which reuses aggregation indexes.
-        if (r.r2 - r.r1 + 1).saturating_mul(r.c2 - r.c1 + 1) > MAX_RANGE {
-            return false;
+            return true;
         }
         let (Ok(top), Ok(bottom), Ok(left), Ok(right)) = (
-            u32::try_from(r.r1),
-            u32::try_from(r.r2),
-            u32::try_from(r.c1),
-            u32::try_from(r.c2),
+            u32::try_from(r.r1.max(0)),
+            u32::try_from(r.r2.max(0)),
+            u32::try_from(r.c1.max(0)),
+            u32::try_from(r.c2.max(0)),
         ) else {
             return false;
         };
-        let columns = self.columns.get_or_insert_with(|| {
-            let mut columns = BTreeMap::<_, Vec<_>>::new();
-            for (slot, &(sheet, row, col)) in self.keys.iter().enumerate() {
-                columns.entry((sheet, col)).or_default().push((row, slot));
-            }
-            columns
-        });
-        for (_, rows) in columns.range((r.sheet, left)..=(r.sheet, right)) {
-            let start = rows.partition_point(|(r, _)| *r < top);
-            let end = rows.partition_point(|(r, _)| *r <= bottom);
-            if out.len() + end - start > MAX_INPUTS {
-                return false;
-            }
-            out.extend(rows[start..end].iter().map(|(_, slot)| *slot));
+        if top > bottom || left > right {
+            return true;
         }
+        let vkey = (r.sheet, top, left, bottom, right);
+        if let Some(&cached_virt) = self.virtual_map.get(&vkey) {
+            if let Some(virt_slot) = cached_virt {
+                out.push(virt_slot);
+            }
+            return true;
+        }
+
+        self.ensure_columns();
+        let values = self.values;
+        let Some(cols) = self.by_sheet.as_ref().unwrap().get(&r.sheet) else {
+            // Zero formula cells on this sheet -> pure literal sheet!
+            return true;
+        };
+
+        let mut small_buf: Vec<usize> = Vec::new();
+        let mut overflowed = false;
+        for (_, rows) in cols.range(left..=right) {
+            let start = rows.partition_point(|(row, _)| *row < top);
+            let end = rows.partition_point(|(row, _)| *row <= bottom);
+            for &(_, slot) in &rows[start..end] {
+                if values[slot].is_none() {
+                    small_buf.push(slot);
+                    if small_buf.len() > DIRECT_RANGE_FORMULA_CAP && !overflowed {
+                        overflowed = true;
+                    }
+                }
+            }
+        }
+
+        if small_buf.is_empty() {
+            self.virtual_map.insert(vkey, None);
+            return true;
+        }
+        if !overflowed {
+            out.extend_from_slice(&small_buf);
+            return true;
+        }
+
+        small_buf.sort_unstable();
+        small_buf.dedup();
+        let virt_slot = self.keys.len() + self.virtual_defs.len();
+        self.virtual_defs.push(small_buf);
+        self.virtual_map.insert(vkey, Some(virt_slot));
+        out.push(virt_slot);
         true
     }
 }
 
-fn uses_definition(node: &super::Node, names: &HashSet<String>) -> bool {
+fn collect_lambda_names(wb: &Workbook) -> HashSet<String> {
+    wb.names
+        .iter()
+        .filter(|(_, _, def)| {
+            def.as_bytes()
+                .windows(6)
+                .any(|w| w.eq_ignore_ascii_case(b"LAMBDA"))
+        })
+        .map(|(name, _, _)| name.to_ascii_uppercase())
+        .collect()
+}
+
+fn uses_named_lambda(node: &super::Node, lambda_names: &HashSet<String>) -> bool {
     use super::Node;
     match node {
-        Node::Name(_) | Node::ScopedName { .. } => true,
+        Node::Name(n) => lambda_names.contains(n),
+        Node::ScopedName { name, .. } => lambda_names.contains(&name.to_ascii_uppercase()),
         Node::Func(name, args) => {
-            names.contains(name) || args.iter().any(|v| uses_definition(v, names))
+            lambda_names.contains(name) || args.iter().any(|v| uses_named_lambda(v, lambda_names))
         }
-        Node::Implicit(v) | Node::Percent(v) | Node::Unary(_, v) => uses_definition(v, names),
-        Node::Binary(_, a, b) => uses_definition(a, names) || uses_definition(b, names),
+        Node::Implicit(v) | Node::Percent(v) | Node::Unary(_, v) => {
+            uses_named_lambda(v, lambda_names)
+        }
+        Node::Binary(_, a, b) => {
+            uses_named_lambda(a, lambda_names) || uses_named_lambda(b, lambda_names)
+        }
         _ => false,
     }
 }
@@ -83,7 +169,7 @@ fn prerequisites(
     wb: &Workbook,
     key: CellKey,
     index: &mut FormulaIndex<'_>,
-    names: &HashSet<String>,
+    lambda_names: &HashSet<String>,
     slots: &mut Vec<usize>,
 ) -> bool {
     let (si, row, col) = key;
@@ -95,15 +181,11 @@ fn prerequisites(
         return false;
     };
     let src = formula.strip_prefix('=').unwrap_or(formula);
-    if !wb.links.is_empty() && src.contains('[') {
-        return false;
-    }
     if let Some(simple) = compiled::scalar_at(src, row, col) {
         simple.refs(|r, c| index.point((si, r, c), slots));
     } else {
-        // Named values and lambdas may resolve relative to the caller's lexical bindings.
-        if !names.is_empty()
-            && compiled::with_node(src, row, col, |node| uses_definition(node, names))
+        if !lambda_names.is_empty()
+            && compiled::with_node(src, row, col, |node| uses_named_lambda(node, lambda_names))
                 .unwrap_or(true)
         {
             return false;
@@ -122,13 +204,13 @@ fn prerequisites(
     true
 }
 
-/// Two flat buffers keep the graph proportional to actual formula edges without
-/// allocating a separate adjacency list for every cell of a filled column.
 struct Edges {
     offsets: Vec<usize>,
     slots: Vec<usize>,
 }
+
 impl Edges {
+    #[inline]
     fn get(&self, slot: usize) -> &[usize] {
         &self.slots[self.offsets[slot]..self.offsets[slot + 1]]
     }
@@ -145,70 +227,94 @@ impl Plan {
     fn build(
         wb: &Workbook,
         keys: &[CellKey],
-        values: &[Option<Value>],
+        values: &[Option<FValue>],
         cancel: Option<&AtomicBool>,
     ) -> Option<Self> {
-        let mut index = FormulaIndex {
-            keys,
-            columns: None,
-        };
-        let names = wb
-            .names
-            .iter()
-            .map(|(name, _, _)| name.to_ascii_uppercase())
-            .collect();
+        let mut index = FormulaIndex::new(keys, values);
+        let lambda_names = collect_lambda_names(wb);
         let mut inputs = Edges {
             offsets: Vec::with_capacity(keys.len() + 1),
             slots: Vec::new(),
         };
-        let mut counts = vec![0; keys.len() + 1];
-        let mut waiting = vec![0; keys.len()];
-        let mut ready = Vec::new();
-        let edge_limit = (keys.len().saturating_mul(16)).clamp(8192, 1_048_576);
+        let mut eligible = vec![false; keys.len()];
+        let edge_limit = (keys.len().saturating_mul(24)).clamp(16_384, 8_388_608);
         let mut scratch = Vec::new();
         for (slot, &key) in keys.iter().enumerate() {
-            if slot % 128 == 0 && cancelled(cancel) {
+            if slot % 256 == 0 && cancelled(cancel) {
                 return None;
             }
             inputs.offsets.push(inputs.slots.len());
             scratch.clear();
-            if values[slot].is_some() || !prerequisites(wb, key, &mut index, &names, &mut scratch) {
+            if values[slot].is_some()
+                || !prerequisites(wb, key, &mut index, &lambda_names, &mut scratch)
+            {
                 continue;
             }
             if inputs.slots.len() + scratch.len() > edge_limit {
                 return None;
             }
-            for &input in &scratch {
-                if values[input].is_none() {
-                    counts[input + 1] += 1;
-                    waiting[slot] += 1;
-                }
+            eligible[slot] = true;
+            inputs.slots.extend_from_slice(&scratch);
+        }
+        inputs.offsets.push(inputs.slots.len());
+
+        let n_real = keys.len();
+        let virtual_defs = index.virtual_defs;
+        let total_nodes = n_real + virtual_defs.len();
+        let mut counts = vec![0usize; total_nodes + 1];
+        let mut waiting = vec![0usize; total_nodes];
+        let mut ready = Vec::new();
+
+        for slot in 0..n_real {
+            if !eligible[slot] {
+                continue;
+            }
+            let deps_slice = inputs.get(slot);
+            for &dep in deps_slice {
+                counts[dep + 1] += 1;
+                waiting[slot] += 1;
             }
             if waiting[slot] == 0 {
                 ready.push(slot);
             }
-            inputs.slots.extend_from_slice(&scratch);
         }
-        inputs.offsets.push(inputs.slots.len());
+        for (v_idx, members) in virtual_defs.iter().enumerate() {
+            let v_node = n_real + v_idx;
+            for &real_dep in members {
+                counts[real_dep + 1] += 1;
+                waiting[v_node] += 1;
+            }
+        }
+
         for i in 1..counts.len() {
             counts[i] += counts[i - 1];
         }
-        let mut write = counts[..keys.len()].to_vec();
+        let mut write = counts[..total_nodes].to_vec();
         let mut consumers = Edges {
-            slots: vec![0; counts[keys.len()]],
+            slots: vec![0; counts[total_nodes]],
             offsets: counts,
         };
-        for slot in 0..keys.len() {
-            if slot % 128 == 0 && cancelled(cancel) {
+
+        for slot in 0..n_real {
+            if slot % 256 == 0 && cancelled(cancel) {
                 return None;
             }
-            for &input in inputs.get(slot) {
-                if values[input].is_none() {
-                    consumers.slots[write[input]] = slot;
-                    write[input] += 1;
-                }
+            if !eligible[slot] {
+                continue;
+            }
+            for &dep in inputs.get(slot) {
+                consumers.slots[write[dep]] = slot;
+                write[dep] += 1;
             }
         }
+        for (v_idx, members) in virtual_defs.iter().enumerate() {
+            let v_node = n_real + v_idx;
+            for &real_dep in members {
+                consumers.slots[write[real_dep]] = v_node;
+                write[real_dep] += 1;
+            }
+        }
+
         Some(Self {
             inputs,
             consumers,
@@ -218,78 +324,79 @@ impl Plan {
     }
 }
 
+#[inline]
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
-fn run_chunk<'a>(
-    wb: &'a Workbook,
-    keys: &[CellKey],
-    chunk: &[usize],
+fn eval_ready_slice<'a>(
+    calc: &mut Calc<'a>,
+    keys: &'a [CellKey],
+    slice: &[usize],
     inputs: &Edges,
-    values: &[Option<Value>],
-    scope: Option<&'a HashSet<CellKey>>,
+    values: &'a [Option<FValue>],
     cancel: Option<&AtomicBool>,
-) -> Vec<(usize, Value)> {
-    let mut calc = Calc::new(wb);
-    calc.scheduling = true;
-    calc.scope = scope;
-    let mut outputs = Vec::new();
-    for &slot in chunk {
+    out: &mut Vec<(usize, FValue)>,
+) {
+    let n_real = keys.len();
+    for &slot in slice {
         if cancelled(cancel) {
             break;
         }
         for &input in inputs.get(slot) {
-            calc.memo
-                .entry(keys[input])
-                .or_insert_with(|| super::to_fvalue(values[input].as_ref().expect("ready input")));
+            if input < n_real {
+                if let Some(ref fv) = values[input] {
+                    calc.memo.entry(keys[input]).or_insert_with(|| fv.clone());
+                }
+            }
         }
         let (si, r, c) = keys[slot];
         let v = calc.cell_value_inner(si, r, c, true);
         if calc.requested.is_some() || matches!(v, FValue::Array(_) | FValue::Lambda(_)) {
-            // A formula may resolve an additional address at runtime. Discard its
-            // partial caches and leave it and its consumers in the serial queue.
-            drop(calc);
-            calc = Calc::new(wb);
-            calc.scheduling = true;
-            calc.scope = scope;
+            calc.reset_partial((si, r, c));
         } else {
-            outputs.push((slot, super::from_fvalue(&v)));
+            out.push((slot, v));
         }
     }
-    outputs
 }
 
-pub(super) fn evaluate(
-    wb: &Workbook,
+pub(super) fn evaluate<'a>(
+    wb: &'a Workbook,
     keys: &[CellKey],
     initial: Option<Batch>,
+    scope: Option<&'a HashSet<CellKey>>,
+    shared: &'a SharedCalcCaches,
+    ctx: EvalCtx,
     cancel: Option<&AtomicBool>,
     done: Option<&AtomicUsize>,
 ) -> Option<Batch> {
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
-        .min(8);
-    evaluate_with_workers(wb, keys, initial, None, cancel, done, workers)
+        .min(32);
+    evaluate_with_workers(wb, keys, initial, scope, Some(shared), ctx, cancel, done, workers)
 }
 
-pub(super) fn dirty(
-    wb: &Workbook,
+pub(super) fn dirty<'a>(
+    wb: &'a Workbook,
     keys: &[CellKey],
-    scope: &HashSet<CellKey>,
+    scope: &'a HashSet<CellKey>,
+    shared: &'a SharedCalcCaches,
+    ctx: EvalCtx,
     cancel: Option<&AtomicBool>,
 ) -> Option<Batch> {
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
-        .min(8);
-    evaluate_with_workers(wb, keys, None, Some(scope), cancel, None, workers)
+        .min(32);
+    evaluate_with_workers(wb, keys, None, Some(scope), Some(shared), ctx, cancel, None, workers)
 }
 
-fn evaluate_with_workers(
-    wb: &Workbook,
+fn evaluate_with_workers<'a>(
+    wb: &'a Workbook,
     keys: &[CellKey],
     initial: Option<Batch>,
-    scope: Option<&HashSet<CellKey>>,
+    scope: Option<&'a HashSet<CellKey>>,
+    shared: Option<&'a SharedCalcCaches>,
+    ctx: EvalCtx,
     cancel: Option<&AtomicBool>,
     done: Option<&AtomicUsize>,
     workers: usize,
@@ -298,49 +405,84 @@ fn evaluate_with_workers(
     if pending < MIN_FORMULAS || workers < 2 || cancelled(cancel) {
         return initial;
     }
-    let mut values: Vec<Option<Value>> = vec![None; keys.len()];
+    let owned_shared;
+    let shared_ref = match shared {
+        Some(s) => s,
+        None => {
+            owned_shared = SharedCalcCaches::default();
+            &owned_shared
+        }
+    };
+
+    let mut values: Vec<Option<FValue>> = vec![None; keys.len()];
     if let Some(batch) = &initial {
         let mut unresolved = batch.pending.iter().copied().peekable();
         for (i, (_, _, _, value)) in batch.values.iter().enumerate() {
             if unresolved.next_if_eq(&i).is_none() {
-                values[i] = Some(super::from_fvalue(value));
+                values[i] = Some(value.clone());
             }
         }
     }
     let Some(mut plan) = Plan::build(wb, keys, &values, cancel) else {
         return initial;
     };
+    let n_real = keys.len();
     let mut completed = keys.len() - pending;
     let mut narrow_levels = 0;
+
     while !plan.ready.is_empty() && !cancelled(cancel) {
         let ready = std::mem::take(&mut plan.ready);
         let threads = (ready.len() / MIN_PER_WORKER).clamp(1, workers);
         if threads == 1 {
             narrow_levels += 1;
-            // One long serial chain should keep the ordinary stack evaluator.
             if narrow_levels > 8 {
                 break;
             }
         } else {
             narrow_levels = 0;
         }
-        let results = if threads == 1 {
-            vec![run_chunk(
-                wb,
-                keys,
-                &ready,
-                &plan.inputs,
-                &values,
-                scope,
-                cancel,
-            )]
+
+        let results: Vec<Vec<(usize, FValue)>> = if threads == 1 {
+            let mut calc = Calc::new_worker(wb, ctx, scope, Some(shared_ref));
+            calc.scheduling = true;
+            calc.parallel_values = Some((keys, &values));
+            let mut out = Vec::with_capacity(ready.len());
+            eval_ready_slice(&mut calc, keys, &ready, &plan.inputs, &values, cancel, &mut out);
+            vec![out]
         } else {
+            let next_idx = AtomicUsize::new(0);
+            let ready_slice = ready.as_slice();
+            let inputs_ref = &plan.inputs;
+            let values_ref = values.as_slice();
             std::thread::scope(|pool| {
-                let jobs: Vec<_> = ready
-                    .chunks(ready.len().div_ceil(threads))
-                    .map(|chunk| {
-                        pool.spawn(|| {
-                            run_chunk(wb, keys, chunk, &plan.inputs, &values, scope, cancel)
+                let jobs: Vec<_> = (0..threads)
+                    .map(|_| {
+                        let next_idx = &next_idx;
+                        pool.spawn(move || {
+                            let mut calc = Calc::new_worker(wb, ctx, scope, Some(shared_ref));
+                            calc.scheduling = true;
+                            calc.parallel_values = Some((keys, values_ref));
+                            let mut out = Vec::new();
+                            loop {
+                                if cancelled(cancel) {
+                                    break;
+                                }
+                                let start = next_idx.fetch_add(WORK_CHUNK, Ordering::Relaxed);
+                                if start >= ready_slice.len() {
+                                    break;
+                                }
+                                let end = (start + WORK_CHUNK).min(ready_slice.len());
+                                eval_ready_slice(
+                                    &mut calc,
+                                    keys,
+                                    &ready_slice[start..end],
+                                    inputs_ref,
+                                    values_ref,
+                                    cancel,
+                                    &mut out,
+                                );
+                            }
+                            out
                         })
                     })
                     .collect();
@@ -349,13 +491,23 @@ fn evaluate_with_workers(
                     .collect()
             })
         };
+
         for (slot, value) in results.into_iter().flatten() {
             completed += 1;
             values[slot] = Some(value);
             for &consumer in plan.consumers.get(slot) {
                 plan.waiting[consumer] -= 1;
                 if plan.waiting[consumer] == 0 {
-                    plan.ready.push(consumer);
+                    if consumer < n_real {
+                        plan.ready.push(consumer);
+                    } else {
+                        for &real_consumer in plan.consumers.get(consumer) {
+                            plan.waiting[real_consumer] -= 1;
+                            if plan.waiting[real_consumer] == 0 {
+                                plan.ready.push(real_consumer);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -363,31 +515,33 @@ fn evaluate_with_workers(
             done.store(completed, Ordering::Relaxed);
         }
     }
+
     if completed == keys.len() - pending || cancelled(cancel) {
         return initial;
     }
-    let mut pending = Vec::new();
-    let values = keys
+    let mut pending_out = Vec::new();
+    let out_values = keys
         .iter()
         .zip(values)
         .enumerate()
         .map(|(slot, (&(si, row, col), value))| {
-            let v = value.map_or_else(
-                || {
-                    pending.push(slot);
-                    FValue::Empty
-                },
-                |v| super::to_fvalue(&v),
-            );
+            let v = value.unwrap_or_else(|| {
+                pending_out.push(slot);
+                FValue::Empty
+            });
             (si, row, col, v)
         })
         .collect();
-    Some(Batch { values, pending })
+    Some(Batch {
+        values: out_values,
+        pending: pending_out,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Value;
     use crate::formula::{deps::Deps, recalc_all_force, recalc_dirty, set_formula};
     use crate::{Cell, Sheet};
 
@@ -410,7 +564,13 @@ mod tests {
                 (1, 0, format!("=SUM(Sheet1!B{n}:C{n})")),
                 (1, 1, format!("=IF(A{n}>0,TEXT(A{n},\"0\"),\"no\")")),
             ] {
-                set_formula(wb.sheet_mut(si), row, col, &formula, FValue::Number(-999.0));
+                set_formula(
+                    wb.sheet_mut(si),
+                    row,
+                    col,
+                    &formula,
+                    FValue::Number(-999.0),
+                );
             }
         }
         set_formula(wb.sheet_mut(0), 0, 7, "=1+1", FValue::Number(999.));
@@ -421,8 +581,11 @@ mod tests {
     fn evaluated_levels_match_serial_with_ranges_across_sheets_and_stale_inputs() {
         let mut wb = fixture();
         wb.names.push(("Rate".into(), None, "=5".into()));
+        wb.names
+            .push(("Tripler".into(), None, "=LAMBDA(x,x*3)".into()));
         set_formula(wb.sheet_mut(0), 0, 9, "=Rate+1", FValue::Empty);
         set_formula(wb.sheet_mut(0), 1, 9, "=J1+2", FValue::Empty);
+        set_formula(wb.sheet_mut(0), 2, 9, "=Tripler(2)", FValue::Empty);
         for (row, formula) in [
             "=SEQUENCE(1,2,3)",
             "=INDIRECT(\"A1\")",
@@ -443,19 +606,21 @@ mod tests {
             .collect();
         keys.sort_unstable();
         let progress = AtomicUsize::new(0);
-        let batch =
-            evaluate_with_workers(&wb, &keys, None, None, None, Some(&progress), 4).unwrap();
+        let ctx = EvalCtx::for_workbook(wb.date_system);
+        let batch = evaluate_with_workers(&wb, &keys, None, None, None, ctx, None, Some(&progress), 4)
+            .unwrap();
         let pending: Vec<_> = batch.pending.iter().map(|&i| keys[i]).collect();
+        // Static defined names (`Rate`, `J1+2`) are now evaluated in parallel;
+        // dynamic array `SEQUENCE`, `INDIRECT`, `NOW`, cyclic `D4`/`D5`, and named `LAMBDA` stay pending.
         assert_eq!(
             pending,
             [
                 (0, 0, 3),
-                (0, 0, 9),
                 (0, 1, 3),
-                (0, 1, 9),
                 (0, 2, 3),
+                (0, 2, 9),
                 (0, 3, 3),
-                (0, 4, 3)
+                (0, 4, 3),
             ]
         );
         assert_eq!(progress.load(Ordering::Relaxed), keys.len() - pending.len());
@@ -477,7 +642,9 @@ mod tests {
             Value::Error(super::super::ErrKind::Circular)
         );
         assert_eq!(wb.sheet(0).value(4, 3), Value::Number(7.));
+        assert_eq!(wb.sheet(0).value(0, 9), Value::Number(6.));
         assert_eq!(wb.sheet(0).value(1, 9), Value::Number(8.));
+        assert_eq!(wb.sheet(0).value(2, 9), Value::Number(6.));
     }
 
     #[test]
@@ -503,7 +670,10 @@ mod tests {
         let mut keys: Vec<_> = dirty.iter().copied().collect();
         keys.sort_unstable();
         assert!(!dirty.contains(&(0, 0, 7)));
-        let batch = evaluate_with_workers(&wb, &keys, None, Some(&dirty), None, None, 4).unwrap();
+        let ctx = EvalCtx::for_workbook(wb.date_system);
+        let batch =
+            evaluate_with_workers(&wb, &keys, None, Some(&dirty), None, ctx, None, None, 4)
+                .unwrap();
         assert!(batch.pending.is_empty());
         assert_eq!(
             batch.values[keys.binary_search(&(1, 759, 0)).unwrap()].3,
@@ -511,7 +681,8 @@ mod tests {
         );
         let flag = AtomicBool::new(true);
         assert!(
-            evaluate_with_workers(&wb, &keys, None, Some(&dirty), Some(&flag), None, 4).is_none()
+            evaluate_with_workers(&wb, &keys, None, Some(&dirty), None, ctx, Some(&flag), None, 4)
+                .is_none()
         );
         assert_eq!(wb.sheet(0).value(759, 1), Value::Number(2280.));
         recalc_dirty(&mut wb, &deps, &seeds);

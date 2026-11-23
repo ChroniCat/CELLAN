@@ -82,32 +82,35 @@ pub use model::*;
 
 /// 整列/整行引用在 OOXML 里写作 `Sheet!A:C`，解析器要求带行号。
 /// 加载时直接改写成 `Sheet!$A$1:$C$1048576`，省得词法再分一套规则。
-fn match_cols(chars: &[char], i: usize) -> Option<(usize, String, String)> {
+pub(crate) fn match_cols_bytes<'a>(text: &'a str, i: usize) -> Option<(usize, &'a str, &'a str)> {
+    let bytes = text.as_bytes();
     let mut j = i;
-    if j < chars.len() && chars[j] == '$' {
+    if bytes.get(j) == Some(&b'$') {
         j += 1;
     }
     let ls = j;
-    while j < chars.len() && chars[j].is_ascii_alphabetic() && j - ls < 3 {
+    while j < bytes.len() && bytes[j].is_ascii_alphabetic() && j - ls < 3 {
         j += 1;
     }
-    if j == ls || j >= chars.len() || chars[j] != ':' {
+    if j == ls || bytes.get(j) != Some(&b':') {
         return None;
     }
-    let first: String = chars[ls..j].iter().collect();
+    let first = &text[ls..j];
     j += 1;
-    if j < chars.len() && chars[j] == '$' {
+    if bytes.get(j) == Some(&b'$') {
         j += 1;
     }
     let ls2 = j;
-    while j < chars.len() && chars[j].is_ascii_alphabetic() && j - ls2 < 3 {
+    while j < bytes.len() && bytes[j].is_ascii_alphabetic() && j - ls2 < 3 {
         j += 1;
     }
     if j == ls2 {
         return None;
     }
-    let second: String = chars[ls2..j].iter().collect();
-    if j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '$' || chars[j] == '(' || chars[j] == '!') {
+    let second = &text[ls2..j];
+    if let Some(&next) = bytes.get(j)
+        && (next.is_ascii_alphanumeric() || matches!(next, b'$' | b'(' | b'!'))
+    {
         return None;
     }
     Some((j, first, second))
@@ -308,35 +311,41 @@ pub fn add_fn_prefixes(text: &str) -> String {
 /// `'` 包住工作表名/外部工作簿名，串内用 `''` 表示一个引号。
 /// 所有「改写公式」的步骤都必须只动引号外的片段——引号里是数据，不是公式。
 pub fn split_quoted(text: &str) -> Vec<(bool, &str)> {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let bytes = text.as_bytes();
+    if !bytes.contains(&b'"') && !bytes.contains(&b'\'') {
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![(false, text)]
+        };
+    }
     let mut out: Vec<(bool, &str)> = Vec::new();
-    let mut quote: Option<char> = None;
+    let mut quote: Option<u8> = None;
     let mut start = 0usize;
-    let mut k = 0usize;
-    while k < chars.len() {
-        let (i, c) = chars[k];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
         match quote {
-            None if c == '"' || c == '\'' => {
+            None if b == b'"' || b == b'\'' => {
                 if i > start {
                     out.push((false, &text[start..i]));
                 }
-                quote = Some(c);
+                quote = Some(b);
                 start = i;
             }
-            Some(q) if c == q => {
-                let escaped = chars.get(k + 1).map(|(_, n)| *n == q).unwrap_or(false);
-                if escaped {
-                    k += 1; // `""` / `''`：成对跳过，仍在串内
-                } else {
-                    let end = i + c.len_utf8();
-                    out.push((true, &text[start..end]));
-                    quote = None;
-                    start = end;
+            Some(q) if b == q => {
+                if bytes.get(i + 1) == Some(&q) {
+                    i += 2; // `""` / `''`：成对跳过，仍在串内
+                    continue;
                 }
+                let end = i + 1;
+                out.push((true, &text[start..end]));
+                quote = None;
+                start = end;
             }
             _ => {}
         }
-        k += 1;
+        i += 1;
     }
     if start < text.len() {
         out.push((quote.is_some(), &text[start..]));
@@ -347,77 +356,87 @@ pub fn split_quoted(text: &str) -> Vec<(bool, &str)> {
 /// 整列引用 `A:C`（可带表名前缀）在 OOXML 里不带行号，
 /// 加载时改写成 `$A$1:$C$1048576`，求值时再按实际使用范围裁剪。
 pub(crate) fn expand_whole_cols(text: &str) -> String {
-    if !text.contains(':') {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len() + 24);
-    for (in_quote, seg) in split_quoted(text) {
-        if in_quote {
-            out.push_str(seg);
-        } else {
-            out.push_str(&expand_whole_cols_seg(seg));
-        }
-    }
-    out
+    expand_whole_cols_cow(text).into_owned()
 }
 
-/// 只处理一段**引号外**的文本。
-fn expand_whole_cols_seg(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len() + 24);
-    let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-        {
-            let boundary = i == 0
-                || !(chars[i - 1].is_ascii_alphanumeric()
-                    || chars[i - 1] == '$'
-                    || chars[i - 1] == '.'
-                    || chars[i - 1] == '_');
-            if boundary {
-                if let Some((end, a, b)) = match_cols(&chars, i) {
-                    out.push_str(&format!("${a}$1:${b}$1048576"));
+pub(crate) fn expand_whole_cols_cow(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(':') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let segs = split_quoted(text);
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut offset = 0usize;
+    for (in_quote, seg) in segs {
+        if !in_quote {
+            let bytes = seg.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let b = bytes[i];
+                let boundary = i == 0
+                    || !(bytes[i - 1].is_ascii_alphanumeric()
+                        || matches!(bytes[i - 1], b'$' | b'.' | b'_'));
+                if boundary
+                    && (b == b'$' || b.is_ascii_alphabetic())
+                    && let Some((end, first, second)) = match_cols_bytes(seg, i)
+                {
+                    let buf = out.get_or_insert_with(|| String::with_capacity(text.len() + 24));
+                    buf.push_str(&text[copied..offset + i]);
+                    buf.push('$');
+                    buf.push_str(first);
+                    buf.push_str("$1:$");
+                    buf.push_str(second);
+                    buf.push_str("$1048576");
+                    copied = offset + end;
                     i = end;
                     continue;
                 }
+                i += 1;
             }
         }
-        out.push(c);
-        i += 1;
+        offset += seg.len();
     }
-    out
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&text[copied..]);
+            std::borrow::Cow::Owned(buf)
+        }
+        None => std::borrow::Cow::Borrowed(text),
+    }
 }
 
-/// 整行引用 `1:3` / `$1:$3` 的匹配。返回 (结束位置, 起始行, 结束行, 是否绝对行)。
-fn match_rows(chars: &[char], i: usize) -> Option<(usize, u32, u32, bool, bool)> {
+/// 整行引用 `1:3` / `$1:$3` 的匹配。返回 (结束字节下标, 起始行, 结束行, 是否绝对行)。
+pub(crate) fn match_rows_bytes(bytes: &[u8], i: usize) -> Option<(usize, u32, u32, bool, bool)> {
     let mut j = i;
-    let a_abs = j < chars.len() && chars[j] == '$';
+    let a_abs = bytes.get(j) == Some(&b'$');
     if a_abs {
         j += 1;
     }
     let start = j;
-    while j < chars.len() && chars[j].is_ascii_digit() && j - start < 7 {
+    while j < bytes.len() && bytes[j].is_ascii_digit() && j - start < 7 {
         j += 1;
     }
-    if j == start || j >= chars.len() || chars[j] != ':' {
+    if j == start || bytes.get(j) != Some(&b':') {
         return None;
     }
-    let first: u32 = chars[start..j].iter().collect::<String>().parse().ok()?;
+    let first: u32 = std::str::from_utf8(&bytes[start..j]).ok()?.parse().ok()?;
     j += 1;
-    let b_abs = j < chars.len() && chars[j] == '$';
+    let b_abs = bytes.get(j) == Some(&b'$');
     if b_abs {
         j += 1;
     }
     let start2 = j;
-    while j < chars.len() && chars[j].is_ascii_digit() && j - start2 < 7 {
+    while j < bytes.len() && bytes[j].is_ascii_digit() && j - start2 < 7 {
         j += 1;
     }
     if j == start2 {
         return None;
     }
-    let second: u32 = chars[start2..j].iter().collect::<String>().parse().ok()?;
+    let second: u32 = std::str::from_utf8(&bytes[start2..j]).ok()?.parse().ok()?;
     // `1:3` 后面不能紧跟字母/数字/`$`/`(`/`!`，否则不是完整的整行引用（如数字表名三维区间 1:3!A1）。
-    if j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '$' || chars[j] == '(' || chars[j] == '!') {
+    if let Some(&next) = bytes.get(j)
+        && (next.is_ascii_alphanumeric() || matches!(next, b'$' | b'(' | b'!'))
+    {
         return None;
     }
     if first == 0 || second == 0 {
@@ -429,147 +448,153 @@ fn match_rows(chars: &[char], i: usize) -> Option<(usize, u32, u32, bool, bool)>
 /// 整行引用在 OOXML/公式里是 `1:3`；解析器只认 A1 区域，因此先展开成
 /// `A1:XFD3`（或绝对行 `A$1:XFD$3`），求值时再按实际使用范围裁剪。
 pub(crate) fn expand_whole_rows(text: &str) -> String {
-    if !text.contains(':') {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len() + 24);
-    for (in_quote, seg) in split_quoted(text) {
-        if in_quote {
-            out.push_str(seg);
-        } else {
-            out.push_str(&expand_whole_rows_seg(seg));
-        }
-    }
-    out
+    expand_whole_rows_cow(text).into_owned()
 }
 
-fn expand_whole_rows_seg(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len() + 24);
-    let mut i = 0usize;
-    let mut bracket_depth = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '[' {
-            bracket_depth += 1;
-        } else if c == ']' {
-            bracket_depth = bracket_depth.saturating_sub(1);
-        }
-        let boundary = bracket_depth == 0
-            && (i == 0
-                || !(chars[i - 1].is_ascii_alphanumeric()
-                    || chars[i - 1] == '$'
-                    || chars[i - 1] == '.'
-                    || chars[i - 1] == '_'));
-        if boundary {
-            if let Some((end, a, b, a_abs, b_abs)) = match_rows(&chars, i) {
-                let da = if a_abs { "$" } else { "" };
-                let db = if b_abs { "$" } else { "" };
-                out.push_str(&format!("A{da}{a}:XFD{db}{b}"));
-                i = end;
-                continue;
+pub(crate) fn expand_whole_rows_cow(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(':') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let segs = split_quoted(text);
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut offset = 0usize;
+    for (in_quote, seg) in segs {
+        if !in_quote {
+            let bytes = seg.as_bytes();
+            let mut i = 0usize;
+            let mut bracket_depth = 0usize;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b == b'[' {
+                    bracket_depth += 1;
+                } else if b == b']' {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                }
+                let boundary = bracket_depth == 0
+                    && (i == 0
+                        || !(bytes[i - 1].is_ascii_alphanumeric()
+                            || matches!(bytes[i - 1], b'$' | b'.' | b'_')));
+                if boundary
+                    && (b == b'$' || b.is_ascii_digit())
+                    && let Some((end, a, b_row, a_abs, b_abs)) = match_rows_bytes(bytes, i)
+                {
+                    let buf = out.get_or_insert_with(|| String::with_capacity(text.len() + 24));
+                    buf.push_str(&text[copied..offset + i]);
+                    use std::fmt::Write;
+                    let da = if a_abs { "$" } else { "" };
+                    let db = if b_abs { "$" } else { "" };
+                    let _ = write!(buf, "A{da}{a}:XFD{db}{b_row}");
+                    copied = offset + end;
+                    i = end;
+                    continue;
+                }
+                i += 1;
             }
         }
-        out.push(c);
-        i += 1;
+        offset += seg.len();
     }
-    out
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&text[copied..]);
+            std::borrow::Cow::Owned(buf)
+        }
+        None => std::borrow::Cow::Borrowed(text),
+    }
 }
 
 pub fn normalize_formula(text: &str) -> String {
-    if !text.contains("_xl") && !text.contains('!') && !text.contains(':') {
-        return text.to_string();
+    normalize_formula_cow(text).into_owned()
+}
+
+pub(crate) fn normalize_formula_cow(text: &str) -> std::borrow::Cow<'_, str> {
+    let has_xl = text.contains("_xl");
+    let has_colon = text.contains(':');
+    if !has_xl && !has_colon {
+        return std::borrow::Cow::Borrowed(text);
     }
     // 整行引用必须保留原文（1:3），否则加载后复制/插列会把 A1:XFD3 当作
     // 普通全宽区域平移，#REF 或漏掉 A 列。求值/依赖解析时再临时展开。
-    let text = expand_whole_cols(text);
-    let mut out = String::with_capacity(text.len());
-    for (in_quote, seg) in split_quoted(&text) {
-        if in_quote {
+    let cols_expanded = expand_whole_cols_cow(text);
+    if !has_xl {
+        return cols_expanded;
+    }
+    let src: &str = &cols_expanded;
+    let mut out = String::with_capacity(src.len());
+    for (in_quote, seg) in split_quoted(src) {
+        if in_quote || !seg.contains("_xl") {
             out.push_str(seg);
         } else {
             out.push_str(&strip_fn_prefixes(seg));
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// 剥掉 `_xlfn.` / `_xlfn._xlws.` / `_xludf.` 这类**函数调用前缀**。
-///
-/// 不能对整段做 `replace`：`Tax_xlfn.Rate` 是合法名称、`Sales_xlfn.Backup` 是合法表名，
-/// 只要前缀前面还粘着别的字符，就不是前缀。判据三条：
-/// 1. 必须从标识符起点开始（前一个字符不是字母/数字/`_`/`.`）；
-/// 2. 前缀后面必须是合法标识符；
-/// 3. 函数前缀（`_xlfn.`/`_xlws.`/`_xludf.`）后面的标识符必须紧跟 `(` ——
-///    这才说明它是一个被调用的函数，而不是同名名称。
-/// `_xlpm.` 是 LET/LAMBDA 的参数名，它不跟括号，单独处理。
 fn strip_fn_prefixes(seg: &str) -> String {
-    const FN_PREFIXES: [&str; 3] = ["_xlfn.", "_xlws.", "_xludf."];
-    let chars: Vec<char> = seg.chars().collect();
+    const FN_PREFIXES: [&[u8]; 3] = [b"_xlfn.", b"_xlws.", b"_xludf."];
+    let bytes = seg.as_bytes();
     let mut out = String::with_capacity(seg.len());
+    let mut copied = 0usize;
     let mut i = 0usize;
-    // 结构化引用（`Sales[_xlpm.Amount]`）里的方括号内容是**列名**，不是公式 token
     let mut bracket_depth = 0usize;
-    let id_start = |c: char| c.is_ascii_alphabetic() || c == '_' || c > '\u{7f}';
-    let id_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c > '\u{7f}';
-    while i < chars.len() {
-        if chars[i] == '[' {
+    let id_start = |b: u8| b.is_ascii_alphabetic() || b == b'_' || b >= 0x80;
+    let id_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b >= 0x80;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'[' {
             bracket_depth += 1;
-        } else if chars[i] == ']' {
+        } else if b == b']' {
             bracket_depth = bracket_depth.saturating_sub(1);
         }
         let boundary = bracket_depth == 0
             && (i == 0
-                || !(chars[i - 1].is_ascii_alphanumeric()
-                    || matches!(chars[i - 1], '_' | '.' | '$')));
-        if boundary {
-            let rest: String = chars[i..].iter().take(16).collect();
-            // LET/LAMBDA 的参数：_xlpm.name → name
-            if rest.starts_with("_xlpm.") {
-                let mut j = i + "_xlpm.".len();
-                let name_start = j;
-                while j < chars.len() && id_char(chars[j]) {
+                || !(bytes[i - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[i - 1], b'_' | b'.' | b'$')
+                    || bytes[i - 1] >= 0x80));
+        if boundary && b == b'_' {
+            if bytes[i..].starts_with(b"_xlpm.") {
+                let name_start = i + 6;
+                let mut j = name_start;
+                while j < bytes.len() && id_byte(bytes[j]) {
                     j += 1;
                 }
-                if j > name_start && id_start(chars[name_start]) {
-                    out.extend(chars[name_start..j].iter());
+                if j > name_start && id_start(bytes[name_start]) {
+                    out.push_str(&seg[copied..i]);
+                    out.push_str(&seg[name_start..j]);
+                    copied = j;
                     i = j;
                     continue;
                 }
             }
-            // 函数前缀：可以连续出现（_xlfn._xlws.FILTER）
             let mut j = i;
             let mut matched = false;
-            loop {
-                let ahead: String = chars[j..].iter().take(8).collect();
-                match FN_PREFIXES.iter().find(|p| ahead.starts_with(**p)) {
-                    Some(p) => {
-                        j += p.len();
-                        matched = true;
-                    }
-                    None => break,
-                }
+            while let Some(p) = FN_PREFIXES.iter().find(|p| bytes[j..].starts_with(p)) {
+                j += p.len();
+                matched = true;
             }
             if matched {
                 let name_start = j;
-                while j < chars.len() && id_char(chars[j]) {
+                while j < bytes.len() && id_byte(bytes[j]) {
                     j += 1;
                 }
                 let mut k = j;
-                while k < chars.len() && chars[k].is_whitespace() {
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                     k += 1;
                 }
-                let is_call = k < chars.len() && chars[k] == '(';
-                if j > name_start && id_start(chars[name_start]) && is_call {
-                    out.extend(chars[name_start..j].iter());
+                if j > name_start && id_start(bytes[name_start]) && bytes.get(k) == Some(&b'(') {
+                    out.push_str(&seg[copied..i]);
+                    out.push_str(&seg[name_start..j]);
+                    copied = j;
                     i = j;
                     continue;
                 }
             }
         }
-        out.push(chars[i]);
         i += 1;
     }
+    out.push_str(&seg[copied..]);
     out
 }
 

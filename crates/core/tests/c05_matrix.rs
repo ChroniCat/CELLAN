@@ -32,7 +32,7 @@ fn render(v: &FValue) -> String {
             ErrKind::Null => "#NULL!".into(),
             other => format!("{other:?}"),
         },
-        FValue::Text(s) => s.clone(),
+        FValue::Text(s) => s.to_string(),
         FValue::Number(n) => {
             if (n.fract()).abs() < f64::EPSILON {
                 format!("{}", *n as i64)

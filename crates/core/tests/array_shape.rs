@@ -19,7 +19,7 @@ fn grid(v: &FValue) -> (usize, usize, String) {
                     if n.fract() == 0.0 { format!("{}", *n as i64) } else { format!("{n}") }
                 }
                 FValue::Bool(b) => format!("{b}"),
-                FValue::Text(t) => t.clone(),
+                FValue::Text(t) => t.to_string(),
                 FValue::Empty => "".into(),
                 other => format!("{other:?}"),
             };
