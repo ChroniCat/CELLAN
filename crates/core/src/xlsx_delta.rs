@@ -21,6 +21,7 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 #[derive(Clone, Debug)]
 pub(crate) struct SourceCells {
+    pub(crate) layout: crate::patch::layout_xml::Baseline,
     store: Arc<Store>,
     signature: (u32, u64),
     strings: Option<(u32, u64)>,
@@ -37,7 +38,7 @@ type Rect = (u32, u32, u32, u32);
 #[derive(Default)]
 struct StyleChanges {
     updates: HashMap<CellRef, Option<u16>>,
-    // A new font XF derives from a specific pre-edit raw XF. Confirm that
+    // A derived XF belongs to a specific pre-edit raw XF. Confirm that
     // original on the worksheet too, including model-default/ambiguous cells.
     sources: HashMap<CellRef, u16>,
 }
@@ -289,6 +290,7 @@ impl SourceCells {
                     })
             });
         Some(Self {
+            layout: crate::patch::layout_xml::Baseline::capture(sheet),
             store,
             notes,
             signature: signature(zip, part)?,
@@ -321,7 +323,7 @@ fn coordinates(
     sheet: &Sheet,
     source: &SourceCells,
     styles: &StyleTable,
-    mut new_font_xf: impl FnMut(u16, u16, u16) -> Option<u16>,
+    mut derive_xf: impl FnMut(u16, u16, u16) -> Option<u16>,
 ) -> Option<Changes> {
     let base = &source.store;
     let mut keys = BTreeSet::new();
@@ -384,10 +386,11 @@ fn coordinates(
                         let (old, raw) = source.original_xf(sheet, key, styles)?;
                         if !map.unchanged(old, styles)
                             || styles.theme_of(id) != styles.theme_of(old)
-                            || styles.pattern_of(id) != styles.pattern_of(old)
+                            || (styles.pattern_of(id) != styles.pattern_of(old)
+                                && !(font_delta::plain_fill_pattern(styles, id) && font_delta::plain_fill_pattern(styles, old)))
                             || styles.diag_of(id) != styles.diag_of(old)
                             || styles.quote_of(id) != styles.quote_of(old) { return None; }
-                        let xf = new_font_xf(raw, old, id)?;
+                        let xf = derive_xf(raw, old, id)?;
                         changed_styles.sources.insert(key, raw);
                         Some(xf)
                     }
@@ -1137,7 +1140,7 @@ pub(super) fn write_with_style_receipt(
     let sst = signature(&mut zip, "xl/sharedStrings.xml");
     let style_part = signature(&mut zip, "xl/styles.xml");
     let style_xml = std::cell::OnceCell::new();
-    let mut fonts = None;
+    let mut changed_xfs = None;
     let mut base_map = None;
     for sheet in &wb.sheets {
         if sheet.row_styles_dirty || sheet.col_styles_dirty {
@@ -1163,11 +1166,11 @@ pub(super) fn write_with_style_receipt(
             return Ok(false);
         }
         let Some(changes) = coordinates(sheet, source, &wb.styles, |raw, old, id| {
-            if fonts.is_none() {
+            if changed_xfs.is_none() {
                 let xml = style_xml.get_or_init(|| super::read_zip_text(&mut zip, "xl/styles.xml").ok());
-                fonts = Some(font_delta::FontEdits::new(xml.as_deref()?)?);
+                changed_xfs = Some(font_delta::Styles::new(xml.as_deref()?)?);
             }
-            fonts.as_mut()?.resolve(raw, old, id, &wb.styles)
+            changed_xfs.as_mut()?.resolve(raw, old, id, &wb.styles)
         }) else {
             return Ok(false);
         };
@@ -1198,7 +1201,7 @@ pub(super) fn write_with_style_receipt(
         }
     }
     let mut updated_map = None;
-    if let Some((xml, additions)) = fonts.and_then(font_delta::FontEdits::finish) {
+    if let Some((xml, additions)) = changed_xfs.and_then(font_delta::Styles::finish) {
         let Some(old) = base_map else { return Ok(false); };
         let mut mapped = old.xfs.clone();
         let mut derived_from = old.derived_from.clone();
@@ -1587,6 +1590,82 @@ mod tests {
                 assert!(copied.bold && copied.italic);
                 assert_eq!(copied.size, 15.0);
             }
+        }
+    }
+
+    #[test]
+    fn fill_font_and_number_edits_reopen_without_losing_raw_xf_fields() {
+        let (dir, file, _) = fixture(r#"<row r="1"><c r="A1"><v>42</v></c><c r="B1"><v>17</v></c></row>"#, "");
+        let base = r#"<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" e:keep="yes"><alignment readingOrder="2"/></xf>"#;
+        let template = format!(r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:e="urn:keep"><fonts count="1"><font><name val="Calibri"/><sz val="11"/><family val="2"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf fontId="0" fillId="0" numFmtId="0"/></cellStyleXfs><cellXfs count="1">{base}</cellXfs></styleSheet>"#);
+        for (kind, styles_xml) in [("missing", template.clone()), ("empty", template.replace("<fonts ", "<numFmts count=\"0\"/><fonts "))] {
+            let path = dir.path().join(format!("derived-{kind}.xlsx"));
+            std::fs::copy(&file, &path).unwrap();
+            crate::fixups::write_parts(&path, &[("xl/styles.xml".into(), styles_xml.as_bytes().into())]).unwrap();
+            let (mut wb, diag) = load_diag(&path).unwrap();
+            assert!(diag.is_complete());
+            let custom = "0.000\" & units\"";
+            for (fill, color, strike, format) in [
+                (Some([12,34,56]), [21,43,65], true, custom),
+                (None, [0,0,0], false, "0.00%"),
+            ] {
+                let mut s = wb.styles.get(wb.sheets[0].style_of(0,0)).clone();
+                s.fill = fill;
+                s.color = color;
+                s.strikethrough = strike;
+                s.format = format.into();
+                let id = wb.styles.intern(s);
+                wb.sheets[0].set_style(0,0,id);
+                let receipt = save_atomic_with_receipt(&path, &wb).unwrap();
+                assert!(receipt.used_cell_delta, "{kind}: {format}");
+                receipt.adopt_document(&mut wb, &path, true);
+                let raw = String::from_utf8(read_part(&path,"xl/styles.xml").unwrap()).unwrap();
+                assert!(raw.contains(base));
+                let doc = roxmltree::Document::parse(&raw).unwrap();
+                let xfs = doc.descendants().find(|n| n.tag_name().name() == "cellXfs").unwrap();
+                assert!(xfs.children().filter(|n| n.is_element()).all(|xf|
+                    xf.attribute(("urn:keep","keep")) == Some("yes") &&
+                    xf.children().any(|n| n.attribute("readingOrder") == Some("2"))));
+                assert_eq!(doc.descendants().filter(|n| n.attribute("formatCode") == Some(custom)).count(), 1);
+                let (view, diag) = load_diag(&path).unwrap();
+                assert!(diag.is_complete(), "{:?}", diag.problems);
+                let style = view.styles.get(view.sheets[0].style_of(0,0));
+                assert_eq!((style.fill,style.color,style.strikethrough,style.format.as_str()), (fill,color,strike,format));
+                assert_eq!(view.sheets[0].value(0,1), Value::Number(17.0));
+                assert_eq!(view.styles.get(view.sheets[0].style_of(0,1)).fill, None);
+                if kind == "empty" {
+                    // The next edit starts from the actual file's style map.
+                    wb = view;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn format_of_a_fresh_default_cell_can_be_changed_after_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("default-format.xlsx");
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0,0,num(42.0));
+        save(&file, &wb).unwrap();
+        for (fill, code) in [(Some([12,34,56]), "0.000"), (None, "0.00%")] {
+            let mut wb = load_diag(&file).unwrap().0;
+            let original = wb.sheets[0].style_of(0,0);
+            let mut style = wb.styles.get(original).clone();
+            style.fill = fill;
+            style.format = code.into();
+            let id = wb.styles.intern(style);
+            wb.sheets[0].set_style(0,0,id);
+            // Explicitly removing the original theme-backed font is a different edit.
+            let theme = wb.styles.theme_of(original);
+            if theme != wb.styles.theme_of(id) {
+                assert!(!write_if_supported(&file, &dir.path().join("unsupported.xlsx"), &wb).unwrap());
+                wb.styles.set_theme(id, theme);
+            }
+            assert!(save_atomic_with_receipt(&file, &wb).unwrap().used_cell_delta, "{code}");
+            let wb = load_diag(&file).unwrap().0;
+            let saved = wb.styles.get(wb.sheets[0].style_of(0,0));
+            assert_eq!((saved.fill,saved.format.as_str()),(fill,code));
         }
     }
 

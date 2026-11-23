@@ -202,33 +202,63 @@ fn esc(s: &str) -> String {
 
 /// 写出 `<scenarios>`（空列表表示删掉整段）
 pub fn set_scenarios(xml: &str, list: &[Scenario]) -> String {
-    // 先删旧的
-    let mut x = String::with_capacity(xml.len() + 128);
-    let mut rest = xml;
-    while let Some(i) = rest.find("<scenarios") {
-        x.push_str(&rest[..i]);
-        let tail = &rest[i..];
-        if let Some(gt) = tail.find('>') {
-            if tail[..gt].ends_with('/') {
-                rest = &tail[gt + 1..];
-            } else if let Some(end) = tail.find("</scenarios>") {
-                rest = &tail[end + "</scenarios>".len()..];
-            } else {
-                rest = &tail[gt + 1..];
+    edit_scenarios(xml, list).unwrap_or_else(|_| xml.to_owned())
+}
+
+pub(crate) fn edit_scenarios(xml: &str, list: &[Scenario]) -> anyhow::Result<String> {
+    use anyhow::{Context, ensure};
+    use quick_xml::{NsReader, events::Event, name::ResolveResult};
+
+    // Only worksheet children determine the slot. In particular sheetData may
+    // be empty, and extensions may contain unrelated elements named scenarios.
+    let mut reader = NsReader::from_str(xml);
+    let mut root = None;
+    let mut old = None;
+    let mut insert = None;
+    loop {
+        let start = reader.buffer_position() as usize;
+        let (ns, event) = reader.read_resolved_event()?;
+        let uri = match ns {
+            ResolveResult::Bound(ns) => ns.0,
+            ResolveResult::Unbound => "",
+            ResolveResult::Unknown(_) => anyhow::bail!("工作表 XML 使用未声明的命名空间"),
+        };
+        match event {
+            Event::Start(tag) if root.is_none() => {
+                let name = tag.name();
+                let prefix = name.as_ref().strip_suffix("worksheet").context("缺少 worksheet 根元素")?;
+                ensure!(tag.local_name().as_ref() == "worksheet", "无效的工作表根元素");
+                root = Some((uri.to_owned(), prefix.to_owned()));
             }
-        } else {
-            rest = tail;
-            break;
+            event @ (Event::Start(_) | Event::Empty(_)) if root.is_some() => {
+                let empty = matches!(event, Event::Empty(_));
+                let (Event::Start(tag) | Event::Empty(tag)) = event else { unreachable!() };
+                let worksheet_ns = root.as_ref().unwrap().0 == uri;
+                let local = tag.local_name();
+                if !empty { reader.read_to_end(tag.name())?; }
+                let end = reader.buffer_position() as usize;
+                if worksheet_ns {
+                    match local.as_ref() {
+                        "sheetData" | "sheetCalcPr" | "sheetProtection" | "protectedRanges" => insert = Some(end),
+                        "scenarios" => {
+                            ensure!(old.is_none(), "工作表存在重复的 scenarios");
+                            old = Some(start..end);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Event::End(_) if root.is_some() => break,
+            Event::Eof => anyhow::bail!("工作表 XML 不完整"),
+            _ => {}
         }
     }
-    x.push_str(rest);
-    if list.is_empty() {
-        return x;
-    }
-    let mut block = String::from("<scenarios>");
+    let mut insert = insert.context("缺少工作表数据")?;
+    let (_, prefix) = root.context("缺少工作表根元素")?;
+    let mut block = if list.is_empty() { String::new() } else { format!("<{prefix}scenarios>") };
     for sc in list {
         block.push_str(&format!(
-            "<scenario name=\"{}\" locked=\"1\" hidden=\"{}\"",
+            "<{prefix}scenario name=\"{}\" locked=\"1\" hidden=\"{}\"",
             esc(&sc.name),
             if sc.hidden { 1 } else { 0 }
         ));
@@ -238,32 +268,22 @@ pub fn set_scenarios(xml: &str, list: &[Scenario]) -> String {
         block.push('>');
         for ((r, c), v) in &sc.cells {
             block.push_str(&format!(
-                "<inputCells r=\"{}\" val=\"{}\"/>",
+                "<{prefix}inputCells r=\"{}\" val=\"{}\"/>",
                 crate::model::cell_name(*r, *c),
                 esc(v)
             ));
         }
-        block.push_str("</scenario>");
+        block.push_str(&format!("</{prefix}scenario>"));
     }
-    block.push_str("</scenarios>");
-    // 位置：autoFilter / mergeCells / 其它靠前的元素之前，实在没有就紧跟 </sheetData>
-    let mut at = x.len();
-    for tag in ["<autoFilter", "<sortState", "<mergeCells", "<conditionalFormatting"] {
-        if let Some(i) = x.find(tag) {
-            if i < at {
-                at = i;
-            }
-        }
+    if !list.is_empty() { block.push_str(&format!("</{prefix}scenarios>")); }
+    let mut out = String::with_capacity(xml.len() + block.len());
+    out.push_str(xml);
+    if let Some(range) = old {
+        if range.end <= insert { insert -= range.len(); }
+        out.replace_range(range, "");
     }
-    if at == x.len() {
-        if let Some(i) = x.find("</sheetData>") {
-            at = i + "</sheetData>".len();
-        } else if let Some(i) = x.find("</worksheet>") {
-            at = i;
-        }
-    }
-    x.insert_str(at, &block);
-    x
+    out.insert_str(insert, &block);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -304,6 +324,19 @@ mod tests {
         assert_eq!(sc.cells.len(), 2);
         assert_eq!(sc.cells[0].1, "10");
         assert_eq!(sc.cells[1].1, "abc");
+    }
+
+    #[test]
+    fn scenarios_follow_protection_and_leave_extension_markup_intact() {
+        let xml = r#"<x:worksheet xmlns:x="urn:sheet" xmlns:f="urn:other"><x:sheetData/><x:sheetProtection/><x:protectedRanges/><x:pageMargins/><x:scenarios/><x:extLst><f:scenarios/></x:extLst></x:worksheet>"#;
+        let mut scenario = Scenario::new("Base");
+        scenario.cells.push(((0, 0), "7".into()));
+        let patched = edit_scenarios(xml, &[scenario]).unwrap();
+        let doc = roxmltree::Document::parse(&patched).unwrap();
+        let names: Vec<_> = doc.root_element().children().filter(|n| n.is_element()).map(|n| n.tag_name().name()).collect();
+        assert_eq!(names, ["sheetData", "sheetProtection", "protectedRanges", "scenarios", "pageMargins", "extLst"]);
+        assert!(patched.contains("<f:scenarios/>"));
+        assert!(doc.descendants().any(|n| n.has_tag_name(("urn:sheet", "inputCells")) && n.attribute("val") == Some("7")));
     }
 
     #[test]

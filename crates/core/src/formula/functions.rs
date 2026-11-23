@@ -303,10 +303,14 @@ impl GroupValue {
 }
 
 /// Group a repeated set of literal SUMIFS/COUNTIFS ranges by equality criteria.
-/// Each Calc holds at most one index per function. Inequalities, wildcard queries
-/// and unsupported numeric keys keep the normal scan and its coercion semantics.
+/// Each function shares its group budget across a few recently used range sets.
+/// Inequalities, wildcards and fractional numeric keys keep the scan semantics.
 #[derive(Default)]
 pub(super) struct GroupedCriteria {
+    entries: std::collections::VecDeque<GroupedRange>,
+}
+
+struct GroupedRange {
     ranges: Vec<super::RangeKey>,
     numeric: Vec<bool>,
     attempted: bool,
@@ -315,7 +319,11 @@ pub(super) struct GroupedCriteria {
 
 impl GroupedCriteria {
     #[cfg(test)]
-    pub(super) fn is_built(&self) -> bool { self.groups.is_some() }
+    pub(super) fn built_ranges(&self) -> usize {
+        self.entries.iter().filter(|e| e.groups.is_some()).count()
+    }
+    #[cfg(test)]
+    pub(super) fn entries_len(&self) -> usize { self.entries.len() }
 
     pub(super) fn lookup(&mut self, key: &super::CriteriaKey, args: &[Arg]) -> Option<FValue> {
         let sum = key.function == 0;
@@ -334,24 +342,30 @@ impl GroupedCriteria {
                 None => GroupValue::Text(crit.text),
             });
         }
-        if self.ranges != key.ranges || self.numeric != numeric {
-            self.ranges.clone_from(&key.ranges);
-            self.numeric = numeric;
-            self.groups = None;
-            self.attempted = false;
+        let Some(slot) = self.entries.iter().position(|e| e.ranges == key.ranges && e.numeric == numeric) else {
+            if self.entries.len() == 4 { self.entries.pop_front(); }
+            self.entries.push_back(GroupedRange {
+                ranges: key.ranges.clone(), numeric, groups: None, attempted: false,
+            });
             return None;
-        }
-        if !self.attempted {
-            self.attempted = true;
+        };
+        let mut entry = self.entries.remove(slot)?;
+        if !entry.attempted {
+            entry.attempted = true;
             let columns: Vec<_> = criteria.chunks_exact(2).map(|pair| pair[0].slice()).collect();
             let amounts = sum.then(|| args[0].slice());
-            self.groups = self.build_groups(&columns, amounts);
+            let used: usize = self.entries.iter().filter_map(|e| e.groups.as_ref()).map(|g| g.len()).sum();
+            entry.groups = entry.build_groups(&columns, amounts, 65_536 - used);
         }
-        Some(FValue::number(self.groups.as_ref()?.get(&query).copied().unwrap_or(0.0)))
+        let result = entry.groups.as_ref().map(|g| FValue::number(g.get(&query).copied().unwrap_or(0.0)));
+        self.entries.push_back(entry);
+        result
     }
+}
 
+impl GroupedRange {
     fn build_groups(
-        &self, columns: &[&[FValue]], amounts: Option<&[FValue]>,
+        &self, columns: &[&[FValue]], amounts: Option<&[FValue]>, limit: usize,
     ) -> Option<std::collections::HashMap<Vec<GroupValue>, f64>> {
         let rows = columns.iter().map(|col| col.len()).min()?.min(amounts.map_or(usize::MAX, |v| v.len()));
         let mut groups = std::collections::HashMap::new();
@@ -377,7 +391,7 @@ impl GroupedCriteria {
             if let Some(total) = groups.get_mut(&key) {
                 *total += add;
             } else {
-                if groups.len() >= 65_536 { return None; }
+                if groups.len() >= limit { return None; }
                 groups.insert(std::mem::take(&mut key), add);
             }
         }
@@ -775,6 +789,10 @@ fn round_sig15(x: f64) -> f64 {
 }
 
 pub fn call(name: &str, args: &[Arg]) -> FValue {
+    call_or_else(name, args, &mut || FValue::Error(ErrKind::Name))
+}
+
+pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -> FValue) -> FValue {
     match name {
         // ---------------- 数学 / 三角
         "SUM" => r(|| {
@@ -2150,7 +2168,7 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
 
         _ => crate::formula::array::call_array(name, args)
             .or_else(|| crate::formula::extra::call_extra(name, args))
-            .unwrap_or(FValue::Error(ErrKind::Name)),
+            .unwrap_or_else(unknown),
     }
 }
 
@@ -2540,6 +2558,12 @@ fn format_value(v: &FValue, fmt: &str) -> String {
 /// 已实现的函数名列表（用于覆盖率统计与文档）
 pub fn implemented() -> Vec<&'static str> {
     IMPLEMENTED.to_vec()
+}
+
+pub(super) fn listed_builtin(name: &str) -> bool {
+    static NAMES: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+        std::sync::LazyLock::new(|| IMPLEMENTED.iter().copied().collect());
+    NAMES.contains(name)
 }
 
 const IMPLEMENTED: &[&str] = &[

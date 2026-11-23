@@ -161,7 +161,7 @@ pub fn percentile_inc(sorted: &[f64], p: f64) -> f64 {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CfKind {
     CellIs { op: CfOp, a: String, b: String, dxf: usize },
     Text { contains: String, dxf: usize },
@@ -267,7 +267,7 @@ impl IconMark {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CfRule {
     pub kind: CfKind,
     pub stop: bool,
@@ -275,13 +275,13 @@ pub struct CfRule {
     pub priority: u32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CfBlock {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub rules: Vec<CfRule>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CfSheet {
     pub blocks: Vec<CfBlock>,
     pub dxfs: Vec<Dxf>,

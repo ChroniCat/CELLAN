@@ -171,24 +171,15 @@ impl Walker<'_> {
     }
 
     fn name(&mut self, si: usize, name: &str, scoped: bool) {
-        let wb = self.wb;
-        let mut global = None;
-        let mut local = None;
-        for (index, (nm, scope, _)) in wb.names.iter().enumerate() {
-            if nm.eq_ignore_ascii_case(name) {
-                if *scope == Some(si) {
-                    local = Some(index);
-                    break;
-                }
-                if scope.is_none() && (!scoped || global.is_none()) {
-                    global = Some(index);
-                }
-            }
-        }
-        let Some(index) = local.or(global) else {
+        let Some(index) = super::named_definition(self.wb, name, si, scoped) else {
             self.result.runtime = true;
             return;
         };
+        self.definition(si, index);
+    }
+
+    fn definition(&mut self, si: usize, index: usize) {
+        let wb = self.wb;
         // Cyclic/name-expanding definitions cannot supply a finite static index.
         if self.name_expansions >= 512 || self.names.len() >= 32 || self.names.contains(&(si, index)) {
             self.result.runtime = true;
@@ -296,7 +287,22 @@ impl Walker<'_> {
                 self.walk(args.last().unwrap(), si);
                 self.bound.truncate(base);
             }
+            Node::Func(name, args) if name == "__CALL__" && matches!(args.first(), Some(Node::ScopedName { book: None, .. })) => {
+                let caller = std::mem::take(&mut self.bound);
+                self.walk(&args[0], si);
+                self.bound = caller;
+                for arg in &args[1..] { self.walk(arg, si); }
+            }
             Node::Func(name, args) => {
+                if !wb.names.is_empty()
+                    && !super::functions::listed_builtin(name)
+                    && !self.bound.iter().any(|local| local == name)
+                    && let Some(index) = super::named_definition(wb, name, si, false)
+                {
+                    let caller = std::mem::take(&mut self.bound);
+                    self.definition(si, index);
+                    self.bound = caller;
+                }
                 // The target may change on any edit. Re-evaluate this formula and all its
                 // statically indexed dependents, pulling changed precedents via Calc's scope.
                 self.result.volatile_ref |= matches!(name.as_str(), "INDIRECT" | "OFFSET");

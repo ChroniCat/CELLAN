@@ -18,7 +18,7 @@ pub enum Structural {
 }
 
 impl Structural {
-    fn reference_shift(&self) -> crate::refs::Shift {
+    pub(crate) fn reference_shift(&self) -> crate::refs::Shift {
         use crate::refs::Axis::{Row, Col};
         let (axis, at, n, delete) = match *self {
             Self::InsertRows { at, n } => (Row, at, n, false),
@@ -134,7 +134,7 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.rows.insert_at(*at, *n);
+                self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, *at, *n, false));
                 self.shift_axis_styles(&shift);
             }
             Structural::DeleteRows { at, n } => {
@@ -150,7 +150,7 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.rows.delete_at(*at, *n);
+                self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, *at, *n, true));
                 self.shift_axis_styles(&shift);
             }
             Structural::InsertCols { at, n } => {
@@ -169,7 +169,7 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.cols.insert_at(*at, *n);
+                self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, *at, *n, false));
                 self.shift_axis_styles(&shift);
             }
             Structural::DeleteCols { at, n } => {
@@ -185,7 +185,7 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.cols.delete_at(*at, *n);
+                self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, *at, *n, true));
                 self.shift_axis_styles(&shift);
             }
         }
@@ -205,6 +205,7 @@ impl Sheet {
     /// 数组元数据与单元格使用同一坐标变换。旧溢出尾格仍需登记，
     /// 后续重算才能清除它们，而不会把它们误当成用户输入的阻塞项。
     fn shift_array_and_hyperlink_ranges(&mut self, shift: &MappedShift) {
+        if shift.n != 0 { self.coordinates_shifted(); }
         let rows = shift.axis == crate::refs::Axis::Row;
         if shift.n == 0 { return; }
         // 刚从 OOXML 读入、尚未重算时，CSE 尾格还没有 spilled 标记。
@@ -552,7 +553,7 @@ impl Sheet {
         self.shift_dv(shift);
         self.shift_sparklines(shift);
         if let Some((r, c)) = self.freeze { self.freeze = Some((shift.map(r).unwrap(), c)); }
-        self.rows.remap_indices(|r| shift.map(r));
+        self.layout_dirty |= self.rows.remap_indices(|r| shift.map(r));
         self.shift_row_visibility(shift);
         if let Some(f) = &mut self.filter {
             let moved = shift.map_range(f.range.0, f.range.2).unwrap();
@@ -589,7 +590,7 @@ impl Sheet {
             let nf = if fr >= at + n { fr - n } else { at.min(fr) };
             self.freeze = Some((nf, fc));
         }
-        self.rows.delete_at(at, n);
+        self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, at, n, true));
         self.shift_row_visibility(&shift);
         self.shift_axis_styles(&shift);
         self.merges_dirty = true;
@@ -622,7 +623,7 @@ impl Sheet {
                 self.freeze = Some((fr, fc + n));
             }
         }
-        self.cols.insert_at(at, n);
+        self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, at, n, false));
         self.shift_axis_styles(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
@@ -653,7 +654,7 @@ impl Sheet {
             let nf = if fc >= at + n { fc - n } else { at.min(fc) };
             self.freeze = Some((fr, nf));
         }
-        self.cols.delete_at(at, n);
+        self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, at, n, true));
         self.shift_axis_styles(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;

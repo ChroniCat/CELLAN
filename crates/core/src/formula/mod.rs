@@ -485,6 +485,20 @@ impl Parser {
             return self.parse_unary();
         }
         let mut node = self.parse_primary()?;
+        // A LAMBDA returned by an expression or a sheet-qualified name can be called directly.
+        if matches!(node, Node::Func(..) | Node::ScopedName { book: None, .. }) {
+            while self.eat(&Tok::LParen) {
+                let mut call = vec![node];
+                if !self.eat(&Tok::RParen) {
+                    loop {
+                        call.push(self.parse_expr()?);
+                        if self.eat(&Tok::RParen) { break; }
+                        if !self.eat(&Tok::Comma) { return Err(ErrKind::Value); }
+                    }
+                }
+                node = Node::Func("__CALL__".into(), call);
+            }
+        }
         while matches!(self.peek(), Some(Tok::Percent)) {
             self.pos += 1;
             node = Node::Percent(Box::new(node));
@@ -620,26 +634,7 @@ impl Parser {
                             return Err(ErrKind::Value);
                         }
                     }
-                    let mut node = Node::Func(name.to_ascii_uppercase(), args);
-                    // LAMBDA(x,x*x)(7)：函数值后面直接跟实参
-                    while matches!(self.peek(), Some(Tok::LParen)) {
-                        self.pos += 1;
-                        let mut call = vec![node];
-                        if !self.eat(&Tok::RParen) {
-                            loop {
-                                call.push(self.parse_expr()?);
-                                if self.eat(&Tok::Comma) {
-                                    continue;
-                                }
-                                if self.eat(&Tok::RParen) {
-                                    break;
-                                }
-                                return Err(ErrKind::Value);
-                            }
-                        }
-                        node = Node::Func("__CALL__".to_string(), call);
-                    }
-                    return Ok(node);
+                    return Ok(Node::Func(name.to_ascii_uppercase(), args));
                 }
                 // TRUE / FALSE
                 let up = name.to_ascii_uppercase();
@@ -871,6 +866,16 @@ struct CriteriaKey {
     criteria: Vec<String>,
 }
 
+fn named_definition(wb: &Workbook, name: &str, si: usize, scoped: bool) -> Option<usize> {
+    let mut global = None;
+    for (index, (nm, scope, _)) in wb.names.iter().enumerate() {
+        if !nm.eq_ignore_ascii_case(name) { continue; }
+        if *scope == Some(si) { return Some(index); }
+        if scope.is_none() && (!scoped || global.is_none()) { global = Some(index); }
+    }
+    global
+}
+
 pub struct Calc<'a> {
     wb: &'a Workbook,
     memo: HashMap<(usize, u32, u32), FValue>,
@@ -878,6 +883,7 @@ pub struct Calc<'a> {
     /// LET 绑定的名字（大写）
     env_stack: EvalEnvironment,
     active_names: HashSet<(usize, deps::CellKey, usize)>,
+    named_calls: Vec<(usize, deps::CellKey, usize, Vec<FValue>)>,
     scheduling: bool,
     requested: Option<EvalFrame>,
     range_remainder: Option<RangeRemainder>,
@@ -1015,7 +1021,7 @@ impl<'a> Calc<'a> {
             let now = functions::now_serial();
             functions::set_now_snapshot(Some(now));
         }
-        Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), approx_positions: HashMap::new(), position_count: 0, scope: None, scheduling: false, requested: None, range_remainder: None, active_names: HashSet::new(),
+        Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), approx_positions: HashMap::new(), position_count: 0, scope: None, scheduling: false, requested: None, range_remainder: None, active_names: HashSet::new(), named_calls: Vec::new(),
             agg_cache: HashMap::new(), cache_vals: 0, count_indexes: Default::default(), depth: 0,
             range_reads: 0,
             cache_order: Default::default(), cache_clock: 0, criteria_cache: HashMap::new(),
@@ -1251,19 +1257,17 @@ impl<'a> Calc<'a> {
     }
 
     fn defined_name_index(&self, name: &str, si: usize, scoped: bool) -> Option<usize> {
-        let mut found = None;
-        for (index, (nm, scope, _)) in self.wb.names.iter().enumerate() {
-            if !nm.eq_ignore_ascii_case(name) { continue; }
-            if *scope == Some(si) { found = Some(index); break; }
-            if scope.is_none() && (!scoped || found.is_none()) { found = Some(index); }
-        }
-        found
+        named_definition(self.wb, name, si, scoped)
     }
 
     fn eval_defined_name(&mut self, name: &str, si: usize, scoped: bool) -> FValue {
         let Some(index) = self.defined_name_index(name, si, scoped) else { return FValue::Error(ErrKind::Name); };
+        self.eval_definition(index, si)
+    }
+
+    fn eval_definition(&mut self, index: usize, si: usize) -> FValue {
         let key = (index, (self.cur_sheet, self.cur.0, self.cur.1), si);
-        if !self.active_names.insert(key) { return FValue::Error(ErrKind::Name); }
+        if self.active_names.len() >= 32 || !self.active_names.insert(key) { return FValue::Error(ErrKind::Name); }
         let body = self.wb.names[index].2.trim_start_matches('=');
         let expanded = crate::table::expand_structured_at(self.wb, si, Some(self.cur.0), Some(self.cur.1), body);
         let value = match compile_at(expanded.as_deref().unwrap_or(body), self.cur.0, self.cur.1) {
@@ -1272,6 +1276,36 @@ impl<'a> Calc<'a> {
         };
         self.active_names.remove(&key);
         value
+    }
+
+    fn call_named_lambda(&mut self, name: &str, si: usize, scoped: bool, args: &[Arg]) -> FValue {
+        let Some(index) = self.defined_name_index(name, si, scoped) else {
+            return FValue::Error(ErrKind::Name);
+        };
+        let values: Vec<_> = args.iter().map(|arg| match arg {
+            Arg::Val(v) => v.clone(),
+            Arg::Range { rows: 1, cols: 1, .. } => arg.first(),
+            Arg::Range { rows, cols, values } => FValue::Array(std::rc::Rc::new(
+                value::Array::new(*rows, *cols, (**values).clone()),
+            )),
+        }).collect();
+        let cell = (self.cur_sheet, self.cur.0, self.cur.1);
+        if self.named_calls.len() >= 16 || self.named_calls.iter().any(|(i, at, sheet, v)|
+            (*i, *at, *sheet) == (index, cell, si) && v == &values) {
+            return FValue::Error(ErrKind::Num);
+        }
+        self.named_calls.push((index, cell, si, values.clone()));
+        // Worksheet names have their own lexical environment. The caller's LET bindings
+        // have already been evaluated in the arguments and must not shadow the definition.
+        let caller = std::mem::take(&mut self.env_stack);
+        let result = match self.eval_definition(index, si) {
+            FValue::Lambda(lambda) => self.apply_lambda_val(&lambda, values, si),
+            FValue::Error(e) => FValue::Error(e),
+            _ => FValue::Error(ErrKind::Value),
+        };
+        self.env_stack = caller;
+        self.named_calls.pop();
+        result
     }
 
     fn eval_ext_defined_name(
@@ -2068,6 +2102,12 @@ impl<'a> Calc<'a> {
             }
             // 立即调用：LAMBDA(x, x*x)(7)
             Node::Func(name, nodes) if name == "__CALL__" && !nodes.is_empty() => {
+                if let Node::ScopedName { book: None, sheet: Some(sheet), name } = &nodes[0] {
+                    let Ok(target) = self.sheet_index(Some(sheet), si) else { return FValue::Error(ErrKind::Ref); };
+                    let args = self.function_args("", &nodes[1..], si);
+                    if self.requested.is_some() { return FValue::Error(ErrKind::Ref); }
+                    return self.call_named_lambda(name, target, true, &args);
+                }
                 let target = self.eval_node(&nodes[0], si);
                 match target {
                     FValue::Lambda(l) => {
@@ -2674,7 +2714,10 @@ impl<'a> Calc<'a> {
                         value
                     }
                 } else {
-                    functions::call(name, &args)
+                    functions::call_or_else(name, &args, &mut || {
+                        if bound.is_some() { FValue::Error(ErrKind::Value) }
+                        else { self.call_named_lambda(name, si, false, &args) }
+                    })
                 };
                 if let Some(key) = criteria_key {
                     if self.criteria_cache.len() >= 16_384 { self.criteria_cache.clear(); }
@@ -3489,6 +3532,14 @@ pub fn recalc_dirty_cancelable(
 fn edit_touches_spill(wb: &Workbook, seeds: &[deps::CellKey]) -> bool {
     wb.sheets.iter().enumerate().any(|(si, sheet)| {
         sheet.arrays.iter().any(|&(anchor, (r1, c1, r2, c2))| {
+            // A legacy one-cell CSE formula may legitimately return a scalar; there
+            // are no spill tails to restore. An edit producing a new array is caught
+            // by the dirty evaluator before writeback.
+            if (anchor.row, anchor.col) == (r1, c1) && (r1, c1) == (r2, c2)
+                && !sheet.spill_shapes.contains_key(&anchor)
+                && sheet.get(r1, c1).is_some_and(|c| c.formula.is_some()) {
+                return false;
+            }
             anchor.row != r1 || anchor.col != c1 || r2 < r1 || c2 < c1
                 || sheet.spill_shapes.get(&anchor) != Some(&(r2.saturating_sub(r1).saturating_add(1),
                     c2.saturating_sub(c1).saturating_add(1)))
@@ -3505,10 +3556,32 @@ fn edit_touches_spill(wb: &Workbook, seeds: &[deps::CellKey]) -> bool {
     })
 }
 
-fn dirty_spill_anchor(wb: &Workbook, dirty: &HashSet<deps::CellKey>) -> bool {
-    wb.sheets.iter().enumerate().any(|(si, sheet)| {
-        sheet.spill_shapes.keys().any(|anchor| dirty.contains(&(si, anchor.row, anchor.col)))
-    })
+/// Previously materialized tails can remain in place if their shape and values
+/// are unchanged. A changed tail may have readers outside the anchor's dirty
+/// closure, so in that case the whole pass is retried before committing results.
+fn write_dirty_results(wb: &mut Workbook, mut results: Vec<(usize, u32, u32, FValue)>) -> bool {
+    let mut stable = true;
+    results.retain(|(si, r, c, value)| {
+        let sh = &wb.sheets[*si];
+        let old = sh.spill_shapes.get(&CellRef::new(*r, *c));
+        match value {
+            FValue::Array(a) if a.rows > 0 && a.cols > 0 &&
+                old.is_some_and(|&(h, w)| (h as usize, w as usize) == (a.rows, a.cols)) => {
+                if (a.rows, a.cols) == (1, 1) { return true; }
+                stable &= (0..a.rows).all(|y| (0..a.cols).all(|x| {
+                    let key = CellRef::new(*r + y as u32, *c + x as u32);
+                    (y == 0 && x == 0 || sh.spilled.contains(&key))
+                        && sh.value(key.row, key.col) == from_fvalue(&a.get(y, x))
+                }));
+                false
+            }
+            FValue::Array(_) => { stable = false; false }
+            _ if old.is_some() => { stable = false; false }
+            _ => true,
+        }
+    });
+    if stable { write_back(wb, results); }
+    stable
 }
 
 fn recalc_dirty_impl(
@@ -3532,8 +3605,7 @@ fn recalc_dirty_impl(
     let dirty = if deps.requires_full_recalc() || edit_touches_spill(wb, seeds) {
         None
     } else {
-        let dirty = deps.edit_closure_cancelable(seeds, cancel)?;
-        (!dirty_spill_anchor(wb, &dirty)).then_some(dirty)
+        Some(deps.edit_closure_cancelable(seeds, cancel)?)
     };
     let Some(mut dirty) = dirty else {
         // 用户覆盖溢出格时保留输入，让数组按正常冲突规则处理。
@@ -3578,11 +3650,10 @@ fn recalc_dirty_impl(
             }
         }
         // 新公式可能第一次产生数组，此时尚无 spilled 标记。
-        if results.iter().any(|(_, _, _, value)| matches!(value, FValue::Array(_))) {
+        if !write_dirty_results(wb, results) {
             let count = wb.sheets.iter().map(|s| s.formula_cells().count()).sum();
             return recalc_all_force_impl(wb, cancel, None).then_some(count);
         }
-        write_back(wb, results);
         last_count = order.len();
         if !wb.calc_iterate {
             break;
@@ -3612,11 +3683,21 @@ fn recalc_dirty_impl(
     Some(last_count)
 }
 
+fn large_spill(&(rows, cols): &(u32, u32)) -> bool {
+    u64::from(rows) * u64::from(cols) > 4096
+}
+
 /// 仅即时计算 `seeds` 中本身带有公式的单元格（供提交编辑时在广播前毫秒级算出当前格结果）。
 /// 若遇到需整表物化的动态数组溢出返回 `false`，普通标量公式写回后返回 `true`。
 pub fn eval_formula_seeds_immediate(wb: &mut Workbook, seeds: &[deps::CellKey]) -> bool {
     if wb.calc_manual || seeds.is_empty() {
         return true;
+    }
+    // Both the edit broadcaster and the interactive planner use this path.
+    // Avoid evaluating a known large anchor once here and then again on the worker.
+    if seeds.iter().any(|&(si, r, c)| wb.sheets.get(si)
+        .and_then(|sh| sh.spill_shapes.get(&CellRef::new(r, c))).is_some_and(large_spill)) {
+        return false;
     }
     let mut formula_seeds: Vec<deps::CellKey> = seeds
         .iter()
@@ -3640,14 +3721,10 @@ pub fn eval_formula_seeds_immediate(wb: &mut Workbook, seeds: &[deps::CellKey]) 
         calc.scope = Some(&scope);
         for &(si, r, c) in &formula_seeds {
             let v = calc.cell_value(si, r, c);
-            if matches!(v, FValue::Array(_)) {
-                return false;
-            }
             results.push((si, r, c, v));
         }
     }
-    write_back(wb, results);
-    true
+    write_dirty_results(wb, results)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3682,7 +3759,9 @@ pub fn recalc_interactive_plan(
         return Complete;
     }
     let total_cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
-    if deps_ready && total_cells <= 1_200 {
+    // Blank spill tails consume calculation time without increasing Sheet::len().
+    if deps_ready && total_cells <= 1_200
+        && !wb.sheets.iter().any(|sh| sh.spill_shapes.values().any(large_spill)) {
         recalc_dirty(wb, deps, seeds);
         return Complete;
     }
@@ -3699,7 +3778,14 @@ pub fn recalc_interactive_plan(
         return BackgroundFull;
     }
     let Some(dirty) = deps.edit_closure_limited(seeds, 96) else { return BackgroundDirty; };
-    if dirty_spill_anchor(wb, &dirty) { return BackgroundFull; }
+    // Large materialized arrays can take longer than a frame to compare.
+    let mut has_tail = false;
+    for &(s, r, c) in &dirty {
+        if let Some(shape) = wb.sheets.get(s).and_then(|sh| sh.spill_shapes.get(&CellRef::new(r, c))) {
+            if large_spill(shape) { return BackgroundDirty; }
+            has_tail |= shape.0 > 1 || shape.1 > 1;
+        }
+    }
     if dirty.is_empty() {
         return Complete;
     }
@@ -3718,15 +3804,11 @@ pub fn recalc_interactive_plan(
                 break;
             }
             let v = calc.cell_value(si, r, c);
-            if matches!(v, FValue::Array(_)) {
-                return BackgroundFull;
-            }
             results.push((si, r, c, v));
         }
     }
-    if !results.is_empty() {
-        write_back(wb, results);
-    }
+    if timed_out && has_tail { return BackgroundDirty; }
+    if !write_dirty_results(wb, results) { return BackgroundFull; }
     if timed_out { BackgroundDirty } else { Complete }
 }
 
@@ -3861,14 +3943,25 @@ pub fn recalc_all_force_impl(
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return mark_cancelled(wb);
         }
-        let mut results = parallel.unwrap_or_default();
-        if results.is_empty() {
-            results.reserve(formulas.len());
+        let (mut results, pending) = match parallel {
+            Some(batch) => (batch.values, Some(batch.pending)),
+            None => (Vec::with_capacity(formulas.len()), None),
+        };
+        let remaining = pending.as_ref().map_or(formulas.len(), Vec::len);
+        if remaining > 0 {
             let mut calc = Calc::new(wb);
+            if pending.is_some() {
+                // Sequential formulas may refer to any numeric batch result, even across sheets.
+                // Keep the original sheet untouched until the complete pass is ready to publish.
+                calc.memo.extend(results.iter().filter(|(_, _, _, v)| !matches!(v, FValue::Empty))
+                    .map(|&(s, r, c, ref value)| ((s, r, c), value.clone())));
+            }
             calc.volatile_values = std::mem::take(&mut volatile_values);
             let profile = profile_enabled();
             let mut slow: Vec<(f64, usize, u32, u32, String)> = Vec::new();
-            for (i, &(si, r, c)) in formulas.iter().enumerate() {
+            for i in 0..remaining {
+                let slot = pending.as_ref().map_or(i, |indices| indices[i]);
+                let (si, r, c) = formulas[slot];
                 if let Some(flag) = cancel {
                     // 每 256 个公式查一次，取消时立刻放弃本轮（尚未写回）
                     if i % 256 == 0 && flag.load(Ordering::Relaxed) {
@@ -3877,8 +3970,7 @@ pub fn recalc_all_force_impl(
                     }
                 }
                 if let Some((done, _)) = progress {
-                    // An unsupported parallel batch may have already reported partial progress.
-                    done.fetch_max(i, Ordering::Relaxed);
+                    done.store(formulas.len() - remaining + i, Ordering::Relaxed);
                 }
                 let t0 = profile.then(std::time::Instant::now);
                 let v = calc.cell_value(si, r, c);
@@ -3894,7 +3986,8 @@ pub fn recalc_all_force_impl(
                             .unwrap_or_default(),
                     ));
                 }
-                results.push((si, r, c, v));
+                if pending.is_some() { results[slot].3 = v; }
+                else { results.push((si, r, c, v)); }
             }
             if profile {
                 for (n, c, t) in prof_dump().into_iter().take(15) {

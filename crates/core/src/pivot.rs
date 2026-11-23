@@ -58,7 +58,7 @@ impl GroupBy {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PivotSpec {
     /// 源区域（含表头行）
     pub source: (u32, u32, u32, u32),
@@ -75,7 +75,7 @@ pub struct PivotSpec {
     pub exclude: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PivotResult {
     /// 表头：第一列是行字段名，其余是列字段的取值
     pub headers: Vec<String>,

@@ -124,7 +124,7 @@ fn grouped_conditional_aggregates_match_the_scan_across_distinct_keys() {
             assert_eq!(calc.eval_node(&parse(&src).unwrap(), 0), slow, "{src}");
         }
     }
-    assert!(calc.grouped_criteria.iter().all(|g| g.is_built()));
+    assert!(calc.grouped_criteria.iter().all(|g| g.built_ranges() == 1));
     drop(calc);
     // Fractional numeric data within epsilon of 1 must retain scan equality semantics.
     number(&mut wb, 0, 0, 1.0 + f64::EPSILON);
@@ -135,7 +135,34 @@ fn grouped_conditional_aggregates_match_the_scan_across_distinct_keys() {
         let slow = calc.call_generic(&name, &nodes, 0);
         assert_eq!(calc.eval_node(&parse(&src).unwrap(), 0), slow);
     }
-    assert!(!calc.grouped_criteria[1].is_built());
+    assert_eq!(calc.grouped_criteria[1].built_ranges(), 0);
+}
+
+#[test]
+fn alternating_criteria_groups_survive_other_ranges_and_remain_bounded() {
+    let mut wb = Workbook::new_blank();
+    for r in 0..600 {
+        for col in 0..6 { number(&mut wb, r, col, ((r + col) % 19) as f64); }
+    }
+    let mut calc = Calc::new(&wb);
+    for (columns, keys) in [(&["A","B","C"][..], 0..4), (&["A","B","C","D","E"][..], 4..9)] {
+        for key in keys {
+            for col in columns {
+                for (name, amount) in [("SUMIFS","F1:F600,"), ("COUNTIFS","")] {
+                    let src = format!("{name}({amount}{col}1:{col}600,{key})");
+                    let node = parse(&src).unwrap();
+                    let Node::Func(_, nodes) = &node else { unreachable!() };
+                    let slow = calc.call_generic(name, nodes, 0);
+                    assert_eq!(calc.eval_node(&node, 0), slow, "{src}");
+                }
+            }
+        }
+        if columns.len() == 3 {
+            assert!(calc.grouped_criteria.iter().all(|cache| cache.built_ranges() == 3));
+        } else {
+            assert!(calc.grouped_criteria.iter().all(|cache| cache.entries_len() <= 4));
+        }
+    }
 }
 
 #[test]
@@ -309,6 +336,102 @@ fn clearing_a_spill_obstruction_recalculates_evaluated_and_loaded_anchors() {
 }
 
 #[test]
+fn named_lambda_dynamic_updates_dirty_save_and_reopen() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    wb.sheets.push(Sheet::new("Report"));
+    wb.names.extend([
+        ("ReadTarget".into(), None, "_xlfn.LAMBDA(_xlpm.addr,INDIRECT(_xlpm.addr))".into()),
+        ("ReadAlias".into(), None, "ReadTarget".into()),
+        ("ReadTotal".into(), Some(1), "LAMBDA(addr,ReadAlias(addr)+1)".into()),
+    ]);
+    wb.names_dirty = true;
+    number(&mut wb, 0, 0, 3.0);
+    // Simulate an imported file whose cached values are already up to date.
+    set_formula(&mut wb.sheets[0], 0, 1, "=A1*2", FValue::number(6.0));
+    set_formula(&mut wb.sheets[1], 0, 0, "=ReadTotal(\"Data!B1\")", FValue::number(7.0));
+    set_formula(&mut wb.sheets[1], 0, 1, "=A1*10", FValue::number(70.0));
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("named-lambda.xlsx");
+    crate::xlsx::save_atomic_with_receipt(&path, &wb).unwrap().apply_to(&mut wb);
+    let mut wb = crate::xlsx::load(&path).unwrap();
+    assert_eq!(wb.names.len(), 3, "{:?}", wb.names);
+    assert_eq!(wb.sheets[1].value(0, 1), Value::Number(70.0));
+    let deps = deps::Deps::build(&wb);
+    number(&mut wb, 0, 0, 8.0);
+    assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 0, 0)]), 3);
+    assert_eq!(wb.sheets[1].value(0, 1), Value::Number(170.0));
+    crate::xlsx::save_atomic_with_receipt(&path, &wb).unwrap().apply_to(&mut wb);
+    let mut reopened = crate::xlsx::load(&path).unwrap();
+    assert_eq!(reopened.sheets[1].value(0, 1), Value::Number(170.0));
+    recalc_all_force(&mut reopened);
+    assert_eq!(reopened.sheets[1].value(0, 1), Value::Number(170.0));
+}
+
+#[test]
+fn named_lambda_respects_scope_builtins_shadowing_and_recursion() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets.push(Sheet::new("Report"));
+    number(&mut wb, 0, 0, 2.0);
+    wb.sheets[1].set(0, 0, Cell { value: Value::Number(5.0), formula: None });
+    wb.names.extend([
+        ("AddRate".into(), None, "LAMBDA(x,x+A1)".into()),
+        ("AddRate".into(), Some(1), "LAMBDA(x,x+A1+10)".into()),
+        ("BaseRate".into(), None, "Sheet1!A1".into()),
+        ("WithRate".into(), None, "LAMBDA(x,x+BaseRate)".into()),
+        ("LoopFunc".into(), None, "LAMBDA(x,OtherLoop(x))".into()),
+        ("OtherLoop".into(), None, "LAMBDA(x,LoopFunc(x))".into()),
+        ("CountDown".into(), None, "LAMBDA(x,IF(x>0,CountDown(x-1)+1,0))".into()),
+        ("ABS".into(), None, "LAMBDA(x,999)".into()),
+    ]);
+    let mut calc = Calc::new(&wb);
+    for (sheet, src, expected) in [
+        (0, "AddRate(1)", 3.0),
+        (1, "AddRate(1)", 16.0),
+        (0, "Report!AddRate(A1)", 17.0),
+        (1, "LET(BaseRate,99,WithRate(1))", 3.0),
+        (0, "LET(AddRate,LAMBDA(x,x*10),AddRate(3))", 30.0),
+        (0, "ABS(-5)", 5.0),
+        (0, "CountDown(3)", 3.0),
+    ] {
+        assert_eq!(calc.eval_node(&parse(src).unwrap(), sheet), FValue::number(expected), "{src}");
+    }
+    assert_eq!(calc.eval_node(&parse("LoopFunc(5)").unwrap(), 0), FValue::Error(ErrKind::Num));
+    drop(calc);
+    formula(&mut wb, 0, 1, "=Report!AddRate(A1)");
+    formula(&mut wb, 0, 2, "=LET(BaseRate,99,WithRate(1))");
+    let deps = deps::Deps::build(&wb);
+    assert!(!deps.requires_full_recalc());
+    assert_eq!(deps.closure(&[(1, 0, 0)]), HashSet::from([(0, 0, 1)]));
+    assert_eq!(deps.closure(&[(0, 0, 0)]), HashSet::from([(0, 0, 1), (0, 0, 2)]));
+    formula(&mut wb, 0, 3, "=LoopFunc(5)");
+    assert!(deps::Deps::build(&wb).requires_full_recalc());
+}
+
+#[test]
+fn single_cell_legacy_scalar_keeps_unrelated_edits_incremental() {
+    let mut wb = Workbook::new_blank();
+    number(&mut wb, 0, 0, 2.0);
+    formula(&mut wb, 0, 1, "=IF(A1>2,SEQUENCE(2),SUM(A1:A1))");
+    wb.sheets[0].arrays.push((CellRef::new(0, 1), (0, 1, 0, 1)));
+    formula(&mut wb, 0, 2, "=D1+1");
+    formula(&mut wb, 0, 4, "=B2+1");
+    recalc_all_force(&mut wb);
+    assert!(wb.sheets[0].spill_shapes.is_empty());
+    let deps = deps::Deps::build(&wb);
+    number(&mut wb, 0, 3, 9.0);
+    assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 0, 3)]), 1);
+    assert_eq!(wb.sheets[0].value(0, 2), Value::Number(10.0));
+    number(&mut wb, 0, 0, 4.0);
+    let mut oracle = wb.clone();
+    recalc_all_force(&mut oracle);
+    recalc_dirty(&mut wb, &deps, &[(0, 0, 0)]);
+    assert_eq!(wb.sheets[0].value(0, 4), Value::Number(3.0));
+    assert_eq!(wb.sheets[0].spill_shapes, oracle.sheets[0].spill_shapes);
+    assert_eq!(wb.sheets[0].value(1, 1), oracle.sheets[0].value(1, 1));
+}
+
+#[test]
 fn runtime_references_recalculate_changed_target_and_dependents_only() {
     let mut wb = Workbook::new_blank();
     number(&mut wb, 0, 0, 3.0);
@@ -323,6 +446,111 @@ fn runtime_references_recalculate_changed_target_and_dependents_only() {
     assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 0, 0)]), 3);
     assert_eq!(wb.sheets[0].value(0, 3), Value::Number(33.0));
     assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 9, 9)]), 2);
+}
+
+#[test]
+fn one_cell_dynamic_arrays_recalculate_in_scope_and_expand_with_tail_dependents() {
+    // Exercise both the immediate interactive budget and worker calculation.
+    for padding in [0, 1250] {
+        let mut wb = Workbook::new_blank();
+        number(&mut wb, 0, 0, 7.0);
+        number(&mut wb, 1, 0, 8.0);
+        number(&mut wb, 0, 1, 1.0);
+        wb.sheets[0].set(0, 2, Cell { value: Value::Text("A1:A1".into()), formula: None });
+        for (col, src) in [(3, "=OFFSET(A1,0,0,B1,1)"), (4, "=INDIRECT(C1)"),
+                           (5, "=SUM(D1#)+SUM(E1#)"), (6, "=D2+E2"), (7, "=999")] {
+            formula(&mut wb, 0, col, src);
+        }
+        for r in 0..padding { number(&mut wb, r, 10, 1.0); }
+        recalc_all_force(&mut wb);
+        let deps = deps::Deps::build(&wb);
+        assert!(!deps.requires_full_recalc());
+        number(&mut wb, 0, 0, 12.0);
+        assert_eq!(recalc_dirty(&mut wb, &deps, &[(0,0,0)]), 3);
+        assert_eq!(wb.sheets[0].value(0,5), Value::Number(24.0));
+        number(&mut wb, 0, 0, 13.0);
+        assert_eq!(recalc_interactive_plan(&mut wb, &deps, &[(0,0,0)], true), InteractiveRecalc::Complete);
+        assert_eq!(wb.sheets[0].value(0,5), Value::Number(26.0));
+        for col in [3,4] {
+            assert_eq!(wb.sheets[0].spill_shapes.get(&CellRef::new(0,col)), Some(&(1,1)));
+        }
+        // A bare INDIRECT address returns a scalar. Its displayed amount is unchanged,
+        // but E1# must stop resolving as soon as the array shape disappears.
+        wb.sheets[0].set(0,2, Cell { value: Value::Text("A1".into()), formula: None });
+        recalc_dirty(&mut wb, &deps, &[(0,0,2)]);
+        assert!(!wb.sheets[0].spill_shapes.contains_key(&CellRef::new(0,4)));
+        assert_eq!(wb.sheets[0].value(0,5), Value::Error(ErrKind::Ref));
+        number(&mut wb, 0, 1, 2.0);
+        wb.sheets[0].set(0,2, Cell { value: Value::Text("A1:A2".into()), formula: None });
+        let seeds = [(0,0,1), (0,0,2)];
+        let mut oracle = wb.clone();
+        recalc_all_force(&mut oracle);
+        match recalc_interactive_plan(&mut wb, &deps, &seeds, true) {
+            InteractiveRecalc::Complete => {},
+            InteractiveRecalc::BackgroundFull => recalc_all_force(&mut wb),
+            InteractiveRecalc::BackgroundDirty => { recalc_dirty(&mut wb, &deps, &seeds); }
+        }
+        assert_eq!(wb.sheets[0].spill_shapes, oracle.sheets[0].spill_shapes);
+        assert_eq!(wb.sheets[0].value(0,5), Value::Number(42.0));
+        assert_eq!(wb.sheets[0].value(0,6), Value::Number(16.0));
+    }
+}
+
+#[test]
+fn editing_a_large_spill_anchor_defers_evaluation_as_well_as_writeback() {
+    let mut wb = Workbook::new_blank();
+    number(&mut wb, 0, 0, 10.0);
+    number(&mut wb, 0, 1, 1.0);
+    formula(&mut wb, 0, 2, "=SEQUENCE(5000,1,A1)");
+    formula(&mut wb, 0, 4, "=B1+1");
+    recalc_all_force(&mut wb);
+    let deps = deps::Deps::build(&wb);
+    number(&mut wb, 0, 1, 8.0);
+    let seeds = [(0,0,1), (0,0,2), (0,0,4)];
+    assert!(!eval_formula_seeds_immediate(&mut wb, &seeds));
+    assert_eq!(recalc_interactive_plan(&mut wb, &deps, &seeds, true), InteractiveRecalc::BackgroundFull);
+    // If immediate evaluation ran before deferral, E1 would already contain 9.
+    assert_eq!(wb.sheets[0].value(0, 4), Value::Number(2.0));
+    recalc_all_force(&mut wb);
+    assert_eq!(wb.sheets[0].value(0, 4), Value::Number(9.0));
+    assert_eq!(wb.sheets[0].value(4999, 2), Value::Number(5009.0));
+}
+
+#[test]
+fn blank_tails_do_not_make_a_large_indirect_spill_an_interactive_small_sheet() {
+    let mut wb = Workbook::new_blank();
+    number(&mut wb, 0, 0, 1.0);
+    number(&mut wb, 9999, 0, 42.0);
+    formula(&mut wb, 0, 3, r#"=INDIRECT("A1:A10000")"#);
+    recalc_all_force(&mut wb);
+    assert!(wb.sheets[0].len() <= 1200);
+    assert_eq!(wb.sheets[0].spill_shapes.get(&CellRef::new(0,3)), Some(&(10000,1)));
+    let deps = deps::Deps::build(&wb);
+    assert_eq!(recalc_interactive_plan(&mut wb, &deps, &[(0,0,3)], true), InteractiveRecalc::BackgroundFull);
+    assert_eq!(recalc_interactive_plan(&mut wb, &deps, &[(0,0,8)], true), InteractiveRecalc::BackgroundDirty);
+}
+
+#[test]
+fn unchanged_indirect_rectangle_stays_incremental_and_changed_tails_refresh_readers() {
+    let mut wb = Workbook::new_blank();
+    for (r, c, v) in [(0, 0, 2.0), (1, 0, 3.0), (0, 1, 5.0), (1, 1, 7.0)] {
+        number(&mut wb, r, c, v);
+    }
+    formula(&mut wb, 0, 3, r#"=INDIRECT("A1:B2")"#);
+    formula(&mut wb, 0, 6, "=SUM(D1#)");
+    formula(&mut wb, 0, 7, "=E2+1");
+    for r in 0..1400 { formula(&mut wb, r, 9, "=1+1"); }
+    recalc_all_force(&mut wb);
+    let deps = deps::Deps::build(&wb);
+    number(&mut wb, 5, 2, 11.0);
+    assert!(recalc_dirty(&mut wb, &deps, &[(0, 5, 2)]) < 10);
+    assert_eq!(recalc_interactive_plan(&mut wb, &deps, &[(0, 5, 2)], true), InteractiveRecalc::Complete);
+    assert_eq!(wb.sheets[0].value(0, 6), Value::Number(17.0));
+    assert_eq!(wb.sheets[0].value(0, 7), Value::Number(8.0));
+    number(&mut wb, 1, 1, 20.0);
+    recalc_dirty(&mut wb, &deps, &[(0, 1, 1)]);
+    assert_eq!(wb.sheets[0].value(0, 6), Value::Number(30.0));
+    assert_eq!(wb.sheets[0].value(0, 7), Value::Number(21.0));
 }
 
 #[test]

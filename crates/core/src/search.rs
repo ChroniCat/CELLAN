@@ -40,16 +40,23 @@ pub fn scoped_hits(
     let mut hits = Vec::new();
     for (si, sh) in wb.sheets.iter().enumerate() {
         if sheet.is_some_and(|only| only != si) { continue; }
-        for (i, (key, cell)) in sh.stored_cells().enumerate() {
-            if i % 256 == 0 && cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                return Vec::new();
-            }
-            if !rects.is_empty() && !rects.iter().any(|&(r1, c1, r2, c2)|
-                r1 <= key.row && key.row <= r2 && c1 <= key.col && key.col <= c2) {
-                continue;
-            }
+        let mut visited = 0usize;
+        let mut check = |key: crate::CellRef, cell: &Cell| {
+            visited += 1;
+            if visited % 256 == 0 && cancelled.load(std::sync::atomic::Ordering::Relaxed) { return false; }
             if matches_at(wb, si, key.row, key.col, cell, needle, opts) {
                 hits.push(Hit { sheet: si, row: key.row, col: key.col });
+            }
+            true
+        };
+        if rects.is_empty() {
+            if !sh.stored_cells().all(|(k,v)| check(k,v)) { return Vec::new(); }
+        } else {
+            for (i, &rect) in rects.iter().enumerate() {
+                for (k,v) in sh.cells().stored_cells_in(rect) {
+                    if !rects[..i].iter().any(|&(r1,c1,r2,c2)| r1<=k.row && k.row<=r2 && c1<=k.col && k.col<=c2)
+                        && !check(k,v) { return Vec::new(); }
+                }
             }
         }
     }

@@ -133,6 +133,7 @@ pub struct Sheet {
     /// Copy-on-write value snapshot matching a verified worksheet ZIP entry.
     pub(crate) source_cells: Option<crate::xlsx::SourceCells>,
     display_style_revision: u64,
+    coordinate_revision: u64,
     /// 被清空过的单元格：保存时要真的从文件里删掉，否则旧值会残留
     pub cleared: std::collections::HashSet<CellRef>,
     /// 被动态数组公式溢出占用的单元格（重算前要清掉）
@@ -267,6 +268,7 @@ impl Sheet {
             saved_cells: None,
             source_cells: None,
             display_style_revision: 0,
+            coordinate_revision: 0,
             cleared: std::collections::HashSet::new(),
             spilled: std::collections::HashSet::new(),
             spill_shapes: std::collections::HashMap::new(),
@@ -442,7 +444,7 @@ impl Sheet {
         self.style_edits.extend(self.cleared.iter().filter(|k| self.styles.get(k).is_some()).copied());
         if !self.style_edits.is_empty() {
             self.styles_dirty = true;
-            self.display_style_revision = self.display_style_revision.wrapping_add(1);
+            self.display_style_revision = next_sheet_identity();
         }
         self.edited = true;
     }
@@ -453,7 +455,31 @@ impl Sheet {
 
     pub fn cell_revision(&self) -> u64 { self.cells.revision() }
 
-    pub(crate) fn cell_version(&self) -> &crate::store::CellVersion { &self.cells.version }
+    pub fn cell_version(&self) -> &crate::store::CellVersion { &self.cells.version }
+
+    pub fn same_cells_in(&self, prior: &Self, rects: &[(u32,u32,u32,u32)], formulas: bool) -> bool {
+        self.cells.same_cells_in(&prior.cells, rects, formulas)
+    }
+
+    pub fn same_display_styles_in(&self, prior: &Self, rects: &[(u32,u32,u32,u32)],
+        current_styles: &crate::style::StyleTable, prior_styles: &crate::style::StyleTable) -> bool {
+        let equal = |a, b| current_styles.get(a).format == prior_styles.get(b).format;
+        let rows = self.row_styles.keys().chain(prior.row_styles.keys())
+            .filter(|&&r| rects.is_empty() || rects.iter().any(|&(r1,_,r2,_)| r1 <= r && r <= r2));
+        let cols = self.col_styles.keys().chain(prior.col_styles.keys())
+            .filter(|&&c| rects.is_empty() || rects.iter().any(|&(_,c1,_,c2)| c1 <= c && c <= c2));
+        let same_override = |a: Option<&u16>, b: Option<&u16>| match (a,b) {
+            (Some(&a),Some(&b)) => equal(a,b),
+            (None,None) => true,
+            _ => false, // An added row override may mask a column's format.
+        };
+        rows.into_iter().all(|r| same_override(self.row_styles.get(r), prior.row_styles.get(r)))
+            && cols.into_iter().all(|c| same_override(self.col_styles.get(c), prior.col_styles.get(c)))
+            && self.styles.changed_keys(&prior.styles).chain(prior.styles.changed_keys(&self.styles)).all(|k| {
+                (!rects.is_empty() && !rects.iter().any(|&(r1,c1,r2,c2)| r1 <= k.row && k.row <= r2 && c1 <= k.col && k.col <= c2))
+                    || equal(self.style_of(k.row,k.col), prior.style_of(k.row,k.col))
+            })
+    }
 
     pub(crate) fn cell_data_needs_save(&self) -> bool {
         self.edited || !self.cleared.is_empty() || match &self.saved_cells {
@@ -480,6 +506,13 @@ impl Sheet {
 
     pub fn display_style_revision(&self) -> u64 { self.display_style_revision }
 
+    pub fn coordinate_revision(&self) -> u64 { self.coordinate_revision }
+
+    pub(crate) fn coordinates_shifted(&mut self) {
+        self.coordinate_revision = next_sheet_identity();
+        self.display_style_revision = self.coordinate_revision;
+    }
+
     pub(crate) fn stored_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.stored_cells()
     }
@@ -497,12 +530,16 @@ impl Sheet {
     /// Inputs used by selection statistics. Cell contents share their COW column
     /// storage with the live sheet, and unrelated workbook metadata stays there.
     pub fn selection_stats_snapshot(&self) -> Self {
+        self.selection_stats_snapshot_with_filter(self.hidden_rows.is_empty())
+    }
+
+    pub fn selection_stats_snapshot_with_filter(&self, with_filter: bool) -> Self {
         let mut snapshot = Self::new(&self.name);
         snapshot.cells = self.cells.clone();
         snapshot.rows = self.rows.clone();
         snapshot.hidden_rows = self.hidden_rows.clone();
         snapshot.hidden_rows_user = self.hidden_rows_user.clone();
-        if self.hidden_rows.is_empty() {
+        if with_filter {
             snapshot.filter = self.filter.clone();
         }
         snapshot
@@ -540,7 +577,7 @@ impl Sheet {
         if result.styles_dirty {
             std::mem::swap(&mut self.styles, &mut result.styles);
             self.styles_dirty = true;
-            self.display_style_revision = self.display_style_revision.wrapping_add(1);
+            self.display_style_revision = next_sheet_identity();
             if self.style_edits.is_empty() {
                 self.style_edits = std::mem::take(&mut result.style_edits);
             } else {
@@ -631,7 +668,7 @@ impl Sheet {
     pub fn set_style(&mut self, r: u32, c: u32, id: u16) {
         let explicit = (id != 0 || self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c)).then_some(id);
         if self.explicit_style_of(r, c) == explicit { return; }
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         if !self.loading {
             self.edited = true;
             self.styles_dirty = true;
@@ -647,7 +684,7 @@ impl Sheet {
 
     /// 从文件载入样式（不算用户修改）
     pub fn set_style_loaded(&mut self, r: u32, c: u32, id: u16) {
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         let key = CellRef::new(r, c);
         if id == 0 {
             if self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c) {
@@ -662,7 +699,7 @@ impl Sheet {
 
     /// 用户设置整列样式（稀疏）
     pub fn set_col_style(&mut self, c: u32, id: u16) {
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         if !self.loading {
             self.edited = true;
             self.styles_dirty = true;
@@ -677,7 +714,7 @@ impl Sheet {
 
     /// 从文件载入整列样式（不算用户修改）
     pub fn set_col_style_loaded(&mut self, c: u32, id: u16) {
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         if id == 0 {
             self.col_styles.remove(&c);
         } else {
@@ -687,7 +724,7 @@ impl Sheet {
 
     /// 用户设置整行样式（稀疏）
     pub fn set_row_style(&mut self, r: u32, id: u16) {
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         if !self.loading {
             self.edited = true;
             self.styles_dirty = true;
@@ -702,7 +739,7 @@ impl Sheet {
 
     /// 从文件载入整行样式（不算用户修改）
     pub fn set_row_style_loaded(&mut self, r: u32, id: u16) {
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         if id == 0 {
             self.row_styles.remove(&r);
         } else {

@@ -67,6 +67,12 @@ pub struct Axis {
     prefix: Arc<Vec<(u32, f64)>>,
 }
 
+impl PartialEq for Axis {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision || (self.default == other.default && self.sizes == other.sizes)
+    }
+}
+
 impl Default for Axis {
     fn default() -> Self {
         Self::new(DEFAULT_COL_W)
@@ -118,11 +124,12 @@ impl Axis {
         }
     }
 
-    pub(crate) fn remap_indices(&mut self, map: impl Fn(u32) -> Option<u32>) {
-        if self.sizes.is_empty() { return; }
+    pub(crate) fn remap_indices(&mut self, map: impl Fn(u32) -> Option<u32>) -> bool {
+        if !self.sizes.keys().any(|&i| map(i) != Some(i)) { return false; }
         self.sizes = Arc::new(self.sizes.iter()
             .filter_map(|(&index, &size)| map(index).map(|new| (new, size))).collect());
         self.rebuild();
+        true
     }
 
     fn rebuild(&mut self) {

@@ -32,31 +32,40 @@ fn numeric(wb: &Workbook, (sheet, row, col): CellKey) -> Option<Result<f64, supe
     }
 }
 
+pub(super) struct Batch {
+    pub values: Vec<(usize, u32, u32, FValue)>,
+    pub pending: Vec<usize>,
+}
+
 pub(super) fn evaluate(wb: &Workbook, keys: &[CellKey], cancel: Option<&AtomicBool>,
-                       done: Option<&AtomicUsize>) -> Option<Vec<(usize, u32, u32, FValue)>> {
+                       done: Option<&AtomicUsize>) -> Option<Batch> {
     const MIN_PER_WORKER: usize = 8192;
     if keys.len() < MIN_PER_WORKER * 2 { return None; }
     let workers = std::thread::available_parallelism().ok()?.get()
         .min(8).min(keys.len() / MIN_PER_WORKER);
     if workers < 2 { return None; }
-    // Quickly bypass mixed sheets. Each worker still validates every expression.
-    for &key in keys.iter().step_by((keys.len() / 16).max(1)) { let _ = numeric(wb, key)?; }
-    let unsupported = AtomicBool::new(false);
+    // Avoid spinning up workers for dependency chains or mostly unsupported formulas.
+    // Vary the offset inside each stratum so a repeating column pattern isn't sampled at one phase.
+    const SAMPLES: usize = 16;
+    let stride = keys.len() / SAMPLES;
+    let eligible = (0..SAMPLES).filter(|&i| {
+        let slot = i * stride + (i * 37 + 17) % stride;
+        numeric(wb, keys[slot]).is_some()
+    }).count();
+    if eligible < SAMPLES / 2 { return None; }
     let batches = std::thread::scope(|scope| {
         let jobs: Vec<_> = keys.chunks(keys.len().div_ceil(workers)).map(|chunk| {
-            let unsupported = &unsupported;
             scope.spawn(move || {
                 let mut values = Vec::with_capacity(chunk.len());
+                let mut completed = 0;
                 for (i, &key) in chunk.iter().enumerate() {
-                    if i % 256 == 0 && (unsupported.load(Ordering::Relaxed)
-                        || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))) { return None; }
-                    let Some(value) = numeric(wb, key) else {
-                        unsupported.store(true, Ordering::Relaxed);
-                        return None;
-                    };
+                    if i % 256 == 0 && cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) { return None; }
+                    let value = numeric(wb, key);
+                    completed += usize::from(value.is_some());
                     values.push(value);
                     if (i + 1) % 256 == 0 {
-                        if let Some(done) = done { done.fetch_add(256, Ordering::Relaxed); }
+                        if let Some(done) = done { done.fetch_add(completed, Ordering::Relaxed); }
+                        completed = 0;
                     }
                 }
                 Some(values)
@@ -65,9 +74,16 @@ pub(super) fn evaluate(wb: &Workbook, keys: &[CellKey], cancel: Option<&AtomicBo
         jobs.into_iter().map(|job| job.join().expect("numeric calculation worker")).collect::<Option<Vec<_>>>()
     })?;
     if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) { return None; }
-    if let Some(done) = done { done.store(keys.len(), Ordering::Relaxed); }
-    Some(keys.iter().zip(batches.into_iter().flatten()).map(|(&(s, r, c), value)|
-        (s, r, c, value.map_or_else(FValue::Error, FValue::Number))).collect())
+    let mut pending = Vec::new();
+    let values = keys.iter().zip(batches.into_iter().flatten()).enumerate().map(|(i, (&(s, r, c), value))| {
+        let value = match value {
+            Some(result) => result.map_or_else(FValue::Error, FValue::Number),
+            None => { pending.push(i); FValue::Empty }
+        };
+        (s, r, c, value)
+    }).collect();
+    if let Some(done) = done { done.store(keys.len() - pending.len(), Ordering::Relaxed); }
+    Some(Batch { values, pending })
 }
 
 #[cfg(test)]
@@ -120,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn large_numeric_batch_falls_back_when_one_input_is_a_formula() {
+    fn large_mixed_batch_reuses_numeric_results_and_preserves_spill_passes() {
         use crate::{Cell, Value};
         let mut wb = Workbook::new_blank();
         let mut keys = Vec::new();
@@ -131,12 +147,26 @@ mod tests {
         }
         if std::thread::available_parallelism().is_ok_and(|n| n.get() > 1) {
             let values = evaluate(&wb, &keys, None, None).unwrap();
-            assert!(matches!(values[0].3, FValue::Error(_)));
-            assert_eq!(values[5].3, FValue::Number(0.6));
+            assert!(values.pending.is_empty());
+            assert!(matches!(values.values[0].3, FValue::Error(_)));
+            assert_eq!(values.values[5].3, FValue::Number(0.6));
         }
         wb.sheet_mut(0).set(37, 0, Cell { value: Value::Empty, formula: Some("=8+4".into()) });
-        assert!(evaluate(&wb, &keys, None, None).is_none());
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() > 1) {
+            let batch = evaluate(&wb, &keys, None, None).unwrap();
+            assert_eq!(batch.pending, [37]);
+        }
+        for (c, src) in [(2, "=SUM(B2:B3)"), (3, "=SEQUENCE(2,1,10)"),
+                          (4, "=D2+1"), (5, "=SUM(D1#)"), (6, "=C1+E1")] {
+            wb.sheet_mut(0).set(0, c, Cell { value: Value::Empty, formula: Some(src.into()) });
+        }
+        wb.sheets.push(crate::Sheet::new("Summary"));
+        wb.sheet_mut(1).set(0, 0, Cell { value: Value::Empty, formula: Some("=SUM(Sheet1!B2:B3,Sheet1!G1)".into()) });
         super::super::recalc_all(&mut wb);
         assert_eq!(wb.sheet(0).value(37, 1), Value::Number(0.25));
+        assert_eq!(wb.sheet(0).value(0, 2), Value::Number(4.5));
+        assert_eq!(wb.sheet(0).value(0, 4), Value::Number(12.0));
+        assert_eq!(wb.sheet(0).value(0, 5), Value::Number(21.0));
+        assert_eq!(wb.sheet(1).value(0, 0), Value::Number(21.0));
     }
 }

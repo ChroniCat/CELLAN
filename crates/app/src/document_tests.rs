@@ -1805,6 +1805,7 @@ fn collaborative_edits_save_promptly_to_original_file_with_zero_sidecar_pollutio
     host_a.save(true);
     wait_for_background_saves(&mut host_a);
     assert_ne!(host_a.tasks.autosave_after_detach, Some(false));
+    assert!(!host_a.tasks.shared_autosave_paused, "leaving this room restores local autosave policy");
     assert!(host_a.net.is_none(), "a different file cannot confirm saves for the original room");
     assert_eq!(sheetcore::xlsx::load(&host_copy).unwrap().sheet(0).value(0, 0), Value::Number(444.0));
     assert!(!session_lock::lock_path(&shared_path).exists());

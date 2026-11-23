@@ -7,19 +7,31 @@ use std::sync::{
 
 type Rect = (u32, u32, u32, u32);
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 struct Query {
     needle: String,
     options: SearchOpts,
     order: SearchOrder,
     sheet: Option<usize>,
     rects: Vec<Rect>,
-    document: (u64, u64, u64),
-    revisions: Vec<(u64, u64, u64)>,
+    document: u64,
+    revisions: Vec<(u64, sheetcore::store::CellVersion, u64, u64)>,
     dates: sheetcore::model::DateSystem,
 }
 
 impl Query {
+    fn same_scope(&self, other: &Self) -> bool {
+        self.document == other.document && self.sheet == other.sheet
+            && self.revisions.iter().map(|v| v.0).eq(other.revisions.iter().map(|v| v.0))
+    }
+
+    fn same_request(&self, other: &Self) -> bool {
+        self.same_scope(other) && self.needle == other.needle && self.options == other.options
+            && self.order == other.order && self.rects == other.rects && self.dates == other.dates
+            && self.revisions.iter().map(|v| v.3).eq(other.revisions.iter().map(|v| v.3))
+    }
+
+
     fn all(&self, wb: &Workbook, cancel: &AtomicBool) -> Vec<Hit> {
         search::scoped_hits(
             wb,
@@ -100,6 +112,8 @@ struct Pending {
 pub(super) struct Navigation {
     query: Arc<Query>,
     hits: Arc<Vec<Hit>>,
+    snapshot: Arc<Workbook>,
+    verified: std::cell::RefCell<Option<Query>>,
     summary: Option<bool>,
     receiver: Option<mpsc::Receiver<Vec<Hit>>>,
     cancel: Arc<AtomicBool>,
@@ -108,8 +122,25 @@ pub(super) struct Navigation {
 
 pub(super) struct Replacement {
     query: Arc<Query>,
+    snapshot: Arc<Workbook>,
     text: String,
     replace_formula_results: bool,
+}
+
+impl Navigation {
+    fn current(&self, now: &Query, wb: &Workbook) -> bool {
+        if *self.query == *now || self.verified.borrow().as_ref() == Some(now) { return true; }
+        if !self.query.same_request(now) { return false; }
+        let matches = self.query.revisions.iter().zip(&now.revisions).enumerate().all(|(n, (a,b))| {
+            let i = self.query.sheet.unwrap_or(n);
+            let live = &wb.sheets[i];
+            let prior = &self.snapshot.sheets[i];
+            (a.2 == b.2 || live.same_display_styles_in(prior, &now.rects, &wb.styles, &self.snapshot.styles))
+                && (a.1 == b.1 || live.same_cells_in(prior, &now.rects, now.options.in_formula))
+        });
+        if matches { *self.verified.borrow_mut() = Some(now.clone()); }
+        matches
+    }
 }
 
 impl Drop for Navigation {
@@ -123,10 +154,20 @@ impl SheetApp {
         self.find_scan = None;
         if self.find.find.is_empty() { return; }
         self.ensure_navigation(true);
-        let Some(nav) = self.find_navigation.as_mut() else { return };
+        let Some(nav) = self.find_navigation.as_ref() else { return };
+        // A reused index can have identical displayed hits after pre-command
+        // edits (e.g. a formula replaced by the same literal value). Guard the
+        // transaction with the actual input when the user requested Replace All.
+        let snapshot = if nav.query.revisions == self.navigation_query().revisions {
+            nav.snapshot.clone()
+        } else {
+            self.search_workbook(&nav.query)
+        };
+        let nav = self.find_navigation.as_mut().unwrap();
         nav.pending = None;
         nav.summary = None;
         self.find_scan = Some(Replacement {
+            snapshot,
             query: Arc::clone(&nav.query),
             text: self.find.replace.clone(),
             replace_formula_results: self.find.replace_formula_results,
@@ -140,12 +181,13 @@ impl SheetApp {
 
     pub(super) fn poll_find_scan(&mut self) {
         let Some(scan) = &self.find_scan else { return };
-        if scan.query.document.1 != self.wb_epoch {
+        let current = self.navigation_query();
+        if !scan.query.same_scope(&current) {
             self.cancel_find_scan();
             self.status = "文档已切换，已取消扫描".into();
             return;
         }
-        if *scan.query != self.navigation_query() || scan.text != self.find.replace
+        if !scan.query.same_request(&current) || scan.text != self.find.replace
             || scan.replace_formula_results != self.find.replace_formula_results {
             self.cancel_find_scan();
             self.status = "工作簿或替换条件已更改，已取消替换".into();
@@ -153,10 +195,15 @@ impl SheetApp {
         }
         self.finish_navigation_index();
         let Some(nav) = &self.find_navigation else { self.cancel_find_scan(); return };
+        if !Arc::ptr_eq(&nav.query, &self.find_scan.as_ref().unwrap().query) {
+            self.cancel_find_scan();
+            return;
+        }
         if nav.receiver.is_none() {
+            let baseline = self.find_scan.as_ref().unwrap().snapshot.clone();
             let hits = Arc::clone(&nav.hits);
             self.find_scan = None;
-            self.apply_replace_hits(&hits);
+            self.apply_replace_hits(&hits, &baseline);
         }
     }
 
@@ -182,16 +229,16 @@ impl SheetApp {
             options,
             sheet,
             rects,
-            document: (self.doc_uid, self.wb_epoch, self.doc_gen),
+            document: self.doc_uid,
             revisions: self
                 .wb
                 .sheets
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| sheet.is_none_or(|si| si == *i))
-                .map(|(_, sh)| (sh.identity, sh.cell_revision(), sh.display_style_revision()))
+                .map(|(_, sh)| (sh.identity, sh.cell_version().clone(), if self.find.in_formula { 0 } else { sh.display_style_revision() }, sh.coordinate_revision()))
                 .collect(),
-            dates: self.wb.date_system,
+            dates: if self.find.in_formula { Default::default() } else { self.wb.date_system },
         }
     }
 
@@ -235,6 +282,19 @@ impl SheetApp {
         };
     }
 
+    fn search_workbook(&self, query: &Query) -> Arc<Workbook> {
+        let mut snapshot = Workbook::new_blank();
+        snapshot.date_system = self.wb.date_system;
+        if !query.options.in_formula {
+            snapshot.styles = self.wb.styles.clone();
+        }
+        snapshot.sheets = self.wb.sheets.iter().enumerate().map(|(i, sh)| {
+            if query.sheet.is_none_or(|si| si == i) { sh.search_snapshot() }
+            else { sheetcore::Sheet::default() }
+        }).collect();
+        Arc::new(snapshot)
+    }
+
     fn ensure_navigation(&mut self, lock_rects: bool) {
         if lock_rects && self.find.scope == 2 && self.find.session_rect.is_none() {
             self.lock_find_rects();
@@ -243,7 +303,7 @@ impl SheetApp {
         if self
             .find_navigation
             .as_ref()
-            .is_none_or(|n| *n.query != query)
+            .is_none_or(|n| !n.current(&query, &self.wb))
         {
             self.find_navigation = None;
             self.find.hits = 0;
@@ -256,9 +316,12 @@ impl SheetApp {
                 .map(|(_, sh)| sh.len())
                 .sum();
             let query = Arc::new(query);
+            let snapshot = self.search_workbook(&query);
             let mut nav = Navigation {
                 query: query.clone(),
                 hits: Arc::default(),
+                snapshot: snapshot.clone(),
+                verified: Default::default(),
                 summary: None,
                 receiver: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -267,22 +330,6 @@ impl SheetApp {
             if count <= 4096 {
                 nav.hits = Arc::new(query.all(&self.wb, &nav.cancel));
             } else {
-                let mut snapshot = Workbook::new_blank();
-                snapshot.date_system = self.wb.date_system;
-                snapshot.styles = self.wb.styles.clone();
-                snapshot.sheets = self
-                    .wb
-                    .sheets
-                    .iter()
-                    .enumerate()
-                    .map(|(i, sh)| {
-                        if query.sheet.is_none_or(|si| si == i) {
-                            sh.search_snapshot()
-                        } else {
-                            sheetcore::model::Sheet::default()
-                        }
-                    })
-                    .collect();
                 let (tx, rx) = mpsc::channel();
                 let cancel = nav.cancel.clone();
                 std::thread::spawn(move || {
@@ -406,11 +453,19 @@ impl SheetApp {
         }
     }
 
+    fn accepts_pending_index(&self, nav: &Navigation) -> bool {
+        let current = self.navigation_query();
+        if self.find_scan.as_ref().is_some_and(|r| Arc::ptr_eq(&r.query, &nav.query)) {
+            return nav.query.same_request(&current);
+        }
+        nav.current(&current, &self.wb)
+    }
+
     pub(super) fn poll_navigation(&mut self, ctx: &egui::Context) {
         if self
             .find_navigation
             .as_ref()
-            .is_some_and(|nav| nav.receiver.is_some() && *nav.query != self.navigation_query())
+            .is_some_and(|nav| nav.receiver.is_some() && !self.accepts_pending_index(nav))
         {
             self.find_navigation = None;
             return;
@@ -441,7 +496,7 @@ impl SheetApp {
                 return;
             }
         };
-        if *self.find_navigation.as_ref().unwrap().query != self.navigation_query() {
+        if !self.accepts_pending_index(self.find_navigation.as_ref().unwrap()) {
             self.find_navigation = None;
             return;
         }
@@ -498,6 +553,85 @@ impl SheetApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_search_reuses_unaffected_hits_and_uses_command_time_replacement_baseline() {
+        let _env = crate::test_env::TestEnv::new("selection-find-inputs");
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+        let value = |f| Cell { value: Value::Number(0.5), formula: f };
+        app.wb.sheets[0].set(5,0,value(Some("=1/2".into())));
+        app.sel = (1,0);
+        app.sel_end = (7,0);
+        app.find.scope = 2;
+        app.find.find = "0.5".into();
+        app.ensure_navigation(true);
+        let original = app.find_navigation.as_ref().unwrap().query.clone();
+        let mut percentage = app.wb.styles.get(0).clone();
+        percentage.format = "0%".into();
+        let percent = app.wb.styles.intern(percentage);
+        app.wb.sheets[0].set_style(20,0,percent);
+        app.wb.sheets[0].set(8,0,text("0.5"));
+        app.wb.sheets[1].set(5,0,text("0.5"));
+        app.doc_gen += 1;
+        app.wb_epoch += 1;
+        app.wb.sheets[0].set(5,0,value(None)); // same displayed value before Replace All
+        app.ensure_navigation(true);
+        assert!(Arc::ptr_eq(&original, &app.find_navigation.as_ref().unwrap().query));
+        app.find.replace = "7".into();
+        app.start_replace_scan();
+        assert_eq!(app.wb.sheets[0].value(5,0), Value::Number(7.0));
+        app.find.find = "700%".into();
+        app.ensure_navigation(true);
+        assert!(app.find_navigation.as_ref().unwrap().hits.is_empty());
+        app.wb.sheets[0].set_style(5,0,percent);
+        app.ensure_navigation(true);
+        assert_eq!(app.find_navigation.as_ref().unwrap().hits.len(), 1);
+    }
+
+    #[test]
+    fn replacement_during_collaboration_preserves_changed_hits_and_commits_survivors() {
+        let _env = crate::test_env::TestEnv::new("replace-concurrent-room");
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+        for r in 0..5_000 { app.wb.sheets[0].set(r, 0, text(if r < 2 { "old" } else { "x" })); }
+        app.find.find = "old".into();
+        app.find.replace = "new".into();
+        app.find.scope = 2;
+        app.sel_end = (4_999, 0);
+        app.ensure_navigation(true);
+        // Stage worker completion so a real inbound Ops batch deterministically
+        // lands after the search snapshot and before the replacement transaction.
+        let nav = app.find_navigation.as_mut().unwrap();
+        let (tx, rx) = mpsc::channel();
+        nav.receiver = Some(rx);
+        let hits = nav.query.all(&nav.snapshot, &AtomicBool::new(false));
+        app.start_replace_scan();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        app.net = Some(crate::net::host_on(listener, 1, "host".into(), "test".into(), "pw".into()).unwrap());
+        app.peer = Some(sheetcore::sync::Peer::new(1));
+        let op = |sheet, row, col, val: &str| sheetcore::sync::Op {
+            sheet, row, col, value: sheetcore::sync::ValueWire::Text(val.into()),
+            formula: None, ts: 3, site: 2,
+        };
+        app.net.as_ref().unwrap().inject_event_for_test(crate::net::NetEvent::Ops(vec![
+            op(1, 0, 0, "old on another sheet"), op(0, 0, 1, "old outside selection"),
+            op(0, 1, 0, "old updated by collaborator"), op(0, 2, 0, "old added during scan"),
+        ]));
+        app.poll_net();
+        app.wb_epoch += 1;
+        app.poll_find_scan();
+        assert!(app.find_scan.is_some());
+        tx.send(hits).unwrap();
+        app.poll_find_scan();
+        assert!(app.find_scan.is_none());
+        assert_eq!(app.wb.sheets[0].get(0, 0), Some(&text("new")));
+        assert_eq!(app.wb.sheets[0].get(1, 0), Some(&text("old updated by collaborator")));
+        assert_eq!(app.wb.sheets[0].get(2, 0), Some(&text("old added during scan")));
+        assert_eq!(app.wb.sheets[0].get(0, 1), Some(&text("old outside selection")));
+        assert_eq!(app.wb.sheets[1].get(0, 0), Some(&text("old on another sheet")));
+        assert!(app.status.contains("已更改的 1 处"), "{}", app.status);
+    }
 
     fn wait_for_index(app: &mut SheetApp) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

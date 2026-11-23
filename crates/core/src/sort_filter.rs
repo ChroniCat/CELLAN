@@ -371,7 +371,7 @@ impl Criterion {
 }
 
 /// 一个筛选器：区域 + 每列允许的值 / 每列的条件
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Filter {
     pub range: (u32, u32, u32, u32),
     /// 列号 → 允许出现文本值；没有条目的列不过滤
