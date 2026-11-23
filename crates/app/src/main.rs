@@ -23152,6 +23152,7 @@ impl SheetApp {
         self.wb.sheet_mut(self.sheet_idx).filter = None;
         self.recalc_filter_hidden();
         self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = "已关闭筛选（箭头已移除）".into();
         true
     }
@@ -23165,6 +23166,7 @@ impl SheetApp {
         self.recalc_filter_hidden();
         let n = self.wb.sheet(self.sheet_idx).hidden_rows.len();
         self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已重新应用筛选：隐藏 {n} 行");
         true
     }
@@ -23196,6 +23198,7 @@ impl SheetApp {
         sheet.filter = Some(sheetcore::sort_filter::Filter::new(r1, c1, r2, c2));
         sheet.filter_dirty = true;
         self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = "已启用筛选：点表头的箭头选择要显示的值".into();
     }
 
@@ -23839,7 +23842,12 @@ impl SheetApp {
         let saved_cf_gen = self.cf_stats_gen;
         let saved_cf_stats = std::mem::take(&mut self.cf_stats);
         let saved_cf_cache = self.cf_cache.take();
-        let saved_cf_inputs = std::mem::take(&mut self.cf_inputs);
+        let mut cmp_cf_inputs = self
+            .normal_page_breaks
+            .compare_cf_inputs
+            .take()
+            .unwrap_or_default();
+        std::mem::swap(&mut self.cf_inputs, &mut cmp_cf_inputs);
         self.cf_stats_gen = u64::MAX;
         self.sheet_idx = cmp_sheet;
         self.scroll = cmp_scroll;
@@ -23859,7 +23867,8 @@ impl SheetApp {
         self.cf_stats_gen = saved_cf_gen;
         self.cf_stats = saved_cf_stats;
         self.cf_cache = saved_cf_cache;
-        self.cf_inputs = saved_cf_inputs;
+        std::mem::swap(&mut self.cf_inputs, &mut cmp_cf_inputs);
+        self.normal_page_breaks.compare_cf_inputs = Some(cmp_cf_inputs);
         self.compare = Some(cmp);
     }
 
@@ -29038,6 +29047,34 @@ impl SheetApp {
                 .conflicts_rect(si, 0, 0, 1_048_575, 16_383, site, 0)
                 .is_some()
         });
+        let fonts_gen = system_fonts::generation();
+        let page_breaks_ptr = if page_mode {
+            std::sync::Arc::as_ptr(&self.normal_page_breaks.get(self.wb.sheet(si))) as usize
+        } else {
+            0
+        };
+        let page_geo_fp = if page_mode {
+            Some(match pg.as_ref() {
+                Some(g) => (
+                    std::sync::Arc::as_ptr(g) as usize,
+                    page_breaks_ptr,
+                    [
+                        g.paper_w.to_bits(),
+                        g.paper_h.to_bits(),
+                        g.ml.to_bits(),
+                        g.mt.to_bits(),
+                        g.origin_x.to_bits(),
+                        g.origin_y.to_bits(),
+                        g.scale.to_bits(),
+                    ],
+                    g.pages_x,
+                    g.pages_y,
+                ),
+                None => (0, page_breaks_ptr, [0; 7], 0, 0),
+            })
+        } else {
+            None
+        };
         let cell_epoch = {
             let sh = self.wb.sheet(si);
             grid_render_cache::CellCacheEpoch {
@@ -29055,7 +29092,9 @@ impl SheetApp {
                 paint_scale_bits: self.paint_scale.to_bits(),
                 show_formulas: self.show_formulas,
                 text_spill: self.text_spill,
-                fonts_gen: system_fonts::generation(),
+                fonts_gen,
+                tables_fp: grid_render_cache::tables_fingerprint(&sh.tables),
+                sparklines_len: sh.sparklines.len(),
             }
         };
         let vp_key = {
@@ -29084,7 +29123,8 @@ impl SheetApp {
                 },
                 locks_fp: (net_site.map(u64::from), 0, 0),
                 notes_len: sh.notes.len(),
-                tables_len: sh.tables.len(),
+                filter_fp: grid_render_cache::filter_fingerprint(sh.filter.as_ref()),
+                page_geo_fp,
             }
         };
 
@@ -30050,18 +30090,39 @@ impl SheetApp {
                 egui::pos2(origin.x + head_w, origin.y + hh),
                 egui::pos2(origin.x + avail.x, origin.y + avail.y),
             );
-            let charts = &self.wb.sheet(self.sheet_idx).charts;
-            for (ci, ch) in charts.iter().enumerate() {
-                let (r1, c1, r2, c2) = ch.anchor;
-                let rect = chart_rect_of(ch);
+            let fonts_gen = system_fonts::generation();
+            let chart_len = self.wb.sheet(self.sheet_idx).charts.len();
+            for ci in 0..chart_len {
+                let (r1, c1, r2, c2) = self.wb.sheet(self.sheet_idx).charts[ci].anchor;
+                let rect = Rect::from_min_max(
+                    egui::pos2(px_of(c1), py_of(r1)),
+                    egui::pos2(px_of(c2), py_of(r2)),
+                );
                 if rect.intersects(clip) {
                     let p2 = painter.with_clip_rect(clip);
-                    chart_view::paint_chart(&p2, rect, ch);
                     if dumping {
+                        let ch = &self.wb.sheet(self.sheet_idx).charts[ci];
+                        chart_view::paint_chart(&p2, rect, ch);
                         dump.push(format!(
                             "chart {:?} 标题={:?} 系列={} 锚点=({},{},{},{})",
                             ch.kind, ch.title, ch.series.len(), r1, c1, r2, c2
                         ));
+                    } else {
+                        let sh = &self.wb.sheets[self.sheet_idx];
+                        let ch = &sh.charts[ci];
+                        let shapes = self.cf_inputs.chart_shapes(
+                            &p2,
+                            sh,
+                            self.doc_gen,
+                            self.wb_epoch,
+                            fonts_gen,
+                            ci,
+                            rect,
+                            ch,
+                        );
+                        if !shapes.is_empty() {
+                            p2.extend(shapes.iter().cloned());
+                        }
                     }
                     if self.chart_sel == Some(ci) {
                         painter.rect_stroke(

@@ -14,8 +14,83 @@ pub const PALETTE: [Color32; 8] = [
     Color32::from_rgb(158, 72, 14),
 ];
 
+struct ChartCanvas<'a> {
+    painter: &'a egui::Painter,
+    shapes: Vec<egui::Shape>,
+}
+
+impl<'a> ChartCanvas<'a> {
+    #[inline]
+    fn rect_filled(&mut self, rect: Rect, cr: impl Into<egui::CornerRadius>, fill: Color32) {
+        self.shapes.push(egui::Shape::rect_filled(rect, cr, fill));
+    }
+
+    #[inline]
+    fn rect_stroke(
+        &mut self,
+        rect: Rect,
+        cr: impl Into<egui::CornerRadius>,
+        stroke: impl Into<Stroke>,
+        kind: egui::StrokeKind,
+    ) {
+        self.shapes
+            .push(egui::Shape::rect_stroke(rect, cr, stroke, kind));
+    }
+
+    #[inline]
+    fn line_segment(&mut self, pts: [Pos2; 2], stroke: impl Into<Stroke>) {
+        self.shapes.push(egui::Shape::line_segment(pts, stroke));
+    }
+
+    #[inline]
+    fn circle_filled(&mut self, center: Pos2, radius: f32, fill: Color32) {
+        self.shapes
+            .push(egui::Shape::circle_filled(center, radius, fill));
+    }
+
+    #[inline]
+    fn text(
+        &mut self,
+        pos: Pos2,
+        anchor: Align2,
+        text: impl ToString,
+        font_id: FontId,
+        color: Color32,
+    ) {
+        let galley = self.painter.layout_no_wrap(text.to_string(), font_id, color);
+        let rect = anchor.anchor_size(pos, galley.size());
+        self.shapes
+            .push(egui::Shape::galley(rect.min, galley, color));
+    }
+
+    #[inline]
+    fn add(&mut self, shape: egui::Shape) {
+        self.shapes.push(shape);
+    }
+}
+
+/// 构建图表的整套绘制图元（供 `Rules.charts` 按版本与矩形直接缓存重放，避免悬停帧重算 10 万点抽稀与排版）。
+pub fn build_chart_shapes(painter: &egui::Painter, rect: Rect, chart: &Chart) -> Vec<egui::Shape> {
+    if rect.width() < 40.0 || rect.height() < 30.0 {
+        return Vec::new();
+    }
+    let mut cv = ChartCanvas {
+        painter,
+        shapes: Vec::with_capacity(32),
+    };
+    paint_chart_into(&mut cv, rect, chart);
+    cv.shapes
+}
+
 /// 在 rect 里画一张图（含标题、图例、坐标轴）
 pub fn paint_chart(painter: &egui::Painter, rect: Rect, chart: &Chart) {
+    let shapes = build_chart_shapes(painter, rect, chart);
+    if !shapes.is_empty() {
+        painter.extend(shapes);
+    }
+}
+
+fn paint_chart_into(painter: &mut ChartCanvas<'_>, rect: Rect, chart: &Chart) {
     if rect.width() < 40.0 || rect.height() < 30.0 {
         return;
     }
@@ -89,7 +164,7 @@ pub fn paint_chart(painter: &egui::Painter, rect: Rect, chart: &Chart) {
     }
 }
 
-fn axis(painter: &egui::Painter, plot: Rect, labels: &[String], max: f64, min: f64) {
+fn axis(painter: &mut ChartCanvas<'_>, plot: Rect, labels: &[String], max: f64, min: f64) {
     let line = Color32::from_rgb(180, 180, 180);
     let text = Color32::from_rgb(110, 110, 110);
     painter.line_segment(
@@ -253,7 +328,7 @@ pub(crate) fn decimate_line_points(
 }
 
 /// 组合图：前 N-1 个系列柱状（主轴），最后一个系列折线（次轴）
-fn paint_combo(painter: &egui::Painter, plot: Rect, chart: &Chart) {
+fn paint_combo(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     if chart.series.len() < 2 {
         paint_bars_slice(painter, plot, &chart.series, chart.kind, chart.show_labels);
         return;
@@ -309,12 +384,12 @@ fn paint_combo(painter: &egui::Painter, plot: Rect, chart: &Chart) {
     }
 }
 
-fn paint_bars(painter: &egui::Painter, plot: Rect, chart: &Chart) {
+fn paint_bars(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     paint_bars_slice(painter, plot, &chart.series, chart.kind, chart.show_labels);
 }
 
 fn paint_bars_slice(
-    painter: &egui::Painter,
+    painter: &mut ChartCanvas<'_>,
     plot: Rect,
     series: &[sheetcore::charts::Series],
     kind: ChartKind,
@@ -428,7 +503,7 @@ fn paint_bars_slice(
     }
 }
 
-fn paint_line(painter: &egui::Painter, plot: Rect, chart: &Chart) {
+fn paint_line(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     let (lo, hi) = bounds_slice(&chart.series);
     let cats: &[String] = chart
         .series
@@ -462,7 +537,7 @@ fn paint_line(painter: &egui::Painter, plot: Rect, chart: &Chart) {
     }
 }
 
-fn paint_area(painter: &egui::Painter, plot: Rect, chart: &Chart) {
+fn paint_area(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     let (lo, hi) = bounds_slice(&chart.series);
     let cats: &[String] = chart
         .series
@@ -503,7 +578,7 @@ fn paint_area(painter: &egui::Painter, plot: Rect, chart: &Chart) {
     }
 }
 
-fn paint_pie(painter: &egui::Painter, plot: Rect, chart: &Chart) {
+fn paint_pie(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     let vals: &[f64] = chart
         .series
         .first()

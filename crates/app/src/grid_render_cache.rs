@@ -54,6 +54,8 @@ pub(super) struct PageBreaks {
     pub(crate) base_axes: std::cell::RefCell<Option<BaseAxesCache>>,
     /// 空闲态公式栏文本缓存（消除空闲/悬停帧重复 `display_formula` 与 `Value::display` 分配）。
     pub(crate) formula_bar: Option<(FormulaBarKey, Arc<str>)>,
+    /// 并排比较副窗格持久复用的 `Rules`（防止每帧 `std::mem::take` 重建与销毁副窗格缓存和后台统计线程）。
+    pub(crate) compare_cf_inputs: Option<Box<Rules>>,
 }
 
 impl PageBreaks {
@@ -213,8 +215,15 @@ impl MergeCache {
 
 #[derive(Default)]
 pub(crate) struct SparkCache {
-    epoch: Option<(u64, u64, u64, CellVersion)>,
-    values: HashMap<(u32, u32), Arc<[Option<f64>]>>,
+    sheet_id: Option<u64>,
+    values: HashMap<
+        (u32, u32),
+        (
+            Option<(u64, CellVersion)>,
+            (u32, u32, u32, u32),
+            Arc<[Option<f64>]>,
+        ),
+    >,
 }
 
 impl SparkCache {
@@ -222,24 +231,34 @@ impl SparkCache {
         &mut self,
         wb: &Workbook,
         sheet_idx: usize,
-        doc_gen: u64,
-        wb_epoch: u64,
+        _doc_gen: u64,
+        _wb_epoch: u64,
         sp: &sheetcore::sparkline::Sparkline,
     ) -> Arc<[Option<f64>]> {
         let sh = wb.sheet(sheet_idx);
-        let key = (sh.identity, doc_gen, wb_epoch, sh.cell_version().clone());
-        if self.epoch.as_ref() != Some(&key) {
+        if self.sheet_id != Some(sh.identity) {
             self.values.clear();
-            self.epoch = Some(key);
+            self.sheet_id = Some(sh.identity);
         }
-        if let Some(v) = self.values.get(&(sp.r, sp.c)) {
-            return v.clone();
+        let src_ver = match sp.source_sheet.as_deref() {
+            Some(name) => wb
+                .sheets
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| (s.identity, s.cell_version().clone())),
+            None => Some((sh.identity, sh.cell_version().clone())),
+        };
+        if let Some((cached_ver, cached_rect, v)) = self.values.get(&(sp.r, sp.c)) {
+            if *cached_ver == src_ver && *cached_rect == sp.rect {
+                return v.clone();
+            }
         }
         let raw: Arc<[Option<f64>]> = crate::spark_view::values(wb, sheet_idx, sp).into();
         if self.values.len() > 4096 {
             self.values.clear();
         }
-        self.values.insert((sp.r, sp.c), raw.clone());
+        self.values
+            .insert((sp.r, sp.c), (src_ver, sp.rect, raw.clone()));
         raw
     }
 }
@@ -263,6 +282,8 @@ pub(crate) struct CellCacheEpoch {
     pub show_formulas: bool,
     pub text_spill: bool,
     pub fonts_gen: u64,
+    pub tables_fp: u64,
+    pub sparklines_len: usize,
 }
 
 #[derive(Clone)]
@@ -348,7 +369,8 @@ pub(crate) struct ViewportCacheKey {
     pub error_marks_fp: (usize, u64),
     pub locks_fp: (Option<u64>, usize, u64),
     pub notes_len: usize,
-    pub tables_len: usize,
+    pub filter_fp: Option<((u32, u32, u32, u32), u64)>,
+    pub page_geo_fp: Option<(usize, usize, [u32; 7], usize, usize)>,
 }
 
 #[derive(Default, Clone)]
@@ -640,8 +662,8 @@ pub(super) struct Rules {
     pub(crate) merges: MergeCache,
     pub(crate) sparks: SparkCache,
     pub(crate) grid: RetainedGridCache,
-    pub(crate) charts: HashMap<(usize, [u32; 4]), Vec<Shape>>,
-    pub(crate) charts_epoch: Option<(u64, u64, u64)>,
+    pub(crate) charts: HashMap<(usize, [u32; 4]), Arc<[Shape]>>,
+    pub(crate) charts_epoch: Option<(u64, u64, u64, CellVersion, u64, u64)>,
 }
 
 impl Rules {
@@ -771,6 +793,113 @@ impl Rules {
         self.observed = observed;
         dirty || async_applied
     }
+
+    pub(crate) fn chart_shapes(
+        &mut self,
+        painter: &egui::Painter,
+        sh: &Sheet,
+        doc_gen: u64,
+        wb_epoch: u64,
+        fonts_gen: u64,
+        ci: usize,
+        rect: Rect,
+        ch: &sheetcore::charts::Chart,
+    ) -> Arc<[Shape]> {
+        let fp = charts_fingerprint(&sh.charts);
+        let epoch = (
+            sh.identity,
+            doc_gen,
+            wb_epoch,
+            sh.cell_version().clone(),
+            fonts_gen,
+            fp,
+        );
+        if self.charts_epoch.as_ref() != Some(&epoch) {
+            self.charts.clear();
+            self.charts_epoch = Some(epoch);
+        }
+        let rkey = [
+            rect.min.x.to_bits(),
+            rect.min.y.to_bits(),
+            rect.max.x.to_bits(),
+            rect.max.y.to_bits(),
+        ];
+        if let Some(cached) = self.charts.get(&(ci, rkey)) {
+            return cached.clone();
+        }
+        let built: Arc<[Shape]> = crate::chart_view::build_chart_shapes(painter, rect, ch).into();
+        if self.charts.len() > 256 {
+            self.charts.clear();
+        }
+        self.charts.insert((ci, rkey), built.clone());
+        built
+    }
+}
+
+pub(crate) fn tables_fingerprint(tables: &[sheetcore::table::Table]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if tables.is_empty() {
+        return 0;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tables.len().hash(&mut h);
+    for t in tables {
+        t.range.hash(&mut h);
+        t.header_row.hash(&mut h);
+        t.totals_row.hash(&mut h);
+    }
+    h.finish()
+}
+
+pub(crate) fn filter_fingerprint(
+    filter: Option<&sheetcore::sort_filter::Filter>,
+) -> Option<((u32, u32, u32, u32), u64)> {
+    let f = filter?;
+    let mut acc = 0u64;
+    for &c in f.allows.keys() {
+        let mut x = (u64::from(c) << 1) | 1;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        acc ^= x;
+    }
+    for &c in f.criteria.keys() {
+        let mut x = (u64::from(c) << 1) | 2;
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        acc ^= x;
+    }
+    Some((f.range, acc))
+}
+
+pub(crate) fn charts_fingerprint(charts: &[sheetcore::charts::Chart]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if charts.is_empty() {
+        return 0;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    charts.len().hash(&mut h);
+    for ch in charts {
+        std::mem::discriminant(&ch.kind).hash(&mut h);
+        ch.title.hash(&mut h);
+        ch.legend.hash(&mut h);
+        ch.anchor.hash(&mut h);
+        ch.show_labels.hash(&mut h);
+        ch.series.len().hash(&mut h);
+        for s in &ch.series {
+            s.name.hash(&mut h);
+            s.color.hash(&mut h);
+            s.secondary.hash(&mut h);
+            (s.vals.as_ptr() as usize).hash(&mut h);
+            s.vals.len().hash(&mut h);
+            if let Some(first) = s.vals.first() {
+                first.to_bits().hash(&mut h);
+            }
+            if let Some(last) = s.vals.last() {
+                last.to_bits().hash(&mut h);
+            }
+            (s.cats.as_ptr() as usize).hash(&mut h);
+            s.cats.len().hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 #[inline]
@@ -1177,5 +1306,307 @@ mod tests {
             .clone()
             .expect("viewport cached");
         assert!(key2 != key3, "cell mutation must invalidate viewport key");
+    }
+
+    #[test]
+    fn filter_toggle_and_page_setup_invalidate_viewport_cache_immediately() {
+        let _env = crate::test_env::TestEnv::new("filter-and-page-vp-key");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        crate::install_fonts(&ctx);
+        for r in 0..=4u32 {
+            app.wb.sheet_mut(0).set(
+                r,
+                0,
+                Cell {
+                    value: Value::Text(format!("R{r}").into()),
+                    formula: None,
+                },
+            );
+        }
+        let run_frame = |app: &mut SheetApp| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+            });
+        };
+
+        run_frame(&mut app);
+        let k_before_filter = app.cf_inputs.grid.viewport.key.clone().unwrap();
+        let shapes_before: usize = app
+            .cf_inputs
+            .grid
+            .viewport
+            .body_batches
+            .iter()
+            .map(|(_, s)| s.len())
+            .sum();
+
+        app.sel = (0, 0);
+        app.start_filter();
+        run_frame(&mut app);
+        let k_after_filter = app.cf_inputs.grid.viewport.key.clone().unwrap();
+        let shapes_after: usize = app
+            .cf_inputs
+            .grid
+            .viewport
+            .body_batches
+            .iter()
+            .map(|(_, s)| s.len())
+            .sum();
+        assert!(
+            k_before_filter != k_after_filter && shapes_after > shapes_before,
+            "enabling AutoFilter must invalidate ViewportCacheKey and record funnel arrow"
+        );
+
+        // Page Layout mode (`view_mode = 2`): mutating `sh.page` without bumping `doc_gen` must invalidate viewport key
+        app.view_mode = 2;
+        run_frame(&mut app);
+        let k_portrait = app.cf_inputs.grid.viewport.key.clone().unwrap();
+        app.wb.sheet_mut(0).page.landscape = !app.wb.sheet(0).page.landscape;
+        run_frame(&mut app);
+        let k_landscape = app.cf_inputs.grid.viewport.key.clone().unwrap();
+        assert!(
+            k_portrait != k_landscape,
+            "page setup mutation in page_mode must invalidate ViewportCacheKey"
+        );
+    }
+
+    #[test]
+    fn table_attribute_flip_and_cross_sheet_sparkline_invalidate_caches() {
+        let _env = crate::test_env::TestEnv::new("table-and-spark-key");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        crate::install_fonts(&ctx);
+        app.wb.sheet_mut(0).set(
+            0,
+            0,
+            Cell {
+                value: Value::Text("Col1".into()),
+                formula: None,
+            },
+        );
+        app.wb.sheet_mut(0).tables.push(sheetcore::table::Table {
+            name: "T1".into(),
+            display: "T1".into(),
+            range: (0, 0, 3, 1),
+            columns: vec!["Col1".into(), "Col2".into()],
+            column_ids: vec![1, 2],
+            header_row: true,
+            totals_row: false,
+        });
+        let run_frame = |app: &mut SheetApp| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+            });
+        };
+        run_frame(&mut app);
+        let k1 = app.cf_inputs.grid.viewport.key.clone().unwrap();
+        // Flip header_row in-place without changing tables.len() or doc_gen
+        app.wb.sheet_mut(0).tables[0].header_row = false;
+        run_frame(&mut app);
+        let k2 = app.cf_inputs.grid.viewport.key.clone().unwrap();
+        assert!(
+            k1.cell_epoch != k2.cell_epoch,
+            "in-place table header_row flip must invalidate CellCacheEpoch"
+        );
+
+        // Cross-sheet sparkline invalidation when source sheet cells change without touching anchor sheet
+        let mut src = Sheet::new("SparkSrc");
+        src.set(
+            0,
+            0,
+            Cell {
+                value: Value::Number(10.0),
+                formula: None,
+            },
+        );
+        src.set(
+            0,
+            1,
+            Cell {
+                value: Value::Number(20.0),
+                formula: None,
+            },
+        );
+        app.wb.sheets.push(src);
+        let sp = sheetcore::sparkline::Sparkline {
+            r: 1,
+            c: 1,
+            source_sheet: Some("SparkSrc".into()),
+            rect: (0, 0, 0, 1),
+            ..Default::default()
+        };
+        let v1 = app
+            .cf_inputs
+            .sparks
+            .get_or_load(&app.wb, 0, app.doc_gen, app.wb_epoch, &sp);
+        assert_eq!(&*v1, &[Some(10.0), Some(20.0)]);
+
+        app.wb.sheets[1].set(
+            0,
+            1,
+            Cell {
+                value: Value::Number(99.0),
+                formula: None,
+            },
+        );
+        let v2 = app
+            .cf_inputs
+            .sparks
+            .get_or_load(&app.wb, 0, app.doc_gen, app.wb_epoch, &sp);
+        assert_eq!(
+            &*v2,
+            &[Some(10.0), Some(99.0)],
+            "SparkCache must detect cell_version change on cross-sheet source_sheet"
+        );
+    }
+
+    #[test]
+    fn chart_shape_cache_reuses_arc_and_compare_pane_persists_rules() {
+        let _env = crate::test_env::TestEnv::new("chart-and-compare-cache");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        crate::install_fonts(&ctx);
+        app.wb.sheet_mut(0).charts.push(sheetcore::charts::Chart {
+            kind: sheetcore::charts::ChartKind::Line,
+            title: "PerfChart".into(),
+            series: vec![sheetcore::charts::Series {
+                name: "S1".into(),
+                cats: vec!["A".into(), "B".into(), "C".into()],
+                vals: vec![1.0, 5.0, 3.0],
+                ..Default::default()
+            }],
+            legend: true,
+            anchor: (1, 1, 12, 6),
+            legend_pos: "r".into(),
+            part: String::new(),
+            drawing: String::new(),
+            show_labels: false,
+            label_opts: Default::default(),
+            radar_style: String::new(),
+            ref_fixes: Vec::new(),
+            axis_x: String::new(),
+            axis_y: String::new(),
+            y_fmt: String::new(),
+            y_min: None,
+            y_max: None,
+        });
+        let run_frame = |app: &mut SheetApp| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+            });
+        };
+        run_frame(&mut app);
+        let ptr1 = app
+            .cf_inputs
+            .charts
+            .values()
+            .next()
+            .map(|a| Arc::as_ptr(a) as *const Shape as usize)
+            .expect("chart shapes cached");
+        app.sel = (4, 4);
+        run_frame(&mut app);
+        let ptr2 = app
+            .cf_inputs
+            .charts
+            .values()
+            .next()
+            .map(|a| Arc::as_ptr(a) as *const Shape as usize)
+            .expect("chart shapes still cached");
+        assert_eq!(ptr1, ptr2, "chart shape Arc must be reused on hover/selection frames");
+
+        app.compare = Some((Workbook::new_blank(), 0, egui::Vec2::ZERO));
+        let run_compare = |app: &mut SheetApp| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| app.draw_compare_pane(ui, ctx));
+            });
+        };
+        run_compare(&mut app);
+        let cmp_ptr1 = app
+            .normal_page_breaks
+            .compare_cf_inputs
+            .as_ref()
+            .map(|b| &**b as *const Rules as usize)
+            .expect("compare Rules persisted");
+        run_compare(&mut app);
+        let cmp_ptr2 = app
+            .normal_page_breaks
+            .compare_cf_inputs
+            .as_ref()
+            .map(|b| &**b as *const Rules as usize)
+            .expect("compare Rules still persisted");
+        assert_eq!(cmp_ptr1, cmp_ptr2, "draw_compare_pane must reuse persistent Rules");
+    }
+
+    #[test]
+    fn current_region_fast_handles_sparse_anchor_column_over_200k_cells() {
+        let mut sh = Sheet::new("LargeSparseAnchor");
+        for r in 0..210_000u32 {
+            sh.set(
+                r,
+                3,
+                Cell {
+                    value: Value::Number(r as f64),
+                    formula: None,
+                },
+            );
+        }
+        sh.set(
+            0,
+            4,
+            Cell {
+                value: Value::Text("Mid".into()),
+                formula: None,
+            },
+        );
+        sh.set(
+            0,
+            5,
+            Cell {
+                value: Value::Text("SparseNote".into()),
+                formula: None,
+            },
+        );
+        assert!(sh.len() > 200_000);
+        let start = std::time::Instant::now();
+        let region = SheetApp::current_region_fast(&sh, 0, 5);
+        let elapsed = start.elapsed();
+        assert_eq!(region, (0, 3, 209_999, 5));
+        assert!(
+            elapsed.as_millis() < 1500,
+            "current_region_fast took {elapsed:?} on >200k sheet with sparse anchor col"
+        );
     }
 }

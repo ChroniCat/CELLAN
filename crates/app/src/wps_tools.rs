@@ -193,15 +193,15 @@ impl SheetApp {
             })
         };
         let row_non_empty = |rr: u32| -> bool {
-            if sheet.get(rr, c).is_some() {
+            if sheet.get(rr, c).is_some()
+                || (c != 0 && sheet.get(rr, 0).is_some())
+                || (c > 0 && sheet.get(rr, c - 1).is_some())
+                || (c + 1 < cols && sheet.get(rr, c + 1).is_some())
+            {
                 return true;
             }
-            if sheet.len() <= 200_000 {
-                let (rb, _) = get_bitmaps();
-                (rb[(rr / 64) as usize] & (1u64 << (rr % 64))) != 0
-            } else {
-                sheet.iter_rect((rr, 0, rr, cols - 1)).next().is_some()
-            }
+            let (rb, _) = get_bitmaps();
+            (rb[(rr / 64) as usize] & (1u64 << (rr % 64))) != 0
         };
         let mut r1 = r;
         while r1 > 0 && row_non_empty(r1 - 1) {
@@ -215,12 +215,8 @@ impl SheetApp {
             if sheet.get(r, cc).is_some() || sheet.get(r1, cc).is_some() {
                 return true;
             }
-            if sheet.len() <= 200_000 {
-                let (_, cb) = get_bitmaps();
-                (cb[(cc / 64) as usize] & (1u64 << (cc % 64))) != 0
-            } else {
-                sheet.iter_rect((0, cc, rows - 1, cc)).next().is_some()
-            }
+            let (_, cb) = get_bitmaps();
+            (cb[(cc / 64) as usize] & (1u64 << (cc % 64))) != 0
         };
         let mut c1 = c;
         while c1 > 0 && col_non_empty(c1 - 1) {
