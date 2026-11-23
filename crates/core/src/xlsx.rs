@@ -4,80 +4,32 @@ use calamine::{open_workbook_auto, Data, Reader};
 use std::borrow::Cow;
 use std::path::Path;
 
-/// .xls 的样式/列宽/行高/合并区（calamine 只给值）
-fn apply_xls_meta(path: &Path, wb: &mut Workbook) {
-    let is_xls = std::fs::File::open(path).is_ok() && !crate::crypto::has_magic(path, b"PK");
-    if !is_xls {
-        return;
+/// 从单次读取的 BIFF `Workbook` 流中还原列宽、行高与预去重样式，避免多次整包重读 `.xls`。
+fn apply_xls_meta_stream(stream: &[u8], wb: &mut Workbook) {
+    let sizes = crate::xls_layout::parse(stream);
+    for (i, sheet) in wb.sheets.iter_mut().enumerate() {
+        let Some(sz) = sizes.sheets.get(i) else { continue };
+        for (a, b, w) in sz.cols.iter() {
+            if b.saturating_sub(*a) < 1024 {
+                sheet.cols.set_many((*a..=*b).map(|c| (c, *w)));
+            } else {
+                sheet.cols.set_default(*w);
+            }
+        }
+        sheet.rows.set_many(sz.rows.iter().map(|(r, h)| (*r, *h)));
     }
-    if let Some(sizes) = crate::xls_layout::read(path) {
-        for (i, sheet) in wb.sheets.iter_mut().enumerate() {
-            let Some(sz) = sizes.sheets.get(i) else { continue };
-            for (a, b, w) in sz.cols.iter() {
-                if b.saturating_sub(*a) < 1024 {
-                    sheet.cols.set_many((*a..=*b).map(|c| (c, *w)));
-                } else {
-                    sheet.cols.set_default(*w);
-                }
-            }
-            sheet.rows.set_many(sz.rows.iter().map(|(r, h)| (*r, *h)));
-        }
-    }
-    if let Some(sty) = crate::xls_style::read(path) {
-        let mut cell_ids: Vec<(usize, u32, u32, u16)> = Vec::new();
-        let mut row_ids: Vec<(usize, u32, u16)> = Vec::new();
-        let mut col_ids: Vec<(usize, u32, u16)> = Vec::new();
-        for (i, sh) in sty.sheets.iter().enumerate() {
-            for (r, st) in sh.rows.iter() {
-                row_ids.push((i, *r, wb.styles.intern(st.clone())));
-            }
-            for (c, st) in sh.cols.iter() {
-                col_ids.push((i, *c, wb.styles.intern(st.clone())));
-            }
-            for (r, c, st) in sh.cells.iter() {
-                cell_ids.push((i, *r, *c, wb.styles.intern(st.clone())));
-            }
-        }
-        for (i, c, id) in col_ids {
-            if let Some(sh) = wb.sheets.get_mut(i) {
-                if id != 0 {
-                    sh.set_col_style_loaded(c, id);
-                }
-            }
-        }
-        for (i, r, id) in row_ids {
-            if let Some(sh) = wb.sheets.get_mut(i) {
-                if id != 0 {
-                    sh.set_row_style_loaded(r, id);
-                }
-            }
-        }
-        for (i, r, c, id) in cell_ids {
-            if let Some(sh) = wb.sheets.get_mut(i) {
-                sh.set_style_loaded(r, c, id);
-            }
-        }
-    }
+    crate::xls_style::apply_stream_to_workbook(stream, wb);
+}
+
+/// .xls 的样式/列宽/行高/批注（供内置 BIFF 兜底分支单次复用）
+fn apply_xls_meta_fallback(path: &Path, stream: &[u8], wb: &mut Workbook) {
+    apply_xls_meta_stream(stream, wb);
     if let Ok(all) = crate::notes::load_notes(path) {
         for sheet in wb.sheets.iter_mut() {
             if let Some(list) = all.get(&sheet.name) {
                 for n in list.iter() {
                     sheet.notes.insert(crate::model::CellRef::new(n.r, n.c), n.clone());
                 }
-            }
-        }
-    }
-    if let Ok(calamine::Sheets::Xls(x)) = open_workbook_auto(path) {
-        let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
-        for (i, name) in names.iter().enumerate() {
-            if i >= wb.sheets.len() {
-                break;
-            }
-            if let Some(regions) = x.worksheet_merge_cells(name) {
-                wb.sheets[i].merges = regions
-                    .iter()
-                    .map(|d| (d.start.0, d.start.1, d.end.0, d.end.1))
-                    .collect();
             }
         }
     }
@@ -213,14 +165,23 @@ fn load_legacy_sheet(
         }
         Err(e) => diag.push(Some(&name), &part, "全部单元格数据", format!("{e:#}"), true),
     }
-    match reader.worksheet_style(&name) {
-        Ok(range) => {
-            for (row, col, style) in range.cells() {
-                let id = styles.intern(convert_style(style));
-                if id != 0 { sheet.set_style_loaded(row, col, id); }
-            }
+    if let calamine::Sheets::Xls(x) = reader {
+        if let Some(regions) = x.worksheet_merge_cells(&name) {
+            sheet.merges = regions
+                .iter()
+                .map(|d| (d.start.0, d.start.1, d.end.0, d.end.1))
+                .collect();
         }
-        Err(e) => diag.push(Some(&name), &part, "单元格样式", format!("{e:#}"), true),
+    } else {
+        match reader.worksheet_style(&name) {
+            Ok(range) => {
+                for (row, col, style) in range.cells() {
+                    let id = styles.intern(convert_style(style));
+                    if id != 0 { sheet.set_style_loaded(row, col, id); }
+                }
+            }
+            Err(e) => diag.push(Some(&name), &part, "单元格样式", format!("{e:#}"), true),
+        }
     }
     match reader.worksheet_formula(&name) {
         Ok(range) => {
@@ -288,38 +249,9 @@ fn load_xlsx_cells(
 }
 
 /// Office 加密文件是 CFB 容器，里面有一个叫 EncryptedPackage 的流。
-/// 这里只做识别：按 1MB 块扫 UTF-16LE 流名，命中就认为需要密码。
+/// 直接通过 CFB 扇区目录表跳转定位（~1.5KB），避免打开大型 `.xls` 时全盘逐块扫描。
 fn is_password_encrypted(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut head = [0u8; 8];
-    if f.read_exact(&mut head).is_err()
-        || head != [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
-    {
-        return false;
-    }
-    let needle: Vec<u8> = "EncryptedPackage"
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut prev: Vec<u8> = Vec::new();
-    loop {
-        let Ok(n) = f.read(&mut buf) else { return false };
-        if n == 0 {
-            return false;
-        }
-        let mut window = Vec::with_capacity(prev.len() + n);
-        window.extend_from_slice(&prev);
-        window.extend_from_slice(&buf[..n]);
-        if window.windows(needle.len()).any(|w| w == needle.as_slice()) {
-            return true;
-        }
-        let keep = needle.len().saturating_sub(1).min(window.len());
-        prev = window[window.len() - keep..].to_vec();
-    }
+    crate::cfb::has_encrypted_package_file(path)
 }
 
 pub fn load(path: &Path) -> Result<Workbook> {
@@ -458,8 +390,19 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 }
                 eprintln!("[load] calamine 打不开，改用内置 BIFF 读取器：{e}");
                 set_load_kind(LOAD_KIND_BIFF_BUILTIN);
+                if let Some(stream) = crate::cfb::read_workbook_stream_file(path) {
+                    let mut wb = crate::xls_read::load_from_stream(path, &stream)?;
+                    apply_xls_meta_fallback(path, &stream, &mut wb);
+                    return Ok((wb, diag));
+                }
                 let mut wb = crate::xls_read::load(path)?;
-                apply_xls_meta(path, &mut wb);
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(cf) = crate::cfb::Compound::open(bytes) {
+                        if let Some(stream) = cf.stream_by_path("Workbook").or_else(|| cf.stream_by_path("Book")) {
+                            apply_xls_meta_fallback(path, &stream, &mut wb);
+                        }
+                    }
+                }
                 return Ok((wb, diag));
             }
         }
@@ -483,12 +426,12 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         load_incomplete: false,
         names: defined_names,
         // 数据源存在 `docProps/custom.xml` 或旧版 `_sc_src_*` 名称里，按需读出来重建
-        sources: if !is_ooxml || zip_has_custom_props || has_source_names {
+        sources: if is_ooxml && (zip_has_custom_props || has_source_names) {
             crate::external::read_sources(path)
         } else {
             Vec::new()
         },
-        links: if !is_ooxml || zip_has_xlinks {
+        links: if is_ooxml && zip_has_xlinks {
             crate::xlinks::read(path)
         } else {
             Vec::new()
@@ -497,7 +440,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         pivot_shifts: Vec::new(),
         pivot_cache_base: Default::default(),
         pivot_session: Default::default(),
-        has_vba: if is_ooxml { zip_has_vba } else { crate::vba::has_macros(path) },
+        has_vba: if is_ooxml { zip_has_vba } else { false },
         date_system: if crate::patch::date1904_xml(&workbook_xml) {
             crate::model::DateSystem::D1904
         } else {
@@ -753,9 +696,11 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             }
         }
     }
-    apply_xls_meta(path, &mut wb);
     if is_cfb {
-        wb.calc_manual = crate::xls_read::read_calc_manual(path);
+        if let Some(xls_stream) = crate::cfb::read_workbook_stream_file(path) {
+            apply_xls_meta_stream(&xls_stream, &mut wb);
+            wb.calc_manual = crate::xls_read::read_calc_manual_stream(&xls_stream);
+        }
     }
 
     // 还原工作表布局和合并区域

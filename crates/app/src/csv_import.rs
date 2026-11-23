@@ -838,6 +838,7 @@ impl SheetApp {
                 }
             }
         }
+        self.tasks.poll_pdf_export(&mut self.status, ctx);
         if self.csv_job.is_none() {
             return;
         }

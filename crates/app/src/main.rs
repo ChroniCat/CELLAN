@@ -9244,8 +9244,8 @@ impl SheetApp {
                 .map(|d| d.as_secs())
                 .unwrap_or(0)
         ));
-        let regular = sheetcore::pdf::Font::parse(FONT_SANS.to_vec());
-        let bold = sheetcore::pdf::Font::parse(FONT_SANS_BOLD.to_vec()).ok();
+        let regular = sheetcore::pdf::Font::parse_static(FONT_SANS);
+        let bold = sheetcore::pdf::Font::parse_static(FONT_SANS_BOLD).ok();
         let export = match regular {
             Ok(regular) => sheetcore::print::export_pdf_pages_with_fonts(
                 &self.wb,
@@ -9323,31 +9323,47 @@ impl SheetApp {
         self.export_pdf_to(&path);
     }
 
-    /// 导出当前工作表为 PDF（对话框与 SC_EXPORT_PDF 共用同一条路径）
+    /// 导出当前工作表为 PDF（对话框与 SC_EXPORT_PDF 共用同一条路径；大表交互导出走后台线程）
     fn export_pdf_to(&mut self, path: &std::path::Path) {
-        // PDF 用内嵌 SIL OFL 字体的常规+粗体两套（不再嵌 Windows 的 simhei.ttf）：
+        // PDF 用内嵌 SIL OFL 字体的常规+粗体两套（全局 OnceLock 零拷贝缓存解析结果）：
         // 粗体走 /F2 的真 700 字形，随包可分发。
-        let regular = sheetcore::pdf::Font::parse(FONT_SANS.to_vec());
-        let bold = sheetcore::pdf::Font::parse(FONT_SANS_BOLD.to_vec()).ok();
+        let regular = sheetcore::pdf::Font::parse_static(FONT_SANS);
+        let bold = sheetcore::pdf::Font::parse_static(FONT_SANS_BOLD).ok();
         match (regular, bold) {
-            (Ok(regular), bold) => match sheetcore::print::export_pdf_pages_with_fonts(
-                &self.wb,
-                self.sheet_idx,
-                path,
-                regular,
-                bold,
-                self.wb.path.as_deref(),
-                None,
-            ) {
-                Ok(n) => {
-                    self.status = format!("已导出 {}", path.display());
-                    eprintln!("[pdf] 已导出 {} 页 {}", n, path.display());
+            (Ok(regular), bold) => {
+                let async_eligible = !cfg!(test)
+                    && std::env::var_os("SC_EXPORT_PDF").is_none()
+                    && std::env::var_os("SC_EXPORT_PDF_EXIT").is_none()
+                    && {
+                        let sh = self.wb.sheet(self.sheet_idx);
+                        sh.len() > 4_096 || !sh.pictures.is_empty() || !sh.charts.is_empty()
+                    };
+                if async_eligible {
+                    let snapshot = self.wb.clone();
+                    let out_path = path.to_path_buf();
+                    self.status = format!("正在后台导出 {}…", out_path.display());
+                    self.tasks.start_pdf_export(snapshot, self.sheet_idx, out_path, regular, bold);
+                    return;
                 }
-                Err(e) => {
-                    self.status = format!("导出失败：{e:#}");
-                    eprintln!("[pdf] 导出失败 {e:#}");
+                match sheetcore::print::export_pdf_pages_with_fonts(
+                    &self.wb,
+                    self.sheet_idx,
+                    path,
+                    regular,
+                    bold,
+                    self.wb.path.as_deref(),
+                    None,
+                ) {
+                    Ok(n) => {
+                        self.status = format!("已导出 {}", path.display());
+                        eprintln!("[pdf] 已导出 {} 页 {}", n, path.display());
+                    }
+                    Err(e) => {
+                        self.status = format!("导出失败：{e:#}");
+                        eprintln!("[pdf] 导出失败 {e:#}");
+                    }
                 }
-            },
+            }
             (Err(e), _) => {
                 self.status = format!("导出失败：内嵌字体解析失败 {e:#}");
                 eprintln!("[pdf] 内嵌字体解析失败 {e:#}");

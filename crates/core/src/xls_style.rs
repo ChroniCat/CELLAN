@@ -172,8 +172,7 @@ pub struct XlsStyles {
     pub sheets: Vec<SheetStyles>,
 }
 
-/// 解析 `Workbook` 流（公开出来便于用内存字节做测试）
-pub fn parse(stream: &[u8]) -> XlsStyles {
+fn parse_global_xf_styles(stream: &[u8]) -> (Vec<u32>, Vec<Option<CellStyle>>) {
     // 第一趟先读 BOUNDSHEET 与自定义 PALETTE(0x0092)，确保后续解析 FONT/XF 时调色板已就绪
     let mut bounds: Vec<u32> = Vec::new();
     let mut palette = DEFAULT_PALETTE;
@@ -266,7 +265,7 @@ pub fn parse(stream: &[u8]) -> XlsStyles {
     let mut implicit = None;
     if fonts.len() >= 4 {
         let base = fonts[0].clone();
-        implicit = Some((base.name.clone(), base.height_twips));
+        implicit = Some((crate::style::normalize_font(&base.name), base.height_twips));
         fonts.insert(4, base);
     } else if !fonts.is_empty() {
         let mut def = fonts[0].clone();
@@ -279,75 +278,88 @@ pub fn parse(stream: &[u8]) -> XlsStyles {
         let base = fonts[mid].clone();
         def.height_twips = base.height_twips;
         def.name = base.name.clone();
-        implicit = Some((def.name.clone(), def.height_twips));
+        implicit = Some((crate::style::normalize_font(&def.name), def.height_twips));
         fonts.insert(0, def);
     }
 
-    let build_cell_style = |ixfe: u16| -> Option<CellStyle> {
-        let xf = xfs.get(ixfe as usize)?;
-        let f = fonts.get(xf.font as usize).cloned().unwrap_or_default();
-        let mut st = CellStyle {
-            bold: f.bold,
-            italic: f.italic,
-            underline: f.underline,
-            double_underline: f.double_underline,
-            strikethrough: f.strikethrough,
-            color: f.color,
-            fill: xf.fill,
-            font: crate::style::normalize_font(&f.name),
-            size: if f.height_twips > 0 {
-                (f.height_twips as f32 / 20.0 * 4.0).round() / 4.0
-            } else {
-                11.0
-            },
-            halign: xf.halign,
-            valign: xf.valign,
-            wrap: xf.wrap,
-            shrink_to_fit: xf.shrink_to_fit,
-            indent: xf.indent,
-            locked: xf.locked,
-            ..Default::default()
-        };
-        st.diagonal = xf.diagonal.clone();
-        for (idx, code) in xf.borders.iter().enumerate() {
-            st.border[idx].style = *code;
-            if *code != 0 {
-                st.border[idx].color = xf.border_colors[idx];
+    let norm_fonts: Vec<String> = fonts.iter().map(|f| crate::style::normalize_font(&f.name)).collect();
+    let xf_styles: Vec<Option<CellStyle>> = xfs
+        .iter()
+        .map(|xf| {
+            let fi = xf.font as usize;
+            let f = fonts.get(fi).cloned().unwrap_or_default();
+            let font_name = norm_fonts.get(fi).cloned().unwrap_or_else(|| crate::style::normalize_font(&f.name));
+            let mut st = CellStyle {
+                bold: f.bold,
+                italic: f.italic,
+                underline: f.underline,
+                double_underline: f.double_underline,
+                strikethrough: f.strikethrough,
+                color: f.color,
+                fill: xf.fill,
+                font: font_name,
+                size: if f.height_twips > 0 {
+                    (f.height_twips as f32 / 20.0 * 4.0).round() / 4.0
+                } else {
+                    11.0
+                },
+                halign: xf.halign,
+                valign: xf.valign,
+                wrap: xf.wrap,
+                shrink_to_fit: xf.shrink_to_fit,
+                indent: xf.indent,
+                locked: xf.locked,
+                ..Default::default()
+            };
+            st.diagonal = xf.diagonal.clone();
+            for (idx, code) in xf.borders.iter().enumerate() {
+                st.border[idx].style = *code;
+                if *code != 0 {
+                    st.border[idx].color = xf.border_colors[idx];
+                }
             }
-        }
-        st.format = formats
-            .get(&xf.format)
-            .cloned()
-            .or_else(|| builtin_format(xf.format).map(|s| s.to_string()))
-            .unwrap_or_default();
-        if st == CellStyle::default() {
-            return None;
-        }
-        if let Some((name, tw)) = &implicit {
-            let norm_name = crate::style::normalize_font(name);
-            let same = st.font == norm_name
-                && (st.size - (*tw as f32 / 20.0)).abs() < 0.01
-                && !st.bold
-                && !st.italic
-                && !st.underline
-                && !st.double_underline
-                && !st.strikethrough
-                && st.color == [0, 0, 0]
-                && st.halign == 0
-                && st.valign == 0
-                && !st.wrap
-                && !st.shrink_to_fit
-                && st.indent == 0
-                && st.format.is_empty()
-                && st.locked
-                && st.fill.is_none()
-                && st.diagonal.is_none()
-                && st.border.iter().all(|b| b.style == 0);
-            if same {
+            st.format = formats
+                .get(&xf.format)
+                .cloned()
+                .or_else(|| builtin_format(xf.format).map(|s| s.to_string()))
+                .unwrap_or_default();
+            if st == CellStyle::default() {
                 return None;
             }
-        }
-        Some(st)
+            if let Some((norm_name, tw)) = &implicit {
+                let same = &st.font == norm_name
+                    && (st.size - (*tw as f32 / 20.0)).abs() < 0.01
+                    && !st.bold
+                    && !st.italic
+                    && !st.underline
+                    && !st.double_underline
+                    && !st.strikethrough
+                    && st.color == [0, 0, 0]
+                    && st.halign == 0
+                    && st.valign == 0
+                    && !st.wrap
+                    && !st.shrink_to_fit
+                    && st.indent == 0
+                    && st.format.is_empty()
+                    && st.locked
+                    && st.fill.is_none()
+                    && st.diagonal.is_none()
+                    && st.border.iter().all(|b| b.style == 0);
+                if same {
+                    return None;
+                }
+            }
+            Some(st)
+        })
+        .collect();
+    (bounds, xf_styles)
+}
+
+/// 解析 `Workbook` 流（公开出来便于用内存字节做测试）
+pub fn parse(stream: &[u8]) -> XlsStyles {
+    let (bounds, xf_styles) = parse_global_xf_styles(stream);
+    let build_cell_style = |ixfe: u16| -> Option<CellStyle> {
+        xf_styles.get(ixfe as usize).and_then(Option::clone)
     };
 
     let mut out = XlsStyles {
@@ -608,15 +620,97 @@ pub fn debug_tables(stream: &[u8]) {
     }
 }
 
-pub fn read(path: &Path) -> Option<XlsStyles> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.starts_with(b"PK") || bytes.len() < 512 {
-        return None;
+/// 直接按预去重的 XF -> u16 映射表单遍写入 Workbook 样式，
+/// 消除 50 万单元格逐格克隆 `CellStyle` 与重复 `StyleTable::intern` 的开销。
+pub fn apply_stream_to_workbook(stream: &[u8], wb: &mut crate::model::Workbook) {
+    let (bounds, xf_styles) = parse_global_xf_styles(stream);
+    let xf_ids: Vec<u16> = xf_styles
+        .into_iter()
+        .map(|opt| opt.map_or(0, |st| wb.styles.intern(st)))
+        .collect();
+    let style_id = |ixfe: u16| -> u16 { xf_ids.get(ixfe as usize).copied().unwrap_or(0) };
+
+    let mut cur: Option<usize> = None;
+    let mut next_bound = 0usize;
+    let mut i = 0usize;
+    while i + 4 <= stream.len() {
+        while next_bound < bounds.len() && (i as u32) >= bounds[next_bound] {
+            cur = Some(next_bound);
+            next_bound += 1;
+        }
+        let (typ, len) = (u16le(stream, i).unwrap(), u16le(stream, i + 2).unwrap() as usize);
+        let body = &stream[(i + 4).min(stream.len())..(i + 4 + len).min(stream.len())];
+        if let Some(si) = cur {
+            if let Some(sh) = wb.sheets.get_mut(si) {
+                match typ {
+                    COLINFO if body.len() >= 8 => {
+                        let ixfe = u16le(body, 6).unwrap_or(15);
+                        if let Some((c1, c2)) =
+                            crate::xls_layout::physical_columns(body).filter(|_| ixfe != 0 && ixfe != 15)
+                        {
+                            let id = style_id(ixfe);
+                            if id != 0 {
+                                for col in c1..=c2 {
+                                    sh.set_col_style_loaded(col, id);
+                                }
+                            }
+                        }
+                    }
+                    ROW_REC if body.len() >= 16 => {
+                        let r = u16le(body, 0).unwrap_or(0) as u32;
+                        let grbit = u16le(body, 12).unwrap_or(0);
+                        if grbit & 0x0080 != 0 {
+                            let ixfe = u16le(body, 14).unwrap_or(15) & 0x0FFF;
+                            let id = style_id(ixfe);
+                            if id != 0 {
+                                sh.set_row_style_loaded(r, id);
+                            }
+                        }
+                    }
+                    LABELSST | LABEL | NUMBER | RK | BOOLERR | BLANK | FORMULA if body.len() >= 6 => {
+                        let r = u16le(body, 0).unwrap() as u32;
+                        let c = u16le(body, 2).unwrap() as u32;
+                        let id = style_id(u16le(body, 4).unwrap());
+                        if id != 0 {
+                            sh.set_style_loaded(r, c, id);
+                        }
+                    }
+                    MULRK if body.len() >= 6 => {
+                        let r = u16le(body, 0).unwrap() as u32;
+                        let c1 = u16le(body, 2).unwrap() as u32;
+                        let n = (body.len().saturating_sub(6)) / 6;
+                        for k in 0..n {
+                            let id = style_id(u16le(body, 4 + k * 6).unwrap());
+                            if id != 0 {
+                                sh.set_style_loaded(r, c1 + k as u32, id);
+                            }
+                        }
+                    }
+                    MULBLANK if body.len() >= 6 => {
+                        let r = u16le(body, 0).unwrap() as u32;
+                        let c1 = u16le(body, 2).unwrap() as u32;
+                        let n = (body.len().saturating_sub(6)) / 2;
+                        for k in 0..n {
+                            let id = style_id(u16le(body, 4 + k * 2).unwrap());
+                            if id != 0 {
+                                sh.set_style_loaded(r, c1 + k as u32, id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let next = (i + 4 + len).min(stream.len());
+        if next <= i {
+            break;
+        }
+        i = next;
     }
-    let c = crate::cfb::Compound::open(bytes).ok()?;
-    let stream = c
-        .stream_by_path("Workbook")
-        .or_else(|| c.stream_by_path("Book"))?;
+}
+
+pub fn read(path: &Path) -> Option<XlsStyles> {
+    let stream = crate::cfb::read_workbook_stream_file(path)?;
     Some(parse(&stream))
 }
 

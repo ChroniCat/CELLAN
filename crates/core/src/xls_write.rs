@@ -29,8 +29,12 @@ const BOUNDSHEET: u16 = 0x0085;
 const DIMENSIONS: u16 = 0x0200;
 const COLINFO: u16 = 0x007D;
 const ROW: u16 = 0x0208;
+const SST: u16 = 0x00FC;
+const LABELSST: u16 = 0x00FD;
+const CONTINUE: u16 = 0x003C;
 const LABEL: u16 = 0x0204;
 const NUMBER: u16 = 0x0203;
+const RK: u16 = 0x027E;
 const BOOLERR: u16 = 0x0205;
 const MERGEDCELLS: u16 = 0x00E5;
 const FORMULA: u16 = 0x0006;
@@ -173,23 +177,181 @@ fn rec(out: &mut Vec<u8>, typ: u16, body: &[u8]) {
     out.extend_from_slice(body);
 }
 
-fn w16(v: u16) -> Vec<u8> {
-    v.to_le_bytes().to_vec()
-}
-fn w32(v: u32) -> Vec<u8> {
-    v.to_le_bytes().to_vec()
+#[inline]
+fn push_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
 }
 
-/// XLUnicodeString（BIFF8）：cch(2) + flags(1) + UTF-16
-fn unicode_str(s: &str) -> Vec<u8> {
-    let units: Vec<u16> = s.encode_utf16().collect();
-    let mut out = Vec::with_capacity(3 + units.len() * 2);
-    out.extend_from_slice(&(units.len() as u16).to_le_bytes());
-    out.push(1);
-    for u in units {
-        out.extend_from_slice(&u.to_le_bytes());
+#[inline]
+fn push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn begin_rec(out: &mut Vec<u8>, typ: u16) -> usize {
+    out.extend_from_slice(&typ.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.len()
+}
+
+#[inline]
+fn end_rec(out: &mut Vec<u8>, body_start: usize) {
+    let body_len = (out.len() - body_start) as u16;
+    out[body_start - 2..body_start].copy_from_slice(&body_len.to_le_bytes());
+}
+
+fn w16(v: u16) -> [u8; 2] {
+    v.to_le_bytes()
+}
+fn w32(v: u32) -> [u8; 4] {
+    v.to_le_bytes()
+}
+
+/// XLUnicodeString（BIFF8）：cch(2) + flags(1) + 字符数据（纯 ASCII 走 8-bit 压缩 flags=0，其余走 UTF-16LE flags=1）
+fn push_unicode_str(out: &mut Vec<u8>, s: &str) {
+    if s.is_ascii() {
+        let len = s.len().min(u16::MAX as usize);
+        push_u16(out, len as u16);
+        out.push(0);
+        out.extend_from_slice(&s.as_bytes()[..len]);
+    } else {
+        let count_pos = out.len();
+        push_u16(out, 0);
+        out.push(1);
+        let mut cch = 0u16;
+        for u in s.encode_utf16() {
+            if cch == u16::MAX {
+                break;
+            }
+            push_u16(out, u);
+            cch += 1;
+        }
+        out[count_pos..count_pos + 2].copy_from_slice(&cch.to_le_bytes());
     }
+}
+
+fn unicode_str(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + s.len() * 2);
+    push_unicode_str(&mut out, s);
     out
+}
+
+/// 无损尝试把 IEEE-754 f64 编码为 4 字节 BIFF8 RK 值（仅当解码结果按位 100% 相等时命中）。
+#[inline]
+fn encode_rk(n: f64) -> Option<u32> {
+    if !n.is_finite() || (n == 0.0 && n.is_sign_negative()) {
+        return None;
+    }
+    let want = n.to_bits();
+    // 1) 30 位有符号整数（int=1, cents=0）
+    if (-536_870_912.0..=536_870_911.0).contains(&n) && n.fract() == 0.0 {
+        let iv = n as i32;
+        let rk = ((iv as u32) << 2) | 0x02;
+        if (((rk as i32) >> 2) as f64).to_bits() == want {
+            return Some(rk);
+        }
+    }
+    // 2) 高 30 位精确匹配的 IEEE-754 浮点数（低 34 位全 0：如 0.5, 42.5, 0.25 等）
+    if (want & 0x0000_0003_FFFF_FFFF) == 0 {
+        let rk = (want >> 32) as u32;
+        if f64::from_bits(((rk as u64) & 0xFFFF_FFFC) << 32).to_bits() == want {
+            return Some(rk);
+        }
+    }
+    // 3) 乘 100 后精确等于 30 位整数且除回 100 无损的定点数（int=1, cents=1）
+    let scaled = (n * 100.0).round();
+    if (-536_870_912.0..=536_870_911.0).contains(&scaled) {
+        let iv = scaled as i32;
+        let rk = ((iv as u32) << 2) | 0x03;
+        if ((((rk as i32) >> 2) as f64) / 100.0).to_bits() == want {
+            return Some(rk);
+        }
+    }
+    None
+}
+
+/// BIFF8 共享字符串表（仅收录出现 >= 2 次且单条序列化不超过 8216 字节的字符串，按完整字符串边界切 CONTINUE）。
+#[derive(Default)]
+struct XlsSst<'a> {
+    map: HashMap<&'a str, u32>,
+    entries: Vec<&'a str>,
+    total_refs: u32,
+}
+
+impl<'a> XlsSst<'a> {
+    fn encoded_len(s: &str) -> usize {
+        if s.is_ascii() {
+            3 + s.len().min(u16::MAX as usize)
+        } else {
+            3 + s.encode_utf16().take(u16::MAX as usize).count() * 2
+        }
+    }
+
+    fn from_workbook(wb: &'a Workbook) -> Self {
+        let mut counts: HashMap<&'a str, u32> = HashMap::new();
+        for sh in &wb.sheets {
+            for (_, cell) in sh.iter() {
+                if cell.formula.is_some() {
+                    continue;
+                }
+                if let Value::Text(t) = &cell.value {
+                    let s: &'a str = t;
+                    // 单条 XLUnicodeString <= 8216 字节保证一定能整条放进首条 SST(8224-8) 或单条 CONTINUE(8224)
+                    if s.len() <= 8213 {
+                        *counts.entry(s).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut sst = Self::default();
+        for sh in &wb.sheets {
+            for (_, cell) in sh.iter() {
+                if cell.formula.is_some() {
+                    continue;
+                }
+                if let Value::Text(t) = &cell.value {
+                    let s: &'a str = t;
+                    if let Some(&cnt) = counts.get(s) {
+                        if cnt >= 2 && Self::encoded_len(s) <= 8216 {
+                            if !sst.map.contains_key(s) {
+                                let idx = sst.entries.len() as u32;
+                                sst.map.insert(s, idx);
+                                sst.entries.push(s);
+                            }
+                            sst.total_refs = sst.total_refs.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        sst
+    }
+
+    #[inline]
+    fn get(&self, s: &str) -> Option<u32> {
+        self.map.get(s).copied()
+    }
+
+    fn write_records(&self, out: &mut Vec<u8>) {
+        if self.entries.is_empty() {
+            return;
+        }
+        const MAX_REC_BODY: usize = 8224;
+        let mut rec_start = begin_rec(out, SST);
+        push_u32(out, self.total_refs);
+        push_u32(out, self.entries.len() as u32);
+        let mut scratch = Vec::with_capacity(128);
+        for &s in &self.entries {
+            scratch.clear();
+            push_unicode_str(&mut scratch, s);
+            if (out.len() - rec_start) + scratch.len() > MAX_REC_BODY {
+                end_rec(out, rec_start);
+                rec_start = begin_rec(out, CONTINUE);
+            }
+            out.extend_from_slice(&scratch);
+        }
+        end_rec(out, rec_start);
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -476,72 +638,75 @@ fn sheet_stream(
     style_table: &crate::style::StyleTable,
     tables: &mut Tables,
     styles_cache: &mut HashMap<u16, u16>,
+    sst: &XlsSst<'_>,
     calc_manual: bool,
 ) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut bof = Vec::new();
-    bof.extend_from_slice(&w16(0x0600));
-    bof.extend_from_slice(&w16(0x0010)); // 工作表
-    bof.extend_from_slice(&w16(0x0DBB));
-    bof.extend_from_slice(&w16(0x07CC));
-    bof.extend_from_slice(&w32(0));
-    bof.extend_from_slice(&w32(0));
-    rec(&mut out, BOF, &bof);
+    let mut out = Vec::with_capacity(256 + sheet.len().saturating_mul(14));
+    {
+        let s = begin_rec(&mut out, BOF);
+        push_u16(&mut out, 0x0600);
+        push_u16(&mut out, 0x0010); // 工作表
+        push_u16(&mut out, 0x0DBB);
+        push_u16(&mut out, 0x07CC);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        end_rec(&mut out, s);
+    }
     // Excel 16 的实际行为：CALCMODE 放在工作表 BOF 之后才生效；放在全局流里
     // Excel/WPS 都按自动计算打开（缓存值虽在，模式提示错误）。0=手动，1=自动。
     rec(&mut out, CALCMODE, &w16(if calc_manual { 0 } else { 1 }));
 
-    // 范围
-    let (mut rmax, mut cmax) = (0u32, 0u32);
-    for (cref, _) in sheet.iter() {
+    // 单遍收集非空单元格并同步统计 rmax / cmax
+    let mut rmax = 0u32;
+    let mut cmax = 0u32;
+    let mut cells: Vec<(u32, u32, &crate::model::Cell)> = Vec::with_capacity(sheet.len());
+    for (cref, cell) in sheet.iter() {
         rmax = rmax.max(cref.row);
         cmax = cmax.max(cref.col);
+        if !cell.is_blank() {
+            cells.push((cref.row, cref.col, cell));
+        }
     }
-    let mut dim = Vec::new();
-    dim.extend_from_slice(&w32(0));
-    dim.extend_from_slice(&w32(rmax + 1));
-    dim.extend_from_slice(&w16(0));
-    dim.extend_from_slice(&w16((cmax + 1) as u16));
-    dim.extend_from_slice(&w16(0));
-    rec(&mut out, DIMENSIONS, &dim);
+    {
+        let s = begin_rec(&mut out, DIMENSIONS);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, rmax + 1);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, (cmax + 1) as u16);
+        push_u16(&mut out, 0);
+        end_rec(&mut out, s);
+    }
 
     // 列宽
     for (c, w) in sheet.cols.custom_pairs() {
-        let mut b = Vec::new();
-        b.extend_from_slice(&w16(c as u16));
-        b.extend_from_slice(&w16(c as u16));
+        let s = begin_rec(&mut out, COLINFO);
+        push_u16(&mut out, c as u16);
+        push_u16(&mut out, c as u16);
         // 像素 → 字符数（内部 px 含 5px 内边距：BIFF 只存字符数）
         let chars = ((w - 5.0) / 8.0).max(0.0);
-        b.extend_from_slice(&w16((chars * 256.0).round().min(65535.0) as u16));
-        b.extend_from_slice(&w16(0x0F));
-        b.extend_from_slice(&w16(0));
-        b.extend_from_slice(&w16(0));
-        rec(&mut out, COLINFO, &b);
+        push_u16(&mut out, (chars * 256.0).round().min(65535.0) as u16);
+        push_u16(&mut out, 0x0F);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        end_rec(&mut out, s);
     }
 
     // 行高
     for (r, h) in sheet.rows.custom_pairs() {
-        let mut b = Vec::new();
-        b.extend_from_slice(&w16(r as u16));
-        b.extend_from_slice(&w16(0));
-        b.extend_from_slice(&w16((cmax + 1) as u16));
-        b.extend_from_slice(&w16((h * 15.0).round().min(65535.0) as u16)); // px → twips (px*15 = pt*20)
-        b.extend_from_slice(&w16(0));
-        b.extend_from_slice(&w16(0));
-        b.extend_from_slice(&w16(0x0140)); // 自定义行高（照 Excel 自己的样）
-        b.extend_from_slice(&w16(0x0F));
-        rec(&mut out, ROW, &b);
+        let s = begin_rec(&mut out, ROW);
+        push_u16(&mut out, r as u16);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, (cmax + 1) as u16);
+        push_u16(&mut out, (h * 15.0).round().min(65535.0) as u16); // px → twips (px*15 = pt*20)
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0x0140); // 自定义行高（照 Excel 自己的样）
+        push_u16(&mut out, 0x0F);
+        end_rec(&mut out, s);
     }
 
     // 单元格
-    let mut cells: Vec<(u32, u32, &crate::model::Cell)> = Vec::new();
-    for (cref, cell) in sheet.iter() {
-        if cell.is_blank() {
-            continue;
-        }
-        cells.push((cref.row, cref.col, cell));
-    }
-    cells.sort_by_key(|(r, c, _)| (*r, *c));
+    cells.sort_unstable_by_key(|(r, c, _)| (*r, *c));
     for (r, c, cell) in cells {
         let sid = sheet.style_of(r, c);
         let xf = match styles_cache.get(&sid) {
@@ -552,10 +717,6 @@ fn sheet_stream(
                 v
             }
         };
-        let mut b = Vec::new();
-        b.extend_from_slice(&w16(r as u16));
-        b.extend_from_slice(&w16(c as u16));
-        b.extend_from_slice(&w16(xf));
         if let Some(text) = cell.formula.as_deref() {
             let node = crate::formula::parse(text.trim_start_matches('='))
                 .map_err(|e| anyhow::anyhow!(
@@ -579,14 +740,18 @@ fn sheet_stream(
                 )
             })?;
             let (cached, follow) = cached_value(&cell.value);
-            b.extend_from_slice(&cached);
-            b.extend_from_slice(&w16(0)); // grbit
-            b.extend_from_slice(&w32(0)); // chn
-            b.extend_from_slice(&w16(tokens.len() as u16));
-            b.extend_from_slice(&tokens);
+            let s = begin_rec(&mut out, FORMULA);
+            push_u16(&mut out, r as u16);
+            push_u16(&mut out, c as u16);
+            push_u16(&mut out, xf);
+            out.extend_from_slice(&cached);
+            push_u16(&mut out, 0); // grbit
+            push_u32(&mut out, 0); // chn
+            push_u16(&mut out, tokens.len() as u16);
+            out.extend_from_slice(&tokens);
             // 数组常量的值跟在记号流后面（rgcb）
-            b.extend_from_slice(&comp.extra);
-            rec(&mut out, FORMULA, &b);
+            out.extend_from_slice(&comp.extra);
+            end_rec(&mut out, s);
             if let Some(sr) = follow {
                 rec(&mut out, STRING, &sr);
             }
@@ -594,25 +759,58 @@ fn sheet_stream(
         }
         match &cell.value {
             Value::Number(n) => {
-                b.extend_from_slice(&n.to_le_bytes());
-                rec(&mut out, NUMBER, &b);
+                if let Some(rk) = encode_rk(*n) {
+                    let s = begin_rec(&mut out, RK);
+                    push_u16(&mut out, r as u16);
+                    push_u16(&mut out, c as u16);
+                    push_u16(&mut out, xf);
+                    push_u32(&mut out, rk);
+                    end_rec(&mut out, s);
+                } else {
+                    let s = begin_rec(&mut out, NUMBER);
+                    push_u16(&mut out, r as u16);
+                    push_u16(&mut out, c as u16);
+                    push_u16(&mut out, xf);
+                    out.extend_from_slice(&n.to_le_bytes());
+                    end_rec(&mut out, s);
+                }
             }
             Value::Text(t) => {
-                let s = unicode_str(t);
-                b.extend_from_slice(&s);
-                rec(&mut out, LABEL, &b);
+                if let Some(sst_idx) = sst.get(t) {
+                    let s = begin_rec(&mut out, LABELSST);
+                    push_u16(&mut out, r as u16);
+                    push_u16(&mut out, c as u16);
+                    push_u16(&mut out, xf);
+                    push_u32(&mut out, sst_idx);
+                    end_rec(&mut out, s);
+                } else {
+                    let s = begin_rec(&mut out, LABEL);
+                    push_u16(&mut out, r as u16);
+                    push_u16(&mut out, c as u16);
+                    push_u16(&mut out, xf);
+                    push_unicode_str(&mut out, t);
+                    end_rec(&mut out, s);
+                }
             }
             Value::Bool(v) => {
-                b.push(if *v { 1 } else { 0 });
-                b.push(0);
-                rec(&mut out, BOOLERR, &b);
+                let s = begin_rec(&mut out, BOOLERR);
+                push_u16(&mut out, r as u16);
+                push_u16(&mut out, c as u16);
+                push_u16(&mut out, xf);
+                out.push(if *v { 1 } else { 0 });
+                out.push(0);
+                end_rec(&mut out, s);
             }
             Value::Error(e) => {
                 // BOOLERR 的字节序是 (bBoolErr, fError)：错误时第 1 字节放错误码、
                 // 第 2 字节置 1。写反了读端就会把 1 当错误码，整格丢掉。
-                b.push(biff_error_code(*e));
-                b.push(1);
-                rec(&mut out, BOOLERR, &b);
+                let s = begin_rec(&mut out, BOOLERR);
+                push_u16(&mut out, r as u16);
+                push_u16(&mut out, c as u16);
+                push_u16(&mut out, xf);
+                out.push(biff_error_code(*e));
+                out.push(1);
+                end_rec(&mut out, s);
             }
             Value::Empty => {}
         }
@@ -620,15 +818,15 @@ fn sheet_stream(
 
     // 合并区
     for merges in sheet.merges.chunks(1027) {
-        let mut b = Vec::new();
-        b.extend_from_slice(&w16(merges.len() as u16));
+        let s = begin_rec(&mut out, MERGEDCELLS);
+        push_u16(&mut out, merges.len() as u16);
         for (r1, c1, r2, c2) in merges {
-            b.extend_from_slice(&w16(*r1 as u16));
-            b.extend_from_slice(&w16(*r2 as u16));
-            b.extend_from_slice(&w16(*c1 as u16));
-            b.extend_from_slice(&w16(*c2 as u16));
+            push_u16(&mut out, *r1 as u16);
+            push_u16(&mut out, *r2 as u16);
+            push_u16(&mut out, *c1 as u16);
+            push_u16(&mut out, *c2 as u16);
         }
-        rec(&mut out, MERGEDCELLS, &b);
+        end_rec(&mut out, s);
     }
 
     // Excel 自己把 PROTECT/PASSWORD 放在工作表流末尾（EOF 之前）；放前面会被判损坏。
@@ -720,6 +918,7 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
         names.set_rgce(idx, rgce);
     }
 
+    let sst = XlsSst::from_workbook(wb);
     for (i, s) in wb.sheets.iter().enumerate() {
         let stream = sheet_stream(
             s,
@@ -731,6 +930,7 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
             &wb.styles,
             &mut tables,
             &mut cache,
+            &sst,
             wb.calc_manual,
         )
         .with_context(|| {
@@ -835,6 +1035,7 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
         let body = crate::xls_formula::name_record(f, None, &crate::xls_formula::future_rgce(), true);
         rec(&mut g, NAME, &body);
     }
+    sst.write_records(&mut g);
     rec(&mut g, EOF, &[]);
 
     // 回填每张表的 BOF 偏移
@@ -1081,6 +1282,80 @@ mod tests {
         assert_eq!(back.sheets[0].get(0, 0).unwrap().formula.as_deref(), Some("=@A1"));
         assert_eq!(back.sheets[0].value(0, 0), Value::Number(7.0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rk_and_sst_continue_roundtrip_calamine_and_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sst_rk.xls");
+        let mut wb = Workbook::new_blank();
+        let sh = &mut wb.sheets[0];
+        sh.name = "海量对账".into();
+        // 构造超过 8224 字节 SST 上限的重复中文与 ASCII 共享字符串（触发 SST + CONTINUE + LABELSST）
+        for i in 0..320u32 {
+            let s = format!("华东大区_往来科目_凭证摘要明细_第{i:04}组_重复共享文本测试");
+            sh.set(i * 2, 0, crate::model::Cell { value: Value::Text(s.clone().into()), formula: None });
+            sh.set(i * 2 + 1, 0, crate::model::Cell { value: Value::Text(s.into()), formula: None });
+            let ascii_dup = format!("DEPT_CODE_{i:04}_REPEATED_ASCII_ENTRY");
+            sh.set(i * 2, 1, crate::model::Cell { value: Value::Text(ascii_dup.clone().into()), formula: None });
+            sh.set(i * 2 + 1, 1, crate::model::Cell { value: Value::Text(ascii_dup.into()), formula: None });
+        }
+        // 唯一字符串仍走内联 LABEL
+        sh.set(0, 2, crate::model::Cell { value: Value::Text("唯一内联备注_Unique".into()), formula: None });
+        // 各类数值：整数 RK、二进制定点 RK、百分位 RK、不可损压缩的普通 NUMBER、负零
+        let nums = [0.0, -0.0, 100.0, -42.0, 42.5, 12.34, -9876.54, std::f64::consts::PI, 1e-12];
+        for (idx, &n) in nums.iter().enumerate() {
+            sh.set(idx as u32, 3, crate::model::Cell { value: Value::Number(n), formula: None });
+        }
+
+        write(&p, &wb).unwrap();
+        assert!(!crate::cfb::has_encrypted_package_file(&p));
+
+        let stream = crate::cfb::read_workbook_stream_file(&p).expect("应直接按扇区读出 Workbook 流");
+        let mut has_sst = false;
+        let mut has_continue = false;
+        let mut has_labelsst = false;
+        let mut has_rk = false;
+        let mut pos = 0usize;
+        while pos + 4 <= stream.len() {
+            let t = u16::from_le_bytes([stream[pos], stream[pos + 1]]);
+            let l = u16::from_le_bytes([stream[pos + 2], stream[pos + 3]]) as usize;
+            has_sst |= t == SST;
+            has_continue |= t == CONTINUE;
+            has_labelsst |= t == LABELSST;
+            has_rk |= t == RK;
+            let next = (pos + 4 + l).min(stream.len());
+            if next <= pos {
+                break;
+            }
+            pos = next;
+        }
+        assert!(has_sst && has_continue && has_labelsst, "应写出 SST + CONTINUE + LABELSST");
+        assert!(has_rk, "整数/定点数应写出紧凑 RK 记录");
+
+        // 1) 主路径（calamine + 单遍流式样式/版面）读回校验
+        let back_calamine = crate::xlsx::load(&p).unwrap();
+        // 2) 内置兜底读取器读回校验
+        let back_builtin = crate::xls_read::load(&p).unwrap();
+
+        for back in [&back_calamine, &back_builtin] {
+            let bsh = &back.sheets[0];
+            for i in 0..320u32 {
+                let expected = format!("华东大区_往来科目_凭证摘要明细_第{i:04}组_重复共享文本测试");
+                assert_eq!(bsh.value(i * 2, 0), Value::Text(expected.clone().into()));
+                assert_eq!(bsh.value(i * 2 + 1, 0), Value::Text(expected.into()));
+                let exp_ascii = format!("DEPT_CODE_{i:04}_REPEATED_ASCII_ENTRY");
+                assert_eq!(bsh.value(i * 2, 1), Value::Text(exp_ascii.clone().into()));
+                assert_eq!(bsh.value(i * 2 + 1, 1), Value::Text(exp_ascii.into()));
+            }
+            assert_eq!(bsh.value(0, 2), Value::Text("唯一内联备注_Unique".into()));
+            for (idx, &n) in nums.iter().enumerate() {
+                match bsh.value(idx as u32, 3) {
+                    Value::Number(got) => assert!((got - n).abs() == 0.0, "数值 #{idx} 失真: {got} vs {n}"),
+                    other => panic!("数值 #{idx} 类型错误: {other:?}"),
+                }
+            }
+        }
     }
 
 }

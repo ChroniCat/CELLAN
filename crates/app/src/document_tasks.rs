@@ -111,6 +111,59 @@ impl CalculatedSnapshot {
 }
 
 impl DocumentTasks {
+    pub fn start_pdf_export(
+        &mut self,
+        wb: Workbook,
+        sheet_idx: usize,
+        out_path: PathBuf,
+        regular: sheetcore::pdf::Font,
+        bold: Option<sheetcore::pdf::Font>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        self.pdf_export = Some(rx);
+        std::thread::spawn(move || {
+            let wb_path = wb.path.clone();
+            let res = sheetcore::print::export_pdf_pages_with_fonts(
+                &wb,
+                sheet_idx,
+                &out_path,
+                regular,
+                bold,
+                wb_path.as_deref(),
+                None,
+            )
+            .map(|n| (out_path, n))
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+        });
+    }
+
+    pub fn poll_pdf_export(&mut self, status: &mut String, ctx: &egui::Context) {
+        let Some(rx) = self.pdf_export.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(Ok((path, n))) => {
+                self.pdf_export = None;
+                *status = format!("已导出 {}", path.display());
+                eprintln!("[pdf] 已导出 {} 页 {}", n, path.display());
+                ctx.request_repaint();
+            }
+            Ok(Err(e)) => {
+                self.pdf_export = None;
+                *status = format!("导出失败：{e}");
+                eprintln!("[pdf] 导出失败 {e}");
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.pdf_export = None;
+                *status = "导出失败：后台 PDF 导出线程异常中止".into();
+                ctx.request_repaint();
+            }
+        }
+    }
+
     pub fn poll_base_hash(&mut self, wb: &Workbook, wb_base_hash: &mut String) -> Option<String> {
         let rx = self.base_hash_rx.as_ref()?;
         match rx.try_recv() {
