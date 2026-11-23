@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "1.72.0"
+version = "1.73.0"
 edition = "2024"
 description = "CELLAN Desktop — Concurrent Engine for Local-first, Lock-free Async Networks"
 
@@ -16,7 +16,7 @@ quick-xml = "0.42"
 rfd = "0.17.2"
 serde_json = "1.0.154"
 sha2 = "0.11.1"
-sheetcore = { version = "1.72.0", path = "../core" }
+sheetcore = { version = "1.73.0", path = "../core" }
 ttf-parser = "0.25"
 
 [target.'cfg(windows)'.dependencies]
