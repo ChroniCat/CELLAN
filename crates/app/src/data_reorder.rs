@@ -670,65 +670,9 @@ impl SheetApp {
         }
     }
 
-    fn rect_has_locked_cell(&self, sheet: usize, (r1, c1, r2, c2): Rect) -> bool {
-        let rows_total = u64::from(r2 - r1 + 1);
-        let cols_total = u64::from(c2 - c1 + 1);
-        let area = rows_total * cols_total;
-        if area <= 4_096 {
-            return (r1..=r2).any(|r| (c1..=c2).any(|c| self.cell_locked_on(sheet, r, c)));
-        }
-        let sh = self.wb.sheet(sheet);
-        let styles = &self.wb.styles;
-        let mut explicit_in_rect = 0u64;
-        for (pos, &id) in sh.styles.iter() {
-            if (r1..=r2).contains(&pos.row) && (c1..=c2).contains(&pos.col) {
-                if styles.get(id).locked {
-                    return true;
-                }
-                explicit_in_rect += 1;
-            }
-        }
-        if explicit_in_rect >= area {
-            return false;
-        }
-        let mut unlocked_rows = 0u64;
-        let mut locked_rows = 0u64;
-        for (&r, &id) in &sh.row_styles {
-            if (r1..=r2).contains(&r) {
-                if styles.get(id).locked {
-                    locked_rows += 1;
-                    if (c1..=c2).any(|c| sh.styles.get(&sheetcore::model::CellRef::new(r, c)).is_none()) {
-                        return true;
-                    }
-                } else {
-                    unlocked_rows += 1;
-                }
-            }
-        }
-        let plain_rows = rows_total.saturating_sub(unlocked_rows + locked_rows);
-        if plain_rows == 0 {
-            return false;
-        }
-        let default_locked = styles.get(0).locked;
-        for c in c1..=c2 {
-            let col_locked = sh
-                .col_styles
-                .get(&c)
-                .map_or(default_locked, |&id| styles.get(id).locked);
-            if col_locked {
-                if explicit_in_rect < plain_rows {
-                    return true;
-                }
-                let has_plain_unoverridden = (r1..=r2).any(|r| {
-                    !sh.row_styles.contains_key(&r)
-                        && sh.styles.get(&sheetcore::model::CellRef::new(r, c)).is_none()
-                });
-                if has_plain_unoverridden {
-                    return true;
-                }
-            }
-        }
-        false
+    #[inline]
+    fn rect_has_locked_cell(&self, sheet: usize, rect: Rect) -> bool {
+        crate::column_clip::rect_has_any_locked(&self.wb, self.wb.sheet(sheet), rect)
     }
 
     fn preflight_reorder(&mut self, sheet: usize, rect: Rect, operation: &Operation) -> bool {

@@ -57,7 +57,7 @@ impl From<&Value> for ValueWire {
         match v {
             Value::Empty => ValueWire::Empty,
             Value::Number(n) => ValueWire::Number(*n),
-            Value::Text(s) => ValueWire::Text(Arc::<str>::from(s.clone())),
+            Value::Text(s) => ValueWire::Text(Arc::clone(s)),
             Value::Bool(b) => ValueWire::Bool(*b),
             Value::Error(e) => ValueWire::Error(Arc::from(e.text())),
         }
@@ -69,11 +69,11 @@ impl From<&ValueWire> for Value {
         match v {
             ValueWire::Empty => Value::Empty,
             ValueWire::Number(n) => Value::Number(*n),
-            ValueWire::Text(s) => Value::Text(s.as_ref().into()),
+            ValueWire::Text(s) => Value::Text(Arc::clone(s)),
             ValueWire::Bool(b) => Value::Bool(*b),
             ValueWire::Error(t) => crate::formula::ErrKind::from_text(t)
                 .map(Value::Error)
-                .unwrap_or_else(|| Value::Text(t.as_ref().into())),
+                .unwrap_or_else(|| Value::Text(Arc::clone(t))),
         }
     }
 }
@@ -995,7 +995,7 @@ impl BaselineBook {
 
     pub fn cell_style(&self, sheet: usize, row: u32, col: u32) -> Option<crate::style::CellStyle> {
         let sh = self.sheets.get(sheet)?;
-        let sid = *sh.styles.get(&crate::model::CellRef::new(row, col))?;
+        let sid = sh.explicit_style_of(row, col)?;
         Some(self.styles.get(sid).clone())
     }
 
@@ -1014,14 +1014,12 @@ impl BaselineBook {
     pub fn for_each_style_in_rect(
         &self,
         sheet: usize,
-        (r1, c1, r2, c2): (u32, u32, u32, u32),
+        rect: (u32, u32, u32, u32),
         mut f: impl FnMut(u32, u32, &crate::style::CellStyle),
     ) {
         let Some(sh) = self.sheets.get(sheet) else { return };
-        for (k, &sid) in sh.styles.iter_from(true, r1) {
-            if k.row <= r2 && (c1..=c2).contains(&k.col) {
-                f(k.row, k.col, self.styles.get(sid));
-            }
+        for (k, sid) in sh.styles.iter_rect(rect) {
+            f(k.row, k.col, self.styles.get(sid));
         }
     }
 
