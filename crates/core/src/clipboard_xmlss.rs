@@ -120,121 +120,207 @@ impl DenseExtent {
     }
 }
 
-fn index_attr(e: &quick_xml::events::BytesStart<'_>, key: &str, default: usize) -> Option<usize> {
-    match attr(e, key) { Some(s) => s.parse().ok(), None => Some(default) }
+#[inline]
+fn local_bytes(q: &[u8]) -> &[u8] {
+    match q.iter().rposition(|&b| b == b':') {
+        Some(pos) => &q[pos + 1..],
+        None => q,
+    }
+}
+
+#[inline]
+fn attr_cow<'a>(
+    e: &'a quick_xml::events::BytesStart<'a>,
+    key: &[u8],
+) -> Option<std::borrow::Cow<'a, str>> {
+    for a in e.attributes().flatten() {
+        if local_bytes(a.key.as_ref().as_bytes()) == key {
+            return Some(match a.value {
+                std::borrow::Cow::Borrowed(raw) => {
+                    if raw.contains('&') {
+                        match quick_xml::escape::unescape(raw) {
+                            Ok(c) => std::borrow::Cow::Owned(c.into_owned()),
+                            Err(_) => std::borrow::Cow::Borrowed(raw),
+                        }
+                    } else {
+                        std::borrow::Cow::Borrowed(raw)
+                    }
+                }
+                std::borrow::Cow::Owned(raw) => {
+                    if raw.contains('&') {
+                        match quick_xml::escape::unescape(&raw) {
+                            Ok(c) => std::borrow::Cow::Owned(c.into_owned()),
+                            Err(_) => std::borrow::Cow::Owned(raw),
+                        }
+                    } else {
+                        std::borrow::Cow::Owned(raw)
+                    }
+                }
+            });
+        }
+    }
+    None
+}
+
+#[inline]
+fn index_attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8], default: usize) -> Option<usize> {
+    match attr_cow(e, key) {
+        Some(s) => s.parse().ok(),
+        None => Some(default),
+    }
 }
 
 fn prepare_row(
-    e: &quick_xml::events::BytesStart<'_>, block: &mut Block, extent: &mut DenseExtent,
+    e: &quick_xml::events::BytesStart<'_>,
+    rows_len: usize,
+    extent: &mut DenseExtent,
 ) -> Option<(usize, usize)> {
-    let row = index_attr(e, "Index", block.rows.len() + 1)?.checked_sub(1)?;
-    let span = index_attr(e, "Span", 0)?.checked_add(1)?;
-    if row < block.rows.len() { return None; }
+    let row = index_attr(e, b"Index", rows_len + 1)?.checked_sub(1)?;
+    let span = index_attr(e, b"Span", 0)?.checked_add(1)?;
+    if row < rows_len {
+        return None;
+    }
     extent.include(row.checked_add(span)?, 1)?;
-    block.rows.resize_with(row, Vec::new);
     Some((row, span))
 }
 
+#[derive(Default)]
+struct RawCell {
+    text: String,
+    kind: Kind,
+    formula: Option<String>,
+    style_idx: u32,
+    colspan: u32,
+    rowspan: u32,
+}
+
 fn prepare_cell(
-    e: &quick_xml::events::BytesStart<'_>, row: &mut Vec<Cell>, r: usize, next_col: &mut usize,
-    extent: &mut DenseExtent, styles: &std::collections::HashMap<String, Style>,
-) -> Option<Cell> {
-    let col = index_attr(e, "Index", *next_col + 1)?.checked_sub(1)?;
-    let across = index_attr(e, "MergeAcross", 0)?.checked_add(1)?;
-    let down = index_attr(e, "MergeDown", 0)?.checked_add(1)?;
-    if col < *next_col { return None; }
+    e: &quick_xml::events::BytesStart<'_>,
+    row: &mut Vec<RawCell>,
+    r: usize,
+    next_col: &mut usize,
+    extent: &mut DenseExtent,
+    style_lookup: &std::collections::HashMap<String, u32>,
+) -> Option<RawCell> {
+    let col = index_attr(e, b"Index", *next_col + 1)?.checked_sub(1)?;
+    let across = index_attr(e, b"MergeAcross", 0)?.checked_add(1)?;
+    let down = index_attr(e, b"MergeDown", 0)?.checked_add(1)?;
+    if col < *next_col {
+        return None;
+    }
     extent.include(r.checked_add(down)?, col.checked_add(across)?)?;
-    row.resize_with(row.len() + (col - *next_col), Cell::default);
+    row.resize_with(row.len() + (col - *next_col), RawCell::default);
     *next_col = col + across;
-    Some(Cell {
-        style: attr(e, "StyleID").and_then(|id| styles.get(&id).cloned()).unwrap_or_default(),
-        formula: attr(e, "Formula").map(|f| r1c1_to_a1(&f, r as u32, col as u32)),
-        colspan: across as u32, rowspan: down as u32, ..Default::default()
+    let style_idx = attr_cow(e, b"StyleID")
+        .and_then(|id| style_lookup.get(id.as_ref()).copied())
+        .unwrap_or(0);
+    Some(RawCell {
+        style_idx,
+        formula: attr_cow(e, b"Formula").map(|f| r1c1_to_a1(&f, r as u32, col as u32)),
+        colspan: across as u32,
+        rowspan: down as u32,
+        ..Default::default()
     })
+}
+
+fn apply_style_tag(tag_local: &[u8], e: &quick_xml::events::BytesStart<'_>, cur_style: &mut Style) {
+    match tag_local {
+        b"Font" => {
+            cur_style.bold = matches!(attr_cow(e, b"Bold").as_deref(), Some("1" | "true"));
+            cur_style.italic = matches!(attr_cow(e, b"Italic").as_deref(), Some("1" | "true"));
+            cur_style.font = attr_cow(e, b"FontName").map(|c| c.into_owned()).unwrap_or_default();
+            if let Some(sz) = attr_cow(e, b"Size").and_then(|s| s.parse::<f32>().ok()) {
+                if sz > 0.0 {
+                    cur_style.size = sz;
+                }
+            }
+            cur_style.color = attr_cow(e, b"Color").and_then(|c| hex_rgb(&c));
+        }
+        b"Interior" => {
+            let pattern = attr_cow(e, b"Pattern");
+            if pattern.as_deref().is_some_and(|p| !p.is_empty() && p != "None") {
+                cur_style.fill = attr_cow(e, b"Color").and_then(|c| hex_rgb(&c));
+            }
+        }
+        b"Border" => {
+            if let Some(c) = attr_cow(e, b"Color").and_then(|c| hex_rgb(&c)) {
+                cur_style.border.get_or_insert(c);
+            }
+        }
+        b"NumberFormat" => {
+            if let Some(f) = attr_cow(e, b"Format") {
+                cur_style.num_format = normalize_num_format(&f);
+            }
+        }
+        b"Alignment" => {
+            cur_style.halign = match attr_cow(e, b"Horizontal").as_deref() {
+                Some("Left") => 1,
+                Some("Center") => 2,
+                Some("Right") => 3,
+                _ => 0,
+            };
+        }
+        _ => {}
+    }
 }
 
 /// 解析整份 XML Spreadsheet；不是这个格式（没有 Workbook/Worksheet）就返回空
 pub fn parse(xml: &str) -> Block {
-    let mut styles: std::collections::HashMap<String, Style> = std::collections::HashMap::new();
-    let mut block = Block::default();
+    let mut style_table: Vec<Style> = vec![Style::default()];
+    let mut style_lookup: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut raw_rows: Vec<Vec<RawCell>> = Vec::new();
     let mut r = Reader::from_str(xml);
     r.config_mut().trim_text(false);
 
-    let mut in_workbook = false;
     let mut style_id = String::new();
     let mut cur_style = Style::default();
     let mut in_style = false;
 
-    let mut row: Vec<Cell> = Vec::new();
-    let mut cur: Option<Cell> = None;
+    let mut row: Vec<RawCell> = Vec::new();
+    let mut cur: Option<RawCell> = None;
     let mut data_type = Kind::Number;
     let mut in_data = false;
     let mut text = String::new();
     let mut extent = DenseExtent::default();
-    let (mut row_index, mut row_span, mut next_col) = (0, 1, 0);
+    let (mut row_index, mut row_span, mut next_col) = (0usize, 1usize, 0usize);
 
     loop {
         match r.read_event() {
             Ok(Event::Start(e)) => {
-                let n = local(e.name().as_ref());
-                match n.as_str() {
-                    "Workbook" => in_workbook = true,
-                    "Style" => {
+                let qname = e.name();
+                let n = local_bytes(qname.as_ref().as_bytes());
+                match n {
+                    b"Style" => {
                         in_style = true;
-                        style_id = attr(&e, "ID").unwrap_or_default();
+                        style_id = attr_cow(&e, b"ID").map(|c| c.into_owned()).unwrap_or_default();
                         cur_style = Style::default();
                     }
-                    "Font" if in_style => {
-                        cur_style.bold = matches!(attr(&e, "Bold").as_deref(), Some("1") | Some("true"));
-                        cur_style.italic =
-                            matches!(attr(&e, "Italic").as_deref(), Some("1") | Some("true"));
-                        cur_style.font = attr(&e, "FontName").unwrap_or_default();
-                        if let Some(sz) = attr(&e, "Size").and_then(|s| s.parse::<f32>().ok()) {
-                            if sz > 0.0 {
-                                cur_style.size = sz;
-                            }
-                        }
-                        cur_style.color = attr(&e, "Color").and_then(|c| hex_rgb(&c));
+                    b"Font" | b"Interior" | b"Border" | b"NumberFormat" | b"Alignment" if in_style => {
+                        apply_style_tag(n, &e, &mut cur_style);
                     }
-                    "Interior" if in_style => {
-                        let pattern = attr(&e, "Pattern").unwrap_or_default();
-                        if !pattern.is_empty() && pattern != "None" {
-                            cur_style.fill = attr(&e, "Color").and_then(|c| hex_rgb(&c));
+                    b"Table" => {
+                        let dims = index_attr(&e, b"ExpandedRowCount", 0)
+                            .zip(index_attr(&e, b"ExpandedColumnCount", 0));
+                        if dims.and_then(|(rows, cols)| extent.include(rows, cols)).is_none() {
+                            return Block::default();
                         }
                     }
-                    "Border" if in_style => {
-                        if let Some(c) = attr(&e, "Color").and_then(|c| hex_rgb(&c)) {
-                            cur_style.border.get_or_insert(c);
-                        }
-                    }
-                    "NumberFormat" if in_style => {
-                        if let Some(f) = attr(&e, "Format") {
-                            cur_style.num_format = normalize_num_format(&f);
-                        }
-                    }
-                    "Alignment" if in_style => {
-                        cur_style.halign = match attr(&e, "Horizontal").as_deref() {
-                            Some("Left") => 1,
-                            Some("Center") => 2,
-                            Some("Right") => 3,
-                            _ => 0,
+                    b"Row" => {
+                        let Some((ri, span)) = prepare_row(&e, raw_rows.len(), &mut extent) else {
+                            return Block::default();
                         };
-                    }
-                    "Table" => {
-                        let dims = index_attr(&e, "ExpandedRowCount", 0).zip(index_attr(&e, "ExpandedColumnCount", 0));
-                        if dims.and_then(|(rows, cols)| extent.include(rows, cols)).is_none() { return Block::default(); }
-                    }
-                    "Row" => {
-                        let Some((r, span)) = prepare_row(&e, &mut block, &mut extent) else { return Block::default() };
-                        (row_index, row_span, next_col) = (r, span, 0);
+                        raw_rows.resize_with(ri, Vec::new);
+                        (row_index, row_span, next_col) = (ri, span, 0);
                         row.clear();
                     }
-                    "Cell" => {
-                        cur = prepare_cell(&e, &mut row, row_index, &mut next_col, &mut extent, &styles);
-                        if cur.is_none() { return Block::default(); }
+                    b"Cell" => {
+                        cur = prepare_cell(&e, &mut row, row_index, &mut next_col, &mut extent, &style_lookup);
+                        if cur.is_none() {
+                            return Block::default();
+                        }
                     }
-                    "Data" => {
-                        data_type = match attr(&e, "Type").as_deref() {
+                    b"Data" => {
+                        data_type = match attr_cow(&e, b"Type").as_deref() {
                             Some("String") => Kind::Text,
                             Some("Boolean") => Kind::Bool,
                             Some("DateTime") => Kind::DateTime,
@@ -248,59 +334,30 @@ pub fn parse(xml: &str) -> Block {
                 }
             }
             Ok(Event::Empty(e)) => {
-                let n = local(e.name().as_ref());
-                // 自闭合的样式元素
+                let qname = e.name();
+                let n = local_bytes(qname.as_ref().as_bytes());
                 if in_style {
-                    match n.as_str() {
-                        "Font" => {
-                            cur_style.bold =
-                                matches!(attr(&e, "Bold").as_deref(), Some("1") | Some("true"));
-                            cur_style.italic =
-                                matches!(attr(&e, "Italic").as_deref(), Some("1") | Some("true"));
-                            cur_style.font = attr(&e, "FontName").unwrap_or_default();
-                            if let Some(sz) = attr(&e, "Size").and_then(|s| s.parse::<f32>().ok()) {
-                                if sz > 0.0 {
-                                    cur_style.size = sz;
-                                }
-                            }
-                            cur_style.color = attr(&e, "Color").and_then(|c| hex_rgb(&c));
-                        }
-                        "Interior" => {
-                            let pattern = attr(&e, "Pattern").unwrap_or_default();
-                            if !pattern.is_empty() && pattern != "None" {
-                                cur_style.fill = attr(&e, "Color").and_then(|c| hex_rgb(&c));
-                            }
-                        }
-                        "NumberFormat" => {
-                            if let Some(f) = attr(&e, "Format") {
-                                cur_style.num_format = normalize_num_format(&f);
-                            }
-                        }
-                        "Alignment" => {
-                            cur_style.halign = match attr(&e, "Horizontal").as_deref() {
-                                Some("Left") => 1,
-                                Some("Center") => 2,
-                                Some("Right") => 3,
-                                _ => 0,
-                            };
-                        }
-                        _ => {}
-                    }
-                } else if n == "Cell" {
-                    let Some(cell) = prepare_cell(&e, &mut row, row_index, &mut next_col, &mut extent, &styles)
-                    else { return Block::default() };
+                    apply_style_tag(n, &e, &mut cur_style);
+                } else if n == b"Cell" {
+                    let Some(cell) =
+                        prepare_cell(&e, &mut row, row_index, &mut next_col, &mut extent, &style_lookup)
+                    else {
+                        return Block::default();
+                    };
                     row.push(cell);
-                } else if n == "Row" {
-                    let Some((r, span)) = prepare_row(&e, &mut block, &mut extent) else { return Block::default() };
-                    block.rows.resize_with(r + span, Vec::new);
+                } else if n == b"Row" {
+                    let Some((ri, span)) = prepare_row(&e, raw_rows.len(), &mut extent) else {
+                        return Block::default();
+                    };
+                    raw_rows.resize_with(ri + span, Vec::new);
                 }
             }
-            Ok(Event::GeneralRef(r)) => {
+            Ok(Event::GeneralRef(r_ref)) => {
                 if in_data {
-                    if let Ok(Some(ch)) = r.resolve_char_ref() {
+                    if let Ok(Some(ch)) = r_ref.resolve_char_ref() {
                         text.push(ch);
                     } else {
-                        match r.as_ref() {
+                        match r_ref.as_ref() {
                             "amp" => text.push('&'),
                             "lt" => text.push('<'),
                             "gt" => text.push('>'),
@@ -313,35 +370,48 @@ pub fn parse(xml: &str) -> Block {
             }
             Ok(Event::Text(t)) => {
                 if in_data {
-                    let raw = t.as_ref().to_string();
-                    text.push_str(&quick_xml::escape::unescape(&raw).map(|c| c.into_owned()).unwrap_or_else(|_| raw.clone()));
+                    let raw = t.as_ref();
+                    if raw.contains('&') {
+                        match quick_xml::escape::unescape(raw) {
+                            Ok(c) => text.push_str(&c),
+                            Err(_) => text.push_str(raw),
+                        }
+                    } else {
+                        text.push_str(raw);
+                    }
                 }
             }
             Ok(Event::End(e)) => {
-                let n = local(e.name().as_ref());
-                match n.as_str() {
-                    "Style" => {
+                let qname = e.name();
+                let n = local_bytes(qname.as_ref().as_bytes());
+                match n {
+                    b"Style" => {
                         in_style = false;
-                        styles.insert(style_id.clone(), cur_style.clone());
+                        if cur_style == Style::default() {
+                            style_lookup.insert(std::mem::take(&mut style_id), 0);
+                        } else {
+                            let idx = style_table.len() as u32;
+                            style_table.push(std::mem::take(&mut cur_style));
+                            style_lookup.insert(std::mem::take(&mut style_id), idx);
+                        }
                     }
-                    "Data" => {
+                    b"Data" => {
                         in_data = false;
                         if let Some(c) = cur.as_mut() {
-                            c.text = text.clone();
+                            c.text = std::mem::take(&mut text);
                             c.kind = data_type;
                         }
                     }
-                    "Cell" => {
+                    b"Cell" => {
                         if let Some(c) = cur.take() {
                             row.push(c);
                         }
                     }
-                    "Row" => {
-                        block.rows.push(std::mem::take(&mut row));
-                        block.rows.resize_with(row_index + row_span, Vec::new);
+                    b"Row" => {
+                        raw_rows.push(std::mem::take(&mut row));
+                        raw_rows.resize_with(row_index + row_span, Vec::new);
                     }
-                    "Worksheet" => break,
-                    "Workbook" => in_workbook = false,
+                    b"Worksheet" => break,
                     _ => {}
                 }
             }
@@ -350,24 +420,28 @@ pub fn parse(xml: &str) -> Block {
             _ => {}
         }
     }
-    let _ = in_workbook;
-    block
-}
 
-fn local(q: &str) -> String {
-    q.rsplit(':').next().unwrap_or(q).to_string()
-}
-
-fn attr(e: &quick_xml::events::BytesStart<'_>, key: &str) -> Option<String> {
-    e.attributes()
-        .flatten()
-        .find(|a| a.key.as_ref().ends_with(key))
-        .map(|a| {
-            let raw = a.value.to_string();
-            quick_xml::escape::unescape(&raw)
-                .map(|c| c.into_owned())
-                .unwrap_or(raw)
+    let rows = raw_rows
+        .into_iter()
+        .map(|r_vec| {
+            r_vec
+                .into_iter()
+                .map(|rc| Cell {
+                    text: rc.text,
+                    kind: rc.kind,
+                    formula: rc.formula,
+                    style: if rc.style_idx == 0 {
+                        Style::default()
+                    } else {
+                        style_table[rc.style_idx as usize].clone()
+                    },
+                    colspan: rc.colspan,
+                    rowspan: rc.rowspan,
+                })
+                .collect()
         })
+        .collect();
+    Block { rows }
 }
 
 fn hex_rgb(s: &str) -> Option<[u8; 3]> {
@@ -408,118 +482,136 @@ fn normalize_num_format(f: &str) -> String {
 /// 只改单元格引用，字符串/函数名/数字原样保留；`$` 决定行列是否绝对。
 /// 支持 `Sheet1!A1`、`'参数 表'!A1:B2` 这类带表名的引用。
 pub fn a1_to_r1c1(f: &str, row0: u32, col0: u32) -> String {
-    let chars: Vec<char> = f.chars().collect();
+    use std::fmt::Write as _;
+    let bytes = f.as_bytes();
     let mut out = String::with_capacity(f.len() + 8);
     let mut i = 0usize;
     let mut in_double = false;
     let mut in_single = false;
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '"' {
+    let mut prev_ident = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
             in_double = !in_double;
-            out.push(ch);
+            out.push('"');
+            prev_ident = false;
             i += 1;
             continue;
         }
-        if ch == '\'' && !in_double {
+        if b == b'\'' && !in_double {
             in_single = !in_single;
-            out.push(ch);
+            out.push('\'');
+            prev_ident = false;
             i += 1;
             continue;
         }
         if in_double || in_single {
-            out.push(ch);
-            i += 1;
+            if b < 0x80 {
+                out.push(b as char);
+                i += 1;
+            } else {
+                let ch = f[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+            prev_ident = false;
             continue;
         }
-        // 候选：[$]字母[$]数字；前一个字符不能是标识符的一部分
-        let prev_ok = i == 0
-            || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_' || chars[i - 1] == '.');
-        if prev_ok && (ch == '$' || ch.is_ascii_alphabetic()) {
+        if !prev_ident && (b == b'$' || b.is_ascii_alphabetic()) {
             let start = i;
             let mut j = i;
-            let col_abs = chars[j] == '$';
+            let col_abs = bytes[j] == b'$';
             if col_abs {
                 j += 1;
             }
             let letters_start = j;
-            while j < chars.len() && chars[j].is_ascii_alphabetic() && j - letters_start < 3 {
+            while j < bytes.len() && bytes[j].is_ascii_alphabetic() && j - letters_start < 3 {
                 j += 1;
             }
             let letters_end = j;
             if letters_end > letters_start {
-                let row_abs = j < chars.len() && chars[j] == '$';
+                let row_abs = j < bytes.len() && bytes[j] == b'$';
                 let row_start = if row_abs { j + 1 } else { j };
                 let mut k = row_start;
-                while k < chars.len() && chars[k].is_ascii_digit() && k - row_start < 7 {
+                while k < bytes.len() && bytes[k].is_ascii_digit() && k - row_start < 7 {
                     k += 1;
                 }
                 if k > row_start {
-                    let next_ok = k >= chars.len()
-                        || !(chars[k].is_alphanumeric() || chars[k] == '_' || chars[k] == '(');
+                    let next_ok = if k >= bytes.len() {
+                        true
+                    } else if bytes[k] < 0x80 {
+                        !(bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_' || bytes[k] == b'(')
+                    } else {
+                        !f[k..].chars().next().is_some_and(char::is_alphanumeric)
+                    };
                     let mut col: u32 = 0;
                     let mut valid = true;
-                    for c in &chars[letters_start..letters_end] {
-                        let d = c.to_ascii_uppercase() as u32 - 'A' as u32 + 1;
+                    for &cb in &bytes[letters_start..letters_end] {
+                        let d = u32::from(cb.to_ascii_uppercase() - b'A') + 1;
                         col = col * 26 + d;
                         if col > 16_384 {
                             valid = false;
                             break;
                         }
                     }
-                    let row: u32 = chars[row_start..k]
-                        .iter()
-                        .collect::<String>()
-                        .parse()
-                        .unwrap_or(0);
-                    if valid && row >= 1 && row <= 1_048_576 && next_ok {
-                        let r = if row_abs {
-                            format!("R{row}")
+                    let mut row: u32 = 0;
+                    for &rb in &bytes[row_start..k] {
+                        row = row.saturating_mul(10).saturating_add(u32::from(rb - b'0'));
+                    }
+                    if valid && (1..=1_048_576).contains(&row) && next_ok {
+                        if row_abs {
+                            let _ = write!(out, "R{row}");
                         } else if row - 1 == row0 {
-                            "R".to_string()
+                            out.push('R');
                         } else {
-                            format!("R[{}]", row as i64 - 1 - row0 as i64)
-                        };
-                        let c = if col_abs {
-                            format!("C{col}")
+                            let _ = write!(out, "R[{}]", row as i64 - 1 - row0 as i64);
+                        }
+                        if col_abs {
+                            let _ = write!(out, "C{col}");
                         } else if col - 1 == col0 {
-                            "C".to_string()
+                            out.push('C');
                         } else {
-                            format!("C[{}]", col as i64 - 1 - col0 as i64)
-                        };
-                        out.push_str(&format!("{r}{c}"));
+                            let _ = write!(out, "C[{}]", col as i64 - 1 - col0 as i64);
+                        }
+                        prev_ident = true;
                         i = k;
                         continue;
                     }
                 }
             }
-            // 不是引用：原样输出到候选末尾，避免逐字重复扫描
-            let end = (start + 1).max(i + 1);
-            out.extend(chars[start..end].iter());
-            i = end;
+            let ch = f[start..].chars().next().unwrap();
+            out.push(ch);
+            prev_ident = ch.is_alphanumeric() || ch == '_' || ch == '.';
+            i = start + ch.len_utf8();
             continue;
         }
-        out.push(ch);
-        i += 1;
+        if b < 0x80 {
+            let ch = b as char;
+            out.push(ch);
+            prev_ident = ch.is_ascii_alphanumeric() || ch == '_' || ch == '.';
+            i += 1;
+        } else {
+            let ch = f[i..].chars().next().unwrap();
+            out.push(ch);
+            prev_ident = ch.is_alphanumeric() || ch == '_' || ch == '.';
+            i += ch.len_utf8();
+        }
     }
     out
 }
 
 pub fn r1c1_to_a1(f: &str, row0: u32, col0: u32) -> String {
-    let chars: Vec<char> = f.chars().collect();
+    let bytes = f.as_bytes();
     let mut out = String::with_capacity(f.len() + 8);
     let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-        // 字符串字面量整段搬走（里面的 R/C 不是引用）
-        if c == '"' {
-            out.push('"');
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            let start = i;
             i += 1;
-            while i < chars.len() {
-                out.push(chars[i]);
-                if chars[i] == '"' {
-                    if chars.get(i + 1) == Some(&'"') {
-                        out.push('"');
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if bytes.get(i + 1) == Some(&b'"') {
                         i += 2;
                         continue;
                     }
@@ -528,24 +620,29 @@ pub fn r1c1_to_a1(f: &str, row0: u32, col0: u32) -> String {
                 }
                 i += 1;
             }
+            out.push_str(&f[start..i]);
             continue;
         }
-        if c == 'R' || c == 'r' {
-            let (rend, rpart) = parse_offset(&chars, i + 1);
-            let is_c = matches!(chars.get(rend), Some('C') | Some('c'));
-            if is_c {
-                let (cend, cpart) = parse_offset(&chars, rend + 1);
-                out.push_str(&build_a1(&rpart, &cpart, row0, col0));
+        if b == b'R' || b == b'r' {
+            let (rend, rpart) = parse_offset_bytes(bytes, i + 1);
+            if matches!(bytes.get(rend), Some(b'C' | b'c')) {
+                let (cend, cpart) = parse_offset_bytes(bytes, rend + 1);
+                push_a1(&mut out, &rpart, &cpart, row0, col0);
                 i = cend;
                 continue;
             }
-            // 只有 R 段（整行引用）本引擎不支持，原样留着
-            out.push(c);
+            out.push(b as char);
             i += 1;
             continue;
         }
-        out.push(c);
-        i += 1;
+        if b < 0x80 {
+            out.push(b as char);
+            i += 1;
+        } else {
+            let ch = f[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
     }
     out
 }
@@ -557,60 +654,63 @@ struct Part {
     n: i64,
 }
 
-fn parse_offset(chars: &[char], i: usize) -> (usize, Part) {
+fn parse_offset_bytes(bytes: &[u8], i: usize) -> (usize, Part) {
     let mut j = i;
-    if j < chars.len() && chars[j] == '[' {
+    if j < bytes.len() && bytes[j] == b'[' {
         let mut k = j + 1;
         let mut sign = 1i64;
-        if k < chars.len() && (chars[k] == '-' || chars[k] == '+') {
-            if chars[k] == '-' {
+        if k < bytes.len() && (bytes[k] == b'-' || bytes[k] == b'+') {
+            if bytes[k] == b'-' {
                 sign = -1;
             }
             k += 1;
         }
         let start = k;
-        while k < chars.len() && chars[k].is_ascii_digit() {
+        let mut acc = 0i64;
+        while k < bytes.len() && bytes[k].is_ascii_digit() {
+            acc = acc.saturating_mul(10).saturating_add(i64::from(bytes[k] - b'0'));
             k += 1;
         }
-        if k > start && k < chars.len() && chars[k] == ']' {
-            let n = chars[start..k]
-                .iter()
-                .collect::<String>()
-                .parse::<i64>()
-                .unwrap_or(0);
-            return (k + 1, Part { abs: false, n: sign * n });
+        if k > start && k < bytes.len() && bytes[k] == b']' {
+            return (k + 1, Part { abs: false, n: sign * acc });
         }
         return (j, Part { abs: false, n: 0 });
     }
     let start = j;
-    while j < chars.len() && chars[j].is_ascii_digit() {
+    let mut acc = 0i64;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        acc = acc.saturating_mul(10).saturating_add(i64::from(bytes[j] - b'0'));
         j += 1;
     }
     if j > start {
-        let n = chars[start..j]
-            .iter()
-            .collect::<String>()
-            .parse::<i64>()
-            .unwrap_or(1);
-        return (j, Part { abs: true, n });
+        return (j, Part { abs: true, n: acc.max(1) });
     }
     (i, Part { abs: false, n: 0 })
 }
 
 /// 绝对行写成 `B$3`（列绝对才是 `$B3`）
-fn build_a1(r: &Part, c: &Part, row0: u32, col0: u32) -> String {
-    let row = if r.abs { r.n } else { row0 as i64 + r.n + 1 };
-    let col = if c.abs { c.n } else { col0 as i64 + c.n + 1 };
-    let row = row.max(1);
-    let col = col.max(1);
-    let col_s = crate::model::col_label((col - 1) as u32);
-    format!(
-        "{}{}{}{}",
-        if c.abs { "$" } else { "" },
-        col_s,
-        if r.abs { "$" } else { "" },
-        row
-    )
+fn push_a1(out: &mut String, r: &Part, c: &Part, row0: u32, col0: u32) {
+    use std::fmt::Write as _;
+    let row = (if r.abs { r.n } else { row0 as i64 + r.n + 1 }).max(1);
+    let col = (if c.abs { c.n } else { col0 as i64 + c.n + 1 }).max(1);
+    if c.abs {
+        out.push('$');
+    }
+    let mut cv = col as u32;
+    let mut col_buf = [0u8; 4];
+    let mut clen = 0usize;
+    while cv > 0 {
+        col_buf[clen] = b'A' + ((cv - 1) % 26) as u8;
+        clen += 1;
+        cv = (cv - 1) / 26;
+    }
+    for idx in (0..clen).rev() {
+        out.push(col_buf[idx] as char);
+    }
+    if r.abs {
+        out.push('$');
+    }
+    let _ = write!(out, "{row}");
 }
 
 #[cfg(test)]

@@ -62,14 +62,9 @@ fn read_format(fmt: u32) -> Option<Vec<u8>> {
         }
         // GlobalSize 给的是分配大小，HTML Format 结尾有 \0，按字符串截断
         let size = GlobalSize(handle);
-        let mut buf = Vec::with_capacity(size);
-        for i in 0..size {
-            let b = *ptr.add(i);
-            if b == 0 {
-                break;
-            }
-            buf.push(b);
-        }
+        let slice = std::slice::from_raw_parts(ptr, size);
+        let len = slice.iter().position(|&b| b == 0).unwrap_or(size);
+        let buf = slice[..len].to_vec();
         GlobalUnlock(handle);
         CloseClipboard();
         Some(buf)
@@ -164,6 +159,22 @@ pub fn has_xml_spreadsheet() -> bool {
     unsafe {
         let format = RegisterClipboardFormatW(wide("XML Spreadsheet").as_ptr());
         format != 0 && IsClipboardFormatAvailable(format) != 0
+    }
+}
+
+pub fn has_rich_table_format() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    unsafe {
+        let xml = RegisterClipboardFormatW(wide("XML Spreadsheet").as_ptr());
+        if xml != 0 && IsClipboardFormatAvailable(xml) != 0 {
+            return true;
+        }
+        let html = RegisterClipboardFormatW(wide("HTML Format").as_ptr());
+        html != 0 && IsClipboardFormatAvailable(html) != 0
     }
 }
 
@@ -565,7 +576,7 @@ fn read_xmlss() -> Option<OfficeBlock> {
         }
         let raw = read_format_raw(fmt)?;
         let text = String::from_utf8_lossy(&raw);
-        let xml = text.trim_end_matches(' ');
+        let xml = text.trim_end_matches('\0');
         let parsed = sheetcore::clipboard_xmlss::parse(xml);
         if parsed.is_empty() {
             return None;
@@ -631,10 +642,7 @@ fn read_format_raw(fmt: u32) -> Option<Vec<u8>> {
             return None;
         }
         let size = GlobalSize(handle);
-        let mut buf = Vec::with_capacity(size);
-        for i in 0..size {
-            buf.push(*ptr.add(i));
-        }
+        let buf = std::slice::from_raw_parts(ptr, size).to_vec();
         GlobalUnlock(handle);
         CloseClipboard();
         Some(buf)
@@ -795,109 +803,163 @@ pub fn build_xmlss(
     let sh = wb.sheet(si);
     let mut ids: BTreeMap<String, usize> = BTreeMap::new();
     let mut style_xml = String::new();
-    let mut id_of = |st: &sheetcore::style::CellStyle, ids: &mut BTreeMap<String, usize>| -> String {
-        let key = style_key(st);
-        if let Some(i) = ids.get(&key) {
-            return format!("sc{i}");
-        }
-        let i = ids.len();
-        ids.insert(key, i);
-        let _ = write!(
-            style_xml,
-            "<Style ss:ID=\"sc{i}\"><Alignment ss:Vertical=\"Center\"/><Font ss:FontName=\"{font}\" ss:Size=\"{size}\"{bold}{italic}{color}/>{fill}{fmt}</Style>",
-            font = if st.font.is_empty() { "等线".to_string() } else { st.font.clone() },
-            size = if st.size > 0.0 { st.size } else { 11.0 },
-            bold = if st.bold { " ss:Bold=\"1\"" } else { "" },
-            italic = if st.italic { " ss:Italic=\"1\"" } else { "" },
-            color = {
-                let c = st.color;
-                format!(" ss:Color=\"#{:02X}{:02X}{:02X}\"", c[0], c[1], c[2])
-            },
-            fill = st
-                .fill
-                .map(|f| format!(
-                    "<Interior ss:Color=\"#{:02X}{:02X}{:02X}\" ss:Pattern=\"Solid\"/>",
-                    f[0], f[1], f[2]
-                ))
-                .unwrap_or_default(),
-            fmt = if st.format.trim().is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "<NumberFormat ss:Format=\"{}\"/>",
-                    st.format.replace('"', "&quot;")
-                )
-            }
-        );
-        format!("sc{i}")
-    };
-
-    let mut style_ids = HashMap::new();
-    let merges: Vec<_> = sh.merges.iter().copied()
-        .filter(|&(a, b, c, d)| a >= r1 && b >= c1 && c <= r2 && d <= c2).collect();
+    let mut style_ids: HashMap<u16, usize> = HashMap::new();
+    let merges: Vec<_> = sh
+        .merges
+        .iter()
+        .copied()
+        .filter(|&(a, b, c, d)| a >= r1 && b >= c1 && c <= r2 && d <= c2)
+        .collect();
     let mut merge_index = sheetcore::merges::MergeIndex::default();
     merge_index.refresh(&merges);
-    let blank = sheetcore::Cell::default();
-    let mut body = String::new();
+
+    let mut style_idx_of = |style: u16, ids: &mut BTreeMap<String, usize>| -> usize {
+        if let Some(&idx) = style_ids.get(&style) {
+            return idx;
+        }
+        let st = wb.styles.get(style);
+        let key = style_key(st);
+        let idx = if let Some(&i) = ids.get(&key) {
+            i
+        } else {
+            let i = ids.len();
+            ids.insert(key, i);
+            let font = if st.font.is_empty() { "等线" } else { st.font.as_str() };
+            let size = if st.size > 0.0 { st.size } else { 11.0 };
+            let bold = if st.bold { " ss:Bold=\"1\"" } else { "" };
+            let italic = if st.italic { " ss:Italic=\"1\"" } else { "" };
+            let c = st.color;
+            let _ = write!(style_xml, "<Style ss:ID=\"sc{i}\"><Alignment ss:Vertical=\"Center\"/><Font ss:FontName=\"");
+            xml_escape_into(&mut style_xml, font);
+            let _ = write!(
+                style_xml,
+                "\" ss:Size=\"{size}\"{bold}{italic} ss:Color=\"#{:02X}{:02X}{:02X}\"/>",
+                c[0], c[1], c[2]
+            );
+            if let Some(f) = st.fill {
+                let _ = write!(
+                    style_xml,
+                    "<Interior ss:Color=\"#{:02X}{:02X}{:02X}\" ss:Pattern=\"Solid\"/>",
+                    f[0], f[1], f[2]
+                );
+            }
+            if !st.format.trim().is_empty() {
+                style_xml.push_str("<NumberFormat ss:Format=\"");
+                xml_escape_into(&mut style_xml, &st.format);
+                style_xml.push_str("\"/>");
+            }
+            style_xml.push_str("</Style>");
+            i
+        };
+        style_ids.insert(style, idx);
+        idx
+    };
+
+    // Pre-cache whether a style format looks like a date so we don't allocate `.to_lowercase()` per numeric cell.
+    let mut date_style_cache: HashMap<u16, bool> = HashMap::new();
+    let mut is_date_style = |style: u16| -> bool {
+        *date_style_cache.entry(style).or_insert_with(|| {
+            let fmt = &wb.styles.get(style).format;
+            fmt.bytes().any(|b| matches!(b, b'y' | b'Y')) && (fmt.contains('-') || fmt.contains('/'))
+        })
+    };
+
+    let mut body = String::with_capacity(1024);
+    let mut expected_row = r1;
     for r in r1..=r2 {
-        body.push_str("<Row>");
+        // Quick skip for completely blank unstyled unmerged rows in sparse large selections.
+        let mut row_started = false;
+        let mut expected_col = c1;
         for c in c1..=c2 {
             let merge = merge_index.at(r, c);
             if merge.is_some_and(|(a, b, _, _)| (r, c) != (a, b)) {
                 continue;
             }
-            let cell = sh.get(r, c).unwrap_or(&blank);
+            let cell_opt = sh.get(r, c);
             let style = sh.style_of(r, c);
-            let st = wb.styles.get(style);
-            let sid = style_ids.entry(style).or_insert_with(|| id_of(st, &mut ids));
-            let mut attrs = format!(" ss:StyleID=\"{sid}\"");
-            // merges 里是 (r1, c1, r2, c2)：横向跨列写 MergeAcross，纵向跨行写 MergeDown。
-            // 写反了 Excel 会直接拒绝整个 XML Spreadsheet（连值都粘不进来）。
+            let has_formula = cell_opt.and_then(|cell| cell.formula.as_deref()).is_some();
+            let has_value = cell_opt.is_some_and(|cell| !matches!(cell.value, sheetcore::Value::Empty));
+            if !has_formula && !has_value && style == 0 && merge.is_none() {
+                continue;
+            }
+            if !row_started {
+                if r == expected_row {
+                    body.push_str("<Row>");
+                } else {
+                    let _ = write!(body, "<Row ss:Index=\"{}\">", r - r1 + 1);
+                }
+                row_started = true;
+            }
+            let sid_idx = style_idx_of(style, &mut ids);
+            body.push_str("<Cell");
+            if c != expected_col {
+                let _ = write!(body, " ss:Index=\"{}\"", c - c1 + 1);
+            }
+            let _ = write!(body, " ss:StyleID=\"sc{sid_idx}\"");
+            let mut span_cols = 1u32;
             if let Some((a, b, cc, dd)) = merge {
                 if dd > b {
-                    let _ = write!(attrs, " ss:MergeAcross=\"{}\"", dd - b);
+                    let across = dd - b;
+                    span_cols = across + 1;
+                    let _ = write!(body, " ss:MergeAcross=\"{across}\"");
                 }
                 if cc > a {
-                    let _ = write!(attrs, " ss:MergeDown=\"{}\"", cc - a);
+                    let _ = write!(body, " ss:MergeDown=\"{}\"", cc - a);
                 }
             }
-            let (ty, data) = match &cell.value {
-                sheetcore::Value::Empty => ("String", String::new()),
-                sheetcore::Value::Number(n) => {
-                    let is_date = st.format.to_lowercase().contains('y')
-                        && (st.format.contains('-') || st.format.contains('/'));
-                    if is_date {
-                        match wb.serial_to_date(*n) {
-                            Some((y, m, d)) => {
-                                ("DateTime", format!("{y:04}-{m:02}-{d:02}T00:00:00.000"))
-                            }
-                            None => ("Number", format!("{n}")),
+            expected_col = c + span_cols;
+
+            if let Some(f) = cell_opt.and_then(|cell| cell.formula.as_deref()) {
+                let r1c1 = sheetcore::clipboard_xmlss::a1_to_r1c1(f, r, c);
+                body.push_str(" ss:Formula=\"");
+                xml_escape_into(&mut body, &r1c1);
+                body.push('"');
+            }
+
+            match cell_opt.map(|cell| &cell.value) {
+                None | Some(sheetcore::Value::Empty) => {
+                    body.push_str("/>");
+                }
+                Some(sheetcore::Value::Text(t)) if t.is_empty() => {
+                    body.push_str("/>");
+                }
+                Some(sheetcore::Value::Text(t)) => {
+                    body.push_str("><Data ss:Type=\"String\">");
+                    xml_escape_into(&mut body, t);
+                    body.push_str("</Data></Cell>");
+                }
+                Some(sheetcore::Value::Number(n)) => {
+                    if is_date_style(style) {
+                        if let Some((y, m, d)) = wb.serial_to_date(*n) {
+                            let _ = write!(
+                                body,
+                                "><Data ss:Type=\"DateTime\">{y:04}-{m:02}-{d:02}T00:00:00.000</Data></Cell>"
+                            );
+                        } else {
+                            let _ = write!(body, "><Data ss:Type=\"Number\">{n}</Data></Cell>");
                         }
                     } else {
-                        ("Number", format!("{n}"))
+                        let _ = write!(body, "><Data ss:Type=\"Number\">{n}</Data></Cell>");
                     }
                 }
-                sheetcore::Value::Text(t) => ("String", t.to_string()),
-                sheetcore::Value::Bool(b) => ("Boolean", if *b { "1".into() } else { "0".into() }),
-                sheetcore::Value::Error(e) => ("Error", e.text().to_string()),
-            };
-            // XML Spreadsheet 的 ss:Formula 是 R1C1 语法；写成 A1 Excel 会忽略公式，
-            // 只把 Data 里的缓存值粘进来。这里按当前格折成 R1C1。
-            if let Some(f) = cell.formula.as_deref() {
-                let r1c1 = sheetcore::clipboard_xmlss::a1_to_r1c1(f, r, c);
-                let _ = write!(attrs, " ss:Formula=\"{}\"", xml_escape(&r1c1));
-            }
-            body.push_str("<Cell");
-            body.push_str(&attrs);
-            if data.is_empty() {
-                body.push_str("/>");
-            } else {
-                body.push('>');
-                let _ = write!(body, "<Data ss:Type=\"{ty}\">{}</Data>", xml_escape(&data));
-                body.push_str("</Cell>");
+                Some(sheetcore::Value::Bool(b)) => {
+                    body.push_str(if *b {
+                        "><Data ss:Type=\"Boolean\">1</Data></Cell>"
+                    } else {
+                        "><Data ss:Type=\"Boolean\">0</Data></Cell>"
+                    });
+                }
+                Some(sheetcore::Value::Error(e)) => {
+                    body.push_str("><Data ss:Type=\"Error\">");
+                    xml_escape_into(&mut body, e.text());
+                    body.push_str("</Data></Cell>");
+                }
             }
         }
-        body.push_str("</Row>");
+        if row_started {
+            body.push_str("</Row>");
+            expected_row = r + 1;
+        }
     }
     format!(
         "<?xml version=\"1.0\"?>
@@ -916,9 +978,30 @@ pub fn build_xmlss(
     )
 }
 
+fn xml_escape_into(out: &mut String, s: &str) {
+    let bytes = s.as_bytes();
+    let mut last = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        let rep = match b {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'"' => "&quot;",
+            _ => continue,
+        };
+        if i > last {
+            out.push_str(&s[last..i]);
+        }
+        out.push_str(rep);
+        last = i + 1;
+    }
+    if last < s.len() {
+        out.push_str(&s[last..]);
+    }
+}
+
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    xml_escape_into(&mut out, s);
+    out
 }

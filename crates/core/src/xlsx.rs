@@ -407,14 +407,26 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         zip_has_comments,
         zip_has_styles,
         zip_has_theme,
+        zip_has_custom_props,
     ) = if let Some(zip) = shared_zip.as_ref() {
-        let (mut vba, mut xlinks, mut drawing, mut table, mut chart, mut comments, mut styles, mut theme) =
-            (false, false, false, false, false, false, false, false);
+        let (
+            mut vba,
+            mut xlinks,
+            mut drawing,
+            mut table,
+            mut chart,
+            mut comments,
+            mut styles,
+            mut theme,
+            mut custom_props,
+        ) = (false, false, false, false, false, false, false, false, false);
         for name in zip.file_names() {
             if name == "xl/vbaProject.bin" {
                 vba = true;
             } else if name == "xl/styles.xml" {
                 styles = true;
+            } else if name == "docProps/custom.xml" {
+                custom_props = true;
             } else if name.starts_with("xl/theme/") {
                 theme = true;
             } else if name.contains("externalLink") {
@@ -429,9 +441,9 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 comments = true;
             }
         }
-        (vba, xlinks, drawing, table, chart, comments, styles, theme)
+        (vba, xlinks, drawing, table, chart, comments, styles, theme, custom_props)
     } else {
-        (false, false, false, false, false, false, false, false)
+        (false, false, false, false, false, false, false, false, false)
     };
     let sheets::WorkbookMetadata { xml: workbook_xml, targets, header } = shared_zip.as_mut()
         .map(sheets::workbook_metadata).transpose()
@@ -470,8 +482,8 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     let mut wb = Workbook {
         load_incomplete: false,
         names: defined_names,
-        // 数据源存在 `_sc_src_*` 名称里，读出来重建
-        sources: if !is_ooxml || has_source_names {
+        // 数据源存在 `docProps/custom.xml` 或旧版 `_sc_src_*` 名称里，按需读出来重建
+        sources: if !is_ooxml || zip_has_custom_props || has_source_names {
             crate::external::read_sources(path)
         } else {
             Vec::new()

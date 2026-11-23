@@ -22,11 +22,30 @@ pub fn is_full_columns((first_row, _, last_row, _): (u32, u32, u32, u32)) -> boo
 pub struct Range {
     book: sheetcore::Workbook,
     rect: (u32, u32, u32, u32),
+    visible_rows: Option<Vec<u32>>,
     cells: std::sync::OnceLock<Matrix>,
 }
 
 impl Range {
     pub fn new(wb: &sheetcore::Workbook, si: usize, rect: (u32, u32, u32, u32)) -> Self {
+        Self::new_with_rows(wb, si, rect, None)
+    }
+
+    pub fn new_filtered(
+        wb: &sheetcore::Workbook,
+        si: usize,
+        rect: (u32, u32, u32, u32),
+        visible_rows: Vec<u32>,
+    ) -> Self {
+        Self::new_with_rows(wb, si, rect, Some(visible_rows))
+    }
+
+    fn new_with_rows(
+        wb: &sheetcore::Workbook,
+        si: usize,
+        rect: (u32, u32, u32, u32),
+        visible_rows: Option<Vec<u32>>,
+    ) -> Self {
         let mut book = sheetcore::Workbook::new_blank();
         let source = wb.sheet(si);
         book.sheets[0] = source.search_snapshot();
@@ -42,8 +61,13 @@ impl Range {
         Self {
             book,
             rect,
+            visible_rows,
             cells: Default::default(),
         }
+    }
+
+    pub fn is_filtered(&self) -> bool {
+        self.visible_rows.is_some()
     }
 
     pub fn book(&self) -> &sheetcore::Workbook {
@@ -55,32 +79,37 @@ impl Range {
         let (r1, c1, r2, c2) = self.rect;
         let overlaps =
             |&&(a, b, c, d): &&(u32, u32, u32, u32)| a <= r2 && b <= c2 && c >= r1 && d >= c1;
+        let same_cell = |r: u32, c: u32| {
+            source.get(r, c) == live.get(r, c)
+                && source.style_of(r, c) == live.style_of(r, c)
+                && source.explicit_style_of(r, c) == live.explicit_style_of(r, c)
+        };
         source.identity == live.identity
-            && source
-                .merges
-                .iter()
-                .filter(overlaps)
-                .eq(live.merges.iter().filter(overlaps))
-            && (r1..=r2).all(|r| {
-                (c1..=c2).all(|c| {
-                    source.get(r, c) == live.get(r, c)
-                        && source.style_of(r, c) == live.style_of(r, c)
-                        && source.explicit_style_of(r, c) == live.explicit_style_of(r, c)
-                })
-            })
+            && (self.is_filtered()
+                || source
+                    .merges
+                    .iter()
+                    .filter(overlaps)
+                    .eq(live.merges.iter().filter(overlaps)))
+            && match &self.visible_rows {
+                Some(rows) => rows.iter().all(|&r| (c1..=c2).all(|c| same_cell(r, c))),
+                None => (r1..=r2).all(|r| (c1..=c2).all(|c| same_cell(r, c))),
+            }
     }
 
     pub fn cells(&self) -> &Matrix {
         self.cells.get_or_init(|| {
             let (r1, c1, r2, c2) = self.rect;
             let sh = self.book.sheet(0);
-            (r1..=r2)
-                .map(|r| {
-                    (c1..=c2)
-                        .map(|c| (sh.get(r, c).cloned().unwrap_or_default(), sh.style_of(r, c)))
-                        .collect()
-                })
-                .collect()
+            let build_row = |r: u32| -> Vec<(sheetcore::Cell, u16)> {
+                (c1..=c2)
+                    .map(|c| (sh.get(r, c).cloned().unwrap_or_default(), sh.style_of(r, c)))
+                    .collect()
+            };
+            match &self.visible_rows {
+                Some(rows) => rows.iter().map(|&r| build_row(r)).collect(),
+                None => (r1..=r2).map(build_row).collect(),
+            }
         })
     }
 
@@ -88,7 +117,7 @@ impl Range {
         let mut text = String::new();
         let (r1, c1, r2, c2) = self.rect;
         let sh = self.book.sheet(0);
-        for r in r1..=r2 {
+        let mut append_row = |r: u32| {
             for c in c1..=c2 {
                 if c != c1 {
                     text.push('\t');
@@ -103,6 +132,18 @@ impl Range {
                 }
             }
             text.push('\n');
+        };
+        match &self.visible_rows {
+            Some(rows) => {
+                for &r in rows {
+                    append_row(r);
+                }
+            }
+            None => {
+                for r in r1..=r2 {
+                    append_row(r);
+                }
+            }
         }
         text
     }
@@ -324,7 +365,9 @@ impl Owner {
                 DestroyWindow(hwnd);
                 return;
             }
-            let pending = if xml_only {
+            let pending = if range.is_filtered() {
+                vec![13]
+            } else if xml_only {
                 vec![xml]
             } else {
                 vec![xml, html, 13]

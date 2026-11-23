@@ -298,6 +298,424 @@ pub fn records_strict_q(text: &str, delim: char, quote: char) -> Result<Vec<Vec<
     records_strict_while(text, delim, quote, || true)
 }
 
+/// Summary of a validated CSV stream keeping only a bounded row preview in memory.
+pub struct CsvSummary {
+    pub preview_rows: Vec<Vec<String>>,
+    pub row_count: usize,
+    pub cols: usize,
+    pub delim: char,
+    pub encoding: Encoding,
+}
+
+/// Borrow UTF-8 CSV text without copying when valid; fall back to `decode` for UTF-16 / GB18030.
+pub fn decode_cow(bytes: &[u8], wanted: Option<Encoding>) -> (std::borrow::Cow<'_, str>, Encoding, bool) {
+    if let Some(w) = wanted {
+        return match w {
+            Encoding::Utf8 => match std::str::from_utf8(bytes) {
+                Ok(t) => (
+                    std::borrow::Cow::Borrowed(t.strip_prefix('\u{feff}').unwrap_or(t)),
+                    Encoding::Utf8,
+                    false,
+                ),
+                Err(_) => (std::borrow::Cow::Borrowed(""), Encoding::Utf8, true),
+            },
+            Encoding::Utf16Le => {
+                let (cow, _, bad) = encoding_rs::UTF_16LE.decode(bytes);
+                (cow, Encoding::Utf16Le, bad)
+            }
+            Encoding::Utf16Be => {
+                let (cow, _, bad) = encoding_rs::UTF_16BE.decode(bytes);
+                (cow, Encoding::Utf16Be, bad)
+            }
+            Encoding::Gb18030 => {
+                let (cow, _, bad) = encoding_rs::GB18030.decode(bytes);
+                (cow, Encoding::Gb18030, bad)
+            }
+        };
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        if let Ok(t) = std::str::from_utf8(&bytes[3..]) {
+            return (std::borrow::Cow::Borrowed(t), Encoding::Utf8, false);
+        }
+        let (cow, _, bad) = encoding_rs::GB18030.decode(bytes);
+        return (cow, Encoding::Gb18030, bad);
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let (cow, _, bad) = encoding_rs::UTF_16LE.decode(bytes);
+        return (cow, Encoding::Utf16Le, bad);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let (cow, _, bad) = encoding_rs::UTF_16BE.decode(bytes);
+        return (cow, Encoding::Utf16Be, bad);
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(t) => (std::borrow::Cow::Borrowed(t), Encoding::Utf8, false),
+        Err(_) => {
+            let (cow, _, bad) = encoding_rs::GB18030.decode(bytes);
+            (cow, Encoding::Gb18030, bad)
+        }
+    }
+}
+
+/// Fast-path preview from the first 64 KiB of a CSV file so the import dialog can render
+/// preview rows immediately before background full-tail validation completes.
+pub fn read_preview_head(
+    path: &std::path::Path,
+    wanted: Option<Encoding>,
+    quote: char,
+    max_rows: usize,
+) -> Option<(Vec<Vec<String>>, usize, char, Encoding)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0usize;
+    while total < buf.len() {
+        match file.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(_) => return None,
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    let eof = total < buf.len();
+    buf.truncate(total);
+    // Trim incomplete trailing multi-byte sequence when we stopped mid-file.
+    if !eof {
+        if matches!(wanted, Some(Encoding::Utf16Le | Encoding::Utf16Be))
+            || buf.starts_with(&[0xFF, 0xFE])
+            || buf.starts_with(&[0xFE, 0xFF])
+        {
+            if buf.len() % 2 == 1 {
+                buf.pop();
+            }
+        } else if let Err(err) = std::str::from_utf8(&buf) {
+            if err.error_len().is_none() {
+                buf.truncate(err.valid_up_to());
+            }
+        }
+    }
+    let (cow, enc, bad) = decode_cow(&buf, wanted);
+    if bad {
+        return None;
+    }
+    let sample = if eof {
+        cow.as_ref()
+    } else if let Some(nl) = cow.rfind('\n') {
+        &cow[..=nl]
+    } else {
+        return None;
+    };
+    let delim = sniff(sample);
+    let mut rows = parse(sample, delim);
+    rows.truncate(max_rows);
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    Some((rows, cols, delim, enc))
+}
+
+/// Strictly validate `text` and collect `(preview_rows, row_count, max_cols)` without
+/// allocating `String` / `Vec<String>` for rows beyond `preview_limit`.
+pub fn scan_summary_while(
+    text: &str,
+    delim: char,
+    quote: char,
+    encoding: Encoding,
+    preview_limit: usize,
+    mut keep_going: impl FnMut() -> bool,
+) -> Result<CsvSummary, String> {
+    let mut preview_rows: Vec<Vec<String>> = Vec::with_capacity(preview_limit.min(16));
+    let mut preview_row: Vec<String> = Vec::new();
+    let mut preview_field = String::new();
+
+    let mut row_count = 0usize;
+    let mut max_cols = 0usize;
+    let mut cur_cols = 0usize;
+    let mut field_non_empty = false;
+    let mut field_non_ws = false;
+    let mut in_quotes = false;
+    let mut quoted_field = false;
+    let mut closed = false;
+    let mut line = 1usize;
+
+    // Fast byte-level state machine when delimiter and quote are ASCII (standard CSV/TSV).
+    if delim.is_ascii() && quote.is_ascii() && delim != '\r' && delim != '\n' && quote != '\r' && quote != '\n' {
+        let bytes = text.as_bytes();
+        let db = delim as u8;
+        let qb = quote as u8;
+        let mut i = 0usize;
+        let mut seg_start = 0usize;
+        while i < bytes.len() {
+            if (i & 8191) == 0 && !keep_going() {
+                return Err("CSV 读取已取消".into());
+            }
+            let b = bytes[i];
+            let collecting = row_count < preview_limit;
+            if in_quotes {
+                if b == qb {
+                    if bytes.get(i + 1) == Some(&qb) {
+                        if collecting {
+                            preview_field.push_str(&text[seg_start..i]);
+                            preview_field.push(quote);
+                        }
+                        field_non_empty = true;
+                        field_non_ws = true;
+                        i += 2;
+                        seg_start = i;
+                        continue;
+                    }
+                    if collecting {
+                        preview_field.push_str(&text[seg_start..i]);
+                    }
+                    in_quotes = false;
+                    closed = true;
+                    i += 1;
+                    seg_start = i;
+                    continue;
+                }
+                if b == b'\n' {
+                    line += 1;
+                }
+                field_non_empty = true;
+                if !b.is_ascii_whitespace() {
+                    field_non_ws = true;
+                }
+                i += 1;
+                continue;
+            }
+            if closed && b != db && b != b'\r' && b != b'\n' {
+                return Err(format!("第 {line} 行：引号字段结束后还有多余字符"));
+            }
+            if b == qb && !field_non_empty && !quoted_field {
+                in_quotes = true;
+                quoted_field = true;
+                i += 1;
+                seg_start = i;
+                continue;
+            }
+            if b == qb && quoted_field {
+                return Err(format!("第 {line} 行：引号字段结束后还有多余字符"));
+            }
+            if b == db {
+                if collecting {
+                    if !quoted_field {
+                        preview_field.push_str(&text[seg_start..i]);
+                    }
+                    preview_row.push(std::mem::take(&mut preview_field));
+                }
+                cur_cols += 1;
+                field_non_empty = false;
+                field_non_ws = false;
+                quoted_field = false;
+                closed = false;
+                i += 1;
+                seg_start = i;
+                continue;
+            }
+            if b == b'\r' {
+                if collecting && !quoted_field {
+                    preview_field.push_str(&text[seg_start..i]);
+                }
+                i += 1;
+                seg_start = i;
+                continue;
+            }
+            if b == b'\n' {
+                if collecting {
+                    if !quoted_field {
+                        preview_field.push_str(&text[seg_start..i]);
+                    }
+                    preview_row.push(std::mem::take(&mut preview_field));
+                }
+                cur_cols += 1;
+                let skip_row = cur_cols == 1 && !quoted_field && !field_non_ws;
+                if !skip_row {
+                    max_cols = max_cols.max(cur_cols);
+                    if collecting {
+                        preview_rows.push(std::mem::take(&mut preview_row));
+                    }
+                    row_count += 1;
+                } else if collecting {
+                    preview_row.clear();
+                }
+                cur_cols = 0;
+                field_non_empty = false;
+                field_non_ws = false;
+                quoted_field = false;
+                closed = false;
+                line += 1;
+                i += 1;
+                seg_start = i;
+                continue;
+            }
+            field_non_empty = true;
+            if !b.is_ascii_whitespace() {
+                // Non-ASCII UTF-8 bytes (`>= 0x80`): check Unicode whitespace only if single-field candidate.
+                if b < 0x80 {
+                    field_non_ws = true;
+                } else if let Some(ch) = text[i..].chars().next() {
+                    if !ch.is_whitespace() {
+                        field_non_ws = true;
+                    }
+                    i += ch.len_utf8();
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        if in_quotes {
+            return Err(format!("第 {line} 行：引号没有闭合"));
+        }
+        if field_non_empty || quoted_field || cur_cols > 0 {
+            let collecting = row_count < preview_limit;
+            if collecting {
+                if !quoted_field && seg_start < bytes.len() {
+                    preview_field.push_str(&text[seg_start..bytes.len()]);
+                }
+                preview_row.push(preview_field);
+            }
+            cur_cols += 1;
+            let skip_row = cur_cols == 1 && !quoted_field && !field_non_ws;
+            if !skip_row {
+                max_cols = max_cols.max(cur_cols);
+                if collecting {
+                    preview_rows.push(preview_row);
+                }
+                row_count += 1;
+            }
+        }
+        return Ok(CsvSummary {
+            preview_rows,
+            row_count,
+            cols: max_cols,
+            delim,
+            encoding,
+        });
+    }
+
+    // Fallback for non-ASCII delimiter/quote characters.
+    let rows = records_strict_while(text, delim, quote, keep_going)?;
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let row_count = rows.len();
+    let preview_rows = rows.into_iter().take(preview_limit).collect();
+    Ok(CsvSummary {
+        preview_rows,
+        row_count,
+        cols,
+        delim,
+        encoding,
+    })
+}
+
+/// Partition validated ASCII-delimited/quoted CSV `text` into up to `target_chunks` slices
+/// `(byte_start, byte_end, starting_logical_row_index)` split strictly at unquoted `\n`.
+pub fn partition_csv_chunks(
+    text: &str,
+    delim: char,
+    quote: char,
+    target_chunks: usize,
+) -> Option<Vec<(usize, usize, usize)>> {
+    if !delim.is_ascii()
+        || !quote.is_ascii()
+        || delim == '\r'
+        || delim == '\n'
+        || quote == '\r'
+        || quote == '\n'
+        || text.is_empty()
+    {
+        return None;
+    }
+    let chunks = target_chunks.max(1);
+    let bytes = text.as_bytes();
+    let target_bytes = (bytes.len() / chunks).max(256 * 1024);
+    let db = delim as u8;
+    let qb = quote as u8;
+
+    let mut out = Vec::with_capacity(chunks);
+    let mut chunk_start = 0usize;
+    let mut chunk_row_start = 0usize;
+    let mut next_split_at = target_bytes;
+
+    let mut row_count = 0usize;
+    let mut cur_cols = 0usize;
+    let mut field_non_empty = false;
+    let mut field_non_ws = false;
+    let mut in_quotes = false;
+    let mut quoted_field = false;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_quotes {
+            if b == qb {
+                if bytes.get(i + 1) == Some(&qb) {
+                    i += 2;
+                    continue;
+                }
+                in_quotes = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == qb && !field_non_empty && !quoted_field {
+            in_quotes = true;
+            quoted_field = true;
+            i += 1;
+            continue;
+        }
+        if b == db {
+            cur_cols += 1;
+            field_non_empty = false;
+            field_non_ws = false;
+            quoted_field = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\r' {
+            i += 1;
+            continue;
+        }
+        if b == b'\n' {
+            cur_cols += 1;
+            let skip_row = cur_cols == 1 && !quoted_field && !field_non_ws;
+            if !skip_row {
+                row_count += 1;
+            }
+            cur_cols = 0;
+            field_non_empty = false;
+            field_non_ws = false;
+            quoted_field = false;
+            let line_end = i + 1;
+            if line_end >= next_split_at && out.len() + 1 < chunks && line_end < bytes.len() {
+                out.push((chunk_start, line_end, chunk_row_start));
+                chunk_start = line_end;
+                chunk_row_start = row_count;
+                next_split_at = line_end + target_bytes;
+            }
+            i = line_end;
+            continue;
+        }
+        field_non_empty = true;
+        if b < 0x80 {
+            if !b.is_ascii_whitespace() {
+                field_non_ws = true;
+            }
+            i += 1;
+        } else if let Some(ch) = text[i..].chars().next() {
+            if !ch.is_whitespace() {
+                field_non_ws = true;
+            }
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
+    }
+    if chunk_start < bytes.len() {
+        out.push((chunk_start, bytes.len(), chunk_row_start));
+    }
+    Some(out)
+}
+
 /// 记录模式：跳过完全空行，但**保留**字段内的换行与引号。
 pub fn records(text: &str, delim: char) -> Vec<Vec<String>> {
     parse(text, delim)
