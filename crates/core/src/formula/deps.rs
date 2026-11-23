@@ -59,6 +59,8 @@ pub struct Deps {
     keys: Vec<CellKey>,
     free_ids: Vec<u32>,
     volatile: HashSet<CellKey>,
+    volatile_refs: HashSet<CellKey>,
+    visibility: HashSet<CellKey>,
     runtime_refs: HashSet<CellKey>,
     cached_spill_errors: HashSet<CellKey>,
     pub rect_count: usize,
@@ -70,7 +72,8 @@ impl Deps {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.refs.is_empty() && self.volatile.is_empty() && self.runtime_refs.is_empty() && self.cached_spill_errors.is_empty()
+        self.refs.is_empty() && self.volatile.is_empty() && self.runtime_refs.is_empty()
+            && self.cached_spill_errors.is_empty() && self.visibility.is_empty()
     }
 
     pub fn requires_full_recalc(&self) -> bool {
@@ -83,12 +86,24 @@ impl Deps {
             || self.cached_spill_errors.contains(&key)
             || self.runtime_refs.contains(&key)
             || self.volatile.contains(&key)
+            || self.visibility.contains(&key)
             || wb.sheets.get(key.0).and_then(|s| s.get(key.1, key.2))
                 .is_some_and(|c| c.formula.is_some())
     }
 
     pub(crate) fn dynamic_cells(&self) -> impl Iterator<Item = CellKey> + '_ {
-        self.runtime_refs.iter().copied()
+        self.runtime_refs.iter().chain(&self.volatile_refs).copied()
+    }
+
+    /// Recalculate visibility-aware formulas that could read the filtered sheet, plus
+    /// volatile formulas. Unresolved references require the full calculation path.
+    pub fn visibility_seeds(&self, sheet: usize) -> Option<Vec<CellKey>> {
+        if self.requires_full_recalc() { return None; }
+        let mut seeds = self.volatile.clone();
+        seeds.extend(self.visibility.iter().copied().filter(|key| {
+            self.refs.get(key).is_some_and(|refs| refs.iter().any(|r| r.sheet == sheet))
+        }));
+        Some(seeds.into_iter().collect())
     }
 }
 
@@ -128,6 +143,8 @@ fn sheet_span(wb: &crate::Workbook, a: &str, b: &str) -> Vec<usize> {
 struct Dependencies {
     rects: Vec<Rect>,
     volatile: bool,
+    volatile_ref: bool,
+    visibility: bool,
     runtime: bool,
     cached_spill_error: bool,
 }
@@ -187,7 +204,12 @@ impl Walker<'_> {
         let wb = self.wb;
         match node {
             Node::Ref(re) | Node::Spill(re) => {
-                self.result.runtime |= matches!(node, Node::Spill(_));
+                if matches!(node, Node::Spill(_)) {
+                    let idx = sheet_index(wb, re.sheet.as_deref(), si);
+                    let anchor = crate::CellRef::new(re.row.max(0) as u32, re.col.max(0) as u32);
+                    self.result.runtime |= re.book.is_some() || re.sheet2.is_some()
+                        || !wb.sheets.get(idx).is_some_and(|sheet| sheet.spill_shapes.contains_key(&anchor));
+                }
                 // 外部工作簿的引用不参与本簿依赖图
                 if re.book.is_some() {
                     return;
@@ -275,7 +297,10 @@ impl Walker<'_> {
                 self.bound.truncate(base);
             }
             Node::Func(name, args) => {
-                self.result.runtime |= matches!(name.as_str(), "INDIRECT" | "OFFSET");
+                // The target may change on any edit. Re-evaluate this formula and all its
+                // statically indexed dependents, pulling changed precedents via Calc's scope.
+                self.result.volatile_ref |= matches!(name.as_str(), "INDIRECT" | "OFFSET");
+                self.result.visibility |= matches!(name.as_str(), "SUBTOTAL" | "AGGREGATE");
                 self.result.volatile |= matches!(
                     name.as_str(),
                     "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY"
@@ -393,11 +418,15 @@ impl Deps {
     }
 
     fn insert(&mut self, key: CellKey, info: Dependencies) {
+        if info.visibility { self.visibility.insert(key); }
         if info.cached_spill_error { self.cached_spill_errors.insert(key); }
         if info.runtime {
             self.runtime_refs.insert(key);
         }
-        if info.volatile {
+        if info.volatile_ref {
+            self.volatile_refs.insert(key);
+        }
+        if info.volatile || info.volatile_ref {
             self.volatile.insert(key);
         }
         let mut rects = info.rects;
@@ -482,6 +511,8 @@ impl Deps {
             }
         }
         self.runtime_refs.remove(&key);
+        self.volatile_refs.remove(&key);
+        self.visibility.remove(&key);
         self.volatile.remove(&key);
         self.cached_spill_errors.remove(&key);
         if let Some(cell) = wb.sheets.get(key.0).and_then(|s| s.get(key.1, key.2))
@@ -638,7 +669,8 @@ mod tests {
         assert_eq!(d.closure(&[(0, 0, 0)]), HashSet::from([(0, 0, 2)]));
         formula(&mut wb, 0, 0, 4, "=LET(place,\"A1\",INDIRECT(place))");
         let d = Deps::build(&wb);
-        assert!(d.requires_full_recalc());
+        assert!(!d.requires_full_recalc());
+        assert!(d.edit_closure(&[(1, 9, 9)]).contains(&(0, 0, 4)));
         wb.names
             .push(("LeftAlias".to_owned(), None, "RightAlias".to_owned()));
         wb.names

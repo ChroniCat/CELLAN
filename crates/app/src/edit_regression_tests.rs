@@ -520,6 +520,50 @@ fn clipboard_cross_sheet_merge_move_undo_checks_both_sides_before_changing_eithe
 }
 
 #[test]
+fn large_selection_statistics_ignore_stale_workers_and_overlapping_rectangles() {
+    let _env = crate::test_env::TestEnv::new("large-selection-stats-worker");
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let sheet = app.wb.sheet_mut(0);
+    sheet.set(0, 0, number(3.0));
+    sheet.set(7, 1, number(4.0));
+    sheet.set(10, 1, number(30.0));
+    sheet.hidden_rows_user.insert(10);
+    let a = [(0, 0, 12_000, 0)];
+    let b = [(0, 0, 12_000, 1), (1, 1, 13_000, 1)];
+    assert_eq!(app.selection_stats_label(&ctx, &a, 12_001, 8), "计算中…");
+    app.wb.sheet_mut(0).set(0, 0, number(8.0));
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let result = app.selection_stats_label(&ctx, &b, 37_002, 8);
+        if result != "计算中…" {
+            assert_eq!(result, "求和: 12");
+            break;
+        }
+        assert!(std::time::Instant::now() < until, "worker did not finish");
+        std::thread::yield_now();
+    }
+    assert_eq!(app.selection_stats_label(&ctx, &b, 37_002, 8), "求和: 12");
+}
+
+#[test]
+fn office_paste_constant_updates_formula_and_undo_redo() {
+    let _env = crate::test_env::TestEnv::new("office-paste-dependent");
+    let mut app = app();
+    app.wb.sheets[0].set(0, 0, formula("5+1"));
+    app.wb.sheets[0].set(0, 1, formula("A1*2"));
+    app.fast_recalc_cells(&[(0, 0, 0), (0, 0, 1)]);
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(12.0));
+    let block = office_clipboard::parse_html("<table><tr><td>9</td></tr></table>");
+    assert!(app.paste_office_block(&block));
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(18.0));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(12.0));
+    app.do_undo(true);
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(18.0));
+}
+
+#[test]
 fn clipboard_office_merge_and_its_values_undo_and_redo_together() {
     let _env = crate::test_env::TestEnv::new("clipboard-office-merge-undo");
     let mut app = app();
@@ -946,6 +990,22 @@ fn structural_undo_restores_cross_sheet_formulas_names_and_layout() {
     app.editing = Some(EditState::new("30".into()));
     app.commit_edit(None);
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(30.0));
+}
+
+#[test]
+fn large_target_insert_keeps_undo_history() {
+    let _env = crate::test_env::TestEnv::new("large-target-undo");
+    let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+    for row in 0..200_001 { app.wb.sheets[0].set(row, 0, number(row as f64)); }
+    app.editing = Some(EditState::new("42".into()));
+    app.commit_edit(None);
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 200_000, n: 1 });
+    assert_eq!(app.wb.sheet(0).value(200_001, 0), Value::Number(200_000.0));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(200_000, 0), Value::Number(200_000.0));
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(42.0));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(0.0));
 }
 
 #[test]
@@ -5443,7 +5503,7 @@ fn replace_all_in_selection_spares_cells_outside_and_is_one_undo() {
 
 /// UI-05.4：大范围扫描分帧进行，可取消且取消后不写任何格；继续扫描则最终一次提交。
 #[test]
-fn long_find_scan_is_chunked_cancellable_and_commits_once() {
+fn background_replace_scan_is_cancellable_and_commits_once() {
     let mut app = app();
     for r in 0..9000u32 {
         app.wb.sheet_mut(0).set(r, 0, text("old"));
@@ -5456,9 +5516,8 @@ fn long_find_scan_is_chunked_cancellable_and_commits_once() {
         ..Default::default()
     };
     app.start_scan(1);
-    assert!(app.find_scan.is_some(), "9000 格应进入分帧扫描");
-    app.poll_find_scan();
-    assert!(app.find_scan.is_some(), "一帧还没扫完");
+    assert!(app.find_scan.is_some(), "9000 格应进入后台扫描");
+
     app.cancel_find_scan();
     assert!(app.find_scan.is_none());
     assert_eq!(app.status, "已取消扫描");
@@ -5466,12 +5525,12 @@ fn long_find_scan_is_chunked_cancellable_and_commits_once() {
     assert_eq!(app.undo.depth(), (0, 0), "取消不能产生撤销步");
 
     app.start_scan(1);
-    let mut guard = 0;
-    while app.find_scan.is_some() && guard < 10 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.find_scan.is_some() && std::time::Instant::now() < deadline {
         app.poll_find_scan();
-        guard += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    assert!(app.find_scan.is_none(), "分帧应在有限帧内完成");
+    assert!(app.find_scan.is_none(), "后台扫描应及时完成");
     assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("new".into()));
     assert_eq!(app.wb.sheet(0).value(8999, 0), Value::Text("new".into()));
     assert_eq!(app.undo.depth(), (1, 0), "扫描完成后一次提交、一步撤销");
@@ -5767,7 +5826,7 @@ fn stale_scan_is_dropped_after_document_switch() {
         ..Default::default()
     };
     app.start_scan(1);
-    let stale = app.find_scan.take().expect("应进入分帧扫描");
+    let stale = app.find_scan.take().expect("应进入后台扫描");
     // 模拟切到另一份文档：内容与世代都换了，但扫描被错误地保留
     let mut b = sheetcore::model::Workbook::new_blank();
     b.sheets[0].set(0, 0, text("old"));
@@ -5786,10 +5845,10 @@ fn stale_scan_is_dropped_after_document_switch() {
     // 正常的分帧扫描仍在同一文档内完成
     app.undo = sheetcore::undo::UndoStack::new();
     app.start_scan(1);
-    let mut guard = 0;
-    while app.find_scan.is_some() && guard < 10 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.find_scan.is_some() && std::time::Instant::now() < deadline {
         app.poll_find_scan();
-        guard += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("new".into()));
 }
@@ -9807,16 +9866,17 @@ fn background_save_finishes_in_its_own_tab_after_switching() {
     app.commit_edit(None);
     assert!(app.wb.dirty, "文档 2 应该是脏的");
 
-    // 等文档 1 的后台保存结束（最多 10 秒）
-    let t0 = std::time::Instant::now();
-    while app.tabs.iter().any(|t| {
-        matches!(t, TabSlot::Parked(d) if d.tasks.saving.is_some())
-    }) && t0.elapsed().as_secs() < 10
-    {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        // 每帧都要真的收一次后台保存结果（和主循环一样），否则挂起标签的 saving 永远不清
+    assert!(matches!(&app.tabs[0], TabSlot::Parked(d) if d.tasks.saving.is_some()),
+        "文档 1 的保存任务应随标签挂起");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
         app.poll_save();
+        if !app.has_pending_save() { break; }
+        assert!(std::time::Instant::now() < deadline, "文档 1 后台保存超时：{}", app.status);
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    assert!(matches!(&app.tabs[0], TabSlot::Parked(d) if !d.wb.dirty && d.tasks.autosave_retry_at.is_none()),
+        "文档 1 后台保存失败：{}", app.status);
 
     // 文档 1：文件里应该有值、脏标记清掉
     let wb = sheetcore::xlsx::load(&path1).expect("读回文档 1");

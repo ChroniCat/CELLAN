@@ -122,6 +122,11 @@ enum ReferenceField {
 pub(crate) struct RenameReferences(std::collections::HashMap<ReferenceField, (String, String)>);
 
 impl RenameReferences {
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.0.capacity() * std::mem::size_of::<(ReferenceField, String, String)>()
+            + self.0.values().map(|(old, new)| old.capacity() + new.capacity()).sum::<usize>()
+    }
+
     pub(crate) fn restore(&self, wb: &mut Workbook, idx: usize, name: &str, redo: bool) -> bool {
         if !valid_name(wb, Some(idx), name) { return false; }
         let mut matched = 0;
@@ -178,7 +183,7 @@ fn visit_references(wb: &mut Workbook, mut update: impl FnMut(ReferenceField, &s
             update(ReferenceField::Formula(si, key), cell.formula.as_deref()?).map(|text| (key, text))
         }).collect();
         for (key, text) in changes {
-            sheet.get_mut(key.row, key.col).unwrap().formula = Some(text.into_boxed_str());
+            sheet.get_mut(key.row, key.col).unwrap().formula = Some(text.into());
             sheet.edited = true;
         }
         for (bi, block) in sheet.cf.blocks.iter_mut().enumerate() {

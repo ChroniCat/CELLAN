@@ -478,6 +478,75 @@ pub fn format_value_fit(v: &crate::model::Value, fmt: &str, cap: usize) -> Strin
     format_value(v, fmt)
 }
 
+// Rendered values vary by cell. The format sections, signs and literal parts
+// of ordinary numeric patterns can be shared by all cells using that format.
+struct FormatSection {
+    raw: String,
+    color: Option<[u8; 3]>,
+    number: Option<NumberSection>,
+}
+
+struct NumberSection {
+    prefix: String,
+    pattern: String,
+    suffix: String,
+    percent: i32,
+    permille: i32,
+}
+
+impl NumberSection {
+    fn compile(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("general")
+            || is_date_format(raw) || crate::dbnum::detect_dbnum(raw).is_some() {
+            return None;
+        }
+        let cleaned = strip_brackets(raw);
+        let sec = cleaned.trim();
+        if sec.contains(['E', 'e']) || (sec.contains('/') && sec.contains('?')) {
+            return None;
+        }
+        Self::from_numeric_pattern(sec)
+    }
+
+    fn from_numeric_pattern(sec: &str) -> Option<Self> {
+        let start = sec.find(['0', '#', '?'])?;
+        let end = sec[start..].find(|c| !matches!(c, '0' | '#' | '?' | ',' | '.'))
+            .map_or(sec.len(), |i| start + i);
+        Some(Self {
+            prefix: render_literals(&sec[..start]),
+            pattern: sec[start..end].to_owned(),
+            suffix: render_literals(&sec[end..]),
+            percent: sec.matches('%').count() as i32,
+            permille: sec.matches('‰').count() as i32,
+        })
+    }
+
+    fn render(&self, val: f64) -> String {
+        let scaled = val * 100f64.powi(self.percent) * 1000f64.powi(self.permille);
+        format!("{}{}{}", self.prefix, render_number(scaled, &self.pattern), self.suffix)
+    }
+}
+
+fn format_sections(fmt: &str) -> std::rc::Rc<[FormatSection]> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<[FormatSection]>>> =
+            Default::default();
+    }
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(hit) = cache.get(fmt) { return hit.clone(); }
+        let sections: std::rc::Rc<[_]> = split_sections(fmt).into_iter().map(|raw| {
+            FormatSection { color: section_color(&raw), number: NumberSection::compile(&raw), raw }
+        }).collect();
+        if fmt.len() <= 4096 {
+            if cache.len() >= 128 { cache.clear(); }
+            cache.insert(fmt.to_owned(), sections.clone());
+        }
+        sections
+    })
+}
+
 pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
     use crate::model::Value;
     if fmt.trim().is_empty() || fmt.eq_ignore_ascii_case("general") {
@@ -490,25 +559,28 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
     // 读盘时它被还原成 mm-dd-yy，这里按系统设置换成本机的写法（和 Excel 一致）。
     let localized = localize_builtin_date(fmt);
     let fmt: &str = localized.as_deref().unwrap_or(fmt);
-    let sections = split_sections(fmt);
+    let sections = format_sections(fmt);
     match v {
         Value::Number(n) => {
             let (sec, val, need_minus) = if *n < 0.0 {
                 if sections.len() >= 2 {
-                    (sections[1].as_str(), -*n, false)
+                    (&sections[1], -*n, false)
                 } else {
-                    (sections[0].as_str(), -*n, true)
+                    (&sections[0], -*n, true)
                 }
             } else if *n == 0.0 && sections.len() >= 3 {
-                (sections[2].as_str(), 0.0, false)
+                (&sections[2], 0.0, false)
             } else {
-                (sections[0].as_str(), *n, false)
+                (&sections[0], *n, false)
             };
-            let mut out = render_section(val, sec);
+            let mut out = match &sec.number {
+                Some(pattern) => pattern.render(val),
+                None => render_section(val, &sec.raw),
+            };
             // Excel 单段格式对负数：先取绝对值套格式，再在最前面补一个负号
             // （`(#,##0.00)` → `-(1,234.50)`；`[Red]-#,##0.00` → `--987.65`）
             if need_minus {
-                if crate::dbnum::detect_dbnum(sec).is_some() {
+                if sec.number.is_none() && crate::dbnum::detect_dbnum(&sec.raw).is_some() {
                     if !out.starts_with('负') {
                         out.insert(0, '负');
                     }
@@ -521,9 +593,9 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
         Value::Text(t) => {
             // 文本优先用第 4 段；没有第 4 段时，第 1 段里有 @ 也照样套
             if sections.len() >= 4 {
-                render_text_section(t, &sections[3])
-            } else if sections[0].contains('@') {
-                render_text_section(t, &sections[0])
+                render_text_section(t, &sections[3].raw)
+            } else if sections[0].raw.contains('@') {
+                render_text_section(t, &sections[0].raw)
             } else {
                 t.to_string()
             }
@@ -535,7 +607,7 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
 /// 内建短日期（14 号）在本机的写法；其它格式原样返回 None。
 /// Excel 在中文/欧洲区域显示 29/11/2025，在美式区域显示 11-29-25——
 /// 我们按系统的 LOCALE_SSHORTDATE 走，打开同一份文件才和 Excel 一致。
-fn localize_builtin_date(fmt: &str) -> Option<String> {
+fn localize_builtin_date(fmt: &str) -> Option<std::rc::Rc<str>> {
     let t = fmt.trim();
     let is_short_date = t.eq_ignore_ascii_case("mm-dd-yy")
         || t.eq_ignore_ascii_case("m/d/yy")
@@ -544,7 +616,19 @@ fn localize_builtin_date(fmt: &str) -> Option<String> {
     if !is_short_date {
         return None;
     }
-    Some(system_short_date())
+    thread_local! {
+        static SHORT_DATE: std::cell::RefCell<Option<(std::time::Instant, std::rc::Rc<str>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    SHORT_DATE.with(|slot| {
+        let mut cache = slot.borrow_mut();
+        if let Some((checked, pattern)) = &*cache {
+            if checked.elapsed() < std::time::Duration::from_secs(1) { return Some(pattern.clone()); }
+        }
+        let pattern: std::rc::Rc<str> = system_short_date().into();
+        *cache = Some((std::time::Instant::now(), pattern.clone()));
+        Some(pattern)
+    })
 }
 
 #[cfg(windows)]
@@ -583,16 +667,18 @@ fn system_short_date() -> String {
 /// 格式代码里指定的文字颜色（[Red] / [Color3] 这类）；没有就返回 None
 pub fn format_color(v: &crate::model::Value, fmt: &str) -> Option<[u8; 3]> {
     use crate::model::Value;
-    if fmt.trim().is_empty() {
-        return None;
-    }
-    let sections = split_sections(fmt);
-    let sec = match v {
-        Value::Number(n) if *n < 0.0 && sections.len() >= 2 => &sections[1],
-        Value::Number(n) if *n == 0.0 && sections.len() >= 3 => &sections[2],
-        Value::Text(_) if sections.len() >= 4 => &sections[3],
-        _ => &sections[0],
+    if !fmt.contains('[') { return None; }
+    let sections = format_sections(fmt);
+    let idx = match v {
+        Value::Number(n) if *n < 0.0 && sections.len() >= 2 => 1,
+        Value::Number(n) if *n == 0.0 && sections.len() >= 3 => 2,
+        Value::Text(_) if sections.len() >= 4 => 3,
+        _ => 0,
     };
+    sections[idx].color
+}
+
+fn section_color(sec: &str) -> Option<[u8; 3]> {
     let palette = [
         [0, 0, 0],
         [255, 255, 255],
@@ -790,32 +876,12 @@ fn render_section(val: f64, sec: &str) -> String {
         }
     }
 
-    // 找到数字占位段（0 # ? , .），前后当字面量
-    let chars: Vec<char> = sec.chars().collect();
-    let is_ph = |c: char| matches!(c, '0' | '#' | '?' | ',' | '.');
-    let start = chars.iter().position(|c| matches!(c, '0' | '#' | '?'));
-    let Some(start) = start else {
-        // 没有数字占位：整段是字面量（会计零值段就是 "-"）
-        let lit = render_literals(sec);
-        if lit.is_empty() {
-            return general_number(val);
-        }
-        return lit;
-    };
-    let mut end = start;
-    while end < chars.len() && is_ph(chars[end]) {
-        end += 1;
+    if let Some(pattern) = NumberSection::from_numeric_pattern(sec) {
+        pattern.render(val)
+    } else {
+        let literal = render_literals(sec);
+        if literal.is_empty() { general_number(val) } else { literal }
     }
-    let prefix: String = chars[..start].iter().collect();
-    let pattern: String = chars[start..end].iter().collect();
-    let suffix: String = chars[end..].iter().collect();
-    let body = render_number(v, &pattern);
-    format!(
-        "{}{}{}",
-        render_literals(&prefix),
-        body,
-        render_literals(&suffix)
-    )
 }
 
 fn general_number(v: f64) -> String {

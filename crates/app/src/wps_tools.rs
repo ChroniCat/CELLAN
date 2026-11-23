@@ -443,7 +443,7 @@ impl SheetApp {
                             c,
                             Cell {
                                 value: Value::Empty,
-                                formula: Some(formula.into_boxed_str()),
+                                formula: Some(formula.into()),
                             },
                         );
                     }
@@ -473,7 +473,7 @@ impl SheetApp {
                         target_c,
                         Cell {
                             value: Value::Empty,
-                            formula: Some(formula.into_boxed_str()),
+                            formula: Some(formula.into()),
                         },
                     );
                     self.txn_end(func, txn);
@@ -614,7 +614,7 @@ impl SheetApp {
                 if let Some(mut nc) = new_cell {
                     if let Some(f) = &nc.formula {
                         let nf = formulas.translate(f, dr, dc);
-                        nc.formula = Some(nf.into_boxed_str());
+                        nc.formula = Some(nf.into());
                         nc.value = Value::Empty;
                     }
                     app.wb.sheet_mut(app.sheet_idx).set(tr, tc, nc);

@@ -245,28 +245,72 @@ pub struct Applied {
     pub merge_conflict: bool,
 }
 
+const HISTORY_PAYLOAD_BUDGET: usize = 256 * 1024 * 1024;
+
 static NEXT_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn next_entry() -> u64 {
-    NEXT_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+#[derive(Clone, Copy)]
+struct EntryStamp {
+    id: u64,
+    payload_bytes: usize,
 }
 
+fn next_entry(payload_bytes: usize) -> EntryStamp {
+    EntryStamp { id: NEXT_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed), payload_bytes }
+}
+
+fn cell_heap_bytes(cell: &Cell) -> usize {
+    cell.formula.as_deref().map_or(0, str::len) + match &cell.value {
+        crate::Value::Text(text) => text.len(),
+        _ => 0,
+    }
+}
+
+impl Action {
+    fn payload_bytes(&self) -> usize {
+        let mut bytes = self.deltas.capacity() * std::mem::size_of::<CellDelta>()
+            + self.deltas.iter().map(|d| cell_heap_bytes(&d.before) + cell_heap_bytes(&d.after)).sum::<usize>();
+        for snap in [&self.snap_before, &self.snap_after].into_iter().flatten() {
+            bytes += std::mem::size_of_val(snap.cells.as_slice()) + std::mem::size_of_val(snap.merges.as_slice())
+                + snap.cells.iter().map(|(_, _, cell, _)| cell_heap_bytes(cell)).sum::<usize>();
+        }
+        if let Some(edit) = &self.merges {
+            bytes += edit.sheets.iter().map(|s| std::mem::size_of_val(s.added.as_slice())
+                + std::mem::size_of_val(s.removed.as_slice())).sum::<usize>();
+        }
+        if let Some(edit) = &self.pictures {
+            bytes += edit.before.iter().chain(&edit.after).map(|p|
+                std::mem::size_of_val(p) + p.data.as_ref().map_or(0, |data| data.len())).sum::<usize>();
+        }
+        if let Some(edit) = &self.shapes {
+            bytes += edit.before.iter().chain(&edit.after).map(|shape|
+                std::mem::size_of_val(shape) + shape.text.len() + shape.name.len()).sum::<usize>();
+        }
+        bytes
+    }
+}
+
+
 enum Entry {
-    Cells(u64, Action),
-    Structure(u64, StructureAction),
-    SheetTab(u64, SheetTabAction),
+    Cells(EntryStamp, Action),
+    NumericSort(EntryStamp, NumericSortAction),
+    Structure(EntryStamp, StructureAction),
+    SheetTab(EntryStamp, SheetTabAction),
 }
 
 impl Entry {
-    fn id(&self) -> u64 {
-        match self { Self::Cells(id, _) | Self::Structure(id, _) | Self::SheetTab(id, _) => *id }
+    fn id(&self) -> u64 { self.stamp().id }
+
+    fn stamp(&self) -> EntryStamp {
+        match self { Self::Cells(s, _) | Self::NumericSort(s, _) | Self::Structure(s, _) | Self::SheetTab(s, _) => *s }
     }
 
-    fn simple_deltas(&self) -> Option<&[CellDelta]> {
+    fn simple_cells(&self) -> Option<Box<dyn Iterator<Item = (usize, u32, u32)> + '_>> {
         match self {
             Self::Cells(_, a) if a.snap_before.is_none() && a.snap_after.is_none()
                 && a.merges.is_none() && a.shapes.is_none() && a.pictures.is_none()
-                && a.refresh_sizes.is_none() => Some(&a.deltas),
+                && a.refresh_sizes.is_none() => Some(Box::new(a.deltas.iter().map(|d| (d.sheet, d.row, d.col)))),
+            Self::NumericSort(_, a) => Some(Box::new(a.sort.deltas().map(|d| (d.sheet, d.row, d.col)))),
             _ => None,
         }
     }
@@ -274,6 +318,7 @@ impl Entry {
     fn label(&self) -> &str {
         match self {
             Self::Cells(_, a) => &a.label,
+            Self::NumericSort(_, a) => &a.label,
             Self::Structure(_, a) => &a.label,
             Self::SheetTab(_, a) => &a.label,
         }
@@ -281,6 +326,7 @@ impl Entry {
     fn by_site(&self) -> u32 {
         match self {
             Self::Cells(_, a) => a.by_site,
+            Self::NumericSort(_, a) => a.by_site,
             Self::Structure(_, a) => a.by_site,
             Self::SheetTab(_, a) => a.by_site,
         }
@@ -294,6 +340,40 @@ struct SheetTabAction {
     previous_focus: (usize, u32, u32),
     change: SheetTabChange,
     by_site: u32,
+}
+
+struct NumericSortAction {
+    sort: crate::data_tools::NumericSort,
+    label: String,
+    focus: (usize, u32, u32),
+    by_site: u32,
+}
+
+impl NumericSortAction {
+    fn apply(&self, sheets: &mut [Sheet], redo: bool, mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Applied {
+        let mut applied = Applied {
+            touched: Vec::new(), style_changes: Vec::new(), label: self.label.clone(), focus: self.focus,
+            skipped: 0, structural: false, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false,
+        };
+        if let Some(sheet) = sheets.get_mut(self.sort.sheet) {
+            let mut apply = |d: CellDelta| {
+                if !guard(d.sheet, d.row, d.col, sheet.get(d.row, d.col).unwrap_or(&Cell::default())) {
+                    applied.skipped += 1;
+                    return;
+                }
+                sheet.set(d.row, d.col, if redo { d.after } else { d.before });
+                let style = if redo { d.after_style } else { d.before_style };
+                if d.before_style != d.after_style && sheet.style_of(d.row, d.col) != style {
+                    sheet.set_style(d.row, d.col, style);
+                    applied.style_changes.push((d.sheet, d.row, d.col));
+                }
+                applied.touched.push((d.sheet, d.row, d.col));
+            };
+            if redo { self.sort.deltas().for_each(&mut apply); }
+            else { self.sort.deltas().rev().for_each(apply); }
+        }
+        applied
+    }
 }
 
 enum SheetTabChange {
@@ -561,13 +641,25 @@ impl UndoStack {
         if action.by_site == 0 {
             action.by_site = self.site;
         }
-        self.done.push(Entry::Cells(next_entry(), action));
+        self.done.push(Entry::Cells(next_entry(action.payload_bytes()), action));
         // 新动作让「重做」失效
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
+    /// Keep the newest operation undoable even when one very large edit exceeds the budget.
+    /// Shared pages are charged at their full allocation so repeated large structural edits
+    /// cannot keep hundreds of old workbook generations alive.
+    fn trim_history(&mut self, budget: usize) {
         self.undone.clear();
         let limit = if self.limit == 0 { 200 } else { self.limit };
-        if self.done.len() > limit {
-            self.done.remove(0);
+        let mut keep = 0;
+        let mut bytes = 0usize;
+        for entry in self.done.iter().rev().take(limit) {
+            bytes = bytes.saturating_add(entry.stamp().payload_bytes);
+            if keep > 0 && bytes > budget { break; }
+            keep += 1;
         }
+        self.done.drain(..self.done.len() - keep);
     }
 
     pub fn can_undo(&self) -> bool {
@@ -618,14 +710,14 @@ impl UndoStack {
                 if self.site != 0 && entry.by_site() != 0 && self.site != entry.by_site() {
                     return false;
                 }
-                if has_later_edit && (structural_barrier || entry.simple_deltas().is_none_or(|ds|
-                    ds.iter().any(|d| later_cells.contains(&(d.sheet, d.row, d.col))))) {
+                if has_later_edit && (structural_barrier || entry.simple_cells().is_none_or(|mut keys|
+                    keys.any(|key| later_cells.contains(&key)))) {
                     return false;
                 }
             } else {
                 has_later_edit = true;
-                match entry.simple_deltas() {
-                    Some(ds) => later_cells.extend(ds.iter().map(|d| (d.sheet, d.row, d.col))),
+                match entry.simple_cells() {
+                    Some(keys) => later_cells.extend(keys),
                     None => structural_barrier = true,
                 }
             }
@@ -667,19 +759,30 @@ impl UndoStack {
 
     fn push_sheet_tab(&mut self, index: usize, identity: u64, previous_focus: (usize, u32, u32),
                       label: &str, change: SheetTabChange) {
-        self.done.push(Entry::SheetTab(next_entry(), SheetTabAction {
+        let bytes = match &change {
+            SheetTabChange::Rename { before, after, references } => before.len() + after.len() + references.payload_bytes(),
+            SheetTabChange::Append { .. } => 0,
+        };
+        self.done.push(Entry::SheetTab(next_entry(bytes), SheetTabAction {
             label: label.into(), index, identity, previous_focus, change, by_site: self.site,
         }));
-        self.undone.clear();
-        let limit = if self.limit == 0 { 200 } else { self.limit };
-        if self.done.len() > limit { self.done.remove(0); }
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
     pub fn push_structure(&mut self, label: impl Into<String>, before: StructureSnapshot, after: StructureSnapshot, focus: (usize, u32, u32)) {
-        self.done.push(Entry::Structure(next_entry(), StructureAction { label: label.into(), before, after, focus, by_site: self.site }));
-        self.undone.clear();
-        let limit = if self.limit == 0 { 200 } else { self.limit };
-        if self.done.len() > limit { self.done.remove(0); }
+        let bytes = before.target.allocated_bytes() + after.target.allocated_bytes()
+            + before.foreign.iter().chain(&after.foreign).map(|f| std::mem::size_of_val(f.cells.as_slice())
+                + f.cells.iter().map(|(_, c)| cell_heap_bytes(c)).sum::<usize>()).sum::<usize>();
+        self.done.push(Entry::Structure(next_entry(bytes), StructureAction { label: label.into(), before, after, focus, by_site: self.site }));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
+    pub fn push_numeric_sort(&mut self, label: &str, sort: crate::data_tools::NumericSort, focus: (usize, u32, u32)) {
+        let stamp = next_entry(sort.bytes());
+        self.done.push(Entry::NumericSort(stamp, NumericSortAction {
+            sort, label: label.into(), focus, by_site: self.site,
+        }));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
     pub fn undo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
@@ -727,6 +830,11 @@ impl UndoStack {
             .unwrap_or(false)
         {
             return None;
+        }
+        if let Some(Entry::NumericSort(_, action)) = self.done.last() {
+            let applied = action.apply(sheets, false, guard);
+            self.undone.push(self.done.pop()?);
+            return Some(applied);
         }
         let Entry::Cells(id, action) = self.done.pop()? else { unreachable!() };
         let mut touched = Vec::new();
@@ -843,6 +951,11 @@ impl UndoStack {
             .unwrap_or(false)
         {
             return None;
+        }
+        if let Some(Entry::NumericSort(_, action)) = self.undone.last() {
+            let applied = action.apply(sheets, true, guard);
+            self.done.push(self.undone.pop()?);
+            return Some(applied);
         }
         let Entry::Cells(id, action) = self.undone.pop()? else { unreachable!() };
         let mut touched = Vec::new();
@@ -1040,6 +1153,24 @@ mod tests {
         assert!(redone.style_changes.is_empty());
         assert_eq!(wb.sheets[0].style_of(0, 0), 2);
         assert_eq!(wb.sheets[0].explicit_style_of(0, 0), None);
+    }
+
+    #[test]
+    fn history_budget_evicts_old_edits_and_keeps_the_latest_undoable() {
+        let mut wb = wb();
+        let mut history = UndoStack::new();
+        for value in [2.0, 3.0, 4.0] {
+            history.push(edit(&mut wb, 0, 0, value));
+        }
+        let cost = history.done.last().unwrap().stamp().payload_bytes;
+        history.trim_history(cost * 2);
+        assert_eq!(history.done.len(), 2);
+        history.trim_history(0);
+        assert_eq!(history.done.len(), 1);
+        history.undo(&mut wb.sheets, |_, _, _, _| true).unwrap();
+        assert_eq!(wb.sheets[0].value(0, 0), Value::Number(3.0));
+        history.redo(&mut wb.sheets, |_, _, _, _| true).unwrap();
+        assert_eq!(wb.sheets[0].value(0, 0), Value::Number(4.0));
     }
 
     #[test]

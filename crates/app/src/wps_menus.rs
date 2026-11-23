@@ -982,7 +982,7 @@ impl SheetApp {
                         if let Some(f) = &src.formula {
                             cell.formula = Some(
                                 shift_formula_coords(f, &coords, &src_sheet_name, i, j, r, c, &target_sheet_name)
-                                    .into_boxed_str(),
+                                    .into(),
                             );
                         } else {
                             cell.formula = None;
@@ -994,7 +994,7 @@ impl SheetApp {
                         if let Some(f) = &src.formula {
                             cell.formula = Some(
                                 shift_formula_coords(f, &coords, &src_sheet_name, i, j, r, c, &target_sheet_name)
-                                    .into_boxed_str(),
+                                    .into(),
                             );
                         } else {
                             cell.formula = None;
@@ -1013,7 +1013,7 @@ impl SheetApp {
                         if let Some(f) = &src.formula {
                             cell.formula = Some(
                                 shift_formula_coords(f, &coords, &src_sheet_name, i, j, r, c, &target_sheet_name)
-                                    .into_boxed_str(),
+                                    .into(),
                             );
                         }
                         write_cell = true;
@@ -1026,7 +1026,7 @@ impl SheetApp {
                         if let Some(f) = &src.formula {
                             cell.formula = Some(
                                 shift_formula_coords(f, &coords, &src_sheet_name, i, j, r, c, &target_sheet_name)
-                                    .into_boxed_str(),
+                                    .into(),
                             );
                         }
                         write_cell = true;
@@ -1149,7 +1149,7 @@ impl SheetApp {
                     dc,
                     Cell {
                         value: src_val,
-                        formula: Some(target_ref.into_boxed_str()),
+                        formula: Some(target_ref.into()),
                     },
                 );
                 touched.push((si, dr, dc));
@@ -1276,7 +1276,7 @@ impl SheetApp {
                     if let Some(ref f) = s.formula {
                         cell.formula = Some(
                             sheetcore::refs::translate(f, r as i64 - r2 as i64, 0, &sheet_name)
-                                .into_boxed_str(),
+                                .into(),
                         );
                     }
                     self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
@@ -1326,7 +1326,7 @@ impl SheetApp {
                     if let Some(ref f) = s.formula {
                         cell.formula = Some(
                             sheetcore::refs::translate(f, 0, c as i64 - c2 as i64, &sheet_name)
-                                .into_boxed_str(),
+                                .into(),
                         );
                     }
                     self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);

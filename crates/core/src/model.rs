@@ -74,15 +74,45 @@ impl Value {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Cell {
     pub value: Value,
-    /// 公式原文（以 = 开头）。用 Box<str> 而不是 String：省 8 字节/格，
-    /// 而且公式一旦写入就不再变长，不需要容量字段
-    pub formula: Option<Box<str>>,
+    /// Immutable source, shared across calculation snapshots, undo and page-column copies.
+    pub formula: Option<std::sync::Arc<str>>,
 }
 
 impl Cell {
     pub fn is_blank(&self) -> bool {
         self.value.is_empty() && self.formula.is_none()
     }
+}
+
+/// Rarely edited per-cell metadata shared by save, calculation and undo snapshots.
+#[derive(Clone, Debug)]
+pub struct CellMetadata<K, V>(std::sync::Arc<HashMap<K, V>>);
+
+impl<K, V> Default for CellMetadata<K, V> {
+    fn default() -> Self { Self(Default::default()) }
+}
+
+impl<K, V> From<HashMap<K, V>> for CellMetadata<K, V> {
+    fn from(map: HashMap<K, V>) -> Self { Self(std::sync::Arc::new(map)) }
+}
+
+impl<K, V> std::ops::Deref for CellMetadata<K, V> {
+    type Target = HashMap<K, V>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl<K: Clone, V: Clone> std::ops::DerefMut for CellMetadata<K, V> {
+    fn deref_mut(&mut self) -> &mut Self::Target { std::sync::Arc::make_mut(&mut self.0) }
+}
+
+impl<K: Clone, V: Clone> IntoIterator for CellMetadata<K, V> {
+    type Item = (K, V);
+    type IntoIter = std::collections::hash_map::IntoIter<K, V>;
+    fn into_iter(self) -> Self::IntoIter { std::sync::Arc::unwrap_or_clone(self.0).into_iter() }
+}
+
+impl<K: Eq + std::hash::Hash, V: PartialEq> PartialEq for CellMetadata<K, V> {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0 }
 }
 
 #[derive(Clone, Debug)]
@@ -153,7 +183,7 @@ pub struct Sheet {
     /// 数据验证被改过
     pub dv_dirty: bool,
     /// 批注
-    pub notes: HashMap<CellRef, crate::notes::Note>,
+    pub notes: CellMetadata<CellRef, crate::notes::Note>,
     /// 批注被改过
     pub notes_dirty: bool,
     /// 冻结窗格：(冻结行数, 冻结列数)
@@ -208,11 +238,11 @@ pub struct Sheet {
     /// 保护状态被改过
     pub protect_dirty: bool,
     /// 单元格富文本（有记录时优先于纯文本绘制）
-    pub rich: std::collections::HashMap<(u32, u32), Vec<crate::richtext::RichRun>>,
+    pub rich: CellMetadata<(u32, u32), Vec<crate::richtext::RichRun>>,
     /// 富文本被改过
     pub rich_dirty: bool,
     /// 单元格超链接
-    pub hyperlinks: std::collections::HashMap<(u32, u32), crate::hyperlinks::Hyperlink>,
+    pub hyperlinks: CellMetadata<(u32, u32), crate::hyperlinks::Hyperlink>,
     pub hyperlinks_dirty: bool,
     /// 单元格迷你图（Excel 的 x14 sparklineGroups）
     pub sparklines: Vec<crate::sparkline::Sparkline>,
@@ -261,7 +291,7 @@ impl Sheet {
             cf_dirty: false,
             dv: Vec::new(),
             dv_dirty: false,
-            notes: HashMap::new(),
+            notes: Default::default(),
             notes_dirty: false,
             freeze: None,
             freeze_dirty: false,
@@ -290,9 +320,9 @@ impl Sheet {
             tables_dirty: false,
             protection: None,
             protect_dirty: false,
-            rich: std::collections::HashMap::new(),
+            rich: Default::default(),
             rich_dirty: false,
-            hyperlinks: std::collections::HashMap::new(),
+            hyperlinks: Default::default(),
             hyperlinks_dirty: false,
             sparklines: Vec::new(),
             sparklines_dirty: false,
@@ -461,6 +491,20 @@ impl Sheet {
         snapshot.styles = self.styles.clone();
         snapshot.row_styles = self.row_styles.clone();
         snapshot.col_styles = self.col_styles.clone();
+        snapshot
+    }
+
+    /// Inputs used by selection statistics. Cell contents share their COW column
+    /// storage with the live sheet, and unrelated workbook metadata stays there.
+    pub fn selection_stats_snapshot(&self) -> Self {
+        let mut snapshot = Self::new(&self.name);
+        snapshot.cells = self.cells.clone();
+        snapshot.rows = self.rows.clone();
+        snapshot.hidden_rows = self.hidden_rows.clone();
+        snapshot.hidden_rows_user = self.hidden_rows_user.clone();
+        if self.hidden_rows.is_empty() {
+            snapshot.filter = self.filter.clone();
+        }
         snapshot
     }
 

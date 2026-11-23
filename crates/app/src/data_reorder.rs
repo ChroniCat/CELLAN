@@ -5,6 +5,36 @@ use super::SheetApp;
 use sheetcore::{Sheet, data_tools, sort_filter};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+#[test]
+fn dense_numeric_sort_keeps_revision_count_and_replays_through_app() {
+    let env = crate::test_env::TestEnv::new("dense_numeric_sort_history");
+    let mut app = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+    app.wb.path = Some(env.path("numbers.xlsx"));
+    let sheet = &mut app.wb.sheets[0];
+    for row in 0..1000 {
+        for col in 0..101 {
+            sheet.set(row, col, sheetcore::Cell {
+                value: sheetcore::Value::Number((1000 - row + col) as f64), formula: None,
+            });
+        }
+    }
+    app.sort_region((0, 0, 999, 100), 0, true);
+    let start = std::time::Instant::now();
+    while app.tasks.reorder.is_some() {
+        app.poll_reorder();
+        assert!(start.elapsed().as_secs() < 30);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let log = app.rev.last().unwrap();
+    assert_eq!(log.cells.len(), sheetcore::revision::MAX_CELLS);
+    assert!(log.note.contains("101000"));
+    assert_eq!(app.wb.sheets[0].value(0, 0), sheetcore::Value::Number(1.0));
+    assert!(app.apply_undo(false));
+    assert_eq!(app.wb.sheets[0].value(0, 0), sheetcore::Value::Number(1000.0));
+    assert!(app.apply_undo(true));
+    assert_eq!(app.wb.sheets[0].value(0, 0), sheetcore::Value::Number(1.0));
+}
+
 type Rect = (u32, u32, u32, u32);
 
 pub(super) enum Operation {
@@ -98,7 +128,16 @@ pub(crate) struct Pending {
     doc_uid: u64,
     rect: Rect,
     operation: std::sync::Arc<Operation>,
-    rx: Receiver<Result<(Sheet, Sheet, data_tools::RowChanges), String>>,
+    rx: Receiver<Result<(Sheet, Sheet, PreparedChanges), String>>,
+}
+
+enum PreparedChanges {
+    Cells(data_tools::RowChanges),
+    Numbers {
+        order: data_tools::NumericSort,
+        total: usize,
+        sample: Vec<sheetcore::undo::CellDelta>,
+    },
 }
 
 impl SheetApp {
@@ -178,17 +217,35 @@ impl SheetApp {
             return;
         }
         let snapshot = sheet.reorder_snapshot();
+        let offline = self.net.is_none();
         let index = self.sheet_idx;
         self.status = format!("正在计算{}…", operation.label());
         let (tx, rx) = mpsc::channel();
         let op = std::sync::Arc::new(operation);
         let worker_op = op.clone();
         std::thread::spawn(move || {
-            let result = worker_op.plan(&snapshot, index, rect).map(|changes| {
+            let result = (|| {
                 let mut prepared = snapshot.clone();
+                if offline && let Operation::Rows { col, asc } = worker_op.as_ref() {
+                    let (r1, c1, r2, c2) = rect;
+                    let header = sort_filter::has_header(&snapshot, r1, c1, r2, c2);
+                    let data = (r1 + u32::from(header), c1, r2, c2);
+                    if let Some(order) = data_tools::NumericSort::plan(&snapshot, index, data, *col, *asc)? {
+                        let mut total = 0;
+                        let mut sample = Vec::new();
+                        for d in order.deltas() {
+                            if d.before != d.after { prepared.set(d.row, d.col, d.after.clone()); }
+                            if d.before_style != d.after_style { prepared.set_style(d.row, d.col, d.after_style); }
+                            if total < sheetcore::revision::MAX_CELLS { sample.push(d); }
+                            total += 1;
+                        }
+                        return Ok((snapshot, prepared, PreparedChanges::Numbers { order, total, sample }));
+                    }
+                }
+                let changes = worker_op.plan(&snapshot, index, rect)?;
                 changes.apply(&mut prepared);
-                (snapshot, prepared, changes)
-            });
+                Ok((snapshot, prepared, PreparedChanges::Cells(changes)))
+            })();
             let _ = tx.send(result);
         });
         self.tasks.reorder = Some(Pending {
@@ -231,7 +288,32 @@ impl SheetApp {
             return;
         }
         if self.preflight_reorder(pending.rect, &pending.operation) {
-            self.finish_reorder(&pending.operation, Ok(changes), Some(&mut prepared));
+            match changes {
+                PreparedChanges::Cells(changes) => {
+                    self.finish_reorder(&pending.operation, Ok(changes), Some(&mut prepared));
+                }
+                PreparedChanges::Numbers { order, total, sample } => {
+                    let operation = &pending.operation;
+                    self.status = operation.completed(order.moved_rows());
+                    if total == 0 { return; }
+                    self.wb.sheet_mut(pending.sheet).take_row_changes(&mut prepared);
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                    self.recalc_all_and_deps_adaptive();
+                    // A room may have been joined while the offline plan was in flight.
+                    if self.net.is_some() {
+                        let mut rows = order.deltas();
+                        loop {
+                            let chunk: Vec<_> = rows.by_ref().take(sheetcore::sync::LIVE_OP_BATCH).collect();
+                            if chunk.is_empty() { break; }
+                            self.broadcast_sheet_deltas(pending.sheet, &chunk);
+                        }
+                    }
+                    self.record_revision_sample(operation.label(), &sample, total);
+                    self.undo.push_numeric_sort(operation.label(), order, (pending.sheet, self.sel.0, self.sel.1));
+                    self.tasks.last_edit = Some(std::time::Instant::now());
+                }
+            }
         }
     }
 

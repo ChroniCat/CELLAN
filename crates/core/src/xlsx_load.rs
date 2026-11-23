@@ -49,26 +49,55 @@ pub(super) struct Header {
     pub styles: Vec<calamine::Style>,
 }
 
+#[derive(Default)]
+pub(super) struct WorkbookMetadata {
+    pub xml: String,
+    pub targets: HashMap<String, String>,
+    pub header: Option<Header>,
+}
+
+pub(super) fn workbook_metadata(src: &mut zip::ZipArchive<File>) -> Result<WorkbookMetadata> {
+    use std::io::Read;
+    let read = |zip: &mut zip::ZipArchive<File>, name: &str| -> Result<Option<Vec<u8>>> {
+        let Some(index) = zip.index_for_name(name) else { return Ok(None) };
+        let mut bytes = Vec::new();
+        zip.by_index(index)?.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    };
+    let Some(bytes) = read(src, "xl/workbook.xml")? else {
+        return Ok(WorkbookMetadata::default());
+    };
+    let xml = String::from_utf8(bytes).unwrap_or_default();
+    let rels = read(src, "xl/_rels/workbook.xml.rels")?;
+    let targets = crate::patch::sheet_targets_xml(
+        Some(&xml), rels.as_deref().and_then(|b| std::str::from_utf8(b).ok()),
+    );
+    let header = header(src, &targets, &xml, rels.as_deref())?;
+    Ok(WorkbookMetadata { xml, targets, header })
+}
+
 /// Calamine's style converter also reads the entire SST when opening a book.
 /// Give it just the original workbook metadata and an empty worksheet. The real
 /// sheets and the SST are consumed exclusively by the shared loader below.
-pub(super) fn header(path: &Path, targets: &HashMap<String, String>) -> Result<Option<Header>> {
+fn header(
+    src: &mut zip::ZipArchive<File>,
+    targets: &HashMap<String, String>,
+    workbook: &str,
+    rels: Option<&[u8]>,
+) -> Result<Option<Header>> {
     if targets.is_empty() {
-        return Ok(None);
-    }
-    let mut src = zip::ZipArchive::new(File::open(path)?)?;
-    if src.index_for_name("xl/workbook.xml").is_none() {
         return Ok(None);
     }
     let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let opts =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for key in [
-        "_rels/.rels",
-        "xl/workbook.xml",
-        "xl/_rels/workbook.xml.rels",
-        "xl/styles.xml",
-    ] {
+    out.start_file("xl/workbook.xml", opts)?;
+    out.write_all(workbook.as_bytes())?;
+    if let Some(xml) = rels {
+        out.start_file("xl/_rels/workbook.xml.rels", opts)?;
+        out.write_all(xml)?;
+    }
+    for key in ["_rels/.rels", "xl/styles.xml"] {
         if src.index_for_name(key).is_some() {
             let mut entry = src.by_name(key)?;
             out.start_file(key, opts)?;
@@ -719,7 +748,7 @@ pub(super) fn worksheets(
                             loaded.sheet.textboxes =
                                 crate::textbox::load_from_sheet(path, part, &shell);
                             loaded.sheet.hyperlinks =
-                                crate::hyperlinks::load_sheet(path, part, &shell);
+                                crate::hyperlinks::load_sheet(path, part, &shell).into();
                             if shell.contains("sparkline") {
                                 loaded.sheet.sparklines = crate::sparkline::parse_sheet(&shell);
                                 loaded.sheet.sparklines.sort_by_key(|s| (s.c, s.r));

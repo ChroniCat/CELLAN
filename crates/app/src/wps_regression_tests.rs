@@ -1406,7 +1406,7 @@ fn unmerge_disabled_when_unmerged_and_zero_lag_noop() {
                 0,
                 sheetcore::model::Cell {
                     value: sheetcore::model::Value::Number(r as f64),
-                    formula: Some(format!("=A{}+1", r).into_boxed_str()),
+                    formula: Some(format!("=A{}+1", r).into()),
                 },
             );
         }

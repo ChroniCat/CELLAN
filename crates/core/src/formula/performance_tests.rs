@@ -104,6 +104,61 @@ fn conditional_aggregates_reuse_only_matching_ranges_and_criteria() {
 }
 
 #[test]
+fn grouped_conditional_aggregates_match_the_scan_across_distinct_keys() {
+    let mut wb = Workbook::new_blank();
+    for r in 0..600 {
+        number(&mut wb, r, 0, (r % 7) as f64);
+        wb.sheets[0].set(r, 1, Cell {
+            value: Value::Text((if r % 2 == 0 { "March" } else { "APRIL" }).into()),
+            formula: None,
+        });
+        number(&mut wb, r, 2, r as f64);
+    }
+    let mut calc = Calc::new(&wb);
+    for k in 0..7 {
+        for name in ["SUMIFS", "COUNTIFS"] {
+            let amounts = if name == "SUMIFS" { "C1:C600," } else { "" };
+            let src = format!("{name}({amounts}A1:A600,{k},B1:B600,\"mArCh\")");
+            let Node::Func(_, nodes) = parse(&src).unwrap() else { unreachable!() };
+            let slow = calc.call_generic(name, &nodes, 0);
+            assert_eq!(calc.eval_node(&parse(&src).unwrap(), 0), slow, "{src}");
+        }
+    }
+    assert!(calc.grouped_criteria.iter().all(|g| g.is_built()));
+    drop(calc);
+    // Fractional numeric data within epsilon of 1 must retain scan equality semantics.
+    number(&mut wb, 0, 0, 1.0 + f64::EPSILON);
+    let mut calc = Calc::new(&wb);
+    for k in [0, 1, 2] {
+        let src = format!("COUNTIFS(A1:A600,{k})");
+        let Node::Func(name, nodes) = parse(&src).unwrap() else { unreachable!() };
+        let slow = calc.call_generic(&name, &nodes, 0);
+        assert_eq!(calc.eval_node(&parse(&src).unwrap(), 0), slow);
+    }
+    assert!(!calc.grouped_criteria[1].is_built());
+}
+
+#[test]
+fn alternating_single_criterion_ranges_keep_indexes_and_sum_in_source_order() {
+    let mut wb = Workbook::new_blank();
+    for r in 0..480 {
+        number(&mut wb, r, 0, (r % 9) as f64);
+        number(&mut wb, r, 1, (r % 11) as f64);
+        number(&mut wb, r, 2, r as f64 + 0.5);
+    }
+    let mut calc = Calc::new(&wb);
+    for k in 0..8 {
+        for (column, modulus) in [("A", 9), ("B", 11)] {
+            let rows: Vec<_> = (0..480).filter(|r| r % modulus == k).collect();
+            let sum: f64 = rows.iter().map(|&r| r as f64 + 0.5).sum();
+            let range = format!("{column}1:{column}480");
+            assert_eq!(calc.eval_node(&parse(&format!("SUMIF({range},{k},C1:C480)")).unwrap(), 0), FValue::number(sum));
+            assert_eq!(calc.eval_node(&parse(&format!("COUNTIF({range},{k})")).unwrap(), 0), FValue::number(rows.len() as f64));
+        }
+    }
+}
+
+#[test]
 fn approximate_lookup_uses_last_duplicate_and_match_default_depends_on_function() {
     let mut wb = Workbook::new_blank();
     for (r, v) in [1.0, 3.0, 3.0, 7.0].into_iter().enumerate() {
@@ -254,6 +309,76 @@ fn clearing_a_spill_obstruction_recalculates_evaluated_and_loaded_anchors() {
 }
 
 #[test]
+fn runtime_references_recalculate_changed_target_and_dependents_only() {
+    let mut wb = Workbook::new_blank();
+    number(&mut wb, 0, 0, 3.0);
+    formula(&mut wb, 0, 1, "=A1*2");
+    formula(&mut wb, 0, 2, "=INDIRECT(\"B1\")+OFFSET(A1,0,1)");
+    formula(&mut wb, 0, 3, "=C1+1");
+    formula(&mut wb, 0, 4, "=42");
+    recalc_all_force(&mut wb);
+    let deps = deps::Deps::build(&wb);
+    assert!(!deps.requires_full_recalc());
+    number(&mut wb, 0, 0, 8.0);
+    assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 0, 0)]), 3);
+    assert_eq!(wb.sheets[0].value(0, 3), Value::Number(33.0));
+    assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 9, 9)]), 2);
+}
+
+#[test]
+fn unrelated_edit_preserves_materialized_spill_and_recalculates_its_reader() {
+    for rows in [1, 3] {
+        let mut wb = Workbook::new_blank();
+        number(&mut wb, 0, 0, rows as f64);
+        formula(&mut wb, 0, 1, "=SEQUENCE(A1,1)");
+        formula(&mut wb, 0, 2, "=D1+SUM(B1#)");
+        formula(&mut wb, 0, 4, "=B2+1");
+        recalc_all_force(&mut wb);
+        let deps = deps::Deps::build(&wb);
+        assert!(!deps.requires_full_recalc());
+        number(&mut wb, 0, 3, 10.0);
+        assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 0, 3)]), 1);
+        assert_eq!(wb.sheets[0].value(0, 2), Value::Number(10.0 + (rows * (rows + 1) / 2) as f64));
+        number(&mut wb, 0, 0, 2.0);
+        recalc_dirty(&mut wb, &deps, &[(0, 0, 0)]);
+        assert_eq!(wb.sheets[0].value(0, 4), Value::Number(3.0));
+        assert_eq!(wb.sheets[0].value(0, 2), Value::Number(13.0));
+    }
+}
+
+#[test]
+fn empty_operand_outside_used_bounds_does_not_create_a_spill() {
+    let mut wb = Workbook::new_blank();
+    for (row, text) in ["=-B2:B1048576", "=B2:B1048576+1", "=B2:B1048576%"].into_iter().enumerate() {
+        formula(&mut wb, row as u32, 0, text);
+    }
+    recalc_all_force(&mut wb);
+    assert!(wb.sheets[0].spill_shapes.is_empty());
+    for row in 0..3 {
+        assert_eq!(wb.sheets[0].value(row, 0), Value::Error(ErrKind::Value));
+    }
+}
+
+#[test]
+fn filter_visibility_seeds_include_cross_sheet_summary_and_its_dependents() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets.push(crate::Sheet::new("Summary"));
+    number(&mut wb, 0, 0, 2.0);
+    number(&mut wb, 1, 0, 3.0);
+    set_formula(&mut wb.sheets[1], 0, 0, "=SUBTOTAL(9,Sheet1!A1:A2)", FValue::Empty);
+    set_formula(&mut wb.sheets[1], 0, 1, "=A1*2", FValue::Empty);
+    set_formula(&mut wb.sheets[1], 0, 2, "=SUM(A5:A8)", FValue::Empty);
+    recalc_all_force(&mut wb);
+    let deps = deps::Deps::build(&wb);
+    let seeds = deps.visibility_seeds(0).unwrap();
+    assert_eq!(seeds, vec![(1, 0, 0)]);
+    assert!(deps.visibility_seeds(1).unwrap().is_empty());
+    wb.sheets[0].hidden_rows.insert(1);
+    assert_eq!(recalc_dirty(&mut wb, &deps, &seeds), 2);
+    assert_eq!(wb.sheets[1].value(0, 1), Value::Number(4.0));
+}
+
+#[test]
 fn lookup_indexes_keep_first_row_and_first_column_distinct() {
     let mut wb = Workbook::new_blank();
     for (r, c, n) in [
@@ -280,6 +405,21 @@ fn lookup_indexes_keep_first_row_and_first_column_distinct() {
             FValue::number(expected)
         );
     }
+}
+
+#[test]
+fn plain_named_lookup_table_uses_key_column_and_respects_let_shadowing() {
+    let mut wb = Workbook::new_blank();
+    wb.names.push(("TableData".into(), None, "Sheet1!$A$1:$C$300".into()));
+    for row in 0..300 {
+        number(&mut wb, row, 0, row as f64);
+        number(&mut wb, row, 1, 10.0 + row as f64);
+    }
+    let mut calc = Calc::new(&wb);
+    assert_eq!(calc.eval_node(&parse("VLOOKUP(9,TableData,2,0)").unwrap(), 0), FValue::number(19.0));
+    assert_eq!(calc.range_reads(), 300);
+    let shadowed = parse("LET(TableData,{9,85},VLOOKUP(9,TableData,2,0))").unwrap();
+    assert_eq!(calc.eval_node(&shadowed, 0), FValue::number(85.0));
 }
 
 #[test]

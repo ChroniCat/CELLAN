@@ -219,7 +219,7 @@ pub(crate) fn apply_after_save(
         else {
             continue;
         };
-        if !sheet.hyperlinks_dirty && load_sheet(path, part, &xml) == sheet.hyperlinks {
+        if !sheet.hyperlinks_dirty && load_sheet(path, part, &xml) == *sheet.hyperlinks {
             continue;
         }
         let rels_name = rels_part(part);

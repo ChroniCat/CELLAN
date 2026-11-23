@@ -611,9 +611,34 @@ pub struct Peer {
     pub site: u32,
     pub clock: u64,
     /// 每个格子的当前胜出版本
-    pub cells: HashMap<(usize, u32, u32), Op>,
+    pub cells: CellOps,
     /// 已知的其他站点（site → 名字、颜色）
     pub peers: HashMap<u32, (String, u8)>,
+}
+
+/// Discard deleted coordinates and relocate only keys affected by the edit.
+/// Reinsert moved entries after extraction so shifted keys cannot collide with old ones.
+pub fn shift_cell_map<V>(cells: &mut HashMap<(usize, u32, u32), V>, sheet: usize,
+                         op: &crate::structural::Structural, mut relocate: impl FnMut(&mut V, u32, u32)) {
+    let mut moved = Vec::new();
+    for ((_, r, c), mut value) in cells.extract_if(|&(sh, r, c), _|
+        sh == sheet && shift_structural_coord(r, c, op) != Some((r, c))) {
+        if let Some((row, col)) = shift_structural_coord(r, c, op) {
+            relocate(&mut value, row, col);
+            moved.push(((sheet, row, col), value));
+        }
+    }
+    cells.extend(moved);
+}
+
+pub type CellOps = HashMap<(usize, u32, u32), std::sync::Arc<Op>>;
+
+pub fn shift_cell_ops(cells: &mut CellOps, sheet: usize, op: &crate::structural::Structural) {
+    shift_cell_map(cells, sheet, op, |op, row, col| {
+        let cell = std::sync::Arc::make_mut(op);
+        cell.row = row;
+        cell.col = col;
+    });
 }
 
 impl Peer {
@@ -634,7 +659,7 @@ impl Peer {
             ts: 1,
             site: self.site,
         };
-        self.cells.insert((sheet, row, col), op);
+        self.cells.insert((sheet, row, col), op.into());
     }
 
     /// 本地编辑：递增逻辑时钟并返回要广播的操作
@@ -649,7 +674,7 @@ impl Peer {
             ts: self.clock,
             site: self.site,
         };
-        self.cells.insert((sheet, row, col), op.clone());
+        self.cells.insert((sheet, row, col), op.clone().into());
         op
     }
 
@@ -663,7 +688,7 @@ impl Peer {
         match self.cells.get(&key) {
             Some(cur) if !op.newer_than(cur) => false,
             _ => {
-                self.cells.insert(key, op);
+                self.cells.insert(key, op.into());
                 true
             }
         }
@@ -676,7 +701,7 @@ impl Peer {
             Some(op) if !op.is_valid() => {}
             Some(op) => {
                 self.clock = self.clock.max(op.ts);
-                self.cells.insert(key, op);
+                self.cells.insert(key, op.into());
             }
             None => {
                 self.cells.remove(&key);
@@ -686,22 +711,11 @@ impl Peer {
 
     /// 结构性增删行列后同步平移副本状态坐标
     pub fn shift_structural(&mut self, sheet: usize, op: &crate::structural::Structural) {
-        let old = std::mem::take(&mut self.cells);
-        for ((sh, r, c), mut cell_op) in old {
-            if sh == sheet {
-                if let Some((nr, nc)) = shift_structural_coord(r, c, op) {
-                    cell_op.row = nr;
-                    cell_op.col = nc;
-                    self.cells.insert((sh, nr, nc), cell_op);
-                }
-            } else {
-                self.cells.insert((sh, r, c), cell_op);
-            }
-        }
+        shift_cell_ops(&mut self.cells, sheet, op);
     }
 
     pub fn snapshot(&self) -> Vec<Op> {
-        self.cells.values().cloned().collect()
+        self.cells.values().map(|op| op.as_ref().clone()).collect()
     }
 
     pub fn merge_snapshot(&mut self, ops: Vec<Op>) -> Vec<Op> {

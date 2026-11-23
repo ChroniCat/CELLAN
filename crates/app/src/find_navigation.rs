@@ -106,6 +106,12 @@ pub(super) struct Navigation {
     pending: Option<Pending>,
 }
 
+pub(super) struct Replacement {
+    query: Arc<Query>,
+    text: String,
+    replace_formula_results: bool,
+}
+
 impl Drop for Navigation {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
@@ -113,6 +119,47 @@ impl Drop for Navigation {
 }
 
 impl SheetApp {
+    pub(super) fn start_replace_scan(&mut self) {
+        self.find_scan = None;
+        if self.find.find.is_empty() { return; }
+        self.ensure_navigation(true);
+        let Some(nav) = self.find_navigation.as_mut() else { return };
+        nav.pending = None;
+        nav.summary = None;
+        self.find_scan = Some(Replacement {
+            query: Arc::clone(&nav.query),
+            text: self.find.replace.clone(),
+            replace_formula_results: self.find.replace_formula_results,
+        });
+        if nav.receiver.is_some() {
+            self.status = "正在查找可替换的单元格，可点“取消”…".into();
+        } else {
+            self.poll_find_scan();
+        }
+    }
+
+    pub(super) fn poll_find_scan(&mut self) {
+        let Some(scan) = &self.find_scan else { return };
+        if scan.query.document.1 != self.wb_epoch {
+            self.cancel_find_scan();
+            self.status = "文档已切换，已取消扫描".into();
+            return;
+        }
+        if *scan.query != self.navigation_query() || scan.text != self.find.replace
+            || scan.replace_formula_results != self.find.replace_formula_results {
+            self.cancel_find_scan();
+            self.status = "工作簿或替换条件已更改，已取消替换".into();
+            return;
+        }
+        self.finish_navigation_index();
+        let Some(nav) = &self.find_navigation else { self.cancel_find_scan(); return };
+        if nav.receiver.is_none() {
+            let hits = Arc::clone(&nav.hits);
+            self.find_scan = None;
+            self.apply_replace_hits(&hits);
+        }
+    }
+
     fn find_cursor(&self) -> Hit {
         Hit {
             sheet: self.sheet_idx,

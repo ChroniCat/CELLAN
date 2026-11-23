@@ -751,27 +751,21 @@ pub fn import_csv_opts(
     let records = crate::csv::records_strict_q(&text, delim, quote).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
-    let mut grid: Vec<Vec<Cell>> = Vec::with_capacity(records.len());
-    for (ri, rec) in records.iter().enumerate() {
-        let mut row = Vec::with_capacity(rec.len());
-        for (ci, f) in rec.iter().enumerate() {
-            let cell = if header && ri == 0 {
-                Cell { value: Value::Text(f.as_str().into()), formula: None }
-            } else if text_cols.contains(&(ci as u32)) {
-                if f.is_empty() {
-                    Cell::default()
-                } else {
-                    Cell { value: Value::Text(f.as_str().into()), formula: None }
-                }
-            } else {
-                parse_field(f)
-            };
-            row.push(cell);
-        }
-        grid.push(row);
-    }
-    let rows = grid.len() as u32;
-    let cols = grid.iter().map(|r| r.len() as u32).max().unwrap_or(0);
+    let (rows, cols) = import_csv_records(sheet, records, header, text_cols, old, at);
+    Ok((rows, cols, used))
+}
+
+/// Apply fully validated CSV records, including the shorter rows of a refreshed source.
+pub fn import_csv_records(
+    sheet: &mut Sheet,
+    records: Vec<Vec<String>>,
+    header: bool,
+    text_cols: &[u32],
+    old: (u32, u32),
+    at: (u32, u32),
+) -> (u32, u32) {
+    let rows = records.len() as u32;
+    let cols = records.iter().map(|r| r.len() as u32).max().unwrap_or(0);
     // 旧区域里超出新数据的部分要清掉（只清自己上次写的那块）
     for r in 0..old.0 {
         for c in 0..old.1 {
@@ -780,7 +774,7 @@ pub fn import_csv_opts(
             }
         }
     }
-    for (ri, row) in grid.into_iter().enumerate() {
+    for (ri, row) in records.into_iter().enumerate() {
         if (ri as u32) < old.0 {
             // 短行补齐：新矩形里这一行没有的列要清空，才能和首次导入一致
             for ci in row.len()..cols as usize {
@@ -789,11 +783,18 @@ pub fn import_csv_opts(
                 }
             }
         }
-        for (ci, cell) in row.into_iter().enumerate() {
+        for (ci, field) in row.into_iter().enumerate() {
+            let cell = if header && ri == 0 {
+                Cell { value: Value::Text(field.into()), formula: None }
+            } else if text_cols.contains(&(ci as u32)) && !field.is_empty() {
+                Cell { value: Value::Text(field.into()), formula: None }
+            } else {
+                parse_field(&field)
+            };
             sheet.set(at.0 + ri as u32, at.1 + ci as u32, cell);
         }
     }
-    Ok((rows, cols, used))
+    (rows, cols)
 }
 
 /// 数字就当数字，空就是空，别的原样当文本

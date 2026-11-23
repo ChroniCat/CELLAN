@@ -226,7 +226,7 @@ fn input_save_load_copy_keep_the_formula_text() {
     let mut with_refs = back.clone();
     with_refs.sheets[0].set(4, 2, Cell {
         value: Value::Text("=B2&\"A1\"&$B$2".into()),
-        formula: Some(moved.clone().into_boxed_str()),
+        formula: Some(moved.clone().into()),
     });
     sheetcore::xlsx::save_atomic(&path, &with_refs).expect("保存移动后的公式失败");
     let reopened = sheetcore::xlsx::load(&path).expect("重开失败");

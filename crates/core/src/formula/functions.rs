@@ -288,11 +288,108 @@ pub(crate) struct Crit {
     wild: bool,
 }
 
-/// Equality counts reused when many cells query the same COUNTIF range.
+#[derive(Eq, PartialEq, Hash)]
+enum GroupValue {
+    Number(u64),
+    Text(String),
+}
+
+impl GroupValue {
+    // Equality scans use an epsilon. Hash integral keys only when *all* numeric
+    // data in that column are integral, so nearby fractions cannot be lost.
+    fn integer(n: f64) -> Option<Self> {
+        (n.fract() == 0.0).then(|| Self::Number(if n == 0.0 { 0 } else { n.to_bits() }))
+    }
+}
+
+/// Group a repeated set of literal SUMIFS/COUNTIFS ranges by equality criteria.
+/// Each Calc holds at most one index per function. Inequalities, wildcard queries
+/// and unsupported numeric keys keep the normal scan and its coercion semantics.
+#[derive(Default)]
+pub(super) struct GroupedCriteria {
+    ranges: Vec<super::RangeKey>,
+    numeric: Vec<bool>,
+    attempted: bool,
+    groups: Option<std::collections::HashMap<Vec<GroupValue>, f64>>,
+}
+
+impl GroupedCriteria {
+    #[cfg(test)]
+    pub(super) fn is_built(&self) -> bool { self.groups.is_some() }
+
+    pub(super) fn lookup(&mut self, key: &super::CriteriaKey, args: &[Arg]) -> Option<FValue> {
+        let sum = key.function == 0;
+        let criteria = args.get(usize::from(sum)..)?;
+        if criteria.is_empty() || criteria.len() % 2 != 0 || criteria[0].slice().len() < 256 {
+            return None;
+        }
+        let mut query = Vec::with_capacity(key.criteria.len());
+        let mut numeric = Vec::with_capacity(key.criteria.len());
+        for text in &key.criteria {
+            let crit = Crit::parse(text);
+            if !crit.indexable() { return None; }
+            numeric.push(crit.num.is_some());
+            query.push(match crit.num {
+                Some(n) => GroupValue::integer(n)?,
+                None => GroupValue::Text(crit.text),
+            });
+        }
+        if self.ranges != key.ranges || self.numeric != numeric {
+            self.ranges.clone_from(&key.ranges);
+            self.numeric = numeric;
+            self.groups = None;
+            self.attempted = false;
+            return None;
+        }
+        if !self.attempted {
+            self.attempted = true;
+            let columns: Vec<_> = criteria.chunks_exact(2).map(|pair| pair[0].slice()).collect();
+            let amounts = sum.then(|| args[0].slice());
+            self.groups = self.build_groups(&columns, amounts);
+        }
+        Some(FValue::number(self.groups.as_ref()?.get(&query).copied().unwrap_or(0.0)))
+    }
+
+    fn build_groups(
+        &self, columns: &[&[FValue]], amounts: Option<&[FValue]>,
+    ) -> Option<std::collections::HashMap<Vec<GroupValue>, f64>> {
+        let rows = columns.iter().map(|col| col.len()).min()?.min(amounts.map_or(usize::MAX, |v| v.len()));
+        let mut groups = std::collections::HashMap::new();
+        let mut key = Vec::with_capacity(columns.len());
+        'row: for row in 0..rows {
+            key.clear();
+            for (col, &numeric) in columns.iter().zip(&self.numeric) {
+                let value = &col[row];
+                key.push(if numeric {
+                    let Ok(n) = value.to_number() else { continue 'row };
+                    GroupValue::integer(n)?
+                } else {
+                    let text = match value {
+                        FValue::Text(s) => s.to_lowercase(),
+                        FValue::Empty => String::new(),
+                        FValue::Bool(b) => b.to_string(),
+                        other => other.display().to_lowercase(),
+                    };
+                    GroupValue::Text(text)
+                });
+            }
+            let add = amounts.map_or(1.0, |values| values[row].to_number().unwrap_or(0.0));
+            if let Some(total) = groups.get_mut(&key) {
+                *total += add;
+            } else {
+                if groups.len() >= 65_536 { return None; }
+                groups.insert(std::mem::take(&mut key), add);
+            }
+        }
+        Some(groups)
+    }
+}
+
+/// Matching row offsets for repeated COUNTIF and SUMIF equality queries.
 #[derive(Default)]
 pub(super) struct CountIndex {
-    numbers: Vec<f64>,
-    text: std::collections::HashMap<String, usize>,
+    numbers: Vec<(f64, usize)>,
+    text: std::collections::HashMap<String, Vec<usize>>,
 }
 
 #[test]
@@ -314,15 +411,15 @@ fn count_index_agrees_with_single_criterion_scan() {
 impl CountIndex {
     pub(super) fn new(data: &[FValue]) -> Self {
         let mut index = Self::default();
-        for value in data {
+        for (row, value) in data.iter().enumerate() {
             let text = match value {
                 FValue::Number(n) => {
-                    if n.is_finite() { index.numbers.push(*n); }
+                    if n.is_finite() { index.numbers.push((*n, row)); }
                     continue;
                 }
                 FValue::Text(s) => {
                     if let Ok(n) = s.trim().parse::<f64>() {
-                        if n.is_finite() { index.numbers.push(n); }
+                        if n.is_finite() { index.numbers.push((n, row)); }
                     }
                     if s.is_ascii() { s.to_ascii_lowercase() } else { s.clone() }
                 }
@@ -330,22 +427,65 @@ impl CountIndex {
                 FValue::Empty => String::new(),
                 _ => continue,
             };
-            *index.text.entry(text).or_default() += 1;
+            index.text.entry(text).or_default().push(row);
         }
-        index.numbers.sort_unstable_by(f64::total_cmp);
+        index.numbers.sort_unstable_by(|a,b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         index
     }
 
+    fn matching_offsets(&self, crit: &Crit) -> (&[(f64, usize)], &[usize]) {
+        let Some(n) = crit.num else {
+            return (&[], self.text.get(&crit.text).map_or(&[], Vec::as_slice));
+        };
+        if !n.is_finite() { return (&[], &[]); }
+        let start = self.numbers.partition_point(|(v, _)| v - n < -f64::EPSILON);
+        let end = self.numbers.partition_point(|(v, _)| v - n <= f64::EPSILON);
+        (&self.numbers[start..end], &[])
+    }
+
     pub(super) fn count(&self, crit: &Crit) -> usize {
-        if let Some(n) = crit.num {
-            if !n.is_finite() { return 0; }
-            // Use the same subtraction as Crit::matches, including near zero and signed zero.
-            let start = self.numbers.partition_point(|v| v - n < -f64::EPSILON);
-            let end = self.numbers.partition_point(|v| v - n <= f64::EPSILON);
-            end - start
-        } else {
-            self.text.get(&crit.text).copied().unwrap_or(0)
+        let (nums, text) = self.matching_offsets(crit);
+        nums.len() + text.len()
+    }
+
+    pub(super) fn rows(&self, crit: &Crit) -> Option<impl Iterator<Item = usize> + '_> {
+        let (nums, text) = self.matching_offsets(crit);
+        // Values within an epsilon (or signed zeros) can span several sorted keys.
+        // Preserve source order for error propagation and floating-point addition.
+        if nums.first().map(|v| v.0.to_bits()) != nums.last().map(|v| v.0.to_bits()) {
+            return None;
         }
+        Some(nums.iter().map(|v| v.1).chain(text.iter().copied()))
+    }
+}
+
+#[derive(Default)]
+pub(super) struct CountIndexes {
+    ranges: std::collections::HashMap<super::RangeKey, Option<CountIndex>>,
+    indexed_values: usize,
+}
+
+impl CountIndexes {
+    pub(super) fn get(&mut self, range: super::RangeKey, data: &[FValue], crit: &Crit) -> Option<&CountIndex> {
+        const LIMIT: usize = 2_097_152;
+        if !crit.indexable() || !(256..=LIMIT).contains(&data.len()) { return None; }
+        if !self.ranges.contains_key(&range) {
+            if self.ranges.len() >= 4096 {
+                self.ranges.clear();
+                self.indexed_values = 0;
+            }
+            self.ranges.insert(range, None);
+            return None;
+        }
+        if self.ranges[&range].is_none() {
+            if self.indexed_values + data.len() > LIMIT {
+                self.ranges.clear();
+                self.indexed_values = 0;
+            }
+            self.ranges.insert(range, Some(CountIndex::new(data)));
+            self.indexed_values += data.len();
+        }
+        self.ranges.get(&range)?.as_ref()
     }
 }
 
@@ -846,11 +986,11 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
         "SUMSQ" => r(|| Ok(FValue::number(numbers(args, 0)?.iter().map(|x| x * x).sum()))),
         "SUMPRODUCT" => r(|| {
             // 各参数必须同形（标量 1×1 可参与），只比元素个数会把 2×2 与 1×4 当成一样
-            let grids: Vec<(usize, usize, Vec<f64>)> = args
+            let grids: Vec<_> = args
                 .iter()
                 .map(|a| {
-                    let (rows, cols, data) = a.grid();
-                    (rows, cols, data.iter().map(|v| v.to_number().unwrap_or(0.0)).collect())
+                    let (rows, cols) = range_dims(a);
+                    (rows, cols, a.slice())
                 })
                 .collect();
             let shape = grids
@@ -869,7 +1009,7 @@ pub fn call(name: &str, args: &[Arg]) -> FValue {
                 let mut p = 1.0;
                 for (r, c, data) in &grids {
                     let idx = if *r == 1 && *c == 1 { 0 } else { i };
-                    p *= data[idx];
+                    p *= data[idx].to_number().unwrap_or(0.0);
                 }
                 sum += p;
             }

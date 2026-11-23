@@ -723,7 +723,7 @@ pub fn rename_table_column(
         (idx, t.name.clone())
     };
     for sh in &mut wb.sheets {
-        let mut edits: Vec<(u32, u32, Box<str>)> = Vec::new();
+        let mut edits: Vec<(u32, u32, std::sync::Arc<str>)> = Vec::new();
         for (cref, cell) in sh.iter() {
             let Some(f) = cell.formula.as_deref() else { continue };
             let inside = sh.tables.iter().any(|t| {
@@ -735,7 +735,7 @@ pub fn rename_table_column(
             });
             let nf = rewrite_table_column_refs(f, &actual_name, old, new, inside);
             if nf != f {
-                edits.push((cref.row, cref.col, nf.into_boxed_str()));
+                edits.push((cref.row, cref.col, nf.into()));
             }
         }
         for (r, c, f) in edits {
@@ -896,7 +896,7 @@ pub fn convert_table_to_range(wb: &mut crate::model::Workbook, table_name: &str)
         })
         .map(|t| t.name.clone())
         .unwrap_or_default();
-    let mut edits: Vec<(usize, u32, u32, Box<str>)> = Vec::new();
+    let mut edits: Vec<(usize, u32, u32, std::sync::Arc<str>)> = Vec::new();
     for (sidx, sh) in wb.sheets.iter().enumerate() {
         for (cref, cell) in sh.iter() {
             let Some(f) = cell.formula.as_deref() else { continue; };
@@ -915,7 +915,7 @@ pub fn convert_table_to_range(wb: &mut crate::model::Workbook, table_name: &str)
             {
                 let nf = format!("={}", e);
                 if nf != f {
-                    edits.push((sidx, cref.row, cref.col, nf.into_boxed_str()));
+                    edits.push((sidx, cref.row, cref.col, nf.into()));
                 }
             }
         }
@@ -992,7 +992,7 @@ pub fn fill_calculated_column(
             col,
             crate::model::Cell {
                 value: crate::model::Value::Empty,
-                formula: Some(f.into_boxed_str()),
+                formula: Some(f.into()),
             },
         );
         filled += 1;

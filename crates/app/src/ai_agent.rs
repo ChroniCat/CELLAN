@@ -643,7 +643,7 @@ impl SheetApp {
                     ed.c,
                     Cell {
                         value: Value::Empty,
-                        formula: Some(f.clone().into_boxed_str()),
+                        formula: Some(f.clone().into()),
                     },
                 );
             } else if let Some(v) = &ed.val {
@@ -743,7 +743,7 @@ impl SheetApp {
                     c,
                     Cell {
                         value: Value::Empty,
-                        formula: Some(translated.into_boxed_str()),
+                        formula: Some(translated.into()),
                     },
                 );
                 if let Some(ref fstr) = fmt {

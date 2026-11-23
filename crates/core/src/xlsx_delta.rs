@@ -3,6 +3,8 @@
 use crate::model::{Cell, CellRef, Sheet, Value, Workbook};
 use crate::store::{CellStyles, Store};
 use crate::style::StyleTable;
+#[path = "xlsx_font_delta.rs"]
+mod font_delta;
 use anyhow::{Context, Result};
 use quick_xml::{
     Reader,
@@ -11,7 +13,7 @@ use quick_xml::{
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs::File,
-    io::Write,
+    io::{BufWriter, Write},
     path::Path,
     sync::Arc,
 };
@@ -32,13 +34,26 @@ pub(crate) struct SourceCells {
 }
 
 type Rect = (u32, u32, u32, u32);
-type StyleChanges = HashMap<CellRef, Option<u16>>;
+#[derive(Default)]
+struct StyleChanges {
+    updates: HashMap<CellRef, Option<u16>>,
+    // A new font XF derives from a specific pre-edit raw XF. Confirm that
+    // original on the worksheet too, including model-default/ambiguous cells.
+    sources: HashMap<CellRef, u16>,
+}
+
+impl StyleChanges {
+    fn matches(&self, key: CellRef, style: Option<u32>) -> bool {
+        self.sources.get(&key).is_none_or(|&s| u32::from(s) == style.unwrap_or(0))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct StyleMap {
     // Only a unique original cellXf can be reused: distinct raw XFs may
     // collapse to one modeled style (e.g. unmodeled alignment properties).
     xfs: HashMap<u16, Option<u16>>,
+    derived_from: HashMap<u16, Option<u16>>,
     original: StyleTable,
 }
 
@@ -52,20 +67,37 @@ impl StyleMap {
         }
         Arc::new(Self {
             xfs,
+            derived_from: HashMap::new(),
             original: styles.clone(),
         })
     }
 
-    fn xf(&self, id: u16, current: &StyleTable) -> Option<u16> {
+    fn unchanged(&self, id: u16, current: &StyleTable) -> bool {
         let old = &self.original;
-        (usize::from(id) < current.len()
+        usize::from(id) < current.len()
+            && usize::from(id) < old.len()
             && old.get(id) == current.get(id)
             && old.theme_of(id) == current.theme_of(id)
             && old.pattern_of(id) == current.pattern_of(id)
             && old.diag_of(id) == current.diag_of(id)
-            && old.quote_of(id) == current.quote_of(id))
-        .then(|| self.xfs.get(&id).copied().flatten())
-        .flatten()
+            && old.quote_of(id) == current.quote_of(id)
+    }
+
+    fn xf(&self, id: u16, current: &StyleTable) -> Option<u16> {
+        self.unchanged(id, current).then(|| self.xfs.get(&id).copied().flatten()).flatten()
+    }
+}
+
+pub(super) struct SavedStyles {
+    signature: Signature,
+    map: Arc<StyleMap>,
+}
+
+impl SavedStyles {
+    pub(super) fn attach(&self, source: &mut SourceCells) {
+        if source.style_part == Some(self.signature) {
+            source.set_style_map(self.map.clone());
+        }
     }
 }
 
@@ -219,6 +251,14 @@ pub(super) fn verify_note_sources(path: &Path, wb: &Workbook) -> Result<()> {
 }
 
 impl SourceCells {
+    fn original_xf(&self, sheet: &Sheet, key: CellRef, styles: &StyleTable) -> Option<(u16, u16)> {
+        match self.styles.get(&key).copied() {
+            Some(id) => Some((id, self.style_map.as_ref()?.xf(id, styles)?)),
+            None if !sheet.row_styles.contains_key(&key.row) && !sheet.col_styles.contains_key(&key.col) => Some((0, 0)),
+            None => None,
+        }
+    }
+
     pub(super) fn set_style_map(&mut self, styles: Arc<StyleMap>) {
         self.style_map = Some(styles);
     }
@@ -277,7 +317,12 @@ fn intersects(keys: &BTreeSet<CellRef>, (top, left, bottom, right): Rect) -> boo
         .any(|k| (left..=right).contains(&k.col))
 }
 
-fn coordinates(sheet: &Sheet, source: &SourceCells, styles: &StyleTable) -> Option<Changes> {
+fn coordinates(
+    sheet: &Sheet,
+    source: &SourceCells,
+    styles: &StyleTable,
+    mut new_font_xf: impl FnMut(u16, u16, u16) -> Option<u16>,
+) -> Option<Changes> {
     let base = &source.store;
     let mut keys = BTreeSet::new();
     let mut formula_changed = false;
@@ -314,7 +359,7 @@ fn coordinates(sheet: &Sheet, source: &SourceCells, styles: &StyleTable) -> Opti
     {
         return None;
     }
-    let mut changed_styles = StyleChanges::new();
+    let mut changed_styles = StyleChanges::default();
     if sheet.styles_dirty || !sheet.style_edits.is_empty() {
         for key in sheet
             .styles
@@ -322,10 +367,34 @@ fn coordinates(sheet: &Sheet, source: &SourceCells, styles: &StyleTable) -> Opti
             .chain(source.styles.changed_keys(&sheet.styles))
         {
             let value = match sheet.explicit_style_of(key.row, key.col) {
-                Some(id) => Some(source.style_map.as_ref()?.xf(id, styles)?),
+                Some(id) => {
+                    let map = source.style_map.as_ref()?;
+                    if let Some(xf) = map.xf(id, styles) {
+                        if let Some(origin) = map.derived_from.get(&id) {
+                            let (_, raw) = source.original_xf(sheet, key, styles)?;
+                            if *origin != Some(raw) && raw != xf {
+                                return None;
+                            }
+                            changed_styles.sources.insert(key, raw);
+                        }
+                        Some(xf)
+                    }
+                    else {
+                        if map.xfs.contains_key(&id) { return None; }
+                        let (old, raw) = source.original_xf(sheet, key, styles)?;
+                        if !map.unchanged(old, styles)
+                            || styles.theme_of(id) != styles.theme_of(old)
+                            || styles.pattern_of(id) != styles.pattern_of(old)
+                            || styles.diag_of(id) != styles.diag_of(old)
+                            || styles.quote_of(id) != styles.quote_of(old) { return None; }
+                        let xf = new_font_xf(raw, old, id)?;
+                        changed_styles.sources.insert(key, raw);
+                        Some(xf)
+                    }
+                }
                 None => None,
             };
-            changed_styles.insert(key, value);
+            changed_styles.updates.insert(key, value);
             keys.insert(key);
         }
     }
@@ -343,17 +412,17 @@ fn attr<'a>(e: &'a BytesStart<'a>, key: &str) -> Option<String> {
         .map(|a| a.value.into_owned())
 }
 
-fn xml_text(text: &str) -> Option<String> {
-    if text.chars().any(|c| c < ' ' && c != '\t' && c != '\n')
+pub(super) fn safe_xml_text(text: &str) -> bool {
+    !(text.chars().any(|c| c < ' ' && c != '\t' && c != '\n')
         // A literal _xHHHH_ requires SpreadsheetML-specific escaping; ordinary
         // identifiers such as _xlfn.XLOOKUP contain no encoded character.
         || text.as_bytes().windows(7).any(|w| w.starts_with(b"_x") && w[6] == b'_' && w[2..6].iter().all(u8::is_ascii_hexdigit))
         || text.contains('\u{fffe}')
-        || text.contains('\u{ffff}')
-    {
-        return None;
-    }
-    Some(quick_xml::escape::escape(text).into_owned())
+        || text.contains('\u{ffff}'))
+}
+
+fn xml_text(text: &str) -> Option<String> {
+    safe_xml_text(text).then(|| quick_xml::escape::escape(text).into_owned())
 }
 
 /// Leave Excel's formula definition intact on cache-only writes, including
@@ -375,7 +444,8 @@ fn replacement(
             _ => return None,
         }
     }
-    if let Some(&xf) = styles.get(&key) {
+    if !styles.matches(key, style) { return None; }
+    if let Some(&xf) = styles.updates.get(&key) {
         style = xf.map(u32::from);
     }
     let mut xml = Reader::from_str(body);
@@ -425,6 +495,10 @@ fn replacement(
             String::new()
         });
     };
+    model_cell_xml(out, cell, same_formula.then_some(definition))
+}
+
+pub(super) fn model_cell_xml(mut out: String, cell: &Cell, original_formula: Option<&str>) -> Option<String> {
     let (kind, value) = match &cell.value {
         Value::Empty => ("", String::new()),
         Value::Number(n) if n.is_finite() => ("", format!("<v>{n}</v>")),
@@ -443,7 +517,7 @@ fn replacement(
     }
     out.push('>');
     if let Some(f) = &cell.formula {
-        if same_formula {
+        if let Some(definition) = original_formula {
             if definition.is_empty() {
                 return None;
             }
@@ -681,7 +755,9 @@ fn sheet_edits(
                 if keys.remove(&key) {
                     let old = base.get(r, c);
                     let new = sheet.get(r, c);
-                    let text = if let Some(xf) = styles.get(&key).filter(|_| old == new) {
+                    let text = if let Some(xf) = styles.updates.get(&key).filter(|_| old == new) {
+                        let old_style = attr(e, "s").map(|value| value.parse::<u32>()).transpose().ok()?;
+                        if !styles.matches(key, old_style) { return None; }
                         // Style-only changes leave rich strings, metadata, shared formulas
                         // and unknown children of the original cell byte-for-byte intact.
                         let mut tag = expanded_tag(e, "s")?;
@@ -722,7 +798,7 @@ fn sheet_edits(
     keys.is_empty().then_some(edits)
 }
 
-fn write_edits(out: &mut ZipWriter<File>, part: &str, xml: &str, edits: &[Edit]) -> Result<()> {
+fn write_edits(out: &mut ZipWriter<BufWriter<File>>, part: &str, xml: &str, edits: &[Edit]) -> Result<()> {
     let opts = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
         .compression_level(Some(1));
@@ -1045,7 +1121,14 @@ fn invalidate_chain(
     Ok(Some((replacements, deleted)))
 }
 
+#[cfg(test)]
 pub(super) fn write_if_supported(base: &Path, target: &Path, wb: &Workbook) -> Result<bool> {
+    write_with_style_receipt(base, target, wb, &mut None)
+}
+
+pub(super) fn write_with_style_receipt(
+    base: &Path, target: &Path, wb: &Workbook, saved_styles: &mut Option<SavedStyles>,
+) -> Result<bool> {
     let mut zip = ZipArchive::new(File::open(base)?)?;
     check_note_sources(&mut zip, wb)?;
     let mut sheets = HashMap::new();
@@ -1053,6 +1136,9 @@ pub(super) fn write_if_supported(base: &Path, target: &Path, wb: &Workbook) -> R
     let mut formula_changed = false;
     let sst = signature(&mut zip, "xl/sharedStrings.xml");
     let style_part = signature(&mut zip, "xl/styles.xml");
+    let style_xml = std::cell::OnceCell::new();
+    let mut fonts = None;
+    let mut base_map = None;
     for sheet in &wb.sheets {
         if sheet.row_styles_dirty || sheet.col_styles_dirty {
             return Ok(false);
@@ -1076,9 +1162,21 @@ pub(super) fn write_if_supported(base: &Path, target: &Path, wb: &Workbook) -> R
         {
             return Ok(false);
         }
-        let Some(changes) = coordinates(sheet, source, &wb.styles) else {
+        let Some(changes) = coordinates(sheet, source, &wb.styles, |raw, old, id| {
+            if fonts.is_none() {
+                let xml = style_xml.get_or_init(|| super::read_zip_text(&mut zip, "xl/styles.xml").ok());
+                fonts = Some(font_delta::FontEdits::new(xml.as_deref()?)?);
+            }
+            fonts.as_mut()?.resolve(raw, old, id, &wb.styles)
+        }) else {
             return Ok(false);
         };
+        if !changes.styles.sources.is_empty() {
+            let Some(map) = &source.style_map else { return Ok(false); };
+            if let Some(prior) = &base_map {
+                if !Arc::ptr_eq(prior, map) { return Ok(false); }
+            } else { base_map = Some(map.clone()); }
+        }
         if sheet.notes_dirty {
             let Some(notes) = crate::notes::edited_parts(&mut zip, part, sheet)? else {
                 return Ok(false);
@@ -1098,6 +1196,23 @@ pub(super) fn write_if_supported(base: &Path, target: &Path, wb: &Workbook) -> R
                 return Ok(false);
             }
         }
+    }
+    let mut updated_map = None;
+    if let Some((xml, additions)) = fonts.and_then(font_delta::FontEdits::finish) {
+        let Some(old) = base_map else { return Ok(false); };
+        let mut mapped = old.xfs.clone();
+        let mut derived_from = old.derived_from.clone();
+        mapped.retain(|&id, value| value.is_none() || old.xf(id, &wb.styles).is_some());
+        for (base, id, xf) in additions {
+            derived_from.entry(id).and_modify(|origin| {
+                if *origin != Some(base) { *origin = None; }
+            }).or_insert(Some(base));
+            mapped.entry(id).and_modify(|entry| {
+                if *entry != Some(xf) { *entry = None; }
+            }).or_insert(Some(xf));
+        }
+        updated_map = Some(Arc::new(StyleMap { xfs: mapped, derived_from, original: wb.styles.clone() }));
+        parts.insert("xl/styles.xml".to_owned(), xml.into_bytes());
     }
     let mut deleted = HashSet::new();
     if formula_changed {
@@ -1124,7 +1239,7 @@ pub(super) fn write_if_supported(base: &Path, target: &Path, wb: &Workbook) -> R
             .unwrap_or(Path::new(".")),
     )?;
     let (file, tmp) = tmp.into_parts();
-    let mut out = ZipWriter::new(file);
+    let mut out = ZipWriter::new(BufWriter::new(file));
     let mut changed_sst = false;
     for index in 0..zip.len() {
         let part = zip
@@ -1203,8 +1318,13 @@ pub(super) fn write_if_supported(base: &Path, target: &Path, wb: &Workbook) -> R
             out.raw_copy_file(zip.by_index_raw(i)?)?;
         }
     }
-    out.finish()?;
+    out.finish()?.flush()?;
     drop(zip);
+    if let Some(map) = updated_map {
+        let mut written = ZipArchive::new(File::open(&tmp)?)?;
+        let signature = signature(&mut written, "xl/styles.xml").context("缺少更新的样式表")?;
+        *saved_styles = Some(SavedStyles { signature, map });
+    }
     tmp.persist(target)?;
     Ok(true)
 }
@@ -1413,6 +1533,147 @@ mod tests {
         });
         wb.sheets[0].set_style(0, 1, custom);
         assert!(!write_if_supported(&file, &copy, &wb).unwrap());
+    }
+
+    #[test]
+    fn new_font_xfs_survive_two_atomic_saves_and_preserve_raw_properties() {
+        let (dir, file, part) = fixture(r#"<row r="1"><c r="A1"><v>42</v></c></row>"#, "");
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:e="urn:test">
+<fonts count="1"><font><sz val="11"/><name val="Calibri"/><family val="2"/></font></fonts>
+<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
+<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" e:keep="yes"><alignment readingOrder="2"/></xf></cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+        crate::fixups::write_parts(&file, &[("xl/styles.xml".into(), styles.as_bytes().into())]).unwrap();
+        let (mut wb, d) = load_diag(&file).unwrap();
+        assert!(d.is_complete(), "{:?}", d.problems);
+        let mut style = wb.styles.get(wb.sheets[0].style_of(0, 0)).clone();
+        style.bold = true;
+        style.italic = true;
+        style.size = 15.0;
+        let first = wb.styles.intern(style.clone());
+        wb.sheets[0].set_style(0, 0, first);
+        let probe = dir.path().join("delta.xlsx");
+        for pass in 1..=2 {
+            if pass == 2 {
+                wb.sheets[0].set_style(100, 2, first);
+                style.italic = false;
+                style.size = 16.0;
+                let second = wb.styles.intern(style.clone());
+                wb.sheets[0].set_style(0, 0, second);
+            }
+            assert!(write_if_supported(&file, &probe, &wb).unwrap(), "delta pass {pass}");
+            let receipt = save_atomic_with_receipt(&file, &wb).unwrap();
+            assert!(receipt.used_cell_delta);
+            receipt.adopt_document(&mut wb, &file, true);
+            let raw = String::from_utf8(read_part(&file, "xl/styles.xml").unwrap()).unwrap();
+            assert_eq!(raw.matches(r#"e:keep="yes""#).count(), pass + 1);
+            assert_eq!(raw.matches(r#"<alignment readingOrder="2"/>"#).count(), pass + 1);
+            assert_eq!(raw.matches(r#"<family val="2"/>"#).count(), pass + 1);
+            assert!(raw.contains(&format!(r#"<cellXfs count="{}">"#, pass + 1)));
+            let sheet = String::from_utf8(read_part(&file, &part).unwrap()).unwrap();
+            assert!(sheet.contains(&format!(r#"<c r="A1" s="{pass}"><v>42</v></c>"#)));
+            let (loaded, diag) = load_diag(&file).unwrap();
+            assert!(diag.is_complete(), "{:?}", diag.problems);
+            let view = &loaded.sheets[0];
+            assert_eq!(view.value(0, 0), Value::Number(42.0));
+            let saved = loaded.styles.get(view.style_of(0, 0));
+            assert!(saved.bold);
+            assert_eq!(saved.italic, pass == 1);
+            assert_eq!(saved.size, style.size);
+            if pass == 2 {
+                let copied = loaded.styles.get(view.style_of(100, 2));
+                assert!(copied.bold && copied.italic);
+                assert_eq!(copied.size, 15.0);
+            }
+        }
+    }
+
+    #[test]
+    fn first_save_receipt_supports_font_change_without_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("created.xlsx");
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, num(13.0));
+        save_atomic_with_receipt(&file, &wb).unwrap().adopt_document(&mut wb, &file, true);
+        let mut style = wb.styles.get(0).clone();
+        style.bold = true;
+        let id = wb.styles.intern(style);
+        wb.sheets[0].set_style(0, 0, id);
+        let receipt = save_atomic_with_receipt(&file, &wb).unwrap();
+        assert!(receipt.used_cell_delta);
+        let (back, diag) = load_diag(&file).unwrap();
+        assert!(diag.is_complete());
+        assert!(back.styles.get(back.sheets[0].style_of(0, 0)).bold);
+        assert_eq!(back.sheets[0].value(0, 0), Value::Number(13.0));
+    }
+
+    #[test]
+    fn generated_xf_is_reused_only_on_its_verified_source() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1" s="1"><v>2</v></c></row>"#;
+        let (dir, file, _) = fixture(rows, "");
+        let raw = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:e="urn:test">
+<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+<cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs>
+<cellXfs count="2"><xf fontId="0"/><xf fontId="0" e:keep="other"/></cellXfs></styleSheet>"#;
+        crate::fixups::write_parts(&file, &[("xl/styles.xml".into(), raw.as_bytes().into())]).unwrap();
+        let (mut wb, d) = load_diag(&file).unwrap();
+        assert!(d.is_complete());
+        let mut style = wb.styles.get(wb.sheets[0].style_of(0, 0)).clone();
+        style.bold = true;
+        let id = wb.styles.intern(style);
+        wb.sheets[0].set_style(0, 0, id);
+        let receipt = save_atomic_with_receipt(&file, &wb).unwrap();
+        assert!(receipt.used_cell_delta);
+        receipt.adopt_document(&mut wb, &file, true);
+        wb.sheets[0].set_style(0, 1, id);
+        let target = dir.path().join("different-source.xlsx");
+        assert!(!write_if_supported(&file, &target, &wb).unwrap());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn new_font_xf_rejects_ambiguous_raw_sources() {
+        let rows = r#"<row r="1"><c r="A1" s="1"><v>1</v></c><c r="B1" s="2"><v>2</v></c></row>"#;
+        let (dir, file, _) = fixture(rows, "");
+        let style = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:e="urn:test">
+<fonts count="1"><font><name val="Calibri"/><sz val="11"/></font></fonts>
+<fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+<borders count="1"><border/></borders>
+<cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs>
+<cellXfs count="3"><xf fontId="0"/><xf fontId="0" e:tag="left"/><xf fontId="0" e:tag="right"/></cellXfs></styleSheet>"#;
+        crate::fixups::write_parts(&file, &[("xl/styles.xml".into(), style.as_bytes().into())]).unwrap();
+        let (mut wb, d) = load_diag(&file).unwrap();
+        assert!(d.is_complete());
+        let source = wb.sheets[0].style_of(0, 0);
+        assert_eq!(wb.sheets[0].style_of(0, 1), source);
+        let mut style = wb.styles.get(source).clone();
+        style.italic = true;
+        let id = wb.styles.intern(style);
+        wb.sheets[0].set_style(0, 0, id);
+        let target = dir.path().join("ambiguous.xlsx");
+        assert!(!write_if_supported(&file, &target, &wb).unwrap());
+        assert!(!target.exists());
+
+        // With no cell style attribute the model uses its own default. A
+        // workbook can assign different font properties to raw XF zero.
+        let (dir, file, _) = fixture(r#"<row r="1"><c r="A1"><v>3</v></c></row>"#, "");
+        let raw = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="1"><font><sz val="25"/><i/></font></fonts>
+<cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs>
+<cellXfs count="1"><xf fontId="0"/></cellXfs></styleSheet>"#;
+        crate::fixups::write_parts(&file, &[("xl/styles.xml".into(), raw.as_bytes().into())]).unwrap();
+        let (mut wb, d) = load_diag(&file).unwrap();
+        assert!(d.is_complete());
+        let mut style = wb.styles.get(wb.sheets[0].style_of(0, 0)).clone();
+        assert_ne!(style.size, 25.0);
+        style.bold = true;
+        let id = wb.styles.intern(style);
+        wb.sheets[0].set_style(0, 0, id);
+        let target = dir.path().join("wrong-default.xlsx");
+        assert!(!write_if_supported(&file, &target, &wb).unwrap());
+        assert!(!target.exists());
     }
 
     #[test]
