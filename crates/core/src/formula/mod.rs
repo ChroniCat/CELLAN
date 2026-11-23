@@ -5,6 +5,10 @@
 
 pub mod array;
 mod compiled;
+mod scalar_batch;
+mod dependency_batch;
+pub(crate) mod lookup_cache;
+mod conditional_index;
 #[cfg(test)]
 mod performance_tests;
 use compiled::compile_at;
@@ -78,7 +82,7 @@ pub enum Node {
     Percent(Box<Node>),
     Binary(BinOp, Box<Node>, Box<Node>),
     /// 数组常量 {1,2;3,4}
-    Array(usize, usize, Vec<FValue>),
+    Array(usize, usize, Vec<crate::Value>),
 }
 
 /// Excel omits referenced cells containing a nested SUBTOTAL. Check the AST
@@ -484,6 +488,20 @@ impl Parser {
             return self.parse_unary();
         }
         let mut node = self.parse_primary()?;
+        // A LAMBDA returned by an expression or a sheet-qualified name can be called directly.
+        if matches!(node, Node::Func(..) | Node::ScopedName { book: None, .. }) {
+            while self.eat(&Tok::LParen) {
+                let mut call = vec![node];
+                if !self.eat(&Tok::RParen) {
+                    loop {
+                        call.push(self.parse_expr()?);
+                        if self.eat(&Tok::RParen) { break; }
+                        if !self.eat(&Tok::Comma) { return Err(ErrKind::Value); }
+                    }
+                }
+                node = Node::Func("__CALL__".into(), call);
+            }
+        }
         while matches!(self.peek(), Some(Tok::Percent)) {
             self.pos += 1;
             node = Node::Percent(Box::new(node));
@@ -503,7 +521,7 @@ impl Parser {
                 Ok(e)
             }
             Some(Tok::LBrace) => {
-                let mut rows: Vec<Vec<FValue>> = vec![Vec::new()];
+                let mut rows: Vec<Vec<crate::Value>> = vec![Vec::new()];
                 loop {
                     let v = match self.next() {
                         Some(Tok::Num(n)) => FValue::number(n),
@@ -534,7 +552,7 @@ impl Parser {
                         }
                         _ => return Err(ErrKind::Value),
                     };
-                    rows.last_mut().unwrap().push(v);
+                    rows.last_mut().unwrap().push(from_fvalue(&v));
                     match self.next() {
                         Some(Tok::Comma) => continue,
                         Some(Tok::Semi) => {
@@ -548,10 +566,10 @@ impl Parser {
                 let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
                 let nrows = rows.len();
                 let mut data = Vec::with_capacity(nrows * cols);
-                for r in &rows {
-                    for c in 0..cols {
-                        data.push(r.get(c).cloned().unwrap_or(FValue::Empty));
-                    }
+                for row in rows {
+                    let end = data.len() + cols;
+                    data.extend(row);
+                    data.resize(end,crate::Value::Empty);
                 }
                 Ok(Node::Array(nrows, cols, data))
             }
@@ -619,26 +637,7 @@ impl Parser {
                             return Err(ErrKind::Value);
                         }
                     }
-                    let mut node = Node::Func(name.to_ascii_uppercase(), args);
-                    // LAMBDA(x,x*x)(7)：函数值后面直接跟实参
-                    while matches!(self.peek(), Some(Tok::LParen)) {
-                        self.pos += 1;
-                        let mut call = vec![node];
-                        if !self.eat(&Tok::RParen) {
-                            loop {
-                                call.push(self.parse_expr()?);
-                                if self.eat(&Tok::Comma) {
-                                    continue;
-                                }
-                                if self.eat(&Tok::RParen) {
-                                    break;
-                                }
-                                return Err(ErrKind::Value);
-                            }
-                        }
-                        node = Node::Func("__CALL__".to_string(), call);
-                    }
-                    return Ok(node);
+                    return Ok(Node::Func(name.to_ascii_uppercase(), args));
                 }
                 // TRUE / FALSE
                 let up = name.to_ascii_uppercase();
@@ -832,6 +831,16 @@ pub fn take_cycle_cells() -> HashSet<(usize, u32, u32)> {
 }
 
 type RangeKey = (usize, i64, i64, i64, i64);
+
+fn literal_range(node: &Node) -> Option<(RefExpr, RefExpr)> {
+    let (a, b) = match node {
+        Node::Range(a, b) => (a, b),
+        Node::Ref(a) => (a, a),
+        _ => return None,
+    };
+    (a.book.is_none() && b.book.is_none() && a.sheet2.is_none() && b.sheet2.is_none())
+        .then(|| (a.clone(), b.clone()))
+}
 type EvalEnvironment = Vec<HashMap<String, FValue>>;
 type EvalFrame = (deps::CellKey, EvalEnvironment);
 
@@ -860,6 +869,16 @@ struct CriteriaKey {
     criteria: Vec<String>,
 }
 
+fn named_definition(wb: &Workbook, name: &str, si: usize, scoped: bool) -> Option<usize> {
+    let mut global = None;
+    for (index, (nm, scope, _)) in wb.names.iter().enumerate() {
+        if !nm.eq_ignore_ascii_case(name) { continue; }
+        if *scope == Some(si) { return Some(index); }
+        if scope.is_none() && (!scoped || global.is_none()) { global = Some(index); }
+    }
+    global
+}
+
 pub struct Calc<'a> {
     wb: &'a Workbook,
     memo: HashMap<(usize, u32, u32), FValue>,
@@ -867,6 +886,7 @@ pub struct Calc<'a> {
     /// LET 绑定的名字（大写）
     env_stack: EvalEnvironment,
     active_names: HashSet<(usize, deps::CellKey, usize)>,
+    named_calls: Vec<(usize, deps::CellKey, usize, Vec<FValue>)>,
     scheduling: bool,
     requested: Option<EvalFrame>,
     range_remainder: Option<RangeRemainder>,
@@ -889,20 +909,22 @@ pub struct Calc<'a> {
     /// 精确匹配用的哈希索引：key → 首次出现的行下标
     approx_positions: HashMap<(RangeKey, usize, functions::LookupKind), Option<Vec<usize>>>,
     position_count: usize,
-    lookup_index: HashMap<(usize, i64, i64, i64, i64), std::rc::Rc<HashMap<String, usize>>>,
+    lookup_index: HashMap<(RangeKey, bool), lookup_cache::Index>,
     /// 增量重算的范围：不在其中的公式单元格一律用缓存值
-    scope: Option<std::collections::HashSet<self::deps::CellKey>>,
+    scope: Option<&'a std::collections::HashSet<self::deps::CellKey>>,
     /// 区域物化实际读取的单元格数（测试/诊断用）
     pub range_reads: usize,
     /// 区域聚合结果缓存：(sheet, r1, c1, r2, c2, 函数, 条件)
     agg_cache: HashMap<(usize, i64, i64, i64, i64, u8, String), FValue>,
     /// 区域缓存已占用的值数量，防止把逐行累积的区间全缓存下来
     cache_vals: usize,
-    last_count_range: Option<RangeKey>,
-    count_index: Option<(RangeKey, functions::CountIndex)>,
+    count_indexes: functions::CountIndexes,
     cache_order: std::collections::BTreeSet<(u64, RangeKey)>,
     cache_clock: u64,
     criteria_cache: HashMap<CriteriaKey, FValue>,
+    grouped_criteria: [functions::GroupedCriteria; 2],
+    ordered_criteria: conditional_index::OrderedCriteria,
+    match_indexes: conditional_index::MatchIndexes,
     sum_prefixes: HashMap<PrefixKey, SumPrefixes>,
     sum_ends: HashMap<PrefixKey, i64>,
     prefix_values: usize,
@@ -928,7 +950,7 @@ impl Arg {
 
     pub fn values(&self) -> Vec<FValue> {
         match self {
-            Arg::Val(FValue::Array(a)) => a.data.clone(),
+            Arg::Val(FValue::Array(a)) => a.data.as_ref().clone(),
             Arg::Val(v) => vec![v.clone()],
             Arg::Range { values, .. } => (**values).clone(),
         }
@@ -942,7 +964,7 @@ impl Arg {
     /// 统一成 (行, 列, 数据) 网格，供数组函数使用
     pub fn grid(&self) -> (usize, usize, Vec<FValue>) {
         match self {
-            Arg::Val(FValue::Array(a)) => (a.rows, a.cols, a.data.clone()),
+            Arg::Val(FValue::Array(a)) => (a.rows, a.cols, a.data.as_ref().clone()),
             Arg::Val(v) => (1, 1, vec![v.scalar()]),
             Arg::Range { values, rows, cols } => (*rows, *cols, (**values).clone()),
         }
@@ -952,7 +974,7 @@ impl Arg {
         let mut out = Vec::new();
         match self {
             Arg::Val(FValue::Array(a)) => {
-                for v in &a.data {
+                for v in a.data.iter() {
                     match v {
                         FValue::Number(n) => out.push(*n),
                         FValue::Error(e) => return Err(*e),
@@ -1004,10 +1026,13 @@ impl<'a> Calc<'a> {
             let now = functions::now_serial();
             functions::set_now_snapshot(Some(now));
         }
-        Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), approx_positions: HashMap::new(), position_count: 0, scope: None, scheduling: false, requested: None, range_remainder: None, active_names: HashSet::new(),
-            agg_cache: HashMap::new(), cache_vals: 0, last_count_range: None, count_index: None, depth: 0,
+        Self { wb, memo: HashMap::new(), visiting: HashSet::new(), env_stack: vec![HashMap::new()], cur: (0, 0), range_cache: HashMap::new(), bounds: HashMap::new(), lookup_index: HashMap::new(), approx_positions: HashMap::new(), position_count: 0, scope: None, scheduling: false, requested: None, range_remainder: None, active_names: HashSet::new(), named_calls: Vec::new(),
+            agg_cache: HashMap::new(), cache_vals: 0, count_indexes: Default::default(), depth: 0,
             range_reads: 0,
             cache_order: Default::default(), cache_clock: 0, criteria_cache: HashMap::new(),
+            grouped_criteria: Default::default(),
+            ordered_criteria: Default::default(),
+            match_indexes: Default::default(),
             sum_prefixes: HashMap::new(), sum_ends: HashMap::new(), prefix_values: 0, agg_hits: 0, agg_miss: 0,
             cur_sheet: 0, volatile_values: HashMap::new(), volatile_counts: HashMap::new(),
             prev_system, prev_now }
@@ -1238,16 +1263,18 @@ impl<'a> Calc<'a> {
         ))))
     }
 
+    fn defined_name_index(&self, name: &str, si: usize, scoped: bool) -> Option<usize> {
+        named_definition(self.wb, name, si, scoped)
+    }
+
     fn eval_defined_name(&mut self, name: &str, si: usize, scoped: bool) -> FValue {
-        let mut found = None;
-        for (index, (nm, scope, _)) in self.wb.names.iter().enumerate() {
-            if !nm.eq_ignore_ascii_case(name) { continue; }
-            if *scope == Some(si) { found = Some(index); break; }
-            if scope.is_none() && (!scoped || found.is_none()) { found = Some(index); }
-        }
-        let Some(index) = found else { return FValue::Error(ErrKind::Name); };
+        let Some(index) = self.defined_name_index(name, si, scoped) else { return FValue::Error(ErrKind::Name); };
+        self.eval_definition(index, si)
+    }
+
+    fn eval_definition(&mut self, index: usize, si: usize) -> FValue {
         let key = (index, (self.cur_sheet, self.cur.0, self.cur.1), si);
-        if !self.active_names.insert(key) { return FValue::Error(ErrKind::Name); }
+        if self.active_names.len() >= 32 || !self.active_names.insert(key) { return FValue::Error(ErrKind::Name); }
         let body = self.wb.names[index].2.trim_start_matches('=');
         let expanded = crate::table::expand_structured_at(self.wb, si, Some(self.cur.0), Some(self.cur.1), body);
         let value = match compile_at(expanded.as_deref().unwrap_or(body), self.cur.0, self.cur.1) {
@@ -1256,6 +1283,42 @@ impl<'a> Calc<'a> {
         };
         self.active_names.remove(&key);
         value
+    }
+
+    fn call_named_lambda(&mut self, name: &str, si: usize, scoped: bool, args: &[Arg]) -> FValue {
+        let Some(index) = self.defined_name_index(name, si, scoped) else {
+            return FValue::Error(ErrKind::Name);
+        };
+        let values: Vec<_> = args.iter().map(|arg| match arg {
+            Arg::Val(v) => v.clone(),
+            Arg::Range { rows: 1, cols: 1, .. } => arg.first(),
+            Arg::Range { rows, cols, values } => FValue::Array(std::rc::Rc::new(
+                value::Array::from_shared(*rows, *cols, values.clone()),
+            )),
+        }).collect();
+        let cell = (self.cur_sheet, self.cur.0, self.cur.1);
+        // Bound live argument frames even when recursion never repeats the same arguments.
+        // Grow the native stack on demand; ordinary named calls stay on the caller's stack.
+        let frame_slots = |arity: usize| arity + 2;
+        let slots = self.named_calls.iter().map(|(_, _, _, args)| frame_slots(args.len())).sum::<usize>();
+        if slots + frame_slots(values.len()) > 1024 || self.named_calls.iter().any(|(i, at, sheet, v)|
+            (*i, *at, *sheet) == (index, cell, si) && v == &values) {
+            return FValue::Error(ErrKind::Num);
+        }
+        self.named_calls.push((index, cell, si, values.clone()));
+        // Worksheet names have their own lexical environment. The caller's LET bindings
+        // have already been evaluated in the arguments and must not shadow the definition.
+        let caller = std::mem::take(&mut self.env_stack);
+        let result = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+            match self.eval_definition(index, si) {
+                FValue::Lambda(lambda) => self.apply_lambda_val(&lambda, values, si),
+                FValue::Error(e) => FValue::Error(e),
+                _ => FValue::Error(ErrKind::Value),
+            }
+        });
+        self.env_stack = caller;
+        self.named_calls.pop();
+        result
     }
 
     fn eval_ext_defined_name(
@@ -1348,8 +1411,8 @@ impl<'a> Calc<'a> {
                     let (si, row, col) = *key;
                     !self.memo.contains_key(key)
                         && !self.visiting.contains(key)
-                        && self.scope.as_ref().is_none_or(|scope| scope.contains(key))
-                        && self.wb.sheets[si].get(row, col).is_some_and(|c| c.formula.is_some())
+                        && self.wb.sheets[si].get(row,col).is_some_and(|c| c.formula.is_some()
+                            && (self.scope.is_none_or(|scope| scope.contains(key)) || callable_cache_candidate(&c.value)))
                 });
                 if let Some(key) = next {
                     let frame = (key, bindings.clone());
@@ -1389,10 +1452,12 @@ impl<'a> Calc<'a> {
         };
         if let Some(f) = cell.formula.as_deref() {
             // 增量重算：不在本次范围内的公式，直接用文件里缓存的结果
-            if let Some(scope) = &self.scope {
-                if !scope.contains(&key) {
-                    return to_fvalue(&cell.value);
-                }
+            let outside_scope = self.scope.is_some_and(|scope| !scope.contains(&key));
+            // Closures have no persisted scalar representation. Re-evaluate just a
+            // requested candidate (including a reference forwarding the closure).
+            // A genuine text cache equal to this marker remains the cached text.
+            if outside_scope && !callable_cache_candidate(&cell.value) {
+                return to_fvalue(&cell.value);
             }
             if !self.visiting.insert(key) {
                 CYCLE_CELLS.with(|cells| {
@@ -1427,10 +1492,12 @@ impl<'a> Calc<'a> {
             // Only volatile formulas need a counter. A suspended frame restarts
             // from its first sample and replays values already collected.
             self.volatile_counts.remove(&key);
-            let mut v = match compile_at(body, r, c) {
-                Ok(node) => self.eval_node(&node, si),
-                Err(e) => FValue::Error(e),
+            let mut v = if let Some(scalar) = compiled::scalar_at(body, r, c) {
+                scalar.evaluate(|row,col| Some(self.cell_value(si,row,col))).expect("scalar template")
+            } else {
+                compiled::with_node(body, r, c, |node| self.eval_node(node, si)).unwrap_or_else(FValue::Error)
             };
+            if outside_scope && !matches!(v,FValue::Lambda(_)) { v = to_fvalue(&cell.value); }
             if let FValue::Array(a) = &v {
                 if array_blocked(self.wb, si, r, c, a, true) {
                     v = FValue::Error(ErrKind::Spill);
@@ -1483,6 +1550,9 @@ impl<'a> Calc<'a> {
         if outside_scope {
             if let Some(a) = self.materialized_spill(si, r, c) {
                 return FValue::Array(std::rc::Rc::new(a));
+            }
+            if let crate::Value::Error(error) = self.wb.sheets[si].value(r, c) {
+                return FValue::Error(error);
             }
             return FValue::Error(ErrKind::Ref);
         }
@@ -1742,10 +1812,10 @@ impl<'a> Calc<'a> {
                             if rows == 1 && cols == 1 {
                                 values.first().cloned().unwrap_or(FValue::Empty)
                             } else {
-                                FValue::Array(std::rc::Rc::new(value::Array::new(
+                                FValue::Array(std::rc::Rc::new(value::Array::from_shared(
                                     rows,
                                     cols,
-                                    (*values).clone(),
+                                    values,
                                 )))
                             }
                         }
@@ -1756,38 +1826,14 @@ impl<'a> Calc<'a> {
             }
             Node::Unary(neg, e) => {
                 // 一元也走二维块：`=-SEQUENCE(2,2)` 必须得到 2×2 而不是 #VALUE!
-                let (rows, cols, vals) = self.operand_block(e, si);
-                let mut out = Vec::with_capacity(vals.len());
-                for v in &vals {
-                    // 逐元素：遇到错误值保留该格的错误，不能把整块坍成一个错误
-                    // （`=-{1;#N/A}` 在 Excel 里是 2×1 的 [-1; #N/A]）
-                    match v.to_number() {
-                        Ok(n) => out.push(FValue::number(if *neg { -n } else { n })),
-                        Err(err) => out.push(FValue::Error(err)),
-                    }
-                }
-                if rows == 1 && cols == 1 {
-                    return out.pop().unwrap_or(FValue::Error(ErrKind::Value));
-                }
-                FValue::Array(std::rc::Rc::new(value::Array::new(rows, cols, out)))
+                self.eval_numeric_unary(e, si, |n| if *neg { -n } else { n })
             }
             Node::Percent(e) => {
-                let (rows, cols, vals) = self.operand_block(e, si);
-                let mut out = Vec::with_capacity(vals.len());
-                for v in &vals {
-                    match v.to_number() {
-                        Ok(n) => out.push(FValue::number(n / 100.0)),
-                        Err(err) => out.push(FValue::Error(err)),
-                    }
-                }
-                if rows == 1 && cols == 1 {
-                    return out.pop().unwrap_or(FValue::Error(ErrKind::Value));
-                }
-                FValue::Array(std::rc::Rc::new(value::Array::new(rows, cols, out)))
+                self.eval_numeric_unary(e, si, |n| n / 100.0)
             }
             Node::Binary(op, l, r) => self.eval_binary(*op, l, r, si),
             Node::Array(rows, cols, data) => {
-                FValue::Array(std::rc::Rc::new(value::Array::new(*rows, *cols, data.clone())))
+                FValue::Array(std::rc::Rc::new(value::Array::new(*rows, *cols, data.iter().map(to_fvalue).collect())))
             }
             // IF 系列必须短路求值：未被选中的分支不能计算（否则 IF(A1=0,1,1/A1) 会误报 #DIV/0!）
             Node::Func(name, nodes) if name == "IF" && nodes.len() >= 2 => {
@@ -1823,7 +1869,7 @@ impl<'a> Calc<'a> {
                         let v = match &nodes[i + 1] {
                             Node::Range(a, b) => match self.range_values(a, b, si) {
                                 Ok(Arg::Range { values, rows, cols }) => FValue::Array(
-                                    std::rc::Rc::new(value::Array::new(rows, cols, (*values).clone())),
+                                    std::rc::Rc::new(value::Array::from_shared(rows, cols, values)),
                                 ),
                                 Ok(Arg::Val(v)) => v,
                                 Err(e) => FValue::Error(e),
@@ -1959,7 +2005,8 @@ impl<'a> Calc<'a> {
                 let lam = nodes.last().unwrap();
                 match name.as_str() {
                     "MAP" => {
-                        let vals = self.operand_values(&nodes[0], si);
+                        let input = self.operand_block(&nodes[0], si);
+                        let vals = input.slice();
                         let lam_val = match self.eval_node(lam, si) {
                             FValue::Lambda(l) => Some(l),
                             _ => None,
@@ -1975,25 +2022,21 @@ impl<'a> Calc<'a> {
                     }
                     "REDUCE" => {
                         let mut acc = self.eval_node(&nodes[0], si);
-                        let vals = match nodes.get(1) {
-                            Some(n) => self.operand_values(n, si),
-                            None => vec![],
-                        };
+                        let input = self.operand_block(&nodes[1], si);
+                        let vals = input.slice();
                         for v in vals {
-                            acc = self.apply_lambda(lam, vec![acc, v], si);
+                            acc = self.apply_lambda(lam, vec![acc, v.clone()], si);
                         }
                         acc
                     }
                     "SCAN" => {
                         let init = self.eval_node(&nodes[0], si);
-                        let vals = match nodes.get(1) {
-                            Some(n) => self.operand_values(n, si),
-                            None => vec![],
-                        };
+                        let input = self.operand_block(&nodes[1], si);
+                        let vals = input.slice();
                         let mut acc = init;
                         let mut out = Vec::with_capacity(vals.len());
                         for v in vals {
-                            acc = self.apply_lambda(lam, vec![acc, v], si);
+                            acc = self.apply_lambda(lam, vec![acc, v.clone()], si);
                             out.push(acc.clone());
                         }
                         FValue::Array(std::rc::Rc::new(value::Array::new(1, out.len(), out)))
@@ -2019,7 +2062,7 @@ impl<'a> Calc<'a> {
                     "BYROW" => {
                         let (rows, cols, data) = match nodes.first() {
                             Some(n) => self.grid_of(n, si),
-                            None => (0, 0, vec![]),
+                            None => (0, 0, Default::default()),
                         };
                         if data.len() == 1 {
                             if let FValue::Error(e) = data[0] {
@@ -2038,7 +2081,7 @@ impl<'a> Calc<'a> {
                         // BYCOL
                         let (rows, cols, data) = match nodes.first() {
                             Some(n) => self.grid_of(n, si),
-                            None => (0, 0, vec![]),
+                            None => (0, 0, Default::default()),
                         };
                         if data.len() == 1 {
                             if let FValue::Error(e) = data[0] {
@@ -2073,6 +2116,12 @@ impl<'a> Calc<'a> {
             }
             // 立即调用：LAMBDA(x, x*x)(7)
             Node::Func(name, nodes) if name == "__CALL__" && !nodes.is_empty() => {
+                if let Node::ScopedName { book: None, sheet: Some(sheet), name } = &nodes[0] {
+                    let Ok(target) = self.sheet_index(Some(sheet), si) else { return FValue::Error(ErrKind::Ref); };
+                    let args = self.function_args("", &nodes[1..], si);
+                    if self.requested.is_some() { return FValue::Error(ErrKind::Ref); }
+                    return self.call_named_lambda(name, target, true, &args);
+                }
                 let target = self.eval_node(&nodes[0], si);
                 match target {
                     FValue::Lambda(l) => {
@@ -2189,7 +2238,7 @@ impl<'a> Calc<'a> {
                             rb.sheet = sheet.clone();
                             match self.range_values(&ra, &rb, si) {
                                 Ok(Arg::Range { values, rows, cols }) => FValue::Array(
-                                    std::rc::Rc::new(value::Array::new(rows, cols, (*values).clone())),
+                                    std::rc::Rc::new(value::Array::from_shared(rows, cols, values)),
                                 ),
                                 Ok(_) => FValue::Error(ErrKind::Value),
                                 Err(e) => FValue::Error(e),
@@ -2254,7 +2303,7 @@ impl<'a> Calc<'a> {
                 };
                 match self.range_values(&a, &b, si) {
                     Ok(Arg::Range { values, rows, cols }) => FValue::Array(
-                        std::rc::Rc::new(value::Array::new(rows, cols, (*values).clone())),
+                        std::rc::Rc::new(value::Array::from_shared(rows, cols, values)),
                     ),
                     _ => FValue::Error(ErrKind::Ref),
                 }
@@ -2323,23 +2372,17 @@ impl<'a> Calc<'a> {
                         return self.call_generic(name, nodes, si);
                     }
                 }
-                let literal = |n: &Node| -> Option<(RefExpr, RefExpr)> {
-                    match n {
-                        Node::Range(a, b)
-                            if a.book.is_none()
-                                && b.book.is_none()
-                                && a.sheet2.is_none()
-                                && b.sheet2.is_none() =>
-                        {
-                            Some((a.clone(), b.clone()))
-                        }
-                        Node::Ref(a) if a.book.is_none() && a.sheet2.is_none() => {
-                            Some((a.clone(), a.clone()))
-                        }
-                        _ => None,
+                let source = match &nodes[1] {
+                    Node::Name(n) if !self.env_stack.iter().rev().any(|env| env.contains_key(n)) => {
+                        self.defined_name_index(n, si, false).and_then(|idx| {
+                            let src = self.wb.names[idx].2.trim_start_matches('=');
+                            let parsed = compile_at(src, self.cur.0, self.cur.1).ok()?;
+                            literal_range(&parsed)
+                        })
                     }
+                    node => literal_range(node),
                 };
-                let Some((la, lb)) = literal(&nodes[1]) else {
+                let Some((la, lb)) = source else {
                     return self.call_generic(name, nodes, si);
                 };
                 let idx = match self.sheet_index(la.sheet.as_deref(), si) {
@@ -2389,15 +2432,13 @@ impl<'a> Calc<'a> {
                         sa.row = r1;
                         sb.row = r1;
                     }
-                    let (s_rows, s_cols, data) = self.cached_grid(idx, &sa, &sb);
-                    let n = if vertical { s_rows } else { s_cols };
-                    if n == 0 {
-                        return FValue::Error(ErrKind::Na);
-                    }
                     let best = if approx {
+                        let (s_rows, s_cols, data) = self.cached_grid(idx, &sa, &sb);
+                        let n = if vertical { s_rows } else { s_cols };
+                        if n == 0 { return FValue::Error(ErrKind::Na); }
                         self.approximate_match((idx, sa.row.min(sb.row), sa.col.min(sb.col), sa.row.max(sb.row), sa.col.max(sb.col)), &data, n, 1, &key, true)
                     } else {
-                        let ix = self.lookup_hash(idx, &sa, &sb, s_cols, s_rows, vertical);
+                        let ix = self.lookup_hash(idx, &sa, &sb, vertical);
                         ix.get(&key_norm(&key)).copied()
                     };
                     return match best {
@@ -2434,7 +2475,7 @@ impl<'a> Calc<'a> {
                 }
                 let mut hit: Option<usize> = None;
                 if mode == 0.0 {
-                    let ix = self.lookup_hash(idx, &la, &lb, cols, rows, vertical);
+                    let ix = self.lookup_hash(idx, &la, &lb, vertical);
                     hit = ix.get(&key_norm(&key)).copied();
                 } else {
                     for i in 0..n {
@@ -2470,7 +2511,7 @@ impl<'a> Calc<'a> {
                 }
 
                 // XLOOKUP：把位置映射到返回区
-                let Some((ra, rb)) = nodes.get(2).and_then(literal) else {
+                let Some((ra, rb)) = nodes.get(2).and_then(literal_range) else {
                     return self.call_generic(name, nodes, si);
                 };
                 let ridx = match self.sheet_index(ra.sheet.as_deref(), si) {
@@ -2499,26 +2540,10 @@ impl<'a> Calc<'a> {
                     "SUM" | "SUMIF" | "COUNTIF" | "COUNTA" | "AVERAGE" | "MAX" | "MIN"
                 ) && !nodes.is_empty() =>
             {
-                let literal = |n: &Node| -> Option<(RefExpr, RefExpr)> {
-                    match n {
-                        Node::Range(a, b)
-                            if a.book.is_none()
-                                && b.book.is_none()
-                                && a.sheet2.is_none()
-                                && b.sheet2.is_none() =>
-                        {
-                            Some((a.clone(), b.clone()))
-                        }
-                        Node::Ref(a) if a.book.is_none() && a.sheet2.is_none() => {
-                            Some((a.clone(), a.clone()))
-                        }
-                        _ => None,
-                    }
-                };
                 let simple = matches!(name.as_str(), "SUM" | "COUNTA" | "AVERAGE" | "MAX" | "MIN");
                 let ok_arity = if simple { nodes.len() == 1 } else { nodes.len() >= 2 };
                 if ok_arity {
-                    if let Some((ra, rb)) = literal(&nodes[0]) {
+                    if let Some((ra, rb)) = literal_range(&nodes[0]) {
                         // 三维引用不是单张表的矩形，不能走单表区域聚合缓存。
                         if ra.sheet2.is_some() || rb.sheet2.is_some() {
                             return self.call_generic(name, nodes, si);
@@ -2552,7 +2577,7 @@ impl<'a> Calc<'a> {
                             let effective = sumif_amount_range(nodes);
                             match effective.as_ref().or(nodes.get(2)) {
                                 None => None,
-                                Some(n2) => match literal(n2) {
+                                Some(n2) => match literal_range(n2) {
                                     Some((sa, sb))
                                         if sa.sheet2.is_none()
                                             && sb.sheet2.is_none()
@@ -2613,16 +2638,8 @@ impl<'a> Calc<'a> {
                             "COUNTIF" => {
                                 let c = functions::Crit::parse(&crit);
                                 let range = (key.0, key.1, key.2, key.3, key.4);
-                                let n = if self.requested.is_none() && c.indexable() && data.len() >= 256
-                                    && self.last_count_range.replace(range) == Some(range)
-                                {
-                                    if self.count_index.as_ref().is_none_or(|(k, _)| *k != range) {
-                                        self.count_index = Some((range, functions::CountIndex::new(&data)));
-                                    }
-                                    self.count_index.as_ref().unwrap().1.count(&c)
-                                } else {
-                                    data.iter().filter(|v| c.matches(v)).count()
-                                };
+                                let index = self.requested.is_none().then(|| self.count_indexes.get(range, &data, &c)).flatten();
+                                let n = index.map_or_else(|| data.iter().filter(|v| c.matches(v)).count(), |index| index.count(&c));
                                 FValue::number(n as f64)
                             }
                             _ => {
@@ -2630,24 +2647,30 @@ impl<'a> Calc<'a> {
                                 let c = functions::Crit::parse(&crit);
                                 let amounts = sum_spec.map(|(sidx, sa, sb)| self.cached_grid(sidx, &sa, &sb));
                                 let mut t = 0.0;
-                                for (i, v) in data.iter().enumerate() {
-                                    if c.matches(v) {
-                                        let amount = match &amounts {
-                                            Some((amount_rows, amount_cols, values)) => {
-                                                let (row, col) = (i / cols, i % cols);
-                                                if row >= *amount_rows || col >= *amount_cols { continue; }
-                                                &values[row * amount_cols + col]
-                                            }
-                                            None => v,
-                                        };
-                                        match amount {
-                                            FValue::Number(n) => t += n,
-                                            FValue::Error(e) => return FValue::Error(*e),
-                                            _ => {}
+                                let mut add = |i: usize| {
+                                    let amount = match &amounts {
+                                        Some((amount_rows, amount_cols, values)) => {
+                                            let (row, col) = (i / cols, i % cols);
+                                            if row >= *amount_rows || col >= *amount_cols { return Ok(()); }
+                                            &values[row * amount_cols + col]
                                         }
+                                        None => &data[i],
+                                    };
+                                    match amount {
+                                        FValue::Number(n) => t += n,
+                                        FValue::Error(e) => return Err(*e),
+                                        _ => {}
                                     }
-                                }
-                                FValue::number(t)
+                                    Ok(())
+                                };
+                                let range = (key.0, key.1, key.2, key.3, key.4);
+                                let index = self.requested.is_none().then(|| self.count_indexes.get(range, &data, &c)).flatten();
+                                let sum = if let Some(mut rows) = index.and_then(|ix| ix.rows(&c)) {
+                                    rows.try_for_each(&mut add)
+                                } else {
+                                    (0..data.len()).filter(|&i| c.matches(&data[i])).try_for_each(add)
+                                };
+                                sum.map(|()| FValue::number(t)).unwrap_or_else(FValue::Error)
                             }
                         };
                         if let Some(start) = t0 { prof_record(&format!("{name}#agg"), start.elapsed().as_secs_f64()); }
@@ -2685,7 +2708,14 @@ impl<'a> Calc<'a> {
                     self.agg_hits += 1;
                     return value.clone();
                 }
-                let out = if matches!(name.as_str(), "RAND" | "RANDBETWEEN" | "RANDARRAY" | "NOW" | "TODAY") {
+                let grouped = criteria_key.as_ref().and_then(|k| {
+                    self.ordered_criteria.lookup(k, &args).or_else(||
+                        self.grouped_criteria.get_mut(k.function as usize)?.lookup(k, &args))
+                        .or_else(|| self.match_indexes.lookup(k,&args))
+                });
+                let out = if let Some(value) = grouped {
+                    value
+                } else if matches!(name.as_str(), "RAND" | "RANDBETWEEN" | "RANDARRAY" | "NOW" | "TODAY") {
                     let cell = (self.cur_sheet, self.cur.0, self.cur.1);
                     let count = self.volatile_counts.entry(cell).or_default();
                     let key = (cell, *count, format!("{name}:{args:?}"));
@@ -2698,7 +2728,10 @@ impl<'a> Calc<'a> {
                         value
                     }
                 } else {
-                    functions::call(name, &args)
+                    functions::call_or_else(name, &args, &mut || {
+                        if bound.is_some() { FValue::Error(ErrKind::Value) }
+                        else { self.call_named_lambda(name, si, false, &args) }
+                    })
                 };
                 if let Some(key) = criteria_key {
                     if self.criteria_cache.len() >= 16_384 { self.criteria_cache.clear(); }
@@ -2862,21 +2895,20 @@ impl<'a> Calc<'a> {
         si: usize,
         a: &RefExpr,
         b: &RefExpr,
-        cols: usize,
-        rows: usize,
         vertical: bool,
-    ) -> std::rc::Rc<HashMap<String, usize>> {
-        let key = (
-            si,
-            a.row.min(b.row),
-            a.col.min(b.col),
-            a.row.max(b.row),
-            a.col.max(b.col),
-        );
-        if let Some(ix) = self.lookup_index.get(&key) {
+    ) -> lookup_cache::Index {
+        let Some(key) = self.grid_key(si,a,b) else { return Default::default(); };
+        let local = (key, vertical);
+        if let Some(ix) = self.lookup_index.get(&local) {
             return ix.clone();
         }
-        let (_rows, _c, data) = self.cached_grid(si, a, b);
+        let sheet = &self.wb.sheets[si];
+        let span = if vertical { key.3 - key.1 } else { key.4 - key.2 };
+        if span >= 255 && let Some(ix) = sheet.shared_lookup.get(sheet, local) {
+            self.lookup_index.insert(local, ix.clone());
+            return ix;
+        }
+        let (rows, cols, data) = self.cached_grid(si, a, b);
         let count = if vertical { rows } else { cols };
         let mut map: HashMap<String, usize> = HashMap::with_capacity(count);
         for i in 0..count {
@@ -2889,9 +2921,20 @@ impl<'a> Calc<'a> {
                 map.entry(key_norm(v)).or_insert(i);
             }
         }
-        let rc = std::rc::Rc::new(map);
-        if self.requested.is_none() { self.lookup_index.insert(key, rc.clone()); }
-        rc
+        let index = std::sync::Arc::new(map);
+        if self.requested.is_none() {
+            if count >= 256 {
+                let sheet = &self.wb.sheets[si];
+                let (_, r1, c1, _, _) = key;
+                let rect = (r1 as u32, c1 as u32, r1 as u32 + if vertical { rows.saturating_sub(1) as u32 } else { 0 },
+                    c1 as u32 + if vertical { 0 } else { cols.saturating_sub(1) as u32 });
+                if !sheet.iter_rect(rect).any(|(_,c)| c.formula.is_some()) {
+                    sheet.shared_lookup.insert(sheet, local, index.clone());
+                }
+            }
+            self.lookup_index.insert(local, index.clone());
+        }
+        index
     }
 
     /// 同一轮重算里，同一块区域只物化一次
@@ -2901,6 +2944,17 @@ impl<'a> Calc<'a> {
         a: &RefExpr,
         b: &RefExpr,
     ) -> (usize, usize, std::rc::Rc<Vec<FValue>>) {
+        let Some(key) = self.grid_key(si,a,b) else { return (0,0,Default::default()); };
+        let (_,r1,c1,br,bc) = key;
+        let rows = (br - r1 + 1) as usize;
+        let cols = (bc - c1 + 1) as usize;
+        match self.materialize_range(key, rows * cols) {
+            Ok(values) => (rows, cols, values),
+            Err(_) => (0, 0, Default::default()),
+        }
+    }
+
+    fn grid_key(&mut self, si: usize, a: &RefExpr, b: &RefExpr) -> Option<RangeKey> {
         // 同样按实际使用范围裁剪，否则 A:A 会展开成 104 万格
         let (max_r, max_c) = self.sheet_bounds(si);
         let mut br = a.row.max(b.row);
@@ -2919,16 +2973,7 @@ impl<'a> Calc<'a> {
             bc = bc.min(max_c as i64);
         }
         let (r1, c1) = (a.row.min(b.row), a.col.min(b.col));
-        if br < r1 || bc < c1 {
-            return (0, 0, std::rc::Rc::new(Vec::new()));
-        }
-        let key = (si, r1, c1, br, bc);
-        let rows = (br - r1 + 1) as usize;
-        let cols = (bc - c1 + 1) as usize;
-        match self.materialize_range(key, rows * cols) {
-            Ok(values) => (rows, cols, values),
-            Err(_) => (0, 0, Default::default()),
-        }
+        (br >= r1 && bc >= c1).then_some((si,r1,c1,br,bc))
     }
 
     fn visible_summary_values(
@@ -3005,54 +3050,54 @@ impl<'a> Calc<'a> {
         functions::call(name, &self.function_args(name, nodes, si))
     }
 
-    fn grid_of(&mut self, n: &Node, si: usize) -> (usize, usize, Vec<FValue>) {
+    fn grid_of(&mut self, n: &Node, si: usize) -> (usize, usize, std::rc::Rc<Vec<FValue>>) {
         match n {
             Node::Ref(re) => {
                 if re.sheet2.is_some() || re.book.is_some() {
                     return match self.eval_node(n, si) {
                         FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
-                        FValue::Error(e) => (1, 1, vec![FValue::Error(e)]),
-                        v => (1, 1, vec![v]),
+                        FValue::Error(e) => (1, 1, vec![FValue::Error(e)].into()),
+                        v => (1, 1, vec![v].into()),
                     };
                 }
                 match self.sheet_index(re.sheet.as_deref(), si) {
                     Ok(idx) => {
                         let v = self.cell_value(idx, re.row.max(0) as u32, re.col.max(0) as u32).scalar();
-                        (1, 1, vec![v])
+                        (1, 1, vec![v].into())
                     }
-                    Err(_) => (0, 0, vec![]),
+                    Err(_) => (0, 0, vec![].into()),
                 }
             }
             Node::Spill(re) => {
                 if re.book.is_some() {
-                    return (1, 1, vec![FValue::Error(ErrKind::Ref)]);
+                    return (1, 1, vec![FValue::Error(ErrKind::Ref)].into());
                 }
                 match self.sheet_index(re.sheet.as_deref(), si) {
                     Ok(idx) => match self.spill_value(idx, re.row.max(0) as u32, re.col.max(0) as u32) {
                         FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
-                        FValue::Error(e) => (1, 1, vec![FValue::Error(e)]),
-                        _ => (1, 1, vec![FValue::Error(ErrKind::Ref)]),
+                        FValue::Error(e) => (1, 1, vec![FValue::Error(e)].into()),
+                        _ => (1, 1, vec![FValue::Error(ErrKind::Ref)].into()),
                     },
-                    Err(_) => (1, 1, vec![FValue::Error(ErrKind::Ref)]),
+                    Err(_) => (1, 1, vec![FValue::Error(ErrKind::Ref)].into()),
                 }
             },
             Node::Range(a, b) => {
                 if a.sheet2.is_some() || b.sheet2.is_some() || a.book.is_some() || b.book.is_some() {
                     return match self.eval_node(n, si) {
                         FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
-                        FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
-                        _ => (0, 0, vec![]),
+                        FValue::Error(e) => (0, 0, vec![FValue::Error(e)].into()),
+                        _ => (0, 0, vec![].into()),
                     };
                 }
                 match self.range_values(a, b, si) {
-                    Ok(Arg::Range { values, rows, cols }) => (rows, cols, (*values).clone()),
-                    _ => (0, 0, vec![]),
+                    Ok(Arg::Range { values, rows, cols }) => (rows, cols, values),
+                    _ => (0, 0, vec![].into()),
                 }
             }
             _ => match self.eval_node(n, si) {
                 FValue::Array(a) => (a.rows, a.cols, a.data.clone()),
-                FValue::Error(e) => (0, 0, vec![FValue::Error(e)]),
-                v => (1, 1, vec![v]),
+                FValue::Error(e) => (0, 0, vec![FValue::Error(e)].into()),
+                v => (1, 1, vec![v].into()),
             },
         }
     }
@@ -3109,41 +3154,38 @@ impl<'a> Calc<'a> {
         FValue::Error(ErrKind::Value)
     }
 
-    fn operand_values(&mut self, n: &Node, si: usize) -> Vec<FValue> {
-        if let Node::Range(a, b) = n {
-            if a.sheet2.is_none() && b.sheet2.is_none() {
-                if let Ok(Arg::Range { values, .. }) = self.range_values(a, b, si) {
-                    return (*values).clone();
-                }
-            }
-        }
-        let v = self.eval_node(n, si);
-        // MAP/BYROW 这类返回数组的函数，聚合时需要摊平
-        if let FValue::Array(a) = &v {
-            return a.data.clone();
-        }
-        vec![v]
-    }
-
     /// 二元运算的操作数一律当成二维块：区域/数组保留 rows×cols，标量是 1×1。
     /// 旧实现直接摊平成 Vec，长度相等就按 1×n 输出，纵向数组会被写成横的。
-    fn operand_block(&mut self, n: &Node, si: usize) -> (usize, usize, Vec<FValue>) {
+    fn operand_block(&mut self, n: &Node, si: usize) -> Arg {
         if let Node::Range(a, b) = n {
             if a.sheet2.is_none() && b.sheet2.is_none() {
-                if let Ok(Arg::Range { values, rows, cols }) = self.range_values(a, b, si) {
-                    return (rows.max(1), cols.max(1), (*values).clone());
+                if let Ok(range @ Arg::Range { .. }) = self.range_values(a, b, si) {
+                    return range;
                 }
             }
         }
-        match self.eval_node(n, si) {
-            FValue::Array(a) => (a.rows.max(1), a.cols.max(1), a.data.clone()),
-            v => (1, 1, vec![v]),
+        Arg::Val(self.eval_node(n, si))
+    }
+
+    fn eval_numeric_unary(&mut self, n: &Node, si: usize, op: impl Fn(f64) -> f64) -> FValue {
+        let arg = self.operand_block(n, si);
+        let (rows, cols) = functions::range_dims(&arg);
+        if arg.slice().is_empty() { return FValue::Error(ErrKind::Value); }
+        let apply = |v: &FValue| v.to_number().map(|x| FValue::number(op(x))).unwrap_or_else(FValue::Error);
+        if rows == 1 && cols == 1 {
+            return arg.slice().first().map(apply).unwrap_or(FValue::Error(ErrKind::Value));
         }
+        let out = arg.slice().iter().map(apply).collect();
+        FValue::Array(std::rc::Rc::new(value::Array::new(rows, cols, out)))
     }
 
     fn eval_binary(&mut self, op: BinOp, l: &Node, r: &Node, si: usize) -> FValue {
-        let (lr, lc, lv) = self.operand_block(l, si);
-        let (rr, rc, rv) = self.operand_block(r, si);
+        let left = self.operand_block(l, si);
+        let right = self.operand_block(r, si);
+        let (lr, lc) = functions::range_dims(&left);
+        let (rr, rc) = functions::range_dims(&right);
+        let (lv, rv) = (left.slice(), right.slice());
+        if lv.is_empty() || rv.is_empty() { return FValue::Error(ErrKind::Value); }
         if lr == 1 && lc == 1 && rr == 1 && rc == 1 {
             return bin_scalar(op, &lv[0], &rv[0]);
         }
@@ -3265,6 +3307,10 @@ pub fn from_fvalue(v: &FValue) -> crate::model::Value {
         // 函数值落盘没有对应类型，Excel 里显示 #CALC!
         FValue::Lambda(_) => V::Text("#CALC!".into()),
     }
+}
+
+fn callable_cache_candidate(value: &crate::Value) -> bool {
+    matches!(value, crate::Value::Text(text) if text.as_ref() == "#CALC!")
 }
 
 fn key_norm(v: &FValue) -> String {
@@ -3494,6 +3540,64 @@ pub fn recalc_dirty_cancelable(
     recalc_dirty_impl(wb, deps, seeds, Some(cancel)).is_some()
 }
 
+/// Existing materialized spills can stay in place when the edit and its dependency
+/// closure are disjoint from them. Imported arrays and blocked/unknown footprints
+/// need the existing whole-workbook stabilization pass.
+fn edit_touches_spill(wb: &Workbook, seeds: &[deps::CellKey]) -> bool {
+    wb.sheets.iter().enumerate().any(|(si, sheet)| {
+        sheet.arrays.iter().any(|&(anchor, (r1, c1, r2, c2))| {
+            // A legacy one-cell CSE formula may legitimately return a scalar; there
+            // are no spill tails to restore. An edit producing a new array is caught
+            // by the dirty evaluator before writeback.
+            if (anchor.row, anchor.col) == (r1, c1) && (r1, c1) == (r2, c2)
+                && !sheet.spill_shapes.contains_key(&anchor)
+                && sheet.get(r1, c1).is_some_and(|c| c.formula.is_some()) {
+                return false;
+            }
+            anchor.row != r1 || anchor.col != c1 || r2 < r1 || c2 < c1
+                || sheet.spill_shapes.get(&anchor) != Some(&(r2.saturating_sub(r1).saturating_add(1),
+                    c2.saturating_sub(c1).saturating_add(1)))
+        })
+            || (sheet.spill_shapes.is_empty() && !sheet.spilled.is_empty())
+            || (!sheet.spill_shapes.is_empty() && wb.calc_iterate)
+            || sheet.spill_shapes.len().saturating_mul(seeds.len()) > 100_000
+            || sheet.spill_shapes.iter().any(|(anchor, &(rows, cols))| {
+                rows == 0 || cols == 0 || seeds.iter().any(|&(s, r, c)| {
+                    s == si && r >= anchor.row && r - anchor.row < rows
+                        && c >= anchor.col && c - anchor.col < cols
+                })
+            })
+    })
+}
+
+/// Previously materialized tails can remain in place if their shape and values
+/// are unchanged. A changed tail may have readers outside the anchor's dirty
+/// closure, so in that case the whole pass is retried before committing results.
+fn write_dirty_results(wb: &mut Workbook, mut results: Vec<(usize, u32, u32, FValue)>) -> bool {
+    let mut stable = true;
+    results.retain(|(si, r, c, value)| {
+        let sh = &wb.sheets[*si];
+        let old = sh.spill_shapes.get(&CellRef::new(*r, *c));
+        match value {
+            FValue::Array(a) if a.rows > 0 && a.cols > 0 &&
+                old.is_some_and(|&(h, w)| (h as usize, w as usize) == (a.rows, a.cols)) => {
+                if (a.rows, a.cols) == (1, 1) { return true; }
+                stable &= (0..a.rows).all(|y| (0..a.cols).all(|x| {
+                    let key = CellRef::new(*r + y as u32, *c + x as u32);
+                    (y == 0 && x == 0 || sh.spilled.contains(&key))
+                        && sh.value(key.row, key.col) == from_fvalue(&a.get(y, x))
+                }));
+                false
+            }
+            FValue::Array(_) => { stable = false; false }
+            _ if old.is_some() => { stable = false; false }
+            _ => true,
+        }
+    });
+    if stable { write_back(wb, results); }
+    stable
+}
+
 fn recalc_dirty_impl(
     wb: &mut Workbook,
     deps: &deps::Deps,
@@ -3512,20 +3616,21 @@ fn recalc_dirty_impl(
     if seeds.is_empty() {
         return Some(0);
     }
-    let has_spills = wb.sheets.iter().any(|s| {
-        !s.spilled.is_empty() || !s.arrays.is_empty() || !s.spill_shapes.is_empty()
-    });
-    if deps.requires_full_recalc() || has_spills {
+    let dirty = if deps.requires_full_recalc() || edit_touches_spill(wb, seeds) {
+        None
+    } else {
+        Some(deps.edit_closure_cancelable(seeds, cancel)?)
+    };
+    let Some(mut dirty) = dirty else {
         // 用户覆盖溢出格时保留输入，让数组按正常冲突规则处理。
         for &(si, r, c) in seeds {
             if let Some(sheet) = wb.sheets.get_mut(si) {
                 sheet.spilled.remove(&CellRef::new(r, c));
             }
         }
-        let count = wb.sheets.iter().map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum();
+        let count = wb.sheets.iter().map(|s| s.formula_cells().count()).sum();
         return recalc_all_force_impl(wb, cancel, None).then_some(count);
-    }
-    let mut dirty = deps.edit_closure_cancelable(seeds, cancel)?;
+    };
     // 修改的公式也必须计算，不能只算它的下游。
     for &key in seeds {
         if wb.sheets.get(key.0).and_then(|s| s.get(key.1, key.2))
@@ -3548,22 +3653,38 @@ fn recalc_dirty_impl(
     let mut prev_nums: HashMap<deps::CellKey, f64> = HashMap::new();
     let mut last_count = 0usize;
     for pass in 0..passes {
-        let mut results = Vec::with_capacity(order.len());
-        {
+        let parallel = if wb.calc_iterate || profile_enabled() { None } else {
+            dependency_batch::dirty(wb,&order,&dirty,cancel)
+        };
+        if cancelled() { return None; }
+        let results = {
             let mut calc = Calc::new(wb);
-            calc.scope = Some(dirty.clone());
-            for (si, r, c) in &order {
-                if cancelled() { return None; }
-                let v = calc.cell_value(*si, *r, *c);
-                results.push((*si, *r, *c, v));
+            calc.scope = Some(&dirty);
+            if let Some(mut batch) = parallel {
+                let mut pending = batch.pending.iter().copied().peekable();
+                for (slot,(s,r,c,v)) in batch.values.iter().enumerate() {
+                    if pending.next_if_eq(&slot).is_none() { calc.memo.insert((*s,*r,*c),v.clone()); }
+                }
+                for slot in batch.pending {
+                    if cancelled() { return None; }
+                    let (si,r,c) = order[slot];
+                    batch.values[slot].3 = calc.cell_value(si,r,c);
+                }
+                batch.values
+            } else {
+                let mut results = Vec::with_capacity(order.len());
+                for &(si,r,c) in &order {
+                    if cancelled() { return None; }
+                    results.push((si,r,c,calc.cell_value(si,r,c)));
+                }
+                results
             }
-        }
+        };
         // 新公式可能第一次产生数组，此时尚无 spilled 标记。
-        if results.iter().any(|(_, _, _, value)| matches!(value, FValue::Array(_))) {
-            let count = wb.sheets.iter().map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum();
+        if !write_dirty_results(wb, results) {
+            let count = wb.sheets.iter().map(|s| s.formula_cells().count()).sum();
             return recalc_all_force_impl(wb, cancel, None).then_some(count);
         }
-        write_back(wb, results);
         last_count = order.len();
         if !wb.calc_iterate {
             break;
@@ -3593,11 +3714,21 @@ fn recalc_dirty_impl(
     Some(last_count)
 }
 
+fn large_spill(&(rows, cols): &(u32, u32)) -> bool {
+    u64::from(rows) * u64::from(cols) > 4096
+}
+
 /// 仅即时计算 `seeds` 中本身带有公式的单元格（供提交编辑时在广播前毫秒级算出当前格结果）。
 /// 若遇到需整表物化的动态数组溢出返回 `false`，普通标量公式写回后返回 `true`。
 pub fn eval_formula_seeds_immediate(wb: &mut Workbook, seeds: &[deps::CellKey]) -> bool {
     if wb.calc_manual || seeds.is_empty() {
         return true;
+    }
+    // Both the edit broadcaster and the interactive planner use this path.
+    // Avoid evaluating a known large anchor once here and then again on the worker.
+    if seeds.iter().any(|&(si, r, c)| wb.sheets.get(si)
+        .and_then(|sh| sh.spill_shapes.get(&CellRef::new(r, c))).is_some_and(large_spill)) {
+        return false;
     }
     let mut formula_seeds: Vec<deps::CellKey> = seeds
         .iter()
@@ -3618,17 +3749,13 @@ pub fn eval_formula_seeds_immediate(wb: &mut Workbook, seeds: &[deps::CellKey]) 
     let mut results = Vec::with_capacity(formula_seeds.len());
     {
         let mut calc = Calc::new(wb);
-        calc.scope = Some(scope);
+        calc.scope = Some(&scope);
         for &(si, r, c) in &formula_seeds {
             let v = calc.cell_value(si, r, c);
-            if matches!(v, FValue::Array(_)) {
-                return false;
-            }
             results.push((si, r, c, v));
         }
     }
-    write_back(wb, results);
-    true
+    write_dirty_results(wb, results)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3663,10 +3790,13 @@ pub fn recalc_interactive_plan(
         return Complete;
     }
     let total_cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
-    if deps_ready && total_cells <= 1_200 {
+    // Blank spill tails consume calculation time without increasing Sheet::len().
+    if deps_ready && total_cells <= 1_200
+        && !wb.sheets.iter().any(|sh| sh.spill_shapes.values().any(large_spill)) {
         recalc_dirty(wb, deps, seeds);
         return Complete;
     }
+    let touches_spill = edit_touches_spill(wb, seeds);
     for &(si, r, c) in seeds {
         if let Some(sheet) = wb.sheets.get_mut(si) {
             sheet.spilled.remove(&CellRef::new(r, c));
@@ -3675,14 +3805,18 @@ pub fn recalc_interactive_plan(
     if !eval_formula_seeds_immediate(wb, seeds) {
         return BackgroundFull;
     }
-    let has_spills_or_arrays = wb
-        .sheets
-        .iter()
-        .any(|s| !s.spilled.is_empty() || !s.spill_shapes.is_empty() || !s.arrays.is_empty());
-    if !deps_ready || deps.requires_full_recalc() || has_spills_or_arrays || wb.calc_iterate {
+    if !deps_ready || deps.requires_full_recalc() || touches_spill || wb.calc_iterate {
         return BackgroundFull;
     }
     let Some(dirty) = deps.edit_closure_limited(seeds, 96) else { return BackgroundDirty; };
+    // Large materialized arrays can take longer than a frame to compare.
+    let mut has_tail = false;
+    for &(s, r, c) in &dirty {
+        if let Some(shape) = wb.sheets.get(s).and_then(|sh| sh.spill_shapes.get(&CellRef::new(r, c))) {
+            if large_spill(shape) { return BackgroundDirty; }
+            has_tail |= shape.0 > 1 || shape.1 > 1;
+        }
+    }
     if dirty.is_empty() {
         return Complete;
     }
@@ -3694,27 +3828,23 @@ pub fn recalc_interactive_plan(
     let mut timed_out = false;
     {
         let mut calc = Calc::new(wb);
-        calc.scope = Some(dirty);
+        calc.scope = Some(&dirty);
         for (idx, &(si, r, c)) in order.iter().enumerate() {
             if idx >= 4 && t0.elapsed() > budget {
                 timed_out = true;
                 break;
             }
             let v = calc.cell_value(si, r, c);
-            if matches!(v, FValue::Array(_)) {
-                return BackgroundFull;
-            }
             results.push((si, r, c, v));
         }
     }
-    if !results.is_empty() {
-        write_back(wb, results);
-    }
+    if timed_out && has_tail { return BackgroundDirty; }
+    if !write_dirty_results(wb, results) { return BackgroundFull; }
     if timed_out { BackgroundDirty } else { Complete }
 }
 
-fn clear_spills(wb: &mut Workbook) {
-    for sheet in &mut wb.sheets {
+fn clear_spills(wb: &mut Workbook, selected: Option<&[bool]>) {
+    for (_,sheet) in wb.sheets.iter_mut().enumerate().filter(|(i,_)| selected.is_none_or(|s| s[*i])) {
         // `Sheet::set` 会把被用户覆盖的格子从 spilled 里摘掉，
         // 所以这里剩下的键一定还是上次溢出写的值，可以安全清掉。
         sheet.spill_shapes.clear();
@@ -3726,8 +3856,8 @@ fn clear_spills(wb: &mut Workbook) {
     }
 }
 
-fn spill_values(wb: &Workbook) -> HashMap<deps::CellKey, crate::Value> {
-    wb.sheets.iter().enumerate().flat_map(|(si, sheet)| {
+fn spill_values(wb: &Workbook, selected: Option<&[bool]>) -> HashMap<deps::CellKey, crate::Value> {
+    wb.sheets.iter().enumerate().filter(|(i,_)| selected.is_none_or(|s| s[*i])).flat_map(|(si, sheet)| {
         sheet.spilled.iter().map(move |key| ((si, key.row, key.col), sheet.value(key.row, key.col)))
     }).collect()
 }
@@ -3752,19 +3882,42 @@ pub fn recalc_all_force(wb: &mut Workbook) {
 }
 
 /// 全量计算的实现：可在公式循环里检查取消标志并把进度写进两个原子计数。
-/// 返回 `false` 表示被取消（此时写回还没发生，模型保持原值，并标 `calc_pending`）。
+/// 返回 `false` 表示被取消，并标 `calc_pending`。调用方应丢弃取消的工作快照：
+/// 多遍计算可能已经物化了前一遍的溢出区或迭代值。
 pub fn recalc_all_force_impl(
     wb: &mut Workbook,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     progress: Option<(&std::sync::atomic::AtomicUsize, &std::sync::atomic::AtomicUsize)>,
 ) -> bool {
+    recalc_selected(wb,None,cancel,progress)
+}
+
+fn recalc_selected(
+    wb: &mut Workbook, selected: Option<&[bool]>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: Option<(&std::sync::atomic::AtomicUsize, &std::sync::atomic::AtomicUsize)>,
+) -> bool {
     use std::sync::atomic::Ordering;
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        wb.calc_pending = true;
+        if let Some((done, total)) = progress {
+            done.store(0, Ordering::Relaxed);
+            total.store(wb.sheets.iter().map(|s| s.formula_cells().count()).sum(), Ordering::Relaxed);
+        }
+        return false;
+    }
     if profile_enabled() { prof_reset(); }
     let prev_now = functions::ensure_now_snapshot_in(wb.date_system);
     // 重算不是用户编辑：记下 edited，写回后再恢复。否则未改过的表
     // （尤其是动态数组表）会被当成 dirty，保存时整表重写，_xlfn 前缀
     // 和溢出缓存都会丢，Excel 打不开/结果不对。
     let edited_before: Vec<bool> = wb.sheets.iter().map(|s| s.edited).collect();
+    let mark_cancelled = |wb: &mut Workbook| {
+        wb.calc_pending = true;
+        for (sheet, was) in wb.sheets.iter_mut().zip(&edited_before) { sheet.edited = *was; }
+        functions::set_now_snapshot(prev_now);
+        false
+    };
     wb.calc_pending = false;
     wb.calc_pending_sheets.clear();
     let phase = std::env::var("SC_PHASE").is_ok();
@@ -3780,7 +3933,7 @@ pub fn recalc_all_force_impl(
     }
     // 文件里带 t="array" ref 的公式，覆盖区域里存的是上次的结果值；
     // 先把这些格子登记成溢出区，否则重算时会被自己上次的结果挡住（#SPILL!）
-    for sheet in wb.sheets.iter_mut() {
+    for (_,sheet) in wb.sheets.iter_mut().enumerate().filter(|(i,_)| selected.is_none_or(|s| s[*i])) {
         for (anchor, (r1, c1, r2, c2)) in sheet.arrays.clone() {
             for r in r1..=r2 {
                 for c in c1..=c2 {
@@ -3793,11 +3946,16 @@ pub fn recalc_all_force_impl(
         }
     }
     // 先清掉上一轮的溢出单元格
-    clear_spills(wb);
+    clear_spills(wb,selected);
 
     mark!("清溢出");
-    let formula_count: usize = wb.sheets.iter()
-        .map(|s| s.iter().filter(|(_, c)| c.formula.is_some()).count()).sum();
+    // Recalculation changes values and spill tails, not formula text. Preserve row-major
+    // order for intersecting spills while skipping pages that cannot contain formulas.
+    let mut formulas: Vec<_> = wb.sheets.iter().enumerate().filter(|(i,_)| selected.is_none_or(|s| s[*i])).flat_map(|(si, sh)|
+        sh.formula_cells().map(move |(k, _)| (si, k.row, k.col))).collect();
+    formulas.sort_unstable();
+    let scope: Option<HashSet<_>> = selected.map(|_| formulas.iter().copied().collect());
+    let formula_count = formulas.len();
     // 无环的溢出依赖链每遍至少推进一个公式；再多一遍确认稳定。
     // 迭代计算：环上按上一轮值反复推进，最多 calc_max_iterations 遍（Excel 默认 100）
     let passes = if wb.calc_iterate {
@@ -3813,44 +3971,49 @@ pub fn recalc_all_force_impl(
     let mut prev_nums: HashMap<deps::CellKey, f64> = HashMap::new();
     for _pass in 0..passes {
         pass_done += 1;
-        let before_spills = spill_values(wb);
-        let formulas: Vec<(usize, u32, u32)> = wb
-            .sheets
-            .iter()
-            .enumerate()
-            .flat_map(|(si, s)| {
-                s.iter()
-                    .filter(|(_, c)| c.formula.is_some())
-                    .map(move |(r, _)| (si, r.row, r.col))
-            })
-            .collect();
-
+        let before_spills = spill_values(wb,selected);
         mark!("收集公式");
         if let Some((done, total)) = progress {
             total.store(formulas.len(), Ordering::Relaxed);
             done.store(0, Ordering::Relaxed);
         }
-        let mut results: Vec<(usize, u32, u32, FValue)> = Vec::with_capacity(formulas.len());
-        {
+        let parallel = if selected.is_none() && !wb.calc_iterate && !profile_enabled() {
+            let done = progress.map(|p| p.0);
+            let independent = scalar_batch::evaluate(wb, &formulas, cancel, done);
+            dependency_batch::evaluate(wb, &formulas, independent, cancel, done)
+        } else { None };
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return mark_cancelled(wb);
+        }
+        let (mut results, pending) = match parallel {
+            Some(batch) => (batch.values, Some(batch.pending)),
+            None => (Vec::with_capacity(formulas.len()), None),
+        };
+        let remaining = pending.as_ref().map_or(formulas.len(), Vec::len);
+        if remaining > 0 {
             let mut calc = Calc::new(wb);
+            calc.scope = scope.as_ref();
+            if pending.is_some() {
+                // Sequential formulas may refer to any numeric batch result, even across sheets.
+                // Keep the original sheet untouched until the complete pass is ready to publish.
+                calc.memo.extend(results.iter().filter(|(_, _, _, v)| !matches!(v, FValue::Empty))
+                    .map(|&(s, r, c, ref value)| ((s, r, c), value.clone())));
+            }
             calc.volatile_values = std::mem::take(&mut volatile_values);
             let profile = profile_enabled();
             let mut slow: Vec<(f64, usize, u32, u32, String)> = Vec::new();
-            for (i, (si, r, c)) in formulas.into_iter().enumerate() {
+            for i in 0..remaining {
+                let slot = pending.as_ref().map_or(i, |indices| indices[i]);
+                let (si, r, c) = formulas[slot];
                 if let Some(flag) = cancel {
                     // 每 256 个公式查一次，取消时立刻放弃本轮（尚未写回）
                     if i % 256 == 0 && flag.load(Ordering::Relaxed) {
                         drop(calc);
-                        wb.calc_pending = true;
-                        for (sheet, was) in wb.sheets.iter_mut().zip(edited_before.iter()) {
-                            sheet.edited = *was;
-                        }
-                        functions::set_now_snapshot(prev_now);
-                        return false;
+                        return mark_cancelled(wb);
                     }
                 }
                 if let Some((done, _)) = progress {
-                    done.store(i, Ordering::Relaxed);
+                    done.store(formulas.len() - remaining + i, Ordering::Relaxed);
                 }
                 let t0 = profile.then(std::time::Instant::now);
                 let v = calc.cell_value(si, r, c);
@@ -3866,7 +4029,8 @@ pub fn recalc_all_force_impl(
                             .unwrap_or_default(),
                     ));
                 }
-                results.push((si, r, c, v));
+                if pending.is_some() { results[slot].3 = v; }
+                else { results.push((si, r, c, v)); }
             }
             if profile {
                 for (n, c, t) in prof_dump().into_iter().take(15) {
@@ -3893,7 +4057,11 @@ pub fn recalc_all_force_impl(
             .filter(|(_, _, _, v)| matches!(v, FValue::Array(_)))
             .map(|(si, r, c, v)| ((*si, *r, *c), v.clone())).collect();
         let final_results = (_pass + 1 == passes).then(|| results.clone());
-        clear_spills(wb);
+        // A cancellation can arrive while worker results are collected into source order.
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return mark_cancelled(wb);
+        }
+        clear_spills(wb,selected);
         write_back(wb, results);
         mark!("写回");
         if std::env::var("SC_CHECKSUM").is_ok() {
@@ -3909,7 +4077,7 @@ pub fn recalc_all_force_impl(
             }
             eprintln!("[checksum] pass {} 数值格 {} 合计 {:.6}", _pass + 1, cnt, sum);
         }
-        let after_spills = spill_values(wb);
+        let after_spills = spill_values(wb,selected);
         // 普通模式：溢出块稳定即停。迭代模式不能在这里停——环上格子没有溢出，
         // 一停就只跑一遍，永远到不了不动点。
         if !wb.calc_iterate && before_spills == after_spills && (!force_two || _pass > 0) {
@@ -3927,7 +4095,7 @@ pub fn recalc_all_force_impl(
             let mut affected = graph.closure(&unstable.iter().copied().collect::<Vec<_>>());
             affected.extend(changing_arrays);
             affected.extend(graph.dynamic_cells());
-            clear_spills(wb);
+            clear_spills(wb,selected);
             for (si, r, c, value) in &mut final_results {
                 let key = (*si, *r, *c);
                 // 迭代计算时环上格子每遍都在变，它们不属于「不稳定」，而是收敛过程本身；
@@ -4060,7 +4228,7 @@ pub fn recalc_sheet(wb: &mut Workbook, sheet: usize) -> usize {
         let before = sheet_spill_values(wb, sheet);
         let results = {
             let mut calc = Calc::new(wb);
-            calc.scope = Some(scope.clone());
+            calc.scope = Some(&scope);
             calc.volatile_values = std::mem::take(&mut volatile_values);
             let out: Vec<_> = seeds
                 .iter()

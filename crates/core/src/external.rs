@@ -751,49 +751,59 @@ pub fn import_csv_opts(
     let records = crate::csv::records_strict_q(&text, delim, quote).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
-    let mut grid: Vec<Vec<Cell>> = Vec::with_capacity(records.len());
-    for (ri, rec) in records.iter().enumerate() {
-        let mut row = Vec::with_capacity(rec.len());
-        for (ci, f) in rec.iter().enumerate() {
-            let cell = if header && ri == 0 {
-                Cell { value: Value::Text(f.as_str().into()), formula: None }
-            } else if text_cols.contains(&(ci as u32)) {
-                if f.is_empty() {
-                    Cell::default()
-                } else {
-                    Cell { value: Value::Text(f.as_str().into()), formula: None }
-                }
-            } else {
-                parse_field(f)
-            };
-            row.push(cell);
-        }
-        grid.push(row);
-    }
-    let rows = grid.len() as u32;
-    let cols = grid.iter().map(|r| r.len() as u32).max().unwrap_or(0);
+    let (rows, cols) = import_csv_records(sheet, records, header, text_cols, old, at);
+    Ok((rows, cols, used))
+}
+
+/// Apply fully validated CSV records, including the shorter rows of a refreshed source.
+pub fn import_csv_records(
+    sheet: &mut Sheet,
+    records: Vec<Vec<String>>,
+    header: bool,
+    text_cols: &[u32],
+    old: (u32, u32),
+    at: (u32, u32),
+) -> (u32, u32) {
+    visit_csv_records(records, header, text_cols, old, at, |r, c, cell| {
+        sheet.set(r, c, cell);
+        Ok::<_, std::convert::Infallible>(())
+    }).unwrap()
+}
+
+/// Emit the same writes as import_csv_records, allowing a detached preparation to stop.
+pub fn visit_csv_records<E>(
+    records: Vec<Vec<String>>, header: bool, text_cols: &[u32], old: (u32, u32), at: (u32, u32),
+    mut write: impl FnMut(u32, u32, Cell) -> Result<(), E>,
+) -> Result<(u32, u32), E> {
+    let rows = records.len() as u32;
+    let cols = records.iter().map(|r| r.len() as u32).max().unwrap_or(0);
     // 旧区域里超出新数据的部分要清掉（只清自己上次写的那块）
     for r in 0..old.0 {
-        for c in 0..old.1 {
-            if r >= rows || c >= cols {
-                sheet.set(at.0 + r, at.1 + c, Cell::default());
-            }
+        for c in (if r >= rows { 0 } else { cols.min(old.1) })..old.1 {
+            write(at.0 + r, at.1 + c, Cell::default())?;
         }
     }
-    for (ri, row) in grid.into_iter().enumerate() {
+    for (ri, row) in records.into_iter().enumerate() {
         if (ri as u32) < old.0 {
             // 短行补齐：新矩形里这一行没有的列要清空，才能和首次导入一致
             for ci in row.len()..cols as usize {
                 if (ci as u32) < old.1 {
-                    sheet.set(at.0 + ri as u32, at.1 + ci as u32, Cell::default());
+                    write(at.0 + ri as u32, at.1 + ci as u32, Cell::default())?;
                 }
             }
         }
-        for (ci, cell) in row.into_iter().enumerate() {
-            sheet.set(at.0 + ri as u32, at.1 + ci as u32, cell);
+        for (ci, field) in row.into_iter().enumerate() {
+            let cell = if header && ri == 0 {
+                Cell { value: Value::Text(field.into()), formula: None }
+            } else if text_cols.contains(&(ci as u32)) && !field.is_empty() {
+                Cell { value: Value::Text(field.into()), formula: None }
+            } else {
+                parse_field(&field)
+            };
+            write(at.0 + ri as u32, at.1 + ci as u32, cell)?;
         }
     }
-    Ok((rows, cols, used))
+    Ok((rows, cols))
 }
 
 /// 数字就当数字，空就是空，别的原样当文本
@@ -817,6 +827,16 @@ pub fn copy_from_sheet(
     dst: &mut Sheet,
     at: (u32, u32),
 ) -> (u32, u32) {
+    visit_source_sheet(src, rect, at, |r, c, cell| {
+        dst.set(r, c, cell);
+        Ok::<_, std::convert::Infallible>(())
+    }).unwrap()
+}
+
+pub fn visit_source_sheet<E>(
+    src: &Sheet, rect: (u32, u32, u32, u32), at: (u32, u32),
+    mut write: impl FnMut(u32, u32, Cell) -> Result<(), E>,
+) -> Result<(u32, u32), E> {
     let (r1, c1, r2, c2) = rect;
     let mut rows = 0;
     let mut cols = 0;
@@ -830,16 +850,16 @@ pub fn copy_from_sheet(
         for c in c1..=c2 {
             let formula = Some(format!("={quoted}!{}", crate::model::cell_name(r, c)).into());
             let value = src.get(r, c).map(|x| x.value.clone()).unwrap_or_default();
-            dst.set(
+            write(
                 at.0 + (r - r1),
                 at.1 + (c - c1),
-                Cell { value: value.clone(), formula },
-            );
+                Cell { value, formula },
+            )?;
             cols = cols.max(c - c1 + 1);
         }
         rows = rows.max(r - r1 + 1);
     }
-    (rows, cols)
+    Ok((rows, cols))
 }
 
 /// 刷新一个数据源；返回写出的 (行, 列)

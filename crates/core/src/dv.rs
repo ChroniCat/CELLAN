@@ -152,7 +152,7 @@ pub enum DvVerdict {
     InformThenAccept,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DataValidation {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub kind: DvKind,

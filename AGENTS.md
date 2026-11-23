@@ -13,6 +13,7 @@
   - 本仓库使用 **Windows 原生 MSVC Rust 工具链**（位于 Windows 侧 `%USERPROFILE%\.cargo\bin\cargo.exe`，仓库 Windows 路径为 `F:\finance-native-sheets-ready`，WSL 挂载路径为 `/mnt/f/finance-native-sheets-ready`）。
   - **若当前 Agent 运行在 WSL / Linux Bash 环境**：必须通过 `powershell.exe` 调用 Windows 侧的 `cargo` 与脚本，并始终附带 `-NoProfile -NonInteractive -InputFormat None` 及 `< /dev/null` 防止标准输入挂起。
   - 优先追加 `--offline` 使用本地依赖缓存构建与测试。
+  - 本机常规 Rust 编译与测试使用 D 盘。PowerShell 中设置 `$env:CARGO_TARGET_DIR = "D:\CELLAN-build\target"` 并将本次进程的 `TEMP`、`TMP` 指向 D 盘已创建的临时目录。正式发版时把专用发布 worktree 建在 D 盘，由脚本使用该 worktree 自己的 `target`。
 
 ### 每个任务使用独立 worktree
 

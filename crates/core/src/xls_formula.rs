@@ -9,7 +9,7 @@
 //! - 定义名称：ptgName 的索引是「第几条 NAME 记录」，1 起；
 //! - 2007 之后才有的函数：先 ptgName 把 `_xlfn.名字` 压栈，再 ptgFuncVar(iftab=0xFF)。
 
-use crate::formula::value::FValue;
+use crate::Value;
 use crate::formula::{BinOp, Node, RefExpr};
 use anyhow::{bail, Result};
 use std::collections::HashMap;
@@ -426,7 +426,7 @@ impl Compiler<'_> {
         &mut self,
         rows: usize,
         cols: usize,
-        vals: &[FValue],
+        vals: &[Value],
         out: &mut Vec<u8>,
     ) -> Result<()> {
         if rows == 0 || cols == 0 || rows * cols > 0x40 {
@@ -444,19 +444,19 @@ impl Compiler<'_> {
         self.extra.push(0);
         for v in vals {
             let (tag, payload): (u8, Vec<u8>) = match v {
-                FValue::Empty => (0x00, vec![0u8; 8]),
-                FValue::Number(n) => (0x01, n.to_le_bytes().to_vec()),
-                FValue::Bool(b) => {
+                Value::Empty => (0x00, vec![0u8; 8]),
+                Value::Number(n) => (0x01, n.to_le_bytes().to_vec()),
+                Value::Bool(b) => {
                     let mut b8 = vec![0u8; 8];
                     b8[0] = if *b { 1 } else { 0 };
                     (0x04, b8)
                 }
-                FValue::Error(e) => {
+                Value::Error(e) => {
                     let mut b8 = vec![0u8; 8];
                     b8[0] = err_code(*e);
                     (0x10, b8)
                 }
-                FValue::Text(_) | FValue::Array(_) | FValue::Lambda(_) => {
+                Value::Text(_) => {
                     bail!("数组常量里的文本/嵌套数组暂时写不进 .xls")
                 }
             };

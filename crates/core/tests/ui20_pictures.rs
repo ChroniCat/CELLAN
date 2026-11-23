@@ -188,3 +188,44 @@ fn moved_picture_rewrites_anchor_and_deleting_it_removes_anchor() {
         assert!(!xml.contains("<xdr:pic"), "删图后不该留下 pic 锚点：{xml}");
     }
 }
+
+#[test]
+fn two_sheets_saved_together_own_distinct_drawings_through_a_utf16_edit() {
+    use sheetcore::{Sheet,model::Workbook,pic::Picture,textbox::TextBox,xlsx};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("two-drawings.xlsx");
+    let mut wb = Workbook::new_blank();
+    wb.sheets.push(Sheet::new("Second"));
+    xlsx::save(&path,&wb).unwrap();
+    for pictures_first in [true, false] {
+        let mut wb = xlsx::load(&path).unwrap();
+        for (index,sheet) in wb.sheets.iter_mut().enumerate() {
+            if pictures_first {
+                let data = tiny_png();
+                sheet.pictures.push(Picture { rect: (index as u32,0,5,5), off: [0;4],
+                    part: sheetcore::pic_write::memory_part(&data,"png"), data: Some(data.into()),
+                    ext:"png".into(), name: format!("pic{index}") });
+                sheet.pictures_dirty = true;
+            } else {
+                assert_eq!(sheet.pictures.len(),1);
+                sheet.textboxes.push(TextBox { text:format!("sheet {index}"),..Default::default() });
+                sheet.textboxes_dirty = true;
+            }
+        }
+        xlsx::save(&path,&wb).unwrap();
+        let drawings: Vec<_> = names(&path).into_iter().filter(|n| n.starts_with("xl/drawings/drawing") && n.ends_with(".xml")).collect();
+        assert_eq!(drawings.len(),2);
+        if pictures_first {
+            for part_name in drawings {
+                let xml = String::from_utf8(part(&path,&part_name).unwrap()).unwrap().replace("UTF-8","UTF-16");
+                let bytes: Vec<_> = [0xff,0xfe].into_iter().chain(xml.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+                sheetcore::patch::append_entry(&path,&part_name,&bytes).unwrap();
+            }
+        }
+    }
+    for (index,sheet) in xlsx::load(&path).unwrap().sheets.iter().enumerate() {
+        assert_eq!(sheet.pictures.len(),1);
+        assert_eq!(sheet.pictures[0].rect.0,index as u32);
+        assert_eq!(sheet.textboxes[0].text,format!("sheet {index}"));
+    }
+}

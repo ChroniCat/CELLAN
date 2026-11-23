@@ -132,10 +132,221 @@ impl PreparedKey {
 
 /// Ordered cells to change, suitable for one undo action. Every value is read
 /// before mutation, including destinations that were empty before the operation.
+pub type LinePermutation = ((u32,u32,u32,u32), bool, Vec<u32>);
+
 #[derive(Debug, Default)]
 pub struct RowChanges {
+    pub permutation: Option<LinePermutation>,
     pub deltas: Vec<CellDelta>,
     pub count: usize,
+}
+
+/// Dense numeric sorts retain one row-major value snapshot and the permutation.
+/// Deltas for audit, undo and collaboration are reconstructed in destination order.
+pub struct NumericSort {
+    pub sheet: usize,
+    first_row: u32,
+    first_col: u32,
+    width: usize,
+    values: Vec<f64>,
+    styles: Vec<u16>,
+    order: Vec<u32>,
+}
+
+impl NumericSort {
+    /// The general planner handles mixed types, formulas, sparse ranges and column sorts.
+    pub fn plan(
+        sheet: &Sheet, index: usize, region: (u32, u32, u32, u32), key: u32, asc: bool,
+    ) -> Result<Option<Self>, String> {
+        let (r1, c1, r2, c2) = region;
+        if r1 >= r2 || c1 > c2 || !(c1..=c2).contains(&key) { return Ok(None); }
+        let width = (c2 - c1 + 1) as usize;
+        let area = width as u64 * u64::from(r2 - r1 + 1);
+        if area <= 100_000 || area > sheet.len() as u64 { return Ok(None); }
+        crate::sort_filter::validate_sort_region(sheet, region)?;
+        let mut values = Vec::new();
+        let mut styles = Vec::new();
+        let has_styles = !sheet.styles.is_empty() || !sheet.row_styles.is_empty() || !sheet.col_styles.is_empty();
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                let Some(Cell { value: Value::Number(n), formula: None }) = sheet.get(r, c) else {
+                    return Ok(None);
+                };
+                if !n.is_finite() { return Ok(None); }
+                values.push(*n);
+                if has_styles { styles.push(sheet.style_of(r, c)); }
+            }
+        }
+        let mut order: Vec<_> = (0..=r2 - r1).collect();
+        let key_col = (key - c1) as usize;
+        order.sort_by(|&a, &b| {
+            let left = values[a as usize * width + key_col];
+            let right = values[b as usize * width + key_col];
+            let cmp = left.partial_cmp(&right).expect("numeric sort has finite keys");
+            if asc { cmp } else { cmp.reverse() }
+        });
+        Ok(Some(Self { sheet: index, first_row: r1, first_col: c1, width, values, styles, order }))
+    }
+
+    pub fn moved_rows(&self) -> usize {
+        self.order.iter().enumerate().filter(|&(dst, src)| dst != *src as usize).count()
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.values.capacity() * size_of::<f64>() + self.styles.capacity() * size_of::<u16>()
+            + self.order.capacity() * size_of::<u32>()
+    }
+
+    pub fn deltas(&self) -> impl DoubleEndedIterator<Item = CellDelta> + '_ {
+        self.order.iter().enumerate().filter(|&(dst, src)| dst != *src as usize)
+            .flat_map(move |(dst, &src)| (0..self.width).filter_map(move |col| {
+                let (a, b) = (dst * self.width + col, src as usize * self.width + col);
+                let (before_style, after_style) = if self.styles.is_empty() {
+                    (0, 0)
+                } else {
+                    (self.styles[a], self.styles[b])
+                };
+                if self.values[a] == self.values[b] && before_style == after_style { return None; }
+                let number = |i: usize| Cell { value: Value::Number(self.values[i]), formula: None };
+                Some(CellDelta {
+                    sheet: self.sheet, row: self.first_row + dst as u32, col: self.first_col + col as u32,
+                    before: number(a), after: number(b), before_style, after_style,
+                })
+            }))
+    }
+}
+
+/// Numeric regions use packed f64s. Other dense regions share the original cell
+/// slabs and translate each affected formula when its delta is requested.
+pub enum CompactSort {
+    Numeric(NumericSort),
+    Mixed { source: Box<Sheet>, index: usize, region: (u32,u32,u32,u32), order: Vec<u32>, horizontal: bool, bytes: usize },
+}
+
+impl CompactSort {
+    pub fn plan(source: &Sheet, index: usize, region: (u32,u32,u32,u32), key: u32, asc: bool,
+                horizontal: bool) -> Result<Option<Self>, String> {
+        let (r1,c1,r2,c2) = region;
+        if r1 > r2 || c1 > c2 { return Ok(None); }
+        let area = u64::from(r2-r1+1) * u64::from(c2-c1+1);
+        if area <= 100_000 { return Ok(None); }
+        if !horizontal && let Some(n) = NumericSort::plan(source,index,region,key,asc)? {
+            return Ok(Some(Self::Numeric(n)));
+        }
+        if !Self::retain_mixed_sheet(source,region) { return Ok(None); }
+        let order = crate::sort_filter::sort_order(source,region,key,asc,horizontal)?;
+        if order.is_empty() { return Ok(None); }
+        Ok(Some(Self::mixed(source,index,(region,horizontal,order))))
+    }
+
+    fn retain_mixed_sheet(source: &Sheet, (r1,c1,r2,c2): (u32,u32,u32,u32)) -> bool {
+        let area = u64::from(r2-r1+1) * u64::from(c2-c1+1);
+        let stored = (source.len() + source.styles.len()) as u64;
+        area > 100_000 && area <= stored.saturating_mul(4) && stored <= area.saturating_mul(4)
+    }
+
+    fn mixed(source: &Sheet, index: usize, (region,horizontal,order): LinePermutation) -> Self {
+        let source = Box::new(source.search_snapshot());
+        // This snapshot outlives the worker as undo history. Account for heap text
+        // and styles as well as the page buffers before handing it to the UI.
+        let bytes = source.allocated_bytes() + order.capacity()*size_of::<u32>()
+            + source.styles.len() * size_of::<(crate::CellRef,u16)>()
+            + (source.row_styles.capacity() + source.col_styles.capacity()) * size_of::<(u32,u16)>()
+            + source.iter().map(|(_,c)| crate::undo::cell_heap_bytes(c)).sum::<usize>();
+        Self::Mixed { source, index, region, order, horizontal, bytes }
+    }
+
+    /// Absolute source line for each destination, in the same order as deltas().
+    pub fn permutation(&self) -> ((u32,u32,u32,u32), bool, Vec<u32>) {
+        match self {
+            Self::Numeric(n) => ((n.first_row, n.first_col, n.first_row + n.order.len() as u32 - 1,
+                                  n.first_col + n.width as u32 - 1), false,
+                                  n.order.iter().map(|line| n.first_row + line).collect()),
+            Self::Mixed { region, horizontal, order, .. } => (*region, *horizontal, order.clone()),
+        }
+    }
+
+    pub fn moved_lines(&self) -> usize {
+        match self {
+            Self::Numeric(n) => n.moved_rows(),
+            Self::Mixed { order, region, horizontal, .. } => {
+                let first = if *horizontal { region.1 } else { region.0 };
+                order.iter().enumerate().filter(|&(i,k)| first+i as u32 != *k).count()
+            }
+        }
+    }
+
+    pub(crate) fn sheet(&self) -> usize {
+        match self { Self::Numeric(n) => n.sheet, Self::Mixed { index,.. } => *index }
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            Self::Numeric(n) => n.bytes(),
+            Self::Mixed { bytes,.. } => *bytes,
+        }
+    }
+
+    pub fn deltas(&self) -> Box<dyn DoubleEndedIterator<Item=CellDelta> + '_> {
+        match self {
+            Self::Numeric(n) => Box::new(n.deltas()),
+            Self::Mixed { source,index,region,order,horizontal,.. } => {
+                let (r1,c1,r2,c2) = *region;
+                let (first, start, end) = if *horizontal { (c1,r1,r2) } else { (r1,c1,c2) };
+                Box::new(order.iter().copied().enumerate().filter(move |&(dst,src)| first+dst as u32 != src)
+                    .flat_map(move |(dst,src)| (start..=end).filter_map(move |offset|
+                        reorder_delta(source,*index,first+dst as u32,Some(src),offset,*horizontal,false))))
+            }
+        }
+    }
+}
+
+fn reorder_delta(sheet: &Sheet, sheet_idx: usize, dst: u32, src: Option<u32>, offset: u32,
+                 horizontal: bool, dedup: bool) -> Option<CellDelta> {
+    if src == Some(dst) {
+        return None;
+    }
+    let coords = |line| if horizontal { (offset, line) } else { (line, offset) };
+    let (row, col) = coords(dst);
+    let before = sheet.get(row, col);
+    let before_style = sheet.style_of(row, col);
+    let (source, after_style) = match src.map(coords) {
+        Some((r, c)) => (sheet.get(r, c), sheet.style_of(r, c)),
+        None => (None, before_style),
+    };
+    let translated = source
+        .and_then(|cell| cell.formula.as_deref())
+        .filter(|_| !dedup)
+        .map(|formula| {
+            let shift = i64::from(dst) - i64::from(src.unwrap());
+            crate::refs::translate(
+                formula,
+                if horizontal { 0 } else { shift },
+                if horizontal { shift } else { 0 },
+                &sheet.name,
+            )
+            .into()
+        });
+    if translated.is_none() && before == source && before_style == after_style {
+        return None;
+    }
+    let mut after = source.cloned().unwrap_or_default();
+    if let Some(f) = translated {
+        after.formula = Some(f);
+    }
+    let before = before.cloned().unwrap_or_default();
+    if before != after || before_style != after_style {
+        return Some(CellDelta {
+            sheet: sheet_idx,
+            row,
+            col,
+            before,
+            after,
+            before_style,
+            after_style,
+        });
+    }
+    None
 }
 
 impl RowChanges {
@@ -157,7 +368,7 @@ pub(crate) fn reorder_lines(
     sheet: &Sheet,
     sheet_idx: usize,
     rect: (u32, u32, u32, u32),
-    order: &[u32],
+    order: Vec<u32>,
     horizontal: bool,
     dedup: bool,
 ) -> RowChanges {
@@ -180,48 +391,8 @@ pub(crate) fn reorder_lines(
 
     let mut collect = |dst: u32, offset: u32| {
         let src = order.get((dst - first) as usize).copied();
-        if src == Some(dst) {
-            return;
-        }
-        let coords = |line| if horizontal { (offset, line) } else { (line, offset) };
-        let (row, col) = coords(dst);
-        let before = sheet.get(row, col);
-        let before_style = sheet.style_of(row, col);
-        let (source, after_style) = match src.map(coords) {
-            Some((r, c)) => (sheet.get(r, c), sheet.style_of(r, c)),
-            None => (None, before_style),
-        };
-        let translated = source
-            .and_then(|cell| cell.formula.as_deref())
-            .filter(|_| !dedup)
-            .map(|formula| {
-                let shift = i64::from(dst) - i64::from(src.unwrap());
-                crate::refs::translate(
-                    formula,
-                    if horizontal { 0 } else { shift },
-                    if horizontal { shift } else { 0 },
-                    &sheet.name,
-                )
-                .into_boxed_str()
-            });
-        if translated.is_none() && before == source && before_style == after_style {
-            return;
-        }
-        let mut after = source.cloned().unwrap_or_default();
-        if let Some(f) = translated {
-            after.formula = Some(f);
-        }
-        let before = before.cloned().unwrap_or_default();
-        if before != after || before_style != after_style {
-            changes.deltas.push(CellDelta {
-                sheet: sheet_idx,
-                row,
-                col,
-                before,
-                after,
-                before_style,
-                after_style,
-            });
+        if let Some(d) = reorder_delta(sheet, sheet_idx, dst, src, offset, horizontal, dedup) {
+            changes.deltas.push(d);
         }
     };
 
@@ -285,31 +456,50 @@ pub(crate) fn reorder_lines(
             }
         }
     }
+    if !dedup { changes.permutation = Some((rect, horizontal, order)); }
     changes
 }
 
-pub fn plan_sort_multi(
-    sheet: &Sheet,
-    sheet_idx: usize,
-    region: (u32, u32, u32, u32),
-    keys: &[SortKey],
-    header: bool,
-) -> Result<RowChanges, String> {
+pub enum MultiSortPlan {
+    Cells(RowChanges),
+    Compact(CompactSort),
+}
+
+pub fn plan_large_sort_multi(sheet: &Sheet, index: usize, region: (u32,u32,u32,u32),
+                            keys: &[SortKey], header: bool) -> Result<MultiSortPlan,String> {
+    let Some((region,horizontal,order)) = multi_sort_order(sheet,region,keys,header)? else {
+        return Ok(MultiSortPlan::Cells(RowChanges::default()));
+    };
+    if CompactSort::retain_mixed_sheet(sheet,region) {
+        Ok(MultiSortPlan::Compact(CompactSort::mixed(sheet,index,(region,horizontal,order))))
+    } else {
+        Ok(MultiSortPlan::Cells(reorder_lines(sheet,index,region,order,horizontal,false)))
+    }
+}
+
+pub fn plan_sort_multi(sheet: &Sheet, index: usize, region: (u32,u32,u32,u32),
+                       keys: &[SortKey], header: bool) -> Result<RowChanges,String> {
+    Ok(multi_sort_order(sheet,region,keys,header)?.map_or_else(RowChanges::default, |(rect,horizontal,order)|
+        reorder_lines(sheet,index,rect,order,horizontal,false)))
+}
+
+fn multi_sort_order(sheet: &Sheet, region: (u32,u32,u32,u32), keys: &[SortKey], header: bool)
+                    -> Result<Option<LinePermutation>,String> {
     let (mut r1, c1, mut r2, mut c2) = region;
     if header {
         r1 = r1.saturating_add(1);
     }
     if r2 <= r1 || c2 < c1 || keys.is_empty() {
-        return Ok(RowChanges::default());
+        return Ok(None);
     }
     if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
         let Some((_, _, ur2, uc2)) = sheet.used_bounds() else {
-            return Ok(RowChanges::default());
+            return Ok(None);
         };
         r2 = r2.min(ur2);
         c2 = c2.min(uc2.max(keys.iter().map(|k| k.col).max().unwrap_or(c1)));
         if r2 <= r1 || c2 < c1 {
-            return Ok(RowChanges::default());
+            return Ok(None);
         }
     }
     crate::sort_filter::validate_sort_region(sheet, (r1, c1, r2, c2))?;
@@ -330,7 +520,7 @@ pub fn plan_sort_multi(
         // Stable passes keep ties in the order established by lower priorities.
         order.sort_by(|&a, &b| values[(a - r1) as usize].compare(&values[(b - r1) as usize], key.asc));
     }
-    Ok(reorder_lines(sheet, sheet_idx, (r1, c1, r2, c2), &order, false, false))
+    Ok(Some(((r1,c1,r2,c2),false,order)))
 }
 
 pub fn sort_multi(sheet: &mut Sheet, region: (u32, u32, u32, u32), keys: &[SortKey], header: bool) -> usize {
@@ -420,7 +610,7 @@ pub fn plan_remove_duplicates(
     let Some((region, keep)) = distinct_rows(sheet, region, cols, header) else {
         return RowChanges::default();
     };
-    reorder_lines(sheet, sheet_idx, region, &keep, false, true)
+    reorder_lines(sheet, sheet_idx, region, keep, false, true)
 }
 
 pub fn remove_duplicates(sheet: &mut Sheet, region: (u32, u32, u32, u32), cols: &[u32], header: bool) -> usize {
@@ -666,6 +856,64 @@ pub fn text_to_columns(sheet: &mut Sheet, region: (u32, u32, u32, u32), delim: c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_mixed_sort_matches_formula_and_style_deltas_in_both_directions() {
+        let mut sheet = Sheet::new("Mixed");
+        for row in 0..321 {
+            for col in 0..320 {
+                let n = f64::from(321-row + 320-col);
+                sheet.set(row,col,Cell { value: Value::Number(n), formula: None });
+            }
+        }
+        sheet.set(1,1, Cell { value: Value::Text("mixed".into()), formula: None });
+        sheet.set(4,7, Cell { value: Value::Number(3.0), formula: Some("=A1+$B$2".into()) });
+        sheet.set_style(1,1,8);
+        let region = (0,0,320,319);
+        for horizontal in [false,true] {
+            let compact = CompactSort::plan(&sheet,0,region,0,true,horizontal).unwrap().unwrap();
+            let full = crate::sort_filter::plan_sort_axis(&sheet,0,region,0,true,horizontal).unwrap();
+            let mut iter = compact.deltas();
+            for expected in full.deltas {
+                let d = iter.next().unwrap();
+                assert_eq!((d.row,d.col,d.before,d.after,d.before_style,d.after_style),
+                    (expected.row,expected.col,expected.before,expected.after,expected.before_style,expected.after_style));
+            }
+            assert!(iter.next().is_none());
+        }
+    }
+
+    #[test]
+    fn dense_numeric_sort_replays_style_and_value_deltas_under_undo_guard() {
+        let mut wb = crate::Workbook::new_blank();
+        let sheet = &mut wb.sheets[0];
+        let (rows, cols) = (1001, 101);
+        for row in 0..rows {
+            for col in 0..cols {
+                sheet.set(row, col, Cell { value: Value::Number((rows - row + col) as f64), formula: None });
+            }
+        }
+        sheet.set_style(rows - 1, 2, 4);
+        let rect = (0, 0, rows - 1, cols - 1);
+        let sort = NumericSort::plan(sheet, 0, rect, 0, true).unwrap().unwrap();
+        let standard = crate::sort_filter::plan_sort_axis(sheet, 0, rect, 0, true, false).unwrap();
+        assert_eq!(sort.deltas().count(), standard.deltas.len());
+        for (d, expected) in sort.deltas().zip(&standard.deltas) {
+            assert_eq!((d.row, d.col, d.before, d.after, d.before_style, d.after_style),
+                (expected.row, expected.col, expected.before.clone(), expected.after.clone(),
+                 expected.before_style, expected.after_style));
+        }
+        assert!(sort.bytes() < standard.deltas.len() * size_of::<CellDelta>() / 3);
+        standard.apply(sheet);
+        let mut undo = crate::undo::UndoStack::new();
+        undo.push_numeric_sort("sort", sort, (0,0,0));
+        let reverted = undo.undo_workbook(&mut wb, |_,r,c,_| (r,c) != (0,0)).unwrap();
+        assert_eq!(reverted.skipped, 1);
+        assert_eq!(wb.sheets[0].value(0,0), Value::Number(1.0));
+        assert_eq!(wb.sheets[0].style_of(rows-1,2), 4);
+        undo.redo_workbook(&mut wb, |_,_,_,_| true).unwrap();
+        assert_eq!(wb.sheets[0].style_of(0,2), 4);
+    }
 
     fn sheet_with(rows: &[&[&str]]) -> Sheet {
         let mut s = Sheet::new("T");

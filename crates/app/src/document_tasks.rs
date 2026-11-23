@@ -8,12 +8,33 @@ use sheetcore::{Workbook, xlsx::SaveReceipt};
 
 use super::{egui, OpenMsg};
 
+#[derive(Clone)]
+pub(crate) struct StructuralCalculation {
+    pub generation: u64,
+    pub sheet: usize,
+    pub op: sheetcore::structural::Structural,
+    pub complex: bool,
+    pub graph: std::sync::Arc<sheetcore::formula::deps::Deps>,
+}
+
+impl StructuralCalculation {
+    pub fn apply(&self, wb: &mut Workbook, cancel: &std::sync::atomic::AtomicBool)
+        -> Option<sheetcore::formula::deps::Deps> {
+        if self.complex {
+            self.graph.recalc_structural_sheets(wb, self.sheet, cancel)
+        } else {
+            self.graph.recalc_structural(wb, self.sheet, &self.op, cancel)
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct DocumentTasks {
     pub open_rx: Option<Receiver<OpenMsg>>,
     pub reorder: Option<super::data_reorder::Pending>,
     pub busy: bool,
     pub needs_full: bool,
+    pub structural_recalc: Option<StructuralCalculation>,
     /// Retain pending edits until a result for this document generation is applied.
     pub dirty_recalc_seeds: std::collections::BTreeSet<sheetcore::formula::deps::CellKey>,
     pub last_edit: Option<Instant>,
@@ -21,6 +42,8 @@ pub(crate) struct DocumentTasks {
     pub autosave_retry_at: Option<Instant>,
     /// Ctrl+S requested a second snapshot while the previous one was being written.
     pub manual_save_queued: bool,
+    /// A shared document inherits the host preference until the room switch is changed.
+    pub shared_autosave: Option<bool>,
     /// Preserve save authority when a tab leaves its collaboration session.
     /// A former guest must not automatically overwrite a shared workbook.
     pub autosave_after_detach: Option<bool>,
@@ -41,6 +64,7 @@ pub(crate) struct PendingSave {
     pub target: PathBuf,
     pub rx: Receiver<Result<(SaveReceipt, Option<CalculatedSnapshot>), String>>,
     pub quiet: bool,
+    pub used_dirty_graph: bool,
     /// Host session and collaboration clock represented by this original-file snapshot.
     pub host: Option<(String, u64)>,
 }
@@ -116,23 +140,30 @@ impl DocumentTasks {
     }
 
     pub fn start_save(&mut self, wb: &mut Workbook, target: PathBuf) {
-        self.start_save_checked(wb, target, |_| None);
+        self.start_save_checked(wb, target, None, None, |_| None);
     }
 
     pub fn start_save_checked(
         &mut self,
         wb: &mut Workbook,
         target: PathBuf,
+        deps: Option<std::sync::Arc<sheetcore::formula::deps::Deps>>,
+        generation: Option<u64>,
         check_target: impl FnOnce(&Path) -> Option<String> + Send + 'static,
     ) {
         debug_assert!(self.saving.is_none());
         let mut snapshot = wb.clone();
         let (tx, rx) = mpsc::channel();
-        self.saving = Some(PendingSave { target: target.clone(), rx, quiet: false, host: None });
+        let used_dirty_graph = deps.is_some() && !self.needs_full && !snapshot.calc_iterate;
+        self.saving = Some(PendingSave { target: target.clone(), rx, quiet: false, used_dirty_graph, host: None });
         // Subsequent edits set this back to true. Completion never clears it.
         wb.dirty = false;
         self.autosave_dirty_since = None;
         let recalc = self.recalc_pending() && !snapshot.calc_manual;
+        let structure = self.structural_recalc.as_ref()
+            .filter(|s| recalc && self.needs_full && Some(s.generation) == generation).cloned();
+        let incremental = deps.filter(|_| recalc && !self.needs_full && !snapshot.calc_iterate)
+            .map(|graph| (graph, self.dirty_recalc_seeds.iter().copied().collect::<Vec<_>>()));
         std::thread::spawn(move || {
             // A missing original has no package to inherit on Save As.
             snapshot.path = snapshot.path.take().filter(|p| p.exists());
@@ -140,7 +171,11 @@ impl DocumentTasks {
             // captured generation before serializing its formula caches.
             let revisions = recalc.then(|| {
                 let revisions = snapshot.sheets.iter().map(|sh| sh.cell_revision()).collect();
-                sheetcore::formula::recalc_all(&mut snapshot);
+                if let Some((graph, seeds)) = incremental {
+                    sheetcore::formula::recalc_dirty(&mut snapshot, &graph, &seeds);
+                } else if !structure.is_some_and(|s| s.apply(&mut snapshot,&false.into()).is_some()) {
+                    sheetcore::formula::recalc_all(&mut snapshot);
+                }
                 revisions
             });
             // The core owns the temporary write, history, and atomic replacement.
@@ -148,8 +183,8 @@ impl DocumentTasks {
                 let _ = tx.send(Err(error));
                 return;
             }
-            let result = sheetcore::xlsx::save_atomic_with_receipt(&target, &snapshot)
-                .map(|receipt| (receipt, revisions.map(|revisions| CalculatedSnapshot {
+            let result = sheetcore::xlsx::save_snapshot_with_receipt(&target, snapshot)
+                .map(|(receipt, snapshot)| (receipt, revisions.map(|revisions| CalculatedSnapshot {
                     revisions, workbook: Box::new(snapshot),
                 })))
                 .map_err(|e| format!("保存失败: {e:#}"));
@@ -176,6 +211,7 @@ impl DocumentTasks {
                 let calculated_on_save = calculated.is_some();
                 let applied = !wb.dirty && calculated.is_some_and(|result| result.apply(wb));
                 if applied {
+                    self.structural_recalc = None;
                     self.needs_full = false;
                     self.dirty_recalc_seeds.clear();
                 }

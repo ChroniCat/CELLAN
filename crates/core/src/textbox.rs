@@ -765,25 +765,13 @@ pub(crate) fn has_part(path: &Path, name: &str) -> bool {
     zip.by_name(name).is_ok()
 }
 
-pub(crate) fn next_part_no(path: &Path, prefix: &str) -> u32 {
-    let Ok(file) = std::fs::File::open(path) else {
-        return 1;
-    };
-    let Ok(mut zip) = zip::ZipArchive::new(file) else {
-        return 1;
-    };
-    let mut max = 0u32;
-    for i in 0..zip.len() {
-        let Ok(f) = zip.by_index(i) else { continue };
-        let name = f.name().to_string();
-        if let Some(rest) = name.strip_prefix(prefix) {
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(v) = digits.parse::<u32>() {
-                max = max.max(v);
-            }
-        }
-    }
-    max + 1
+/// Each save pass allocates drawing part numbers from one sequence for all its sheets.
+pub(crate) fn next_drawing_no(path: &Path) -> anyhow::Result<u32> {
+    let zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let max = zip.file_names().filter_map(|name| {
+        name.strip_prefix("xl/drawings/drawing")?.strip_suffix(".xml")?.parse::<u32>().ok()
+    }).max().unwrap_or(0);
+    max.checked_add(1).ok_or_else(|| anyhow::anyhow!("绘图编号已用尽"))
 }
 
 /// 找到（没有就建）工作表对应的 drawing 部件；返回部件名与是否需要补关系
@@ -791,41 +779,27 @@ pub(crate) fn ensure_drawing(
     path: &Path,
     sheet_part: &str,
     xml: &str,
+    next: &mut u32,
 ) -> anyhow::Result<(String, String, Option<String>)> {
     // 已有 <drawing r:id> → 从 rels 拿 Target
-    if let Some(tag) = find_tag(xml, "drawing") {
-        if let Some(rid) = attr(&tag, "r:id") {
-            let rels = crate::hyperlinks::read_rels(path, sheet_part);
-            if let Some((target, _)) = rels.get(&rid) {
-                let part = resolve(sheet_part, target);
-                let rels_p = rels_part(&part);
-                return Ok((part, rels_p, None));
-            }
-        }
+    let slot = drawing_slot(xml)?;
+    anyhow::ensure!(!slot.strict, "暂不支持改写 Strict 工作表中的绘图部件");
+    if let Some(rid) = slot.rid {
+        let part = drawing_target(path,sheet_part,&rid,false)?;
+        anyhow::ensure!(has_part(path,&part), "缺少工作表引用的绘图部件 {part}");
+        let rels = rels_part(&part);
+        return Ok((part, rels, None));
     }
-    let no = next_part_no(path, "xl/drawings/drawing");
+    let no = *next;
+    *next = no.checked_add(1).ok_or_else(|| anyhow::anyhow!("绘图编号已用尽"))?;
     let part = format!("xl/drawings/drawing{no}.xml");
     let rels_p = rels_part(&part);
-    let rid = format!("rIdDrawTb{no}");
+    let rels = crate::hyperlinks::read_rels(path, sheet_part);
+    let rid = (no..).map(|i| format!("rIdDrawTb{i}")).find(|id| !rels.contains_key(id))
+        .ok_or_else(|| anyhow::anyhow!("工作表的关系标识不足"))?;
     Ok((part, rels_p, Some(rid)))
 }
 
-fn resolve(sheet_part: &str, target: &str) -> String {
-    // drawing 的 Target 一般是 ../drawings/drawing1.xml
-    if let Some(rest) = target.strip_prefix("../") {
-        let dir = sheet_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        // 工作表在 xl/worksheets 下，../drawings → xl/drawings
-        let base = dir.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        return format!("{base}/{rest}");
-    }
-    if target.starts_with('/') {
-        return target.trim_start_matches('/').to_string();
-    }
-    match sheet_part.rsplit_once('/') {
-        Some((d, _)) => format!("{d}/{target}"),
-        None => target.to_string(),
-    }
-}
 
 /// 保存收尾：把文本框写回各表（只处理 dirty 的表）
 pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
@@ -838,6 +812,7 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
     let mut patch_rels: Vec<(String, String)> = Vec::new();
     let mut patch_sheet: Vec<(String, String)> = Vec::new();
     let mut ct_parts: Vec<String> = Vec::new();
+    let mut next = next_drawing_no(path)?;
     for sheet in &wb.sheets {
         if !sheet.textboxes_dirty {
             continue;
@@ -845,16 +820,16 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
         let Some(sheet_part) = targets.get(&sheet.name) else {
             continue;
         };
-        let sheet_xml = crate::fixups::read_part_file(path, sheet_part)
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_default();
-        let (draw_part, draw_rels, rid) = ensure_drawing(path, sheet_part, &sheet_xml)?;
+        let sheet_bytes = crate::fixups::read_part_file(path,sheet_part).ok_or_else(|| anyhow::anyhow!("缺少工作表 {sheet_part}"))?;
+        let sheet_xml = crate::xlsx::patch_xml_text(&sheet_bytes,sheet_part)?;
+        let (draw_part, draw_rels, rid) = ensure_drawing(path, sheet_part, &sheet_xml, &mut next)?;
         // drawing 本体
-        let body = match crate::fixups::read_part_file(path, &draw_part)
-            .and_then(|b| String::from_utf8(b).ok())
-        {
-            Some(xml) => rewrite_drawing(&xml, &sheet.textboxes),
-            None => new_drawing_xml(&sheet.textboxes),
+        let body = if rid.is_none() {
+            let bytes = crate::fixups::read_part_file(path, &draw_part)
+                .ok_or_else(|| anyhow::anyhow!("无法读取原有绘图 {draw_part}"))?;
+            rewrite_drawing(&crate::xlsx::patch_xml_text(&bytes, &draw_part)?, &sheet.textboxes)
+        } else {
+            new_drawing_xml(&sheet.textboxes)
         };
         if has_part(path, &draw_part) {
             patch_sheet_drawing(&mut patch_sheet, &draw_part, body);
@@ -873,33 +848,14 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
         // 工作表关系 + <drawing r:id>
         if let Some(rid) = rid {
             let rels_name = rels_part(sheet_part);
-            let mut rels_xml = crate::fixups::read_part_file(path, &rels_name)
-                .and_then(|b| String::from_utf8(b).ok())
-                .unwrap_or_else(|| {
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>"
-                        .to_string()
-                });
-            let target = format!(
-                "../{}",
-                draw_part.strip_prefix("xl/").unwrap_or(&draw_part)
-            );
-            let rel = format!(
-                "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"{target}\"/>"
-            );
-            if !rels_xml.contains(&format!("Id=\"{rid}\"")) {
-                if rels_xml.contains("</Relationships>") {
-                    rels_xml = rels_xml.replace("</Relationships>", &format!("{rel}</Relationships>"));
-                } else {
-                    rels_xml.push_str(&rel);
-                }
-            }
+            let target = format!("../{}", draw_part.strip_prefix("xl/").unwrap_or(&draw_part));
+            let rels_xml = add_drawing_relationship(&drawing_relationships(path,&rels_name)?, &rid, &target)?;
             if has_part(path, &rels_name) {
                 patch_rels.push((rels_name, rels_xml));
             } else {
                 additions.push((rels_name, rels_xml.into_bytes()));
             }
-            patch_sheet.push((sheet_part.clone(), insert_drawing_tag(&sheet_xml, &rid)));
+            patch_sheet.push((sheet_part.clone(), insert_drawing_tag(&sheet_xml, &rid)?));
         }
     }
     if additions.is_empty() && patch_rels.is_empty() && patch_sheet.is_empty() {
@@ -949,52 +905,146 @@ pub(crate) fn patch_sheet_drawing(queue: &mut Vec<(String, String)>, part: &str,
     }
 }
 
-/// 在 worksheet 里插入 `<drawing r:id>`（schema 顺序：legacyDrawing/tableParts/extLst 之前）
-pub(crate) fn insert_drawing_tag(xml: &str, rid: &str) -> String {
-    if xml.contains("<drawing ") || xml.contains("<drawing/>") {
-        return xml.to_string();
+pub(crate) fn add_drawing_relationship(xml: &str, rid: &str, target: &str) -> anyhow::Result<String> {
+    let doc = roxmltree::Document::parse(xml)?;
+    let root = doc.root_element();
+    anyhow::ensure!(root.tag_name().name() == "Relationships", "无效的工作表关系清单");
+    let kind = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing";
+    if let Some(old) = root.children().find(|n| n.attribute("Id") == Some(rid)) {
+        anyhow::ensure!(old.attribute("Type") == Some(kind) && old.attribute("Target") == Some(target),
+            "工作表关系标识 {rid} 已被使用");
+        return Ok(xml.to_owned());
     }
-    let tag = format!(
-        "<drawing xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"{rid}\"/>"
-    );
-    let mut pos = xml.find("</worksheet>").unwrap_or(xml.len());
-    for t in ["<legacyDrawing", "<tableParts", "<extLst"] {
-        if let Some(i) = xml.find(t) {
-            pos = pos.min(i);
+    let root_xml = &xml[root.range()];
+    let root_name = root_xml[1..].split([' ', '\t','\n','\r','/','>']).next().unwrap();
+    let prefix = root_name.strip_suffix("Relationships").unwrap_or("");
+    // Both inputs are generated internally from part numbers.
+    let child = format!("<{prefix}Relationship Id=\"{rid}\" Type=\"{kind}\" Target=\"{target}\"/>");
+    let mut result = xml.to_owned();
+    if root_xml.ends_with("/>") {
+        result.replace_range(root.range().end-2..root.range().end,&format!(">{child}</{root_name}>"));
+    } else {
+        let end = root_xml.rfind("</").ok_or_else(|| anyhow::anyhow!("工作表关系清单不完整"))?;
+        result.insert_str(root.range().start+end,&child);
+    }
+    Ok(result)
+}
+
+pub(crate) fn drawing_relationships(path: &Path, part: &str) -> anyhow::Result<String> {
+    if has_part(path,part) {
+        let bytes = crate::fixups::read_part_file(path,part).ok_or_else(|| anyhow::anyhow!("无法读取绘图关系 {part}"))?;
+        Ok(crate::xlsx::patch_xml_text(&bytes,part)?.into_owned())
+    } else {
+        Ok("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>".into())
+    }
+}
+
+/// 在 worksheet 里插入 `<drawing r:id>`（schema 顺序：legacyDrawing/tableParts/extLst 之前）
+struct DrawingSlot {
+    position: usize,
+    prefix: String,
+    strict: bool,
+    rid: Option<String>,
+}
+
+fn drawing_slot(xml: &str) -> anyhow::Result<DrawingSlot> {
+    use anyhow::{ensure, Context};
+    use quick_xml::{NsReader, events::Event, name::ResolveResult};
+    let mut reader = NsReader::from_str(xml);
+    let mut root = None;
+    let mut insert = None;
+    let mut rid = None;
+    loop {
+        let start = reader.buffer_position() as usize;
+        let (ns,event) = reader.read_resolved_event()?;
+        let ns = match ns {
+            ResolveResult::Bound(n) => n.0,
+            ResolveResult::Unbound => "",
+            _ => anyhow::bail!("工作表使用未声明的命名空间"),
+        };
+        match event {
+            Event::Start(tag) if root.is_none() => {
+                ensure!(tag.local_name().as_ref() == "worksheet", "缺少 worksheet 根元素");
+                let prefix = tag.name().as_ref().strip_suffix("worksheet").unwrap().to_owned();
+                root = Some((ns.to_owned(),prefix));
+            }
+            e @ (Event::Start(_) | Event::Empty(_)) if root.is_some() => {
+                let closed = matches!(e,Event::Empty(_));
+                let (Event::Start(tag) | Event::Empty(tag)) = e else { unreachable!() };
+                if ns == root.as_ref().unwrap().0 {
+                    match tag.local_name().as_ref() {
+                        "drawing" => {
+                            ensure!(rid.is_none(), "工作表有重复的 drawing");
+                            let expected = if ns == "http://purl.oclc.org/ooxml/spreadsheetml/main" {
+                                "http://purl.oclc.org/ooxml/officeDocument/relationships"
+                            } else { "http://schemas.openxmlformats.org/officeDocument/2006/relationships" };
+                            let attr = tag.attributes().filter_map(Result::ok)
+                                .find(|a| {
+                                    let (ns,local) = reader.resolver().resolve_attribute(a.key);
+                                    local.as_ref() == "id" && matches!(ns, ResolveResult::Bound(n) if n.0 == expected)
+                                })
+                                .context("绘图缺少关系标识")?;
+                            rid = Some(attr.value.into_owned());
+                        }
+                        "legacyDrawing" | "legacyDrawingHF" | "drawingHF" | "picture" |
+                        "oleObjects" | "controls" | "webPublishItems" | "tableParts" | "extLst" => {
+                            insert.get_or_insert(start);
+                        }
+                        _ => {}
+                    }
+                }
+                if !closed { reader.read_to_end(tag.name())?; }
+            }
+            Event::End(_) if root.is_some() => {
+                let (uri,prefix) = root.unwrap();
+                return Ok(DrawingSlot { position:insert.unwrap_or(start), prefix, rid,
+                    strict:uri == "http://purl.oclc.org/ooxml/spreadsheetml/main" });
+            }
+            Event::Eof => anyhow::bail!("工作表 drawing 所属的 XML 不完整"),
+            _ => {}
         }
     }
-    format!("{}{}{}", &xml[..pos], tag, &xml[pos..])
+}
+
+pub(crate) fn insert_drawing_tag(xml: &str, rid: &str) -> anyhow::Result<String> {
+    let DrawingSlot {position, prefix, strict, rid: existing} = drawing_slot(xml)?;
+    if let Some(existing) = existing {
+        anyhow::ensure!(existing == rid, "工作表已有不同的绘图关系 {existing}");
+        return Ok(xml.to_owned());
+    }
+    anyhow::ensure!(!strict, "暂不支持向 Strict 工作表挂接 Transitional 绘图部件");
+    Ok(format!("{}<{prefix}drawing xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"{rid}\"/>{}", &xml[..position], &xml[position..]))
 }
 
 // ---------------------------------------------------------------- 载入
 
 /// 读出某张表的文本框
 pub fn load(path: &Path, sheet_part: &str) -> Vec<TextBox> {
-    let Some(xml) = crate::fixups::read_part_file(path, sheet_part)
-        .and_then(|b| String::from_utf8(b).ok())
-    else {
-        return Vec::new();
-    };
+    let Some(bytes) = crate::fixups::read_part_file(path,sheet_part) else { return Vec::new() };
+    let Ok(xml) = crate::xlsx::patch_xml_text(&bytes,sheet_part) else { return Vec::new() };
     load_from_sheet(path, sheet_part, &xml)
 }
 
+fn drawing_target(path: &Path, sheet_part: &str, rid: &str, strict: bool) -> anyhow::Result<String> {
+    let part = rels_part(sheet_part);
+    let bytes = crate::fixups::read_part(path,&part).ok_or_else(|| anyhow::anyhow!("缺少工作表关系清单 {part}"))?;
+    let xml = crate::xlsx::patch_xml_text(&bytes,&part)?;
+    let doc = roxmltree::Document::parse(&xml)?;
+    let kind = if strict { "http://purl.oclc.org/ooxml/officeDocument/relationships/drawing" }
+        else { "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" };
+    let rel = doc.root_element().children().find(|n| n.tag_name().name() == "Relationship"
+        && n.attribute("Type") == Some(kind) && n.attribute("Id") == Some(rid)
+        && n.attribute("TargetMode") != Some("External")).ok_or_else(|| anyhow::anyhow!("找不到工作表的内部绘图关系 {rid}"))?;
+    let target = rel.attribute("Target").ok_or_else(|| anyhow::anyhow!("缺少绘图关系目标"))?;
+    Ok(crate::fixups::resolve_target(&part,target))
+}
+
 pub(crate) fn load_from_sheet(path: &Path, sheet_part: &str, xml: &str) -> Vec<TextBox> {
-    let Some(tag) = find_tag(xml, "drawing") else {
-        return Vec::new();
-    };
-    let Some(rid) = attr(&tag, "r:id") else {
-        return Vec::new();
-    };
-    let rels = crate::hyperlinks::read_rels(path, sheet_part);
-    let Some((target, _)) = rels.get(&rid) else {
-        return Vec::new();
-    };
-    let part = resolve(sheet_part, target);
-    let Some(draw) = crate::fixups::read_part_file(path, &part)
-        .and_then(|b| String::from_utf8(b).ok())
-    else {
-        return Vec::new();
-    };
+    if !xml.contains("drawing") { return Vec::new(); }
+    let Ok(DrawingSlot {rid:Some(rid), strict,..}) = drawing_slot(xml) else { return Vec::new() };
+    let Ok(part) = drawing_target(path,sheet_part,&rid,strict) else { return Vec::new() };
+    let Some(bytes) = crate::fixups::read_part_file(path,&part) else { return Vec::new() };
+    let Ok(draw) = crate::xlsx::patch_xml_text(&bytes,&part) else { return Vec::new() };
     parse_drawing(&draw)
 }
 
@@ -1060,14 +1110,68 @@ mod tests {
     }
 
     #[test]
+    fn attaching_a_drawing_requires_a_complete_sheet_and_the_expected_relationship() {
+        assert!(insert_drawing_tag("<worksheet><sheetData>", "rId1").is_err());
+        let xml = r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData/><drawing r:id="rId2"/></worksheet>"#;
+        assert!(insert_drawing_tag(xml,"rId1").is_err());
+        assert_eq!(insert_drawing_tag(xml,"rId2").unwrap(),xml);
+    }
+
+    #[test]
+    fn append_to_self_closing_prefixed_drawing_relationships_preserves_the_namespace() {
+        let xml = r#"<p:Relationships xmlns:p="http://schemas.openxmlformats.org/package/2006/relationships"/>"#;
+        let output = add_drawing_relationship(xml,"rId1","../drawings/drawing1.xml").unwrap();
+        let doc = roxmltree::Document::parse(&output).unwrap();
+        let child = doc.root_element().first_element_child().unwrap();
+        assert_eq!(child.tag_name().namespace(),doc.root_element().tag_name().namespace());
+        assert_eq!(child.attribute("Target"),Some("../drawings/drawing1.xml"));
+        assert!(add_drawing_relationship(&output,"rId1","other.xml").is_err());
+    }
+
+    #[test]
+    fn prefixed_worksheet_and_relationship_preserve_the_textbox_through_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefix.xlsx");
+        let mut wb = crate::Workbook::new_blank();
+        wb.sheets[0].textboxes.push(TextBox { text:"before".into(),..Default::default() });
+        wb.sheets[0].textboxes_dirty = true;
+        crate::xlsx::save_atomic(&path,&wb).unwrap();
+        let name = "xl/worksheets/sheet1.xml";
+        let bytes = crate::fixups::read_part_file(&path,name).unwrap();
+        let xml = String::from_utf8(bytes).unwrap()
+            .replace("<worksheet ",r#"<s:worksheet xmlns:s="http://schemas.openxmlformats.org/spreadsheetml/2006/main" "#)
+            .replace("</worksheet>","</s:worksheet>").replace("<drawing ","<s:drawing ")
+            .replace("xmlns:r=","xmlns:rel=").replace("r:id=","rel:id=");
+        assert!(xml.contains("<s:drawing ") && xml.contains("rel:id="));
+        crate::fixups::write_parts(&path,&[(name.into(),xml.into_bytes())]).unwrap();
+        let mut loaded = crate::xlsx::load(&path).unwrap();
+        assert_eq!(loaded.sheets[0].textboxes[0].text,"before");
+        loaded.sheets[0].textboxes[0].text = "after".into();
+        loaded.sheets[0].textboxes_dirty = true;
+        crate::xlsx::save_atomic(&path,&loaded).unwrap();
+        let back = crate::xlsx::load(&path).unwrap();
+        assert_eq!(back.sheets[0].textboxes.len(),1);
+        assert_eq!(back.sheets[0].textboxes[0].text,"after");
+    }
+
+    #[test]
+    fn strict_sheet_requires_the_strict_relationship_namespace() {
+        let xml = r#"<s:worksheet xmlns:s="http://purl.oclc.org/ooxml/spreadsheetml/main" xmlns:k="http://purl.oclc.org/ooxml/officeDocument/relationships"><s:sheetData/><s:drawing k:id="a"/></s:worksheet>"#;
+        assert_eq!(drawing_slot(xml).unwrap().rid.as_deref(),Some("a"));
+        assert!(drawing_slot(&xml.replace("http://purl.oclc.org/ooxml/officeDocument/relationships",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships")).is_err());
+        assert!(insert_drawing_tag(&xml.replace(r#"<s:drawing k:id="a"/>"#,""),"a").is_err());
+    }
+
+    #[test]
     fn insert_drawing_respects_schema_order() {
         let xml = "<worksheet><sheetData/><tableParts count=\"0\"/><extLst></extLst></worksheet>";
-        let out = insert_drawing_tag(xml, "rId5");
+        let out = insert_drawing_tag(xml, "rId5").unwrap();
         let d = out.find("<drawing").unwrap();
         assert!(d < out.find("<tableParts").unwrap(), "drawing 要在 tableParts 前");
         assert!(d < out.find("<extLst").unwrap());
         // 已经有时不重复插
-        let again = insert_drawing_tag(&out, "rId5");
+        let again = insert_drawing_tag(&out, "rId5").unwrap();
         assert_eq!(again.matches("<drawing ").count(), 1);
         let _ = SHEET;
     }

@@ -520,6 +520,96 @@ fn clipboard_cross_sheet_merge_move_undo_checks_both_sides_before_changing_eithe
 }
 
 #[test]
+fn large_selection_statistics_ignore_stale_workers_and_overlapping_rectangles() {
+    let _env = crate::test_env::TestEnv::new("large-selection-stats-worker");
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let sheet = app.wb.sheet_mut(0);
+    sheet.set(0, 0, number(3.0));
+    sheet.set(7, 1, number(4.0));
+    sheet.set(10, 1, number(30.0));
+    sheet.hidden_rows_user.insert(10);
+    let a = [(0, 0, 12_000, 0)];
+    let b = [(0, 0, 12_000, 1), (1, 1, 13_000, 1)];
+    assert_eq!(app.selection_stats_label(&ctx, &a, 12_001, 8), "计算中…");
+    app.wb.sheet_mut(0).set(0, 0, number(8.0));
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let result = app.selection_stats_label(&ctx, &b, 37_002, 8);
+        if result != "计算中…" {
+            assert_eq!(result, "求和: 12");
+            break;
+        }
+        assert!(std::time::Instant::now() < until, "worker did not finish");
+        std::thread::yield_now();
+    }
+    assert_eq!(app.selection_stats_label(&ctx, &b, 37_002, 8), "求和: 12");
+}
+
+#[test]
+fn selection_worker_ignores_unrelated_updates_and_observes_filter_columns() {
+    let _env = crate::test_env::TestEnv::new("selection-during-collaboration");
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+    let sh = &mut app.wb.sheets[0];
+    sh.set(1, 0, number(4.0));
+    sh.set(2, 0, number(5.0));
+    sh.set(1, 1, text("yes"));
+    sh.set(2, 1, text("yes"));
+    let mut filter = sheetcore::sort_filter::Filter::new(0,0,5_000,1);
+    filter.allows.insert(1, ["yes".to_owned()].into_iter().collect());
+    sh.filter = Some(filter);
+    let ranges = [(1,0,5_000,0)];
+    let poll = |app: &mut SheetApp| app.selection_stats_label(&ctx, &ranges, 5_000,8);
+    assert_eq!(poll(&mut app), "计算中…");
+    let origin = app.stats_job.as_ref().unwrap().snapshot.clone();
+    let wait = |app: &mut SheetApp| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.wb.sheets[1].set(0,0,number(app.doc_gen as f64));
+            app.wb.sheets[0].set(0,0,number(app.doc_gen as f64)); // same slab, outside selection
+            app.wb.sheets[0].set(1,2,number(app.doc_gen as f64)); // neither selected nor filtered
+            app.wb.sheets[0].rows.set(8_000, 12.0 + (app.doc_gen % 3) as f32);
+            app.doc_gen += 1;
+            app.wb_epoch += 1;
+            let label = poll(app);
+            if label != "计算中…" { return label; }
+            assert!(std::time::Instant::now() < until, "statistics worker starved");
+            std::thread::yield_now();
+        }
+    };
+    assert_eq!(wait(&mut app), "求和: 9");
+    assert!(std::sync::Arc::ptr_eq(&origin, app.stat_cache.as_ref().unwrap().2.as_ref().unwrap()));
+    app.wb.sheets[0].set(1,1,text("no"));
+    assert_eq!(poll(&mut app), "计算中…");
+    assert_eq!(wait(&mut app), "求和: 5");
+    app.wb.sheets[0].hidden_rows_user.insert(2);
+    assert_eq!(poll(&mut app), "计算中…");
+    assert_eq!(wait(&mut app), "");
+    app.wb.sheets[0].filter.as_mut().unwrap().allows.clear();
+    assert_eq!(poll(&mut app), "计算中…");
+    assert_eq!(wait(&mut app), "求和: 4");
+}
+
+#[test]
+fn office_paste_constant_updates_formula_and_undo_redo() {
+    let _env = crate::test_env::TestEnv::new("office-paste-dependent");
+    let mut app = app();
+    app.wb.sheets[0].set(0, 0, formula("5+1"));
+    app.wb.sheets[0].set(0, 1, formula("A1*2"));
+    app.fast_recalc_cells(&[(0, 0, 0), (0, 0, 1)]);
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(12.0));
+    let block = office_clipboard::parse_html("<table><tr><td>9</td></tr></table>");
+    assert!(app.paste_office_block(&block));
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(18.0));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(12.0));
+    app.do_undo(true);
+    assert_eq!(app.wb.sheets[0].value(0, 1), Value::Number(18.0));
+}
+
+#[test]
 fn clipboard_office_merge_and_its_values_undo_and_redo_together() {
     let _env = crate::test_env::TestEnv::new("clipboard-office-merge-undo");
     let mut app = app();
@@ -946,6 +1036,61 @@ fn structural_undo_restores_cross_sheet_formulas_names_and_layout() {
     app.editing = Some(EditState::new("30".into()));
     app.commit_edit(None);
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(30.0));
+}
+
+#[test]
+fn large_target_insert_keeps_undo_history() {
+    let _env = crate::test_env::TestEnv::new("large-target-undo");
+    let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+    for row in 0..200_001 { app.wb.sheets[0].set(row, 0, number(row as f64)); }
+    app.editing = Some(EditState::new("42".into()));
+    app.commit_edit(None);
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 200_000, n: 1 });
+    assert_eq!(app.wb.sheet(0).value(200_001, 0), Value::Number(200_000.0));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(200_000, 0), Value::Number(200_000.0));
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(42.0));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(0.0));
+}
+
+#[test]
+fn structural_undo_after_disconnect_preserves_received_edit() {
+    let _env = crate::test_env::TestEnv::new("structural-disconnect-undo");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut app = app();
+    app.peer = Some(sheetcore::sync::Peer::new(1));
+    app.net = Some(net::host_on(listener, 1, "host".into(), "doc".into(), "pw".into()).unwrap());
+    app.undo.set_site(1);
+    app.wb.sheets[0].set(0, 0, number(3.0));
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(app.undo.depth(), (1, 0));
+    app.net.as_ref().unwrap().inject_event_for_test(net::NetEvent::Ops(vec![sheetcore::sync::Op {
+        sheet: 0, row: 1, col: 0, value: sheetcore::sync::ValueWire::Number(77.0),
+        formula: None, site: 2, ts: 2,
+    }]));
+    app.poll_net();
+    assert_eq!(app.wb.sheets[0].value(1, 0), Value::Number(77.0));
+    app.leave_session();
+    assert!(!app.apply_undo(false));
+    assert!(app.status.contains("结构操作") && app.status.contains("已保留"));
+    assert_eq!(app.wb.sheets[0].value(1, 0), Value::Number(77.0));
+    assert_eq!(app.undo.depth(), (1, 0));
+}
+
+#[test]
+fn structural_undo_preserves_a_solver_write_outside_undo_history() {
+    let _env = crate::test_env::TestEnv::new("structural-solver-undo");
+    let mut app = app();
+    app.wb.sheets[0].set(0, 0, number(3.0));
+    app.wb.sheets[0].set(0, 1, formula("=A1*2"));
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    let solved = app.goal_seek_run(1, 1, 24.0, 1, 0).unwrap();
+    assert!((solved - 12.0).abs() < 1e-8);
+    assert!(!app.apply_undo(false));
+    assert_eq!(app.undo.depth(), (1, 0));
+    assert!((app.cell_num(1, 0).unwrap() - 12.0).abs() < 1e-8);
+    assert!((app.cell_num(1, 1).unwrap() - 24.0).abs() < 1e-8);
 }
 
 #[test]
@@ -1969,8 +2114,8 @@ fn format_dialog_fill_and_protection_apply_to_selection() {
 fn format_dialog_clears_fill_and_protection_on_existing_file() {
     use sheetcore::style::CellStyle;
     let ctx = egui::Context::default();
-    let path = crate::test_env::scratch("ui15-clear-existing").join("existing.xlsx");
-    let _ = std::fs::remove_file(&path);
+    let env = crate::test_env::TestEnv::new("ui15-clear-existing");
+    let path = env.path("existing.xlsx");
     let mut seed = sheetcore::model::Workbook::new_blank();
     seed.sheets[0].set(0, 0, text("x"));
     let sid = seed.styles.intern(CellStyle {
@@ -4308,6 +4453,7 @@ fn csv_import_from_the_app_keeps_quoted_newlines_and_registers_a_refreshable_sou
     let csv = env.path("a.csv");
     std::fs::write(&csv, "\"line1\nline2\",B\nC,D\n").unwrap();
     app.import_csv_from(&csv);
+    app.finish_csv_probe();
 
     let sh = app.wb.sheet(app.sheet_idx);
     let val = |r: u32, c: u32| match sh.get(r, c).map(|x| x.value.clone()) {
@@ -4333,9 +4479,10 @@ fn csv_import_dialog_renders_with_real_preview_before_any_write() {
     let csv = env.path("dlg.csv");
     std::fs::write(&csv, "编号,名称\n00123,甲\n".as_bytes()).unwrap();
     app.open_csv_dialog(&csv);
+    app.csv_dlg.as_mut().unwrap().wait_preview();
     let dlg = app.csv_dlg.as_ref().unwrap();
-    assert_eq!(dlg.preview.len(), 2, "对话框打开即解析出预览");
-    assert_eq!(dlg.preview[1][0], "00123");
+    assert_eq!(dlg.preview().len(), 2, "对话框打开即解析出预览");
+    assert_eq!(dlg.preview()[1][0], "00123");
     // 渲染一帧：窗口能画出来，且不因预览/勾选框 panic
     let _ = ctx.run(egui::RawInput::default(), |ctx| {
         app.csv_dlg_ui(ctx);
@@ -4355,11 +4502,13 @@ fn csv_import_choices_persist_and_refresh_reuses_them() {
     std::fs::write(&csv, "账号,金额\n001234567890123456,5\n").unwrap();
     // 模拟对话框选择：UTF-8 + 首行表头 + 第 1 列按文本
     app.open_csv_dialog(&csv);
+    app.csv_dlg.as_mut().unwrap().wait_preview();
     let dlg = app.csv_dlg.as_ref().expect("应打开导入对话框");
-    assert!(!dlg.preview.is_empty(), "对话框要有真实预览");
+    assert!(!dlg.preview().is_empty(), "对话框要有真实预览");
     let delim = dlg.delim;
     app.csv_dlg = None;
     app.import_csv_choice(&csv, delim, true, Some(sheetcore::csv::Encoding::Utf8), '"', &[0]);
+    app.finish_csv_probe();
 
     let sh = app.wb.sheet(app.sheet_idx);
     let val = |r: u32, c: u32| match sh.get(r, c).map(|x| x.value.clone()) {
@@ -4401,12 +4550,14 @@ fn refresh_is_one_undo_step_that_restores_values_rect_and_source_size() {
     let csv = env.path("r.csv");
     std::fs::write(&csv, "A,B\nC,D\n").unwrap();
     app.import_csv_from(&csv);
+    app.finish_csv_probe();
     assert_eq!(app.wb.sources.len(), 1);
     assert_eq!((app.wb.sources[0].rows, app.wb.sources[0].cols), (2, 2));
     let labels_before = app.undo.depth().0;
     // 文件变长且首行变短：刷新后 B1 必须清空、矩形变 3x2
     std::fs::write(&csv, "A\nE,F\nG,H\n").unwrap();
     app.refresh_import();
+    app.finish_csv_probe();
     let sh = app.wb.sheet(app.sheet_idx);
     let val = |r: u32, c: u32| match sh.get(r, c).map(|x| x.value.clone()) {
         Some(sheetcore::model::Value::Text(t)) => t.to_string(),
@@ -5443,7 +5594,7 @@ fn replace_all_in_selection_spares_cells_outside_and_is_one_undo() {
 
 /// UI-05.4：大范围扫描分帧进行，可取消且取消后不写任何格；继续扫描则最终一次提交。
 #[test]
-fn long_find_scan_is_chunked_cancellable_and_commits_once() {
+fn background_replace_scan_is_cancellable_and_commits_once() {
     let mut app = app();
     for r in 0..9000u32 {
         app.wb.sheet_mut(0).set(r, 0, text("old"));
@@ -5456,9 +5607,8 @@ fn long_find_scan_is_chunked_cancellable_and_commits_once() {
         ..Default::default()
     };
     app.start_scan(1);
-    assert!(app.find_scan.is_some(), "9000 格应进入分帧扫描");
-    app.poll_find_scan();
-    assert!(app.find_scan.is_some(), "一帧还没扫完");
+    assert!(app.find_scan.is_some(), "9000 格应进入后台扫描");
+
     app.cancel_find_scan();
     assert!(app.find_scan.is_none());
     assert_eq!(app.status, "已取消扫描");
@@ -5466,12 +5616,12 @@ fn long_find_scan_is_chunked_cancellable_and_commits_once() {
     assert_eq!(app.undo.depth(), (0, 0), "取消不能产生撤销步");
 
     app.start_scan(1);
-    let mut guard = 0;
-    while app.find_scan.is_some() && guard < 10 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.find_scan.is_some() && std::time::Instant::now() < deadline {
         app.poll_find_scan();
-        guard += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    assert!(app.find_scan.is_none(), "分帧应在有限帧内完成");
+    assert!(app.find_scan.is_none(), "后台扫描应及时完成");
     assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("new".into()));
     assert_eq!(app.wb.sheet(0).value(8999, 0), Value::Text("new".into()));
     assert_eq!(app.undo.depth(), (1, 0), "扫描完成后一次提交、一步撤销");
@@ -5767,7 +5917,7 @@ fn stale_scan_is_dropped_after_document_switch() {
         ..Default::default()
     };
     app.start_scan(1);
-    let stale = app.find_scan.take().expect("应进入分帧扫描");
+    let stale = app.find_scan.take().expect("应进入后台扫描");
     // 模拟切到另一份文档：内容与世代都换了，但扫描被错误地保留
     let mut b = sheetcore::model::Workbook::new_blank();
     b.sheets[0].set(0, 0, text("old"));
@@ -5786,10 +5936,10 @@ fn stale_scan_is_dropped_after_document_switch() {
     // 正常的分帧扫描仍在同一文档内完成
     app.undo = sheetcore::undo::UndoStack::new();
     app.start_scan(1);
-    let mut guard = 0;
-    while app.find_scan.is_some() && guard < 10 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.find_scan.is_some() && std::time::Instant::now() < deadline {
         app.poll_find_scan();
-        guard += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("new".into()));
 }
@@ -7673,6 +7823,51 @@ fn multi_level_sort_respects_level_order_and_selection_range() {
     assert_eq!(order, vec!["2", "4", "1", "3"], "先组后编号");
     assert_eq!(app.wb.sheet(0).get(5, 0).unwrap().value.display(), "99", "选区外不动");
     assert_eq!(app.wb.sheet(0).get(0, 0).unwrap().value.display(), "编号", "标题保留");
+}
+
+#[test]
+fn broad_structural_worker_publishes_relocated_edges_and_position_sensitive_values() {
+    let _env = crate::test_env::TestEnv::new("broad_structure");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx,None);
+    for row in 0..2100 {
+        app.wb.sheets[0].set(row,0,number(f64::from(row)));
+        app.wb.sheets[0].set(row,1,formula(&format!("=A{}+1",row+1)));
+    }
+    app.wb.sheets[0].set(0,2,formula("=ROW()+B1"));
+    sheetcore::formula::recalc_all(&mut app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build_after_recalc(&app.wb).into();
+    app.deps_built = true;
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert!(app.tasks.structural_recalc.is_some());
+    app.tasks.last_edit = None;
+    app.start_silent_recalc(&ctx);
+    let start = std::time::Instant::now();
+    while app.bg_recalc_rx.is_some() {
+        app.poll_silent_recalc();
+        assert!(start.elapsed().as_secs() < 30);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(app.deps_built && !app.tasks.recalc_pending());
+    assert_eq!(app.wb.sheets[0].value(1,2),sheetcore::Value::Number(3.));
+    let downstream = app.deps.edit_closure(&[(0,1,0)]);
+    assert!(downstream.contains(&(0,1,1)) && downstream.contains(&(0,1,2)));
+}
+
+#[test]
+fn structural_edit_validates_fast_open_formula_caches_before_reusing_them() {
+    let _env = crate::test_env::TestEnv::new("structure_fast_open_cache");
+    let mut app = app();
+    app.wb.sheets[0].set(0,0,number(3.0));
+    app.wb.sheets[0].set(0,1,sheetcore::Cell { value: sheetcore::Value::Number(999.0),
+        formula: Some("=A1+1".into()) });
+    // Fast-open explicitly builds the graph without recalculating imported caches.
+    app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
+    app.deps_built = true;
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(app.wb.sheets[0].value(1,1),sheetcore::Value::Number(4.0));
+    app.structural(sheetcore::structural::Structural::InsertCols { at: 0, n: 1 });
+    assert_eq!(app.wb.sheets[0].value(1,2),sheetcore::Value::Number(4.0));
 }
 
 #[test]
@@ -9807,16 +10002,17 @@ fn background_save_finishes_in_its_own_tab_after_switching() {
     app.commit_edit(None);
     assert!(app.wb.dirty, "文档 2 应该是脏的");
 
-    // 等文档 1 的后台保存结束（最多 10 秒）
-    let t0 = std::time::Instant::now();
-    while app.tabs.iter().any(|t| {
-        matches!(t, TabSlot::Parked(d) if d.tasks.saving.is_some())
-    }) && t0.elapsed().as_secs() < 10
-    {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        // 每帧都要真的收一次后台保存结果（和主循环一样），否则挂起标签的 saving 永远不清
+    assert!(matches!(&app.tabs[0], TabSlot::Parked(d) if d.tasks.saving.is_some()),
+        "文档 1 的保存任务应随标签挂起");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
         app.poll_save();
+        if !app.has_pending_save() { break; }
+        assert!(std::time::Instant::now() < deadline, "文档 1 后台保存超时：{}", app.status);
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    assert!(matches!(&app.tabs[0], TabSlot::Parked(d) if !d.wb.dirty && d.tasks.autosave_retry_at.is_none()),
+        "文档 1 后台保存失败：{}", app.status);
 
     // 文档 1：文件里应该有值、脏标记清掉
     let wb = sheetcore::xlsx::load(&path1).expect("读回文档 1");
@@ -11178,4 +11374,50 @@ fn large_fill_down_records_the_last_destination_and_can_undo_it() {
     app.do_undo(false);
     assert!(app.wb.sheet(0).get(100_000, 0).is_none());
     assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(7.0));
+}
+
+#[test]
+fn scenario_summary_uses_each_scenario_independently_and_preserves_live_formulas() {
+    let _env = crate::test_env::TestEnv::new("scenario-summary");
+    let mut app = app();
+    let sheet = app.wb.sheet_mut(0);
+    sheet.set(0,0,Cell {formula:Some("=2*3".into()),value:Value::Number(6.)});
+    sheet.set(0,1,number(10.));
+    sheet.set(0,2,Cell {formula:Some("=A1+B1".into()),value:Value::Number(16.)});
+    for (name,key) in [("first",(0,0)),("second",(0,1))] {
+        let mut sc = sheetcore::scenarios::Scenario::new(name);
+        sc.cells.push((key,"1".into()));
+        sheet.scenarios.push(sc);
+    }
+    sheet.scenario_settings.sqref = Some("D2".into());
+    app.build_scenario_summary("C1 A1").unwrap();
+    assert_eq!(app.wb.sheet(0).get(0,0).unwrap().formula.as_deref(),Some("=2*3"));
+    assert_eq!(app.wb.sheet(0).value(0,2),Value::Number(16.));
+    assert_eq!(app.wb.sheet(0).scenario_settings.sqref.as_deref(),Some("D2"));
+    assert!(!app.wb.sheet(0).scenarios_dirty);
+    let report = app.wb.sheet(1);
+    assert_eq!(report.value(2,3),Value::Number(11.));
+    assert_eq!(report.value(3,3),Value::Number(7.));
+}
+
+#[test]
+fn scenario_show_after_row_delete_preserves_the_next_formula_and_is_undoable() {
+    let _env = crate::test_env::TestEnv::new("scenario-show-undo");
+    let mut app=app();
+    let sheet=app.wb.sheet_mut(0);
+    sheet.set(0,0,Cell { formula:Some("=3*4".into()),value:Value::Number(12.) });
+    sheet.set(1,0,number(20.));
+    sheet.set(2,0,Cell { formula:Some("=A1+1".into()),value:Value::Number(13.) });
+    let mut sc=sheetcore::scenarios::Scenario::new("inputs");
+    sc.cells=vec![((0,0),"7".into()),((1,0),"8".into())];
+    sheet.scenarios.push(sc);
+    sheet.delete_rows(1,1);
+    app.show_scenario(0);
+    assert_eq!(app.wb.sheet(0).value(0,0), Value::Number(7.));
+    assert_eq!(app.wb.sheet(0).get(1,0).unwrap().formula.as_deref(), Some("=A1+1"));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).get(0,0).unwrap().formula.as_deref(), Some("=3*4"));
+    assert_eq!(app.wb.sheet(0).value(1,0), Value::Number(13.));
+    app.do_undo(true);
+    assert_eq!(app.wb.sheet(0).value(1,0), Value::Number(8.));
 }

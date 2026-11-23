@@ -28,6 +28,7 @@ pub struct SheetLayout {
     pub outline_pr: Option<(bool, bool, bool)>,
     /// 方案管理器里的方案
     pub scenarios: Vec<crate::scenarios::Scenario>,
+    pub scenario_settings: crate::scenarios::ScenarioSettings,
     /// 被忽略错误的单元格（0-based）
     pub ignored_errors: Vec<(u32, u32)>,
     /// 分级显示级别（0-based 行列 → 1..=7）
@@ -35,6 +36,7 @@ pub struct SheetLayout {
     pub col_levels: Vec<(u32, u8)>,
     /// 整列 / 整行样式索引（0-based 行列 → xl/styles.xml cellXfs 索引）
     pub col_xfs: Vec<(u32, u32)>,
+    pub(crate) invalid_column_bounds: bool,
     pub row_xfs: Vec<(u32, u32)>,
     /// 条件格式
     pub cf: Vec<crate::cf::CfBlock>,
@@ -152,7 +154,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
             || !lay.row_heights.is_empty()
             || lay.row_default.is_some()
             || lay.outline_pr.is_some()
-            || !lay.scenarios.is_empty()
+            || lay.scenario_settings.has_source() || !lay.scenarios.is_empty()
             || !lay.ignored_errors.is_empty()
             || !lay.row_levels.is_empty()
             || !lay.col_levels.is_empty()
@@ -175,7 +177,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
 
 pub(crate) fn sheet_layout(xml: &str, dxfs: &[crate::cf::Dxf], dxf_ext: bool) -> SheetLayout {
     let mut layout = parse_layout(xml);
-    layout.scenarios = crate::scenarios::parse(xml);
+    (layout.scenario_settings, layout.scenarios) = crate::scenarios::parse_with_settings(xml);
     layout.cf = crate::cf::parse_cf_blocks(xml);
     layout.cf_ext = crate::cf::xml_has_cf_ext(xml);
     layout.dxfs = dxfs.to_vec();
@@ -274,6 +276,10 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             "outlineLevel" => outline_lv = val.parse::<u8>().unwrap_or(0),
                             _ => {}
                         }
+                    }
+                    if min == 0 || max < min || max > crate::sync::MAX_COLS {
+                        out.invalid_column_bounds = true;
+                        max = max.min(crate::sync::MAX_COLS);
                     }
                     if outline_lv > 0 && min >= 1 && max >= min && (max - min) < 1024 {
                         for c in (min - 1)..max {

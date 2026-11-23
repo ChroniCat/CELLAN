@@ -155,7 +155,7 @@ pub fn read_rels(path: &Path, sheet_part: &str) -> HashMap<String, (String, bool
     let Some(body) = crate::fixups::read_part(path, &rels_part(sheet_part)) else {
         return map;
     };
-    let Ok(xml) = String::from_utf8(body) else {
+    let Ok(xml) = crate::xlsx::patch_xml_text(&body,sheet_part) else {
         return map;
     };
     if let Ok(doc) = roxmltree::Document::parse(&xml) {
@@ -215,16 +215,14 @@ pub(crate) fn apply_after_save(
         let Some(part) = targets.get(&sheet.name) else {
             continue;
         };
-        let Some(xml) = crate::fixups::read_part(path, part).and_then(|b| String::from_utf8(b).ok())
-        else {
-            continue;
-        };
-        if !sheet.hyperlinks_dirty && load_sheet(path, part, &xml) == sheet.hyperlinks {
+        let bytes = crate::fixups::read_part(path, part).ok_or_else(|| anyhow::anyhow!("缺少工作表 {part}"))?;
+        let xml = crate::xlsx::patch_xml_text(&bytes, part)?;
+        if !sheet.hyperlinks_dirty && load_sheet(path, part, &xml) == *sheet.hyperlinks {
             continue;
         }
         let rels_name = rels_part(part);
         let rels_xml = crate::fixups::read_part(path, &rels_name)
-            .and_then(|b| String::from_utf8(b).ok())
+            .map(|b| crate::xlsx::patch_xml_text(&b,&rels_name).map(|s| s.into_owned())).transpose()?
             .unwrap_or_else(|| "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>".into());
         // 去掉旧的 hyperlink 关系，保留根元素、图片/图表等
         let doc = roxmltree::Document::parse(&rels_xml)?;

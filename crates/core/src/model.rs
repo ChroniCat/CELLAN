@@ -39,6 +39,13 @@ pub fn format_number(n: f64) -> String {
 }
 
 impl Value {
+    pub(crate) fn same_stored_value(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Number(a), Self::Number(b)) => a.to_bits() == b.to_bits(),
+            (a, b) => a == b,
+        }
+    }
+
     /// 显示用文本（数字去掉多余的 .0）
     pub fn display(&self) -> String {
         match self {
@@ -74,15 +81,86 @@ impl Value {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Cell {
     pub value: Value,
-    /// 公式原文（以 = 开头）。用 Box<str> 而不是 String：省 8 字节/格，
-    /// 而且公式一旦写入就不再变长，不需要容量字段
-    pub formula: Option<Box<str>>,
+    /// Immutable source, shared across calculation snapshots, undo and page-column copies.
+    pub formula: Option<std::sync::Arc<str>>,
 }
 
 impl Cell {
+    /// Formula caches are calculated state. Compare only the editable input.
+    pub fn same_input(&self, other: &Self) -> bool {
+        if self.formula.is_some() || other.formula.is_some() {
+            return self.formula == other.formula;
+        }
+        self.value.same_stored_value(&other.value)
+    }
+
     pub fn is_blank(&self) -> bool {
         self.value.is_empty() && self.formula.is_none()
     }
+}
+
+/// Rarely edited per-cell metadata shared by save, calculation and undo snapshots.
+#[derive(Clone, Debug)]
+pub struct CellMetadata<K, V>(std::sync::Arc<HashMap<K, V>>);
+
+impl<K, V> Default for CellMetadata<K, V> {
+    fn default() -> Self { Self(Default::default()) }
+}
+
+impl<K, V> From<HashMap<K, V>> for CellMetadata<K, V> {
+    fn from(map: HashMap<K, V>) -> Self { Self(std::sync::Arc::new(map)) }
+}
+
+impl<K, V> std::ops::Deref for CellMetadata<K, V> {
+    type Target = HashMap<K, V>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl<K: Clone, V: Clone> std::ops::DerefMut for CellMetadata<K, V> {
+    fn deref_mut(&mut self) -> &mut Self::Target { std::sync::Arc::make_mut(&mut self.0) }
+}
+
+impl<K: Clone, V: Clone> IntoIterator for CellMetadata<K, V> {
+    type Item = (K, V);
+    type IntoIter = std::collections::hash_map::IntoIter<K, V>;
+    fn into_iter(self) -> Self::IntoIter { std::sync::Arc::unwrap_or_clone(self.0).into_iter() }
+}
+
+impl<K: Eq + std::hash::Hash, V: PartialEq> PartialEq for CellMetadata<K, V> {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0 }
+}
+
+/// Save receipts, background jobs and undo snapshots share the edit journals.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellJournal(std::sync::Arc<std::collections::HashSet<CellRef>>);
+
+impl<const N: usize> From<[CellRef; N]> for CellJournal {
+    fn from(keys: [CellRef; N]) -> Self { Self(std::sync::Arc::new(keys.into())) }
+}
+
+impl std::ops::Deref for CellJournal {
+    type Target = std::collections::HashSet<CellRef>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl std::ops::DerefMut for CellJournal {
+    fn deref_mut(&mut self) -> &mut Self::Target { std::sync::Arc::make_mut(&mut self.0) }
+}
+
+impl CellJournal {
+    pub fn clear(&mut self) {
+        if let Some(unique) = std::sync::Arc::get_mut(&mut self.0) { unique.clear(); }
+        else { *self = Self::default(); }
+    }
+    fn remove_if_present(&mut self, key: &CellRef) {
+        if self.contains(key) { self.remove(key); }
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a CellMetadata<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::collections::hash_map::Iter<'a, K, V>;
+    fn into_iter(self) -> Self::IntoIter { self.0.iter() }
 }
 
 #[derive(Clone, Debug)]
@@ -91,10 +169,15 @@ pub struct Sheet {
     /// Runtime identity survives snapshots, renames and reordering. Save
     /// acknowledgements must never identify a sheet by its current index/name.
     pub identity: u64,
+    /// Immutable exact-match indexes shared by calculation snapshots of this sheet.
+    pub(crate) shared_lookup: crate::formula::lookup_cache::SharedLookup,
     /// Stable worksheet part in the loaded OOXML package. Renaming/reordering a
     /// sheet must retain its original relationships and other unmodeled content.
     /// A duplicated/new sheet has no source part.
     pub source_part: Option<String>,
+    /// The source has implicit row/cell coordinates or out-of-range column
+    /// dimensions that require normalization before umya reads a temporary copy.
+    pub(crate) source_needs_dom_repair: bool,
     /// 分页列式存储（见 store.rs）：页内按列连续，扫描快、每格只占 40 字节
     cells: Store,
     /// Cell storage revision represented by the current OOXML source part.
@@ -103,8 +186,9 @@ pub struct Sheet {
     /// Copy-on-write value snapshot matching a verified worksheet ZIP entry.
     pub(crate) source_cells: Option<crate::xlsx::SourceCells>,
     display_style_revision: u64,
+    coordinate_revision: u64,
     /// 被清空过的单元格：保存时要真的从文件里删掉，否则旧值会残留
-    pub cleared: std::collections::HashSet<CellRef>,
+    pub cleared: CellJournal,
     /// 被动态数组公式溢出占用的单元格（重算前要清掉）
     pub spilled: std::collections::HashSet<CellRef>,
     /// 动态数组锚点 → 本次重算写回的精确形状 (rows, cols)。1×1 也记录；
@@ -133,11 +217,11 @@ pub struct Sheet {
     /// 有样式的单元格 → 样式表索引（只存有样式的格子，稀疏）
     pub styles: crate::store::CellStyles,
     /// 整列默认样式（列号 -> 样式表索引，稀疏）
-    pub col_styles: HashMap<u32, u16>,
+    pub col_styles: CellMetadata<u32, u16>,
     /// 整行默认样式（行号 -> 样式表索引，稀疏）
-    pub row_styles: HashMap<u32, u16>,
+    pub row_styles: CellMetadata<u32, u16>,
     /// 用户改过样式的格子（保存时只需要回写这些，不必重写整表样式）
-    pub style_edits: std::collections::HashSet<CellRef>,
+    pub style_edits: CellJournal,
     /// 整列样式被改过
     pub col_styles_dirty: bool,
     /// 整行样式被改过
@@ -153,7 +237,7 @@ pub struct Sheet {
     /// 数据验证被改过
     pub dv_dirty: bool,
     /// 批注
-    pub notes: HashMap<CellRef, crate::notes::Note>,
+    pub notes: CellMetadata<CellRef, crate::notes::Note>,
     /// 批注被改过
     pub notes_dirty: bool,
     /// 冻结窗格：(冻结行数, 冻结列数)
@@ -172,6 +256,7 @@ pub struct Sheet {
     pub layout_dirty: bool,
     /// 方案管理器里的方案（写进 <scenarios>）
     pub scenarios: Vec<crate::scenarios::Scenario>,
+    pub scenario_settings: crate::scenarios::ScenarioSettings,
     /// 方案列表被改过
     pub scenarios_dirty: bool,
     /// 被用户「忽略错误」的单元格（写进 <ignoredErrors>）
@@ -208,11 +293,11 @@ pub struct Sheet {
     /// 保护状态被改过
     pub protect_dirty: bool,
     /// 单元格富文本（有记录时优先于纯文本绘制）
-    pub rich: std::collections::HashMap<(u32, u32), Vec<crate::richtext::RichRun>>,
+    pub rich: CellMetadata<(u32, u32), Vec<crate::richtext::RichRun>>,
     /// 富文本被改过
     pub rich_dirty: bool,
     /// 单元格超链接
-    pub hyperlinks: std::collections::HashMap<(u32, u32), crate::hyperlinks::Hyperlink>,
+    pub hyperlinks: CellMetadata<(u32, u32), crate::hyperlinks::Hyperlink>,
     pub hyperlinks_dirty: bool,
     /// 单元格迷你图（Excel 的 x14 sparklineGroups）
     pub sparklines: Vec<crate::sparkline::Sparkline>,
@@ -232,12 +317,15 @@ impl Sheet {
         Self {
             name: name.into(),
             identity: next_sheet_identity(),
+            shared_lookup: Default::default(),
             source_part: None,
+            source_needs_dom_repair: false,
             cells: Store::default(),
             saved_cells: None,
             source_cells: None,
             display_style_revision: 0,
-            cleared: std::collections::HashSet::new(),
+            coordinate_revision: 0,
+            cleared: CellJournal::default(),
             spilled: std::collections::HashSet::new(),
             spill_shapes: std::collections::HashMap::new(),
             arrays: Vec::new(),
@@ -251,9 +339,9 @@ impl Sheet {
             cols: crate::layout::Axis::new(crate::layout::DEFAULT_COL_W),
             rows: crate::layout::Axis::new(crate::layout::DEFAULT_ROW_H),
             styles: crate::store::CellStyles::default(),
-            col_styles: HashMap::new(),
-            row_styles: HashMap::new(),
-            style_edits: std::collections::HashSet::new(),
+            col_styles: Default::default(),
+            row_styles: Default::default(),
+            style_edits: CellJournal::default(),
             col_styles_dirty: false,
             row_styles_dirty: false,
             merges_dirty: false,
@@ -261,7 +349,7 @@ impl Sheet {
             cf_dirty: false,
             dv: Vec::new(),
             dv_dirty: false,
-            notes: HashMap::new(),
+            notes: Default::default(),
             notes_dirty: false,
             freeze: None,
             freeze_dirty: false,
@@ -271,6 +359,7 @@ impl Sheet {
             hidden_cols: Default::default(),
             layout_dirty: false,
             scenarios: Vec::new(),
+            scenario_settings: Default::default(),
             scenarios_dirty: false,
             ignored_errors: std::collections::HashSet::new(),
             ignored_errors_dirty: false,
@@ -290,9 +379,9 @@ impl Sheet {
             tables_dirty: false,
             protection: None,
             protect_dirty: false,
-            rich: std::collections::HashMap::new(),
+            rich: Default::default(),
             rich_dirty: false,
-            hyperlinks: std::collections::HashMap::new(),
+            hyperlinks: Default::default(),
             hyperlinks_dirty: false,
             sparklines: Vec::new(),
             sparklines_dirty: false,
@@ -307,6 +396,7 @@ impl Sheet {
     pub fn renew_identity(&mut self) {
         self.identity = next_sheet_identity();
         self.source_part = None;
+        self.source_needs_dom_repair = false;
         self.saved_cells = None;
         self.source_cells = None;
     }
@@ -359,7 +449,7 @@ impl Sheet {
             }
             return;
         }
-        self.cleared.remove(&key);
+        self.cleared.remove_if_present(&key);
         self.cells.set(r, c, cell);
     }
 
@@ -397,6 +487,8 @@ impl Sheet {
     /// 按行、列升序遍历所有单元格
     pub(crate) fn cells(&self) -> &Store { &self.cells }
 
+    pub(crate) fn replace_cell_store(&mut self, cells: Store) { self.cells = cells; }
+
     pub(crate) fn formula_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.formula_cells()
     }
@@ -412,7 +504,7 @@ impl Sheet {
         self.style_edits.extend(self.cleared.iter().filter(|k| self.styles.get(k).is_some()).copied());
         if !self.style_edits.is_empty() {
             self.styles_dirty = true;
-            self.display_style_revision = self.display_style_revision.wrapping_add(1);
+            self.display_style_revision = next_sheet_identity();
         }
         self.edited = true;
     }
@@ -423,7 +515,31 @@ impl Sheet {
 
     pub fn cell_revision(&self) -> u64 { self.cells.revision() }
 
-    pub(crate) fn cell_version(&self) -> &crate::store::CellVersion { &self.cells.version }
+    pub fn cell_version(&self) -> &crate::store::CellVersion { &self.cells.version }
+
+    pub fn same_cells_in(&self, prior: &Self, rects: &[(u32,u32,u32,u32)], formulas: bool) -> bool {
+        self.cells.same_cells_in(&prior.cells, rects, formulas)
+    }
+
+    pub fn same_display_styles_in(&self, prior: &Self, rects: &[(u32,u32,u32,u32)],
+        current_styles: &crate::style::StyleTable, prior_styles: &crate::style::StyleTable) -> bool {
+        let equal = |a, b| current_styles.get(a).format == prior_styles.get(b).format;
+        let rows = self.row_styles.keys().chain(prior.row_styles.keys())
+            .filter(|&&r| rects.is_empty() || rects.iter().any(|&(r1,_,r2,_)| r1 <= r && r <= r2));
+        let cols = self.col_styles.keys().chain(prior.col_styles.keys())
+            .filter(|&&c| rects.is_empty() || rects.iter().any(|&(_,c1,_,c2)| c1 <= c && c <= c2));
+        let same_override = |a: Option<&u16>, b: Option<&u16>| match (a,b) {
+            (Some(&a),Some(&b)) => equal(a,b),
+            (None,None) => true,
+            _ => false, // An added row override may mask a column's format.
+        };
+        rows.into_iter().all(|r| same_override(self.row_styles.get(r), prior.row_styles.get(r)))
+            && cols.into_iter().all(|c| same_override(self.col_styles.get(c), prior.col_styles.get(c)))
+            && self.styles.changed_keys(&prior.styles).chain(prior.styles.changed_keys(&self.styles)).all(|k| {
+                (!rects.is_empty() && !rects.iter().any(|&(r1,c1,r2,c2)| r1 <= k.row && k.row <= r2 && c1 <= k.col && k.col <= c2))
+                    || equal(self.style_of(k.row,k.col), prior.style_of(k.row,k.col))
+            })
+    }
 
     pub(crate) fn cell_data_needs_save(&self) -> bool {
         self.edited || !self.cleared.is_empty() || match &self.saved_cells {
@@ -450,6 +566,13 @@ impl Sheet {
 
     pub fn display_style_revision(&self) -> u64 { self.display_style_revision }
 
+    pub fn coordinate_revision(&self) -> u64 { self.coordinate_revision }
+
+    pub(crate) fn coordinates_shifted(&mut self) {
+        self.coordinate_revision = next_sheet_identity();
+        self.display_style_revision = self.coordinate_revision;
+    }
+
     pub(crate) fn stored_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.stored_cells()
     }
@@ -458,9 +581,30 @@ impl Sheet {
     pub fn search_snapshot(&self) -> Self {
         let mut snapshot = Self::new(&self.name);
         snapshot.cells = self.cells.clone();
+        snapshot.identity = self.identity;
+        snapshot.coordinate_revision = self.coordinate_revision;
+        snapshot.display_style_revision = self.display_style_revision;
         snapshot.styles = self.styles.clone();
         snapshot.row_styles = self.row_styles.clone();
         snapshot.col_styles = self.col_styles.clone();
+        snapshot
+    }
+
+    /// Inputs used by selection statistics. Cell contents share their COW column
+    /// storage with the live sheet, and unrelated workbook metadata stays there.
+    pub fn selection_stats_snapshot(&self) -> Self {
+        self.selection_stats_snapshot_with_filter(self.hidden_rows.is_empty())
+    }
+
+    pub fn selection_stats_snapshot_with_filter(&self, with_filter: bool) -> Self {
+        let mut snapshot = Self::new(&self.name);
+        snapshot.cells = self.cells.clone();
+        snapshot.rows = self.rows.clone();
+        snapshot.hidden_rows = self.hidden_rows.clone();
+        snapshot.hidden_rows_user = self.hidden_rows_user.clone();
+        if with_filter {
+            snapshot.filter = self.filter.clone();
+        }
         snapshot
     }
 
@@ -482,6 +626,107 @@ impl Sheet {
             && self.merges == source.merges && self.arrays == source.arrays && self.spilled == source.spilled
     }
 
+    /// CSV writes cells, while a sort also depends on cached values and formats.
+    /// Changed storage slabs can be shared with the worker even on very large sheets.
+    pub fn csv_inputs_match(&self, before: &Self, keys: &[(u32, u32)]) -> bool {
+        let hit = |k: CellRef| keys.binary_search(&(k.row, k.col)).is_ok();
+        let intersects = |&(r1,c1,r2,c2): &(u32,u32,u32,u32)| {
+            keys[keys.partition_point(|&(r,_)| r < r1)..].iter()
+                .take_while(|&&(r,_)| r <= r2).any(|&(_,c)| (c1..=c2).contains(&c))
+        };
+        self.merges.iter().filter(|r| intersects(r)).eq(before.merges.iter().filter(|r| intersects(r)))
+            && self.arrays.iter().filter(|(_,r)| intersects(r)).eq(before.arrays.iter().filter(|(_,r)| intersects(r)))
+            && !self.spilled.symmetric_difference(&before.spilled).any(|k| hit(*k))
+            && (self.cell_version() == before.cell_version() ||
+                self.changed_cells(before).chain(before.changed_cells(self)).filter(|k| hit(*k)).all(|k| {
+                    self.get(k.row,k.col).zip(before.get(k.row,k.col)).is_some_and(|(a,b)| a.same_input(b))
+                }))
+    }
+
+    pub fn same_sort_region(&self, before: &Self, rect: (u32,u32,u32,u32)) -> bool {
+        let (r1,c1,r2,c2) = rect;
+        let inside = |k: CellRef| (r1..=r2).contains(&k.row) && (c1..=c2).contains(&k.col);
+        let intersects = |&(a,b,c,d): &(u32,u32,u32,u32)| a <= r2 && c >= r1 && b <= c2 && d >= c1;
+        let axis_matches = |live: &CellMetadata<u32,u16>, old: &CellMetadata<u32,u16>, first: u32, last: u32| {
+            let range = first..=last;
+            live.keys().chain(old.keys()).filter(|&k| range.contains(k))
+                .all(|k| live.get(k) == old.get(k))
+        };
+        self.same_cells_in(before, &[rect], true) && self.same_cells_in(before, &[rect], false)
+            && self.merges.iter().filter(|r| intersects(r)).eq(before.merges.iter().filter(|r| intersects(r)))
+            && self.arrays.iter().filter(|(_,r)| intersects(r)).eq(before.arrays.iter().filter(|(_,r)| intersects(r)))
+            && !self.spilled.symmetric_difference(&before.spilled).any(|k| inside(*k))
+            && axis_matches(&self.row_styles, &before.row_styles, r1, r2)
+            && axis_matches(&self.col_styles, &before.col_styles, c1, c2)
+            && !self.styles.changed_keys(&before.styles).chain(before.styles.changed_keys(&self.styles)).any(inside)
+    }
+
+    /// Carry concurrent edits outside a validated operation into its prepared COW pages.
+    /// Live save journals already own those edits. Only the worker's writes need new entries.
+    pub fn rebase_row_changes(&self, before: &Sheet, prepared: &mut Sheet, in_target: impl Fn(CellRef) -> bool) {
+        if self.cell_version() != before.cell_version() {
+            for k in self.changed_cells(before).filter(|k| !in_target(*k)) {
+                if let Some(cell) = self.get(k.row, k.col) {
+                    prepared.cells.set(k.row, k.col, cell.clone());
+                }
+            }
+            for k in before.changed_cells(self).filter(|k| !in_target(*k) && self.get(k.row,k.col).is_none()) {
+                prepared.cells.remove(k.row,k.col);
+            }
+        }
+        for k in self.spilled.symmetric_difference(&before.spilled).filter(|k| !in_target(**k)) {
+            if self.spilled.contains(k) { prepared.spilled.insert(*k); }
+            else { prepared.spilled.remove(k); }
+        }
+        if prepared.styles_dirty {
+            for k in self.styles.changed_keys(&before.styles) {
+                if let Some(&id) = self.styles.get(&k) { prepared.styles.insert(k,id); }
+            }
+            for k in before.styles.changed_keys(&self.styles).filter(|k| self.styles.get(k).is_none()) {
+                prepared.styles.remove(&k);
+            }
+        }
+    }
+
+    /// Merge concurrent edits into staged replacement pages. Changed target values
+    /// survive and are excluded from the undo/broadcast transaction. A whole-row
+    /// format change or a large intervening edit is cheaper to restage off-thread.
+    pub fn rebase_replacement(&self, before: &Sheet, result: &mut Sheet,
+        targets: &[(u32, u32)], value_mode: bool, live_styles: &crate::style::StyleTable,
+        old_styles: &crate::style::StyleTable) -> Option<Vec<(u32,u32)>> {
+        let hit = |k: CellRef| targets.binary_search(&(k.row, k.col)).is_ok();
+        let mut conflicts = Vec::new();
+        if value_mode && self.display_style_revision != before.display_style_revision {
+            if self.row_styles != before.row_styles || self.col_styles != before.col_styles { return None; }
+            for k in self.styles.changed_keys(&before.styles).chain(before.styles.changed_keys(&self.styles)) {
+                if hit(k) && live_styles.get(self.style_of(k.row,k.col)).format != old_styles.get(before.style_of(k.row,k.col)).format {
+                    conflicts.push((k.row,k.col));
+                    result.set(k.row,k.col,self.get(k.row,k.col).cloned().unwrap_or_default());
+                }
+            }
+        }
+        if self.cell_version() != before.cell_version() {
+            let changes = self.changed_cells(before).chain(before.changed_cells(self)
+                .filter(|k| self.get(k.row, k.col).is_none()));
+            for (n, k) in changes.enumerate() {
+                if n >= 4096 { return None; }
+                if hit(k) {
+                    // A changed formula cache is still the same formula-mode hit. Restage
+                    // to capture its new cached value in both sides of the undo record.
+                    if !value_mode && self.get(k.row,k.col).and_then(|cell| cell.formula.as_ref())
+                        == before.get(k.row,k.col).and_then(|cell| cell.formula.as_ref()) { return None; }
+                    conflicts.push((k.row,k.col));
+                }
+                result.set(k.row, k.col, self.get(k.row, k.col).cloned().unwrap_or_default());
+            }
+        }
+        conflicts.sort_unstable();
+        conflicts.dedup();
+        result.spilled = self.spilled.iter().copied().filter(|k|
+            !hit(*k) || conflicts.binary_search(&(k.row,k.col)).is_ok()).collect();
+        Some(conflicts)
+    }
+
     /// Install a validated reorder and merge just the worker's new edits into
     /// the live save journals, which may have been acknowledged in the meantime.
     pub fn take_row_changes(&mut self, result: &mut Self) {
@@ -496,7 +741,7 @@ impl Sheet {
         if result.styles_dirty {
             std::mem::swap(&mut self.styles, &mut result.styles);
             self.styles_dirty = true;
-            self.display_style_revision = self.display_style_revision.wrapping_add(1);
+            self.display_style_revision = next_sheet_identity();
             if self.style_edits.is_empty() {
                 self.style_edits = std::mem::take(&mut result.style_edits);
             } else {
@@ -583,11 +828,23 @@ impl Sheet {
         self.styles.get(&CellRef::new(r, c)).copied()
     }
 
+    /// An existing OOXML value cell with no s uses cellXfs[0]. An absent cell
+    /// at the same address would inherit the row or column style on entry.
+    pub(crate) fn apply_loaded_xf_zero(&mut self, xf_zero: u16) {
+        for (key, _) in self.cells.iter() {
+            if (self.row_styles.contains_key(&key.row) || self.col_styles.contains_key(&key.col))
+                && self.styles.get(&key).is_none()
+            {
+                self.styles.insert(key, xf_zero);
+            }
+        }
+    }
+
     /// 用户改样式（标记脏，保存时回写）
     pub fn set_style(&mut self, r: u32, c: u32, id: u16) {
         let explicit = (id != 0 || self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c)).then_some(id);
         if self.explicit_style_of(r, c) == explicit { return; }
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         if !self.loading {
             self.edited = true;
             self.styles_dirty = true;
@@ -603,7 +860,7 @@ impl Sheet {
 
     /// 从文件载入样式（不算用户修改）
     pub fn set_style_loaded(&mut self, r: u32, c: u32, id: u16) {
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         let key = CellRef::new(r, c);
         if id == 0 {
             if self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c) {
@@ -618,7 +875,7 @@ impl Sheet {
 
     /// 用户设置整列样式（稀疏）
     pub fn set_col_style(&mut self, c: u32, id: u16) {
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         if !self.loading {
             self.edited = true;
             self.styles_dirty = true;
@@ -633,7 +890,7 @@ impl Sheet {
 
     /// 从文件载入整列样式（不算用户修改）
     pub fn set_col_style_loaded(&mut self, c: u32, id: u16) {
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         if id == 0 {
             self.col_styles.remove(&c);
         } else {
@@ -643,7 +900,7 @@ impl Sheet {
 
     /// 用户设置整行样式（稀疏）
     pub fn set_row_style(&mut self, r: u32, id: u16) {
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         if !self.loading {
             self.edited = true;
             self.styles_dirty = true;
@@ -658,7 +915,7 @@ impl Sheet {
 
     /// 从文件载入整行样式（不算用户修改）
     pub fn set_row_style_loaded(&mut self, r: u32, id: u16) {
-        self.display_style_revision = self.display_style_revision.wrapping_add(1);
+        self.display_style_revision = next_sheet_identity();
         if id == 0 {
             self.row_styles.remove(&r);
         } else {

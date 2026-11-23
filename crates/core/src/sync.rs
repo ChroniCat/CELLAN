@@ -333,6 +333,56 @@ impl LockTable {
     }
 }
 
+/// A checked destination-to-source permutation. Its digest covers the exact
+/// LWW operations and style changes the sender would otherwise transmit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SortPermutation {
+    pub structural_revision: usize,
+    pub sheet: usize,
+    pub name: String,
+    pub region: (u32, u32, u32, u32),
+    pub horizontal: bool,
+    pub order: Vec<u32>,
+    pub first_ts: u64,
+    pub site: u32,
+    pub digest: [u8; 32],
+}
+
+impl SortPermutation {
+    pub fn valid(&self) -> bool {
+        let (r1, c1, r2, c2) = self.region;
+        if !cell_in_bounds(self.sheet, r2, c2) || r1 > r2 || c1 > c2
+            || self.name.len() > 1024 || self.first_ts == 0 || !ts_ok(self.first_ts) {
+            return false;
+        }
+        // Bound candidate reconstruction even for a syntactically valid sparse rectangle.
+        let area = u64::from(r2-r1+1) * u64::from(c2-c1+1);
+        let (first, last) = if self.horizontal { (c1, c2) } else { (r1, r2) };
+        if area > 16_000_000 || self.order.len() != (last-first+1) as usize { return false; }
+        let mut seen = vec![false; self.order.len()];
+        self.order.iter().all(|&line| (first..=last).contains(&line)
+            && !std::mem::replace(&mut seen[(line-first) as usize], true))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SortResponse {
+    Accepted,
+    NeedCells,
+    Locked { structural_revision: usize },
+}
+
+/// Only the rejected writer receives these corrections. A correction applies
+/// if the optimistic sort still owns that coordinate at the given timestamp.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SortRepair {
+    pub rejected_ts: u64,
+    pub row: u32,
+    pub col: u32,
+    pub cell: Option<Op>,
+    pub style: Option<(crate::style::CellStyle, Option<crate::style::CellStyle>)>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Msg {
@@ -357,6 +407,8 @@ pub enum Msg {
         auth: String,
         #[serde(default)]
         base_hash: String,
+        #[serde(default)]
+        sort_permutation: bool,
     },
     /// 本机显示名变更（不改变 site；宿主转发给其他参与者）
     Rename { site: u32, name: String },
@@ -369,6 +421,10 @@ pub enum Msg {
         #[serde(default)]
         batch_ops: bool,
         #[serde(default)]
+        sort_permutation: bool,
+        #[serde(default)]
+        structural_ack: bool,
+        #[serde(default)]
         clock: u64,
     },
     Snapshot { ops: Vec<Op> },
@@ -376,6 +432,13 @@ pub enum Msg {
     SnapshotChunk { ops: Vec<Op>, #[serde(default)] last: bool },
     Op(Op),
     Ops { ops: Vec<Op> },
+    SortPermutation(SortPermutation),
+    SortData { first_ts: u64, items: Vec<(Op,Option<crate::style::CellStyle>)> },
+    SortCommitted { first_ts: u64 },
+    SortRepairDone { first_ts: u64 },
+    SortReply { first_ts: u64, outcome: SortResponse },
+    SortRepairRequest { sheet: usize, first_ts: u64, structural_revision: usize, keys: Vec<(u32,u32,Option<crate::style::CellStyle>)> },
+    SortRepairs { sheet: usize, first_ts: u64, items: Vec<SortRepair> },
     CursorMsg(Cursor),
     /// 格式变更（一批格子 + 每个格子的样式内容）
     StyleOp {
@@ -407,6 +470,10 @@ pub enum Msg {
         sheet: usize,
         op: crate::structural::Structural,
     },
+    /// Guests keep their original coordinate system until the host echoes Structural.
+    StructuralRequest { site: u32, sheet: usize, revision: usize, op: crate::structural::Structural },
+    StructuralRejected { reason: String },
+    StructureRevision { revision: usize },
     /// 请求编辑某格（同一格同时只允许一个人）
     LockReq { site: u32, name: String, sheet: usize, row: u32, col: u32 },
     /// 宿主批准（广播）
@@ -523,6 +590,20 @@ impl Msg {
             Msg::Snapshot { ops } | Msg::SnapshotChunk { ops, .. } => {
                 ops.len() <= MAX_BATCH_ITEMS && ops.iter().all(Op::is_valid)
             }
+            Msg::SortPermutation(p) => p.valid(),
+            Msg::SortCommitted { first_ts } | Msg::SortRepairDone { first_ts } => ts_ok(*first_ts),
+            Msg::SortData { first_ts,items } => ts_ok(*first_ts) && items.len() <= LIVE_OP_BATCH
+                && items.iter().all(|(op,_)| op.is_valid()),
+            Msg::SortRepairRequest { sheet, first_ts, keys, .. } => {
+                keys.len() <= LIVE_OP_BATCH && ts_ok(first_ts.saturating_add(keys.len().saturating_sub(1) as u64))
+                    && keys.iter().all(|(r,c,_)| cell_in_bounds(*sheet,*r,*c))
+            }
+            Msg::SortRepairs { sheet, first_ts, items } => {
+                items.len() <= LIVE_OP_BATCH && ts_ok(first_ts.saturating_add(items.len().saturating_sub(1) as u64))
+                    && items.iter().all(|v| ts_ok(v.rejected_ts) && cell_in_bounds(*sheet,v.row,v.col) && v.cell.as_ref().is_none_or(|op|
+                        op.is_valid() && (op.sheet,op.row,op.col) == (*sheet,v.row,v.col)))
+            }
+            Msg::SortReply { first_ts, .. } => ts_ok(*first_ts),
             Msg::Op(op) => op.is_valid(),
             Msg::Ops { ops } => !ops.is_empty() && ops.len() <= LIVE_OP_BATCH && ops.iter().all(Op::is_valid),
             Msg::CursorMsg(c) => cell_in_bounds(c.sheet, c.row, c.col) && c.name.len() <= MAX_SHORT_TEXT,
@@ -546,7 +627,9 @@ impl Msg {
             Msg::StructuralLog { items } => {
                 items.len() <= MAX_BATCH_ITEMS && items.iter().all(|(s, op)| structural_ok(*s, op))
             }
-            Msg::Structural { sheet, op, .. } => structural_ok(*sheet, op),
+            Msg::Structural { sheet, op, .. } | Msg::StructuralRequest { sheet, op, .. } => structural_ok(*sheet, op),
+            Msg::StructureRevision { revision } => u64::try_from(*revision).is_ok_and(ts_ok),
+            Msg::StructuralRejected { reason } => reason.len() <= MAX_SHORT_TEXT,
             Msg::LockReq { sheet, row, col, name, .. } | Msg::LockOk { sheet, row, col, name, .. } => {
                 cell_in_bounds(*sheet, *row, *col) && name.len() <= MAX_SHORT_TEXT
             }
@@ -611,14 +694,109 @@ pub struct Peer {
     pub site: u32,
     pub clock: u64,
     /// 每个格子的当前胜出版本
-    pub cells: HashMap<(usize, u32, u32), Op>,
+    pub cells: CellOps,
     /// 已知的其他站点（site → 名字、颜色）
     pub peers: HashMap<u32, (String, u8)>,
 }
 
+/// Discard deleted coordinates and relocate only keys affected by the edit.
+/// Reinsert moved entries after extraction so shifted keys cannot collide with old ones.
+pub fn shift_cell_map<V>(cells: &mut std::collections::BTreeMap<(usize, u32, u32), V>, sheet: usize,
+                         op: &crate::structural::Structural, mut relocate: impl FnMut(&mut V, u32, u32)) {
+    let mut moved = Vec::new();
+    use crate::structural::Structural::*;
+    let mut extract = |map: &mut std::collections::BTreeMap<_, V>, first, last| {
+        for ((_, r, c), mut value) in map.extract_if(first..=last, |_, _| true) {
+            if let Some((row, col)) = shift_structural_coord(r, c, op) {
+                relocate(&mut value, row, col);
+                moved.push(((sheet, row, col), value));
+            }
+        }
+    };
+    match *op {
+        InsertRows { at, .. } | DeleteRows { at, .. } => {
+            extract(cells, (sheet, at, 0), (sheet, u32::MAX, u32::MAX));
+        }
+        InsertCols { at: 0, .. } | DeleteCols { at: 0, .. } => {
+            extract(cells, (sheet, 0, 0), (sheet, u32::MAX, u32::MAX));
+        }
+        InsertCols { at, .. } | DeleteCols { at, .. } => {
+            // Seek directly to each occupied row's affected suffix.
+            let mut start = 0;
+            while let Some((&(_, row, _), _)) = cells.range((sheet,start,0)..=(sheet,u32::MAX,u32::MAX)).next() {
+                extract(cells, (sheet, row, at), (sheet, row, u32::MAX));
+                let Some(next) = row.checked_add(1) else { break };
+                start = next;
+            }
+        }
+    }
+    cells.extend(moved);
+}
+
+#[test]
+fn sort_permutation_validates_bounds_and_defaults_old_hello_to_legacy() {
+    let mut sort = SortPermutation { structural_revision: 0, sheet: 1, name: "one".into(), region: (3,7,6,9),
+        horizontal: true, order: vec![9,7,8], first_ts: 10, site: 3, digest: [0;32] };
+    assert!(sort.valid());
+    for bad in [vec![9,8],vec![9,8,9],vec![9,8,6],vec![9,8,10]] {
+        sort.order = bad;
+        assert!(!sort.valid());
+    }
+    sort.region = (0,0,MAX_ROWS-1,MAX_COLS-1);
+    sort.horizontal = false;
+    assert!(!sort.valid());
+    let hello: Msg = serde_json::from_str(r#"{"t":"Hello","site":1,"name":"a","doc":"d","proof":"p"}"#).unwrap();
+    assert!(matches!(hello,Msg::Hello { sort_permutation: false, .. }));
+}
+
+#[test]
+fn shifting_sparse_column_suffixes_preserves_other_rows_and_sheets() {
+    use crate::structural::Structural;
+    let mut map = std::collections::BTreeMap::from([
+        ((0,0,19), 1), ((1,0,3), 2), ((1,0,9), 3), ((1,0,12), 4),
+        ((1,64,1), 5), ((1,999_999,14), 6), ((2,0,10), 7)
+    ]);
+    let mut moved = Vec::new();
+    shift_cell_map(&mut map,1,&Structural::DeleteCols { at:9, n:2 }, |v,r,c| moved.push((*v,r,c)));
+    assert_eq!(moved, [(4,0,10),(6,999_999,12)]);
+    assert_eq!(map.keys().copied().collect::<Vec<_>>(),
+        [(0,0,19),(1,0,3),(1,0,10),(1,64,1),(1,999_999,12),(2,0,10)]);
+    shift_cell_map(&mut map,1,&Structural::InsertCols { at:0, n:2 },|_,_,_| {});
+    assert_eq!(map.keys().copied().collect::<Vec<_>>(),
+        [(0,0,19),(1,0,5),(1,0,12),(1,64,3),(1,999_999,14),(2,0,10)]);
+}
+
+pub type CellOps = std::collections::BTreeMap<(usize, u32, u32), std::sync::Arc<Op>>;
+
+/// Use the same per-sheet reference context as the workbook's structural edit.
+pub fn structural_reference_shifts(names: &[String], target: usize, op: &crate::structural::Structural)
+    -> Vec<crate::refs::Shift> {
+    let Some(name) = names.get(target) else { return Vec::new() };
+    let base = op.reference_shift();
+    names.iter().map(|own| crate::refs::Shift {
+        target_sheet:name.clone(), own_sheet:own.clone(), ..base.clone()
+    }).collect()
+}
+
+impl Op {
+    pub fn shifted_formula(&self, shifts: &[crate::refs::Shift]) -> Option<String> {
+        let formula = self.formula.as_ref()?;
+        let rewritten = crate::refs::rewrite(formula,shifts.get(self.sheet)?);
+        (rewritten != *formula).then_some(rewritten)
+    }
+}
+
+pub fn shift_cell_ops(cells: &mut CellOps, sheet: usize, op: &crate::structural::Structural) {
+    shift_cell_map(cells, sheet, op, |op, row, col| {
+        let cell = std::sync::Arc::make_mut(op);
+        cell.row = row;
+        cell.col = col;
+    });
+}
+
 impl Peer {
     pub fn new(site: u32) -> Self {
-        Self { site, clock: 0, cells: HashMap::new(), peers: HashMap::new() }
+        Self { site, clock: 0, cells: CellOps::new(), peers: HashMap::new() }
     }
 
     /// 宿主启动时将磁盘基准单元格放入初始快照：所有未改基准格统一赋 `ts = 1`，
@@ -634,11 +812,15 @@ impl Peer {
             ts: 1,
             site: self.site,
         };
-        self.cells.insert((sheet, row, col), op);
+        self.cells.insert((sheet, row, col), op.into());
     }
 
     /// 本地编辑：递增逻辑时钟并返回要广播的操作
     pub fn local_set(&mut self, sheet: usize, row: u32, col: u32, cell: &Cell) -> Op {
+        (*self.local_set_shared(sheet, row, col, cell)).clone()
+    }
+
+    pub fn local_set_shared(&mut self, sheet: usize, row: u32, col: u32, cell: &Cell) -> std::sync::Arc<Op> {
         self.clock = self.clock.saturating_add(1);
         let op = Op {
             sheet,
@@ -649,12 +831,17 @@ impl Peer {
             ts: self.clock,
             site: self.site,
         };
+        let op = std::sync::Arc::new(op);
         self.cells.insert((sheet, row, col), op.clone());
         op
     }
 
     /// 应用远端操作；返回是否真的改动了本地状态
     pub fn apply(&mut self, op: Op) -> bool {
+        self.apply_shared(op.into())
+    }
+
+    pub fn apply_shared(&mut self, op: std::sync::Arc<Op>) -> bool {
         if !op.is_valid() {
             return false; // 越界坐标或离谱时间戳：不进副本，也不推高时钟
         }
@@ -676,7 +863,7 @@ impl Peer {
             Some(op) if !op.is_valid() => {}
             Some(op) => {
                 self.clock = self.clock.max(op.ts);
-                self.cells.insert(key, op);
+                self.cells.insert(key, op.into());
             }
             None => {
                 self.cells.remove(&key);
@@ -686,22 +873,11 @@ impl Peer {
 
     /// 结构性增删行列后同步平移副本状态坐标
     pub fn shift_structural(&mut self, sheet: usize, op: &crate::structural::Structural) {
-        let old = std::mem::take(&mut self.cells);
-        for ((sh, r, c), mut cell_op) in old {
-            if sh == sheet {
-                if let Some((nr, nc)) = shift_structural_coord(r, c, op) {
-                    cell_op.row = nr;
-                    cell_op.col = nc;
-                    self.cells.insert((sh, nr, nc), cell_op);
-                }
-            } else {
-                self.cells.insert((sh, r, c), cell_op);
-            }
-        }
+        shift_cell_ops(&mut self.cells, sheet, op);
     }
 
     pub fn snapshot(&self) -> Vec<Op> {
-        self.cells.values().cloned().collect()
+        self.cells.values().map(|op| op.as_ref().clone()).collect()
     }
 
     pub fn merge_snapshot(&mut self, ops: Vec<Op>) -> Vec<Op> {

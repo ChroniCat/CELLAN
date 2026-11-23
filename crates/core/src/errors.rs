@@ -132,55 +132,63 @@ pub fn scan(sheet: &Sheet) -> Vec<Issue> {
 /// 带工作簿的扫描：除了错误值，还能认出「单元格格式是文本(@)、值是数字」的格子
 /// （我们的加载器会把看起来像数字的文本直接转成数字，所以只能靠格式判断）。
 pub fn scan_wb(wb: &crate::model::Workbook, si: usize) -> Vec<Issue> {
-    let sheet = wb.sheet(si);
     let mut out = Vec::new();
-    for (cref, cell) in sheet.iter() {
-        // 用户点过「忽略错误」的格子不再报
-        if sheet.ignored_errors.contains(&(cref.row, cref.col)) {
-            continue;
-        }
-        match &cell.value {
-            Value::Text(t) => {
-                if let Some(kind) = error_kind(t) {
-                    out.push(Issue {
-                        row: cref.row,
-                        col: cref.col,
-                        kind,
-                        text: kind.error_text().to_string(),
-                    });
-                }
-            }
-            Value::Number(_) => {
-                let st = wb.styles.get(sheet.style_of(cref.row, cref.col));
-                if st.format.trim() == "@" {
-                    out.push(Issue {
-                        row: cref.row,
-                        col: cref.col,
-                        kind: IssueKind::NumberAsText,
-                        text: format!("{}", cell.value.display()),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
+    visit_issues(wb, si, &std::sync::atomic::AtomicBool::new(false), |key, cell, kind| {
+        let text = if kind == IssueKind::NumberAsText { cell.value.display() } else { kind.error_text().into() };
+        out.push(Issue { row: key.row, col: key.col, kind, text });
+    });
     out.sort_by_key(|i| (i.row, i.col));
     out
+}
+
+/// Background marks only need coordinates; avoid a sortable list of display strings.
+pub fn mark_positions(wb: &crate::Workbook, si: usize, check_text: bool, check_errors: bool,
+    stop: &std::sync::atomic::AtomicBool) -> std::collections::HashSet<(u32,u32)> {
+    let mut out = std::collections::HashSet::new();
+    visit_issues(wb, si, stop, |key, _, kind| {
+        let enabled = if kind == IssueKind::NumberAsText { check_text } else { check_errors };
+        if enabled {
+            out.insert((key.row, key.col));
+        }
+    });
+    out
+}
+
+fn visit_issues(wb: &crate::Workbook, si:usize, stop:&std::sync::atomic::AtomicBool,
+    mut visit: impl FnMut(crate::CellRef, &crate::Cell, IssueKind)) {
+    let sheet = wb.sheet(si);
+    for (i, (key, cell)) in sheet.stored_cells().enumerate() {
+        if i % 256 == 0 && stop.load(std::sync::atomic::Ordering::Relaxed) { return; }
+        if sheet.ignored_errors.contains(&(key.row, key.col)) { continue; }
+        let kind = match &cell.value {
+            Value::Text(t) => error_kind(t),
+            Value::Number(_) if wb.styles.get(sheet.style_of(key.row,key.col)).format.trim() == "@" => Some(IssueKind::NumberAsText),
+            _ => None,
+        };
+        if let Some(kind) = kind { visit(key,cell,kind); }
+    }
 }
 
 /// 找循环引用：在「公式格 → 它引用的公式格」这张图上做 DFS，遇到回边就把环上的格子标出来。
 /// 公式太多（> 20000）时直接返回空，避免每次编辑都全量解析。
 pub fn find_cycles(wb: &crate::model::Workbook, si: usize) -> Vec<(u32, u32)> {
+    find_cycles_cancellable(wb, si, &std::sync::atomic::AtomicBool::new(false))
+}
+
+/// A cancelled automatic scan discards all partial results.
+pub fn find_cycles_cancellable(wb: &crate::Workbook, si: usize, stop: &std::sync::atomic::AtomicBool) -> Vec<(u32,u32)> {
+    use std::sync::atomic::Ordering;
     use std::collections::HashMap;
     let sheet = wb.sheet(si);
-    let formulas: Vec<(u32, u32)> = sheet
-        .iter()
-        .filter(|(_, c)| c.formula.is_some())
+    let mut formulas: Vec<(u32, u32)> = sheet
+        .formula_cells()
+        .take(20_001)
         .map(|(k, _)| (k.row, k.col))
         .collect();
     if formulas.is_empty() || formulas.len() > 20_000 {
         return Vec::new();
     }
+    formulas.sort_unstable();
     let idx: HashMap<(u32, u32), usize> = formulas
         .iter()
         .enumerate()
@@ -188,10 +196,12 @@ pub fn find_cycles(wb: &crate::model::Workbook, si: usize) -> Vec<(u32, u32)> {
         .collect();
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); formulas.len()];
     for (i, (r, c)) in formulas.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) { return Vec::new(); }
         let Some(f) = sheet.get(*r, *c).and_then(|x| x.formula.clone()) else {
             continue;
         };
         for rect in crate::formula::deps::refs_of(wb, si, &f) {
+            if stop.load(Ordering::Relaxed) { return Vec::new(); }
             if rect.sheet != si {
                 continue;
             }
@@ -227,6 +237,7 @@ pub fn find_cycles(wb: &crate::model::Workbook, si: usize) -> Vec<(u32, u32)> {
         let mut stack: Vec<usize> = vec![s0];
         let mut next: Vec<usize> = vec![0];
         while let Some(&u) = stack.last() {
+            if stop.load(Ordering::Relaxed) { return Vec::new(); }
             let k = *next.last().unwrap();
             if k < adj[u].len() {
                 *next.last_mut().unwrap() += 1;

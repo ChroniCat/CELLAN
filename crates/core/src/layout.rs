@@ -4,6 +4,7 @@
 //! 这里维护「自定义项 + 累计偏移」，位置查询是 O(log n)，改一项是 O(n)（改尺寸很少发生）。
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn layout_revision() -> u64 {
@@ -61,9 +62,15 @@ pub const DEFAULT_ROW_H: f32 = 18.0;
 pub struct Axis {
     revision: u64,
     default: f32,
-    sizes: BTreeMap<u32, f32>,
+    sizes: Arc<BTreeMap<u32, f32>>,
     /// 自定义项的索引和结束位置。连续隐藏项的结束位置完全相同，可二分跳过。
-    prefix: Vec<(u32, f64)>,
+    prefix: Arc<Vec<(u32, f64)>>,
+}
+
+impl PartialEq for Axis {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision || (self.default == other.default && self.sizes == other.sizes)
+    }
 }
 
 impl Default for Axis {
@@ -74,26 +81,26 @@ impl Default for Axis {
 
 impl Axis {
     pub fn new(default: f32) -> Self {
-        Self { revision: layout_revision(), default, sizes: BTreeMap::new(), prefix: Vec::new() }
+        Self { revision: layout_revision(), default, sizes: Default::default(), prefix: Default::default() }
     }
 
     pub fn revision(&self) -> u64 { self.revision }
 
     pub fn set(&mut self, i: u32, size: f32) {
-        if (size - self.default).abs() < 0.01 {
-            self.sizes.remove(&i);
-        } else {
-            self.sizes.insert(i, size);
-        }
-        self.rebuild();
+        self.set_many([(i, size)]);
     }
 
-    /// 批量将指定行/列尺寸设为 0（筛选/手动隐藏）：一次性写入后只 rebuild 一遍，
-    /// 避免在数万行筛选表上逐行 `set(r, 0.0)` 退化成 O(N²)。
-    pub fn hide_many(&mut self, indices: impl IntoIterator<Item = u32>) {
+    /// Apply absolute sizes in input order, then rebuild the position index once.
+    pub fn set_many(&mut self, sizes: impl IntoIterator<Item = (u32, f32)>) {
         let mut changed = false;
-        for i in indices {
-            if self.sizes.insert(i, 0.0) != Some(0.0) {
+        for (i, size) in sizes {
+            if (size - self.default).abs() < 0.01 {
+                if self.sizes.contains_key(&i) {
+                    Arc::make_mut(&mut self.sizes).remove(&i);
+                    changed = true;
+                }
+            } else if self.sizes.get(&i) != Some(&size) {
+                Arc::make_mut(&mut self.sizes).insert(i, size);
                 changed = true;
             }
         }
@@ -102,22 +109,42 @@ impl Axis {
         }
     }
 
-    pub(crate) fn remap_indices(&mut self, map: impl Fn(u32) -> Option<u32>) {
-        if self.sizes.is_empty() { return; }
-        self.sizes = std::mem::take(&mut self.sizes).into_iter()
-            .filter_map(|(index, size)| map(index).map(|new| (new, size))).collect();
+    /// 批量将指定行/列尺寸设为 0（筛选/手动隐藏）：一次性写入后只 rebuild 一遍，
+    /// 避免在数万行筛选表上逐行 `set(r, 0.0)` 退化成 O(N²)。
+    pub fn hide_many(&mut self, indices: impl IntoIterator<Item = u32>) {
+        let mut changed = false;
+        for i in indices {
+            if self.sizes.get(&i) != Some(&0.0) {
+                Arc::make_mut(&mut self.sizes).insert(i, 0.0);
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild();
+        }
+    }
+
+    pub(crate) fn remap_indices(&mut self, map: impl Fn(u32) -> Option<u32>) -> bool {
+        if !self.sizes.keys().any(|&i| map(i) != Some(i)) { return false; }
+        self.sizes = Arc::new(self.sizes.iter()
+            .filter_map(|(&index, &size)| map(index).map(|new| (new, size))).collect());
         self.rebuild();
+        true
     }
 
     fn rebuild(&mut self) {
         self.revision = layout_revision();
-        self.prefix.clear();
-        self.prefix.reserve(self.sizes.len());
+        if Arc::get_mut(&mut self.prefix).is_none() {
+            self.prefix = Arc::default();
+        }
+        let prefix = Arc::make_mut(&mut self.prefix);
+        prefix.clear();
+        prefix.reserve(self.sizes.len());
         let mut next = 0u64;
         let mut end = 0.0;
-        for (&i, &size) in &self.sizes {
+        for (&i, &size) in self.sizes.iter() {
             end += (u64::from(i) - next) as f64 * f64::from(self.default) + f64::from(size);
-            self.prefix.push((i, end));
+            prefix.push((i, end));
             next = u64::from(i) + 1;
         }
     }
@@ -208,7 +235,7 @@ impl Axis {
 
     /// 清掉所有自定义尺寸
     pub fn clear_custom(&mut self) {
-        self.sizes.clear();
+        self.sizes = Arc::default();
         self.rebuild();
     }
 
@@ -216,9 +243,7 @@ impl Axis {
     /// 只影响视图几何，不回写模型。
     pub fn scaled(&self, z: f32) -> Self {
         let mut out = Axis::new(self.default * z);
-        for (i, w) in self.sizes.iter() {
-            out.sizes.insert(*i, *w * z);
-        }
+        out.sizes = Arc::new(self.sizes.iter().map(|(&i, &w)| (i, w * z)).collect());
         out.rebuild();
         out
     }
@@ -267,6 +292,21 @@ pub fn pt_to_px(pt: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_size_edits_leave_shared_axis_snapshot_unchanged() {
+        let mut axis = Axis::new(18.0);
+        axis.set_many([(2, 24.0), (4, 0.0)]);
+        let snapshot = axis.clone();
+        axis.set_many([(2, 24.0), (3, 18.0)]);
+        assert_eq!(snapshot.revision(), axis.revision());
+        assert!(Arc::ptr_eq(&snapshot.prefix, &axis.prefix));
+        assert!(Arc::ptr_eq(&snapshot.sizes, &axis.sizes));
+        axis.set_many([(2, 18.0), (3, 12.0), (3, 15.0)]);
+        assert_eq!(axis.pos(5), 69.0);
+        assert_eq!(snapshot.pos(5), 78.0);
+        assert_eq!(snapshot.size(2), 24.0);
+    }
 
     #[test]
     fn uniform_when_empty() {

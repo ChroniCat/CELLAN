@@ -941,16 +941,7 @@ impl SheetApp {
                 self.dtable_dlg = true;
             }
             "ScenarioManager" => {
-                let (r1, c1, mut r2, mut c2) = self.sel_rect();
-                if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 512 {
-                    if let Some((_, _, ur2, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
-                        r2 = r2.min(ur2.max(r1)).min(r1 + 31);
-                        c2 = c2.min(uc2.max(c1)).min(c1 + 15);
-                    } else {
-                        r2 = r1;
-                        c2 = c1;
-                    }
-                }
+                let (r1, c1, r2, c2) = self.sel_rect();
                 self.scen_range = if r1 == r2 && c1 == c2 {
                     cell_name(r1, c1)
                 } else {
@@ -958,9 +949,10 @@ impl SheetApp {
                 };
                 self.scen_name.clear();
                 self.scen_comment.clear();
-                self.scen_result.clear();
+                let sheet = self.wb.sheet(self.sheet_idx);
+                self.scen_result = sheet.scenario_settings.sqref.clone().unwrap_or_default();
                 self.scen_msg.clear();
-                self.scen_sel = None;
+                self.scen_sel = sheet.scenario_settings.current.filter(|&i| i < sheet.scenarios.len());
                 self.scen_dlg = true;
             }
             "GroupSelection" => self.group_selection(),

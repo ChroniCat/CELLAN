@@ -206,6 +206,16 @@ pub fn parse_strict(text: &str, delim: char) -> Result<Vec<Vec<String>>, String>
 
 /// 同 `parse_strict`，但可指定引号字符（部分德语/法语 CSV 用 `'`）。
 pub fn parse_strict_q(text: &str, delim: char, quote: char) -> Result<Vec<Vec<String>>, String> {
+    parse_strict_while(text, delim, quote, false, || true)
+}
+
+/// Strict record parsing with cooperative cancellation, including inside multiline fields.
+pub fn records_strict_while(text: &str, delim: char, quote: char, keep_going: impl FnMut() -> bool) -> Result<Vec<Vec<String>>, String> {
+    parse_strict_while(text, delim, quote, true, keep_going)
+}
+
+fn parse_strict_while(text: &str, delim: char, quote: char, skip_whitespace: bool, mut keep_going: impl FnMut() -> bool) -> Result<Vec<Vec<String>>, String> {
+    let skip = |row: &[String]| row.len() == 1 && (row[0].is_empty() || (skip_whitespace && row[0].trim().is_empty()));
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
     let mut field = String::new();
@@ -214,7 +224,10 @@ pub fn parse_strict_q(text: &str, delim: char, quote: char) -> Result<Vec<Vec<St
     let mut closed = false;
     let mut line = 1usize;
     let mut chars = text.chars().peekable();
+    let mut ticks = 0usize;
     while let Some(ch) = chars.next() {
+        if ticks % 8192 == 0 && !keep_going() { return Err("CSV 读取已取消".into()); }
+        ticks += 1;
         if in_quotes {
             if ch == quote {
                 if chars.peek() == Some(&quote) {
@@ -253,7 +266,7 @@ pub fn parse_strict_q(text: &str, delim: char, quote: char) -> Result<Vec<Vec<St
                 row.push(std::mem::take(&mut field));
                 quoted_field = false;
                 closed = false;
-                if !(row.len() == 1 && row[0].is_empty()) {
+                if !skip(&row) {
                     rows.push(std::mem::take(&mut row));
                 } else {
                     row.clear();
@@ -268,7 +281,7 @@ pub fn parse_strict_q(text: &str, delim: char, quote: char) -> Result<Vec<Vec<St
     }
     if !field.is_empty() || !row.is_empty() {
         row.push(field);
-        if !(row.len() == 1 && row[0].is_empty()) {
+        if !skip(&row) {
             rows.push(row);
         }
     }
@@ -282,11 +295,7 @@ pub fn records_strict(text: &str, delim: char) -> Result<Vec<Vec<String>>, Strin
 
 /// 可指定引号字符的严格记录视图
 pub fn records_strict_q(text: &str, delim: char, quote: char) -> Result<Vec<Vec<String>>, String> {
-    let rows = parse_strict_q(text, delim, quote)?;
-    Ok(rows
-        .into_iter()
-        .filter(|r| !(r.len() == 1 && r[0].trim().is_empty()))
-        .collect())
+    records_strict_while(text, delim, quote, || true)
 }
 
 /// 记录模式：跳过完全空行，但**保留**字段内的换行与引号。

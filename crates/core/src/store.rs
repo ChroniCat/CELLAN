@@ -213,7 +213,7 @@ impl Page {
 /// Snapshots share an identity until a writer forks. The counter alone can
 /// coincide on independently edited copies (for example after undo).
 #[derive(Clone, Debug, Default)]
-pub(crate) struct CellVersion {
+pub struct CellVersion {
     lineage: std::sync::Arc<()>,
     revision: u64,
 }
@@ -243,6 +243,50 @@ pub struct Store {
 }
 
 impl Store {
+    /// Compare only changed column slabs inside a query's rectangles. A COW
+    /// fork in a different row of the same slab still leaves this range valid.
+    pub(crate) fn same_cells_in(&self, other: &Self, rects: &[(u32,u32,u32,u32)], formulas: bool) -> bool {
+        if self.version == other.version { return true; }
+        let same_rect = |&(r1, c1, r2, c2): &(u32,u32,u32,u32)| {
+            if r1 > r2 || c1 > c2 { return true; }
+            let same_page = |&p: &u32| {
+                if p < r1 / PAGE_ROWS || p > r2 / PAGE_ROWS { return true; }
+                let a = self.pages.get(&p).map(|p| p.cols.as_slice()).unwrap_or_default();
+                let b = other.pages.get(&p).map(|p| p.cols.as_slice()).unwrap_or_default();
+                let end = (c2 as usize).saturating_add(1).min(a.len().max(b.len()));
+                (c1 as usize..end).all(|c| {
+                    let (a,b) = (a.get(c), b.get(c));
+                    if a.zip(b).is_some_and(|(a,b)| std::sync::Arc::ptr_eq(a,b)) { return true; }
+                    let a = a.map(|v| v.as_slice()).unwrap_or_default();
+                    let b = b.map(|v| v.as_slice()).unwrap_or_default();
+                    let base = p * PAGE_ROWS;
+                    let end = (r2-base).saturating_add(1) as usize;
+                    (r1.saturating_sub(base) as usize..end.min(a.len().max(b.len()))).all(|i| {
+                        let a = a.get(i).filter(|c| !c.is_blank());
+                        let b = b.get(i).filter(|c| !c.is_blank());
+                        if formulas { a.and_then(|c| c.formula.as_ref()) == b.and_then(|c| c.formula.as_ref()) }
+                        else {
+                            match (a,b) {
+                                (Some(a),Some(b)) => a.value.same_stored_value(&b.value),
+                                (None,None) => true,
+                                _ => false,
+                            }
+                        }
+                    })
+                })
+            };
+            let first = r1 / PAGE_ROWS;
+            let last = r2 / PAGE_ROWS;
+            if (last - first) as usize <= self.pages.len() {
+                return (first..=last).all(|p| same_page(&p));
+            }
+            self.pages.keys().all(same_page)
+                && other.pages.keys().filter(|p| !self.pages.contains_key(p)).all(same_page)
+        };
+        if rects.is_empty() { same_rect(&(0,0,u32::MAX,u32::MAX)) }
+        else { rects.iter().all(same_rect) }
+    }
+
     pub(crate) fn revision(&self) -> u64 { self.version.revision }
     pub fn len(&self) -> usize {
         self.len
@@ -470,6 +514,24 @@ impl Store {
         })
     }
 
+    /// Search sorts its hits afterwards. Visit only allocated slots, in storage
+    /// order, so a distant column does not turn sparse pages into dense grids.
+    pub(crate) fn stored_cells_in(&self, (r1,c1,r2,c2): (u32,u32,u32,u32)) -> impl Iterator<Item = (CellRef, &Cell)> {
+        self.pages.iter().filter(move |&(&p, _)| r1 / PAGE_ROWS <= p && p <= r2 / PAGE_ROWS)
+            .flat_map(move |(&p, page)| {
+                let base = p * PAGE_ROWS;
+                let last = (c2 as usize).saturating_add(1).min(page.cols.len());
+                let cols = page.cols.get(c1 as usize..last).unwrap_or_default();
+                cols.iter().enumerate().flat_map(move |(c, cells)| {
+                    let first = r1.saturating_sub(base) as usize;
+                    let last = (r2 - base).saturating_add(1) as usize;
+                    cells.get(first..last.min(cells.len())).unwrap_or_default().iter().enumerate()
+                        .filter_map(move |(i, cell)| (!cell.is_blank()).then_some((
+                            CellRef::new(base + (first + i) as u32, c1 + c as u32), cell)))
+                })
+            })
+    }
+
     /// Occupied cells in this snapshot that differ from the other snapshot.
     pub(crate) fn changed_keys(&self, other: &Self) -> impl Iterator<Item = CellRef> {
         self.pages.iter().flat_map(move |(&p, page)| {
@@ -478,7 +540,8 @@ impl Store {
                 let shared = old.is_some_and(|old| std::sync::Arc::ptr_eq(old, cells));
                 (!shared).then_some(cells).into_iter().flat_map(move |cells| {
                     cells.iter().enumerate().filter_map(move |(row, cell)| {
-                        (!cell.is_blank() && old.and_then(|c| c.get(row)) != Some(cell))
+                        (!cell.is_blank() && old.and_then(|c| c.get(row)).is_none_or(|prior|
+                            prior.formula != cell.formula || !prior.value.same_stored_value(&cell.value)))
                             .then_some(CellRef::new(p * PAGE_ROWS + row as u32, col as u32))
                     })
                 })

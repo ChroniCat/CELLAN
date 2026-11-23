@@ -488,13 +488,14 @@ pub fn parse_cell_styles(xml: &str) -> HashMap<(u32, u32), u16> {
     out
 }
 
-pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) -> anyhow::Result<String> {
+pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) -> anyhow::Result<(String, bool)> {
     let mut r = Reader::from_str(xml);
     let mut cur_row = 0u32;
     let mut next_col = 0u32;
     let mut in_data = false;
     let mut closed = false;
     let mut root = None;
+    let mut implicit_coordinates = false;
 
     let mut shell = String::new();
     let mut copied = 0;
@@ -516,13 +517,16 @@ pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) 
                     in_data = matches!(&ev, Ok(Event::Start(_)));
                 } else if in_data && lname == "row" {
                     next_col = 0;
+                    let mut explicit = false;
                     for a in e.attributes().flatten() {
                         if local_name(a.key.as_ref()) == "r" {
                             if let Ok(rn) = a.value.trim().parse::<u32>() {
+                                explicit = true;
                                 cur_row = rn.saturating_sub(1);
                             }
                         }
                     }
+                    implicit_coordinates |= !explicit;
                 } else if in_data && lname == "c" {
                     let mut coord: Option<(u32, u32)> = None;
                     let mut s_idx: Option<u16> = None;
@@ -536,6 +540,7 @@ pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) 
                             }
                         }
                     }
+                    implicit_coordinates |= coord.is_none();
                     let (row, col) = coord.unwrap_or((cur_row, next_col));
                     cur_row = row;
                     next_col = col + 1;
@@ -564,7 +569,7 @@ pub(crate) fn visit_cell_styles(xml: &str, mut cell: impl FnMut(u32, u32, u16)) 
     }
     anyhow::ensure!(closed, "工作表 XML 未正常结束");
     shell.push_str(&xml[copied..]);
-    Ok(shell)
+    Ok((shell, implicit_coordinates))
 }
 
 fn a1(s: &str) -> Option<(u32, u32)> {

@@ -162,14 +162,7 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Picture>> {
 
     for (sheet_name, part) in targets.iter() {
         let rels_path = part.replace("worksheets/", "worksheets/_rels/") + ".rels";
-        let mut rels_xml = String::new();
-        {
-            let Ok(mut f) = zip.by_name(&rels_path) else { continue };
-            if f.read_to_string(&mut rels_xml).is_err() {
-                continue;
-            }
-        }
-        let rels = rels_map(&rels_xml);
+        let Ok(rels_xml) = crate::xlsx::read_zip_text(&mut zip, &rels_path) else { continue };
         // 找 drawing 关系
         let mut drawing_part = None;
         let mut rest = rels_xml.as_str();
@@ -185,26 +178,16 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Picture>> {
             rest = &rest[end.min(rest.len())..];
         }
         let Some(drawing) = drawing_part else { continue };
-        let mut drawing_xml = String::new();
-        {
-            let Ok(mut f) = zip.by_name(&drawing) else { continue };
-            if f.read_to_string(&mut drawing_xml).is_err() {
-                continue;
-            }
-        }
+        let Ok(drawing_xml) = crate::xlsx::read_zip_text(&mut zip, &drawing) else { continue };
         let drawing_rels_path = {
             let dir = drawing.rsplit_once('/').map(|(d, _)| d).unwrap_or("xl");
             let name = drawing.rsplit('/').next().unwrap_or("drawing1.xml");
             format!("{dir}/_rels/{name}.rels")
         };
         let mut draw_rels = HashMap::new();
-        if let Ok(mut f) = zip.by_name(&drawing_rels_path) {
-            let mut xml = String::new();
-            if f.read_to_string(&mut xml).is_ok() {
-                // Target 是相对 drawing 所在目录的
-                for (k, v) in rels_map(&xml) {
-                    draw_rels.insert(k, crate::fixups::resolve_target(&drawing_rels_path, &v));
-                }
+        if let Ok(xml) = crate::xlsx::read_zip_text(&mut zip, &drawing_rels_path) {
+            for (key, target) in rels_map(&xml) {
+                draw_rels.insert(key, crate::fixups::resolve_target(&drawing_rels_path, &target));
             }
         }
         let list: Vec<Picture> = parse_drawing(&drawing_xml)

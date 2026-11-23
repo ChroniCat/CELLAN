@@ -194,7 +194,7 @@ fn qa06_2_incremental_matches_full_recalc() {
     formula::recalc_all(&mut inc);
     inc.sheets[0].set(0, 1, num(10.0));
     let deps = deps::Deps::build(&inc);
-    let n = formula::recalc_dirty(&mut inc, &deps, &[(0, 1, 0)]);
+    let n = formula::recalc_dirty(&mut inc, &deps, &[(0, 0, 1)]);
     assert!(n > 0, "增量重算没有命中任何公式");
 
     let mut diffs = Vec::new();

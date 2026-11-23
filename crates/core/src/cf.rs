@@ -161,7 +161,7 @@ pub fn percentile_inc(sorted: &[f64], p: f64) -> f64 {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CfKind {
     CellIs { op: CfOp, a: String, b: String, dxf: usize },
     Text { contains: String, dxf: usize },
@@ -267,7 +267,7 @@ impl IconMark {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CfRule {
     pub kind: CfKind,
     pub stop: bool,
@@ -275,13 +275,13 @@ pub struct CfRule {
     pub priority: u32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CfBlock {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub rules: Vec<CfRule>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CfSheet {
     pub blocks: Vec<CfBlock>,
     pub dxfs: Vec<Dxf>,
@@ -580,35 +580,80 @@ fn lerp_color(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
 
 /// 计算某格的条件格式叠加。
 /// `expr` 是公式规则的求值器：传入公式原文与当前格坐标，返回是否命中。
-pub fn overlay_at<F>(cf: &CfSheet, stats: &CfStats, sheet: &Sheet, r: u32, c: u32, mut expr: F) -> Overlay
+pub fn overlay_at<F>(cf: &CfSheet, stats: &CfStats, sheet: &Sheet, r: u32, c: u32, expr: F) -> Overlay
 where
     F: FnMut(&str, u32, u32) -> bool,
 {
-    let mut out = Overlay::default();
-    if cf.blocks.is_empty() || !cf.blocks.iter().any(|b| in_block(b, r, c)) {
-        return out;
+    RowRules::new(cf, r).overlay_at(stats, sheet, c, expr)
+}
+
+/// Sparse row interval lookup for all ranges in the active rule definitions.
+#[derive(Default)]
+pub struct RuleIndex {
+    ranges: Vec<(u32, u32, usize)>,
+    ends: Vec<u32>,
+}
+
+impl RuleIndex {
+    pub fn new(cf: &CfSheet) -> Self {
+        let mut ranges: Vec<_> = cf.blocks.iter().enumerate().flat_map(|(i, b)|
+            b.ranges.iter().filter_map(move |&(top, _, bottom, _)| (top <= bottom).then_some((top, bottom, i)))).collect();
+        ranges.sort_unstable();
+        let mut last = 0;
+        let ends = ranges.iter().map(|&(_, bottom, _)| { last = last.max(bottom); last }).collect();
+        Self { ranges, ends }
     }
-    let raw = sheet.get(r, c).map(|x| x.value.clone()).unwrap_or(Value::Empty);
-    // Excel 按 priority 求值，与 XML 里的先后无关；同优先级按出现顺序（仅收集覆盖当前格的块）
-    let mut order: Vec<(u32, usize, usize)> = Vec::new();
-    for (bi, block) in cf.blocks.iter().enumerate() {
-        if !in_block(block, r, c) {
-            continue;
-        }
-        for (ri, rule) in block.rules.iter().enumerate() {
-            order.push((rule.priority, bi, ri));
-        }
+
+    pub fn row<'a>(&self, cf: &'a CfSheet, row: u32) -> RowRules<'a> {
+        let start = self.ends.partition_point(|&end| end < row);
+        let end = self.ranges.partition_point(|&(top, _, _)| top <= row);
+        let mut blocks: Vec<_> = self.ranges[start..end].iter()
+            .filter_map(|&(_, bottom, i)| (bottom >= row).then_some(i)).collect();
+        blocks.sort_unstable();
+        blocks.dedup(); // two ranges of a block can intersect the same row
+        let mut order: Vec<_> = blocks.into_iter().flat_map(|bi| cf.blocks[bi].rules.iter().enumerate()
+            .map(move |(ri, rule)| (rule.priority, bi, ri))).collect();
+        order.sort_unstable();
+        RowRules { cf, row, order }
     }
-    order.sort_by_key(|x| (x.0, x.1, x.2));
-    for (_, bi, ri) in order {
-        let block = &cf.blocks[bi];
-        let rule = &block.rules[ri];
-        let (ar, ac) = block
-            .ranges
-            .first()
-            .map(|(r1, c1, _, _)| (*r1, *c1))
-            .unwrap_or((0, 0));
-        let mut hit = false;
+}
+
+/// Visible cells on the same row share rule priority and the set of candidate blocks.
+pub struct RowRules<'a> {
+    cf: &'a CfSheet,
+    pub row: u32,
+    order: Vec<(u32, usize, usize)>,
+}
+
+impl<'a> RowRules<'a> {
+    pub fn new(cf: &'a CfSheet, row: u32) -> Self {
+        let mut order = Vec::new();
+        for (bi, block) in cf.blocks.iter().enumerate() {
+            if block.ranges.iter().any(|&(r1, _, r2, _)| r1 <= row && row <= r2) {
+                order.extend(block.rules.iter().enumerate().map(|(ri, rule)| (rule.priority, bi, ri)));
+            }
+        }
+        order.sort_unstable();
+        Self { cf, row, order }
+    }
+
+    pub fn overlay_at<F>(&self, stats: &CfStats, sheet: &Sheet, c: u32, mut expr: F) -> Overlay
+    where F: FnMut(&str, u32, u32) -> bool {
+        let cf = self.cf;
+        let r = self.row;
+        let mut out = Overlay::default();
+        if self.order.is_empty() { return out; }
+        let raw = sheet.get(r, c).map(|x| x.value.clone()).unwrap_or(Value::Empty);
+        for &(_, bi, ri) in &self.order {
+            let block = &cf.blocks[bi];
+            if !in_block(block, r, c) { continue; }
+            let rule = &block.rules[ri];
+            let (ar, ac) = block
+                .ranges
+                .first()
+                .map(|(r1, c1, _, _)| (*r1, *c1))
+                .unwrap_or((0, 0));
+            let mut hit = false;
             match &rule.kind {
                 CfKind::CellIs { op, a, b, dxf } => {
                     let av = parse_lit(a);
@@ -744,11 +789,12 @@ where
                     }
                 }
             }
-        if hit && rule.stop {
-            return out;
+            if hit && rule.stop {
+                return out;
+            }
         }
+        out
     }
-    out
 }
 
 fn apply_dxf(cf: &CfSheet, idx: usize, out: &mut Overlay) {

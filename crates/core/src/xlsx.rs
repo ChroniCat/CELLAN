@@ -1,6 +1,7 @@
 use crate::model::{Cell, Sheet, Value, Workbook};
 use anyhow::{Context, Result};
 use calamine::{open_workbook_auto, Data, Reader};
+use std::borrow::Cow;
 use std::path::Path;
 
 /// .xls 的样式/列宽/行高/合并区（calamine 只给值）
@@ -14,16 +15,12 @@ fn apply_xls_meta(path: &Path, wb: &mut Workbook) {
             let Some(sz) = sizes.sheets.get(i) else { continue };
             for (a, b, w) in sz.cols.iter() {
                 if b.saturating_sub(*a) < 1024 {
-                    for c in *a..=*b {
-                        sheet.cols.set(c, *w);
-                    }
+                    sheet.cols.set_many((*a..=*b).map(|c| (c, *w)));
                 } else {
                     sheet.cols.set_default(*w);
                 }
             }
-            for (r, h) in sz.rows.iter() {
-                sheet.rows.set(*r, *h);
-            }
+            sheet.rows.set_many(sz.rows.iter().map(|(r, h)| (*r, *h)));
         }
     }
     if let Some(sty) = crate::xls_style::read(path) {
@@ -89,6 +86,10 @@ fn apply_xls_meta(path: &Path, wb: &mut Workbook) {
 mod sheets;
 #[path = "xlsx_delta.rs"]
 mod delta;
+#[path = "xlsx_fresh.rs"]
+mod fresh;
+#[path = "xlsx_dynamic.rs"]
+mod dynamic;
 pub(crate) use delta::SourceCells;
 #[path = "xlsx_structure.rs"]
 mod structure;
@@ -396,10 +397,11 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     // .xls：先让 calamine 读（它对真实 Excel 文件最稳），读不了再走内置 BIFF 读取器
     //（我们自己写出的容器就属于后一种）。
     let is_ooxml = crate::crypto::has_magic(path, b"PK");
-    let package_stamp = is_ooxml.then(|| sheets::package_stamp(path)).transpose()?;
-    let targets = crate::patch::sheet_targets(path).unwrap_or_default();
-    let header = sheets::header(path, &targets)
-        .with_context(|| format!("无法打开 {} 的工作簿元数据和样式", path.display()))?;
+    let (mut shared_zip, package_stamp) = is_ooxml.then(|| sheets::open_stamped(path)).transpose()?.unzip();
+    let sheets::WorkbookMetadata { xml: workbook_xml, targets, header } = shared_zip.as_mut()
+        .map(sheets::workbook_metadata).transpose()
+        .with_context(|| format!("无法打开 {} 的工作簿元数据和样式", path.display()))?
+        .unwrap_or_default();
     let mut reader = if header.is_none() {
         match open_workbook_auto(path) {
             Ok(reader) => Some(reader),
@@ -423,14 +425,14 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     };
 
     let is_cfb = crate::crypto::has_magic(path, &[0xD0, 0xCF, 0x11, 0xE0]);
-    let manual_hidden = crate::patch::read_manual_hidden(path);
+    let mut defined_names = crate::patch::defined_names_xml(&workbook_xml);
+    let manual_hidden = crate::patch::manual_hidden_from_names(&defined_names);
+    defined_names.retain(|(name, _, _)| name != crate::patch::MANUAL_HIDDEN_NAME);
+    let (calc_iterate, calc_max_iterations, calc_max_change) =
+        crate::patch::calc_iteration_xml(&workbook_xml).unwrap_or((false, 100, 0.001));
     let mut wb = Workbook {
         load_incomplete: false,
-        names: {
-            let mut names = crate::patch::read_defined_names(path);
-            names.retain(|(name, _, _)| name != crate::patch::MANUAL_HIDDEN_NAME);
-            names
-        },
+        names: defined_names,
         // 数据源存在 `_sc_src_*` 名称里，读出来重建
         sources: crate::external::read_sources(path),
         links: crate::xlinks::read(path),
@@ -439,7 +441,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         pivot_cache_base: Default::default(),
         pivot_session: Default::default(),
         has_vba: crate::vba::has_macros(path),
-        date_system: if crate::patch::read_date1904(path) {
+        date_system: if crate::patch::date1904_xml(&workbook_xml) {
             crate::model::DateSystem::D1904
         } else {
             crate::model::DateSystem::D1900
@@ -447,11 +449,11 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         pivot_calc_fields: Vec::new(),
         pivots_pending: Vec::new(),
         pivots_pending2: Vec::new(),
-        calc_manual: crate::patch::read_calc_manual(path),
+        calc_manual: crate::patch::calc_manual_xml(&workbook_xml),
         // calcPr/@iterate / maxIterations / maxChange（缺省 = 关闭 / 100 / 0.001）
-        calc_iterate: crate::patch::read_calc_iteration(path).map(|(i, _, _)| i).unwrap_or(false),
-        calc_max_iterations: crate::patch::read_calc_iteration(path).map(|(_, n, _)| n).unwrap_or(100),
-        calc_max_change: crate::patch::read_calc_iteration(path).map(|(_, _, c)| c).unwrap_or(0.001),
+        calc_iterate,
+        calc_max_iterations,
+        calc_max_change,
         calc_pending: false,
         calc_pending_sheets: std::collections::BTreeSet::new(),
         sheets: Vec::new(),
@@ -484,11 +486,6 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         });
     }
     let t_all = std::time::Instant::now();
-    let mut shared_zip = if is_ooxml {
-        Some(zip::ZipArchive::new(std::fs::File::open(path)?)?)
-    } else {
-        None
-    };
     // 主题色：Excel 的 <color theme tint> 不能只当 RGB，读盘时记下索引与 tint
     let theme_book = if is_ooxml {
         crate::style_theme::load(path, &[])
@@ -531,7 +528,17 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             id
         })
     };
-    let page_names = crate::page::load_defined_names(path);
+    let mut page_names = std::collections::HashMap::new();
+    if workbook_xml.contains("definedName") {
+        for i in 0..names.len() as u32 {
+            let settings = crate::page::parse_defined_names(&workbook_xml, i);
+            if settings != (None, None, None) {
+                page_names.insert(i, settings);
+            }
+        }
+    }
+    let states = crate::patch::sheet_states_xml(&workbook_xml);
+    drop(workbook_xml);
     let mut layouts = std::collections::HashMap::new();
     let styles_xml = shared_zip.as_mut().and_then(|zip| read_zip_text(zip, "xl/styles.xml").ok()).unwrap_or_default();
     let dxfs = crate::cf::parse_dxfs(&styles_xml);
@@ -543,9 +550,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         for mut part in loaded {
             for (r, c, xf) in part.xfs {
                 let id = loaded_style_id(xf, &mut wb.styles);
-                if id != 0 {
-                    part.sheet.set_style_loaded(r, c, id);
-                }
+                part.sheet.styles.insert(crate::CellRef::new(r, c), id);
             }
             if let Some(layout) = part.layout {
                 layouts.insert(part.sheet.name.clone(), layout);
@@ -579,16 +584,15 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                     Ok(xml) => {
                         let shell = crate::style_theme::visit_cell_styles(&xml, |r, c, xf| {
                             let id = loaded_style_id(xf, &mut wb.styles);
-                            if id != 0 {
-                                sheet.set_style_loaded(r, c, id);
-                            }
+                            sheet.styles.insert(crate::CellRef::new(r, c), id);
                         });
                         match shell {
-                            Ok(shell) => {
+                            Ok((shell, implicit_coordinates)) => {
+                                sheet.source_needs_dom_repair |= implicit_coordinates;
                                 layouts.insert(name.clone(), crate::merges::sheet_layout(&shell, &dxfs, dxf_ext));
                                 sheet.page = crate::page::parse_page_setup(&shell);
                                 sheet.textboxes = crate::textbox::load_from_sheet(path, part, &shell);
-                                sheet.hyperlinks = crate::hyperlinks::load_sheet(path, part, &shell);
+                                sheet.hyperlinks = crate::hyperlinks::load_sheet(path, part, &shell).into();
                                 if shell.contains("sparkline") {
                                     sheet.sparklines = crate::sparkline::parse_sheet(&shell);
                                     sheet.sparklines.sort_by_key(|s| (s.c, s.r));
@@ -602,7 +606,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                             )).collect();
                         }
                         if xml.contains("inlineStr") && (xml.contains("<r>") || xml.contains("<r ")) {
-                            sheet.rich = crate::richtext::inline_cells(&xml);
+                            sheet.rich = crate::richtext::inline_cells(&xml).into();
                         }
                     }
                     Err(e) => diag.push(Some(name), part, "工作表属性和样式", format!("{e:#}"), true),
@@ -679,6 +683,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         let wb_styles = &mut wb.styles;
         for sheet in wb_sheets.iter_mut() {
             if let Some(lay) = layouts.get(&sheet.name) {
+                sheet.source_needs_dom_repair |= lay.invalid_column_bounds;
                 // .xls 没有 XML 版面，合并区来自 apply_xls_meta，别被空值覆盖
                 if !lay.merges.is_empty() || !is_cfb {
                     sheet.merges = lay.merges.clone();
@@ -690,12 +695,8 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 if let Some(h) = lay.row_default {
                     sheet.rows.set_default(h);
                 }
-                for (c, w) in lay.col_widths.iter() {
-                    sheet.cols.set(*c, *w);
-                }
-                for (r, h) in lay.row_heights.iter() {
-                    sheet.rows.set(*r, *h);
-                }
+                sheet.cols.set_many(lay.col_widths.iter().map(|(c, w)| (*c, *w)));
+                sheet.rows.set_many(lay.row_heights.iter().map(|(r, h)| (*r, *h)));
                 for c in lay.hidden_cols.iter() {
                     sheet.hidden_cols.insert(*c);
                 }
@@ -708,8 +709,9 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 for (r, c) in lay.ignored_errors.iter() {
                     sheet.ignored_errors.insert((*r, *c));
                 }
-                if !lay.scenarios.is_empty() {
+                if lay.scenario_settings.has_source() || !lay.scenarios.is_empty() {
                     sheet.scenarios = lay.scenarios.clone();
+                    sheet.scenario_settings = lay.scenario_settings.clone();
                 }
                 if let Some((below, right, symbols)) = lay.outline_pr {
                     sheet.outline_summary_below = below;
@@ -734,6 +736,9 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                             sheet.set_row_style_loaded(pos, id);
                         }
                     }
+                }
+                if is_ooxml && (!sheet.row_styles.is_empty() || !sheet.col_styles.is_empty()) {
+                    sheet.apply_loaded_xf_zero(loaded_style_id(0, wb_styles));
                 }
                 sheet.tab_color = lay.tab_color;
                 sheet.protection = lay.protection.clone();
@@ -834,7 +839,6 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             }
         }
         // 工作表可见性（workbook.xml 的 state="hidden"）
-        let states = crate::patch::read_sheet_states(path);
         let delta_styles = delta::StyleMap::new(&style_ids, &wb.styles);
         for sheet in wb.sheets.iter_mut() {
             if let Some(&hide) = states.get(&sheet.name) {
@@ -894,6 +898,8 @@ fn pivot_definitions(path: &Path) -> Vec<(String, Vec<u8>)> {
 /// applied to a newer live document without resetting edits made during save.
 #[derive(Debug, Default)]
 pub struct SaveReceipt {
+    /// True when sheet cell changes were applied by the verified source-package delta writer.
+    pub used_cell_delta: bool,
     sheets: std::collections::HashMap<u64, SavedSheet>,
     source_encryption: Option<crate::crypto::EncryptionSettings>,
     committed_charts: std::collections::HashMap<u64, Vec<SavedChart>>,
@@ -902,9 +908,10 @@ pub struct SaveReceipt {
 #[derive(Debug)]
 struct SavedSheet {
     part: String,
+    source_needs_dom_repair: bool,
     cells: crate::store::CellVersion,
     source_cells: Option<SourceCells>,
-    cleared: std::collections::HashSet<crate::model::CellRef>,
+    cleared: crate::model::CellJournal,
 }
 
 #[derive(Debug)]
@@ -913,6 +920,7 @@ struct SavedChart {
     drawing: String,
     anchor: (u32, u32, u32, u32),
     ref_fixes: Vec<(String, String)>,
+    created: Option<(crate::charts::Chart, String, String)>,
 }
 
 struct RestoreFile(Option<std::path::PathBuf>);
@@ -939,11 +947,23 @@ impl SaveReceipt {
                         continue;
                     };
                     // Edits made while the worker was saving append to this journal.
+                    if let Some((original, part, drawing)) = &baseline.created {
+                        let anchor = std::mem::replace(&mut chart.anchor, original.anchor);
+                        let same = chart == original;
+                        chart.anchor = anchor;
+                        if !same {
+                            dirty = true;
+                            continue;
+                        }
+                        chart.part.clone_from(part);
+                        chart.drawing.clone_from(drawing);
+                    }
                     if chart.ref_fixes.starts_with(&baseline.ref_fixes) {
                         chart.ref_fixes.drain(..baseline.ref_fixes.len());
                     }
                     dirty |= saved_index != index || baseline.anchor != chart.anchor
-                        || baseline.drawing != chart.drawing || !chart.ref_fixes.is_empty();
+                        || (baseline.created.is_none() && baseline.drawing != chart.drawing)
+                        || !chart.ref_fixes.is_empty();
                 }
                 sheet.charts_dirty = dirty;
             }
@@ -959,6 +979,7 @@ impl SaveReceipt {
             let Some(saved) = self.sheets.get(&sheet.identity) else { continue };
             sheet.saved_cells = Some(saved.cells.clone());
             sheet.source_cells.clone_from(&saved.source_cells);
+            sheet.source_needs_dom_repair = saved.source_needs_dom_repair;
             if sheet.cell_version() != &saved.cells {
                 continue;
             }
@@ -982,6 +1003,9 @@ impl SaveReceipt {
             sheet.col_styles_dirty = false;
             sheet.merges_dirty = false;
             sheet.notes_dirty = false;
+            if saved.source_cells.as_ref().is_some_and(|source| source.rich == sheet.rich) {
+                sheet.rich_dirty = false;
+            }
             sheet.cf_dirty = false;
             sheet.dv_dirty = false;
             sheet.freeze_dirty = false;
@@ -991,26 +1015,136 @@ impl SaveReceipt {
     }
 }
 
-fn package_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
-    let targets = crate::patch::sheet_targets(path).context("读取已保存的工作表身份失败")?;
+#[derive(Default)]
+struct CellWrite {
+    styles: Option<delta::SavedStyles>,
+    used_delta: bool,
+    created_charts: std::collections::HashMap<(u64, usize), (String, String)>,
+}
+
+// Reconstruct only unambiguous raw XF numbers from the committed style part.
+// The header reader supplies a synthetic empty worksheet, so collecting a save
+// receipt never inflates sheetData or the shared-string table.
+fn committed_style_map(
+    path: &Path,
+    zip: &mut zip::ZipArchive<std::fs::File>,
+    wb: &Workbook,
+    targets: &std::collections::HashMap<String, String>,
+    book: &str,
+    rels: &[u8],
+) -> Option<std::sync::Arc<delta::StyleMap>> {
+    let header = sheets::header(zip, targets, book, Some(rels)).ok()??;
+    let theme = crate::style_theme::load(path, &[]);
+    let ext = crate::style_ext::load(path);
+    let mut ids = std::collections::HashMap::new();
+    let mut defaults = std::collections::HashMap::new();
+    for (index, style) in header.styles.iter().enumerate() {
+        let raw = u16::try_from(index).ok()?;
+        let mut cell = convert_style(style);
+        let xf = theme.xfs.get(index).copied().unwrap_or_default();
+        crate::style_theme::apply_resolved(
+            &mut cell,
+            Some(&xf),
+            theme.resolved.get(index),
+            &theme.palette,
+        );
+        let pattern = ext
+            .xf_fill
+            .get(index)
+            .and_then(|&n| ext.patterns.get(n as usize))
+            .and_then(Option::as_ref);
+        let diagonal = ext
+            .xf_border
+            .get(index)
+            .and_then(|&n| ext.diags.get(n as usize))
+            .and_then(Option::as_ref);
+        let quoted = ext.xf_quote.get(index).copied().unwrap_or(false);
+        let matching_id = |candidate: &crate::style::CellStyle| {
+            let id = wb.styles.find_style(candidate)?;
+            (wb.styles.theme_of(id) == xf
+                && wb.styles.pattern_of(id) == pattern
+                && wb.styles.diag_of(id) == diagonal
+                && wb.styles.quote_of(id) == quoted)
+                .then_some(id)
+        };
+        if let Some(id) = matching_id(&cell) {
+            ids.insert(raw, id);
+        }
+        let bottom = cell.valign == 3;
+        let calibri = cell.font == "Calibri";
+        let mut origin = |candidate: &crate::style::CellStyle| {
+            if let Some(id) = matching_id(candidate) {
+                defaults
+                    .entry(id)
+                    .and_modify(|v| {
+                        if *v != Some(raw) {
+                            *v = None;
+                        }
+                    })
+                    .or_insert(Some(raw));
+            }
+        };
+        if calibri {
+            let mut implicit_font = cell.clone();
+            implicit_font.font.clear();
+            origin(&implicit_font);
+            if bottom {
+                implicit_font.valign = 0;
+                origin(&implicit_font);
+            }
+        }
+        if bottom {
+            cell.valign = 0;
+            origin(&cell);
+        }
+    }
+    Some(delta::StyleMap::recovered(&ids, defaults, &wb.styles))
+}
+
+fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveReceipt> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let book = read_zip_text(&mut zip,"xl/workbook.xml")?;
+    let rels = read_zip_text(&mut zip,"xl/_rels/workbook.xml.rels")?;
+    let targets = crate::patch::sheet_targets_xml(Some(&book),Some(&rels));
+    let rebuilt = std::cell::OnceCell::new();
+    let unstyled_map = std::cell::OnceCell::new();
     let sheets = wb.sheets.iter().map(|sheet| {
         let part = targets.get(&sheet.name)
             .with_context(|| format!("已保存文件缺少工作表: {}", sheet.name))?;
         Ok((sheet.identity, SavedSheet {
             part: part.clone(),
-            source_cells: SourceCells::capture(&mut zip, part, sheet),
+            source_needs_dom_repair: sheet.source_needs_dom_repair &&
+                (write.used_delta || !(sheet.row_styles_dirty || sheet.col_styles_dirty)),
+            source_cells: SourceCells::capture(&mut zip, part, sheet).map(|mut source| {
+                if let Some(styles) = &write.styles { styles.attach(&mut source); }
+                else if sheet.source_part.is_none() && sheet.styles.is_empty()
+                    && sheet.row_styles.is_empty() && sheet.col_styles.is_empty() {
+                    // No user XF was assigned when this sheet was created. On
+                    // its next save, font edits must still prove the raw cell XF
+                    // is zero and the original font properties match the model.
+                    source.set_style_map(unstyled_map.get_or_init(||
+                        delta::StyleMap::new(&Default::default(), &crate::style::StyleTable::new())
+                    ).clone());
+                }
+                if !source.has_style_map() && let Some(map) = rebuilt.get_or_init(||
+                    committed_style_map(path,&mut zip,wb,&targets,&book,rels.as_bytes())) {
+                    source.set_style_map(map.clone());
+                }
+                source
+            }),
             cells: sheet.cell_version().clone(),
             cleared: sheet.cleared.clone(),
         }))
     }).collect::<Result<_>>()?;
     Ok(SaveReceipt {
+        used_cell_delta: write.used_delta,
         sheets,
         source_encryption: wb.encryption.clone(),
-        committed_charts: wb.sheets.iter().filter(|s| s.charts_dirty).map(|sheet| {
-            let charts = sheet.charts.iter().map(|chart| SavedChart {
+        committed_charts: wb.sheets.iter().filter(|s| s.charts_dirty || write.created_charts.contains_key(&(s.identity, 0))).map(|sheet| {
+            let charts = sheet.charts.iter().enumerate().map(|(i, chart)| SavedChart {
                 part: chart.part.clone(), drawing: chart.drawing.clone(),
                 anchor: chart.anchor, ref_fixes: chart.ref_fixes.clone(),
+                created: write.created_charts.get(&(sheet.identity, i)).map(|(part, drawing)| (chart.clone(), part.clone(), drawing.clone())),
             }).collect();
             (sheet.identity, charts)
         }).collect(),
@@ -1028,16 +1162,14 @@ fn package_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
 /// 覆盖：ZIP 能打开、每个条目 CRC 读通、必需部件齐全、[Content_Types].xml 声明的部件全在、
 /// workbook.xml.rels 里的工作表目标全在、这几个关键 XML 良构。XLS 走对应的 CFB 读取路径。
 pub fn verify_saved_package(path: &Path) -> Result<()> {
+    use std::io::{Read, Seek};
     // 不能靠扩展名判断类型：调用方传进来的常常是临时文件（.~a.xls.saving-1234），
     // 它的扩展名是 saving-1234。按文件头判断才可靠。
     let mut head = [0u8; 8];
-    {
-        use std::io::Read;
-        let mut f = std::fs::File::open(path).with_context(|| format!("打开保存产物失败：{}", path.display()))?;
-        let n = f.read(&mut head).with_context(|| format!("读取保存产物失败：{}", path.display()))?;
-        if n < 8 {
-            anyhow::bail!("保存产物只有 {n} 字节，明显被截断");
-        }
+    let mut file = std::fs::File::open(path).with_context(|| format!("打开保存产物失败：{}", path.display()))?;
+    let n = file.read(&mut head).with_context(|| format!("读取保存产物失败：{}", path.display()))?;
+    if n < 8 {
+        anyhow::bail!("保存产物只有 {n} 字节，明显被截断");
     }
     let is_zip = head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") || head.starts_with(b"PK\x07\x08");
     let is_cfb = head == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -1063,24 +1195,39 @@ pub fn verify_saved_package(path: &Path) -> Result<()> {
     if !is_zip {
         anyhow::bail!("保存产物开头不是 ZIP/CFB 签名，格式无法识别");
     }
-    let file = std::fs::File::open(path).with_context(|| format!("打开保存产物失败：{}", path.display()))?;
+    file.rewind()?;
     let mut zip = zip::ZipArchive::new(file).context("保存产物不是有效的 ZIP（中央目录缺失或文件被截断）")?;
     const CRITICAL_XML: [&str; 4] = ["[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels"];
     let mut critical = std::collections::HashMap::new();
     for part in CRITICAL_XML {
         anyhow::ensure!(zip.index_for_name(part).is_some(), "保存产物缺少必需部件 {part}");
+        let body = read_zip_text(&mut zip,part)?;
+        check_single_root(part,&body)?;
+        critical.insert(part,body);
     }
-    // Drain every entry through the ZIP reader to verify its CRC. Keep the four
-    // XML documents needed below from that same read.
+    let types = roxmltree::Document::parse(&critical["[Content_Types].xml"])?;
+    let mut worksheets: std::collections::HashSet<String> = types.root_element().children()
+        .filter(|entry| entry.tag_name().name()=="Override" && entry.attribute("ContentType")
+            ==Some("application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"))
+        .filter_map(|entry| entry.attribute("PartName").map(|p| p.trim_start_matches('/').to_owned())).collect();
+    let links = roxmltree::Document::parse(&critical["xl/_rels/workbook.xml.rels"])?;
+    for entry in links.root_element().children().filter(|e| e.tag_name().name()=="Relationship"
+        && e.attribute("Type").is_some_and(|t| t.ends_with("/worksheet")) && e.attribute("TargetMode") != Some("External")) {
+        if let Some(target) = entry.attribute("Target").and_then(|t| resolve_part("xl",t)) {
+            worksheets.insert(target);
+        }
+    }
+    let mut seen_critical = std::collections::HashSet::new();
     for i in 0..zip.len() {
         let mut e = zip.by_index(i).with_context(|| format!("读取保存产物第 {i} 个条目失败"))?;
         let name = e.name().to_owned();
-        if CRITICAL_XML.contains(&name.as_str()) {
-            let mut body = String::new();
-            std::io::Read::read_to_string(&mut e, &mut body)
-                .with_context(|| format!("保存产物条目损坏：{name}"))?;
-            check_single_root(&name, &body)?;
-            anyhow::ensure!(critical.insert(name.clone(), body).is_none(), "保存产物关键部件重复：{name}");
+        if critical.contains_key(name.as_str()) {
+            anyhow::ensure!(seen_critical.insert(name.clone()), "保存产物关键部件重复：{name}");
+        } else if worksheets.contains(&name) {
+            delta::stream::xml_input(&mut e, &name, |source| {
+                check_xml_reader(&name, std::io::BufReader::new(source), Some("worksheet"))?;
+                Ok(true)
+            }).with_context(|| format!("保存产物条目损坏：{name}"))?;
         } else {
             std::io::copy(&mut e, &mut std::io::sink())
                 .with_context(|| format!("保存产物条目损坏：{name}"))?;
@@ -1145,28 +1292,38 @@ fn resolve_part(base: &str, target: &str) -> Option<String> {
 /// XML 必须「有且只有一个根元素」，根之后不允许再出现元素或非空白文本。
 /// 自闭合根（`<a/>`）也算根；根后再来一个 `<extra/>` 或第二段文本都要拒。
 fn check_single_root(part: &str, body: &str) -> Result<()> {
-    let mut reader = quick_xml::Reader::from_str(body);
+    check_xml_reader(part,body.as_bytes(),None)
+}
+
+fn check_xml_reader(part: &str, input: impl std::io::BufRead, expected: Option<&str>) -> Result<()> {
+    let mut reader = quick_xml::Reader::from_reader(input);
+    let mut buffer = Vec::new();
     reader.config_mut().check_end_names = true;
     let mut depth: i32 = 0;
     let mut roots = 0;
     let mut closed = false;
     loop {
-        match reader.read_event() {
-            Ok(quick_xml::events::Event::Start(_)) => {
+        buffer.clear();
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(ref tag)) => {
+                for attr in tag.attributes() { attr.with_context(|| format!("{part}: invalid attribute"))?; }
                 if closed {
                     anyhow::bail!("{part} 在根元素之后又出现了元素（多个根）");
                 }
                 if depth == 0 {
+                    anyhow::ensure!(expected.is_none_or(|n| n == tag.local_name().as_ref()),"{part}: wrong root element");
                     roots += 1;
                 }
                 depth += 1;
             }
-            Ok(quick_xml::events::Event::Empty(_)) => {
+            Ok(quick_xml::events::Event::Empty(ref tag)) => {
+                for attr in tag.attributes() { attr.with_context(|| format!("{part}: invalid attribute"))?; }
                 if closed {
                     anyhow::bail!("{part} 在根元素之后又出现了元素（多个根）");
                 }
                 // 自闭合元素既不进也不出栈；在顶层时它自己就是一个根。
                 if depth == 0 {
+                    anyhow::ensure!(expected.is_none_or(|n| n == tag.local_name().as_ref()),"{part}: wrong root element");
                     roots += 1;
                     closed = true;
                 }
@@ -1274,7 +1431,16 @@ mod gate_tests {
     }
 }
 
-fn read_zip_text(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
+/// Borrow ordinary UTF-8 and transcode only worksheets which actually use UTF-16.
+pub(crate) fn patch_xml_text<'a>(bytes: &'a [u8], part: &str) -> Result<std::borrow::Cow<'a,str>> {
+    if sheets::utf16_encoding(bytes).is_some() {
+        Ok(sheets::decode_xml_part(bytes.to_owned(),part)?.into())
+    } else {
+        Ok(std::str::from_utf8(bytes).with_context(|| format!("invalid XML encoding in {part}"))?.into())
+    }
+}
+
+pub(crate) fn read_zip_text(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
     sheets::xml_part(zip, name).with_context(|| format!("读取 {name} 失败"))
 }
 
@@ -1464,6 +1630,18 @@ fn sweep_stale_saving_files(dir: &Path, name: &str, keep_active: Option<&Path>) 
 
 /// Build the receipt from the staged OOXML before committing the replacement.
 pub fn save_atomic_with_receipt(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
+    save_atomic_model(path, &mut Cow::Borrowed(wb))
+}
+
+/// Save a background worker's private copy and return its calculated cells.
+/// Preparing a newly built package only changes transient save flags on this copy.
+pub fn save_snapshot_with_receipt(path: &Path, wb: Workbook) -> Result<(SaveReceipt, Workbook)> {
+    let mut snapshot = Cow::Owned(wb);
+    let receipt = save_atomic_model(path, &mut snapshot)?;
+    Ok((receipt, snapshot.into_owned()))
+}
+
+fn save_atomic_model(path: &Path, wb: &mut Cow<'_, Workbook>) -> Result<SaveReceipt> {
     refuse_overwrite_of_source(wb, path)?;
     if std::fs::metadata(path).is_ok_and(|m| m.permissions().readonly()) {
         anyhow::bail!("替换 {} 失败：目标文件为只读属性，原文件未被修改", path.display());
@@ -1700,7 +1878,7 @@ pub fn save(path: &Path, wb: &Workbook) -> Result<()> {
     if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("xls")) {
         return save_atomic(path, wb);
     }
-    write_ooxml(path, wb).map(|_| ())
+    write_ooxml(path, &mut Cow::Borrowed(wb)).map(|_| ())
 }
 
 fn private_workbook_dir() -> Result<tempfile::TempDir> {
@@ -1722,10 +1900,10 @@ fn private_workbook_dir() -> Result<tempfile::TempDir> {
         .context("无法创建本机工作簿临时目录")
 }
 
-fn write_ooxml(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
+fn write_ooxml(path: &Path, wb: &mut Cow<'_, Workbook>) -> Result<SaveReceipt> {
     if wb.encryption.is_none() && wb.source_encryption.is_none() {
-        save_plain_base(path, wb, None)?;
-        return package_receipt(path, wb);
+        let write = save_plain_base(path, wb, None)?;
+        return package_receipt(path, wb, write);
     }
     let scratch = private_workbook_dir()?;
     let base = scratch.path().join("source.xlsx");
@@ -1741,19 +1919,24 @@ fn write_ooxml(path: &Path, wb: &Workbook) -> Result<SaveReceipt> {
     } else {
         None
     };
-    let Some(enc) = wb.encryption.as_ref() else {
-        save_plain_base(path, wb, base_override)?;
-        return package_receipt(path, wb);
-    };
     // Keep the logical file extension (including .xlsm) and isolate all helper files.
-    let out_dir = scratch.path().join("output");
-    std::fs::create_dir(&out_dir)?;
-    let plain = out_dir.join(path.file_name().context("保存路径缺少文件名")?);
-    save_plain_base(&plain, wb, base_override)?;
-    corrupt_tmp_for_test(&plain);
-    verify_saved_package(&plain).context("加密前的临时明文未通过完整性校验")?;
-    let receipt = package_receipt(&plain, wb)?;
-    let bytes = std::fs::read(&plain).context("读取临时明文失败")?;
+    let plain;
+    let output = if wb.encryption.is_some() {
+        let out_dir = scratch.path().join("output");
+        std::fs::create_dir(&out_dir)?;
+        plain = out_dir.join(path.file_name().context("保存路径缺少文件名")?);
+        plain.as_path()
+    } else {
+        path
+    };
+    let write = save_plain_base(output, wb, base_override)?;
+    let Some(enc) = wb.encryption.as_ref() else {
+        return package_receipt(output, wb, write);
+    };
+    corrupt_tmp_for_test(output);
+    verify_saved_package(output).context("加密前的临时明文未通过完整性校验")?;
+    let receipt = package_receipt(output, wb, write)?;
+    let bytes = std::fs::read(output).context("读取临时明文失败")?;
     crate::crypto::encrypt(path, &bytes, enc)?;
     Ok(receipt)
 }
@@ -1885,72 +2068,335 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Build a private input for umya. Large sheets that will be restored from the
-/// baseline omit their cells, and range hyperlinks are handled by our OOXML writer.
-fn slim_umya_base(
-    base: &Path, wb: &Workbook,
-) -> Result<Option<(tempfile::TempPath, Vec<String>)>> {
-    use std::io::Write;
+/// Sparse umya input and the data ranges that must be restored after its metadata patches.
+struct SlimBase {
+    path: tempfile::TempPath,
+    omitted: Vec<String>,
+    grids: std::collections::HashMap<String, PreservedGrid>,
+}
+struct PreservedGrid {
+    source_part: String,
+    edits: Option<tempfile::NamedTempFile>,
+    dimension: Option<String>,
+}
+
+fn slim_umya_base(base: &Path, wb: &Workbook) -> Result<Option<SlimBase>> {
+    use std::io::{BufWriter, Write};
     let targets = crate::patch::sheet_targets(base)?;
     let mut zip = zip::ZipArchive::new(std::fs::File::open(base)?)?;
     let mut candidates = std::collections::HashMap::new();
+    let styles_stable = wb.sheets.iter().all(|s| {
+        !s.styles_dirty && !s.row_styles_dirty && !s.col_styles_dirty && s.style_edits.is_empty()
+    });
     let mut omitted = Vec::new();
+    let mut grids = std::collections::HashMap::new();
     for (idx, sheet) in wb.sheets.iter().enumerate() {
-        let Some(part) = targets.get(&sheet.name) else { continue };
-        // At these stable paths restore_unedited_sheets uses compressed raw copy.
-        let omit_cells = crate::fixups::can_restore_sheet_xml(sheet)
-            && *part == format!("xl/worksheets/sheet{}.xml", idx + 1)
+        let Some(part) = targets.get(&sheet.name) else {
+            continue;
+        };
+        let large = *part == format!("xl/worksheets/sheet{}.xml", idx + 1)
             && zip.by_name(part)?.size() > crate::fixups::RAW_SHEET_MIN_BYTES;
-        // A deleted range can still exist in the on-disk baseline.
-        let check_links = sheet.hyperlinks_dirty || sheet.hyperlinks.values().any(|h| h.span != (0, 0));
-        if !omit_cells && !check_links { continue; }
-        candidates.insert(part.as_str(), (sheet.name.as_str(), omit_cells, check_links));
+        let omit = large && crate::fixups::can_restore_sheet_xml(sheet);
+        let keep_grid = large
+            && !omit
+            && styles_stable
+            && (sheet.notes_dirty || sheet.cf_dirty || sheet.dv_dirty || sheet.charts_dirty)
+            && !sheet.layout_dirty
+            && !sheet.filter_dirty
+            && !sheet.rich_dirty
+            && !sheet.merges_dirty
+            && sheet
+                .source_cells
+                .as_ref()
+                .is_some_and(|s| s.reusable_grid(&mut zip, part, sheet));
+        let check_links =
+            sheet.hyperlinks_dirty || sheet.hyperlinks.values().any(|h| h.span != (0, 0));
+        if omit || keep_grid || check_links || sheet.source_needs_dom_repair {
+            candidates.insert(
+                part.clone(),
+                (sheet.name.clone(), omit, keep_grid, check_links, sheet.source_needs_dom_repair),
+            );
+        }
     }
-    if candidates.is_empty() { return Ok(None); }
-    let temp = tempfile::Builder::new().prefix("cellan-umya-").suffix(".xlsx").tempfile()?;
-    let (file, path) = temp.into_parts();
-    let mut out = zip::ZipWriter::new(file);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let (file, path) = tempfile::Builder::new()
+        .prefix("cellan-umya-")
+        .suffix(".xlsx")
+        .tempfile()?
+        .into_parts();
+    let mut out = zip::ZipWriter::new(BufWriter::new(file));
     for i in 0..zip.len() {
         let part = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
-        let Some(&(sheet_name, omit_cells, check_links)) = candidates.get(part.as_str()) else {
+        let Some((name, omit, mut keep_grid, check_links, repair_input)) = candidates.remove(&part) else {
             out.raw_copy_file(zip.by_index_raw(i)?)?;
             continue;
         };
-        let mut xml = read_zip_text(&mut zip, &part)?;
-        let mut changed = false;
-        if omit_cells {
-            let mut reader = quick_xml::Reader::from_str(&xml);
-            let mut depth = 0;
-            loop {
-                match reader.read_event()? {
-                    quick_xml::events::Event::Start(e) if depth == 1 && e.local_name().as_ref() == "sheetData" => {
-                        let contents = reader.read_to_end(e.name())?;
-                        xml.replace_range(contents.start as usize..contents.end as usize, "");
-                        omitted.push(sheet_name.to_owned());
-                        changed = true;
-                        break;
-                    }
-                    quick_xml::events::Event::Start(_) => depth += 1,
-                    quick_xml::events::Event::End(_) => depth -= 1,
-                    quick_xml::events::Event::Eof => break,
-                    _ => {}
-                }
+        let mut shell = None;
+        let mut edited = None;
+        if keep_grid {
+            let sheet = wb
+                .sheets
+                .iter()
+                .find(|s| s.name == name)
+                .context("找不到原工作表")?;
+            let source = sheet.source_cells.as_ref().context("缺少单元格基准")?;
+            if !source.unchanged_values(sheet) {
+                edited = source.stage_grid_edits(&mut zip, &part, sheet, &wb.styles)?;
+                keep_grid = edited.is_some();
             }
         }
-        if check_links { changed |= crate::hyperlinks::remove_range_links(&mut xml); }
-        if changed {
-            out.start_file(part, zip::write::SimpleFileOptions::default()
+        if omit || keep_grid {
+            let mut bytes = Vec::new();
+            let (portable, dimension) = if let Some(edited) = &edited {
+                delta::split_grid(edited.reopen()?, &part, &mut bytes, None)?
+            } else {
+                delta::split_grid(zip.by_index(i)?, &part, &mut bytes, None)?
+            };
+            if omit {
+                omitted.push(name.clone());
+                shell = Some(String::from_utf8(bytes)?);
+            } else if portable {
+                grids.insert(
+                    name,
+                    PreservedGrid {
+                        source_part: part.clone(),
+                        edits: edited,
+                        dimension,
+                    },
+                );
+                shell = Some(String::from_utf8(bytes)?);
+            }
+        }
+        if check_links {
+            if shell.is_none() {
+                let mut xml = read_zip_text(&mut zip, &part)?;
+                if crate::hyperlinks::remove_range_links(&mut xml) {
+                    shell = Some(xml);
+                }
+            } else if let Some(xml) = &mut shell {
+                crate::hyperlinks::remove_range_links(xml);
+            }
+        }
+        if repair_input {
+            out.start_file(&part, zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated))?;
+            if let Some(xml) = shell {
+                delta::stream::repair_dom_input(xml.as_bytes(), &mut out)?;
+            } else {
+                delta::stream::xml_input(zip.by_index(i)?, &part, |input|
+                    delta::stream::repair_dom_input(input, &mut out))?;
+            }
+        } else if let Some(xml) = shell {
+            out.start_file(
+                part,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )?;
             out.write_all(xml.as_bytes())?;
         } else {
             out.raw_copy_file(zip.by_index_raw(i)?)?;
         }
     }
-    out.finish()?;
-    Ok(Some((path, omitted)))
+    out.finish()?.flush()?;
+    Ok(Some(SlimBase {
+        path,
+        omitted,
+        grids,
+    }))
 }
 
-fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> Result<()> {
+/// The shell is the fully patched worksheet. Transfer the source data directly
+/// from the original ZIP (or its staged value edits), retaining new metadata.
+fn restore_grids(
+    path: &Path,
+    base: &Path,
+    restored: &[String],
+    same_manifest: bool,
+    grids: std::collections::HashMap<String, PreservedGrid>,
+) -> Result<()> {
+    use std::io::{BufWriter, Write};
+    let targets = crate::patch::sheet_targets(path)?;
+    let mut parts = std::collections::HashMap::new();
+    for (sheet, grid) in grids {
+        let part = targets.get(&sheet).context("找不到单元格区域所属工作表")?;
+        anyhow::ensure!(parts.insert(part.clone(), grid).is_none(), "工作表部件重复");
+    }
+    let restored: std::collections::HashSet<_> = restored.iter().collect();
+    let unchanged_cells = same_manifest && parts.values().all(|g| g.edits.is_none());
+    let rebuilt: std::collections::HashSet<_> = targets.iter().filter(|(name,part)| {
+        !restored.contains(name) && !parts.contains_key(*part)
+    }).map(|(_,part)| part.clone()).collect();
+    let mut source = zip::ZipArchive::new(std::fs::File::open(base)?)?;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    if parts.is_empty() {
+        let signature = |z: &mut zip::ZipArchive<std::fs::File>| {
+            let entry = z.by_index_raw(z.index_for_name(delta::sst::PART)?).ok()?;
+            Some((entry.crc32(),entry.size()))
+        };
+        let original = signature(&mut source);
+        if original.is_none() || original == signature(&mut zip) { return Ok(()); }
+    }
+    let strings = delta::sst::Merge::prepare(&mut source,&mut zip,&rebuilt)?;
+    let copy_strings = unchanged_cells && rebuilt.is_empty();
+    let missing_strings = strings.is_some() && zip.index_for_name(delta::sst::PART).is_none();
+    let (file, temp) = tempfile::NamedTempFile::new_in(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?
+    .into_parts();
+    let mut out = zip::ZipWriter::new(BufWriter::new(file));
+    for i in 0..zip.len() {
+        let part = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
+        if strings.is_some() && part == delta::sst::PART { continue; }
+        if let Some(merge) = strings.as_ref().filter(|m| m.remaps(&part)) {
+            out.start_file(&part, delta::sst::compression())?;
+            merge.remap_worksheet(zip.by_index(i)?, &mut out, &part)?;
+            continue;
+        }
+        let Some(grid) = parts.remove(&part) else {
+            out.raw_copy_file(zip.by_index_raw(i)?)?;
+            continue;
+        };
+        let mut shell = read_zip_text(&mut zip, &part)?;
+        let doc = roxmltree::Document::parse(&shell)?;
+        if let Some(d) = doc
+            .root_element()
+            .children()
+            .find(|n| n.has_tag_name("dimension"))
+        {
+            if let Some(reference) = grid.dimension {
+                let span = d
+                    .attribute_node("ref")
+                    .context("工作表缺少尺寸")?
+                    .range_value();
+                shell.replace_range(span, &reference);
+            } else {
+                shell.replace_range(d.range(), "");
+            }
+        }
+        let doc = roxmltree::Document::parse(&shell)?;
+        let data = doc
+            .root_element()
+            .children()
+            .find(|n| n.has_tag_name("sheetData"))
+            .context("工作表缺少 sheetData")?
+            .range();
+        out.start_file(part, delta::sst::compression())?;
+        out.write_all(&shell.as_bytes()[..data.start])?;
+        let mut discard = std::io::sink();
+        let (portable, _) = if let Some(edited) = grid.edits {
+            delta::split_grid(edited.reopen()?, &grid.source_part, &mut discard, Some(&mut out))?
+        } else {
+            delta::split_grid(source.by_name(&grid.source_part)?, &grid.source_part, &mut discard, Some(&mut out))?
+        };
+        anyhow::ensure!(portable,"基准单元格元数据已改变");
+        out.write_all(&shell.as_bytes()[data.end..])?;
+    }
+    anyhow::ensure!(parts.is_empty(), "缺少要恢复的单元格区域");
+    if let Some(merge) = strings {
+        if copy_strings {
+            out.raw_copy_file(source.by_index_raw(source.index_for_name(delta::sst::PART).context("缺少原始共享字符串表")?)?)?;
+        } else {
+            out.start_file(delta::sst::PART,delta::sst::compression())?;
+            merge.write(&mut source,&mut zip,&mut out)?;
+        }
+    }
+    out.finish()?.flush()?;
+    drop(zip);
+    temp.persist(path)?;
+    if missing_strings {
+        crate::fixups::ensure_shared_strings_rel(path)?;
+        crate::fixups::rebuild_content_types(path,base)?;
+    }
+
+    Ok(())
+}
+
+// The borrowed public API may need a private model for a new package. A save
+// worker already owns one, so retain only the sheet flags needed by its receipt.
+macro_rules! fresh_sheet_flags {
+    ($sheet:ident, $streamed:ident; $($flag:ident = $enabled:expr),+ $(,)?) => {
+        #[derive(Debug, PartialEq)]
+        struct OriginalSheetFlags { $($flag: bool),+ }
+
+        impl OriginalSheetFlags {
+            fn capture(sheet: &Sheet) -> Self {
+                Self { $($flag: sheet.$flag),+ }
+            }
+
+            fn prepare($sheet: &mut Sheet, $streamed: bool) -> Self {
+                let previous = Self::capture($sheet);
+                $($sheet.$flag = $enabled;)+
+                previous
+            }
+
+            fn restore(self, sheet: &mut Sheet) {
+                $(sheet.$flag = self.$flag;)+
+            }
+        }
+    };
+}
+
+fresh_sheet_flags!(s, streamed;
+    styles_dirty = true,
+    row_styles_dirty = true,
+    col_styles_dirty = true,
+    merges_dirty = true,
+    outline_pr_dirty = true,
+    page_dirty = true,
+    charts_dirty = true,
+    hidden_dirty = true,
+    cf_dirty = !s.cf.blocks.is_empty() || !s.cf.dxfs.is_empty(),
+    dv_dirty = !s.dv.is_empty(),
+    notes_dirty = !s.notes.is_empty(),
+    freeze_dirty = s.freeze.is_some(),
+    layout_dirty = !s.cols.is_empty() || !s.rows.is_empty() || !s.hidden_cols.is_empty()
+        || !s.hidden_rows.is_empty() || !s.hidden_rows_user.is_empty()
+        || !s.row_levels.is_empty() || !s.col_levels.is_empty(),
+    scenarios_dirty = s.scenario_settings.has_source() || !s.scenarios.is_empty(),
+    ignored_errors_dirty = !s.ignored_errors.is_empty(),
+    filter_dirty = s.filter.is_some() || !s.hidden_rows.is_empty(),
+    tab_color_dirty = s.tab_color.is_some(),
+    tables_dirty = !s.tables.is_empty(),
+    protect_dirty = s.protection.is_some(),
+    rich_dirty = !streamed && !s.rich.is_empty(),
+    sparklines_dirty = !s.sparklines.is_empty(),
+    textboxes_dirty = !s.textboxes.is_empty(),
+    pictures_dirty = s.pictures_dirty || s.pictures.iter().any(|p| p.data.is_some()),
+    hyperlinks_dirty = s.hyperlinks_dirty || !s.hyperlinks.is_empty(),
+);
+
+fn restore_sheet_flags(book: &mut Workbook, flags: &mut Vec<OriginalSheetFlags>) {
+    for (sheet, saved) in book.sheets.iter_mut().zip(flags.drain(..)) {
+        saved.restore(sheet);
+    }
+}
+
+fn save_plain_base(
+    path: &Path, input: &mut Cow<'_, Workbook>, base_override: Option<&Path>,
+) -> Result<CellWrite> {
+    let borrowed = match *input {
+        Cow::Borrowed(book) => Some(book),
+        Cow::Owned(_) => None,
+    };
+    let mut flags = Vec::new();
+    let result = save_plain_at(path, input, base_override, true, &mut flags);
+    if let Some(book) = borrowed {
+        *input = Cow::Borrowed(book);
+    } else if let Cow::Owned(book) = input {
+        restore_sheet_flags(book, &mut flags);
+    }
+    result
+}
+
+fn save_plain_at(
+    path: &Path, input: &mut Cow<'_, Workbook>, base_override: Option<&Path>,
+    allow_stream: bool, flags: &mut Vec<OriginalSheetFlags>,
+) -> Result<CellWrite> {
+    let wb: &Workbook = input;
     note_save_target(path);
     // 先把被清空的单元格从文件里删掉（见 Sheet::cleared）
     use umya_spreadsheet::{new_file, reader::xlsx::read, writer::xlsx::write};
@@ -2021,29 +2467,23 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // 一旦 umya::write 落盘后 restore_base.exists() 会由 false 变 true，误把新写文件当旧基准覆盖。
     let has_restore_base = restore_base.exists();
     let run_restore_steps = has_restore_base || std::env::var("SC_FAIL_SAVE_STEP").is_ok();
-    // 样式表在写之前先留一份：base 可能就是目标文件，写完再读就变味了
-    let base_styles: Option<Vec<u8>> = if has_restore_base {
-        crate::fixups::read_part_file(&restore_base, "xl/styles.xml")
-    } else {
-        None
-    };
     // 没有可用的基准（抢救副本 / 全新文件）：整份内容只能从模型重建，
     // 做过载入的表也要把样式、合并、批注等写出来，不能等 dirty 标记。
     let fresh_base = !base.exists();
-    // 抢救副本从零建包：以后所有补丁都要按"全部脏"跑一遍，
-    // 否则已加载但没编辑过的列宽/行高/保护/页面设置/批注会静默丢掉。
-    let forced_snapshot;
-    let wb: &Workbook = if fresh_base {
-        let mut copy = wb.clone();
-        for sh in copy.sheets.iter_mut() {
-            sh.mark_all_dirty();
-            sh.hyperlinks_dirty |= !sh.hyperlinks.is_empty();
-        }
-        forced_snapshot = copy;
-        &forced_snapshot
-    } else {
-        wb
-    };
+    let fresh_streaming = allow_stream && fresh_base && !wb.load_incomplete && !wb.styles.quote_of(0)
+        && wb.links.is_empty() && wb.pivots_pending.is_empty() && wb.pivots_pending2.is_empty()
+        && wb.pivot_calc_fields.is_empty();
+    let streamed: Vec<_> = wb.sheets.iter()
+        .map(|s| fresh_streaming && s.source_part.is_none() && fresh::supported(s)
+            && !s.row_styles.values().chain(s.col_styles.values()).any(|&id| wb.styles.quote_of(id)))
+        .collect();
+    // A fresh umya sheet has no previous user metadata to remove. Rebuild all
+    // populated features (including unedited rescue data) and keep our page defaults.
+    if fresh_base {
+        flags.extend(input.to_mut().sheets.iter_mut().zip(&streamed)
+            .map(|(sheet, &streamed)| OriginalSheetFlags::prepare(sheet, streamed)));
+    }
+    let wb: &Workbook = input;
     // 外链关系的原文（URL/TargetMode）：有的引擎会把 URL 当包内路径改写
     let external_rels = crate::notes::capture_external_rels(if base.exists() { &base } else { path });
     let sheet_needs_umya = |s: &crate::model::Sheet| -> bool {
@@ -2054,6 +2494,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             || s.col_styles_dirty
             || s.merges_dirty
             || s.notes_dirty
+            || s.rich_dirty
             || !s.style_edits.is_empty()
     };
     let reusable_package = !fresh_base
@@ -2071,10 +2512,19 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         let _ = std::fs::create_dir_all(parent);
     }
     let unchanged_cells = !wb.sheets.iter().any(&sheet_needs_umya);
+    let mut saved_styles = None;
     let patched = reusable_package && !unchanged_cells
-        && delta::write_if_supported(&restore_base, path, wb)?;
+        && delta::write_with_style_receipt(&restore_base, path, wb, &mut saved_styles)?;
     let can_bypass_umya = reusable_package && (unchanged_cells || patched);
+    let untouched = wb.sheets.iter().all(|s| !s.styles_dirty && !s.col_styles_dirty && !s.row_styles_dirty);
+    let base_styles = if has_restore_base && !can_bypass_umya && untouched {
+        crate::fixups::read_part_file(&restore_base, "xl/styles.xml")
+    } else {
+        None
+    };
+    let mut restored_sheets = Vec::new();
     let mut omitted_sheets = Vec::new();
+    let mut preserved_grids = std::collections::HashMap::new();
     if can_bypass_umya {
         if !patched && base != path {
             std::fs::copy(&base, path).with_context(|| format!("写入失败 {}", path.display()))?;
@@ -2088,10 +2538,11 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         }
     } else {
         let mut book = if base.exists() {
-            let slim = slim_umya_base(&base, wb)?;
-            let source = if let Some((path, names)) = &slim {
-                omitted_sheets.clone_from(names);
-                path.as_ref()
+            let mut slim = slim_umya_base(&base, wb)?;
+            let source = if let Some(slim) = &mut slim {
+                omitted_sheets = std::mem::take(&mut slim.omitted);
+                preserved_grids = std::mem::take(&mut slim.grids);
+                slim.path.as_ref()
             } else {
                 base.as_path()
             };
@@ -2154,6 +2605,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             let style_targets: Vec<(u32, u32)> = if fresh_base {
                 // 从样式表枚举：空白但有填充/边框的格不在 sheet.iter() 里，漏了就丢格式；
                 // 同时保留对整行/整列样式的显式默认(0)覆盖
+                let mut examples = std::collections::HashSet::new();
                 sheet
                     .styles
                     .iter()
@@ -2162,6 +2614,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                             || sheet.row_styles.contains_key(&c.row)
                             || sheet.col_styles.contains_key(&c.col)
                     })
+                    // The streamed values need only one raw XF example per model style.
+                    // Style-only blanks must still appear at their original coordinates.
+                    .filter(|(c, id)| !streamed[idx] || !sheet.contains(c.row, c.col) || examples.insert(**id))
                     .map(|(c, _)| (c.row, c.col))
                     .collect()
             } else {
@@ -2171,17 +2626,29 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 let sid = sheet.style_of(row, col);
                 let cell = ws.get_cell_mut((col + 1, row + 1));
                 write_umya_style(wb, sid, cell.get_style_mut());
+                if streamed[idx] && sheet.contains(row, col) { cell.set_value_number(0.0); }
             }
-            if fresh_base || sheet.row_styles_dirty || sheet.styles_dirty {
+            let style_source = sheet.source_cells.as_ref().filter(|_| !fresh_base);
+            if fresh_base || sheet.row_styles_dirty {
+                if let Some(src) = style_source {
+                    for &r in src.row_styles.keys().filter(|r| !sheet.row_styles.contains_key(r)) {
+                        ws.row_dimension_mut(r + 1).set_style(Default::default());
+                    }
+                }
                 for (&r, &sid) in &sheet.row_styles {
-                    if sid != 0 {
+                    if style_source.and_then(|s| s.row_styles.get(&r)) != Some(&sid) {
                         write_umya_style(wb, sid, ws.get_row_dimension_mut(&(r + 1)).get_style_mut());
                     }
                 }
             }
-            if fresh_base || sheet.col_styles_dirty || sheet.styles_dirty {
+            if fresh_base || sheet.col_styles_dirty {
+                if let Some(src) = style_source {
+                    for &c in src.col_styles.keys().filter(|c| !sheet.col_styles.contains_key(c)) {
+                        ws.column_dimension_by_number_mut(c + 1).set_style(Default::default());
+                    }
+                }
                 for (&c, &sid) in &sheet.col_styles {
-                    if sid != 0 {
+                    if style_source.and_then(|s| s.col_styles.get(&c)) != Some(&sid) {
                         let cd = ws.get_column_dimension_by_number_mut(&(c + 1));
                         let w_px = sheet.cols.size(c);
                         if (w_px - crate::layout::DEFAULT_COL_W).abs() > 0.5 && w_px > 0.0 {
@@ -2212,6 +2679,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 *ws.get_merge_cells_mut() = refs;
             }
 
+            if streamed[idx] || preserved_grids.contains_key(&sheet.name) { continue; }
             for (cref, cell) in sheet.iter() {
                 // 动态数组的溢出值不落盘：文件里只保存锚点公式，打开时重新计算
                 if sheet.spilled.contains(&cref) {
@@ -2221,6 +2689,21 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                     continue;
                 }
                 let coord = (cref.col + 1, cref.row + 1);
+                if sheet.explicit_style_of(cref.row, cref.col).is_none() {
+                    // Reuse the dimension's actual package style so a value-only save
+                    // can restore the original styles.xml without dangling XF indices.
+                    let inherited = if sheet.row_styles.contains_key(&cref.row) {
+                        ws.row_dimension(coord.1).map(|r| r.style().clone())
+                    } else if sheet.col_styles.contains_key(&cref.col) {
+                        ws.column_dimension_by_number(coord.0).map(|c| c.style().clone())
+                    } else {
+                        None
+                    };
+                    if let Some(style) = inherited {
+                        ws.cell_mut(coord).set_style(style);
+                    }
+                }
+
                 if let Some(f) = &cell.formula {
                     // OOXML 里 <f> 不带等号；内部统一带，写盘时去掉。
                     // 加载时剥掉的 _xlfn./_xlws./_xlpm. 前缀在这里加回：umya 不会加，
@@ -2285,7 +2768,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             if let Ok(ws) = book.get_sheet_by_name_mut(&sheet.name) {
                 // 整表重写：先清空再从模型里灌（批注数量通常很小）；以 map key 为准避免移动后坐标漂移
                 ws.get_comments_mut().clear();
-                for (k, n) in &sheet.notes {
+                for (k, n) in sheet.notes.iter() {
                     let mut nc = umya_spreadsheet::Comment::default();
                     let mut coord = umya_spreadsheet::Coordinate::default();
                     coord.set_coordinate(format!("{}{}", crate::model::col_label(k.col), k.row + 1));
@@ -2335,9 +2818,8 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     }
 
     // 样式表原样沿用基准：umya 重建的样式表和原文件对不上（字体/填充被裁、dxfs 被压）
-    let untouched = wb.sheets.iter().all(|s| !s.styles_dirty && !s.col_styles_dirty && !s.row_styles_dirty);
     if !can_bypass_umya {
-        if let Some(xml) = base_styles.as_ref().filter(|_| untouched) {
+        if let Some(xml) = &base_styles {
             must_save!("styles", crate::patch::append_entry(path, "xl/styles.xml", xml));
             if prof {
                 eprintln!("  [save] 样式表沿用基准");
@@ -2509,7 +2991,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         );
     }
     // quotePrefix 是 xf 上的未建模属性，umya 重建样式表会丢；保存后按格补回
-    if !can_bypass_umya {
+    if !can_bypass_umya && (0..wb.styles.len()).any(|i| wb.styles.quote_of(i as u16)) {
         let live_targets = crate::patch::sheet_targets(path).unwrap_or_default();
         let quote_parts: Vec<(String, Vec<(u32, u32)>)> = wb
             .sheets
@@ -2527,11 +3009,14 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                     .get(&sh.name)
                     .cloned()
                     .or_else(|| sh.source_part.clone())?;
-                let cells: Vec<(u32, u32)> = sh
+                let mut cells: Vec<(u32, u32)> = sh
                     .iter()
                     .filter(|(r, _)| wb.styles.quote_of(sh.style_of(r.row, r.col)))
                     .map(|(r, _)| (r.row, r.col))
                     .collect();
+                cells.extend(sh.styles.iter().filter_map(|(pos, &id)| {
+                    (wb.styles.quote_of(id) && !sh.contains(pos.row, pos.col)).then_some((pos.row, pos.col))
+                }));
                 if cells.is_empty() {
                     None
                 } else {
@@ -2556,6 +3041,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         if !kept.is_empty() && prof {
             eprintln!("  [save] 原样沿用 {} 张表: {:?}", kept.len(), kept);
         }
+        restored_sheets = kept;
         // umya 会把工作表搬到 xl/worksheets/，搬回去（绘图/图表/透视表的相对路径才成立）
         let rehomed = must_save!("rehome-sheets", crate::fixups::rehome_sheets(path, &restore_base));
         if !rehomed.is_empty() && prof {
@@ -2690,7 +3176,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         }
     }
     must_save!("outline", crate::patch::apply_outline_pr(path, wb));
-    must_save!("scenarios", crate::patch::apply_scenarios(path, wb));
+    must_save!("scenarios", crate::patch::restore_scenarios(path, wb, !can_bypass_umya));
     must_save!("ignored-errors", crate::patch::apply_ignored_errors(path, wb));
     must_save!("tab-colors", crate::patch::apply_tab_colors(path, wb));
     must_save!("protection", crate::patch::apply_protection(path, wb));
@@ -2725,12 +3211,18 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 wb.calc_max_iterations,
                 wb.calc_max_change,
             );
-            if next_xml != wb_xml {
-                crate::patch::append_entry(path, "xl/workbook.xml", next_xml.as_bytes())?;
+            let updated = if !wb.calc_manual && wb.sheets.iter().any(|s| s.has_formulas())
+                && (fresh_base || wb.names_dirty || wb.sheets.iter().any(|s| s.cell_data_needs_save())) {
+                delta::recalc_on_open(&next_xml,false)?.context("workbook.xml: invalid calculation properties")?
+            } else { next_xml.into_bytes() };
+            if updated != wb_xml.as_bytes() {
+                crate::patch::append_entry(path, "xl/workbook.xml", &updated)?;
             }
         }
     }
-    must_save!("rich", crate::patch::apply_rich(path, wb));
+    if !can_bypass_umya {
+        must_save!("rich", crate::patch::apply_rich(path, wb));
+    }
     must_save!("page-setup", crate::patch::apply_page_setup(path, wb));
     if !can_bypass_umya {
         let shrink_parts: Vec<(String, Vec<(u32, u32)>, Vec<u32>, Vec<u32>)> = wb
@@ -2829,7 +3321,51 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // 最后一步：外链关系按原文恢复，避免 URL 被归一、TargetMode 被丢
     must_save!("restore-external-rels", crate::notes::restore_external_rels(path, &external_rels));
     crate::patch::commit_stage(path).context("保存收尾补丁落盘失败")?;
-    Ok(())
+    let mut created_charts = std::collections::HashMap::new();
+    if fresh_base {
+        for sheet in wb.sheets.iter().filter(|s| s.source_part.is_none()) {
+            let new_charts: Vec<_> = sheet.charts.iter().enumerate().filter(|(_,ch)| ch.part.is_empty()).collect();
+            for (_, chart) in &new_charts {
+                let mut committed = (*chart).clone();
+                if committed.series.iter().any(|series| !series.val_ref.is_empty()) {
+                    crate::chart_write::refresh_series_from_refs(wb, &sheet.name, &mut committed)?;
+                }
+                crate::chart_write::insert_chart(path, &sheet.name, &committed)?;
+            }
+            if !new_charts.is_empty() {
+                let generated = crate::charts::load_charts(path, &sheet.name)?;
+                anyhow::ensure!(generated.len() == new_charts.len(), "图表写入后的关系数量不一致");
+                for ((i,_), chart) in new_charts.into_iter().zip(generated) {
+                    created_charts.insert((sheet.identity, i), (chart.part, chart.drawing));
+                }
+            }
+        }
+    }
+    if streamed.iter().any(|&s| s) {
+        if let Err(error) = fresh::write(path, wb, &streamed) {
+            if error.chain().any(|e| e.is::<std::io::Error>())
+                || wb.sheets.iter().zip(&streamed).any(|(s,&selected)| selected && fresh::has_dynamic(s)) {
+                // The compatibility writer has no dynamic cell metadata. An
+                // unsuccessful attempt must not downgrade a valid dynamic array.
+                return Err(error);
+            }
+            // Rebuild from the original model. The incomplete shell at path must
+            // never be taken as the source of a second save.
+            let retry = private_workbook_dir()?;
+            let output = retry.path().join(path.file_name().context("缺少保存文件名")?);
+            if let Cow::Owned(book) = input {
+                restore_sheet_flags(book, flags);
+            }
+            let write = save_plain_at(&output, input, base_override, false, flags)
+                .with_context(|| format!("streaming save failed ({error:#}); rebuilding workbook"))?;
+            std::fs::copy(&output,path)?;
+            return Ok(write);
+        }
+    }
+    if !preserved_grids.is_empty() || !omitted_sheets.is_empty() {
+        restore_grids(path,&restore_base,&restored_sheets,base == original_base,preserved_grids)?;
+    }
+    Ok(CellWrite { styles: saved_styles, used_delta: patched, created_charts })
 }
 
 /// 把条件格式写进 xlsx（重写 sheet XML 与 styles.xml 的 dxfs）
@@ -2853,6 +3389,7 @@ fn apply_cf_patch(
                 s.name.clone(),
                 s.arrays
                     .iter()
+                    .filter(|(a,_)| s.get(a.row,a.col).is_some_and(|c| c.formula.is_some()))
                     .map(|(a, r)| crate::arr::ArrayFml {
                         range: *r,
                         anchor: (a.row, a.col),
@@ -2947,7 +3484,7 @@ fn apply_cf_patch(
         .map(|s| s.cf.dxfs.clone())
         .unwrap_or_default();
     let has_dxfs = !dxfs.is_empty();
-    crate::patch::rewrite_zip_where(
+    crate::patch::rewrite_zip_borrowed(
         path,
         |name| {
             per_sheet.contains_key(name)
@@ -2958,8 +3495,9 @@ fn apply_cf_patch(
             if let Some((blocks, dv, freeze, freeze_dirty, af, hidden, f_dirty, page, page_dirty, arrs)) =
                 per_sheet.get(name)
             {
-                if let Ok(xml) = String::from_utf8(buf.clone()) {
-                    let mut x = xml;
+                let touches_rows = (do_filter && *f_dirty) || !arrs.is_empty();
+                return crate::patch::transform_worksheet(name,buf,!touches_rows,|xml| {
+                    let mut x = xml.to_owned();
                     if do_cf {
                         x = crate::patch::insert_cf(&x, blocks);
                     }
@@ -2979,12 +3517,14 @@ fn apply_cf_patch(
                     if !arrs.is_empty() {
                         x = crate::arr::apply_xml(&x, arrs);
                     }
-                    return x.into_bytes();
-                }
+                    Ok(x)
+                });
             }
             if name == "xl/workbook.xml" {
-                if let Ok(xml) = String::from_utf8(buf.clone()) {
-                    let mut x = crate::patch::set_calc_mode(&xml, wb.calc_manual);
+                {
+                    let xml = patch_xml_text(buf,name)?;
+                    let mut x = if crate::patch::calc_manual_xml(&xml) == wb.calc_manual { xml.to_string() }
+                        else { crate::patch::set_calc_mode(&xml, wb.calc_manual) };
                     x = crate::patch::set_calc_iteration(
                         &x,
                         wb.calc_iterate,
@@ -2998,19 +3538,19 @@ fn apply_cf_patch(
                             }
                         }
                     }
-                    return x.into_bytes();
+                    return Ok((x != xml).then(|| x.into_bytes()));
                 }
             }
             if name == "xl/styles.xml" {
                 // 没有 dxfs 就别碰 styles.xml：改写反而会写坏（Excel 直接判损坏）
                 if dxfs.is_empty() {
-                    return buf;
+                    return Ok(None);
                 }
-                if let Ok(xml) = String::from_utf8(buf.clone()) {
-                    return crate::patch::replace_dxfs(&xml, &dxfs).into_bytes();
-                }
+                let xml = patch_xml_text(buf,name)?;
+                let edited = crate::patch::replace_dxfs(&xml,&dxfs);
+                return Ok((edited != xml).then(|| edited.into_bytes()));
             }
-            buf
+            Ok(None)
         },
     )?;
     Ok(())
@@ -3020,6 +3560,60 @@ fn apply_cf_patch(
 mod tests {
     use super::*;
     use crate::model::{Cell, CellRef, Sheet, Value, Workbook};
+
+    #[test]
+    fn verify_worksheet_structure_with_a_valid_zip_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-sheet.xlsx");
+        save(&path,&Workbook::new_blank()).unwrap();
+        let part = crate::patch::sheet_targets(&path).unwrap()["Sheet1"].clone();
+        crate::fixups::write_parts(&path,&[("xl/worksheets/vendor/settings.xml".into(),b"<settings/>".to_vec())]).unwrap();
+        verify_saved_package(&path).unwrap();
+        for xml in ["<worksheet><row></worksheet>","<worksheet/><another/>","<other/>",
+            "<worksheet><row r=1/></worksheet>","<worksheet duplicate='1' duplicate='2'/>"] {
+            crate::fixups::write_parts(&path,&[(part.clone(),xml.as_bytes().to_vec())]).unwrap();
+            assert!(format!("{:#}",verify_saved_package(&path).unwrap_err()).contains(&part));
+        }
+    }
+
+    #[test]
+    fn owned_save_restores_edit_flags_and_keeps_the_workers_sheet_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.xlsx");
+        let mut book = Workbook::new_blank();
+        let sheet = &mut book.sheets[0];
+        sheet.rows.set(1, 32.0);
+        sheet.set(1, 0, Cell { value: Value::Number(7.0), formula: None });
+        sheet.layout_dirty = false;
+        sheet.notes_dirty = true;
+        let before = OriginalSheetFlags::capture(sheet);
+        let storage = book.sheets.as_ptr();
+        let (_, worker) = save_snapshot_with_receipt(&path, book).unwrap();
+        assert_eq!(storage, worker.sheets.as_ptr());
+        assert_eq!(OriginalSheetFlags::capture(&worker.sheets[0]), before);
+        let saved = load(&path).unwrap();
+        assert_eq!(saved.sheets[0].rows.size(1), 32.0);
+        assert_eq!(saved.sheets[0].value(1, 0), Value::Number(7.0));
+    }
+
+    #[test]
+    fn fresh_stream_failure_rebuilds_from_model_in_a_separate_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry.xlsx");
+        let mut wb = Workbook::new_blank();
+        let sheet = &mut wb.sheets[0];
+        for r in 0..16_384 { sheet.set(r,0,Cell { value: Value::Number(f64::from(r)),formula:None }); }
+        sheet.set(0,1,Cell {value:Value::Number(3.),formula:Some("=1+2".into())});
+        let anchor = (CellRef::new(0,1),(0,1,0,1));
+        sheet.arrays.extend([anchor,anchor,(CellRef::new(1,0),(1,0,1,0))]);
+        let before = OriginalSheetFlags::capture(sheet);
+        let (_, returned) = save_snapshot_with_receipt(&path, wb).unwrap();
+        assert_eq!(OriginalSheetFlags::capture(&returned.sheets[0]), before);
+        let saved = load(&path).unwrap();
+        assert_eq!(saved.sheets[0].arrays,vec![anchor]);
+        assert_eq!(saved.sheets[0].value(1,0),Value::Number(1.));
+        assert_eq!(saved.sheets[0].value(16_383,0),Value::Number(16_383.));
+    }
 
     #[test]
     fn save_receipt_does_not_read_sheet_data_but_final_verification_detects_bad_crc() {
@@ -3041,7 +3635,7 @@ mod tests {
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&[byte[0] ^ 0xff]).unwrap();
         drop(file);
-        assert!(package_receipt(&path, &wb).unwrap().sheets[&wb.sheets[0].identity].source_cells.is_some());
+        assert!(package_receipt(&path, &wb, CellWrite::default()).unwrap().sheets[&wb.sheets[0].identity].source_cells.is_some());
         let error = verify_saved_package(&path).unwrap_err();
         assert!(format!("{error:#}").contains(&part));
     }
@@ -3675,14 +4269,203 @@ mod tests {
         crate::patch::append_entry(&base, &part, original.as_bytes()).unwrap();
         let mut loaded = load(&base).unwrap();
         loaded.sheets[0].set(0, 0, Cell { value: Value::Text("new shared string".into()), formula: None });
-        let (slim, omitted) = slim_umya_base(&base, &loaded).unwrap().unwrap();
-        assert_eq!(omitted, ["Large"]);
-        assert!(read_part(&slim, &part).unwrap().len() < 4096);
+        let slim = slim_umya_base(&base, &loaded).unwrap().unwrap();
+        assert_eq!(slim.omitted, ["Large"]);
+        assert!(read_part(&slim.path, &part).unwrap().len() < 4096);
         save_atomic(&copy, &loaded).unwrap();
         assert_eq!(crate::fixups::read_part_file(&copy, &part).unwrap(), original.as_bytes());
         let back = load(&copy).unwrap();
         assert_eq!(back.sheets[1].value(0, 0), wb.sheets[1].value(0, 0));
         assert_eq!(back.sheets[0].value(0, 0), loaded.sheets[0].value(0, 0));
+    }
+
+    #[test]
+    fn metadata_only_save_retains_reused_sst_index_and_package_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.xlsx");
+        let mut wb = Workbook::new_blank();
+        for row in 0..800 {
+            wb.sheets[0].set(row,0,Cell {value:Value::Text("Shared".into()),formula:None});
+        }
+        save_atomic(&path,&wb).unwrap();
+        let part = crate::patch::sheet_targets(&path).unwrap()["Sheet1"].clone();
+        let read = |part: &str| read_zip_text(
+            &mut zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap(),part).unwrap();
+        let original_strings = read(delta::sst::PART);
+        let large = read(&part).replace("</sheetData>", &format!("<!--{}--></sheetData>",
+            "x".repeat(crate::fixups::RAW_SHEET_MIN_BYTES as usize)));
+        crate::patch::append_entry(&path,&part,large.as_bytes()).unwrap();
+        let mut loaded = load(&path).unwrap();
+        let note = crate::notes::Note {r:3,c:2,author:"Reviewer".into(),text:"Review".into()};
+        loaded.sheets[0].notes.insert(CellRef::new(3,2),note.clone());
+        loaded.sheets[0].notes_dirty = true;
+        let slim = slim_umya_base(&path,&loaded).unwrap().unwrap();
+        assert!(slim.grids["Sheet1"].edits.is_none());
+        save_atomic(&path,&loaded).unwrap();
+        let xml = read(&part);
+        assert_eq!(xml.matches("t=\"s\"").count(),800);
+        assert!(!xml.contains("inlineStr"));
+        assert_eq!(read(delta::sst::PART),original_strings);
+        assert!(read("xl/_rels/workbook.xml.rels").contains("/sharedStrings"));
+        assert!(read("[Content_Types].xml").contains("spreadsheetml.sharedStrings+xml"));
+        let check = load(&path).unwrap();
+        assert_eq!(check.sheets[0].value(799,0),Value::Text("Shared".into()));
+        assert_eq!(check.sheets[0].notes.get(&CellRef::new(3,2)),Some(&note));
+    }
+
+    #[test]
+    fn existing_large_grid_and_new_note_survive_metadata_only_dom_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.xlsx");
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(
+            0,
+            0,
+            Cell {
+                value: Value::Number(73.0),
+                formula: None,
+            },
+        );
+        wb.sheets[0].set(
+            1,
+            0,
+            Cell {
+                value: Value::Number(5.0),
+                formula: None,
+            },
+        );
+        wb.sheets[0].set(
+            1,
+            1,
+            Cell {
+                value: Value::Number(10.0),
+                formula: Some("=A2*2".into()),
+            },
+        );
+        wb.sheets[0].set(
+            2,
+            0,
+            Cell {
+                value: Value::Text("Rich text".into()),
+                formula: None,
+            },
+        );
+        // The metadata writer uses index 0 for the new text on another sheet.
+        // The raw-copied sheet and the restored grid still use 0 for the rich SI.
+        wb.sheets.push(Sheet::new("Edited"));
+        wb.sheets.push(Sheet::new("Untouched"));
+        for sheet in &mut wb.sheets[1..] {
+            sheet.set(0,0,Cell {value:Value::Text("Rich text".into()),formula:None});
+        }
+        save_atomic(&path, &wb).unwrap();
+        let part = crate::patch::sheet_targets(&path).unwrap()["Sheet1"].clone();
+        let xml = read_zip_text(
+            &mut zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap(),
+            &part,
+        )
+        .unwrap();
+        let marker = "<?keep data?><v>0073.000</v>";
+        let rich = "<r><rPr><b/></rPr><t xml:space=\"preserve\">Rich </t></r><r><t>text</t></r><rPh sb=\"0\" eb=\"1\"><t>R</t></rPh>";
+        assert!(xml.contains("t=\"s\""));
+        crate::patch::append_entry(&path,"xl/sharedStrings.xml",format!("<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\" uniqueCount=\"1\"><si>{rich}</si></sst>").as_bytes()).unwrap();
+        let raw = xml.replace("<v>73</v>", marker).replace(
+            "</sheetData>",
+            &format!(
+                "<!--{}--></sheetData>",
+                "grid".repeat(crate::fixups::RAW_SHEET_MIN_BYTES as usize / 4)
+            ),
+        );
+        assert!(raw.contains(marker));
+        crate::patch::append_entry(&path, &part, raw.as_bytes()).unwrap();
+        let mut model = load(&path).unwrap();
+        let note = crate::notes::Note {
+            r: 5,
+            c: 7,
+            author: "Review".into(),
+            text: "first note".into(),
+        };
+        model.sheets[0]
+            .notes
+            .insert(CellRef::new(5, 7), note.clone());
+        model.sheets[0].notes_dirty = true;
+        model.sheets[0].set(
+            1,
+            0,
+            Cell {
+                value: Value::Number(6.0),
+                formula: None,
+            },
+        );
+        for row in [0,1] {
+            model.sheets[1].set(row,0,Cell {value:Value::Text("New".into()),formula:None});
+        }
+        crate::formula::recalc_all(&mut model);
+        let s = &model.sheets[0];
+        assert!(s.source_cells.as_ref().is_some_and(|src| src.reusable_grid(
+            &mut zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap(),
+            &part,
+            s
+        )));
+        assert!(
+            !s.layout_dirty
+                && !s.filter_dirty
+                && !s.rich_dirty
+                && !s.merges_dirty
+                && !s.styles_dirty
+                && s.style_edits.is_empty(),
+            "layout={}, filter={}, rich={}, merges={}, styles={}",
+            s.layout_dirty,
+            s.filter_dirty,
+            s.rich_dirty,
+            s.merges_dirty,
+            s.styles_dirty
+        );
+        assert!(
+            crate::patch::entry_size(&path, &part) > crate::fixups::RAW_SHEET_MIN_BYTES,
+            "source size: {}, {}",
+            crate::patch::entry_size(&path, &part),
+            part
+        );
+        let slim = slim_umya_base(&path, &model).unwrap().unwrap();
+        assert!(slim.grids.contains_key("Sheet1"));
+        assert!(read_part(&slim.path, &part).unwrap().len() < 4096);
+        let receipt = save_atomic_with_receipt(&path, &model).unwrap();
+        assert!(!receipt.used_cell_delta);
+        receipt.adopt_document(&mut model, &path, true);
+        let mut reloaded = load(&path).unwrap();
+        assert_eq!(reloaded.sheets[1].value(0,0),Value::Text("New".into()));
+        assert_eq!(reloaded.sheets[1].value(1,0),Value::Text("New".into()));
+        assert_eq!(reloaded.sheets[2].value(0,0),Value::Text("Rich text".into()));
+        let sheet = reloaded.sheets.remove(0);
+        assert_eq!(sheet.value(0, 0), Value::Number(73.0));
+        assert_eq!(sheet.value(1, 1), Value::Number(12.0));
+        assert_eq!(sheet.value(1, 0), Value::Number(6.0));
+        assert_eq!(sheet.notes.get(&CellRef::new(5, 7)), Some(&note));
+        let saved =
+            String::from_utf8(crate::fixups::read_part_file(&path, &part).unwrap()).unwrap();
+        assert!(saved.contains(marker) && saved.contains("gridgrid"));
+        assert!(saved.contains("t=\"s\"") && !saved.contains("inlineStr"));
+        let strings = read_zip_text(&mut zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap(),delta::sst::PART).unwrap();
+        assert!(strings.contains(rich));
+        let doc = roxmltree::Document::parse(&strings).unwrap();
+        assert_eq!(doc.descendants().filter(|n| n.has_tag_name("t") && n.text()==Some("New")).count(),1);
+        assert_eq!(doc.root_element().children().filter(|n| n.has_tag_name("si")).count(),2);
+        assert_eq!(sheet.value(2, 0), Value::Text("Rich text".into()));
+        model.sheets[0].set(
+            1,
+            0,
+            Cell {
+                value: Value::Number(8.0),
+                formula: None,
+            },
+        );
+        crate::formula::recalc_all(&mut model);
+        let second = save_atomic_with_receipt(&path, &model).unwrap();
+        assert!(second.used_cell_delta);
+        assert_eq!(
+            load(&path).unwrap().sheets[0].value(1, 1),
+            Value::Number(16.0)
+        );
     }
 
     #[test]

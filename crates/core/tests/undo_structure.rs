@@ -119,10 +119,14 @@ fn structure_undo_restores_foreign_reference_metadata_and_pending_pivot_specific
     let changed_chart = wb.sheets[1].charts[0].series[0].val_ref.clone();
     assert_ne!(changed_chart, original_chart);
     assert_eq!(wb.pivots_pending[0].1.source, (2, 0, 3, 1));
+    wb.sheets[1].charts[0].title = "later chart title".into();
+    wb.sheets[1].charts[0].series[0].vals = vec![f64::NAN];
     undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
     assert_eq!(format!("{:?}", wb.sheets[1].cf), original_cf);
     assert_eq!(wb.sheets[1].dv[0].f1, "Sheet1!$A$1");
     assert_eq!(wb.sheets[1].charts[0].series[0].val_ref, original_chart);
+    assert_eq!(wb.sheets[1].charts[0].title, "later chart title");
+    assert!(wb.sheets[1].charts[0].series[0].vals[0].is_nan());
     assert!(wb.sheets[1].charts[0].ref_fixes.contains(&(changed_chart, original_chart)));
     assert_eq!(wb.pivots_pending[0].1.source, (0, 0, 1, 1));
     assert!(wb.pivot_shifts.is_empty());
@@ -188,6 +192,192 @@ fn slice_only_undo_does_not_silently_consume_a_workbook_transaction() {
     assert_eq!(undo.depth(), (1, 0));
     undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
     assert_eq!(undo.depth(), (0, 1));
+}
+
+#[test]
+fn structural_history_refuses_untracked_target_writes_in_either_direction() {
+    let mut wb = seed();
+    let mut undo = UndoStack::new();
+    apply(&mut wb, &mut undo, Structural::InsertRows { at: 0, n: 1 });
+    // A received edit or a solver writes directly to the model without a new undo entry.
+    wb.sheets[0].set(9, 7, number(88.0));
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert_eq!(undo.depth(), (1, 0));
+    assert_eq!(wb.sheets[0].value(9, 7), Value::Number(88.0));
+    assert_eq!(wb.sheets[1].get(0, 0).unwrap().formula.as_deref(), Some("=Sheet1!A2"));
+    wb.sheets[0].remove(9, 7);
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_some());
+    wb.sheets[0].set(0, 0, number(92.0));
+    assert!(undo.redo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert_eq!(undo.depth(), (0, 1));
+    assert_eq!(wb.sheets[0].value(0, 0), Value::Number(92.0));
+}
+
+#[test]
+fn metadata_and_foreign_reference_conflicts_leave_all_sheets_and_history_intact() {
+    let mut wb = seed();
+    let mut undo = UndoStack::new();
+    apply(&mut wb, &mut undo, Structural::InsertRows { at: 0, n: 1 });
+    let sheet_id = wb.sheets[1].identity;
+    wb.sheets[1].identity += 9000;
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    wb.sheets[1].identity = sheet_id;
+    wb.sheets[0].rows.set(22, 44.0);
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert_eq!(wb.sheets[0].rows.size(22), 44.0);
+    let default_height = wb.sheets[0].rows.default_size();
+    wb.sheets[0].rows.set(22, default_height);
+    let structural_name = std::mem::replace(&mut wb.names[0].2, "123".into());
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert_eq!(wb.names[0].2, "123");
+    wb.names[0].2 = structural_name;
+    wb.names.insert(0, ("Unrelated".into(), None, "123".into()));
+    wb.sheets[1].set(0, 0, f("=42"));
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert_eq!(wb.sheets[1].get(0, 0).unwrap().formula.as_deref(), Some("=42"));
+    assert_eq!(wb.sheets[0].value(1, 0), Value::Number(10.0));
+    assert_eq!(undo.depth(), (1, 0));
+    wb.sheets[1].set(0, 0, f("=Sheet1!A2"));
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_some());
+    assert_eq!(wb.names[0].2, "123");
+    assert_eq!(wb.names[1].2, "Sheet1!$A$1:$A$2");
+}
+
+#[test]
+fn sequential_undo_redo_survives_save_receipts_recalculation_and_restored_inputs() {
+    let fixture = Fixture::new();
+    let mut wb = seed();
+    wb.sheets[0].set(3, 1, f("=RAND()"));
+    wb.sheets[0].rows.set(3, 48.0);
+    wb.sheets[0].layout_dirty = true;
+    let path = fixture.file();
+    xlsx::save_atomic(&path, &wb).unwrap();
+    let mut wb = xlsx::load(&path).unwrap();
+    let mut undo = UndoStack::new();
+    apply(&mut wb, &mut undo, Structural::InsertRows { at: 1, n: 1 });
+    apply(&mut wb, &mut undo, Structural::InsertCols { at: 1, n: 1 });
+    wb.sheets[0].set(2, 0, number(200.0));
+    wb.sheets[0].set(2, 0, number(20.0));
+    for redo in [false, false, true, true] {
+        formula::recalc_all(&mut wb);
+        wb.dirty = false;
+        xlsx::save_atomic_with_receipt(&path, &wb).unwrap().adopt_document(&mut wb, &path, true);
+        assert_eq!(xlsx::load(&path).unwrap().sheets[0].rows.custom_pairs(), wb.sheets[0].rows.custom_pairs());
+        let step = if redo { undo.redo_workbook(&mut wb, |_, _, _, _| true) }
+            else { undo.undo_workbook(&mut wb, |_, _, _, _| true) };
+        assert!(step.is_some());
+    }
+    assert_eq!(undo.depth(), (2, 0));
+    assert_eq!(wb.sheets[0].value(2, 0), Value::Number(20.0));
+    assert_eq!(wb.sheets[0].get(4, 2).unwrap().formula.as_deref(), Some("=RAND()"));
+}
+
+#[test]
+fn a_literal_override_of_a_dynamic_spill_tail_is_not_treated_as_a_cache() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].set(0, 0, f("=SEQUENCE(2)"));
+    formula::recalc_all(&mut wb);
+    let mut undo = UndoStack::new();
+    apply(&mut wb, &mut undo, Structural::InsertCols { at: 2, n: 1 });
+    assert_eq!(wb.sheets[0].value(1, 0), Value::Number(2.0));
+    wb.sheets[0].set(1, 0, number(2.0));
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert!(!wb.sheets[0].spilled.contains(&CellRef::new(1, 0)));
+    wb.sheets[0].remove(1, 0);
+    formula::recalc_all(&mut wb);
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_some());
+}
+
+#[test]
+fn cse_cache_loaded_from_disk_can_recalculate_between_undo_and_redo() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].set(0, 0, f("=SEQUENCE(2)"));
+    wb.sheets[0].set(1, 0, number(2.0));
+    wb.sheets[0].arrays.push((CellRef::new(0, 0), (0, 0, 1, 0)));
+    let mut undo = UndoStack::new();
+    apply(&mut wb, &mut undo, Structural::InsertCols { at: 1, n: 1 });
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_some());
+    formula::recalc_all(&mut wb);
+    assert!(wb.sheets[0].spilled.contains(&CellRef::new(1, 0)));
+    assert!(undo.redo_workbook(&mut wb, |_, _, _, _| true).is_some());
+}
+
+#[test]
+fn changed_foreign_validation_and_pivot_payloads_are_protected() {
+    let mut wb = seed();
+    wb.sheets[1].dv.push(sheetcore::dv::DataValidation {
+        f1: "Sheet1!$A$1".into(), ..Default::default()
+    });
+    let spec = sheetcore::pivot::PivotSpec {
+        source: (0, 0, 2, 1), row_field: 0, col_field: None, value_field: 1,
+        agg: sheetcore::pivot::Agg::Sum, group: sheetcore::pivot::GroupBy::None, exclude: vec![]
+    };
+    wb.pivots_pending.push((0, spec, Default::default(), (4, 0, 5, 1), "old".into()));
+    let mut undo = UndoStack::new();
+    apply(&mut wb, &mut undo, Structural::InsertRows { at: 0, n: 1 });
+    wb.pivots_pending[0].4 = "new".into();
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert_eq!(wb.pivots_pending[0].4, "new");
+    wb.pivots_pending[0].4 = "old".into();
+    wb.sheets[1].dv[0].error_title = "later edit".into();
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert_eq!(wb.sheets[1].dv[0].error_title, "later edit");
+    assert_eq!(wb.sheets[0].value(1, 0), Value::Number(10.0));
+    assert_eq!(undo.depth(), (1, 0));
+}
+
+#[test]
+fn new_and_rewritten_references_cannot_silently_retarget_across_undo_or_redo() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    wb.sheets[0].set(1, 0, number(99.0));
+    wb.sheets.push(Sheet::new("Report"));
+    let mut undo = UndoStack::new();
+    apply(&mut wb, &mut undo, Structural::InsertRows { at: 0, n: 1 });
+    wb.sheets[1].set(0, 3, f("=Data!A3"));
+    formula::recalc_all(&mut wb);
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert_eq!(wb.sheets[1].value(0, 3), Value::Number(99.0));
+    wb.sheets[1].set(0, 3, f("=Report!A3"));
+    wb.sheets[1].set(4, 3, number(123.0));
+    wb.names.push(("New".into(), None, "Data!A3".into()));
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    wb.names[0].2 = "42".into();
+    wb.sheets[1].dv.push(sheetcore::dv::DataValidation {
+        f1: "Data!A3".into(), ..Default::default()
+    });
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    wb.sheets[1].dv[0].f1 = "42".into();
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_some());
+    assert_eq!(wb.names[0].2, "42");
+    assert_eq!(wb.sheets[1].value(4, 3), Value::Number(123.0));
+    wb.sheets[1].set(0, 3, f("='Data'!A2"));
+    assert!(undo.redo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert_eq!(undo.depth(), (0, 1));
+}
+
+#[test]
+fn new_reference_metadata_uses_the_actual_affected_coordinate_range() {
+    let mut wb = seed();
+    let mut undo = UndoStack::new();
+    apply(&mut wb, &mut undo, Structural::InsertRows { at: 4, n: 1 });
+    let new_link = sheetcore::hyperlinks::Hyperlink { location: "Sheet1!A6".into(), ..Default::default() };
+    wb.sheets[1].hyperlinks.insert((3, 2), new_link);
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    wb.sheets[1].hyperlinks.get_mut(&(3, 2)).unwrap().location = "Sheet1!A1".into();
+    let chart = sheetcore::chart_write::chart_from_selection(&wb.sheets[0], "Sheet1", (6, 0, 8, 1), "new", sheetcore::charts::ChartKind::Column);
+    wb.sheets[1].charts.push(chart);
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    wb.sheets[1].charts.clear();
+    wb.sheets[1].sparklines.push(sheetcore::sparkline::Sparkline {
+        source_sheet: Some("Sheet1".into()), rect: (5, 0, 8, 0), ..Default::default()
+    });
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    wb.sheets[1].sparklines[0].rect = (0, 0, 1, 0);
+    wb.sheets[1].set(3, 0, f("=Sheet1!A1"));
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_some());
+    assert_eq!(wb.sheets[1].sparklines[0].rect, (0, 0, 1, 0));
+    assert_eq!(wb.sheets[1].hyperlinks[&(3, 2)].location, "Sheet1!A1");
 }
 
 #[test]

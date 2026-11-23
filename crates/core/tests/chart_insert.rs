@@ -41,3 +41,17 @@ fn insert_column_chart() {
     assert!(c.series[0].vals.is_empty(), "部门列是文本，没有数值");
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+fn chart_insert_rejects_a_broken_sheet_before_appending_any_parts() {
+    let wb = sheetcore::Workbook::new_blank();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("broken.xlsx");
+    sheetcore::xlsx::save_atomic(&path,&wb).unwrap();
+    let part = sheetcore::patch::sheet_targets(&path).unwrap().remove("Sheet1").unwrap();
+    sheetcore::fixups::write_parts(&path,&[(part,b"<worksheet><sheetData/>".to_vec())]).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let chart = sheetcore::chart_write::chart_from_selection(wb.sheet(0),"Sheet1",(0,0,1,1),"A",sheetcore::charts::ChartKind::Column);
+    assert!(sheetcore::chart_write::insert_chart(&path,"Sheet1",&chart).is_err());
+    assert_eq!(before,std::fs::read(&path).unwrap());
+}

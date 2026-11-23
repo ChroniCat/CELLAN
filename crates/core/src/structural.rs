@@ -18,7 +18,7 @@ pub enum Structural {
 }
 
 impl Structural {
-    fn reference_shift(&self) -> crate::refs::Shift {
+    pub(crate) fn reference_shift(&self) -> crate::refs::Shift {
         use crate::refs::Axis::{Row, Col};
         let (axis, at, n, delete) = match *self {
             Self::InsertRows { at, n } => (Row, at, n, false),
@@ -59,7 +59,7 @@ fn shift_axis(v: u32, at: u32, n: u32, del: bool) -> Option<u32> {
 struct TableRowFill {
     row: u32,
     col: u32,
-    formula: Box<str>,
+    formula: std::sync::Arc<str>,
     style: Option<u16>,
 }
 
@@ -73,7 +73,7 @@ impl Sheet {
         let rewrite = |(key, cell): (crate::model::CellRef, &crate::model::Cell)| {
             let old = cell.formula.as_deref()?;
             let new = crate::refs::rewrite_mapped(old, shift);
-            (new != old).then(|| (key, new.into_boxed_str()))
+            (new != old).then(|| (key, new.into()))
         };
         let changes: Vec<_> = if shift.translate.is_none() && !shift.own_sheet.eq_ignore_ascii_case(&shift.target_sheet) {
             self.foreign_formula_cells(&shift.target_sheet).filter_map(rewrite).collect()
@@ -134,8 +134,8 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.rows.insert_at(*at, *n);
-                self.shift_axis_styles(&shift);
+                self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, *at, *n, false));
+                self.shift_axis_metadata(&shift);
             }
             Structural::DeleteRows { at, n } => {
                 self.merges = self
@@ -150,8 +150,8 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.rows.delete_at(*at, *n);
-                self.shift_axis_styles(&shift);
+                self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, *at, *n, true));
+                self.shift_axis_metadata(&shift);
             }
             Structural::InsertCols { at, n } => {
                 self.merges = self
@@ -169,8 +169,8 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.cols.insert_at(*at, *n);
-                self.shift_axis_styles(&shift);
+                self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, *at, *n, false));
+                self.shift_axis_metadata(&shift);
             }
             Structural::DeleteCols { at, n } => {
                 self.merges = self
@@ -185,8 +185,8 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.cols.delete_at(*at, *n);
-                self.shift_axis_styles(&shift);
+                self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, *at, *n, true));
+                self.shift_axis_metadata(&shift);
             }
         }
         self.merges_dirty = true;
@@ -205,6 +205,7 @@ impl Sheet {
     /// 数组元数据与单元格使用同一坐标变换。旧溢出尾格仍需登记，
     /// 后续重算才能清除它们，而不会把它们误当成用户输入的阻塞项。
     fn shift_array_and_hyperlink_ranges(&mut self, shift: &MappedShift) {
+        if shift.n != 0 { self.coordinates_shifted(); }
         let rows = shift.axis == crate::refs::Axis::Row;
         if shift.n == 0 { return; }
         // 刚从 OOXML 读入、尚未重算时，CSE 尾格还没有 spilled 标记。
@@ -241,7 +242,7 @@ impl Sheet {
                 (r, first)
             };
             Some((anchor, link))
-        }).collect();
+        }).collect::<std::collections::HashMap<_, _>>().into();
         self.arrays = self.arrays.iter().filter_map(|&(anchor, (r1, c1, r2, c2))| {
             if rows {
                 let row = shift.map(anchor.row)?;
@@ -329,10 +330,7 @@ impl Sheet {
             self.hyperlinks.insert((at + dr, c), v);
             self.hyperlinks_dirty = true;
         }
-        for (i, h) in heights.into_iter().enumerate() {
-            let i = i as u32;
-            self.rows.set(at + i, h);
-        }
+        self.rows.set_many(heights.into_iter().enumerate().map(|(i, h)| (at + i as u32, h)));
         for (i, hid) in hidden.into_iter().enumerate() {
             let i = i as u32;
             if hid {
@@ -421,10 +419,7 @@ impl Sheet {
             self.hyperlinks.insert((r, at + dc), v);
             self.hyperlinks_dirty = true;
         }
-        for (i, w) in widths.into_iter().enumerate() {
-            let i = i as u32;
-            self.cols.set(at + i, w);
-        }
+        self.cols.set_many(widths.into_iter().enumerate().map(|(i, w)| (at + i as u32, w)));
         for (i, hid) in hidden.into_iter().enumerate() {
             let i = i as u32;
             if hid {
@@ -491,7 +486,7 @@ impl Sheet {
                     out.push(TableRowFill {
                         row,
                         col,
-                        formula: crate::refs::rewrite(formula, &shift).into_boxed_str(),
+                        formula: crate::refs::rewrite(formula, &shift).into(),
                         style,
                     });
                 }
@@ -558,14 +553,13 @@ impl Sheet {
         self.shift_dv(shift);
         self.shift_sparklines(shift);
         if let Some((r, c)) = self.freeze { self.freeze = Some((shift.map(r).unwrap(), c)); }
-        self.rows.remap_indices(|r| shift.map(r));
-        self.shift_row_visibility(shift);
+        self.layout_dirty |= self.rows.remap_indices(|r| shift.map(r));
         if let Some(f) = &mut self.filter {
             let moved = shift.map_range(f.range.0, f.range.2).unwrap();
             self.filter_dirty |= (f.range.0, f.range.2) != moved;
             (f.range.0, f.range.2) = moved;
         }
-        self.shift_axis_styles(shift);
+        self.shift_axis_metadata(shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }
@@ -595,9 +589,8 @@ impl Sheet {
             let nf = if fr >= at + n { fr - n } else { at.min(fr) };
             self.freeze = Some((nf, fc));
         }
-        self.rows.delete_at(at, n);
-        self.shift_row_visibility(&shift);
-        self.shift_axis_styles(&shift);
+        self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, at, n, true));
+        self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }
@@ -628,8 +621,8 @@ impl Sheet {
                 self.freeze = Some((fr, fc + n));
             }
         }
-        self.cols.insert_at(at, n);
-        self.shift_axis_styles(&shift);
+        self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, at, n, false));
+        self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }
@@ -659,31 +652,33 @@ impl Sheet {
             let nf = if fc >= at + n { fc - n } else { at.min(fc) };
             self.freeze = Some((fr, nf));
         }
-        self.cols.delete_at(at, n);
-        self.shift_axis_styles(&shift);
+        self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, at, n, true));
+        self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }
 
-    fn shift_row_visibility(&mut self, shift: &MappedShift) {
-        // SUBTOTAL reads the row visibility sets. They must move with the row's
-        // height or it would omit an adjacent visible record after insertion.
-        for hidden in [&mut self.hidden_rows, &mut self.hidden_rows_user] {
-            if hidden.is_empty() { continue; }
-            *hidden = hidden.iter().filter_map(|&row| shift.map(row)).collect::<HashSet<_>>().into();
-            self.layout_dirty = true;
-        }
-        if !self.row_levels.is_empty() {
-            self.row_levels = std::mem::take(&mut self.row_levels).into_iter()
-                .filter_map(|(r, level)| Some((shift.map(r)?, level))).collect();
-            self.layout_dirty = true;
-        }
-    }
-
-    fn shift_axis_styles(&mut self, shift: &MappedShift) {
+    fn shift_axis_metadata(&mut self, shift: &MappedShift) {
         let rows = shift.axis == crate::refs::Axis::Row;
-        if shift.n == 0 {
-            return;
+        if shift.n == 0 { return; }
+        crate::scenarios::shift_references(self, shift);
+        let mut move_hidden = |hidden: &mut crate::layout::HiddenIndices| {
+            if !hidden.is_empty() {
+                *hidden = hidden.iter().filter_map(|&pos| shift.map(pos)).collect::<HashSet<_>>().into();
+                self.layout_dirty = true;
+            }
+        };
+        if rows {
+            move_hidden(&mut self.hidden_rows);
+            move_hidden(&mut self.hidden_rows_user);
+        } else {
+            move_hidden(&mut self.hidden_cols);
+        }
+        let levels = if rows { &mut self.row_levels } else { &mut self.col_levels };
+        if !levels.is_empty() {
+            *levels = std::mem::take(levels).into_iter()
+                .filter_map(|(pos, level)| Some((shift.map(pos)?, level))).collect();
+            self.layout_dirty = true;
         }
         let map = if rows { &mut self.row_styles } else { &mut self.col_styles };
         if map.is_empty() {
@@ -697,10 +692,10 @@ impl Sheet {
             }
         }
         if rows {
-            self.row_styles = out;
+            self.row_styles = out.into();
             self.row_styles_dirty = true;
         } else {
-            self.col_styles = out;
+            self.col_styles = out.into();
             self.col_styles_dirty = true;
         }
         self.styles_dirty = true;
@@ -724,7 +719,7 @@ impl Sheet {
                 out.insert(key, v);
             }
         }
-        self.notes = out;
+        self.notes = out.into();
     }
 
     /// 迷你图跟着行列结构走：锚点格位移，同表的数据区一起位移；
