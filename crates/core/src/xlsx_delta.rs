@@ -35,8 +35,8 @@ pub(crate) struct SourceCells {
     pub(super) col_styles: crate::model::CellMetadata<u32,u16>,
     pub(super) rich: crate::model::CellMetadata<(u32, u32), Vec<crate::richtext::RichRun>>,
     arrays: Arc<Vec<(CellRef, Rect)>>,
-    spill_shapes: Arc<HashMap<CellRef, (u32, u32)>>,
-    spilled: Arc<HashSet<CellRef>>,
+    spill_shapes: crate::model::CellMetadata<CellRef, (u32, u32)>,
+    spilled: crate::model::CellSet<CellRef>,
 }
 
 type Rect = (u32, u32, u32, u32);
@@ -311,8 +311,8 @@ impl SourceCells {
         self.styles == sheet.styles
             && self.rich == sheet.rich
             && self.arrays.as_ref() == &sheet.arrays
-            && self.spill_shapes.as_ref() == &sheet.spill_shapes
-            && self.spilled.as_ref() == &sheet.spilled
+            && self.spill_shapes == sheet.spill_shapes
+            && self.spilled == sheet.spilled
             && signature(zip, part) == Some(self.signature)
             && signature(zip, "xl/styles.xml") == self.style_part
             && signature(zip, "xl/sharedStrings.xml") == self.strings
@@ -399,8 +399,8 @@ impl SourceCells {
             col_styles: sheet.col_styles.clone(),
             rich: sheet.rich.clone(),
             arrays: Arc::new(sheet.arrays.clone()),
-            spill_shapes: Arc::new(sheet.spill_shapes.clone()),
-            spilled: Arc::new(sheet.spilled.clone()),
+            spill_shapes: sheet.spill_shapes.clone(),
+            spilled: sheet.spilled.clone(),
         })
     }
 }

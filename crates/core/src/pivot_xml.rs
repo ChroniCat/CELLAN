@@ -55,7 +55,20 @@ pub fn attach(
     out_rect: (u32, u32, u32, u32),
     value_label: &str,
 ) -> Result<u32> {
-    attach_impl(path, sheet_name, spec, res, out_rect, value_label, "sheetcore")
+    attach_impl(path, None, sheet_name, spec, res, out_rect, value_label, "sheetcore")
+}
+
+/// 直接使用内存 `&Workbook` 追加透视表部件（省去二次 `xlsx::load(path)` 整包解压解析！）
+pub fn attach_wb(
+    path: &Path,
+    wb: &crate::model::Workbook,
+    sheet_name: &str,
+    spec: &PivotSpec,
+    res: &PivotResult,
+    out_rect: (u32, u32, u32, u32),
+    value_label: &str,
+) -> Result<u32> {
+    attach_impl(path, Some(wb), sheet_name, spec, res, out_rect, value_label, "sheetcore")
 }
 
 /// Mark attachments owned by one live workbook session so a later save can
@@ -64,12 +77,32 @@ pub fn attach_for_session(
     path: &Path, sheet_name: &str, spec: &PivotSpec, res: &PivotResult,
     out_rect: (u32, u32, u32, u32), value_label: &str, session: &str,
 ) -> Result<u32> {
-    attach_impl(path, sheet_name, spec, res, out_rect, value_label, &format!("sheetcore:{session}"))
+    attach_impl(path, None, sheet_name, spec, res, out_rect, value_label, &format!("sheetcore:{session}"))
+}
+
+/// 直接使用内存 `&Workbook` 附挂当前会话的透视表部件（零二次读盘！）
+pub fn attach_for_session_wb(
+    path: &Path,
+    wb: &crate::model::Workbook,
+    sheet_name: &str,
+    spec: &PivotSpec,
+    res: &PivotResult,
+    out_rect: (u32, u32, u32, u32),
+    value_label: &str,
+    session: &str,
+) -> Result<u32> {
+    attach_impl(path, Some(wb), sheet_name, spec, res, out_rect, value_label, &format!("sheetcore:{session}"))
 }
 
 fn attach_impl(
-    path: &Path, sheet_name: &str, spec: &PivotSpec, res: &PivotResult,
-    out_rect: (u32, u32, u32, u32), value_label: &str, refreshed_by: &str,
+    path: &Path,
+    wb: Option<&crate::model::Workbook>,
+    sheet_name: &str,
+    spec: &PivotSpec,
+    res: &PivotResult,
+    out_rect: (u32, u32, u32, u32),
+    value_label: &str,
+    refreshed_by: &str,
 ) -> Result<u32> {
     let valid_rect = |(r1, c1, r2, c2)| r1 <= r2 && c1 <= c2 && r2 < 1_048_576 && c2 < 16_384;
     ensure!(valid_rect(spec.source), "透视表源区域无效");
@@ -77,25 +110,18 @@ fn attach_impl(
     let valid_field = |col| col >= spec.source.1 && col <= spec.source.3;
     ensure!(valid_field(spec.row_field) && valid_field(spec.value_field)
         && spec.col_field.is_none_or(valid_field), "透视表字段超出源区域");
-    // Resolve and validate every existing part before touching the ZIP. IDs,
-    // part suffixes and relationship IDs have separate collision domains.
     let plan = AttachmentPlan::read(path, sheet_name)?;
     let cache_id = plan.cache_id;
     let table_idx = plan.table_idx;
-    let src = format!(
-        "{}{}:{}{}",
-        col_name(spec.source.1),
-        spec.source.0 + 1,
-        col_name(spec.source.3),
-        spec.source.2 + 1
-    );
-    let n_fields = (spec.source.3 - spec.source.1 + 1) as usize;
-    let headers: Vec<String> = res.headers.clone();
 
-    // ---------- 缓存与透视表定义（pivot_parts.rs 负责三份 XML 的一致性）----------
-    let (def, records, def_table) = crate::pivot_parts::build(
-        path, sheet_name, spec, res, out_rect, value_label, cache_id, &plan.table_name, refreshed_by,
-    )?;
+    let (def, records, def_table) = match wb {
+        Some(wb) => crate::pivot_parts::build_wb(
+            wb, sheet_name, spec, res, out_rect, value_label, cache_id, &plan.table_name, refreshed_by,
+        )?,
+        None => crate::pivot_parts::build(
+            path, sheet_name, spec, res, out_rect, value_label, cache_id, &plan.table_name, refreshed_by,
+        )?,
+    };
 
     write_parts(path, &plan, cache_id, table_idx, def, records, def_table)
 }
@@ -456,6 +482,31 @@ pub fn attach2_for_session(
     out_rect: (u32, u32, u32, u32),
     session: &str,
 ) -> Result<u32> {
+    attach2_impl(path, None, sheet_name, spec, grid, out_rect, session)
+}
+
+/// 直接使用内存 `&Workbook` 附挂多字段透视部件（零二次读盘！）
+pub fn attach2_for_session_wb(
+    path: &Path,
+    wb: &crate::model::Workbook,
+    sheet_name: &str,
+    spec: &crate::pivot_multi::PivotSpec2,
+    grid: &crate::pivot_multi::PivotGrid,
+    out_rect: (u32, u32, u32, u32),
+    session: &str,
+) -> Result<u32> {
+    attach2_impl(path, Some(wb), sheet_name, spec, grid, out_rect, session)
+}
+
+fn attach2_impl(
+    path: &Path,
+    wb: Option<&crate::model::Workbook>,
+    sheet_name: &str,
+    spec: &crate::pivot_multi::PivotSpec2,
+    grid: &crate::pivot_multi::PivotGrid,
+    out_rect: (u32, u32, u32, u32),
+    session: &str,
+) -> Result<u32> {
     let (r1, c1, r2, c2) = spec.source;
     ensure!(r1 <= r2 && c1 <= c2, "透视表源区域无效");
     let (or1, oc1, or2, oc2) = out_rect;
@@ -463,16 +514,29 @@ pub fn attach2_for_session(
     let plan = AttachmentPlan::read(path, sheet_name)?;
     let cache_id = plan.cache_id;
     let table_idx = plan.table_idx;
-    let (def, records, def_table) = crate::pivot_parts2::build(
-        path,
-        sheet_name,
-        spec,
-        grid,
-        out_rect,
-        cache_id,
-        &plan.table_name,
-        &format!("sheetcore:{session}"),
-    )?;
+    let refreshed_by = format!("sheetcore:{session}");
+    let (def, records, def_table) = match wb {
+        Some(wb) => crate::pivot_parts2::build_wb(
+            wb,
+            sheet_name,
+            spec,
+            grid,
+            out_rect,
+            cache_id,
+            &plan.table_name,
+            &refreshed_by,
+        )?,
+        None => crate::pivot_parts2::build(
+            path,
+            sheet_name,
+            spec,
+            grid,
+            out_rect,
+            cache_id,
+            &plan.table_name,
+            &refreshed_by,
+        )?,
+    };
     write_parts(path, &plan, cache_id, table_idx, def, records, def_table)
 }
 

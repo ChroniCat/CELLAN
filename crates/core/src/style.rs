@@ -240,7 +240,7 @@ impl CellStyle {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct StyleTable {
+struct StyleTableInner {
     styles: Vec<CellStyle>,
     index: HashMap<u64, u16>,
     /// 与 styles 同长：每个样式号对应的主题色引用（读盘时记，保存时按它写回）
@@ -251,10 +251,19 @@ pub struct StyleTable {
     quotes: Vec<bool>,
 }
 
+/// Copy-on-write style table: cloning a `Workbook` or snapshot only bumps an `Arc`.
+#[derive(Clone, Debug, Default)]
+pub struct StyleTable(std::sync::Arc<StyleTableInner>);
+
 impl StyleTable {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// 工作簿里实际出现的字体名（去重前的原始顺序），供 UI 按需加载系统字体。
     pub fn font_names(&self) -> impl Iterator<Item = &str> {
-        self.styles
+        self.0
+            .styles
             .iter()
             .map(|s| s.font.as_str())
             .filter(|f| !f.trim().is_empty())
@@ -298,79 +307,87 @@ impl StyleTable {
     }
 
     pub(crate) fn find_style(&self, style: &CellStyle) -> Option<u16> {
-        self.index.get(&hash_of(style)).copied().filter(|&id| self.get(id) == style)
+        self.0.index.get(&hash_of(style)).copied().filter(|&id| self.get(id) == style)
     }
 
     pub fn intern(&mut self, s: CellStyle) -> u16 {
         let k = hash_of(&s);
-        if let Some(id) = self.index.get(&k) {
-            if self.styles[*id as usize] == s {
-                return *id;
+        if let Some(&id) = self.0.index.get(&k) {
+            if self.0.styles[id as usize] == s {
+                return id;
             }
         }
-        let id = self.styles.len() as u16;
-        self.styles.push(s);
-        self.themes.push(crate::style_theme::XfTheme::default());
-        self.patterns.push(None);
-        self.quotes.push(false);
-        self.index.insert(k, id);
+        let inner = std::sync::Arc::make_mut(&mut self.0);
+        let id = inner.styles.len() as u16;
+        inner.styles.push(s);
+        inner.themes.push(crate::style_theme::XfTheme::default());
+        inner.patterns.push(None);
+        inner.quotes.push(false);
+        inner.index.insert(k, id);
         id
     }
 
     /// 记录样式号的主题色引用（不参与去重键：主题不同的两格颜色已由解析结果区分）
     pub fn set_theme(&mut self, id: u16, t: crate::style_theme::XfTheme) {
-        if let Some(slot) = self.themes.get_mut(id as usize) {
+        if self.0.themes.get(id as usize).copied() == Some(t) {
+            return;
+        }
+        if let Some(slot) = std::sync::Arc::make_mut(&mut self.0).themes.get_mut(id as usize) {
             *slot = t;
         }
     }
 
     pub fn theme_of(&self, id: u16) -> crate::style_theme::XfTheme {
-        self.themes.get(id as usize).copied().unwrap_or_default()
+        self.0.themes.get(id as usize).copied().unwrap_or_default()
     }
 
     pub fn set_pattern(&mut self, id: u16, p: crate::style_ext::FillPattern) {
-        if let Some(slot) = self.patterns.get_mut(id as usize) {
+        if let Some(slot) = std::sync::Arc::make_mut(&mut self.0).patterns.get_mut(id as usize) {
             *slot = Some(p);
         }
     }
 
     pub fn pattern_of(&self, id: u16) -> Option<&crate::style_ext::FillPattern> {
-        self.patterns.get(id as usize).and_then(|p| p.as_ref())
+        self.0.patterns.get(id as usize).and_then(|p| p.as_ref())
     }
 
     pub fn set_diag(&mut self, id: u16, d: crate::style_ext::DiagBorder) {
-        if let Some(style) = self.styles.get_mut(id as usize) {
+        let inner = std::sync::Arc::make_mut(&mut self.0);
+        if let Some(style) = inner.styles.get_mut(id as usize) {
             let old = hash_of(style);
-            if self.index.get(&old) == Some(&id) { self.index.remove(&old); }
+            if inner.index.get(&old) == Some(&id) { inner.index.remove(&old); }
             style.diagonal = Some(d);
-            self.index.insert(hash_of(style), id);
+            inner.index.insert(hash_of(style), id);
         }
     }
 
     pub fn set_quote(&mut self, id: u16, q: bool) {
-        if let Some(slot) = self.quotes.get_mut(id as usize) {
+        if self.0.quotes.get(id as usize).copied() == Some(q) {
+            return;
+        }
+        if let Some(slot) = std::sync::Arc::make_mut(&mut self.0).quotes.get_mut(id as usize) {
             *slot = q;
         }
     }
 
     pub fn quote_of(&self, id: u16) -> bool {
-        self.quotes.get(id as usize).copied().unwrap_or(false)
+        self.0.quotes.get(id as usize).copied().unwrap_or(false)
     }
 
     pub fn diag_of(&self, id: u16) -> Option<&crate::style_ext::DiagBorder> {
-        self.styles.get(id as usize)?.diagonal.as_ref()
+        self.0.styles.get(id as usize)?.diagonal.as_ref()
     }
 
     pub fn get(&self, id: u16) -> &CellStyle {
-        self.styles.get(id as usize).unwrap_or_else(|| &self.styles[0])
+        self.0.styles.get(id as usize).unwrap_or_else(|| &self.0.styles[0])
     }
 
     pub fn len(&self) -> usize {
-        self.styles.len()
+        self.0.styles.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.styles.is_empty()
+        self.0.styles.is_empty()
     }
 }
 

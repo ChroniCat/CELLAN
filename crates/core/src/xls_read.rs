@@ -398,7 +398,7 @@ pub fn load(path: &Path) -> Result<Workbook> {
         for (r, c, cell) in sd.cells {
             sh.set(r, c, cell);
         }
-        sh.merges = sd.merges;
+        sh.merges = sd.merges.into();
         sh.protection = sd.protection;
         wb.sheets.push(sh);
     }

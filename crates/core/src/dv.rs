@@ -233,6 +233,52 @@ pub fn in_ranges(ranges: &[(u32, u32, u32, u32)], r: u32, c: u32) -> bool {
     ranges.iter().any(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
 }
 
+/// Sorted row-interval index for `O(log M)` `DataValidation` lookup on sheets with many rules.
+#[derive(Clone, Debug, Default)]
+pub struct DvIndex {
+    ranges: Vec<(u32, u32, u32, u32, usize)>,
+    ends: Vec<u32>,
+}
+
+impl DvIndex {
+    pub fn new(list: &[DataValidation]) -> Self {
+        let mut ranges: Vec<(u32, u32, u32, u32, usize)> = list
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, dv)| {
+                dv.ranges
+                    .iter()
+                    .filter_map(move |&(r1, c1, r2, c2)| (r1 <= r2 && c1 <= c2).then_some((r1, r2, c1, c2, idx)))
+            })
+            .collect();
+        ranges.sort_unstable_by_key(|&(r1, r2, _, _, idx)| (r1, idx, r2));
+        let mut max_end = 0u32;
+        let ends = ranges
+            .iter()
+            .map(|&(_, r2, _, _, _)| {
+                max_end = max_end.max(r2);
+                max_end
+            })
+            .collect();
+        Self { ranges, ends }
+    }
+
+    pub fn find<'a>(&self, list: &'a [DataValidation], r: u32, c: u32) -> Option<&'a DataValidation> {
+        if self.ranges.is_empty() {
+            return None;
+        }
+        let start = self.ends.partition_point(|&end| end < r);
+        let end = self.ranges.partition_point(|&(r1, _, _, _, _)| r1 <= r);
+        let mut best: Option<usize> = None;
+        for &(_, r2, c1, c2, idx) in &self.ranges[start..end] {
+            if r <= r2 && c >= c1 && c <= c2 {
+                best = Some(best.map_or(idx, |cur| cur.min(idx)));
+            }
+        }
+        best.and_then(|idx| list.get(idx))
+    }
+}
+
 /// 找到作用于该格的验证规则
 pub fn find<'a>(list: &'a [DataValidation], r: u32, c: u32) -> Option<&'a DataValidation> {
     list.iter().find(|d| in_ranges(&d.ranges, r, c))
@@ -910,7 +956,80 @@ where
     validate_impl(dv, value, sheet, r, c, None, formula_eval)
 }
 
-/// 带工作簿上下文的校验入口：列表来源可解析为命名区域或跨表区域。
+type CachedRectSetKey = (u64, crate::store::CellVersion, (u32, u32, u32, u32));
+
+fn cached_list_set_wb(
+    wb: &crate::model::Workbook,
+    si: usize,
+    dv: &DataValidation,
+    r: u32,
+    c: u32,
+) -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+    let expr = list_expression(wb, si, dv);
+    let (ar, ac) = range_anchor(dv, r, c);
+    let shifted = crate::cf::shift_formula(expr, r - ar, c - ac);
+    if shifted.is_empty() {
+        return Some(Default::default());
+    }
+    if let Some(items) = inline_items(&shifted) {
+        thread_local! {
+            static INLINE_CACHE: std::cell::RefCell<Vec<(String, std::sync::Arc<std::collections::HashSet<String>>)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        return INLINE_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if let Some(pos) = cache.iter().position(|(k, _)| k == &shifted) {
+                let arc = cache[pos].1.clone();
+                if pos != 0 {
+                    cache.swap(0, pos);
+                }
+                return Some(arc);
+            }
+            let set: std::sync::Arc<std::collections::HashSet<String>> =
+                std::sync::Arc::new(items.into_iter().collect());
+            if cache.len() >= 8 {
+                cache.pop();
+            }
+            cache.insert(0, (shifted, set.clone()));
+            Some(set)
+        });
+    }
+    let (sheet_name, range) = split_sheet_prefix(&shifted);
+    if let Some(rect) = parse_rect(&range) {
+        let sheet = match sheet_name.as_deref() {
+            Some(n) if !n.is_empty() => wb
+                .sheets
+                .iter()
+                .find(|s| s.name == n || s.name.eq_ignore_ascii_case(n))?,
+            _ => wb.sheet(si),
+        };
+        let key: CachedRectSetKey = (sheet.identity, sheet.cell_version().clone(), rect);
+        thread_local! {
+            static RECT_CACHE: std::cell::RefCell<Vec<(CachedRectSetKey, std::sync::Arc<std::collections::HashSet<String>>)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        return RECT_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
+                let arc = cache[pos].1.clone();
+                if pos != 0 {
+                    cache.swap(0, pos);
+                }
+                return Some(arc);
+            }
+            let set: std::sync::Arc<std::collections::HashSet<String>> =
+                std::sync::Arc::new(collect_rect(sheet, rect).into_iter().collect());
+            if cache.len() >= 8 {
+                cache.pop();
+            }
+            cache.insert(0, (key, set.clone()));
+            Some(set)
+        });
+    }
+    dynamic_source(wb, si, &shifted).map(|v| std::sync::Arc::new(v.into_iter().collect()))
+}
+
+/// 带工作簿上下文的校验入口：列表来源可解析为命名区域或跨表区域，并复用版本安全的候选集合缓存。
 pub fn validate_wb<F>(
     wb: &crate::model::Workbook,
     si: usize,
@@ -924,11 +1043,21 @@ where
     F: FnMut(&str, u32, u32) -> crate::formula::FValue,
 {
     if dv.kind == DvKind::List {
-        let items = list_items_wb(wb, si, dv, r, c).unwrap_or_default();
-        validate_impl(dv, value, wb.sheet(si), r, c, Some(&items), formula_eval)
-    } else {
-        validate_impl(dv, value, wb.sheet(si), r, c, None, formula_eval)
+        if matches!(value, Value::Empty) {
+            return dv.allow_blank;
+        }
+        let Some(set) = cached_list_set_wb(wb, si, dv, r, c) else {
+            return false;
+        };
+        if set.is_empty() {
+            return false;
+        }
+        return match value {
+            Value::Text(s) => set.contains(s.as_ref()),
+            _ => set.contains(&value.display()),
+        };
     }
+    validate_impl(dv, value, wb.sheet(si), r, c, None, formula_eval)
 }
 
 fn validate_impl<F>(

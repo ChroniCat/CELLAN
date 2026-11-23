@@ -99,10 +99,26 @@ pub(crate) fn sort_order(
         .into());
     }
     validate_sort_region(sheet, region)?;
+    let mut lower_cache: HashMap<usize, String> = HashMap::new();
     let mut lines: Vec<_> = (first..=last)
         .map(|line| {
             let (r, c) = if horizontal { (key, line) } else { (line, key) };
-            (sheet.get(r, c).and_then(|cell| key_of(&cell.value)), line)
+            let v = sheet.value_ref(r, c);
+            let k = match v {
+                Value::Number(n) => Some((0u8, *n, String::new())),
+                Value::Text(t) => {
+                    let ptr = std::sync::Arc::as_ptr(t) as *const () as usize;
+                    let low = lower_cache
+                        .entry(ptr)
+                        .or_insert_with(|| t.to_lowercase())
+                        .clone();
+                    Some((1u8, 0.0, low))
+                }
+                Value::Bool(b) => Some((2u8, if *b { 1.0 } else { 0.0 }, String::new())),
+                Value::Error(e) => Some((3u8, 0.0, e.text().to_string())),
+                Value::Empty => None,
+            };
+            (k, line)
         })
         .collect();
     lines.sort_by(|a, b| match (&a.0, &b.0) {
@@ -191,31 +207,34 @@ pub fn sort_region(sheet: &mut Sheet, region: (u32, u32, u32, u32), col: u32, as
     }
 }
 
-/// 以 (r, c) 为中心找出连续的数据区域（Excel 的「当前区域」）
+/// 以 (r, c) 为中心找出连续的数据区域（Excel 的「当前区域」）。
+/// 使用 `Store` 页级 `row_mask` 与 `col_nonempty` 位图检测空行/空列，跳过百万空行无需逐格查询。
 pub fn current_region(sheet: &Sheet, r: u32, c: u32) -> (u32, u32, u32, u32) {
-    let (rr2, cc2) = sheet
-        .used_bounds()
-        .map(|(_, _, r2, c2)| (r2 + 1, c2 + 1))
-        .unwrap_or((r + 1, c + 1));
-    let rows = rr2.max(r + 1);
-    let cols = cc2.max(c + 1);
-    let is_blank_row = |rr: u32| (0..cols).all(|cc| sheet.get(rr, cc).is_none());
-    let is_blank_col = |cc: u32| (0..rows).all(|rr| sheet.get(rr, cc).is_none());
+    let Some((ur1, uc1, ur2, uc2)) = sheet.used_bounds() else {
+        return (r, c, r, c);
+    };
+    let min_r = ur1.min(r);
+    let max_r = ur2.max(r);
+    let min_c = uc1.min(c);
+    let max_c = uc2.max(c);
+    let cells = sheet.cells();
+    let is_blank_row = |rr: u32| !cells.row_has_any_in(rr, min_c, max_c);
+    let is_blank_col = |cc: u32| !cells.col_has_any_in(cc, min_r, max_r);
 
     let mut r1 = r;
-    while r1 > 0 && !is_blank_row(r1 - 1) {
+    while r1 > min_r && !is_blank_row(r1 - 1) {
         r1 -= 1;
     }
     let mut r2 = r;
-    while r2 + 1 < rows && !is_blank_row(r2 + 1) {
+    while r2 < max_r && !is_blank_row(r2 + 1) {
         r2 += 1;
     }
     let mut c1 = c;
-    while c1 > 0 && !is_blank_col(c1 - 1) {
+    while c1 > min_c && !is_blank_col(c1 - 1) {
         c1 -= 1;
     }
     let mut c2 = c;
-    while c2 + 1 < cols && !is_blank_col(c2 + 1) {
+    while c2 < max_c && !is_blank_col(c2 + 1) {
         c2 += 1;
     }
     (r1, c1, r2, c2)
@@ -379,18 +398,273 @@ impl Criterion {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Filter {
     pub range: (u32, u32, u32, u32),
-    /// 列号 → 允许出现文本值；没有条目的列不过滤
-    pub allows: HashMap<u32, HashSet<String>>,
+    /// 列号 → 允许出现文本值；没有条目的列不过滤（CoW 共享，避免 Sheet 克隆深拷几万唯一值）
+    pub allows: crate::model::CellMetadata<u32, HashSet<String>>,
     /// 列号 → 条件（文本筛选/数字筛选）；和 allows 是「与」关系
     pub criteria: HashMap<u32, Criterion>,
+}
+
+#[inline]
+fn ascii_contains_ci(hay: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if hay.len() < needle_lower.len() {
+        return false;
+    }
+    let b0 = needle_lower[0];
+    let end = hay.len() - needle_lower.len();
+    for i in 0..=end {
+        if hay[i].to_ascii_lowercase() == b0
+            && hay[i..i + needle_lower.len()].eq_ignore_ascii_case(needle_lower)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+struct CompiledCriterion {
+    op: CmpOp,
+    num1: Option<f64>,
+    num2: Option<f64>,
+    lower1: String,
+    lower2: String,
+    ascii_only: bool,
+}
+
+impl CompiledCriterion {
+    fn new(c: &Criterion) -> Self {
+        let num1 = if c.op.is_text() {
+            None
+        } else {
+            c.val.trim().parse::<f64>().ok()
+        };
+        let num2 = if c.op == CmpOp::Between {
+            c.val2
+                .as_deref()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .or(num1)
+        } else {
+            None
+        };
+        let lower1 = c.val.to_lowercase();
+        let lower2 = c.val2.as_deref().unwrap_or("").to_lowercase();
+        let ascii_only = lower1.is_ascii() && lower2.is_ascii();
+        Self {
+            op: c.op,
+            num1,
+            num2,
+            lower1,
+            lower2,
+            ascii_only,
+        }
+    }
+
+    #[inline]
+    fn matches_num(&self, a: f64, b: f64) -> bool {
+        match self.op {
+            CmpOp::Eq => a == b,
+            CmpOp::Ne => a != b,
+            CmpOp::Gt => a > b,
+            CmpOp::Ge => a >= b,
+            CmpOp::Lt => a < b,
+            CmpOp::Le => a <= b,
+            CmpOp::Between => {
+                let hi = self.num2.unwrap_or(b);
+                a >= b.min(hi) && a <= b.max(hi)
+            }
+            _ => true,
+        }
+    }
+
+    fn matches_str(&self, text: &str) -> bool {
+        if self.op.is_text() {
+            if self.ascii_only && text.is_ascii() {
+                let tb = text.as_bytes();
+                let nb = self.lower1.as_bytes();
+                return match self.op {
+                    CmpOp::Contains => ascii_contains_ci(tb, nb),
+                    CmpOp::NotContains => !ascii_contains_ci(tb, nb),
+                    CmpOp::Begins => tb.len() >= nb.len() && tb[..nb.len()].eq_ignore_ascii_case(nb),
+                    CmpOp::Ends => {
+                        tb.len() >= nb.len() && tb[tb.len() - nb.len()..].eq_ignore_ascii_case(nb)
+                    }
+                    _ => unreachable!(),
+                };
+            }
+            let low = text.to_lowercase();
+            return match self.op {
+                CmpOp::Contains => low.contains(&self.lower1),
+                CmpOp::NotContains => !low.contains(&self.lower1),
+                CmpOp::Begins => low.starts_with(&self.lower1),
+                CmpOp::Ends => low.ends_with(&self.lower1),
+                _ => unreachable!(),
+            };
+        }
+        if let Some(b) = self.num1 {
+            let trimmed = text.trim();
+            if trimmed
+                .as_bytes()
+                .first()
+                .is_some_and(|ch| ch.is_ascii_digit() || matches!(ch, b'+' | b'-' | b'.' | b'i' | b'I' | b'n' | b'N'))
+                && let Ok(a) = trimmed.parse::<f64>()
+            {
+                return self.matches_num(a, b);
+            }
+        }
+        let t = text.to_lowercase();
+        let v = &self.lower1;
+        match self.op {
+            CmpOp::Eq => &t == v,
+            CmpOp::Ne => &t != v,
+            CmpOp::Gt => &t > v,
+            CmpOp::Ge => &t >= v,
+            CmpOp::Lt => &t < v,
+            CmpOp::Le => &t <= v,
+            CmpOp::Between => {
+                let hi = &self.lower2;
+                let (lo, hi) = if v <= hi { (v, hi) } else { (hi, v) };
+                &t >= lo && &t <= hi
+            }
+            _ => true,
+        }
+    }
+
+    #[inline]
+    fn matches_value(&self, v: &Value) -> bool {
+        match v {
+            Value::Number(n) if !self.op.is_text() => {
+                if let Some(b) = self.num1 {
+                    self.matches_num(*n, b)
+                } else {
+                    self.matches_str(&v.display())
+                }
+            }
+            Value::Text(t) => self.matches_str(t),
+            Value::Empty => self.matches_str(""),
+            Value::Bool(b) => self.matches_str(if *b { "TRUE" } else { "FALSE" }),
+            Value::Error(e) => self.matches_str(e.text()),
+            Value::Number(_) => self.matches_str(&v.display()),
+        }
+    }
 }
 
 impl Filter {
     pub fn new(r1: u32, c1: u32, r2: u32, c2: u32) -> Self {
         Self {
             range: (r1, c1, r2, c2),
-            allows: HashMap::new(),
+            allows: Default::default(),
             criteria: HashMap::new(),
+        }
+    }
+
+    /// Compute hidden rows directly as coalesced intervals (`HiddenIndices`),
+    /// matching native `&Value` without per-cell `display() -> parse::<f64>()` formatting.
+    pub fn hidden_row_intervals(&self, sheet: &Sheet) -> crate::layout::HiddenIndices {
+        let (r1, c1, mut r2, c2) = self.range;
+        if (self.allows.is_empty() && self.criteria.is_empty()) || r1 >= r2 {
+            return crate::layout::HiddenIndices::default();
+        }
+        let used_max_r = sheet.used_bounds().map(|(_, _, ur2, _)| ur2).unwrap_or(r1);
+        if r2 > used_max_r.saturating_add(64) {
+            r2 = used_max_r.saturating_add(1).min(r2);
+        }
+        if r1 >= r2 {
+            return crate::layout::HiddenIndices::default();
+        }
+        let mut col_ids: Vec<u32> = self
+            .allows
+            .keys()
+            .chain(self.criteria.keys())
+            .copied()
+            .filter(|&c| c >= c1 && c <= c2)
+            .collect();
+        col_ids.sort_unstable();
+        col_ids.dedup();
+        if col_ids.is_empty() {
+            return crate::layout::HiddenIndices::default();
+        }
+
+        struct ColRule<'a> {
+            col: u32,
+            allows: Option<&'a HashSet<String>>,
+            crit: Option<CompiledCriterion>,
+            empty_ok: bool,
+        }
+        impl<'a> ColRule<'a> {
+            #[inline]
+            fn passes(&self, v: &Value) -> bool {
+                if matches!(v, Value::Empty) {
+                    return self.empty_ok;
+                }
+                if let Some(allows) = self.allows {
+                    let ok = match v {
+                        Value::Text(t) => allows.contains(t.as_ref()),
+                        Value::Bool(b) => allows.contains(if *b { "TRUE" } else { "FALSE" }),
+                        Value::Error(e) => allows.contains(e.text()),
+                        Value::Number(_) => allows.contains(&v.display()),
+                        Value::Empty => unreachable!(),
+                    };
+                    if !ok {
+                        return false;
+                    }
+                }
+                if let Some(crit) = &self.crit {
+                    return crit.matches_value(v);
+                }
+                true
+            }
+        }
+
+        let rules: Vec<ColRule<'_>> = col_ids
+            .iter()
+            .map(|&col| {
+                let allows = self.allows.get(&col);
+                let crit = self.criteria.get(&col).map(CompiledCriterion::new);
+                let empty_ok = allows.is_none_or(|a| a.contains(""))
+                    && crit.as_ref().is_none_or(|c| c.matches_str(""));
+                ColRule {
+                    col,
+                    allows,
+                    crit,
+                    empty_ok,
+                }
+            })
+            .collect();
+
+        let first = r1 + 1;
+        if let Some(req_idx) = rules.iter().position(|r| !r.empty_ok) {
+            let req = &rules[req_idx];
+            let mut intervals: Vec<(u32, u32)> = Vec::new();
+            let mut next = first;
+            for (key, cell) in sheet.iter_rect((first, req.col, r2, req.col)) {
+                if req.passes(&cell.value)
+                    && rules
+                        .iter()
+                        .enumerate()
+                        .all(|(i, r)| i == req_idx || r.passes(sheet.value_ref(key.row, r.col)))
+                {
+                    if next < key.row {
+                        intervals.push((next, key.row - 1));
+                    }
+                    next = key.row.saturating_add(1);
+                }
+            }
+            if next <= r2 {
+                intervals.push((next, r2));
+            }
+            crate::layout::HiddenIndices::from_intervals(intervals)
+        } else {
+            let mut rows = Vec::new();
+            for rule in &rules {
+                for (key, cell) in sheet.iter_rect((first, rule.col, r2, rule.col)) {
+                    if !rule.passes(&cell.value) {
+                        rows.push(key.row);
+                    }
+                }
+            }
+            rows.into_iter().collect()
         }
     }
 
@@ -398,43 +672,10 @@ impl Filter {
     /// 对整列自动筛选（如 `A1:D1048576`），裁剪到工作表实际数据边界（保留 1 行尾部空行语义），
     /// 避免遍历 104 万空行并往 `hidden_rows` 塞入百万条无效行号。
     pub fn hidden_rows(&self, sheet: &Sheet) -> HashSet<u32> {
-        let (r1, c1, mut r2, c2) = self.range;
-        let mut out = HashSet::new();
-        if self.allows.is_empty() && self.criteria.is_empty() {
-            return out;
-        }
-        let used_max_r = sheet.used_bounds().map(|(_, _, ur2, _)| ur2).unwrap_or(r1);
-        if r2 > used_max_r.saturating_add(64) {
-            r2 = used_max_r.saturating_add(1).min(r2);
-        }
-        let columns: std::collections::BTreeSet<_> = self.allows.keys().chain(self.criteria.keys())
-            .copied().filter(|&c| c >= c1 && c <= c2).collect();
-        let passes = |col: u32, text: &str| {
-            self.allows.get(&col).is_none_or(|a| a.contains(text))
-                && self.criteria.get(&col).is_none_or(|rule| rule.matches(text))
-        };
-        if r1 >= r2 { return out; }
-        let first = r1 + 1;
-        if let Some(&required) = columns.iter().find(|&&c| !passes(c, "")) {
-            // Every visible row must have a matching cell in this column. Emit hidden
-            // gaps directly instead of looking up every empty cell in every filter.
-            let mut next = first;
-            for (key, cell) in sheet.iter_rect((first, required, r2, required)) {
-                if passes(required, &cell.value.display()) && columns.iter().all(|&c| {
-                    c == required || passes(c, &sheet.get(key.row, c).map(|v| v.value.display()).unwrap_or_default())
-                }) {
-                    out.extend(next..key.row);
-                    next = key.row.saturating_add(1);
-                }
-            }
-            out.extend(next..=r2);
-        } else {
-            // Empty rows satisfy all filters. Only stored cells can disqualify a row.
-            for col in columns {
-                for (key, cell) in sheet.iter_rect((first, col, r2, col)) {
-                    if !passes(col, &cell.value.display()) { out.insert(key.row); }
-                }
-            }
+        let intervals = self.hidden_row_intervals(sheet);
+        let mut out = HashSet::with_capacity(intervals.len());
+        for &(lo, hi) in intervals.intervals() {
+            out.extend(lo..=hi);
         }
         out
     }

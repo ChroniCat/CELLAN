@@ -19,10 +19,82 @@ pub enum Value {
     #[default]
     Empty,
     Number(f64),
-    Text(Box<str>),
+    Text(std::sync::Arc<str>),
     Bool(bool),
     /// 真正的错误值（`=1/0` 算出来的），与「用户输入的文本 `#DIV/0!`」是两回事。
     Error(crate::formula::ErrKind),
+}
+
+/// 驻留字符串池：在单次流式加载、排序或聚合中将重复文本去重为共享 `Arc<str>`，
+/// 命中已有文本时零堆分配（直接 `HashSet<Arc<str>>::get(&str)` 后递增引用计数）。
+#[derive(Clone, Debug, Default)]
+pub struct StringPool {
+    table: std::collections::HashSet<std::sync::Arc<str>>,
+}
+
+impl StringPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            table: std::collections::HashSet::with_capacity(cap),
+        }
+    }
+
+    #[inline]
+    pub fn empty_arc() -> std::sync::Arc<str> {
+        static EMPTY: std::sync::OnceLock<std::sync::Arc<str>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| "".into()).clone()
+    }
+
+    pub fn intern(&mut self, s: &str) -> std::sync::Arc<str> {
+        if s.is_empty() {
+            return Self::empty_arc();
+        }
+        if let Some(existing) = self.table.get(s) {
+            return existing.clone();
+        }
+        let arc: std::sync::Arc<str> = s.into();
+        self.table.insert(arc.clone());
+        arc
+    }
+
+    pub fn intern_owned(&mut self, s: String) -> std::sync::Arc<str> {
+        if s.is_empty() {
+            return Self::empty_arc();
+        }
+        if let Some(existing) = self.table.get(s.as_str()) {
+            return existing.clone();
+        }
+        let arc: std::sync::Arc<str> = s.into();
+        self.table.insert(arc.clone());
+        arc
+    }
+
+    pub fn intern_arc(&mut self, s: std::sync::Arc<str>) -> std::sync::Arc<str> {
+        if s.is_empty() {
+            return Self::empty_arc();
+        }
+        if let Some(existing) = self.table.get(s.as_ref()) {
+            return existing.clone();
+        }
+        self.table.insert(s.clone());
+        s
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.table.clear();
+    }
 }
 
 /// 数字显示：整数不带小数点，小数最多 10 位并去掉尾零
@@ -76,6 +148,19 @@ impl Value {
     pub fn is_empty(&self) -> bool {
         matches!(self, Value::Empty)
     }
+
+    #[inline]
+    pub fn text(s: impl Into<std::sync::Arc<str>>) -> Self {
+        Value::Text(s.into())
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Text(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -111,6 +196,26 @@ impl<K, V> From<HashMap<K, V>> for CellMetadata<K, V> {
     fn from(map: HashMap<K, V>) -> Self { Self(std::sync::Arc::new(map)) }
 }
 
+impl<K: Eq + std::hash::Hash, V> FromIterator<(K, V)> for CellMetadata<K, V> {
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+        Self(std::sync::Arc::new(iter.into_iter().collect()))
+    }
+}
+
+impl<K, V> CellMetadata<K, V> {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub fn clear(&mut self) {
+        if let Some(unique) = std::sync::Arc::get_mut(&mut self.0) {
+            unique.clear();
+        } else if !self.0.is_empty() {
+            self.0 = Default::default();
+        }
+    }
+}
+
 impl<K, V> std::ops::Deref for CellMetadata<K, V> {
     type Target = HashMap<K, V>;
     fn deref(&self) -> &Self::Target { &self.0 }
@@ -130,30 +235,429 @@ impl<K: Eq + std::hash::Hash, V: PartialEq> PartialEq for CellMetadata<K, V> {
     fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0 }
 }
 
-/// Save receipts, background jobs and undo snapshots share the edit journals.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CellJournal(std::sync::Arc<std::collections::HashSet<CellRef>>);
-
-impl<const N: usize> From<[CellRef; N]> for CellJournal {
-    fn from(keys: [CellRef; N]) -> Self { Self(std::sync::Arc::new(keys.into())) }
+impl<K: Eq + std::hash::Hash, V: PartialEq> PartialEq<HashMap<K, V>> for CellMetadata<K, V> {
+    fn eq(&self, other: &HashMap<K, V>) -> bool { &*self.0 == other }
 }
 
-impl std::ops::Deref for CellJournal {
-    type Target = std::collections::HashSet<CellRef>;
+impl<K: Eq + std::hash::Hash, V: Eq> Eq for CellMetadata<K, V> {}
+
+/// Copy-on-write set wrapper for sparse cell/coordinate sets (`spilled`, `ignored_errors`).
+#[derive(Clone, Debug)]
+pub struct CellSet<T>(std::sync::Arc<std::collections::HashSet<T>>);
+
+impl<T> Default for CellSet<T> {
+    fn default() -> Self { Self(Default::default()) }
+}
+
+impl<T> From<std::collections::HashSet<T>> for CellSet<T> {
+    fn from(set: std::collections::HashSet<T>) -> Self { Self(std::sync::Arc::new(set)) }
+}
+
+impl<T: Eq + std::hash::Hash> FromIterator<T> for CellSet<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self(std::sync::Arc::new(iter.into_iter().collect()))
+    }
+}
+
+impl<T> CellSet<T> {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub fn clear(&mut self) {
+        if let Some(unique) = std::sync::Arc::get_mut(&mut self.0) {
+            unique.clear();
+        } else if !self.0.is_empty() {
+            self.0 = Default::default();
+        }
+    }
+}
+
+impl<T> std::ops::Deref for CellSet<T> {
+    type Target = std::collections::HashSet<T>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-impl std::ops::DerefMut for CellJournal {
+impl<T: Clone> std::ops::DerefMut for CellSet<T> {
     fn deref_mut(&mut self) -> &mut Self::Target { std::sync::Arc::make_mut(&mut self.0) }
 }
 
-impl CellJournal {
-    pub fn clear(&mut self) {
-        if let Some(unique) = std::sync::Arc::get_mut(&mut self.0) { unique.clear(); }
-        else { *self = Self::default(); }
+impl<T: Eq + std::hash::Hash> PartialEq for CellSet<T> {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
     }
-    fn remove_if_present(&mut self, key: &CellRef) {
-        if self.contains(key) { self.remove(key); }
+}
+
+impl<T: Eq + std::hash::Hash> PartialEq<std::collections::HashSet<T>> for CellSet<T> {
+    fn eq(&self, other: &std::collections::HashSet<T>) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl<T: Eq + std::hash::Hash> Eq for CellSet<T> {}
+
+impl<T: Clone> IntoIterator for CellSet<T> {
+    type Item = T;
+    type IntoIter = std::collections::hash_set::IntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        std::sync::Arc::unwrap_or_clone(self.0).into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a CellSet<T> {
+    type Item = &'a T;
+    type IntoIter = std::collections::hash_set::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter { self.0.iter() }
+}
+
+/// Copy-on-write vector wrapper for rarely mutated heavy lists (such as `Sheet::charts`).
+#[derive(Clone, Debug)]
+pub struct SharedList<T>(std::sync::Arc<Vec<T>>);
+
+impl<T> Default for SharedList<T> {
+    fn default() -> Self { Self(Default::default()) }
+}
+
+impl<T> From<Vec<T>> for SharedList<T> {
+    fn from(vec: Vec<T>) -> Self { Self(std::sync::Arc::new(vec)) }
+}
+
+impl<T> FromIterator<T> for SharedList<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self(std::sync::Arc::new(iter.into_iter().collect()))
+    }
+}
+
+impl<T> SharedList<T> {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub fn clear(&mut self) {
+        if let Some(unique) = std::sync::Arc::get_mut(&mut self.0) {
+            unique.clear();
+        } else if !self.0.is_empty() {
+            self.0 = Default::default();
+        }
+    }
+}
+
+impl<T: Clone> SharedList<T> {
+    pub fn push(&mut self, value: T) {
+        std::sync::Arc::make_mut(&mut self.0).push(value);
+    }
+}
+
+impl<T> std::ops::Deref for SharedList<T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl<T: Clone> std::ops::DerefMut for SharedList<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target { std::sync::Arc::make_mut(&mut self.0) }
+}
+
+impl<T> AsRef<[T]> for SharedList<T> {
+    fn as_ref(&self) -> &[T] { &self.0 }
+}
+
+impl<T: PartialEq> PartialEq for SharedList<T> {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl<T: PartialEq> PartialEq<Vec<T>> for SharedList<T> {
+    fn eq(&self, other: &Vec<T>) -> bool { self.0.as_slice() == other.as_slice() }
+}
+
+impl<T: PartialEq> PartialEq<[T]> for SharedList<T> {
+    fn eq(&self, other: &[T]) -> bool { self.0.as_slice() == other }
+}
+
+impl<T: PartialEq> PartialEq<&[T]> for SharedList<T> {
+    fn eq(&self, other: &&[T]) -> bool { self.0.as_slice() == *other }
+}
+
+impl<T: Eq> Eq for SharedList<T> {}
+
+impl<T: Clone> IntoIterator for SharedList<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        std::sync::Arc::unwrap_or_clone(self.0).into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a SharedList<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter { self.0.iter() }
+}
+
+impl<'a, T: Clone> IntoIterator for &'a mut SharedList<T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+    fn into_iter(self) -> Self::IntoIter { std::sync::Arc::make_mut(&mut self.0).iter_mut() }
+}
+
+/// Page-level 256-row bitmap journal (`cleared` and `style_edits`).
+/// Stores 1 bit per cell per `(page, col)` (`[u64; 4]` = 32 bytes for 256 rows),
+/// shrinking 1,000,000 cleared/styled cells from ~48 MB `HashSet<CellRef>` to ~750 KB.
+#[derive(Clone, Debug, Default)]
+pub struct CellJournal {
+    pages: std::sync::Arc<HashMap<(u32, u32), [u64; 4]>>,
+    len: usize,
+}
+
+impl PartialEq for CellJournal {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && (std::sync::Arc::ptr_eq(&self.pages, &other.pages) || self.pages == other.pages)
+    }
+}
+
+impl Eq for CellJournal {}
+
+impl<const N: usize> From<[CellRef; N]> for CellJournal {
+    fn from(keys: [CellRef; N]) -> Self {
+        keys.into_iter().collect()
+    }
+}
+
+impl FromIterator<CellRef> for CellJournal {
+    fn from_iter<T: IntoIterator<Item = CellRef>>(iter: T) -> Self {
+        let mut out = Self::default();
+        out.extend(iter);
+        out
+    }
+}
+
+impl Extend<CellRef> for CellJournal {
+    fn extend<T: IntoIterator<Item = CellRef>>(&mut self, iter: T) {
+        let mut iter = iter.into_iter().peekable();
+        if iter.peek().is_none() {
+            return;
+        }
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        for key in iter {
+            let p = key.row / crate::store::PAGE_ROWS;
+            let off = (key.row % crate::store::PAGE_ROWS) as usize;
+            let mask = 1u64 << (off % 64);
+            let entry = pages.entry((p, key.col)).or_default();
+            if entry[off / 64] & mask == 0 {
+                entry[off / 64] |= mask;
+                self.len += 1;
+            }
+        }
+    }
+}
+
+impl<'a> Extend<&'a CellRef> for CellJournal {
+    fn extend<T: IntoIterator<Item = &'a CellRef>>(&mut self, iter: T) {
+        self.extend(iter.into_iter().copied());
+    }
+}
+
+impl CellJournal {
+    #[inline]
+    pub fn len(&self) -> usize { self.len }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    #[inline]
+    pub fn contains(&self, key: &CellRef) -> bool {
+        let Some(bits) = self.pages.get(&(key.row / crate::store::PAGE_ROWS, key.col)) else {
+            return false;
+        };
+        let off = (key.row % crate::store::PAGE_ROWS) as usize;
+        (bits[off / 64] & (1u64 << (off % 64))) != 0
+    }
+
+    pub fn insert(&mut self, key: CellRef) -> bool {
+        if self.contains(&key) {
+            return false;
+        }
+        let p = key.row / crate::store::PAGE_ROWS;
+        let off = (key.row % crate::store::PAGE_ROWS) as usize;
+        let entry = std::sync::Arc::make_mut(&mut self.pages).entry((p, key.col)).or_default();
+        entry[off / 64] |= 1u64 << (off % 64);
+        self.len += 1;
+        true
+    }
+
+    /// Batch-mark an entire rectangle `[r1..=r2, c1..=c2]` using 64-bit word masks.
+    pub fn insert_rect(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) {
+        if r1 > r2 || c1 > c2 {
+            return;
+        }
+        let first_p = r1 / crate::store::PAGE_ROWS;
+        let last_p = r2 / crate::store::PAGE_ROWS;
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        for p in first_p..=last_p {
+            let base = p * crate::store::PAGE_ROWS;
+            let lo = r1.saturating_sub(base) as usize;
+            let hi = (r2 - base).min(crate::store::PAGE_ROWS - 1) as usize;
+            let mut mask = [0u64; 4];
+            if lo == 0 && hi == 255 {
+                mask = [u64::MAX; 4];
+            } else {
+                for r in lo..=hi {
+                    mask[r / 64] |= 1u64 << (r % 64);
+                }
+            }
+            for col in c1..=c2 {
+                let entry = pages.entry((p, col)).or_default();
+                for w in 0..4 {
+                    let added = mask[w] & !entry[w];
+                    if added != 0 {
+                        entry[w] |= added;
+                        self.len += added.count_ones() as usize;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn remove(&mut self, key: &CellRef) -> bool {
+        if !self.contains(key) {
+            return false;
+        }
+        let page_key = (key.row / crate::store::PAGE_ROWS, key.col);
+        let off = (key.row % crate::store::PAGE_ROWS) as usize;
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        if let Some(bits) = pages.get_mut(&page_key) {
+            bits[off / 64] &= !(1u64 << (off % 64));
+            if *bits == [0; 4] {
+                pages.remove(&page_key);
+            }
+            self.len -= 1;
+            return true;
+        }
+        false
+    }
+
+    pub fn clear(&mut self) {
+        if let Some(unique) = std::sync::Arc::get_mut(&mut self.pages) {
+            unique.clear();
+        } else if !self.pages.is_empty() {
+            self.pages = Default::default();
+        }
+        self.len = 0;
+    }
+
+    pub(crate) fn remove_if_present(&mut self, key: &CellRef) {
+        let _ = self.remove(key);
+    }
+
+    #[inline]
+    pub(crate) fn raw_pages(&self) -> &HashMap<(u32, u32), [u64; 4]> {
+        &self.pages
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        self.pages.capacity() * (std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<[u64; 4]>() + 1)
+    }
+
+    /// Page-wise bitwise OR union with `other` (zero per-cell decoding).
+    pub fn union_from(&mut self, other: &Self) {
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            *self = other.clone();
+            return;
+        }
+        if std::sync::Arc::ptr_eq(&self.pages, &other.pages) {
+            return;
+        }
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        for (&key, words) in other.pages.iter() {
+            let entry = pages.entry(key).or_default();
+            for w in 0..4 {
+                let added = words[w] & !entry[w];
+                if added != 0 {
+                    entry[w] |= added;
+                    self.len += added.count_ones() as usize;
+                }
+            }
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = CellRef> + '_ {
+        self.pages.iter().flat_map(|(&(p, col), words)| {
+            let base = p * crate::store::PAGE_ROWS;
+            words.iter().enumerate().flat_map(move |(w, &bits)| {
+                let mut bits = bits;
+                std::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let tz = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    Some(CellRef::new(base + w as u32 * 64 + tz, col))
+                })
+            })
+        })
+    }
+
+    pub fn drain(&mut self) -> impl Iterator<Item = CellRef> {
+        let old = std::mem::take(self);
+        std::sync::Arc::unwrap_or_clone(old.pages).into_iter().flat_map(|((p, col), words)| {
+            let base = p * crate::store::PAGE_ROWS;
+            words.into_iter().enumerate().flat_map(move |(w, mut bits)| {
+                std::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let tz = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    Some(CellRef::new(base + w as u32 * 64 + tz, col))
+                })
+            })
+        })
+    }
+
+    pub fn retain(&mut self, mut f: impl FnMut(&CellRef) -> bool) {
+        if self.is_empty() {
+            return;
+        }
+        let mut new_len = 0usize;
+        std::sync::Arc::make_mut(&mut self.pages).retain(|&(p, col), words| {
+            let base = p * crate::store::PAGE_ROWS;
+            let mut keep_page = false;
+            for (w, word) in words.iter_mut().enumerate() {
+                let mut bits = *word;
+                let mut kept = 0u64;
+                while bits != 0 {
+                    let tz = bits.trailing_zeros();
+                    let bit = 1u64 << tz;
+                    let cref = CellRef::new(base + w as u32 * 64 + tz, col);
+                    if f(&cref) {
+                        kept |= bit;
+                        new_len += 1;
+                    }
+                    bits &= bits - 1;
+                }
+                *word = kept;
+                keep_page |= kept != 0;
+            }
+            keep_page
+        });
+        self.len = new_len;
+    }
+}
+
+impl<'a> IntoIterator for &'a CellJournal {
+    type Item = CellRef;
+    type IntoIter = Box<dyn Iterator<Item = CellRef> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
     }
 }
 
@@ -190,10 +694,10 @@ pub struct Sheet {
     /// 被清空过的单元格：保存时要真的从文件里删掉，否则旧值会残留
     pub cleared: CellJournal,
     /// 被动态数组公式溢出占用的单元格（重算前要清掉）
-    pub spilled: std::collections::HashSet<CellRef>,
+    pub spilled: CellSet<CellRef>,
     /// 动态数组锚点 → 本次重算写回的精确形状 (rows, cols)。1×1 也记录；
     /// 跨表只重算时用它识别可信锚点，不能靠 spilled 邻接尾格猜形状。
-    pub spill_shapes: std::collections::HashMap<CellRef, (u32, u32)>,
+    pub spill_shapes: CellMetadata<CellRef, (u32, u32)>,
     /// 老式 CSE 数组公式：锚点 → 覆盖区域（保存时要写回 t="array" ref）
     pub arrays: Vec<(CellRef, (u32, u32, u32, u32))>,
     /// Excel 表格对象（ListObject）
@@ -208,8 +712,8 @@ pub struct Sheet {
     pub edited: bool,
     /// 格式动过没有（动过就不能整段沿用基准的样式表）
     pub styles_dirty: bool,
-    /// 合并单元格区域 (r1, c1, r2, c2)
-    pub merges: Vec<(u32, u32, u32, u32)>,
+    /// 合并单元格区域 (r1, c1, r2, c2)（CoW 共享 + 单调版本号 + 内置二分索引）
+    pub merges: crate::merges::Merges,
     /// 列宽（只有被设置过的列才有条目）
     pub cols: crate::layout::Axis,
     /// 行高
@@ -260,7 +764,7 @@ pub struct Sheet {
     /// 方案列表被改过
     pub scenarios_dirty: bool,
     /// 被用户「忽略错误」的单元格（写进 <ignoredErrors>）
-    pub ignored_errors: std::collections::HashSet<(u32, u32)>,
+    pub ignored_errors: CellSet<(u32, u32)>,
     /// 忽略列表被改过
     pub ignored_errors_dirty: bool,
     /// 分级显示设置：明细在下方 / 在右侧 / 显示分级符号
@@ -278,8 +782,8 @@ pub struct Sheet {
     pub page: crate::page::PageSetup,
     /// 页面设置被改过
     pub page_dirty: bool,
-    /// 图表（只读展示，原样保留）
-    pub charts: Vec<crate::charts::Chart>,
+    /// 图表（只读展示，原样保留；CoW 共享避免渲染与快照每帧深拷）
+    pub charts: SharedList<crate::charts::Chart>,
     /// 图表引用被改过：保存时要重写 chart 部件
     pub charts_dirty: bool,
     /// 工作表标签颜色（RGB）
@@ -326,8 +830,8 @@ impl Sheet {
             display_style_revision: 0,
             coordinate_revision: 0,
             cleared: CellJournal::default(),
-            spilled: std::collections::HashSet::new(),
-            spill_shapes: std::collections::HashMap::new(),
+            spilled: CellSet::default(),
+            spill_shapes: CellMetadata::default(),
             arrays: Vec::new(),
             tables: Vec::new(),
             pictures: Vec::new(),
@@ -335,7 +839,7 @@ impl Sheet {
             loading: false,
             edited: false,
             styles_dirty: false,
-            merges: Vec::new(),
+            merges: crate::merges::Merges::default(),
             cols: crate::layout::Axis::new(crate::layout::DEFAULT_COL_W),
             rows: crate::layout::Axis::new(crate::layout::DEFAULT_ROW_H),
             styles: crate::store::CellStyles::default(),
@@ -361,7 +865,7 @@ impl Sheet {
             scenarios: Vec::new(),
             scenario_settings: Default::default(),
             scenarios_dirty: false,
-            ignored_errors: std::collections::HashSet::new(),
+            ignored_errors: CellSet::default(),
             ignored_errors_dirty: false,
             outline_summary_below: true,
             outline_summary_right: true,
@@ -372,7 +876,7 @@ impl Sheet {
             filter_dirty: false,
             page: crate::page::PageSetup::default(),
             page_dirty: false,
-            charts: Vec::new(),
+            charts: SharedList::default(),
             charts_dirty: false,
             tab_color: None,
             tab_color_dirty: false,
@@ -426,6 +930,14 @@ impl Sheet {
 
     pub fn has_formulas(&self) -> bool { self.cells.has_formulas() }
 
+    pub fn formula_count(&self) -> usize { self.cells.formula_count() }
+
+    #[inline]
+    pub fn value_ref(&self, r: u32, c: u32) -> &Value {
+        static EMPTY: Value = Value::Empty;
+        self.cells.get(r, c).map_or(&EMPTY, |x| &x.value)
+    }
+
     pub fn value(&self, r: u32, c: u32) -> Value {
         self.cells.get(r, c).map(|x| x.value.clone()).unwrap_or_default()
     }
@@ -442,7 +954,9 @@ impl Sheet {
         // 往溢出区里写东西 = 用户覆盖：从这个集合里摘掉，重算时才会判成 #SPILL!，
         // 而不是被 clear_spills 当成旧溢出值删掉（那会静默吞掉用户输入）。
         // 溢出写回自己是先 set 再 insert，顺序不受影响。
-        self.spilled.remove(&key);
+        if !self.spilled.is_empty() {
+            self.spilled.remove(&key);
+        }
         if cell.is_blank() {
             if self.cells.remove(r, c).is_some() {
                 self.cleared.insert(key);
@@ -489,7 +1003,7 @@ impl Sheet {
 
     pub(crate) fn replace_cell_store(&mut self, cells: Store) { self.cells = cells; }
 
-    pub(crate) fn formula_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
+    pub fn formula_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.formula_cells()
     }
 
@@ -501,7 +1015,24 @@ impl Sheet {
         self.style_edits.extend(self.styles.changed_keys(&old_styles));
         // Removing an old cell on disk also removes its format. Reapply any
         // explicitly styled blank which now occupies that same position.
-        self.style_edits.extend(self.cleared.iter().filter(|k| self.styles.get(k).is_some()).copied());
+        self.style_edits.extend(self.cleared.iter().filter(|k| self.styles.get(k).is_some()));
+        if !self.style_edits.is_empty() {
+            self.styles_dirty = true;
+            self.display_style_revision = next_sheet_identity();
+        }
+        self.edited = true;
+    }
+
+    pub(crate) fn permute_cell_band(&mut self, rows: bool, lo: u32, hi: u32, map: impl Fn(u32) -> u32 + Copy) {
+        if lo >= hi {
+            return;
+        }
+        self.cells.permute_band(rows, lo, hi, map, &mut self.cleared);
+        let old_styles = self.styles.clone();
+        self.styles.permute_band(rows, lo, hi, map);
+        self.style_edits.extend(old_styles.changed_keys(&self.styles));
+        self.style_edits.extend(self.styles.changed_keys(&old_styles));
+        self.style_edits.extend(self.cleared.iter().filter(|k| self.styles.get(k).is_some()));
         if !self.style_edits.is_empty() {
             self.styles_dirty = true;
             self.display_style_revision = next_sheet_identity();
@@ -925,37 +1456,70 @@ impl Sheet {
 
     /// 合并一个矩形区域（与区域内已有合并冲突的先拆掉）
     pub fn merge_range(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) {
-        let (r1, r2) = (r1.min(r2), r1.max(r2));
-        let (c1, c2) = (c1.min(c2), c1.max(c2));
-        if r1 == r2 && c1 == c2 {
-            return;
-        }
-        // 拆掉所有与新区域相交的旧合并
-        self.merges
-            .retain(|(a, b, cc, d)| *a > r2 || *cc < r1 || *b > c2 || *d < c1);
-        self.merges.push((r1, c1, r2, c2));
-        self.merges.sort();
-        self.merges_dirty = true;
-    }
-
-    /// 拆掉与给定区域相交的所有合并
-    pub fn unmerge_range(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) {
-        let (r1, r2) = (r1.min(r2), r1.max(r2));
-        let (c1, c2) = (c1.min(c2), c1.max(c2));
-        let before = self.merges.len();
-        self.merges
-            .retain(|(a, b, cc, d)| *a > r2 || *cc < r1 || *b > c2 || *d < c1);
-        if self.merges.len() != before {
+        if self.merges.merge_range(r1, c1, r2, c2) {
             self.merges_dirty = true;
         }
     }
 
-    /// 命中合并区域时返回该区域（含锚点）
+    /// 批量合并多个矩形区域（一次去冲突与排序，避免多次 O(M log M) 重排）
+    pub fn merge_ranges(&mut self, rects: impl IntoIterator<Item = (u32, u32, u32, u32)>) {
+        if self.merges.merge_ranges(rects) {
+            self.merges_dirty = true;
+        }
+    }
+
+    /// 拆掉与给定区域相交的所有合并
+    pub fn unmerge_range(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) {
+        if self.merges.unmerge_range(r1, c1, r2, c2) {
+            self.merges_dirty = true;
+        }
+    }
+
+    /// 命中合并区域时返回该区域（含锚点）；基于惰性区间索引，查询复杂度 O(log M)
     pub fn merge_at(&self, r: u32, c: u32) -> Option<(u32, u32, u32, u32)> {
-        self.merges
-            .iter()
-            .find(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
-            .copied()
+        self.merges.at(r, c)
+    }
+
+    #[inline]
+    pub fn merges_revision(&self) -> u64 {
+        self.merges.revision()
+    }
+
+    #[inline]
+    pub fn max_merge_row(&self) -> Option<u32> {
+        self.merges.max_row()
+    }
+
+    #[inline]
+    pub fn max_merge_col(&self) -> Option<u32> {
+        self.merges.max_col()
+    }
+
+    /// 批量写入矩形区域样式：整页全覆盖时自动压缩为 `Uniform(id)` 共享页
+    pub fn set_style_rect(&mut self, r1: u32, c1: u32, r2: u32, c2: u32, id: u16) {
+        let (r1, r2) = (r1.min(r2), r1.max(r2));
+        let (c1, c2) = (c1.min(c2), c1.max(c2));
+        self.display_style_revision = next_sheet_identity();
+        if !self.loading {
+            self.edited = true;
+            self.styles_dirty = true;
+        }
+        if id != 0 {
+            self.styles.insert_rect(r1, c1, r2, c2, id);
+            self.style_edits.insert_rect(r1, c1, r2, c2);
+        } else {
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    let key = CellRef::new(r, c);
+                    if self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c) {
+                        self.styles.insert(key, 0);
+                    } else {
+                        self.styles.remove(&key);
+                    }
+                }
+            }
+            self.style_edits.insert_rect(r1, c1, r2, c2);
+        }
     }
 
     /// 已用区域 (r1, c1, r2, c2)，0-based
@@ -968,9 +1532,44 @@ impl Sheet {
         self.cells.column_span(r1, r2, c)
     }
 
+    /// 单列按页零分配切片迭代：返回 `(起始行号, &[Cell])`，范围求值/聚合零堆分配
+    pub fn column_slices(&self, r1: u32, r2: u32, c: u32) -> impl Iterator<Item = (u32, &[Cell])> + '_ {
+        self.cells.column_slices(r1, r2, c)
+    }
+
+    /// 按行列升序归并输出单元格与显式样式（`xlsx_fresh` 顺序写盘零重复哈希查找）
+    pub fn iter_cells_with_explicit_style(&self) -> impl Iterator<Item = (CellRef, &Cell, Option<u16>)> + '_ {
+        self.cells.iter_with_explicit_style(&self.styles)
+    }
+
+    /// 按行列升序并进遍历所有「非空单元格或显式样式格」
+    pub fn iter_with_styles(&self) -> impl Iterator<Item = (CellRef, Option<&Cell>, Option<u16>)> + '_ {
+        self.cells.iter_merged_with_styles(&self.styles)
+    }
+
+    /// 稀疏行内非空边界跳跃（供 `Ctrl+←/→` 等导航跳过大段空白列，复杂度 O(字长位扫描)）
+    pub fn next_occupied_in_row(&self, row: u32, from_col: u32, forward: bool) -> Option<u32> {
+        self.cells.next_occupied_in_row(row, from_col, forward)
+    }
+
+    /// 稀疏列内非空边界跳跃（供 `Ctrl+↑/↓` 等导航跳过百万空行，复杂度 O(页数)）
+    pub fn next_occupied_in_col(&self, col: u32, from_row: u32, forward: bool) -> Option<u32> {
+        self.cells.next_occupied_in_col(col, from_row, forward)
+    }
+
+    /// 判断两张快照的指定 256 行页指针是否完全未变（供 AI 增量观测与后台缓存跳过整页）
+    pub fn same_page(&self, other: &Self, page_idx: u32) -> bool {
+        self.cells.same_page(&other.cells, page_idx)
+    }
+
     /// 存储层实际占用字节（调试用）
     pub fn allocated_bytes(&self) -> usize {
         self.cells.allocated_bytes()
+    }
+
+    /// 诊断用：返回 `(页数, 已分配非空列块数, 槽位总容量)`
+    pub fn store_stats(&self) -> (usize, usize, usize) {
+        self.cells.stats()
     }
 }
 

@@ -30,6 +30,280 @@ fn ordered_key(h: &Hit, order: SearchOrder) -> (usize, u32, u32) {
     }
 }
 
+struct PreparedSearch<'a> {
+    needle: &'a str,
+    opts: &'a SearchOpts,
+    ascii_ci: bool,
+    uncased_utf8_needle: bool,
+}
+
+#[inline]
+fn ascii_contains_ci(hay: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if hay.len() < needle_lower.len() {
+        return false;
+    }
+    let b0 = needle_lower[0];
+    let end = hay.len() - needle_lower.len();
+    for i in 0..=end {
+        if hay[i].to_ascii_lowercase() == b0
+            && hay[i..i + needle_lower.len()].eq_ignore_ascii_case(needle_lower)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn is_general_format(fmt: &str) -> bool {
+    fmt.is_empty() || fmt.eq_ignore_ascii_case("General")
+}
+
+impl<'a> PreparedSearch<'a> {
+    fn new(needle: &'a str, opts: &'a SearchOpts) -> Self {
+        let ascii_ci = !opts.match_case && needle.is_ascii();
+        // Pure CJK ideographs + ASCII digits/symbols cannot be matched via case-folding of any other codepoint.
+        let uncased_utf8_needle = !opts.match_case
+            && !ascii_ci
+            && needle.chars().all(|ch| {
+                ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+                    || (ch.is_ascii() && !ch.is_ascii_alphabetic())
+            });
+        Self {
+            needle,
+            opts,
+            ascii_ci,
+            uncased_utf8_needle,
+        }
+    }
+
+    #[inline]
+    fn matches_str(&self, text: &str) -> bool {
+        if self.needle.is_empty() {
+            return false;
+        }
+        if self.opts.match_case || self.uncased_utf8_needle {
+            return if self.opts.whole_cell {
+                text == self.needle
+            } else {
+                text.contains(self.needle)
+            };
+        }
+        if self.ascii_ci && text.is_ascii() {
+            return if self.opts.whole_cell {
+                text.eq_ignore_ascii_case(self.needle)
+            } else {
+                ascii_contains_ci(text.as_bytes(), self.needle.as_bytes())
+            };
+        }
+        let hay = text.to_lowercase();
+        if self.opts.whole_cell {
+            hay == self.needle
+        } else {
+            hay.contains(self.needle)
+        }
+    }
+
+    #[inline]
+    fn matches_cell_on_sheet(
+        &self,
+        wb: &Workbook,
+        sh: &crate::model::Sheet,
+        has_any_styles: bool,
+        style0_general: bool,
+        row: u32,
+        col: u32,
+        cell: &Cell,
+    ) -> bool {
+        if self.opts.in_formula {
+            let Some(f) = cell.formula.as_deref() else {
+                return false;
+            };
+            return self.matches_str(f);
+        }
+        match &cell.value {
+            crate::model::Value::Empty => false,
+            v => {
+                let id = if has_any_styles { sh.style_of(row, col) } else { 0 };
+                let general = if id == 0 {
+                    style0_general
+                } else {
+                    is_general_format(&wb.styles.get(id).format)
+                };
+                if general {
+                    match v {
+                        crate::model::Value::Text(s) => return self.matches_str(s),
+                        crate::model::Value::Bool(b) => {
+                            return self.matches_str(if *b { "TRUE" } else { "FALSE" });
+                        }
+                        crate::model::Value::Error(e) => return self.matches_str(e.text()),
+                        crate::model::Value::Number(n)
+                            if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 =>
+                        {
+                            let mut buf = [0u8; 24];
+                            let mut pos = buf.len();
+                            let iv = *n as i64;
+                            let neg = iv < 0;
+                            let mut u = iv.unsigned_abs();
+                            if u == 0 {
+                                pos -= 1;
+                                buf[pos] = b'0';
+                            } else {
+                                while u > 0 {
+                                    pos -= 1;
+                                    buf[pos] = b'0' + (u % 10) as u8;
+                                    u /= 10;
+                                }
+                            }
+                            if neg {
+                                pos -= 1;
+                                buf[pos] = b'-';
+                            }
+                            let s = unsafe { std::str::from_utf8_unchecked(&buf[pos..]) };
+                            return self.matches_str(s);
+                        }
+                        _ => {}
+                    }
+                }
+                let fmt = &wb.styles.get(id).format;
+                let formatted = crate::style::format_value_in(wb.date_system, v, fmt);
+                self.matches_str(&formatted)
+            }
+        }
+    }
+}
+
+fn search_sheet_pages_parallel(
+    wb: &Workbook,
+    si: usize,
+    sh: &crate::model::Sheet,
+    prep: &PreparedSearch<'_>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<Vec<Hit>> {
+    let has_any_styles =
+        !sh.styles.is_empty() || !sh.row_styles.is_empty() || !sh.col_styles.is_empty();
+    let style0_general = is_general_format(&wb.styles.get(0).format);
+    let pages: Vec<(u32, &std::sync::Arc<crate::store::Page>)> = sh.cells().iter_pages().collect();
+    if pages.is_empty() {
+        return Some(Vec::new());
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8);
+    if sh.len() < 32_768 || pages.len() < 4 || threads <= 1 {
+        let mut out = Vec::new();
+        let mut visited = 0usize;
+        for (pi, page) in pages {
+            if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return None;
+            }
+            let base = pi * crate::store::PAGE_ROWS;
+            for col in page.iter_nonempty_cols(0, u32::MAX) {
+                let Some(slab) = page.cols.get(col as usize).and_then(Option::as_deref) else {
+                    continue;
+                };
+                for (r_off, cell) in slab.iter().enumerate() {
+                    if cell.is_blank() {
+                        continue;
+                    }
+                    visited += 1;
+                    if visited % 512 == 0
+                        && cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return None;
+                    }
+                    let row = base + r_off as u32;
+                    if prep.matches_cell_on_sheet(
+                        wb,
+                        sh,
+                        has_any_styles,
+                        style0_general,
+                        row,
+                        col,
+                        cell,
+                    ) {
+                        out.push(Hit { sheet: si, row, col });
+                    }
+                }
+            }
+        }
+        return Some(out);
+    }
+
+    let chunk_size = pages.len().div_ceil(threads);
+    let aborted = std::sync::atomic::AtomicBool::new(false);
+    let partial: Vec<Vec<Hit>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = pages
+            .chunks(chunk_size)
+            .map(|chunk| {
+                let aborted_ref = &aborted;
+                scope.spawn(move || {
+                    let mut local = Vec::new();
+                    let mut visited = 0usize;
+                    for &(pi, page) in chunk {
+                        if aborted_ref.load(std::sync::atomic::Ordering::Relaxed)
+                            || cancelled
+                                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                        {
+                            aborted_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Vec::new();
+                        }
+                        let base = pi * crate::store::PAGE_ROWS;
+                        for col in page.iter_nonempty_cols(0, u32::MAX) {
+                            let Some(slab) =
+                                page.cols.get(col as usize).and_then(Option::as_deref)
+                            else {
+                                continue;
+                            };
+                            for (r_off, cell) in slab.iter().enumerate() {
+                                if cell.is_blank() {
+                                    continue;
+                                }
+                                visited += 1;
+                                if visited % 512 == 0
+                                    && cancelled.is_some_and(|c| {
+                                        c.load(std::sync::atomic::Ordering::Relaxed)
+                                    })
+                                {
+                                    aborted_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    return Vec::new();
+                                }
+                                let row = base + r_off as u32;
+                                if prep.matches_cell_on_sheet(
+                                    wb,
+                                    sh,
+                                    has_any_styles,
+                                    style0_general,
+                                    row,
+                                    col,
+                                    cell,
+                                ) {
+                                    local.push(Hit { sheet: si, row, col });
+                                }
+                            }
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+    });
+    if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let total: usize = partial.iter().map(Vec::len).sum();
+    let mut merged = Vec::with_capacity(total);
+    for v in partial {
+        merged.extend(v);
+    }
+    Some(merged)
+}
+
 /// A snapshot search can stop when its query or document has been superseded.
 /// Overlapping selection rectangles are tested in one pass, so a cell is counted once.
 pub fn scoped_hits(
@@ -37,25 +311,35 @@ pub fn scoped_hits(
     needle: &str, opts: &SearchOpts, order: SearchOrder,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Vec<Hit> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let prep = PreparedSearch::new(needle, opts);
     let mut hits = Vec::new();
     for (si, sh) in wb.sheets.iter().enumerate() {
         if sheet.is_some_and(|only| only != si) { continue; }
-        let mut visited = 0usize;
-        let mut check = |key: crate::CellRef, cell: &Cell| {
-            visited += 1;
-            if visited % 256 == 0 && cancelled.load(std::sync::atomic::Ordering::Relaxed) { return false; }
-            if matches_at(wb, si, key.row, key.col, cell, needle, opts) {
-                hits.push(Hit { sheet: si, row: key.row, col: key.col });
-            }
-            true
-        };
         if rects.is_empty() {
-            if !sh.stored_cells().all(|(k,v)| check(k,v)) { return Vec::new(); }
+            let Some(sheet_hits) = search_sheet_pages_parallel(wb, si, sh, &prep, Some(cancelled)) else {
+                return Vec::new();
+            };
+            hits.extend(sheet_hits);
         } else {
+            let has_any_styles =
+                !sh.styles.is_empty() || !sh.row_styles.is_empty() || !sh.col_styles.is_empty();
+            let style0_general = is_general_format(&wb.styles.get(0).format);
+            let mut visited = 0usize;
             for (i, &rect) in rects.iter().enumerate() {
-                for (k,v) in sh.cells().stored_cells_in(rect) {
-                    if !rects[..i].iter().any(|&(r1,c1,r2,c2)| r1<=k.row && k.row<=r2 && c1<=k.col && k.col<=c2)
-                        && !check(k,v) { return Vec::new(); }
+                for (k, v) in sh.cells().stored_cells_in(rect) {
+                    if rects[..i].iter().any(|&(r1, c1, r2, c2)| r1 <= k.row && k.row <= r2 && c1 <= k.col && k.col <= c2) {
+                        continue;
+                    }
+                    visited += 1;
+                    if visited % 256 == 0 && cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Vec::new();
+                    }
+                    if prep.matches_cell_on_sheet(wb, sh, has_any_styles, style0_general, k.row, k.col, v) {
+                        hits.push(Hit { sheet: si, row: k.row, col: k.col });
+                    }
                 }
             }
         }
@@ -126,19 +410,17 @@ pub fn cell_matches(
 
 fn matches_at(wb: &Workbook, sheet: usize, row: u32, col: u32, cell: &Cell,
               needle: &str, opts: &SearchOpts) -> bool {
+    let prep = PreparedSearch::new(needle, opts);
+    if let Some(sh) = wb.sheets.get(sheet) {
+        let has_any_styles =
+            !sh.styles.is_empty() || !sh.row_styles.is_empty() || !sh.col_styles.is_empty();
+        let style0_general = is_general_format(&wb.styles.get(0).format);
+        return prep.matches_cell_on_sheet(wb, sh, has_any_styles, style0_general, row, col, cell);
+    }
     let Some(text) = cell_text_at(wb, sheet, row, col, cell, opts.in_formula) else {
         return false;
     };
-    let hay = if opts.match_case {
-        text
-    } else {
-        text.to_lowercase()
-    };
-    if opts.whole_cell {
-        hay == needle
-    } else {
-        hay.contains(needle)
-    }
+    prep.matches_str(&text)
 }
 
 /// 一张表内全部命中，按指定顺序排序。
@@ -149,17 +431,22 @@ pub fn hits_in_sheet(
     opts: &SearchOpts,
     order: SearchOrder,
 ) -> Vec<Hit> {
-    hits_in_rect(
-        wb,
-        sheet,
-        (0, 0, u32::MAX - 1, u32::MAX - 1),
-        needle,
-        opts,
-        order,
-    )
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let Some(sh) = wb.sheets.get(sheet) else {
+        return Vec::new();
+    };
+    let prep = PreparedSearch::new(needle, opts);
+    let mut out = search_sheet_pages_parallel(wb, sheet, sh, &prep, None).unwrap_or_default();
+    match order {
+        SearchOrder::RowMajor => out.sort_unstable(),
+        SearchOrder::ColumnMajor => out.sort_unstable_by_key(|h| (h.sheet, h.col, h.row)),
+    }
+    out
 }
 
-/// 一张表某个矩形内的命中（稀疏过滤），按指定顺序排序。
+/// 一张表某个矩形内的命中（稀疏页块过滤），按指定顺序排序。
 pub fn hits_in_rect(
     wb: &Workbook,
     sheet: usize,
@@ -168,23 +455,28 @@ pub fn hits_in_rect(
     opts: &SearchOpts,
     order: SearchOrder,
 ) -> Vec<Hit> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
     let Some(sh) = wb.sheets.get(sheet) else {
         return Vec::new();
     };
+    let prep = PreparedSearch::new(needle, opts);
+    let has_any_styles =
+        !sh.styles.is_empty() || !sh.row_styles.is_empty() || !sh.col_styles.is_empty();
+    let style0_general = is_general_format(&wb.styles.get(0).format);
     let (r1, c1, r2, c2) = rect;
+    let norm_rect = (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2));
     let mut out: Vec<Hit> = sh
-        .iter()
-        .filter(|(k, _)| {
-            k.row >= r1.min(r2)
-                && k.row <= r1.max(r2)
-                && k.col >= c1.min(c2)
-                && k.col <= c1.max(c2)
-                && cell_matches(wb, sheet, k.row, k.col, needle, opts)
-        })
-        .map(|(k, _)| Hit {
-            sheet,
-            row: k.row,
-            col: k.col,
+        .cells()
+        .stored_cells_in(norm_rect)
+        .filter_map(|(k, cell)| {
+            prep.matches_cell_on_sheet(wb, sh, has_any_styles, style0_general, k.row, k.col, cell)
+                .then_some(Hit {
+                    sheet,
+                    row: k.row,
+                    col: k.col,
+                })
         })
         .collect();
     match order {

@@ -11,7 +11,7 @@ use std::path::Path;
 /// 一张表除单元格之外的版式信息
 #[derive(Default, Clone, Debug)]
 pub struct SheetLayout {
-    pub merges: Vec<(u32, u32, u32, u32)>,
+    pub merges: Merges,
     /// 列号（0-based）→ 像素宽
     pub col_widths: Vec<(u32, f32)>,
     /// `<col min=1 max=16384>` 这种整表默认宽度（按列展开会变成上万条，改用默认值）
@@ -470,7 +470,7 @@ fn parse_layout(xml: &str) -> SheetLayout {
     }
     if let Some(range) = af_range {
         let mut f = crate::sort_filter::Filter::new(range.0, range.1, range.2, range.3);
-        f.allows = af_allows;
+        f.allows = af_allows.into();
         f.criteria = af_criteria;
         out.filter = Some(f);
     }
@@ -575,39 +575,403 @@ mod tests {
 }
 
 
-type MergeRect = (u32, u32, u32, u32);
+pub type MergeRect = (u32, u32, u32, u32);
 
-/// Row intervals ordered by their first row, with prefix maxima for the last row.
-/// Retain source indices so overlapping imported merges keep their original precedence.
-#[derive(Default)]
-pub struct MergeIndex {
-    source: Vec<MergeRect>,
+fn next_merge_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Debug)]
+struct MergesMeta {
+    max_row: Option<u32>,
+    max_col: Option<u32>,
     order: Vec<usize>,
     ends: Vec<u32>,
 }
 
+impl MergesMeta {
+    fn build(rects: &[MergeRect]) -> Self {
+        if rects.is_empty() {
+            return Self {
+                max_row: None,
+                max_col: None,
+                order: Vec::new(),
+                ends: Vec::new(),
+            };
+        }
+        let mut max_r = 0u32;
+        let mut max_c = 0u32;
+        for &(_, _, r2, c2) in rects {
+            max_r = max_r.max(r2);
+            max_c = max_c.max(c2);
+        }
+        let mut order: Vec<usize> = (0..rects.len()).collect();
+        order.sort_unstable_by_key(|&i| rects[i].0);
+        let mut bottom = 0u32;
+        let ends: Vec<u32> = order
+            .iter()
+            .map(|&i| {
+                bottom = bottom.max(rects[i].2);
+                bottom
+            })
+            .collect();
+        Self {
+            max_row: Some(max_r),
+            max_col: Some(max_c),
+            order,
+            ends,
+        }
+    }
+
+    #[inline]
+    fn at(&self, rects: &[MergeRect], r: u32, c: u32) -> Option<MergeRect> {
+        if r > self.max_row? || c > self.max_col? {
+            return None;
+        }
+        let start = self.ends.partition_point(|&end| end < r);
+        let end = self.order.partition_point(|&i| rects[i].0 <= r);
+        self.order
+            .get(start..end)?
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let (_, left, bottom, right) = rects[i];
+                r <= bottom && left <= c && c <= right
+            })
+            .min()
+            .map(|i| rects[i])
+    }
+}
+
+#[derive(Debug)]
+struct MergesInner {
+    rects: Vec<MergeRect>,
+    revision: u64,
+    meta: std::sync::OnceLock<MergesMeta>,
+}
+
+impl Clone for MergesInner {
+    fn clone(&self) -> Self {
+        Self {
+            rects: self.rects.clone(),
+            revision: next_merge_revision(),
+            meta: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+/// Copy-on-write merge list with monotonic `revision()`, cached `max_row()` / `max_col()`,
+/// and built-in `O(log M)` interval lookup (`at(r, c)`).
+#[derive(Clone, Debug)]
+pub struct Merges(std::sync::Arc<MergesInner>);
+
+impl Default for Merges {
+    fn default() -> Self {
+        static EMPTY: std::sync::OnceLock<std::sync::Arc<MergesInner>> = std::sync::OnceLock::new();
+        Self(
+            EMPTY
+                .get_or_init(|| {
+                    std::sync::Arc::new(MergesInner {
+                        rects: Vec::new(),
+                        revision: 0,
+                        meta: std::sync::OnceLock::from(MergesMeta {
+                            max_row: None,
+                            max_col: None,
+                            order: Vec::new(),
+                            ends: Vec::new(),
+                        }),
+                    })
+                })
+                .clone(),
+        )
+    }
+}
+
+impl From<Vec<MergeRect>> for Merges {
+    fn from(rects: Vec<MergeRect>) -> Self {
+        if rects.is_empty() {
+            return Self::default();
+        }
+        Self(std::sync::Arc::new(MergesInner {
+            rects,
+            revision: next_merge_revision(),
+            meta: std::sync::OnceLock::new(),
+        }))
+    }
+}
+
+impl FromIterator<MergeRect> for Merges {
+    fn from_iter<T: IntoIterator<Item = MergeRect>>(iter: T) -> Self {
+        let rects: Vec<MergeRect> = iter.into_iter().collect();
+        Self::from(rects)
+    }
+}
+
+impl Merges {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn revision(&self) -> u64 {
+        self.0.revision
+    }
+
+    #[inline]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    #[inline]
+    fn meta(&self) -> &MergesMeta {
+        self.0.meta.get_or_init(|| MergesMeta::build(&self.0.rects))
+    }
+
+    #[inline]
+    pub fn max_row(&self) -> Option<u32> {
+        if self.0.rects.is_empty() {
+            return None;
+        }
+        self.meta().max_row
+    }
+
+    #[inline]
+    pub fn max_col(&self) -> Option<u32> {
+        if self.0.rects.is_empty() {
+            return None;
+        }
+        self.meta().max_col
+    }
+
+    #[inline]
+    pub fn at(&self, r: u32, c: u32) -> Option<MergeRect> {
+        if self.0.rects.is_empty() {
+            return None;
+        }
+        self.meta().at(&self.0.rects, r, c)
+    }
+
+    pub fn merge_range(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) -> bool {
+        let (r1, r2) = (r1.min(r2), r1.max(r2));
+        let (c1, c2) = (c1.min(c2), c1.max(c2));
+        if r1 == r2 && c1 == c2 {
+            return false;
+        }
+        let rects: &mut Vec<MergeRect> = &mut *self;
+        rects.retain(|&(a, b, cc, d)| a > r2 || cc < r1 || b > c2 || d < c1);
+        rects.push((r1, c1, r2, c2));
+        rects.sort_unstable();
+        true
+    }
+
+    pub fn merge_ranges(&mut self, incoming: impl IntoIterator<Item = MergeRect>) -> bool {
+        let normalized: Vec<MergeRect> = incoming
+            .into_iter()
+            .filter_map(|(r1, c1, r2, c2)| {
+                let (r1, r2) = (r1.min(r2), r1.max(r2));
+                let (c1, c2) = (c1.min(c2), c1.max(c2));
+                (r1 != r2 || c1 != c2).then_some((r1, c1, r2, c2))
+            })
+            .collect();
+        if normalized.is_empty() {
+            return false;
+        }
+        let rects: &mut Vec<MergeRect> = &mut *self;
+        if !rects.is_empty() {
+            rects.retain(|&(a, b, cc, d)| {
+                normalized
+                    .iter()
+                    .all(|&(r1, c1, r2, c2)| a > r2 || cc < r1 || b > c2 || d < c1)
+            });
+        }
+        for rect in normalized {
+            rects.retain(|&(a, b, cc, d)| a > rect.2 || cc < rect.0 || b > rect.3 || d < rect.1);
+            rects.push(rect);
+        }
+        rects.sort_unstable();
+        true
+    }
+
+    pub fn unmerge_range(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) -> bool {
+        if self.0.rects.is_empty() {
+            return false;
+        }
+        let (r1, r2) = (r1.min(r2), r1.max(r2));
+        let (c1, c2) = (c1.min(c2), c1.max(c2));
+        if !self
+            .0
+            .rects
+            .iter()
+            .any(|&(a, b, cc, d)| a <= r2 && cc >= r1 && b <= c2 && d >= c1)
+        {
+            return false;
+        }
+        let before = self.0.rects.len();
+        let rects: &mut Vec<MergeRect> = &mut *self;
+        rects.retain(|&(a, b, cc, d)| a > r2 || cc < r1 || b > c2 || d < c1);
+        rects.len() != before
+    }
+}
+
+impl std::ops::Deref for Merges {
+    type Target = Vec<MergeRect>;
+    fn deref(&self) -> &Self::Target {
+        &self.0.rects
+    }
+}
+
+impl std::ops::DerefMut for Merges {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let inner = std::sync::Arc::make_mut(&mut self.0);
+        inner.revision = next_merge_revision();
+        inner.meta.take();
+        &mut inner.rects
+    }
+}
+
+impl AsRef<[MergeRect]> for Merges {
+    fn as_ref(&self) -> &[MergeRect] {
+        &self.0.rects
+    }
+}
+
+impl PartialEq for Merges {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.revision == other.0.revision || self.0.rects == other.0.rects
+    }
+}
+
+impl Eq for Merges {}
+
+impl PartialEq<Vec<MergeRect>> for Merges {
+    fn eq(&self, other: &Vec<MergeRect>) -> bool {
+        self.0.rects.as_slice() == other.as_slice()
+    }
+}
+
+impl PartialEq<[MergeRect]> for Merges {
+    fn eq(&self, other: &[MergeRect]) -> bool {
+        self.0.rects.as_slice() == other
+    }
+}
+
+impl PartialEq<&[MergeRect]> for Merges {
+    fn eq(&self, other: &&[MergeRect]) -> bool {
+        self.0.rects.as_slice() == *other
+    }
+}
+
+impl<const N: usize> PartialEq<[MergeRect; N]> for Merges {
+    fn eq(&self, other: &[MergeRect; N]) -> bool {
+        self.0.rects.as_slice() == other.as_slice()
+    }
+}
+
+impl IntoIterator for Merges {
+    type Item = MergeRect;
+    type IntoIter = std::vec::IntoIter<MergeRect>;
+    fn into_iter(self) -> Self::IntoIter {
+        std::sync::Arc::unwrap_or_clone(self.0).rects.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Merges {
+    type Item = &'a MergeRect;
+    type IntoIter = std::slice::Iter<'a, MergeRect>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.rects.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Merges {
+    type Item = &'a mut MergeRect;
+    type IntoIter = std::slice::IterMut<'a, MergeRect>;
+    fn into_iter(self) -> Self::IntoIter {
+        (&mut **self).iter_mut()
+    }
+}
+
+/// Row intervals ordered by their first row, with prefix maxima for the last row.
+/// Retain source indices so overlapping imported merges keep their original precedence.
+#[derive(Default, Clone, Debug)]
+pub struct MergeIndex {
+    revision: Option<u64>,
+    source: Vec<MergeRect>,
+    order: Vec<usize>,
+    ends: Vec<u32>,
+    max_row: Option<u32>,
+    max_col: Option<u32>,
+}
+
 impl MergeIndex {
+    /// O(1) revision-checked refresh against `Sheet::merges`.
+    pub fn refresh_merges(&mut self, merges: &Merges) {
+        let rev = merges.revision();
+        if self.revision == Some(rev) {
+            return;
+        }
+        self.rebuild_from_slice(&merges.0.rects);
+        self.revision = Some(rev);
+    }
+
     pub fn refresh(&mut self, merges: &[MergeRect]) {
-        if self.source == merges { return; }
+        if self.source == merges {
+            return;
+        }
+        self.rebuild_from_slice(merges);
+        self.revision = None;
+    }
+
+    fn rebuild_from_slice(&mut self, merges: &[MergeRect]) {
         self.source.clear();
         self.source.extend_from_slice(merges);
         self.order.clear();
         self.order.extend(0..merges.len());
         self.order.sort_unstable_by_key(|&i| merges[i].0);
-        let mut bottom = 0;
+        let mut bottom = 0u32;
+        let mut right_max = 0u32;
         self.ends.clear();
-        self.ends.extend(self.order.iter().map(|&i| {
+        self.ends.reserve(merges.len());
+        for &i in &self.order {
             bottom = bottom.max(merges[i].2);
-            bottom
-        }));
+            right_max = right_max.max(merges[i].3);
+            self.ends.push(bottom);
+        }
+        if merges.is_empty() {
+            self.max_row = None;
+            self.max_col = None;
+        } else {
+            self.max_row = Some(bottom);
+            self.max_col = Some(right_max);
+        }
+    }
+
+    #[inline]
+    pub fn max_row(&self) -> Option<u32> {
+        self.max_row
+    }
+
+    #[inline]
+    pub fn max_col(&self) -> Option<u32> {
+        self.max_col
     }
 
     pub fn at(&self, r: u32, c: u32) -> Option<MergeRect> {
+        if self.source.is_empty() || r > self.max_row? || c > self.max_col? {
+            return None;
+        }
         let start = self.ends.partition_point(|&end| end < r);
         let end = self.order.partition_point(|&i| self.source[i].0 <= r);
-        self.order.get(start..end)?.iter().copied().filter(|&i| {
-            let (_, left, bottom, right) = self.source[i];
-            r <= bottom && left <= c && c <= right
-        }).min().map(|i| self.source[i])
+        self.order
+            .get(start..end)?
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let (_, left, bottom, right) = self.source[i];
+                r <= bottom && left <= c && c <= right
+            })
+            .min()
+            .map(|i| self.source[i])
     }
 }

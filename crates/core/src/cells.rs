@@ -24,8 +24,8 @@ fn used(sheet: &Sheet) -> Option<(u32, u32)> {
     if let Some((_, _, r2, c2)) = sheet.used_bounds() {
         bump(r2, c2);
     }
-    for k in sheet.styles.keys() {
-        bump(k.row, k.col);
+    if let Some((r2, c2)) = sheet.styles.max_coords() {
+        bump(r2, c2);
     }
     for k in sheet.notes.keys() {
         bump(k.row, k.col);
@@ -36,67 +36,118 @@ fn used(sheet: &Sheet) -> Option<(u32, u32)> {
     for &(r, c) in sheet.hyperlinks.keys() {
         bump(r, c);
     }
-    for &(_, _, r2, c2) in &sheet.merges {
-        bump(r2, c2);
+    if let (Some(mr), Some(mc)) = (sheet.max_merge_row(), sheet.max_merge_col()) {
+        bump(mr, mc);
     }
     max_r.zip(max_c)
 }
 
-fn clear_slot(sheet: &mut Sheet, pos: (u32, u32)) {
-    sheet.remove(pos.0, pos.1);
-    let k = CellRef::new(pos.0, pos.1);
-    sheet.styles.remove(&k);
-    if sheet.notes.remove(&k).is_some() {
-        sheet.notes_dirty = true;
-    }
-    if sheet.rich.remove(&pos).is_some() {
-        sheet.rich_dirty = true;
-    }
-    if sheet.hyperlinks.remove(&pos).is_some() {
-        sheet.hyperlinks_dirty = true;
-    }
-}
-
-fn move_slot(sheet: &mut Sheet, from: (u32, u32), to: (u32, u32)) {
-    if from == to {
+fn shift_sparse_ray(
+    sheet: &mut Sheet,
+    ray: (u32, u32, u32, u32),
+    map_coord: impl Fn(u32, u32) -> Option<(u32, u32)>,
+) {
+    let (r1, c1, r2, c2) = ray;
+    if r1 > r2 || c1 > c2 {
         return;
     }
-    if let Some(cell) = sheet.get(from.0, from.1).cloned() {
-        sheet.remove(from.0, from.1);
-        sheet.set(to.0, to.1, cell);
-    } else {
-        sheet.remove(to.0, to.1);
+    let cells: Vec<(CellRef, crate::model::Cell)> = sheet
+        .iter_rect(ray)
+        .map(|(k, c)| (k, c.clone()))
+        .collect();
+    for (k, _) in &cells {
+        sheet.remove(k.row, k.col);
+    }
+    for (k, cell) in cells {
+        if let Some((nr, nc)) = map_coord(k.row, k.col) {
+            sheet.set(nr, nc, cell);
+        }
     }
 
-    let k_from = CellRef::new(from.0, from.1);
-    let k_to = CellRef::new(to.0, to.1);
-    if let Some(st) = sheet.styles.remove(&k_from) {
-        sheet.set_style(to.0, to.1, st);
-    } else {
-        sheet.styles.remove(&k_to);
+    let styles: Vec<(CellRef, u16)> = sheet.styles.iter_rect(ray).collect();
+    if !styles.is_empty() {
+        for &(k, _) in &styles {
+            if sheet.styles.remove(&k).is_some() {
+                sheet.style_edits.insert(k);
+            }
+        }
+        sheet.styles_dirty = true;
+        for (k, st) in styles {
+            if let Some((nr, nc)) = map_coord(k.row, k.col) {
+                sheet.set_style(nr, nc, st);
+            }
+        }
     }
 
-    if let Some(mut n) = sheet.notes.remove(&k_from) {
-        n.r = to.0;
-        n.c = to.1;
-        sheet.notes.insert(k_to, n);
-        sheet.notes_dirty = true;
-    } else if sheet.notes.remove(&k_to).is_some() {
-        sheet.notes_dirty = true;
+    if !sheet.notes.is_empty() {
+        let keys: Vec<CellRef> = sheet
+            .notes
+            .keys()
+            .filter(|k| k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
+            .copied()
+            .collect();
+        if !keys.is_empty() {
+            sheet.notes_dirty = true;
+            let mut moved = Vec::with_capacity(keys.len());
+            for k in keys {
+                if let Some(mut note) = sheet.notes.remove(&k)
+                    && let Some((nr, nc)) = map_coord(k.row, k.col)
+                {
+                    note.r = nr;
+                    note.c = nc;
+                    moved.push((CellRef::new(nr, nc), note));
+                }
+            }
+            for (nk, note) in moved {
+                sheet.notes.insert(nk, note);
+            }
+        }
     }
 
-    if let Some(v) = sheet.rich.remove(&from) {
-        sheet.rich.insert(to, v);
-        sheet.rich_dirty = true;
-    } else if sheet.rich.remove(&to).is_some() {
-        sheet.rich_dirty = true;
+    if !sheet.rich.is_empty() {
+        let keys: Vec<(u32, u32)> = sheet
+            .rich
+            .keys()
+            .filter(|&&(r, c)| r >= r1 && r <= r2 && c >= c1 && c <= c2)
+            .copied()
+            .collect();
+        if !keys.is_empty() {
+            sheet.rich_dirty = true;
+            let mut moved = Vec::with_capacity(keys.len());
+            for pos in keys {
+                if let Some(runs) = sheet.rich.remove(&pos)
+                    && let Some(dest) = map_coord(pos.0, pos.1)
+                {
+                    moved.push((dest, runs));
+                }
+            }
+            for (dest, runs) in moved {
+                sheet.rich.insert(dest, runs);
+            }
+        }
     }
 
-    if let Some(v) = sheet.hyperlinks.remove(&from) {
-        sheet.hyperlinks.insert(to, v);
-        sheet.hyperlinks_dirty = true;
-    } else if sheet.hyperlinks.remove(&to).is_some() {
-        sheet.hyperlinks_dirty = true;
+    if !sheet.hyperlinks.is_empty() {
+        let keys: Vec<(u32, u32)> = sheet
+            .hyperlinks
+            .keys()
+            .filter(|&&(r, c)| r >= r1 && r <= r2 && c >= c1 && c <= c2)
+            .copied()
+            .collect();
+        if !keys.is_empty() {
+            sheet.hyperlinks_dirty = true;
+            let mut moved = Vec::with_capacity(keys.len());
+            for pos in keys {
+                if let Some(link) = sheet.hyperlinks.remove(&pos)
+                    && let Some(dest) = map_coord(pos.0, pos.1)
+                {
+                    moved.push((dest, link));
+                }
+            }
+            for (dest, link) in moved {
+                sheet.hyperlinks.insert(dest, link);
+            }
+        }
     }
 }
 
@@ -118,21 +169,8 @@ pub fn insert(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u3
             if c1 > c2_eff {
                 return;
             }
-            for c in c1..=c2_eff {
-                if used_r2 >= r1 {
-                    let mut r = used_r2;
-                    loop {
-                        move_slot(sheet, (r, c), (r + n, c));
-                        if r == r1 {
-                            break;
-                        }
-                        r -= 1;
-                    }
-                }
-                // 清出插入的空白带
-                for rr in r1..(r1 + n) {
-                    clear_slot(sheet, (rr, c));
-                }
+            if used_r2 >= r1 {
+                shift_sparse_ray(sheet, (r1, c1, used_r2, c2_eff), |r, c| Some((r + n, c)));
             }
             let mut merges_changed = false;
             for m in sheet.merges.iter_mut() {
@@ -155,20 +193,8 @@ pub fn insert(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u3
             if r1 > r2_eff {
                 return;
             }
-            for r in r1..=r2_eff {
-                if used_c2 >= c1 {
-                    let mut c = used_c2;
-                    loop {
-                        move_slot(sheet, (r, c), (r, c + n));
-                        if c == c1 {
-                            break;
-                        }
-                        c -= 1;
-                    }
-                }
-                for cc in c1..(c1 + n) {
-                    clear_slot(sheet, (r, cc));
-                }
+            if used_c2 >= c1 {
+                shift_sparse_ray(sheet, (r1, c1, r2_eff, used_c2), |r, c| Some((r, c + n)));
             }
             let mut merges_changed = false;
             for m in sheet.merges.iter_mut() {
@@ -202,16 +228,9 @@ pub fn delete(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u3
                 return;
             }
             let c2_eff = c2.min(used_c2);
-            for c in c1..=c2_eff {
-                for r in r1..=used_r2 {
-                    let src = r + n;
-                    if src <= used_r2 {
-                        move_slot(sheet, (src, c), (r, c));
-                    } else {
-                        clear_slot(sheet, (r, c));
-                    }
-                }
-            }
+            shift_sparse_ray(sheet, (r1, c1, used_r2, c2_eff), |r, c| {
+                (r >= r1 + n).then(|| (r - n, c))
+            });
             let before_len = sheet.merges.len();
             let mut merges_changed = false;
             sheet.merges.retain_mut(|m| {
@@ -237,16 +256,9 @@ pub fn delete(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u3
                 return;
             }
             let r2_eff = r2.min(used_r2);
-            for r in r1..=r2_eff {
-                for c in c1..=used_c2 {
-                    let src = c + n;
-                    if src <= used_c2 {
-                        move_slot(sheet, (r, src), (r, c));
-                    } else {
-                        clear_slot(sheet, (r, c));
-                    }
-                }
-            }
+            shift_sparse_ray(sheet, (r1, c1, r2_eff, used_c2), |r, c| {
+                (c >= c1 + n).then(|| (r, c - n))
+            });
             let before_len = sheet.merges.len();
             let mut merges_changed = false;
             sheet.merges.retain_mut(|m| {

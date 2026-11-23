@@ -317,6 +317,14 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         ..Default::default()
     };
 
+    // 预编译筛选允许集：O(1) 哈希匹配替代逐行 Vec 线性扫描
+    let compiled_filters: Vec<(u32, std::collections::HashSet<&str>)> = spec
+        .filters
+        .iter()
+        .filter(|f| !f.keep.is_empty())
+        .map(|f| (f.col, f.keep.iter().map(String::as_str).collect()))
+        .collect();
+
     // 收集：行路径 → 列路径 → 每个值字段的累计
     let mut data: BTreeMap<Vec<String>, CellMap> = BTreeMap::new();
     // 首次出现序号：排序口径切到「数据源顺序」时用
@@ -324,12 +332,13 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
     let mut col_first: std::collections::HashMap<Vec<String>, usize> = Default::default();
     for r in (r1 + 1)..=r2 {
         let mut keep = true;
-        for f in &spec.filters {
-            if f.keep.is_empty() {
-                continue;
-            }
-            let v = sheet.get(r, f.col).map(|x| x.value.display()).unwrap_or_default();
-            if !f.keep.iter().any(|k| *k == v) {
+        for (col, allowed) in &compiled_filters {
+            let v = sheet.value_ref(r, *col);
+            let matched = match v {
+                Value::Text(t) => allowed.contains(t.as_ref()),
+                other => allowed.contains(other.display().as_str()),
+            };
+            if !matched {
                 keep = false;
                 break;
             }
@@ -337,44 +346,50 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         if !keep {
             continue;
         }
-        let get = |c: u32| sheet.get(r, c).map(|x| x.value.clone()).unwrap_or(Value::Empty);
         let row_path: Vec<String> = spec
             .rows
             .iter()
-            .map(|f| group_key(&get(f.col), &f.group))
+            .map(|f| group_key(sheet.value_ref(r, f.col), &f.group))
             .collect();
         let col_path: Vec<String> = spec
             .cols
             .iter()
-            .map(|f| group_key(&get(f.col), &f.group))
+            .map(|f| group_key(sheet.value_ref(r, f.col), &f.group))
             .collect();
-        // 数据源顺序（Excel 打开既有文件时的 rowItems 口径）
-        let next = row_first.len();
-        row_first.entry(row_path.clone()).or_insert(next);
-        let nextc = col_first.len();
-        col_first.entry(col_path.clone()).or_insert(nextc);
+        if !row_first.contains_key(&row_path) {
+            row_first.insert(row_path.clone(), row_first.len());
+        }
+        if !col_first.contains_key(&col_path) {
+            col_first.insert(col_path.clone(), col_first.len());
+        }
         let entry = data.entry(row_path).or_default().entry(col_path).or_default();
-        entry.resize(spec.values.len(), Acc::default());
+        if entry.len() < spec.values.len() {
+            entry.resize(spec.values.len(), Acc::default());
+        }
         for (i, vf) in spec.values.iter().enumerate() {
             entry[i].push(sheet.get(r, vf.col).map(|x| &x.value));
         }
     }
 
-    // 列叶子标签
-    let mut col_paths: Vec<Vec<String>> = Vec::new();
-    for m in data.values() {
-        for k in m.keys() {
-            if !col_paths.contains(k) {
-                col_paths.push(k.clone());
-            }
-        }
-    }
-    match spec.layout.sort {
+    // 列叶子标签：直接从 col_first 提取唯一路径（消除 O(C²) Vec::contains），并预计算一次拼音排序键！
+    let mut col_paths: Vec<Vec<String>> = match spec.layout.sort {
         AxisSort::Pinyin => {
-            col_paths.sort_by(|a, b| crate::collate::cmp_pinyin(&a.join(" / "), &b.join(" / ")))
+            let mut decorated: Vec<(Vec<u8>, Vec<String>)> = col_first
+                .keys()
+                .map(|p| (crate::collate::sort_key(&p.join(" / ")), p.clone()))
+                .collect();
+            decorated.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            decorated.into_iter().map(|(_, p)| p).collect()
         }
-        AxisSort::Source => col_paths.sort_by_key(|k| col_first.get(k).cloned().unwrap_or(usize::MAX)),
-    }
+        AxisSort::Source => {
+            let mut pairs: Vec<(usize, Vec<String>)> = col_first
+                .iter()
+                .map(|(p, &ord)| (ord, p.clone()))
+                .collect();
+            pairs.sort_unstable_by_key(|&(ord, _)| ord);
+            pairs.into_iter().map(|(_, p)| p).collect()
+        }
+    };
     if col_paths.is_empty() && spec.cols.is_empty() {
         col_paths.push(Vec::new());
     }
@@ -503,15 +518,23 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         grid.headers.push(row);
     }
 
-    // 逐组输出 + 小计 + 总计
+    // 逐组输出 + 小计 + 总计（预计算一次拼音排序键，移出 sort_by 闭包！）
     let mut prev: Vec<String> = vec![String::new(); spec.rows.len()];
-    let mut keys: Vec<Vec<String>> = data.keys().cloned().collect();
-    match spec.layout.sort {
+    let keys: Vec<Vec<String>> = match spec.layout.sort {
         AxisSort::Pinyin => {
-            keys.sort_by(|a, b| crate::collate::cmp_pinyin(&a.join(" / "), &b.join(" / ")))
+            let mut decorated: Vec<(Vec<u8>, Vec<String>)> = data
+                .keys()
+                .map(|k| (crate::collate::sort_key(&k.join(" / ")), k.clone()))
+                .collect();
+            decorated.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            decorated.into_iter().map(|(_, k)| k).collect()
         }
-        AxisSort::Source => keys.sort_by_key(|k| row_first.get(k).cloned().unwrap_or(usize::MAX)),
-    }
+        AxisSort::Source => {
+            let mut ks: Vec<Vec<String>> = data.keys().cloned().collect();
+            ks.sort_by_key(|k| row_first.get(k).copied().unwrap_or(usize::MAX));
+            ks
+        }
+    };
     let mut grand: Vec<Vec<Acc>> = vec![vec![Acc::default(); spec.values.len()]; slots.len()];
     let mut i = 0;
     while i < keys.len() {

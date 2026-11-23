@@ -33,7 +33,7 @@ pub(super) struct Uses(HashSet<(Location, Arc<str>)>);
 impl Uses {
     pub(super) fn covers(&self, wb: &Workbook, target: usize, op: &Shift) -> bool {
         let mut covered = true;
-        visit(wb, target, op, |entry| covered &= self.0.contains(&entry));
+        visit(wb, target, op, None, |entry| covered &= self.0.contains(&entry));
         covered
     }
 
@@ -53,66 +53,146 @@ impl Uses {
     }
 }
 
+#[inline]
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let first = needle[0];
+    let first_lo = first.to_ascii_lowercase();
+    let first_hi = first.to_ascii_uppercase();
+    let end = haystack.len() - needle.len();
+    let mut i = 0;
+    while i <= end {
+        let b = haystack[i];
+        if (b == first_lo || b == first_hi)
+            && haystack[i..i + needle.len()].eq_ignore_ascii_case(needle)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[inline]
+fn may_mention_foreign_sheet(text: &str, target_name: &str, fast_byte_filter_ok: bool) -> bool {
+    if !text.contains('!') {
+        return false;
+    }
+    if fast_byte_filter_ok {
+        contains_ascii_ci(text.as_bytes(), target_name.as_bytes())
+    } else {
+        true
+    }
+}
+
 pub(super) fn collect(wb: &Workbook, target: usize, op: &Shift) -> Uses {
     let mut uses = Uses::default();
-    visit(wb, target, op, |entry| {
+    visit(wb, target, op, None, |entry| {
         uses.0.insert(entry);
     });
     uses
 }
 
-fn visit(wb: &Workbook, target: usize, op: &Shift, mut emit: impl FnMut((Location, Arc<str>))) {
+/// Single-pass foreign reference + `Uses` collector for `snapshot_structure`,
+/// avoiding rewriting every foreign formula/CF/DV/chart twice.
+pub(super) fn collect_with_foreign(
+    wb: &Workbook,
+    target: usize,
+    op: &Shift,
+) -> (Uses, Vec<super::ForeignReferences>) {
+    let mut uses = Uses::default();
+    let mut foreign = Vec::new();
+    visit(wb, target, op, Some(&mut foreign), |entry| {
+        uses.0.insert(entry);
+    });
+    (uses, foreign)
+}
+
+fn visit(
+    wb: &Workbook,
+    target: usize,
+    op: &Shift,
+    mut foreign_out: Option<&mut Vec<super::ForeignReferences>>,
+    mut emit: impl FnMut((Location, Arc<str>)),
+) {
     let mut shift = op.clone();
     let target_name = &wb.sheets[target].name;
     shift.target_sheet.clone_from(target_name);
+    let fast_filter_ok = !target_name.contains('\'')
+        && target_name
+            .chars()
+            .all(|c| c.is_ascii() || (!c.is_uppercase() && !c.is_lowercase()));
     for (index, sheet) in wb.sheets.iter().enumerate() {
         if index == target {
             continue;
         }
         shift.own_sheet.clone_from(&sheet.name);
         let id = sheet.identity;
-        let changes = |text: &str| text.contains('!') && crate::refs::rewrite(text, &shift) != text;
+        let changes = |text: &str| {
+            may_mention_foreign_sheet(text, target_name, fast_filter_ok)
+                && crate::refs::rewrite(text, &shift) != text
+        };
+        let capture_foreign = foreign_out.is_some();
+        let mut foreign_cells = Vec::new();
         for (key, cell) in sheet.foreign_formula_cells(target_name) {
             if let Some(text) = cell.formula.as_ref().filter(|f| changes(f)) {
                 emit((Location::Cell(id, key), text.clone()));
+                if capture_foreign {
+                    foreign_cells.push((key, cell.clone()));
+                }
             }
         }
-        let mut record = |loc, text: &str| {
-            if changes(text) {
-                emit((loc, text.into()));
-            }
-        };
+        let mut dv_changed = false;
         for (i, dv) in sheet.dv.iter().enumerate() {
-            record(Location::Validation(id, i, 0), &dv.f1);
-            record(Location::Validation(id, i, 1), &dv.f2);
+            if changes(&dv.f1) {
+                emit((Location::Validation(id, i, 0), dv.f1.as_str().into()));
+                dv_changed = true;
+            }
+            if changes(&dv.f2) {
+                emit((Location::Validation(id, i, 1), dv.f2.as_str().into()));
+                dv_changed = true;
+            }
         }
+        let mut cf_changed = false;
         for (i, block) in sheet.cf.blocks.iter().enumerate() {
             for (j, rule) in block.rules.iter().enumerate() {
-                let mut add = |slot, text: &str| record(Location::Condition(id, i, j, slot), text);
+                let mut add = |slot, text: &str, capture_cf: bool| {
+                    if changes(text) {
+                        emit((Location::Condition(id, i, j, slot), text.into()));
+                        if capture_cf {
+                            cf_changed = true;
+                        }
+                    }
+                };
                 match &rule.kind {
-                    CfKind::Expr { formula, .. } => add(0, formula),
+                    CfKind::Expr { formula, .. } => add(0, formula, true),
                     CfKind::CellIs { a, b, .. } => {
-                        add(0, a);
-                        add(1, b);
+                        add(0, a, true);
+                        add(1, b, true);
                     }
                     CfKind::Scale { points } => {
                         for (k, (v, _)) in points.iter().enumerate() {
                             if v.kind == CfvoKind::Formula {
-                                add(k, &v.formula);
+                                add(k, &v.formula, false);
                             }
                         }
                     }
                     CfKind::Bar { min, max, .. } => {
                         for (k, v) in [min, max].into_iter().enumerate() {
                             if v.kind == CfvoKind::Formula {
-                                add(k, &v.formula);
+                                add(k, &v.formula, false);
                             }
                         }
                     }
                     CfKind::IconSet { thresholds, .. } => {
                         for (k, v) in thresholds.iter().enumerate() {
                             if v.kind == CfvoKind::Formula {
-                                add(k, &v.formula);
+                                add(k, &v.formula, false);
                             }
                         }
                     }
@@ -120,29 +200,60 @@ fn visit(wb: &Workbook, target: usize, op: &Shift, mut emit: impl FnMut((Locatio
                 }
             }
         }
+        let mut charts_changed = false;
         for (i, chart) in sheet.charts.iter().enumerate() {
             for (j, series) in chart.series.iter().enumerate() {
                 for (k, text) in [&series.name_ref, &series.cat_ref, &series.val_ref]
                     .into_iter()
                     .enumerate()
                 {
-                    record(Location::Chart(id, i, j, k), text);
+                    if changes(text) {
+                        emit((Location::Chart(id, i, j, k), text.as_str().into()));
+                        charts_changed = true;
+                    }
                 }
             }
         }
         for (&(row, col), link) in sheet.hyperlinks.iter() {
-            if !link.external {
-                record(Location::Hyperlink(id, row, col), &link.location);
+            if !link.external && changes(&link.location) {
+                emit((Location::Hyperlink(id, row, col), link.location.as_str().into()));
             }
         }
+        let mut sparklines_ref_target = false;
         for sp in &sheet.sparklines {
-            if sp
+            let same_source = sp
                 .source_sheet
                 .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(target_name))
-                && rect_moves(&shift, sp.rect)
+                .is_some_and(|n| n.eq_ignore_ascii_case(target_name));
+            if same_source {
+                if sp.source_sheet.as_deref() == Some(target_name.as_str()) {
+                    sparklines_ref_target = true;
+                }
+                if rect_moves(&shift, sp.rect) {
+                    emit((Location::Spark(id, sp.r, sp.c, sp.rect), "".into()));
+                }
+            }
+        }
+        if let Some(out) = foreign_out.as_deref_mut() {
+            let cf = cf_changed.then(|| sheet.cf.clone());
+            let dv = dv_changed.then(|| sheet.dv.clone());
+            let charts = charts_changed.then(|| sheet.charts.clone());
+            let sparklines = sparklines_ref_target.then(|| sheet.sparklines.clone());
+            if !foreign_cells.is_empty()
+                || cf.is_some()
+                || dv.is_some()
+                || charts.is_some()
+                || sparklines.is_some()
             {
-                emit((Location::Spark(id, sp.r, sp.c, sp.rect), "".into()));
+                out.push(super::ForeignReferences {
+                    sheet: index,
+                    identity: id,
+                    cells: foreign_cells,
+                    cf,
+                    dv,
+                    charts,
+                    sparklines,
+                });
             }
         }
     }

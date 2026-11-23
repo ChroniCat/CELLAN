@@ -44,25 +44,30 @@ impl SortKey {
     }
 }
 
-/// Precompute the display, locale and stroke keys once per row and sort level.
+/// Precompute the display, locale and stroke keys once per unique/needed row and sort level.
 struct PreparedKey {
     number: Option<f64>,
     boolean: Option<bool>,
     empty: bool,
-    text: Vec<u8>,
+    text: Box<[u8]>,
     custom: Option<usize>,
-    strokes: Vec<Option<u16>>,
+    strokes: Box<[Option<u16>]>,
 }
 
 impl PreparedKey {
-    fn new(value: &Value, spec: &SortKey, ranks: &HashMap<String, usize>) -> Self {
+    fn new(
+        value: &Value,
+        spec: &SortKey,
+        ranks: &HashMap<String, usize>,
+        key_cache: &mut crate::collate::SortKeyCache,
+    ) -> Self {
         let mut result = Self {
             number: None,
             boolean: None,
             empty: false,
-            text: Vec::new(),
+            text: Box::default(),
             custom: None,
-            strokes: Vec::new(),
+            strokes: Box::default(),
         };
         match value {
             Value::Number(n) => {
@@ -76,10 +81,23 @@ impl PreparedKey {
             Value::Bool(b) => result.boolean = Some(*b),
             _ => {}
         }
-        let mut text = value.display();
-        if spec.ignore_case {
-            text = text.to_lowercase();
-        }
+        let owned_buf: String;
+        let text: &str = match value {
+            Value::Text(t) if !spec.ignore_case || (t.is_ascii() && !t.bytes().any(|b| b.is_ascii_uppercase())) => t.as_ref(),
+            Value::Text(t) => {
+                owned_buf = t.to_lowercase();
+                &owned_buf
+            }
+            _ => {
+                let disp = value.display();
+                owned_buf = if spec.ignore_case {
+                    disp.to_lowercase()
+                } else {
+                    disp
+                };
+                &owned_buf
+            }
+        };
         if matches!(spec.mode, SortMode::Stroke) {
             result.strokes = text.chars().map(crate::collate::stroke_rank).collect();
         }
@@ -87,9 +105,9 @@ impl PreparedKey {
             result.custom = ranks.get(&text.trim().to_ascii_lowercase()).copied();
         }
         result.text = if matches!(spec.mode, SortMode::Default) {
-            text.into_bytes()
+            text.as_bytes().into()
         } else {
-            crate::collate::sort_key(&text)
+            key_cache.get_or_compute(text).into()
         };
         result
     }
@@ -116,7 +134,7 @@ impl PreparedKey {
     }
 
     fn compare_text(&self, other: &Self) -> Ordering {
-        for (a, b) in self.strokes.iter().zip(&other.strokes) {
+        for (a, b) in self.strokes.iter().zip(other.strokes.iter()) {
             match (a, b) {
                 (Some(x), Some(y)) if x != y => return x.cmp(y),
                 (Some(_), Some(_)) => {}
@@ -293,16 +311,30 @@ impl CompactSort {
             Self::Mixed { source,index,region,order,horizontal,.. } => {
                 let (r1,c1,r2,c2) = *region;
                 let (first, start, end) = if *horizontal { (c1,r1,r2) } else { (r1,c1,c2) };
+                let cache = std::rc::Rc::new(std::cell::RefCell::new(crate::refs::FillFormulas::default()));
                 Box::new(order.iter().copied().enumerate().filter(move |&(dst,src)| first+dst as u32 != src)
-                    .flat_map(move |(dst,src)| (start..=end).filter_map(move |offset|
-                        reorder_delta(source,*index,first+dst as u32,Some(src),offset,*horizontal,false))))
+                    .flat_map(move |(dst,src)| {
+                        let cache = cache.clone();
+                        (start..=end).filter_map(move |offset| {
+                            let mut fill = cache.borrow_mut();
+                            reorder_delta_cached(source,*index,first+dst as u32,Some(src),offset,*horizontal,false,&mut fill)
+                        })
+                    }))
             }
         }
     }
 }
 
-fn reorder_delta(sheet: &Sheet, sheet_idx: usize, dst: u32, src: Option<u32>, offset: u32,
-                 horizontal: bool, dedup: bool) -> Option<CellDelta> {
+fn reorder_delta_cached(
+    sheet: &Sheet,
+    sheet_idx: usize,
+    dst: u32,
+    src: Option<u32>,
+    offset: u32,
+    horizontal: bool,
+    dedup: bool,
+    fill_cache: &mut crate::refs::FillFormulas,
+) -> Option<CellDelta> {
     if src == Some(dst) {
         return None;
     }
@@ -319,13 +351,13 @@ fn reorder_delta(sheet: &Sheet, sheet_idx: usize, dst: u32, src: Option<u32>, of
         .filter(|_| !dedup)
         .map(|formula| {
             let shift = i64::from(dst) - i64::from(src.unwrap());
-            crate::refs::translate(
-                formula,
-                if horizontal { 0 } else { shift },
-                if horizontal { shift } else { 0 },
-                &sheet.name,
-            )
-            .into()
+            let dr = if horizontal { 0 } else { shift };
+            let dc = if horizontal { shift } else { 0 };
+            if !formula.contains('!') {
+                fill_cache.translate(formula, dr, dc).into()
+            } else {
+                crate::refs::translate(formula, dr, dc, &sheet.name).into()
+            }
         });
     if translated.is_none() && before == source && before_style == after_style {
         return None;
@@ -389,9 +421,19 @@ pub(crate) fn reorder_lines(
         return changes;
     }
 
+    let mut fill_cache = crate::refs::FillFormulas::default();
     let mut collect = |dst: u32, offset: u32| {
         let src = order.get((dst - first) as usize).copied();
-        if let Some(d) = reorder_delta(sheet, sheet_idx, dst, src, offset, horizontal, dedup) {
+        if let Some(d) = reorder_delta_cached(
+            sheet,
+            sheet_idx,
+            dst,
+            src,
+            offset,
+            horizontal,
+            dedup,
+            &mut fill_cache,
+        ) {
             changes.deltas.push(d);
         }
     };
@@ -415,10 +457,12 @@ pub(crate) fn reorder_lines(
             inverse[(src - first) as usize] = Some(first + i as u32);
         }
         let mut candidates = Vec::new();
-        for k in sheet.stored_cells().map(|(k, _)| k).chain(sheet.styles.keys()) {
-            if k.row < r1 || k.row > r2 || k.col < c1 || k.col > c2 {
-                continue;
-            }
+        for k in sheet
+            .cells()
+            .stored_cells_in(rect)
+            .map(|(k, _)| k)
+            .chain(sheet.styles.iter_rect(rect).map(|(k, _)| k))
+        {
             let (line, offset) = if horizontal { (k.col, k.row) } else { (k.row, k.col) };
             if order.get((line - first) as usize) != Some(&line) {
                 candidates.push((line, offset));
@@ -503,30 +547,148 @@ fn multi_sort_order(sheet: &Sheet, region: (u32,u32,u32,u32), keys: &[SortKey], 
         }
     }
     crate::sort_filter::validate_sort_region(sheet, (r1, c1, r2, c2))?;
-    let mut order: Vec<_> = (r1..=r2).collect();
-    for key in keys.iter().rev().filter(|k| (c1..=c2).contains(&k.col)) {
+    let mut order: Vec<u32> = (r1..=r2).collect();
+    let active: Vec<&SortKey> = keys.iter().filter(|k| (c1..=c2).contains(&k.col)).collect();
+    if active.is_empty() {
+        return Ok(Some(((r1, c1, r2, c2), false, order)));
+    }
+
+    // Top-down MSD tie-refinement: sort all rows by primary key once, then evaluate
+    // secondary/tertiary keys ONLY on tied sub-slices (`len > 1`).
+    let mut ties: Vec<std::ops::Range<usize>> = vec![0..order.len()];
+    for key in active {
+        if ties.is_empty() {
+            break;
+        }
         let mut ranks = HashMap::new();
         if let SortMode::Custom(values) = &key.mode {
             for (idx, value) in values.iter().enumerate() {
                 ranks.entry(value.trim().to_ascii_lowercase()).or_insert(idx);
             }
         }
-        let values: Vec<_> = (r1..=r2)
-            .map(|r| {
-                let value = sheet.get(r, key.col).map(|cell| &cell.value).unwrap_or(&Value::Empty);
-                PreparedKey::new(value, key, &ranks)
-            })
-            .collect();
-        // Stable passes keep ties in the order established by lower priorities.
-        order.sort_by(|&a, &b| values[(a - r1) as usize].compare(&values[(b - r1) as usize], key.asc));
+        let mut key_cache = crate::collate::SortKeyCache::new();
+        let mut next_ties: Vec<std::ops::Range<usize>> = Vec::new();
+
+        if ties.len() == 1 && ties[0] == (0..order.len()) {
+            let prepared: Vec<PreparedKey> = (r1..=r2)
+                .map(|r| PreparedKey::new(sheet.value_ref(r, key.col), key, &ranks, &mut key_cache))
+                .collect();
+            order.sort_by(|&a, &b| {
+                prepared[(a - r1) as usize].compare(&prepared[(b - r1) as usize], key.asc)
+            });
+            let mut i = 0usize;
+            while i < order.len() {
+                let mut j = i + 1;
+                while j < order.len()
+                    && prepared[(order[i] - r1) as usize]
+                        .compare(&prepared[(order[j] - r1) as usize], key.asc)
+                        == Ordering::Equal
+                {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    next_ties.push(i..j);
+                }
+                i = j;
+            }
+        } else {
+            for span in ties {
+                let mut local: Vec<(PreparedKey, u32)> = order[span.clone()]
+                    .iter()
+                    .map(|&r| {
+                        (
+                            PreparedKey::new(sheet.value_ref(r, key.col), key, &ranks, &mut key_cache),
+                            r,
+                        )
+                    })
+                    .collect();
+                local.sort_by(|a, b| a.0.compare(&b.0, key.asc));
+                let mut i = 0usize;
+                while i < local.len() {
+                    let mut j = i + 1;
+                    while j < local.len() && local[i].0.compare(&local[j].0, key.asc) == Ordering::Equal {
+                        j += 1;
+                    }
+                    if j - i > 1 {
+                        next_ties.push((span.start + i)..(span.start + j));
+                    }
+                    i = j;
+                }
+                for (dst, (_, row_id)) in order[span].iter_mut().zip(local) {
+                    *dst = row_id;
+                }
+            }
+        }
+        ties = next_ties;
     }
-    Ok(Some(((r1,c1,r2,c2),false,order)))
+    Ok(Some(((r1, c1, r2, c2), false, order)))
 }
 
 pub fn sort_multi(sheet: &mut Sheet, region: (u32, u32, u32, u32), keys: &[SortKey], header: bool) -> usize {
     let changes = plan_sort_multi(sheet, 0, region, keys, header).unwrap_or_default();
     changes.apply(sheet);
     changes.count
+}
+
+#[inline]
+fn fnv_mix(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[inline]
+fn hash_display_field(h: u64, col: u32, v: &Value) -> u64 {
+    match v {
+        Value::Empty => h,
+        Value::Text(t) if t.is_empty() => h,
+        Value::Text(t) => {
+            let mut h = fnv_mix(h, &col.to_le_bytes());
+            h = fnv_mix(h, &(t.len() as u64).to_le_bytes());
+            fnv_mix(h, t.as_bytes())
+        }
+        Value::Bool(b) => {
+            let s = if *b { b"TRUE".as_slice() } else { b"FALSE".as_slice() };
+            let mut h = fnv_mix(h, &col.to_le_bytes());
+            h = fnv_mix(h, &(s.len() as u64).to_le_bytes());
+            fnv_mix(h, s)
+        }
+        Value::Error(e) => {
+            let s = e.text().as_bytes();
+            let mut h = fnv_mix(h, &col.to_le_bytes());
+            h = fnv_mix(h, &(s.len() as u64).to_le_bytes());
+            fnv_mix(h, s)
+        }
+        Value::Number(_) => {
+            let text = v.display();
+            if text.is_empty() {
+                h
+            } else {
+                let mut h = fnv_mix(h, &col.to_le_bytes());
+                h = fnv_mix(h, &(text.len() as u64).to_le_bytes());
+                fnv_mix(h, text.as_bytes())
+            }
+        }
+    }
+}
+
+fn values_same_display(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Empty, Value::Empty) => true,
+        (Value::Empty, Value::Text(t)) | (Value::Text(t), Value::Empty) => t.is_empty(),
+        (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::Number(x), Value::Number(y)) if x == y => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Error(x), Value::Error(y)) => x == y,
+        _ => a.display() == b.display(),
+    }
+}
+
+fn rows_match_on_cols(sheet: &Sheet, r_a: u32, r_b: u32, cols: &[u32]) -> bool {
+    cols.iter()
+        .all(|&c| values_same_display(sheet.value_ref(r_a, c), sheet.value_ref(r_b, c)))
 }
 
 fn distinct_rows(
@@ -550,44 +712,58 @@ fn distinct_rows(
             return None;
         }
     }
-    let use_cols = if cols.is_empty() {
+    let mut use_cols: Vec<u32> = if cols.is_empty() {
         (c1..=c2).collect()
     } else {
         cols.to_vec()
     };
-    // Sparse signatures omit empty strings and retain the field position,
-    // so embedded delimiters cannot collide with a different column layout.
-    let mut seen = HashSet::new();
+    // Deduplicate column list preserving first occurrence so repeated col specs behave identically.
+    let mut col_seen = HashSet::with_capacity(use_cols.len());
+    use_cols.retain(|c| col_seen.insert(*c));
+
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    let mut buckets: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut keep = Vec::new();
     let area = (r2 - r1 + 1) as u64 * use_cols.len() as u64;
     if area > 4096 && area > sheet.len() as u64 * 4 {
-        let selected: HashSet<_> = use_cols.iter().copied().collect();
-        let mut by_row: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
-        for (k, cell) in sheet.stored_cells() {
-            if (r1..=r2).contains(&k.row) && selected.contains(&k.col) {
-                let text = cell.value.display();
-                if !text.is_empty() {
-                    by_row.entry(k.row).or_default().push((k.col, text));
-                }
+        let selected: HashSet<u32> = use_cols.iter().copied().collect();
+        let min_sel = use_cols.iter().copied().min().unwrap_or(c1);
+        let max_sel = use_cols.iter().copied().max().unwrap_or(c2);
+        let mut row_hashes: HashMap<u32, u64> = HashMap::new();
+        // `sheet.iter_rect` visits in ascending `(row, col)` order!
+        let mut sorted_cols = use_cols.clone();
+        sorted_cols.sort_unstable();
+        for (k, cell) in sheet.iter_rect((r1, min_sel, r2, max_sel)) {
+            if selected.contains(&k.col) {
+                let entry = row_hashes.entry(k.row).or_insert(FNV_OFFSET);
+                *entry = hash_display_field(*entry, k.col, &cell.value);
             }
         }
+        let mut seen_blank_row = false;
         for row in r1..=r2 {
-            let mut signature = by_row.remove(&row).unwrap_or_default();
-            signature.sort_unstable_by_key(|(c, _)| *c);
-            if seen.insert(signature) {
+            let h = row_hashes.get(&row).copied().unwrap_or(FNV_OFFSET);
+            if h == FNV_OFFSET && !row_hashes.contains_key(&row) {
+                if !seen_blank_row {
+                    seen_blank_row = true;
+                    keep.push(row);
+                }
+                continue;
+            }
+            let bucket = buckets.entry(h).or_default();
+            if !bucket.iter().any(|&prev| rows_match_on_cols(sheet, prev, row, &sorted_cols)) {
+                bucket.push(row);
                 keep.push(row);
             }
         }
     } else {
         for row in r1..=r2 {
-            let signature: Vec<_> = use_cols
-                .iter()
-                .filter_map(|&c| {
-                    let text = sheet.get(row, c)?.value.display();
-                    (!text.is_empty()).then_some((c, text))
-                })
-                .collect();
-            if seen.insert(signature) {
+            let mut h = FNV_OFFSET;
+            for &c in &use_cols {
+                h = hash_display_field(h, c, sheet.value_ref(row, c));
+            }
+            let bucket = buckets.entry(h).or_default();
+            if !bucket.iter().any(|&prev| rows_match_on_cols(sheet, prev, row, &use_cols)) {
+                bucket.push(row);
                 keep.push(row);
             }
         }

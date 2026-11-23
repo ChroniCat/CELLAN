@@ -320,10 +320,44 @@ impl Overlay {
     }
 }
 
-/// 每个色阶/数据条块的取值范围（按需计算并缓存）
+#[derive(Clone, Copy, Debug, Default)]
+struct SliceSummary {
+    min: f64,
+    max: f64,
+    sum: f64,
+    count: usize,
+}
+
+impl SliceSummary {
+    fn from_slice(slice: &PageSlice) -> Self {
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        let end = slice.end.min(slice.cells.len());
+        if slice.start < end {
+            for cell in &slice.cells[slice.start..end] {
+                if let Value::Number(v) = &cell.value
+                    && v.is_finite()
+                {
+                    min = min.min(*v);
+                    max = max.max(*v);
+                    sum += *v;
+                    count += 1;
+                }
+            }
+        }
+        Self { min, max, sum, count }
+    }
+}
+
+type SliceCacheKey = (usize, u32, u32, usize, usize);
+
+/// 每个色阶/数据条块的取值范围（按需计算并缓存，支持按 256 行页切片增量归并）
 #[derive(Clone, Debug, Default)]
 pub struct CfStats {
     inputs: Option<Vec<BlockInputs>>,
+    slice_cache: HashMap<SliceCacheKey, SliceSummary>,
     /// block 序号 → (min, max)
     pub ranges: HashMap<usize, (f64, f64)>,
     /// 平均/计数用于 avg、top 规则
@@ -387,8 +421,23 @@ fn requirements(block: &CfBlock) -> (bool, bool, bool) {
     (numeric, sort, duplicates)
 }
 
-/// Compare only the stored pages touched by statistical rules. Most edits can be
-/// dismissed by identity; a change outside a partial page compares at most 256 cells.
+fn ranges_pairwise_disjoint(ranges: &[(u32, u32, u32, u32)]) -> bool {
+    if ranges.len() <= 1 {
+        return true;
+    }
+    for i in 0..ranges.len() {
+        let (ar1, ac1, ar2, ac2) = ranges[i];
+        for &(br1, bc1, br2, bc2) in &ranges[i + 1..] {
+            if ar1 <= br2 && br1 <= ar2 && ac1 <= bc2 && bc1 <= ac2 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Compare only the stored pages touched by statistical rules. Unchanged 256-row
+/// `PageSlice`s reuse their cached `(min, max, sum, count)` in `O(1)` without rescanning cells.
 pub fn refresh_stats(sheet: &Sheet, into: &mut CfStats) -> bool {
     let inputs: Vec<_> = sheet.cf.blocks.iter().map(|block| {
         let (numeric, sort, duplicates) = requirements(block);
@@ -398,23 +447,38 @@ pub fn refresh_stats(sheet: &Sheet, into: &mut CfStats) -> bool {
         BlockInputs { numeric, sort, duplicates, ranges }
     }).collect();
     if into.inputs.as_ref() == Some(&inputs) { return false; }
-    compute_stats(&sheet.cf, sheet, into);
+    // Keep `prev_inputs` alive until `next_cache` is built so `Arc::as_ptr` keys cannot be ABA-reused.
+    let prev_inputs = into.inputs.take();
+    compute_stats_with_slices(&sheet.cf, sheet, Some(&inputs), into);
+    drop(prev_inputs);
     into.inputs = Some(inputs);
     true
 }
 
 pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
     into.inputs = None;
+    into.slice_cache.clear();
+    compute_stats_with_slices(cf, sheet, None, into);
+}
+
+fn compute_stats_with_slices(
+    cf: &CfSheet,
+    sheet: &Sheet,
+    precomputed: Option<&[BlockInputs]>,
+    into: &mut CfStats,
+) {
     into.ranges.clear();
     into.averages.clear();
     into.counts.clear();
     into.sorted.clear();
     into.dup_counts.clear();
     if cf.blocks.is_empty() {
+        into.slice_cache.clear();
         return;
     }
     let bounds = sheet.used_bounds();
-    let sheet_len = sheet.len();
+    let mut next_slice_cache: HashMap<SliceCacheKey, SliceSummary> = HashMap::new();
+
     for (i, block) in cf.blocks.iter().enumerate() {
         let (needs_num, needs_sort, needs_dup) = requirements(block);
         if !needs_num && !needs_dup {
@@ -430,7 +494,6 @@ pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
             continue;
         };
         let mut clamped: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(block.ranges.len());
-        let mut total_area: u64 = 0;
         for &(r1, c1, r2, c2) in &block.ranges {
             let cr1 = r1.max(ur1);
             let cr2 = r2.min(ur2);
@@ -438,9 +501,6 @@ pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
             let cc2 = c2.min(uc2);
             if cr1 <= cr2 && cc1 <= cc2 {
                 clamped.push((cr1, cc1, cr2, cc2));
-                total_area = total_area.saturating_add(
-                    (cr2 - cr1 + 1) as u64 * (cc2 - cc1 + 1) as u64,
-                );
             }
         }
         let mut min = f64::INFINITY;
@@ -450,10 +510,50 @@ pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
         let mut vals: Vec<f64> = Vec::new();
         let mut dups: HashMap<String, usize> = HashMap::new();
 
-        let mut visit = |cell: &crate::model::Cell| {
-            if needs_num {
-                if let Value::Number(v) = &cell.value {
-                    if v.is_finite() {
+        if !clamped.is_empty() {
+            let disjoint = ranges_pairwise_disjoint(&block.ranges);
+            // Incremental `PageSlice` summary merge for numeric-only rules (ColorScale / DataBar / Avg)
+            if disjoint && needs_num && !needs_sort && !needs_dup {
+                let mut consume_slice = |slice: &PageSlice| {
+                    let key: SliceCacheKey = (
+                        std::sync::Arc::as_ptr(&slice.cells) as usize,
+                        slice.page,
+                        slice.col,
+                        slice.start,
+                        slice.end,
+                    );
+                    let summary = into
+                        .slice_cache
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_else(|| SliceSummary::from_slice(slice));
+                    next_slice_cache.insert(key, summary);
+                    if summary.count > 0 {
+                        min = min.min(summary.min);
+                        max = max.max(summary.max);
+                        sum += summary.sum;
+                        n += summary.count;
+                    }
+                };
+                if let Some(bi) = precomputed.and_then(| v | v.get(i)) {
+                    for (_, slices) in &bi.ranges {
+                        for slice in slices {
+                            consume_slice(slice);
+                        }
+                    }
+                } else {
+                    for &rect in &clamped {
+                        for slice in sheet.cf_pages(rect) {
+                            consume_slice(&slice);
+                        }
+                    }
+                }
+            } else {
+                let mut visit = |cell: &crate::model::Cell| {
+                    if needs_num
+                        && let Value::Number(v) = &cell.value
+                        && v.is_finite()
+                    {
                         min = min.min(*v);
                         max = max.max(*v);
                         sum += *v;
@@ -462,32 +562,31 @@ pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
                             vals.push(*v);
                         }
                     }
-                }
-            }
-            if needs_dup {
-                let key = cell.value.display();
-                if !key.is_empty() {
-                    *dups.entry(key).or_insert(0) += 1;
-                }
-            }
-        };
-
-        if clamped.is_empty() {
-            // 块范围完全落在非空区之外
-        } else if total_area > (sheet_len as u64).saturating_mul(2).max(256)
-            || clamped.len() > 1
-        {
-            for (cref, cell) in sheet.iter() {
-                if in_block(block, cref.row, cref.col) {
-                    visit(cell);
-                }
-            }
-        } else {
-            let (cr1, cc1, cr2, cc2) = clamped[0];
-            for r in cr1..=cr2 {
-                for c in cc1..=cc2 {
-                    if let Some(cell) = sheet.get(r, c) {
-                        visit(cell);
+                    if needs_dup {
+                        let key = cell.value.display();
+                        if !key.is_empty() {
+                            *dups.entry(key).or_insert(0) += 1;
+                        }
+                    }
+                };
+                if ranges_pairwise_disjoint(&clamped) {
+                    for &rect in &clamped {
+                        for (_, cell) in sheet.iter_rect(rect) {
+                            visit(cell);
+                        }
+                    }
+                } else {
+                    // Overlapping multi-range block: visit each rect via `iter_rect` and skip
+                    // cells already covered by an earlier clamped rect (never scans outside block!).
+                    for (ri, &rect) in clamped.iter().enumerate() {
+                        for (cref, cell) in sheet.iter_rect(rect) {
+                            let already = clamped[..ri].iter().any(|&(r1, c1, r2, c2)| {
+                                cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2
+                            });
+                            if !already {
+                                visit(cell);
+                            }
+                        }
                     }
                 }
             }
@@ -507,6 +606,7 @@ pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
             into.dup_counts.insert(i, dups);
         }
     }
+    into.slice_cache = next_slice_cache;
 }
 
 /// 判断某格是否落在块范围内
@@ -643,7 +743,7 @@ impl<'a> RowRules<'a> {
         let r = self.row;
         let mut out = Overlay::default();
         if self.order.is_empty() { return out; }
-        let raw = sheet.get(r, c).map(|x| x.value.clone()).unwrap_or(Value::Empty);
+        let raw = sheet.value_ref(r, c);
         for &(_, bi, ri) in &self.order {
             let block = &cf.blocks[bi];
             if !in_block(block, r, c) { continue; }
@@ -656,6 +756,9 @@ impl<'a> RowRules<'a> {
             let mut hit = false;
             match &rule.kind {
                 CfKind::CellIs { op, a, b, dxf } => {
+                    if matches!(raw, Value::Empty) {
+                        continue;
+                    }
                     let av = parse_lit(a);
                     let bv = parse_lit(b);
                     let need_b = matches!(op, CfOp::Between | CfOp::NotBetween);
@@ -663,17 +766,33 @@ impl<'a> RowRules<'a> {
                         if need_b && bv.is_none() {
                             continue;
                         }
-                        // 未填第二个值时用第一个值占位（Excel 里介于必须两个值）
                         let bv = bv.unwrap_or_else(|| av.clone());
-                        if !matches!(raw, Value::Empty) && test_op(*op, &raw, &av, &bv) {
+                        if test_op(*op, raw, &av, &bv) {
                             apply_dxf(cf, *dxf, &mut out);
                             hit = true;
                         }
                     }
                 }
                 CfKind::Text { contains, dxf } => {
-                    if let Value::Text(t) = &raw {
-                        if t.to_lowercase().contains(&contains.to_lowercase()) {
+                    if let Value::Text(t) = raw {
+                        let matched = if t.is_ascii() && contains.is_ascii() {
+                            if contains.is_empty() {
+                                true
+                            } else if t.len() < contains.len() {
+                                false
+                            } else {
+                                let tb = t.as_bytes();
+                                let cb = contains.as_bytes();
+                                let b0 = cb[0].to_ascii_lowercase();
+                                (0..=tb.len() - cb.len()).any(|idx| {
+                                    tb[idx].to_ascii_lowercase() == b0
+                                        && tb[idx..idx + cb.len()].eq_ignore_ascii_case(cb)
+                                })
+                            }
+                        } else {
+                            t.to_lowercase().contains(&contains.to_lowercase())
+                        };
+                        if matched {
                             apply_dxf(cf, *dxf, &mut out);
                             hit = true;
                         }
@@ -688,9 +807,14 @@ impl<'a> RowRules<'a> {
                         dups.get(&key).copied().unwrap_or(0)
                     } else {
                         let mut cnt = 0usize;
-                        for (cref, cell) in sheet.iter() {
-                            if in_block(block, cref.row, cref.col) && cell.value.display() == key {
-                                cnt += 1;
+                        for (ri_idx, &rect) in block.ranges.iter().enumerate() {
+                            for (cref, cell) in sheet.iter_rect(rect) {
+                                let dup_rect = block.ranges[..ri_idx].iter().any(|&(r1, c1, r2, c2)| {
+                                    cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2
+                                });
+                                if !dup_rect && cell.value.display() == key {
+                                    cnt += 1;
+                                }
                             }
                         }
                         cnt
@@ -850,146 +974,297 @@ fn scale_color(points: &[(f64, [u8; 3])], v: f64) -> Option<[u8; 3]> {
     Some(points[points.len() - 1].1)
 }
 
-/// 把公式里的相对引用按 (dr, dc) 平移（A1 → B2 之类）
-pub fn shift_formula(f: &str, r: u32, c: u32) -> String {
-    if r == 0 && c == 0 {
-        return f.to_string();
+#[derive(Clone, Debug)]
+enum ShiftToken {
+    Literal(std::ops::Range<usize>),
+    RowRange {
+        span: std::ops::Range<usize>,
+        a_abs: bool,
+        r1: u32,
+        b_abs: bool,
+        r2: u32,
+    },
+    Cell {
+        span: std::ops::Range<usize>,
+        abs_col: bool,
+        col: u32,
+        abs_row: bool,
+        row: u32,
+    },
+}
+
+/// Pre-tokenized CF/DV relative-reference formula template: lexes once over UTF-8 bytes
+/// and renders `(dr, dc)` offsets without `Vec<char>` or `format!()` allocations.
+#[derive(Clone, Debug)]
+pub struct CompiledShiftFormula {
+    src: String,
+    tokens: Vec<ShiftToken>,
+    has_relative: bool,
+}
+
+#[inline]
+fn push_u32_decimal(out: &mut String, mut v: u32) {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    if v == 0 {
+        out.push('0');
+        return;
     }
-    let chars: Vec<char> = f.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    let mut in_str = false;
-    let mut bracket_depth = 0usize;
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '"' {
-            in_str = !in_str;
-            out.push(ch);
-            i += 1;
-            continue;
-        }
-        if !in_str && ch == '[' {
-            bracket_depth += 1;
-            out.push(ch);
-            i += 1;
-            continue;
-        }
-        if !in_str && ch == ']' {
-            bracket_depth = bracket_depth.saturating_sub(1);
-            out.push(ch);
-            i += 1;
-            continue;
-        }
-        // 整行引用 `1:1` / `$1:$1`：复制时只随行偏移，横向复制不变。
-        // 必须在 A1 分支之前处理，否则以数字开头的行引用会被跳过；
-        // 结构化引用方括号里的 `[1:3]` 是列名，不是行引用。
-        if !in_str
-            && bracket_depth == 0
-            && (ch == '$' || ch.is_ascii_digit())
-            && (i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_'))
-        {
-            let mut j = i;
-            let a_abs = chars[j] == '$';
-            j += usize::from(a_abs);
-            let a0 = j;
-            while j < chars.len() && chars[j].is_ascii_digit() {
-                j += 1;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    // SAFETY: `buf[i..]` contains only ASCII digits `b'0'..=b'9'`.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+#[inline]
+fn push_col_letters(out: &mut String, col_one_based: u32) {
+    let mut n = col_one_based;
+    let mut buf = [0u8; 4];
+    let mut i = buf.len();
+    while n > 0 {
+        let rem = (n - 1) % 26;
+        i -= 1;
+        buf[i] = b'A' + rem as u8;
+        n = (n - 1) / 26;
+    }
+    // SAFETY: `buf[i..]` contains only ASCII uppercase letters `b'A'..=b'Z'`.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+#[inline]
+fn parse_u32_bytes(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut acc = 0u32;
+    for &b in bytes {
+        acc = acc.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(acc)
+}
+
+impl CompiledShiftFormula {
+    pub fn compile(f: &str) -> Self {
+        let bytes = f.as_bytes();
+        let mut tokens = Vec::new();
+        let mut has_relative = false;
+        let mut lit_start = 0usize;
+        let mut i = 0usize;
+        let mut in_str = false;
+        let mut bracket_depth = 0usize;
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'"' {
+                in_str = !in_str;
+                i += 1;
+                continue;
             }
-            let a1 = j;
-            if j > a0 && j < chars.len() && chars[j] == ':' {
-                j += 1;
-                let b_abs = j < chars.len() && chars[j] == '$';
-                j += usize::from(b_abs);
-                let b0 = j;
-                while j < chars.len() && chars[j].is_ascii_digit() {
+            if !in_str && b == b'[' {
+                bracket_depth += 1;
+                i += 1;
+                continue;
+            }
+            if !in_str && b == b']' {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            let prev_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if !in_str && bracket_depth == 0 && (b == b'$' || b.is_ascii_digit()) && prev_ok {
+                let mut j = i;
+                let a_abs = bytes[j] == b'$';
+                j += usize::from(a_abs);
+                let a0 = j;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
                     j += 1;
                 }
-                let b1 = j;
-                let end_ok = j == chars.len()
-                    || !(chars[j].is_ascii_alphanumeric()
-                        || chars[j] == '_'
-                        || chars[j] == '('
-                        || chars[j] == '$');
-                if j > b0 && end_ok {
-                    let parse = |s: &[char]| -> Option<u32> {
-                        s.iter().collect::<String>().parse::<u32>().ok()
-                    };
-                    if let (Some(r1), Some(r2)) =
-                        (parse(&chars[a0..a1]), parse(&chars[b0..b1]))
+                let a1 = j;
+                if j > a0 && j < bytes.len() && bytes[j] == b':' {
+                    j += 1;
+                    let b_abs = j < bytes.len() && bytes[j] == b'$';
+                    j += usize::from(b_abs);
+                    let b0 = j;
+                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    let b1 = j;
+                    let end_ok = j == bytes.len()
+                        || !(bytes[j].is_ascii_alphanumeric()
+                            || bytes[j] == b'_'
+                            || bytes[j] == b'('
+                            || bytes[j] == b'$');
+                    if j > b0
+                        && end_ok
+                        && let (Some(r1), Some(r2)) =
+                            (parse_u32_bytes(&bytes[a0..a1]), parse_u32_bytes(&bytes[b0..b1]))
                     {
-                        let nr1 = if a_abs { r1 } else { r1.saturating_add(r) };
-                        let nr2 = if b_abs { r2 } else { r2.saturating_add(r) };
-                        if nr1 == 0 || nr2 == 0 || nr1 > 1_048_576 || nr2 > 1_048_576 {
-                            out.push_str("#REF!");
-                        } else {
-                            out.push_str(&format!(
-                                "{}{}:{}{}",
-                                if a_abs { "$" } else { "" },
-                                nr1,
-                                if b_abs { "$" } else { "" },
-                                nr2
-                            ));
+                        if lit_start < i {
+                            tokens.push(ShiftToken::Literal(lit_start..i));
                         }
+                        has_relative |= !a_abs || !b_abs || r1 == 0 || r2 == 0 || r1 > 1_048_576 || r2 > 1_048_576;
+                        tokens.push(ShiftToken::RowRange {
+                            span: i..j,
+                            a_abs,
+                            r1,
+                            b_abs,
+                            r2,
+                        });
                         i = j;
+                        lit_start = j;
                         continue;
                     }
                 }
             }
-        }
-        let starts_ref = !in_str && (ch == '$' || ch.is_ascii_alphabetic());
-        // 前一个字符不能是字母数字或下划线（避免把名字截断）
-        let prev_ok = i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
-        if starts_ref && prev_ok {
-            let mut j = i;
-            let mut abs_col = false;
-            if chars[j] == '$' {
-                abs_col = true;
-                j += 1;
-            }
-            let col_start = j;
-            let mut col = 0u32;
-            while j < chars.len() && chars[j].is_ascii_alphabetic() {
-                // 超长名字（如 ISNUMBER、NOT）会让 col 溢出：饱和相加，随后由
-                // col <= 16384 的检查把它判成「不是引用」，按普通字符原样输出。
-                col = col
-                    .saturating_mul(26)
-                    .saturating_add(chars[j].to_ascii_uppercase() as u32 - 'A' as u32 + 1);
-                j += 1;
-            }
-            let has_col = j > col_start;
-            let mut abs_row = false;
-            if has_col && j < chars.len() && chars[j] == '$' {
-                abs_row = true;
-                j += 1;
-            }
-            let row_start = j;
-            let mut row = 0u32;
-            while j < chars.len() && chars[j].is_ascii_digit() {
-                row = row * 10 + (chars[j] as u32 - '0' as u32);
-                j += 1;
-            }
-            let has_row = j > row_start;
-            let next_ok = j >= chars.len() || !(chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '(');
-            if has_col && has_row && next_ok && col > 0 && col <= 16_384 {
-                let nc = if abs_col { col } else { col + c };
-                let nr = if abs_row { row } else { row + r };
-                if nc >= 1 && nc <= 16_384 {
-                    out.push_str(&format!(
-                        "{}{}{}{}",
-                        if abs_col { "$" } else { "" },
-                        crate::model::col_label(nc - 1),
-                        if abs_row { "$" } else { "" },
-                        nr.max(1)
-                    ));
+            if !in_str && (b == b'$' || b.is_ascii_alphabetic()) && prev_ok {
+                let mut j = i;
+                let abs_col = bytes[j] == b'$';
+                j += usize::from(abs_col);
+                let col_start = j;
+                let mut col = 0u32;
+                while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+                    col = col
+                        .saturating_mul(26)
+                        .saturating_add((bytes[j].to_ascii_uppercase() - b'A') as u32 + 1);
+                    j += 1;
+                }
+                let has_col = j > col_start;
+                let mut abs_row = false;
+                if has_col && j < bytes.len() && bytes[j] == b'$' {
+                    abs_row = true;
+                    j += 1;
+                }
+                let row_start = j;
+                let mut row = 0u32;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    row = row.saturating_mul(10).saturating_add((bytes[j] - b'0') as u32);
+                    j += 1;
+                }
+                let has_row = j > row_start;
+                let next_ok = j >= bytes.len()
+                    || !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'(');
+                if has_col && has_row && next_ok && col > 0 && col <= 16_384 {
+                    if lit_start < i {
+                        tokens.push(ShiftToken::Literal(lit_start..i));
+                    }
+                    has_relative |= !abs_col || !abs_row || row == 0;
+                    tokens.push(ShiftToken::Cell {
+                        span: i..j,
+                        abs_col,
+                        col,
+                        abs_row,
+                        row,
+                    });
                     i = j;
+                    lit_start = j;
                     continue;
                 }
             }
+            i += 1;
         }
-        out.push(ch);
-        i += 1;
+        if lit_start < bytes.len() {
+            tokens.push(ShiftToken::Literal(lit_start..bytes.len()));
+        }
+        Self {
+            src: f.to_string(),
+            tokens,
+            has_relative,
+        }
     }
-    out
+
+    pub fn shift(&self, r: u32, c: u32) -> String {
+        if (r == 0 && c == 0) || !self.has_relative {
+            return self.src.clone();
+        }
+        let mut out = String::with_capacity(self.src.len() + 8);
+        for tok in &self.tokens {
+            match tok {
+                ShiftToken::Literal(span) => out.push_str(&self.src[span.clone()]),
+                ShiftToken::RowRange {
+                    span,
+                    a_abs,
+                    r1,
+                    b_abs,
+                    r2,
+                } => {
+                    if r == 0 && *r1 >= 1 && *r2 >= 1 && *r1 <= 1_048_576 && *r2 <= 1_048_576 {
+                        out.push_str(&self.src[span.clone()]);
+                        continue;
+                    }
+                    let nr1 = if *a_abs { *r1 } else { r1.saturating_add(r) };
+                    let nr2 = if *b_abs { *r2 } else { r2.saturating_add(r) };
+                    if nr1 == 0 || nr2 == 0 || nr1 > 1_048_576 || nr2 > 1_048_576 {
+                        out.push_str("#REF!");
+                    } else {
+                        if *a_abs {
+                            out.push('$');
+                        }
+                        push_u32_decimal(&mut out, nr1);
+                        out.push(':');
+                        if *b_abs {
+                            out.push('$');
+                        }
+                        push_u32_decimal(&mut out, nr2);
+                    }
+                }
+                ShiftToken::Cell {
+                    span,
+                    abs_col,
+                    col,
+                    abs_row,
+                    row,
+                } => {
+                    let nc = if *abs_col { *col } else { col.saturating_add(c) };
+                    let nr = if *abs_row { *row } else { row.saturating_add(r) };
+                    if nc >= 1 && nc <= 16_384 {
+                        if *abs_col {
+                            out.push('$');
+                        }
+                        push_col_letters(&mut out, nc);
+                        if *abs_row {
+                            out.push('$');
+                        }
+                        push_u32_decimal(&mut out, nr.max(1));
+                    } else {
+                        out.push_str(&self.src[span.clone()]);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 把公式里的相对引用按 (dr, dc) 平移（A1 → B2 之类）。
+/// 内置 16 槽线程局部预编译模板缓存：同一条 CF/DV 公式跨十万单元格求值无需重复词法扫描。
+pub fn shift_formula(f: &str, r: u32, c: u32) -> String {
+    if r == 0 && c == 0 {
+        return f.to_string();
+    }
+    thread_local! {
+        static TEMPLATE_CACHE: std::cell::RefCell<Vec<CompiledShiftFormula>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    TEMPLATE_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some(pos) = cache.iter().position(|t| t.src == f) {
+            let out = cache[pos].shift(r, c);
+            if pos != 0 {
+                cache.swap(0, pos);
+            }
+            return out;
+        }
+        let compiled = CompiledShiftFormula::compile(f);
+        let out = compiled.shift(r, c);
+        if cache.len() >= 16 {
+            cache.pop();
+        }
+        cache.insert(0, compiled);
+        out
+    })
 }
 
 #[cfg(test)]

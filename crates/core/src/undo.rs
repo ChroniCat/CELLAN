@@ -64,7 +64,7 @@ pub fn snapshot_sheet(sheet: &Sheet, idx: usize) -> SheetSnapshot {
             .iter()
             .map(|(k, c)| (k.row, k.col, c.clone(), sheet.style_of(k.row, k.col)))
             .collect(),
-        merges: sheet.merges.clone(),
+        merges: sheet.merges.to_vec(),
     }
 }
 
@@ -74,7 +74,7 @@ pub fn restore_sheet(sheet: &mut Sheet, snap: &SheetSnapshot) {
         sheet.set(*r, *c, cell.clone());
         sheet.set_style(*r, *c, *st);
     }
-    sheet.merges = snap.merges.clone();
+    sheet.merges = snap.merges.clone().into();
     sheet.merges_dirty = true;
 }
 
@@ -173,7 +173,7 @@ fn plan_merge_diff(
     sheet: &Sheet,
     add: &[(u32, u32, u32, u32)],
     remove: &[(u32, u32, u32, u32)],
-) -> Option<(Vec<(u32, u32, u32, u32)>, Vec<((u32, u32, u32, u32), bool)>)> {
+) -> Option<(crate::merges::Merges, Vec<((u32, u32, u32, u32), bool)>)> {
     let mut next = sheet.merges.clone();
     let mut changed = Vec::new();
     for r in remove {
@@ -351,8 +351,11 @@ impl Action {
 }
 
 
+pub const COW_BATCH_THRESHOLD: usize = 16_384;
+
 enum Entry {
     Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>),
+    CowBatch(EntryStamp, Box<CowBatchAction>),
     NumericSort(EntryStamp, NumericSortAction),
     Structure(EntryStamp, StructureAction),
     SheetTab(EntryStamp, SheetTabAction),
@@ -362,11 +365,23 @@ impl Entry {
     fn id(&self) -> u64 { self.stamp().id }
 
     fn stamp(&self) -> EntryStamp {
-        match self { Self::Cells(s, _, _) | Self::NumericSort(s, _) | Self::Structure(s, _) | Self::SheetTab(s, _) => *s }
+        match self {
+            Self::Cells(s, _, _)
+            | Self::CowBatch(s, _)
+            | Self::NumericSort(s, _)
+            | Self::Structure(s, _)
+            | Self::SheetTab(s, _) => *s,
+        }
     }
 
     fn stamp_mut(&mut self) -> &mut EntryStamp {
-        match self { Self::Cells(s, _, _) | Self::NumericSort(s, _) | Self::Structure(s, _) | Self::SheetTab(s, _) => s }
+        match self {
+            Self::Cells(s, _, _)
+            | Self::CowBatch(s, _)
+            | Self::NumericSort(s, _)
+            | Self::Structure(s, _)
+            | Self::SheetTab(s, _) => s,
+        }
     }
 
     fn simple_cells(&self) -> Option<Box<dyn Iterator<Item = (usize, u32, u32)> + '_>> {
@@ -374,6 +389,15 @@ impl Entry {
             Self::Cells(_, a, _) if a.snap_before.is_none() && a.snap_after.is_none()
                 && a.merges.is_none() && a.shapes.is_none() && a.pictures.is_none()
                 && a.refresh_sizes.is_none() => Some(Box::new(a.deltas.iter().map(|d| (d.sheet, d.row, d.col)))),
+            Self::CowBatch(_, a) if a.row_style_deltas.is_empty() && a.col_style_deltas.is_empty() => {
+                let sheet = a.sheet;
+                Some(Box::new(
+                    a.all_mask
+                        .iter()
+                        .filter(|k| !a.excluded.contains(k))
+                        .map(move |k| (sheet, k.row, k.col)),
+                ))
+            }
             Self::NumericSort(_, a) => Some(Box::new(a.sort.deltas().map(|d| (d.sheet, d.row, d.col)))),
             _ => None,
         }
@@ -382,6 +406,7 @@ impl Entry {
     fn label(&self) -> &str {
         match self {
             Self::Cells(_, a, _) => &a.label,
+            Self::CowBatch(_, a) => &a.label,
             Self::NumericSort(_, a) => &a.label,
             Self::Structure(_, a) => &a.label,
             Self::SheetTab(_, a) => &a.label,
@@ -390,10 +415,372 @@ impl Entry {
     fn by_site(&self) -> u32 {
         match self {
             Self::Cells(_, a, _) => a.by_site,
+            Self::CowBatch(_, a) => a.by_site,
             Self::NumericSort(_, a) => a.by_site,
             Self::Structure(_, a) => a.by_site,
             Self::SheetTab(_, a) => a.by_site,
         }
+    }
+}
+
+struct CowBatchAction {
+    sheet: usize,
+    before_cells: crate::store::Store,
+    after_cells: crate::store::Store,
+    before_styles: crate::store::CellStyles,
+    after_styles: crate::store::CellStyles,
+    row_style_deltas: Vec<(u32, u16, u16)>,
+    col_style_deltas: Vec<(u32, u16, u16)>,
+    cell_mask: crate::model::CellJournal,
+    style_mask: crate::model::CellJournal,
+    all_mask: crate::model::CellJournal,
+    excluded: crate::model::CellJournal,
+    label: String,
+    focus: (usize, u32, u32),
+    by_site: u32,
+    permutation: Option<crate::data_tools::LinePermutation>,
+}
+
+impl CowBatchAction {
+    fn from_action(action: &Action) -> Option<(Self, usize)> {
+        if action.deltas.len() <= COW_BATCH_THRESHOLD
+            || action.snap_before.is_some()
+            || action.snap_after.is_some()
+            || action.merges.is_some()
+            || action.shapes.is_some()
+            || action.pictures.is_some()
+            || action.refresh_sizes.is_some()
+        {
+            return None;
+        }
+        let sheet = action.deltas.first()?.sheet;
+        if action.deltas.iter().any(|d| d.sheet != sheet) {
+            return None;
+        }
+        let mut before_cells = crate::store::Store::default();
+        let mut after_cells = crate::store::Store::default();
+        let mut before_styles = crate::store::CellStyles::default();
+        let mut after_styles = crate::store::CellStyles::default();
+        let mut cell_mask = crate::model::CellJournal::default();
+        let mut style_mask = crate::model::CellJournal::default();
+        let mut heap_text_bytes = 0usize;
+
+        // Replay in forward order so duplicate coordinates in `deltas` keep first `before` and last `after`.
+        let mut seen = crate::model::CellJournal::default();
+        for d in &action.deltas {
+            let key = CellRef::new(d.row, d.col);
+            let first_visit = seen.insert(key);
+            if !d.before.same_input(&d.after) || cell_mask.contains(&key) {
+                if first_visit && !d.before.is_blank() {
+                    heap_text_bytes += cell_heap_bytes(&d.before);
+                    before_cells.set(d.row, d.col, d.before.clone());
+                }
+                if d.after.is_blank() {
+                    after_cells.remove(d.row, d.col);
+                } else {
+                    heap_text_bytes += cell_heap_bytes(&d.after);
+                    after_cells.set(d.row, d.col, d.after.clone());
+                }
+                cell_mask.insert(key);
+            }
+            if d.before_style != d.after_style || style_mask.contains(&key) {
+                if first_visit {
+                    before_styles.insert(key, d.before_style);
+                }
+                after_styles.insert(key, d.after_style);
+                style_mask.insert(key);
+            }
+        }
+        let mut all_mask = cell_mask.clone();
+        all_mask.union_from(&style_mask);
+        if all_mask.is_empty() {
+            return None;
+        }
+        let payload = before_cells.unique_payload_bytes()
+            + after_cells.unique_payload_bytes()
+            + before_styles.payload_bytes()
+            + after_styles.payload_bytes()
+            + cell_mask.payload_bytes()
+            + style_mask.payload_bytes()
+            + all_mask.payload_bytes()
+            + heap_text_bytes;
+        Some((
+            Self {
+                sheet,
+                before_cells,
+                after_cells,
+                before_styles,
+                after_styles,
+                row_style_deltas: Vec::new(),
+                col_style_deltas: Vec::new(),
+                cell_mask,
+                style_mask,
+                all_mask,
+                excluded: Default::default(),
+                label: action.label.clone(),
+                focus: action.focus,
+                by_site: action.by_site,
+                permutation: None,
+            },
+            payload,
+        ))
+    }
+
+    fn from_sheets(
+        label: String,
+        sheet_idx: usize,
+        before: &Sheet,
+        after: &Sheet,
+        focus: (usize, u32, u32),
+        by_site: u32,
+    ) -> Option<(Self, usize)> {
+        let mut cell_mask = crate::model::CellJournal::default();
+        let mut changed_coords = Vec::new();
+        let mut dummy_cleared = crate::model::CellJournal::default();
+        before
+            .cells()
+            .diff_both_sides(after.cells(), sheet_idx, &mut dummy_cleared, &mut changed_coords);
+        let blank = Cell::default();
+        let mut diff_heap = 0usize;
+        for &(_, r, c) in &changed_coords {
+            let bc = before.get(r, c).unwrap_or(&blank);
+            let ac = after.get(r, c).unwrap_or(&blank);
+            if !bc.same_input(ac) {
+                cell_mask.insert(CellRef::new(r, c));
+                diff_heap += cell_heap_bytes(bc) + cell_heap_bytes(ac);
+            }
+        }
+        let mut style_mask = crate::model::CellJournal::default();
+        let mut before_styles = crate::store::CellStyles::default();
+        let mut after_styles = crate::store::CellStyles::default();
+        for k in before
+            .styles
+            .changed_keys(&after.styles)
+            .chain(after.styles.changed_keys(&before.styles))
+        {
+            if style_mask.contains(&k) {
+                continue;
+            }
+            let bs = before.style_of(k.row, k.col);
+            let as_ = after.style_of(k.row, k.col);
+            if bs != as_ || before.explicit_style_of(k.row, k.col) != after.explicit_style_of(k.row, k.col) {
+                style_mask.insert(k);
+                before_styles.insert(k, bs);
+                after_styles.insert(k, as_);
+            }
+        }
+        let mut row_style_deltas = Vec::new();
+        if before.row_styles != after.row_styles {
+            let mut rows: Vec<u32> = before
+                .row_styles
+                .keys()
+                .chain(after.row_styles.keys())
+                .copied()
+                .collect();
+            rows.sort_unstable();
+            rows.dedup();
+            for r in rows {
+                let b_id = before.row_styles.get(&r).copied().unwrap_or(0);
+                let a_id = after.row_styles.get(&r).copied().unwrap_or(0);
+                if b_id != a_id {
+                    row_style_deltas.push((r, b_id, a_id));
+                }
+            }
+        }
+        let mut col_style_deltas = Vec::new();
+        if before.col_styles != after.col_styles {
+            let mut cols: Vec<u32> = before
+                .col_styles
+                .keys()
+                .chain(after.col_styles.keys())
+                .copied()
+                .collect();
+            cols.sort_unstable();
+            cols.dedup();
+            for c in cols {
+                let b_id = before.col_styles.get(&c).copied().unwrap_or(0);
+                let a_id = after.col_styles.get(&c).copied().unwrap_or(0);
+                if b_id != a_id {
+                    col_style_deltas.push((c, b_id, a_id));
+                }
+            }
+        }
+        let mut all_mask = cell_mask.clone();
+        all_mask.union_from(&style_mask);
+        if all_mask.is_empty() && row_style_deltas.is_empty() && col_style_deltas.is_empty() {
+            return None;
+        }
+        let before_cells = if cell_mask.is_empty() {
+            Default::default()
+        } else {
+            before.cells().clone()
+        };
+        let after_cells = if cell_mask.is_empty() {
+            Default::default()
+        } else {
+            after.cells().clone()
+        };
+        let payload = cell_mask.len() * std::mem::size_of::<Cell>() * 2
+            + diff_heap
+            + before_styles.payload_bytes()
+            + after_styles.payload_bytes()
+            + (row_style_deltas.capacity() + col_style_deltas.capacity()) * std::mem::size_of::<(u32, u16, u16)>()
+            + cell_mask.payload_bytes()
+            + style_mask.payload_bytes()
+            + all_mask.payload_bytes();
+        Some((
+            Self {
+                sheet: sheet_idx,
+                before_cells,
+                after_cells,
+                before_styles,
+                after_styles,
+                row_style_deltas,
+                col_style_deltas,
+                cell_mask,
+                style_mask,
+                all_mask,
+                excluded: Default::default(),
+                label,
+                focus,
+                by_site,
+                permutation: None,
+            },
+            payload,
+        ))
+    }
+
+    fn apply(
+        &mut self,
+        stamp: &mut EntryStamp,
+        sheets: &mut [Sheet],
+        redo: bool,
+        mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
+    ) -> (Applied, bool) {
+        let prev_excl_bytes = self.excluded.payload_bytes();
+        let mut applied = Applied {
+            touched: Vec::new(),
+            style_changes: Vec::new(),
+            label: self.label.clone(),
+            focus: self.focus,
+            skipped: 0,
+            structural: false,
+            refresh_sizes: None,
+            merge_changes: Vec::new(),
+            merge_conflict: false,
+        };
+        let Some(sheet) = sheets.get_mut(self.sheet) else {
+            applied.skipped = self.all_mask.len().saturating_sub(self.excluded.len());
+            return (applied, false);
+        };
+        let (exp_cells, tgt_cells, exp_styles, tgt_styles) = if redo {
+            (
+                &self.before_cells,
+                &self.after_cells,
+                &self.before_styles,
+                &self.after_styles,
+            )
+        } else {
+            (
+                &self.after_cells,
+                &self.before_cells,
+                &self.after_styles,
+                &self.before_styles,
+            )
+        };
+        let blank = Cell::default();
+        // 1) Validate per-cell changes before mutating inherited row/col styles so `sheet.style_of` sees pre-replay state.
+        let mut accepted: Vec<(CellRef, bool, bool)> = Vec::new();
+        for k in self.all_mask.iter() {
+            if self.excluded.contains(&k) {
+                continue;
+            }
+            let has_cell = self.cell_mask.contains(&k);
+            let has_style = self.style_mask.contains(&k);
+            let current = sheet.get(k.row, k.col).unwrap_or(&blank);
+            let ok_cell = !has_cell || {
+                let expected = exp_cells.get(k.row, k.col).unwrap_or(&blank);
+                current.same_input(expected)
+            };
+            let ok_style = !has_style || {
+                let expected_st = exp_styles.get(&k).copied().unwrap_or(0);
+                sheet.style_of(k.row, k.col) == expected_st
+            };
+            if !ok_cell || !ok_style || !guard(self.sheet, k.row, k.col, current) {
+                self.excluded.insert(k);
+                applied.skipped += 1;
+                self.permutation = None;
+                continue;
+            }
+            accepted.push((k, has_cell, has_style));
+        }
+        // 2) Replay inherited row/column styles first so explicit `set_style(r, c, 0)` overrides behave identically.
+        let mut axis_replayed = false;
+        self.row_style_deltas.retain(|&(r, b_id, a_id)| {
+            let (exp, tgt) = if redo { (b_id, a_id) } else { (a_id, b_id) };
+            if sheet.row_styles.get(&r).copied().unwrap_or(0) != exp {
+                applied.skipped += 1;
+                return false;
+            }
+            sheet.set_row_style(r, tgt);
+            axis_replayed = true;
+            for (k, _) in sheet.iter_rect((r, 0, r, u32::MAX)) {
+                applied.touched.push((self.sheet, k.row, k.col));
+                applied.style_changes.push((self.sheet, k.row, k.col));
+            }
+            true
+        });
+        self.col_style_deltas.retain(|&(c, b_id, a_id)| {
+            let (exp, tgt) = if redo { (b_id, a_id) } else { (a_id, b_id) };
+            if sheet.col_styles.get(&c).copied().unwrap_or(0) != exp {
+                applied.skipped += 1;
+                return false;
+            }
+            sheet.set_col_style(c, tgt);
+            axis_replayed = true;
+            let mut col_cells = Vec::new();
+            for (base_row, slice) in sheet.cells().column_slices(0, u32::MAX, c) {
+                for (i, cell) in slice.iter().enumerate() {
+                    if !cell.is_blank() {
+                        col_cells.push(base_row + i as u32);
+                    }
+                }
+            }
+            for r in col_cells {
+                applied.touched.push((self.sheet, r, c));
+                applied.style_changes.push((self.sheet, r, c));
+            }
+            true
+        });
+        // 3) Replay accepted cell & explicit style changes.
+        for (k, has_cell, has_style) in accepted {
+            if has_cell {
+                if let Some(tgt) = tgt_cells.get(k.row, k.col) {
+                    sheet.set(k.row, k.col, tgt.clone());
+                } else {
+                    sheet.remove(k.row, k.col);
+                }
+            }
+            if has_style {
+                let tgt_st = tgt_styles.get(&k).copied().unwrap_or(0);
+                sheet.set_style(k.row, k.col, tgt_st);
+                applied.style_changes.push((self.sheet, k.row, k.col));
+            }
+            applied.touched.push((self.sheet, k.row, k.col));
+        }
+        if axis_replayed {
+            applied.touched.sort_unstable();
+            applied.touched.dedup();
+            applied.style_changes.sort_unstable();
+            applied.style_changes.dedup();
+        }
+        stamp.payload_bytes = stamp
+            .payload_bytes
+            .saturating_add(self.excluded.payload_bytes().saturating_sub(prev_excl_bytes));
+        let keep = self.excluded.len() < self.all_mask.len()
+            || !self.row_style_deltas.is_empty()
+            || !self.col_style_deltas.is_empty();
+        (applied, keep)
     }
 }
 
@@ -501,7 +888,7 @@ struct ForeignReferences {
     cells: Vec<(CellRef, Cell)>,
     cf: Option<crate::cf::CfSheet>,
     dv: Option<Vec<crate::dv::DataValidation>>,
-    charts: Option<Vec<crate::charts::Chart>>,
+    charts: Option<crate::model::SharedList<crate::charts::Chart>>,
     sparklines: Option<Vec<crate::sparkline::Sparkline>>,
 }
 
@@ -525,39 +912,18 @@ pub struct StructureSnapshot {
 }
 
 pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::Structural) -> StructureSnapshot {
-    use crate::{refs::{Axis, Shift}, structural::Structural};
-    let (axis, at, n, delete) = match op {
-        Structural::InsertRows { at, n } => (Axis::Row, *at, *n, false),
-        Structural::DeleteRows { at, n } => (Axis::Row, *at, *n, true),
-        Structural::InsertCols { at, n } => (Axis::Col, *at, *n, false),
-        Structural::DeleteCols { at, n } => (Axis::Col, *at, *n, true),
-    };
     let target = wb.sheets[sheet].clone();
-    let mut foreign = Vec::new();
-    for (si, other) in wb.sheets.iter().enumerate().filter(|(si, _)| *si != sheet) {
-        let shift = Shift { axis, at, n, delete, target_sheet: target.name.clone(), own_sheet: other.name.clone(), translate: None, row_filter: None, col_filter: None };
-        let changes = |f: &str| crate::refs::rewrite(f, &shift) != f;
-        let cells: Vec<_> = other.foreign_formula_cells(&target.name).filter(|(_, c)| c.formula.as_deref().is_some_and(changes))
-            .map(|(key, c)| (key, c.clone())).collect();
-        let cf = other.cf.blocks.iter().any(|block| block.rules.iter().any(|rule| match &rule.kind {
-            crate::cf::CfKind::Expr { formula, .. } => changes(formula),
-            crate::cf::CfKind::CellIs { a, b, .. } => changes(a) || changes(b),
-            _ => false,
-        })).then(|| other.cf.clone());
-        let dv = other.dv.iter().any(|rule| changes(&rule.f1) || changes(&rule.f2)).then(|| other.dv.clone());
-        let charts = other.charts.iter().any(|chart| chart.series.iter().any(|series| {
-            changes(&series.name_ref) || changes(&series.cat_ref) || changes(&series.val_ref)
-        })).then(|| other.charts.clone());
-        let sparklines = other.sparklines.iter().any(|spark| spark.source_sheet.as_deref() == Some(target.name.as_str()))
-            .then(|| other.sparklines.clone());
-        if !cells.is_empty() || cf.is_some() || dv.is_some() || charts.is_some() || sparklines.is_some() {
-            foreign.push(ForeignReferences { sheet: si, identity: other.identity, cells, cf, dv, charts, sparklines });
-        }
-    }
     let shift = op.reference_shift();
-    let reference_uses = structure_refs::collect(wb, sheet, &shift);
+    let (reference_uses, foreign) = structure_refs::collect_with_foreign(wb, sheet, &shift);
     StructureSnapshot {
-        sheet, target, compact: None, shift, reference_uses, foreign, names: wb.names.clone(), pivot_shifts: wb.pivot_shifts.clone(),
+        sheet,
+        target,
+        compact: None,
+        shift,
+        reference_uses,
+        foreign,
+        names: wb.names.clone(),
+        pivot_shifts: wb.pivot_shifts.clone(),
         pending_pivots: wb.pivots_pending.clone(),
     }
 }
@@ -608,9 +974,15 @@ fn chart_refs_match(current: &[crate::charts::Chart], expected: &[crate::charts:
 
 /// A row/column operation only changes series references. Retain the live
 /// chart's presentation, cached values and save journal when changing them back.
-fn restored_charts(current: &[crate::charts::Chart], desired: &[crate::charts::Chart]) -> Vec<crate::charts::Chart> {
-    let mut restored = current.to_vec();
-    for (chart, desired) in restored.iter_mut().zip(desired) {
+fn restored_charts(
+    current: &crate::model::SharedList<crate::charts::Chart>,
+    desired: &crate::model::SharedList<crate::charts::Chart>,
+) -> crate::model::SharedList<crate::charts::Chart> {
+    if current.ptr_eq(desired) || chart_refs_match(current, desired) {
+        return current.clone();
+    }
+    let mut restored = current.clone();
+    for (chart, desired) in restored.iter_mut().zip(desired.iter()) {
         for (series, dest) in chart.series.iter_mut().zip(&desired.series) {
             for (from, to) in [(&mut series.name_ref, &dest.name_ref),
                 (&mut series.cat_ref, &dest.cat_ref), (&mut series.val_ref, &dest.val_ref)] {
@@ -724,29 +1096,64 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     if let Some(history) = &snap.compact {
         target.replace_cell_store(history.restore(current,&expected.shift)?);
     }
-    let mut touched = HashSet::new();
+    let mut touched = Vec::new();
     // Saving may have assigned a part to a previously new sheet. Undo changes
     // its content, not its identity or the current save baseline.
     target.identity = current.identity;
     target.source_part = current.source_part.clone();
     target.saved_cells.clone_from(&current.saved_cells);
     target.source_cells.clone_from(&current.source_cells);
-    target.cleared.extend(current.cleared.iter().copied());
-    for key in current.changed_cells(&target).collect::<Vec<_>>() {
-        touched.insert((snap.sheet, key.row, key.col));
-        if !target.contains(key.row, key.col) {
-            target.cleared.insert(key);
-        }
-    }
-    touched.extend(target.changed_cells(current).map(|k| (snap.sheet, k.row, k.col)));
-    target.style_edits.extend(current.style_edits.iter().copied());
+    let mut cleared = std::mem::take(&mut target.cleared);
+    cleared.union_from(&current.cleared);
+    current
+        .cells()
+        .diff_both_sides(target.cells(), snap.sheet, &mut cleared, &mut touched);
+    target.cleared = cleared;
+    target.style_edits.union_from(&current.style_edits);
     for k in current.styles.changed_keys(&target.styles).chain(target.styles.changed_keys(&current.styles)) {
-        touched.insert((snap.sheet, k.row, k.col));
+        touched.push((snap.sheet, k.row, k.col));
         target.style_edits.insert(k);
     }
-    if current.row_styles != target.row_styles || current.col_styles != target.col_styles {
-        touched.extend(target.iter().filter(|(k, _)| target.style_of(k.row, k.col) != current.style_of(k.row, k.col))
-            .map(|(k, _)| (snap.sheet, k.row, k.col)));
+    if current.row_styles != target.row_styles {
+        let mut changed_rows: Vec<u32> = current
+            .row_styles
+            .keys()
+            .chain(target.row_styles.keys())
+            .copied()
+            .filter(|r| current.row_styles.get(r) != target.row_styles.get(r))
+            .collect();
+        changed_rows.sort_unstable();
+        changed_rows.dedup();
+        for r in changed_rows {
+            for (k, _) in target.iter_rect((r, 0, r, u32::MAX)) {
+                if target.style_of(k.row, k.col) != current.style_of(k.row, k.col) {
+                    touched.push((snap.sheet, k.row, k.col));
+                }
+            }
+        }
+    }
+    if current.col_styles != target.col_styles {
+        let mut changed_cols: Vec<u32> = current
+            .col_styles
+            .keys()
+            .chain(target.col_styles.keys())
+            .copied()
+            .filter(|c| current.col_styles.get(c) != target.col_styles.get(c))
+            .collect();
+        changed_cols.sort_unstable();
+        changed_cols.dedup();
+        for c in changed_cols {
+            for (base_row, slice) in target.cells().column_slices(0, u32::MAX, c) {
+                for (i, cell) in slice.iter().enumerate() {
+                    if !cell.is_blank() {
+                        let r = base_row + i as u32;
+                        if target.style_of(r, c) != current.style_of(r, c) {
+                            touched.push((snap.sheet, r, c));
+                        }
+                    }
+                }
+            }
+        }
     }
     target.charts = restored_charts(&current.charts, &target.charts);
     target.loading = false;
@@ -779,7 +1186,7 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
         let Some(sheet) = wb.sheets.get_mut(foreign.sheet) else { continue };
         for (key, cell) in &foreign.cells {
             sheet.set(key.row, key.col, cell.clone());
-            touched.insert((foreign.sheet, key.row, key.col));
+            touched.push((foreign.sheet, key.row, key.col));
         }
         if let Some(cf) = &foreign.cf { sheet.cf = cf.clone(); sheet.cf_dirty = true; }
         if let Some(dv) = &foreign.dv { sheet.dv = dv.clone(); sheet.dv_dirty = true; }
@@ -806,8 +1213,8 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
         wb.pivots_pending.clone_from(&snap.pending_pivots);
     }
     wb.dirty = true;
-    let mut touched: Vec<_> = touched.into_iter().collect();
     touched.sort_unstable();
+    touched.dedup();
     Some(touched)
 }
 
@@ -842,9 +1249,31 @@ impl UndoStack {
         if action.by_site == 0 {
             action.by_site = self.site;
         }
-        self.done.push(Entry::Cells(next_entry(bytes), action, None));
+        if let Some((cow, cow_bytes)) = CowBatchAction::from_action(&action) {
+            self.done.push(Entry::CowBatch(next_entry(cow_bytes), Box::new(cow)));
+        } else {
+            self.done.push(Entry::Cells(next_entry(bytes), action, None));
+        }
         // 新动作让「重做」失效
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
+    /// Record a large single-sheet batch directly from `before` and `after` CoW `Sheet` snapshots
+    /// without constructing a per-cell `Vec<CellDelta>`.
+    pub fn push_cow_batch(
+        &mut self,
+        label: impl Into<String>,
+        sheet_idx: usize,
+        before: &Sheet,
+        after: &Sheet,
+        focus: (usize, u32, u32),
+    ) {
+        if let Some((cow, bytes)) =
+            CowBatchAction::from_sheets(label.into(), sheet_idx, before, after, focus, self.site)
+        {
+            self.done.push(Entry::CowBatch(next_entry(bytes), Box::new(cow)));
+            self.trim_history(HISTORY_PAYLOAD_BUDGET);
+        }
     }
 
     /// Keep the newest operation undoable even when one very large edit exceeds the budget.
@@ -994,10 +1423,18 @@ impl UndoStack {
 
     /// Called immediately after recording the nonempty cell action for a sort.
     pub fn tag_sorted_cells(&mut self, order: crate::data_tools::LinePermutation) {
-        if let Some(Entry::Cells(stamp, _, slot)) = self.done.last_mut() {
-            stamp.payload_bytes += order.2.capacity() * size_of::<u32>();
-            *slot = Some(order);
-            self.trim_history(HISTORY_PAYLOAD_BUDGET);
+        match self.done.last_mut() {
+            Some(Entry::Cells(stamp, _, slot)) => {
+                stamp.payload_bytes += order.2.capacity() * size_of::<u32>();
+                *slot = Some(order);
+                self.trim_history(HISTORY_PAYLOAD_BUDGET);
+            }
+            Some(Entry::CowBatch(stamp, action)) => {
+                stamp.payload_bytes += order.2.capacity() * size_of::<u32>();
+                action.permutation = Some(order);
+                self.trim_history(HISTORY_PAYLOAD_BUDGET);
+            }
+            _ => {}
         }
     }
 
@@ -1005,6 +1442,7 @@ impl UndoStack {
         let entry = if redo { self.undone.last()? } else { self.done.last()? };
         let (region, horizontal, mut order) = match entry {
             Entry::Cells(_, _, Some(p)) => p.clone(),
+            Entry::CowBatch(_, a) if a.excluded.is_empty() => a.permutation.clone()?,
             Entry::NumericSort(_, a) if a.excluded.is_empty() => a.sort.permutation(),
             _ => return None,
         };
@@ -1133,6 +1571,12 @@ impl UndoStack {
             if !applied.touched.is_empty() { self.undone.push(entry); }
             return Some(applied);
         }
+        if let Some(Entry::CowBatch(stamp, action)) = self.done.last_mut() {
+            let (applied, keep) = action.apply(stamp, sheets, false, guard);
+            let entry = self.done.pop()?;
+            if keep { self.undone.push(entry); }
+            return Some(applied);
+        }
         let Entry::Cells(id, mut action, mut permutation) = self.done.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
@@ -1253,6 +1697,12 @@ impl UndoStack {
             let applied = action.apply(stamp, sheets, true, guard);
             let entry = self.undone.pop()?;
             if !applied.touched.is_empty() { self.done.push(entry); }
+            return Some(applied);
+        }
+        if let Some(Entry::CowBatch(stamp, action)) = self.undone.last_mut() {
+            let (applied, keep) = action.apply(stamp, sheets, true, guard);
+            let entry = self.undone.pop()?;
+            if keep { self.done.push(entry); }
             return Some(applied);
         }
         let Entry::Cells(id, mut action, mut permutation) = self.undone.pop()? else { unreachable!() };
@@ -1624,16 +2074,10 @@ pub fn sparse_rect_keys(sheet: &Sheet, r1: u32, c1: u32, r2: u32, c2: u32) -> Ve
     if area <= 200_000 {
         return rect_keys(r1, c1, r2, c2);
     }
-    let mut set = std::collections::BTreeSet::new();
-    for (cref, _) in sheet.iter() {
-        if cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2 {
-            set.insert((cref.row, cref.col));
-        }
-    }
-    for cref in sheet.styles.keys() {
-        if cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2 {
-            set.insert((cref.row, cref.col));
-        }
-    }
-    set.into_iter().collect()
+    let rect = (r1, c1, r2, c2);
+    let mut keys: Vec<(u32, u32)> = sheet.iter_rect(rect).map(|(k, _)| (k.row, k.col)).collect();
+    keys.extend(sheet.styles.iter_rect(rect).map(|(k, _)| (k.row, k.col)));
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }

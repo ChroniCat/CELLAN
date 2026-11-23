@@ -259,11 +259,11 @@ fn parse_link_part(xml: &str) -> ParsedPart {
                 if n == "v" {
                     if let Some((row, col)) = cur {
                         let v = match cur_t.as_str() {
-                            "str" => Value::Text(text.clone().into_boxed_str()),
+                            "str" => Value::Text(text.as_str().into()),
                             "b" => Value::Bool(text.trim() == "1"),
                             "e" => match crate::formula::ErrKind::from_text(&text) {
                                 Some(k) => Value::Error(k),
-                                None => Value::Text(text.clone().into_boxed_str()),
+                                None => Value::Text(text.as_str().into()),
                             },
                             _ => text
                                 .trim()
@@ -1734,10 +1734,10 @@ fn data_to_value(d: &calamine::Data) -> Value {
     match d {
         Data::Int(i) => Value::Number(*i as f64),
         Data::Float(f) => Value::Number(*f),
-        Data::String(s) => Value::Text(s.clone().into_boxed_str()),
+        Data::String(s) => Value::Text(s.as_str().into()),
         Data::Bool(b) => Value::Bool(*b),
         Data::DateTime(x) => Value::Number(x.as_f64()),
-        Data::DateTimeIso(s) | Data::DurationIso(s) => Value::Text(s.clone().into_boxed_str()),
+        Data::DateTimeIso(s) | Data::DurationIso(s) => Value::Text(s.as_str().into()),
         Data::Error(e) => match e {
             calamine::CellErrorType::Div0 => Value::Error(crate::formula::ErrKind::Div0),
             calamine::CellErrorType::Name => Value::Error(crate::formula::ErrKind::Name),

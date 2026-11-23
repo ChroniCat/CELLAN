@@ -199,7 +199,7 @@ struct Marks {
     source: SheetCells,
     styles: u64,
     options: (bool, bool),
-    ignored: HashSet<(u32, u32)>,
+    ignored: sheetcore::model::CellSet<(u32, u32)>,
 }
 
 struct Cycles {

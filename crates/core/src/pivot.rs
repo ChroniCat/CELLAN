@@ -6,7 +6,7 @@
 //! pivotCacheDefinition + pivotTableDefinition 两套部件，投入产出不划算。
 
 use crate::model::{Cell, Sheet, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Agg {
@@ -162,8 +162,74 @@ pub fn row_values(sheet: &Sheet, spec: &PivotSpec) -> Vec<String> {
     out
 }
 
-#[derive(Clone, Copy)]
-struct PivotVal { n: Option<f64> }
+/// Streaming scalar accumulator: replaces retaining 3-4 copies of `Vec<PivotVal>` per cell.
+#[derive(Clone, Copy, Debug)]
+struct PivotAcc {
+    nonempty: u64,
+    numeric: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Default for PivotAcc {
+    fn default() -> Self {
+        Self {
+            nonempty: 0,
+            numeric: 0,
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl PivotAcc {
+    #[inline]
+    fn push(&mut self, n: Option<f64>, nonempty: bool, agg: Agg) {
+        if agg == Agg::Count {
+            if nonempty {
+                self.nonempty += 1;
+            }
+        } else if let Some(v) = n {
+            self.nonempty += 1;
+            self.numeric += 1;
+            self.sum += v;
+            self.min = self.min.min(v);
+            self.max = self.max.max(v);
+        }
+    }
+
+    #[inline]
+    fn merge(&mut self, other: &Self) {
+        self.nonempty += other.nonempty;
+        self.numeric += other.numeric;
+        self.sum += other.sum;
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+    }
+
+    #[inline]
+    fn finish(&self, agg: Agg) -> Value {
+        if agg == Agg::Count {
+            if self.nonempty == 0 {
+                Value::Empty
+            } else {
+                Value::Number(self.nonempty as f64)
+            }
+        } else if self.numeric == 0 {
+            Value::Empty
+        } else {
+            match agg {
+                Agg::Sum => Value::Number(self.sum),
+                Agg::Avg => Value::Number(self.sum / self.numeric as f64),
+                Agg::Max => Value::Number(self.max),
+                Agg::Min => Value::Number(self.min),
+                Agg::Count => unreachable!(),
+            }
+        }
+    }
+}
 
 pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     let (r1, _, r2, _) = spec.source;
@@ -175,60 +241,79 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     };
     let row_name = header(spec.row_field);
     let value_name = header(spec.value_field);
-    let col_name = spec.col_field.map(|c| header(c));
+    let col_name = spec.col_field.map(&header);
     let value_caption = format!("{}:{}", agg_prefix(spec.agg), value_name);
 
-    // 收集：行标签 → (列标签 → 值列表)。Count 只数非空格（数字/文本都算），
-    // 空白格不能以 0 混进计数。
-    let mut data: BTreeMap<String, BTreeMap<String, Vec<PivotVal>>> = BTreeMap::new();
-    // Excel 透视表默认按「源表出现顺序」排列行/列标签，不排序
+    // 流式聚合：按源表出现顺序用 O(1) HashMap 索引 (row_id, col_id) -> PivotAcc
     let mut row_order: Vec<String> = Vec::new();
+    let mut row_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut col_order: Vec<String> = Vec::new();
-    let mut known_cols = HashSet::new();
-    let excluded: HashSet<_> = spec.exclude.iter().map(String::as_str).collect();
-    for r in (r1 + 1)..=r2 {
-        let raw = sheet
-            .get(r, spec.row_field)
-            .map(|x| &x.value)
-            .unwrap_or(&Value::Empty);
-        let key = group_key(raw, &spec.group);
-        if key.is_empty() {
-            continue;
-        }
-        if excluded.contains(key.as_str()) {
-            continue;
-        }
-        let col_key = match spec.col_field {
-            Some(cc) => sheet.get(r, cc).map(|x| x.value.display()).unwrap_or_default(),
-            None => value_name.clone(),
-        };
-        let v = sheet.get(r, spec.value_field).map(|x| x.value.clone());
-        let (n, nonempty) = match v {
-            Some(Value::Number(n)) => (Some(n), true),
-            Some(Value::Empty) | None => (None, false),
-            Some(other) => (other.display().parse::<f64>().ok(), true),
-        };
-        // 先建立分组标签，再决定是否纳值。否则某个标签下的值全为空时，
-        // 整行/整列会从结果里消失（Excel 仍保留标签，全空组的 Count 显示空白）。
-        let row = data.entry(key).or_insert_with_key(|key| {
-            row_order.push(key.clone());
-            BTreeMap::new()
-        });
-        if !known_cols.contains(&col_key) {
-            known_cols.insert(col_key.clone());
-            col_order.push(col_key.clone());
-        }
-        let entry = row.entry(col_key).or_default();
-        if spec.agg == Agg::Count {
-            if nonempty {
-                entry.push(PivotVal { n });
-            }
-        } else if let Some(n) = n {
-            entry.push(PivotVal { n: Some(n) });
-        }
+    let mut col_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut cells: Vec<Vec<PivotAcc>> = Vec::new();
+    let excluded: HashSet<&str> = spec.exclude.iter().map(String::as_str).collect();
+
+    if spec.col_field.is_none() {
+        col_map.insert(value_name.clone(), 0);
+        col_order.push(value_name.clone());
     }
 
-    let col_keys: Vec<String> = col_order;
+    for r in (r1 + 1)..=r2 {
+        let raw = sheet.value_ref(r, spec.row_field);
+        let key = group_key(raw, &spec.group);
+        if key.is_empty() || excluded.contains(key.as_str()) {
+            continue;
+        }
+        let ci = match spec.col_field {
+            Some(cc) => {
+                let col_val = sheet.value_ref(r, cc);
+                if let Value::Text(t) = col_val
+                    && let Some(&idx) = col_map.get(t.as_ref())
+                {
+                    idx
+                } else {
+                    let ck = col_val.display();
+                    match col_map.get(&ck) {
+                        Some(&idx) => idx,
+                        None => {
+                            let idx = col_order.len();
+                            col_map.insert(ck.clone(), idx);
+                            col_order.push(ck);
+                            idx
+                        }
+                    }
+                }
+            }
+            None => 0,
+        };
+        let v = sheet.value_ref(r, spec.value_field);
+        let (n, nonempty) = match v {
+            Value::Number(n) => (Some(*n), true),
+            Value::Empty => (None, false),
+            Value::Text(t) => (t.trim().parse::<f64>().ok(), !t.is_empty()),
+            other => (other.display().parse::<f64>().ok(), true),
+        };
+        let ri = match row_map.get(&key) {
+            Some(&idx) => idx,
+            None => {
+                let idx = row_order.len();
+                row_map.insert(key.clone(), idx);
+                row_order.push(key);
+                cells.push(Vec::new());
+                idx
+            }
+        };
+        if cells[ri].len() <= ci {
+            cells[ri].resize(ci + 1, PivotAcc::default());
+        }
+        cells[ri][ci].push(n, nonempty, spec.agg);
+    }
+
+    let n_cols = if row_order.is_empty() && spec.col_field.is_none() {
+        0
+    } else {
+        col_order.len()
+    };
+    let col_keys = if n_cols == 0 { Vec::new() } else { col_order };
 
     let mut headers = vec![row_name.clone()];
     headers.extend(col_keys.iter().cloned());
@@ -236,38 +321,47 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
         headers.push("总计".to_string());
     }
 
-    let mut rows = Vec::new();
-    let mut grand: Vec<Vec<PivotVal>> = vec![Vec::new(); col_keys.len()];
-    let mut grand_all: Vec<PivotVal> = Vec::new();
-    for key in row_order.iter() {
-        let m = &data[key];
-        let mut line = vec![Value::Text(key.as_str().into())];
-        let mut row_vals: Vec<PivotVal> = Vec::new();
-        for (i, ck) in col_keys.iter().enumerate() {
-            let vals = m.get(ck).cloned().unwrap_or_default();
-            grand[i].extend(vals.iter().copied());
-            row_vals.extend(vals.iter().copied());
-            line.push(agg_value(&vals, spec.agg));
+    let mut rows = Vec::with_capacity(row_order.len() + 1);
+    let mut grand: Vec<PivotAcc> = vec![PivotAcc::default(); col_keys.len()];
+    let mut grand_all = PivotAcc::default();
+    let default_acc = PivotAcc::default();
+    for (ri, key) in row_order.iter().enumerate() {
+        let row_accs = &cells[ri];
+        let mut line = Vec::with_capacity(col_keys.len() + 2);
+        line.push(Value::Text(key.as_str().into()));
+        let mut row_tot = PivotAcc::default();
+        for ci in 0..col_keys.len() {
+            let acc = row_accs.get(ci).unwrap_or(&default_acc);
+            grand[ci].merge(acc);
+            row_tot.merge(acc);
+            line.push(acc.finish(spec.agg));
         }
         if spec.col_field.is_some() {
-            grand_all.extend(row_vals.iter().copied());
-            line.push(agg_value(&row_vals, spec.agg));
+            grand_all.merge(&row_tot);
+            line.push(row_tot.finish(spec.agg));
         }
         rows.push(line);
     }
-    // 合计行
     if rows.len() > 1 {
-        let mut total = vec![Value::Text("总计".into())];
-        for i in 0..col_keys.len() {
-            total.push(agg_value(&grand[i], spec.agg));
+        let mut total = Vec::with_capacity(col_keys.len() + 2);
+        total.push(Value::Text("总计".into()));
+        for g in &grand {
+            total.push(g.finish(spec.agg));
         }
         if spec.col_field.is_some() {
-            total.push(agg_value(&grand_all, spec.agg));
+            total.push(grand_all.finish(spec.agg));
         }
         rows.push(total);
     }
 
-    PivotResult { headers, rows, row_name, value_name, col_name, value_caption }
+    PivotResult {
+        headers,
+        rows,
+        row_name,
+        value_name,
+        col_name,
+        value_caption,
+    }
 }
 
 /// 排序键：非 ASCII 文本按 GBK 编码比较（GB2312 一级汉字按拼音排列，与 Excel 中文排序一致）
@@ -287,22 +381,6 @@ pub fn agg_prefix(agg: Agg) -> &'static str {
         Agg::Avg => "平均值项",
         Agg::Max => "最大值项",
         Agg::Min => "最小值项",
-    }
-}
-
-fn agg_value<T: std::borrow::Borrow<PivotVal>>(vals: &[T], agg: Agg) -> Value {
-    if vals.is_empty() {
-        // 本机 Excel 365 对“整组全空”的 Count 显示空白，而不是 0；
-        // 但分组标签仍保留（由 compute 先建 entry 保证）。
-        return Value::Empty;
-    }
-    let nums: Vec<f64> = vals.iter().filter_map(|v| v.borrow().n).collect();
-    match agg {
-        Agg::Sum => Value::Number(nums.iter().sum()),
-        Agg::Count => Value::Number(vals.len() as f64),
-        Agg::Avg => Value::Number(nums.iter().sum::<f64>() / nums.len() as f64),
-        Agg::Max => Value::Number(nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
-        Agg::Min => Value::Number(nums.iter().cloned().fold(f64::INFINITY, f64::min)),
     }
 }
 
