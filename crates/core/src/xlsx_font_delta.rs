@@ -118,63 +118,276 @@ fn rgb(node: Node<'_, '_>) -> Option<[u8; 3]> {
     ])
 }
 
-// A modeled RGB fill cannot describe theme colors, gradients, patterns or extensions.
-// Only replace a plain foreground fill whose raw attributes agree with the model.
-pub(super) fn plain_fill_pattern(styles: &StyleTable, id: u16) -> bool {
-    styles.pattern_of(id).is_none_or(|p| {
-        p.kind == "solid"
-            && p.fg.is_some()
-            && p.fg == styles.get(id).fill
-            && p.fg_theme.is_none()
-            && p.fg_indexed.is_none()
-            && p.bg.is_none()
-            && p.bg_theme.is_none()
-            && matches!(p.bg_indexed, None | Some(64))
-    })
+#[derive(Clone, Copy, PartialEq)]
+enum Paint {
+    Rgb([u8; 3]),
+    Theme(u8, f32),
+    Indexed(u8),
 }
 
-fn solid_fill(fill: Node<'_, '_>, old: Option<[u8; 3]>, new: Option<[u8; 3]>) -> Option<String> {
-    if fill.attributes().len() != 0 {
-        return None;
-    }
-    let mut children = fill.children().filter(Node::is_element);
-    let pattern = children.next()?;
-    if children.next().is_some()
-        || !pattern.has_tag_name((NS, "patternFill"))
-        || pattern
-            .attributes()
-            .any(|a| a.namespace().is_some() || a.name() != "patternType")
-    {
-        return None;
-    }
-    let mut fg = None;
-    let mut bg = false;
-    for child in pattern.children().filter(Node::is_element) {
-        if child.has_tag_name((NS, "fgColor")) && fg.is_none() {
-            fg = Some(rgb(child)?);
-        } else if child.has_tag_name((NS, "bgColor"))
-            && !bg
-            && child.attributes().len() == 1
-            && child.attribute("indexed") == Some("64")
-            && !child.children().any(|n| n.is_element())
-        {
-            bg = true;
-        } else {
+impl Paint {
+    fn read(n: Node<'_, '_>) -> Option<Self> {
+        if n.children().any(|n| n.is_element()) {
             return None;
         }
+        if let Some(c) = rgb(n) {
+            return Some(Self::Rgb(c));
+        }
+        if let Some(index) = n.attribute("theme") {
+            if n.attributes()
+                .any(|a| a.namespace().is_some() || !matches!(a.name(), "theme" | "tint"))
+            {
+                return None;
+            }
+            let index = index.parse().ok()?;
+            let tint: f32 = n.attribute("tint").unwrap_or("0").parse().ok()?;
+            return (index < 12 && (-1.0..=1.0).contains(&tint))
+                .then_some(Self::Theme(index, tint));
+        }
+        if n.attributes().len() != 1 {
+            return None;
+        }
+        Some(Self::Indexed(n.attribute("indexed")?.parse().ok()?))
     }
-    match pattern.attribute("patternType").unwrap_or("none") {
-        "none" if fg.is_none() && old.is_none() => {}
-        "solid" if fg.is_some() && fg == old => {}
-        _ => return None,
+    fn xml(self, tag: &str) -> Option<String> {
+        let attrs = match self {
+            Self::Rgb(color) => format!("rgb=\"{}\"", argb(color)),
+            Self::Indexed(i) if i <= 65 => format!("indexed=\"{i}\""),
+            Self::Theme(i, t) if i < 12 && (-1.0..=1.0).contains(&t) => {
+                format!("theme=\"{i}\" tint=\"{t}\"")
+            }
+            _ => return None,
+        };
+        Some(format!("<{tag} {attrs}/>"))
     }
-    Some(match new {
-        None => "<fill><patternFill patternType=\"none\"/></fill>".into(),
-        Some(color) => format!(
-            "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"{}\"/><bgColor indexed=\"64\"/></patternFill></fill>",
-            argb(color)
-        ),
-    })
+    fn model(
+        color: Option<[u8; 3]>,
+        theme: Option<(u8, f32)>,
+        indexed: Option<u8>,
+    ) -> Option<Option<Self>> {
+        match (color, theme, indexed) {
+            (None, Some((i, t)), None) => Some(Some(Self::Theme(i, t))),
+            (None, None, Some(i)) => Some(Some(Self::Indexed(i))),
+            (c, None, None) => Some(c.map(Self::Rgb)),
+            _ => None,
+        }
+    }
+}
+#[derive(PartialEq)]
+struct Pattern<'a> {
+    kind: &'a str,
+    fg: Option<Paint>,
+    bg: Option<Paint>,
+}
+
+impl<'a> Pattern<'a> {
+    fn model(styles: &'a StyleTable, id: u16) -> Option<Self> {
+        let theme = styles.theme_of(id).fill.map(|t| (t.idx, t.tint));
+        if let Some(p) = styles.pattern_of(id) {
+            if theme.is_some() && p.fg_theme != theme {
+                return None;
+            }
+            if p.kind == "solid" && p.fg.is_some() && p.fg != styles.get(id).fill {
+                return None;
+            }
+            return Some(Self {
+                kind: &p.kind,
+                fg: Paint::model(p.fg, p.fg_theme, p.fg_indexed)?,
+                bg: Paint::model(p.bg, p.bg_theme, p.bg_indexed)?,
+            });
+        }
+        let fg = theme
+            .map(|(i, t)| Paint::Theme(i, t))
+            .or_else(|| styles.get(id).fill.map(Paint::Rgb));
+        Some(Self {
+            kind: if fg.is_some() { "solid" } else { "none" },
+            fg,
+            bg: None,
+        })
+    }
+    fn raw(fill: Node<'a, '_>) -> Option<Self> {
+        if fill.attributes().len() != 0 {
+            return None;
+        }
+        let mut children = fill.children().filter(Node::is_element);
+        let pattern = children.next()?;
+        if children.next().is_some()
+            || !pattern.has_tag_name((NS, "patternFill"))
+            || pattern
+                .attributes()
+                .any(|a| a.namespace().is_some() || a.name() != "patternType")
+        {
+            return None;
+        }
+        let mut out = Self {
+            kind: pattern.attribute("patternType").unwrap_or("none"),
+            fg: None,
+            bg: None,
+        };
+        for child in pattern.children().filter(Node::is_element) {
+            if child.has_tag_name((NS, "fgColor")) && out.fg.is_none() {
+                out.fg = Some(Paint::read(child)?);
+            } else if child.has_tag_name((NS, "bgColor")) && out.bg.is_none() {
+                out.bg = Some(Paint::read(child)?);
+            } else {
+                return None;
+            }
+        }
+        Some(out)
+    }
+    fn xml(&self) -> Option<String> {
+        if !matches!(
+            self.kind,
+            "none"
+                | "solid"
+                | "mediumGray"
+                | "darkGray"
+                | "lightGray"
+                | "darkHorizontal"
+                | "darkVertical"
+                | "darkDown"
+                | "darkUp"
+                | "darkGrid"
+                | "darkTrellis"
+                | "lightHorizontal"
+                | "lightVertical"
+                | "lightDown"
+                | "lightUp"
+                | "lightGrid"
+                | "lightTrellis"
+                | "gray125"
+                | "gray0625"
+        ) {
+            return None;
+        }
+        let mut out = format!("<fill><patternFill patternType=\"{}\">", self.kind);
+        if let Some(c) = self.fg {
+            out.push_str(&c.xml("fgColor")?);
+        }
+        if let Some(c) = self
+            .bg
+            .or_else(|| (self.kind == "solid").then_some(Paint::Indexed(64)))
+        {
+            out.push_str(&c.xml("bgColor")?);
+        }
+        out.push_str("</patternFill></fill>");
+        Some(out)
+    }
+}
+
+/// Preserve diagonal, interior lines, border flags and extensions on the original
+/// record. Only replace a requested side whose old representation is understood.
+fn border_variant(
+    xml: &str,
+    border: Node<'_, '_>,
+    old: &CellStyle,
+    new: &CellStyle,
+) -> Option<String> {
+    const NAMES: [&str; 7] = [
+        "left",
+        "right",
+        "top",
+        "bottom",
+        "diagonal",
+        "vertical",
+        "horizontal",
+    ];
+    const STYLES: [&str; 7] = [
+        "none", "thin", "medium", "thick", "double", "dashed", "dotted",
+    ];
+    if border.default_namespace() != Some(NS) {
+        return None;
+    }
+    let range = border.range();
+    let raw = &xml[range.clone()];
+    if !raw.starts_with("<border") {
+        return None;
+    }
+    let mut edits = Vec::new();
+    let mut end_insert = String::new();
+    for (index, name) in NAMES[..4].iter().enumerate() {
+        let was = old.border[index];
+        let want = new.border[index];
+        if was == want {
+            continue;
+        }
+        let mut sides = border.children().filter(|n| n.has_tag_name((NS, *name)));
+        let side = sides.next();
+        if sides.next().is_some() {
+            return None;
+        }
+        let raw_style = side.and_then(|n| n.attribute("style")).unwrap_or("none");
+        if raw_style != *STYLES.get(usize::from(was.style))? {
+            return None;
+        }
+        let style = STYLES.get(usize::from(want.style))?;
+        let mut color = None;
+        if let Some(side) = side {
+            if side
+                .attributes()
+                .any(|a| a.namespace().is_some() || a.name() != "style")
+                || side
+                    .namespaces()
+                    .any(|ns| border.lookup_namespace_uri(ns.name()) != Some(ns.uri()))
+            {
+                return None;
+            }
+            for c in side.children().filter(Node::is_element) {
+                if !c.has_tag_name((NS, "color")) || color.replace(c).is_some() {
+                    return None;
+                }
+            }
+        }
+        let replacement = if want.style == 0 {
+            if let Some(c) = color {
+                if !ordinary_border_color(c, was.color) {
+                    return None;
+                }
+            }
+            format!("<{name}/>")
+        } else {
+            let color = if was.color == want.color && color.is_some() {
+                xml[color?.range()].to_owned()
+            } else {
+                if color.is_some_and(|c| !ordinary_border_color(c, was.color)) {
+                    return None;
+                }
+                format!("<color rgb=\"{}\"/>", argb(want.color))
+            };
+            format!("<{name} style=\"{style}\">{color}</{name}>")
+        };
+        if let Some(side) = side {
+            edits.push((side.range(), replacement));
+        } else if let Some(next) = border.children().find(|n| {
+            n.is_element()
+                && (NAMES[index + 1..]
+                    .iter()
+                    .any(|name| n.has_tag_name((NS, *name)))
+                    || n.tag_name().namespace() != Some(NS))
+        }) {
+            let pos = next.range().start;
+            edits.push((pos..pos, replacement));
+        } else {
+            end_insert.push_str(&replacement);
+        }
+    }
+    if !end_insert.is_empty() {
+        if raw.ends_with("/>") {
+            edits.push((range.end - 2..range.end, format!(">{end_insert}</border>")));
+        } else {
+            let pos = range.start + raw.rfind("</")?;
+            edits.push((pos..pos, end_insert));
+        }
+    }
+    Some(apply_edits(raw, range.start, edits))
+}
+
+fn ordinary_border_color(c: Node<'_, '_>, expected: [u8; 3]) -> bool {
+    rgb(c) == Some(expected)
+        || expected == [0; 3]
+            && c.attributes().len() == 1
+            && matches!(c.attribute("auto"), Some("1" | "true"))
+            && !c.children().any(|n| n.is_element())
 }
 
 struct NumberFormats {
@@ -304,6 +517,7 @@ pub(super) struct Styles<'a> {
     doc: Document<'a>,
     fonts: Table,
     fills: Option<Table>,
+    borders: Option<Table>,
     formats: Option<NumberFormats>,
     xfs: Table,
     resolved: HashMap<(u16, u16, u16), u16>,
@@ -324,6 +538,7 @@ impl<'a> Styles<'a> {
             doc,
             fonts,
             fills: None,
+            borders: None,
             formats: None,
             xfs,
             resolved: HashMap::new(),
@@ -366,34 +581,50 @@ impl<'a> Styles<'a> {
         expected.shrink_to_fit = new.shrink_to_fit;
         expected.indent = new.indent;
         expected.halign = new.halign;
-        if expected != *new || old == new {
+        expected.valign = new.valign;
+        expected.rotation = new.rotation;
+        expected.vertical_text = new.vertical_text;
+        expected.font.clone_from(&new.font);
+        expected.border = new.border;
+        let was_theme = styles.theme_of(old_id);
+        let want_theme = styles.theme_of(id);
+        let fill_changed = old.fill != new.fill
+            || was_theme.fill != want_theme.fill
+            || styles.pattern_of(old_id) != styles.pattern_of(id);
+        if expected != *new || (old == new && !fill_changed && was_theme == want_theme) {
             return None;
         }
         let mut fields = Vec::new();
-        if old.bold != new.bold
+        if old.font != new.font
+            || old.bold != new.bold
+            || was_theme.font != want_theme.font
             || old.italic != new.italic
             || (old.underline, old.double_underline) != (new.underline, new.double_underline)
             || old.size != new.size
             || old.color != new.color
             || old.strikethrough != new.strikethrough
         {
-            if old.color != new.color && styles.theme_of(old_id).font.is_some() {
-                return None;
-            }
             let original = self.component(base, "fontId", "applyFont")?;
-            fields.push(("fontId", self.font(original, old, new)?));
+            fields.push((
+                "fontId",
+                self.font(original, old, new, was_theme.font, want_theme.font)?,
+            ));
             fields.push(("applyFont", 1));
         }
-        if old.fill != new.fill {
-            if styles.theme_of(old_id).fill.is_some()
-                || !plain_fill_pattern(styles, old_id)
-                || !plain_fill_pattern(styles, id)
+        if fill_changed {
+            let original = self.component(base, "fillId", "applyFill")?;
+            let mut actual = Pattern::raw(self.node("fills", original)?)?;
+            let expected = Pattern::model(styles, old_id)?;
+            if expected.bg.is_none()
+                && actual.bg == Some(Paint::Indexed(64))
+                && expected.kind == "solid"
             {
+                actual.bg = None;
+            }
+            if actual != expected {
                 return None;
             }
-            let original = self.component(base, "fillId", "applyFill")?;
-            let record = self.node("fills", original)?;
-            let fill = solid_fill(record, old.fill, new.fill)?;
+            let fill = Pattern::model(styles, id)?.xml()?;
             if self.fills.is_none() {
                 self.fills = Some(Table::read(
                     self.doc.root_element(),
@@ -404,6 +635,20 @@ impl<'a> Styles<'a> {
             }
             fields.push(("fillId", self.fills.as_mut()?.intern(self.xml, fill)?));
             fields.push(("applyFill", 1));
+        }
+        if old.border != new.border {
+            let original = self.component(base, "borderId", "applyBorder")?;
+            let value = border_variant(self.xml, self.node("borders", original)?, old, new)?;
+            if self.borders.is_none() {
+                self.borders = Some(Table::read(
+                    self.doc.root_element(),
+                    self.xml,
+                    "borders",
+                    "border",
+                )?);
+            }
+            fields.push(("borderId", self.borders.as_mut()?.intern(self.xml, value)?));
+            fields.push(("applyBorder", 1));
         }
         if old.format != new.format {
             let original = self.component(base, "numFmtId", "applyNumberFormat")?;
@@ -453,7 +698,14 @@ impl<'a> Styles<'a> {
         Some(local)
     }
 
-    fn font(&mut self, font_id: u16, old: &CellStyle, new: &CellStyle) -> Option<u16> {
+    fn font(
+        &mut self,
+        font_id: u16,
+        old: &CellStyle,
+        new: &CellStyle,
+        was_theme: Option<crate::style_theme::ThemeRef>,
+        want_theme: Option<crate::style_theme::ThemeRef>,
+    ) -> Option<u16> {
         let font = self.node("fonts", font_id)?;
         if font.default_namespace() != Some(NS) {
             return None;
@@ -461,6 +713,40 @@ impl<'a> Styles<'a> {
         let font_range = font.range();
         let mut edits = Vec::new();
         let mut prefix = String::new();
+        if old.font != new.font {
+            if new.font.is_empty()
+                || new.font.encode_utf16().count() > 31
+                || !super::safe_xml_text(&new.font)
+            {
+                return None;
+            }
+            let mut names = font.children().filter(|n| n.has_tag_name((NS, "name")));
+            let escaped = quick_xml::escape::escape(&new.font);
+            if let Some(name) = names.next() {
+                let attr = name.attribute_node("val")?;
+                let normalized = crate::style::normalize_font(attr.value());
+                if names.next().is_some()
+                    || !(normalized == old.font || old.font.is_empty() && normalized == "Calibri")
+                {
+                    return None;
+                }
+                edits.push((attr.range_value(), escaped.to_string()));
+            } else if old.font.is_empty() {
+                prefix.push_str(&format!("<name val=\"{escaped}\"/>"));
+            } else {
+                return None;
+            }
+            // Explicit typeface selection supersedes the major/minor theme font.
+            for scheme in font.children().filter(|n| n.has_tag_name((NS, "scheme"))) {
+                if scheme.attributes().len() != 1
+                    || !matches!(scheme.attribute("val"), Some("none" | "major" | "minor"))
+                    || scheme.children().any(|n| n.is_element())
+                {
+                    return None;
+                }
+                edits.push((scheme.range(), String::new()));
+            }
+        }
         for (name, was, want) in [
             ("b", old.bold, new.bold),
             ("i", old.italic, new.italic),
@@ -508,15 +794,23 @@ impl<'a> Styles<'a> {
                 Some("double") => (true, true),
                 _ => return None, // Accounting underlines are not represented by CellStyle.
             };
-            if props.next().is_some() || source != (old.underline, old.double_underline)
-                || (!new.underline && new.double_underline) { return None; }
+            if props.next().is_some()
+                || source != (old.underline, old.double_underline)
+                || (!new.underline && new.double_underline)
+            {
+                return None;
+            }
             let replacement = match (new.underline, new.double_underline) {
                 (true, true) => r#"<u val="double"/>"#,
                 (true, false) => "<u/>",
                 _ => "",
             };
             if let Some(prop) = prop {
-                if prop.children().any(|n| n.is_element()) || prop.attributes().any(|a| a.namespace().is_some() || a.name() != "val") {
+                if prop.children().any(|n| n.is_element())
+                    || prop
+                        .attributes()
+                        .any(|a| a.namespace().is_some() || a.name() != "val")
+                {
                     return None;
                 }
                 edits.push((prop.range(), replacement.to_owned()));
@@ -535,15 +829,18 @@ impl<'a> Styles<'a> {
             }
             edits.push((size.range_value(), new.size.to_string()));
         }
-        if old.color != new.color {
+        if old.color != new.color || was_theme != want_theme {
+            let was = was_theme.map_or(Paint::Rgb(old.color), |t| Paint::Theme(t.idx, t.tint));
+            let want = want_theme.map_or(Paint::Rgb(new.color), |t| Paint::Theme(t.idx, t.tint));
             let mut colors = font.children().filter(|n| n.has_tag_name((NS, "color")));
+            let new_color = want.xml("color")?;
             if let Some(color) = colors.next() {
-                if colors.next().is_some() || rgb(color)? != old.color {
+                if colors.next().is_some() || Paint::read(color)? != was {
                     return None;
                 }
-                edits.push((color.attribute_node("rgb")?.range_value(), argb(new.color)));
-            } else if old.color == [0; 3] {
-                prefix.push_str(&format!("<color rgb=\"{}\"/>", argb(new.color)));
+                edits.push((color.range(), new_color));
+            } else if was == Paint::Rgb([0; 3]) {
+                prefix.push_str(&new_color);
             } else {
                 return None;
             }
@@ -558,7 +855,12 @@ impl<'a> Styles<'a> {
         self.fonts.intern(self.xml, raw_font)
     }
 
-    fn alignment_edits(&self, xf: Node<'_, '_>, old: &CellStyle, new: &CellStyle) -> Option<Vec<(Range<usize>, String)>> {
+    fn alignment_edits(
+        &self,
+        xf: Node<'_, '_>,
+        old: &CellStyle,
+        new: &CellStyle,
+    ) -> Option<Vec<(Range<usize>, String)>> {
         let range = xf.range();
         let mut edits = Vec::new();
         // Enabling an XF's local alignment must not change inherited
@@ -567,40 +869,115 @@ impl<'a> Styles<'a> {
             Some("1" | "true") => {}
             None | Some("0" | "false") => {
                 let parent = xf.attribute("xfId").unwrap_or("0").parse().ok()?;
-                let record = self.node("cellStyleXfs",parent);
-                if record.is_none() && (parent != 0 || self.doc.root_element().children().any(|n| n.has_tag_name((NS,"cellStyleXfs"))))
-                    || record.is_some_and(|p| p.children().any(|n| n.has_tag_name((NS,"alignment")))) { return None; }
+                let record = self.node("cellStyleXfs", parent);
+                if record.is_none()
+                    && (parent != 0
+                        || self
+                            .doc
+                            .root_element()
+                            .children()
+                            .any(|n| n.has_tag_name((NS, "cellStyleXfs"))))
+                    || record
+                        .is_some_and(|p| p.children().any(|n| n.has_tag_name((NS, "alignment"))))
+                {
+                    return None;
+                }
             }
             _ => return None,
         }
-        let mut children = xf.children().filter(|n| n.has_tag_name((NS,"alignment")));
+        let mut children = xf.children().filter(|n| n.has_tag_name((NS, "alignment")));
         let alignment = children.next();
-        if children.next().is_some() { return None; }
+        if children.next().is_some() {
+            return None;
+        }
         let attribute = |name| alignment.and_then(|n| n.attribute(name));
         let mut changed = Vec::new();
-        for (name,was,want) in [("wrapText",old.wrap,new.wrap),("shrinkToFit",old.shrink_to_fit,new.shrink_to_fit)] {
-            if was == want { continue; }
+        for (name, was, want) in [
+            ("wrapText", old.wrap, new.wrap),
+            ("shrinkToFit", old.shrink_to_fit, new.shrink_to_fit),
+        ] {
+            if was == want {
+                continue;
+            }
             let raw = match attribute(name) {
                 None | Some("false" | "0") => false,
                 Some("true" | "1") => true,
                 _ => return None,
             };
-            if raw != was { return None; }
-            changed.push((name,u8::from(want).to_string()));
+            if raw != was {
+                return None;
+            }
+            changed.push((name, u8::from(want).to_string()));
         }
         if old.indent != new.indent {
-            if new.indent > 15 || attribute("indent").unwrap_or("0").parse::<u8>().ok()? != old.indent { return None; }
-            changed.push(("indent",new.indent.to_string()));
+            if new.indent > 15
+                || attribute("indent").unwrap_or("0").parse::<u8>().ok()? != old.indent
+            {
+                return None;
+            }
+            changed.push(("indent", new.indent.to_string()));
         }
         if old.halign != new.halign {
-            let horizontal = ["general","left","center","right","centerContinuous","distributed"];
-            if attribute("horizontal").unwrap_or("general") != *horizontal.get(usize::from(old.halign))? { return None; }
-            changed.push(("horizontal",horizontal.get(usize::from(new.halign))?.to_string()));
+            let horizontal = [
+                "general",
+                "left",
+                "center",
+                "right",
+                "centerContinuous",
+                "distributed",
+            ];
+            if attribute("horizontal").unwrap_or("general")
+                != *horizontal.get(usize::from(old.halign))?
+            {
+                return None;
+            }
+            changed.push((
+                "horizontal",
+                horizontal.get(usize::from(new.halign))?.to_string(),
+            ));
+        }
+        if old.valign != new.valign {
+            let old_raw = attribute("vertical");
+            let modeled = match old_raw {
+                Some("top") => 1,
+                Some("center") => 2,
+                Some("bottom") => 3,
+                None => 0,
+                _ => return None,
+            };
+            if old.valign != modeled && !(matches!(old.valign, 0 | 3) && matches!(modeled, 0 | 3)) {
+                return None;
+            }
+            if new.valign == 0 {
+                if let Some(attr) = alignment.and_then(|n| n.attribute_node("vertical")) {
+                    edits.push((attr.range(), String::new()));
+                }
+            } else {
+                let value = ["", "top", "center", "bottom"].get(new.valign as usize)?;
+                changed.push(("vertical", value.to_string()));
+            }
+        }
+        if (old.vertical_text, old.rotation) != (new.vertical_text, new.rotation) {
+            let rotation = |st: &CellStyle| match (st.vertical_text, st.rotation) {
+                (true, 0) => Some(255i16),
+                (false, degrees @ -90..=-1) => Some(90 - degrees),
+                (false, degrees @ 0..=90) => Some(degrees),
+                _ => None,
+            };
+            if attribute("textRotation")
+                .unwrap_or("0")
+                .parse::<i16>()
+                .ok()?
+                != rotation(old)?
+            {
+                return None;
+            }
+            changed.push(("textRotation", rotation(new)?.to_string()));
         }
         let mut insert = String::new();
-        for (name,value) in changed {
+        for (name, value) in changed {
             if let Some(existing) = alignment.and_then(|n| n.attribute_node(name)) {
-                edits.push((existing.range_value(),value));
+                edits.push((existing.range_value(), value));
             } else {
                 insert.push_str(&format!(" {name}=\"{value}\""));
             }
@@ -608,32 +985,56 @@ impl<'a> Styles<'a> {
         if !insert.is_empty() {
             if let Some(alignment) = alignment {
                 let raw = &self.xml[alignment.range()];
-                if !raw.starts_with("<alignment") { return None; }
+                if !raw.starts_with("<alignment") {
+                    return None;
+                }
                 let at = alignment.range().start + "<alignment".len();
-                edits.push((at..at,insert));
+                edits.push((at..at, insert));
             } else {
                 let tag = format!("<alignment{insert}/>");
                 let raw = &self.xml[range.clone()];
                 if raw.ends_with("/>") {
-                    edits.push((range.end-2..range.end,format!(">{tag}</xf>")));
+                    edits.push((range.end - 2..range.end, format!(">{tag}</xf>")));
                 } else {
                     let mut reader = quick_xml::Reader::from_str(raw);
                     reader.read_event().ok()?;
                     let at = range.start + reader.buffer_position() as usize;
-                    edits.push((at..at,tag));
+                    edits.push((at..at, tag));
                 }
             }
         }
         Some(edits)
     }
 
-    fn with_fields(&mut self, base: u16, mut fields: Vec<(&str, u16)>, old: &CellStyle, new: &CellStyle) -> Option<u16> {
+    fn with_fields(
+        &mut self,
+        base: u16,
+        mut fields: Vec<(&str, u16)>,
+        old: &CellStyle,
+        new: &CellStyle,
+    ) -> Option<u16> {
         let xf = self.node("cellXfs", base)?;
         let range = xf.range();
         let mut edits = Vec::new();
-        if (old.wrap,old.shrink_to_fit,old.indent,old.halign) != (new.wrap,new.shrink_to_fit,new.indent,new.halign) {
-            edits.extend(self.alignment_edits(xf,old,new)?);
-            fields.push(("applyAlignment",1));
+        if (
+            old.wrap,
+            old.shrink_to_fit,
+            old.indent,
+            old.halign,
+            old.valign,
+            old.rotation,
+            old.vertical_text,
+        ) != (
+            new.wrap,
+            new.shrink_to_fit,
+            new.indent,
+            new.halign,
+            new.valign,
+            new.rotation,
+            new.vertical_text,
+        ) {
+            edits.extend(self.alignment_edits(xf, old, new)?);
+            fields.push(("applyAlignment", 1));
         }
         let mut attrs = String::new();
         for (name, value) in fields {
@@ -665,6 +1066,7 @@ impl<'a> Styles<'a> {
         if let Some(fills) = self.fills {
             fills.changes(&mut edits);
         }
+        if let Some(borders) = self.borders { borders.changes(&mut edits); }
         if let Some(formats) = self.formats {
             formats.changes(&mut edits);
         }

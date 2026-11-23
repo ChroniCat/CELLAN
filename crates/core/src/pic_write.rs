@@ -160,40 +160,15 @@ pub fn insert_picture(
     let sheet_path2 = sheet_path.clone();
     let sheet_rels2 = sheet_rels_part.clone();
     let drawing_name = format!("drawing{drawing_no}.xml");
-    crate::chart_write::rewrite_with_additions_pub(path, additions, &[&sheet_path, &sheet_rels_part, "[Content_Types].xml"], move |name, buf| {
+    crate::chart_write::rewrite_with_additions_checked(path, additions, &[&sheet_path, &sheet_rels_part, "[Content_Types].xml"], move |name, buf| {
         if name == sheet_rels2 {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                if !xml.contains(&drawing_name) {
-                    let add = format!(
-                        "<Relationship Id=\"rId{next_rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/{drawing_name}\"/>"
-                    );
-                    return xml
-                        .replace("</Relationships>", &format!("{add}</Relationships>"))
-                        .into_bytes();
-                }
-            }
-            return buf;
+            let xml = crate::xlsx::patch_xml_text(&buf,name)?;
+            return Ok(crate::textbox::add_drawing_relationship(&xml, &format!("rId{next_rid}"),
+                &format!("../drawings/{drawing_name}"))?.into_bytes());
         }
         if name == sheet_path2 {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                let mut x = xml;
-                if !x.contains("<drawing ") {
-                    // 有些工作表根节点没声明 xmlns:r，就地补上，否则 Excel 报 unbound prefix
-                    let tag = format!(
-                        "<drawing xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId{next_rid}\"/>"
-                    );
-                    // schema 顺序：drawing 必须在 legacyDrawing/tableParts/extLst 之前
-                    let mut pos = x.find("</worksheet>").unwrap_or(x.len());
-                    for t in ["<legacyDrawing", "<tableParts", "<extLst"] {
-                        if let Some(i) = x.find(t) {
-                            pos = pos.min(i);
-                        }
-                    }
-                    x = format!("{}{}{}", &x[..pos], tag, &x[pos..]);
-                }
-                return x.into_bytes();
-            }
-            return buf;
+            let xml = crate::xlsx::patch_xml_text(&buf,name)?;
+            return Ok(crate::textbox::insert_drawing_tag(&xml,&format!("rId{next_rid}"))?.into_bytes());
         }
         if name == "[Content_Types].xml" {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
@@ -210,11 +185,11 @@ pub fn insert_picture(
                         &format!("<Override PartName=\"/xl/drawings/{drawing_name}\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/></Types>"),
                     );
                 }
-                return x.into_bytes();
+                return Ok(x.into_bytes());
             }
-            return buf;
+            return Ok(buf);
         }
-        buf
+        Ok(buf)
     })?;
     Ok(())
 }
@@ -344,9 +319,8 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
             continue;
         }
         let Some(sheet_part) = targets.get(&sheet.name).cloned() else { continue };
-        let sheet_xml = crate::fixups::read_part_file(path, &sheet_part)
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_default();
+        let sheet_bytes = crate::fixups::read_part_file(path,&sheet_part).ok_or_else(|| anyhow::anyhow!("缺少工作表 {sheet_part}"))?;
+        let sheet_xml = crate::xlsx::patch_xml_text(&sheet_bytes,&sheet_part)?;
         let (draw_part, draw_rels, rid) =
             crate::textbox::ensure_drawing(path, &sheet_part, &sheet_xml)?;
         let existing = crate::fixups::read_part_file(path, &draw_part)
@@ -400,16 +374,9 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
         }
         if let Some(rid) = rid {
             let srels_name = crate::textbox::rels_part(&sheet_part);
-            let mut srels = crate::fixups::read_part_file(path, &srels_name)
-                .and_then(|b| String::from_utf8(b).ok())
-                .unwrap_or_else(empty_rels);
             let target = format!("../{}", draw_part.strip_prefix("xl/").unwrap_or(&draw_part));
-            let rel = format!(
-                "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"{target}\"/>"
-            );
-            if !srels.contains(&format!("Id=\"{rid}\"")) {
-                srels = srels.replace("</Relationships>", &format!("{rel}</Relationships>"));
-            }
+            let srels = crate::textbox::add_drawing_relationship(
+                &crate::textbox::drawing_relationships(path,&srels_name)?, &rid, &target)?;
             if crate::textbox::has_part(path, &srels_name) {
                 patch.push((srels_name, srels));
             } else {
@@ -417,7 +384,7 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
             }
             patch.push((
                 sheet_part.clone(),
-                crate::textbox::insert_drawing_tag(&sheet_xml, &rid),
+                crate::textbox::insert_drawing_tag(&sheet_xml, &rid)?,
             ));
         }
         touched = true;

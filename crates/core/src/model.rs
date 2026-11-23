@@ -238,6 +238,7 @@ pub struct Sheet {
     pub layout_dirty: bool,
     /// 方案管理器里的方案（写进 <scenarios>）
     pub scenarios: Vec<crate::scenarios::Scenario>,
+    pub scenario_settings: crate::scenarios::ScenarioSettings,
     /// 方案列表被改过
     pub scenarios_dirty: bool,
     /// 被用户「忽略错误」的单元格（写进 <ignoredErrors>）
@@ -339,6 +340,7 @@ impl Sheet {
             hidden_cols: Default::default(),
             layout_dirty: false,
             scenarios: Vec::new(),
+            scenario_settings: Default::default(),
             scenarios_dirty: false,
             ignored_errors: std::collections::HashSet::new(),
             ignored_errors_dirty: false,

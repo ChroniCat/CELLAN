@@ -640,7 +640,7 @@ fn target_matches(a: &Sheet, b: &Sheet) -> bool {
         && a.col_styles == b.col_styles && a.row_styles == b.row_styles
         && a.cf == b.cf && a.dv == b.dv && a.notes == b.notes && a.freeze == b.freeze
         && a.filter == b.filter && a.hidden_rows == b.hidden_rows && a.hidden_rows_user == b.hidden_rows_user
-        && a.hidden_cols == b.hidden_cols && a.scenarios == b.scenarios && a.ignored_errors == b.ignored_errors
+        && a.hidden_cols == b.hidden_cols && a.scenarios == b.scenarios && a.scenario_settings == b.scenario_settings && a.ignored_errors == b.ignored_errors
         && a.outline_summary_below == b.outline_summary_below && a.outline_summary_right == b.outline_summary_right
         && a.outline_symbols == b.outline_symbols && a.row_levels == b.row_levels && a.col_levels == b.col_levels
         && a.page == b.page && chart_refs_match(&a.charts, &b.charts) && a.tab_color == b.tab_color

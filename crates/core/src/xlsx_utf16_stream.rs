@@ -40,12 +40,12 @@ impl<R: BufRead> Read for Utf8<R> {
     }
 }
 
-pub(super) fn process(
+pub(super) fn process<T>(
     source: impl BufRead,
     encoding: &'static Encoding,
     part: &str,
-    process: impl FnOnce(&mut dyn Read) -> Result<bool>,
-) -> Result<bool> {
+    process: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<T> {
     let mut input = BufReader::new(Utf8 {
         source,
         decoder: encoding.new_decoder_with_bom_removal(),

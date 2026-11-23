@@ -7,21 +7,20 @@ use crate::{CellRef, Sheet, store::Store};
 use anyhow::{Context, Result};
 use quick_xml::{Reader, events::Event};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet,BTreeMap},
     io::{self, BufRead, BufReader, Read, Write},
 };
 
 #[path = "xlsx_utf16_stream.rs"]
 mod utf16;
-#[path = "xlsx_sst_spool.rs"]
-mod sst;
-pub(in crate::xlsx) use sst::SharedStrings as GridStrings;
+#[path = "xlsx_sst_merge.rs"]
+pub(in crate::xlsx) mod sst;
 
-pub(super) fn xml_input(
+pub(in crate::xlsx) fn xml_input<T>(
     mut input: impl Read,
     part: &str,
-    process: impl FnOnce(&mut dyn Read) -> Result<bool>,
-) -> Result<bool> {
+    process: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<T> {
     let mut prefix = Vec::with_capacity(2);
     input.by_ref().take(2).read_to_end(&mut prefix)?;
     let encoding = super::super::sheets::utf16_encoding(&prefix);
@@ -33,7 +32,7 @@ pub(super) fn xml_input(
     }
 }
 
-struct Window<R> {
+pub(in crate::xlsx) struct Window<R> {
     input: BufReader<R>,
     bytes: Vec<u8>,
     first: usize,
@@ -41,7 +40,7 @@ struct Window<R> {
 }
 
 impl<R: Read> Window<R> {
-    fn start(input: R, out: &mut impl Write) -> Result<Reader<Self>> {
+    pub(in crate::xlsx) fn start(input: R, out: &mut impl Write) -> Result<Reader<Self>> {
         let mut input = BufReader::new(input);
         if input.fill_buf()?.starts_with(b"\xef\xbb\xbf") {
             out.write_all(b"\xef\xbb\xbf")?;
@@ -55,7 +54,7 @@ impl<R: Read> Window<R> {
         }))
     }
 
-    fn through(&mut self, end: u64) -> Result<&[u8]> {
+    pub(in crate::xlsx) fn through(&mut self, end: u64) -> Result<&[u8]> {
         let len = usize::try_from(end.checked_sub(self.offset).context("XML 读取位置倒退")?)?;
         let start = self.first;
         self.first = start.checked_add(len).context("XML 位置溢出")?;
@@ -106,11 +105,10 @@ fn inherited_attribute(key: &str) -> bool {
 
 pub(in crate::xlsx) fn split_grid(
     input: impl Read,
-    shell: &mut Vec<u8>,
+    shell: &mut dyn Write,
     mut grid: Option<&mut dyn Write>,
-    strings: &mut GridStrings,
 ) -> Result<(bool, Option<String>)> {
-    let mut reader = Window::start(input, shell)?;
+    let mut reader = Window::start(input, &mut &mut *shell)?;
     let mut buf = Vec::new();
     let mut depth = 0usize;
     let mut inside = false;
@@ -164,25 +162,9 @@ pub(in crate::xlsx) fn split_grid(
                 copy = false;
             }
             Event::Start(e) | Event::Empty(e)
-                if inside && grid.is_some() && e.local_name().as_ref() == "c" =>
-            {
-                if e.attributes()
-                    .flatten()
-                    .any(|a| matches!(a.key.as_ref(), "cm" | "vm"))
-                {
+                if inside && e.local_name().as_ref() == "c" => {
+                if e.attributes().flatten().any(|a| matches!(a.key.as_ref(), "cm" | "vm")) {
                     portable = false;
-                } else if attr(e, "t").as_deref() == Some("s") {
-                    if matches!(event, Event::Start(_)) {
-                        portable &= sst::inline_cell(
-                            &mut reader,
-                            e,
-                            strings,
-                            grid.as_deref_mut().unwrap(),
-                        )?;
-                        continue;
-                    } else {
-                        portable = false;
-                    }
                 }
             }
             Event::Eof => break,
@@ -212,24 +194,74 @@ pub(in crate::xlsx) fn split_grid(
     Ok((portable, dimension))
 }
 
+const SHEET_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const STRICT_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+
+/// Translate element names while retaining values, attribute spelling and
+/// comments. Mixed namespaces in a changed row require the general writer.
+fn rebind(xml: &str, from: &str, to: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    let mut output = String::with_capacity(xml.len());
+    let mut copied = 0;
+    loop {
+        let start = reader.buffer_position() as usize;
+        let event = reader.read_event().ok()?;
+        let (offset, name) = match &event {
+            Event::Start(e) | Event::Empty(e) => {
+                for attribute in e.attributes() {
+                    let attribute = attribute.ok()?;
+                    if attribute.key.as_ref() == "xmlns" || attribute.key.as_ref().starts_with("xmlns:") {
+                        return None;
+                    }
+                }
+                (1,e.name())
+            }
+            Event::End(e) => (2,e.name()),
+            Event::Eof => break,
+            _ => continue,
+        };
+        let local = name.as_ref().strip_prefix(from)?;
+        if local.contains(':') { return None; }
+        let at = start + offset;
+        output.push_str(xml.get(copied..at)?);
+        output.push_str(to);
+        copied = at + from.len();
+    }
+    output.push_str(&xml[copied..]);
+    Some(output)
+}
+
 fn missing_rows(
     out: &mut impl Write,
+    prefix: &str,
     before: u32,
     keys: &mut BTreeSet<CellRef>,
+    rows: &mut BTreeMap<u32,Option<u16>>,
     sheet: &Sheet,
     base: &Store,
     styles: &StyleChanges,
 ) -> Result<bool> {
-    while let Some(&key) = keys.first().filter(|k| k.row < before) {
-        write!(out, "<row r=\"{}\">", key.row + 1)?;
-        while let Some(k) = keys.first().copied().filter(|k| k.row == key.row) {
+    loop {
+        let row = keys.first().map_or(u32::MAX, |k| k.row)
+            .min(rows.first_key_value().map_or(u32::MAX, |(&r,_)| r));
+        if row >= before { break; }
+        let style = rows.remove(&row).flatten();
+        if style.is_none() && keys.first().is_none_or(|k| k.row != row) { continue; }
+        write!(out, "<{prefix}row r=\"{}\"", row+1)?;
+        if let Some(xf) = style { write!(out," s=\"{xf}\" customFormat=\"1\"")?; }
+        out.write_all(b">")?;
+        while let Some(k) = keys.first().copied().filter(|k| k.row == row) {
             let Some(cell) = new_cell(k, sheet, base, styles) else {
                 return Ok(false);
             };
-            out.write_all(cell.as_bytes())?;
+            if prefix.is_empty() {
+                out.write_all(cell.as_bytes())?;
+            } else if let Some(tagged) = rebind(&cell, "", prefix) {
+                out.write_all(tagged.as_bytes())?;
+            } else { return Ok(false); }
             keys.pop_first();
         }
-        out.write_all(b"</row>")?;
+        write!(out, "</{prefix}row>")?;
     }
     Ok(true)
 }
@@ -277,8 +309,10 @@ pub(super) fn worksheet(
     changed_sst: &mut bool,
 ) -> Result<bool> {
     let Changes {
-        mut keys, styles, ..
+        mut keys, mut styles, ..
     } = changes;
+    let mut axis_rows = std::mem::take(&mut styles.rows);
+    let mut header = (!styles.cols.is_empty()).then(Vec::new);
     let mut additions: Option<(u32, u32, u32, u32)> = None;
     let merge_corners = sheet
         .merges
@@ -304,22 +338,39 @@ pub(super) fn worksheet(
     let mut buf = Vec::new();
     let mut skip = Vec::new();
     let mut in_data = false;
+    let mut prefix = String::new();
+    let mut binding = String::from("xmlns");
+    let mut root_uri = String::new();
     let mut last_row = None;
     let mut depth = 0usize;
     loop {
         buf.clear();
+        let event_start = reader.buffer_position();
         let event = reader.read_event_into(&mut buf)?;
         let start = matches!(event, Event::Start(_));
         let empty = matches!(event, Event::Empty(_));
         match event {
             Event::Start(ref e) | Event::Empty(ref e)
-                if depth == 0 && e.name().as_ref() != "worksheet" =>
+                if depth == 0 =>
             {
-                return Ok(false);
+                if e.local_name().as_ref() != "worksheet" { return Ok(false); }
+                if let Some((p,_)) = e.name().as_ref().split_once(':') {
+                    prefix = format!("{p}:");
+                    binding = format!("xmlns:{p}");
+                    if !styles.cols.is_empty() || !axis_rows.is_empty() || sheet.merges_dirty {
+                        return Ok(false);
+                    }
+                }
+                match attr(e,&binding) {
+                    Some(uri) if uri == SHEET_NS || uri == STRICT_NS => root_uri = uri,
+                    None if prefix.is_empty() => {}
+                    _ => return Ok(false),
+                }
             }
             Event::Start(ref e) | Event::Empty(ref e)
-                if depth == 1 && e.name().as_ref() == "dimension" && additions.is_some() =>
+                if depth == 1 && e.name().as_ref().strip_prefix(prefix.as_str()) == Some("dimension") && additions.is_some() =>
             {
+                if attr(e,&binding).is_some_and(|uri| uri != root_uri) { return Ok(false); }
                 let Some(bounds) = attr(e, "ref").and_then(|s| crate::arr::parse_a1_range(&s))
                 else {
                     return Ok(false);
@@ -336,8 +387,9 @@ pub(super) fn worksheet(
                         return Ok(false);
                     };
                     tag.pop();
+                    let target: &mut dyn Write = match &mut header { Some(bytes) => bytes, None => out };
                     write!(
-                        out,
+                        target,
                         "{tag} ref=\"{}\"{}",
                         crate::arr::a1_range(expanded),
                         if empty { "/>" } else { ">" }
@@ -349,17 +401,22 @@ pub(super) fn worksheet(
                 }
             }
             Event::Start(ref e) | Event::Empty(ref e)
-                if depth == 1 && e.name().as_ref() == "sheetData" =>
+                if depth == 1 && e.name().as_ref().strip_prefix(prefix.as_str()) == Some("sheetData") =>
             {
+                if attr(e,&binding).is_some_and(|uri| uri != root_uri) { return Ok(false); }
+                if let Some(header) = header.take() {
+                    let styled = crate::patch::layout_xml::styled_columns(std::str::from_utf8(&header)?, &styles.cols)?;
+                    out.write_all(styled.as_bytes())?;
+                }
                 if empty {
                     let Some(tag) = expanded_tag(e, "") else {
                         return Ok(false);
                     };
                     out.write_all(tag.as_bytes())?;
-                    if !missing_rows(out, u32::MAX, &mut keys, sheet, base, &styles)? {
+                    if !missing_rows(out, &prefix, u32::MAX, &mut keys, &mut axis_rows, sheet, base, &styles)? {
                         return Ok(false);
                     }
-                    out.write_all(b"</sheetData>")?;
+                    write!(out, "</{prefix}sheetData>")?;
                     let end = reader.buffer_position();
                     reader.get_mut().through(end)?;
                     break;
@@ -367,46 +424,70 @@ pub(super) fn worksheet(
                 in_data = true;
             }
             Event::Start(ref e) | Event::Empty(ref e)
-                if in_data && depth == 2 && e.name().as_ref() == "row" =>
+                if in_data && depth == 2 && e.name().as_ref().strip_prefix(prefix.as_str()) == Some("row") =>
             {
                 let Some(r) = attr(e, "r").and_then(|s| s.parse::<u32>().ok()?.checked_sub(1))
                 else {
                     return Ok(false);
                 };
                 if last_row.is_some_and(|p| p >= r)
-                    || !missing_rows(out, r, &mut keys, sheet, base, &styles)?
+                    || !missing_rows(out, &prefix, r, &mut keys, &mut axis_rows, sheet, base, &styles)?
                 {
                     return Ok(false);
                 }
                 last_row = Some(r);
+                let tag_len = usize::try_from(reader.buffer_position() - event_start)?;
                 if start {
                     skip.clear();
                     reader.read_to_end_into(e.name(), &mut skip)?;
                 }
                 let end = reader.buffer_position();
                 let raw = reader.get_mut().through(end)?;
+                let styled;
+                let raw = if let Some(xf) = axis_rows.remove(&r) {
+                    let (tag,body) = raw.split_at(tag_len);
+                    let mut bytes = crate::patch::layout_xml::styled_row(std::str::from_utf8(tag)?,xf)?.into_bytes();
+                    bytes.extend_from_slice(body);
+                    styled = bytes;
+                    styled.as_slice()
+                } else { raw };
                 if keys.first().is_some_and(|k| k.row == r) {
                     let mut row_keys = BTreeSet::new();
                     while keys.first().is_some_and(|k| k.row == r) {
                         row_keys.insert(keys.pop_first().unwrap());
                     }
-                    let xml = std::str::from_utf8(raw)?;
+                    let raw_xml = std::str::from_utf8(raw)?;
+                    let normalized;
+                    let xml = if prefix.is_empty() && !raw_xml.contains("xmlns") {
+                        raw_xml
+                    } else {
+                        let Some(adapted) = rebind(raw_xml,&prefix,"") else { return Ok(false); };
+                        normalized = adapted;
+                        &normalized
+                    };
                     let Some(edits) = row_edits(xml, sheet, base, row_keys, &styles, changed_sst)
                     else {
                         return Ok(false);
                     };
-                    write_spans(out, xml, &edits)?;
+                    if prefix.is_empty() {
+                        write_spans(out, xml, &edits)?;
+                    } else {
+                        let mut row = Vec::new();
+                        write_spans(&mut row,xml,&edits)?;
+                        let Some(tagged) = rebind(std::str::from_utf8(&row)?,"",&prefix) else { return Ok(false); };
+                        out.write_all(tagged.as_bytes())?;
+                    }
                 } else {
                     out.write_all(raw)?;
                 }
-                if keys.is_empty() && !sheet.merges_dirty {
+                if keys.is_empty() && axis_rows.is_empty() && !sheet.merges_dirty {
                     break;
                 }
                 continue;
             }
             Event::Start(_) | Event::Empty(_) if in_data => return Ok(false),
-            Event::End(ref e) if in_data && depth == 2 && e.name().as_ref() == "sheetData" => {
-                if !missing_rows(out, u32::MAX, &mut keys, sheet, base, &styles)? {
+            Event::End(ref e) if in_data && depth == 2 && e.name().as_ref().strip_prefix(prefix.as_str()) == Some("sheetData") => {
+                if !missing_rows(out, &prefix, u32::MAX, &mut keys, &mut axis_rows, sheet, base, &styles)? {
                     return Ok(false);
                 }
                 let end = reader.buffer_position();
@@ -419,7 +500,9 @@ pub(super) fn worksheet(
         }
         depth += usize::from(start);
         let end = reader.buffer_position();
-        out.write_all(reader.get_mut().through(end)?)?;
+        let raw = reader.get_mut().through(end)?;
+        if let Some(bytes) = &mut header { bytes.extend_from_slice(raw); }
+        else { out.write_all(raw)?; }
     }
     if sheet.merges_dirty {
         // Merges are ordered among worksheet-level metadata after sheetData.
@@ -479,6 +562,17 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn edited_rows_with_locally_rebound_names_decline_the_prefix_adapter() {
+        let row = r#"<x:row r="1"><x:c r="A1"><x:v xmlns:x="urn:other">2</x:v></x:c></x:row>"#;
+        assert!(rebind(row,"x:","").is_none());
+        let row = r#"<row r="1"><c r="A1"><v xmlns="urn:other">2</v></c></row>"#;
+        assert!(rebind(row,"","").is_none());
+        let row = r#"<x:row r='1'><!-- <x:c/> --><x:c r='A1'><x:f>"x:c"</x:f><x:v>1</x:v></x:c></x:row>"#;
+        let local = rebind(row,"x:","").unwrap();
+        assert_eq!(rebind(&local,"","x:").as_deref(),Some(row));
     }
 
     #[test]

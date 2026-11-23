@@ -1,5 +1,5 @@
 //! Change only modeled dimension attributes. Column metadata is confined to
-//! the small worksheet header. Rows and their cell bodies are streamed.
+//! the small worksheet header. Row edits copy the original cell bodies into the output XML.
 use crate::{
     Sheet,
     layout::{Axis, HiddenIndices},
@@ -15,6 +15,8 @@ pub(crate) struct Baseline {
     hidden: HiddenIndices,
     manual: HiddenIndices,
     hidden_cols: HiddenIndices,
+    row_levels: Vec<u32>,
+    col_levels: Vec<u32>,
 }
 
 impl Baseline {
@@ -25,6 +27,8 @@ impl Baseline {
             hidden: s.hidden_rows.clone(),
             manual: s.hidden_rows_user.clone(),
             hidden_cols: s.hidden_cols.clone(),
+            row_levels: s.row_levels.keys().copied().collect(),
+            col_levels: s.col_levels.keys().copied().collect(),
         }
     }
 }
@@ -34,6 +38,7 @@ struct Change {
     size: Option<Option<f32>>,
     hidden: Option<bool>,
     level: Option<u8>,
+    style: Option<Option<u16>>,
 }
 type Attrs = Vec<(&'static str, Option<String>)>;
 
@@ -60,12 +65,22 @@ impl Change {
         if let Some(lv) = self.level {
             out.push(("outlineLevel", (lv != 0).then(|| lv.to_string())));
         }
+        if let Some(style) = self.style {
+            out.push((
+                if row { "s" } else { "style" },
+                style.map(|xf| xf.to_string()),
+            ));
+            if row {
+                out.push(("customFormat", style.map(|_| "1".into())));
+            }
+        }
         out
     }
     fn needs_record(&self) -> bool {
         self.size.flatten().is_some()
             || self.hidden == Some(true)
             || self.level.is_some_and(|l| l > 0)
+            || self.style.flatten().is_some()
     }
 }
 
@@ -79,6 +94,12 @@ impl Changes {
     pub(super) fn from_sheet(s: &Sheet, base: Option<&Baseline>) -> Self {
         let mut out = Self::default();
         if let Some(old) = base {
+            for &r in &old.row_levels {
+                out.rows.entry(r).or_default().level = Some(0);
+            }
+            for &c in &old.col_levels {
+                out.cols.entry(c).or_default().level = Some(0);
+            }
             for (&r, _) in old.rows.entries() {
                 out.rows.entry(r).or_default().size = Some(None);
             }
@@ -126,7 +147,7 @@ impl Changes {
                 Change {
                     size: Some(Some(w)),
                     hidden: Some(h),
-                    level: None,
+                    ..Default::default()
                 },
             );
         }
@@ -140,7 +161,7 @@ impl Changes {
                 Change {
                     size: h.map(Some),
                     hidden: Some(hidden),
-                    level: None,
+                    ..Default::default()
                 },
             );
         }
@@ -261,7 +282,43 @@ fn start_end(xml: &str, start: usize) -> Result<usize> {
     Ok(start + reader.buffer_position() as usize)
 }
 
+pub(crate) fn styled_columns(header: &str, updates: &BTreeMap<u32, Option<u16>>) -> Result<String> {
+    let changes = updates
+        .iter()
+        .map(|(&col, &style)| {
+            (
+                col,
+                Change {
+                    style: Some(style),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    columns(header, "worksheet", &changes)
+}
+
+pub(crate) fn styled_row(tag: &str, style: Option<u16>) -> Result<String> {
+    update_tag(
+        tag,
+        &Change {
+            style: Some(style),
+            ..Default::default()
+        }
+        .attrs(true),
+    )
+}
+
 fn columns(header: &str, root_name: &str, changes: &BTreeMap<u32, Change>) -> Result<String> {
+    patch_columns(header, root_name, changes, false)
+}
+
+fn patch_columns(
+    header: &str,
+    root_name: &str,
+    changes: &BTreeMap<u32, Change>,
+    unordered: bool,
+) -> Result<String> {
     if changes.is_empty() {
         return Ok(header.into());
     }
@@ -280,6 +337,7 @@ fn columns(header: &str, root_name: &str, changes: &BTreeMap<u32, Change>) -> Re
     let mut edits = Vec::new();
     let mut previous = None;
     let mut final_group = None;
+    let mut covered = std::collections::BTreeSet::new();
     for group in groups {
         let gr = group.range();
         let open_end = start_end(header, gr.start)?;
@@ -299,14 +357,14 @@ fn columns(header: &str, root_name: &str, changes: &BTreeMap<u32, Change>) -> Re
             };
             let first = index("min")?;
             let last = index("max")?;
-            ensure!(
-                first <= last && last < 16_384 && previous.is_none_or(|p| p < first),
-                "重叠或无效的列区间"
-            );
+            ensure!(first <= last && last < 16_384, "重叠或无效的列区间");
+            if !unordered && previous.is_some_and(|p| p >= first) {
+                return patch_columns(header, root_name, changes, true);
+            }
             previous = Some(last);
             let range = col.range();
             let mut before = String::new();
-            while let Some((&c, ch)) = todo.next_if(|(c, _)| **c < first) {
+            while let Some((&c, ch)) = todo.next_if(|(c, _)| !unordered && **c < first) {
                 if ch.needs_record() {
                     before.push_str(&new_record(&col_name, false, c, c, ch)?);
                 }
@@ -316,7 +374,12 @@ fn columns(header: &str, root_name: &str, changes: &BTreeMap<u32, Change>) -> Re
             }
             let mut pieces: Vec<(u32, u32, Option<&Change>)> = Vec::new();
             let mut next = first;
-            while let Some((&c, ch)) = todo.next_if(|(c, _)| **c <= last) {
+            for (&c, ch) in changes.range(first..=last) {
+                if unordered {
+                    covered.insert(c);
+                } else {
+                    todo.next();
+                }
                 if next < c {
                     pieces.push((next, c - 1, None));
                 }
@@ -371,7 +434,7 @@ fn columns(header: &str, root_name: &str, changes: &BTreeMap<u32, Change>) -> Re
         .map(|v| v.3.clone())
         .unwrap_or_else(|| qualified(root_name, "col"));
     for (&c, ch) in todo {
-        if ch.needs_record() {
+        if !covered.contains(&c) && ch.needs_record() {
             append.push_str(&new_record(&col_name, false, c, c, ch)?);
         }
     }
@@ -393,6 +456,11 @@ fn columns(header: &str, root_name: &str, changes: &BTreeMap<u32, Change>) -> Re
 }
 
 pub(super) fn apply(xml: &str, changes: &Changes) -> Result<String> {
+    patch_rows(xml, changes, false)
+}
+
+fn patch_rows(xml: &str, changes: &Changes, unordered: bool) -> Result<String> {
+    let mut covered = std::collections::BTreeSet::new();
     ensure!(
         changes
             .rows
@@ -478,19 +546,29 @@ pub(super) fn apply(xml: &str, changes: &Changes) -> Result<String> {
                         }
                     }
                     let r = number.unwrap_or_else(|| previous.map_or(0, |p| p + 1));
-                    ensure!(
-                        previous.is_none_or(|p| p < r) && r < 1_048_576,
-                        "无效的行顺序"
-                    );
+                    ensure!(r < 1_048_576, "无效的行顺序");
+                    if !unordered && previous.is_some_and(|p| p >= r) {
+                        drop(out);
+                        return patch_rows(xml, changes, true);
+                    }
                     previous = Some(r);
                     out.push_str(&xml[pos..start]);
                     pos = end;
-                    while let Some((&i, ch)) = rows.next_if(|(i, _)| **i < r) {
+                    while let Some((&i, ch)) = rows.next_if(|(i, _)| !unordered && **i < r) {
                         if ch.needs_record() {
                             out.push_str(&new_record(row_name, true, i, i, ch)?);
                         }
                     }
-                    if let Some((_, ch)) = rows.next_if(|(i, _)| **i == r) {
+                    let change = if unordered {
+                        let change = changes.rows.get(&r);
+                        if change.is_some() {
+                            covered.insert(r);
+                        }
+                        change
+                    } else {
+                        rows.next_if(|(i, _)| **i == r).map(|(_, v)| v)
+                    };
+                    if let Some(ch) = change {
                         out.push_str(&update_tag(&xml[start..end], &ch.attrs(true))?);
                     } else {
                         out.push_str(&xml[start..end]);
@@ -504,7 +582,7 @@ pub(super) fn apply(xml: &str, changes: &Changes) -> Result<String> {
                 out.push_str(&xml[pos..start]);
                 let row_name = data.as_ref().unwrap();
                 for (&r, ch) in rows {
-                    if ch.needs_record() {
+                    if !covered.contains(&r) && ch.needs_record() {
                         out.push_str(&new_record(row_name, true, r, r, ch)?);
                     }
                 }
@@ -569,6 +647,97 @@ pub(super) fn apply_bytes(raw: &[u8], changes: &Changes) -> Result<Option<Vec<u8
 mod tests {
     use super::*;
     const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+    #[test]
+    fn removed_outline_levels_are_cleared_even_after_a_structural_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grouped.xlsx");
+        let mut wb = crate::Workbook::new_blank();
+        wb.sheets[0].row_levels.extend([(1, 1), (4, 2)]);
+        wb.sheets[0].col_levels.extend([(1, 1), (4, 2)]);
+        wb.sheets[0].layout_dirty = true;
+        crate::xlsx::save_atomic(&path, &wb).unwrap();
+        let mut wb = crate::xlsx::load(&path).unwrap();
+        wb.sheets[0].row_levels.remove(&1);
+        wb.sheets[0].col_levels.remove(&1);
+        crate::structural::apply_structural_wb(
+            &mut wb,
+            0,
+            &crate::structural::Structural::DeleteRows { at: 2, n: 1 },
+        );
+        crate::structural::apply_structural_wb(
+            &mut wb,
+            0,
+            &crate::structural::Structural::DeleteCols { at: 2, n: 1 },
+        );
+        wb.sheets[0].layout_dirty = true;
+        crate::xlsx::save_atomic(&path, &wb).unwrap();
+        let wb = crate::xlsx::load(&path).unwrap();
+        assert_eq!(wb.sheets[0].row_levels, [(3, 2)].into());
+        assert_eq!(wb.sheets[0].col_levels, [(3, 2)].into());
+    }
+
+    #[test]
+    fn irregular_dimension_order_updates_all_overlaps_without_duplicate_rows() {
+        let xml = r#"<worksheet xmlns="urn:w"><cols><col min="2" max="3" x="1"/><col min="1" max="3" y="2"/></cols><sheetData><row r="4"><c r="A4"/></row><row r="1"><c r="A1"/></row></sheetData></worksheet>"#;
+        let mut changes = Changes::outline(&[(0, 2), (1, 1), (3, 1)], &[(1, 3), (4, 2)]);
+        changes.rows.entry(3).or_default().hidden = Some(true);
+        let generated = apply(xml, &changes).unwrap();
+        let doc = roxmltree::Document::parse(&generated).unwrap();
+        let nodes = |tag| {
+            doc.descendants()
+                .filter(move |n| n.has_tag_name(("urn:w", tag)))
+        };
+        assert_eq!(nodes("row").count(), 3);
+        assert_eq!(
+            nodes("row")
+                .find(|n| n.attribute("r") == Some("1"))
+                .unwrap()
+                .attribute("outlineLevel"),
+            Some("2")
+        );
+        assert_eq!(
+            nodes("row")
+                .find(|n| n.attribute("r") == Some("4"))
+                .unwrap()
+                .attribute("hidden"),
+            Some("1")
+        );
+        assert_eq!(
+            nodes("col")
+                .filter(
+                    |n| n.attribute("min") == Some("2") && n.attribute("outlineLevel") == Some("3")
+                )
+                .count(),
+            2
+        );
+        assert!(
+            nodes("col").any(
+                |n| n.attribute("min") == Some("5") && n.attribute("outlineLevel") == Some("2")
+            )
+        );
+        assert!(generated.contains("<c r=\"A4\"/>") && generated.contains("<c r=\"A1\"/>"));
+    }
+
+    #[test]
+    fn can_save_and_reopen_dimension_edits_on_out_of_order_third_party_sheets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unordered.xlsx");
+        crate::xlsx::save(&path,&crate::Workbook::new_blank()).unwrap();
+        let part = crate::patch::sheet_targets(&path).unwrap()["Sheet1"].clone();
+        let xml = format!(r#"<worksheet xmlns="{NS}"><cols><col min="2" max="3"/><col min="1" max="3"/></cols><sheetData><row r="4"><c r="A4"><v>4</v></c></row><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#);
+        crate::fixups::write_parts(&path,&[(part,xml.into_bytes())]).unwrap();
+        let mut wb = crate::xlsx::load(&path).unwrap();
+        wb.sheets[0].rows.set(0,48.0);
+        wb.sheets[0].cols.set(1,101.0);
+        wb.sheets[0].layout_dirty=true;
+        crate::xlsx::save_atomic(&path,&wb).unwrap();
+        let back=crate::xlsx::load(&path).unwrap();
+        assert_eq!(back.sheets[0].rows.size(0),48.);
+        assert_eq!(back.sheets[0].cols.size(1),101.);
+        assert_eq!(back.sheets[0].value(3,0),crate::Value::Number(4.));
+        assert_eq!(back.sheets[0].value(0,0),crate::Value::Number(1.));
+    }
 
     #[test]
     fn local_prefixes_empty_groups_and_prefixed_rows_retain_scope() {

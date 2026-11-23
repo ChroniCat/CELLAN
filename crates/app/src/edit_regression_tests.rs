@@ -11375,3 +11375,25 @@ fn large_fill_down_records_the_last_destination_and_can_undo_it() {
     assert!(app.wb.sheet(0).get(100_000, 0).is_none());
     assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(7.0));
 }
+
+#[test]
+fn scenario_summary_uses_each_scenario_independently_and_preserves_live_formulas() {
+    let _env = crate::test_env::TestEnv::new("scenario-summary");
+    let mut app = app();
+    let sheet = app.wb.sheet_mut(0);
+    sheet.set(0,0,Cell {formula:Some("=2*3".into()),value:Value::Number(6.)});
+    sheet.set(0,1,number(10.));
+    sheet.set(0,2,Cell {formula:Some("=A1+B1".into()),value:Value::Number(16.)});
+    for (name,key) in [("first",(0,0)),("second",(0,1))] {
+        let mut sc = sheetcore::scenarios::Scenario::new(name);
+        sc.cells.push((key,"1".into()));
+        sheet.scenarios.push(sc);
+    }
+    app.build_scenario_summary("C1 A1").unwrap();
+    assert_eq!(app.wb.sheet(0).get(0,0).unwrap().formula.as_deref(),Some("=2*3"));
+    assert_eq!(app.wb.sheet(0).value(0,2),Value::Number(16.));
+    assert_eq!(app.wb.sheet(0).scenario_settings.sqref.as_deref(),Some("C1 A1"));
+    let report = app.wb.sheet(1);
+    assert_eq!(report.value(2,3),Value::Number(11.));
+    assert_eq!(report.value(3,3),Value::Number(7.));
+}

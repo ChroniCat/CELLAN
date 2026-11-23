@@ -28,6 +28,7 @@ pub struct SheetLayout {
     pub outline_pr: Option<(bool, bool, bool)>,
     /// 方案管理器里的方案
     pub scenarios: Vec<crate::scenarios::Scenario>,
+    pub scenario_settings: crate::scenarios::ScenarioSettings,
     /// 被忽略错误的单元格（0-based）
     pub ignored_errors: Vec<(u32, u32)>,
     /// 分级显示级别（0-based 行列 → 1..=7）
@@ -175,7 +176,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
 
 pub(crate) fn sheet_layout(xml: &str, dxfs: &[crate::cf::Dxf], dxf_ext: bool) -> SheetLayout {
     let mut layout = parse_layout(xml);
-    layout.scenarios = crate::scenarios::parse(xml);
+    (layout.scenario_settings, layout.scenarios) = crate::scenarios::parse_with_settings(xml);
     layout.cf = crate::cf::parse_cf_blocks(xml);
     layout.cf_ext = crate::cf::xml_has_cf_ext(xml);
     layout.dxfs = dxfs.to_vec();

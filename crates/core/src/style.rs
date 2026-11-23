@@ -278,6 +278,10 @@ impl StyleTable {
         t
     }
 
+    pub(crate) fn find_style(&self, style: &CellStyle) -> Option<u16> {
+        self.index.get(&hash_of(style)).copied().filter(|&id| self.get(id) == style)
+    }
+
     pub fn intern(&mut self, s: CellStyle) -> u16 {
         let k = hash_of(&s);
         if let Some(id) = self.index.get(&k) {

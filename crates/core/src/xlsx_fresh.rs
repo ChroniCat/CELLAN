@@ -56,7 +56,9 @@ fn write_value(
         start.push_str(&format!(" s=\"{xf}\""));
     }
     let shape = sheet.spill_shapes.get(&key);
-    let rect = if let Some(&rect) = arrays.get(&key) {
+    let rect = if cell.formula.is_none() {
+        None // A replaced anchor is now an ordinary literal.
+    } else if let Some(&rect) = arrays.get(&key) {
         Some(rect)
     } else if let Some(&(h, w)) = shape {
         start.push_str(" cm=\"1\"");
@@ -132,9 +134,27 @@ fn write_sheet(out: impl Write, shell: String, sheet: &Sheet) -> Result<()> {
             formats.insert(id, xf);
         }
     }
+    // The row/column dimensions in the sparse template contain the actual
+    // package XF, which can differ from the model's interned style number.
+    for row in data.children().filter(|n| n.has_tag_name((namespace,"row"))) {
+        if let (Some(r), Some(raw)) = (row.attribute("r"),row.attribute("s"))
+            && let Some(id) = r.parse::<u32>()?.checked_sub(1).and_then(|i| sheet.row_styles.get(&i)) {
+            formats.insert(*id,raw.parse()?);
+        }
+    }
+    for col in root.children().filter(|n| n.has_tag_name((namespace,"cols")))
+        .flat_map(|cols| cols.children().filter(|n| n.has_tag_name((namespace,"col")))) {
+        if let (Some(first),Some(last),Some(raw)) = (col.attribute("min"), col.attribute("max"), col.attribute("style")) {
+            let xf = raw.parse()?;
+            for c in first.parse::<u32>()?..=last.parse::<u32>()?.min(crate::sync::MAX_COLS) {
+                if let Some(id) = c.checked_sub(1).and_then(|c| sheet.col_styles.get(&c)) { formats.insert(*id,xf); }
+            }
+        }
+    }
     let xf_for = |key: CellRef| -> Result<Option<u16>> {
-        sheet.explicit_style_of(key.row, key.col).map(|id| formats.get(&id).copied()
-            .context("模板缺少单元格样式")).transpose()
+        sheet.explicit_style_of(key.row, key.col)
+            .or_else(|| sheet.row_styles.get(&key.row).or_else(||sheet.col_styles.get(&key.col)).copied())
+            .map(|id| formats.get(&id).copied().context("模板缺少单元格样式")).transpose()
     };
     let first = crate::model::cell_name(top, left);
     let end = crate::model::cell_name(bottom, right);
@@ -203,6 +223,12 @@ fn write_sheet(out: impl Write, shell: String, sheet: &Sheet) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn has_dynamic(sheet: &Sheet) -> bool {
+    let fixed: std::collections::HashSet<_> = sheet.arrays.iter().map(|(k,_)| k).collect();
+    sheet.spill_shapes.keys().any(|k| !fixed.contains(k)
+        && sheet.get(k.row,k.col).is_some_and(|c| c.formula.is_some()))
+}
+
 pub(super) fn write(path: &Path, wb: &Workbook, selected: &[bool]) -> Result<()> {
     let targets = crate::patch::sheet_targets(path)?;
     let mut sheets = HashMap::new();
@@ -217,8 +243,7 @@ pub(super) fn write(path: &Path, wb: &Workbook, selected: &[bool]) -> Result<()>
     }
     let mut zip = ZipArchive::new(File::open(path)?)?;
     let dynamic = sheets.values().any(|s| {
-        let fixed: std::collections::HashSet<_> = s.arrays.iter().map(|(k,_)| k).collect();
-        s.spill_shapes.keys().any(|k| !fixed.contains(k))
+        has_dynamic(s)
     });
     ensure!(!dynamic || zip.index_for_name(super::dynamic::PART).is_none(),"新建模板的元数据部件已占用");
     let dir = path
@@ -270,7 +295,7 @@ mod tests {
         let marked = crate::textbox::insert_drawing_tag(
             "<s:worksheet xmlns:s=\"urn:w\"><s:sheetData><s:extLst/></s:sheetData><s:tableParts/></s:worksheet>",
             "rId7",
-        );
+        ).unwrap();
         let tree = roxmltree::Document::parse(&marked).unwrap();
         let tags: Vec<_> = tree
             .root_element()
@@ -348,7 +373,12 @@ mod tests {
             assert_eq!(f.attribute("t"), Some("array"));
             assert_eq!(f.attribute("ref"), Some(range));
         }
-        assert!(zip(super::super::dynamic::PART).contains("XLDAPR"));
+        let meta = zip(super::super::dynamic::PART);
+        // Other producers may keep unrelated cell metadata before the dynamic record.
+        let meta = meta.replace("<cellMetadata count=\"1\">","<cellMetadata count=\"2\"><bk/>");
+        let xml = xml.replace("cm=\"1\"","cm=\"2\"");
+        crate::fixups::write_parts(&path,&[(super::super::dynamic::PART.into(),meta.into_bytes()),
+            ("xl/worksheets/sheet1.xml".into(),xml.into_bytes())]).unwrap();
         let mut reopened = crate::xlsx::load(&path).unwrap();
         let s = &reopened.sheets[0];
         assert_eq!(s.arrays, [(CellRef::new(0, 4), (0, 4, 0, 5))]);
@@ -475,6 +505,7 @@ mod tests {
         }
         sheet.set_col_style(5, italic);
         sheet.set_row_style(7, italic);
+        sheet.set(7, 4, Cell {value: Value::Number(123.), formula: None});
         sheet.set(10, 5, Cell { value: Value::Bool(true), formula: None });
         sheet.set(11, 5, Cell { value: Value::Bool(false), formula: None });
         sheet.set_style(11, 5, 0);
@@ -500,6 +531,11 @@ mod tests {
         let doc = roxmltree::Document::parse(&xml).unwrap();
         let xf = |address| doc.descendants().find(|n| n.attribute("r") == Some(address)).unwrap().attribute("s").unwrap();
         assert_eq!(xf("E15"), xf("E16"));
+        let row_xf = doc.descendants().find(|n| n.tag_name().name()=="row" && n.attribute("r")==Some("8")).unwrap().attribute("s");
+        let col_xf = doc.descendants().find(|n| n.tag_name().name()=="col" && n.attribute("min")==Some("6")).unwrap().attribute("style");
+        assert_eq!(Some(xf("E8")),row_xf);
+        assert_eq!(Some(xf("F11")),col_xf);
+        assert_ne!(xf("F11"),"0");
         assert!(back.styles.quote_of(sh.style_of(15, 4)));
     }
 

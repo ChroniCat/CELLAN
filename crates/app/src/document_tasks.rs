@@ -183,8 +183,8 @@ impl DocumentTasks {
                 let _ = tx.send(Err(error));
                 return;
             }
-            let result = sheetcore::xlsx::save_atomic_with_receipt(&target, &snapshot)
-                .map(|receipt| (receipt, revisions.map(|revisions| CalculatedSnapshot {
+            let result = sheetcore::xlsx::save_snapshot_with_receipt(&target, snapshot)
+                .map(|(receipt, snapshot)| (receipt, revisions.map(|revisions| CalculatedSnapshot {
                     revisions, workbook: Box::new(snapshot),
                 })))
                 .map_err(|e| format!("保存失败: {e:#}"));

@@ -1,5 +1,7 @@
-//! XLSX worksheets share one string table. Each worker inflates a sheet once and
-//! reads its values, formulas, styles and row/column metadata from that buffer.
+//! XLSX workers share one decoded string table. Large worksheet entries are
+//! inflated once and decoded in batches of complete rows.
+#[path = "xlsx_read_stream.rs"]
+mod stream;
 use super::LoadDiag;
 use crate::model::{Cell, CellRef, Sheet, Value};
 use crate::richtext::RichRun;
@@ -96,7 +98,7 @@ pub(super) fn workbook_metadata(src: &mut zip::ZipArchive<File>) -> Result<Workb
 /// Calamine's style converter also reads the entire SST when opening a book.
 /// Give it just the original workbook metadata and an empty worksheet. The real
 /// sheets and the SST are consumed exclusively by the shared loader below.
-fn header(
+pub(super) fn header(
     src: &mut zip::ZipArchive<File>,
     targets: &HashMap<String, String>,
     workbook: &str,
@@ -148,8 +150,36 @@ fn header(
 #[derive(Default)]
 struct Strings {
     dynamic: std::collections::HashSet<u32>,
-    text: Vec<String>,
+    text: TextPool,
     rich: HashMap<usize, Vec<RichRun>>,
+}
+
+// Values are retrieved by SST index while sheets decode concurrently. Pack short
+// strings into slabs to avoid a String allocation per item. Growing the table
+// never reallocates/copies all previously decoded UTF-8 text.
+#[derive(Default)]
+struct TextPool {
+    slabs: Vec<String>,
+    ends: Vec<(usize,usize)>,
+}
+
+impl TextPool {
+    fn push(&mut self, text: String) {
+        const BYTES: usize = 64 * 1024;
+        if self.slabs.last().is_none_or(|s| s.len().saturating_add(text.len()) > BYTES) {
+            self.slabs.push(text);
+        } else {
+            self.slabs.last_mut().unwrap().push_str(&text);
+        }
+        self.ends.push((self.slabs.len()-1,self.slabs.last().unwrap().len()));
+    }
+
+    fn get(&self, id: usize) -> Option<&str> {
+        let &(page,end) = self.ends.get(id)?;
+        let start = id.checked_sub(1).and_then(|prev| self.ends.get(prev))
+            .filter(|(old,_)| *old == page).map_or(0,|(_,end)| *end);
+        Some(&self.slabs[page][start..end])
+    }
 }
 
 fn attr<'a>(e: &'a BytesStart<'a>, name: &str) -> Option<Cow<'a, str>> {
@@ -349,26 +379,8 @@ fn strings(zip: &mut zip::ZipArchive<File>) -> Result<Strings> {
     if zip.index_for_name("xl/sharedStrings.xml").is_none() {
         return Ok(table);
     }
-    let xml = xml_part(zip, "xl/sharedStrings.xml")?;
-    let mut r = Reader::from_str(&xml);
-    let mut closed = false;
-    loop {
-        match r.read_event()? {
-            Event::Start(e) if e.local_name().as_ref() == "si" => {
-                let (t, runs) = string_item(&mut r)?;
-                if !runs.is_empty() {
-                    table.rich.insert(table.text.len(), runs);
-                }
-                table.text.push(t);
-            }
-            Event::Empty(e) if e.local_name().as_ref() == "si" => table.text.push(String::new()),
-            Event::End(e) if e.local_name().as_ref() == "sst" => closed = true,
-            Event::Empty(e) if e.local_name().as_ref() == "sst" => closed = true,
-            Event::Eof => break,
-            _ => {}
-        }
-    }
-    ensure!(closed, "sharedStrings.xml 未正常结束");
+    let part = "xl/sharedStrings.xml";
+    super::delta::stream::xml_input(zip.by_name(part)?,part,|input| stream::string_table(input,&mut table))?;
     Ok(table)
 }
 
@@ -430,7 +442,6 @@ fn cell(
                                         .text
                                         .get(id)
                                         .context("缺少共享字符串")?
-                                        .as_str()
                                         .into(),
                                 )
                             }
@@ -560,7 +571,7 @@ fn cell(
 
 fn parse(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::SheetType) -> Result<String> {
     let mut f = Formulas::default();
-    let shell = parse_section(xml, table, dst, typ, &mut f, None)?;
+    let shell = parse_section(xml, table, dst, typ, &mut f, None, 0)?;
     expand_shared(dst, f)?;
     Ok(shell)
 }
@@ -568,9 +579,9 @@ fn parse(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::SheetType)
 type RowCells = Vec<((u32, u32), Cell)>;
 
 fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::SheetType,
-    f: &mut Formulas, mut rows: Option<&mut RowCells>) -> Result<String> {
+    f: &mut Formulas, mut rows: Option<&mut RowCells>, first_row: u32) -> Result<String> {
     let mut r = Reader::from_str(xml);
-    let mut pos = (0u32, 0u32);
+    let mut pos = (first_row, 0u32);
     let fragment = rows.is_some();
     let mut in_data = fragment;
     let mut keep_row = false;
@@ -737,46 +748,6 @@ fn expand_shared(dst: &mut Loaded, f: Formulas) -> Result<()> {
     Ok(())
 }
 
-// Split only ordinary worksheet row streams at independently numbered rows.
-// The regular parser handles other XML shapes, implicit boundary rows and diagnostics.
-fn row_chunks(xml: &str, bytes: usize) -> Option<(usize, usize, Vec<&str>)> {
-    if xml.len() < 2 * bytes { return None; }
-    let mut reader = Reader::from_str(xml);
-    let mut root = false;
-    let start = loop {
-        match reader.read_event().ok()? {
-            Event::Start(e) if !root && e.name().as_ref() == "worksheet" => root = true,
-            Event::Start(e) if root && e.name().as_ref() == "sheetData" => break reader.buffer_position() as usize,
-            Event::Start(e) if root => { reader.read_to_end(e.name()).ok()?; }
-            Event::Start(_) | Event::End(_) | Event::Eof => return None,
-            _ => {}
-        }
-    };
-    let body = &xml[start..];
-    let end = body.find("</sheetData>")?;
-    let body = &body[..end];
-    // Comments, CDATA and processing instructions can contain literal row markup.
-    if body.contains("<!") || body.contains("<?") { return None; }
-    let mut rest = body;
-    let mut chunks = Vec::new();
-    while rest.len() > bytes {
-        let middle = rest.ceil_char_boundary(bytes);
-        let Some(offset) = rest[middle..].find("<row ") else { break };
-        let split = middle + offset;
-        let next = &rest[split..];
-        let mut r = Reader::from_str(next);
-        let first = r.read_event().ok()?;
-        match first {
-            Event::Start(e) | Event::Empty(e) if attr(&e, "r").is_some() => {}
-            _ => return None,
-        }
-        chunks.push(&rest[..split]);
-        rest = next;
-    }
-    chunks.push(rest);
-    (chunks.len() > 1).then_some((start, start + end, chunks))
-}
-
 impl Loaded {
     fn empty(name: &str, part: &str) -> Self {
         let mut sheet = Sheet::new(name);
@@ -784,53 +755,6 @@ impl Loaded {
         sheet.loading = true;
         Self { sheet, xfs: Vec::new(), layout: None, diag: Default::default() }
     }
-}
-
-fn parallel_rows(xml: &str, table: &Strings, name: &str, part: &str, workers: usize, chunk_size: usize)
-    -> Option<(Loaded, String)> {
-    if workers < 2 { return None; }
-    let (start, end, chunks) = row_chunks(xml, chunk_size)?;
-    let typ = calamine::SheetType::WorkSheet;
-    let mut out = Loaded::empty(name, part);
-    // Validate the original outer structure before accepting any decoded row.
-    let mut outer = xml[..start].to_owned();
-    outer.push_str(&xml[end..]);
-    parse(&outer, table, &mut out, typ).ok()?;
-    let mut shell = xml[..start].to_owned();
-    let mut formulas = Formulas::default();
-    // Limit temporary decoded cells to a few chunks, even for a very large sheet.
-    for group in chunks.chunks(workers) {
-        let ok = std::thread::scope(|scope| -> Result<()> {
-            let jobs: Vec<_> = group.iter().map(|&rows| scope.spawn(move || -> Result<_> {
-                let mut local = Loaded::empty(name, part);
-                let mut cells = Vec::new();
-                let mut shared = Formulas::default();
-                let shell = parse_section(rows, table, &mut local, typ, &mut shared, Some(&mut cells))?;
-                Ok((local, cells, shared, shell))
-            })).collect();
-            for job in jobs {
-                let (local, cells, shared, text) = job.join().map_err(|_| anyhow::anyhow!("行块读取线程异常退出"))??;
-                for ((r,c), cell) in cells { out.sheet.set(r, c, cell); }
-                out.xfs.extend(local.xfs);
-                out.sheet.rich.extend(local.sheet.rich);
-                out.sheet.arrays.extend(local.sheet.arrays);
-                out.sheet.spill_shapes.extend(local.sheet.spill_shapes);
-                for p in local.diag.problems {
-                    if !out.diag.problems.iter().any(|old| old.what == p.what) { out.diag.problems.push(p); }
-                }
-                for (si, master) in shared.masters {
-                    ensure!(formulas.masters.insert(si, master).is_none(), "共享公式序号重复");
-                }
-                formulas.children.extend(shared.children);
-                shell.push_str(&text);
-            }
-            Ok(())
-        });
-        ok.ok()?;
-    }
-    expand_shared(&mut out, formulas).ok()?;
-    shell.push_str(&xml[end..]);
-    Some((out, shell))
 }
 
 pub(super) fn worksheets(
@@ -872,16 +796,16 @@ pub(super) fn worksheets(
                 "读取期间工作表 {name} 已被替换，请重新打开"
             );
             let mut loaded = Loaded::empty(name, part);
-            match xml_part(zip, part).and_then(|xml| {
-                if header.types[index] == calamine::SheetType::WorkSheet
-                    && let Some((decoded, shell)) = parallel_rows(&xml, &shared, name, part,
-                        cores / workers, 1024 * 1024) {
-                    loaded = decoded;
-                    return Ok(shell);
-                }
-                parse(&xml, &shared, &mut loaded, header.types[index])
-            })
-            {
+            let typ = header.types[index];
+            let parsed = if typ == calamine::SheetType::WorkSheet
+                && signatures[index].is_some_and(|(_, size)| size >= 1024 * 1024) {
+                let entry = zip.by_name(part)?;
+                super::delta::stream::xml_input(entry, part, |input|
+                    stream::worksheet(input, &shared, &mut loaded, cores / workers, 256 * 1024))
+            } else {
+                xml_part(zip, part).and_then(|xml| parse(&xml, &shared, &mut loaded, typ))
+            };
+            match parsed {
                 Ok(shell) => {
                     for (anchor,(h,w)) in loaded.sheet.spill_shapes.clone() {
                         if loaded.sheet.value(anchor.row,anchor.col) == Value::Error(crate::formula::ErrKind::Spill) {
@@ -951,17 +875,45 @@ mod tests {
         let typ = calamine::SheetType::WorkSheet;
         let mut serial = Loaded::empty("Data", "sheet");
         let shell = parse(&xml, &table, &mut serial, typ).unwrap();
-        let (parallel, row_shell) = parallel_rows(&xml, &table, "Data", "sheet", 3, 1100).unwrap();
+        let mut parallel = Loaded::empty("Data","sheet");
+        let row_shell = stream::worksheet(xml.as_bytes(), &table, &mut parallel, 3, 1100).unwrap();
         assert_eq!(row_shell, shell);
         assert_eq!(parallel.xfs, serial.xfs);
         assert_eq!(parallel.sheet.rich, serial.sheet.rich);
         assert_eq!(parallel.sheet.iter().collect::<Vec<_>>(), serial.sheet.iter().collect::<Vec<_>>());
         assert_eq!(parallel.sheet.get(79, 1).unwrap().formula.as_deref(), Some("=A80+2"));
         let commented = xml.replace("<sheetData>", "<sheetData><!-- <row r='200'> -->");
-        assert!(parallel_rows(&commented, &table, "Data", "sheet", 3, 1100).is_none());
+        let mut comments = Loaded::empty("Data","sheet");
+        let kept = stream::worksheet(commented.as_bytes(), &table, &mut comments, 3, 1100).unwrap();
+        assert!(kept.contains("<!-- <row r='200'> -->"));
         let broken = xml.replace("ref=\"B1:B80\"", "ref=\"B1:B3\"");
-        assert!(parallel_rows(&broken, &table, "Data", "sheet", 3, 1100).is_none());
+        assert!(stream::worksheet(broken.as_bytes(), &table, &mut Loaded::empty("Data","sheet"), 3, 1100).is_err());
         assert!(parse(&broken, &table, &mut Loaded::empty("Data", "sheet"), typ).is_err());
+    }
+
+    #[test]
+    fn opened_utf16_sheet_streams_implicit_rows_across_batches_and_resolves_late_masters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rows.xlsx");
+        super::super::save_atomic(&path,&Workbook::new_blank()).unwrap();
+        let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-16"?><s:worksheet xmlns:s="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><s:sheetData>"#);
+        let filler = "文".repeat(1100);
+        for row in 1..=550 {
+            let f = if row == 550 { r#"<s:f t="shared" si="3" ref="B1:B550">A550+1</s:f>"# }
+                else { r#"<s:f t="shared" si="3"/>"# };
+            xml.push_str(&format!(r#"<s:row ht="23"><s:c><s:v>{row}</s:v></s:c><s:c>{f}<s:v>1</s:v></s:c><s:c t="inlineStr"><s:is><s:t>{filler}</s:t></s:is></s:c></s:row>"#));
+        }
+        xml.push_str("</s:sheetData></s:worksheet>");
+        let bytes: Vec<_> = [0xfe,0xff].into_iter().chain(xml.encode_utf16().flat_map(u16::to_be_bytes)).collect();
+        crate::fixups::write_parts(&path,&[("xl/worksheets/sheet1.xml".into(),bytes)]).unwrap();
+        let (wb,diag) = super::super::load_diag(&path).unwrap();
+        assert!(!diag.has_fatal(),"{:?}",diag.problems);
+        let sheet = wb.sheet(0);
+        for row in [0,202,549] {
+            assert_eq!(sheet.value(row,0),Value::Number((row+1) as f64));
+            assert_eq!(sheet.get(row,1).unwrap().formula.as_deref().unwrap(),format!("=A{}+1",row+1));
+            assert_eq!(sheet.value(row,2), Value::Text(filler.clone().into_boxed_str()));
+        }
     }
 
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {

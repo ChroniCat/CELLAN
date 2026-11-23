@@ -158,7 +158,7 @@ where
     })
 }
 
-fn rewrite_zip_borrowed(
+pub(crate) fn rewrite_zip_borrowed(
     path: &Path,
     mut pred: impl FnMut(&str) -> bool,
     mut update: impl FnMut(&str, &[u8]) -> Result<Option<Vec<u8>>>,
@@ -242,10 +242,73 @@ fn rewrite_sheet_xml<T>(
     transform: impl Fn(&str, &T) -> String,
 ) -> Result<()> {
     rewrite_zip_borrowed(path, |name| sheets.contains_key(name), |name, buf| {
-        let Ok(xml) = std::str::from_utf8(buf) else { return Ok(None) };
-        let updated = transform(xml, &sheets[name]).into_bytes();
-        Ok((updated != buf).then_some(updated))
+        let xml = crate::xlsx::patch_xml_text(buf, name)?;
+        let updated = transform(&xml, &sheets[name]);
+        Ok((updated.as_str() != xml.as_ref()).then(|| updated.into_bytes()))
     })
+}
+
+/// Worksheet-level setters only need the metadata surrounding sheetData. Keep
+/// the original row bytes out of their temporary strings and equality checks.
+fn rewrite_sheet_metadata<T>(
+    path: &Path,
+    sheets: &std::collections::HashMap<String, T>,
+    transform: impl Fn(&str, &T) -> Result<String>,
+) -> Result<()> {
+    rewrite_zip_borrowed(
+        path,
+        |name| sheets.contains_key(name),
+        |name, bytes| transform_worksheet(name, bytes, true, |xml| transform(xml, &sheets[name])),
+    )
+}
+
+pub(crate) fn transform_worksheet(
+    name: &str,
+    bytes: &[u8],
+    metadata_only: bool,
+    transform: impl FnOnce(&str) -> Result<String>,
+) -> Result<Option<Vec<u8>>> {
+    fn contents(xml: &str) -> Result<Option<std::ops::Range<usize>>> {
+        use quick_xml::events::Event;
+        let mut reader = quick_xml::Reader::from_str(xml);
+        let mut depth = 0usize;
+        loop {
+            match reader.read_event()? {
+                Event::Start(e) if depth == 1 && e.local_name().as_ref() == "sheetData" => {
+                    let span = reader.read_to_end(e.name())?;
+                    return Ok(Some(span.start as usize..span.end as usize));
+                }
+                Event::Start(_) => depth += 1,
+                Event::End(_) => depth = depth.checked_sub(1).context("invalid worksheet XML")?,
+                Event::Eof => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+    let xml = crate::xlsx::patch_xml_text(bytes, name)?;
+    if metadata_only
+        && xml.len() >= 64 * 1024
+        && let Some(body) = contents(&xml)?
+        && !body.is_empty()
+    {
+        let shell = [&xml[..body.start], &xml[body.end..]].concat();
+        let metadata = transform(&shell)?;
+        if metadata == shell {
+            return Ok(None);
+        }
+        let slot = contents(&metadata)?.context("metadata patch removed sheetData")?;
+        anyhow::ensure!(
+            slot.is_empty(),
+            "metadata patch generated unexpected worksheet cells"
+        );
+        let mut result = Vec::with_capacity(metadata.len() + body.len());
+        result.extend_from_slice(&metadata.as_bytes()[..slot.start]);
+        result.extend_from_slice(&xml.as_bytes()[body]);
+        result.extend_from_slice(&metadata.as_bytes()[slot.end..]);
+        return Ok(Some(result));
+    }
+    let updated = transform(&xml)?;
+    Ok((updated.as_str() != xml.as_ref()).then(|| updated.into_bytes()))
 }
 
 /// 重写 zip：对每个 entry 调用 f，返回新内容
@@ -2442,7 +2505,7 @@ pub fn apply_outline_pr(path: &std::path::Path, wb: &crate::model::Workbook) -> 
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_sheet_xml(path, &map, |xml, (b, r, sym)| set_outline_pr(xml, *b, *r, *sym))
+    rewrite_sheet_metadata(path, &map, |xml, (b, r, sym)| Ok(set_outline_pr(xml, *b, *r, *sym)))
 }
 
 /// 保存收尾：把方案列表写回各表（`<scenarios>`）
@@ -2451,24 +2514,19 @@ pub fn apply_scenarios(path: &std::path::Path, wb: &crate::model::Workbook) -> a
         return Ok(());
     }
     let targets = sheet_targets(path)?;
-    let mut map: std::collections::HashMap<String, Vec<crate::scenarios::Scenario>> =
-        std::collections::HashMap::new();
+    let mut map = std::collections::HashMap::new();
     for s in &wb.sheets {
         if !s.scenarios_dirty {
             continue;
         }
-        if let Some(part) = targets.get(&s.name) {
-            map.insert(part.clone(), s.scenarios.clone());
-        }
+        let part = targets.get(&s.name).context("找不到方案所属的工作表")?;
+        map.insert(part.clone(), s);
     }
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_zip_borrowed(path, |name| map.contains_key(name), |name, buf| {
-        let xml = std::str::from_utf8(buf).context("工作表方案 XML 编码无效")?;
-        let updated = crate::scenarios::edit_scenarios(xml, &map[name])?.into_bytes();
-        Ok((updated != buf).then_some(updated))
-    })
+    rewrite_sheet_metadata(path, &map, |xml,sheet|
+        crate::scenarios::edit_scenarios(xml, &sheet.scenarios, &sheet.scenario_settings))
 }
 
 /// 保存收尾：把忽略错误列表写回各表
@@ -2491,7 +2549,7 @@ pub fn apply_ignored_errors(path: &std::path::Path, wb: &crate::model::Workbook)
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_sheet_xml(path, &map, |xml, cells| set_ignored_errors(xml, cells))
+    rewrite_sheet_metadata(path, &map, |xml, cells| Ok(set_ignored_errors(xml, cells)))
 }
 
 /// 保存收尾：把列宽/行高/隐藏状态补进 sheet XML
@@ -2571,7 +2629,7 @@ pub fn apply_tab_colors(path: &std::path::Path, wb: &crate::model::Workbook) -> 
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_sheet_xml(path, &map, |xml, c| set_tab_color(xml, *c))
+    rewrite_sheet_metadata(path, &map, |xml, c| Ok(set_tab_color(xml, *c)))
 }
 
 /// 和 rewrite_zip 一样，但可以丢弃指定的部件（删除表格/图片等用）
@@ -2675,7 +2733,7 @@ pub fn apply_protection(path: &std::path::Path, wb: &crate::model::Workbook) -> 
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_sheet_xml(path, &map, |xml, p| set_sheet_protection(xml, p.as_ref()))
+    rewrite_sheet_metadata(path, &map, |xml, p| Ok(set_sheet_protection(xml, p.as_ref())))
 }
 
 /// 页面设置写回：printOptions / pageMargins / pageSetup 三个元素
@@ -2848,7 +2906,7 @@ pub fn apply_page_setup(path: &std::path::Path, wb: &crate::model::Workbook) -> 
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_sheet_xml(path, &map, |xml, p| set_page_setup(xml, p))
+    rewrite_sheet_metadata(path, &map, |xml, p| Ok(set_page_setup(xml, p)))
 }
 
 /// 保存收尾：把改过的富文本单元格写成 inlineStr

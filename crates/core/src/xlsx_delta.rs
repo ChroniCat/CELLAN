@@ -6,14 +6,14 @@ use crate::style::StyleTable;
 #[path = "xlsx_font_delta.rs"]
 mod font_delta;
 #[path = "xlsx_stream_delta.rs"]
-mod stream;
+pub(super) mod stream;
 use anyhow::{Context, Result};
 use quick_xml::{
     Reader,
     events::{BytesStart, Event},
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::File,
     io::{BufWriter, Write},
     path::Path,
@@ -31,6 +31,8 @@ pub(crate) struct SourceCells {
     style_map: Option<Arc<StyleMap>>,
     notes: Option<NoteSource>,
     styles: CellStyles,
+    row_styles: crate::model::CellMetadata<u32,u16>,
+    col_styles: crate::model::CellMetadata<u32,u16>,
     pub(super) rich: crate::model::CellMetadata<(u32, u32), Vec<crate::richtext::RichRun>>,
     arrays: Arc<Vec<(CellRef, Rect)>>,
     spill_shapes: Arc<HashMap<CellRef, (u32, u32)>>,
@@ -38,18 +40,17 @@ pub(crate) struct SourceCells {
 }
 
 type Rect = (u32, u32, u32, u32);
-pub(super) use stream::GridStrings;
+pub(super) use stream::sst;
 
 pub(super) fn split_grid(
     input: impl std::io::Read,
     part: &str,
-    shell: &mut Vec<u8>,
+    shell: &mut dyn Write,
     grid: Option<&mut dyn Write>,
-    strings: &mut GridStrings,
 ) -> Result<(bool, Option<String>)> {
     let mut result = None;
     stream::xml_input(input, part, |xml| {
-        result = Some(stream::split_grid(xml, shell, grid, strings)?);
+        result = Some(stream::split_grid(xml, shell, grid)?);
         Ok(true)
     })?;
     result.context("无法读取工作表数据")
@@ -58,6 +59,10 @@ pub(super) fn split_grid(
 #[derive(Default)]
 struct StyleChanges {
     updates: HashMap<CellRef, Option<u16>>,
+    rows: BTreeMap<u32, Option<u16>>,
+    cols: BTreeMap<u32, Option<u16>>,
+    derived_axis: bool,
+    dynamic_index: Option<u32>,
     dynamic: HashMap<CellRef, (Option<Rect>, Option<Rect>)>,
     // A derived XF belongs to a specific pre-edit raw XF. Confirm that
     // original on the worksheet too, including model-default/ambiguous cells.
@@ -76,6 +81,10 @@ pub(super) struct StyleMap {
     // collapse to one modeled style (e.g. unmodeled alignment properties).
     xfs: HashMap<u16, Option<u16>>,
     derived_from: HashMap<u16, Option<u16>>,
+    // umya may materialize a default font/alignment. These XF numbers are
+    // candidates only for editing the existing cell, never for assigning a
+    // style elsewhere. The worksheet must still prove its original s attribute.
+    origin_only: HashMap<u16, Option<u16>>,
     original: StyleTable,
 }
 
@@ -90,8 +99,28 @@ impl StyleMap {
         Arc::new(Self {
             xfs,
             derived_from: HashMap::new(),
+            origin_only: HashMap::new(),
             original: styles.clone(),
         })
+    }
+
+    pub(super) fn recovered(
+        ids: &HashMap<u16, u16>,
+        defaults: HashMap<u16, Option<u16>>,
+        styles: &StyleTable,
+    ) -> Arc<Self> {
+        let mut map = Self::new(ids, styles);
+        Arc::make_mut(&mut map).origin_only = defaults;
+        map
+    }
+
+    fn editing_origin(&self, id: u16, styles: &StyleTable) -> Option<u16> {
+        if self.xfs.contains_key(&id) {
+            return self.xf(id, styles);
+        }
+        self.unchanged(id, styles)
+            .then(|| self.origin_only.get(&id).copied().flatten())
+            .flatten()
     }
 
     fn unchanged(&self, id: u16, current: &StyleTable) -> bool {
@@ -298,7 +327,7 @@ impl SourceCells {
         sheet: &Sheet,
         styles: &StyleTable,
     ) -> Result<Option<tempfile::NamedTempFile>> {
-        let Some(changes) = coordinates(sheet, self, styles, false, |_, _, _| None) else {
+        let Some(changes) = coordinates(sheet, self, styles, None, |_, _, _| None) else {
             return Ok(None);
         };
         if changes.formula_changed {
@@ -306,9 +335,9 @@ impl SourceCells {
         }
         let mut staged = tempfile::NamedTempFile::new()?;
         let mut writer = BufWriter::new(staged.as_file_mut());
-        let ok = stream::xml_input(zip.by_name(part)?, part, |input| {
+        let ok = stream_supported(stream::xml_input(zip.by_name(part)?, part, |input| {
             stream::worksheet(input, &mut writer, sheet, &self.store, changes, &mut false)
-        })?;
+        }))?;
         writer.flush()?;
         drop(writer);
         Ok(ok.then_some(staged))
@@ -320,11 +349,13 @@ impl SourceCells {
 
     fn original_xf(&self, sheet: &Sheet, key: CellRef, styles: &StyleTable) -> Option<(u16, u16)> {
         match self.styles.get(&key).copied() {
-            Some(id) => Some((id, self.style_map.as_ref()?.xf(id, styles)?)),
+            Some(id) => Some((id, self.style_map.as_ref()?.editing_origin(id, styles)?)),
             None if !sheet.row_styles.contains_key(&key.row) && !sheet.col_styles.contains_key(&key.col) => Some((0, 0)),
             None => None,
         }
     }
+
+    pub(super) fn has_style_map(&self) -> bool { self.style_map.is_some() }
 
     pub(super) fn set_style_map(&mut self, styles: Arc<StyleMap>) {
         self.style_map = Some(styles);
@@ -364,6 +395,8 @@ impl SourceCells {
             style_part,
             style_map,
             styles: sheet.styles.clone(),
+            row_styles: sheet.row_styles.clone(),
+            col_styles: sheet.col_styles.clone(),
             rich: sheet.rich.clone(),
             arrays: Arc::new(sheet.arrays.clone()),
             spill_shapes: Arc::new(sheet.spill_shapes.clone()),
@@ -383,21 +416,57 @@ fn rich_changed(sheet: &Sheet, key: CellRef) -> bool {
     sheet.rich_dirty && sheet.source_cells.as_ref().is_some_and(|s| s.rich.get(&k) != sheet.rich.get(&k))
 }
 
-fn intersects(keys: &BTreeSet<CellRef>, (top, left, bottom, right): Rect) -> bool {
-    if top > bottom || left > right {
-        return true;
+/// Excel's fixed array definition and footprint stay in the source XML.
+/// A value in a tail is replaceable only while the evaluator owns it. Typing
+/// over the same address removes that ownership, even for an equal number.
+fn cache_only_arrays(sheet: &Sheet, source: &SourceCells, keys: &BTreeSet<CellRef>, editable_dynamic: bool) -> bool {
+    if sheet.arrays != *source.arrays { return false; }
+    if sheet.arrays.is_empty() && (editable_dynamic || (sheet.spilled.is_empty() && source.spilled.is_empty()
+        && sheet.spill_shapes.is_empty() && source.spill_shapes.is_empty())) { return true; }
+    let mut restricted = BTreeSet::new();
+    if !editable_dynamic {
+        restricted.extend(sheet.spilled.symmetric_difference(&source.spilled).copied());
+        restricted.extend(keys.iter().filter(|k| sheet.spilled.contains(k) || sheet.spill_shapes.contains_key(k)).copied());
+        for key in sheet.spill_shapes.keys().chain(source.spill_shapes.keys()) {
+            if sheet.spill_shapes.get(key) != source.spill_shapes.get(key) { restricted.insert(*key); }
+        }
     }
-    keys.range(CellRef::new(top, 0)..=CellRef::new(bottom, u32::MAX))
-        .any(|k| (left..=right).contains(&k.col))
+    for &(anchor,(top,left,bottom,right)) in &sheet.arrays {
+        if top > bottom || left > right || bottom >= crate::sync::MAX_ROWS || right >= crate::sync::MAX_COLS || anchor != CellRef::new(top,left) { return false; }
+        let rows = CellRef::new(top,0)..=CellRef::new(bottom,u32::MAX);
+        let inside = |k: &&CellRef| (left..=right).contains(&k.col);
+        let cache = |key: &CellRef| {
+            let before = source.store.get(key.row,key.col);
+            let after = sheet.get(key.row,key.col);
+            if rich_changed(sheet,*key) { return false; }
+            if *key == anchor {
+                return before.and_then(|c| c.formula.as_ref()).is_some_and(|f| Some(f)==after.and_then(|c| c.formula.as_ref()));
+            }
+            sheet.spilled.contains(key) && before.is_none_or(|c| c.formula.is_none()) && after.is_none_or(|c| c.formula.is_none())
+        };
+        let mut changed = keys.range(rows.clone()).filter(inside).peekable();
+        let ownership: Vec<_> = restricted.range(rows).filter(inside).copied().collect();
+        let old_shape = source.spill_shapes.get(&anchor);
+        let shape = sheet.spill_shapes.get(&anchor);
+        if changed.peek().is_none() && ownership.is_empty() && old_shape == shape { continue; }
+        let expected = (bottom-top+1,right-left+1);
+        if old_shape.is_some_and(|s| *s != expected) || shape.is_some_and(|s| *s != expected)
+            || !cache(&anchor) || !changed.all(cache) || !ownership.iter().all(cache) {
+            return false;
+        }
+        for k in ownership { restricted.remove(&k); }
+    }
+    restricted.is_empty()
 }
 
 fn coordinates(
     sheet: &Sheet,
     source: &SourceCells,
     styles: &StyleTable,
-    editable_dynamic: bool,
+    dynamic_index: Option<u32>,
     mut derive_xf: impl FnMut(u16, u16, u16) -> Option<u16>,
 ) -> Option<Changes> {
+    let editable_dynamic = dynamic_index.is_some();
     let base = &source.store;
     let mut keys = BTreeSet::new();
     let mut formula_changed = false;
@@ -422,21 +491,8 @@ fn coordinates(
             if rich_changed(sheet, key) { keys.insert(key); }
         }
     }
-    // The fallback owns changes to array formulas, cached spill results and their footprints.
-    // An unrelated value edit in the same sheet never needs to materialize these regions.
-    if sheet.arrays != *source.arrays
-        || (!editable_dynamic && (sheet.spill_shapes != *source.spill_shapes || sheet.spilled != *source.spilled))
-        || sheet
-            .arrays
-            .iter()
-            .any(|(_, rect)| intersects(&keys, *rect))
-        || !editable_dynamic && keys
-            .iter()
-            .any(|k| sheet.spilled.contains(k) || sheet.spill_shapes.contains_key(k))
-    {
-        return None;
-    }
-    let mut changed_styles = StyleChanges::default();
+    if !cache_only_arrays(sheet,source,&keys,editable_dynamic) { return None; }
+    let mut changed_styles = StyleChanges {dynamic_index,..Default::default()};
     if sheet.styles_dirty || !sheet.style_edits.is_empty() {
         for key in sheet
             .styles
@@ -460,9 +516,6 @@ fn coordinates(
                         if map.xfs.contains_key(&id) { return None; }
                         let (old, raw) = source.original_xf(sheet, key, styles)?;
                         if !map.unchanged(old, styles)
-                            || styles.theme_of(id) != styles.theme_of(old)
-                            || (styles.pattern_of(id) != styles.pattern_of(old)
-                                && !(font_delta::plain_fill_pattern(styles, id) && font_delta::plain_fill_pattern(styles, old)))
                             || styles.diag_of(id) != styles.diag_of(old)
                             || styles.quote_of(id) != styles.quote_of(old) { return None; }
                         let xf = derive_xf(raw, old, id)?;
@@ -474,6 +527,66 @@ fn coordinates(
             };
             changed_styles.updates.insert(key, value);
             keys.insert(key);
+        }
+    }
+    // Axis defaults need package XF numbers, not CELLAN's interned IDs.
+    // Keep the model sparse; only occupied inheriting cells also receive an s.
+    for (dirty, prior, current, axis) in [
+        (sheet.row_styles_dirty, &source.row_styles, &sheet.row_styles, &mut changed_styles.rows),
+        (sheet.col_styles_dirty, &source.col_styles, &sheet.col_styles, &mut changed_styles.cols),
+    ] {
+        if !dirty { continue; }
+        for pos in prior.keys().chain(current.keys()) {
+            let old = prior.get(pos).copied();
+            let new = current.get(pos).copied();
+            if old == new || axis.contains_key(pos) { continue; }
+            let xf = match new {
+                None => None,
+                Some(id) => {
+                    let map = source.style_map.as_ref()?;
+                    let original = || match old {
+                        Some(old) => map.xf(old,styles),
+                        None if map.xfs.get(&0).is_none_or(|v| *v == Some(0)) => Some(0),
+                        None => None,
+                    };
+                    if let Some(xf) = map.xf(id,styles) {
+                        if let Some(origin) = map.derived_from.get(&id) {
+                            let base = original()?;
+                            if *origin != Some(base) && xf != base { return None; }
+                        }
+                        Some(xf)
+                    } else {
+                        if map.xfs.contains_key(&id) { return None; }
+                        let raw = original()?;
+                        let old = old.unwrap_or(0);
+                        if !map.unchanged(old,styles)
+                            || styles.diag_of(id) != styles.diag_of(old)
+                            || styles.quote_of(id) != styles.quote_of(old) { return None; }
+                        changed_styles.derived_axis = true;
+                        Some(derive_xf(raw,old,id)?)
+                    }
+                }
+            };
+            axis.insert(*pos,xf);
+        }
+    }
+    if !changed_styles.rows.is_empty() || !changed_styles.cols.is_empty() {
+        keys.extend(sheet.iter().filter_map(|(key,_)| {
+            (sheet.explicit_style_of(key.row,key.col).is_none() &&
+                (changed_styles.rows.contains_key(&key.row) || changed_styles.cols.contains_key(&key.col)))
+                .then_some(key)
+        }));
+    }
+    for &key in &keys {
+        if !sheet.contains(key.row,key.col) || sheet.explicit_style_of(key.row,key.col).is_some() { continue; }
+        let inherited = if let Some(&id) = sheet.row_styles.get(&key.row) {
+            Some((id,changed_styles.rows.get(&key.row)))
+        } else { sheet.col_styles.get(&key.col).map(|&id| (id,changed_styles.cols.get(&key.col))) };
+        if let Some((id,update)) = inherited {
+            let xf = match update { Some(Some(xf)) => *xf, _ => source.style_map.as_ref()?.xf(id,styles)? };
+            changed_styles.updates.insert(key,Some(xf));
+        } else if changed_styles.rows.contains_key(&key.row) || changed_styles.cols.contains_key(&key.col) {
+            changed_styles.updates.insert(key,None);
         }
     }
     if editable_dynamic {
@@ -542,7 +655,7 @@ fn replacement(
             _ => return None,
         }
     }
-    if cm != shapes.and_then(|(old,_)| old.map(|_| 1)) { return None; }
+    if cm != shapes.and_then(|(old,_)| old.and(styles.dynamic_index)) { return None; }
     if !styles.matches(key, style) { return None; }
     if let Some(&xf) = styles.updates.get(&key) {
         style = xf.map(u32::from);
@@ -600,7 +713,7 @@ fn replacement(
     if let Some((old,new)) = shapes {
         if old.is_some() && definition.is_empty() { return None; }
         if let Some(rect) = new {
-            out.push_str(" cm=\"1\"");
+            out.push_str(&format!(" cm=\"{}\"", styles.dynamic_index?));
             let formula = cell.formula.as_deref()?;
             let f = crate::add_fn_prefixes(formula.strip_prefix('=').unwrap_or(formula));
             let f = format!("<f t=\"array\" ref=\"{}\">{}</f>",super::dynamic::reference(*rect),xml_text(&f)?);
@@ -1066,6 +1179,13 @@ fn invalidate_chain(
         replacements.insert(TYPES.into(), replace_spans(&xml, edits));
     }
     let xml = super::read_zip_text(zip, BOOK)?;
+    let Some(updated) = recalc_on_open(&xml,manual)? else { return Ok(None); };
+    replacements.insert(BOOK.into(), updated);
+    Ok(Some((replacements, deleted)))
+}
+
+/// Mark the persisted caches for Excel without discarding a still-valid dependency chain.
+pub(super) fn recalc_on_open(xml: &str, manual: bool) -> Result<Option<Vec<u8>>> {
     let Some((parts, close)) = children(&xml, "workbook") else {
         return Ok(None);
     };
@@ -1129,23 +1249,31 @@ fn invalidate_chain(
     } else {
         Event::Start(tag)
     })?;
-    replacements.insert(
-        BOOK.into(),
-        replace_spans(
+    Ok(Some(replace_spans(
             &xml,
             [Edit {
                 from,
                 to,
                 text: String::from_utf8(w.into_inner())?,
             }],
-        ),
-    );
-    Ok(Some((replacements, deleted)))
+        )))
+
 }
 
 #[cfg(test)]
 pub(super) fn write_if_supported(base: &Path, target: &Path, wb: &Workbook) -> Result<bool> {
     write_with_style_receipt(base, target, wb, &mut None)
+}
+
+/// Parser limitations decline this private attempt. Source ZIP, destination IO
+/// and CRC failures must still abort the save and preserve the original file.
+fn stream_supported(result: Result<bool>) -> Result<bool> {
+    match result {
+        Err(error) if error.chain().any(|e| e.is::<quick_xml::Error>() || e.is::<std::str::Utf8Error>())
+            && !error.chain().any(|e| e.is::<std::io::Error>() ||
+                matches!(e.downcast_ref::<quick_xml::Error>(),Some(quick_xml::Error::Io(_)))) => Ok(false),
+        other => other,
+    }
 }
 
 pub(super) fn write_with_style_receipt(
@@ -1163,11 +1291,8 @@ pub(super) fn write_with_style_receipt(
     let mut changed_xfs = None;
     let mut base_map = None;
     for sheet in &wb.sheets {
-        if sheet.row_styles_dirty || sheet.col_styles_dirty {
-            return Ok(false);
-        }
         if !sheet.cell_data_needs_save()
-            && !sheet.styles_dirty
+            && !sheet.styles_dirty && !sheet.row_styles_dirty && !sheet.col_styles_dirty
             && sheet.style_edits.is_empty()
             && !sheet.merges_dirty
             && !sheet.notes_dirty
@@ -1180,13 +1305,13 @@ pub(super) fn write_with_style_receipt(
         };
         if signature(&mut zip, part) != Some(source.signature)
             || source.strings != sst
-            || ((sheet.styles_dirty || !sheet.style_edits.is_empty())
+            || ((sheet.styles_dirty || sheet.row_styles_dirty || sheet.col_styles_dirty || !sheet.row_styles.is_empty() || !sheet.col_styles.is_empty() || !sheet.style_edits.is_empty())
                 && source.style_part != style_part)
         {
             return Ok(false);
         }
-        let edit_dynamic = !(source.spill_shapes.is_empty() && sheet.spill_shapes.is_empty()) &&
-            *dynamic.get_or_init(|| super::dynamic::editable(&mut zip));
+        let edit_dynamic = if source.spill_shapes.is_empty() && sheet.spill_shapes.is_empty() { None }
+            else { *dynamic.get_or_init(|| super::dynamic::editable(&mut zip)) };
         let Some(changes) = coordinates(sheet, source, &wb.styles, edit_dynamic, |raw, old, id| {
             if changed_xfs.is_none() {
                 let xml = style_xml.get_or_init(|| super::read_zip_text(&mut zip, "xl/styles.xml").ok());
@@ -1196,7 +1321,7 @@ pub(super) fn write_with_style_receipt(
         }) else {
             return Ok(false);
         };
-        if !changes.styles.sources.is_empty() {
+        if !changes.styles.sources.is_empty() || changes.styles.derived_axis {
             let Some(map) = &source.style_map else { return Ok(false); };
             if let Some(prior) = &base_map {
                 if !Arc::ptr_eq(prior, map) { return Ok(false); }
@@ -1213,7 +1338,7 @@ pub(super) fn write_with_style_receipt(
             }
         }
         formula_changed |= changes.formula_changed;
-        if !changes.keys.is_empty() || sheet.merges_dirty {
+        if !changes.keys.is_empty() || sheet.merges_dirty || !changes.styles.rows.is_empty() || !changes.styles.cols.is_empty() {
             if sheets
                 .insert(part.clone(), (sheet, &source.store, changes))
                 .is_some()
@@ -1236,7 +1361,9 @@ pub(super) fn write_with_style_receipt(
                 if *entry != Some(xf) { *entry = None; }
             }).or_insert(Some(xf));
         }
-        updated_map = Some(Arc::new(StyleMap { xfs: mapped, derived_from, original: wb.styles.clone() }));
+        let origin_only=old.origin_only.iter().filter(|(id,_)|old.unchanged(**id,&wb.styles))
+            .map(|(&id,&origin)|(id,origin)).collect();
+        updated_map = Some(Arc::new(StyleMap { xfs: mapped, derived_from, origin_only, original: wb.styles.clone() }));
         parts.insert("xl/styles.xml".to_owned(), xml.into_bytes());
     }
     let mut deleted = HashSet::new();
@@ -1285,8 +1412,8 @@ pub(super) fn write_with_style_receipt(
         } else if let Some((sheet, store, changes)) = sheets.remove(&part) {
             out.start_file(&part, SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated).compression_level(Some(1)))?;
-            if !stream::xml_input(zip.by_index(index)?, &part, |input|
-                stream::worksheet(input, &mut out, sheet, store, changes, &mut changed_sst))? {
+            if !stream_supported(stream::xml_input(zip.by_index(index)?, &part, |input|
+                stream::worksheet(input, &mut out, sheet, store, changes, &mut changed_sst)))? {
                 return Ok(false);
             }
         } else {
@@ -1302,8 +1429,8 @@ pub(super) fn write_with_style_receipt(
             // optional; preserve indices, rich runs and every original <si>.
             out.start_file("xl/sharedStrings.xml", SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated).compression_level(Some(1)))?;
-            if !stream::xml_input(zip.by_index(i)?, "xl/sharedStrings.xml", |input|
-                stream::shared_strings(input, &mut out))? { return Ok(false); }
+            if !stream_supported(stream::xml_input(zip.by_index(i)?, "xl/sharedStrings.xml", |input|
+                stream::shared_strings(input, &mut out)))? { return Ok(false); }
         } else {
             out.raw_copy_file(zip.by_index_raw(i)?)?;
         }
@@ -1340,6 +1467,131 @@ mod tests {
             value: Value::Number(v),
             formula: None,
         }
+    }
+
+    #[test]
+    fn malformed_stream_declines_without_masking_an_io_error() {
+        let mut reader = quick_xml::Reader::from_str("<x></y>");
+        reader.read_event().unwrap();
+        let malformed = reader.read_event().unwrap_err();
+        assert!(!stream_supported(Err(malformed.into())).unwrap());
+        let io = std::io::Error::other("write failed");
+        assert!(stream_supported(Err(quick_xml::Error::from(io).into())).is_err());
+    }
+
+    #[test]
+    fn value_only_edits_request_excel_recalculation_only_for_automatic_books() {
+        for manual in [false,true] {
+            let (_dir,path,_) = fixture("<row r='1'><c r='A1'><v>2</v></c><c r='B1'><f>A1*2</f><v>4</v></c></row>","");
+            let (mut wb,_) = load_diag(&path).unwrap();
+            wb.calc_manual = manual;
+            wb.sheets[0].set(0,0,num(9.));
+            assert!(save_atomic_with_receipt(&path,&wb).unwrap().used_cell_delta);
+            let xml = String::from_utf8(read_part(&path,"xl/workbook.xml").unwrap()).unwrap();
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let calc = doc.descendants().find(|n| n.tag_name().name()=="calcPr").unwrap();
+            assert_eq!(calc.attribute("fullCalcOnLoad")==Some("1"),!manual);
+            assert_eq!(calc.attribute("calcMode")==Some("manual"),manual);
+        }
+    }
+
+    #[test]
+    fn fallback_style_receipt_allows_a_second_edit_without_reopening() {
+        let (dir, path, part) = fixture("<row r='1'><c r='A1'><v>2</v></c></row>", "");
+        let (mut wb, _) = load_diag(&path).unwrap();
+        let mut style = wb.styles.get(wb.sheets[0].style_of(0, 0)).clone();
+        style.locked = false;
+        let unlocked = wb.styles.intern(style.clone());
+        wb.sheets[0].set_style(0, 0, unlocked);
+        let first = save_atomic_with_receipt(&path, &wb).unwrap();
+        assert!(!first.used_cell_delta);
+        first.adopt_document(&mut wb, &path, true);
+        style.italic = true;
+        style.valign = 1;
+        let italic = wb.styles.intern(style);
+        // Even a signed package with the same style table can contain a cell
+        // whose actual XF does not agree with the recovered default alias.
+        let other = dir.path().join("different-origin.xlsx");
+        std::fs::copy(&path, &other).unwrap();
+        let mut xml = String::from_utf8(read_part(&other, &part).unwrap()).unwrap();
+        let span = roxmltree::Document::parse(&xml)
+            .unwrap()
+            .descendants()
+            .find(|c| c.attribute("r") == Some("A1"))
+            .unwrap()
+            .attribute_node("s")
+            .unwrap()
+            .range_value();
+        xml.replace_range(span, "0");
+        crate::fixups::write_parts(&other, &[(part.clone(), xml.into_bytes())]).unwrap();
+        let mut divergent = wb.clone();
+        let mut zip = ZipArchive::new(File::open(&other).unwrap()).unwrap();
+        divergent.sheets[0].source_cells =
+            SourceCells::capture(&mut zip, &part, &divergent.sheets[0]);
+        drop(zip);
+        divergent.sheets[0].set_style(0, 0, italic);
+        assert!(!write_if_supported(&other, &dir.path().join("guard.xlsx"), &divergent).unwrap());
+        wb.sheets[0].set_style(0, 0, italic);
+        assert!(
+            save_atomic_with_receipt(&path, &wb)
+                .unwrap()
+                .used_cell_delta
+        );
+        let (saved, _) = load_diag(&path).unwrap();
+        let style = saved.styles.get(saved.sheets[0].style_of(0, 0));
+        assert!(style.italic && !style.locked);
+        assert_eq!(style.valign, 1);
+    }
+
+    #[test]
+    fn saves_axis_defaults_and_materializes_inherited_xfs_on_populated_cells() {
+        let (_dir, source, part) = fixture(
+            "<row r='3'><c r='B3'><v>3</v></c></row>",
+            "<dimension ref='B3'/>",
+        );
+        let mut wb = load_diag(&source).unwrap().0;
+        let bold = wb.styles.intern(crate::style::CellStyle {
+            bold: true,
+            ..wb.styles.get(0).clone()
+        });
+        let sheet = wb.sheet_mut(0);
+        sheet.set_col_style(1, bold);
+        sheet.set_row_style(4, bold);
+        sheet.set(4, 0, num(5.));
+        let target = source.with_file_name("axes.xlsx");
+        assert!(write_with_style_receipt(&source, &target, &wb, &mut None).unwrap());
+        let mut wb = load_diag(&target).unwrap().0;
+        let xml = String::from_utf8(read_part(&target, &part).unwrap()).unwrap();
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let raw = |kind, attr, id, style| {
+            doc.descendants()
+                .find(|n| n.tag_name().name() == kind && n.attribute(attr) == Some(id))
+                .unwrap()
+                .attribute(style)
+                .unwrap()
+        };
+        let xf = raw("col", "min", "2", "style");
+        assert_ne!(xf, "0");
+        assert_eq!(raw("row", "r", "5", "s"), xf);
+        assert_eq!(raw("c", "r", "B3", "s"), xf);
+        assert_eq!(raw("c", "r", "A5", "s"), xf);
+        wb.sheets[0].set(8, 1, num(42.));
+        let path = source.with_file_name("new-value.xlsx");
+        assert!(write_with_style_receipt(&target, &path, &wb, &mut None).unwrap());
+        let xml = String::from_utf8(read_part(&path, &part).unwrap()).unwrap();
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        assert_eq!(
+            doc.descendants()
+                .find(|n| n.attribute("r") == Some("B9"))
+                .unwrap()
+                .attribute("s"),
+            Some(xf)
+        );
+        wb.sheets[0].set_col_style(1, 0);
+        wb.sheets[0].set_row_style(4, 0);
+        assert!(write_with_style_receipt(&target, &path, &wb, &mut None).unwrap());
+        let back = load_diag(&path).unwrap().0;
+        assert!(back.sheets[0].row_styles.is_empty() && back.sheets[0].col_styles.is_empty());
     }
 
     #[test]
@@ -1642,6 +1894,115 @@ mod tests {
     }
 
     #[test]
+    fn derived_xfs_preserve_border_extensions_and_theme_pattern_colors() {
+        use crate::style_ext::FillPattern;
+        use crate::style_theme::{ThemeRef, XfTheme};
+        let (dir, path, part) = fixture(r#"<row r="1"><c r="A1" s="0"><v>3</v></c></row>"#, "");
+        let seed = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:e="urn:vendor">
+<fonts count="1"><font><name val="Calibri"/><family val="2"/><color theme="1"/><sz val="11"/><scheme val="minor"/></font></fonts>
+<fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+<borders count="1"><border outline="0"><right e:keep="yes"/><diagonal/></border></borders>
+<cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="1"><xf fontId="0" fillId="0" borderId="0" numFmtId="0" xfId="0" e:vendor="v"><alignment readingOrder="2"/></xf></cellXfs>
+</styleSheet>"#;
+        crate::fixups::write_parts(&path, &[("xl/styles.xml".into(), seed.as_bytes().to_vec())])
+            .unwrap();
+        let mut wb = load_diag(&path).unwrap().0;
+        let base = wb.sheets[0].style_of(0, 0);
+        let mut style = wb.styles.get(base).clone();
+        style.font = "A & B".into();
+        style.valign = 2;
+        style.rotation = -30;
+        style.border[0] = crate::style::Border {
+            style: 1,
+            color: [10, 20, 30],
+        };
+        style.fill = Some([31, 41, 51]);
+        let id = wb.styles.intern(style);
+        let font = ThemeRef { idx: 4, tint: 0.25 };
+        wb.styles.set_theme(
+            id,
+            XfTheme {
+                font: Some(font),
+                fill: None,
+            },
+        );
+        wb.styles.set_pattern(
+            id,
+            FillPattern {
+                kind: "darkTrellis".into(),
+                fg: Some([31, 41, 51]),
+                fg_theme: None,
+                fg_indexed: None,
+                bg: None,
+                bg_theme: Some((5, -0.25)),
+                bg_indexed: None,
+            },
+        );
+        wb.sheets[0].set_style(0, 0, id);
+        let target = dir.path().join("styled.xlsx");
+        assert!(write_if_supported(&path, &target, &wb).unwrap());
+        let encoded = String::from_utf8(read_part(&target, "xl/styles.xml").unwrap()).unwrap();
+        let doc = roxmltree::Document::parse(&encoded).unwrap();
+        let last = |family| {
+            doc.root_element()
+                .children()
+                .find(|e| e.tag_name().name() == family)
+                .unwrap()
+                .last_element_child()
+                .unwrap()
+        };
+        let new_border = last("borders");
+        assert_eq!(new_border.attribute("outline"), Some("0"));
+        assert_eq!(
+            new_border
+                .children()
+                .find(|e| e.tag_name().name() == "right")
+                .unwrap()
+                .attribute(("urn:vendor", "keep")),
+            Some("yes")
+        );
+        let left = new_border.first_element_child().unwrap();
+        assert_eq!(left.tag_name().name(), "left");
+        assert_eq!(left.attribute("style"), Some("thin"));
+        assert_eq!(
+            left.first_element_child().unwrap().attribute("rgb"),
+            Some("FF0A141E")
+        );
+        assert_eq!(
+            last("cellXfs").attribute(("urn:vendor", "vendor")),
+            Some("v")
+        );
+        assert_eq!(
+            last("cellXfs")
+                .first_element_child()
+                .unwrap()
+                .attribute("readingOrder"),
+            Some("2")
+        );
+        assert_eq!(
+            last("cellXfs")
+                .first_element_child()
+                .unwrap()
+                .attribute("textRotation"),
+            Some("120")
+        );
+        let xml = String::from_utf8(read_part(&target, &part).unwrap()).unwrap();
+        assert!(xml.contains(r#"s="1""#));
+        let back = load_diag(&target).unwrap().0;
+        let sid = back.sheets[0].style_of(0, 0);
+        assert_eq!(
+            (
+                back.styles.get(sid).font.as_str(),
+                back.styles.get(sid).rotation,
+                back.styles.get(sid).valign
+            ),
+            ("A & B", -30, 2)
+        );
+        assert_eq!(back.styles.theme_of(sid).font, Some(font));
+        assert_eq!(back.styles.pattern_of(sid), wb.styles.pattern_of(id));
+    }
+
+    #[test]
     fn format_of_a_fresh_default_cell_can_be_changed_after_reopening() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("default-format.xlsx");
@@ -1659,7 +2020,7 @@ mod tests {
             // Explicitly removing the original theme-backed font is a different edit.
             let theme = wb.styles.theme_of(original);
             if theme != wb.styles.theme_of(id) {
-                assert!(!write_if_supported(&file, &dir.path().join("unsupported.xlsx"), &wb).unwrap());
+                assert!(write_if_supported(&file, &dir.path().join("fixed-color.xlsx"), &wb).unwrap());
                 wb.styles.set_theme(id, theme);
             }
             assert!(save_atomic_with_receipt(&file, &wb).unwrap().used_cell_delta, "{code}");
@@ -1873,6 +2234,54 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_worksheet_cell_changes_use_original_namespace_and_keep_extension_bytes() {
+        let (dir,path,part) = fixture("", "");
+        let extension = r#"<x:extLst><x:ext uri="test"><setting xmlns="urn:vendor"><x:label>xx</x:label></setting></x:ext></x:extLst>"#;
+        let xml = format!(r#"<x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns="urn:default"><x:dimension ref="A1"/><x:sheetData><x:row r='1'><x:c r="A1"><x:v>2</x:v></x:c></x:row></x:sheetData>{extension}</x:worksheet>"#);
+        crate::patch::append_entry(&path,&part,xml.as_bytes()).unwrap();
+        let (mut wb,diag) = load_diag(&path).unwrap();
+        assert!(diag.is_complete());
+        wb.sheets[0].set(0,0,num(5.));
+        wb.sheets[0].set(2,1,Cell { value: Value::Text("x:c".into()), formula:None });
+        let out = dir.path().join("prefixed.xlsx");
+        let receipt = save_atomic_with_receipt(&out,&wb).unwrap();
+        assert!(receipt.used_cell_delta);
+        let saved = String::from_utf8(read_part(&out,&part).unwrap()).unwrap();
+        assert!(saved.contains(extension));
+        let doc = roxmltree::Document::parse(&saved).unwrap();
+        let cells: Vec<_> = doc.descendants().filter(|e| e.tag_name().name()=="c").collect();
+        assert_eq!(cells.len(),2);
+        assert!(cells.iter().flat_map(|c| c.descendants()).filter(|n| n.is_element())
+            .all(|n| n.tag_name().namespace()==Some("http://schemas.openxmlformats.org/spreadsheetml/2006/main")));
+        let back = load_diag(&out).unwrap().0;
+        assert_eq!(back.sheets[0].value(0,0),Value::Number(5.));
+        assert_eq!(back.sheets[0].value(2,1),Value::Text("x:c".into()));
+    }
+
+    #[test]
+    fn fixed_array_cache_edits_preserve_definition_and_decline_tail_input() {
+        let rows = r#"<row r="1"><c r="A1"><f t="array" ref="A1:A2" aca="1">B1:B2*2</f><v>4</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>6</v></c><c r="B2"><v>3</v></c></row>"#;
+        let (dir,path,part) = fixture(rows,"");
+        let (mut wb,diag) = load_diag(&path).unwrap();
+        assert!(diag.is_complete());
+        wb.sheets[0].set(0,1,num(5.));
+        wb.sheets[0].set(1,1,num(7.));
+        crate::formula::recalc_all(&mut wb);
+        assert_eq!(wb.sheets[0].value(1,0),Value::Number(14.));
+        let out = dir.path().join("fixed-cache.xlsx");
+        let receipt = save_atomic_with_receipt(&out,&wb).unwrap();
+        assert!(receipt.used_cell_delta);
+        let xml = String::from_utf8(read_part(&out,&part).unwrap()).unwrap();
+        assert!(xml.contains(r#"<f t="array" ref="A1:A2" aca="1">B1:B2*2</f><v>10</v>"#));
+        let reopened = load_diag(&out).unwrap().0;
+        assert_eq!(reopened.sheets[0].value(1,0),Value::Number(14.));
+        assert_eq!(reopened.sheets[0].arrays,wb.sheets[0].arrays);
+        receipt.adopt_document(&mut wb,&out,true);
+        wb.sheets[0].set(1,0,num(99.));
+        assert!(!write_if_supported(&out,&dir.path().join("override.xlsx"),&wb).unwrap());
+    }
+
+    #[test]
     fn changing_a_shared_formula_master_uses_the_full_serializer() {
         let rows = r#"<row r="1"><c r="A1"><f t="shared" si="0" ref="A1:A2">B1+1</f><v>2</v></c></row><row r="2"><c r="A2"><f t="shared" si="0"/><v>3</v></c></row>"#;
         let (dir, path, part) = fixture(rows, "");
@@ -1883,6 +2292,10 @@ mod tests {
         assert!(write_if_supported(&path, &target, &wb).unwrap());
         let xml = String::from_utf8(read_part(&target, &part).unwrap()).unwrap();
         assert!(xml.contains(r#"<f t="shared" si="0" ref="A1:A2">B1+1</f><v>11</v>"#));
+        wb.sheets[0].get_mut(1, 0).unwrap().value = Value::Number(18.0);
+        assert!(write_if_supported(&path, &target, &wb).unwrap());
+        let xml = String::from_utf8(read_part(&target,&part).unwrap()).unwrap();
+        assert!(xml.contains(r#"<f t="shared" si="0"/><v>18</v>"#));
         wb.sheets[0].set(0, 0, num(4.0));
         assert!(!write_if_supported(&path, &target, &wb).unwrap());
         save(&target, &wb).unwrap();

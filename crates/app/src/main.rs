@@ -5172,17 +5172,22 @@ impl SheetApp {
                             if let Ok(spec) = std::env::var("SC_SCEN_ADD") {
                                 if let Some((name, range)) = spec.split_once(':') {
                                     if let Some(r) = SheetApp::parse_rect(range) {
-                                        let sc = sheetcore::scenarios::capture(
+                                        let captured = sheetcore::scenarios::capture(
                                             self.wb.sheet(self.sheet_idx),
                                             name,
                                             "",
                                             r,
                                         );
-                                        let n = sc.cells.len();
-                                        let sh = self.wb.sheet_mut(self.sheet_idx);
-                                        sh.scenarios.push(sc);
-                                        sh.scenarios_dirty = true;
-                                        eprintln!("[scen] added {name} cells={n}");
+                                        match captured {
+                                            Ok(sc) => {
+                                                let n = sc.cells.len();
+                                                let sh = self.wb.sheet_mut(self.sheet_idx);
+                                                sh.scenarios.push(sc);
+                                                sh.scenarios_dirty = true;
+                                                eprintln!("[scen] added {name} cells={n}");
+                                            }
+                                            Err(err) => eprintln!("[scen] {err}"),
+                                        }
                                     } else {
                                         eprintln!("[scen] bad range {range}");
                                     }
@@ -5213,10 +5218,8 @@ impl SheetApp {
                                 }
                             }
                             if std::env::var("SC_SCEN_SUMMARY").is_ok() {
-                                let res = std::env::var("SC_SCEN_RESULTS")
-                                    .ok()
-                                    .and_then(|v| SheetApp::parse_rect(&v));
-                                match self.build_scenario_summary(res) {
+                                let res = std::env::var("SC_SCEN_RESULTS").unwrap_or_default();
+                                match self.build_scenario_summary(&res) {
                                     Ok(n) => eprintln!("[scen] summary sheet {n}"),
                                     Err(e) => eprintln!("[scen] summary fail {e}"),
                                 }
@@ -15765,6 +15768,12 @@ let txn = self.txn_begin(&keys);
                     }
                 });
             });
+        if self.scen_sel != sel {
+            let sh = self.wb.sheet_mut(self.sheet_idx);
+            sh.scenario_settings.current = sel;
+            sh.scenarios_dirty = true;
+            self.wb.dirty = true;
+        }
         self.scen_sel = sel;
         let rect = Self::parse_rect(&self.scen_range);
         if do_add {
@@ -15772,17 +15781,20 @@ let txn = self.txn_begin(&keys);
                 (Some(r), false) => {
                     let name = self.scen_name.trim().to_string();
                     let comment = self.scen_comment.trim().to_string();
-                    let sc = sheetcore::scenarios::capture(
+                    let sc = match sheetcore::scenarios::capture(
                         self.wb.sheet(self.sheet_idx),
                         &name,
                         &comment,
                         r,
-                    );
+                    ) {
+                        Ok(sc) => sc,
+                        Err(err) => { self.scen_msg = err.to_string(); return; }
+                    };
                     let n = sc.cells.len();
                     {
                         let sh = self.wb.sheet_mut(self.sheet_idx);
                         if let Some(pos) = sh.scenarios.iter().position(|x| x.name == name) {
-                            sh.scenarios[pos] = sc;
+                            sh.scenarios[pos].replace_inputs(sc);
                         } else {
                             sh.scenarios.push(sc);
                         }
@@ -15799,6 +15811,9 @@ let txn = self.txn_begin(&keys);
         if do_show {
             if let Some(i) = self.scen_sel {
                 if let Some(sc) = self.wb.sheet(self.sheet_idx).scenarios.get(i).cloned() {
+                    let sh = self.wb.sheet_mut(self.sheet_idx);
+                    sh.scenario_settings.show = Some(i);
+                    sh.scenarios_dirty = true;
                     for ((r, c), v) in &sc.cells {
                         let val = sheetcore::scenarios::apply_value(v);
                         let sh = self.wb.sheet_mut(self.sheet_idx);
@@ -15823,6 +15838,7 @@ let txn = self.txn_begin(&keys);
                     let sh = self.wb.sheet_mut(self.sheet_idx);
                     if i < sh.scenarios.len() {
                         let n = sh.scenarios.remove(i).name;
+                        sh.scenario_settings.removed(i, sh.scenarios.len());
                         sh.scenarios_dirty = true;
                         Some(n)
                     } else {
@@ -15837,12 +15853,8 @@ let txn = self.txn_begin(&keys);
             }
         }
         if do_summary {
-            let res = if self.scen_result.trim().is_empty() {
-                None
-            } else {
-                Self::parse_rect(&self.scen_result)
-            };
-            match self.build_scenario_summary(res) {
+            let res = self.scen_result.trim().to_owned();
+            match self.build_scenario_summary(&res) {
                 Ok(name) => {
                     self.scen_msg = format!("已在「{name}」里生成摘要");
                     self.status = format!("方案摘要已生成：{name}");
@@ -15871,7 +15883,7 @@ let txn = self.txn_begin(&keys);
     /// 带 `results` 时，还会把每个方案下这些格子的计算结果一起写进去。
     fn build_scenario_summary(
         &mut self,
-        results: Option<(u32, u32, u32, u32)>,
+        results: &str,
     ) -> Result<String, String> {
         let list = self.wb.sheet(self.sheet_idx).scenarios.clone();
         if list.is_empty() {
@@ -15886,39 +15898,24 @@ let txn = self.txn_begin(&keys);
             }
         }
         keys.sort();
-        let result_cells: Vec<(u32, u32)> = match results {
-            Some((r1, c1, r2, c2)) => {
-                let mut v = Vec::new();
-                for r in r1..=r2 {
-                    for c in c1..=c2 {
-                        v.push((r, c));
-                    }
+        let mut result_cells = Vec::new();
+        for range in results.split_whitespace() {
+            let (r1,c1,r2,c2) = Self::parse_rect(range).ok_or_else(|| format!("结果单元格地址无效：{range}"))?;
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    if !result_cells.contains(&(r,c)) { result_cells.push((r,c)); }
+                    if result_cells.len() > 32 { return Err("每个方案摘要最多可指定 32 个结果单元格".into()); }
                 }
-                v
             }
-            None => Vec::new(),
-        };
-        // 先把「所有方案会动的格子」的当前值记下来，算完恢复
-        let snapshot: Vec<((u32, u32), sheetcore::model::Value)> = keys
-            .iter()
-            .map(|(r, c)| {
-                (
-                    (*r, *c),
-                    self.wb
-                        .sheet(self.sheet_idx)
-                        .get(*r, *c)
-                        .map(|x| x.value.clone())
-                        .unwrap_or_default(),
-                )
-            })
-            .collect();
+        }
         // 逐个方案代值、重算、抓结果
         let mut rows: Vec<Vec<Vec<sheetcore::model::Value>>> = Vec::new();
         let deps = sheetcore::formula::deps::Deps::build(&self.wb);
         for sc in &list {
+            let mut preview = self.wb.clone();
             for ((r, c), v) in &sc.cells {
                 let val = sheetcore::scenarios::apply_value(v);
-                let sh = self.wb.sheet_mut(self.sheet_idx);
+                let sh = preview.sheet_mut(self.sheet_idx);
                 let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
                 cell.value = val;
                 cell.formula = None;
@@ -15929,11 +15926,11 @@ let txn = self.txn_begin(&keys);
                 .iter()
                 .map(|((r, c), _)| (self.sheet_idx, *r, *c))
                 .collect();
-            sheetcore::formula::recalc_dirty(&mut self.wb, &deps, &seeds);
+            sheetcore::formula::recalc_dirty(&mut preview, &deps, &seeds);
             let vals: Vec<sheetcore::model::Value> = result_cells
                 .iter()
                 .map(|(r, c)| {
-                    self.wb
+                    preview
                         .sheet(self.sheet_idx)
                         .get(*r, *c)
                         .map(|x| x.value.clone())
@@ -15942,14 +15939,12 @@ let txn = self.txn_begin(&keys);
                 .collect();
             rows.push(vec![vals]);
         }
-        // 恢复原状
-        for ((r, c), v) in snapshot {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            let mut cell = sh.get(r, c).cloned().unwrap_or_default();
-            cell.value = v;
-            sh.set(r, c, cell);
+        let sh = self.wb.sheet_mut(self.sheet_idx);
+        let refs = (!results.is_empty()).then(|| results.to_owned());
+        if sh.scenario_settings.sqref != refs {
+            sh.scenario_settings.sqref = refs;
+            sh.scenarios_dirty = true;
         }
-        sheetcore::formula::recalc_all(&mut self.wb);
 
         let mut base = "方案摘要".to_string();
         let mut n = 1;

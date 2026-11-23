@@ -531,6 +531,13 @@ pub(crate) fn rewrite_with_additions_pub<F>(
 where
     F: FnMut(&str, Vec<u8>) -> Vec<u8>,
 {
+    rewrite_with_additions_checked(path, additions, targets, |name, bytes| Ok(edit(name,bytes)))
+}
+
+pub(crate) fn rewrite_with_additions_checked(
+    path: &Path, additions: Vec<(String,Vec<u8>)>, targets: &[&str],
+    mut edit: impl FnMut(&str,Vec<u8>) -> Result<Vec<u8>>,
+) -> Result<()> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
     let mut pending: Vec<_> = additions.into_iter()
         .filter(|(name, _)| zip.index_for_name(name).is_none()).collect();
@@ -538,7 +545,7 @@ where
         let Some(index) = zip.index_for_name(name) else { continue };
         let mut original = Vec::new();
         zip.by_index(index)?.read_to_end(&mut original)?;
-        let updated = edit(name, original.clone());
+        let updated = edit(name, original.clone())?;
         if updated != original {
             pending.push((name.to_owned(), updated));
         }
@@ -601,14 +608,19 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
                 .filter(|n| n.attribute("Type").is_some_and(|t| t.ends_with("/drawing")) && n.attribute("TargetMode") != Some("External"))
                 .filter_map(|n| Some((n.attribute("Id")?, n.attribute("Target")?))).collect();
             if targets.is_empty() { None } else {
-                let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::new(zip.by_name(&sheet_path)?));
+                let mut reader = quick_xml::NsReader::from_reader(std::io::BufReader::new(zip.by_name(&sheet_path)?));
                 let mut buf = Vec::new();
                 let mut skip = Vec::new();
                 let mut root = false;
                 loop {
                     buf.clear();
                     match reader.read_event_into(&mut buf)? {
-                        quick_xml::events::Event::Start(e) if !root && e.local_name().as_ref() == "worksheet" => root = true,
+                        quick_xml::events::Event::Start(e) if !root && e.local_name().as_ref() == "worksheet" => {
+                            let (ns,_) = reader.resolver().resolve_element(e.name());
+                            anyhow::ensure!(!matches!(ns,quick_xml::name::ResolveResult::Bound(n) if n.0 == "http://purl.oclc.org/ooxml/spreadsheetml/main"),
+                                "暂不支持改写 Strict 工作表中的绘图部件");
+                            root = true;
+                        }
                         quick_xml::events::Event::Empty(e) | quick_xml::events::Event::Start(e) if root && e.local_name().as_ref() == "drawing" => {
                             let id = e.attributes().flatten().find(|a| a.key.local_name().as_ref() == "id")
                                 .map(|a| a.value.into_owned()).ok_or_else(|| anyhow::anyhow!("绘图缺少关系标识"))?;
@@ -729,23 +741,15 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
     let sheet_rels2 = sheet_rels_part.clone();
     let drawing_name = format!("drawing{drawing_no}.xml");
     let chart_name = format!("chart{chart_no}.xml");
-    rewrite_with_additions_pub(path, additions, &[&sheet_path, &sheet_rels_part, "[Content_Types].xml"], move |name, buf| {
+    rewrite_with_additions_checked(path, additions, &[&sheet_path, &sheet_rels_part, "[Content_Types].xml"], move |name, buf| {
         if name == sheet_rels2 {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                if !xml.contains(&drawing_name) {
-                    let add = format!(
-                        "<Relationship Id=\"rId{next_rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/{drawing_name}\"/>"
-                    );
-                    return xml.replace("</Relationships>", &format!("{add}</Relationships>")).into_bytes();
-                }
-            }
-            return buf;
+            let xml = crate::xlsx::patch_xml_text(&buf, name)?;
+            return Ok(crate::textbox::add_drawing_relationship(&xml, &format!("rId{next_rid}"),
+                &format!("../drawings/{drawing_name}"))?.into_bytes());
         }
         if name == sheet_path2 {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                return crate::textbox::insert_drawing_tag(&xml, &format!("rId{next_rid}")).into_bytes();
-            }
-            return buf;
+            let xml = crate::xlsx::patch_xml_text(&buf, name)?;
+            return Ok(crate::textbox::insert_drawing_tag(&xml, &format!("rId{next_rid}"))?.into_bytes());
         }
         if name == "[Content_Types].xml" {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
@@ -762,11 +766,11 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
                         &format!("<Override PartName=\"/xl/drawings/{drawing_name}\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/></Types>"),
                     );
                 }
-                return x.into_bytes();
+                return Ok(x.into_bytes());
             }
-            return buf;
+            return Ok(buf);
         }
-        buf
+        Ok(buf)
     })?;
     Ok(())
 }

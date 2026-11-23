@@ -13,28 +13,11 @@ pub(super) const RELS: &str = "xl/_rels/workbook.xml.rels";
 pub(super) const TYPES: &str = "[Content_Types].xml";
 pub(super) const METADATA: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray"><metadataTypes count="1"><metadataType name="XLDAPR" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1" cellMeta="1"/></metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}"><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>"#;
 
-pub(super) fn editable(zip: &mut zip::ZipArchive<File>) -> bool {
-    // A cell metadata index may reference several records (e.g. rich data).
-    // Replacing the entire index is safe only for this single-purpose package.
-    if !zip
-        .by_name(PART)
-        .is_ok_and(|f| f.size() == METADATA.len() as u64)
-    {
-        return false;
-    }
-    if !super::read_zip_text(zip, PART).is_ok_and(|xml| xml == METADATA) {
-        return false;
-    }
-    super::read_zip_text(zip, RELS).ok().is_some_and(|xml| {
-        Document::parse(&xml).is_ok_and(|doc| {
-            doc.root_element().children().any(|e| {
-                e.attribute("Type") == Some(REL)
-                    && e.attribute("TargetMode") != Some("External")
-                    && e.attribute("Target")
-                        .is_some_and(|t| crate::fixups::resolve_target(RELS, t) == PART)
-            })
-        })
-    })
+/// Reuse an existing cell metadata record only when it carries dynamic-array
+/// metadata alone. Formatting and unrelated future metadata may vary by producer.
+pub(super) fn editable(zip: &mut zip::ZipArchive<File>) -> Option<u32> {
+    let rels = super::read_zip_text(zip,RELS).ok()?;
+    read_indices(zip,rels.as_bytes(),true).ok()?.into_iter().min()
 }
 
 pub(super) fn area(key: crate::CellRef, (h, w): (u32, u32)) -> Option<(u32, u32, u32, u32)> {
@@ -95,6 +78,23 @@ pub(super) fn declare(xml: &mut String, part: &str) -> Result<()> {
 }
 
 pub(super) fn indices(zip: &mut zip::ZipArchive<File>, rels: &[u8]) -> Result<HashSet<u32>> {
+    read_indices(zip,rels,false)
+}
+
+fn standalone_dynamic(block: roxmltree::Node<'_, '_>) -> bool {
+    let mut node = block;
+    for (ns,name) in [(NS,"extLst"),(NS,"ext"),(XDA,"dynamicArrayProperties")] {
+        let mut children = node.children().filter(|n| n.is_element());
+        let Some(child) = children.next() else { return false };
+        if children.next().is_some() || !child.has_tag_name((ns,name)) { return false; }
+        node = child;
+    }
+    !node.children().any(|n| n.is_element()) &&
+        node.attributes().all(|a| a.namespace().is_none() && matches!(a.name(),"fDynamic" | "fCollapsed")) &&
+        matches!(node.attribute("fCollapsed"),None | Some("0" | "false"))
+}
+
+fn read_indices(zip: &mut zip::ZipArchive<File>, rels: &[u8], standalone: bool) -> Result<HashSet<u32>> {
     let mut result = HashSet::new();
     let relationships = Document::parse(std::str::from_utf8(rels)?)?;
     let Some(target) = relationships
@@ -125,7 +125,7 @@ pub(super) fn indices(zip: &mut zip::ZipArchive<File>, rels: &[u8]) -> Result<Ha
         .flat_map(|n| n.children().filter(|n| n.has_tag_name((NS, "bk"))))
         .enumerate()
         .filter(|(_, n)| {
-            n.descendants().any(|p| {
+            (!standalone || standalone_dynamic(*n)) && n.descendants().any(|p| {
                 p.has_tag_name((XDA, "dynamicArrayProperties"))
                     && matches!(p.attribute("fDynamic"), Some("1" | "true"))
             })
@@ -137,8 +137,12 @@ pub(super) fn indices(zip: &mut zip::ZipArchive<File>, rels: &[u8]) -> Result<Ha
         .filter(|n| n.has_tag_name((NS, "bk")))
         .enumerate()
     {
+        if standalone && (block.attributes().len() != 0 || block.children().filter(|r| r.is_element()).count() != 1) {
+            continue;
+        }
         if block.children().any(|r| {
             r.has_tag_name((NS, "rc"))
+                && (!standalone || (r.attributes().len() == 2 && !r.children().any(|child| child.is_element())))
                 && r.attribute("t").and_then(|a| a.parse().ok()) == Some(t + 1)
                 && r.attribute("v")
                     .and_then(|a| a.parse::<usize>().ok())
@@ -176,6 +180,6 @@ mod tests {
             indices(&mut zip, rels.as_bytes()).unwrap(),
             HashSet::from([2])
         );
-        assert!(!editable(&mut zip));
+        assert_eq!(read_indices(&mut zip,rels.as_bytes(),true).unwrap(),HashSet::from([2]));
     }
 }

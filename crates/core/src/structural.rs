@@ -135,7 +135,7 @@ impl Sheet {
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
                 self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, *at, *n, false));
-                self.shift_axis_styles(&shift);
+                self.shift_axis_metadata(&shift);
             }
             Structural::DeleteRows { at, n } => {
                 self.merges = self
@@ -151,7 +151,7 @@ impl Sheet {
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
                 self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, *at, *n, true));
-                self.shift_axis_styles(&shift);
+                self.shift_axis_metadata(&shift);
             }
             Structural::InsertCols { at, n } => {
                 self.merges = self
@@ -170,7 +170,7 @@ impl Sheet {
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
                 self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, *at, *n, false));
-                self.shift_axis_styles(&shift);
+                self.shift_axis_metadata(&shift);
             }
             Structural::DeleteCols { at, n } => {
                 self.merges = self
@@ -186,7 +186,7 @@ impl Sheet {
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
                 self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, *at, *n, true));
-                self.shift_axis_styles(&shift);
+                self.shift_axis_metadata(&shift);
             }
         }
         self.merges_dirty = true;
@@ -554,13 +554,12 @@ impl Sheet {
         self.shift_sparklines(shift);
         if let Some((r, c)) = self.freeze { self.freeze = Some((shift.map(r).unwrap(), c)); }
         self.layout_dirty |= self.rows.remap_indices(|r| shift.map(r));
-        self.shift_row_visibility(shift);
         if let Some(f) = &mut self.filter {
             let moved = shift.map_range(f.range.0, f.range.2).unwrap();
             self.filter_dirty |= (f.range.0, f.range.2) != moved;
             (f.range.0, f.range.2) = moved;
         }
-        self.shift_axis_styles(shift);
+        self.shift_axis_metadata(shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }
@@ -591,8 +590,7 @@ impl Sheet {
             self.freeze = Some((nf, fc));
         }
         self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, at, n, true));
-        self.shift_row_visibility(&shift);
-        self.shift_axis_styles(&shift);
+        self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }
@@ -624,7 +622,7 @@ impl Sheet {
             }
         }
         self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, at, n, false));
-        self.shift_axis_styles(&shift);
+        self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }
@@ -655,30 +653,31 @@ impl Sheet {
             self.freeze = Some((fr, nf));
         }
         self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, at, n, true));
-        self.shift_axis_styles(&shift);
+        self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
     }
 
-    fn shift_row_visibility(&mut self, shift: &MappedShift) {
-        // SUBTOTAL reads the row visibility sets. They must move with the row's
-        // height or it would omit an adjacent visible record after insertion.
-        for hidden in [&mut self.hidden_rows, &mut self.hidden_rows_user] {
-            if hidden.is_empty() { continue; }
-            *hidden = hidden.iter().filter_map(|&row| shift.map(row)).collect::<HashSet<_>>().into();
-            self.layout_dirty = true;
-        }
-        if !self.row_levels.is_empty() {
-            self.row_levels = std::mem::take(&mut self.row_levels).into_iter()
-                .filter_map(|(r, level)| Some((shift.map(r)?, level))).collect();
-            self.layout_dirty = true;
-        }
-    }
-
-    fn shift_axis_styles(&mut self, shift: &MappedShift) {
+    fn shift_axis_metadata(&mut self, shift: &MappedShift) {
         let rows = shift.axis == crate::refs::Axis::Row;
-        if shift.n == 0 {
-            return;
+        if shift.n == 0 { return; }
+        let mut move_hidden = |hidden: &mut crate::layout::HiddenIndices| {
+            if !hidden.is_empty() {
+                *hidden = hidden.iter().filter_map(|&pos| shift.map(pos)).collect::<HashSet<_>>().into();
+                self.layout_dirty = true;
+            }
+        };
+        if rows {
+            move_hidden(&mut self.hidden_rows);
+            move_hidden(&mut self.hidden_rows_user);
+        } else {
+            move_hidden(&mut self.hidden_cols);
+        }
+        let levels = if rows { &mut self.row_levels } else { &mut self.col_levels };
+        if !levels.is_empty() {
+            *levels = std::mem::take(levels).into_iter()
+                .filter_map(|(pos, level)| Some((shift.map(pos)?, level))).collect();
+            self.layout_dirty = true;
         }
         let map = if rows { &mut self.row_styles } else { &mut self.col_styles };
         if map.is_empty() {
