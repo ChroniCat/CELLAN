@@ -379,8 +379,8 @@ impl Criterion {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Filter {
     pub range: (u32, u32, u32, u32),
-    /// 列号 → 允许出现文本值；没有条目的列不过滤
-    pub allows: HashMap<u32, HashSet<String>>,
+    /// 列号 → 允许出现文本值；没有条目的列不过滤（CoW 共享，避免 Sheet 克隆深拷几万唯一值）
+    pub allows: crate::model::CellMetadata<u32, HashSet<String>>,
     /// 列号 → 条件（文本筛选/数字筛选）；和 allows 是「与」关系
     pub criteria: HashMap<u32, Criterion>,
 }
@@ -389,7 +389,7 @@ impl Filter {
     pub fn new(r1: u32, c1: u32, r2: u32, c2: u32) -> Self {
         Self {
             range: (r1, c1, r2, c2),
-            allows: HashMap::new(),
+            allows: Default::default(),
             criteria: HashMap::new(),
         }
     }

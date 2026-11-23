@@ -28717,7 +28717,7 @@ let txn = self.txn_begin(&keys);
 
         // 图表（浮在单元格之上；无图表工作表零分配跳过）
         let charts = if self.wb.sheet(self.sheet_idx).charts.is_empty() {
-            Vec::new()
+            Default::default()
         } else {
             self.wb.sheet(self.sheet_idx).charts.clone()
         };

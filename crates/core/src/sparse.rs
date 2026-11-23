@@ -124,6 +124,18 @@ pub fn shared_strings_checked(path: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// 读共享字符串表（直接驻留为 `Arc<str>`，供大表零拷贝加载）
+pub fn shared_strings_arc(path: &Path) -> Vec<std::sync::Arc<str>> {
+    shared_strings_arc_checked(path).unwrap_or_default()
+}
+
+/// 读共享字符串表并驻留为 `Arc<str>`；重复文本共享同一块堆内存。
+pub fn shared_strings_arc_checked(path: &Path) -> Result<Vec<std::sync::Arc<str>>> {
+    let raw = shared_strings_checked(path)?;
+    let mut pool = crate::model::StringPool::with_capacity(raw.len());
+    Ok(raw.into_iter().map(|s| pool.intern_owned(s)).collect())
+}
+
 /// 流式读一张表：返回 (行, 列, 单元格)
 pub fn read_sheet(path: &Path, part: &str, ss: &[String]) -> Result<HashMap<(u32, u32), Cell>> {
     let file = std::fs::File::open(path)?;
@@ -133,6 +145,20 @@ pub fn read_sheet(path: &Path, part: &str, ss: &[String]) -> Result<HashMap<(u32
     f.read_to_string(&mut xml)?;
     let cells = parse_sheet_xml(&xml, ss)?;
     Ok(cells)
+}
+
+/// 流式读一张表（直接使用预驻留 `Arc<str>` 共享字符串表，零重复文本堆分配）
+pub fn read_sheet_arc(
+    path: &Path,
+    part: &str,
+    ss: &[std::sync::Arc<str>],
+) -> Result<HashMap<(u32, u32), Cell>> {
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut f = zip.by_name(part)?;
+    let mut xml = String::new();
+    f.read_to_string(&mut xml)?;
+    parse_sheet_xml_arc(&xml, ss)
 }
 
 
@@ -330,11 +356,47 @@ pub fn fix_shared_children(xml: &str) -> Vec<(u32, u32, String)> {
 
 /// 工作表 XML → 单元格表。单拎出来是为了能直接用字符串写测试。
 pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> Result<HashMap<(u32, u32), Cell>> {
+    let mut ss_arcs: Vec<Option<std::sync::Arc<str>>> = vec![None; ss.len()];
+    parse_sheet_xml_impl(xml, ss.len(), |idx, pool| {
+        let s = ss.get(idx)?;
+        if s.is_empty() {
+            return Some(None);
+        }
+        if let Some(arc) = &ss_arcs[idx] {
+            return Some(Some(arc.clone()));
+        }
+        let arc = pool.intern(s);
+        ss_arcs[idx] = Some(arc.clone());
+        Some(Some(arc))
+    })
+}
+
+/// 工作表 XML → 单元格表（直接复用预构建的 `&[Arc<str>]` SST，零拷贝克隆 `Arc`）。
+pub fn parse_sheet_xml_arc(
+    xml: &str,
+    ss: &[std::sync::Arc<str>],
+) -> Result<HashMap<(u32, u32), Cell>> {
+    parse_sheet_xml_impl(xml, ss.len(), |idx, _pool| {
+        let s = ss.get(idx)?;
+        if s.is_empty() {
+            Some(None)
+        } else {
+            Some(Some(s.clone()))
+        }
+    })
+}
+
+fn parse_sheet_xml_impl(
+    xml: &str,
+    ss_len: usize,
+    mut get_shared: impl FnMut(usize, &mut crate::model::StringPool) -> Option<Option<std::sync::Arc<str>>>,
+) -> Result<HashMap<(u32, u32), Cell>> {
     let mut out: HashMap<(u32, u32), Cell> = HashMap::new();
+    let mut pool = crate::model::StringPool::with_capacity(ss_len.min(4096));
     // 共享字符串索引取不到时不能静默变空值：要么整份 SST 没读出来，要么文件本身坏了
     let mut bad_shared = 0usize;
     let mut xml_err: Option<String> = None;
-    let mut reader = Reader::from_str(&xml);
+    let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
 
     let mut row: u32 = 0;
@@ -356,9 +418,9 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> Result<HashMap<(u32, u32), C
                 let value = match cell_type.as_str() {
                     "s" => {
                         let idx: usize = text.trim().parse().unwrap_or(usize::MAX);
-                        match ss.get(idx) {
-                            Some(s) if !s.is_empty() => Value::Text(s.clone().into()),
-                            Some(_) => Value::Empty,
+                        match get_shared(idx, &mut pool) {
+                            Some(Some(s)) => Value::Text(s),
+                            Some(None) => Value::Empty,
                             None => {
                                 bad_shared += 1;
                                 Value::Empty
@@ -370,23 +432,24 @@ pub fn parse_sheet_xml(xml: &str, ss: &[String]) -> Result<HashMap<(u32, u32), C
                         if text.is_empty() {
                             Value::Empty
                         } else {
-                            Value::Text(text.clone().into())
+                            Value::Text(pool.intern_owned(text))
                         }
                     }
                     _ => {
-                        if text.trim().is_empty() {
+                        let trimmed = text.trim();
+                        if trimmed.is_empty() {
                             Value::Empty
                         } else {
-                            match text.trim().parse::<f64>() {
+                            match trimmed.parse::<f64>() {
                                 Ok(n) => Value::Number(n),
-                                Err(_) => Value::Text(text.clone().into()),
+                                Err(_) => Value::Text(pool.intern_owned(text)),
                             }
                         }
                     }
                 };
                 let f = formula.take();
                 if !matches!(value, Value::Empty) || f.is_some() {
-                    out.insert((r, c), Cell { value, formula: f.map(|s| s.into()) });
+                    out.insert((r, c), Cell { value, formula: f.map(|s| pool.intern_owned(s)) });
                 }
             } else {
                 val.clear();

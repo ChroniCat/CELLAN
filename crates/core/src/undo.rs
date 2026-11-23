@@ -64,7 +64,7 @@ pub fn snapshot_sheet(sheet: &Sheet, idx: usize) -> SheetSnapshot {
             .iter()
             .map(|(k, c)| (k.row, k.col, c.clone(), sheet.style_of(k.row, k.col)))
             .collect(),
-        merges: sheet.merges.clone(),
+        merges: sheet.merges.to_vec(),
     }
 }
 
@@ -74,7 +74,7 @@ pub fn restore_sheet(sheet: &mut Sheet, snap: &SheetSnapshot) {
         sheet.set(*r, *c, cell.clone());
         sheet.set_style(*r, *c, *st);
     }
-    sheet.merges = snap.merges.clone();
+    sheet.merges = snap.merges.clone().into();
     sheet.merges_dirty = true;
 }
 
@@ -173,7 +173,7 @@ fn plan_merge_diff(
     sheet: &Sheet,
     add: &[(u32, u32, u32, u32)],
     remove: &[(u32, u32, u32, u32)],
-) -> Option<(Vec<(u32, u32, u32, u32)>, Vec<((u32, u32, u32, u32), bool)>)> {
+) -> Option<(crate::merges::Merges, Vec<((u32, u32, u32, u32), bool)>)> {
     let mut next = sheet.merges.clone();
     let mut changed = Vec::new();
     for r in remove {
@@ -501,7 +501,7 @@ struct ForeignReferences {
     cells: Vec<(CellRef, Cell)>,
     cf: Option<crate::cf::CfSheet>,
     dv: Option<Vec<crate::dv::DataValidation>>,
-    charts: Option<Vec<crate::charts::Chart>>,
+    charts: Option<crate::model::SharedList<crate::charts::Chart>>,
     sparklines: Option<Vec<crate::sparkline::Sparkline>>,
 }
 
@@ -608,9 +608,15 @@ fn chart_refs_match(current: &[crate::charts::Chart], expected: &[crate::charts:
 
 /// A row/column operation only changes series references. Retain the live
 /// chart's presentation, cached values and save journal when changing them back.
-fn restored_charts(current: &[crate::charts::Chart], desired: &[crate::charts::Chart]) -> Vec<crate::charts::Chart> {
-    let mut restored = current.to_vec();
-    for (chart, desired) in restored.iter_mut().zip(desired) {
+fn restored_charts(
+    current: &crate::model::SharedList<crate::charts::Chart>,
+    desired: &crate::model::SharedList<crate::charts::Chart>,
+) -> crate::model::SharedList<crate::charts::Chart> {
+    if current.ptr_eq(desired) || chart_refs_match(current, desired) {
+        return current.clone();
+    }
+    let mut restored = current.clone();
+    for (chart, desired) in restored.iter_mut().zip(desired.iter()) {
         for (series, dest) in chart.series.iter_mut().zip(&desired.series) {
             for (from, to) in [(&mut series.name_ref, &dest.name_ref),
                 (&mut series.cat_ref, &dest.cat_ref), (&mut series.val_ref, &dest.val_ref)] {
@@ -731,7 +737,7 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     target.source_part = current.source_part.clone();
     target.saved_cells.clone_from(&current.saved_cells);
     target.source_cells.clone_from(&current.source_cells);
-    target.cleared.extend(current.cleared.iter().copied());
+    target.cleared.extend(current.cleared.iter());
     for key in current.changed_cells(&target).collect::<Vec<_>>() {
         touched.insert((snap.sheet, key.row, key.col));
         if !target.contains(key.row, key.col) {
@@ -739,7 +745,7 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
         }
     }
     touched.extend(target.changed_cells(current).map(|k| (snap.sheet, k.row, k.col)));
-    target.style_edits.extend(current.style_edits.iter().copied());
+    target.style_edits.extend(current.style_edits.iter());
     for k in current.styles.changed_keys(&target.styles).chain(target.styles.changed_keys(&current.styles)) {
         touched.insert((snap.sheet, k.row, k.col));
         target.style_edits.insert(k);

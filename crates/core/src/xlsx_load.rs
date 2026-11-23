@@ -482,7 +482,7 @@ fn cell(
                         } else {
                             string_item(r)?
                         };
-                        value = Value::Text(text.into_boxed_str());
+                        value = Value::Text(text.into());
                         if !runs.is_empty() {
                             dst.sheet.rich.insert(pos, runs);
                         }
@@ -916,7 +916,7 @@ mod tests {
         for row in [0,202,549] {
             assert_eq!(sheet.value(row,0),Value::Number((row+1) as f64));
             assert_eq!(sheet.get(row,1).unwrap().formula.as_deref().unwrap(),format!("=A{}+1",row+1));
-            assert_eq!(sheet.value(row,2), Value::Text(filler.clone().into_boxed_str()));
+            assert_eq!(sheet.value(row,2), Value::Text(filler.as_str().into()));
         }
     }
 

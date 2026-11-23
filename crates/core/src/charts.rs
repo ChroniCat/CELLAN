@@ -259,7 +259,7 @@ fn load_charts_for_part(zip: &mut zip::ZipArchive<std::fs::File>, sheet_path: &s
 pub fn load_charts_all(
     path: &Path,
     sheets: &[Sheet],
-) -> Result<std::collections::HashMap<u32, Vec<Chart>>> {
+) -> Result<std::collections::HashMap<u32, crate::model::SharedList<Chart>>> {
     load_charts_all_in(path, sheets, None, crate::model::DateSystem::D1900)
 }
 
@@ -269,7 +269,7 @@ pub fn load_charts_all_in(
     sheets: &[Sheet],
     styles: Option<&crate::style::StyleTable>,
     sys: crate::model::DateSystem,
-) -> Result<std::collections::HashMap<u32, Vec<Chart>>> {
+) -> Result<std::collections::HashMap<u32, crate::model::SharedList<Chart>>> {
     let targets = crate::patch::sheet_targets(path)?;
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
     let mut out = std::collections::HashMap::new();
@@ -282,7 +282,7 @@ pub fn load_charts_all_in(
             resolve_series_in(chart, sheet, styles, sys);
         }
         if !list.is_empty() {
-            out.insert(idx as u32, list);
+            out.insert(idx as u32, list.into());
         }
     }
     Ok(out)

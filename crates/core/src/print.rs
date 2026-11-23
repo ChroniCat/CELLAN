@@ -1221,7 +1221,7 @@ fn fvalue_to_value(v: crate::formula::FValue) -> crate::model::Value {
     match v {
         FValue::Empty => Value::Empty,
         FValue::Number(n) => Value::Number(n),
-        FValue::Text(t) => Value::Text(t.into_boxed_str()),
+        FValue::Text(t) => Value::Text(t.into()),
         FValue::Bool(b) => Value::Bool(b),
         FValue::Error(e) => Value::Error(e),
         FValue::Array(a) => a

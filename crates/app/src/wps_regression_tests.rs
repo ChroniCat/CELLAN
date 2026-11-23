@@ -1727,7 +1727,7 @@ fn vlookup_full_column_wide_table_materializes_only_first_column_and_shares_inde
             r,
             0,
             sheetcore::model::Cell {
-                value: sheetcore::model::Value::Text(format!("K{r}").into_boxed_str()),
+                value: sheetcore::model::Value::Text(format!("K{r}").into()),
                 formula: None,
             },
         );

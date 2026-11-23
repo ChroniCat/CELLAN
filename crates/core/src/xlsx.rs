@@ -268,7 +268,7 @@ fn load_xlsx_cells(
         };
         let value = match record.value {
             calamine::DataRef::SharedString(text) => Value::Text(text.into()),
-            calamine::DataRef::String(text) => Value::Text(text.into_boxed_str()),
+            calamine::DataRef::String(text) => Value::Text(text.into()),
             other => data_to_value(&other.into()),
         };
         let formula = formula.filter(|f| !f.is_empty()).map(|f| {
@@ -2741,7 +2741,7 @@ fn save_plain_at(
                         ws.get_cell_mut(coord).set_value_number(*n);
                     }
                     Value::Text(t) => {
-                        ws.get_cell_mut(coord).set_value_string(t.clone());
+                        ws.get_cell_mut(coord).set_value_string(t.as_ref());
                     }
                     Value::Bool(b) => {
                         ws.get_cell_mut(coord).set_value_bool(*b);
@@ -3465,7 +3465,7 @@ fn apply_cf_patch(
                             // 屏蔽行两种来源必须合并：筛选条件命中的 hidden_rows
                             // 和用户手动隐藏的 hidden_rows_user。关闭筛选时只清 hidden_rows，
                             // 不能把手动隐藏的行一起抹掉。
-                            let mut hidden = (*sheet.hidden_rows).clone();
+                            let mut hidden: std::collections::HashSet<u32> = sheet.hidden_rows.iter().copied().collect();
                             hidden.extend(sheet.hidden_rows_user.iter().copied());
                             hidden
                         },
