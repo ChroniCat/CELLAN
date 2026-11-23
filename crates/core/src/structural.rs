@@ -266,31 +266,30 @@ impl Sheet {
         if n == 0 || to == from {
             return;
         }
-        let (_, _, _, c2) = self.used_bounds().unwrap_or((0, 0, 0, 0));
-        let r2 = from + n - 1;
-        let mut cells: Vec<(u32, u32, Cell)> = Vec::new();
-        let mut styles: Vec<(u32, u32, u16)> = Vec::new();
-        for r in from..=r2 {
-            for c in 0..=c2 {
-                if let Some(cell) = self.get(r, c) {
-                    cells.push((r - from, c, cell.clone()));
-                }
-                if let Some(st) = self.styles.get(&CellRef::new(r, c)).copied() {
-                    styles.push((r - from, c, st));
-                }
-            }
+        let at = if to > from { to - n } else { to };
+        if at == from {
+            return;
         }
+        let lo = from.min(at);
+        let hi = (from + n).max(at + n);
+        let r2 = from + n - 1;
+        let perm = |r: u32| -> u32 {
+            if r < lo || r >= hi {
+                r
+            } else if r >= from && r < from + n {
+                at + (r - from)
+            } else if at > from {
+                r - n
+            } else {
+                r + n
+            }
+        };
+
         let notes: Vec<_> = self
             .notes
             .iter()
             .filter(|(k, _)| k.row >= from && k.row <= r2)
             .map(|(k, v)| (k.row - from, k.col, v.clone()))
-            .collect();
-        let rich: Vec<_> = self
-            .rich
-            .iter()
-            .filter(|((r, _), _)| *r >= from && *r <= r2)
-            .map(|((r, c), v)| (r - from, *c, v.clone()))
             .collect();
         let links: Vec<_> = self
             .hyperlinks
@@ -309,22 +308,39 @@ impl Sheet {
             .map(|r| self.row_styles.get(&r).copied().unwrap_or(0))
             .collect();
 
-        self.delete_rows(from, n);
-        let at = if to > from { to - n } else { to };
-        self.insert_rows(at, n);
+        if !self.rich.is_empty() {
+            let rich_keys: Vec<(u32, u32)> = self
+                .rich
+                .keys()
+                .filter(|&&(r, _)| r >= lo && r < hi)
+                .copied()
+                .collect();
+            if !rich_keys.is_empty() {
+                self.rich_dirty = true;
+                let mut moved_rich = Vec::with_capacity(rich_keys.len());
+                for pos in rich_keys {
+                    if let Some(v) = self.rich.remove(&pos) {
+                        moved_rich.push(((perm(pos.0), pos.1), v));
+                    }
+                }
+                for (dest, v) in moved_rich {
+                    self.rich.insert(dest, v);
+                }
+            }
+        }
 
-        for (dr, c, cell) in cells {
-            self.set(at + dr, c, cell);
-        }
-        for (dr, c, st) in styles {
-            self.set_style(at + dr, c, st);
-        }
-        for (dr, c, v) in notes {
+        // Single-pass bounded `[lo..hi)` permutation on cells and explicit styles:
+        // pages `< lo / PAGE_ROWS` and `> (hi - 1) / PAGE_ROWS` are 100% untouched.
+        self.permute_cell_band(true, lo, hi, perm);
+
+        self.delete_rows_inner(from, n, false);
+        self.insert_rows_inner(at, n, false);
+
+        for (dr, c, mut v) in notes {
+            v.r = at + dr;
+            v.c = c;
             self.notes.insert(CellRef::new(at + dr, c), v);
-        }
-        for (dr, c, v) in rich {
-            self.rich.insert((at + dr, c), v);
-            self.rich_dirty = true;
+            self.notes_dirty = true;
         }
         for (dr, c, v) in links {
             self.hyperlinks.insert((at + dr, c), v);
@@ -357,31 +373,30 @@ impl Sheet {
         if n == 0 || to == from {
             return;
         }
-        let (_, _, r2, _) = self.used_bounds().unwrap_or((0, 0, 0, 0));
-        let c2 = from + n - 1;
-        let mut cells: Vec<(u32, u32, Cell)> = Vec::new();
-        let mut styles: Vec<(u32, u32, u16)> = Vec::new();
-        for c in from..=c2 {
-            for r in 0..=r2 {
-                if let Some(cell) = self.get(r, c) {
-                    cells.push((r, c - from, cell.clone()));
-                }
-                if let Some(st) = self.styles.get(&CellRef::new(r, c)).copied() {
-                    styles.push((r, c - from, st));
-                }
-            }
+        let at = if to > from { to - n } else { to };
+        if at == from {
+            return;
         }
+        let lo = from.min(at);
+        let hi = (from + n).max(at + n);
+        let c2 = from + n - 1;
+        let perm = |c: u32| -> u32 {
+            if c < lo || c >= hi {
+                c
+            } else if c >= from && c < from + n {
+                at + (c - from)
+            } else if at > from {
+                c - n
+            } else {
+                c + n
+            }
+        };
+
         let notes: Vec<_> = self
             .notes
             .iter()
             .filter(|(k, _)| k.col >= from && k.col <= c2)
             .map(|(k, v)| (k.row, k.col - from, v.clone()))
-            .collect();
-        let rich: Vec<_> = self
-            .rich
-            .iter()
-            .filter(|((_, c), _)| *c >= from && *c <= c2)
-            .map(|((r, c), v)| (*r, c - from, v.clone()))
             .collect();
         let links: Vec<_> = self
             .hyperlinks
@@ -398,22 +413,37 @@ impl Sheet {
             .map(|c| self.col_styles.get(&c).copied().unwrap_or(0))
             .collect();
 
-        self.delete_cols(from, n);
-        let at = if to > from { to - n } else { to };
-        self.insert_cols(at, n);
+        if !self.rich.is_empty() {
+            let rich_keys: Vec<(u32, u32)> = self
+                .rich
+                .keys()
+                .filter(|&&(_, c)| c >= lo && c < hi)
+                .copied()
+                .collect();
+            if !rich_keys.is_empty() {
+                self.rich_dirty = true;
+                let mut moved_rich = Vec::with_capacity(rich_keys.len());
+                for pos in rich_keys {
+                    if let Some(v) = self.rich.remove(&pos) {
+                        moved_rich.push(((pos.0, perm(pos.1)), v));
+                    }
+                }
+                for (dest, v) in moved_rich {
+                    self.rich.insert(dest, v);
+                }
+            }
+        }
 
-        for (r, dc, cell) in cells {
-            self.set(r, at + dc, cell);
-        }
-        for (r, dc, st) in styles {
-            self.set_style(r, at + dc, st);
-        }
-        for (r, dc, v) in notes {
+        self.permute_cell_band(false, lo, hi, perm);
+
+        self.delete_cols_inner(from, n, false);
+        self.insert_cols_inner(at, n, false);
+
+        for (r, dc, mut v) in notes {
+            v.r = r;
+            v.c = at + dc;
             self.notes.insert(CellRef::new(r, at + dc), v);
-        }
-        for (r, dc, v) in rich {
-            self.rich.insert((r, at + dc), v);
-            self.rich_dirty = true;
+            self.notes_dirty = true;
         }
         for (r, dc, v) in links {
             self.hyperlinks.insert((r, at + dc), v);
@@ -531,19 +561,37 @@ impl Sheet {
     }
 
     pub fn insert_rows(&mut self, at: u32, n: u32) {
+        self.insert_rows_inner(at, n, true);
+    }
+
+    fn insert_rows_inner(&mut self, at: u32, n: u32, move_cells: bool) {
         if n == 0 {
             return;
         }
         let fills = self.capture_table_row_fills(at, n, &[]);
         let shift = (Structural::InsertRows { at, n }).reference_shift();
-        self.insert_mapped_rows(&MappedShift { shift: &shift, insertions: &[] });
+        self.insert_mapped_rows_inner(&MappedShift { shift: &shift, insertions: &[] }, move_cells);
         self.adjust_tables_for_row_insert(at, n);
-        self.apply_table_row_fills(fills);
+        if move_cells {
+            self.apply_table_row_fills(fills);
+        } else if !fills.is_empty() {
+            let surviving: Vec<_> = fills
+                .into_iter()
+                .filter(|f| !self.contains(f.row, f.col))
+                .collect();
+            self.apply_table_row_fills(surviving);
+        }
     }
 
     fn insert_mapped_rows(&mut self, shift: &MappedShift) {
+        self.insert_mapped_rows_inner(shift, true);
+    }
+
+    fn insert_mapped_rows_inner(&mut self, shift: &MappedShift, move_cells: bool) {
         self.shift_array_and_hyperlink_ranges(shift);
-        self.remap_cell_axis(true, shift.at, |row| shift.map(row));
+        if move_cells {
+            self.remap_cell_axis(true, shift.at, |row| shift.map(row));
+        }
         for (r1, _, r2, _) in &mut self.merges {
             *r1 = shift.map(*r1).unwrap();
             *r2 = shift.map(*r2).unwrap();
@@ -565,13 +613,19 @@ impl Sheet {
     }
 
     pub fn delete_rows(&mut self, at: u32, n: u32) {
+        self.delete_rows_inner(at, n, true);
+    }
+
+    fn delete_rows_inner(&mut self, at: u32, n: u32, move_cells: bool) {
         if n == 0 {
             return;
         }
         let shift = (Structural::DeleteRows { at, n }).reference_shift();
         let shift = MappedShift { shift: &shift, insertions: &[] };
         self.shift_array_and_hyperlink_ranges(&shift);
-        self.shift_cells(true, at, n, true);
+        if move_cells {
+            self.shift_cells(true, at, n, true);
+        }
         self.merges = self
             .merges
             .iter()
@@ -596,13 +650,19 @@ impl Sheet {
     }
 
     pub fn insert_cols(&mut self, at: u32, n: u32) {
+        self.insert_cols_inner(at, n, true);
+    }
+
+    fn insert_cols_inner(&mut self, at: u32, n: u32, move_cells: bool) {
         if n == 0 {
             return;
         }
         let shift = (Structural::InsertCols { at, n }).reference_shift();
         let shift = MappedShift { shift: &shift, insertions: &[] };
         self.shift_array_and_hyperlink_ranges(&shift);
-        self.shift_cells(false, at, n, false);
+        if move_cells {
+            self.shift_cells(false, at, n, false);
+        }
         self.merges = self
             .merges
             .iter()
@@ -628,13 +688,19 @@ impl Sheet {
     }
 
     pub fn delete_cols(&mut self, at: u32, n: u32) {
+        self.delete_cols_inner(at, n, true);
+    }
+
+    fn delete_cols_inner(&mut self, at: u32, n: u32, move_cells: bool) {
         if n == 0 {
             return;
         }
         let shift = (Structural::DeleteCols { at, n }).reference_shift();
         let shift = MappedShift { shift: &shift, insertions: &[] };
         self.shift_array_and_hyperlink_ranges(&shift);
-        self.shift_cells(false, at, n, true);
+        if move_cells {
+            self.shift_cells(false, at, n, true);
+        }
         self.merges = self
             .merges
             .iter()
@@ -664,8 +730,12 @@ impl Sheet {
         crate::scenarios::shift_references(self, shift);
         let mut move_hidden = |hidden: &mut crate::layout::HiddenIndices| {
             if !hidden.is_empty() {
-                *hidden = hidden.iter().filter_map(|&pos| shift.map(pos)).collect::<HashSet<_>>().into();
-                self.layout_dirty = true;
+                let changed = if shift.insertions.is_empty() {
+                    hidden.shift_axis(shift.at, shift.n, shift.delete)
+                } else {
+                    hidden.remap_insertions(|pos| shift.map(pos))
+                };
+                self.layout_dirty |= changed;
             }
         };
         if rows {
@@ -1006,11 +1076,5 @@ fn update_workbook_references(
 
 /// 供撤销用：一行/一列里有哪些格子
 pub fn collect_region(sheet: &Sheet, r1: u32, c1: u32, r2: u32, c2: u32) -> HashSet<CellRef> {
-    let mut out = HashSet::new();
-    for (cref, _) in sheet.iter() {
-        if cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2 {
-            out.insert(cref);
-        }
-    }
-    out
+    sheet.iter_rect((r1, c1, r2, c2)).map(|(cref, _)| cref).collect()
 }

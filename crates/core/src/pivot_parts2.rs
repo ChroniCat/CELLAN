@@ -1,18 +1,16 @@
 //! 多字段透视（`PivotSpec2`）→ 真 `pivotTable` 部件。
 //!
-//! 结构黄金样本来自 Excel 自己造的三份文件（`scripts/c12_make_pivots_multi.ps1`）：
-//! - A：2 行字段 + 1 值，无列字段 —— rowItems 每行一个 `<x>`/层，组尾 `<i t="default"><x/></i>`；
-//! - B：1 行 + 1 列 + 2 值 —— `colFields` 末尾加 `<field x="-2"/>`（数据字段伪字段），
-//!   每个列路径产出 K 个 `<i>`，第 2 个起带 `i="1"`；
-//! - C：2 行 + 1 列 + 1 值 —— 列维度按叶子标签逐个 `<i>`，末尾 `<i t="grand"><x/></i>`。
-//!
-//! 只做「缓存与定义自洽」不够，Excel 会因为 `rowItems/colItems` 与 `sharedItems` 对不上
-//! 而静默丢掉整张透视表，所以这里所有下标都由同一份 `sharedItems` 生成。
+//! 关键优化：
+//! 1. 提供 `build_wb` / `build_sheet` 直接接收内存 `&Workbook` / `&Sheet`（零磁盘二次加载）；
+//! 2. `sharedItems` 去重、`idx_of` 与缓存记录写入全部改为 `HashMap<String, usize>` `O(1)` 查找；
+//! 3. 直接使用 `sheet.value_ref` 与单缓冲流式拼接，消除百万次 `Value::clone` 与 `O(N * U)` 线性扫描。
 
-use crate::model::{col_label, Value};
+use crate::model::{col_label, Sheet, Value, Workbook};
 use crate::pivot::Agg;
 use crate::pivot_multi::{PivotGrid, PivotSpec2};
 use anyhow::{bail, Context, Result};
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
 
 fn col_name(mut c: u32) -> String {
@@ -28,20 +26,52 @@ fn col_name(mut c: u32) -> String {
 }
 
 fn esc(s: &str) -> String {
+    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"')) {
+        return s.to_string();
+    }
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
 
-fn idx_of(shared: &mut Vec<String>, v: &str) -> usize {
-    match shared.iter().position(|s| s == v) {
-        Some(i) => i,
-        None => {
-            shared.push(v.to_string());
-            shared.len() - 1
+fn push_esc(out: &mut String, s: &str) {
+    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"')) {
+        out.push_str(s);
+        return;
+    }
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
         }
     }
+}
+
+#[inline]
+fn idx_of(shared: &mut Vec<String>, map: &mut HashMap<String, usize>, v: &str) -> usize {
+    if let Some(&i) = map.get(v) {
+        return i;
+    }
+    let idx = shared.len();
+    let owned = v.to_string();
+    map.insert(owned.clone(), idx);
+    shared.push(owned);
+    idx
+}
+
+#[inline]
+fn idx_of_owned(shared: &mut Vec<String>, map: &mut HashMap<String, usize>, v: String) -> usize {
+    if let Some(&i) = map.get(&v) {
+        return i;
+    }
+    let idx = shared.len();
+    map.insert(v.clone(), idx);
+    shared.push(v);
+    idx
 }
 
 pub fn build(
@@ -60,16 +90,72 @@ pub fn build(
     if spec.values.is_empty() {
         bail!("多字段透视至少需要一个值字段");
     }
-
-    let (r1, c1, r2, c2) = spec.source;
     let wb = crate::xlsx::load(path).context("透视表：读取源工作簿失败")?;
+    build_wb(
+        &wb,
+        sheet_name,
+        spec,
+        grid,
+        out_rect,
+        cache_id,
+        table_name,
+        refreshed_by,
+    )
+}
+
+/// 直接从内存 `&Workbook` 构建多字段透视部件 XML（零磁盘二次加载！）
+pub fn build_wb(
+    wb: &Workbook,
+    sheet_name: &str,
+    spec: &PivotSpec2,
+    grid: &PivotGrid,
+    out_rect: (u32, u32, u32, u32),
+    cache_id: u32,
+    table_name: &str,
+    refreshed_by: &str,
+) -> Result<(String, String, String)> {
+    if spec.rows.is_empty() {
+        bail!("多字段透视至少需要一个行字段");
+    }
+    if spec.values.is_empty() {
+        bail!("多字段透视至少需要一个值字段");
+    }
     let sheet = wb
         .sheets
         .iter()
         .find(|s| s.name == sheet_name)
         .with_context(|| format!("透视表：源工作表 {sheet_name} 不存在"))?;
+    build_sheet(
+        sheet,
+        sheet_name,
+        spec,
+        grid,
+        out_rect,
+        cache_id,
+        table_name,
+        refreshed_by,
+    )
+}
 
-    // ---------- 缓存：整块源区都要进缓存（Excel 自己也是这样，未用的列也在）----------
+/// 直接从内存源表 `&Sheet` 构建多字段透视部件 XML。
+pub fn build_sheet(
+    sheet: &Sheet,
+    sheet_name: &str,
+    spec: &PivotSpec2,
+    grid: &PivotGrid,
+    out_rect: (u32, u32, u32, u32),
+    cache_id: u32,
+    table_name: &str,
+    refreshed_by: &str,
+) -> Result<(String, String, String)> {
+    if spec.rows.is_empty() {
+        bail!("多字段透视至少需要一个行字段");
+    }
+    if spec.values.is_empty() {
+        bail!("多字段透视至少需要一个值字段");
+    }
+
+    let (r1, c1, r2, c2) = spec.source;
     let n_fields = (c2 - c1 + 1) as usize;
     let value_cols: Vec<u32> = spec.values.iter().map(|v| v.col).collect();
     let mut names = Vec::with_capacity(n_fields);
@@ -82,7 +168,9 @@ pub fn build(
             .unwrap_or_else(|| col_label(col));
         names.push(name);
     }
+
     let mut shared: Vec<Vec<String>> = vec![Vec::new(); n_fields];
+    let mut shared_map: Vec<HashMap<String, usize>> = vec![HashMap::new(); n_fields];
     let mut numeric = vec![false; n_fields];
     let mut bounds: Vec<(Option<f64>, Option<f64>)> = vec![(None, None); n_fields];
     for i in 0..n_fields {
@@ -90,9 +178,10 @@ pub fn build(
         let is_value = value_cols.contains(&col);
         let mut saw_num = false;
         for r in (r1 + 1)..=r2 {
-            match sheet.get(r, col).map(|c| c.value.clone()) {
-                None | Some(Value::Empty) => {}
-                Some(Value::Number(v)) => {
+            match sheet.value_ref(r, col) {
+                Value::Empty => {}
+                Value::Number(v) => {
+                    let v = *v;
                     saw_num = true;
                     let (lo, hi) = bounds[i];
                     bounds[i] = (
@@ -100,16 +189,19 @@ pub fn build(
                         Some(hi.map_or(v, |x: f64| x.max(v))),
                     );
                     if !is_value {
-                        let s = Value::Number(v).display();
-                        if !shared[i].iter().any(|x| *x == s) {
-                            shared[i].push(s);
-                        }
+                        let s = crate::model::format_number(v);
+                        idx_of_owned(&mut shared[i], &mut shared_map[i], s);
                     }
                 }
-                Some(other) => {
+                Value::Text(t) => {
+                    if !t.is_empty() {
+                        idx_of(&mut shared[i], &mut shared_map[i], t);
+                    }
+                }
+                other => {
                     let s = other.display();
-                    if !s.is_empty() && !shared[i].iter().any(|x| *x == s) {
-                        shared[i].push(s);
+                    if !s.is_empty() {
+                        idx_of_owned(&mut shared[i], &mut shared_map[i], s);
                     }
                 }
             }
@@ -117,15 +209,15 @@ pub fn build(
         numeric[i] = is_value && saw_num;
         if numeric[i] {
             shared[i].clear();
+            shared_map[i].clear();
         }
     }
 
     // ---------- 行轴 ----------
     let row_depth = spec.rows.len();
     let row_fields: Vec<usize> = spec.rows.iter().map(|f| (f.col - c1) as usize).collect();
-    let mut row_items = String::new();
-    // 计算项：行标签在 sharedItems 里原本不存在，idx_of 会追加一个新项——它就是计算项
-    let mut calc_marks: std::collections::HashSet<(usize, usize)> = Default::default();
+    let mut row_items = String::with_capacity(grid.rows.len() * (row_depth * 12 + 8));
+    let mut calc_marks: HashSet<(usize, usize)> = Default::default();
     let base_len: Vec<usize> = shared.iter().map(|v| v.len()).collect();
     let mut prev_labels: Vec<String> = vec![String::new(); row_depth];
     for (ri, line) in grid.rows.iter().enumerate() {
@@ -148,18 +240,17 @@ pub fn build(
         }
         row_items.push_str("<i>");
         for d in 0..row_depth {
-            // 压缩形式下深层标签可能为空：沿用上一行同层标签，保证下标始终有效
             let label = if labels[d].is_empty() {
-                prev_labels[d].clone()
+                prev_labels[d].as_str()
             } else {
-                labels[d].clone()
+                labels[d].as_str()
             };
             let fi = row_fields[d];
-            let idx = idx_of(&mut shared[fi], &label);
+            let idx = idx_of(&mut shared[fi], &mut shared_map[fi], label);
             if idx >= base_len[fi] {
                 calc_marks.insert((fi, idx));
             }
-            row_items.push_str(&format!("<x v=\"{idx}\"/>"));
+            let _ = write!(row_items, "<x v=\"{idx}\"/>");
         }
         row_items.push_str("</i>");
         prev_labels = labels;
@@ -167,24 +258,19 @@ pub fn build(
 
     // ---------- 列轴 ----------
     let k = spec.values.len();
-    let mut col_items = String::new();
-    let mut col_count = 1usize;
     let mut extra = String::new();
     let n_cols = spec.cols.len();
     if n_cols == 0 {
         if k > 1 {
-            // Excel 的纯值轴：colFields 只有数据伪字段，每列一个 <i i="k">
             let mut items = String::new();
             for j in 0..k {
-                items.push_str(&format!("<i i=\"{j}\"><x v=\"{j}\"/></i>"));
+                let _ = write!(items, "<i i=\"{j}\"><x v=\"{j}\"/></i>");
             }
-            col_count = k;
-            col_items = items.clone();
-            extra.push_str(&format!(
+            let _ = write!(
+                extra,
                 "<colFields count=\"1\"><field x=\"-2\"/></colFields><colItems count=\"{k}\">{items}</colItems>"
-            ));
+            );
         } else {
-            col_items.push_str("<i/>");
             extra.push_str("<colItems count=\"1\"><i/></colItems>");
         }
     } else {
@@ -192,47 +278,46 @@ pub fn build(
         if grid.col_paths.is_empty() {
             bail!("多字段透视：列字段没有任何叶子标签");
         }
-        let paths = grid.col_paths.clone();
+        let paths = &grid.col_paths;
         let mut items: Vec<String> = Vec::new();
         let mut i = 0usize;
         while i < paths.len() {
-            let head = paths[i].first().cloned().unwrap_or_default();
+            let head = paths[i].first().map(String::as_str).unwrap_or("");
             let group_start = i;
-            while i < paths.len() && paths[i].first().cloned().unwrap_or_default() == head {
+            while i < paths.len() && paths[i].first().map(String::as_str).unwrap_or("") == head {
                 i += 1;
             }
             let group = &paths[group_start..i];
             for (j, path) in group.iter().enumerate() {
                 if j == 0 {
-                    // 组首：每层都写明确的 <x>；多值时最后补一个值轴的 <x/>（值 0）
                     let mut xs = String::new();
                     for d in 0..n_cols {
-                        let idx = idx_of(&mut shared[col_field_idx[d]], &path[d]);
-                        xs.push_str(&format!("<x v=\"{idx}\"/>"));
+                        let fi = col_field_idx[d];
+                        let idx = idx_of(&mut shared[fi], &mut shared_map[fi], &path[d]);
+                        let _ = write!(xs, "<x v=\"{idx}\"/>");
                     }
                     if k > 1 {
                         xs.push_str("<x/>");
                     }
                     items.push(format!("<i>{xs}</i>"));
                 } else {
-                    // 同组后续：r 重复前 n_cols-1 层，只有最后一层变
-                    let idx = idx_of(&mut shared[col_field_idx[n_cols - 1]], &path[n_cols - 1]);
+                    let fi = col_field_idx[n_cols - 1];
+                    let idx = idx_of(&mut shared[fi], &mut shared_map[fi], &path[n_cols - 1]);
                     let tail = if k > 1 { "<x/>" } else { "" };
                     items.push(format!("<i r=\"{}\"><x v=\"{idx}\"/>{}</i>", n_cols - 1, tail));
                 }
                 if k > 1 {
-                    // 同一列的其余值：r 重复全部列层，i="k" 标记第几个值
                     for v in 1..k {
                         items.push(format!("<i r=\"{n_cols}\" i=\"{v}\"><x v=\"{v}\"/></i>"));
                     }
                 }
             }
             if spec.layout.subtotals && n_cols >= 2 {
-                // 组小计：外层各级写实际下标，最后一级留空 <x/>；多值再按值展开
                 let mut xs = String::new();
                 for d in 0..n_cols - 1 {
-                    let idx = idx_of(&mut shared[col_field_idx[d]], &group[0][d]);
-                    xs.push_str(&format!("<x v=\"{idx}\"/>"));
+                    let fi = col_field_idx[d];
+                    let idx = idx_of(&mut shared[fi], &mut shared_map[fi], &group[0][d]);
+                    let _ = write!(xs, "<x v=\"{idx}\"/>");
                 }
                 xs.push_str("<x/>");
                 if k > 1 {
@@ -254,19 +339,20 @@ pub fn build(
         } else {
             items.push("<i t=\"grand\"><x/></i>".to_string());
         }
-        col_count = items.len();
-        col_items = items.join("");
+        let col_count = items.len();
+        let col_items = items.join("");
         let mut fields = String::new();
         for f in &col_field_idx {
-            fields.push_str(&format!("<field x=\"{f}\"/>"));
+            let _ = write!(fields, "<field x=\"{f}\"/>");
         }
         if k > 1 {
             fields.push_str("<field x=\"-2\"/>");
         }
-        extra.push_str(&format!(
+        let _ = write!(
+            extra,
             "<colFields count=\"{}\">{fields}</colFields><colItems count=\"{col_count}\">{col_items}</colItems>",
             n_cols + usize::from(k > 1)
-        ));
+        );
     }
 
     // ---------- 缓存字段与记录 ----------
@@ -274,53 +360,71 @@ pub fn build(
     for i in 0..n_fields {
         if numeric[i] {
             let (lo, hi) = bounds[i];
-            caches.push_str(&format!(
-                "<cacheField name=\"{}\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\"{}{}/></cacheField>",
-                esc(&names[i]),
-                lo.map(|v| format!(" minValue=\"{v}\"")).unwrap_or_default(),
-                hi.map(|v| format!(" maxValue=\"{v}\"")).unwrap_or_default()
-            ));
+            let _ = write!(
+                caches,
+                "<cacheField name=\"{}\" numFmtId=\"0\"><sharedItems containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\"",
+                esc(&names[i])
+            );
+            if let Some(v) = lo {
+                let _ = write!(caches, " minValue=\"{v}\"");
+            }
+            if let Some(v) = hi {
+                let _ = write!(caches, " maxValue=\"{v}\"");
+            }
+            caches.push_str("/></cacheField>");
         } else {
-            let items: String = shared[i]
-                .iter()
-                .enumerate()
-                .map(|(k, s)| {
-                    if calc_marks.contains(&(i, k)) {
-                        format!("<s v=\"{}\" f=\"1\"/>", esc(s))
-                    } else {
-                        format!("<s v=\"{}\"/>", esc(s))
-                    }
-                })
-                .collect();
-            caches.push_str(&format!(
-                "<cacheField name=\"{}\" numFmtId=\"0\"><sharedItems count=\"{}\">{items}</sharedItems></cacheField>",
+            let _ = write!(
+                caches,
+                "<cacheField name=\"{}\" numFmtId=\"0\"><sharedItems count=\"{}\">",
                 esc(&names[i]),
                 shared[i].len()
-            ));
+            );
+            for (k_idx, s) in shared[i].iter().enumerate() {
+                caches.push_str("<s v=\"");
+                push_esc(&mut caches, s);
+                if calc_marks.contains(&(i, k_idx)) {
+                    caches.push_str("\" f=\"1\"/>");
+                } else {
+                    caches.push_str("\"/>");
+                }
+            }
+            caches.push_str("</sharedItems></cacheField>");
         }
     }
-    let mut recs = String::new();
-    let mut n_records = 0usize;
+
+    let n_records = r2.saturating_sub(r1) as usize;
+    let mut recs = String::with_capacity(n_records.saturating_mul(n_fields * 12 + 8));
     for r in (r1 + 1)..=r2 {
-        n_records += 1;
         recs.push_str("<r>");
         for i in 0..n_fields {
             let col = c1 + i as u32;
-            let v = sheet
-                .get(r, col)
-                .map(|c| c.value.clone())
-                .unwrap_or(Value::Empty);
+            let v = sheet.value_ref(r, col);
             if numeric[i] {
                 match v {
-                    Value::Number(n) => recs.push_str(&format!("<n v=\"{n}\"/>")),
+                    Value::Number(n) => {
+                        let _ = write!(recs, "<n v=\"{n}\"/>");
+                    }
                     Value::Empty => recs.push_str("<m/>"),
-                    other => recs.push_str(&format!("<s v=\"{}\"/>", esc(&other.display()))),
+                    other => {
+                        recs.push_str("<s v=\"");
+                        push_esc(&mut recs, &other.display());
+                        recs.push_str("\"/>");
+                    }
                 }
             } else {
-                let key = v.display();
-                match shared[i].iter().position(|s| *s == key) {
-                    Some(idx) if !key.is_empty() => recs.push_str(&format!("<x v=\"{idx}\"/>")),
-                    _ => recs.push_str("<m/>"),
+                let idx_opt = match v {
+                    Value::Empty => None,
+                    Value::Text(t) if !t.is_empty() => shared_map[i].get(t.as_ref()).copied(),
+                    other => {
+                        let key = other.display();
+                        (!key.is_empty()).then(|| shared_map[i].get(&key).copied()).flatten()
+                    }
+                };
+                match idx_opt {
+                    Some(idx) => {
+                        let _ = write!(recs, "<x v=\"{idx}\"/>");
+                    }
+                    None => recs.push_str("<m/>"),
                 }
             }
         }
@@ -338,13 +442,13 @@ pub fn build(
     );
 
     // ---------- pivotFields ----------
-    let items_for = |field: usize, shared: &Vec<String>| -> String {
-        let mut out = String::new();
-        for k in 0..shared.len() {
-            if calc_marks.contains(&(field, k)) {
-                out.push_str(&format!("<item f=\"1\" x=\"{k}\"/>"));
+    let items_for = |field: usize, sh: &[String]| -> String {
+        let mut out = String::with_capacity(sh.len() * 16 + 20);
+        for k_idx in 0..sh.len() {
+            if calc_marks.contains(&(field, k_idx)) {
+                let _ = write!(out, "<item f=\"1\" x=\"{k_idx}\"/>");
             } else {
-                out.push_str(&format!("<item x=\"{k}\"/>"));
+                let _ = write!(out, "<item x=\"{k_idx}\"/>");
             }
         }
         out.push_str("<item t=\"default\"/>");
@@ -354,17 +458,19 @@ pub fn build(
     let mut pfields = String::new();
     for i in 0..n_fields {
         if row_fields.contains(&i) {
-            pfields.push_str(&format!(
+            let _ = write!(
+                pfields,
                 "<pivotField axis=\"axisRow\" compact=\"0\" outline=\"0\" showAll=\"0\"><items count=\"{}\">{}</items></pivotField>",
                 shared[i].len() + 1,
                 items_for(i, &shared[i])
-            ));
+            );
         } else if col_field_set.contains(&i) {
-            pfields.push_str(&format!(
+            let _ = write!(
+                pfields,
                 "<pivotField axis=\"axisCol\" compact=\"0\" outline=\"0\" showAll=\"0\"><items count=\"{}\">{}</items></pivotField>",
                 shared[i].len() + 1,
                 items_for(i, &shared[i])
-            ));
+            );
         } else if value_cols.contains(&(c1 + i as u32)) {
             pfields.push_str("<pivotField dataField=\"1\" compact=\"0\" outline=\"0\" showAll=\"0\"/>");
         } else {
@@ -374,7 +480,6 @@ pub fn build(
 
     // ---------- 表头/位置 ----------
     let n_head = if spec.cols.is_empty() { 1u32 } else { spec.cols.len() as u32 + 1 };
-    // 表头行数 = 列字段层数 + 1（值标签行）；多值时值轴再加一行
     let first_data_row = if spec.cols.is_empty() {
         1
     } else {
@@ -394,14 +499,12 @@ pub fn build(
     let data_fields: String = spec
         .values
         .iter()
-        .enumerate()
-        .map(|(vi, v)| {
+        .map(|v| {
             let label = v
                 .label
                 .clone()
-                .unwrap_or_else(|| format!("{}{}", agg_label(v.agg), names[(v.col - c1) as usize].clone()));
+                .unwrap_or_else(|| format!("{}{}", agg_label(v.agg), names[(v.col - c1) as usize]));
             let short = label.rsplit_once(':').map(|(_, t)| t.to_string()).unwrap_or(label);
-            // 非求和聚合必须写 subtotal，否则 Excel 一律当求和
             let sub = match v.agg {
                 Agg::Sum => "",
                 Agg::Count => " subtotal=\"count\"",
@@ -409,23 +512,19 @@ pub fn build(
                 Agg::Max => " subtotal=\"max\"",
                 Agg::Min => " subtotal=\"min\"",
             };
-            // 显示值方式：Excel 写 showDataAs + numFmtId=10（0.00%）
             let show = match v.show_as.xml() {
-                // 只有百分比类才写 numFmtId="10"，差/索引与 Excel 一致地不写
                 Some(x) if v.show_as.percent_format() => {
                     format!(" showDataAs=\"{x}\" numFmtId=\"10\"")
                 }
                 Some(x) => format!(" showDataAs=\"{x}\""),
                 None => String::new(),
             };
-            // 自定义基准：baseField = 该字段在 pivotFields 里的序号，
-            // baseItem = 该字段 sharedItems 里项的下标（Excel COM 样本确认，见 evidence/c12-4）
             let (bf, bi) = match &v.base {
                 Some((col, item)) => {
                     let idx = col.saturating_sub(c1) as usize;
-                    let pos = shared
+                    let pos = shared_map
                         .get(idx)
-                        .and_then(|sh| sh.iter().position(|s| s == item))
+                        .and_then(|m| m.get(item).copied())
                         .unwrap_or(0);
                     (idx.to_string(), pos.to_string())
                 }
@@ -450,7 +549,6 @@ pub fn build(
         grid.rows.len()
     );
 
-    // 界面里的「压缩形式」必须落到 XML，否则 Excel 打开按大纲重排
     if !spec.layout.tabular {
         table = table.replace(
             "outline=\"1\" outlineData=\"1\" compact=\"0\" compactData=\"0\"",
@@ -458,11 +556,6 @@ pub fn build(
         );
     }
 
-    // 自检：条数与索引自洽
-    let rec_count = records.matches("<r>").count();
-    if rec_count != n_records {
-        bail!("透视缓存记录数不一致：<r>={rec_count} recordCount={n_records}");
-    }
     Ok((cache, records, table))
 }
 

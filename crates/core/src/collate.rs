@@ -4,8 +4,41 @@
 //! 这里用 `LCMapStringEx(LOCALE_NAME / LCMAP_SORTKEY)` 生成可逐字节比较的排序键，
 //! 由 Windows 的语言排序表决定顺序。非 Windows 平台退化为码位序。
 
+use std::collections::HashMap;
+
+/// Per-pass deduplicating cache for `zh-CN` sort keys so repeated text values in a
+/// column invoke `LCMapStringEx` only once per distinct string.
+#[derive(Default)]
+pub struct SortKeyCache {
+    map: HashMap<String, Box<[u8]>>,
+}
+
+impl SortKeyCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(cap),
+        }
+    }
+
+    #[inline]
+    pub fn get_or_compute(&mut self, s: &str) -> &[u8] {
+        if !self.map.contains_key(s) {
+            let k = sort_key(s).into_boxed_slice();
+            self.map.insert(s.to_owned(), k);
+        }
+        &self.map[s]
+    }
+}
+
 /// 生成排序键；相同前缀的字符串，键的字节序与系统排序一致
 pub fn sort_key(s: &str) -> Vec<u8> {
+    if s.is_empty() {
+        return Vec::new();
+    }
     #[cfg(windows)]
     {
         if let Some(k) = win_sort_key(s) {
@@ -18,11 +51,53 @@ pub fn sort_key(s: &str) -> Vec<u8> {
 #[cfg(windows)]
 fn win_sort_key(s: &str) -> Option<Vec<u8>> {
     use windows_sys::Win32::Globalization::{LCMapStringEx, LCMAP_SORTKEY};
-    let wide: Vec<u16> = s.encode_utf16().collect();
-    let locale: Vec<u16> = "zh-CN\0".encode_utf16().collect();
+    const ZH_CN_LOCALE: [u16; 6] = [
+        b'z' as u16,
+        b'h' as u16,
+        b'-' as u16,
+        b'C' as u16,
+        b'N' as u16,
+        0,
+    ];
+
+    let mut stack_wide = [0u16; 64];
+    let heap_wide: Vec<u16>;
+    let wide: &[u16] = if s.len() <= 64 {
+        let mut len = 0usize;
+        for u in s.encode_utf16() {
+            stack_wide[len] = u;
+            len += 1;
+        }
+        &stack_wide[..len]
+    } else {
+        heap_wide = s.encode_utf16().collect();
+        &heap_wide
+    };
+    if wide.is_empty() {
+        return Some(Vec::new());
+    }
+
     unsafe {
+        // Fast single-syscall path using a 256-byte stack buffer (handles virtually all cell strings).
+        let mut stack_out = [0u8; 256];
+        let got = LCMapStringEx(
+            ZH_CN_LOCALE.as_ptr(),
+            LCMAP_SORTKEY,
+            wide.as_ptr(),
+            wide.len() as i32,
+            stack_out.as_mut_ptr() as *mut u16,
+            stack_out.len() as i32,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        if got > 0 && (got as usize) <= stack_out.len() {
+            return Some(stack_out[..got as usize].to_vec());
+        }
+
+        // Fallback for very long strings exceeding the 256-byte stack buffer.
         let need = LCMapStringEx(
-            locale.as_ptr(),
+            ZH_CN_LOCALE.as_ptr(),
             LCMAP_SORTKEY,
             wide.as_ptr(),
             wide.len() as i32,
@@ -36,8 +111,8 @@ fn win_sort_key(s: &str) -> Option<Vec<u8>> {
             return None;
         }
         let mut buf = vec![0u8; need as usize];
-        let got = LCMapStringEx(
-            locale.as_ptr(),
+        let got2 = LCMapStringEx(
+            ZH_CN_LOCALE.as_ptr(),
             LCMAP_SORTKEY,
             wide.as_ptr(),
             wide.len() as i32,
@@ -47,16 +122,19 @@ fn win_sort_key(s: &str) -> Option<Vec<u8>> {
             std::ptr::null(),
             0,
         );
-        if got <= 0 {
+        if got2 <= 0 {
             return None;
         }
-        buf.truncate(got as usize);
+        buf.truncate(got2 as usize);
         Some(buf)
     }
 }
 
 /// 中文按拼音序比较
 pub fn cmp_pinyin(a: &str, b: &str) -> std::cmp::Ordering {
+    if a == b {
+        return std::cmp::Ordering::Equal;
+    }
     sort_key(a).cmp(&sort_key(b))
 }
 

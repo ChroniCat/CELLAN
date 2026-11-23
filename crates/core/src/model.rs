@@ -555,6 +555,40 @@ impl CellJournal {
         let _ = self.remove(key);
     }
 
+    #[inline]
+    pub(crate) fn raw_pages(&self) -> &HashMap<(u32, u32), [u64; 4]> {
+        &self.pages
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        self.pages.capacity() * (std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<[u64; 4]>() + 1)
+    }
+
+    /// Page-wise bitwise OR union with `other` (zero per-cell decoding).
+    pub fn union_from(&mut self, other: &Self) {
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            *self = other.clone();
+            return;
+        }
+        if std::sync::Arc::ptr_eq(&self.pages, &other.pages) {
+            return;
+        }
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        for (&key, words) in other.pages.iter() {
+            let entry = pages.entry(key).or_default();
+            for w in 0..4 {
+                let added = words[w] & !entry[w];
+                if added != 0 {
+                    entry[w] |= added;
+                    self.len += added.count_ones() as usize;
+                }
+            }
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = CellRef> + '_ {
         self.pages.iter().flat_map(|(&(p, col), words)| {
             let base = p * crate::store::PAGE_ROWS;
@@ -981,6 +1015,23 @@ impl Sheet {
         self.style_edits.extend(self.styles.changed_keys(&old_styles));
         // Removing an old cell on disk also removes its format. Reapply any
         // explicitly styled blank which now occupies that same position.
+        self.style_edits.extend(self.cleared.iter().filter(|k| self.styles.get(k).is_some()));
+        if !self.style_edits.is_empty() {
+            self.styles_dirty = true;
+            self.display_style_revision = next_sheet_identity();
+        }
+        self.edited = true;
+    }
+
+    pub(crate) fn permute_cell_band(&mut self, rows: bool, lo: u32, hi: u32, map: impl Fn(u32) -> u32 + Copy) {
+        if lo >= hi {
+            return;
+        }
+        self.cells.permute_band(rows, lo, hi, map, &mut self.cleared);
+        let old_styles = self.styles.clone();
+        self.styles.permute_band(rows, lo, hi, map);
+        self.style_edits.extend(old_styles.changed_keys(&self.styles));
+        self.style_edits.extend(self.styles.changed_keys(&old_styles));
         self.style_edits.extend(self.cleared.iter().filter(|k| self.styles.get(k).is_some()));
         if !self.style_edits.is_empty() {
             self.styles_dirty = true;
@@ -1514,6 +1565,11 @@ impl Sheet {
     /// 存储层实际占用字节（调试用）
     pub fn allocated_bytes(&self) -> usize {
         self.cells.allocated_bytes()
+    }
+
+    /// 诊断用：返回 `(页数, 已分配非空列块数, 槽位总容量)`
+    pub fn store_stats(&self) -> (usize, usize, usize) {
+        self.cells.stats()
     }
 }
 

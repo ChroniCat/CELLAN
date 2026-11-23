@@ -377,7 +377,8 @@ impl CellStyles {
     }
 
     /// Re-key complete style pages when possible. Repack split pages in ascending
-    /// row order so a run of equal styles never shifts the packed vector per cell.
+    /// row order so a run of equal styles never shifts the packed vector per cell,
+    /// and preserve `StyleColumn::Uniform(sid)` pages via contiguous `insert_rect`.
     pub(crate) fn remap_axis(&mut self, rows: bool, at: u32, map: impl Fn(u32) -> Option<u32>) {
         if self
             .pages
@@ -393,7 +394,11 @@ impl CellStyles {
         for (&(p, c), page) in pages {
             let base = p * PAGE_ROWS;
             let same_page = if !rows {
-                map(c).map(|col| (p, col))
+                if c < at {
+                    Some((p, c))
+                } else {
+                    map(c).map(|col| (p, col))
+                }
             } else if base + PAGE_ROWS <= at {
                 Some((p, c))
             } else {
@@ -405,14 +410,111 @@ impl CellStyles {
                 Arc::make_mut(&mut out.pages).insert(key, page.clone());
                 out.len += page.len();
             } else if rows {
-                for (cref, &id) in page.iter_entries(p, c) {
-                    if let Some(target) = map(cref.row) {
-                        out.insert(CellRef::new(target, c), id);
+                if let StyleColumn::Uniform(sid) = page.as_ref() {
+                    let mut run: Option<(u32, u32)> = None;
+                    for off in 0..PAGE_ROWS {
+                        if let Some(target) = map(base + off) {
+                            match &mut run {
+                                Some((_, end)) if target == *end + 1 => *end = target,
+                                Some((start, end)) => {
+                                    out.insert_rect(*start, c, *end, c, *sid);
+                                    run = Some((target, target));
+                                }
+                                None => run = Some((target, target)),
+                            }
+                        }
+                    }
+                    if let Some((start, end)) = run {
+                        out.insert_rect(start, c, end, c, *sid);
+                    }
+                } else {
+                    for (cref, &id) in page.iter_entries(p, c) {
+                        if let Some(target) = map(cref.row) {
+                            out.insert(CellRef::new(target, c), id);
+                        }
                     }
                 }
             }
         }
         *self = out;
+    }
+
+    /// Permute coordinates strictly within `[lo..hi)` while leaving all pages outside `[lo..hi)` untouched.
+    pub(crate) fn permute_band(&mut self, rows: bool, lo: u32, hi: u32, map: impl Fn(u32) -> u32) {
+        if lo >= hi || self.is_empty() {
+            return;
+        }
+        let p_lo = lo / PAGE_ROWS;
+        let p_hi = (hi - 1) / PAGE_ROWS;
+        let affected: Vec<((u32, u32), Arc<StyleColumn>)> = self
+            .pages
+            .iter()
+            .filter(|&(&(p, c), _)| {
+                if rows {
+                    p >= p_lo && p <= p_hi
+                } else {
+                    c >= lo && c < hi
+                }
+            })
+            .map(|(&k, v)| (k, v.clone()))
+            .collect();
+        if affected.is_empty() {
+            return;
+        }
+        if !rows {
+            let pages = Arc::make_mut(&mut self.pages);
+            for ((p, c), _) in &affected {
+                if let Some(removed) = pages.remove(&(*p, *c)) {
+                    self.len -= removed.len();
+                }
+            }
+            for ((p, c), sc) in affected {
+                let nc = map(c);
+                self.len += sc.len();
+                pages.insert((p, nc), sc);
+            }
+            return;
+        }
+        let mut staged: Vec<(CellRef, u16)> = Vec::new();
+        for ((p, c), sc) in affected {
+            let base = p * PAGE_ROWS;
+            for (cref, &id) in sc.iter_entries(p, c) {
+                if cref.row >= lo && cref.row < hi {
+                    staged.push((CellRef::new(map(cref.row), c), id));
+                }
+            }
+            // Clear only `[lo..hi)` inside `(p, c)`.
+            let r1 = lo.max(base);
+            let r2 = (hi - 1).min(base + PAGE_ROWS - 1);
+            if r1 == base && r2 == base + PAGE_ROWS - 1 {
+                if let Some(removed) = Arc::make_mut(&mut self.pages).remove(&(p, c)) {
+                    self.len -= removed.len();
+                }
+            } else {
+                for r in r1..=r2 {
+                    self.remove(&CellRef::new(r, c));
+                }
+            }
+        }
+        for (cref, id) in staged {
+            self.insert(cref, id);
+        }
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        let mut seen = std::collections::HashSet::with_capacity(self.pages.len());
+        let mut bytes = self.pages.capacity()
+            * (std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<Arc<StyleColumn>>() + 1);
+        for sc in self.pages.values() {
+            let ptr = Arc::as_ptr(sc) as usize;
+            if seen.insert(ptr) {
+                bytes += std::mem::size_of::<StyleColumn>();
+                if let StyleColumn::Sparse { ids, .. } = sc.as_ref() {
+                    bytes += ids.capacity() * std::mem::size_of::<u16>();
+                }
+            }
+        }
+        bytes
     }
 
     pub fn keys(&self) -> impl Iterator<Item = CellRef> {
@@ -546,7 +648,7 @@ impl Page {
     }
 
     /// Iterate non-empty column indices in `[c1..=c2]` in ascending order via bit-scan.
-    fn iter_nonempty_cols(&self, c1: u32, c2: u32) -> impl Iterator<Item = u32> + '_ {
+    pub(crate) fn iter_nonempty_cols(&self, c1: u32, c2: u32) -> impl Iterator<Item = u32> + '_ {
         let total_words = self.col_nonempty.len();
         let start_w = (c1 / 64) as usize;
         let end_w = (c2 / 64) as usize;
@@ -629,7 +731,7 @@ impl Default for Store {
 
 impl Store {
     #[inline]
-    fn page(&self, pi: u32) -> Option<&Arc<Page>> {
+    pub(crate) fn page(&self, pi: u32) -> Option<&Arc<Page>> {
         if pi < DIRECT_PAGE_LIMIT {
             self.pages.get(pi as usize)?.as_ref()
         } else {
@@ -1507,8 +1609,8 @@ impl Store {
             })
     }
 
-    /// Rebuild the affected page band once. Column edits move whole COW slabs.
-    /// Row edits map each old row once per page, then move owned cells directly.
+    /// Rebuild only the affected page band once. Pages strictly before `at / PAGE_ROWS`
+    /// (for row edits) stay untouched in `O(1)`. Whole-page multiples move `Arc<Page>` directly.
     pub(crate) fn remap_axis(
         &mut self,
         rows: bool,
@@ -1516,28 +1618,56 @@ impl Store {
         map: impl Fn(u32) -> Option<u32>,
         cleared: &mut CellJournal,
     ) {
+        if self.len == 0 {
+            return;
+        }
         let mut occupied = Vec::<(u32, u32, [u64; 4])>::new();
-        let old_direct = std::mem::take(&mut self.pages);
-        let old_bits = std::mem::take(&mut self.page_bits);
-        let old_far = self.far_pages.take();
         self.bounds.take();
         self.formula_count.take();
         self.version.advance();
 
+        let first_pi = if rows { at / PAGE_ROWS } else { 0 };
         let mut source_pages: Vec<(u32, Arc<Page>)> = Vec::new();
-        for (w, mut bits) in old_bits.into_iter().enumerate() {
-            while bits != 0 {
-                let tz = bits.trailing_zeros();
-                bits &= bits - 1;
-                let pi = w as u32 * 64 + tz;
-                if let Some(Some(page)) = old_direct.get(pi as usize) {
-                    source_pages.push((pi, page.clone()));
+        if first_pi < DIRECT_PAGE_LIMIT && !self.page_bits.is_empty() {
+            let start_w = (first_pi / 64) as usize;
+            for w in start_w..self.page_bits.len() {
+                let mut bits = self.page_bits[w];
+                if w == start_w {
+                    let keep_mask = (1u64 << (first_pi % 64)) - 1;
+                    let take_bits = bits & !keep_mask;
+                    self.page_bits[w] = bits & keep_mask;
+                    bits = take_bits;
+                } else {
+                    self.page_bits[w] = 0;
+                }
+                while bits != 0 {
+                    let tz = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    let pi = w as u32 * 64 + tz;
+                    if let Some(slot) = self.pages.get_mut(pi as usize)
+                        && let Some(page) = slot.take()
+                    {
+                        source_pages.push((pi, page));
+                    }
                 }
             }
+            while self.page_bits.last() == Some(&0) {
+                self.page_bits.pop();
+            }
         }
-        drop(old_direct);
-        if let Some(far) = old_far {
-            source_pages.extend(*far);
+        if let Some(mut far) = self.far_pages.take() {
+            if first_pi <= DIRECT_PAGE_LIMIT {
+                source_pages.extend(*far);
+            } else {
+                let tail = far.split_off(&first_pi);
+                if !far.is_empty() {
+                    self.far_pages = Some(far);
+                }
+                source_pages.extend(tail);
+            }
+        }
+        if source_pages.is_empty() {
+            return;
         }
 
         let mut dirty_pages = Vec::<u32>::new();
@@ -1582,6 +1712,31 @@ impl Store {
                 continue;
             }
 
+            // Whole-page fast path when shifting by an exact multiple of PAGE_ROWS:
+            // reuse `Arc<Page>` directly without cloning `Page` or touching `Arc<Vec<Cell>>`.
+            if base >= at
+                && let Some(target0) = map(base)
+                && target0 % PAGE_ROWS == 0
+                && map(base + PAGE_ROWS - 1) == Some(target0 + PAGE_ROWS - 1)
+            {
+                let dest = target0 / PAGE_ROWS;
+                for c in page_arc.iter_nonempty_cols(0, u32::MAX) {
+                    if let Some(cells) = page_arc.cols.get(c as usize).and_then(Option::as_deref) {
+                        let mut bits = [0u64; 4];
+                        for (r, cell) in cells.iter().enumerate() {
+                            if !cell.is_blank() {
+                                bits[r / 64] |= 1u64 << (r % 64);
+                            }
+                        }
+                        occupied.push((pi, c, bits));
+                    }
+                }
+                if self.page(dest).is_none() {
+                    self.insert_page_arc(dest, page_arc);
+                    continue;
+                }
+            }
+
             let page = Arc::unwrap_or_clone(page_arc);
             let mut spans: Vec<(std::ops::Range<usize>, u32, u32)> = Vec::new();
             for r in 0..page.n_rows {
@@ -1595,6 +1750,11 @@ impl Store {
                     source.end += 1;
                 } else {
                     spans.push((r as usize..r as usize + 1, dest, offset));
+                }
+            }
+            for &(_, dest, _) in &spans {
+                if dirty_pages.last() != Some(&dest) {
+                    dirty_pages.push(dest);
                 }
             }
             let page_formula = page.may_have_formula;
@@ -1644,7 +1804,6 @@ impl Store {
                     dest_p.may_have_qualified_formula |= page_qual;
                     let dst = dest_p.ensure(*offset + src.len() as u32 - 1, col as u32);
                     src.swap_with_slice(&mut dst[*offset as usize..*offset as usize + src.len()]);
-                    dirty_pages.push(*dest);
                 }
                 self.len -= cells.iter().filter(|cell| !cell.is_blank()).count();
             }
@@ -1677,6 +1836,296 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Permute coordinates strictly within `[lo..hi)` (`map` is a bijection on `[lo..hi)`),
+    /// leaving all pages outside `[lo..hi)` completely untouched (`O(band_pages)`).
+    pub(crate) fn permute_band(
+        &mut self,
+        rows: bool,
+        lo: u32,
+        hi: u32,
+        map: impl Fn(u32) -> u32,
+        cleared: &mut CellJournal,
+    ) {
+        if lo >= hi || self.len == 0 {
+            return;
+        }
+        self.bounds.take();
+        self.formula_count.take();
+        self.version.advance();
+
+        if !rows {
+            let page_ids: Vec<u32> = self
+                .iter_pages()
+                .filter(|(_, p)| p.iter_nonempty_cols(lo, hi - 1).next().is_some())
+                .map(|(pi, _)| pi)
+                .collect();
+            let mut old_occupied: Vec<(u32, u32, [u64; 4])> = Vec::new();
+            for pi in page_ids {
+                let Some(page) = self.page_mut_existing(pi) else { continue };
+                let cols_in_band: Vec<u32> = page.iter_nonempty_cols(lo, hi - 1).collect();
+                let mut moved: Vec<(u32, Arc<Vec<Cell>>)> = Vec::with_capacity(cols_in_band.len());
+                for c in cols_in_band {
+                    if let Some(slab) = page.cols.get_mut(c as usize).and_then(Option::take) {
+                        page.clear_col_bit(c);
+                        let mut bits = [0u64; 4];
+                        for (r, cell) in slab.iter().enumerate() {
+                            if !cell.is_blank() {
+                                bits[r / 64] |= 1u64 << (r % 64);
+                            }
+                        }
+                        old_occupied.push((pi, c, bits));
+                        moved.push((map(c), slab));
+                    }
+                }
+                for (nc, slab) in moved {
+                    if page.cols.len() <= nc as usize {
+                        page.cols.resize(nc as usize + 1, None);
+                    }
+                    page.cols[nc as usize] = Some(slab);
+                    Page::set_col_bit(&mut page.col_nonempty, nc);
+                }
+                page.rebuild_masks();
+            }
+            cleared.retain(|k| k.col < lo || k.col >= hi || !self.contains(k.row, k.col));
+            for (pi, col, words) in old_occupied {
+                let dest = self
+                    .page(pi)
+                    .and_then(|p| p.cols.get(col as usize))
+                    .and_then(Option::as_deref);
+                for (w, mut bits) in words.into_iter().enumerate() {
+                    while bits != 0 {
+                        let r = w * 64 + bits.trailing_zeros() as usize;
+                        if dest.and_then(|cells| cells.get(r)).is_none_or(Cell::is_blank) {
+                            cleared.insert(CellRef::new(pi * PAGE_ROWS + r as u32, col));
+                        }
+                        bits &= bits - 1;
+                    }
+                }
+            }
+            return;
+        }
+
+        let p_lo = lo / PAGE_ROWS;
+        let p_hi = (hi - 1) / PAGE_ROWS;
+        let active_pages: Vec<u32> = self.iter_pages_in(p_lo, p_hi).map(|(pi, _)| pi).collect();
+        if active_pages.is_empty() {
+            return;
+        }
+        let mut extracted: Vec<(u32, u32, Cell)> = Vec::new();
+        let mut old_coords: Vec<CellRef> = Vec::new();
+        let mut dirty_pages: Vec<u32> = Vec::new();
+        let mut any_formula = false;
+        let mut any_qual = false;
+        for pi in active_pages {
+            let base = pi * PAGE_ROWS;
+            let r_start = lo.saturating_sub(base) as usize;
+            let r_end = ((hi - 1 - base) as usize + 1).min(PAGE_ROWS as usize);
+            let Some(page) = self.page_mut_existing(pi) else { continue };
+            any_formula |= page.may_have_formula;
+            any_qual |= page.may_have_qualified_formula;
+            let cols: Vec<u32> = page.iter_nonempty_cols(0, u32::MAX).collect();
+            let mut touched_page = false;
+            for c in cols {
+                let Some(slot) = page.cols.get_mut(c as usize).and_then(Option::as_mut) else {
+                    continue;
+                };
+                let end = r_end.min(slot.len());
+                if r_start >= end {
+                    continue;
+                }
+                if !slot[r_start..end].iter().any(|cell| !cell.is_blank()) {
+                    continue;
+                }
+                let vec = Arc::make_mut(slot);
+                for r_off in r_start..end {
+                    if !vec[r_off].is_blank() {
+                        let cell = std::mem::take(&mut vec[r_off]);
+                        let orig_r = base + r_off as u32;
+                        old_coords.push(CellRef::new(orig_r, c));
+                        extracted.push((map(orig_r), c, cell));
+                        touched_page = true;
+                    }
+                }
+            }
+            if touched_page {
+                dirty_pages.push(pi);
+            }
+        }
+        for (nr, c, cell) in extracted {
+            let (dpi, dro) = Self::split(nr);
+            let p = self.page_mut_or_insert(dpi);
+            p.may_have_formula |= any_formula || cell.formula.is_some();
+            p.may_have_qualified_formula |=
+                any_qual || cell.formula.as_deref().is_some_and(|f| f.contains('!'));
+            let col = p.ensure(dro, c);
+            col[dro as usize] = cell;
+            dirty_pages.push(dpi);
+        }
+        dirty_pages.sort_unstable();
+        dirty_pages.dedup();
+        for pi in dirty_pages {
+            if let Some(p) = self.page_mut_existing(pi) {
+                p.rebuild_masks();
+                if p.col_nonempty.is_empty() {
+                    self.remove_page(pi);
+                }
+            }
+        }
+        cleared.retain(|k| k.row < lo || k.row >= hi || !self.contains(k.row, k.col));
+        for k in old_coords {
+            if !self.contains(k.row, k.col) {
+                cleared.insert(k);
+            }
+        }
+    }
+
+    /// Check if `row` has any occupied cell in `[c1..=c2]` using page `row_mask` + `col_nonempty`.
+    #[inline]
+    pub(crate) fn row_has_any_in(&self, row: u32, c1: u32, c2: u32) -> bool {
+        if c1 > c2 || self.len == 0 {
+            return false;
+        }
+        let (pi, ro) = Self::split(row);
+        let Some(page) = self.page(pi) else {
+            return false;
+        };
+        if (page.row_mask[(ro / 64) as usize] & (1u64 << (ro % 64))) == 0 {
+            return false;
+        }
+        page.iter_nonempty_cols(c1, c2).any(|c| page.get(ro, c).is_some())
+    }
+
+    /// Check if `col` has any occupied cell in `[r1..=r2]` using `page_bits` + `has_col` bitmaps.
+    #[inline]
+    pub(crate) fn col_has_any_in(&self, col: u32, r1: u32, r2: u32) -> bool {
+        if r1 > r2 || self.len == 0 {
+            return false;
+        }
+        let p1 = r1 / PAGE_ROWS;
+        let p2 = r2 / PAGE_ROWS;
+        for (pi, page) in self.iter_pages_in(p1, p2) {
+            if !page.has_col(col) {
+                continue;
+            }
+            let Some(slab) = page.cols.get(col as usize).and_then(Option::as_deref) else {
+                continue;
+            };
+            let base = pi * PAGE_ROWS;
+            let lo = r1.saturating_sub(base) as usize;
+            let hi = ((r2 - base) as usize + 1).min(slab.len());
+            if lo < hi && slab[lo..hi].iter().any(|cell| !cell.is_blank()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Single-pass symmetric diff between `self` (`current`) and `other` (`target`):
+    /// skips identical `Arc<Page>` and `Arc<Vec<Cell>>` slabs in `O(1)`, marks cells vacated
+    /// in `other` into `cleared_in_other`, and appends all changed `(sheet_idx, r, c)` in page order.
+    pub(crate) fn diff_both_sides(
+        &self,
+        other: &Self,
+        sheet_idx: usize,
+        cleared_in_other: &mut CellJournal,
+        out: &mut Vec<(usize, u32, u32)>,
+    ) {
+        let mut check_pair = |pi: u32, pa: Option<&Arc<Page>>, pb: Option<&Arc<Page>>| {
+            match (pa, pb) {
+                (None, None) => return,
+                (Some(a), Some(b)) if Arc::ptr_eq(a, b) => return,
+                _ => {}
+            }
+            let base = pi * PAGE_ROWS;
+            let max_words = pa
+                .map_or(0, |p| p.col_nonempty.len())
+                .max(pb.map_or(0, |p| p.col_nonempty.len()));
+            for w in 0..max_words {
+                let mut bits = pa.and_then(|p| p.col_nonempty.get(w)).copied().unwrap_or(0)
+                    | pb.and_then(|p| p.col_nonempty.get(w)).copied().unwrap_or(0);
+                while bits != 0 {
+                    let tz = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    let col = w as u32 * 64 + tz;
+                    let ca = pa.and_then(|p| p.cols.get(col as usize)).and_then(Option::as_ref);
+                    let cb = pb.and_then(|p| p.cols.get(col as usize)).and_then(Option::as_ref);
+                    if let (Some(xa), Some(xb)) = (ca, cb)
+                        && Arc::ptr_eq(xa, xb)
+                    {
+                        continue;
+                    }
+                    let sa = ca.map(|v| v.as_slice()).unwrap_or_default();
+                    let sb = cb.map(|v| v.as_slice()).unwrap_or_default();
+                    let rows = sa.len().max(sb.len());
+                    for r in 0..rows {
+                        let a_cell = sa.get(r).filter(|c| !c.is_blank());
+                        let b_cell = sb.get(r).filter(|c| !c.is_blank());
+                        let differs = match (a_cell, b_cell) {
+                            (None, None) => false,
+                            (Some(_), None) => {
+                                cleared_in_other.insert(CellRef::new(base + r as u32, col));
+                                true
+                            }
+                            (None, Some(_)) => true,
+                            (Some(ac), Some(bc)) => {
+                                ac.formula != bc.formula || !ac.value.same_stored_value(&bc.value)
+                            }
+                        };
+                        if differs {
+                            out.push((sheet_idx, base + r as u32, col));
+                        }
+                    }
+                }
+            }
+        };
+
+        let max_direct_words = self.page_bits.len().max(other.page_bits.len());
+        for w in 0..max_direct_words {
+            let mut bits = self.page_bits.get(w).copied().unwrap_or(0)
+                | other.page_bits.get(w).copied().unwrap_or(0);
+            while bits != 0 {
+                let tz = bits.trailing_zeros();
+                bits &= bits - 1;
+                let pi = w as u32 * 64 + tz;
+                check_pair(pi, self.page(pi), other.page(pi));
+            }
+        }
+        if self.far_pages.is_some() || other.far_pages.is_some() {
+            let mut far_keys: Vec<u32> = self
+                .far_pages
+                .iter()
+                .flat_map(|m| m.keys().copied())
+                .chain(other.far_pages.iter().flat_map(|m| m.keys().copied()))
+                .collect();
+            far_keys.sort_unstable();
+            far_keys.dedup();
+            for pi in far_keys {
+                check_pair(pi, self.page(pi), other.page(pi));
+            }
+        }
+    }
+
+    pub fn unique_payload_bytes(&self) -> usize {
+        let mut seen_pages = std::collections::HashSet::new();
+        let mut seen_slabs = std::collections::HashSet::new();
+        let mut bytes = self.pages.capacity() * std::mem::size_of::<Option<Arc<Page>>>()
+            + self.page_bits.capacity() * std::mem::size_of::<u64>();
+        for (_, page) in self.iter_pages() {
+            if seen_pages.insert(Arc::as_ptr(page) as usize) {
+                bytes += std::mem::size_of::<Page>()
+                    + page.cols.capacity() * std::mem::size_of::<Option<Arc<Vec<Cell>>>>()
+                    + page.col_nonempty.capacity() * std::mem::size_of::<u64>();
+                for slab in page.cols.iter().flatten() {
+                    if seen_slabs.insert(Arc::as_ptr(slab) as usize) {
+                        bytes += std::mem::size_of::<Vec<Cell>>()
+                            + slab.capacity() * std::mem::size_of::<Cell>();
+                    }
+                }
+            }
+        }
+        bytes
     }
 
     fn invalidate_boundary(cache: &mut OnceLock<Option<(u32, u32, u32, u32)>>, r: u32, c: u32) {

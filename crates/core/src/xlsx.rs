@@ -3121,12 +3121,12 @@ fn save_plain_at(
     }
     for (si, spec, res, rect, label) in &wb.pivots_pending {
         let sheet = wb.sheets.get(*si).context("透视表所属工作表不存在")?;
-        crate::pivot_xml::attach_for_session(path, &sheet.name, spec, res, *rect, label, wb.pivot_session.token())
+        crate::pivot_xml::attach_for_session_wb(path, wb, &sheet.name, spec, res, *rect, label, wb.pivot_session.token())
             .context("透视表部件写入失败")?;
     }
     for (si, spec, grid, rect) in &wb.pivots_pending2 {
         let sheet = wb.sheets.get(*si).context("多字段透视所属工作表不存在")?;
-        crate::pivot_xml::attach2_for_session(path, &sheet.name, spec, grid, *rect, wb.pivot_session.token())
+        crate::pivot_xml::attach2_for_session_wb(path, wb, &sheet.name, spec, grid, *rect, wb.pivot_session.token())
             .context("多字段透视部件写入失败")?;
     }
     // C12.4 计算字段：紧跟在透视表部件之后写缓存定义

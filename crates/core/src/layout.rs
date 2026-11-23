@@ -326,6 +326,86 @@ impl HiddenIndices {
         self.refresh_meta();
     }
 
+    /// Shift all hidden intervals in `O(intervals)` time for a structural insert or delete.
+    pub fn shift_axis(&mut self, at: u32, n: u32, delete: bool) -> bool {
+        if n == 0 || self.intervals.is_empty() {
+            return false;
+        }
+        if self.intervals.last().is_some_and(|&(_, hi)| hi < at) {
+            return false;
+        }
+        let mut raw = Vec::with_capacity(self.intervals.len() + 1);
+        if delete {
+            let end_del = at.saturating_add(n);
+            for &(lo, hi) in self.intervals.iter() {
+                if hi < at {
+                    raw.push((lo, hi));
+                } else if lo >= end_del {
+                    raw.push((lo - n, hi - n));
+                } else {
+                    if lo < at {
+                        raw.push((lo, at - 1));
+                    }
+                    if hi >= end_del {
+                        raw.push((at, hi - n));
+                    }
+                }
+            }
+        } else {
+            for &(lo, hi) in self.intervals.iter() {
+                if hi < at {
+                    raw.push((lo, hi));
+                } else if lo >= at {
+                    raw.push((lo.saturating_add(n), hi.saturating_add(n)));
+                } else {
+                    raw.push((lo, at - 1));
+                    raw.push((at.saturating_add(n), hi.saturating_add(n)));
+                }
+            }
+        }
+        let (merged, _) = coalesce_sorted_intervals(raw);
+        if merged == *self.intervals {
+            return false;
+        }
+        self.intervals = Arc::new(merged);
+        self.refresh_meta();
+        true
+    }
+
+    /// Remap hidden intervals for multi-point non-deleting insertions (e.g. `MappedShift` subtotals)
+    /// in `O(intervals + insertions * log(span))` without expanding Million-row intervals.
+    pub fn remap_insertions(&mut self, map: impl Fn(u32) -> Option<u32>) -> bool {
+        if self.intervals.is_empty() {
+            return false;
+        }
+        fn split_interval(lo: u32, hi: u32, map: &impl Fn(u32) -> Option<u32>, out: &mut Vec<(u32, u32)>) {
+            match (map(lo), map(hi)) {
+                (Some(a), Some(b)) if b >= a && b - a == hi - lo => out.push((a, b)),
+                _ if lo == hi => {
+                    if let Some(a) = map(lo) {
+                        out.push((a, a));
+                    }
+                }
+                _ => {
+                    let mid = lo + (hi - lo) / 2;
+                    split_interval(lo, mid, map, out);
+                    split_interval(mid + 1, hi, map, out);
+                }
+            }
+        }
+        let mut raw = Vec::with_capacity(self.intervals.len());
+        for &(lo, hi) in self.intervals.iter() {
+            split_interval(lo, hi, &map, &mut raw);
+        }
+        let (merged, _) = coalesce_sorted_intervals(raw);
+        if merged == *self.intervals {
+            return false;
+        }
+        self.intervals = Arc::new(merged);
+        self.refresh_meta();
+        true
+    }
+
     pub fn retain(&mut self, mut f: impl FnMut(&u32) -> bool) {
         if self.is_empty() {
             return;

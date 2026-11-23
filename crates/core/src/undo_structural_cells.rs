@@ -128,53 +128,148 @@ fn same_mapped(source: &Cell, desired: &Cell, shift: &Shift) -> bool {
         }
 }
 
-fn input_digest(sheet: &Sheet, legacy: &HashMap<CellRef, Cell>) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    for (k, cell) in sheet.iter() {
-        if !sheet.spilled.contains(&k) && !legacy.contains_key(&k) {
-            hash_input(&mut hash, k, cell);
-        }
+type SlabDigestCache = HashMap<usize, Option<[u8; 32]>>;
+
+#[inline]
+fn flush_hash_buf(hash: &mut Sha256, buf: &mut [u8; 4096], pos: &mut usize) {
+    if *pos > 0 {
+        hash.update(&buf[..*pos]);
+        *pos = 0;
     }
-    hash.finalize().into()
 }
 
-// Use the same row-major sequence and typed fields when recording a snapshot and checking a fork.
-fn hash_input(hash: &mut Sha256, k: CellRef, cell: &Cell) {
-    hash.update(k.row.to_le_bytes());
-    hash.update(k.col.to_le_bytes());
+#[inline]
+fn push_hash_bytes(hash: &mut Sha256, buf: &mut [u8; 4096], pos: &mut usize, bytes: &[u8]) {
+    if bytes.len() >= buf.len() {
+        flush_hash_buf(hash, buf, pos);
+        hash.update(bytes);
+        return;
+    }
+    if *pos + bytes.len() > buf.len() {
+        flush_hash_buf(hash, buf, pos);
+    }
+    buf[*pos..*pos + bytes.len()].copy_from_slice(bytes);
+    *pos += bytes.len();
+}
+
+fn hash_slab_cell(hash: &mut Sha256, buf: &mut [u8; 4096], pos: &mut usize, r_off: u16, cell: &Cell) {
+    push_hash_bytes(hash, buf, pos, &r_off.to_le_bytes());
     if let Some(f) = cell.formula.as_deref() {
-        hash.update([0]);
-        hash.update((f.len() as u64).to_le_bytes());
-        hash.update(f.as_bytes());
+        push_hash_bytes(hash, buf, pos, &[0]);
+        push_hash_bytes(hash, buf, pos, &(f.len() as u64).to_le_bytes());
+        push_hash_bytes(hash, buf, pos, f.as_bytes());
     } else {
         match &cell.value {
             Value::Number(n) => {
-                hash.update([1]);
-                hash.update(n.to_bits().to_le_bytes());
+                push_hash_bytes(hash, buf, pos, &[1]);
+                push_hash_bytes(hash, buf, pos, &n.to_bits().to_le_bytes());
             }
             Value::Text(t) => {
-                hash.update([2]);
-                hash.update((t.len() as u64).to_le_bytes());
-                hash.update(t.as_bytes());
+                push_hash_bytes(hash, buf, pos, &[2]);
+                push_hash_bytes(hash, buf, pos, &(t.len() as u64).to_le_bytes());
+                push_hash_bytes(hash, buf, pos, t.as_bytes());
             }
-            Value::Bool(b) => hash.update([3, *b as u8]),
-            Value::Error(e) => hash.update([4, *e as u8]),
-            Value::Empty => hash.update([5]),
+            Value::Bool(b) => push_hash_bytes(hash, buf, pos, &[3, *b as u8]),
+            Value::Error(e) => push_hash_bytes(hash, buf, pos, &[4, *e as u8]),
+            Value::Empty => push_hash_bytes(hash, buf, pos, &[5]),
         }
     }
 }
 
+fn compute_slab_digest_unfiltered(slab: &[Cell]) -> Option<[u8; 32]> {
+    let mut hash = Sha256::new();
+    let mut buf = [0u8; 4096];
+    let mut pos = 0usize;
+    let mut any = false;
+    for (r_off, cell) in slab.iter().enumerate() {
+        if !cell.is_blank() {
+            any = true;
+            hash_slab_cell(&mut hash, &mut buf, &mut pos, r_off as u16, cell);
+        }
+    }
+    if !any {
+        return None;
+    }
+    flush_hash_buf(&mut hash, &mut buf, &mut pos);
+    Some(hash.finalize().into())
+}
+
+fn input_digest_with_cache(
+    sheet: &Sheet,
+    legacy: &HashMap<CellRef, Cell>,
+    mut cache: Option<&mut SlabDigestCache>,
+) -> [u8; 32] {
+    let mut excluded_slabs = std::collections::HashSet::new();
+    if !sheet.spilled.is_empty() || !legacy.is_empty() {
+        for k in sheet.spilled.iter().chain(legacy.keys()) {
+            excluded_slabs.insert((k.row / crate::store::PAGE_ROWS, k.col));
+        }
+    }
+    let mut top = Sha256::new();
+    let mut top_buf = [0u8; 4096];
+    let mut top_pos = 0usize;
+    for (pi, page) in sheet.cells().iter_pages() {
+        let base = pi * crate::store::PAGE_ROWS;
+        for col in page.iter_nonempty_cols(0, u32::MAX) {
+            let Some(slab_arc) = page.cols.get(col as usize).and_then(Option::as_ref) else {
+                continue;
+            };
+            let slab_digest = if excluded_slabs.contains(&(pi, col)) {
+                let mut h = Sha256::new();
+                let mut buf = [0u8; 4096];
+                let mut pos = 0usize;
+                let mut any = false;
+                for (r_off, cell) in slab_arc.iter().enumerate() {
+                    if !cell.is_blank() {
+                        let k = CellRef::new(base + r_off as u32, col);
+                        if !sheet.spilled.contains(&k) && !legacy.contains_key(&k) {
+                            any = true;
+                            hash_slab_cell(&mut h, &mut buf, &mut pos, r_off as u16, cell);
+                        }
+                    }
+                }
+                if any {
+                    flush_hash_buf(&mut h, &mut buf, &mut pos);
+                    Some(h.finalize().into())
+                } else {
+                    None
+                }
+            } else if let Some(c) = cache.as_deref_mut() {
+                let ptr = std::sync::Arc::as_ptr(slab_arc) as usize;
+                *c.entry(ptr)
+                    .or_insert_with(|| compute_slab_digest_unfiltered(slab_arc))
+            } else {
+                compute_slab_digest_unfiltered(slab_arc)
+            };
+            if let Some(digest) = slab_digest {
+                push_hash_bytes(&mut top, &mut top_buf, &mut top_pos, &pi.to_le_bytes());
+                push_hash_bytes(&mut top, &mut top_buf, &mut top_pos, &col.to_le_bytes());
+                push_hash_bytes(&mut top, &mut top_buf, &mut top_pos, &digest);
+            }
+        }
+    }
+    flush_hash_buf(&mut top, &mut top_buf, &mut top_pos);
+    top.finalize().into()
+}
+
+fn input_digest(sheet: &Sheet, legacy: &HashMap<CellRef, Cell>) -> [u8; 32] {
+    input_digest_with_cache(sheet, legacy, None)
+}
+
 impl CellHistory {
-    /// Record both directions together. Each sheet is visited once in row-major order:
-    /// digest, formula caches, non-invertible values and the opposite side's holes share the pass.
+    /// Record both directions together, sharing column-slab Merkle SHA-256 digests across
+    /// unchanged/shifted `Arc<Vec<Cell>>` slabs and skipping untouched `Arc::ptr_eq` pages in `O(1)`.
     pub(super) fn pair(
         before: &Sheet,
         after: &Sheet,
         forward: &Shift,
         backward: &Shift,
     ) -> (Self, Self) {
-        let (mut undo, redo_blanks) = Self::record_side(before, after, backward, forward);
-        let (mut redo, undo_blanks) = Self::record_side(after, before, forward, backward);
+        let mut slab_cache = SlabDigestCache::new();
+        let (mut undo, redo_blanks) =
+            Self::record_side(before, after, backward, forward, &mut slab_cache);
+        let (mut redo, undo_blanks) =
+            Self::record_side(after, before, forward, backward, &mut slab_cache);
         undo.exceptions
             .extend(undo_blanks.into_iter().map(|key| (key, Cell::default())));
         redo.exceptions
@@ -187,6 +282,7 @@ impl CellHistory {
         other: &Sheet,
         toward_desired: &Shift,
         toward_other: &Shift,
+        slab_cache: &mut SlabDigestCache,
     ) -> (Self, Vec<CellRef>) {
         let incoming = on_sheet(toward_desired, other);
         let inverse = Shift {
@@ -206,44 +302,146 @@ impl CellHistory {
                 );
             }
         }
+        let hash = input_digest_with_cache(desired, &legacy, Some(slab_cache));
+
+        let mut spilled_pages = std::collections::HashSet::new();
+        if !desired.spilled.is_empty() || !other.spilled.is_empty() {
+            for k in desired.spilled.iter().chain(other.spilled.iter()) {
+                spilled_pages.insert(k.row / crate::store::PAGE_ROWS);
+            }
+        }
+
+        let rows_axis = incoming.axis == Axis::Row
+            && toward_other.axis == Axis::Row
+            && incoming.translate.is_none()
+            && toward_other.translate.is_none()
+            && incoming.col_filter.is_none()
+            && toward_other.col_filter.is_none();
+        let unchanged_row_bound = if rows_axis {
+            incoming.at.min(toward_other.at)
+        } else {
+            0
+        };
+
         let mut exceptions = Vec::new();
         let mut clear_other = Vec::new();
         let mut formula_values = FormulaValues::default();
-        let mut formula_index = 0;
-        let mut hash = Sha256::new();
-        for (key, cell) in desired.iter() {
-            let spill = desired.spilled.contains(&key);
-            if !spill && !legacy.contains_key(&key) {
-                hash_input(&mut hash, key, cell);
+        let mut formula_index = 0usize;
+
+        for (pi, page) in desired.cells().iter_pages() {
+            let base = pi * crate::store::PAGE_ROWS;
+            // Fast O(1) skip for untouched prefix pages that share the exact `Arc<Page>` with `other`!
+            if base + crate::store::PAGE_ROWS <= unchanged_row_bound
+                && desired.cells().same_page(other.cells(), pi)
+                && !spilled_pages.contains(&pi)
+            {
+                if !page.may_have_formula {
+                    continue;
+                }
+                for w in 0..4usize {
+                    let mut bits = page.row_mask[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros();
+                        bits &= bits - 1;
+                        let ro = w as u32 * 64 + tz;
+                        let r_idx = ro as usize;
+                        for col in page.iter_nonempty_cols(0, u32::MAX) {
+                            let Some(cell) = page
+                                .cols
+                                .get(col as usize)
+                                .and_then(Option::as_ref)
+                                .and_then(|s| s.get(r_idx))
+                                .filter(|c| !c.is_blank())
+                            else {
+                                continue;
+                            };
+                            if let Some(f_desired) = cell.formula.as_deref() {
+                                formula_values.push(formula_index, &cell.value);
+                                formula_index += 1;
+                                // In a shared page, `prior == cell`; formula is invertible iff rewrite(f, incoming) == f.
+                                if crate::refs::rewrite(f_desired, &incoming) != f_desired {
+                                    exceptions.push((CellRef::new(base + ro, col), cell.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
             }
-            if cell.formula.is_some() {
-                formula_values.push(formula_index, &cell.value);
-                formula_index += 1;
-            }
-            let origin = map(key, &inverse);
-            let prior = origin.and_then(|pos| other.get(pos.row, pos.col));
-            let invertible = origin.is_some_and(|pos| !other.spilled.contains(&pos))
-                && prior.is_some_and(|c| same_mapped(c, cell, &incoming));
-            if spill || !invertible {
-                exceptions.push((key, cell.clone()));
-            }
-            // Composite operations (subtotals and partial cell shifts) can have different
-            // forward and reverse boundaries. Only reuse the lookup for the same coordinate.
-            if !spill && let Some(dest) = map(key, toward_other) {
-                let absent = if Some(dest) == origin {
-                    prior.is_none()
-                } else {
-                    !other.contains(dest.row, dest.col)
-                };
-                if absent {
-                    clear_other.push(dest);
+
+            let other_cells = other.cells();
+            let mut cached_other_page: Option<(u32, Option<&std::sync::Arc<crate::store::Page>>)> =
+                None;
+            let mut get_other = |r: u32, c: u32| -> Option<&Cell> {
+                let opi = r / crate::store::PAGE_ROWS;
+                let oro = (r % crate::store::PAGE_ROWS) as usize;
+                let opage = match cached_other_page {
+                    Some((p, page_ref)) if p == opi => page_ref,
+                    _ => {
+                        let p_ref = other_cells.page(opi);
+                        cached_other_page = Some((opi, p_ref));
+                        p_ref
+                    }
+                }?;
+                opage
+                    .cols
+                    .get(c as usize)?
+                    .as_ref()?
+                    .get(oro)
+                    .filter(|cell| !cell.is_blank())
+            };
+
+            for w in 0..4usize {
+                let mut bits = page.row_mask[w];
+                while bits != 0 {
+                    let tz = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    let ro = w as u32 * 64 + tz;
+                    let r_idx = ro as usize;
+                    let row = base + ro;
+                    for col in page.iter_nonempty_cols(0, u32::MAX) {
+                        let Some(cell) = page
+                            .cols
+                            .get(col as usize)
+                            .and_then(Option::as_ref)
+                            .and_then(|s| s.get(r_idx))
+                            .filter(|c| !c.is_blank())
+                        else {
+                            continue;
+                        };
+                        let key = CellRef::new(row, col);
+                        let spill =
+                            !desired.spilled.is_empty() && desired.spilled.contains(&key);
+                        if cell.formula.is_some() {
+                            formula_values.push(formula_index, &cell.value);
+                            formula_index += 1;
+                        }
+                        let origin = map(key, &inverse);
+                        let prior = origin.and_then(|pos| get_other(pos.row, pos.col));
+                        let invertible = origin
+                            .is_some_and(|pos| other.spilled.is_empty() || !other.spilled.contains(&pos))
+                            && prior.is_some_and(|c| same_mapped(c, cell, &incoming));
+                        if spill || !invertible {
+                            exceptions.push((key, cell.clone()));
+                        }
+                        if !spill && let Some(dest) = map(key, toward_other) {
+                            let absent = if Some(dest) == origin {
+                                prior.is_none()
+                            } else {
+                                get_other(dest.row, dest.col).is_none()
+                            };
+                            if absent {
+                                clear_other.push(dest);
+                            }
+                        }
+                    }
                 }
             }
         }
         (
             Self {
                 version: desired.cell_version().clone(),
-                hash: hash.finalize().into(),
+                hash,
                 legacy,
                 exceptions,
                 formula_values,
