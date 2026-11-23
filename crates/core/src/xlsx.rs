@@ -340,6 +340,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         zip_has_styles,
         zip_has_theme,
         zip_has_custom_props,
+        zip_has_sheet_rels,
     ) = if let Some(zip) = shared_zip.as_ref() {
         let (
             mut vba,
@@ -351,7 +352,8 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             mut styles,
             mut theme,
             mut custom_props,
-        ) = (false, false, false, false, false, false, false, false, false);
+            mut sheet_rels,
+        ) = (false, false, false, false, false, false, false, false, false, false);
         for name in zip.file_names() {
             if name == "xl/vbaProject.bin" {
                 vba = true;
@@ -361,6 +363,8 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 custom_props = true;
             } else if name.starts_with("xl/theme/") {
                 theme = true;
+            } else if name.contains("worksheets/_rels/") {
+                sheet_rels = true;
             } else if name.contains("externalLink") {
                 xlinks = true;
             } else if name.contains("drawing") {
@@ -373,9 +377,20 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 comments = true;
             }
         }
-        (vba, xlinks, drawing, table, chart, comments, styles, theme, custom_props)
+        (
+            vba,
+            xlinks,
+            drawing,
+            table,
+            chart,
+            comments,
+            styles,
+            theme,
+            custom_props,
+            sheet_rels,
+        )
     } else {
-        (false, false, false, false, false, false, false, false, false)
+        (false, false, false, false, false, false, false, false, false, false)
     };
     let sheets::WorkbookMetadata { xml: workbook_xml, targets, header } = shared_zip.as_mut()
         .map(sheets::workbook_metadata).transpose()
@@ -431,7 +446,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         } else {
             Vec::new()
         },
-        links: if is_ooxml && zip_has_xlinks {
+        links: if is_ooxml && (zip_has_xlinks || workbook_xml.contains("externalReference")) {
             crate::xlinks::read(path)
         } else {
             Vec::new()
@@ -479,8 +494,8 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 panic!("注入：旁路扫描线程 panic");
             }
             let out = (
-                if zip_has_drawing { crate::pic::load(&p) } else { Default::default() },
-                if zip_has_table { crate::table::load(&p) } else { Default::default() },
+                if zip_has_drawing || zip_has_sheet_rels { crate::pic::load(&p) } else { Default::default() },
+                if zip_has_table || zip_has_sheet_rels { crate::table::load(&p) } else { Default::default() },
             );
             let _ = side_tx.send(out);
         });
@@ -552,7 +567,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             &style_lookup,
             &dxfs,
             dxf_ext,
-            zip_has_drawing,
+            zip_has_drawing || zip_has_sheet_rels,
         );
         let (styles_back, ids_back) = style_lookup.into_inner();
         wb.styles = styles_back;
@@ -822,7 +837,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         eprintln!("[load] 总计 {:.2}s", t_all_load.elapsed().as_secs_f64());
     }
     // 图表：drawing 是 OOXML 结构，BIFF(.xls) 没有，别拿 zip 扫描器去读
-    let charts_res = if is_ooxml && zip_has_chart {
+    let charts_res = if is_ooxml && (zip_has_chart || zip_has_drawing || zip_has_sheet_rels) {
         crate::charts::load_charts_all_in(path, &wb.sheets, Some(&wb.styles), wb.date_system)
     } else {
         Ok(Default::default())
@@ -839,7 +854,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     }
 
     // 批注
-    if !is_ooxml || zip_has_comments {
+    if !is_ooxml || zip_has_comments || zip_has_sheet_rels {
         if let Ok(all) = crate::notes::load_notes(path) {
             for sheet in wb.sheets.iter_mut() {
                 if let Some(list) = all.get(&sheet.name) {
