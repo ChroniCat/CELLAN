@@ -349,9 +349,15 @@ fn clearing_a_spill_obstruction_recalculates_evaluated_and_loaded_anchors() {
         wb.sheets[0].remove(1, 0);
         assert_eq!(
             recalc_interactive_plan(&mut wb, &deps, &[(0, 1, 0)], true),
-            InteractiveRecalc::BackgroundFull
+            if cached {
+                InteractiveRecalc::Complete
+            } else {
+                InteractiveRecalc::BackgroundFull
+            }
         );
-        recalc_all_force(&mut wb);
+        if !cached {
+            recalc_all_force(&mut wb);
+        }
         assert_eq!(wb.sheets[0].value(2, 0), Value::Number(3.0));
     }
 }
@@ -667,7 +673,7 @@ fn range_bindings_and_array_values_share_materialized_storage() {
         assert_eq!(array.get(299,0),FValue::Number(299.0));
         results.push(array.data.clone());
     }
-    assert!(results[1..].iter().all(|r| std::rc::Rc::ptr_eq(&results[0],r)));
+    assert!(results[1..].iter().all(|r| std::sync::Arc::ptr_eq(&results[0],r)));
     assert_eq!(calc.range_reads,300);
 }
 

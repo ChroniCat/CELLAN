@@ -150,27 +150,80 @@ pub fn scan(path: &Path) -> HashMap<String, Vec<ArrayFml>> {
     out
 }
 
-/// 给锚点单元格的 `<f>` 补上 `t="array" ref="..."`
+/// 给锚点单元格的 `<f>` 补上 `t="array" ref="..."`（单遍线性扫描拼接，消除 O(K × XML_bytes) 搬移）
 pub fn apply_xml(xml: &str, arrays: &[ArrayFml]) -> String {
-    let mut out = xml.to_string();
+    if arrays.is_empty() {
+        return xml.to_string();
+    }
+    let mut targets: HashMap<String, String> = HashMap::with_capacity(arrays.len());
     for a in arrays {
-        let key = format!(" r=\"{}\"", a1_range((a.anchor.0, a.anchor.1, a.anchor.0, a.anchor.1)).split(':').next().unwrap_or("A1"));
-        let Some(cpos) = out.find(&key) else { continue };
-        // 往回找到这个单元格的 <c（注意 cpos 落在 " r=" 的空格上，不能用 "<c " 匹配）
-        let cstart = out[..cpos].rfind("<c").unwrap_or(cpos);
-        let Some(cend_rel) = out[cstart..].find("</c>") else { continue };
-        let cend = cstart + cend_rel;
-        let chunk = &out[cstart..cend];
-        let Some(fpos) = chunk.find("<f") else { continue };
-        let f_at = cstart + fpos;
-        let Some(fend_rel) = out[f_at..].find('>') else { continue };
-        let f_tag = &out[f_at..f_at + fend_rel];
-        if f_tag.contains("t=\"array\"") {
+        let addr = format!("{}{}", col_label(a.anchor.1), a.anchor.0 + 1);
+        targets.entry(addr).or_insert_with(|| a1_range(a.range));
+    }
+    let bytes = xml.as_bytes();
+    let mut out = String::with_capacity(xml.len() + targets.len() * 28);
+    let mut written = 0usize;
+    let mut pos = 0usize;
+    while pos + 4 < bytes.len() && !targets.is_empty() {
+        let Some(rel) = xml[pos..].find("<c") else {
+            break;
+        };
+        let cstart = pos + rel;
+        let next_b = bytes.get(cstart + 2).copied().unwrap_or(0);
+        if !matches!(next_b, b' ' | b'\t' | b'\r' | b'\n' | b'>') {
+            pos = cstart + 2;
             continue;
         }
-        let insert = format!(" t=\"array\" ref=\"{}\"", a1_range(a.range));
-        out.replace_range(f_at + 2..f_at + 2, &insert);
+        let Some(open_end_rel) = xml[cstart..].find('>') else {
+            break;
+        };
+        let open_end = cstart + open_end_rel;
+        if open_end > cstart && bytes[open_end - 1] == b'/' {
+            pos = open_end + 1;
+            continue;
+        }
+        let open_tag = &xml[cstart..open_end];
+        let addr = open_tag.find(" r=\"").and_then(|ri| {
+            let rest = &open_tag[ri + 4..];
+            let q = rest.find('"')?;
+            Some(&rest[..q])
+        });
+        if let Some(addr_str) = addr
+            && let Some(range_ref) = targets.get(addr_str)
+        {
+            let body_start = open_end + 1;
+            let Some(cend_rel) = xml[body_start..].find("</c>") else {
+                break;
+            };
+            let cend = body_start + cend_rel;
+            let chunk = &xml[body_start..cend];
+            if let Some(fpos) = chunk.find("<f") {
+                let f_at = body_start + fpos;
+                let after_f = bytes.get(f_at + 2).copied().unwrap_or(0);
+                if matches!(after_f, b'>' | b' ' | b'\t' | b'\r' | b'\n' | b'/')
+                    && let Some(fend_rel) = xml[f_at..cend].find('>')
+                {
+                    let f_tag = &xml[f_at..f_at + fend_rel];
+                    if !f_tag.contains("t=\"array\"") {
+                        out.push_str(&xml[written..f_at + 2]);
+                        out.push_str(" t=\"array\" ref=\"");
+                        out.push_str(range_ref);
+                        out.push('"');
+                        written = f_at + 2;
+                    }
+                    let key_owned = addr_str.to_string();
+                    targets.remove(&key_owned);
+                }
+            }
+            pos = cend + 4;
+            continue;
+        }
+        pos = open_end + 1;
     }
+    if written == 0 {
+        return xml.to_string();
+    }
+    out.push_str(&xml[written..]);
     out
 }
 

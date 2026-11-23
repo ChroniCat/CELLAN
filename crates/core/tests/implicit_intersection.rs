@@ -85,7 +85,7 @@ fn implicit_intersection_is_a_dependency_and_survives_save_reload() {
 
     let deps = deps::Deps::build(&wb);
     assert!(
-        !deps.refs.get(&(0, 1, 3)).unwrap_or(&Vec::new()).is_empty(),
+        deps.refs.get(&(0, 1, 3)).is_some_and(|r| !r.is_empty()),
         "@A1:A2 必须进入依赖图"
     );
     let affected = deps.closure(&[(0, 1, 0)]);

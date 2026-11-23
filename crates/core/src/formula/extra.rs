@@ -3,10 +3,49 @@
 
 use super::dist;
 use super::functions::{
-    arg, date_to_serial, first_numbers, flatten_values, int_arg, match_criteria, num, numbers,
-    opt_num, r, range_dims, range_get, serial_to_date, text,
+    arg, current_date_system, date_to_serial_in, first_numbers, flatten_values, int_arg,
+    match_criteria, num, numbers, opt_num, r, range_dims, range_get, serial_to_date_in, text,
 };
 use super::{Arg, ErrKind, FValue};
+use crate::model::DateSystem;
+use std::sync::{Arc, LazyLock, RwLock};
+
+type CompiledRegex = Result<Arc<regex::Regex>, ErrKind>;
+
+static REGEX_CACHE: LazyLock<RwLock<std::collections::HashMap<String, CompiledRegex>>> =
+    LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
+
+thread_local! {
+    static LAST_REGEX: std::cell::RefCell<Option<(String, CompiledRegex)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn cached_regex(pat: &str) -> CompiledRegex {
+    if pat.len() > 2048 {
+        return regex::Regex::new(pat).map(Arc::new).map_err(|_| ErrKind::Value);
+    }
+    LAST_REGEX.with(|slot| {
+        if let Some((last_pat, res)) = slot.borrow().as_ref()
+            && last_pat == pat
+        {
+            return res.clone();
+        }
+        if let Some(res) = REGEX_CACHE.read().unwrap().get(pat).cloned() {
+            *slot.borrow_mut() = Some((pat.to_owned(), res.clone()));
+            return res;
+        }
+        let compiled = regex::Regex::new(pat).map(Arc::new).map_err(|_| ErrKind::Value);
+        {
+            let mut map = REGEX_CACHE.write().unwrap();
+            if map.len() >= 256 {
+                map.clear();
+            }
+            map.insert(pat.to_owned(), compiled.clone());
+        }
+        *slot.borrow_mut() = Some((pat.to_owned(), compiled.clone()));
+        compiled
+    })
+}
 
 /// 双参数分布的统一入口：Excel 的 cumulative 是第三个参数
 fn cum(args: &[Arg], i: usize) -> Result<bool, ErrKind> {
@@ -28,6 +67,10 @@ fn check_p(p: f64) -> Result<f64, ErrKind> {
 }
 
 pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
+    call_extra_in(current_date_system(), name, args)
+}
+
+pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option<FValue> {
     let v = match name {
         // ============================ 统计分布
         "NORM.DIST" | "NORMDIST" => r(|| {
@@ -563,7 +606,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             if !(2..=36).contains(&radix) {
                 return Err(ErrKind::Num);
             }
-            Ok(FValue::Text(to_radix(n, radix as u32)))
+            Ok(FValue::Text(to_radix(n, radix as u32).into()))
         }),
         "DECIMAL" => r(|| {
             let s = text(args, 0)?;
@@ -916,7 +959,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             let s = text(args, 0)?;
             let d = text(args, 1)?;
             match s.find(&d) {
-                Some(i) => Ok(FValue::Text(s[..i].to_string())),
+                Some(i) => Ok(FValue::Text(s[..i].into())),
                 None => Err(ErrKind::Na),
             }
         }),
@@ -924,14 +967,14 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             let s = text(args, 0)?;
             let d = text(args, 1)?;
             match s.find(&d) {
-                Some(i) => Ok(FValue::Text(s[i + d.len()..].to_string())),
+                Some(i) => Ok(FValue::Text(s[i + d.len()..].into())),
                 None => Err(ErrKind::Na),
             }
         }),
         "UNICHAR" => r(|| {
             let n = int_arg(args, 0)?;
             let c = char::from_u32(n as u32).ok_or(ErrKind::Value)?;
-            Ok(FValue::Text(c.to_string()))
+            Ok(FValue::Text(c.to_string().into()))
         }),
         "UNICODE" => r(|| {
             let s = text(args, 0)?;
@@ -941,14 +984,14 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
         "ARRAYTOTEXT" | "VALUETOTEXT" => r(|| {
             let vals = flatten_values(args, 0);
             let parts: Vec<String> = vals.iter().map(|v| v.display()).collect();
-            Ok(FValue::Text(parts.join(",")))
+            Ok(FValue::Text(parts.join(",").into()))
         }),
         "ROMAN" => r(|| {
             let n = int_arg(args, 0)?;
             if !(0..4000).contains(&n) {
                 return Err(ErrKind::Value);
             }
-            Ok(FValue::Text(to_roman(n as usize)))
+            Ok(FValue::Text(to_roman(n as usize).into()))
         }),
         "ARABIC" => r(|| {
             let s = text(args, 0)?;
@@ -1077,7 +1120,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             let ys_t: Vec<f64> = if log_mode { ys.iter().map(|v| v.ln()).collect() } else { ys.clone() };
             let (m, b) = linfit(&xs, &ys_t)?;
             let targets = match args.get(2) {
-                Some(a) => a.values().iter().filter_map(|v| v.to_number().ok()).collect::<Vec<f64>>(),
+                Some(a) => a.slice().iter().filter_map(|v| v.to_number().ok()).collect::<Vec<f64>>(),
                 None => xs.clone(),
             };
             let out: Vec<FValue> = targets
@@ -1087,7 +1130,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
                     FValue::number(if log_mode { v.exp() } else { v })
                 })
                 .collect();
-            Ok(FValue::Array(std::rc::Rc::new(super::value::Array::new(1, out.len(), out))))
+            Ok(FValue::Array(Arc::new(super::value::Array::new(1, out.len(), out))))
         }),
         "LINEST" => r(|| {
             let y = first_numbers(args)?;
@@ -1096,7 +1139,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             });
             let (m, b) = linfit(&x, &y)?;
             let out = vec![FValue::number(m), FValue::number(b)];
-            Ok(FValue::Array(std::rc::Rc::new(super::value::Array::new(1, 2, out))))
+            Ok(FValue::Array(Arc::new(super::value::Array::new(1, 2, out))))
         }),
 
         // ============================ 百分位 / 排名补充
@@ -1354,13 +1397,13 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
                 .filter(|(_, c)| *c == top)
                 .map(|(x, _)| FValue::number(x))
                 .collect();
-            Ok(FValue::Array(std::rc::Rc::new(super::value::Array::new(1, vals.len(), vals))))
+            Ok(FValue::Array(Arc::new(super::value::Array::new(1, vals.len(), vals))))
         }),
         "AGGREGATE" => r(|| {
             let func = int_arg(args, 0)?;
             let opts = int_arg(args, 1)?;
             let ignore_errors = matches!(opts, 2 | 3 | 6 | 7);
-            let mut vals: Vec<FValue> = args.iter().skip(2).flat_map(|a| a.values()).collect();
+            let mut vals: Vec<FValue> = args.iter().skip(2).flat_map(|a| a.slice().iter().cloned()).collect();
             if ignore_errors {
                 vals.retain(|v| !v.is_error());
             }
@@ -1412,7 +1455,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
                 }
             }
             let vals: Vec<FValue> = counts.into_iter().map(FValue::number).collect();
-            Ok(FValue::Array(std::rc::Rc::new(super::value::Array::new(vals.len(), 1, vals))))
+            Ok(FValue::Array(Arc::new(super::value::Array::new(vals.len(), 1, vals))))
         }),
         "PROB" => r(|| {
             let xs = args.first().ok_or(ErrKind::Value)?.numbers()?;
@@ -1470,8 +1513,8 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
         "HYPERLINK" => r(|| {
             let _ = text(args, 0)?;
             match args.get(1) {
-                Some(a) => Ok(FValue::Text(a.first().to_text().unwrap_or_default())),
-                None => Ok(FValue::Text(text(args, 0)?)),
+                Some(a) => Ok(FValue::Text(a.first().to_text().unwrap_or_default().into())),
+                None => Ok(FValue::Text(text(args, 0)?.into())),
             }
         }),
         "ENCODEURL" => r(|| {
@@ -1485,36 +1528,36 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
                     _ => out.push_str(&format!("%{b:02X}")),
                 }
             }
-            Ok(FValue::Text(out.as_str().into()))
+            Ok(FValue::Text(out.into()))
         }),
         "TEXTSPLIT" => r(|| {
             let s = text(args, 0)?;
             let coldelim = text(args, 1)?;
             let rowdelim = args.get(2).map(|a| a.first().to_text()).transpose()?.unwrap_or_default();
-            let rows_src: Vec<String> = if rowdelim.is_empty() {
-                vec![s]
+            let rows_src: Vec<&str> = if rowdelim.is_empty() {
+                vec![s.as_str()]
             } else {
-                s.split(rowdelim.as_str()).map(|x| x.to_string()).collect()
+                s.split(rowdelim.as_str()).collect()
             };
             let grid: Vec<Vec<FValue>> = rows_src
                 .iter()
                 .map(|line| {
                     line.split(coldelim.as_str())
-                        .map(|cell| FValue::Text(cell.to_string()))
+                        .map(|cell| FValue::Text(cell.into()))
                         .collect()
                 })
                 .collect();
             let cols = grid.iter().map(|r| r.len()).max().unwrap_or(0);
-            let mut data = Vec::new();
+            let mut data = Vec::with_capacity(grid.len() * cols);
             for row in &grid {
                 for c in 0..cols {
                     data.push(row.get(c).cloned().unwrap_or(FValue::Empty));
                 }
             }
-            Ok(FValue::Array(std::rc::Rc::new(super::value::Array::new(grid.len(), cols, data))))
+            Ok(FValue::Array(Arc::new(super::value::Array::new(grid.len(), cols, data))))
         }),
         "WRAPROWS" | "WRAPCOLS" => r(|| {
-            let vals = args.first().ok_or(ErrKind::Value)?.values();
+            let vals = args.first().ok_or(ErrKind::Value)?.slice();
             let n = int_arg(args, 1)?;
             if n <= 0 {
                 return Err(ErrKind::Num);
@@ -1527,7 +1570,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
                 data.push(vals.get(i).cloned().unwrap_or_else(|| pad.clone()));
             }
             if name == "WRAPROWS" {
-                Ok(FValue::Array(std::rc::Rc::new(super::value::Array::new(rows, n, data))))
+                Ok(FValue::Array(Arc::new(super::value::Array::new(rows, n, data))))
             } else {
                 // 按列填充：先转置
                 let mut t = Vec::with_capacity(rows * n);
@@ -1536,7 +1579,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
                         t.push(data[c * rows + r].clone());
                     }
                 }
-                Ok(FValue::Array(std::rc::Rc::new(super::value::Array::new(n, rows, t))))
+                Ok(FValue::Array(Arc::new(super::value::Array::new(n, rows, t))))
             }
         }),
 
@@ -1649,12 +1692,12 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             let ln_y: Vec<f64> = ys.iter().map(|v| v.ln()).collect();
             let (m, b) = linfit(&xs, &ln_y)?;
             let out = vec![FValue::number(m.exp()), FValue::number(b.exp())];
-            Ok(FValue::Array(std::rc::Rc::new(super::value::Array::new(1, 2, out))))
+            Ok(FValue::Array(Arc::new(super::value::Array::new(1, 2, out))))
         }),
 
         // ============================ 矩阵
         "MDETERM" | "MINVERSE" => r(|| {
-            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
+            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
             if rows != cols || rows == 0 {
                 return Err(ErrKind::Value);
             }
@@ -1724,13 +1767,13 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
                 }
             }
             let out: Vec<FValue> = inv.iter().flatten().map(|v| FValue::number(*v)).collect();
-            Ok(FValue::Array(std::rc::Rc::new(super::value::Array::new(n, n, out))))
+            Ok(FValue::Array(Arc::new(super::value::Array::new(n, n, out))))
         }),
 
         // ============================ 文本补充
         "CLEAN" => r(|| {
             let s = text(args, 0)?;
-            Ok(FValue::Text(s.chars().filter(|c| (*c as u32) > 31).collect()))
+            Ok(FValue::Text(s.chars().filter(|c| (*c as u32) > 31).collect::<String>().into()))
         }),
         "ASC" => r(|| {
             let s = text(args, 0)?;
@@ -1805,8 +1848,8 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
 
         // ============================ 日期补充
         "DAYS360" => r(|| {
-            let (y1, m1, d1) = serial_to_date(num(args, 0)?).ok_or(ErrKind::Num)?;
-            let (y2, m2, d2) = serial_to_date(num(args, 1)?).ok_or(ErrKind::Num)?;
+            let (y1, m1, d1) = serial_to_date_in(sys, num(args, 0)?).ok_or(ErrKind::Num)?;
+            let (y2, m2, d2) = serial_to_date_in(sys, num(args, 1)?).ok_or(ErrKind::Num)?;
             let european = match args.get(2) {
                 Some(a) => a.first().to_bool().unwrap_or(false),
                 None => false,
@@ -1845,7 +1888,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             let c = parts[2].parse::<u32>().map_err(|_| ErrKind::Value)?;
             // 年份在最前 → ISO；否则按 月/日/年
             let (y, m, d): (i32, u32, u32) = if a > 31 { (a, b, c) } else { (c as i32, b, a as u32) };
-            date_to_serial(y, m, d).map(FValue::number).ok_or(ErrKind::Value)
+            date_to_serial_in(sys, y, m, d).map(FValue::number).ok_or(ErrKind::Value)
         }),
         "TIMEVALUE" => r(|| {
             let s = text(args, 0)?.trim().to_ascii_uppercase();
@@ -1869,8 +1912,8 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
         }),
         "ISOWEEKNUM" => r(|| {
             let serial = num(args, 0)?;
-            let (y, m, d) = serial_to_date(serial).ok_or(ErrKind::Num)?;
-            Ok(FValue::number(iso_week(y, m, d) as f64))
+            let (y, m, d) = serial_to_date_in(sys, serial).ok_or(ErrKind::Num)?;
+            Ok(FValue::number(iso_week(sys, y, m, d) as f64))
         }),
 
         // ============================ 债券：票息日推算
@@ -1881,15 +1924,12 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             if settlement >= maturity {
                 return Err(ErrKind::Num);
             }
-            let (d_prev, _, d_next, _) = coupon_frame(settlement, maturity, freq)?;
+            let (d_prev, _, d_next, n) = coupon_frame(sys, settlement, maturity, freq)?;
             let period = d_next - d_prev;
             match name {
                 "COUPPCD" => Ok(FValue::number(d_prev)),
                 "COUPNCD" => Ok(FValue::number(d_next)),
-                "COUPNUM" => {
-                    let (_, _, _, n) = coupon_frame(settlement, maturity, freq)?;
-                    Ok(FValue::number(n as f64))
-                }
+                "COUPNUM" => Ok(FValue::number(n as f64)),
                 "COUPDAYS" => Ok(FValue::number(period)),
                 "COUPDAYBS" => Ok(FValue::number(settlement - d_prev)),
                 _ => Ok(FValue::number(d_next - settlement)),
@@ -1904,7 +1944,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             if settlement >= maturity {
                 return Err(ErrKind::Num);
             }
-            let (s, m, e, n) = coupon_frame(settlement, maturity, freq)?;
+            let (s, m, e, n) = coupon_frame(sys, settlement, maturity, freq)?;
             let dsc = e - s;
             let a = s - m;
             let e_len = e - m;
@@ -2029,24 +2069,22 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
         "REGEXTEST" => r(|| {
             let text_ = text(args, 0)?;
             let pat = text(args, 1)?;
-            match regex::Regex::new(&pat) {
-                Ok(re) => Ok(FValue::Bool(re.is_match(&text_))),
-                Err(_) => Err(ErrKind::Value),
-            }
+            let re = cached_regex(&pat)?;
+            Ok(FValue::Bool(re.is_match(&text_)))
         }),
         "REGEXEXTRACT" => r(|| {
             let text_ = text(args, 0)?;
             let pat = text(args, 1)?;
-            let re = regex::Regex::new(&pat).map_err(|_| ErrKind::Value)?;
+            let re = cached_regex(&pat)?;
             match re.captures(&text_) {
                 Some(caps) => {
                     let groups: Vec<FValue> = (0..caps.len())
-                        .map(|i| FValue::Text(caps.get(i).map(|m| m.as_str().to_string()).unwrap_or_default()))
+                        .map(|i| FValue::Text(caps.get(i).map(|m| m.as_str()).unwrap_or_default().into()))
                         .collect();
                     if groups.len() == 1 {
                         Ok(groups.into_iter().next().unwrap())
                     } else {
-                        Ok(FValue::Array(std::rc::Rc::new(super::value::Array::new(
+                        Ok(FValue::Array(Arc::new(super::value::Array::new(
                             1,
                             groups.len(),
                             groups,
@@ -2060,9 +2098,9 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             let text_ = text(args, 0)?;
             let pat = text(args, 1)?;
             let rep = text(args, 2)?;
-            let re = regex::Regex::new(&pat).map_err(|_| ErrKind::Value)?;
+            let re = cached_regex(&pat)?;
             // Excel 用 $1 还是 \1：regex crate 用 $1，与 Excel 一致
-            Ok(FValue::Text(re.replace_all(&text_, rep.as_str()).to_string()))
+            Ok(FValue::Text(re.replace_all(&text_, rep.as_str()).as_ref().into()))
         }),
 
         // ============================ 国际化工作日
@@ -2180,7 +2218,7 @@ pub fn call_extra(name: &str, args: &[Arg]) -> Option<FValue> {
             let freq = if odd_first { int_arg(args, 7)? } else { int_arg(args, 6)? }.max(1);
             let anchor = num(args, 2)?.floor(); // issue 或 last_interest
 
-            let flows = odd_cashflows(settlement, maturity, anchor, rate, freq, odd_first)?;
+            let flows = odd_cashflows(sys, settlement, maturity, anchor, rate, freq, odd_first)?;
             if flows.items.is_empty() {
                 return Err(ErrKind::Num);
             }
@@ -2390,7 +2428,7 @@ fn base_convert(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
             n as u64
         };
         let s = to_radix(v, to_radix_n);
-        return Ok(if n == 0 { FValue::Text("0".into()) } else { FValue::Text(s) });
+        return Ok(if n == 0 { FValue::Text("0".into()) } else { FValue::Text(s.into()) });
     }
 
     let s = text(args, 0)?;
@@ -2414,7 +2452,7 @@ fn base_convert(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
     } else {
         signed as u64
     };
-    Ok(FValue::Text(to_radix(v, to_radix_n)))
+    Ok(FValue::Text(to_radix(v, to_radix_n).into()))
 }
 
 // ---------------------------------------------------------------- 复数
@@ -2482,7 +2520,7 @@ fn complex_fn(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
             if suffix == "j" {
                 s = s.replace('i', "j");
             }
-            return Ok(FValue::Text(s));
+            return Ok(FValue::Text(s.into()));
         }
         "IMREAL" => FValue::number(get(0)?.re),
         "IMAGINARY" => FValue::number(get(0)?.im),
@@ -2496,7 +2534,7 @@ fn complex_fn(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
         }
         "IMCONJUGATE" => {
             let c = get(0)?;
-            FValue::Text(fmt_complex(Complex { re: c.re, im: -c.im }))
+            FValue::Text(fmt_complex(Complex { re: c.re, im: -c.im }).into())
         }
         "IMADD" | "IMSUB" | "IMMUL" | "IMDIV" => {
             let a = get(0)?;
@@ -2519,7 +2557,7 @@ fn complex_fn(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
                     }
                 }
             };
-            FValue::Text(fmt_complex(r))
+            FValue::Text(fmt_complex(r).into())
         }
         "IMPOWER" => {
             let a = get(0)?;
@@ -2530,18 +2568,18 @@ fn complex_fn(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
             FValue::Text(fmt_complex(Complex {
                 re: rn * (n * theta).cos(),
                 im: rn * (n * theta).sin(),
-            }))
+            }).into())
         }
         "IMSQRT" => {
             let a = get(0)?;
             let r = a.re.hypot(a.im).sqrt();
             let theta = a.im.atan2(a.re) / 2.0;
-            FValue::Text(fmt_complex(Complex { re: r * theta.cos(), im: r * theta.sin() }))
+            FValue::Text(fmt_complex(Complex { re: r * theta.cos(), im: r * theta.sin() }).into())
         }
         "IMEXP" => {
             let a = get(0)?;
             let e = a.re.exp();
-            FValue::Text(fmt_complex(Complex { re: e * a.im.cos(), im: e * a.im.sin() }))
+            FValue::Text(fmt_complex(Complex { re: e * a.im.cos(), im: e * a.im.sin() }).into())
         }
         "IMLN" | "IMLOG10" | "IMLOG2" => {
             let a = get(0)?;
@@ -2557,7 +2595,7 @@ fn complex_fn(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
             FValue::Text(fmt_complex(Complex {
                 re: r.ln() / base,
                 im: a.im.atan2(a.re) / base,
-            }))
+            }).into())
         }
         "IMSIN" | "IMCOS" | "IMTAN" => {
             let a = get(0)?;
@@ -2577,7 +2615,7 @@ fn complex_fn(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
                     im: (s_im * c_re - s_re * c_im) / d,
                 }
             };
-            FValue::Text(fmt_complex(r))
+            FValue::Text(fmt_complex(r).into())
         }
         "IMSUM" | "IMPRODUCT" => {
             let mut acc = if name == "IMSUM" {
@@ -2586,7 +2624,7 @@ fn complex_fn(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
                 Complex { re: 1.0, im: 0.0 }
             };
             for a in args.iter() {
-                for v in a.values() {
+                for v in a.slice() {
                     let c = parse_complex(&v.display())?;
                     acc = if name == "IMSUM" {
                         Complex { re: acc.re + c.re, im: acc.im + c.im }
@@ -2598,7 +2636,7 @@ fn complex_fn(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
                     };
                 }
             }
-            FValue::Text(fmt_complex(acc))
+            FValue::Text(fmt_complex(acc).into())
         }
         _ => return Err(ErrKind::Name),
     };
@@ -2773,8 +2811,8 @@ fn binom_coef(n: usize, k: usize) -> f64 {
 }
 
 /// ISO 8601 周数
-fn iso_week(y: i32, m: u32, d: u32) -> u32 {
-    let serial = match date_to_serial(y, m, d) {
+fn iso_week(sys: DateSystem, y: i32, m: u32, d: u32) -> u32 {
+    let serial = match date_to_serial_in(sys, y, m, d) {
         Some(s) => s as i64,
         None => return 0,
     };
@@ -2782,26 +2820,26 @@ fn iso_week(y: i32, m: u32, d: u32) -> u32 {
     let weekday = (serial - 1).rem_euclid(7);
     let iso_wd = if weekday == 0 { 7 } else { weekday };
     let thursday = serial + (4 - iso_wd);
-    let (ty, _, _) = match serial_to_date(thursday as f64) {
+    let (ty, _, _) = match serial_to_date_in(sys, thursday as f64) {
         Some(v) => v,
         None => return 0,
     };
-    let jan1 = date_to_serial(ty, 1, 1).unwrap_or(0.0) as i64;
+    let jan1 = date_to_serial_in(sys, ty, 1, 1).unwrap_or(0.0) as i64;
     ((thursday - jan1) / 7 + 1) as u32
 }
 
 
 /// 票息框架：返回 (上一票息日, 结算日, 下一票息日, 剩余票息次数)
 /// 从到期日按 12/freq 个月往前推，票息日序列 d_j = maturity - j*step。
-fn coupon_frame(settlement: f64, maturity: f64, freq: i64) -> Result<(f64, f64, f64, usize), ErrKind> {
+fn coupon_frame(sys: DateSystem, settlement: f64, maturity: f64, freq: i64) -> Result<(f64, f64, f64, usize), ErrKind> {
     let step = (12 / freq.max(1)) as u32;
     if step == 0 {
         return Err(ErrKind::Num);
     }
-    let (my, mm, md) = serial_to_date(maturity).ok_or(ErrKind::Num)?;
+    let (my, mm, md) = serial_to_date_in(sys, maturity).ok_or(ErrKind::Num)?;
     let at = |j: u32| -> Option<f64> {
         let (y, m, d) = months_back(my, mm, md, j * step);
-        date_to_serial(y, m, d)
+        date_to_serial_in(sys, y, m, d)
     };
     // 票息日随时间递减，找到第一个不晚于结算日的下标 jp
     let mut jp: u32 = 0;
@@ -2864,6 +2902,7 @@ struct Cashflows {
 /// 生成现金流。odd_first=true 表示首个付息期不规则（issue → first_coupon），
 /// 否则表示最后一个付息期不规则（last_interest → maturity）。
 fn odd_cashflows(
+    sys: DateSystem,
     settlement: f64,
     maturity: f64,
     anchor: f64,
@@ -2875,14 +2914,14 @@ fn odd_cashflows(
     if step == 0 {
         return Err(ErrKind::Num);
     }
-    let (ay, am, ad) = serial_to_date(anchor).ok_or(ErrKind::Num)?;
+    let (ay, am, ad) = serial_to_date_in(sys, anchor).ok_or(ErrKind::Num)?;
     let date_at = |j: i64| -> Option<f64> {
         let (y, m, d) = if j >= 0 {
             months_fwd(ay, am, ad, (j as u32) * step)
         } else {
             months_back(ay, am, ad, ((-j) as u32) * step)
         };
-        date_to_serial(y, m, d)
+        date_to_serial_in(sys, y, m, d)
     };
 
     // 常规期长度（按锚点后一个周期算）

@@ -1,12 +1,12 @@
 //! 动态数组函数：返回二维数组，由 recalc 溢出到相邻单元格。
 
-use super::functions::{int_arg, num, opt_num, r};
+use super::functions::{int_arg, opt_num, r};
 use super::value::Array;
 use super::{Arg, ErrKind, FValue};
-use std::rc::Rc;
+use std::sync::Arc;
 
 fn arr(a: Array) -> FValue {
-    FValue::Array(Rc::new(a))
+    FValue::Array(Arc::new(a))
 }
 
 fn truthy(v: &FValue) -> bool {
@@ -54,7 +54,7 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
             Ok(arr(Array::new(rows, cols, data)))
         }),
         "TRANSPOSE" => r(|| {
-            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
+            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
             let mut out = vec![FValue::Empty; rows * cols];
             for r0 in 0..rows {
                 for c0 in 0..cols {
@@ -64,7 +64,7 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
             Ok(arr(Array::new(cols, rows, out)))
         }),
         "UNIQUE" => r(|| {
-            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
+            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
             let by_col = args.get(1).map(|a| a.first().to_bool().unwrap_or(false)).unwrap_or(false);
             let once = args.get(2).map(|a| a.first().to_bool().unwrap_or(false)).unwrap_or(false);
             let (lines, width) = if by_col { (cols, rows) } else { (rows, cols) };
@@ -102,7 +102,7 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
             }
         }),
         "SORT" => r(|| {
-            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
+            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
             let idx = match args.get(1) {
                 Some(_) => (int_arg(args, 1)?.max(1) as usize) - 1,
                 None => 0,
@@ -130,50 +130,51 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
                 });
                 let mut out = Vec::with_capacity(rows * cols);
                 for &row in &order {
-                    for j in 0..cols {
-                        out.push(data[row * cols + j].clone());
-                    }
+                    out.extend_from_slice(&data[row * cols..(row + 1) * cols]);
                 }
                 Ok(arr(Array::new(rows, cols, out)))
             }
         }),
         "SORTBY" => r(|| {
-            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
+            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
             let mut order: Vec<usize> = (0..rows).collect();
             // 依次按每个 key 排序（稳定排序，逆序从最后一组往前做）
-            let mut keys: Vec<(Vec<FValue>, bool)> = Vec::new();
+            let mut keys: Vec<(&[FValue], bool)> = Vec::new();
             let mut i = 1;
             while i < args.len() {
-                let by = args[i].values();
+                let by = args[i].slice();
                 let desc = args.get(i + 1).map(|a| a.first().to_number().unwrap_or(1.0) < 0.0).unwrap_or(false);
                 keys.push((by, desc));
                 i += 2;
             }
             for (by, desc) in keys.iter().rev() {
                 order.sort_by(|&a, &b| {
-                    let va = by.get(a).cloned().unwrap_or(FValue::Empty);
-                    let vb = by.get(b).cloned().unwrap_or(FValue::Empty);
-                    let cmp = sort_key_cmp(&va, &vb);
+                    let va = by.get(a).unwrap_or(&FValue::Empty);
+                    let vb = by.get(b).unwrap_or(&FValue::Empty);
+                    let cmp = sort_key_cmp(va, vb);
                     if *desc { cmp.reverse() } else { cmp }
                 });
             }
             let mut out = Vec::with_capacity(rows * cols);
             for &row in &order {
-                for j in 0..cols {
-                    out.push(data[row * cols + j].clone());
-                }
+                out.extend_from_slice(&data[row * cols..(row + 1) * cols]);
             }
             Ok(arr(Array::new(rows, cols, out)))
         }),
         "FILTER" => r(|| {
-            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
+            let first_arg = args.first().ok_or(ErrKind::Value)?;
+            let (rows, cols, data) = first_arg.grid_slice();
             // 条件按**形状**判方向，不能按元素个数：2×2 数据配 1×2 条件，
             // 个数也等于 2，若按长度猜就会错当成「按行」。
-            let (ir, ic, include) = args.get(1).ok_or(ErrKind::Value)?.grid();
+            let (ir, ic, include) = args.get(1).ok_or(ErrKind::Value)?.grid_slice();
             if ir == 1 && ic == 1 {
                 // 标量条件：TRUE 返回整块，FALSE 走 if_empty
                 if include.first().map(truthy).unwrap_or(false) {
-                    return Ok(arr(Array::new(rows, cols, data)));
+                    return match first_arg {
+                        Arg::Range { values, .. } => Ok(arr(Array::from_shared(rows, cols, values.clone()))),
+                        Arg::Val(FValue::Array(a)) => Ok(FValue::Array(a.clone())),
+                        _ => Ok(arr(Array::new(rows, cols, data.into_owned()))),
+                    };
                 }
                 if let Some(f) = args.get(2) {
                     return Ok(f.first());
@@ -186,8 +187,6 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
             if !by_row && !by_col {
                 return Err(ErrKind::Value);
             }
-            let mut out = Vec::new();
-            let mut n = 0usize;
             if by_col {
                 let mut keep = Vec::new();
                 for c in 0..cols {
@@ -201,12 +200,13 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
                     }
                     return Err(ErrKind::Value);
                 }
+                let n = keep.len();
+                let mut out = Vec::with_capacity(rows * n);
                 for i in 0..rows {
                     for &c in &keep {
                         out.push(data[i * cols + c].clone());
                     }
                 }
-                n = keep.len();
                 Ok(arr(Array::new(rows, n, out)))
             } else {
                 let mut keep = Vec::new();
@@ -221,17 +221,16 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
                     }
                     return Err(ErrKind::Value);
                 }
+                let n = keep.len();
+                let mut out = Vec::with_capacity(n * cols);
                 for &i in &keep {
-                    for j in 0..cols {
-                        out.push(data[i * cols + j].clone());
-                    }
+                    out.extend_from_slice(&data[i * cols..(i + 1) * cols]);
                 }
-                n = keep.len();
                 Ok(arr(Array::new(n, cols, out)))
             }
         }),
         "TAKE" | "DROP" => r(|| {
-            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
+            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
             let n_rows = if args.len() > 1 { int_arg(args, 1)? } else { 0 };
             let n_cols = if args.len() > 2 { int_arg(args, 2)? } else { 0 };
             let pick = |n: i64, total: usize| -> (usize, usize) {
@@ -254,102 +253,106 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
                 return Err(ErrKind::Value);
             }
             let mut out = Vec::with_capacity(rs * cs);
-            for i in r0..r1 {
-                for j in c0..c1 {
-                    out.push(data[i * cols + j].clone());
+            if c0 == 0 && c1 == cols {
+                out.extend_from_slice(&data[r0 * cols..r1 * cols]);
+            } else {
+                for i in r0..r1 {
+                    out.extend_from_slice(&data[i * cols + c0..i * cols + c1]);
                 }
             }
             Ok(arr(Array::new(rs, cs, out)))
         }),
         "HSTACK" => r(|| {
-            let grids: Vec<(usize, usize, Vec<FValue>)> = args.iter().map(|a| a.grid()).collect();
+            let grids: Vec<_> = args.iter().map(|a| a.grid_slice()).collect();
             let rows = grids.iter().map(|g| g.0).max().unwrap_or(0);
             let cols: usize = grids.iter().map(|g| g.1).sum();
             let mut out = vec![FValue::Error(ErrKind::Na); rows * cols];
             let mut c_off = 0;
             for (gr, gc, gd) in &grids {
                 for i in 0..*gr {
-                    for j in 0..*gc {
-                        out[i * cols + c_off + j] = gd[i * gc + j].clone();
-                    }
+                    out[i * cols + c_off..i * cols + c_off + *gc]
+                        .clone_from_slice(&gd[i * gc..(i + 1) * gc]);
                 }
                 c_off += gc;
             }
             Ok(arr(Array::new(rows, cols, out)))
         }),
         "VSTACK" => r(|| {
-            let grids: Vec<(usize, usize, Vec<FValue>)> = args.iter().map(|a| a.grid()).collect();
+            let grids: Vec<_> = args.iter().map(|a| a.grid_slice()).collect();
             let cols = grids.iter().map(|g| g.1).max().unwrap_or(0);
             let rows: usize = grids.iter().map(|g| g.0).sum();
             let mut out = vec![FValue::Error(ErrKind::Na); rows * cols];
             let mut r_off = 0;
             for (gr, gc, gd) in &grids {
                 for i in 0..*gr {
-                    for j in 0..*gc {
-                        out[(r_off + i) * cols + j] = gd[i * gc + j].clone();
-                    }
+                    out[(r_off + i) * cols..(r_off + i) * cols + *gc]
+                        .clone_from_slice(&gd[i * gc..(i + 1) * gc]);
                 }
                 r_off += gr;
             }
             Ok(arr(Array::new(rows, cols, out)))
         }),
         "CHOOSECOLS" | "CHOOSEROWS" => r(|| {
-            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
+            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
             let mut idx: Vec<i64> = Vec::new();
             for a in args.iter().skip(1) {
-                for v in a.values() {
+                for v in a.slice() {
                     if let Ok(n) = v.to_number() {
                         idx.push(n as i64);
                     }
                 }
             }
             if name == "CHOOSECOLS" {
-                let mut out = Vec::new();
+                let mut cols_checked = Vec::with_capacity(idx.len());
+                for &k in &idx {
+                    let c = if k < 0 { cols as i64 + k } else { k - 1 };
+                    if c < 0 || c >= cols as i64 {
+                        return Err(ErrKind::Value);
+                    }
+                    cols_checked.push(c as usize);
+                }
+                let mut out = Vec::with_capacity(rows * cols_checked.len());
                 for i in 0..rows {
-                    for &k in &idx {
-                        let c = if k < 0 { cols as i64 + k } else { k - 1 };
-                        if c < 0 || c >= cols as i64 {
-                            return Err(ErrKind::Value);
-                        }
-                        out.push(data[i * cols + c as usize].clone());
+                    let base = i * cols;
+                    for &c in &cols_checked {
+                        out.push(data[base + c].clone());
                     }
                 }
-                Ok(arr(Array::new(rows, idx.len(), out)))
+                Ok(arr(Array::new(rows, cols_checked.len(), out)))
             } else {
-                let mut out = Vec::new();
+                let mut out = Vec::with_capacity(idx.len() * cols);
                 for &k in &idx {
                     let rr = if k < 0 { rows as i64 + k } else { k - 1 };
                     if rr < 0 || rr >= rows as i64 {
                         return Err(ErrKind::Value);
                     }
-                    for j in 0..cols {
-                        out.push(data[rr as usize * cols + j].clone());
-                    }
+                    let start = rr as usize * cols;
+                    out.extend_from_slice(&data[start..start + cols]);
                 }
                 Ok(arr(Array::new(idx.len(), cols, out)))
             }
         }),
         "TOROW" | "TOCOL" => r(|| {
-            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
-            let vals: Vec<FValue> = if name == "TOCOL" {
+            let first_arg = args.first().ok_or(ErrKind::Value)?;
+            let (rows, cols, data) = first_arg.grid_slice();
+            if name == "TOCOL" {
                 let mut v = Vec::with_capacity(rows * cols);
                 for c in 0..cols {
                     for r0 in 0..rows {
                         v.push(data[r0 * cols + c].clone());
                     }
                 }
-                v
+                Ok(arr(Array::new(rows * cols, 1, v)))
             } else {
-                data.clone()
-            };
-            if name == "TOCOL" {
-                Ok(arr(Array::new(rows * cols, 1, vals)))
-            } else {
-                Ok(arr(Array::new(1, rows * cols, vals)))
+                match first_arg {
+                    Arg::Range { values, .. } => Ok(arr(Array::from_shared(1, rows * cols, values.clone()))),
+                    Arg::Val(FValue::Array(a)) => Ok(arr(Array::from_shared(1, rows * cols, a.data.clone()))),
+                    _ => Ok(arr(Array::new(1, rows * cols, data.into_owned()))),
+                }
             }
         }),
         "EXPAND" => r(|| {
-            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid();
+            let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
             let new_rows = int_arg(args, 1)?.max(rows as i64) as usize;
             let new_cols = match args.get(2) {
                 Some(_) => int_arg(args, 2)?.max(cols as i64) as usize,
@@ -358,25 +361,30 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
             let pad = args.get(3).map(|a| a.first()).unwrap_or(FValue::Error(ErrKind::Na));
             let mut out = vec![pad; new_rows * new_cols];
             for i in 0..rows {
-                for j in 0..cols {
-                    out[i * new_cols + j] = data[i * cols + j].clone();
-                }
+                out[i * new_cols..i * new_cols + cols]
+                    .clone_from_slice(&data[i * cols..(i + 1) * cols]);
             }
             Ok(arr(Array::new(new_rows, new_cols, out)))
         }),
         "MMULT" => r(|| {
-            let (r1, c1, d1) = args.first().ok_or(ErrKind::Value)?.grid();
-            let (r2, c2, d2) = args.get(1).ok_or(ErrKind::Value)?.grid();
+            let (r1, c1, d1) = args.first().ok_or(ErrKind::Value)?.grid_slice();
+            let (r2, c2, d2) = args.get(1).ok_or(ErrKind::Value)?.grid_slice();
             if c1 != r2 {
                 return Err(ErrKind::Value);
             }
+            let n1: Vec<f64> = d1.iter().map(|v| v.to_number().unwrap_or(0.0)).collect();
+            let mut n2_t = vec![0.0; c2 * r2];
+            for r in 0..r2 {
+                for c in 0..c2 {
+                    n2_t[c * r2 + r] = d2[r * c2 + c].to_number().unwrap_or(0.0);
+                }
+            }
             let mut out = Vec::with_capacity(r1 * c2);
             for i in 0..r1 {
+                let row = &n1[i * c1..(i + 1) * c1];
                 for j in 0..c2 {
-                    let mut s = 0.0;
-                    for k in 0..c1 {
-                        s += d1[i * c1 + k].to_number().unwrap_or(0.0) * d2[k * c2 + j].to_number().unwrap_or(0.0);
-                    }
+                    let col = &n2_t[j * c1..(j + 1) * c1];
+                    let s: f64 = row.iter().zip(col).map(|(a, b)| a * b).sum();
                     out.push(FValue::number(s));
                 }
             }
