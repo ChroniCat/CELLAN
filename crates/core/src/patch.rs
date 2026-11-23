@@ -3347,7 +3347,11 @@ pub fn read_calc_manual(path: &Path) -> bool {
     if f.read_to_string(&mut xml).is_err() {
         return false;
     }
-    let mut r = Reader::from_str(&xml);
+    calc_manual_xml(&xml)
+}
+
+pub(crate) fn calc_manual_xml(xml: &str) -> bool {
+    let mut r = Reader::from_str(xml);
     loop {
         match r.read_event() {
             Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == "calcPr" => {

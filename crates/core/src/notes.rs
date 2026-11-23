@@ -1,5 +1,8 @@
 //! 单元格批注：同时支持 `.xlsx`（传统 `comments*.xml` + 新版 Excel `threadedComments`）与 `.xls`（BIFF8 `OBJ`+`TXO`+`NOTE`）。
 
+mod edits;
+pub(crate) use edits::edited_parts;
+
 use anyhow::Result;
 use quick_xml::events::Event;
 use quick_xml::Reader;

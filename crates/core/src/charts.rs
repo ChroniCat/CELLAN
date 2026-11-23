@@ -117,12 +117,14 @@ pub struct Chart {
 
 /// 解析某张表的图表
 pub fn load_charts(path: &Path, sheet_name: &str) -> Result<Vec<Chart>> {
-    let dbg = std::env::var("SC_CHART_DBG").is_ok();
     let targets = crate::patch::sheet_targets(path)?;
-    let Some(sheet_path) = targets.get(sheet_name) else { if dbg { eprintln!("[chart] 没有工作表路径") } return Ok(Vec::new()) };
-    let file = std::fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
+    let Some(sheet_path) = targets.get(sheet_name) else { return Ok(Vec::new()); };
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    load_charts_for_part(&mut zip, sheet_path)
+}
 
+fn load_charts_for_part(zip: &mut zip::ZipArchive<std::fs::File>, sheet_path: &str) -> Result<Vec<Chart>> {
+    let dbg = std::env::var("SC_CHART_DBG").is_ok();
     // sheet 的 rels：drawing 关系
     let rels_path = match sheet_path.rsplit_once('/') {
         Some((dir, base)) => format!("{dir}/_rels/{base}.rels"),
@@ -295,28 +297,21 @@ pub fn load_charts_all_in(
     sys: crate::model::DateSystem,
 ) -> Result<std::collections::HashMap<u32, Vec<Chart>>> {
     let targets = crate::patch::sheet_targets(path)?;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
     let mut out = std::collections::HashMap::new();
-    for (idx, (name, _)) in sorted_targets(&targets).into_iter().enumerate() {
-        // 每张表都要读；读失败要带表名往上抛，不能 `if let Ok` 悄悄跳过
-        // （drawing 指向缺失的 chart XML 时，图表就是真丢了）
-        let mut list = load_charts(path, &name)
+    for (idx, sheet) in sheets.iter().enumerate() {
+        let name = &sheet.name;
+        let Some(part) = targets.get(name) else { continue };
+        let mut list = load_charts_for_part(&mut zip, part)
             .map_err(|e| anyhow::anyhow!("读取工作表 {name} 的图表失败：{e:#}"))?;
-        if let Some(sh) = sheets.get(idx) {
-            for ch in list.iter_mut() {
-                resolve_series_in(ch, sh, styles, sys);
-            }
+        for chart in &mut list {
+            resolve_series_in(chart, sheet, styles, sys);
         }
         if !list.is_empty() {
             out.insert(idx as u32, list);
         }
     }
     Ok(out)
-}
-
-fn sorted_targets(m: &std::collections::HashMap<String, String>) -> Vec<(String, String)> {
-    let mut v: Vec<(String, String)> = m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    v.sort_by(|a, b| a.1.cmp(&b.1));
-    v
 }
 
 fn normalize(base: &str, target: &str) -> String {

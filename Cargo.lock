@@ -204,6 +204,7 @@ dependencies = [
  "sheetcore",
  "ttf-parser",
  "windows-sys 0.61.2",
+ "winit",
 ]
 
 [[package]]

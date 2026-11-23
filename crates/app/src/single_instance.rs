@@ -105,10 +105,12 @@ pub fn claim_with_port(
                                 (already_open || st.accept_new_tab, st.wake_ctx.clone())
                             })
                             .unwrap_or((false, None));
+                        // The GUI receiver may have been dropped while an old
+                        // clipboard owner finishes in the background.
+                        let accept = accept && tx.send(path).is_ok();
                         let _ = writeln!(writer, "{}", if accept { "yes" } else { "no" });
                         let _ = writer.flush();
                         if accept {
-                            let _ = tx.send(path);
                             if let Some(ctx) = wake {
                                 ctx.request_repaint();
                             }
@@ -215,6 +217,18 @@ mod tests {
     fn reserve_loopback_port() -> u16 {
         let sock = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
         sock.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn handoff_declines_when_gui_closed_and_clipboard_is_finishing() {
+        let port = reserve_loopback_port();
+        let state = InstanceState { accept_new_tab: true, ..Default::default() };
+        let Role::Primary(rx) = claim_with_port(port, None, Arc::new(Mutex::new(state))) else {
+            panic!("expected the primary instance");
+        };
+        drop(rx);
+        let second = claim_with_port(port, Some(PathBuf::from("second.xlsx")), Default::default());
+        assert!(matches!(second, Role::Standalone));
     }
 
     #[test]

@@ -712,6 +712,7 @@ impl SheetApp {
         let rect = self.sel_rect();
         let (w, h, rgba) = self.render_range_to_rgba(self.sheet_idx, rect);
         let png = encode_rgba_png(w, h, &rgba);
+        self.retire_previous_clipboard();
         self.clip_pic = Some((w, h, png));
         self.clip = None;
         self.clip_stamp = None;
@@ -763,6 +764,7 @@ impl SheetApp {
         }
         let tsv = format!("{}\n", lines.join("\n"));
         ctx.copy_text(tsv.clone());
+        self.retire_previous_clipboard();
         #[cfg(not(test))]
         if let Ok(mut cb) = arboard::Clipboard::new() {
             let _ = cb.set_text(tsv.clone());

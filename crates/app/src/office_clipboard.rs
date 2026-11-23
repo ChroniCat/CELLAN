@@ -8,6 +8,7 @@
 //! 直接调 Win32：项目里没有 windows crate，也不该为了几十行 API 引一整套。
 
 pub mod delayed;
+pub mod shortcut;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -692,8 +693,29 @@ fn alloc_global(bytes: &[u8]) -> *mut c_void {
 /// arboard 只能写 HTML/文本，没有 XMLSS flavor；Excel 粘 HTML 时公式会退化成值，
 /// 所以这里直接走 Win32，三种格式同一时刻落到剪贴板上。
 pub fn write_office_clipboard(xmlss: &str, html: &str, text: &str) -> bool {
-    // GUI tests keep all clipboard I/O within the harness.
     if cfg!(test) { return false; }
+    write_office_clipboard_native(xmlss, html, text)
+}
+
+fn write_office_clipboard_native(xmlss: &str, html: &str, text: &str) -> bool {
+    use windows_sys::Win32::UI::{Input::KeyboardAndMouse::GetActiveWindow, WindowsAndMessaging::*};
+    // EmptyClipboard with a null opener leaves no owner for SetClipboardData.
+    // Background copies (including private-desktop tests) use a message-only
+    // window for the duration of the write.
+    struct TemporaryWindow(*mut c_void);
+    impl Drop for TemporaryWindow {
+        fn drop(&mut self) {
+            if !self.0.is_null() { unsafe { DestroyWindow(self.0); } }
+        }
+    }
+    let mut temporary = TemporaryWindow(std::ptr::null_mut());
+    let mut window = unsafe { GetActiveWindow() };
+    if window.is_null() {
+        window = unsafe { CreateWindowExW(0, wide("STATIC").as_ptr(), std::ptr::null(), 0,
+            0, 0, 0, 0, HWND_MESSAGE, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) };
+        if window.is_null() { return false; }
+        temporary.0 = window;
+    }
     let mut xmlss_bytes = xmlss.as_bytes().to_vec();
     xmlss_bytes.push(0);
     let mut text_utf16: Vec<u8> = Vec::with_capacity(text.len() * 2 + 2);
@@ -714,7 +736,7 @@ pub fn write_office_clipboard(xmlss: &str, html: &str, text: &str) -> bool {
         // 别的进程/本进程的 arboard 实例可能正开着剪贴板：重试几次再放弃。
         let mut opened = false;
         for _ in 0..8 {
-            if OpenClipboard(std::ptr::null_mut()) != 0 {
+            if OpenClipboard(window) != 0 {
                 opened = true;
                 break;
             }
@@ -726,7 +748,7 @@ pub fn write_office_clipboard(xmlss: &str, html: &str, text: &str) -> bool {
             }
             return false;
         }
-        EmptyClipboard();
+        if EmptyClipboard() == 0 { CloseClipboard(); return false; }
         let mut ok = true;
         let mut put = |fmt: u32, bytes: &[u8]| {
             let h = alloc_global(bytes);

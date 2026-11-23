@@ -183,6 +183,27 @@ fn deferred_clipboard_cut_requires_unchanged_source_and_current_owner() {
 }
 
 #[test]
+fn clipboard_small_and_filtered_copy_retire_the_previous_delayed_owner() {
+    let _env = crate::test_env::TestEnv::new("clipboard-replace-delayed");
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.sel = (0, 0);
+    app.sel_end = (1024, 0);
+    app.clip_copy(false, &ctx);
+    assert!(app.clipboard_owner.is_some());
+    app.sel_end = app.sel;
+    app.clip_copy(false, &ctx);
+    assert!(app.clipboard_owner.is_none());
+    app.sel_end = (1024, 0);
+    app.clip_copy(false, &ctx);
+    assert!(app.clipboard_owner.is_some());
+    app.wb.sheets[0].hidden_rows.insert(0);
+    app.clip_copy(false, &ctx);
+    assert!(app.clipboard_owner.is_none());
+    assert_eq!(app.clip.as_ref().unwrap().source_rows.as_ref().unwrap().len(), 1024);
+}
+
+#[test]
 fn deferred_clipboard_rejects_cutting_three_entire_columns_without_truncating() {
     let _env = crate::test_env::TestEnv::new("deferred-clipboard-column-limit");
     let mut app = app();

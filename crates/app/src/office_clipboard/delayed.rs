@@ -2,6 +2,11 @@
 use super::{alloc_global, cf_html, wide};
 use std::cell::RefCell;
 use std::ptr::null_mut;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU8, Ordering},
+};
+use std::thread::JoinHandle;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::{DataExchange::*, LibraryLoader::GetModuleHandleW},
@@ -164,6 +169,34 @@ impl Selection {
 
 thread_local! { static SELECTION: RefCell<Option<Selection>> = const { RefCell::new(None) }; }
 
+// The owner thread can be asked to retire after egui publishes a replacement,
+// or to persist pending formats after the application window has gone away.
+const PUBLISHED: u8 = 0;
+const AFTER_REPLACEMENT: u8 = 1;
+const FINISH: u8 = 2;
+
+unsafe fn persist_formats(hwnd: HWND) -> bool {
+    unsafe {
+        if GetClipboardOwner() != hwnd {
+            return true;
+        }
+        if OpenClipboard(hwnd) == 0 {
+            return false;
+        }
+        let done = GetClipboardOwner() != hwnd
+            || SELECTION.with_borrow_mut(|state| {
+                state.as_mut().is_none_or(|s| {
+                    for format in s.pending.clone() {
+                        s.render(format);
+                    }
+                    s.pending.is_empty()
+                })
+            });
+        CloseClipboard();
+        done
+    }
+}
+
 unsafe extern "system" fn messages(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -173,20 +206,12 @@ unsafe extern "system" fn messages(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
             }),
             WM_RENDERALLFORMATS => {
-                if OpenClipboard(hwnd) != 0 {
-                    if GetClipboardOwner() == hwnd {
-                        SELECTION.with_borrow_mut(|data| {
-                            if let Some(s) = data {
-                                for f in s.pending.clone() {
-                                    s.render(f);
-                                }
-                            }
-                        });
-                    }
-                    CloseClipboard();
-                }
+                persist_formats(hwnd);
             }
-            WM_DESTROYCLIPBOARD => SELECTION.with_borrow_mut(|s| *s = None),
+            WM_DESTROYCLIPBOARD => {
+                SELECTION.with_borrow_mut(|s| *s = None);
+                PostMessageW(hwnd, WM_NULL, 0, 0);
+            }
             WM_DESTROY => PostQuitMessage(0),
             _ => return DefWindowProcW(hwnd, msg, wp, lp),
         }
@@ -194,9 +219,39 @@ unsafe extern "system" fn messages(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
+struct Worker {
+    window: usize,
+    request: Arc<AtomicU8>,
+    thread: JoinHandle<()>,
+}
+
+impl Worker {
+    fn request(&self, mode: u8) {
+        self.request.store(mode, Ordering::Release);
+        // WM_NULL is harmless even if a completed worker's HWND has been reused.
+        unsafe {
+            PostMessageW(self.window as HWND, WM_NULL, 0, 0);
+        }
+    }
+}
+
+static RETIRING: Mutex<Vec<Worker>> = Mutex::new(Vec::new());
+
+/// Called after run_native returns and has destroyed the GUI and dropped its
+/// document locks. Keep the owning process alive until Win32 owns the bytes.
+pub fn finish_after_gui_exit() {
+    let retiring = std::mem::take(&mut *RETIRING.lock().unwrap_or_else(|e| e.into_inner()));
+    for worker in &retiring {
+        worker.request(FINISH);
+    }
+    for worker in retiring {
+        let _ = worker.thread.join();
+    }
+}
+
 pub struct Owner {
     window: usize,
-    thread: Option<std::thread::JoinHandle<()>>,
+    worker: Option<Worker>,
 }
 
 impl Owner {
@@ -218,7 +273,7 @@ impl Owner {
             crate::clear_test_clipboard();
             Some(Self {
                 window: crate::TEST_CLIP_GEN.with(|seq| seq.get()),
-                thread: None,
+                worker: None,
             })
         }
         #[cfg(not(test))]
@@ -227,6 +282,8 @@ impl Owner {
 
     fn publish_native(range: std::sync::Arc<Range>) -> Option<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let request = Arc::new(AtomicU8::new(PUBLISHED));
+        let mode = request.clone();
         let thread = std::thread::spawn(move || unsafe {
             let sh = range.book.sheet(0);
             // The XMLSS table preserves the complete dimensions and sparse row indices
@@ -295,24 +352,49 @@ impl Owner {
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
                 DispatchMessageW(&msg);
+                match mode.load(Ordering::Acquire) {
+                    AFTER_REPLACEMENT if GetClipboardOwner() != hwnd => {
+                        DestroyWindow(hwnd);
+                    }
+                    FINISH => {
+                        if persist_formats(hwnd) {
+                            DestroyWindow(hwnd);
+                        } else {
+                            SetTimer(hwnd, 1, 100, None);
+                        }
+                    }
+                    _ => {}
+                }
             }
         });
         let window = rx.recv().ok()?;
         Some(Self {
             window,
-            thread: Some(thread),
+            worker: Some(Worker {
+                window,
+                thread,
+                request,
+            }),
         })
+    }
+
+    fn retire(&mut self, mode: u8) {
+        if let Some(worker) = self.worker.take() {
+            worker.request(mode);
+            let mut retiring = RETIRING.lock().unwrap_or_else(|e| e.into_inner());
+            retiring.retain(|worker| !worker.thread.is_finished());
+            retiring.push(worker);
+        }
+    }
+
+    pub fn after_replacement(mut self) {
+        self.retire(AFTER_REPLACEMENT);
     }
 }
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        if let Some(thread) = self.thread.take() {
-            unsafe {
-                PostMessageW(self.window as HWND, WM_CLOSE, 0, 0);
-            }
-            let _ = thread.join();
-        }
+        self.retire(FINISH);
     }
 }
 
@@ -389,9 +471,47 @@ mod tests {
             String::from_utf8(super::super::read_format(format).expect("clipboard data")).unwrap()
         };
         assert!(read(xml_format).contains(">快照</Data>"));
-        drop(owner); // WM_RENDERALLFORMATS must preserve the still-pending HTML after exit.
+        // Hold the clipboard open as an external reader. Releasing the GUI's
+        // owner must return before that reader releases its lock; process exit
+        // still waits until every outstanding format has been persisted.
+        assert_ne!(unsafe { OpenClipboard(null_mut()) }, 0);
+        let (released, receipt) = std::sync::mpsc::channel();
+        let exit = std::thread::spawn(move || {
+            drop(owner);
+            let _ = released.send(());
+            finish_after_gui_exit();
+        });
+        let returned = receipt
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        unsafe {
+            CloseClipboard();
+        }
+        assert!(returned, "dropping the GUI blocked on clipboard rendering");
+        exit.join().unwrap();
         assert!(read(html_format).contains("快照"));
+        let utf16 = super::super::read_format_raw(13).unwrap();
+        let words: Vec<_> = utf16
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .take_while(|w| *w != 0)
+            .collect();
+        assert!(String::from_utf16(&words).unwrap().starts_with("快照"));
         assert!(range.cells.get().is_none());
+
+        let old_range = Arc::new(Range::new(&wb, 0, (0, 0, 36, 30)));
+        let old = Owner::publish_native(old_range.clone()).unwrap();
+        old.after_replacement();
+        let html = "<table><tr><td>替换</td></tr></table>";
+        assert!(super::super::write_office_clipboard_native(
+            "<Workbook>替换</Workbook>",
+            html,
+            "替换"
+        ));
+        // Synchronize the worker before checking the OS-owned replacement.
+        finish_after_gui_exit();
+        assert!(read(xml_format).contains("替换") && read(html_format).contains("替换"));
+        assert_eq!(Arc::strong_count(&old_range), 1);
 
         let bottom = sheetcore::sync::MAX_ROWS - 1;
         wb.sheets[0].set(
@@ -403,13 +523,15 @@ mod tests {
             },
         );
         let columns = std::sync::Arc::new(Range::new(&wb, 0, (0, 0, bottom, 2)));
-        let _owner = Owner::publish_native(columns.clone()).expect("register full columns");
+        let owner = Owner::publish_native(columns.clone()).expect("register full columns");
         let xml = read(xml_format);
         assert!(xml.contains("ss:ExpandedColumnCount=\"3\""));
         assert!(xml.contains("ss:ExpandedRowCount=\"1048576\""));
         assert!(xml.contains("ss:Index=\"1048576\""));
         assert!(xml.contains(">42</Data>"));
         assert!(xml.len() < 16_384 && columns.cells.get().is_none());
+        drop(owner);
+        finish_after_gui_exit();
     }
 
     #[test]

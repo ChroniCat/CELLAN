@@ -1869,6 +1869,7 @@ struct SheetApp {
     /// 最近一次 app 复制时写入系统剪贴板的文本；用于识别之后的外部复制
     clip_stamp: Option<String>,
     clipboard_owner: Option<office_clipboard::delayed::Owner>,
+    grid_paste: Option<std::rc::Rc<office_clipboard::shortcut::GridPaste>>,
     /// 合并会丢内容时的二次确认；再次点同一文档/表/矩形且内容未变才执行
     merge_pending: Option<MergePending>,
     /// 格式对话框里的“合并/取消合并”：确定后才执行，取消不改
@@ -3177,6 +3178,7 @@ impl SheetApp {
             painter_double: false,
             clip_stamp: None,
             clipboard_owner: None,
+            grid_paste: None,
             merge_pending: None,
             fmt_merge_pending: None,
             color_popup: None,
@@ -7194,6 +7196,12 @@ impl SheetApp {
         out
     }
 
+    fn retire_previous_clipboard(&mut self) {
+        if let Some(owner) = self.clipboard_owner.take() {
+            owner.after_replacement();
+        }
+    }
+
     fn clip_copy(&mut self, cut: bool, ctx: &egui::Context) {
         let (r1, c1, r2, c2) = self.sel_rect();
         let rect = (r1, c1, r2, c2);
@@ -7212,10 +7220,10 @@ impl SheetApp {
             self.status = "整列包含数组公式或溢出区域，请选中具体数据区域后复制".into();
             return;
         }
-        if full_columns && self.wb.sheet(si).merges.iter().any(|&(_, left, _, right)| {
-            left <= c2 && right >= c1 && (left < c1 || right > c2)
+        if full_columns && self.wb.sheet(si).merges.iter().any(|&(top, left, bottom, right)| {
+            left <= c2 && right >= c1 && (left < c1 || right > c2 || top > bottom || bottom >= sheetcore::sync::MAX_ROWS)
         }) {
-            self.status = "整列选区截断了合并单元格，请选中合并区涉及的全部列".into();
+            self.status = "整列选区不能完整表示合并单元格，请确认合并范围并选中涉及的全部列".into();
             return;
         }
         if full_columns && filtered {
@@ -7236,6 +7244,7 @@ impl SheetApp {
                 ctx.copy_text(plain.clone());
                 Some(plain)
             } else { None };
+            self.retire_previous_clipboard();
             self.clipboard_owner = owner;
             let merges = self.wb.sheet(si).merges.iter().copied()
                 .filter(|&(a,b,c,d)| a >= r1 && b >= c1 && c <= r2 && d <= c2).collect();
@@ -7270,6 +7279,7 @@ impl SheetApp {
             // XMLSS/HTML 不能表达非连续行；筛选复制先按 Excel 的可见单元格语义
             // 压紧成纯文本，保证粘贴不把隐藏行带回来，也不让 Excel 误用带隐藏行的块。
             ctx.copy_text(tsv.clone());
+            self.retire_previous_clipboard();
             self.clip_stamp = Some(tsv);
             let visible_count = visible_rows.len();
             self.clip_pic = None;
@@ -7307,6 +7317,7 @@ impl SheetApp {
         if !html_ok {
             ctx.copy_text(tsv.clone());
         }
+        self.retire_previous_clipboard();
         self.clip_stamp = Some(tsv);
         let merges = self.wb.sheet(si).merges.iter()
             .filter(|(a, b, c, d)| *a >= r1 && *b >= c1 && *c <= r2 && *d <= c2)
@@ -13030,6 +13041,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 i.modifiers.command && i.key_pressed(Key::H),
             )
         });
+        if let Some(values_only) = self.grid_paste.as_ref().and_then(|hook| hook.take()) {
+            self.clip_paste(values_only, None);
+            return;
+        }
         if copy_k || copy_evt {
             self.clip_copy(false, ctx);
             return;
@@ -22929,7 +22944,7 @@ let txn = self.txn_begin(&keys);
             return;
         }
         match sheetcore::xlsx::save_atomic_with_receipt(&path, &self.wb) {
-            Ok(receipt) => receipt.apply_to(&mut self.wb),
+            Ok(receipt) => receipt.adopt_document(&mut self.wb, &path, true),
             Err(e) => {
                 self.status = format!("保存失败：{e}");
                 return;
@@ -34809,6 +34824,7 @@ impl eframe::App for SheetApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(hook) = &self.grid_paste { hook.begin_frame(); }
         // UI-25.1 无界面验收：SC_FRAME_TIMES=<path> 逐帧记「距上一帧的毫秒数」，
         // 用来量百万格密集选区时状态栏分帧统计有没有把一帧卡死。
         if let Ok(path) = std::env::var("SC_FRAME_TIMES") {
@@ -37436,6 +37452,13 @@ impl eframe::App for SheetApp {
                 ctx.request_repaint();
             }
         }
+        if let Some(hook) = &self.grid_paste {
+            hook.end_frame(!self.show_start && !self.backstage && !self.dialog_modal
+                && self.editing.is_none() && self.ctx_menu.is_none() && self.dv_open.is_none()
+                && !self.fmt_dlg && !self.profile_open && !self.about_open && !self.keytips
+                && !ctx.wants_keyboard_input());
+        }
+
     }
 }
 
@@ -38316,6 +38339,7 @@ fn main() -> eframe::Result<()> {
         candidates.push("glow");
     }
     eprintln!("[renderer] 候选 {:?}（请求 {want}）", candidates);
+    let grid_paste = std::rc::Rc::new(office_clipboard::shortcut::GridPaste::default());
     let mut attempt = 0usize;
     let mut failed_backends: Vec<String> = Vec::new();
     let result = loop {
@@ -38356,6 +38380,7 @@ fn main() -> eframe::Result<()> {
         }
         let r = run_app(
             &mut opts,
+            grid_paste.clone(),
             initial.clone(),
             auto_host,
             auto_join.clone(),
@@ -38387,11 +38412,20 @@ fn main() -> eframe::Result<()> {
         );
         show_fatal_error_box("CELLAN 启动失败", &msg);
     }
+    // run_native has returned. The workbook and its file locks are gone.
+    // Do not accept file-open forwards while finishing delayed clipboard formats.
+    if let Ok(mut state) = instance_state.lock() {
+        state.accept_new_tab = false;
+        state.open_files.clear();
+        state.wake_ctx = None;
+    }
+    office_clipboard::delayed::finish_after_gui_exit();
     result
 }
 
 fn run_app(
     opts: &mut eframe::NativeOptions,
+    grid_paste: std::rc::Rc<office_clipboard::shortcut::GridPaste>,
     initial: Option<PathBuf>,
     auto_host: bool,
     auto_join: Option<String>,
@@ -38399,15 +38433,19 @@ fn run_app(
     open_requests: std::rc::Rc<std::cell::RefCell<Option<std::sync::mpsc::Receiver<PathBuf>>>>,
     instance_state: std::sync::Arc<std::sync::Mutex<single_instance::InstanceState>>,
 ) -> Result<(), eframe::Error> {
+    let mut options = opts.clone();
+    grid_paste.install(&mut options);
     eframe::run_native(
         "cellan",
-        opts.clone(),
+        options,
         {
             let initial = initial.clone();
             let auto_join = auto_join.clone();
             let open_requests = open_requests.clone();
             Box::new(move |cc| {
                 let mut app = SheetApp::new(cc, initial.clone());
+                grid_paste.attach(cc);
+                app.grid_paste = Some(grid_paste);
                 app.open_requests = open_requests.borrow_mut().take();
                 app.show_start = initial.is_none();
                 app.has_open_workbook = initial.is_some();
