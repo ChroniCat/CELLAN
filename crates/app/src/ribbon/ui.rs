@@ -1680,6 +1680,32 @@ fn paste_visual_grid(
     ui.add_space(2.0);
 }
 
+fn border_preset_icon(ui: &egui::Ui, row: Rect, action: &str) {
+    let origin = egui::pos2(row.left() + 7.0, row.center().y - 8.0);
+    let fg = ui.visuals().text_color();
+    for y in 0..2 {
+        for x in 0..2 {
+            let cell = Rect::from_min_size(origin + Vec2::new(x as f32 * 8.0, y as f32 * 8.0), Vec2::splat(8.0));
+            let edges = super::actions::preset_edges(action, [x == 0, x == 1, y == 0, y == 1], 1);
+            for ((a,b), style) in [
+                (cell.left_top(),cell.left_bottom()), (cell.right_top(),cell.right_bottom()),
+                (cell.left_top(),cell.right_top()), (cell.left_bottom(),cell.right_bottom()),
+            ].into_iter().zip(edges) {
+                let id = style.unwrap_or(0);
+                let color = if id == 0 { Color32::from_gray(172) } else { fg };
+                crate::border_lines::paint(ui.painter(), a, b, if id == 0 { 6 } else { id }, color, 0.8);
+            }
+        }
+    }
+}
+
+fn activate_border_pen(app: &mut SheetApp) {
+    use crate::BorderBrush::{Grid, Outline};
+    if !matches!(app.border_brush, Some(Grid | Outline)) {
+        app.set_border_brush(Outline);
+    }
+}
+
 fn draw_menu_nodes(
     app: &mut SheetApp,
     ui: &mut egui::Ui,
@@ -1693,6 +1719,34 @@ fn draw_menu_nodes(
     want_sub: &mut Option<(String, Menu, egui::Pos2)>,
     hover_non_sub: &mut bool,
 ) {
+    if menu_id == "BorderColorMenu" {
+        let mut auto = false;
+        let mut picked = None;
+        crate::wps_chrome::paint_wps_color_palette(ui, Some(app.last_border_color), &app.recent_colors,
+            Some("自动"), &mut auto, &mut picked);
+        if let Some(color) = picked.or_else(|| auto.then_some([0; 3])) {
+            app.last_border_color = color;
+            if !auto { app.push_recent_color(color); }
+            activate_border_pen(app);
+            *close = true;
+        }
+        return;
+    }
+    if menu_id == "BorderLineMenu" {
+        for &(id, label) in crate::border_lines::STYLES {
+            let row = popup_menu_row(ui, label, None, None, "", false, id == app.border_brush_style, true, min_w, false);
+            let end = egui::pos2(row.rect.right() - 9.0, row.rect.center().y);
+            crate::border_lines::paint(ui.painter(), end - Vec2::new(68.0, 0.0), end, id,
+                Color32::from_rgb(app.last_border_color[0],app.last_border_color[1],app.last_border_color[2]), 1.0);
+            if row.clicked() {
+                app.border_brush_style = id;
+                activate_border_pen(app);
+                *close = true;
+            }
+        }
+        return;
+    }
+    if menu_id == "BordersMenu" { ui.strong("边框"); }
     if menu_id == "RecentFnMenu" {
         for name in crate::fnrecent::menu_items() {
             let r = popup_menu_row(ui, &name, None, None, "", false, false, true, min_w, icon_gutter);
@@ -1721,6 +1775,7 @@ fn draw_menu_nodes(
                 ui.add_space(2.0);
             }
             MenuNode::Button(c) => {
+                if menu_id == "BordersMenu" && c.id == "BorderDraw" { ui.strong("绘制边框"); }
                 let st = app.ctl_state(&c.id);
                 if !st.visible {
                     continue;
@@ -1729,7 +1784,14 @@ fn draw_menu_nodes(
                 let icon = c.image.as_deref().and_then(icon_of);
                 let sw = menu_swatch(c.action());
                 let sc = menu_shortcut(c.action());
-                let r = popup_menu_row(ui, &label, icon, sw, sc, false, false, st.enabled, min_w, icon_gutter);
+                let checked = matches!((c.action(), app.border_brush),
+                    ("BorderDraw", Some(crate::BorderBrush::Outline))
+                    | ("BorderDrawGrid", Some(crate::BorderBrush::Grid))
+                    | ("BorderErase", Some(crate::BorderBrush::Erase)));
+                let r = popup_menu_row(ui, &label, icon, sw, sc, false, checked, st.enabled, min_w, icon_gutter);
+                if menu_id == "BordersMenu" && c.image.is_none() {
+                    border_preset_icon(ui, r.rect, c.action());
+                }
                 if r.hovered() {
                     *hover_non_sub = true;
                 }
@@ -1789,10 +1851,16 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                 176.0
             };
             let w = measure_menu_width(app, ui, m, min_w);
-            let scroll = m.items.len() > 13;
-            let extra = if m.ctl.id == "PasteMenu" { 104.0 } else { 0.0 };
-            let h = (m.items.len() as f32 * 28.0 + 18.0 + extra).min(460.0);
-            (w, scroll, h)
+            if m.ctl.id == "BordersMenu" {
+                let needed = m.items.iter().map(|it| if matches!(it, MenuNode::Separator) { 7.0 } else { 29.0 }).sum::<f32>() + 64.0;
+                let available = (screen.height() - 42.0).max(80.0);
+                (w, needed > available, needed.min(available))
+            } else {
+                let scroll = m.items.len() > 13;
+                let extra = if m.ctl.id == "PasteMenu" { 104.0 } else { 0.0 };
+                let h = (m.items.len() as f32 * 28.0 + 18.0 + extra).min(460.0);
+                (w, scroll, h)
+            }
         }
         PopupKind::Items(items) => {
             let w = measure_items_width(ui, items);
@@ -1842,7 +1910,7 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                             );
                         };
                         if has_scroll {
-                            egui::ScrollArea::vertical().max_height(390.0).show(ui, show_rows);
+                            egui::ScrollArea::vertical().max_height(if m.ctl.id == "BordersMenu" { est_h - 14.0 } else { 390.0 }).show(ui, show_rows);
                         } else {
                             show_rows(ui);
                         }
@@ -1917,11 +1985,16 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
     let mut sub_rect: Option<Rect> = None;
     if let Some((pid, sub, mut spos)) = app.ribbon_sub.clone() {
         let sub_gutter = menu_has_gutter(&sub);
-        let sub_inner_w = measure_menu_width(app, ui, &sub, if sub_gutter { 186.0 } else { 170.0 });
-        let sub_scroll = sub.items.len() > 13;
+        let sub_inner_w = if sub.ctl.id == "BorderColorMenu" { 218.0 } else { measure_menu_width(app, ui, &sub, if sub_gutter { 186.0 } else { 170.0 }) };
+        let desired_h = match sub.ctl.id.as_str() {
+            "BorderLineMenu" => 29.0 * crate::border_lines::STYLES.len() as f32 + 14.0,
+            "BorderColorMenu" => 238.0,
+            _ => (sub.items.len() as f32 * 28.0 + 16.0).min(390.0),
+        };
+        let sub_h = desired_h.min((screen.height() - 42.0).max(80.0));
+        let sub_scroll = sub.items.len() > 13 || desired_h > sub_h;
         let sub_frame_w = sub_inner_w + if sub_scroll { 14.0 } else { 0.0 };
         let sub_outer_w = sub_frame_w + 12.0;
-        let sub_h = (sub.items.len() as f32 * 28.0 + 16.0).min(390.0);
         if p.opened_at == 0.0 {
             spos = egui::pos2(rect.right() + 2.0, rect.top() + 58.0);
         }
@@ -1962,7 +2035,7 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                         );
                     };
                     if sub_scroll {
-                        egui::ScrollArea::vertical().max_height(370.0).show(ui, show_sub);
+                        egui::ScrollArea::vertical().max_height(sub_h - 16.0).show(ui, show_sub);
                     } else {
                         show_sub(ui);
                     }
@@ -2590,6 +2663,58 @@ pub fn icon_of(name: &str) -> Option<Icon> {
 #[cfg(test)]
 mod compact_tests {
     use super::*;
+
+    #[test]
+    fn border_menu_pen_choices_enter_draw_mode_preserve_grid_and_exit_on_escape() {
+        use crate::BorderBrush::{Erase, Grid, Outline};
+        use egui::{Event, Modifiers, PointerButton, RawInput};
+
+        let _env = crate::test_env::TestEnv::new("ribbon-border-pen");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 480.0));
+        let pos = egui::pos2(25.0, 18.0);
+        for menu in ["BorderLineMenu", "BorderColorMenu"] {
+            for before in [None, Some(Erase), Some(Outline), Some(Grid)] {
+                app.border_brush = before;
+                app.border_brush_style = 3;
+                app.last_border_color = [96, 30, 40];
+                let mut close = false;
+                for press in [None, Some(true), Some(false)] {
+                    let mut events = vec![Event::PointerMoved(pos)];
+                    if let Some(pressed) = press {
+                        events.push(Event::PointerButton {
+                            pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                        });
+                    }
+                    let input = RawInput { events, screen_rect: Some(screen), ..Default::default() };
+                    let _ = ctx.run(input, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            draw_menu_nodes(&mut app, ui, menu, &[], 190.0, false, None,
+                                &mut None, &mut close, &mut None, &mut false);
+                        });
+                    });
+                }
+                assert!(close, "choosing a pen should close {menu}");
+                if menu == "BorderLineMenu" {
+                    assert_eq!(app.border_brush_style, crate::border_lines::STYLES[0].0);
+                } else {
+                    assert_eq!(app.last_border_color, [0; 3]);
+                }
+                let expected = if before == Some(Grid) { Grid } else { Outline };
+                assert!(app.border_brush == Some(expected));
+                let escape = Event::Key {
+                    key: egui::Key::Escape, physical_key: None, pressed: true,
+                    repeat: false, modifiers: Modifiers::NONE,
+                };
+                let input = RawInput { events: vec![escape], screen_rect: Some(screen), ..Default::default() };
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+                });
+                assert!(app.border_brush.is_none());
+            }
+        }
+    }
 
     #[test]
     fn compact_alignment_group_has_a_bounded_grid() {

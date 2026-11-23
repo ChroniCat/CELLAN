@@ -112,6 +112,7 @@ pub(crate) fn view_with_merge(
     let st: &CellStyle = wb.styles.get(sheet.style_of(r, c));
     let has_style = st.fill.is_some()
         || st.border.iter().any(|b| b.style != 0)
+        || st.diagonal.is_some()
         || !st.format.is_empty()
         || st.bold
         || st.italic;

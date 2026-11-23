@@ -19,7 +19,7 @@ pub struct FillPattern {
     pub bg_indexed: Option<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DiagBorder {
     /// `diagonal` 的 style 原值
     pub style: String,
@@ -201,11 +201,7 @@ pub fn attach(styles: &mut StyleTable, ext: &StyleExt, id: u16, xf_index: u16) {
     if ext.xf_quote.get(xf_index as usize).copied().unwrap_or(false) {
         styles.set_quote(id, true);
     }
-    if let Some(border_id) = ext.xf_border.get(xf_index as usize) {
-        if let Some(d) = ext.diags.get(*border_id as usize).cloned().flatten() {
-            styles.set_diag(id, d);
-        }
-    }
+
 }
 
 #[cfg(test)]

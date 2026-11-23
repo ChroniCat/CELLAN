@@ -120,14 +120,26 @@
                   <button id="BorderLeft" label="左框线" onAction="BorderLeft"/>
                   <button id="BorderRight" label="右框线" onAction="BorderRight"/>
                   <menuSeparator id="BordersSep1"/>
+                  <button id="BorderNone" label="无框线" onAction="BorderNone"/>
                   <button id="BorderAll" label="所有框线" keytip="B" onAction="BordersAll"/>
                   <button id="BorderOuter" label="外侧框线" onAction="BorderOuter"/>
-                  <button id="BorderThickOuter" label="粗外侧框线" onAction="BorderThickOuter"/>
-                  <button id="BorderThickBottom" label="粗底框线" onAction="BorderThickBottom"/>
+                  <button id="BorderThickOuter" label="粗匣框线" onAction="BorderThickOuter"/>
+                  <menuSeparator id="BordersSep2"/>
                   <button id="BorderDoubleBottom" label="双底框线" onAction="BorderDoubleBottom"/>
-                  <button id="BorderInsideH" label="内侧横线" onAction="BorderInsideH"/>
-                  <button id="BorderInsideV" label="内侧竖线" onAction="BorderInsideV"/>
-                  <button id="BorderNone" label="无框线" onAction="BorderNone"/>
+                  <button id="BorderThickBottom" label="粗下框线" onAction="BorderThickBottom"/>
+                  <button id="BorderTopBottom" label="上下框线" onAction="BorderTopBottom"/>
+                  <button id="BorderTopThickBottom" label="上框线和粗下框线" onAction="BorderTopThickBottom"/>
+                  <button id="BorderTopDoubleBottom" label="上框线和双下框线" onAction="BorderTopDoubleBottom"/>
+                  <button id="BorderInsideH" label="内侧横框线" onAction="BorderInsideH"/>
+                  <button id="BorderInsideV" label="内侧竖框线" onAction="BorderInsideV"/>
+                  <menuSeparator id="BordersSep3"/>
+                  <button id="BorderDraw" label="绘制边框" imageMso="SparkEdit" onAction="BorderDraw"/>
+                  <button id="BorderDrawGrid" label="绘制边框网格" imageMso="Borders" onAction="BorderDrawGrid"/>
+                  <button id="BorderErase" label="擦除边框" imageMso="Eraser" onAction="BorderErase"/>
+                  <menu id="BorderColorMenu" label="线条颜色" imageMso="FontColor"/>
+                  <menu id="BorderLineMenu" label="线型" imageMso="Borders"/>
+                  <menuSeparator id="BordersSep4"/>
+                  <button id="MoreBorders" label="其他边框…" imageMso="FormatCells" onAction="MoreBorders"/>
                 </menu>
               </splitButton>
               <splitButton id="FillColorSplit" sizeString="39" arrowWidth="15">

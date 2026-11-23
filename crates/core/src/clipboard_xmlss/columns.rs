@@ -51,6 +51,24 @@ fn pattern_name(kind: &str) -> Option<&'static str> {
     })
 }
 
+fn xmlss_border(style: &str) -> (&'static str, u8) {
+    match style {
+        "double" => ("Double", 3),
+        "dashed" => ("Dash", 1),
+        "mediumDashed" => ("Dash", 2),
+        "dotted" => ("Dot", 1),
+        "dashDot" => ("DashDot", 1),
+        "mediumDashDot" => ("DashDot", 2),
+        "dashDotDot" => ("DashDotDot", 1),
+        "mediumDashDotDot" => ("DashDotDot", 2),
+        "slantDashDot" => ("SlantDashDot", 2),
+        "hair" => ("Continuous", 0),
+        "medium" => ("Continuous", 2),
+        "thick" => ("Continuous", 3),
+        _ => ("Continuous", 1),
+    }
+}
+
 fn write_style(xml: &mut String, id: u16, styles: &StyleTable) {
     let s = styles.get(id);
     if id == 0 {
@@ -92,32 +110,12 @@ fn write_style(xml: &mut String, id: u16, styles: &StyleTable) {
         .into_iter()
         .zip(&s.border)
     {
-        let (line, weight) = match b.style {
-            0 => continue,
-            1..=3 => ("Continuous", b.style),
-            4 => ("Double", 3),
-            5 => ("Dash", 1),
-            6 => ("Dot", 1),
-            _ => ("Continuous", 1),
-        };
+        if b.is_none() { continue; }
+        let (line, weight) = xmlss_border(crate::style::Border::ooxml_name(b.style));
         write!(xml, "<Border ss:Position=\"{position}\" ss:LineStyle=\"{line}\" ss:Weight=\"{weight}\" ss:Color=\"{}\"/>", rgb(b.color)).unwrap();
     }
     if let Some(d) = styles.diag_of(id) {
-        let (line, weight) = match d.style.as_str() {
-            "double" => ("Double", 3),
-            "dashed" => ("Dash", 1),
-            "mediumDashed" => ("Dash", 2),
-            "dotted" => ("Dot", 1),
-            "dashDot" => ("DashDot", 1),
-            "mediumDashDot" => ("DashDot", 2),
-            "dashDotDot" => ("DashDotDot", 1),
-            "mediumDashDotDot" => ("DashDotDot", 2),
-            "slantDashDot" => ("SlantDashDot", 2),
-            "hair" => ("Continuous", 0),
-            "medium" => ("Continuous", 2),
-            "thick" => ("Continuous", 3),
-            _ => ("Continuous", 1),
-        };
+        let (line, weight) = xmlss_border(&d.style);
         for (position, enabled) in [("DiagonalLeft", d.down), ("DiagonalRight", d.up)] {
             if enabled {
                 write!(xml, "<Border ss:Position=\"{position}\" ss:LineStyle=\"{line}\" ss:Weight=\"{weight}\" ss:Color=\"{}\"/>", rgb(d.color)).unwrap();
