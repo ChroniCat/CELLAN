@@ -300,6 +300,109 @@ pub(super) fn shared_strings(input: impl Read, out: &mut impl Write) -> Result<b
     }
 }
 
+/// umya expects explicit cell/row coordinates and bounded column endpoints.
+/// Prepare only sheets identified during load. Keep at most one cell and the
+/// small worksheet header in memory, and leave other XML byte-for-byte intact.
+pub(in crate::xlsx) fn repair_dom_input(input: impl Read, out: &mut impl Write) -> Result<()> {
+    use quick_xml::{NsReader, name::ResolveResult};
+    let mut reader = NsReader::from_reader(Window::start(input, out)?.into_inner());
+    let mut root = None;
+    let mut buf = Vec::new();
+    let mut skip = Vec::new();
+    let (mut data, mut row_open) = (false, false);
+    let (mut row, mut next_row, mut next_col) = (0u32, 0u32, 0u32);
+    loop {
+        buf.clear();
+        let start = reader.buffer_position();
+        let (ns, event) = reader.read_resolved_event_into(&mut buf)?;
+        let ns = match ns {
+            ResolveResult::Bound(n) => n.0,
+            ResolveResult::Unbound => "",
+            ResolveResult::Unknown(_) => anyhow::bail!("工作表使用未声明的 XML 命名空间"),
+        };
+        let sheet_ns = root.as_deref() == Some(ns);
+        let empty = matches!(event, Event::Empty(_));
+        let mut finished = false;
+        match event {
+            Event::Start(tag) if root.is_none() && tag.local_name().as_ref() == "worksheet" => {
+                root = Some(ns.to_owned());
+            }
+            Event::Empty(tag) | Event::Start(tag) => {
+                let mut coordinate = None;
+                let mut skip_body = true;
+                match (data, row_open, tag.local_name().as_ref()) {
+                    (false, false, "sheetData") if sheet_ns => {
+                        let header = std::str::from_utf8(reader.get_mut().through(start)?)?;
+                        out.write_all(
+                            crate::patch::layout_xml::repair_column_bounds(header)?
+                                .as_bytes(),
+                        )?;
+                        data = true;
+                        finished = empty;
+                        skip_body = false;
+                    }
+                    (true, false, "row") if sheet_ns => {
+                        row = match attr(&tag, "r") {
+                            Some(value) => {
+                                value.parse::<u32>()?.checked_sub(1).context("行号为零")?
+                            }
+                            None => {
+                                coordinate = Some((next_row + 1).to_string());
+                                next_row
+                            }
+                        };
+                        anyhow::ensure!(row < crate::sync::MAX_ROWS, "行号超出工作表");
+                        next_row = row + 1;
+                        next_col = 0;
+                        row_open = !empty;
+                        skip_body = false;
+                    }
+                    (true, true, "c") if sheet_ns => {
+                        let col = match attr(&tag, "r") {
+                            Some(value) => {
+                                crate::sparse::parse_ref(&value)
+                                    .context("单元格坐标无效")?
+                                    .1
+                            }
+                            None => {
+                                coordinate = Some(crate::model::cell_name(row, next_col));
+                                next_col
+                            }
+                        };
+                        anyhow::ensure!(col < crate::sync::MAX_COLS, "列号超出工作表");
+                        next_col = col + 1;
+                    }
+                    _ => {}
+                }
+                if let Some(r) = coordinate {
+                    let end = reader.buffer_position();
+                    let raw = reader.get_mut().through(end)?;
+                    let pos = raw.len() - if empty { 2 } else { 1 };
+                    out.write_all(&raw[..pos])?;
+                    write!(out, " r=\"{r}\"")?;
+                    out.write_all(&raw[pos..])?;
+                }
+                if !empty && skip_body {
+                    skip.clear();
+                    reader.read_to_end_into(tag.name(), &mut skip)?;
+                }
+            }
+            Event::End(_) if row_open => row_open = false,
+            Event::End(_) if data => finished = true,
+            Event::Eof => anyhow::bail!("工作表缺少 sheetData"),
+            _ => {}
+        }
+        if data {
+            let end = reader.buffer_position();
+            out.write_all(reader.get_mut().through(end)?)?;
+        }
+        if finished {
+            reader.into_inner().copy_rest(out)?;
+            return Ok(());
+        }
+    }
+}
+
 pub(super) fn worksheet(
     input: impl Read,
     out: &mut impl Write,
@@ -405,7 +508,9 @@ pub(super) fn worksheet(
             {
                 if attr(e,&binding).is_some_and(|uri| uri != root_uri) { return Ok(false); }
                 if let Some(header) = header.take() {
-                    let styled = crate::patch::layout_xml::styled_columns(std::str::from_utf8(&header)?, &styles.cols)?;
+                    let Ok(styled) = crate::patch::layout_xml::styled_columns(std::str::from_utf8(&header)?, &styles.cols) else {
+                        return Ok(false);
+                    };
                     out.write_all(styled.as_bytes())?;
                 }
                 if empty {
@@ -446,7 +551,10 @@ pub(super) fn worksheet(
                 let styled;
                 let raw = if let Some(xf) = axis_rows.remove(&r) {
                     let (tag,body) = raw.split_at(tag_len);
-                    let mut bytes = crate::patch::layout_xml::styled_row(std::str::from_utf8(tag)?,xf)?.into_bytes();
+                    let Ok(styled_tag) = crate::patch::layout_xml::styled_row(std::str::from_utf8(tag)?, xf) else {
+                        return Ok(false);
+                    };
+                    let mut bytes = styled_tag.into_bytes();
                     bytes.extend_from_slice(body);
                     styled = bytes;
                     styled.as_slice()

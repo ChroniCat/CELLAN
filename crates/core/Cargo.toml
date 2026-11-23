@@ -9,6 +9,7 @@ name = "sheetcore"
 path = "src/lib.rs"
 
 [dependencies]
+stacker = "0.1.25"
 sha2 = "0.11.1"
 aes = "0.9.4"
 cfb = "0.14.0"

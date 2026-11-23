@@ -31,8 +31,8 @@ pub(crate) struct SourceCells {
     style_map: Option<Arc<StyleMap>>,
     notes: Option<NoteSource>,
     styles: CellStyles,
-    row_styles: crate::model::CellMetadata<u32,u16>,
-    col_styles: crate::model::CellMetadata<u32,u16>,
+    pub(super) row_styles: crate::model::CellMetadata<u32,u16>,
+    pub(super) col_styles: crate::model::CellMetadata<u32,u16>,
     pub(super) rich: crate::model::CellMetadata<(u32, u32), Vec<crate::richtext::RichRun>>,
     arrays: Arc<Vec<(CellRef, Rect)>>,
     spill_shapes: Arc<HashMap<CellRef, (u32, u32)>>,
@@ -1303,6 +1303,9 @@ pub(super) fn write_with_style_receipt(
         let (Some(part), Some(source)) = (&sheet.source_part, &sheet.source_cells) else {
             return Ok(false);
         };
+        if sheet.source_needs_dom_repair && (sheet.row_styles_dirty || sheet.col_styles_dirty) {
+            return Ok(false);
+        }
         if signature(&mut zip, part) != Some(source.signature)
             || source.strings != sst
             || ((sheet.styles_dirty || sheet.row_styles_dirty || sheet.col_styles_dirty || !sheet.row_styles.is_empty() || !sheet.col_styles.is_empty() || !sheet.style_edits.is_empty())
@@ -1541,6 +1544,146 @@ mod tests {
         let style = saved.styles.get(saved.sheets[0].style_of(0, 0));
         assert!(style.italic && !style.locked);
         assert_eq!(style.valign, 1);
+    }
+
+    #[test]
+    fn existing_xf_zero_and_new_inherited_values_survive_streaming_and_dom_saves() {
+        for force_dom in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mixed.xlsx");
+            let mut wb = Workbook::new_blank();
+            let normal = wb.styles.get(0).clone();
+            let bold = wb.styles.intern(crate::style::CellStyle {
+                bold: true,
+                ..normal.clone()
+            });
+            let italic = wb.styles.intern(crate::style::CellStyle {
+                italic: true,
+                ..normal
+            });
+            let sheet = wb.sheet_mut(0);
+            sheet.set_row_style(0, bold);
+            sheet.set_col_style(1, italic);
+            sheet.set(0, 0, num(1.));
+            sheet.set(1, 1, num(2.));
+            save(&path, &wb).unwrap();
+            let part = crate::patch::sheet_targets(&path).unwrap()["Sheet1"].clone();
+            let original = String::from_utf8(read_part(&path, &part).unwrap()).unwrap();
+            let doc = roxmltree::Document::parse(&original).unwrap();
+            let mut xml = original.clone();
+            for cell in doc
+                .descendants()
+                .filter(|n| n.tag_name().name() == "c")
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                let range = cell.attribute_node("s").unwrap().range();
+                let extra = if force_dom && cell.attribute("r") == Some("A1") {
+                    "ph=\"1\""
+                } else {
+                    ""
+                };
+                xml.replace_range(range, extra);
+            }
+            crate::fixups::write_parts(&path, &[(part.clone(), xml.into_bytes())]).unwrap();
+            let (mut wb, diag) = load_diag(&path).unwrap();
+            assert!(diag.is_complete());
+            let sheet = wb.sheet_mut(0);
+            sheet.set(0, 0, num(10.));
+            sheet.set(0, 1, num(20.)); // Both defaults apply; the row takes precedence.
+            sheet.set(2, 1, num(30.));
+            let check = |wb: &Workbook, stage: &str| {
+                let style = |r, c| wb.styles.get(wb.sheets[0].style_of(r, c));
+                assert!(!style(0, 0).bold && !style(1, 1).italic);
+                assert_eq!(
+                    (style(0, 1).bold, style(0, 1).italic, style(2, 1).italic),
+                    (true, false, true),
+                    "{stage} force_dom={force_dom} sheet={:?} {:?}",
+                    wb.sheets[0].row_styles,
+                    wb.sheets[0].col_styles
+                );
+            };
+            check(&wb, "before");
+            let receipt = save_atomic_with_receipt(&path, &wb).unwrap();
+            assert_eq!(receipt.used_cell_delta, !force_dom);
+            let xml = String::from_utf8(read_part(&path, &part).unwrap()).unwrap();
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let xf = |address| {
+                doc.descendants()
+                    .find(|n| n.attribute("r") == Some(address))
+                    .unwrap()
+                    .attribute("s")
+                    .unwrap_or("0")
+            };
+            assert_eq!((xf("A1"), xf("B2")), ("0", "0"));
+            assert_ne!(xf("B1"), "0");
+            assert_ne!(xf("B3"), "0");
+            let saved = load_diag(&path).unwrap().0;
+            check(&saved, "after");
+            assert_eq!(saved.sheets[0].value(2, 1), Value::Number(30.));
+        }
+    }
+
+    #[test]
+    fn unsupported_axis_xml_uses_the_dom_save_and_keeps_neighbor_values() {
+        for (column, columns, row) in [
+            (false, "", "<row>"),
+            (
+                true,
+                "<cols><col min='1' max='3'><extLst/></col></cols>",
+                "<row r='1'>",
+            ),
+            (
+                true,
+                "<cols><col min='2'/><col max='3'/><col min='invalid' max='4'/></cols>",
+                "<row r='1'>",
+            ),
+            (
+                false,
+                "<cols><col min='16383' max='4294967295' width='24' customWidth='1'/></cols>",
+                "<row r='1'>",
+            ),
+        ] {
+            let rows = if row == "<row>" {
+                "<row><c><v>7</v></c><c><v>8</v></c></row>".to_owned()
+            } else {
+                format!("{row}<c r='A1'><v>7</v></c><c r='B1'><v>8</v></c></row>")
+            };
+            let (_dir, path, part) = fixture(&rows, columns);
+            let (mut wb, diag) = load_diag(&path).unwrap();
+            assert!(diag.is_complete(), "{:?}", diag.problems);
+            let bold = wb.styles.intern(crate::style::CellStyle {
+                bold: true,
+                ..wb.styles.get(0).clone()
+            });
+            if column {
+                wb.sheets[0].set_col_style(1, bold);
+            } else {
+                wb.sheets[0].set_row_style(0, bold);
+            }
+            let receipt = save_atomic_with_receipt(&path, &wb).unwrap();
+            assert!(!receipt.used_cell_delta);
+            let saved = load_diag(&path).unwrap().0;
+            assert!(!saved.sheets[0].source_needs_dom_repair, "{columns} {row}: {}", String::from_utf8_lossy(&read_part(&path,&part).unwrap()));
+            assert_eq!(
+                saved.sheets[0].value(0, 0),
+                Value::Number(7.),
+                "{columns} {row}"
+            );
+            assert_eq!(saved.sheets[0].value(0, 1), Value::Number(8.));
+            assert!(
+                saved.styles.get(saved.sheets[0].style_of(0, 1)).bold,
+                "{part}"
+            );
+            assert_eq!(
+                saved.styles.get(saved.sheets[0].style_of(0, 0)).bold,
+                !column
+            );
+            if columns.contains("4294967295") {
+                assert!(saved.sheets[0].cols.size(16383) > 100.);
+            }
+        }
     }
 
     #[test]

@@ -89,6 +89,7 @@ impl Rows {
     }
 
     fn append(self, out: &mut Loaded, formulas: &mut Formulas, shell: &mut String) -> Result<()> {
+        out.sheet.source_needs_dom_repair |= self.local.sheet.source_needs_dom_repair;
         for ((r, c), cell) in self.cells {
             out.sheet.set(r, c, cell);
         }

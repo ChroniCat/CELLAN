@@ -39,6 +39,13 @@ pub fn format_number(n: f64) -> String {
 }
 
 impl Value {
+    pub(crate) fn same_stored_value(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Number(a), Self::Number(b)) => a.to_bits() == b.to_bits(),
+            (a, b) => a == b,
+        }
+    }
+
     /// 显示用文本（数字去掉多余的 .0）
     pub fn display(&self) -> String {
         match self {
@@ -79,6 +86,14 @@ pub struct Cell {
 }
 
 impl Cell {
+    /// Formula caches are calculated state. Compare only the editable input.
+    pub fn same_input(&self, other: &Self) -> bool {
+        if self.formula.is_some() || other.formula.is_some() {
+            return self.formula == other.formula;
+        }
+        self.value.same_stored_value(&other.value)
+    }
+
     pub fn is_blank(&self) -> bool {
         self.value.is_empty() && self.formula.is_none()
     }
@@ -160,6 +175,9 @@ pub struct Sheet {
     /// sheet must retain its original relationships and other unmodeled content.
     /// A duplicated/new sheet has no source part.
     pub source_part: Option<String>,
+    /// The source has implicit row/cell coordinates or out-of-range column
+    /// dimensions that require normalization before umya reads a temporary copy.
+    pub(crate) source_needs_dom_repair: bool,
     /// 分页列式存储（见 store.rs）：页内按列连续，扫描快、每格只占 40 字节
     cells: Store,
     /// Cell storage revision represented by the current OOXML source part.
@@ -301,6 +319,7 @@ impl Sheet {
             identity: next_sheet_identity(),
             shared_lookup: Default::default(),
             source_part: None,
+            source_needs_dom_repair: false,
             cells: Store::default(),
             saved_cells: None,
             source_cells: None,
@@ -377,6 +396,7 @@ impl Sheet {
     pub fn renew_identity(&mut self) {
         self.identity = next_sheet_identity();
         self.source_part = None;
+        self.source_needs_dom_repair = false;
         self.saved_cells = None;
         self.source_cells = None;
     }
@@ -561,6 +581,8 @@ impl Sheet {
     pub fn search_snapshot(&self) -> Self {
         let mut snapshot = Self::new(&self.name);
         snapshot.cells = self.cells.clone();
+        snapshot.identity = self.identity;
+        snapshot.coordinate_revision = self.coordinate_revision;
         snapshot.display_style_revision = self.display_style_revision;
         snapshot.styles = self.styles.clone();
         snapshot.row_styles = self.row_styles.clone();
@@ -602,6 +624,68 @@ impl Sheet {
             && self.name == source.name && self.styles == source.styles
             && self.row_styles == source.row_styles && self.col_styles == source.col_styles
             && self.merges == source.merges && self.arrays == source.arrays && self.spilled == source.spilled
+    }
+
+    /// CSV writes cells, while a sort also depends on cached values and formats.
+    /// Changed storage slabs can be shared with the worker even on very large sheets.
+    pub fn csv_inputs_match(&self, before: &Self, keys: &[(u32, u32)]) -> bool {
+        let hit = |k: CellRef| keys.binary_search(&(k.row, k.col)).is_ok();
+        let intersects = |&(r1,c1,r2,c2): &(u32,u32,u32,u32)| {
+            keys[keys.partition_point(|&(r,_)| r < r1)..].iter()
+                .take_while(|&&(r,_)| r <= r2).any(|&(_,c)| (c1..=c2).contains(&c))
+        };
+        self.merges.iter().filter(|r| intersects(r)).eq(before.merges.iter().filter(|r| intersects(r)))
+            && self.arrays.iter().filter(|(_,r)| intersects(r)).eq(before.arrays.iter().filter(|(_,r)| intersects(r)))
+            && !self.spilled.symmetric_difference(&before.spilled).any(|k| hit(*k))
+            && (self.cell_version() == before.cell_version() ||
+                self.changed_cells(before).chain(before.changed_cells(self)).filter(|k| hit(*k)).all(|k| {
+                    self.get(k.row,k.col).zip(before.get(k.row,k.col)).is_some_and(|(a,b)| a.same_input(b))
+                }))
+    }
+
+    pub fn same_sort_region(&self, before: &Self, rect: (u32,u32,u32,u32)) -> bool {
+        let (r1,c1,r2,c2) = rect;
+        let inside = |k: CellRef| (r1..=r2).contains(&k.row) && (c1..=c2).contains(&k.col);
+        let intersects = |&(a,b,c,d): &(u32,u32,u32,u32)| a <= r2 && c >= r1 && b <= c2 && d >= c1;
+        let axis_matches = |live: &CellMetadata<u32,u16>, old: &CellMetadata<u32,u16>, first: u32, last: u32| {
+            let range = first..=last;
+            live.keys().chain(old.keys()).filter(|&k| range.contains(k))
+                .all(|k| live.get(k) == old.get(k))
+        };
+        self.same_cells_in(before, &[rect], true) && self.same_cells_in(before, &[rect], false)
+            && self.merges.iter().filter(|r| intersects(r)).eq(before.merges.iter().filter(|r| intersects(r)))
+            && self.arrays.iter().filter(|(_,r)| intersects(r)).eq(before.arrays.iter().filter(|(_,r)| intersects(r)))
+            && !self.spilled.symmetric_difference(&before.spilled).any(|k| inside(*k))
+            && axis_matches(&self.row_styles, &before.row_styles, r1, r2)
+            && axis_matches(&self.col_styles, &before.col_styles, c1, c2)
+            && !self.styles.changed_keys(&before.styles).chain(before.styles.changed_keys(&self.styles)).any(inside)
+    }
+
+    /// Carry concurrent edits outside a validated operation into its prepared COW pages.
+    /// Live save journals already own those edits. Only the worker's writes need new entries.
+    pub fn rebase_row_changes(&self, before: &Sheet, prepared: &mut Sheet, in_target: impl Fn(CellRef) -> bool) {
+        if self.cell_version() != before.cell_version() {
+            for k in self.changed_cells(before).filter(|k| !in_target(*k)) {
+                if let Some(cell) = self.get(k.row, k.col) {
+                    prepared.cells.set(k.row, k.col, cell.clone());
+                }
+            }
+            for k in before.changed_cells(self).filter(|k| !in_target(*k) && self.get(k.row,k.col).is_none()) {
+                prepared.cells.remove(k.row,k.col);
+            }
+        }
+        for k in self.spilled.symmetric_difference(&before.spilled).filter(|k| !in_target(**k)) {
+            if self.spilled.contains(k) { prepared.spilled.insert(*k); }
+            else { prepared.spilled.remove(k); }
+        }
+        if prepared.styles_dirty {
+            for k in self.styles.changed_keys(&before.styles) {
+                if let Some(&id) = self.styles.get(&k) { prepared.styles.insert(k,id); }
+            }
+            for k in before.styles.changed_keys(&self.styles).filter(|k| self.styles.get(k).is_none()) {
+                prepared.styles.remove(&k);
+            }
+        }
     }
 
     /// Merge concurrent edits into staged replacement pages. Changed target values
@@ -742,6 +826,18 @@ impl Sheet {
     /// 显式写在单元格上的样式索引（不回退到整行/整列）
     pub fn explicit_style_of(&self, r: u32, c: u32) -> Option<u16> {
         self.styles.get(&CellRef::new(r, c)).copied()
+    }
+
+    /// An existing OOXML value cell with no s uses cellXfs[0]. An absent cell
+    /// at the same address would inherit the row or column style on entry.
+    pub(crate) fn apply_loaded_xf_zero(&mut self, xf_zero: u16) {
+        for (key, _) in self.cells.iter() {
+            if (self.row_styles.contains_key(&key.row) || self.col_styles.contains_key(&key.col))
+                && self.styles.get(&key).is_none()
+            {
+                self.styles.insert(key, xf_zero);
+            }
+        }
     }
 
     /// 用户改样式（标记脏，保存时回写）

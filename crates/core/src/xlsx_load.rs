@@ -641,6 +641,7 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                                 _ => {}
                             }
                         }
+                        dst.sheet.source_needs_dom_repair |= !explicit_row;
                         if !keep_row {
                             shell.push_str(&xml[copied..start]);
                             copied = r.buffer_position() as usize;
@@ -661,10 +662,12 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                         let mut xf = None;
                         let mut dynamic = false;
                         let mut here = pos;
+                        let mut explicit_cell = false;
                         for a in e.attributes() {
                             let a = a?;
                             match a.key.as_ref() {
                                 "r" => {
+                                    explicit_cell = true;
                                     here = crate::sparse::parse_ref(&a.value)
                                         .context("无效单元格坐标")?
                                 }
@@ -674,6 +677,7 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                                 _ => {}
                             }
                         }
+                        dst.sheet.source_needs_dom_repair |= !explicit_cell;
                         ensure!(
                             here.0 < crate::sync::MAX_ROWS && here.1 < crate::sync::MAX_COLS,
                             "单元格坐标越界"

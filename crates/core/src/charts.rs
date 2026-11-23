@@ -130,12 +130,8 @@ fn load_charts_for_part(zip: &mut zip::ZipArchive<std::fs::File>, sheet_path: &s
         Some((dir, base)) => format!("{dir}/_rels/{base}.rels"),
         None => return Ok(Vec::new()),
     };
-    let mut rels_xml = String::new();
-    {
-        use std::io::Read;
-        let Ok(mut f) = zip.by_name(&rels_path) else { if dbg { eprintln!("[chart] 没有 sheet rels {rels_path}") } return Ok(Vec::new()) };
-        let _ = f.read_to_string(&mut rels_xml);
-    }
+    if zip.index_for_name(&rels_path).is_none() { return Ok(Vec::new()); }
+    let rels_xml = crate::xlsx::read_zip_text(zip, &rels_path)?;
     let Some(drawing_target) = find_rel_target(&rels_xml, "/drawing") else { if dbg { eprintln!("[chart] sheet rels 里没有 drawing 关系") } return Ok(Vec::new()) };
     // rels 里的路径相对于 sheet 所在目录
     let sheet_dir = match sheet_path.rsplit_once('/') {
@@ -144,28 +140,15 @@ fn load_charts_for_part(zip: &mut zip::ZipArchive<std::fs::File>, sheet_path: &s
     };
     let drawing_path = normalize(&sheet_dir, &drawing_target);
 
-    let mut drawing_xml = String::new();
-    {
-        use std::io::Read;
-        let Ok(mut f) = zip.by_name(&drawing_path) else {
-            anyhow::bail!("工作表引用了 drawing 部件 {drawing_path}，但包里没有它");
-        };
-        let _ = f.read_to_string(&mut drawing_xml);
-    }
+    let drawing_xml = crate::xlsx::read_zip_text(zip, &drawing_path)?;
 
     // drawing 的 rels：chart 关系
     let d_rels = match drawing_path.rsplit_once('/') {
         Some((dir, base)) => format!("{dir}/_rels/{base}.rels"),
         None => return Ok(Vec::new()),
     };
-    let mut d_rels_xml = String::new();
-    let mut d_rels_ok = false;
-    {
-        use std::io::Read;
-        if let Ok(mut f) = zip.by_name(&d_rels) {
-            d_rels_ok = f.read_to_string(&mut d_rels_xml).is_ok();
-        }
-    }
+    let d_rels_ok = zip.index_for_name(&d_rels).is_some();
+    let d_rels_xml = if d_rels_ok { crate::xlsx::read_zip_text(zip, &d_rels)? } else { String::new() };
     let mut chart_targets: HashMap<String, (String, bool)> = HashMap::new();
     {
         let mut r = Reader::from_str(&d_rels_xml);
@@ -219,16 +202,7 @@ fn load_charts_for_part(zip: &mut zip::ZipArchive<std::fs::File>, sheet_path: &s
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("drawing 里的图表引用 {rid} 在关系部件中不存在"))?;
         {
-            use std::io::Read;
-            let mut cx = String::new();
-            {
-                use std::io::Read;
-                let mut f = zip
-                    .by_name(&cp)
-                    .map_err(|e| anyhow::anyhow!("drawing 关系指向的图表部件 {cp} 不存在：{e}"))?;
-                f.read_to_string(&mut cx)
-                    .map_err(|e| anyhow::anyhow!("图表部件 {cp} 读取失败：{e}"))?;
-            }
+            let cx = crate::xlsx::read_zip_text(zip, &cp)?;
             // 截断/半截 XML 里可能已经出现 <c:barChart>，parse_chart 会返回部分结果；
             // 先做严格良构校验，坏 XML 一律报错而不是"读到一半当成功"。
             let mut r = Reader::from_str(&cx);

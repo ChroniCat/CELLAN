@@ -5194,27 +5194,11 @@ impl SheetApp {
                                 }
                             }
                             if let Ok(name) = std::env::var("SC_SCEN_SHOW") {
-                                let sc = self
-                                    .wb
-                                    .sheet(self.sheet_idx)
-                                    .scenarios
-                                    .iter()
-                                    .find(|x| x.name == name)
-                                    .cloned();
-                                match sc {
-                                    Some(sc) => {
-                                        for ((r, c), v) in &sc.cells {
-                                            let val = sheetcore::scenarios::apply_value(v);
-                                            let sh = self.wb.sheet_mut(self.sheet_idx);
-                                            let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
-                                            cell.value = val;
-                                            cell.formula = None;
-                                            sh.set(*r, *c, cell);
-                                        }
-                                        sheetcore::formula::recalc_all(&mut self.wb);
-                                        eprintln!("[scen] shown {name}");
-                                    }
-                                    None => eprintln!("[scen] not found {name}"),
+                                if let Some(i) = self.wb.sheet(self.sheet_idx).scenarios.iter().position(|sc| sc.name == name) {
+                                    self.show_scenario(i);
+                                    eprintln!("[scen] {}", self.scen_msg);
+                                } else {
+                                    eprintln!("[scen] not found {name}");
                                 }
                             }
                             if std::env::var("SC_SCEN_SUMMARY").is_ok() {
@@ -6771,7 +6755,7 @@ impl SheetApp {
     /// 工作表受保护时阻止一切改内容的操作
     /// 只读查询：当前选区是否因后台构图或工作表保护而被禁止编辑（供菜单/功能区灰态判定，不改 status）
     pub(crate) fn is_edit_blocked(&self) -> bool {
-        if self.deps_pending {
+        if self.deps_pending || self.net.as_ref().is_some_and(net::Net::pending_structure) {
             return true;
         }
         if self.wb.sheet(self.sheet_idx).protection.is_some() {
@@ -6784,6 +6768,10 @@ impl SheetApp {
     }
 
     fn edit_blocked(&mut self) -> bool {
+        if self.net.as_ref().is_some_and(net::Net::pending_structure) {
+            self.status = "正在等待宿主确认插删操作".into();
+            return true;
+        }
         if self.deps_pending {
             self.status = "大型工作簿正在后台构建依赖图，请稍候再编辑".into();
             return true;
@@ -6874,6 +6862,10 @@ impl SheetApp {
 
     /// 需要整表权限的操作（插入/删除行列、排序、筛选）：没授权就拒绝并说明原因
     fn prot_denied(&mut self, op: sheetcore::protection::ProtOp, what: &str) -> bool {
+        if self.net.as_ref().is_some_and(net::Net::pending_structure) {
+            self.status = "正在等待宿主确认插删操作".into();
+            return true;
+        }
         if self.wb.sheet(self.sheet_idx).protection.is_none() || self.prot_can(op) {
             return false;
         }
@@ -6912,6 +6904,10 @@ impl SheetApp {
         what: &str,
         op: Option<sheetcore::protection::ProtOp>,
     ) -> bool {
+        if self.net.as_ref().is_some_and(net::Net::pending_structure) {
+            self.status = "正在等待宿主确认插删操作".into();
+            return false;
+        }
         if self.deps_pending {
             self.status = "大型工作簿正在后台构建依赖图，请稍候再操作".into();
             return false;
@@ -7082,11 +7078,13 @@ impl SheetApp {
     }
 
     fn record_deltas_and_merges(&mut self, label: &str, deltas: Vec<sheetcore::undo::CellDelta>, merges: Option<sheetcore::undo::MergeEdit>) {
-        if deltas.is_empty() && merges.is_none() {
-            return;
-        }
+        self.record_deltas_at(label, deltas, merges, (self.sheet_idx, self.sel.0, self.sel.1));
+    }
+
+    fn record_deltas_at(&mut self, label: &str, deltas: Vec<sheetcore::undo::CellDelta>,
+        merges: Option<sheetcore::undo::MergeEdit>, focus: (usize,u32,u32)) {
+        if deltas.is_empty() && merges.is_none() { return; }
         self.record_revision(label, &deltas);
-        let focus = (self.sheet_idx, self.sel.0, self.sel.1);
         self.undo.push(sheetcore::undo::Action {
             label: label.to_string(),
             merges,
@@ -9372,7 +9370,7 @@ impl SheetApp {
     /// C09：选文件后先打开选项对话框（编码/引号/表头/文本列 + 真实预览）
     fn open_csv_dialog(&mut self, path: &std::path::Path) {
         self.csv_job = None;
-        self.csv_dlg = Some(CsvDlg::new(path, sheet_edit_target::SheetEditTarget::current(self, self.sel)));
+        self.csv_dlg = Some(CsvDlg::new(path, sheet_edit_target::SheetEditTarget::current(self, self.sel), self.wb.sheet(self.sheet_idx).reorder_snapshot()));
     }
 
     fn csv_dlg_ui(&mut self, ctx: &egui::Context) {
@@ -10957,6 +10955,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 "{}：合并结构与当前表冲突或区域内有他人改动，已整体放弃（结构、内容和广播均未改动）",
                 if redo { "重做" } else { "撤销" }
             );
+            return false;
+        }
+        if applied.skipped > 0 && applied.touched.is_empty() && applied.refresh_sizes.is_none() {
+            self.status = format!("{}：{} 格已被其他用户修改，已跳过", applied.label, applied.skipped);
             return false;
         }
         // 刷新类动作撤销/重做时把外源源尺寸一起还原
@@ -15691,7 +15693,7 @@ let txn = self.txn_begin(&keys);
         let mut do_show = false;
         let mut do_del = false;
         let mut do_summary = false;
-        let list = self.wb.sheet(self.sheet_idx).scenarios.clone();
+        let list = &self.wb.sheet(self.sheet_idx).scenarios;
         let mut sel = self.scen_sel;
         ui_kit::window(ctx, "方案管理器", 580.0)
             .open(&mut open)
@@ -15768,13 +15770,11 @@ let txn = self.txn_begin(&keys);
                     }
                 });
             });
-        if self.scen_sel != sel {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            sh.scenario_settings.current = sel;
-            sh.scenarios_dirty = true;
-            self.wb.dirty = true;
-        }
         self.scen_sel = sel;
+        if (do_add || do_del) && !self.write_preflight_op(&[], "编辑方案", sheetcore::protection::ProtOp::EditScenarios) {
+            self.scen_msg = self.status.clone();
+            return;
+        }
         let rect = Self::parse_rect(&self.scen_range);
         if do_add {
             match (rect, self.scen_name.trim().is_empty()) {
@@ -15793,14 +15793,18 @@ let txn = self.txn_begin(&keys);
                     let n = sc.cells.len();
                     {
                         let sh = self.wb.sheet_mut(self.sheet_idx);
-                        if let Some(pos) = sh.scenarios.iter().position(|x| x.name == name) {
-                            sh.scenarios[pos].replace_inputs(sc);
+                        if let Some(existing) = sh.scenarios.iter_mut().find(|x| x.name == name) {
+                            if existing.comment != sc.comment || existing.cells != sc.cells {
+                                existing.replace_inputs(sc);
+                                sh.scenarios_dirty = true;
+                                self.wb.dirty = true;
+                            }
                         } else {
                             sh.scenarios.push(sc);
+                            sh.scenarios_dirty = true;
+                            self.wb.dirty = true;
                         }
-                        sh.scenarios_dirty = true;
                     }
-                    self.wb.dirty = true;
                     self.scen_msg = format!("已保存方案「{name}」（{n} 个单元格）");
                     self.status = format!("方案「{name}」已保存");
                 }
@@ -15808,29 +15812,8 @@ let txn = self.txn_begin(&keys);
                 (_, true) => self.scen_msg = "名称不能为空".into(),
             }
         }
-        if do_show {
-            if let Some(i) = self.scen_sel {
-                if let Some(sc) = self.wb.sheet(self.sheet_idx).scenarios.get(i).cloned() {
-                    let sh = self.wb.sheet_mut(self.sheet_idx);
-                    sh.scenario_settings.show = Some(i);
-                    sh.scenarios_dirty = true;
-                    for ((r, c), v) in &sc.cells {
-                        let val = sheetcore::scenarios::apply_value(v);
-                        let sh = self.wb.sheet_mut(self.sheet_idx);
-                        let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
-                        cell.value = val;
-                        cell.formula = None;
-                        sh.set(*r, *c, cell);
-                    }
-                    self.wb.dirty = true;
-                    self.doc_gen = self.doc_gen.wrapping_add(1);
-                    self.deps = sheetcore::formula::deps::Deps::build(&self.wb).into();
-                    sheetcore::formula::recalc_dirty(&mut self.wb, &self.deps, &[]);
-                    sheetcore::formula::recalc_all(&mut self.wb);
-                    self.scen_msg = format!("已显示方案「{}」", sc.name);
-                    self.status = format!("已切换到方案「{}」", sc.name);
-                }
-            }
+        if do_show && let Some(i) = self.scen_sel {
+            self.show_scenario(i);
         }
         if do_del {
             if let Some(i) = self.scen_sel {
@@ -15867,6 +15850,36 @@ let txn = self.txn_begin(&keys);
         }
     }
 
+    fn show_scenario(&mut self, index: usize) {
+        let sheet_index = self.sheet_idx;
+        let Some(sc) = self.wb.sheet(sheet_index).scenarios.get(index).cloned() else { return };
+        let mut keys: Vec<_> = sc.cells.iter().map(|(key, _)| *key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        if !self.write_preflight(&keys, "显示方案") {
+            self.scen_msg = self.status.clone();
+            return;
+        }
+        let before = self.txn_begin(&keys);
+        let sheet = self.wb.sheet_mut(sheet_index);
+        for ((row,col),v) in &sc.cells {
+            let cell = sheetcore::Cell { value: sheetcore::scenarios::apply_value(v), formula: None };
+            if sheet.get(*row,*col).cloned().unwrap_or_default() != cell {
+                sheet.set(*row,*col,cell);
+            }
+        }
+        let deltas = sheetcore::undo::finish(before,sheet);
+        if !deltas.is_empty() {
+            let changed:Vec<_> = deltas.iter().map(|d|(sheet_index,d.row,d.col)).collect();
+            self.record_deltas("显示方案", deltas);
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.wb.dirty = true;
+            self.recalc_and_broadcast(&changed);
+        }
+        self.scen_msg = format!("已显示方案「{}」",sc.name);
+        self.status = self.scen_msg.clone();
+    }
+
     /// "A1:C3" / "A1" → (r1, c1, r2, c2)
     fn parse_rect(s: &str) -> Option<(u32, u32, u32, u32)> {
         let t = s.trim();
@@ -15885,19 +15898,13 @@ let txn = self.txn_begin(&keys);
         &mut self,
         results: &str,
     ) -> Result<String, String> {
-        let list = self.wb.sheet(self.sheet_idx).scenarios.clone();
+        let list = &self.wb.sheet(self.sheet_idx).scenarios;
         if list.is_empty() {
             return Err("还没有方案，先保存一个".into());
         }
-        let mut keys: Vec<(u32, u32)> = Vec::new();
-        for sc in &list {
-            for (k, _) in &sc.cells {
-                if !keys.contains(k) {
-                    keys.push(*k);
-                }
-            }
-        }
-        keys.sort();
+        let mut keys: Vec<_> = list.iter().flat_map(|sc| sc.cells.iter().map(|(key, _)| *key)).collect();
+        keys.sort_unstable();
+        keys.dedup();
         let mut result_cells = Vec::new();
         for range in results.split_whitespace() {
             let (r1,c1,r2,c2) = Self::parse_rect(range).ok_or_else(|| format!("结果单元格地址无效：{range}"))?;
@@ -15908,44 +15915,28 @@ let txn = self.txn_begin(&keys);
                 }
             }
         }
-        // 逐个方案代值、重算、抓结果
-        let mut rows: Vec<Vec<Vec<sheetcore::model::Value>>> = Vec::new();
-        let deps = sheetcore::formula::deps::Deps::build(&self.wb);
-        for sc in &list {
-            let mut preview = self.wb.clone();
-            for ((r, c), v) in &sc.cells {
-                let val = sheetcore::scenarios::apply_value(v);
-                let sh = preview.sheet_mut(self.sheet_idx);
-                let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
-                cell.value = val;
-                cell.formula = None;
-                sh.set(*r, *c, cell);
+        if keys.len() + result_cells.len() + 1 > sheetcore::sync::MAX_COLS as usize
+            || list.len() + 2 > sheetcore::sync::MAX_ROWS as usize {
+            return Err("方案摘要超过工作表的行列上限".into());
+        }
+        let mut rows = Vec::new();
+        if !result_cells.is_empty() {
+            let deps = sheetcore::formula::deps::Deps::build(&self.wb);
+            for sc in list {
+                let mut preview = self.wb.clone();
+                let sheet = preview.sheet_mut(self.sheet_idx);
+                for ((r, c), v) in &sc.cells {
+                    sheet.set(*r, *c, sheetcore::Cell {
+                        value: sheetcore::scenarios::apply_value(v),
+                        formula: None,
+                    });
+                }
+                let seeds: Vec<_> = sc.cells.iter().map(|((r, c), _)| (self.sheet_idx, *r, *c)).collect();
+                sheetcore::formula::recalc_dirty(&mut preview, &deps, &seeds);
+                let values: Vec<_> = result_cells.iter().map(|&(r, c)| preview.sheet(self.sheet_idx).value(r, c)).collect();
+                rows.push(values);
             }
-            let seeds: Vec<_> = sc
-                .cells
-                .iter()
-                .map(|((r, c), _)| (self.sheet_idx, *r, *c))
-                .collect();
-            sheetcore::formula::recalc_dirty(&mut preview, &deps, &seeds);
-            let vals: Vec<sheetcore::model::Value> = result_cells
-                .iter()
-                .map(|(r, c)| {
-                    preview
-                        .sheet(self.sheet_idx)
-                        .get(*r, *c)
-                        .map(|x| x.value.clone())
-                        .unwrap_or_default()
-                })
-                .collect();
-            rows.push(vec![vals]);
         }
-        let sh = self.wb.sheet_mut(self.sheet_idx);
-        let refs = (!results.is_empty()).then(|| results.to_owned());
-        if sh.scenario_settings.sqref != refs {
-            sh.scenario_settings.sqref = refs;
-            sh.scenarios_dirty = true;
-        }
-
         let mut base = "方案摘要".to_string();
         let mut n = 1;
         while self.wb.sheets.iter().any(|s| s.name == base) {
@@ -15953,7 +15944,7 @@ let txn = self.txn_begin(&keys);
             base = format!("方案摘要{n}");
         }
         let mut sh = sheetcore::model::Sheet::new(&base);
-        let mut put = |sh: &mut sheetcore::model::Sheet,
+        let put = |sh: &mut sheetcore::model::Sheet,
                        r: u32,
                        c: u32,
                        v: sheetcore::model::Value| {
@@ -15986,16 +15977,11 @@ let txn = self.txn_begin(&keys);
         for (i, sc) in list.iter().enumerate() {
             let row = i as u32 + 2;
             put(&mut sh, row, 0, sheetcore::model::Value::Text(sc.name.clone().into()));
-            for (j, k) in keys.iter().enumerate() {
-                let v = sc
-                    .cells
-                    .iter()
-                    .find(|(kk, _)| kk == k)
-                    .map(|(_, v)| sheetcore::scenarios::apply_value(v))
-                    .unwrap_or_default();
-                put(&mut sh, row, j as u32 + 1, v);
+            for (key, text) in &sc.cells {
+                let j = keys.binary_search(key).expect("scenario input is in the summary columns");
+                put(&mut sh, row, j as u32 + 1, sheetcore::scenarios::apply_value(text));
             }
-            for (j, v) in rows[i][0].iter().enumerate() {
+            for (j, v) in rows.get(i).into_iter().flatten().enumerate() {
                 put(
                     &mut sh,
                     row,
@@ -22988,7 +22974,15 @@ let txn = self.txn_begin(&keys);
                 self.status = message;
                 return;
             }
+            if !net.hosting {
+                self.status = format!("等待宿主确认{}",op.label());
+                return;
+            }
         }
+        self.apply_local_structural(idx, op);
+    }
+
+    fn apply_local_structural(&mut self, idx: usize, op: sheetcore::structural::Structural) {
         let updates = self.structural_updates(idx, &op);
         let before = sheetcore::undo::snapshot_structure(&self.wb, idx, &op);
         let pending_pivots_before = self.wb.pivots_pending.len();
@@ -30995,6 +30989,13 @@ let txn = self.txn_begin(&keys);
         self.locks.shift_structural(sheet, op);
         if let Some(peer) = self.peer.as_mut() {
             peer.shift_structural(sheet, op);
+            let names: Vec<_> = self.wb.sheets.iter().map(|sheet| sheet.name.clone()).collect();
+            let shifts = sheetcore::sync::structural_reference_shifts(&names,sheet,op);
+            for cell in peer.cells.values_mut() {
+                if let Some(formula) = cell.shifted_formula(&shifts) {
+                    std::sync::Arc::make_mut(cell).formula = Some(formula);
+                }
+            }
         }
         if let Some((ls, lr, lc)) = self.my_lock {
             if ls == sheet {
@@ -34222,6 +34223,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         for e in events {
             match e {
                 net::NetEvent::Sort(plan, reply) => {
+                    if !reply.pending() { continue; }
                     if let (Some(net),Some(sheet)) = (&self.net,self.wb.sheets.get(plan.sheet)) {
                         let target = crate::net_sort::SortTarget { document: self.doc_uid, sheet: plan.sheet,
                             identity: sheet.identity, coordinates: sheet.coordinate_revision() };
@@ -34235,6 +34237,9 @@ fn elide(s: &str, max_chars: usize) -> String {
                     if reply.send(accepted).is_ok() && accepted && let Some(batch) = batch {
                         self.apply_remote_sort(&batch);
                     }
+                }
+                net::NetEvent::LocalSortRepair(correction) => {
+                    correction.chunks(|sheet,first,items| { self.repair_rejected_sort(sheet,first,items); true });
                 }
                 net::NetEvent::SortRepairs { sheet, first_ts, items } => {
                     self.repair_rejected_sort(sheet,first_ts,items);
@@ -34315,8 +34320,24 @@ fn elide(s: &str, max_chars: usize) -> String {
                     if let Some(net) = &self.net { net.note_structure(items.len()); }
                     self.struct_history.extend(items);
                 }
+                crate::net::NetEvent::StructureRevision(revision) => {
+                    if let Some(net) = &self.net { net.set_structure_revision(revision); }
+                }
+                crate::net::NetEvent::StructuralRejected(reason) => {
+                    if let Some(net) = &self.net { net.finish_structure(); }
+                    self.status = reason;
+                }
                 crate::net::NetEvent::Structural { site, sheet, op } => {
-                    if let Some(net) = &self.net { net.note_structure(1); }
+                    if let Some(net) = &self.net {
+                        net.note_structure(1);
+                        if !net.hosting && net.site == site {
+                            net.finish_structure();
+                            if sheet < self.wb.sheets.len() {
+                                self.apply_local_structural(sheet, op);
+                            }
+                            continue;
+                        }
+                    }
                     if sheet < self.wb.sheets.len() {
                         let updates = self.structural_updates(sheet, &op);
                         let label = op.label();
@@ -34494,6 +34515,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     // 快照落定后再补发（断线期间的编辑原本会被这里静默清掉）。
                     self.stash_own_ops_for_rejoin();
                     if let Some(net) = &self.net {
+                        net.finish_structure();
                         net.reset_structure();
                         for ts in net.discard_pending_sorts() { self.undo.reject_sort(ts); }
                     }
@@ -34702,6 +34724,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     }
                 }
                 net::NetEvent::Disconnected(msg) => {
+                    if let Some(net) = &self.net { net.finish_structure(); }
                     eprintln!("[net] disconnected: {msg}");
                     if let Some((uid, _)) = self.delegated_save_pending.take() {
                         if uid == self.doc_uid { self.tasks.autosave_after_detach = Some(false); }
@@ -35036,6 +35059,11 @@ impl eframe::App for SheetApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut compacting = self.undo.poll_compaction();
+        for tab in &mut self.tabs {
+            if let TabSlot::Parked(doc) = tab { compacting |= doc.undo.poll_compaction(); }
+        }
+        if compacting { ctx.request_repaint_after(std::time::Duration::from_millis(120)); }
         let frame_start = std::time::Instant::now();
         if let Some(hook) = &self.grid_paste { hook.begin_frame(); }
         // UI-25.1 无界面验收：SC_FRAME_TIMES=<path> 逐帧记「距上一帧的毫秒数」，

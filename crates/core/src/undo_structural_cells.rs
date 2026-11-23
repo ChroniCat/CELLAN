@@ -52,6 +52,9 @@ impl FormulaValues {
     }
 
     fn restore(&self, store: &mut Store) -> Option<()> {
+        if self.numbers.is_empty() && self.other.is_empty() {
+            return (!store.has_formulas()).then_some(());
+        }
         let mut others = self.other.iter().peekable();
         let mut numbers = self.numbers.iter();
         let mut changes = Vec::new();
@@ -127,72 +130,69 @@ fn same_mapped(source: &Cell, desired: &Cell, shift: &Shift) -> bool {
 
 fn input_digest(sheet: &Sheet, legacy: &HashMap<CellRef, Cell>) -> [u8; 32] {
     let mut hash = Sha256::new();
-    // Row-major traversal and tagged, length-prefixed fields make the digest
-    // independent of storage layout and unambiguous for arbitrary user text.
     for (k, cell) in sheet.iter() {
-        if sheet.spilled.contains(&k) || legacy.contains_key(&k) {
-            continue;
-        }
-        hash.update(k.row.to_le_bytes());
-        hash.update(k.col.to_le_bytes());
-        if let Some(f) = cell.formula.as_deref() {
-            hash.update([0]);
-            hash.update((f.len() as u64).to_le_bytes());
-            hash.update(f.as_bytes());
-        } else {
-            match &cell.value {
-                Value::Number(n) => {
-                    hash.update([1]);
-                    hash.update(n.to_bits().to_le_bytes());
-                }
-                Value::Text(t) => {
-                    hash.update([2]);
-                    hash.update((t.len() as u64).to_le_bytes());
-                    hash.update(t.as_bytes());
-                }
-                Value::Bool(b) => hash.update([3, *b as u8]),
-                Value::Error(e) => hash.update([4, *e as u8]),
-                Value::Empty => hash.update([5]),
-            }
+        if !sheet.spilled.contains(&k) && !legacy.contains_key(&k) {
+            hash_input(&mut hash, k, cell);
         }
     }
     hash.finalize().into()
 }
 
+// Use the same row-major sequence and typed fields when recording a snapshot and checking a fork.
+fn hash_input(hash: &mut Sha256, k: CellRef, cell: &Cell) {
+    hash.update(k.row.to_le_bytes());
+    hash.update(k.col.to_le_bytes());
+    if let Some(f) = cell.formula.as_deref() {
+        hash.update([0]);
+        hash.update((f.len() as u64).to_le_bytes());
+        hash.update(f.as_bytes());
+    } else {
+        match &cell.value {
+            Value::Number(n) => {
+                hash.update([1]);
+                hash.update(n.to_bits().to_le_bytes());
+            }
+            Value::Text(t) => {
+                hash.update([2]);
+                hash.update((t.len() as u64).to_le_bytes());
+                hash.update(t.as_bytes());
+            }
+            Value::Bool(b) => hash.update([3, *b as u8]),
+            Value::Error(e) => hash.update([4, *e as u8]),
+            Value::Empty => hash.update([5]),
+        }
+    }
+}
+
 impl CellHistory {
-    pub(super) fn between(source: &Sheet, desired: &Sheet, shift: &Shift) -> Self {
-        let forward = on_sheet(shift, source);
-        let reverse = Shift {
-            delete: !shift.delete,
-            ..forward.clone()
+    /// Record both directions together. Each sheet is visited once in row-major order:
+    /// digest, formula caches, non-invertible values and the opposite side's holes share the pass.
+    pub(super) fn pair(
+        before: &Sheet,
+        after: &Sheet,
+        forward: &Shift,
+        backward: &Shift,
+    ) -> (Self, Self) {
+        let (mut undo, redo_blanks) = Self::record_side(before, after, backward, forward);
+        let (mut redo, undo_blanks) = Self::record_side(after, before, forward, backward);
+        undo.exceptions
+            .extend(undo_blanks.into_iter().map(|key| (key, Cell::default())));
+        redo.exceptions
+            .extend(redo_blanks.into_iter().map(|key| (key, Cell::default())));
+        (undo, redo)
+    }
+
+    fn record_side(
+        desired: &Sheet,
+        other: &Sheet,
+        toward_desired: &Shift,
+        toward_other: &Shift,
+    ) -> (Self, Vec<CellRef>) {
+        let incoming = on_sheet(toward_desired, other);
+        let inverse = Shift {
+            delete: !incoming.delete,
+            ..incoming.clone()
         };
-        let mut exceptions = Vec::new();
-        let mut formula_values = FormulaValues::default();
-        let mut formula_index = 0;
-        // A deleted row has no inverse source. A formula that was rewritten to
-        // #REF! cannot recover its text. Record these, including formula caches.
-        for (key, cell) in desired.iter() {
-            if cell.formula.is_some() {
-                formula_values.push(formula_index, &cell.value);
-                formula_index += 1;
-            }
-            let prior = map(key, &reverse)
-                .filter(|k| !source.spilled.contains(k))
-                .and_then(|k| source.get(k.row, k.col));
-            if desired.spilled.contains(&key)
-                || !prior.is_some_and(|v| same_mapped(v, cell, &forward))
-            {
-                exceptions.push((key, cell.clone()));
-            }
-        }
-        for (key, _) in source.iter() {
-            if !source.spilled.contains(&key)
-                && let Some(dest) = map(key, &forward)
-                && !desired.contains(dest.row, dest.col)
-            {
-                exceptions.push((dest, Cell::default()));
-            }
-        }
         let mut legacy = HashMap::new();
         for &(anchor, rect) in &desired.arrays {
             if !desired.spill_shapes.contains_key(&anchor) {
@@ -206,13 +206,50 @@ impl CellHistory {
                 );
             }
         }
-        Self {
-            version: desired.cell_version().clone(),
-            hash: input_digest(desired, &legacy),
-            legacy,
-            exceptions,
-            formula_values,
+        let mut exceptions = Vec::new();
+        let mut clear_other = Vec::new();
+        let mut formula_values = FormulaValues::default();
+        let mut formula_index = 0;
+        let mut hash = Sha256::new();
+        for (key, cell) in desired.iter() {
+            let spill = desired.spilled.contains(&key);
+            if !spill && !legacy.contains_key(&key) {
+                hash_input(&mut hash, key, cell);
+            }
+            if cell.formula.is_some() {
+                formula_values.push(formula_index, &cell.value);
+                formula_index += 1;
+            }
+            let origin = map(key, &inverse);
+            let prior = origin.and_then(|pos| other.get(pos.row, pos.col));
+            let invertible = origin.is_some_and(|pos| !other.spilled.contains(&pos))
+                && prior.is_some_and(|c| same_mapped(c, cell, &incoming));
+            if spill || !invertible {
+                exceptions.push((key, cell.clone()));
+            }
+            // Composite operations (subtotals and partial cell shifts) can have different
+            // forward and reverse boundaries. Only reuse the lookup for the same coordinate.
+            if !spill && let Some(dest) = map(key, toward_other) {
+                let absent = if Some(dest) == origin {
+                    prior.is_none()
+                } else {
+                    !other.contains(dest.row, dest.col)
+                };
+                if absent {
+                    clear_other.push(dest);
+                }
+            }
         }
+        (
+            Self {
+                version: desired.cell_version().clone(),
+                hash: hash.finalize().into(),
+                legacy,
+                exceptions,
+                formula_values,
+            },
+            clear_other,
+        )
     }
 
     pub(super) fn matches(&self, live: &Sheet, expected: &Sheet) -> bool {
@@ -285,6 +322,51 @@ mod tests {
     };
 
     #[test]
+    fn paired_history_restores_exceptions_and_holes_with_different_shift_boundaries() {
+        let mut before = Sheet::new("Budget");
+        for (r, c, n) in [(0, 0, 1.), (1, 1, 2.), (3, 0, 8.), (8, 2, 16.)] {
+            before.set(
+                r,
+                c,
+                Cell {
+                    value: Value::Number(n),
+                    formula: None,
+                },
+            );
+        }
+        let mut after = before.clone();
+        after.insert_rows(2, 1);
+        after.remove(0, 0);
+        after.set(
+            3,
+            4,
+            Cell {
+                value: Value::Text("new".into()),
+                formula: None,
+            },
+        );
+        let forward = Structural::InsertRows { at: 2, n: 1 }.reference_shift();
+        let reverse = Structural::DeleteRows { at: 1, n: 1 }.reference_shift();
+        let (undo, redo) = CellHistory::pair(&before, &after, &forward, &reverse);
+        let restored = undo.restore(&after, &reverse).unwrap();
+        assert!(restored.iter().eq(before.iter()));
+        let reapplied = redo.restore(&before, &forward).unwrap();
+        assert!(reapplied.iter().eq(after.iter()));
+        let mut changed = after.clone();
+        changed.set(
+            20,
+            1,
+            Cell {
+                value: Value::Bool(true),
+                formula: None,
+            },
+        );
+        assert!(!redo.matches(&changed, &after));
+        changed.remove(20, 1);
+        assert!(redo.matches(&changed, &after));
+    }
+
+    #[test]
     fn inverse_axis_restores_cached_formula_state_after_later_calculation() {
         let mut wb = Workbook::new_blank();
         for (r, n) in [(0, 3.), (1, 20.), (2, 5.)] {
@@ -308,8 +390,8 @@ mod tests {
         let mut stack = crate::undo::UndoStack::new();
         stack.push_structure("delete", snapshot, staged, (0, 0, 0));
         let reverse = Structural::InsertRows { at: 1, n: 1 }.reference_shift();
-        let history = CellHistory::between(wb.sheet(0), &before, &reverse);
-        let guard = CellHistory::between(&before, wb.sheet(0), &op.reference_shift());
+        let (history, guard) =
+            CellHistory::pair(&before, wb.sheet(0), &op.reference_shift(), &reverse);
         let after = wb.sheet(0).clone();
         formula::recalc_all_force(&mut wb);
         assert_eq!(wb.sheet(0).value(0, 2), Value::Number(10.));

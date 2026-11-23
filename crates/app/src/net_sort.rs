@@ -45,13 +45,23 @@ impl SortBatch {
 
     pub fn offer(&self) -> SortPermutation {
         let mut plan = self.plan.clone();
-        plan.digest = *self.checksum.get_or_init(|| digest(&self.ops, &self.styles));
+        plan.digest = *self
+            .checksum
+            .get_or_init(|| digest(&self.ops, &self.styles));
         plan
     }
 
     pub fn expand(
         plan: &SortPermutation,
+        read: impl FnMut(u32, u32) -> (ValueWire, Option<String>, Arc<CellStyle>),
+    ) -> Option<Self> {
+        Self::expand_while(plan, read, || true)
+    }
+
+    fn expand_while(
+        plan: &SortPermutation,
         mut read: impl FnMut(u32, u32) -> (ValueWire, Option<String>, Arc<CellStyle>),
+        pending: impl Fn() -> bool,
     ) -> Option<Self> {
         if !plan.valid() {
             return None;
@@ -72,11 +82,17 @@ impl SortBatch {
         let mut ops = Vec::new();
         let mut styles = Vec::new();
         for (i, &src) in plan.order.iter().enumerate() {
+            if i % 64 == 0 && !pending() {
+                return None;
+            }
             let dst = first + i as u32;
             if dst == src {
                 continue;
             }
             for offset in start..=end {
+                if offset != start && (offset - start) % 2048 == 0 && !pending() {
+                    return None;
+                }
                 let (r, c) = coords(src, offset);
                 let (row, col) = coords(dst, offset);
                 let (value, formula, style) = read(r, c);
@@ -157,7 +173,10 @@ fn digest(ops: &[Arc<Op>], styles: &[StyleItem]) -> [u8; 32] {
     for (r, c, style) in styles {
         hash.update(r.to_le_bytes());
         hash.update(c.to_le_bytes());
-        bytes(&mut hash, &serde_json::to_vec(style).expect("serializable style"));
+        bytes(
+            &mut hash,
+            &serde_json::to_vec(style).expect("serializable style"),
+        );
     }
     hash.finalize().into()
 }
@@ -166,17 +185,164 @@ pub(crate) fn from_sheet(
     sh: &sheetcore::Sheet,
     palette: &sheetcore::style::StyleTable,
     plan: &SortPermutation,
+    pending: impl Fn() -> bool,
 ) -> Option<SortBatch> {
     let mut styles = std::collections::HashMap::new();
-    SortBatch::expand(plan, |r, c| {
-        let style = styles
-            .entry(sh.style_of(r, c))
-            .or_insert_with_key(|id| Arc::new(palette.get(*id).clone()));
-        let cell = sh.get(r, c);
-        (
-            cell.map_or(ValueWire::Empty, |v| (&v.value).into()),
-            cell.and_then(|v| v.formula.as_deref().map(str::to_owned)),
-            style.clone(),
-        )
-    })
+    SortBatch::expand_while(
+        plan,
+        |r, c| {
+            let style = styles
+                .entry(sh.style_of(r, c))
+                .or_insert_with_key(|id| Arc::new(palette.get(*id).clone()));
+            let cell = sh.get(r, c);
+            (
+                cell.map_or(ValueWire::Empty, |v| (&v.value).into()),
+                cell.and_then(|v| v.formula.as_deref().map(str::to_owned)),
+                style.clone(),
+            )
+        },
+        pending,
+    )
+}
+
+// Persistent ordered maps give sort workers a stable view in constant time.
+// A regular edit copies only the path to that key when a worker holds a snapshot.
+type Key = (usize, u32, u32);
+pub(crate) type Grid<V> = immutable_chunkmap::map::MapM<Key, Arc<V>>;
+pub(crate) type SharedGrid<V> = Arc<std::sync::Mutex<Arc<Grid<V>>>>;
+
+#[derive(Clone)]
+pub(crate) struct RoomGrids {
+    pub cells: Arc<Grid<Op>>,
+    pub delta: Arc<Grid<Op>>,
+    pub styles: Arc<Grid<CellStyle>>,
+    pub delta_styles: Arc<Grid<CellStyle>>,
+}
+
+impl RoomGrids {
+    pub fn capture(
+        cells: &SharedGrid<Op>,
+        delta: &SharedGrid<Op>,
+        styles: &SharedGrid<CellStyle>,
+        delta_styles: &SharedGrid<CellStyle>,
+    ) -> Self {
+        Self {
+            cells: cells.lock().unwrap().clone(),
+            delta: delta.lock().unwrap().clone(),
+            styles: styles.lock().unwrap().clone(),
+            delta_styles: delta_styles.lock().unwrap().clone(),
+        }
+    }
+
+    pub fn expand(&self, plan: &SortPermutation) -> Option<SortBatch> {
+        let default = Arc::new(CellStyle::default_dark());
+        SortBatch::expand(plan, |r, c| {
+            let key = (plan.sheet, r, c);
+            let cell = self.cells.get(&key);
+            (
+                cell.map_or(ValueWire::Empty, |c| c.value.clone()),
+                cell.and_then(|c| c.formula.clone()),
+                self.styles.get(&key).unwrap_or(&default).clone(),
+            )
+        })
+    }
+
+    pub fn apply(&self, batch: &SortBatch) -> Self {
+        let mut next = self.clone();
+        let cells = Arc::make_mut(&mut next.cells);
+        let delta = Arc::make_mut(&mut next.delta);
+        for op in &batch.ops {
+            upsert(cells, op);
+            upsert(delta, op);
+        }
+        let styles = Arc::make_mut(&mut next.styles);
+        let delta_styles = Arc::make_mut(&mut next.delta_styles);
+        for (r, c, style) in &batch.styles {
+            let key = (batch.plan.sheet, *r, *c);
+            let style = Arc::new(style.clone());
+            styles.insert_cow(key, style.clone());
+            delta_styles.insert_cow(key, style);
+        }
+        next
+    }
+
+    // Caller holds the room ordering mutex across validation, publication and notification.
+    pub fn publish(
+        &self,
+        next: &Self,
+        cells: &SharedGrid<Op>,
+        delta: &SharedGrid<Op>,
+        styles: &SharedGrid<CellStyle>,
+        delta_styles: &SharedGrid<CellStyle>,
+    ) -> bool {
+        let mut c = cells.lock().unwrap();
+        let mut d = delta.lock().unwrap();
+        let mut s = styles.lock().unwrap();
+        let mut ds = delta_styles.lock().unwrap();
+        if !(Arc::ptr_eq(&c, &self.cells)
+            && Arc::ptr_eq(&d, &self.delta)
+            && Arc::ptr_eq(&s, &self.styles)
+            && Arc::ptr_eq(&ds, &self.delta_styles))
+        {
+            return false;
+        }
+        *c = next.cells.clone();
+        *d = next.delta.clone();
+        *s = next.styles.clone();
+        *ds = next.delta_styles.clone();
+        true
+    }
+}
+
+pub(crate) fn upsert(map: &mut Grid<Op>, op: &Arc<Op>) {
+    let key = (op.sheet, op.row, op.col);
+    if map
+        .get(&key)
+        .is_none_or(|v| (op.ts, op.site) > (v.ts, v.site))
+    {
+        map.insert_cow(key, op.clone());
+    }
+}
+
+/// Iterate only affected suffixes. Keep original entries available until every
+/// destination has been computed, including inserts that overlap existing keys.
+pub(crate) fn shift_grid<V>(
+    grid: &SharedGrid<V>,
+    sheet: usize,
+    op: &sheetcore::structural::Structural,
+    mut relocate: impl FnMut(&mut Arc<V>, u32, u32),
+) {
+    use sheetcore::structural::Structural::*;
+    let mut root = grid.lock().unwrap();
+    let source = root.clone();
+    let target = Arc::make_mut(&mut root);
+    let mut moved = Vec::new();
+    let mut shift = |first, last| {
+        for (&key, value) in source.range(first..=last) {
+            target.remove_cow(&key);
+            if let Some((r, c)) = sheetcore::sync::shift_structural_coord(key.1, key.2, op) {
+                let mut value = value.clone();
+                relocate(&mut value, r, c);
+                moved.push(((sheet, r, c), value));
+            }
+        }
+    };
+    let last = (sheet, u32::MAX, u32::MAX);
+    match *op {
+        InsertRows { at, .. } | DeleteRows { at, .. } => shift((sheet, at, 0), last),
+        InsertCols { at: 0, .. } | DeleteCols { at: 0, .. } => shift((sheet, 0, 0), last),
+        InsertCols { at, .. } | DeleteCols { at, .. } => {
+            let mut from = 0;
+            while let Some((&(_, row, _), _)) = source.range((sheet, from, 0)..=last).next() {
+                shift((sheet, row, at), (sheet, row, u32::MAX));
+                let Some(next) = row.checked_add(1) else {
+                    break;
+                };
+                from = next;
+            }
+        }
+    }
+    for (key, value) in moved {
+        target.insert_cow(key, value);
+    }
 }

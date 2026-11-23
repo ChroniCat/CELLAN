@@ -423,6 +423,8 @@ pub enum Msg {
         #[serde(default)]
         sort_permutation: bool,
         #[serde(default)]
+        structural_ack: bool,
+        #[serde(default)]
         clock: u64,
     },
     Snapshot { ops: Vec<Op> },
@@ -468,6 +470,10 @@ pub enum Msg {
         sheet: usize,
         op: crate::structural::Structural,
     },
+    /// Guests keep their original coordinate system until the host echoes Structural.
+    StructuralRequest { site: u32, sheet: usize, revision: usize, op: crate::structural::Structural },
+    StructuralRejected { reason: String },
+    StructureRevision { revision: usize },
     /// 请求编辑某格（同一格同时只允许一个人）
     LockReq { site: u32, name: String, sheet: usize, row: u32, col: u32 },
     /// 宿主批准（广播）
@@ -621,7 +627,9 @@ impl Msg {
             Msg::StructuralLog { items } => {
                 items.len() <= MAX_BATCH_ITEMS && items.iter().all(|(s, op)| structural_ok(*s, op))
             }
-            Msg::Structural { sheet, op, .. } => structural_ok(*sheet, op),
+            Msg::Structural { sheet, op, .. } | Msg::StructuralRequest { sheet, op, .. } => structural_ok(*sheet, op),
+            Msg::StructureRevision { revision } => u64::try_from(*revision).is_ok_and(ts_ok),
+            Msg::StructuralRejected { reason } => reason.len() <= MAX_SHORT_TEXT,
             Msg::LockReq { sheet, row, col, name, .. } | Msg::LockOk { sheet, row, col, name, .. } => {
                 cell_in_bounds(*sheet, *row, *col) && name.len() <= MAX_SHORT_TEXT
             }
@@ -759,6 +767,24 @@ fn shifting_sparse_column_suffixes_preserves_other_rows_and_sheets() {
 }
 
 pub type CellOps = std::collections::BTreeMap<(usize, u32, u32), std::sync::Arc<Op>>;
+
+/// Use the same per-sheet reference context as the workbook's structural edit.
+pub fn structural_reference_shifts(names: &[String], target: usize, op: &crate::structural::Structural)
+    -> Vec<crate::refs::Shift> {
+    let Some(name) = names.get(target) else { return Vec::new() };
+    let base = op.reference_shift();
+    names.iter().map(|own| crate::refs::Shift {
+        target_sheet:name.clone(), own_sheet:own.clone(), ..base.clone()
+    }).collect()
+}
+
+impl Op {
+    pub fn shifted_formula(&self, shifts: &[crate::refs::Shift]) -> Option<String> {
+        let formula = self.formula.as_ref()?;
+        let rewritten = crate::refs::rewrite(formula,shifts.get(self.sheet)?);
+        (rewritten != *formula).then_some(rewritten)
+    }
+}
 
 pub fn shift_cell_ops(cells: &mut CellOps, sheet: usize, op: &crate::structural::Structural) {
     shift_cell_map(cells, sheet, op, |op, row, col| {

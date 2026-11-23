@@ -309,6 +309,60 @@ pub(crate) fn styled_row(tag: &str, style: Option<u16>) -> Result<String> {
     )
 }
 
+/// umya requires both endpoints and eagerly allocates one dimension per column.
+/// Repair only the private DOM input, keeping the valid portion of every range.
+pub(crate) fn repair_column_bounds(header: &str) -> Result<String> {
+    let mut reader = quick_xml::Reader::from_str(header);
+    let root_name = loop {
+        match reader.read_event()? {
+            Event::Start(tag) => break tag.name().as_ref().to_owned(),
+            Event::Eof => anyhow::bail!("缺少 worksheet 根元素"),
+            _ => {}
+        }
+    };
+    let closed = format!("{header}</{root_name}>");
+    let doc = roxmltree::Document::parse(&closed)?;
+    let root = doc.root_element();
+    let named = |n: roxmltree::Node, name| {
+        n.is_element()
+            && n.tag_name().name() == name
+            && n.tag_name().namespace() == root.tag_name().namespace()
+    };
+    let mut edits = Vec::new();
+    for group in root.children().filter(|n| named(*n, "cols")) {
+        let mut group_edits = Vec::new();
+        let mut retained = false;
+        for col in group.children().filter(|n| named(*n, "col")) {
+            let index = |name| {
+                col.attribute(name)
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0)
+            };
+            let (first, last) = (index("min"), index("max"));
+            if first == 0 || first > last || first > crate::sync::MAX_COLS {
+                group_edits.push((col.range(), String::new()));
+                continue;
+            }
+            retained = true;
+            if last > crate::sync::MAX_COLS {
+                group_edits.push((
+                    col.attribute_node("max").unwrap().range_value(),
+                    crate::sync::MAX_COLS.to_string(),
+                ));
+            }
+        }
+        if !retained
+            && !group_edits.is_empty()
+            && group.children().all(|n| !n.is_element() || named(n, "col"))
+        {
+            edits.push((group.range(), String::new()));
+        } else {
+            edits.extend(group_edits);
+        }
+    }
+    render(header, edits)
+}
+
 fn columns(header: &str, root_name: &str, changes: &BTreeMap<u32, Change>) -> Result<String> {
     patch_columns(header, root_name, changes, false)
 }

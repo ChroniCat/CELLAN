@@ -661,6 +661,7 @@ impl Sheet {
     fn shift_axis_metadata(&mut self, shift: &MappedShift) {
         let rows = shift.axis == crate::refs::Axis::Row;
         if shift.n == 0 { return; }
+        crate::scenarios::shift_references(self, shift);
         let mut move_hidden = |hidden: &mut crate::layout::HiddenIndices| {
             if !hidden.is_empty() {
                 *hidden = hidden.iter().filter_map(|&pos| shift.map(pos)).collect::<HashSet<_>>().into();

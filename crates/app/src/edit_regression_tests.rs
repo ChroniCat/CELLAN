@@ -11389,11 +11389,35 @@ fn scenario_summary_uses_each_scenario_independently_and_preserves_live_formulas
         sc.cells.push((key,"1".into()));
         sheet.scenarios.push(sc);
     }
+    sheet.scenario_settings.sqref = Some("D2".into());
     app.build_scenario_summary("C1 A1").unwrap();
     assert_eq!(app.wb.sheet(0).get(0,0).unwrap().formula.as_deref(),Some("=2*3"));
     assert_eq!(app.wb.sheet(0).value(0,2),Value::Number(16.));
-    assert_eq!(app.wb.sheet(0).scenario_settings.sqref.as_deref(),Some("C1 A1"));
+    assert_eq!(app.wb.sheet(0).scenario_settings.sqref.as_deref(),Some("D2"));
+    assert!(!app.wb.sheet(0).scenarios_dirty);
     let report = app.wb.sheet(1);
     assert_eq!(report.value(2,3),Value::Number(11.));
     assert_eq!(report.value(3,3),Value::Number(7.));
+}
+
+#[test]
+fn scenario_show_after_row_delete_preserves_the_next_formula_and_is_undoable() {
+    let _env = crate::test_env::TestEnv::new("scenario-show-undo");
+    let mut app=app();
+    let sheet=app.wb.sheet_mut(0);
+    sheet.set(0,0,Cell { formula:Some("=3*4".into()),value:Value::Number(12.) });
+    sheet.set(1,0,number(20.));
+    sheet.set(2,0,Cell { formula:Some("=A1+1".into()),value:Value::Number(13.) });
+    let mut sc=sheetcore::scenarios::Scenario::new("inputs");
+    sc.cells=vec![((0,0),"7".into()),((1,0),"8".into())];
+    sheet.scenarios.push(sc);
+    sheet.delete_rows(1,1);
+    app.show_scenario(0);
+    assert_eq!(app.wb.sheet(0).value(0,0), Value::Number(7.));
+    assert_eq!(app.wb.sheet(0).get(1,0).unwrap().formula.as_deref(), Some("=A1+1"));
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).get(0,0).unwrap().formula.as_deref(), Some("=3*4"));
+    assert_eq!(app.wb.sheet(0).value(1,0), Value::Number(13.));
+    app.do_undo(true);
+    assert_eq!(app.wb.sheet(0).value(1,0), Value::Number(8.));
 }

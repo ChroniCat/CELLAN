@@ -8,6 +8,8 @@
 
 #[path = "undo_structural_cells.rs"]
 mod structural_cells;
+#[path = "undo_structural_history.rs"]
+mod structural_history;
 use crate::model::{Cell, CellRef, Sheet, Workbook};
 use std::collections::HashSet;
 #[path = "undo_references.rs"]
@@ -24,6 +26,27 @@ pub struct CellDelta {
     /// 样式号（StyleTable 里的索引，内容去重后稳定）
     pub before_style: u16,
     pub after_style: u16,
+}
+
+impl CellDelta {
+    fn can_replay(&self, sheet: &Sheet, redo: bool, guard: &mut impl FnMut(usize,u32,u32,&Cell) -> bool) -> bool {
+        let blank = Cell::default();
+        let current = sheet.get(self.row, self.col).unwrap_or(&blank);
+        let (expected, style) = if redo { (&self.before,self.before_style) } else { (&self.after,self.after_style) };
+        current.same_input(expected)
+            && (self.before_style == self.after_style || sheet.style_of(self.row,self.col) == style)
+            && guard(self.sheet,self.row,self.col,current)
+    }
+
+    fn replay(&self, sheet: &mut Sheet, redo: bool, style_changes: &mut Vec<(usize,u32,u32)>) {
+        if !self.before.same_input(&self.after) {
+            sheet.set(self.row, self.col, if redo { self.after.clone() } else { self.before.clone() });
+        }
+        if self.before_style != self.after_style {
+            sheet.set_style(self.row,self.col,if redo { self.after_style } else { self.before_style });
+            style_changes.push((self.sheet,self.row,self.col));
+        }
+    }
 }
 
 /// 整表快照（结构性改动用：删行之后没法靠「逐格回填」还原）
@@ -115,10 +138,8 @@ impl MergeEdit {
         guard: &mut impl FnMut(usize, u32, u32, &Cell) -> bool,
         forward: bool,
     ) -> Option<Vec<(usize, MergeRect, bool)>> {
-        let blank = Cell::default();
         for d in deltas {
-            let current = sheets.get(d.sheet)?.get(d.row, d.col).unwrap_or(&blank);
-            if !guard(d.sheet, d.row, d.col, current) { return None; }
+            if !d.can_replay(sheets.get(d.sheet)?, forward, guard) { return None; }
         }
         self.apply(sheets, forward)
     }
@@ -224,6 +245,7 @@ impl Action {
 pub struct UndoStack {
     done: Vec<Entry>,
     undone: Vec<Entry>,
+    pending_compaction: bool,
     /// 最多保留多少步
     pub limit: usize,
     /// 我是谁（协作站点号）；0 表示单人。撤销只退自己的动作
@@ -385,6 +407,7 @@ struct SheetTabAction {
 }
 
 struct NumericSortAction {
+    excluded: std::collections::HashSet<(u32,u32)>,
     sort: crate::data_tools::CompactSort,
     label: String,
     focus: (usize, u32, u32),
@@ -392,28 +415,28 @@ struct NumericSortAction {
 }
 
 impl NumericSortAction {
-    fn apply(&self, sheets: &mut [Sheet], redo: bool, mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Applied {
+    fn apply(&mut self, stamp: &mut EntryStamp, sheets: &mut [Sheet], redo: bool, mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Applied {
+        let previous_capacity = self.excluded.capacity();
         let mut applied = Applied {
             touched: Vec::new(), style_changes: Vec::new(), label: self.label.clone(), focus: self.focus,
             skipped: 0, structural: false, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false,
         };
         if let Some(sheet) = sheets.get_mut(self.sort.sheet()) {
             let mut apply = |d: CellDelta| {
-                if !guard(d.sheet, d.row, d.col, sheet.get(d.row, d.col).unwrap_or(&Cell::default())) {
+                let key = (d.row,d.col);
+                if self.excluded.contains(&key) { return; }
+                if !d.can_replay(sheet, redo, &mut guard) {
+                    self.excluded.insert(key);
                     applied.skipped += 1;
                     return;
                 }
-                sheet.set(d.row, d.col, if redo { d.after } else { d.before });
-                let style = if redo { d.after_style } else { d.before_style };
-                if d.before_style != d.after_style && sheet.style_of(d.row, d.col) != style {
-                    sheet.set_style(d.row, d.col, style);
-                    applied.style_changes.push((d.sheet, d.row, d.col));
-                }
+                d.replay(sheet, redo, &mut applied.style_changes);
                 applied.touched.push((d.sheet, d.row, d.col));
             };
             if redo { self.sort.deltas().for_each(&mut apply); }
             else { self.sort.deltas().rev().for_each(apply); }
         }
+        stamp.payload_bytes += (self.excluded.capacity() - previous_capacity) * (size_of::<(u32,u32)>() + 1);
         applied
     }
 }
@@ -466,8 +489,7 @@ impl SheetTabAction {
 
 struct StructureAction {
     label: String,
-    before: StructureSnapshot,
-    after: StructureSnapshot,
+    history: structural_history::History,
     focus: (usize, u32, u32),
     by_site: u32,
 }
@@ -604,10 +626,7 @@ fn restored_charts(current: &[crate::charts::Chart], desired: &[crate::charts::C
 
 fn same_input(a: Option<&Cell>, b: Option<&Cell>) -> bool {
     match (a, b) {
-        (Some(a), Some(b)) if a.formula.is_some() => a.formula == b.formula,
-        (Some(Cell { formula: None, value: crate::Value::Number(a) }),
-         Some(Cell { formula: None, value: crate::Value::Number(b) })) => a.to_bits() == b.to_bits(),
-        (Some(a), Some(b)) => a == b,
+        (Some(a), Some(b)) => a.same_input(b),
         (None, None) => true,
         _ => false,
     }
@@ -794,7 +813,7 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
 
 impl Default for UndoStack {
     fn default() -> Self {
-        Self { done: Vec::new(), undone: Vec::new(), limit: 200, site: 0 }
+        Self { done: Vec::new(), undone: Vec::new(), pending_compaction: false, limit: 200, site: 0 }
     }
 }
 
@@ -806,10 +825,7 @@ impl UndoStack {
     /// 记一步。相同格子在一步里只记第一次（后写的 after 覆盖）
     /// 换站点（进/退协作房间）：历史属于上一个人，清掉
     pub fn set_site(&mut self, site: u32) {
-        if site != self.site {
-            self.done.clear();
-            self.undone.clear();
-        }
+        if site != self.site { self.clear(); }
         self.site = site;
     }
 
@@ -834,6 +850,39 @@ impl UndoStack {
     /// Keep the newest operation undoable even when one very large edit exceeds the budget.
     fn trim_history(&mut self, budget: usize) {
         self.undone.clear();
+        self.settle_compaction(false);
+        self.trim_done(budget);
+    }
+
+    /// The worker releases the raw snapshots as soon as compression finishes.
+    /// Apply its exact retained size to the existing history position on the UI thread.
+    pub fn poll_compaction(&mut self) -> bool {
+        if self.settle_compaction(false) { self.trim_done(HISTORY_PAYLOAD_BUDGET); }
+        self.pending_compaction
+    }
+
+    fn settle_compaction(&mut self, wait: bool) -> bool {
+        if !self.pending_compaction { return false; }
+        self.pending_compaction = false;
+        let mut completed = false;
+        for entry in &mut self.done {
+            if let Entry::Structure(stamp, action) = entry {
+                if let Some(bytes) = action.history.settle(wait) {
+                    stamp.payload_bytes = bytes;
+                    completed = true;
+                }
+                self.pending_compaction |= action.history.pending();
+            }
+        }
+        completed
+    }
+
+    fn settle_before_replay(&mut self) {
+        // Complete accounting before moving entries across the undo/redo boundary.
+        if self.settle_compaction(true) { self.trim_done(HISTORY_PAYLOAD_BUDGET); }
+    }
+
+    fn trim_done(&mut self, budget: usize) {
         let limit = if self.limit == 0 { 200 } else { self.limit };
         let mut keep = 0;
         let mut bytes = 0usize;
@@ -956,7 +1005,7 @@ impl UndoStack {
         let entry = if redo { self.undone.last()? } else { self.done.last()? };
         let (region, horizontal, mut order) = match entry {
             Entry::Cells(_, _, Some(p)) => p.clone(),
-            Entry::NumericSort(_, a) => a.sort.permutation(),
+            Entry::NumericSort(_, a) if a.excluded.is_empty() => a.sort.permutation(),
             _ => return None,
         };
         if !redo {
@@ -1008,23 +1057,10 @@ impl UndoStack {
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
-    pub fn push_structure(&mut self, label: impl Into<String>, mut before: StructureSnapshot, mut after: StructureSnapshot, focus: (usize, u32, u32)) {
-        let undo_cells = structural_cells::CellHistory::between(&after.target, &before.target, &after.shift);
-        let redo_cells = structural_cells::CellHistory::between(&before.target, &after.target, &before.shift);
-        let cell_bytes = undo_cells.bytes() + redo_cells.bytes();
-        before.compact = Some(undo_cells);
-        after.compact = Some(redo_cells);
-        for side in [&mut before,&mut after] {
-            side.target.replace_cell_store(Default::default());
-            side.target.source_cells = None;
-            side.target.saved_cells = None;
-            side.target.shared_lookup = Default::default();
-        }
-        let bytes = cell_bytes
-            + before.reference_uses.bytes() + after.reference_uses.bytes()
-            + before.foreign.iter().chain(&after.foreign).map(|f| std::mem::size_of_val(f.cells.as_slice())
-                + f.cells.iter().map(|(_, c)| cell_heap_bytes(c)).sum::<usize>()).sum::<usize>();
-        self.done.push(Entry::Structure(next_entry(bytes), StructureAction { label: label.into(), before, after, focus, by_site: self.site }));
+    pub fn push_structure(&mut self, label: impl Into<String>, before: StructureSnapshot, after: StructureSnapshot, focus: (usize, u32, u32)) {
+        let (history, bytes) = structural_history::History::record(before, after);
+        self.pending_compaction |= history.pending();
+        self.done.push(Entry::Structure(next_entry(bytes), StructureAction { label: label.into(), history, focus, by_site: self.site }));
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
@@ -1035,12 +1071,13 @@ impl UndoStack {
     pub fn push_compact_sort(&mut self, label: &str, sort: crate::data_tools::CompactSort, focus: (usize, u32, u32)) {
         let stamp = next_entry(sort.bytes());
         self.done.push(Entry::NumericSort(stamp, NumericSortAction {
-            sort, label: label.into(), focus, by_site: self.site,
+            sort, label: label.into(), focus, by_site: self.site, excluded: Default::default(),
         }));
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
     pub fn undo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
+        self.settle_before_replay();
         if !self.undo_is_structure() { return self.undo(&mut wb.sheets, guard); }
         if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::SheetTab(_, action)) = self.done.last_mut() {
@@ -1049,13 +1086,15 @@ impl UndoStack {
             return Some(applied);
         }
         let Entry::Structure(_, action) = self.done.last()? else { unreachable!() };
-        let touched = restore_structure(wb, &action.before, &action.after)?;
+        let (before, after) = action.history.snapshots()?;
+        let touched = restore_structure(wb, before, after)?;
         let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false };
         self.undone.push(self.done.pop()?);
         Some(applied)
     }
 
     pub fn redo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
+        self.settle_before_replay();
         if !self.redo_is_structure() { return self.redo(&mut wb.sheets, guard); }
         if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::SheetTab(_, action)) = self.undone.last_mut() {
@@ -1064,7 +1103,8 @@ impl UndoStack {
             return Some(applied);
         }
         let Entry::Structure(_, action) = self.undone.last()? else { unreachable!() };
-        let touched = restore_structure(wb, &action.after, &action.before)?;
+        let (before, after) = action.history.snapshots()?;
+        let touched = restore_structure(wb, after, before)?;
         let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false };
         self.done.push(self.undone.pop()?);
         Some(applied)
@@ -1076,6 +1116,7 @@ impl UndoStack {
         sheets: &mut [Sheet],
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<Applied> {
+        self.settle_before_replay();
         if self.undo_is_structure() { return None; }
         // 只撤自己的：栈顶不是我的动作就不动（也不丢，免得误删历史）
         if self
@@ -1086,12 +1127,13 @@ impl UndoStack {
         {
             return None;
         }
-        if let Some(Entry::NumericSort(_, action)) = self.done.last() {
-            let applied = action.apply(sheets, false, guard);
-            self.undone.push(self.done.pop()?);
+        if let Some(Entry::NumericSort(stamp, action)) = self.done.last_mut() {
+            let applied = action.apply(stamp, sheets, false, guard);
+            let entry = self.done.pop()?;
+            if !applied.touched.is_empty() { self.undone.push(entry); }
             return Some(applied);
         }
-        let Entry::Cells(id, action, permutation) = self.done.pop()? else { unreachable!() };
+        let Entry::Cells(id, mut action, mut permutation) = self.done.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
@@ -1161,22 +1203,21 @@ impl UndoStack {
             self.undone.push(Entry::Cells(id, action, permutation));
             return Some(applied);
         }
-        for d in action.deltas.iter().rev() {
-            let Some(sheet) = sheets.get_mut(d.sheet) else { continue };
-            let cur = sheet.get(d.row, d.col).cloned().unwrap_or(Cell {
-                value: crate::model::Value::Empty,
-                formula: None,
-            });
-            if action.merges.is_none() && !guard(d.sheet, d.row, d.col, &cur) {
-                skipped += 1;
+        let mut excluded = std::collections::HashSet::new();
+        for (i, d) in action.deltas.iter().enumerate().rev() {
+            let Some(sheet) = sheets.get_mut(d.sheet) else { excluded.insert(i); continue };
+            if action.merges.is_none() && !d.can_replay(sheet, false, &mut guard) {
+                excluded.insert(i);
                 continue;
             }
-            sheet.set(d.row, d.col, d.before.clone());
-            if d.before_style != d.after_style && sheet.style_of(d.row, d.col) != d.before_style {
-                sheet.set_style(d.row, d.col, d.before_style);
-                style_changes.push((d.sheet, d.row, d.col));
-            }
-            touched.push((d.sheet, d.row, d.col));
+            d.replay(sheet, false, &mut style_changes);
+            touched.push((d.sheet,d.row,d.col));
+        }
+        skipped = excluded.len();
+        if skipped != 0 {
+            let mut i = 0;
+            action.deltas.retain(|_| { let keep = !excluded.contains(&i); i += 1; keep });
+            permutation = None;
         }
         let applied = Applied {
             touched,
@@ -1188,7 +1229,7 @@ impl UndoStack {
             style_changes, merge_changes,
             merge_conflict: false,
         };
-        self.undone.push(Entry::Cells(id, action, permutation));
+        if !action.is_empty() { self.undone.push(Entry::Cells(id, action, permutation)); }
         Some(applied)
     }
 
@@ -1198,6 +1239,7 @@ impl UndoStack {
         sheets: &mut [Sheet],
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<Applied> {
+        self.settle_before_replay();
         if self.redo_is_structure() { return None; }
         if self
             .undone
@@ -1207,12 +1249,13 @@ impl UndoStack {
         {
             return None;
         }
-        if let Some(Entry::NumericSort(_, action)) = self.undone.last() {
-            let applied = action.apply(sheets, true, guard);
-            self.done.push(self.undone.pop()?);
+        if let Some(Entry::NumericSort(stamp, action)) = self.undone.last_mut() {
+            let applied = action.apply(stamp, sheets, true, guard);
+            let entry = self.undone.pop()?;
+            if !applied.touched.is_empty() { self.done.push(entry); }
             return Some(applied);
         }
-        let Entry::Cells(id, action, permutation) = self.undone.pop()? else { unreachable!() };
+        let Entry::Cells(id, mut action, mut permutation) = self.undone.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
@@ -1282,22 +1325,21 @@ impl UndoStack {
             self.done.push(Entry::Cells(id, action, permutation));
             return Some(applied);
         }
-        for d in action.deltas.iter() {
-            let Some(sheet) = sheets.get_mut(d.sheet) else { continue };
-            let cur = sheet.get(d.row, d.col).cloned().unwrap_or(Cell {
-                value: crate::model::Value::Empty,
-                formula: None,
-            });
-            if action.merges.is_none() && !guard(d.sheet, d.row, d.col, &cur) {
-                skipped += 1;
+        let mut excluded = std::collections::HashSet::new();
+        for (i, d) in action.deltas.iter().enumerate() {
+            let Some(sheet) = sheets.get_mut(d.sheet) else { excluded.insert(i); continue };
+            if action.merges.is_none() && !d.can_replay(sheet, true, &mut guard) {
+                excluded.insert(i);
                 continue;
             }
-            sheet.set(d.row, d.col, d.after.clone());
-            if d.before_style != d.after_style && sheet.style_of(d.row, d.col) != d.after_style {
-                sheet.set_style(d.row, d.col, d.after_style);
-                style_changes.push((d.sheet, d.row, d.col));
-            }
-            touched.push((d.sheet, d.row, d.col));
+            d.replay(sheet, true, &mut style_changes);
+            touched.push((d.sheet,d.row,d.col));
+        }
+        skipped = excluded.len();
+        if skipped != 0 {
+            let mut i = 0;
+            action.deltas.retain(|_| { let keep = !excluded.contains(&i); i += 1; keep });
+            permutation = None;
         }
         let applied = Applied {
             touched,
@@ -1309,11 +1351,12 @@ impl UndoStack {
             style_changes, merge_changes,
             merge_conflict: false,
         };
-        self.done.push(Entry::Cells(id, action, permutation));
+        if !action.is_empty() { self.done.push(Entry::Cells(id, action, permutation)); }
         Some(applied)
     }
 
     pub fn clear(&mut self) {
+        self.pending_compaction = false;
         self.done.clear();
         self.undone.clear();
     }
@@ -1457,6 +1500,23 @@ mod tests {
         assert!(st.can_redo());
         st.push(edit(&mut wb, 0, 0, 3.0));
         assert!(!st.can_redo(), "新动作应该清掉重做栈");
+    }
+
+    #[test]
+    fn sheet_tab_history_replays_even_when_it_has_no_cell_deltas() {
+        let mut wb = wb();
+        let mut stack = UndoStack::new();
+        wb.sheets.push(Sheet::new("Added"));
+        stack.record_appended_sheet(&wb, (0,0,0));
+        assert!(stack.rename_sheet(&mut wb,1,"Report",(1,0,0)));
+        for expected in [2,1] {
+            assert!(stack.undo_workbook(&mut wb,|_,_,_,_| true).is_some());
+            assert_eq!(wb.sheets.len(),expected);
+        }
+        for expected in ["Added","Report"] {
+            assert!(stack.redo_workbook(&mut wb,|_,_,_,_| true).is_some());
+            assert_eq!(wb.sheet(1).name,expected);
+        }
     }
 
     #[test]

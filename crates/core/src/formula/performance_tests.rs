@@ -414,9 +414,11 @@ fn named_lambda_respects_scope_builtins_shadowing_and_recursion() {
         (0, "LET(AddRate,LAMBDA(x,x*10),AddRate(3))", 30.0),
         (0, "ABS(-5)", 5.0),
         (0, "CountDown(3)", 3.0),
+        (0, "CountDown(128)", 128.0),
     ] {
         assert_eq!(calc.eval_node(&parse(src).unwrap(), sheet), FValue::number(expected), "{src}");
     }
+    assert_eq!(calc.eval_node(&parse("CountDown(1000)").unwrap(), 0), FValue::Error(ErrKind::Num));
     assert_eq!(calc.eval_node(&parse("LoopFunc(5)").unwrap(), 0), FValue::Error(ErrKind::Num));
     drop(calc);
     formula(&mut wb, 0, 1, "=Report!AddRate(A1)");

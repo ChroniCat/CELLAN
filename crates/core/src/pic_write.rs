@@ -278,23 +278,22 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
 }
 
 /// 画布关系里保留非图片关系（图表等），图片关系重建
-fn keep_other_rels(xml: &str) -> String {
-    let mut out = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
-    );
-    let mut rest = xml;
-    while let Some(pos) = rest.find("<Relationship") {
-        let Some(endrel) = rest[pos..].find("/>") else { break };
-        let end = pos + endrel + 2;
-        let tag = &rest[pos..end];
-        if !(tag.contains("/image\"") || tag.contains("/image/")) {
-            out.push_str(tag);
-        }
-        rest = &rest[end..];
+fn keep_other_rels(xml: &str) -> anyhow::Result<String> {
+    let doc = roxmltree::Document::parse(xml)?;
+    let root = doc.root_element();
+    anyhow::ensure!(root.tag_name().name() == "Relationships", "无效的绘图关系清单");
+    let mut kept = xml.to_owned();
+    for rel in root.children().rev().filter(|n| n.is_element() && n.tag_name().name() == "Relationship"
+        && n.attribute("Type").is_some_and(|t| t.ends_with("/image"))) {
+        kept.replace_range(rel.range(), "");
     }
-    out.push_str("</Relationships>");
-    out
+    if root.children().next().is_none() && xml[root.range()].trim_end().ends_with("/>") {
+        let end = root.range().end;
+        let prefix = root.tag_name().namespace().and_then(|uri| root.lookup_prefix(uri));
+        let tag = prefix.map_or_else(|| "Relationships".to_owned(), |p| format!("{p}:Relationships"));
+        kept.replace_range(end-2..end,&format!("></{tag}>"));
+    }
+    Ok(kept)
 }
 
 fn empty_rels() -> String {
@@ -314,6 +313,7 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
     let mut exts: Vec<String> = Vec::new();
     let mut new_drawings: Vec<String> = Vec::new();
     let mut touched = false;
+    let mut next = crate::textbox::next_drawing_no(path)?;
     for sheet in &wb.sheets {
         if !sheet.pictures_dirty {
             continue;
@@ -322,20 +322,22 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
         let sheet_bytes = crate::fixups::read_part_file(path,&sheet_part).ok_or_else(|| anyhow::anyhow!("缺少工作表 {sheet_part}"))?;
         let sheet_xml = crate::xlsx::patch_xml_text(&sheet_bytes,&sheet_part)?;
         let (draw_part, draw_rels, rid) =
-            crate::textbox::ensure_drawing(path, &sheet_part, &sheet_xml)?;
-        let existing = crate::fixups::read_part_file(path, &draw_part)
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_else(|| {
+            crate::textbox::ensure_drawing(path, &sheet_part, &sheet_xml, &mut next)?;
+        let existing = if rid.is_none() {
+            let bytes = crate::fixups::read_part_file(path, &draw_part)
+                .ok_or_else(|| anyhow::anyhow!("无法读取原有绘图 {draw_part}"))?;
+            crate::xlsx::patch_xml_text(&bytes, &draw_part)?.into_owned()
+        } else {
                 "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" \
 xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
 xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"></xdr:wsDr>"
                     .to_string()
-            });
-        let old_rels = crate::fixups::read_part_file(path, &draw_rels)
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_else(empty_rels);
-        let mut rels = keep_other_rels(&old_rels);
+        };
+        let old_rels = if crate::textbox::has_part(path,&draw_rels) {
+            crate::textbox::drawing_relationships(path,&draw_rels)?
+        } else { empty_rels() };
+        let mut rels = keep_other_rels(&old_rels)?;
         let mut anchors = String::new();
         for (i, pic) in sheet.pictures.iter().enumerate() {
             let rid_i = format!("rIdPic{}", i + 1);
@@ -350,9 +352,10 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
             };
             let fname = media.rsplit('/').next().unwrap_or("image1.png");
             let rel = format!(
-                "<Relationship Id=\"{rid_i}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/{fname}\"/>"
+                "<Relationship xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\" Id=\"{rid_i}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/{fname}\"/>"
             );
-            rels = rels.replace("</Relationships>", &format!("{rel}</Relationships>"));
+            let end = rels.rfind("</").ok_or_else(|| anyhow::anyhow!("绘图关系缺少根结束标记"))?;
+            rels.insert_str(end,&rel);
             let ext = if pic.ext.is_empty() {
                 fname.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_else(|| "png".into())
             } else {
@@ -366,7 +369,11 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
         let body = rewrite_drawing(&existing, &anchors);
         if crate::textbox::has_part(path, &draw_part) {
             crate::textbox::patch_sheet_drawing(&mut patch, &draw_part, body);
-            patch.push((draw_rels.clone(), rels));
+            if crate::textbox::has_part(path, &draw_rels) {
+                patch.push((draw_rels.clone(), rels));
+            } else {
+                additions.push((draw_rels.clone(), rels.into_bytes()));
+            }
         } else {
             additions.push((draw_part.clone(), body.into_bytes()));
             additions.push((draw_rels.clone(), rels.into_bytes()));

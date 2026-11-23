@@ -1297,7 +1297,11 @@ impl<'a> Calc<'a> {
             )),
         }).collect();
         let cell = (self.cur_sheet, self.cur.0, self.cur.1);
-        if self.named_calls.len() >= 16 || self.named_calls.iter().any(|(i, at, sheet, v)|
+        // Bound live argument frames even when recursion never repeats the same arguments.
+        // Grow the native stack on demand; ordinary named calls stay on the caller's stack.
+        let frame_slots = |arity: usize| arity + 2;
+        let slots = self.named_calls.iter().map(|(_, _, _, args)| frame_slots(args.len())).sum::<usize>();
+        if slots + frame_slots(values.len()) > 1024 || self.named_calls.iter().any(|(i, at, sheet, v)|
             (*i, *at, *sheet) == (index, cell, si) && v == &values) {
             return FValue::Error(ErrKind::Num);
         }
@@ -1305,11 +1309,13 @@ impl<'a> Calc<'a> {
         // Worksheet names have their own lexical environment. The caller's LET bindings
         // have already been evaluated in the arguments and must not shadow the definition.
         let caller = std::mem::take(&mut self.env_stack);
-        let result = match self.eval_definition(index, si) {
-            FValue::Lambda(lambda) => self.apply_lambda_val(&lambda, values, si),
-            FValue::Error(e) => FValue::Error(e),
-            _ => FValue::Error(ErrKind::Value),
-        };
+        let result = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+            match self.eval_definition(index, si) {
+                FValue::Lambda(lambda) => self.apply_lambda_val(&lambda, values, si),
+                FValue::Error(e) => FValue::Error(e),
+                _ => FValue::Error(ErrKind::Value),
+            }
+        });
         self.env_stack = caller;
         self.named_calls.pop();
         result

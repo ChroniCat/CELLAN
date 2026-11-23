@@ -121,11 +121,12 @@ pub(super) struct CsvDlg {
     pub cols: usize,
     pub err: Option<String>,
     target: Target,
+    before: Option<Sheet>,
     pending: Option<Worker<ParsedCsv>>,
 }
 
 impl CsvDlg {
-    pub fn new(path: &Path, target: Target) -> Self {
+    pub fn new(path: &Path, target: Target, before: Sheet) -> Self {
         let mut dlg = Self {
             path: path.to_owned(),
             delim: ',',
@@ -138,6 +139,7 @@ impl CsvDlg {
             cols: 0,
             err: None,
             pending: None,
+            before: Some(before),
             target,
         };
         dlg.reload();
@@ -232,7 +234,7 @@ struct PreparedImport {
     changed: usize,
     label: &'static str,
     status: String,
-    internal_versions: Vec<(String, sheetcore::store::CellVersion)>,
+    internal: Vec<Sheet>,
 }
 
 fn within_grid(at: (u32, u32), rows: usize, cols: usize) -> bool {
@@ -451,8 +453,6 @@ fn prepare(
                 refresh_sizes = Some((before_sizes, after_sizes));
             }
             // Multiple sources may have written one cell. Its undo baseline is the original workbook.
-            keys.sort_unstable();
-            keys.dedup();
             (
                 "刷新外部数据",
                 if failures.is_empty() {
@@ -467,6 +467,8 @@ fn prepare(
             )
         }
     };
+    keys.sort_unstable();
+    keys.dedup();
     let mut deltas = Vec::new();
     for chunk in keys.chunks(4096) {
         check_cancelled(cancel)?;
@@ -499,10 +501,6 @@ fn prepare(
         merges: None,
     }
     .prepare();
-    let internal_versions = internal
-        .iter()
-        .map(|s| (s.name.clone(), s.cell_version().clone()))
-        .collect();
     Ok(PreparedImport {
         before,
         result,
@@ -514,19 +512,23 @@ fn prepare(
         changed,
         label,
         status,
-        internal_versions,
+        internal,
         registration,
     })
 }
 
 impl SheetApp {
     fn start_import(&mut self, input: Input, target: Target) {
+        self.start_import_from(input, target, None);
+    }
+
+    fn start_import_from(&mut self, input: Input, target: Target, before: Option<Sheet>) {
         if !target.valid(self) {
             self.status = "目标工作表或协作状态已改变，请重新导入".into();
             return;
         }
         self.csv_dlg = None;
-        let before = self.wb.sheet(target.sheet).reorder_snapshot();
+        let before = before.unwrap_or_else(|| self.wb.sheet(target.sheet).reorder_snapshot());
         let refreshing = matches!(&input, Input::Refresh);
         let internal = if refreshing {
             self.wb
@@ -579,7 +581,7 @@ impl SheetApp {
         let Some(parsed) = dlg.records.take() else {
             return;
         };
-        self.start_import(
+        self.start_import_from(
             Input::Import {
                 path: dlg.path.clone(),
                 delim: dlg.delim,
@@ -588,6 +590,7 @@ impl SheetApp {
                 parsed: Some(parsed),
             },
             dlg.target.clone(),
+            dlg.before.take(),
         );
     }
 
@@ -670,15 +673,16 @@ impl SheetApp {
                 return;
             }
         };
-        if !self.wb.sheet(idx).matches_reorder_source(&update.before)
-            || update.internal_versions.iter().any(|(name, ver)| {
-                !self
-                    .wb
-                    .sheets
-                    .iter()
-                    .any(|s| &s.name == name && s.cell_version() == ver)
-            })
-        {
+        let live = self.wb.sheet(idx);
+        let whole_snapshot_matches = live.matches_reorder_source(&update.before);
+        let source_changed = update.sources.iter().any(|source| {
+            let Kind::Internal { sheet, rect } = &source.kind else { return false };
+            let Some(before) = update.internal.iter().find(|s| &s.name == sheet) else { return false };
+            !self.wb.sheets.iter().any(|s| s.identity == before.identity && s.name == before.name
+                && s.coordinate_revision() == before.coordinate_revision()
+                && s.same_cells_in(before, &[*rect], false))
+        });
+        if source_changed || (!whole_snapshot_matches && !live.csv_inputs_match(&update.before, &update.keys)) {
             self.status = "来源表或目标表已改变，请重新操作".into();
             std::thread::spawn(move || drop(update));
             return;
@@ -687,7 +691,12 @@ impl SheetApp {
             std::thread::spawn(move || drop(update));
             return;
         }
-        self.wb.sheet_mut(idx).take_row_changes(&mut update.result);
+        let live = self.wb.sheet_mut(idx);
+        if !whole_snapshot_matches {
+            live.rebase_row_changes(&update.before, &mut update.result,
+                |k| update.keys.binary_search(&(k.row, k.col)).is_ok());
+        }
+        live.take_row_changes(&mut update.result);
         if let Some(registration) = update.registration {
             store_source(&mut self.wb, registration);
         } else {
@@ -816,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn import_captures_its_anchor_and_rejects_switched_documents_sheets_and_concurrent_values() {
+    fn import_keeps_its_original_sheet_but_rejects_document_changes_and_target_overwrites() {
         let env = crate::test_env::TestEnv::new("csv_target_guard");
         let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
         let path = env.path("source.csv");
@@ -833,9 +842,14 @@ mod tests {
         assert_eq!(app.wb.sources[0].at, (2, 3));
         app.wb.sheets.push(Sheet::new("Other"));
         app.import_csv_from(&path);
-        app.sheet_idx = 1;
+        assert!(app.switch_sheet_view(1));
+        app.wb.sheet_mut(0).set(8, 9, number(81.));
         app.finish_csv_probe();
+        assert_eq!(app.sheet_idx, 1);
+        assert_eq!(app.wb.sheet(0).value(8, 8), Value::Number(7.));
+        assert_eq!(app.wb.sheet(0).value(8, 9), Value::Number(81.));
         assert_eq!(app.wb.sheet(1).value(8, 8), Value::Empty);
+        app.sel = (8, 8);
         app.import_csv_from(&path);
         app.doc_uid = crate::next_doc_uid();
         app.finish_csv_probe();
@@ -844,6 +858,35 @@ mod tests {
         app.wb.sheet_mut(1).set(8, 8, number(90.));
         app.finish_csv_probe();
         assert_eq!(app.wb.sheet(1).value(8, 8), Value::Number(90.));
+        assert_eq!(app.undo.depth(), (2, 0));
+    }
+
+    #[test]
+    fn wizard_checks_only_the_cells_it_will_write_since_opening() {
+        let env = crate::test_env::TestEnv::new("csv_preview_edit");
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        let path = env.path("ragged.csv");
+        std::fs::write(&path, "1,2\n3").unwrap();
+        app.wb.sheet_mut(0).set(7, 8, number(0.));
+        app.open_csv_dialog(&path);
+        app.wb.sheet_mut(0).set(7, 8, number(-0.));
+        app.wb.sheet_mut(0).set(1, 1, number(70.)); // the short row leaves B2 alone
+        let mut dlg = app.csv_dlg.take().unwrap();
+        assert!(dlg.valid(&app));
+        dlg.wait_preview();
+        app.confirm_csv(dlg);
+        app.finish_csv_probe();
+        let Value::Number(zero) = app.wb.sheet(0).value(7, 8) else { panic!("number") };
+        assert!(zero.is_sign_negative());
+        assert_eq!(app.wb.sheet(0).value(1, 0), Value::Number(3.));
+        assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(70.));
+        app.open_csv_dialog(&path);
+        app.wb.sheet_mut(0).set(1, 0, number(80.));
+        let mut dlg = app.csv_dlg.take().unwrap();
+        dlg.wait_preview();
+        app.confirm_csv(dlg);
+        app.finish_csv_probe();
+        assert_eq!(app.wb.sheet(0).value(1, 0), Value::Number(80.));
         assert_eq!(app.undo.depth(), (1, 0));
     }
 
@@ -1015,7 +1058,7 @@ mod tests {
         std::fs::write(&path, &csv).unwrap();
         let ctx = egui::Context::default();
         let app = SheetApp::new_with_context(&ctx, None);
-        let mut dialog = CsvDlg::new(&path, Target::current(&app, (0, 0)));
+        let mut dialog = CsvDlg::new(&path, Target::current(&app, (0, 0)), app.wb.sheet(0).reorder_snapshot());
         assert!(dialog.pending.is_some());
         // Wait for this dialog's worker without mutating the UI or workbook.
         dialog.wait_preview();

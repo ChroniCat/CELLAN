@@ -72,3 +72,35 @@ fn roundtrip_keeps_everything() {
 
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+fn utf16_parts_preserve_hyperlinks_sparklines_and_sheet_visibility() {
+    use sheetcore::{Sheet, Workbook, hyperlinks::Hyperlink, sparkline::Sparkline, xlsx};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("utf16-edits.xlsx");
+    let mut book = Workbook::new_blank();
+    book.sheets.push(Sheet::new("Report"));
+    xlsx::save(&path, &book).unwrap();
+    {
+        let name = "xl/worksheets/sheet2.xml";
+        let bytes = sheetcore::fixups::read_part(&path, name).unwrap();
+        let xml = std::str::from_utf8(&bytes).unwrap().replace("UTF-8","UTF-16");
+        let bytes: Vec<_> = [0xff,0xfe].into_iter().chain(xml.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        sheetcore::patch::append_entry(&path, name, &bytes).unwrap();
+    }
+    let mut book = xlsx::load(&path).unwrap();
+    let report = &mut book.sheets[1];
+    report.hyperlinks.insert((3,1), Hyperlink { location:"Sheet1!A1".into(), ..Default::default() });
+    report.hyperlinks_dirty = true;
+    report.sparklines.push(Sparkline { r:2,c:1,rect:(0,0,1,0),..Default::default() });
+    report.sparklines_dirty = true;
+    report.hidden = true;
+    report.hidden_dirty = true;
+    xlsx::save_atomic(&path, &book).unwrap();
+    let reopened = xlsx::load(&path).unwrap();
+    let report = &reopened.sheets[1];
+    assert!(report.hidden);
+    assert_eq!(report.hyperlinks[&(3,1)].location,"Sheet1!A1");
+    assert_eq!(report.sparklines.len(),1);
+    assert_eq!(report.sparklines[0].rect,(0,0,1,0));
+}

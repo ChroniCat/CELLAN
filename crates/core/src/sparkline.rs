@@ -465,18 +465,12 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
     if map.is_empty() {
         return Ok(());
     }
-    crate::patch::rewrite_zip_where(
-        path,
-        |name| map.contains_key(name),
-        |name, buf| {
-            if let Some((list, sheet_name)) = map.get(name) {
-                if let Ok(xml) = String::from_utf8(buf.clone()) {
-                    return set_sparklines(&xml, list, sheet_name).into_bytes();
-                }
-            }
-            buf
-        },
-    )
+    crate::patch::rewrite_zip_borrowed(path, |name| map.contains_key(name), |name, bytes| {
+        let (list, sheet_name) = &map[name];
+        let xml = crate::xlsx::patch_xml_text(bytes, name)?;
+        let updated = set_sparklines(&xml, list, sheet_name);
+        Ok((updated != xml).then(|| updated.into_bytes()))
+    })
 }
 
 #[cfg(test)]

@@ -668,7 +668,11 @@ pub fn merge_sheet_data(path: &Path, base: &Path, wb: &crate::model::Workbook) -
         };
         let b_end = b_end + "</sheetData>".len();
         let n_end = n_end + "</sheetData>".len();
-        let mut head = bxml[..b_start].to_string();
+        let mut head = if sheet.source_needs_dom_repair {
+            crate::patch::layout_xml::repair_column_bounds(&bxml[..b_start])?
+        } else {
+            bxml[..b_start].to_owned()
+        };
         if sheet.col_styles_dirty {
             if let (Some(ns_c), Some(ne_c)) = (nxml[..n_start].find("<cols"), nxml[..n_start].find("</cols>")) {
                 let ncol = &nxml[ns_c..ne_c + "</cols>".len()];

@@ -46,6 +46,57 @@ fn until(h: &mut SheetApp,g: &mut SheetApp,mut done: impl FnMut(&SheetApp,&Sheet
 }
 
 #[test]
+fn guest_structural_denial_keeps_coordinates_and_next_sort_converges() {
+    use sheetcore::{Value, structural::Structural};
+    let env = crate::test_env::TestEnv::new("ordered_structure_denial");
+    let (mut host, mut guest) = sort_apps(&env);
+    // The authoritative lease has not reached the guest's UI when it requests the insert.
+    host.net.as_ref().unwrap().request_lock(0,1,0,"H");
+    guest.structural(Structural::InsertRows { at:0,n:1 });
+    assert!(guest.net.as_ref().unwrap().pending_structure());
+    assert_eq!(guest.wb.sheet(0).value(0,0),Value::Number(2.));
+    let start = std::time::Instant::now();
+    while guest.net.as_ref().unwrap().pending_structure() {
+        guest.poll_net();
+        assert!(start.elapsed().as_secs() < 5);
+        std::thread::yield_now();
+    }
+    assert_eq!(guest.undo.depth().0,0);
+    assert_eq!(guest.net.as_ref().unwrap().structure_seen(),0);
+    host.net.as_ref().unwrap().release_lock(0,1,0);
+    until(&mut host,&mut guest,|_,g| g.locks.is_empty());
+    guest.sort_region((0,0,1,0),0,true);
+    until(&mut host,&mut guest,|h,g| h.wb.sheet(0).value(0,0)==Value::Number(1.)
+        && g.net.as_ref().unwrap().pending_sort_ranges().is_empty());
+    guest.structural(Structural::InsertRows { at:0,n:1 });
+    until(&mut host,&mut guest,|h,g| h.wb.sheet(0).value(1,0)==Value::Number(1.)
+        && g.wb.sheet(0).value(1,0)==Value::Number(1.));
+    for app in [&host,&guest] {
+        assert_eq!(app.net.as_ref().unwrap().structure_seen(),1);
+        assert_eq!(app.wb.sheet(0).value(2,0),Value::Number(2.));
+    }
+    assert_eq!(guest.undo.depth().0,2);
+}
+
+#[test]
+fn future_sort_epoch_repairs_the_guest_without_disconnecting() {
+    use sheetcore::Value;
+    let env = crate::test_env::TestEnv::new("future_sort_epoch");
+    let (mut host,mut guest) = sort_apps(&env);
+    guest.net.as_ref().unwrap().note_structure(1);
+    guest.sort_region((0,0,1,0),0,true);
+    until(&mut host,&mut guest,|_,g| g.net.as_ref().unwrap().structure_seen()==0
+        && g.net.as_ref().unwrap().pending_sort_ranges().is_empty());
+    assert_eq!(guest.wb.sheet(0).value(0,0),Value::Number(2.));
+    assert_eq!(guest.undo.depth().0,0);
+    assert!(!guest.room_lost);
+    guest.sort_region((0,0,1,0),0,true);
+    until(&mut host,&mut guest,|h,g| h.wb.sheet(0).value(0,0)==Value::Number(1.)
+        && g.net.as_ref().unwrap().pending_sort_ranges().is_empty());
+    assert_eq!(guest.wb.sheet(0).value(1,0),Value::Number(2.));
+}
+
+#[test]
 fn rejected_sort_crossing_a_structural_frame_repairs_moved_cells_and_history() {
     use sheetcore::Value;
     for locked in [true,false] {
@@ -175,6 +226,30 @@ fn negotiated_sort_and_guarded_undo_converge_through_both_apps() {
 }
 
 #[test]
+fn leaving_room_preserves_peer_value_when_undoing_and_redoing_my_edit() {
+    use sheetcore::{Cell,Value};
+    let env = crate::test_env::TestEnv::new("undo_after_leaving_room");
+    let (mut host,mut guest) = sort_apps(&env);
+    let number = |n| Cell { value: Value::Number(n), formula: None };
+    let saved = sheetcore::undo::capture(guest.wb.sheet(0),0,&[(0,0),(1,0)]);
+    guest.wb.sheet_mut(0).set(0,0,number(8.));
+    guest.wb.sheet_mut(0).set(1,0,number(9.));
+    guest.record_deltas("输入", sheetcore::undo::finish(saved,guest.wb.sheet(0)));
+    guest.broadcast_cells(&[(0,0,0),(0,1,0)]);
+    until(&mut host,&mut guest,|h,_| h.wb.sheet(0).value(1,0)==Value::Number(9.));
+    host.wb.sheet_mut(0).set(0,0,number(2.)); // matches the old value of the guest's edit
+    host.broadcast_cells(&[(0,0,0)]);
+    until(&mut host,&mut guest,|_,g| g.wb.sheet(0).value(0,0)==Value::Number(2.));
+    guest.leave_session_at(None);
+    assert!(!guest.apply_undo(false));
+    assert!(guest.status.contains("1 格"));
+    assert_eq!(guest.wb.sheet(0).value(1,0),Value::Number(1.));
+    assert!(guest.apply_undo(true));
+    assert_eq!(guest.wb.sheet(0).value(1,0),Value::Number(9.));
+    assert_eq!(guest.wb.sheet(0).value(0,0),Value::Number(2.));
+}
+
+#[test]
 fn dense_multi_sort_uses_the_stable_multi_key_permutation_for_undo() {
     use sheetcore::{Cell,Value};
     let _env = crate::test_env::TestEnv::new("sort_compact_multi");
@@ -221,12 +296,19 @@ fn dense_numeric_sort_keeps_revision_count_and_replays_through_app() {
         }
     }
     app.sort_region((0, 0, 999, 100), 0, true);
+    // A concurrent same-sheet edit and a sheet-tab switch must survive the prepared swap.
+    app.wb.sheet_mut(0).set(1001,0,sheetcore::Cell { value: sheetcore::Value::Number(81.), formula: None });
+    app.wb.sheets.push(Sheet::new("Other"));
+    assert!(app.switch_sheet_view(1));
     let start = std::time::Instant::now();
     while app.tasks.reorder.is_some() {
         app.poll_reorder();
         assert!(start.elapsed().as_secs() < 30);
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!(app.wb.sheet(0).value(1001,0),sheetcore::Value::Number(81.));
+    assert_eq!(app.wb.sheet(1).value(0,0),sheetcore::Value::Empty);
     let log = app.rev.last().unwrap();
     assert_eq!(log.cells.len(), sheetcore::revision::MAX_CELLS);
     assert!(log.note.contains("101000"));
@@ -235,6 +317,12 @@ fn dense_numeric_sort_keeps_revision_count_and_replays_through_app() {
     assert_eq!(app.wb.sheets[0].value(0, 0), sheetcore::Value::Number(1000.0));
     assert!(app.apply_undo(true));
     assert_eq!(app.wb.sheets[0].value(0, 0), sheetcore::Value::Number(1.0));
+    // A later writer restored the original value; redo must still exclude this cell.
+    app.wb.sheet_mut(0).set(0,0,sheetcore::Cell { value: sheetcore::Value::Number(1000.), formula: None });
+    assert!(!app.apply_undo(false));
+    assert!(app.status.contains("1 格"));
+    assert!(app.apply_undo(true));
+    assert_eq!(app.wb.sheet(0).value(0,0),sheetcore::Value::Number(1000.));
 }
 
 #[test]
@@ -503,17 +591,17 @@ impl SheetApp {
         }
     }
 
-    fn preflight_reorder(&mut self, rect: Rect, operation: &Operation) -> bool {
+    fn preflight_reorder(&mut self, sheet: usize, rect: Rect, operation: &Operation) -> bool {
         let (r1, c1, r2, c2) = rect;
         let label = operation.label();
         let op = matches!(operation, Operation::Rows { .. })
             .then_some(sheetcore::protection::ProtOp::Sort);
-        if !self.write_preflight_on_op(self.sheet_idx, &[], label, op) {
+        if !self.write_preflight_on_op(sheet, &[], label, op) {
             return false;
         }
         if op.is_none()
-            && self.wb.sheet(self.sheet_idx).protection.is_some()
-            && (r1..=r2).any(|r| (c1..=c2).any(|c| self.cell_locked_on(self.sheet_idx, r, c)))
+            && self.wb.sheet(sheet).protection.is_some()
+            && (r1..=r2).any(|r| (c1..=c2).any(|c| self.cell_locked_on(sheet, r, c)))
         {
             self.status = format!("工作表受保护：目标区域含锁定单元格，不能{label}");
             return false;
@@ -521,12 +609,12 @@ impl SheetApp {
         let conflict = self
             .net
             .as_ref()
-            .and_then(|n| n.host_lock_conflict_rect(self.sheet_idx, rect))
+            .and_then(|n| n.host_lock_conflict_rect(sheet, rect))
             .map(|(_, name, r, c)| (name, r, c))
             .or_else(|| {
                 let site = self.net.as_ref().map_or(0, |n| n.site);
                 self.locks
-                    .conflicts_rect(self.sheet_idx, r1, c1, r2, c2, site, self.lock_now())
+                    .conflicts_rect(sheet, r1, c1, r2, c2, site, self.lock_now())
                     .map(|((r, c), h)| (h.name.clone(), r, c))
             });
         if let Some((name, r, c)) = conflict {
@@ -544,14 +632,14 @@ impl SheetApp {
             self.status = "正在计算上一项数据操作，请稍候".into();
             return;
         }
-        if !self.preflight_reorder(rect, &operation) {
+        if !self.preflight_reorder(self.sheet_idx, rect, &operation) {
             return;
         }
         let sheet = self.wb.sheet(self.sheet_idx);
         let area = u64::from(rect.2 - rect.0 + 1) * u64::from(rect.3 - rect.1 + 1);
         if area <= 100_000 {
             let changes = operation.plan(sheet, self.sheet_idx, rect);
-            self.finish_reorder(&operation, changes, None);
+            self.finish_reorder(&operation, changes, None, (self.sheet_idx,self.sel.0,self.sel.1));
             return;
         }
         let snapshot = sheet.reorder_snapshot();
@@ -633,17 +721,26 @@ impl SheetApp {
                 return;
             }
         };
-        let current = self.wb.sheet(self.sheet_idx);
-        if !pending.target.valid(self)
-            || !current.matches_reorder_source(&source)
-        {
-            self.status = "工作表已变更，请重新执行数据操作".into();
+        if !pending.target.valid(self) {
+            self.status = "目标表或协作状态已改变，请重新执行数据操作".into();
             return;
         }
-        if self.preflight_reorder(pending.rect, &pending.operation) {
+        let current = self.wb.sheet(pending.sheet);
+        let whole_snapshot_matches = current.matches_reorder_source(&source);
+        if !whole_snapshot_matches && !current.same_sort_region(&source, pending.rect) {
+            self.status = "排序区域已变更，请重新执行数据操作".into();
+            return;
+        }
+        let focus = (pending.sheet, pending.target.at.0, pending.target.at.1);
+        if self.preflight_reorder(pending.sheet, pending.rect, &pending.operation) {
+            if !whole_snapshot_matches {
+                let (r1,c1,r2,c2) = pending.rect;
+                self.wb.sheet(pending.sheet).rebase_row_changes(&source, &mut prepared,
+                    |k| (r1..=r2).contains(&k.row) && (c1..=c2).contains(&k.col));
+            }
             match changes {
                 PreparedChanges::Cells(changes) => {
-                    self.finish_reorder(&pending.operation, Ok(changes), Some(&mut prepared));
+                    self.finish_reorder(&pending.operation, Ok(changes), Some(&mut prepared), focus);
                 }
                 PreparedChanges::Permutation { order, total, sample } => {
                     let operation = &pending.operation;
@@ -658,7 +755,7 @@ impl SheetApp {
                             order.deltas().map(|d| (d.row,d.col,d.before_style != d.after_style)))
                     }).flatten();
                     self.record_revision_sample(operation.label(), &sample, total);
-                    self.undo.push_compact_sort(operation.label(), order, (pending.sheet, self.sel.0, self.sel.1));
+                    self.undo.push_compact_sort(operation.label(), order, focus);
                     if let Some(ts) = ts { self.undo.track_sort(ts,None); }
                     self.tasks.last_edit = Some(std::time::Instant::now());
                 }
@@ -671,6 +768,7 @@ impl SheetApp {
         operation: &Operation,
         changes: Result<data_tools::RowChanges, String>,
         prepared: Option<&mut Sheet>,
+        focus: (usize,u32,u32),
     ) {
         let mut changes = match changes {
             Err(error) => {
@@ -681,7 +779,7 @@ impl SheetApp {
         };
         let message = operation.completed(changes.count);
         if !changes.deltas.is_empty() {
-            let sheet = self.wb.sheet_mut(self.sheet_idx);
+            let sheet = self.wb.sheet_mut(focus.0);
             if let Some(prepared) = prepared {
                 sheet.take_row_changes(prepared);
             } else {
@@ -691,10 +789,10 @@ impl SheetApp {
             self.doc_gen = self.doc_gen.wrapping_add(1);
             self.recalc_all_and_deps_adaptive();
             let ts = if self.net.is_some() && let Some(order) = changes.permutation.clone() {
-                self.broadcast_line_permutation(self.sheet_idx, order,
+                self.broadcast_line_permutation(focus.0, order,
                     changes.deltas.iter().map(|d| (d.row,d.col,d.before_style != d.after_style)))
-            } else { self.broadcast_sheet_deltas(self.sheet_idx, &changes.deltas); None };
-            self.record_deltas(operation.label(), changes.deltas);
+            } else { self.broadcast_sheet_deltas(focus.0, &changes.deltas); None };
+            self.record_deltas_at(operation.label(), changes.deltas, None, focus);
             if let Some(order) = changes.permutation.take() { self.undo.tag_sorted_cells(order); }
             if let Some(ts) = ts { self.undo.track_sort(ts,None); }
             self.tasks.last_edit = Some(std::time::Instant::now());

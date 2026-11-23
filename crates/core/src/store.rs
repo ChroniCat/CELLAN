@@ -265,7 +265,13 @@ impl Store {
                         let a = a.get(i).filter(|c| !c.is_blank());
                         let b = b.get(i).filter(|c| !c.is_blank());
                         if formulas { a.and_then(|c| c.formula.as_ref()) == b.and_then(|c| c.formula.as_ref()) }
-                        else { a.map(|c| &c.value) == b.map(|c| &c.value) }
+                        else {
+                            match (a,b) {
+                                (Some(a),Some(b)) => a.value.same_stored_value(&b.value),
+                                (None,None) => true,
+                                _ => false,
+                            }
+                        }
                     })
                 })
             };
@@ -534,7 +540,8 @@ impl Store {
                 let shared = old.is_some_and(|old| std::sync::Arc::ptr_eq(old, cells));
                 (!shared).then_some(cells).into_iter().flat_map(move |cells| {
                     cells.iter().enumerate().filter_map(move |(row, cell)| {
-                        (!cell.is_blank() && old.and_then(|c| c.get(row)) != Some(cell))
+                        (!cell.is_blank() && old.and_then(|c| c.get(row)).is_none_or(|prior|
+                            prior.formula != cell.formula || !prior.value.same_stored_value(&cell.value)))
                             .then_some(CellRef::new(p * PAGE_ROWS + row as u32, col as u32))
                     })
                 })

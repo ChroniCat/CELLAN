@@ -3,12 +3,12 @@
 //! 所有会话使用房间口令和随机盐建立带认证的加密通道；完成握手后才交换工作簿数据。
 
 use sha2::{Digest, Sha256};
-use crate::net_sort::SortBatch;
+use crate::net_sort::{Grid, RoomGrids, SharedGrid, SortBatch, shift_grid, upsert};
 use sheetcore::sync::{Cursor, Msg, Op, SortResponse};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -21,6 +21,39 @@ pub fn port() -> u16 {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(DEFAULT_PORT)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SortVote {
+    sender: Arc<Mutex<Option<Sender<bool>>>>,
+    connection: Weak<()>,
+}
+
+impl SortVote {
+    pub fn send(&self, value: bool) -> Result<(), ()> {
+        let _connection = self.connection.upgrade().ok_or(())?;
+        self.sender.lock().unwrap().take().ok_or(())?.send(value).map_err(|_| ())
+    }
+
+    pub fn pending(&self) -> bool {
+        self.connection.strong_count() != 0 && self.sender.lock().unwrap().is_some()
+    }
+
+    /// The UI and deadline compete for a single vote. When it times out, ordinary
+    /// cell frames can proceed and a late GUI completion cannot apply the permutation.
+    fn wait(rx: Receiver<bool>, sender: Weak<Mutex<Option<Sender<bool>>>>, deadline: Duration) -> bool {
+        match rx.recv_timeout(deadline) {
+            Ok(value) => value,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(sender) = sender.upgrade()
+                    && let Some(tx) = sender.lock().unwrap().take() {
+                    let _ = tx.send(false);
+                }
+                rx.recv().unwrap_or(false)
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -36,12 +69,13 @@ pub enum NetEvent {
     PeerRenamed(u32, String),
     PeerLeft(u32),
     Ops(Vec<Op>),
-    Sort(sheetcore::sync::SortPermutation, Sender<bool>),
-    SortReady(crate::net_sort::SortTarget, Option<Arc<SortBatch>>, Sender<bool>),
+    Sort(sheetcore::sync::SortPermutation, SortVote),
+    SortReady(crate::net_sort::SortTarget, Option<Arc<SortBatch>>, SortVote),
     Sorted(Arc<SortBatch>),
     CommittedSortStyles(Arc<SortBatch>),
     ConfirmedStyles(Vec<(usize,u32,u32,sheetcore::style::CellStyle)>),
     SortRepairDone(u64),
+    LocalSortRepair(Arc<SortCorrection>),
     SortRepairs { sheet:usize, first_ts:u64, items:Vec<sheetcore::sync::SortRepair> },
     /// 宿主初始/重连快照接收完毕
     SnapshotDone,
@@ -50,6 +84,8 @@ pub enum NetEvent {
     LockOk { site: u32, name: String, sheet: usize, row: u32, col: u32 },
     /// 结构改动历史（加入时补）
     StructuralHistory(Vec<(usize, sheetcore::structural::Structural)>),
+    StructuralRejected(String),
+    StructureRevision(usize),
     /// 远端结构性改动（带已认证站点号）
     Structural { site: u32, sheet: usize, op: sheetcore::structural::Structural },
     /// 远端格式变更（`snapshot=true` 表示入房补发的既有样式，不记修订日志）
@@ -101,10 +137,11 @@ pub enum NetEvent {
 
 enum Cmd {
     Broadcast(String),
+    GuestStructure(u64,Msg),
     Cells(Vec<Op>),
     Style(Msg),
     Deliver(Vec<LiveSender>, RoomChange),
-    Sort(Arc<SortBatch>),
+    Sort(u64,Arc<SortBatch>),
     SendTo(u32, String),
     Stop,
 }
@@ -113,6 +150,7 @@ enum Cmd {
 /// updates. Encoding happens on the dispatcher after releasing the state lock.
 enum RoomChange {
     Sort(Arc<SortBatch>),
+    Correction(Arc<SortCorrection>),
     Cells(Vec<Op>),
     Message(Msg),
 }
@@ -149,7 +187,7 @@ fn cell_frames(ops: impl IntoIterator<Item = Op>, to_host: bool, batch: bool, mu
     if !pending.is_empty() { flush(pending); }
 }
 
-enum LiveFrame { Line(String), Sort(Arc<SortBatch>) }
+enum LiveFrame { Line(String), Sort(Arc<SortBatch>), Correction(Arc<SortCorrection>) }
 
 #[derive(Clone)]
 struct LiveSender {
@@ -187,10 +225,32 @@ fn sort_repair_keys(batch: &SortBatch, mut emit: impl FnMut(u64,RepairKeys) -> b
     true
 }
 
-fn sort_repairs(state: &Mutex<sheetcore::sync::CellOps>, styles: &SharedStyles, sheet: usize,
+// Captured at the ordered rejection point. Encoding a large rollback happens
+// on the receiver's writer; subsequent room frames remain behind it.
+#[derive(Debug)]
+pub(crate) struct SortCorrection {
+    batch: Arc<SortBatch>,
+    cells: Arc<Grid<Op>>,
+    styles: Arc<Grid<sheetcore::style::CellStyle>>,
+    edits: Vec<(usize,sheetcore::structural::Structural)>,
+}
+
+impl SortCorrection {
+    fn capture(batch: Arc<SortBatch>, cells: &SharedGrid<Op>, styles: &SharedStyles,
+               edits: &[(usize,sheetcore::structural::Structural)]) -> Arc<Self> {
+        Arc::new(Self { batch, cells: cells.lock().unwrap().clone(), styles: styles.lock().unwrap().clone(), edits: edits.to_vec() })
+    }
+
+    pub fn chunks(&self, mut send: impl FnMut(usize,u64,Vec<sheetcore::sync::SortRepair>) -> bool) -> bool {
+        let sheet = self.batch.plan.sheet;
+        sort_repair_keys(&self.batch, |first,keys| {
+            send(sheet,first,sort_repairs(&self.cells,&self.styles,sheet,first,keys,&self.edits))
+        })
+    }
+}
+
+fn sort_repairs(cells: &Grid<Op>, styles: &Grid<sheetcore::style::CellStyle>, sheet: usize,
                 first_ts:u64, keys: RepairKeys, edits: &[(usize,sheetcore::structural::Structural)]) -> Vec<sheetcore::sync::SortRepair> {
-    let cells = state.lock().unwrap();
-    let styles = styles.lock().unwrap();
     keys.into_iter().enumerate().filter_map(|(index,(row,col,expected))| {
         // Structural frames preceding this correction have already relocated the
         // optimistic operation on the reader. Deleted slots need no value repair.
@@ -209,28 +269,26 @@ fn send_sort(batch: &SortBatch, capable: bool, to_host: bool, batched: bool,
     if capable {
         let offer = Msg::SortPermutation(batch.offer());
         if !send(serde_json::to_string(&offer).unwrap()) { return false; }
-        match replies.recv_timeout(Duration::from_secs(60)) {
-            Ok((id, outcome)) if id == batch.plan.first_ts => {
-                if outcome == SortResponse::Accepted { return true; }
-                if outcome == SortResponse::NeedCells && to_host {
-                    let first_ts = batch.plan.first_ts;
-                    let mut fmts = batch.styles.iter().peekable();
-                    for ops in batch.ops.chunks(sheetcore::sync::LIVE_OP_BATCH) {
-                        let items = ops.iter().map(|op| {
-                            let style = fmts.next_if(|s| (s.0,s.1)==(op.row,op.col)).map(|s| s.2.clone());
-                            ((**op).clone(),style)
-                        }).collect();
-                        if !send_room_message(Msg::SortData { first_ts,items }, MAX_PLAIN_LINE, &mut send, || {}) { return false; }
-                    }
-                    return send(serde_json::to_string(&Msg::SortData { first_ts,items:Vec::new() }).unwrap());
-                }
-                if let SortResponse::Locked { structural_revision } = outcome && to_host {
-                    return sort_repair_keys(batch, |first_ts,keys| {
-                        send_room_message(Msg::SortRepairRequest { sheet: batch.plan.sheet, first_ts, structural_revision, keys }, MAX_PLAIN_LINE, &mut send, || {})
-                    }) && send(serde_json::to_string(&Msg::SortRepairDone { first_ts: batch.plan.first_ts }).unwrap());
-                }
+        let Some(outcome) = replies.iter().find_map(|(id,v)| (id == batch.plan.first_ts).then_some(v)) else {
+            return false; // The read loop closed this connection's acknowledgement channel.
+        };
+        if outcome == SortResponse::Accepted { return true; }
+        if outcome == SortResponse::NeedCells && to_host {
+            let first_ts = batch.plan.first_ts;
+            let mut fmts = batch.styles.iter().peekable();
+            for ops in batch.ops.chunks(sheetcore::sync::LIVE_OP_BATCH) {
+                let items = ops.iter().map(|op| {
+                    let style = fmts.next_if(|s| (s.0,s.1)==(op.row,op.col)).map(|s| s.2.clone());
+                    ((**op).clone(),style)
+                }).collect();
+                if !send_room_message(Msg::SortData { first_ts,items }, MAX_PLAIN_LINE, &mut send, || {}) { return false; }
             }
-            _ => return false, // unknown delivery outcome: resume via authoritative room snapshot
+            return send(serde_json::to_string(&Msg::SortData { first_ts,items:Vec::new() }).unwrap());
+        }
+        if let SortResponse::Locked { structural_revision } = outcome && to_host {
+            return sort_repair_keys(batch, |first_ts,keys| {
+                send_room_message(Msg::SortRepairRequest { sheet: batch.plan.sheet, first_ts, structural_revision, keys }, MAX_PLAIN_LINE, &mut send, || {})
+            }) && send(serde_json::to_string(&Msg::SortRepairDone { first_ts: batch.plan.first_ts }).unwrap());
         }
     }
     ordinary_sort_frames(batch, to_host, batched, send)
@@ -622,11 +680,30 @@ impl EvtTx {
     }
 }
 
-type SharedStyles = Arc<Mutex<std::collections::BTreeMap<(usize, u32, u32), Arc<sheetcore::style::CellStyle>>>>;
+type SharedStyles = SharedGrid<sheetcore::style::CellStyle>;
+
+#[derive(Default)]
+struct StructureProgress {
+    seen: usize,
+    // The host may apply an edit to B before the UI polls an earlier edit to A.
+    // Publishing a global revision must wait until all preceding edits were seen.
+    applied_out_of_order: std::collections::BTreeSet<usize>,
+}
+
+impl StructureProgress {
+    fn consume(&mut self, count: usize) {
+        self.seen += count;
+        while self.applied_out_of_order.remove(&self.seen) { self.seen += 1; }
+    }
+}
 
 pub struct Net {
     pub site: u32,
-    structure_seen: std::sync::atomic::AtomicUsize,
+    structure_seen: Mutex<StructureProgress>,
+    sheet_names: Arc<Mutex<Vec<String>>>,
+    structural_ack: Arc<AtomicBool>,
+    connection_generation: Arc<AtomicU64>,
+    pending_structure: AtomicBool,
     pending_sorts: Arc<Mutex<std::collections::BTreeMap<u64,Arc<SortBatch>>>>,
     local_sort_ranges: Mutex<Vec<(u64,u64)>>,
     cmd: Sender<Cmd>,
@@ -643,8 +720,8 @@ pub struct Net {
     connected: Arc<AtomicBool>,
     wake_ctx: Arc<Mutex<Option<eframe::egui::Context>>>,
     sockets: Arc<Mutex<Vec<Weak<TcpStream>>>>,
-    state: Option<Arc<Mutex<sheetcore::sync::CellOps>>>,
-    delta_ops: Option<Arc<Mutex<sheetcore::sync::CellOps>>>,
+    state: Option<SharedGrid<Op>>,
+    delta_ops: Option<SharedGrid<Op>>,
     host_base_hash: Option<Arc<Mutex<String>>>,
     host_roster: Option<Arc<Mutex<RoomRoster>>>,
     room_order: Option<Arc<Mutex<()>>>,
@@ -652,6 +729,8 @@ pub struct Net {
     after_snapshot: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
     #[cfg(test)]
     pub(crate) before_sort_reply: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    #[cfg(test)]
+    pub(crate) before_sort_commit: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
     /// 宿主自己也是参与者：本地租约表 + 光标表 + 事件入口
     host_locks: Option<Arc<Mutex<sheetcore::sync::LockTable>>>,
     host_cursors: Option<Arc<Mutex<HashMap<u32, Cursor>>>>,
@@ -766,27 +845,19 @@ impl Drop for ConnSlot {
 
 /// 结构改动后，宿主的操作日志、样式表、租约表与光标表都要同步平移坐标，
 /// 否则后来加入的人或在线持锁者会停留在旧坐标。
-fn upsert_lww_op(map: &mut sheetcore::sync::CellOps, op: Arc<Op>) {
-    let key = (op.sheet, op.row, op.col);
-    match map.get(&key) {
-        Some(cur) if (op.ts, op.site) <= (cur.ts, cur.site) => {}
-        _ => {
-            map.insert(key, op);
-        }
-    }
-}
-
-fn update_host_ops(state: &Mutex<sheetcore::sync::CellOps>, delta: &Mutex<sheetcore::sync::CellOps>, ops: &[Op]) {
+fn update_host_ops(state: &Mutex<Arc<Grid<Op>>>, delta: &Mutex<Arc<Grid<Op>>>, ops: &[Op]) {
     update_host_shared_ops(state, delta, ops.iter().cloned().map(Arc::new));
 }
 
-fn update_host_shared_ops(state: &Mutex<sheetcore::sync::CellOps>, delta: &Mutex<sheetcore::sync::CellOps>,
+fn update_host_shared_ops(state: &Mutex<Arc<Grid<Op>>>, delta: &Mutex<Arc<Grid<Op>>>,
                           ops: impl IntoIterator<Item=Arc<Op>>) {
     let mut state = state.lock().unwrap();
     let mut delta = delta.lock().unwrap();
+    let state = Arc::make_mut(&mut state);
+    let delta = Arc::make_mut(&mut delta);
     for op in ops {
-        upsert_lww_op(&mut state, Arc::clone(&op));
-        upsert_lww_op(&mut delta, op);
+        upsert(state, &op);
+        upsert(delta, &op);
     }
 }
 
@@ -794,32 +865,48 @@ fn update_host_styles(state: &SharedStyles, delta: &SharedStyles, sheet: usize,
                       items: &[(u32, u32, sheetcore::style::CellStyle)]) {
     let mut state = state.lock().unwrap();
     let mut delta = delta.lock().unwrap();
+    let state = Arc::make_mut(&mut state);
+    let delta = Arc::make_mut(&mut delta);
     for (row, col, style) in items {
         let key = (sheet, *row, *col);
         let style = Arc::new(style.clone());
-        state.insert(key, Arc::clone(&style));
-        delta.insert(key, style);
+        state.insert_cow(key, Arc::clone(&style));
+        delta.insert_cow(key, style);
     }
 }
 
 fn shift_state(
-    state: &Arc<Mutex<sheetcore::sync::CellOps>>,
-    delta_ops: &Arc<Mutex<sheetcore::sync::CellOps>>,
+    state: &SharedGrid<Op>,
+    delta_ops: &SharedGrid<Op>,
     base_hash: &Arc<Mutex<String>>,
     styles: &SharedStyles,
     delta_styles: &SharedStyles,
     locks: &Arc<Mutex<sheetcore::sync::LockTable>>,
     cursors: &Arc<Mutex<HashMap<u32, Cursor>>>,
+    names: &[String],
     sheet: usize,
     op: &sheetcore::structural::Structural,
 ) {
     let map = |r: u32, c: u32| sheetcore::sync::shift_structural_coord(r, c, op);
     base_hash.lock().unwrap().clear();
-    sheetcore::sync::shift_cell_ops(&mut state.lock().unwrap(), sheet, op);
-    sheetcore::sync::shift_cell_ops(&mut delta_ops.lock().unwrap(), sheet, op);
-    for styles in [styles, delta_styles] {
-        sheetcore::sync::shift_cell_map(&mut styles.lock().unwrap(), sheet, op, |_, _, _| {});
+    let shifts = sheetcore::sync::structural_reference_shifts(names,sheet,op);
+    for cells in [state, delta_ops] {
+        shift_grid(cells, sheet, op, |value, row, col| {
+            let cell = Arc::make_mut(value);
+            cell.row = row;
+            cell.col = col;
+        });
+        let mut grid = cells.lock().unwrap();
+        let original = grid.clone();
+        for (&key,cell) in original.range(..) {
+            if let Some(formula) = cell.shifted_formula(&shifts) {
+                let mut changed = (**cell).clone();
+                changed.formula = Some(formula);
+                Arc::make_mut(&mut grid).insert_cow(key,Arc::new(changed));
+            }
+        }
     }
+    for styles in [styles, delta_styles] { shift_grid(styles, sheet, op, |_,_,_| {}); }
     locks.lock().unwrap().shift_structural(sheet, op);
     {
         let mut cm = cursors.lock().unwrap();
@@ -924,7 +1011,7 @@ fn send_room_message(msg: Msg, limit: usize, mut send: impl FnMut(String) -> boo
 }
 
 fn latest_cell_op(
-    state: &Mutex<sheetcore::sync::CellOps>,
+    state: &Mutex<Arc<Grid<Op>>>,
     sheet: usize,
     row: u32,
     col: u32,
@@ -961,15 +1048,17 @@ impl Net {
         workbook: &sheetcore::Workbook,
         mut host_cursor: Cursor,
     ) {
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        *self.sheet_names.lock().unwrap() = workbook.sheets.iter().map(|s| s.name.clone()).collect();
         if let Some(st) = &self.state {
             let mut map = st.lock().unwrap();
-            map.clone_from(&peer.cells);
+            *map = Arc::new(peer.cells.iter().map(|(k,v)| (*k,v.clone())).collect());
         }
         if let Some(d) = &self.delta_ops {
-            d.lock().unwrap().clear();
+            *d.lock().unwrap() = Default::default();
         }
         if let Some(ds) = &self.delta_styles {
-            ds.lock().unwrap().clear();
+            *ds.lock().unwrap() = Default::default();
         }
         if let Some(dm) = &self.delta_merges {
             dm.lock().unwrap().clear();
@@ -980,7 +1069,7 @@ impl Net {
             for (index, sheet) in workbook.sheets.iter().enumerate() {
                 for (pos, &id) in sheet.styles.iter().filter(|(_, id)| **id != 0) {
                     let style = palette.entry(id).or_insert_with(|| Arc::new(workbook.styles.get(id).clone()));
-                    map.insert((index, pos.row, pos.col), Arc::clone(style));
+                    Arc::make_mut(&mut map).insert_cow((index, pos.row, pos.col), Arc::clone(style));
                 }
             }
         }
@@ -1098,9 +1187,15 @@ impl Net {
         }
     }
 
-    pub fn structure_seen(&self) -> usize { self.structure_seen.load(Ordering::Relaxed) }
-    pub fn note_structure(&self, count: usize) { self.structure_seen.fetch_add(count, Ordering::Relaxed); }
-    pub fn reset_structure(&self) { self.structure_seen.store(0, Ordering::Relaxed); }
+    pub fn pending_structure(&self) -> bool { self.pending_structure.load(Ordering::Acquire) }
+    pub fn finish_structure(&self) { self.pending_structure.store(false, Ordering::Release); }
+
+    pub fn structure_seen(&self) -> usize { self.structure_seen.lock().unwrap().seen }
+    pub fn note_structure(&self, count: usize) { self.structure_seen.lock().unwrap().consume(count); }
+    pub fn set_structure_revision(&self, revision: usize) {
+        *self.structure_seen.lock().unwrap() = StructureProgress { seen:revision,..Default::default() };
+    }
+    pub fn reset_structure(&self) { self.set_structure_revision(0); }
 
     pub fn sort_clock_ranges(&self) -> Vec<(u64,u64)> { self.local_sort_ranges.lock().unwrap().clone() }
 
@@ -1116,10 +1211,10 @@ impl Net {
     }
 
     pub(crate) fn check_sort(&self, target: crate::net_sort::SortTarget, plan: sheetcore::sync::SortPermutation, sheet: sheetcore::Sheet,
-                              styles: sheetcore::style::StyleTable, reply: Sender<bool>) {
+                              styles: sheetcore::style::StyleTable, reply: SortVote) {
         let events = self.evt_tx.clone();
         std::thread::spawn(move || {
-            let batch = crate::net_sort::from_sheet(&sheet,&styles,&plan).map(Arc::new);
+            let batch = crate::net_sort::from_sheet(&sheet,&styles,&plan,|| reply.pending()).map(Arc::new);
             let _ = events.send(NetEvent::SortReady(target,batch,reply));
         });
     }
@@ -1128,25 +1223,27 @@ impl Net {
         let batch = Arc::new(batch);
         if let (Some(order), Some(roster), Some(state), Some(delta), Some(styles), Some(delta_styles)) =
             (&self.room_order, &self.host_roster, &self.state, &self.delta_ops, &self.host_styles, &self.delta_styles) {
-            let _order = order.lock().unwrap();
-            let leases = self.host_locks.as_ref().expect("host lease table").lock().unwrap();
-            let (r1,c1,r2,c2) = batch.plan.region;
-            let history = self.host_structs.as_ref().expect("host structural history").lock().unwrap();
-            let later = history.get(batch.plan.structural_revision..).unwrap_or_default();
-            if later.iter().any(|(s,_)| *s==batch.plan.sheet)
-                || leases.conflicts_rect(batch.plan.sheet,r1,c1,r2,c2,self.site,self.host_now_ms()).is_some() {
-                drop(leases);
-                sort_repair_keys(&batch, |first_ts,keys| {
-                    let items = sort_repairs(state,styles,batch.plan.sheet,first_ts,keys,later);
-                    self.evt_tx.send(NetEvent::SortRepairs { sheet: batch.plan.sheet, first_ts, items }).is_ok()
-                });
-                return;
+            for attempt in 0..3 {
+                let current = RoomGrids::capture(state,delta,styles,delta_styles);
+                let next = current.apply(&batch);
+                let _order = order.lock().unwrap();
+                let leases = self.host_locks.as_ref().expect("host lease table").lock().unwrap();
+                let (r1,c1,r2,c2) = batch.plan.region;
+                let history = self.host_structs.as_ref().expect("host structural history").lock().unwrap();
+                let later = history.get(batch.plan.structural_revision..);
+                let allowed = later.is_some_and(|changes| changes.iter().all(|(s,_)| *s != batch.plan.sheet))
+                    && leases.conflicts_rect(batch.plan.sheet,r1,c1,r2,c2,self.site,self.host_now_ms()).is_none();
+                if allowed && current.publish(&next,state,delta,styles,delta_styles) {
+                    if !batch.styles.is_empty() { let _ = self.evt_tx.send(NetEvent::CommittedSortStyles(batch.clone())); }
+                    queue_room_change(&self.cmd,roster,None,RoomChange::Sort(batch));
+                    return;
+                }
+                if !allowed || attempt == 2 {
+                    let correction = SortCorrection::capture(batch,state,styles,later.unwrap_or_default());
+                    let _ = self.evt_tx.send(NetEvent::LocalSortRepair(correction));
+                    return;
+                }
             }
-            update_host_shared_ops(state,delta,batch.ops.iter().cloned());
-            update_host_styles(styles,delta_styles,batch.plan.sheet,&batch.styles);
-            if !batch.styles.is_empty() { let _ = self.evt_tx.send(NetEvent::CommittedSortStyles(batch.clone())); }
-            queue_room_change(&self.cmd,roster,None,RoomChange::Sort(batch));
-            drop(leases);
         } else {
             let first = batch.plan.first_ts;
             let end = first + batch.ops.len() as u64;
@@ -1155,7 +1252,8 @@ impl Net {
             else { ranges.push((first,end)); }
             drop(ranges);
             self.pending_sorts.lock().unwrap().insert(first,batch.clone());
-            let _ = self.cmd.send(Cmd::Sort(batch));
+            let generation = self.connection_generation.load(Ordering::Acquire);
+            let _ = self.cmd.send(Cmd::Sort(generation,batch));
         }
     }
 
@@ -1352,19 +1450,39 @@ impl Net {
 
     /// 广播结构性改动（宿主顺手把本地快照日志、租约与光标也搬家）
     pub fn broadcast_structural(&self, sheet: usize, op: &sheetcore::structural::Structural) -> Result<(), String> {
+        let message = Msg::Structural { site: self.site, sheet, op: op.clone() };
+        if !message.is_within_limits() { return Err("插删区域超出工作表范围".into()); }
+        let generation = self.connection_generation.load(Ordering::Acquire);
         let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        if let Some(history) = &self.host_structs {
+            let history = history.lock().unwrap();
+            let progress = self.structure_seen.lock().unwrap();
+            if history.get(progress.seen..).is_none_or(|later| later.iter().enumerate().any(|(i,(s,_))|
+                *s == sheet && !progress.applied_out_of_order.contains(&(progress.seen+i)))) {
+                return Err("正在同步工作表结构，请稍后重新执行插删操作".into());
+            }
+        }
         if let Some((_, name, row, col)) = self.host_lock_conflict_structural(sheet, op) {
             return Err(format!("{name} 正在编辑 {}，请待其完成后再{}", sheetcore::model::cell_name(row, col), op.label()));
         }
         if !self.alive.load(Ordering::SeqCst) || !self.is_live() {
             return Err("协作连接已断开，结构修改尚未执行".into());
         }
-        let msg = Msg::Structural { site: self.site, sheet, op: op.clone() };
-        let queued = if let Some(roster) = &self.host_roster {
-            queue_room_change(&self.cmd, roster, None, RoomChange::Message(msg))
-        } else {
-            serde_json::to_string(&msg).is_ok_and(|s| self.cmd.send(Cmd::Broadcast(s)).is_ok())
-        };
+        if !self.hosting {
+            if !self.structural_ack.load(Ordering::Acquire) {
+                return Err("当前宿主版本无法确认插删操作，请由宿主执行或升级宿主".into());
+            }
+            if self.pending_structure.swap(true, Ordering::AcqRel) {
+                return Err("正在等待宿主确认上一项插删操作".into());
+            }
+            let msg = Msg::StructuralRequest { site: self.site, sheet, revision: self.structure_seen(), op: op.clone() };
+            if self.cmd.send(Cmd::GuestStructure(generation,msg)).is_ok() {
+                return Ok(());
+            }
+            self.finish_structure();
+            return Err("协作连接已断开，结构修改尚未执行".into());
+        }
+        let queued = queue_room_change(&self.cmd,self.host_roster.as_ref().unwrap(),None,RoomChange::Message(message));
         if !queued { return Err("协作发送队列已关闭，结构修改尚未执行".into()); }
         if let (Some(state), Some(delta_ops), Some(bh), Some(st), Some(ds), Some(locks), Some(cursors)) = (
             &self.state,
@@ -1376,18 +1494,22 @@ impl Net {
             &self.host_cursors,
         ) {
             let before = state.lock().unwrap().len();
-            shift_state(state, delta_ops, bh, st, ds, locks, cursors, sheet, op);
+            shift_state(state, delta_ops, bh, st, ds, locks, cursors, &self.sheet_names.lock().unwrap(), sheet, op);
             if std::env::var("SC_DBG").is_ok() {
                 let g = state.lock().unwrap();
-                let r0 = g.values().filter(|o| o.row == 0).count();
-                let r2 = g.values().filter(|o| o.row == 2).count();
+                let r0 = g.range(..).filter(|(_,o)| o.row == 0).count();
+                let r2 = g.range(..).filter(|(_,o)| o.row == 2).count();
                 eprintln!("[dbg] shift_state: {before} 条，row0={r0} row2={r2}");
             }
         }
         if let Some(h) = &self.host_structs {
-            h.lock().unwrap().push((sheet, op.clone()));
+            let mut history = h.lock().unwrap();
+            let index = history.len();
+            history.push((sheet, op.clone()));
+            let mut progress = self.structure_seen.lock().unwrap();
+            progress.applied_out_of_order.insert(index);
+            progress.consume(0);
         }
-        self.note_structure(1);
         Ok(())
     }
 
@@ -1537,6 +1659,8 @@ impl Net {
         for socket in self.sockets.lock().unwrap().drain(..).filter_map(|s| s.upgrade()) {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
+        self.finish_structure();
+        self.pending_sorts.lock().unwrap().clear();
         let _ = self.cmd.send(Cmd::Stop);
     }
 }
@@ -1675,12 +1799,15 @@ fn host_initialized(
     let roster = Arc::new(Mutex::new(RoomRoster::new(site, name)));
     let roster_for_self = roster.clone();
     let room_order = Arc::new(Mutex::new(()));
+    let sheet_names: Arc<Mutex<Vec<String>>> = Default::default();
     #[cfg(test)]
     let after_snapshot: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> = Default::default();
     #[cfg(test)]
     let before_sort_reply: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> = Default::default();
-    let state: Arc<Mutex<sheetcore::sync::CellOps>> = Default::default();
-    let delta_ops: Arc<Mutex<sheetcore::sync::CellOps>> = Default::default();
+    #[cfg(test)]
+    let before_sort_commit: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> = Default::default();
+    let state: SharedGrid<Op> = Default::default();
+    let delta_ops: SharedGrid<Op> = Default::default();
     let host_base_hash: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
     // 广播与定向单播分发
@@ -1702,7 +1829,7 @@ fn host_initialized(
                             });
                         }
                     }
-                    Cmd::Sort(_) => unreachable!("guest sort command on host"),
+                    Cmd::GuestStructure(..) | Cmd::Sort(..) => unreachable!("guest command on host"),
                     Cmd::Style(_) => unreachable!("client style dispatch is guest-only"),
                     Cmd::Deliver(peers, change) => {
                         let send = |line: String| {
@@ -1713,6 +1840,9 @@ fn host_initialized(
                                 for peer in &peers {
                                     let _ = peer.tx.send(LiveFrame::Sort(batch.clone()));
                                 }
+                            }
+                            RoomChange::Correction(correction) => {
+                                for peer in &peers { let _ = peer.tx.send(LiveFrame::Correction(correction.clone())); }
                             }
                             RoomChange::Cells(ops) => cell_frames(ops, false, true, send),
                             RoomChange::Message(msg) => {
@@ -1806,11 +1936,14 @@ fn host_initialized(
     // accept 循环
     {
         let sockets = sockets.clone();
+        let sheet_names = sheet_names.clone();
         let room_order = room_order.clone();
         #[cfg(test)]
         let after_snapshot = after_snapshot.clone();
         #[cfg(test)]
         let before_sort_reply = before_sort_reply.clone();
+        #[cfg(test)]
+        let before_sort_commit = before_sort_commit.clone();
         let cmd = cmd_tx.clone();
         let roster = roster.clone();
         let state = state.clone();
@@ -1853,11 +1986,14 @@ fn host_initialized(
                 let _ = stream.set_nodelay(true);
                 let Some(stream) = track_socket(stream, &sockets, &alive) else { break };
                 let roster = roster.clone();
+                let sheet_names = sheet_names.clone();
                 let room_order = room_order.clone();
                 #[cfg(test)]
                 let after_snapshot = after_snapshot.clone();
                 #[cfg(test)]
                 let before_sort_reply = before_sort_reply.clone();
+                #[cfg(test)]
+                let before_sort_commit = before_sort_commit.clone();
                 let cmd = cmd.clone();
                 let state = state.clone();
                 let delta_ops = delta_ops_outer.clone();
@@ -1921,6 +2057,11 @@ fn host_initialized(
                         for frame in intro_rx.into_iter().map(LiveFrame::Line).chain(rx) {
                             let ok = match frame {
                                 LiveFrame::Line(line) => send(line),
+                                LiveFrame::Correction(correction) => {
+                                    correction.chunks(|sheet,first_ts,items| send_room_message(
+                                        Msg::SortRepairs { sheet,first_ts,items },MAX_PLAIN_LINE,send,|| {}))
+                                        && send(serde_json::to_string(&Msg::SortRepairDone { first_ts:correction.batch.plan.first_ts }).unwrap())
+                                }
                                 LiveFrame::Sort(batch) => send_sort(&batch, write_sort.load(Ordering::Acquire), false, true, &ack_rx, send),
                             };
                             if !ok { break; }
@@ -1956,8 +2097,6 @@ fn host_initialized(
 
                     let commit_sort = |batch: Arc<SortBatch>| {
                         let site = batch.plan.site;
-                        update_host_shared_ops(&state, &delta_ops, batch.ops.iter().cloned());
-                        update_host_styles(&styles,&delta_styles,batch.plan.sheet,&batch.styles);
                         queue_room_change(&cmd,&roster,Some(site),RoomChange::Sort(batch.clone()));
                         let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(
                             Msg::SortCommitted { first_ts: batch.plan.first_ts })));
@@ -2024,23 +2163,23 @@ fn host_initialized(
                                     && hist.is_empty()
                                     && *host_base_hash.lock().unwrap() == client_hash;
                                 let (snap, host_clock) = if can_delta {
-                                    let dops: Vec<Arc<Op>> = delta_ops.lock().unwrap().values().cloned().collect();
+                                    let dops: Vec<Arc<Op>> = delta_ops.lock().unwrap().range(..).map(|(_,o)| o.clone()).collect();
                                     let clk = dops
                                         .iter()
                                         .map(|o| o.ts)
                                         .max()
                                         .unwrap_or_else(|| {
-                                            state.lock().unwrap().values().map(|o| o.ts).max().unwrap_or(1)
+                                            state.lock().unwrap().range(..).map(|(_,o)| o.ts).max().unwrap_or(1)
                                         })
                                         .max(1);
                                     (dops, clk)
                                 } else {
-                                    let full: Vec<Arc<Op>> = state.lock().unwrap().values().cloned().collect();
+                                    let full: Vec<Arc<Op>> = state.lock().unwrap().range(..).map(|(_,o)| o.clone()).collect();
                                     let clk = full.iter().map(|o| o.ts).max().unwrap_or(1).max(1);
                                     (full, clk)
                                 };
                                 let style_source = if can_delta { &delta_styles } else { &styles };
-                                let style_snapshot = style_source.lock().unwrap().iter()
+                                let style_snapshot = style_source.lock().unwrap().range(..)
                                     .map(|(&key, style)| (key, Arc::clone(style))).collect();
                                 let merges = delta_merges.lock().unwrap().clone();
                                 expire_and_broadcast();
@@ -2068,6 +2207,7 @@ fn host_initialized(
                                         clock: host_clock,
                                         batch_ops: true,
                                         sort_permutation: true,
+                                        structural_ack: true,
                                     })
                                     .unwrap(),
                                 );
@@ -2182,61 +2322,75 @@ fn host_initialized(
                                 }
                                 let batch = fallback.take().unwrap();
                                 if batch.offer().digest != batch.plan.digest { break; }
-                                let _order = room_order.lock().unwrap();
-                                let history = structs.lock().unwrap();
-                                let Some(later) = history.get(batch.plan.structural_revision..) else { break };
-                                let leases = locks.lock().unwrap();
-                                let sheet = batch.plan.sheet;
-                                if later.iter().any(|(s,_)| *s==sheet) || leases.conflicts_rect(sheet,r1,c1,r2,c2,batch.plan.site,now_ms()).is_some() {
-                                    sort_repair_keys(&batch,|first_ts,keys| {
-                                        let items = sort_repairs(&state,&styles,sheet,first_ts,keys,later);
-                                        cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::SortRepairs {sheet,first_ts,items}))).is_ok()
-                                    });
-                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::SortRepairDone { first_ts })));
-                                } else { commit_sort(Arc::new(batch)); }
+                                let batch = Arc::new(batch);
+                                for attempt in 0..3 {
+                                    let current = RoomGrids::capture(&state,&delta_ops,&styles,&delta_styles);
+                                    let next = current.apply(&batch);
+                                    let _order = room_order.lock().unwrap();
+                                    let history = structs.lock().unwrap();
+                                    let later = history.get(batch.plan.structural_revision..);
+                                    let leases = locks.lock().unwrap();
+                                    let sheet = batch.plan.sheet;
+                                    let allowed = later.is_some_and(|edits| edits.iter().all(|(s,_)| *s!=sheet))
+                                        && leases.conflicts_rect(sheet,r1,c1,r2,c2,batch.plan.site,now_ms()).is_none();
+                                    if allowed && current.publish(&next,&state,&delta_ops,&styles,&delta_styles) {
+                                        commit_sort(batch.clone());
+                                        break;
+                                    }
+                                    if !allowed || attempt == 2 {
+                                        let correction = SortCorrection::capture(batch.clone(),&state,&styles,later.unwrap_or_default());
+                                        let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Correction(correction)));
+                                        break;
+                                    }
+                                }
                             }
                             Msg::SortRepairRequest { sheet, first_ts, structural_revision, keys } if can_sort.load(Ordering::Acquire) => {
                                 let _order = room_order.lock().unwrap();
                                 let history = structs.lock().unwrap();
-                                let Some(edits) = history.get(structural_revision..) else { break };
-                                let items = sort_repairs(&state,&styles,sheet,first_ts,keys,edits);
+                                let edits = history.get(structural_revision..).unwrap_or_default();
+                                if structural_revision > history.len() {
+                                    let msg = Msg::StructureRevision { revision: history.len() };
+                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(msg)));
+                                }
+                                let items = sort_repairs(&state.lock().unwrap(),&styles.lock().unwrap(),sheet,first_ts,keys,edits);
                                 let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::SortRepairs {sheet,first_ts,items})));
                             }
                             Msg::SortPermutation(plan) if can_sort.load(Ordering::Acquire) => {
                                 let Some(site) = hello_site else { break };
                                 if plan.site != site { break; }
-                                let _order = room_order.lock().unwrap();
                                 let (r1,c1,r2,c2) = plan.region;
+                                let current = RoomGrids::capture(&state,&delta_ops,&styles,&delta_styles);
+                                let same_frame = structs.lock().unwrap().get(plan.structural_revision..)
+                                    .is_some_and(|later| later.iter().all(|(s,_)| *s != plan.sheet));
+                                let permitted = same_frame && locks.lock().unwrap()
+                                    .conflicts_rect(plan.sheet,r1,c1,r2,c2,site,now_ms()).is_none();
+                                let candidate = permitted.then(|| current.expand(&plan)).flatten().map(Arc::new);
+                                let next = candidate.as_ref().map(|batch| current.apply(batch));
+                                #[cfg(test)]
+                                if let Some(hook) = before_sort_commit.lock().unwrap().take() { hook(); }
+                                let order = room_order.lock().unwrap();
                                 let history = structs.lock().unwrap();
-                                let Some(later) = history.get(plan.structural_revision..) else { break };
-                                let same_frame = !later.iter().any(|(s,_)| *s == plan.sheet);
-                                drop(history);
-                                let allowed = same_frame && locks.lock().unwrap().conflicts_rect(plan.sheet, r1,c1,r2,c2, site, now_ms()).is_none();
-                                let batch = allowed.then(|| {
-                                    let cells = state.lock().unwrap();
-                                    let fmts = styles.lock().unwrap();
-                                    let default = Arc::new(sheetcore::style::CellStyle::default_dark());
-                                    SortBatch::expand(&plan, |r,c| {
-                                        let key = (plan.sheet,r,c);
-                                        let op = cells.get(&key);
-                                        (op.map_or(sheetcore::sync::ValueWire::Empty, |o| o.value.clone()),
-                                         op.and_then(|o| o.formula.clone()), fmts.get(&key).unwrap_or(&default).clone())
-                                    })
-                                }).flatten();
-                                // Expansion can take time; a new lease must win if granted
-                                // before the authoritative sort is committed.
                                 let leases = locks.lock().unwrap();
-                                let allowed = allowed && leases.conflicts_rect(plan.sheet,r1,c1,r2,c2,site,now_ms()).is_none();
-                                let accepted = allowed && batch.is_some();
-                                if allowed && let Some(batch) = batch {
-                                    commit_sort(Arc::new(batch));
-                                } else if allowed {
-                                    fallback = Some(SortBatch::new(plan.clone(), Vec::new(), Vec::new()));
-                                }
-                                let outcome = if !allowed { SortResponse::Locked { structural_revision: plan.structural_revision } }
-                                    else if accepted { SortResponse::Accepted } else { SortResponse::NeedCells };
+                                let allowed = history.get(plan.structural_revision..)
+                                    .is_some_and(|later| !later.iter().any(|(s,_)| *s==plan.sheet))
+                                    && leases.conflicts_rect(plan.sheet,r1,c1,r2,c2,site,now_ms()).is_none();
+                                let outcome = if !allowed {
+                                    if plan.structural_revision > history.len() {
+                                        let msg = Msg::StructureRevision { revision: history.len() };
+                                        let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(msg)));
+                                    }
+                                    SortResponse::Locked { structural_revision: plan.structural_revision.min(history.len()) }
+                                } else if let (Some(batch),Some(next)) = (&candidate,&next)
+                                    && current.publish(next,&state,&delta_ops,&styles,&delta_styles) {
+                                    commit_sort(batch.clone());
+                                    SortResponse::Accepted
+                                } else {
+                                    fallback = Some(SortBatch::new(plan.clone(),Vec::new(),Vec::new()));
+                                    SortResponse::NeedCells
+                                };
                                 drop(leases);
-                                drop(_order);
+                                drop(history);
+                                drop(order);
                                 #[cfg(test)]
                                 if let Some(hook) = before_sort_reply.lock().unwrap().take() { hook(); }
                                 let reply = serde_json::to_string(&Msg::SortReply { first_ts: plan.first_ts, outcome }).unwrap();
@@ -2319,12 +2473,27 @@ fn host_initialized(
                                 }
                                 let _ = evt_tx.send(NetEvent::PeerRenamed(conn_site, canonical));
                             }
-                            Msg::Structural { site, sheet, op } => {
+                            request @ (Msg::Structural { .. } | Msg::StructuralRequest { .. }) => {
+                                let (site,sheet,op,revision) = match request {
+                                    Msg::Structural { site,sheet,op } => (site,sheet,op,None),
+                                    Msg::StructuralRequest { site,sheet,op,revision } => (site,sheet,op,Some(revision)),
+                                    _ => unreachable!(),
+                                };
                                 let Some(conn_site) = hello_site else { break };
                                 if site != conn_site {
                                     continue;
                                 }
                                 let _order = room_order.lock().unwrap();
+                                if revision.is_some_and(|rev| {
+                                    structs.lock().unwrap().get(rev..)
+                                        .is_none_or(|later| later.iter().any(|(s,_)| *s==sheet))
+                                }) {
+                                    let revision = structs.lock().unwrap().len();
+                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::StructureRevision { revision })));
+                                    let msg = Msg::StructuralRejected { reason: "工作表结构已变更，请重新执行插删操作".into() };
+                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(msg)));
+                                    continue;
+                                }
                                 expire_and_broadcast();
                                 let conflict = locks
                                     .lock()
@@ -2332,6 +2501,11 @@ fn host_initialized(
                                     .conflicts_structural(sheet, &op, conn_site, now_ms())
                                     .map(|((r, c), h)| (h.site, h.name.clone(), r, c));
                                 if let Some((holder, holder_name, row, col)) = conflict {
+                                    if revision.is_some() {
+                                        let reason = format!("{holder_name} 正在编辑 {}，宿主未执行{}",sheetcore::model::cell_name(row,col),op.label());
+                                        let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::StructuralRejected { reason })));
+                                        continue;
+                                    }
                                     let deny = serde_json::to_string(&Msg::LockDeny {
                                         site: conn_site,
                                         sheet,
@@ -2344,9 +2518,9 @@ fn host_initialized(
                                     let _ = tx.send(deny);
                                     continue;
                                 }
-                                shift_state(&state, &delta_ops, &host_base_hash, &styles, &delta_styles, &locks, &cursors, sheet, &op);
+                                shift_state(&state, &delta_ops, &host_base_hash, &styles, &delta_styles, &locks, &cursors, &sheet_names.lock().unwrap(), sheet, &op);
                                 structs.lock().unwrap().push((sheet, op.clone()));
-                                queue_room_change(&cmd, &roster, Some(conn_site), RoomChange::Message(Msg::Structural {
+                                queue_room_change(&cmd, &roster, revision.is_none().then_some(conn_site), RoomChange::Message(Msg::Structural {
                                     site: conn_site,
                                     sheet,
                                     op: op.clone(),
@@ -2702,6 +2876,7 @@ fn host_initialized(
                             _ => {}
                         }
                     }
+                    drop(ack_tx); // Wake this socket's writer even if its sort never got a reply.
                     if let Some(site) = hello_site {
                         let remaining = roster.lock().unwrap().remove_member(site);
                         cursors.lock().unwrap().remove(&site);
@@ -2759,11 +2934,17 @@ fn host_initialized(
 
         #[cfg(test)]
         before_sort_reply,
+        #[cfg(test)]
+        before_sort_commit,
         host_locks: Some(locks_for_self),
         host_cursors: Some(cursors_for_self),
         host_styles: Some(styles_for_self),
         delta_styles: Some(delta_styles_for_self),
         delta_merges: Some(delta_merges_for_self),
+        pending_structure: Default::default(),
+        structural_ack: Default::default(),
+        connection_generation: Default::default(),
+        sheet_names,
         structure_seen: Default::default(),
         pending_sorts: Default::default(),
         local_sort_ranges: Default::default(),
@@ -2954,6 +3135,11 @@ fn join_session(
     let alive = Arc::new(AtomicBool::new(true));
     let connected_flag = Arc::new(AtomicBool::new(false));
     let connected_for_net = connected_flag.clone();
+    let structural_ack = Arc::new(AtomicBool::new(false));
+    let ack_for_reader = structural_ack.clone();
+    let connection_generation = Arc::new(AtomicU64::new(0));
+    let writer_generation = connection_generation.clone();
+    let reader_generation = connection_generation.clone();
     let writer: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
     // 发送端加密会话单独归写线程持有，读线程使用栈上独立解密会话（彻底消灭大快照解密期间读写锁争用！）
     type GuestSend = (sheetcore::wire::Session, bool, bool, Arc<Mutex<Receiver<(u64,SortResponse)>>>);
@@ -2998,8 +3184,10 @@ fn join_session(
                             }
                         }
                     }
-                    Cmd::Sort(batch) => {
-                        let current = send_sess.lock().unwrap().as_ref().map(|(_,b,c,acks)| (*b,*c,acks.clone()));
+                    Cmd::Sort(generation,batch) => {
+                        let current = send_sess.lock().unwrap().as_ref()
+                            .filter(|_| writer_generation.load(Ordering::Acquire) == generation)
+                            .map(|(_,b,c,acks)| (*b,*c,acks.clone()));
                         let Some((batched, capable, acks)) = current else { continue };
                         let ok = send_sort(&batch, capable, true, batched, &acks.lock().unwrap(), |line| {
                             let mut session = send_sess.lock().unwrap();
@@ -3010,6 +3198,15 @@ fn join_session(
                         if ok && !capable { pending_for_writer.lock().unwrap().remove(&batch.plan.first_ts); }
                         if !ok && send_sess.lock().unwrap().as_ref().is_some_and(|(_,_,_,current)| Arc::ptr_eq(current,&acks))
                             && let Some(w) = writer.lock().unwrap().as_ref() { let _ = w.shutdown(std::net::Shutdown::Both); }
+                    }
+                    Cmd::GuestStructure(generation,msg) => {
+                        let mut session = send_sess.lock().unwrap();
+                        let mut writer = writer.lock().unwrap();
+                        if writer_generation.load(Ordering::Acquire) == generation
+                            && let (Some((se,_,_,_)),Some(w)) = (session.as_mut(),writer.as_mut()) {
+                            let result = write_line(w,&se.seal(&serde_json::to_string(&msg).unwrap()));
+                            if result.is_err() { let _ = w.shutdown(std::net::Shutdown::Both); }
+                        }
                     }
                     Cmd::Deliver(_, _) => unreachable!("room dispatch is host-only"),
                     Cmd::Broadcast(s) | Cmd::SendTo(_, s) => {
@@ -3068,6 +3265,8 @@ fn join_session(
 
                 let (sort_ack, sort_replies) = channel();
                 let sort_replies = Arc::new(Mutex::new(sort_replies));
+                let connection = Arc::new(());
+                let mut active_vote: Weak<Mutex<Option<Sender<bool>>>> = Weak::new();
                 let mut reader = reader;
                 loop {
                     let Ok(Some(line)) = read_line_bounded(&mut reader, MAX_LINE) else { break };
@@ -3144,12 +3343,14 @@ fn join_session(
                             denied = true;
                             break;
                         }
-                        Msg::Welcome { peers, doc: remote_doc, delta_sync, clock, batch_ops, sort_permutation, .. } if !got_welcome => {
+                        Msg::Welcome { peers, doc: remote_doc, delta_sync, clock, batch_ops, sort_permutation, structural_ack, .. } if !got_welcome => {
                             if require_same_document && remote_doc != doc {
                                 let _ = evt_tx.send(NetEvent::Denied("共享地址已属于另一工作簿，请刷新协作会话".into()));
                                 denied = true;
                                 break;
                             }
+                            reader_generation.fetch_add(1,Ordering::AcqRel);
+                            ack_for_reader.store(structural_ack,Ordering::Release);
                             got_welcome = true;
                             ever_welcomed = true;
                             if let Some(se) = pending_sender.take() {
@@ -3178,15 +3379,32 @@ fn join_session(
                             let _ = evt_tx.send(NetEvent::SortRepairs { sheet,first_ts,items });
                         }
                         Msg::SortPermutation(plan) => {
+                            if active_vote.upgrade().is_some_and(|v| v.lock().unwrap().is_some()) { break; }
                             let first_ts = plan.first_ts;
                             let (tx,rx) = channel();
-                            if evt_tx.send(NetEvent::Sort(plan, tx)).is_err() { break; }
-                            let Ok(accepted) = rx.recv_timeout(Duration::from_secs(60)) else { break };
-                            let mut session = send_sess.lock().unwrap();
-                            let Some((se, _, true, _)) = session.as_mut() else { break };
-                            let outcome = if accepted { SortResponse::Accepted } else { SortResponse::NeedCells };
-                            let msg = serde_json::to_string(&Msg::SortReply { first_ts, outcome }).unwrap();
-                            if write_line(&mut write_half, &se.seal(&msg)).is_err() { break; }
+                            let vote = SortVote { sender: Arc::new(Mutex::new(Some(tx))), connection: Arc::downgrade(&connection) };
+                            active_vote = Arc::downgrade(&vote.sender);
+                            let deadline_vote = active_vote.clone();
+                            let connected_to_offer = vote.connection.clone();
+                            if evt_tx.send(NetEvent::Sort(plan, vote)).is_err() { break; }
+                            let current_replies = sort_replies.clone();
+                            let session = send_sess.clone();
+                            let Ok(mut response) = write_half.try_clone() else { break };
+                            std::thread::spawn(move || {
+                                // A busy UI may take longer than a previous-version peer's
+                                // deadline. Request its ordinary cells before that deadline.
+                                // The one-shot vote prevents late work from applying twice.
+                                let accepted = SortVote::wait(rx,deadline_vote,Duration::from_secs(15));
+                                if connected_to_offer.upgrade().is_none() { return; }
+                                let mut session = session.lock().unwrap();
+                                let Some((se, _, true, replies)) = session.as_mut() else { return };
+                                if !Arc::ptr_eq(replies,&current_replies) { return; }
+                                let outcome = if accepted { SortResponse::Accepted } else { SortResponse::NeedCells };
+                                let line = serde_json::to_string(&Msg::SortReply { first_ts,outcome }).unwrap();
+                                if write_line(&mut response,&se.seal(&line)).is_err() {
+                                    let _ = response.shutdown(std::net::Shutdown::Both);
+                                }
+                            });
                         }
                         Msg::SnapshotChunk { ops, last } => {
                             let _ = evt_tx.send(NetEvent::Ops(ops));
@@ -3200,6 +3418,12 @@ fn join_session(
                         }
                         Msg::Op(op) => {
                             let _ = evt_tx.send(NetEvent::Ops(vec![op]));
+                        }
+                        Msg::StructureRevision { revision } => {
+                            let _ = evt_tx.send(NetEvent::StructureRevision(revision));
+                        }
+                        Msg::StructuralRejected { reason } => {
+                            let _ = evt_tx.send(NetEvent::StructuralRejected(reason));
                         }
                         Msg::StructuralLog { items } => {
                             let _ = evt_tx.send(NetEvent::StructuralHistory(items));
@@ -3354,6 +3578,11 @@ fn join_session(
                         _ => {}
                     }
                 }
+                drop(connection);
+                if let Some(vote) = active_vote.upgrade() {
+                    vote.lock().unwrap().take();
+                }
+                drop(sort_ack);
                 connected_flag.store(false, Ordering::SeqCst);
                 *writer.lock().unwrap() = None;
                 *send_sess.lock().unwrap() = None;
@@ -3398,12 +3627,18 @@ fn join_session(
         after_snapshot: Default::default(),
         #[cfg(test)]
         before_sort_reply: Default::default(),
+        #[cfg(test)]
+        before_sort_commit: Default::default(),
         host_locks: None,
         host_cursors: None,
         host_styles: None,
         delta_styles: None,
         delta_merges: None,
+        sheet_names: Default::default(),
         structure_seen: Default::default(),
+        pending_structure: Default::default(),
+        structural_ack,
+        connection_generation,
         pending_sorts: pending_for_net,
         local_sort_ranges: Default::default(),
         host_structs: None,
@@ -4135,6 +4370,143 @@ mod integrity_tests {
     use super::tests::{op,wait_for};
 
     #[test]
+    fn guest_insert_seeds_late_join_with_local_and_cross_sheet_formula_references() {
+        let _env = crate::test_env::TestEnv::new("structural_formula_snapshot");
+        let (host,port) = host_for_test(1,"H","doc","pw");
+        let mut book = sheetcore::Workbook::new_blank();
+        book.sheets[0].name = "Sales".into();
+        book.sheets.push(sheetcore::Sheet::new("Report"));
+        let mut peer = sheetcore::sync::Peer::new(1);
+        for (s,r,c,formula,value) in [(0,0,0,None,3.),(0,0,1,Some("=A1*2"),6.),
+                                       (1,0,0,Some("=Sales!B1+A2"),6.)] {
+            let cell = sheetcore::Cell { value:sheetcore::Value::Number(value),formula:formula.map(Into::into) };
+            peer.seed_cell(s,r,c,&cell);
+            book.sheets[s].set(r,c,cell);
+        }
+        host.seed_snapshot(&peer,&book,Cursor { site:1,name:"H".into(),color:1,sheet:0,row:0,col:0 });
+        let addr = format!("127.0.0.1:{port}");
+        let guest = join(2,"G".into(),"doc".into(),&addr,"pw".into()).unwrap();
+        assert!(wait_event(&guest,3000,|e| matches!(e,NetEvent::SnapshotDone)).is_some());
+        guest.broadcast_structural(0,&Structural::InsertRows {at:0,n:1}).unwrap();
+        assert!(wait_event(&guest,3000,|e| matches!(e,NetEvent::Structural {site:2,..})).is_some());
+        let late = join(3,"L".into(),"doc".into(),&addr,"pw".into()).unwrap();
+        let mut cells = HashMap::new();
+        loop {
+            match late.events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                NetEvent::Ops(ops) => for op in ops { cells.insert((op.sheet,op.row,op.col),op); },
+                NetEvent::SnapshotDone => break,
+                _ => {}
+            }
+        }
+        assert_eq!(cells[&(0,1,1)].formula.as_deref(),Some("=A2*2"));
+        assert_eq!(cells[&(1,0,0)].formula.as_deref(),Some("=Sales!B2+A2"));
+        assert_eq!(cells[&(0,1,0)].value,ValueWire::Number(3.));
+    }
+
+    #[test]
+    fn structural_broadcast_rejects_invalid_coordinates_before_setting_pending() {
+        let _env = crate::test_env::TestEnv::new("bounded_structure_request");
+        let (host,port) = host_for_test(1,"H","doc","pw");
+        let guest = join(2,"G".into(),"doc".into(),&format!("127.0.0.1:{port}"),"pw".into()).unwrap();
+        assert!(wait_event(&guest,3000,|e| matches!(e,NetEvent::SnapshotDone)).is_some());
+        for peer in [&host,&guest] {
+            for (sheet,op) in [(0, Structural::InsertCols { at:0,n:0 }),
+                (0,Structural::DeleteRows { at:sheetcore::sync::MAX_ROWS,n:1 }),
+                (sheetcore::sync::MAX_SHEET_INDEX,Structural::InsertRows { at:0,n:1 })] {
+                assert!(peer.broadcast_structural(sheet,&op).is_err());
+                assert!(!peer.pending_structure());
+                assert_eq!(peer.structure_seen(),0);
+            }
+        }
+        guest.broadcast_structural(0,&Structural::InsertRows { at:5,n:1 }).unwrap();
+        assert!(wait_event(&host,3000,|e| matches!(e,NetEvent::Structural { .. })).is_some());
+        // Network state is committed, but the host UI still has the previous coordinates.
+        assert!(host.broadcast_structural(0,&Structural::DeleteRows { at:5,n:1 }).is_err());
+        assert!(host.broadcast_structural(1,&Structural::InsertCols { at:0,n:1 }).is_ok());
+        assert_eq!(host.structure_seen(),0);
+        assert!(host.broadcast_structural(0,&Structural::DeleteRows { at:5,n:1 }).is_err());
+        host.note_structure(1);
+        assert_eq!(host.structure_seen(),2);
+        assert!(host.broadcast_structural(0,&Structural::DeleteRows { at:5,n:1 }).is_ok());
+    }
+
+    #[test]
+    fn a_cell_edit_can_commit_while_a_sort_is_being_prepared() {
+        let _env = crate::test_env::TestEnv::new("sort_prepare_without_room_lock");
+        let (host, port) = host_for_test(1,"H","doc","sort");
+        let addr = format!("127.0.0.1:{port}");
+        let writer = join(2,"W".into(),"doc".into(),&addr,"sort".into()).unwrap();
+        let editor = join(3,"E".into(),"doc".into(),&addr,"sort".into()).unwrap();
+        for peer in [&writer,&editor] {
+            assert!(wait_event(peer,5000,|e| matches!(e,NetEvent::SnapshotDone)).is_some());
+        }
+        let make = |row,n,ts,site| Op { sheet:0,row,col:0,value:ValueWire::Number(n),formula:None,ts,site };
+        host.broadcast_ops(vec![make(0,2.,1,1),make(1,1.,1,1)]);
+        let (parked,entered) = channel();
+        let (release,go) = channel();
+        *host.before_sort_commit.lock().unwrap() = Some(Box::new(move || {
+            parked.send(()).unwrap();
+            go.recv_timeout(Duration::from_secs(6)).unwrap();
+        }));
+        let sort = sheetcore::sync::SortPermutation { structural_revision:0,sheet:0,name:"Sheet1".into(),
+            region:(0,0,1,0),horizontal:false,order:vec![1,0],first_ts:2,site:2,digest:[0;32] };
+        writer.broadcast_sort(SortBatch::new(sort,vec![Arc::new(make(0,1.,2,2)),Arc::new(make(1,2.,3,2))],vec![]));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        editor.broadcast_op(make(0,88.,10,3));
+        assert!(wait_event(&host,3000,|e| matches!(e,NetEvent::Ops(ops) if ops.iter().any(|o| o.ts==10))).is_some());
+        release.send(()).unwrap();
+        assert!(wait_event(&host,5000,|e| matches!(e,NetEvent::Sorted(_))).is_some());
+        let state = host.state.as_ref().unwrap().lock().unwrap();
+        assert_eq!(state.get(&(0,0,0)).unwrap().value,ValueWire::Number(88.));
+        assert_eq!(state.get(&(0,1,0)).unwrap().value,ValueWire::Number(2.));
+    }
+
+    #[test]
+    fn a_modal_ui_missing_its_vote_deadline_can_never_apply_the_fallback_twice() {
+        let connection = Arc::new(());
+        for answer_before_deadline in [true,false] {
+            let (tx,rx) = channel();
+            let vote = SortVote { sender:Arc::new(Mutex::new(Some(tx))),connection:Arc::downgrade(&connection) };
+            if answer_before_deadline { vote.send(true).unwrap(); }
+            assert_eq!(SortVote::wait(rx,Arc::downgrade(&vote.sender),Duration::ZERO),answer_before_deadline);
+            assert!(vote.send(true).is_err());
+        }
+    }
+
+    #[test]
+    fn waiting_for_guest_ui_does_not_block_replies_to_its_own_sort() {
+        let _env = crate::test_env::TestEnv::new("sort_bidirectional_progress");
+        let (host,port) = host_for_test(1,"H","doc","sort");
+        let guest = join(2,"G".into(),"doc".into(),&format!("127.0.0.1:{port}"),"sort".into()).unwrap();
+        assert!(wait_event(&guest,5000,|e| matches!(e,NetEvent::SnapshotDone)).is_some());
+        let make = |r,n,t,site| Op { sheet:0,row:r,col:0,value:ValueWire::Number(n),formula:None,ts:t,site };
+        let batch = |row,ts,site| SortBatch::new(sheetcore::sync::SortPermutation {
+            sheet:0,structural_revision:0,name:"Sheet1".into(),region:(row,0,row+1,0),
+            horizontal:false,order:vec![row+1,row],first_ts:ts,site,digest:[0;32],
+        },vec![Arc::new(make(row,1.,ts,site)),Arc::new(make(row+1,2.,ts+1,site))],vec![]);
+        host.broadcast_ops(vec![make(0,2.,1,1),make(1,1.,1,1),make(4,2.,1,1),make(5,1.,1,1)]);
+        host.broadcast_sort(batch(0,2,1));
+        let Some(NetEvent::Sort(_,vote)) = wait_event(&guest,5000,|e| matches!(e,NetEvent::Sort(..))) else {
+            panic!("missing host sort");
+        };
+        // Keep the GUI's vote pending while the guest negotiates the opposite direction.
+        guest.broadcast_sort(batch(4,4,2));
+        guest.broadcast_op(make(8,9.,9,2));
+        assert!(wait_event(&host,3000,|e| matches!(e,NetEvent::Ops(v) if v.iter().any(|o| o.row==8))).is_some());
+        vote.send(false).unwrap();
+        assert!(wait_event(&guest,3000,|e| matches!(e,NetEvent::Ops(v) if v.iter().any(|o| o.ts==2))).is_some());
+        assert!(guest.is_live());
+        host.broadcast_sort(batch(0,12,1));
+        let Some(NetEvent::Sort(_,late_vote)) = wait_event(&guest,3000,|e| matches!(e,NetEvent::Sort(..))) else {
+            panic!("missing second offer");
+        };
+        guest.shutdown();
+        assert!(wait_event(&host,3000,|e| matches!(e,NetEvent::PeerLeft(2))).is_some());
+        assert!(wait_event(&guest,3000,|e| matches!(e,NetEvent::Disconnected(_))).is_some());
+        assert!(late_vote.send(true).is_err());
+    }
+
+    #[test]
     fn negotiated_sort_preserves_order_recovers_a_divergent_replica_and_seeds_late_join() {
         let _env = crate::test_env::TestEnv::new("sort_wire_order");
         let (host, port) = host_for_test(1,"host","doc","sort");
@@ -4171,6 +4543,7 @@ mod integrity_tests {
         let batch = SortBatch::new(plan,ops,vec![(0,0,fmt.clone()),(1,0,Default::default())]);
         for supported in [false,true] {
             let (ack,rx) = channel();
+            ack.send((1,SortResponse::NeedCells)).unwrap(); // already-finished offer
             ack.send((2,SortResponse::Accepted)).unwrap();
             let mut frames = Vec::new();
             assert!(send_sort(&batch,supported,false,true,&rx,|line| {
@@ -4273,7 +4646,7 @@ mod integrity_tests {
             "闯入者改他人持锁格样式必须被驳回"
         );
 
-        assert!(host.host_styles.as_ref().unwrap().lock().unwrap().is_empty(),
+        assert!(host.host_styles.as_ref().unwrap().lock().unwrap().len()==0,
             "the held cell in the middle must reject all 700 styles");
 
         intruder.broadcast_merge(0, (2, 1, 4, 3), true);
@@ -4284,7 +4657,7 @@ mod integrity_tests {
 
         intruder.broadcast_structural(0, &Structural::InsertRows { at: 1, n: 1 }).unwrap();
         assert!(
-            wait_event(&intruder, 3000, |e| matches!(e, NetEvent::LockDeny { holder: 2, row: 3, col: 2, .. })).is_some(),
+            wait_event(&intruder, 3000, |e| matches!(e, NetEvent::StructuralRejected(reason) if reason.contains("持锁人"))).is_some(),
             "闯入者在持锁格上方插行必须被宿主拒绝"
         );
 

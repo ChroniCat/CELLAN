@@ -17,7 +17,9 @@ pub fn read_date1904(path: &Path) -> bool {
 }
 
 fn workbook_xml(path: &Path) -> Option<String> {
-    String::from_utf8(crate::fixups::read_part_file(path, "xl/workbook.xml")?).ok()
+    let name = "xl/workbook.xml";
+    let bytes = crate::fixups::read_part_file(path, name)?;
+    crate::xlsx::patch_xml_text(&bytes, name).ok().map(|xml| xml.into_owned())
 }
 
 pub(crate) fn date1904_xml(xml: &str) -> bool {
@@ -46,30 +48,16 @@ pub fn sheet_targets(path: &Path) -> Result<HashMap<String, String>> {
         .filter(|(owner, _)| owner == path).map(|(_, targets)| targets.clone())) {
         return Ok(cached);
     }
+    let workbook = "xl/workbook.xml";
+    let relations = "xl/_rels/workbook.xml.rels";
     let (wb_xml_opt, rels_xml_opt) = if staged_here {
-        (
-            crate::fixups::read_part(path, "xl/workbook.xml")
-                .and_then(|b| String::from_utf8(b).ok()),
-            crate::fixups::read_part(path, "xl/_rels/workbook.xml.rels")
-                .and_then(|b| String::from_utf8(b).ok()),
-        )
+        let read = |part| crate::fixups::read_part(path, part)
+            .map(|bytes| crate::xlsx::patch_xml_text(&bytes,part).map(|xml| xml.into_owned())).transpose();
+        (read(workbook)?, read(relations)?)
     } else {
-        let file = std::fs::File::open(path)?;
-        let mut zip = zip::ZipArchive::new(file)?;
-        let wb_xml = zip.by_name("xl/workbook.xml").ok().and_then(|mut f| {
-            let mut s = String::new();
-            let _ = f.read_to_string(&mut s);
-            Some(s)
-        });
-        let rels_xml = zip
-            .by_name("xl/_rels/workbook.xml.rels")
-            .ok()
-            .and_then(|mut f| {
-                let mut s = String::new();
-                let _ = f.read_to_string(&mut s);
-                Some(s)
-            });
-        (wb_xml, rels_xml)
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+        let mut read = |part| zip.index_for_name(part).map(|_| crate::xlsx::read_zip_text(&mut zip,part)).transpose();
+        (read(workbook)?, read(relations)?)
     };
 
     let targets = sheet_targets_xml(wb_xml_opt.as_deref(), rels_xml_opt.as_deref());
@@ -2510,15 +2498,18 @@ pub fn apply_outline_pr(path: &std::path::Path, wb: &crate::model::Workbook) -> 
 
 /// 保存收尾：把方案列表写回各表（`<scenarios>`）
 pub fn apply_scenarios(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
-    if !wb.sheets.iter().any(|s| s.scenarios_dirty) {
+    restore_scenarios(path, wb, false)
+}
+
+pub(crate) fn restore_scenarios(path: &std::path::Path, wb: &crate::model::Workbook, rebuilt: bool) -> anyhow::Result<()> {
+    let needed = |s: &crate::model::Sheet| s.scenarios_dirty
+        || rebuilt && (!s.scenarios.is_empty() || s.scenario_settings.has_source());
+    if !wb.sheets.iter().any(needed) {
         return Ok(());
     }
     let targets = sheet_targets(path)?;
     let mut map = std::collections::HashMap::new();
-    for s in &wb.sheets {
-        if !s.scenarios_dirty {
-            continue;
-        }
+    for s in wb.sheets.iter().filter(|s| needed(s)) {
         let part = targets.get(&s.name).context("找不到方案所属的工作表")?;
         map.insert(part.clone(), s);
     }
@@ -2970,17 +2961,15 @@ pub fn apply_sheet_states(path: &std::path::Path, wb: &crate::model::Workbook) -
     if want.is_empty() {
         return Ok(());
     }
-    let Some(xml) = crate::fixups::read_part(path, "xl/workbook.xml")
-        .and_then(|b| String::from_utf8(b).ok())
-    else {
-        return Ok(());
-    };
+    let part = "xl/workbook.xml";
+    let bytes = crate::fixups::read_part(path,part).context("缺少工作簿部件")?;
+    let xml = crate::xlsx::patch_xml_text(&bytes, part)?;
     // 至少要留一张可见表
     if !wb.sheets.iter().any(|s| !s.hidden) {
         return Err(anyhow::anyhow!("不能把全部工作表都隐藏"));
     }
     let mut out = String::with_capacity(xml.len() + 32);
-    let mut rest = xml.as_str();
+    let mut rest = xml.as_ref();
     while let Some(i) = rest.find("<sheet ") {
         out.push_str(&rest[..i]);
         let tail = &rest[i..];

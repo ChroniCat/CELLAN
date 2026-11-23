@@ -5,7 +5,9 @@
 
 use crate::model::{Sheet, Value};
 
-#[derive(Clone, Debug, PartialEq)]
+use std::{collections::HashMap, ops::Range, sync::Arc};
+
+#[derive(Clone, Debug)]
 pub struct Scenario {
     pub name: String,
     pub comment: String,
@@ -13,10 +15,26 @@ pub struct Scenario {
     pub cells: Vec<((u32, u32), String)>,
     pub hidden: bool,
     pub locked: bool,
+    // Source record and input positions survive coordinate changes and allow opaque XML to round-trip.
+    source_record: Option<usize>,
+    source_inputs: HashMap<(u32, u32), Vec<usize>>,
     user: Option<String>,
     explicit_count: bool,
     // Rare per-input XML properties. Ordinary scenarios allocate no entries.
     input_properties: std::collections::HashMap<(u32, u32), Vec<(String, String)>>,
+}
+
+impl PartialEq for Scenario {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.comment == other.comment
+            && self.cells == other.cells
+            && self.hidden == other.hidden
+            && self.locked == other.locked
+            && self.user == other.user
+            && self.explicit_count == other.explicit_count
+            && self.input_properties == other.input_properties
+    }
 }
 
 impl Scenario {
@@ -27,12 +45,16 @@ impl Scenario {
             cells: Vec::new(),
             hidden: false,
             locked: true,
+            source_record: None,
+            source_inputs: HashMap::new(),
             user: None,
             explicit_count: false,
             input_properties: Default::default(),
         }
     }
     pub fn replace_inputs(&mut self, captured: Scenario) {
+        self.source_inputs
+            .retain(|k, _| captured.cells.iter().any(|(key, _)| key == k));
         self.comment = captured.comment;
         self.cells = captured.cells;
         self.input_properties
@@ -40,14 +62,25 @@ impl Scenario {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct ScenarioSettings {
+    original: Option<Arc<str>>,
     pub current: Option<usize>,
     pub show: Option<usize>,
     pub sqref: Option<String>,
 }
 
+impl PartialEq for ScenarioSettings {
+    fn eq(&self, other: &Self) -> bool {
+        self.current == other.current && self.show == other.show && self.sqref == other.sqref
+    }
+}
+
 impl ScenarioSettings {
+    pub(crate) fn has_source(&self) -> bool {
+        self.original.is_some()
+    }
+
     pub fn removed(&mut self, position: usize, remaining: usize) {
         if remaining == 0 {
             *self = Self::default();
@@ -55,12 +88,114 @@ impl ScenarioSettings {
         }
         for index in [&mut self.current, &mut self.show] {
             *index = index.and_then(|i| {
-                if i == position {
+                if i > remaining {
+                    Some(i) // Preserve an unrelated, out-of-range legacy index.
+                } else if i == position {
                     None
                 } else {
                     Some(i - usize::from(i > position))
                 }
             });
+        }
+    }
+}
+
+/// Shift the same sheet coordinates as the grid. An input removed by a structural edit cannot
+/// subsequently overwrite the cell that has moved into its former address.
+pub(crate) fn shift_references(sheet: &mut Sheet, shift: &crate::refs::MappedShift) {
+    if sheet.scenarios.is_empty() && sheet.scenario_settings.sqref.is_none() {
+        return;
+    }
+    let rows = shift.axis == crate::refs::Axis::Row;
+    let limit = if rows {
+        crate::sync::MAX_ROWS
+    } else {
+        crate::sync::MAX_COLS
+    };
+    let map = |(r, c)| {
+        let value = shift.map(if rows { r } else { c })?;
+        (value < limit).then_some(if rows { (value, c) } else { (r, value) })
+    };
+    let mut removed = Vec::new();
+    for (i, sc) in sheet.scenarios.iter_mut().enumerate() {
+        if !sc.cells.iter().any(|(k, _)| map(*k) != Some(*k)) {
+            continue;
+        }
+        sc.cells.retain_mut(|(key, _)| {
+            if let Some(k) = map(*key) {
+                *key = k;
+                true
+            } else {
+                false
+            }
+        });
+        sc.input_properties = std::mem::take(&mut sc.input_properties)
+            .into_iter()
+            .filter_map(|(k, v)| Some((map(k)?, v)))
+            .collect();
+        sc.source_inputs = std::mem::take(&mut sc.source_inputs)
+            .into_iter()
+            .filter_map(|(k, v)| Some((map(k)?, v)))
+            .collect();
+        sheet.scenarios_dirty = true;
+        if sc.cells.is_empty() {
+            removed.push(i);
+        }
+    }
+    for i in removed.into_iter().rev() {
+        sheet.scenarios.remove(i);
+        sheet.scenario_settings.removed(i, sheet.scenarios.len());
+    }
+    if let Some(refs) = &sheet.scenario_settings.sqref {
+        let mut changed = false;
+        let mut refs_out = Vec::new();
+        for area in refs.split_whitespace() {
+            let (left, right) = area.split_once(':').unwrap_or((area, area));
+            let (Some((r1, c1)), Some((r2, c2))) = (parse_cell(left), parse_cell(right)) else {
+                refs_out.push(area.to_owned());
+                continue;
+            };
+            let (a, b) = if rows { (r1, r2) } else { (c1, c2) };
+            let moved = shift
+                .map_range(a, b)
+                .filter(|(a, _)| *a < limit)
+                .map(|(a, b)| (a, b.min(limit - 1)));
+            if moved == Some((a, b)) {
+                refs_out.push(area.to_owned());
+                continue;
+            }
+            changed = true;
+            let Some((a, b)) = moved else {
+                continue;
+            };
+            let (ka, kb) = if rows {
+                ((a, c1), (b, c2))
+            } else {
+                ((r1, a), (r2, b))
+            };
+            let format = |pattern: &str, (r, c)| {
+                format!(
+                    "{}{}{}{}",
+                    if pattern.starts_with('$') { "$" } else { "" },
+                    crate::model::col_label(c),
+                    if pattern.trim_start_matches('$').contains('$') {
+                        "$"
+                    } else {
+                        ""
+                    },
+                    r + 1
+                )
+            };
+            let mut ref_text = format(left, ka);
+            if area.contains(':') {
+                ref_text.push(':');
+                ref_text.push_str(&format(right, kb));
+            }
+            refs_out.push(ref_text);
+        }
+        if changed {
+            sheet.scenario_settings.sqref = (!refs_out.is_empty()).then(|| refs_out.join(" "));
+            sheet.scenarios_dirty = true;
         }
     }
 }
@@ -161,106 +296,76 @@ pub fn parse(xml: &str) -> Vec<Scenario> {
 }
 
 pub(crate) fn parse_with_settings(xml: &str) -> (ScenarioSettings, Vec<Scenario>) {
-    use quick_xml::{
-        NsReader,
-        events::{BytesStart, Event},
-        name::ResolveResult,
-    };
-    let mut settings = ScenarioSettings::default();
-    let mut scenarios = Vec::new();
     if !xml.contains("scenario") {
-        return (settings, scenarios);
+        return Default::default();
     }
-
-    fn attr(e: &BytesStart, name: &str) -> Option<String> {
-        e.attributes()
-            .flatten()
-            .find(|a| a.key.as_ref() == name)
-            .and_then(|a| {
-                quick_xml::escape::unescape(a.value.as_ref())
-                    .ok()
-                    .map(|v| v.into_owned())
-            })
-    }
-
-    let mut reader = NsReader::from_str(xml);
-    let mut namespace = None;
-    let mut depth = 0;
-    let mut in_scenarios = false;
-    let mut current = None;
-    while let Ok((ns, event)) = reader.read_resolved_event() {
-        let (tag, closed) = match event {
-            Event::Start(tag) => (tag, false),
-            Event::Empty(tag) => (tag, true),
-            Event::End(_) => {
-                if depth == 2 {
-                    in_scenarios = false;
-                }
-                if depth == 3 {
-                    current = None;
-                }
-                depth -= 1;
-                continue;
-            }
-            Event::Eof => break,
-            _ => continue,
-        };
-        let uri = match ns {
-            ResolveResult::Bound(n) => n.0,
-            _ => "",
-        };
-        let local = tag.local_name();
-        let child = namespace.as_deref() == Some(uri);
-        match (depth, local.as_ref()) {
-            (0, "worksheet") => namespace = Some(uri.to_owned()),
-            (1, "scenarios") if child => {
-                settings.current = attr(&tag, "current").and_then(|x| x.parse().ok());
-                settings.show = attr(&tag, "show").and_then(|x| x.parse().ok());
-                settings.sqref = attr(&tag, "sqref");
-                in_scenarios = !closed;
-            }
-            (2, "scenario") if child && in_scenarios => {
-                if let Some(name) = attr(&tag, "name") {
-                    let mut sc = Scenario::new(name);
-                    sc.locked =
-                        attr(&tag, "locked").is_some_and(|x| matches!(x.as_str(), "1" | "true"));
-                    sc.hidden =
-                        attr(&tag, "hidden").is_some_and(|x| matches!(x.as_str(), "1" | "true"));
-                    sc.comment = attr(&tag, "comment").unwrap_or_default();
-                    sc.user = attr(&tag, "user");
-                    sc.explicit_count = attr(&tag, "count").is_some();
-                    current = (!closed).then_some(scenarios.len());
-                    scenarios.push(sc);
-                }
-            }
-            (3, "inputCells") if child && in_scenarios => {
-                if let Some(i) = current
-                    && let Some(k) = attr(&tag, "r").and_then(|s| parse_cell(&s))
-                {
-                    let properties: Vec<_> = ["numFmtId", "deleted", "undone"]
-                        .into_iter()
-                        .filter_map(|name| attr(&tag, name).map(|v| (name.to_owned(), v)))
-                        .collect();
-                    if !properties.is_empty() {
-                        scenarios[i].input_properties.insert(k, properties);
-                    }
-                    scenarios[i]
-                        .cells
-                        .push((k, attr(&tag, "val").unwrap_or_default()));
-                }
-            }
-            _ => {
-                if !closed && reader.read_to_end(tag.name()).is_err() {
-                    break;
-                }
-                continue;
-            }
-        }
-        if !closed {
-            depth += 1;
-        }
-    }
+    let Ok(slot) = worksheet_slot(xml) else {
+        return Default::default();
+    };
+    let Some(block) = slot.old else {
+        return Default::default();
+    };
+    let wrapper = format!(
+        "{}{}</{}worksheet>",
+        &xml[slot.root_open], &xml[block], slot.prefix
+    );
+    let Ok(doc) = roxmltree::Document::parse(&wrapper) else {
+        return Default::default();
+    };
+    let root = doc.root_element().first_element_child().unwrap();
+    let mut settings = read_settings(root);
+    let scenarios = elements(root, "scenario")
+        .enumerate()
+        .filter_map(|(i, node)| read_scenario(i, node))
+        .collect();
+    settings.original = Some(wrapper.into());
     (settings, scenarios)
+}
+
+fn elements<'a, 'b>(
+    node: roxmltree::Node<'a, 'b>,
+    name: &'static str,
+) -> impl Iterator<Item = roxmltree::Node<'a, 'b>> {
+    node.children().filter(move |n| {
+        n.is_element()
+            && n.tag_name().namespace() == node.tag_name().namespace()
+            && n.tag_name().name() == name
+    })
+}
+
+fn read_settings(node: roxmltree::Node) -> ScenarioSettings {
+    ScenarioSettings {
+        current: node.attribute("current").and_then(|x| x.parse().ok()),
+        show: node.attribute("show").and_then(|x| x.parse().ok()),
+        sqref: node.attribute("sqref").map(str::to_owned),
+        original: None,
+    }
+}
+
+fn read_scenario(index: usize, node: roxmltree::Node) -> Option<Scenario> {
+    let mut sc = Scenario::new(node.attribute("name")?);
+    sc.source_record = Some(index);
+    sc.comment = node.attribute("comment").unwrap_or_default().into();
+    sc.user = node.attribute("user").map(str::to_owned);
+    sc.explicit_count = node.has_attribute("count");
+    sc.locked = matches!(node.attribute("locked"), Some("1" | "true"));
+    sc.hidden = matches!(node.attribute("hidden"), Some("1" | "true"));
+    for (pos, input) in elements(node, "inputCells").enumerate() {
+        let Some(k) = input.attribute("r").and_then(parse_cell) else {
+            continue;
+        };
+        let props: Vec<_> = ["numFmtId", "deleted", "undone"]
+            .iter()
+            .filter_map(|&name| input.attribute(name).map(|v| (name.into(), v.into())))
+            .collect();
+        if !props.is_empty() {
+            sc.input_properties.insert(k, props);
+        }
+        sc.source_inputs.entry(k).or_default().push(pos);
+        sc.cells
+            .push((k, input.attribute("val").unwrap_or_default().into()));
+    }
+    Some(sc)
 }
 
 fn esc(s: &str) -> String {
@@ -268,6 +373,7 @@ fn esc(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// 写出 `<scenarios>`（空列表表示删掉整段）
@@ -275,11 +381,14 @@ pub fn set_scenarios(xml: &str, list: &[Scenario]) -> String {
     edit_scenarios(xml, list, &parse_with_settings(xml).0).unwrap_or_else(|_| xml.to_owned())
 }
 
-pub(crate) fn edit_scenarios(
-    xml: &str,
-    list: &[Scenario],
-    settings: &ScenarioSettings,
-) -> anyhow::Result<String> {
+struct WorksheetSlot {
+    root_open: Range<usize>,
+    old: Option<Range<usize>>,
+    prefix: String,
+    insert: Option<usize>,
+}
+
+fn worksheet_slot(xml: &str) -> anyhow::Result<WorksheetSlot> {
     use anyhow::{Context, ensure};
     use quick_xml::{NsReader, events::Event, name::ResolveResult};
 
@@ -287,6 +396,7 @@ pub(crate) fn edit_scenarios(
     // be empty, and extensions may contain unrelated elements named scenarios.
     let mut reader = NsReader::from_str(xml);
     let mut root = None;
+    let mut root_open = 0..0;
     let mut old = None;
     let mut insert = None;
     loop {
@@ -309,6 +419,7 @@ pub(crate) fn edit_scenarios(
                     "无效的工作表根元素"
                 );
                 root = Some((uri.to_owned(), prefix.to_owned()));
+                root_open = start..reader.buffer_position() as usize;
             }
             event @ (Event::Start(_) | Event::Empty(_)) if root.is_some() => {
                 let empty = matches!(event, Event::Empty(_));
@@ -339,68 +450,44 @@ pub(crate) fn edit_scenarios(
             _ => {}
         }
     }
-    let mut insert = insert.context("缺少工作表数据")?;
     let (_, prefix) = root.context("缺少工作表根元素")?;
-    let mut block = String::new();
-    if !list.is_empty() {
-        block.push_str(&format!("<{prefix}scenarios"));
-        for (key, value) in [("current", settings.current), ("show", settings.show)] {
-            if let Some(i) = value {
-                ensure!(i < list.len(), "方案 {key} 的索引 {i} 已超出方案列表");
-                block.push_str(&format!(" {key}=\"{i}\""));
+    Ok(WorksheetSlot {
+        root_open,
+        old,
+        prefix,
+        insert,
+    })
+}
+pub(crate) fn edit_scenarios(
+    xml: &str,
+    list: &[Scenario],
+    settings: &ScenarioSettings,
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let slot = worksheet_slot(xml)?;
+    let mut insert = slot.insert.context("缺少工作表数据")?;
+    let old = slot.old;
+    let block = if let Some(original) = &settings.original {
+        let doc = roxmltree::Document::parse(original)?;
+        let root = doc
+            .root_element()
+            .first_element_child()
+            .context("缺少来源方案")?;
+        let destination = format!("{}</{}worksheet>", &xml[slot.root_open], slot.prefix);
+        let dest = roxmltree::Document::parse(&destination)?;
+        let block = render_existing(original, root, dest.root_element(), list, settings)?;
+        match (
+            root.tag_name().namespace(),
+            dest.root_element().tag_name().namespace(),
+        ) {
+            (Some(previous), Some(next)) if previous != next => {
+                rebind_namespace(&block, previous, next)?
             }
+            _ => block,
         }
-        if let Some(references) = &settings.sqref {
-            block.push_str(&format!(" sqref=\"{}\"", esc(references)));
-        }
-        block.push('>');
-    }
-    for sc in list {
-        ensure!(
-            (1..=MAX_CHANGING_CELLS).contains(&sc.cells.len()),
-            "方案「{}」必须有 1–32 个可变单元格（当前 {} 个）",
-            sc.name,
-            sc.cells.len()
-        );
-        block.push_str(&format!(
-            "<{prefix}scenario name=\"{}\" locked=\"{}\" hidden=\"{}\"",
-            esc(&sc.name),
-            u8::from(sc.locked),
-            u8::from(sc.hidden)
-        ));
-        if let Some(user) = &sc.user {
-            block.push_str(&format!(" user=\"{}\"", esc(user)));
-        }
-        if sc.explicit_count {
-            block.push_str(&format!(" count=\"{}\"", sc.cells.len()));
-        }
-        if !sc.comment.is_empty() {
-            block.push_str(&format!(" comment=\"{}\"", esc(&sc.comment)));
-        }
-        block.push('>');
-        for ((r, c), v) in &sc.cells {
-            ensure!(
-                *r < crate::sync::MAX_ROWS && *c < crate::sync::MAX_COLS,
-                "方案「{}」的可变单元格越界",
-                sc.name
-            );
-            block.push_str(&format!(
-                "<{prefix}inputCells r=\"{}\" val=\"{}\"",
-                crate::model::cell_name(*r, *c),
-                esc(v)
-            ));
-            if let Some(attributes) = sc.input_properties.get(&(*r, *c)) {
-                for (key, value) in attributes {
-                    block.push_str(&format!(" {key}=\"{}\"", esc(value)));
-                }
-            }
-            block.push_str("/>");
-        }
-        block.push_str(&format!("</{prefix}scenario>"));
-    }
-    if !list.is_empty() {
-        block.push_str(&format!("</{prefix}scenarios>"));
-    }
+    } else {
+        render_new(&slot.prefix, list, settings)?
+    };
     let mut out = String::with_capacity(xml.len() + block.len());
     out.push_str(xml);
     if let Some(range) = old {
@@ -411,6 +498,357 @@ pub(crate) fn edit_scenarios(
     }
     out.insert_str(insert, &block);
     Ok(out)
+}
+
+// A fresh package can use Transitional worksheet namespaces for a Strict source workbook.
+// Change only namespace declarations; cell text or extension values may contain the same URI.
+fn rebind_namespace(xml: &str, previous: &str, next: &str) -> anyhow::Result<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut updated = String::new();
+    let mut copied = 0;
+    loop {
+        match reader.read_event()? {
+            Event::Start(tag) | Event::Empty(tag) => {
+                for attr in tag.attributes() {
+                    let attr = attr?;
+                    let key = attr.key.as_ref();
+                    if (key == "xmlns" || key.starts_with("xmlns:"))
+                        && quick_xml::escape::unescape(&attr.value)? == previous
+                    {
+                        // The slice reader borrows the unescaped source bytes for this attribute.
+                        let raw = attr.value.as_ref();
+                        let start = (raw.as_ptr() as usize).checked_sub(xml.as_ptr() as usize);
+                        let start = start
+                            .filter(|&i| {
+                                i >= copied && xml.get(i..i.saturating_add(raw.len())) == Some(raw)
+                            })
+                            .ok_or_else(|| anyhow::anyhow!("无法定位方案的 XML 命名空间"))?;
+                        updated.push_str(&xml[copied..start]);
+                        updated.push_str(&esc(next));
+                        copied = start + raw.len();
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    updated.push_str(&xml[copied..]);
+    Ok(updated)
+}
+
+fn validate(sc: &Scenario) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=MAX_CHANGING_CELLS).contains(&sc.cells.len()),
+        "方案「{}」必须有 1–32 个可变单元格（当前 {} 个）",
+        sc.name,
+        sc.cells.len()
+    );
+    anyhow::ensure!(
+        sc.cells
+            .iter()
+            .all(|((r, c), _)| *r < crate::sync::MAX_ROWS && *c < crate::sync::MAX_COLS),
+        "方案「{}」的可变单元格越界",
+        sc.name
+    );
+    Ok(())
+}
+
+fn new_input(prefix: &str, k: (u32, u32), value: &str, sc: &Scenario) -> String {
+    let mut xml = format!(
+        "<{prefix}inputCells r=\"{}\" val=\"{}\"",
+        crate::model::cell_name(k.0, k.1),
+        esc(value)
+    );
+    for (key, val) in sc.input_properties.get(&k).into_iter().flatten() {
+        xml.push_str(&format!(" {key}=\"{}\"", esc(val)));
+    }
+    xml.push_str("/>");
+    xml
+}
+
+fn new_record(prefix: &str, sc: &Scenario) -> anyhow::Result<String> {
+    validate(sc)?;
+    let mut xml = format!(
+        "<{prefix}scenario name=\"{}\" locked=\"{}\" hidden=\"{}\"",
+        esc(&sc.name),
+        u8::from(sc.locked),
+        u8::from(sc.hidden)
+    );
+    if let Some(v) = &sc.user {
+        xml.push_str(&format!(" user=\"{}\"", esc(v)));
+    }
+    if sc.explicit_count {
+        xml.push_str(&format!(" count=\"{}\"", sc.cells.len()));
+    }
+    if !sc.comment.is_empty() {
+        xml.push_str(&format!(" comment=\"{}\"", esc(&sc.comment)));
+    }
+    xml.push('>');
+    for (key, val) in &sc.cells {
+        xml.push_str(&new_input(prefix, *key, val, sc));
+    }
+    xml.push_str(&format!("</{prefix}scenario>"));
+    Ok(xml)
+}
+
+fn render_new(prefix: &str, list: &[Scenario], s: &ScenarioSettings) -> anyhow::Result<String> {
+    if list.is_empty() {
+        return Ok(String::new());
+    }
+    let mut xml = format!("<{prefix}scenarios");
+    for (name, index) in [("current", s.current), ("show", s.show)] {
+        if let Some(i) = index {
+            anyhow::ensure!(i < list.len(), "方案 {name} 的索引 {i} 已超出方案列表");
+            xml.push_str(&format!(" {name}=\"{i}\""));
+        }
+    }
+    if let Some(refs) = &s.sqref {
+        xml.push_str(&format!(" sqref=\"{}\"", esc(refs)));
+    }
+    xml.push('>');
+    for sc in list {
+        xml.push_str(&new_record(prefix, sc)?);
+    }
+    xml.push_str(&format!("</{prefix}scenarios>"));
+    Ok(xml)
+}
+
+// Patch a single element in its source document. Unchanged attributes, comments, and vendor children
+// keep their original spelling. Ranges come from the XML parser, including the ranges of child nodes.
+fn patch_element(
+    source: &str,
+    node: roxmltree::Node,
+    attrs: Vec<(String, Option<String>)>,
+    mut edits: Vec<(Range<usize>, String)>,
+    append: &str,
+) -> String {
+    let span = node.range();
+    let raw = &source[span.clone()];
+    let qname = raw[1..]
+        .split([' ', '\t', '\r', '\n', '/', '>'])
+        .next()
+        .unwrap();
+    let mut extra = String::new();
+    for (name, value) in attrs {
+        if let Some(attr) = node
+            .attributes()
+            .find(|a| a.namespace().is_none() && a.name() == name)
+        {
+            match value {
+                Some(v) if v != attr.value() => edits.push((attr.range_value(), esc(&v))),
+                None => edits.push((attr.range(), String::new())),
+                _ => {}
+            }
+        } else if let Some(v) = value {
+            extra.push_str(&format!(" {name}=\"{}\"", esc(&v)));
+        }
+    }
+    if !extra.is_empty() {
+        let p = span.start + 1 + qname.len();
+        edits.push((p..p, extra));
+    }
+    if !append.is_empty() {
+        if raw.ends_with("/>") {
+            edits.push((span.end - 2..span.end, format!(">{append}</{qname}>")));
+        } else {
+            let p = span.start + raw.rfind("</").unwrap();
+            edits.push((p..p, append.into()));
+        }
+    }
+    edits.sort_by_key(|(r, _)| (r.start, r.end));
+    let mut at = span.start;
+    let mut out = String::new();
+    for (r, v) in edits {
+        out.push_str(&source[at..r.start]);
+        out.push_str(&v);
+        at = r.end;
+    }
+    out.push_str(&source[at..span.end]);
+    out
+}
+
+fn element_prefix<'a>(source: &'a str, node: roxmltree::Node) -> &'a str {
+    let name = source[node.range().start + 1..]
+        .split([' ', '\t', '\r', '\n', '/', '>'])
+        .next()
+        .unwrap();
+    name.strip_suffix(node.tag_name().name()).unwrap()
+}
+
+fn replace_children<'a, 'b>(
+    slots: impl Iterator<Item = roxmltree::Node<'a, 'b>>,
+    values: Vec<String>,
+) -> (Vec<(Range<usize>, String)>, String)
+where
+    'b: 'a,
+{
+    let mut iter = values.into_iter();
+    let edits = slots
+        .map(|node| (node.range(), iter.next().unwrap_or_default()))
+        .collect();
+    (edits, iter.collect())
+}
+
+fn existing_record(
+    source: &str,
+    node: roxmltree::Node,
+    index: usize,
+    sc: &Scenario,
+) -> anyhow::Result<String> {
+    let Some(original) = read_scenario(index, node) else {
+        anyhow::bail!("无法读取原方案");
+    };
+    if sc == &original {
+        return Ok(source[node.range()].into());
+    }
+    let inputs: Vec<_> = elements(node, "inputCells").collect();
+    // Excel caps interactive edits at 32 inputs. An axis change can move an imported
+    // larger scenario without changing its values. Keep that legacy record usable.
+    let moved_legacy = sc.cells.len() > MAX_CHANGING_CELLS
+        && original.cells.len() >= sc.cells.len()
+        && sc.name == original.name
+        && sc.comment == original.comment
+        && sc.hidden == original.hidden
+        && sc.locked == original.locked
+        && sc.cells.iter().all(|(k, v)| {
+            sc.source_inputs.get(k).is_some_and(|indices| {
+                indices.len() == 1
+                    && inputs
+                        .get(indices[0])
+                        .is_some_and(|input| input.attribute("val").unwrap_or_default() == v)
+            })
+        })
+        && sc
+            .cells
+            .iter()
+            .all(|((r, c), _)| *r < crate::sync::MAX_ROWS && *c < crate::sync::MAX_COLS);
+    if !moved_legacy {
+        validate(sc)?;
+    }
+    let mut attrs = Vec::new();
+    for (name, after, before) in [
+        ("name", &sc.name, &original.name),
+        ("comment", &sc.comment, &original.comment),
+    ] {
+        if after != before {
+            attrs.push((name.into(), Some(after.clone())));
+        }
+    }
+    for (name, after, before) in [
+        ("hidden", sc.hidden, original.hidden),
+        ("locked", sc.locked, original.locked),
+    ] {
+        if after != before {
+            attrs.push((name.into(), Some(u8::from(after).to_string())));
+        }
+    }
+    if sc.explicit_count
+        && node
+            .attribute("count")
+            .and_then(|n| n.parse::<usize>().ok())
+            != Some(sc.cells.len())
+    {
+        attrs.push(("count".into(), Some(sc.cells.len().to_string())));
+    }
+    let prefix = element_prefix(source, node);
+    let mut values = Vec::with_capacity(sc.cells.len());
+    let mut occurrences = HashMap::<_, usize>::new();
+    for (key, val) in &sc.cells {
+        let occurrence = occurrences.entry(key).or_default();
+        let source_input = sc
+            .source_inputs
+            .get(key)
+            .and_then(|indices| indices.get(*occurrence))
+            .and_then(|&idx| inputs.get(idx));
+        *occurrence += 1;
+        if let Some(&input) = source_input {
+            let mut updates = Vec::new();
+            if input.attribute("r").and_then(parse_cell) != Some(*key) {
+                updates.push(("r".into(), Some(crate::model::cell_name(key.0, key.1))));
+            }
+            if input.attribute("val").unwrap_or_default() != val {
+                updates.push(("val".into(), Some(val.clone())));
+            }
+            values.push(patch_element(source, input, updates, Vec::new(), ""));
+        } else {
+            values.push(new_input(prefix, *key, val, sc));
+        }
+    }
+    let (edits, append) = replace_children(inputs.into_iter(), values);
+    Ok(patch_element(source, node, attrs, edits, &append))
+}
+
+fn render_existing(
+    source: &str,
+    node: roxmltree::Node,
+    dest: roxmltree::Node,
+    list: &[Scenario],
+    settings: &ScenarioSettings,
+) -> anyhow::Result<String> {
+    let records: Vec<_> = elements(node, "scenario").collect();
+    if list.is_empty() && records.iter().any(|n| n.has_attribute("name")) {
+        return Ok(String::new());
+    }
+    let mut attrs = Vec::new();
+    let mut reader = quick_xml::Reader::from_str(&source[node.range()]);
+    let first = reader.read_event()?;
+    let (quick_xml::events::Event::Start(tag) | quick_xml::events::Event::Empty(tag)) = first
+    else {
+        anyhow::bail!("方案 XML 缺少开始元素")
+    };
+    let local_declarations: std::collections::HashSet<_> = tag
+        .attributes()
+        .flatten()
+        .map(|a| a.key.as_ref().to_owned())
+        .collect();
+    for ns in node.parent_element().unwrap().namespaces() {
+        let prefix = ns.name();
+        if node.lookup_namespace_uri(prefix) == Some(ns.uri())
+            && dest.lookup_namespace_uri(prefix) != Some(ns.uri())
+        {
+            let name = prefix.map_or_else(|| "xmlns".into(), |p| format!("xmlns:{p}"));
+            // A local declaration already travels with this fragment.
+            if !local_declarations.contains(&name) {
+                attrs.push((name, Some(ns.uri().into())));
+            }
+        }
+    }
+    let before = read_settings(node);
+    for (name, new, old) in [
+        ("current", settings.current, before.current),
+        ("show", settings.show, before.show),
+    ] {
+        if new != old {
+            anyhow::ensure!(
+                new.is_none_or(|i| i < list.len()),
+                "方案 {name} 的索引已超出方案列表"
+            );
+            attrs.push((name.into(), new.map(|i| i.to_string())));
+        }
+    }
+    if settings.sqref != before.sqref {
+        attrs.push(("sqref".into(), settings.sqref.clone()));
+    }
+    let prefix = element_prefix(source, node);
+    let mut values = Vec::with_capacity(list.len());
+    for sc in list {
+        let record = if let Some((i, n)) = sc
+            .source_record
+            .and_then(|i| records.get(i).copied().map(|n| (i, n)))
+        {
+            existing_record(source, n, i, sc)?
+        } else {
+            new_record(prefix, sc)?
+        };
+        values.push(record);
+    }
+    let (edits, append) = replace_children(
+        records.into_iter().filter(|n| n.has_attribute("name")),
+        values,
+    );
+    Ok(patch_element(source, node, attrs, edits, &append))
 }
 
 #[cfg(test)]
@@ -508,7 +946,8 @@ mod tests {
             ScenarioSettings {
                 current: Some(1),
                 show: Some(0),
-                sqref: Some("G4 G6:G8".into())
+                sqref: Some("G4 G6:G8".into()),
+                ..Default::default()
             }
         );
         assert!(!s.scenarios[0].locked);
@@ -544,6 +983,89 @@ mod tests {
         assert!(doc.descendants().any(
             |n| n.has_tag_name(("urn:sheet", "inputCells")) && n.attribute("val") == Some("7")
         ));
+    }
+
+    #[test]
+    fn legacy_scenarios_survive_fresh_and_incremental_saves_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy.xlsx");
+        let saved = temp.path().join("copy.xlsx");
+        crate::xlsx::save_atomic(&path, &crate::Workbook::new_blank()).unwrap();
+        let part = "xl/worksheets/sheet1.xml";
+        let many = (1..=33)
+            .map(|r| format!("<inputCells r='A{r}' val='1'/>"))
+            .collect::<String>();
+        let block = format!(
+            "<scenarios current='99' host:version='1' xmlns:host='urn:vendor'><scenario name='empty' host:type='unknown'/><!--gap--><scenario name='many'>{many}</scenario><scenario name='ordinary' host:type='x'><inputCells r='B3' val='a' host:id='15'/><host:ext/></scenario></scenarios>"
+        );
+        let worksheet = format!(
+            "<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><sheetData/>{block}</worksheet>"
+        );
+        crate::fixups::write_parts(&path, &[(part.into(), worksheet.into_bytes())]).unwrap();
+        let mut wb = crate::xlsx::load(&path).unwrap();
+        assert_eq!(wb.sheets[0].scenarios[1].cells.len(), 33);
+        // A new package has no donor worksheet XML. Opaque metadata must also survive here.
+        wb.path = None;
+        crate::xlsx::save_atomic(&saved, &wb).unwrap();
+        let xml = String::from_utf8(crate::fixups::read_part_file(&saved, part).unwrap()).unwrap();
+        assert!(xml.contains(&block), "{xml}");
+        let mut wb = crate::xlsx::load(&saved).unwrap();
+        wb.sheets[0].scenarios[2].cells[0].1 = "x'&".into();
+        wb.sheets[0].scenarios_dirty = true;
+        crate::xlsx::save_atomic(&saved, &wb).unwrap();
+        let changed = block.replace("val='a'", "val='x&apos;&amp;'");
+        let xml = String::from_utf8(crate::fixups::read_part_file(&saved, part).unwrap()).unwrap();
+        assert!(xml.contains(&changed), "{xml}");
+        wb.sheets[0].scenarios[1].comment = "genuine edit".into();
+        assert!(crate::xlsx::save_atomic(&saved, &wb).is_err());
+        assert_eq!(
+            crate::xlsx::load(&saved).unwrap().sheets[0].scenarios[2].cells[0].1,
+            "x'&"
+        );
+    }
+
+    #[test]
+    fn scenario_references_shift_with_axes_and_keep_input_xml_on_the_moved_cell() {
+        let xml = r#"<x:worksheet xmlns:x="urn:s" xmlns:e="urn:extension"><x:sheetData/><x:scenarios current="1" show="0" sqref="$B$2:$B$4 D8 XFD1"><x:scenario name="gone"><x:inputCells r="B2" val="x"/></x:scenario><x:scenario name="follow"><x:inputCells r="B4" val="y" e:id="42"/><x:inputCells r="XFD1" val="z"/></x:scenario></x:scenarios></x:worksheet>"#;
+        let mut sheet = Sheet::new("S");
+        (sheet.scenario_settings, sheet.scenarios) = parse_with_settings(xml);
+        sheet.delete_rows(1, 1);
+        sheet.insert_cols(0, 1);
+        assert_eq!(sheet.scenario_settings.current, Some(0));
+        assert_eq!(sheet.scenario_settings.show, None);
+        assert_eq!(
+            sheet.scenario_settings.sqref.as_deref(),
+            Some("$C$2:$C$3 E7")
+        );
+        assert_eq!(sheet.scenarios[0].cells, vec![((2, 2), "y".into())]);
+        let written = edit_scenarios(
+            "<worksheet xmlns='urn:s'><sheetData/></worksheet>",
+            &sheet.scenarios,
+            &sheet.scenario_settings,
+        )
+        .unwrap();
+        let doc = roxmltree::Document::parse(&written).unwrap();
+        let input = doc
+            .descendants()
+            .find(|n| n.has_tag_name(("urn:s", "inputCells")))
+            .unwrap();
+        assert_eq!(input.attribute(("urn:extension", "id")), Some("42"));
+        assert_eq!(input.attribute("r"), Some("C3"));
+        let converted = edit_scenarios(
+            "<worksheet xmlns='urn:other-version'><sheetData/></worksheet>",
+            &sheet.scenarios,
+            &sheet.scenario_settings,
+        )
+        .unwrap();
+        let doc = roxmltree::Document::parse(&converted).unwrap();
+        let input = doc
+            .descendants()
+            .find(|n| n.has_tag_name(("urn:other-version", "inputCells")))
+            .unwrap();
+        assert_eq!(input.attribute(("urn:extension", "id")), Some("42"));
+        sheet.scenarios_dirty = false;
+        sheet.insert_rows(40, 1);
+        assert!(!sheet.scenarios_dirty);
     }
 
     #[test]

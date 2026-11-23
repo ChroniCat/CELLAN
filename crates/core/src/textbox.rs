@@ -765,25 +765,13 @@ pub(crate) fn has_part(path: &Path, name: &str) -> bool {
     zip.by_name(name).is_ok()
 }
 
-pub(crate) fn next_part_no(path: &Path, prefix: &str) -> u32 {
-    let Ok(file) = std::fs::File::open(path) else {
-        return 1;
-    };
-    let Ok(mut zip) = zip::ZipArchive::new(file) else {
-        return 1;
-    };
-    let mut max = 0u32;
-    for i in 0..zip.len() {
-        let Ok(f) = zip.by_index(i) else { continue };
-        let name = f.name().to_string();
-        if let Some(rest) = name.strip_prefix(prefix) {
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(v) = digits.parse::<u32>() {
-                max = max.max(v);
-            }
-        }
-    }
-    max + 1
+/// Each save pass allocates drawing part numbers from one sequence for all its sheets.
+pub(crate) fn next_drawing_no(path: &Path) -> anyhow::Result<u32> {
+    let zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let max = zip.file_names().filter_map(|name| {
+        name.strip_prefix("xl/drawings/drawing")?.strip_suffix(".xml")?.parse::<u32>().ok()
+    }).max().unwrap_or(0);
+    max.checked_add(1).ok_or_else(|| anyhow::anyhow!("绘图编号已用尽"))
 }
 
 /// 找到（没有就建）工作表对应的 drawing 部件；返回部件名与是否需要补关系
@@ -791,6 +779,7 @@ pub(crate) fn ensure_drawing(
     path: &Path,
     sheet_part: &str,
     xml: &str,
+    next: &mut u32,
 ) -> anyhow::Result<(String, String, Option<String>)> {
     // 已有 <drawing r:id> → 从 rels 拿 Target
     let slot = drawing_slot(xml)?;
@@ -801,7 +790,8 @@ pub(crate) fn ensure_drawing(
         let rels = rels_part(&part);
         return Ok((part, rels, None));
     }
-    let no = next_part_no(path, "xl/drawings/drawing");
+    let no = *next;
+    *next = no.checked_add(1).ok_or_else(|| anyhow::anyhow!("绘图编号已用尽"))?;
     let part = format!("xl/drawings/drawing{no}.xml");
     let rels_p = rels_part(&part);
     let rels = crate::hyperlinks::read_rels(path, sheet_part);
@@ -822,6 +812,7 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
     let mut patch_rels: Vec<(String, String)> = Vec::new();
     let mut patch_sheet: Vec<(String, String)> = Vec::new();
     let mut ct_parts: Vec<String> = Vec::new();
+    let mut next = next_drawing_no(path)?;
     for sheet in &wb.sheets {
         if !sheet.textboxes_dirty {
             continue;
@@ -831,13 +822,14 @@ pub fn apply(path: &Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
         };
         let sheet_bytes = crate::fixups::read_part_file(path,sheet_part).ok_or_else(|| anyhow::anyhow!("缺少工作表 {sheet_part}"))?;
         let sheet_xml = crate::xlsx::patch_xml_text(&sheet_bytes,sheet_part)?;
-        let (draw_part, draw_rels, rid) = ensure_drawing(path, sheet_part, &sheet_xml)?;
+        let (draw_part, draw_rels, rid) = ensure_drawing(path, sheet_part, &sheet_xml, &mut next)?;
         // drawing 本体
-        let body = match crate::fixups::read_part_file(path, &draw_part)
-            .and_then(|b| String::from_utf8(b).ok())
-        {
-            Some(xml) => rewrite_drawing(&xml, &sheet.textboxes),
-            None => new_drawing_xml(&sheet.textboxes),
+        let body = if rid.is_none() {
+            let bytes = crate::fixups::read_part_file(path, &draw_part)
+                .ok_or_else(|| anyhow::anyhow!("无法读取原有绘图 {draw_part}"))?;
+            rewrite_drawing(&crate::xlsx::patch_xml_text(&bytes, &draw_part)?, &sheet.textboxes)
+        } else {
+            new_drawing_xml(&sheet.textboxes)
         };
         if has_part(path, &draw_part) {
             patch_sheet_drawing(&mut patch_sheet, &draw_part, body);

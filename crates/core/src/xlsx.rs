@@ -550,9 +550,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         for mut part in loaded {
             for (r, c, xf) in part.xfs {
                 let id = loaded_style_id(xf, &mut wb.styles);
-                if id != 0 {
-                    part.sheet.set_style_loaded(r, c, id);
-                }
+                part.sheet.styles.insert(crate::CellRef::new(r, c), id);
             }
             if let Some(layout) = part.layout {
                 layouts.insert(part.sheet.name.clone(), layout);
@@ -586,12 +584,11 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                     Ok(xml) => {
                         let shell = crate::style_theme::visit_cell_styles(&xml, |r, c, xf| {
                             let id = loaded_style_id(xf, &mut wb.styles);
-                            if id != 0 {
-                                sheet.set_style_loaded(r, c, id);
-                            }
+                            sheet.styles.insert(crate::CellRef::new(r, c), id);
                         });
                         match shell {
-                            Ok(shell) => {
+                            Ok((shell, implicit_coordinates)) => {
+                                sheet.source_needs_dom_repair |= implicit_coordinates;
                                 layouts.insert(name.clone(), crate::merges::sheet_layout(&shell, &dxfs, dxf_ext));
                                 sheet.page = crate::page::parse_page_setup(&shell);
                                 sheet.textboxes = crate::textbox::load_from_sheet(path, part, &shell);
@@ -686,6 +683,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         let wb_styles = &mut wb.styles;
         for sheet in wb_sheets.iter_mut() {
             if let Some(lay) = layouts.get(&sheet.name) {
+                sheet.source_needs_dom_repair |= lay.invalid_column_bounds;
                 // .xls 没有 XML 版面，合并区来自 apply_xls_meta，别被空值覆盖
                 if !lay.merges.is_empty() || !is_cfb {
                     sheet.merges = lay.merges.clone();
@@ -711,7 +709,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 for (r, c) in lay.ignored_errors.iter() {
                     sheet.ignored_errors.insert((*r, *c));
                 }
-                if !lay.scenarios.is_empty() {
+                if lay.scenario_settings.has_source() || !lay.scenarios.is_empty() {
                     sheet.scenarios = lay.scenarios.clone();
                     sheet.scenario_settings = lay.scenario_settings.clone();
                 }
@@ -738,6 +736,9 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                             sheet.set_row_style_loaded(pos, id);
                         }
                     }
+                }
+                if is_ooxml && (!sheet.row_styles.is_empty() || !sheet.col_styles.is_empty()) {
+                    sheet.apply_loaded_xf_zero(loaded_style_id(0, wb_styles));
                 }
                 sheet.tab_color = lay.tab_color;
                 sheet.protection = lay.protection.clone();
@@ -907,6 +908,7 @@ pub struct SaveReceipt {
 #[derive(Debug)]
 struct SavedSheet {
     part: String,
+    source_needs_dom_repair: bool,
     cells: crate::store::CellVersion,
     source_cells: Option<SourceCells>,
     cleared: crate::model::CellJournal,
@@ -977,6 +979,7 @@ impl SaveReceipt {
             let Some(saved) = self.sheets.get(&sheet.identity) else { continue };
             sheet.saved_cells = Some(saved.cells.clone());
             sheet.source_cells.clone_from(&saved.source_cells);
+            sheet.source_needs_dom_repair = saved.source_needs_dom_repair;
             if sheet.cell_version() != &saved.cells {
                 continue;
             }
@@ -1110,6 +1113,8 @@ fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveR
             .with_context(|| format!("已保存文件缺少工作表: {}", sheet.name))?;
         Ok((sheet.identity, SavedSheet {
             part: part.clone(),
+            source_needs_dom_repair: sheet.source_needs_dom_repair &&
+                (write.used_delta || !(sheet.row_styles_dirty || sheet.col_styles_dirty)),
             source_cells: SourceCells::capture(&mut zip, part, sheet).map(|mut source| {
                 if let Some(styles) = &write.styles { styles.attach(&mut source); }
                 else if sheet.source_part.is_none() && sheet.styles.is_empty()
@@ -1435,7 +1440,7 @@ pub(crate) fn patch_xml_text<'a>(bytes: &'a [u8], part: &str) -> Result<std::bor
     }
 }
 
-fn read_zip_text(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
+pub(crate) fn read_zip_text(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
     sheets::xml_part(zip, name).with_context(|| format!("读取 {name} 失败"))
 }
 
@@ -2106,10 +2111,10 @@ fn slim_umya_base(base: &Path, wb: &Workbook) -> Result<Option<SlimBase>> {
                 .is_some_and(|s| s.reusable_grid(&mut zip, part, sheet));
         let check_links =
             sheet.hyperlinks_dirty || sheet.hyperlinks.values().any(|h| h.span != (0, 0));
-        if omit || keep_grid || check_links {
+        if omit || keep_grid || check_links || sheet.source_needs_dom_repair {
             candidates.insert(
                 part.clone(),
-                (sheet.name.clone(), omit, keep_grid, check_links),
+                (sheet.name.clone(), omit, keep_grid, check_links, sheet.source_needs_dom_repair),
             );
         }
     }
@@ -2124,7 +2129,7 @@ fn slim_umya_base(base: &Path, wb: &Workbook) -> Result<Option<SlimBase>> {
     let mut out = zip::ZipWriter::new(BufWriter::new(file));
     for i in 0..zip.len() {
         let part = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
-        let Some((name, omit, mut keep_grid, check_links)) = candidates.remove(&part) else {
+        let Some((name, omit, mut keep_grid, check_links, repair_input)) = candidates.remove(&part) else {
             out.raw_copy_file(zip.by_index_raw(i)?)?;
             continue;
         };
@@ -2174,7 +2179,16 @@ fn slim_umya_base(base: &Path, wb: &Workbook) -> Result<Option<SlimBase>> {
                 crate::hyperlinks::remove_range_links(xml);
             }
         }
-        if let Some(xml) = shell {
+        if repair_input {
+            out.start_file(&part, zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated))?;
+            if let Some(xml) = shell {
+                delta::stream::repair_dom_input(xml.as_bytes(), &mut out)?;
+            } else {
+                delta::stream::xml_input(zip.by_index(i)?, &part, |input|
+                    delta::stream::repair_dom_input(input, &mut out))?;
+            }
+        } else if let Some(xml) = shell {
             out.start_file(
                 part,
                 zip::write::SimpleFileOptions::default()
@@ -2342,7 +2356,7 @@ fresh_sheet_flags!(s, streamed;
     layout_dirty = !s.cols.is_empty() || !s.rows.is_empty() || !s.hidden_cols.is_empty()
         || !s.hidden_rows.is_empty() || !s.hidden_rows_user.is_empty()
         || !s.row_levels.is_empty() || !s.col_levels.is_empty(),
-    scenarios_dirty = !s.scenarios.is_empty(),
+    scenarios_dirty = s.scenario_settings.has_source() || !s.scenarios.is_empty(),
     ignored_errors_dirty = !s.ignored_errors.is_empty(),
     filter_dirty = s.filter.is_some() || !s.hidden_rows.is_empty(),
     tab_color_dirty = s.tab_color.is_some(),
@@ -2614,16 +2628,27 @@ fn save_plain_at(
                 write_umya_style(wb, sid, cell.get_style_mut());
                 if streamed[idx] && sheet.contains(row, col) { cell.set_value_number(0.0); }
             }
-            if fresh_base || sheet.row_styles_dirty || sheet.styles_dirty {
+            let style_source = sheet.source_cells.as_ref().filter(|_| !fresh_base);
+            if fresh_base || sheet.row_styles_dirty {
+                if let Some(src) = style_source {
+                    for &r in src.row_styles.keys().filter(|r| !sheet.row_styles.contains_key(r)) {
+                        ws.row_dimension_mut(r + 1).set_style(Default::default());
+                    }
+                }
                 for (&r, &sid) in &sheet.row_styles {
-                    if sid != 0 {
+                    if style_source.and_then(|s| s.row_styles.get(&r)) != Some(&sid) {
                         write_umya_style(wb, sid, ws.get_row_dimension_mut(&(r + 1)).get_style_mut());
                     }
                 }
             }
-            if fresh_base || sheet.col_styles_dirty || sheet.styles_dirty {
+            if fresh_base || sheet.col_styles_dirty {
+                if let Some(src) = style_source {
+                    for &c in src.col_styles.keys().filter(|c| !sheet.col_styles.contains_key(c)) {
+                        ws.column_dimension_by_number_mut(c + 1).set_style(Default::default());
+                    }
+                }
                 for (&c, &sid) in &sheet.col_styles {
-                    if sid != 0 {
+                    if style_source.and_then(|s| s.col_styles.get(&c)) != Some(&sid) {
                         let cd = ws.get_column_dimension_by_number_mut(&(c + 1));
                         let w_px = sheet.cols.size(c);
                         if (w_px - crate::layout::DEFAULT_COL_W).abs() > 0.5 && w_px > 0.0 {
@@ -2664,9 +2689,19 @@ fn save_plain_at(
                     continue;
                 }
                 let coord = (cref.col + 1, cref.row + 1);
-                if sheet.explicit_style_of(cref.row,cref.col).is_none()
-                    && let Some(&id) = sheet.row_styles.get(&cref.row).or_else(|| sheet.col_styles.get(&cref.col)) {
-                    write_umya_style(wb,id,ws.get_cell_mut(coord).get_style_mut());
+                if sheet.explicit_style_of(cref.row, cref.col).is_none() {
+                    // Reuse the dimension's actual package style so a value-only save
+                    // can restore the original styles.xml without dangling XF indices.
+                    let inherited = if sheet.row_styles.contains_key(&cref.row) {
+                        ws.row_dimension(coord.1).map(|r| r.style().clone())
+                    } else if sheet.col_styles.contains_key(&cref.col) {
+                        ws.column_dimension_by_number(coord.0).map(|c| c.style().clone())
+                    } else {
+                        None
+                    };
+                    if let Some(style) = inherited {
+                        ws.cell_mut(coord).set_style(style);
+                    }
                 }
 
                 if let Some(f) = &cell.formula {
@@ -3141,7 +3176,7 @@ fn save_plain_at(
         }
     }
     must_save!("outline", crate::patch::apply_outline_pr(path, wb));
-    must_save!("scenarios", crate::patch::apply_scenarios(path, wb));
+    must_save!("scenarios", crate::patch::restore_scenarios(path, wb, !can_bypass_umya));
     must_save!("ignored-errors", crate::patch::apply_ignored_errors(path, wb));
     must_save!("tab-colors", crate::patch::apply_tab_colors(path, wb));
     must_save!("protection", crate::patch::apply_protection(path, wb));

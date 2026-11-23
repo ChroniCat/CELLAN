@@ -205,7 +205,9 @@ pub fn ensure(names: &[String]) -> bool {
                 if !b.contains_key(&norm(n)) {
                     b.insert(norm(n), Loaded { data, index });
                     changed = true;
-                    pending().lock().map(|mut p| p.insert(format!("bold:{}", norm(n))));
+                    if let Ok(mut fonts) = pending().lock() {
+                        fonts.insert(format!("bold:{}", norm(n)));
+                    }
                 }
             }
         }
