@@ -174,6 +174,8 @@ pub struct AiState {
     pub(crate) bound_doc_uid: Option<u64>,
     pub(crate) ime_composing: bool,
     pub(crate) request_input_focus: bool,
+    pub(super) elide_cache: std::collections::HashMap<(u32, u32, String), (String, bool)>,
+    pub(super) card_heights: std::collections::HashMap<usize, (u64, f32)>,
 }
 
 impl Default for AiState {
@@ -201,6 +203,8 @@ impl Default for AiState {
             bound_doc_uid: None,
             ime_composing: false,
             request_input_focus: false,
+            elide_cache: std::collections::HashMap::new(),
+            card_heights: std::collections::HashMap::new(),
         }
     }
 }
@@ -564,11 +568,13 @@ impl SheetApp {
             }
             "style_range" => self.tool_style_range(&tc.arguments).into(),
             "manage_sheet" => self.tool_manage_sheet(&tc.arguments).into(),
-            "data_operation" => self.tool_data_operation(&tc.arguments, ctx).into(),
+            "data_operation" => self.tool_data_operation(&tc.arguments, checkpoint, ctx),
             other => AiToolOutput::Ready(format!("未知工具：{other}"),
                 json!({"ok": false, "error": format!("不支持的工具名称: {other}")})),
         };
-        if let Some(last) = self.ai.messages.last_mut() {
+        if !matches!(output, AiToolOutput::Reordering { .. })
+            && let Some(last) = self.ai.messages.last_mut()
+        {
             last.undo_ids.extend(self.undo.ids_since(checkpoint));
         }
         output
@@ -807,6 +813,15 @@ impl SheetApp {
 
         let sh_name = self.wb.sheet(si).name.clone();
         let before = sheetcore::undo::capture(self.wb.sheet(si), si, &keys);
+        let mut fill_formulas = refs::FillFormulas::default();
+        let need_net_styles = fmt.is_some() && self.net.is_some();
+        let mut style_cache: std::collections::HashMap<u16, (u16, sheetcore::style::CellStyle)> =
+            std::collections::HashMap::new();
+        let mut wire_styles = if need_net_styles {
+            Vec::with_capacity(keys.len())
+        } else {
+            Vec::new()
+        };
         for r in r1..=r2 {
             for c in c1..=c2 {
                 let dr = r as i64 - r1 as i64;
@@ -814,7 +829,7 @@ impl SheetApp {
                 let translated = if dr == 0 && dc == 0 {
                     body.to_string()
                 } else {
-                    refs::translate(body, dr, dc, &sh_name)
+                    fill_formulas.translate(body, dr, dc)
                 };
                 self.wb.sheet_mut(si).set(
                     r,
@@ -826,11 +841,27 @@ impl SheetApp {
                 );
                 if let Some(ref fstr) = fmt {
                     let sid = self.wb.sheet(si).style_of(r, c);
-                    let mut st = self.wb.styles.get(sid).clone();
-                    st.format = fstr.clone();
-                    let nsid = self.wb.styles.intern(st);
+                    let (nsid, cached_st) = style_cache
+                        .entry(sid)
+                        .or_insert_with(|| {
+                            let mut st = self.wb.styles.get(sid).clone();
+                            st.format = fstr.clone();
+                            let id = self.wb.styles.intern(st.clone());
+                            (id, st)
+                        })
+                        .clone();
                     self.wb.sheet_mut(si).set_style(r, c, nsid);
+                    if need_net_styles {
+                        wire_styles.push((r, c, cached_st));
+                    }
                 }
+            }
+        }
+        if !wire_styles.is_empty()
+            && let Some(net) = self.net.as_ref()
+        {
+            for chunk in wire_styles.chunks(sheetcore::sync::STYLE_PALETTE_CHUNK_ITEMS) {
+                net.broadcast_style(si, chunk.to_vec());
             }
         }
         let deltas = sheetcore::undo::finish(before, self.wb.sheet(si));
@@ -1006,15 +1037,20 @@ impl SheetApp {
         }
     }
 
-    fn tool_data_operation(&mut self, args: &JsonValue, _ctx: &egui::Context) -> (String, JsonValue) {
+    fn tool_data_operation(
+        &mut self,
+        args: &JsonValue,
+        undo_checkpoint: u64,
+        _ctx: &egui::Context,
+    ) -> AiToolOutput {
         let Some(si) = self.resolve_sheet_index(args.get("sheet").and_then(|v| v.as_str())) else {
-            return ("数据操作失败".into(), json!({"ok": false, "error": "未找到工作表"}));
+            return ("数据操作失败".into(), json!({"ok": false, "error": "未找到工作表"})).into();
         };
         let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let (r1, c1, mut r2, mut c2) = match args.get("range") {
             Some(range) => match range.as_str().and_then(checked_ai_range) {
                 Some(rect) => rect,
-                None => return ("数据操作失败".into(), json!({"ok": false, "error": "range 格式无效"})),
+                None => return ("数据操作失败".into(), json!({"ok": false, "error": "range 格式无效"})).into(),
             },
             None => self.sel_rect(),
         };
@@ -1031,7 +1067,7 @@ impl SheetApp {
             top <= r2 && bottom >= r1 && left <= c2 && right >= c1
                 && (top < r1 || left < c1 || bottom > r2 || right > c2)
         }) {
-            return ("合并失败".into(), json!({"ok": false, "error": "现有合并单元格跨出指定区域"}));
+            return ("合并失败".into(), json!({"ok": false, "error": "现有合并单元格跨出指定区域"})).into();
         }
         let saved = (self.sheet_idx, self.sel, self.sel_end, self.extra_sel.clone());
         self.sheet_idx = si;
@@ -1070,7 +1106,7 @@ impl SheetApp {
                 self.sel = saved.1;
                 self.sel_end = saved.2;
                 self.extra_sel = saved.3;
-                return ("数据操作失败".into(), json!({"ok": false, "error": "不支持的 op"}));
+                return ("数据操作失败".into(), json!({"ok": false, "error": "不支持的 op"})).into();
             }
         };
 
@@ -1080,10 +1116,21 @@ impl SheetApp {
         self.extra_sel = saved.3;
 
         let span = range_label((r1, c1), (r2, c2));
-        if self.doc_gen == generation {
-            return (format!("{label} {span} 未执行"), json!({"ok": false, "status": self.status}));
+        if self.tasks.reorder.is_some() {
+            return AiToolOutput::Reordering {
+                sheet_id: self.wb.sheet(si).identity,
+                op_desc: label.to_string(),
+                range_lbl: span,
+                undo_checkpoint,
+                before_gen: generation,
+            };
         }
-        (format!("{label} {span}"), json!({"ok": true, "status": self.status}))
+        let noop_ok = self.doc_gen == generation
+            && (self.status.starts_with("已按") || self.status == "没有重复行");
+        if self.doc_gen == generation && !noop_ok {
+            return (format!("{label} {span} 未执行"), json!({"ok": false, "status": self.status})).into();
+        }
+        (format!("{label} {span}"), json!({"ok": true, "status": self.status})).into()
     }
 
     // =====================================================================
@@ -1834,12 +1881,36 @@ impl SheetApp {
                                         });
                                 }
 
-                                for idx in 0..self.ai.messages.len() {
+                                let last_can_retry = self.can_retry_ai_round_ui();
+                                let avail_msg_w = ui.available_width();
+                                let msg_len = self.ai.messages.len();
+                                for idx in 0..msg_len {
+                                    let is_last = idx + 1 == msg_len;
                                     let role = self.ai.messages[idx].role;
                                     match role {
                                         AiRole::User => {
-                                            let txt = self.ai.messages[idx].content.clone();
-                                            ui.with_layout(
+                                            let sig = {
+                                                use std::hash::{Hash, Hasher};
+                                                let mut h = std::hash::DefaultHasher::new();
+                                                (0u8, self.ai.messages[idx].content.len(), avail_msg_w.to_bits()).hash(&mut h);
+                                                h.finish()
+                                            };
+                                            if !is_last
+                                                && !self.ai.scroll_bottom
+                                                && let Some(&(cached_sig, cached_h)) = self.ai.card_heights.get(&idx)
+                                                && cached_sig == sig
+                                            {
+                                                let probe = Rect::from_min_size(
+                                                    ui.cursor().min,
+                                                    Vec2::new(avail_msg_w, cached_h),
+                                                );
+                                                if !ui.is_rect_visible(probe) {
+                                                    ui.allocate_space(Vec2::new(avail_msg_w, cached_h));
+                                                    continue;
+                                                }
+                                            }
+                                            let txt = self.ai.messages[idx].content.as_str();
+                                            let row_resp = ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::TOP),
                                                 |ui| {
                                                     egui::Frame::NONE
@@ -1866,25 +1937,68 @@ impl SheetApp {
                                                         });
                                                 },
                                             );
+                                            self.ai
+                                                .card_heights
+                                                .insert(idx, (sig, row_resp.response.rect.height()));
                                         }
                                         AiRole::Assistant => {
-                                            let has_reason =
-                                                !self.ai.messages[idx].reasoning.is_empty();
-                                            let reason_open = self.ai.messages[idx].reasoning_open;
-                                            let reason_txt =
-                                                self.ai.messages[idx].reasoning.clone();
-                                            let tool_logs =
-                                                self.ai.messages[idx].tool_logs.clone();
-                                            let content_txt =
-                                                self.ai.messages[idx].content.clone();
-                                            let err_opt = self.ai.messages[idx].error.clone();
+                                            let open_id = egui::Id::new(("ai_tools_open", idx));
+                                            let tools_open = ui.ctx().data(|d| {
+                                                d.get_temp::<bool>(open_id).unwrap_or(true)
+                                            });
+                                            let can_retry = is_last && last_can_retry;
                                             let usteps = self.ai.messages[idx].undo_ids.len();
-                                            let is_last = idx + 1 == self.ai.messages.len();
-                                            let can_retry = is_last && self.can_retry_ai_round();
                                             let can_undo =
                                                 usteps > 0 && !self.ai.busy && is_last;
+                                            let sig = {
+                                                use std::hash::{Hash, Hasher};
+                                                let msg = &self.ai.messages[idx];
+                                                let mut h = std::hash::DefaultHasher::new();
+                                                (
+                                                    1u8,
+                                                    msg.content.len(),
+                                                    msg.reasoning.len(),
+                                                    msg.reasoning_open,
+                                                    tools_open,
+                                                    msg.tool_logs.len(),
+                                                    msg.error.as_ref().map(String::len),
+                                                    can_retry,
+                                                    can_undo,
+                                                    avail_msg_w.to_bits(),
+                                                )
+                                                    .hash(&mut h);
+                                                h.finish()
+                                            };
+                                            if !is_last
+                                                && !self.ai.scroll_bottom
+                                                && let Some(&(cached_sig, cached_h)) = self.ai.card_heights.get(&idx)
+                                                && cached_sig == sig
+                                            {
+                                                let probe = Rect::from_min_size(
+                                                    ui.cursor().min,
+                                                    Vec2::new(avail_msg_w, cached_h),
+                                                );
+                                                if !ui.is_rect_visible(probe) {
+                                                    ui.allocate_space(Vec2::new(avail_msg_w, cached_h));
+                                                    continue;
+                                                }
+                                            }
+                                            let AiState {
+                                                messages,
+                                                elide_cache,
+                                                card_heights,
+                                                busy,
+                                                confirmation_label,
+                                                ..
+                                            } = &mut self.ai;
+                                            let msg = &messages[idx];
+                                            let has_reason = !msg.reasoning.is_empty();
+                                            let reason_open = msg.reasoning_open;
+                                            let ai_busy = *busy;
+                                            let has_confirm = confirmation_label.is_some();
+                                            let mut toggle_reason = false;
 
-                                            egui::Frame::NONE
+                                            let card_resp = egui::Frame::NONE
                                                 .fill(Color32::from_rgb(250, 251, 253))
                                                 .stroke(Stroke::new(1.0_f32, ui_kit::CARD_BORDER))
                                                 .corner_radius(8.0)
@@ -1952,8 +2066,7 @@ impl SheetApp {
                                                             );
                                                         }
                                                         if hresp.clicked() {
-                                                            self.ai.messages[idx].reasoning_open =
-                                                                !reason_open;
+                                                            toggle_reason = true;
                                                         }
                                                         if reason_open {
                                                             egui::Frame::NONE
@@ -1982,7 +2095,7 @@ impl SheetApp {
                                                                             ui.add(
                                                                                 egui::Label::new(
                                                                                     egui::RichText::new(
-                                                                                        reason_txt,
+                                                                                        msg.reasoning.as_str(),
                                                                                     )
                                                                                     .size(11.0)
                                                                                     .color(
@@ -1997,13 +2110,7 @@ impl SheetApp {
                                                     }
 
                                                     // 工具步骤子卡片（可折叠 + 限高滚动 + 带语义图标胶囊行）
-                                                    if !tool_logs.is_empty() {
-                                                        let open_id =
-                                                            egui::Id::new(("ai_tools_open", idx));
-                                                        let tools_open = ui.ctx().data(|d| {
-                                                            d.get_temp::<bool>(open_id)
-                                                                .unwrap_or(true)
-                                                        });
+                                                    if !msg.tool_logs.is_empty() {
                                                         egui::Frame::NONE
                                                             .fill(Color32::from_rgb(243, 246, 251))
                                                             .stroke(Stroke::new(
@@ -2061,7 +2168,7 @@ impl SheetApp {
                                                                     ui_kit::TEXT,
                                                                 );
                                                                 let cnt_txt =
-                                                                    format!("{} 步", tool_logs.len());
+                                                                    format!("{} 步", msg.tool_logs.len());
                                                                 let cg =
                                                                     ui.painter().layout_no_wrap(
                                                                         cnt_txt.clone(),
@@ -2148,9 +2255,11 @@ impl SheetApp {
                                                                             ui.spacing_mut()
                                                                                 .item_spacing
                                                                                 .y = 4.0;
-                                                                            for tl in &tool_logs {
+                                                                            for tl in &msg.tool_logs {
                                                                                 draw_ai_tool_step(
-                                                                                    ui, tl,
+                                                                                    ui,
+                                                                                    tl,
+                                                                                    elide_cache,
                                                                                 );
                                                                             }
                                                                         });
@@ -2159,18 +2268,18 @@ impl SheetApp {
                                                     }
 
                                                     // 正文回复
-                                                    if !content_txt.is_empty() {
+                                                    if !msg.content.is_empty() {
                                                         ui.add(
                                                             egui::Label::new(
-                                                                egui::RichText::new(content_txt)
+                                                                egui::RichText::new(msg.content.as_str())
                                                                     .size(12.0)
                                                                     .color(ui_kit::TEXT),
                                                             )
                                                             .wrap(),
                                                         );
                                                     } else if is_last
-                                                        && self.ai.busy
-                                                        && self.ai.confirmation_label.is_none()
+                                                        && ai_busy
+                                                        && !has_confirm
                                                     {
                                                         ui.label(
                                                             egui::RichText::new(
@@ -2182,7 +2291,7 @@ impl SheetApp {
                                                     }
 
                                                     // 错误提示横幅卡片
-                                                    if let Some(err) = err_opt {
+                                                    if let Some(err) = msg.error.as_deref() {
                                                         egui::Frame::NONE
                                                             .fill(Color32::from_rgb(254, 242, 242))
                                                             .stroke(Stroke::new(
@@ -2267,6 +2376,11 @@ impl SheetApp {
                                                         });
                                                     }
                                                 });
+                                            card_heights
+                                                .insert(idx, (sig, card_resp.response.rect.height()));
+                                            if toggle_reason {
+                                                messages[idx].reasoning_open = !reason_open;
+                                            }
                                         }
                                     }
                                 }
@@ -2294,6 +2408,7 @@ impl SheetApp {
             self.ai.wire_history.clear();
             self.ai.active_round = None;
             self.ai.status_hint.clear();
+            self.ai.card_heights.clear();
         }
         if undo_requested {
             self.undo_last_ai_change();
@@ -2578,7 +2693,11 @@ fn ai_secret_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> egui::Res
     te_resp
 }
 
-fn draw_ai_tool_step(ui: &mut egui::Ui, log: &str) {
+fn draw_ai_tool_step(
+    ui: &mut egui::Ui,
+    log: &str,
+    elide_cache: &mut std::collections::HashMap<(u32, u32, String), (String, bool)>,
+) {
     let (icon, is_err) = classify_tool_log(log);
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
@@ -2604,8 +2723,19 @@ fn draw_ai_tool_step(ui: &mut egui::Ui, log: &str) {
     ui_icons::draw_excel(ui.painter(), ir, icon, fg, true);
 
     let max_txt_w = (rect.width() - 44.0).max(32.0);
-    let (shown, clipped) =
-        elide_to_width(ui.painter(), log, FontId::proportional(11.0), max_txt_w);
+    let width_key = (max_txt_w * 2.0).round() as u32;
+    let font_key = 110u32;
+    let cache_key = (font_key, width_key, log.to_owned());
+    let (shown, clipped) = if let Some(hit) = elide_cache.get(&cache_key) {
+        hit.clone()
+    } else {
+        if elide_cache.len() >= 2048 {
+            elide_cache.clear();
+        }
+        let computed = elide_to_width(ui.painter(), log, FontId::proportional(11.0), max_txt_w);
+        elide_cache.insert(cache_key, computed.clone());
+        computed
+    };
     ui.painter().text(
         egui::pos2(rect.left() + 23.0, rect.center().y),
         Align2::LEFT_CENTER,

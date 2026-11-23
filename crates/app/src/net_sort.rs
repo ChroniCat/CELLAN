@@ -53,14 +53,15 @@ impl SortBatch {
 
     pub fn expand(
         plan: &SortPermutation,
-        read: impl FnMut(u32, u32) -> (ValueWire, Option<String>, Arc<CellStyle>),
+        read: impl FnMut(u32, u32) -> (ValueWire, Option<Arc<str>>, Arc<CellStyle>),
     ) -> Option<Self> {
-        Self::expand_while(plan, read, || true)
+        Self::expand_while(plan, None, read, || true)
     }
 
     fn expand_while(
         plan: &SortPermutation,
-        mut read: impl FnMut(u32, u32) -> (ValueWire, Option<String>, Arc<CellStyle>),
+        active_offsets: Option<&[u32]>,
+        mut read: impl FnMut(u32, u32) -> (ValueWire, Option<Arc<str>>, Arc<CellStyle>),
         pending: impl Fn() -> bool,
     ) -> Option<Self> {
         if !plan.valid() {
@@ -89,8 +90,8 @@ impl SortBatch {
             if dst == src {
                 continue;
             }
-            for offset in start..=end {
-                if offset != start && (offset - start) % 2048 == 0 && !pending() {
+            let mut visit_offset = |step: usize, offset: u32| -> Option<()> {
+                if step != 0 && step % 2048 == 0 && !pending() {
                     return None;
                 }
                 let (r, c) = coords(src, offset);
@@ -99,15 +100,20 @@ impl SortBatch {
                 let (before, prev_formula, prev_style) = read(row, col);
                 let formula = formula.map(|f| {
                     let shift = i64::from(dst) - i64::from(src);
-                    sheetcore::refs::translate(
+                    let translated = sheetcore::refs::translate(
                         &f,
                         if plan.horizontal { 0 } else { shift },
                         if plan.horizontal { shift } else { 0 },
                         &plan.name,
-                    )
+                    );
+                    if translated == *f {
+                        f
+                    } else {
+                        Arc::<str>::from(translated)
+                    }
                 });
                 if before == value && formula == prev_formula && style == prev_style {
-                    continue;
+                    return Some(());
                 }
                 if style != prev_style {
                     styles.push((row, col, (*style).clone()));
@@ -125,6 +131,16 @@ impl SortBatch {
                     ts,
                     site: plan.site,
                 }));
+                Some(())
+            };
+            if let Some(offsets) = active_offsets {
+                for (step, &offset) in offsets.iter().enumerate() {
+                    visit_offset(step, offset)?;
+                }
+            } else {
+                for (step, offset) in (start..=end).enumerate() {
+                    visit_offset(step, offset)?;
+                }
             }
         }
         (digest(&ops, &styles) == plan.digest).then(|| Self {
@@ -170,13 +186,21 @@ fn digest(ops: &[Arc<Op>], styles: &[StyleItem]) -> [u8; 32] {
             bytes(&mut hash, f.as_bytes());
         }
     }
+    // 按唯一 CellStyle 缓存 JSON 字节，消除百万格带样式排序时百万次重复 serde_json::to_vec
+    let mut style_json_cache: std::collections::HashMap<u64, Vec<(CellStyle, Vec<u8>)>> =
+        std::collections::HashMap::new();
     for (r, c, style) in styles {
         hash.update(r.to_le_bytes());
         hash.update(c.to_le_bytes());
-        bytes(
-            &mut hash,
-            &serde_json::to_vec(style).expect("serializable style"),
-        );
+        let h = sheetcore::sync::cell_style_hash(style);
+        let bucket = style_json_cache.entry(h).or_default();
+        if let Some((_, encoded)) = bucket.iter().find(|(s, _)| s == style) {
+            bytes(&mut hash, encoded);
+        } else {
+            let encoded = serde_json::to_vec(style).expect("serializable style");
+            bytes(&mut hash, &encoded);
+            bucket.push((style.clone(), encoded));
+        }
     }
     hash.finalize().into()
 }
@@ -190,6 +214,7 @@ pub(crate) fn from_sheet(
     let mut styles = std::collections::HashMap::new();
     SortBatch::expand_while(
         plan,
+        None,
         |r, c| {
             let style = styles
                 .entry(sh.style_of(r, c))
@@ -197,7 +222,7 @@ pub(crate) fn from_sheet(
             let cell = sh.get(r, c);
             (
                 cell.map_or(ValueWire::Empty, |v| (&v.value).into()),
-                cell.and_then(|v| v.formula.as_deref().map(str::to_owned)),
+                cell.and_then(|v| v.formula.clone()),
                 style.clone(),
             )
         },
@@ -210,9 +235,27 @@ pub(crate) fn from_sheet(
 type Key = (usize, u32, u32);
 pub(crate) type Grid<V> = immutable_chunkmap::map::MapM<Key, Arc<V>>;
 pub(crate) type SharedGrid<V> = Arc<std::sync::Mutex<Arc<Grid<V>>>>;
+pub(crate) type SharedBaseline = Arc<std::sync::Mutex<Option<Arc<sheetcore::sync::BaselineBook>>>>;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SheetAxisStyles {
+    pub rows: std::collections::BTreeMap<u32, Arc<CellStyle>>,
+    pub cols: std::collections::BTreeMap<u32, Arc<CellStyle>>,
+}
+
+impl SheetAxisStyles {
+    #[inline]
+    pub fn get(&self, row: u32, col: u32) -> Option<&Arc<CellStyle>> {
+        self.rows.get(&row).or_else(|| self.cols.get(&col))
+    }
+}
+
+pub(crate) type AxisStylesMap = Arc<std::collections::HashMap<usize, SheetAxisStyles>>;
 
 #[derive(Clone)]
 pub(crate) struct RoomGrids {
+    pub baseline: Option<Arc<sheetcore::sync::BaselineBook>>,
+    pub axis_styles: AxisStylesMap,
     pub cells: Arc<Grid<Op>>,
     pub delta: Arc<Grid<Op>>,
     pub styles: Arc<Grid<CellStyle>>,
@@ -221,12 +264,16 @@ pub(crate) struct RoomGrids {
 
 impl RoomGrids {
     pub fn capture(
+        baseline: &SharedBaseline,
+        axis_styles: AxisStylesMap,
         cells: &SharedGrid<Op>,
         delta: &SharedGrid<Op>,
         styles: &SharedGrid<CellStyle>,
         delta_styles: &SharedGrid<CellStyle>,
     ) -> Self {
         Self {
+            baseline: baseline.lock().unwrap().clone(),
+            axis_styles,
             cells: cells.lock().unwrap().clone(),
             delta: delta.lock().unwrap().clone(),
             styles: styles.lock().unwrap().clone(),
@@ -235,16 +282,120 @@ impl RoomGrids {
     }
 
     pub fn expand(&self, plan: &SortPermutation) -> Option<SortBatch> {
-        let default = Arc::new(CellStyle::default_dark());
-        SortBatch::expand(plan, |r, c| {
-            let key = (plan.sheet, r, c);
-            let cell = self.cells.get(&key);
-            (
-                cell.map_or(ValueWire::Empty, |c| c.value.clone()),
-                cell.and_then(|c| c.formula.clone()),
-                self.styles.get(&key).unwrap_or(&default).clone(),
-            )
-        })
+        if !plan.valid() {
+            return None;
+        }
+        let (r1, c1, r2, c2) = plan.region;
+        let default = self.baseline.as_ref().map_or_else(
+            || Arc::new(CellStyle::default_dark()),
+            |b| Arc::new(b.styles.get(0).clone()),
+        );
+        let (offset_start, offset_end) = if plan.horizontal { (r1, r2) } else { (c1, c2) };
+        let offset_len = (offset_end - offset_start + 1) as usize;
+        let mut occupied_offset = vec![false; offset_len];
+        let mut mark = |r: u32, c: u32| {
+            let off = if plan.horizontal { r } else { c };
+            occupied_offset[(off - offset_start) as usize] = true;
+        };
+
+        let mut cell_map: std::collections::HashMap<(u32, u32), (ValueWire, Option<Arc<str>>)> =
+            std::collections::HashMap::new();
+        let mut style_map: std::collections::HashMap<(u32, u32), Arc<CellStyle>> =
+            std::collections::HashMap::new();
+        let mut base_style_cache: std::collections::HashMap<u64, Vec<Arc<CellStyle>>> =
+            std::collections::HashMap::new();
+
+        if let Some(base) = &self.baseline {
+            base.for_each_cell_in_rect(plan.sheet, plan.region, |r, c, cell| {
+                mark(r, c);
+                cell_map.insert((r, c), ((&cell.value).into(), cell.formula.clone()));
+            });
+            base.for_each_style_in_rect(plan.sheet, plan.region, |r, c, st| {
+                mark(r, c);
+                let h = sheetcore::sync::cell_style_hash(st);
+                let bucket = base_style_cache.entry(h).or_default();
+                let shared = if let Some(found) = bucket.iter().find(|s| s.as_ref() == st) {
+                    found.clone()
+                } else {
+                    let arc = Arc::new(st.clone());
+                    bucket.push(arc.clone());
+                    arc
+                };
+                style_map.insert((r, c), shared);
+            });
+        }
+
+        let sheet_axis = self.axis_styles.get(&plan.sheet);
+        let mut fill_all_offsets = false;
+        if let Some(ax) = sheet_axis {
+            if plan.horizontal {
+                if ax.cols.range(c1..=c2).next().is_some() {
+                    fill_all_offsets = true;
+                } else {
+                    for (&r, _) in ax.rows.range(r1..=r2) {
+                        mark(r, c1);
+                    }
+                }
+            } else if ax.rows.range(r1..=r2).next().is_some() {
+                fill_all_offsets = true;
+            } else {
+                for (&c, _) in ax.cols.range(c1..=c2) {
+                    mark(r1, c);
+                }
+            }
+        }
+
+        for (&(_, r, c), op) in self
+            .cells
+            .range((plan.sheet, r1, c1)..=(plan.sheet, r2, c2))
+        {
+            if (c1..=c2).contains(&c) {
+                mark(r, c);
+                if matches!(op.value, ValueWire::Empty) && op.formula.is_none() {
+                    cell_map.remove(&(r, c));
+                } else {
+                    cell_map.insert((r, c), (op.value.clone(), op.formula.clone()));
+                }
+            }
+        }
+        for (&(_, r, c), st) in self
+            .styles
+            .range((plan.sheet, r1, c1)..=(plan.sheet, r2, c2))
+        {
+            if (c1..=c2).contains(&c) {
+                mark(r, c);
+                style_map.insert((r, c), st.clone());
+            }
+        }
+        if fill_all_offsets {
+            occupied_offset.fill(true);
+        }
+
+        let active_offsets: Vec<u32> = occupied_offset
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, used)| used.then_some(offset_start + i as u32))
+            .collect();
+
+        SortBatch::expand_while(
+            plan,
+            Some(&active_offsets),
+            |r, c| {
+                let (val, formula) = cell_map
+                    .get(&(r, c))
+                    .cloned()
+                    .unwrap_or((ValueWire::Empty, None));
+                let st = if let Some(explicit) = style_map.get(&(r, c)) {
+                    explicit.clone()
+                } else if let Some(axis_st) = sheet_axis.and_then(|ax| ax.get(r, c)) {
+                    axis_st.clone()
+                } else {
+                    default.clone()
+                };
+                (val, formula, st)
+            },
+            || true,
+        )
     }
 
     pub fn apply(&self, batch: &SortBatch) -> Self {

@@ -11,7 +11,13 @@
 //!    加密钥与认证钥（不同前缀，互不相关）。每条连接 salt 不同，密钥互不复用。
 //! 每帧独立计数器作为 nonce，接收端要求严格递增（防重放/重排）。
 
+use base64::Engine;
 use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+
+const DIR_COMPRESSED_FLAG: u8 = 0x80;
+const COMPRESS_MIN_BYTES: usize = 512;
+const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// ChaCha20 的 32 位字
 fn quarter(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
@@ -67,14 +73,23 @@ pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64
     out
 }
 
-/// 原地加/解密（同一操作）
+/// 原地加/解密（同一操作，按 64 字节完整块批量异或以利 SIMD 向量化）
 pub fn apply_keystream(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
-    let mut block = chacha20_block(key, counter, nonce);
-    for (i, b) in data.iter_mut().enumerate() {
-        if i > 0 && i % 64 == 0 {
-            block = chacha20_block(key, counter.wrapping_add((i / 64) as u32), nonce);
+    let mut chunks = data.chunks_exact_mut(64);
+    let mut block_idx = 0u32;
+    for chunk in &mut chunks {
+        let ks = chacha20_block(key, counter.wrapping_add(block_idx), nonce);
+        for (dst, src) in chunk.iter_mut().zip(ks.iter()) {
+            *dst ^= *src;
         }
-        *b ^= block[i % 64];
+        block_idx = block_idx.wrapping_add(1);
+    }
+    let rem = chunks.into_remainder();
+    if !rem.is_empty() {
+        let ks = chacha20_block(key, counter.wrapping_add(block_idx), nonce);
+        for (dst, src) in rem.iter_mut().zip(ks.iter()) {
+            *dst ^= *src;
+        }
     }
 }
 
@@ -197,69 +212,30 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     r
 }
 
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 pub fn b64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(B64[(n >> 18) as usize & 63] as char);
-        out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            B64[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            B64[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut rev = [255u8; 256];
-    for (i, c) in B64.iter().enumerate() {
-        rev[*c as usize] = i as u8;
+    let trimmed = s.trim_ascii();
+    if trimmed.is_empty() {
+        return Some(Vec::new());
     }
-    let bytes: Vec<u8> = s
+    if !trimmed.bytes().any(|b| b.is_ascii_whitespace()) {
+        if let Ok(out) = base64::engine::general_purpose::STANDARD.decode(trimmed) {
+            return Some(out);
+        }
+        return base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(trimmed.trim_end_matches('='))
+            .ok();
+    }
+    let cleaned: Vec<u8> = trimmed
         .bytes()
         .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
         .collect();
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    let mut acc = 0u32;
-    let mut n = 0;
-    for b in bytes {
-        let v = rev[b as usize];
-        if v == 255 {
-            return None;
-        }
-        acc = (acc << 6) | v as u32;
-        n += 1;
-        if n == 4 {
-            out.push((acc >> 16) as u8);
-            out.push((acc >> 8) as u8);
-            out.push(acc as u8);
-            acc = 0;
-            n = 0;
-        }
-    }
-    match n {
-        2 => out.push((acc >> 4) as u8),
-        3 => {
-            out.push((acc >> 10) as u8);
-            out.push((acc >> 2) as u8);
-        }
-        _ => {}
-    }
-    Some(out)
+    base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(&cleaned)
+        .ok()
 }
 
 /// 一个会话的加解密状态
@@ -330,43 +306,57 @@ impl Session {
         n
     }
 
-    /// 加密一帧（明文 JSON → base64(计数器 | 密文 | tag)）
+    /// 加密一帧（明文 JSON → 可选 deflate 压缩 → 原地加密 + 零拷贝 HMAC → base64）
     pub fn seal(&mut self, plain: &str) -> String {
         self.send_ctr = self.send_ctr.wrapping_add(1);
         let ctr = self.send_ctr;
-        let dir = self.send_dir;
-        let mut buf = plain.as_bytes().to_vec();
-        apply_keystream(&self.enc, ctr, &Self::nonce(dir, ctr), &mut buf);
-        let mut framed = Vec::with_capacity(5 + buf.len() + 32);
-        framed.push(dir);
-        framed.extend_from_slice(&ctr.to_le_bytes());
-        framed.extend_from_slice(&buf);
-        let mut m = Vec::with_capacity(framed.len());
-        m.extend_from_slice(&framed);
-        let tag = hmac_sha256(&self.mac, &m);
+        let raw_bytes = plain.as_bytes();
+        let mut framed = Vec::with_capacity(5 + raw_bytes.len().min(65_536) + 32);
+        framed.extend_from_slice(&[0, 0, 0, 0, 0]);
+        let wire_dir = if raw_bytes.len() >= COMPRESS_MIN_BYTES {
+            let compressed_ok = {
+                let mut enc = flate2::write::DeflateEncoder::new(
+                    &mut framed,
+                    flate2::Compression::fast(),
+                );
+                enc.write_all(raw_bytes).is_ok() && enc.finish().is_ok()
+            };
+            if compressed_ok && framed.len() - 5 < raw_bytes.len() {
+                self.send_dir | DIR_COMPRESSED_FLAG
+            } else {
+                framed.truncate(5);
+                framed.extend_from_slice(raw_bytes);
+                self.send_dir
+            }
+        } else {
+            framed.extend_from_slice(raw_bytes);
+            self.send_dir
+        };
+        framed[0] = wire_dir;
+        framed[1..5].copy_from_slice(&ctr.to_le_bytes());
+        apply_keystream(&self.enc, ctr, &Self::nonce(wire_dir, ctr), &mut framed[5..]);
+        let tag = hmac_sha256(&self.mac, &framed);
         framed.extend_from_slice(&tag);
         b64_encode(&framed)
     }
 
     /// 解密并验签；计数器必须比上一帧大
     pub fn open(&mut self, frame: &str) -> Option<String> {
-        let raw = b64_decode(frame)?;
+        let mut raw = b64_decode(frame)?;
         if raw.len() < 5 + 32 {
             return None;
         }
-        let dir = raw[0];
+        let wire_dir = raw[0];
+        let compressed = (wire_dir & DIR_COMPRESSED_FLAG) != 0;
+        let dir = wire_dir & !DIR_COMPRESSED_FLAG;
         if dir != self.recv_dir {
             return None; // 方向的密钥相同，方向位是防重放/防回环的关键
         }
         let ctr = u32::from_le_bytes([raw[1], raw[2], raw[3], raw[4]]);
-        let body_len = raw.len() - 5 - 32;
-        let body = raw[5..5 + body_len].to_vec();
-        let tag = &raw[5 + body_len..];
-        let mut m = Vec::with_capacity(raw.len() - 32);
-        m.extend_from_slice(&raw[..5]);
-        m.extend_from_slice(&body);
-        let expect = hmac_sha256(&self.mac, &m);
+        let mac_offset = raw.len() - 32;
+        let expect = hmac_sha256(&self.mac, &raw[..mac_offset]);
         // 定长比较，避免时序泄露
+        let tag = &raw[mac_offset..];
         let mut diff = 0u8;
         for i in 0..32 {
             diff |= expect[i] ^ tag[i];
@@ -378,9 +368,21 @@ impl Session {
             return None; // 重放或乱序
         }
         self.recv_ctr = ctr;
-        let mut buf = body;
-        apply_keystream(&self.enc, ctr, &Self::nonce(dir, ctr), &mut buf);
-        String::from_utf8(buf).ok()
+        apply_keystream(&self.enc, ctr, &Self::nonce(wire_dir, ctr), &mut raw[5..mac_offset]);
+        if compressed {
+            let mut dec = flate2::read::DeflateDecoder::new(&raw[5..mac_offset])
+                .take(MAX_DECOMPRESSED_BYTES + 1);
+            let mut out = Vec::with_capacity((mac_offset - 5).saturating_mul(4).min(4 * 1024 * 1024));
+            dec.read_to_end(&mut out).ok()?;
+            if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+                return None;
+            }
+            String::from_utf8(out).ok()
+        } else {
+            raw.truncate(mac_offset);
+            raw.drain(..5);
+            String::from_utf8(raw).ok()
+        }
     }
 }
 
@@ -515,5 +517,45 @@ mod tests {
         assert_eq!(b64_encode(b"Man"), "TWFu");
         assert_eq!(b64_encode(b"Ma"), "TWE=");
         assert_eq!(b64_encode(b"M"), "TQ==");
+    }
+
+    #[test]
+    fn compressed_large_frames_shrink_round_trip_and_reject_tamper() {
+        let room = RoomKey::derive_with_iters("perf-room", b"room-salt", 10);
+        let mut host = Session::host_side(&room, b"conn-salt");
+        let mut client = Session::client_side(&room, b"conn-salt");
+
+        let mut big = String::from("{\"t\":\"Ops\",\"ops\":[");
+        for i in 0..512 {
+            if i > 0 {
+                big.push(',');
+            }
+            big.push_str(&format!(
+                "{{\"sheet\":0,\"row\":{i},\"col\":2,\"value\":{{\"Number\":12345.67}},\"formula\":null,\"ts\":{},\"site\":1}}",
+                100 + i
+            ));
+        }
+        big.push_str("]}");
+        assert!(big.len() > 40_000);
+
+        let sealed = host.seal(&big);
+        assert!(
+            sealed.len() < big.len() / 3,
+            "repetitive JSON frame should compress >3x even after base64: {} vs {}",
+            sealed.len(),
+            big.len()
+        );
+        let raw = b64_decode(&sealed).expect("valid base64");
+        assert_ne!(raw[0] & DIR_COMPRESSED_FLAG, 0, "compressed flag must be set");
+
+        let mut tampered = sealed.clone().into_bytes();
+        let mid = tampered.len() / 2;
+        tampered[mid] = if tampered[mid] == b'X' { b'Y' } else { b'X' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        assert!(client.open(&tampered).is_none(), "tampered compressed frame must fail MAC");
+
+        let opened = client.open(&sealed).expect("untampered compressed frame opens");
+        assert_eq!(opened, big);
+        assert!(client.open(&sealed).is_none(), "replay of compressed frame must fail");
     }
 }

@@ -438,6 +438,16 @@ impl Operation {
     }
 }
 
+pub(crate) const ASYNC_REORDER_CELLS: u64 = 20_000;
+
+type PrebuiltSortItem = (
+    u32,
+    u32,
+    sheetcore::sync::ValueWire,
+    Option<std::sync::Arc<str>>,
+    Option<sheetcore::style::CellStyle>,
+);
+
 pub(crate) struct Pending {
     sheet: usize,
     target: super::sheet_edit_target::SheetEditTarget,
@@ -452,6 +462,7 @@ enum PreparedChanges {
         order: data_tools::CompactSort,
         total: usize,
         sample: Vec<sheetcore::undo::CellDelta>,
+        collab: Option<Vec<PrebuiltSortItem>>,
     },
 }
 
@@ -573,9 +584,18 @@ impl SheetApp {
         let blank = sheetcore::Cell::default();
         let mut ops = Vec::new();
         let mut styles = Vec::new();
+        let mut style_cache: std::collections::HashMap<u16, sheetcore::style::CellStyle> =
+            std::collections::HashMap::new();
         for (r,c,style) in cells {
             ops.push(peer.local_set_shared(sheet, r, c, sh.get(r,c).unwrap_or(&blank)));
-            if style { styles.push((r,c,self.wb.styles.get(sh.style_of(r,c)).clone())); }
+            if style {
+                let sid = sh.style_of(r, c);
+                let st = style_cache
+                    .entry(sid)
+                    .or_insert_with(|| self.wb.styles.get(sid).clone())
+                    .clone();
+                styles.push((r, c, st));
+            }
         }
         let Some(first) = ops.first() else { return None };
         let plan = sheetcore::sync::SortPermutation { structural_revision: net.structure_seen(), sheet, name: sh.name.clone(), region, horizontal,
@@ -586,9 +606,129 @@ impl SheetApp {
             Some(first_ts)
         } else {
             for chunk in ops.chunks(sheetcore::sync::LIVE_OP_BATCH) { net.broadcast_ops(chunk.iter().map(|o| (**o).clone()).collect()); }
-            for chunk in styles.chunks(sheetcore::sync::LIVE_OP_BATCH) { net.broadcast_style(sheet,chunk.to_vec()); }
+            for chunk in styles.chunks(sheetcore::sync::STYLE_PALETTE_CHUNK_ITEMS) { net.broadcast_style(sheet,chunk.to_vec()); }
             None
         }
+    }
+
+    fn broadcast_prebuilt_permutation(
+        &mut self,
+        sheet: usize,
+        (region, horizontal, order): data_tools::LinePermutation,
+        items: Vec<PrebuiltSortItem>,
+    ) -> Option<u64> {
+        let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) else {
+            return None;
+        };
+        if items.is_empty() {
+            return None;
+        }
+        let sh_name = self.wb.sheet(sheet).name.clone();
+        let site = peer.site;
+        let mut ops = Vec::with_capacity(items.len());
+        let mut styles = Vec::new();
+        for (row, col, value, formula, style) in items {
+            peer.clock = peer.clock.saturating_add(1);
+            let op = std::sync::Arc::new(sheetcore::sync::Op {
+                sheet,
+                row,
+                col,
+                value,
+                formula,
+                ts: peer.clock,
+                site,
+            });
+            peer.cells.insert((sheet, row, col), op.clone());
+            ops.push(op);
+            if let Some(st) = style {
+                styles.push((row, col, st));
+            }
+        }
+        let first_ts = ops[0].ts;
+        let plan = sheetcore::sync::SortPermutation {
+            structural_revision: net.structure_seen(),
+            sheet,
+            name: sh_name,
+            region,
+            horizontal,
+            order,
+            first_ts,
+            site,
+            digest: [0; 32],
+        };
+        if plan.valid() {
+            net.broadcast_sort(crate::net_sort::SortBatch::new(plan, ops, styles));
+            Some(first_ts)
+        } else {
+            for chunk in ops.chunks(sheetcore::sync::LIVE_OP_BATCH) {
+                net.broadcast_ops(chunk.iter().map(|o| (**o).clone()).collect());
+            }
+            for chunk in styles.chunks(sheetcore::sync::STYLE_PALETTE_CHUNK_ITEMS) {
+                net.broadcast_style(sheet, chunk.to_vec());
+            }
+            None
+        }
+    }
+
+    fn rect_has_locked_cell(&self, sheet: usize, (r1, c1, r2, c2): Rect) -> bool {
+        let rows_total = u64::from(r2 - r1 + 1);
+        let cols_total = u64::from(c2 - c1 + 1);
+        let area = rows_total * cols_total;
+        if area <= 4_096 {
+            return (r1..=r2).any(|r| (c1..=c2).any(|c| self.cell_locked_on(sheet, r, c)));
+        }
+        let sh = self.wb.sheet(sheet);
+        let styles = &self.wb.styles;
+        let mut explicit_in_rect = 0u64;
+        for (pos, &id) in sh.styles.iter() {
+            if (r1..=r2).contains(&pos.row) && (c1..=c2).contains(&pos.col) {
+                if styles.get(id).locked {
+                    return true;
+                }
+                explicit_in_rect += 1;
+            }
+        }
+        if explicit_in_rect >= area {
+            return false;
+        }
+        let mut unlocked_rows = 0u64;
+        let mut locked_rows = 0u64;
+        for (&r, &id) in &sh.row_styles {
+            if (r1..=r2).contains(&r) {
+                if styles.get(id).locked {
+                    locked_rows += 1;
+                    if (c1..=c2).any(|c| sh.styles.get(&sheetcore::model::CellRef::new(r, c)).is_none()) {
+                        return true;
+                    }
+                } else {
+                    unlocked_rows += 1;
+                }
+            }
+        }
+        let plain_rows = rows_total.saturating_sub(unlocked_rows + locked_rows);
+        if plain_rows == 0 {
+            return false;
+        }
+        let default_locked = styles.get(0).locked;
+        for c in c1..=c2 {
+            let col_locked = sh
+                .col_styles
+                .get(&c)
+                .map_or(default_locked, |&id| styles.get(id).locked);
+            if col_locked {
+                if explicit_in_rect < plain_rows {
+                    return true;
+                }
+                let has_plain_unoverridden = (r1..=r2).any(|r| {
+                    !sh.row_styles.contains_key(&r)
+                        && sh.styles.get(&sheetcore::model::CellRef::new(r, c)).is_none()
+                });
+                if has_plain_unoverridden {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn preflight_reorder(&mut self, sheet: usize, rect: Rect, operation: &Operation) -> bool {
@@ -601,7 +741,7 @@ impl SheetApp {
         }
         if op.is_none()
             && self.wb.sheet(sheet).protection.is_some()
-            && (r1..=r2).any(|r| (c1..=c2).any(|c| self.cell_locked_on(sheet, r, c)))
+            && self.rect_has_locked_cell(sheet, rect)
         {
             self.status = format!("工作表受保护：目标区域含锁定单元格，不能{label}");
             return false;
@@ -637,12 +777,16 @@ impl SheetApp {
         }
         let sheet = self.wb.sheet(self.sheet_idx);
         let area = u64::from(rect.2 - rect.0 + 1) * u64::from(rect.3 - rect.1 + 1);
-        if area <= 100_000 {
+        if area <= ASYNC_REORDER_CELLS {
             let changes = operation.plan(sheet, self.sheet_idx, rect);
             self.finish_reorder(&operation, changes, None, (self.sheet_idx,self.sel.0,self.sel.1));
             return;
         }
         let snapshot = sheet.reorder_snapshot();
+        let collab_palette = self
+            .net
+            .is_some()
+            .then(|| std::sync::Arc::new(self.wb.styles.clone()));
         let index = self.sheet_idx;
         self.status = format!("正在计算{}…", operation.label());
         let (tx, rx) = mpsc::channel();
@@ -678,13 +822,36 @@ impl SheetApp {
                 if let Some(order) = sort {
                         let mut total = 0;
                         let mut sample = Vec::new();
+                        let mut collab = collab_palette.as_ref().map(|_| Vec::new());
+                        let mut style_cache: std::collections::HashMap<u16, sheetcore::style::CellStyle> =
+                            std::collections::HashMap::new();
                         for d in order.deltas() {
                             if d.before != d.after { prepared.set(d.row, d.col, d.after.clone()); }
                             if d.before_style != d.after_style { prepared.set_style(d.row, d.col, d.after_style); }
+                            if let (Some(out), Some(pal)) = (collab.as_mut(), collab_palette.as_ref()) {
+                                let effective_st = if d.before_style != d.after_style {
+                                    let sid = prepared.style_of(d.row, d.col);
+                                    Some(
+                                        style_cache
+                                            .entry(sid)
+                                            .or_insert_with(|| pal.get(sid).clone())
+                                            .clone(),
+                                    )
+                                } else {
+                                    None
+                                };
+                                out.push((
+                                    d.row,
+                                    d.col,
+                                    (&d.after.value).into(),
+                                    d.after.formula.clone(),
+                                    effective_st,
+                                ));
+                            }
                             if total < sheetcore::revision::MAX_CELLS { sample.push(d); }
                             total += 1;
                         }
-                        return Ok((snapshot, prepared, PreparedChanges::Permutation { order, total, sample }));
+                        return Ok((snapshot, prepared, PreparedChanges::Permutation { order, total, sample, collab }));
                 }
                 let changes = worker_op.plan(&snapshot, index, rect)?;
                 changes.apply(&mut prepared);
@@ -742,7 +909,7 @@ impl SheetApp {
                 PreparedChanges::Cells(changes) => {
                     self.finish_reorder(&pending.operation, Ok(changes), Some(&mut prepared), focus);
                 }
-                PreparedChanges::Permutation { order, total, sample } => {
+                PreparedChanges::Permutation { order, total, sample, collab } => {
                     let operation = &pending.operation;
                     self.status = operation.completed(order.moved_lines());
                     if total == 0 { return; }
@@ -750,10 +917,31 @@ impl SheetApp {
                     self.wb.dirty = true;
                     self.doc_gen = self.doc_gen.wrapping_add(1);
                     self.recalc_all_and_deps_adaptive();
-                    let ts = self.net.is_some().then(|| {
-                        self.broadcast_line_permutation(pending.sheet, order.permutation(),
-                            order.deltas().map(|d| (d.row,d.col,d.before_style != d.after_style)))
-                    }).flatten();
+                    let ts = if self.net.is_some() {
+                        if whole_snapshot_matches {
+                            if let Some(prebuilt) = collab {
+                                self.broadcast_prebuilt_permutation(
+                                    pending.sheet,
+                                    order.permutation(),
+                                    prebuilt,
+                                )
+                            } else {
+                                self.broadcast_line_permutation(
+                                    pending.sheet,
+                                    order.permutation(),
+                                    order.deltas().map(|d| (d.row, d.col, d.before_style != d.after_style)),
+                                )
+                            }
+                        } else {
+                            self.broadcast_line_permutation(
+                                pending.sheet,
+                                order.permutation(),
+                                order.deltas().map(|d| (d.row, d.col, d.before_style != d.after_style)),
+                            )
+                        }
+                    } else {
+                        None
+                    };
                     self.record_revision_sample(operation.label(), &sample, total);
                     self.undo.push_compact_sort(operation.label(), order, focus);
                     if let Some(ts) = ts { self.undo.track_sort(ts,None); }
