@@ -493,8 +493,8 @@ fn ai_config_defaults_and_roundtrip() {
     assert_eq!(def.base_url, "https://deepseek.hollantex.net/v1");
     assert_eq!(def.model, "deepseek-v4.1-flash");
     assert!(def.native_tools);
+    assert!(!def.allow_unframed_text);
     assert!(def.api_key.is_empty());
-    assert!(!def.data_consent, "默认未确认数据外发");
 
     let dir = crate::test_env::scratch("ai-cfg-test");
     let builtin_file = dir.join("builtin_ai.ini");
@@ -509,7 +509,7 @@ fn ai_config_defaults_and_roundtrip() {
         api_key: "secret-key".into(),
         model: "deepseek-v4".into(),
         native_tools: false,
-        data_consent: true,
+        allow_unframed_text: true,
     };
     custom.save_to(&file);
     let loaded = ai_agent::AiConfig::load_from(&file);
@@ -600,7 +600,6 @@ fn ai_micro_harness_executes_multi_turn_sse_tool_loop_and_supports_undo() {
     }
     app.ai.cfg.base_url = format!("http://127.0.0.1:{port}/v1");
     app.ai.cfg.api_key = "test-key".into();
-    app.ai.cfg.data_consent = true;
     app.start_ai_prompt("把 C1:C3 设为 A*B".into());
 
     let start = std::time::Instant::now();
@@ -851,7 +850,7 @@ fn menu_enrichment_fill_goto_cf_table_and_styles() {
 }
 
 #[test]
-fn ai_requires_own_key_https_and_consent_before_sending() {
+fn ai_requires_own_key_and_secure_remote_endpoint_before_sending() {
     let env = crate::test_env::TestEnv::new("ai_key_consent");
 
     // 旧版本写下的「@builtin」占位符不再换成任何内置密钥
@@ -860,7 +859,6 @@ fn ai_requires_own_key_https_and_consent_before_sending() {
     std::fs::write(&ini, "base_url=https://example.invalid/v1\napi_key=@builtin\n").unwrap();
     let legacy = ai_agent::AiConfig::load_from(&ini);
     assert!(!legacy.has_api_key(), "旧占位符必须读成「未填写」");
-    assert!(!legacy.data_consent);
 
     let ctx = egui::Context::default();
     let mut app = wps_app(&ctx);
@@ -872,18 +870,9 @@ fn ai_requires_own_key_https_and_consent_before_sending() {
     app.start_ai_prompt("hi".into());
     assert!(!app.ai.busy && app.ai.settings_open && app.ai.messages.is_empty());
 
-    // 有密钥但未确认外发：提问被暂存，不发请求
+    // 非本机地址的明文 http 必须被拒绝（密钥与表格内容不能裸传）
     app.ai.settings_open = false;
     app.ai.cfg.api_key = "test-key".into();
-    app.start_ai_prompt("hi".into());
-    assert!(!app.ai.busy && app.ai.messages.is_empty());
-    assert_eq!(app.ai.pending_consent_prompt.as_deref(), Some("hi"));
-    wps_frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
-    assert!(!app.ai.busy, "确认卡片画出来时也不能自动发送");
-
-    // 非本机地址的明文 http 必须被拒绝（密钥与表格内容不能裸传）
-    app.ai.pending_consent_prompt = None;
-    app.ai.cfg.data_consent = true;
     app.ai.cfg.base_url = "http://10.0.0.5:8080/v1".into();
     app.start_ai_prompt("hi".into());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -933,7 +922,6 @@ fn ai_aborts_tool_calls_if_user_switches_tab_mid_round() {
     let mut app = wps_app(&ctx);
     app.ai.cfg.base_url = format!("http://127.0.0.1:{port}/v1");
     app.ai.cfg.api_key = "test".into();
-    app.ai.cfg.data_consent = true;
     app.start_ai_prompt("把 A1 改成 999".into());
 
     // 在模型推理尚未返回工具执行阶段前切换到新标签页
@@ -963,7 +951,6 @@ fn ai_composer_ime_commit_enter_does_not_prematurely_send() {
     app.ai.open = true;
     app.ai.cfg.base_url = "http://127.0.0.1:9/v1".into();
     app.ai.cfg.api_key = "test-key".into();
-    app.ai.cfg.data_consent = true;
     app.ai.draft = "请帮我用 ".into();
 
     // 第 0 帧渲染出输入框并赋予焦点

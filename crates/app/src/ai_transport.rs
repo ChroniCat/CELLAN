@@ -6,9 +6,11 @@ use eframe::egui;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BUFFER_BYTES: usize = 8192;
+// A few gateways leave their text-only final data line without an SSE separator or EOF.
+const UNFRAMED_TERMINAL_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub(super) struct RequestCancel {
@@ -49,7 +51,8 @@ struct Attempt {
     headers_ms: Option<u128>,
     first_byte_ms: Option<u128>,
     bytes: usize,
-    done: bool,
+    saw_done: bool,
+    finish_reason: Option<&'static str>,
     status: Option<u32>,
     stage: &'static str,
     #[cfg(windows)]
@@ -68,7 +71,8 @@ impl Attempt {
             headers_ms: None,
             first_byte_ms: None,
             bytes: 0,
-            done: false,
+            saw_done: false,
+            finish_reason: None,
             status: None,
             stage: "connect",
             #[cfg(windows)]
@@ -80,15 +84,26 @@ impl Attempt {
         self.started.elapsed().as_millis()
     }
 
+    fn record_termination(&mut self, stream: &StreamAssembler) {
+        self.saw_done = stream.saw_done();
+        self.finish_reason = stream.finish_reason().map(|reason| match reason {
+            "stop" => "stop",
+            "tool_calls" => "tool_calls",
+            "length" => "length",
+            _ => "other",
+        });
+    }
+
     fn log(&self, route: &str, end: &str) {
         let line = format!(
-            "start_unix_ms={} route={route} sent_ms={:?} headers_ms={:?} first_byte_ms={:?} bytes={} done={} http={:?} end={end} stage={} elapsed_ms={}\n",
+            "start_unix_ms={} route={route} sent_ms={:?} headers_ms={:?} first_byte_ms={:?} bytes={} done={} finish_reason={} http={:?} end={end} stage={} elapsed_ms={}\n",
             self.started_unix_ms,
             self.sent_ms,
             self.headers_ms,
             self.first_byte_ms,
             self.bytes,
-            self.done,
+            self.saw_done,
+            self.finish_reason.unwrap_or("-"),
             self.status,
             self.stage,
             self.elapsed()
@@ -117,10 +132,11 @@ impl Attempt {
 
 fn receive_body(
     status: u32,
-    mut read: impl FnMut(&mut [u8]) -> Result<usize, String>,
+    mut read: impl FnMut(&mut [u8], bool) -> Result<usize, String>,
     trace: &mut Attempt,
     tx: &mpsc::Sender<StreamMsg>,
     wake: Option<egui::Context>,
+    allow_unframed_text: bool,
 ) -> Result<(), String> {
     trace.status = Some(status);
     trace.stage = "body";
@@ -132,17 +148,13 @@ fn receive_body(
         return Err(format_http_status_error(status, ""));
     }
     loop {
-        let n = match read(&mut buf) {
+        let unframed_terminal = allow_unframed_text && success && assembler.has_unframed_terminal();
+        let n = match read(&mut buf, unframed_terminal) {
             Ok(n) => n,
             Err(_) if !success => break,
             Err(e) => return Err(e),
         };
         if n == 0 {
-            if success {
-                // A clean EOF also terminates an unterminated last "data:" line.
-                trace.stage = "sse";
-                trace.done = assembler.feed_bytes(b"\n", tx)?;
-            }
             break;
         }
         if trace.first_byte_ms.is_none() {
@@ -151,8 +163,9 @@ fn receive_body(
         trace.bytes += n;
         if success {
             trace.stage = "sse";
-            if assembler.feed_bytes(&buf[..n], tx)? {
-                trace.done = true;
+            let complete = assembler.feed_bytes(&buf[..n], tx);
+            trace.record_termination(&assembler);
+            if complete? {
                 break;
             }
             trace.stage = "body";
@@ -165,7 +178,9 @@ fn receive_body(
     }
     if success {
         trace.stage = "sse";
-        assembler.finish(tx)
+        let result = assembler.finish(tx);
+        trace.record_termination(&assembler);
+        result
     } else {
         Err(format_http_status_error(
             status,
@@ -181,6 +196,7 @@ pub(super) fn stream_post(
     cancel: &RequestCancel,
     tx: &mpsc::Sender<StreamMsg>,
     wake: Option<egui::Context>,
+    allow_unframed_text: bool,
 ) -> Result<(), String> {
     #[cfg(windows)]
     let routes = ["direct", "auto_proxy"];
@@ -198,21 +214,24 @@ pub(super) fn stream_post(
             wake.clone(),
             route,
             &mut trace,
+            allow_unframed_text,
         );
         cancel.interrupt.lock().unwrap().take();
         let was_cancelled = cancel.check().is_err();
-        let end = match (&result, was_cancelled, trace.done, trace.stage) {
+        let end = match (&result, was_cancelled, trace.saw_done, trace.stage) {
             (_, true, _, _) => "cancelled",
             (Ok(()), _, true, _) => "done",
-            (Ok(()), _, false, _) => "eof_after_finish_reason",
-            (Err(_), _, _, _) if trace.status.is_some_and(|s| !(200..300).contains(&s)) => "http_error",
+            (Ok(()), _, false, _) => "finish_reason",
+            (Err(_), _, _, _) if trace.status.is_some_and(|s| !(200..300).contains(&s)) => {
+                "http_error"
+            }
             (Err(_), _, _, "sse") => "protocol_error",
             (Err(_), _, _, _) => "transport_error",
         };
         trace.log(route, end);
         cancel.check()?;
-        // WinHttpConnect doesn't actually open a socket until SendRequest. Only
-        // DNS/connect failures there can be replayed without duplicating a POST.
+        // WinHttpConnect doesn't actually open a socket until SendRequest. Only failures
+        // before a TCP connection existed can be replayed without duplicating a POST.
         #[cfg(windows)]
         if route == "direct" && trace.connect_failed {
             continue;
@@ -227,6 +246,7 @@ mod platform {
     use super::*;
     use core::ffi::c_void;
     use std::ptr::{null, null_mut};
+    use std::sync::{Arc, atomic::AtomicU32};
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Networking::WinHttp::*;
 
@@ -272,6 +292,23 @@ mod platform {
         tx: mpsc::Sender<Event>,
         body: Vec<u8>,
         buffer: Vec<u8>,
+        send_notifications: Arc<AtomicU32>,
+    }
+
+    const PRE_CONNECT: u32 =
+        WINHTTP_CALLBACK_STATUS_RESOLVING_NAME | WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER;
+    const CONNECTED_OR_SENDING: u32 = WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER
+        | WINHTTP_CALLBACK_STATUS_SENDING_REQUEST
+        | WINHTTP_CALLBACK_STATUS_REQUEST_SENT;
+
+    pub(super) fn replayable_send_failure(code: u32, observed: u32) -> bool {
+        // Pooled sockets can begin sending without a CONNECTED_TO_SERVER callback.
+        // A generic timeout needs positive evidence that the request was still connecting.
+        observed & CONNECTED_OR_SENDING == 0
+            && (matches!(
+                code,
+                ERROR_WINHTTP_NAME_NOT_RESOLVED | ERROR_WINHTTP_CANNOT_CONNECT
+            ) || (code == ERROR_WINHTTP_TIMEOUT && observed & PRE_CONNECT != 0))
     }
 
     unsafe extern "system" fn callback(
@@ -300,7 +337,16 @@ mod platform {
                 status,
                 size: unsafe { *info.cast::<u32>() },
             },
-            _ => Event::Complete { status, size },
+            WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE
+            | WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE
+            | WINHTTP_CALLBACK_STATUS_READ_COMPLETE => Event::Complete { status, size },
+            status if status & (PRE_CONNECT | CONNECTED_OR_SENDING) != 0 => {
+                unsafe { &(*ctx).send_notifications }.fetch_or(status, Ordering::Release);
+                return;
+            }
+            // Informational notifications (WinHTTP may deliver the whole connect group)
+            // complete no API call; forwarding them would fail the pending wait.
+            _ => return,
         };
         let _ = unsafe { &(*ctx).tx }.send(event);
     }
@@ -317,6 +363,7 @@ mod platform {
         wake: Option<egui::Context>,
         route: &str,
         trace: &mut Attempt,
+        allow_unframed_text: bool,
     ) -> Result<(), String> {
         let access = if route == "direct" {
             WINHTTP_ACCESS_TYPE_NO_PROXY
@@ -364,10 +411,12 @@ mod platform {
                 let _ = events.send(Event::Cancel);
             }
         })?;
+        let send_notifications = Arc::new(AtomicU32::new(0));
         let mut ctx = Box::new(Context {
             tx: events,
             body: body.to_vec(),
             buffer: vec![0; BUFFER_BYTES],
+            send_notifications: send_notifications.clone(),
         });
         let body_ptr = ctx.body.as_ptr();
         let read_ptr = ctx.buffer.as_mut_ptr();
@@ -387,7 +436,9 @@ mod platform {
             }
             return Err(err);
         }
-        let notifications = WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE
+        let notifications = PRE_CONNECT
+            | CONNECTED_OR_SENDING
+            | WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE
             | WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE
             | WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE
             | WINHTTP_CALLBACK_STATUS_READ_COMPLETE
@@ -402,17 +453,29 @@ mod platform {
             return Err(err);
         }
         // The final callback now owns the context and both I/O buffers.
-        let wait = |ok: i32, expected: u32| -> Result<u32, u32> {
+        let wait_for = |ok: i32, expected: u32, unframed_terminal: bool| -> Result<u32, u32> {
             if ok == 0 {
                 return Err(unsafe { GetLastError() });
             }
-            match rx.recv() {
-                Ok(Event::Complete { status, size }) if status == expected => Ok(size),
-                Ok(Event::Error(code)) => Err(code),
-                Ok(Event::Cancel) => Err(12017),
+            let event = if unframed_terminal {
+                // Only used for QueryDataAvailable after a text-only terminal line.
+                // On idle, receive_body finishes and drops the outstanding request.
+                match rx.recv_timeout(UNFRAMED_TERMINAL_GRACE) {
+                    Ok(event) => event,
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Ok(0),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(12004),
+                }
+            } else {
+                rx.recv().map_err(|_| 12004u32)?
+            };
+            match event {
+                Event::Complete { status, size } if status == expected => Ok(size),
+                Event::Error(code) => Err(code),
+                Event::Cancel => Err(12017),
                 _ => Err(12004),
             }
         };
+        let wait = |ok, expected| wait_for(ok, expected, false);
         let mut headers =
             "Content-Type: application/json\r\nAccept: text/event-stream\r\n".to_owned();
         if !api_key.trim().is_empty() {
@@ -435,10 +498,8 @@ mod platform {
             )
         };
         if let Err(code) = wait(send, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE) {
-            trace.connect_failed = matches!(
-                code,
-                ERROR_WINHTTP_NAME_NOT_RESOLVED | ERROR_WINHTTP_CANNOT_CONNECT
-            );
+            trace.connect_failed =
+                replayable_send_failure(code, send_notifications.load(Ordering::Acquire));
             return Err(win_error("发送请求失败", code));
         }
         cancel.check()?;
@@ -468,11 +529,12 @@ mod platform {
         }
         receive_body(
             status,
-            |dst| {
+            |dst, unframed_terminal| {
                 cancel.check()?;
-                let available = wait(
+                let available = wait_for(
                     unsafe { WinHttpQueryDataAvailable(req.0, null_mut()) },
                     WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE,
+                    unframed_terminal,
                 )
                 .map_err(|e| win_error("等待流式响应中断", e))?;
                 if available == 0 {
@@ -492,6 +554,7 @@ mod platform {
             trace,
             tx,
             wake,
+            allow_unframed_text,
         )
     }
 }
@@ -499,10 +562,41 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::*;
-    use std::io::{BufRead, BufReader, Read};
+    use std::io::{self, BufRead, BufReader, Read};
     use std::net::{Shutdown, TcpStream};
     use std::sync::Arc;
     use std::time::Duration;
+
+    struct CancellableRead<'a> {
+        socket: &'a TcpStream,
+        cancel: &'a RequestCancel,
+        timeout: Duration,
+    }
+
+    impl Read for CancellableRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let started = Instant::now();
+            loop {
+                if self.cancel.stopped.load(Ordering::Acquire) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "已停止生成",
+                    ));
+                }
+                match self.socket.read(buf) {
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) && started.elapsed() < self.timeout =>
+                    {
+                        continue;
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
 
     pub(super) fn post(
         ep: &ParsedUrl,
@@ -513,6 +607,7 @@ mod platform {
         wake: Option<egui::Context>,
         _route: &str,
         trace: &mut Attempt,
+        allow_unframed_text: bool,
     ) -> Result<(), String> {
         if ep.https {
             return Err("当前非 Windows 测试构建仅支持明文 HTTP 回环测试".into());
@@ -522,7 +617,7 @@ mod platform {
             .map_err(|e| format!("连接模型服务失败：{e}"))?;
         let mut stream = socket.as_ref();
         stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(Duration::from_millis(200)))
             .map_err(|e| e.to_string())?;
         let socket = socket.clone();
         cancel.register(move || {
@@ -549,7 +644,11 @@ mod platform {
             .and_then(|_| stream.write_all(body))
             .map_err(|e| format!("发送请求失败：{e}"))?;
         trace.stage = "headers";
-        let mut reader = BufReader::new(stream);
+        let mut reader = BufReader::new(CancellableRead {
+            socket: stream,
+            cancel,
+            timeout: Duration::from_secs(30),
+        });
         let mut line = String::new();
         reader
             .read_line(&mut line)
@@ -584,45 +683,68 @@ mod platform {
         }
         receive_body(
             status,
-            |buf| {
+            |buf, unframed_terminal| {
                 cancel.check()?;
-                if chunked && remaining == Some(0) {
-                    if need_delimiter {
-                        let mut delimiter = [0; 2];
-                        reader
-                            .read_exact(&mut delimiter)
-                            .map_err(|e| format!("HTTP 分块中断：{e}"))?;
-                        if &delimiter != b"\r\n" {
-                            return Err("无效 HTTP 分块结尾".into());
+                reader.get_mut().timeout = if unframed_terminal {
+                    UNFRAMED_TERMINAL_GRACE
+                } else {
+                    Duration::from_secs(30)
+                };
+                let mut read_body = || -> io::Result<usize> {
+                    if chunked && remaining == Some(0) {
+                        if need_delimiter {
+                            let mut delimiter = [0; 2];
+                            reader.read_exact(&mut delimiter)?;
+                            if &delimiter != b"\r\n" {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "无效 HTTP 分块结尾",
+                                ));
+                            }
                         }
+                        line.clear();
+                        reader.read_line(&mut line)?;
+                        let n =
+                            u64::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16)
+                                .map_err(|_| {
+                                    io::Error::new(io::ErrorKind::InvalidData, "HTTP 分块不完整")
+                                })?;
+                        remaining = Some(n);
+                        need_delimiter = true;
                     }
-                    line.clear();
-                    reader
-                        .read_line(&mut line)
-                        .map_err(|e| format!("读取 HTTP 分块失败：{e}"))?;
-                    let n = u64::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16)
-                        .map_err(|_| "HTTP 分块不完整")?;
-                    remaining = Some(n);
-                    need_delimiter = true;
-                }
-                let want = remaining.map_or(buf.len(), |n| n.min(buf.len() as u64) as usize);
-                if want == 0 {
-                    return Ok(0);
-                }
-                let n = reader
-                    .read(&mut buf[..want])
-                    .map_err(|e| format!("读取流式响应中断：{e}"))?;
-                if let Some(left) = &mut remaining {
-                    if n == 0 {
-                        return Err("HTTP 响应在正文传输完成前中断".into());
+                    let want = remaining.map_or(buf.len(), |n| n.min(buf.len() as u64) as usize);
+                    if want == 0 {
+                        return Ok(0);
                     }
-                    *left -= n as u64;
+                    let n = reader.read(&mut buf[..want])?;
+                    if let Some(left) = &mut remaining {
+                        if n == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "HTTP 响应在正文传输完成前中断",
+                            ));
+                        }
+                        *left -= n as u64;
+                    }
+                    Ok(n)
+                };
+                match read_body() {
+                    Err(e)
+                        if unframed_terminal
+                            && matches!(
+                                e.kind(),
+                                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                            ) =>
+                    {
+                        Ok(0)
+                    }
+                    result => result.map_err(|e| format!("读取流式响应中断：{e}")),
                 }
-                Ok(n)
             },
             trace,
             tx,
             wake,
+            allow_unframed_text,
         )
     }
 }
