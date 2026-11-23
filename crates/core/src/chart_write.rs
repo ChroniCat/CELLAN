@@ -593,39 +593,44 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
     // 我们自己的 load 也读不到（chart 部件没被任何 sheet 引用）。
     let existing_drawing = {
         let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
-        let mut sheet_xml = String::new();
-        if let Ok(mut f) = zip.by_name(&sheet_path) {
-            let _ = f.read_to_string(&mut sheet_xml);
-        }
-        let rid = sheet_xml
-            .split("<drawing r:id=\"")
-            .nth(1)
-            .and_then(|r| r.split('"').next())
-            .map(|s| s.to_string());
-        rid.and_then(|rid| {
-            let mut rels = String::new();
-            if let Ok(mut f) = zip.by_name(&sheet_rels_part) {
-                let _ = f.read_to_string(&mut rels);
-            }
-            rels.split("<Relationship ")
-                .find(|c| c.contains(&format!("Id=\"{rid}\"")))
-                .and_then(|c| c.split("Target=\"").nth(1))
-                .and_then(|c| c.split('"').next())
-                .map(|t| {
-                    if let Some(rest) = t.strip_prefix("../") {
-                        format!("xl/{rest}")
-                    } else if let Some(rest) = t.strip_prefix('/') {
-                        rest.to_string()
-                    } else {
-                        format!("xl/worksheets/{t}")
+        let mut rels = String::new();
+        if let Ok(mut f) = zip.by_name(&sheet_rels_part) { f.read_to_string(&mut rels)?; }
+        if rels.is_empty() { None } else {
+            let doc = roxmltree::Document::parse(&rels)?;
+            let targets: std::collections::HashMap<_,_> = doc.root_element().children()
+                .filter(|n| n.attribute("Type").is_some_and(|t| t.ends_with("/drawing")) && n.attribute("TargetMode") != Some("External"))
+                .filter_map(|n| Some((n.attribute("Id")?, n.attribute("Target")?))).collect();
+            if targets.is_empty() { None } else {
+                let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::new(zip.by_name(&sheet_path)?));
+                let mut buf = Vec::new();
+                let mut skip = Vec::new();
+                let mut root = false;
+                loop {
+                    buf.clear();
+                    match reader.read_event_into(&mut buf)? {
+                        quick_xml::events::Event::Start(e) if !root && e.local_name().as_ref() == "worksheet" => root = true,
+                        quick_xml::events::Event::Empty(e) | quick_xml::events::Event::Start(e) if root && e.local_name().as_ref() == "drawing" => {
+                            let id = e.attributes().flatten().find(|a| a.key.local_name().as_ref() == "id")
+                                .map(|a| a.value.into_owned()).ok_or_else(|| anyhow::anyhow!("绘图缺少关系标识"))?;
+                            let target = targets.get(id.as_str()).ok_or_else(|| anyhow::anyhow!("找不到工作表绘图关系"))?;
+                            break Some(crate::fixups::resolve_target(&sheet_rels_part,target));
+                        }
+                        quick_xml::events::Event::Start(e) if root => {
+                            skip.clear();
+                            reader.read_to_end_into(e.name(), &mut skip)?;
+                        }
+                        quick_xml::events::Event::Eof => break None,
+                        _ => {}
                     }
-                })
-        })
+                }
+            }
+        }
     };
     if let Some(dpart) = existing_drawing {
         let mut dxml = String::new();
         let mut drels = String::new();
-        let mut drels_part = String::new();
+        let drels_part;
+        let has_rels;
         {
             let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
             zip.by_name(&dpart)?.read_to_string(&mut dxml)?;
@@ -634,7 +639,11 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
                 None => String::new(),
             };
             if let Ok(mut f) = zip.by_name(&drels_part) {
-                let _ = f.read_to_string(&mut drels);
+                f.read_to_string(&mut drels)?;
+                has_rels = true;
+            } else {
+                drels = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>".into();
+                has_rels = false;
             }
         }
         let max_rel = drels
@@ -660,8 +669,9 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
             "</Relationships>",
             &format!("<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" Target=\"../charts/chart{chart_no}.xml\"/></Relationships>"),
         );
+        anyhow::ensure!(new_rels != drels, "无法向绘图关系清单追加图表");
         let chart_name = format!("chart{chart_no}.xml");
-        let additions = vec![(
+        let mut additions = vec![(
             format!("xl/charts/chart{chart_no}.xml"),
             chart_xml(ch).into_bytes(),
         )];
@@ -669,6 +679,7 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
         let drels_c = drels_part.clone();
         let new_drawing_c = new_drawing.into_bytes();
         let new_rels_c = new_rels.into_bytes();
+        if !has_rels { additions.push((drels_part.clone(), new_rels_c.clone())); }
         rewrite_with_additions_pub(path, additions, &[&dpart, &drels_part, "[Content_Types].xml"], move |name, buf| {
             // 已有条目不能靠 additions 覆盖（那里只追加新名字），必须在闭包里替换
             if name == dpart_c {
@@ -732,28 +743,7 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
         }
         if name == sheet_path2 {
             if let Ok(xml) = String::from_utf8(buf.clone()) {
-                let mut x = xml;
-                if !x.contains("<drawing ") {
-                    // 工作表根常常没有 xmlns:r（只有 drawing/超链接才用得上）。直接写 r:id
-                    // 会变成未绑定前缀，Excel 打开即报「不能取得 Workbooks 的 Open 属性」。
-                    // 跳过 <?xml ... ?> 声明：它的 '>' 也在，直接 find('>') 会把属性插进声明里
-                    let decl_end = x.find("?>").map(|i| i + 2).unwrap_or(0);
-                    if let Some(rel) = x[decl_end..].find('>') {
-                        let root_end = decl_end + rel;
-                        if !x[..root_end].contains("xmlns:r=") {
-                            let head = format!(
-                                "{} xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
-                                &x[..root_end]
-                            );
-                            x = format!("{head}{}", &x[root_end..]);
-                        }
-                    }
-                    let tag = format!("<drawing r:id=\"rId{next_rid}\"/>");
-                    if let Some(i) = x.find("</worksheet>") {
-                        x = format!("{}{}{}", &x[..i], tag, &x[i..]);
-                    }
-                }
-                return x.into_bytes();
+                return crate::textbox::insert_drawing_tag(&xml, &format!("rId{next_rid}")).into_bytes();
             }
             return buf;
         }

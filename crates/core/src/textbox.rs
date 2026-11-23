@@ -951,19 +951,66 @@ pub(crate) fn patch_sheet_drawing(queue: &mut Vec<(String, String)>, part: &str,
 
 /// 在 worksheet 里插入 `<drawing r:id>`（schema 顺序：legacyDrawing/tableParts/extLst 之前）
 pub(crate) fn insert_drawing_tag(xml: &str, rid: &str) -> String {
-    if xml.contains("<drawing ") || xml.contains("<drawing/>") {
-        return xml.to_string();
-    }
-    let tag = format!(
-        "<drawing xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"{rid}\"/>"
-    );
-    let mut pos = xml.find("</worksheet>").unwrap_or(xml.len());
-    for t in ["<legacyDrawing", "<tableParts", "<extLst"] {
-        if let Some(i) = xml.find(t) {
-            pos = pos.min(i);
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut root = None;
+    let mut insert = None;
+    loop {
+        let start = reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(Event::Start(e)) if root.is_none() && e.local_name().as_ref() == "worksheet" => {
+                root = Some(e.name().as_ref().to_owned());
+            }
+            Ok(Event::Start(e) | Event::Empty(e))
+                if root.is_some() && e.local_name().as_ref() == "drawing" =>
+            {
+                return xml.to_owned();
+            }
+            Ok(e @ (Event::Start(_) | Event::Empty(_))) if root.is_some() => {
+                let (tag, closed) = match e {
+                    Event::Start(e) => (e, false),
+                    Event::Empty(e) => (e, true),
+                    _ => unreachable!(),
+                };
+                if matches!(
+                    tag.local_name().as_ref(),
+                    "legacyDrawing"
+                        | "legacyDrawingHF"
+                        | "drawingHF"
+                        | "picture"
+                        | "oleObjects"
+                        | "controls"
+                        | "webPublishItems"
+                        | "tableParts"
+                        | "extLst"
+                ) {
+                    insert.get_or_insert(start);
+                }
+                if !closed && reader.read_to_end(tag.name()).is_err() {
+                    return xml.to_owned();
+                }
+            }
+            Ok(Event::End(e)) if root.as_deref() == Some(e.name().as_ref()) => {
+                let pos = insert.unwrap_or(start);
+                let prefix = root
+                    .as_deref()
+                    .and_then(|s| s.rsplit_once(':'))
+                    .map_or("", |(prefix, _)| prefix);
+                let name = if prefix.is_empty() {
+                    String::from("drawing")
+                } else {
+                    format!("{prefix}:drawing")
+                };
+                return format!(
+                    "{}<{name} xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"{rid}\"/>{}",
+                    &xml[..pos],
+                    &xml[pos..]
+                );
+            }
+            Ok(Event::Eof) | Err(_) => return xml.to_owned(),
+            _ => {}
         }
     }
-    format!("{}{}{}", &xml[..pos], tag, &xml[pos..])
 }
 
 // ---------------------------------------------------------------- 载入

@@ -35,6 +35,7 @@ mod wps_regression_tests;
 #[cfg(test)]
 mod test_env;
 mod net;
+mod net_sort;
 mod office_clipboard;
 mod recent;
 mod templates;
@@ -1698,7 +1699,7 @@ struct UpdateUiState {
 enum StructuralRecalc {
     Full,
     Local(Vec<sheetcore::formula::deps::CellKey>),
-    Background(usize, sheetcore::structural::Structural),
+    Background(usize, sheetcore::structural::Structural, bool),
 }
 
 struct SheetApp {
@@ -5601,7 +5602,7 @@ impl SheetApp {
         let host = self.save_host();
         self.status = Self::start_document_save(
             &mut self.wb, &mut self.tasks, self.load_diag.as_ref(), force_dialog, &other_paths,
-            host, self.deps_built.then(|| self.deps.clone()),
+            host, self.doc_gen, self.deps_built.then(|| self.deps.clone()),
         ).unwrap_or_else(|message| message);
     }
 
@@ -5654,6 +5655,7 @@ impl SheetApp {
         force_dialog: bool,
         other_paths: &[PathBuf],
         host: Option<(String, u64)>,
+        generation: u64,
         deps: Option<std::sync::Arc<sheetcore::formula::deps::Deps>>,
     ) -> Result<String, String> {
         if !force_dialog && wb.path.is_some() {
@@ -5704,7 +5706,7 @@ impl SheetApp {
         let original = !force_dialog && wb.path.as_ref() == Some(&path);
         let session = host.as_ref().map(|(session, _)| session.clone());
         let others = other_paths.to_vec();
-        tasks.start_save_checked(wb, path, deps, move |target| {
+        tasks.start_save_checked(wb, path, deps, Some(generation), move |target| {
             if others.iter().any(|p| single_instance::same_file_path(p, target)) {
                 return Some(format!("{} 已由其他标签页打开或正在保存，请选择其他目标", target.display()));
             }
@@ -5861,11 +5863,11 @@ impl SheetApp {
             }
             let other_paths = self.other_document_paths(index);
             let host = if active { self.save_host() } else { None };
-            let (wb, tasks, diagnostic, deps) = match &mut self.tabs[index] {
-                TabSlot::Active => (&mut self.wb, &mut self.tasks, self.load_diag.as_ref(), self.deps_built.then(|| self.deps.clone())),
-                TabSlot::Parked(doc) => (&mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref(), doc.deps_built.then(|| doc.deps.clone())),
+            let (wb, tasks, diagnostic, generation, deps) = match &mut self.tabs[index] {
+                TabSlot::Active => (&mut self.wb, &mut self.tasks, self.load_diag.as_ref(), self.doc_gen, self.deps_built.then(|| self.deps.clone())),
+                TabSlot::Parked(doc) => (&mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref(), doc.doc_gen, doc.deps_built.then(|| doc.deps.clone())),
             };
-            match Self::start_document_save(wb, tasks, diagnostic, false, &other_paths, host, deps)
+            match Self::start_document_save(wb, tasks, diagnostic, false, &other_paths, host, generation, deps)
             {
                 Ok(_) => {
                     if let Some(pending) = &mut tasks.saving {
@@ -6076,10 +6078,10 @@ impl SheetApp {
         let host = if idx == self.active_tab { self.save_host() } else { None };
         let result = match &mut self.tabs[idx] {
             TabSlot::Active => {
-                Self::start_document_save(&mut self.wb, &mut self.tasks, self.load_diag.as_ref(), choose_path, &paths, host, self.deps_built.then(|| self.deps.clone()))
+                Self::start_document_save(&mut self.wb, &mut self.tasks, self.load_diag.as_ref(), choose_path, &paths, host, self.doc_gen, self.deps_built.then(|| self.deps.clone()))
             }
             TabSlot::Parked(doc) => Self::start_document_save(
-                &mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref(), choose_path, &paths, host, doc.deps_built.then(|| doc.deps.clone())),
+                &mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref(), choose_path, &paths, host, doc.doc_gen, doc.deps_built.then(|| doc.deps.clone())),
         };
         match result {
             Ok(_) => {
@@ -8008,6 +8010,7 @@ impl SheetApp {
                             return;
                         }
                         self.tasks.needs_full = false;
+                        self.tasks.structural_recalc = None;
                         self.tasks.dirty_recalc_seeds.clear();
                         if let Some(d) = d {
                             self.deps = d.into();
@@ -8046,7 +8049,7 @@ impl SheetApp {
                 let seeds: Vec<_> = self.tasks.dirty_recalc_seeds.iter().copied().collect();
                 (self.deps.clone(), seeds)
             });
-            let structure = self.tasks.structural_recalc.take().filter(|(generation,..)| *generation == self.doc_gen);
+            let structure = self.tasks.structural_recalc.as_ref().filter(|s| s.generation == self.doc_gen).cloned();
             let uid = self.doc_uid;
             let epoch = self.wb_epoch;
             let doc_gen = self.doc_gen;
@@ -8063,8 +8066,8 @@ impl SheetApp {
                         return;
                     }
                     None
-                } else if let Some((_,sheet,op,old)) = structure {
-                    match old.recalc_structural(&mut wb2,sheet,&op,&cancel) {
+                } else if let Some(structure) = structure {
+                    match structure.apply(&mut wb2,&cancel) {
                         Some(index) => Some(Box::new(index)),
                         None if cancel.load(Ordering::Relaxed) => return,
                         None => {
@@ -10689,14 +10692,16 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     fn structural_updates(&self, sheet: usize, op: &sheetcore::structural::Structural) -> StructuralRecalc {
         if !self.deps_built || self.deps_pending || self.tasks.recalc_pending() || self.wb.calc_pending
-            || self.deps.is_empty() && self.wb.sheets.iter().any(|s| s.has_formulas())
-            || !self.deps.supports_structural(&self.wb) {
+            || !self.deps.can_reuse_calculated_sheets(&self.wb) {
             return StructuralRecalc::Full;
+        }
+        if !self.deps.supports_structural(&self.wb) {
+            return StructuralRecalc::Background(sheet,op.clone(),true);
         }
         match self.deps.structural_updates(&self.wb,sheet,op,2_000) {
             Some(keys) => StructuralRecalc::Local(keys),
             None if self.wb.calc_manual || self.manual_calc => StructuralRecalc::Full,
-            None => StructuralRecalc::Background(sheet,op.clone()),
+            None => StructuralRecalc::Background(sheet,op.clone(),false),
         }
     }
 
@@ -10704,9 +10709,17 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         let keys = match updates {
             StructuralRecalc::Local(keys) => keys,
             StructuralRecalc::Full => { self.recalc_all_and_deps_adaptive(); return; }
-            StructuralRecalc::Background(sheet, op) => {
+            StructuralRecalc::Background(sheet, op, complex) => {
+                if complex && self.wb.sheets.iter().map(|s| s.len()).sum::<usize>() <= 2_000 {
+                    if let Some(graph) = self.deps.recalc_structural_sheets(&mut self.wb,sheet,&false.into()) {
+                        self.deps = graph.into();
+                        return;
+                    }
+                }
                 self.request_silent_bg_recalc();
-                self.tasks.structural_recalc = Some((self.doc_gen,sheet,op,self.deps.clone()));
+                self.tasks.structural_recalc = Some(document_tasks::StructuralCalculation {
+                    generation:self.doc_gen, sheet, op, complex, graph:self.deps.clone(),
+                });
                 self.deps_built = false;
                 return;
             }
@@ -10907,17 +10920,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return false;
         }
         // 协作时：只回退仍然是我改成的样子的格子
-        let mut mine: std::collections::HashSet<(usize, u32, u32)> = std::collections::HashSet::new();
         let site = self.net.as_ref().map(|n| n.site);
-        if let Some(_site) = site {
-            if let Some(peer) = self.peer.as_ref() {
-                for (k, op) in peer.cells.iter() {
-                    if op.site == site.unwrap() {
-                        mine.insert(*k);
-                    }
-                }
-            }
-        }
+        let owner = self.peer.as_ref();
+        let permutation = site.and_then(|_| self.undo.next_sort_permutation(redo));
         let my_site = site.unwrap_or(0);
         let locks = &self.locks;
         let net_ref = self.net.as_ref();
@@ -10930,7 +10935,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     return false;
                 }
             }
-            site.is_none() || mine.contains(&(sheet, row, col))
+            site.is_none() || owner.and_then(|p| p.cells.get(&(sheet,row,col))).is_some_and(|op| op.site == my_site)
         };
         let applied = if redo {
             self.undo.redo_workbook(&mut self.wb, guard)
@@ -10975,9 +10980,19 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.invalid_gen = u64::MAX;
         self.tasks.last_edit = Some(std::time::Instant::now());
         // 协作广播
-        self.broadcast_cells(&applied.touched);
-        let changed_styles = if applied.structural { &applied.touched } else { &applied.style_changes };
-        self.broadcast_cell_styles(changed_styles);
+        if applied.skipped == 0 && let Some(order) = permutation {
+            let sheet = applied.focus.0;
+            let styles: std::collections::HashSet<_> = applied.style_changes.iter().copied().collect();
+            let mut keys = applied.touched.clone();
+            if order.1 { keys.sort_unstable_by_key(|&(_,r,c)| (c,r)); } else { keys.sort_unstable(); }
+            if let Some(ts) = self.broadcast_line_permutation(sheet,order,keys.iter().map(|k| (k.1,k.2,styles.contains(k)))) {
+                self.undo.track_sort(ts,Some(redo));
+            }
+        } else {
+            self.broadcast_cells(&applied.touched);
+            let changed_styles = if applied.structural { &applied.touched } else { &applied.style_changes };
+            self.broadcast_cell_styles(changed_styles);
+        }
         if let Some(net) = &self.net {
             // 合并结构也要同步；只发内容/样式会让对端留下旧的合并轮廓。
             for (sheet, rect, on) in applied.merge_changes.iter() {
@@ -31029,10 +31044,14 @@ let txn = self.txn_begin(&keys);
         }
         let Some(peer) = self.peer.as_ref() else { return };
         // ts = 1 是宿主播种的磁盘基准格，不算「我的编辑」
+        let sorts = self.net.as_ref().map(|n| n.sort_clock_ranges()).unwrap_or_default();
         let mine: Vec<sheetcore::sync::Op> = peer
             .cells
             .values()
-            .filter(|o| o.site == peer.site && o.ts > 1)
+            .filter(|o| o.site == peer.site && o.ts > 1 && {
+                let i = sorts.partition_point(|(first,_)| *first <= o.ts);
+                i == 0 || o.ts >= sorts[i-1].1
+            })
             .map(|op| op.as_ref().clone())
             .collect();
         if mine.is_empty() {
@@ -34207,6 +34226,34 @@ fn elide(s: &str, max_chars: usize) -> String {
         }
         for e in events {
             match e {
+                net::NetEvent::Sort(plan, reply) => {
+                    if let (Some(net),Some(sheet)) = (&self.net,self.wb.sheets.get(plan.sheet)) {
+                        let target = crate::net_sort::SortTarget { document: self.doc_uid, sheet: plan.sheet,
+                            identity: sheet.identity, coordinates: sheet.coordinate_revision() };
+                        net.check_sort(target, plan, sheet.search_snapshot(), self.wb.styles.clone(), reply);
+                    } else { let _ = reply.send(false); }
+                }
+                net::NetEvent::SortReady(target, batch, reply) => {
+                    // A disconnected session drops the reply channel. A stale worker
+                    // must never apply its sort to a later authoritative snapshot.
+                    let accepted = batch.is_some() && target.valid(self.doc_uid,&self.wb);
+                    if reply.send(accepted).is_ok() && accepted && let Some(batch) = batch {
+                        self.apply_remote_sort(&batch);
+                    }
+                }
+                net::NetEvent::SortRepairs { sheet, first_ts, items } => {
+                    self.repair_rejected_sort(sheet,first_ts,items);
+                }
+                net::NetEvent::SortRepairDone(first_ts) => {
+                    if let Some(net) = &self.net { net.finish_sort(first_ts); }
+                }
+                net::NetEvent::Sorted(batch) => self.apply_remote_sort(&batch),
+                net::NetEvent::ConfirmedStyles(items) => {
+                    self.confirm_own_styles(items.iter().map(|(sh,r,c,s)| (*sh,*r,*c,s)));
+                }
+                net::NetEvent::CommittedSortStyles(batch) => {
+                    self.confirm_own_styles(batch.styles.iter().map(|(r,c,s)| (batch.plan.sheet,*r,*c,s)));
+                }
                 crate::net::NetEvent::LockOk { site, name, sheet, row, col } => {
                     let my_site = self.net.as_ref().map(|n| n.site).unwrap_or(0);
                     if site == my_site {
@@ -34270,9 +34317,11 @@ fn elide(s: &str, max_chars: usize) -> String {
                 }
                 crate::net::NetEvent::StructuralHistory(items) => {
                     // 先存着：文件还在后台读/重算，这会儿改会被随后的整份替换冲掉
+                    if let Some(net) = &self.net { net.note_structure(items.len()); }
                     self.struct_history.extend(items);
                 }
                 crate::net::NetEvent::Structural { site, sheet, op } => {
+                    if let Some(net) = &self.net { net.note_structure(1); }
                     if sheet < self.wb.sheets.len() {
                         let updates = self.structural_updates(sheet, &op);
                         let label = op.label();
@@ -34449,6 +34498,10 @@ fn elide(s: &str, max_chars: usize) -> String {
                     // 重连：宿主的快照会覆盖本地副本。先把自己写过的格子暂存起来，
                     // 快照落定后再补发（断线期间的编辑原本会被这里静默清掉）。
                     self.stash_own_ops_for_rejoin();
+                    if let Some(net) = &self.net {
+                        net.reset_structure();
+                        for ts in net.discard_pending_sorts() { self.undo.reject_sort(ts); }
+                    }
                     if !delta_sync {
                         for sh in &mut self.wb.sheets {
                             sh.clear();
@@ -34722,7 +34775,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                                 self.load_diag.as_ref(),
                                 false,
                                 &other_paths,
-                                host, self.deps_built.then(|| self.deps.clone()),
+                                host, self.doc_gen, self.deps_built.then(|| self.deps.clone()),
                             ) {
                                 Ok(_) => {
                                     if let Some(pending) = &mut self.tasks.saving {

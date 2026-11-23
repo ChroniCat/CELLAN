@@ -176,12 +176,15 @@ fn the_spilled_shape_survives_a_save_and_reopen() {
     sheetcore::xlsx::save_atomic(&path, &wb).expect("保存失败");
 
     let mut back = sheetcore::xlsx::load(&path).expect("打开失败");
-    // 文件里只存锚点公式（溢出值不落盘），打开后按 Excel 语义重算
+    // Excel persists the anchor formula and its generated values. Reopening must
+    // restore their ownership so cached tails can never become ordinary inputs.
     assert_eq!(
         back.sheets[0].get(0, 0).unwrap().formula.as_deref(),
         Some("=SEQUENCE(2,2)+1")
     );
-    assert_eq!(back.sheets[0].value(0, 1), Value::Empty, "溢出子格不应写死在文件里");
+    assert_eq!(back.sheets[0].value(0, 1), Value::Number(3.0));
+    assert!(back.sheets[0].spilled.contains(&sheetcore::CellRef::new(0,1)));
+    assert!(back.sheets[0].arrays.is_empty());
     formula::recalc_all(&mut back);
     let s = &back.sheets[0];
     assert_eq!(s.value(0, 0), Value::Number(2.0), "重开后 A1");
@@ -189,6 +192,9 @@ fn the_spilled_shape_survives_a_save_and_reopen() {
     assert_eq!(s.value(1, 0), Value::Number(4.0), "重开后 A2");
     assert_eq!(s.value(1, 1), Value::Number(5.0), "重开后 B2");
     assert_eq!(s.get(0, 0).unwrap().formula.as_deref(), Some("=SEQUENCE(2,2)+1"));
+    back.sheets[0].set(0,0,Cell { value: Value::Empty, formula: Some("=SEQUENCE(1)".into()) });
+    formula::recalc_all(&mut back);
+    assert_eq!(back.sheets[0].value(0,1),Value::Empty);
 }
 
 // ---------------------------------------- FILTER 的条件形状（2×2 数据两种方向）

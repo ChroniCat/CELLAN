@@ -139,3 +139,38 @@ fn structure_only_replay_moves_array_metadata_without_moving_snapshot_cells() {
         assert_eq!(metadata.value(4, 2), Value::Number(99.0));
     }
 }
+
+#[test]
+fn scoped_structural_recalc_updates_names_tables_and_spill_readers() {
+    use sheetcore::{Sheet, formula::deps::Deps, table::Table};
+    let mut seed = Workbook::new_blank();
+    let formula = |f: &str| Cell {formula:Some(f.into()),value:Value::Empty};
+    let add = |b: &mut Workbook, name: &str| b.sheets.push(Sheet::new(name));
+    for name in ["Readers","Summary","Independent"] { add(&mut seed,name); }
+    seed.sheets[0].set(1,0,number(4.));
+    seed.sheets[0].set(2,0,number(7.));
+    seed.sheets[0].set(2,3,formula("=SEQUENCE(2,1)"));
+    seed.sheets[0].tables.push(Table { name:"Data".into(),display:"Data".into(),range:(0,0,2,0),
+        columns:vec!["Amount".into()],column_ids:vec![1],header_row:true,..Default::default() });
+    seed.names.push(("AmountCells".into(),None,"Sheet1!$A$2:$A$3".into()));
+    seed.sheets[1].set(0,0,formula("=SUM(AmountCells)+SUM(Data[Amount])+Sheet1!D4"));
+    seed.sheets[2].set(0,0,formula("=Readers!A1*2"));
+    seed.sheets[3].set(0,0,formula("=7+3"));
+    formula::recalc_all(&mut seed);
+    for op in [Structural::InsertRows {at:2,n:1},Structural::DeleteRows {at:1,n:1}] {
+        let mut wb = seed.clone();
+        let graph = Deps::build_after_recalc(&wb);
+        apply_structural_wb(&mut wb,0,&op);
+        let mut expected = wb.clone();
+        formula::recalc_all(&mut expected);
+        // A distinctive cached result proves the independent sheet wasn't evaluated.
+        wb.sheets[3].set(0,0,Cell {formula:Some("=7+3".into()),value:Value::Number(900.)});
+        let repaired = graph.recalc_structural_sheets(&mut wb,0,&false.into()).unwrap();
+        for si in 0..3 {
+            assert!(wb.sheets[si].iter().eq(expected.sheets[si].iter()));
+            assert_eq!(wb.sheets[si].spilled,expected.sheets[si].spilled);
+        }
+        assert_eq!(wb.sheets[3].value(0,0),Value::Number(900.));
+        assert_eq!(repaired.edit_closure(&[(1,0,0)]),Deps::build_after_recalc(&wb).edit_closure(&[(1,0,0)]));
+    }
+}

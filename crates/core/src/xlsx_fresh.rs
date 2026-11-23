@@ -11,21 +11,20 @@ use std::{
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 pub(super) fn supported(sheet: &Sheet) -> bool {
-    if sheet.len() < 16_384
-        || !sheet.arrays.is_empty()
-        || !sheet.spill_shapes.is_empty()
-        || !sheet.spilled.is_empty()
-        || !sheet.tables.is_empty()
-        || !sheet.notes.is_empty()
-        || !sheet.rich.is_empty()
-        || !sheet.sparklines.is_empty()
-        || !sheet.charts.is_empty()
-        || !sheet.pictures.is_empty()
-        || !sheet.textboxes.is_empty()
+    // A saved dynamic result needs its cell metadata and persisted spill caches
+    // even when the workbook has only one formula.
+    if (sheet.len() < 16_384 && sheet.spill_shapes.is_empty())
+        || sheet.charts.iter().any(|c| !c.part.is_empty())
+        || sheet.pictures.iter().any(|p| p.data.is_none())
     {
         return false;
     }
-    sheet.iter().all(|(key, cell)| {
+    sheet.rich.iter().all(|(&(r, c), runs)| {
+        runs.is_empty()
+            || sheet
+                .get(r, c)
+                .is_some_and(|cell| super::delta::supports_runs(cell, runs))
+    }) && sheet.iter().all(|(key, cell)| {
         key.row < crate::sync::MAX_ROWS
             && key.col < crate::sync::MAX_COLS
             && cell
@@ -35,21 +34,78 @@ pub(super) fn supported(sheet: &Sheet) -> bool {
             && match &cell.value {
                 Value::Number(n) => n.is_finite(),
                 Value::Text(s) => super::delta::safe_xml_text(s),
-                Value::Error(
-                    crate::formula::ErrKind::Spill | crate::formula::ErrKind::Circular,
-                ) => false,
+                Value::Error(crate::formula::ErrKind::Spill) => {
+                    sheet.spill_shapes.contains_key(&key)
+                }
                 _ => true,
             }
     })
 }
 
-fn write_value(out: &mut impl Write, key: CellRef, cell: &Cell, xf: Option<u16>) -> Result<()> {
+fn write_value(
+    out: &mut impl Write,
+    sheet: &Sheet,
+    arrays: &HashMap<CellRef, (u32, u32, u32, u32)>,
+    key: CellRef,
+    cell: &Cell,
+    xf: Option<u16>,
+) -> Result<()> {
     let reference = crate::model::cell_name(key.row, key.col);
     let mut start = format!("<c r=\"{reference}\"");
     if let Some(xf) = xf {
         start.push_str(&format!(" s=\"{xf}\""));
     }
-    let xml = super::delta::model_cell_xml(start, cell, None).context("无效的工作表单元格")?;
+    let shape = sheet.spill_shapes.get(&key);
+    let rect = if let Some(&rect) = arrays.get(&key) {
+        Some(rect)
+    } else if let Some(&(h, w)) = shape {
+        start.push_str(" cm=\"1\"");
+        Some((
+            key.row,
+            key.col,
+            key.row
+                .checked_add(h.saturating_sub(1))
+                .context("数组越界")?,
+            key.col
+                .checked_add(w.saturating_sub(1))
+                .context("数组越界")?,
+        ))
+    } else {
+        None
+    };
+    let definition = if let Some(rect) = rect {
+        ensure!(
+            (rect.0, rect.1) == (key.row, key.col)
+                && rect.2 >= rect.0
+                && rect.3 >= rect.1
+                && rect.2 < crate::sync::MAX_ROWS
+                && rect.3 < crate::sync::MAX_COLS,
+            "无效的数组范围"
+        );
+        let formula = cell.formula.as_deref().context("缺少数组锚点公式")?;
+        let formula = crate::add_fn_prefixes(formula.strip_prefix('=').unwrap_or(formula));
+        let range = super::dynamic::reference(rect);
+        Some(format!(
+            "<f t=\"array\" ref=\"{range}\">{}</f>",
+            quick_xml::escape::escape(&formula)
+        ))
+    } else {
+        None
+    };
+    let xml = if cell.value == Value::Error(crate::formula::ErrKind::Spill) {
+        format!(
+            "{start} t=\"e\">{}<v>#SPILL!</v></c>",
+            definition.context("溢出错误缺少锚点")?
+        )
+    } else {
+        super::delta::cell_with_runs(
+            start,
+            cell,
+            definition.as_deref(),
+            sheet.rich.get(&(key.row, key.col)).map(Vec::as_slice),
+        )
+        .context("无效的工作表单元格")?
+    };
     out.write_all(xml.as_bytes())?;
     Ok(())
 }
@@ -66,6 +122,8 @@ fn write_sheet(out: impl Write, shell: String, sheet: &Sheet) -> Result<()> {
         .context("新建工作表缺少 sheetData")?;
     let (mut top, mut left, mut bottom, mut right) = sheet.used_bounds().context("流式工作表缺少单元格")?;
     let mut formats = std::collections::HashMap::from([(0u16, 0u16)]);
+    let arrays: HashMap<_, _> = sheet.arrays.iter().copied().collect();
+    ensure!(arrays.len()==sheet.arrays.len(),"重复的数组锚点");
     for stub in data.descendants().filter(|n| n.has_tag_name((namespace, "c"))) {
         let (r,c) = stub.attribute("r").and_then(crate::sparse::parse_ref).context("无效的模板单元格")?;
         top = top.min(r); left = left.min(c); bottom = bottom.max(r); right = right.max(c);
@@ -124,19 +182,19 @@ fn write_sheet(out: impl Write, shell: String, sheet: &Sheet) -> Result<()> {
                 .context("无效的模板单元格")?;
             ensure!(sr == r, "模板单元格行号不一致");
             while let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r && k.col < sc) {
-                write_value(&mut out, key, cell, xf_for(key)?)?;
+                write_value(&mut out, sheet, &arrays, key, cell, xf_for(key)?)?;
             }
             if let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r && k.col == sc) {
                 let xf = stub.attribute("s").map(str::parse::<u16>).transpose()?;
-                write_value(&mut out, key, cell, xf.or(xf_for(key)?))?;
+                write_value(&mut out, sheet, &arrays, key, cell, xf.or(xf_for(key)?))?;
             } else if stub.attribute("s").is_none() && sheet.explicit_style_of(sr, sc) == Some(0) {
-                write_value(&mut out, CellRef::new(sr, sc), &Cell::default(), Some(0))?;
+                write_value(&mut out, sheet, &arrays, CellRef::new(sr, sc), &Cell::default(), Some(0))?;
             } else {
                 out.write_all(shell[stub.range()].as_bytes())?;
             }
         }
         while let Some((key, cell)) = cells.next_if(|(k, _)| k.row == r) {
-            write_value(&mut out, key, cell, xf_for(key)?)?;
+            write_value(&mut out, sheet, &arrays, key, cell, xf_for(key)?)?;
         }
         out.write_all(b"</row>")?;
     }
@@ -158,6 +216,11 @@ pub(super) fn write(path: &Path, wb: &Workbook, selected: &[bool]) -> Result<()>
         }
     }
     let mut zip = ZipArchive::new(File::open(path)?)?;
+    let dynamic = sheets.values().any(|s| {
+        let fixed: std::collections::HashSet<_> = s.arrays.iter().map(|(k,_)| k).collect();
+        s.spill_shapes.keys().any(|k| !fixed.contains(k))
+    });
+    ensure!(!dynamic || zip.index_for_name(super::dynamic::PART).is_none(),"新建模板的元数据部件已占用");
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -175,11 +238,20 @@ pub(super) fn write(path: &Path, wb: &Workbook, selected: &[bool]) -> Result<()>
                     .compression_level(Some(4)),
             )?;
             write_sheet(&mut out, shell, sheet)?;
+        } else if dynamic && matches!(part.as_str(), super::dynamic::RELS | super::dynamic::TYPES) {
+            let mut xml = super::read_zip_text(&mut zip,&part)?;
+            super::dynamic::declare(&mut xml,&part)?;
+            out.start_file(part,SimpleFileOptions::default().compression_method(CompressionMethod::Deflated))?;
+            out.write_all(xml.as_bytes())?;
         } else {
             out.raw_copy_file(zip.by_index_raw(i)?)?;
         }
     }
     ensure!(sheets.is_empty(), "缺少流式工作表部件");
+    if dynamic {
+        out.start_file(super::dynamic::PART,SimpleFileOptions::default().compression_method(CompressionMethod::Deflated))?;
+        out.write_all(super::dynamic::METADATA.as_bytes())?;
+    }
     out.finish()?.flush()?;
     drop(zip);
     temp.persist(path)?;
@@ -190,6 +262,202 @@ pub(super) fn write(path: &Path, wb: &Workbook, selected: &[bool]) -> Result<()>
 mod tests {
     use super::*;
     use crate::model::Cell;
+
+    #[test]
+    fn streamed_drawings_and_both_array_types_roundtrip_with_their_cached_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drawing-arrays.xlsx");
+        let marked = crate::textbox::insert_drawing_tag(
+            "<s:worksheet xmlns:s=\"urn:w\"><s:sheetData><s:extLst/></s:sheetData><s:tableParts/></s:worksheet>",
+            "rId7",
+        );
+        let tree = roxmltree::Document::parse(&marked).unwrap();
+        let tags: Vec<_> = tree
+            .root_element()
+            .children()
+            .filter(|n| n.is_element())
+            .map(|n| n.tag_name().name())
+            .collect();
+        assert_eq!(tags, ["sheetData", "drawing", "tableParts"]);
+        let mut wb = Workbook::new_blank();
+        let sheet = &mut wb.sheets[0];
+        let number = |n| Cell {
+            value: Value::Number(n),
+            formula: None,
+        };
+        let formula = |text: &str| Cell {
+            formula: Some(text.into()),
+            ..Default::default()
+        };
+        for r in 0..16_384 {
+            sheet.set(r, 0, number(f64::from(r)));
+        }
+        for r in 0..5 {
+            sheet.set(r, 9, number(f64::from(2 * r)));
+        }
+        for r in 0..5 {
+            sheet.set(r, 10, number(f64::from(3 * r)));
+        }
+        sheet.set(0, 1, formula("=SEQUENCE(2,2)"));
+        sheet.set(0, 4, formula("=SEQUENCE(1,2)"));
+        sheet.arrays.push((CellRef::new(0, 4), (0, 4, 0, 5)));
+        sheet.set(0, 7, formula("=SEQUENCE(2)"));
+        sheet.set(1, 7, number(109.0));
+        let chart = crate::chart_write::chart_from_selection(
+            sheet,
+            &sheet.name,
+            (0, 9, 4, 10),
+            "Sales",
+            crate::charts::ChartKind::Column,
+        );
+        sheet.charts.push(chart);
+        let png = std::sync::Arc::new(vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 252, 255, 31,
+            0, 3, 3, 2, 0, 238, 86, 219, 145, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ]);
+        sheet.pictures.push(crate::pic::Picture {
+            rect: (1, 3, 9, 5),
+            off: [0; 4],
+            part: "xl/media/image1.png".into(),
+            data: Some(png.clone()),
+            ext: "png".into(),
+            name: "Logo".into(),
+        });
+        crate::formula::recalc_all(&mut wb);
+        assert!(supported(&wb.sheets[0]));
+        let receipt = crate::xlsx::save_atomic_with_receipt(&path, &wb).unwrap();
+        receipt.adopt_document(&mut wb, &path, true);
+        assert!(!wb.sheets[0].charts[0].part.is_empty());
+        let zip =
+            |part| String::from_utf8(crate::fixups::read_part_file(&path, part).unwrap()).unwrap();
+        let xml = zip("xl/worksheets/sheet1.xml");
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let cell = |s| {
+            doc.descendants()
+                .find(|n| n.has_tag_name("c") && n.attribute("r") == Some(s))
+                .unwrap()
+        };
+        for (r, cm, range) in [
+            ("B1", Some("1"), "B1:C2"),
+            ("E1", None, "E1:F1"),
+            ("H1", Some("1"), "H1"),
+        ] {
+            assert_eq!(cell(r).attribute("cm"), cm);
+            let f = cell(r).children().find(|n| n.has_tag_name("f")).unwrap();
+            assert_eq!(f.attribute("t"), Some("array"));
+            assert_eq!(f.attribute("ref"), Some(range));
+        }
+        assert!(zip(super::super::dynamic::PART).contains("XLDAPR"));
+        let mut reopened = crate::xlsx::load(&path).unwrap();
+        let s = &reopened.sheets[0];
+        assert_eq!(s.arrays, [(CellRef::new(0, 4), (0, 4, 0, 5))]);
+        assert_eq!(s.spill_shapes[&CellRef::new(0, 1)], (2, 2));
+        assert_eq!(s.spill_shapes[&CellRef::new(0, 7)], (0, 0));
+        assert!(s.spilled.contains(&CellRef::new(1, 2)));
+        assert_eq!(s.value(1, 2), Value::Number(4.0));
+        assert_eq!(s.value(0, 5), Value::Number(2.0));
+        assert_eq!(s.value(1, 7), Value::Number(109.0));
+        assert_eq!(s.charts.len(), 1);
+        assert_eq!(s.charts[0].series[0].vals, [3.0, 6.0, 9.0, 12.0]);
+        assert_eq!(s.pictures.len(), 1);
+        assert_eq!(
+            crate::fixups::read_part_file(&path, &s.pictures[0].part).as_ref(),
+            Some(&*png)
+        );
+        reopened.sheets[0].remove(1, 7);
+        crate::formula::recalc_all(&mut reopened);
+        assert_eq!(reopened.sheets[0].value(1, 7), Value::Number(2.0));
+        let receipt = crate::xlsx::save_atomic_with_receipt(&path, &reopened).unwrap();
+        assert!(receipt.used_cell_delta);
+        let again = crate::xlsx::load(&path).unwrap();
+        assert_eq!(again.sheets[0].spill_shapes[&CellRef::new(0, 7)], (2, 1));
+        assert_eq!(again.sheets[0].charts.len(), 1);
+        // A drawing that contains only a textbox initially has no chart/image relationships.
+        let other = dir.path().join("textbox-chart.xlsx");
+        let mut secondary = Workbook::new_blank();
+        let s = &mut secondary.sheets[0];
+        s.set(1, 0, number(1.0));
+        s.set(1, 1, number(7.0));
+        s.textboxes.push(crate::textbox::TextBox {
+            text: "Label".into(),
+            ..Default::default()
+        });
+        s.charts.push(crate::chart_write::chart_from_selection(
+            s,
+            &s.name,
+            (0, 0, 1, 1),
+            "Second",
+            crate::charts::ChartKind::Line,
+        ));
+        crate::xlsx::save_atomic(&other, &secondary).unwrap();
+        let back = crate::xlsx::load(&other).unwrap();
+        assert_eq!(back.sheets[0].textboxes[0].text, "Label");
+        assert_eq!(back.sheets[0].charts[0].series[0].vals, [7.0]);
+    }
+
+    #[test]
+    fn streamed_table_notes_sparkline_and_rich_runs_survive_fresh_and_existing_atomic_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("objects.xlsx");
+        let mut wb = Workbook::new_blank();
+        let sheet = wb.sheet_mut(0);
+        for r in 0..16_384 {
+            sheet.set(r,0,Cell { value: Value::Number(f64::from(r)), formula: None });
+        }
+        sheet.set(0,0,Cell { value: Value::Text("Sales".into()), formula: None });
+        let text = Cell { value: Value::Text("part 2".into()), formula: None };
+        sheet.set(0,1,text.clone());
+        let mut first = crate::richtext::RichRun::plain("part ");
+        first.bold = true;
+        first.font = Some("A&B \"C\"".into());
+        let runs = vec![first,crate::richtext::RichRun::plain("2")];
+        sheet.rich.insert((0,1),runs.clone());
+        sheet.tables.push(crate::table::Table { name:"SalesTable".into(),display:"SalesTable".into(),
+            range:(0,0,9,0),columns:vec!["Sales".into()],column_ids:vec![1],header_row:true, ..Default::default() });
+        let note = crate::notes::Note {r:0,c:1,author:"Reviewer".into(),text:"retain comment".into()};
+        sheet.notes.insert(CellRef::new(0,1),note.clone());
+        let spark = crate::sparkline::Sparkline { r:4,c:2,source_sheet:Some("Sheet1".into()),rect:(1,0,3,0), ..Default::default() };
+        sheet.sparklines.push(spark.clone());
+        let textbox = crate::textbox::TextBox {text:"Quarterly report".into(), ..Default::default()};
+        sheet.textboxes.push(textbox.clone());
+        assert!(supported(sheet));
+        crate::xlsx::save_atomic(&path,&wb).unwrap();
+        let mut saved = crate::xlsx::load(&path).unwrap();
+        assert_eq!(saved.sheets[0].rich[&(0,1)],runs);
+        assert_eq!(saved.sheets[0].notes[&CellRef::new(0,1)],note);
+        assert_eq!(saved.sheets[0].sparklines,[spark.clone()]);
+        assert_eq!(saved.sheets[0].textboxes[0].text,textbox.text);
+        assert_eq!(saved.sheets[0].tables[0].range,(0,0,9,0));
+        // A formatting-only rich edit leaves the cell's searchable text identical.
+        // Capture a vendor element in another row and require lexical preservation.
+        let part = saved.sheets[0].source_part.clone().unwrap();
+        let xml = String::from_utf8(crate::fixups::read_part_file(&path,&part).unwrap()).unwrap();
+        let raw = "<?keep row?><c r=\"A16384\" t=\"n\"><v>016383.00</v></c>";
+        let tagged = xml.replace("<c r=\"A16384\"><v>16383</v></c>",raw);
+        assert_ne!(xml,tagged);
+        crate::fixups::write_parts(&path,&[(part.clone(),tagged.into_bytes())]).unwrap();
+        saved = crate::xlsx::load(&path).unwrap();
+        saved.sheets[0].rich.get_mut(&(0,1)).unwrap()[1].italic = true;
+        saved.sheets[0].rich_dirty = true;
+        let receipt = crate::xlsx::save_atomic_with_receipt(&path,&saved).unwrap();
+        assert!(receipt.used_cell_delta);
+        receipt.adopt_document(&mut saved,&path,true);
+        let reopened = crate::xlsx::load(&path).unwrap();
+        assert!(reopened.sheets[0].rich[&(0,1)][1].italic);
+        assert_eq!(reopened.sheets[0].tables[0].columns,["Sales"]);
+        assert_eq!(reopened.sheets[0].notes[&CellRef::new(0,1)],note);
+        assert_eq!(reopened.sheets[0].sparklines,[spark]);
+        assert_eq!(reopened.sheets[0].textboxes[0].text,textbox.text);
+        saved.sheets[0].rich.remove(&(0,1));
+        saved.sheets[0].rich_dirty = true;
+        crate::xlsx::save_atomic(&path,&saved).unwrap();
+        let reopened = crate::xlsx::load(&path).unwrap();
+        assert!(!reopened.sheets[0].rich.contains_key(&(0,1)));
+        assert_eq!(reopened.sheets[0].get(0,1),Some(&text));
+        let xml = String::from_utf8(crate::fixups::read_part_file(&path,&part).unwrap()).unwrap();
+        assert!(xml.contains(raw));
+    }
 
     #[test]
     fn streamed_dense_styles_inherited_defaults_filter_and_hyperlink_roundtrip() {

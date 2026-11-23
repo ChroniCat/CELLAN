@@ -29,18 +29,18 @@ pub struct TestEnv {
 
 /// 测试根目录：**不能**用 `std::env::temp_dir()`——并行测试里别人随时会把 TEMP
 /// 换成自己的隔离目录，路径就会嵌套到别人的根下面，别人一 drop 就整个被删。
-/// 固定在仓库 `target/test-tmp/`，与进程环境无关。
+/// 跟随 Cargo 目标目录，避免另行指定构建盘时仍向源码盘写入。
 pub fn run_root() -> PathBuf {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
         // 用 parent() 逐级上退，不要写 "../../"：路径里留 ".." 会和
         // `std::env::temp_dir()` 的规范路径比不相等（路径带不带 .. 语义相同但字节不同）。
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap_or_else(|| Path::new("."))
-            .join("target")
-            .join("test-tmp");
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest.parent().and_then(Path::parent).unwrap_or(manifest);
+        let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from)
+            .or_else(|| option_env!("CARGO_TARGET_DIR").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("target"));
+        let p = workspace.join(target).join("test-tmp");
         std::fs::create_dir_all(&p).unwrap_or_else(|e| panic!("建测试根失败 {}: {e}", p.display()));
         p
     })

@@ -465,6 +465,8 @@ impl Sheet {
     /// 按行、列升序遍历所有单元格
     pub(crate) fn cells(&self) -> &Store { &self.cells }
 
+    pub(crate) fn replace_cell_store(&mut self, cells: Store) { self.cells = cells; }
+
     pub(crate) fn formula_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.formula_cells()
     }
@@ -869,10 +871,6 @@ impl Sheet {
     }
 
     /// 存储层实际占用字节（调试用）
-    pub(crate) fn pair_allocated_bytes(&self, other: &Sheet) -> usize {
-        self.cells.pair_allocated_bytes(&other.cells)
-    }
-
     pub fn allocated_bytes(&self) -> usize {
         self.cells.allocated_bytes()
     }

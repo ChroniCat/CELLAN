@@ -46,7 +46,7 @@ impl ChartKind {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Series {
     pub name: String,
     pub cats: Vec<String>,
@@ -82,7 +82,7 @@ pub struct LabelOpts {
     pub position: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Chart {
     pub kind: ChartKind,
     pub title: String,

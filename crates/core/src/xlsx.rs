@@ -87,6 +87,8 @@ mod sheets;
 mod delta;
 #[path = "xlsx_fresh.rs"]
 mod fresh;
+#[path = "xlsx_dynamic.rs"]
+mod dynamic;
 pub(crate) use delta::SourceCells;
 #[path = "xlsx_structure.rs"]
 mod structure;
@@ -914,6 +916,7 @@ struct SavedChart {
     drawing: String,
     anchor: (u32, u32, u32, u32),
     ref_fixes: Vec<(String, String)>,
+    created: Option<(crate::charts::Chart, String, String)>,
 }
 
 struct RestoreFile(Option<std::path::PathBuf>);
@@ -940,11 +943,23 @@ impl SaveReceipt {
                         continue;
                     };
                     // Edits made while the worker was saving append to this journal.
+                    if let Some((original, part, drawing)) = &baseline.created {
+                        let anchor = std::mem::replace(&mut chart.anchor, original.anchor);
+                        let same = chart == original;
+                        chart.anchor = anchor;
+                        if !same {
+                            dirty = true;
+                            continue;
+                        }
+                        chart.part.clone_from(part);
+                        chart.drawing.clone_from(drawing);
+                    }
                     if chart.ref_fixes.starts_with(&baseline.ref_fixes) {
                         chart.ref_fixes.drain(..baseline.ref_fixes.len());
                     }
                     dirty |= saved_index != index || baseline.anchor != chart.anchor
-                        || baseline.drawing != chart.drawing || !chart.ref_fixes.is_empty();
+                        || (baseline.created.is_none() && baseline.drawing != chart.drawing)
+                        || !chart.ref_fixes.is_empty();
                 }
                 sheet.charts_dirty = dirty;
             }
@@ -983,6 +998,9 @@ impl SaveReceipt {
             sheet.col_styles_dirty = false;
             sheet.merges_dirty = false;
             sheet.notes_dirty = false;
+            if saved.source_cells.as_ref().is_some_and(|source| source.rich == sheet.rich) {
+                sheet.rich_dirty = false;
+            }
             sheet.cf_dirty = false;
             sheet.dv_dirty = false;
             sheet.freeze_dirty = false;
@@ -996,6 +1014,7 @@ impl SaveReceipt {
 struct CellWrite {
     styles: Option<delta::SavedStyles>,
     used_delta: bool,
+    created_charts: std::collections::HashMap<(u64, usize), (String, String)>,
 }
 
 fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveReceipt> {
@@ -1029,10 +1048,11 @@ fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveR
         used_cell_delta: write.used_delta,
         sheets,
         source_encryption: wb.encryption.clone(),
-        committed_charts: wb.sheets.iter().filter(|s| s.charts_dirty).map(|sheet| {
-            let charts = sheet.charts.iter().map(|chart| SavedChart {
+        committed_charts: wb.sheets.iter().filter(|s| s.charts_dirty || write.created_charts.contains_key(&(s.identity, 0))).map(|sheet| {
+            let charts = sheet.charts.iter().enumerate().map(|(i, chart)| SavedChart {
                 part: chart.part.clone(), drawing: chart.drawing.clone(),
                 anchor: chart.anchor, ref_fixes: chart.ref_fixes.clone(),
+                created: write.created_charts.get(&(sheet.identity, i)).map(|(part, drawing)| (chart.clone(), part.clone(), drawing.clone())),
             }).collect();
             (sheet.identity, charts)
         }).collect(),
@@ -1905,69 +1925,209 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Build a private input for umya. Large sheets that will be restored from the
-/// baseline omit their cells, and range hyperlinks are handled by our OOXML writer.
-fn slim_umya_base(
-    base: &Path, wb: &Workbook,
-) -> Result<Option<(tempfile::TempPath, Vec<String>)>> {
-    use std::io::Write;
+/// Sparse umya input and the data ranges that must be restored after its metadata patches.
+struct SlimBase {
+    path: tempfile::TempPath,
+    omitted: Vec<String>,
+    grids: std::collections::HashMap<String, PreservedGrid>,
+}
+struct PreservedGrid {
+    path: tempfile::TempPath,
+    dimension: Option<String>,
+}
+
+fn slim_umya_base(base: &Path, wb: &Workbook) -> Result<Option<SlimBase>> {
+    use std::io::{BufWriter, Write};
     let targets = crate::patch::sheet_targets(base)?;
     let mut zip = zip::ZipArchive::new(std::fs::File::open(base)?)?;
     let mut candidates = std::collections::HashMap::new();
+    let styles_stable = wb.sheets.iter().all(|s| {
+        !s.styles_dirty && !s.row_styles_dirty && !s.col_styles_dirty && s.style_edits.is_empty()
+    });
     let mut omitted = Vec::new();
+    let mut grids = std::collections::HashMap::new();
+    let mut strings = delta::GridStrings::new(base);
     for (idx, sheet) in wb.sheets.iter().enumerate() {
-        let Some(part) = targets.get(&sheet.name) else { continue };
-        // At these stable paths restore_unedited_sheets uses compressed raw copy.
-        let omit_cells = crate::fixups::can_restore_sheet_xml(sheet)
-            && *part == format!("xl/worksheets/sheet{}.xml", idx + 1)
+        let Some(part) = targets.get(&sheet.name) else {
+            continue;
+        };
+        let large = *part == format!("xl/worksheets/sheet{}.xml", idx + 1)
             && zip.by_name(part)?.size() > crate::fixups::RAW_SHEET_MIN_BYTES;
-        // A deleted range can still exist in the on-disk baseline.
-        let check_links = sheet.hyperlinks_dirty || sheet.hyperlinks.values().any(|h| h.span != (0, 0));
-        if !omit_cells && !check_links { continue; }
-        candidates.insert(part.as_str(), (sheet.name.as_str(), omit_cells, check_links));
+        let omit = large && crate::fixups::can_restore_sheet_xml(sheet);
+        let keep_grid = large
+            && !omit
+            && styles_stable
+            && (sheet.notes_dirty || sheet.cf_dirty || sheet.dv_dirty || sheet.charts_dirty)
+            && !sheet.layout_dirty
+            && !sheet.filter_dirty
+            && !sheet.rich_dirty
+            && !sheet.merges_dirty
+            && sheet
+                .source_cells
+                .as_ref()
+                .is_some_and(|s| s.reusable_grid(&mut zip, part, sheet));
+        let check_links =
+            sheet.hyperlinks_dirty || sheet.hyperlinks.values().any(|h| h.span != (0, 0));
+        if omit || keep_grid || check_links {
+            candidates.insert(
+                part.clone(),
+                (sheet.name.clone(), omit, keep_grid, check_links),
+            );
+        }
     }
-    if candidates.is_empty() { return Ok(None); }
-    let temp = tempfile::Builder::new().prefix("cellan-umya-").suffix(".xlsx").tempfile()?;
-    let (file, path) = temp.into_parts();
-    let mut out = zip::ZipWriter::new(file);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let (file, path) = tempfile::Builder::new()
+        .prefix("cellan-umya-")
+        .suffix(".xlsx")
+        .tempfile()?
+        .into_parts();
+    let mut out = zip::ZipWriter::new(BufWriter::new(file));
     for i in 0..zip.len() {
         let part = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
-        let Some(&(sheet_name, omit_cells, check_links)) = candidates.get(part.as_str()) else {
+        let Some((name, omit, mut keep_grid, check_links)) = candidates.remove(&part) else {
             out.raw_copy_file(zip.by_index_raw(i)?)?;
             continue;
         };
-        let mut xml = read_zip_text(&mut zip, &part)?;
-        let mut changed = false;
-        if omit_cells {
-            let mut reader = quick_xml::Reader::from_str(&xml);
-            let mut depth = 0;
-            loop {
-                match reader.read_event()? {
-                    quick_xml::events::Event::Start(e) if depth == 1 && e.local_name().as_ref() == "sheetData" => {
-                        let contents = reader.read_to_end(e.name())?;
-                        xml.replace_range(contents.start as usize..contents.end as usize, "");
-                        omitted.push(sheet_name.to_owned());
-                        changed = true;
-                        break;
-                    }
-                    quick_xml::events::Event::Start(_) => depth += 1,
-                    quick_xml::events::Event::End(_) => depth -= 1,
-                    quick_xml::events::Event::Eof => break,
-                    _ => {}
-                }
+        let mut shell = None;
+        let mut edited = None;
+        if keep_grid {
+            let sheet = wb
+                .sheets
+                .iter()
+                .find(|s| s.name == name)
+                .context("找不到原工作表")?;
+            let source = sheet.source_cells.as_ref().context("缺少单元格基准")?;
+            if !source.unchanged_values(sheet) {
+                edited = source.stage_grid_edits(&mut zip, &part, sheet, &wb.styles)?;
+                keep_grid = edited.is_some();
             }
         }
-        if check_links { changed |= crate::hyperlinks::remove_range_links(&mut xml); }
-        if changed {
-            out.start_file(part, zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated))?;
+        if omit || keep_grid {
+            let mut bytes = Vec::new();
+            let mut spool = keep_grid.then(tempfile::NamedTempFile::new).transpose()?;
+            let (portable, dimension) = {
+                let mut writer = spool.as_mut().map(|f| BufWriter::new(f.as_file_mut()));
+                let output = writer.as_mut().map(|w| w as &mut dyn Write);
+                let info = if let Some(edited) = edited {
+                    delta::split_grid(edited.reopen()?, &part, &mut bytes, output, &mut strings)?
+                } else {
+                    delta::split_grid(zip.by_index(i)?, &part, &mut bytes, output, &mut strings)?
+                };
+                if let Some(mut w) = writer {
+                    w.flush()?;
+                }
+                info
+            };
+            if omit {
+                omitted.push(name.clone());
+                shell = Some(String::from_utf8(bytes)?);
+            } else if portable {
+                grids.insert(
+                    name,
+                    PreservedGrid {
+                        path: spool.context("缺少单元格暂存文件")?.into_temp_path(),
+                        dimension,
+                    },
+                );
+                shell = Some(String::from_utf8(bytes)?);
+            }
+        }
+        if check_links {
+            if shell.is_none() {
+                let mut xml = read_zip_text(&mut zip, &part)?;
+                if crate::hyperlinks::remove_range_links(&mut xml) {
+                    shell = Some(xml);
+                }
+            } else if let Some(xml) = &mut shell {
+                crate::hyperlinks::remove_range_links(xml);
+            }
+        }
+        if let Some(xml) = shell {
+            out.start_file(
+                part,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )?;
             out.write_all(xml.as_bytes())?;
         } else {
             out.raw_copy_file(zip.by_index_raw(i)?)?;
         }
     }
-    out.finish()?;
-    Ok(Some((path, omitted)))
+    out.finish()?.flush()?;
+    Ok(Some(SlimBase {
+        path,
+        omitted,
+        grids,
+    }))
+}
+
+/// The shell is the fully patched worksheet. Transfer the source data directly
+/// from its spool to the ZIP and retain new comments, drawings and other siblings.
+fn restore_grids(
+    path: &Path,
+    grids: std::collections::HashMap<String, PreservedGrid>,
+) -> Result<()> {
+    use std::io::{BufWriter, Write};
+    let targets = crate::patch::sheet_targets(path)?;
+    let mut parts = std::collections::HashMap::new();
+    for (sheet, grid) in grids {
+        let part = targets.get(&sheet).context("找不到单元格区域所属工作表")?;
+        anyhow::ensure!(parts.insert(part.clone(), grid).is_none(), "工作表部件重复");
+    }
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let (file, temp) = tempfile::NamedTempFile::new_in(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?
+    .into_parts();
+    let mut out = zip::ZipWriter::new(BufWriter::new(file));
+    for i in 0..zip.len() {
+        let part = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
+        let Some(grid) = parts.remove(&part) else {
+            out.raw_copy_file(zip.by_index_raw(i)?)?;
+            continue;
+        };
+        let mut shell = read_zip_text(&mut zip, &part)?;
+        let doc = roxmltree::Document::parse(&shell)?;
+        if let Some(d) = doc
+            .root_element()
+            .children()
+            .find(|n| n.has_tag_name("dimension"))
+        {
+            if let Some(reference) = grid.dimension {
+                let span = d
+                    .attribute_node("ref")
+                    .context("工作表缺少尺寸")?
+                    .range_value();
+                shell.replace_range(span, &reference);
+            } else {
+                shell.replace_range(d.range(), "");
+            }
+        }
+        let doc = roxmltree::Document::parse(&shell)?;
+        let data = doc
+            .root_element()
+            .children()
+            .find(|n| n.has_tag_name("sheetData"))
+            .context("工作表缺少 sheetData")?
+            .range();
+        out.start_file(
+            part,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )?;
+        out.write_all(&shell.as_bytes()[..data.start])?;
+        std::io::copy(&mut std::fs::File::open(&grid.path)?, &mut out)?;
+        out.write_all(&shell.as_bytes()[data.end..])?;
+    }
+    anyhow::ensure!(parts.is_empty(), "缺少要恢复的单元格区域");
+    out.finish()?.flush()?;
+    drop(zip);
+    temp.persist(path)?;
+    Ok(())
 }
 
 fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> Result<CellWrite> {
@@ -2056,7 +2216,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     let forced_snapshot;
     let wb: &Workbook = if fresh_base {
         let mut copy = wb.clone();
-        for sh in copy.sheets.iter_mut() {
+        for (index, sh) in copy.sheets.iter_mut().enumerate() {
             sh.mark_all_dirty();
             sh.cf_dirty = !sh.cf.blocks.is_empty() || !sh.cf.dxfs.is_empty();
             sh.dv_dirty = !sh.dv.is_empty();
@@ -2065,6 +2225,10 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             sh.scenarios_dirty = !sh.scenarios.is_empty();
             sh.ignored_errors_dirty = !sh.ignored_errors.is_empty();
             sh.notes_dirty = !sh.notes.is_empty();
+            sh.rich_dirty = !streamed[index] && !sh.rich.is_empty();
+            sh.sparklines_dirty = !sh.sparklines.is_empty();
+            sh.textboxes_dirty = !sh.textboxes.is_empty();
+            sh.pictures_dirty |= sh.pictures.iter().any(|p| p.data.is_some());
             sh.tables_dirty = !sh.tables.is_empty();
             sh.tab_color_dirty = sh.tab_color.is_some();
             sh.protect_dirty = sh.protection.is_some();
@@ -2088,6 +2252,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             || s.col_styles_dirty
             || s.merges_dirty
             || s.notes_dirty
+            || s.rich_dirty
             || !s.style_edits.is_empty()
     };
     let reusable_package = !fresh_base
@@ -2116,6 +2281,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         None
     };
     let mut omitted_sheets = Vec::new();
+    let mut preserved_grids = std::collections::HashMap::new();
     if can_bypass_umya {
         if !patched && base != path {
             std::fs::copy(&base, path).with_context(|| format!("写入失败 {}", path.display()))?;
@@ -2129,10 +2295,11 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
         }
     } else {
         let mut book = if base.exists() {
-            let slim = slim_umya_base(&base, wb)?;
-            let source = if let Some((path, names)) = &slim {
-                omitted_sheets.clone_from(names);
-                path.as_ref()
+            let mut slim = slim_umya_base(&base, wb)?;
+            let source = if let Some(slim) = &mut slim {
+                omitted_sheets = std::mem::take(&mut slim.omitted);
+                preserved_grids = std::mem::take(&mut slim.grids);
+                slim.path.as_ref()
             } else {
                 base.as_path()
             };
@@ -2258,7 +2425,7 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
                 *ws.get_merge_cells_mut() = refs;
             }
 
-            if streamed[idx] { continue; }
+            if streamed[idx] || preserved_grids.contains_key(&sheet.name) { continue; }
             for (cref, cell) in sheet.iter() {
                 // 动态数组的溢出值不落盘：文件里只保存锚点公式，打开时重新计算
                 if sheet.spilled.contains(&cref) {
@@ -2779,7 +2946,9 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
             }
         }
     }
-    must_save!("rich", crate::patch::apply_rich(path, wb));
+    if !can_bypass_umya {
+        must_save!("rich", crate::patch::apply_rich(path, wb));
+    }
     must_save!("page-setup", crate::patch::apply_page_setup(path, wb));
     if !can_bypass_umya {
         let shrink_parts: Vec<(String, Vec<(u32, u32)>, Vec<u32>, Vec<u32>)> = wb
@@ -2878,10 +3047,31 @@ fn save_plain_base(path: &Path, wb: &Workbook, base_override: Option<&Path>) -> 
     // 最后一步：外链关系按原文恢复，避免 URL 被归一、TargetMode 被丢
     must_save!("restore-external-rels", crate::notes::restore_external_rels(path, &external_rels));
     crate::patch::commit_stage(path).context("保存收尾补丁落盘失败")?;
+    let mut created_charts = std::collections::HashMap::new();
+    if fresh_base {
+        for sheet in wb.sheets.iter().filter(|s| s.source_part.is_none()) {
+            let new_charts: Vec<_> = sheet.charts.iter().enumerate().filter(|(_,ch)| ch.part.is_empty()).collect();
+            for (_, chart) in &new_charts {
+                let mut committed = (*chart).clone();
+                if committed.series.iter().any(|series| !series.val_ref.is_empty()) {
+                    crate::chart_write::refresh_series_from_refs(wb, &sheet.name, &mut committed)?;
+                }
+                crate::chart_write::insert_chart(path, &sheet.name, &committed)?;
+            }
+            if !new_charts.is_empty() {
+                let generated = crate::charts::load_charts(path, &sheet.name)?;
+                anyhow::ensure!(generated.len() == new_charts.len(), "图表写入后的关系数量不一致");
+                for ((i,_), chart) in new_charts.into_iter().zip(generated) {
+                    created_charts.insert((sheet.identity, i), (chart.part, chart.drawing));
+                }
+            }
+        }
+    }
     if streamed.iter().any(|&s| s) {
         fresh::write(path, wb, &streamed).context("流式写入工作表单元格失败")?;
     }
-    Ok(CellWrite { styles: saved_styles, used_delta: patched })
+    if !preserved_grids.is_empty() { restore_grids(path,preserved_grids)?; }
+    Ok(CellWrite { styles: saved_styles, used_delta: patched, created_charts })
 }
 
 /// 把条件格式写进 xlsx（重写 sheet XML 与 styles.xml 的 dxfs）
@@ -3728,14 +3918,150 @@ mod tests {
         crate::patch::append_entry(&base, &part, original.as_bytes()).unwrap();
         let mut loaded = load(&base).unwrap();
         loaded.sheets[0].set(0, 0, Cell { value: Value::Text("new shared string".into()), formula: None });
-        let (slim, omitted) = slim_umya_base(&base, &loaded).unwrap().unwrap();
-        assert_eq!(omitted, ["Large"]);
-        assert!(read_part(&slim, &part).unwrap().len() < 4096);
+        let slim = slim_umya_base(&base, &loaded).unwrap().unwrap();
+        assert_eq!(slim.omitted, ["Large"]);
+        assert!(read_part(&slim.path, &part).unwrap().len() < 4096);
         save_atomic(&copy, &loaded).unwrap();
         assert_eq!(crate::fixups::read_part_file(&copy, &part).unwrap(), original.as_bytes());
         let back = load(&copy).unwrap();
         assert_eq!(back.sheets[1].value(0, 0), wb.sheets[1].value(0, 0));
         assert_eq!(back.sheets[0].value(0, 0), loaded.sheets[0].value(0, 0));
+    }
+
+    #[test]
+    fn existing_large_grid_and_new_note_survive_metadata_only_dom_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.xlsx");
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(
+            0,
+            0,
+            Cell {
+                value: Value::Number(73.0),
+                formula: None,
+            },
+        );
+        wb.sheets[0].set(
+            1,
+            0,
+            Cell {
+                value: Value::Number(5.0),
+                formula: None,
+            },
+        );
+        wb.sheets[0].set(
+            1,
+            1,
+            Cell {
+                value: Value::Number(10.0),
+                formula: Some("=A2*2".into()),
+            },
+        );
+        wb.sheets[0].set(
+            2,
+            0,
+            Cell {
+                value: Value::Text("Rich text".into()),
+                formula: None,
+            },
+        );
+        save_atomic(&path, &wb).unwrap();
+        let part = crate::patch::sheet_targets(&path).unwrap()["Sheet1"].clone();
+        let xml = read_zip_text(
+            &mut zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap(),
+            &part,
+        )
+        .unwrap();
+        let marker = "<?keep data?><v>0073.000</v>";
+        let rich = "<r><rPr><b/></rPr><t xml:space=\"preserve\">Rich </t></r><r><t>text</t></r><rPh sb=\"0\" eb=\"1\"><t>R</t></rPh>";
+        assert!(xml.contains("t=\"s\""));
+        crate::patch::append_entry(&path,"xl/sharedStrings.xml",format!("<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\" uniqueCount=\"1\"><si>{rich}</si></sst>").as_bytes()).unwrap();
+        let raw = xml.replace("<v>73</v>", marker).replace(
+            "</sheetData>",
+            &format!(
+                "<!--{}--></sheetData>",
+                "grid".repeat(crate::fixups::RAW_SHEET_MIN_BYTES as usize / 4)
+            ),
+        );
+        assert!(raw.contains(marker));
+        crate::patch::append_entry(&path, &part, raw.as_bytes()).unwrap();
+        let mut model = load(&path).unwrap();
+        let note = crate::notes::Note {
+            r: 5,
+            c: 7,
+            author: "Review".into(),
+            text: "first note".into(),
+        };
+        model.sheets[0]
+            .notes
+            .insert(CellRef::new(5, 7), note.clone());
+        model.sheets[0].notes_dirty = true;
+        model.sheets[0].set(
+            1,
+            0,
+            Cell {
+                value: Value::Number(6.0),
+                formula: None,
+            },
+        );
+        crate::formula::recalc_all(&mut model);
+        let s = &model.sheets[0];
+        assert!(s.source_cells.as_ref().is_some_and(|src| src.reusable_grid(
+            &mut zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap(),
+            &part,
+            s
+        )));
+        assert!(
+            !s.layout_dirty
+                && !s.filter_dirty
+                && !s.rich_dirty
+                && !s.merges_dirty
+                && !s.styles_dirty
+                && s.style_edits.is_empty(),
+            "layout={}, filter={}, rich={}, merges={}, styles={}",
+            s.layout_dirty,
+            s.filter_dirty,
+            s.rich_dirty,
+            s.merges_dirty,
+            s.styles_dirty
+        );
+        assert!(
+            crate::patch::entry_size(&path, &part) > crate::fixups::RAW_SHEET_MIN_BYTES,
+            "source size: {}, {}",
+            crate::patch::entry_size(&path, &part),
+            part
+        );
+        let slim = slim_umya_base(&path, &model).unwrap().unwrap();
+        assert!(slim.grids.contains_key("Sheet1"));
+        assert!(read_part(&slim.path, &part).unwrap().len() < 4096);
+        let receipt = save_atomic_with_receipt(&path, &model).unwrap();
+        assert!(!receipt.used_cell_delta);
+        receipt.adopt_document(&mut model, &path, true);
+        let sheet = load(&path).unwrap().sheets.remove(0);
+        assert_eq!(sheet.value(0, 0), Value::Number(73.0));
+        assert_eq!(sheet.value(1, 1), Value::Number(12.0));
+        assert_eq!(sheet.value(1, 0), Value::Number(6.0));
+        assert_eq!(sheet.notes.get(&CellRef::new(5, 7)), Some(&note));
+        let saved =
+            String::from_utf8(crate::fixups::read_part_file(&path, &part).unwrap()).unwrap();
+        assert!(saved.contains(marker) && saved.contains("gridgrid"));
+        assert!(saved.contains(rich));
+        assert_eq!(sheet.value(2, 0), Value::Text("Rich text".into()));
+        model.sheets[0].set(
+            1,
+            0,
+            Cell {
+                value: Value::Number(8.0),
+                formula: None,
+            },
+        );
+        crate::formula::recalc_all(&mut model);
+        let second = save_atomic_with_receipt(&path, &model).unwrap();
+        assert!(second.used_cell_delta);
+        assert_eq!(
+            load(&path).unwrap().sheets[0].value(1, 1),
+            Value::Number(16.0)
+        );
     }
 
     #[test]

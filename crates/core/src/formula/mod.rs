@@ -6,6 +6,7 @@
 pub mod array;
 mod compiled;
 mod scalar_batch;
+mod dependency_batch;
 pub(crate) mod lookup_cache;
 mod conditional_index;
 #[cfg(test)]
@@ -81,7 +82,7 @@ pub enum Node {
     Percent(Box<Node>),
     Binary(BinOp, Box<Node>, Box<Node>),
     /// 数组常量 {1,2;3,4}
-    Array(usize, usize, Vec<FValue>),
+    Array(usize, usize, Vec<crate::Value>),
 }
 
 /// Excel omits referenced cells containing a nested SUBTOTAL. Check the AST
@@ -520,7 +521,7 @@ impl Parser {
                 Ok(e)
             }
             Some(Tok::LBrace) => {
-                let mut rows: Vec<Vec<FValue>> = vec![Vec::new()];
+                let mut rows: Vec<Vec<crate::Value>> = vec![Vec::new()];
                 loop {
                     let v = match self.next() {
                         Some(Tok::Num(n)) => FValue::number(n),
@@ -551,7 +552,7 @@ impl Parser {
                         }
                         _ => return Err(ErrKind::Value),
                     };
-                    rows.last_mut().unwrap().push(v);
+                    rows.last_mut().unwrap().push(from_fvalue(&v));
                     match self.next() {
                         Some(Tok::Comma) => continue,
                         Some(Tok::Semi) => {
@@ -565,10 +566,10 @@ impl Parser {
                 let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
                 let nrows = rows.len();
                 let mut data = Vec::with_capacity(nrows * cols);
-                for r in &rows {
-                    for c in 0..cols {
-                        data.push(r.get(c).cloned().unwrap_or(FValue::Empty));
-                    }
+                for row in rows {
+                    let end = data.len() + cols;
+                    data.extend(row);
+                    data.resize(end,crate::Value::Empty);
                 }
                 Ok(Node::Array(nrows, cols, data))
             }
@@ -923,6 +924,7 @@ pub struct Calc<'a> {
     criteria_cache: HashMap<CriteriaKey, FValue>,
     grouped_criteria: [functions::GroupedCriteria; 2],
     ordered_criteria: conditional_index::OrderedCriteria,
+    match_indexes: conditional_index::MatchIndexes,
     sum_prefixes: HashMap<PrefixKey, SumPrefixes>,
     sum_ends: HashMap<PrefixKey, i64>,
     prefix_values: usize,
@@ -1030,6 +1032,7 @@ impl<'a> Calc<'a> {
             cache_order: Default::default(), cache_clock: 0, criteria_cache: HashMap::new(),
             grouped_criteria: Default::default(),
             ordered_criteria: Default::default(),
+            match_indexes: Default::default(),
             sum_prefixes: HashMap::new(), sum_ends: HashMap::new(), prefix_values: 0, agg_hits: 0, agg_miss: 0,
             cur_sheet: 0, volatile_values: HashMap::new(), volatile_counts: HashMap::new(),
             prev_system, prev_now }
@@ -1402,8 +1405,8 @@ impl<'a> Calc<'a> {
                     let (si, row, col) = *key;
                     !self.memo.contains_key(key)
                         && !self.visiting.contains(key)
-                        && self.scope.as_ref().is_none_or(|scope| scope.contains(key))
-                        && self.wb.sheets[si].get(row, col).is_some_and(|c| c.formula.is_some())
+                        && self.wb.sheets[si].get(row,col).is_some_and(|c| c.formula.is_some()
+                            && (self.scope.is_none_or(|scope| scope.contains(key)) || callable_cache_candidate(&c.value)))
                 });
                 if let Some(key) = next {
                     let frame = (key, bindings.clone());
@@ -1443,10 +1446,12 @@ impl<'a> Calc<'a> {
         };
         if let Some(f) = cell.formula.as_deref() {
             // 增量重算：不在本次范围内的公式，直接用文件里缓存的结果
-            if let Some(scope) = &self.scope {
-                if !scope.contains(&key) {
-                    return to_fvalue(&cell.value);
-                }
+            let outside_scope = self.scope.is_some_and(|scope| !scope.contains(&key));
+            // Closures have no persisted scalar representation. Re-evaluate just a
+            // requested candidate (including a reference forwarding the closure).
+            // A genuine text cache equal to this marker remains the cached text.
+            if outside_scope && !callable_cache_candidate(&cell.value) {
+                return to_fvalue(&cell.value);
             }
             if !self.visiting.insert(key) {
                 CYCLE_CELLS.with(|cells| {
@@ -1481,10 +1486,12 @@ impl<'a> Calc<'a> {
             // Only volatile formulas need a counter. A suspended frame restarts
             // from its first sample and replays values already collected.
             self.volatile_counts.remove(&key);
-            let mut v = match compile_at(body, r, c) {
-                Ok(node) => self.eval_node(&node, si),
-                Err(e) => FValue::Error(e),
+            let mut v = if let Some(scalar) = compiled::scalar_at(body, r, c) {
+                scalar.evaluate(|row,col| Some(self.cell_value(si,row,col))).expect("scalar template")
+            } else {
+                compiled::with_node(body, r, c, |node| self.eval_node(node, si)).unwrap_or_else(FValue::Error)
             };
+            if outside_scope && !matches!(v,FValue::Lambda(_)) { v = to_fvalue(&cell.value); }
             if let FValue::Array(a) = &v {
                 if array_blocked(self.wb, si, r, c, a, true) {
                     v = FValue::Error(ErrKind::Spill);
@@ -1820,7 +1827,7 @@ impl<'a> Calc<'a> {
             }
             Node::Binary(op, l, r) => self.eval_binary(*op, l, r, si),
             Node::Array(rows, cols, data) => {
-                FValue::Array(std::rc::Rc::new(value::Array::new(*rows, *cols, data.clone())))
+                FValue::Array(std::rc::Rc::new(value::Array::new(*rows, *cols, data.iter().map(to_fvalue).collect())))
             }
             // IF 系列必须短路求值：未被选中的分支不能计算（否则 IF(A1=0,1,1/A1) 会误报 #DIV/0!）
             Node::Func(name, nodes) if name == "IF" && nodes.len() >= 2 => {
@@ -2698,6 +2705,7 @@ impl<'a> Calc<'a> {
                 let grouped = criteria_key.as_ref().and_then(|k| {
                     self.ordered_criteria.lookup(k, &args).or_else(||
                         self.grouped_criteria.get_mut(k.function as usize)?.lookup(k, &args))
+                        .or_else(|| self.match_indexes.lookup(k,&args))
                 });
                 let out = if let Some(value) = grouped {
                     value
@@ -2883,20 +2891,14 @@ impl<'a> Calc<'a> {
         b: &RefExpr,
         vertical: bool,
     ) -> lookup_cache::Index {
-        let key = (
-            si,
-            a.row.min(b.row),
-            a.col.min(b.col),
-            a.row.max(b.row),
-            a.col.max(b.col),
-        );
+        let Some(key) = self.grid_key(si,a,b) else { return Default::default(); };
         let local = (key, vertical);
         if let Some(ix) = self.lookup_index.get(&local) {
             return ix.clone();
         }
         let sheet = &self.wb.sheets[si];
         let span = if vertical { key.3 - key.1 } else { key.4 - key.2 };
-        if span >= 255 && let Some(ix) = sheet.shared_lookup.get(sheet.cell_version(), local) {
+        if span >= 255 && let Some(ix) = sheet.shared_lookup.get(sheet, local) {
             self.lookup_index.insert(local, ix.clone());
             return ix;
         }
@@ -2921,7 +2923,7 @@ impl<'a> Calc<'a> {
                 let rect = (r1 as u32, c1 as u32, r1 as u32 + if vertical { rows.saturating_sub(1) as u32 } else { 0 },
                     c1 as u32 + if vertical { 0 } else { cols.saturating_sub(1) as u32 });
                 if !sheet.iter_rect(rect).any(|(_,c)| c.formula.is_some()) {
-                    sheet.shared_lookup.insert(sheet.cell_version(), local, index.clone());
+                    sheet.shared_lookup.insert(sheet, local, index.clone());
                 }
             }
             self.lookup_index.insert(local, index.clone());
@@ -2936,6 +2938,17 @@ impl<'a> Calc<'a> {
         a: &RefExpr,
         b: &RefExpr,
     ) -> (usize, usize, std::rc::Rc<Vec<FValue>>) {
+        let Some(key) = self.grid_key(si,a,b) else { return (0,0,Default::default()); };
+        let (_,r1,c1,br,bc) = key;
+        let rows = (br - r1 + 1) as usize;
+        let cols = (bc - c1 + 1) as usize;
+        match self.materialize_range(key, rows * cols) {
+            Ok(values) => (rows, cols, values),
+            Err(_) => (0, 0, Default::default()),
+        }
+    }
+
+    fn grid_key(&mut self, si: usize, a: &RefExpr, b: &RefExpr) -> Option<RangeKey> {
         // 同样按实际使用范围裁剪，否则 A:A 会展开成 104 万格
         let (max_r, max_c) = self.sheet_bounds(si);
         let mut br = a.row.max(b.row);
@@ -2954,16 +2967,7 @@ impl<'a> Calc<'a> {
             bc = bc.min(max_c as i64);
         }
         let (r1, c1) = (a.row.min(b.row), a.col.min(b.col));
-        if br < r1 || bc < c1 {
-            return (0, 0, std::rc::Rc::new(Vec::new()));
-        }
-        let key = (si, r1, c1, br, bc);
-        let rows = (br - r1 + 1) as usize;
-        let cols = (bc - c1 + 1) as usize;
-        match self.materialize_range(key, rows * cols) {
-            Ok(values) => (rows, cols, values),
-            Err(_) => (0, 0, Default::default()),
-        }
+        (br >= r1 && bc >= c1).then_some((si,r1,c1,br,bc))
     }
 
     fn visible_summary_values(
@@ -3297,6 +3301,10 @@ pub fn from_fvalue(v: &FValue) -> crate::model::Value {
         // 函数值落盘没有对应类型，Excel 里显示 #CALC!
         FValue::Lambda(_) => V::Text("#CALC!".into()),
     }
+}
+
+fn callable_cache_candidate(value: &crate::Value) -> bool {
+    matches!(value, crate::Value::Text(text) if text.as_ref() == "#CALC!")
 }
 
 fn key_norm(v: &FValue) -> String {
@@ -3639,16 +3647,33 @@ fn recalc_dirty_impl(
     let mut prev_nums: HashMap<deps::CellKey, f64> = HashMap::new();
     let mut last_count = 0usize;
     for pass in 0..passes {
-        let mut results = Vec::with_capacity(order.len());
-        {
+        let parallel = if wb.calc_iterate || profile_enabled() { None } else {
+            dependency_batch::dirty(wb,&order,&dirty,cancel)
+        };
+        if cancelled() { return None; }
+        let results = {
             let mut calc = Calc::new(wb);
             calc.scope = Some(&dirty);
-            for (si, r, c) in &order {
-                if cancelled() { return None; }
-                let v = calc.cell_value(*si, *r, *c);
-                results.push((*si, *r, *c, v));
+            if let Some(mut batch) = parallel {
+                let mut pending = batch.pending.iter().copied().peekable();
+                for (slot,(s,r,c,v)) in batch.values.iter().enumerate() {
+                    if pending.next_if_eq(&slot).is_none() { calc.memo.insert((*s,*r,*c),v.clone()); }
+                }
+                for slot in batch.pending {
+                    if cancelled() { return None; }
+                    let (si,r,c) = order[slot];
+                    batch.values[slot].3 = calc.cell_value(si,r,c);
+                }
+                batch.values
+            } else {
+                let mut results = Vec::with_capacity(order.len());
+                for &(si,r,c) in &order {
+                    if cancelled() { return None; }
+                    results.push((si,r,c,calc.cell_value(si,r,c)));
+                }
+                results
             }
-        }
+        };
         // 新公式可能第一次产生数组，此时尚无 spilled 标记。
         if !write_dirty_results(wb, results) {
             let count = wb.sheets.iter().map(|s| s.formula_cells().count()).sum();
@@ -3812,8 +3837,8 @@ pub fn recalc_interactive_plan(
     if timed_out { BackgroundDirty } else { Complete }
 }
 
-fn clear_spills(wb: &mut Workbook) {
-    for sheet in &mut wb.sheets {
+fn clear_spills(wb: &mut Workbook, selected: Option<&[bool]>) {
+    for (_,sheet) in wb.sheets.iter_mut().enumerate().filter(|(i,_)| selected.is_none_or(|s| s[*i])) {
         // `Sheet::set` 会把被用户覆盖的格子从 spilled 里摘掉，
         // 所以这里剩下的键一定还是上次溢出写的值，可以安全清掉。
         sheet.spill_shapes.clear();
@@ -3825,8 +3850,8 @@ fn clear_spills(wb: &mut Workbook) {
     }
 }
 
-fn spill_values(wb: &Workbook) -> HashMap<deps::CellKey, crate::Value> {
-    wb.sheets.iter().enumerate().flat_map(|(si, sheet)| {
+fn spill_values(wb: &Workbook, selected: Option<&[bool]>) -> HashMap<deps::CellKey, crate::Value> {
+    wb.sheets.iter().enumerate().filter(|(i,_)| selected.is_none_or(|s| s[*i])).flat_map(|(si, sheet)| {
         sheet.spilled.iter().map(move |key| ((si, key.row, key.col), sheet.value(key.row, key.col)))
     }).collect()
 }
@@ -3855,6 +3880,14 @@ pub fn recalc_all_force(wb: &mut Workbook) {
 /// 多遍计算可能已经物化了前一遍的溢出区或迭代值。
 pub fn recalc_all_force_impl(
     wb: &mut Workbook,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: Option<(&std::sync::atomic::AtomicUsize, &std::sync::atomic::AtomicUsize)>,
+) -> bool {
+    recalc_selected(wb,None,cancel,progress)
+}
+
+fn recalc_selected(
+    wb: &mut Workbook, selected: Option<&[bool]>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     progress: Option<(&std::sync::atomic::AtomicUsize, &std::sync::atomic::AtomicUsize)>,
 ) -> bool {
@@ -3894,7 +3927,7 @@ pub fn recalc_all_force_impl(
     }
     // 文件里带 t="array" ref 的公式，覆盖区域里存的是上次的结果值；
     // 先把这些格子登记成溢出区，否则重算时会被自己上次的结果挡住（#SPILL!）
-    for sheet in wb.sheets.iter_mut() {
+    for (_,sheet) in wb.sheets.iter_mut().enumerate().filter(|(i,_)| selected.is_none_or(|s| s[*i])) {
         for (anchor, (r1, c1, r2, c2)) in sheet.arrays.clone() {
             for r in r1..=r2 {
                 for c in c1..=c2 {
@@ -3907,14 +3940,15 @@ pub fn recalc_all_force_impl(
         }
     }
     // 先清掉上一轮的溢出单元格
-    clear_spills(wb);
+    clear_spills(wb,selected);
 
     mark!("清溢出");
     // Recalculation changes values and spill tails, not formula text. Preserve row-major
     // order for intersecting spills while skipping pages that cannot contain formulas.
-    let mut formulas: Vec<_> = wb.sheets.iter().enumerate().flat_map(|(si, sh)|
+    let mut formulas: Vec<_> = wb.sheets.iter().enumerate().filter(|(i,_)| selected.is_none_or(|s| s[*i])).flat_map(|(si, sh)|
         sh.formula_cells().map(move |(k, _)| (si, k.row, k.col))).collect();
     formulas.sort_unstable();
+    let scope: Option<HashSet<_>> = selected.map(|_| formulas.iter().copied().collect());
     let formula_count = formulas.len();
     // 无环的溢出依赖链每遍至少推进一个公式；再多一遍确认稳定。
     // 迭代计算：环上按上一轮值反复推进，最多 calc_max_iterations 遍（Excel 默认 100）
@@ -3931,14 +3965,16 @@ pub fn recalc_all_force_impl(
     let mut prev_nums: HashMap<deps::CellKey, f64> = HashMap::new();
     for _pass in 0..passes {
         pass_done += 1;
-        let before_spills = spill_values(wb);
+        let before_spills = spill_values(wb,selected);
         mark!("收集公式");
         if let Some((done, total)) = progress {
             total.store(formulas.len(), Ordering::Relaxed);
             done.store(0, Ordering::Relaxed);
         }
-        let parallel = if !wb.calc_iterate && !profile_enabled() {
-            scalar_batch::evaluate(wb, &formulas, cancel, progress.map(|p| p.0))
+        let parallel = if selected.is_none() && !wb.calc_iterate && !profile_enabled() {
+            let done = progress.map(|p| p.0);
+            let independent = scalar_batch::evaluate(wb, &formulas, cancel, done);
+            dependency_batch::evaluate(wb, &formulas, independent, cancel, done)
         } else { None };
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return mark_cancelled(wb);
@@ -3950,6 +3986,7 @@ pub fn recalc_all_force_impl(
         let remaining = pending.as_ref().map_or(formulas.len(), Vec::len);
         if remaining > 0 {
             let mut calc = Calc::new(wb);
+            calc.scope = scope.as_ref();
             if pending.is_some() {
                 // Sequential formulas may refer to any numeric batch result, even across sheets.
                 // Keep the original sheet untouched until the complete pass is ready to publish.
@@ -4018,7 +4055,7 @@ pub fn recalc_all_force_impl(
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return mark_cancelled(wb);
         }
-        clear_spills(wb);
+        clear_spills(wb,selected);
         write_back(wb, results);
         mark!("写回");
         if std::env::var("SC_CHECKSUM").is_ok() {
@@ -4034,7 +4071,7 @@ pub fn recalc_all_force_impl(
             }
             eprintln!("[checksum] pass {} 数值格 {} 合计 {:.6}", _pass + 1, cnt, sum);
         }
-        let after_spills = spill_values(wb);
+        let after_spills = spill_values(wb,selected);
         // 普通模式：溢出块稳定即停。迭代模式不能在这里停——环上格子没有溢出，
         // 一停就只跑一遍，永远到不了不动点。
         if !wb.calc_iterate && before_spills == after_spills && (!force_two || _pass > 0) {
@@ -4052,7 +4089,7 @@ pub fn recalc_all_force_impl(
             let mut affected = graph.closure(&unstable.iter().copied().collect::<Vec<_>>());
             affected.extend(changing_arrays);
             affected.extend(graph.dynamic_cells());
-            clear_spills(wb);
+            clear_spills(wb,selected);
             for (si, r, c, value) in &mut final_results {
                 let key = (*si, *r, *c);
                 // 迭代计算时环上格子每遍都在变，它们不属于「不稳定」，而是收敛过程本身；

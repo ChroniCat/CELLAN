@@ -504,6 +504,10 @@ impl CountIndexes {
 }
 
 impl Crit {
+    pub(super) fn numeric_query(&self) -> Option<(&'static str,f64)> {
+        self.num.map(|n| (self.op,n))
+    }
+
     pub(super) fn numeric_bounds(&self) -> Option<(&'static str, f64)> {
         let n = self.num?;
         (n.is_finite() && matches!(self.op, ">" | "<" | ">=" | "<=" | "<>")).then_some((self.op, n))
@@ -615,6 +619,10 @@ impl Crit {
             FValue::Bool(true) => "true", FValue::Bool(false) => "false",
             _ => { display = v.display(); &display }
         };
+        self.matches_coerced_text(text)
+    }
+
+    pub(super) fn matches_coerced_text(&self, text: &str) -> bool {
         if self.wild && matches!(self.op, "=" | "<>") {
             let matched = if text.contains('Σ') {
                 wildcard_ci(&text.to_lowercase(), &self.text)

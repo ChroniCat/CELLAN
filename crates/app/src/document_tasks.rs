@@ -8,13 +8,33 @@ use sheetcore::{Workbook, xlsx::SaveReceipt};
 
 use super::{egui, OpenMsg};
 
+#[derive(Clone)]
+pub(crate) struct StructuralCalculation {
+    pub generation: u64,
+    pub sheet: usize,
+    pub op: sheetcore::structural::Structural,
+    pub complex: bool,
+    pub graph: std::sync::Arc<sheetcore::formula::deps::Deps>,
+}
+
+impl StructuralCalculation {
+    pub fn apply(&self, wb: &mut Workbook, cancel: &std::sync::atomic::AtomicBool)
+        -> Option<sheetcore::formula::deps::Deps> {
+        if self.complex {
+            self.graph.recalc_structural_sheets(wb, self.sheet, cancel)
+        } else {
+            self.graph.recalc_structural(wb, self.sheet, &self.op, cancel)
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct DocumentTasks {
     pub open_rx: Option<Receiver<OpenMsg>>,
     pub reorder: Option<super::data_reorder::Pending>,
     pub busy: bool,
     pub needs_full: bool,
-    pub structural_recalc: Option<(u64, usize, sheetcore::structural::Structural, std::sync::Arc<sheetcore::formula::deps::Deps>)>,
+    pub structural_recalc: Option<StructuralCalculation>,
     /// Retain pending edits until a result for this document generation is applied.
     pub dirty_recalc_seeds: std::collections::BTreeSet<sheetcore::formula::deps::CellKey>,
     pub last_edit: Option<Instant>,
@@ -120,7 +140,7 @@ impl DocumentTasks {
     }
 
     pub fn start_save(&mut self, wb: &mut Workbook, target: PathBuf) {
-        self.start_save_checked(wb, target, None, |_| None);
+        self.start_save_checked(wb, target, None, None, |_| None);
     }
 
     pub fn start_save_checked(
@@ -128,6 +148,7 @@ impl DocumentTasks {
         wb: &mut Workbook,
         target: PathBuf,
         deps: Option<std::sync::Arc<sheetcore::formula::deps::Deps>>,
+        generation: Option<u64>,
         check_target: impl FnOnce(&Path) -> Option<String> + Send + 'static,
     ) {
         debug_assert!(self.saving.is_none());
@@ -139,6 +160,8 @@ impl DocumentTasks {
         wb.dirty = false;
         self.autosave_dirty_since = None;
         let recalc = self.recalc_pending() && !snapshot.calc_manual;
+        let structure = self.structural_recalc.as_ref()
+            .filter(|s| recalc && self.needs_full && Some(s.generation) == generation).cloned();
         let incremental = deps.filter(|_| recalc && !self.needs_full && !snapshot.calc_iterate)
             .map(|graph| (graph, self.dirty_recalc_seeds.iter().copied().collect::<Vec<_>>()));
         std::thread::spawn(move || {
@@ -150,7 +173,7 @@ impl DocumentTasks {
                 let revisions = snapshot.sheets.iter().map(|sh| sh.cell_revision()).collect();
                 if let Some((graph, seeds)) = incremental {
                     sheetcore::formula::recalc_dirty(&mut snapshot, &graph, &seeds);
-                } else {
+                } else if !structure.is_some_and(|s| s.apply(&mut snapshot,&false.into()).is_some()) {
                     sheetcore::formula::recalc_all(&mut snapshot);
                 }
                 revisions
@@ -188,6 +211,7 @@ impl DocumentTasks {
                 let calculated_on_save = calculated.is_some();
                 let applied = !wb.dirty && calculated.is_some_and(|result| result.apply(wb));
                 if applied {
+                    self.structural_recalc = None;
                     self.needs_full = false;
                     self.dirty_recalc_seeds.clear();
                 }

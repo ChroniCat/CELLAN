@@ -1,6 +1,6 @@
 //! Independent numeric expressions can be split across cores without duplicating
 //! Calc's memoized dependencies, volatile values or lookup indexes.
-use super::{bin_scalar, compile_at, deps::CellKey, BinOp, Calc, FValue, Node, RefExpr, Workbook};
+use super::{bin_scalar, deps::CellKey, BinOp, Calc, FValue, Node, RefExpr, Workbook};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn literal(wb: &Workbook, sheet: usize, node: &Node) -> Option<f64> {
@@ -66,17 +66,27 @@ fn independent(wb: &Workbook, sheet: usize, node: &Node) -> bool {
 
 fn evaluate_cell<'a>(wb: &'a Workbook, (sheet,row,col): CellKey, worker: &mut Option<Calc<'a>>) -> Option<crate::Value> {
     let formula = wb.sheet(sheet).get(row, col)?.formula.as_deref()?;
-    let node = compile_at(formula.strip_prefix('=').unwrap_or(formula), row, col).ok()?;
-    if let Some(value) = numeric_binary(wb, sheet, &node) {
-        return Some(value.map_or_else(crate::Value::Error, crate::Value::Number));
+    let source = formula.strip_prefix('=').unwrap_or(formula);
+    if let Some(template) = super::compiled::scalar_at(source, row, col) {
+        let result = template.evaluate(|r,c| match wb.sheet(sheet).get(r,c) {
+            Some(cell) if cell.formula.is_some() => None,
+            Some(cell) => Some(super::to_fvalue(&cell.value)),
+            None => Some(FValue::Empty),
+        })?;
+        return Some(super::from_fvalue(&result));
     }
-    if !independent(wb, sheet, &node) { return None; }
-    let calc = worker.get_or_insert_with(|| Calc::new(wb));
-    calc.cur = (row,col);
-    calc.cur_sheet = sheet;
-    let value = calc.eval_node(&node, sheet);
-    if matches!(value, FValue::Array(_) | FValue::Lambda(_)) { return None; }
-    Some(super::from_fvalue(&value))
+    super::compiled::with_node(source, row, col, |node| {
+        if let Some(value) = numeric_binary(wb, sheet, node) {
+            return Some(value.map_or_else(crate::Value::Error, crate::Value::Number));
+        }
+        if !independent(wb, sheet, node) { return None; }
+        let calc = worker.get_or_insert_with(|| Calc::new(wb));
+        calc.cur = (row,col);
+        calc.cur_sheet = sheet;
+        let value = calc.eval_node(node, sheet);
+        if matches!(value, FValue::Array(_) | FValue::Lambda(_)) { return None; }
+        Some(super::from_fvalue(&value))
+    }).ok().flatten()
 }
 
 pub(super) struct Batch {
@@ -141,7 +151,7 @@ mod tests {
 
     fn numeric(wb: &Workbook, (sheet,row,col): CellKey) -> Option<Result<f64, crate::formula::ErrKind>> {
         let src = wb.sheet(sheet).get(row,col)?.formula.as_deref()?;
-        let node = compile_at(src.trim_start_matches('='),row,col).ok()?;
+        let node = super::super::compile_at(src.trim_start_matches('='),row,col).ok()?;
         numeric_binary(wb,sheet,&node)
     }
 

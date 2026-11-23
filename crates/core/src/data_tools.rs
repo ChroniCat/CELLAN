@@ -132,8 +132,11 @@ impl PreparedKey {
 
 /// Ordered cells to change, suitable for one undo action. Every value is read
 /// before mutation, including destinations that were empty before the operation.
+pub type LinePermutation = ((u32,u32,u32,u32), bool, Vec<u32>);
+
 #[derive(Debug, Default)]
 pub struct RowChanges {
+    pub permutation: Option<LinePermutation>,
     pub deltas: Vec<CellDelta>,
     pub count: usize,
 }
@@ -230,12 +233,19 @@ impl CompactSort {
         if !horizontal && let Some(n) = NumericSort::plan(source,index,region,key,asc)? {
             return Ok(Some(Self::Numeric(n)));
         }
-        // Keep sparse far-away selections on the occupied-coordinate planner.
-        // Also avoid retaining a large unrelated sheet for a small subrange.
-        let stored = (source.len() + source.styles.len()) as u64;
-        if area > stored.saturating_mul(4) || stored > area.saturating_mul(4) { return Ok(None); }
+        if !Self::retain_mixed_sheet(source,region) { return Ok(None); }
         let order = crate::sort_filter::sort_order(source,region,key,asc,horizontal)?;
         if order.is_empty() { return Ok(None); }
+        Ok(Some(Self::mixed(source,index,(region,horizontal,order))))
+    }
+
+    fn retain_mixed_sheet(source: &Sheet, (r1,c1,r2,c2): (u32,u32,u32,u32)) -> bool {
+        let area = u64::from(r2-r1+1) * u64::from(c2-c1+1);
+        let stored = (source.len() + source.styles.len()) as u64;
+        area > 100_000 && area <= stored.saturating_mul(4) && stored <= area.saturating_mul(4)
+    }
+
+    fn mixed(source: &Sheet, index: usize, (region,horizontal,order): LinePermutation) -> Self {
         let source = Box::new(source.search_snapshot());
         // This snapshot outlives the worker as undo history. Account for heap text
         // and styles as well as the page buffers before handing it to the UI.
@@ -243,7 +253,17 @@ impl CompactSort {
             + source.styles.len() * size_of::<(crate::CellRef,u16)>()
             + (source.row_styles.capacity() + source.col_styles.capacity()) * size_of::<(u32,u16)>()
             + source.iter().map(|(_,c)| crate::undo::cell_heap_bytes(c)).sum::<usize>();
-        Ok(Some(Self::Mixed { source, index, region, order, horizontal, bytes }))
+        Self::Mixed { source, index, region, order, horizontal, bytes }
+    }
+
+    /// Absolute source line for each destination, in the same order as deltas().
+    pub fn permutation(&self) -> ((u32,u32,u32,u32), bool, Vec<u32>) {
+        match self {
+            Self::Numeric(n) => ((n.first_row, n.first_col, n.first_row + n.order.len() as u32 - 1,
+                                  n.first_col + n.width as u32 - 1), false,
+                                  n.order.iter().map(|line| n.first_row + line).collect()),
+            Self::Mixed { region, horizontal, order, .. } => (*region, *horizontal, order.clone()),
+        }
     }
 
     pub fn moved_lines(&self) -> usize {
@@ -348,7 +368,7 @@ pub(crate) fn reorder_lines(
     sheet: &Sheet,
     sheet_idx: usize,
     rect: (u32, u32, u32, u32),
-    order: &[u32],
+    order: Vec<u32>,
     horizontal: bool,
     dedup: bool,
 ) -> RowChanges {
@@ -436,31 +456,50 @@ pub(crate) fn reorder_lines(
             }
         }
     }
+    if !dedup { changes.permutation = Some((rect, horizontal, order)); }
     changes
 }
 
-pub fn plan_sort_multi(
-    sheet: &Sheet,
-    sheet_idx: usize,
-    region: (u32, u32, u32, u32),
-    keys: &[SortKey],
-    header: bool,
-) -> Result<RowChanges, String> {
+pub enum MultiSortPlan {
+    Cells(RowChanges),
+    Compact(CompactSort),
+}
+
+pub fn plan_large_sort_multi(sheet: &Sheet, index: usize, region: (u32,u32,u32,u32),
+                            keys: &[SortKey], header: bool) -> Result<MultiSortPlan,String> {
+    let Some((region,horizontal,order)) = multi_sort_order(sheet,region,keys,header)? else {
+        return Ok(MultiSortPlan::Cells(RowChanges::default()));
+    };
+    if CompactSort::retain_mixed_sheet(sheet,region) {
+        Ok(MultiSortPlan::Compact(CompactSort::mixed(sheet,index,(region,horizontal,order))))
+    } else {
+        Ok(MultiSortPlan::Cells(reorder_lines(sheet,index,region,order,horizontal,false)))
+    }
+}
+
+pub fn plan_sort_multi(sheet: &Sheet, index: usize, region: (u32,u32,u32,u32),
+                       keys: &[SortKey], header: bool) -> Result<RowChanges,String> {
+    Ok(multi_sort_order(sheet,region,keys,header)?.map_or_else(RowChanges::default, |(rect,horizontal,order)|
+        reorder_lines(sheet,index,rect,order,horizontal,false)))
+}
+
+fn multi_sort_order(sheet: &Sheet, region: (u32,u32,u32,u32), keys: &[SortKey], header: bool)
+                    -> Result<Option<LinePermutation>,String> {
     let (mut r1, c1, mut r2, mut c2) = region;
     if header {
         r1 = r1.saturating_add(1);
     }
     if r2 <= r1 || c2 < c1 || keys.is_empty() {
-        return Ok(RowChanges::default());
+        return Ok(None);
     }
     if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
         let Some((_, _, ur2, uc2)) = sheet.used_bounds() else {
-            return Ok(RowChanges::default());
+            return Ok(None);
         };
         r2 = r2.min(ur2);
         c2 = c2.min(uc2.max(keys.iter().map(|k| k.col).max().unwrap_or(c1)));
         if r2 <= r1 || c2 < c1 {
-            return Ok(RowChanges::default());
+            return Ok(None);
         }
     }
     crate::sort_filter::validate_sort_region(sheet, (r1, c1, r2, c2))?;
@@ -481,7 +520,7 @@ pub fn plan_sort_multi(
         // Stable passes keep ties in the order established by lower priorities.
         order.sort_by(|&a, &b| values[(a - r1) as usize].compare(&values[(b - r1) as usize], key.asc));
     }
-    Ok(reorder_lines(sheet, sheet_idx, (r1, c1, r2, c2), &order, false, false))
+    Ok(Some(((r1,c1,r2,c2),false,order)))
 }
 
 pub fn sort_multi(sheet: &mut Sheet, region: (u32, u32, u32, u32), keys: &[SortKey], header: bool) -> usize {
@@ -571,7 +610,7 @@ pub fn plan_remove_duplicates(
     let Some((region, keep)) = distinct_rows(sheet, region, cols, header) else {
         return RowChanges::default();
     };
-    reorder_lines(sheet, sheet_idx, region, &keep, false, true)
+    reorder_lines(sheet, sheet_idx, region, keep, false, true)
 }
 
 pub fn remove_duplicates(sheet: &mut Sheet, region: (u32, u32, u32, u32), cols: &[u32], header: bool) -> usize {

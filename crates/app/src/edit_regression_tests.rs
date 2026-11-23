@@ -2114,8 +2114,8 @@ fn format_dialog_fill_and_protection_apply_to_selection() {
 fn format_dialog_clears_fill_and_protection_on_existing_file() {
     use sheetcore::style::CellStyle;
     let ctx = egui::Context::default();
-    let path = crate::test_env::scratch("ui15-clear-existing").join("existing.xlsx");
-    let _ = std::fs::remove_file(&path);
+    let env = crate::test_env::TestEnv::new("ui15-clear-existing");
+    let path = env.path("existing.xlsx");
     let mut seed = sheetcore::model::Workbook::new_blank();
     seed.sheets[0].set(0, 0, text("x"));
     let sid = seed.styles.intern(CellStyle {

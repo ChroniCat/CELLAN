@@ -60,6 +60,7 @@ fn hash_directory(file: &mut File, offset: u64) -> Result<[u8; 32]> {
 }
 
 pub(super) struct Header {
+    dynamic: std::collections::HashSet<u32>,
     pub names: Vec<String>,
     types: Vec<calamine::SheetType>,
     pub styles: Vec<calamine::Style>,
@@ -137,6 +138,7 @@ fn header(
         .context("工作表关系无效")?;
     let styles = book.worksheet_cells_reader(name)?.styles().to_vec();
     Ok(Some(Header {
+        dynamic: if let Some(rels) = rels { super::dynamic::indices(src, rels)? } else { Default::default() },
         names,
         types,
         styles,
@@ -145,6 +147,7 @@ fn header(
 
 #[derive(Default)]
 struct Strings {
+    dynamic: std::collections::HashSet<u32>,
     text: Vec<String>,
     rich: HashMap<usize, Vec<RichRun>>,
 }
@@ -300,14 +303,21 @@ pub(super) fn xml_part(zip: &mut zip::ZipArchive<File>, part: &str) -> Result<St
         .with_context(|| format!("缺少部件 {part}"))?;
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes)?;
-    let encoding = if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(b"<\0") {
+    decode_xml_part(bytes, part)
+}
+
+pub(super) fn utf16_encoding(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(b"<\0") {
         Some(encoding_rs::UTF_16LE)
     } else if bytes.starts_with(&[0xfe, 0xff]) || bytes.starts_with(b"\0<") {
         Some(encoding_rs::UTF_16BE)
     } else {
         None
-    };
-    if let Some(encoding) = encoding {
+    }
+}
+
+pub(super) fn decode_xml_part(bytes: Vec<u8>, part: &str) -> Result<String> {
+    if let Some(encoding) = utf16_encoding(&bytes) {
         let (s, _, invalid) = encoding.decode(&bytes);
         ensure!(!invalid, "{part}: UTF-16 编码错误");
         let mut xml = s.into_owned();
@@ -393,6 +403,7 @@ fn cell(
     formulas: &mut Formulas,
     pos: (u32, u32),
     typ: &str,
+    dynamic: bool,
 ) -> Result<Cell> {
     let mut value = Value::Empty;
     let mut formula = None;
@@ -497,7 +508,13 @@ fn cell(
                             Some("array") => {
                                 let range = attr(e, "ref").context("数组公式缺少区域")?;
                                 let rect = formula_range(&range)?;
-                                dst.sheet.arrays.push((CellRef::new(pos.0, pos.1), rect));
+                                let anchor = CellRef::new(pos.0, pos.1);
+                                if dynamic {
+                                    ensure!((rect.0,rect.1) == pos,"动态数组锚点与范围不一致");
+                                    dst.sheet.spill_shapes.insert(anchor,(rect.2-rect.0+1,rect.3-rect.1+1));
+                                } else {
+                                    dst.sheet.arrays.push((anchor, rect));
+                                }
                             }
                             Some("dataTable") => {
                                 if !dst.diag.problems.iter().any(|p| p.what == "模拟运算表公式")
@@ -631,6 +648,7 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                     "c" if in_data && level == 3 => {
                         let mut typ = Cow::Borrowed("");
                         let mut xf = None;
+                        let mut dynamic = false;
                         let mut here = pos;
                         for a in e.attributes() {
                             let a = a?;
@@ -640,6 +658,7 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                                         .context("无效单元格坐标")?
                                 }
                                 "s" => xf = Some(a.value.parse::<u16>()?),
+                                "cm" => dynamic = table.dynamic.contains(&a.value.parse::<u32>()?),
                                 "t" => typ = a.value,
                                 _ => {}
                             }
@@ -652,7 +671,7 @@ fn parse_section(xml: &str, table: &Strings, dst: &mut Loaded, typ: calamine::Sh
                             dst.xfs.push((here.0, here.1, id));
                         }
                         if !empty {
-                            let cell = cell(&mut r, dst, table, f, here, &typ)?;
+                            let cell = cell(&mut r, dst, table, f, here, &typ, dynamic)?;
                             if !cell.is_blank() {
                                 if let Some(cells) = rows.as_deref_mut() { cells.push((here, cell)); }
                                 else { dst.sheet.set(here.0, here.1, cell); }
@@ -795,6 +814,7 @@ fn parallel_rows(xml: &str, table: &Strings, name: &str, part: &str, workers: us
                 out.xfs.extend(local.xfs);
                 out.sheet.rich.extend(local.sheet.rich);
                 out.sheet.arrays.extend(local.sheet.arrays);
+                out.sheet.spill_shapes.extend(local.sheet.spill_shapes);
                 for p in local.diag.problems {
                     if !out.diag.problems.iter().any(|old| old.what == p.what) { out.diag.problems.push(p); }
                 }
@@ -822,7 +842,8 @@ pub(super) fn worksheets(
     dxf_ext: bool,
 ) -> Result<Vec<Loaded>> {
     let names = &header.names;
-    let shared = strings(zip).context("读取 xl/sharedStrings.xml 失败")?;
+    let mut shared = strings(zip).context("读取 xl/sharedStrings.xml 失败")?;
+    shared.dynamic.clone_from(&header.dynamic);
     let signatures: Vec<_> = names
         .iter()
         .map(|n| targets.get(n).and_then(|p| signature(zip, p)))
@@ -862,6 +883,15 @@ pub(super) fn worksheets(
             })
             {
                 Ok(shell) => {
+                    for (anchor,(h,w)) in loaded.sheet.spill_shapes.clone() {
+                        if loaded.sheet.value(anchor.row,anchor.col) == Value::Error(crate::formula::ErrKind::Spill) {
+                            loaded.sheet.spill_shapes.insert(anchor,(0,0));
+                        } else {
+                            let tails: Vec<_> = loaded.sheet.iter_rect((anchor.row,anchor.col,anchor.row+h-1,anchor.col+w-1))
+                                .filter_map(|(k,c)| (k != anchor && c.formula.is_none()).then_some(k)).collect();
+                            loaded.sheet.spilled.extend(tails);
+                        }
+                    }
                     loaded.layout =
                         Some(crate::merges::sheet_layout(&shell, dxfs, dxf_ext));
                     loaded.sheet.page = crate::page::parse_page_setup(&shell);

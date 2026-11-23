@@ -79,7 +79,7 @@ pub fn plan_sort_axis(
 ) -> Result<crate::data_tools::RowChanges, String> {
     let order = sort_order(sheet, region, key, asc, horizontal)?;
     if order.is_empty() { return Ok(Default::default()); }
-    Ok(crate::data_tools::reorder_lines(sheet, sheet_idx, region, &order, horizontal, false))
+    Ok(crate::data_tools::reorder_lines(sheet, sheet_idx, region, order, horizontal, false))
 }
 
 pub(crate) fn sort_order(

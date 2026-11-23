@@ -6,6 +6,8 @@
 //! 协作场景：撤销时如果某格当前值已经不是「我改成的样子」，说明别人后来动过，
 //! 跳过它——不拿旧值盖掉别人的新编辑。
 
+#[path = "undo_structural_cells.rs"]
+mod structural_cells;
 use crate::model::{Cell, CellRef, Sheet, Workbook};
 use std::collections::HashSet;
 #[path = "undo_references.rs"]
@@ -255,12 +257,14 @@ static NEXT_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 #[derive(Clone, Copy)]
 struct EntryStamp {
+    sort_created: Option<u64>,
+    sort_replay: Option<(u64, bool, Option<u64>)>,
     id: u64,
     payload_bytes: usize,
 }
 
 fn next_entry(payload_bytes: usize) -> EntryStamp {
-    EntryStamp { id: NEXT_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed), payload_bytes }
+    EntryStamp { sort_created: None, sort_replay: None, id: NEXT_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed), payload_bytes }
 }
 
 pub(crate) fn cell_heap_bytes(cell: &Cell) -> usize {
@@ -326,7 +330,7 @@ impl Action {
 
 
 enum Entry {
-    Cells(EntryStamp, Action),
+    Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>),
     NumericSort(EntryStamp, NumericSortAction),
     Structure(EntryStamp, StructureAction),
     SheetTab(EntryStamp, SheetTabAction),
@@ -336,12 +340,16 @@ impl Entry {
     fn id(&self) -> u64 { self.stamp().id }
 
     fn stamp(&self) -> EntryStamp {
-        match self { Self::Cells(s, _) | Self::NumericSort(s, _) | Self::Structure(s, _) | Self::SheetTab(s, _) => *s }
+        match self { Self::Cells(s, _, _) | Self::NumericSort(s, _) | Self::Structure(s, _) | Self::SheetTab(s, _) => *s }
+    }
+
+    fn stamp_mut(&mut self) -> &mut EntryStamp {
+        match self { Self::Cells(s, _, _) | Self::NumericSort(s, _) | Self::Structure(s, _) | Self::SheetTab(s, _) => s }
     }
 
     fn simple_cells(&self) -> Option<Box<dyn Iterator<Item = (usize, u32, u32)> + '_>> {
         match self {
-            Self::Cells(_, a) if a.snap_before.is_none() && a.snap_after.is_none()
+            Self::Cells(_, a, _) if a.snap_before.is_none() && a.snap_after.is_none()
                 && a.merges.is_none() && a.shapes.is_none() && a.pictures.is_none()
                 && a.refresh_sizes.is_none() => Some(Box::new(a.deltas.iter().map(|d| (d.sheet, d.row, d.col)))),
             Self::NumericSort(_, a) => Some(Box::new(a.sort.deltas().map(|d| (d.sheet, d.row, d.col)))),
@@ -351,7 +359,7 @@ impl Entry {
 
     fn label(&self) -> &str {
         match self {
-            Self::Cells(_, a) => &a.label,
+            Self::Cells(_, a, _) => &a.label,
             Self::NumericSort(_, a) => &a.label,
             Self::Structure(_, a) => &a.label,
             Self::SheetTab(_, a) => &a.label,
@@ -359,7 +367,7 @@ impl Entry {
     }
     fn by_site(&self) -> u32 {
         match self {
-            Self::Cells(_, a) => a.by_site,
+            Self::Cells(_, a, _) => a.by_site,
             Self::NumericSort(_, a) => a.by_site,
             Self::Structure(_, a) => a.by_site,
             Self::SheetTab(_, a) => a.by_site,
@@ -485,6 +493,7 @@ type PendingPivot = (usize, crate::pivot::PivotSpec, crate::pivot::PivotResult,
 pub struct StructureSnapshot {
     sheet: usize,
     target: Sheet,
+    compact: Option<structural_cells::CellHistory>,
     shift: crate::refs::Shift,
     reference_uses: structure_refs::Uses,
     foreign: Vec<ForeignReferences>,
@@ -526,7 +535,7 @@ pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::S
     let shift = op.reference_shift();
     let reference_uses = structure_refs::collect(wb, sheet, &shift);
     StructureSnapshot {
-        sheet, target, shift, reference_uses, foreign, names: wb.names.clone(), pivot_shifts: wb.pivot_shifts.clone(),
+        sheet, target, compact: None, shift, reference_uses, foreign, names: wb.names.clone(), pivot_shifts: wb.pivot_shifts.clone(),
         pending_pivots: wb.pivots_pending.clone(),
     }
 }
@@ -546,6 +555,7 @@ impl StructureSnapshot {
         Self {
             sheet: self.sheet,
             target: wb.sheets[self.sheet].clone(),
+            compact: None,
             reference_uses: structure_refs::collect(wb, self.sheet, &shift),
             shift,
             foreign: self.foreign.iter().map(|scope| {
@@ -636,12 +646,14 @@ fn target_matches(a: &Sheet, b: &Sheet) -> bool {
         && a.page == b.page && chart_refs_match(&a.charts, &b.charts) && a.tab_color == b.tab_color
         && a.protection == b.protection && a.rich == b.rich && a.hyperlinks == b.hyperlinks
         && a.sparklines == b.sparklines && a.textboxes == b.textboxes && a.hidden == b.hidden
-        && sheet_inputs_match(a, b)
+
 }
 
 impl StructureSnapshot {
     fn matches_live(&self, wb: &Workbook, desired: &Self) -> bool {
-        wb.sheets.get(self.sheet).is_some_and(|s| target_matches(s, &self.target))
+        wb.sheets.get(self.sheet).is_some_and(|s| target_matches(s, &self.target) &&
+            self.compact.as_ref().map_or_else(|| sheet_inputs_match(s,&self.target),
+                |history| history.matches(s,&self.target)))
             && (self.pivot_shifts == desired.pivot_shifts || wb.pivot_shifts == self.pivot_shifts)
             && (self.pending_pivots == desired.pending_pivots || wb.pivots_pending == self.pending_pivots)
             && self.foreign.iter().all(|expected| {
@@ -690,6 +702,9 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     let names = changed_names(&wb.names, &expected.names, &snap.names)?;
     let current = wb.sheets.get(snap.sheet)?;
     let mut target = snap.target.clone();
+    if let Some(history) = &snap.compact {
+        target.replace_cell_store(history.restore(current,&expected.shift)?);
+    }
     let mut touched = HashSet::new();
     // Saving may have assigned a part to a previously new sheet. Undo changes
     // its content, not its identity or the current save baseline.
@@ -698,7 +713,7 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     target.saved_cells.clone_from(&current.saved_cells);
     target.source_cells.clone_from(&current.source_cells);
     target.cleared.extend(current.cleared.iter().copied());
-    for key in current.changed_cells(&snap.target) {
+    for key in current.changed_cells(&target).collect::<Vec<_>>() {
         touched.insert((snap.sheet, key.row, key.col));
         if !target.contains(key.row, key.col) {
             target.cleared.insert(key);
@@ -811,14 +826,12 @@ impl UndoStack {
         if action.by_site == 0 {
             action.by_site = self.site;
         }
-        self.done.push(Entry::Cells(next_entry(bytes), action));
+        self.done.push(Entry::Cells(next_entry(bytes), action, None));
         // 新动作让「重做」失效
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
     /// Keep the newest operation undoable even when one very large edit exceeds the budget.
-    /// Shared pages are charged at their full allocation so repeated large structural edits
-    /// cannot keep hundreds of old workbook generations alive.
     fn trim_history(&mut self, budget: usize) {
         self.undone.clear();
         let limit = if self.limit == 0 { 200 } else { self.limit };
@@ -899,6 +912,62 @@ impl UndoStack {
         true
     }
 
+    pub fn track_sort(&mut self, first_ts: u64, replay: Option<bool>) {
+        match replay {
+            None => if let Some(entry) = self.done.last_mut() { entry.stamp_mut().sort_created = Some(first_ts); },
+            Some(redo) => {
+                let (from,to) = if redo { (&self.undone,&mut self.done) } else { (&self.done,&mut self.undone) };
+                if let Some(entry) = to.last_mut() {
+                    entry.stamp_mut().sort_replay = Some((first_ts,redo,from.last().map(Entry::id)));
+                }
+            }
+        }
+    }
+
+    pub fn reject_sort(&mut self, first_ts: u64) {
+        for stack in [&mut self.done,&mut self.undone] {
+            if let Some(i) = stack.iter().position(|e| e.stamp().sort_created == Some(first_ts)) {
+                stack.remove(i);
+                return;
+            }
+        }
+        for redo in [false,true] {
+            let (from,to) = if redo { (&mut self.done,&mut self.undone) } else { (&mut self.undone,&mut self.done) };
+            if let Some(index) = from.iter().position(|e| e.stamp().sort_replay.is_some_and(|(ts,r,_)| ts == first_ts && r == redo)) {
+                let mut entry = from.remove(index);
+                let (_,_,previous) = entry.stamp_mut().sort_replay.take().unwrap();
+                let at = previous.and_then(|id| to.iter().position(|e| e.id()==id)).map_or(0, |i| i+1);
+                to.insert(at,entry);
+                return;
+            }
+        }
+    }
+
+    /// Called immediately after recording the nonempty cell action for a sort.
+    pub fn tag_sorted_cells(&mut self, order: crate::data_tools::LinePermutation) {
+        if let Some(Entry::Cells(stamp, _, slot)) = self.done.last_mut() {
+            stamp.payload_bytes += order.2.capacity() * size_of::<u32>();
+            *slot = Some(order);
+            self.trim_history(HISTORY_PAYLOAD_BUDGET);
+        }
+    }
+
+    pub fn next_sort_permutation(&self, redo: bool) -> Option<crate::data_tools::LinePermutation> {
+        let entry = if redo { self.undone.last()? } else { self.done.last()? };
+        let (region, horizontal, mut order) = match entry {
+            Entry::Cells(_, _, Some(p)) => p.clone(),
+            Entry::NumericSort(_, a) => a.sort.permutation(),
+            _ => return None,
+        };
+        if !redo {
+            let first = if horizontal {region.1} else {region.0};
+            let mut inverse = vec![0; order.len()];
+            for (dst, src) in order.into_iter().enumerate() { inverse[(src-first) as usize] = first+dst as u32; }
+            order = inverse;
+        }
+        Some((region,horizontal,order))
+    }
+
     pub fn next_undo_id(&self) -> Option<u64> {
         self.done.last().map(Entry::id)
     }
@@ -939,8 +1008,19 @@ impl UndoStack {
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
-    pub fn push_structure(&mut self, label: impl Into<String>, before: StructureSnapshot, after: StructureSnapshot, focus: (usize, u32, u32)) {
-        let bytes = before.target.pair_allocated_bytes(&after.target)
+    pub fn push_structure(&mut self, label: impl Into<String>, mut before: StructureSnapshot, mut after: StructureSnapshot, focus: (usize, u32, u32)) {
+        let undo_cells = structural_cells::CellHistory::between(&after.target, &before.target, &after.shift);
+        let redo_cells = structural_cells::CellHistory::between(&before.target, &after.target, &before.shift);
+        let cell_bytes = undo_cells.bytes() + redo_cells.bytes();
+        before.compact = Some(undo_cells);
+        after.compact = Some(redo_cells);
+        for side in [&mut before,&mut after] {
+            side.target.replace_cell_store(Default::default());
+            side.target.source_cells = None;
+            side.target.saved_cells = None;
+            side.target.shared_lookup = Default::default();
+        }
+        let bytes = cell_bytes
             + before.reference_uses.bytes() + after.reference_uses.bytes()
             + before.foreign.iter().chain(&after.foreign).map(|f| std::mem::size_of_val(f.cells.as_slice())
                 + f.cells.iter().map(|(_, c)| cell_heap_bytes(c)).sum::<usize>()).sum::<usize>();
@@ -1011,7 +1091,7 @@ impl UndoStack {
             self.undone.push(self.done.pop()?);
             return Some(applied);
         }
-        let Entry::Cells(id, action) = self.done.pop()? else { unreachable!() };
+        let Entry::Cells(id, action, permutation) = self.done.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
@@ -1031,7 +1111,7 @@ impl UndoStack {
                 style_changes, merge_changes,
                 merge_conflict: false,
             };
-            self.undone.push(Entry::Cells(id, action));
+            self.undone.push(Entry::Cells(id, action, permutation));
             return Some(applied);
         }
         if let Some(sh) = action.shapes.clone() {
@@ -1049,7 +1129,7 @@ impl UndoStack {
                 style_changes, merge_changes,
                 merge_conflict: false,
             };
-            self.undone.push(Entry::Cells(id, action));
+            self.undone.push(Entry::Cells(id, action, permutation));
             return Some(applied);
         }
         let merged = action.merges.as_ref().map(|edit| {
@@ -1060,7 +1140,7 @@ impl UndoStack {
         if merge_conflict {
             let label = action.label.clone();
             let focus = action.focus;
-            self.done.push(Entry::Cells(id, action));
+            self.done.push(Entry::Cells(id, action, permutation));
             return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true });
         }
         if let Some(snap) = action.snap_before.clone() {
@@ -1078,7 +1158,7 @@ impl UndoStack {
                 style_changes, merge_changes,
                 merge_conflict: false,
             };
-            self.undone.push(Entry::Cells(id, action));
+            self.undone.push(Entry::Cells(id, action, permutation));
             return Some(applied);
         }
         for d in action.deltas.iter().rev() {
@@ -1108,7 +1188,7 @@ impl UndoStack {
             style_changes, merge_changes,
             merge_conflict: false,
         };
-        self.undone.push(Entry::Cells(id, action));
+        self.undone.push(Entry::Cells(id, action, permutation));
         Some(applied)
     }
 
@@ -1132,7 +1212,7 @@ impl UndoStack {
             self.done.push(self.undone.pop()?);
             return Some(applied);
         }
-        let Entry::Cells(id, action) = self.undone.pop()? else { unreachable!() };
+        let Entry::Cells(id, action, permutation) = self.undone.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
@@ -1152,7 +1232,7 @@ impl UndoStack {
                 style_changes, merge_changes,
                 merge_conflict: false,
             };
-            self.done.push(Entry::Cells(id, action));
+            self.done.push(Entry::Cells(id, action, permutation));
             return Some(applied);
         }
         if let Some(sh) = action.shapes.clone() {
@@ -1170,7 +1250,7 @@ impl UndoStack {
                 style_changes, merge_changes,
                 merge_conflict: false,
             };
-            self.done.push(Entry::Cells(id, action));
+            self.done.push(Entry::Cells(id, action, permutation));
             return Some(applied);
         }
         let merged = action.merges.as_ref().map(|edit| {
@@ -1181,7 +1261,7 @@ impl UndoStack {
         if merge_conflict {
             let label = action.label.clone();
             let focus = action.focus;
-            self.undone.push(Entry::Cells(id, action));
+            self.undone.push(Entry::Cells(id, action, permutation));
             return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true });
         }
         if let Some(snap) = action.snap_after.clone() {
@@ -1199,7 +1279,7 @@ impl UndoStack {
                 style_changes, merge_changes,
                 merge_conflict: false,
             };
-            self.done.push(Entry::Cells(id, action));
+            self.done.push(Entry::Cells(id, action, permutation));
             return Some(applied);
         }
         for d in action.deltas.iter() {
@@ -1229,7 +1309,7 @@ impl UndoStack {
             style_changes, merge_changes,
             merge_conflict: false,
         };
-        self.done.push(Entry::Cells(id, action));
+        self.done.push(Entry::Cells(id, action, permutation));
         Some(applied)
     }
 
@@ -1328,6 +1408,26 @@ mod tests {
         assert!(redone.style_changes.is_empty());
         assert_eq!(wb.sheets[0].style_of(0, 0), 2);
         assert_eq!(wb.sheets[0].explicit_style_of(0, 0), None);
+    }
+
+    #[test]
+    fn axis_insertion_history_cost_is_independent_of_the_moved_cell_count() {
+        let mut wb = wb();
+        let mut stack = UndoStack::new();
+        stack.push(edit(&mut wb,0,0,13.));
+        for r in 1..12000 { wb.sheets[0].set(r,0,Cell {value:Value::Number(r as f64),formula:None}); }
+        let op = crate::structural::Structural::InsertRows {at:1,n:1};
+        let before = snapshot_structure(&wb,0,&op);
+        crate::structural::apply_structural_wb(&mut wb,0,&op);
+        let after = before.capture_after(&wb);
+        stack.push_structure("insert",before,after,(0,0,0));
+        assert!(stack.done.last().unwrap().stamp().payload_bytes < 4096);
+        stack.trim_history(4096);
+        assert_eq!(stack.done.len(),2);
+        stack.undo_workbook(&mut wb,|_,_,_,_| true).unwrap();
+        assert_eq!(wb.sheets[0].value(11999,0), Value::Number(11999.));
+        stack.undo_workbook(&mut wb,|_,_,_,_| true).unwrap();
+        assert_ne!(wb.sheets[0].value(0,0), Value::Number(13.));
     }
 
     #[test]

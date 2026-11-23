@@ -362,6 +362,10 @@ impl<'a> Styles<'a> {
         expected.color = new.color;
         expected.fill = new.fill;
         expected.format.clone_from(&new.format);
+        expected.wrap = new.wrap;
+        expected.shrink_to_fit = new.shrink_to_fit;
+        expected.indent = new.indent;
+        expected.halign = new.halign;
         if expected != *new || old == new {
             return None;
         }
@@ -414,7 +418,7 @@ impl<'a> Styles<'a> {
             ));
             fields.push(("applyNumberFormat", 1));
         }
-        let new_xf = self.with_fields(base, fields)?;
+        let new_xf = self.with_fields(base, fields, old, new)?;
         self.resolved.insert((base, old_id, id), new_xf);
         Some(new_xf)
     }
@@ -554,10 +558,83 @@ impl<'a> Styles<'a> {
         self.fonts.intern(self.xml, raw_font)
     }
 
-    fn with_fields(&mut self, base: u16, fields: Vec<(&str, u16)>) -> Option<u16> {
+    fn alignment_edits(&self, xf: Node<'_, '_>, old: &CellStyle, new: &CellStyle) -> Option<Vec<(Range<usize>, String)>> {
+        let range = xf.range();
+        let mut edits = Vec::new();
+        // Enabling an XF's local alignment must not change inherited
+        // alignment attributes that the model cannot represent.
+        match xf.attribute("applyAlignment") {
+            Some("1" | "true") => {}
+            None | Some("0" | "false") => {
+                let parent = xf.attribute("xfId").unwrap_or("0").parse().ok()?;
+                let record = self.node("cellStyleXfs",parent);
+                if record.is_none() && (parent != 0 || self.doc.root_element().children().any(|n| n.has_tag_name((NS,"cellStyleXfs"))))
+                    || record.is_some_and(|p| p.children().any(|n| n.has_tag_name((NS,"alignment")))) { return None; }
+            }
+            _ => return None,
+        }
+        let mut children = xf.children().filter(|n| n.has_tag_name((NS,"alignment")));
+        let alignment = children.next();
+        if children.next().is_some() { return None; }
+        let attribute = |name| alignment.and_then(|n| n.attribute(name));
+        let mut changed = Vec::new();
+        for (name,was,want) in [("wrapText",old.wrap,new.wrap),("shrinkToFit",old.shrink_to_fit,new.shrink_to_fit)] {
+            if was == want { continue; }
+            let raw = match attribute(name) {
+                None | Some("false" | "0") => false,
+                Some("true" | "1") => true,
+                _ => return None,
+            };
+            if raw != was { return None; }
+            changed.push((name,u8::from(want).to_string()));
+        }
+        if old.indent != new.indent {
+            if new.indent > 15 || attribute("indent").unwrap_or("0").parse::<u8>().ok()? != old.indent { return None; }
+            changed.push(("indent",new.indent.to_string()));
+        }
+        if old.halign != new.halign {
+            let horizontal = ["general","left","center","right","centerContinuous","distributed"];
+            if attribute("horizontal").unwrap_or("general") != *horizontal.get(usize::from(old.halign))? { return None; }
+            changed.push(("horizontal",horizontal.get(usize::from(new.halign))?.to_string()));
+        }
+        let mut insert = String::new();
+        for (name,value) in changed {
+            if let Some(existing) = alignment.and_then(|n| n.attribute_node(name)) {
+                edits.push((existing.range_value(),value));
+            } else {
+                insert.push_str(&format!(" {name}=\"{value}\""));
+            }
+        }
+        if !insert.is_empty() {
+            if let Some(alignment) = alignment {
+                let raw = &self.xml[alignment.range()];
+                if !raw.starts_with("<alignment") { return None; }
+                let at = alignment.range().start + "<alignment".len();
+                edits.push((at..at,insert));
+            } else {
+                let tag = format!("<alignment{insert}/>");
+                let raw = &self.xml[range.clone()];
+                if raw.ends_with("/>") {
+                    edits.push((range.end-2..range.end,format!(">{tag}</xf>")));
+                } else {
+                    let mut reader = quick_xml::Reader::from_str(raw);
+                    reader.read_event().ok()?;
+                    let at = range.start + reader.buffer_position() as usize;
+                    edits.push((at..at,tag));
+                }
+            }
+        }
+        Some(edits)
+    }
+
+    fn with_fields(&mut self, base: u16, mut fields: Vec<(&str, u16)>, old: &CellStyle, new: &CellStyle) -> Option<u16> {
         let xf = self.node("cellXfs", base)?;
         let range = xf.range();
         let mut edits = Vec::new();
+        if (old.wrap,old.shrink_to_fit,old.indent,old.halign) != (new.wrap,new.shrink_to_fit,new.indent,new.halign) {
+            edits.extend(self.alignment_edits(xf,old,new)?);
+            fields.push(("applyAlignment",1));
+        }
         let mut attrs = String::new();
         for (name, value) in fields {
             if let Some(attr) = xf.attribute_node(name) {
@@ -571,7 +648,9 @@ impl<'a> Styles<'a> {
             if !self.xml[range.clone()].starts_with("<xf") {
                 return None;
             }
-            edits.push((name_end..name_end, attrs));
+            // With a bare <xf/>, an added child expands the slash at the same
+            // offset. Emit the new attributes before that replacement.
+            edits.insert(0, (name_end..name_end, attrs));
         }
         let raw_xf = apply_edits(&self.xml[range.clone()], range.start, edits);
         self.xfs.intern(self.xml, raw_xf)
@@ -602,6 +681,22 @@ impl<'a> Styles<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_alignment_handles_an_empty_xf_and_leaves_inherited_alignment_to_the_fallback() {
+        let xml = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font/></fonts><cellXfs count="1"><xf/></cellXfs></styleSheet>"#;
+        let mut styles = StyleTable::new();
+        let id = styles.intern(CellStyle {wrap:true, ..styles.get(0).clone()});
+        let mut delta = Styles::new(xml).unwrap();
+        assert_eq!(delta.resolve(0,0,id,&styles),Some(1));
+        let (encoded,_) = delta.finish().unwrap();
+        let doc = Document::parse(&encoded).unwrap();
+        let rows: Vec<_> = doc.descendants().filter(|n| n.has_tag_name((NS,"xf"))).collect();
+        assert_eq!(rows[1].attribute("applyAlignment"),Some("1"));
+        assert_eq!(rows[1].first_element_child().unwrap().attribute("wrapText"),Some("1"));
+        let inherited = xml.replace("<cellXfs",r#"<cellStyleXfs count="1"><xf><alignment readingOrder="2"/></xf></cellStyleXfs><cellXfs"#);
+        assert!(Styles::new(&inherited).unwrap().resolve(0,0,id,&styles).is_none());
+    }
 
     #[test]
     fn inherited_colors_and_unsupported_fill_or_format_components_fall_back() {

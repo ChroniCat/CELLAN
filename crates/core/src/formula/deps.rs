@@ -64,6 +64,7 @@ pub struct Deps {
     runtime_refs: HashSet<CellKey>,
     cached_spill_errors: HashSet<CellKey>,
     structural_sensitive: HashSet<CellKey>,
+    indirect_definitions: HashSet<CellKey>,
     computed_baseline: bool,
     pub rect_count: usize,
 }
@@ -151,6 +152,7 @@ struct Dependencies {
     runtime: bool,
     cached_spill_error: bool,
     structural_sensitive: bool,
+    indirect_definition: bool,
 }
 
 struct Walker<'a> {
@@ -168,10 +170,9 @@ impl Walker<'_> {
         let raw = formula.strip_prefix('=').unwrap_or(formula);
         let expanded =
             crate::table::expand_structured_at(self.wb, si, Some(self.row), Some(self.col), raw);
-        match super::compile_at(expanded.as_deref().unwrap_or(raw), self.row, self.col) {
-            Ok(node) => self.walk(&node, si),
-            Err(_) => self.result.runtime = true,
-        }
+        self.result.indirect_definition |= expanded.is_some();
+        if super::compiled::with_node(expanded.as_deref().unwrap_or(raw), self.row, self.col,
+            |node| self.walk(node, si)).is_err() { self.result.runtime = true; }
     }
 
     fn name(&mut self, si: usize, name: &str, scoped: bool) {
@@ -189,6 +190,7 @@ impl Walker<'_> {
             self.result.runtime = true;
             return;
         }
+        self.result.indirect_definition = true;
         self.name_expansions += 1;
         self.names.push((si, index));
         self.formula(si, &wb.names[index].2);
@@ -354,6 +356,11 @@ pub fn refs_of(wb: &crate::Workbook, si: usize, formula: &str) -> Vec<Rect> {
     dependencies(wb, (si, 0, 0), formula).rects
 }
 
+pub(super) fn parallel_inputs(wb: &crate::Workbook, key: CellKey, src: &str) -> Option<Vec<Rect>> {
+    let info = dependencies(wb, key, src);
+    (!info.runtime && !info.volatile && !info.volatile_ref && !info.visibility).then_some(info.rects)
+}
+
 fn dependencies(wb: &crate::Workbook, key: CellKey, formula: &str) -> Dependencies {
     let mut walker = Walker {
         wb,
@@ -445,6 +452,7 @@ impl Deps {
     }
 
     fn insert(&mut self, key: CellKey, info: Dependencies) {
+        if info.indirect_definition { self.indirect_definitions.insert(key); }
         if info.structural_sensitive { self.structural_sensitive.insert(key); }
         if info.visibility { self.visibility.insert(key); }
         if info.cached_spill_error { self.cached_spill_errors.insert(key); }
@@ -538,6 +546,7 @@ impl Deps {
                 self.free_ids.push(id);
             }
         }
+        self.indirect_definitions.remove(&key);
         self.structural_sensitive.remove(&key);
         self.runtime_refs.remove(&key);
         self.volatile_refs.remove(&key);
@@ -556,6 +565,66 @@ impl Deps {
     pub fn supports_structural(&self, wb: &crate::Workbook) -> bool {
         self.computed_baseline && !self.requires_full_recalc() && wb.names.is_empty() && !wb.calc_iterate &&
             wb.sheets.iter().all(|s| s.tables.is_empty() && s.arrays.is_empty() && s.spill_shapes.is_empty() && s.spilled.is_empty())
+    }
+
+    pub fn can_reuse_calculated_sheets(&self, wb: &crate::Workbook) -> bool {
+        self.computed_baseline && !wb.calc_iterate && !wb.calc_manual && !wb.calc_pending
+    }
+
+    /// Start with the edited sheet and expressions that may resolve through changed
+    /// definitions. Any formula reading a selected sheet brings in its whole sheet:
+    /// this includes readers of the former as well as the new size of a spill.
+    fn structural_sheets(&self, edited: usize, count: usize) -> Vec<bool> {
+        let mut readers = vec![HashSet::new();count];
+        for (formula, refs) in &self.refs {
+            for r in refs {
+                if formula.0 != r.sheet { readers[r.sheet].insert(formula.0); }
+            }
+        }
+        let mut pending = vec![edited];
+        pending.extend(self.indirect_definitions.iter().chain(&self.volatile)
+            .chain(&self.runtime_refs).chain(&self.cached_spill_errors).map(|k| k.0));
+        let mut selected = vec![false;count];
+        while let Some(si) = pending.pop() {
+            if !selected[si] {
+                selected[si] = true;
+                pending.extend(&readers[si]);
+            }
+        }
+        selected
+    }
+
+    pub fn recalc_structural_sheets(&self, wb: &mut crate::Workbook, edited: usize,
+                                    cancel: &std::sync::atomic::AtomicBool) -> Option<Self> {
+        if !self.can_reuse_calculated_sheets(wb) { return None; }
+        let selected = self.structural_sheets(edited,wb.sheets.len());
+        if !super::recalc_selected(wb,Some(&selected),Some(cancel),None) { return None; }
+        let mut next = Self { computed_baseline:true, ..Default::default() };
+        let mut keep = |key: CellKey| {
+            if selected[key.0] { return; }
+            let info = Dependencies {
+                rects:self.refs.get(&key).cloned().unwrap_or_default(),
+                structural_sensitive:self.structural_sensitive.contains(&key),
+                visibility:self.visibility.contains(&key),
+                indirect_definition:self.indirect_definitions.contains(&key),
+                ..Default::default()
+            };
+            next.insert(key,info);
+        };
+        for &key in self.refs.keys() { keep(key); }
+        for &key in &self.structural_sensitive {
+            if !self.refs.contains_key(&key) { keep(key); }
+        }
+        for (si,sheet) in wb.sheets.iter().enumerate().filter(|(si,_)| selected[*si]) {
+            for (k,cell) in sheet.formula_cells() {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+                let key = (si,k.row,k.col);
+                let mut info = dependencies(wb,key,cell.formula.as_deref()?);
+                info.cached_spill_error = super::is_cached_spill_error(&cell.value);
+                next.insert(key,info);
+            }
+        }
+        Some(next)
     }
 
     /// Reindex a broad edit on the worker. A cached scalar remains valid when
@@ -922,5 +991,71 @@ mod structural_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod structural_lambda_tests {
+    use super::*;
+    use crate::{Sheet, Value, Workbook, formula::{self,FValue}, structural::{Structural,apply_structural_wb}};
+
+    #[test]
+    fn scoped_axis_recalc_recovers_a_callable_from_another_sheets_cached_display_value() {
+        let mut wb=Workbook::new_blank();
+        wb.sheets.push(Sheet::new("Functions"));
+        wb.sheets.push(Sheet::new("Transfer"));
+        wb.sheets.push(Sheet::new("Summary"));
+        for (si,r,c,src) in [(1,0,0,"=LAMBDA(n,n*3)"),(2,0,0,"=Functions!A1"),(0,2,3,"=MAP(A3:B3,Transfer!A1)"),(3,0,0,"=SUM(Sheet1!D3#)")] {
+            formula::set_formula(wb.sheet_mut(si),r,c,src,FValue::Empty);
+        }
+        for (col,value) in [(0,5.),(1,7.)] {
+            wb.sheet_mut(0).set(2,col,crate::Cell{value:Value::Number(value),formula:None});
+        }
+        formula::recalc_all_force(&mut wb);
+        assert_eq!(wb.sheet(3).value(0,0),Value::Number(36.));
+        let graph=Deps::build_after_recalc(&wb);
+        let op=Structural::InsertRows{at:1,n:1};
+        apply_structural_wb(&mut wb,0,&op);
+        let mut full=wb.clone();
+        formula::recalc_all_force(&mut full);
+        graph.recalc_structural_sheets(&mut wb,0,&false.into()).unwrap();
+        assert_eq!(wb.sheet(3).value(0,0),full.sheet(3).value(0,0));
+        assert_eq!(wb.sheet(0).value(3,4),Value::Number(21.));
+    }
+
+    #[test]
+    fn dirty_levels_preserve_display_text_and_resolve_external_callable_chains() {
+        let mut wb=Workbook::new_blank();
+        wb.sheets.push(Sheet::new("Functions"));
+        formula::set_formula(wb.sheet_mut(1),0,0,"=LAMBDA(n,n*3)",FValue::Empty);
+        formula::set_formula(wb.sheet_mut(1),1,0,"=A1",FValue::Empty);
+        formula::set_formula(wb.sheet_mut(1),2,0,"=7",FValue::Empty);
+        let mut seeds=Vec::new();
+        for r in 0..2050 {
+            wb.sheet_mut(0).set(r,0,crate::Cell{value:Value::Number(1.),formula:None});
+            let n=r+1;
+            formula::set_formula(wb.sheet_mut(0),r,1,&format!("=SUM(MAP(A{n}:A{n},Functions!$A$2))+LEN(Functions!$A$3)"),FValue::Empty);
+            seeds.push((0,r,0));
+        }
+        formula::recalc_all_force(&mut wb);
+        // A genuine text cache using the closure display marker cannot be replaced
+        // by evaluating its formula (this cell is outside the edit closure).
+        wb.sheet_mut(1).set_formula_cache(2,0,Value::Text("#CALC!".into()));
+        let deps=Deps::build(&wb);
+        for &(s,r,c) in &seeds {wb.sheet_mut(s).set(r,c,crate::Cell{value:Value::Number(5.),formula:None});}
+        formula::recalc_dirty(&mut wb,&deps,&seeds);
+        for r in [0,130,2049] { assert_eq!(wb.sheet(0).value(r,1),Value::Number(21.)); }
+        assert_eq!(wb.sheet(1).value(2,0),Value::Text("#CALC!".into()));
+
+        // Imported display markers may be stale. Cyclic forwarded candidates
+        // must terminate and keep their previous scalar cache.
+        for (r,f) in [(0,"=A2"),(1,"=A1")] {
+            formula::set_formula(wb.sheet_mut(1),r,0,f,FValue::Text("#CALC!".into()));
+        }
+        formula::set_formula(wb.sheet_mut(0),0,3,"=LEN(Functions!A1)",FValue::Empty);
+        let keys=HashSet::from([(0,0,3)]);
+        let mut calc=formula::Calc::new(&wb);
+        calc.scope=Some(&keys);
+        assert_eq!(calc.cell_value(0,0,3),FValue::Number(6.));
     }
 }

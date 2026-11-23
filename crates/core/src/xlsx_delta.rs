@@ -5,6 +5,8 @@ use crate::store::{CellStyles, Store};
 use crate::style::StyleTable;
 #[path = "xlsx_font_delta.rs"]
 mod font_delta;
+#[path = "xlsx_stream_delta.rs"]
+mod stream;
 use anyhow::{Context, Result};
 use quick_xml::{
     Reader,
@@ -29,15 +31,34 @@ pub(crate) struct SourceCells {
     style_map: Option<Arc<StyleMap>>,
     notes: Option<NoteSource>,
     styles: CellStyles,
+    pub(super) rich: crate::model::CellMetadata<(u32, u32), Vec<crate::richtext::RichRun>>,
     arrays: Arc<Vec<(CellRef, Rect)>>,
     spill_shapes: Arc<HashMap<CellRef, (u32, u32)>>,
     spilled: Arc<HashSet<CellRef>>,
 }
 
 type Rect = (u32, u32, u32, u32);
+pub(super) use stream::GridStrings;
+
+pub(super) fn split_grid(
+    input: impl std::io::Read,
+    part: &str,
+    shell: &mut Vec<u8>,
+    grid: Option<&mut dyn Write>,
+    strings: &mut GridStrings,
+) -> Result<(bool, Option<String>)> {
+    let mut result = None;
+    stream::xml_input(input, part, |xml| {
+        result = Some(stream::split_grid(xml, shell, grid, strings)?);
+        Ok(true)
+    })?;
+    result.context("无法读取工作表数据")
+}
+
 #[derive(Default)]
 struct StyleChanges {
     updates: HashMap<CellRef, Option<u16>>,
+    dynamic: HashMap<CellRef, (Option<Rect>, Option<Rect>)>,
     // A derived XF belongs to a specific pre-edit raw XF. Confirm that
     // original on the worksheet too, including model-default/ambiguous cells.
     sources: HashMap<CellRef, u16>,
@@ -252,6 +273,51 @@ pub(super) fn verify_note_sources(path: &Path, wb: &Workbook) -> Result<()> {
 }
 
 impl SourceCells {
+    pub(super) fn reusable_grid(
+        &self,
+        zip: &mut ZipArchive<File>,
+        part: &str,
+        sheet: &Sheet,
+    ) -> bool {
+        self.styles == sheet.styles
+            && self.rich == sheet.rich
+            && self.arrays.as_ref() == &sheet.arrays
+            && self.spill_shapes.as_ref() == &sheet.spill_shapes
+            && self.spilled.as_ref() == &sheet.spilled
+            && signature(zip, part) == Some(self.signature)
+            && signature(zip, "xl/styles.xml") == self.style_part
+            && signature(zip, "xl/sharedStrings.xml") == self.strings
+    }
+
+    /// Stage supported value and formula-cache edits before umya handles comments
+    /// or drawings. The private file is discarded immediately after splitting it.
+    pub(super) fn stage_grid_edits(
+        &self,
+        zip: &mut ZipArchive<File>,
+        part: &str,
+        sheet: &Sheet,
+        styles: &StyleTable,
+    ) -> Result<Option<tempfile::NamedTempFile>> {
+        let Some(changes) = coordinates(sheet, self, styles, false, |_, _, _| None) else {
+            return Ok(None);
+        };
+        if changes.formula_changed {
+            return Ok(None);
+        }
+        let mut staged = tempfile::NamedTempFile::new()?;
+        let mut writer = BufWriter::new(staged.as_file_mut());
+        let ok = stream::xml_input(zip.by_name(part)?, part, |input| {
+            stream::worksheet(input, &mut writer, sheet, &self.store, changes, &mut false)
+        })?;
+        writer.flush()?;
+        drop(writer);
+        Ok(ok.then_some(staged))
+    }
+
+    pub(super) fn unchanged_values(&self, sheet: &Sheet) -> bool {
+        &self.store.version == sheet.cell_version()
+    }
+
     fn original_xf(&self, sheet: &Sheet, key: CellRef, styles: &StyleTable) -> Option<(u16, u16)> {
         match self.styles.get(&key).copied() {
             Some(id) => Some((id, self.style_map.as_ref()?.xf(id, styles)?)),
@@ -298,6 +364,7 @@ impl SourceCells {
             style_part,
             style_map,
             styles: sheet.styles.clone(),
+            rich: sheet.rich.clone(),
             arrays: Arc::new(sheet.arrays.clone()),
             spill_shapes: Arc::new(sheet.spill_shapes.clone()),
             spilled: Arc::new(sheet.spilled.clone()),
@@ -309,6 +376,11 @@ struct Changes {
     keys: BTreeSet<CellRef>,
     styles: StyleChanges,
     formula_changed: bool,
+}
+
+fn rich_changed(sheet: &Sheet, key: CellRef) -> bool {
+    let k = (key.row, key.col);
+    sheet.rich_dirty && sheet.source_cells.as_ref().is_some_and(|s| s.rich.get(&k) != sheet.rich.get(&k))
 }
 
 fn intersects(keys: &BTreeSet<CellRef>, (top, left, bottom, right): Rect) -> bool {
@@ -323,6 +395,7 @@ fn coordinates(
     sheet: &Sheet,
     source: &SourceCells,
     styles: &StyleTable,
+    editable_dynamic: bool,
     mut derive_xf: impl FnMut(u16, u16, u16) -> Option<u16>,
 ) -> Option<Changes> {
     let base = &source.store;
@@ -336,9 +409,6 @@ fn coordinates(
         if !keys.insert(key) {
             continue;
         }
-        if sheet.rich.contains_key(&(key.row, key.col)) {
-            return None;
-        }
         formula_changed |= base
             .get(key.row, key.col)
             .and_then(|c| c.formula.as_deref())
@@ -346,16 +416,21 @@ fn coordinates(
                 .get(key.row, key.col)
                 .and_then(|c| c.formula.as_deref());
     }
+    if sheet.rich_dirty {
+        for &(row, col) in sheet.rich.keys().chain(source.rich.keys()) {
+            let key = CellRef::new(row, col);
+            if rich_changed(sheet, key) { keys.insert(key); }
+        }
+    }
     // The fallback owns changes to array formulas, cached spill results and their footprints.
     // An unrelated value edit in the same sheet never needs to materialize these regions.
     if sheet.arrays != *source.arrays
-        || sheet.spill_shapes != *source.spill_shapes
-        || sheet.spilled != *source.spilled
+        || (!editable_dynamic && (sheet.spill_shapes != *source.spill_shapes || sheet.spilled != *source.spilled))
         || sheet
             .arrays
             .iter()
             .any(|(_, rect)| intersects(&keys, *rect))
-        || keys
+        || !editable_dynamic && keys
             .iter()
             .any(|k| sheet.spilled.contains(k) || sheet.spill_shapes.contains_key(k))
     {
@@ -401,6 +476,22 @@ fn coordinates(
             keys.insert(key);
         }
     }
+    if editable_dynamic {
+        let fixed: HashSet<_> = sheet.arrays.iter().map(|(k,_)| k).collect();
+        for &key in source.spill_shapes.keys().chain(sheet.spill_shapes.keys()) {
+            if fixed.contains(&key) { continue; }
+            let before = source.spill_shapes.get(&key);
+            let after = sheet.spill_shapes.get(&key);
+            if before != after || keys.contains(&key) {
+                keys.insert(key);
+                let rect = |shape: Option<&(u32,u32)>| match shape {
+                    Some(&s) => Some(Some(super::dynamic::area(key,s)?)),
+                    None => Some(None),
+                };
+                changed_styles.dynamic.insert(key, (rect(before)?,rect(after)?));
+            }
+        }
+    }
     Some(Changes {
         keys,
         styles: changed_styles,
@@ -437,16 +528,21 @@ fn replacement(
     old: Option<&Cell>,
     new: Option<&Cell>,
     styles: &StyleChanges,
+    sheet: &Sheet,
 ) -> Option<String> {
     let mut style = None;
+    let shapes = styles.dynamic.get(&key);
+    let mut cm = None;
     for a in start.attributes() {
         let a = a.ok()?;
         match a.key.as_ref() {
             "r" | "t" => {}
             "s" => style = Some(a.value.parse::<u32>().ok()?),
+            "cm" => cm = Some(a.value.parse::<u32>().ok()?),
             _ => return None,
         }
     }
+    if cm != shapes.and_then(|(old,_)| old.map(|_| 1)) { return None; }
     if !styles.matches(key, style) { return None; }
     if let Some(&xf) = styles.updates.get(&key) {
         style = xf.map(u32::from);
@@ -471,7 +567,10 @@ fn replacement(
                     if old.and_then(|c| c.formula.as_ref()).is_none() {
                         return None;
                     }
-                    if old.and_then(|c| c.formula.as_ref()) != new.and_then(|c| c.formula.as_ref())
+                    if let Some((Some(rect),_)) = shapes {
+                        if attr(e,"t").as_deref() != Some("array") || crate::arr::parse_a1_range(&attr(e,"ref")?)? != *rect
+                            || e.attributes().count() != 2 { return None; }
+                    } else if (shapes.is_some() || old.and_then(|c| c.formula.as_ref()) != new.and_then(|c| c.formula.as_ref()))
                         && e.attributes().next().is_some()
                     {
                         return None;
@@ -498,7 +597,36 @@ fn replacement(
             String::new()
         });
     };
-    model_cell_xml(out, cell, same_formula.then_some(definition))
+    if let Some((old,new)) = shapes {
+        if old.is_some() && definition.is_empty() { return None; }
+        if let Some(rect) = new {
+            out.push_str(" cm=\"1\"");
+            let formula = cell.formula.as_deref()?;
+            let f = crate::add_fn_prefixes(formula.strip_prefix('=').unwrap_or(formula));
+            let f = format!("<f t=\"array\" ref=\"{}\">{}</f>",super::dynamic::reference(*rect),xml_text(&f)?);
+            if cell.value == Value::Error(crate::formula::ErrKind::Spill) {
+                return Some(format!("{out} t=\"e\">{f}<v>#SPILL!</v></c>"));
+            }
+            return model_cell_xml(out, cell, Some(&f));
+        }
+        return cell_with_runs(out,cell,None,sheet.rich.get(&(key.row,key.col)).map(Vec::as_slice));
+    }
+    cell_with_runs(out, cell, same_formula.then_some(definition), sheet.rich.get(&(key.row, key.col)).map(Vec::as_slice))
+}
+
+pub(super) fn supports_runs(cell: &Cell, runs: &[crate::richtext::RichRun]) -> bool {
+    let Value::Text(text) = &cell.value else { return false; };
+    cell.formula.is_none() && runs.iter().flat_map(|r| r.text.bytes()).eq(text.bytes())
+        && runs.iter().all(|r| safe_xml_text(&r.text) && r.font.as_ref().is_none_or(|f| safe_xml_text(f))
+            && r.size.is_none_or(|v| v.is_finite() && v > 0.0))
+}
+
+pub(super) fn cell_with_runs(out: String, cell: &Cell, original_formula: Option<&str>, runs: Option<&[crate::richtext::RichRun]>) -> Option<String> {
+    let Some(runs) = runs.filter(|r| !r.is_empty()) else {
+        return model_cell_xml(out,cell,original_formula);
+    };
+    if !supports_runs(cell,runs) { return None; }
+    Some(format!("{out} t=\"inlineStr\">{}</c>", crate::richtext::runs_to_inline(runs)))
 }
 
 pub(super) fn model_cell_xml(mut out: String, cell: &Cell, original_formula: Option<&str>) -> Option<String> {
@@ -554,26 +682,8 @@ fn new_cell(key: CellRef, sheet: &Sheet, base: &Store, styles: &StyleChanges) ->
         None,
         sheet.get(key.row, key.col),
         styles,
+        sheet,
     )
-}
-
-fn insert_missing_rows(
-    before: u32,
-    sheet: &Sheet,
-    base: &Store,
-    keys: &mut BTreeSet<CellRef>,
-    styles: &StyleChanges,
-) -> Option<String> {
-    let mut xml = String::new();
-    while let Some(&key) = keys.first().filter(|key| key.row < before) {
-        xml.push_str(&format!("<row r=\"{}\">", key.row + 1));
-        while let Some(cell) = keys.first().copied().filter(|cell| cell.row == key.row) {
-            xml.push_str(&new_cell(cell, sheet, base, styles)?);
-            keys.pop_first();
-        }
-        xml.push_str("</row>");
-    }
-    Some(xml)
 }
 
 fn expanded_tag(tag: &BytesStart<'_>, omit: &str) -> Option<String> {
@@ -589,7 +699,7 @@ fn expanded_tag(tag: &BytesStart<'_>, omit: &str) -> Option<String> {
     String::from_utf8(w.into_inner()).ok()
 }
 
-fn sheet_edits(
+fn row_edits(
     xml: &str,
     sheet: &Sheet,
     base: &Store,
@@ -599,102 +709,15 @@ fn sheet_edits(
 ) -> Option<Vec<Edit>> {
     let mut reader = Reader::from_str(xml);
     let mut edits = Vec::new();
-    let mut in_data = false;
     let mut row = None;
-    let mut last_row = None;
-    let mut additions: Vec<_> = keys
-        .iter()
-        .filter(|k| base.get(k.row, k.col).is_none())
-        .copied()
-        .collect();
-    if sheet.merges_dirty {
-        additions.extend(
-            sheet
-                .merges
-                .iter()
-                .flat_map(|&(r, c, z, d)| [CellRef::new(r, c), CellRef::new(z, d)]),
-        );
-    }
-    let mut passed_dimension = additions.is_empty();
-    if additions
-        .iter()
-        .any(|k| k.row >= 1_048_576 || k.col >= 16_384)
-    {
-        return None;
-    }
     loop {
         let from = reader.buffer_position() as usize;
         let event = reader.read_event().ok()?;
         let to = reader.buffer_position() as usize;
         match event {
-            Event::Empty(ref e) | Event::Start(ref e)
-                if e.local_name().as_ref() == "dimension" && !additions.is_empty() =>
-            {
-                passed_dimension = true;
-                let bounds = crate::arr::parse_a1_range(&attr(&e, "ref")?)?;
-                let expanded = additions.iter().fold(bounds, |(r1, c1, r2, c2), k| {
-                    (r1.min(k.row), c1.min(k.col), r2.max(k.row), c2.max(k.col))
-                });
-                if expanded != bounds {
-                    let mut text = expanded_tag(e, "ref")?;
-                    text.pop();
-                    let end = if matches!(event, Event::Empty(_)) {
-                        "/>"
-                    } else {
-                        ">"
-                    };
-                    text.push_str(&format!(" ref=\"{}\"{end}", crate::arr::a1_range(expanded)));
-                    edits.push(Edit { from, to, text });
-                }
-            }
-            Event::Start(e) if e.name().as_ref() == "sheetData" => {
-                in_data = true;
-                passed_dimension = true;
-            }
-            Event::Empty(e) if e.name().as_ref() == "sheetData" => {
-                let mut text = expanded_tag(&e, "")?;
-                text.push_str(&insert_missing_rows(
-                    u32::MAX,
-                    sheet,
-                    base,
-                    &mut keys,
-                    styles,
-                )?);
-                text.push_str("</sheetData>");
-                edits.push(Edit { from, to, text });
-                break;
-            }
-            Event::End(e) if e.name().as_ref() == "sheetData" => {
-                let text = insert_missing_rows(u32::MAX, sheet, base, &mut keys, styles)?;
-                if !text.is_empty() {
-                    edits.push(Edit {
-                        from,
-                        to: from,
-                        text,
-                    });
-                }
-                break;
-            }
-            Event::Start(ref e) | Event::Empty(ref e) if in_data && e.name().as_ref() == "row" => {
+            Event::Start(ref e) | Event::Empty(ref e) if e.name().as_ref() == "row" => {
                 let r = attr(e, "r")?.parse::<u32>().ok()?.checked_sub(1)?;
-                if last_row.is_some_and(|prev| prev >= r) {
-                    return None;
-                }
-                last_row = Some(r);
-                let text = insert_missing_rows(r, sheet, base, &mut keys, styles)?;
-                if !text.is_empty() {
-                    edits.push(Edit {
-                        from,
-                        to: from,
-                        text,
-                    });
-                }
-                if keys.first().is_none_or(|key| key.row != r) {
-                    if matches!(event, Event::Start(_)) {
-                        reader.read_to_end(e.name()).ok()?;
-                    }
-                    continue;
-                }
+                if keys.first().is_none_or(|key| key.row != r) { return None; }
                 if matches!(event, Event::Empty(_)) {
                     let mut text = expanded_tag(e, "spans")?;
                     while let Some(k) = keys.first().copied().filter(|k| k.row == r) {
@@ -758,7 +781,7 @@ fn sheet_edits(
                 if keys.remove(&key) {
                     let old = base.get(r, c);
                     let new = sheet.get(r, c);
-                    let text = if let Some(xf) = styles.updates.get(&key).filter(|_| old == new) {
+                    let text = if let Some(xf) = styles.updates.get(&key).filter(|_| old == new && !rich_changed(sheet,key)) {
                         let old_style = attr(e, "s").map(|value| value.parse::<u32>()).transpose().ok()?;
                         if !styles.matches(key, old_style) { return None; }
                         // Style-only changes leave rich strings, metadata, shared formulas
@@ -778,7 +801,7 @@ fn sheet_edits(
                         tag
                     } else {
                         *changed_sst |= attr(e, "t").as_deref() == Some("s");
-                        replacement(key, e, body, old, new, styles)?
+                        replacement(key, e, body, old, new, styles, sheet)?
                     };
                     let to = reader.buffer_position() as usize;
                     if let Some(previous) = edits.last_mut().filter(|e| e.to == from) {
@@ -790,22 +813,18 @@ fn sheet_edits(
                 }
             }
             // Unknown row/sheetData children have their own ordering rules.
-            Event::Start(_) | Event::Empty(_) if in_data => return None,
+            Event::Start(_) | Event::Empty(_) => return None,
             Event::Eof => break,
             _ => {}
         }
-        if keys.is_empty() && passed_dimension {
+        if keys.is_empty() {
             break;
         }
     }
     keys.is_empty().then_some(edits)
 }
 
-fn write_edits(out: &mut ZipWriter<BufWriter<File>>, part: &str, xml: &str, edits: &[Edit]) -> Result<()> {
-    let opts = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .compression_level(Some(1));
-    out.start_file(part, opts)?;
+fn write_spans(out: &mut impl Write, xml: &str, edits: &[Edit]) -> Result<()> {
     let mut copied = 0;
     for e in edits {
         out.write_all(&xml.as_bytes()[copied..e.from])?;
@@ -1140,6 +1159,7 @@ pub(super) fn write_with_style_receipt(
     let sst = signature(&mut zip, "xl/sharedStrings.xml");
     let style_part = signature(&mut zip, "xl/styles.xml");
     let style_xml = std::cell::OnceCell::new();
+    let dynamic = std::cell::OnceCell::new();
     let mut changed_xfs = None;
     let mut base_map = None;
     for sheet in &wb.sheets {
@@ -1151,21 +1171,23 @@ pub(super) fn write_with_style_receipt(
             && sheet.style_edits.is_empty()
             && !sheet.merges_dirty
             && !sheet.notes_dirty
+            && !sheet.rich_dirty
         {
             continue;
         }
         let (Some(part), Some(source)) = (&sheet.source_part, &sheet.source_cells) else {
             return Ok(false);
         };
-        if sheet.rich_dirty
-            || signature(&mut zip, part) != Some(source.signature)
+        if signature(&mut zip, part) != Some(source.signature)
             || source.strings != sst
             || ((sheet.styles_dirty || !sheet.style_edits.is_empty())
                 && source.style_part != style_part)
         {
             return Ok(false);
         }
-        let Some(changes) = coordinates(sheet, source, &wb.styles, |raw, old, id| {
+        let edit_dynamic = !(source.spill_shapes.is_empty() && sheet.spill_shapes.is_empty()) &&
+            *dynamic.get_or_init(|| super::dynamic::editable(&mut zip));
+        let Some(changes) = coordinates(sheet, source, &wb.styles, edit_dynamic, |raw, old, id| {
             if changed_xfs.is_none() {
                 let xml = style_xml.get_or_init(|| super::read_zip_text(&mut zip, "xl/styles.xml").ok());
                 changed_xfs = Some(font_delta::Styles::new(xml.as_deref()?)?);
@@ -1261,25 +1283,12 @@ pub(super) fn write_with_style_receipt(
             )?;
             out.write_all(&data)?;
         } else if let Some((sheet, store, changes)) = sheets.remove(&part) {
-            let xml = super::read_zip_text(&mut zip, &part)?;
-            let Some(mut edits) = sheet_edits(
-                &xml,
-                sheet,
-                store,
-                changes.keys,
-                &changes.styles,
-                &mut changed_sst,
-            ) else {
+            out.start_file(&part, SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated).compression_level(Some(1)))?;
+            if !stream::xml_input(zip.by_index(index)?, &part, |input|
+                stream::worksheet(input, &mut out, sheet, store, changes, &mut changed_sst))? {
                 return Ok(false);
-            };
-            if sheet.merges_dirty {
-                let Some(merge) = merge_edit(&xml, sheet) else {
-                    return Ok(false);
-                };
-                edits.push(merge);
-                edits.sort_by_key(|e| e.from);
             }
-            write_edits(&mut out, &part, &xml, &edits)?;
         } else {
             out.raw_copy_file(zip.by_index_raw(index)?)?;
         }
@@ -1291,32 +1300,10 @@ pub(super) fn write_with_style_receipt(
         if changed_sst {
             // Some indexed references became inline strings. Both counters are
             // optional; preserve indices, rich runs and every original <si>.
-            let xml = super::read_zip_text(&mut zip, "xl/sharedStrings.xml")?;
-            let mut reader = Reader::from_str(&xml);
-            let edit = loop {
-                let from = reader.buffer_position() as usize;
-                match reader.read_event()? {
-                    Event::Start(e) if e.local_name().as_ref() == "sst" => {
-                        let mut root = BytesStart::new(e.name().as_ref().to_owned());
-                        for a in e.attributes() {
-                            let a = a?;
-                            if !matches!(a.key.as_ref(), "count" | "uniqueCount") {
-                                root.push_attribute(a);
-                            }
-                        }
-                        let mut w = quick_xml::Writer::new(Vec::new());
-                        w.write_event(Event::Start(root))?;
-                        break Edit {
-                            from,
-                            to: reader.buffer_position() as usize,
-                            text: String::from_utf8(w.into_inner())?,
-                        };
-                    }
-                    Event::Eof => return Ok(false),
-                    _ => {}
-                }
-            };
-            write_edits(&mut out, "xl/sharedStrings.xml", &xml, &[edit])?;
+            out.start_file("xl/sharedStrings.xml", SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated).compression_level(Some(1)))?;
+            if !stream::xml_input(zip.by_index(i)?, "xl/sharedStrings.xml", |input|
+                stream::shared_strings(input, &mut out))? { return Ok(false); }
         } else {
             out.raw_copy_file(zip.by_index_raw(i)?)?;
         }
@@ -1555,6 +1542,9 @@ mod tests {
         style.bold = true;
         style.italic = true;
         style.underline = true;
+        style.wrap = true;
+        style.indent = 2;
+        style.halign = 2;
         style.size = 15.0;
         let first = wb.styles.intern(style.clone());
         wb.sheets[0].set_style(0, 0, first);
@@ -1564,6 +1554,10 @@ mod tests {
                 wb.sheets[0].set_style(100, 2, first);
                 style.italic = false;
                 style.double_underline = true;
+                style.wrap = false;
+                style.shrink_to_fit = true;
+                style.indent = 1;
+                style.halign = 3;
                 style.size = 16.0;
                 let second = wb.styles.intern(style.clone());
                 wb.sheets[0].set_style(0, 0, second);
@@ -1574,7 +1568,7 @@ mod tests {
             receipt.adopt_document(&mut wb, &file, true);
             let raw = String::from_utf8(read_part(&file, "xl/styles.xml").unwrap()).unwrap();
             assert_eq!(raw.matches(r#"e:keep="yes""#).count(), pass + 1);
-            assert_eq!(raw.matches(r#"<alignment readingOrder="2"/>"#).count(), pass + 1);
+            assert_eq!(raw.matches(r#"readingOrder="2""#).count(), pass + 1);
             assert_eq!(raw.matches(r#"<family val="2"/>"#).count(), pass + 1);
             assert!(raw.contains(&format!(r#"<cellXfs count="{}">"#, pass + 1)));
             let sheet = String::from_utf8(read_part(&file, &part).unwrap()).unwrap();
@@ -1589,6 +1583,8 @@ mod tests {
             assert!(saved.bold);
             assert_eq!(saved.italic, pass == 1);
             assert_eq!(saved.size, style.size);
+            assert_eq!((saved.wrap,saved.shrink_to_fit,saved.indent,saved.halign),
+                       (style.wrap,style.shrink_to_fit,style.indent,style.halign));
             if pass == 2 {
                 let copied = loaded.styles.get(view.style_of(100, 2));
                 assert!(copied.bold && copied.italic);

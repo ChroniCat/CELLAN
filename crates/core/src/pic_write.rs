@@ -365,13 +365,16 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
         let mut anchors = String::new();
         for (i, pic) in sheet.pictures.iter().enumerate() {
             let rid_i = format!("rIdPic{}", i + 1);
-            if let Some(data) = pic.data.as_ref() {
+            let media = if let Some(data) = pic.data.as_ref() {
                 let part = memory_part(data, &pic.ext);
-                if !crate::textbox::has_part(path, &part) {
+                if !crate::textbox::has_part(path, &part) && !additions.iter().any(|(name, _)| name == &part) {
                     additions.push((part.clone(), data.as_ref().clone()));
                 }
-            }
-            let fname = pic.part.rsplit('/').next().unwrap_or("image1.png").to_string();
+                part
+            } else {
+                pic.part.clone()
+            };
+            let fname = media.rsplit('/').next().unwrap_or("image1.png");
             let rel = format!(
                 "<Relationship Id=\"{rid_i}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"../media/{fname}\"/>"
             );

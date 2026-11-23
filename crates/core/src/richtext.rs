@@ -63,7 +63,7 @@ pub fn runs_to_inline(runs: &[RichRun]) -> String {
             props.push_str(&format!("<sz val=\"{sz}\"/>"));
         }
         if let Some(f) = &r.font {
-            props.push_str(&format!("<rFont val=\"{}\"/>", esc(f)));
+            props.push_str(&format!("<rFont val=\"{}\"/>", esc(f).replace('"', "&quot;")));
         }
         if !props.is_empty() {
             out.push_str(&format!("<rPr>{props}</rPr>"));
@@ -119,7 +119,7 @@ pub fn parse_inline(xml: &str) -> Option<Vec<RichRun>> {
                 let font = pr.find("<rFont val=\"").and_then(|p| {
                     let rest = &pr[p + 12..];
                     let q = rest.find('"')?;
-                    Some(rest[..q].to_string())
+                    Some(unescape(&rest[..q]))
                 });
                 (
                     pr.contains("<b/>") || pr.contains("<b val=\"1\""),

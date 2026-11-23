@@ -240,9 +240,33 @@ fn incremental_save_updates_dependents_and_preserves_clean_formula_caches() {
     let path = env.path("edited.xlsx");
     let mut tasks = DocumentTasks::default();
     tasks.dirty_recalc_seeds.insert((0, 0, 0));
-    tasks.start_save_checked(&mut wb, path.clone(), Some(graph.into()), |_| None);
+    tasks.start_save_checked(&mut wb, path.clone(), Some(graph.into()), None, |_| None);
     assert!(wait_for_document_save(&mut tasks, &mut wb).unwrap().1);
     let saved = sheetcore::xlsx::load(&path).unwrap();
     assert_eq!(saved.sheet(0).value(0, 1), Value::Number(8.0));
     assert_eq!(saved.sheet(0).value(0, 2), Value::Number(123.0));
+}
+
+#[test]
+fn structural_save_uses_only_the_plan_for_the_current_document_generation() {
+    let env = crate::test_env::TestEnv::new("structural-save-generation");
+    use sheetcore::{formula::deps::Deps, structural::{Structural,apply_structural_wb}};
+    for (generation, expected_cache) in [(2,71.),(3,2.)] {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0,0,Cell {value:Value::Number(3.),formula:None});
+        wb.sheets[0].set(1,0,Cell {value:Value::Number(6.),formula:Some("=A1*2".into())});
+        wb.sheets.push(Sheet::new("Independent"));
+        wb.sheets[1].set(0,0,Cell {value:Value::Number(71.),formula:Some("=1+1".into())});
+        let graph = Deps::build_after_recalc(&wb).into();
+        let op = Structural::DeleteRows {at:0,n:1};
+        apply_structural_wb(&mut wb,0,&op);
+        let mut tasks = DocumentTasks { needs_full:true, structural_recalc:Some(StructuralCalculation {
+            generation:2,sheet:0,op,complex:true,graph,
+        }),..Default::default() };
+        let path = env.path(&format!("save-{generation}.xlsx"));
+        tasks.start_save_checked(&mut wb,path,None,Some(generation),|_| None);
+        assert!(wait_for_document_save(&mut tasks,&mut wb).unwrap().1);
+        assert_eq!(wb.sheets[1].value(0,0),Value::Number(expected_cache));
+        assert!(matches!(wb.sheets[0].value(0,0),Value::Error(_)));
+    }
 }
