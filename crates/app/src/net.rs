@@ -1202,6 +1202,158 @@ fn write_line<W: Write>(stream: &mut W, s: &str) -> std::io::Result<()> {
     stream.flush()
 }
 
+fn write_binary_frame<W: Write>(stream: &mut W, frame: &[u8]) -> std::io::Result<()> {
+    stream.write_all(frame)?;
+    stream.flush()
+}
+
+/// 宿主写线程内部控制前缀：明文未加密拒绝报文（认证失败时发给尚未建立会话的对端）
+const CTRL_RAW_LINE_PREFIX: char = '\u{1}';
+/// 宿主写线程内部控制哨兵：写完 v2 `Welcome` 后原子切换至 v3 二进制帧封装
+const CTRL_ENABLE_BINARY_V3: &str = "\u{2}";
+
+enum WireFrame {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+/// 首字节自识别读取一帧：
+/// - 首字节为 `BINARY_V3_MAGIC (0x02)` 且 `allow_binary == true` 时，按 `[0x02][4B LE len][body]` 读入 v3 二进制帧；
+/// - 否则按原有 v2 行分隔文本帧读取（`\n` 结束）。
+/// 读取端无需依赖切换时序即可同时支持 v2 与 v3，彻底消除协议切换边界竞态。
+fn read_wire_frame<R: BufRead>(
+    r: &mut R,
+    max: usize,
+    allow_binary: bool,
+) -> std::io::Result<Option<WireFrame>> {
+    let first = loop {
+        match r.fill_buf() {
+            Ok(b) if b.is_empty() => return Ok(None),
+            Ok(b) => break b[0],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    if first == sheetcore::wire::BINARY_V3_MAGIC {
+        if !allow_binary {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "未完成握手前不允许二进制帧",
+            ));
+        }
+        r.consume(1);
+        let mut len_buf = [0u8; 4];
+        std::io::Read::read_exact(r, &mut len_buf)?;
+        let body_len = u32::from_le_bytes(len_buf) as usize;
+        if body_len < sheetcore::wire::BINARY_V3_MIN_BODY_LEN || body_len > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "二进制报文长度越界",
+            ));
+        }
+        let mut body = Vec::with_capacity(body_len.min(256 * 1024));
+        let mut limited = std::io::Read::take(&mut *r, body_len as u64);
+        let n = std::io::Read::read_to_end(&mut limited, &mut body)?;
+        if n != body_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "二进制报文截断",
+            ));
+        }
+        return Ok(Some(WireFrame::Binary(body)));
+    }
+    read_line_bounded(r, max).map(|opt| opt.map(WireFrame::Text))
+}
+
+struct HostOutput {
+    writer: BufWriter<TcpStream>,
+    sess: sheetcore::wire::Session,
+    binary_v3: bool,
+    scratch: Vec<u8>,
+}
+
+impl HostOutput {
+    fn new(writer: BufWriter<TcpStream>, sess: sheetcore::wire::Session) -> Self {
+        Self {
+            writer,
+            sess,
+            binary_v3: false,
+            scratch: Vec::new(),
+        }
+    }
+
+    fn write_plain(&mut self, plain: &str) -> std::io::Result<()> {
+        if self.binary_v3 {
+            self.sess.seal_binary_into(plain, true, &mut self.scratch);
+            let res = write_binary_frame(&mut self.writer, &self.scratch);
+            if self.scratch.capacity() > 512 * 1024 {
+                self.scratch = Vec::new();
+            }
+            res
+        } else {
+            let frame = self.sess.seal(plain);
+            write_line(&mut self.writer, &frame)
+        }
+    }
+
+    fn write_prepared(&mut self, prepared: &sheetcore::wire::PreparedPayload) -> std::io::Result<()> {
+        if self.binary_v3 {
+            self.sess.seal_prepared_binary_into(prepared, &mut self.scratch);
+            let res = write_binary_frame(&mut self.writer, &self.scratch);
+            if self.scratch.capacity() > 512 * 1024 {
+                self.scratch = Vec::new();
+            }
+            res
+        } else {
+            let frame = self.sess.seal_prepared(prepared);
+            write_line(&mut self.writer, &frame)
+        }
+    }
+}
+
+struct GuestSend {
+    sess: sheetcore::wire::Session,
+    batch_ops: bool,
+    sort_permutation: bool,
+    binary_v3: bool,
+    scratch: Vec<u8>,
+    acks: Arc<Mutex<Receiver<(u64, SortResponse)>>>,
+}
+
+impl GuestSend {
+    fn write_plain<W: Write>(&mut self, w: &mut W, plain: &str) -> std::io::Result<()> {
+        if self.binary_v3 {
+            self.sess.seal_binary_into(plain, true, &mut self.scratch);
+            let res = write_binary_frame(w, &self.scratch);
+            if self.scratch.capacity() > 512 * 1024 {
+                self.scratch = Vec::new();
+            }
+            res
+        } else {
+            let frame = self.sess.seal(plain);
+            write_line(w, &frame)
+        }
+    }
+
+    fn write_prepared<W: Write>(
+        &mut self,
+        w: &mut W,
+        prepared: &sheetcore::wire::PreparedPayload,
+    ) -> std::io::Result<()> {
+        if self.binary_v3 {
+            self.sess.seal_prepared_binary_into(prepared, &mut self.scratch);
+            let res = write_binary_frame(w, &self.scratch);
+            if self.scratch.capacity() > 512 * 1024 {
+                self.scratch = Vec::new();
+            }
+            res
+        } else {
+            let frame = self.sess.seal_prepared(prepared);
+            write_line(w, &frame)
+        }
+    }
+}
+
 /// 认证前单行上限：挑战与 Hello 报文都很短，局域网里的陌生连接不该让宿主攒内存
 const MAX_PREAUTH_LINE: usize = 64 * 1024;
 /// 认证后单行上限（整表快照分片、批量样式等大报文也在其内）
@@ -3408,7 +3560,7 @@ fn host_initialized(
                         return;
                     }
                     let mut sess = sheetcore::wire::Session::host_side(&room_key, &salt);
-                    let output = Arc::new(Mutex::new((write_half, sess.fork_sender())));
+                    let output = Arc::new(Mutex::new(HostOutput::new(write_half, sess.fork_sender())));
                     let reader = BufReader::new(&*stream);
                     let (live, rx) = channel::<LiveFrame>();
                     let tx = LiveSender { tx: live };
@@ -3421,19 +3573,21 @@ fn host_initialized(
                     std::thread::spawn(move || {
                         let send = |s: String| {
                             let mut out = write_out.lock().unwrap();
-                            let (w, se) = &mut *out;
-                            let frame = if let Some(denial) = s.strip_prefix('\u{1}') {
-                                denial.to_owned()
-                            } else { se.seal(&s) };
-                            write_line(w, &frame).is_ok()
+                            if s == CTRL_ENABLE_BINARY_V3 {
+                                out.binary_v3 = true;
+                                return true;
+                            }
+                            if let Some(denial) = s.strip_prefix(CTRL_RAW_LINE_PREFIX) {
+                                return write_line(&mut out.writer, denial).is_ok();
+                            }
+                            out.write_plain(&s).is_ok()
                         };
                         for frame in intro_rx.into_iter().map(LiveFrame::Line).chain(rx) {
                             let ok = match frame {
                                 LiveFrame::Line(line) => send(line),
                                 LiveFrame::Prepared(prepared) => {
                                     let mut out = write_out.lock().unwrap();
-                                    let (w, se) = &mut *out;
-                                    write_line(w, &se.seal_prepared(&prepared)).is_ok()
+                                    out.write_prepared(&prepared).is_ok()
                                 }
                                 LiveFrame::Correction(correction) => {
                                     correction.chunks(|sheet,first_ts,items| send_room_message(
@@ -3444,7 +3598,7 @@ fn host_initialized(
                             };
                             if !ok { break; }
                         }
-                        let _ = write_out.lock().unwrap().0.get_ref().shutdown(std::net::Shutdown::Both);
+                        let _ = write_out.lock().unwrap().writer.get_ref().shutdown(std::net::Shutdown::Both);
                     });
 
                     let expire_and_broadcast = || {
@@ -3490,14 +3644,19 @@ fn host_initialized(
                     let mut hello_site: Option<u32> = None;
                     let mut reader = reader;
                     loop {
-                        let limit = if hello_site.is_none() { MAX_PREAUTH_LINE } else { MAX_LINE };
-                        let Ok(Some(line)) = read_line_bounded(&mut reader, limit) else { break };
-                        let Some(line) = sess.open(&line) else {
+                        let allow_binary = hello_site.is_some();
+                        let limit = if allow_binary { MAX_LINE } else { MAX_PREAUTH_LINE };
+                        let Ok(Some(frame)) = read_wire_frame(&mut reader, limit, allow_binary) else { break };
+                        let opened = match frame {
+                            WireFrame::Text(line) => sess.open(&line),
+                            WireFrame::Binary(body) => sess.open_binary_owned(body),
+                        };
+                        let Some(line) = opened else {
                             if hello_site.is_none() {
                                 let deny = serde_json::to_string(&Msg::Denied {
                                     reason: "口令不正确或客户端不支持加密协作".into(),
                                 }).unwrap();
-                                let _ = tx.send(format!("\u{1}{deny}"));
+                                let _ = tx.send(format!("{CTRL_RAW_LINE_PREFIX}{deny}"));
                             }
                             break;
                         };
@@ -3523,6 +3682,7 @@ fn host_initialized(
                                 resume_room,
                                 resume_watermark,
                                 resume_struct_rev,
+                                binary_v3,
                             } => {
                                 can_sort.store(sort_permutation, Ordering::Release);
                                 let live_tx = tx.clone();
@@ -3622,9 +3782,14 @@ fn host_initialized(
                                         room_id: room_session_id.clone(),
                                         watermark: current_wm,
                                         structure_revision: struct_rev,
+                                        binary_v3,
                                     })
                                     .unwrap(),
                                 );
+                                // Welcome 仍按 v2 文本行发出；若双方协商启用 binary_v3，紧随 Welcome 之后切换为 v3 二进制流帧
+                                if binary_v3 {
+                                    let _ = tx.send(CTRL_ENABLE_BINARY_V3.to_string());
+                                }
                                 if canonical_name != name {
                                     let _ = tx.send(
                                         serde_json::to_string(&Msg::Rename {
@@ -3895,6 +4060,7 @@ fn host_initialized(
                                     resume_room: String::new(),
                                     resume_watermark: 0,
                                     resume_struct_rev: 0,
+                                    binary_v3: false,
                                 })
                                 .unwrap();
                                 broadcast_line_to(&other_peers, hello);
@@ -4003,8 +4169,7 @@ fn host_initialized(
                                 if let Some(hook) = before_sort_reply.lock().unwrap().take() { hook(); }
                                 let reply = serde_json::to_string(&Msg::SortReply { first_ts: plan.first_ts, outcome }).unwrap();
                                 let mut out = output.lock().unwrap();
-                                let (w,se) = &mut *out;
-                                if write_line(w, &se.seal(&reply)).is_err() { break; }
+                                if out.write_plain(&reply).is_err() { break; }
                             }
                             message @ (Msg::Op(_) | Msg::Ops { .. }) => {
                                 let Some(conn_site) = hello_site else { break };
@@ -4956,7 +5121,6 @@ fn join_session(
     let reader_generation = connection_generation.clone();
     let writer: Arc<Mutex<Option<BufWriter<TcpStream>>>> = Arc::new(Mutex::new(None));
     // 发送端加密会话单独归写线程持有，读线程使用栈上独立解密会话（彻底消灭大快照解密期间读写锁争用！）
-    type GuestSend = (sheetcore::wire::Session, bool, bool, Arc<Mutex<Receiver<(u64,SortResponse)>>>);
     let send_sess: Arc<Mutex<Option<GuestSend>>> = Arc::new(Mutex::new(None));
     // 本客户端实例专属重连凭据：断线重连可继续沿用自身 site，其他客户端不能冒领该 site
     let client_auth = crate::session_lock::new_session_id();
@@ -4989,16 +5153,17 @@ fn join_session(
                 match cmd {
                     Cmd::Cells(ops) => {
                         let mut session = send_sess.lock().unwrap();
-                        if let (Some((se, batch, _, _)), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
-                            cell_frames(ops, true, *batch, |line| { let _ = write_line(w, &se.seal(&line)); });
+                        if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            let batch = gs.batch_ops;
+                            cell_frames(ops, true, batch, |line| { let _ = gs.write_plain(w, &line); });
                         }
                     }
                     Cmd::Style(msg) => {
                         let mut session = send_sess.lock().unwrap();
-                        if let (Some((se, _, _, _)), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                        if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
                             if !send_room_message(msg, MAX_PLAIN_LINE, |line| {
                                 unconfirmed_styles_for_writer.fetch_add(1, Ordering::AcqRel);
-                                if write_line(w, &se.seal(&line)).is_ok() {
+                                if gs.write_plain(w, &line).is_ok() {
                                     true
                                 } else {
                                     let _ = unconfirmed_styles_for_writer.fetch_update(
@@ -5021,38 +5186,38 @@ fn join_session(
                     Cmd::Sort(generation,batch) => {
                         let current = send_sess.lock().unwrap().as_ref()
                             .filter(|_| writer_generation.load(Ordering::Acquire) == generation)
-                            .map(|(_,b,c,acks)| (*b,*c,acks.clone()));
+                            .map(|gs| (gs.batch_ops, gs.sort_permutation, gs.acks.clone()));
                         let Some((batched, capable, acks)) = current else { continue };
                         let ok = send_sort(&batch, capable, true, batched, &acks.lock().unwrap(), |line| {
                             let mut session = send_sess.lock().unwrap();
                             let mut writer = writer.lock().unwrap();
-                            let (Some((se, _, _, current)), Some(w)) = (session.as_mut(), writer.as_mut()) else { return false };
-                            Arc::ptr_eq(current,&acks) && write_line(w, &se.seal(&line)).is_ok()
+                            let (Some(gs), Some(w)) = (session.as_mut(), writer.as_mut()) else { return false };
+                            Arc::ptr_eq(&gs.acks, &acks) && gs.write_plain(w, &line).is_ok()
                         });
                         if ok && !capable { pending_for_writer.lock().unwrap().remove(&batch.plan.first_ts); }
-                        if !ok && send_sess.lock().unwrap().as_ref().is_some_and(|(_,_,_,current)| Arc::ptr_eq(current,&acks))
+                        if !ok && send_sess.lock().unwrap().as_ref().is_some_and(|gs| Arc::ptr_eq(&gs.acks, &acks))
                             && let Some(w) = writer.lock().unwrap().as_ref() { let _ = w.get_ref().shutdown(std::net::Shutdown::Both); }
                     }
                     Cmd::GuestStructure(generation,msg) => {
                         let mut session = send_sess.lock().unwrap();
                         let mut writer = writer.lock().unwrap();
                         if writer_generation.load(Ordering::Acquire) == generation
-                            && let (Some((se,_,_,_)),Some(w)) = (session.as_mut(),writer.as_mut()) {
-                            let result = write_line(w,&se.seal(&serde_json::to_string(&msg).unwrap()));
+                            && let (Some(gs), Some(w)) = (session.as_mut(), writer.as_mut()) {
+                            let result = gs.write_plain(w, &serde_json::to_string(&msg).unwrap());
                             if result.is_err() { let _ = w.get_ref().shutdown(std::net::Shutdown::Both); }
                         }
                     }
                     Cmd::Deliver(_, _) => unreachable!("room dispatch is host-only"),
                     Cmd::Broadcast(s) | Cmd::SendTo(_, s) => {
                         let mut session = send_sess.lock().unwrap();
-                        if let (Some((se, _, _, _)), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
-                            let _ = write_line(w, &se.seal(&s));
+                        if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            let _ = gs.write_plain(w, &s);
                         }
                     }
                     Cmd::SendPrepared(_, prepared) => {
                         let mut session = send_sess.lock().unwrap();
-                        if let (Some((se, _, _, _)), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
-                            let _ = write_line(w, &se.seal_prepared(&prepared));
+                        if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            let _ = gs.write_prepared(w, &prepared);
                         }
                     }
                     Cmd::Stop => break,
@@ -5115,19 +5280,31 @@ fn join_session(
                 let mut active_vote: Weak<Mutex<Option<Sender<bool>>>> = Weak::new();
                 let mut reader = reader;
                 loop {
-                    let Ok(Some(line)) = read_line_bounded(&mut reader, MAX_LINE) else { break };
-                    let msg = if let Some(se) = recv_sess.as_mut() {
-                        match se.open(&line) {
-                            Some(plain) => serde_json::from_str::<Msg>(&plain),
-                            None => match serde_json::from_str::<Msg>(&line) {
-                                Ok(msg @ Msg::Denied { .. }) if !got_welcome => Ok(msg),
-                                _ => break,
-                            },
+                    let allow_binary = got_welcome && recv_sess.is_some();
+                    let Ok(Some(frame)) = read_wire_frame(&mut reader, MAX_LINE, allow_binary) else { break };
+                    let msg = match frame {
+                        WireFrame::Binary(body) => {
+                            let Some(se) = recv_sess.as_mut() else { break };
+                            match se.open_binary_owned(body) {
+                                Some(plain) => serde_json::from_str::<Msg>(&plain),
+                                None => break,
+                            }
                         }
-                    } else {
-                        match serde_json::from_str::<Msg>(&line) {
-                            Ok(msg @ (Msg::ChallengeSalt { .. } | Msg::Challenge { .. } | Msg::Denied { .. })) => Ok(msg),
-                            _ => break,
+                        WireFrame::Text(line) => {
+                            if let Some(se) = recv_sess.as_mut() {
+                                match se.open(&line) {
+                                    Some(plain) => serde_json::from_str::<Msg>(&plain),
+                                    None => match serde_json::from_str::<Msg>(&line) {
+                                        Ok(msg @ Msg::Denied { .. }) if !got_welcome => Ok(msg),
+                                        _ => break,
+                                    },
+                                }
+                            } else {
+                                match serde_json::from_str::<Msg>(&line) {
+                                    Ok(msg @ (Msg::ChallengeSalt { .. } | Msg::Challenge { .. } | Msg::Denied { .. })) => Ok(msg),
+                                    _ => break,
+                                }
+                            }
                         }
                     };
                     let msg = match msg {
@@ -5184,6 +5361,7 @@ fn join_session(
                                 resume_room,
                                 resume_watermark,
                                 resume_struct_rev,
+                                binary_v3: true,
                                 base_hash: if synced_once {
                                     String::new()
                                 } else {
@@ -5213,6 +5391,7 @@ fn join_session(
                             room_id,
                             watermark,
                             structure_revision,
+                            binary_v3,
                             ..
                         } if !got_welcome => {
                             if require_same_document && remote_doc != doc {
@@ -5231,7 +5410,14 @@ fn join_session(
                                 resume_state = None;
                             }
                             if let Some(se) = pending_sender.take() {
-                                *send_sess.lock().unwrap() = Some((se, batch_ops, sort_permutation, sort_replies.clone()));
+                                *send_sess.lock().unwrap() = Some(GuestSend {
+                                    sess: se,
+                                    batch_ops,
+                                    sort_permutation,
+                                    binary_v3,
+                                    scratch: Vec::new(),
+                                    acks: sort_replies.clone(),
+                                });
                             }
                             if let Ok(clone) = connected.try_clone() {
                                 let _ = clone.set_write_timeout(Some(Duration::from_secs(10)));
@@ -5277,11 +5463,11 @@ fn join_session(
                                 let accepted = SortVote::wait(rx,deadline_vote,Duration::from_secs(15));
                                 if connected_to_offer.upgrade().is_none() { return; }
                                 let mut session = session.lock().unwrap();
-                                let Some((se, _, true, replies)) = session.as_mut() else { return };
-                                if !Arc::ptr_eq(replies,&current_replies) { return; }
+                                let Some(gs) = session.as_mut() else { return };
+                                if !gs.sort_permutation || !Arc::ptr_eq(&gs.acks, &current_replies) { return; }
                                 let outcome = if accepted { SortResponse::Accepted } else { SortResponse::NeedCells };
-                                let line = serde_json::to_string(&Msg::SortReply { first_ts,outcome }).unwrap();
-                                if write_line(&mut response,&se.seal(&line)).is_err() {
+                                let line = serde_json::to_string(&Msg::SortReply { first_ts, outcome }).unwrap();
+                                if gs.write_plain(&mut response, &line).is_err() {
                                     let _ = response.get_ref().shutdown(std::net::Shutdown::Both);
                                 }
                             });
@@ -6114,6 +6300,7 @@ mod integrity_tests {
             resume_room: String::new(),
             resume_watermark: 0,
             resume_struct_rev: 0,
+            binary_v3: false,
         };
         let mut w = write_half;
         let frame = sess.seal(&serde_json::to_string(&hello).unwrap());
@@ -7206,6 +7393,389 @@ mod integrity_tests {
         assert!(wm.op_seqs.get(&(0, 7, 0)).is_some());
         assert!(wm.op_seqs.get(&(0, 10, 0)).is_some());
     }
+
+    fn raw_client_handshake(
+        port: u16,
+        site: u32,
+        name: &str,
+        password: &str,
+        auth: &str,
+        binary_v3: bool,
+    ) -> (TcpStream, BufReader<TcpStream>, sheetcore::wire::Session, Msg) {
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect raw client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut w = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let challenge_line = read_line_bounded(&mut reader, MAX_PREAUTH_LINE)
+            .unwrap()
+            .expect("challenge line");
+        let Msg::ChallengeSalt { nonce, salt, room_salt } =
+            serde_json::from_str::<Msg>(&challenge_line).expect("parse ChallengeSalt")
+        else {
+            panic!("expected ChallengeSalt, got {challenge_line}");
+        };
+        let raw_salt = sheetcore::wire::b64_decode(&salt).unwrap();
+        let room_raw = sheetcore::wire::b64_decode(&room_salt).unwrap();
+        let room = sheetcore::wire::RoomKey::derive(password, &room_raw);
+        let mut sess = sheetcore::wire::Session::client_side(&room, &raw_salt);
+        let hello = Msg::Hello {
+            site,
+            name: name.into(),
+            doc: "doc".into(),
+            proof: room.proof(nonce),
+            auth: auth.into(),
+            base_hash: String::new(),
+            sort_permutation: false,
+            palette_styles: true,
+            resume_room: String::new(),
+            resume_watermark: 0,
+            resume_struct_rev: 0,
+            binary_v3,
+        };
+        let frame = sess.seal(&serde_json::to_string(&hello).unwrap());
+        write_line(&mut w, &frame).unwrap();
+
+        // Welcome 握手帧必须始终保持 v2 文本行，确保与旧版客户端/宿主 100% 互通
+        let welcome_frame = read_wire_frame(&mut reader, MAX_LINE, false)
+            .unwrap()
+            .expect("welcome frame");
+        let WireFrame::Text(welcome_line) = welcome_frame else {
+            panic!("Welcome 必须走 v2 文本帧");
+        };
+        let welcome_plain = sess.open(&welcome_line).expect("open Welcome");
+        let welcome_msg: Msg = serde_json::from_str(&welcome_plain).expect("parse Welcome");
+        (w, reader, sess, welcome_msg)
+    }
+
+    fn read_decoded_frame(
+        reader: &mut BufReader<TcpStream>,
+        sess: &mut sheetcore::wire::Session,
+        allow_binary: bool,
+    ) -> (bool, usize, Msg) {
+        let frame = read_wire_frame(reader, MAX_LINE, allow_binary)
+            .unwrap()
+            .expect("expected frame");
+        match frame {
+            WireFrame::Text(line) => {
+                let wire_bytes = line.len() + 1; // 含 '\n'
+                let plain = sess.open(&line).expect("open v2 text frame");
+                let msg = serde_json::from_str::<Msg>(&plain).expect("parse v2 json");
+                (false, wire_bytes, msg)
+            }
+            WireFrame::Binary(body) => {
+                let wire_bytes = 5 + body.len(); // 含 [0x02][4B LE len]
+                let plain = sess.open_binary(&body).expect("open v3 binary frame");
+                let msg = serde_json::from_str::<Msg>(&plain).expect("parse v3 json");
+                (true, wire_bytes, msg)
+            }
+        }
+    }
+
+    #[test]
+    fn binary_v3_host_and_client_bidirectional_live_sync_and_wire_probe() {
+        let (host, port) = host_for_test(1, "宿主", "doc", "pw-v3-sync");
+        let addr = format!("127.0.0.1:{port}");
+
+        // 1. 真实 v3 客户端接入
+        let guest = join(2, "新客户端".into(), "doc".into(), &addr, "pw-v3-sync".into()).unwrap();
+        assert!(wait_event(&guest, 4000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+        assert!(wait_event(&host, 4000, |e| matches!(e, NetEvent::PeerJoined(2, _, _))).is_some());
+
+        // 2. 原始 v3 协议探针验证握手与切帧边界
+        let (mut probe_w, mut probe_r, mut probe_sess, welcome) =
+            raw_client_handshake(port, 3, "探针V3", "pw-v3-sync", "auth-probe-3", true);
+        assert!(
+            matches!(welcome, Msg::Welcome { binary_v3: true, .. }),
+            "双方支持时 Welcome 必须回传 binary_v3=true，实际：{welcome:?}"
+        );
+        // Welcome 之后的 Snapshot 帧必须自动切换为 v3 二进制帧（首字节 0x02）
+        let mut saw_snap = false;
+        for _ in 0..8 {
+            let (is_bin, _, msg) = read_decoded_frame(&mut probe_r, &mut probe_sess, true);
+            assert!(is_bin, "Welcome 后的后续帧应使用 v3 二进制帧，实际收到 v2：{msg:?}");
+            if matches!(msg, Msg::Snapshot { .. } | Msg::SnapshotChunk { last: true, .. }) {
+                saw_snap = true;
+                break;
+            }
+        }
+        assert!(saw_snap, "探针应通过 v3 二进制帧收到初始快照");
+        assert!(wait_event(&host, 4000, |e| matches!(e, NetEvent::PeerJoined(3, _, _))).is_some());
+
+        // 3. 探针发 v3 二进制 Op → 宿主与真实 v3 客户端均收到
+        let op_from_probe = Op {
+            sheet: 0,
+            row: 4,
+            col: 2,
+            value: ValueWire::Number(321.5),
+            formula: None,
+            ts: 10,
+            site: 3,
+        };
+        let bin_frame = probe_sess.seal_binary(&serde_json::to_string(&Msg::Op(op_from_probe)).unwrap());
+        assert_eq!(bin_frame[0], sheetcore::wire::BINARY_V3_MAGIC);
+        write_binary_frame(&mut probe_w, &bin_frame).unwrap();
+
+        assert!(
+            wait_event(&host, 4000, |e| matches!(e, NetEvent::Ops(ops) if ops.iter().any(|o| o.row == 4 && o.col == 2 && o.value == ValueWire::Number(321.5)))).is_some(),
+            "宿主应正确解开 v3 二进制 Op"
+        );
+        assert!(
+            wait_event(&guest, 4000, |e| matches!(e, NetEvent::Ops(ops) if ops.iter().any(|o| o.row == 4 && o.col == 2 && o.value == ValueWire::Number(321.5)))).is_some(),
+            "真实 v3 客户端应收到转发的 Op"
+        );
+
+        // 4. 真实 v3 客户端发 Op → 宿主与探针均收到（探针收到的是 v3 二进制帧）
+        let op_from_guest = Op {
+            sheet: 0,
+            row: 7,
+            col: 1,
+            value: ValueWire::Text("双向V3同步".into()),
+            formula: None,
+            ts: 11,
+            site: 2,
+        };
+        guest.broadcast_ops(vec![op_from_guest]);
+        assert!(
+            wait_event(&host, 4000, |e| matches!(e, NetEvent::Ops(ops) if ops.iter().any(|o| o.row == 7 && o.col == 1))).is_some(),
+            "宿主应收到真实 v3 客户端发出的 Op"
+        );
+        let mut probe_got_guest_op = false;
+        for _ in 0..8 {
+            let (is_bin, _, msg) = read_decoded_frame(&mut probe_r, &mut probe_sess, true);
+            assert!(is_bin, "v3 广播帧应为二进制格式");
+            match msg {
+                Msg::Op(o) if o.row == 7 && o.col == 1 => {
+                    assert_eq!(o.value, ValueWire::Text("双向V3同步".into()));
+                    probe_got_guest_op = true;
+                    break;
+                }
+                Msg::SnapshotChunk { ops, .. } | Msg::Ops { ops }
+                    if ops.iter().any(|o| o.row == 7 && o.col == 1) =>
+                {
+                    probe_got_guest_op = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(probe_got_guest_op, "v3 探针应通过二进制帧收到 guest 的编辑");
+    }
+
+    #[test]
+    fn mixed_room_v2_legacy_and_v3_clients_interop_with_wire_reduction() {
+        let (host, port) = host_for_test(1, "宿主", "doc", "pw-mix");
+        let addr = format!("127.0.0.1:{port}");
+
+        // 1. 模拟 1.74/1.75 旧版 v2 客户端（binary_v3 = false）
+        let (mut v2_w, mut v2_r, mut v2_sess, v2_welcome) =
+            raw_client_handshake(port, 10, "旧客户端V2", "pw-mix", "auth-v2-10", false);
+        assert!(
+            matches!(v2_welcome, Msg::Welcome { binary_v3: false, .. }),
+            "旧客户端握手后 Welcome 必须回传 binary_v3=false，实际：{v2_welcome:?}"
+        );
+        // 旧客户端后续快照帧必须全部是 v2 文本行（allow_binary=false 严格校验不出现 0x02）
+        loop {
+            let (is_bin, _, msg) = read_decoded_frame(&mut v2_r, &mut v2_sess, false);
+            assert!(!is_bin);
+            if matches!(msg, Msg::Snapshot { .. }) {
+                break;
+            }
+        }
+        assert!(wait_event(&host, 4000, |e| matches!(e, NetEvent::PeerJoined(10, _, _))).is_some());
+
+        // 2. 新版 v3 观测客户端（binary_v3 = true）+ 真实 join() v3 客户端
+        let (mut v3_w, mut v3_r, mut v3_sess, v3_welcome) =
+            raw_client_handshake(port, 11, "新观测V3", "pw-mix", "auth-v3-11", true);
+        assert!(matches!(v3_welcome, Msg::Welcome { binary_v3: true, .. }));
+        loop {
+            let (is_bin, _, msg) = read_decoded_frame(&mut v3_r, &mut v3_sess, true);
+            assert!(is_bin, "v3 观测端在 Welcome 后应只收二进制帧");
+            if matches!(msg, Msg::Snapshot { .. }) {
+                break;
+            }
+        }
+        assert!(wait_event(&host, 4000, |e| matches!(e, NetEvent::PeerJoined(11, _, _))).is_some());
+
+        let v3_real = join(12, "真实V3".into(), "doc".into(), &addr, "pw-mix".into()).unwrap();
+        assert!(wait_event(&v3_real, 4000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+        assert!(wait_event(&host, 4000, |e| matches!(e, NetEvent::PeerJoined(12, _, _))).is_some());
+
+        // 3. 旧 v2 客户端发编辑 → 宿主、真实 v3 客户端、v3 观测端均能收到
+        let op_from_v2 = Op {
+            sheet: 0,
+            row: 2,
+            col: 3,
+            value: ValueWire::Text("来自V2旧客户端".into()),
+            formula: None,
+            ts: 20,
+            site: 10,
+        };
+        write_line(&mut v2_w, &v2_sess.seal(&serde_json::to_string(&Msg::Op(op_from_v2)).unwrap()))
+            .unwrap();
+        assert!(
+            wait_event(&v3_real, 4000, |e| matches!(e, NetEvent::Ops(ops) if ops.iter().any(|o| o.row == 2 && o.col == 3))).is_some(),
+            "真实 v3 客户端必须收到旧 v2 客户端的编辑"
+        );
+
+        // 4. 新 v3 客户端发编辑 → 宿主与旧 v2 客户端（严格 v2 文本帧）均能收到
+        let op_from_v3 = Op {
+            sheet: 0,
+            row: 3,
+            col: 4,
+            value: ValueWire::Number(888.0),
+            formula: None,
+            ts: 21,
+            site: 11,
+        };
+        write_binary_frame(
+            &mut v3_w,
+            &v3_sess.seal_binary(&serde_json::to_string(&Msg::Op(op_from_v3)).unwrap()),
+        )
+        .unwrap();
+        let mut v2_got_v3_op = false;
+        for _ in 0..12 {
+            let (is_bin, _, msg) = read_decoded_frame(&mut v2_r, &mut v2_sess, false);
+            assert!(!is_bin, "旧 v2 客户端只能收到 v2 文本行");
+            if matches!(msg, Msg::Op(ref o) if o.row == 3 && o.col == 4 && o.value == ValueWire::Number(888.0))
+            {
+                v2_got_v3_op = true;
+                break;
+            }
+        }
+        assert!(v2_got_v3_op, "旧 v2 客户端必须收到来自 v3 客户端的编辑");
+
+        // 5. 宿主广播大批量操作（同一份 Arc<PreparedPayload> 同时发给 v2 和 v3 混合房间），比对真实线缆字节缩减
+        let batch: Vec<Op> = (0..200u32)
+            .map(|r| Op {
+                sheet: 0,
+                row: 100 + r,
+                col: 1,
+                value: ValueWire::Number(1000.0 + r as f64 * 0.5),
+                formula: None,
+                ts: 100 + u64::from(r),
+                site: 1,
+            })
+            .collect();
+        host.broadcast_ops(batch);
+
+        let mut v2_batch_bytes = 0usize;
+        for _ in 0..16 {
+            let (is_bin, bytes, msg) = read_decoded_frame(&mut v2_r, &mut v2_sess, false);
+            assert!(!is_bin);
+            if let Msg::SnapshotChunk { ops, .. } | Msg::Ops { ops } = msg {
+                if ops.len() == 200 && ops[0].row == 100 {
+                    v2_batch_bytes = bytes;
+                    break;
+                }
+            }
+        }
+        let mut v3_batch_bytes = 0usize;
+        for _ in 0..16 {
+            let (is_bin, bytes, msg) = read_decoded_frame(&mut v3_r, &mut v3_sess, true);
+            assert!(is_bin);
+            if let Msg::SnapshotChunk { ops, .. } | Msg::Ops { ops } = msg {
+                if ops.len() == 200 && ops[0].row == 100 {
+                    v3_batch_bytes = bytes;
+                    break;
+                }
+            }
+        }
+        assert!(v2_batch_bytes > 0 && v3_batch_bytes > 0, "v2/v3 双方均应收到完整 200 格广播批次");
+        assert!(
+            v3_batch_bytes * 100 <= v2_batch_bytes * 78,
+            "混合房间同一 PreparedPayload 广播时 v3 线缆字节应比 v2 减少 ≥22%：v3={v3_batch_bytes}B vs v2={v2_batch_bytes}B"
+        );
+    }
+
+    #[test]
+    fn v3_client_falls_back_to_v2_against_legacy_v2_only_host() {
+        // 模拟仅支持 v2 文本行的 1.74/1.75 旧版宿主（不识别 binary_v3，Welcome 中不含 binary_v3）
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock legacy host");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client");
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut w = BufWriter::new(stream.try_clone().unwrap());
+            let mut r = BufReader::new(stream);
+
+            let salt = [7u8; 16];
+            let room_salt = [9u8; 16];
+            let nonce = 424242u64;
+            let room_key = sheetcore::wire::RoomKey::derive("legacy-pw", &room_salt);
+            let challenge = Msg::ChallengeSalt {
+                nonce,
+                salt: sheetcore::wire::b64_encode(&salt),
+                room_salt: sheetcore::wire::b64_encode(&room_salt),
+            };
+            write_line(&mut w, &serde_json::to_string(&challenge).unwrap()).unwrap();
+
+            let mut host_sess = sheetcore::wire::Session::host_side(&room_key, &salt);
+            // 旧宿主仅支持 read_line_bounded（v2 文本行）
+            let hello_line = read_line_bounded(&mut r, MAX_PREAUTH_LINE)
+                .unwrap()
+                .expect("hello line");
+            let hello_plain = host_sess.open(&hello_line).expect("open v2 Hello");
+            let hello: Msg = serde_json::from_str(&hello_plain).expect("parse Hello");
+            assert!(
+                matches!(hello, Msg::Hello { site: 5, binary_v3: true, .. }),
+                "新客户端应在 Hello 中宣告 binary_v3=true"
+            );
+
+            // 旧宿主回传不含 binary_v3 字段的传统 Welcome + 空 Snapshot（v2 文本行）
+            let legacy_welcome = r#"{"t":"Welcome","site":5,"doc":"doc","peers":[[1,"旧宿主",1]],"delta_sync":false,"batch_ops":true,"clock":1}"#;
+            write_line(&mut w, &host_sess.seal(legacy_welcome)).unwrap();
+            let snap = serde_json::to_string(&Msg::Snapshot { ops: Vec::new() }).unwrap();
+            write_line(&mut w, &host_sess.seal(&snap)).unwrap();
+
+            // 客户端收到旧 Welcome 后必须回退为 v2 文本行发送编辑，旧宿主用 read_line_bounded 应能无误解开
+            let op_line = read_line_bounded(&mut r, MAX_LINE)
+                .unwrap()
+                .expect("client v2 op line");
+            assert_ne!(
+                op_line.as_bytes().first().copied(),
+                Some(sheetcore::wire::BINARY_V3_MAGIC),
+                "对旧宿主不得发送 v3 二进制帧"
+            );
+            let op_plain = host_sess.open(&op_line).expect("open client v2 op");
+            let msg: Msg = serde_json::from_str(&op_plain).expect("parse client op");
+            assert!(matches!(msg, Msg::Op(ref o) if o.row == 5 && o.col == 6));
+
+            // 旧宿主发回一条 v2 Op，新客户端应能正常接收
+            let reply_op = Msg::Op(Op {
+                sheet: 0,
+                row: 9,
+                col: 1,
+                value: ValueWire::Number(77.0),
+                formula: None,
+                ts: 30,
+                site: 1,
+            });
+            write_line(&mut w, &host_sess.seal(&serde_json::to_string(&reply_op).unwrap())).unwrap();
+            // 稍等确保客户端读完再结束连接
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let addr = format!("127.0.0.1:{port}");
+        let client = join(5, "新客户端".into(), "doc".into(), &addr, "legacy-pw".into()).unwrap();
+        assert!(wait_event(&client, 5000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+        client.broadcast_ops(vec![Op {
+            sheet: 0,
+            row: 5,
+            col: 6,
+            value: ValueWire::Number(12.5),
+            formula: None,
+            ts: 2,
+            site: 5,
+        }]);
+        assert!(
+            wait_event(&client, 5000, |e| matches!(e, NetEvent::Ops(ops) if ops.iter().any(|o| o.row == 9 && o.col == 1 && o.value == ValueWire::Number(77.0)))).is_some(),
+            "新客户端对旧宿主应能正常收发 v2 文本帧"
+        );
+        drop(client);
+        server.join().expect("mock legacy host thread should succeed");
+    }
 }
 
 #[cfg(test)]
@@ -7243,9 +7813,11 @@ pub(crate) fn bench_collab_hotpaths(wm_entries: u32, peers: usize) -> (f64, f64,
     let t_seal = std::time::Instant::now();
     let mut total_bytes = 0usize;
     let prepared = sheetcore::wire::prepare_payload(&payload, true);
+    let mut scratch = Vec::with_capacity(prepared.payload_len() + 64);
     for s in &mut sessions {
-        let frame = s.seal_prepared(&prepared);
-        total_bytes += frame.len();
+        s.seal_prepared_binary_into(&prepared, &mut scratch);
+        std::hint::black_box(scratch.as_slice());
+        total_bytes += scratch.len();
     }
     let seal_ms = t_seal.elapsed().as_secs_f64() * 1000.0;
     (wm_clone_ms, seal_ms, total_bytes)

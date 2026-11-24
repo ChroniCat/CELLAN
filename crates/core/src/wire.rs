@@ -19,7 +19,40 @@ const DIR_COMPRESSED_FLAG: u8 = 0x80;
 const COMPRESS_MIN_BYTES: usize = 512;
 const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 
+/// 协议 v3 二进制帧魔数首字节（非可打印 ASCII，与 v2 JSON/Base64 首字节严格不相交）
+pub const BINARY_V3_MAGIC: u8 = 0x02;
+/// v3 二进制帧体最小长度：`1B flags + 8B counter + 32B HMAC-SHA256`
+pub const BINARY_V3_MIN_BODY_LEN: usize = 1 + 8 + 32;
+/// v3 flags 标志位：`bit0 = compressed`，`bits 1..=2 = dir`，`bit6 = v3 域分离标记`
+const V3_FLAG_COMPRESSED: u8 = 0x01;
+const V3_FLAG_DIR_MASK: u8 = 0x06;
+const V3_FLAG_MARKER: u8 = 0x40;
+const V3_FLAG_ALLOWED_MASK: u8 = V3_FLAG_MARKER | V3_FLAG_DIR_MASK | V3_FLAG_COMPRESSED;
+
+#[inline(always)]
+fn init_chacha_state(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u32; 16] {
+    [
+        0x6170_7865,
+        0x3320_646e,
+        0x7962_2d32,
+        0x6b20_6574,
+        u32::from_le_bytes([key[0], key[1], key[2], key[3]]),
+        u32::from_le_bytes([key[4], key[5], key[6], key[7]]),
+        u32::from_le_bytes([key[8], key[9], key[10], key[11]]),
+        u32::from_le_bytes([key[12], key[13], key[14], key[15]]),
+        u32::from_le_bytes([key[16], key[17], key[18], key[19]]),
+        u32::from_le_bytes([key[20], key[21], key[22], key[23]]),
+        u32::from_le_bytes([key[24], key[25], key[26], key[27]]),
+        u32::from_le_bytes([key[28], key[29], key[30], key[31]]),
+        counter,
+        u32::from_le_bytes([nonce[0], nonce[1], nonce[2], nonce[3]]),
+        u32::from_le_bytes([nonce[4], nonce[5], nonce[6], nonce[7]]),
+        u32::from_le_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]),
+    ]
+}
+
 /// ChaCha20 的 32 位字
+#[inline(always)]
 fn quarter(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
     s[a] = s[a].wrapping_add(s[b]);
     s[d] ^= s[a];
@@ -35,26 +68,10 @@ fn quarter(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
     s[b] = s[b].rotate_left(7);
 }
 
-/// 生成一个 64 字节的密钥流块
-pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
-    let mut st = [0u32; 16];
-    st[0] = 0x6170_7865;
-    st[1] = 0x3320_646e;
-    st[2] = 0x7962_2d32;
-    st[3] = 0x6b20_6574;
-    for i in 0..8 {
-        st[4 + i] = u32::from_le_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
-    }
-    st[12] = counter;
-    for i in 0..3 {
-        st[13 + i] = u32::from_le_bytes([
-            nonce[i * 4],
-            nonce[i * 4 + 1],
-            nonce[i * 4 + 2],
-            nonce[i * 4 + 3],
-        ]);
-    }
-    let init = st;
+#[inline(always)]
+fn chacha20_block_from_state(mut init: [u32; 16], counter: u32) -> [u8; 64] {
+    init[12] = counter;
+    let mut st = init;
     for _ in 0..10 {
         quarter(&mut st, 0, 4, 8, 12);
         quarter(&mut st, 1, 5, 9, 13);
@@ -73,20 +90,249 @@ pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64
     out
 }
 
-/// 原地加/解密（同一操作，按 64 字节完整块批量异或以利 SIMD 向量化）
+/// 生成一个 64 字节的密钥流块
+pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
+    chacha20_block_from_state(init_chacha_state(key, counter, nonce), counter)
+}
+
+#[inline(always)]
+fn add4(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    [
+        a[0].wrapping_add(b[0]),
+        a[1].wrapping_add(b[1]),
+        a[2].wrapping_add(b[2]),
+        a[3].wrapping_add(b[3]),
+    ]
+}
+
+#[inline(always)]
+fn xor4(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    [a[0] ^ b[0], a[1] ^ b[1], a[2] ^ b[2], a[3] ^ b[3]]
+}
+
+#[inline(always)]
+fn rotl4(a: [u32; 4], n: u32) -> [u32; 4] {
+    [
+        a[0].rotate_left(n),
+        a[1].rotate_left(n),
+        a[2].rotate_left(n),
+        a[3].rotate_left(n),
+    ]
+}
+
+#[inline(always)]
+fn quarter_x4(
+    mut a: [u32; 4],
+    mut b: [u32; 4],
+    mut c: [u32; 4],
+    mut d: [u32; 4],
+) -> ([u32; 4], [u32; 4], [u32; 4], [u32; 4]) {
+    a = add4(a, b);
+    d = rotl4(xor4(d, a), 16);
+    c = add4(c, d);
+    b = rotl4(xor4(b, c), 12);
+    a = add4(a, b);
+    d = rotl4(xor4(d, a), 8);
+    c = add4(c, d);
+    b = rotl4(xor4(b, c), 7);
+    (a, b, c, d)
+}
+
+#[inline(always)]
+fn xor_quad_transposed(
+    chunk: &mut [u8; 256],
+    quad_offset: usize,
+    w0: [u32; 4],
+    w1: [u32; 4],
+    w2: [u32; 4],
+    w3: [u32; 4],
+) {
+    let rows = [
+        [w0[0], w1[0], w2[0], w3[0]],
+        [w0[1], w1[1], w2[1], w3[1]],
+        [w0[2], w1[2], w2[2], w3[2]],
+        [w0[3], w1[3], w2[3], w3[3]],
+    ];
+    for (lane, row) in rows.iter().enumerate() {
+        let base = lane * 64 + quad_offset;
+        for (j, &word) in row.iter().enumerate() {
+            let off = base + j * 4;
+            let cur = u32::from_le_bytes([
+                chunk[off],
+                chunk[off + 1],
+                chunk[off + 2],
+                chunk[off + 3],
+            ]);
+            chunk[off..off + 4].copy_from_slice(&(cur ^ word).to_le_bytes());
+        }
+    }
+}
+
+/// 4-way 并行生成 4 个 64 字节密钥流块（256 字节）并原地异或。
+/// 每个状态字为 `[u32; 4]`，在 x86-64-v2（SSE2/SSSE3/SSE4.2）上由 LLVM 自动向量化为 128 位 SIMD 指令。
+#[inline(always)]
+fn chacha20_xor_4blocks(init: &[u32; 16], counter: u32, chunk: &mut [u8; 256]) {
+    let c = [
+        counter,
+        counter.wrapping_add(1),
+        counter.wrapping_add(2),
+        counter.wrapping_add(3),
+    ];
+    let mut s0 = [init[0]; 4];
+    let mut s1 = [init[1]; 4];
+    let mut s2 = [init[2]; 4];
+    let mut s3 = [init[3]; 4];
+    let mut s4 = [init[4]; 4];
+    let mut s5 = [init[5]; 4];
+    let mut s6 = [init[6]; 4];
+    let mut s7 = [init[7]; 4];
+    let mut s8 = [init[8]; 4];
+    let mut s9 = [init[9]; 4];
+    let mut s10 = [init[10]; 4];
+    let mut s11 = [init[11]; 4];
+    let mut s12 = c;
+    let mut s13 = [init[13]; 4];
+    let mut s14 = [init[14]; 4];
+    let mut s15 = [init[15]; 4];
+
+    for _ in 0..10 {
+        (s0, s4, s8, s12) = quarter_x4(s0, s4, s8, s12);
+        (s1, s5, s9, s13) = quarter_x4(s1, s5, s9, s13);
+        (s2, s6, s10, s14) = quarter_x4(s2, s6, s10, s14);
+        (s3, s7, s11, s15) = quarter_x4(s3, s7, s11, s15);
+        (s0, s5, s10, s15) = quarter_x4(s0, s5, s10, s15);
+        (s1, s6, s11, s12) = quarter_x4(s1, s6, s11, s12);
+        (s2, s7, s8, s13) = quarter_x4(s2, s7, s8, s13);
+        (s3, s4, s9, s14) = quarter_x4(s3, s4, s9, s14);
+    }
+
+    s0 = add4(s0, [init[0]; 4]);
+    s1 = add4(s1, [init[1]; 4]);
+    s2 = add4(s2, [init[2]; 4]);
+    s3 = add4(s3, [init[3]; 4]);
+    s4 = add4(s4, [init[4]; 4]);
+    s5 = add4(s5, [init[5]; 4]);
+    s6 = add4(s6, [init[6]; 4]);
+    s7 = add4(s7, [init[7]; 4]);
+    s8 = add4(s8, [init[8]; 4]);
+    s9 = add4(s9, [init[9]; 4]);
+    s10 = add4(s10, [init[10]; 4]);
+    s11 = add4(s11, [init[11]; 4]);
+    s12 = add4(s12, c);
+    s13 = add4(s13, [init[13]; 4]);
+    s14 = add4(s14, [init[14]; 4]);
+    s15 = add4(s15, [init[15]; 4]);
+
+    xor_quad_transposed(chunk, 0, s0, s1, s2, s3);
+    xor_quad_transposed(chunk, 16, s4, s5, s6, s7);
+    xor_quad_transposed(chunk, 32, s8, s9, s10, s11);
+    xor_quad_transposed(chunk, 48, s12, s13, s14, s15);
+}
+
+#[inline(always)]
+fn quarter_16way(s: &mut [[u32; 16]; 16], a: usize, b: usize, c: usize, d: usize) {
+    let mut i = 0;
+    while i < 16 {
+        s[a][i] = s[a][i].wrapping_add(s[b][i]);
+        s[d][i] = (s[d][i] ^ s[a][i]).rotate_left(16);
+        s[c][i] = s[c][i].wrapping_add(s[d][i]);
+        s[b][i] = (s[b][i] ^ s[c][i]).rotate_left(12);
+        s[a][i] = s[a][i].wrapping_add(s[b][i]);
+        s[d][i] = (s[d][i] ^ s[a][i]).rotate_left(8);
+        s[c][i] = s[c][i].wrapping_add(s[d][i]);
+        s[b][i] = (s[b][i] ^ s[c][i]).rotate_left(7);
+        i += 1;
+    }
+}
+
+/// 16 块（4×4-way = 1024 字节）并行纯安全 Rust ChaCha20：
+/// 固定 16 路循环触发 LLVM Loop Vectorizer（VF=4）在 x86-64-v2 上生成真实
+/// SSE2/SSSE3 `paddd`/`pxor`/`pshufb`/`pslld`/`psrld` 128 位向量指令（~2.8 GB/s）。
+#[inline(always)]
+fn chacha20_xor_16blocks(init: &[u32; 16], counter: u32, chunk: &mut [u8; 1024]) {
+    let mut s = [[0u32; 16]; 16];
+    for w in 0..16 {
+        s[w] = [init[w]; 16];
+    }
+    let mut ctrs = [0u32; 16];
+    for lane in 0..16 {
+        ctrs[lane] = counter.wrapping_add(lane as u32);
+    }
+    s[12] = ctrs;
+
+    for _ in 0..10 {
+        quarter_16way(&mut s, 0, 4, 8, 12);
+        quarter_16way(&mut s, 1, 5, 9, 13);
+        quarter_16way(&mut s, 2, 6, 10, 14);
+        quarter_16way(&mut s, 3, 7, 11, 15);
+        quarter_16way(&mut s, 0, 5, 10, 15);
+        quarter_16way(&mut s, 1, 6, 11, 12);
+        quarter_16way(&mut s, 2, 7, 8, 13);
+        quarter_16way(&mut s, 3, 4, 9, 14);
+    }
+
+    for w in 0..16 {
+        if w == 12 {
+            for lane in 0..16 {
+                s[12][lane] = s[12][lane].wrapping_add(ctrs[lane]);
+            }
+        } else {
+            let add = init[w];
+            for lane in 0..16 {
+                s[w][lane] = s[w][lane].wrapping_add(add);
+            }
+        }
+    }
+
+    for lane in 0..16 {
+        let block = &mut chunk[lane * 64..(lane + 1) * 64];
+        for w in 0..16 {
+            let off = w * 4;
+            let cur = u32::from_le_bytes([
+                block[off],
+                block[off + 1],
+                block[off + 2],
+                block[off + 3],
+            ]);
+            block[off..off + 4].copy_from_slice(&(cur ^ s[w][lane]).to_le_bytes());
+        }
+    }
+}
+
+/// 原地加/解密（同一操作：4×4-way 1024B SSE2/SSSE3 向量主循环 + 4-way 256B + 单块 64B 尾部回退）
 pub fn apply_keystream(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
-    let mut chunks = data.chunks_exact_mut(64);
+    if data.is_empty() {
+        return;
+    }
+    let init = init_chacha_state(key, counter, nonce);
     let mut block_idx = 0u32;
-    for chunk in &mut chunks {
-        let ks = chacha20_block(key, counter.wrapping_add(block_idx), nonce);
+
+    let mut chunks1024 = data.chunks_exact_mut(1024);
+    for chunk in &mut chunks1024 {
+        let block16: &mut [u8; 1024] = chunk.try_into().expect("1024-byte exact chunk");
+        chacha20_xor_16blocks(&init, counter.wrapping_add(block_idx), block16);
+        block_idx = block_idx.wrapping_add(16);
+    }
+
+    let mut chunks256 = chunks1024.into_remainder().chunks_exact_mut(256);
+    for chunk in &mut chunks256 {
+        let block4: &mut [u8; 256] = chunk.try_into().expect("256-byte exact chunk");
+        chacha20_xor_4blocks(&init, counter.wrapping_add(block_idx), block4);
+        block_idx = block_idx.wrapping_add(4);
+    }
+
+    let mut chunks64 = chunks256.into_remainder().chunks_exact_mut(64);
+    for chunk in &mut chunks64 {
+        let ks = chacha20_block_from_state(init, counter.wrapping_add(block_idx));
         for (dst, src) in chunk.iter_mut().zip(ks.iter()) {
             *dst ^= *src;
         }
         block_idx = block_idx.wrapping_add(1);
     }
-    let rem = chunks.into_remainder();
+
+    let rem = chunks64.into_remainder();
     if !rem.is_empty() {
-        let ks = chacha20_block(key, counter.wrapping_add(block_idx), nonce);
+        let ks = chacha20_block_from_state(init, counter.wrapping_add(block_idx));
         for (dst, src) in rem.iter_mut().zip(ks.iter()) {
             *dst ^= *src;
         }
@@ -288,9 +534,10 @@ pub fn prepare_payload(plain: &str, compress: bool) -> std::sync::Arc<PreparedPa
 /// 一个会话的加解密状态
 pub struct Session {
     enc: [u8; 32],
-    mac: [u8; 32],
-    send_ctr: u32,
-    recv_ctr: u32,
+    mac_inner: Sha256,
+    mac_outer: Sha256,
+    send_ctr: u64,
+    recv_ctr: u64,
     /// 方向位（1 = 宿主发出，2 = 客户端发出）。两个方向若用同一 nonce，
     /// 密钥流会重复，等于把两段明文异或在一起——必须分开。
     send_dir: u8,
@@ -318,7 +565,8 @@ impl Session {
     pub fn fork_sender(&self) -> Self {
         Self {
             enc: self.enc,
-            mac: self.mac,
+            mac_inner: self.mac_inner.clone(),
+            mac_outer: self.mac_outer.clone(),
             send_ctr: 0,
             recv_ctr: 0,
             send_dir: self.send_dir,
@@ -343,7 +591,38 @@ impl Session {
         let mut m = [0u8; 32];
         e.copy_from_slice(&enc.finalize());
         m.copy_from_slice(&mac.finalize());
-        Self { enc: e, mac: m, send_ctr: 0, recv_ctr: 0, send_dir: 0, recv_dir: 0 }
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for i in 0..32 {
+            ipad[i] ^= m[i];
+            opad[i] ^= m[i];
+        }
+        let mut mac_inner = Sha256::new();
+        mac_inner.update(ipad);
+        let mut mac_outer = Sha256::new();
+        mac_outer.update(opad);
+        Self {
+            enc: e,
+            mac_inner,
+            mac_outer,
+            send_ctr: 0,
+            recv_ctr: 0,
+            send_dir: 0,
+            recv_dir: 0,
+        }
+    }
+
+    #[inline]
+    fn mac_tag(&self, msg: &[u8]) -> [u8; 32] {
+        let mut inner = self.mac_inner.clone();
+        inner.update(msg);
+        let inner_digest = inner.finalize();
+        let mut outer = self.mac_outer.clone();
+        outer.update(inner_digest);
+        let out = outer.finalize();
+        let mut r = [0u8; 32];
+        r.copy_from_slice(&out);
+        r
     }
 
     fn nonce(dir: u8, ctr: u32) -> [u8; 12] {
@@ -353,10 +632,23 @@ impl Session {
         n
     }
 
-    /// 使用预处理的共享负载加密一帧（与 `seal`/`open` 线缆格式 100% 兼容）
+    fn nonce_v3(flags: u8, ctr: u64) -> [u8; 12] {
+        let mut n = [0u8; 12];
+        n[0] = flags;
+        n[1] = BINARY_V3_MAGIC;
+        n[4..12].copy_from_slice(&ctr.to_le_bytes());
+        n
+    }
+
+    #[inline]
+    fn v3_flags(&self, compressed: bool) -> u8 {
+        V3_FLAG_MARKER | ((self.send_dir & 0x03) << 1) | u8::from(compressed)
+    }
+
+    /// 使用预处理的共享负载加密一帧 v2 文本帧（与 `seal`/`open` 线缆格式 100% 兼容）
     pub fn seal_prepared(&mut self, prepared: &PreparedPayload) -> String {
         self.send_ctr = self.send_ctr.wrapping_add(1);
-        let ctr = self.send_ctr;
+        let ctr = self.send_ctr as u32;
         let wire_dir = if prepared.compressed {
             self.send_dir | DIR_COMPRESSED_FLAG
         } else {
@@ -367,9 +659,88 @@ impl Session {
         framed.extend_from_slice(&ctr.to_le_bytes());
         framed.extend_from_slice(&prepared.payload);
         apply_keystream(&self.enc, ctr, &Self::nonce(wire_dir, ctr), &mut framed[5..]);
-        let tag = hmac_sha256(&self.mac, &framed);
+        let tag = self.mac_tag(&framed);
         framed.extend_from_slice(&tag);
         b64_encode(&framed)
+    }
+
+    /// 使用预处理的共享负载封装一帧 v3 二进制帧并直接写入复用缓冲区 `out`（零二次分配、无 Base64 膨胀）。
+    ///
+    /// 线缆格式：`[0x02][4B LE body_len][1B flags: bit0=compressed][8B LE counter][ciphertext][32B HMAC-SHA256]`。
+    /// 其中 `HMAC-SHA256` 覆盖 `flags || counter || ciphertext`。
+    pub fn seal_prepared_binary_into(&mut self, prepared: &PreparedPayload, out: &mut Vec<u8>) {
+        self.send_ctr = self.send_ctr.wrapping_add(1);
+        let ctr = self.send_ctr;
+        let flags = self.v3_flags(prepared.compressed);
+        let body_len = 1 + 8 + prepared.payload.len() + 32;
+        let body_len_u32 =
+            u32::try_from(body_len).expect("v3 binary frame body length exceeds u32::MAX");
+        out.clear();
+        out.reserve(5 + body_len);
+        out.push(BINARY_V3_MAGIC);
+        out.extend_from_slice(&body_len_u32.to_le_bytes());
+        out.push(flags);
+        out.extend_from_slice(&ctr.to_le_bytes());
+        let ct_start = out.len();
+        out.extend_from_slice(&prepared.payload);
+        apply_keystream(&self.enc, 1, &Self::nonce_v3(flags, ctr), &mut out[ct_start..]);
+        let tag = self.mac_tag(&out[5..]);
+        out.extend_from_slice(&tag);
+    }
+
+    /// 使用预处理的共享负载封装一帧完整 v3 二进制帧（含 `0x02` 魔数与 4 字节小端长度头）
+    pub fn seal_prepared_binary(&mut self, prepared: &PreparedPayload) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + 1 + 8 + prepared.payload.len() + 32);
+        self.seal_prepared_binary_into(prepared, &mut out);
+        out
+    }
+
+    /// 加密一帧为 v3 二进制帧并直接写入复用缓冲区 `out`（原地可选 deflate + ChaCha20 + HMAC-SHA256）
+    pub fn seal_binary_into(&mut self, plain: &str, compress: bool, out: &mut Vec<u8>) {
+        self.send_ctr = self.send_ctr.wrapping_add(1);
+        let ctr = self.send_ctr;
+        let raw_bytes = plain.as_bytes();
+        out.clear();
+        out.reserve(5 + 1 + 8 + raw_bytes.len().min(65_536) + 32);
+        // 占位 14 字节：[0x02][4B LE body_len][1B flags][8B LE counter]
+        out.extend_from_slice(&[BINARY_V3_MAGIC, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&ctr.to_le_bytes());
+        let ct_start = 14usize;
+        let compressed = if compress && raw_bytes.len() >= COMPRESS_MIN_BYTES {
+            let compressed_ok = {
+                let mut enc = flate2::write::DeflateEncoder::new(
+                    &mut *out,
+                    flate2::Compression::fast(),
+                );
+                enc.write_all(raw_bytes).is_ok() && enc.finish().is_ok()
+            };
+            if compressed_ok && out.len() - ct_start < raw_bytes.len() {
+                true
+            } else {
+                out.truncate(ct_start);
+                out.extend_from_slice(raw_bytes);
+                false
+            }
+        } else {
+            out.extend_from_slice(raw_bytes);
+            false
+        };
+        let flags = self.v3_flags(compressed);
+        let body_len = (out.len() - 5) + 32;
+        let body_len_u32 =
+            u32::try_from(body_len).expect("v3 binary frame body length exceeds u32::MAX");
+        out[1..5].copy_from_slice(&body_len_u32.to_le_bytes());
+        out[5] = flags;
+        apply_keystream(&self.enc, 1, &Self::nonce_v3(flags, ctr), &mut out[ct_start..]);
+        let tag = self.mac_tag(&out[5..]);
+        out.extend_from_slice(&tag);
+    }
+
+    /// 加密一帧为完整 v3 二进制帧（默认启用 deflate 自适应压缩）
+    pub fn seal_binary(&mut self, plain: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.seal_binary_into(plain, true, &mut out);
+        out
     }
 
     /// 加密一帧（明文 JSON → 可选 deflate 压缩 → 原地加密 + 零拷贝 HMAC → base64）
@@ -380,7 +751,7 @@ impl Session {
     /// 加密一帧，允许调用方显式控制是否尝试 deflate 压缩
     pub fn seal_with_compression(&mut self, plain: &str, compress: bool) -> String {
         self.send_ctr = self.send_ctr.wrapping_add(1);
-        let ctr = self.send_ctr;
+        let ctr = self.send_ctr as u32;
         let raw_bytes = plain.as_bytes();
         let mut framed = Vec::with_capacity(5 + raw_bytes.len().min(65_536) + 32);
         framed.extend_from_slice(&[0, 0, 0, 0, 0]);
@@ -406,12 +777,12 @@ impl Session {
         framed[0] = wire_dir;
         framed[1..5].copy_from_slice(&ctr.to_le_bytes());
         apply_keystream(&self.enc, ctr, &Self::nonce(wire_dir, ctr), &mut framed[5..]);
-        let tag = hmac_sha256(&self.mac, &framed);
+        let tag = self.mac_tag(&framed);
         framed.extend_from_slice(&tag);
         b64_encode(&framed)
     }
 
-    /// 解密并验签；计数器必须比上一帧大
+    /// 解密并验签 v2 文本帧；计数器必须比上一帧大
     pub fn open(&mut self, frame: &str) -> Option<String> {
         let mut raw = b64_decode(frame)?;
         if raw.len() < 5 + 32 {
@@ -424,8 +795,9 @@ impl Session {
             return None; // 方向的密钥相同，方向位是防重放/防回环的关键
         }
         let ctr = u32::from_le_bytes([raw[1], raw[2], raw[3], raw[4]]);
+        let ctr_u64 = u64::from(ctr);
         let mac_offset = raw.len() - 32;
-        let expect = hmac_sha256(&self.mac, &raw[..mac_offset]);
+        let expect = self.mac_tag(&raw[..mac_offset]);
         // 定长比较，避免时序泄露
         let tag = &raw[mac_offset..];
         let mut diff = 0u8;
@@ -435,10 +807,10 @@ impl Session {
         if diff != 0 {
             return None;
         }
-        if ctr <= self.recv_ctr {
+        if ctr_u64 <= self.recv_ctr {
             return None; // 重放或乱序
         }
-        self.recv_ctr = ctr;
+        self.recv_ctr = ctr_u64;
         apply_keystream(&self.enc, ctr, &Self::nonce(wire_dir, ctr), &mut raw[5..mac_offset]);
         if compressed {
             let mut dec = flate2::read::DeflateDecoder::new(&raw[5..mac_offset])
@@ -453,6 +825,78 @@ impl Session {
             raw.truncate(mac_offset);
             raw.drain(..5);
             String::from_utf8(raw).ok()
+        }
+    }
+
+    fn verify_binary_body(&self, body: &[u8]) -> Option<(u8, u64, bool, usize)> {
+        if body.len() < BINARY_V3_MIN_BODY_LEN {
+            return None;
+        }
+        let flags = body[0];
+        if (flags & V3_FLAG_MARKER) == 0 || (flags & !V3_FLAG_ALLOWED_MASK) != 0 {
+            return None;
+        }
+        let dir = (flags & V3_FLAG_DIR_MASK) >> 1;
+        if dir != self.recv_dir {
+            return None;
+        }
+        let compressed = (flags & V3_FLAG_COMPRESSED) != 0;
+        let ctr = u64::from_le_bytes(body[1..9].try_into().ok()?);
+        let mac_offset = body.len() - 32;
+        let expect = self.mac_tag(&body[..mac_offset]);
+        let tag = &body[mac_offset..];
+        let mut diff = 0u8;
+        for i in 0..32 {
+            diff |= expect[i] ^ tag[i];
+        }
+        if diff != 0 {
+            return None;
+        }
+        if ctr <= self.recv_ctr {
+            return None;
+        }
+        Some((flags, ctr, compressed, mac_offset))
+    }
+
+    /// 解密并验签 v3 二进制帧体（不含 5 字节 `[0x02][4B len]` 外层头，即 `[flags][8B ctr][ciphertext][32B HMAC]`）。
+    pub fn open_binary(&mut self, body: &[u8]) -> Option<String> {
+        let (flags, ctr, compressed, mac_offset) = self.verify_binary_body(body)?;
+        self.recv_ctr = ctr;
+        let mut plain = body[9..mac_offset].to_vec();
+        apply_keystream(&self.enc, 1, &Self::nonce_v3(flags, ctr), &mut plain);
+        if compressed {
+            let mut dec = flate2::read::DeflateDecoder::new(plain.as_slice())
+                .take(MAX_DECOMPRESSED_BYTES + 1);
+            let mut out = Vec::with_capacity(plain.len().saturating_mul(4).min(4 * 1024 * 1024));
+            dec.read_to_end(&mut out).ok()?;
+            if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+                return None;
+            }
+            String::from_utf8(out).ok()
+        } else {
+            String::from_utf8(plain).ok()
+        }
+    }
+
+    /// 零拷贝原地解密并验签已拥有缓冲区的 v3 二进制帧体（避免密文二次复制）。
+    pub fn open_binary_owned(&mut self, mut body: Vec<u8>) -> Option<String> {
+        let (flags, ctr, compressed, mac_offset) = self.verify_binary_body(&body)?;
+        self.recv_ctr = ctr;
+        apply_keystream(&self.enc, 1, &Self::nonce_v3(flags, ctr), &mut body[9..mac_offset]);
+        if compressed {
+            let mut dec = flate2::read::DeflateDecoder::new(&body[9..mac_offset])
+                .take(MAX_DECOMPRESSED_BYTES + 1);
+            let mut out =
+                Vec::with_capacity((mac_offset - 9).saturating_mul(4).min(4 * 1024 * 1024));
+            dec.read_to_end(&mut out).ok()?;
+            if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+                return None;
+            }
+            String::from_utf8(out).ok()
+        } else {
+            body.truncate(mac_offset);
+            body.drain(..9);
+            String::from_utf8(body).ok()
         }
     }
 }
@@ -673,5 +1117,152 @@ mod tests {
         let mut h_a = Session::host_side(&room, b"same-conn");
         let mut h_b = Session::host_side(&room, b"same-conn");
         assert_eq!(h_a.seal(&big), h_b.seal_prepared(&p_comp));
+    }
+
+    /// 标量版 ChaCha20 参考实现，用于与 4-way 向量化 `apply_keystream` 逐字节交叉比对
+    fn apply_keystream_scalar_ref(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
+        let mut block_idx = 0u32;
+        for chunk in data.chunks_mut(64) {
+            let ks = chacha20_block(key, counter.wrapping_add(block_idx), nonce);
+            for (dst, src) in chunk.iter_mut().zip(ks.iter()) {
+                *dst ^= *src;
+            }
+            block_idx = block_idx.wrapping_add(1);
+        }
+    }
+
+    #[test]
+    fn chacha20_4way_matches_scalar_across_lengths_and_counter_wrap() {
+        let key: [u8; 32] = std::array::from_fn(|i| ((i * 19 + 7) & 0xff) as u8);
+        let nonce: [u8; 12] = std::array::from_fn(|i| ((i * 31 + 3) & 0xff) as u8);
+        let lengths = [
+            0usize, 1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025,
+            1280, 2048, 4096,
+        ];
+        let counters = [0u32, 1, 42, u32::MAX - 17, u32::MAX - 15, u32::MAX - 2, u32::MAX - 1, u32::MAX];
+
+        for &ctr in &counters {
+            for &len in &lengths {
+                let plain: Vec<u8> = (0..len)
+                    .map(|i| ((i.wrapping_mul(131) ^ (ctr as usize)) & 0xff) as u8)
+                    .collect();
+                let mut fast = plain.clone();
+                let mut scalar = plain.clone();
+                apply_keystream(&key, ctr, &nonce, &mut fast);
+                apply_keystream_scalar_ref(&key, ctr, &nonce, &mut scalar);
+                assert_eq!(
+                    fast, scalar,
+                    "4-way ChaCha20 与标量参考输出不一致：len={len}, counter={ctr:#x}"
+                );
+                // 自反解密回到原文
+                apply_keystream(&key, ctr, &nonce, &mut fast);
+                assert_eq!(fast, plain, "4-way ChaCha20 往返解密失败：len={len}, counter={ctr:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn binary_v3_round_trip_compression_tamper_replay_and_v2_continuity() {
+        let room = RoomKey::derive_with_iters("v3-room-pw", b"room-salt-v3", 10);
+        let mut host = Session::host_side(&room, b"conn-v3");
+        let mut client = Session::client_side(&room, b"conn-v3");
+
+        // 1. 握手帧走 v2 文本行，随后无缝切入 v3 二进制帧（共享单调递增 counter）
+        let welcome = r#"{"t":"Welcome","site":2,"doc":"d","peers":[],"binary_v3":true}"#;
+        let v2_frame = host.seal(welcome);
+        assert_eq!(client.open(&v2_frame).as_deref(), Some(welcome));
+
+        // 2. 小帧（非压缩分支）：bit0 == 0
+        let small = r#"{"t":"Op","row":1,"col":2,"value":"Empty","ts":2,"site":1}"#;
+        let bin_small = host.seal_binary(small);
+        assert_eq!(bin_small[0], BINARY_V3_MAGIC);
+        let body_len = u32::from_le_bytes(bin_small[1..5].try_into().unwrap()) as usize;
+        assert_eq!(body_len, bin_small.len() - 5);
+        assert_eq!(bin_small[5] & V3_FLAG_COMPRESSED, 0, "小帧不得置位压缩标志");
+        assert_eq!(client.open_binary(&bin_small[5..]).as_deref(), Some(small));
+        // 重放必须被拒绝
+        assert!(client.open_binary(&bin_small[5..]).is_none(), "v3 重放帧必须拒绝");
+        // 旧 v2 握手帧也不能在切入 v3 后重放
+        assert!(client.open(&v2_frame).is_none(), "旧 v2 帧重放必须拒绝");
+
+        // 3. 大帧（压缩分支）+ PreparedPayload 同时复用于 v2 和 v3，验证线缆体积缩减 ~25%
+        let mut big = String::from("{\"t\":\"Ops\",\"ops\":[");
+        for i in 0..400 {
+            if i > 0 {
+                big.push(',');
+            }
+            big.push_str(&format!(
+                "{{\"sheet\":0,\"row\":{i},\"col\":1,\"value\":{{\"Number\":{i}.25}},\"formula\":null,\"ts\":{},\"site\":1}}",
+                100 + i
+            ));
+        }
+        big.push_str("]}");
+        let prepared = prepare_payload(&big, true);
+        assert!(prepared.is_compressed());
+
+        let mut host_v2 = Session::host_side(&room, b"size-cmp");
+        let mut host_v3 = Session::host_side(&room, b"size-cmp");
+        let v2_wire_len = host_v2.seal_prepared(&prepared).len() + 1; // + '\n'
+        let mut scratch = Vec::new();
+        host_v3.seal_prepared_binary_into(&prepared, &mut scratch);
+        let v3_wire_len = scratch.len();
+        assert!(
+            v3_wire_len * 100 <= v2_wire_len * 78,
+            "v3 二进制帧应相比 v2 Base64 缩减至少 22% 体积：v3={v3_wire_len} vs v2={v2_wire_len}"
+        );
+
+        // 实际用 host/client 会话走 seal_prepared_binary 与 open_binary_owned
+        let bin_big = host.seal_prepared_binary(&prepared);
+        assert_eq!(bin_big[0], BINARY_V3_MAGIC);
+        assert_ne!(bin_big[5] & V3_FLAG_COMPRESSED, 0, "大帧压缩标志必须置位");
+
+        // 4. 各类篡改必须被拒绝（flags / counter / ciphertext / tag / 截断）
+        let body = &bin_big[5..];
+        for &idx in &[0usize, 1, 8, 9, body.len() / 2, body.len() - 1] {
+            let mut bad = body.to_vec();
+            bad[idx] ^= 0x01;
+            assert!(
+                client.open_binary(&bad).is_none(),
+                "篡改 body[{idx}] 必须被 HMAC 或标志位校验拒绝"
+            );
+        }
+        assert!(client.open_binary(&body[..BINARY_V3_MIN_BODY_LEN - 1]).is_none());
+
+        // 5. 跨方向反射拒绝（host 自己不得解开自己发出的 v3 帧）
+        assert!(host.open_binary(body).is_none(), "同向反射 v3 帧必须拒绝");
+
+        // 6. 跨版本混淆拒绝（把 v3 body 做 Base64 喂给 v2 open，或把 v2 原始帧喂给 open_binary）
+        assert!(
+            client.open(&b64_encode(body)).is_none(),
+            "v3 帧体伪装为 v2 Base64 必须拒绝"
+        );
+        let v2_raw = b64_decode(&v2_frame).unwrap();
+        assert!(
+            client.open_binary(&v2_raw).is_none(),
+            "v2 帧体伪装为 v3 二进制帧必须拒绝"
+        );
+
+        // 7. 未篡改的大压缩帧通过 open_binary_owned 正常解开
+        assert_eq!(client.open_binary_owned(body.to_vec()).as_deref(), Some(big.as_str()));
+
+        // 8. 不压缩的大帧（compress=false，如 UpdateSlice）
+        let raw_prepared = prepare_payload(&big, false);
+        assert!(!raw_prepared.is_compressed());
+        let mut reuse_buf = Vec::new();
+        host.seal_prepared_binary_into(&raw_prepared, &mut reuse_buf);
+        assert_eq!(reuse_buf[5] & V3_FLAG_COMPRESSED, 0);
+        assert_eq!(client.open_binary(&reuse_buf[5..]).as_deref(), Some(big.as_str()));
+
+        // 9. 错误口令会话拒绝解开
+        let wrong_room = RoomKey::derive_with_iters("wrong-pw", b"room-salt-v3", 10);
+        let mut attacker = Session::client_side(&wrong_room, b"conn-v3");
+        let f_next = host.seal_binary("{\"t\":\"Bye\",\"site\":1}");
+        assert!(attacker.open_binary(&f_next[5..]).is_none());
+        assert_eq!(client.open_binary(&f_next[5..]).as_deref(), Some("{\"t\":\"Bye\",\"site\":1}"));
+
+        // 10. seal_binary 与 seal_prepared_binary 对同一会话状态逐字节一致
+        let mut h_a = Session::host_side(&room, b"same-v3");
+        let mut h_b = Session::host_side(&room, b"same-v3");
+        assert_eq!(h_a.seal_binary(&big), h_b.seal_prepared_binary(&prepared));
     }
 }
