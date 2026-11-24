@@ -1089,13 +1089,19 @@ impl FilterColumn {
         let mut unique: FxHashSet<String> = FxHashSet::default();
         let mut seen_ptrs: FxHashSet<usize> = FxHashSet::default();
         let mut seen_num_bits: FxHashSet<u64> = FxHashSet::default();
+        let mut seen_empty = false;
         let mut seen_true = false;
         let mut seen_false = false;
         let mut populated = 0u32;
 
         let mut insert_val = |v: &Value| {
             match v {
-                Value::Empty => {}
+                Value::Empty => {
+                    if !seen_empty {
+                        seen_empty = true;
+                        unique.insert(String::new());
+                    }
+                }
                 Value::Number(n) => {
                     let nb = if *n == 0.0 { 0u64 } else { n.to_bits() };
                     if seen_num_bits.insert(nb) {
@@ -1467,5 +1473,22 @@ mod tests {
         let (num_choices, num_numeric) = FilterColumn::new(&s, (0, 0, 600, 1), 1).choices();
         assert!(num_numeric);
         assert_eq!(num_choices, vec!["0".to_string(), "12.5".to_string()]);
+
+        // Column 2: 100% populated by unevaluated formulas (`formula: Some`, cached `Value::Empty`)
+        // must still include `""` in `choices()`.
+        s.set(0, 2, crate::model::Cell { value: Value::Text("待算".into()), formula: None });
+        for r in 1..=600u32 {
+            s.set(
+                r,
+                2,
+                crate::model::Cell {
+                    value: Value::Empty,
+                    formula: Some("=B2".into()),
+                },
+            );
+        }
+        let (empty_f_choices, empty_f_numeric) = FilterColumn::new(&s, (0, 0, 600, 2), 2).choices();
+        assert!(!empty_f_numeric);
+        assert_eq!(empty_f_choices, vec![String::new()]);
     }
 }

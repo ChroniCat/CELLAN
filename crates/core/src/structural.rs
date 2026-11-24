@@ -993,28 +993,16 @@ impl Sheet {
             }
             if sp.source_sheet.is_none() {
                 let (r1, c1, r2, c2) = sp.rect;
-                let (a, b) = if rows {
-                    let a = shift.map(r1);
-                    let b = shift.map(r2);
-                    (a, b)
+                if rows {
+                    let Some((nr1, nr2)) = shift.map_range(r1, r2) else {
+                        continue;
+                    };
+                    sp.rect = (nr1, c1, nr2, c2);
                 } else {
-                    let a = shift.map(c1);
-                    let b = shift.map(c2);
-                    (a, b)
-                };
-                match (rows, a, b) {
-                    // 整段都被删掉：这条迷你图没有数据了
-                    (true, None, None) | (false, None, None) => continue,
-                    (true, a, b) => {
-                        let nr1 = a.unwrap_or(shift.at);
-                        let nr2 = b.unwrap_or(nr1);
-                        sp.rect = (nr1, c1, nr2.max(nr1), c2);
-                    }
-                    (false, a, b) => {
-                        let nc1 = a.unwrap_or(shift.at);
-                        let nc2 = b.unwrap_or(nc1);
-                        sp.rect = (r1, nc1, r2, nc2.max(nc1));
-                    }
+                    let Some((nc1, nc2)) = shift.map_range(c1, c2) else {
+                        continue;
+                    };
+                    sp.rect = (r1, nc1, r2, nc2);
                 }
             }
             out.push(sp);
@@ -1044,11 +1032,11 @@ fn shift_rule_ranges(ranges: &mut Vec<(u32, u32, u32, u32)>, shift: &MappedShift
         };
         // A rule covering entire columns/rows continues to cover the entire axis.
         if *first == 0 && *last == limit { return true; }
-        match (shift.map(*first), shift.map(*last)) {
-            (Some(a), Some(b)) => { *first = a; *last = b.max(a); }
-            (Some(pos), None) | (None, Some(pos)) => { *first = pos; *last = pos; }
-            (None, None) => return false,
-        }
+        let Some((a, b)) = shift.map_range(*first, *last) else {
+            return false;
+        };
+        *first = a;
+        *last = b;
         true
     });
 }
@@ -1176,17 +1164,11 @@ fn update_workbook_references(
             }
             let (r1, c1, r2, c2) = sp.rect;
             if axis == crate::refs::Axis::Row {
-                let a = shift.map(r1);
-                let b = shift.map(r2);
-                let nr1 = a.unwrap_or(at);
-                let nr2 = b.unwrap_or(nr1);
-                sp.rect = (nr1, c1, nr2.max(nr1), c2);
+                let (nr1, nr2) = shift.map_range(r1, r2).unwrap_or((at, at));
+                sp.rect = (nr1, c1, nr2, c2);
             } else {
-                let a = shift.map(c1);
-                let b = shift.map(c2);
-                let nc1 = a.unwrap_or(at);
-                let nc2 = b.unwrap_or(nc1);
-                sp.rect = (r1, nc1, r2, nc2.max(nc1));
+                let (nc1, nc2) = shift.map_range(c1, c2).unwrap_or((at, at));
+                sp.rect = (r1, nc1, r2, nc2);
             }
             sheet.sparklines_dirty = true;
         }
@@ -1576,19 +1558,12 @@ impl Sheet {
                     if *r1 == 0 && *r2 == 1_048_575 {
                         return true;
                     }
-                    match (del_map.map(*r1), del_map.map(*r2)) {
-                        (Some(a), Some(b)) => {
-                            *r1 = a;
-                            *r2 = b.max(a);
-                            true
-                        }
-                        (Some(pos), None) | (None, Some(pos)) => {
-                            *r1 = pos;
-                            *r2 = pos;
-                            true
-                        }
-                        (None, None) => false,
-                    }
+                    let Some((a, b)) = del_map.map_range(*r1, *r2) else {
+                        return false;
+                    };
+                    *r1 = a;
+                    *r2 = b;
+                    true
                 });
             }
             self.cf.blocks.retain(|b| !b.ranges.is_empty());
@@ -1601,19 +1576,12 @@ impl Sheet {
                     if *r1 == 0 && *r2 == 1_048_575 {
                         return true;
                     }
-                    match (del_map.map(*r1), del_map.map(*r2)) {
-                        (Some(a), Some(b)) => {
-                            *r1 = a;
-                            *r2 = b.max(a);
-                            true
-                        }
-                        (Some(pos), None) | (None, Some(pos)) => {
-                            *r1 = pos;
-                            *r2 = pos;
-                            true
-                        }
-                        (None, None) => false,
-                    }
+                    let Some((a, b)) = del_map.map_range(*r1, *r2) else {
+                        return false;
+                    };
+                    *r1 = a;
+                    *r2 = b;
+                    true
                 });
             }
             self.dv.retain(|r| !r.ranges.is_empty());
@@ -1629,11 +1597,10 @@ impl Sheet {
                 sp.r = na;
                 if sp.source_sheet.is_none() {
                     let (r1, c1, r2, c2) = sp.rect;
-                    match (del_map.map(r1), del_map.map(r2)) {
-                        (None, None) => continue,
-                        (Some(a), Some(b)) => sp.rect = (a, c1, b.max(a), c2),
-                        (Some(pos), None) | (None, Some(pos)) => sp.rect = (pos, c1, pos, c2),
-                    }
+                    let Some((a, b)) = del_map.map_range(r1, r2) else {
+                        continue;
+                    };
+                    sp.rect = (a, c1, b, c2);
                 }
                 out.push(sp);
             }
@@ -1769,13 +1736,11 @@ pub fn delete_row_intervals_wb(
                 continue;
             }
             let (r1, c1, r2, c2) = sp.rect;
-            match (del_map.map(r1), del_map.map(r2)) {
-                (Some(a), Some(b)) => sp.rect = (a, c1, b.max(a), c2),
-                (Some(pos), None) | (None, Some(pos)) => sp.rect = (pos, c1, pos, c2),
-                (None, None) => {
-                    let fallback = del_map.map_freeze_or_clamp(r1);
-                    sp.rect = (fallback, c1, fallback, c2);
-                }
+            if let Some((a, b)) = del_map.map_range(r1, r2) {
+                sp.rect = (a, c1, b, c2);
+            } else {
+                let fallback = del_map.map_freeze_or_clamp(r1);
+                sp.rect = (fallback, c1, fallback, c2);
             }
             sheet.sparklines_dirty = true;
         }
@@ -1879,7 +1844,9 @@ mod wave5_structural_tests {
             }
             s.merge_range(7, 0, 10, 0);
             s.cf.blocks.push(CfBlock {
-                ranges: vec![(1, 1, 28, 1), (14, 1, 16, 1)],
+                // `(3, 1, 24, 1)` has BOTH endpoints inside deleted intervals `(2..=4)` and `(22..=25)`
+                // while middle rows `5..=8`, `11..=13`, `17..=21` survive -> must shrink to `(2, 1, 13, 1)`!
+                ranges: vec![(1, 1, 28, 1), (14, 1, 16, 1), (3, 1, 24, 1)],
                 rules: vec![CfRule {
                     kind: CfKind::CellIs {
                         op: CfOp::Greater,
@@ -1892,9 +1859,17 @@ mod wave5_structural_tests {
                 }],
             });
             s.dv.push(DataValidation {
-                ranges: vec![(2, 1, 26, 1)],
+                // `(2, 1, 26, 1)` has start deleted (`2` in `2..=4`) -> must shrink to `(2, 1, 14, 1)` without collapsing!
+                ranges: vec![(2, 1, 26, 1), (3, 1, 24, 1)],
                 kind: DvKind::List,
                 f1: "\"A,B\"".into(),
+                ..Default::default()
+            });
+            s.sparklines.push(crate::sparkline::Sparkline {
+                r: 0,
+                c: 3,
+                source_sheet: None,
+                rect: (3, 1, 24, 1),
                 ..Default::default()
             });
             s.notes.insert(
@@ -1916,6 +1891,13 @@ mod wave5_structural_tests {
                 formula: Some("=SUM(明细!B2:B30)+明细!B16+明细!B25".into()),
             },
         );
+        summary.sparklines.push(crate::sparkline::Sparkline {
+            r: 0,
+            c: 1,
+            source_sheet: Some("明细".into()),
+            rect: (3, 1, 24, 1),
+            ..Default::default()
+        });
         base.sheets.push(summary);
 
         let intervals = [(2u32, 4u32), (9, 10), (14, 16), (22, 25)];
@@ -1945,8 +1927,14 @@ mod wave5_structural_tests {
             assert_eq!(s_batch.rows.size(r), s_seq.rows.size(r), "row height mismatch at {r}");
         }
         assert_eq!(s_batch.merges, s_seq.merges);
+        assert_eq!(s_batch.cf.blocks[0].ranges, vec![(1, 1, 16, 1), (2, 1, 13, 1)]);
         assert_eq!(s_batch.cf.blocks[0].ranges, s_seq.cf.blocks[0].ranges);
+        assert_eq!(s_batch.dv[0].ranges, vec![(2, 1, 14, 1), (2, 1, 13, 1)]);
         assert_eq!(s_batch.dv[0].ranges, s_seq.dv[0].ranges);
+        assert_eq!(s_batch.sparklines[0].rect, (2, 1, 13, 1));
+        assert_eq!(s_batch.sparklines, s_seq.sparklines);
+        assert_eq!(via_batch.sheets[1].sparklines[0].rect, (2, 1, 13, 1));
+        assert_eq!(via_batch.sheets[1].sparklines, via_seq.sheets[1].sparklines);
         assert_eq!(s_batch.hidden_rows.intervals(), s_seq.hidden_rows.intervals());
         assert_eq!(s_batch.hidden_rows_user.intervals(), s_seq.hidden_rows_user.intervals());
         assert_eq!(s_batch.notes, s_seq.notes);
