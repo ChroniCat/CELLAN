@@ -189,6 +189,48 @@ fn receive_body(
     }
 }
 
+#[cfg(windows)]
+mod route_cache {
+    use super::ParsedUrl;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    const MAX_ENTRIES: usize = 64;
+
+    fn cache() -> &'static Mutex<HashMap<String, &'static str>> {
+        static CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn key_for(ep: &ParsedUrl) -> String {
+        format!("{}:{}", ep.host.to_ascii_lowercase(), ep.port)
+    }
+
+    pub(super) fn ordered_routes(key: &str) -> [&'static str; 2] {
+        let preferred = cache().lock().unwrap().get(key).copied();
+        if preferred == Some("auto_proxy") {
+            ["auto_proxy", "direct"]
+        } else {
+            ["direct", "auto_proxy"]
+        }
+    }
+
+    pub(super) fn remember(key: &str, route: &'static str) {
+        let mut map = cache().lock().unwrap();
+        if map.len() >= MAX_ENTRIES && !map.contains_key(key) {
+            map.clear();
+        }
+        map.insert(key.to_owned(), route);
+    }
+
+    pub(super) fn invalidate(key: &str, failed_route: &'static str) {
+        let mut map = cache().lock().unwrap();
+        if map.get(key).copied() == Some(failed_route) {
+            map.remove(key);
+        }
+    }
+}
+
 pub(super) fn stream_post(
     ep: &ParsedUrl,
     api_key: &str,
@@ -199,10 +241,12 @@ pub(super) fn stream_post(
     allow_unframed_text: bool,
 ) -> Result<(), String> {
     #[cfg(windows)]
-    let routes = ["direct", "auto_proxy"];
+    let route_key = route_cache::key_for(ep);
+    #[cfg(windows)]
+    let routes = route_cache::ordered_routes(&route_key);
     #[cfg(not(windows))]
     let routes = ["direct"];
-    for route in routes {
+    for (idx, route) in routes.into_iter().enumerate() {
         cancel.check()?;
         let mut trace = Attempt::new();
         let result = platform::post(
@@ -230,10 +274,16 @@ pub(super) fn stream_post(
         };
         trace.log(route, end);
         cancel.check()?;
+        #[cfg(windows)]
+        if result.is_ok() || trace.status.is_some() {
+            route_cache::remember(&route_key, route);
+            return result;
+        }
         // WinHttpConnect doesn't actually open a socket until SendRequest. Only failures
         // before a TCP connection existed can be replayed without duplicating a POST.
         #[cfg(windows)]
-        if route == "direct" && trace.connect_failed {
+        if idx == 0 && trace.connect_failed {
+            route_cache::invalidate(&route_key, route);
             continue;
         }
         return result;
@@ -256,6 +306,48 @@ mod platform {
             unsafe {
                 WinHttpCloseHandle(self.0);
             }
+        }
+    }
+
+    /// 全局复用的 WinHTTP 会话句柄（Microsoft 官方文档明确规定 `WinHttpOpen` 会话句柄线程安全，
+    /// 进程级复用可保留底层 HTTP/TLS keep-alive 连接池与代理缓存，避免每轮多步推理重做 TLS 握手）。
+    struct SharedSession(*mut c_void);
+    unsafe impl Send for SharedSession {}
+    unsafe impl Sync for SharedSession {}
+
+    fn shared_session(route: &str) -> Result<*mut c_void, String> {
+        static DIRECT: std::sync::OnceLock<SharedSession> = std::sync::OnceLock::new();
+        static AUTO_PROXY: std::sync::OnceLock<SharedSession> = std::sync::OnceLock::new();
+        let (slot, access) = if route == "direct" {
+            (&DIRECT, WINHTTP_ACCESS_TYPE_NO_PROXY)
+        } else {
+            (&AUTO_PROXY, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY)
+        };
+        if let Some(existing) = slot.get() {
+            return Ok(existing.0);
+        }
+        let opened = handle(
+            unsafe {
+                WinHttpOpen(
+                    wide("CELLAN").as_ptr(),
+                    access,
+                    null(),
+                    null(),
+                    WINHTTP_FLAG_ASYNC,
+                )
+            },
+            "初始化 HTTP 会话失败",
+        )?;
+        unsafe {
+            WinHttpSetTimeouts(opened.0, 10_000, 15_000, 30_000, 180_000);
+        }
+        let raw = opened.0;
+        if slot.set(SharedSession(raw)).is_ok() {
+            std::mem::forget(opened);
+            Ok(raw)
+        } else {
+            // 并发初始化时另一线程已写入缓存；本地多余句柄随 `opened` 析构安全关闭。
+            Ok(slot.get().unwrap().0)
         }
     }
 
@@ -365,28 +457,9 @@ mod platform {
         trace: &mut Attempt,
         allow_unframed_text: bool,
     ) -> Result<(), String> {
-        let access = if route == "direct" {
-            WINHTTP_ACCESS_TYPE_NO_PROXY
-        } else {
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
-        };
-        let session = handle(
-            unsafe {
-                WinHttpOpen(
-                    wide("CELLAN").as_ptr(),
-                    access,
-                    null(),
-                    null(),
-                    WINHTTP_FLAG_ASYNC,
-                )
-            },
-            "初始化 HTTP 会话失败",
-        )?;
-        unsafe {
-            WinHttpSetTimeouts(session.0, 10_000, 15_000, 30_000, 180_000);
-        }
+        let session = shared_session(route)?;
         let conn = handle(
-            unsafe { WinHttpConnect(session.0, wide(&ep.host).as_ptr(), ep.port, 0) },
+            unsafe { WinHttpConnect(session, wide(&ep.host).as_ptr(), ep.port, 0) },
             "连接模型服务器失败",
         )?;
         let req = handle(
@@ -746,6 +819,31 @@ mod platform {
             wake,
             allow_unframed_text,
         )
+    }
+}
+
+#[cfg(all(test, windows))]
+mod route_cache_tests {
+    use super::route_cache;
+
+    #[test]
+    fn host_route_cache_prefers_last_success_and_falls_back_on_invalidation() {
+        let key = "route-cache-unit.internal:443";
+        assert_eq!(route_cache::ordered_routes(key), ["direct", "auto_proxy"]);
+
+        route_cache::remember(key, "auto_proxy");
+        assert_eq!(route_cache::ordered_routes(key), ["auto_proxy", "direct"]);
+
+        // Invalidating a non-matching route does not disturb cached preference.
+        route_cache::invalidate(key, "direct");
+        assert_eq!(route_cache::ordered_routes(key), ["auto_proxy", "direct"]);
+
+        // When cached auto_proxy fails before connect, invalidation restores direct-first order.
+        route_cache::invalidate(key, "auto_proxy");
+        assert_eq!(route_cache::ordered_routes(key), ["direct", "auto_proxy"]);
+
+        route_cache::remember(key, "direct");
+        assert_eq!(route_cache::ordered_routes(key), ["direct", "auto_proxy"]);
     }
 }
 

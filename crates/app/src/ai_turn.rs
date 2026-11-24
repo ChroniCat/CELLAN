@@ -25,14 +25,43 @@ struct FootprintSnap {
     date_1904: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum FootprintTarget {
+    /// 矩形选区（或可精确合并为无空洞矩形的批量写入）
+    Rect(Rect),
+    /// 同一工作表上离散批量 `set_cells` 的有序去重坐标集合（零误报冲突，共享单份快照）
+    Cells(Vec<(u32, u32)>),
+}
+
+impl FootprintTarget {
+    fn label(&self) -> String {
+        match self {
+            Self::Rect((r1, c1, r2, c2)) => range_label((*r1, *c1), (*r2, *c2)),
+            Self::Cells(coords) => {
+                let Some(&(mut r1, mut c1)) = coords.first() else {
+                    return String::new();
+                };
+                let (mut r2, mut c2) = (r1, c1);
+                for &(r, c) in coords.iter().skip(1) {
+                    r1 = r1.min(r);
+                    c1 = c1.min(c);
+                    r2 = r2.max(r);
+                    c2 = c2.max(c);
+                }
+                range_label((r1, c1), (r2, c2))
+            }
+        }
+    }
+}
+
 /// A confirmation protects the inputs. Once a tool reports values, its calculated
 /// values and number formats also belong to the observation.
 struct Footprint {
     sheet: u64,
-    rect: Rect,
+    target: FootprintTarget,
     values: bool,
     hash: Option<u64>,
-    snap: std::cell::RefCell<Option<(Option<u64>, FootprintSnap)>>,
+    snap: std::cell::RefCell<Option<(Option<u64>, std::rc::Rc<FootprintSnap>)>>,
 }
 
 struct SheetBandSearchCache {
@@ -135,38 +164,49 @@ fn read_hash(result: &JsonValue) -> u64 {
     hash.finish()
 }
 
+#[inline]
+fn hash_single_cell(
+    wb: &sheetcore::Workbook,
+    sheet: &sheetcore::model::Sheet,
+    r: u32,
+    c: u32,
+    cell: &Cell,
+    values: bool,
+    calculated: bool,
+    needs_calculation: &mut bool,
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    (r, c).hash(&mut h);
+    cell.formula.hash(&mut h);
+    if values {
+        if !calculated && !*needs_calculation {
+            *needs_calculation = cell.formula.is_some()
+                || sheet.spilled.contains(&sheetcore::model::CellRef::new(r, c));
+        }
+        wb.styles.get(sheet.style_of(r, c)).format.hash(&mut h);
+    }
+    if values || cell.formula.is_none() {
+        match &cell.value {
+            Value::Number(n) => (2u8, n.to_bits()).hash(&mut h),
+            Value::Text(t) => (3u8, t).hash(&mut h),
+            Value::Bool(b) => (4u8, b).hash(&mut h),
+            Value::Error(e) => (5u8, e.text()).hash(&mut h),
+            Value::Empty => 6u8.hash(&mut h),
+        }
+    }
+    h.finish()
+}
+
 /// Hash stored cells without expanding sparse selections such as entire columns.
-fn region_hash(
+fn target_hash(
     wb: &sheetcore::Workbook,
     si: usize,
-    rect: Rect,
+    target: &FootprintTarget,
     values: bool,
     calculated: bool,
 ) -> Option<u64> {
     let sheet = wb.sheet(si);
     let mut needs_calculation = false;
-    let mut cell_hash = |r: u32, c: u32, cell: &Cell| {
-        let mut h = DefaultHasher::new();
-        (r, c).hash(&mut h);
-        cell.formula.hash(&mut h);
-        if values {
-            if !calculated && !needs_calculation {
-                needs_calculation = cell.formula.is_some()
-                    || sheet.spilled.contains(&sheetcore::model::CellRef::new(r, c));
-            }
-            wb.styles.get(sheet.style_of(r, c)).format.hash(&mut h);
-        }
-        if values || cell.formula.is_none() {
-            match &cell.value {
-                Value::Number(n) => (2u8, n.to_bits()).hash(&mut h),
-                Value::Text(t) => (3u8, t).hash(&mut h),
-                Value::Bool(b) => (4u8, b).hash(&mut h),
-                Value::Error(e) => (5u8, e.text()).hash(&mut h),
-                Value::Empty => 6u8.hash(&mut h),
-            }
-        }
-        h.finish()
-    };
     // Calls on the wire use sheet names. An old name must not silently resolve to
     // a different sheet while a confirmation card is open.
     let mut identity = DefaultHasher::new();
@@ -175,28 +215,68 @@ fn region_hash(
         wb.date_system.is_1904().hash(&mut identity);
     }
     let mut sum = identity.finish();
-    let (mut r1, mut c1, mut r2, mut c2) = rect;
-    let mut area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
-    if area > 4096 {
-        // Large targets such as whole columns: only the used part can hold content.
-        let Some((ur1, uc1, ur2, uc2)) = sheet.used_bounds() else { return Some(sum) };
-        (r1, c1, r2, c2) = (r1.max(ur1), c1.max(uc1), r2.min(ur2), c2.min(uc2));
-        if r1 > r2 || c1 > c2 {
-            return Some(sum);
-        }
-        area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
-    }
-    if area <= sheet.len() as u64 {
-        for r in r1..=r2 {
-            for c in c1..=c2 {
-                if let Some(cell) = sheet.get(r, c).filter(|cell| !cell.is_blank()) {
-                    sum = sum.wrapping_add(cell_hash(r, c, cell));
+    match target {
+        FootprintTarget::Rect(rect) => {
+            let (mut r1, mut c1, mut r2, mut c2) = *rect;
+            let mut area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
+            if area > 4096 {
+                // Large targets such as whole columns: only the used part can hold content.
+                let Some((ur1, uc1, ur2, uc2)) = sheet.used_bounds() else {
+                    return Some(sum);
+                };
+                (r1, c1, r2, c2) = (r1.max(ur1), c1.max(uc1), r2.min(ur2), c2.min(uc2));
+                if r1 > r2 || c1 > c2 {
+                    return Some(sum);
+                }
+                area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
+            }
+            if area <= sheet.len() as u64 {
+                for r in r1..=r2 {
+                    for c in c1..=c2 {
+                        if let Some(cell) = sheet.get(r, c).filter(|cell| !cell.is_blank()) {
+                            sum = sum.wrapping_add(hash_single_cell(
+                                wb,
+                                sheet,
+                                r,
+                                c,
+                                cell,
+                                values,
+                                calculated,
+                                &mut needs_calculation,
+                            ));
+                        }
+                    }
+                }
+            } else {
+                for (at, cell) in sheetcore::sync::iter_sheet_rect(sheet, (r1, c1, r2, c2)) {
+                    sum = sum.wrapping_add(hash_single_cell(
+                        wb,
+                        sheet,
+                        at.row,
+                        at.col,
+                        cell,
+                        values,
+                        calculated,
+                        &mut needs_calculation,
+                    ));
                 }
             }
         }
-    } else {
-        for (at, cell) in sheetcore::sync::iter_sheet_rect(sheet, (r1, c1, r2, c2)) {
-            sum = sum.wrapping_add(cell_hash(at.row, at.col, cell));
+        FootprintTarget::Cells(coords) => {
+            for &(r, c) in coords {
+                if let Some(cell) = sheet.get(r, c).filter(|cell| !cell.is_blank()) {
+                    sum = sum.wrapping_add(hash_single_cell(
+                        wb,
+                        sheet,
+                        r,
+                        c,
+                        cell,
+                        values,
+                        calculated,
+                        &mut needs_calculation,
+                    ));
+                }
+            }
         }
     }
     (calculated || !needs_calculation).then_some(sum)
@@ -901,7 +981,7 @@ impl SheetApp {
     }
 
     /// Regions a finished (or staged) call depends on.
-    fn ai_tool_footprint(&self, call: &ToolCallSpec, result: &JsonValue) -> Vec<(u64, Rect)> {
+    fn ai_tool_footprint(&self, call: &ToolCallSpec, result: &JsonValue) -> Vec<(u64, FootprintTarget)> {
         let args = &call.arguments;
         let sheet = |name: &JsonValue| name.as_str().and_then(|n| self.resolve_sheet_index(Some(n)));
         let identity = |index: usize| self.wb.sheet(index).identity;
@@ -910,22 +990,47 @@ impl SheetApp {
             "inspect_sheet" => {
                 let rect = result["range"].as_str().and_then(checked_ai_range);
                 if let (Some(si), Some(rect)) = (sheet(&result["sheet"]), rect) {
-                    regions.push((identity(si), rect));
+                    regions.push((identity(si), FootprintTarget::Rect(rect)));
                 }
             }
             "set_cells" => {
                 if let Some(si) = sheet(&args["sheet"]) {
-                    for edit in args["edits"].as_array().into_iter().flatten() {
-                        if let Some((r, c)) = edit["cell"].as_str().and_then(checked_address) {
-                            regions.push((identity(si), (r, c, r, c)));
-                        }
+                    let mut coords: Vec<(u32, u32)> = args["edits"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|edit| edit["cell"].as_str().and_then(checked_address))
+                        .collect();
+                    if !coords.is_empty() {
+                        coords.sort_unstable();
+                        coords.dedup();
+                        let target = if coords.len() == 1 {
+                            let (r, c) = coords[0];
+                            FootprintTarget::Rect((r, c, r, c))
+                        } else {
+                            let (mut r1, mut c1) = coords[0];
+                            let (mut r2, mut c2) = (r1, c1);
+                            for &(r, c) in coords.iter().skip(1) {
+                                r1 = r1.min(r);
+                                c1 = c1.min(c);
+                                r2 = r2.max(r);
+                                c2 = c2.max(c);
+                            }
+                            let area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
+                            if area == coords.len() as u64 {
+                                FootprintTarget::Rect((r1, c1, r2, c2))
+                            } else {
+                                FootprintTarget::Cells(coords)
+                            }
+                        };
+                        regions.push((identity(si), target));
                     }
                 }
             }
             "fill_formula_range" | "data_operation" => {
                 let rect = args["range"].as_str().and_then(checked_ai_range);
                 if let (Some(si), Some(rect)) = (sheet(&args["sheet"]), rect) {
-                    regions.push((identity(si), rect));
+                    regions.push((identity(si), FootprintTarget::Rect(rect)));
                 }
             }
             _ => {}
@@ -939,12 +1044,16 @@ impl SheetApp {
             return;
         };
         let values = !result.is_null();
-        let mut known: HashSet<_> = turn.footprint.iter().map(|f| (f.sheet, f.rect, f.values)).collect();
-        for (sheet, rect) in regions {
-            if known.insert((sheet, rect, values)) {
+        let mut known: HashSet<_> = turn
+            .footprint
+            .iter()
+            .map(|f| (f.sheet, f.target.clone(), f.values))
+            .collect();
+        for (sheet, target) in regions {
+            if known.insert((sheet, target.clone(), values)) {
                 turn.footprint.push(Footprint {
                     sheet,
-                    rect,
+                    target,
                     values,
                     hash: None,
                     snap: std::cell::RefCell::new(None),
@@ -954,6 +1063,14 @@ impl SheetApp {
     }
 
     fn ai_region_hash(&self, f: &Footprint) -> Option<u64> {
+        self.ai_region_hash_with_snaps(f, None)
+    }
+
+    fn ai_region_hash_with_snaps(
+        &self,
+        f: &Footprint,
+        shared_snaps: Option<&mut std::collections::HashMap<(u64, bool), std::rc::Rc<FootprintSnap>>>,
+    ) -> Option<u64> {
         let calculated = self.ai_calculated_workbook();
         let wb = if f.values { calculated.unwrap_or(&self.wb) } else { &self.wb };
         let index = wb.sheets.iter().position(|s| s.identity == f.sheet)?;
@@ -965,25 +1082,50 @@ impl SheetApp {
             && prior.calculated == calc_flag
             && (!f.values || prior.date_1904 == date_1904)
             && (!f.values || calc_flag || sh.spilled.is_empty())
-            && sh.same_cells_in(&prior.sheet, &[f.rect], true)
-            && sh.same_cells_in(&prior.sheet, &[f.rect], false)
-            && (!f.values
-                || ((sh.display_style_revision() == prior.sheet.display_style_revision()
-                    && wb.styles.get(0).format == prior.styles.get(0).format)
-                    || sh.same_display_styles_in(&prior.sheet, &[f.rect], &wb.styles, &prior.styles)))
         {
-            return cached_hash;
+            let cells_same = sh.cell_version() == prior.sheet.cell_version()
+                || match &f.target {
+                    FootprintTarget::Rect(rect) => {
+                        sh.same_cells_in(&prior.sheet, &[*rect], true)
+                            && sh.same_cells_in(&prior.sheet, &[*rect], false)
+                    }
+                    FootprintTarget::Cells(_) => false,
+                };
+            let styles_same = !f.values
+                || (sh.display_style_revision() == prior.sheet.display_style_revision()
+                    && wb.styles.get(0).format == prior.styles.get(0).format)
+                || match &f.target {
+                    FootprintTarget::Rect(rect) => {
+                        sh.same_display_styles_in(&prior.sheet, &[*rect], &wb.styles, &prior.styles)
+                    }
+                    FootprintTarget::Cells(_) => false,
+                };
+            if cells_same && styles_same {
+                return cached_hash;
+            }
         }
-        let computed = region_hash(wb, index, f.rect, f.values, calc_flag);
-        *f.snap.borrow_mut() = Some((
-            computed,
-            FootprintSnap {
+        let computed = target_hash(wb, index, &f.target, f.values, calc_flag);
+        let snap = if let Some(snaps) = shared_snaps {
+            snaps
+                .entry((f.sheet, f.values))
+                .or_insert_with(|| {
+                    std::rc::Rc::new(FootprintSnap {
+                        sheet: sh.search_snapshot(),
+                        styles: wb.styles.clone(),
+                        calculated: calc_flag,
+                        date_1904,
+                    })
+                })
+                .clone()
+        } else {
+            std::rc::Rc::new(FootprintSnap {
                 sheet: sh.search_snapshot(),
                 styles: wb.styles.clone(),
                 calculated: calc_flag,
                 date_1904,
-            },
-        ));
+            })
+        };
+        *f.snap.borrow_mut() = Some((computed, snap));
         computed
     }
 
@@ -1231,10 +1373,17 @@ impl SheetApp {
         };
         let revision = (self.doc_gen, self.wb_epoch);
         let updated = turn.revision != revision || turn.awaiting_write_results;
+        let mut shared_snaps = std::collections::HashMap::new();
         let hashes: Vec<_> = turn
             .footprint
             .iter()
-            .map(|f| if updated || f.hash.is_none() { self.ai_region_hash(f) } else { f.hash })
+            .map(|f| {
+                if updated || f.hash.is_none() {
+                    self.ai_region_hash_with_snaps(f, Some(&mut shared_snaps))
+                } else {
+                    f.hash
+                }
+            })
             .collect();
         let reads: Vec<_> = turn.reads.iter().map(|read| {
             if updated || read.hash.is_none() {
@@ -1287,10 +1436,9 @@ impl SheetApp {
             .ai_sheet_by_identity(changed.sheet)
             .map(|i| self.wb.sheet(i).name.clone())
             .unwrap_or_default();
-        let (r1, c1, r2, c2) = changed.rect;
         Some(format!(
             "「{name}」{} 在 AI 处理期间发生了变化或有待重算",
-            range_label((r1, c1), (r2, c2))
+            changed.target.label()
         ))
     }
 
@@ -1947,6 +2095,46 @@ mod tests {
             .sum();
         assert!(bytes <= HISTORY_BYTES);
         assert!(state.wire_history.back().unwrap().0.ends_with("已截短）"));
+    }
+
+    #[test]
+    fn ai_scattered_set_cells_footprint_compacts_without_false_bounding_box_conflict() {
+        let ctx = egui::Context::default();
+        let mut app = pending_app(&ctx);
+        app.finish_ai_round(
+            String::new(),
+            None,
+            Ok(vec![call(
+                "w1",
+                "set_cells",
+                json!({"edits": [
+                    {"cell": "A1", "value": 10},
+                    {"cell": "E10", "value": 20},
+                    {"cell": "C5", "value": 30}
+                ]}),
+            )]),
+            &ctx,
+        );
+        let turn = app.ai.active_round.as_ref().unwrap();
+        assert_eq!(turn.footprint.len(), 1, "scattered set_cells must compact into one Footprint");
+        assert!(matches!(turn.footprint[0].target, FootprintTarget::Cells(ref v) if v.len() == 3));
+
+        // Editing an unrelated cell INSIDE the A1:E10 bounding box must NOT trigger conflict.
+        app.wb.sheet_mut(0).set(1, 1, number(999.0));
+        app.doc_gen += 1;
+        assert!(
+            app.ai_turn_still_valid().is_ok(),
+            "editing unrelated B2 inside A1:E10 bounding box must not trigger conflict"
+        );
+
+        // Editing one of the actual set_cells coordinates MUST trigger conflict.
+        app.wb.sheet_mut(0).set(4, 2, number(31.0));
+        app.doc_gen += 1;
+        assert!(
+            app.ai_turn_still_valid().is_err(),
+            "editing targeted C5 must trigger conflict"
+        );
+        app.stop_ai_generation();
     }
 }
 

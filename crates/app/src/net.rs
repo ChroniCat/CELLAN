@@ -150,6 +150,7 @@ enum Cmd {
     Deliver(Vec<LiveSender>, RoomChange),
     Sort(u64,Arc<SortBatch>),
     SendTo(u32, String),
+    SendPrepared(u32, Arc<sheetcore::wire::PreparedPayload>),
     Stop,
 }
 
@@ -194,7 +195,12 @@ fn cell_frames(ops: impl IntoIterator<Item = Op>, to_host: bool, batch: bool, mu
     if !pending.is_empty() { flush(pending); }
 }
 
-enum LiveFrame { Line(String), Sort(Arc<SortBatch>), Correction(Arc<SortCorrection>) }
+enum LiveFrame {
+    Line(String),
+    Prepared(Arc<sheetcore::wire::PreparedPayload>),
+    Sort(Arc<SortBatch>),
+    Correction(Arc<SortCorrection>),
+}
 
 #[derive(Clone)]
 struct LiveSender {
@@ -204,6 +210,26 @@ struct LiveSender {
 impl LiveSender {
     fn send(&self, line: String) -> Result<(), ()> {
         self.tx.send(LiveFrame::Line(line)).map_err(|_| ())
+    }
+
+    fn send_prepared(&self, payload: Arc<sheetcore::wire::PreparedPayload>) -> Result<(), ()> {
+        self.tx.send(LiveFrame::Prepared(payload)).map_err(|_| ())
+    }
+}
+
+/// 广播同一明文帧给多个在线 peer 时，先预压缩一次再通过 `Arc<PreparedPayload>` 零拷贝共享给各写线程。
+fn broadcast_line_to(peers: &[LiveSender], line: String) {
+    match peers.len() {
+        0 => {}
+        1 => {
+            let _ = peers[0].send(line);
+        }
+        _ => {
+            let prepared = sheetcore::wire::prepare_payload(&line, true);
+            for peer in peers {
+                let _ = peer.send_prepared(Arc::clone(&prepared));
+            }
+        }
     }
 }
 
@@ -515,6 +541,7 @@ struct ActivePeerDownload {
     manifest: crate::update::SignedManifest,
     file: std::fs::File,
     part_path: std::path::PathBuf,
+    prefix_hash: crate::update::PrefixSha256,
     written: u64,
     last_pct: u64,
 }
@@ -654,6 +681,7 @@ fn accept_incoming_update_slice(
             let _ = evt_tx.send(NetEvent::PeerUpdateFailed("写入本地更新缓存失败".into()));
             return;
         }
+        dl.prefix_hash.update(&chunk);
         dl.written += chunk.len() as u64;
         let pct = (dl.written.saturating_mul(100)) / total.max(1);
         if done || pct >= dl.last_pct.saturating_add(2) {
@@ -680,11 +708,13 @@ fn accept_incoming_update_slice(
     if let Some(mut completed) = finished {
         let _ = completed.file.flush();
         drop(completed.file);
+        let streamed_sha = completed.prefix_hash.finalize_hex();
         let evt_tx = evt_tx.clone();
         std::thread::spawn(move || {
-            match crate::update::verify_and_finalize_staged_exe(
+            match crate::update::verify_and_finalize_staged_exe_with_sha(
                 &completed.part_path,
                 &completed.manifest,
+                streamed_sha.as_deref(),
             ) {
                 Ok(()) => {
                     let verified_path = crate::update::staging_file_path(
@@ -759,27 +789,148 @@ impl StructureProgress {
     }
 }
 
+type SeqKey = (usize, u32, u32);
+type SeqMap = immutable_chunkmap::map::MapM<SeqKey, u64>;
+type AxisSeqTable = HashMap<usize, BTreeMap<u32, (Option<sheetcore::style::CellStyle>, u64)>>;
+type MergeWatermarkLog = Vec<(u64, usize, u32, u32, u32, u32, bool)>;
+
+const SEQ_LOG_CHUNK_SIZE: usize = 1024;
+
+/// 按 `seq` 单调追加的分块 CoW 变更日志：
+/// - `clone()` 为严格 `O(1)`（仅增加外层 `Arc` 引用计数）；
+/// - 写时仅对尾块执行 CoW（<= 1024 项），避免快照存在时复制整条历史；
+/// - 增量恢复通过两级 `partition_point` 切片直达 `seq > resume_watermark`，复杂度 `O(log N + Δ)`。
+#[derive(Clone, Debug)]
+struct SeqLog {
+    chunks: Arc<Vec<Arc<Vec<(u64, SeqKey)>>>>,
+    len: usize,
+}
+
+impl Default for SeqLog {
+    fn default() -> Self {
+        Self {
+            chunks: Arc::new(Vec::new()),
+            len: 0,
+        }
+    }
+}
+
+impl SeqLog {
+    fn clear(&mut self) {
+        self.chunks = Arc::new(Vec::new());
+        self.len = 0;
+    }
+
+    fn push(&mut self, seq: u64, key: SeqKey) {
+        let chunks = Arc::make_mut(&mut self.chunks);
+        let need_new = chunks
+            .last()
+            .is_none_or(|c| c.len() >= SEQ_LOG_CHUNK_SIZE);
+        if need_new {
+            let mut next = Vec::with_capacity(64);
+            next.push((seq, key));
+            chunks.push(Arc::new(next));
+        } else {
+            let tail = Arc::make_mut(chunks.last_mut().unwrap());
+            tail.push((seq, key));
+        }
+        self.len += 1;
+    }
+
+    fn since(&self, after_seq: u64) -> impl Iterator<Item = (u64, SeqKey)> + '_ {
+        let start_chunk = self
+            .chunks
+            .partition_point(|ch| ch.last().is_some_and(|(s, _)| *s <= after_seq));
+        self.chunks[start_chunk..]
+            .iter()
+            .enumerate()
+            .flat_map(move |(idx, ch)| {
+                let start = if idx == 0 {
+                    ch.partition_point(|(s, _)| *s <= after_seq)
+                } else {
+                    0
+                };
+                ch[start..].iter().copied()
+            })
+    }
+
+    /// 同一单元格被反复覆盖导致历史冗余过高时压缩重建，限制长会话内存上限。
+    fn maybe_compact(&mut self, latest: &SeqMap) {
+        if self.len <= latest.len().saturating_mul(4).max(16_384) {
+            return;
+        }
+        let mut entries: Vec<(u64, SeqKey)> =
+            latest.range(..).map(|(&k, &seq)| (seq, k)).collect();
+        entries.sort_unstable_by_key(|&(seq, _)| seq);
+        let total = entries.len();
+        let mut chunks = Vec::with_capacity(total.div_ceil(SEQ_LOG_CHUNK_SIZE));
+        for part in entries.chunks(SEQ_LOG_CHUNK_SIZE) {
+            chunks.push(Arc::new(part.to_vec()));
+        }
+        self.chunks = Arc::new(chunks);
+        self.len = total;
+    }
+}
+
+fn shift_seq_map(map: &mut SeqMap, sheet: usize, op: &sheetcore::structural::Structural) {
+    use sheetcore::structural::Structural::*;
+    let source = map.clone();
+    let mut moved = Vec::new();
+    let mut shift = |first, last| {
+        for (&key, &seq) in source.range(first..=last) {
+            map.remove_cow(&key);
+            if let Some((r, c)) = sheetcore::sync::shift_structural_coord(key.1, key.2, op) {
+                moved.push(((sheet, r, c), seq));
+            }
+        }
+    };
+    let last = (sheet, u32::MAX, u32::MAX);
+    match *op {
+        InsertRows { at, .. } | DeleteRows { at, .. } => shift((sheet, at, 0), last),
+        InsertCols { at: 0, .. } | DeleteCols { at: 0, .. } => shift((sheet, 0, 0), last),
+        InsertCols { at, .. } | DeleteCols { at, .. } => {
+            let mut from = 0;
+            while let Some((&(_, row, _), _)) = source.range((sheet, from, 0)..=last).next() {
+                shift((sheet, row, at), (sheet, row, u32::MAX));
+                let Some(next) = row.checked_add(1) else {
+                    break;
+                };
+                from = next;
+            }
+        }
+    }
+    for (key, seq) in moved {
+        map.insert_cow(key, seq);
+    }
+}
+
 #[derive(Clone, Debug)]
 struct HostWatermark {
     seq: u64,
-    op_seqs: BTreeMap<(usize, u32, u32), u64>,
-    style_seqs: BTreeMap<(usize, u32, u32), u64>,
-    axis_rows: HashMap<usize, BTreeMap<u32, (Option<sheetcore::style::CellStyle>, u64)>>,
-    axis_cols: HashMap<usize, BTreeMap<u32, (Option<sheetcore::style::CellStyle>, u64)>>,
+    op_seqs: SeqMap,
+    style_seqs: SeqMap,
+    log_floor_seq: u64,
+    op_log: SeqLog,
+    style_log: SeqLog,
+    axis_rows: Arc<AxisSeqTable>,
+    axis_cols: Arc<AxisSeqTable>,
     cached_axis: Option<AxisStylesMap>,
-    merges: Vec<(u64, usize, u32, u32, u32, u32, bool)>,
+    merges: Arc<MergeWatermarkLog>,
 }
 
 impl Default for HostWatermark {
     fn default() -> Self {
         Self {
             seq: 1,
-            op_seqs: BTreeMap::new(),
-            style_seqs: BTreeMap::new(),
-            axis_rows: HashMap::new(),
-            axis_cols: HashMap::new(),
+            op_seqs: SeqMap::new(),
+            style_seqs: SeqMap::new(),
+            log_floor_seq: 0,
+            op_log: SeqLog::default(),
+            style_log: SeqLog::default(),
+            axis_rows: Arc::new(HashMap::new()),
+            axis_cols: Arc::new(HashMap::new()),
             cached_axis: None,
-            merges: Vec::new(),
+            merges: Arc::new(Vec::new()),
         }
     }
 }
@@ -833,8 +984,12 @@ impl HostWatermark {
     fn record_ops<'a>(&mut self, ops: impl IntoIterator<Item = &'a Op>) -> u64 {
         let seq = self.bump();
         for op in ops {
-            self.op_seqs.insert((op.sheet, op.row, op.col), seq);
+            let key = (op.sheet, op.row, op.col);
+            if self.op_seqs.insert_cow(key, seq) != Some(seq) {
+                self.op_log.push(seq, key);
+            }
         }
+        self.op_log.maybe_compact(&self.op_seqs);
         seq
     }
 
@@ -843,21 +998,41 @@ impl HostWatermark {
         sheet: usize,
         items: &[(u32, u32, sheetcore::style::CellStyle)],
     ) -> u64 {
+        self.record_style_coords(sheet, items.iter().map(|&(r, c, _)| (r, c)))
+    }
+
+    fn record_style_coords(
+        &mut self,
+        sheet: usize,
+        coords: impl IntoIterator<Item = (u32, u32)>,
+    ) -> u64 {
         let seq = self.bump();
-        for &(r, c, _) in items {
-            self.style_seqs.insert((sheet, r, c), seq);
+        for (r, c) in coords {
+            let key = (sheet, r, c);
+            if self.style_seqs.insert_cow(key, seq) != Some(seq) {
+                self.style_log.push(seq, key);
+            }
         }
+        self.style_log.maybe_compact(&self.style_seqs);
         seq
     }
 
     fn record_sort(&mut self, batch: &SortBatch) -> u64 {
         let seq = self.bump();
         for op in &batch.ops {
-            self.op_seqs.insert((op.sheet, op.row, op.col), seq);
+            let key = (op.sheet, op.row, op.col);
+            if self.op_seqs.insert_cow(key, seq) != Some(seq) {
+                self.op_log.push(seq, key);
+            }
         }
         for &(r, c, _) in &batch.styles {
-            self.style_seqs.insert((batch.plan.sheet, r, c), seq);
+            let key = (batch.plan.sheet, r, c);
+            if self.style_seqs.insert_cow(key, seq) != Some(seq) {
+                self.style_log.push(seq, key);
+            }
         }
+        self.op_log.maybe_compact(&self.op_seqs);
+        self.style_log.maybe_compact(&self.style_seqs);
         seq
     }
 
@@ -865,13 +1040,13 @@ impl HostWatermark {
         let seq = self.bump();
         self.cached_axis = None;
         if !patch.rows.is_empty() {
-            let rm = self.axis_rows.entry(sheet).or_default();
+            let rm = Arc::make_mut(&mut self.axis_rows).entry(sheet).or_default();
             for (r, st) in &patch.rows {
                 rm.insert(*r, (st.clone(), seq));
             }
         }
         if !patch.cols.is_empty() {
-            let cm = self.axis_cols.entry(sheet).or_default();
+            let cm = Arc::make_mut(&mut self.axis_cols).entry(sheet).or_default();
             for (c, st) in &patch.cols {
                 cm.insert(*c, (st.clone(), seq));
             }
@@ -881,55 +1056,67 @@ impl HostWatermark {
 
     fn record_merge(&mut self, sheet: usize, rect: (u32, u32, u32, u32), on: bool) -> u64 {
         let seq = self.bump();
-        self.merges
+        Arc::make_mut(&mut self.merges)
             .push((seq, sheet, rect.0, rect.1, rect.2, rect.3, on));
         seq
     }
 
     fn shift_structural(&mut self, sheet: usize, op: &sheetcore::structural::Structural) -> u64 {
         self.cached_axis = None;
-        sheetcore::sync::shift_cell_map(&mut self.op_seqs, sheet, op, |_, _, _| {});
-        sheetcore::sync::shift_cell_map(&mut self.style_seqs, sheet, op, |_, _, _| {});
+        shift_seq_map(&mut self.op_seqs, sheet, op);
+        shift_seq_map(&mut self.style_seqs, sheet, op);
         use sheetcore::structural::Structural as S;
         match *op {
             S::InsertRows { at, n } => {
-                if let Some(rm) = self.axis_rows.get_mut(&sheet) {
-                    let moved: Vec<_> = rm
-                        .extract_if(at.., |_, _| true)
-                        .map(|(r, v)| (r.saturating_add(n), v))
-                        .collect();
-                    rm.extend(moved);
+                if self.axis_rows.contains_key(&sheet) {
+                    if let Some(rm) = Arc::make_mut(&mut self.axis_rows).get_mut(&sheet) {
+                        let moved: Vec<_> = rm
+                            .extract_if(at.., |_, _| true)
+                            .map(|(r, v)| (r.saturating_add(n), v))
+                            .collect();
+                        rm.extend(moved);
+                    }
                 }
             }
             S::DeleteRows { at, n } => {
-                if let Some(rm) = self.axis_rows.get_mut(&sheet) {
-                    let moved: Vec<_> = rm
-                        .extract_if(at.., |_, _| true)
-                        .filter_map(|(r, v)| (r >= at.saturating_add(n)).then_some((r - n, v)))
-                        .collect();
-                    rm.extend(moved);
+                if self.axis_rows.contains_key(&sheet) {
+                    if let Some(rm) = Arc::make_mut(&mut self.axis_rows).get_mut(&sheet) {
+                        let moved: Vec<_> = rm
+                            .extract_if(at.., |_, _| true)
+                            .filter_map(|(r, v)| (r >= at.saturating_add(n)).then_some((r - n, v)))
+                            .collect();
+                        rm.extend(moved);
+                    }
                 }
             }
             S::InsertCols { at, n } => {
-                if let Some(cm) = self.axis_cols.get_mut(&sheet) {
-                    let moved: Vec<_> = cm
-                        .extract_if(at.., |_, _| true)
-                        .map(|(c, v)| (c.saturating_add(n), v))
-                        .collect();
-                    cm.extend(moved);
+                if self.axis_cols.contains_key(&sheet) {
+                    if let Some(cm) = Arc::make_mut(&mut self.axis_cols).get_mut(&sheet) {
+                        let moved: Vec<_> = cm
+                            .extract_if(at.., |_, _| true)
+                            .map(|(c, v)| (c.saturating_add(n), v))
+                            .collect();
+                        cm.extend(moved);
+                    }
                 }
             }
             S::DeleteCols { at, n } => {
-                if let Some(cm) = self.axis_cols.get_mut(&sheet) {
-                    let moved: Vec<_> = cm
-                        .extract_if(at.., |_, _| true)
-                        .filter_map(|(c, v)| (c >= at.saturating_add(n)).then_some((c - n, v)))
-                        .collect();
-                    cm.extend(moved);
+                if self.axis_cols.contains_key(&sheet) {
+                    if let Some(cm) = Arc::make_mut(&mut self.axis_cols).get_mut(&sheet) {
+                        let moved: Vec<_> = cm
+                            .extract_if(at.., |_, _| true)
+                            .filter_map(|(c, v)| (c >= at.saturating_add(n)).then_some((c - n, v)))
+                            .collect();
+                        cm.extend(moved);
+                    }
                 }
             }
         }
-        self.bump()
+        let seq = self.bump();
+        self.log_floor_seq = seq;
+        self.op_log.clear();
+        self.style_log.clear();
+        seq
     }
 }
 
@@ -962,6 +1149,8 @@ pub struct Net {
     host_baseline: Option<SharedBaseline>,
     formula_keys: Option<Arc<Mutex<BTreeSet<(usize, u32, u32)>>>>,
     host_watermark: Option<Arc<Mutex<HostWatermark>>>,
+    host_max_clock: Option<Arc<AtomicU64>>,
+    host_wake_addr: Option<std::net::SocketAddr>,
     state: Option<SharedGrid<Op>>,
     delta_ops: Option<SharedGrid<Op>>,
     host_base_hash: Option<Arc<Mutex<String>>>,
@@ -1091,15 +1280,23 @@ fn update_host_ops(
     state: &Mutex<Arc<Grid<Op>>>,
     delta: &Mutex<Arc<Grid<Op>>>,
     formula_keys: &Mutex<BTreeSet<(usize, u32, u32)>>,
+    max_clock: &AtomicU64,
     ops: &[Op],
 ) {
-    update_host_shared_ops(state, delta, formula_keys, ops.iter().cloned().map(Arc::new));
+    update_host_shared_ops(
+        state,
+        delta,
+        formula_keys,
+        max_clock,
+        ops.iter().cloned().map(Arc::new),
+    );
 }
 
 fn update_host_shared_ops(
     state: &Mutex<Arc<Grid<Op>>>,
     delta: &Mutex<Arc<Grid<Op>>>,
     formula_keys: &Mutex<BTreeSet<(usize, u32, u32)>>,
+    max_clock: &AtomicU64,
     ops: impl IntoIterator<Item = Arc<Op>>,
 ) {
     let mut state = state.lock().unwrap();
@@ -1107,7 +1304,9 @@ fn update_host_shared_ops(
     let mut fk = formula_keys.lock().unwrap();
     let state = Arc::make_mut(&mut state);
     let delta = Arc::make_mut(&mut delta);
+    let mut batch_max_ts = 0u64;
     for op in ops {
+        batch_max_ts = batch_max_ts.max(op.ts);
         let key = (op.sheet, op.row, op.col);
         let prev_winner = state.get(&key);
         let wins = prev_winner.is_none_or(|v| (op.ts, op.site) > (v.ts, v.site));
@@ -1120,6 +1319,9 @@ fn update_host_shared_ops(
                 fk.remove(&key);
             }
         }
+    }
+    if batch_max_ts > 0 {
+        max_clock.fetch_max(batch_max_ts, Ordering::AcqRel);
     }
 }
 
@@ -1158,6 +1360,29 @@ fn update_host_styles(state: &SharedStyles, delta: &SharedStyles, sheet: usize,
         };
         state.insert_cow(key, Arc::clone(&shared));
         delta.insert_cow(key, shared);
+    }
+}
+
+/// 按调色板索引直接写入宿主共享样式表（仅分配 `palette.len()` 个 `Arc<CellStyle>`，零逐格哈希与深拷贝）。
+fn update_host_palette_styles(
+    state: &SharedStyles,
+    delta: &SharedStyles,
+    sheet: usize,
+    palette: &[sheetcore::style::CellStyle],
+    items: &[(u32, u32, u16)],
+) {
+    let shared_palette: Vec<Arc<sheetcore::style::CellStyle>> =
+        palette.iter().cloned().map(Arc::new).collect();
+    let mut state = state.lock().unwrap();
+    let mut delta = delta.lock().unwrap();
+    let state = Arc::make_mut(&mut state);
+    let delta = Arc::make_mut(&mut delta);
+    for &(row, col, idx) in items {
+        if let Some(shared) = shared_palette.get(idx as usize) {
+            let key = (sheet, row, col);
+            state.insert_cow(key, Arc::clone(shared));
+            delta.insert_cow(key, Arc::clone(shared));
+        }
     }
 }
 
@@ -1259,19 +1484,159 @@ fn emit_style_snapshot_chunk(
     )
 }
 
-/// 流式下发样式快照（合并只读 `BaselineBook` 与稀疏覆盖 `Grid<CellStyle>`，零百万级中间 Vec）
+fn emit_style_palette_snapshot_chunk(
+    palette: &mut Vec<sheetcore::style::CellStyle>,
+    items: &mut Vec<(usize, u32, u32, u16)>,
+    tx: &std::sync::mpsc::SyncSender<String>,
+) -> bool {
+    if items.is_empty() {
+        palette.clear();
+        return true;
+    }
+    let pal = std::mem::take(palette);
+    let it = std::mem::take(items);
+    if let Ok(line) = serde_json::to_string(&Msg::StylePaletteSnapshot {
+        palette: pal.clone(),
+        items: it.clone(),
+    }) {
+        if line.len() <= MAX_PLAIN_LINE {
+            return tx.send(line).is_ok();
+        }
+    }
+    // 极端超长样式帧回退至逐条拆帧
+    let expanded: Vec<(usize, u32, u32, sheetcore::style::CellStyle)> = it
+        .into_iter()
+        .filter_map(|(s, r, c, idx)| pal.get(idx as usize).map(|st| (s, r, c, st.clone())))
+        .collect();
+    style_frames(
+        &expanded,
+        MAX_PLAIN_LINE,
+        |batch| serde_json::to_string(&Msg::StyleSnapshot { items: batch.to_vec() }),
+        |line| tx.send(line).is_ok(),
+    )
+}
+
+/// 面向稀疏覆盖样式 `Arc<CellStyle>` 的流式调色板分片发送器：
+/// 先按 `Arc` 指针身份 `O(1)` 命中，未命中再按内容哈希去重，避免逐格克隆 `CellStyle` 与重复哈希。
+struct OverlayStylePaletteEmitter {
+    palette: Vec<sheetcore::style::CellStyle>,
+    ptr_to_pal: HashMap<usize, u16>,
+    hash_buckets: HashMap<u64, Vec<u16>>,
+    items: Vec<(usize, u32, u32, u16)>,
+}
+
+impl OverlayStylePaletteEmitter {
+    fn new() -> Self {
+        Self {
+            palette: Vec::new(),
+            ptr_to_pal: HashMap::new(),
+            hash_buckets: HashMap::new(),
+            items: Vec::with_capacity(SNAPSHOT_STYLE_CHUNK),
+        }
+    }
+
+    fn push(
+        &mut self,
+        si: usize,
+        row: u32,
+        col: u32,
+        style: &Arc<sheetcore::style::CellStyle>,
+        tx: &std::sync::mpsc::SyncSender<String>,
+    ) -> bool {
+        let ptr = Arc::as_ptr(style) as usize;
+        let idx = if let Some(&id) = self.ptr_to_pal.get(&ptr) {
+            id
+        } else {
+            let h = sheetcore::sync::cell_style_hash(style);
+            let mut found = None;
+            if let Some(cands) = self.hash_buckets.get(&h) {
+                for &id in cands {
+                    if &self.palette[id as usize] == style.as_ref() {
+                        found = Some(id);
+                        break;
+                    }
+                }
+            }
+            let id = match found {
+                Some(id) => id,
+                None => {
+                    let id = u16::try_from(self.palette.len()).unwrap_or(u16::MAX);
+                    if (id as usize) == self.palette.len() {
+                        self.palette.push(style.as_ref().clone());
+                        self.hash_buckets.entry(h).or_default().push(id);
+                    }
+                    id
+                }
+            };
+            self.ptr_to_pal.insert(ptr, id);
+            id
+        };
+        self.items.push((si, row, col, idx));
+        if self.items.len() >= SNAPSHOT_STYLE_CHUNK {
+            return self.flush(tx);
+        }
+        true
+    }
+
+    fn flush(&mut self, tx: &std::sync::mpsc::SyncSender<String>) -> bool {
+        self.ptr_to_pal.clear();
+        self.hash_buckets.clear();
+        emit_style_palette_snapshot_chunk(&mut self.palette, &mut self.items, tx)
+    }
+}
+
+/// 流式下发样式快照（合并只读 `BaselineBook` 与稀疏覆盖 `Grid<CellStyle>`，零百万级中间 Vec）：
+/// 现代客户端按 `StyleId` / `Arc` 指针直接构造调色板分片，消除逐格克隆 `CellStyle` 与重复哈希。
 fn stream_snapshot_styles(
     baseline: Option<&BaselineBook>,
     overlay: &Grid<sheetcore::style::CellStyle>,
     palette_capable: bool,
     tx: &std::sync::mpsc::SyncSender<String>,
 ) -> bool {
+    if palette_capable {
+        if let Some(base) = baseline {
+            let mut palette: Vec<sheetcore::style::CellStyle> = Vec::new();
+            let mut id_to_pal: HashMap<u16, u16> = HashMap::new();
+            let mut items: Vec<(usize, u32, u32, u16)> = Vec::with_capacity(SNAPSHOT_STYLE_CHUNK);
+            for (si, sh) in base.sheets.iter().enumerate() {
+                // Preserve explicit `sid == 0` entries as well: `sh.styles` only stores `0` when
+                // masking a row/column default style (e.g. an unbolded cell inside a bold column).
+                for (pos, &id) in sh.styles.iter() {
+                    let key = (si, pos.row, pos.col);
+                    if overlay.get(&key).is_some() {
+                        continue;
+                    }
+                    let pal_idx = *id_to_pal.entry(id).or_insert_with(|| {
+                        let idx = palette.len() as u16;
+                        palette.push(base.styles.get(id).clone());
+                        idx
+                    });
+                    items.push((si, pos.row, pos.col, pal_idx));
+                    if items.len() >= SNAPSHOT_STYLE_CHUNK {
+                        id_to_pal.clear();
+                        if !emit_style_palette_snapshot_chunk(&mut palette, &mut items, tx) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            if !emit_style_palette_snapshot_chunk(&mut palette, &mut items, tx) {
+                return false;
+            }
+        }
+        let mut emitter = OverlayStylePaletteEmitter::new();
+        for (&(si, r, c), style) in overlay.range(..) {
+            if !emitter.push(si, r, c, style, tx) {
+                return false;
+            }
+        }
+        return emitter.flush(tx);
+    }
+
     let mut buf: Vec<(usize, u32, u32, sheetcore::style::CellStyle)> =
         Vec::with_capacity(SNAPSHOT_STYLE_CHUNK);
     if let Some(base) = baseline {
         for (si, sh) in base.sheets.iter().enumerate() {
-            // Preserve explicit `sid == 0` entries as well: `sh.styles` only stores `0` when
-            // masking a row/column default style (e.g. an unbolded cell inside a bold column).
             for (pos, &id) in sh.styles.iter() {
                 let key = (si, pos.row, pos.col);
                 if overlay.get(&key).is_some() {
@@ -1279,7 +1644,7 @@ fn stream_snapshot_styles(
                 }
                 buf.push((si, pos.row, pos.col, base.styles.get(id).clone()));
                 if buf.len() >= SNAPSHOT_STYLE_CHUNK {
-                    if !emit_style_snapshot_chunk(&buf, palette_capable, tx) {
+                    if !emit_style_snapshot_chunk(&buf, false, tx) {
                         return false;
                     }
                     buf.clear();
@@ -1290,13 +1655,13 @@ fn stream_snapshot_styles(
     for (&(si, r, c), style) in overlay.range(..) {
         buf.push((si, r, c, style.as_ref().clone()));
         if buf.len() >= SNAPSHOT_STYLE_CHUNK {
-            if !emit_style_snapshot_chunk(&buf, palette_capable, tx) {
+            if !emit_style_snapshot_chunk(&buf, false, tx) {
                 return false;
             }
             buf.clear();
         }
     }
-    emit_style_snapshot_chunk(&buf, palette_capable, tx)
+    emit_style_snapshot_chunk(&buf, false, tx)
 }
 
 /// 流式下发单元格快照（直接借用 `&Op` 序列化，彻底消除 `Arc::unwrap_or_clone` 百万次深拷贝）
@@ -1594,9 +1959,21 @@ impl Net {
                 .unwrap_or_else(|| BaselineBook::from_workbook(self.site, workbook));
             *hb.lock().unwrap() = Some(Arc::new(base));
         }
+        let mut seed_max_ts = 1u64;
         if let Some(st) = &self.state {
             let mut map = st.lock().unwrap();
-            *map = Arc::new(peer.cells.iter().map(|(k, v)| (*k, v.clone())).collect());
+            *map = Arc::new(
+                peer.cells
+                    .iter()
+                    .map(|(k, v)| {
+                        seed_max_ts = seed_max_ts.max(v.ts);
+                        (*k, v.clone())
+                    })
+                    .collect(),
+            );
+        }
+        if let Some(mc) = &self.host_max_clock {
+            mc.store(seed_max_ts.max(1), Ordering::Release);
         }
         if let Some(fk) = &self.formula_keys {
             let mut set = fk.lock().unwrap();
@@ -1621,11 +1998,14 @@ impl Net {
             *hs.lock().unwrap() = Default::default();
         }
         if let Some(wm) = &self.host_watermark {
-            let mut w = wm.lock().unwrap();
+            let mut w_guard = wm.lock().unwrap();
+            let w = &mut *w_guard;
             w.reset();
+            let axis_rows = Arc::make_mut(&mut w.axis_rows);
+            let axis_cols = Arc::make_mut(&mut w.axis_cols);
             for (si, sh) in workbook.sheets.iter().enumerate() {
                 if !sh.row_styles.is_empty() {
-                    let rm = w.axis_rows.entry(si).or_default();
+                    let rm = axis_rows.entry(si).or_default();
                     for (&r, &id) in &sh.row_styles {
                         if id != 0 {
                             rm.insert(r, (Some(workbook.styles.get(id).clone()), 1));
@@ -1633,7 +2013,7 @@ impl Net {
                     }
                 }
                 if !sh.col_styles.is_empty() {
-                    let cm = w.axis_cols.entry(si).or_default();
+                    let cm = axis_cols.entry(si).or_default();
                     for (&c, &id) in &sh.col_styles {
                         if id != 0 {
                             cm.insert(c, (Some(workbook.styles.get(id).clone()), 1));
@@ -1782,10 +2162,13 @@ impl Net {
         }
         drop(locks);
         if ops.is_empty() { return; }
-        if let (Some(state), Some(delta), Some(fk)) =
-            (&self.state, &self.delta_ops, &self.formula_keys)
-        {
-            update_host_ops(state, delta, fk, &ops);
+        if let (Some(state), Some(delta), Some(fk), Some(mc)) = (
+            &self.state,
+            &self.delta_ops,
+            &self.formula_keys,
+            &self.host_max_clock,
+        ) {
+            update_host_ops(state, delta, fk, mc, &ops);
         }
         if let Some(roster) = &self.host_roster {
             let wm_seq = self
@@ -1845,6 +2228,7 @@ impl Net {
             Some(baseline),
             Some(fk),
             Some(wm),
+            Some(max_clock),
             Some(state),
             Some(delta),
             Some(styles),
@@ -1855,6 +2239,7 @@ impl Net {
             &self.host_baseline,
             &self.formula_keys,
             &self.host_watermark,
+            &self.host_max_clock,
             &self.state,
             &self.delta_ops,
             &self.host_styles,
@@ -1866,6 +2251,7 @@ impl Net {
                                     baseline: &SharedBaseline,
                                     fk: &Arc<Mutex<BTreeSet<(usize, u32, u32)>>>,
                                     wm: &Arc<Mutex<HostWatermark>>,
+                                    max_clock: &Arc<AtomicU64>,
                                     state: &SharedGrid<Op>,
                                     delta: &SharedGrid<Op>,
                                     styles: &SharedStyles,
@@ -1892,6 +2278,9 @@ impl Net {
                             .conflicts_rect(batch.plan.sheet, r1, c1, r2, c2, site, now)
                             .is_none();
                     if allowed && current.publish(&next, state, delta, styles, delta_styles) {
+                        if let Some(m) = batch.ops.iter().map(|o| o.ts).max() {
+                            max_clock.fetch_max(m, Ordering::AcqRel);
+                        }
                         update_formula_keys_for_sort(fk, &batch.ops);
                         let seq = wm.lock().unwrap().record_sort(&batch);
                         let struct_rev = history.len();
@@ -1928,6 +2317,7 @@ impl Net {
                 let baseline = baseline.clone();
                 let fk = fk.clone();
                 let wm = wm.clone();
+                let max_clock = max_clock.clone();
                 let state = state.clone();
                 let delta = delta.clone();
                 let styles = styles.clone();
@@ -1946,6 +2336,7 @@ impl Net {
                         &baseline,
                         &fk,
                         &wm,
+                        &max_clock,
                         &state,
                         &delta,
                         &styles,
@@ -1966,6 +2357,7 @@ impl Net {
                     baseline,
                     fk,
                     wm,
+                    max_clock,
                     state,
                     delta,
                     styles,
@@ -2438,30 +2830,81 @@ impl Net {
         let _ = self.evt_tx.send(NetEvent::PeerRenamed(self.site, canonical));
     }
 
-    /// 向房间成员宣告本机持有经过官方数字签名的版本（若本机为正式签名包）
+    /// 向房间成员宣告本机持有经过官方数字签名的版本（若本机为正式签名包；后台异步预热缓存绝不阻塞 UI 主线程）
     pub fn announce_local_signed_update(&self) {
-        let Some((_, manifest)) = resolve_local_seed(&self.update_seed_override) else {
-            return;
-        };
-        self.announce_update(&manifest);
+        if let Ok(g) = self.update_seed_override.lock() {
+            if let Some((_, manifest)) = g.as_ref() {
+                self.announce_update(manifest);
+                return;
+            }
+        }
+        let my_site = self.site;
+        let cmd = self.cmd.clone();
+        let alive = self.alive.clone();
+        crate::update::warm_local_signed_bundle_async(move |bundle| {
+            if !alive.load(Ordering::Acquire) {
+                return;
+            }
+            let Some((_, manifest)) = bundle else {
+                return;
+            };
+            if !crate::update::verify_manifest_sig(&manifest) {
+                return;
+            }
+            let msg = Msg::UpdateAnnounce {
+                site: my_site,
+                version: manifest.version,
+                size: manifest.size,
+                sha256: manifest.sha256,
+                sig: manifest.sig,
+                notes: manifest.notes,
+            };
+            if let Ok(s) = serde_json::to_string(&msg) {
+                let _ = cmd.send(Cmd::Broadcast(s));
+            }
+        });
     }
 
-    /// 向指定新加入成员单播本机的签名版本宣告（宿主在新成员入房后调用）
+    /// 向指定新加入成员单播本机的签名版本宣告（宿主在新成员入房后调用；后台异步预热缓存绝不阻塞 UI 主线程）
     pub fn announce_local_signed_update_to(&self, target_site: u32) {
-        let Some((_, manifest)) = resolve_local_seed(&self.update_seed_override) else {
-            return;
-        };
-        let msg = Msg::UpdateAnnounce {
-            site: self.site,
-            version: manifest.version,
-            size: manifest.size,
-            sha256: manifest.sha256,
-            sig: manifest.sig,
-            notes: manifest.notes,
-        };
-        if let Ok(s) = serde_json::to_string(&msg) {
-            let _ = self.cmd.send(Cmd::SendTo(target_site, s));
+        if let Ok(g) = self.update_seed_override.lock() {
+            if let Some((_, manifest)) = g.clone() {
+                let msg = Msg::UpdateAnnounce {
+                    site: self.site,
+                    version: manifest.version,
+                    size: manifest.size,
+                    sha256: manifest.sha256,
+                    sig: manifest.sig,
+                    notes: manifest.notes,
+                };
+                if let Ok(s) = serde_json::to_string(&msg) {
+                    let _ = self.cmd.send(Cmd::SendTo(target_site, s));
+                }
+                return;
+            }
         }
+        let my_site = self.site;
+        let cmd = self.cmd.clone();
+        let alive = self.alive.clone();
+        crate::update::warm_local_signed_bundle_async(move |bundle| {
+            if !alive.load(Ordering::Acquire) {
+                return;
+            }
+            let Some((_, manifest)) = bundle else {
+                return;
+            };
+            let msg = Msg::UpdateAnnounce {
+                site: my_site,
+                version: manifest.version,
+                size: manifest.size,
+                sha256: manifest.sha256,
+                sig: manifest.sig,
+                notes: manifest.notes,
+            };
+            if let Ok(s) = serde_json::to_string(&msg) {
+                let _ = cmd.send(Cmd::SendTo(target_site, s));
+            }
+        });
     }
 
     pub fn announce_update(&self, manifest: &crate::update::SignedManifest) {
@@ -2504,11 +2947,13 @@ impl Net {
                 drop(prev.file);
                 let _ = std::fs::remove_file(&prev.part_path);
             }
+            let expected_size = manifest.size;
             *g = Some(ActivePeerDownload {
                 peer_site,
                 manifest: manifest.clone(),
                 file,
                 part_path,
+                prefix_hash: crate::update::PrefixSha256::new(expected_size),
                 written: 0,
                 last_pct: 0,
             });
@@ -2543,6 +2988,10 @@ impl Net {
     pub fn shutdown(&self) {
         if !self.alive.swap(false, Ordering::SeqCst) {
             return;
+        }
+        if let Some(addr) = self.host_wake_addr {
+            // 唤醒阻塞在 accept() 的宿主监听线程，避免 40ms 轮询且确保端口即时释放
+            let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(100));
         }
         for socket in self.sockets.lock().unwrap().drain(..).filter_map(|s| s.upgrade()) {
             let _ = socket.shutdown(std::net::Shutdown::Both);
@@ -2668,8 +3117,20 @@ fn host_initialized(
             "宿主站点号不能为 0",
         ));
     }
-    let port = listener.local_addr()?.port();
-    listener.set_nonblocking(true)?;
+    let local_addr = listener.local_addr()?;
+    let port = local_addr.port();
+    let host_wake_addr = match local_addr {
+        std::net::SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+            std::net::SocketAddr::from(([127, 0, 0, 1], port))
+        }
+        std::net::SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+            std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port))
+        }
+        other => other,
+    };
+    listener.set_nonblocking(false)?;
+    // 后台非阻塞预热本机签名包缓存，避免成员入房时在 UI 线程同步读自身 60 MB 算 SHA-256
+    let _ = crate::update::try_cached_local_signed_bundle();
     // 协议 v2：开房时仅生成 16B 随机 salt（微秒级），20 万轮 PBKDF2 放入后台 accept 线程执行以绝不阻塞 UI 主线程
     let mut room_salt = [0u8; 16];
     getrandom::fill(&mut room_salt)
@@ -2698,6 +3159,8 @@ fn host_initialized(
     let formula_keys_for_self = formula_keys.clone();
     let host_watermark: Arc<Mutex<HostWatermark>> = Default::default();
     let host_watermark_for_self = host_watermark.clone();
+    let host_max_clock = Arc::new(AtomicU64::new(1));
+    let host_max_clock_for_self = host_max_clock.clone();
     let state: SharedGrid<Op> = Default::default();
     let delta_ops: SharedGrid<Op> = Default::default();
     let host_base_hash: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -2717,7 +3180,7 @@ fn host_initialized(
                         let senders = roster.lock().unwrap().all_senders();
                         if !senders.is_empty() {
                             cell_frames(ops, false, true, |s| {
-                                for tx in &senders { let _ = tx.send(s.clone()); }
+                                broadcast_line_to(&senders, s);
                             });
                         }
                     }
@@ -2725,7 +3188,7 @@ fn host_initialized(
                     Cmd::Style(_) => unreachable!("client style dispatch is guest-only"),
                     Cmd::Deliver(peers, change) => {
                         let send = |line: String| {
-                            for peer in &peers { let _ = peer.send(line.clone()); }
+                            broadcast_line_to(&peers, line);
                         };
                         match change {
                             RoomChange::Sort(batch) => {
@@ -2746,14 +3209,18 @@ fn host_initialized(
                     }
                     Cmd::Broadcast(s) => {
                         let senders = roster.lock().unwrap().all_senders();
-                        for tx in senders {
-                            let _ = tx.send(s.clone());
-                        }
+                        broadcast_line_to(&senders, s);
                     }
                     Cmd::SendTo(target_site, s) => {
                         let target = roster.lock().unwrap().sender_of(target_site);
                         if let Some(tx) = target {
                             let _ = tx.send(s);
+                        }
+                    }
+                    Cmd::SendPrepared(target_site, prepared) => {
+                        let target = roster.lock().unwrap().sender_of(target_site);
+                        if let Some(tx) = target {
+                            let _ = tx.send_prepared(prepared);
                         }
                     }
                     Cmd::Stop => break,
@@ -2841,6 +3308,7 @@ fn host_initialized(
         let host_baseline_outer = host_baseline.clone();
         let formula_keys_outer = formula_keys.clone();
         let host_watermark_outer = host_watermark.clone();
+        let host_max_clock_outer = host_max_clock.clone();
         let room_session_id = session_id.clone();
         let state = state.clone();
         let delta_ops_outer = delta_ops.clone();
@@ -2867,12 +3335,13 @@ fn host_initialized(
             while alive.load(Ordering::SeqCst) {
                 let stream = match listener.accept() {
                     Ok((stream, _)) => stream,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(40));
-                        continue;
-                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
+                if !alive.load(Ordering::SeqCst) {
+                    drop(stream);
+                    break;
+                }
                 // 连接数封顶：每条连接两个线程，局域网里的扫描器不能把宿主线程耗尽
                 let Some(slot) = ConnSlot::try_take(&active_conns) else {
                     drop(stream);
@@ -2896,6 +3365,7 @@ fn host_initialized(
                 let host_baseline = host_baseline_outer.clone();
                 let formula_keys = formula_keys_outer.clone();
                 let host_watermark = host_watermark_outer.clone();
+                let host_max_clock = host_max_clock_outer.clone();
                 let room_session_id = room_session_id.clone();
                 let state = state.clone();
                 let delta_ops = delta_ops_outer.clone();
@@ -2960,6 +3430,11 @@ fn host_initialized(
                         for frame in intro_rx.into_iter().map(LiveFrame::Line).chain(rx) {
                             let ok = match frame {
                                 LiveFrame::Line(line) => send(line),
+                                LiveFrame::Prepared(prepared) => {
+                                    let mut out = write_out.lock().unwrap();
+                                    let (w, se) = &mut *out;
+                                    write_line(w, &se.seal_prepared(&prepared)).is_ok()
+                                }
                                 LiveFrame::Correction(correction) => {
                                     correction.chunks(|sheet,first_ts,items| send_room_message(
                                         Msg::SortRepairs { sheet,first_ts,items },MAX_PLAIN_LINE,send,|| {}))
@@ -2999,6 +3474,9 @@ fn host_initialized(
                     };
 
                     let commit_sort = |batch: Arc<SortBatch>, struct_rev: usize| {
+                        if let Some(m) = batch.ops.iter().map(|o| o.ts).max() {
+                            host_max_clock.fetch_max(m, Ordering::AcqRel);
+                        }
                         update_formula_keys_for_sort(&formula_keys, &batch.ops);
                         let seq = host_watermark.lock().unwrap().record_sort(&batch);
                         let site = batch.plan.site;
@@ -3107,14 +3585,9 @@ fn host_initialized(
                                 } else {
                                     styles.lock().unwrap().clone()
                                 };
-                                let state_for_clk = state.lock().unwrap().clone();
+                                let host_clock = host_max_clock.load(Ordering::Acquire).max(1);
                                 let merges = if can_resume {
-                                    wm_snapshot
-                                        .merges
-                                        .iter()
-                                        .filter(|(seq, ..)| *seq > resume_watermark)
-                                        .map(|&(_, s, r1, c1, r2, c2, on)| (s, r1, c1, r2, c2, on))
-                                        .collect::<Vec<_>>()
+                                    Vec::new()
                                 } else {
                                     delta_merges.lock().unwrap().clone()
                                 };
@@ -3130,12 +3603,6 @@ fn host_initialized(
                                 let other_peers = roster.lock().unwrap().finish_admit(site, live_tx);
                                 drop(order);
 
-                                let host_clock = state_for_clk
-                                    .range(..)
-                                    .map(|(_, o)| o.ts)
-                                    .max()
-                                    .unwrap_or(1)
-                                    .max(1);
                                 #[cfg(test)]
                                 {
                                     let hook = after_snapshot.lock().unwrap().take();
@@ -3221,30 +3688,83 @@ fn host_initialized(
                                     }
                                 }
                                 if can_resume {
-                                    // 水位增量重连：仅流式发送 seq > resume_watermark 的变更样式与单元格
-                                    let mut style_buf = Vec::new();
-                                    for (&(si, r, c), &seq) in &wm_snapshot.style_seqs {
-                                        if seq <= resume_watermark {
-                                            continue;
-                                        }
-                                        if let Some(st) = styles_grid.get(&(si, r, c)) {
-                                            style_buf.push((si, r, c, st.as_ref().clone()));
-                                            if style_buf.len() >= SNAPSHOT_STYLE_CHUNK {
-                                                if !emit_style_snapshot_chunk(
-                                                    &style_buf,
-                                                    palette_styles,
-                                                    &tx,
-                                                ) {
-                                                    break;
+                                    // 水位增量重连：按 partition_point 切片 O(log N + Δ) 发送 seq > resume_watermark 的变更样式与单元格
+                                    let use_seq_log = resume_watermark >= wm_snapshot.log_floor_seq;
+                                    let mut style_ok = true;
+                                    if palette_styles {
+                                        let mut emitter = OverlayStylePaletteEmitter::new();
+                                        if use_seq_log {
+                                            for (seq, key) in wm_snapshot.style_log.since(resume_watermark) {
+                                                if wm_snapshot.style_seqs.get(&key) != Some(&seq) {
+                                                    continue;
                                                 }
-                                                style_buf.clear();
+                                                if let Some(st) = styles_grid.get(&key) {
+                                                    if !emitter.push(key.0, key.1, key.2, st, &tx) {
+                                                        style_ok = false;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            for (&key, &seq) in wm_snapshot.style_seqs.range(..) {
+                                                if seq <= resume_watermark {
+                                                    continue;
+                                                }
+                                                if let Some(st) = styles_grid.get(&key) {
+                                                    if !emitter.push(key.0, key.1, key.2, st, &tx) {
+                                                        style_ok = false;
+                                                        break;
+                                                    }
+                                                }
                                             }
                                         }
+                                        if style_ok && !emitter.flush(&tx) {
+                                            style_ok = false;
+                                        }
+                                    } else {
+                                        let mut style_buf = Vec::new();
+                                        let mut push_legacy = |key: SeqKey| -> bool {
+                                            if let Some(st) = styles_grid.get(&key) {
+                                                style_buf.push((key.0, key.1, key.2, st.as_ref().clone()));
+                                                if style_buf.len() >= SNAPSHOT_STYLE_CHUNK {
+                                                    if !emit_style_snapshot_chunk(&style_buf, false, &tx) {
+                                                        return false;
+                                                    }
+                                                    style_buf.clear();
+                                                }
+                                            }
+                                            true
+                                        };
+                                        if use_seq_log {
+                                            for (seq, key) in wm_snapshot.style_log.since(resume_watermark) {
+                                                if wm_snapshot.style_seqs.get(&key) == Some(&seq)
+                                                    && !push_legacy(key)
+                                                {
+                                                    style_ok = false;
+                                                    break;
+                                                }
+                                            }
+                                        } else {
+                                            for (&key, &seq) in wm_snapshot.style_seqs.range(..) {
+                                                if seq > resume_watermark && !push_legacy(key) {
+                                                    style_ok = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if style_ok && !emit_style_snapshot_chunk(&style_buf, false, &tx) {
+                                            style_ok = false;
+                                        }
                                     }
-                                    if !emit_style_snapshot_chunk(&style_buf, palette_styles, &tx) {
+                                    if !style_ok {
                                         break;
                                     }
-                                    for (msh, r1, c1, r2, c2, on) in merges {
+                                    let merge_start = wm_snapshot
+                                        .merges
+                                        .partition_point(|(seq, ..)| *seq <= resume_watermark);
+                                    for &(_, msh, r1, c1, r2, c2, on) in
+                                        &wm_snapshot.merges[merge_start..]
+                                    {
                                         let _ = tx.send(
                                             serde_json::to_string(&Msg::MergeOp {
                                                 site: 0,
@@ -3260,10 +3780,7 @@ fn host_initialized(
                                         );
                                     }
                                     let mut op_refs: Vec<&Op> = Vec::new();
-                                    for (&key, &seq) in &wm_snapshot.op_seqs {
-                                        if seq <= resume_watermark {
-                                            continue;
-                                        }
+                                    let mut push_op = |key: SeqKey| {
                                         if let Some(op) = ops_grid.get(&key) {
                                             op_refs.push(op.as_ref());
                                             if op_refs.len() >= sheetcore::sync::LIVE_OP_BATCH {
@@ -3275,6 +3792,19 @@ fn host_initialized(
                                                 let _ =
                                                     tx.send(serde_json::to_string(&frame).unwrap());
                                                 op_refs.clear();
+                                            }
+                                        }
+                                    };
+                                    if use_seq_log {
+                                        for (seq, key) in wm_snapshot.op_log.since(resume_watermark) {
+                                            if wm_snapshot.op_seqs.get(&key) == Some(&seq) {
+                                                push_op(key);
+                                            }
+                                        }
+                                    } else {
+                                        for (&key, &seq) in wm_snapshot.op_seqs.range(..) {
+                                            if seq > resume_watermark {
+                                                push_op(key);
                                             }
                                         }
                                     }
@@ -3367,9 +3897,7 @@ fn host_initialized(
                                     resume_struct_rev: 0,
                                 })
                                 .unwrap();
-                                for ptx in other_peers {
-                                    let _ = ptx.send(hello.clone());
-                                }
+                                broadcast_line_to(&other_peers, hello);
                             }
                             Msg::SortReply { first_ts, outcome } if can_sort.load(Ordering::Acquire) => {
                                 let _ = ack_tx.send((first_ts,outcome));
@@ -3506,7 +4034,7 @@ fn host_initialized(
                                 }
                                 drop(lt);
                                 if ops.is_empty() { continue; }
-                                update_host_ops(&state, &delta_ops, &formula_keys, &ops);
+                                update_host_ops(&state, &delta_ops, &formula_keys, &host_max_clock, &ops);
                                 let seq = host_watermark.lock().unwrap().record_ops(ops.iter());
                                 let struct_rev = structs.lock().unwrap().len();
                                 queue_room_change(&cmd, &roster, Some(conn_site), RoomChange::Cells(ops.clone()));
@@ -3622,18 +4150,91 @@ fn host_initialized(
                                     op,
                                 });
                             }
-                            style_msg @ (Msg::StyleOp { .. } | Msg::StylePaletteOp { .. }) => {
+                            Msg::StylePaletteOp { site, sheet, ts, palette, items } => {
                                 let Some(conn_site) = hello_site else { break };
-                                let (site, sheet, ts, items) = match style_msg {
-                                    Msg::StyleOp { site, sheet, ts, items } => (site, sheet, ts, items),
-                                    Msg::StylePaletteOp { site, sheet, ts, palette, items } => {
-                                        let Some(decoded) = sheetcore::sync::decode_style_palette(&palette, &items) else {
-                                            continue;
-                                        };
-                                        (site, sheet, ts, decoded)
+                                if site != conn_site {
+                                    continue;
+                                }
+                                let _order = room_order.lock().unwrap();
+                                expire_and_broadcast();
+                                let conflict = {
+                                    let now = now_ms();
+                                    let lt = locks.lock().unwrap();
+                                    if lt.is_empty()
+                                        || (items.len() > lt.len().saturating_mul(4)
+                                            && !lt.iter().any(|((sh, _, _), h)| {
+                                                sh == sheet
+                                                    && h.site != conn_site
+                                                    && now.saturating_sub(h.at_ms) < lt.ttl_ms
+                                            }))
+                                    {
+                                        None
+                                    } else {
+                                        items.iter().find_map(|(r, c, _)| {
+                                            lt.holder_other(sheet, *r, *c, conn_site, now)
+                                                .map(|h| (h.site, h.name.clone(), *r, *c))
+                                        })
                                     }
-                                    _ => unreachable!(),
                                 };
+                                if let Some((holder, holder_name, row, col)) = conflict {
+                                    let axis_snap = host_watermark.lock().unwrap().axis_styles_snapshot();
+                                    let revert_styles: Vec<_> = items
+                                        .iter()
+                                        .map(|(r, c, _)| {
+                                            (
+                                                *r,
+                                                *c,
+                                                latest_cell_style(
+                                                    Some(&host_baseline),
+                                                    Some(&axis_snap),
+                                                    &styles,
+                                                    sheet,
+                                                    *r,
+                                                    *c,
+                                                ),
+                                            )
+                                        })
+                                        .collect();
+                                    let deny = Msg::WriteDeny {
+                                        holder, holder_name, sheet, row, col,
+                                        revert_ops: Vec::new(), revert_styles, revert_merge: None,
+                                    };
+                                    if !send_room_message(deny, MAX_PLAIN_LINE, |line| tx.send(line).is_ok(), || {}) { break; }
+                                    continue;
+                                }
+                                // 直接按调色板写入宿主共享样式并原样透传 `StylePaletteOp`，彻底消除 decode -> re-encode 与逐格哈希！
+                                update_host_palette_styles(&styles, &delta_styles, sheet, &palette, &items);
+                                let seq = host_watermark
+                                    .lock()
+                                    .unwrap()
+                                    .record_style_coords(sheet, items.iter().map(|&(r, c, _)| (r, c)));
+                                let struct_rev = structs.lock().unwrap().len();
+                                let exclude = (!can_sort.load(Ordering::Acquire)).then_some(conn_site);
+                                let ev: Vec<(usize, u32, u32, sheetcore::style::CellStyle)> = items
+                                    .iter()
+                                    .filter_map(|&(r, c, idx)| {
+                                        palette
+                                            .get(idx as usize)
+                                            .map(|st| (sheet, r, c, st.clone()))
+                                    })
+                                    .collect();
+                                let fwd_msg = Msg::StylePaletteOp {
+                                    site: conn_site,
+                                    sheet,
+                                    ts,
+                                    palette,
+                                    items,
+                                };
+                                queue_room_change(&cmd, &roster, exclude, RoomChange::Message(fwd_msg));
+                                emit_room_watermark(&cmd, &roster, seq, struct_rev);
+                                let _ = evt_tx.send(NetEvent::Styles {
+                                    site: conn_site,
+                                    items: ev,
+                                    snapshot: false,
+                                });
+                            }
+                            Msg::StyleOp { site, sheet, ts, items } => {
+                                let Some(conn_site) = hello_site else { break };
                                 if site != conn_site {
                                     continue;
                                 }
@@ -4016,7 +4617,13 @@ fn host_initialized(
                                         seed_override.clone(),
                                         serving_update.clone(),
                                         alive_conn.clone(),
-                                        move |json| peer_tx.send(json).is_ok(),
+                                        move |json| {
+                                            peer_tx
+                                                .send_prepared(sheetcore::wire::prepare_payload(
+                                                    &json, false,
+                                                ))
+                                                .is_ok()
+                                        },
                                     );
                                 } else if let Some(target_tx) =
                                     roster.lock().unwrap().sender_of(to_site)
@@ -4057,17 +4664,10 @@ fn host_initialized(
                                 } else if let Some(target_tx) =
                                     roster.lock().unwrap().sender_of(to_site)
                                 {
-                                    if let Ok(fwd) = serde_json::to_string(&Msg::UpdateSlice {
-                                        from_site: conn_site,
-                                        to_site,
-                                        version,
-                                        offset,
-                                        total,
-                                        data_b64,
-                                        done,
-                                    }) {
-                                        let _ = target_tx.send(fwd);
-                                    }
+                                    // 高熵 Base64 更新分片原样透传且跳过 deflate 压缩
+                                    let _ = target_tx.send_prepared(
+                                        sheetcore::wire::prepare_payload(&line, false),
+                                    );
                                 }
                             }
                             Msg::Bye { site } => {
@@ -4130,6 +4730,8 @@ fn host_initialized(
         host_baseline: Some(host_baseline_for_self),
         formula_keys: Some(formula_keys_for_self),
         host_watermark: Some(host_watermark_for_self),
+        host_max_clock: Some(host_max_clock_for_self),
+        host_wake_addr: Some(host_wake_addr),
         state: Some(state),
         delta_ops: Some(delta_ops_for_self),
         host_base_hash: Some(host_base_hash_for_self),
@@ -4335,6 +4937,7 @@ fn join_session(
     }
     // 仅在调用线程做毫秒级纯文本语法归一化；真正 TCP 连接全部放入后台监督线程执行，绝不卡死 UI！
     let (display_addr, first_port, targets) = parse_join_targets(addr)?;
+    let _ = crate::update::try_cached_local_signed_bundle();
     let sockets = Arc::new(Mutex::new(Vec::new()));
 
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
@@ -4444,6 +5047,12 @@ fn join_session(
                         let mut session = send_sess.lock().unwrap();
                         if let (Some((se, _, _, _)), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
                             let _ = write_line(w, &se.seal(&s));
+                        }
+                    }
+                    Cmd::SendPrepared(_, prepared) => {
+                        let mut session = send_sess.lock().unwrap();
+                        if let (Some((se, _, _, _)), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            let _ = write_line(w, &se.seal_prepared(&prepared));
                         }
                     }
                     Cmd::Stop => break,
@@ -4912,7 +5521,14 @@ fn join_session(
                                     client_seed_override.clone(),
                                     client_serving_update.clone(),
                                     alive.clone(),
-                                    move |json| out_tx.send(Cmd::SendTo(from_site, json)).is_ok(),
+                                    move |json| {
+                                        out_tx
+                                            .send(Cmd::SendPrepared(
+                                                from_site,
+                                                sheetcore::wire::prepare_payload(&json, false),
+                                            ))
+                                            .is_ok()
+                                    },
                                 );
                             }
                         }
@@ -4993,6 +5609,8 @@ fn join_session(
         host_baseline: None,
         formula_keys: None,
         host_watermark: None,
+        host_max_clock: None,
+        host_wake_addr: None,
         state: None,
         delta_ops: None,
         host_base_hash: None,
@@ -6537,6 +7155,57 @@ mod integrity_tests {
             "sort_repairs must preserve live axis italic on (2, 1)"
         );
     }
+
+    #[test]
+    fn watermark_cow_seq_log_deduplicates_and_survives_structural_shift() {
+        let mut wm = HostWatermark::default();
+        let op1 = Op {
+            sheet: 0,
+            row: 2,
+            col: 1,
+            value: ValueWire::Number(1.0),
+            formula: None,
+            ts: 2,
+            site: 1,
+        };
+        let s1 = wm.record_ops([&op1]);
+        let op2 = Op {
+            sheet: 0,
+            row: 5,
+            col: 0,
+            value: ValueWire::Number(2.0),
+            formula: None,
+            ts: 3,
+            site: 1,
+        };
+        let s2 = wm.record_ops([&op2, &op1]);
+        let snap = wm.clone();
+        // Post-clone mutation does not affect snapshot
+        let op3 = Op {
+            sheet: 0,
+            row: 8,
+            col: 0,
+            value: ValueWire::Number(3.0),
+            formula: None,
+            ts: 4,
+            site: 1,
+        };
+        let _s3 = wm.record_ops([&op3]);
+        let since_s1: Vec<_> = snap
+            .op_log
+            .since(s1)
+            .filter(|(seq, k)| snap.op_seqs.get(k) == Some(seq))
+            .map(|(_, k)| k)
+            .collect();
+        assert_eq!(since_s1, vec![(0, 5, 0), (0, 2, 1)]);
+        assert_eq!(snap.seq, s2);
+        // Structural insert shifts op_seqs and advances log_floor_seq
+        let s_struct = wm.shift_structural(0, &Structural::InsertRows { at: 3, n: 2 });
+        assert_eq!(wm.log_floor_seq, s_struct);
+        assert!(wm.op_seqs.get(&(0, 2, 1)).is_some());
+        assert!(wm.op_seqs.get(&(0, 7, 0)).is_some());
+        assert!(wm.op_seqs.get(&(0, 10, 0)).is_some());
+    }
 }
 
 #[cfg(test)]
@@ -6544,8 +7213,11 @@ pub(crate) fn bench_collab_hotpaths(wm_entries: u32, peers: usize) -> (f64, f64,
     let mut wm = HostWatermark::default();
     for i in 0..wm_entries {
         wm.seq += 1;
-        wm.op_seqs.insert((0, i, 0), wm.seq);
-        wm.style_seqs.insert((0, i, 0), wm.seq);
+        let key = (0, i, 0);
+        wm.op_seqs.insert_cow(key, wm.seq);
+        wm.op_log.push(wm.seq, key);
+        wm.style_seqs.insert_cow(key, wm.seq);
+        wm.style_log.push(wm.seq, key);
     }
     let t_wm = std::time::Instant::now();
     let cloned = wm.clone();
@@ -6570,9 +7242,9 @@ pub(crate) fn bench_collab_hotpaths(wm_entries: u32, peers: usize) -> (f64, f64,
 
     let t_seal = std::time::Instant::now();
     let mut total_bytes = 0usize;
+    let prepared = sheetcore::wire::prepare_payload(&payload, true);
     for s in &mut sessions {
-        let line = payload.clone();
-        let frame = s.seal(&line);
+        let frame = s.seal_prepared(&prepared);
         total_bytes += frame.len();
     }
     let seal_ms = t_seal.elapsed().as_secs_f64() * 1000.0;
