@@ -24,7 +24,7 @@ pub const APP_NAME: &str = "CELLAN";
 pub const APP_FULL_NAME: &str = "Concurrent Engine for Local-first, Lock-free Async Networks";
 
 /// 当前版本（全应用唯一版本常量：开始页、关于窗口、检查更新、打包元数据共用）。
-pub const VERSION: &str = "1.76";
+pub const VERSION: &str = "1.77";
 
 /// 内网 HTTP 发版服务默认端口（避开常见开发端口与协作端口 7878 / 单实例端口 48765）
 pub const DEFAULT_UPDATE_PORT: u16 = 48_768;
