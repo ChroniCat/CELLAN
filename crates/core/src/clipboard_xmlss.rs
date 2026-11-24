@@ -254,12 +254,10 @@ fn next_attr<'a>(b: &'a [u8], pos: &mut usize) -> Result<Option<(&'a [u8], &'a [
     let quote = b[i];
     i += 1;
     let vstart = i;
-    while i < b.len() && b[i] != quote {
-        i += 1;
-    }
-    if i >= b.len() {
+    let Some(rel) = crate::xlsx::sheets::stream::simd_memchr(quote, &b[vstart..]) else {
         return Err(FastTableErr::Fallback);
-    }
+    };
+    i = vstart + rel;
     let val = &b[vstart..i];
     *pos = i + 1;
     Ok(Some((key, val)))
@@ -326,13 +324,10 @@ fn parse_sparse_table_fast(
 
     while i < len {
         // 跳到下一个 `<`
-        while i < len && b[i] != b'<' {
-            i += 1;
-        }
-        if i >= len {
+        let Some(lt_rel) = crate::xlsx::sheets::stream::simd_memchr(b'<', &b[i..]) else {
             return Err(FastTableErr::Fallback);
-        }
-        i += 1; // 跳过 `<`
+        };
+        i += lt_rel + 1; // 跳过 `<`
         if i >= len {
             return Err(FastTableErr::Fallback);
         }
@@ -528,72 +523,47 @@ fn parse_sparse_table_fast(
                 let mut had_data = false;
 
                 if !self_closing {
-                    // 读取 `<Cell>` 内部直至 `</Cell>`
-                    loop {
-                        while i < len && b[i] != b'<' {
-                            i += 1;
-                        }
-                        if i + 1 >= len {
-                            return Err(FastTableErr::Fallback);
-                        }
-                        i += 1;
-                        if b[i] == b'!' || b[i] == b'?' {
-                            return Err(FastTableErr::Fallback);
-                        }
-                        if b[i] == b'/' {
-                            i += 1;
-                            let cs = i;
-                            while i < len && !matches!(b[i], b'>' | b' ' | b'\t' | b'\r' | b'\n') {
-                                i += 1;
-                            }
-                            let cl = local_bytes(&b[cs..i]);
-                            i = skip_ws(b, i);
-                            if i >= len || b[i] != b'>' || cl != b"Cell" {
-                                return Err(FastTableErr::Fallback);
-                            }
-                            i += 1;
-                            break;
-                        }
-                        let cs = i;
-                        while i < len && !is_name_end(b[i]) {
-                            i += 1;
-                        }
-                        let child = local_bytes(&b[cs..i]);
-                        if child == b"Data" {
-                            let mut dtype = Kind::Number;
-                            while let Some((k, v)) = next_attr(b, &mut i)? {
-                                if k == b"Type" {
-                                    dtype = decode_kind_bytes(v);
-                                }
-                            }
-                            let data_empty = finish_tag_head(b, &mut i)?;
-                            if !data_empty {
-                                // 直接扫描到 `</Data>`；若含子标签或 CDATA/注释则回退 quick-xml
-                                let tstart = i;
-                                let mut has_amp = false;
-                                while i < len && b[i] != b'<' {
-                                    if b[i] == b'&' {
+                    // 超热快路径：直接匹配标准单子元素 `<Data ss:Type="...">...</Data></Cell>`
+                    let d_pos = skip_ws(b, i);
+                    let fast_matched = if b[d_pos..].starts_with(b"<Data ss:Type=\"") {
+                        let type_start = d_pos + 15;
+                        let fast_type = if b[type_start..].starts_with(b"Number\">") {
+                            Some((Kind::Number, type_start + 8))
+                        } else if b[type_start..].starts_with(b"String\">") {
+                            Some((Kind::Text, type_start + 8))
+                        } else if b[type_start..].starts_with(b"Boolean\">") {
+                            Some((Kind::Bool, type_start + 9))
+                        } else if b[type_start..].starts_with(b"DateTime\">") {
+                            Some((Kind::DateTime, type_start + 10))
+                        } else if b[type_start..].starts_with(b"Error\">") {
+                            Some((Kind::Error, type_start + 7))
+                        } else {
+                            None
+                        };
+                        if let Some((dtype, tstart)) = fast_type {
+                            let mut scan = tstart;
+                            let mut has_amp = false;
+                            let val_end = loop {
+                                match crate::xlsx::sheets::stream::simd_memchr2(
+                                    b'<',
+                                    b'&',
+                                    &b[scan..],
+                                ) {
+                                    Some(rel) => {
+                                        let hit = scan + rel;
+                                        if b[hit] == b'<' {
+                                            break Some(hit);
+                                        }
                                         has_amp = true;
+                                        scan = hit + 1;
                                     }
-                                    i += 1;
+                                    None => break None,
                                 }
-                                if i + 2 >= len || b[i + 1] != b'/' {
-                                    return Err(FastTableErr::Fallback);
-                                }
-                                let raw_str = &xml[tstart..i];
-                                i += 2; // 跳过 `</`
-                                let es = i;
-                                while i < len && !matches!(b[i], b'>' | b' ' | b'\t' | b'\r' | b'\n') {
-                                    i += 1;
-                                }
-                                if local_bytes(&b[es..i]) != b"Data" {
-                                    return Err(FastTableErr::Fallback);
-                                }
-                                i = skip_ws(b, i);
-                                if i >= len || b[i] != b'>' {
-                                    return Err(FastTableErr::Fallback);
-                                }
-                                i += 1;
+                            };
+                            if let Some(vend) = val_end
+                                && b[vend..].starts_with(b"</Data></Cell>")
+                            {
+                                let raw_str = &xml[tstart..vend];
                                 text = if has_amp {
                                     match quick_xml::escape::unescape(raw_str) {
                                         Ok(c) => c.into_owned(),
@@ -604,10 +574,115 @@ fn parse_sparse_table_fast(
                                 };
                                 kind = dtype;
                                 had_data = true;
+                                i = vend + 14;
+                                true
+                            } else {
+                                false
                             }
                         } else {
-                            // 如 `<Comment>` / `<NamedCell>` 等子标签：回退 quick-xml
-                            return Err(FastTableErr::Fallback);
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !fast_matched {
+                        // 读取 `<Cell>` 内部直至 `</Cell>`
+                        loop {
+                            let Some(lt_rel) =
+                                crate::xlsx::sheets::stream::simd_memchr(b'<', &b[i..])
+                            else {
+                                return Err(FastTableErr::Fallback);
+                            };
+                            i += lt_rel;
+                            if i + 1 >= len {
+                                return Err(FastTableErr::Fallback);
+                            }
+                            i += 1;
+                            if b[i] == b'!' || b[i] == b'?' {
+                                return Err(FastTableErr::Fallback);
+                            }
+                            if b[i] == b'/' {
+                                i += 1;
+                                let cs = i;
+                                while i < len && !matches!(b[i], b'>' | b' ' | b'\t' | b'\r' | b'\n') {
+                                    i += 1;
+                                }
+                                let cl = local_bytes(&b[cs..i]);
+                                i = skip_ws(b, i);
+                                if i >= len || b[i] != b'>' || cl != b"Cell" {
+                                    return Err(FastTableErr::Fallback);
+                                }
+                                i += 1;
+                                break;
+                            }
+                            let cs = i;
+                            while i < len && !is_name_end(b[i]) {
+                                i += 1;
+                            }
+                            let child = local_bytes(&b[cs..i]);
+                            if child == b"Data" {
+                                let mut dtype = Kind::Number;
+                                while let Some((k, v)) = next_attr(b, &mut i)? {
+                                    if k == b"Type" {
+                                        dtype = decode_kind_bytes(v);
+                                    }
+                                }
+                                let data_empty = finish_tag_head(b, &mut i)?;
+                                if !data_empty {
+                                    // 直接扫描到 `</Data>`；若含子标签或 CDATA/注释则回退 quick-xml
+                                    let tstart = i;
+                                    let mut has_amp = false;
+                                    let vend = loop {
+                                        match crate::xlsx::sheets::stream::simd_memchr2(
+                                            b'<',
+                                            b'&',
+                                            &b[i..],
+                                        ) {
+                                            Some(rel) => {
+                                                let hit = i + rel;
+                                                if b[hit] == b'<' {
+                                                    break hit;
+                                                }
+                                                has_amp = true;
+                                                i = hit + 1;
+                                            }
+                                            None => return Err(FastTableErr::Fallback),
+                                        }
+                                    };
+                                    i = vend;
+                                    if i + 2 >= len || b[i + 1] != b'/' {
+                                        return Err(FastTableErr::Fallback);
+                                    }
+                                    let raw_str = &xml[tstart..i];
+                                    i += 2; // 跳过 `</`
+                                    let es = i;
+                                    while i < len && !matches!(b[i], b'>' | b' ' | b'\t' | b'\r' | b'\n') {
+                                        i += 1;
+                                    }
+                                    if local_bytes(&b[es..i]) != b"Data" {
+                                        return Err(FastTableErr::Fallback);
+                                    }
+                                    i = skip_ws(b, i);
+                                    if i >= len || b[i] != b'>' {
+                                        return Err(FastTableErr::Fallback);
+                                    }
+                                    i += 1;
+                                    text = if has_amp {
+                                        match quick_xml::escape::unescape(raw_str) {
+                                            Ok(c) => c.into_owned(),
+                                            Err(_) => return Err(FastTableErr::Fallback),
+                                        }
+                                    } else {
+                                        raw_str.to_owned()
+                                    };
+                                    kind = dtype;
+                                    had_data = true;
+                                }
+                            } else {
+                                // 如 `<Comment>` / `<NamedCell>` 等子标签：回退 quick-xml
+                                return Err(FastTableErr::Fallback);
+                            }
                         }
                     }
                 }
@@ -1333,6 +1408,792 @@ pub fn parse_sparse(xml: &str) -> Option<SparseBlock> {
     })
 }
 
+/// Zero-copy borrowed sparse cell (`Cow<'a, str>` avoids per-cell `String` heap allocations
+/// when parsing 100k–500k unescaped XMLSS cells).
+#[derive(Clone, Debug, Default)]
+pub struct BorrowedSparseCell<'a> {
+    pub row: u32,
+    pub col: u32,
+    pub text: std::borrow::Cow<'a, str>,
+    pub kind: Kind,
+    pub r1c1_formula: Option<std::borrow::Cow<'a, str>>,
+    pub style_idx: u32,
+    pub has_explicit_style: bool,
+    pub colspan: u32,
+    pub rowspan: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BorrowedSparseBlock<'a> {
+    pub rows: u32,
+    pub cols: u32,
+    pub full_columns: bool,
+    pub date1904: bool,
+    pub styles: Vec<Style>,
+    pub cells: Vec<BorrowedSparseCell<'a>>,
+}
+
+/// Zero-copy fast parser for `<Table>` body into `BorrowedSparseCell<'a>`, skipping `<Styles>`
+/// entirely when `values_only == true`.
+pub fn parse_sparse_borrowed<'a>(xml: &'a str, values_only: bool) -> Option<BorrowedSparseBlock<'a>> {
+    const MAX_R: usize = 1_048_576;
+    const MAX_C: usize = 16_384;
+
+    let mut styles: Vec<Style> = vec![Style::default()];
+    let mut style_lookup: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut col_styles: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+
+    let mut r = Reader::from_str(xml);
+    r.config_mut().trim_text(false);
+    let mut style_id = String::new();
+    let mut cur_style = Style::default();
+    let mut in_style = false;
+    let mut date1904 = false;
+    let mut max_rows = 0usize;
+    let mut max_cols = 0usize;
+    let mut full_columns = false;
+    let mut table_body_start: Option<usize> = None;
+    let mut empty_table = false;
+
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e)) => {
+                let qname = e.name();
+                let n = local_bytes(qname.as_ref().as_bytes());
+                match n {
+                    b"Date1904" => date1904 = true,
+                    b"Style" if !values_only => {
+                        in_style = true;
+                        style_id = attr_cow(&e, b"ID").map(|c| c.into_owned()).unwrap_or_default();
+                        cur_style = Style::default();
+                    }
+                    b"Font" | b"Interior" | b"Border" | b"NumberFormat" | b"Alignment"
+                        if in_style && !values_only =>
+                    {
+                        apply_style_tag(n, &e, &mut cur_style);
+                    }
+                    b"Table" => {
+                        let (er, ec) = index_attr(&e, b"ExpandedRowCount", 0)
+                            .zip(index_attr(&e, b"ExpandedColumnCount", 0))?;
+                        max_rows = max_rows.max(er);
+                        max_cols = max_cols.max(ec);
+                        if max_rows > MAX_R || max_cols > MAX_C {
+                            return None;
+                        }
+                        if attr_cow(&e, b"FullColumns").as_deref() == Some("1") || er == MAX_R {
+                            full_columns = true;
+                        }
+                        table_body_start = Some(r.buffer_position() as usize);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let qname = e.name();
+                let n = local_bytes(qname.as_ref().as_bytes());
+                if in_style && !values_only {
+                    apply_style_tag(n, &e, &mut cur_style);
+                } else if n == b"Date1904" {
+                    date1904 = true;
+                } else if n == b"Table" {
+                    let (er, ec) = index_attr(&e, b"ExpandedRowCount", 0)
+                        .zip(index_attr(&e, b"ExpandedColumnCount", 0))?;
+                    max_rows = max_rows.max(er);
+                    max_cols = max_cols.max(ec);
+                    if max_rows > MAX_R || max_cols > MAX_C || max_rows == 0 || max_cols == 0 {
+                        return None;
+                    }
+                    if attr_cow(&e, b"FullColumns").as_deref() == Some("1") || er == MAX_R {
+                        full_columns = true;
+                    }
+                    empty_table = true;
+                    break;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let qname = e.name();
+                let n = local_bytes(qname.as_ref().as_bytes());
+                if n == b"Style" && !values_only {
+                    in_style = false;
+                    if cur_style == Style::default() {
+                        style_lookup.insert(std::mem::take(&mut style_id), 0);
+                    } else {
+                        let idx = styles.len() as u32;
+                        styles.push(std::mem::take(&mut cur_style));
+                        style_lookup.insert(std::mem::take(&mut style_id), idx);
+                    }
+                }
+            }
+            Ok(Event::Eof) => return None,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+
+    if empty_table {
+        return Some(BorrowedSparseBlock {
+            rows: max_rows as u32,
+            cols: max_cols as u32,
+            full_columns,
+            date1904,
+            styles,
+            cells: Vec::new(),
+        });
+    }
+
+    let start_pos = table_body_start?;
+    let b = xml.as_bytes();
+    let len = b.len();
+    let mut i = start_pos;
+    let mut col_cursor = 0usize;
+    let mut row_cursor = 0usize;
+    let mut in_row = false;
+    let mut row_index = 0usize;
+    let mut row_span = 1usize;
+    let mut row_style_idx: Option<u32> = None;
+    let mut next_col = 0usize;
+    let est = ((len.saturating_sub(start_pos)) / 48).min(crate::undo::MAX_DENSE_RECT_KEYS);
+    let mut cells: Vec<BorrowedSparseCell<'a>> = Vec::with_capacity(est);
+
+    while i < len {
+        let Some(lt_rel) = crate::xlsx::sheets::stream::simd_memchr(b'<', &b[i..]) else {
+            break;
+        };
+        i += lt_rel + 1;
+        if i >= len {
+            break;
+        }
+        let first = b[i];
+        if first == b'!' || first == b'?' {
+            return parse_sparse(xml).map(|owned| BorrowedSparseBlock {
+                rows: owned.rows,
+                cols: owned.cols,
+                full_columns: owned.full_columns,
+                date1904: owned.date1904,
+                styles: owned.styles,
+                cells: owned
+                    .cells
+                    .into_iter()
+                    .map(|c| BorrowedSparseCell {
+                        row: c.row,
+                        col: c.col,
+                        text: std::borrow::Cow::Owned(c.text),
+                        kind: c.kind,
+                        r1c1_formula: c.r1c1_formula.map(std::borrow::Cow::Owned),
+                        style_idx: c.style_idx,
+                        has_explicit_style: c.has_explicit_style,
+                        colspan: c.colspan,
+                        rowspan: c.rowspan,
+                    })
+                    .collect(),
+            });
+        }
+        if first == b'/' {
+            i += 1;
+            let nstart = i;
+            while i < len && !matches!(b[i], b'>' | b' ' | b'\t' | b'\r' | b'\n') {
+                i += 1;
+            }
+            let close_local = local_bytes(&b[nstart..i]);
+            i = skip_ws(b, i);
+            if i >= len || b[i] != b'>' {
+                return None;
+            }
+            i += 1;
+            match close_local {
+                b"Row" => {
+                    if !in_row {
+                        return None;
+                    }
+                    in_row = false;
+                    row_cursor = row_index + row_span;
+                    row_style_idx = None;
+                }
+                b"Table" => {
+                    if in_row || max_rows == 0 || max_cols == 0 {
+                        return None;
+                    }
+                    return Some(BorrowedSparseBlock {
+                        rows: max_rows as u32,
+                        cols: max_cols as u32,
+                        full_columns,
+                        date1904,
+                        styles,
+                        cells,
+                    });
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        let nstart = i;
+        while i < len && !is_name_end(b[i]) {
+            i += 1;
+        }
+        match local_bytes(&b[nstart..i]) {
+            b"Row" => {
+                if in_row {
+                    return None;
+                }
+                if i < len && b[i] == b'>' {
+                    i += 1;
+                    let ri = row_cursor;
+                    max_rows = max_rows.max(ri.checked_add(1)?);
+                    max_cols = max_cols.max(1);
+                    if max_rows > MAX_R || max_cols > MAX_C {
+                        return None;
+                    }
+                    in_row = true;
+                    row_index = ri;
+                    row_span = 1;
+                    row_style_idx = None;
+                    next_col = 0;
+                    continue;
+                }
+                let mut idx_attr = None;
+                let mut span_attr = 0usize;
+                let mut sty_attr = None;
+                while let Ok(Some((k, v))) = next_attr(b, &mut i) {
+                    match k {
+                        b"Index" => idx_attr = Some(parse_ascii_usize(v)?),
+                        b"Span" => span_attr = parse_ascii_usize(v)?,
+                        b"StyleID" if !values_only => {
+                            if let Ok(s) = std::str::from_utf8(v) {
+                                let cow = unescape_cow(std::borrow::Cow::Borrowed(s));
+                                sty_attr = style_lookup.get(cow.as_ref()).copied().filter(|&id| id != 0);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Ok(self_closing) = finish_tag_head(b, &mut i) else {
+                    return None;
+                };
+                let ri = idx_attr.unwrap_or(row_cursor + 1).checked_sub(1)?;
+                let span = span_attr.checked_add(1)?;
+                if ri < row_cursor {
+                    return None;
+                }
+                max_rows = max_rows.max(ri.checked_add(span)?);
+                max_cols = max_cols.max(1);
+                if max_rows > MAX_R || max_cols > MAX_C {
+                    return None;
+                }
+                if self_closing {
+                    row_cursor = ri + span;
+                } else {
+                    in_row = true;
+                    row_index = ri;
+                    row_span = span;
+                    row_style_idx = sty_attr;
+                    next_col = 0;
+                }
+            }
+            b"Cell" => {
+                if !in_row {
+                    return None;
+                }
+                let mut idx_attr = None;
+                let mut across_attr = 0usize;
+                let mut down_attr = 0usize;
+                let mut raw_style: Option<&'a [u8]> = None;
+                let mut raw_formula: Option<&'a [u8]> = None;
+                let self_closing = if i < len && b[i] == b'>' {
+                    i += 1;
+                    false
+                } else {
+                    while let Ok(Some((k, v))) = next_attr(b, &mut i) {
+                        match k {
+                            b"Index" => idx_attr = Some(parse_ascii_usize(v)?),
+                            b"MergeAcross" => across_attr = parse_ascii_usize(v)?,
+                            b"MergeDown" => down_attr = parse_ascii_usize(v)?,
+                            b"StyleID" if !values_only => raw_style = Some(v),
+                            b"Formula" if !values_only => raw_formula = Some(v),
+                            _ => {}
+                        }
+                    }
+                    let Ok(sc) = finish_tag_head(b, &mut i) else {
+                        return None;
+                    };
+                    sc
+                };
+                let col = idx_attr.unwrap_or(next_col + 1).checked_sub(1)?;
+                let across = across_attr.checked_add(1)?;
+                let down = down_attr.checked_add(1)?;
+                if col < next_col {
+                    return None;
+                }
+                max_rows = max_rows.max(row_index.checked_add(down)?);
+                max_cols = max_cols.max(col.checked_add(across)?);
+                if max_rows > MAX_R || max_cols > MAX_C {
+                    return None;
+                }
+                next_col = col + across;
+                let style_idx = if values_only {
+                    0
+                } else {
+                    raw_style
+                        .and_then(|v| std::str::from_utf8(v).ok())
+                        .and_then(|s| {
+                            let cow = unescape_cow(std::borrow::Cow::Borrowed(s));
+                            style_lookup.get(cow.as_ref()).copied()
+                        })
+                        .or(row_style_idx)
+                        .or_else(|| col_styles.get(&(col as u32)).copied())
+                        .unwrap_or(0)
+                };
+                let has_explicit_style = !values_only && (raw_style.is_some() || style_idx != 0);
+                let r1c1_formula = raw_formula
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                    .map(|s| unescape_cow(std::borrow::Cow::Borrowed(s)));
+
+                let mut text: std::borrow::Cow<'a, str> = std::borrow::Cow::Borrowed("");
+                let mut kind = Kind::Number;
+                let mut had_data = false;
+
+                if !self_closing {
+                    let d_pos = skip_ws(b, i);
+                    let fast_type = if b[d_pos..].starts_with(b"<Data ss:Type=\"") {
+                        let ts = d_pos + 15;
+                        if b[ts..].starts_with(b"Number\">") {
+                            Some((Kind::Number, ts + 8))
+                        } else if b[ts..].starts_with(b"String\">") {
+                            Some((Kind::Text, ts + 8))
+                        } else if b[ts..].starts_with(b"Boolean\">") {
+                            Some((Kind::Bool, ts + 9))
+                        } else if b[ts..].starts_with(b"DateTime\">") {
+                            Some((Kind::DateTime, ts + 10))
+                        } else if b[ts..].starts_with(b"Error\">") {
+                            Some((Kind::Error, ts + 7))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((dtype, tstart)) = fast_type {
+                        let mut scan = tstart;
+                        let mut has_amp = false;
+                        let val_end = loop {
+                            match crate::xlsx::sheets::stream::simd_memchr2(b'<', b'&', &b[scan..]) {
+                                Some(rel) => {
+                                    let hit = scan + rel;
+                                    if b[hit] == b'<' {
+                                        break Some(hit);
+                                    }
+                                    has_amp = true;
+                                    scan = hit + 1;
+                                }
+                                None => break None,
+                            }
+                        };
+                        let vend = val_end?;
+                        if !b[vend..].starts_with(b"</Data></Cell>") {
+                            return parse_sparse(xml).map(|owned| BorrowedSparseBlock {
+                                rows: owned.rows,
+                                cols: owned.cols,
+                                full_columns: owned.full_columns,
+                                date1904: owned.date1904,
+                                styles: owned.styles,
+                                cells: owned
+                                    .cells
+                                    .into_iter()
+                                    .map(|c| BorrowedSparseCell {
+                                        row: c.row,
+                                        col: c.col,
+                                        text: std::borrow::Cow::Owned(c.text),
+                                        kind: c.kind,
+                                        r1c1_formula: c.r1c1_formula.map(std::borrow::Cow::Owned),
+                                        style_idx: c.style_idx,
+                                        has_explicit_style: c.has_explicit_style,
+                                        colspan: c.colspan,
+                                        rowspan: c.rowspan,
+                                    })
+                                    .collect(),
+                            });
+                        }
+                        let raw_str = &xml[tstart..vend];
+                        text = if has_amp {
+                            std::borrow::Cow::Owned(quick_xml::escape::unescape(raw_str).ok()?.into_owned())
+                        } else {
+                            std::borrow::Cow::Borrowed(raw_str)
+                        };
+                        kind = dtype;
+                        had_data = true;
+                        i = vend + 14;
+                    } else {
+                        return parse_sparse(xml).map(|owned| BorrowedSparseBlock {
+                            rows: owned.rows,
+                            cols: owned.cols,
+                            full_columns: owned.full_columns,
+                            date1904: owned.date1904,
+                            styles: owned.styles,
+                            cells: owned
+                                .cells
+                                .into_iter()
+                                .map(|c| BorrowedSparseCell {
+                                    row: c.row,
+                                    col: c.col,
+                                    text: std::borrow::Cow::Owned(c.text),
+                                    kind: c.kind,
+                                    r1c1_formula: c.r1c1_formula.map(std::borrow::Cow::Owned),
+                                    style_idx: c.style_idx,
+                                    has_explicit_style: c.has_explicit_style,
+                                    colspan: c.colspan,
+                                    rowspan: c.rowspan,
+                                })
+                                .collect(),
+                        });
+                    }
+                }
+
+                let meaningful = had_data
+                    || !text.is_empty()
+                    || r1c1_formula.is_some()
+                    || has_explicit_style
+                    || (!values_only && (across > 1 || down > 1));
+                if meaningful {
+                    if cells.len() >= crate::undo::MAX_DENSE_RECT_KEYS {
+                        return None;
+                    }
+                    cells.push(BorrowedSparseCell {
+                        row: row_index as u32,
+                        col: col as u32,
+                        text,
+                        kind,
+                        r1c1_formula,
+                        style_idx,
+                        has_explicit_style,
+                        colspan: if values_only { 1 } else { across as u32 },
+                        rowspan: if values_only { 1 } else { down as u32 },
+                    });
+                }
+            }
+            b"Column" => {
+                if in_row {
+                    return None;
+                }
+                let mut idx_attr = None;
+                let mut span_attr = 0usize;
+                let mut raw_style: Option<&'a [u8]> = None;
+                while let Ok(Some((k, v))) = next_attr(b, &mut i) {
+                    match k {
+                        b"Index" => idx_attr = Some(parse_ascii_usize(v)?),
+                        b"Span" => span_attr = parse_ascii_usize(v)?,
+                        b"StyleID" if !values_only => raw_style = Some(v),
+                        _ => {}
+                    }
+                }
+                let Ok(self_closing) = finish_tag_head(b, &mut i) else {
+                    return None;
+                };
+                if !self_closing {
+                    let lt_rel = crate::xlsx::sheets::stream::simd_memchr(b'<', &b[i..])?;
+                    i += lt_rel;
+                    if !b[i..].starts_with(b"</") {
+                        return None;
+                    }
+                    i += 2;
+                    let cs = i;
+                    while i < len && !matches!(b[i], b'>' | b' ' | b'\t' | b'\r' | b'\n') {
+                        i += 1;
+                    }
+                    if local_bytes(&b[cs..i]) != b"Column" {
+                        return None;
+                    }
+                    i = skip_ws(b, i);
+                    if i >= len || b[i] != b'>' {
+                        return None;
+                    }
+                    i += 1;
+                }
+                let c_idx = idx_attr.unwrap_or(col_cursor + 1).checked_sub(1)?;
+                let c_span = span_attr.checked_add(1)?;
+                if c_idx < col_cursor {
+                    return None;
+                }
+                max_cols = max_cols.max(c_idx.checked_add(c_span)?);
+                if max_cols > MAX_C {
+                    return None;
+                }
+                if !values_only
+                    && let Some(sid) = raw_style
+                        .and_then(|v| std::str::from_utf8(v).ok())
+                        .and_then(|s| {
+                            let cow = unescape_cow(std::borrow::Cow::Borrowed(s));
+                            style_lookup.get(cow.as_ref()).copied()
+                        })
+                    && sid != 0
+                {
+                    for cc in c_idx..(c_idx + c_span) {
+                        col_styles.insert(cc as u32, sid);
+                    }
+                }
+                col_cursor = c_idx + c_span;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Parse XMLSS into an owned `SparseBlock`, skipping `<Styles>`, `StyleID`, `Formula`,
+/// and merge attributes when `values_only == true` (e.g. `Ctrl+Shift+V` paste-values).
+pub fn parse_sparse_ext(xml: &str, values_only: bool) -> Option<SparseBlock> {
+    if !values_only {
+        return parse_sparse(xml);
+    }
+    let borrowed = parse_sparse_borrowed(xml, true)?;
+    Some(SparseBlock {
+        rows: borrowed.rows,
+        cols: borrowed.cols,
+        full_columns: borrowed.full_columns,
+        date1904: borrowed.date1904,
+        styles: borrowed.styles,
+        cells: borrowed
+            .cells
+            .into_iter()
+            .map(|c| SparseCell {
+                row: c.row,
+                col: c.col,
+                text: c.text.into_owned(),
+                kind: c.kind,
+                r1c1_formula: None,
+                style_idx: 0,
+                has_explicit_style: false,
+                colspan: 1,
+                rowspan: 1,
+            })
+            .collect(),
+    })
+}
+
+/// Apply a pre-parsed `BorrowedSparseBlock` onto `(wb, sheet_idx)` anchored at `(r0, c0)`
+/// using `fast_parse_f64_bytes`, `StringPool` interning, `(base_id, style_idx)` style cache,
+/// and column-ordered `(col, row)` `Sheet::set` writes so `ColSlab` appends stay cache-local.
+pub fn apply_borrowed_sparse_to_sheet<'a>(
+    block: &BorrowedSparseBlock<'a>,
+    wb: &mut crate::model::Workbook,
+    sheet_idx: usize,
+    anchor: (u32, u32),
+    values_only: bool,
+) -> Option<(u32, u32)> {
+    let (r0, c0) = anchor;
+    if r0.checked_add(block.rows)? > crate::sync::MAX_ROWS
+        || c0.checked_add(block.cols)? > crate::sync::MAX_COLS
+    {
+        return None;
+    }
+    let date_sys = wb.date_system;
+    let mut default_date_sid: Option<u16> = None;
+    let mut style_cache: std::collections::HashMap<(u16, u32), Option<u16>> =
+        std::collections::HashMap::new();
+
+    // Sort indices by `(col, row)` so writes hit contiguous 256-row column slabs in cache order.
+    let mut order: Vec<usize> = (0..block.cells.len()).collect();
+    order.sort_unstable_by_key(|&idx| {
+        let c = &block.cells[idx];
+        (c.col, c.row)
+    });
+
+    let mut str_pool: std::collections::HashMap<&'a str, std::sync::Arc<str>> =
+        std::collections::HashMap::new();
+    let mut owned_pool: std::collections::HashMap<String, std::sync::Arc<str>> =
+        std::collections::HashMap::new();
+    let mut intern_cow = |cow: &std::borrow::Cow<'a, str>| -> std::sync::Arc<str> {
+        match cow {
+            std::borrow::Cow::Borrowed(s) => str_pool
+                .entry(s)
+                .or_insert_with(|| std::sync::Arc::<str>::from(*s))
+                .clone(),
+            std::borrow::Cow::Owned(s) => {
+                if let Some(found) = owned_pool.get(s.as_str()) {
+                    found.clone()
+                } else {
+                    let arc = std::sync::Arc::<str>::from(s.as_str());
+                    owned_pool.insert(s.clone(), arc.clone());
+                    arc
+                }
+            }
+        }
+    };
+
+    for idx in order {
+        let c = &block.cells[idx];
+        let tr = r0 + c.row;
+        let tc = c0 + c.col;
+        let formula = if values_only {
+            None
+        } else {
+            c.r1c1_formula
+                .as_deref()
+                .map(|f| std::sync::Arc::<str>::from(r1c1_to_a1(f, tr, tc)))
+        };
+        let mut needs_iso_date_fmt = false;
+        let val = match c.kind {
+            Kind::Number => {
+                let raw_bytes = c.text.as_bytes();
+                let parsed = crate::xlsx::sheets::stream::fast_parse_f64_bytes(raw_bytes).or_else(
+                    || {
+                        raw_bytes
+                            .contains(&b',')
+                            .then(|| c.text.replace(',', "").trim().parse::<f64>().ok())
+                            .flatten()
+                    },
+                );
+                match parsed {
+                    Some(n) => crate::model::Value::Number(n),
+                    None if c.text.trim().is_empty() => crate::model::Value::Empty,
+                    None if formula.is_some() => crate::model::Value::Empty,
+                    None => crate::model::Value::Text(intern_cow(&c.text)),
+                }
+            }
+            Kind::Text => {
+                if c.text.is_empty() {
+                    crate::model::Value::Empty
+                } else {
+                    crate::model::Value::Text(intern_cow(&c.text))
+                }
+            }
+            Kind::Bool => {
+                let t = c.text.trim();
+                if t.is_empty() && formula.is_none() {
+                    crate::model::Value::Empty
+                } else {
+                    crate::model::Value::Bool(t == "1" || t.eq_ignore_ascii_case("true"))
+                }
+            }
+            Kind::DateTime => {
+                let t = c.text.trim();
+                if t.is_empty() && formula.is_none() {
+                    crate::model::Value::Empty
+                } else {
+                    match iso_to_serial(date_sys, t) {
+                        Some((serial, _)) => {
+                            if !values_only && formula.is_none() {
+                                let has_fmt = block
+                                    .styles
+                                    .get(c.style_idx as usize)
+                                    .is_some_and(|st| !st.num_format.trim().is_empty());
+                                if !has_fmt {
+                                    needs_iso_date_fmt = true;
+                                }
+                            }
+                            crate::model::Value::Number(serial)
+                        }
+                        None => crate::model::Value::Text(intern_cow(&c.text)),
+                    }
+                }
+            }
+            Kind::Error => {
+                let t = c.text.trim();
+                if t.is_empty() && formula.is_none() {
+                    crate::model::Value::Empty
+                } else {
+                    match crate::formula::ErrKind::from_text(t) {
+                        Some(ek) => crate::model::Value::Error(ek),
+                        None => crate::model::Value::Text(intern_cow(&c.text)),
+                    }
+                }
+            }
+        };
+        if !matches!(val, crate::model::Value::Empty) || formula.is_some() {
+            wb.sheet_mut(sheet_idx)
+                .set(tr, tc, crate::model::Cell { value: val, formula });
+        }
+        if !values_only {
+            if needs_iso_date_fmt {
+                let sid = *default_date_sid.get_or_insert_with(|| {
+                    wb.styles.intern(crate::style::CellStyle {
+                        format: "yyyy-mm-dd".into(),
+                        ..Default::default()
+                    })
+                });
+                wb.sheet_mut(sheet_idx).set_style(tr, tc, sid);
+            }
+            if c.style_idx != 0 {
+                let base_id = wb.sheet(sheet_idx).style_of(tr, tc);
+                let resolved = *style_cache
+                    .entry((base_id, c.style_idx))
+                    .or_insert_with(|| {
+                        let st = block.styles.get(c.style_idx as usize)?;
+                        let mut cs = wb.styles.get(base_id).clone();
+                        let mut changed = false;
+                        if st.bold != cs.bold {
+                            cs.bold = st.bold;
+                            changed = true;
+                        }
+                        if st.italic != cs.italic {
+                            cs.italic = st.italic;
+                            changed = true;
+                        }
+                        if let Some(fill) = st.fill {
+                            cs.fill = Some(fill);
+                            changed = true;
+                        }
+                        if let Some(color) = st.color {
+                            cs.color = color;
+                            changed = true;
+                        }
+                        if st.halign != 0 && st.halign != cs.halign {
+                            cs.halign = st.halign;
+                            changed = true;
+                        }
+                        if let Some(bc) = st.border {
+                            for side in cs.border.iter_mut() {
+                                if side.style == 0 {
+                                    side.style = 1;
+                                    side.color = bc;
+                                }
+                            }
+                            changed = true;
+                        }
+                        if !st.font.is_empty() {
+                            let f = crate::style::normalize_font(&st.font);
+                            if f != cs.font {
+                                cs.font = f;
+                                changed = true;
+                            }
+                        }
+                        if st.size > 0.0 && (st.size - cs.size).abs() > 0.01 {
+                            cs.size = st.size;
+                            changed = true;
+                        }
+                        if !st.num_format.is_empty() && st.num_format != cs.format {
+                            cs.format = st.num_format.clone();
+                            changed = true;
+                        }
+                        changed.then(|| wb.styles.intern(cs))
+                    });
+                if let Some(sid) = resolved {
+                    wb.sheet_mut(sheet_idx).set_style(tr, tc, sid);
+                }
+            }
+            if c.colspan > 1 || c.rowspan > 1 {
+                wb.sheet_mut(sheet_idx)
+                    .merges
+                    .push((tr, tc, tr + c.rowspan - 1, tc + c.colspan - 1));
+            }
+        }
+    }
+    Some((block.rows, block.cols))
+}
+
+/// Apply an XMLSS payload directly onto `(wb, sheet_idx)` anchored at `(r0, c0)` using
+/// zero-copy `parse_sparse_borrowed`, `fast_parse_f64_bytes`, `StringPool` interning,
+/// and column-ordered `Sheet::set` writes so `ColSlab` appends stay cache-local.
+pub fn apply_sparse_xmlss_to_sheet(
+    xml: &str,
+    wb: &mut crate::model::Workbook,
+    sheet_idx: usize,
+    anchor: (u32, u32),
+    values_only: bool,
+) -> Option<(u32, u32)> {
+    let block = parse_sparse_borrowed(xml, values_only)?;
+    apply_borrowed_sparse_to_sheet(&block, wb, sheet_idx, anchor, values_only)
+}
+
 fn hex_rgb(s: &str) -> Option<[u8; 3]> {
     let s = s.trim().trim_start_matches('#');
     if s.len() != 6 {
@@ -1755,5 +2616,59 @@ mod tests {
         ] {
             assert!(parse_sparse(bad).is_none(), "should reject {bad}");
         }
+    }
+
+    #[test]
+    fn borrowed_sparse_values_only_and_column_grouped_apply() {
+        let xml = r##"<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+ <Styles>
+  <Style ss:ID="Default" ss:Name="Normal"/>
+  <Style ss:ID="s1"><Font ss:Bold="1"/><Interior ss:Color="#00FF00" ss:Pattern="Solid"/></Style>
+ </Styles>
+ <Worksheet ss:Name="Sheet1">
+  <Table ss:ExpandedColumnCount="2" ss:ExpandedRowCount="2">
+   <Row>
+    <Cell ss:StyleID="s1" ss:MergeAcross="1"><Data ss:Type="String">标题</Data></Cell>
+   </Row>
+   <Row>
+    <Cell ss:StyleID="s1"><Data ss:Type="Number">12.5</Data></Cell>
+    <Cell ss:StyleID="s1" ss:Formula="=RC[-1]*2"><Data ss:Type="Number">25</Data></Cell>
+   </Row>
+  </Table>
+ </Worksheet>
+</Workbook>"##;
+
+        let borrowed = parse_sparse_borrowed(xml, false).unwrap();
+        assert!(matches!(borrowed.cells[0].text, std::borrow::Cow::Borrowed("标题")));
+        assert!(matches!(borrowed.cells[1].text, std::borrow::Cow::Borrowed("12.5")));
+
+        // Full apply (formulas + styles + merges + default font/size preservation)
+        let mut wb_full = crate::model::Workbook::new_blank();
+        assert_eq!(apply_sparse_xmlss_to_sheet(xml, &mut wb_full, 0, (2, 3), false), Some((2, 2)));
+        assert_eq!(wb_full.sheets[0].value(2, 3), crate::model::Value::Text("标题".into()));
+        assert_eq!(wb_full.sheets[0].merges, vec![(2, 3, 2, 4)]);
+        let s33 = wb_full.styles.get(wb_full.sheets[0].style_of(3, 3));
+        assert!(s33.bold);
+        assert!((s33.size - 11.0).abs() < 0.01, "must keep default 11pt font size, got {}", s33.size);
+        assert_eq!(s33.fill, Some([0, 255, 0]));
+        assert_eq!(
+            wb_full.sheets[0].get(3, 4).unwrap().formula.as_deref(),
+            Some("=D4*2")
+        );
+
+        // Values-only apply & parse_sparse_ext (skips styles, formulas, and merges)
+        let sparse_vo = parse_sparse_ext(xml, true).unwrap();
+        assert_eq!(sparse_vo.styles.len(), 1);
+        assert!(sparse_vo.cells.iter().all(|c| c.r1c1_formula.is_none() && c.style_idx == 0));
+
+        let mut wb_val = crate::model::Workbook::new_blank();
+        assert_eq!(apply_sparse_xmlss_to_sheet(xml, &mut wb_val, 0, (2, 3), true), Some((2, 2)));
+        assert_eq!(wb_val.sheets[0].value(3, 3), crate::model::Value::Number(12.5));
+        assert_eq!(wb_val.sheets[0].value(3, 4), crate::model::Value::Number(25.0));
+        assert!(wb_val.sheets[0].get(3, 4).unwrap().formula.is_none());
+        assert_eq!(wb_val.sheets[0].style_of(3, 3), 0);
+        assert!(wb_val.sheets[0].merges.is_empty());
     }
 }

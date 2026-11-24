@@ -1,7 +1,7 @@
 //! XLSX workers share one decoded string table and lock-free style lookup.
 //! Large worksheet entries stream via byte-sliced row chunks into persistent workers.
 #[path = "xlsx_read_stream.rs"]
-mod stream;
+pub(crate) mod stream;
 use super::LoadDiag;
 use crate::model::{Cell, CellRef, Sheet, Value};
 use crate::richtext::RichRun;
@@ -14,7 +14,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fs::File,
-    io::Read,
+    io::{Cursor, Read, Seek},
     path::Path,
     sync::{
         Arc, Mutex, RwLock,
@@ -28,40 +28,158 @@ fn shared_text_value(s: &Arc<str>) -> Value {
     Value::Text(Arc::clone(s))
 }
 
-/// Fast-path parser for `<= 15`-digit ASCII integers (exact in IEEE-754 `f64`),
-/// falling back to `core::num::dec2flt` (`str::parse::<f64>()`) for decimals/exponents.
+/// Fast-path parser for `<= 15`-sig-digit ASCII numbers/decimals (exact Clinger IEEE-754 `f64`),
+/// falling back to `core::num::dec2flt` (`str::parse::<f64>()`) for >15 digits or exponents.
 #[inline]
 pub(super) fn fast_parse_f64(s: &str) -> Result<f64, std::num::ParseFloatError> {
-    let bytes = s.as_bytes();
-    if !bytes.is_empty() && bytes.len() <= 16 {
-        let (neg, digits) = match bytes[0] {
-            b'-' => (true, &bytes[1..]),
-            b'+' => (false, &bytes[1..]),
-            _ => (false, bytes),
-        };
-        if !digits.is_empty() && digits.len() <= 15 {
-            let mut acc = 0u64;
-            let mut all_digits = true;
-            for &b in digits {
-                let d = b.wrapping_sub(b'0');
-                if d <= 9 {
-                    acc = acc * 10 + u64::from(d);
-                } else {
-                    all_digits = false;
-                    break;
-                }
-            }
-            if all_digits {
-                return Ok(if neg { -(acc as f64) } else { acc as f64 });
-            }
-        }
+    if let Some(v) = stream::fast_parse_f64_bytes(s.as_bytes()) {
+        return Ok(v);
     }
     s.parse::<f64>()
 }
 
-fn signature(zip: &mut zip::ZipArchive<File>, part: &str) -> Option<(u32, u64)> {
+fn signature<R: Read + Seek>(zip: &mut zip::ZipArchive<R>, part: &str) -> Option<(u32, u64)> {
     let e = zip.by_index_raw(zip.index_for_name(part)?).ok()?;
     Some((e.crc32(), e.size()))
+}
+
+#[cfg(windows)]
+mod mmap_win {
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    type Handle = *mut core::ffi::c_void;
+    const PAGE_READONLY: u32 = 0x02;
+    const FILE_MAP_READ: u32 = 0x04;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileMappingW(
+            h_file: Handle,
+            attrs: *const core::ffi::c_void,
+            protect: u32,
+            max_high: u32,
+            max_low: u32,
+            name: *const u16,
+        ) -> Handle;
+        fn MapViewOfFile(
+            mapping: Handle,
+            access: u32,
+            off_high: u32,
+            off_low: u32,
+            bytes: usize,
+        ) -> *const u8;
+        fn UnmapViewOfFile(base: *const core::ffi::c_void) -> i32;
+        fn CloseHandle(obj: Handle) -> i32;
+    }
+
+    pub(in crate::xlsx) struct MappedFile {
+        ptr: ptr::NonNull<u8>,
+        len: usize,
+        _file: File,
+    }
+
+    unsafe impl Send for MappedFile {}
+    unsafe impl Sync for MappedFile {}
+
+    impl MappedFile {
+        pub(super) fn try_map(file: File, len: usize) -> Option<Self> {
+            if len == 0 {
+                return None;
+            }
+            unsafe {
+                let mapping = CreateFileMappingW(
+                    file.as_raw_handle() as Handle,
+                    ptr::null(),
+                    PAGE_READONLY,
+                    0,
+                    0,
+                    ptr::null(),
+                );
+                if mapping.is_null() {
+                    return None;
+                }
+                let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, len);
+                let _ = CloseHandle(mapping);
+                let ptr = ptr::NonNull::new(view as *mut u8)?;
+                Some(Self {
+                    ptr,
+                    len,
+                    _file: file,
+                })
+            }
+        }
+
+        #[inline]
+        pub(super) fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        }
+    }
+
+    impl Drop for MappedFile {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = UnmapViewOfFile(self.ptr.as_ptr() as *const core::ffi::c_void);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(super) enum ArchiveBytes<'a> {
+    #[cfg(windows)]
+    Mapped(mmap_win::MappedFile),
+    Owned(Vec<u8>),
+    Borrowed(&'a [u8]),
+}
+
+impl<'a> ArchiveBytes<'a> {
+    pub(super) fn open(path: &Path) -> Result<ArchiveBytes<'static>> {
+        let file = File::open(path)?;
+        #[cfg(windows)]
+        {
+            if let Ok(meta) = file.metadata() {
+                if let Ok(len) = usize::try_from(meta.len()) {
+                    if len > 0 {
+                        if let Some(mapped) = mmap_win::MappedFile::try_map(file, len) {
+                            return Ok(ArchiveBytes::Mapped(mapped));
+                        }
+                    } else {
+                        return Ok(ArchiveBytes::Owned(Vec::new()));
+                    }
+                }
+            }
+        }
+        let _ = file;
+        Ok(ArchiveBytes::Owned(std::fs::read(path)?))
+    }
+
+    #[inline]
+    pub(super) fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(windows)]
+            Self::Mapped(m) => m.as_slice(),
+            Self::Owned(v) => v.as_slice(),
+            Self::Borrowed(b) => b,
+        }
+    }
+}
+
+pub(super) fn open_bytes_stamped<'a>(
+    bytes: &'a [u8],
+    compute_stamp: bool,
+) -> Result<(zip::ZipArchive<Cursor<&'a [u8]>>, Option<[u8; 32]>)> {
+    use sha2::{Digest, Sha256};
+    let zip = zip::ZipArchive::new(Cursor::new(bytes))?;
+    let stamp = if compute_stamp {
+        let start = usize::try_from(zip.central_directory_start()).unwrap_or(bytes.len());
+        let slice = bytes.get(start..).unwrap_or(&[]);
+        Some(Sha256::digest(slice).into())
+    } else {
+        None
+    };
+    Ok((zip, stamp))
 }
 
 /// The central directory includes each part name, size, CRC and offset. Comparing
@@ -72,22 +190,9 @@ pub(super) fn package_stamp(path: &Path) -> Result<[u8; 32]> {
     hash_directory(&mut zip.into_inner(), offset)
 }
 
-pub(super) fn open_stamped(path: &Path) -> Result<(zip::ZipArchive<File>, [u8; 32])> {
-    use std::io::{Seek, SeekFrom};
-    let file = File::open(path)?;
-    let mut cursor = file.try_clone()?;
-    let zip = zip::ZipArchive::new(file)?;
-    // Duplicated file handles share the seek position. Restore it before handing
-    // the archive to the normal readers, and retain the same physical file.
-    let position = cursor.stream_position()?;
-    let stamp = hash_directory(&mut cursor, zip.central_directory_start())?;
-    cursor.seek(SeekFrom::Start(position))?;
-    Ok((zip, stamp))
-}
-
 fn hash_directory(file: &mut File, offset: u64) -> Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::SeekFrom;
     file.seek(SeekFrom::Start(offset))?;
     let mut hash = Sha256::new();
     let mut buf = [0u8; 16384];
@@ -1161,7 +1266,9 @@ impl ParsedStylesBook {
     }
 }
 
-pub(super) fn parse_styles_from_zip(zip: &mut zip::ZipArchive<File>) -> Result<ParsedStylesBook> {
+pub(super) fn parse_styles_from_zip<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<ParsedStylesBook> {
     let theme_xml = if let Some(idx) = zip.index_for_name("xl/theme/theme1.xml") {
         let mut s = String::new();
         zip.by_index(idx).ok().and_then(|mut f| f.read_to_string(&mut s).ok().map(|_| s))
@@ -1197,8 +1304,10 @@ pub(super) struct WorkbookMetadata {
     pub header: Option<Header>,
 }
 
-pub(super) fn workbook_metadata(src: &mut zip::ZipArchive<File>) -> Result<WorkbookMetadata> {
-    let read = |zip: &mut zip::ZipArchive<File>, name: &str| -> Result<Option<Vec<u8>>> {
+pub(super) fn workbook_metadata<R: Read + Seek>(
+    src: &mut zip::ZipArchive<R>,
+) -> Result<WorkbookMetadata> {
+    let read = |zip: &mut zip::ZipArchive<R>, name: &str| -> Result<Option<Vec<u8>>> {
         let Some(index) = zip.index_for_name(name) else { return Ok(None) };
         let mut bytes = Vec::new();
         zip.by_index(index)?.read_to_end(&mut bytes)?;
@@ -1217,11 +1326,76 @@ pub(super) fn workbook_metadata(src: &mut zip::ZipArchive<File>) -> Result<Workb
     Ok(WorkbookMetadata { xml, targets, header })
 }
 
+fn dynamic_indices_generic<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    rels: &[u8],
+) -> Result<std::collections::HashSet<u32>> {
+    const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const XDA: &str = "http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray";
+    const REL: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata";
+    const RELS: &str = "xl/_rels/workbook.xml.rels";
+
+    let mut result = std::collections::HashSet::new();
+    let relationships = roxmltree::Document::parse(std::str::from_utf8(rels)?)?;
+    let Some(target) = relationships
+        .root_element()
+        .children()
+        .find(|r| r.attribute("Type") == Some(REL) && r.attribute("TargetMode") != Some("External"))
+        .and_then(|r| r.attribute("Target"))
+    else {
+        return Ok(result);
+    };
+    let body = super::read_zip_text(zip, &crate::fixups::resolve_target(RELS, target))?;
+    let doc = roxmltree::Document::parse(&body)?;
+    let root = doc.root_element();
+    let child = |n| root.children().find(|e| e.has_tag_name((NS, n)));
+    let (Some(types), Some(cells)) = (child("metadataTypes"), child("cellMetadata")) else {
+        return Ok(result);
+    };
+    let Some(t) = types
+        .children()
+        .filter(|n| n.has_tag_name((NS, "metadataType")))
+        .position(|n| n.attribute("name") == Some("XLDAPR"))
+    else {
+        return Ok(result);
+    };
+    let dynamic: std::collections::HashSet<_> = root
+        .children()
+        .filter(|n| n.has_tag_name((NS, "futureMetadata")) && n.attribute("name") == Some("XLDAPR"))
+        .flat_map(|n| n.children().filter(|n| n.has_tag_name((NS, "bk"))))
+        .enumerate()
+        .filter(|(_, n)| {
+            n.descendants().any(|p| {
+                p.has_tag_name((XDA, "dynamicArrayProperties"))
+                    && matches!(p.attribute("fDynamic"), Some("1" | "true"))
+            })
+        })
+        .map(|(i, _)| i)
+        .collect();
+    for (i, block) in cells
+        .children()
+        .filter(|n| n.has_tag_name((NS, "bk")))
+        .enumerate()
+    {
+        if block.children().any(|r| {
+            r.has_tag_name((NS, "rc"))
+                && r.attribute("t").and_then(|a| a.parse().ok()) == Some(t + 1)
+                && r.attribute("v")
+                    .and_then(|a| a.parse::<usize>().ok())
+                    .is_some_and(|v| dynamic.contains(&v))
+        }) {
+            result.insert(u32::try_from(i + 1)?);
+        }
+    }
+    Ok(result)
+}
+
 /// Direct single-pass OOXML header & style loader: parses `xl/workbook.xml`,
 /// `xl/_rels/workbook.xml.rels`, `xl/theme/*.xml` and `xl/styles.xml` directly from
 /// the opened ZIP archive without constructing a synthetic in-memory ZIP for `calamine`.
-pub(super) fn header(
-    src: &mut zip::ZipArchive<File>,
+pub(super) fn header<R: Read + Seek>(
+    src: &mut zip::ZipArchive<R>,
     targets: &HashMap<String, String>,
     workbook: &str,
     rels_text: Option<&str>,
@@ -1323,7 +1497,7 @@ pub(super) fn header(
     let parsed_styles = parse_styles_from_zip(src)?;
     let dynamic = if rels_str.contains("sheetMetadata") {
         if let Some(raw) = rels_raw {
-            super::dynamic::indices(src, raw)?
+            dynamic_indices_generic(src, raw)?
         } else {
             Default::default()
         }
@@ -1430,12 +1604,17 @@ impl TextPool {
         self.items.len()
     }
 
+    #[cfg(test)]
     fn push(&mut self, text: String) {
         self.items.push(Arc::from(text));
     }
 
-    fn push_str(&mut self, text: &str) {
-        self.items.push(Arc::from(text));
+    fn push_arc(&mut self, arc: Arc<str>) {
+        self.items.push(arc);
+    }
+
+    fn extend_arcs(&mut self, iter: impl IntoIterator<Item = Arc<str>>) {
+        self.items.extend(iter);
     }
 
     fn prepare_shared(&mut self) {}
@@ -1460,7 +1639,7 @@ fn attr<'a>(e: &'a BytesStart<'a>, name: &str) -> Option<Cow<'a, str>> {
 // ST_Xstring uses UTF-16 code-unit escapes; _x005F_x0041_ denotes the
 // literal string "_x0041_". Decode once, including adjacent surrogate pairs.
 fn office_text(s: &str) -> Cow<'_, str> {
-    if !s.contains("_x") {
+    if stream::simd_memchr(b'_', s.as_bytes()).is_none() || !s.contains("_x") {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len());
@@ -1594,8 +1773,10 @@ fn string_item(r: &mut Reader<&[u8]>) -> Result<(String, Vec<RichRun>)> {
     }
 }
 
-pub(super) fn xml_part(zip: &mut zip::ZipArchive<File>, part: &str) -> Result<String> {
-    use std::io::Read;
+pub(super) fn xml_part<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    part: &str,
+) -> Result<String> {
     let mut entry = zip
         .by_name(part)
         .with_context(|| format!("缺少部件 {part}"))?;
@@ -1642,7 +1823,7 @@ pub(super) fn decode_xml_part(bytes: Vec<u8>, part: &str) -> Result<String> {
     Ok(String::from_utf8(bytes).with_context(|| format!("{part}: 工作表 XML 编码无效"))?)
 }
 
-fn strings(zip: &mut zip::ZipArchive<File>) -> Result<Strings> {
+fn strings<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> Result<Strings> {
     let mut table = Strings::default();
     if zip.index_for_name("xl/sharedStrings.xml").is_none() {
         return Ok(table);
@@ -1685,6 +1866,9 @@ pub(super) struct Loaded {
     pub row_layout: RowLayout,
     pub layout: Option<crate::merges::SheetLayout>,
     pub diag: LoadDiag,
+    pub all_rows_clean: bool,
+    pub clean_shell: Option<Arc<str>>,
+    pub sst_arcs: Option<Arc<[Arc<str>]>>,
 }
 
 type MasterSpec = ((u32, u32), (u32, u32, u32, u32), String);
@@ -2203,14 +2387,17 @@ impl Loaded {
             row_layout: RowLayout::default(),
             layout: None,
             diag: Default::default(),
+            all_rows_clean: true,
+            clean_shell: None,
+            sst_arcs: None,
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn worksheets(
-    path: &Path,
-    zip: &mut zip::ZipArchive<File>,
+pub(super) fn worksheets<'a>(
+    path_for_rels: Option<&Path>,
+    zip: &mut zip::ZipArchive<Cursor<&'a [u8]>>,
     header: &Header,
     targets: &HashMap<String, String>,
     style_lookup: &StyleLookup<'_>,
@@ -2247,7 +2434,7 @@ pub(super) fn worksheets(
         .min((128_000_000 / largest_buffered).max(1) as usize)
         .max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let run = |zip: &mut zip::ZipArchive<File>| -> Result<Vec<(usize, Loaded)>> {
+    let run = |zip: &mut zip::ZipArchive<Cursor<&'a [u8]>>| -> Result<Vec<(usize, Loaded)>> {
         let mut sheets = Vec::new();
         loop {
             let index = next.fetch_add(1, Ordering::Relaxed);
@@ -2308,12 +2495,18 @@ pub(super) fn worksheets(
                     loaded.layout = Some(layout);
                     loaded.sheet.page = crate::page::parse_page_setup(&shell);
                     if has_drawing && shell.contains("drawing") {
-                        loaded.sheet.textboxes =
-                            crate::textbox::load_from_sheet(path, part, &shell);
+                        if let Some(p) = path_for_rels {
+                            loaded.sheet.textboxes =
+                                crate::textbox::load_from_sheet(p, part, &shell);
+                        }
                     }
                     if shell.contains("hyperlink") {
-                        loaded.sheet.hyperlinks =
-                            crate::hyperlinks::load_sheet(path, part, &shell).into();
+                        loaded.sheet.hyperlinks = crate::hyperlinks::load_sheet(
+                            path_for_rels.unwrap_or(Path::new("")),
+                            part,
+                            &shell,
+                        )
+                        .into();
                     }
                     if shell.contains("sparkline") {
                         loaded.sheet.sparklines = crate::sparkline::parse_sheet(&shell);
@@ -2332,10 +2525,11 @@ pub(super) fn worksheets(
         }
         Ok(sheets)
     };
-    std::thread::scope(|scope| {
+    let mut out_sheets: Vec<Loaded> = std::thread::scope(|scope| -> Result<Vec<Loaded>> {
         let mut jobs = Vec::new();
         for _ in 1..workers {
-            jobs.push(scope.spawn(|| run(&mut zip::ZipArchive::new(File::open(path)?)?)));
+            let mut worker_zip = zip.clone();
+            jobs.push(scope.spawn(move || run(&mut worker_zip)));
         }
         let mut sheets = run(zip)?;
         for job in jobs {
@@ -2346,7 +2540,19 @@ pub(super) fn worksheets(
         }
         sheets.sort_unstable_by_key(|(i, _)| *i);
         Ok(sheets.into_iter().map(|(_, s)| s).collect())
-    })
+    })?;
+    if out_sheets.iter().any(|s| s.clean_shell.is_some())
+        && shared.rich.is_empty()
+        && !shared.text.items.is_empty()
+    {
+        let sst_arcs: Arc<[Arc<str>]> = Arc::from(shared.text.items);
+        for s in &mut out_sheets {
+            if s.clean_shell.is_some() {
+                s.sst_arcs = Some(Arc::clone(&sst_arcs));
+            }
+        }
+    }
+    Ok(out_sheets)
 }
 
 #[cfg(test)]

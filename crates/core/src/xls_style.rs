@@ -213,13 +213,18 @@ fn parse_global_xf_styles(stream: &[u8]) -> (Vec<u32>, Vec<Option<CellStyle>>) {
         i = next;
     }
     bounds.sort_unstable();
+    let globals_end = bounds
+        .first()
+        .copied()
+        .map(|off| (off as usize).min(stream.len()))
+        .unwrap_or(stream.len());
 
-    // 第二趟读全局记录：FONT / FORMAT / XF
+    // 第二趟只读 Workbook Globals 区段（首个工作表 BOF 之前）的全局记录：FONT / FORMAT / XF
     let mut fonts: Vec<FontRec> = Vec::new();
     let mut formats: HashMap<u16, String> = HashMap::new();
     let mut xfs: Vec<XfRec> = Vec::new();
     let mut i = 0usize;
-    while i + 4 <= stream.len() {
+    while i + 4 <= globals_end {
         let (typ, len) = (u16le(stream, i).unwrap(), u16le(stream, i + 2).unwrap() as usize);
         let body = &stream[(i + 4).min(stream.len())..(i + 4 + len).min(stream.len())];
         match typ {

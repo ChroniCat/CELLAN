@@ -411,19 +411,32 @@ pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
     let mut cf = cfb::CompoundFile::open(std::io::Cursor::new(bytes))
         .map_err(|e| anyhow!("不是有效的 CFB 容器：{e}"))?;
     let mut info = Vec::new();
-    cf.open_stream("EncryptionInfo")
-        .map_err(|e| anyhow!("缺少 EncryptionInfo：{e}"))?
-        .read_to_end(&mut info)?;
-    let (salt_pkg, key, key_bytes) = verify_and_extract_key(&info, password)?;
+    {
+        let mut s = cf
+            .open_stream("EncryptionInfo")
+            .map_err(|e| anyhow!("缺少 EncryptionInfo：{e}"))?;
+        info.reserve(s.len() as usize);
+        s.read_to_end(&mut info)?;
+    }
+    // Overlap reading EncryptedPackage sectors from CFB with the 100k-spin SHA-512 KDF.
+    let (key_res, pkg_res) = std::thread::scope(|s| {
+        let kdf = s.spawn(|| verify_and_extract_key(&info, password));
+        let pkg = (|| -> Result<Vec<u8>> {
+            let mut st = cf
+                .open_stream("EncryptedPackage")
+                .map_err(|e| anyhow!("缺少 EncryptedPackage：{e}"))?;
+            let mut buf = Vec::with_capacity(st.len() as usize);
+            st.read_to_end(&mut buf)?;
+            Ok(buf)
+        })();
+        (kdf.join().expect("kdf thread panicked"), pkg)
+    });
+    let (salt_pkg, key, key_bytes) = key_res?;
     if key_bytes != 32 {
         bail!("AES 密钥/IV 长度不对");
     }
     let cipher = aes::Aes256::new_from_slice(&key[..32]).map_err(|e| anyhow!("AES key: {e}"))?;
-
-    let mut pkg = Vec::new();
-    cf.open_stream("EncryptedPackage")
-        .map_err(|e| anyhow!("缺少 EncryptedPackage：{e}"))?
-        .read_to_end(&mut pkg)?;
+    let pkg = pkg_res?;
     if pkg.len() < 8 {
         bail!("EncryptedPackage 太短");
     }
@@ -757,15 +770,19 @@ encryptedVerifierHashValue=\"{evh}\" encryptedKeyValue=\"{ekv}\"/>\
         let mut mem = std::io::Cursor::new(Vec::with_capacity(pkg.len() + 32 * 1024));
         write_cfb(&mut mem)?;
         let cfb_bytes = mem.into_inner();
-        // 内存自检：确认 CFB 头与 EncryptionInfo/EncryptedPackage 两个必需流完整可读
+        // O(1) header + size sanity check on the freshly flushed in-memory CFB container
+        // (avoids re-parsing the entire FAT sector chain via `CompoundFile::open`).
+        if !cfb_bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
+            || info.len() < 8
+            || pkg.len() < 8
+            || cfb_bytes.len() < 512 + pkg.len()
         {
-            let mut verify_cf = cfb::CompoundFile::open(std::io::Cursor::new(cfb_bytes.as_slice()))
-                .map_err(|e| anyhow!("生成的 CFB 加密容器无效：{e}"))?;
-            let info_len = verify_cf.open_stream("EncryptionInfo").map(|s| s.len()).unwrap_or(0);
-            let pkg_len = verify_cf.open_stream("EncryptedPackage").map(|s| s.len()).unwrap_or(0);
-            if info_len < 8 || pkg_len < 8 {
-                bail!("生成的加密流长度异常（EncryptionInfo={info_len}, EncryptedPackage={pkg_len}）");
-            }
+            bail!(
+                "生成的加密流长度异常（cfb={}, EncryptionInfo={}, EncryptedPackage={}）",
+                cfb_bytes.len(),
+                info.len(),
+                pkg.len()
+            );
         }
         let fp = cfb_fingerprint_bytes(&cfb_bytes);
         let total_len = cfb_bytes.len() as u64;

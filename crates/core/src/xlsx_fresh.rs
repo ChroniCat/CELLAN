@@ -271,7 +271,7 @@ fn patch_merge_cells(
     out
 }
 
-fn update_dimension_in_header(
+pub(super) fn update_dimension_in_header(
     header: &str,
     root_qname: &str,
     bounds: Option<(u32, u32, u32, u32)>,
@@ -305,7 +305,7 @@ fn update_dimension_in_header(
     out
 }
 
-fn fresh_sheet_shell_xml(sheet: &Sheet, tab_selected: bool) -> String {
+fn minimal_sheet_shell_xml(sheet: &Sheet, tab_selected: bool) -> String {
     let sel = if tab_selected { " tabSelected=\"1\"" } else { "" };
     let merges = build_merge_cells_xml(&sheet.merges, "");
     format!(
@@ -321,6 +321,119 @@ fn fresh_sheet_shell_xml(sheet: &Sheet, tab_selected: bool) -> String {
 <pageSetup paperSize=\"9\" orientation=\"portrait\" scale=\"100\"/>\
 </worksheet>"
     )
+}
+
+fn direct_sheet_shell_xml(sheet: &Sheet, tab_selected: bool) -> Result<String> {
+    use std::fmt::Write as _;
+    let sel = if tab_selected { " tabSelected=\"1\"" } else { "" };
+    let merges = build_merge_cells_xml(&sheet.merges, "");
+    let mut fmt_pr = String::from("<sheetFormatPr");
+    if (sheet.rows.default_size() - crate::layout::DEFAULT_ROW_H).abs() > 0.01 {
+        let _ = write!(
+            fmt_pr,
+            " defaultRowHeight=\"{:.2}\" customHeight=\"1\"",
+            sheet.rows.default_size() * 72.0 / 96.0
+        );
+    } else {
+        fmt_pr.push_str(" defaultRowHeight=\"15\"");
+    }
+    if let Some(max_rlv) = sheet.row_levels.values().copied().max().filter(|&v| v > 0) {
+        let _ = write!(fmt_pr, " outlineLevelRow=\"{max_rlv}\"");
+    }
+    if let Some(max_clv) = sheet.col_levels.values().copied().max().filter(|&v| v > 0) {
+        let _ = write!(fmt_pr, " outlineLevelCol=\"{max_clv}\"");
+    }
+    fmt_pr.push_str("/>");
+
+    let has_col_default = (sheet.cols.default_size() - crate::layout::DEFAULT_COL_W).abs() > 0.01;
+    let init_cols = if has_col_default {
+        let w = ((sheet.cols.default_size() - 5.0) / 8.0).max(0.0);
+        format!("<cols><col min=\"1\" max=\"16384\" width=\"{w:.2}\" customWidth=\"1\"/></cols>")
+    } else {
+        String::new()
+    };
+
+    let mut shell = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+<sheetPr><outlinePr summaryBelow=\"1\" summaryRight=\"1\" showOutlineSymbols=\"1\"/><pageSetUpPr fitToPage=\"0\"/></sheetPr>\
+<dimension ref=\"A1\"/>\
+<sheetViews><sheetView{sel} workbookViewId=\"0\"/></sheetViews>\
+{fmt_pr}{init_cols}\
+<sheetData/>{merges}\
+<printOptions gridLines=\"0\" headings=\"0\" horizontalCentered=\"0\" verticalCentered=\"0\"/>\
+<pageMargins left=\"0.7\" right=\"0.7\" top=\"0.75\" bottom=\"0.75\" header=\"0.3\" footer=\"0.3\"/>\
+<pageSetup paperSize=\"9\" orientation=\"portrait\" scale=\"100\"/>\
+</worksheet>"
+    );
+
+    if sheet.tab_color.is_some() {
+        shell = crate::patch::set_tab_color(&shell, sheet.tab_color);
+    }
+    if !sheet.outline_summary_below || !sheet.outline_summary_right || !sheet.outline_symbols {
+        shell = crate::patch::set_outline_pr(
+            &shell,
+            sheet.outline_summary_below,
+            sheet.outline_summary_right,
+            sheet.outline_symbols,
+        );
+    }
+    if sheet.freeze.is_some() {
+        shell = crate::patch::set_freeze_xml(&shell, sheet.freeze);
+    }
+    if !sheet.cols.spans().is_empty()
+        || !sheet.hidden_cols.is_empty()
+        || !sheet.col_levels.is_empty()
+    {
+        let mut col_changes: BTreeMap<u32, crate::patch::layout_xml::Change> = BTreeMap::new();
+        for (&c, &w) in sheet.cols.entries() {
+            if c < crate::sync::MAX_COLS {
+                col_changes.entry(c).or_default().size = Some(Some(w));
+            }
+        }
+        for &c in sheet.hidden_cols.iter() {
+            if c < crate::sync::MAX_COLS {
+                col_changes.entry(c).or_default().hidden = Some(true);
+            }
+        }
+        for (&c, &lv) in &sheet.col_levels {
+            if c < crate::sync::MAX_COLS && lv > 0 {
+                col_changes.entry(c).or_default().level = Some(lv);
+            }
+        }
+        if !col_changes.is_empty() {
+            if let Some(sd_pos) = shell.find("<sheetData") {
+                let updated_head =
+                    crate::patch::layout_xml::apply_header(&shell[..sd_pos], &col_changes)?;
+                let mut next = String::with_capacity(updated_head.len() + shell.len() - sd_pos);
+                next.push_str(&updated_head);
+                next.push_str(&shell[sd_pos..]);
+                shell = next;
+            }
+        }
+    }
+    if sheet.protection.is_some() {
+        shell = crate::patch::set_sheet_protection(&shell, sheet.protection.as_ref());
+    }
+    if let Some(f) = &sheet.filter {
+        shell = crate::patch::insert_auto_filter(&shell, &crate::patch::auto_filter_xml(f));
+    }
+    if !sheet.cf.blocks.is_empty() && sheet.cf.dxfs.is_empty() {
+        shell = crate::patch::insert_cf(&shell, &crate::patch::cf_blocks_xml(&sheet.cf.blocks));
+    }
+    if !sheet.dv.is_empty() {
+        shell = crate::patch::insert_dv(&shell, &crate::patch::dv_xml(&sheet.dv));
+    }
+    if sheet.page != crate::page::PageSetup::default() {
+        shell = crate::patch::set_page_xml(&shell, &sheet.page);
+        shell = crate::patch::set_page_setup(&shell, &sheet.page);
+    }
+    if !sheet.ignored_errors.is_empty() {
+        let mut cells: Vec<(u32, u32)> = sheet.ignored_errors.iter().copied().collect();
+        cells.sort_unstable();
+        shell = crate::patch::set_ignored_errors(&shell, &cells);
+    }
+    Ok(shell)
 }
 
 fn minimal_styles_xml() -> &'static str {
@@ -343,7 +456,8 @@ fn build_fresh_package_xmls(
     has_sst: bool,
     has_metadata: bool,
     full_calc_on_load: bool,
-) -> (String, String, String, String) {
+    include_direct_workbook_meta: bool,
+) -> Result<(String, String, String, String)> {
     use std::fmt::Write as _;
     let mut ct = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -369,6 +483,7 @@ fn build_fresh_package_xmls(
 <bookViews><workbookView xWindow=\"0\" yWindow=\"0\" windowWidth=\"24000\" windowHeight=\"12000\"/></bookViews>\
 <sheets>"
     );
+    let any_visible_sheet = wb.sheets.iter().any(|s| !s.hidden);
     for (idx, name) in sheet_names.iter().enumerate() {
         let n = idx + 1;
         let _ = write!(
@@ -379,9 +494,17 @@ fn build_fresh_package_xmls(
             wb_rels,
             "<Relationship Id=\"rId{n}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{n}.xml\"/>"
         );
+        let state_attr = if include_direct_workbook_meta
+            && any_visible_sheet
+            && wb.sheets.get(idx).is_some_and(|s| s.hidden)
+        {
+            " state=\"hidden\""
+        } else {
+            ""
+        };
         let _ = write!(
             wb_xml,
-            "<sheet name=\"{}\" sheetId=\"{n}\" r:id=\"rId{n}\"/>",
+            "<sheet name=\"{}\" sheetId=\"{n}\"{state_attr} r:id=\"rId{n}\"/>",
             encode_xml_attr(name)
         );
     }
@@ -415,19 +538,98 @@ fn build_fresh_package_xmls(
     ct.push_str("</Types>");
     wb_rels.push_str("</Relationships>");
     wb_xml.push_str("</sheets>");
+
+    if include_direct_workbook_meta {
+        let mut defs = String::new();
+        for (name, local, text) in &wb.names {
+            if name == crate::patch::MANUAL_HIDDEN_NAME {
+                continue;
+            }
+            let body = text.trim_start_matches('=');
+            match local {
+                Some(i) => {
+                    let _ = write!(
+                        defs,
+                        "<definedName name=\"{}\" localSheetId=\"{i}\">{}</definedName>",
+                        encode_xml_attr(name),
+                        encode_xml_attr(body)
+                    );
+                }
+                None => {
+                    let _ = write!(
+                        defs,
+                        "<definedName name=\"{}\">{}</definedName>",
+                        encode_xml_attr(name),
+                        encode_xml_attr(body)
+                    );
+                }
+            }
+        }
+        let manual_hidden: BTreeMap<String, Vec<(u32, u32)>> = wb
+            .sheets
+            .iter()
+            .filter(|s| !s.hidden_rows_user.is_empty())
+            .map(|s| (s.name.clone(), s.hidden_rows_user.intervals().to_vec()))
+            .collect();
+        if !manual_hidden.is_empty() {
+            let encoded = crate::patch::encode_manual_hidden_intervals(&manual_hidden)?;
+            let _ = write!(
+                defs,
+                "<definedName name=\"{}\" hidden=\"1\">{encoded}</definedName>",
+                crate::patch::MANUAL_HIDDEN_NAME
+            );
+        }
+        if !defs.is_empty() {
+            wb_xml.push_str("<definedNames>");
+            wb_xml.push_str(&defs);
+            wb_xml.push_str("</definedNames>");
+        }
+    }
+
     if full_calc_on_load {
         wb_xml.push_str("<calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/>");
     } else {
         wb_xml.push_str("<calcPr calcId=\"0\"/>");
     }
     wb_xml.push_str("</workbook>");
+
+    if include_direct_workbook_meta {
+        for (idx, sheet) in wb.sheets.iter().enumerate() {
+            if sheet.page.print_area.is_some()
+                || sheet.page.title_rows.is_some()
+                || sheet.page.title_cols.is_some()
+            {
+                wb_xml = crate::patch::set_print_names(
+                    &wb_xml,
+                    idx as u32,
+                    &sheet.name,
+                    &sheet.page,
+                );
+            }
+        }
+        if wb.calc_manual {
+            wb_xml = crate::patch::set_calc_mode(&wb_xml, true);
+        }
+        if wb.calc_iterate
+            || wb.calc_max_iterations != 100
+            || (wb.calc_max_change - 0.001).abs() > 1e-12
+        {
+            wb_xml = crate::patch::set_calc_iteration(
+                &wb_xml,
+                wb.calc_iterate,
+                wb.calc_max_iterations,
+                wb.calc_max_change,
+            );
+        }
+    }
+
     let root_rels = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
 <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\
 </Relationships>",
     );
-    (ct, root_rels, wb_xml, wb_rels)
+    Ok((ct, root_rels, wb_xml, wb_rels))
 }
 
 /// Write a tiny (~1.5 KB) valid OOXML skeleton so all post-save metadata patches
@@ -445,7 +647,7 @@ pub(super) fn write_fresh_skeleton(path: &Path, wb: &Workbook) -> Result<()> {
     };
     let names: Vec<&str> = sheets.iter().map(|s| s.name.as_str()).collect();
     let (ct, root_rels, wb_xml, wb_rels) =
-        build_fresh_package_xmls(wb, &names, false, false, false);
+        build_fresh_package_xmls(wb, &names, false, false, false, false)?;
 
     let file = File::create(path).with_context(|| format!("创建文件失败 {}", path.display()))?;
     let mut out = ZipWriter::new(BufWriter::with_capacity(64 * 1024, file));
@@ -465,61 +667,40 @@ pub(super) fn write_fresh_skeleton(path: &Path, wb: &Workbook) -> Result<()> {
     for (idx, sheet) in sheets.iter().enumerate() {
         let part = format!("xl/worksheets/sheet{}.xml", idx + 1);
         out.start_file(part, opts)?;
-        out.write_all(fresh_sheet_shell_xml(sheet, idx == 0).as_bytes())?;
+        out.write_all(minimal_sheet_shell_xml(sheet, idx == 0).as_bytes())?;
     }
     out.finish()?.flush()?;
     Ok(())
 }
 
-/// True when a brand-new workbook needs zero post-save metadata patches and can
-/// be streamed directly to `path` in a single ZIP pass.
+/// True when a brand-new workbook needs zero multi-part post-save patches (charts,
+/// pictures, textboxes, tables, notes, hyperlinks, sparklines, scenarios, DXFs, pivots)
+/// and can be streamed directly to `path` in a single parallel ZIP pass!
 pub(super) fn can_write_direct(wb: &Workbook, wants_macro: bool) -> bool {
     if wants_macro
         || wb.sheets.is_empty()
+        || !wb.sheets.iter().any(|s| !s.hidden)
         || !wb.sources.is_empty()
-        || wb.names_dirty
         || !wb.links.is_empty()
         || !wb.pivots_pending.is_empty()
         || !wb.pivots_pending2.is_empty()
         || !wb.pivot_calc_fields.is_empty()
         || !wb.pivot_shifts.is_empty()
-        || wb.calc_manual
-        || wb.calc_iterate
         || std::env::var("SC_FAIL_SAVE_STEP").is_ok()
     {
         return false;
     }
-    let default_page = crate::page::PageSetup::default();
     wb.sheets.iter().all(|s| {
-        s.cf.blocks.is_empty()
-            && s.cf.dxfs.is_empty()
-            && s.dv.is_empty()
+        s.cf.dxfs.is_empty()
             && s.notes.is_empty()
-            && s.freeze.is_none()
-            && s.filter.is_none()
-            && s.cols.is_empty()
-            && s.rows.is_empty()
-            && s.hidden_cols.is_empty()
-            && s.hidden_rows.is_empty()
-            && s.hidden_rows_user.is_empty()
-            && s.row_levels.is_empty()
-            && s.col_levels.is_empty()
-            && s.outline_summary_below
-            && s.outline_summary_right
-            && s.outline_symbols
             && !s.scenario_settings.has_source()
             && s.scenarios.is_empty()
-            && s.ignored_errors.is_empty()
-            && s.tab_color.is_none()
-            && s.protection.is_none()
             && s.sparklines.is_empty()
             && s.hyperlinks.is_empty()
             && s.textboxes.is_empty()
             && s.pictures.is_empty()
             && s.charts.is_empty()
             && s.tables.is_empty()
-            && !s.hidden
-            && s.page == default_page
     })
 }
 
@@ -1504,6 +1685,33 @@ fn push_i64(out: &mut Vec<u8>, v: i64) {
 }
 
 #[inline]
+pub(super) fn push_f64_xml(out: &mut Vec<u8>, n: f64) {
+    let n = if n == 0.0 { 0.0 } else { n };
+    let iv = n as i64;
+    if (iv as f64) == n && iv.unsigned_abs() < 10_000_000_000_000_000 {
+        push_i64(out, iv);
+    } else {
+        let _ = serde_json::to_writer(out, &n);
+    }
+}
+
+#[inline]
+fn push_pt_2dec(out: &mut Vec<u8>, px: f32) {
+    let pt = f64::from(px * 72.0 / 96.0);
+    let scaled = pt * 100.0;
+    let rounded = scaled.round();
+    if pt >= 0.0 && pt < 1_000_000.0 && (scaled - rounded).abs() < 1e-3 {
+        let centi = rounded as u64;
+        push_i64(out, (centi / 100) as i64);
+        out.push(b'.');
+        out.push(b'0' + ((centi / 10) % 10) as u8);
+        out.push(b'0' + (centi % 10) as u8);
+    } else {
+        let _ = write!(out, "{:.2}", px * 72.0 / 96.0);
+    }
+}
+
+#[inline]
 fn push_a1(out: &mut Vec<u8>, row: u32, col: u32) {
     let mut c = col + 1;
     let mut col_tmp = [0u8; 4];
@@ -1521,7 +1729,7 @@ fn push_a1(out: &mut Vec<u8>, row: u32, col: u32) {
 }
 
 #[inline]
-fn format_a1_buf(row: u32, col: u32, buf: &mut [u8; 16]) -> &str {
+pub(super) fn format_a1_buf(row: u32, col: u32, buf: &mut [u8; 16]) -> &str {
     let mut c = col + 1;
     let mut col_tmp = [0u8; 4];
     let mut clen = 0usize;
@@ -1590,20 +1798,58 @@ fn declare_sst(xml: &mut String, part: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct SheetSstLookup<'a> {
+    str_map: &'a HashMap<&'a str, u32>,
+    ptr_map: &'a HashMap<(usize, usize), u32>,
+}
+
+impl<'a> SheetSstLookup<'a> {
+    #[inline]
+    pub(super) fn from_maps(
+        str_map: &'a HashMap<&'a str, u32>,
+        ptr_map: &'a HashMap<(usize, usize), u32>,
+    ) -> Self {
+        Self { str_map, ptr_map }
+    }
+
+    #[inline]
+    pub(super) fn get_arc(&self, s: &std::sync::Arc<str>) -> Option<u32> {
+        let key = (s.as_ptr() as usize, s.len());
+        if let Some(&idx) = self.ptr_map.get(&key) {
+            return Some(idx);
+        }
+        self.str_map.get(s.as_ref()).copied()
+    }
+
+    #[inline]
+    pub(super) fn get_str(&self, s: &str) -> Option<u32> {
+        self.str_map.get(s).copied()
+    }
+}
+
 struct FreshSst<'a> {
     indices: HashMap<&'a str, u32>,
     large_indices: HashMap<&'a str, u32>,
+    indices_ptr: HashMap<(usize, usize), u32>,
+    large_indices_ptr: HashMap<(usize, usize), u32>,
     xml: Vec<u8>,
     existed_in_zip: bool,
     modified: bool,
 }
 
 impl<'a> FreshSst<'a> {
-    fn map_for(&self, sheet: &Sheet) -> &HashMap<&'a str, u32> {
+    fn map_for(&self, sheet: &Sheet) -> SheetSstLookup<'_> {
         if sheet.len() < 16_384 {
-            &self.indices
+            SheetSstLookup {
+                str_map: &self.indices,
+                ptr_map: &self.indices_ptr,
+            }
         } else {
-            &self.large_indices
+            SheetSstLookup {
+                str_map: &self.large_indices,
+                ptr_map: &self.large_indices_ptr,
+            }
         }
     }
 
@@ -1612,23 +1858,36 @@ impl<'a> FreshSst<'a> {
         ordered_sheets: &[(&str, &'a Sheet)],
     ) -> Result<Option<Self>> {
         let mut large_counts: HashMap<&'a str, u32> = HashMap::new();
+        let mut large_ptr_counts: HashMap<(usize, usize), (u32, &'a str)> = HashMap::new();
         let mut large_repeated: Vec<&'a str> = Vec::new();
         let mut small_seen: HashSet<&'a str> = HashSet::new();
+        let mut small_ptr_seen: HashMap<(usize, usize), &'a str> = HashMap::new();
         let mut small_order: Vec<&'a str> = Vec::new();
 
         for &(_, sheet) in ordered_sheets {
             let is_small = sheet.len() < 16_384;
             let has_spilled = !sheet.spilled.is_empty();
             let has_rich = !sheet.rich.is_empty();
-            let mut record = |text: &'a str| {
+            let mut record_arc = |s: &'a std::sync::Arc<str>| {
+                let text: &'a str = s.as_ref();
+                let pkey = (text.as_ptr() as usize, text.len());
                 if is_small {
-                    if small_seen.insert(text) {
-                        small_order.push(text);
+                    if let std::collections::hash_map::Entry::Vacant(v) = small_ptr_seen.entry(pkey)
+                    {
+                        v.insert(text);
+                        if small_seen.insert(text) {
+                            small_order.push(text);
+                        }
                     }
                 } else {
-                    let entry = large_counts.entry(text).or_insert(0);
-                    *entry += 1;
-                    if *entry == 2 {
+                    let entry = large_ptr_counts.entry(pkey).or_insert((0, text));
+                    if entry.0 >= 2 {
+                        return;
+                    }
+                    entry.0 += 1;
+                    let sc = large_counts.entry(text).or_insert(0);
+                    *sc += 1;
+                    if *sc == 2 {
                         large_repeated.push(text);
                     }
                 }
@@ -1651,7 +1910,7 @@ impl<'a> FreshSst<'a> {
                                 {
                                     continue;
                                 }
-                                record(s.as_ref());
+                                record_arc(s);
                             }
                         }
                         crate::store::ColSlab::Mixed(cs) => {
@@ -1670,7 +1929,7 @@ impl<'a> FreshSst<'a> {
                                 {
                                     continue;
                                 }
-                                record(s.as_ref());
+                                record_arc(s);
                             }
                         }
                     }
@@ -1890,6 +2149,22 @@ impl<'a> FreshSst<'a> {
             }
         }
 
+        let mut indices_ptr = HashMap::with_capacity(small_ptr_seen.len() + large_ptr_counts.len());
+        let mut large_indices_ptr = HashMap::with_capacity(large_ptr_counts.len());
+        for (pkey, text) in small_ptr_seen {
+            if let Some(&idx) = indices.get(text) {
+                indices_ptr.insert(pkey, idx);
+            }
+        }
+        for (pkey, (_, text)) in large_ptr_counts {
+            if let Some(&idx) = indices.get(text) {
+                indices_ptr.insert(pkey, idx);
+            }
+            if let Some(&idx) = large_indices.get(text) {
+                large_indices_ptr.insert(pkey, idx);
+            }
+        }
+
         let modified = !existed_in_zip || appended_any;
         let final_xml = if modified {
             xml.push_str(&root_close);
@@ -1901,6 +2176,8 @@ impl<'a> FreshSst<'a> {
         Ok(Some(Self {
             indices,
             large_indices,
+            indices_ptr,
+            large_indices_ptr,
             xml: final_xml,
             existed_in_zip,
             modified,
@@ -2805,12 +3082,42 @@ impl StyleAppender {
     }
 }
 
+fn push_formula_xml_bytes(buf: &mut Vec<u8>, raw: &str) {
+    let formula = crate::add_fn_prefixes(raw.strip_prefix('=').unwrap_or(raw));
+    if formula
+        .bytes()
+        .all(|b| b >= 0x20 && !matches!(b, b'&' | b'<' | b'>'))
+        && !formula.contains('\u{fffe}')
+        && !formula.contains('\u{ffff}')
+    {
+        buf.extend_from_slice(formula.as_bytes());
+        return;
+    }
+    for ch in formula.chars() {
+        match ch {
+            '&' => buf.extend_from_slice(b"&amp;"),
+            '<' => buf.extend_from_slice(b"&lt;"),
+            '>' => buf.extend_from_slice(b"&gt;"),
+            '\r' => buf.extend_from_slice(b"&#13;"),
+            '\t' | '\n' => {
+                let mut tmp = [0u8; 4];
+                buf.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+            }
+            c if c < ' ' || c == '\u{fffe}' || c == '\u{ffff}' => {}
+            c => {
+                let mut tmp = [0u8; 4];
+                buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_value_buf(
     buf: &mut Vec<u8>,
     sheet: &Sheet,
     arrays: &HashMap<CellRef, (u32, u32, u32, u32)>,
-    sst: Option<&HashMap<&str, u32>>,
+    sst: Option<SheetSstLookup<'_>>,
     key: CellRef,
     cell: crate::store::CellView<'_>,
     xf: Option<u16>,
@@ -2852,14 +3159,8 @@ fn write_value_buf(
                     push_u16(buf, xf);
                 }
                 if n.is_finite() {
-                    let n = if n == 0.0 { 0.0 } else { n };
                     buf.extend_from_slice(b"\"><v>");
-                    let iv = n as i64;
-                    if (iv as f64) == n && iv.unsigned_abs() < 10_000_000_000_000_000 {
-                        push_i64(buf, iv);
-                    } else {
-                        write!(buf, "{n}")?;
-                    }
+                    push_f64_xml(buf, n);
                     buf.extend_from_slice(b"</v></c>");
                 } else {
                     buf.extend_from_slice(b"\" t=\"e\"><v>#NUM!</v></c>");
@@ -2886,14 +3187,8 @@ fn write_value_buf(
                         push_u16(buf, xf);
                     }
                     if n.is_finite() {
-                        let n = if *n == 0.0 { 0.0 } else { *n };
                         buf.extend_from_slice(b"\"><v>");
-                        let iv = n as i64;
-                        if (iv as f64) == n && iv.unsigned_abs() < 10_000_000_000_000_000 {
-                            push_i64(buf, iv);
-                        } else {
-                            write!(buf, "{n}")?;
-                        }
+                        push_f64_xml(buf, *n);
                         buf.extend_from_slice(b"</v></c>");
                     } else {
                         buf.extend_from_slice(b"\" t=\"e\"><v>#NUM!</v></c>");
@@ -2927,8 +3222,7 @@ fn write_value_buf(
                     return Ok(());
                 }
                 Value::Text(s) => {
-                    let text: &str = s.as_ref();
-                    if let Some(&sst_idx) = sst.and_then(|m| m.get(text)) {
+                    if let Some(sst_idx) = sst.and_then(|m| m.get_arc(s)) {
                         buf.extend_from_slice(b"<c r=\"");
                         push_a1(buf, key.row, key.col);
                         if let Some(xf) = xf {
@@ -2943,6 +3237,65 @@ fn write_value_buf(
                 }
             },
         }
+    }
+
+    // Fast path for unprefixed ordinary scalar formula cells (no CSE array / spill shape).
+    if prefix.is_empty()
+        && let crate::store::CellView::Cell(cell_ref) = cell
+        && let Some(f_raw) = cell_ref.formula.as_deref()
+        && (arrays.is_empty() || !arrays.contains_key(&key))
+        && (sheet.spill_shapes.is_empty() || !sheet.spill_shapes.contains_key(&key))
+    {
+        buf.extend_from_slice(b"<c r=\"");
+        push_a1(buf, key.row, key.col);
+        if let Some(xf) = xf {
+            buf.extend_from_slice(b"\" s=\"");
+            push_u16(buf, xf);
+        }
+        match &cell_ref.value {
+            Value::Empty => {
+                buf.extend_from_slice(b"\"><f>");
+                push_formula_xml_bytes(buf, f_raw);
+                buf.extend_from_slice(b"</f></c>");
+            }
+            Value::Number(n) => {
+                if n.is_finite() {
+                    buf.extend_from_slice(b"\"><f>");
+                    push_formula_xml_bytes(buf, f_raw);
+                    buf.extend_from_slice(b"</f><v>");
+                    push_f64_xml(buf, *n);
+                    buf.extend_from_slice(b"</v></c>");
+                } else {
+                    buf.extend_from_slice(b"\" t=\"e\"><f>");
+                    push_formula_xml_bytes(buf, f_raw);
+                    buf.extend_from_slice(b"</f><v>#NUM!</v></c>");
+                }
+            }
+            Value::Bool(b) => {
+                buf.extend_from_slice(b"\" t=\"b\"><f>");
+                push_formula_xml_bytes(buf, f_raw);
+                buf.extend_from_slice(if *b {
+                    b"</f><v>1</v></c>"
+                } else {
+                    b"</f><v>0</v></c>"
+                });
+            }
+            Value::Error(e) => {
+                buf.extend_from_slice(b"\" t=\"e\"><f>");
+                push_formula_xml_bytes(buf, f_raw);
+                buf.extend_from_slice(b"</f><v>");
+                buf.extend_from_slice(e.text().as_bytes());
+                buf.extend_from_slice(b"</v></c>");
+            }
+            Value::Text(s) => {
+                buf.extend_from_slice(b"\" t=\"str\"><f>");
+                push_formula_xml_bytes(buf, f_raw);
+                buf.extend_from_slice(b"</f><v>");
+                buf.extend_from_slice(encode_xstring_xml(s.as_ref()).as_bytes());
+                buf.extend_from_slice(b"</v></c>");
+            }
+        }
+        return Ok(());
     }
 
     let cell_cow = cell.to_cow();
@@ -2980,8 +3333,15 @@ fn write_value_buf(
             Value::Number(n) => {
                 buf.extend_from_slice(start.as_bytes());
                 if n.is_finite() {
-                    let n = if *n == 0.0 { 0.0 } else { *n };
-                    write!(buf, "><{prefix}v>{n}</{prefix}v></{prefix}c>")?;
+                    buf.extend_from_slice(b"><");
+                    buf.extend_from_slice(prefix.as_bytes());
+                    buf.extend_from_slice(b"v>");
+                    push_f64_xml(buf, *n);
+                    buf.extend_from_slice(b"</");
+                    buf.extend_from_slice(prefix.as_bytes());
+                    buf.extend_from_slice(b"v></");
+                    buf.extend_from_slice(prefix.as_bytes());
+                    buf.extend_from_slice(b"c>");
                 } else {
                     write!(buf, " t=\"e\"><{prefix}v>#NUM!</{prefix}v></{prefix}c>")?;
                 }
@@ -3004,7 +3364,7 @@ fn write_value_buf(
             }
             Value::Text(s) => {
                 let text: &str = s.as_ref();
-                if let Some(&sst_idx) = sst.and_then(|m| m.get(text)) {
+                if let Some(sst_idx) = sst.and_then(|m| m.get_arc(s).or_else(|| m.get_str(text))) {
                     buf.extend_from_slice(start.as_bytes());
                     write!(buf, " t=\"s\"><{prefix}v>{sst_idx}</{prefix}v></{prefix}c>")?;
                 } else {
@@ -3061,8 +3421,17 @@ fn write_value_buf(
         }
         Value::Number(n) => {
             if n.is_finite() {
-                let n = if *n == 0.0 { 0.0 } else { *n };
-                write!(buf, ">{f_tag}<{prefix}v>{n}</{prefix}v></{prefix}c>")?;
+                buf.push(b'>');
+                buf.extend_from_slice(f_tag.as_bytes());
+                buf.push(b'<');
+                buf.extend_from_slice(prefix.as_bytes());
+                buf.extend_from_slice(b"v>");
+                push_f64_xml(buf, *n);
+                buf.extend_from_slice(b"</");
+                buf.extend_from_slice(prefix.as_bytes());
+                buf.extend_from_slice(b"v></");
+                buf.extend_from_slice(prefix.as_bytes());
+                buf.extend_from_slice(b"c>");
             } else {
                 write!(
                     buf,
@@ -3105,34 +3474,479 @@ fn write_styled_blank_buf(buf: &mut Vec<u8>, key: CellRef, xf: u16, prefix: &str
     buf.extend_from_slice(b"\"/>");
 }
 
-fn sheet_styled_bounds(sheet: &Sheet) -> Option<(u32, u32, u32, u32)> {
+pub(super) fn sheet_styled_bounds(sheet: &Sheet) -> Option<(u32, u32, u32, u32)> {
     let mut bounds = sheet.used_bounds();
-    if !sheet.styles.is_empty() {
-        for (pos, &sid) in sheet.styles.iter() {
-            if sid != 0
-                || sheet.row_styles.contains_key(&pos.row)
-                || sheet.col_styles.contains_key(&pos.col)
-            {
-                bounds = Some(match bounds {
-                    Some((t, l, b, r)) => (
-                        t.min(pos.row),
-                        l.min(pos.col),
-                        b.max(pos.row),
-                        r.max(pos.col),
-                    ),
-                    None => (pos.row, pos.col, pos.row, pos.col),
-                });
+    if let Some((max_r, max_c)) = sheet.styles.max_coords() {
+        if let Some((first_pos, _)) = sheet.styles.iter().next() {
+            let min_r = first_pos.row;
+            let mut min_c = first_pos.col;
+            if let Some((_, l, _, _)) = bounds {
+                min_c = min_c.min(l);
             }
+            for (_, page) in sheet.styles.iter_pages() {
+                if let Some(c) = page.iter_nonempty_cols(0, min_c).next() {
+                    min_c = min_c.min(c);
+                }
+            }
+            bounds = Some(match bounds {
+                Some((t, l, b, r)) => (t.min(min_r), l.min(min_c), b.max(max_r), r.max(max_c)),
+                None => (min_r, min_c, max_r, max_c),
+            });
         }
     }
     bounds
+}
+
+fn sheet_row_span_bounds(
+    sheet: &Sheet,
+    styled_bounds: Option<(u32, u32, u32, u32)>,
+) -> Option<(u32, u32)> {
+    let mut range: Option<(u32, u32)> = styled_bounds.map(|(t, _, b, _)| (t, b));
+    let mut merge = |lo: u32, hi: u32| {
+        let lo = lo.min(crate::sync::MAX_ROWS - 1);
+        let hi = hi.min(crate::sync::MAX_ROWS - 1);
+        if lo <= hi {
+            range = Some(match range {
+                Some((a, b)) => (a.min(lo), b.max(hi)),
+                None => (lo, hi),
+            });
+        }
+    };
+    if let (Some(f), Some(l)) = (sheet.rows.spans().first(), sheet.rows.spans().last()) {
+        if f.start < crate::sync::MAX_ROWS {
+            merge(f.start, l.end);
+        }
+    }
+    if let (Some(f), Some(l)) = (
+        sheet.hidden_rows.intervals().first(),
+        sheet.hidden_rows.intervals().last(),
+    ) {
+        if f.0 < crate::sync::MAX_ROWS {
+            merge(f.0, l.1);
+        }
+    }
+    if let (Some(f), Some(l)) = (
+        sheet.hidden_rows_user.intervals().first(),
+        sheet.hidden_rows_user.intervals().last(),
+    ) {
+        if f.0 < crate::sync::MAX_ROWS {
+            merge(f.0, l.1);
+        }
+    }
+    for &r in sheet.row_styles.keys() {
+        if r < crate::sync::MAX_ROWS {
+            merge(r, r);
+        }
+    }
+    for (&r, &lv) in &sheet.row_levels {
+        if lv > 0 && r < crate::sync::MAX_ROWS {
+            merge(r, r);
+        }
+    }
+    range
+}
+
+fn sheet_estimated_work(sheet: &Sheet) -> usize {
+    let row_h_work: usize = sheet
+        .rows
+        .spans()
+        .iter()
+        .filter(|s| s.start < crate::sync::MAX_ROWS)
+        .map(|s| (s.end.min(crate::sync::MAX_ROWS - 1) - s.start) as usize + 1)
+        .sum();
+    sheet
+        .len()
+        .saturating_add(sheet.styles.len())
+        .saturating_add(row_h_work)
+        .saturating_add(sheet.hidden_rows.len())
+        .saturating_add(sheet.hidden_rows_user.len())
+}
+
+struct RowMetaCursor<'a> {
+    ht_spans: &'a [crate::layout::Span],
+    ht_idx: usize,
+    ht_cur: u32,
+    hid1: &'a [(u32, u32)],
+    hid1_idx: usize,
+    hid1_cur: u32,
+    hid2: &'a [(u32, u32)],
+    hid2_idx: usize,
+    hid2_cur: u32,
+    row_xfs: &'a [(u32, u16)],
+    xf_idx: usize,
+    row_levels: &'a [(u32, u8)],
+    lv_idx: usize,
+    r2: u32,
+}
+
+impl<'a> RowMetaCursor<'a> {
+    fn new(
+        sheet: &'a Sheet,
+        row_xfs: &'a [(u32, u16)],
+        row_levels: &'a [(u32, u8)],
+        r1: u32,
+        r2: u32,
+    ) -> Self {
+        let ht_spans = sheet.rows.spans();
+        let ht_idx = ht_spans.partition_point(|s| s.end < r1);
+        let hid1 = sheet.hidden_rows.intervals();
+        let hid1_idx = hid1.partition_point(|&(_, hi)| hi < r1);
+        let hid2 = sheet.hidden_rows_user.intervals();
+        let hid2_idx = hid2.partition_point(|&(_, hi)| hi < r1);
+        let xf_idx = row_xfs.partition_point(|&(r, _)| r < r1);
+        let lv_idx = row_levels.partition_point(|&(r, _)| r < r1);
+        Self {
+            ht_spans,
+            ht_idx,
+            ht_cur: r1,
+            hid1,
+            hid1_idx,
+            hid1_cur: r1,
+            hid2,
+            hid2_idx,
+            hid2_cur: r1,
+            row_xfs,
+            xf_idx,
+            row_levels,
+            lv_idx,
+            r2,
+        }
+    }
+
+    #[inline]
+    fn peek_row(&self) -> u32 {
+        let mut best = u32::MAX;
+        if let Some(s) = self.ht_spans.get(self.ht_idx) {
+            let cand = s.start.max(self.ht_cur);
+            if cand <= s.end && cand <= self.r2 {
+                best = best.min(cand);
+            }
+        }
+        if let Some(&(lo, hi)) = self.hid1.get(self.hid1_idx) {
+            let cand = lo.max(self.hid1_cur);
+            if cand <= hi && cand <= self.r2 {
+                best = best.min(cand);
+            }
+        }
+        if let Some(&(lo, hi)) = self.hid2.get(self.hid2_idx) {
+            let cand = lo.max(self.hid2_cur);
+            if cand <= hi && cand <= self.r2 {
+                best = best.min(cand);
+            }
+        }
+        if let Some(&(r, _)) = self.row_xfs.get(self.xf_idx)
+            && r <= self.r2
+        {
+            best = best.min(r);
+        }
+        if let Some(&(r, _)) = self.row_levels.get(self.lv_idx)
+            && r <= self.r2
+        {
+            best = best.min(r);
+        }
+        best
+    }
+
+    #[inline]
+    fn take_at(&mut self, r: u32) -> (Option<f32>, bool, Option<u16>, Option<u8>) {
+        let mut ht = None;
+        if let Some(s) = self.ht_spans.get(self.ht_idx) {
+            let cand = s.start.max(self.ht_cur);
+            if cand == r && r <= s.end {
+                ht = Some(s.size);
+                self.ht_cur = r.saturating_add(1);
+                if self.ht_cur > s.end {
+                    self.ht_idx += 1;
+                }
+            }
+        }
+        let mut hidden = false;
+        if let Some(&(lo, hi)) = self.hid1.get(self.hid1_idx) {
+            let cand = lo.max(self.hid1_cur);
+            if cand == r && r <= hi {
+                hidden = true;
+                self.hid1_cur = r.saturating_add(1);
+                if self.hid1_cur > hi {
+                    self.hid1_idx += 1;
+                }
+            }
+        }
+        if let Some(&(lo, hi)) = self.hid2.get(self.hid2_idx) {
+            let cand = lo.max(self.hid2_cur);
+            if cand == r && r <= hi {
+                hidden = true;
+                self.hid2_cur = r.saturating_add(1);
+                if self.hid2_cur > hi {
+                    self.hid2_idx += 1;
+                }
+            }
+        }
+        let row_xf = if let Some(&(xr, xf)) = self.row_xfs.get(self.xf_idx)
+            && xr == r
+        {
+            self.xf_idx += 1;
+            Some(xf)
+        } else {
+            None
+        };
+        let row_lv = if let Some(&(lr, lv)) = self.row_levels.get(self.lv_idx)
+            && lr == r
+        {
+            self.lv_idx += 1;
+            Some(lv)
+        } else {
+            None
+        };
+        (ht, hidden, row_xf, row_lv)
+    }
+}
+
+#[inline]
+fn write_row_open_tag(
+    buf: &mut Vec<u8>,
+    r: u32,
+    ht: Option<f32>,
+    hidden: bool,
+    row_xf: Option<u16>,
+    row_lv: Option<u8>,
+    self_closing: bool,
+) {
+    buf.extend_from_slice(b"<row r=\"");
+    push_u32(buf, r + 1);
+    buf.push(b'"');
+    if let Some(xf) = row_xf {
+        buf.extend_from_slice(b" s=\"");
+        push_u16(buf, xf);
+        buf.extend_from_slice(b"\" customFormat=\"1\"");
+    }
+    if let Some(px) = ht {
+        buf.extend_from_slice(b" ht=\"");
+        push_pt_2dec(buf, px);
+        buf.extend_from_slice(b"\" customHeight=\"1\"");
+    }
+    if hidden {
+        buf.extend_from_slice(b" hidden=\"1\"");
+    }
+    if let Some(lv) = row_lv.filter(|&l| l > 0) {
+        buf.extend_from_slice(b" outlineLevel=\"");
+        push_u32(buf, u32::from(lv));
+        buf.push(b'"');
+    }
+    if self_closing {
+        buf.extend_from_slice(b"/>");
+    } else {
+        buf.push(b'>');
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_band_rows_streaming(
+    buf: &mut Vec<u8>,
+    mut flush_to: Option<&mut dyn Write>,
+    sheet: &Sheet,
+    arrays: &HashMap<CellRef, (u32, u32, u32, u32)>,
+    sst: Option<SheetSstLookup<'_>>,
+    direct_xf: &[Option<u16>],
+    row_xfs: &[(u32, u16)],
+    row_levels: &[(u32, u8)],
+    r1: u32,
+    r2: u32,
+) -> Result<()> {
+    let lookup_xf = |id: u16| -> Result<u16> {
+        direct_xf
+            .get(usize::from(id))
+            .copied()
+            .flatten()
+            .context("直接样式表缺少单元格样式")
+    };
+    let has_row_or_col_styles = !sheet.row_styles.is_empty() || !sheet.col_styles.is_empty();
+    let xf_for = |key: CellRef, explicit: Option<u16>| -> Result<Option<u16>> {
+        let inherited = if !has_row_or_col_styles {
+            None
+        } else {
+            sheet
+                .row_styles
+                .get(&key.row)
+                .or_else(|| sheet.col_styles.get(&key.col))
+                .copied()
+        };
+        let sid = explicit.or(inherited);
+        match sid {
+            None => Ok(None),
+            Some(0) if inherited.is_none() => Ok(None),
+            Some(id) => Ok(Some(lookup_xf(id)?)),
+        }
+    };
+
+    let plain_grid = sheet.styles.is_empty()
+        && row_xfs.is_empty()
+        && row_levels.is_empty()
+        && sheet.rows.spans().is_empty()
+        && sheet.hidden_rows.is_empty()
+        && sheet.hidden_rows_user.is_empty();
+    if plain_grid {
+        let has_col_styles = !sheet.col_styles.is_empty();
+        let mut open_row: Option<u32> = None;
+        for (key, cell) in sheet.cells().iter_rect_views((r1, 0, r2, u32::MAX)) {
+            if open_row != Some(key.row) {
+                if open_row.is_some() {
+                    buf.extend_from_slice(b"</row>");
+                    if let Some(w) = flush_to.as_deref_mut()
+                        && buf.len() >= 128 * 1024
+                    {
+                        w.write_all(buf)?;
+                        buf.clear();
+                    }
+                }
+                buf.extend_from_slice(b"<row r=\"");
+                push_u32(buf, key.row + 1);
+                buf.extend_from_slice(b"\">");
+                open_row = Some(key.row);
+            }
+            let xf = if has_col_styles {
+                sheet
+                    .col_styles
+                    .get(&key.col)
+                    .map(|&id| lookup_xf(id))
+                    .transpose()?
+            } else {
+                None
+            };
+            write_value_buf(buf, sheet, arrays, sst, key, cell, xf, "", Some(1))?;
+        }
+        if open_row.is_some() {
+            buf.extend_from_slice(b"</row>");
+        }
+        return Ok(());
+    }
+
+    let mut meta = RowMetaCursor::new(sheet, row_xfs, row_levels, r1, r2);
+    let has_cell_styles = !sheet.styles.is_empty();
+    let p1 = r1 / crate::store::PAGE_ROWS;
+    let p2 = r2 / crate::store::PAGE_ROWS;
+    let mut page_styles: Vec<(CellRef, u16)> = Vec::new();
+    let mut row_entries_buf: Vec<(CellRef, Option<crate::store::CellView<'_>>, Option<u16>)> =
+        Vec::new();
+
+    for p in p1..=p2 {
+        let ps = (p * crate::store::PAGE_ROWS).max(r1);
+        let pe = (p * crate::store::PAGE_ROWS + crate::store::PAGE_ROWS - 1).min(r2);
+        if ps > pe {
+            continue;
+        }
+        page_styles.clear();
+        if has_cell_styles {
+            page_styles.extend(sheet.styles.iter_rect((ps, 0, pe, u32::MAX)));
+            page_styles.sort_unstable_by_key(|&(k, _)| (k.row, k.col));
+        }
+        let mut cell_it = sheet.cells().iter_rect_views((ps, 0, pe, u32::MAX)).peekable();
+        let mut style_idx = 0usize;
+
+        loop {
+            let next_c = cell_it.peek().map_or(u32::MAX, |(k, _)| k.row);
+            let next_s = page_styles.get(style_idx).map_or(u32::MAX, |&(k, _)| k.row);
+            let next_m = meta.peek_row();
+            let r = next_c.min(next_s).min(next_m);
+            if r > pe {
+                break;
+            }
+            let (ht, hidden, row_xf, row_lv) = meta.take_at(r);
+            row_entries_buf.clear();
+            while cell_it.peek().is_some_and(|(k, _)| k.row == r)
+                || page_styles.get(style_idx).is_some_and(|&(k, _)| k.row == r)
+            {
+                let c_col = cell_it
+                    .peek()
+                    .filter(|(k, _)| k.row == r)
+                    .map_or(u32::MAX, |(k, _)| k.col);
+                let s_col = page_styles
+                    .get(style_idx)
+                    .filter(|&&(k, _)| k.row == r)
+                    .map_or(u32::MAX, |&(k, _)| k.col);
+                let col = c_col.min(s_col);
+                let cell_opt = if c_col == col {
+                    Some(cell_it.next().unwrap().1)
+                } else {
+                    None
+                };
+                let explicit = if s_col == col {
+                    let sid = page_styles[style_idx].1;
+                    style_idx += 1;
+                    Some(sid)
+                } else {
+                    None
+                };
+                if cell_opt.is_some()
+                    || explicit.is_some_and(|id| {
+                        id != 0
+                            || sheet.row_styles.contains_key(&r)
+                            || sheet.col_styles.contains_key(&col)
+                    })
+                {
+                    row_entries_buf.push((CellRef::new(r, col), cell_opt, explicit));
+                }
+            }
+
+            if row_entries_buf.is_empty() {
+                if ht.is_some() || hidden || row_xf.is_some() || row_lv.is_some_and(|l| l > 0) {
+                    write_row_open_tag(buf, r, ht, hidden, row_xf, row_lv, true);
+                }
+            } else {
+                write_row_open_tag(buf, r, ht, hidden, row_xf, row_lv, false);
+                for (key, cell_opt, explicit) in row_entries_buf.drain(..) {
+                    if let Some(cell) = cell_opt {
+                        let xf = xf_for(key, explicit)?;
+                        write_value_buf(buf, sheet, arrays, sst, key, cell, xf, "", Some(1))?;
+                    } else if let Some(id) = explicit {
+                        let xf = lookup_xf(id)?;
+                        write_styled_blank_buf(buf, key, xf, "");
+                    }
+                }
+                buf.extend_from_slice(b"</row>");
+            }
+
+            if let Some(w) = flush_to.as_deref_mut()
+                && buf.len() >= 128 * 1024
+            {
+                w.write_all(buf)?;
+                buf.clear();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepare_row_meta_vecs(
+    sheet: &Sheet,
+    direct_xf: &[Option<u16>],
+) -> Result<(Vec<(u32, u16)>, Vec<(u32, u8)>)> {
+    let mut row_xfs: Vec<(u32, u16)> = Vec::with_capacity(sheet.row_styles.len());
+    for (&r, &sid) in &sheet.row_styles {
+        if r < crate::sync::MAX_ROWS {
+            let xf = direct_xf
+                .get(usize::from(sid))
+                .copied()
+                .flatten()
+                .context("直接样式表缺少行样式")?;
+            row_xfs.push((r, xf));
+        }
+    }
+    row_xfs.sort_unstable_by_key(|&(r, _)| r);
+
+    let mut row_levels: Vec<(u32, u8)> = sheet
+        .row_levels
+        .iter()
+        .filter_map(|(&r, &lv)| (lv > 0 && r < crate::sync::MAX_ROWS).then_some((r, lv)))
+        .collect();
+    row_levels.sort_unstable_by_key(|&(r, _)| r);
+    Ok((row_xfs, row_levels))
 }
 
 fn write_sheet(
     mut out: impl Write,
     shell: &str,
     sheet: &Sheet,
-    sst: Option<&HashMap<&str, u32>>,
+    sst: Option<SheetSstLookup<'_>>,
     direct_xf: Option<&[Option<u16>]>,
 ) -> Result<()> {
     // Only the sparse, freshly generated template is parsed. Values are merged
@@ -3224,24 +4038,6 @@ fn write_sheet(
         }
     };
 
-    let xf_for = |key: CellRef, explicit: Option<u16>| -> Result<Option<u16>> {
-        let inherited = if sheet.row_styles.is_empty() && sheet.col_styles.is_empty() {
-            None
-        } else {
-            sheet
-                .row_styles
-                .get(&key.row)
-                .or_else(|| sheet.col_styles.get(&key.col))
-                .copied()
-        };
-        let sid = explicit.or(inherited);
-        match sid {
-            None => Ok(None),
-            Some(0) if inherited.is_none() && direct_xf.is_some() => Ok(None),
-            Some(id) => Ok(Some(lookup_xf(id)?)),
-        }
-    };
-
     let mut header = if let Some(dimension) = dimension {
         let reference = match bounds {
             Some((top, left, bottom, right)) => {
@@ -3275,6 +4071,53 @@ fn write_sheet(
 
     const FLUSH_AT: usize = 128 * 1024;
     let mut buf: Vec<u8> = Vec::with_capacity(FLUSH_AT + 16 * 1024);
+
+    // Direct empty-<sheetData/> fast path: stream all cells + styles + row metadata directly!
+    if let Some(dxf) = direct_xf
+        && !data.children().any(|n| n.is_element())
+    {
+        buf.extend_from_slice(header.as_bytes());
+        buf.extend_from_slice(b"<sheetData>");
+        if let Some((top_r, bot_r)) = sheet_row_span_bounds(sheet, bounds) {
+            let (row_xfs, row_levels) = prepare_row_meta_vecs(sheet, dxf)?;
+            write_band_rows_streaming(
+                &mut buf,
+                Some(&mut out),
+                sheet,
+                &arrays,
+                sst,
+                dxf,
+                &row_xfs,
+                &row_levels,
+                top_r,
+                bot_r,
+            )?;
+        }
+        buf.extend_from_slice(b"</sheetData>");
+        buf.extend_from_slice(shell[data.range().end..].as_bytes());
+        out.write_all(&buf)?;
+        out.flush()?;
+        return Ok(());
+    }
+
+    let xf_for = |key: CellRef, explicit: Option<u16>| -> Result<Option<u16>> {
+        let inherited = if sheet.row_styles.is_empty() && sheet.col_styles.is_empty() {
+            None
+        } else {
+            sheet
+                .row_styles
+                .get(&key.row)
+                .or_else(|| sheet.col_styles.get(&key.col))
+                .copied()
+        };
+        let sid = explicit.or(inherited);
+        match sid {
+            None => Ok(None),
+            Some(0) if inherited.is_none() && direct_xf.is_some() => Ok(None),
+            Some(id) => Ok(Some(lookup_xf(id)?)),
+        }
+    };
+
     buf.extend_from_slice(header.as_bytes());
     buf.extend_from_slice(b"<sheetData>");
 
@@ -3475,17 +4318,18 @@ fn write_sheet(
     Ok(())
 }
 
-/// Build a single-entry ZIP in memory for a large plain/uniformly-styled worksheet by
-/// parallelizing BOTH XML serialization and raw RFC 1951 deflate across CPU cores.
-/// Returns `Ok(None)` if the sheet requires the general template-merge path.
-fn write_sheet_parallel_zip(
+/// Build a single-entry ZIP in memory for a large worksheet (including styled, row-height,
+/// hidden-row, and outline-level sheets!) by parallelizing BOTH XML serialization and raw
+/// RFC 1951 deflate across CPU cores. Returns `Ok(None)` if the sheet is small or has template rows.
+pub(super) fn write_sheet_parallel_zip(
     part: &str,
     shell: &str,
     sheet: &Sheet,
-    sst: Option<&HashMap<&str, u32>>,
+    sst: Option<SheetSstLookup<'_>>,
     direct_xf: &[Option<u16>],
 ) -> Result<Option<(Vec<u8>, Option<(u32, u64)>)>> {
-    if !sheet.styles.is_empty() || !sheet.row_styles.is_empty() || sheet.len() < 32_768 {
+    let est_work = sheet_estimated_work(sheet);
+    if est_work < 32_768 {
         return Ok(None);
     }
     let doc = roxmltree::Document::parse(shell)?;
@@ -3505,7 +4349,8 @@ fn write_sheet_parallel_zip(
     if data.children().any(|n| n.is_element()) {
         return Ok(None);
     }
-    let Some((top, left, bottom, right)) = sheet.used_bounds() else {
+    let styled_bounds = sheet_styled_bounds(sheet);
+    let Some((top, bottom)) = sheet_row_span_bounds(sheet, styled_bounds) else {
         return Ok(None);
     };
     let arrays = valid_arrays_map(sheet);
@@ -3519,12 +4364,17 @@ fn write_sheet_parallel_zip(
     };
 
     let mut header = if let Some(dimension) = dimension {
-        let first = crate::model::cell_name(top, left);
-        let end = crate::model::cell_name(bottom, right);
-        let reference = if first == end {
-            first
-        } else {
-            format!("{first}:{end}")
+        let reference = match styled_bounds {
+            Some((dt, dl, db, dr)) => {
+                let first = crate::model::cell_name(dt, dl);
+                let end = crate::model::cell_name(db, dr);
+                if first == end {
+                    first
+                } else {
+                    format!("{first}:{end}")
+                }
+            }
+            None => "A1".to_owned(),
         };
         let dim = dimension.range_value();
         let mut h = String::with_capacity(data.range().start + reference.len() + 32);
@@ -3554,14 +4404,16 @@ fn write_sheet_parallel_zip(
         .map(|n| n.get())
         .unwrap_or(2)
         .clamp(2, 8);
-    let row_span = bottom.saturating_sub(top).saturating_add(1);
-    let raw_per = (row_span + workers as u32 - 1) / workers as u32;
-    let band_rows = ((raw_per + 255) / 256).max(1) * 256;
+    let first_page_row = (top / crate::store::PAGE_ROWS) * crate::store::PAGE_ROWS;
+    let row_span = bottom.saturating_sub(first_page_row).saturating_add(1);
+    let raw_per = row_span.div_ceil(workers as u32);
+    let band_rows = raw_per.div_ceil(256).max(1) * 256;
     let mut bands: Vec<(u32, u32)> = Vec::with_capacity(workers);
-    let mut cur = top;
+    let mut cur = first_page_row;
     while cur <= bottom {
+        let lo = cur.max(top);
         let end_r = cur.saturating_add(band_rows - 1).min(bottom);
-        bands.push((cur, end_r));
+        bands.push((lo, end_r));
         if end_r == bottom {
             break;
         }
@@ -3571,6 +4423,9 @@ fn write_sheet_parallel_zip(
         return Ok(None);
     }
 
+    let (row_xfs, row_levels) = prepare_row_meta_vecs(sheet, direct_xf)?;
+    let row_xfs_ref = row_xfs.as_slice();
+    let row_levels_ref = row_levels.as_slice();
     let num_bands = bands.len();
     let header_ref = header.as_str();
     let arrays_ref = &arrays;
@@ -3584,49 +4439,25 @@ fn write_sheet_parallel_zip(
                 let one = (|| -> Result<(usize, Vec<u8>, u32, u64, bool)> {
                     let is_first = idx == 0;
                     let is_last = idx + 1 == num_bands;
-                    let est_cells = (sheet.len() / num_bands).max(1024);
-                    let mut buf = Vec::with_capacity(est_cells * 36 + 4096);
+                    let est_items = (est_work / num_bands).max(1024);
+                    let mut buf = Vec::with_capacity(est_items * 36 + 4096);
                     if is_first {
                         buf.extend_from_slice(header_ref.as_bytes());
                         buf.extend_from_slice(b"<sheetData>");
                     }
                     let body_start = buf.len();
-                    let has_col_styles = !sheet.col_styles.is_empty();
-                    let mut open_row: Option<u32> = None;
-                    for (key, cell) in sheet.cells().iter_rect_views((r1, 0, r2, u32::MAX)) {
-                        if open_row != Some(key.row) {
-                            if open_row.is_some() {
-                                buf.extend_from_slice(b"</row>");
-                            }
-                            buf.extend_from_slice(b"<row r=\"");
-                            push_u32(&mut buf, key.row + 1);
-                            buf.extend_from_slice(b"\">");
-                            open_row = Some(key.row);
-                        }
-                        let xf = if has_col_styles {
-                            sheet
-                                .col_styles
-                                .get(&key.col)
-                                .map(|&id| lookup_xf(id))
-                                .transpose()?
-                        } else {
-                            None
-                        };
-                        write_value_buf(
-                            &mut buf,
-                            sheet,
-                            arrays_ref,
-                            sst,
-                            key,
-                            cell,
-                            xf,
-                            "",
-                            Some(1),
-                        )?;
-                    }
-                    if open_row.is_some() {
-                        buf.extend_from_slice(b"</row>");
-                    }
+                    write_band_rows_streaming(
+                        &mut buf,
+                        None,
+                        sheet,
+                        arrays_ref,
+                        sst,
+                        direct_xf,
+                        row_xfs_ref,
+                        row_levels_ref,
+                        r1,
+                        r2,
+                    )?;
                     let body_end = buf.len();
                     if is_last {
                         buf.extend_from_slice(b"</sheetData>");
@@ -3720,7 +4551,7 @@ pub(super) fn has_dynamic(sheet: &Sheet) -> bool {
     })
 }
 
-/// Single-pass direct native streaming writer for fresh workbooks with no post-save patches.
+/// Single-pass direct native streaming writer for fresh workbooks with no multi-part post-save patches.
 pub(super) fn write_direct(path: &Path, wb: &Workbook) -> Result<FreshResult> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = std::fs::create_dir_all(parent);
@@ -3746,7 +4577,8 @@ pub(super) fn write_direct(path: &Path, wb: &Workbook) -> Result<FreshResult> {
         fresh_sst.is_some(),
         dynamic,
         full_calc,
-    );
+        true,
+    )?;
 
     let dir = path
         .parent()
@@ -3761,28 +4593,46 @@ pub(super) fn write_direct(path: &Path, wb: &Workbook) -> Result<FreshResult> {
         trusted_parts.insert(SST_PART.to_owned(), (crc.sum(), sst.xml.len() as u64));
     }
 
+    // Pre-build shells; sheets >= 32,768 use intra-sheet parallel XML+deflate (`write_sheet_parallel_zip`),
+    // while multiple smaller sheets run in parallel across sheets!
+    let mut shells: Vec<String> = Vec::with_capacity(ordered_sheets.len());
+    for (idx, &(_, sheet)) in ordered_sheets.iter().enumerate() {
+        shells.push(direct_sheet_shell_xml(sheet, idx == 0)?);
+    }
+
+    let mut parallel_minis: HashMap<String, Vec<u8>> = HashMap::new();
     let mut parallel_parts: HashMap<String, tempfile::TempPath> = HashMap::new();
-    if ordered_sheets.len() >= 2 {
-        let jobs: Vec<(String, String, &Sheet)> = ordered_sheets
-            .iter()
-            .enumerate()
-            .map(|(idx, &(part, sheet))| {
-                (part.to_owned(), fresh_sheet_shell_xml(sheet, idx == 0), sheet)
-            })
-            .collect();
+    let mut small_jobs: Vec<(String, &str, &Sheet)> = Vec::new();
+    for ((part, sheet), shell) in ordered_sheets.iter().copied().zip(shells.iter()) {
+        if sheet_estimated_work(sheet) >= 32_768 {
+            let sheet_sst = fresh_sst.as_ref().map(|s| s.map_for(sheet));
+            if let Some((mini, sig)) =
+                write_sheet_parallel_zip(part, shell, sheet, sheet_sst, direct_xf)?
+            {
+                if let Some(s) = sig {
+                    trusted_parts.insert(part.to_owned(), s);
+                }
+                parallel_minis.insert(part.to_owned(), mini);
+                continue;
+            }
+        }
+        small_jobs.push((part.to_owned(), shell.as_str(), sheet));
+    }
+
+    if small_jobs.len() >= 2 {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2)
             .min(8)
-            .min(jobs.len());
+            .min(small_jobs.len());
         let next_job = std::sync::atomic::AtomicUsize::new(0);
         let sst_ref = fresh_sst.as_ref();
         let results: std::sync::Mutex<
             Vec<Result<(String, tempfile::TempPath, Option<(u32, u64)>)>>,
-        > = std::sync::Mutex::new(Vec::with_capacity(jobs.len()));
+        > = std::sync::Mutex::new(Vec::with_capacity(small_jobs.len()));
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                let jobs_ref = &jobs;
+                let jobs_ref = &small_jobs;
                 let next_ref = &next_job;
                 let res_ref = &results;
                 scope.spawn(move || loop {
@@ -3840,35 +4690,34 @@ pub(super) fn write_direct(path: &Path, wb: &Workbook) -> Result<FreshResult> {
     out.start_file(STYLES_PART, meta_opts)?;
     out.write_all(&fresh_styles.xml)?;
     if let Some(sst) = &fresh_sst {
-        out.start_file(SST_PART, meta_opts)?;
-        out.write_all(&sst.xml)?;
+        if sst.xml.len() >= 2 * 1024 * 1024 {
+            let _ = write_parallel_deflate_entry(&mut out, SST_PART, 2, Some("sst"), |w| {
+                w.write_all(&sst.xml)?;
+                Ok(true)
+            })?;
+        } else {
+            out.start_file(SST_PART, meta_opts)?;
+            out.write_all(&sst.xml)?;
+        }
     }
     if dynamic {
         out.start_file(super::dynamic::PART, meta_opts)?;
         out.write_all(super::dynamic::METADATA.as_bytes())?;
     }
-    for (idx, &(part, sheet)) in ordered_sheets.iter().enumerate() {
-        if let Some(tp) = parallel_parts.remove(part) {
+    for ((part, sheet), shell) in ordered_sheets.iter().copied().zip(shells.iter()) {
+        if let Some(mini) = parallel_minis.remove(part) {
+            let mut mini_zip = ZipArchive::new(std::io::Cursor::new(mini))?;
+            out.raw_copy_file(mini_zip.by_index_raw(0)?)?;
+        } else if let Some(tp) = parallel_parts.remove(part) {
             let mut part_zip = ZipArchive::new(File::open(&tp)?)?;
             out.raw_copy_file(part_zip.by_index_raw(0)?)?;
         } else {
-            let shell = fresh_sheet_shell_xml(sheet, idx == 0);
             let sheet_sst = fresh_sst.as_ref().map(|s| s.map_for(sheet));
-            if let Some((mini, sig)) =
-                write_sheet_parallel_zip(part, &shell, sheet, sheet_sst, direct_xf)?
-            {
-                let mut mini_zip = ZipArchive::new(std::io::Cursor::new(mini))?;
-                out.raw_copy_file(mini_zip.by_index_raw(0)?)?;
-                if let Some(s) = sig {
-                    trusted_parts.insert(part.to_owned(), s);
-                }
-            } else {
-                out.start_file(part, meta_opts)?;
-                let mut vw = VerifiedXmlWriter::new(&mut out);
-                write_sheet(&mut vw, &shell, sheet, sheet_sst, Some(direct_xf))?;
-                if let Some(s) = vw.finish(Some("worksheet"))? {
-                    trusted_parts.insert(part.to_owned(), s);
-                }
+            out.start_file(part, meta_opts)?;
+            let mut vw = VerifiedXmlWriter::new(&mut out);
+            write_sheet(&mut vw, shell, sheet, sheet_sst, Some(direct_xf))?;
+            if let Some(s) = vw.finish(Some("worksheet"))? {
+                trusted_parts.insert(part.to_owned(), s);
             }
         }
     }
@@ -3931,27 +4780,41 @@ pub(super) fn write(
         trusted_parts.insert(SST_PART.to_owned(), (crc.sum(), sst.xml.len() as u64));
     }
 
-    // Pre-compress multiple streamed worksheets across cores into single-entry temp ZIPs,
-    // then splice via O(1) `raw_copy_file`.
+    // Use intra-sheet parallel XML+deflate for large sheets (>= 32,768), and sheet-level
+    // parallelism for remaining sheets!
+    let mut parallel_minis: HashMap<String, Vec<u8>> = HashMap::new();
     let mut parallel_parts: HashMap<String, tempfile::TempPath> = HashMap::new();
+    let mut small_jobs: Vec<(String, String, &Sheet)> = Vec::new();
     if ordered_sheets.len() >= 2 {
-        let mut jobs: Vec<(String, String, &Sheet)> = Vec::with_capacity(ordered_sheets.len());
         for &(part, sheet) in &ordered_sheets {
             let shell = super::read_zip_text(&mut zip, part)?;
-            jobs.push((part.to_owned(), shell, sheet));
+            if let Some(dxf) = direct_xf
+                && sheet_estimated_work(sheet) >= 32_768
+                && let Some((mini, sig)) =
+                    write_sheet_parallel_zip(part, &shell, sheet, sst_ref.map(|s| s.map_for(sheet)), dxf)?
+            {
+                if let Some(s) = sig {
+                    trusted_parts.insert(part.to_owned(), s);
+                }
+                parallel_minis.insert(part.to_owned(), mini);
+                continue;
+            }
+            small_jobs.push((part.to_owned(), shell, sheet));
         }
+    }
+    if small_jobs.len() >= 2 {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2)
             .min(8)
-            .min(jobs.len());
+            .min(small_jobs.len());
         let next_job = std::sync::atomic::AtomicUsize::new(0);
         let results: std::sync::Mutex<
             Vec<Result<(String, tempfile::TempPath, Option<(u32, u64)>)>>,
-        > = std::sync::Mutex::new(Vec::with_capacity(jobs.len()));
+        > = std::sync::Mutex::new(Vec::with_capacity(small_jobs.len()));
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                let jobs_ref = &jobs;
+                let jobs_ref = &small_jobs;
                 let next_ref = &next_job;
                 let res_ref = &results;
                 scope.spawn(move || loop {
@@ -3999,7 +4862,10 @@ pub(super) fn write(
     for i in 0..zip.len() {
         let part = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
         if let Some(sheet) = sheets.remove(part.as_str()) {
-            if let Some(tp) = parallel_parts.remove(&part) {
+            if let Some(mini) = parallel_minis.remove(&part) {
+                let mut mini_zip = ZipArchive::new(std::io::Cursor::new(mini))?;
+                out.raw_copy_file(mini_zip.by_index_raw(0)?)?;
+            } else if let Some(tp) = parallel_parts.remove(&part) {
                 let mut part_zip = ZipArchive::new(File::open(&tp)?)?;
                 out.raw_copy_file(part_zip.by_index_raw(0)?)?;
             } else {
@@ -4040,13 +4906,20 @@ pub(super) fn write(
             wrote_styles = true;
         } else if part == SST_PART && fresh_sst.as_ref().is_some_and(|s| s.modified) {
             let sst = fresh_sst.as_ref().unwrap();
-            out.start_file(
-                SST_PART,
-                SimpleFileOptions::default()
-                    .compression_method(CompressionMethod::Deflated)
-                    .compression_level(Some(2)),
-            )?;
-            out.write_all(&sst.xml)?;
+            if sst.xml.len() >= 2 * 1024 * 1024 {
+                let _ = write_parallel_deflate_entry(&mut out, SST_PART, 2, Some("sst"), |w| {
+                    w.write_all(&sst.xml)?;
+                    Ok(true)
+                })?;
+            } else {
+                out.start_file(
+                    SST_PART,
+                    SimpleFileOptions::default()
+                        .compression_method(CompressionMethod::Deflated)
+                        .compression_level(Some(2)),
+                )?;
+                out.write_all(&sst.xml)?;
+            }
         } else if (dynamic || need_sst_decl)
             && matches!(part.as_str(), super::dynamic::RELS | super::dynamic::TYPES)
         {
@@ -4063,7 +4936,11 @@ pub(super) fn write(
             )?;
             out.write_all(xml.as_bytes())?;
         } else {
-            out.raw_copy_file(zip.by_index_raw(i)?)?;
+            let raw = zip.by_index_raw(i)?;
+            if !wb.load_incomplete && (raw.size() == 0 || raw.compressed_size() > 0) {
+                trusted_parts.insert(part, (raw.crc32(), raw.size()));
+            }
+            out.raw_copy_file(raw)?;
         }
     }
     ensure!(sheets.is_empty(), "缺少流式工作表部件");
@@ -4110,7 +4987,7 @@ struct ScannedBaseSheet {
     orig_cell_xf: HashMap<CellRef, u16>,
 }
 
-fn scan_base_sheet(xml: &str) -> Result<ScannedBaseSheet> {
+fn scan_base_sheet(xml: &str, need_cell_xf: bool) -> Result<ScannedBaseSheet> {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut depth = 0usize;
     let mut root_open_tag = String::new();
@@ -4226,35 +5103,37 @@ fn scan_base_sheet(xml: &str) -> Result<ScannedBaseSheet> {
                         depth = 3;
                     }
                 } else if in_sheet_data && depth == 3 && e.local_name().as_ref() == "c" {
-                    let mut parsed_ref: Option<(u32, u32)> = None;
-                    let mut cell_s: Option<u16> = None;
-                    for a in e.attributes().flatten() {
-                        match a.key.as_ref() {
-                            "r" => {
-                                parsed_ref = crate::sparse::parse_ref(&a.value);
-                            }
-                            "s" => {
-                                if let Ok(v) = a.value.parse::<u16>() {
-                                    cell_s = Some(v);
+                    if need_cell_xf {
+                        let mut parsed_ref: Option<(u32, u32)> = None;
+                        let mut cell_s: Option<u16> = None;
+                        for a in e.attributes().flatten() {
+                            match a.key.as_ref() {
+                                "r" => {
+                                    parsed_ref = crate::sparse::parse_ref(&a.value);
                                 }
+                                "s" => {
+                                    if let Ok(v) = a.value.parse::<u16>() {
+                                        cell_s = Some(v);
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
-                    }
-                    let (r, c) = match parsed_ref {
-                        Some((r, c)) => {
-                            next_col = c.saturating_add(1);
-                            (r, c)
+                        let (r, c) = match parsed_ref {
+                            Some((r, c)) => {
+                                next_col = c.saturating_add(1);
+                                (r, c)
+                            }
+                            None => {
+                                let r = cur_row.unwrap_or(0);
+                                let c = next_col;
+                                next_col = c.saturating_add(1);
+                                (r, c)
+                            }
+                        };
+                        if let Some(xf) = cell_s {
+                            orig_cell_xf.insert(CellRef::new(r, c), xf);
                         }
-                        None => {
-                            let r = cur_row.unwrap_or(0);
-                            let c = next_col;
-                            next_col = c.saturating_add(1);
-                            (r, c)
-                        }
-                    };
-                    if let Some(xf) = cell_s {
-                        orig_cell_xf.insert(CellRef::new(r, c), xf);
                     }
                     if !empty {
                         depth = 4;
@@ -4374,12 +5253,19 @@ fn write_rebuilt_sheet(
     part: &str,
     wb: &Workbook,
     sheet: &Sheet,
-    sst: Option<&HashMap<&str, u32>>,
+    sst: Option<SheetSstLookup<'_>>,
     cm_index: Option<u32>,
     style_appender: &mut Option<StyleAppender>,
     base_styles_xml: &mut Option<String>,
 ) -> Result<()> {
-    let scanned = scan_base_sheet(base_xml)?;
+    let need_cell_xf = !sheet.styles.is_empty()
+        || sheet.styles_dirty
+        || !sheet.style_edits.is_empty()
+        || sheet
+            .source_cells
+            .as_ref()
+            .is_some_and(|s| !s.base_styles().is_empty());
+    let scanned = scan_base_sheet(base_xml, need_cell_xf)?;
     let prefix = scanned.prefix.as_str();
     let src = sheet
         .source_cells
@@ -4781,26 +5667,47 @@ pub(super) fn rebuild_from_base(
         let base_xml = super::read_zip_text(&mut zip, &part)?;
         let (f, tp) = tempfile::NamedTempFile::new_in(dir)?.into_parts();
         let mut zw = ZipWriter::new(BufWriter::with_capacity(128 * 1024, f));
-        zw.start_file(
-            part.as_str(),
-            SimpleFileOptions::default()
-                .compression_method(CompressionMethod::Deflated)
-                .compression_level(Some(2)),
-        )?;
-        let mut vw = VerifiedXmlWriter::new(&mut zw);
-        write_rebuilt_sheet(
-            &mut vw,
-            &base_xml,
-            &part,
-            wb,
-            sheet,
-            sst_ref.map(|s| s.map_for(sheet)),
-            cm_index,
-            &mut style_appender,
-            &mut base_styles_xml,
-        )?;
-        if let Some(sig) = vw.finish(Some("worksheet"))? {
-            trusted_parts.insert(part.clone(), sig);
+        if sheet_estimated_work(sheet) >= 32_768 || base_xml.len() >= 2 * 1024 * 1024 {
+            if let Some(Some(sig)) =
+                write_parallel_deflate_entry(&mut zw, part.as_str(), 2, Some("worksheet"), |w| {
+                    write_rebuilt_sheet(
+                        w,
+                        &base_xml,
+                        &part,
+                        wb,
+                        sheet,
+                        sst_ref.map(|s| s.map_for(sheet)),
+                        cm_index,
+                        &mut style_appender,
+                        &mut base_styles_xml,
+                    )?;
+                    Ok(true)
+                })?
+            {
+                trusted_parts.insert(part.clone(), sig);
+            }
+        } else {
+            zw.start_file(
+                part.as_str(),
+                SimpleFileOptions::default()
+                    .compression_method(CompressionMethod::Deflated)
+                    .compression_level(Some(2)),
+            )?;
+            let mut vw = VerifiedXmlWriter::new(&mut zw);
+            write_rebuilt_sheet(
+                &mut vw,
+                &base_xml,
+                &part,
+                wb,
+                sheet,
+                sst_ref.map(|s| s.map_for(sheet)),
+                cm_index,
+                &mut style_appender,
+                &mut base_styles_xml,
+            )?;
+            if let Some(sig) = vw.finish(Some("worksheet"))? {
+                trusted_parts.insert(part.clone(), sig);
+            }
         }
         zw.finish()?.flush()?;
         rebuilt_zips.insert(part, tp);
@@ -4854,8 +5761,16 @@ pub(super) fn rebuild_from_base(
             continue;
         }
         if part == SST_PART && fresh_sst.as_ref().is_some_and(|s| s.modified) {
-            out.start_file(SST_PART, opts)?;
-            out.write_all(&fresh_sst.as_ref().unwrap().xml)?;
+            let sst = fresh_sst.as_ref().unwrap();
+            if sst.xml.len() >= 2 * 1024 * 1024 {
+                let _ = write_parallel_deflate_entry(&mut out, SST_PART, 2, Some("sst"), |w| {
+                    w.write_all(&sst.xml)?;
+                    Ok(true)
+                })?;
+            } else {
+                out.start_file(SST_PART, opts)?;
+                out.write_all(&sst.xml)?;
+            }
             continue;
         }
         if let Some(bytes) = extra_parts.remove(&part) {
@@ -4863,7 +5778,11 @@ pub(super) fn rebuild_from_base(
             out.write_all(&bytes)?;
             continue;
         }
-        out.raw_copy_file(zip.by_index_raw(i)?)?;
+        let raw = zip.by_index_raw(i)?;
+        if !wb.load_incomplete && (raw.size() == 0 || raw.compressed_size() > 0) {
+            trusted_parts.insert(part, (raw.crc32(), raw.size()));
+        }
+        out.raw_copy_file(raw)?;
     }
 
     ensure!(rebuilt_zips.is_empty(), "重建工作表部件缺失");
@@ -5376,5 +6295,153 @@ mod tests {
             st.feed(bad.as_bytes());
             assert!(!st.finish_document(Some("worksheet")), "must reject: {bad}");
         }
+    }
+
+    #[test]
+    fn direct_layout_metadata_and_parallel_sheet_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("direct-meta-parallel.xlsx");
+        let mut wb = Workbook::new_blank();
+        wb.calc_manual = true;
+        wb.names.push(("Rate".into(), None, "=0.08".into()));
+        let bold_sid = wb.styles.intern(crate::style::CellStyle {
+            bold: true,
+            fill: Some([230, 240, 255]),
+            ..Default::default()
+        });
+        {
+            let sh = &mut wb.sheets[0];
+            sh.tab_color = Some([255, 128, 0]);
+            sh.freeze = Some((2, 1));
+            sh.cols.set(0, 140.0);
+            sh.hidden_cols.insert(3);
+            sh.rows.set(0, 36.0);
+            sh.rows.set(500, 42.0);
+            sh.hidden_rows.insert_range(10, 15);
+            sh.hidden_rows_user.insert_range(10, 15);
+            sh.row_levels.insert(5, 1);
+            sh.col_levels.insert(2, 1);
+            sh.merges.push((0, 0, 0, 1));
+            sh.filter = Some(crate::sort_filter::Filter::new(1, 0, 100, 2));
+            sh.page.landscape = true;
+            sh.page.print_area = Some((0, 0, 50, 2));
+            for r in 0..35_000u32 {
+                sh.set(
+                    r,
+                    0,
+                    Cell {
+                        value: Value::Number(f64::from(r) * 1.25),
+                        formula: None,
+                    },
+                );
+                if r % 500 == 0 {
+                    sh.set_style(r, 0, bold_sid);
+                }
+            }
+        }
+        let mut hidden_sh = crate::model::Sheet::new("HiddenTab");
+        hidden_sh.hidden = true;
+        hidden_sh.set(
+            0,
+            0,
+            Cell {
+                value: Value::Text("后台数据".into()),
+                formula: None,
+            },
+        );
+        wb.sheets.push(hidden_sh);
+
+        assert!(
+            can_write_direct(&wb, false),
+            "workbook with layout/meta must qualify for write_direct"
+        );
+        crate::xlsx::save(&path, &wb).unwrap();
+
+        let (back, diag) = crate::xlsx::load_diag(&path).unwrap();
+        assert!(diag.is_complete());
+        assert!(back.calc_manual);
+        assert_eq!(back.names.len(), 1);
+        let s0 = &back.sheets[0];
+        assert_eq!(s0.tab_color, Some([255, 128, 0]));
+        assert_eq!(s0.freeze, Some((2, 1)));
+        assert!((s0.rows.size(0) - 36.0).abs() < 0.5);
+        assert!((s0.rows.size(500) - 42.0).abs() < 0.5);
+        assert!(s0.hidden_cols.contains(&3));
+        assert!(s0.hidden_rows.is_empty() && s0.hidden_rows_user.contains(&12));
+        assert_eq!(s0.merges, vec![(0, 0, 0, 1)]);
+        assert!(s0.page.landscape);
+        assert_eq!(s0.page.print_area, Some((0, 0, 50, 2)));
+        assert!(back.styles.get(s0.style_of(500, 0)).bold);
+        assert_eq!(s0.value(34_999, 0), Value::Number(34_999.0 * 1.25));
+        assert!(back.sheets[1].hidden);
+        assert_eq!(back.sheets[1].value(0, 0), Value::Text("后台数据".into()));
+    }
+
+    #[test]
+    fn direct_save_then_delta_edit_and_encrypted_memory_hyperlink_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("direct-to-delta.xlsx");
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].freeze = Some((1, 0));
+        wb.sheets[0].rows.set(0, 32.0);
+        wb.sheets[0].cols.set(0, 128.0);
+        for r in 0..2_000u32 {
+            wb.sheets[0].set(
+                r,
+                0,
+                Cell {
+                    value: Value::Number(f64::from(r)),
+                    formula: None,
+                },
+            );
+        }
+        crate::xlsx::save(&path, &wb).unwrap();
+
+        let (mut loaded, _) = crate::xlsx::load_diag(&path).unwrap();
+        loaded.sheets[0].set(
+            5,
+            0,
+            Cell {
+                value: Value::Number(999.5),
+                formula: None,
+            },
+        );
+        let receipt = crate::xlsx::save_atomic_with_receipt(&path, &loaded).unwrap();
+        assert!(receipt.used_cell_delta, "1-cell edit after direct save must use delta");
+
+        let (after_delta, diag) = crate::xlsx::load_diag(&path).unwrap();
+        assert!(diag.is_complete());
+        assert_eq!(after_delta.sheets[0].freeze, Some((1, 0)));
+        assert!((after_delta.sheets[0].rows.size(0) - 32.0).abs() < 0.5);
+        assert_eq!(after_delta.sheets[0].value(5, 0), Value::Number(999.5));
+        assert_eq!(after_delta.sheets[0].value(1_999, 0), Value::Number(1_999.0));
+
+        // Encrypted workbook with internal hyperlink roundtrip via in-memory Cursor loader
+        let enc_path = dir.path().join("encrypted-internal-link.xlsx");
+        let mut ewb = Workbook::new_blank();
+        ewb.encryption = Some(crate::crypto::EncryptionSettings::new("pw123"));
+        ewb.sheets[0].set(
+            0,
+            0,
+            Cell {
+                value: Value::Text("跳转".into()),
+                formula: None,
+            },
+        );
+        ewb.sheets[0].hyperlinks.insert(
+            (0, 0),
+            crate::hyperlinks::Hyperlink {
+                location: "Sheet1!A10".into(),
+                tooltip: "去第10行".into(),
+                ..Default::default()
+            },
+        );
+        ewb.sheets[0].hyperlinks_dirty = true;
+        crate::xlsx::save(&enc_path, &ewb).unwrap();
+
+        let (dec_wb, dec_diag) = crate::xlsx::load_with_password_diag(&enc_path, "pw123").unwrap();
+        assert!(dec_diag.is_complete());
+        let link = dec_wb.sheets[0].hyperlinks.get(&(0, 0)).expect("internal hyperlink preserved");
+        assert_eq!(link.location, "Sheet1!A10");
     }
 }
