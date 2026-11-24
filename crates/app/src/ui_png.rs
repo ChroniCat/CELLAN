@@ -1,9 +1,13 @@
 //! Excel 原始功能区图标（Office imageMso 导出，32px 与 16px 两套）。
+//! 正式版本已全面采用 `ui_icons` 矢量绘制；旧位图资源默认不打入二进制以瘦身体积，
+//! 如需对照位图与矢量，请以 `--features legacy_png_icons` 编译并配合 `SC_ICONS=bitmap` 使用。
 use crate::ui_icons::Icon;
 use eframe::egui;
+#[cfg(feature = "legacy_png_icons")]
 use eframe::egui::{Color32, Context, TextureHandle, TextureOptions};
 
 /// 返回 (纹理名, 32px 字节, 16px 字节)；没有位图的矢量图标返回 None。
+#[cfg(feature = "legacy_png_icons")]
 pub fn png(icon: Icon) -> Option<(&'static str, &'static [u8], &'static [u8])> {
     Some(match icon {
         Icon::AlignC => ("AlignC", include_bytes!("../../../assets/icons/excel/AlignC.png"), include_bytes!("../../../assets/icons/excel/AlignC_16.png")),
@@ -55,6 +59,13 @@ pub fn png(icon: Icon) -> Option<(&'static str, &'static [u8], &'static [u8])> {
     })
 }
 
+#[cfg(not(feature = "legacy_png_icons"))]
+#[allow(dead_code)]
+pub fn png(_icon: Icon) -> Option<(&'static str, &'static [u8], &'static [u8])> {
+    None
+}
+
+#[cfg(feature = "legacy_png_icons")]
 fn texture(ctx: &Context, name: &'static str, small: bool, bytes: &'static [u8]) -> TextureHandle {
     let id = egui::Id::new(("excel-icon", name, small));
     if let Some(t) = ctx.data(|d| d.get_temp::<TextureHandle>(id)) {
@@ -70,6 +81,7 @@ fn texture(ctx: &Context, name: &'static str, small: bool, bytes: &'static [u8])
 }
 
 /// 画一张位图图标；小尺寸用原生 16px 版本，避免 32px 缩小的发虚。
+#[cfg(feature = "legacy_png_icons")]
 pub fn draw(p: &egui::Painter, rect: egui::Rect, icon: Icon, enabled: bool) -> bool {
     if let Some((name, big, small)) = png(icon) {
         let ppp = p.pixels_per_point().max(0.1);
@@ -95,5 +107,10 @@ pub fn draw(p: &egui::Painter, rect: egui::Rect, icon: Icon, enabled: bool) -> b
     } else {
         false
     }
+}
+
+#[cfg(not(feature = "legacy_png_icons"))]
+pub fn draw(_p: &egui::Painter, _rect: egui::Rect, _icon: Icon, _enabled: bool) -> bool {
+    false
 }
 

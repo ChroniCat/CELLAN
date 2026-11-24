@@ -238,6 +238,53 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// 预处理的帧负载：供宿主广播给多个 peer 时仅做一次可选 deflate 压缩，
+/// 各 peer 只需按自身会话密钥执行 ChaCha20 加密 + HMAC-SHA256 认证。
+#[derive(Clone, Debug)]
+pub struct PreparedPayload {
+    payload: Vec<u8>,
+    compressed: bool,
+}
+
+impl PreparedPayload {
+    /// 该预处理负载是否启用了 deflate 压缩
+    pub fn is_compressed(&self) -> bool {
+        self.compressed
+    }
+
+    /// 预处理后（压缩或原始）负载的字节长度
+    pub fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+}
+
+/// 预处理待发送的明文 JSON 帧：
+/// - `compress == true` 且长度不小于 `COMPRESS_MIN_BYTES` 时仅压缩一次；若压缩后反而变大则回退原始明文。
+/// - `compress == false` 时跳过 deflate（适用于 `UpdateSlice` 等高熵 Base64 帧）。
+pub fn prepare_payload(plain: &str, compress: bool) -> std::sync::Arc<PreparedPayload> {
+    let raw_bytes = plain.as_bytes();
+    if compress && raw_bytes.len() >= COMPRESS_MIN_BYTES {
+        let mut compressed_buf = Vec::with_capacity(raw_bytes.len().min(65_536));
+        let ok = {
+            let mut enc = flate2::write::DeflateEncoder::new(
+                &mut compressed_buf,
+                flate2::Compression::fast(),
+            );
+            enc.write_all(raw_bytes).is_ok() && enc.finish().is_ok()
+        };
+        if ok && compressed_buf.len() < raw_bytes.len() {
+            return std::sync::Arc::new(PreparedPayload {
+                payload: compressed_buf,
+                compressed: true,
+            });
+        }
+    }
+    std::sync::Arc::new(PreparedPayload {
+        payload: raw_bytes.to_vec(),
+        compressed: false,
+    })
+}
+
 /// 一个会话的加解密状态
 pub struct Session {
     enc: [u8; 32],
@@ -306,14 +353,38 @@ impl Session {
         n
     }
 
+    /// 使用预处理的共享负载加密一帧（与 `seal`/`open` 线缆格式 100% 兼容）
+    pub fn seal_prepared(&mut self, prepared: &PreparedPayload) -> String {
+        self.send_ctr = self.send_ctr.wrapping_add(1);
+        let ctr = self.send_ctr;
+        let wire_dir = if prepared.compressed {
+            self.send_dir | DIR_COMPRESSED_FLAG
+        } else {
+            self.send_dir
+        };
+        let mut framed = Vec::with_capacity(5 + prepared.payload.len() + 32);
+        framed.push(wire_dir);
+        framed.extend_from_slice(&ctr.to_le_bytes());
+        framed.extend_from_slice(&prepared.payload);
+        apply_keystream(&self.enc, ctr, &Self::nonce(wire_dir, ctr), &mut framed[5..]);
+        let tag = hmac_sha256(&self.mac, &framed);
+        framed.extend_from_slice(&tag);
+        b64_encode(&framed)
+    }
+
     /// 加密一帧（明文 JSON → 可选 deflate 压缩 → 原地加密 + 零拷贝 HMAC → base64）
     pub fn seal(&mut self, plain: &str) -> String {
+        self.seal_with_compression(plain, true)
+    }
+
+    /// 加密一帧，允许调用方显式控制是否尝试 deflate 压缩
+    pub fn seal_with_compression(&mut self, plain: &str, compress: bool) -> String {
         self.send_ctr = self.send_ctr.wrapping_add(1);
         let ctr = self.send_ctr;
         let raw_bytes = plain.as_bytes();
         let mut framed = Vec::with_capacity(5 + raw_bytes.len().min(65_536) + 32);
         framed.extend_from_slice(&[0, 0, 0, 0, 0]);
-        let wire_dir = if raw_bytes.len() >= COMPRESS_MIN_BYTES {
+        let wire_dir = if compress && raw_bytes.len() >= COMPRESS_MIN_BYTES {
             let compressed_ok = {
                 let mut enc = flate2::write::DeflateEncoder::new(
                     &mut framed,
@@ -557,5 +628,50 @@ mod tests {
         let opened = client.open(&sealed).expect("untampered compressed frame opens");
         assert_eq!(opened, big);
         assert!(client.open(&sealed).is_none(), "replay of compressed frame must fail");
+    }
+
+    #[test]
+    fn prepared_payload_shares_single_compression_and_respects_compress_flag() {
+        let room = RoomKey::derive_with_iters("perf-room", b"room-salt", 10);
+        let mut h1 = Session::host_side(&room, b"conn-1");
+        let mut c1 = Session::client_side(&room, b"conn-1");
+        let mut h2 = Session::host_side(&room, b"conn-2");
+        let mut c2 = Session::client_side(&room, b"conn-2");
+
+        let mut big = String::from("{\"t\":\"Ops\",\"ops\":[");
+        for i in 0..256 {
+            if i > 0 {
+                big.push(',');
+            }
+            big.push_str(&format!(
+                "{{\"sheet\":0,\"row\":{i},\"col\":0,\"value\":{{\"Number\":99.5}},\"formula\":null,\"ts\":{},\"site\":1}}",
+                10 + i
+            ));
+        }
+        big.push_str("]}");
+
+        let p_comp = prepare_payload(&big, true);
+        assert!(p_comp.is_compressed());
+        assert!(p_comp.payload_len() < big.len() / 4);
+
+        let f1 = h1.seal_prepared(&p_comp);
+        let f2 = h2.seal_prepared(&p_comp);
+        assert_ne!(f1, f2, "distinct peer sessions must produce distinct ciphertexts");
+        assert_eq!(c1.open(&f1).as_deref(), Some(big.as_str()));
+        assert_eq!(c2.open(&f2).as_deref(), Some(big.as_str()));
+
+        // High-entropy / UpdateSlice bypasses deflate when compress = false
+        let p_raw = prepare_payload(&big, false);
+        assert!(!p_raw.is_compressed());
+        assert_eq!(p_raw.payload_len(), big.len());
+        let f_raw = h1.seal_prepared(&p_raw);
+        let raw_bytes = b64_decode(&f_raw).expect("valid base64");
+        assert_eq!(raw_bytes[0] & DIR_COMPRESSED_FLAG, 0, "uncompressed flag must be clear");
+        assert_eq!(c1.open(&f_raw).as_deref(), Some(big.as_str()));
+
+        // Byte-identical wire output between seal() and seal_prepared() for same session state
+        let mut h_a = Session::host_side(&room, b"same-conn");
+        let mut h_b = Session::host_side(&room, b"same-conn");
+        assert_eq!(h_a.seal(&big), h_b.seal_prepared(&p_comp));
     }
 }

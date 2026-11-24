@@ -529,7 +529,8 @@ pub fn draw_vec_color(p: &Painter, rect: Rect, icon: Icon) {
 }
 
 /// 图标来源：默认矢量。imageMso 导出的是 Office 2010 时代的彩色渐变图，
-/// 和 Excel 365 的扁平线面风格差得远；SC_ICONS=bitmap 可切回位图做对照。
+/// 和 Excel 365 的扁平线面风格差得远；启用 `legacy_png_icons` 特性后 `SC_ICONS=bitmap` 可切回位图做对照。
+#[cfg(feature = "legacy_png_icons")]
 fn use_bitmap() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -541,6 +542,7 @@ fn use_bitmap() -> bool {
 
 /// Excel 风格：彩色块面 + 深色描边。关掉的按钮只画灰线，不铺色。
 pub fn draw_excel(p: &Painter, rect: Rect, icon: Icon, color: Color32, enabled: bool) {
+    #[cfg(feature = "legacy_png_icons")]
     if use_bitmap() && crate::ui_png::draw(p, rect, icon, enabled) {
         return;
     }

@@ -220,9 +220,9 @@ pub fn dir() -> Option<PathBuf> {
             return Some(PathBuf::from(t));
         }
     }
-    let st = load_saved_settings();
-    let p = st.dir?;
-    p.is_dir().then_some(p)
+    // 避免在 UI 主线程同步对可能离线的 SMB 共享路径执行 `is_dir()` 阻塞；
+    // 真正的可达性检查推迟到后台线程的 `probe_all_sources()` 中执行。
+    load_saved_settings().dir
 }
 
 /// 按优先级汇总候选 HTTP 更新地址（去重）：
@@ -776,8 +776,36 @@ fn sha256_prefix_of_file(path: &Path, byte_count: u64) -> Result<String, String>
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// 检查任意一个 `CELLAN.exe` 是否带有合法且自洽的官方签名尾部（`CLNUPD01`）
-pub fn inspect_signed_exe(exe_path: &Path) -> Option<SignedManifest> {
+/// 边写盘边累加前 `expected_prefix_len` 字节的 SHA-256，消除下载落盘后的整包重读哈希。
+pub struct PrefixSha256 {
+    hasher: Sha256,
+    remaining: u64,
+}
+
+impl PrefixSha256 {
+    pub fn new(expected_prefix_len: u64) -> Self {
+        Self {
+            hasher: Sha256::new(),
+            remaining: expected_prefix_len,
+        }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        if self.remaining == 0 || bytes.is_empty() {
+            return;
+        }
+        let take = (bytes.len() as u64).min(self.remaining) as usize;
+        self.hasher.update(&bytes[..take]);
+        self.remaining -= take as u64;
+    }
+
+    pub fn finalize_hex(self) -> Option<String> {
+        (self.remaining == 0).then(|| hex::encode(self.hasher.finalize()))
+    }
+}
+
+/// 仅校验可执行文件末尾的 `CLNUPD01` 签名清单与文件长度自洽性（只读末尾 <= 8 KB，不做全文件哈希）。
+pub fn inspect_signed_exe_trailer(exe_path: &Path) -> Option<SignedManifest> {
     let mut f = std::fs::File::open(exe_path).ok()?;
     let file_len = f.metadata().ok()?.len();
     if file_len < 16 {
@@ -808,6 +836,12 @@ pub fn inspect_signed_exe(exe_path: &Path) -> Option<SignedManifest> {
     if !verify_manifest_sig(&manifest) {
         return None;
     }
+    Some(manifest)
+}
+
+/// 检查任意一个 `CELLAN.exe` 是否带有合法且自洽的官方签名尾部（`CLNUPD01`），并校验全文件 SHA-256。
+pub fn inspect_signed_exe(exe_path: &Path) -> Option<SignedManifest> {
+    let manifest = inspect_signed_exe_trailer(exe_path)?;
     let got_sha = sha256_prefix_of_file(exe_path, manifest.size).ok()?;
     if !got_sha.eq_ignore_ascii_case(&manifest.sha256) {
         return None;
@@ -815,29 +849,75 @@ pub fn inspect_signed_exe(exe_path: &Path) -> Option<SignedManifest> {
     Some(manifest)
 }
 
+static LOCAL_BUNDLE_CACHE: std::sync::OnceLock<Option<(PathBuf, SignedManifest)>> =
+    std::sync::OnceLock::new();
+static LOCAL_BUNDLE_WARMING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn compute_local_signed_bundle() -> Option<(PathBuf, SignedManifest)> {
+    let exe = std::env::current_exe().ok()?;
+    let m = inspect_signed_exe(&exe)?;
+    (m.version == VERSION).then_some((exe, m))
+}
+
+/// 触发后台异步预热 `local_signed_bundle()` 缓存（立即返回，绝不阻塞调用线程）；
+/// 若缓存已就绪则直接返回克隆。
+pub fn try_cached_local_signed_bundle() -> Option<(PathBuf, SignedManifest)> {
+    if cfg!(test) {
+        return compute_local_signed_bundle();
+    }
+    if let Some(cached) = LOCAL_BUNDLE_CACHE.get() {
+        return cached.clone();
+    }
+    if LOCAL_BUNDLE_WARMING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        std::thread::spawn(|| {
+            let _ = LOCAL_BUNDLE_CACHE.get_or_init(compute_local_signed_bundle);
+        });
+    }
+    None
+}
+
+/// 异步获取本机已签名安装包：若缓存已热则当场回调，否则放入后台线程校验后再回调，避免 UI 主线程同步算 60 MB SHA-256。
+pub fn warm_local_signed_bundle_async(
+    on_ready: impl FnOnce(Option<(PathBuf, SignedManifest)>) + Send + 'static,
+) {
+    if cfg!(test) {
+        on_ready(compute_local_signed_bundle());
+        return;
+    }
+    if let Some(cached) = LOCAL_BUNDLE_CACHE.get() {
+        on_ready(cached.clone());
+        return;
+    }
+    std::thread::spawn(move || {
+        let val = LOCAL_BUNDLE_CACHE
+            .get_or_init(compute_local_signed_bundle)
+            .clone();
+        on_ready(val);
+    });
+}
+
 /// 若当前正在运行的 `CELLAN.exe` 是经过官方签名的正式发行版，返回 `(自身路径, 签名清单)`。
 /// 本地 `cargo run` / `cargo test` 未签名开发版返回 `None`，不会对外接力广播。
 pub fn local_signed_bundle() -> Option<(PathBuf, SignedManifest)> {
-    static CACHED: std::sync::OnceLock<Option<(PathBuf, SignedManifest)>> =
-        std::sync::OnceLock::new();
     if cfg!(test) {
-        let exe = std::env::current_exe().ok()?;
-        let m = inspect_signed_exe(&exe)?;
-        return (m.version == VERSION).then_some((exe, m));
+        return compute_local_signed_bundle();
     }
-    CACHED
-        .get_or_init(|| {
-            let exe = std::env::current_exe().ok()?;
-            let m = inspect_signed_exe(&exe)?;
-            (m.version == VERSION).then_some((exe, m))
-        })
+    LOCAL_BUNDLE_CACHE
+        .get_or_init(compute_local_signed_bundle)
         .clone()
 }
 
-/// 对下载落盘的临时文件执行严格的「公钥验签 + SHA-256 全量校验 + 尾部补全」
-pub fn verify_and_finalize_staged_exe(
+/// 对下载落盘的临时文件执行严格的「公钥验签 + SHA-256 全量校验 + 尾部补全」。
+/// 若调用方已在流式写盘时计算完前 `expected.size` 字节的 SHA-256，传入 `precomputed_sha256` 可彻底省去落盘后的全文件重读；
+/// 若文件已带 `CLNUPD01` 尾部，仅校验尾部清单与元信息，不再重读整包做第二遍 SHA-256。
+pub fn verify_and_finalize_staged_exe_with_sha(
     staged_path: &Path,
     expected: &SignedManifest,
+    precomputed_sha256: Option<&str>,
 ) -> Result<(), String> {
     if !verify_manifest_sig(expected) {
         return Err("更新包数字签名校验未通过，已拒绝安装".into());
@@ -851,9 +931,18 @@ pub fn verify_and_finalize_staged_exe(
             expected.size, file_len
         ));
     }
-    let got_sha = sha256_prefix_of_file(staged_path, expected.size)?;
-    if !got_sha.eq_ignore_ascii_case(&expected.sha256) {
-        return Err("更新包 SHA-256 摘要不匹配（文件损坏或被篡改），已拒绝安装".into());
+    match precomputed_sha256 {
+        Some(got_sha) => {
+            if !got_sha.eq_ignore_ascii_case(&expected.sha256) {
+                return Err("更新包 SHA-256 摘要不匹配（文件损坏或被篡改），已拒绝安装".into());
+            }
+        }
+        None => {
+            let got_sha = sha256_prefix_of_file(staged_path, expected.size)?;
+            if !got_sha.eq_ignore_ascii_case(&expected.sha256) {
+                return Err("更新包 SHA-256 摘要不匹配（文件损坏或被篡改），已拒绝安装".into());
+            }
+        }
     }
 
     if file_len == expected.size {
@@ -868,8 +957,9 @@ pub fn verify_and_finalize_staged_exe(
         return Ok(());
     }
 
-    // 文件已带尾部：核对尾部合法且与 expected 完全一致
-    let Some(embedded) = inspect_signed_exe(staged_path) else {
+    // 文件已带尾部：前面已验证主体前 `expected.size` 字节的 SHA-256 与 expected 一致，
+    // 这里仅验证末尾 `CLNUPD01` 尾部清单、签名与总长度严格匹配，彻底避免第二遍 60 MB 哈希。
+    let Some(embedded) = inspect_signed_exe_trailer(staged_path) else {
         return Err("更新包附加数据异常，已拒绝安装".into());
     };
     if embedded.version != expected.version
@@ -880,6 +970,15 @@ pub fn verify_and_finalize_staged_exe(
         return Err("更新包内嵌签名清单与通告不一致，已拒绝安装".into());
     }
     Ok(())
+}
+
+/// 对下载落盘的临时文件执行严格的「公钥验签 + SHA-256 全量校验 + 尾部补全」
+#[allow(dead_code)]
+pub fn verify_and_finalize_staged_exe(
+    staged_path: &Path,
+    expected: &SignedManifest,
+) -> Result<(), String> {
+    verify_and_finalize_staged_exe_with_sha(staged_path, expected, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,7 +1183,7 @@ pub fn check_shared_dir(dir: &Path) -> Result<Option<AvailableUpdate>, String> {
 /// 按顺序探测所有已配置更新源（HTTP 发版源优先，其次共享目录）
 pub fn probe_all_sources() -> Result<Option<AvailableUpdate>, String> {
     let urls = candidate_http_urls();
-    let shared = dir();
+    let shared = dir().filter(|p| p.is_dir());
     if urls.is_empty() && shared.is_none() {
         return Err("尚未配置更新源（将在与新版同事协作时自动同步）".into());
     }
@@ -1140,7 +1239,7 @@ pub fn download_and_verify(
     let _ = std::fs::remove_file(&part_path);
     let _ = std::fs::remove_file(&verified_path);
 
-    let res: Result<(), String> = match &avail.source {
+    let res: Result<Option<String>, String> = match &avail.source {
         UpdateSource::Http { base_url } => {
             download_from_http(base_url, &avail.manifest, &part_path, &mut on_progress)
         }
@@ -1154,11 +1253,16 @@ pub fn download_and_verify(
             Err("未签名的共享目录包不支持自动安装".into())
         }
     };
-    if let Err(e) = res {
-        let _ = std::fs::remove_file(&part_path);
-        return Err(e);
-    }
-    if let Err(e) = verify_and_finalize_staged_exe(&part_path, &avail.manifest) {
+    let streamed_sha = match res {
+        Ok(sha) => sha,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(e);
+        }
+    };
+    if let Err(e) =
+        verify_and_finalize_staged_exe_with_sha(&part_path, &avail.manifest, streamed_sha.as_deref())
+    {
         let _ = std::fs::remove_file(&part_path);
         return Err(e);
     }
@@ -1172,7 +1276,7 @@ fn download_from_http(
     manifest: &SignedManifest,
     dest: &Path,
     on_progress: &mut impl FnMut(u64, u64),
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let parsed = parse_http_base(base_url)?;
     let mut stream = connect_http_direct(&parsed, Duration::from_secs(4))?;
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -1201,6 +1305,7 @@ fn download_from_http(
     }
     let mut out = std::fs::File::create(dest).map_err(|e| format!("创建临时安装包失败：{e}"))?;
     let mut buf = vec![0u8; IO_BUF_BYTES];
+    let mut prefix_hash = PrefixSha256::new(manifest.size);
     let mut received = 0u64;
     on_progress(0, total);
     loop {
@@ -1214,13 +1319,14 @@ fn download_from_http(
         if received > MAX_EXE_BYTES + (MAX_MANIFEST_BYTES as u64) + 64 {
             return Err("下载数据超过大小上限".into());
         }
+        prefix_hash.update(&buf[..n]);
         out.write_all(&buf[..n])
             .map_err(|e| format!("写入临时安装包失败：{e}"))?;
         on_progress(received.min(total), total);
     }
     out.flush()
         .map_err(|e| format!("刷新临时安装包失败：{e}"))?;
-    Ok(())
+    Ok(prefix_hash.finalize_hex())
 }
 
 fn copy_from_shared_dir(
@@ -1228,7 +1334,7 @@ fn copy_from_shared_dir(
     manifest: &SignedManifest,
     dest: &Path,
     on_progress: &mut impl FnMut(u64, u64),
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let mut src = std::fs::File::open(src_exe).map_err(|e| format!("打开共享盘更新包失败：{e}"))?;
     let total = src
         .metadata()
@@ -1240,6 +1346,7 @@ fn copy_from_shared_dir(
     }
     let mut out = std::fs::File::create(dest).map_err(|e| format!("创建本地缓存文件失败：{e}"))?;
     let mut buf = vec![0u8; IO_BUF_BYTES];
+    let mut prefix_hash = PrefixSha256::new(manifest.size);
     let mut received = 0u64;
     on_progress(0, total);
     loop {
@@ -1250,13 +1357,14 @@ fn copy_from_shared_dir(
             break;
         }
         received += n as u64;
+        prefix_hash.update(&buf[..n]);
         out.write_all(&buf[..n])
             .map_err(|e| format!("写入本地缓存失败：{e}"))?;
         on_progress(received.min(total), total);
     }
     out.flush()
         .map_err(|e| format!("刷新本地缓存失败：{e}"))?;
-    Ok(())
+    Ok(prefix_hash.finalize_hex())
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,7 +1372,7 @@ fn copy_from_shared_dir(
 // ---------------------------------------------------------------------------
 
 /// 将已验签通过的 `verified_exe` 原地原子替换到 `target_exe`：
-/// 1. 先复制到与 `target_exe` 同目录的临时文件（跨盘符安全，目录只读时提前失败不伤原程序）；
+/// 1. 同卷优先原子 `rename` 到与 `target_exe` 同目录的临时文件（零 60 MB 磁盘拷贝），跨卷或重命名失败时回退 `copy`；
 /// 2. 将正在运行的 `target_exe` 重命名为 `.old`（Windows 允许对运行中进程执行同目录 rename）；
 /// 3. 将同目录新文件原子重命名为 `target_exe`，失败则立即回滚 `.old`。
 pub fn install_to_target(verified_exe: &Path, target_exe: &Path) -> Result<(), String> {
@@ -1279,12 +1387,18 @@ pub fn install_to_target(verified_exe: &Path, target_exe: &Path) -> Result<(), S
     let staged_same_vol = parent.join(format!(".{file_name}.{pid}.new"));
     let _ = std::fs::remove_file(&staged_same_vol);
 
-    std::fs::copy(verified_exe, &staged_same_vol).map_err(|e| {
-        format!(
-            "当前程序所在目录不可写（{}），请将 CELLAN.exe 放在桌面或个人目录运行：{e}",
-            parent.display()
-        )
-    })?;
+    let moved_in_place = match std::fs::rename(verified_exe, &staged_same_vol) {
+        Ok(()) => true,
+        Err(_) => {
+            std::fs::copy(verified_exe, &staged_same_vol).map_err(|e| {
+                format!(
+                    "当前程序所在目录不可写（{}），请将 CELLAN.exe 放在桌面或个人目录运行：{e}",
+                    parent.display()
+                )
+            })?;
+            false
+        }
+    };
 
     let primary_old = parent.join(format!("{file_name}.old"));
     let backup_old = if !primary_old.exists() || std::fs::remove_file(&primary_old).is_ok() {
@@ -1295,18 +1409,24 @@ pub fn install_to_target(verified_exe: &Path, target_exe: &Path) -> Result<(), S
 
     if target_exe.exists() {
         if let Err(e) = std::fs::rename(target_exe, &backup_old) {
-            let _ = std::fs::remove_file(&staged_same_vol);
+            if !moved_in_place || std::fs::rename(&staged_same_vol, verified_exe).is_err() {
+                let _ = std::fs::remove_file(&staged_same_vol);
+            }
             return Err(format!("重命名当前运行程序失败：{e}"));
         }
     }
 
     if let Err(e) = std::fs::rename(&staged_same_vol, target_exe) {
         let _ = std::fs::rename(&backup_old, target_exe);
-        let _ = std::fs::remove_file(&staged_same_vol);
+        if !moved_in_place || std::fs::rename(&staged_same_vol, verified_exe).is_err() {
+            let _ = std::fs::remove_file(&staged_same_vol);
+        }
         return Err(format!("替换新版可执行文件失败（已回滚原版本）：{e}"));
     }
 
-    let _ = std::fs::remove_file(verified_exe);
+    if !moved_in_place {
+        let _ = std::fs::remove_file(verified_exe);
+    }
     Ok(())
 }
 
@@ -1851,5 +1971,46 @@ mod tests {
             .expect("PowerShell ECDsaCng 签出的 CLNUPD01 安装包必须通过 Rust 端验签");
         assert_eq!(verified.version, "99.5");
         assert_eq!(verified.notes, "PSInterop");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn streaming_prefix_sha_verifies_signed_and_raw_staged_exe_and_rejects_bad_trailer() {
+        let env = crate::test_env::TestEnv::new("update-streaming-sha");
+        let kp = cng::TestKeyPair::generate();
+        env.sc("SC_UPDATE_PUBKEY", &kp.pubkey_hex);
+
+        let raw = b"MZ-streaming-prefix-sha256-payload-data-0123456789";
+        let (manifest, full_exe) = make_test_signed_release(&kp, "99.7", raw, "流式单遍校验");
+
+        // 1. Streaming hash across chunk boundaries matches manifest.sha256
+        let mut h = PrefixSha256::new(manifest.size);
+        for chunk in full_exe.chunks(11) {
+            h.update(chunk);
+        }
+        let sha = h.finalize_hex().expect("complete prefix");
+        assert_eq!(sha, manifest.sha256);
+
+        // 2. Signed exe with CLNUPD01 trailer passes trailer-only check + precomputed sha
+        let signed_path = env.path("signed.part");
+        std::fs::write(&signed_path, &full_exe).unwrap();
+        assert_eq!(inspect_signed_exe_trailer(&signed_path), Some(manifest.clone()));
+        verify_and_finalize_staged_exe_with_sha(&signed_path, &manifest, Some(&sha)).unwrap();
+
+        // 3. Raw exe without trailer gets trailer appended cleanly
+        let raw_path = env.path("raw.part");
+        std::fs::write(&raw_path, raw).unwrap();
+        verify_and_finalize_staged_exe_with_sha(&raw_path, &manifest, Some(&sha)).unwrap();
+        assert_eq!(std::fs::read(&raw_path).unwrap(), full_exe);
+
+        // 4. Corrupted trailer is rejected even when precomputed prefix sha matches
+        let mut bad_trailer = full_exe.clone();
+        let last = bad_trailer.len() - 1;
+        bad_trailer[last] ^= 0xFF;
+        let bad_path = env.path("bad_trailer.part");
+        std::fs::write(&bad_path, &bad_trailer).unwrap();
+        assert!(
+            verify_and_finalize_staged_exe_with_sha(&bad_path, &manifest, Some(&sha)).is_err()
+        );
     }
 }

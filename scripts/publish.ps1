@@ -207,7 +207,7 @@ if ($LASTEXITCODE -ne 0 -or $pending) {
 # 4. Build static single-file release executable with embedded update endpoint
 $env:CELLAN_RELEASE_COMMIT = $releaseCommit
 $env:CARGO_TARGET_DIR = Join-Path $repoRoot "target"
-$env:RUSTFLAGS = "-C target-feature=+crt-static"
+$env:RUSTFLAGS = "-C target-feature=+crt-static -C target-cpu=x86-64-v2"
 $env:CELLAN_DEFAULT_UPDATE_URL = $UpdateUrl
 $env:CELLAN_UPDATE_PUBKEY = $pubHex
 
