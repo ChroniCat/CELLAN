@@ -221,8 +221,8 @@ pub(crate) fn from_sheet(
                 .or_insert_with_key(|id| Arc::new(palette.get(*id).clone()));
             let cell = sh.get(r, c);
             (
-                cell.map_or(ValueWire::Empty, |v| (&v.value).into()),
-                cell.and_then(|v| v.formula.clone()),
+                cell.as_deref().map_or(ValueWire::Empty, |v| (&v.value).into()),
+                cell.as_deref().and_then(|v| v.formula.clone()),
                 style.clone(),
             )
         },

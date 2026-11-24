@@ -1,68 +1,41 @@
 //! Append verified variations of an existing cell XF. Existing records and
 //! extension markup stay byte-for-byte intact. Raw indices never move.
 use crate::style::{CellStyle, StyleTable};
+use quick_xml::{Reader, events::Event};
 use roxmltree::{Document, Node};
-use std::{collections::HashMap, ops::Range};
+use std::{borrow::Cow, collections::HashMap, ops::Range};
 
 const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 
-struct Table {
+struct Table<'a> {
     rows: Vec<Range<usize>>,
     count: Range<usize>,
     end: usize,
     close_empty: Option<String>,
     added: Vec<String>,
+    lookup: Option<HashMap<Cow<'a, str>, u16>>,
 }
 
-impl Table {
-    fn read(root: Node<'_, '_>, xml: &str, name: &str, item: &str) -> Option<Self> {
-        let mut nodes = root.children().filter(|n| n.has_tag_name((NS, name)));
-        let table = nodes.next()?;
-        if nodes.next().is_some() || table.default_namespace() != Some(NS) {
-            return None;
-        }
-        let count = table.attribute_node("count")?;
-        let mut rows = Vec::new();
-        for child in table.children().filter(|n| n.is_element()) {
-            if !child.has_tag_name((NS, item)) {
-                return None;
+impl<'a> Table<'a> {
+    fn intern(&mut self, xml: &'a str, value: String) -> Option<u16> {
+        let lookup = self.lookup.get_or_insert_with(|| {
+            let mut map = HashMap::with_capacity(self.rows.len() + 8);
+            for (i, r) in self.rows.iter().enumerate() {
+                if let Ok(idx) = u16::try_from(i) {
+                    map.entry(Cow::Borrowed(&xml[r.clone()])).or_insert(idx);
+                }
             }
-            rows.push(child.range());
+            map
+        });
+        if let Some(&idx) = lookup.get(value.as_str()) {
+            return Some(idx);
         }
-        if rows.len() != count.value().parse::<usize>().ok()? {
-            return None;
-        }
-        let close = format!("</{name}>");
-        let raw = &xml[table.range()];
-        let (end, close_empty) = if raw.ends_with(&close) {
-            (table.range().end - close.len(), None)
-        } else if raw.ends_with("/>") && raw.starts_with(&format!("<{name}")) && rows.is_empty() {
-            (table.range().end - 2, Some(close))
-        } else {
-            return None;
-        };
-        Some(Self {
-            rows,
-            count: count.range_value(),
-            end,
-            close_empty,
-            added: Vec::new(),
-        })
-    }
-
-    fn intern(&mut self, xml: &str, value: String) -> Option<u16> {
-        if let Some(i) = self.rows.iter().position(|r| xml[r.clone()] == value) {
-            return u16::try_from(i).ok();
-        }
-        let len = self.rows.len();
-        if let Some(i) = self.added.iter().position(|s| s == &value) {
-            return u16::try_from(len + i).ok();
-        }
-        let idx = u16::try_from(len + self.added.len()).ok()?;
+        let idx = u16::try_from(self.rows.len() + self.added.len()).ok()?;
         // Leave room for the collection count and avoid Excel's style limit.
         if idx >= 65_490 {
             return None;
         }
+        lookup.insert(Cow::Owned(value.clone()), idx);
         self.added.push(value);
         Some(idx)
     }
@@ -79,6 +52,76 @@ impl Table {
             edits.push((self.end..self.end, rows));
         }
     }
+}
+
+/// 在 `<tag ...>` 原始字节串内定位某个属性的值范围（不含引号），避免整表 DOM 解析。
+fn find_attr_value_range(xml: &str, tag_start: usize, tag_end: usize, target: &str) -> Option<Range<usize>> {
+    let b = xml.as_bytes();
+    let mut i = tag_start;
+    if i >= tag_end || b[i] != b'<' {
+        return None;
+    }
+    i += 1;
+    while i < tag_end && !matches!(b[i], b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>') {
+        i += 1;
+    }
+    while i < tag_end {
+        while i < tag_end && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        }
+        if i >= tag_end || b[i] == b'>' || b[i] == b'/' {
+            break;
+        }
+        let kstart = i;
+        while i < tag_end && !matches!(b[i], b' ' | b'\t' | b'\r' | b'\n' | b'=' | b'/' | b'>') {
+            i += 1;
+        }
+        let key = &xml[kstart..i];
+        while i < tag_end && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        }
+        if i >= tag_end || b[i] != b'=' {
+            return None;
+        }
+        i += 1;
+        while i < tag_end && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        }
+        if i >= tag_end || (b[i] != b'"' && b[i] != b'\'') {
+            return None;
+        }
+        let q = b[i];
+        i += 1;
+        let vstart = i;
+        while i < tag_end && b[i] != q {
+            i += 1;
+        }
+        if i >= tag_end {
+            return None;
+        }
+        let vend = i;
+        i += 1;
+        if key == target {
+            return Some(vstart..vend);
+        }
+    }
+    None
+}
+
+fn parse_fragment(root_open: &str, raw: &str) -> Option<(String, usize)> {
+    let mut wrapped = String::with_capacity(root_open.len() + raw.len() + "</styleSheet>".len());
+    wrapped.push_str(root_open);
+    wrapped.push_str(raw);
+    wrapped.push_str("</styleSheet>");
+    Some((wrapped, root_open.len()))
+}
+
+fn shift_range(r: Range<usize>, wrap_offset: usize, xml_start: usize) -> Range<usize> {
+    (r.start - wrap_offset + xml_start)..(r.end - wrap_offset + xml_start)
+}
+
+fn effective_font_name(name: &str) -> &str {
+    if name.is_empty() { "Calibri" } else { name }
 }
 
 fn apply_edits(original: &str, start: usize, mut edits: Vec<(Range<usize>, String)>) -> String {
@@ -260,14 +303,17 @@ impl<'a> Pattern<'a> {
         ) {
             return None;
         }
+        let bg = self
+            .bg
+            .or_else(|| (self.kind == "solid").then_some(Paint::Indexed(64)));
+        if self.fg.is_none() && bg.is_none() {
+            return Some(format!("<fill><patternFill patternType=\"{}\"/></fill>", self.kind));
+        }
         let mut out = format!("<fill><patternFill patternType=\"{}\">", self.kind);
         if let Some(c) = self.fg {
             out.push_str(&c.xml("fgColor")?);
         }
-        if let Some(c) = self
-            .bg
-            .or_else(|| (self.kind == "solid").then_some(Paint::Indexed(64)))
-        {
+        if let Some(c) = bg {
             out.push_str(&c.xml("bgColor")?);
         }
         out.push_str("</patternFill></fill>");
@@ -391,56 +437,15 @@ fn ordinary_border_color(c: Node<'_, '_>, expected: [u8; 3]) -> bool {
             && !c.children().any(|n| n.is_element())
 }
 
-struct NumberFormats {
-    table: Option<Table>,
+struct NumberFormats<'a> {
+    table: Option<Table<'a>>,
     before_fonts: usize,
     codes: HashMap<u16, String>,
     next: Option<u16>,
     added: Vec<String>,
 }
 
-impl NumberFormats {
-    fn read(root: Node<'_, '_>, xml: &str) -> Option<Self> {
-        let fonts = root.children().find(|n| n.has_tag_name((NS, "fonts")))?;
-        let mut codes = HashMap::new();
-        let table = if let Some(records) = root.children().find(|n| n.has_tag_name((NS, "numFmts")))
-        {
-            let table = Table::read(root, xml, "numFmts", "numFmt")?;
-            for row in records.children().filter(Node::is_element) {
-                if row.children().any(|n| n.is_element())
-                    || row.attributes().any(|a| {
-                        a.namespace().is_some() || !matches!(a.name(), "numFmtId" | "formatCode")
-                    })
-                {
-                    return None;
-                }
-                let id = row.attribute("numFmtId")?.parse().ok()?;
-                if codes
-                    .insert(id, row.attribute("formatCode")?.to_owned())
-                    .is_some()
-                {
-                    return None;
-                }
-            }
-            Some(table)
-        } else {
-            None
-        };
-        // Reserve even IDs referenced by other style families (e.g. differential
-        // styles); do not give previously unrecognized references a new meaning.
-        let mut highest = 163u16;
-        for id in root.descendants().filter_map(|n| n.attribute("numFmtId")) {
-            highest = highest.max(id.parse().ok()?);
-        }
-        Some(Self {
-            table,
-            before_fonts: fonts.range().start,
-            codes,
-            next: highest.checked_add(1),
-            added: Vec::new(),
-        })
-    }
-
+impl<'a> NumberFormats<'a> {
     fn resolve(&mut self, old_id: u16, old: &str, new: &str) -> Option<u16> {
         // Use only locale-independent built-ins. Other codes can be recorded
         // verbatim in a custom format, preserving the user's exact display code.
@@ -513,47 +518,386 @@ impl NumberFormats {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    NumFmts,
+    Fonts,
+    Fills,
+    Borders,
+    CellStyleXfs,
+    CellXfs,
+}
+
+impl Section {
+    fn from_tag(name: &str) -> Option<Self> {
+        match name {
+            "numFmts" => Some(Self::NumFmts),
+            "fonts" => Some(Self::Fonts),
+            "fills" => Some(Self::Fills),
+            "borders" => Some(Self::Borders),
+            "cellStyleXfs" => Some(Self::CellStyleXfs),
+            "cellXfs" => Some(Self::CellXfs),
+            _ => None,
+        }
+    }
+    fn tag_name(self) -> &'static str {
+        match self {
+            Self::NumFmts => "numFmts",
+            Self::Fonts => "fonts",
+            Self::Fills => "fills",
+            Self::Borders => "borders",
+            Self::CellStyleXfs => "cellStyleXfs",
+            Self::CellXfs => "cellXfs",
+        }
+    }
+    fn item_name(self) -> &'static str {
+        match self {
+            Self::NumFmts => "numFmt",
+            Self::Fonts => "font",
+            Self::Fills => "fill",
+            Self::Borders => "border",
+            Self::CellStyleXfs => "xf",
+            Self::CellXfs => "xf",
+        }
+    }
+}
+
+struct SectionSlot<'a> {
+    seen: usize,
+    valid: bool,
+    table: Option<Table<'a>>,
+}
+
+impl<'a> Default for SectionSlot<'a> {
+    fn default() -> Self {
+        Self {
+            seen: 0,
+            valid: true,
+            table: None,
+        }
+    }
+}
+
 pub(super) struct Styles<'a> {
     xml: &'a str,
-    doc: Document<'a>,
-    fonts: Table,
-    fills: Option<Table>,
-    borders: Option<Table>,
-    formats: Option<NumberFormats>,
-    xfs: Table,
+    root_open: String,
+    fonts: Table<'a>,
+    fills: Option<Table<'a>>,
+    borders: Option<Table<'a>>,
+    cell_style_xfs: Option<Vec<Range<usize>>>,
+    has_cell_style_xfs: bool,
+    formats: Option<NumberFormats<'a>>,
+    xfs: Table<'a>,
     resolved: HashMap<(u16, u16, u16), u16>,
 }
 
 impl<'a> Styles<'a> {
+    /// 单遍流式索引 `xl/styles.xml`：不构造全量 `roxmltree` DOM，
+    /// 仅记录各表子项字节切片范围，后续按需对单个修改记录做微片段解析。
     pub(super) fn new(xml: &'a str) -> Option<Self> {
-        let doc = Document::parse(xml).ok()?;
-        let root = doc.root_element();
-        // Inserted font property names inherit the default SpreadsheetML namespace.
-        if !root.has_tag_name((NS, "styleSheet")) || root.default_namespace() != Some(NS) {
+        let mut reader = Reader::from_str(xml);
+        let mut depth = 0usize;
+        let mut root_open = String::new();
+        let mut saw_root = false;
+
+        let mut fonts_slot = SectionSlot::default();
+        let mut fills_slot = SectionSlot::default();
+        let mut borders_slot = SectionSlot::default();
+        let mut xfs_slot = SectionSlot::default();
+        let mut num_fmts_slot = SectionSlot::default();
+        let mut cell_style_xfs_rows: Vec<Range<usize>> = Vec::new();
+        let mut has_cell_style_xfs = false;
+        let mut cell_style_xfs_count_seen = 0usize;
+
+        let mut before_fonts: Option<usize> = None;
+        let mut highest_num_fmt_id: u16 = 163;
+        let mut num_fmt_id_overflow = false;
+        let mut num_fmt_codes: HashMap<u16, String> = HashMap::new();
+        let mut num_fmts_attrs_ok = true;
+
+        let mut active: Option<(Section, usize, Option<Range<usize>>, Option<usize>, Vec<Range<usize>>, bool)> = None;
+
+        loop {
+            let start = reader.buffer_position() as usize;
+            let ev = reader.read_event().ok()?;
+            let end = reader.buffer_position() as usize;
+            match ev {
+                Event::Start(ref e) | Event::Empty(ref e) => {
+                    let empty = matches!(ev, Event::Empty(_));
+                    let qname = e.name();
+                    let name = qname.as_ref();
+
+                    // 收集任意深度上的 numFmtId（与原先 root.descendants() 保持一致）
+                    for a in e.attributes() {
+                        let a = a.ok()?;
+                        if a.key.as_ref() == "numFmtId" {
+                            match a.value.parse::<u16>() {
+                                Ok(id) => highest_num_fmt_id = highest_num_fmt_id.max(id),
+                                Err(_) => num_fmt_id_overflow = true,
+                            }
+                        }
+                    }
+
+                    if depth == 0 {
+                        if saw_root || name != "styleSheet" {
+                            return None;
+                        }
+                        let mut default_ns_ok = false;
+                        for a in e.attributes() {
+                            let a = a.ok()?;
+                            if a.key.as_ref() == "xmlns"
+                                && quick_xml::escape::unescape(&a.value).ok().as_deref() == Some(NS)
+                            {
+                                default_ns_ok = true;
+                            }
+                        }
+                        if !default_ns_ok || empty {
+                            return None;
+                        }
+                        root_open = xml[start..end].to_owned();
+                        saw_root = true;
+                        depth = 1;
+                    } else if depth == 1 {
+                        if let Some(sec) = Section::from_tag(name) {
+                            let mut bad_ns = false;
+                            let mut count_val: Option<usize> = None;
+                            for a in e.attributes() {
+                                let a = a.ok()?;
+                                if a.key.as_ref() == "xmlns"
+                                    && quick_xml::escape::unescape(&a.value).ok().as_deref() != Some(NS)
+                                {
+                                    bad_ns = true;
+                                } else if a.key.as_ref() == "count" {
+                                    count_val = a.value.parse::<usize>().ok();
+                                }
+                            }
+                            if sec == Section::Fonts && before_fonts.is_none() {
+                                before_fonts = Some(start);
+                            }
+                            if sec == Section::CellStyleXfs {
+                                has_cell_style_xfs = true;
+                                cell_style_xfs_count_seen += 1;
+                                if empty {
+                                    // empty <cellStyleXfs/>
+                                } else {
+                                    active = Some((sec, start, None, None, Vec::new(), !bad_ns));
+                                    depth = 2;
+                                }
+                                continue;
+                            }
+                            let count_range = find_attr_value_range(xml, start, end, "count");
+                            if empty {
+                                let valid = !bad_ns
+                                    && count_val == Some(0)
+                                    && count_range.is_some()
+                                    && xml[start..end].ends_with("/>")
+                                    && xml[start..end].starts_with(&format!("<{}", sec.tag_name()));
+                                let slot = match sec {
+                                    Section::NumFmts => &mut num_fmts_slot,
+                                    Section::Fonts => &mut fonts_slot,
+                                    Section::Fills => &mut fills_slot,
+                                    Section::Borders => &mut borders_slot,
+                                    Section::CellXfs => &mut xfs_slot,
+                                    Section::CellStyleXfs => unreachable!(),
+                                };
+                                slot.seen += 1;
+                                if valid && slot.seen == 1 {
+                                    slot.table = Some(Table {
+                                        rows: Vec::new(),
+                                        count: count_range.unwrap(),
+                                        end: end - 2,
+                                        close_empty: Some(format!("</{}>", sec.tag_name())),
+                                        added: Vec::new(),
+                                        lookup: None,
+                                    });
+                                } else {
+                                    slot.valid = false;
+                                    slot.table = None;
+                                }
+                            } else {
+                                let valid = !bad_ns && count_val.is_some() && count_range.is_some();
+                                let cap = count_val.unwrap_or(0).min(65_536);
+                                active = Some((sec, start, count_range, count_val, Vec::with_capacity(cap), valid));
+                                depth = 2;
+                            }
+                        } else if !empty {
+                            depth = 2;
+                        }
+                    } else if depth == 2 {
+                        if let Some((sec, _, _, _, ref mut rows, ref mut valid)) = active {
+                            let item_name = sec.item_name();
+                            if name != item_name {
+                                *valid = false;
+                            }
+                            let mut bad_ns = false;
+                            if sec == Section::NumFmts {
+                                let mut id_opt = None;
+                                let mut fmt_opt = None;
+                                for a in e.attributes() {
+                                    let a = a.ok()?;
+                                    let k = a.key.as_ref();
+                                    if k == "xmlns" {
+                                        if quick_xml::escape::unescape(&a.value).ok().as_deref() != Some(NS) {
+                                            bad_ns = true;
+                                        }
+                                    } else if k == "numFmtId" {
+                                        id_opt = a.value.parse::<u16>().ok();
+                                    } else if k == "formatCode" {
+                                        fmt_opt = quick_xml::escape::unescape(&a.value).ok().map(Cow::into_owned);
+                                    } else {
+                                        num_fmts_attrs_ok = false;
+                                    }
+                                }
+                                if !empty {
+                                    // 检查是否有子元素
+                                    let mut sub_depth = 1usize;
+                                    while sub_depth > 0 {
+                                        match reader.read_event().ok()? {
+                                            Event::Start(_) => {
+                                                num_fmts_attrs_ok = false;
+                                                sub_depth += 1;
+                                            }
+                                            Event::Empty(_) => {
+                                                num_fmts_attrs_ok = false;
+                                            }
+                                            Event::End(_) => sub_depth -= 1,
+                                            Event::Eof => return None,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                let item_end = reader.buffer_position() as usize;
+                                if let (Some(id), Some(fc)) = (id_opt, fmt_opt) {
+                                    if num_fmt_codes.insert(id, fc).is_some() {
+                                        num_fmts_attrs_ok = false;
+                                    }
+                                } else {
+                                    num_fmts_attrs_ok = false;
+                                }
+                                if bad_ns {
+                                    *valid = false;
+                                }
+                                rows.push(start..item_end);
+                                continue;
+                            } else {
+                                for a in e.attributes() {
+                                    let a = a.ok()?;
+                                    if a.key.as_ref() == "xmlns"
+                                        && quick_xml::escape::unescape(&a.value).ok().as_deref() != Some(NS)
+                                    {
+                                        bad_ns = true;
+                                    }
+                                }
+                                if bad_ns {
+                                    *valid = false;
+                                }
+                                if !empty {
+                                    reader.read_to_end(e.name()).ok()?;
+                                }
+                                let item_end = reader.buffer_position() as usize;
+                                rows.push(start..item_end);
+                                continue;
+                            }
+                        } else if !empty {
+                            depth += 1;
+                        }
+                    } else if !empty {
+                        depth += 1;
+                    }
+                }
+                Event::End(_) => {
+                    if depth == 2 && active.is_some() {
+                        let (sec, _sec_start, count_range, count_val, rows, valid) = active.take().unwrap();
+                        let close = format!("</{}>", sec.tag_name());
+                        if sec == Section::CellStyleXfs {
+                            if cell_style_xfs_count_seen == 1 && valid {
+                                cell_style_xfs_rows = rows;
+                            }
+                        } else {
+                            let ok = valid
+                                && count_val == Some(rows.len())
+                                && xml[start..end] == close;
+                            let slot = match sec {
+                                Section::NumFmts => &mut num_fmts_slot,
+                                Section::Fonts => &mut fonts_slot,
+                                Section::Fills => &mut fills_slot,
+                                Section::Borders => &mut borders_slot,
+                                Section::CellXfs => &mut xfs_slot,
+                                Section::CellStyleXfs => unreachable!(),
+                            };
+                            slot.seen += 1;
+                            if ok && slot.seen == 1 {
+                                slot.table = Some(Table {
+                                    rows,
+                                    count: count_range.unwrap(),
+                                    end: start,
+                                    close_empty: None,
+                                    added: Vec::new(),
+                                    lookup: None,
+                                });
+                            } else {
+                                slot.valid = false;
+                                slot.table = None;
+                            }
+                        }
+                    }
+                    depth = depth.checked_sub(1)?;
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        if !saw_root || depth != 0 {
             return None;
         }
-        let fonts = Table::read(root, xml, "fonts", "font")?;
-        let xfs = Table::read(root, xml, "cellXfs", "xf")?;
+        let fonts = (fonts_slot.valid && fonts_slot.seen == 1).then_some(fonts_slot.table)??;
+        let xfs = (xfs_slot.valid && xfs_slot.seen == 1).then_some(xfs_slot.table)??;
+        let fills = (fills_slot.valid && fills_slot.seen == 1)
+            .then_some(fills_slot.table)
+            .flatten();
+        let borders = (borders_slot.valid && borders_slot.seen == 1)
+            .then_some(borders_slot.table)
+            .flatten();
+        let formats = if !num_fmt_id_overflow
+            && num_fmts_attrs_ok
+            && (num_fmts_slot.seen == 0 || (num_fmts_slot.seen == 1 && num_fmts_slot.valid))
+        {
+            Some(NumberFormats {
+                table: num_fmts_slot.table,
+                before_fonts: before_fonts?,
+                codes: num_fmt_codes,
+                next: highest_num_fmt_id.checked_add(1),
+                added: Vec::new(),
+            })
+        } else {
+            None
+        };
+        let cell_style_xfs = (has_cell_style_xfs && cell_style_xfs_count_seen == 1)
+            .then_some(cell_style_xfs_rows);
         Some(Self {
             xml,
-            doc,
+            root_open,
             fonts,
-            fills: None,
-            borders: None,
-            formats: None,
+            fills,
+            borders,
+            cell_style_xfs,
+            has_cell_style_xfs,
+            formats,
             xfs,
             resolved: HashMap::new(),
         })
     }
 
-    fn node(&self, table: &str, index: u16) -> Option<Node<'_, 'a>> {
-        self.doc
-            .root_element()
-            .children()
-            .find(|n| n.has_tag_name((NS, table)))?
-            .children()
-            .filter(|n| n.is_element())
-            .nth(usize::from(index))
+    fn row_range(&self, table: &str, index: u16) -> Option<Range<usize>> {
+        let i = usize::from(index);
+        match table {
+            "fonts" => self.fonts.rows.get(i).cloned(),
+            "fills" => self.fills.as_ref()?.rows.get(i).cloned(),
+            "borders" => self.borders.as_ref()?.rows.get(i).cloned(),
+            "cellXfs" => self.xfs.rows.get(i).cloned(),
+            "cellStyleXfs" => self.cell_style_xfs.as_ref()?.get(i).cloned(),
+            _ => None,
+        }
     }
 
     pub(super) fn resolve(
@@ -598,7 +942,7 @@ impl<'a> Styles<'a> {
             return None;
         }
         let mut fields = Vec::new();
-        if old.font != new.font
+        if effective_font_name(&old.font) != effective_font_name(&new.font)
             || old.bold != new.bold
             || was_theme.font != want_theme.font
             || old.italic != new.italic
@@ -616,7 +960,11 @@ impl<'a> Styles<'a> {
         }
         if fill_changed {
             let original = self.component(base, "fillId", "applyFill")?;
-            let mut actual = Pattern::raw(self.node("fills", original)?)?;
+            let fill_range = self.row_range("fills", original)?;
+            let (wrapped, _) = parse_fragment(&self.root_open, &self.xml[fill_range])?;
+            let doc = Document::parse(&wrapped).ok()?;
+            let fill_node = doc.root_element().first_element_child()?;
+            let mut actual = Pattern::raw(fill_node)?;
             let expected = Pattern::model(styles, old_id)?;
             if expected.bg.is_none()
                 && actual.bg == Some(Paint::Indexed(64))
@@ -628,36 +976,22 @@ impl<'a> Styles<'a> {
                 return None;
             }
             let fill = Pattern::model(styles, id)?.xml()?;
-            if self.fills.is_none() {
-                self.fills = Some(Table::read(
-                    self.doc.root_element(),
-                    self.xml,
-                    "fills",
-                    "fill",
-                )?);
-            }
             fields.push(("fillId", self.fills.as_mut()?.intern(self.xml, fill)?));
             fields.push(("applyFill", 1));
         }
         if old.border != new.border {
             let original = self.component(base, "borderId", "applyBorder")?;
-            let value = border_variant(self.xml, self.node("borders", original)?, old, new)?;
-            if self.borders.is_none() {
-                self.borders = Some(Table::read(
-                    self.doc.root_element(),
-                    self.xml,
-                    "borders",
-                    "border",
-                )?);
-            }
+            let border_range = self.row_range("borders", original)?;
+            let (wrapped, wrap_off) = parse_fragment(&self.root_open, &self.xml[border_range])?;
+            let doc = Document::parse(&wrapped).ok()?;
+            let border_node = doc.root_element().first_element_child()?;
+            let _ = wrap_off;
+            let value = border_variant(&wrapped, border_node, old, new)?;
             fields.push(("borderId", self.borders.as_mut()?.intern(self.xml, value)?));
             fields.push(("applyBorder", 1));
         }
         if old.format != new.format {
             let original = self.component(base, "numFmtId", "applyNumberFormat")?;
-            if self.formats.is_none() {
-                self.formats = Some(NumberFormats::read(self.doc.root_element(), self.xml)?);
-            }
             fields.push((
                 "numFmtId",
                 self.formats
@@ -672,29 +1006,32 @@ impl<'a> Styles<'a> {
     }
 
     fn component(&self, base: u16, id: &str, apply: &str) -> Option<u16> {
-        let xf = self.node("cellXfs", base)?;
+        let xf_range = self.row_range("cellXfs", base)?;
+        let (wrapped, _) = parse_fragment(&self.root_open, &self.xml[xf_range])?;
+        let doc = Document::parse(&wrapped).ok()?;
+        let xf = doc.root_element().first_element_child()?;
         let local = xf.attribute(id).unwrap_or("0").parse().ok()?;
         if !matches!(xf.attribute(apply), Some("1" | "true")) {
-            if !matches!(xf.attribute(apply), None | Some("0" | "false")) {
+            let apply_attr = xf.attribute(apply);
+            if !matches!(apply_attr, None | Some("0" | "false")) {
                 return None;
             }
             let parent = xf.attribute("xfId").unwrap_or("0").parse().ok()?;
             // Fresh CELLAN files may omit the entire optional cellStyleXfs table.
             // Only the default component of the implicit Normal style is unambiguous.
-            let inherited = match self.node("cellStyleXfs", parent) {
-                Some(row) => row.attribute(id).unwrap_or("0").parse::<u16>().ok()?,
-                None if parent == 0
-                    && !self
-                        .doc
-                        .root_element()
-                        .children()
-                        .any(|n| n.has_tag_name((NS, "cellStyleXfs"))) =>
-                {
-                    0
+            let inherited = match self.row_range("cellStyleXfs", parent) {
+                Some(prange) => {
+                    let (pw, _) = parse_fragment(&self.root_open, &self.xml[prange])?;
+                    let pdoc = Document::parse(&pw).ok()?;
+                    let prow = pdoc.root_element().first_element_child()?;
+                    prow.attribute(id).unwrap_or("0").parse::<u16>().ok()?
                 }
+                None if parent == 0 && !self.has_cell_style_xfs => 0,
                 None => return None,
             };
-            if inherited != local {
+            // When apply* is omitted on a cellXf and cellStyleXfs uses default 0,
+            // Excel/umya apply the non-zero local component directly.
+            if inherited != local && !(apply_attr.is_none() && inherited == 0) {
                 return None;
             }
         }
@@ -709,22 +1046,24 @@ impl<'a> Styles<'a> {
         was_theme: Option<crate::style_theme::ThemeRef>,
         want_theme: Option<crate::style_theme::ThemeRef>,
     ) -> Option<u16> {
-        let font = self.node("fonts", font_id)?;
+        let font_range = self.row_range("fonts", font_id)?;
+        let (wrapped, wrap_off) = parse_fragment(&self.root_open, &self.xml[font_range.clone()])?;
+        let doc = Document::parse(&wrapped).ok()?;
+        let font = doc.root_element().first_element_child()?;
         if font.default_namespace() != Some(NS) {
             return None;
         }
-        let font_range = font.range();
+        let map_r = |r: Range<usize>| shift_range(r, wrap_off, font_range.start);
         let mut edits = Vec::new();
         let mut prefix = String::new();
-        if old.font != new.font {
-            if new.font.is_empty()
-                || new.font.encode_utf16().count() > 31
-                || !super::safe_xml_text(&new.font)
-            {
+        let old_fname = effective_font_name(&old.font);
+        let new_fname = effective_font_name(&new.font);
+        if old_fname != new_fname {
+            if new_fname.encode_utf16().count() > 31 || !super::safe_xml_text(new_fname) {
                 return None;
             }
             let mut names = font.children().filter(|n| n.has_tag_name((NS, "name")));
-            let escaped = quick_xml::escape::escape(&new.font);
+            let escaped = quick_xml::escape::escape(new_fname);
             if let Some(name) = names.next() {
                 let attr = name.attribute_node("val")?;
                 let normalized = crate::style::normalize_font(attr.value());
@@ -733,7 +1072,7 @@ impl<'a> Styles<'a> {
                 {
                     return None;
                 }
-                edits.push((attr.range_value(), escaped.to_string()));
+                edits.push((map_r(attr.range_value()), escaped.to_string()));
             } else if old.font.is_empty() {
                 prefix.push_str(&format!("<name val=\"{escaped}\"/>"));
             } else {
@@ -747,7 +1086,7 @@ impl<'a> Styles<'a> {
                 {
                     return None;
                 }
-                edits.push((scheme.range(), String::new()));
+                edits.push((map_r(scheme.range()), String::new()));
             }
         }
         for (name, was, want) in [
@@ -777,7 +1116,7 @@ impl<'a> Styles<'a> {
                     return None;
                 }
                 edits.push((
-                    prop.range(),
+                    map_r(prop.range()),
                     if want {
                         format!("<{name}/>")
                     } else {
@@ -816,7 +1155,7 @@ impl<'a> Styles<'a> {
                 {
                     return None;
                 }
-                edits.push((prop.range(), replacement.to_owned()));
+                edits.push((map_r(prop.range()), replacement.to_owned()));
             } else {
                 prefix.push_str(replacement);
             }
@@ -830,7 +1169,7 @@ impl<'a> Styles<'a> {
             if !new.size.is_finite() || !(1.0..=409.0).contains(&new.size) {
                 return None;
             }
-            edits.push((size.range_value(), new.size.to_string()));
+            edits.push((map_r(size.range_value()), new.size.to_string()));
         }
         if old.color != new.color || was_theme != want_theme {
             let was = was_theme.map_or(Paint::Rgb(old.color), |t| Paint::Theme(t.idx, t.tint));
@@ -841,7 +1180,7 @@ impl<'a> Styles<'a> {
                 if colors.next().is_some() || Paint::read(color)? != was {
                     return None;
                 }
-                edits.push((color.range(), new_color));
+                edits.push((map_r(color.range()), new_color));
             } else if was == Paint::Rgb([0; 3]) {
                 prefix.push_str(&new_color);
             } else {
@@ -851,7 +1190,7 @@ impl<'a> Styles<'a> {
         if !prefix.is_empty() {
             // Insert after the start tag using the XML parser's first child offset.
             // Reject a self-closing/empty font where that position is ambiguous.
-            let pos = font.first_child()?.range().start;
+            let pos = map_r(font.first_child()?.range()).start;
             edits.insert(0, (pos..pos, prefix));
         }
         let raw_font = apply_edits(&self.xml[font_range.clone()], font_range.start, edits);
@@ -861,10 +1200,14 @@ impl<'a> Styles<'a> {
     fn alignment_edits(
         &self,
         xf: Node<'_, '_>,
+        xf_range: Range<usize>,
+        wrap_off: usize,
         old: &CellStyle,
         new: &CellStyle,
     ) -> Option<Vec<(Range<usize>, String)>> {
-        let range = xf.range();
+        let xf_start = xf_range.start;
+        let map_r = |r: Range<usize>| shift_range(r, wrap_off, xf_start);
+        let range = xf_range;
         let mut edits = Vec::new();
         // Enabling an XF's local alignment must not change inherited
         // alignment attributes that the model cannot represent.
@@ -872,18 +1215,17 @@ impl<'a> Styles<'a> {
             Some("1" | "true") => {}
             None | Some("0" | "false") => {
                 let parent = xf.attribute("xfId").unwrap_or("0").parse().ok()?;
-                let record = self.node("cellStyleXfs", parent);
-                if record.is_none()
-                    && (parent != 0
-                        || self
-                            .doc
-                            .root_element()
-                            .children()
-                            .any(|n| n.has_tag_name((NS, "cellStyleXfs"))))
-                    || record
-                        .is_some_and(|p| p.children().any(|n| n.has_tag_name((NS, "alignment"))))
-                {
+                let prange = self.row_range("cellStyleXfs", parent);
+                if prange.is_none() && (parent != 0 || self.has_cell_style_xfs) {
                     return None;
+                }
+                if let Some(pr) = prange {
+                    let (pw, _) = parse_fragment(&self.root_open, &self.xml[pr])?;
+                    let pdoc = Document::parse(&pw).ok()?;
+                    let prow = pdoc.root_element().first_element_child()?;
+                    if prow.children().any(|n| n.has_tag_name((NS, "alignment"))) {
+                        return None;
+                    }
                 }
             }
             _ => return None,
@@ -953,7 +1295,7 @@ impl<'a> Styles<'a> {
             }
             if new.valign == 0 {
                 if let Some(attr) = alignment.and_then(|n| n.attribute_node("vertical")) {
-                    edits.push((attr.range(), String::new()));
+                    edits.push((map_r(attr.range()), String::new()));
                 }
             } else {
                 let value = ["", "top", "center", "bottom"].get(new.valign as usize)?;
@@ -980,18 +1322,19 @@ impl<'a> Styles<'a> {
         let mut insert = String::new();
         for (name, value) in changed {
             if let Some(existing) = alignment.and_then(|n| n.attribute_node(name)) {
-                edits.push((existing.range_value(), value));
+                edits.push((map_r(existing.range_value()), value));
             } else {
                 insert.push_str(&format!(" {name}=\"{value}\""));
             }
         }
         if !insert.is_empty() {
             if let Some(alignment) = alignment {
-                let raw = &self.xml[alignment.range()];
+                let ar = map_r(alignment.range());
+                let raw = &self.xml[ar.clone()];
                 if !raw.starts_with("<alignment") {
                     return None;
                 }
-                let at = alignment.range().start + "<alignment".len();
+                let at = ar.start + "<alignment".len();
                 edits.push((at..at, insert));
             } else {
                 let tag = format!("<alignment{insert}/>");
@@ -1014,18 +1357,17 @@ impl<'a> Styles<'a> {
             Some("1" | "true") => {}
             None | Some("0" | "false") => {
                 let parent = xf.attribute("xfId").unwrap_or("0").parse().ok()?;
-                let record = self.node("cellStyleXfs", parent);
-                if record.is_none()
-                    && (parent != 0
-                        || self
-                            .doc
-                            .root_element()
-                            .children()
-                            .any(|n| n.has_tag_name((NS, "cellStyleXfs"))))
-                    || record
-                        .is_some_and(|p| p.children().any(|n| n.has_tag_name((NS, "protection"))))
-                {
+                let prange = self.row_range("cellStyleXfs", parent);
+                if prange.is_none() && (parent != 0 || self.has_cell_style_xfs) {
                     return None;
+                }
+                if let Some(pr) = prange {
+                    let (pw, _) = parse_fragment(&self.root_open, &self.xml[pr])?;
+                    let pdoc = Document::parse(&pw).ok()?;
+                    let prow = pdoc.root_element().first_element_child()?;
+                    if prow.children().any(|n| n.has_tag_name((NS, "protection"))) {
+                        return None;
+                    }
                 }
             }
             _ => return None,
@@ -1104,8 +1446,11 @@ impl<'a> Styles<'a> {
         old: &CellStyle,
         new: &CellStyle,
     ) -> Option<u16> {
-        let xf = self.node("cellXfs", base)?;
-        let range = xf.range();
+        let range = self.row_range("cellXfs", base)?;
+        let (wrapped, wrap_off) = parse_fragment(&self.root_open, &self.xml[range.clone()])?;
+        let doc = Document::parse(&wrapped).ok()?;
+        let xf = doc.root_element().first_element_child()?;
+        let map_r = |r: Range<usize>| shift_range(r, wrap_off, range.start);
         let mut edits = Vec::new();
         if (
             old.wrap,
@@ -1124,7 +1469,7 @@ impl<'a> Styles<'a> {
             new.rotation,
             new.vertical_text,
         ) {
-            edits.extend(self.alignment_edits(xf, old, new)?);
+            edits.extend(self.alignment_edits(xf, range.clone(), wrap_off, old, new)?);
             fields.push(("applyAlignment", 1));
         }
         let protection_changed = (old.locked, old.hidden) != (new.locked, new.hidden);
@@ -1135,7 +1480,7 @@ impl<'a> Styles<'a> {
         let mut attrs = String::new();
         for (name, value) in fields {
             if let Some(attr) = xf.attribute_node(name) {
-                edits.push((attr.range_value(), value.to_string()));
+                edits.push((map_r(attr.range_value()), value.to_string()));
             } else {
                 attrs.push_str(&format!(" {name}=\"{value}\""));
             }
@@ -1165,7 +1510,9 @@ impl<'a> Styles<'a> {
         if let Some(fills) = self.fills {
             fills.changes(&mut edits);
         }
-        if let Some(borders) = self.borders { borders.changes(&mut edits); }
+        if let Some(borders) = self.borders {
+            borders.changes(&mut edits);
+        }
         if let Some(formats) = self.formats {
             formats.changes(&mut edits);
         }

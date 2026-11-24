@@ -42,9 +42,13 @@ pub struct ContextTab {
 #[derive(Clone, Debug, Default)]
 pub struct Group {
     pub id: String,
+    pub id_mid: String,
+    pub id_compact: String,
     pub label: String,
     pub children: Vec<Node>,
     pub launcher: Option<Ctl>,
+    pub compact_w: f32,
+    pub compact_needs_text: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,6 +56,13 @@ pub enum Size {
     #[default]
     Normal,
     Large,
+}
+
+/// 中档屏宽（1280..1720）预计算控件视图，消除每帧在 `node_mid` 中克隆 `Ctl` / `Menu`。
+#[derive(Clone, Debug)]
+pub struct CtlMid {
+    pub ctl: Ctl,
+    pub full_label: Option<String>,
 }
 
 /// 控件公共属性（MS-CUSTOMUI 的 button/toggleButton/… 共用那一套）。
@@ -72,11 +83,22 @@ pub struct Ctl {
     /// 没写就按 id 分发。
     pub on_action: Option<String>,
     pub enabled: bool,
+    /// 若在 1280..1720 中档布局下有精简标签或尺寸覆盖，则在解析期预计算存放于此。
+    pub mid: Option<Box<CtlMid>>,
 }
 
 impl Ctl {
     pub fn action(&self) -> &str {
         self.on_action.as_deref().unwrap_or(&self.id)
+    }
+
+    #[inline]
+    pub fn mid_view(&self) -> (&Ctl, Option<&str>) {
+        if let Some(m) = self.mid.as_deref() {
+            (&m.ctl, m.full_label.as_deref())
+        } else {
+            (self, None)
+        }
     }
 }
 
@@ -335,7 +357,134 @@ fn read_tab(e: &El) -> Result<Tab, String> {
         tab.groups.push(read_group(g)?);
     }
     fill_missing_keytips(&mut tab);
+    for g in &mut tab.groups {
+        precompute_mid_nodes(&mut g.children);
+    }
     Ok(tab)
+}
+
+fn mid_short_label(raw: &str) -> Option<&'static str> {
+    Some(match raw {
+        "自动换行" => "换行",
+        "合并后居中" => "合并",
+        "自动求和" => "求和",
+        "条件格式" => "条件",
+        "套用表格格式" => "表样",
+        "排序和筛选" => "筛选",
+        "查找和选择" => "查找",
+        "冻结窗格" => "冻结",
+        "格式刷" => "格式刷",
+        _ => return None,
+    })
+}
+
+fn build_mid_ctl(
+    c: &Ctl,
+    clear_width: bool,
+    force_width: Option<f32>,
+    force_arrow: Option<f32>,
+) -> Option<Box<CtlMid>> {
+    let short = c.label.as_deref().and_then(mid_short_label);
+    let need_clear_w = clear_width && c.width.is_some();
+    let need_force_w = force_width.is_some() && c.width != force_width;
+    let need_force_a = force_arrow.is_some() && c.arrow != force_arrow;
+    if short.is_none() && !need_clear_w && !need_force_w && !need_force_a {
+        return None;
+    }
+    let mut c2 = c.clone();
+    c2.mid = None;
+    let mut full = None;
+    if let Some(s) = short {
+        if let Some(lbl) = c2.label.as_deref() {
+            full = Some(lbl.to_string());
+            if c2.screentip.is_none() {
+                c2.screentip = Some(lbl.to_string());
+            }
+        }
+        c2.label = Some(s.to_string());
+        c2.width = None;
+    }
+    if clear_width {
+        c2.width = None;
+    }
+    if let Some(w) = force_width {
+        c2.width = Some(w);
+    }
+    if let Some(a) = force_arrow {
+        c2.arrow = Some(a);
+    }
+    Some(Box::new(CtlMid {
+        ctl: c2,
+        full_label: full,
+    }))
+}
+
+fn precompute_mid_nodes(nodes: &mut [Node]) {
+    for n in nodes {
+        match n {
+            Node::Button(c) => {
+                let clear_w = c.id == "TextDirection";
+                c.mid = build_mid_ctl(c, clear_w, None, None);
+            }
+            Node::Toggle(c) => {
+                c.mid = build_mid_ctl(c, false, None, None);
+            }
+            Node::Split { ctl, .. } => {
+                let is_sum = ctl.id == "AutoSum";
+                ctl.mid = build_mid_ctl(ctl, is_sum, None, is_sum.then_some(15.0));
+            }
+            Node::Menu(m) => {
+                let clear_w = matches!(
+                    m.ctl.id.as_str(),
+                    "FillMenu" | "ClearMenu" | "TextDirection"
+                );
+                m.ctl.mid = build_mid_ctl(&m.ctl, clear_w, None, None);
+            }
+            Node::DropDown { ctl, .. } => {
+                let fw = (ctl.id == "NumberFormat").then_some(106.0);
+                ctl.mid = build_mid_ctl(ctl, false, fw, None);
+            }
+            Node::Box { children, .. } => precompute_mid_nodes(children),
+            _ => {}
+        }
+    }
+}
+
+fn compute_compact_leaf_count(list: &[Node]) -> usize {
+    list.iter()
+        .map(|n| match n {
+            Node::Button(_)
+            | Node::Toggle(_)
+            | Node::Split { .. }
+            | Node::Menu(_)
+            | Node::DropDown { .. }
+            | Node::Gallery { .. }
+            | Node::ComboBox { .. }
+            | Node::EditBox { .. }
+            | Node::Slider { .. } => 1,
+            Node::Box { children, .. } => compute_compact_leaf_count(children),
+            Node::Label(_) | Node::Spacer(_) | Node::Separator => 0,
+        })
+        .sum()
+}
+
+fn compute_compact_needs_text(list: &[Node]) -> bool {
+    let no_icon_long = |c: &Ctl| {
+        let len = c.label.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+        (c.image.is_none() && len > 2) || len > 5
+    };
+    list.iter().any(|n| match n {
+        Node::Button(c) | Node::Toggle(c) => no_icon_long(c),
+        Node::Split { ctl, .. } => no_icon_long(ctl),
+        Node::Menu(m) => no_icon_long(&m.ctl),
+        Node::DropDown { ctl, .. }
+        | Node::Gallery { ctl, .. }
+        | Node::ComboBox { ctl, .. }
+        | Node::EditBox { ctl, .. }
+        | Node::Slider { ctl, .. } => no_icon_long(ctl),
+        Node::Box { children, .. } => compute_compact_needs_text(children),
+        Node::Label(_) | Node::Spacer(_) | Node::Separator => false,
+    })
 }
 
 /// UI-23.1：XML 里未写 keytip 的控件补一个页签内唯一的序列。
@@ -432,11 +581,18 @@ fn fill_missing_keytips(tab: &mut Tab) {
 }
 
 fn read_group(e: &El) -> Result<Group, String> {
+    let id = attr(e, "id").unwrap_or_default();
+    let id_mid = format!("{id}#m");
+    let id_compact = format!("{id}#c");
     let mut group = Group {
-        id: attr(e, "id").unwrap_or_default(),
+        id,
+        id_mid,
+        id_compact,
         label: attr(e, "label").unwrap_or_default(),
         children: Vec::new(),
         launcher: None,
+        compact_w: 0.0,
+        compact_needs_text: false,
     };
     if group.id.is_empty() {
         return Err(format!("group「{}」缺 id", group.label));
@@ -455,6 +611,10 @@ fn read_group(e: &El) -> Result<Group, String> {
             }
         }
     }
+    let n = compute_compact_leaf_count(&group.children);
+    let cols: f32 = if n >= 6 { 4.0 } else { 3.0 };
+    group.compact_w = (cols * 52.0 + 10.0).min(210.0);
+    group.compact_needs_text = compute_compact_needs_text(&group.children);
     Ok(group)
 }
 
@@ -620,6 +780,7 @@ fn read_ctl(e: &El) -> Ctl {
         keytip: attr(e, "keytip").filter(|s| !s.is_empty()),
         on_action: attr(e, "onAction"),
         enabled: attr(e, "enabled").as_deref() != Some("false"),
+        mid: None,
     }
 }
 

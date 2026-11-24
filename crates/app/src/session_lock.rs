@@ -118,9 +118,13 @@ pub fn new_session_id() -> String {
 }
 
 pub fn machine_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".into())
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "unknown".into())
+    })
+    .clone()
 }
 
 #[cfg(windows)]
@@ -817,7 +821,7 @@ pub fn is_dir_marked_shared(file: &Path) -> bool {
 pub fn set_dir_marked_shared(file: &Path, enabled: bool) -> std::io::Result<()> {
     let dir = file.parent().unwrap_or_else(|| Path::new("."));
     let marker = dir.join(SHARED_MARKER);
-    if enabled {
+    let res = if enabled {
         unhide_before_replace(&marker);
         let mut f = std::fs::File::create(&marker)?;
         let _ = f.write_all(b"cellan-lan-share=1\n");
@@ -830,7 +834,9 @@ pub fn set_dir_marked_shared(file: &Path, enabled: bool) -> std::io::Result<()> 
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
-    }
+    };
+    invalidate_network_path_cache();
+    res
 }
 
 /// 检测本机路径是否位于已开启 Windows 局域网文件共享（LanmanServer\Shares）的文件夹内，
@@ -964,8 +970,42 @@ fn query_lanman_share_paths() -> Vec<String> {
     out
 }
 
+fn network_path_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (std::time::Instant, bool)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, (std::time::Instant, bool)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn invalidate_network_path_cache() {
+    if let Ok(mut guard) = network_path_cache().lock() {
+        guard.clear();
+    }
+}
+
 /// 路径是不是网盘/共享目录：支持 UNC、SMB 映射网络盘、本机已开启 Windows 共享的文件夹、主流企业云盘/同步盘及显式标记的协同目录。
+/// 结果按路径缓存 30 秒（最多 64 项），消除热路径重复磁盘/驱动器/注册表探测；`set_dir_marked_shared` 自动失效缓存。
 pub fn is_network_path(file: &Path) -> bool {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    if let Ok(guard) = network_path_cache().lock() {
+        if let Some(&(at, val)) = guard.get(file) {
+            if at.elapsed() < TTL {
+                return val;
+            }
+        }
+    }
+    let val = is_network_path_uncached(file);
+    if let Ok(mut guard) = network_path_cache().lock() {
+        if guard.len() >= 64 {
+            guard.clear();
+        }
+        guard.insert(file.to_path_buf(), (std::time::Instant::now(), val));
+    }
+    val
+}
+
+fn is_network_path_uncached(file: &Path) -> bool {
     let text = file.to_string_lossy();
     if text.starts_with("\\\\") || text.starts_with("//") {
         return true;

@@ -69,10 +69,18 @@ fn size_text(v: f32) -> String {
 }
 
 impl SheetApp {
-    /// 控件状态：等价于 MS-CUSTOMUI 的 get* 回调。
+    /// 控件状态：等价于 MS-CUSTOMUI 的 get* 回调（对外入口，借用当前格样式零克隆）。
     pub fn ctl_state(&self, id: &str) -> CtlState {
+        self.ctl_state_with_style(id, self.current_style_ref())
+    }
+
+    /// 供功能区每帧复用单次读取的 `CellStyle`，避免单帧克隆 40-50 次样式表项。
+    pub(crate) fn ctl_state_with_style(
+        &self,
+        id: &str,
+        cur: &sheetcore::style::CellStyle,
+    ) -> CtlState {
         let mut st = CtlState::default();
-        let cur = self.current_style();
         match id {
             // 按钮的可用性与快捷键共用命令表里的同一个谓词
             // 剪贴板空着时「粘贴」系列灰掉（Excel 行为）；剪切/复制对空单元格也有效，保持可用
@@ -126,22 +134,14 @@ impl SheetApp {
             "WrapText" => st.checked = cur.wrap,
             "MergeCenter" => {
                 let (r1, c1, r2, c2) = self.sel_rect();
-                let sh = self.wb.sheet(self.sheet_idx);
-                st.checked = sh
-                    .merges
-                    .iter()
-                    .any(|m| m.0 == r1 && m.1 == c1 && m.2 == r2 && m.3 == c2)
-                    || (r1 == r2 && c1 == c2 && sh.merge_at(r1, c1).is_some());
+                let m = self.merge_at_fast(r1, c1);
+                st.checked = m == Some((r1, c1, r2, c2)) || (r1 == r2 && c1 == c2 && m.is_some());
                 st.enabled = !self.is_edit_blocked();
             }
             "MergeCenterItem" => {
                 let (r1, c1, r2, c2) = self.sel_rect();
-                let sh = self.wb.sheet(self.sheet_idx);
-                st.checked = sh
-                    .merges
-                    .iter()
-                    .any(|m| m.0 == r1 && m.1 == c1 && m.2 == r2 && m.3 == c2)
-                    || (r1 == r2 && c1 == c2 && sh.merge_at(r1, c1).is_some());
+                let m = self.merge_at_fast(r1, c1);
+                st.checked = m == Some((r1, c1, r2, c2)) || (r1 == r2 && c1 == c2 && m.is_some());
                 st.enabled = (st.checked || !(r1 == r2 && c1 == c2)) && !self.is_edit_blocked();
                 if !st.enabled && r1 == r2 && c1 == c2 {
                     st.tip = Some("请选择两个以上单元格再合并".into());
@@ -261,9 +261,10 @@ impl SheetApp {
                 });
             }
             "PageScale" => {
-                let p = self.wb.sheet(self.sheet_idx).page.clone();
+                let sh = self.wb.sheet(self.sheet_idx);
+                let p = &sh.page;
                 let pct = if p.fit_to_page {
-                    (p.scale_factor(self.wb.sheet(self.sheet_idx)) * 100.0).round() as i32
+                    (p.scale_factor(sh) * 100.0).round() as i32
                 } else {
                     p.scale as i32
                 };
@@ -351,7 +352,7 @@ impl SheetApp {
             }
             _ => {}
         }
-        if std::env::var("SC_RIBBON_STATE").map(|v| v == id).unwrap_or(false) {
+        if crate::debug_flags::ribbon_state_matches(id) {
             eprintln!("[ribbon] 状态 {id} → {st:?}");
         }
         st
@@ -1287,7 +1288,7 @@ impl SheetApp {
 
             // ---------------------------------------------------- 图表工具
             "ChartEdit" => {
-                if let Some(ch) = self.chart_at_sel() {
+                if let Some(ch) = self.chart_at_sel().cloned() {
                     self.chart_edit = Some(ch);
                 }
             }
@@ -1397,7 +1398,7 @@ impl SheetApp {
                 // UI-30：未命中的命令必须留痕并让用户看见，不能只写环境变量日志。
                 self.unhandled_action = Some(action.to_string());
                 self.status = format!("这个命令还没有接入：{action}");
-                if std::env::var("SC_RIBBON_LOG").is_ok() {
+                if crate::debug_flags::ribbon_log() {
                     eprintln!("[ribbon] 未实现的命令：{action}");
                 }
             }

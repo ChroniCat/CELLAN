@@ -1,77 +1,247 @@
 //! Bounded syntax-only caches. Syntax never captures a workbook, evaluation state or a date system.
+use super::fxhash::{FxHashMap, fx_hash_one};
 use super::{ErrKind, FValue, Node, RefExpr, bin_scalar, parse, parse_a1, parse_normalized};
 use std::{
     cell::RefCell,
-    collections::HashMap,
-    hash::{BuildHasher, RandomState},
-    sync::{Arc, LazyLock, RwLock},
+    sync::{Arc, LazyLock, RwLock, Weak},
 };
 
 type Parsed = Result<Arc<Node>, ErrKind>;
 const MAX_SOURCE: usize = 2048;
-const SHARDS: usize = 32;
-const PER_SHARD: usize = 1024;
+const SHARDS: usize = 64;
+const PER_SHARD: usize = 2048;
+const TLS_TEMPLATES: usize = 8;
+const TLS_PTR_SLOTS: usize = 256;
 
 #[derive(Default)]
 struct Cache {
-    exact: HashMap<String, Parsed>,
-    relative: HashMap<Vec<u8>, Arc<Template>>,
+    exact: FxHashMap<Arc<str>, Parsed>,
+    relative: FxHashMap<Vec<u8>, Arc<Template>>,
 }
 
-static HASH: LazyLock<RandomState> = LazyLock::new(RandomState::new);
 static CACHE: LazyLock<[RwLock<Cache>; SHARDS]> =
     LazyLock::new(|| std::array::from_fn(|_| RwLock::new(Cache::default())));
 
+#[inline]
 fn shard<T: std::hash::Hash + ?Sized>(key: &T) -> &'static RwLock<Cache> {
-    &CACHE[HASH.hash_one(key) as usize % SHARDS]
+    &CACHE[(fx_hash_one(key) as usize) & (SHARDS - 1)]
 }
 
-struct Template {
+pub(super) struct Template {
     node: Arc<Node>,
     row: u32,
     col: u32,
     scalar: bool,
+    cross_sheet_scalar: bool,
+    min_rel_row: i64,
+    max_rel_row: i64,
+    min_rel_col: i64,
+    max_rel_col: i64,
 }
 
-#[derive(Default)]
-struct LastTemplate {
-    key: Vec<u8>,
+impl Template {
+    fn from_node(node: Arc<Node>, row: u32, col: u32) -> Self {
+        let mut bounds = RelBounds::default();
+        collect_rel_bounds(&node, &mut bounds);
+        Self {
+            scalar: projectable(&node, false),
+            cross_sheet_scalar: projectable(&node, true),
+            node,
+            row,
+            col,
+            min_rel_row: bounds.min_row,
+            max_rel_row: bounds.max_row,
+            min_rel_col: bounds.min_col,
+            max_rel_col: bounds.max_col,
+        }
+    }
+
+    #[inline]
+    fn offset_valid(&self, dr: i64, dc: i64) -> bool {
+        (self.min_rel_row == i64::MAX
+            || (self.min_rel_row + dr >= 0 && self.max_rel_row + dr < 1_048_576))
+            && (self.min_rel_col == i64::MAX
+                || (self.min_rel_col + dc >= 0 && self.max_rel_col + dc < 16_384))
+    }
+}
+
+struct RelBounds {
+    min_row: i64,
+    max_row: i64,
+    min_col: i64,
+    max_col: i64,
+}
+
+impl Default for RelBounds {
+    fn default() -> Self {
+        Self {
+            min_row: i64::MAX,
+            max_row: i64::MIN,
+            min_col: i64::MAX,
+            max_col: i64::MIN,
+        }
+    }
+}
+
+fn collect_rel_bounds(node: &Node, b: &mut RelBounds) {
+    let mut visit_ref = |r: &RefExpr| {
+        if !r.row_abs {
+            b.min_row = b.min_row.min(r.row);
+            b.max_row = b.max_row.max(r.row);
+        }
+        if !r.col_abs {
+            b.min_col = b.min_col.min(r.col);
+            b.max_col = b.max_col.max(r.col);
+        }
+    };
+    match node {
+        Node::Ref(r) | Node::Spill(r) => visit_ref(r),
+        Node::Range(x, y) => {
+            visit_ref(x);
+            visit_ref(y);
+        }
+        Node::Func(_, args) => {
+            for a in args {
+                collect_rel_bounds(a, b);
+            }
+        }
+        Node::Implicit(n) | Node::Percent(n) | Node::Unary(_, n) => collect_rel_bounds(n, b),
+        Node::Binary(_, l, r) => {
+            collect_rel_bounds(l, b);
+            collect_rel_bounds(r, b);
+        }
+        _ => {}
+    }
+}
+
+struct RecentTemplates {
+    entries: Vec<(Vec<u8>, Arc<Template>)>,
     scratch: Vec<u8>,
-    template: Option<Arc<Template>>,
 }
 
-thread_local! { static LAST: RefCell<LastTemplate> = RefCell::new(LastTemplate::default()); }
+impl Default for RecentTemplates {
+    fn default() -> Self {
+        Self {
+            entries: Vec::with_capacity(TLS_TEMPLATES),
+            scratch: Vec::with_capacity(128),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum CachedCompiled {
+    Exact(Arc<Node>, bool, bool),
+    Shifted {
+        template: Arc<Template>,
+        dr: i64,
+        dc: i64,
+    },
+    Err(ErrKind),
+}
+
+struct PtrSlot {
+    ptr: usize,
+    weak: Weak<str>,
+    entry: CachedCompiled,
+}
+
+struct TlsPtrCache {
+    slots: Box<[Option<PtrSlot>]>,
+}
+
+impl Default for TlsPtrCache {
+    fn default() -> Self {
+        Self {
+            slots: (0..TLS_PTR_SLOTS).map(|_| None).collect(),
+        }
+    }
+}
+
+impl TlsPtrCache {
+    #[inline]
+    fn slot_idx(ptr: usize) -> usize {
+        ((ptr.wrapping_mul(0x9e37_79b9_7f4a_7c15)) >> 56) & (TLS_PTR_SLOTS - 1)
+    }
+
+    #[inline]
+    fn get(&self, formula: &Arc<str>) -> Option<CachedCompiled> {
+        let ptr = Arc::as_ptr(formula) as *const u8 as usize;
+        let slot = self.slots[Self::slot_idx(ptr)].as_ref()?;
+        if slot.ptr == ptr && slot.weak.strong_count() > 0 {
+            Some(slot.entry.clone())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn put(&mut self, formula: &Arc<str>, entry: CachedCompiled) {
+        let ptr = Arc::as_ptr(formula) as *const u8 as usize;
+        self.slots[Self::slot_idx(ptr)] = Some(PtrSlot {
+            ptr,
+            weak: Arc::downgrade(formula),
+            entry,
+        });
+    }
+}
+
+thread_local! {
+    static RECENT: RefCell<RecentTemplates> = RefCell::new(RecentTemplates::default());
+    static PTR_CACHE: RefCell<TlsPtrCache> = RefCell::new(TlsPtrCache::default());
+}
 
 fn parse_body(src: &str) -> Parsed {
     let norm = crate::normalize_formula_cow(src);
-    let rows = crate::expand_whole_rows_cow(&norm);
-    let cols = crate::expand_whole_cols_cow(&rows);
-    parse_normalized(&cols).map(Arc::new)
+    if norm.as_bytes().contains(&b':') {
+        let rows = crate::expand_whole_rows_cow(&norm);
+        parse_normalized(&rows).map(Arc::new)
+    } else {
+        parse_normalized(&norm).map(Arc::new)
+    }
 }
 
 fn template(src: &str, row: u32, col: u32) -> Option<Arc<Template>> {
     if src.len() > MAX_SOURCE {
         return None;
     }
-    LAST.with_borrow_mut(|front| {
-        relative_key_opts(src, row, col, true, &mut front.scratch)?;
-        if front.key == front.scratch && front.template.is_some() {
-            return front.template.clone();
+    RECENT.with_borrow_mut(|recent| {
+        relative_key_opts(src, row, col, true, &mut recent.scratch)?;
+        if let Some(pos) = recent
+            .entries
+            .iter()
+            .position(|(k, _)| k.as_slice() == recent.scratch.as_slice())
+        {
+            let tpl = recent.entries[pos].1.clone();
+            if pos != 0 {
+                let item = recent.entries.remove(pos);
+                recent.entries.insert(0, item);
+            }
+            return Some(tpl);
         }
-        let shard = shard(&front.scratch);
-        let cached = shard.read().unwrap().relative.get(&front.scratch).cloned();
-        let template = match cached {
+        let sh = shard(recent.scratch.as_slice());
+        let cached = sh
+            .read()
+            .unwrap()
+            .relative
+            .get(recent.scratch.as_slice())
+            .cloned();
+        let tpl = match cached {
             Some(value) => value,
             None => {
-                let node = parse_body(src).ok()?;
-                let value = Arc::new(Template {
-                    row,
-                    col,
-                    scalar: projectable(&node),
-                    node,
-                });
-                let mut cache = shard.write().unwrap();
-                if let Some(existing) = cache.relative.get(&front.scratch) {
+                // Check exact cache before parsing in case this exact string was already compiled.
+                let exact_hit = shard(src)
+                    .read()
+                    .unwrap()
+                    .exact
+                    .get(src)
+                    .and_then(|res| res.as_ref().ok().cloned());
+                let node = match exact_hit {
+                    Some(n) => n,
+                    None => parse_body(src).ok()?,
+                };
+                let value = Arc::new(Template::from_node(node, row, col));
+                let mut cache = sh.write().unwrap();
+                if let Some(existing) = cache.relative.get(recent.scratch.as_slice()) {
                     existing.clone()
                 } else {
                     if cache.relative.len() >= PER_SHARD {
@@ -79,24 +249,396 @@ fn template(src: &str, row: u32, col: u32) -> Option<Arc<Template>> {
                     }
                     cache
                         .relative
-                        .entry(front.scratch.clone())
+                        .entry(recent.scratch.clone())
                         .or_insert(value)
                         .clone()
                 }
             }
         };
-        std::mem::swap(&mut front.key, &mut front.scratch);
-        front.template = Some(template.clone());
-        Some(template)
+        if recent.entries.len() >= TLS_TEMPLATES {
+            recent.entries.pop();
+        }
+        recent
+            .entries
+            .insert(0, (recent.scratch.clone(), tpl.clone()));
+        Some(tpl)
     })
+}
+
+/// Fast resolution returning either an exact `Arc<Node>` or a `(Template, dr, dc)` pair
+/// without mutating or cloning the AST.
+fn resolve_compiled(src: &str, row: u32, col: u32) -> CachedCompiled {
+    if src.len() > MAX_SOURCE {
+        return match parse_body(src) {
+            Ok(node) => {
+                let s = projectable(&node, false);
+                let cs = projectable(&node, true);
+                CachedCompiled::Exact(node, s, cs)
+            }
+            Err(e) => CachedCompiled::Err(e),
+        };
+    }
+
+    // 1. Lock-free TLS recent relative templates check (hits ~100% for fill series and alternating patterns)
+    let rel_computed = RECENT.with_borrow_mut(|recent| {
+        let ok = relative_key_opts(src, row, col, true, &mut recent.scratch).is_some();
+        if !ok {
+            return None;
+        }
+        if let Some(pos) = recent
+            .entries
+            .iter()
+            .position(|(k, _)| k.as_slice() == recent.scratch.as_slice())
+        {
+            let tpl = recent.entries[pos].1.clone();
+            if pos != 0 {
+                let item = recent.entries.remove(pos);
+                recent.entries.insert(0, item);
+            }
+            let dr = i64::from(row) - i64::from(tpl.row);
+            let dc = i64::from(col) - i64::from(tpl.col);
+            if tpl.offset_valid(dr, dc) {
+                return Some(Ok(CachedCompiled::Shifted {
+                    template: tpl,
+                    dr,
+                    dc,
+                }));
+            }
+        }
+        Some(Err(recent.scratch.clone()))
+    });
+
+    if let Some(Ok(hit)) = rel_computed {
+        return hit;
+    }
+
+    // 2. Check global exact shard (fast FxHash lookup — catches repeated strings with different row offsets!)
+    let exact_sh = shard(src);
+    if let Some(res) = exact_sh.read().unwrap().exact.get(src) {
+        return match res {
+            Ok(node) => {
+                let s = projectable(node, false);
+                let cs = projectable(node, true);
+                CachedCompiled::Exact(node.clone(), s, cs)
+            }
+            Err(e) => CachedCompiled::Err(*e),
+        };
+    }
+
+    // 3. Check global relative shard if relative_key succeeded
+    if let Some(Err(rel_key)) = rel_computed {
+        let rel_sh = shard(rel_key.as_slice());
+        if let Some(tpl) = rel_sh.read().unwrap().relative.get(rel_key.as_slice()).cloned() {
+            let dr = i64::from(row) - i64::from(tpl.row);
+            let dc = i64::from(col) - i64::from(tpl.col);
+            if tpl.offset_valid(dr, dc) {
+                RECENT.with_borrow_mut(|recent| {
+                    if recent.entries.len() >= TLS_TEMPLATES {
+                        recent.entries.pop();
+                    }
+                    recent.entries.insert(0, (rel_key, tpl.clone()));
+                });
+                return CachedCompiled::Shifted {
+                    template: tpl,
+                    dr,
+                    dc,
+                };
+            }
+        } else {
+            // Cold parse: populate BOTH relative template (for fill series) AND exact cache (for repeated strings)
+            match parse_body(src) {
+                Ok(node) => {
+                    let tpl = Arc::new(Template::from_node(node.clone(), row, col));
+                    {
+                        let mut cache = rel_sh.write().unwrap();
+                        if cache.relative.len() >= PER_SHARD {
+                            cache.relative.clear();
+                        }
+                        cache
+                            .relative
+                            .entry(rel_key.clone())
+                            .or_insert_with(|| tpl.clone());
+                    }
+                    {
+                        let mut cache = exact_sh.write().unwrap();
+                        if cache.exact.len() >= PER_SHARD {
+                            cache.exact.clear();
+                        }
+                        cache
+                            .exact
+                            .entry(Arc::from(src))
+                            .or_insert_with(|| Ok(node));
+                    }
+                    RECENT.with_borrow_mut(|recent| {
+                        if recent.entries.len() >= TLS_TEMPLATES {
+                            recent.entries.pop();
+                        }
+                        recent.entries.insert(0, (rel_key, tpl.clone()));
+                    });
+                    return CachedCompiled::Shifted {
+                        template: tpl,
+                        dr: 0,
+                        dc: 0,
+                    };
+                }
+                Err(e) => {
+                    let mut cache = exact_sh.write().unwrap();
+                    if cache.exact.len() >= PER_SHARD {
+                        cache.exact.clear();
+                    }
+                    cache.exact.entry(Arc::from(src)).or_insert(Err(e));
+                    return CachedCompiled::Err(e);
+                }
+            }
+        }
+    }
+
+    // 4. Non-relative formula: parse and cache in exact shard
+    let parsed = parse_body(src);
+    let mut cache = exact_sh.write().unwrap();
+    if cache.exact.len() >= PER_SHARD {
+        cache.exact.clear();
+    }
+    let stored = cache.exact.entry(Arc::from(src)).or_insert(parsed).clone();
+    match stored {
+        Ok(node) => {
+            let s = projectable(&node, false);
+            let cs = projectable(&node, true);
+            CachedCompiled::Exact(node, s, cs)
+        }
+        Err(e) => CachedCompiled::Err(e),
+    }
+}
+
+/// Resolve an `Arc<str>` formula (with or without leading `'='`) using the lock-free TLS
+/// pointer cache first, falling back to `resolve_compiled`.
+#[inline]
+fn resolve_compiled_arc(formula: &Arc<str>, row: u32, col: u32) -> CachedCompiled {
+    if Arc::strong_count(formula) > 1 {
+        if let Some(hit) = PTR_CACHE.with_borrow(|c| c.get(formula)) {
+            return hit;
+        }
+        let src = formula.strip_prefix('=').unwrap_or(formula);
+        let compiled = resolve_compiled(src, row, col);
+        PTR_CACHE.with_borrow_mut(|c| c.put(formula, compiled.clone()));
+        return compiled;
+    }
+    let src = formula.strip_prefix('=').unwrap_or(formula);
+    resolve_compiled(src, row, col)
+}
+
+/// Zero-relocate visitor passing `(&Node, dr, dc)` directly to the caller.
+#[inline]
+pub(crate) fn with_shifted<T>(
+    src: &str,
+    row: u32,
+    col: u32,
+    visit: impl FnOnce(&Node, i64, i64) -> T,
+) -> Result<T, ErrKind> {
+    match resolve_compiled(src, row, col) {
+        CachedCompiled::Exact(node, _, _) => Ok(visit(&node, 0, 0)),
+        CachedCompiled::Shifted { template, dr, dc } => Ok(visit(&template.node, dr, dc)),
+        CachedCompiled::Err(e) => Err(e),
+    }
+}
+
+/// Zero-relocate visitor for `Arc<str>` formulas using lock-free pointer caching.
+#[inline]
+pub(crate) fn with_shifted_arc<T>(
+    formula: &Arc<str>,
+    row: u32,
+    col: u32,
+    visit: impl FnOnce(&Node, i64, i64) -> T,
+) -> Result<T, ErrKind> {
+    match resolve_compiled_arc(formula, row, col) {
+        CachedCompiled::Exact(node, _, _) => Ok(visit(&node, 0, 0)),
+        CachedCompiled::Shifted { template, dr, dc } => Ok(visit(&template.node, dr, dc)),
+        CachedCompiled::Err(e) => Err(e),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScalarKind {
+    None,
+    SameSheet,
+    CrossSheet,
+}
+
+/// Single-lookup evaluation dispatch: avoids scanning `src` twice for `scalar_at` + `with_node`,
+/// and lets callers fast-evaluate both same-sheet and cross-sheet scalar expressions.
+#[inline]
+pub(super) fn with_eval_arc<T>(
+    formula: &Arc<str>,
+    row: u32,
+    col: u32,
+    visit: impl FnOnce(&Node, i64, i64, ScalarKind) -> T,
+) -> Result<T, ErrKind> {
+    match resolve_compiled_arc(formula, row, col) {
+        CachedCompiled::Exact(node, scalar, cross_scalar) => {
+            let kind = if scalar {
+                ScalarKind::SameSheet
+            } else if cross_scalar {
+                ScalarKind::CrossSheet
+            } else {
+                ScalarKind::None
+            };
+            Ok(visit(&node, 0, 0, kind))
+        }
+        CachedCompiled::Shifted { template, dr, dc } => {
+            let kind = if template.scalar {
+                ScalarKind::SameSheet
+            } else if template.cross_sheet_scalar {
+                ScalarKind::CrossSheet
+            } else {
+                ScalarKind::None
+            };
+            Ok(visit(&template.node, dr, dc, kind))
+        }
+        CachedCompiled::Err(e) => Err(e),
+    }
+}
+
+/// Single-lookup evaluation dispatch for `&str` (used after structured table expansion).
+#[inline]
+pub(super) fn with_eval_str<T>(
+    src: &str,
+    row: u32,
+    col: u32,
+    visit: impl FnOnce(&Node, i64, i64, ScalarKind) -> T,
+) -> Result<T, ErrKind> {
+    match resolve_compiled(src, row, col) {
+        CachedCompiled::Exact(node, scalar, cross_scalar) => {
+            let kind = if scalar {
+                ScalarKind::SameSheet
+            } else if cross_scalar {
+                ScalarKind::CrossSheet
+            } else {
+                ScalarKind::None
+            };
+            Ok(visit(&node, 0, 0, kind))
+        }
+        CachedCompiled::Shifted { template, dr, dc } => {
+            let kind = if template.scalar {
+                ScalarKind::SameSheet
+            } else if template.cross_sheet_scalar {
+                ScalarKind::CrossSheet
+            } else {
+                ScalarKind::None
+            };
+            Ok(visit(&template.node, dr, dc, kind))
+        }
+        CachedCompiled::Err(e) => Err(e),
+    }
+}
+
+/// Fast scalar evaluator on a shifted AST node whose `projectable(node, true)` holds.
+#[inline]
+pub(super) fn eval_projected_scalar(
+    node: &Node,
+    dr: i64,
+    dc: i64,
+    read: &mut impl FnMut(Option<&str>, u32, u32) -> Option<FValue>,
+) -> Option<FValue> {
+    Some(match node {
+        Node::Number(v) => FValue::Number(*v),
+        Node::Bool(b) => FValue::Bool(*b),
+        Node::Text(s) => FValue::Text(s.as_str().into()),
+        Node::Err(e) => FValue::Error(*e),
+        Node::Empty => FValue::Empty,
+        Node::Ref(r) => {
+            let row = r.row + if r.row_abs { 0 } else { dr };
+            let col = r.col + if r.col_abs { 0 } else { dc };
+            if row < 0 || col < 0 {
+                return Some(FValue::Error(ErrKind::Ref));
+            }
+            read(r.sheet.as_deref(), row as u32, col as u32)?.scalar()
+        }
+        Node::Unary(neg, n) => eval_projected_scalar(n, dr, dc, read)?
+            .to_number()
+            .map(|v| FValue::number(if *neg { -v } else { v }))
+            .unwrap_or_else(FValue::Error),
+        Node::Percent(n) => eval_projected_scalar(n, dr, dc, read)?
+            .to_number()
+            .map(|v| FValue::number(v / 100.0))
+            .unwrap_or_else(FValue::Error),
+        Node::Binary(op, a, b) => bin_scalar(
+            *op,
+            &eval_projected_scalar(a, dr, dc, read)?,
+            &eval_projected_scalar(b, dr, dc, read)?,
+        ),
+        Node::Func(name, args) => match name.id() {
+            super::func_id::FuncId::If if (2..=3).contains(&args.len()) => {
+                let cond = eval_projected_scalar(&args[0], dr, dc, read)?;
+                match cond.to_bool() {
+                    Ok(true) => eval_projected_scalar(&args[1], dr, dc, read)?,
+                    Ok(false) => {
+                        if args.len() >= 3 {
+                            eval_projected_scalar(&args[2], dr, dc, read)?
+                        } else {
+                            FValue::Bool(false)
+                        }
+                    }
+                    Err(e) => FValue::Error(e),
+                }
+            }
+            super::func_id::FuncId::IfError if args.len() == 2 => {
+                let v = eval_projected_scalar(&args[0], dr, dc, read)?;
+                if v.is_error() {
+                    eval_projected_scalar(&args[1], dr, dc, read)?
+                } else {
+                    v
+                }
+            }
+            super::func_id::FuncId::IfNa if args.len() == 2 => {
+                let v = eval_projected_scalar(&args[0], dr, dc, read)?;
+                if matches!(v, FValue::Error(ErrKind::Na)) {
+                    eval_projected_scalar(&args[1], dr, dc, read)?
+                } else {
+                    v
+                }
+            }
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Visit references of a projected scalar AST node with `(dr, dc)` offset.
+#[inline]
+pub(super) fn visit_projected_refs(
+    node: &Node,
+    dr: i64,
+    dc: i64,
+    visit: &mut impl FnMut(Option<&str>, u32, u32),
+) {
+    match node {
+        Node::Ref(r) => {
+            let row = r.row + if r.row_abs { 0 } else { dr };
+            let col = r.col + if r.col_abs { 0 } else { dc };
+            if row >= 0 && col >= 0 {
+                visit(r.sheet.as_deref(), row as u32, col as u32);
+            }
+        }
+        Node::Unary(_, n) | Node::Percent(n) => visit_projected_refs(n, dr, dc, visit),
+        Node::Binary(_, a, b) => {
+            visit_projected_refs(a, dr, dc, visit);
+            visit_projected_refs(b, dr, dc, visit);
+        }
+        Node::Func(_, args) => {
+            for a in args {
+                visit_projected_refs(a, dr, dc, visit);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(super) fn compile_at(src: &str, row: u32, col: u32) -> Parsed {
     if src.len() > MAX_SOURCE {
         return parse_body(src);
     }
-    let shard = shard(src);
-    if let Some(value) = shard.read().unwrap().exact.get(src) {
+    let sh = shard(src);
+    if let Some(value) = sh.read().unwrap().exact.get(src) {
         return value.clone();
     }
     let value = match template(src, row, col) {
@@ -115,14 +657,18 @@ pub(super) fn compile_at(src: &str, row: u32, col: u32) -> Parsed {
         }
         None => parse_body(src),
     };
-    let mut cache = shard.write().unwrap();
+    let mut cache = sh.write().unwrap();
     if let Some(existing) = cache.exact.get(src) {
         return existing.clone();
     }
     if cache.exact.len() >= PER_SHARD {
         cache.exact.clear();
     }
-    cache.exact.entry(src.to_owned()).or_insert(value).clone()
+    cache
+        .exact
+        .entry(Arc::from(src))
+        .or_insert(value)
+        .clone()
 }
 
 struct Shifted {
@@ -182,12 +728,23 @@ pub(crate) fn with_node<T>(
     Ok(result)
 }
 
-fn projectable(node: &Node) -> bool {
+fn projectable(node: &Node, allow_sheet: bool) -> bool {
     match node {
-        Node::Number(_) => true,
-        Node::Ref(r) => r.sheet.is_none() && r.sheet2.is_none() && r.book.is_none(),
-        Node::Unary(_, n) | Node::Percent(n) => projectable(n),
-        Node::Binary(_, a, b) => projectable(a) && projectable(b),
+        Node::Number(_) | Node::Bool(_) | Node::Text(_) | Node::Err(_) | Node::Empty => true,
+        Node::Ref(r) => {
+            (allow_sheet || r.sheet.is_none()) && r.sheet2.is_none() && r.book.is_none()
+        }
+        Node::Unary(_, n) | Node::Percent(n) => projectable(n, allow_sheet),
+        Node::Binary(_, a, b) => projectable(a, allow_sheet) && projectable(b, allow_sheet),
+        Node::Func(name, args) => match name.id() {
+            super::func_id::FuncId::If if (2..=3).contains(&args.len()) => {
+                args.iter().all(|a| projectable(a, allow_sheet))
+            }
+            super::func_id::FuncId::IfError | super::func_id::FuncId::IfNa if args.len() == 2 => {
+                args.iter().all(|a| projectable(a, allow_sheet))
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -198,15 +755,19 @@ pub(super) struct BoundScalar {
     dc: i64,
 }
 
+#[allow(dead_code)]
 pub(super) fn scalar_at(src: &str, row: u32, col: u32) -> Option<BoundScalar> {
     let template = template(src, row, col)?;
-    template.scalar.then(|| BoundScalar {
-        dr: i64::from(row) - i64::from(template.row),
-        dc: i64::from(col) - i64::from(template.col),
+    let dr = i64::from(row) - i64::from(template.row);
+    let dc = i64::from(col) - i64::from(template.col);
+    (template.scalar && template.offset_valid(dr, dc)).then(|| BoundScalar {
+        dr,
+        dc,
         template,
     })
 }
 
+#[allow(dead_code)]
 impl BoundScalar {
     fn coord(&self, r: &RefExpr) -> (u32, u32) {
         let row = r.row + if r.row_abs { 0 } else { self.dr };
@@ -216,53 +777,18 @@ impl BoundScalar {
     }
 
     pub(super) fn refs(&self, mut visit: impl FnMut(u32, u32)) {
-        fn walk(bound: &BoundScalar, node: &Node, visit: &mut impl FnMut(u32, u32)) {
-            match node {
-                Node::Ref(r) => {
-                    let (row, col) = bound.coord(r);
-                    visit(row, col);
-                }
-                Node::Unary(_, n) | Node::Percent(n) => walk(bound, n, visit),
-                Node::Binary(_, a, b) => {
-                    walk(bound, a, visit);
-                    walk(bound, b, visit);
-                }
-                _ => {}
-            }
-        }
-        walk(self, &self.template.node, &mut visit);
+        visit_projected_refs(&self.template.node, self.dr, self.dc, &mut |_, r, c| {
+            visit(r, c);
+        });
     }
 
     pub(super) fn evaluate(
         &self,
         mut read: impl FnMut(u32, u32) -> Option<FValue>,
     ) -> Option<FValue> {
-        fn eval(
-            bound: &BoundScalar,
-            n: &Node,
-            read: &mut impl FnMut(u32, u32) -> Option<FValue>,
-        ) -> Option<FValue> {
-            Some(match n {
-                Node::Number(v) => FValue::Number(*v),
-                Node::Ref(r) => {
-                    let (row, col) = bound.coord(r);
-                    read(row, col)?.scalar()
-                }
-                Node::Unary(neg, n) => eval(bound, n, read)?
-                    .to_number()
-                    .map(|v| FValue::number(if *neg { -v } else { v }))
-                    .unwrap_or_else(FValue::Error),
-                Node::Percent(n) => eval(bound, n, read)?
-                    .to_number()
-                    .map(|v| FValue::number(v / 100.0))
-                    .unwrap_or_else(FValue::Error),
-                Node::Binary(op, a, b) => {
-                    bin_scalar(*op, &eval(bound, a, read)?, &eval(bound, b, read)?)
-                }
-                _ => return None,
-            })
-        }
-        eval(self, &self.template.node, &mut read)
+        eval_projected_scalar(&self.template.node, self.dr, self.dc, &mut |_, r, c| {
+            read(r, c)
+        })
     }
 }
 
@@ -425,8 +951,12 @@ fn relative_key_opts(
             let r2_0 = i64::from(r2) - 1;
             out.push(2);
             out.push(u8::from(a_abs) | (u8::from(b_abs) << 1));
-            out.extend_from_slice(&(if a_abs { r1_0 } else { r1_0 - i64::from(row) }).to_le_bytes());
-            out.extend_from_slice(&(if b_abs { r2_0 } else { r2_0 - i64::from(row) }).to_le_bytes());
+            out.extend_from_slice(
+                &(if a_abs { r1_0 } else { r1_0 - i64::from(row) }).to_le_bytes(),
+            );
+            out.extend_from_slice(
+                &(if b_abs { r2_0 } else { r2_0 - i64::from(row) }).to_le_bytes(),
+            );
             // Whole-row expansion uses relative columns A..XFD, so pin template per column (dc == 0).
             out.extend_from_slice(&col.to_le_bytes());
             i = end;
@@ -462,7 +992,9 @@ fn relative_key_opts(
         }
 
         // 6. Numeric literal (including scientific notation 1e3 / 1.5E-4)
-        if byte.is_ascii_digit() || (byte == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)) {
+        if byte.is_ascii_digit()
+            || (byte == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+        {
             if need_ref || after_bang {
                 return None;
             }
@@ -484,10 +1016,9 @@ fn relative_key_opts(
                     i = save;
                 }
             }
-            if bytes
-                .get(i)
-                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'$' | b'_' | b'.' | b'!' | b':'))
-            {
+            if bytes.get(i).is_some_and(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, b'$' | b'_' | b'.' | b'!' | b':')
+            }) {
                 return None;
             }
             out.push(6);
@@ -556,7 +1087,11 @@ fn relative_key_opts(
                 let fn_name = if extended {
                     strip_xlfn_prefix(word)?
                 } else {
-                    if word.as_bytes().windows(3).any(|w| w.eq_ignore_ascii_case(b"_xl")) {
+                    if word
+                        .as_bytes()
+                        .windows(3)
+                        .any(|w| w.eq_ignore_ascii_case(b"_xl"))
+                    {
                         return None;
                     }
                     word
@@ -671,7 +1206,7 @@ fn relative_key_opts(
 /// retain the text translator's handling of whole axes, sheet names and bounds.
 #[derive(Default)]
 pub struct RuleFormulas {
-    templates: HashMap<String, Option<Node>>,
+    templates: FxHashMap<String, Option<Node>>,
 }
 
 impl RuleFormulas {
@@ -690,7 +1225,7 @@ impl RuleFormulas {
     }
 }
 
-fn relocate(node: &mut Node, dr: i64, dc: i64) -> bool {
+pub(super) fn relocate(node: &mut Node, dr: i64, dc: i64) -> bool {
     let shift = |r: &mut super::RefExpr| {
         if !r.row_abs {
             r.row += dr;

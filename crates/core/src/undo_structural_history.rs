@@ -15,22 +15,24 @@ impl Snapshots {
         let (before, after) = (&mut self.before, &mut self.after);
         let (undo, redo) =
             CellHistory::pair(&before.target, &after.target, &before.shift, &after.shift);
-        let bytes = undo.bytes()
-            + redo.bytes()
-            + before.reference_uses.bytes()
-            + after.reference_uses.bytes()
-            + before
-                .foreign
-                .iter()
-                .chain(&after.foreign)
-                .map(|f| {
-                    std::mem::size_of_val(f.cells.as_slice())
-                        + f.cells
-                            .iter()
-                            .map(|(_, c)| cell_heap_bytes(c))
-                            .sum::<usize>()
-                })
-                .sum::<usize>();
+        let foreign_bytes = before
+            .foreign
+            .iter()
+            .chain(&after.foreign)
+            .fold(0usize, |acc, f| {
+                let slice_bytes = std::mem::size_of_val(f.cells.as_slice());
+                let heap_bytes = f
+                    .cells
+                    .iter()
+                    .fold(0usize, |sum, (_, c)| sum.saturating_add(cell_heap_bytes(c)));
+                acc.saturating_add(slice_bytes).saturating_add(heap_bytes)
+            });
+        let bytes = undo
+            .bytes()
+            .saturating_add(redo.bytes())
+            .saturating_add(before.reference_uses.bytes())
+            .saturating_add(after.reference_uses.bytes())
+            .saturating_add(foreign_bytes);
         before.compact = Some(undo);
         after.compact = Some(redo);
         for side in [before, after] {
@@ -51,13 +53,15 @@ pub(super) struct Job {
 
 impl Job {
     fn run(&self) {
-        let mut slot = self.snapshots.lock().unwrap();
-        let snapshots = slot.as_mut().expect("new compression job");
-        // Failure to encode a legacy snapshot must never strand a waiting undo. Until both
-        // histories exist the original snapshots are intact and support the same replay guard.
-        let bytes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snapshots.compact()))
-            .unwrap_or(usize::MAX);
-        self.bytes.set(bytes).expect("one worker per job");
+        let mut slot = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        // `Snapshots::compact` operates solely on owned in-memory stores with checked iteration
+        // and saturating accounting, so it never relies on unwinding. Still guard the slot with
+        // an explicit `Option` check so waiting undo callers can never be stranded.
+        let bytes = match slot.as_mut() {
+            Some(snapshots) => snapshots.compact(),
+            None => usize::MAX,
+        };
+        let _ = self.bytes.set(bytes);
         self.finished.notify_all();
     }
 
@@ -65,11 +69,11 @@ impl Job {
         if !wait && self.bytes.get().is_none() {
             return None;
         }
-        let slot = self.snapshots.lock().unwrap();
+        let slot = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
         let mut slot = self
             .finished
             .wait_while(slot, |_| self.bytes.get().is_none())
-            .unwrap();
+            .unwrap_or_else(|e| e.into_inner());
         Some((slot.take()?, *self.bytes.get()?))
     }
 }

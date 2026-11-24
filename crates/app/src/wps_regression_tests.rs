@@ -409,16 +409,16 @@ fn cat4_spotlight_split_duplicates_merge_same_datetime_and_paste_reapply() {
     app.sel_end = (7, 0);
     app.clip_paste(false, None);
     assert_eq!(
-        app.wb.sheet(0).get(7, 0).and_then(|c| c.formula.as_deref()),
+        app.wb.sheet(0).formula_of(7, 0),
         Some("40+2")
     );
     app.reapply_last_paste(1);
-    let pasted_val_only = app.wb.sheet(0).get(7, 0).cloned().unwrap();
+    let pasted_val_only = app.wb.sheet(0).get(7, 0).map(|c| c.into_owned()).unwrap();
     assert!(pasted_val_only.formula.is_none(), "切换为仅值应剥离公式");
     assert_eq!(pasted_val_only.value, Value::Number(42.0));
     app.reapply_last_paste(2);
     assert_eq!(
-        app.wb.sheet(0).get(7, 0).and_then(|c| c.formula.as_deref()),
+        app.wb.sheet(0).formula_of(7, 0),
         Some("40+2"),
         "切回仅公式应恢复公式"
     );
@@ -617,7 +617,7 @@ fn ai_micro_harness_executes_multi_turn_sse_tool_loop_and_supports_undo() {
     assert_eq!(app.wb.sheet(0).value(0, 2), Value::Number(20.0));
     assert_eq!(app.wb.sheet(0).value(1, 2), Value::Number(60.0));
     assert_eq!(app.wb.sheet(0).value(2, 2), Value::Number(120.0));
-    assert_eq!(app.wb.sheet(0).get(1, 2).and_then(|c| c.formula.as_deref()), Some("A2*B2"));
+    assert_eq!(app.wb.sheet(0).formula_of(1, 2), Some("A2*B2"));
 
     app.undo_last_ai_change();
     assert_eq!(app.wb.sheet(0).value(0, 2), Value::Empty, "一键撤销应恢复 C1");
@@ -662,7 +662,7 @@ fn menu_enrichment_paste_suite() {
         source_rows: None,
         sheet: 0,
         rect: (0, 0, 0, 0),
-        cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), src_sid)]],
+        cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().into_owned(), src_sid)]],
         merges: Vec::new(),
         cut: false,
     });
@@ -673,7 +673,7 @@ fn menu_enrichment_paste_suite() {
     app.sel_end = (0, 1);
     app.ribbon_action("PasteValuesNumFmt", &ctx);
     assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(1234.5));
-    assert_eq!(app.wb.sheet(0).get(0, 1).and_then(|c| c.formula.as_deref()), None);
+    assert_eq!(app.wb.sheet(0).formula_of(0, 1), None);
     let st_b1 = app.wb.styles.get(app.wb.sheet(0).style_of(0, 1));
     assert_eq!(st_b1.format, "¥#,##0.00");
     assert_eq!(st_b1.fill, Some([240, 240, 240]), "ValuesNumFmt 应保留目标原有底纹");
@@ -683,7 +683,7 @@ fn menu_enrichment_paste_suite() {
     app.sel_end = (0, 2);
     app.ribbon_action("PasteValuesSourceFmt", &ctx);
     assert_eq!(app.wb.sheet(0).value(0, 2), Value::Number(1234.5));
-    assert_eq!(app.wb.sheet(0).get(0, 2).and_then(|c| c.formula.as_deref()), None);
+    assert_eq!(app.wb.sheet(0).formula_of(0, 2), None);
     let st_c1 = app.wb.styles.get(app.wb.sheet(0).style_of(0, 2));
     assert_eq!(st_c1.fill, Some([220, 235, 250]));
     assert_eq!(st_c1.color, [200, 30, 30]);
@@ -706,19 +706,19 @@ fn menu_enrichment_paste_suite() {
     app.sel = (0, 5);
     app.sel_end = (0, 5);
     app.ribbon_action("PasteFormulasNumFmt", &ctx);
-    assert_eq!(app.wb.sheet(0).get(0, 5).and_then(|c| c.formula.as_deref()), Some("1000+234.5"));
+    assert_eq!(app.wb.sheet(0).formula_of(0, 5), Some("1000+234.5"));
     assert_eq!(app.wb.styles.get(app.wb.sheet(0).style_of(0, 5)).format, "¥#,##0.00");
 
     // 6. 粘贴链接（同表 & 跨表）
     app.sel = (1, 0);
     app.sel_end = (1, 0);
     app.ribbon_action("PasteLink", &ctx);
-    assert_eq!(app.wb.sheet(0).get(1, 0).and_then(|c| c.formula.as_deref()), Some("=A1"));
+    assert_eq!(app.wb.sheet(0).formula_of(1, 0), Some("=A1"));
     app.switch_sheet_view(1);
     app.sel = (0, 0);
     app.sel_end = (0, 0);
     app.ribbon_action("PasteLink", &ctx);
-    let cross_f = app.wb.sheet(1).get(0, 0).and_then(|c| c.formula.as_deref()).unwrap_or("");
+    let cross_f = app.wb.sheet(1).formula_of(0, 0).unwrap_or("");
     assert!(cross_f.ends_with("!A1"), "跨表粘贴链接应带工作表名：{cross_f}");
 
     // 7. 跳过空单元格（ps_skip_blanks）

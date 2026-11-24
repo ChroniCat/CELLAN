@@ -4,9 +4,12 @@
 //! 分列把一格按分隔符拆到右边相邻的列，右边的原有内容会被推开。
 
 use crate::model::{Cell, Sheet, Value};
+use crate::sort_filter::{FxHashMap, parallel_stable_sort};
+use crate::store::{ColSlab, GatheredColumn, GatheredSlab, NumberSlab, PAGE_ROWS, StyleColumn};
 use crate::undo::CellDelta;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// 文本排序方式（Excel 的“排序依据”）
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -44,96 +47,55 @@ impl SortKey {
     }
 }
 
-/// Precompute the display, locale and stroke keys once per unique/needed row and sort level.
-struct PreparedKey {
-    number: Option<f64>,
-    boolean: Option<bool>,
-    empty: bool,
-    text: Box<[u8]>,
-    custom: Option<usize>,
-    strokes: Box<[Option<u16>]>,
+/// Compact 16-byte `Copy` sort key backed by deduplicated `u32` text ranks.
+/// Preserves exact `PreparedKey::compare` semantics (including `Bool` vs `Text` fallback to custom/text).
+#[derive(Clone, Copy)]
+struct CompactKey {
+    /// 0 = Number, 1 = Bool, 2 = Text/Error, 3 = Empty
+    kind: u8,
+    /// `u32::MAX` when not in `SortMode::Custom`.
+    custom: u32,
+    /// For Number: `f64::to_bits()`.
+    /// For Bool: `(bool_bit << 32) | (text_rank as u64)`.
+    /// For Text/Error: `text_rank as u64`.
+    payload: u64,
 }
 
-impl PreparedKey {
-    fn new(
-        value: &Value,
-        spec: &SortKey,
-        ranks: &HashMap<String, usize>,
-        key_cache: &mut crate::collate::SortKeyCache,
-    ) -> Self {
-        let mut result = Self {
-            number: None,
-            boolean: None,
-            empty: false,
-            text: Box::default(),
-            custom: None,
-            strokes: Box::default(),
-        };
-        match value {
-            Value::Number(n) => {
-                result.number = Some(*n);
-                return result;
-            }
-            Value::Empty => {
-                result.empty = true;
-                return result;
-            }
-            Value::Bool(b) => result.boolean = Some(*b),
-            _ => {}
-        }
-        let owned_buf: String;
-        let text: &str = match value {
-            Value::Text(t) if !spec.ignore_case || (t.is_ascii() && !t.bytes().any(|b| b.is_ascii_uppercase())) => t.as_ref(),
-            Value::Text(t) => {
-                owned_buf = t.to_lowercase();
-                &owned_buf
-            }
-            _ => {
-                let disp = value.display();
-                owned_buf = if spec.ignore_case {
-                    disp.to_lowercase()
-                } else {
-                    disp
-                };
-                &owned_buf
-            }
-        };
-        if matches!(spec.mode, SortMode::Stroke) {
-            result.strokes = text.chars().map(crate::collate::stroke_rank).collect();
-        }
-        if matches!(spec.mode, SortMode::Custom(_)) {
-            result.custom = ranks.get(&text.trim().to_ascii_lowercase()).copied();
-        }
-        result.text = if matches!(spec.mode, SortMode::Default) {
-            text.as_bytes().into()
-        } else {
-            key_cache.get_or_compute(text).into()
-        };
-        result
-    }
+impl CompactKey {
+    const KIND_NUM: u8 = 0;
+    const KIND_BOOL: u8 = 1;
+    const KIND_TEXT: u8 = 2;
+    const KIND_EMPTY: u8 = 3;
 
-    fn compare(&self, other: &Self, ascending: bool) -> Ordering {
-        if self.empty || other.empty {
-            return self.empty.cmp(&other.empty);
+    #[inline]
+    fn compare(self, other: Self, ascending: bool) -> Ordering {
+        if self.kind == Self::KIND_EMPTY || other.kind == Self::KIND_EMPTY {
+            return (self.kind == Self::KIND_EMPTY).cmp(&(other.kind == Self::KIND_EMPTY));
         }
-        let order = match (self.number, other.number) {
-            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            _ => match (self.boolean, other.boolean) {
-                (Some(a), Some(b)) => a.cmp(&b),
-                _ => match (self.custom, other.custom) {
-                    (Some(x), Some(y)) => x.cmp(&y),
-                    (Some(_), None) => Ordering::Less,
-                    (None, Some(_)) => Ordering::Greater,
-                    (None, None) => self.compare_text(other),
-                },
-            },
+        let order = match (self.kind, other.kind) {
+            (Self::KIND_NUM, Self::KIND_NUM) => f64::from_bits(self.payload)
+                .partial_cmp(&f64::from_bits(other.payload))
+                .unwrap_or(Ordering::Equal),
+            (Self::KIND_NUM, _) => Ordering::Less,
+            (_, Self::KIND_NUM) => Ordering::Greater,
+            (Self::KIND_BOOL, Self::KIND_BOOL) => (self.payload >> 32).cmp(&(other.payload >> 32)),
+            _ => self
+                .custom
+                .cmp(&other.custom)
+                .then_with(|| (self.payload as u32).cmp(&(other.payload as u32))),
         };
         if ascending { order } else { order.reverse() }
     }
+}
 
-    fn compare_text(&self, other: &Self) -> Ordering {
+struct UniqueTextEntry {
+    text: Box<[u8]>,
+    strokes: Box<[Option<u16>]>,
+    custom: u32,
+}
+
+impl UniqueTextEntry {
+    fn cmp_text(&self, other: &Self) -> Ordering {
         for (a, b) in self.strokes.iter().zip(other.strokes.iter()) {
             match (a, b) {
                 (Some(x), Some(y)) if x != y => return x.cmp(y),
@@ -146,6 +108,151 @@ impl PreparedKey {
             .cmp(&other.strokes.len())
             .then_with(|| self.text.cmp(&other.text))
     }
+}
+
+fn build_compact_keys_for_rows(
+    sheet: &Sheet,
+    rows: &[u32],
+    spec: &SortKey,
+    custom_ranks: &HashMap<String, usize>,
+    key_cache: &mut crate::collate::SortKeyCache,
+) -> Vec<CompactKey> {
+    let mut keys = Vec::with_capacity(rows.len());
+    let mut ptr_cache: FxHashMap<usize, u32> = FxHashMap::default();
+    let mut str_dedup: FxHashMap<String, u32> = FxHashMap::default();
+    let mut uniques: Vec<UniqueTextEntry> = Vec::new();
+    let mut scratch = String::new();
+
+    let mut intern_text = |raw: &str,
+                           shared_ptr: Option<usize>,
+                           key_cache: &mut crate::collate::SortKeyCache|
+     -> (u32, u32) {
+        if let Some(ptr) = shared_ptr
+            && let Some(&uid) = ptr_cache.get(&ptr)
+        {
+            return (uid, uniques[uid as usize].custom);
+        }
+        let norm: &str = if !spec.ignore_case
+            || (raw.is_ascii() && !raw.bytes().any(|b| b.is_ascii_uppercase()))
+        {
+            raw
+        } else {
+            scratch.clear();
+            if raw.is_ascii() {
+                scratch.extend(raw.bytes().map(|b| b.to_ascii_lowercase() as char));
+            } else {
+                scratch.push_str(&raw.to_lowercase());
+            }
+            &scratch
+        };
+        if let Some(&uid) = str_dedup.get(norm) {
+            if let Some(ptr) = shared_ptr {
+                ptr_cache.insert(ptr, uid);
+            }
+            return (uid, uniques[uid as usize].custom);
+        }
+        let strokes: Box<[Option<u16>]> = if matches!(spec.mode, SortMode::Stroke) {
+            norm.chars().map(crate::collate::stroke_rank).collect()
+        } else {
+            Box::default()
+        };
+        let custom = if matches!(spec.mode, SortMode::Custom(_)) {
+            custom_ranks
+                .get(&norm.trim().to_ascii_lowercase())
+                .map_or(u32::MAX, |&r| r as u32)
+        } else {
+            u32::MAX
+        };
+        let text: Box<[u8]> = if matches!(spec.mode, SortMode::Default) {
+            norm.as_bytes().into()
+        } else {
+            key_cache.get_or_compute(norm).into()
+        };
+        let uid = uniques.len() as u32;
+        uniques.push(UniqueTextEntry {
+            text,
+            strokes,
+            custom,
+        });
+        str_dedup.insert(norm.to_owned(), uid);
+        if let Some(ptr) = shared_ptr {
+            ptr_cache.insert(ptr, uid);
+        }
+        (uid, custom)
+    };
+
+    for &r in rows {
+        let v_cow = sheet.value_ref(r, spec.col);
+        match v_cow.as_ref() {
+            Value::Number(n) => keys.push(CompactKey {
+                kind: CompactKey::KIND_NUM,
+                custom: u32::MAX,
+                payload: n.to_bits(),
+            }),
+            Value::Empty => keys.push(CompactKey {
+                kind: CompactKey::KIND_EMPTY,
+                custom: u32::MAX,
+                payload: 0,
+            }),
+            Value::Text(t) => {
+                let shared = (Arc::strong_count(t) > 1)
+                    .then(|| Arc::as_ptr(t) as *const () as usize);
+                let (uid, custom) = intern_text(t.as_ref(), shared, key_cache);
+                keys.push(CompactKey {
+                    kind: CompactKey::KIND_TEXT,
+                    custom,
+                    payload: uid as u64,
+                });
+            }
+            Value::Bool(b) => {
+                let disp = if *b { "TRUE" } else { "FALSE" };
+                let (uid, custom) = intern_text(disp, None, key_cache);
+                keys.push(CompactKey {
+                    kind: CompactKey::KIND_BOOL,
+                    custom,
+                    payload: (u64::from(*b) << 32) | (uid as u64),
+                });
+            }
+            Value::Error(e) => {
+                let (uid, custom) = intern_text(e.text(), None, key_cache);
+                keys.push(CompactKey {
+                    kind: CompactKey::KIND_TEXT,
+                    custom,
+                    payload: uid as u64,
+                });
+            }
+        }
+    }
+
+    if uniques.len() > 1 {
+        let mut uids: Vec<u32> = (0..uniques.len() as u32).collect();
+        let uref = uniques.as_slice();
+        parallel_stable_sort(&mut uids, &|&a, &b| uref[a as usize].cmp_text(&uref[b as usize]));
+        let mut dense_rank = vec![0u32; uniques.len()];
+        let mut rank = 0u32;
+        for i in 0..uids.len() {
+            if i > 0
+                && uref[uids[i - 1] as usize].cmp_text(&uref[uids[i] as usize]) != Ordering::Equal
+            {
+                rank += 1;
+            }
+            dense_rank[uids[i] as usize] = rank;
+        }
+        for k in &mut keys {
+            match k.kind {
+                CompactKey::KIND_TEXT => {
+                    k.payload = dense_rank[k.payload as usize] as u64;
+                }
+                CompactKey::KIND_BOOL => {
+                    let b_hi = k.payload & 0xffff_ffff_0000_0000;
+                    let uid = (k.payload & 0xffff_ffff) as usize;
+                    k.payload = b_hi | (dense_rank[uid] as u64);
+                }
+                _ => {}
+            }
+        }
+    }
+    keys
 }
 
 /// Ordered cells to change, suitable for one undo action. Every value is read
@@ -187,19 +294,20 @@ impl NumericSort {
         let has_styles = !sheet.styles.is_empty() || !sheet.row_styles.is_empty() || !sheet.col_styles.is_empty();
         for r in r1..=r2 {
             for c in c1..=c2 {
-                let Some(Cell { value: Value::Number(n), formula: None }) = sheet.get(r, c) else {
+                let Some(n) = sheet.get_f64_plain(r, c) else {
                     return Ok(None);
                 };
                 if !n.is_finite() { return Ok(None); }
-                values.push(*n);
+                values.push(n);
                 if has_styles { styles.push(sheet.style_of(r, c)); }
             }
         }
-        let mut order: Vec<_> = (0..=r2 - r1).collect();
+        let mut order: Vec<u32> = (0..=r2 - r1).collect();
         let key_col = (key - c1) as usize;
-        order.sort_by(|&a, &b| {
-            let left = values[a as usize * width + key_col];
-            let right = values[b as usize * width + key_col];
+        let values_ref = values.as_slice();
+        parallel_stable_sort(&mut order, &|&a, &b| {
+            let left = values_ref[a as usize * width + key_col];
+            let right = values_ref[b as usize * width + key_col];
             let cmp = left.partial_cmp(&right).expect("numeric sort has finite keys");
             if asc { cmp } else { cmp.reverse() }
         });
@@ -213,6 +321,331 @@ impl NumericSort {
     pub(crate) fn bytes(&self) -> usize {
         self.values.capacity() * size_of::<f64>() + self.styles.capacity() * size_of::<u16>()
             + self.order.capacity() * size_of::<u32>()
+    }
+
+    /// Parallel columnar gather directly into `sheet` (no per-cell `CellDelta` / `sheet.set` loop).
+    /// Returns exact count of changed cells (matching `self.deltas().count()`).
+    pub fn apply_to_sheet(&self, sheet: &mut Sheet) -> usize {
+        let rows = self.order.len();
+        if rows == 0 || self.width == 0 {
+            return 0;
+        }
+        let r1 = self.first_row;
+        let r2 = r1 + rows as u32 - 1;
+        let c1 = self.first_col;
+        let p_lo = r1 / PAGE_ROWS;
+        let p_hi = r2 / PAGE_ROWS;
+        let n_pages = (p_hi - p_lo + 1) as usize;
+        let has_styles = !self.styles.is_empty();
+        let width = self.width;
+
+        struct NumericColResult {
+            col_data: GatheredColumn,
+            style_slabs: Option<Vec<Option<Arc<StyleColumn>>>>,
+            style_edits: Vec<(u32, [u64; 4])>,
+            changed: usize,
+            style_changed: bool,
+        }
+
+        let build_col = |col_off: usize| -> NumericColResult {
+            let col = c1 + col_off as u32;
+            let old_slabs = sheet.cells().col_page_slices(col, p_lo, p_hi);
+            let mut new_slabs: Vec<Option<GatheredSlab>> = Vec::with_capacity(n_pages);
+            let mut style_slabs = has_styles.then(|| Vec::with_capacity(n_pages));
+            let mut style_edits: Vec<(u32, [u64; 4])> = Vec::new();
+            let mut occupied_masks: Vec<(u32, [u64; 4])> = Vec::new();
+            let mut len_delta: isize = 0;
+            let mut has_formula = false;
+            let mut has_qual_formula = false;
+            let mut changed = 0usize;
+            let mut style_changed = false;
+            let has_col_style = has_styles && sheet.col_styles.contains_key(&col);
+            let track_cleared = !sheet.cleared.is_empty();
+
+            for page_idx in 0..n_pages {
+                let pi = p_lo + page_idx as u32;
+                let base = pi * PAGE_ROWS;
+                let lo = r1.saturating_sub(base) as usize;
+                let hi = (r2 - base).min(PAGE_ROWS - 1) as usize;
+                let old_slab = old_slabs[page_idx];
+                let old_len = old_slab.map_or(0, ColSlab::len);
+                let old_count = old_slab.map_or(0, ColSlab::occupied_count) as isize;
+                let target_len = old_len.max(hi + 1);
+                let push_mode = lo == 0 && hi + 1 >= old_len;
+                let keep_numbers = push_mode || old_slab.is_none_or(ColSlab::is_numbers);
+
+                let mut style_dense = [None::<u16>; PAGE_ROWS as usize];
+                let mut st_edit_mask = [0u64; 4];
+                let old_style_col = if has_styles {
+                    sheet.styles.page_col(pi, col)
+                } else {
+                    None
+                };
+                if let Some(osc) = old_style_col {
+                    for r in 0..lo {
+                        style_dense[r] = osc.get(r as u32).copied();
+                    }
+                    for r in (hi + 1)..PAGE_ROWS as usize {
+                        style_dense[r] = osc.get(r as u32).copied();
+                    }
+                }
+
+                let mut occ_mask = [0u64; 4];
+                if keep_numbers {
+                    let mut out_vals = if push_mode {
+                        Vec::with_capacity(target_len)
+                    } else {
+                        vec![0.0; target_len]
+                    };
+                    let mut present = [0u64; 4];
+                    let mut new_count: isize = 0;
+                    if !push_mode
+                        && let Some(ColSlab::Numbers(ons)) = old_slab
+                    {
+                        for r in 0..lo.min(ons.values.len()) {
+                            if ons.contains(r as u32) {
+                                out_vals[r] = ons.values[r];
+                                present[r / 64] |= 1u64 << (r % 64);
+                                new_count += 1;
+                            }
+                        }
+                        for r in (hi + 1)..ons.values.len() {
+                            if ons.contains(r as u32) {
+                                out_vals[r] = ons.values[r];
+                                present[r / 64] |= 1u64 << (r % 64);
+                                new_count += 1;
+                            }
+                        }
+                    }
+
+                    for r_off in lo..=hi {
+                        let dst_r = base + r_off as u32;
+                        let dst = (dst_r - r1) as usize;
+                        let src = self.order[dst] as usize;
+                        let a_idx = dst * width + col_off;
+                        let b_idx = src * width + col_off;
+                        let val = self.values[b_idx];
+                        let val_diff = dst != src && self.values[a_idx] != val;
+                        let mut st_diff = false;
+                        if has_styles {
+                            let before_st = self.styles[a_idx];
+                            let after_st = self.styles[b_idx];
+                            if dst != src && before_st != after_st {
+                                st_diff = true;
+                                style_changed = true;
+                                st_edit_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                                let explicit = (after_st != 0
+                                    || has_col_style
+                                    || (!sheet.row_styles.is_empty()
+                                        && sheet.row_styles.contains_key(&dst_r)))
+                                .then_some(after_st);
+                                style_dense[r_off] = explicit;
+                            } else {
+                                style_dense[r_off] =
+                                    old_style_col.and_then(|osc| osc.get(r_off as u32).copied());
+                            }
+                        }
+                        if val_diff || st_diff {
+                            changed += 1;
+                        }
+                        new_count += 1;
+                        present[r_off / 64] |= 1u64 << (r_off % 64);
+                        if track_cleared {
+                            occ_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                        }
+                        if push_mode {
+                            out_vals.push(val);
+                        } else {
+                            out_vals[r_off] = val;
+                        }
+                    }
+
+                    len_delta += new_count - old_count;
+                    if track_cleared && occ_mask != [0; 4] {
+                        occupied_masks.push((pi, occ_mask));
+                    }
+                    new_slabs.push((present != [0; 4]).then(|| GatheredSlab {
+                        cells: Arc::new(ColSlab::Numbers(NumberSlab {
+                            present,
+                            values: out_vals,
+                        })),
+                        row_mask: present,
+                    }));
+                } else {
+                    let mut out_vec = vec![Cell::default(); target_len];
+                    let mut new_count: isize = 0;
+                    let mut row_mask = [0u64; 4];
+                    if let Some(os) = old_slab {
+                        for r in 0..lo.min(old_len) {
+                            if let Some(v) = os.get_view(r as u32) {
+                                if let Some(f) = v.formula() {
+                                    has_formula = true;
+                                    if f.contains('!') {
+                                        has_qual_formula = true;
+                                    }
+                                }
+                                new_count += 1;
+                                row_mask[r / 64] |= 1u64 << (r % 64);
+                                out_vec[r] = v.to_cell();
+                            }
+                        }
+                        for r in (hi + 1)..old_len {
+                            if let Some(v) = os.get_view(r as u32) {
+                                if let Some(f) = v.formula() {
+                                    has_formula = true;
+                                    if f.contains('!') {
+                                        has_qual_formula = true;
+                                    }
+                                }
+                                new_count += 1;
+                                row_mask[r / 64] |= 1u64 << (r % 64);
+                                out_vec[r] = v.to_cell();
+                            }
+                        }
+                    }
+                    for r_off in lo..=hi {
+                        let dst_r = base + r_off as u32;
+                        let dst = (dst_r - r1) as usize;
+                        let src = self.order[dst] as usize;
+                        let a_idx = dst * width + col_off;
+                        let b_idx = src * width + col_off;
+                        let val = self.values[b_idx];
+                        let val_diff = dst != src && self.values[a_idx] != val;
+                        let mut st_diff = false;
+                        if has_styles {
+                            let before_st = self.styles[a_idx];
+                            let after_st = self.styles[b_idx];
+                            if dst != src && before_st != after_st {
+                                st_diff = true;
+                                style_changed = true;
+                                st_edit_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                                let explicit = (after_st != 0
+                                    || has_col_style
+                                    || (!sheet.row_styles.is_empty()
+                                        && sheet.row_styles.contains_key(&dst_r)))
+                                .then_some(after_st);
+                                style_dense[r_off] = explicit;
+                            } else {
+                                style_dense[r_off] =
+                                    old_style_col.and_then(|osc| osc.get(r_off as u32).copied());
+                            }
+                        }
+                        if val_diff || st_diff {
+                            changed += 1;
+                        }
+                        new_count += 1;
+                        row_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                        if track_cleared {
+                            occ_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                        }
+                        out_vec[r_off] = Cell {
+                            value: Value::Number(val),
+                            formula: None,
+                        };
+                    }
+                    while out_vec.last().is_some_and(Cell::is_blank) {
+                        out_vec.pop();
+                    }
+                    len_delta += new_count - old_count;
+                    if track_cleared && occ_mask != [0; 4] {
+                        occupied_masks.push((pi, occ_mask));
+                    }
+                    let slab = if has_formula {
+                        ColSlab::Mixed(out_vec)
+                    } else {
+                        ColSlab::Values(out_vec.into_iter().map(|c| c.value).collect())
+                    };
+                    new_slabs.push((!slab.is_empty()).then(|| GatheredSlab {
+                        cells: Arc::new(slab),
+                        row_mask,
+                    }));
+                }
+
+                if let Some(ref mut slabs) = style_slabs {
+                    slabs.push(StyleColumn::from_dense(&style_dense));
+                    if st_edit_mask != [0; 4] {
+                        style_edits.push((pi, st_edit_mask));
+                    }
+                }
+            }
+
+            NumericColResult {
+                col_data: GatheredColumn {
+                    col,
+                    slabs: new_slabs,
+                    len_delta,
+                    has_formula,
+                    has_qual_formula,
+                    vacated_masks: Vec::new(),
+                    occupied_masks,
+                },
+                style_slabs,
+                style_edits,
+                changed,
+                style_changed,
+            }
+        };
+
+        let area = rows as u64 * width as u64;
+        let results: Vec<NumericColResult> = if area >= 16_384 && width >= 2 {
+            let n_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(8)
+                .min(width);
+            let col_indices: Vec<usize> = (0..width).collect();
+            let chunk_size = width.div_ceil(n_threads);
+            let mut all = Vec::with_capacity(width);
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(n_threads);
+                for chunk in col_indices.chunks(chunk_size) {
+                    let f = &build_col;
+                    handles.push(s.spawn(move || {
+                        chunk.iter().map(|&c| f(c)).collect::<Vec<_>>()
+                    }));
+                }
+                for h in handles {
+                    if let Ok(local) = h.join() {
+                        all.extend(local);
+                    }
+                }
+            });
+            all
+        } else {
+            (0..width).map(build_col).collect()
+        };
+
+        let mut total_changed = 0usize;
+        let mut any_style_changed = false;
+        let mut gathered = Vec::with_capacity(results.len());
+        let mut style_updates = Vec::new();
+        for res in results {
+            total_changed += res.changed;
+            any_style_changed |= res.style_changed;
+            let col = res.col_data.col;
+            gathered.push(res.col_data);
+            if let Some(slabs) = res.style_slabs {
+                style_updates.push((col, slabs, res.style_edits));
+            }
+        }
+        let (cells, cleared) = sheet.cells_and_cleared_mut();
+        cells.install_gathered_columns(p_lo, p_hi, gathered, cleared);
+        if any_style_changed {
+            for (col, slabs, edits) in style_updates {
+                sheet.styles.install_col_pages(col, p_lo, slabs);
+                for (pi, mask) in edits {
+                    sheet.style_edits.or_page_mask(pi, col, mask);
+                }
+            }
+            sheet.bump_display_style_revision();
+            if !sheet.loading {
+                sheet.styles_dirty = true;
+            }
+        }
+        if total_changed > 0 && !sheet.loading {
+            sheet.edited = true;
+        }
+        total_changed
     }
 
     pub fn deltas(&self) -> impl DoubleEndedIterator<Item = CellDelta> + '_ {
@@ -268,10 +701,177 @@ impl CompactSort {
         // This snapshot outlives the worker as undo history. Account for heap text
         // and styles as well as the page buffers before handing it to the UI.
         let bytes = source.allocated_bytes() + order.capacity()*size_of::<u32>()
-            + source.styles.len() * size_of::<(crate::CellRef,u16)>()
+            + source.styles.payload_bytes()
             + (source.row_styles.capacity() + source.col_styles.capacity()) * size_of::<(u32,u16)>()
-            + source.iter().map(|(_,c)| crate::undo::cell_heap_bytes(c)).sum::<usize>();
+            + source.cells().total_cell_heap_bytes();
         Self::Mixed { source, index, region, order, horizontal, bytes }
+    }
+
+    /// Parallel columnar gather directly into `sheet` (no per-cell `CellDelta` / `sheet.set` loop).
+    /// Returns exact count of changed cells (value/formula OR style).
+    pub fn apply_to_sheet(&self, sheet: &mut Sheet) -> usize {
+        match self {
+            Self::Numeric(n) => n.apply_to_sheet(sheet),
+            Self::Mixed {
+                source,
+                region,
+                order,
+                horizontal,
+                ..
+            } => {
+                let (r1, c1, r2, c2) = *region;
+                if r1 > r2 || c1 > c2 || order.is_empty() {
+                    return 0;
+                }
+                if *horizontal {
+                    return apply_horizontal_gather(source, sheet, *region, order);
+                }
+                let (cells, cleared) = sheet.cells_and_cleared_mut();
+                let cell_changed = cells.gather_rows(
+                    source.cells(),
+                    *region,
+                    order,
+                    &source.name,
+                    cleared,
+                );
+                let has_styles = !source.styles.is_empty()
+                    || !source.row_styles.is_empty()
+                    || !source.col_styles.is_empty()
+                    || !sheet.styles.is_empty();
+                let mut style_only_changed = 0usize;
+                if has_styles {
+                    let p_lo = r1 / PAGE_ROWS;
+                    let p_hi = r2 / PAGE_ROWS;
+                    let n_pages = (p_hi - p_lo + 1) as usize;
+                    let cols: Vec<u32> = (c1..=c2).collect();
+
+                    let build_style_col = |col: u32| -> (u32, Vec<Option<Arc<StyleColumn>>>, Vec<(u32, [u64; 4])>, usize, bool) {
+                        let mut slabs = Vec::with_capacity(n_pages);
+                        let mut edits = Vec::new();
+                        let mut extra_changed = 0usize;
+                        let mut col_changed = false;
+                        let has_col_style = sheet.col_styles.contains_key(&col);
+                        let has_row_styles = !sheet.row_styles.is_empty();
+
+                        for page_idx in 0..n_pages {
+                            let pi = p_lo + page_idx as u32;
+                            let base = pi * PAGE_ROWS;
+                            let lo = r1.saturating_sub(base) as usize;
+                            let hi = (r2 - base).min(PAGE_ROWS - 1) as usize;
+                            let mut dense = [None::<u16>; PAGE_ROWS as usize];
+                            let old_sc = sheet.styles.page_col(pi, col);
+                            if let Some(osc) = old_sc {
+                                for r in 0..lo {
+                                    dense[r] = osc.get(r as u32).copied();
+                                }
+                                for r in (hi + 1)..PAGE_ROWS as usize {
+                                    dense[r] = osc.get(r as u32).copied();
+                                }
+                            }
+                            let mut edit_mask = [0u64; 4];
+                            for r_off in lo..=hi {
+                                let dst_r = base + r_off as u32;
+                                let src_r = order[(dst_r - r1) as usize];
+                                if dst_r == src_r {
+                                    dense[r_off] =
+                                        old_sc.and_then(|osc| osc.get(r_off as u32).copied());
+                                    continue;
+                                }
+                                let before_st = source.style_of(dst_r, col);
+                                let after_st = source.style_of(src_r, col);
+                                if before_st != after_st {
+                                    col_changed = true;
+                                    edit_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                                    let explicit = (after_st != 0
+                                        || has_col_style
+                                        || (has_row_styles && sheet.row_styles.contains_key(&dst_r)))
+                                    .then_some(after_st);
+                                    dense[r_off] = explicit;
+                                    if source.get(dst_r, col) == sheet.get(dst_r, col) {
+                                        extra_changed += 1;
+                                    }
+                                } else {
+                                    dense[r_off] =
+                                        old_sc.and_then(|osc| osc.get(r_off as u32).copied());
+                                }
+                            }
+                            slabs.push(StyleColumn::from_dense(&dense));
+                            if edit_mask != [0; 4] {
+                                edits.push((pi, edit_mask));
+                            }
+                        }
+                        (col, slabs, edits, extra_changed, col_changed)
+                    };
+
+                    let area = u64::from(r2 - r1 + 1) * cols.len() as u64;
+                    let results: Vec<_> = if area >= 16_384 && cols.len() >= 2 {
+                        let n_threads = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(4)
+                            .min(8)
+                            .min(cols.len());
+                        let chunk_size = cols.len().div_ceil(n_threads);
+                        let mut all = Vec::with_capacity(cols.len());
+                        std::thread::scope(|s| {
+                            let mut handles = Vec::with_capacity(n_threads);
+                            for chunk in cols.chunks(chunk_size) {
+                                let f = &build_style_col;
+                                handles.push(s.spawn(move || {
+                                    chunk.iter().map(|&c| f(c)).collect::<Vec<_>>()
+                                }));
+                            }
+                            for h in handles {
+                                if let Ok(local) = h.join() {
+                                    all.extend(local);
+                                }
+                            }
+                        });
+                        all
+                    } else {
+                        cols.iter().map(|&c| build_style_col(c)).collect()
+                    };
+
+                    let mut any_style_changed = false;
+                    for (col, slabs, edits, extra, changed) in results {
+                        style_only_changed += extra;
+                        if changed {
+                            any_style_changed = true;
+                            sheet.styles.install_col_pages(col, p_lo, slabs);
+                            for (pi, mask) in edits {
+                                sheet.style_edits.or_page_mask(pi, col, mask);
+                            }
+                        }
+                    }
+                    if any_style_changed {
+                        sheet.bump_display_style_revision();
+                        if !sheet.loading {
+                            sheet.styles_dirty = true;
+                        }
+                    }
+                }
+                let total = cell_changed + style_only_changed;
+                if total > 0 && !sheet.loading {
+                    sheet.edited = true;
+                }
+                total
+            }
+        }
+    }
+
+    /// Apply via parallel columnar gather AND collect up to `max_sample` leading `CellDelta`s
+    /// for revision audit logs without materializing millions of deltas.
+    pub fn apply_to_sheet_with_sample(
+        &self,
+        sheet: &mut Sheet,
+        max_sample: usize,
+    ) -> (usize, Vec<CellDelta>) {
+        let sample: Vec<CellDelta> = if max_sample == 0 {
+            Vec::new()
+        } else {
+            self.deltas().take(max_sample).collect()
+        };
+        let changed = self.apply_to_sheet(sheet);
+        (changed, sample)
     }
 
     /// Absolute source line for each destination, in the same order as deltas().
@@ -311,11 +911,33 @@ impl CompactSort {
             Self::Mixed { source,index,region,order,horizontal,.. } => {
                 let (r1,c1,r2,c2) = *region;
                 let (first, start, end) = if *horizontal { (c1,r1,r2) } else { (r1,c1,c2) };
+                let has_styles = !source.styles.is_empty()
+                    || !source.row_styles.is_empty()
+                    || !source.col_styles.is_empty();
+                let has_formulas = source.cells().has_formulas();
                 let cache = std::rc::Rc::new(std::cell::RefCell::new(crate::refs::FillFormulas::default()));
                 Box::new(order.iter().copied().enumerate().filter(move |&(dst,src)| first+dst as u32 != src)
                     .flat_map(move |(dst,src)| {
                         let cache = cache.clone();
                         (start..=end).filter_map(move |offset| {
+                            if !has_styles && !has_formulas {
+                                let (row, col) = if *horizontal { (offset, first + dst as u32) } else { (first + dst as u32, offset) };
+                                let (sr, sc) = if *horizontal { (offset, src) } else { (src, offset) };
+                                let before = source.get(row, col);
+                                let after = source.get(sr, sc);
+                                if before == after {
+                                    return None;
+                                }
+                                return Some(CellDelta {
+                                    sheet: *index,
+                                    row,
+                                    col,
+                                    before: before.map(|c| c.into_owned()).unwrap_or_default(),
+                                    after: after.map(|c| c.into_owned()).unwrap_or_default(),
+                                    before_style: 0,
+                                    after_style: 0,
+                                });
+                            }
                             let mut fill = cache.borrow_mut();
                             reorder_delta_cached(source,*index,first+dst as u32,Some(src),offset,*horizontal,false,&mut fill)
                         })
@@ -323,6 +945,291 @@ impl CompactSort {
             }
         }
     }
+}
+
+fn apply_horizontal_gather(
+    source: &Sheet,
+    sheet: &mut Sheet,
+    region: (u32, u32, u32, u32),
+    order: &[u32],
+) -> usize {
+    let (r1, c1, r2, c2) = region;
+    let p_lo = r1 / PAGE_ROWS;
+    let p_hi = r2 / PAGE_ROWS;
+    let n_pages = (p_hi - p_lo + 1) as usize;
+    let has_styles = !source.styles.is_empty()
+        || !source.row_styles.is_empty()
+        || !source.col_styles.is_empty()
+        || !sheet.styles.is_empty();
+    let cols: Vec<u32> = (c1..=c2).collect();
+
+    let build_col = |dst_c: u32| -> (GatheredColumn, Option<Vec<Option<Arc<StyleColumn>>>>, Vec<(u32, [u64; 4])>, usize, bool) {
+        let src_c = order[(dst_c - c1) as usize];
+        let src_slabs = source.cells().col_page_slices(src_c, p_lo, p_hi);
+        let old_slabs = sheet.cells().col_page_slices(dst_c, p_lo, p_hi);
+        let mut fill_cache = crate::refs::FillFormulas::default();
+        let mut new_slabs = Vec::with_capacity(n_pages);
+        let mut style_slabs = has_styles.then(|| Vec::with_capacity(n_pages));
+        let mut style_edits = Vec::new();
+        let mut vacated_masks = Vec::new();
+        let mut occupied_masks = Vec::new();
+        let mut len_delta: isize = 0;
+        let mut has_formula = false;
+        let mut has_qual_formula = false;
+        let mut changed = 0usize;
+        let mut style_changed = false;
+        let has_col_style = has_styles && sheet.col_styles.contains_key(&dst_c);
+        let has_row_styles = has_styles && !sheet.row_styles.is_empty();
+        let dc = i64::from(dst_c) - i64::from(src_c);
+
+        for page_idx in 0..n_pages {
+            let pi = p_lo + page_idx as u32;
+            let base = pi * PAGE_ROWS;
+            let lo = r1.saturating_sub(base) as usize;
+            let hi = (r2 - base).min(PAGE_ROWS - 1) as usize;
+            let old_slab = old_slabs[page_idx];
+            let src_slab = src_slabs[page_idx];
+            let old_len = old_slab.map_or(0, ColSlab::len);
+            let old_count = old_slab.map_or(0, ColSlab::occupied_count) as isize;
+
+            let target_len = old_len.max(hi + 1);
+            let mut out_vec = vec![Cell::default(); target_len];
+            let mut new_count: isize = 0;
+            let mut row_mask = [0u64; 4];
+            let mut slab_has_formula = false;
+            let mut slab_all_numbers = true;
+            if let Some(os) = old_slab {
+                for r in 0..lo.min(old_len) {
+                    if let Some(v) = os.get_view(r as u32) {
+                        if let Some(f) = v.formula() {
+                            has_formula = true;
+                            slab_has_formula = true;
+                            slab_all_numbers = false;
+                            if f.contains('!') {
+                                has_qual_formula = true;
+                            }
+                        } else if v.as_f64().is_none() {
+                            slab_all_numbers = false;
+                        }
+                        new_count += 1;
+                        row_mask[r / 64] |= 1u64 << (r % 64);
+                        out_vec[r] = v.to_cell();
+                    }
+                }
+                for r in (hi + 1)..old_len {
+                    if let Some(v) = os.get_view(r as u32) {
+                        if let Some(f) = v.formula() {
+                            has_formula = true;
+                            slab_has_formula = true;
+                            slab_all_numbers = false;
+                            if f.contains('!') {
+                                has_qual_formula = true;
+                            }
+                        } else if v.as_f64().is_none() {
+                            slab_all_numbers = false;
+                        }
+                        new_count += 1;
+                        row_mask[r / 64] |= 1u64 << (r % 64);
+                        out_vec[r] = v.to_cell();
+                    }
+                }
+            }
+
+            let mut vac_mask = [0u64; 4];
+            let mut occ_mask = [0u64; 4];
+            let mut dense_st = [None::<u16>; PAGE_ROWS as usize];
+            let mut st_edit_mask = [0u64; 4];
+            let old_sc = if has_styles { sheet.styles.page_col(pi, dst_c) } else { None };
+            if let Some(osc) = old_sc {
+                for r in 0..lo {
+                    dense_st[r] = osc.get(r as u32).copied();
+                }
+                for r in (hi + 1)..PAGE_ROWS as usize {
+                    dense_st[r] = osc.get(r as u32).copied();
+                }
+            }
+
+            for r_off in lo..=hi {
+                let row = base + r_off as u32;
+                let src_view = src_slab.and_then(|s| s.get_view(r_off as u32));
+                let old_view = old_slab.and_then(|s| s.get_view(r_off as u32));
+                let mut cell_diff = false;
+                if let Some(sv) = src_view {
+                    let mut cell = sv.to_cell();
+                    if dc != 0
+                        && let Some(f) = cell.formula.as_deref()
+                    {
+                        let nf: Arc<str> = if !f.contains('!') {
+                            fill_cache.translate(f, 0, dc).into()
+                        } else {
+                            crate::refs::translate(f, 0, dc, &source.name).into()
+                        };
+                        cell.formula = Some(nf);
+                    }
+                    if old_view.is_none_or(|ov| !ov.eq_cell(&cell)) {
+                        cell_diff = true;
+                    }
+                    if let Some(f) = cell.formula.as_deref() {
+                        has_formula = true;
+                        slab_has_formula = true;
+                        slab_all_numbers = false;
+                        if f.contains('!') {
+                            has_qual_formula = true;
+                        }
+                    } else if !matches!(cell.value, Value::Number(_)) {
+                        slab_all_numbers = false;
+                    }
+                    new_count += 1;
+                    row_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                    occ_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                    out_vec[r_off] = cell;
+                } else if old_view.is_some() {
+                    cell_diff = true;
+                    vac_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                }
+
+                let mut st_diff = false;
+                if has_styles {
+                    if dc != 0 {
+                        let before_st = source.style_of(row, dst_c);
+                        let after_st = source.style_of(row, src_c);
+                        if before_st != after_st {
+                            st_diff = true;
+                            style_changed = true;
+                            st_edit_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                            let explicit = (after_st != 0
+                                || has_col_style
+                                || (has_row_styles && sheet.row_styles.contains_key(&row)))
+                            .then_some(after_st);
+                            dense_st[r_off] = explicit;
+                        } else {
+                            dense_st[r_off] = old_sc.and_then(|osc| osc.get(r_off as u32).copied());
+                        }
+                    } else {
+                        dense_st[r_off] = old_sc.and_then(|osc| osc.get(r_off as u32).copied());
+                    }
+                }
+                if cell_diff || st_diff {
+                    changed += 1;
+                }
+            }
+
+            while out_vec.last().is_some_and(Cell::is_blank) {
+                out_vec.pop();
+            }
+            len_delta += new_count - old_count;
+            if vac_mask != [0; 4] {
+                vacated_masks.push((pi, vac_mask));
+            }
+            if occ_mask != [0; 4] {
+                occupied_masks.push((pi, occ_mask));
+            }
+            let slab = if out_vec.is_empty() {
+                None
+            } else if slab_has_formula {
+                Some(ColSlab::Mixed(out_vec))
+            } else if slab_all_numbers {
+                let mut vals = vec![0.0; out_vec.len()];
+                for (r, c) in out_vec.iter().enumerate() {
+                    if let Value::Number(n) = c.value {
+                        vals[r] = n;
+                    }
+                }
+                Some(ColSlab::Numbers(NumberSlab {
+                    present: row_mask,
+                    values: vals,
+                }))
+            } else {
+                Some(ColSlab::Values(out_vec.into_iter().map(|c| c.value).collect()))
+            };
+            new_slabs.push(slab.map(|s| GatheredSlab {
+                cells: Arc::new(s),
+                row_mask,
+            }));
+            if let Some(ref mut slabs) = style_slabs {
+                slabs.push(StyleColumn::from_dense(&dense_st));
+                if st_edit_mask != [0; 4] {
+                    style_edits.push((pi, st_edit_mask));
+                }
+            }
+        }
+
+        (
+            GatheredColumn {
+                col: dst_c,
+                slabs: new_slabs,
+                len_delta,
+                has_formula,
+                has_qual_formula,
+                vacated_masks,
+                occupied_masks,
+            },
+            style_slabs,
+            style_edits,
+            changed,
+            style_changed,
+        )
+    };
+
+    let area = u64::from(r2 - r1 + 1) * cols.len() as u64;
+    let results: Vec<_> = if area >= 16_384 && cols.len() >= 2 {
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(8)
+            .min(cols.len());
+        let chunk_size = cols.len().div_ceil(n_threads);
+        let mut all = Vec::with_capacity(cols.len());
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(n_threads);
+            for chunk in cols.chunks(chunk_size) {
+                let f = &build_col;
+                handles.push(s.spawn(move || chunk.iter().map(|&c| f(c)).collect::<Vec<_>>()));
+            }
+            for h in handles {
+                if let Ok(local) = h.join() {
+                    all.extend(local);
+                }
+            }
+        });
+        all
+    } else {
+        cols.iter().map(|&c| build_col(c)).collect()
+    };
+
+    let mut total_changed = 0usize;
+    let mut any_style_changed = false;
+    let mut gathered = Vec::with_capacity(results.len());
+    let mut style_updates = Vec::new();
+    for (gc, st_slabs, st_edits, ch, st_ch) in results {
+        total_changed += ch;
+        let col = gc.col;
+        gathered.push(gc);
+        if st_ch
+            && let Some(slabs) = st_slabs
+        {
+            any_style_changed = true;
+            style_updates.push((col, slabs, st_edits));
+        }
+    }
+    let (cells, cleared) = sheet.cells_and_cleared_mut();
+    cells.install_gathered_columns(p_lo, p_hi, gathered, cleared);
+    if any_style_changed {
+        for (col, slabs, edits) in style_updates {
+            sheet.styles.install_col_pages(col, p_lo, slabs);
+            for (pi, mask) in edits {
+                sheet.style_edits.or_page_mask(pi, col, mask);
+            }
+        }
+        sheet.bump_display_style_revision();
+        if !sheet.loading {
+            sheet.styles_dirty = true;
+        }
+    }
+    if total_changed > 0 && !sheet.loading {
+        sheet.edited = true;
+    }
+    total_changed
 }
 
 fn reorder_delta_cached(
@@ -347,6 +1254,7 @@ fn reorder_delta_cached(
         None => (None, before_style),
     };
     let translated = source
+        .as_deref()
         .and_then(|cell| cell.formula.as_deref())
         .filter(|_| !dedup)
         .map(|formula| {
@@ -362,11 +1270,11 @@ fn reorder_delta_cached(
     if translated.is_none() && before == source && before_style == after_style {
         return None;
     }
-    let mut after = source.cloned().unwrap_or_default();
+    let mut after = source.map(|c| c.into_owned()).unwrap_or_default();
     if let Some(f) = translated {
         after.formula = Some(f);
     }
-    let before = before.cloned().unwrap_or_default();
+    let before = before.map(|c| c.into_owned()).unwrap_or_default();
     if before != after || before_style != after_style {
         return Some(CellDelta {
             sheet: sheet_idx,
@@ -570,19 +1478,17 @@ fn multi_sort_order(sheet: &Sheet, region: (u32,u32,u32,u32), keys: &[SortKey], 
         let mut next_ties: Vec<std::ops::Range<usize>> = Vec::new();
 
         if ties.len() == 1 && ties[0] == (0..order.len()) {
-            let prepared: Vec<PreparedKey> = (r1..=r2)
-                .map(|r| PreparedKey::new(sheet.value_ref(r, key.col), key, &ranks, &mut key_cache))
+            let prepared = build_compact_keys_for_rows(sheet, &order, key, &ranks, &mut key_cache);
+            let mut indexed: Vec<(CompactKey, u32)> = prepared
+                .into_iter()
+                .zip(order.iter().copied())
                 .collect();
-            order.sort_by(|&a, &b| {
-                prepared[(a - r1) as usize].compare(&prepared[(b - r1) as usize], key.asc)
-            });
+            let asc = key.asc;
+            parallel_stable_sort(&mut indexed, &|a, b| a.0.compare(b.0, asc));
             let mut i = 0usize;
-            while i < order.len() {
+            while i < indexed.len() {
                 let mut j = i + 1;
-                while j < order.len()
-                    && prepared[(order[i] - r1) as usize]
-                        .compare(&prepared[(order[j] - r1) as usize], key.asc)
-                        == Ordering::Equal
+                while j < indexed.len() && indexed[i].0.compare(indexed[j].0, asc) == Ordering::Equal
                 {
                     j += 1;
                 }
@@ -591,22 +1497,23 @@ fn multi_sort_order(sheet: &Sheet, region: (u32,u32,u32,u32), keys: &[SortKey], 
                 }
                 i = j;
             }
+            for (dst, (_, row_id)) in order.iter_mut().zip(indexed) {
+                *dst = row_id;
+            }
         } else {
             for span in ties {
-                let mut local: Vec<(PreparedKey, u32)> = order[span.clone()]
-                    .iter()
-                    .map(|&r| {
-                        (
-                            PreparedKey::new(sheet.value_ref(r, key.col), key, &ranks, &mut key_cache),
-                            r,
-                        )
-                    })
+                let slice = &order[span.clone()];
+                let prepared = build_compact_keys_for_rows(sheet, slice, key, &ranks, &mut key_cache);
+                let mut local: Vec<(CompactKey, u32)> = prepared
+                    .into_iter()
+                    .zip(slice.iter().copied())
                     .collect();
-                local.sort_by(|a, b| a.0.compare(&b.0, key.asc));
+                let asc = key.asc;
+                parallel_stable_sort(&mut local, &|a, b| a.0.compare(b.0, asc));
                 let mut i = 0usize;
                 while i < local.len() {
                     let mut j = i + 1;
-                    while j < local.len() && local[i].0.compare(&local[j].0, key.asc) == Ordering::Equal {
+                    while j < local.len() && local[i].0.compare(local[j].0, asc) == Ordering::Equal {
                         j += 1;
                     }
                     if j - i > 1 {
@@ -688,7 +1595,7 @@ fn values_same_display(a: &Value, b: &Value) -> bool {
 
 fn rows_match_on_cols(sheet: &Sheet, r_a: u32, r_b: u32, cols: &[u32]) -> bool {
     cols.iter()
-        .all(|&c| values_same_display(sheet.value_ref(r_a, c), sheet.value_ref(r_b, c)))
+        .all(|&c| values_same_display(sheet.value_ref(r_a, c).as_ref(), sheet.value_ref(r_b, c).as_ref()))
 }
 
 fn distinct_rows(
@@ -733,10 +1640,10 @@ fn distinct_rows(
         // `sheet.iter_rect` visits in ascending `(row, col)` order!
         let mut sorted_cols = use_cols.clone();
         sorted_cols.sort_unstable();
-        for (k, cell) in sheet.iter_rect((r1, min_sel, r2, max_sel)) {
+        for (k, cell) in sheet.iter_rect_views((r1, min_sel, r2, max_sel)) {
             if selected.contains(&k.col) {
                 let entry = row_hashes.entry(k.row).or_insert(FNV_OFFSET);
-                *entry = hash_display_field(*entry, k.col, &cell.value);
+                *entry = hash_display_field(*entry, k.col, cell.value().as_ref());
             }
         }
         let mut seen_blank_row = false;
@@ -759,7 +1666,7 @@ fn distinct_rows(
         for row in r1..=r2 {
             let mut h = FNV_OFFSET;
             for &c in &use_cols {
-                h = hash_display_field(h, c, sheet.value_ref(row, c));
+                h = hash_display_field(h, c, sheet.value_ref(row, c).as_ref());
             }
             let bucket = buckets.entry(h).or_default();
             if !bucket.iter().any(|&prev| rows_match_on_cols(sheet, prev, row, &use_cols)) {
@@ -973,7 +1880,7 @@ pub fn text_to_columns_ex(
         let last = sheet.used_bounds().map(|b| b.3).unwrap_or(c2).max(c2);
         for cc in (c1 + 1..=last).rev() {
             for rr in r1..=r2 {
-                if let Some(cell) = sheet.get(rr, cc).cloned() {
+                if let Some(cell) = sheet.get(rr, cc).map(|c| c.into_owned()) {
                     sheet.set(rr, cc + shift, cell);
                     let st = sheet.style_of(rr, cc);
                     sheet.set_style(rr, cc + shift, st);
@@ -1360,5 +2267,173 @@ mod col_mode_tests {
         let rep = text_to_columns_ex(&mut s, (0, 0, 0, 0), &opts, false);
         assert_eq!(rep.width, 2);
         assert!(matches!(s.get(0, 1).unwrap().value, Value::Number(_)), "默认仍识别数字");
+    }
+}
+
+#[cfg(test)]
+mod compact_sort_gather_tests {
+    use super::*;
+    use crate::model::{Cell, Sheet, Value};
+
+    #[test]
+    fn apply_to_sheet_matches_deltas_on_numeric_mixed_formulas_styles_and_horizontal() {
+        // 1) Mixed vertical sort (text keys + numbers + formulas + explicit & row styles + boundary rows outside rect)
+        let mut base = Sheet::new("Data");
+        base.set(0, 0, Cell { value: Value::Text("Header".into()), formula: None });
+        base.set_row_style(10, 4);
+        for r in 1..=20_005u32 {
+            let key = format!("SKU-{:05}", (20_006 - r) % 777);
+            base.set(r, 0, Cell { value: Value::Text(key.into()), formula: None });
+            base.set(r, 1, Cell { value: Value::Number((r % 97) as f64), formula: None });
+            if r % 13 == 0 {
+                base.set(r, 2, Cell { value: Value::Number(0.0), formula: Some(format!("=B{}", r + 1).into()) });
+            } else if r % 5 != 0 {
+                base.set(r, 2, Cell { value: Value::Number((r * 2) as f64), formula: None });
+            }
+            base.set(r, 3, Cell { value: Value::Number((r * 3) as f64), formula: None });
+            base.set(r, 4, Cell { value: Value::Number((r * 4) as f64), formula: None });
+            base.set(r, 5, Cell { value: Value::Number((r * 5) as f64), formula: None });
+            if r % 3 == 0 {
+                base.set_style(r, 0, 2);
+            }
+        }
+        // Row outside sort rect on boundary page
+        base.set(20_006, 0, Cell { value: Value::Text("Footer".into()), formula: None });
+        base.set_style(20_006, 0, 9);
+
+        let rect = (1, 0, 20_005, 5);
+        let plan = CompactSort::plan(&base, 0, rect, 0, true, false).unwrap().unwrap();
+
+        let mut via_deltas = base.clone();
+        let mut expected_count = 0usize;
+        for d in plan.deltas() {
+            if d.before != d.after {
+                via_deltas.set(d.row, d.col, d.after);
+            }
+            if d.before_style != d.after_style {
+                via_deltas.set_style(d.row, d.col, d.after_style);
+            }
+            expected_count += 1;
+        }
+
+        let mut via_gather = base.clone();
+        let (gather_count, sample) = plan.apply_to_sheet_with_sample(&mut via_gather, 100);
+        assert_eq!(gather_count, expected_count);
+        assert_eq!(sample.len(), 100);
+        assert_eq!(via_gather.len(), via_deltas.len());
+        for r in 0..=20_006u32 {
+            for c in 0..=5u32 {
+                assert_eq!(via_gather.get(r, c), via_deltas.get(r, c), "cell mismatch at ({r},{c})");
+                assert_eq!(via_gather.style_of(r, c), via_deltas.style_of(r, c), "style mismatch at ({r},{c})");
+            }
+        }
+        assert_eq!(via_gather.get(0, 0).unwrap().value, Value::Text("Header".into()));
+        assert_eq!(via_gather.get(20_006, 0).unwrap().value, Value::Text("Footer".into()));
+        assert_eq!(via_gather.style_of(20_006, 0), 9);
+
+        // 2) Dense NumericSort path (25,000 x 5 = 125,000 > 100,000)
+        let mut num_base = Sheet::new("Num");
+        for r in 0..25_000u32 {
+            for c in 0..5u32 {
+                num_base.set(r, c, Cell { value: Value::Number(((25_000 - r) + c * 3) as f64), formula: None });
+            }
+            if r % 4 == 0 {
+                num_base.set_style(r, 0, 3);
+            }
+        }
+        let num_plan = CompactSort::plan(&num_base, 0, (0, 0, 24_999, 4), 0, true, false)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(num_plan, CompactSort::Numeric(_)));
+        let mut num_deltas = num_base.clone();
+        let mut num_expected = 0usize;
+        for d in num_plan.deltas() {
+            if d.before != d.after {
+                num_deltas.set(d.row, d.col, d.after);
+            }
+            if d.before_style != d.after_style {
+                num_deltas.set_style(d.row, d.col, d.after_style);
+            }
+            num_expected += 1;
+        }
+        let mut num_gather = num_base.clone();
+        let num_got = num_plan.apply_to_sheet(&mut num_gather);
+        assert_eq!(num_got, num_expected);
+        for r in [0u32, 1, 255, 256, 12_345, 24_999] {
+            for c in 0..5u32 {
+                assert_eq!(num_gather.get(r, c), num_deltas.get(r, c));
+                assert_eq!(num_gather.style_of(r, c), num_deltas.style_of(r, c));
+            }
+        }
+
+        // 3) Horizontal CompactSort path (20,001 rows x 6 cols = 120,006 > 100,000)
+        let mut h_base = Sheet::new("Horiz");
+        for c in 0..6u32 {
+            h_base.set(0, c, Cell { value: Value::Number((6 - c) as f64), formula: None });
+            for r in 1..=20_000u32 {
+                h_base.set(r, c, Cell { value: Value::Number((r * 10 + c) as f64), formula: None });
+            }
+        }
+        let h_plan = CompactSort::plan(&h_base, 0, (0, 0, 20_000, 5), 0, true, true)
+            .unwrap()
+            .unwrap();
+        let mut h_deltas = h_base.clone();
+        let mut h_expected = 0usize;
+        for d in h_plan.deltas() {
+            h_deltas.set(d.row, d.col, d.after);
+            h_expected += 1;
+        }
+        let mut h_gather = h_base.clone();
+        let h_got = h_plan.apply_to_sheet(&mut h_gather);
+        assert_eq!(h_got, h_expected);
+        for r in [0u32, 1, 255, 256, 20_000] {
+            for c in 0..6u32 {
+                assert_eq!(h_gather.get(r, c), h_deltas.get(r, c));
+            }
+        }
+    }
+
+    #[test]
+    fn apply_to_sheet_200k_x10_gather_verify_and_timing() {
+        let rows = 200_000u32;
+        let cols = 10u32;
+        let mut sheet = Sheet::new("Bench");
+        for r in 0..rows {
+            sheet.set(
+                r,
+                0,
+                Cell {
+                    value: Value::Text(format!("SKU-{:06}", rows - r).into()),
+                    formula: None,
+                },
+            );
+            for c in 1..cols {
+                sheet.set(
+                    r,
+                    c,
+                    Cell {
+                        value: Value::Number(((r + c * 7) % 10_000) as f64),
+                        formula: None,
+                    },
+                );
+            }
+        }
+        let t_plan = std::time::Instant::now();
+        let plan = CompactSort::plan(&sheet, 0, (0, 0, rows - 1, cols - 1), 0, true, false)
+            .unwrap()
+            .unwrap();
+        let plan_ms = t_plan.elapsed().as_secs_f64() * 1000.0;
+
+        let t_apply = std::time::Instant::now();
+        let changed = plan.apply_to_sheet(&mut sheet);
+        let apply_ms = t_apply.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "COMPACT_SORT_GATHER_200K_X10: plan_ms={plan_ms:.2} apply_ms={apply_ms:.2} total_ms={:.2} changed={changed}",
+            plan_ms + apply_ms
+        );
+        assert_eq!(changed, 2_000_000);
+        assert_eq!(sheet.get(0, 0).unwrap().value, Value::Text("SKU-000001".into()));
+        assert_eq!(sheet.get(rows - 1, 0).unwrap().value, Value::Text("SKU-200000".into()));
+        assert_eq!(sheet.len(), (rows * cols) as usize);
     }
 }

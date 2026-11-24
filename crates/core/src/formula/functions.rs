@@ -1,5 +1,7 @@
 //! 函数库。所有函数经由 `call()` 分发，新增函数只需在 match 里加一行。
 
+use super::func_id::FuncId;
+use super::fxhash::FxHashMap;
 use super::{Arg, ErrKind, FValue};
 
 // ---------------------------------------------------------------- 小工具
@@ -341,7 +343,7 @@ pub(crate) struct GroupStats {
 #[derive(Clone)]
 pub(crate) struct BuiltGroups {
     pub distinct_nums: Vec<Option<Vec<f64>>>,
-    pub map: std::collections::HashMap<Vec<GroupValue>, GroupStats>,
+    pub map: FxHashMap<Vec<GroupValue>, GroupStats>,
 }
 
 impl BuiltGroups {
@@ -582,7 +584,7 @@ impl GroupedRange {
             }
         }
 
-        let mut map: std::collections::HashMap<Vec<GroupValue>, GroupStats> = std::collections::HashMap::new();
+        let mut map: FxHashMap<Vec<GroupValue>, GroupStats> = FxHashMap::default();
         let mut key = Vec::with_capacity(columns.len());
         'row: for row in 0..rows {
             key.clear();
@@ -651,7 +653,11 @@ impl GroupedRange {
 #[derive(Default)]
 pub(super) struct CountIndex {
     numbers: Vec<(f64, usize)>,
-    text: std::collections::HashMap<String, Vec<usize>>,
+    numbers_ready: bool,
+    text: FxHashMap<String, Vec<usize>>,
+    empty_only_count: usize,
+    empty_rows_indexed: bool,
+    text_ready: bool,
 }
 
 #[test]
@@ -671,28 +677,74 @@ fn count_index_agrees_with_single_criterion_scan() {
 }
 
 impl CountIndex {
+    #[allow(dead_code)]
     pub(super) fn new(data: &[FValue]) -> Self {
         let mut index = Self::default();
+        index.ensure_numbers(data);
+        index.ensure_text(data);
+        index
+    }
+
+    fn ensure_numbers(&mut self, data: &[FValue]) {
+        if self.numbers_ready {
+            return;
+        }
         for (row, value) in data.iter().enumerate() {
-            let text = match value {
-                FValue::Number(n) => {
-                    if n.is_finite() { index.numbers.push((*n, row)); }
-                    continue;
-                }
+            match value {
+                FValue::Number(n) if n.is_finite() => self.numbers.push((*n, row)),
                 FValue::Text(s) => {
                     if let Ok(n) = s.trim().parse::<f64>() {
-                        if n.is_finite() { index.numbers.push((n, row)); }
+                        if n.is_finite() {
+                            self.numbers.push((n, row));
+                        }
                     }
-                    if s.is_ascii() { s.to_ascii_lowercase() } else { s.to_string() }
+                }
+                _ => {}
+            }
+        }
+        self.numbers
+            .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        self.numbers_ready = true;
+    }
+
+    fn ensure_text(&mut self, data: &[FValue]) {
+        if self.text_ready && self.empty_rows_indexed {
+            return;
+        }
+        self.text.clear();
+        self.empty_only_count = 0;
+        for (row, value) in data.iter().enumerate() {
+            let text = match value {
+                FValue::Number(_) => continue,
+                FValue::Text(s) => {
+                    if s.is_ascii() {
+                        s.to_ascii_lowercase()
+                    } else {
+                        s.to_string()
+                    }
                 }
                 FValue::Bool(b) => b.to_string(),
                 FValue::Empty => String::new(),
                 _ => continue,
             };
-            index.text.entry(text).or_default().push(row);
+            self.text.entry(text).or_default().push(row);
         }
-        index.numbers.sort_unstable_by(|a,b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        index
+        self.empty_rows_indexed = true;
+        self.text_ready = true;
+    }
+
+    pub(super) fn from_streamed_text(
+        text: FxHashMap<String, Vec<usize>>,
+        empty_only_count: usize,
+    ) -> Self {
+        Self {
+            numbers: Vec::new(),
+            numbers_ready: false,
+            text,
+            empty_only_count,
+            empty_rows_indexed: empty_only_count == 0,
+            text_ready: true,
+        }
     }
 
     fn matching_offsets(&self, crit: &Crit) -> (&[(f64, usize)], &[usize]) {
@@ -707,10 +759,18 @@ impl CountIndex {
 
     pub(super) fn count(&self, crit: &Crit) -> usize {
         let (nums, text) = self.matching_offsets(crit);
-        nums.len() + text.len()
+        let extra_empty = if crit.num.is_none() && crit.text.is_empty() {
+            self.empty_only_count
+        } else {
+            0
+        };
+        nums.len() + text.len() + extra_empty
     }
 
     pub(super) fn rows(&self, crit: &Crit) -> Option<impl Iterator<Item = usize> + '_> {
+        if crit.num.is_none() && crit.text.is_empty() && !self.empty_rows_indexed {
+            return None;
+        }
         let (nums, text) = self.matching_offsets(crit);
         // Values within an epsilon (or signed zeros) can span several sorted keys.
         // Preserve source order for error propagation and floating-point addition.
@@ -723,11 +783,44 @@ impl CountIndex {
 
 #[derive(Default)]
 pub(super) struct CountIndexes {
-    ranges: std::collections::HashMap<super::RangeKey, Option<CountIndex>>,
+    ranges: FxHashMap<super::RangeKey, Option<CountIndex>>,
     indexed_values: usize,
 }
 
 impl CountIndexes {
+    #[inline]
+    pub(super) fn lookup_ready(&self, range: super::RangeKey, crit: &Crit) -> Option<&CountIndex> {
+        if !crit.indexable() {
+            return None;
+        }
+        let ix = self.ranges.get(&range)?.as_ref()?;
+        if crit.num.is_some() {
+            ix.numbers_ready.then_some(ix)
+        } else {
+            ix.text_ready.then_some(ix)
+        }
+    }
+
+    pub(super) fn insert_streamed_text(
+        &mut self,
+        range: super::RangeKey,
+        indexed_entries: usize,
+        text: FxHashMap<String, Vec<usize>>,
+        empty_only_count: usize,
+    ) {
+        const LIMIT: usize = 2_097_152;
+        if indexed_entries > LIMIT {
+            return;
+        }
+        if self.ranges.len() >= 4096 || self.indexed_values + indexed_entries > LIMIT {
+            self.ranges.clear();
+            self.indexed_values = 0;
+        }
+        self.ranges
+            .insert(range, Some(CountIndex::from_streamed_text(text, empty_only_count)));
+        self.indexed_values += indexed_entries;
+    }
+
     pub(super) fn get(&mut self, range: super::RangeKey, data: &[FValue], crit: &Crit) -> Option<&CountIndex> {
         const LIMIT: usize = 2_097_152;
         if !crit.indexable() || !(256..=LIMIT).contains(&data.len()) { return None; }
@@ -744,10 +837,16 @@ impl CountIndexes {
                 self.ranges.clear();
                 self.indexed_values = 0;
             }
-            self.ranges.insert(range, Some(CountIndex::new(data)));
+            self.ranges.insert(range, Some(CountIndex::default()));
             self.indexed_values += data.len();
         }
-        self.ranges.get(&range)?.as_ref()
+        let index = self.ranges.get_mut(&range)?.as_mut()?;
+        if crit.num.is_some() {
+            index.ensure_numbers(data);
+        } else {
+            index.ensure_text(data);
+        }
+        Some(index)
     }
 }
 
@@ -792,10 +891,8 @@ impl Crit {
         }
     }
 
+    #[inline]
     pub(crate) fn matches(&self, v: &FValue) -> bool {
-        if matches!(v, FValue::Empty) && self.num.is_some() {
-            return self.op == "<>";
-        }
         if let Some(t) = self.num {
             let n = match v {
                 FValue::Number(n) => *n,
@@ -826,15 +923,77 @@ impl Crit {
             }
             FValue::Empty => self.text.is_empty(),
             FValue::Bool(b) => (if *b { "true" } else { "false" }) == self.text,
-            FValue::Number(n) => {
-                let t = if n.fract() == 0.0 && n.abs() < 1e15 {
-                    format!("{}", *n as i64)
-                } else {
-                    format!("{n}")
-                };
-                t == self.text
-            }
+            // When `self.num.is_none()`, the criterion text failed `parse::<f64>()`,
+            // so no formatted numeric cell can equal `self.text` (and Excel wildcards
+            // never match numeric cells). Avoid per-cell `format!()` allocations.
+            FValue::Number(_) => false,
             _ => false,
+        };
+        match self.op {
+            "<>" => !eq,
+            ">" => !eq && !self.text.is_empty(),
+            "<" => false,
+            _ => eq,
+        }
+    }
+
+    /// Zero-conversion criterion match directly on a raw `f64` from `ColSlab::Numbers`.
+    #[inline]
+    pub(crate) fn matches_number(&self, n: f64) -> bool {
+        if let Some(t) = self.num {
+            return match self.op {
+                ">=" => n >= t,
+                "<=" => n <= t,
+                ">" => n > t,
+                "<" => n < t,
+                "<>" => (n - t).abs() > f64::EPSILON,
+                _ => (n - t).abs() <= f64::EPSILON,
+            };
+        }
+        match self.op {
+            "<>" => true,
+            ">" => !self.text.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Zero-conversion criterion match directly on a stored `crate::Value` in a Sheet page slab.
+    #[inline]
+    pub(crate) fn matches_value(&self, v: &crate::Value) -> bool {
+        if let Some(t) = self.num {
+            let n = match v {
+                crate::Value::Number(n) => *n,
+                crate::Value::Text(s) if self.op == "=" || self.op == "<>" => {
+                    match s.trim().parse::<f64>() {
+                        Ok(n) => n,
+                        Err(_) => return self.op == "<>",
+                    }
+                }
+                _ => return self.op == "<>",
+            };
+            return match self.op {
+                ">=" => n >= t,
+                "<=" => n <= t,
+                ">" => n > t,
+                "<" => n < t,
+                "<>" => (n - t).abs() > f64::EPSILON,
+                _ => (n - t).abs() <= f64::EPSILON,
+            };
+        }
+        let eq = match v {
+            crate::Value::Text(s) => {
+                if self.wild {
+                    wildcard_match_ci(&self.text, s)
+                } else if self.text.is_ascii() {
+                    s.eq_ignore_ascii_case(&self.text)
+                } else {
+                    s.as_ref() == self.text
+                }
+            }
+            crate::Value::Empty => self.text.is_empty(),
+            crate::Value::Bool(b) => (if *b { "true" } else { "false" }) == self.text,
+            crate::Value::Number(_) => false,
+            crate::Value::Error(_) => false,
         };
         match self.op {
             "<>" => !eq,
@@ -854,6 +1013,13 @@ impl Crit {
                 "<>" => (n - target).abs() > f64::EPSILON,
                 _ => (n - target).abs() <= f64::EPSILON,
             };
+        }
+        if let FValue::Number(n) = v
+            && n.is_finite()
+            && !self.wild
+            && matches!(self.op, "=" | "<>")
+        {
+            return self.op == "<>";
         }
         let display;
         let text = match v {
@@ -1291,15 +1457,29 @@ pub(super) fn call_or_else(name: &str, args: &[Arg], unknown: &mut dyn FnMut() -
     call_or_else_in(EvalCtx::from_ambient(), name, args, unknown)
 }
 
+pub(crate) fn call_id_in(ctx: EvalCtx, id: FuncId, name: &str, args: &[Arg]) -> FValue {
+    call_by_id_in(ctx, id, name, args, &mut || FValue::Error(ErrKind::Name))
+}
+
 pub(super) fn call_or_else_in(
     ctx: EvalCtx,
     name: &str,
     args: &[Arg],
     unknown: &mut dyn FnMut() -> FValue,
 ) -> FValue {
-    match name {
+    call_by_id_in(ctx, FuncId::from_upper(name), name, args, unknown)
+}
+
+pub(super) fn call_by_id_in(
+    ctx: EvalCtx,
+    id: FuncId,
+    name: &str,
+    args: &[Arg],
+    unknown: &mut dyn FnMut() -> FValue,
+) -> FValue {
+    match id {
         // ---------------- 数学 / 三角
-        "SUM" => r(|| {
+        FuncId::Sum => r(|| {
             let mut s = 0.0;
             for a in args {
                 for v in a.slice() {
@@ -1312,7 +1492,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(s))
         }),
-        "PRODUCT" => r(|| {
+        FuncId::Product => r(|| {
             let v = numbers(args, 0)?;
             if v.is_empty() {
                 Ok(FValue::number(0.0))
@@ -1320,35 +1500,35 @@ pub(super) fn call_or_else_in(
                 Ok(FValue::number(v.iter().product()))
             }
         }),
-        "ABS" => r(|| Ok(FValue::number(num(args, 0)?.abs()))),
-        "SIGN" => r(|| Ok(FValue::number(num(args, 0)?.signum()))),
-        "INT" => r(|| Ok(FValue::number(num(args, 0)?.floor()))),
-        "TRUNC" => r(|| {
+        FuncId::Abs => r(|| Ok(FValue::number(num(args, 0)?.abs()))),
+        FuncId::Sign => r(|| Ok(FValue::number(num(args, 0)?.signum()))),
+        FuncId::Int => r(|| Ok(FValue::number(num(args, 0)?.floor()))),
+        FuncId::Trunc => r(|| {
             let n = num(args, 0)?;
             let d = opt_num(args, 1, 0.0)?;
             let f = 10f64.powi(d as i32);
             Ok(FValue::number((n * f).trunc() / f))
         }),
-        "ROUND" => r(|| {
+        FuncId::Round => r(|| {
             let n = num(args, 0)?;
             let d = int_arg(args, 1)?;
             let f = 10f64.powi(d as i32);
             Ok(FValue::number(round_sig15(n * f).round() / f))
         }),
-        "ROUNDUP" => r(|| {
+        FuncId::RoundUp => r(|| {
             let n = num(args, 0)?;
             let d = int_arg(args, 1)?;
             let f = 10f64.powi(d as i32);
             let x = round_sig15(n * f);
             Ok(FValue::number(if x >= 0.0 { x.ceil() } else { x.floor() } / f))
         }),
-        "ROUNDDOWN" => r(|| {
+        FuncId::RoundDown => r(|| {
             let n = num(args, 0)?;
             let d = int_arg(args, 1)?;
             let f = 10f64.powi(d as i32);
             Ok(FValue::number((n * f).trunc() / f))
         }),
-        "MOD" => r(|| {
+        FuncId::Mod => r(|| {
             let a = num(args, 0)?;
             let b = num(args, 1)?;
             if b == 0.0 {
@@ -1356,7 +1536,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(a - b * (a / b).floor()))
         }),
-        "QUOTIENT" => r(|| {
+        FuncId::Quotient => r(|| {
             let a = num(args, 0)?;
             let b = num(args, 1)?;
             if b == 0.0 {
@@ -1364,37 +1544,37 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number((a / b).trunc()))
         }),
-        "POWER" => r(|| Ok(FValue::number(num(args, 0)?.powf(num(args, 1)?)))),
-        "SQRT" => r(|| {
+        FuncId::Power => r(|| Ok(FValue::number(num(args, 0)?.powf(num(args, 1)?)))),
+        FuncId::Sqrt => r(|| {
             let n = num(args, 0)?;
             if n < 0.0 {
                 return Err(ErrKind::Num);
             }
             Ok(FValue::number(n.sqrt()))
         }),
-        "SQRTPI" => r(|| {
+        FuncId::SqrtPi => r(|| {
             let n = num(args, 0)?;
             if n < 0.0 {
                 return Err(ErrKind::Num);
             }
             Ok(FValue::number((n * std::f64::consts::PI).sqrt()))
         }),
-        "EXP" => r(|| Ok(FValue::number(num(args, 0)?.exp()))),
-        "LN" => r(|| {
+        FuncId::Exp => r(|| Ok(FValue::number(num(args, 0)?.exp()))),
+        FuncId::Ln => r(|| {
             let n = num(args, 0)?;
             if n <= 0.0 {
                 return Err(ErrKind::Num);
             }
             Ok(FValue::number(n.ln()))
         }),
-        "LOG10" => r(|| {
+        FuncId::Log10 => r(|| {
             let n = num(args, 0)?;
             if n <= 0.0 {
                 return Err(ErrKind::Num);
             }
             Ok(FValue::number(n.log10()))
         }),
-        "LOG" => r(|| {
+        FuncId::Log => r(|| {
             let n = num(args, 0)?;
             let b = opt_num(args, 1, 10.0)?;
             if n <= 0.0 || b <= 0.0 || b == 1.0 {
@@ -1402,20 +1582,20 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(n.log(b)))
         }),
-        "PI" => FValue::number(std::f64::consts::PI),
-        "SIN" => r(|| Ok(FValue::number(num(args, 0)?.sin()))),
-        "COS" => r(|| Ok(FValue::number(num(args, 0)?.cos()))),
-        "TAN" => r(|| Ok(FValue::number(num(args, 0)?.tan()))),
-        "ASIN" => r(|| Ok(FValue::number(num(args, 0)?.asin()))),
-        "ACOS" => r(|| Ok(FValue::number(num(args, 0)?.acos()))),
-        "ATAN" => r(|| Ok(FValue::number(num(args, 0)?.atan()))),
-        "ATAN2" => r(|| Ok(FValue::number(num(args, 0)?.atan2(num(args, 1)?)))),
-        "SINH" => r(|| Ok(FValue::number(num(args, 0)?.sinh()))),
-        "COSH" => r(|| Ok(FValue::number(num(args, 0)?.cosh()))),
-        "TANH" => r(|| Ok(FValue::number(num(args, 0)?.tanh()))),
-        "DEGREES" => r(|| Ok(FValue::number(num(args, 0)?.to_degrees()))),
-        "RADIANS" => r(|| Ok(FValue::number(num(args, 0)?.to_radians()))),
-        "FACT" => r(|| {
+        FuncId::Pi => FValue::number(std::f64::consts::PI),
+        FuncId::Sin => r(|| Ok(FValue::number(num(args, 0)?.sin()))),
+        FuncId::Cos => r(|| Ok(FValue::number(num(args, 0)?.cos()))),
+        FuncId::Tan => r(|| Ok(FValue::number(num(args, 0)?.tan()))),
+        FuncId::Asin => r(|| Ok(FValue::number(num(args, 0)?.asin()))),
+        FuncId::Acos => r(|| Ok(FValue::number(num(args, 0)?.acos()))),
+        FuncId::Atan => r(|| Ok(FValue::number(num(args, 0)?.atan()))),
+        FuncId::Atan2 => r(|| Ok(FValue::number(num(args, 0)?.atan2(num(args, 1)?)))),
+        FuncId::Sinh => r(|| Ok(FValue::number(num(args, 0)?.sinh()))),
+        FuncId::Cosh => r(|| Ok(FValue::number(num(args, 0)?.cosh()))),
+        FuncId::Tanh => r(|| Ok(FValue::number(num(args, 0)?.tanh()))),
+        FuncId::Degrees => r(|| Ok(FValue::number(num(args, 0)?.to_degrees()))),
+        FuncId::Radians => r(|| Ok(FValue::number(num(args, 0)?.to_radians()))),
+        FuncId::Fact => r(|| {
             let n = int_arg(args, 0)?;
             if n < 0 {
                 return Err(ErrKind::Num);
@@ -1426,7 +1606,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(v))
         }),
-        "GCD" => r(|| {
+        FuncId::Gcd => r(|| {
             let v = numbers(args, 0)?;
             let mut g = 0i64;
             for x in v {
@@ -1434,7 +1614,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(g as f64))
         }),
-        "LCM" => r(|| {
+        FuncId::Lcm => r(|| {
             let v = numbers(args, 0)?;
             let mut l = 1i64;
             for x in v {
@@ -1446,7 +1626,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(l as f64))
         }),
-        "COMBIN" => r(|| {
+        FuncId::Combin => r(|| {
             let n = int_arg(args, 0)?;
             let k = int_arg(args, 1)?;
             if n < 0 || k < 0 || k > n {
@@ -1458,7 +1638,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(v))
         }),
-        "CEILING" | "CEILING.MATH" => r(|| {
+        FuncId::Ceiling | FuncId::CeilingMath => r(|| {
             let n = num(args, 0)?;
             let s = opt_num(args, 1, 1.0)?;
             if s == 0.0 {
@@ -1466,7 +1646,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number((n / s).ceil() * s))
         }),
-        "FLOOR" | "FLOOR.MATH" => r(|| {
+        FuncId::Floor | FuncId::FloorMath => r(|| {
             let n = num(args, 0)?;
             let s = opt_num(args, 1, 1.0)?;
             if s == 0.0 {
@@ -1474,7 +1654,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number((n / s).floor() * s))
         }),
-        "MROUND" => r(|| {
+        FuncId::MRound => r(|| {
             let n = num(args, 0)?;
             let s = num(args, 1)?;
             if s == 0.0 {
@@ -1482,12 +1662,12 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number((n / s).round() * s))
         }),
-        "EVEN" => r(|| {
+        FuncId::Even => r(|| {
             let n = num(args, 0)?;
             let v = (n / 2.0).ceil().abs() * 2.0;
             Ok(FValue::number(if n < 0.0 { -v } else { v }))
         }),
-        "ODD" => r(|| {
+        FuncId::Odd => r(|| {
             let n = num(args, 0)?;
             let mut v = (n.abs() / 2.0).ceil() * 2.0 - 1.0;
             if v == 0.0 {
@@ -1495,8 +1675,8 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(if n < 0.0 { -v } else { v }))
         }),
-        "RAND" => FValue::number(rand_f64()),
-        "RANDBETWEEN" => r(|| {
+        FuncId::Rand => FValue::number(rand_f64()),
+        FuncId::RandBetween => r(|| {
             let a = int_arg(args, 0)?;
             let b = int_arg(args, 1)?;
             if a > b {
@@ -1505,8 +1685,8 @@ pub(super) fn call_or_else_in(
             let span = (b - a + 1) as f64;
             Ok(FValue::number((a as f64 + (rand_f64() * span).floor()).min(b as f64)))
         }),
-        "SUMSQ" => r(|| Ok(FValue::number(numbers(args, 0)?.iter().map(|x| x * x).sum()))),
-        "SUMPRODUCT" => r(|| {
+        FuncId::SumSq => r(|| Ok(FValue::number(numbers(args, 0)?.iter().map(|x| x * x).sum()))),
+        FuncId::SumProduct => r(|| {
             // 各参数必须同形（标量 1×1 可参与），只比元素个数会把 2×2 与 1×4 当成一样
             let grids: Vec<_> = args
                 .iter()
@@ -1559,7 +1739,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(sum))
         }),
-        "SUMIF" => r(|| {
+        FuncId::SumIf => r(|| {
             let crit = Crit::parse(&text(args, 1)?);
             for reference in [args.first(), args.get(2)].into_iter().flatten() {
                 if let Arg::Val(FValue::Error(error)) = reference {
@@ -1582,7 +1762,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(s))
         }),
-        "SUMIFS" => r(|| {
+        FuncId::SumIfs => r(|| {
             let sum_range = args.first().map(|a| a.slice()).unwrap_or(&[]);
             let mut s = 0.0;
             let pairs = criteria_pairs(args.get(1..).unwrap_or_default());
@@ -1595,7 +1775,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(s))
         }),
-        "SUBTOTAL" => r(|| {
+        FuncId::Subtotal => r(|| {
             let f = int_arg(args, 0)?;
             let base = f % 100;
             let sub = &args[1.min(args.len())..];
@@ -1616,7 +1796,7 @@ pub(super) fn call_or_else_in(
         }),
 
         // ---------------- 统计
-        "AVERAGE" => r(|| {
+        FuncId::Average => r(|| {
             let mut s = 0.0;
             let mut n = 0usize;
             for a in args {
@@ -1636,7 +1816,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(s / n as f64))
         }),
-        "AVERAGEA" => r(|| {
+        FuncId::AverageA => r(|| {
             let vals = flatten_values(args, 0);
             if vals.is_empty() {
                 return Err(ErrKind::Div0);
@@ -1651,7 +1831,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(s / vals.len() as f64))
         }),
-        "COUNT" => r(|| {
+        FuncId::Count => r(|| {
             let mut n = 0usize;
             for a in args {
                 // 直接写在参数里的 TRUE/FALSE 要计数；引用区域里的逻辑值不计数
@@ -1668,7 +1848,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(n as f64))
         }),
-        "COUNTA" => r(|| {
+        FuncId::CountA => r(|| {
             let n = args
                 .iter()
                 .flat_map(|a| a.slice())
@@ -1676,7 +1856,7 @@ pub(super) fn call_or_else_in(
                 .count();
             Ok(FValue::number(n as f64))
         }),
-        "COUNTBLANK" => r(|| {
+        FuncId::CountBlank => r(|| {
             let n = args
                 .iter()
                 .flat_map(|a| a.slice())
@@ -1688,7 +1868,7 @@ pub(super) fn call_or_else_in(
                 .count();
             Ok(FValue::number(n as f64))
         }),
-        "COUNTIF" => r(|| {
+        FuncId::CountIf => r(|| {
             let crit = Crit::parse(&text(args, 1)?);
             let mut n = 0usize;
             if let Some(a) = args.first() {
@@ -1700,7 +1880,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(n as f64))
         }),
-        "COUNTIFS" => r(|| {
+        FuncId::CountIfs => r(|| {
             let mut count = 0usize;
             let pairs = criteria_pairs(args);
             let len = pairs.iter().map(|(r, _)| r.len()).min().unwrap_or(0);
@@ -1711,7 +1891,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(count as f64))
         }),
-        "AVERAGEIF" => r(|| {
+        FuncId::AverageIf => r(|| {
             let crit = Crit::parse(&text(args, 1)?);
             let target = args.first().map(|a| a.slice()).unwrap_or(&[]);
             let vals = args.get(2).map(|a| a.slice()).unwrap_or(target);
@@ -1730,7 +1910,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(s / n))
         }),
-        "MAX" => r(|| {
+        FuncId::Max => r(|| {
             let mut m = f64::NEG_INFINITY;
             let mut any = false;
             for a in args {
@@ -1749,7 +1929,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(if any { m } else { 0.0 }))
         }),
-        "MIN" => r(|| {
+        FuncId::Min => r(|| {
             let mut m = f64::INFINITY;
             let mut any = false;
             for a in args {
@@ -1768,7 +1948,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(if any { m } else { 0.0 }))
         }),
-        "MAXA" | "MINA" => r(|| {
+        FuncId::MaxA | FuncId::MinA => r(|| {
             let vals = flatten_values(args, 0);
             let mut best = if name == "MAXA" { f64::NEG_INFINITY } else { f64::INFINITY };
             for v in vals {
@@ -1781,7 +1961,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(if best.is_infinite() { 0.0 } else { best }))
         }),
-        "MEDIAN" => r(|| {
+        FuncId::Median => r(|| {
             let mut v = numbers(args, 0)?;
             if v.is_empty() {
                 return Err(ErrKind::Num);
@@ -1794,7 +1974,7 @@ pub(super) fn call_or_else_in(
                 (v[n / 2 - 1] + v[n / 2]) / 2.0
             }))
         }),
-        "MODE" => r(|| {
+        FuncId::Mode => r(|| {
             let v = numbers(args, 0)?;
             let mut best = (f64::NAN, 0usize);
             for &x in &v {
@@ -1808,7 +1988,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(best.0))
         }),
-        "LARGE" | "SMALL" => r(|| {
+        FuncId::Large | FuncId::Small => r(|| {
             let mut v = first_numbers(args)?;
             let k = int_arg(args, 1)?;
             if k < 1 || k as usize > v.len() {
@@ -1819,7 +1999,7 @@ pub(super) fn call_or_else_in(
             let idx = if name == "LARGE" { n - k as usize } else { k as usize - 1 };
             Ok(FValue::number(v[idx]))
         }),
-        "RANK" | "RANK.EQ" => r(|| {
+        FuncId::Rank | FuncId::RankEq => r(|| {
             let x = num(args, 0)?;
             let v = args.get(1).map(|a| a.numbers()).transpose()?.unwrap_or_default();
             let asc = opt_num(args, 2, 0.0)? != 0.0;
@@ -1830,18 +2010,18 @@ pub(super) fn call_or_else_in(
                 None => Err(ErrKind::Na),
             }
         }),
-        "STDEV" | "STDEV.S" | "STDEVP" | "STDEV.P" => r(|| {
+        FuncId::Stdev | FuncId::StdevS | FuncId::StdevP | FuncId::StdevDotP => r(|| {
             let v = numbers(args, 0)?;
             let sample = name != "STDEVP" && name != "STDEV.P";
             Ok(FValue::number(std_dev(&v, sample)?))
         }),
-        "VAR" | "VAR.S" | "VARP" | "VAR.P" => r(|| {
+        FuncId::Var | FuncId::VarS | FuncId::VarP | FuncId::VarDotP => r(|| {
             let v = numbers(args, 0)?;
             let sample = name != "VARP" && name != "VAR.P";
             let sd = std_dev(&v, sample)?;
             Ok(FValue::number(sd * sd))
         }),
-        "AVEDEV" => r(|| {
+        FuncId::AveDev => r(|| {
             let v = numbers(args, 0)?;
             if v.is_empty() {
                 return Err(ErrKind::Num);
@@ -1849,26 +2029,26 @@ pub(super) fn call_or_else_in(
             let m = v.iter().sum::<f64>() / v.len() as f64;
             Ok(FValue::number(v.iter().map(|x| (x - m).abs()).sum::<f64>() / v.len() as f64))
         }),
-        "DEVSQ" => r(|| {
+        FuncId::DevSq => r(|| {
             let v = numbers(args, 0)?;
             let m = v.iter().sum::<f64>() / v.len() as f64;
             Ok(FValue::number(v.iter().map(|x| (x - m).powi(2)).sum::<f64>()))
         }),
-        "GEOMEAN" => r(|| {
+        FuncId::GeoMean => r(|| {
             let v = numbers(args, 0)?;
             if v.is_empty() || v.iter().any(|x| *x <= 0.0) {
                 return Err(ErrKind::Num);
             }
             Ok(FValue::number((v.iter().map(|x| x.ln()).sum::<f64>() / v.len() as f64).exp()))
         }),
-        "HARMEAN" => r(|| {
+        FuncId::HarMean => r(|| {
             let v = numbers(args, 0)?;
             if v.is_empty() || v.iter().any(|x| *x == 0.0) {
                 return Err(ErrKind::Num);
             }
             Ok(FValue::number(v.len() as f64 / v.iter().map(|x| 1.0 / x).sum::<f64>()))
         }),
-        "PERCENTILE" | "PERCENTILE.INC" => r(|| {
+        FuncId::Percentile | FuncId::PercentileInc => r(|| {
             let mut v = first_numbers(args)?;
             let p = num(args, 1)?;
             if v.is_empty() || !(0.0..=1.0).contains(&p) {
@@ -1877,7 +2057,7 @@ pub(super) fn call_or_else_in(
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
             Ok(FValue::number(percentile(&v, p)))
         }),
-        "QUARTILE" | "QUARTILE.INC" => r(|| {
+        FuncId::Quartile | FuncId::QuartileInc => r(|| {
             let mut v = first_numbers(args)?;
             let q = int_arg(args, 1)?;
             if !(0..=4).contains(&q) {
@@ -1886,7 +2066,7 @@ pub(super) fn call_or_else_in(
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
             Ok(FValue::number(percentile(&v, q as f64 / 4.0)))
         }),
-        "CORREL" => r(|| {
+        FuncId::Correl => r(|| {
             let a = args.first().map(|x| x.numbers()).transpose()?.unwrap_or_default();
             let b = args.get(1).map(|x| x.numbers()).transpose()?.unwrap_or_default();
             let n = a.len().min(b.len());
@@ -1910,7 +2090,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(num / (da.sqrt() * db.sqrt())))
         }),
-        "SLOPE" => r(|| {
+        FuncId::Slope => r(|| {
             let y = args.first().map(|x| x.numbers()).transpose()?.unwrap_or_default();
             let x = args.get(1).map(|x| x.numbers()).transpose()?.unwrap_or_default();
             let n = x.len().min(y.len());
@@ -1930,7 +2110,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(a / b))
         }),
-        "INTERCEPT" => r(|| {
+        FuncId::Intercept => r(|| {
             let y = args.first().map(|x| x.numbers()).transpose()?.unwrap_or_default();
             let x = args.get(1).map(|x| x.numbers()).transpose()?.unwrap_or_default();
             let n = x.len().min(y.len());
@@ -1953,28 +2133,28 @@ pub(super) fn call_or_else_in(
         }),
 
         // ---------------- 文本
-        "LEN" => r(|| Ok(FValue::number(text(args, 0)?.chars().count() as f64))),
-        "LEFT" => r(|| {
+        FuncId::Len => r(|| Ok(FValue::number(text(args, 0)?.chars().count() as f64))),
+        FuncId::Left => r(|| {
             let s = text(args, 0)?;
             let n = opt_num(args, 1, 1.0)?.max(0.0) as usize;
             Ok(FValue::Text(s.chars().take(n).collect::<String>().into()))
         }),
-        "RIGHT" => r(|| {
+        FuncId::Right => r(|| {
             let s = text(args, 0)?;
             let n = opt_num(args, 1, 1.0)?.max(0.0) as usize;
             let len = s.chars().count();
             let skip = len.saturating_sub(n);
             Ok(FValue::Text(s.chars().skip(skip).collect::<String>().into()))
         }),
-        "MID" => r(|| {
+        FuncId::Mid => r(|| {
             let s = text(args, 0)?;
             let start = num(args, 1)?.max(1.0) as usize;
             let n = num(args, 2)?.max(0.0) as usize;
             Ok(FValue::Text(s.chars().skip(start - 1).take(n).collect::<String>().into()))
         }),
-        "LOWER" => r(|| Ok(FValue::Text(text(args, 0)?.to_lowercase().into()))),
-        "UPPER" => r(|| Ok(FValue::Text(text(args, 0)?.to_uppercase().into()))),
-        "PROPER" => r(|| {
+        FuncId::Lower => r(|| Ok(FValue::Text(text(args, 0)?.to_lowercase().into()))),
+        FuncId::Upper => r(|| Ok(FValue::Text(text(args, 0)?.to_uppercase().into()))),
+        FuncId::Proper => r(|| {
             let s = text(args, 0)?;
             let mut out = String::new();
             let mut cap = true;
@@ -1993,12 +2173,12 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::Text(out.into()))
         }),
-        "TRIM" => r(|| {
+        FuncId::Trim => r(|| {
             let s = text(args, 0)?;
             let parts: Vec<&str> = s.split_whitespace().collect();
             Ok(FValue::Text(parts.join(" ").into()))
         }),
-        "CONCAT" | "CONCATENATE" => r(|| {
+        FuncId::Concat | FuncId::Concatenate => r(|| {
             let mut out = String::new();
             for a in args {
                 for v in a.slice() {
@@ -2007,7 +2187,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::Text(out.into()))
         }),
-        "TEXTJOIN" => r(|| {
+        FuncId::TextJoin => r(|| {
             let sep = text(args, 0)?;
             let ignore_empty = arg(args, 1).to_bool()?;
             let mut parts = Vec::new();
@@ -2022,7 +2202,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::Text(parts.join(&sep).into()))
         }),
-        "REPT" => r(|| {
+        FuncId::Rept => r(|| {
             let s = text(args, 0)?;
             let n = num(args, 1)?.max(0.0) as usize;
             if s.len() * n > 32_767 {
@@ -2030,7 +2210,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::Text(s.repeat(n).into()))
         }),
-        "SUBSTITUTE" => r(|| {
+        FuncId::Substitute => r(|| {
             let s = text(args, 0)?;
             let old = text(args, 1)?;
             let new = text(args, 2)?;
@@ -2061,7 +2241,7 @@ pub(super) fn call_or_else_in(
                 }
             }
         }),
-        "REPLACE" => r(|| {
+        FuncId::Replace => r(|| {
             let s = text(args, 0)?;
             let start = num(args, 1)?.max(1.0) as usize;
             let count = num(args, 2)?.max(0.0) as usize;
@@ -2072,7 +2252,7 @@ pub(super) fn call_or_else_in(
             out.extend(chars.iter().skip((start - 1 + count).min(chars.len())));
             Ok(FValue::Text(out.into()))
         }),
-        "FIND" | "SEARCH" => r(|| {
+        FuncId::Find | FuncId::Search => r(|| {
             let needle = text(args, 0)?;
             let hay = text(args, 1)?;
             let start = opt_num(args, 2, 1.0)?.max(1.0) as usize;
@@ -2093,20 +2273,20 @@ pub(super) fn call_or_else_in(
                 None => Err(ErrKind::Value),
             }
         }),
-        "EXACT" => r(|| Ok(FValue::Bool(text(args, 0)? == text(args, 1)?))),
-        "CHAR" => r(|| {
+        FuncId::Exact => r(|| Ok(FValue::Bool(text(args, 0)? == text(args, 1)?))),
+        FuncId::Char => r(|| {
             let n = int_arg(args, 0)?;
             if !(1..=255).contains(&n) {
                 return Err(ErrKind::Value);
             }
             Ok(FValue::Text(((n as u8) as char).to_string().into()))
         }),
-        "CODE" => r(|| {
+        FuncId::Code => r(|| {
             let s = text(args, 0)?;
             let c = s.chars().next().ok_or(ErrKind::Value)?;
             Ok(FValue::number(c as u32 as f64))
         }),
-        "VALUE" => r(|| {
+        FuncId::Value => r(|| {
             let s = text(args, 0)?;
             let t = s.replace(',', "").replace('¥', "").replace('$', "");
             let t = t.trim();
@@ -2120,21 +2300,21 @@ pub(super) fn call_or_else_in(
             }
             Err(ErrKind::Value)
         }),
-        "TEXT" => r(|| {
+        FuncId::Text => r(|| {
             let v = arg(args, 0);
             let fmt = text(args, 1)?;
             Ok(FValue::Text(format_value_in(ctx.date_system, &v, &fmt).into()))
         }),
-        "T" => r(|| match arg(args, 0) {
+        FuncId::T => r(|| match arg(args, 0) {
             FValue::Text(s) => Ok(FValue::Text(s)),
             _ => Ok(FValue::Text("".into())),
         }),
 
         // ---------------- 逻辑
-        "TRUE" => FValue::Bool(true),
-        "FALSE" => FValue::Bool(false),
-        "NOT" => r(|| Ok(FValue::Bool(!arg(args, 0).to_bool()?))),
-        "AND" => r(|| {
+        FuncId::True => FValue::Bool(true),
+        FuncId::False => FValue::Bool(false),
+        FuncId::Not => r(|| Ok(FValue::Bool(!arg(args, 0).to_bool()?))),
+        FuncId::And => r(|| {
             let mut any = false;
             for a in args {
                 for v in a.slice() {
@@ -2152,7 +2332,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::Bool(true))
         }),
-        "OR" => r(|| {
+        FuncId::Or => r(|| {
             let mut any = false;
             for a in args {
                 for v in a.slice() {
@@ -2170,7 +2350,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::Bool(false))
         }),
-        "XOR" => r(|| {
+        FuncId::Xor => r(|| {
             let mut t = false;
             for a in args {
                 for v in a.slice() {
@@ -2182,7 +2362,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::Bool(t))
         }),
-        "IF" => {
+        FuncId::If => {
             let cond = arg(args, 0);
             // IF 需要短路：只求对应分支的值
             match cond.to_bool() {
@@ -2197,7 +2377,7 @@ pub(super) fn call_or_else_in(
                 Err(e) => FValue::Error(e),
             }
         }
-        "IFERROR" => {
+        FuncId::IfError => {
             let v = arg(args, 0);
             if v.is_error() {
                 arg(args, 1)
@@ -2205,7 +2385,7 @@ pub(super) fn call_or_else_in(
                 v
             }
         }
-        "IFNA" => {
+        FuncId::IfNa => {
             let v = arg(args, 0);
             if matches!(v, FValue::Error(ErrKind::Na)) {
                 arg(args, 1)
@@ -2213,7 +2393,7 @@ pub(super) fn call_or_else_in(
                 v
             }
         }
-        "IFS" => {
+        FuncId::Ifs => {
             for pair in args.chunks(2) {
                 if pair.len() < 2 {
                     break;
@@ -2226,7 +2406,7 @@ pub(super) fn call_or_else_in(
             }
             FValue::Error(ErrKind::Na)
         }
-        "SWITCH" => {
+        FuncId::Switch => {
             let target = arg(args, 0);
             let mut i = 1;
             while i + 1 < args.len() {
@@ -2243,31 +2423,31 @@ pub(super) fn call_or_else_in(
         }
 
         // ---------------- 查找
-        "ROW" => r(|| {
+        FuncId::Row => r(|| {
             if args.is_empty() {
                 return Err(ErrKind::Value);
             }
             Ok(FValue::number(1.0))
         }),
-        "COLUMN" => r(|| {
+        FuncId::Column => r(|| {
             if args.is_empty() {
                 return Err(ErrKind::Value);
             }
             Ok(FValue::number(1.0))
         }),
-        "ROWS" => {
+        FuncId::Rows => {
             let (rows, _) = range_dims(args.first().unwrap_or(&Arg::Val(FValue::Empty)));
             FValue::number(rows as f64)
         }
-        "COLUMNS" => {
+        FuncId::Columns => {
             let (_, cols) = range_dims(args.first().unwrap_or(&Arg::Val(FValue::Empty)));
             FValue::number(cols as f64)
         }
-        "CHOOSE" => r(|| {
+        FuncId::Choose => r(|| {
             let i = index_arg(args, 0)?;
             Ok(arg(args, i + 1))
         }),
-        "VLOOKUP" | "HLOOKUP" => r(|| {
+        FuncId::VLookup | FuncId::HLookup => r(|| {
             let needle = arg(args, 0);
             if let FValue::Error(e) = needle {
                 return Err(e);
@@ -2299,7 +2479,7 @@ pub(super) fn call_or_else_in(
                 None => Err(ErrKind::Na),
             }
         }),
-        "MATCH" | "XMATCH" => r(|| {
+        FuncId::Match | FuncId::XMatch => r(|| {
             let needle = arg(args, 0);
             if let FValue::Error(e) = needle {
                 return Err(e);
@@ -2330,7 +2510,7 @@ pub(super) fn call_or_else_in(
             let hit = xlookup_search(vals, vals.len(), 1, None, &needle, match_type.trunc() as i64, search_mode)?;
             hit.map(|i| FValue::number((i + 1) as f64)).ok_or(ErrKind::Na)
         }),
-        "XLOOKUP" => r(|| {
+        FuncId::XLookup => r(|| {
             let needle = arg(args, 0);
             if let FValue::Error(e) = needle {
                 return Err(e);
@@ -2366,7 +2546,7 @@ pub(super) fn call_or_else_in(
             }
             Err(ErrKind::Na)
         }),
-        "INDEX" => r(|| {
+        FuncId::Index => r(|| {
             let area = args.first().ok_or(ErrKind::Value)?;
             let row_raw = num(args, 1)?;
             if row_raw < 0.0 {
@@ -2423,7 +2603,7 @@ pub(super) fn call_or_else_in(
             let target_c = if has_col { col - 1 } else { 0 };
             Ok(range_get(area, row - 1, target_c))
         }),
-        "LOOKUP" => r(|| {
+        FuncId::Lookup => r(|| {
             let needle = arg(args, 0);
             let lookup_vals = args.get(1).ok_or(ErrKind::Value)?.slice();
             let result_vals = args
@@ -2445,9 +2625,9 @@ pub(super) fn call_or_else_in(
         }),
 
         // ---------------- 日期时间
-        "TODAY" => FValue::number(ctx.now_serial().floor()),
-        "NOW" => FValue::number(ctx.now_serial()),
-        "DATE" => r(|| {
+        FuncId::Today => FValue::number(ctx.now_serial().floor()),
+        FuncId::Now => FValue::number(ctx.now_serial()),
+        FuncId::Date => r(|| {
             let y = int_arg(args, 0)? as i32;
             let m = int_arg(args, 1)? as i32;
             let d = int_arg(args, 2)?;
@@ -2457,7 +2637,7 @@ pub(super) fn call_or_else_in(
             let base = date_to_serial_in(ctx.date_system, y2, m2, 1).ok_or(ErrKind::Num)?;
             Ok(FValue::number(base + d as f64 - 1.0))
         }),
-        "TIME" => r(|| {
+        FuncId::Time => r(|| {
             let h = num(args, 0)?;
             let m = num(args, 1)?;
             let s = num(args, 2)?;
@@ -2465,31 +2645,31 @@ pub(super) fn call_or_else_in(
                 (h * 3600.0 + m * 60.0 + s) / 86_400.0,
             ))
         }),
-        "YEAR" => r(|| {
+        FuncId::Year => r(|| {
             let (y, _, _) = serial_to_date_in(ctx.date_system, num(args, 0)?).ok_or(ErrKind::Num)?;
             Ok(FValue::number(y as f64))
         }),
-        "MONTH" => r(|| {
+        FuncId::Month => r(|| {
             let (_, m, _) = serial_to_date_in(ctx.date_system, num(args, 0)?).ok_or(ErrKind::Num)?;
             Ok(FValue::number(m as f64))
         }),
-        "DAY" => r(|| {
+        FuncId::Day => r(|| {
             let (_, _, d) = serial_to_date_in(ctx.date_system, num(args, 0)?).ok_or(ErrKind::Num)?;
             Ok(FValue::number(d as f64))
         }),
-        "HOUR" => r(|| {
+        FuncId::Hour => r(|| {
             let s = num(args, 0)?.rem_euclid(1.0);
             Ok(FValue::number((s * 24.0).floor()))
         }),
-        "MINUTE" => r(|| {
+        FuncId::Minute => r(|| {
             let s = num(args, 0)?.rem_euclid(1.0);
             Ok(FValue::number(((s * 24.0 * 60.0) % 60.0).floor()))
         }),
-        "SECOND" => r(|| {
+        FuncId::Second => r(|| {
             let s = num(args, 0)?.rem_euclid(1.0);
             Ok(FValue::number(((s * 86_400.0) % 60.0).floor()))
         }),
-        "WEEKDAY" => r(|| {
+        FuncId::Weekday => r(|| {
             let serial = num(args, 0)?;
             let t = opt_num(args, 1, 1.0)? as i64;
             let days = (serial.floor() as i64 + 6) % 7; // 0=Sunday
@@ -2501,7 +2681,7 @@ pub(super) fn call_or_else_in(
             };
             Ok(FValue::number(v as f64))
         }),
-        "EDATE" => r(|| {
+        FuncId::EDate => r(|| {
             let serial = num(args, 0)?;
             let months = int_arg(args, 1)?;
             let (y, m, d) = serial_to_date_in(ctx.date_system, serial).ok_or(ErrKind::Num)?;
@@ -2510,7 +2690,7 @@ pub(super) fn call_or_else_in(
             let d2 = d.min(days_in_month(y2, m2));
             Ok(FValue::number(date_to_serial_in(ctx.date_system, y2, m2, d2).ok_or(ErrKind::Num)?))
         }),
-        "EOMONTH" => r(|| {
+        FuncId::EOMonth => r(|| {
             let serial = num(args, 0)?;
             let months = int_arg(args, 1)?;
             let (y, m, _) = serial_to_date_in(ctx.date_system, serial).ok_or(ErrKind::Num)?;
@@ -2520,8 +2700,8 @@ pub(super) fn call_or_else_in(
                 date_to_serial_in(ctx.date_system, y2, m2, days_in_month(y2, m2)).ok_or(ErrKind::Num)?,
             ))
         }),
-        "DAYS" => r(|| Ok(FValue::number(num(args, 0)?.floor() - num(args, 1)?.floor()))),
-        "DATEDIF" => r(|| {
+        FuncId::Days => r(|| Ok(FValue::number(num(args, 0)?.floor() - num(args, 1)?.floor()))),
+        FuncId::DateDif => r(|| {
             let a = num(args, 0)?.floor();
             let b = num(args, 1)?.floor();
             let unit = text(args, 2)?.to_ascii_uppercase();
@@ -2546,14 +2726,14 @@ pub(super) fn call_or_else_in(
             };
             Ok(FValue::number(v))
         }),
-        "WEEKNUM" => r(|| {
+        FuncId::WeekNum => r(|| {
             let serial = num(args, 0)?.floor();
             let (y, _, _) = serial_to_date_in(ctx.date_system, serial).ok_or(ErrKind::Num)?;
             let jan1 = date_to_serial_in(ctx.date_system, y, 1, 1).ok_or(ErrKind::Num)?;
             let offset = ((jan1 as i64 + 6) % 7) as f64; // 周日为一周开始
             Ok(FValue::number(((serial - jan1 + offset) / 7.0).floor() + 1.0))
         }),
-        "NETWORKDAYS" => r(|| {
+        FuncId::NetworkDays => r(|| {
             let a = num(args, 0)?.floor() as i64;
             let b = num(args, 1)?.floor() as i64;
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
@@ -2567,7 +2747,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(n as f64))
         }),
-        "WORKDAY" => r(|| {
+        FuncId::Workday => r(|| {
             let start = num(args, 0)?.floor() as i64;
             let days = int_arg(args, 1)?;
             let mut d = start;
@@ -2582,7 +2762,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(d as f64))
         }),
-        "YEARFRAC" => r(|| {
+        FuncId::YearFrac => r(|| {
             let start = num(args, 0)?.floor();
             let end = num(args, 1)?.floor();
             let basis = opt_num(args, 2, 0.0)?.trunc() as i32;
@@ -2590,7 +2770,7 @@ pub(super) fn call_or_else_in(
         }),
 
         // ---------------- 财务
-        "PMT" => r(|| {
+        FuncId::Pmt => r(|| {
             let rate = num(args, 0)?;
             let nper = num(args, 1)?;
             let pv = num(args, 2)?;
@@ -2598,7 +2778,7 @@ pub(super) fn call_or_else_in(
             let t = opt_num(args, 4, 0.0)?;
             Ok(FValue::number(pmt(rate, nper, pv, fv, t)))
         }),
-        "FV" => r(|| {
+        FuncId::Fv => r(|| {
             let rate = num(args, 0)?;
             let nper = num(args, 1)?;
             let pmt_v = num(args, 2)?;
@@ -2606,7 +2786,7 @@ pub(super) fn call_or_else_in(
             let t = opt_num(args, 4, 0.0)?;
             Ok(FValue::number(fv(rate, nper, pmt_v, pv, t)))
         }),
-        "PV" => r(|| {
+        FuncId::Pv => r(|| {
             let rate = num(args, 0)?;
             let nper = num(args, 1)?;
             let pmt_v = num(args, 2)?;
@@ -2614,7 +2794,7 @@ pub(super) fn call_or_else_in(
             let t = opt_num(args, 4, 0.0)?;
             Ok(FValue::number(pv(rate, nper, pmt_v, fv_, t)))
         }),
-        "NPER" => r(|| {
+        FuncId::Nper => r(|| {
             let rate = num(args, 0)?;
             let pmt_v = num(args, 1)?;
             let pv_ = num(args, 2)?;
@@ -2634,7 +2814,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number((num_ / den).ln() / (1.0 + rate).ln()))
         }),
-        "IPMT" => r(|| {
+        FuncId::Ipmt => r(|| {
             let rate = num(args, 0)?;
             let per = num(args, 1)?;
             let nper = num(args, 2)?;
@@ -2647,7 +2827,7 @@ pub(super) fn call_or_else_in(
             let balance = -fv_after(rate, per - 1.0, p, pv_, t);
             Ok(FValue::number(-(balance * rate)))
         }),
-        "PPMT" => r(|| {
+        FuncId::Ppmt => r(|| {
             let rate = num(args, 0)?;
             let per = num(args, 1)?;
             let nper = num(args, 2)?;
@@ -2659,7 +2839,7 @@ pub(super) fn call_or_else_in(
             let interest = -(balance * rate);
             Ok(FValue::number(p - interest))
         }),
-        "NPV" => r(|| {
+        FuncId::Npv => r(|| {
             let rate = num(args, 0)?;
             let flows = numbers(args, 1)?;
             let mut v = 0.0;
@@ -2668,7 +2848,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number(v))
         }),
-        "SLN" => r(|| {
+        FuncId::Sln => r(|| {
             let cost = num(args, 0)?;
             let salvage = num(args, 1)?;
             let life = num(args, 2)?;
@@ -2677,7 +2857,7 @@ pub(super) fn call_or_else_in(
             }
             Ok(FValue::number((cost - salvage) / life))
         }),
-        "SYD" => r(|| {
+        FuncId::Syd => r(|| {
             let cost = num(args, 0)?;
             let salvage = num(args, 1)?;
             let life = num(args, 2)?;
@@ -2686,25 +2866,25 @@ pub(super) fn call_or_else_in(
         }),
 
         // ---------------- 信息
-        "ISBLANK" => FValue::Bool(matches!(arg(args, 0), FValue::Empty)),
-        "ISNUMBER" => FValue::Bool(matches!(arg(args, 0), FValue::Number(_))),
-        "ISTEXT" => FValue::Bool(matches!(arg(args, 0), FValue::Text(_))),
-        "ISNONTEXT" => FValue::Bool(!matches!(arg(args, 0), FValue::Text(_))),
-        "ISLOGICAL" => FValue::Bool(matches!(arg(args, 0), FValue::Bool(_))),
-        "ISEVEN" => FValue::Bool(matches!(arg(args, 0).to_number(), Ok(n) if (n.trunc() as i64) % 2 == 0)),
-        "ISODD" => FValue::Bool(matches!(arg(args, 0).to_number(), Ok(n) if (n.trunc() as i64) % 2 != 0)),
-        "ISERROR" => FValue::Bool(arg(args, 0).is_error()),
-        "ISERR" => FValue::Bool(matches!(arg(args, 0), FValue::Error(e) if e != ErrKind::Na)),
-        "ISNA" => FValue::Bool(matches!(arg(args, 0), FValue::Error(ErrKind::Na))),
-        "ISREF" => FValue::Bool(false),
-        "NA" => FValue::Error(ErrKind::Na),
-        "N" => r(|| match arg(args, 0) {
+        FuncId::IsBlank => FValue::Bool(matches!(arg(args, 0), FValue::Empty)),
+        FuncId::IsNumber => FValue::Bool(matches!(arg(args, 0), FValue::Number(_))),
+        FuncId::IsText => FValue::Bool(matches!(arg(args, 0), FValue::Text(_))),
+        FuncId::IsNonText => FValue::Bool(!matches!(arg(args, 0), FValue::Text(_))),
+        FuncId::IsLogical => FValue::Bool(matches!(arg(args, 0), FValue::Bool(_))),
+        FuncId::IsEven => FValue::Bool(matches!(arg(args, 0).to_number(), Ok(n) if (n.trunc() as i64) % 2 == 0)),
+        FuncId::IsOdd => FValue::Bool(matches!(arg(args, 0).to_number(), Ok(n) if (n.trunc() as i64) % 2 != 0)),
+        FuncId::IsError => FValue::Bool(arg(args, 0).is_error()),
+        FuncId::IsErr => FValue::Bool(matches!(arg(args, 0), FValue::Error(e) if e != ErrKind::Na)),
+        FuncId::IsNa => FValue::Bool(matches!(arg(args, 0), FValue::Error(ErrKind::Na))),
+        FuncId::IsRef => FValue::Bool(false),
+        FuncId::Na => FValue::Error(ErrKind::Na),
+        FuncId::N => r(|| match arg(args, 0) {
             FValue::Number(n) => Ok(FValue::number(n)),
             FValue::Bool(b) => Ok(FValue::number(if b { 1.0 } else { 0.0 })),
             FValue::Error(e) => Err(e),
             _ => Ok(FValue::number(0.0)),
         }),
-        "TYPE" => FValue::number(match arg(args, 0) {
+        FuncId::Type => FValue::number(match arg(args, 0) {
             FValue::Array(_) => 64.0,
             FValue::Number(_) => 1.0,
             FValue::Text(_) => 2.0,
@@ -2713,7 +2893,7 @@ pub(super) fn call_or_else_in(
             FValue::Error(_) => 16.0,
             FValue::Empty => 1.0,
         }),
-        "ERROR.TYPE" => r(|| match arg(args, 0) {
+        FuncId::ErrorType => r(|| match arg(args, 0) {
             FValue::Error(e) => Ok(FValue::number(match e {
                 ErrKind::Null => 1.0,
                 ErrKind::Div0 => 2.0,
@@ -3271,5 +3451,35 @@ mod round_precision {
         assert_eq!(round_sig15(-2.5).round(), -3.0);
         assert_eq!(round_sig15(0.0), 0.0);
         assert_eq!(round_sig15(1234.5678 * 100.0).round() / 100.0, 1234.57);
+    }
+
+    #[test]
+    fn text_criteria_on_numbers_short_circuits_accurately() {
+        use super::{Crit, FValue};
+        let n = FValue::Number(42.0);
+        for (crit, want) in [
+            ("apple", false),
+            ("=apple", false),
+            ("<>apple", true),
+            (">apple", true),
+            ("<apple", false),
+            (">=apple", false),
+            ("<=apple", false),
+            ("", false),
+            ("<>", true),
+            (">", false),
+            ("4*", false),
+            ("<>4*", true),
+            ("*", false),
+            ("?", false),
+            ("42", true),
+            ("=42", true),
+            ("<>42", false),
+            (">41", true),
+            ("<=42", true),
+        ] {
+            let c = Crit::parse(crit);
+            assert_eq!(c.matches(&n), want, "Crit::matches({crit:?}) on 42.0");
+        }
     }
 }

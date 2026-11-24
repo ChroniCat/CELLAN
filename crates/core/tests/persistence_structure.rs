@@ -49,7 +49,7 @@ fn assert_cells(expected: &Sheet, actual: &Sheet) {
     for r in 0..8 {
         for c in 0..8 {
             assert_eq!(actual.value(r, c), expected.value(r, c), "{} ({r},{c})", expected.name);
-            assert_eq!(actual.get(r, c).and_then(|cell| cell.formula.as_deref()), expected.get(r, c).and_then(|cell| cell.formula.as_deref()), "formula ({r},{c})");
+            assert_eq!(actual.formula_of(r, c), expected.formula_of(r, c), "formula ({r},{c})");
         }
     }
 }

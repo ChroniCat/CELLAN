@@ -262,8 +262,8 @@ pub fn capture(
     sc.comment = comment.to_owned();
     for r in r1..=r2 {
         for c in c1..=c2 {
-            let v = sheet.get(r, c).map_or(&Value::Empty, |cell| &cell.value);
-            sc.cells.push(((r, c), value_text(v)));
+            let v = sheet.value_ref(r, c);
+            sc.cells.push(((r, c), value_text(v.as_ref())));
         }
     }
     Ok(sc)

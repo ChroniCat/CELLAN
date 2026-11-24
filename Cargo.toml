@@ -10,8 +10,10 @@ repository = "https://github.com/ChroniCat/finance-native-sheets"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+strip = "symbols"
+panic = "abort"
 
 # 协作房间口令用 PBKDF2 拉伸（故意慢），工作簿加密也要跑 10 万轮 SHA-512。
 # 调试构建里未优化的哈希压缩函数会慢一个数量级，让测试里的握手超时；

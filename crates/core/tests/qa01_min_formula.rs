@@ -51,7 +51,7 @@ fn formula_min_fixture_loads_recalculates_and_keeps_formulas() {
     ]
     .iter()
     .map(|(r, c, expected)| {
-        let actual = sh.get(*r, *c).unwrap().formula.as_deref().expect("formula text");
+        let actual = sh.formula_of(*r, *c).expect("formula text");
         assert_eq!(actual, *expected);
         actual
     })

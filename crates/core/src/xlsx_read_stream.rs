@@ -7,10 +7,10 @@ use super::{
 use anyhow::{Context, Result, ensure};
 use quick_xml::{Reader, events::Event};
 use std::collections::BTreeMap;
-use std::io::{self, Read};
+use std::io::Read;
 use std::sync::{Mutex, RwLock, mpsc};
 
-const READ_BUF_BYTES: usize = 64 * 1024;
+const READ_BUF_BYTES: usize = 256 * 1024;
 
 #[inline]
 fn is_xml_ws(b: u8) -> bool {
@@ -156,6 +156,19 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Skips over `<c>`, `<v>`, `<f>`, `<t>`, etc. in a couple of instructions without parsing attributes,
 /// while still respecting XML comments and CDATA sections.
 fn find_matching_close(buf: &[u8], mut cursor: usize, local_target: &[u8]) -> Result<Option<usize>> {
+    if local_target == b"row" {
+        let mut search = cursor;
+        while let Some(rel) = buf[search..].iter().position(|&b| b == b'w') {
+            let w = search + rel;
+            if w >= cursor + 4 && w + 1 < buf.len() && &buf[w - 4..w + 2] == b"</row>" {
+                if !buf[cursor..w - 4].contains(&b'!') {
+                    return Ok(Some(w + 2));
+                }
+                break;
+            }
+            search = w + 1;
+        }
+    }
     while cursor < buf.len() {
         let Some(rel) = buf[cursor..].iter().position(|&b| b == b'<') else {
             return Ok(None);
@@ -446,7 +459,18 @@ pub(super) fn string_table(input: impl Read, table: &mut Strings) -> Result<()> 
                 let local = local_tag_name(&raw_name);
                 if !opened {
                     ensure!(local == b"sst", "无效共享字符串根元素");
-                    let _ = std::str::from_utf8(&sb.buf[sb.pos..end])?;
+                    let head = std::str::from_utf8(&sb.buf[sb.pos..end])?;
+                    if let Some(pos) = head.find("uniqueCount=") {
+                        let rest = &head[pos + "uniqueCount=".len()..];
+                        if let Some(q) = rest.as_bytes().first().copied().filter(|&b| b == b'"' || b == b'\'') {
+                            let val = &rest[1..];
+                            if let Some(end_q) = val.find(q as char) {
+                                if let Ok(n) = val[..end_q].parse::<usize>() {
+                                    table.text.reserve(n.min(2_000_000));
+                                }
+                            }
+                        }
+                    }
                     opened = true;
                     closed = empty;
                     sb.pos = end;
@@ -526,6 +550,417 @@ struct Rows {
     shell: String,
 }
 
+#[inline]
+fn parse_u32_ascii(b: &[u8]) -> Option<u32> {
+    if b.is_empty() || b.len() > 10 {
+        return None;
+    }
+    let mut acc = 0u64;
+    for &ch in b {
+        let d = ch.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        acc = acc * 10 + u64::from(d);
+    }
+    u32::try_from(acc).ok()
+}
+
+#[inline]
+fn parse_a1_bytes(b: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 0usize;
+    let mut col = 0u32;
+    while i < b.len() {
+        let ch = b[i];
+        if ch.is_ascii_uppercase() {
+            col = col.checked_mul(26)?.checked_add(u32::from(ch - b'A' + 1))?;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i == 0 || i > 3 || i >= b.len() {
+        return None;
+    }
+    let row = parse_u32_ascii(&b[i..])?;
+    if row == 0 || col == 0 {
+        return None;
+    }
+    Some((row - 1, col - 1))
+}
+
+#[inline]
+fn fast_parse_f64_bytes(b: &[u8]) -> Option<f64> {
+    if !b.is_empty() && b.len() <= 16 {
+        let (neg, digits) = match b[0] {
+            b'-' => (true, &b[1..]),
+            b'+' => (false, &b[1..]),
+            _ => (false, b),
+        };
+        if !digits.is_empty() && digits.len() <= 15 {
+            let mut acc = 0u64;
+            let mut all_digits = true;
+            for &ch in digits {
+                let d = ch.wrapping_sub(b'0');
+                if d <= 9 {
+                    acc = acc * 10 + u64::from(d);
+                } else {
+                    all_digits = false;
+                    break;
+                }
+            }
+            if all_digits {
+                return Some(if neg { -(acc as f64) } else { acc as f64 });
+            }
+        }
+    }
+    std::str::from_utf8(b).ok()?.parse::<f64>().ok()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FastRow {
+    Ok,
+    FallbackRow,
+    FallbackChunk,
+}
+
+/// Fast raw-byte decoder for an individual plain `<row ...>...</row>` containing no entities,
+/// comments, namespaces, formulas, or inline strings. Returns `FallbackRow` on complex cells
+/// (e.g. formulas) so only that row uses `quick-xml`, or `FallbackChunk` if row numbering is implicit.
+fn try_fast_decode_row(
+    row: &[u8],
+    table: &Strings,
+    lookup: &StyleLookup<'_>,
+    col_has_xf: &[bool],
+    cells: &mut Vec<((u32, u32), crate::model::Cell)>,
+    styles: &mut Vec<(crate::model::CellRef, u16)>,
+    row_layout: &mut RowLayout,
+) -> FastRow {
+    if !row.starts_with(b"<row") {
+        return FastRow::FallbackChunk;
+    }
+    let Some(&after_name) = row.get(4) else {
+        return FastRow::FallbackChunk;
+    };
+    if !is_xml_ws(after_name) && after_name != b'>' && after_name != b'/' {
+        return FastRow::FallbackChunk;
+    }
+
+    // Parse `<row ...>` open tag attributes
+    let mut i = 4usize;
+    let mut row_idx: Option<u32> = None;
+    let mut ht = 0f32;
+    let mut custom_ht = false;
+    let mut hidden = false;
+    let mut row_s = 0u32;
+    let mut row_lv = 0u8;
+    let open_end;
+    let row_empty;
+    loop {
+        while i < row.len() && is_xml_ws(row[i]) {
+            i += 1;
+        }
+        if i >= row.len() {
+            return FastRow::FallbackChunk;
+        }
+        if row[i] == b'>' {
+            open_end = i + 1;
+            row_empty = false;
+            break;
+        }
+        if row[i] == b'/' {
+            if row.get(i + 1) != Some(&b'>') {
+                return FastRow::FallbackChunk;
+            }
+            open_end = i + 2;
+            row_empty = true;
+            break;
+        }
+        let ks = i;
+        while i < row.len() && !is_xml_ws(row[i]) && row[i] != b'=' && row[i] != b'>' && row[i] != b'/' {
+            i += 1;
+        }
+        let key = &row[ks..i];
+        while i < row.len() && is_xml_ws(row[i]) {
+            i += 1;
+        }
+        if row.get(i) != Some(&b'=') {
+            return FastRow::FallbackChunk;
+        }
+        i += 1;
+        while i < row.len() && is_xml_ws(row[i]) {
+            i += 1;
+        }
+        let Some(&q) = row.get(i).filter(|&&b| b == b'"' || b == b'\'') else {
+            return FastRow::FallbackChunk;
+        };
+        i += 1;
+        let vs = i;
+        while i < row.len() && row[i] != q {
+            if row[i] == b'<' {
+                return FastRow::FallbackChunk;
+            }
+            i += 1;
+        }
+        if i >= row.len() {
+            return FastRow::FallbackChunk;
+        }
+        let val = &row[vs..i];
+        i += 1;
+        match key {
+            b"r" => {
+                let Some(n) = parse_u32_ascii(val).and_then(|v| v.checked_sub(1)) else {
+                    return FastRow::FallbackChunk;
+                };
+                if n >= crate::sync::MAX_ROWS {
+                    return FastRow::FallbackChunk;
+                }
+                row_idx = Some(n);
+            }
+            b"ht" => {
+                ht = std::str::from_utf8(val).ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            }
+            b"customHeight" => {
+                custom_ht = val == b"1" || val == b"true";
+            }
+            b"hidden" => {
+                hidden = val == b"1" || val == b"true";
+            }
+            b"s" => {
+                row_s = parse_u32_ascii(val).unwrap_or(0);
+            }
+            b"outlineLevel" => {
+                row_lv = parse_u32_ascii(val).and_then(|v| u8::try_from(v).ok()).unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+
+    let Some(r_idx) = row_idx else {
+        return FastRow::FallbackChunk;
+    };
+    let row_has_xf = row_s > 0;
+    if row_lv > 0 {
+        row_layout.row_levels.push((r_idx, row_lv));
+    }
+    if row_s > 0 {
+        row_layout.row_xfs.push((r_idx, row_s));
+    }
+    if hidden {
+        row_layout.hidden_rows.push(r_idx);
+    }
+    if ht > 0.0 && custom_ht {
+        let px = crate::layout::pt_to_px(ht);
+        if (px - crate::layout::DEFAULT_ROW_H).abs() > 0.5 {
+            row_layout.row_heights.push((r_idx, px));
+        }
+    }
+    if row_empty {
+        return if open_end == row.len() {
+            FastRow::Ok
+        } else {
+            FastRow::FallbackChunk
+        };
+    }
+    if row.len() < open_end + 6 || &row[row.len() - 6..] != b"</row>" {
+        return FastRow::FallbackChunk;
+    }
+
+    let body = &row[open_end..row.len() - 6];
+    let mut p = 0usize;
+    while p < body.len() {
+        while p < body.len() && is_xml_ws(body[p]) {
+            p += 1;
+        }
+        if p >= body.len() {
+            break;
+        }
+        if !body[p..].starts_with(b"<c") {
+            return FastRow::FallbackRow;
+        }
+        let Some(&after_c) = body.get(p + 2) else {
+            return FastRow::FallbackRow;
+        };
+        if !is_xml_ws(after_c) && after_c != b'>' && after_c != b'/' {
+            return FastRow::FallbackRow;
+        }
+        p += 2;
+        let mut here: Option<(u32, u32)> = None;
+        let mut xf: Option<u16> = None;
+        let mut typ: &[u8] = b"";
+        let c_empty;
+        loop {
+            while p < body.len() && is_xml_ws(body[p]) {
+                p += 1;
+            }
+            if p >= body.len() {
+                return FastRow::FallbackRow;
+            }
+            if body[p] == b'>' {
+                p += 1;
+                c_empty = false;
+                break;
+            }
+            if body[p] == b'/' {
+                if body.get(p + 1) != Some(&b'>') {
+                    return FastRow::FallbackRow;
+                }
+                p += 2;
+                c_empty = true;
+                break;
+            }
+            let ks = p;
+            while p < body.len() && !is_xml_ws(body[p]) && body[p] != b'=' && body[p] != b'>' && body[p] != b'/' {
+                p += 1;
+            }
+            let key = &body[ks..p];
+            while p < body.len() && is_xml_ws(body[p]) {
+                p += 1;
+            }
+            if body.get(p) != Some(&b'=') {
+                return FastRow::FallbackRow;
+            }
+            p += 1;
+            while p < body.len() && is_xml_ws(body[p]) {
+                p += 1;
+            }
+            let Some(&q) = body.get(p).filter(|&&b| b == b'"' || b == b'\'') else {
+                return FastRow::FallbackRow;
+            };
+            p += 1;
+            let vs = p;
+            while p < body.len() && body[p] != q {
+                if body[p] == b'<' {
+                    return FastRow::FallbackRow;
+                }
+                p += 1;
+            }
+            if p >= body.len() {
+                return FastRow::FallbackRow;
+            }
+            let val = &body[vs..p];
+            p += 1;
+            match key {
+                b"r" => {
+                    let Some((cr, cc)) = parse_a1_bytes(val) else {
+                        return FastRow::FallbackRow;
+                    };
+                    if cr >= crate::sync::MAX_ROWS || cc >= crate::sync::MAX_COLS {
+                        return FastRow::FallbackRow;
+                    }
+                    here = Some((cr, cc));
+                }
+                b"s" => {
+                    let Some(s) = parse_u32_ascii(val).and_then(|v| u16::try_from(v).ok()) else {
+                        return FastRow::FallbackRow;
+                    };
+                    xf = Some(s);
+                }
+                b"t" => {
+                    if !matches!(val, b"" | b"n" | b"s" | b"b") {
+                        return FastRow::FallbackRow;
+                    }
+                    typ = val;
+                }
+                b"cm" => return FastRow::FallbackRow,
+                _ => {}
+            }
+        }
+        let Some((cr, cc)) = here else {
+            return FastRow::FallbackRow;
+        };
+        if let Some(raw_xf) = xf {
+            let id = lookup.resolve(raw_xf);
+            let col_styled = col_has_xf.get(cc as usize).copied().unwrap_or(false);
+            if raw_xf != 0 || id != 0 || row_has_xf || col_styled {
+                styles.push((crate::model::CellRef::new(cr, cc), id));
+            }
+        }
+        if c_empty {
+            continue;
+        }
+        while p < body.len() && is_xml_ws(body[p]) {
+            p += 1;
+        }
+        if body[p..].starts_with(b"</c>") {
+            p += 4;
+            continue;
+        }
+        if !body[p..].starts_with(b"<v>") {
+            return FastRow::FallbackRow;
+        }
+        p += 3;
+        let v_start = p;
+        let Some(lt_rel) = body[p..].iter().position(|&b| b == b'<') else {
+            return FastRow::FallbackRow;
+        };
+        let v_end = p + lt_rel;
+        if !body[v_end..].starts_with(b"</v>") {
+            return FastRow::FallbackRow;
+        }
+        let v_bytes = &body[v_start..v_end];
+        p = v_end + 4;
+        while p < body.len() && is_xml_ws(body[p]) {
+            p += 1;
+        }
+        if !body[p..].starts_with(b"</c>") {
+            return FastRow::FallbackRow;
+        }
+        p += 4;
+
+        let value = match typ {
+            b"s" if !v_bytes.is_empty() => {
+                let trimmed = trim_ascii_ws(v_bytes);
+                let Some(id) = parse_u32_ascii(trimmed).map(|v| v as usize) else {
+                    return FastRow::FallbackRow;
+                };
+                if table.rich.contains_key(&id) {
+                    return FastRow::FallbackRow;
+                }
+                let Some(arc) = table.text.get_arc(id) else {
+                    return FastRow::FallbackRow;
+                };
+                crate::model::Value::Text(std::sync::Arc::clone(arc))
+            }
+            _ if v_bytes.is_empty() => crate::model::Value::Empty,
+            b"" => match fast_parse_f64_bytes(v_bytes) {
+                Some(n) => crate::model::Value::Number(n),
+                None => match std::str::from_utf8(v_bytes) {
+                    Ok(s) => crate::model::Value::Text(s.into()),
+                    Err(_) => return FastRow::FallbackRow,
+                },
+            },
+            b"n" => match fast_parse_f64_bytes(v_bytes) {
+                Some(n) => crate::model::Value::Number(n),
+                None => return FastRow::FallbackRow,
+            },
+            b"b" => {
+                let trimmed = trim_ascii_ws(v_bytes);
+                if trimmed.is_empty() {
+                    crate::model::Value::Empty
+                } else if trimmed == b"1" || trimmed.eq_ignore_ascii_case(b"true") {
+                    crate::model::Value::Bool(true)
+                } else if trimmed == b"0" || trimmed.eq_ignore_ascii_case(b"false") {
+                    crate::model::Value::Bool(false)
+                } else {
+                    return FastRow::FallbackRow;
+                }
+            }
+            _ => return FastRow::FallbackRow,
+        };
+        if !value.is_empty() {
+            cells.push((
+                (cr, cc),
+                crate::model::Cell {
+                    value,
+                    formula: None,
+                },
+            ));
+        }
+    }
+    FastRow::Ok
+}
+
 impl Rows {
     fn decode(
         chunk: Chunk,
@@ -536,24 +971,181 @@ impl Rows {
         name: &str,
         part: &str,
     ) -> Result<Self> {
-        let xml = std::str::from_utf8(&chunk.bytes)?;
         let mut local = Loaded::empty(name, part);
-        let mut cells = Vec::new();
+        let mut cells = Vec::with_capacity(chunk.bytes.len() / 24);
         let mut styles = Vec::new();
         let mut shared = Formulas::default();
-        let shell = parse_section(
-            xml,
-            table,
-            style_lookup,
-            col_has_xf,
-            Some(shared_masters),
-            &mut local,
-            calamine::SheetType::WorkSheet,
-            &mut shared,
-            Some((&mut cells, &mut styles)),
-            chunk.first_row,
-        )?;
+        let mut shell = String::new();
+
+        // Try fast raw-byte row decoding when `style_lookup` is active and the chunk has no
+        // comments/PIs/entities/namespace prefixes. Any individual row containing formulas,
+        // inline strings, rich SST items, or implicit coordinates falls back seamlessly to
+        // `parse_section`.
+        let can_fast = style_lookup.is_some()
+            && !chunk
+                .bytes
+                .iter()
+                .any(|&b| b == b'!' || b == b'?' || b == b'&' || b == b':' || b == b'\r');
+        let mut used_fast = false;
+        if can_fast {
+            let lookup = style_lookup.unwrap();
+            let bytes = chunk.bytes.as_slice();
+            let mut pos = 0usize;
+            let mut fast_ok = true;
+            let mut row_layout = RowLayout::default();
+            while pos < bytes.len() {
+                let ws_start = pos;
+                while pos < bytes.len() && is_xml_ws(bytes[pos]) {
+                    pos += 1;
+                }
+                if pos > ws_start {
+                    // Preserve any inter-row whitespace in `shell` just like `parse_section`.
+                    let Ok(ws) = std::str::from_utf8(&bytes[ws_start..pos]) else {
+                        fast_ok = false;
+                        break;
+                    };
+                    shell.push_str(ws);
+                }
+                if pos >= bytes.len() {
+                    break;
+                }
+                if !bytes[pos..].starts_with(b"<row") {
+                    fast_ok = false;
+                    break;
+                }
+                // Find end of this `<row ...>` element
+                let Some(open_gt) = bytes[pos..].iter().position(|&b| b == b'>') else {
+                    fast_ok = false;
+                    break;
+                };
+                let open_end = pos + open_gt + 1;
+                let row_end = if open_gt >= 1 && bytes[pos + open_gt - 1] == b'/' {
+                    open_end
+                } else {
+                    let mut search = open_end;
+                    let mut found = None;
+                    while let Some(rel) = bytes[search..].iter().position(|&b| b == b'w') {
+                        let w = search + rel;
+                        if w >= open_end + 4 && w + 1 < bytes.len() && &bytes[w - 4..w + 2] == b"</row>" {
+                            found = Some(w + 2);
+                            break;
+                        }
+                        search = w + 1;
+                    }
+                    let Some(e) = found else {
+                        fast_ok = false;
+                        break;
+                    };
+                    e
+                };
+                let row_slice = &bytes[pos..row_end];
+                let saved_lens = (
+                    cells.len(),
+                    styles.len(),
+                    row_layout.row_heights.len(),
+                    row_layout.hidden_rows.len(),
+                    row_layout.row_levels.len(),
+                    row_layout.row_xfs.len(),
+                );
+                match try_fast_decode_row(
+                    row_slice,
+                    table,
+                    lookup,
+                    col_has_xf,
+                    &mut cells,
+                    &mut styles,
+                    &mut row_layout,
+                ) {
+                    FastRow::Ok => {}
+                    FastRow::FallbackChunk => {
+                        fast_ok = false;
+                        break;
+                    }
+                    FastRow::FallbackRow => {
+                        cells.truncate(saved_lens.0);
+                        styles.truncate(saved_lens.1);
+                        row_layout.row_heights.truncate(saved_lens.2);
+                        row_layout.hidden_rows.truncate(saved_lens.3);
+                        row_layout.row_levels.truncate(saved_lens.4);
+                        row_layout.row_xfs.truncate(saved_lens.5);
+                        let row_xml = std::str::from_utf8(row_slice)?;
+                        let row_shell = parse_section(
+                            row_xml,
+                            table,
+                            style_lookup,
+                            col_has_xf,
+                            Some(shared_masters),
+                            &mut local,
+                            calamine::SheetType::WorkSheet,
+                            &mut shared,
+                            Some((&mut cells, &mut styles)),
+                            chunk.first_row,
+                        )?;
+                        shell.push_str(&row_shell);
+                        row_layout.extend(std::mem::take(&mut local.row_layout));
+                    }
+                }
+                pos = row_end;
+            }
+            if fast_ok {
+                local.row_layout = row_layout;
+                used_fast = true;
+            } else {
+                // Full clean rollback to `parse_section` for the whole chunk.
+                cells.clear();
+                styles.clear();
+                shared = Formulas::default();
+                shell.clear();
+                local = Loaded::empty(name, part);
+            }
+        }
+
+        if !used_fast {
+            let xml = std::str::from_utf8(&chunk.bytes)?;
+            shell = parse_section(
+                xml,
+                table,
+                style_lookup,
+                col_has_xf,
+                Some(shared_masters),
+                &mut local,
+                calamine::SheetType::WorkSheet,
+                &mut shared,
+                Some((&mut cells, &mut styles)),
+                chunk.first_row,
+            )?;
+        }
+
         let row_layout = std::mem::take(&mut local.row_layout);
+        // When coordinates in the chunk are strictly unique (normal OOXML), reorder cells by
+        // `(page, Reverse(col), Reverse(row))` so the single-threaded merger's `Page::ensure`
+        // allocates each `page.cols` and each 256-slot column `Vec<Cell>` ONCE (zero reallocs).
+        if cells.len() >= 32 {
+            let mut strictly_ordered = true;
+            let mut prev: Option<(u32, u32)> = None;
+            for &((r, c), _) in &cells {
+                if let Some(p) = prev {
+                    if (r, c) <= p {
+                        strictly_ordered = false;
+                        break;
+                    }
+                }
+                prev = Some((r, c));
+            }
+            if strictly_ordered {
+                cells.sort_unstable_by_key(|&((r, c), _)| {
+                    (
+                        r / crate::store::PAGE_ROWS,
+                        std::cmp::Reverse(c),
+                        std::cmp::Reverse(r),
+                    )
+                });
+            }
+        }
+        // Keep styles in ascending `(page, col, row)` order so `StyleColumn::insert` appends in O(1).
+        if styles.len() >= 64 {
+            styles.sort_unstable_by_key(|&(k, _)| (k.row / crate::store::PAGE_ROWS, k.col, k.row));
+        }
         Ok(Self {
             local,
             cells,
@@ -566,29 +1158,11 @@ impl Rows {
 
     fn append(self, out: &mut Loaded, formulas: &mut Formulas, shell: &mut String) -> Result<()> {
         out.sheet.source_needs_dom_repair |= self.local.sheet.source_needs_dom_repair;
-        // Group inserts by column within this batch so Store & CellStyles touch each
-        // column page sequentially in L1 cache instead of thrashing across columns per row.
-        if self.cells.len() >= 64 {
-            let mut by_col = self.cells;
-            by_col.sort_by_key(|&((_r, c), _)| c);
-            for ((r, c), cell) in by_col {
-                out.sheet.set(r, c, cell);
-            }
-        } else {
-            for ((r, c), cell) in self.cells {
-                out.sheet.set(r, c, cell);
-            }
+        for ((r, c), cell) in self.cells {
+            out.sheet.set(r, c, cell);
         }
-        if self.styles.len() >= 64 {
-            let mut by_col = self.styles;
-            by_col.sort_unstable_by_key(|&(k, _)| (k.col, k.row));
-            for (key, id) in by_col {
-                out.sheet.styles.insert(key, id);
-            }
-        } else {
-            for (key, id) in self.styles {
-                out.sheet.styles.insert(key, id);
-            }
+        for (key, id) in self.styles {
+            out.sheet.styles.insert(key, id);
         }
         out.xfs.extend(self.local.xfs);
         out.row_layout.extend(self.row_layout);
@@ -718,6 +1292,40 @@ fn scan_worksheet_stream<R: Read>(
             }
             XmlSlice::CData { .. } => anyhow::bail!("工作表顶层含非法 CDATA"),
             XmlSlice::Start { end, name_start, name_end, empty } => {
+                // Fast zero-allocation branch for `<row>` inside `<sheetData>`.
+                if opened && !closed && in_data && local_tag_name(&sb.buf[name_start..name_end]) == b"row" {
+                    let rel_end = end - sb.pos;
+                    let r_idx = extract_row_attr(&sb.buf[sb.pos..end])?.unwrap_or(next_row);
+                    next_row = r_idx.saturating_add(1);
+                    let rel_row_end = if empty {
+                        rel_end
+                    } else {
+                        let mut rel_search = rel_end;
+                        loop {
+                            if let Some(close_end) =
+                                find_matching_close(&sb.buf, sb.pos + rel_search, b"row")?
+                            {
+                                break close_end - sb.pos;
+                            }
+                            rel_search = sb.rem().len().saturating_sub(12).max(rel_end);
+                            ensure!(sb.fill_more()?, "工作表 row 未闭合");
+                        }
+                    };
+                    let row_end = sb.pos + rel_row_end;
+                    if chunk.bytes.is_empty() {
+                        chunk.first_row = r_idx;
+                        chunk.bytes.reserve(chunk_size.saturating_add(65536));
+                    }
+                    chunk.bytes.extend_from_slice(&sb.buf[sb.pos..row_end]);
+                    sb.pos = row_end;
+                    if chunk.bytes.len() >= chunk_size
+                        && (next_row % crate::store::PAGE_ROWS == 0
+                            || chunk.bytes.len() >= chunk_size.saturating_mul(2))
+                    {
+                        flush_chunk(&mut chunk, &mut emit)?;
+                    }
+                    continue;
+                }
                 let raw_name = sb.buf[name_start..name_end].to_vec();
                 let local = local_tag_name(&raw_name);
                 if !opened {
@@ -738,33 +1346,6 @@ fn scan_worksheet_stream<R: Read>(
                         data_raw = raw_name;
                         emit(StreamItem::Shell(s))?;
                         sb.pos = end;
-                    } else if in_data && local == b"row" {
-                        let rel_end = end - sb.pos;
-                        let r_idx = extract_row_attr(&sb.buf[sb.pos..end])?.unwrap_or(next_row);
-                        next_row = r_idx.saturating_add(1);
-                        let rel_row_end = if empty {
-                            rel_end
-                        } else {
-                            let mut rel_search = rel_end;
-                            loop {
-                                if let Some(close_end) =
-                                    find_matching_close(&sb.buf, sb.pos + rel_search, b"row")?
-                                {
-                                    break close_end - sb.pos;
-                                }
-                                rel_search = sb.rem().len().saturating_sub(12).max(rel_end);
-                                ensure!(sb.fill_more()?, "工作表 row 未闭合");
-                            }
-                        };
-                        let row_end = sb.pos + rel_row_end;
-                        if chunk.bytes.is_empty() {
-                            chunk.first_row = r_idx;
-                        }
-                        chunk.bytes.extend_from_slice(&sb.buf[sb.pos..row_end]);
-                        sb.pos = row_end;
-                        if chunk.bytes.len() >= chunk_size {
-                            flush_chunk(&mut chunk, &mut emit)?;
-                        }
                     } else {
                         let rel_end = end - sb.pos;
                         let rel_elem_end = if empty {
@@ -1008,6 +1589,7 @@ pub(super) fn worksheet_with_styles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     struct CutConnection;
     impl Read for CutConnection {
         fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {

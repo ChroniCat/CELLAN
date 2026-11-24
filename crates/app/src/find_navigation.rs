@@ -174,19 +174,19 @@ impl ReplacementPlan {
             let prior = baseline.sheet(si);
             let Some(cell) = live.get(row, col) else { result.conflicts += 1; continue };
             let old = prior.get(row,col);
-            let conflict = if opts.in_formula { old.and_then(|c| c.formula.as_ref()) != cell.formula.as_ref() }
-                else { old != Some(cell) || baseline.styles.get(prior.style_of(row,col)).format
+            let conflict = if opts.in_formula { old.as_deref().and_then(|c| c.formula.as_ref()) != cell.formula.as_ref() }
+                else { old.as_deref() != Some(cell.as_ref()) || baseline.styles.get(prior.style_of(row,col)).format
                     != result.before.styles.get(live.style_of(row,col)).format };
             if conflict { result.conflicts += 1; continue; }
             if !opts.in_formula && !replace_results && cell.formula.is_some() { result.formulas += 1; continue; }
-            let Some(after) = replacement(&result.before,si,row,col,cell,needle,opts,replace,replace_results) else { continue };
+            let Some(after) = replacement(&result.before,si,row,col,cell.as_ref(),needle,opts,replace,replace_results) else { continue };
             result.formula_edit |= cell.formula != after.formula;
             let (prepared, keys) = result.sheets.entry(si).or_insert_with(||
                 (if hits.len() > 1024 { live.search_snapshot() } else { sheetcore::Sheet::default() }, Vec::new()));
             prepared.set(row,col,after.clone());
             keys.push((row,col));
             let style = live.style_of(row,col);
-            deltas.push(sheetcore::undo::CellDelta { sheet: si, row, col, before: cell.clone(), after,
+            deltas.push(sheetcore::undo::CellDelta { sheet: si, row, col, before: cell.into_owned(), after,
                 before_style: style, after_style: style });
         }
         for (_, keys) in result.sheets.values_mut() {
@@ -312,7 +312,10 @@ impl SheetApp {
             if *cursor < end {
                 let ops: Vec<_> = keys[*cursor..end]
                     .iter()
-                    .map(|&(r, c)| peer.local_set(si, r, c, sh.get(r, c).unwrap_or(&blank)))
+                    .map(|&(r, c)| {
+                        let cell = sh.get(r, c);
+                        peer.local_set(si, r, c, cell.as_deref().unwrap_or(&blank))
+                    })
                     .collect();
                 sent += ops.len();
                 *cursor = end;
@@ -417,7 +420,7 @@ impl SheetApp {
             if large { self.wb.sheet_mut(si).take_row_changes(prepared); }
             else {
                 let sh = self.wb.sheet_mut(si);
-                for &(r,c) in keys.iter() { sh.set(r, c, prepared.get(r,c).cloned().unwrap_or_default()); }
+                for &(r,c) in keys.iter() { sh.set(r, c, prepared.get(r,c).map(|c| c.into_owned()).unwrap_or_default()); }
             }
         }
         let status = plan.status();
@@ -864,11 +867,11 @@ mod tests {
         tx.send(hits).unwrap();
         app.poll_find_scan();
         assert!(app.find_scan.is_none());
-        assert_eq!(app.wb.sheets[0].get(0, 0), Some(&text("new")));
-        assert_eq!(app.wb.sheets[0].get(1, 0), Some(&text("old updated by collaborator")));
-        assert_eq!(app.wb.sheets[0].get(2, 0), Some(&text("old added during scan")));
-        assert_eq!(app.wb.sheets[0].get(0, 1), Some(&text("old outside selection")));
-        assert_eq!(app.wb.sheets[1].get(0, 0), Some(&text("old on another sheet")));
+        assert_eq!(app.wb.sheets[0].get(0, 0).as_deref(), Some(&text("new")));
+        assert_eq!(app.wb.sheets[0].get(1, 0).as_deref(), Some(&text("old updated by collaborator")));
+        assert_eq!(app.wb.sheets[0].get(2, 0).as_deref(), Some(&text("old added during scan")));
+        assert_eq!(app.wb.sheets[0].get(0, 1).as_deref(), Some(&text("old outside selection")));
+        assert_eq!(app.wb.sheets[1].get(0, 0).as_deref(), Some(&text("old on another sheet")));
         assert!(app.status.contains("已更改的 1 处"), "{}", app.status);
     }
 
@@ -895,7 +898,7 @@ mod tests {
         stage(&mut app);
         app.cancel_find_scan();
         assert_eq!(app.undo.depth(),(0,0));
-        assert_eq!(app.wb.sheets[0].get(0,0),Some(&text("old")));
+        assert_eq!(app.wb.sheets[0].get(0,0).as_deref(),Some(&text("old")));
         stage(&mut app);
         app.locks.request(1,1,2,66,"late holder",app.lock_now());
         finish(&mut app);
@@ -938,7 +941,7 @@ mod tests {
             if app.find_scan.is_none() { commit = elapsed; }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert_eq!(app.wb.sheets[0].get(rows-1,0),Some(&text("new")));
+        assert_eq!(app.wb.sheets[0].get(rows-1,0).as_deref(),Some(&text("new")));
         assert_eq!(app.undo.depth(),(1,0));
         eprintln!("replace {rows} matches total={:?} max_ui_poll={worst:?} commit={commit:?}",start.elapsed());
     }

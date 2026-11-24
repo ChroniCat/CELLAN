@@ -24,7 +24,7 @@ fn set_formula(wb: &mut Workbook, r: u32, c: u32, f: &str) {
     wb.sheets[0].set(r, c, Cell { value: Value::Empty, formula: Some(f.into()) });
 }
 fn formula_at(wb: &Workbook, r: u32, c: u32) -> &str {
-    wb.sheets[0].get(r, c).unwrap().formula.as_deref().unwrap()
+    wb.sheets[0].formula_of(r, c).unwrap()
 }
 
 #[test]

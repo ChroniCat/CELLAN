@@ -144,7 +144,7 @@ impl SheetApp {
                     let live = self.wb.sheet(si);
                     let target = copy.sheet_mut(si);
                     match live.get(r, c) {
-                        Some(cell) => target.set(r, c, cell.clone()),
+                        Some(cell) => target.set(r, c, cell.into_owned()),
                         None => {
                             let _ = target.remove(r, c);
                         }
@@ -362,6 +362,39 @@ pub(super) struct PreparedSearchQuery {
     pub can_match_false: bool,
 }
 
+struct StackFmt<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackFmt<N> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> std::fmt::Write for StackFmt<N> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        if self.len + bytes.len() > N {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+}
+
 impl PreparedSearchQuery {
     pub(super) fn new(query: &str) -> Self {
         let q_low = query.to_lowercase();
@@ -407,17 +440,52 @@ impl PreparedSearchQuery {
         s.to_lowercase().contains(&self.q_low)
     }
 
+    /// 栈缓冲区零堆分配格式化数字并与 `sheetcore::model::format_number` 保持字节级一致。
+    #[inline]
+    fn matches_number(&self, n: f64) -> bool {
+        if n.is_nan() || n.is_infinite() {
+            return self.matches_str("#NUM!");
+        }
+        if !self.can_match_num {
+            return false;
+        }
+        if n.fract() == 0.0 && n.abs() < 1e15 {
+            let v = n as i64;
+            let mut raw = [0u8; 24];
+            let mut pos = raw.len();
+            let mut u = v.unsigned_abs();
+            if u == 0 {
+                pos -= 1;
+                raw[pos] = b'0';
+            } else {
+                while u > 0 {
+                    pos -= 1;
+                    raw[pos] = b'0' + (u % 10) as u8;
+                    u /= 10;
+                }
+                if v < 0 {
+                    pos -= 1;
+                    raw[pos] = b'-';
+                }
+            }
+            let s = std::str::from_utf8(&raw[pos..]).unwrap_or("");
+            return self.matches_str(s);
+        }
+        use std::fmt::Write as _;
+        let mut fmt = StackFmt::<64>::new();
+        if write!(&mut fmt, "{:.10}", n).is_ok() {
+            let s = fmt.as_str().trim_end_matches('0').trim_end_matches('.');
+            self.matches_str(s)
+        } else {
+            self.matches_str(&sheetcore::model::format_number(n))
+        }
+    }
+
     #[inline]
     pub(super) fn matches_cell(&self, cell: &sheetcore::model::Cell) -> bool {
         let val_hit = match &cell.value {
             Value::Empty => false,
-            Value::Number(n) => {
-                if !self.can_match_num && n.is_finite() {
-                    false
-                } else {
-                    self.matches_str(&cell.value.display())
-                }
-            }
+            Value::Number(n) => self.matches_number(*n),
             Value::Bool(b) => {
                 if *b {
                     self.can_match_true
@@ -563,7 +631,7 @@ impl WorkbookToolView<'_> {
         'search: for si in sheets {
             let sh = self.wb.sheet(si);
             for (cr, cell) in sheetcore::sync::iter_sheet_rect(sh, (0, 0, u32::MAX, u32::MAX)) {
-                if prepared.matches_cell(cell) {
+                if prepared.matches_cell(cell.as_ref()) {
                     if hits.len() == HIT_LIMIT {
                         has_more = true;
                         break 'search;
@@ -816,5 +884,34 @@ mod tests {
         let (_, formula_res) = view.tool_search_cells(&json!({"query": "sum(a1:a10)"}));
         assert_eq!(formula_res["hits"].as_array().unwrap().len(), 1);
         assert_eq!(formula_res["hits"][0]["cell"], "D521");
+
+        // Stack-formatted numeric search matches exact display values across ints, negatives, fractions & NaN/Inf.
+        let samples = [
+            0.0_f64,
+            -0.0_f64,
+            -42.0,
+            123456789012345.0,
+            3.1415926535,
+            -0.005,
+            1.25e16,
+            f64::NAN,
+            f64::INFINITY,
+        ];
+        for n in samples {
+            let cell = Cell {
+                value: Value::Number(n),
+                formula: None,
+            };
+            let displayed = cell.value.display();
+            let q = PreparedSearchQuery::new(&displayed);
+            assert!(
+                q.matches_cell(&cell),
+                "stack number search must match exact display string for {n:?} -> {displayed:?}"
+            );
+            if n.is_finite() {
+                let miss = PreparedSearchQuery::new("not-a-number");
+                assert!(!miss.matches_cell(&cell));
+            }
+        }
     }
 }

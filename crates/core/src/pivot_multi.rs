@@ -334,7 +334,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         let mut keep = true;
         for (col, allowed) in &compiled_filters {
             let v = sheet.value_ref(r, *col);
-            let matched = match v {
+            let matched = match v.as_ref() {
                 Value::Text(t) => allowed.contains(t.as_ref()),
                 other => allowed.contains(other.display().as_str()),
             };
@@ -349,12 +349,12 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         let row_path: Vec<String> = spec
             .rows
             .iter()
-            .map(|f| group_key(sheet.value_ref(r, f.col), &f.group))
+            .map(|f| group_key(sheet.value_ref(r, f.col).as_ref(), &f.group))
             .collect();
         let col_path: Vec<String> = spec
             .cols
             .iter()
-            .map(|f| group_key(sheet.value_ref(r, f.col), &f.group))
+            .map(|f| group_key(sheet.value_ref(r, f.col).as_ref(), &f.group))
             .collect();
         if !row_first.contains_key(&row_path) {
             row_first.insert(row_path.clone(), row_first.len());
@@ -367,7 +367,8 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
             entry.resize(spec.values.len(), Acc::default());
         }
         for (i, vf) in spec.values.iter().enumerate() {
-            entry[i].push(sheet.get(r, vf.col).map(|x| &x.value));
+            let v = sheet.value_ref(r, vf.col);
+            entry[i].push((!matches!(v.as_ref(), Value::Empty)).then_some(v.as_ref()));
         }
     }
 

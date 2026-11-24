@@ -53,12 +53,12 @@ fn inserting_a_row_inside_a_table_expands_it_and_fills_calculated_column() {
     assert_eq!(t.range, (0, 0, 2, 2), "表体插入行应扩展表格末行");
     assert!(sh.tables_dirty, "表格范围改变必须标记待保存");
     assert_eq!(
-        sh.get(2, 2).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(2, 2),
         Some("=[@Amount]*[@Tax]"),
         "新行应复制上一数据行的计算列公式"
     );
     assert_eq!(
-        sh.get(1, 2).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(1, 2),
         Some("=[@Amount]*[@Tax]"),
         "原数据行应保留公式"
     );
@@ -113,20 +113,20 @@ fn rename_table_column_updates_definition_and_formulas_and_preserves_ids() {
         "表头单元格必须同步改名，不能只改表定义"
     );
     assert_eq!(
-        sh.get(1, 2).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(1, 2),
         Some("=[@Qty]*[@Tax]")
     );
     assert_eq!(
-        sh.get(2, 2).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(2, 2),
         Some("=SUM(Sales[Qty])")
     );
     assert_eq!(
-        sh.get(3, 2).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(3, 2),
         Some("=SUM(sales[Qty])"),
         "表名匹配不能区分大小写，且应保留原文大小写"
     );
     assert_eq!(
-        sh.get(3, 3).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(3, 3),
         Some(r#"="sales[Amount]""#),
         "字符串里的 sales[Amount] 不是表格引用"
     );
@@ -162,9 +162,7 @@ fn renamed_table_column_and_ids_survive_save_and_reload() {
         "保存重开后表头必须与列定义一致"
     );
     assert_eq!(
-        back.sheets[0]
-            .get(1, 2)
-            .and_then(|c| c.formula.as_deref()),
+        back.sheets[0].formula_of(1, 2),
         Some("=[@Qty]*[@Tax]")
     );
     let _ = std::fs::remove_file(&path);
@@ -178,7 +176,7 @@ fn converting_table_to_range_keeps_formulas_usable_after_reopen() {
     assert!(sh.tables.is_empty(), "转换后表格对象应删除");
     assert!(sh.tables_dirty, "删除表格必须触发表格部件同步");
     assert_eq!(
-        sh.get(1, 2).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(1, 2),
         Some("=A2*B2"),
         "当前行结构化引用应展开为 A1"
     );
@@ -196,7 +194,7 @@ fn converting_table_to_range_keeps_formulas_usable_after_reopen() {
     let back = sheetcore::xlsx::load(&path).expect("load");
     assert!(back.sheets[0].tables.is_empty(), "重开后不应再有表格部件");
     assert_eq!(
-        back.sheets[0].get(1, 2).and_then(|c| c.formula.as_deref()),
+        back.sheets[0].formula_of(1, 2),
         Some("=A2*B2")
     );
     let _ = std::fs::remove_file(&path);
@@ -220,8 +218,8 @@ fn calculated_column_fill_copies_relative_formulas_to_other_rows() {
         },
     );
     assert_eq!(fill_calculated_column(sh, "Sales", "Total"), 2);
-    assert_eq!(sh.get(2, 2).and_then(|c| c.formula.as_deref()), Some("=A3*B3"));
-    assert_eq!(sh.get(3, 2).and_then(|c| c.formula.as_deref()), Some("=A4*B4"));
+    assert_eq!(sh.formula_of(2, 2), Some("=A3*B3"));
+    assert_eq!(sh.formula_of(3, 2), Some("=A4*B4"));
     recalc_all_force(&mut wb);
     let sh = &wb.sheets[0];
     assert_eq!(sh.get(2, 2).map(|c| c.value.clone()), Some(Value::Number(20.0)));
@@ -282,21 +280,21 @@ fn converting_one_table_leaves_other_tables_structured_refs_untouched() {
     assert!(convert_table_to_range(&mut wb, "Sales"));
     let sh = &wb.sheets[0];
     assert_eq!(
-        sh.get(1, 5).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(1, 5),
         Some("=[@Amount]*2"),
         "转换 Sales 不能把 Other 内部的裸当前行改成 VALUE"
     );
     assert_eq!(
-        sh.get(2, 5).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(2, 5),
         Some("=SUM(Other[Amount])"),
         "转换 Sales 不能把 Other 的显式引用改成固定范围"
     );
     assert_eq!(
-        sh.get(4, 0).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(4, 0),
         Some(r#"="Sales[Amount]""#),
         "字符串里的目标表名不能改"
     );
-    let target = sh.get(3, 0).and_then(|c| c.formula.as_deref()).unwrap();
+    let target = sh.formula_of(3, 0).unwrap();
     assert!(!target.contains("Sales["), "目标表显式引用应展开：{target}");
     recalc_all_force(&mut wb);
     let sh = &wb.sheets[0];
@@ -358,16 +356,16 @@ fn rename_table_column_does_not_panic_on_chinese_formula_slices() {
         Some(Value::Text("含税金额".into()))
     );
     assert_eq!(
-        sh.get(1, 2).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(1, 2),
         Some("=[@含税金额]*[@税率]")
     );
     assert_eq!(
-        sh.get(2, 3).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(2, 3),
         Some("=SUM(金额)"),
         "无关中文公式必须原样保留"
     );
     assert_eq!(
-        sh.get(3, 3).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(3, 3),
         Some(r#"="金额""#)
     );
 }

@@ -766,7 +766,7 @@ pub fn rename_table_column(
         }
     }
     if let Some(hr) = header_row {
-        let old_cell = wb.sheets[si].get(hr, header_col).cloned();
+        let old_cell = wb.sheets[si].get(hr, header_col).map(|c| c.into_owned());
         let mut cell = old_cell.unwrap_or_default();
         cell.value = crate::model::Value::Text(new.into());
         cell.formula = None;
@@ -968,7 +968,7 @@ pub fn fill_calculated_column(
         return 0;
     }
     let Some((src_row, src_formula)) = (data_start..=data_end).find_map(|r| {
-        let f = sheet.get(r, col)?.formula.as_deref()?;
+        let f = sheet.formula_of(r, col)?;
         Some((r, f.to_string()))
     }) else {
         return 0;

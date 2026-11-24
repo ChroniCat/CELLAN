@@ -696,12 +696,14 @@ impl<'a> CompiledFilter<'a> {
             return false;
         }
         for a in &self.allows {
-            if !a.matches_cell(sheet.get(r, a.col)) {
+            let cell = sheet.get(r, a.col);
+            if !a.matches_cell(cell.as_deref()) {
                 return true;
             }
         }
         for c in &self.criteria {
-            if !c.matches_cell(sheet.get(r, c.col)) {
+            let cell = sheet.get(r, c.col);
+            if !c.matches_cell(cell.as_deref()) {
                 return true;
             }
         }

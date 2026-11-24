@@ -746,7 +746,7 @@ impl SheetApp {
             let mut row_txt = Vec::new();
             let mut row_cells = Vec::new();
             for c in c1..=c2 {
-                let cell = sh.get(r, c).cloned().unwrap_or_default();
+                let cell = sh.get(r, c).map(|c| c.into_owned()).unwrap_or_default();
                 let sid = sh.style_of(r, c);
                 let fmt = &self.wb.styles.get(sid).format;
                 let s = sheetcore::style::format_value_in(self.wb.date_system, &cell.value, fmt);
@@ -942,7 +942,7 @@ impl SheetApp {
             .iter()
             .map(|&(rr, cc)| {
                 let sh = self.wb.sheet(si);
-                (rr, cc, sh.get(rr, cc).cloned(), sh.style_of(rr, cc))
+                (rr, cc, sh.get(rr, cc).map(|c| c.into_owned()), sh.style_of(rr, cc))
             })
             .collect();
         let txn = self.txn_begin(&keys);
@@ -954,7 +954,7 @@ impl SheetApp {
                 let src_style = self.wb.styles.get(*sid).clone();
                 let dst_sid = self.wb.sheet(si).style_of(r, c);
                 let dst_style = self.wb.styles.get(dst_sid).clone();
-                let mut cell = self.wb.sheet(si).get(r, c).cloned().unwrap_or_default();
+                let mut cell = self.wb.sheet(si).get(r, c).map(|c| c.into_owned()).unwrap_or_default();
                 let mut write_cell = false;
                 let mut new_style_id: Option<u16> = None;
 
@@ -1268,7 +1268,7 @@ impl SheetApp {
         let txn = self.txn_begin(&keys);
         let mut touched = Vec::new();
         for c in c1..=c2 {
-            let src = self.wb.sheet(self.sheet_idx).get(r2, c).cloned();
+            let src = self.wb.sheet(self.sheet_idx).get(r2, c).map(|c| c.into_owned());
             let sid = self.wb.sheet(self.sheet_idx).style_of(r2, c);
             for r in r1..r2 {
                 if let Some(ref s) = src {
@@ -1318,7 +1318,7 @@ impl SheetApp {
         let txn = self.txn_begin(&keys);
         let mut touched = Vec::new();
         for r in r1..=r2 {
-            let src = self.wb.sheet(self.sheet_idx).get(r, c2).cloned();
+            let src = self.wb.sheet(self.sheet_idx).get(r, c2).map(|c| c.into_owned());
             let sid = self.wb.sheet(self.sheet_idx).style_of(r, c2);
             for c in c1..c2 {
                 if let Some(ref s) = src {

@@ -115,13 +115,13 @@ fn on_sheet(shift: &Shift, sheet: &Sheet) -> Shift {
     }
 }
 
-fn same_mapped(source: &Cell, desired: &Cell, shift: &Shift) -> bool {
-    let equal = match (&source.value, &desired.value) {
-        (Value::Number(a), Value::Number(b)) => a.to_bits() == b.to_bits(),
-        (a, b) => a == b,
-    };
-    equal
-        && match (source.formula.as_deref(), desired.formula.as_deref()) {
+fn same_mapped_view(
+    source: crate::store::CellView<'_>,
+    desired: crate::store::CellView<'_>,
+    shift: &Shift,
+) -> bool {
+    source.same_stored_value(&desired)
+        && match (source.formula(), desired.formula()) {
             (Some(a), Some(b)) => crate::refs::rewrite(a, shift) == b,
             (None, None) => true,
             _ => false,
@@ -152,39 +152,88 @@ fn push_hash_bytes(hash: &mut Sha256, buf: &mut [u8; 4096], pos: &mut usize, byt
     *pos += bytes.len();
 }
 
-fn hash_slab_cell(hash: &mut Sha256, buf: &mut [u8; 4096], pos: &mut usize, r_off: u16, cell: &Cell) {
+fn hash_slab_value(hash: &mut Sha256, buf: &mut [u8; 4096], pos: &mut usize, r_off: u16, value: &Value) {
     push_hash_bytes(hash, buf, pos, &r_off.to_le_bytes());
-    if let Some(f) = cell.formula.as_deref() {
-        push_hash_bytes(hash, buf, pos, &[0]);
-        push_hash_bytes(hash, buf, pos, &(f.len() as u64).to_le_bytes());
-        push_hash_bytes(hash, buf, pos, f.as_bytes());
-    } else {
-        match &cell.value {
-            Value::Number(n) => {
-                push_hash_bytes(hash, buf, pos, &[1]);
-                push_hash_bytes(hash, buf, pos, &n.to_bits().to_le_bytes());
+    match value {
+        Value::Number(n) => {
+            push_hash_bytes(hash, buf, pos, &[1]);
+            push_hash_bytes(hash, buf, pos, &n.to_bits().to_le_bytes());
+        }
+        Value::Text(t) => {
+            push_hash_bytes(hash, buf, pos, &[2]);
+            push_hash_bytes(hash, buf, pos, &(t.len() as u64).to_le_bytes());
+            push_hash_bytes(hash, buf, pos, t.as_bytes());
+        }
+        Value::Bool(b) => push_hash_bytes(hash, buf, pos, &[3, *b as u8]),
+        Value::Error(e) => push_hash_bytes(hash, buf, pos, &[4, *e as u8]),
+        Value::Empty => push_hash_bytes(hash, buf, pos, &[5]),
+    }
+}
+
+fn hash_slab_view(
+    hash: &mut Sha256,
+    buf: &mut [u8; 4096],
+    pos: &mut usize,
+    r_off: u16,
+    view: crate::store::CellView<'_>,
+) {
+    match view {
+        crate::store::CellView::Number(n) => {
+            push_hash_bytes(hash, buf, pos, &r_off.to_le_bytes());
+            push_hash_bytes(hash, buf, pos, &[1]);
+            push_hash_bytes(hash, buf, pos, &n.to_bits().to_le_bytes());
+        }
+        crate::store::CellView::Value(v) => hash_slab_value(hash, buf, pos, r_off, v),
+        crate::store::CellView::Cell(cell) => {
+            if let Some(f) = cell.formula.as_deref() {
+                push_hash_bytes(hash, buf, pos, &r_off.to_le_bytes());
+                push_hash_bytes(hash, buf, pos, &[0]);
+                push_hash_bytes(hash, buf, pos, &(f.len() as u64).to_le_bytes());
+                push_hash_bytes(hash, buf, pos, f.as_bytes());
+            } else {
+                hash_slab_value(hash, buf, pos, r_off, &cell.value);
             }
-            Value::Text(t) => {
-                push_hash_bytes(hash, buf, pos, &[2]);
-                push_hash_bytes(hash, buf, pos, &(t.len() as u64).to_le_bytes());
-                push_hash_bytes(hash, buf, pos, t.as_bytes());
-            }
-            Value::Bool(b) => push_hash_bytes(hash, buf, pos, &[3, *b as u8]),
-            Value::Error(e) => push_hash_bytes(hash, buf, pos, &[4, *e as u8]),
-            Value::Empty => push_hash_bytes(hash, buf, pos, &[5]),
         }
     }
 }
 
-fn compute_slab_digest_unfiltered(slab: &[Cell]) -> Option<[u8; 32]> {
+fn compute_slab_digest_unfiltered(slab: &crate::store::ColSlab) -> Option<[u8; 32]> {
     let mut hash = Sha256::new();
     let mut buf = [0u8; 4096];
     let mut pos = 0usize;
     let mut any = false;
-    for (r_off, cell) in slab.iter().enumerate() {
-        if !cell.is_blank() {
-            any = true;
-            hash_slab_cell(&mut hash, &mut buf, &mut pos, r_off as u16, cell);
+    match slab {
+        crate::store::ColSlab::Numbers(ns) => {
+            for (r_off, &n) in ns.values.iter().enumerate() {
+                if (ns.present[r_off / 64] & (1u64 << (r_off % 64))) != 0 {
+                    any = true;
+                    push_hash_bytes(&mut hash, &mut buf, &mut pos, &(r_off as u16).to_le_bytes());
+                    push_hash_bytes(&mut hash, &mut buf, &mut pos, &[1]);
+                    push_hash_bytes(&mut hash, &mut buf, &mut pos, &n.to_bits().to_le_bytes());
+                }
+            }
+        }
+        crate::store::ColSlab::Values(vs) => {
+            for (r_off, v) in vs.iter().enumerate() {
+                if !v.is_empty() {
+                    any = true;
+                    hash_slab_value(&mut hash, &mut buf, &mut pos, r_off as u16, v);
+                }
+            }
+        }
+        crate::store::ColSlab::Mixed(cs) => {
+            for (r_off, cell) in cs.iter().enumerate() {
+                if !cell.is_blank() {
+                    any = true;
+                    hash_slab_view(
+                        &mut hash,
+                        &mut buf,
+                        &mut pos,
+                        r_off as u16,
+                        crate::store::CellView::Cell(cell),
+                    );
+                }
+            }
         }
     }
     if !any {
@@ -210,21 +259,18 @@ fn input_digest_with_cache(
     let mut top_pos = 0usize;
     for (pi, page) in sheet.cells().iter_pages() {
         let base = pi * crate::store::PAGE_ROWS;
-        for col in page.iter_nonempty_cols(0, u32::MAX) {
-            let Some(slab_arc) = page.cols.get(col as usize).and_then(Option::as_ref) else {
-                continue;
-            };
+        for (col, slab_arc) in page.cols.iter_entries() {
             let slab_digest = if excluded_slabs.contains(&(pi, col)) {
                 let mut h = Sha256::new();
                 let mut buf = [0u8; 4096];
                 let mut pos = 0usize;
                 let mut any = false;
-                for (r_off, cell) in slab_arc.iter().enumerate() {
-                    if !cell.is_blank() {
+                for r_off in 0..slab_arc.len() {
+                    if let Some(view) = slab_arc.get_view(r_off as u32) {
                         let k = CellRef::new(base + r_off as u32, col);
                         if !sheet.spilled.contains(&k) && !legacy.contains_key(&k) {
                             any = true;
-                            hash_slab_cell(&mut h, &mut buf, &mut pos, r_off as u16, cell);
+                            hash_slab_view(&mut h, &mut buf, &mut pos, r_off as u16, view);
                         }
                     }
                 }
@@ -294,11 +340,11 @@ impl CellHistory {
             if !desired.spill_shapes.contains_key(&anchor) {
                 legacy.extend(
                     desired
-                        .iter_rect(rect)
+                        .iter_rect_views(rect)
                         .filter(|(k, c)| {
-                            *k != anchor && c.formula.is_none() && !desired.spilled.contains(k)
+                            *k != anchor && !c.has_formula() && !desired.spilled.contains(k)
                         })
-                        .map(|(k, c)| (k, c.clone())),
+                        .map(|(k, c)| (k, c.to_cell())),
                 );
             }
         }
@@ -344,15 +390,11 @@ impl CellHistory {
                         let tz = bits.trailing_zeros();
                         bits &= bits - 1;
                         let ro = w as u32 * 64 + tz;
-                        let r_idx = ro as usize;
-                        for col in page.iter_nonempty_cols(0, u32::MAX) {
-                            let Some(cell) = page
-                                .cols
-                                .get(col as usize)
-                                .and_then(Option::as_ref)
-                                .and_then(|s| s.get(r_idx))
-                                .filter(|c| !c.is_blank())
-                            else {
+                        for (col, slab) in page.cols.iter_entries() {
+                            let crate::store::ColSlab::Mixed(cs) = slab.as_ref() else {
+                                continue;
+                            };
+                            let Some(cell) = cs.get(ro as usize).filter(|c| !c.is_blank()) else {
                                 continue;
                             };
                             if let Some(f_desired) = cell.formula.as_deref() {
@@ -372,9 +414,9 @@ impl CellHistory {
             let other_cells = other.cells();
             let mut cached_other_page: Option<(u32, Option<&std::sync::Arc<crate::store::Page>>)> =
                 None;
-            let mut get_other = |r: u32, c: u32| -> Option<&Cell> {
+            let mut get_other = |r: u32, c: u32| -> Option<crate::store::CellView<'_>> {
                 let opi = r / crate::store::PAGE_ROWS;
-                let oro = (r % crate::store::PAGE_ROWS) as usize;
+                let oro = r % crate::store::PAGE_ROWS;
                 let opage = match cached_other_page {
                     Some((p, page_ref)) if p == opi => page_ref,
                     _ => {
@@ -383,12 +425,7 @@ impl CellHistory {
                         p_ref
                     }
                 }?;
-                opage
-                    .cols
-                    .get(c as usize)?
-                    .as_ref()?
-                    .get(oro)
-                    .filter(|cell| !cell.is_blank())
+                opage.get_view(oro, c)
             };
 
             for w in 0..4usize {
@@ -397,32 +434,25 @@ impl CellHistory {
                     let tz = bits.trailing_zeros();
                     bits &= bits - 1;
                     let ro = w as u32 * 64 + tz;
-                    let r_idx = ro as usize;
                     let row = base + ro;
-                    for col in page.iter_nonempty_cols(0, u32::MAX) {
-                        let Some(cell) = page
-                            .cols
-                            .get(col as usize)
-                            .and_then(Option::as_ref)
-                            .and_then(|s| s.get(r_idx))
-                            .filter(|c| !c.is_blank())
-                        else {
+                    for (col, slab) in page.cols.iter_entries() {
+                        let Some(cell) = slab.get_view(ro) else {
                             continue;
                         };
                         let key = CellRef::new(row, col);
                         let spill =
                             !desired.spilled.is_empty() && desired.spilled.contains(&key);
-                        if cell.formula.is_some() {
-                            formula_values.push(formula_index, &cell.value);
+                        if cell.has_formula() {
+                            formula_values.push(formula_index, cell.value().as_ref());
                             formula_index += 1;
                         }
                         let origin = map(key, &inverse);
                         let prior = origin.and_then(|pos| get_other(pos.row, pos.col));
                         let invertible = origin
                             .is_some_and(|pos| other.spilled.is_empty() || !other.spilled.contains(&pos))
-                            && prior.is_some_and(|c| same_mapped(c, cell, &incoming));
+                            && prior.is_some_and(|c| same_mapped_view(c, cell, &incoming));
                         if spill || !invertible {
-                            exceptions.push((key, cell.clone()));
+                            exceptions.push((key, cell.to_cell()));
                         }
                         if !spill && let Some(dest) = map(key, toward_other) {
                             let absent = if Some(dest) == origin {
@@ -456,7 +486,8 @@ impl CellHistory {
         }
         input_digest(live, &self.legacy) == self.hash
             && self.legacy.iter().all(|(k, old)| {
-                live.spilled.contains(k) || super::same_input(live.get(k.row, k.col), Some(old))
+                live.spilled.contains(k)
+                    || super::same_input(live.get(k.row, k.col).as_deref(), Some(old))
             })
     }
 

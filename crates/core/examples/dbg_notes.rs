@@ -1,19 +1,22 @@
 fn main() {
-    use umya_spreadsheet::{reader::xlsx::read, writer::xlsx::write};
+    use sheetcore::{model::CellRef, notes::Note, xlsx};
     let p = std::path::Path::new("F:/Finance/work/notes.xlsx");
-    let mut book = read(p).unwrap();
-    let ws = book.get_sheet_by_name_mut("批注").unwrap();
-    println!("原有批注: {}", ws.get_comments().len());
-    for c in ws.get_comments() {
-        println!("  {:?} {}: {:?}", c.get_coordinate(), c.get_author(), c.get_text().get_text());
+    let mut wb = xlsx::load(p).unwrap();
+    let ws = wb.sheets.iter_mut().find(|s| s.name == "批注").unwrap();
+    println!("原有批注: {}", ws.notes.len());
+    for (pos, n) in &ws.notes {
+        println!("  ({},{}) {}: {:?}", pos.row, pos.col, n.author, n.text);
     }
-    let mut nc = umya_spreadsheet::Comment::default();
-    let mut coord = umya_spreadsheet::Coordinate::default();
-    coord.set_coordinate("C5");
-    *nc.coordinate_mut() = coord;
-    nc.set_author("Hermes");
-    nc.set_text_string("新加批注");
-    ws.add_comments(nc);
-    write(&book, std::path::Path::new("F:/Finance/work/notes_out.xlsx")).unwrap();
+    ws.notes.insert(
+        CellRef::new(4, 2),
+        Note {
+            r: 4,
+            c: 2,
+            author: "Hermes".into(),
+            text: "新加批注".into(),
+        },
+    );
+    ws.notes_dirty = true;
+    xlsx::save_atomic(std::path::Path::new("F:/Finance/work/notes_out.xlsx"), &wb).unwrap();
     println!("已保存");
 }

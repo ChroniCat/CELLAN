@@ -25,7 +25,9 @@ pub fn norm(name: &str) -> String {
 /// 其余字体用英文名去 Fonts 目录找同名 .ttf/.ttc。
 fn file_candidates(name: &str) -> Vec<&'static str> {
     match norm(name).as_str() {
-        "宋体" | "simsun" | "新宋体" | "nsimsun" => vec!["simsun.ttc"],
+        "宋体" | "simsun" | "新宋体" | "nsimsun" | "思源宋体" | "notoserifsc" | "sourcehanserifsc" => {
+            vec!["simsun.ttc", "simsunb.ttf"]
+        }
         "微软雅黑" | "microsoftyahei" | "microsoftyaheiui" => vec!["msyh.ttc", "msyhbd.ttc"],
         "黑体" | "simhei" => vec!["simhei.ttf"],
         "楷体" | "楷体_gb2312" | "kaiti" => vec!["simkai.ttf"],
@@ -65,9 +67,96 @@ fn bold_file_candidates(name: &str) -> Vec<&'static str> {
     }
 }
 
-fn fonts_dir() -> std::path::PathBuf {
-    let win = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-    std::path::PathBuf::from(win).join("Fonts")
+fn fonts_dir() -> &'static std::path::Path {
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let win = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+        std::path::PathBuf::from(win).join("Fonts")
+    })
+    .as_path()
+}
+
+/// Windows 只读零拷贝映射系统字体（`CreateFileW` + `CreateFileMappingW` + `MapViewOfFile`），
+/// 避免把 39.5 MB 的 `msyh.ttc`/`msyhbd.ttc` 全量读进进程堆内存；映射视图在关闭文件与映射句柄后仍由内核保持有效。
+#[cfg(windows)]
+fn map_file_readonly(path: &std::path::Path) -> Option<&'static [u8]> {
+    use std::os::windows::ffi::OsStrExt;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+    const PAGE_READONLY: u32 = 0x02;
+    const FILE_MAP_READ: u32 = 0x0004;
+    const INVALID_HANDLE_VALUE: *mut core::ffi::c_void = (-1isize) as *mut core::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *const core::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn GetFileSizeEx(h_file: *mut core::ffi::c_void, lp_file_size: *mut i64) -> i32;
+        fn CreateFileMappingW(
+            h_file: *mut core::ffi::c_void,
+            lp_file_mapping_attributes: *const core::ffi::c_void,
+            fl_protect: u32,
+            dw_maximum_size_high: u32,
+            dw_maximum_size_low: u32,
+            lp_name: *const u16,
+        ) -> *mut core::ffi::c_void;
+        fn MapViewOfFile(
+            h_file_mapping_object: *mut core::ffi::c_void,
+            dw_desired_access: u32,
+            dw_file_offset_high: u32,
+            dw_file_offset_low: u32,
+            dw_number_of_bytes_to_map: usize,
+        ) -> *const u8;
+        fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let hfile = CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_ALL,
+            core::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            core::ptr::null_mut(),
+        );
+        if hfile.is_null() || hfile == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut size: i64 = 0;
+        if GetFileSizeEx(hfile, &mut size) == 0 || size <= 0 || (size as u64) > (isize::MAX as u64)
+        {
+            CloseHandle(hfile);
+            return None;
+        }
+        let hmap = CreateFileMappingW(hfile, core::ptr::null(), PAGE_READONLY, 0, 0, core::ptr::null());
+        if hmap.is_null() {
+            CloseHandle(hfile);
+            return None;
+        }
+        let ptr = MapViewOfFile(hmap, FILE_MAP_READ, 0, 0, size as usize);
+        // 内核对已映射视图保持引用计数，关闭句柄不影响只读视图生命周期。
+        CloseHandle(hmap);
+        CloseHandle(hfile);
+        if ptr.is_null() {
+            return None;
+        }
+        Some(core::slice::from_raw_parts(ptr, size as usize))
+    }
 }
 
 /// 在 TTC/TTF 里按 family 名找 face；找不到返回 0 号 face。
@@ -93,17 +182,117 @@ fn face_index(data: &[u8], want: &str) -> Option<u32> {
 }
 
 // epaint retains borrowed bytes for the lifetime of its font faces. Cache by
-// filename so aliases, TTC faces and the UI fallback all share one allocation.
+// filename so aliases, TTC faces and the UI fallback all share one mapping/allocation.
 pub(super) fn file_bytes(file: &'static str) -> Option<&'static [u8]> {
     static FILES: OnceLock<Mutex<HashMap<&'static str, &'static [u8]>>> = OnceLock::new();
-    let mut files = FILES.get_or_init(Default::default).lock().ok()?;
-    if let Some(&bytes) = files.get(file) {
-        return Some(bytes);
+    let table = FILES.get_or_init(Default::default);
+    if let Ok(files) = table.lock() {
+        if let Some(&bytes) = files.get(file) {
+            return Some(bytes);
+        }
     }
-    let bytes = std::fs::read(fonts_dir().join(file)).ok()?;
-    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-    files.insert(file, bytes);
+    let path = fonts_dir().join(file);
+    #[cfg(windows)]
+    let mapped = map_file_readonly(&path);
+    #[cfg(not(windows))]
+    let mapped: Option<&'static [u8]> = None;
+
+    let bytes: &'static [u8] = match mapped {
+        Some(s) => s,
+        None => {
+            let raw = std::fs::read(&path).ok()?;
+            Box::leak(raw.into_boxed_slice())
+        }
+    };
+    if let Ok(mut files) = table.lock() {
+        if let Some(&existing) = files.get(file) {
+            return Some(existing);
+        }
+        files.insert(file, bytes);
+    }
     Some(bytes)
+}
+
+/// Windows 原生中文字体（`msyh.ttc` / `msyhbd.ttc`）与系统衬线字体（`simsun.ttc` / `simsunb.ttf` / `georgia.ttf` / `georgiab.ttf`）
+/// 的只读零拷贝 `MapViewOfFile` 映射与 face 校验结果，供首帧后由后台线程异步准备，
+/// 避免冷启动阻塞大体积 CJK 字体加载与解析。
+pub(crate) struct UiCjkFonts {
+    pub msyh_ui: Option<std::sync::Arc<FontData>>,
+    pub msyh_ui_b: Option<std::sync::Arc<FontData>>,
+    pub serif_cjk: Option<std::sync::Arc<FontData>>,
+    pub serif_latin: Option<std::sync::Arc<FontData>>,
+    pub serif_latin_b: Option<std::sync::Arc<FontData>>,
+}
+
+impl UiCjkFonts {
+    pub(crate) fn has_any(&self) -> bool {
+        self.msyh_ui.is_some()
+            || self.msyh_ui_b.is_some()
+            || self.serif_cjk.is_some()
+            || self.serif_latin.is_some()
+            || self.serif_latin_b.is_some()
+    }
+}
+
+static UI_CJK_FONTS: OnceLock<UiCjkFonts> = OnceLock::new();
+static UI_CJK_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn load_ttf_face(file: &'static str, idx: u32) -> Option<std::sync::Arc<FontData>> {
+    let bytes = file_bytes(file)?;
+    let n = ttf_parser::fonts_in_collection(bytes).unwrap_or(1);
+    let index = if idx < n { idx } else { 0 };
+    ttf_parser::Face::parse(bytes, index).ok()?;
+    Some(std::sync::Arc::new(FontData {
+        font: std::borrow::Cow::Borrowed(bytes),
+        index,
+        tweak: Default::default(),
+    }))
+}
+
+pub(crate) fn ui_cjk_cached() -> Option<&'static UiCjkFonts> {
+    UI_CJK_FONTS.get()
+}
+
+pub(crate) fn load_ui_cjk_sync() -> &'static UiCjkFonts {
+    UI_CJK_FONTS.get_or_init(|| UiCjkFonts {
+        // msyh.ttc / msyhbd.ttc 的 1 号 face 是专门优化过 UI 行高与字面的 Microsoft YaHei UI / Bold
+        msyh_ui: load_ttf_face("msyh.ttc", 1),
+        msyh_ui_b: load_ttf_face("msyhbd.ttc", 1),
+        // 系统宋体优先 simsun.ttc（0 号 face 为 SimSun），缺失时降级 simsunb.ttf
+        serif_cjk: load_ttf_face("simsun.ttc", 0).or_else(|| load_ttf_face("simsunb.ttf", 0)),
+        // 西文衬线与真粗体（无宋体环境及粗体衬线拉丁字形用）
+        serif_latin: load_ttf_face("georgia.ttf", 0),
+        serif_latin_b: load_ttf_face("georgiab.ttf", 0),
+    })
+}
+
+pub(crate) fn request_ui_cjk_async(ctx: &egui::Context) {
+    if UI_CJK_FONTS.get().is_some() {
+        return;
+    }
+    if UI_CJK_STARTED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let wake = ctx.clone();
+    std::thread::spawn(move || {
+        let loaded = load_ui_cjk_sync();
+        if loaded.has_any() {
+            READY_TO_INSTALL.store(true, std::sync::atomic::Ordering::Release);
+            wake.request_repaint();
+        }
+    });
+}
+
+pub(crate) fn bump_generation() {
+    ACTIVE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 pub fn load(name: &str) -> Option<(&'static [u8], u32)> {
@@ -229,7 +418,8 @@ pub fn begin_frame() {
 
 /// 返回是否新增了字体（调用方需要重设 FontDefinitions）。
 pub fn ensure(names: &[String]) -> bool {
-    if std::env::var("SC_FONT_LOG").is_ok() {
+    let log = crate::debug_flags::font_log();
+    if log {
         eprintln!("[fonts] ensure enter {} names", names.len());
     }
     // 先在锁外完成磁盘读取与 TTC face 解析，缩短全局字体表持锁时间
@@ -253,7 +443,7 @@ pub fn ensure(names: &[String]) -> bool {
             t.insert(key.clone());
         }
         if let Some((data, index)) = load(n) {
-            if std::env::var("SC_FONT_LOG").is_ok() {
+            if log {
                 eprintln!("[fonts] insert {} face {}", n, index);
             }
             let bold = load_bold(n).map(|(bd, bi)| Loaded { data: bd, index: bi });
@@ -285,17 +475,18 @@ pub fn ensure(names: &[String]) -> bool {
             }
         }
     }
-    if std::env::var("SC_FONT_LOG").is_ok() {
+    if log {
         eprintln!("[fonts] ensure changed={} size={}", changed, map.len());
     }
     changed
 }
 
 pub fn apply(fonts: &mut egui::FontDefinitions) {
+    let log = crate::debug_flags::font_log();
     let map = match loaded().lock() {
         Ok(m) => m,
         Err(e) => {
-            if std::env::var("SC_FONT_LOG").is_ok() {
+            if log {
                 eprintln!("[fonts] lock poisoned: {e}");
             }
             return;
@@ -307,7 +498,7 @@ pub fn apply(fonts: &mut egui::FontDefinitions) {
             key.clone(),
             FontData { font: std::borrow::Cow::Borrowed(f.data), index: f.index, tweak: Default::default() }.into(),
         );
-        if std::env::var("SC_FONT_LOG").is_ok() {
+        if log {
             eprintln!("[fonts] apply {:?} index={}", key, f.index);
         }
         let mut chain = vec![key.clone()];
@@ -396,5 +587,18 @@ mod tests {
             fam.iter().any(|k| k == "noto-sans"),
             "西文系统字体族必须串接中文回退字库以防保存重开后汉字变成问号，实际: {fam:?}"
         );
+    }
+
+    #[test]
+    fn ui_cjk_sync_maps_system_serif_fonts() {
+        let cjk = load_ui_cjk_sync();
+        assert!(cjk.has_any());
+        #[cfg(windows)]
+        {
+            assert!(
+                cjk.serif_cjk.is_some() || cjk.serif_latin.is_some(),
+                "Windows 环境应能零拷贝映射系统宋体或 Georgia 衬线字体"
+            );
+        }
     }
 }

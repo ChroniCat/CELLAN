@@ -147,11 +147,8 @@ pub fn row_values(sheet: &Sheet, spec: &PivotSpec) -> Vec<String> {
     let (r1, _, r2, _) = spec.source;
     let mut labels = HashSet::new();
     for r in (r1 + 1)..=r2 {
-        let raw = sheet
-            .get(r, spec.row_field)
-            .map(|x| &x.value)
-            .unwrap_or(&Value::Empty);
-        let key = group_key(raw, &spec.group);
+        let raw = sheet.value_ref(r, spec.row_field);
+        let key = group_key(raw.as_ref(), &spec.group);
         if key.is_empty() {
             continue;
         }
@@ -259,14 +256,14 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
 
     for r in (r1 + 1)..=r2 {
         let raw = sheet.value_ref(r, spec.row_field);
-        let key = group_key(raw, &spec.group);
+        let key = group_key(raw.as_ref(), &spec.group);
         if key.is_empty() || excluded.contains(key.as_str()) {
             continue;
         }
         let ci = match spec.col_field {
             Some(cc) => {
                 let col_val = sheet.value_ref(r, cc);
-                if let Value::Text(t) = col_val
+                if let Value::Text(t) = col_val.as_ref()
                     && let Some(&idx) = col_map.get(t.as_ref())
                 {
                     idx
@@ -286,7 +283,7 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
             None => 0,
         };
         let v = sheet.value_ref(r, spec.value_field);
-        let (n, nonempty) = match v {
+        let (n, nonempty) = match v.as_ref() {
             Value::Number(n) => (Some(*n), true),
             Value::Empty => (None, false),
             Value::Text(t) => (t.trim().parse::<f64>().ok(), !t.is_empty()),

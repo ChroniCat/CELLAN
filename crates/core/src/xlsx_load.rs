@@ -6,7 +6,6 @@ use super::LoadDiag;
 use crate::model::{Cell, CellRef, Sheet, Value};
 use crate::richtext::RichRun;
 use anyhow::{Context, Result, ensure};
-use calamine::Reader as _;
 use quick_xml::{
     Reader,
     events::{BytesStart, Event},
@@ -15,10 +14,10 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fs::File,
-    io::{Cursor, Write},
+    io::Read,
     path::Path,
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU16, Ordering},
     },
 };
@@ -102,11 +101,1093 @@ fn hash_directory(file: &mut File, offset: u64) -> Result<[u8; 32]> {
     Ok(hash.finalize().into())
 }
 
+/// Default Office 2007 theme palette used by `calamine` when `xl/theme/theme1.xml` is absent,
+/// already ordered by Excel's `theme` attribute (0=lt1, 1=dk1, 2=lt2, 3=dk2, 4..11=accent/links).
+const CALAMINE_DEFAULT_THEME: [[u8; 3]; 12] = [
+    [255, 255, 255],
+    [0, 0, 0],
+    [238, 236, 225],
+    [31, 73, 125],
+    [79, 129, 189],
+    [192, 80, 77],
+    [155, 187, 89],
+    [128, 100, 162],
+    [75, 172, 198],
+    [247, 150, 70],
+    [0, 0, 255],
+    [128, 0, 128],
+];
+
+fn builtin_format_code_by_id(id: u32) -> Option<&'static str> {
+    match id {
+        0 => Some("General"),
+        1 => Some("0"),
+        2 => Some("0.00"),
+        3 => Some("#,##0"),
+        4 => Some("#,##0.00"),
+        9 => Some("0%"),
+        10 => Some("0.00%"),
+        11 => Some("0.00E+00"),
+        12 => Some("# ?/?"),
+        13 => Some("# ??/??"),
+        14 => Some("mm-dd-yy"),
+        15 => Some("d-mmm-yy"),
+        16 => Some("d-mmm"),
+        17 => Some("mmm-yy"),
+        18 => Some("h:mm AM/PM"),
+        19 => Some("h:mm:ss AM/PM"),
+        20 => Some("h:mm"),
+        21 => Some("h:mm:ss"),
+        22 => Some("m/d/yy h:mm"),
+        37 => Some("#,##0 ;(#,##0)"),
+        38 => Some("#,##0 ;[Red](#,##0)"),
+        39 => Some("#,##0.00;(#,##0.00)"),
+        40 => Some("#,##0.00;[Red](#,##0.00)"),
+        41 => Some("_(* #,##0_);_(* (#,##0);_(* \"-\"_);_(@_)"),
+        42 => Some("_($* #,##0_);_($* (#,##0);_($* \"-\"_);_(@_)"),
+        43 => Some("_(* #,##0.00_);_(* (#,##0.00);_(* \"-\"??_);_(@_)"),
+        44 => Some("_($* #,##0.00_);_($* (#,##0.00);_($* \"-\"??_);_(@_)"),
+        45 => Some("mm:ss"),
+        46 => Some("[h]:mm:ss"),
+        47 => Some("mmss.0"),
+        48 => Some("##0.0E+0"),
+        49 => Some("@"),
+        _ => None,
+    }
+}
+
+#[inline]
+fn local_attr_name(raw: &str) -> &str {
+    raw.rsplit_once(':').map_or(raw, |(_, l)| l)
+}
+
+#[inline]
+fn parse_ooxml_bool(val: &str) -> bool {
+    !matches!(val, "0" | "false")
+}
+
+#[inline]
+fn parse_hex_argb(s: &str) -> Option<(u8, [u8; 3])> {
+    let t = s.trim();
+    let t = t.strip_prefix('#').unwrap_or(t);
+    let pair = |off: usize| -> Option<u8> { u8::from_str_radix(t.get(off..off + 2)?, 16).ok() };
+    match t.len() {
+        6 => Some((255, [pair(0)?, pair(2)?, pair(4)?])),
+        8 => Some((pair(0)?, [pair(2)?, pair(4)?, pair(6)?])),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RawColor {
+    rgb: Option<(u8, [u8; 3])>,
+    theme: Option<u8>,
+    indexed: Option<u8>,
+    tint: f64,
+    has_tint: bool,
+}
+
+impl RawColor {
+    fn from_elem(e: &BytesStart<'_>) -> Self {
+        let mut c = Self::default();
+        for a in e.attributes().flatten() {
+            match local_attr_name(a.key.as_ref()) {
+                "rgb" => c.rgb = parse_hex_argb(&a.value),
+                "theme" => {
+                    if let Ok(n) = a.value.trim().parse::<u32>() {
+                        c.theme = Some(n.min(255) as u8);
+                    }
+                }
+                "indexed" => {
+                    if let Ok(n) = a.value.trim().parse::<u32>() {
+                        c.indexed = Some(n.min(255) as u8);
+                    }
+                }
+                "tint" => {
+                    if let Ok(f) = a.value.trim().parse::<f64>() {
+                        c.tint = f;
+                        c.has_tint = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        c
+    }
+
+    #[inline]
+    fn tint_f32(&self) -> f32 {
+        if self.has_tint { self.tint as f32 } else { 0.0 }
+    }
+
+    /// Resolve color using `calamine` priority (`rgb > theme > indexed`), preserving alpha.
+    fn resolve_calamine(&self, calamine_theme: &[[u8; 3]]) -> Option<(u8, [u8; 3])> {
+        let (alpha, base) = if let Some((a, rgb)) = self.rgb {
+            (a, rgb)
+        } else if let Some(t) = self.theme {
+            (255, calamine_theme.get(t as usize).copied().unwrap_or([0, 0, 0]))
+        } else if let Some(idx) = self.indexed {
+            let rgb = match idx {
+                0..=63 => crate::style_theme::DEFAULT_INDEXED_PALETTE[idx as usize],
+                64 => [0, 0, 0],
+                65 => [255, 255, 255],
+                _ => [0, 0, 0],
+            };
+            (255, rgb)
+        } else {
+            return None;
+        };
+        let rgb = if self.has_tint && self.tint != 0.0 {
+            crate::style_theme::tint_rgb(base, self.tint as f32)
+        } else {
+            base
+        };
+        Some((alpha, rgb))
+    }
+
+    /// Resolve color using `style_theme` priority (`theme > rgb > custom indexed < 64`).
+    fn resolve_theme(
+        &self,
+        palette: &[[u8; 3]],
+        indexed_palette: &[[u8; 3]; 64],
+    ) -> (Option<crate::style_theme::ThemeRef>, Option<[u8; 3]>) {
+        let tint = self.tint_f32();
+        let theme = self
+            .theme
+            .map(|idx| crate::style_theme::ThemeRef { idx, tint });
+        let rgb = if let Some(t) = theme {
+            palette
+                .get(crate::style_theme::scheme_index(t.idx))
+                .map(|base| crate::style_theme::tint_rgb(*base, t.tint))
+        } else if let Some((_, hex)) = self.rgb {
+            Some(crate::style_theme::tint_rgb(hex, tint))
+        } else if let Some(idx) = self.indexed {
+            if (idx as usize) < indexed_palette.len() {
+                Some(crate::style_theme::tint_rgb(
+                    indexed_palette[idx as usize],
+                    tint,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        (theme, rgb)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ParsedFont {
+    name: String,
+    size: f32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    double_underline: bool,
+    strikethrough: bool,
+    color: RawColor,
+    has_color: bool,
+}
+
+impl Default for ParsedFont {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            size: 11.0,
+            bold: false,
+            italic: false,
+            underline: false,
+            double_underline: false,
+            strikethrough: false,
+            color: RawColor::default(),
+            has_color: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ParsedFill {
+    pattern_type: String,
+    fg: RawColor,
+    has_fg: bool,
+    bg: RawColor,
+    has_bg: bool,
+}
+
+#[inline]
+fn is_calamine_fill_pattern(val: &str) -> bool {
+    matches!(
+        val,
+        "solid"
+            | "darkGray"
+            | "mediumGray"
+            | "lightGray"
+            | "gray125"
+            | "gray0625"
+            | "darkHorizontal"
+            | "darkVertical"
+            | "darkDown"
+            | "darkUp"
+            | "darkGrid"
+            | "darkTrellis"
+            | "lightHorizontal"
+            | "lightVertical"
+            | "lightDown"
+            | "lightUp"
+            | "lightGrid"
+            | "lightTrellis"
+    )
+}
+
+#[inline]
+fn parse_border_style_code(val: &str) -> u8 {
+    match val {
+        "thin" => 1,
+        "medium" => 2,
+        "thick" => 3,
+        "double" => 4,
+        "dashed" => 5,
+        "dotted" => 6,
+        "hair" => 7,
+        "dashDot" => 8,
+        "dashDotDot" => 9,
+        "mediumDashed" => 10,
+        "mediumDashDot" => 11,
+        "mediumDashDotDot" => 12,
+        "slantDashDot" => 13,
+        _ => 0,
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ParsedBorder {
+    sides: [(u8, RawColor, bool); 4],
+    diagonal: Option<crate::style_ext::DiagBorder>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParsedRawXf {
+    num_fmt_id: Option<u32>,
+    font_id: Option<u32>,
+    fill_id: Option<u32>,
+    border_id: Option<u32>,
+    quote_prefix: bool,
+    has_alignment: bool,
+    halign: u8,
+    valign: u8,
+    wrap: bool,
+    shrink_to_fit: bool,
+    indent: u8,
+    vertical_text: bool,
+    rotation: i16,
+    has_protection: bool,
+    locked: bool,
+    hidden: bool,
+}
+
+impl Default for ParsedRawXf {
+    fn default() -> Self {
+        Self {
+            num_fmt_id: None,
+            font_id: None,
+            fill_id: None,
+            border_id: None,
+            quote_prefix: false,
+            has_alignment: false,
+            halign: 0,
+            valign: 0,
+            wrap: false,
+            shrink_to_fit: false,
+            indent: 0,
+            vertical_text: false,
+            rotation: 0,
+            has_protection: false,
+            locked: true,
+            hidden: false,
+        }
+    }
+}
+
+/// Single-pass parsed representation of `xl/styles.xml` + `xl/theme/*.xml`.
+/// Replaces the 6-pass `calamine` fake-ZIP + `style_theme` + `style_ext` + `cf::dxfs` pipeline.
+#[derive(Clone, Debug)]
+pub(super) struct ParsedStylesBook {
+    theme_palette: Vec<[u8; 3]>,
+    calamine_theme: Vec<[u8; 3]>,
+    indexed_palette: [[u8; 3]; 64],
+    num_fmts: HashMap<u32, String>,
+    fonts: Vec<ParsedFont>,
+    fills: Vec<ParsedFill>,
+    borders: Vec<ParsedBorder>,
+    xfs: Vec<ParsedRawXf>,
+    pub dxfs: Vec<crate::cf::Dxf>,
+    pub dxf_ext: bool,
+}
+
+impl Default for ParsedStylesBook {
+    fn default() -> Self {
+        Self {
+            theme_palette: crate::style_theme::DEFAULT_THEME_PALETTE.to_vec(),
+            calamine_theme: CALAMINE_DEFAULT_THEME.to_vec(),
+            indexed_palette: crate::style_theme::DEFAULT_INDEXED_PALETTE,
+            num_fmts: HashMap::new(),
+            fonts: Vec::new(),
+            fills: Vec::new(),
+            borders: Vec::new(),
+            xfs: Vec::new(),
+            dxfs: Vec::new(),
+            dxf_ext: false,
+        }
+    }
+}
+
+impl ParsedStylesBook {
+    #[inline]
+    pub(super) fn xf_count(&self) -> usize {
+        self.xfs.len()
+    }
+
+    pub(super) fn resolve_xf(
+        &self,
+        index: usize,
+    ) -> (
+        crate::style::CellStyle,
+        crate::style_theme::XfTheme,
+        Option<crate::style_ext::FillPattern>,
+        bool,
+    ) {
+        let mut cs = crate::style::CellStyle {
+            size: 11.0,
+            color: [0, 0, 0],
+            ..Default::default()
+        };
+        let Some(xf) = self.xfs.get(index) else {
+            return (cs, crate::style_theme::XfTheme::default(), None, false);
+        };
+
+        let mut font_theme = None;
+        if let Some(f) = xf.font_id.and_then(|id| self.fonts.get(id as usize)) {
+            cs.bold = f.bold;
+            cs.italic = f.italic;
+            cs.underline = f.underline;
+            cs.double_underline = f.double_underline;
+            cs.strikethrough = f.strikethrough;
+            if !f.name.is_empty() {
+                cs.font.clone_from(&f.name);
+            }
+            cs.size = f.size;
+            if f.has_color {
+                if let Some((_, rgb)) = f.color.resolve_calamine(&self.calamine_theme) {
+                    cs.color = rgb;
+                }
+                let (t, rgb) = f
+                    .color
+                    .resolve_theme(&self.theme_palette, &self.indexed_palette);
+                font_theme = t;
+                if let Some(t) = t {
+                    if let Some(base) = self
+                        .theme_palette
+                        .get(crate::style_theme::scheme_index(t.idx))
+                    {
+                        cs.color = crate::style_theme::tint_rgb(*base, t.tint);
+                    }
+                } else if let Some(c) = rgb {
+                    cs.color = c;
+                }
+            }
+        }
+
+        let mut fill_theme = None;
+        let mut pattern = None;
+        if let Some(fl) = xf.fill_id.and_then(|id| self.fills.get(id as usize)) {
+            if !fl.pattern_type.is_empty() && fl.pattern_type != "none" {
+                pattern = Some(crate::style_ext::FillPattern {
+                    kind: fl.pattern_type.clone(),
+                    fg: fl.has_fg.then(|| fl.fg.rgb.map(|(_, c)| c)).flatten(),
+                    bg: fl.has_bg.then(|| fl.bg.rgb.map(|(_, c)| c)).flatten(),
+                    fg_theme: fl
+                        .has_fg
+                        .then(|| fl.fg.theme.map(|i| (i, fl.fg.tint_f32())))
+                        .flatten(),
+                    bg_theme: fl
+                        .has_bg
+                        .then(|| fl.bg.theme.map(|i| (i, fl.bg.tint_f32())))
+                        .flatten(),
+                    fg_indexed: fl.has_fg.then(|| fl.fg.indexed).flatten(),
+                    bg_indexed: fl.has_bg.then(|| fl.bg.indexed).flatten(),
+                });
+                if is_calamine_fill_pattern(&fl.pattern_type) && fl.has_fg {
+                    if let Some((a, rgb)) = fl.fg.resolve_calamine(&self.calamine_theme) {
+                        if !(rgb == [0, 0, 0] && a == 0) {
+                            cs.fill = Some(rgb);
+                        }
+                    }
+                }
+                let (fg_t, fg_rgb) = if fl.has_fg {
+                    fl.fg
+                        .resolve_theme(&self.theme_palette, &self.indexed_palette)
+                } else {
+                    (None, None)
+                };
+                let (chosen_t, chosen_rgb) = if fg_t.is_some() || fg_rgb.is_some() {
+                    (fg_t, fg_rgb)
+                } else if fl.has_bg {
+                    fl.bg
+                        .resolve_theme(&self.theme_palette, &self.indexed_palette)
+                } else {
+                    (None, None)
+                };
+                fill_theme = chosen_t;
+                if let Some(t) = chosen_t {
+                    if let Some(base) = self
+                        .theme_palette
+                        .get(crate::style_theme::scheme_index(t.idx))
+                    {
+                        cs.fill = Some(crate::style_theme::tint_rgb(*base, t.tint));
+                    }
+                } else if let Some(c) = chosen_rgb {
+                    cs.fill = Some(c);
+                }
+            }
+        }
+
+        if let Some(b) = xf.border_id.and_then(|id| self.borders.get(id as usize)) {
+            for i in 0..4 {
+                let (style_code, raw_col, has_col) = b.sides[i];
+                let color = if has_col {
+                    raw_col
+                        .resolve_calamine(&self.calamine_theme)
+                        .map_or([0, 0, 0], |(_, c)| c)
+                } else {
+                    [0, 0, 0]
+                };
+                cs.border[i] = crate::style::Border {
+                    style: style_code,
+                    color,
+                };
+            }
+            cs.diagonal.clone_from(&b.diagonal);
+        }
+
+        if xf.has_protection {
+            cs.locked = xf.locked;
+            cs.hidden = xf.hidden;
+        }
+
+        if xf.has_alignment {
+            cs.halign = xf.halign;
+            cs.valign = xf.valign;
+            cs.wrap = xf.wrap;
+            cs.shrink_to_fit = xf.shrink_to_fit;
+            cs.indent = xf.indent;
+            cs.vertical_text = xf.vertical_text;
+            cs.rotation = xf.rotation;
+        }
+
+        if let Some(id) = xf.num_fmt_id {
+            let code = self
+                .num_fmts
+                .get(&id)
+                .map(String::as_str)
+                .or_else(|| builtin_format_code_by_id(id));
+            if let Some(code) = code {
+                if !code.is_empty() && code != "General" {
+                    cs.format = code.to_owned();
+                }
+            }
+        }
+
+        (
+            cs,
+            crate::style_theme::XfTheme {
+                font: font_theme,
+                fill: fill_theme,
+            },
+            pattern,
+            xf.quote_prefix,
+        )
+    }
+
+    pub(super) fn parse_xml(styles_xml: &str, theme_xml: Option<&str>) -> Result<Self> {
+        let mut book = Self::default();
+        if let Some(txml) = theme_xml {
+            let pal = crate::style_theme::parse_palette(txml);
+            if !pal.is_empty() {
+                book.calamine_theme = (0..pal.len())
+                    .map(|i| {
+                        pal.get(crate::style_theme::scheme_index(i as u8))
+                            .copied()
+                            .unwrap_or([0, 0, 0])
+                    })
+                    .collect();
+                book.theme_palette = pal;
+            }
+        }
+        if styles_xml.is_empty() {
+            return Ok(book);
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Section {
+            None,
+            NumFmts,
+            Fonts,
+            Fills,
+            Borders,
+            CellXfs,
+            Dxfs,
+            Colors,
+            Other,
+        }
+
+        let mut reader = Reader::from_str(styles_xml);
+        let mut depth: usize = 0;
+        let mut section = Section::None;
+
+        let mut cur_font = ParsedFont::default();
+        let mut in_font = false;
+
+        let mut cur_fill = ParsedFill::default();
+        let mut in_fill = false;
+
+        let mut cur_border = ParsedBorder::default();
+        let mut in_border = false;
+        let mut cur_diag_up = false;
+        let mut cur_diag_down = false;
+        let mut cur_side: Option<usize> = None; // 0=L,1=R,2=T,3=B,4=diagonal
+        let mut cur_diag_style = String::new();
+        let mut cur_diag_color = RawColor::default();
+
+        let mut cur_xf = ParsedRawXf::default();
+        let mut in_xf = false;
+
+        let mut in_indexed_colors = false;
+        let mut indexed_slot: usize = 0;
+        let mut saw_dxf = false;
+        let mut dxfs_start: usize = 0;
+        let mut dxfs_end: usize = 0;
+
+        let parse_count = |e: &BytesStart<'_>| -> usize {
+            for a in e.attributes().flatten() {
+                if local_attr_name(a.key.as_ref()) == "count" {
+                    if let Ok(n) = a.value.trim().parse::<usize>() {
+                        return n.min(262_144);
+                    }
+                }
+            }
+            0
+        };
+
+        loop {
+            let ev_start = reader.buffer_position() as usize;
+            let ev = reader.read_event().context("xl/styles.xml 解析失败")?;
+            match &ev {
+                Event::Start(e) | Event::Empty(e) => {
+                    let is_empty = matches!(ev, Event::Empty(_));
+                    let raw_name = e.name();
+                    if !book.dxf_ext {
+                        let r = raw_name.as_ref();
+                        if r.eq_ignore_ascii_case("diagonal")
+                            || r.eq_ignore_ascii_case("vertical")
+                            || r.eq_ignore_ascii_case("horizontal")
+                            || r.eq_ignore_ascii_case("start")
+                            || r.eq_ignore_ascii_case("end")
+                            || r.eq_ignore_ascii_case("outline")
+                        {
+                            if e.attributes().flatten().any(|a| {
+                                a.key.as_ref() == "style"
+                                    && !a.value.is_empty()
+                                    && a.value.as_ref() != "none"
+                            }) {
+                                book.dxf_ext = true;
+                            }
+                        }
+                    }
+                    let tag = e.local_name();
+                    let lname = tag.as_ref();
+                    let level = depth;
+                    if !is_empty {
+                        depth += 1;
+                    }
+
+                    if level == 0 {
+                        continue;
+                    }
+                    if level == 1 {
+                        if !is_empty {
+                            section = match lname {
+                                "numFmts" => {
+                                    book.num_fmts.reserve(parse_count(e));
+                                    Section::NumFmts
+                                }
+                                "fonts" => {
+                                    book.fonts.reserve(parse_count(e));
+                                    Section::Fonts
+                                }
+                                "fills" => {
+                                    book.fills.reserve(parse_count(e));
+                                    Section::Fills
+                                }
+                                "borders" => {
+                                    book.borders.reserve(parse_count(e));
+                                    Section::Borders
+                                }
+                                "cellXfs" => {
+                                    book.xfs.reserve(parse_count(e));
+                                    Section::CellXfs
+                                }
+                                "dxfs" => {
+                                    dxfs_start = ev_start;
+                                    Section::Dxfs
+                                }
+                                "colors" => Section::Colors,
+                                _ => Section::Other,
+                            };
+                        }
+                        continue;
+                    }
+
+                    match section {
+                        Section::NumFmts if level == 2 && lname == "numFmt" => {
+                            let mut id: Option<u32> = None;
+                            let mut code: Option<String> = None;
+                            for a in e.attributes().flatten() {
+                                match local_attr_name(a.key.as_ref()) {
+                                    "numFmtId" => id = a.value.trim().parse::<u32>().ok(),
+                                    "formatCode" => code = Some(crate::model::xml_unescape(&a.value)),
+                                    _ => {}
+                                }
+                            }
+                            if let (Some(id), Some(code)) = (id, code) {
+                                book.num_fmts.insert(id, code);
+                            }
+                        }
+                        Section::Fonts => {
+                            if level == 2 && lname == "font" {
+                                cur_font = ParsedFont::default();
+                                if is_empty {
+                                    book.fonts.push(std::mem::take(&mut cur_font));
+                                } else {
+                                    in_font = true;
+                                }
+                            } else if in_font && level == 3 {
+                                match lname {
+                                    "name" => {
+                                        for a in e.attributes().flatten() {
+                                            if local_attr_name(a.key.as_ref()) == "val" {
+                                                let decoded = crate::model::xml_unescape(&a.value);
+                                                cur_font.name = crate::style::normalize_font(&decoded);
+                                            }
+                                        }
+                                    }
+                                    "sz" => {
+                                        for a in e.attributes().flatten() {
+                                            if local_attr_name(a.key.as_ref()) == "val" {
+                                                if let Ok(sz) = a.value.trim().parse::<f64>() {
+                                                    cur_font.size = sz as f32;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    "b" => {
+                                        let mut val = None;
+                                        for a in e.attributes().flatten() {
+                                            if local_attr_name(a.key.as_ref()) == "val" {
+                                                val = Some(a.value);
+                                            }
+                                        }
+                                        cur_font.bold = match val.as_deref() {
+                                            None => true,
+                                            Some("bold" | "700" | "1" | "true") => true,
+                                            Some("normal" | "400" | "0" | "false") => false,
+                                            Some(v) => v.parse::<u16>().is_ok_and(|w| w >= 600),
+                                        };
+                                    }
+                                    "i" => {
+                                        let mut val = None;
+                                        for a in e.attributes().flatten() {
+                                            if local_attr_name(a.key.as_ref()) == "val" {
+                                                val = Some(a.value);
+                                            }
+                                        }
+                                        cur_font.italic = match val.as_deref() {
+                                            None => true,
+                                            Some("italic" | "oblique" | "1" | "true") => true,
+                                            _ => false,
+                                        };
+                                    }
+                                    "u" => {
+                                        let mut val = None;
+                                        for a in e.attributes().flatten() {
+                                            if local_attr_name(a.key.as_ref()) == "val" {
+                                                val = Some(a.value);
+                                            }
+                                        }
+                                        match val.as_deref() {
+                                            None | Some("single" | "singleAccounting" | "doubleAccounting") => {
+                                                cur_font.underline = true;
+                                                cur_font.double_underline = false;
+                                            }
+                                            Some("double") => {
+                                                cur_font.underline = true;
+                                                cur_font.double_underline = true;
+                                            }
+                                            _ => {
+                                                cur_font.underline = false;
+                                                cur_font.double_underline = false;
+                                            }
+                                        }
+                                    }
+                                    "strike" => {
+                                        let mut val = None;
+                                        for a in e.attributes().flatten() {
+                                            if local_attr_name(a.key.as_ref()) == "val" {
+                                                val = Some(a.value);
+                                            }
+                                        }
+                                        cur_font.strikethrough =
+                                            val.as_deref().map_or(true, parse_ooxml_bool);
+                                    }
+                                    "color" => {
+                                        cur_font.color = RawColor::from_elem(e);
+                                        cur_font.has_color = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Section::Fills => {
+                            if level == 2 && lname == "fill" {
+                                cur_fill = ParsedFill::default();
+                                if is_empty {
+                                    book.fills.push(std::mem::take(&mut cur_fill));
+                                } else {
+                                    in_fill = true;
+                                }
+                            } else if in_fill {
+                                match lname {
+                                    "patternFill" => {
+                                        for a in e.attributes().flatten() {
+                                            if local_attr_name(a.key.as_ref()) == "patternType" {
+                                                cur_fill.pattern_type = a.value.into_owned();
+                                            }
+                                        }
+                                    }
+                                    "fgColor" => {
+                                        cur_fill.fg = RawColor::from_elem(e);
+                                        cur_fill.has_fg = true;
+                                    }
+                                    "bgColor" => {
+                                        cur_fill.bg = RawColor::from_elem(e);
+                                        cur_fill.has_bg = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Section::Borders => {
+                            if level == 2 && lname == "border" {
+                                cur_border = ParsedBorder::default();
+                                cur_diag_up = false;
+                                cur_diag_down = false;
+                                cur_side = None;
+                                for a in e.attributes().flatten() {
+                                    match local_attr_name(a.key.as_ref()) {
+                                        "diagonalUp" => cur_diag_up = a.value == "1" || a.value == "true",
+                                        "diagonalDown" => cur_diag_down = a.value == "1" || a.value == "true",
+                                        _ => {}
+                                    }
+                                }
+                                if is_empty {
+                                    book.borders.push(std::mem::take(&mut cur_border));
+                                } else {
+                                    in_border = true;
+                                }
+                            } else if in_border && level == 3 {
+                                let side_idx = match lname {
+                                    "left" => Some(0),
+                                    "right" => Some(1),
+                                    "top" => Some(2),
+                                    "bottom" => Some(3),
+                                    "diagonal" => Some(4),
+                                    _ => None,
+                                };
+                                if let Some(s) = side_idx {
+                                    let mut style_attr = None;
+                                    for a in e.attributes().flatten() {
+                                        if local_attr_name(a.key.as_ref()) == "style" {
+                                            style_attr = Some(a.value);
+                                        }
+                                    }
+                                    if s < 4 {
+                                        let code = style_attr
+                                            .as_deref()
+                                            .map_or(0, parse_border_style_code);
+                                        cur_border.sides[s] = (code, RawColor::default(), false);
+                                    } else {
+                                        cur_diag_style = style_attr
+                                            .map(|v| v.into_owned())
+                                            .unwrap_or_default();
+                                        cur_diag_color = RawColor::default();
+                                        if is_empty
+                                            && !cur_diag_style.is_empty()
+                                            && cur_diag_style != "none"
+                                        {
+                                            cur_border.diagonal = Some(crate::style_ext::DiagBorder {
+                                                style: std::mem::take(&mut cur_diag_style),
+                                                color: [0, 0, 0],
+                                                color_theme: None,
+                                                up: cur_diag_up,
+                                                down: cur_diag_down,
+                                            });
+                                        }
+                                    }
+                                    if !is_empty {
+                                        cur_side = Some(s);
+                                    }
+                                }
+                            } else if in_border && level == 4 && lname == "color" {
+                                if let Some(s) = cur_side {
+                                    let col = RawColor::from_elem(e);
+                                    if s < 4 {
+                                        cur_border.sides[s].1 = col;
+                                        cur_border.sides[s].2 = true;
+                                    } else {
+                                        cur_diag_color = col;
+                                    }
+                                }
+                            }
+                        }
+                        Section::CellXfs => {
+                            if level == 2 && lname == "xf" {
+                                cur_xf = ParsedRawXf::default();
+                                for a in e.attributes().flatten() {
+                                    match local_attr_name(a.key.as_ref()) {
+                                        "numFmtId" => {
+                                            cur_xf.num_fmt_id = a.value.trim().parse::<u32>().ok();
+                                        }
+                                        "fontId" => {
+                                            cur_xf.font_id = a.value.trim().parse::<u32>().ok();
+                                        }
+                                        "fillId" => {
+                                            cur_xf.fill_id = a.value.trim().parse::<u32>().ok();
+                                        }
+                                        "borderId" => {
+                                            cur_xf.border_id = a.value.trim().parse::<u32>().ok();
+                                        }
+                                        "quotePrefix" => {
+                                            cur_xf.quote_prefix =
+                                                a.value == "1" || a.value == "true";
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if is_empty {
+                                    book.xfs.push(cur_xf);
+                                } else {
+                                    in_xf = true;
+                                }
+                            } else if in_xf && level == 3 {
+                                match lname {
+                                    "alignment" => {
+                                        cur_xf.has_alignment = true;
+                                        // Matches calamine::Alignment::default() -> VerticalAlignment::Bottom.
+                                        cur_xf.halign = 0;
+                                        cur_xf.valign = 3;
+                                        cur_xf.wrap = false;
+                                        cur_xf.shrink_to_fit = false;
+                                        cur_xf.indent = 0;
+                                        cur_xf.vertical_text = false;
+                                        cur_xf.rotation = 0;
+                                        for a in e.attributes().flatten() {
+                                            match local_attr_name(a.key.as_ref()) {
+                                                "horizontal" => {
+                                                    cur_xf.halign = match a.value.as_ref() {
+                                                        "left" => 1,
+                                                        "center" => 2,
+                                                        "right" => 3,
+                                                        "centerContinuous" => 4,
+                                                        "distributed" => 5,
+                                                        _ => 0,
+                                                    };
+                                                }
+                                                "vertical" => {
+                                                    cur_xf.valign = match a.value.as_ref() {
+                                                        "top" => 1,
+                                                        "center" => 2,
+                                                        "bottom" => 3,
+                                                        "justify" | "distributed" => 0,
+                                                        _ => 3,
+                                                    };
+                                                }
+                                                "wrapText" => {
+                                                    cur_xf.wrap = parse_ooxml_bool(&a.value);
+                                                }
+                                                "shrinkToFit" => {
+                                                    cur_xf.shrink_to_fit =
+                                                        parse_ooxml_bool(&a.value);
+                                                }
+                                                "indent" => {
+                                                    if let Ok(ind) = a.value.trim().parse::<u8>() {
+                                                        cur_xf.indent = ind.min(15);
+                                                    }
+                                                }
+                                                "textRotation" => {
+                                                    if let Ok(d) = a.value.trim().parse::<u16>() {
+                                                        if d == 255 {
+                                                            cur_xf.vertical_text = true;
+                                                            cur_xf.rotation = 0;
+                                                        } else {
+                                                            cur_xf.vertical_text = false;
+                                                            cur_xf.rotation = if d <= 90 {
+                                                                d as i16
+                                                            } else {
+                                                                90 - d as i16
+                                                            };
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    "protection" => {
+                                        cur_xf.has_protection = true;
+                                        cur_xf.locked = true;
+                                        cur_xf.hidden = false;
+                                        for a in e.attributes().flatten() {
+                                            match local_attr_name(a.key.as_ref()) {
+                                                "locked" => {
+                                                    cur_xf.locked = parse_ooxml_bool(&a.value);
+                                                }
+                                                "hidden" => {
+                                                    cur_xf.hidden = parse_ooxml_bool(&a.value);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Section::Dxfs => {
+                            if level == 2 && lname == "dxf" {
+                                saw_dxf = true;
+                            }
+                        }
+                        Section::Colors => {
+                            if level == 2 && lname == "indexedColors" {
+                                if !is_empty {
+                                    in_indexed_colors = true;
+                                    indexed_slot = 0;
+                                }
+                            } else if in_indexed_colors && level == 3 && lname == "rgbColor" {
+                                for a in e.attributes().flatten() {
+                                    if local_attr_name(a.key.as_ref()) == "rgb" {
+                                        if let Some((_, c)) = parse_hex_argb(&a.value) {
+                                            if indexed_slot < book.indexed_palette.len() {
+                                                book.indexed_palette[indexed_slot] = c;
+                                            }
+                                        }
+                                    }
+                                }
+                                indexed_slot += 1;
+                            }
+                        }
+                        Section::NumFmts | Section::None | Section::Other => {}
+                    }
+                }
+                Event::End(e) => {
+                    depth = depth.checked_sub(1).context("xl/styles.xml 标签不匹配")?;
+                    let tag = e.local_name();
+                    let lname = tag.as_ref();
+                    if depth == 1 {
+                        if section == Section::Dxfs {
+                            dxfs_end = reader.buffer_position() as usize;
+                        }
+                        section = Section::None;
+                    } else if depth == 2 {
+                        match section {
+                            Section::Fonts if in_font && lname == "font" => {
+                                book.fonts.push(std::mem::take(&mut cur_font));
+                                in_font = false;
+                            }
+                            Section::Fills if in_fill && lname == "fill" => {
+                                book.fills.push(std::mem::take(&mut cur_fill));
+                                in_fill = false;
+                            }
+                            Section::Borders if in_border && lname == "border" => {
+                                book.borders.push(std::mem::take(&mut cur_border));
+                                in_border = false;
+                                cur_side = None;
+                            }
+                            Section::CellXfs if in_xf && lname == "xf" => {
+                                book.xfs.push(cur_xf);
+                                in_xf = false;
+                            }
+                            Section::Colors if in_indexed_colors && lname == "indexedColors" => {
+                                in_indexed_colors = false;
+                            }
+                            _ => {}
+                        }
+                    } else if depth == 3 && section == Section::Borders && in_border {
+                        if cur_side == Some(4) && lname == "diagonal" {
+                            if !cur_diag_style.is_empty() && cur_diag_style != "none" {
+                                cur_border.diagonal = Some(crate::style_ext::DiagBorder {
+                                    style: std::mem::take(&mut cur_diag_style),
+                                    color: cur_diag_color.rgb.map_or([0, 0, 0], |(_, c)| c),
+                                    color_theme: cur_diag_color
+                                        .theme
+                                        .map(|i| (i, cur_diag_color.tint_f32())),
+                                    up: cur_diag_up,
+                                    down: cur_diag_down,
+                                });
+                            }
+                        }
+                        cur_side = None;
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        ensure!(depth == 0, "xl/styles.xml 未正常闭合");
+        if saw_dxf && dxfs_end > dxfs_start {
+            book.dxfs = crate::cf::parse_dxfs(&styles_xml[dxfs_start..dxfs_end]);
+        }
+        Ok(book)
+    }
+}
+
+pub(super) fn parse_styles_from_zip(zip: &mut zip::ZipArchive<File>) -> Result<ParsedStylesBook> {
+    let theme_xml = if let Some(idx) = zip.index_for_name("xl/theme/theme1.xml") {
+        let mut s = String::new();
+        zip.by_index(idx).ok().and_then(|mut f| f.read_to_string(&mut s).ok().map(|_| s))
+    } else {
+        let alt_name = zip
+            .file_names()
+            .find(|n| n.starts_with("xl/theme/") && n.ends_with(".xml"))
+            .map(str::to_owned);
+        alt_name.and_then(|name| {
+            let mut s = String::new();
+            zip.by_name(&name).ok().and_then(|mut f| f.read_to_string(&mut s).ok().map(|_| s))
+        })
+    };
+    let styles_xml = if zip.index_for_name("xl/styles.xml").is_some() {
+        xml_part(zip, "xl/styles.xml")?
+    } else {
+        String::new()
+    };
+    ParsedStylesBook::parse_xml(&styles_xml, theme_xml.as_deref())
+}
+
 pub(super) struct Header {
     dynamic: std::collections::HashSet<u32>,
     pub names: Vec<String>,
     types: Vec<calamine::SheetType>,
-    pub styles: Vec<calamine::Style>,
+    pub parsed_styles: ParsedStylesBook,
 }
 
 #[derive(Default)]
@@ -117,7 +1198,6 @@ pub(super) struct WorkbookMetadata {
 }
 
 pub(super) fn workbook_metadata(src: &mut zip::ZipArchive<File>) -> Result<WorkbookMetadata> {
-    use std::io::Read;
     let read = |zip: &mut zip::ZipArchive<File>, name: &str| -> Result<Option<Vec<u8>>> {
         let Some(index) = zip.index_for_name(name) else { return Ok(None) };
         let mut bytes = Vec::new();
@@ -127,69 +1207,134 @@ pub(super) fn workbook_metadata(src: &mut zip::ZipArchive<File>) -> Result<Workb
     let Some(bytes) = read(src, "xl/workbook.xml")? else {
         return Ok(WorkbookMetadata::default());
     };
-    let xml = String::from_utf8(bytes).unwrap_or_default();
+    let xml = decode_xml_part(bytes, "xl/workbook.xml").unwrap_or_default();
     let rels = read(src, "xl/_rels/workbook.xml.rels")?;
-    let targets = crate::patch::sheet_targets_xml(
-        Some(&xml),
-        rels.as_deref().and_then(|b| std::str::from_utf8(b).ok()),
-    );
-    let header = header(src, &targets, &xml, rels.as_deref())?;
+    let rels_text = rels
+        .as_deref()
+        .map(|b| decode_xml_part(b.to_vec(), "xl/_rels/workbook.xml.rels").unwrap_or_default());
+    let targets = crate::patch::sheet_targets_xml(Some(&xml), rels_text.as_deref());
+    let header = header(src, &targets, &xml, rels_text.as_deref(), rels.as_deref())?;
     Ok(WorkbookMetadata { xml, targets, header })
 }
 
-/// Calamine's style converter also reads the entire SST when opening a book.
-/// Give it just the original workbook metadata and an empty worksheet. The real
-/// sheets and the SST are consumed exclusively by the shared loader below.
+/// Direct single-pass OOXML header & style loader: parses `xl/workbook.xml`,
+/// `xl/_rels/workbook.xml.rels`, `xl/theme/*.xml` and `xl/styles.xml` directly from
+/// the opened ZIP archive without constructing a synthetic in-memory ZIP for `calamine`.
 pub(super) fn header(
     src: &mut zip::ZipArchive<File>,
     targets: &HashMap<String, String>,
     workbook: &str,
-    rels: Option<&[u8]>,
+    rels_text: Option<&str>,
+    rels_raw: Option<&[u8]>,
 ) -> Result<Option<Header>> {
-    if targets.is_empty() {
+    if targets.is_empty() || !targets.values().any(|p| src.index_for_name(p).is_some()) {
         return Ok(None);
     }
-    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let opts =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    out.start_file("xl/workbook.xml", opts)?;
-    out.write_all(workbook.as_bytes())?;
-    if let Some(xml) = rels {
-        out.start_file("xl/_rels/workbook.xml.rels", opts)?;
-        out.write_all(xml)?;
-    }
-    for key in ["_rels/.rels", "xl/styles.xml"] {
-        if src.index_for_name(key).is_some() {
-            let mut entry = src.by_name(key)?;
-            out.start_file(key, opts)?;
-            std::io::copy(&mut entry, &mut out)?;
-        }
-    }
-    let Some(part) = targets.values().find(|p| src.index_for_name(p).is_some()) else {
+    let Some(rels_str) = rels_text else {
         return Ok(None);
     };
-    out.start_file(part.as_str(), opts)?;
-    out.write_all(b"<worksheet><sheetData/></worksheet>")?;
-    let mut book = calamine::Xlsx::new(out.finish()?)?;
-    let names = book.sheet_names();
-    let types = book.sheets_metadata().iter().map(|s| s.typ).collect();
-    if names.iter().any(|n| !targets.contains_key(n)) {
+
+    // Parse workbook.xml.rels -> relationship Id -> Type
+    let mut rel_types: HashMap<String, String> = HashMap::new();
+    {
+        let mut r = Reader::from_str(rels_str);
+        loop {
+            match r.read_event() {
+                Ok(Event::Start(e)) | Ok(Event::Empty(e))
+                    if e.local_name().as_ref() == "Relationship" =>
+                {
+                    let mut id = None;
+                    let mut typ = None;
+                    let mut external = false;
+                    for a in e.attributes().flatten() {
+                        match local_attr_name(a.key.as_ref()) {
+                            "Id" => id = Some(a.value.into_owned()),
+                            "Type" => typ = Some(a.value.into_owned()),
+                            "TargetMode" => external = a.value.eq_ignore_ascii_case("External"),
+                            _ => {}
+                        }
+                    }
+                    if !external {
+                        if let (Some(id), Some(typ)) = (id, typ) {
+                            rel_types.insert(id, typ);
+                        }
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(_) => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+
+    // Parse workbook.xml -> sheet names + SheetType in document order
+    let mut names = Vec::new();
+    let mut types = Vec::new();
+    {
+        let mut r = Reader::from_str(workbook);
+        loop {
+            match r.read_event() {
+                Ok(Event::Start(e)) | Ok(Event::Empty(e))
+                    if e.local_name().as_ref() == "sheet" =>
+                {
+                    let mut name: Option<String> = None;
+                    let mut rel_id: Option<String> = None;
+                    let mut valid_state = true;
+                    for a in e.attributes().flatten() {
+                        match local_attr_name(a.key.as_ref()) {
+                            "name" => name = Some(crate::model::xml_unescape(&a.value)),
+                            "id" => rel_id = Some(a.value.into_owned()),
+                            "state" => {
+                                valid_state =
+                                    matches!(a.value.as_ref(), "visible" | "hidden" | "veryHidden");
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !valid_state {
+                        return Ok(None);
+                    }
+                    let (Some(name), Some(rid)) = (name, rel_id) else {
+                        return Ok(None);
+                    };
+                    let Some(rel_type) = rel_types.get(&rid) else {
+                        return Ok(None);
+                    };
+                    let typ = match rel_type.rsplit('/').next() {
+                        Some("worksheet") => calamine::SheetType::WorkSheet,
+                        Some("chartsheet") => calamine::SheetType::ChartSheet,
+                        Some("dialogsheet") => calamine::SheetType::DialogSheet,
+                        _ => return Ok(None),
+                    };
+                    names.push(name);
+                    types.push(typ);
+                }
+                Ok(Event::Eof) => break,
+                Err(_) => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+
+    if names.is_empty() || names.iter().any(|n| !targets.contains_key(n)) {
         return Ok(None);
     }
-    let name = names
-        .iter()
-        .find(|n| targets.get(*n) == Some(part))
-        .context("工作表关系无效")?;
-    let styles = book.worksheet_cells_reader(name)?.styles().to_vec();
-    Ok(Some(Header {
-        dynamic: if let Some(rels) = rels {
-            super::dynamic::indices(src, rels)?
+
+    let parsed_styles = parse_styles_from_zip(src)?;
+    let dynamic = if rels_str.contains("sheetMetadata") {
+        if let Some(raw) = rels_raw {
+            super::dynamic::indices(src, raw)?
         } else {
             Default::default()
-        },
+        }
+    } else {
+        Default::default()
+    };
+    Ok(Some(Header {
+        dynamic,
         names,
         types,
-        styles,
+        parsed_styles,
     }))
 }
 
@@ -199,25 +1344,16 @@ pub(super) fn header(
 pub(super) struct StyleLookup<'a> {
     cache: Vec<AtomicU16>,
     inner: Mutex<(crate::style::StyleTable, HashMap<u16, u16>)>,
-    ooxml_styles: &'a [calamine::Style],
-    theme_book: &'a crate::style_theme::ThemeBook,
-    ext_book: &'a crate::style_ext::StyleExt,
+    parsed: &'a ParsedStylesBook,
 }
 
 impl<'a> StyleLookup<'a> {
     pub(super) fn new(
         styles: crate::style::StyleTable,
         ids: HashMap<u16, u16>,
-        ooxml_styles: &'a [calamine::Style],
-        theme_book: &'a crate::style_theme::ThemeBook,
-        ext_book: &'a crate::style_ext::StyleExt,
+        parsed: &'a ParsedStylesBook,
     ) -> Self {
-        let cap = ooxml_styles
-            .len()
-            .max(theme_book.xfs.len())
-            .max(ext_book.xf_border.len())
-            .saturating_add(16)
-            .max(64);
+        let cap = parsed.xf_count().saturating_add(16).max(64);
         let cache: Vec<AtomicU16> = (0..cap).map(|_| AtomicU16::new(u16::MAX)).collect();
         for (&xf, &id) in &ids {
             if let Some(slot) = cache.get(xf as usize) {
@@ -227,9 +1363,7 @@ impl<'a> StyleLookup<'a> {
         Self {
             cache,
             inner: Mutex::new((styles, ids)),
-            ooxml_styles,
-            theme_book,
-            ext_book,
+            parsed,
         }
     }
 
@@ -249,35 +1383,17 @@ impl<'a> StyleLookup<'a> {
         let mut guard = self.inner.lock().unwrap();
         let (styles, ids) = &mut *guard;
         let id = *ids.entry(xf).or_insert_with(|| {
-            let mut cs = self
-                .ooxml_styles
-                .get(xf as usize)
-                .map(super::convert_style)
-                .unwrap_or_else(|| crate::style::CellStyle {
-                    size: 11.0,
-                    color: [0, 0, 0],
-                    ..Default::default()
-                });
-            let theme_xf = self.theme_book.xfs.get(xf as usize);
-            let resolved = self.theme_book.resolved.get(xf as usize);
-            crate::style_theme::apply_resolved(
-                &mut cs,
-                theme_xf,
-                resolved,
-                &self.theme_book.palette,
-            );
-            cs.diagonal = self
-                .ext_book
-                .xf_border
-                .get(xf as usize)
-                .and_then(|id| self.ext_book.diags.get(*id as usize))
-                .cloned()
-                .flatten();
+            let (cs, theme_xf, pattern, quote) = self.parsed.resolve_xf(xf as usize);
             let id = styles.intern(cs);
-            if let Some(txf) = theme_xf {
-                styles.set_theme(id, *txf);
+            if (xf as usize) < self.parsed.xf_count() {
+                styles.set_theme(id, theme_xf);
             }
-            crate::style_ext::attach(styles, self.ext_book, id, xf);
+            if let Some(p) = pattern {
+                styles.set_pattern(id, p);
+            }
+            if quote {
+                styles.set_quote(id, true);
+            }
             id
         });
         if let Some(slot) = self.cache.get(xf as usize) {
@@ -298,75 +1414,39 @@ struct Strings {
     rich: HashMap<usize, Vec<RichRun>>,
 }
 
-// Values are retrieved by SST index while sheets decode concurrently. Pack short
-// strings into slabs to avoid a String allocation per item, and cache shared `Arc<str>`
-// handles lazily on demand for referenced SST slots.
+// Values are decoded directly into `Arc<str>` entries so concurrent worksheet
+// workers share string handles in O(1) with zero slab copies and zero atomics.
 #[derive(Default)]
 struct TextPool {
-    slabs: Vec<String>,
-    ends: Vec<(usize, usize)>,
-    shared: OnceLock<Vec<OnceLock<Arc<str>>>>,
+    items: Vec<Arc<str>>,
 }
 
 impl TextPool {
+    fn reserve(&mut self, additional: usize) {
+        self.items.reserve(additional);
+    }
+
     fn len(&self) -> usize {
-        self.ends.len()
+        self.items.len()
     }
 
     fn push(&mut self, text: String) {
-        const BYTES: usize = 64 * 1024;
-        if self
-            .slabs
-            .last()
-            .is_none_or(|s| s.len().saturating_add(text.len()) > BYTES)
-        {
-            self.slabs.push(text);
-        } else {
-            self.slabs.last_mut().unwrap().push_str(&text);
-        }
-        self.ends
-            .push((self.slabs.len() - 1, self.slabs.last().unwrap().len()));
+        self.items.push(Arc::from(text));
     }
 
     fn push_str(&mut self, text: &str) {
-        const BYTES: usize = 64 * 1024;
-        if self
-            .slabs
-            .last()
-            .is_none_or(|s| s.len().saturating_add(text.len()) > BYTES)
-        {
-            let mut slab = String::with_capacity(text.len().max(BYTES));
-            slab.push_str(text);
-            self.slabs.push(slab);
-        } else {
-            self.slabs.last_mut().unwrap().push_str(text);
-        }
-        self.ends
-            .push((self.slabs.len() - 1, self.slabs.last().unwrap().len()));
+        self.items.push(Arc::from(text));
     }
 
-    fn prepare_shared(&mut self) {
-        let slots = (0..self.ends.len()).map(|_| OnceLock::new()).collect();
-        let _ = self.shared.set(slots);
-    }
+    fn prepare_shared(&mut self) {}
 
+    #[cfg(test)]
     fn get(&self, id: usize) -> Option<&str> {
-        let &(page, end) = self.ends.get(id)?;
-        let start = id
-            .checked_sub(1)
-            .and_then(|prev| self.ends.get(prev))
-            .filter(|(old, _)| *old == page)
-            .map_or(0, |(_, end)| *end);
-        Some(&self.slabs[page][start..end])
+        self.items.get(id).map(AsRef::as_ref)
     }
 
     fn get_arc(&self, id: usize) -> Option<&Arc<str>> {
-        let raw = self.get(id)?;
-        let slots = self.shared.get_or_init(|| {
-            (0..self.ends.len()).map(|_| OnceLock::new()).collect()
-        });
-        let slot = slots.get(id)?;
-        Some(slot.get_or_init(|| Arc::from(raw)))
+        self.items.get(id)
     }
 }
 
@@ -1193,7 +2273,7 @@ pub(super) fn worksheets(
                         Some(style_lookup),
                         &mut loaded,
                         stream_workers,
-                        256 * 1024,
+                        128 * 1024,
                     )
                 })
             } else {
@@ -1541,5 +2621,143 @@ mod tests {
         let series = &wb.sheets[11].charts[0].series[0];
         assert_eq!(series.vals, vec![12.]);
         assert_eq!(series.cats, vec!["1904-01-02"]);
+    }
+
+    #[test]
+    fn single_pass_styles_matches_calamine_theme_and_ext() {
+        use calamine::Reader as _;
+        use std::io::{Cursor, Write};
+        let theme_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office">
+  <a:themeElements>
+    <a:clrScheme name="Office">
+      <a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>
+      <a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>
+      <a:dk2><a:srgbClr val="44546A"/></a:dk2>
+      <a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+      <a:accent1><a:srgbClr val="4472C4"/></a:accent1>
+      <a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+      <a:accent3><a:srgbClr val="A5A5A5"/></a:accent3>
+      <a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+      <a:accent5><a:srgbClr val="5B9BD5"/></a:accent5>
+      <a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+      <a:hlink><a:srgbClr val="0563C1"/></a:hlink>
+      <a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+    </a:clrScheme>
+  </a:themeElements>
+</a:theme>"#;
+        let styles_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="2">
+    <numFmt numFmtId="164" formatCode="&quot;¥&quot;#,##0.00"/>
+    <numFmt numFmtId="165" formatCode="yyyy/mm/dd"/>
+  </numFmts>
+  <fonts count="4">
+    <font><sz val="11"/><name val="Calibri"/><color theme="1"/></font>
+    <font><b/><i/><u val="double"/><strike/><sz val="14.5"/><name val="SimSun"/><color rgb="FF9C0006"/></font>
+    <font><b val="700"/><u/><sz val="9"/><name val="Microsoft YaHei"/><color theme="4" tint="0.4"/></font>
+    <font><sz val="12"/><color indexed="10"/></font>
+  </fonts>
+  <fills count="4">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"><fgColor rgb="FF808080"/><bgColor rgb="FFFFFFFF"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor theme="5" tint="-0.25"/><bgColor indexed="64"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor indexed="43"/></patternFill></fill>
+  </fills>
+  <borders count="2">
+    <border><left/><right/><top/><bottom/><diagonal/></border>
+    <border diagonalUp="1" diagonalDown="0">
+      <left style="thin"><color rgb="FF112233"/></left>
+      <right style="mediumDashed"><color theme="4"/></right>
+      <top style="double"><color indexed="2"/></top>
+      <bottom style="thick"/>
+      <diagonal style="thin"><color rgb="FF9C0006"/></diagonal>
+    </border>
+  </borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="5">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+    <xf numFmtId="164" fontId="1" fillId="1" borderId="1" quotePrefix="1">
+      <alignment horizontal="center" wrapText="1" indent="2" textRotation="45"/>
+      <protection locked="0" hidden="1"/>
+    </xf>
+    <xf numFmtId="14" fontId="2" fillId="2" borderId="0">
+      <alignment horizontal="right" vertical="top" shrinkToFit="1" textRotation="255"/>
+    </xf>
+    <xf numFmtId="165" fontId="3" fillId="3" borderId="1">
+      <alignment vertical="center" textRotation="135"/>
+    </xf>
+    <xf numFmtId="49" fontId="0" fillId="0" borderId="0">
+      <alignment horizontal="distributed" vertical="justify"/>
+    </xf>
+  </cellXfs>
+  <dxfs count="1">
+    <dxf><font><b/><color rgb="FF006100"/></font><fill><patternFill><bgColor rgb="FFC6EFCE"/></patternFill></fill></dxf>
+  </dxfs>
+  <colors>
+    <indexedColors>
+      <rgbColor rgb="FF000000"/><rgbColor rgb="FFFFFFFF"/><rgbColor rgb="FFFF0000"/><rgbColor rgb="FF00FF00"/>
+      <rgbColor rgb="FF0000FF"/><rgbColor rgb="FFFFFF00"/><rgbColor rgb="FFFF00FF"/><rgbColor rgb="FF00FFFF"/>
+      <rgbColor rgb="FF000000"/><rgbColor rgb="FFFFFFFF"/><rgbColor rgb="FFAA1122"/>
+    </indexedColors>
+  </colors>
+</styleSheet>"#;
+
+        // Build minimal in-memory XLSX for calamine ground truth
+        let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let rels_root = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let wb_xml = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let wb_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        for (name, body) in [
+            ("_rels/.rels", rels_root),
+            ("xl/workbook.xml", wb_xml),
+            ("xl/_rels/workbook.xml.rels", wb_rels),
+            ("xl/theme/theme1.xml", theme_xml),
+            ("xl/styles.xml", styles_xml),
+            ("xl/worksheets/sheet1.xml", "<worksheet><sheetData/></worksheet>"),
+        ] {
+            out.start_file(name, opts).unwrap();
+            out.write_all(body.as_bytes()).unwrap();
+        }
+        let mut book = calamine::Xlsx::new(out.finish().unwrap()).unwrap();
+        let cal_styles = book.worksheet_cells_reader("S1").unwrap().styles().to_vec();
+        let palette = crate::style_theme::parse_palette(theme_xml);
+        let (xfs_theme, xfs_res) = crate::style_theme::parse_styles_with_palette(styles_xml, &palette);
+        let ext = crate::style_ext::parse(styles_xml);
+
+        let parsed = ParsedStylesBook::parse_xml(styles_xml, Some(theme_xml)).unwrap();
+        assert_eq!(parsed.xf_count(), cal_styles.len());
+        assert_eq!(parsed.dxfs, crate::cf::parse_dxfs(styles_xml));
+        assert_eq!(parsed.dxf_ext, crate::cf::dxfs_unsupported(styles_xml));
+        for i in 0..cal_styles.len() {
+            let mut expected_cs = super::super::convert_style(&cal_styles[i]);
+            crate::style_theme::apply_resolved(
+                &mut expected_cs,
+                xfs_theme.get(i),
+                xfs_res.get(i),
+                &palette,
+            );
+            expected_cs.diagonal = ext
+                .xf_border
+                .get(i)
+                .and_then(|&id| ext.diags.get(id as usize))
+                .cloned()
+                .flatten();
+            let expected_pat = ext
+                .xf_fill
+                .get(i)
+                .and_then(|&id| ext.patterns.get(id as usize))
+                .cloned()
+                .flatten();
+            let expected_quote = ext.xf_quote.get(i).copied().unwrap_or(false);
+
+            let (got_cs, got_theme, got_pat, got_quote) = parsed.resolve_xf(i);
+            assert_eq!(got_cs, expected_cs, "xf {i} CellStyle mismatch");
+            assert_eq!(got_theme, xfs_theme[i], "xf {i} XfTheme mismatch");
+            assert_eq!(got_pat, expected_pat, "xf {i} FillPattern mismatch");
+            assert_eq!(got_quote, expected_quote, "xf {i} quotePrefix mismatch");
+        }
     }
 }

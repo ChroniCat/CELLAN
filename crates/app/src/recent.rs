@@ -8,20 +8,56 @@ use std::path::{Path, PathBuf};
 pub const MAX: usize = 12;
 
 fn store() -> PathBuf {
-    crate::update::app_dir().join("recent.txt")
+    crate::debug_flags::app_dir().join("recent.txt")
 }
 
+/// 快速加载最近打开路径列表：启动热路径不做逐条同步 `p.is_file()`（避免断网 SMB/UNC 盘阻塞冷启动），
+/// 失效路径由 `prune_missing_async` 在后台线程异步清理。
 pub fn load() -> Vec<PathBuf> {
     let Ok(text) = std::fs::read_to_string(store()) else {
         return Vec::new();
     };
+    parse_lines(&text)
+}
+
+fn parse_lines(text: &str) -> Vec<PathBuf> {
     text.lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .map(PathBuf::from)
-        .filter(|p| p.is_file())
         .take(MAX)
         .collect()
+}
+
+/// 后台异步检测并剔除 `recent.txt` 中已失效的死链（仅在文件存在且非空时派生单次轻量线程；
+/// 写回前比对原文以防与并发 `touch()` / 测试环境清理竞态）。
+pub fn prune_missing_async(
+    wake: Option<eframe::egui::Context>,
+) -> Option<std::sync::mpsc::Receiver<Vec<PathBuf>>> {
+    let path = store();
+    let Ok(original) = std::fs::read_to_string(&path) else {
+        return None;
+    };
+    let parsed = parse_lines(&original);
+    if parsed.is_empty() {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let kept: Vec<PathBuf> = parsed.into_iter().filter(|p| p.is_file()).collect();
+        let body: String = kept.iter().map(|p| format!("{}\n", p.display())).collect();
+        if body != original {
+            // 仅当磁盘文件未被期间的 `touch`/`forget` 改动过且父目录仍在时才写回
+            if std::fs::read_to_string(&path).ok().as_deref() == Some(original.as_str()) {
+                let _ = std::fs::write(&path, body);
+            }
+            let _ = tx.send(kept);
+            if let Some(ctx) = wake {
+                ctx.request_repaint();
+            }
+        }
+    });
+    Some(rx)
 }
 
 /// 把一个文件提到最前（打开/保存时调用）
@@ -43,6 +79,23 @@ pub fn forget(path: &Path) {
 }
 
 fn same(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let na = a.to_string_lossy().replace('/', "\\");
+        let nb = b.to_string_lossy().replace('/', "\\");
+        if na.eq_ignore_ascii_case(&nb) {
+            return true;
+        }
+        // 文件名不同时无需触盘 `canonicalize`，避免对断网 SMB 路径阻塞
+        let fa = a.file_name().map(|s| s.to_string_lossy().to_lowercase());
+        let fb = b.file_name().map(|s| s.to_string_lossy().to_lowercase());
+        if fa != fb {
+            return false;
+        }
+    }
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(x), Ok(y)) => x == y,
         _ => a == b,

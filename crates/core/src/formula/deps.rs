@@ -3,12 +3,18 @@
 //! 关键设计：
 //! 1. 单格引用进入按列有序点表 `points_by_col`，二分查找 `O(log N)`，零行桶哈希探测；
 //! 2. 多格区域通过 `AreaId` 全局去重（10 万条公式引用同一 `$A$1:$CV$100000` 仅存 1 份列区间）；
-//! 3. `FormulaRefs` 内联存储 0~2 个紧凑 `CompactRect`（20B），消除每条普通公式的独立 `Vec` 堆分配；
-//! 4. `update_cell` 采用墓碑（Tombstone）惰性失效，单格编辑摊还 `O(1)`；
-//! 5. 动态数组活跃溢出区与 `#SPILL!` 阻塞监视矩形直接编入依赖图，局部唤醒锚点，消除整簿全量回退。
+//! 3. 宽区域（列宽 > 512，如整行引用 `5:5`）对称按行分桶 `wide_by_row`，避免每次 frontier 全扫；
+//! 4. `FormulaRefs` 内联存储 0~2 个紧凑 `CompactRect`（20B），消除每条普通公式的独立 `Vec` 堆分配；
+//! 5. 所有大型索引容器采用 `Arc` Base + 小增量 Overlay 的 CoW 结构，`Deps::clone()` 为 `O(1)`，
+//!    后台持有 `Arc<Deps>` 快照期间 `Arc::make_mut(&mut deps).update_cell(...)` 仅修改单条补丁（`< 0.15 ms`）；
+//! 6. 动态数组活跃溢出区与 `#SPILL!` 阻塞监视矩形直接编入依赖图，局部唤醒锚点，消除整簿全量回退。
 
-use super::Node;
-use std::collections::{HashMap, HashSet};
+use super::func_id::FuncId;
+use super::fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
+use super::{Node, RefExpr};
+use std::collections::HashSet;
+use std::hash::Hash;
+use std::sync::{Arc, Mutex};
 
 pub type CellKey = (usize, u32, u32);
 
@@ -123,8 +129,488 @@ impl FormulaRefs {
     }
 }
 
-// A multi-cell range reference is indexed once per unique AreaId per column, in the smallest
-// aligned row bucket containing both endpoints. A point lookup visits at most seven buckets.
+// ============================================================================
+// O(1) CoW Base + Small Overlay Containers
+// ============================================================================
+
+#[derive(Clone)]
+struct CowMap<K, V> {
+    base: Arc<FxHashMap<K, V>>,
+    overlay: Arc<FxHashMap<K, Option<V>>>,
+    len: usize,
+}
+
+impl<K, V> Default for CowMap<K, V> {
+    fn default() -> Self {
+        Self {
+            base: Arc::new(FxHashMap::default()),
+            overlay: Arc::new(FxHashMap::default()),
+            len: 0,
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> CowMap<K, V> {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            base: Arc::new(FxHashMap::with_capacity_and_hasher(cap, FxBuildHasher)),
+            overlay: Arc::new(FxHashMap::default()),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn get(&self, key: &K) -> Option<&V> {
+        if !self.overlay.is_empty()
+            && let Some(entry) = self.overlay.get(key)
+        {
+            return entry.as_ref();
+        }
+        self.base.get(key)
+    }
+
+    #[inline]
+    fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn maybe_flush(&mut self) {
+        let ov_len = self.overlay.len();
+        if ov_len == 0 {
+            return;
+        }
+        let unshared = Arc::strong_count(&self.base) == 1;
+        if ov_len >= 2048 || (unshared && ov_len >= 256) {
+            let base = Arc::make_mut(&mut self.base);
+            let ov = std::mem::take(Arc::make_mut(&mut self.overlay));
+            for (k, v_opt) in ov {
+                match v_opt {
+                    Some(v) => {
+                        base.insert(k, v);
+                    }
+                    None => {
+                        base.remove(&k);
+                    }
+                }
+            }
+            self.len = base.len();
+        }
+    }
+
+    fn insert(&mut self, key: K, val: V) -> Option<V> {
+        if self.overlay.is_empty() && Arc::strong_count(&self.base) == 1 {
+            let base = Arc::get_mut(&mut self.base).unwrap();
+            let old = base.insert(key, val);
+            if old.is_none() {
+                self.len += 1;
+            }
+            return old;
+        }
+        let old = {
+            let ov = Arc::make_mut(&mut self.overlay);
+            if let Some(slot) = ov.get_mut(&key) {
+                let prev = slot.replace(val);
+                if prev.is_none() {
+                    self.len += 1;
+                }
+                prev
+            } else {
+                let prev = self.base.get(&key).cloned();
+                if prev.is_none() {
+                    self.len += 1;
+                }
+                ov.insert(key, Some(val));
+                prev
+            }
+        };
+        self.maybe_flush();
+        old
+    }
+
+    fn remove(&mut self, key: &K) -> Option<V> {
+        if self.overlay.is_empty() && Arc::strong_count(&self.base) == 1 {
+            let base = Arc::get_mut(&mut self.base).unwrap();
+            let old = base.remove(key);
+            if old.is_some() {
+                self.len -= 1;
+            }
+            return old;
+        }
+        // Fast bail-out if absent from both overlay and base (avoids cloning overlay)
+        if !self.overlay.contains_key(key) && !self.base.contains_key(key) {
+            return None;
+        }
+        let old = {
+            let ov = Arc::make_mut(&mut self.overlay);
+            if let Some(slot) = ov.get_mut(key) {
+                let prev = slot.take();
+                if prev.is_some() {
+                    self.len -= 1;
+                }
+                prev
+            } else {
+                let prev = self.base.get(key).cloned();
+                if prev.is_some() {
+                    ov.insert(key.clone(), None);
+                    self.len -= 1;
+                }
+                prev
+            }
+        };
+        self.maybe_flush();
+        old
+    }
+
+    /// Mutate an existing entry or insert a default value, copying ONLY that single entry
+    /// into `overlay` when `base` is shared with another snapshot.
+    fn get_or_default_mut(&mut self, key: K) -> &mut V
+    where
+        V: Default,
+    {
+        if self.overlay.is_empty() && Arc::strong_count(&self.base) == 1 {
+            let base = Arc::get_mut(&mut self.base).unwrap();
+            let mut inserted = false;
+            let entry = base.entry(key).or_insert_with(|| {
+                inserted = true;
+                V::default()
+            });
+            if inserted {
+                self.len += 1;
+            }
+            return entry;
+        }
+        let ov = Arc::make_mut(&mut self.overlay);
+        let slot = ov.entry(key.clone()).or_insert_with(|| {
+            match self.base.get(&key) {
+                Some(v) => Some(v.clone()),
+                None => {
+                    self.len += 1;
+                    Some(V::default())
+                }
+            }
+        });
+        if slot.is_none() {
+            self.len += 1;
+            *slot = Some(V::default());
+        }
+        slot.as_mut().unwrap()
+    }
+
+    fn flush_into_base(&mut self) {
+        if self.overlay.is_empty() {
+            return;
+        }
+        let base = Arc::make_mut(&mut self.base);
+        let ov = std::mem::take(Arc::make_mut(&mut self.overlay));
+        for (k, v_opt) in ov {
+            match v_opt {
+                Some(v) => {
+                    base.insert(k, v);
+                }
+                None => {
+                    base.remove(&k);
+                }
+            }
+        }
+        self.len = base.len();
+    }
+
+    fn base_mut_flushed(&mut self) -> &mut FxHashMap<K, V> {
+        self.flush_into_base();
+        Arc::make_mut(&mut self.base)
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &K> + '_ {
+        let base_keys = self
+            .base
+            .keys()
+            .filter(|k| self.overlay.is_empty() || !self.overlay.contains_key(*k));
+        let ov_keys = self
+            .overlay
+            .iter()
+            .filter_map(|(k, v)| v.is_some().then_some(k));
+        base_keys.chain(ov_keys)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
+        let base_it = self
+            .base
+            .iter()
+            .filter(|(k, _)| self.overlay.is_empty() || !self.overlay.contains_key(*k));
+        let ov_it = self
+            .overlay
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|val| (k, val)));
+        base_it.chain(ov_it)
+    }
+}
+
+#[derive(Clone)]
+struct CowSet<K> {
+    inner: CowMap<K, ()>,
+}
+
+impl<K> Default for CowSet<K> {
+    fn default() -> Self {
+        Self {
+            inner: CowMap::default(),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone> CowSet<K> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[inline]
+    fn contains(&self, key: &K) -> bool {
+        self.inner.contains_key(key)
+    }
+
+    #[inline]
+    fn insert(&mut self, key: K) -> bool {
+        self.inner.insert(key, ()).is_none()
+    }
+
+    #[inline]
+    fn remove(&mut self, key: &K) -> bool {
+        self.inner.remove(key).is_some()
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = &K> + '_ {
+        self.inner.keys()
+    }
+}
+
+/// Public CoW wrapper for `Deps::refs` preserving `.get()`, `.len()`, `.is_empty()`,
+/// `.contains_key()`, `.keys()`, and `.iter()` compatibility.
+#[derive(Clone, Default)]
+pub struct RefMap {
+    inner: CowMap<CellKey, FormulaRefs>,
+}
+
+impl RefMap {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            inner: CowMap::with_capacity(cap),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, key: &CellKey) -> Option<&FormulaRefs> {
+        self.inner.get(key)
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &CellKey) -> bool {
+        self.inner.contains_key(key)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[inline]
+    pub fn keys(&self) -> impl Iterator<Item = &CellKey> + '_ {
+        self.inner.keys()
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (&CellKey, &FormulaRefs)> + '_ {
+        self.inner.iter()
+    }
+
+    #[inline]
+    fn insert(&mut self, key: CellKey, val: FormulaRefs) -> Option<FormulaRefs> {
+        self.inner.insert(key, val)
+    }
+
+    #[inline]
+    fn remove(&mut self, key: &CellKey) -> Option<FormulaRefs> {
+        self.inner.remove(key)
+    }
+}
+
+#[derive(Clone, Default)]
+struct SlotTable {
+    base: Arc<Vec<CellKey>>,
+    dead_base: Arc<FxHashSet<u32>>,
+    extra: Arc<Vec<Option<CellKey>>>,
+}
+
+impl SlotTable {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            base: Arc::new(Vec::with_capacity(cap)),
+            dead_base: Arc::new(FxHashSet::default()),
+            extra: Arc::new(Vec::new()),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.base.len() + self.extra.len()
+    }
+
+    #[inline]
+    fn get(&self, id: u32) -> Option<CellKey> {
+        let idx = id as usize;
+        if idx < self.base.len() {
+            if !self.dead_base.is_empty() && self.dead_base.contains(&id) {
+                None
+            } else {
+                Some(self.base[idx])
+            }
+        } else {
+            self.extra.get(idx - self.base.len()).copied().flatten()
+        }
+    }
+
+    #[inline]
+    fn is_live(&self, id: u32) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn alloc(&mut self, key: CellKey) -> u32 {
+        if self.extra.is_empty() && Arc::strong_count(&self.base) == 1 {
+            let base = Arc::get_mut(&mut self.base).unwrap();
+            let id = u32::try_from(base.len()).expect("more than 2^32 indexed formulas");
+            base.push(key);
+            return id;
+        }
+        let extra = Arc::make_mut(&mut self.extra);
+        let id =
+            u32::try_from(self.base.len() + extra.len()).expect("more than 2^32 indexed formulas");
+        extra.push(Some(key));
+        id
+    }
+
+    fn tombstone(&mut self, id: u32) -> bool {
+        let idx = id as usize;
+        if idx < self.base.len() {
+            Arc::make_mut(&mut self.dead_base).insert(id)
+        } else if let Some(slot) = Arc::make_mut(&mut self.extra).get_mut(idx - self.base.len()) {
+            slot.take().is_some()
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CowVec<T> {
+    base: Arc<Vec<T>>,
+    overlay: Arc<FxHashMap<usize, T>>,
+    extra: Arc<Vec<T>>,
+}
+
+impl<T> Default for CowVec<T> {
+    fn default() -> Self {
+        Self {
+            base: Arc::new(Vec::new()),
+            overlay: Arc::new(FxHashMap::default()),
+            extra: Arc::new(Vec::new()),
+        }
+    }
+}
+
+impl<T: Clone> CowVec<T> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.base.len() + self.extra.len()
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> Option<&T> {
+        if idx < self.base.len() {
+            if !self.overlay.is_empty()
+                && let Some(v) = self.overlay.get(&idx)
+            {
+                return Some(v);
+            }
+            Some(&self.base[idx])
+        } else {
+            self.extra.get(idx - self.base.len())
+        }
+    }
+
+    fn push(&mut self, val: T) -> usize {
+        if self.extra.is_empty() && Arc::strong_count(&self.base) == 1 {
+            let base = Arc::get_mut(&mut self.base).unwrap();
+            let id = base.len();
+            base.push(val);
+            return id;
+        }
+        let extra = Arc::make_mut(&mut self.extra);
+        let id = self.base.len() + extra.len();
+        extra.push(val);
+        id
+    }
+
+    fn get_mut(&mut self, idx: usize) -> &mut T {
+        if idx < self.base.len() {
+            if self.overlay.is_empty() && Arc::strong_count(&self.base) == 1 {
+                return &mut Arc::get_mut(&mut self.base).unwrap()[idx];
+            }
+            let base = &self.base;
+            Arc::make_mut(&mut self.overlay)
+                .entry(idx)
+                .or_insert_with(|| base[idx].clone())
+        } else {
+            &mut Arc::make_mut(&mut self.extra)[idx - self.base.len()]
+        }
+    }
+
+    fn flush_into_base(&mut self) {
+        if self.overlay.is_empty() && self.extra.is_empty() {
+            return;
+        }
+        let base = Arc::make_mut(&mut self.base);
+        let ov = std::mem::take(Arc::make_mut(&mut self.overlay));
+        for (i, v) in ov {
+            base[i] = v;
+        }
+        let extra = std::mem::take(Arc::make_mut(&mut self.extra));
+        base.extend(extra);
+    }
+
+    fn as_mut_slice_flushed(&mut self) -> &mut [T] {
+        self.flush_into_base();
+        Arc::make_mut(&mut self.base).as_mut_slice()
+    }
+}
+
+// ============================================================================
+// Area & Point Indexes
+// ============================================================================
+
+// A multi-cell range reference is indexed once per unique AreaId per column (or per row bucket
+// for wide ranges > 512 cols), in the smallest aligned row bucket containing both endpoints.
+// A point lookup visits at most seven buckets.
 const ROW_SHIFTS: [u32; 7] = [5, 10, 15, 20, 25, 30, 32];
 
 #[inline]
@@ -146,23 +632,90 @@ struct AreaInterval {
     last: u32,
 }
 
+#[derive(Clone, Copy)]
+struct WideInterval {
+    area_id: u32,
+    r1: u32,
+    r2: u32,
+    c1: u32,
+    c2: u32,
+}
+
 #[derive(Clone, Default)]
 struct SharedArea {
     rect: CompactRect,
-    subscribers: Vec<u32>,
+    subscribers: Arc<Vec<u32>>,
+    extra_subscribers: Arc<Vec<u32>>,
+}
+
+impl SharedArea {
+    fn new(rect: CompactRect, first_sub: u32) -> Self {
+        Self {
+            rect,
+            subscribers: Arc::new(vec![first_sub]),
+            extra_subscribers: Arc::new(Vec::new()),
+        }
+    }
+
+    fn push_subscriber(&mut self, formula_id: u32) {
+        if self.extra_subscribers.is_empty() && Arc::strong_count(&self.subscribers) == 1 {
+            Arc::get_mut(&mut self.subscribers)
+                .unwrap()
+                .push(formula_id);
+            return;
+        }
+        let extra = Arc::make_mut(&mut self.extra_subscribers);
+        extra.push(formula_id);
+        if extra.len() >= 256
+            || (extra.len() >= 32 && Arc::strong_count(&self.subscribers) == 1)
+        {
+            let subs = Arc::make_mut(&mut self.subscribers);
+            subs.extend_from_slice(extra);
+            extra.clear();
+        }
+    }
+
+    #[inline]
+    fn visit_subscribers(&self, emit: &mut impl FnMut(u32) -> bool) -> bool {
+        for &sub in self.subscribers.iter() {
+            if !emit(sub) {
+                return false;
+            }
+        }
+        for &sub in self.extra_subscribers.iter() {
+            if !emit(sub) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn retain_live(&mut self, slots: &SlotTable) {
+        if !self.extra_subscribers.is_empty() {
+            let extra = std::mem::take(Arc::make_mut(&mut self.extra_subscribers));
+            Arc::make_mut(&mut self.subscribers).extend(extra);
+        }
+        Arc::make_mut(&mut self.subscribers).retain(|&id| slots.is_live(id));
+    }
 }
 
 #[derive(Clone, Default)]
 struct PointColumn {
-    sorted: Vec<(u32, u32)>,
-    unsorted: Vec<(u32, u32)>,
+    sorted: Arc<Vec<(u32, u32)>>,
+    unsorted: Arc<Vec<(u32, u32)>>,
 }
 
 impl PointColumn {
     #[inline]
+    fn push_bulk(&mut self, row: u32, formula_id: u32) {
+        Arc::make_mut(&mut self.unsorted).push((row, formula_id));
+    }
+
+    #[inline]
     fn push_unsorted(&mut self, row: u32, formula_id: u32) {
-        self.unsorted.push((row, formula_id));
-        if self.unsorted.len() >= 64 {
+        let unsorted = Arc::make_mut(&mut self.unsorted);
+        unsorted.push((row, formula_id));
+        if unsorted.len() >= 64 {
             self.seal();
         }
     }
@@ -171,19 +724,30 @@ impl PointColumn {
         if self.unsorted.is_empty() {
             return;
         }
-        self.sorted.append(&mut self.unsorted);
-        self.sorted.sort_unstable_by_key(|&(row, id)| (row, id));
-        self.sorted.dedup();
+        let mut unsorted = std::mem::take(Arc::make_mut(&mut self.unsorted));
+        let sorted = Arc::make_mut(&mut self.sorted);
+        if sorted.is_empty() {
+            if !unsorted.is_sorted_by_key(|&(r, id)| (r, id)) {
+                unsorted.sort_unstable_by_key(|&(row, id)| (row, id));
+            }
+            unsorted.dedup();
+            *sorted = unsorted;
+        } else {
+            sorted.append(&mut unsorted);
+            sorted.sort_unstable_by_key(|&(row, id)| (row, id));
+            sorted.dedup();
+        }
     }
 
     fn query_sorted_rows(&self, rows: &[CellKey], mut emit: impl FnMut(u32) -> bool) -> bool {
         if !self.sorted.is_empty() {
+            let sorted = self.sorted.as_slice();
             let mut lo = 0usize;
             for &(_, r, _) in rows {
-                lo += self.sorted[lo..].partition_point(|&(pr, _)| pr < r);
+                lo += sorted[lo..].partition_point(|&(pr, _)| pr < r);
                 let mut k = lo;
-                while k < self.sorted.len() && self.sorted[k].0 == r {
-                    if !emit(self.sorted[k].1) {
+                while k < sorted.len() && sorted[k].0 == r {
+                    if !emit(sorted[k].1) {
                         return false;
                     }
                     k += 1;
@@ -191,7 +755,7 @@ impl PointColumn {
             }
         }
         if !self.unsorted.is_empty() {
-            for &(pr, id) in &self.unsorted {
+            for &(pr, id) in self.unsorted.iter() {
                 if rows.binary_search_by_key(&pr, |k| k.1).is_ok() && !emit(id) {
                     return false;
                 }
@@ -204,30 +768,33 @@ impl PointColumn {
 #[derive(Default, Clone)]
 pub struct Deps {
     /// 公式单元格 → 引用区域。内联 0~2 个紧凑矩形以避免每条公式一次堆分配。
-    pub refs: HashMap<CellKey, FormulaRefs>,
-    formula_ids: HashMap<CellKey, u32>,
-    slots: Vec<Option<CellKey>>,
+    pub refs: RefMap,
+    formula_ids: CowMap<CellKey, u32>,
+    slots: SlotTable,
     tombstones: usize,
     /// 单格引用列索引：(sheet, col) → 按行有序的 (row, formula_id)
-    points_by_col: HashMap<(u32, u32), PointColumn>,
-    /// 多格区域共享池：相同矩形仅在列桶登记一次
-    area_map: HashMap<CompactRect, u32>,
-    areas: Vec<SharedArea>,
+    points_by_col: CowMap<(u32, u32), PointColumn>,
+    /// 多格区域共享池：相同矩形仅在列桶/行桶登记一次
+    area_map: CowMap<CompactRect, u32>,
+    areas: CowVec<SharedArea>,
     /// 拥有至少一个多格区间的 (sheet, col)，让纯点引用链完全跳过 7 次行桶查询
-    range_cols: HashSet<(u32, u32)>,
+    range_cols: CowSet<(u32, u32)>,
     /// (表, 列, 行桶位数, 桶号) → AreaInterval
-    by_col: HashMap<(u32, u32, u32, u32), Vec<AreaInterval>>,
-    wide: HashMap<u32, Vec<u32>>,
+    by_col: CowMap<(u32, u32, u32, u32), Arc<Vec<AreaInterval>>>,
+    /// 拥有宽区域（列宽 > 512）的表下标，让普通表跳过宽区域行桶查询
+    wide_sheets: CowSet<u32>,
+    /// 宽区域按行分桶索引：(表, 行桶位数, 桶号) → WideInterval
+    wide_by_row: CowMap<(u32, u32, u32), Arc<Vec<WideInterval>>>,
     /// 动态数组活跃溢出区与 `#SPILL!` 阻塞监视区：anchor -> (watch_formula_id, watch_rect)
-    spill_watches: HashMap<CellKey, (u32, CompactRect)>,
-    untracked_spill_errors: HashSet<CellKey>,
+    spill_watches: CowMap<CellKey, (u32, CompactRect)>,
+    untracked_spill_errors: CowSet<CellKey>,
     has_spill_op_refs: bool,
-    volatile: HashSet<CellKey>,
-    volatile_refs: HashSet<CellKey>,
-    visibility: HashSet<CellKey>,
-    runtime_refs: HashSet<CellKey>,
-    structural_sensitive: HashSet<CellKey>,
-    indirect_definitions: HashSet<CellKey>,
+    volatile: CowSet<CellKey>,
+    volatile_refs: CowSet<CellKey>,
+    visibility: CowSet<CellKey>,
+    runtime_refs: CowSet<CellKey>,
+    structural_sensitive: CowSet<CellKey>,
+    indirect_definitions: CowSet<CellKey>,
     computed_baseline: bool,
     pub rect_count: usize,
 }
@@ -277,7 +844,10 @@ impl Deps {
     }
 
     pub(crate) fn dynamic_cells(&self) -> impl Iterator<Item = CellKey> + '_ {
-        self.runtime_refs.iter().chain(&self.volatile_refs).copied()
+        self.runtime_refs
+            .iter()
+            .chain(self.volatile_refs.iter())
+            .copied()
     }
 
     /// Recalculate visibility-aware formulas that could read the filtered sheet, plus
@@ -286,7 +856,7 @@ impl Deps {
         if self.requires_full_recalc() {
             return None;
         }
-        let mut seeds = self.volatile.clone();
+        let mut seeds: HashSet<CellKey> = self.volatile.iter().copied().collect();
         seeds.extend(self.visibility.iter().copied().filter(|key| {
             self.refs
                 .get(key)
@@ -329,26 +899,58 @@ fn sheet_span(wb: &crate::Workbook, a: &str, b: &str) -> Vec<usize> {
 }
 
 #[inline]
-fn is_position_or_layout_func(name: &str) -> bool {
-    matches!(
-        name,
-        "ROW"
-            | "COLUMN"
-            | "ROWS"
-            | "COLUMNS"
-            | "AREAS"
-            | "ADDRESS"
-            | "CELL"
-            | "INFO"
-            | "OFFSET"
-            | "INDIRECT"
-            | "FORMULATEXT"
-            | "ISFORMULA"
-            | "SUBTOTAL"
-            | "AGGREGATE"
-            | "SHEET"
-            | "SHEETS"
-    )
+fn resolve_row(r: &RefExpr, dr: i64) -> i64 {
+    if r.row_abs { r.row } else { r.row + dr }
+}
+
+#[inline]
+fn resolve_col(r: &RefExpr, dc: i64) -> i64 {
+    if r.col_abs { r.col } else { r.col + dc }
+}
+
+/// Compute shifted SUMIF 3rd-argument amount rectangle directly without mutating/cloning AST nodes.
+fn sumif_amount_rect_shifted(
+    wb: &crate::Workbook,
+    si: usize,
+    args: &[Node],
+    dr: i64,
+    dc: i64,
+) -> Option<Rect> {
+    let [criteria, _, amounts] = args else {
+        return None;
+    };
+    let (height, width) = match criteria {
+        Node::Range(a, b) => (
+            (resolve_row(a, dr) - resolve_row(b, dr)).abs(),
+            (resolve_col(a, dc) - resolve_col(b, dc)).abs(),
+        ),
+        Node::Ref(_) => (0, 0),
+        _ => return None,
+    };
+    let (start_ref, start_r, start_c) = match amounts {
+        Node::Ref(a) => (a, resolve_row(a, dr), resolve_col(a, dc)),
+        Node::Range(a, b) => (
+            a,
+            resolve_row(a, dr).min(resolve_row(b, dr)),
+            resolve_col(a, dc).min(resolve_col(b, dc)),
+        ),
+        _ => return None,
+    };
+    if start_ref.book.is_some() || start_ref.sheet2.is_some() {
+        return None;
+    }
+    let sheet = sheet_index(wb, start_ref.sheet.as_deref(), si);
+    let r1 = start_r.max(0);
+    let c1 = start_c.max(0);
+    let r2 = (start_r + height).clamp(r1, 1_048_575);
+    let c2 = (start_c + width).clamp(c1, 16_383);
+    Some(Rect {
+        sheet,
+        r1,
+        c1,
+        r2,
+        c2,
+    })
 }
 
 #[derive(Default)]
@@ -366,6 +968,8 @@ struct Dependencies {
 
 struct Walker<'a> {
     wb: &'a crate::Workbook,
+    name_index: Option<&'a super::NameIndex>,
+    has_tables: bool,
     row: u32,
     col: u32,
     bound: Vec<String>,
@@ -375,27 +979,55 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
+    fn formula_arc(&mut self, si: usize, formula: &Arc<str>) {
+        if self.has_tables {
+            let raw = formula.strip_prefix('=').unwrap_or(formula);
+            if let Some(expanded) =
+                crate::table::expand_structured_at(self.wb, si, Some(self.row), Some(self.col), raw)
+            {
+                self.result.indirect_definition = true;
+                self.result.structural_sensitive = true;
+                let _ = super::compiled::with_shifted(&expanded, self.row, self.col, |node, dr, dc| {
+                    self.walk(node, si, dr, dc)
+                });
+                return;
+            }
+        }
+        // Parse failure yields zero static references instead of forcing requires_full_recalc().
+        let _ = super::compiled::with_shifted_arc(formula, self.row, self.col, |node, dr, dc| {
+            self.walk(node, si, dr, dc)
+        });
+    }
+
     fn formula(&mut self, si: usize, formula: &str) {
         let raw = formula.strip_prefix('=').unwrap_or(formula);
-        let expanded =
-            crate::table::expand_structured_at(self.wb, si, Some(self.row), Some(self.col), raw);
+        let expanded = if self.has_tables {
+            crate::table::expand_structured_at(self.wb, si, Some(self.row), Some(self.col), raw)
+        } else {
+            None
+        };
         self.result.indirect_definition |= expanded.is_some();
         self.result.structural_sensitive |= expanded.is_some();
-        if super::compiled::with_node(
-            expanded.as_deref().unwrap_or(raw),
-            self.row,
-            self.col,
-            |node| self.walk(node, si),
-        )
-        .is_err()
-        {
-            self.result.runtime = true;
+        let body = expanded.as_deref().unwrap_or(raw);
+        // Parse failure yields zero static references instead of forcing requires_full_recalc().
+        let _ = super::compiled::with_shifted(body, self.row, self.col, |node, dr, dc| {
+            self.walk(node, si, dr, dc)
+        });
+    }
+
+    #[inline]
+    fn resolve_name(&self, name: &str, si: usize, scoped: bool) -> Option<usize> {
+        match self.name_index {
+            Some(ix) => ix.find(name, si, scoped),
+            None => super::named_definition(self.wb, name, si, scoped),
         }
     }
 
     fn name(&mut self, si: usize, name: &str, scoped: bool) {
-        let Some(index) = super::named_definition(self.wb, name, si, scoped) else {
-            self.result.runtime = true;
+        let Some(index) = self.resolve_name(name, si, scoped) else {
+            // Undefined name (e.g. `=UndefinedName+1`): treat as dynamic/volatile_ref so it
+            // recalculates with edits without degrading the entire workbook to full recalc.
+            self.result.volatile_ref = true;
             return;
         };
         self.definition(si, index);
@@ -418,13 +1050,15 @@ impl Walker<'_> {
         self.names.pop();
     }
 
-    fn walk(&mut self, node: &Node, si: usize) {
+    fn walk(&mut self, node: &Node, si: usize, dr: i64, dc: i64) {
         let wb = self.wb;
         // Only position/layout/visibility-observing functions or dynamic indirections
         // can change result when all referenced cell/range inputs remain identical.
         self.result.structural_sensitive |= match node {
             Node::Func(name, _) => {
-                is_position_or_layout_func(name.as_str()) || !super::functions::listed_builtin(name)
+                let id = name.id();
+                id.is_position_or_layout()
+                    || (!id.is_known_builtin() && !super::functions::listed_builtin(name.as_str()))
             }
             Node::Ref(r) => r.book.is_some() || r.sheet2.is_some(),
             Node::Range(a, b) => {
@@ -435,45 +1069,63 @@ impl Walker<'_> {
         };
         match node {
             Node::Ref(re) | Node::Spill(re) => {
+                let r = resolve_row(re, dr).max(0);
+                let c = resolve_col(re, dc).max(0);
                 if matches!(node, Node::Spill(_)) {
                     self.result.spill_op = true;
                     let idx = sheet_index(wb, re.sheet.as_deref(), si);
-                    let anchor = crate::CellRef::new(re.row.max(0) as u32, re.col.max(0) as u32);
+                    let anchor = crate::CellRef::new(r as u32, c as u32);
                     if re.book.is_some() || re.sheet2.is_some() {
-                        self.result.runtime = true;
+                        // External / 3D spill ref always evaluates to #REF!
+                        return;
                     } else if let Some(&(rows, cols)) =
                         wb.sheets.get(idx).and_then(|s| s.spill_shapes.get(&anchor))
                     {
                         if rows > 0 && cols > 0 {
-                            let r1 = re.row.max(0);
-                            let c1 = re.col.max(0);
                             self.result.rects.push(Rect {
                                 sheet: idx,
-                                r1,
-                                c1,
-                                r2: r1 + i64::from(rows) - 1,
-                                c2: c1 + i64::from(cols) - 1,
+                                r1: r,
+                                c1: c,
+                                r2: r + i64::from(rows) - 1,
+                                c2: c + i64::from(cols) - 1,
                             });
                             return;
                         }
-                        // Blocked `(0, 0)` anchor: fall through to register the anchor `(idx, r, c)`
-                        // point dependency; the anchor itself has a `spill_watch` (or `untracked_spill_errors`).
+                        // Blocked `(0, 0)` anchor: fall through to register anchor point dep;
+                        // the anchor itself has a `spill_watch` (or `untracked_spill_errors`).
                     } else {
-                        self.result.runtime = true;
+                        let uncalculated_formula_anchor = wb
+                            .sheets
+                            .get(idx)
+                            .and_then(|s| s.get(anchor.row, anchor.col))
+                            .is_some_and(|cell| {
+                                cell.formula.is_some() && cell.value == crate::Value::Empty
+                            });
+                        if uncalculated_formula_anchor {
+                            // Anchor formula has never been evaluated yet so its spill shape is unknown.
+                            self.result.runtime = true;
+                        } else {
+                            // Anchor currently has no spill shape (scalar / empty): track as dynamic
+                            // cell + anchor point dep instead of forcing whole-workbook full recalc.
+                            self.result.volatile_ref = true;
+                        }
                     }
                 }
                 if re.book.is_some() {
                     return;
                 }
-                let sheets = if let (Some(a), Some(b)) = (re.sheet.as_deref(), re.sheet2.as_deref())
-                {
-                    sheet_span(wb, a, b)
+                if let (Some(a), Some(b)) = (re.sheet.as_deref(), re.sheet2.as_deref()) {
+                    for sheet in sheet_span(wb, a, b) {
+                        self.result.rects.push(Rect {
+                            sheet,
+                            r1: r,
+                            c1: c,
+                            r2: r,
+                            c2: c,
+                        });
+                    }
                 } else {
-                    vec![sheet_index(wb, re.sheet.as_deref(), si)]
-                };
-                let r = re.row.max(0);
-                let c = re.col.max(0);
-                for sheet in sheets {
+                    let sheet = sheet_index(wb, re.sheet.as_deref(), si);
                     self.result.rects.push(Rect {
                         sheet,
                         r1: r,
@@ -487,24 +1139,42 @@ impl Walker<'_> {
                 if a.book.is_some() || b.book.is_some() {
                     return;
                 }
-                let sheets = if let (Some(x), Some(y)) = (a.sheet.as_deref(), a.sheet2.as_deref()) {
-                    sheet_span(wb, x, y)
+                let ar = resolve_row(a, dr);
+                let br = resolve_row(b, dr);
+                let ac = resolve_col(a, dc);
+                let bc = resolve_col(b, dc);
+                let r1 = ar.min(br).max(0);
+                let c1 = ac.min(bc).max(0);
+                let r2 = ar.max(br).max(0);
+                let c2 = ac.max(bc).max(0);
+                if let (Some(x), Some(y)) = (a.sheet.as_deref(), a.sheet2.as_deref()) {
+                    for sheet in sheet_span(wb, x, y) {
+                        self.result.rects.push(Rect {
+                            sheet,
+                            r1,
+                            c1,
+                            r2,
+                            c2,
+                        });
+                    }
                 } else if let (Some(x), Some(y)) = (b.sheet.as_deref(), b.sheet2.as_deref()) {
-                    sheet_span(wb, x, y)
+                    for sheet in sheet_span(wb, x, y) {
+                        self.result.rects.push(Rect {
+                            sheet,
+                            r1,
+                            c1,
+                            r2,
+                            c2,
+                        });
+                    }
                 } else {
-                    vec![sheet_index(
-                        wb,
-                        a.sheet.as_deref().or(b.sheet.as_deref()),
-                        si,
-                    )]
-                };
-                for sheet in sheets {
+                    let sheet = sheet_index(wb, a.sheet.as_deref().or(b.sheet.as_deref()), si);
                     self.result.rects.push(Rect {
                         sheet,
-                        r1: a.row.min(b.row).max(0),
-                        c1: a.col.min(b.col).max(0),
-                        r2: a.row.max(b.row).max(0),
-                        c2: a.col.max(b.col).max(0),
+                        r1,
+                        c1,
+                        r2,
+                        c2,
                     });
                 }
             }
@@ -526,74 +1196,72 @@ impl Walker<'_> {
                     self.name(target, name, true);
                 }
             }
-            Node::Func(name, args) if name == "LET" && args.len() >= 3 => {
+            Node::Func(name, args) if name.id() == FuncId::Let && args.len() >= 3 => {
                 let base = self.bound.len();
                 for pair in args[..args.len() - 1].chunks_exact(2) {
                     if let Node::Name(n) = &pair[0] {
-                        self.walk(&pair[1], si);
+                        self.walk(&pair[1], si, dr, dc);
                         self.bound.push(n.clone());
                     }
                 }
-                self.walk(args.last().unwrap(), si);
+                self.walk(args.last().unwrap(), si, dr, dc);
                 self.bound.truncate(base);
             }
-            Node::Func(name, args) if name == "LAMBDA" && !args.is_empty() => {
+            Node::Func(name, args) if name.id() == FuncId::Lambda && !args.is_empty() => {
                 let base = self.bound.len();
                 for p in &args[..args.len() - 1] {
                     if let Node::Name(n) = p {
                         self.bound.push(n.clone());
                     }
                 }
-                self.walk(args.last().unwrap(), si);
+                self.walk(args.last().unwrap(), si, dr, dc);
                 self.bound.truncate(base);
             }
             Node::Func(name, args)
-                if name == "__CALL__"
+                if name.id() == FuncId::InternalCall
                     && matches!(args.first(), Some(Node::ScopedName { book: None, .. })) =>
             {
                 let caller = std::mem::take(&mut self.bound);
-                self.walk(&args[0], si);
+                self.walk(&args[0], si, dr, dc);
                 self.bound = caller;
                 for arg in &args[1..] {
-                    self.walk(arg, si);
+                    self.walk(arg, si, dr, dc);
                 }
             }
             Node::Func(name, args) => {
+                let id = name.id();
                 if !wb.names.is_empty()
-                    && !super::functions::listed_builtin(name)
-                    && !self.bound.iter().any(|local| local == name)
-                    && let Some(index) = super::named_definition(wb, name, si, false)
+                    && !id.is_known_builtin()
+                    && !super::functions::listed_builtin(name.as_str())
+                    && !self.bound.iter().any(|local| local == name.as_str())
+                    && let Some(index) = self.resolve_name(name.as_str(), si, false)
                 {
                     let caller = std::mem::take(&mut self.bound);
                     self.definition(si, index);
                     self.bound = caller;
                 }
-                self.result.volatile_ref |= matches!(name.as_str(), "INDIRECT" | "OFFSET");
-                self.result.visibility |= matches!(name.as_str(), "SUBTOTAL" | "AGGREGATE");
-                self.result.volatile |= matches!(
-                    name.as_str(),
-                    "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY"
-                );
-                let amounts = if name == "SUMIF" {
-                    super::sumif_amount_range(args)
+                self.result.volatile_ref |= id.is_volatile_ref();
+                self.result.visibility |= id.is_visibility();
+                self.result.volatile |= id.is_volatile();
+                let sumif_rect = if id == FuncId::SumIf {
+                    sumif_amount_rect_shifted(wb, si, args, dr, dc)
                 } else {
                     None
                 };
                 for (i, a) in args.iter().enumerate() {
-                    self.walk(
-                        if i == 2 {
-                            amounts.as_ref().unwrap_or(a)
-                        } else {
-                            a
-                        },
-                        si,
-                    );
+                    if i == 2
+                        && let Some(rect) = sumif_rect
+                    {
+                        self.result.rects.push(rect);
+                    } else {
+                        self.walk(a, si, dr, dc);
+                    }
                 }
             }
-            Node::Implicit(x) | Node::Unary(_, x) | Node::Percent(x) => self.walk(x, si),
+            Node::Implicit(x) | Node::Unary(_, x) | Node::Percent(x) => self.walk(x, si, dr, dc),
             Node::Binary(_, l, r) => {
-                self.walk(l, si);
-                self.walk(r, si);
+                self.walk(l, si, dr, dc);
+                self.walk(r, si, dr, dc);
             }
             _ => {}
         }
@@ -610,9 +1278,24 @@ pub(super) fn parallel_inputs(wb: &crate::Workbook, key: CellKey, src: &str) -> 
         .then_some(info.rects)
 }
 
+pub(super) fn parallel_inputs_arc(
+    wb: &crate::Workbook,
+    name_index: Option<&super::NameIndex>,
+    has_tables: bool,
+    key: CellKey,
+    formula: &Arc<str>,
+) -> Option<Vec<Rect>> {
+    let info = dependencies_arc(wb, name_index, has_tables, key, formula);
+    (!info.runtime && !info.volatile && !info.volatile_ref && !info.visibility)
+        .then_some(info.rects)
+}
+
 fn dependencies(wb: &crate::Workbook, key: CellKey, formula: &str) -> Dependencies {
+    let has_tables = wb.sheets.iter().any(|s| !s.tables.is_empty());
     let mut walker = Walker {
         wb,
+        name_index: None,
+        has_tables,
         row: key.1,
         col: key.2,
         bound: Vec::new(),
@@ -624,22 +1307,58 @@ fn dependencies(wb: &crate::Workbook, key: CellKey, formula: &str) -> Dependenci
     walker.result
 }
 
+fn dependencies_arc(
+    wb: &crate::Workbook,
+    name_index: Option<&super::NameIndex>,
+    has_tables: bool,
+    key: CellKey,
+    formula: &Arc<str>,
+) -> Dependencies {
+    let mut walker = Walker {
+        wb,
+        name_index,
+        has_tables,
+        row: key.1,
+        col: key.2,
+        bound: Vec::new(),
+        names: Vec::new(),
+        name_expansions: 0,
+        result: Dependencies::default(),
+    };
+    walker.formula_arc(key.0, formula);
+    walker.result
+}
+
 impl Deps {
     pub fn build(wb: &crate::Workbook) -> Deps {
-        let mut deps = Deps::default();
-        let mut jobs: Vec<(CellKey, &str, bool)> = Vec::new();
+        Self::build_filtered(wb, None)
+    }
+
+    pub(crate) fn build_filtered(wb: &crate::Workbook, selected: Option<&[bool]>) -> Deps {
+        let mut jobs: Vec<(CellKey, &Arc<str>, bool)> = Vec::new();
         for (si, sheet) in wb.sheets.iter().enumerate() {
+            if selected.is_some_and(|mask| !mask.get(si).copied().unwrap_or(false)) {
+                continue;
+            }
             for (cell_ref, cell) in sheet.formula_cells() {
-                if let Some(f) = cell.formula.as_deref() {
+                if let Some(f) = cell.formula.as_ref() {
                     let is_spill_err = super::is_cached_spill_error(&cell.value);
                     jobs.push(((si, cell_ref.row, cell_ref.col), f, is_spill_err));
                 }
             }
         }
+        let mut deps = Deps {
+            refs: RefMap::with_capacity(jobs.len()),
+            formula_ids: CowMap::with_capacity(jobs.len()),
+            slots: SlotTable::with_capacity(jobs.len()),
+            ..Default::default()
+        };
+        let has_tables = wb.sheets.iter().any(|s| !s.tables.is_empty());
+        let name_index = super::NameIndex::build_if_needed(wb);
+        let name_ix_ref = name_index.as_ref();
         let mut blocked_spills: Vec<CellKey> = Vec::new();
-        let workers = if jobs.len() >= 4_096 {
-            std::thread::available_parallelism()
-                .map_or(1, |n| n.get())
+        let workers = if jobs.len() >= 2_048 {
+            super::pool::max_workers()
                 .min(jobs.len().div_ceil(512))
                 .min(16)
         } else {
@@ -647,7 +1366,7 @@ impl Deps {
         };
         if workers <= 1 {
             for &(key, f, is_spill_err) in &jobs {
-                let mut info = dependencies(wb, key, f);
+                let mut info = dependencies_arc(wb, name_ix_ref, has_tables, key, f);
                 info.cached_spill_error = is_spill_err;
                 if is_spill_err {
                     blocked_spills.push(key);
@@ -655,49 +1374,58 @@ impl Deps {
                 deps.insert_building(key, info);
             }
         } else {
-            use std::sync::{
-                atomic::{AtomicUsize, Ordering},
-                mpsc,
-            };
-            const CHUNK: usize = 256;
-            let next = AtomicUsize::new(0);
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            const CHUNK: usize = 512;
+            let num_chunks = jobs.len().div_ceil(CHUNK);
+            let next_chunk = AtomicUsize::new(0);
+            let outputs: Vec<Mutex<Vec<(CellKey, Dependencies)>>> =
+                (0..num_chunks).map(|_| Mutex::new(Vec::new())).collect();
             let jobs_slice = jobs.as_slice();
-            std::thread::scope(|scope| {
-                let (tx, rx) = mpsc::sync_channel(workers * 2);
-                for _ in 0..workers {
-                    let tx = tx.clone();
-                    let next = &next;
-                    scope.spawn(move || {
-                        loop {
-                            let start = next.fetch_add(CHUNK, Ordering::Relaxed);
-                            if start >= jobs_slice.len() {
-                                break;
-                            }
-                            let end = (start + CHUNK).min(jobs_slice.len());
-                            let mut batch = Vec::with_capacity(end - start);
-                            for &(key, f, is_spill_err) in &jobs_slice[start..end] {
-                                let mut info = dependencies(wb, key, f);
-                                info.cached_spill_error = is_spill_err;
-                                batch.push((key, info));
-                            }
-                            tx.send(batch).unwrap();
-                        }
-                    });
-                }
-                drop(tx);
-                for batch in rx {
-                    for (key, info) in batch {
-                        if info.cached_spill_error {
-                            blocked_spills.push(key);
-                        }
-                        deps.insert_building(key, info);
+            super::pool::run_parallel(workers, |_| {
+                loop {
+                    let ci = next_chunk.fetch_add(1, Ordering::Relaxed);
+                    if ci >= num_chunks {
+                        break;
                     }
+                    let start = ci * CHUNK;
+                    let end = (start + CHUNK).min(jobs_slice.len());
+                    let mut batch = Vec::with_capacity(end - start);
+                    for &(key, f, is_spill_err) in &jobs_slice[start..end] {
+                        let mut info = dependencies_arc(wb, name_ix_ref, has_tables, key, f);
+                        info.cached_spill_error = is_spill_err;
+                        batch.push((key, info));
+                    }
+                    *outputs[ci].lock().unwrap() = batch;
                 }
             });
+            for chunk_mutex in outputs {
+                for (key, info) in chunk_mutex.into_inner().unwrap() {
+                    if info.cached_spill_error {
+                        blocked_spills.push(key);
+                    }
+                    deps.insert_building(key, info);
+                }
+            }
         }
-        deps.index_workbook_spills(wb, &blocked_spills);
+        deps.index_workbook_spills(wb, selected, &blocked_spills);
         deps.seal_points();
         deps
+    }
+
+    /// Incrementally refresh spill watches for specific anchor keys without rebuilding the full graph.
+    pub(crate) fn refresh_spills(
+        &mut self,
+        wb: &crate::Workbook,
+        keys: impl IntoIterator<Item = CellKey>,
+    ) {
+        for key in keys {
+            let is_spill_err = wb
+                .sheets
+                .get(key.0)
+                .and_then(|s| s.get(key.1, key.2))
+                .is_some_and(|c| super::is_cached_spill_error(&c.value));
+            self.index_cell_spill(wb, key, is_spill_err);
+        }
     }
 
     /// Use only immediately after a completed whole-workbook calculation.
@@ -727,53 +1455,55 @@ impl Deps {
     }
 
     fn seal_points(&mut self) {
-        for col in self.points_by_col.values_mut() {
+        for col in self.points_by_col.base_mut_flushed().values_mut() {
             col.seal();
         }
     }
 
+    #[inline]
     fn alloc_slot(&mut self, key: CellKey) -> u32 {
-        let id = u32::try_from(self.slots.len()).expect("more than 2^32 indexed formulas");
-        self.slots.push(Some(key));
-        id
+        self.slots.alloc(key)
     }
 
     fn register_area(&mut self, rect: CompactRect, formula_id: u32) {
         if let Some(&area_id) = self.area_map.get(&rect) {
-            self.areas[area_id as usize].subscribers.push(formula_id);
+            self.areas
+                .get_mut(area_id as usize)
+                .push_subscriber(formula_id);
             return;
         }
         let area_id = u32::try_from(self.areas.len()).expect("more than 2^32 shared areas");
-        self.areas.push(SharedArea {
-            rect,
-            subscribers: vec![formula_id],
-        });
+        self.areas.push(SharedArea::new(rect, formula_id));
         self.area_map.insert(rect, area_id);
+        let (shift, bin) = row_bucket(rect.r1, rect.r2);
         if rect.c2 - rect.c1 > 512 {
-            self.wide.entry(rect.sheet).or_default().push(area_id);
+            self.wide_sheets.insert(rect.sheet);
+            let bucket_vec = self.wide_by_row.get_or_default_mut((rect.sheet, shift, bin));
+            Arc::make_mut(bucket_vec).push(WideInterval {
+                area_id,
+                r1: rect.r1,
+                r2: rect.r2,
+                c1: rect.c1,
+                c2: rect.c2,
+            });
         } else {
-            let (shift, bin) = row_bucket(rect.r1, rect.r2);
             for c in rect.c1..=rect.c2 {
                 self.range_cols.insert((rect.sheet, c));
-                self.by_col
-                    .entry((rect.sheet, c, shift, bin))
-                    .or_default()
-                    .push(AreaInterval {
-                        area_id,
-                        first: rect.r1,
-                        last: rect.r2,
-                    });
+                let bucket_vec = self.by_col.get_or_default_mut((rect.sheet, c, shift, bin));
+                Arc::make_mut(bucket_vec).push(AreaInterval {
+                    area_id,
+                    first: rect.r1,
+                    last: rect.r2,
+                });
             }
         }
     }
 
     fn insert_spill_watch(&mut self, key: CellKey, rect: CompactRect) {
-        if let Some((old_id, _)) = self.spill_watches.remove(&key) {
-            if let Some(slot) = self.slots.get_mut(old_id as usize)
-                && slot.take().is_some()
-            {
-                self.tombstones += 1;
-            }
+        if let Some((old_id, _)) = self.spill_watches.remove(&key)
+            && self.slots.tombstone(old_id)
+        {
+            self.tombstones += 1;
         }
         let watch_id = self.alloc_slot(key);
         self.register_area(rect, watch_id);
@@ -782,12 +1512,10 @@ impl Deps {
 
     fn index_cell_spill(&mut self, wb: &crate::Workbook, key: CellKey, is_spill_err: bool) {
         self.untracked_spill_errors.remove(&key);
-        if let Some((old_id, _)) = self.spill_watches.remove(&key) {
-            if let Some(slot) = self.slots.get_mut(old_id as usize)
-                && slot.take().is_some()
-            {
-                self.tombstones += 1;
-            }
+        if let Some((old_id, _)) = self.spill_watches.remove(&key)
+            && self.slots.tombstone(old_id)
+        {
+            self.tombstones += 1;
         }
         let anchor = crate::CellRef::new(key.1, key.2);
         if let Some(&(rows, cols)) = wb
@@ -829,8 +1557,16 @@ impl Deps {
         }
     }
 
-    fn index_workbook_spills(&mut self, wb: &crate::Workbook, blocked_spills: &[CellKey]) {
+    fn index_workbook_spills(
+        &mut self,
+        wb: &crate::Workbook,
+        selected: Option<&[bool]>,
+        blocked_spills: &[CellKey],
+    ) {
         for (si, sheet) in wb.sheets.iter().enumerate() {
+            if selected.is_some_and(|mask| !mask.get(si).copied().unwrap_or(false)) {
+                continue;
+            }
             for (&anchor, &(rows, cols)) in &sheet.spill_shapes {
                 if rows > 1 || cols > 1 {
                     let key = (si, anchor.row, anchor.col);
@@ -891,9 +1627,9 @@ impl Deps {
         self.formula_ids.insert(key, id);
         for &r in &compact {
             if r.is_point() {
-                let col_entry = self.points_by_col.entry((r.sheet, r.c1)).or_default();
+                let col_entry = self.points_by_col.get_or_default_mut((r.sheet, r.c1));
                 if bulk_building {
-                    col_entry.unsorted.push((r.r1, id));
+                    col_entry.push_bulk(r.r1, id);
                 } else {
                     col_entry.push_unsorted(r.r1, id);
                 }
@@ -910,17 +1646,15 @@ impl Deps {
             return;
         }
         let slots = &self.slots;
-        for col in self.points_by_col.values_mut() {
-            col.sorted
-                .retain(|&(_, id)| slots.get(id as usize).is_some_and(Option::is_some));
-            col.unsorted
-                .retain(|&(_, id)| slots.get(id as usize).is_some_and(Option::is_some));
+        let points_base = self.points_by_col.base_mut_flushed();
+        for col in points_base.values_mut() {
+            Arc::make_mut(&mut col.sorted).retain(|&(_, id)| slots.is_live(id));
+            Arc::make_mut(&mut col.unsorted).retain(|&(_, id)| slots.is_live(id));
         }
-        self.points_by_col
-            .retain(|_, col| !col.sorted.is_empty() || !col.unsorted.is_empty());
-        for area in &mut self.areas {
-            area.subscribers
-                .retain(|&id| slots.get(id as usize).is_some_and(Option::is_some));
+        points_base.retain(|_, col| !col.sorted.is_empty() || !col.unsorted.is_empty());
+        self.points_by_col.len = points_base.len();
+        for area in self.areas.as_mut_slice_flushed() {
+            area.retain_live(slots);
         }
         self.tombstones = 0;
     }
@@ -930,8 +1664,7 @@ impl Deps {
             self.rect_count -= old_refs.len();
         }
         if let Some(old_id) = self.formula_ids.remove(&key)
-            && let Some(slot) = self.slots.get_mut(old_id as usize)
-            && slot.take().is_some()
+            && self.slots.tombstone(old_id)
         {
             self.tombstones += 1;
         }
@@ -943,35 +1676,34 @@ impl Deps {
         self.volatile.remove(&key);
         self.untracked_spill_errors.remove(&key);
         if let Some((old_watch_id, _)) = self.spill_watches.remove(&key)
-            && let Some(slot) = self.slots.get_mut(old_watch_id as usize)
-            && slot.take().is_some()
+            && self.slots.tombstone(old_watch_id)
         {
             self.tombstones += 1;
         }
         self.maybe_compact_tombstones();
 
         if let Some(cell) = wb.sheets.get(key.0).and_then(|s| s.get(key.1, key.2))
-            && let Some(f) = cell.formula.as_deref()
+            && let Some(f) = cell.formula.as_ref()
         {
             let is_spill_err = super::is_cached_spill_error(&cell.value);
-            let mut info = dependencies(wb, key, f);
+            let has_tables = wb.sheets.iter().any(|s| !s.tables.is_empty());
+            let mut info = dependencies_arc(wb, None, has_tables, key, f);
             info.cached_spill_error = is_spill_err;
             self.insert(key, info);
             self.index_cell_spill(wb, key, is_spill_err);
         }
     }
 
+    /// Supports incremental structural recalculation even when `wb.names` or `sheet.tables`
+    /// exist: formulas referencing names or structured table columns are marked
+    /// `structural_sensitive` and re-expanded/recalculated accurately.
     pub fn supports_structural(&self, wb: &crate::Workbook) -> bool {
         self.computed_baseline
             && !self.requires_full_recalc()
             && self.spill_watches.is_empty()
-            && wb.names.is_empty()
             && !wb.calc_iterate
             && wb.sheets.iter().all(|s| {
-                s.tables.is_empty()
-                    && s.arrays.is_empty()
-                    && s.spill_shapes.is_empty()
-                    && s.spilled.is_empty()
+                s.arrays.is_empty() && s.spill_shapes.is_empty() && s.spilled.is_empty()
             })
     }
 
@@ -981,7 +1713,7 @@ impl Deps {
 
     fn structural_sheets(&self, edited: usize, count: usize) -> Vec<bool> {
         let mut readers = vec![HashSet::new(); count];
-        for (formula, refs) in &self.refs {
+        for (formula, refs) in self.refs.iter() {
             for r in refs.as_slice() {
                 let target = r.sheet as usize;
                 if formula.0 != target && target < count {
@@ -993,9 +1725,9 @@ impl Deps {
         pending.extend(
             self.indirect_definitions
                 .iter()
-                .chain(&self.volatile)
-                .chain(&self.runtime_refs)
-                .chain(&self.untracked_spill_errors)
+                .chain(self.volatile.iter())
+                .chain(self.runtime_refs.iter())
+                .chain(self.untracked_spill_errors.iter())
                 .chain(self.spill_watches.keys())
                 .map(|k| k.0),
         );
@@ -1038,6 +1770,8 @@ impl Deps {
                 .unwrap_or_default();
             let info = Dependencies {
                 rects,
+                volatile: self.volatile.contains(&key),
+                volatile_ref: self.volatile_refs.contains(&key),
                 structural_sensitive: self.structural_sensitive.contains(&key),
                 visibility: self.visibility.contains(&key),
                 indirect_definition: self.indirect_definitions.contains(&key),
@@ -1048,11 +1782,13 @@ impl Deps {
         for &key in self.refs.keys() {
             keep(key);
         }
-        for &key in &self.structural_sensitive {
+        for &key in self.structural_sensitive.iter() {
             if !self.refs.contains_key(&key) {
                 keep(key);
             }
         }
+        let has_tables = wb.sheets.iter().any(|s| !s.tables.is_empty());
+        let name_index = super::NameIndex::build_if_needed(wb);
         for (si, sheet) in wb.sheets.iter().enumerate().filter(|(si, _)| selected[*si]) {
             for (k, cell) in sheet.formula_cells() {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1060,7 +1796,13 @@ impl Deps {
                 }
                 let key = (si, k.row, k.col);
                 let is_spill_err = super::is_cached_spill_error(&cell.value);
-                let mut info = dependencies(wb, key, cell.formula.as_deref()?);
+                let mut info = dependencies_arc(
+                    wb,
+                    name_index.as_ref(),
+                    has_tables,
+                    key,
+                    cell.formula.as_ref()?,
+                );
                 info.cached_spill_error = is_spill_err;
                 if is_spill_err {
                     blocked_spills.push(key);
@@ -1068,7 +1810,7 @@ impl Deps {
                 next.insert_building(key, info);
             }
         }
-        next.index_workbook_spills(wb, &blocked_spills);
+        next.index_workbook_spills(wb, None, &blocked_spills);
         next.seal_points();
         Some(next)
     }
@@ -1099,17 +1841,28 @@ impl Deps {
                 Some((si, r, c))
             }
         };
-        for old in self.refs.keys().chain(
-            self.structural_sensitive
-                .iter()
-                .filter(|k| !self.refs.contains_key(k)),
-        ) {
+        let has_tables = wb.sheets.iter().any(|s| !s.tables.is_empty());
+        let name_index = super::NameIndex::build_if_needed(wb);
+        let mut visited_old: FxHashSet<CellKey> = FxHashSet::default();
+        let mut visited_new: FxHashSet<CellKey> = FxHashSet::default();
+        let all_old = self
+            .refs
+            .keys()
+            .chain(self.structural_sensitive.iter())
+            .chain(self.volatile.iter())
+            .chain(self.volatile_refs.iter());
+        for old in all_old {
+            if !visited_old.insert(*old) {
+                continue;
+            }
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
             let Some(key) = relocate(*old) else { continue };
+            visited_new.insert(key);
             let old_compact = self.refs.get(old).map(FormulaRefs::as_slice).unwrap_or(&[]);
             if !self.structural_sensitive.contains(old)
+                && !self.volatile_refs.contains(old)
                 && key == *old
                 && !old_compact.iter().any(|r| {
                     r.sheet as usize == sheet
@@ -1123,19 +1876,24 @@ impl Deps {
                     key,
                     Dependencies {
                         rects: old_compact.iter().copied().map(CompactRect::to_rect).collect(),
+                        volatile: self.volatile.contains(old),
+                        volatile_ref: self.volatile_refs.contains(old),
+                        visibility: self.visibility.contains(old),
+                        indirect_definition: self.indirect_definitions.contains(old),
                         ..Default::default()
                     },
                 );
                 continue;
             }
             let cell = wb.sheets[key.0].get(key.1, key.2)?;
-            let formula = cell.formula.as_deref()?;
-            let mut info = dependencies(wb, key, formula);
+            let formula = cell.formula.as_ref()?;
+            let mut info = dependencies_arc(wb, name_index.as_ref(), has_tables, key, formula);
             info.cached_spill_error = super::is_cached_spill_error(&cell.value);
             let stable = cell.value != crate::Value::Empty
                 && !self.structural_sensitive.contains(old)
                 && !info.structural_sensitive
                 && !info.runtime
+                && !info.volatile_ref
                 && info.rects.len() == old_compact.len()
                 && old_compact.iter().zip(&info.rects).all(|(r, n)| {
                     if r.is_point() {
@@ -1161,6 +1919,32 @@ impl Deps {
             }
             next.insert_building(key, info);
         }
+
+        // Row insertion inside a Table may fill calculated-column formulas into the newly
+        // inserted rows (see `Sheet::apply_table_row_fills`). Index and evaluate them too.
+        if let crate::structural::Structural::InsertRows { at, n } = *op
+            && n > 0
+            && let Some(sh) = wb.sheets.get(sheet)
+            && !sh.tables.is_empty()
+        {
+            let r_end = at.saturating_add(n - 1);
+            for t in &sh.tables {
+                let (_, c1, _, c2) = t.range;
+                for (cref, cell) in sh.iter_rect((at, c1, r_end, c2)) {
+                    if let Some(f) = cell.formula.as_ref() {
+                        let key = (sheet, cref.row, cref.col);
+                        if visited_new.insert(key) {
+                            let mut info =
+                                dependencies_arc(wb, name_index.as_ref(), has_tables, key, f);
+                            info.cached_spill_error = super::is_cached_spill_error(&cell.value);
+                            seeds.push(key);
+                            next.insert_building(key, info);
+                        }
+                    }
+                }
+            }
+        }
+
         next.seal_points();
         if !super::recalc_dirty_cancelable(wb, &next, &seeds, cancel) {
             return None;
@@ -1190,7 +1974,13 @@ impl Deps {
         }
         let shift = op.reference_shift();
         let mut slots = HashSet::new();
-        for key in self.refs.keys().chain(&self.structural_sensitive) {
+        for key in self
+            .refs
+            .keys()
+            .chain(self.structural_sensitive.iter())
+            .chain(self.volatile.iter())
+            .chain(self.volatile_refs.iter())
+        {
             let &(si, row, col) = key;
             let moved = if si == sheet {
                 crate::sync::shift_structural_coord(row, col, op).map(|(r, c)| (si, r, c))
@@ -1199,6 +1989,7 @@ impl Deps {
             };
             if moved == Some(*key)
                 && !self.structural_sensitive.contains(key)
+                && !self.volatile_refs.contains(key)
                 && !self.refs.get(key).is_some_and(|refs| {
                     refs.as_slice().iter().any(|r| {
                         r.sheet as usize == sheet
@@ -1217,6 +2008,43 @@ impl Deps {
                 return None;
             }
         }
+        // Include newly filled calculated-column rows if inserting rows into a Table.
+        if let crate::structural::Structural::InsertRows { at, n } = *op
+            && n > 0
+            && let Some(sh) = wb.sheets.get(sheet)
+            && !sh.tables.is_empty()
+        {
+            for t in &sh.tables {
+                let (r1, c1, r2, c2) = t.range;
+                let data_start = if t.header_row { r1 + 1 } else { r1 };
+                let data_end = if t.totals_row {
+                    r2.saturating_sub(1)
+                } else {
+                    r2
+                };
+                let max_insert = if t.totals_row { r2 } else { r2 + 1 };
+                if at <= r1 || at > max_insert || data_start > data_end {
+                    continue;
+                }
+                let source = if at > data_start { at - 1 } else { data_start };
+                if source < data_start || source > data_end {
+                    continue;
+                }
+                for col in c1..=c2 {
+                    if sh
+                        .get(source, col)
+                        .is_some_and(|cell| cell.formula.is_some())
+                    {
+                        for k in 0..n {
+                            slots.insert((sheet, at + k, col));
+                            if slots.len() > limit {
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Some(slots.into_iter().collect())
     }
 
@@ -1229,7 +2057,7 @@ impl Deps {
         seeds: &[CellKey],
         anchors: &HashSet<CellKey>,
     ) -> HashSet<CellKey> {
-        let excluded: HashSet<u32> = anchors
+        let excluded: FxHashSet<u32> = anchors
             .iter()
             .filter_map(|k| self.spill_watches.get(k).map(|(wid, _)| *wid))
             .collect();
@@ -1263,7 +2091,7 @@ impl Deps {
         edit: bool,
         limit: usize,
         cancel: Option<&std::sync::atomic::AtomicBool>,
-        skip_first_wave_ids: Option<&HashSet<u32>>,
+        skip_first_wave_ids: Option<&FxHashSet<u32>>,
     ) -> Option<HashSet<CellKey>> {
         let mut dirty = HashSet::new();
         let mut frontier: Vec<CellKey> = seeds.to_vec();
@@ -1274,7 +2102,7 @@ impl Deps {
             dirty.extend(self.volatile.iter().copied());
             frontier.extend(self.volatile.iter().copied());
         }
-        let mut triggered_areas: HashSet<u32> = HashSet::new();
+        let mut triggered_areas: FxHashSet<u32> = FxHashSet::default();
         let mut next = Vec::new();
         let mut first_wave = true;
         while !frontier.is_empty() {
@@ -1283,12 +2111,16 @@ impl Deps {
             }
             frontier.sort_unstable_by_key(|&(s, r, c)| (s, c, r));
             frontier.dedup();
-            let skip_now = if first_wave { skip_first_wave_ids } else { None };
+            let skip_now = if first_wave {
+                skip_first_wave_ids
+            } else {
+                None
+            };
             let mut add = |id: u32| -> bool {
                 if skip_now.is_some_and(|ex| ex.contains(&id)) {
                     return true;
                 }
-                let Some(&Some(key)) = self.slots.get(id as usize) else {
+                let Some(key) = self.slots.get(id) else {
                     return true;
                 };
                 if dirty.insert(key) {
@@ -1316,18 +2148,17 @@ impl Deps {
                         {
                             let bin = bucket(rows[0].1, shift);
                             if let Some(entries) = self.by_col.get(&(sheet_u32, col, shift, bin)) {
-                                for entry in entries {
+                                for entry in entries.iter() {
                                     if triggered_areas.contains(&entry.area_id) {
                                         continue;
                                     }
                                     let p = rows.partition_point(|k| k.1 < entry.first);
                                     if p < rows.len() && rows[p].1 <= entry.last {
                                         triggered_areas.insert(entry.area_id);
-                                        for &sub in &self.areas[entry.area_id as usize].subscribers
+                                        if let Some(area) = self.areas.get(entry.area_id as usize)
+                                            && !area.visit_subscribers(&mut add)
                                         {
-                                            if !add(sub) {
-                                                return None;
-                                            }
+                                            return None;
                                         }
                                     }
                                 }
@@ -1336,22 +2167,29 @@ impl Deps {
                     }
                 }
 
-                // 3. Wide ranges (> 512 cols)
-                if let Some(area_ids) = self.wide.get(&sheet_u32) {
-                    for &area_id in area_ids {
-                        if triggered_areas.contains(&area_id) {
-                            continue;
-                        }
-                        let r = self.areas[area_id as usize].rect;
-                        if col < r.c1 || col > r.c2 {
-                            continue;
-                        }
-                        let p = column.partition_point(|k| k.1 < r.r1);
-                        if p < column.len() && column[p].1 <= r.r2 {
-                            triggered_areas.insert(area_id);
-                            for &sub in &self.areas[area_id as usize].subscribers {
-                                if !add(sub) {
-                                    return None;
+                // 3. Wide ranges (> 512 cols) indexed symmetrically by row bucket
+                if self.wide_sheets.contains(&sheet_u32) {
+                    for shift in ROW_SHIFTS {
+                        for rows in column.chunk_by(|a, b| bucket(a.1, shift) == bucket(b.1, shift))
+                        {
+                            let bin = bucket(rows[0].1, shift);
+                            if let Some(entries) = self.wide_by_row.get(&(sheet_u32, shift, bin)) {
+                                for entry in entries.iter() {
+                                    if col < entry.c1
+                                        || col > entry.c2
+                                        || triggered_areas.contains(&entry.area_id)
+                                    {
+                                        continue;
+                                    }
+                                    let p = rows.partition_point(|k| k.1 < entry.r1);
+                                    if p < rows.len() && rows[p].1 <= entry.r2 {
+                                        triggered_areas.insert(entry.area_id);
+                                        if let Some(area) = self.areas.get(entry.area_id as usize)
+                                            && !area.visit_subscribers(&mut add)
+                                        {
+                                            return None;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1430,6 +2268,38 @@ mod tests {
             .push(("RightAlias".to_owned(), None, "LeftAlias".to_owned()));
         let d = dependencies(&wb, (0, 0, 0), "=LeftAlias");
         assert!(d.runtime);
+    }
+
+    #[test]
+    fn undefined_name_and_parse_error_do_not_degrade_to_full_recalc() {
+        let mut wb = Workbook::new_blank();
+        formula(&mut wb, 0, 0, 1, "=A1+1");
+        formula(&mut wb, 0, 0, 2, "=UndefinedName+1");
+        formula(&mut wb, 0, 0, 3, "=C1*2");
+        formula(&mut wb, 0, 0, 4, "=SUM(1,"); // syntax error
+        let d = Deps::build(&wb);
+        assert!(!d.requires_full_recalc());
+        let closure = d.edit_closure(&[(0, 0, 0)]);
+        assert!(closure.contains(&(0, 0, 1)));
+        assert!(closure.contains(&(0, 0, 2)));
+        assert!(closure.contains(&(0, 0, 3)));
+        assert!(!closure.contains(&(0, 0, 4)));
+    }
+
+    #[test]
+    fn cow_make_mut_update_preserves_shared_snapshot() {
+        let mut wb = Workbook::new_blank();
+        formula(&mut wb, 0, 0, 1, "=A1+1");
+        formula(&mut wb, 0, 1, 1, "=A2+1");
+        let mut deps = Arc::new(Deps::build(&wb));
+        let snap = Arc::clone(&deps);
+        formula(&mut wb, 0, 0, 1, "=A3+5");
+        Arc::make_mut(&mut deps).update_cell(&wb, (0, 0, 1));
+        assert_eq!(snap.closure(&[(0, 0, 0)]), HashSet::from([(0, 0, 1)]));
+        assert!(snap.closure(&[(0, 2, 0)]).is_empty());
+        assert!(deps.closure(&[(0, 0, 0)]).is_empty());
+        assert_eq!(deps.closure(&[(0, 2, 0)]), HashSet::from([(0, 0, 1)]));
+        assert_eq!(deps.closure(&[(0, 1, 0)]), HashSet::from([(0, 1, 1)]));
     }
 
     #[test]
@@ -1531,6 +2401,7 @@ mod structural_tests {
     use crate::{
         Cell, Sheet, Value, Workbook,
         structural::{Structural, apply_structural_wb},
+        table::Table,
     };
 
     #[test]
@@ -1615,6 +2486,76 @@ mod structural_tests {
                         rebuilt.edit_closure(&[(0, r, c)])
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_structural_supports_defined_names_and_tables() {
+        for op in [
+            Structural::InsertRows { at: 2, n: 1 },
+            Structural::DeleteRows { at: 1, n: 1 },
+        ] {
+            let mut wb = Workbook::new_blank();
+            wb.sheets.push(Sheet::new("Report"));
+            wb.sheets[0].set(1, 0, Cell { value: Value::Number(4.0), formula: None });
+            wb.sheets[0].set(2, 0, Cell { value: Value::Number(7.0), formula: None });
+            wb.sheets[0].set(1, 1, Cell { value: Value::Empty, formula: Some("=A2*10".into()) });
+            wb.sheets[0].set(2, 1, Cell { value: Value::Empty, formula: Some("=A3*10".into()) });
+            wb.sheets[0].tables.push(Table {
+                name: "Data".into(),
+                display: "Data".into(),
+                range: (0, 0, 2, 1),
+                columns: vec!["Amount".into(), "Scaled".into()],
+                column_ids: vec![1, 2],
+                header_row: true,
+                ..Default::default()
+            });
+            wb.names
+                .push(("AmountCells".into(), None, "Sheet1!$A$2:$A$3".into()));
+            wb.sheets[1].set(
+                0,
+                0,
+                Cell {
+                    value: Value::Empty,
+                    formula: Some("=SUM(AmountCells)+SUM(Data[Amount])+SUM(Data[Scaled])".into()),
+                },
+            );
+            wb.sheets[1].set(
+                0,
+                1,
+                Cell {
+                    value: Value::Empty,
+                    formula: Some("=A1*2".into()),
+                },
+            );
+            crate::formula::recalc_all(&mut wb);
+            let deps = Deps::build_after_recalc(&wb);
+            assert!(deps.supports_structural(&wb));
+            let mut inc = wb.clone();
+            apply_structural_wb(&mut inc, 0, &op);
+            let next_deps = deps
+                .recalc_structural(&mut inc, 0, &op, &false.into())
+                .expect("recalc_structural should handle names and tables");
+            let mut full = wb.clone();
+            apply_structural_wb(&mut full, 0, &op);
+            crate::formula::recalc_all(&mut full);
+            for (si, sh) in full.sheets.iter().enumerate() {
+                for (pos, cell) in sh.iter() {
+                    assert_eq!(
+                        inc.sheets[si].value(pos.row, pos.col),
+                        cell.value,
+                        "{op:?} sheet {si} at {pos:?}"
+                    );
+                }
+            }
+            let rebuilt = Deps::build_after_recalc(&inc);
+            for r in 0..5 {
+                assert_eq!(
+                    next_deps.edit_closure(&[(0, r, 0)]),
+                    rebuilt.edit_closure(&[(0, r, 0)]),
+                    "{op:?} closure at row {r}"
+                );
             }
         }
     }

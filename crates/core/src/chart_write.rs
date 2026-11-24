@@ -79,14 +79,14 @@ pub fn chart_from_selection(
         };
         for r in (r1 + 1)..=r2 {
             let cell = sheet.get(r, c1);
-            if let Some(v) = cell {
+            if let Some(v) = cell.as_deref() {
                 cats.push(v.value.display());
             }
             let y = sheet.get(r, c).and_then(|v| num(&v.value));
             // 散点图是 (x,y) 成对数据：X 不是数值的行整行丢弃，保证 xv/vals 一一对应；
             // 其它图型沿用原语义（第一列当分类名，空值跳过）。
             if kind == crate::charts::ChartKind::Scatter {
-                let x = cell.and_then(|v| num(&v.value));
+                let x = cell.as_deref().and_then(|v| num(&v.value));
                 if let (Some(x), Some(y)) = (x, y) {
                     xv.push(x);
                     vals.push(y);
@@ -829,11 +829,11 @@ pub fn refresh_series_from_refs(
                 let rr = cr.0 + k.min(cr.2.saturating_sub(cr.0));
                 sheet.get(rr, cr.1)
             });
-            if let Some(c) = xcell {
+            if let Some(c) = xcell.as_deref() {
                 cats.push(c.value.display());
             }
             if ch.kind == crate::charts::ChartKind::Scatter {
-                let x = xcell.and_then(|c| num(&c.value));
+                let x = xcell.as_deref().and_then(|c| num(&c.value));
                 if let (Some(x), Some(y)) = (x, y) {
                     xv.push(x);
                     vals.push(y);

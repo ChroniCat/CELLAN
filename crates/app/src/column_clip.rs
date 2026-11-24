@@ -270,11 +270,11 @@ fn plan(
             }
             if before == new_cell
                 && before_style == after_style
-                && new_cell.is_none_or(|cell| cell.formula.is_none())
+                && new_cell.as_deref().is_none_or(|cell| cell.formula.is_none())
             {
                 continue;
             }
-            let mut after = new_cell.cloned().unwrap_or_default();
+            let mut after = new_cell.map(|c| c.into_owned()).unwrap_or_default();
             if values_only {
                 after.formula = None;
             } else if col_shift != 0 {
@@ -283,7 +283,7 @@ fn plan(
                         Some(sheetcore::refs::translate(f, 0, col_shift, &target.name).into());
                 }
             }
-            let before = before.cloned().unwrap_or_default();
+            let before = before.map(|c| c.into_owned()).unwrap_or_default();
             if before == after && before_style == after_style {
                 continue;
             }
@@ -593,7 +593,7 @@ mod tests {
         app.paste_full_columns(&copied, 0, 2, true);
         for state in [Some(7.0), None, Some(7.0)] {
             let sh = &app.wb.sheets[0];
-            assert_eq!(sh.get(0, 3).cloned(), state.map(num));
+            assert_eq!(sh.get(0, 3).map(|c| c.into_owned()), state.map(num));
             assert_eq!(sh.style_of(0, 3), red);
             assert_eq!(sh.explicit_style_of(0, 3), None);
             app.do_undo(state.is_none());
@@ -627,6 +627,6 @@ mod tests {
             if ops.iter().any(|op| (op.sheet, op.row, op.col) == (0, 2, 1) && op.value == ValueWire::Empty))
         });
         app.do_undo(false);
-        assert_eq!(app.wb.sheets[0].get(2, 1).cloned(), Some(num(10.0)));
+        assert_eq!(app.wb.sheets[0].get(2, 1).map(|c| c.into_owned()), Some(num(10.0)));
     }
 }

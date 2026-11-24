@@ -16,6 +16,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::MutexGuard;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
+static ENV_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// 进程测试环境变量代数计数器：每次 `TestEnv` / `EnvTxn` 修改环境变量时递增，
+/// 供 `debug_flags` 在测试里以单次原子读同步缓存。
+pub fn env_gen() -> u64 {
+    ENV_GEN.load(Ordering::Acquire)
+}
+
+pub fn bump_env_gen() {
+    ENV_GEN.fetch_add(1, Ordering::AcqRel);
+}
 
 /// 一次测试的隔离环境。存活期间 TEMP/TMP/LOCALAPPDATA 都指向它自己的目录。
 pub struct TestEnv {
@@ -90,6 +101,7 @@ impl TestEnv {
             set_var(key, &root);
         }
         set_var("LOCALAPPDATA", &root.join("profile"));
+        bump_env_gen();
 
         if std::env::var_os("SC_ENV_TRACE").is_some() {
             eprintln!("[env-new] {:?} root={} TEMP={:?}", std::thread::current().id(), root.display(), std::env::var_os("TEMP"));
@@ -122,6 +134,7 @@ impl TestEnv {
         assert!(name.starts_with("SC_"), "只允许 SC_* 探针：{name}");
         // SAFETY: 持有 ENV_LOCK。
         unsafe { std::env::set_var(name, value) };
+        bump_env_gen();
     }
 }
 
@@ -161,6 +174,7 @@ impl Drop for TestEnv {
             // SAFETY: 仍持有 ENV_LOCK（字段 drop 顺序：先执行本函数，再释放 _lock）。
             unsafe { std::env::remove_var(&key) };
         }
+        bump_env_gen();
         // 只删自己建的目录：必须是 base 的子路径，且不等于 base 本身。
         if self.root.starts_with(&self.base) && self.root != self.base {
             let _ = std::fs::remove_dir_all(&self.root);
@@ -200,6 +214,7 @@ mod tests {
         fn set(&self, key: &'static str, value: &str) {
             // SAFETY: 本事务持有 ENV_LOCK
             unsafe { std::env::set_var(key, value) };
+            bump_env_gen();
         }
 
         /// 写哨兵值并交出守卫；原值挂到 TestEnv 上，Drop 时按「先 extra 后三项」还原。
@@ -225,6 +240,7 @@ mod tests {
                         None => unsafe { std::env::remove_var(&k) },
                     }
                 }
+                bump_env_gen();
             }
         }
     }

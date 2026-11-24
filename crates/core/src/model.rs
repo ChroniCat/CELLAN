@@ -1,4 +1,5 @@
-use crate::store::Store;
+use crate::store::{CellView, ColSlab, ColSlice, Store};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -272,6 +273,17 @@ impl<T> CellSet<T> {
         } else if !self.0.is_empty() {
             self.0 = Default::default();
         }
+    }
+
+    #[inline]
+    pub fn remove_if_present(&mut self, value: &T) -> bool
+    where
+        T: Eq + std::hash::Hash + Clone,
+    {
+        if self.0.is_empty() || !self.0.contains(value) {
+            return false;
+        }
+        std::sync::Arc::make_mut(&mut self.0).remove(value)
     }
 }
 
@@ -555,9 +567,40 @@ impl CellJournal {
         let _ = self.remove(key);
     }
 
-    #[inline]
-    pub(crate) fn raw_pages(&self) -> &HashMap<(u32, u32), [u64; 4]> {
-        &self.pages
+    /// Bitwise OR a 256-row mask directly into page `(p, col)` without decoding coordinates.
+    pub(crate) fn or_page_mask(&mut self, p: u32, col: u32, mask: [u64; 4]) {
+        if mask == [0; 4] {
+            return;
+        }
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        let entry = pages.entry((p, col)).or_default();
+        for w in 0..4 {
+            let added = mask[w] & !entry[w];
+            if added != 0 {
+                entry[w] |= added;
+                self.len += added.count_ones() as usize;
+            }
+        }
+    }
+
+    /// Bitwise clear a 256-row mask from page `(p, col)` without decoding coordinates.
+    pub(crate) fn clear_page_mask(&mut self, p: u32, col: u32, mask: [u64; 4]) {
+        if self.len == 0 || mask == [0; 4] || !self.pages.contains_key(&(p, col)) {
+            return;
+        }
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        if let Some(entry) = pages.get_mut(&(p, col)) {
+            for w in 0..4 {
+                let removed = entry[w] & mask[w];
+                if removed != 0 {
+                    entry[w] &= !removed;
+                    self.len -= removed.count_ones() as usize;
+                }
+            }
+            if *entry == [0; 4] {
+                pages.remove(&(p, col));
+            }
+        }
     }
 
     pub fn payload_bytes(&self) -> usize {
@@ -905,8 +948,34 @@ impl Sheet {
         self.source_cells = None;
     }
 
-    pub fn get(&self, r: u32, c: u32) -> Option<&Cell> {
+    #[inline]
+    pub fn get(&self, r: u32, c: u32) -> Option<Cow<'_, Cell>> {
         self.cells.get(r, c)
+    }
+
+    #[inline]
+    pub fn get_view(&self, r: u32, c: u32) -> Option<CellView<'_>> {
+        self.cells.get_view(r, c)
+    }
+
+    #[inline]
+    pub fn get_f64(&self, r: u32, c: u32) -> Option<f64> {
+        self.cells.get_f64(r, c)
+    }
+
+    #[inline]
+    pub(crate) fn get_f64_plain(&self, r: u32, c: u32) -> Option<f64> {
+        self.cells.get_f64_plain(r, c)
+    }
+
+    #[inline]
+    pub fn formula_of(&self, r: u32, c: u32) -> Option<&str> {
+        self.cells.formula_of(r, c)
+    }
+
+    #[inline]
+    pub(crate) fn formula_arc_of(&self, r: u32, c: u32) -> Option<&std::sync::Arc<str>> {
+        self.cells.formula_arc_of(r, c)
     }
 
     pub fn get_mut(&mut self, r: u32, c: u32) -> Option<&mut Cell> {
@@ -933,13 +1002,13 @@ impl Sheet {
     pub fn formula_count(&self) -> usize { self.cells.formula_count() }
 
     #[inline]
-    pub fn value_ref(&self, r: u32, c: u32) -> &Value {
-        static EMPTY: Value = Value::Empty;
-        self.cells.get(r, c).map_or(&EMPTY, |x| &x.value)
+    pub fn value_ref(&self, r: u32, c: u32) -> Cow<'_, Value> {
+        self.cells.value_ref(r, c)
     }
 
+    #[inline]
     pub fn value(&self, r: u32, c: u32) -> Value {
-        self.cells.get(r, c).map(|x| x.value.clone()).unwrap_or_default()
+        self.cells.value(r, c)
     }
 
     pub fn contains(&self, r: u32, c: u32) -> bool {
@@ -954,9 +1023,7 @@ impl Sheet {
         // 往溢出区里写东西 = 用户覆盖：从这个集合里摘掉，重算时才会判成 #SPILL!，
         // 而不是被 clear_spills 当成旧溢出值删掉（那会静默吞掉用户输入）。
         // 溢出写回自己是先 set 再 insert，顺序不受影响。
-        if !self.spilled.is_empty() {
-            self.spilled.remove(&key);
-        }
+        self.spilled.remove_if_present(&key);
         if cell.is_blank() {
             if self.cells.remove(r, c).is_some() {
                 self.cleared.insert(key);
@@ -1090,7 +1157,7 @@ impl Sheet {
     }
 
     pub(crate) fn set_formula_cache(&mut self, r: u32, c: u32, value: Value) {
-        if self.get(r, c).is_some_and(|cell| cell.value != value) {
+        if self.get_view(r, c).is_some_and(|cell| cell.value().as_ref() != &value) {
             self.cells.set_formula_cache(r, c, value);
         }
     }
@@ -1104,7 +1171,7 @@ impl Sheet {
         self.display_style_revision = self.coordinate_revision;
     }
 
-    pub(crate) fn stored_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
+    pub(crate) fn stored_cells(&self) -> impl Iterator<Item = (CellRef, CellView<'_>)> {
         self.cells.stored_cells()
     }
 
@@ -1170,8 +1237,43 @@ impl Sheet {
             && !self.spilled.symmetric_difference(&before.spilled).any(|k| hit(*k))
             && (self.cell_version() == before.cell_version() ||
                 self.changed_cells(before).chain(before.changed_cells(self)).filter(|k| hit(*k)).all(|k| {
-                    self.get(k.row,k.col).zip(before.get(k.row,k.col)).is_some_and(|(a,b)| a.same_input(b))
+                    self.get_view(k.row,k.col).zip(before.get_view(k.row,k.col)).is_some_and(|(a,b)| a.same_input(&b))
                 }))
+    }
+
+    /// Rectangle-based CSV preflight validation: O(merges + arrays + spilled + changed_pages)
+    /// without materializing millions of `(row, col)` coordinates.
+    pub fn csv_inputs_match_rects(&self, before: &Self, rects: &[(u32, u32, u32, u32)]) -> bool {
+        let hit = |k: CellRef| {
+            rects
+                .iter()
+                .any(|&(r1, c1, r2, c2)| (r1..=r2).contains(&k.row) && (c1..=c2).contains(&k.col))
+        };
+        let intersects = |&(a, b, c, d): &(u32, u32, u32, u32)| {
+            rects
+                .iter()
+                .any(|&(r1, c1, r2, c2)| a <= r2 && c >= r1 && b <= c2 && d >= c1)
+        };
+        self.merges
+            .iter()
+            .filter(|r| intersects(r))
+            .eq(before.merges.iter().filter(|r| intersects(r)))
+            && self
+                .arrays
+                .iter()
+                .filter(|(_, r)| intersects(r))
+                .eq(before.arrays.iter().filter(|(_, r)| intersects(r)))
+            && !self.spilled.symmetric_difference(&before.spilled).any(|k| hit(*k))
+            && (self.cell_version() == before.cell_version()
+                || self
+                    .changed_cells(before)
+                    .chain(before.changed_cells(self))
+                    .filter(|k| hit(*k))
+                    .all(|k| {
+                        self.get_view(k.row, k.col)
+                            .zip(before.get_view(k.row, k.col))
+                            .is_some_and(|(a, b)| a.same_input(&b))
+                    }))
     }
 
     pub fn same_sort_region(&self, before: &Self, rect: (u32,u32,u32,u32)) -> bool {
@@ -1197,17 +1299,17 @@ impl Sheet {
     pub fn rebase_row_changes(&self, before: &Sheet, prepared: &mut Sheet, in_target: impl Fn(CellRef) -> bool) {
         if self.cell_version() != before.cell_version() {
             for k in self.changed_cells(before).filter(|k| !in_target(*k)) {
-                if let Some(cell) = self.get(k.row, k.col) {
-                    prepared.cells.set(k.row, k.col, cell.clone());
+                if let Some(cell) = self.get_view(k.row, k.col) {
+                    prepared.cells.set(k.row, k.col, cell.to_cell());
                 }
             }
-            for k in before.changed_cells(self).filter(|k| !in_target(*k) && self.get(k.row,k.col).is_none()) {
+            for k in before.changed_cells(self).filter(|k| !in_target(*k) && !self.contains(k.row, k.col)) {
                 prepared.cells.remove(k.row,k.col);
             }
         }
         for k in self.spilled.symmetric_difference(&before.spilled).filter(|k| !in_target(**k)) {
             if self.spilled.contains(k) { prepared.spilled.insert(*k); }
-            else { prepared.spilled.remove(k); }
+            else { prepared.spilled.remove_if_present(k); }
         }
         if prepared.styles_dirty {
             for k in self.styles.changed_keys(&before.styles) {
@@ -1232,23 +1334,24 @@ impl Sheet {
             for k in self.styles.changed_keys(&before.styles).chain(before.styles.changed_keys(&self.styles)) {
                 if hit(k) && live_styles.get(self.style_of(k.row,k.col)).format != old_styles.get(before.style_of(k.row,k.col)).format {
                     conflicts.push((k.row,k.col));
-                    result.set(k.row,k.col,self.get(k.row,k.col).cloned().unwrap_or_default());
+                    result.set(k.row,k.col,self.get(k.row,k.col).map(Cow::into_owned).unwrap_or_default());
                 }
             }
         }
         if self.cell_version() != before.cell_version() {
             let changes = self.changed_cells(before).chain(before.changed_cells(self)
-                .filter(|k| self.get(k.row, k.col).is_none()));
+                .filter(|k| !self.contains(k.row, k.col)));
             for (n, k) in changes.enumerate() {
                 if n >= 4096 { return None; }
                 if hit(k) {
                     // A changed formula cache is still the same formula-mode hit. Restage
                     // to capture its new cached value in both sides of the undo record.
-                    if !value_mode && self.get(k.row,k.col).and_then(|cell| cell.formula.as_ref())
-                        == before.get(k.row,k.col).and_then(|cell| cell.formula.as_ref()) { return None; }
+                    if !value_mode && self.formula_of(k.row, k.col) == before.formula_of(k.row, k.col) {
+                        return None;
+                    }
                     conflicts.push((k.row,k.col));
                 }
-                result.set(k.row, k.col, self.get(k.row, k.col).cloned().unwrap_or_default());
+                result.set(k.row, k.col, self.get(k.row, k.col).map(Cow::into_owned).unwrap_or_default());
             }
         }
         conflicts.sort_unstable();
@@ -1267,7 +1370,8 @@ impl Sheet {
         if self.cleared.is_empty() {
             self.cleared = std::mem::take(&mut result.cleared);
         } else {
-            self.cleared.extend(result.cleared.drain());
+            self.cleared.union_from(&result.cleared);
+            result.cleared.clear();
         }
         if result.styles_dirty {
             std::mem::swap(&mut self.styles, &mut result.styles);
@@ -1276,7 +1380,8 @@ impl Sheet {
             if self.style_edits.is_empty() {
                 self.style_edits = std::mem::take(&mut result.style_edits);
             } else {
-                self.style_edits.extend(result.style_edits.drain());
+                self.style_edits.union_from(&result.style_edits);
+                result.style_edits.clear();
             }
         }
         self.edited = true;
@@ -1286,7 +1391,7 @@ impl Sheet {
         self.cells.cf_pages(rect)
     }
 
-    pub(crate) fn column_pages(&self, col: u32) -> Vec<(u32, std::sync::Arc<Vec<Cell>>)> {
+    pub(crate) fn column_pages(&self, col: u32) -> Vec<(u32, std::sync::Arc<ColSlab>)> {
         self.cells.column_pages(col)
     }
 
@@ -1304,16 +1409,24 @@ impl Sheet {
         std::mem::swap(&mut self.spill_shapes, &mut result.spill_shapes);
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
+    pub fn iter(&self) -> impl Iterator<Item = (CellRef, Cow<'_, Cell>)> {
         self.cells.iter()
     }
 
     /// Occupied cells in a rectangle, ordered by row and then column.
-    pub fn iter_rect(&self, rect: (u32, u32, u32, u32)) -> impl Iterator<Item = (CellRef, &Cell)> {
+    pub fn iter_rect(&self, rect: (u32, u32, u32, u32)) -> impl Iterator<Item = (CellRef, Cow<'_, Cell>)> {
         self.cells.iter_rect(rect)
     }
 
-    pub fn values(&self) -> impl Iterator<Item = &Cell> {
+    pub fn iter_views(&self) -> impl Iterator<Item = (CellRef, CellView<'_>)> {
+        self.cells.iter_views()
+    }
+
+    pub fn iter_rect_views(&self, rect: (u32, u32, u32, u32)) -> impl Iterator<Item = (CellRef, CellView<'_>)> {
+        self.cells.iter_rect_views(rect)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = Cow<'_, Cell>> {
         self.cells.iter_values()
     }
 
@@ -1341,14 +1454,19 @@ impl Sheet {
         self.hidden_dirty = true;
     }
 
+    #[inline]
     pub fn style_of(&self, r: u32, c: u32) -> u16 {
         if let Some(&id) = self.styles.get(&CellRef::new(r, c)) {
             return id;
         }
-        if let Some(&id) = self.row_styles.get(&r) {
+        if !self.row_styles.is_empty()
+            && let Some(&id) = self.row_styles.get(&r)
+        {
             return id;
         }
-        if let Some(&id) = self.col_styles.get(&c) {
+        if !self.col_styles.is_empty()
+            && let Some(&id) = self.col_styles.get(&c)
+        {
             return id;
         }
         0
@@ -1413,7 +1531,9 @@ impl Sheet {
             self.col_styles_dirty = true;
         }
         if id == 0 {
-            self.col_styles.remove(&c);
+            if self.col_styles.contains_key(&c) {
+                self.col_styles.remove(&c);
+            }
         } else {
             self.col_styles.insert(c, id);
         }
@@ -1423,7 +1543,9 @@ impl Sheet {
     pub fn set_col_style_loaded(&mut self, c: u32, id: u16) {
         self.display_style_revision = next_sheet_identity();
         if id == 0 {
-            self.col_styles.remove(&c);
+            if self.col_styles.contains_key(&c) {
+                self.col_styles.remove(&c);
+            }
         } else {
             self.col_styles.insert(c, id);
         }
@@ -1438,7 +1560,9 @@ impl Sheet {
             self.row_styles_dirty = true;
         }
         if id == 0 {
-            self.row_styles.remove(&r);
+            if self.row_styles.contains_key(&r) {
+                self.row_styles.remove(&r);
+            }
         } else {
             self.row_styles.insert(r, id);
         }
@@ -1448,7 +1572,9 @@ impl Sheet {
     pub fn set_row_style_loaded(&mut self, r: u32, id: u16) {
         self.display_style_revision = next_sheet_identity();
         if id == 0 {
-            self.row_styles.remove(&r);
+            if self.row_styles.contains_key(&r) {
+                self.row_styles.remove(&r);
+            }
         } else {
             self.row_styles.insert(r, id);
         }
@@ -1495,7 +1621,9 @@ impl Sheet {
         self.merges.max_col()
     }
 
-    /// 批量写入矩形区域样式：整页全覆盖时自动压缩为 `Uniform(id)` 共享页
+    /// 批量写入矩形区域样式：整页全覆盖时自动压缩为 `Uniform(id)` 共享页；
+    /// `id == 0` 走页级 `remove_rect_recording`，仅对命中整行/整列样式的行列写回显式 `0`，
+    /// 避免全选清除样式时遍历 1.7×10¹⁰ 个空坐标。
     pub fn set_style_rect(&mut self, r1: u32, c1: u32, r2: u32, c2: u32, id: u16) {
         let (r1, r2) = (r1.min(r2), r1.max(r2));
         let (c1, c2) = (c1.min(c2), c1.max(c2));
@@ -1508,18 +1636,77 @@ impl Sheet {
             self.styles.insert_rect(r1, c1, r2, c2, id);
             self.style_edits.insert_rect(r1, c1, r2, c2);
         } else {
-            for r in r1..=r2 {
-                for c in c1..=c2 {
-                    let key = CellRef::new(r, c);
-                    if self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c) {
-                        self.styles.insert(key, 0);
-                    } else {
-                        self.styles.remove(&key);
-                    }
+            self.styles
+                .remove_rect_recording(r1, c1, r2, c2, &mut self.style_edits);
+            if !self.row_styles.is_empty() {
+                let hit_rows: Vec<u32> = self
+                    .row_styles
+                    .keys()
+                    .copied()
+                    .filter(|&r| r >= r1 && r <= r2)
+                    .collect();
+                for r in hit_rows {
+                    self.styles.insert_rect(r, c1, r, c2, 0);
+                    self.style_edits.insert_rect(r, c1, r, c2);
                 }
             }
-            self.style_edits.insert_rect(r1, c1, r2, c2);
+            if !self.col_styles.is_empty() {
+                let hit_cols: Vec<u32> = self
+                    .col_styles
+                    .keys()
+                    .copied()
+                    .filter(|&c| c >= c1 && c <= c2)
+                    .collect();
+                for c in hit_cols {
+                    self.styles.insert_rect(r1, c, r2, c, 0);
+                    self.style_edits.insert_rect(r1, c, r2, c);
+                }
+            }
         }
+    }
+
+    /// 批量清空矩形区域单元格内容（跳过空页并整块释放完整列页），返回被清空的非空格数。
+    pub fn clear_cells_rect(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) -> usize {
+        let (r1, r2) = (r1.min(r2), r1.max(r2));
+        let (c1, c2) = (c1.min(c2), c1.max(c2));
+        let removed = self.cells.clear_rect(r1, c1, r2, c2, &mut self.cleared);
+        if removed > 0 && !self.loading {
+            self.edited = true;
+        }
+        removed
+    }
+
+    /// 仅在 `[c1..=c2]` 列带内将 `>= at` 行的单元格与显式样式整块下移或删除上移。
+    pub(crate) fn shift_col_band_rows(&mut self, c1: u32, c2: u32, at: u32, n: u32, delete: bool) {
+        self.cells
+            .shift_col_band_rows(c1, c2, at, n, delete, &mut self.cleared);
+        let styles_before = self.style_edits.len();
+        self.styles
+            .shift_col_band_rows(c1, c2, at, n, delete, &mut self.style_edits);
+        if self.style_edits.len() != styles_before {
+            self.display_style_revision = next_sheet_identity();
+            if !self.loading {
+                self.styles_dirty = true;
+            }
+        }
+        if !self.loading {
+            self.edited = true;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn cells_mut(&mut self) -> &mut Store {
+        &mut self.cells
+    }
+
+    #[inline]
+    pub(crate) fn cells_and_cleared_mut(&mut self) -> (&mut Store, &mut CellJournal) {
+        (&mut self.cells, &mut self.cleared)
+    }
+
+    #[inline]
+    pub(crate) fn bump_display_style_revision(&mut self) {
+        self.display_style_revision = next_sheet_identity();
     }
 
     /// 已用区域 (r1, c1, r2, c2)，0-based
@@ -1528,22 +1715,22 @@ impl Sheet {
     }
 
     /// 单列连续访问（范围求值的快路径）
-    pub fn column_span(&self, r1: u32, r2: u32, c: u32) -> Vec<&Cell> {
+    pub fn column_span(&self, r1: u32, r2: u32, c: u32) -> Vec<Cow<'_, Cell>> {
         self.cells.column_span(r1, r2, c)
     }
 
-    /// 单列按页零分配切片迭代：返回 `(起始行号, &[Cell])`，范围求值/聚合零堆分配
-    pub fn column_slices(&self, r1: u32, r2: u32, c: u32) -> impl Iterator<Item = (u32, &[Cell])> + '_ {
-        self.cells.column_slices(r1, r2, c)
+    /// 单列按页零分配类型化切片迭代：返回 `(起始行号, ColSlice<'_>)`
+    pub fn column_typed_slices(&self, r1: u32, r2: u32, c: u32) -> impl Iterator<Item = (u32, ColSlice<'_>)> + '_ {
+        self.cells.column_typed_slices(r1, r2, c)
     }
 
-    /// 按行列升序归并输出单元格与显式样式（`xlsx_fresh` 顺序写盘零重复哈希查找）
-    pub fn iter_cells_with_explicit_style(&self) -> impl Iterator<Item = (CellRef, &Cell, Option<u16>)> + '_ {
+    /// 按行列升序归并输出单元格视图与显式样式（`xlsx_fresh` 顺序写盘零拷贝零重复哈希查找）
+    pub fn iter_cells_with_explicit_style(&self) -> impl Iterator<Item = (CellRef, CellView<'_>, Option<u16>)> + '_ {
         self.cells.iter_with_explicit_style(&self.styles)
     }
 
     /// 按行列升序并进遍历所有「非空单元格或显式样式格」
-    pub fn iter_with_styles(&self) -> impl Iterator<Item = (CellRef, Option<&Cell>, Option<u16>)> + '_ {
+    pub fn iter_with_styles(&self) -> impl Iterator<Item = (CellRef, Option<CellView<'_>>, Option<u16>)> + '_ {
         self.cells.iter_merged_with_styles(&self.styles)
     }
 
@@ -1565,6 +1752,11 @@ impl Sheet {
     /// 存储层实际占用字节（调试用）
     pub fn allocated_bytes(&self) -> usize {
         self.cells.allocated_bytes()
+    }
+
+    /// 存储层去重净有效字节（共享 `Arc` 页/列块只计一次）
+    pub fn unique_payload_bytes(&self) -> usize {
+        self.cells.unique_payload_bytes()
     }
 
     /// 诊断用：返回 `(页数, 已分配非空列块数, 槽位总容量)`
@@ -1805,6 +1997,28 @@ mod tests {
         assert_eq!(Value::Number(42.0).display(), "42");
         assert_eq!(Value::Number(3.5).display(), "3.5");
         assert_eq!(Value::Number(0.1 + 0.2).display(), "0.3");
+    }
+
+    #[test]
+    fn cell_set_remove_if_present_preserves_cow_when_absent() {
+        let mut sh = Sheet::new("SpillCow");
+        for r in 0..16u32 {
+            sh.spilled.insert(CellRef::new(r, 1));
+        }
+        let snap = sh.clone();
+        assert!(sh.spilled.ptr_eq(&snap.spilled));
+
+        // Writing outside `spilled` must NOT break CoW sharing of `spilled`.
+        sh.set(100, 0, Cell { value: Value::Number(42.0), formula: None });
+        assert!(sh.spilled.ptr_eq(&snap.spilled));
+        assert!(!sh.spilled.remove_if_present(&CellRef::new(999, 9)));
+        assert!(sh.spilled.ptr_eq(&snap.spilled));
+
+        // Writing onto a spilled cell must detach and remove that entry.
+        sh.set(5, 1, Cell { value: Value::Number(7.0), formula: None });
+        assert!(!sh.spilled.ptr_eq(&snap.spilled));
+        assert!(!sh.spilled.contains(&CellRef::new(5, 1)));
+        assert!(snap.spilled.contains(&CellRef::new(5, 1)));
     }
 }
 

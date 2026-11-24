@@ -42,7 +42,7 @@ fn used(sheet: &Sheet) -> Option<(u32, u32)> {
     max_r.zip(max_c)
 }
 
-fn shift_sparse_ray(
+fn shift_ray_metadata(
     sheet: &mut Sheet,
     ray: (u32, u32, u32, u32),
     map_coord: impl Fn(u32, u32) -> Option<(u32, u32)>,
@@ -50,33 +50,6 @@ fn shift_sparse_ray(
     let (r1, c1, r2, c2) = ray;
     if r1 > r2 || c1 > c2 {
         return;
-    }
-    let cells: Vec<(CellRef, crate::model::Cell)> = sheet
-        .iter_rect(ray)
-        .map(|(k, c)| (k, c.clone()))
-        .collect();
-    for (k, _) in &cells {
-        sheet.remove(k.row, k.col);
-    }
-    for (k, cell) in cells {
-        if let Some((nr, nc)) = map_coord(k.row, k.col) {
-            sheet.set(nr, nc, cell);
-        }
-    }
-
-    let styles: Vec<(CellRef, u16)> = sheet.styles.iter_rect(ray).collect();
-    if !styles.is_empty() {
-        for &(k, _) in &styles {
-            if sheet.styles.remove(&k).is_some() {
-                sheet.style_edits.insert(k);
-            }
-        }
-        sheet.styles_dirty = true;
-        for (k, st) in styles {
-            if let Some((nr, nc)) = map_coord(k.row, k.col) {
-                sheet.set_style(nr, nc, st);
-            }
-        }
     }
 
     if !sheet.notes.is_empty() {
@@ -151,6 +124,46 @@ fn shift_sparse_ray(
     }
 }
 
+fn shift_sparse_ray(
+    sheet: &mut Sheet,
+    ray: (u32, u32, u32, u32),
+    map_coord: impl Fn(u32, u32) -> Option<(u32, u32)>,
+) {
+    let (r1, c1, r2, c2) = ray;
+    if r1 > r2 || c1 > c2 {
+        return;
+    }
+    let cells: Vec<(CellRef, crate::model::Cell)> = sheet
+        .iter_rect_views(ray)
+        .map(|(k, c)| (k, c.to_cell()))
+        .collect();
+    for (k, _) in &cells {
+        sheet.remove(k.row, k.col);
+    }
+    for (k, cell) in cells {
+        if let Some((nr, nc)) = map_coord(k.row, k.col) {
+            sheet.set(nr, nc, cell);
+        }
+    }
+
+    let styles: Vec<(CellRef, u16)> = sheet.styles.iter_rect(ray).collect();
+    if !styles.is_empty() {
+        for &(k, _) in &styles {
+            if sheet.styles.remove(&k).is_some() {
+                sheet.style_edits.insert(k);
+            }
+        }
+        sheet.styles_dirty = true;
+        for (k, st) in styles {
+            if let Some((nr, nc)) = map_coord(k.row, k.col) {
+                sheet.set_style(nr, nc, st);
+            }
+        }
+    }
+
+    shift_ray_metadata(sheet, ray, map_coord);
+}
+
 /// 在 rect 覆盖的列/行里插入 n 格
 pub fn insert(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u32) {
     if n == 0 {
@@ -170,7 +183,8 @@ pub fn insert(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u3
                 return;
             }
             if used_r2 >= r1 {
-                shift_sparse_ray(sheet, (r1, c1, used_r2, c2_eff), |r, c| Some((r + n, c)));
+                sheet.shift_col_band_rows(c1, c2_eff, r1, n, false);
+                shift_ray_metadata(sheet, (r1, c1, used_r2, c2_eff), |r, c| Some((r + n, c)));
             }
             let mut merges_changed = false;
             for m in sheet.merges.iter_mut() {
@@ -228,7 +242,8 @@ pub fn delete(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u3
                 return;
             }
             let c2_eff = c2.min(used_c2);
-            shift_sparse_ray(sheet, (r1, c1, used_r2, c2_eff), |r, c| {
+            sheet.shift_col_band_rows(c1, c2_eff, r1, n, true);
+            shift_ray_metadata(sheet, (r1, c1, used_r2, c2_eff), |r, c| {
                 (r >= r1 + n).then(|| (r - n, c))
             });
             let before_len = sheet.merges.len();

@@ -674,7 +674,7 @@ impl SheetApp {
                 let mut src_cells: Vec<(u32, Option<Cell>, u16)> = Vec::with_capacity(src_len as usize);
                 for sr in win_r1..=win_r2 {
                     let sh = self.wb.sheet(self.sheet_idx);
-                    src_cells.push((sr, sh.get(sr, col).cloned(), sh.style_of(sr, col)));
+                    src_cells.push((sr, sh.get(sr, col).map(|c| c.into_owned()), sh.style_of(sr, col)));
                 }
                 let src_ordered: Vec<(u32, Option<Cell>, u16)> = if down {
                     src_cells.clone()
@@ -749,7 +749,7 @@ impl SheetApp {
                 let mut src_cells: Vec<(u32, Option<Cell>, u16)> = Vec::with_capacity(src_len as usize);
                 for sc in win_c1..=win_c2 {
                     let sh = self.wb.sheet(self.sheet_idx);
-                    src_cells.push((sc, sh.get(row, sc).cloned(), sh.style_of(row, sc)));
+                    src_cells.push((sc, sh.get(row, sc).map(|c| c.into_owned()), sh.style_of(row, sc)));
                 }
                 let src_ordered: Vec<(u32, Option<Cell>, u16)> = if right {
                     src_cells.clone()
@@ -918,7 +918,7 @@ impl SheetApp {
             .iter()
             .map(|&(rr, cc)| {
                 let sh = self.wb.sheet(si);
-                (rr, cc, sh.get(rr, cc).cloned(), sh.style_of(rr, cc))
+                (rr, cc, sh.get(rr, cc).map(|c| c.into_owned()), sh.style_of(rr, cc))
             })
             .collect();
         let txn = self.txn_begin(&keys);
