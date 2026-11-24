@@ -6,6 +6,7 @@ param(
     [string]$NotesFile = "",
     [int]$Port = 48768,
     [string]$UpdateUrl = "",
+    [string]$PgoProfdata = "",
     [switch]$NoServe,
     [switch]$PrepareOnly
 )
@@ -207,7 +208,19 @@ if ($LASTEXITCODE -ne 0 -or $pending) {
 # 4. Build static single-file release executable with embedded update endpoint
 $env:CELLAN_RELEASE_COMMIT = $releaseCommit
 $env:CARGO_TARGET_DIR = Join-Path $repoRoot "target"
-$env:RUSTFLAGS = "-C target-feature=+crt-static -C target-cpu=x86-64-v2"
+$rustFlags = "-C target-feature=+crt-static -C target-cpu=x86-64-v2"
+if (-not [string]::IsNullOrWhiteSpace($PgoProfdata)) {
+    if (-not (Test-Path -LiteralPath $PgoProfdata)) {
+        throw "PGO profile data file not found: $PgoProfdata"
+    }
+    $resolvedProfdata = (Resolve-Path -LiteralPath $PgoProfdata).Path
+    if ($resolvedProfdata -match '\s') {
+        throw "PGO profile data path must not contain whitespace (RUSTFLAGS is space-delimited): $resolvedProfdata"
+    }
+    $rustFlags = "$rustFlags -C profile-use=$resolvedProfdata -C llvm-args=-pgo-warn-missing-function"
+    Write-Host "[pgo] Using profile data: $resolvedProfdata" -ForegroundColor Cyan
+}
+$env:RUSTFLAGS = $rustFlags
 $env:CELLAN_DEFAULT_UPDATE_URL = $UpdateUrl
 $env:CELLAN_UPDATE_PUBKEY = $pubHex
 

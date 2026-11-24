@@ -6,7 +6,9 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+#[cfg(panic = "unwind")]
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+#[cfg(panic = "unwind")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -25,6 +27,7 @@ struct JobState {
     helpers_joined: usize,
     helpers_finished: usize,
     closed: bool,
+    #[cfg(panic = "unwind")]
     panicked: AtomicBool,
 }
 
@@ -99,10 +102,15 @@ fn worker_loop(shared: Arc<PoolShared>) {
         };
 
         let (job_arc, func_ptr, trampoline, tid) = claimed;
+        #[cfg(panic = "unwind")]
         let res = catch_unwind(AssertUnwindSafe(|| {
             trampoline(func_ptr, tid);
         }));
+        #[cfg(not(panic = "unwind"))]
+        trampoline(func_ptr, tid);
+
         let mut job = job_arc.state.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(panic = "unwind")]
         if res.is_err() {
             job.panicked.store(true, Ordering::Release);
         }
@@ -149,6 +157,7 @@ where
             helpers_joined: 0,
             helpers_finished: 0,
             closed: false,
+            #[cfg(panic = "unwind")]
             panicked: AtomicBool::new(false),
         }),
         done_cv: Condvar::new(),
@@ -197,22 +206,32 @@ where
         job_arc: Arc::clone(&job_arc),
     };
 
-    let caller_res = catch_unwind(AssertUnwindSafe(|| {
-        f(0);
-    }));
+    #[cfg(panic = "unwind")]
+    {
+        let caller_res = catch_unwind(AssertUnwindSafe(|| {
+            f(0);
+        }));
 
-    drop(guard);
+        drop(guard);
 
-    if let Err(payload) = caller_res {
-        resume_unwind(payload);
+        if let Err(payload) = caller_res {
+            resume_unwind(payload);
+        }
+        let helper_panicked = job_arc
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .panicked
+            .load(Ordering::Acquire);
+        if helper_panicked {
+            panic!("formula pool worker panicked");
+        }
     }
-    let helper_panicked = job_arc
-        .state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .panicked
-        .load(Ordering::Acquire);
-    if helper_panicked {
-        panic!("formula pool worker panicked");
+    #[cfg(not(panic = "unwind"))]
+    {
+        // Under `panic = "abort"`, any panic terminates the process immediately without
+        // unwinding `f`'s stack frame; on normal return `drop(guard)` joins all active helpers.
+        f(0);
+        drop(guard);
     }
 }

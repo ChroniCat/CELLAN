@@ -11187,13 +11187,13 @@ fn run_split_skips_column_and_shifts_left() {
 }
 
 /// UI-14.2：粗体必须是真 700 字面，不是把常规字面放大。
-/// 这里直接解析内嵌子集的 OS/2 字重，并确认四套粗体各自与常规字面字节不同。
+/// 这里直接解析内嵌三套子集（黑体 / Latin / 等宽；宋体改走系统字体零拷贝映射）的 OS/2 字重，
+/// 并确认粗体各自与常规字面字节不同。
 #[test]
 fn embedded_bold_faces_are_real_700() {
     use ttf_parser::Face;
-    let faces: [(&str, &[u8], &[u8], char); 4] = [
+    let faces: [(&str, &[u8], &[u8], char); 3] = [
         ("sans", FONT_SANS, FONT_SANS_BOLD, '国'),
-        ("serif", FONT_SERIF, FONT_SERIF_BOLD, '国'),
         ("latin", FONT_LATIN, FONT_LATIN_BOLD, 'A'),
         ("mono", FONT_MONO, FONT_MONO_BOLD, 'A'),
     ];
@@ -11210,10 +11210,23 @@ fn embedded_bold_faces_are_real_700() {
 
 /// UI-14.2：五套 `*-bold` family 都注册进了 egui，且真的指向 700 字面。
 /// 少注册一套，对应字体的粗体就会掉回默认字族（界面上看不出加粗）。
+/// 衬线字族不再内嵌 11.8 MB 思源宋体，无系统衬线字体时回退内嵌 `noto-sans` / `noto-sans-bold` + `inter`。
 #[test]
 fn bold_families_are_registered_with_real_bold_data() {
     let defs = font_defs();
-    for fam in ["default-bold", "cjk-sans-bold", "cjk-serif-bold", "latin-bold", "mono-bold"] {
+    assert!(
+        !defs.font_data.contains_key("noto-serif")
+            && !defs.font_data.contains_key("noto-serif-bold"),
+        "思源宋体不应再内嵌进二进制"
+    );
+    for fam in [
+        "cjk-serif",
+        "default-bold",
+        "cjk-sans-bold",
+        "cjk-serif-bold",
+        "latin-bold",
+        "mono-bold",
+    ] {
         let list = defs
             .families
             .get(&family_named(fam))
@@ -11228,7 +11241,8 @@ fn bold_families_are_registered_with_real_bold_data() {
         ("default-bold", "inter-bold"),
         // cjk-sans-bold 的拉丁首选 Inter Bold，中文回退 Noto Sans SC Bold
         ("cjk-sans-bold", "inter-bold"),
-        ("cjk-serif-bold", "noto-serif-bold"),
+        // cjk-serif-bold 在纯内嵌基线下首选 Noto Sans SC Bold（700）+ Inter Bold
+        ("cjk-serif-bold", "noto-sans-bold"),
         ("mono-bold", "mono-bold"),
     ] {
         let data = &defs.font_data[key];
@@ -11236,6 +11250,56 @@ fn bold_families_are_registered_with_real_bold_data() {
         assert_eq!(face.weight().to_number(), 700, "{fam}/{key}");
         let list = &defs.families[&family_named(fam)];
         assert_eq!(list.first().map(String::as_str), Some(key), "{fam} 首选项不是 {key}");
+    }
+}
+
+/// Wave 4C：验证 `cjk-serif` / `cjk-serif-bold` 在无系统字体时无缝回退内嵌黑体，
+/// 以及在 Windows 零拷贝映射系统宋体后优先挂接 `sys-serif-cjk` / `sys-serif-latin-b`。
+#[test]
+fn serif_families_prefer_system_simsun_and_fallback_to_embedded_sans() {
+    // 1) 无系统衬线字体回退路径
+    let mut fallback = font_defs();
+    apply_serif_system_fonts(&mut fallback, None, None, None);
+    let serif_fb = &fallback.families[&family_named("cjk-serif")];
+    assert_eq!(serif_fb.first().map(String::as_str), Some("noto-sans"));
+    assert!(serif_fb.iter().any(|k| k == "inter"));
+    let serif_bold_fb = &fallback.families[&family_named("cjk-serif-bold")];
+    assert_eq!(serif_bold_fb.first().map(String::as_str), Some("noto-sans-bold"));
+    assert!(serif_bold_fb.iter().any(|k| k == "inter-bold"));
+    for key in serif_fb.iter().chain(serif_bold_fb.iter()) {
+        assert!(fallback.font_data.contains_key(key), "回退链引用未注册字体 {key}");
+    }
+
+    // 2) Windows 系统宋体零拷贝映射路径
+    let sys = system_fonts::load_ui_cjk_sync();
+    let mut with_sys = font_defs();
+    apply_serif_system_fonts(
+        &mut with_sys,
+        sys.serif_cjk.clone(),
+        sys.serif_latin.clone(),
+        sys.serif_latin_b.clone(),
+    );
+    let serif_sys = &with_sys.families[&family_named("cjk-serif")];
+    if sys.serif_cjk.is_some() {
+        assert_eq!(
+            serif_sys.first().map(String::as_str),
+            Some("sys-serif-cjk"),
+            "Windows 上 cjk-serif 应优先使用零拷贝映射的系统宋体"
+        );
+    }
+    let serif_bold_sys = &with_sys.families[&family_named("cjk-serif-bold")];
+    let first_bold_key = serif_bold_sys.first().expect("cjk-serif-bold 不能为空");
+    let first_bold_data = &with_sys.font_data[first_bold_key];
+    let first_bold_face =
+        ttf_parser::Face::parse(first_bold_data.font.as_ref(), first_bold_data.index)
+            .expect("bold face");
+    assert_eq!(
+        first_bold_face.weight().to_number(),
+        700,
+        "cjk-serif-bold 首选字体 {first_bold_key} 必须为真 700 粗体"
+    );
+    for key in serif_sys.iter().chain(serif_bold_sys.iter()) {
+        assert!(with_sys.font_data.contains_key(key), "系统衬线链引用未注册字体 {key}");
     }
 }
 

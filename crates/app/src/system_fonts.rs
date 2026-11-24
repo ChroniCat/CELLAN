@@ -25,7 +25,9 @@ pub fn norm(name: &str) -> String {
 /// 其余字体用英文名去 Fonts 目录找同名 .ttf/.ttc。
 fn file_candidates(name: &str) -> Vec<&'static str> {
     match norm(name).as_str() {
-        "宋体" | "simsun" | "新宋体" | "nsimsun" => vec!["simsun.ttc"],
+        "宋体" | "simsun" | "新宋体" | "nsimsun" | "思源宋体" | "notoserifsc" | "sourcehanserifsc" => {
+            vec!["simsun.ttc", "simsunb.ttf"]
+        }
         "微软雅黑" | "microsoftyahei" | "microsoftyaheiui" => vec!["msyh.ttc", "msyhbd.ttc"],
         "黑体" | "simhei" => vec!["simhei.ttf"],
         "楷体" | "楷体_gb2312" | "kaiti" => vec!["simkai.ttf"],
@@ -211,11 +213,25 @@ pub(super) fn file_bytes(file: &'static str) -> Option<&'static [u8]> {
     Some(bytes)
 }
 
-/// Windows 原生中文字体（`msyh.ttc` / `msyhbd.ttc`）只读映射与 face 校验结果，
-/// 供首帧后由后台线程异步准备，避免冷启动阻塞 39.5 MB CJK 字体加载与解析。
+/// Windows 原生中文字体（`msyh.ttc` / `msyhbd.ttc`）与系统衬线字体（`simsun.ttc` / `simsunb.ttf` / `georgia.ttf` / `georgiab.ttf`）
+/// 的只读零拷贝 `MapViewOfFile` 映射与 face 校验结果，供首帧后由后台线程异步准备，
+/// 避免冷启动阻塞大体积 CJK 字体加载与解析。
 pub(crate) struct UiCjkFonts {
     pub msyh_ui: Option<std::sync::Arc<FontData>>,
     pub msyh_ui_b: Option<std::sync::Arc<FontData>>,
+    pub serif_cjk: Option<std::sync::Arc<FontData>>,
+    pub serif_latin: Option<std::sync::Arc<FontData>>,
+    pub serif_latin_b: Option<std::sync::Arc<FontData>>,
+}
+
+impl UiCjkFonts {
+    pub(crate) fn has_any(&self) -> bool {
+        self.msyh_ui.is_some()
+            || self.msyh_ui_b.is_some()
+            || self.serif_cjk.is_some()
+            || self.serif_latin.is_some()
+            || self.serif_latin_b.is_some()
+    }
 }
 
 static UI_CJK_FONTS: OnceLock<UiCjkFonts> = OnceLock::new();
@@ -242,6 +258,11 @@ pub(crate) fn load_ui_cjk_sync() -> &'static UiCjkFonts {
         // msyh.ttc / msyhbd.ttc 的 1 号 face 是专门优化过 UI 行高与字面的 Microsoft YaHei UI / Bold
         msyh_ui: load_ttf_face("msyh.ttc", 1),
         msyh_ui_b: load_ttf_face("msyhbd.ttc", 1),
+        // 系统宋体优先 simsun.ttc（0 号 face 为 SimSun），缺失时降级 simsunb.ttf
+        serif_cjk: load_ttf_face("simsun.ttc", 0).or_else(|| load_ttf_face("simsunb.ttf", 0)),
+        // 西文衬线与真粗体（无宋体环境及粗体衬线拉丁字形用）
+        serif_latin: load_ttf_face("georgia.ttf", 0),
+        serif_latin_b: load_ttf_face("georgiab.ttf", 0),
     })
 }
 
@@ -263,7 +284,7 @@ pub(crate) fn request_ui_cjk_async(ctx: &egui::Context) {
     let wake = ctx.clone();
     std::thread::spawn(move || {
         let loaded = load_ui_cjk_sync();
-        if loaded.msyh_ui.is_some() || loaded.msyh_ui_b.is_some() {
+        if loaded.has_any() {
             READY_TO_INSTALL.store(true, std::sync::atomic::Ordering::Release);
             wake.request_repaint();
         }
@@ -566,5 +587,18 @@ mod tests {
             fam.iter().any(|k| k == "noto-sans"),
             "西文系统字体族必须串接中文回退字库以防保存重开后汉字变成问号，实际: {fam:?}"
         );
+    }
+
+    #[test]
+    fn ui_cjk_sync_maps_system_serif_fonts() {
+        let cjk = load_ui_cjk_sync();
+        assert!(cjk.has_any());
+        #[cfg(windows)]
+        {
+            assert!(
+                cjk.serif_cjk.is_some() || cjk.serif_latin.is_some(),
+                "Windows 环境应能零拷贝映射系统宋体或 Georgia 衬线字体"
+            );
+        }
     }
 }

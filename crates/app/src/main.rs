@@ -3946,8 +3946,12 @@ impl SheetApp {
         self.tasks.open_path = Some(path.clone());
         self.status = format!("正在打开 {}…", path.display());
         std::thread::spawn(move || {
+            // 所有可预见的损坏文件 / IO / ZIP / XML 错误均通过 `load_diag` 的 `Result::Err`
+            // 传播为 `OpenMsg::Failed`；仅在 dev/test（`panic = "unwind"`）下额外保留 `catch_unwind`
+            // 以便测试与开发态把非预期 panic 转成状态栏失败消息，release（`panic = "abort"`）下零展开开销。
+            #[cfg(panic = "unwind")]
             let tx2 = tx.clone();
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let run_open = move || {
             let prof = std::env::var("SC_LOAD_PROF").is_ok();
             let t0 = std::time::Instant::now();
             let hash_path = path.clone();
@@ -4041,8 +4045,9 @@ impl SheetApp {
                     let _ = tx.send(OpenMsg::Failed(format!("打开失败: {e:#}")));
                 }
             }
-                    }));
-            if let Err(p) = r {
+            };
+            #[cfg(panic = "unwind")]
+            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_open)) {
                 let msg = p
                     .downcast_ref::<&str>()
                     .map(|x| x.to_string())
@@ -4052,7 +4057,9 @@ impl SheetApp {
                     "打开失败：加载线程异常退出（panic）：{msg}"
                 )));
             }
-});
+            #[cfg(not(panic = "unwind"))]
+            run_open();
+        });
     }
 
     fn open_path_with_password(&mut self, path: PathBuf, pw: String) {
@@ -41878,19 +41885,18 @@ fn save_color_image(path: &std::path::Path, img: &egui::ColorImage) -> anyhow::R
     Ok(())
 }
 
-/// 内嵌字体（SIL OFL 1.1）：思源黑体、思源宋体、Inter、JetBrains Mono。
+/// 内嵌字体（SIL OFL 1.1）：思源黑体、Inter、JetBrains Mono。
 ///
 /// 原始 ttf 不入库，子集由 scripts/subset_fonts.py 重建（GB2312 + 拉丁 + 常用符号）。
+/// 衬线字体（宋体）优先零拷贝 `MapViewOfFile` 挂载 Windows 系统宋体（`simsun.ttc` / `simsunb.ttf` / `georgia.ttf`），
+/// 不再内嵌 ~11.8 MB 的思源宋体子集；缺失系统衬线字体时无缝回退至内嵌 `noto-sans` / `inter`。
 pub(crate) const FONT_SANS: &[u8] = include_bytes!("../../../assets/fonts/subset/NotoSansSC-Regular.subset.ttf");
-const FONT_SERIF: &[u8] = include_bytes!("../../../assets/fonts/subset/NotoSerifSC-Regular.subset.ttf");
 pub(crate) const FONT_LATIN: &[u8] = include_bytes!("../../../assets/fonts/subset/Inter-Regular.subset.ttf");
 const FONT_MONO: &[u8] = include_bytes!("../../../assets/fonts/subset/JetBrainsMono-Regular.subset.ttf");
 /// 真 700 字面（SIL OFL，来自 Google Fonts 可变字体实例化后裁子集）。
 /// 粗体优先用它们，而不是把常规字面放大 —— 后者在 100% 缩放下会被像素对齐吃掉。
 pub(crate) const FONT_SANS_BOLD: &[u8] =
     include_bytes!("../../../assets/fonts/subset/NotoSansSC-Bold.subset.ttf");
-const FONT_SERIF_BOLD: &[u8] =
-    include_bytes!("../../../assets/fonts/subset/NotoSerifSC-Bold.subset.ttf");
 pub(crate) const FONT_LATIN_BOLD: &[u8] =
     include_bytes!("../../../assets/fonts/subset/Inter-Bold.subset.ttf");
 const FONT_MONO_BOLD: &[u8] =
@@ -42088,6 +42094,9 @@ fn install_ui_system_fonts(fonts: &mut egui::FontDefinitions, ctx: &egui::Contex
         for (fam, list) in fonts.families.iter_mut() {
             if let egui::FontFamily::Name(nm) = fam {
                 let s = nm.as_ref();
+                if matches!(s, "cjk-serif" | "cjk-serif-bold") {
+                    continue;
+                }
                 let is_bold_fam = s.starts_with("sysbold:") || s.ends_with("-bold");
                 let is_cell_fam = s.starts_with("sys:")
                     || is_bold_fam
@@ -42111,6 +42120,70 @@ fn install_ui_system_fonts(fonts: &mut egui::FontDefinitions, ctx: &egui::Contex
             }
         }
     }
+
+    // 系统衬线字体族：Windows 优先挂载零拷贝映射的系统宋体（simsun.ttc / simsunb.ttf）与 Georgia，
+    // 缺失系统衬线字体时回退到已注册的 sys-ui-msyh / noto-sans / noto-sans-bold + inter。
+    apply_serif_system_fonts(
+        fonts,
+        cjk.and_then(|c| c.serif_cjk.clone()),
+        cjk.and_then(|c| c.serif_latin.clone()),
+        cjk.and_then(|c| c.serif_latin_b.clone()),
+    );
+}
+
+fn apply_serif_system_fonts(
+    fonts: &mut egui::FontDefinitions,
+    serif_cjk: Option<std::sync::Arc<egui::FontData>>,
+    serif_latin: Option<std::sync::Arc<egui::FontData>>,
+    serif_latin_b: Option<std::sync::Arc<egui::FontData>>,
+) {
+    if let Some(f) = serif_cjk {
+        fonts.font_data.insert("sys-serif-cjk".to_owned(), f);
+    }
+    if let Some(f) = serif_latin {
+        fonts.font_data.insert("sys-serif-latin".to_owned(), f);
+    }
+    if let Some(f) = serif_latin_b {
+        fonts.font_data.insert("sys-serif-latin-b".to_owned(), f);
+    }
+
+    let build_chain = |candidates: &[&str]| -> Vec<String> {
+        let mut chain = Vec::with_capacity(candidates.len());
+        for &k in candidates {
+            if fonts.font_data.contains_key(k) && !chain.iter().any(|x| x == k) {
+                chain.push(k.to_owned());
+            }
+        }
+        chain
+    };
+
+    let serif_chain = build_chain(&[
+        "sys-serif-cjk",
+        "sys-serif-latin",
+        "sys-ui-msyh",
+        "noto-sans",
+        "inter",
+    ]);
+    if !serif_chain.is_empty() {
+        fonts.families.insert(family_named("cjk-serif"), serif_chain);
+    }
+
+    // 粗体衬线：西文优先真 700 字面 Georgia Bold，中文优先真 700 字面雅黑粗体 / 思源黑体粗体，
+    // 末级保留宋体/常规字面兜底避免生僻字变豆腐块。
+    let serif_bold_chain = build_chain(&[
+        "sys-serif-latin-b",
+        "sys-ui-msyh-b",
+        "noto-sans-bold",
+        "inter-bold",
+        "sys-serif-cjk",
+        "sys-ui-msyh",
+        "noto-sans",
+    ]);
+    if !serif_bold_chain.is_empty() {
+        fonts
+            .families
+            .insert(family_named("cjk-serif-bold"), serif_bold_chain);
+    }
 }
 
 fn font_defs() -> egui::FontDefinitions {
@@ -42120,9 +42193,6 @@ fn font_defs() -> egui::FontDefinitions {
         .insert("noto-sans".to_owned(), egui::FontData::from_static(FONT_SANS).into());
     fonts
         .font_data
-        .insert("noto-serif".to_owned(), egui::FontData::from_static(FONT_SERIF).into());
-    fonts
-        .font_data
         .insert("inter".to_owned(), egui::FontData::from_static(FONT_LATIN).into());
     fonts
         .font_data
@@ -42130,10 +42200,6 @@ fn font_defs() -> egui::FontDefinitions {
     fonts.font_data.insert(
         "noto-sans-bold".to_owned(),
         egui::FontData::from_static(FONT_SANS_BOLD).into(),
-    );
-    fonts.font_data.insert(
-        "noto-serif-bold".to_owned(),
-        egui::FontData::from_static(FONT_SERIF_BOLD).into(),
     );
     fonts.font_data.insert(
         "inter-bold".to_owned(),
@@ -42162,15 +42228,17 @@ fn font_defs() -> egui::FontDefinitions {
     let sans = vec!["inter".to_owned(), "noto-sans".to_owned()];
     fonts.families.insert(family_named("default"), sans.clone());
     fonts.families.insert(family_named("cjk-sans"), sans);
-    // 宋体连拉丁也用宋体字形，和黑体一眼能分开
-    fonts
-        .families
-        .insert(family_named("cjk-serif"), vec!["noto-serif".to_owned()]);
+    // 宋体基线回退：Windows 上由 install_ui_system_fonts 优先挂接零拷贝系统宋体（simsun.ttc / georgia.ttf），
+    // 无系统衬线字体时无缝回退至内嵌 noto-sans + inter，确保 egui 永远不会 FontFamily not bound panic。
+    fonts.families.insert(
+        family_named("cjk-serif"),
+        vec!["noto-sans".to_owned(), "inter".to_owned()],
+    );
     fonts.families.insert(
         family_named("latin"),
         vec!["inter".to_owned(), "noto-sans".to_owned()],
     );
-    // 粗体族：拉丁用 Inter Bold，中文回退思源黑/宋 700；末尾再挂常规字面，
+    // 粗体族：拉丁用 Inter Bold，中文回退思源黑体 700；末尾再挂常规字面，
     // 子集里没有的字至少还能显示（否则 egui 画成豆腐块）。
     fonts.families.insert(
         family_named("default-bold"),
@@ -42190,7 +42258,11 @@ fn font_defs() -> egui::FontDefinitions {
     );
     fonts.families.insert(
         family_named("cjk-serif-bold"),
-        vec!["noto-serif-bold".to_owned(), "noto-serif".to_owned()],
+        vec![
+            "noto-sans-bold".to_owned(),
+            "inter-bold".to_owned(),
+            "noto-sans".to_owned(),
+        ],
     );
     fonts.families.insert(
         family_named("latin-bold"),
@@ -42368,7 +42440,7 @@ fn install_crash_hook() {
         let detail = format!("{payload}\n位置：{loc}");
         let log_path = append_crash_log("PANIC", &detail);
         prev(info);
-        // 仅在主线程触发致命提示框；后台加载线程使用 catch_unwind 自行消化异常，严禁弹窗。
+        // 仅在主线程触发致命提示框；后台线程若触发 panic，先写入 crash.log，避免子线程阻塞弹窗。
         if std::thread::current().name() == Some("main") {
             let log_hint = log_path
                 .as_ref()
@@ -42475,13 +42547,20 @@ fn main() -> eframe::Result<()> {
     };
     let open_requests = std::rc::Rc::new(std::cell::RefCell::new(open_requests));
 
-    // 渲染后端：--renderer=glow|wgpu|auto，默认 auto（先 glow，失败自动降级 wgpu）
-    let mut want = std::env::var("SC_RENDERER").unwrap_or_else(|_| "auto".into());
-    for a in std::env::args().skip(1) {
-        if let Some(v) = a.strip_prefix("--renderer=") {
-            want = v.to_string();
-        }
-    }
+    // 渲染后端：--renderer=wgpu|glow|auto 优先，其次 SC_BACKEND / SC_RENDERER，默认 auto：
+    // Windows 默认优先 DX12（wgpu + AutoVsync），失败自动回退 OpenGL 3.3（glow），
+    // 并将探测成功的后端持久化到 profile ui.ini，避免后续启动重复探测。
+    let cli_renderer = std::env::args()
+        .skip(1)
+        .filter_map(|a| a.strip_prefix("--renderer=").map(str::to_string))
+        .last();
+    let sc_backend = std::env::var("SC_BACKEND").ok();
+    let sc_renderer = std::env::var("SC_RENDERER").ok();
+    let want = ui_prefs::resolve_backend_request(
+        cli_renderer.as_deref(),
+        sc_backend.as_deref(),
+        sc_renderer.as_deref(),
+    );
     let mut opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([
@@ -42504,23 +42583,38 @@ fn main() -> eframe::Result<()> {
             .with_title("CELLAN"),
         ..Default::default()
     };
-    // 候选顺序：auto 优先尝试启动更快的 glow（OpenGL 3.3），失败时自动降级到 wgpu（DirectX 12 / WARP 软件渲染），
-    // 兼容无 3D 加速的远程桌面、虚拟机与老旧核显
-    let mut candidates: Vec<&str> = match want.as_str() {
-        "glow" => vec!["glow"],
-        "wgpu" => vec!["wgpu"],
-        _ => vec!["glow", "wgpu"],
-    };
-    // 没编进来的后端直接跳过
-    candidates.retain(|c| match *c {
-        "wgpu" => cfg!(feature = "wgpu"),
-        "glow" => cfg!(feature = "glow"),
-        _ => false,
-    });
-    if candidates.is_empty() {
-        candidates.push("glow");
+    #[cfg(feature = "wgpu")]
+    {
+        opts.wgpu_options.present_mode = eframe::wgpu::PresentMode::AutoVsync;
+        #[cfg(windows)]
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut setup) = opts.wgpu_options.wgpu_setup
+        {
+            // Windows 默认直接走 DX12，跳过 Vulkan/GL 适配层探测；用户显式指定 WGPU_BACKEND 时尊重覆盖。
+            if std::env::var_os("WGPU_BACKEND").is_none() {
+                setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+            }
+        }
     }
-    eprintln!("[renderer] 候选 {:?}（请求 {want}）", candidates);
+    let env_fp = ui_prefs::gpu_env_fingerprint();
+    let cached_backend = if !matches!(want.as_str(), "wgpu" | "glow") {
+        ui_prefs::UiPrefs::load().cached_gpu_backend(&env_fp)
+    } else {
+        None
+    };
+    let plan = ui_prefs::plan_gpu_backends(
+        &want,
+        cached_backend,
+        cfg!(feature = "wgpu"),
+        cfg!(feature = "glow"),
+        cfg!(windows),
+    );
+    let candidates = plan.candidates;
+    eprintln!(
+        "[renderer] 候选 {:?}（请求 {want}，缓存 {:?}）",
+        candidates,
+        if plan.used_cache { cached_backend } else { None }
+    );
+    let force_fail = std::env::var("SC_FORCE_FAIL").ok();
     let grid_paste = std::rc::Rc::new(office_clipboard::shortcut::GridPaste::default());
     let mut attempt = 0usize;
     let mut failed_backends: Vec<String> = Vec::new();
@@ -42550,7 +42644,7 @@ fn main() -> eframe::Result<()> {
         }
         eprintln!("[renderer] 尝试 {which}");
         // 自检用：强制某个后端失败，验证回退路径
-        if std::env::var("SC_FORCE_FAIL").map(|v| v == which).unwrap_or(false) {
+        if force_fail.as_deref() == Some(which) {
             let e = eframe::Error::AppCreation(Box::new(std::io::Error::other("forced")));
             eprintln!("[renderer] {which} 启动失败: forced");
             failed_backends.push(format!("{which}: forced"));
@@ -42560,6 +42654,11 @@ fn main() -> eframe::Result<()> {
             attempt += 1;
             continue;
         }
+        let persist_backend = if plan.is_auto && force_fail.is_none() {
+            Some((which, env_fp.clone()))
+        } else {
+            None
+        };
         let r = run_app(
             &mut opts,
             grid_paste.clone(),
@@ -42569,12 +42668,16 @@ fn main() -> eframe::Result<()> {
             auto_pass.clone(),
             open_requests.clone(),
             instance_state.clone(),
+            persist_backend,
         );
         match r {
             Ok(()) => break Ok(()),
             Err(e) => {
                 eprintln!("[renderer] {which} 启动失败: {e}");
                 failed_backends.push(format!("{which}: {e}"));
+                if plan.is_auto && plan.used_cache && attempt == 0 && force_fail.is_none() {
+                    ui_prefs::reset_cached_gpu_backend();
+                }
                 if attempt + 1 >= candidates.len() {
                     break Err(e);
                 }
@@ -42590,7 +42693,7 @@ fn main() -> eframe::Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "%LOCALAPPDATA%\\CELLAN\\crash.log".to_string());
         let msg = format!(
-            "CELLAN 无法初始化图形界面（已自动尝试 OpenGL 3.3 与 DirectX 12 / WARP 渲染后端）。\n\n错误详情：\n{summary}\n\n建议更新显卡驱动后重试；诊断日志已写入：\n{log_display}"
+            "CELLAN 无法初始化图形界面（已自动尝试 DirectX 12 / WARP 与 OpenGL 3.3 渲染后端）。\n\n错误详情：\n{summary}\n\n建议更新显卡驱动后重试；诊断日志已写入：\n{log_display}"
         );
         show_fatal_error_box("CELLAN 启动失败", &msg);
     }
@@ -42605,6 +42708,7 @@ fn main() -> eframe::Result<()> {
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_app(
     opts: &mut eframe::NativeOptions,
     grid_paste: std::rc::Rc<office_clipboard::shortcut::GridPaste>,
@@ -42614,6 +42718,7 @@ fn run_app(
     auto_pass: Option<String>,
     open_requests: std::rc::Rc<std::cell::RefCell<Option<std::sync::mpsc::Receiver<PathBuf>>>>,
     instance_state: std::sync::Arc<std::sync::Mutex<single_instance::InstanceState>>,
+    persist_backend: Option<(&'static str, String)>,
 ) -> Result<(), eframe::Error> {
     let mut options = opts.clone();
     grid_paste.install(&mut options);
@@ -42625,6 +42730,11 @@ fn run_app(
             let auto_join = auto_join.clone();
             let open_requests = open_requests.clone();
             Box::new(move |cc| {
+                // 到达 AppCreator 说明窗口与图形上下文已初始化成功；在 SheetApp 加载 UiPrefs 前持久化，
+                // 避免后续保存偏好时覆盖已探测成功的后端。
+                if let Some((backend, fp)) = persist_backend.as_ref() {
+                    ui_prefs::persist_probed_gpu_backend(backend, fp);
+                }
                 let mut app = SheetApp::new(cc, initial.clone());
                 grid_paste.attach(cc);
                 app.grid_paste = Some(grid_paste);
