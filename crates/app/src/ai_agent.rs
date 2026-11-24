@@ -176,6 +176,14 @@ pub struct AiState {
     pub(crate) request_input_focus: bool,
     pub(super) elide_cache: std::collections::HashMap<(u32, u32, String), (String, bool)>,
     pub(super) card_heights: std::collections::HashMap<usize, (u64, f32)>,
+    pub(super) pending_search_cache: Arc<
+        std::sync::Mutex<
+            Option<(
+                sheet_results::PreparedSearchQuery,
+                Vec<sheet_results::SheetBandSearchCache>,
+            )>,
+        >,
+    >,
 }
 
 impl Default for AiState {
@@ -205,6 +213,7 @@ impl Default for AiState {
             request_input_focus: false,
             elide_cache: std::collections::HashMap::new(),
             card_heights: std::collections::HashMap::new(),
+            pending_search_cache: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -519,6 +528,52 @@ fn json_to_cell_value(v: &JsonValue) -> Value {
     }
 }
 
+const STREAM_BLOCK_MIN_BYTES: usize = 768;
+
+/// 将长流式回复按稳定换行边界切分为若干闭合前缀切片 + 末尾活动块，
+/// 让闭合段落/表格行命中 egui 的 `Galley` 帧缓存，每帧只重新排版末尾活动块。
+pub(super) fn split_streaming_text_blocks(text: &str) -> Vec<&str> {
+    if text.len() <= STREAM_BLOCK_MIN_BYTES {
+        return vec![text];
+    }
+    let bytes = text.as_bytes();
+    let mut blocks = Vec::new();
+    let mut block_start = 0usize;
+    let mut search_from = STREAM_BLOCK_MIN_BYTES;
+    while search_from < bytes.len() {
+        let Some(rel_nl) = bytes[search_from..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let nl = search_from + rel_nl;
+        if nl + 1 >= bytes.len() {
+            break;
+        }
+        blocks.push(&text[block_start..nl]);
+        block_start = nl + 1;
+        search_from = block_start.saturating_add(STREAM_BLOCK_MIN_BYTES);
+    }
+    blocks.push(&text[block_start..]);
+    blocks
+}
+
+fn render_streaming_text_blocks(ui: &mut egui::Ui, text: &str, size: f32, color: Color32) {
+    let blocks = split_streaming_text_blocks(text);
+    if blocks.len() == 1 {
+        ui.add(
+            egui::Label::new(egui::RichText::new(blocks[0]).size(size).color(color)).wrap(),
+        );
+    } else {
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for block in blocks {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(block).size(size).color(color)).wrap(),
+                );
+            }
+        });
+    }
+}
+
 impl SheetApp {
     fn resolve_sheet_index(&self, name: Option<&str>) -> Option<usize> {
         WorkbookToolView { wb: &self.wb, sheet_idx: self.sheet_idx }.resolve_sheet_index(name)
@@ -545,21 +600,36 @@ impl SheetApp {
             }
             "inspect_sheet" | "search_cells" | "eval_preview" => {
                 let tc = tc.clone();
+                let search_cache = (tc.name == "search_cells").then(|| {
+                    let slot = self.ai.pending_search_cache.clone();
+                    if let Ok(mut g) = slot.lock() {
+                        *g = None;
+                    }
+                    slot
+                });
                 self.with_calculated_ai_view(ctx, Box::new(move |view| match tc.name.as_str() {
                     "inspect_sheet" => view.tool_inspect_sheet(&tc.arguments),
-                    "search_cells" => view.tool_search_cells(&tc.arguments),
+                    "search_cells" => {
+                        let (out, built) = view.tool_search_cells_cached(&tc.arguments);
+                        if let Some(ref slot) = search_cache
+                            && let Ok(mut g) = slot.lock()
+                        {
+                            *g = built;
+                        }
+                        out
+                    }
                     _ => view.tool_eval_preview(&tc.arguments),
                 }))
             }
             "set_cells" | "fill_formula_range" => {
                 let before = self.ai_calc_revision();
                 let write = if tc.name == "set_cells" {
-                    self.tool_set_cells(&tc.arguments)
+                    self.tool_set_cells(&tc.arguments, false)
                 } else {
-                    self.tool_fill_formula_range(&tc.arguments)
+                    self.tool_fill_formula_range(&tc.arguments, false)
                 };
                 match write {
-                    Ok(written) => {
+                    Ok((written, _)) => {
                         self.note_ai_written_cells(before, written.sheet_id, &written.keys);
                         self.with_calculated_ai_view(ctx, Box::new(move |view| written.result(view.wb)))
                     }
@@ -613,7 +683,30 @@ impl SheetApp {
         self.ai.status_hint = "已撤销本轮记录的表格编辑".into();
     }
 
-    fn tool_set_cells(&mut self, args: &JsonValue) -> Result<WrittenCells, (String, JsonValue)> {
+    pub(super) fn apply_ai_write_tool(
+        &mut self,
+        tc: &ToolCallSpec,
+        defer_recalc: bool,
+    ) -> Result<(WrittenCells, Vec<(usize, u32, u32)>), (String, JsonValue)> {
+        let checkpoint = self.undo.checkpoint();
+        let res = if tc.name == "set_cells" {
+            self.tool_set_cells(&tc.arguments, defer_recalc)
+        } else {
+            self.tool_fill_formula_range(&tc.arguments, defer_recalc)
+        };
+        if res.is_ok()
+            && let Some(last) = self.ai.messages.last_mut()
+        {
+            last.undo_ids.extend(self.undo.ids_since(checkpoint));
+        }
+        res
+    }
+
+    fn tool_set_cells(
+        &mut self,
+        args: &JsonValue,
+        defer_recalc: bool,
+    ) -> Result<(WrittenCells, Vec<(usize, u32, u32)>), (String, JsonValue)> {
         let Some(si) = self.resolve_sheet_index(args.get("sheet").and_then(|v| v.as_str())) else {
             return Err(("写入失败".into(), json!({"ok": false, "error": "未找到指定工作表"})));
         };
@@ -769,20 +862,31 @@ impl SheetApp {
             });
         }
         let touched: Vec<_> = keys.iter().map(|&(r, c)| (si, r, c)).collect();
-        self.recalc_and_broadcast(&touched);
+        if defer_recalc {
+            self.broadcast_cells(&touched);
+        } else {
+            self.recalc_and_broadcast(&touched);
+        }
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
 
-        Ok(WrittenCells {
-            sheet_id: self.wb.sheet(si).identity,
-            label: format!("写入 {} 个单元格", parsed.len()),
-            metadata: json!({"ok": true, "written": parsed.len()}),
-            sample_limit: 12,
-            keys,
-        })
+        Ok((
+            WrittenCells {
+                sheet_id: self.wb.sheet(si).identity,
+                label: format!("写入 {} 个单元格", parsed.len()),
+                metadata: json!({"ok": true, "written": parsed.len()}),
+                sample_limit: 12,
+                keys,
+            },
+            touched,
+        ))
     }
 
-    fn tool_fill_formula_range(&mut self, args: &JsonValue) -> Result<WrittenCells, (String, JsonValue)> {
+    fn tool_fill_formula_range(
+        &mut self,
+        args: &JsonValue,
+        defer_recalc: bool,
+    ) -> Result<(WrittenCells, Vec<(usize, u32, u32)>), (String, JsonValue)> {
         let Some(si) = self.resolve_sheet_index(args.get("sheet").and_then(|v| v.as_str())) else {
             return Err(("填充公式失败".into(), json!({"ok": false, "error": "未找到工作表"})));
         };
@@ -881,18 +985,25 @@ impl SheetApp {
             });
         }
         let touched: Vec<_> = keys.iter().map(|&(r, c)| (si, r, c)).collect();
-        self.recalc_and_broadcast(&touched);
+        if defer_recalc {
+            self.broadcast_cells(&touched);
+        } else {
+            self.recalc_and_broadcast(&touched);
+        }
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
 
         let span = range_label((r1, c1), (r2, c2));
-        Ok(WrittenCells {
-            sheet_id: self.wb.sheet(si).identity,
-            label: format!("填充公式 {sh_name}!{span}"),
-            metadata: json!({"ok": true, "range": span, "count": keys.len()}),
-            sample_limit: 8,
-            keys,
-        })
+        Ok((
+            WrittenCells {
+                sheet_id: self.wb.sheet(si).identity,
+                label: format!("填充公式 {sh_name}!{span}"),
+                metadata: json!({"ok": true, "range": span, "count": keys.len()}),
+                sample_limit: 8,
+                keys,
+            },
+            touched,
+        ))
     }
 
     fn tool_style_range(&mut self, args: &JsonValue) -> (String, JsonValue) {
@@ -1900,7 +2011,6 @@ impl SheetApp {
                                                 h.finish()
                                             };
                                             if !is_last
-                                                && !self.ai.scroll_bottom
                                                 && let Some(&(cached_sig, cached_h)) = self.ai.card_heights.get(&idx)
                                                 && cached_sig == sig
                                             {
@@ -1974,7 +2084,6 @@ impl SheetApp {
                                                 h.finish()
                                             };
                                             if !is_last
-                                                && !self.ai.scroll_bottom
                                                 && let Some(&(cached_sig, cached_h)) = self.ai.card_heights.get(&idx)
                                                 && cached_sig == sig
                                             {
@@ -2096,17 +2205,11 @@ impl SheetApp {
                                                                         ))
                                                                         .max_height(140.0)
                                                                         .show(ui, |ui| {
-                                                                            ui.add(
-                                                                                egui::Label::new(
-                                                                                    egui::RichText::new(
-                                                                                        msg.reasoning.as_str(),
-                                                                                    )
-                                                                                    .size(11.0)
-                                                                                    .color(
-                                                                                        ui_kit::TEXT_WEAK,
-                                                                                    ),
-                                                                                )
-                                                                                .wrap(),
+                                                                            render_streaming_text_blocks(
+                                                                                ui,
+                                                                                msg.reasoning.as_str(),
+                                                                                11.0,
+                                                                                ui_kit::TEXT_WEAK,
                                                                             );
                                                                         });
                                                                 });
@@ -2273,13 +2376,11 @@ impl SheetApp {
 
                                                     // 正文回复
                                                     if !msg.content.is_empty() {
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                egui::RichText::new(msg.content.as_str())
-                                                                    .size(12.0)
-                                                                    .color(ui_kit::TEXT),
-                                                            )
-                                                            .wrap(),
+                                                        render_streaming_text_blocks(
+                                                            ui,
+                                                            msg.content.as_str(),
+                                                            12.0,
+                                                            ui_kit::TEXT,
                                                         );
                                                     } else if is_last
                                                         && ai_busy

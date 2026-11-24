@@ -161,7 +161,9 @@ impl SheetApp {
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
         let (worker_cancel, worker_progress) = (cancel.clone(), progress.clone());
-        let full = incremental.is_none().then(|| self.wb.clone());
+        let full = incremental
+            .is_none()
+            .then(|| sheetcore::sync::calc_snapshot_workbook(&self.wb));
         let (tx, rx) = mpsc::channel();
         let wake = ctx.clone();
         std::thread::spawn(move || {
@@ -231,15 +233,24 @@ impl SheetApp {
 
     /// Cells written by the assistant keep a manual-mode calculated copy reusable.
     pub(super) fn note_ai_written_cells(&mut self, before: (u64, u64, u64), sheet_id: u64, keys: &[(u32, u32)]) {
+        self.note_ai_written_batch(before, &[(sheet_id, keys)]);
+    }
+
+    pub(super) fn note_ai_written_batch(
+        &mut self,
+        before: (u64, u64, u64),
+        batches: &[(u64, &[(u32, u32)])],
+    ) {
         let after = self.ai_calc_revision();
         match self.ai.calc_base.as_mut() {
             Some(base) if base.revision == before && self.wb.calc_manual => {
-                // The before/after revisions bracket one synchronous write, so indices match the copy.
-                if let Some(sheet) = base.wb.sheets.iter().position(|s| s.identity == sheet_id) {
-                    base.replay.extend(keys.iter().map(|&(r, c)| (sheet, r, c)));
-                } else {
-                    self.ai.calc_base = None;
-                    return;
+                for &(sheet_id, keys) in batches {
+                    if let Some(sheet) = base.wb.sheets.iter().position(|s| s.identity == sheet_id) {
+                        base.replay.extend(keys.iter().map(|&(r, c)| (sheet, r, c)));
+                    } else {
+                        self.ai.calc_base = None;
+                        return;
+                    }
                 }
                 base.revision = after;
             }
@@ -352,8 +363,15 @@ pub(super) struct WorkbookToolView<'a> {
     pub sheet_idx: usize,
 }
 
+pub(crate) struct SheetBandSearchCache {
+    pub identity: u64,
+    pub snapshot: sheetcore::model::Sheet,
+    pub scanned_bands: u32,
+    pub bands: std::collections::BTreeMap<u32, Vec<(u32, u32, String, Option<String>)>>,
+}
+
 #[derive(Clone, Debug)]
-pub(super) struct PreparedSearchQuery {
+pub(crate) struct PreparedSearchQuery {
     pub q_low: String,
     pub q_ascii: bool,
     pub q_caseless_cjk: bool,
@@ -613,36 +631,99 @@ impl WorkbookToolView<'_> {
     }
 
     pub(super) fn tool_search_cells(&self, args: &JsonValue) -> (String, JsonValue) {
+        self.tool_search_cells_cached(args).0
+    }
+
+    pub(super) fn tool_search_cells_cached(
+        &self,
+        args: &JsonValue,
+    ) -> (
+        (String, JsonValue),
+        Option<(PreparedSearchQuery, Vec<SheetBandSearchCache>)>,
+    ) {
         const HIT_LIMIT: usize = 30;
+        const BAND_ROWS: u32 = sheetcore::store::PAGE_ROWS;
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
         if query.is_empty() {
-            return ("搜索为空".into(), json!({"ok": false, "error": "query 不能为空"}));
+            return (
+                ("搜索为空".into(), json!({"ok": false, "error": "query 不能为空"})),
+                None,
+            );
         }
         let prepared = PreparedSearchQuery::new(query);
         let sheets: Vec<usize> = match args.get("sheet").and_then(|v| v.as_str()) {
             Some(name) => match self.resolve_sheet_index(Some(name)) {
                 Some(i) => vec![i],
-                None => return ("搜索失败".into(), json!({"ok": false, "error": "未找到工作表"})),
+                None => {
+                    return (
+                        ("搜索失败".into(), json!({"ok": false, "error": "未找到工作表"})),
+                        None,
+                    )
+                }
             },
             None => (0..self.wb.sheets.len()).collect(),
         };
-        let mut hits = Vec::new();
+        let mut hits = Vec::with_capacity(HIT_LIMIT);
         let mut has_more = false;
+        let mut cached_sheets = Vec::with_capacity(sheets.len());
         'search: for si in sheets {
             let sh = self.wb.sheet(si);
-            for (cr, cell) in sheetcore::sync::iter_sheet_rect(sh, (0, 0, u32::MAX, u32::MAX)) {
-                if prepared.matches_cell(cell.as_ref()) {
-                    if hits.len() == HIT_LIMIT {
-                        has_more = true;
-                        break 'search;
+            let mut bands = std::collections::BTreeMap::new();
+            let Some((_, _, r2, _)) = sh.used_bounds() else {
+                cached_sheets.push(SheetBandSearchCache {
+                    identity: sh.identity,
+                    snapshot: sh.search_snapshot(),
+                    scanned_bands: u32::MAX,
+                    bands,
+                });
+                continue;
+            };
+            let last_band = r2 / BAND_ROWS;
+            let mut b = 0u32;
+            let mut stopped_early = false;
+            while b <= last_band {
+                let band_start = b * BAND_ROWS;
+                let band_end = band_start.saturating_add(BAND_ROWS - 1);
+                let mut band_hits = Vec::new();
+                for (cr, cell) in
+                    sheetcore::sync::iter_sheet_rect(sh, (band_start, 0, band_end, u32::MAX))
+                {
+                    if prepared.matches_cell(cell.as_ref()) {
+                        let val_str = cell.value.display();
+                        let form_str = cell.formula.as_deref().map(|s| format!("={s}"));
+                        if hits.len() < HIT_LIMIT {
+                            hits.push(json!({
+                                "sheet": sh.name,
+                                "cell": cell_name(cr.row, cr.col),
+                                "value": val_str.clone(),
+                                "formula": form_str.clone(),
+                            }));
+                        } else {
+                            has_more = true;
+                            stopped_early = true;
+                        }
+                        band_hits.push((cr.row, cr.col, val_str, form_str));
+                        if band_hits.len() > HIT_LIMIT || stopped_early {
+                            break;
+                        }
                     }
-                    hits.push(json!({
-                        "sheet": sh.name,
-                        "cell": cell_name(cr.row, cr.col),
-                        "value": cell.value.display(),
-                        "formula": cell.formula.as_deref().map(|s| format!("={s}"))
-                    }));
                 }
+                if !band_hits.is_empty() {
+                    bands.insert(b, band_hits);
+                }
+                b += 1;
+                if stopped_early {
+                    break;
+                }
+            }
+            cached_sheets.push(SheetBandSearchCache {
+                identity: sh.identity,
+                snapshot: sh.search_snapshot(),
+                scanned_bands: if stopped_early { b } else { u32::MAX },
+                bands,
+            });
+            if stopped_early {
+                break 'search;
             }
         }
         let label = if has_more {
@@ -650,7 +731,10 @@ impl WorkbookToolView<'_> {
         } else {
             format!("搜索「{query}」（命中 {} 处）", hits.len())
         };
-        (label, json!({"ok": true, "has_more": has_more, "hits": hits}))
+        (
+            (label, json!({"ok": true, "has_more": has_more, "hits": hits})),
+            Some((prepared, cached_sheets)),
+        )
     }
 
     pub(super) fn tool_eval_preview(&self, args: &JsonValue) -> (String, JsonValue) {

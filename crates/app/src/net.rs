@@ -144,13 +144,16 @@ pub enum NetEvent {
 
 enum Cmd {
     Broadcast(String),
+    BroadcastMsg(Msg),
     GuestStructure(u64,Msg),
     Cells(Vec<Op>),
+    SharedCells(Vec<Arc<Op>>),
     Style(Msg),
     Deliver(Vec<LiveSender>, RoomChange),
     Sort(u64,Arc<SortBatch>),
     SendTo(u32, String),
     SendPrepared(u32, Arc<sheetcore::wire::PreparedPayload>),
+    PumpUpdate,
     Stop,
 }
 
@@ -160,6 +163,7 @@ enum RoomChange {
     Sort(Arc<SortBatch>),
     Correction(Arc<SortCorrection>),
     Cells(Vec<Op>),
+    SharedCells(Vec<Arc<Op>>),
     Message(Msg),
 }
 
@@ -195,25 +199,164 @@ fn cell_frames(ops: impl IntoIterator<Item = Op>, to_host: bool, batch: bool, mu
     if !pending.is_empty() { flush(pending); }
 }
 
+fn cell_frames_msg(ops: impl IntoIterator<Item = Op>, to_host: bool, batch: bool, mut send: impl FnMut(Msg)) {
+    use sheetcore::sync::ValueWire;
+    let mut pending = Vec::new();
+    let mut bytes = 0usize;
+    let mut flush = |mut chunk: Vec<Op>| {
+        let msg = if chunk.len() == 1 {
+            Msg::Op(chunk.pop().unwrap())
+        } else if to_host {
+            Msg::Ops { ops: chunk }
+        } else {
+            Msg::SnapshotChunk { ops: chunk, last: false }
+        };
+        send(msg);
+    };
+    for op in ops {
+        let text_len = match &op.value { ValueWire::Text(s) | ValueWire::Error(s) => s.len(), _ => 0 };
+        let size = text_len + op.formula.as_deref().map_or(0, str::len) + 96;
+        if !pending.is_empty() && (!batch || pending.len() == sheetcore::sync::LIVE_OP_BATCH || bytes + size > 256 * 1024) {
+            flush(std::mem::take(&mut pending));
+            bytes = 0;
+        }
+        bytes += size;
+        pending.push(op);
+    }
+    if !pending.is_empty() { flush(pending); }
+}
+
+fn shared_cell_frames_to_peers(ops: &[Arc<Op>], peers: &[LiveSender]) {
+    if peers.is_empty() || ops.is_empty() {
+        return;
+    }
+    use sheetcore::sync::ValueWire;
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    let flush_slice = |slice: &[Arc<Op>]| {
+        if slice.is_empty() {
+            return;
+        }
+        let any_compact = peers.iter().any(|p| p.is_compact_v3());
+        let any_legacy = peers.iter().any(|p| !p.is_compact_v3());
+        let compact_prep = any_compact.then(|| {
+            // Host -> Guest cell frames use SnapshotChunk { last: false } when len > 1, or Op when len == 1
+            let raw = if slice.len() == 1 {
+                sheetcore::sync::encode_arc_ops_compact(slice)
+            } else {
+                let refs: Vec<&Op> = slice.iter().map(Arc::as_ref).collect();
+                sheetcore::sync::encode_snapshot_chunk_ref_compact(&refs, false)
+            };
+            sheetcore::wire::prepare_compact_payload(raw, true)
+        });
+        let legacy_prep = any_legacy.then(|| {
+            let line = if slice.len() == 1 {
+                serde_json::to_string(&Msg::Op((*slice[0]).clone())).unwrap()
+            } else {
+                let refs: Vec<&Op> = slice.iter().map(Arc::as_ref).collect();
+                serde_json::to_string(&sheetcore::sync::SnapshotChunkRef {
+                    t: "SnapshotChunk",
+                    ops: &refs,
+                    last: false,
+                })
+                .unwrap()
+            };
+            sheetcore::wire::prepare_payload(&line, true)
+        });
+        for peer in peers {
+            if peer.is_compact_v3() {
+                if let Some(ref p) = compact_prep {
+                    let _ = peer.send_prepared(Arc::clone(p));
+                }
+            } else if let Some(ref p) = legacy_prep {
+                let _ = peer.send_prepared(Arc::clone(p));
+            }
+        }
+    };
+    for (idx, op) in ops.iter().enumerate() {
+        let text_len = match &op.value { ValueWire::Text(s) | ValueWire::Error(s) => s.len(), _ => 0 };
+        let size = text_len + op.formula.as_deref().map_or(0, str::len) + 96;
+        if idx > start && (idx - start >= sheetcore::sync::LIVE_OP_BATCH || bytes + size > 256 * 1024) {
+            flush_slice(&ops[start..idx]);
+            start = idx;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < ops.len() {
+        flush_slice(&ops[start..]);
+    }
+}
+
+const LOW_PRIO_UPDATE_CAP: usize = 4;
+
+type LowPrioUpdateQueue = Arc<(
+    Mutex<(std::collections::VecDeque<Arc<sheetcore::wire::PreparedPayload>>, bool)>,
+    std::sync::Condvar,
+)>;
+
 enum LiveFrame {
     Line(String),
+    Compact(Vec<u8>),
     Prepared(Arc<sheetcore::wire::PreparedPayload>),
     Sort(Arc<SortBatch>),
     Correction(Arc<SortCorrection>),
+    PumpUpdate,
 }
 
 #[derive(Clone)]
 struct LiveSender {
     tx: Sender<LiveFrame>,
+    compact_v3: Arc<AtomicBool>,
+    low_prio_update: LowPrioUpdateQueue,
 }
 
 impl LiveSender {
+    fn new(tx: Sender<LiveFrame>, compact_v3: Arc<AtomicBool>) -> (Self, LowPrioUpdateQueue) {
+        let q: LowPrioUpdateQueue = Arc::new((
+            Mutex::new((std::collections::VecDeque::with_capacity(LOW_PRIO_UPDATE_CAP), false)),
+            std::sync::Condvar::new(),
+        ));
+        (
+            Self {
+                tx,
+                compact_v3,
+                low_prio_update: q.clone(),
+            },
+            q,
+        )
+    }
+
+    #[inline]
+    fn is_compact_v3(&self) -> bool {
+        self.compact_v3.load(Ordering::Acquire)
+    }
+
     fn send(&self, line: String) -> Result<(), ()> {
         self.tx.send(LiveFrame::Line(line)).map_err(|_| ())
     }
 
+    fn send_compact(&self, raw: Vec<u8>) -> Result<(), ()> {
+        self.tx.send(LiveFrame::Compact(raw)).map_err(|_| ())
+    }
+
     fn send_prepared(&self, payload: Arc<sheetcore::wire::PreparedPayload>) -> Result<(), ()> {
         self.tx.send(LiveFrame::Prepared(payload)).map_err(|_| ())
+    }
+
+    /// 低优先级投递 P2P 自更新分片：队列上限 `LOW_PRIO_UPDATE_CAP` 背压限流，且写线程始终优先排空实时协作帧。
+    fn send_update_slice(&self, payload: Arc<sheetcore::wire::PreparedPayload>) -> Result<(), ()> {
+        let (lock, cvar) = &*self.low_prio_update;
+        let mut guard = lock.lock().unwrap();
+        while guard.0.len() >= LOW_PRIO_UPDATE_CAP && !guard.1 {
+            guard = cvar.wait(guard).unwrap();
+        }
+        if guard.1 {
+            return Err(());
+        }
+        guard.0.push_back(payload);
+        drop(guard);
+        self.tx.send(LiveFrame::PumpUpdate).map_err(|_| ())
     }
 }
 
@@ -229,6 +372,42 @@ fn broadcast_line_to(peers: &[LiveSender], line: String) {
             for peer in peers {
                 let _ = peer.send_prepared(Arc::clone(&prepared));
             }
+        }
+    }
+}
+
+/// 广播结构化 `Msg` 给多个在线 peer：`compact_v3` 节点共享单份紧凑二进制预压缩帧，旧版节点按需共享 JSON 帧。
+fn broadcast_msg_to(peers: &[LiveSender], msg: &Msg) {
+    if peers.is_empty() {
+        return;
+    }
+    if peers.len() == 1 {
+        if peers[0].is_compact_v3() {
+            let _ = peers[0].send_compact(sheetcore::sync::encode_msg_compact(msg));
+        } else if let Ok(line) = serde_json::to_string(msg) {
+            let _ = peers[0].send(line);
+        }
+        return;
+    }
+    let any_compact = peers.iter().any(|p| p.is_compact_v3());
+    let any_legacy = peers.iter().any(|p| !p.is_compact_v3());
+    let compact_prep = any_compact.then(|| {
+        sheetcore::wire::prepare_compact_payload(sheetcore::sync::encode_msg_compact(msg), true)
+    });
+    let legacy_prep = if any_legacy {
+        serde_json::to_string(msg)
+            .ok()
+            .map(|line| sheetcore::wire::prepare_payload(&line, true))
+    } else {
+        None
+    };
+    for peer in peers {
+        if peer.is_compact_v3() {
+            if let Some(ref p) = compact_prep {
+                let _ = peer.send_prepared(Arc::clone(p));
+            }
+        } else if let Some(ref p) = legacy_prep {
+            let _ = peer.send_prepared(Arc::clone(p));
         }
     }
 }
@@ -561,79 +740,190 @@ fn resolve_local_seed(
 }
 
 const UPDATE_SLICE_RAW_BYTES: usize = 192 * 1024;
+const MAX_PENDING_SEED_JOBS: usize = 16;
 
-fn spawn_peer_update_stream(
+struct UpdateSeedJob {
     my_site: u32,
     to_site: u32,
     req_version: String,
     seed_override: SharedUpdateSeed,
-    serving_guard: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
-    send_frame: impl Fn(String) -> bool + Send + 'static,
-) {
-    if serving_guard
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    use_compact_bin: Arc<AtomicBool>,
+    send_slice: Box<dyn Fn(Arc<sheetcore::wire::PreparedPayload>) -> bool + Send + 'static>,
+}
+
+#[derive(Clone, Default)]
+struct UpdateSeederQueue {
+    inner: Arc<(Mutex<UpdateSeederInner>, std::sync::Condvar)>,
+}
+
+#[derive(Default)]
+struct UpdateSeederInner {
+    queue: std::collections::VecDeque<UpdateSeedJob>,
+    worker_running: bool,
+    stopped: bool,
+}
+
+fn make_update_slice_payload(
+    from_site: u32,
+    to_site: u32,
+    version: &str,
+    offset: u64,
+    total: u64,
+    chunk: &[u8],
+    done: bool,
+    compact_bin: bool,
+) -> Arc<sheetcore::wire::PreparedPayload> {
+    if compact_bin {
+        let raw = sheetcore::sync::encode_update_slice_compact(
+            from_site, to_site, version, offset, total, chunk, done,
+        );
+        sheetcore::wire::prepare_compact_payload(raw, false)
+    } else {
+        let msg = Msg::UpdateSlice {
+            from_site,
+            to_site,
+            version: version.to_string(),
+            offset,
+            total,
+            data_b64: sheetcore::wire::b64_encode(chunk),
+            raw_data: Vec::new(),
+            done,
+        };
+        let json = serde_json::to_string(&msg).unwrap_or_default();
+        sheetcore::wire::prepare_payload(&json, false)
+    }
+}
+
+impl UpdateSeederQueue {
+    fn enqueue(&self, job: UpdateSeedJob) {
+        let (lock, cvar) = &*self.inner;
+        let mut g = lock.lock().unwrap();
+        if g.stopped {
+            return;
+        }
+        if g.queue
+            .iter()
+            .any(|j| j.to_site == job.to_site && j.req_version == job.req_version)
+        {
+            return;
+        }
+        if g.queue.len() >= MAX_PENDING_SEED_JOBS {
+            let compact = job.use_compact_bin.load(Ordering::Acquire);
+            let reject = make_update_slice_payload(
+                job.my_site,
+                job.to_site,
+                &job.req_version,
+                0,
+                0,
+                &[],
+                true,
+                compact,
+            );
+            drop(g);
+            let _ = (job.send_slice)(reject);
+            return;
+        }
+        g.queue.push_back(job);
+        if !g.worker_running {
+            g.worker_running = true;
+            let runner = self.inner.clone();
+            std::thread::spawn(move || {
+                let (lock, cvar) = &*runner;
+                let mut buf = vec![0u8; UPDATE_SLICE_RAW_BYTES];
+                loop {
+                    let job = {
+                        let mut g = lock.lock().unwrap();
+                        if g.stopped {
+                            g.queue.clear();
+                            g.worker_running = false;
+                            return;
+                        }
+                        match g.queue.pop_front() {
+                            Some(j) => j,
+                            None => {
+                                let (mut g2, _) =
+                                    cvar.wait_timeout(g, Duration::from_millis(50)).unwrap();
+                                if g2.stopped {
+                                    g2.queue.clear();
+                                    g2.worker_running = false;
+                                    return;
+                                }
+                                match g2.queue.pop_front() {
+                                    Some(j) => j,
+                                    None => {
+                                        g2.worker_running = false;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    run_single_seed_job(job, &mut buf);
+                }
+            });
+        } else {
+            cvar.notify_one();
+        }
+    }
+
+    fn shutdown(&self) {
+        let (lock, cvar) = &*self.inner;
+        let mut g = lock.lock().unwrap();
+        g.stopped = true;
+        g.queue.clear();
+        cvar.notify_all();
+    }
+}
+
+fn run_single_seed_job(job: UpdateSeedJob, buf: &mut [u8]) {
+    if !job.alive.load(Ordering::Acquire) {
         return;
     }
-    std::thread::spawn(move || {
-        struct Guard(Arc<AtomicBool>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _g = Guard(serving_guard);
-
-        let Some((exe_path, manifest)) = resolve_local_seed(&seed_override) else {
-            return;
+    let Some((exe_path, manifest)) = resolve_local_seed(&job.seed_override) else {
+        return;
+    };
+    if manifest.version != job.req_version || !crate::update::verify_manifest_sig(&manifest) {
+        return;
+    }
+    let Ok(mut f) = std::fs::File::open(&exe_path) else {
+        return;
+    };
+    let Ok(md) = f.metadata() else {
+        return;
+    };
+    let total = md.len();
+    if total == 0 || total > 256 * 1024 * 1024 {
+        return;
+    }
+    let mut offset = 0u64;
+    while job.alive.load(Ordering::Acquire) {
+        let n = match std::io::Read::read(&mut f, buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
         };
-        if manifest.version != req_version || !crate::update::verify_manifest_sig(&manifest) {
-            return;
+        let next_off = offset + n as u64;
+        let done = next_off >= total;
+        let compact = job.use_compact_bin.load(Ordering::Acquire);
+        let payload = make_update_slice_payload(
+            job.my_site,
+            job.to_site,
+            &manifest.version,
+            offset,
+            total,
+            &buf[..n],
+            done,
+            compact,
+        );
+        if !(job.send_slice)(payload) {
+            break;
         }
-        let Ok(mut f) = std::fs::File::open(&exe_path) else {
-            return;
-        };
-        let Ok(md) = f.metadata() else {
-            return;
-        };
-        let total = md.len();
-        if total == 0 || total > 256 * 1024 * 1024 {
-            return;
+        offset = next_off;
+        if done {
+            break;
         }
-        let mut buf = vec![0u8; UPDATE_SLICE_RAW_BYTES];
-        let mut offset = 0u64;
-        while alive.load(Ordering::Acquire) {
-            let n = match std::io::Read::read(&mut f, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            let next_off = offset + n as u64;
-            let done = next_off >= total;
-            let msg = Msg::UpdateSlice {
-                from_site: my_site,
-                to_site,
-                version: manifest.version.clone(),
-                offset,
-                total,
-                data_b64: sheetcore::wire::b64_encode(&buf[..n]),
-                done,
-            };
-            let Ok(json) = serde_json::to_string(&msg) else {
-                break;
-            };
-            if !send_frame(json) {
-                break;
-            }
-            offset = next_off;
-            if done {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    });
+    }
 }
 
 fn accept_incoming_update_slice(
@@ -644,15 +934,37 @@ fn accept_incoming_update_slice(
     offset: u64,
     total: u64,
     data_b64: &str,
+    raw_data: &[u8],
     done: bool,
 ) {
-    let Some(chunk) = sheetcore::wire::b64_decode(data_b64) else {
+    if total == 0 && done {
         let mut g = dl_slot.lock().unwrap();
-        if let Some(dl) = g.take() {
+        if g.as_ref()
+            .is_some_and(|dl| dl.peer_site == from_site && dl.manifest.version == version)
+            && let Some(dl) = g.take()
+        {
+            drop(dl.file);
             let _ = std::fs::remove_file(&dl.part_path);
-            let _ = evt_tx.send(NetEvent::PeerUpdateFailed("更新分片解码失败".into()));
+            let _ = evt_tx.send(NetEvent::PeerUpdateFailed(
+                "供种节点当前繁忙，请稍后重试".into(),
+            ));
         }
         return;
+    }
+    let decoded_b64;
+    let chunk: &[u8] = if !raw_data.is_empty() || data_b64.is_empty() {
+        raw_data
+    } else {
+        let Some(bytes) = sheetcore::wire::b64_decode(data_b64) else {
+            let mut g = dl_slot.lock().unwrap();
+            if let Some(dl) = g.take() {
+                let _ = std::fs::remove_file(&dl.part_path);
+                let _ = evt_tx.send(NetEvent::PeerUpdateFailed("更新分片解码失败".into()));
+            }
+            return;
+        };
+        decoded_b64 = bytes;
+        &decoded_b64
     };
 
     let finished = {
@@ -717,11 +1029,7 @@ fn accept_incoming_update_slice(
                 streamed_sha.as_deref(),
             ) {
                 Ok(()) => {
-                    let verified_path = crate::update::staging_file_path(
-                        &completed.manifest.version,
-                        "peer.verified.exe",
-                    )
-                    .unwrap_or_else(|_| completed.part_path.with_extension("verified.exe"));
+                    let verified_path = completed.part_path.with_extension("verified.exe");
                     let _ = std::fs::remove_file(&verified_path);
                     match std::fs::rename(&completed.part_path, &verified_path) {
                         Ok(()) => {
@@ -751,12 +1059,24 @@ fn accept_incoming_update_slice(
 struct EvtTx {
     tx: Sender<NetEvent>,
     wake: Arc<Mutex<Option<eframe::egui::Context>>>,
+    t0: std::time::Instant,
+    last_cursor_wake_ms: Arc<AtomicU64>,
+    last_snap_wake_ms: Arc<AtomicU64>,
 }
 
 impl EvtTx {
     fn new(tx: Sender<NetEvent>) -> (Self, Arc<Mutex<Option<eframe::egui::Context>>>) {
         let wake = Arc::new(Mutex::new(None));
-        (Self { tx, wake: wake.clone() }, wake)
+        (
+            Self {
+                tx,
+                wake: wake.clone(),
+                t0: std::time::Instant::now(),
+                last_cursor_wake_ms: Arc::new(AtomicU64::new(0)),
+                last_snap_wake_ms: Arc::new(AtomicU64::new(0)),
+            },
+            wake,
+        )
     }
 
     fn send(&self, ev: NetEvent) -> Result<(), std::sync::mpsc::SendError<NetEvent>> {
@@ -764,6 +1084,46 @@ impl EvtTx {
         if res.is_ok() {
             if let Ok(guard) = self.wake.lock() {
                 if let Some(ctx) = guard.as_ref() {
+                    ctx.request_repaint();
+                }
+            }
+        }
+        res
+    }
+
+    /// 立即入队光标事件（保证单测零延迟可见），但将 UI 帧重绘唤醒限频在 60Hz（16ms）以内。
+    fn send_cursor(&self, ev: NetEvent) -> Result<(), std::sync::mpsc::SendError<NetEvent>> {
+        let res = self.tx.send(ev);
+        if res.is_ok() {
+            let now = self.t0.elapsed().as_millis() as u64 + 1;
+            let prev = self.last_cursor_wake_ms.load(Ordering::Relaxed);
+            if now.saturating_sub(prev) >= 16 {
+                self.last_cursor_wake_ms.store(now, Ordering::Relaxed);
+                if let Ok(guard) = self.wake.lock()
+                    && let Some(ctx) = guard.as_ref()
+                {
+                    ctx.request_repaint();
+                }
+            } else if let Ok(guard) = self.wake.lock()
+                && let Some(ctx) = guard.as_ref()
+            {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
+        res
+    }
+
+    /// 初始快照分片到达时合并 UI 唤醒（32ms 节流），消除 740 次 `request_repaint()` 风暴。
+    fn send_snapshot_batch(&self, ev: NetEvent) -> Result<(), std::sync::mpsc::SendError<NetEvent>> {
+        let res = self.tx.send(ev);
+        if res.is_ok() {
+            let now = self.t0.elapsed().as_millis() as u64 + 1;
+            let prev = self.last_snap_wake_ms.load(Ordering::Relaxed);
+            if now.saturating_sub(prev) >= 32 {
+                self.last_snap_wake_ms.store(now, Ordering::Relaxed);
+                if let Ok(guard) = self.wake.lock()
+                    && let Some(ctx) = guard.as_ref()
+                {
                     ctx.request_repaint();
                 }
             }
@@ -904,6 +1264,43 @@ fn shift_seq_map(map: &mut SeqMap, sheet: usize, op: &sheetcore::structural::Str
     }
 }
 
+const MAX_SAVE_CHECKPOINTS: usize = 8;
+
+/// 后台在加入者监督线程中直接组装完成的列式工作簿快照，
+/// 供 UI 线程在 `SnapshotDone` 时以 `O(页数)` 原子移交，消除 50 万次 `BTreeMap` 插入与 `CellStyle` 深拷贝。
+#[allow(dead_code)]
+pub struct PreparedGuestSnapshot {
+    pub sheets: Vec<sheetcore::Sheet>,
+    pub styles: sheetcore::style::StyleTable,
+    pub has_seed_styles: bool,
+    pub merge_ops: Vec<(usize, u32, u32, u32, u32, bool)>,
+    pub overlay_ops: Vec<Op>,
+    pub max_ts: u64,
+    pub host_site: u32,
+}
+
+#[allow(dead_code)]
+impl PreparedGuestSnapshot {
+    pub fn install(self, wb: &mut sheetcore::Workbook, peer: Option<&mut sheetcore::sync::Peer>) {
+        sheetcore::sync::install_guest_snapshot_into_workbook(
+            wb,
+            self.sheets,
+            self.styles,
+            self.has_seed_styles,
+            &self.merge_ops,
+        );
+        if let Some(p) = peer {
+            p.clock = p.clock.max(self.max_ts).max(1);
+            p.cells.clear();
+            let base = BaselineBook::from_workbook(self.host_site.max(1), wb);
+            p.cells.set_baseline(base);
+            for op in self.overlay_ops {
+                p.apply(op);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct HostWatermark {
     seq: u64,
@@ -916,6 +1313,9 @@ struct HostWatermark {
     axis_cols: Arc<AxisSeqTable>,
     cached_axis: Option<AxisStylesMap>,
     merges: Arc<MergeWatermarkLog>,
+    /// 最近几次保存原文件的 `(file_sha256, watermark_seq, structure_revision)` 检查点环，
+    /// 使宿主保存后打开共享文件的同事仍可直接走 `O(Δ)` 水位增量入房而非退化为全量快照。
+    checkpoints: Arc<std::collections::VecDeque<(String, u64, usize)>>,
 }
 
 impl Default for HostWatermark {
@@ -931,6 +1331,7 @@ impl Default for HostWatermark {
             axis_cols: Arc::new(HashMap::new()),
             cached_axis: None,
             merges: Arc::new(Vec::new()),
+            checkpoints: Arc::new(std::collections::VecDeque::new()),
         }
     }
 }
@@ -938,6 +1339,29 @@ impl Default for HostWatermark {
 impl HostWatermark {
     fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    fn record_checkpoint(&mut self, hash: String, wm_seq: u64, struct_rev: usize) {
+        if hash.is_empty() {
+            return;
+        }
+        let cps = Arc::make_mut(&mut self.checkpoints);
+        cps.retain(|(h, _, _)| h != &hash);
+        if cps.len() >= MAX_SAVE_CHECKPOINTS {
+            cps.pop_front();
+        }
+        cps.push_back((hash, wm_seq.max(1), struct_rev));
+    }
+
+    fn find_checkpoint(&self, hash: &str) -> Option<(u64, usize)> {
+        if hash.is_empty() {
+            return None;
+        }
+        self.checkpoints
+            .iter()
+            .rev()
+            .find(|(h, _, _)| h == hash)
+            .map(|&(_, wm, srev)| (wm, srev))
     }
 
     fn axis_styles_snapshot(&mut self) -> AxisStylesMap {
@@ -1171,10 +1595,118 @@ pub struct Net {
         Option<SharedStyles>,
     delta_merges: Option<Arc<Mutex<Vec<(usize, u32, u32, u32, u32, bool)>>>>,
     host_structs: Option<Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>>>,
+    host_file_path: Option<Arc<Mutex<Option<std::path::PathBuf>>>>,
+    staged_save_cursor: Mutex<Option<(u64, u64, usize)>>,
     peer_update_dl: Arc<Mutex<Option<ActivePeerDownload>>>,
     update_seed_override: SharedUpdateSeed,
+    seeder_queue: UpdateSeederQueue,
+    cursor_throttle: CursorSendThrottle,
+    fast_snapshot_handoff: Arc<AtomicBool>,
+    seed_styles: Arc<Mutex<Option<sheetcore::style::StyleTable>>>,
+    ready_snapshot: Arc<Mutex<Option<PreparedGuestSnapshot>>>,
     evt_tx: EvtTx,
     t0: std::time::Instant,
+}
+
+const CURSOR_SEND_THROTTLE: Duration = Duration::from_millis(33);
+
+#[derive(Default)]
+struct CursorSendState {
+    last_sent: Option<std::time::Instant>,
+    pending: Option<Cursor>,
+    worker_armed: bool,
+    stopped: bool,
+}
+
+#[derive(Clone, Default)]
+struct CursorSendThrottle {
+    inner: Arc<(Mutex<CursorSendState>, std::sync::Condvar)>,
+}
+
+impl CursorSendThrottle {
+    fn send_throttled(&self, cur: Cursor, cmd: &Sender<Cmd>, alive: &Arc<AtomicBool>) {
+        let (lock, _) = &*self.inner;
+        let mut g = lock.lock().unwrap();
+        if g.stopped {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if !g.worker_armed
+            && g.last_sent
+                .is_none_or(|t| now.saturating_duration_since(t) >= CURSOR_SEND_THROTTLE)
+        {
+            // 前缘 0ms 立即发送：首次或间隔 >= 33ms 直接投递，零额外延迟、零辅助线程
+            g.last_sent = Some(now);
+            g.pending = None;
+            drop(g);
+            let _ = cmd.send(Cmd::BroadcastMsg(Msg::CursorMsg(cur)));
+            return;
+        }
+        // 33ms 窗口内高频连发：合并覆盖单槽 `pending`，尾随定时补发确保不丢最终位置
+        g.pending = Some(cur);
+        if !g.worker_armed {
+            g.worker_armed = true;
+            let runner = self.inner.clone();
+            let cmd = cmd.clone();
+            let alive = alive.clone();
+            std::thread::spawn(move || {
+                let (lock, cvar) = &*runner;
+                let mut g = lock.lock().unwrap();
+                loop {
+                    if g.stopped || !alive.load(Ordering::Acquire) {
+                        g.pending = None;
+                        g.worker_armed = false;
+                        return;
+                    }
+                    let wait_dur = g
+                        .last_sent
+                        .map(|t| {
+                            (t + CURSOR_SEND_THROTTLE)
+                                .saturating_duration_since(std::time::Instant::now())
+                        })
+                        .unwrap_or(Duration::ZERO);
+                    if !wait_dur.is_zero() {
+                        let (g2, _) = cvar.wait_timeout(g, wait_dur).unwrap();
+                        g = g2;
+                        continue;
+                    }
+                    let Some(latest) = g.pending.take() else {
+                        g.worker_armed = false;
+                        return;
+                    };
+                    g.last_sent = Some(std::time::Instant::now());
+                    drop(g);
+                    if cmd.send(Cmd::BroadcastMsg(Msg::CursorMsg(latest))).is_err() {
+                        let mut g_err = lock.lock().unwrap();
+                        g_err.pending = None;
+                        g_err.worker_armed = false;
+                        return;
+                    }
+                    g = lock.lock().unwrap();
+                    if g.pending.is_none() {
+                        g.worker_armed = false;
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    fn rename_pending(&self, canonical: &str) {
+        let (lock, _) = &*self.inner;
+        let mut g = lock.lock().unwrap();
+        if let Some(cur) = g.pending.as_mut() {
+            cur.name = canonical.to_string();
+        }
+    }
+
+    fn shutdown(&self) {
+        let (lock, cvar) = &*self.inner;
+        let mut g = lock.lock().unwrap();
+        g.stopped = true;
+        g.pending = None;
+        cvar.notify_all();
+    }
 }
 
 impl Drop for Net {
@@ -1196,21 +1728,45 @@ fn track_socket(
     Some(stream)
 }
 
-fn write_line<W: Write>(stream: &mut W, s: &str) -> std::io::Result<()> {
+fn write_line_opt<W: Write>(stream: &mut W, s: &str, flush: bool) -> std::io::Result<()> {
     stream.write_all(s.as_bytes())?;
     stream.write_all(b"\n")?;
-    stream.flush()
+    if flush {
+        stream.flush()
+    } else {
+        Ok(())
+    }
 }
 
-fn write_binary_frame<W: Write>(stream: &mut W, frame: &[u8]) -> std::io::Result<()> {
+fn write_line<W: Write>(stream: &mut W, s: &str) -> std::io::Result<()> {
+    write_line_opt(stream, s, true)
+}
+
+fn write_binary_frame_opt<W: Write>(stream: &mut W, frame: &[u8], flush: bool) -> std::io::Result<()> {
     stream.write_all(frame)?;
-    stream.flush()
+    if flush {
+        stream.flush()
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn write_binary_frame<W: Write>(stream: &mut W, frame: &[u8]) -> std::io::Result<()> {
+    write_binary_frame_opt(stream, frame, true)
 }
 
 /// 宿主写线程内部控制前缀：明文未加密拒绝报文（认证失败时发给尚未建立会话的对端）
 const CTRL_RAW_LINE_PREFIX: char = '\u{1}';
-/// 宿主写线程内部控制哨兵：写完 v2 `Welcome` 后原子切换至 v3 二进制帧封装
+/// 宿主写线程内部控制哨兵：写完 v2 `Welcome` 后原子切换至 v3 二进制帧封装（JSON 内层）
 const CTRL_ENABLE_BINARY_V3: &str = "\u{2}";
+/// 宿主写线程内部控制哨兵：写完 v2 `Welcome` 后原子切换至 v3 紧凑二进制帧封装（`V3_FLAG_COMPACT_BIN`）
+const CTRL_ENABLE_COMPACT_V3: &str = "\u{3}";
+
+enum IntroFrame {
+    Line(String),
+    Compact(Vec<u8>),
+}
 
 enum WireFrame {
     Text(String),
@@ -1269,6 +1825,7 @@ struct HostOutput {
     writer: BufWriter<TcpStream>,
     sess: sheetcore::wire::Session,
     binary_v3: bool,
+    compact_v3: bool,
     scratch: Vec<u8>,
 }
 
@@ -1278,35 +1835,81 @@ impl HostOutput {
             writer,
             sess,
             binary_v3: false,
+            compact_v3: false,
             scratch: Vec::new(),
         }
     }
 
-    fn write_plain(&mut self, plain: &str) -> std::io::Result<()> {
+    fn write_plain_opt(&mut self, plain: &str, flush: bool) -> std::io::Result<()> {
         if self.binary_v3 {
             self.sess.seal_binary_into(plain, true, &mut self.scratch);
-            let res = write_binary_frame(&mut self.writer, &self.scratch);
+            let res = write_binary_frame_opt(&mut self.writer, &self.scratch, flush);
             if self.scratch.capacity() > 512 * 1024 {
                 self.scratch = Vec::new();
             }
             res
         } else {
             let frame = self.sess.seal(plain);
-            write_line(&mut self.writer, &frame)
+            write_line_opt(&mut self.writer, &frame, flush)
         }
     }
 
-    fn write_prepared(&mut self, prepared: &sheetcore::wire::PreparedPayload) -> std::io::Result<()> {
-        if self.binary_v3 {
-            self.sess.seal_prepared_binary_into(prepared, &mut self.scratch);
-            let res = write_binary_frame(&mut self.writer, &self.scratch);
+    fn write_plain(&mut self, plain: &str) -> std::io::Result<()> {
+        self.write_plain_opt(plain, true)
+    }
+
+    fn write_compact_opt(&mut self, raw: &[u8], flush: bool) -> std::io::Result<()> {
+        if self.binary_v3 && self.compact_v3 {
+            self.sess
+                .seal_compact_binary_into(raw, true, &mut self.scratch);
+            let res = write_binary_frame_opt(&mut self.writer, &self.scratch, flush);
             if self.scratch.capacity() > 512 * 1024 {
                 self.scratch = Vec::new();
             }
             res
+        } else if let Some(msg) = sheetcore::sync::decode_msg_compact(raw)
+            && let Ok(plain) = serde_json::to_string(&msg)
+        {
+            self.write_plain_opt(&plain, flush)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compact frame fallback failed",
+            ))
+        }
+    }
+
+    fn write_prepared_opt(
+        &mut self,
+        prepared: &sheetcore::wire::PreparedPayload,
+        flush: bool,
+    ) -> std::io::Result<()> {
+        if self.binary_v3 && (!prepared.is_compact_bin() || self.compact_v3) {
+            self.sess.seal_prepared_binary_into(prepared, &mut self.scratch);
+            let res = write_binary_frame_opt(&mut self.writer, &self.scratch, flush);
+            if self.scratch.capacity() > 512 * 1024 {
+                self.scratch = Vec::new();
+            }
+            res
+        } else if prepared.is_compact_bin() {
+            let Some(raw) = prepared.decode_compact_bytes() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid compact prepared payload",
+                ));
+            };
+            let Some(msg) = sheetcore::sync::decode_msg_compact(&raw) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "compact payload transcoding failed",
+                ));
+            };
+            let plain = serde_json::to_string(&msg)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            self.write_plain_opt(&plain, flush)
         } else {
             let frame = self.sess.seal_prepared(prepared);
-            write_line(&mut self.writer, &frame)
+            write_line_opt(&mut self.writer, &frame, flush)
         }
     }
 }
@@ -1316,40 +1919,79 @@ struct GuestSend {
     batch_ops: bool,
     sort_permutation: bool,
     binary_v3: bool,
+    compact_v3: bool,
     scratch: Vec<u8>,
     acks: Arc<Mutex<Receiver<(u64, SortResponse)>>>,
 }
 
 impl GuestSend {
-    fn write_plain<W: Write>(&mut self, w: &mut W, plain: &str) -> std::io::Result<()> {
+    fn write_plain_opt<W: Write>(&mut self, w: &mut W, plain: &str, flush: bool) -> std::io::Result<()> {
         if self.binary_v3 {
             self.sess.seal_binary_into(plain, true, &mut self.scratch);
-            let res = write_binary_frame(w, &self.scratch);
+            let res = write_binary_frame_opt(w, &self.scratch, flush);
             if self.scratch.capacity() > 512 * 1024 {
                 self.scratch = Vec::new();
             }
             res
         } else {
             let frame = self.sess.seal(plain);
-            write_line(w, &frame)
+            write_line_opt(w, &frame, flush)
         }
     }
 
-    fn write_prepared<W: Write>(
-        &mut self,
-        w: &mut W,
-        prepared: &sheetcore::wire::PreparedPayload,
-    ) -> std::io::Result<()> {
-        if self.binary_v3 {
-            self.sess.seal_prepared_binary_into(prepared, &mut self.scratch);
-            let res = write_binary_frame(w, &self.scratch);
+    fn write_plain<W: Write>(&mut self, w: &mut W, plain: &str) -> std::io::Result<()> {
+        self.write_plain_opt(w, plain, true)
+    }
+
+    fn write_msg_opt<W: Write>(&mut self, w: &mut W, msg: &Msg, flush: bool) -> std::io::Result<()> {
+        if self.binary_v3 && self.compact_v3 {
+            let raw = sheetcore::sync::encode_msg_compact(msg);
+            self.sess
+                .seal_compact_binary_into(&raw, true, &mut self.scratch);
+            let res = write_binary_frame_opt(w, &self.scratch, flush);
             if self.scratch.capacity() > 512 * 1024 {
                 self.scratch = Vec::new();
             }
             res
         } else {
+            let plain = serde_json::to_string(msg)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            self.write_plain_opt(w, &plain, flush)
+        }
+    }
+
+    fn write_prepared_opt<W: Write>(
+        &mut self,
+        w: &mut W,
+        prepared: &sheetcore::wire::PreparedPayload,
+        flush: bool,
+    ) -> std::io::Result<()> {
+        if self.binary_v3 && (!prepared.is_compact_bin() || self.compact_v3) {
+            self.sess.seal_prepared_binary_into(prepared, &mut self.scratch);
+            let res = write_binary_frame_opt(w, &self.scratch, flush);
+            if self.scratch.capacity() > 512 * 1024 {
+                self.scratch = Vec::new();
+            }
+            res
+        } else if prepared.is_compact_bin() {
+            let Some(raw) = prepared.decode_compact_bytes() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid compact prepared payload",
+                ));
+            };
+            let Some(msg) = sheetcore::sync::decode_msg_compact(&raw) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "compact payload transcoding failed",
+                ));
+            };
+            let plain = serde_json::to_string(&msg)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            self.write_plain_opt(w, &plain, flush)
+        } else {
             let frame = self.sess.seal_prepared(prepared);
-            write_line(w, &frame)
+            write_line_opt(w, &frame, flush)
         }
     }
 }
@@ -1611,20 +2253,29 @@ fn shift_state(
 // Allow for the authentication tag, sequence number and Base64 expansion.
 const MAX_PLAIN_LINE: usize = MAX_LINE / 4 * 3 - 64;
 const SNAPSHOT_STYLE_CHUNK: usize = 1_024;
+const SNAPSHOT_PALETTE_STYLE_CHUNK: usize = SNAPSHOT_STYLE_CHUNK * 2;
+const SNAPSHOT_COMPACT_OP_CHUNK: usize = 8_192;
 
 fn emit_style_snapshot_chunk(
     chunk: &[(usize, u32, u32, sheetcore::style::CellStyle)],
     palette_capable: bool,
-    tx: &std::sync::mpsc::SyncSender<String>,
+    compact_v3: bool,
+    tx: &std::sync::mpsc::SyncSender<IntroFrame>,
 ) -> bool {
     if chunk.is_empty() {
         return true;
     }
     if palette_capable {
         let (palette, items) = sheetcore::sync::encode_style_snapshot_palette(chunk);
-        if let Ok(line) = serde_json::to_string(&Msg::StylePaletteSnapshot { palette, items }) {
+        let msg = Msg::StylePaletteSnapshot { palette, items };
+        if compact_v3 {
+            return tx
+                .send(IntroFrame::Compact(sheetcore::sync::encode_msg_compact(&msg)))
+                .is_ok();
+        }
+        if let Ok(line) = serde_json::to_string(&msg) {
             if line.len() <= MAX_PLAIN_LINE {
-                return tx.send(line).is_ok();
+                return tx.send(IntroFrame::Line(line)).is_ok();
             }
         }
     }
@@ -1632,14 +2283,15 @@ fn emit_style_snapshot_chunk(
         chunk,
         MAX_PLAIN_LINE,
         |batch| serde_json::to_string(&Msg::StyleSnapshot { items: batch.to_vec() }),
-        |line| tx.send(line).is_ok(),
+        |line| tx.send(IntroFrame::Line(line)).is_ok(),
     )
 }
 
 fn emit_style_palette_snapshot_chunk(
     palette: &mut Vec<sheetcore::style::CellStyle>,
     items: &mut Vec<(usize, u32, u32, u16)>,
-    tx: &std::sync::mpsc::SyncSender<String>,
+    compact_v3: bool,
+    tx: &std::sync::mpsc::SyncSender<IntroFrame>,
 ) -> bool {
     if items.is_empty() {
         palette.clear();
@@ -1647,12 +2299,21 @@ fn emit_style_palette_snapshot_chunk(
     }
     let pal = std::mem::take(palette);
     let it = std::mem::take(items);
+    if compact_v3 {
+        let msg = Msg::StylePaletteSnapshot {
+            palette: pal,
+            items: it,
+        };
+        return tx
+            .send(IntroFrame::Compact(sheetcore::sync::encode_msg_compact(&msg)))
+            .is_ok();
+    }
     if let Ok(line) = serde_json::to_string(&Msg::StylePaletteSnapshot {
         palette: pal.clone(),
         items: it.clone(),
     }) {
         if line.len() <= MAX_PLAIN_LINE {
-            return tx.send(line).is_ok();
+            return tx.send(IntroFrame::Line(line)).is_ok();
         }
     }
     // 极端超长样式帧回退至逐条拆帧
@@ -1664,7 +2325,7 @@ fn emit_style_palette_snapshot_chunk(
         &expanded,
         MAX_PLAIN_LINE,
         |batch| serde_json::to_string(&Msg::StyleSnapshot { items: batch.to_vec() }),
-        |line| tx.send(line).is_ok(),
+        |line| tx.send(IntroFrame::Line(line)).is_ok(),
     )
 }
 
@@ -1675,15 +2336,20 @@ struct OverlayStylePaletteEmitter {
     ptr_to_pal: HashMap<usize, u16>,
     hash_buckets: HashMap<u64, Vec<u16>>,
     items: Vec<(usize, u32, u32, u16)>,
+    chunk_limit: usize,
+    compact_v3: bool,
 }
 
 impl OverlayStylePaletteEmitter {
-    fn new() -> Self {
+    fn new(compact_v3: bool) -> Self {
+        let chunk_limit = SNAPSHOT_PALETTE_STYLE_CHUNK;
         Self {
             palette: Vec::new(),
             ptr_to_pal: HashMap::new(),
             hash_buckets: HashMap::new(),
-            items: Vec::with_capacity(SNAPSHOT_STYLE_CHUNK),
+            items: Vec::with_capacity(chunk_limit.min(4096)),
+            chunk_limit,
+            compact_v3,
         }
     }
 
@@ -1693,7 +2359,7 @@ impl OverlayStylePaletteEmitter {
         row: u32,
         col: u32,
         style: &Arc<sheetcore::style::CellStyle>,
-        tx: &std::sync::mpsc::SyncSender<String>,
+        tx: &std::sync::mpsc::SyncSender<IntroFrame>,
     ) -> bool {
         let ptr = Arc::as_ptr(style) as usize;
         let idx = if let Some(&id) = self.ptr_to_pal.get(&ptr) {
@@ -1724,16 +2390,16 @@ impl OverlayStylePaletteEmitter {
             id
         };
         self.items.push((si, row, col, idx));
-        if self.items.len() >= SNAPSHOT_STYLE_CHUNK {
+        if self.items.len() >= self.chunk_limit {
             return self.flush(tx);
         }
         true
     }
 
-    fn flush(&mut self, tx: &std::sync::mpsc::SyncSender<String>) -> bool {
+    fn flush(&mut self, tx: &std::sync::mpsc::SyncSender<IntroFrame>) -> bool {
         self.ptr_to_pal.clear();
         self.hash_buckets.clear();
-        emit_style_palette_snapshot_chunk(&mut self.palette, &mut self.items, tx)
+        emit_style_palette_snapshot_chunk(&mut self.palette, &mut self.items, self.compact_v3, tx)
     }
 }
 
@@ -1743,19 +2409,27 @@ fn stream_snapshot_styles(
     baseline: Option<&BaselineBook>,
     overlay: &Grid<sheetcore::style::CellStyle>,
     palette_capable: bool,
-    tx: &std::sync::mpsc::SyncSender<String>,
+    compact_v3: bool,
+    tx: &std::sync::mpsc::SyncSender<IntroFrame>,
 ) -> bool {
+    let overlay_nonempty = overlay.range(..).next().is_some();
     if palette_capable {
+        let chunk_limit = SNAPSHOT_PALETTE_STYLE_CHUNK;
         if let Some(base) = baseline {
             let mut palette: Vec<sheetcore::style::CellStyle> = Vec::new();
             let mut id_to_pal: HashMap<u16, u16> = HashMap::new();
-            let mut items: Vec<(usize, u32, u32, u16)> = Vec::with_capacity(SNAPSHOT_STYLE_CHUNK);
+            let mut items: Vec<(usize, u32, u32, u16)> =
+                Vec::with_capacity(chunk_limit.min(4096));
             for (si, sh) in base.sheets.iter().enumerate() {
+                let sheet_has_overlay = overlay_nonempty
+                    && overlay
+                        .range((si, 0, 0)..=(si, u32::MAX, u32::MAX))
+                        .next()
+                        .is_some();
                 // Preserve explicit `sid == 0` entries as well: `sh.styles` only stores `0` when
                 // masking a row/column default style (e.g. an unbolded cell inside a bold column).
                 for (pos, &id) in sh.styles.iter() {
-                    let key = (si, pos.row, pos.col);
-                    if overlay.get(&key).is_some() {
+                    if sheet_has_overlay && overlay.get(&(si, pos.row, pos.col)).is_some() {
                         continue;
                     }
                     let pal_idx = *id_to_pal.entry(id).or_insert_with(|| {
@@ -1764,39 +2438,46 @@ fn stream_snapshot_styles(
                         idx
                     });
                     items.push((si, pos.row, pos.col, pal_idx));
-                    if items.len() >= SNAPSHOT_STYLE_CHUNK {
+                    if items.len() >= chunk_limit {
                         id_to_pal.clear();
-                        if !emit_style_palette_snapshot_chunk(&mut palette, &mut items, tx) {
+                        if !emit_style_palette_snapshot_chunk(&mut palette, &mut items, compact_v3, tx) {
                             return false;
                         }
                     }
                 }
             }
-            if !emit_style_palette_snapshot_chunk(&mut palette, &mut items, tx) {
+            if !emit_style_palette_snapshot_chunk(&mut palette, &mut items, compact_v3, tx) {
                 return false;
             }
         }
-        let mut emitter = OverlayStylePaletteEmitter::new();
-        for (&(si, r, c), style) in overlay.range(..) {
-            if !emitter.push(si, r, c, style, tx) {
-                return false;
+        if overlay_nonempty {
+            let mut emitter = OverlayStylePaletteEmitter::new(compact_v3);
+            for (&(si, r, c), style) in overlay.range(..) {
+                if !emitter.push(si, r, c, style, tx) {
+                    return false;
+                }
             }
+            return emitter.flush(tx);
         }
-        return emitter.flush(tx);
+        return true;
     }
 
     let mut buf: Vec<(usize, u32, u32, sheetcore::style::CellStyle)> =
         Vec::with_capacity(SNAPSHOT_STYLE_CHUNK);
     if let Some(base) = baseline {
         for (si, sh) in base.sheets.iter().enumerate() {
+            let sheet_has_overlay = overlay_nonempty
+                && overlay
+                    .range((si, 0, 0)..=(si, u32::MAX, u32::MAX))
+                    .next()
+                    .is_some();
             for (pos, &id) in sh.styles.iter() {
-                let key = (si, pos.row, pos.col);
-                if overlay.get(&key).is_some() {
+                if sheet_has_overlay && overlay.get(&(si, pos.row, pos.col)).is_some() {
                     continue;
                 }
                 buf.push((si, pos.row, pos.col, base.styles.get(id).clone()));
                 if buf.len() >= SNAPSHOT_STYLE_CHUNK {
-                    if !emit_style_snapshot_chunk(&buf, false, tx) {
+                    if !emit_style_snapshot_chunk(&buf, false, false, tx) {
                         return false;
                     }
                     buf.clear();
@@ -1804,44 +2485,75 @@ fn stream_snapshot_styles(
             }
         }
     }
-    for (&(si, r, c), style) in overlay.range(..) {
-        buf.push((si, r, c, style.as_ref().clone()));
-        if buf.len() >= SNAPSHOT_STYLE_CHUNK {
-            if !emit_style_snapshot_chunk(&buf, false, tx) {
-                return false;
+    if overlay_nonempty {
+        for (&(si, r, c), style) in overlay.range(..) {
+            buf.push((si, r, c, style.as_ref().clone()));
+            if buf.len() >= SNAPSHOT_STYLE_CHUNK {
+                if !emit_style_snapshot_chunk(&buf, false, false, tx) {
+                    return false;
+                }
+                buf.clear();
             }
-            buf.clear();
         }
     }
-    emit_style_snapshot_chunk(&buf, false, tx)
+    emit_style_snapshot_chunk(&buf, false, false, tx)
 }
 
-/// 流式下发单元格快照（直接借用 `&Op` 序列化，彻底消除 `Arc::unwrap_or_clone` 百万次深拷贝）
+fn send_snapshot_chunk_refs(
+    refs: &[&Op],
+    compact_v3: bool,
+    tx: &std::sync::mpsc::SyncSender<IntroFrame>,
+) -> bool {
+    if refs.is_empty() {
+        return true;
+    }
+    if compact_v3 {
+        let raw = sheetcore::sync::encode_snapshot_chunk_ref_compact(refs, false);
+        tx.send(IntroFrame::Compact(raw)).is_ok()
+    } else {
+        let frame = sheetcore::sync::SnapshotChunkRef {
+            t: "SnapshotChunk",
+            ops: refs,
+            last: false,
+        };
+        serde_json::to_string(&frame).is_ok_and(|line| tx.send(IntroFrame::Line(line)).is_ok())
+    }
+}
+
+/// 流式下发单元格快照（直接借用 `&Op` 序列化，空覆盖表完全跳过 B-Tree 探查，紧凑模式下零 JSON 分配）
 fn stream_snapshot_ops(
     baseline: Option<&BaselineBook>,
     overlay: &Grid<Op>,
-    tx: &std::sync::mpsc::SyncSender<String>,
+    compact_v3: bool,
+    tx: &std::sync::mpsc::SyncSender<IntroFrame>,
 ) -> bool {
+    let chunk_cap = if compact_v3 {
+        SNAPSHOT_COMPACT_OP_CHUNK
+    } else {
+        sheetcore::sync::SNAPSHOT_CHUNK_OPS
+    };
+    let byte_cap = if compact_v3 { 1024 * 1024 } else { 512 * 1024 };
+    let overlay_nonempty = overlay.range(..).next().is_some();
+
     let flush_owned = |chunk: &[Op]| -> bool {
         if chunk.is_empty() {
             return true;
         }
         let refs: Vec<&Op> = chunk.iter().collect();
-        let frame = sheetcore::sync::SnapshotChunkRef {
-            t: "SnapshotChunk",
-            ops: &refs,
-            last: false,
-        };
-        serde_json::to_string(&frame).is_ok_and(|line| tx.send(line).is_ok())
+        send_snapshot_chunk_refs(&refs, compact_v3, tx)
     };
 
     if let Some(base) = baseline {
-        let mut chunk: Vec<Op> = Vec::with_capacity(sheetcore::sync::LIVE_OP_BATCH);
+        let mut chunk: Vec<Op> = Vec::with_capacity(chunk_cap.min(4096));
         let mut bytes = 0usize;
         for (si, sh) in base.sheets.iter().enumerate() {
+            let sheet_has_overlay = overlay_nonempty
+                && overlay
+                    .range((si, 0, 0)..=(si, u32::MAX, u32::MAX))
+                    .next()
+                    .is_some();
             for (pos, cell) in sh.iter() {
-                let key = (si, pos.row, pos.col);
-                if overlay.get(&key).is_some() {
+                if sheet_has_overlay && overlay.get(&(si, pos.row, pos.col)).is_some() {
                     continue;
                 }
                 let op = Op {
@@ -1859,11 +2571,8 @@ fn stream_snapshot_ops(
                     }
                     _ => 0,
                 };
-                let size = text_len + op.formula.as_deref().map_or(0, str::len) + 128;
-                if !chunk.is_empty()
-                    && (chunk.len() >= sheetcore::sync::SNAPSHOT_CHUNK_OPS
-                        || bytes + size > 512 * 1024)
-                {
+                let size = text_len + op.formula.as_deref().map_or(0, str::len) + 64;
+                if !chunk.is_empty() && (chunk.len() >= chunk_cap || bytes + size > byte_cap) {
                     if !flush_owned(&chunk) {
                         return false;
                     }
@@ -1879,45 +2588,27 @@ fn stream_snapshot_ops(
         }
     }
 
-    let mut refs: Vec<&Op> = Vec::with_capacity(sheetcore::sync::SNAPSHOT_CHUNK_OPS);
-    let mut bytes = 0usize;
-    for (_, op_arc) in overlay.range(..) {
-        let op = op_arc.as_ref();
-        let text_len = match &op.value {
-            sheetcore::sync::ValueWire::Text(s) | sheetcore::sync::ValueWire::Error(s) => s.len(),
-            _ => 0,
-        };
-        let size = text_len + op.formula.as_deref().map_or(0, str::len) + 128;
-        if !refs.is_empty()
-            && (refs.len() >= sheetcore::sync::SNAPSHOT_CHUNK_OPS || bytes + size > 512 * 1024)
-        {
-            let frame = sheetcore::sync::SnapshotChunkRef {
-                t: "SnapshotChunk",
-                ops: &refs,
-                last: false,
+    if overlay_nonempty {
+        let mut refs: Vec<&Op> = Vec::with_capacity(chunk_cap.min(4096));
+        let mut bytes = 0usize;
+        for (_, op_arc) in overlay.range(..) {
+            let op = op_arc.as_ref();
+            let text_len = match &op.value {
+                sheetcore::sync::ValueWire::Text(s) | sheetcore::sync::ValueWire::Error(s) => s.len(),
+                _ => 0,
             };
-            let Ok(line) = serde_json::to_string(&frame) else {
-                return false;
-            };
-            if tx.send(line).is_err() {
-                return false;
+            let size = text_len + op.formula.as_deref().map_or(0, str::len) + 64;
+            if !refs.is_empty() && (refs.len() >= chunk_cap || bytes + size > byte_cap) {
+                if !send_snapshot_chunk_refs(&refs, compact_v3, tx) {
+                    return false;
+                }
+                refs.clear();
+                bytes = 0;
             }
-            refs.clear();
-            bytes = 0;
+            bytes += size;
+            refs.push(op);
         }
-        bytes += size;
-        refs.push(op);
-    }
-    if !refs.is_empty() {
-        let frame = sheetcore::sync::SnapshotChunkRef {
-            t: "SnapshotChunk",
-            ops: &refs,
-            last: false,
-        };
-        let Ok(line) = serde_json::to_string(&frame) else {
-            return false;
-        };
-        if tx.send(line).is_err() {
+        if !refs.is_empty() && !send_snapshot_chunk_refs(&refs, compact_v3, tx) {
             return false;
         }
     }
@@ -2149,10 +2840,20 @@ impl Net {
             // 基准显式样式保留在只读 CoW `BaselineBook` 中，`host_styles` 仅存储建房后的增量改动
             *hs.lock().unwrap() = Default::default();
         }
+        if let Some(hp) = &self.host_file_path {
+            *hp.lock().unwrap() = workbook.path.clone();
+        }
+        *self.staged_save_cursor.lock().unwrap() = None;
         if let Some(wm) = &self.host_watermark {
             let mut w_guard = wm.lock().unwrap();
             let w = &mut *w_guard;
             w.reset();
+            if let Some(bh) = &self.host_base_hash {
+                let initial_hash = bh.lock().unwrap().clone();
+                if !initial_hash.is_empty() {
+                    w.record_checkpoint(initial_hash, 1, 0);
+                }
+            }
             let axis_rows = Arc::make_mut(&mut w.axis_rows);
             let axis_cols = Arc::make_mut(&mut w.axis_cols);
             for (si, sh) in workbook.sheets.iter().enumerate() {
@@ -2183,10 +2884,71 @@ impl Net {
             hc.lock().unwrap().insert(host_cursor.site, host_cursor);
         }
     }
+
     pub fn set_base_hash(&self, hash: String) {
+        if let Some(wm) = &self.host_watermark
+            && !hash.is_empty()
+        {
+            let srev = self
+                .host_structs
+                .as_ref()
+                .map_or(0, |h| h.lock().unwrap().len());
+            let mut w = wm.lock().unwrap();
+            let seq = w.seq;
+            w.record_checkpoint(hash.clone(), seq, srev);
+        }
         if let Some(bh) = &self.host_base_hash {
             *bh.lock().unwrap() = hash;
         }
+    }
+
+    /// 绑定宿主当前托管的原文件路径，供保存完成后自动异步刷新增量入房检查点。
+    #[allow(dead_code)]
+    pub fn set_host_file_path(&self, path: Option<std::path::PathBuf>) {
+        if let Some(hp) = &self.host_file_path {
+            *hp.lock().unwrap() = path;
+        }
+    }
+
+    /// 显式记录一次宿主原文件保存对应的 `(file_sha256, watermark_seq, structure_revision)` 检查点。
+    #[allow(dead_code)]
+    pub fn record_save_checkpoint(&self, file_hash: String) {
+        if !self.hosting || file_hash.is_empty() {
+            return;
+        }
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let srev = self
+            .host_structs
+            .as_ref()
+            .map_or(0, |h| h.lock().unwrap().len());
+        if let Some(wm) = &self.host_watermark {
+            let mut w = wm.lock().unwrap();
+            let seq = w.seq;
+            w.record_checkpoint(file_hash, seq, srev);
+        }
+    }
+
+    /// 启用加入者后台列式工作簿快照直接移交（配合 `take_prepared_snapshot` 使用）。
+    #[allow(dead_code)]
+    pub fn enable_fast_snapshot_handoff(&self) {
+        self.fast_snapshot_handoff.store(true, Ordering::Release);
+    }
+
+    /// 以加入者现有工作簿样式表（含主题色 `themes`、图案填充 `patterns`、`quotePrefix`）为种子，
+    /// 启用后台列式快照直接移交，使新样式追加在原样式表之后、安装时 `O(1)` 替换且不丢失任何 OOXML 样式扩展。
+    #[allow(dead_code)]
+    pub fn enable_fast_snapshot_handoff_with_styles(
+        &self,
+        base_styles: &sheetcore::style::StyleTable,
+    ) {
+        *self.seed_styles.lock().unwrap() = Some(base_styles.clone());
+        self.fast_snapshot_handoff.store(true, Ordering::Release);
+    }
+
+    /// 在收到 `NetEvent::SnapshotDone` 时取走后台已组装完毕的列式工作簿快照。
+    #[allow(dead_code)]
+    pub fn take_prepared_snapshot(&self) -> Option<PreparedGuestSnapshot> {
+        self.ready_snapshot.lock().unwrap().take()
     }
 
     fn host_now_ms(&self) -> u64 {
@@ -2273,10 +3035,19 @@ impl Net {
     }
 
     pub fn broadcast_ops(&self, mut ops: Vec<Op>) {
+        if ops.is_empty() {
+            return;
+        }
         let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
-        self.expire_host_locks();
-        let locks = self.host_locks.as_ref().map(|table| table.lock().unwrap());
         let now = self.host_now_ms();
+        let has_expired = self.host_locks.as_ref().is_some_and(|table| {
+            let lt = table.lock().unwrap();
+            !lt.is_empty() && lt.iter().any(|(_, h)| now.saturating_sub(h.at_ms) >= lt.ttl_ms)
+        });
+        if has_expired {
+            self.expire_host_locks();
+        }
+        let locks = self.host_locks.as_ref().map(|table| table.lock().unwrap());
         let has_other_locks = locks.as_ref().is_some_and(|lt| {
             !lt.is_empty()
                 && lt
@@ -2314,29 +3085,101 @@ impl Net {
         }
         drop(locks);
         if ops.is_empty() { return; }
+        let shared: Vec<Arc<Op>> = ops.into_iter().map(Arc::new).collect();
+        self.commit_and_dispatch_shared_ops(shared);
+    }
+
+    /// 零克隆批量广播已由 `Peer::local_set_shared` 构造的 `Arc<Op>` 切片。
+    #[allow(dead_code)]
+    pub fn broadcast_shared_ops(&self, mut ops: Vec<Arc<Op>>) {
+        if ops.is_empty() {
+            return;
+        }
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let now = self.host_now_ms();
+        let has_expired = self.host_locks.as_ref().is_some_and(|table| {
+            let lt = table.lock().unwrap();
+            !lt.is_empty() && lt.iter().any(|(_, h)| now.saturating_sub(h.at_ms) >= lt.ttl_ms)
+        });
+        if has_expired {
+            self.expire_host_locks();
+        }
+        let locks = self.host_locks.as_ref().map(|table| table.lock().unwrap());
+        let has_other_locks = locks.as_ref().is_some_and(|lt| {
+            !lt.is_empty()
+                && lt
+                    .iter()
+                    .any(|(_, h)| h.site != self.site && now.saturating_sub(h.at_ms) < lt.ttl_ms)
+        });
+        if has_other_locks {
+            ops.retain_mut(|op_arc| {
+                if op_arc.site != self.site {
+                    Arc::make_mut(op_arc).site = self.site;
+                }
+                if let Some(holder) = locks.as_ref().and_then(|lt| {
+                    lt.holder_other(op_arc.sheet, op_arc.row, op_arc.col, self.site, now)
+                }) {
+                    let prev = self.state.as_ref().and_then(|st| {
+                        latest_cell_op(
+                            self.host_baseline.as_ref(),
+                            st,
+                            op_arc.sheet,
+                            op_arc.row,
+                            op_arc.col,
+                        )
+                    });
+                    let _ = self.evt_tx.send(NetEvent::WriteRejected {
+                        holder: holder.site,
+                        holder_name: holder.name.clone(),
+                        sheet: op_arc.sheet,
+                        row: op_arc.row,
+                        col: op_arc.col,
+                        revert_ops: vec![(op_arc.row, op_arc.col, prev)],
+                        revert_styles: Vec::new(),
+                        revert_merge: None,
+                    });
+                    return false;
+                }
+                true
+            });
+        } else {
+            for op_arc in &mut ops {
+                if op_arc.site != self.site {
+                    Arc::make_mut(op_arc).site = self.site;
+                }
+            }
+        }
+        drop(locks);
+        if ops.is_empty() {
+            return;
+        }
+        self.commit_and_dispatch_shared_ops(ops);
+    }
+
+    fn commit_and_dispatch_shared_ops(&self, ops: Vec<Arc<Op>>) {
         if let (Some(state), Some(delta), Some(fk), Some(mc)) = (
             &self.state,
             &self.delta_ops,
             &self.formula_keys,
             &self.host_max_clock,
         ) {
-            update_host_ops(state, delta, fk, mc, &ops);
+            update_host_shared_ops(state, delta, fk, mc, ops.iter().cloned());
         }
         if let Some(roster) = &self.host_roster {
             let wm_seq = self
                 .host_watermark
                 .as_ref()
-                .map(|wm| wm.lock().unwrap().record_ops(ops.iter()));
+                .map(|wm| wm.lock().unwrap().record_ops(ops.iter().map(Arc::as_ref)));
             let struct_rev = self
                 .host_structs
                 .as_ref()
                 .map_or(0, |h| h.lock().unwrap().len());
-            queue_room_change(&self.cmd, roster, None, RoomChange::Cells(ops));
+            queue_room_change(&self.cmd, roster, None, RoomChange::SharedCells(ops));
             if let Some(seq) = wm_seq {
                 emit_room_watermark(&self.cmd, roster, seq, struct_rev);
             }
         } else {
-            let _ = self.cmd.send(Cmd::Cells(ops));
+            let _ = self.cmd.send(Cmd::SharedCells(ops));
         }
     }
 
@@ -2638,15 +3481,142 @@ impl Net {
         }
     }
 
-    /// 宿主保存共享原文件成功后广播通知全员
-    pub fn broadcast_saved(&self, clock: u64) {
+    /// 在发起后台保存（拍摄 `Workbook` 快照）的同一时刻捕获权威房间水位 `(wm_seq, struct_rev)`，
+    /// 杜绝写盘期间新编辑推进水位导致检查点超前；既可传给 `broadcast_saved_with_cursor`，也会自动暂存供同 `clock` 的 `broadcast_saved` 消费。
+    #[allow(dead_code)]
+    pub fn note_save_snapshot(&self, clock: u64) -> Option<(u64, usize)> {
+        if !self.hosting {
+            return None;
+        }
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let wm_seq = self.host_watermark.as_ref()?.lock().unwrap().seq;
+        let srev = self
+            .host_structs
+            .as_ref()
+            .map_or(0, |h| h.lock().unwrap().len());
+        *self.staged_save_cursor.lock().unwrap() = Some((clock, wm_seq, srev));
+        Some((wm_seq, srev))
+    }
+
+    /// 使用拍保存快照时刻捕获的 `(wm_seq, struct_rev)` 异步校验文件 `(len, modified)` 稳定后登记检查点并广播 `Saved`。
+    #[allow(dead_code)]
+    pub fn broadcast_saved_with_cursor(&self, clock: u64, cursor: Option<(u64, usize)>) {
+        self.broadcast_saved_impl(clock, cursor, true);
+    }
+
+    fn broadcast_saved_impl(
+        &self,
+        clock: u64,
+        cursor: Option<(u64, usize)>,
+        explicit_cursor: bool,
+    ) {
         if !self.hosting {
             return;
+        }
+        {
+            let mut staged = self.staged_save_cursor.lock().unwrap();
+            if staged.is_some_and(|(c, _, _)| c <= clock) {
+                *staged = None;
+            }
+        }
+        if let (Some((saved_seq, saved_srev)), Some(hp), Some(wm)) =
+            (cursor, &self.host_file_path, &self.host_watermark)
+            && let Some(path) = hp.lock().unwrap().clone()
+        {
+            let wm_clone = wm.clone();
+            let hs_clone = self.host_structs.clone();
+            let alive = self.alive.clone();
+            std::thread::spawn(move || {
+                if !alive.load(Ordering::Acquire) {
+                    return;
+                }
+                let Ok(md_before) = std::fs::metadata(&path) else {
+                    return;
+                };
+                let expected_len = md_before.len();
+                let Ok(mtime_before) = md_before.modified() else {
+                    return;
+                };
+                if expected_len == 0 {
+                    return;
+                }
+                let Ok(mut f) = std::fs::File::open(&path) else {
+                    return;
+                };
+                let mut hasher = Sha256::new();
+                let mut buf = vec![0u8; 256 * 1024];
+                let mut total_read = 0u64;
+                loop {
+                    match std::io::Read::read(&mut f, &mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total_read += n as u64;
+                            hasher.update(&buf[..n]);
+                        }
+                        Err(_) => return,
+                    }
+                }
+                drop(f);
+                let Ok(md_after) = std::fs::metadata(&path) else {
+                    return;
+                };
+                let Ok(mtime_after) = md_after.modified() else {
+                    return;
+                };
+                // 仅当读盘前后文件大小与修改时间完全一致时才登记检查点，防止并发二次覆盖污染检查点环
+                if total_read != expected_len
+                    || md_after.len() != expected_len
+                    || mtime_after != mtime_before
+                    || !alive.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                let hash = hex::encode(hasher.finalize());
+                let cur_srev = hs_clone.as_ref().map_or(0, |h| h.lock().unwrap().len());
+                let mut wm_guard = wm_clone.lock().unwrap();
+                if !explicit_cursor && (wm_guard.seq != saved_seq || cur_srev != saved_srev) {
+                    return;
+                }
+                wm_guard.record_checkpoint(hash, saved_seq, saved_srev);
+            });
         }
         let msg = Msg::Saved { site: self.site, clock };
         if let Ok(s) = serde_json::to_string(&msg) {
             let _ = self.cmd.send(Cmd::Broadcast(s));
         }
+    }
+
+    pub fn broadcast_saved(&self, clock: u64) {
+        if !self.hosting {
+            return;
+        }
+        let staged = {
+            let mut guard = self.staged_save_cursor.lock().unwrap();
+            if guard.is_some_and(|(c, _, _)| c == clock) {
+                guard.take().map(|(_, seq, srev)| (seq, srev))
+            } else {
+                None
+            }
+        };
+        if let Some(cur) = staged {
+            self.broadcast_saved_impl(clock, Some(cur), true);
+            return;
+        }
+        let cursor = (|| {
+            let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+            let max_clk = self
+                .host_max_clock
+                .as_ref()
+                .map_or(0, |c| c.load(Ordering::Acquire));
+            let wm_seq = self.host_watermark.as_ref()?.lock().unwrap().seq;
+            let srev = self
+                .host_structs
+                .as_ref()
+                .map_or(0, |h| h.lock().unwrap().len());
+            // 未显式调 `note_save_snapshot` 时，仅在写盘期间逻辑时钟与房间水位均未越过快照时刻 `clock` 时才登记检查点
+            (max_clk <= clock && wm_seq <= clock.max(1)).then_some((wm_seq, srev))
+        })();
+        self.broadcast_saved_impl(clock, cursor, false);
     }
 
     /// 广播格式变更（自动启用调色板字典编码，消除数十万格重复序列化 `CellStyle`）
@@ -2954,9 +3924,8 @@ impl Net {
         if let Some(hc) = &self.host_cursors {
             hc.lock().unwrap().insert(cur.site, cur.clone());
         }
-        if let Ok(s) = serde_json::to_string(&Msg::CursorMsg(cur)) {
-            let _ = self.cmd.send(Cmd::Broadcast(s));
-        }
+        self.cursor_throttle
+            .send_throttled(cur, &self.cmd, &self.alive);
     }
 
     /// 在线改显示名：客户端发给宿主，宿主做房间内唯一性消歧后转发给其他客户端；
@@ -2975,6 +3944,7 @@ impl Net {
                 cur.name = canonical.clone();
             }
         }
+        self.cursor_throttle.rename_pending(&canonical);
         let msg = Msg::Rename { site: self.site, name: canonical.clone() };
         if let Ok(s) = serde_json::to_string(&msg) {
             let _ = self.cmd.send(Cmd::Broadcast(s));
@@ -3088,7 +4058,8 @@ impl Net {
         if !crate::update::verify_manifest_sig(manifest) {
             return Err("更新清单签名无效，已拒绝请求".into());
         }
-        let part_path = crate::update::staging_file_path(&manifest.version, "peer.part")
+        let part_name = format!("peer-{}.part", self.site);
+        let part_path = crate::update::staging_file_path(&manifest.version, &part_name)
             .map_err(|e| format!("无法创建更新缓存目录：{e}"))?;
         let _ = std::fs::remove_file(&part_path);
         let file = std::fs::File::create(&part_path)
@@ -3148,6 +4119,8 @@ impl Net {
         for socket in self.sockets.lock().unwrap().drain(..).filter_map(|s| s.upgrade()) {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
+        self.seeder_queue.shutdown();
+        self.cursor_throttle.shutdown();
         self.finish_structure();
         self.pending_sorts.lock().unwrap().clear();
         let _ = self.cmd.send(Cmd::Stop);
@@ -3331,12 +4304,21 @@ fn host_initialized(
                     Cmd::Cells(ops) => {
                         let senders = roster.lock().unwrap().all_senders();
                         if !senders.is_empty() {
-                            cell_frames(ops, false, true, |s| {
-                                broadcast_line_to(&senders, s);
-                            });
+                            let shared: Vec<Arc<Op>> = ops.into_iter().map(Arc::new).collect();
+                            shared_cell_frames_to_peers(&shared, &senders);
                         }
                     }
-                    Cmd::GuestStructure(..) | Cmd::Sort(..) => unreachable!("guest command on host"),
+                    Cmd::SharedCells(ops) => {
+                        let senders = roster.lock().unwrap().all_senders();
+                        shared_cell_frames_to_peers(&ops, &senders);
+                    }
+                    Cmd::BroadcastMsg(msg) => {
+                        let senders = roster.lock().unwrap().all_senders();
+                        broadcast_msg_to(&senders, &msg);
+                    }
+                    Cmd::GuestStructure(..) | Cmd::Sort(..) | Cmd::PumpUpdate => {
+                        unreachable!("guest command on host")
+                    }
                     Cmd::Style(_) => unreachable!("client style dispatch is guest-only"),
                     Cmd::Deliver(peers, change) => {
                         let send = |line: String| {
@@ -3351,12 +4333,56 @@ fn host_initialized(
                             RoomChange::Correction(correction) => {
                                 for peer in &peers { let _ = peer.tx.send(LiveFrame::Correction(correction.clone())); }
                             }
-                            RoomChange::Cells(ops) => cell_frames(ops, false, true, send),
-                            RoomChange::Message(msg) => {
-                                if !send_room_message(msg, MAX_PLAIN_LINE, |line| { send(line); true }, || {}) {
-                                    let _ = dispatch_events.send(NetEvent::Error("协作修改未能完整发送".into()));
-                                }
+                            RoomChange::Cells(ops) => {
+                                let shared: Vec<Arc<Op>> = ops.into_iter().map(Arc::new).collect();
+                                shared_cell_frames_to_peers(&shared, &peers);
                             }
+                            RoomChange::SharedCells(ops) => {
+                                shared_cell_frames_to_peers(&ops, &peers);
+                            }
+                            RoomChange::Message(msg) => match &msg {
+                                Msg::Watermark { .. } | Msg::CursorMsg(_) => {
+                                    broadcast_msg_to(&peers, &msg);
+                                }
+                                Msg::StylePaletteOp { items, .. }
+                                    if items.len() <= sheetcore::sync::MAX_BATCH_ITEMS =>
+                                {
+                                    let (compact_peers, legacy_peers): (Vec<_>, Vec<_>) =
+                                        peers.iter().cloned().partition(LiveSender::is_compact_v3);
+                                    if !compact_peers.is_empty() {
+                                        let raw = sheetcore::sync::encode_msg_compact(&msg);
+                                        if raw.len() <= MAX_PLAIN_LINE {
+                                            let prep =
+                                                sheetcore::wire::prepare_compact_payload(raw, true);
+                                            for p in &compact_peers {
+                                                let _ = p.send_prepared(Arc::clone(&prep));
+                                            }
+                                        } else {
+                                            let send_c = |line: String| {
+                                                broadcast_line_to(&compact_peers, line);
+                                                true
+                                            };
+                                            if !send_room_message(msg.clone(), MAX_PLAIN_LINE, send_c, || {}) {
+                                                let _ = dispatch_events.send(NetEvent::Error("协作修改未能完整发送".into()));
+                                            }
+                                        }
+                                    }
+                                    if !legacy_peers.is_empty() {
+                                        let send_l = |line: String| {
+                                            broadcast_line_to(&legacy_peers, line);
+                                            true
+                                        };
+                                        if !send_room_message(msg, MAX_PLAIN_LINE, send_l, || {}) {
+                                            let _ = dispatch_events.send(NetEvent::Error("协作修改未能完整发送".into()));
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    if !send_room_message(msg, MAX_PLAIN_LINE, |line| { send(line); true }, || {}) {
+                                        let _ = dispatch_events.send(NetEvent::Error("协作修改未能完整发送".into()));
+                                    }
+                                }
+                            },
                         }
                     }
                     Cmd::Broadcast(s) => {
@@ -3440,7 +4466,9 @@ fn host_initialized(
     let host_update_dl_for_self = host_update_dl.clone();
     let host_seed_override: SharedUpdateSeed = Arc::new(Mutex::new(None));
     let host_seed_override_for_self = host_seed_override.clone();
-    let host_serving_update = Arc::new(AtomicBool::new(false));
+    let host_seeder_queue = UpdateSeederQueue::default();
+    let host_seeder_for_self = host_seeder_queue.clone();
+    let host_file_path: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
     let host_site_id = site;
 
     let (ready, initialized) = channel();
@@ -3477,7 +4505,7 @@ fn host_initialized(
         let structs_outer = structs.clone();
         let update_dl_outer = host_update_dl.clone();
         let seed_override_outer = host_seed_override.clone();
-        let serving_update_outer = host_serving_update.clone();
+        let seeder_queue_outer = host_seeder_queue.clone();
         let now_ms_outer = now_ms;
         std::thread::spawn(move || {
             let room_key = sheetcore::wire::RoomKey::derive(&password, &room_salt);
@@ -3533,7 +4561,7 @@ fn host_initialized(
                 let structs = structs_outer.clone();
                 let update_dl = update_dl_outer.clone();
                 let seed_override = seed_override_outer.clone();
-                let serving_update = serving_update_outer.clone();
+                let seeder_queue = seeder_queue_outer.clone();
                 let alive_conn = alive.clone();
                 let now_ms = now_ms_outer;
                 std::thread::spawn(move || {
@@ -3543,7 +4571,7 @@ fn host_initialized(
                         Err(_) => return,
                     };
                     let _ = write_raw.set_write_timeout(Some(Duration::from_secs(10)));
-                    let mut write_half = BufWriter::with_capacity(64 * 1024, write_raw);
+                    let mut write_half = BufWriter::with_capacity(128 * 1024, write_raw);
                     // 未认证连接限时：建连后 10 秒内不完成 Hello 就断开
                     let _ = stream.set_read_timeout(Some(PREAUTH_TIMEOUT));
                     let mut salt = [0u8; 16];
@@ -3561,47 +4589,145 @@ fn host_initialized(
                     }
                     let mut sess = sheetcore::wire::Session::host_side(&room_key, &salt);
                     let output = Arc::new(Mutex::new(HostOutput::new(write_half, sess.fork_sender())));
-                    let reader = BufReader::new(&*stream);
+                    let reader = BufReader::with_capacity(64 * 1024, &*stream);
                     let (live, rx) = channel::<LiveFrame>();
-                    let tx = LiveSender { tx: live };
+                    let peer_compact_flag = Arc::new(AtomicBool::new(false));
+                    let (tx, low_prio_q) = LiveSender::new(live, peer_compact_flag.clone());
                     let (ack_tx, ack_rx) = channel::<(u64,SortResponse)>();
                     let can_sort = Arc::new(AtomicBool::new(false));
                     let write_sort = can_sort.clone();
-                    let (intro, intro_rx) = std::sync::mpsc::sync_channel::<String>(4);
+                    let (intro, intro_rx) = std::sync::mpsc::sync_channel::<IntroFrame>(8);
                     let mut intro = Some(intro);
                     let write_out = output.clone();
                     std::thread::spawn(move || {
-                        let send = |s: String| {
+                        let send_line_opt = |s: String, flush: bool| -> bool {
                             let mut out = write_out.lock().unwrap();
                             if s == CTRL_ENABLE_BINARY_V3 {
                                 out.binary_v3 = true;
-                                return true;
+                                return !flush || out.writer.flush().is_ok();
+                            }
+                            if s == CTRL_ENABLE_COMPACT_V3 {
+                                out.binary_v3 = true;
+                                out.compact_v3 = true;
+                                return !flush || out.writer.flush().is_ok();
                             }
                             if let Some(denial) = s.strip_prefix(CTRL_RAW_LINE_PREFIX) {
-                                return write_line(&mut out.writer, denial).is_ok();
+                                return write_line_opt(&mut out.writer, denial, flush).is_ok();
                             }
-                            out.write_plain(&s).is_ok()
+                            out.write_plain_opt(&s, flush).is_ok()
                         };
-                        for frame in intro_rx.into_iter().map(LiveFrame::Line).chain(rx) {
-                            let ok = match frame {
-                                LiveFrame::Line(line) => send(line),
-                                LiveFrame::Prepared(prepared) => {
+                        let send_line = |s: String| send_line_opt(s, true);
+
+                        let mut intro_ok = true;
+                        let mut pending_intro = intro_rx.recv().ok();
+                        while let Some(item) = pending_intro.take() {
+                            let next = intro_rx.try_recv().ok();
+                            let flush_now = next.is_none();
+                            let ok = match item {
+                                IntroFrame::Line(s) => send_line_opt(s, flush_now),
+                                IntroFrame::Compact(raw) => {
                                     let mut out = write_out.lock().unwrap();
-                                    out.write_prepared(&prepared).is_ok()
+                                    out.write_compact_opt(&raw, flush_now).is_ok()
                                 }
-                                LiveFrame::Correction(correction) => {
-                                    correction.chunks(|sheet,first_ts,items| send_room_message(
-                                        Msg::SortRepairs { sheet,first_ts,items },MAX_PLAIN_LINE,send,|| {}))
-                                        && send(serde_json::to_string(&Msg::SortRepairDone { first_ts:correction.batch.plan.first_ts }).unwrap())
-                                }
-                                LiveFrame::Sort(batch) => send_sort(&batch, write_sort.load(Ordering::Acquire), false, true, &ack_rx, send),
                             };
-                            if !ok { break; }
+                            if !ok {
+                                intro_ok = false;
+                                break;
+                            }
+                            pending_intro = next.or_else(|| intro_rx.recv().ok());
+                        }
+
+                        if intro_ok {
+                            let mut next_frame = rx.recv().ok();
+                            while let Some(first) = next_frame.take() {
+                                let mut cur = Some(first);
+                                let mut batch_ok = true;
+                                while let Some(frame) = cur.take() {
+                                    let peek = rx.try_recv().ok();
+                                    let flush_now = peek.is_none()
+                                        && low_prio_q.0.lock().unwrap().0.is_empty();
+                                    let ok = match frame {
+                                        LiveFrame::Line(line) => send_line_opt(line, flush_now),
+                                        LiveFrame::Compact(raw) => {
+                                            let mut out = write_out.lock().unwrap();
+                                            out.write_compact_opt(&raw, flush_now).is_ok()
+                                        }
+                                        LiveFrame::Prepared(prepared) => {
+                                            let mut out = write_out.lock().unwrap();
+                                            out.write_prepared_opt(&prepared, flush_now).is_ok()
+                                        }
+                                        LiveFrame::Correction(correction) => {
+                                            correction.chunks(|sheet,first_ts,items| send_room_message(
+                                                Msg::SortRepairs { sheet,first_ts,items },MAX_PLAIN_LINE,send_line,|| {}))
+                                                && send_line(serde_json::to_string(&Msg::SortRepairDone { first_ts:correction.batch.plan.first_ts }).unwrap())
+                                        }
+                                        LiveFrame::Sort(batch) => send_sort(&batch, write_sort.load(Ordering::Acquire), false, true, &ack_rx, send_line),
+                                        LiveFrame::PumpUpdate => true,
+                                    };
+                                    if !ok {
+                                        batch_ok = false;
+                                        break;
+                                    }
+                                    cur = peek;
+                                }
+                                if !batch_ok {
+                                    break;
+                                }
+                                // 高优通道已排空：穿插发送低优 P2P 更新分片，每发 1 片立即检查是否有新实时协作帧到达
+                                let mut slice_ok = true;
+                                loop {
+                                    if let Ok(hp) = rx.try_recv() {
+                                        next_frame = Some(hp);
+                                        break;
+                                    }
+                                    let popped = {
+                                        let (lock, cvar) = &*low_prio_q;
+                                        let mut g = lock.lock().unwrap();
+                                        let item = g.0.pop_front();
+                                        let empty = g.0.is_empty();
+                                        if item.is_some() {
+                                            cvar.notify_one();
+                                        }
+                                        (item, empty)
+                                    };
+                                    let (Some(slice), queue_empty) = popped else {
+                                        let _ = write_out.lock().unwrap().writer.flush();
+                                        break;
+                                    };
+                                    let ok = {
+                                        let mut out = write_out.lock().unwrap();
+                                        out.write_prepared_opt(&slice, queue_empty).is_ok()
+                                    };
+                                    if !ok {
+                                        slice_ok = false;
+                                        break;
+                                    }
+                                    if queue_empty {
+                                        break;
+                                    }
+                                }
+                                if !slice_ok {
+                                    break;
+                                }
+                                if next_frame.is_none() {
+                                    next_frame = rx.recv().ok();
+                                }
+                            }
+                        }
+                        {
+                            let (lock, cvar) = &*low_prio_q;
+                            let mut g = lock.lock().unwrap();
+                            g.0.clear();
+                            g.1 = true;
+                            cvar.notify_all();
                         }
                         let _ = write_out.lock().unwrap().writer.get_ref().shutdown(std::net::Shutdown::Both);
                     });
 
                     let expire_and_broadcast = || {
+                        if locks.lock().unwrap().is_empty() {
+                            return;
+                        }
                         let dead = locks.lock().unwrap().expire(now_ms());
                         if dead.is_empty() {
                             return;
@@ -3647,20 +4773,55 @@ fn host_initialized(
                         let allow_binary = hello_site.is_some();
                         let limit = if allow_binary { MAX_LINE } else { MAX_PREAUTH_LINE };
                         let Ok(Some(frame)) = read_wire_frame(&mut reader, limit, allow_binary) else { break };
-                        let opened = match frame {
-                            WireFrame::Text(line) => sess.open(&line),
-                            WireFrame::Binary(body) => sess.open_binary_owned(body),
+                        let mut raw_json_line: Option<String> = None;
+                        let decoded_msg: Option<Msg> = match frame {
+                            WireFrame::Text(line) => match sess.open(&line) {
+                                Some(plain) => {
+                                    let parsed = serde_json::from_str::<Msg>(&plain).ok();
+                                    raw_json_line = Some(plain);
+                                    parsed
+                                }
+                                None => {
+                                    if hello_site.is_none() {
+                                        let deny = serde_json::to_string(&Msg::Denied {
+                                            reason: "口令不正确或客户端不支持加密协作".into(),
+                                        }).unwrap();
+                                        let _ = tx.send(format!("{CTRL_RAW_LINE_PREFIX}{deny}"));
+                                    }
+                                    break;
+                                }
+                            },
+                            WireFrame::Binary(body) => match sess.open_binary_frame_owned(body) {
+                                Some(sheetcore::wire::DecodedWireFrame::Text(plain)) => {
+                                    let parsed = serde_json::from_str::<Msg>(&plain).ok();
+                                    raw_json_line = Some(plain);
+                                    parsed
+                                }
+                                Some(sheetcore::wire::DecodedWireFrame::Compact(bytes)) => {
+                                    // 零 JSON 转发 P2P 二进制自更新分片：宿主仅校验头部站点号并直投目标低优队列
+                                    if let Some(conn_site) = hello_site
+                                        && let Some((from_s, to_s)) =
+                                            sheetcore::sync::peek_compact_update_slice_target(&bytes)
+                                        && from_s == conn_site
+                                        && to_s != conn_site
+                                        && to_s != host_site_id
+                                        && bytes.len() <= 390_000
+                                    {
+                                        if let Some(target_tx) = roster.lock().unwrap().sender_of(to_s)
+                                            && target_tx.is_compact_v3()
+                                        {
+                                            let _ = target_tx.send_update_slice(
+                                                sheetcore::wire::prepare_compact_payload(bytes, false),
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    sheetcore::sync::decode_msg_compact(&bytes)
+                                }
+                                None => break,
+                            },
                         };
-                        let Some(line) = opened else {
-                            if hello_site.is_none() {
-                                let deny = serde_json::to_string(&Msg::Denied {
-                                    reason: "口令不正确或客户端不支持加密协作".into(),
-                                }).unwrap();
-                                let _ = tx.send(format!("{CTRL_RAW_LINE_PREFIX}{deny}"));
-                            }
-                            break;
-                        };
-                        let Ok(msg) = serde_json::from_str::<Msg>(&line) else { continue };
+                        let Some(msg) = decoded_msg else { continue };
                         // 坐标、数量、时间戳越界的报文整条丢弃，不进宿主状态、不转发
                         if !msg.is_within_limits() {
                             continue;
@@ -3683,17 +4844,20 @@ fn host_initialized(
                                 resume_watermark,
                                 resume_struct_rev,
                                 binary_v3,
+                                compact_v3,
                             } => {
                                 can_sort.store(sort_permutation, Ordering::Release);
+                                let use_compact_v3 = binary_v3 && compact_v3;
+                                peer_compact_flag.store(use_compact_v3, Ordering::Release);
                                 let live_tx = tx.clone();
                                 let tx = intro.take().expect("only one introduction");
                                 if !proof_matches(&got, &room_key.proof(nonce)) {
-                                    let _ = tx.send(
+                                    let _ = tx.send(IntroFrame::Line(
                                         serde_json::to_string(&Msg::Denied {
                                             reason: "口令不正确".into(),
                                         })
                                         .unwrap(),
-                                    );
+                                    ));
                                     break;
                                 }
                                 let order = room_order.lock().unwrap();
@@ -3701,12 +4865,12 @@ fn host_initialized(
                                 let (canonical_name, known) = match admitted {
                                     Ok(pair) => pair,
                                     Err(reason) => {
-                                        let _ = tx.send(
+                                        let _ = tx.send(IntroFrame::Line(
                                             serde_json::to_string(&Msg::Denied {
                                                 reason: reason.into(),
                                             })
                                             .unwrap(),
-                                        );
+                                        ));
                                         break;
                                     }
                                 };
@@ -3722,12 +4886,40 @@ fn host_initialized(
                                     && resume_room == room_session_id
                                     && resume_watermark >= 1
                                     && resume_watermark <= current_wm
-                                    && resume_struct_rev == struct_rev;
-                                let can_hash_delta = !can_resume
+                                    && resume_struct_rev <= struct_rev
+                                    && (resume_struct_rev == struct_rev
+                                        || wm_snapshot
+                                            .merges
+                                            .partition_point(|(s, ..)| *s <= resume_watermark)
+                                            == wm_snapshot.merges.len());
+                                let checkpoint_match = (!can_resume && !client_hash.is_empty())
+                                    .then(|| wm_snapshot.find_checkpoint(&client_hash))
+                                    .flatten();
+                                let can_checkpoint_delta = !can_resume
+                                    && checkpoint_match.is_some_and(|(cp_wm, cp_srev)| {
+                                        cp_wm >= 1
+                                            && cp_wm <= current_wm
+                                            && cp_srev <= struct_rev
+                                            && (cp_srev == struct_rev
+                                                || wm_snapshot
+                                                    .merges
+                                                    .partition_point(|(s, ..)| *s <= cp_wm)
+                                                    == wm_snapshot.merges.len())
+                                    });
+                                let can_legacy_hash_delta = !can_resume
+                                    && !can_checkpoint_delta
                                     && !client_hash.is_empty()
                                     && hist.is_empty()
                                     && *host_base_hash.lock().unwrap() == client_hash;
-                                let is_delta = can_resume || can_hash_delta;
+                                let is_wm_delta = can_resume || can_checkpoint_delta;
+                                let (delta_wm, delta_srev) = if can_resume {
+                                    (resume_watermark, resume_struct_rev)
+                                } else if let Some(pair) = checkpoint_match {
+                                    pair
+                                } else {
+                                    (0, 0)
+                                };
+                                let is_delta = is_wm_delta || can_legacy_hash_delta;
 
                                 // 锁内仅做 O(1) CoW 根指针克隆，绝不在 room_order 锁内遍历百万格！
                                 let base_arc = if is_delta {
@@ -3735,18 +4927,18 @@ fn host_initialized(
                                 } else {
                                     host_baseline.lock().unwrap().clone()
                                 };
-                                let ops_grid = if can_hash_delta {
+                                let ops_grid = if can_legacy_hash_delta {
                                     delta_ops.lock().unwrap().clone()
                                 } else {
                                     state.lock().unwrap().clone()
                                 };
-                                let styles_grid = if can_hash_delta {
+                                let styles_grid = if can_legacy_hash_delta {
                                     delta_styles.lock().unwrap().clone()
                                 } else {
                                     styles.lock().unwrap().clone()
                                 };
                                 let host_clock = host_max_clock.load(Ordering::Acquire).max(1);
-                                let merges = if can_resume {
+                                let merges = if is_wm_delta {
                                     Vec::new()
                                 } else {
                                     delta_merges.lock().unwrap().clone()
@@ -3768,7 +4960,7 @@ fn host_initialized(
                                     let hook = after_snapshot.lock().unwrap().take();
                                     if let Some(run) = hook { run(); }
                                 }
-                                let _ = tx.send(
+                                let _ = tx.send(IntroFrame::Line(
                                     serde_json::to_string(&Msg::Welcome {
                                         site,
                                         doc: doc_name.clone(),
@@ -3783,35 +4975,57 @@ fn host_initialized(
                                         watermark: current_wm,
                                         structure_revision: struct_rev,
                                         binary_v3,
+                                        compact_v3: use_compact_v3,
                                     })
                                     .unwrap(),
-                                );
-                                // Welcome 仍按 v2 文本行发出；若双方协商启用 binary_v3，紧随 Welcome 之后切换为 v3 二进制流帧
-                                if binary_v3 {
-                                    let _ = tx.send(CTRL_ENABLE_BINARY_V3.to_string());
+                                ));
+                                // Welcome 仍按 v2 文本行发出；紧随 Welcome 之后切换为协商一致的 v3 流帧
+                                if use_compact_v3 {
+                                    let _ = tx.send(IntroFrame::Line(CTRL_ENABLE_COMPACT_V3.to_string()));
+                                } else if binary_v3 {
+                                    let _ = tx.send(IntroFrame::Line(CTRL_ENABLE_BINARY_V3.to_string()));
                                 }
                                 if canonical_name != name {
-                                    let _ = tx.send(
+                                    let _ = tx.send(IntroFrame::Line(
                                         serde_json::to_string(&Msg::Rename {
                                             site,
                                             name: canonical_name.clone(),
                                         })
                                         .unwrap(),
-                                    );
+                                    ));
                                 }
-                                if !is_delta && !hist.is_empty() {
+                                if is_wm_delta {
+                                    if delta_srev > 0 {
+                                        let _ = tx.send(IntroFrame::Line(
+                                            serde_json::to_string(&Msg::StructureRevision {
+                                                revision: delta_srev,
+                                            })
+                                            .unwrap(),
+                                        ));
+                                    }
+                                    for &(sh_i, ref op) in &hist[delta_srev..] {
+                                        let _ = tx.send(IntroFrame::Line(
+                                            serde_json::to_string(&Msg::Structural {
+                                                site: 0,
+                                                sheet: sh_i,
+                                                op: op.clone(),
+                                            })
+                                            .unwrap(),
+                                        ));
+                                    }
+                                } else if !is_delta && !hist.is_empty() {
                                     if std::env::var("SC_DBG").is_ok() {
                                         eprintln!("[dbg] 下发结构历史 {} 条", hist.len());
                                     }
-                                    let _ = tx.send(
+                                    let _ = tx.send(IntroFrame::Line(
                                         serde_json::to_string(&Msg::StructuralLog { items: hist }).unwrap(),
-                                    );
+                                    ));
                                 }
                                 // 整行 / 整列默认样式快照（全量握手发全部非零轴样式，水位重连仅发断线期间增量）
                                 {
-                                    let min_seq = if can_resume {
-                                        resume_watermark
-                                    } else if can_hash_delta {
+                                    let min_seq = if is_wm_delta {
+                                        delta_wm
+                                    } else if can_legacy_hash_delta {
                                         1
                                     } else {
                                         0
@@ -3842,24 +5056,24 @@ fn host_initialized(
                                             .unwrap_or_default();
                                         let patch = AxisStylePatch { rows, cols };
                                         if !patch.is_empty() {
-                                            let _ = tx.send(
+                                            let _ = tx.send(IntroFrame::Line(
                                                 serde_json::to_string(&Msg::AxisStyleSnapshot {
                                                     sheet: sh_idx,
                                                     patch,
                                                 })
                                                 .unwrap(),
-                                            );
+                                            ));
                                         }
                                     }
                                 }
-                                if can_resume {
-                                    // 水位增量重连：按 partition_point 切片 O(log N + Δ) 发送 seq > resume_watermark 的变更样式与单元格
-                                    let use_seq_log = resume_watermark >= wm_snapshot.log_floor_seq;
+                                if is_wm_delta {
+                                    // 水位增量重连/检查点入房：按 partition_point 切片 O(log N + Δ) 发送 seq > delta_wm 的变更样式与单元格
+                                    let use_seq_log = delta_wm >= wm_snapshot.log_floor_seq;
                                     let mut style_ok = true;
                                     if palette_styles {
-                                        let mut emitter = OverlayStylePaletteEmitter::new();
+                                        let mut emitter = OverlayStylePaletteEmitter::new(use_compact_v3);
                                         if use_seq_log {
-                                            for (seq, key) in wm_snapshot.style_log.since(resume_watermark) {
+                                            for (seq, key) in wm_snapshot.style_log.since(delta_wm) {
                                                 if wm_snapshot.style_seqs.get(&key) != Some(&seq) {
                                                     continue;
                                                 }
@@ -3872,7 +5086,7 @@ fn host_initialized(
                                             }
                                         } else {
                                             for (&key, &seq) in wm_snapshot.style_seqs.range(..) {
-                                                if seq <= resume_watermark {
+                                                if seq <= delta_wm {
                                                     continue;
                                                 }
                                                 if let Some(st) = styles_grid.get(&key) {
@@ -3892,7 +5106,7 @@ fn host_initialized(
                                             if let Some(st) = styles_grid.get(&key) {
                                                 style_buf.push((key.0, key.1, key.2, st.as_ref().clone()));
                                                 if style_buf.len() >= SNAPSHOT_STYLE_CHUNK {
-                                                    if !emit_style_snapshot_chunk(&style_buf, false, &tx) {
+                                                    if !emit_style_snapshot_chunk(&style_buf, false, false, &tx) {
                                                         return false;
                                                     }
                                                     style_buf.clear();
@@ -3901,7 +5115,7 @@ fn host_initialized(
                                             true
                                         };
                                         if use_seq_log {
-                                            for (seq, key) in wm_snapshot.style_log.since(resume_watermark) {
+                                            for (seq, key) in wm_snapshot.style_log.since(delta_wm) {
                                                 if wm_snapshot.style_seqs.get(&key) == Some(&seq)
                                                     && !push_legacy(key)
                                                 {
@@ -3911,13 +5125,13 @@ fn host_initialized(
                                             }
                                         } else {
                                             for (&key, &seq) in wm_snapshot.style_seqs.range(..) {
-                                                if seq > resume_watermark && !push_legacy(key) {
+                                                if seq > delta_wm && !push_legacy(key) {
                                                     style_ok = false;
                                                     break;
                                                 }
                                             }
                                         }
-                                        if style_ok && !emit_style_snapshot_chunk(&style_buf, false, &tx) {
+                                        if style_ok && !emit_style_snapshot_chunk(&style_buf, false, false, &tx) {
                                             style_ok = false;
                                         }
                                     }
@@ -3926,11 +5140,11 @@ fn host_initialized(
                                     }
                                     let merge_start = wm_snapshot
                                         .merges
-                                        .partition_point(|(seq, ..)| *seq <= resume_watermark);
+                                        .partition_point(|(seq, ..)| *seq <= delta_wm);
                                     for &(_, msh, r1, c1, r2, c2, on) in
                                         &wm_snapshot.merges[merge_start..]
                                     {
-                                        let _ = tx.send(
+                                        let _ = tx.send(IntroFrame::Line(
                                             serde_json::to_string(&Msg::MergeOp {
                                                 site: 0,
                                                 sheet: msh,
@@ -3942,61 +5156,75 @@ fn host_initialized(
                                                 on,
                                             })
                                             .unwrap(),
-                                        );
+                                        ));
                                     }
+                                    let op_chunk_cap = if use_compact_v3 {
+                                        SNAPSHOT_COMPACT_OP_CHUNK
+                                    } else {
+                                        sheetcore::sync::LIVE_OP_BATCH
+                                    };
                                     let mut op_refs: Vec<&Op> = Vec::new();
-                                    let mut push_op = |key: SeqKey| {
+                                    let mut push_op = |key: SeqKey| -> bool {
                                         if let Some(op) = ops_grid.get(&key) {
                                             op_refs.push(op.as_ref());
-                                            if op_refs.len() >= sheetcore::sync::LIVE_OP_BATCH {
-                                                let frame = sheetcore::sync::SnapshotChunkRef {
-                                                    t: "SnapshotChunk",
-                                                    ops: &op_refs,
-                                                    last: false,
-                                                };
-                                                let _ =
-                                                    tx.send(serde_json::to_string(&frame).unwrap());
+                                            if op_refs.len() >= op_chunk_cap {
+                                                if !send_snapshot_chunk_refs(&op_refs, use_compact_v3, &tx) {
+                                                    return false;
+                                                }
                                                 op_refs.clear();
                                             }
                                         }
+                                        true
                                     };
+                                    let mut ops_ok = true;
                                     if use_seq_log {
-                                        for (seq, key) in wm_snapshot.op_log.since(resume_watermark) {
-                                            if wm_snapshot.op_seqs.get(&key) == Some(&seq) {
-                                                push_op(key);
+                                        for (seq, key) in wm_snapshot.op_log.since(delta_wm) {
+                                            if wm_snapshot.op_seqs.get(&key) == Some(&seq)
+                                                && !push_op(key)
+                                            {
+                                                ops_ok = false;
+                                                break;
                                             }
                                         }
                                     } else {
                                         for (&key, &seq) in wm_snapshot.op_seqs.range(..) {
-                                            if seq > resume_watermark {
-                                                push_op(key);
+                                            if seq > delta_wm && !push_op(key) {
+                                                ops_ok = false;
+                                                break;
                                             }
                                         }
                                     }
-                                    if !op_refs.is_empty() {
-                                        let frame = sheetcore::sync::SnapshotChunkRef {
-                                            t: "SnapshotChunk",
-                                            ops: &op_refs,
-                                            last: false,
-                                        };
-                                        let _ = tx.send(serde_json::to_string(&frame).unwrap());
+                                    if !ops_ok || !send_snapshot_chunk_refs(&op_refs, use_compact_v3, &tx) {
+                                        break;
                                     }
-                                    let _ = tx.send(
-                                        serde_json::to_string(&Msg::Snapshot { ops: Vec::new() })
-                                            .unwrap(),
-                                    );
+                                    let end_ok = if use_compact_v3 {
+                                        tx.send(IntroFrame::Compact(
+                                            sheetcore::sync::encode_snapshot_ref_compact(&[]),
+                                        ))
+                                        .is_ok()
+                                    } else {
+                                        tx.send(IntroFrame::Line(
+                                            serde_json::to_string(&Msg::Snapshot { ops: Vec::new() })
+                                                .unwrap(),
+                                        ))
+                                        .is_ok()
+                                    };
+                                    if !end_ok {
+                                        break;
+                                    }
                                 } else {
                                     // 样式与单元格流式分片下发（零百万格深拷贝）
                                     if !stream_snapshot_styles(
                                         base_arc.as_deref(),
                                         &styles_grid,
                                         palette_styles,
+                                        use_compact_v3,
                                         &tx,
                                     ) {
                                         break;
                                     }
                                     for (msh, r1, c1, r2, c2, on) in merges {
-                                        let _ = tx.send(
+                                        let _ = tx.send(IntroFrame::Line(
                                             serde_json::to_string(&Msg::MergeOp {
                                                 site: 0,
                                                 sheet: msh,
@@ -4008,20 +5236,36 @@ fn host_initialized(
                                                 on,
                                             })
                                             .unwrap(),
-                                        );
+                                        ));
                                     }
-                                    if !stream_snapshot_ops(base_arc.as_deref(), &ops_grid, &tx) {
+                                    if !stream_snapshot_ops(
+                                        base_arc.as_deref(),
+                                        &ops_grid,
+                                        use_compact_v3,
+                                        &tx,
+                                    ) {
                                         break;
                                     }
-                                    let _ = tx.send(
-                                        serde_json::to_string(&Msg::Snapshot { ops: Vec::new() })
-                                            .unwrap(),
-                                    );
+                                    let end_ok = if use_compact_v3 {
+                                        tx.send(IntroFrame::Compact(
+                                            sheetcore::sync::encode_snapshot_ref_compact(&[]),
+                                        ))
+                                        .is_ok()
+                                    } else {
+                                        tx.send(IntroFrame::Line(
+                                            serde_json::to_string(&Msg::Snapshot { ops: Vec::new() })
+                                                .unwrap(),
+                                        ))
+                                        .is_ok()
+                                    };
+                                    if !end_ok {
+                                        break;
+                                    }
                                 }
                                 {
                                     // 下发当前所有未过期的单元格编辑租约，确保后加入成员立即看到谁锁了哪格并禁用它
                                     for (sheet, row, col, lsite, lname) in active_locks {
-                                        let _ = tx.send(
+                                        let _ = tx.send(IntroFrame::Line(
                                             serde_json::to_string(&Msg::LockOk {
                                                 site: lsite,
                                                 name: lname,
@@ -4030,16 +5274,22 @@ fn host_initialized(
                                                 col,
                                             })
                                             .unwrap(),
-                                        );
+                                        ));
                                     }
                                 }
                                 {
                                     // 下发所有在线成员的实时选区光标，后加入者无需等待对方移动鼠标即可看见同事 ID 标签
                                     for cur in active_cursors {
                                         if cur.site != site {
-                                            let _ = tx.send(
-                                                serde_json::to_string(&Msg::CursorMsg(cur)).unwrap(),
-                                            );
+                                            if use_compact_v3 {
+                                                let _ = tx.send(IntroFrame::Compact(
+                                                    sheetcore::sync::encode_msg_compact(&Msg::CursorMsg(cur)),
+                                                ));
+                                            } else {
+                                                let _ = tx.send(IntroFrame::Line(
+                                                    serde_json::to_string(&Msg::CursorMsg(cur)).unwrap(),
+                                                ));
+                                            }
                                         }
                                     }
                                 }
@@ -4061,6 +5311,7 @@ fn host_initialized(
                                     resume_watermark: 0,
                                     resume_struct_rev: 0,
                                     binary_v3: false,
+                                    compact_v3: false,
                                 })
                                 .unwrap();
                                 broadcast_line_to(&other_peers, hello);
@@ -4182,8 +5433,8 @@ fn host_initialized(
                                 let _order = room_order.lock().unwrap();
                                 expire_and_broadcast();
                                 let lt = locks.lock().unwrap();
-                                let now = now_ms();
                                 if !lt.is_empty() {
+                                    let now = now_ms();
                                     ops.retain(|op| {
                                         let Some(h) = lt.holder_other(op.sheet, op.row, op.col, conn_site, now) else { return true };
                                         let prev = latest_cell_op(Some(&host_baseline), &state, op.sheet, op.row, op.col);
@@ -4199,10 +5450,11 @@ fn host_initialized(
                                 }
                                 drop(lt);
                                 if ops.is_empty() { continue; }
-                                update_host_ops(&state, &delta_ops, &formula_keys, &host_max_clock, &ops);
-                                let seq = host_watermark.lock().unwrap().record_ops(ops.iter());
+                                let shared: Vec<Arc<Op>> = ops.iter().cloned().map(Arc::new).collect();
+                                update_host_shared_ops(&state, &delta_ops, &formula_keys, &host_max_clock, shared.iter().cloned());
+                                let seq = host_watermark.lock().unwrap().record_ops(shared.iter().map(Arc::as_ref));
                                 let struct_rev = structs.lock().unwrap().len();
-                                queue_room_change(&cmd, &roster, Some(conn_site), RoomChange::Cells(ops.clone()));
+                                queue_room_change(&cmd, &roster, Some(conn_site), RoomChange::SharedCells(shared));
                                 emit_room_watermark(&cmd, &roster, seq, struct_rev);
                                 let _ = evt_tx.send(NetEvent::Ops(ops));
                             }
@@ -4215,13 +5467,9 @@ fn host_initialized(
                                 c.color = (conn_site % 7) as u8;
                                 c.name = roster.lock().unwrap().name_of(conn_site);
                                 cursors.lock().unwrap().insert(conn_site, c.clone());
-                                let line =
-                                    serde_json::to_string(&Msg::CursorMsg(c.clone())).unwrap();
                                 let others = roster.lock().unwrap().other_senders(Some(conn_site));
-                                for ptx in others {
-                                    let _ = ptx.send(line.clone());
-                                }
-                                let _ = evt_tx.send(NetEvent::Cursor(c));
+                                broadcast_msg_to(&others, &Msg::CursorMsg(c.clone()));
+                                let _ = evt_tx.send_cursor(NetEvent::Cursor(c));
                             }
                             Msg::Rename { site, name } => {
                                 let Some(conn_site) = hello_site else { break };
@@ -4775,21 +6023,18 @@ fn host_initialized(
                                 }
                                 if to_site == host_site_id {
                                     let peer_tx = tx.clone();
-                                    spawn_peer_update_stream(
-                                        host_site_id,
-                                        conn_site,
-                                        version,
-                                        seed_override.clone(),
-                                        serving_update.clone(),
-                                        alive_conn.clone(),
-                                        move |json| {
-                                            peer_tx
-                                                .send_prepared(sheetcore::wire::prepare_payload(
-                                                    &json, false,
-                                                ))
-                                                .is_ok()
-                                        },
-                                    );
+                                    let use_compact_bin = peer_tx.compact_v3.clone();
+                                    seeder_queue.enqueue(UpdateSeedJob {
+                                        my_site: host_site_id,
+                                        to_site: conn_site,
+                                        req_version: version,
+                                        seed_override: seed_override.clone(),
+                                        alive: alive_conn.clone(),
+                                        use_compact_bin,
+                                        send_slice: Box::new(move |payload| {
+                                            peer_tx.send_update_slice(payload).is_ok()
+                                        }),
+                                    });
                                 } else if let Some(target_tx) =
                                     roster.lock().unwrap().sender_of(to_site)
                                 {
@@ -4809,6 +6054,7 @@ fn host_initialized(
                                 offset,
                                 total,
                                 data_b64,
+                                raw_data,
                                 done,
                             } => {
                                 let Some(conn_site) = hello_site else { break };
@@ -4824,15 +6070,45 @@ fn host_initialized(
                                         offset,
                                         total,
                                         &data_b64,
+                                        &raw_data,
                                         done,
                                     );
                                 } else if let Some(target_tx) =
                                     roster.lock().unwrap().sender_of(to_site)
                                 {
-                                    // 高熵 Base64 更新分片原样透传且跳过 deflate 压缩
-                                    let _ = target_tx.send_prepared(
-                                        sheetcore::wire::prepare_payload(&line, false),
-                                    );
+                                    let target_compact = target_tx.is_compact_v3();
+                                    if !target_compact
+                                        && raw_data.is_empty()
+                                        && let Some(ref raw_line) = raw_json_line
+                                    {
+                                        // 旧版 JSON 客户端到旧版 JSON 客户端：原样透传免重编码
+                                        let _ = target_tx.send_update_slice(
+                                            sheetcore::wire::prepare_payload(raw_line, false),
+                                        );
+                                    } else {
+                                        let decoded_tmp;
+                                        let slice_bytes: &[u8] = if !raw_data.is_empty()
+                                            || data_b64.is_empty()
+                                        {
+                                            &raw_data
+                                        } else if let Some(b) = sheetcore::wire::b64_decode(&data_b64) {
+                                            decoded_tmp = b;
+                                            &decoded_tmp
+                                        } else {
+                                            continue;
+                                        };
+                                        let payload = make_update_slice_payload(
+                                            conn_site,
+                                            to_site,
+                                            &version,
+                                            offset,
+                                            total,
+                                            slice_bytes,
+                                            done,
+                                            target_compact,
+                                        );
+                                        let _ = target_tx.send_update_slice(payload);
+                                    }
                                 }
                             }
                             Msg::Bye { site } => {
@@ -4925,8 +6201,15 @@ fn host_initialized(
         pending_sorts: Default::default(),
         local_sort_ranges: Default::default(),
         host_structs: Some(structs_for_self),
+        host_file_path: Some(host_file_path),
+        staged_save_cursor: Mutex::new(None),
         peer_update_dl: host_update_dl_for_self,
         update_seed_override: host_seed_override_for_self,
+        seeder_queue: host_seeder_for_self,
+        cursor_throttle: CursorSendThrottle::default(),
+        fast_snapshot_handoff: Arc::new(AtomicBool::new(false)),
+        seed_styles: Arc::new(Mutex::new(None)),
+        ready_snapshot: Arc::new(Mutex::new(None)),
         evt_tx: evt_tx_self,
         t0,
     };
@@ -5085,6 +6368,181 @@ fn connect_any_target(targets: &[String], timeout: Duration) -> std::io::Result<
     }))
 }
 
+const SNAPSHOT_EVENT_COALESCE: usize = 32_768;
+
+struct PreparedGuestSnapshotBuilder {
+    sheets: Vec<sheetcore::Sheet>,
+    styles: sheetcore::style::StyleTable,
+    has_seed_styles: bool,
+    merge_ops: Vec<(usize, u32, u32, u32, u32, bool)>,
+    overlay_ops: Vec<Op>,
+    pal_ids: Vec<u16>,
+    max_ts: u64,
+    host_site: u32,
+}
+
+impl PreparedGuestSnapshotBuilder {
+    fn new(seed_styles: Option<sheetcore::style::StyleTable>) -> Self {
+        let has_seed_styles = seed_styles.is_some();
+        Self {
+            sheets: Vec::new(),
+            styles: seed_styles.unwrap_or_else(sheetcore::style::StyleTable::new),
+            has_seed_styles,
+            merge_ops: Vec::new(),
+            overlay_ops: Vec::new(),
+            pal_ids: Vec::new(),
+            max_ts: 1,
+            host_site: 1,
+        }
+    }
+
+    fn ensure_sheet(&mut self, si: usize) -> &mut sheetcore::Sheet {
+        while self.sheets.len() <= si {
+            let idx = self.sheets.len() + 1;
+            let mut sh = sheetcore::Sheet::new(format!("Sheet{idx}"));
+            sh.loading = true;
+            self.sheets.push(sh);
+        }
+        &mut self.sheets[si]
+    }
+
+    fn apply_axis_snapshot(&mut self, sheet: usize, patch: AxisStylePatch) {
+        let mut row_ids = Vec::with_capacity(patch.rows.len());
+        for (r, st_opt) in patch.rows {
+            let id = st_opt.map_or(0, |st| self.styles.intern(st));
+            row_ids.push((r, id));
+        }
+        let mut col_ids = Vec::with_capacity(patch.cols.len());
+        for (c, st_opt) in patch.cols {
+            let id = st_opt.map_or(0, |st| self.styles.intern(st));
+            col_ids.push((c, id));
+        }
+        let sh = self.ensure_sheet(sheet);
+        for (r, id) in row_ids {
+            sh.set_row_style_loaded(r, id);
+        }
+        for (c, id) in col_ids {
+            sh.set_col_style_loaded(c, id);
+        }
+    }
+
+    fn apply_style_palette_snapshot(
+        &mut self,
+        palette: &[sheetcore::style::CellStyle],
+        items: &[(usize, u32, u32, u16)],
+    ) {
+        self.pal_ids.clear();
+        self.pal_ids.reserve(palette.len());
+        for st in palette {
+            self.pal_ids.push(self.styles.intern(st.clone()));
+        }
+        if let Some(&max_si) = items.iter().map(|(si, ..)| si).max() {
+            let _ = self.ensure_sheet(max_si);
+        }
+        for &(si, r, c, idx) in items {
+            if let Some(&sid) = self.pal_ids.get(idx as usize) {
+                self.sheets[si].set_style_loaded(r, c, sid);
+            }
+        }
+    }
+
+    fn apply_style_snapshot(
+        &mut self,
+        items: Vec<(usize, u32, u32, sheetcore::style::CellStyle)>,
+    ) {
+        if let Some(&max_si) = items.iter().map(|(si, ..)| si).max() {
+            let _ = self.ensure_sheet(max_si);
+        }
+        for (si, r, c, st) in items {
+            let sid = self.styles.intern(st);
+            self.sheets[si].set_style_loaded(r, c, sid);
+        }
+    }
+
+    fn apply_merge(&mut self, sheet: usize, r1: u32, c1: u32, r2: u32, c2: u32, on: bool) {
+        self.merge_ops.push((sheet, r1, c1, r2, c2, on));
+    }
+
+    fn apply_ops(&mut self, ops: Vec<Op>) {
+        if let Some(&max_si) = ops.iter().map(|o| &o.sheet).max() {
+            let _ = self.ensure_sheet(max_si);
+        }
+        for op in ops {
+            self.max_ts = self.max_ts.max(op.ts);
+            if op.site != 0 {
+                self.host_site = op.site;
+            }
+            let cell = sheetcore::model::Cell {
+                value: sheetcore::model::Value::from(&op.value),
+                formula: op.formula.clone(),
+            };
+            self.sheets[op.sheet].set(op.row, op.col, cell);
+            if op.ts > 1 {
+                self.overlay_ops.push(op);
+            }
+        }
+    }
+
+    fn finish(mut self) -> PreparedGuestSnapshot {
+        for sh in &mut self.sheets {
+            sh.loading = false;
+        }
+        PreparedGuestSnapshot {
+            sheets: self.sheets,
+            styles: self.styles,
+            has_seed_styles: self.has_seed_styles,
+            merge_ops: self.merge_ops,
+            overlay_ops: self.overlay_ops,
+            max_ts: self.max_ts,
+            host_site: self.host_site,
+        }
+    }
+}
+
+fn send_guest_shared_ops<W: Write>(gs: &mut GuestSend, w: &mut W, ops: &[Arc<Op>]) {
+    if ops.is_empty() {
+        return;
+    }
+    if gs.binary_v3 && gs.compact_v3 && gs.batch_ops {
+        use sheetcore::sync::ValueWire;
+        let mut start = 0usize;
+        let mut bytes = 0usize;
+        for (idx, op) in ops.iter().enumerate() {
+            let text_len = match &op.value {
+                ValueWire::Text(s) | ValueWire::Error(s) => s.len(),
+                _ => 0,
+            };
+            let size = text_len + op.formula.as_deref().map_or(0, str::len) + 96;
+            if idx > start
+                && (idx - start >= sheetcore::sync::LIVE_OP_BATCH || bytes + size > 256 * 1024)
+            {
+                let raw = sheetcore::sync::encode_arc_ops_compact(&ops[start..idx]);
+                gs.sess.seal_compact_binary_into(&raw, true, &mut gs.scratch);
+                let _ = write_binary_frame_opt(w, &gs.scratch, false);
+                start = idx;
+                bytes = 0;
+            }
+            bytes += size;
+        }
+        if start < ops.len() {
+            let raw = sheetcore::sync::encode_arc_ops_compact(&ops[start..]);
+            gs.sess.seal_compact_binary_into(&raw, true, &mut gs.scratch);
+            let _ = write_binary_frame_opt(w, &gs.scratch, true);
+            if gs.scratch.capacity() > 512 * 1024 {
+                gs.scratch = Vec::new();
+            }
+        } else {
+            let _ = w.flush();
+        }
+    } else {
+        let batch = gs.batch_ops;
+        cell_frames_msg(ops.iter().map(|o| (**o).clone()), true, batch, |msg| {
+            let _ = gs.write_msg_opt(w, &msg, false);
+        });
+        let _ = w.flush();
+    }
+}
+
 fn join_session(
     site: u32,
     name: String,
@@ -5128,7 +6586,24 @@ fn join_session(
     let client_update_dl_for_net = client_update_dl.clone();
     let client_seed_override: SharedUpdateSeed = Arc::new(Mutex::new(None));
     let client_seed_override_for_net = client_seed_override.clone();
-    let client_serving_update = Arc::new(AtomicBool::new(false));
+    let client_seeder_queue = UpdateSeederQueue::default();
+    let client_seeder_for_net = client_seeder_queue.clone();
+    let host_compact_flag = Arc::new(AtomicBool::new(false));
+    let guest_low_prio_update: LowPrioUpdateQueue = Arc::new((
+        Mutex::new((
+            std::collections::VecDeque::with_capacity(LOW_PRIO_UPDATE_CAP),
+            false,
+        )),
+        std::sync::Condvar::new(),
+    ));
+    let guest_low_prio_for_writer = guest_low_prio_update.clone();
+    let guest_low_prio_for_reader = guest_low_prio_update.clone();
+    let fast_snapshot_handoff = Arc::new(AtomicBool::new(false));
+    let fast_handoff_for_reader = fast_snapshot_handoff.clone();
+    let seed_styles: Arc<Mutex<Option<sheetcore::style::StyleTable>>> = Arc::new(Mutex::new(None));
+    let seed_styles_for_reader = seed_styles.clone();
+    let ready_snapshot: Arc<Mutex<Option<PreparedGuestSnapshot>>> = Arc::new(Mutex::new(None));
+    let ready_snapshot_for_reader = ready_snapshot.clone();
     let cmd_tx_for_stream = cmd_tx.clone();
 
     let pending_sorts: Arc<Mutex<std::collections::BTreeMap<u64,Arc<SortBatch>>>> = Default::default();
@@ -5146,83 +6621,192 @@ fn join_session(
         let dispatch_events = evt_tx.clone();
         let send_sess = send_sess.clone();
         std::thread::spawn(move || {
-            while let Ok(cmd) = cmd_rx.recv() {
+            let mut next_cmd = cmd_rx.recv().ok();
+            while let Some(first) = next_cmd.take() {
                 if !alive.load(Ordering::SeqCst) {
                     break;
                 }
-                match cmd {
-                    Cmd::Cells(ops) => {
-                        let mut session = send_sess.lock().unwrap();
-                        if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
-                            let batch = gs.batch_ops;
-                            cell_frames(ops, true, batch, |line| { let _ = gs.write_plain(w, &line); });
-                        }
-                    }
-                    Cmd::Style(msg) => {
-                        let mut session = send_sess.lock().unwrap();
-                        if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
-                            if !send_room_message(msg, MAX_PLAIN_LINE, |line| {
-                                unconfirmed_styles_for_writer.fetch_add(1, Ordering::AcqRel);
-                                if gs.write_plain(w, &line).is_ok() {
-                                    true
-                                } else {
-                                    let _ = unconfirmed_styles_for_writer.fetch_update(
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                        |v| Some(v.saturating_sub(1)),
-                                    );
-                                    false
+                let mut cur = Some(first);
+                let mut stop_now = false;
+                while let Some(cmd) = cur.take() {
+                    let peek = cmd_rx.try_recv().ok();
+                    let flush_now = peek.is_none()
+                        && guest_low_prio_for_writer.0.lock().unwrap().0.is_empty();
+                    match cmd {
+                        Cmd::Cells(ops) => {
+                            let mut session = send_sess.lock().unwrap();
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                                let batch = gs.batch_ops;
+                                cell_frames_msg(ops, true, batch, |msg| {
+                                    let _ = gs.write_msg_opt(w, &msg, false);
+                                });
+                                if flush_now {
+                                    let _ = w.flush();
                                 }
-                            }, || {
-                                let _ = dispatch_events.send(NetEvent::Error("格式修改超过单条消息上限，宿主将分批检查编辑锁并应用".into()));
-                            }) {
-                                let _ = dispatch_events.send(NetEvent::Error("协作格式未能完整发送".into()));
                             }
-                        } else {
-                            // Disconnected while sending optimistic styles -> require full snapshot on reconnect
-                            unconfirmed_styles_for_writer.fetch_add(1, Ordering::AcqRel);
                         }
-                    }
-                    Cmd::Sort(generation,batch) => {
-                        let current = send_sess.lock().unwrap().as_ref()
-                            .filter(|_| writer_generation.load(Ordering::Acquire) == generation)
-                            .map(|gs| (gs.batch_ops, gs.sort_permutation, gs.acks.clone()));
-                        let Some((batched, capable, acks)) = current else { continue };
-                        let ok = send_sort(&batch, capable, true, batched, &acks.lock().unwrap(), |line| {
+                        Cmd::SharedCells(ops) => {
+                            let mut session = send_sess.lock().unwrap();
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                                send_guest_shared_ops(gs, w, &ops);
+                            }
+                        }
+                        Cmd::BroadcastMsg(msg) => {
+                            let mut session = send_sess.lock().unwrap();
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                                let _ = gs.write_msg_opt(w, &msg, flush_now);
+                            }
+                        }
+                        Cmd::Style(msg) => {
+                            let mut session = send_sess.lock().unwrap();
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                                let mut handled_compact = false;
+                                if gs.binary_v3
+                                    && gs.compact_v3
+                                    && matches!(
+                                        &msg,
+                                        Msg::StylePaletteOp { items, .. }
+                                            if items.len() <= sheetcore::sync::MAX_BATCH_ITEMS
+                                    )
+                                {
+                                    let raw = sheetcore::sync::encode_msg_compact(&msg);
+                                    if raw.len() <= MAX_PLAIN_LINE {
+                                        unconfirmed_styles_for_writer.fetch_add(1, Ordering::AcqRel);
+                                        gs.sess.seal_compact_binary_into(&raw, true, &mut gs.scratch);
+                                        if write_binary_frame_opt(w, &gs.scratch, flush_now).is_err() {
+                                            let _ = unconfirmed_styles_for_writer.fetch_update(
+                                                Ordering::AcqRel,
+                                                Ordering::Acquire,
+                                                |v| Some(v.saturating_sub(1)),
+                                            );
+                                            let _ = dispatch_events.send(NetEvent::Error("协作格式未能完整发送".into()));
+                                        }
+                                        if gs.scratch.capacity() > 512 * 1024 {
+                                            gs.scratch = Vec::new();
+                                        }
+                                        handled_compact = true;
+                                    }
+                                }
+                                if !handled_compact {
+                                    if !send_room_message(msg, MAX_PLAIN_LINE, |line| {
+                                        unconfirmed_styles_for_writer.fetch_add(1, Ordering::AcqRel);
+                                        if gs.write_plain_opt(w, &line, flush_now).is_ok() {
+                                            true
+                                        } else {
+                                            let _ = unconfirmed_styles_for_writer.fetch_update(
+                                                Ordering::AcqRel,
+                                                Ordering::Acquire,
+                                                |v| Some(v.saturating_sub(1)),
+                                            );
+                                            false
+                                        }
+                                    }, || {
+                                        let _ = dispatch_events.send(NetEvent::Error("格式修改超过单条消息上限，宿主将分批检查编辑锁并应用".into()));
+                                    }) {
+                                        let _ = dispatch_events.send(NetEvent::Error("协作格式未能完整发送".into()));
+                                    }
+                                }
+                            } else {
+                                // Disconnected while sending optimistic styles -> require full snapshot on reconnect
+                                unconfirmed_styles_for_writer.fetch_add(1, Ordering::AcqRel);
+                            }
+                        }
+                        Cmd::Sort(generation,batch) => {
+                            let current = send_sess.lock().unwrap().as_ref()
+                                .filter(|_| writer_generation.load(Ordering::Acquire) == generation)
+                                .map(|gs| (gs.batch_ops, gs.sort_permutation, gs.acks.clone()));
+                            if let Some((batched, capable, acks)) = current {
+                                let ok = send_sort(&batch, capable, true, batched, &acks.lock().unwrap(), |line| {
+                                    let mut session = send_sess.lock().unwrap();
+                                    let mut writer = writer.lock().unwrap();
+                                    let (Some(gs), Some(w)) = (session.as_mut(), writer.as_mut()) else { return false };
+                                    Arc::ptr_eq(&gs.acks, &acks) && gs.write_plain(w, &line).is_ok()
+                                });
+                                if ok && !capable { pending_for_writer.lock().unwrap().remove(&batch.plan.first_ts); }
+                                if !ok && send_sess.lock().unwrap().as_ref().is_some_and(|gs| Arc::ptr_eq(&gs.acks, &acks))
+                                    && let Some(w) = writer.lock().unwrap().as_ref() { let _ = w.get_ref().shutdown(std::net::Shutdown::Both); }
+                            }
+                        }
+                        Cmd::GuestStructure(generation,msg) => {
                             let mut session = send_sess.lock().unwrap();
                             let mut writer = writer.lock().unwrap();
-                            let (Some(gs), Some(w)) = (session.as_mut(), writer.as_mut()) else { return false };
-                            Arc::ptr_eq(&gs.acks, &acks) && gs.write_plain(w, &line).is_ok()
-                        });
-                        if ok && !capable { pending_for_writer.lock().unwrap().remove(&batch.plan.first_ts); }
-                        if !ok && send_sess.lock().unwrap().as_ref().is_some_and(|gs| Arc::ptr_eq(&gs.acks, &acks))
-                            && let Some(w) = writer.lock().unwrap().as_ref() { let _ = w.get_ref().shutdown(std::net::Shutdown::Both); }
-                    }
-                    Cmd::GuestStructure(generation,msg) => {
-                        let mut session = send_sess.lock().unwrap();
-                        let mut writer = writer.lock().unwrap();
-                        if writer_generation.load(Ordering::Acquire) == generation
-                            && let (Some(gs), Some(w)) = (session.as_mut(), writer.as_mut()) {
-                            let result = gs.write_plain(w, &serde_json::to_string(&msg).unwrap());
-                            if result.is_err() { let _ = w.get_ref().shutdown(std::net::Shutdown::Both); }
+                            if writer_generation.load(Ordering::Acquire) == generation
+                                && let (Some(gs), Some(w)) = (session.as_mut(), writer.as_mut()) {
+                                let result = gs.write_plain(w, &serde_json::to_string(&msg).unwrap());
+                                if result.is_err() { let _ = w.get_ref().shutdown(std::net::Shutdown::Both); }
+                            }
+                        }
+                        Cmd::Deliver(_, _) => unreachable!("room dispatch is host-only"),
+                        Cmd::Broadcast(s) | Cmd::SendTo(_, s) => {
+                            let mut session = send_sess.lock().unwrap();
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                                let _ = gs.write_plain_opt(w, &s, flush_now);
+                            }
+                        }
+                        Cmd::SendPrepared(_, prepared) => {
+                            let mut session = send_sess.lock().unwrap();
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                                let _ = gs.write_prepared_opt(w, &prepared, flush_now);
+                            }
+                        }
+                        Cmd::PumpUpdate => {}
+                        Cmd::Stop => {
+                            stop_now = true;
+                            break;
                         }
                     }
-                    Cmd::Deliver(_, _) => unreachable!("room dispatch is host-only"),
-                    Cmd::Broadcast(s) | Cmd::SendTo(_, s) => {
+                    cur = peek;
+                }
+                if stop_now {
+                    break;
+                }
+                // 排空高优命令后穿插发送低优 P2P 更新分片，每发 1 片立即检查是否有新实时协作命令到达
+                loop {
+                    if let Ok(hp) = cmd_rx.try_recv() {
+                        next_cmd = Some(hp);
+                        break;
+                    }
+                    let popped = {
+                        let (lock, cvar) = &*guest_low_prio_for_writer;
+                        let mut g = lock.lock().unwrap();
+                        let item = g.0.pop_front();
+                        let empty = g.0.is_empty();
+                        if item.is_some() {
+                            cvar.notify_one();
+                        }
+                        (item, empty)
+                    };
+                    let (Some(slice), queue_empty) = popped else {
+                        if let Some(w) = writer.lock().unwrap().as_mut() {
+                            let _ = w.flush();
+                        }
+                        break;
+                    };
+                    {
                         let mut session = send_sess.lock().unwrap();
                         if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
-                            let _ = gs.write_plain(w, &s);
+                            let _ = gs.write_prepared_opt(w, &slice, queue_empty);
+                        } else {
+                            let (lock, cvar) = &*guest_low_prio_for_writer;
+                            let mut g = lock.lock().unwrap();
+                            g.0.clear();
+                            cvar.notify_all();
+                            break;
                         }
                     }
-                    Cmd::SendPrepared(_, prepared) => {
-                        let mut session = send_sess.lock().unwrap();
-                        if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
-                            let _ = gs.write_prepared(w, &prepared);
-                        }
+                    if queue_empty {
+                        break;
                     }
-                    Cmd::Stop => break,
+                }
+                if next_cmd.is_none() {
+                    next_cmd = cmd_rx.recv().ok();
                 }
             }
+            let (lock, cvar) = &*guest_low_prio_for_writer;
+            let mut g = lock.lock().unwrap();
+            g.0.clear();
+            g.1 = true;
+            cvar.notify_all();
         });
     }
 
@@ -5265,9 +6849,12 @@ fn join_session(
                 };
                 let _ = write_raw.set_write_timeout(Some(Duration::from_secs(10)));
                 let mut write_half = BufWriter::with_capacity(64 * 1024, write_raw);
-                let reader = BufReader::new(&*connected);
+                let reader = BufReader::with_capacity(128 * 1024, &*connected);
                 let mut denied = false;
                 let mut got_welcome = false;
+                let mut in_initial_snapshot = false;
+                let mut pending_snap_ops: Vec<Op> = Vec::new();
+                let mut snap_builder: Option<PreparedGuestSnapshotBuilder> = None;
                 let mut conn_room_id = String::new();
                 let mut conn_welcome_wm = 0u64;
                 let mut conn_welcome_srev = 0usize;
@@ -5282,37 +6869,42 @@ fn join_session(
                 loop {
                     let allow_binary = got_welcome && recv_sess.is_some();
                     let Ok(Some(frame)) = read_wire_frame(&mut reader, MAX_LINE, allow_binary) else { break };
-                    let msg = match frame {
+                    let msg: Option<Msg> = match frame {
                         WireFrame::Binary(body) => {
                             let Some(se) = recv_sess.as_mut() else { break };
-                            match se.open_binary_owned(body) {
-                                Some(plain) => serde_json::from_str::<Msg>(&plain),
+                            match se.open_binary_frame_owned(body) {
+                                Some(sheetcore::wire::DecodedWireFrame::Text(plain)) => {
+                                    serde_json::from_str::<Msg>(&plain).ok()
+                                }
+                                Some(sheetcore::wire::DecodedWireFrame::Compact(bytes)) => {
+                                    sheetcore::sync::decode_msg_compact(&bytes)
+                                }
                                 None => break,
                             }
                         }
                         WireFrame::Text(line) => {
                             if let Some(se) = recv_sess.as_mut() {
                                 match se.open(&line) {
-                                    Some(plain) => serde_json::from_str::<Msg>(&plain),
+                                    Some(plain) => serde_json::from_str::<Msg>(&plain).ok(),
                                     None => match serde_json::from_str::<Msg>(&line) {
-                                        Ok(msg @ Msg::Denied { .. }) if !got_welcome => Ok(msg),
+                                        Ok(msg @ Msg::Denied { .. }) if !got_welcome => Some(msg),
                                         _ => break,
                                     },
                                 }
                             } else {
                                 match serde_json::from_str::<Msg>(&line) {
-                                    Ok(msg @ (Msg::ChallengeSalt { .. } | Msg::Challenge { .. } | Msg::Denied { .. })) => Ok(msg),
+                                    Ok(msg @ (Msg::ChallengeSalt { .. } | Msg::Challenge { .. } | Msg::Denied { .. })) => Some(msg),
                                     _ => break,
                                 }
                             }
                         }
                     };
                     let msg = match msg {
-                        Ok(m) => m,
+                        Some(m) => m,
                         // 入房后认不出的报文（例如更新版本宿主的新消息类型）跳过即可，
                         // 断开只会换来无限重连；握手阶段认不出才断开
-                        Err(_) if got_welcome => continue,
-                        Err(_) => break,
+                        None if got_welcome => continue,
+                        None => break,
                     };
                     if !msg.is_within_limits() {
                         continue;
@@ -5362,6 +6954,7 @@ fn join_session(
                                 resume_watermark,
                                 resume_struct_rev,
                                 binary_v3: true,
+                                compact_v3: true,
                                 base_hash: if synced_once {
                                     String::new()
                                 } else {
@@ -5392,6 +6985,7 @@ fn join_session(
                             watermark,
                             structure_revision,
                             binary_v3,
+                            compact_v3,
                             ..
                         } if !got_welcome => {
                             if require_same_document && remote_doc != doc {
@@ -5399,10 +6993,22 @@ fn join_session(
                                 denied = true;
                                 break;
                             }
+                            let use_compact = binary_v3 && compact_v3;
+                            host_compact_flag.store(use_compact, Ordering::Release);
                             reader_generation.fetch_add(1,Ordering::AcqRel);
                             ack_for_reader.store(structural_ack,Ordering::Release);
                             palette_for_reader.store(palette_styles, Ordering::Release);
                             got_welcome = true;
+                            in_initial_snapshot = true;
+                            pending_snap_ops.clear();
+                            *ready_snapshot_for_reader.lock().unwrap() = None;
+                            snap_builder = (!delta_sync
+                                && fast_handoff_for_reader.load(Ordering::Acquire))
+                            .then(|| {
+                                PreparedGuestSnapshotBuilder::new(
+                                    seed_styles_for_reader.lock().unwrap().clone(),
+                                )
+                            });
                             conn_room_id = room_id;
                             conn_welcome_wm = watermark;
                             conn_welcome_srev = structure_revision;
@@ -5415,13 +7021,14 @@ fn join_session(
                                     batch_ops,
                                     sort_permutation,
                                     binary_v3,
+                                    compact_v3: use_compact,
                                     scratch: Vec::new(),
                                     acks: sort_replies.clone(),
                                 });
                             }
                             if let Ok(clone) = connected.try_clone() {
                                 let _ = clone.set_write_timeout(Some(Duration::from_secs(10)));
-                                *writer.lock().unwrap() = Some(BufWriter::with_capacity(64 * 1024, clone));
+                                *writer.lock().unwrap() = Some(BufWriter::with_capacity(128 * 1024, clone));
                             }
                             connected_flag.store(true, Ordering::SeqCst);
                             let _ = evt_tx.send(NetEvent::Connected);
@@ -5473,24 +7080,72 @@ fn join_session(
                             });
                         }
                         Msg::SnapshotChunk { ops, last } => {
-                            if !ops.is_empty() {
-                                let _ = evt_tx.send(NetEvent::Ops(ops));
-                            }
-                            if last {
-                                synced_once = true;
-                                if !conn_room_id.is_empty() && conn_welcome_wm >= 1 {
-                                    resume_state = Some((
-                                        conn_room_id.clone(),
-                                        conn_welcome_wm,
-                                        conn_welcome_srev,
-                                    ));
+                            if in_initial_snapshot {
+                                if let Some(b) = snap_builder.as_mut() {
+                                    if !ops.is_empty() {
+                                        b.apply_ops(ops);
+                                    }
+                                } else if !ops.is_empty() {
+                                    pending_snap_ops.extend(ops);
+                                    if pending_snap_ops.len() >= SNAPSHOT_EVENT_COALESCE {
+                                        let _ = evt_tx.send_snapshot_batch(NetEvent::Ops(
+                                            std::mem::take(&mut pending_snap_ops),
+                                        ));
+                                    }
                                 }
-                                let _ = evt_tx.send(NetEvent::SnapshotDone);
+                                if last {
+                                    in_initial_snapshot = false;
+                                    if let Some(b) = snap_builder.take() {
+                                        *ready_snapshot_for_reader.lock().unwrap() =
+                                            Some(b.finish());
+                                    } else if !pending_snap_ops.is_empty() {
+                                        let _ = evt_tx.send(NetEvent::Ops(std::mem::take(
+                                            &mut pending_snap_ops,
+                                        )));
+                                    }
+                                    synced_once = true;
+                                    if !conn_room_id.is_empty() && conn_welcome_wm >= 1 {
+                                        resume_state = Some((
+                                            conn_room_id.clone(),
+                                            conn_welcome_wm,
+                                            conn_welcome_srev,
+                                        ));
+                                    }
+                                    let _ = evt_tx.send(NetEvent::SnapshotDone);
+                                }
+                            } else {
+                                if !ops.is_empty() {
+                                    let _ = evt_tx.send(NetEvent::Ops(ops));
+                                }
+                                if last {
+                                    synced_once = true;
+                                    if !conn_room_id.is_empty() && conn_welcome_wm >= 1 {
+                                        resume_state = Some((
+                                            conn_room_id.clone(),
+                                            conn_welcome_wm,
+                                            conn_welcome_srev,
+                                        ));
+                                    }
+                                    let _ = evt_tx.send(NetEvent::SnapshotDone);
+                                }
                             }
                         }
                         Msg::Snapshot { ops } => {
-                            if !ops.is_empty() {
-                                let _ = evt_tx.send(NetEvent::Ops(ops));
+                            in_initial_snapshot = false;
+                            if let Some(mut b) = snap_builder.take() {
+                                if !ops.is_empty() {
+                                    b.apply_ops(ops);
+                                }
+                                *ready_snapshot_for_reader.lock().unwrap() = Some(b.finish());
+                            } else {
+                                if !ops.is_empty() {
+                                    pending_snap_ops.extend(ops);
+                                }
+                                if !pending_snap_ops.is_empty() {
+                                    let _ = evt_tx.send(NetEvent::Ops(std::mem::take(
+                                        &mut pending_snap_ops,
+                                    )));
+                                }
                             }
                             synced_once = true;
                             if !conn_room_id.is_empty() && conn_welcome_wm >= 1 {
@@ -5565,17 +7220,23 @@ fn join_session(
                             }
                         }
                         Msg::StyleSnapshot { items } => {
-                            let _ = evt_tx.send(NetEvent::Styles {
-                                site: 0,
-                                items,
-                                snapshot: true,
-                            });
+                            if let Some(b) = snap_builder.as_mut() {
+                                b.apply_style_snapshot(items);
+                            } else {
+                                let _ = evt_tx.send_snapshot_batch(NetEvent::Styles {
+                                    site: 0,
+                                    items,
+                                    snapshot: true,
+                                });
+                            }
                         }
                         Msg::StylePaletteSnapshot { palette, items } => {
-                            if let Some(decoded) =
+                            if let Some(b) = snap_builder.as_mut() {
+                                b.apply_style_palette_snapshot(&palette, &items);
+                            } else if let Some(decoded) =
                                 sheetcore::sync::decode_style_snapshot_palette(&palette, &items)
                             {
-                                let _ = evt_tx.send(NetEvent::Styles {
+                                let _ = evt_tx.send_snapshot_batch(NetEvent::Styles {
                                     site: 0,
                                     items: decoded,
                                     snapshot: true,
@@ -5599,20 +7260,30 @@ fn join_session(
                             }
                         }
                         Msg::AxisStyleSnapshot { sheet, patch } => {
-                            let _ = evt_tx.send(NetEvent::AxisStyles {
-                                site: 0,
-                                sheet,
-                                patch,
-                                snapshot: true,
-                            });
+                            if let Some(b) = snap_builder.as_mut() {
+                                b.apply_axis_snapshot(sheet, patch);
+                            } else {
+                                let _ = evt_tx.send_snapshot_batch(NetEvent::AxisStyles {
+                                    site: 0,
+                                    sheet,
+                                    patch,
+                                    snapshot: true,
+                                });
+                            }
                         }
-                        Msg::MergeOp { site, sheet, ts: _, r1, c1, r2, c2, on } => {
-                            let _ = evt_tx.send(NetEvent::Merge {
-                                site,
-                                sheet,
-                                rect: (r1, c1, r2, c2),
-                                on,
-                            });
+                        Msg::MergeOp { site: msite, sheet, ts: _, r1, c1, r2, c2, on } => {
+                            if in_initial_snapshot
+                                && let Some(b) = snap_builder.as_mut()
+                            {
+                                b.apply_merge(sheet, r1, c1, r2, c2, on);
+                            } else {
+                                let _ = evt_tx.send(NetEvent::Merge {
+                                    site: msite,
+                                    sheet,
+                                    rect: (r1, c1, r2, c2),
+                                    on,
+                                });
+                            }
                         }
                         Msg::LockOk { site, name, sheet, row, col } => {
                             let _ = evt_tx.send(NetEvent::LockOk { site, name, sheet, row, col });
@@ -5654,7 +7325,7 @@ fn join_session(
                             let _ = evt_tx.send(NetEvent::Saved { clock });
                         }
                         Msg::CursorMsg(c) => {
-                            let _ = evt_tx.send(NetEvent::Cursor(c));
+                            let _ = evt_tx.send_cursor(NetEvent::Cursor(c));
                         }
                         Msg::Hello { site: s, name: n, .. } => {
                             let _ = evt_tx.send(NetEvent::PeerJoined(s, n, (s % 7) as u8));
@@ -5700,22 +7371,29 @@ fn join_session(
                         } => {
                             if to_site == site && from_site != site {
                                 let out_tx = cmd_tx_for_stream.clone();
-                                spawn_peer_update_stream(
-                                    site,
-                                    from_site,
-                                    version,
-                                    client_seed_override.clone(),
-                                    client_serving_update.clone(),
-                                    alive.clone(),
-                                    move |json| {
-                                        out_tx
-                                            .send(Cmd::SendPrepared(
-                                                from_site,
-                                                sheetcore::wire::prepare_payload(&json, false),
-                                            ))
-                                            .is_ok()
-                                    },
-                                );
+                                let low_q = guest_low_prio_for_reader.clone();
+                                let use_compact_bin = host_compact_flag.clone();
+                                client_seeder_queue.enqueue(UpdateSeedJob {
+                                    my_site: site,
+                                    to_site: from_site,
+                                    req_version: version,
+                                    seed_override: client_seed_override.clone(),
+                                    alive: alive.clone(),
+                                    use_compact_bin,
+                                    send_slice: Box::new(move |payload| {
+                                        let (lock, cvar) = &*low_q;
+                                        let mut g = lock.lock().unwrap();
+                                        while g.0.len() >= LOW_PRIO_UPDATE_CAP && !g.1 {
+                                            g = cvar.wait(g).unwrap();
+                                        }
+                                        if g.1 {
+                                            return false;
+                                        }
+                                        g.0.push_back(payload);
+                                        drop(g);
+                                        out_tx.send(Cmd::PumpUpdate).is_ok()
+                                    }),
+                                });
                             }
                         }
                         Msg::UpdateSlice {
@@ -5725,6 +7403,7 @@ fn join_session(
                             offset,
                             total,
                             data_b64,
+                            raw_data,
                             done,
                         } => {
                             if to_site == site && from_site != site {
@@ -5736,6 +7415,7 @@ fn join_session(
                                     offset,
                                     total,
                                     &data_b64,
+                                    &raw_data,
                                     done,
                                 );
                             }
@@ -5760,6 +7440,12 @@ fn join_session(
                 connected_flag.store(false, Ordering::SeqCst);
                 *writer.lock().unwrap() = None;
                 *send_sess.lock().unwrap() = None;
+                {
+                    let (lock, cvar) = &*guest_low_prio_for_reader;
+                    let mut g = lock.lock().unwrap();
+                    g.0.clear();
+                    cvar.notify_all();
+                }
                 if denied {
                     break;
                 }
@@ -5824,8 +7510,15 @@ fn join_session(
         pending_sorts: pending_for_net,
         local_sort_ranges: Default::default(),
         host_structs: None,
+        host_file_path: None,
+        staged_save_cursor: Mutex::new(None),
         peer_update_dl: client_update_dl_for_net,
         update_seed_override: client_seed_override_for_net,
+        seeder_queue: client_seeder_for_net,
+        cursor_throttle: CursorSendThrottle::default(),
+        fast_snapshot_handoff,
+        seed_styles,
+        ready_snapshot,
         evt_tx: evt_tx_clone,
         t0: std::time::Instant::now(),
     })
@@ -6301,6 +7994,7 @@ mod integrity_tests {
             resume_watermark: 0,
             resume_struct_rev: 0,
             binary_v3: false,
+            compact_v3: false,
         };
         let mut w = write_half;
         let frame = sess.seal(&serde_json::to_string(&hello).unwrap());
@@ -7433,6 +9127,7 @@ mod integrity_tests {
             resume_watermark: 0,
             resume_struct_rev: 0,
             binary_v3,
+            compact_v3: false,
         };
         let frame = sess.seal(&serde_json::to_string(&hello).unwrap());
         write_line(&mut w, &frame).unwrap();
@@ -7775,6 +9470,745 @@ mod integrity_tests {
         );
         drop(client);
         server.join().expect("mock legacy host thread should succeed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_peer_update_pulls_both_complete_via_compact_slices_without_starving_ops() {
+        let env = crate::test_env::TestEnv::new("concurrent-peer-update-queue");
+        let official_kp = crate::update::cng::TestKeyPair::generate();
+        env.sc("SC_UPDATE_PUBKEY", &official_kp.pubkey_hex);
+
+        // 450 KB 安装包跨越 3 个 192KB 分片，验证双节点并发拉取排队不静默丢包且不阻塞实时 Op
+        let raw_exe: Vec<u8> = (0..(450 * 1024)).map(|i| ((i * 17 + 13) & 0xFF) as u8).collect();
+        let (manifest, full_exe) = crate::update::make_test_signed_release(
+            &official_kp,
+            "99.5",
+            &raw_exe,
+            "并发接力更新测试",
+        );
+        let seed_exe = env.path("seed-995-CELLAN.exe");
+        std::fs::write(&seed_exe, &full_exe).unwrap();
+
+        let (host, port) = host_for_test(1, "宿主", "concurrent-upd.xlsx", "pw");
+        let addr = format!("127.0.0.1:{port}");
+        let seeder = join(2, "供种成员".into(), "concurrent-upd.xlsx".into(), &addr, "pw".into()).unwrap();
+        let peer_b = join(3, "成员B".into(), "concurrent-upd.xlsx".into(), &addr, "pw".into()).unwrap();
+        let peer_c = join(4, "成员C".into(), "concurrent-upd.xlsx".into(), &addr, "pw".into()).unwrap();
+
+        for p in [&seeder, &peer_b, &peer_c] {
+            assert!(wait_event(p, 5000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+        }
+        seeder.set_update_bundle_for_test(seed_exe, manifest.clone());
+
+        // 两个旧版成员几乎同时向同一供种成员发起拉取（旧实现第二个请求会被 AtomicBool 静默丢弃卡在 0%）
+        peer_b.request_peer_update(2, &manifest).unwrap();
+        peer_c.request_peer_update(2, &manifest).unwrap();
+
+        // 供种期间宿主并发广播实时单元格操作，验证低优更新队列不饿死高优实时帧
+        host.broadcast_op(Op {
+            sheet: 0,
+            row: 12,
+            col: 3,
+            value: ValueWire::Number(2026.0),
+            formula: None,
+            ts: 50,
+            site: 1,
+        });
+
+        for (idx, receiver) in [(3, &peer_b), (4, &peer_c)] {
+            let mut got_live_op = false;
+            let mut got_update_ready = false;
+            let deadline = std::time::Instant::now() + Duration::from_secs(12);
+            while !(got_live_op && got_update_ready) {
+                let rem = deadline.saturating_duration_since(std::time::Instant::now());
+                let ev = receiver
+                    .events
+                    .recv_timeout(rem)
+                    .unwrap_or_else(|_| panic!("peer {idx} timed out waiting for op+update"));
+                match ev {
+                    NetEvent::Ops(ops) if ops.iter().any(|o| o.row == 12 && o.col == 3) => {
+                        got_live_op = true;
+                    }
+                    NetEvent::PeerUpdateReady { version, verified_exe } => {
+                        assert_eq!(version, "99.5");
+                        assert_eq!(std::fs::read(&verified_exe).unwrap(), full_exe);
+                        got_update_ready = true;
+                    }
+                    NetEvent::PeerUpdateFailed(err) => {
+                        panic!("peer {idx} update unexpectedly failed: {err}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn save_checkpoints_and_post_structural_delta_reconnect_avoid_full_snapshot() {
+        let _env = crate::test_env::TestEnv::new("checkpoint-and-structural-delta");
+        let (host, port) = host_for_test(1, "Host", "checkpoint-doc", "pw");
+        let mut wb = sheetcore::Workbook::new_blank();
+        for r in 0..1_200u32 {
+            wb.sheet_mut(0).set(
+                r,
+                0,
+                sheetcore::model::Cell {
+                    value: sheetcore::model::Value::Number(f64::from(r + 1)),
+                    formula: None,
+                },
+            );
+        }
+        let mut host_peer = sheetcore::sync::Peer::new(1);
+        host_peer.seed_workbook(&wb);
+        host.set_base_hash("hash-v0".into());
+        host.seed_snapshot(
+            &host_peer,
+            &wb,
+            Cursor {
+                site: 1,
+                name: "Host".into(),
+                color: 1,
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        );
+
+        // 宿主编辑 1 格并保存 v1 检查点，再插行（struct_rev = 1）并再编辑 1 格后保存 v2 检查点
+        host.broadcast_op(Op {
+            sheet: 0,
+            row: 0,
+            col: 1,
+            value: ValueWire::Number(111.0),
+            formula: None,
+            ts: 2,
+            site: 1,
+        });
+        host.record_save_checkpoint("hash-v1".into());
+        let _ = host.broadcast_structural(0, &sheetcore::structural::Structural::InsertRows { at: 0, n: 2 });
+        host.broadcast_op(Op {
+            sheet: 0,
+            row: 0,
+            col: 1,
+            value: ValueWire::Number(222.0),
+            formula: None,
+            ts: 3,
+            site: 1,
+        });
+        host.record_save_checkpoint("hash-v2".into());
+        host.broadcast_op(Op {
+            sheet: 0,
+            row: 1,
+            col: 1,
+            value: ValueWire::Number(333.0),
+            formula: None,
+            ts: 4,
+            site: 1,
+        });
+
+        // 持旧保存版本 hash-v1 的同事入房：即使宿主已插行且又保存了 hash-v2，仍走 delta_sync=true 增量同步！
+        let addr = format!("127.0.0.1:{port}");
+        let late_v1 = join_with_base(
+            2,
+            "ColleagueV1".into(),
+            "checkpoint-doc".into(),
+            &addr,
+            "pw".into(),
+            "hash-v1".into(),
+        )
+        .unwrap();
+
+        let mut saw_delta_welcome = false;
+        let mut saw_struct_insert = false;
+        let mut received_ops = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            let ev = late_v1
+                .events
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            match ev {
+                NetEvent::Welcome { delta_sync, .. } => saw_delta_welcome = delta_sync,
+                NetEvent::Structural {
+                    sheet: 0,
+                    op: sheetcore::structural::Structural::InsertRows { at: 0, n: 2 },
+                    ..
+                } => saw_struct_insert = true,
+                NetEvent::Ops(ops) => received_ops += ops.len(),
+                NetEvent::SnapshotDone => break,
+                _ => {}
+            }
+        }
+        assert!(saw_delta_welcome, "历史保存检查点 hash-v1 应命中增量入房");
+        assert!(saw_struct_insert, "增量入房应自动补发检查点之后的插行结构变更");
+        assert!(
+            received_ops <= 5,
+            "增量入房仅应收到少量变更格而非 1200 格全量基准，实际收到 {received_ops} 格"
+        );
+
+        // 验证在线断线重连期间发生结构插行（resume_struct_rev < struct_rev）仍走增量重连而非回退全量快照
+        late_v1.disconnect_socket_for_test();
+        assert!(wait_event(&late_v1, 4000, |e| matches!(e, NetEvent::Disconnected(_))).is_some());
+        let _ = host.broadcast_structural(0, &sheetcore::structural::Structural::InsertCols { at: 0, n: 1 });
+        host.broadcast_op(Op {
+            sheet: 0,
+            row: 5,
+            col: 2,
+            value: ValueWire::Number(999.0),
+            formula: None,
+            ts: 10,
+            site: 1,
+        });
+
+        let mut reconnected_delta = false;
+        let mut reconnected_insert_col = false;
+        let mut reconnected_ops = 0usize;
+        let reconn_deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let ev = late_v1
+                .events
+                .recv_timeout(reconn_deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            match ev {
+                NetEvent::Welcome { delta_sync, .. } => reconnected_delta = delta_sync,
+                NetEvent::Structural {
+                    sheet: 0,
+                    op: sheetcore::structural::Structural::InsertCols { at: 0, n: 1 },
+                    ..
+                } => reconnected_insert_col = true,
+                NetEvent::Ops(ops) => reconnected_ops += ops.len(),
+                NetEvent::SnapshotDone => break,
+                _ => {}
+            }
+        }
+        assert!(reconnected_delta, "断线期间发生插列后重连应继续走增量水位重连");
+        assert!(reconnected_insert_col, "重连应补发断线窗口内的 InsertCols");
+        assert!(reconnected_ops <= 4, "重连不应重发 1200 格基准，实际收到 {reconnected_ops} 格");
+    }
+
+    #[test]
+    fn fast_snapshot_handoff_builds_columnar_workbook_off_ui_thread() {
+        let _env = crate::test_env::TestEnv::new("fast-snapshot-handoff");
+        let (host, port) = host_for_test(1, "Host", "handoff-doc", "pw");
+        let mut wb = sheetcore::Workbook::new_blank();
+        let mut bold = sheetcore::style::CellStyle::default();
+        bold.bold = true;
+        let bold_id = wb.styles.intern(bold);
+        wb.sheet_mut(0).set_col_style(0, bold_id);
+        wb.sheet_mut(0).set(
+            0,
+            0,
+            sheetcore::model::Cell {
+                value: sheetcore::model::Value::Number(50.0),
+                formula: None,
+            },
+        );
+        wb.sheet_mut(0).set(
+            1,
+            0,
+            sheetcore::model::Cell {
+                value: sheetcore::model::Value::Number(100.0),
+                formula: Some("=A1*2".into()),
+            },
+        );
+        let mut host_peer = sheetcore::sync::Peer::new(1);
+        host_peer.seed_workbook(&wb);
+        host.seed_snapshot(
+            &host_peer,
+            &wb,
+            Cursor {
+                site: 1,
+                name: "Host".into(),
+                color: 1,
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        );
+        host.broadcast_merge(0, (2, 0, 3, 1), true);
+
+        let guest_net = join(
+            2,
+            "FastGuest".into(),
+            "handoff-doc".into(),
+            &format!("127.0.0.1:{port}"),
+            "pw".into(),
+        )
+        .unwrap();
+        guest_net.enable_fast_snapshot_handoff();
+
+        let mut ui_ops_events = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            let ev = guest_net
+                .events
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            match ev {
+                NetEvent::Ops(_) => ui_ops_events += 1,
+                NetEvent::SnapshotDone => break,
+                _ => {}
+            }
+        }
+        assert_eq!(ui_ops_events, 0, "后台直接组装列式快照时不应向 UI 通道倾倒逐块 Ops");
+        let prepared = guest_net
+            .take_prepared_snapshot()
+            .expect("SnapshotDone 时应可取走已组装完成的列式工作簿快照");
+        let mut guest_wb = sheetcore::Workbook::new_blank();
+        let mut guest_peer = sheetcore::sync::Peer::new(2);
+        prepared.install(&mut guest_wb, Some(&mut guest_peer));
+
+        assert_eq!(guest_wb.sheet(0).value(0, 0), sheetcore::model::Value::Number(50.0));
+        assert_eq!(
+            guest_wb.sheet(0).get(1, 0).unwrap().formula.as_deref(),
+            Some("=A1*2")
+        );
+        assert!(guest_wb.styles.get(guest_wb.sheet(0).style_of(10, 0)).bold);
+        assert_eq!(guest_wb.sheet(0).merge_at(2, 0), Some((2, 0, 3, 1)));
+    }
+
+    #[test]
+    fn fast_snapshot_handoff_preserves_layout_freeze_themes_trailing_sheets_and_baseline_merges() {
+        let _env = crate::test_env::TestEnv::new("fast-snapshot-metadata-preservation");
+        let (host, port) = host_for_test(1, "Host", "preserve-doc", "pw");
+
+        let mut host_wb = sheetcore::Workbook::new_blank();
+        let mut italic = sheetcore::style::CellStyle::default();
+        italic.italic = true;
+        let italic_id = host_wb.styles.intern(italic);
+        host_wb.sheet_mut(0).set_style(0, 0, italic_id);
+        host_wb.sheet_mut(0).set(
+            0,
+            0,
+            sheetcore::model::Cell {
+                value: sheetcore::model::Value::Number(42.0),
+                formula: None,
+            },
+        );
+        let mut host_peer = sheetcore::sync::Peer::new(1);
+        host_peer.seed_workbook(&host_wb);
+        host.seed_snapshot(
+            &host_peer,
+            &host_wb,
+            Cursor {
+                site: 1,
+                name: "Host".into(),
+                color: 1,
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        );
+        // 宿主开房后编辑一格 (ts=5) + 拆并原文件合并格 (8,0,9,1) + 新增房间合并格 (2,0,3,1)
+        host.broadcast_op(Op {
+            sheet: 0,
+            row: 0,
+            col: 1,
+            value: ValueWire::Number(84.0),
+            formula: None,
+            ts: 5,
+            site: 1,
+        });
+        host.broadcast_merge(0, (8, 0, 9, 1), false);
+        host.broadcast_merge(0, (2, 0, 3, 1), true);
+
+        for (idx, seed_mode) in [true, false].into_iter().enumerate() {
+            // 模拟加入者本地已打开共享盘原文件：含列宽、行高、冻结、CF、DV、表格、图表、原文件合并格、样式主题/quotePrefix 及尾表
+            let mut guest_wb = sheetcore::Workbook::new_blank();
+            let mut quoted_style = sheetcore::style::CellStyle::default();
+            quoted_style.underline = true;
+            let q_id = guest_wb.styles.intern(quoted_style);
+            let q_theme = sheetcore::style_theme::XfTheme {
+                font: Some(sheetcore::style_theme::ThemeRef { idx: 5, tint: -0.25 }),
+                fill: None,
+            };
+            guest_wb.styles.set_theme(q_id, q_theme);
+            guest_wb.styles.set_quote(q_id, true);
+            let orig_id0 = guest_wb.sheets[0].identity;
+            guest_wb.sheets[0].source_part = Some("xl/worksheets/sheet1.xml".into());
+            guest_wb.sheets[0].cols.set(0, 180.0);
+            guest_wb.sheets[0].rows.set(0, 32.0);
+            guest_wb.sheets[0].freeze = Some((1, 2));
+            guest_wb.sheets[0].cf.blocks.push(sheetcore::cf::CfBlock {
+                ranges: vec![(0, 0, 20, 0)],
+                rules: Vec::new(),
+            });
+            guest_wb.sheets[0].dv.push(sheetcore::dv::DataValidation {
+                ranges: vec![(0, 0, 10, 0)],
+                kind: sheetcore::dv::DvKind::List,
+                op: sheetcore::dv::DvOp::Between,
+                f1: "甲,乙,丙".into(),
+                f2: String::new(),
+                allow_blank: true,
+                show_dropdown: true,
+                error_style: sheetcore::dv::DvStyle::Stop,
+                show_error: true,
+                show_prompt: false,
+                error_title: String::new(),
+                error_msg: String::new(),
+                prompt_title: String::new(),
+                prompt_msg: String::new(),
+            });
+            guest_wb.sheets[0].tables.push(sheetcore::table::Table {
+                name: "TblSales".into(),
+                display: "TblSales".into(),
+                range: (0, 0, 4, 2),
+                columns: vec!["地区".into(), "销量".into(), "单价".into()],
+                column_ids: vec![1, 2, 3],
+                header_row: true,
+                totals_row: false,
+            });
+            guest_wb.sheets[0].charts.push(sheetcore::charts::Chart {
+                kind: sheetcore::charts::ChartKind::Line,
+                title: "趋势图".into(),
+                series: Vec::new(),
+                legend: true,
+                anchor: (0, 4, 12, 10),
+                legend_pos: "r".into(),
+                part: "xl/charts/chart1.xml".into(),
+                drawing: "xl/drawings/drawing1.xml".into(),
+                show_labels: false,
+                label_opts: Default::default(),
+                radar_style: String::new(),
+                ref_fixes: Vec::new(),
+                axis_x: String::new(),
+                axis_y: String::new(),
+                y_fmt: String::new(),
+                y_min: None,
+                y_max: None,
+            });
+            guest_wb.sheets[0].merge_range(5, 0, 6, 1); // 原文件基础合并格（宿主未动，必须保留）
+            guest_wb.sheets[0].merge_range(8, 0, 9, 1); // 原文件基础合并格（宿主已拆并，必须移除）
+
+            let mut tail = sheetcore::model::Sheet::new("Sheet2");
+            tail.freeze = Some((2, 0));
+            tail.merge_range(1, 1, 2, 2);
+            tail.set(
+                0,
+                0,
+                sheetcore::model::Cell {
+                    value: sheetcore::model::Value::Number(999.0),
+                    formula: None,
+                },
+            );
+            tail.set_style(0, 0, q_id);
+            guest_wb.sheets.push(tail);
+
+            let guest_net = join(
+                10 + idx as u32,
+                format!("Guest{idx}"),
+                "preserve-doc".into(),
+                &format!("127.0.0.1:{port}"),
+                "pw".into(),
+            )
+            .unwrap();
+            if seed_mode {
+                guest_net.enable_fast_snapshot_handoff_with_styles(&guest_wb.styles);
+            } else {
+                guest_net.enable_fast_snapshot_handoff();
+            }
+
+            assert!(wait_event(&guest_net, 6000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+            let prepared = guest_net.take_prepared_snapshot().expect("prepared snapshot");
+            let mut guest_peer = sheetcore::sync::Peer::new(10 + idx as u32);
+            prepared.install(&mut guest_wb, Some(&mut guest_peer));
+
+            // 1. 宿主单元格、样式与 ts>1 LWW 水位准确写入
+            assert_eq!(guest_wb.sheet(0).value(0, 0), sheetcore::model::Value::Number(42.0));
+            assert_eq!(guest_wb.sheet(0).value(0, 1), sheetcore::model::Value::Number(84.0));
+            assert!(guest_wb.styles.get(guest_wb.sheet(0).style_of(0, 0)).italic);
+            assert!(
+                !guest_peer.apply(Op {
+                    sheet: 0,
+                    row: 0,
+                    col: 1,
+                    value: ValueWire::Number(1.0),
+                    formula: None,
+                    ts: 3,
+                    site: 99,
+                }),
+                "ts=3 过期乱序编辑必须被 ts=5 的快照增量格拒绝"
+            );
+            // 2. 非单元格布局、冻结、CF、DV、表格、图表、source_part、identity 与原样式表主题/quotePrefix 100% 保留
+            assert_eq!(guest_wb.sheet(0).identity, orig_id0);
+            assert_eq!(guest_wb.sheet(0).source_part.as_deref(), Some("xl/worksheets/sheet1.xml"));
+            assert!((guest_wb.sheet(0).cols.pos(1) - 180.0).abs() < 0.05);
+            assert!((guest_wb.sheet(0).rows.pos(1) - 32.0).abs() < 0.05);
+            assert_eq!(guest_wb.sheet(0).freeze, Some((1, 2)));
+            assert_eq!(guest_wb.sheet(0).cf.blocks.len(), 1);
+            assert_eq!(guest_wb.sheet(0).dv.len(), 1);
+            assert_eq!(guest_wb.sheet(0).tables.len(), 1);
+            assert_eq!(guest_wb.sheet(0).charts.len(), 1);
+            assert_eq!(guest_wb.styles.theme_of(q_id), q_theme, "StyleTable themes must survive");
+            assert!(guest_wb.styles.quote_of(q_id), "StyleTable quotePrefix must survive");
+            // 3. 原文件未动合并格保留、宿主拆并的原合并格移除、新增合并格生效
+            assert_eq!(guest_wb.sheet(0).merge_at(5, 0), Some((5, 0, 6, 1)));
+            assert_eq!(guest_wb.sheet(0).merge_at(8, 0), None);
+            assert_eq!(guest_wb.sheet(0).merge_at(2, 0), Some((2, 0, 3, 1)));
+            // 4. 快照未触及的尾表旧单元格与旧显式样式被清空，但其自身冻结窗格与基础合并格保留
+            assert_eq!(guest_wb.sheet(1).value(0, 0), sheetcore::model::Value::Empty);
+            assert_eq!(guest_wb.sheet(1).explicit_style_of(0, 0), None);
+            assert_eq!(guest_wb.sheet(1).freeze, Some((2, 0)));
+            assert_eq!(guest_wb.sheet(1).merge_at(1, 1), Some((1, 1, 2, 2)));
+        }
+    }
+
+    #[test]
+    fn broadcast_saved_guards_against_inflight_edits_and_supports_snapshot_cursor() {
+        let env = crate::test_env::TestEnv::new("save-checkpoint-race-guard");
+        let save_path = env.path("shared_budget.xlsx");
+        let v1_bytes = b"xlsx-snapshot-v1-bytes";
+        std::fs::write(&save_path, v1_bytes).unwrap();
+        let v1_hash = hex::encode(Sha256::digest(v1_bytes));
+
+        let (host, port) = host_for_test(1, "Host", "race-doc", "pw");
+        let mut wb = sheetcore::Workbook::new_blank();
+        wb.path = Some(save_path.clone());
+        wb.sheet_mut(0).set(
+            0,
+            0,
+            sheetcore::model::Cell {
+                value: sheetcore::model::Value::Number(10.0),
+                formula: None,
+            },
+        );
+        let mut host_peer = sheetcore::sync::Peer::new(1);
+        host_peer.seed_workbook(&wb);
+        host.seed_snapshot(
+            &host_peer,
+            &wb,
+            Cursor {
+                site: 1,
+                name: "Host".into(),
+                color: 1,
+                sheet: 0,
+                row: 0,
+                col: 0,
+            },
+        );
+
+        // 1. 模拟未调 note_save_snapshot 时，后台写盘期间（clock=1）发生了并发新编辑（ts=2）：
+        //    默认 broadcast_saved(1) 必须拒绝把已推进到 ts=2 的水位错绑到旧 v1 文件哈希上！
+        host.broadcast_op(Op {
+            sheet: 0,
+            row: 4,
+            col: 0,
+            value: ValueWire::Number(555.0),
+            formula: None,
+            ts: 2,
+            site: 1,
+        });
+        host.broadcast_saved(1);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            host.host_watermark
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .find_checkpoint(&v1_hash)
+                .is_none(),
+            "写盘期间已发生新编辑时，未捕获快照游标的默认 broadcast_saved 不得错绑超前水位"
+        );
+
+        // 2. 模拟在拍保存快照时刻（clock=2）先调 note_save_snapshot(2) 锁存精确水位，
+        //    随后写盘期间并发发生插行 + 新编辑（ts=3），再完成写盘并调 broadcast_saved_with_cursor：
+        //    持 v2 文件入房的同事应命中 delta_sync=true 且完整收到写盘期间的插行与 ts=3 编辑！
+        let snap_cursor = host.note_save_snapshot(2);
+        assert!(snap_cursor.is_some());
+        let v2_bytes = b"xlsx-snapshot-v2-at-clock-2";
+        std::fs::write(&save_path, v2_bytes).unwrap();
+        let v2_hash = hex::encode(Sha256::digest(v2_bytes));
+
+        let _ = host.broadcast_structural(0, &sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+        host.broadcast_op(Op {
+            sheet: 0,
+            row: 9,
+            col: 0,
+            value: ValueWire::Number(777.0),
+            formula: None,
+            ts: 3,
+            site: 1,
+        });
+        host.broadcast_saved_with_cursor(2, snap_cursor);
+
+        let wait_cp = std::time::Instant::now() + Duration::from_secs(3);
+        while host
+            .host_watermark
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .find_checkpoint(&v2_hash)
+            .is_none()
+        {
+            assert!(std::time::Instant::now() < wait_cp, "v2 checkpoint was not recorded");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let joiner = join_with_base(
+            2,
+            "ColleagueV2".into(),
+            "race-doc".into(),
+            &format!("127.0.0.1:{port}"),
+            "pw".into(),
+            v2_hash,
+        )
+        .unwrap();
+        let mut saw_delta = false;
+        let mut saw_inflight_struct = false;
+        let mut saw_inflight_777 = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            let ev = joiner
+                .events
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            match ev {
+                NetEvent::Welcome { delta_sync, .. } => saw_delta = delta_sync,
+                NetEvent::Structural {
+                    sheet: 0,
+                    op: sheetcore::structural::Structural::InsertRows { at: 0, n: 1 },
+                    ..
+                } => saw_inflight_struct = true,
+                NetEvent::Ops(ops) if ops.iter().any(|o| o.row == 9 && o.value == ValueWire::Number(777.0)) => {
+                    saw_inflight_777 = true;
+                }
+                NetEvent::SnapshotDone => break,
+                _ => {}
+            }
+        }
+        assert!(saw_delta && saw_inflight_struct && saw_inflight_777);
+    }
+
+    #[test]
+    fn cursor_sender_throttles_burst_to_30hz_preserving_edges_and_compact_prepared_fallback_works() {
+        let _env = crate::test_env::TestEnv::new("cursor-30hz-throttle-and-fallback");
+        let (host, port) = host_for_test(1, "Host", "cursor-doc", "pw");
+        let guest = join(
+            2,
+            "Guest".into(),
+            "cursor-doc".into(),
+            &format!("127.0.0.1:{port}"),
+            "pw".into(),
+        )
+        .unwrap();
+        assert!(wait_event(&guest, 5000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+
+        // 1. 模拟 120Hz 高频拖选连发 40 次光标：前缘第 1 帧立即发出，中间帧合并，尾随末帧 row=40 必达！
+        for r in 1..=40u32 {
+            guest.broadcast_cursor(Cursor {
+                site: 2,
+                name: "Guest".into(),
+                color: 2,
+                sheet: 0,
+                row: r,
+                col: 1,
+            });
+        }
+        let mut seen_rows = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while seen_rows.last().copied() != Some(40) {
+            let ev = host
+                .events
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("trailing cursor row=40 should arrive");
+            if let NetEvent::Cursor(c) = ev
+                && c.site == 2
+            {
+                seen_rows.push(c.row);
+            }
+        }
+        assert_eq!(seen_rows.first().copied(), Some(1), "leading-edge cursor must arrive immediately");
+        assert_eq!(seen_rows.last().copied(), Some(40), "trailing-edge final cursor must never be dropped");
+        assert!(
+            seen_rows.len() <= 5,
+            "40 rapid cursor updates should coalesce to <= 5 wire frames, got {seen_rows:?}"
+        );
+
+        // 2. 验证 GuestSend / HostOutput 的 write_prepared_opt 对未压缩与预压缩 compact_bin 负载在非 compact 通道（v2 文本与 v3 JSON）下的安全转码防御
+        let room = sheetcore::wire::RoomKey::derive_with_iters("fb-pw", b"fb-salt", 4);
+        let big_ops: Vec<Op> = (0..64u32)
+            .map(|r| Op {
+                sheet: 0,
+                row: r,
+                col: 1,
+                value: ValueWire::Text("重复文本用于触发预压缩路径".into()),
+                formula: None,
+                ts: 10 + r as u64,
+                site: 1,
+            })
+            .collect();
+        let ops_msg = Msg::Ops { ops: big_ops };
+        let compact_prep_compressed = sheetcore::wire::prepare_compact_payload(
+            sheetcore::sync::encode_msg_compact(&ops_msg),
+            true,
+        );
+        assert!(compact_prep_compressed.is_compact_bin());
+
+        let wm_msg = Msg::Watermark { seq: 77, structure_revision: 3 };
+        let compact_prep = sheetcore::wire::prepare_compact_payload(
+            sheetcore::sync::encode_msg_compact(&wm_msg),
+            false,
+        );
+        assert!(compact_prep.is_compact_bin());
+
+        for binary_v3 in [false, true] {
+            let (_ack_tx, ack_rx) = channel();
+            let mut gs = GuestSend {
+                sess: sheetcore::wire::Session::client_side(&room, b"fb-conn"),
+                batch_ops: true,
+                sort_permutation: true,
+                binary_v3,
+                compact_v3: false,
+                scratch: Vec::new(),
+                acks: Arc::new(Mutex::new(ack_rx)),
+            };
+            let mut host_recv = sheetcore::wire::Session::host_side(&room, b"fb-conn");
+            let mut wire_buf = Vec::new();
+            gs.write_prepared_opt(&mut wire_buf, &compact_prep, true)
+                .expect("GuestSend compact prepared fallback must not panic or fail");
+            let mut cursor = std::io::Cursor::new(wire_buf);
+            let frame = read_wire_frame(&mut cursor, MAX_LINE, binary_v3)
+                .unwrap()
+                .unwrap();
+            let plain = match frame {
+                WireFrame::Text(line) => host_recv.open(&line).unwrap(),
+                WireFrame::Binary(body) => host_recv.open_binary(&body).unwrap(),
+            };
+            let decoded: Msg = serde_json::from_str(&plain).unwrap();
+            assert!(matches!(
+                decoded,
+                Msg::Watermark { seq: 77, structure_revision: 3 }
+            ));
+
+            // 同步验证 HostOutput::write_prepared_opt 对预压缩 compact_bin 的降级转码
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let laddr = listener.local_addr().unwrap();
+            let cli_sock = TcpStream::connect(laddr).unwrap();
+            let (srv_sock, _) = listener.accept().unwrap();
+            let mut ho = HostOutput::new(
+                BufWriter::new(srv_sock),
+                sheetcore::wire::Session::host_side(&room, b"fb-host"),
+            );
+            ho.binary_v3 = binary_v3;
+            ho.compact_v3 = false;
+            ho.write_prepared_opt(&compact_prep_compressed, true)
+                .expect("HostOutput compressed compact fallback must not panic or fail");
+            drop(ho);
+            let mut cli_reader = BufReader::new(cli_sock);
+            let mut cli_recv = sheetcore::wire::Session::client_side(&room, b"fb-host");
+            let hframe = read_wire_frame(&mut cli_reader, MAX_LINE, binary_v3)
+                .unwrap()
+                .unwrap();
+            let hplain = match hframe {
+                WireFrame::Text(line) => cli_recv.open(&line).unwrap(),
+                WireFrame::Binary(body) => cli_recv.open_binary(&body).unwrap(),
+            };
+            let hdecoded: Msg = serde_json::from_str(&hplain).unwrap();
+            assert!(matches!(hdecoded, Msg::Ops { ref ops } if ops.len() == 64));
+        }
     }
 }
 

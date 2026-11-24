@@ -646,3 +646,70 @@ fn ai_manual_large_workbook_reuses_calc_base_deps_and_broadcasts_fill_formula_st
         Some("A50*2")
     );
 }
+
+#[test]
+fn ai_consecutive_write_tools_coalesce_recalc_and_streaming_blocks_stay_stable() {
+    // 1. 验证长流式回复增量分块：闭合段落前缀在后续 SSE token 追加时保持 100% 字节稳定（命中 egui Galley 缓存）
+    let long_para_a = "第一段财务分析结论：".repeat(50); // > 768 bytes
+    let long_para_b = "第二段现金流预测明细：".repeat(50); // > 768 bytes
+    let s1 = format!("{long_para_a}\n\n{long_para_b}\n\n正在生成的尾部第1字");
+    let s2 = format!("{long_para_a}\n\n{long_para_b}\n\n正在生成的尾部第1字、第2字、第3字");
+    let b1 = crate::ai_agent::split_streaming_text_blocks(&s1);
+    let b2 = crate::ai_agent::split_streaming_text_blocks(&s2);
+    assert!(b1.len() >= 3 && b2.len() == b1.len());
+    assert_eq!(
+        b1[..b1.len() - 1],
+        b2[..b2.len() - 1],
+        "已封口的历史段落块在追加新 SSE token 时必须完全不变，仅最后一个活跃尾块重排"
+    );
+
+    // 2. 验证单轮连续多个无确认写工具调用（set_cells + fill_formula_range）合并重算且保留逐条撤销
+    let mut chat = Conversation::new();
+    chat.app.start_ai_prompt("录入三行基础数据并填充汇总公式".into());
+    let (first, _) = chat.request();
+    let args_w1 = json!({
+        "edits": [
+            {"cell": "A1", "value": 10},
+            {"cell": "A2", "value": 20},
+            {"cell": "A3", "value": 30}
+        ]
+    })
+    .to_string();
+    let args_w2 = json!({
+        "range": "B1:B3",
+        "top_left_formula": "=A1*10"
+    })
+    .to_string();
+    respond(
+        first,
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [
+                        {"index": 0, "id": "call_w1", "function": {"name": "set_cells", "arguments": args_w1}},
+                        {"index": 1, "id": "call_w2", "function": {"name": "fill_formula_range", "arguments": args_w2}}
+                    ]
+                }
+            }]
+        }),
+    );
+
+    let (second, req2) = chat.request();
+    let msgs = req2["messages"].as_array().unwrap();
+    let n = msgs.len();
+    let obs_w1: JsonValue = serde_json::from_str(msgs[n - 2]["content"].as_str().unwrap()).unwrap();
+    let obs_w2: JsonValue = serde_json::from_str(msgs[n - 1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(obs_w1["ok"], true);
+    assert_eq!(obs_w2["ok"], true);
+    assert_eq!(obs_w2["samples"][0]["value"], "100");
+    assert_eq!(chat.app.wb.sheet(0).value(2, 1), Value::Number(300.0));
+
+    respond(second, json!({"choices": [{"delta": {"content": "已完成批量写入"}}]}));
+    chat.poll_until(|app| !app.ai.busy);
+
+    // 两个写工具各自的 undo_id 均被完整保留在当前轮消息中，一键撤销同时回退两条写入
+    assert_eq!(chat.app.ai.messages.last().unwrap().undo_ids.len(), 2);
+    chat.app.undo_last_ai_change();
+    assert_eq!(chat.app.wb.sheet(0).value(2, 1), Value::Empty);
+    assert_eq!(chat.app.wb.sheet(0).value(2, 0), Value::Empty);
+}

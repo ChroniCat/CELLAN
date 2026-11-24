@@ -488,6 +488,8 @@ pub enum Msg {
         resume_struct_rev: usize,
         #[serde(default)]
         binary_v3: bool,
+        #[serde(default)]
+        compact_v3: bool,
     },
     /// 本机显示名变更（不改变 site；宿主转发给其他参与者）
     Rename { site: u32, name: String },
@@ -515,6 +517,8 @@ pub enum Msg {
         structure_revision: usize,
         #[serde(default)]
         binary_v3: bool,
+        #[serde(default)]
+        compact_v3: bool,
     },
     Snapshot { ops: Vec<Op> },
     /// 大文件分片下发（last=1 表示这是最后一片）
@@ -643,7 +647,10 @@ pub enum Msg {
         version: String,
         offset: u64,
         total: u64,
+        #[serde(default)]
         data_b64: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        raw_data: Vec<u8>,
         done: bool,
     },
     Bye { site: u32 },
@@ -934,14 +941,22 @@ impl Msg {
                 offset,
                 total,
                 data_b64,
+                raw_data,
+                done,
                 ..
             } => {
                 !version.is_empty()
                     && version.len() <= 32
-                    && *total > 0
-                    && *total <= 256 * 1024 * 1024
-                    && *offset <= *total
-                    && data_b64.len() <= 512 * 1024
+                    && ((*total == 0
+                        && *done
+                        && *offset == 0
+                        && data_b64.is_empty()
+                        && raw_data.is_empty())
+                        || (*total > 0
+                            && *total <= 256 * 1024 * 1024
+                            && *offset <= *total
+                            && data_b64.len() <= 512 * 1024
+                            && raw_data.len() <= 384 * 1024))
             }
             Msg::Challenge { .. }
             | Msg::ChallengeSalt { .. }
@@ -952,12 +967,721 @@ impl Msg {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 协议 v3 紧凑二进制内层编码（V3_FLAG_COMPACT_BIN）
+//
+// 首字节 tag：
+//   0x00 = UTF-8 JSON 回退（用于低频控制/握手/结构消息）
+//   0x01 = Msg::Op
+//   0x02 = Msg::Ops
+//   0x03 = Msg::Snapshot
+//   0x04 = Msg::SnapshotChunk
+//   0x05 = Msg::StylePaletteOp
+//   0x06 = Msg::StylePaletteSnapshot
+//   0x07 = Msg::CursorMsg
+//   0x08 = Msg::Watermark
+//   0x09 = Msg::UpdateSlice（原生二进制，免 Base64 与宿主 JSON 重解析）
+// ---------------------------------------------------------------------------
+
+const COMPACT_TAG_JSON: u8 = 0x00;
+const COMPACT_TAG_OP: u8 = 0x01;
+const COMPACT_TAG_OPS: u8 = 0x02;
+const COMPACT_TAG_SNAPSHOT: u8 = 0x03;
+const COMPACT_TAG_SNAPSHOT_CHUNK: u8 = 0x04;
+const COMPACT_TAG_STYLE_PALETTE_OP: u8 = 0x05;
+const COMPACT_TAG_STYLE_PALETTE_SNAP: u8 = 0x06;
+const COMPACT_TAG_CURSOR: u8 = 0x07;
+const COMPACT_TAG_WATERMARK: u8 = 0x08;
+const COMPACT_TAG_UPDATE_SLICE: u8 = 0x09;
+
+const MAX_COMPACT_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_COMPACT_PALETTE_JSON_BYTES: usize = 8 * 1024 * 1024;
+
+#[inline]
+fn write_compact_str(out: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+#[inline]
+fn write_compact_op(out: &mut Vec<u8>, op: &Op) {
+    let sh = u32::try_from(op.sheet).unwrap_or(u32::MAX);
+    out.extend_from_slice(&sh.to_le_bytes());
+    out.extend_from_slice(&op.row.to_le_bytes());
+    out.extend_from_slice(&op.col.to_le_bytes());
+    out.extend_from_slice(&op.ts.to_le_bytes());
+    out.extend_from_slice(&op.site.to_le_bytes());
+    let has_f = if op.formula.is_some() { 0x80u8 } else { 0u8 };
+    match &op.value {
+        ValueWire::Empty => {
+            out.push(has_f);
+        }
+        ValueWire::Number(n) => {
+            out.push(has_f | 1);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        ValueWire::Bool(false) => {
+            out.push(has_f | 2);
+        }
+        ValueWire::Bool(true) => {
+            out.push(has_f | 3);
+        }
+        ValueWire::Text(s) => {
+            out.push(has_f | 4);
+            write_compact_str(out, s);
+        }
+        ValueWire::Error(s) => {
+            out.push(has_f | 5);
+            write_compact_str(out, s);
+        }
+    }
+    if let Some(f) = &op.formula {
+        write_compact_str(out, f);
+    }
+}
+
+#[inline]
+fn read_u8<'a>(cur: &mut &'a [u8]) -> Option<u8> {
+    let (&b, rest) = cur.split_first()?;
+    *cur = rest;
+    Some(b)
+}
+
+#[inline]
+fn read_u16<'a>(cur: &mut &'a [u8]) -> Option<u16> {
+    if cur.len() < 2 {
+        return None;
+    }
+    let (head, rest) = cur.split_at(2);
+    *cur = rest;
+    Some(u16::from_le_bytes([head[0], head[1]]))
+}
+
+#[inline]
+fn read_u32<'a>(cur: &mut &'a [u8]) -> Option<u32> {
+    if cur.len() < 4 {
+        return None;
+    }
+    let (head, rest) = cur.split_at(4);
+    *cur = rest;
+    Some(u32::from_le_bytes([head[0], head[1], head[2], head[3]]))
+}
+
+#[inline]
+fn read_u64<'a>(cur: &mut &'a [u8]) -> Option<u64> {
+    if cur.len() < 8 {
+        return None;
+    }
+    let (head, rest) = cur.split_at(8);
+    *cur = rest;
+    Some(u64::from_le_bytes(head.try_into().ok()?))
+}
+
+#[inline]
+fn read_bytes<'a>(cur: &mut &'a [u8], max_len: usize) -> Option<&'a [u8]> {
+    let len = read_u32(cur)? as usize;
+    if len > max_len || cur.len() < len {
+        return None;
+    }
+    let (head, rest) = cur.split_at(len);
+    *cur = rest;
+    Some(head)
+}
+
+#[inline]
+fn read_str<'a>(cur: &mut &'a [u8], max_len: usize) -> Option<&'a str> {
+    std::str::from_utf8(read_bytes(cur, max_len)?).ok()
+}
+
+#[inline]
+fn read_compact_op(cur: &mut &[u8]) -> Option<Op> {
+    let sheet = read_u32(cur)? as usize;
+    let row = read_u32(cur)?;
+    let col = read_u32(cur)?;
+    let ts = read_u64(cur)?;
+    let site = read_u32(cur)?;
+    let tag = read_u8(cur)?;
+    let has_f = (tag & 0x80) != 0;
+    let value = match tag & 0x7F {
+        0 => ValueWire::Empty,
+        1 => {
+            let bits = read_u64(cur)?;
+            ValueWire::Number(f64::from_bits(bits))
+        }
+        2 => ValueWire::Bool(false),
+        3 => ValueWire::Bool(true),
+        4 => ValueWire::Text(Arc::from(read_str(cur, MAX_COMPACT_TEXT_BYTES)?)),
+        5 => ValueWire::Error(Arc::from(read_str(cur, MAX_SHORT_TEXT)?)),
+        _ => return None,
+    };
+    let formula = if has_f {
+        Some(Arc::from(read_str(cur, MAX_COMPACT_TEXT_BYTES)?))
+    } else {
+        None
+    };
+    Some(Op {
+        sheet,
+        row,
+        col,
+        value,
+        formula,
+        ts,
+        site,
+    })
+}
+
+/// 零深拷贝直接从 `&[&Op]` 生成 `SnapshotChunk` 紧凑二进制帧负载
+pub fn encode_snapshot_chunk_ref_compact(ops: &[&Op], last: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + ops.len() * 34);
+    out.push(COMPACT_TAG_SNAPSHOT_CHUNK);
+    out.push(u8::from(last));
+    out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+    for op in ops {
+        write_compact_op(&mut out, op);
+    }
+    out
+}
+
+/// 零深拷贝直接从 `&[&Op]` 生成 `Snapshot` 紧凑二进制帧负载
+pub fn encode_snapshot_ref_compact(ops: &[&Op]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + ops.len() * 34);
+    out.push(COMPACT_TAG_SNAPSHOT);
+    out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+    for op in ops {
+        write_compact_op(&mut out, op);
+    }
+    out
+}
+
+/// 零深拷贝直接从 `&[Arc<Op>]` 生成 `Ops`（或单条 `Op`）紧凑二进制帧负载
+pub fn encode_arc_ops_compact(ops: &[Arc<Op>]) -> Vec<u8> {
+    if ops.len() == 1 {
+        let mut out = Vec::with_capacity(40);
+        out.push(COMPACT_TAG_OP);
+        write_compact_op(&mut out, &ops[0]);
+        return out;
+    }
+    let mut out = Vec::with_capacity(5 + ops.len() * 34);
+    out.push(COMPACT_TAG_OPS);
+    out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+    for op in ops {
+        write_compact_op(&mut out, op);
+    }
+    out
+}
+
+/// 直接编码原生二进制 `UpdateSlice`（免 Base64 膨胀与 JSON 转义）
+pub fn encode_update_slice_compact(
+    from_site: u32,
+    to_site: u32,
+    version: &str,
+    offset: u64,
+    total: u64,
+    raw: &[u8],
+    done: bool,
+) -> Vec<u8> {
+    let vb = version.as_bytes();
+    let vlen = vb.len().min(255);
+    let mut out = Vec::with_capacity(1 + 4 + 4 + 8 + 8 + 1 + 1 + vlen + 4 + raw.len());
+    out.push(COMPACT_TAG_UPDATE_SLICE);
+    out.extend_from_slice(&from_site.to_le_bytes());
+    out.extend_from_slice(&to_site.to_le_bytes());
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(&total.to_le_bytes());
+    out.push(u8::from(done));
+    out.push(vlen as u8);
+    out.extend_from_slice(&vb[..vlen]);
+    out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    out.extend_from_slice(raw);
+    out
+}
+
+/// 宿主零拷贝快速窥探紧凑二进制 `UpdateSlice` 的 `(from_site, to_site)`，免整包反序列化直接路由！
+#[inline]
+pub fn peek_compact_update_slice_target(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 1 + 4 + 4 + 8 + 8 + 1 + 1 || bytes[0] != COMPACT_TAG_UPDATE_SLICE {
+        return None;
+    }
+    let from_site = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+    let to_site = u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+    Some((from_site, to_site))
+}
+
+/// 将任意 `Msg` 编码为紧凑二进制内层帧并写入 `out`
+pub fn encode_msg_compact_into(msg: &Msg, out: &mut Vec<u8>) {
+    out.clear();
+    match msg {
+        Msg::Op(op) => {
+            out.reserve(40);
+            out.push(COMPACT_TAG_OP);
+            write_compact_op(out, op);
+        }
+        Msg::Ops { ops } => {
+            out.reserve(5 + ops.len() * 34);
+            out.push(COMPACT_TAG_OPS);
+            out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+            for op in ops {
+                write_compact_op(out, op);
+            }
+        }
+        Msg::Snapshot { ops } => {
+            out.reserve(5 + ops.len() * 34);
+            out.push(COMPACT_TAG_SNAPSHOT);
+            out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+            for op in ops {
+                write_compact_op(out, op);
+            }
+        }
+        Msg::SnapshotChunk { ops, last } => {
+            out.reserve(6 + ops.len() * 34);
+            out.push(COMPACT_TAG_SNAPSHOT_CHUNK);
+            out.push(u8::from(*last));
+            out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+            for op in ops {
+                write_compact_op(out, op);
+            }
+        }
+        Msg::StylePaletteOp {
+            site,
+            sheet,
+            ts,
+            palette,
+            items,
+        } => {
+            if let Ok(pal_json) = serde_json::to_vec(palette) {
+                out.reserve(1 + 4 + 4 + 8 + 4 + pal_json.len() + 4 + items.len() * 10);
+                out.push(COMPACT_TAG_STYLE_PALETTE_OP);
+                out.extend_from_slice(&site.to_le_bytes());
+                out.extend_from_slice(&(u32::try_from(*sheet).unwrap_or(u32::MAX)).to_le_bytes());
+                out.extend_from_slice(&ts.to_le_bytes());
+                out.extend_from_slice(&(pal_json.len() as u32).to_le_bytes());
+                out.extend_from_slice(&pal_json);
+                out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                for &(r, c, idx) in items {
+                    out.extend_from_slice(&r.to_le_bytes());
+                    out.extend_from_slice(&c.to_le_bytes());
+                    out.extend_from_slice(&idx.to_le_bytes());
+                }
+                return;
+            }
+            out.push(COMPACT_TAG_JSON);
+            let _ = serde_json::to_writer(&mut *out, msg);
+        }
+        Msg::StylePaletteSnapshot { palette, items } => {
+            if let Ok(pal_json) = serde_json::to_vec(palette) {
+                out.reserve(1 + 4 + pal_json.len() + 4 + items.len() * 14);
+                out.push(COMPACT_TAG_STYLE_PALETTE_SNAP);
+                out.extend_from_slice(&(pal_json.len() as u32).to_le_bytes());
+                out.extend_from_slice(&pal_json);
+                out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                for &(sh, r, c, idx) in items {
+                    out.extend_from_slice(&(u32::try_from(sh).unwrap_or(u32::MAX)).to_le_bytes());
+                    out.extend_from_slice(&r.to_le_bytes());
+                    out.extend_from_slice(&c.to_le_bytes());
+                    out.extend_from_slice(&idx.to_le_bytes());
+                }
+                return;
+            }
+            out.push(COMPACT_TAG_JSON);
+            let _ = serde_json::to_writer(&mut *out, msg);
+        }
+        Msg::CursorMsg(cur) => {
+            let nb = cur.name.as_bytes();
+            let nlen = nb.len().min(u16::MAX as usize);
+            out.reserve(1 + 4 + 1 + 4 + 4 + 4 + 2 + nlen);
+            out.push(COMPACT_TAG_CURSOR);
+            out.extend_from_slice(&cur.site.to_le_bytes());
+            out.push(cur.color);
+            out.extend_from_slice(&(u32::try_from(cur.sheet).unwrap_or(u32::MAX)).to_le_bytes());
+            out.extend_from_slice(&cur.row.to_le_bytes());
+            out.extend_from_slice(&cur.col.to_le_bytes());
+            out.extend_from_slice(&(nlen as u16).to_le_bytes());
+            out.extend_from_slice(&nb[..nlen]);
+        }
+        Msg::Watermark {
+            seq,
+            structure_revision,
+        } => {
+            out.reserve(17);
+            out.push(COMPACT_TAG_WATERMARK);
+            out.extend_from_slice(&seq.to_le_bytes());
+            out.extend_from_slice(&(*structure_revision as u64).to_le_bytes());
+        }
+        Msg::UpdateSlice {
+            from_site,
+            to_site,
+            version,
+            offset,
+            total,
+            data_b64,
+            raw_data,
+            done,
+        } => {
+            if !raw_data.is_empty() || data_b64.is_empty() {
+                *out = encode_update_slice_compact(
+                    *from_site,
+                    *to_site,
+                    version,
+                    *offset,
+                    *total,
+                    raw_data,
+                    *done,
+                );
+            } else if let Ok(decoded) =
+                <base64::engine::GeneralPurpose as base64::Engine>::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    data_b64.as_bytes(),
+                )
+            {
+                *out = encode_update_slice_compact(
+                    *from_site,
+                    *to_site,
+                    version,
+                    *offset,
+                    *total,
+                    &decoded,
+                    *done,
+                );
+            } else {
+                out.push(COMPACT_TAG_JSON);
+                let _ = serde_json::to_writer(&mut *out, msg);
+            }
+        }
+        _ => {
+            out.push(COMPACT_TAG_JSON);
+            let _ = serde_json::to_writer(&mut *out, msg);
+        }
+    }
+}
+
+pub fn encode_msg_compact(msg: &Msg) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_msg_compact_into(msg, &mut out);
+    out
+}
+
+/// 解码紧凑二进制内层帧为 `Msg`（含严格边界与 OOM 防护检查）
+pub fn decode_msg_compact(bytes: &[u8]) -> Option<Msg> {
+        let mut cur = bytes;
+    let tag = read_u8(&mut cur)?;
+    match tag {
+        COMPACT_TAG_JSON => serde_json::from_slice(cur).ok(),
+        COMPACT_TAG_OP => {
+            let op = read_compact_op(&mut cur)?;
+            cur.is_empty().then_some(Msg::Op(op))
+        }
+        COMPACT_TAG_OPS | COMPACT_TAG_SNAPSHOT => {
+            let count = read_u32(&mut cur)? as usize;
+            if count > MAX_BATCH_ITEMS || cur.len() < count.saturating_mul(25) {
+                return None;
+            }
+            let mut ops = Vec::with_capacity(count);
+            for _ in 0..count {
+                ops.push(read_compact_op(&mut cur)?);
+            }
+            if !cur.is_empty() {
+                return None;
+            }
+            Some(if tag == COMPACT_TAG_OPS {
+                Msg::Ops { ops }
+            } else {
+                Msg::Snapshot { ops }
+            })
+        }
+        COMPACT_TAG_SNAPSHOT_CHUNK => {
+            let last = read_u8(&mut cur)? != 0;
+            let count = read_u32(&mut cur)? as usize;
+            if count > MAX_BATCH_ITEMS || cur.len() < count.saturating_mul(25) {
+                return None;
+            }
+            let mut ops = Vec::with_capacity(count);
+            for _ in 0..count {
+                ops.push(read_compact_op(&mut cur)?);
+            }
+            cur.is_empty().then_some(Msg::SnapshotChunk { ops, last })
+        }
+        COMPACT_TAG_STYLE_PALETTE_OP => {
+            let site = read_u32(&mut cur)?;
+            let sheet = read_u32(&mut cur)? as usize;
+            let ts = read_u64(&mut cur)?;
+            let pal_bytes = read_bytes(&mut cur, MAX_COMPACT_PALETTE_JSON_BYTES)?;
+            let palette: Vec<crate::style::CellStyle> = serde_json::from_slice(pal_bytes).ok()?;
+            let count = read_u32(&mut cur)? as usize;
+            if count > MAX_BATCH_ITEMS || cur.len() != count.saturating_mul(10) {
+                return None;
+            }
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                let r = read_u32(&mut cur)?;
+                let c = read_u32(&mut cur)?;
+                let idx = read_u16(&mut cur)?;
+                items.push((r, c, idx));
+            }
+            Some(Msg::StylePaletteOp {
+                site,
+                sheet,
+                ts,
+                palette,
+                items,
+            })
+        }
+        COMPACT_TAG_STYLE_PALETTE_SNAP => {
+            let pal_bytes = read_bytes(&mut cur, MAX_COMPACT_PALETTE_JSON_BYTES)?;
+            let palette: Vec<crate::style::CellStyle> = serde_json::from_slice(pal_bytes).ok()?;
+            let count = read_u32(&mut cur)? as usize;
+            if count > MAX_BATCH_ITEMS || cur.len() != count.saturating_mul(14) {
+                return None;
+            }
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                let sh = read_u32(&mut cur)? as usize;
+                let r = read_u32(&mut cur)?;
+                let c = read_u32(&mut cur)?;
+                let idx = read_u16(&mut cur)?;
+                items.push((sh, r, c, idx));
+            }
+            Some(Msg::StylePaletteSnapshot { palette, items })
+        }
+        COMPACT_TAG_CURSOR => {
+            let site = read_u32(&mut cur)?;
+            let color = read_u8(&mut cur)?;
+            let sheet = read_u32(&mut cur)? as usize;
+            let row = read_u32(&mut cur)?;
+            let col = read_u32(&mut cur)?;
+            let nlen = read_u16(&mut cur)? as usize;
+            if cur.len() != nlen {
+                return None;
+            }
+            let name = std::str::from_utf8(cur).ok()?.to_string();
+            Some(Msg::CursorMsg(Cursor {
+                site,
+                name,
+                color,
+                sheet,
+                row,
+                col,
+            }))
+        }
+        COMPACT_TAG_WATERMARK => {
+            let seq = read_u64(&mut cur)?;
+            let structure_revision = usize::try_from(read_u64(&mut cur)?).ok()?;
+            cur.is_empty().then_some(Msg::Watermark {
+                seq,
+                structure_revision,
+            })
+        }
+        COMPACT_TAG_UPDATE_SLICE => {
+            let from_site = read_u32(&mut cur)?;
+            let to_site = read_u32(&mut cur)?;
+            let offset = read_u64(&mut cur)?;
+            let total = read_u64(&mut cur)?;
+            let done = read_u8(&mut cur)? != 0;
+            let vlen = read_u8(&mut cur)? as usize;
+            if cur.len() < vlen + 4 {
+                return None;
+            }
+            let (vb, rest) = cur.split_at(vlen);
+            cur = rest;
+            let version = std::str::from_utf8(vb).ok()?.to_string();
+            let raw_bytes = read_bytes(&mut cur, 384 * 1024)?;
+            if !cur.is_empty() {
+                return None;
+            }
+            Some(Msg::UpdateSlice {
+                from_site,
+                to_site,
+                version,
+                offset,
+                total,
+                data_b64: String::new(),
+                raw_data: raw_bytes.to_vec(),
+                done,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// 按矩形范围稀疏遍历工作表非空单元格（跳过空白页与空白列块）
 pub fn iter_sheet_rect(
     sheet: &Sheet,
     rect: (u32, u32, u32, u32),
 ) -> impl Iterator<Item = (crate::model::CellRef, std::borrow::Cow<'_, Cell>)> {
     sheet.cells().iter_rect(rect)
+}
+
+/// 构造仅保留公式求值与格式化所需字段的轻量级 CoW 工作簿快照，
+/// 避免后台只读计算/AI 复核深拷贝图片、图表、批注、条件格式、数据验证与透视表缓存。
+pub fn calc_snapshot_workbook(wb: &crate::model::Workbook) -> crate::model::Workbook {
+    let mut out = crate::model::Workbook::new_blank();
+    out.names = wb.names.clone();
+    out.links = wb.links.clone();
+    out.styles = wb.styles.clone();
+    out.path = wb.path.clone();
+    out.date_system = wb.date_system;
+    out.calc_manual = wb.calc_manual;
+    out.calc_iterate = wb.calc_iterate;
+    out.calc_max_iterations = wb.calc_max_iterations;
+    out.calc_max_change = wb.calc_max_change;
+    out.calc_pending = wb.calc_pending;
+    out.calc_pending_sheets = wb.calc_pending_sheets.clone();
+    out.sheets = wb
+        .sheets
+        .iter()
+        .map(|sh| {
+            let mut snap = sh.search_snapshot();
+            snap.shared_lookup = sh.shared_lookup.clone();
+            snap.cleared = sh.cleared.clone();
+            snap.spilled = sh.spilled.clone();
+            snap.spill_shapes = sh.spill_shapes.clone();
+            snap.arrays = sh.arrays.clone();
+            snap.tables = sh.tables.clone();
+            snap.merges = sh.merges.clone();
+            snap.cols = sh.cols.clone();
+            snap.rows = sh.rows.clone();
+            snap.hidden_rows = sh.hidden_rows.clone();
+            snap.hidden_rows_user = sh.hidden_rows_user.clone();
+            snap.hidden_cols = sh.hidden_cols.clone();
+            snap.filter = sh.filter.clone();
+            snap
+        })
+        .collect();
+    out
+}
+
+/// 将后台监督线程组装完成的列式快照无损移交至加入者工作簿：
+/// - 先清空现有全部工作表的单元格、动态溢出与显式单元格/整行/整列样式（包含快照未触及的尾表），
+/// - 100% 保留每张工作表的 `name`、`identity`、`source_part`、`cols`/`rows`（列宽行高）、`freeze`、
+///   `charts`、`pictures`、`cf`、`dv`、`notes`、`tables`、`filter`、隐藏行列及原文件基础 `merges`，
+/// - 保留原文件 `StyleTable` 的 `themes`/`patterns`/`quotes`（已用 `&wb.styles` 作种子时 `O(1)` 替换，未作种子时自动重映射），
+/// - 最后按序回放房间增量 `merge_ops`（含 `on == false` 拆并原文件基础合并格）。
+pub fn install_guest_snapshot_into_workbook(
+    wb: &mut crate::model::Workbook,
+    src_sheets: Vec<Sheet>,
+    src_styles: crate::style::StyleTable,
+    has_seed_styles: bool,
+    merge_ops: &[(usize, u32, u32, u32, u32, bool)],
+) {
+    let mut prior_state = Vec::with_capacity(wb.sheets.len());
+    for dst in &mut wb.sheets {
+        let had_cells = !dst.is_empty();
+        let old_styles = std::mem::take(&mut dst.styles);
+        let old_row_styles = std::mem::take(&mut dst.row_styles);
+        let old_col_styles = std::mem::take(&mut dst.col_styles);
+        prior_state.push((had_cells, old_styles, old_row_styles, old_col_styles));
+        dst.clear();
+        dst.spilled.clear();
+        dst.spill_shapes.clear();
+        dst.shared_lookup = Default::default();
+        dst.coordinates_shifted();
+    }
+
+    let trivial_base_styles = wb.styles.is_empty()
+        || (wb.styles.len() == 1
+            && !src_styles.is_empty()
+            && wb.styles.get(0) == src_styles.get(0)
+            && wb.styles.theme_of(0) == Default::default()
+            && wb.styles.pattern_of(0).is_none()
+            && !wb.styles.quote_of(0));
+
+    if has_seed_styles || trivial_base_styles {
+        wb.styles = src_styles;
+        for (si, mut src) in src_sheets.into_iter().enumerate() {
+            if let Some(dst) = wb.sheets.get_mut(si) {
+                dst.replace_cell_store(src.cells().clone());
+                dst.row_styles = std::mem::take(&mut src.row_styles);
+                dst.col_styles = std::mem::take(&mut src.col_styles);
+                dst.styles = std::mem::take(&mut src.styles);
+                dst.coordinates_shifted();
+            } else {
+                src.loading = false;
+                src.edited = !src.is_empty()
+                    || !src.styles.is_empty()
+                    || !src.row_styles.is_empty()
+                    || !src.col_styles.is_empty();
+                src.row_styles_dirty = !src.row_styles.is_empty();
+                src.col_styles_dirty = !src.col_styles.is_empty();
+                src.styles_dirty =
+                    !src.styles.is_empty() || src.row_styles_dirty || src.col_styles_dirty;
+                wb.sheets.push(src);
+            }
+        }
+    } else {
+        let mut remap = Vec::with_capacity(src_styles.len());
+        remap.push(0u16);
+        for idx in 1..src_styles.len() {
+            remap.push(wb.styles.intern(src_styles.get(idx as u16).clone()));
+        }
+        let map_id = |id: u16| -> u16 {
+            if id == 0 {
+                0
+            } else {
+                remap.get(id as usize).copied().unwrap_or(0)
+            }
+        };
+        for (si, src) in src_sheets.into_iter().enumerate() {
+            if si >= wb.sheets.len() {
+                let mut extra = Sheet::new(src.name.clone());
+                extra.loading = false;
+                wb.sheets.push(extra);
+            }
+            let dst = &mut wb.sheets[si];
+            dst.replace_cell_store(src.cells().clone());
+            for (&r, &id) in &src.row_styles {
+                dst.set_row_style_loaded(r, map_id(id));
+            }
+            for (&c, &id) in &src.col_styles {
+                dst.set_col_style_loaded(c, map_id(id));
+            }
+            for (pos, &id) in src.styles.iter() {
+                dst.set_style_loaded(pos.row, pos.col, map_id(id));
+            }
+            if si >= prior_state.len() {
+                dst.row_styles_dirty = !dst.row_styles.is_empty();
+                dst.col_styles_dirty = !dst.col_styles.is_empty();
+                dst.styles_dirty =
+                    !dst.styles.is_empty() || dst.row_styles_dirty || dst.col_styles_dirty;
+                dst.edited = !dst.is_empty() || dst.styles_dirty;
+            }
+            dst.coordinates_shifted();
+        }
+    }
+
+    for (si, (had_cells, old_styles, old_row_styles, old_col_styles)) in
+        prior_state.into_iter().enumerate()
+    {
+        let dst = &mut wb.sheets[si];
+        if had_cells || !dst.is_empty() {
+            dst.edited = true;
+        }
+        if dst.row_styles != old_row_styles {
+            dst.row_styles_dirty = true;
+            dst.styles_dirty = true;
+            dst.edited = true;
+        }
+        if dst.col_styles != old_col_styles {
+            dst.col_styles_dirty = true;
+            dst.styles_dirty = true;
+            dst.edited = true;
+        }
+        if dst.styles != old_styles {
+            dst.styles_dirty = true;
+            dst.edited = true;
+        }
+    }
+
+    for &(sheet, r1, c1, r2, c2, on) in merge_ops {
+        while wb.sheets.len() <= sheet {
+            let idx = wb.sheets.len() + 1;
+            wb.sheets.push(Sheet::new(format!("Sheet{idx}")));
+        }
+        if on {
+            wb.sheets[sheet].merge_range(r1, c1, r2, c2);
+        } else {
+            wb.sheets[sheet].unmerge_range(r1, c1, r2, c2);
+        }
+    }
 }
 
 /// 宿主开房时的零拷贝 CoW 基准工作簿快照（基于 `Sheet::search_snapshot` 列块共享）
@@ -982,6 +1706,22 @@ impl BaselineBook {
             .get(sheet)
             .and_then(|sh| sh.get(row, col))
             .is_some()
+    }
+
+    #[inline]
+    pub fn cell_value_wire(
+        &self,
+        sheet: usize,
+        row: u32,
+        col: u32,
+    ) -> Option<(ValueWire, Option<Arc<str>>)> {
+        let cell = self.sheets.get(sheet)?.get(row, col)?;
+        Some((ValueWire::from(&cell.value), cell.formula.clone()))
+    }
+
+    #[inline]
+    pub fn cell_style_id(&self, sheet: usize, row: u32, col: u32) -> Option<u16> {
+        self.sheets.get(sheet)?.explicit_style_of(row, col)
     }
 
     pub fn cell_op(&self, sheet: usize, row: u32, col: u32) -> Option<Op> {
@@ -1794,5 +2534,222 @@ mod tests {
         }
         .is_within_limits());
         assert_eq!(decode_style_palette(&palette, &items).unwrap(), raw_items);
+    }
+
+    #[test]
+    fn compact_msg_codec_roundtrips_all_hot_variants_and_shrinks_wire_size() {
+        // 1. 覆盖全部 ValueWire 变体与公式的批量 Ops / SnapshotChunk
+        let ops: Vec<Op> = (0..200u32)
+            .map(|r| Op {
+                sheet: (r % 2) as usize,
+                row: r,
+                col: r % 8,
+                value: match r % 6 {
+                    0 => ValueWire::Number(r as f64 * 1.25),
+                    1 => ValueWire::Empty,
+                    2 => ValueWire::Bool(false),
+                    3 => ValueWire::Bool(true),
+                    4 => ValueWire::Text(format!("行{r}").into()),
+                    _ => ValueWire::Error("#DIV/0!".into()),
+                },
+                formula: (r % 5 == 0).then(|| format!("=A{}", r + 1).into()),
+                ts: 100 + u64::from(r),
+                site: 7,
+            })
+            .collect();
+
+        let refs: Vec<&Op> = ops.iter().collect();
+        let compact_chunk = encode_snapshot_chunk_ref_compact(&refs, true);
+        let json_chunk = serde_json::to_string(&SnapshotChunkRef {
+            t: "SnapshotChunk",
+            ops: &refs,
+            last: true,
+        })
+        .unwrap();
+        assert!(
+            compact_chunk.len() * 2 < json_chunk.len(),
+            "紧凑二进制批量帧应显著小于 JSON：compact={} vs json={}",
+            compact_chunk.len(),
+            json_chunk.len()
+        );
+        match decode_msg_compact(&compact_chunk).expect("decode compact chunk") {
+            Msg::SnapshotChunk { ops: got, last } => {
+                assert!(last);
+                assert_eq!(got, ops);
+            }
+            other => panic!("unexpected decoded msg: {other:?}"),
+        }
+
+        // 2. Arc<Op> 零克隆编码
+        let shared: Vec<Arc<Op>> = ops[..3].iter().cloned().map(Arc::new).collect();
+        let raw_arc = encode_arc_ops_compact(&shared);
+        match decode_msg_compact(&raw_arc).expect("decode arc ops") {
+            Msg::Ops { ops: got } => assert_eq!(got, ops[..3]),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 3. 调色板样式、光标、水位线与 JSON 兜底控制帧
+        let mut st = crate::style::CellStyle::default();
+        st.bold = true;
+        let pal_op = Msg::StylePaletteOp {
+            site: 3,
+            sheet: 1,
+            ts: 55,
+            palette: vec![st.clone()],
+            items: vec![(10, 2, 0), (11, 2, 0)],
+        };
+        let raw_pal = encode_msg_compact(&pal_op);
+        match decode_msg_compact(&raw_pal).unwrap() {
+            Msg::StylePaletteOp { site, sheet, ts, palette, items } => {
+                assert_eq!((site, sheet, ts, palette, items), (3, 1, 55, vec![st.clone()], vec![(10, 2, 0), (11, 2, 0)]));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let wm = Msg::Watermark { seq: 9876, structure_revision: 4 };
+        assert!(matches!(
+            decode_msg_compact(&encode_msg_compact(&wm)),
+            Some(Msg::Watermark { seq: 9876, structure_revision: 4 })
+        ));
+
+        let cur = Msg::CursorMsg(Cursor {
+            site: 2,
+            name: "张三".into(),
+            color: 2,
+            sheet: 0,
+            row: 8,
+            col: 4,
+        });
+        assert!(matches!(
+            decode_msg_compact(&encode_msg_compact(&cur)),
+            Some(Msg::CursorMsg(ref c)) if c.name == "张三" && (c.row, c.col) == (8, 4)
+        ));
+
+        let rename = Msg::Rename { site: 2, name: "新名字".into() };
+        assert!(matches!(
+            decode_msg_compact(&encode_msg_compact(&rename)),
+            Some(Msg::Rename { site: 2, ref name }) if name == "新名字"
+        ));
+
+        // 4. 原生二进制 UpdateSlice（零 Base64 + 站点头快速窥探 + 繁忙拒绝信号）
+        let bin_slice = encode_update_slice_compact(2, 5, "1.77", 196_608, 600_000, &[0xAB, 0xCD, 0xEF], false);
+        assert_eq!(peek_compact_update_slice_target(&bin_slice), Some((2, 5)));
+        let decoded_slice = decode_msg_compact(&bin_slice).expect("decode binary UpdateSlice");
+        assert!(decoded_slice.is_within_limits());
+        match decoded_slice {
+            Msg::UpdateSlice { from_site, to_site, version, offset, total, data_b64, raw_data, done } => {
+                assert_eq!((from_site, to_site, version.as_str(), offset, total, done), (2, 5, "1.77", 196_608, 600_000, false));
+                assert!(data_b64.is_empty());
+                assert_eq!(raw_data, vec![0xAB, 0xCD, 0xEF]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let busy_reject = encode_update_slice_compact(2, 5, "1.77", 0, 0, &[], true);
+        let decoded_reject = decode_msg_compact(&busy_reject).expect("decode busy reject");
+        assert!(decoded_reject.is_within_limits());
+    }
+
+    #[test]
+    fn install_guest_snapshot_preserves_sheet_metadata_themes_and_save_dirty_flags() {
+        let mut wb = crate::model::Workbook::new_blank();
+        // 单样式原表挂载主题色与 quotePrefix，验证无种子重映射也不会覆盖索引 0 样式扩展
+        let custom_theme = crate::style_theme::XfTheme {
+            font: Some(crate::style_theme::ThemeRef { idx: 4, tint: 0.25 }),
+            fill: None,
+        };
+        wb.styles.set_theme(0, custom_theme);
+        wb.styles.set_quote(0, true);
+
+        let sh0 = &mut wb.sheets[0];
+        sh0.cols.set(0, 165.0);
+        sh0.rows.set(0, 28.0);
+        sh0.freeze = Some((1, 1));
+        sh0.merge_range(4, 0, 5, 1);
+        sh0.merge_range(7, 0, 8, 1);
+        sh0.cf.blocks.push(crate::cf::CfBlock {
+            ranges: vec![(0, 0, 10, 0)],
+            rules: Vec::new(),
+        });
+        sh0.dv.push(crate::dv::DataValidation {
+            ranges: vec![(0, 0, 5, 0)],
+            kind: crate::dv::DvKind::List,
+            op: crate::dv::DvOp::Between,
+            f1: "A,B,C".into(),
+            f2: String::new(),
+            allow_blank: true,
+            show_dropdown: true,
+            error_style: crate::dv::DvStyle::Stop,
+            show_error: true,
+            show_prompt: false,
+            error_title: String::new(),
+            error_msg: String::new(),
+            prompt_title: String::new(),
+            prompt_msg: String::new(),
+        });
+        sh0.tables.push(crate::table::Table {
+            name: "TblBudget".into(),
+            display: "TblBudget".into(),
+            range: (0, 0, 3, 1),
+            columns: vec!["科目".into(), "金额".into()],
+            column_ids: vec![1, 2],
+            header_row: true,
+            totals_row: false,
+        });
+        sh0.charts.push(crate::charts::Chart {
+            kind: crate::charts::ChartKind::Column,
+            title: "预算柱状图".into(),
+            series: Vec::new(),
+            legend: true,
+            anchor: (0, 3, 10, 8),
+            legend_pos: "r".into(),
+            part: "xl/charts/chart1.xml".into(),
+            drawing: "xl/drawings/drawing1.xml".into(),
+            show_labels: false,
+            label_opts: Default::default(),
+            radar_style: String::new(),
+            ref_fixes: Vec::new(),
+            axis_x: String::new(),
+            axis_y: String::new(),
+            y_fmt: String::new(),
+            y_min: None,
+            y_max: None,
+        });
+        sh0.edited = false;
+        sh0.styles_dirty = false;
+        sh0.merges_dirty = false;
+
+        let mut src_styles = crate::style::StyleTable::new();
+        let mut bold = crate::style::CellStyle::default();
+        bold.bold = true;
+        let bold_src_id = src_styles.intern(bold);
+
+        let mut src_sh0 = Sheet::new("Sheet1");
+        src_sh0.loading = true;
+        src_sh0.set(0, 0, Cell { value: Value::Number(88.0), formula: None });
+        src_sh0.set_style_loaded(0, 0, bold_src_id);
+
+        install_guest_snapshot_into_workbook(
+            &mut wb,
+            vec![src_sh0],
+            src_styles,
+            false,
+            &[(0, 7, 0, 8, 1, false), (0, 1, 0, 2, 1, true)],
+        );
+
+        assert_eq!(wb.styles.theme_of(0), custom_theme);
+        assert!(wb.styles.quote_of(0));
+        assert_eq!(wb.sheets[0].value(0, 0), Value::Number(88.0));
+        assert!(wb.styles.get(wb.sheets[0].style_of(0, 0)).bold);
+        assert!(wb.sheets[0].edited && wb.sheets[0].styles_dirty);
+        assert!((wb.sheets[0].cols.pos(1) - 165.0).abs() < 0.05);
+        assert!((wb.sheets[0].rows.pos(1) - 28.0).abs() < 0.05);
+        assert_eq!(wb.sheets[0].freeze, Some((1, 1)));
+        assert_eq!(wb.sheets[0].cf.blocks.len(), 1);
+        assert_eq!(wb.sheets[0].dv.len(), 1);
+        assert_eq!(wb.sheets[0].tables.len(), 1);
+        assert_eq!(wb.sheets[0].charts.len(), 1);
+        assert_eq!(wb.sheets[0].merge_at(4, 0), Some((4, 0, 5, 1)));
+        assert_eq!(wb.sheets[0].merge_at(7, 0), None);
+        assert_eq!(wb.sheets[0].merge_at(1, 0), Some((1, 0, 2, 1)));
     }
 }

@@ -44,7 +44,7 @@ pub const TRAILER_MAGIC: &[u8; 8] = b"CLNUPD01";
 
 const MAX_MANIFEST_BYTES: usize = 8 * 1024;
 const MAX_EXE_BYTES: u64 = 256 * 1024 * 1024;
-const IO_BUF_BYTES: usize = 64 * 1024;
+const IO_BUF_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Remote {
@@ -1086,8 +1086,10 @@ fn read_http_response_head(
     Ok((code, content_len))
 }
 
-/// 检查单个内网 HTTP 更新源是否有经过合法签名的新版本
-pub fn check_http(base_url: &str) -> Result<Option<AvailableUpdate>, String> {
+fn check_http_with_pubkey(
+    base_url: &str,
+    pubkey_hex: Option<&str>,
+) -> Result<(Option<AvailableUpdate>, String), String> {
     let parsed = parse_http_base(base_url)?;
     let mut stream = connect_http_direct(&parsed, Duration::from_millis(2_200))?;
     let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
@@ -1123,28 +1125,42 @@ pub fn check_http(base_url: &str) -> Result<Option<AvailableUpdate>, String> {
     let text = String::from_utf8(body).map_err(|_| "manifest.txt 不是合法 UTF-8".to_string())?;
     let manifest =
         parse_signed_manifest(&text).ok_or_else(|| "远端 manifest.txt 缺少签名或格式无效".to_string())?;
-    if !verify_manifest_sig(&manifest) {
+    let sig_ok = pubkey_hex.is_some_and(|pk| verify_manifest_sig_with_pubkey(&manifest, pk));
+    if !sig_ok {
         return Err("远端 manifest.txt 数字签名不匹配，已忽略".into());
     }
     let clean_url = base_url.trim().trim_end_matches('/').to_string();
-    remember_http_url(&clean_url);
     if !is_newer(&manifest.version, VERSION) {
-        return Ok(None);
+        return Ok((None, clean_url));
     }
-    Ok(Some(AvailableUpdate {
-        manifest,
-        source: UpdateSource::Http {
-            base_url: clean_url,
-        },
-    }))
+    Ok((
+        Some(AvailableUpdate {
+            manifest,
+            source: UpdateSource::Http {
+                base_url: clean_url.clone(),
+            },
+        }),
+        clean_url,
+    ))
 }
 
-/// 检查共享目录（若包含合法签名清单则支持一键自动更新；若为旧式无签名清单则仅提示）
-pub fn check_shared_dir(dir: &Path) -> Result<Option<AvailableUpdate>, String> {
+/// 检查单个内网 HTTP 更新源是否有经过合法签名的新版本
+pub fn check_http(base_url: &str) -> Result<Option<AvailableUpdate>, String> {
+    let pk = active_pubkey_hex();
+    let (avail, clean_url) = check_http_with_pubkey(base_url, pk.as_deref())?;
+    remember_http_url(&clean_url);
+    Ok(avail)
+}
+
+fn check_shared_dir_with_pubkey(
+    dir: &Path,
+    pubkey_hex: Option<&str>,
+) -> Result<Option<AvailableUpdate>, String> {
     let text = std::fs::read_to_string(dir.join("manifest.txt"))
         .map_err(|e| format!("读取共享目录 manifest.txt 失败：{e}"))?;
     if let Some(signed) = parse_signed_manifest(&text) {
-        if !verify_manifest_sig(&signed) {
+        let sig_ok = pubkey_hex.is_some_and(|pk| verify_manifest_sig_with_pubkey(&signed, pk));
+        if !sig_ok {
             return Err("共享盘更新包签名校验失败，已拒绝".into());
         }
         if !is_newer(&signed.version, VERSION) {
@@ -1180,29 +1196,100 @@ pub fn check_shared_dir(dir: &Path) -> Result<Option<AvailableUpdate>, String> {
     }
 }
 
-/// 按顺序探测所有已配置更新源（HTTP 发版源优先，其次共享目录）
+/// 检查共享目录（若包含合法签名清单则支持一键自动更新；若为旧式无签名清单则仅提示）
+pub fn check_shared_dir(dir: &Path) -> Result<Option<AvailableUpdate>, String> {
+    let pk = active_pubkey_hex();
+    check_shared_dir_with_pubkey(dir, pk.as_deref())
+}
+
+fn is_unc_network_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.starts_with(r"\\") || s.starts_with("//")
+}
+
+/// 并行探测所有已配置 HTTP 更新源，回退检查共享目录（UNC 共享带 3 秒超时保护，防离线卡死）
 pub fn probe_all_sources() -> Result<Option<AvailableUpdate>, String> {
     let urls = candidate_http_urls();
-    let shared = dir().filter(|p| p.is_dir());
-    if urls.is_empty() && shared.is_none() {
+    let raw_shared = dir();
+    if urls.is_empty() && raw_shared.is_none() {
         return Err("尚未配置更新源（将在与新版同事协作时自动同步）".into());
     }
+    let pk = active_pubkey_hex();
     let mut last_err: Option<String> = None;
     let mut any_reachable = false;
-    for u in &urls {
-        match check_http(u) {
-            Ok(Some(avail)) => return Ok(Some(avail)),
-            Ok(None) => any_reachable = true,
+
+    if urls.len() == 1 {
+        match check_http_with_pubkey(&urls[0], pk.as_deref()) {
+            Ok((Some(avail), clean_url)) => {
+                remember_http_url(&clean_url);
+                return Ok(Some(avail));
+            }
+            Ok((None, clean_url)) => {
+                remember_http_url(&clean_url);
+                any_reachable = true;
+            }
             Err(e) => last_err = Some(e),
         }
-    }
-    if let Some(d) = shared {
-        match check_shared_dir(&d) {
-            Ok(Some(avail)) => return Ok(Some(avail)),
-            Ok(None) => any_reachable = true,
-            Err(e) => last_err = Some(e),
+    } else if urls.len() > 1 {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let total = urls.len();
+        for (idx, u) in urls.into_iter().enumerate() {
+            let tx_i = tx.clone();
+            let pk_i = pk.clone();
+            std::thread::spawn(move || {
+                let res = check_http_with_pubkey(&u, pk_i.as_deref());
+                let _ = tx_i.send((idx, res));
+            });
+        }
+        drop(tx);
+        for _ in 0..total {
+            let Ok((_idx, res)) = rx.recv() else { break };
+            match res {
+                Ok((Some(avail), clean_url)) => {
+                    remember_http_url(&clean_url);
+                    return Ok(Some(avail));
+                }
+                Ok((None, clean_url)) => {
+                    remember_http_url(&clean_url);
+                    any_reachable = true;
+                }
+                Err(e) => last_err = Some(e),
+            }
         }
     }
+
+    if let Some(d) = raw_shared {
+        if is_unc_network_path(&d) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let pk_s = pk.clone();
+            std::thread::spawn(move || {
+                let res = if d.is_dir() {
+                    Some(check_shared_dir_with_pubkey(&d, pk_s.as_deref()))
+                } else {
+                    None
+                };
+                let _ = tx.send(res);
+            });
+            match rx.recv_timeout(Duration::from_secs(3)) {
+                Ok(Some(Ok(Some(avail)))) => return Ok(Some(avail)),
+                Ok(Some(Ok(None))) => any_reachable = true,
+                Ok(Some(Err(e))) => last_err = Some(e),
+                Ok(None) => {}
+                Err(_) => {
+                    if last_err.is_none() {
+                        last_err = Some("共享盘更新目录响应超时".into());
+                    }
+                }
+            }
+        } else if d.is_dir() {
+            match check_shared_dir_with_pubkey(&d, pk.as_deref()) {
+                Ok(Some(avail)) => return Ok(Some(avail)),
+                Ok(None) => any_reachable = true,
+                Err(e) => last_err = Some(e),
+            }
+        }
+    }
+
     if any_reachable {
         Ok(None)
     } else {
@@ -1559,6 +1646,12 @@ pub fn serve_updates_blocking(dir: &Path, port: u16) -> std::io::Result<()> {
     serve_updates_on_listener(listener, dir.to_path_buf(), None)
 }
 
+#[derive(Default)]
+struct ServerManifestCache {
+    raw_bytes: Vec<u8>,
+    allowed_exe: Option<String>,
+}
+
 pub fn serve_updates_on_listener(
     listener: TcpListener,
     dir: PathBuf,
@@ -1568,6 +1661,7 @@ pub fn serve_updates_on_listener(
         listener.set_nonblocking(true)?;
     }
     let active = Arc::new(AtomicUsize::new(0));
+    let manifest_cache = Arc::new(std::sync::Mutex::new(ServerManifestCache::default()));
     loop {
         if stop_flag
             .as_ref()
@@ -1590,16 +1684,42 @@ pub fn serve_updates_on_listener(
         active.fetch_add(1, Ordering::Relaxed);
         let active_clone = active.clone();
         let dir_clone = dir.clone();
+        let cache_clone = manifest_cache.clone();
         std::thread::spawn(move || {
             let _ = stream.set_nonblocking(false);
-            let _ = handle_update_http_conn(stream, &dir_clone);
+            let _ = handle_update_http_conn(stream, &dir_clone, &cache_clone);
             active_clone.fetch_sub(1, Ordering::Relaxed);
         });
     }
     Ok(())
 }
 
-fn handle_update_http_conn(mut stream: TcpStream, dir: &Path) -> std::io::Result<()> {
+fn resolve_allowed_exe_cached(
+    dir: &Path,
+    cache: &std::sync::Mutex<ServerManifestCache>,
+) -> Option<String> {
+    let bytes = std::fs::read(dir.join("manifest.txt")).ok()?;
+    if let Ok(guard) = cache.lock()
+        && guard.raw_bytes == bytes
+    {
+        return guard.allowed_exe.clone();
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let allowed = parse_signed_manifest(text)
+        .map(|m| m.exe)
+        .or_else(|| parse_manifest(text).map(|(_, e, _)| e));
+    if let Ok(mut guard) = cache.lock() {
+        guard.raw_bytes = bytes;
+        guard.allowed_exe = allowed.clone();
+    }
+    allowed
+}
+
+fn handle_update_http_conn(
+    mut stream: TcpStream,
+    dir: &Path,
+    cache: &std::sync::Mutex<ServerManifestCache>,
+) -> std::io::Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(120)));
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -1654,16 +1774,10 @@ fn handle_update_http_conn(mut stream: TcpStream, dir: &Path) -> std::io::Result
     if !is_safe_exe_filename(requested_name) {
         return write_simple_http(&mut stream, 404, "Not Found", b"not found");
     }
-    let Ok(manifest_text) = std::fs::read_to_string(dir.join("manifest.txt")) else {
+    let Some(allowed_exe) = resolve_allowed_exe_cached(dir, cache) else {
         return write_simple_http(&mut stream, 404, "Not Found", b"manifest missing");
     };
-    let allowed_exe = parse_signed_manifest(&manifest_text)
-        .map(|m| m.exe)
-        .or_else(|| parse_manifest(&manifest_text).map(|(_, e, _)| e));
-    if !allowed_exe
-        .as_deref()
-        .is_some_and(|e| e.eq_ignore_ascii_case(requested_name))
-    {
+    if !allowed_exe.eq_ignore_ascii_case(requested_name) {
         return write_simple_http(&mut stream, 404, "Not Found", b"not found");
     }
 
