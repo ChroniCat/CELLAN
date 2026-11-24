@@ -486,6 +486,8 @@ pub enum Msg {
         resume_watermark: u64,
         #[serde(default)]
         resume_struct_rev: usize,
+        #[serde(default)]
+        binary_v3: bool,
     },
     /// 本机显示名变更（不改变 site；宿主转发给其他参与者）
     Rename { site: u32, name: String },
@@ -511,6 +513,8 @@ pub enum Msg {
         watermark: u64,
         #[serde(default)]
         structure_revision: usize,
+        #[serde(default)]
+        binary_v3: bool,
     },
     Snapshot { ops: Vec<Op> },
     /// 大文件分片下发（last=1 表示这是最后一片）
@@ -1187,7 +1191,9 @@ fn sort_permutation_validates_bounds_and_defaults_old_hello_to_legacy() {
     sort.horizontal = false;
     assert!(!sort.valid());
     let hello: Msg = serde_json::from_str(r#"{"t":"Hello","site":1,"name":"a","doc":"d","proof":"p"}"#).unwrap();
-    assert!(matches!(hello,Msg::Hello { sort_permutation: false, palette_styles: false, resume_watermark: 0, .. }));
+    assert!(matches!(hello,Msg::Hello { sort_permutation: false, palette_styles: false, resume_watermark: 0, binary_v3: false, .. }));
+    let welcome: Msg = serde_json::from_str(r#"{"t":"Welcome","site":2,"doc":"d","peers":[]}"#).unwrap();
+    assert!(matches!(welcome, Msg::Welcome { binary_v3: false, .. }));
 }
 
 #[test]
