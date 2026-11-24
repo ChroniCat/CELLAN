@@ -20,6 +20,41 @@ unsafe extern "system" {
     fn GetClipboardData(format: u32) -> *mut c_void;
     fn IsClipboardFormatAvailable(format: u32) -> i32;
     fn RegisterClipboardFormatW(name: *const u16) -> u32;
+    #[cfg(not(test))]
+    fn GetClipboardSequenceNumber() -> u32;
+}
+
+static LAST_INTERNAL_CLIP_SEQ: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// O(1) Win32 clipboard sequence counter (`GetClipboardSequenceNumber`), zero `OpenClipboard` lock.
+#[inline]
+pub fn clipboard_sequence_number() -> u32 {
+    #[cfg(test)]
+    {
+        crate::TEST_CLIP_GEN.with(|seq| seq.get() as u32)
+    }
+    #[cfg(not(test))]
+    unsafe {
+        GetClipboardSequenceNumber()
+    }
+}
+
+/// Record the current Win32 clipboard sequence number as owned by CELLAN's internal copy.
+#[inline]
+pub fn record_internal_clipboard_seq() {
+    LAST_INTERNAL_CLIP_SEQ.store(
+        clipboard_sequence_number(),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Returns `true` in O(1) when another process modified the system clipboard after CELLAN's last copy.
+#[inline]
+pub fn is_external_clipboard() -> bool {
+    let cur = clipboard_sequence_number();
+    let last = LAST_INTERNAL_CLIP_SEQ.load(std::sync::atomic::Ordering::Acquire);
+    cur != 0 && cur != last
 }
 
 #[link(name = "user32")]
@@ -187,8 +222,13 @@ pub enum RichClipboard {
 ///（不再二次读剪贴板、不再构建双份稠密矩阵、超阈值时不跌落慢速 `parse_html`）；
 /// 仅当剪贴板不存在 XMLSS 时才读取 `"HTML Format"`。
 pub fn read_rich_table() -> Option<RichClipboard> {
+    read_rich_table_ext(false)
+}
+
+pub fn read_rich_table_ext(values_only: bool) -> Option<RichClipboard> {
     #[cfg(test)]
     {
+        let _ = values_only;
         return None;
     }
     #[cfg(not(test))]
@@ -196,9 +236,14 @@ pub fn read_rich_table() -> Option<RichClipboard> {
         let xml_fmt = RegisterClipboardFormatW(wide("XML Spreadsheet").as_ptr());
         if xml_fmt != 0 && IsClipboardFormatAvailable(xml_fmt) != 0 {
             if let Some(raw) = read_format_raw(xml_fmt) {
-                let text = String::from_utf8_lossy(&raw);
+                let text = match std::str::from_utf8(&raw) {
+                    Ok(s) => std::borrow::Cow::Borrowed(s),
+                    Err(_) => String::from_utf8_lossy(&raw),
+                };
                 let xml = text.trim_end_matches('\0');
-                if let Some(sparse) = sheetcore::clipboard_xmlss::parse_sparse(xml) {
+                if let Some(sparse) =
+                    sheetcore::clipboard_xmlss::parse_sparse_ext(xml, values_only)
+                {
                     if sparse.rows > 0 && sparse.cols > 0 {
                         return Some(RichClipboard::Sparse(sparse));
                     }
@@ -215,6 +260,23 @@ pub fn read_rich_table() -> Option<RichClipboard> {
             }
         }
         read_html_table().map(RichClipboard::Block)
+    }
+}
+
+/// Read raw `"XML Spreadsheet"` bytes once from the system clipboard so callers can invoke
+/// zero-copy `sheetcore::clipboard_xmlss::parse_sparse_borrowed` / `apply_sparse_xmlss_to_sheet`.
+pub fn read_raw_xmlss() -> Option<Vec<u8>> {
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    unsafe {
+        let fmt = RegisterClipboardFormatW(wide("XML Spreadsheet").as_ptr());
+        if fmt == 0 || IsClipboardFormatAvailable(fmt) == 0 {
+            return None;
+        }
+        read_format_raw(fmt)
     }
 }
 
@@ -768,30 +830,41 @@ fn read_format_raw(fmt: u32) -> Option<Vec<u8>> {
 // 写出：让 Excel/WPS 粘贴时也能拿到公式、数字格式和日期类型
 // ---------------------------------------------------------------------------
 
+#[inline]
+fn write_u64_010(dst: &mut [u8; 10], mut v: usize) {
+    for i in (0..10).rev() {
+        dst[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+}
+
 /// `CF_HTML` 头：Excel/WPS 都按这四个偏移切片段，偏移是**字节**数（UTF-8）。
+/// 单缓冲一次性预分配构造，消除中间 `String` 与 `format!` 二次整块拷贝。
 fn cf_html(fragment: &str) -> Vec<u8> {
-    // CF_HTML 必须是完整文档：只给片段时 Excel 认得出格式却粘不动（报「无法粘贴数据」）。
-    // 行尾用运行时构造的 CRLF，避免源码里的转义被行尾处理吃掉。
-    let crlf = String::from_utf8(vec![13u8, 10u8]).unwrap();
-    let head_tpl = format!(
-        "Version:1.0{crlf}StartHTML:0000000000{crlf}EndHTML:0000000000{crlf}StartFragment:0000000000{crlf}EndFragment:0000000000{crlf}"
-    );
-    let doc_head = "<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body>";
-    let doc_tail = "</body></html>";
-    let marker_s = "<!--StartFragment-->";
-    let marker_e = "<!--EndFragment-->";
-    let sf = head_tpl.len() + doc_head.len() + marker_s.len();
+    const HEAD_TPL: &[u8] = b"Version:1.0\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n";
+    const DOC_HEAD: &[u8] = b"<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body>";
+    const MARKER_S: &[u8] = b"<!--StartFragment-->";
+    const MARKER_E: &[u8] = b"<!--EndFragment-->";
+    const DOC_TAIL: &[u8] = b"</body></html>";
+
+    let head_len = HEAD_TPL.len();
+    let sf = head_len + DOC_HEAD.len() + MARKER_S.len();
     let ef = sf + fragment.len();
-    let end = ef + marker_e.len() + doc_tail.len();
-    let text = format!(
-        "Version:1.0{crlf}StartHTML:{:010}{crlf}EndHTML:{:010}{crlf}StartFragment:{:010}{crlf}EndFragment:{:010}{crlf}{doc_head}{marker_s}{fragment}{marker_e}{doc_tail}",
-        head_tpl.len(),
-        end,
-        sf,
-        ef
-    );
-    debug_assert_eq!(text.len(), end, "CF_HTML 偏移算错");
-    text.into_bytes()
+    let end = ef + MARKER_E.len() + DOC_TAIL.len();
+
+    let mut out = Vec::with_capacity(end);
+    out.extend_from_slice(HEAD_TPL);
+    write_u64_010((&mut out[23..33]).try_into().unwrap(), head_len);
+    write_u64_010((&mut out[43..53]).try_into().unwrap(), end);
+    write_u64_010((&mut out[69..79]).try_into().unwrap(), sf);
+    write_u64_010((&mut out[93..103]).try_into().unwrap(), ef);
+    out.extend_from_slice(DOC_HEAD);
+    out.extend_from_slice(MARKER_S);
+    out.extend_from_slice(fragment.as_bytes());
+    out.extend_from_slice(MARKER_E);
+    out.extend_from_slice(DOC_TAIL);
+    debug_assert_eq!(out.len(), end, "CF_HTML 偏移算错");
+    out
 }
 fn alloc_global(bytes: &[u8]) -> *mut c_void {
     const GMEM_MOVEABLE: u32 = 0x0002;
@@ -892,6 +965,9 @@ fn write_office_clipboard_native(xmlss: &str, html: &str, text: &str) -> bool {
         }
         if include_text {
             put(CF_UNICODETEXT, &text_utf16);
+        }
+        if ok {
+            record_internal_clipboard_seq();
         }
         CloseClipboard();
         ok
@@ -1028,7 +1104,12 @@ pub fn build_xmlss_rows(
         None
     };
 
-    let mut body = String::with_capacity(1024);
+    let est_rows = match (&visible_rows, &sparse_active_rows) {
+        (Some(v), _) => v.len(),
+        (None, Some(s)) => s.len(),
+        (None, None) => (r2 - r1 + 1) as usize,
+    };
+    let mut body = String::with_capacity(est_rows.saturating_mul(64).clamp(1024, 8 * 1024 * 1024));
     let mut expected_out_row: usize = 0;
 
     let mut emit_one_row = |out_row: usize, r: u32| {
@@ -1098,6 +1179,18 @@ pub fn build_xmlss_rows(
                     body.push_str("</Data></Cell>");
                 }
                 Some(sheetcore::Value::Number(n)) => {
+                    let push_num = |b: &mut String, val: f64| {
+                        b.push_str("><Data ss:Type=\"Number\">");
+                        let val = if val == 0.0 { 0.0 } else { val };
+                        let iv = val as i64;
+                        if (iv as f64) == val && iv.unsigned_abs() < 10_000_000_000_000_000 {
+                            let _ = std::fmt::Write::write_fmt(b, format_args!("{iv}"));
+                        } else {
+                            // SAFETY: `serde_json::to_writer` appends valid ASCII decimal bytes.
+                            let _ = serde_json::to_writer(unsafe { b.as_mut_vec() }, &val);
+                        }
+                        b.push_str("</Data></Cell>");
+                    };
                     if is_date_style(style) {
                         if let Some((y, m, d)) = wb.serial_to_date(*n) {
                             let _ = write!(
@@ -1105,10 +1198,10 @@ pub fn build_xmlss_rows(
                                 "><Data ss:Type=\"DateTime\">{y:04}-{m:02}-{d:02}T00:00:00.000</Data></Cell>"
                             );
                         } else {
-                            let _ = write!(body, "><Data ss:Type=\"Number\">{n}</Data></Cell>");
+                            push_num(&mut body, *n);
                         }
                     } else {
-                        let _ = write!(body, "><Data ss:Type=\"Number\">{n}</Data></Cell>");
+                        push_num(&mut body, *n);
                     }
                 }
                 Some(sheetcore::Value::Bool(b)) => {
@@ -1148,21 +1241,29 @@ pub fn build_xmlss_rows(
         (r2 - r1 + 1) as usize
     };
 
-    format!(
-        "<?xml version=\"1.0\"?>
-<?mso-application progid=\"Excel.Sheet\"?>
-<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\"
- xmlns:o=\"urn:schemas-microsoft-com:office:office\"
- xmlns:x=\"urn:schemas-microsoft-com:office:excel\"
- xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\"
- xmlns:html=\"http://www.w3.org/TR/REC-html40\">
-<Styles><Style ss:ID=\"Default\" ss:Name=\"Normal\"><Alignment ss:Vertical=\"Center\"/><Borders/><Font ss:FontName=\"等线\" ss:Size=\"11\"/><Interior/><NumberFormat/><Protection/></Style>{style_xml}</Styles>
-<Worksheet ss:Name=\"{}\"><Table ss:ExpandedColumnCount=\"{cols}\" ss:ExpandedRowCount=\"{rows}\">{body}</Table></Worksheet>
-</Workbook>",
-        xml_escape(&sh.name),
-        cols = c2 - c1 + 1,
-        rows = out_row_count
-    )
+    let cols = c2 - c1 + 1;
+    let rows = out_row_count;
+    let mut out = String::with_capacity(512 + style_xml.len() + body.len());
+    out.push_str(
+        "<?xml version=\"1.0\"?>\n\
+<?mso-application progid=\"Excel.Sheet\"?>\n\
+<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\"\n\
+ xmlns:o=\"urn:schemas-microsoft-com:office:office\"\n\
+ xmlns:x=\"urn:schemas-microsoft-com:office:excel\"\n\
+ xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\"\n\
+ xmlns:html=\"http://www.w3.org/TR/REC-html40\">\n\
+<Styles><Style ss:ID=\"Default\" ss:Name=\"Normal\"><Alignment ss:Vertical=\"Center\"/><Borders/><Font ss:FontName=\"等线\" ss:Size=\"11\"/><Interior/><NumberFormat/><Protection/></Style>",
+    );
+    out.push_str(&style_xml);
+    out.push_str("</Styles>\n<Worksheet ss:Name=\"");
+    xml_escape_into(&mut out, &sh.name);
+    let _ = write!(
+        out,
+        "\"><Table ss:ExpandedColumnCount=\"{cols}\" ss:ExpandedRowCount=\"{rows}\">"
+    );
+    out.push_str(&body);
+    out.push_str("</Table></Worksheet>\n</Workbook>");
+    out
 }
 
 fn xml_escape_into(out: &mut String, s: &str) {

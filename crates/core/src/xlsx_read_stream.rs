@@ -12,6 +12,221 @@ use std::sync::{Mutex, RwLock, mpsc};
 
 const READ_BUF_BYTES: usize = 256 * 1024;
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_avx2() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0);
+    match CACHED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let ok = std::arch::is_x86_feature_detected!("avx2");
+            CACHED.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+            ok
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn memchr_avx2(needle: u8, hay: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let len = hay.len();
+    let ptr = hay.as_ptr();
+    let vn = _mm256_set1_epi8(needle as i8);
+    let mut i = 0usize;
+    while i + 32 <= len {
+        let chunk = unsafe { _mm256_loadu_si256(ptr.add(i) as *const __m256i) };
+        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vn)) as u32;
+        if mask != 0 {
+            return Some(i + mask.trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+    while i < len {
+        if unsafe { *ptr.add(i) } == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn memchr2_avx2(n1: u8, n2: u8, hay: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let len = hay.len();
+    let ptr = hay.as_ptr();
+    let v1 = _mm256_set1_epi8(n1 as i8);
+    let v2 = _mm256_set1_epi8(n2 as i8);
+    let mut i = 0usize;
+    while i + 32 <= len {
+        let chunk = unsafe { _mm256_loadu_si256(ptr.add(i) as *const __m256i) };
+        let eq = _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v1), _mm256_cmpeq_epi8(chunk, v2));
+        let mask = _mm256_movemask_epi8(eq) as u32;
+        if mask != 0 {
+            return Some(i + mask.trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+    while i < len {
+        let b = unsafe { *ptr.add(i) };
+        if b == n1 || b == n2 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn memchr3_avx2(n1: u8, n2: u8, n3: u8, hay: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let len = hay.len();
+    let ptr = hay.as_ptr();
+    let v1 = _mm256_set1_epi8(n1 as i8);
+    let v2 = _mm256_set1_epi8(n2 as i8);
+    let v3 = _mm256_set1_epi8(n3 as i8);
+    let mut i = 0usize;
+    while i + 32 <= len {
+        let chunk = unsafe { _mm256_loadu_si256(ptr.add(i) as *const __m256i) };
+        let eq12 = _mm256_or_si256(_mm256_cmpeq_epi8(chunk, v1), _mm256_cmpeq_epi8(chunk, v2));
+        let eq = _mm256_or_si256(eq12, _mm256_cmpeq_epi8(chunk, v3));
+        let mask = _mm256_movemask_epi8(eq) as u32;
+        if mask != 0 {
+            return Some(i + mask.trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+    while i < len {
+        let b = unsafe { *ptr.add(i) };
+        if b == n1 || b == n2 || b == n3 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[inline]
+pub(crate) fn simd_memchr(needle: u8, hay: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if hay.len() >= 32 && has_avx2() {
+            return unsafe { memchr_avx2(needle, hay) };
+        }
+        use std::arch::x86_64::*;
+        let len = hay.len();
+        let ptr = hay.as_ptr();
+        let mut i = 0usize;
+        if len >= 16 {
+            let vn = unsafe { _mm_set1_epi8(needle as i8) };
+            while i + 16 <= len {
+                let chunk = unsafe { _mm_loadu_si128(ptr.add(i) as *const __m128i) };
+                let mask = unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, vn)) } as u32;
+                if mask != 0 {
+                    return Some(i + mask.trailing_zeros() as usize);
+                }
+                i += 16;
+            }
+        }
+        while i < len {
+            if unsafe { *ptr.add(i) } == needle {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        hay.iter().position(|&b| b == needle)
+    }
+}
+
+#[inline]
+pub(crate) fn simd_memchr2(n1: u8, n2: u8, hay: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if hay.len() >= 32 && has_avx2() {
+            return unsafe { memchr2_avx2(n1, n2, hay) };
+        }
+        use std::arch::x86_64::*;
+        let len = hay.len();
+        let ptr = hay.as_ptr();
+        let mut i = 0usize;
+        if len >= 16 {
+            let v1 = unsafe { _mm_set1_epi8(n1 as i8) };
+            let v2 = unsafe { _mm_set1_epi8(n2 as i8) };
+            while i + 16 <= len {
+                let chunk = unsafe { _mm_loadu_si128(ptr.add(i) as *const __m128i) };
+                let eq = unsafe { _mm_or_si128(_mm_cmpeq_epi8(chunk, v1), _mm_cmpeq_epi8(chunk, v2)) };
+                let mask = unsafe { _mm_movemask_epi8(eq) } as u32;
+                if mask != 0 {
+                    return Some(i + mask.trailing_zeros() as usize);
+                }
+                i += 16;
+            }
+        }
+        while i < len {
+            let b = unsafe { *ptr.add(i) };
+            if b == n1 || b == n2 {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        hay.iter().position(|&b| b == n1 || b == n2)
+    }
+}
+
+#[inline]
+pub(crate) fn simd_memchr3(n1: u8, n2: u8, n3: u8, hay: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if hay.len() >= 32 && has_avx2() {
+            return unsafe { memchr3_avx2(n1, n2, n3, hay) };
+        }
+        use std::arch::x86_64::*;
+        let len = hay.len();
+        let ptr = hay.as_ptr();
+        let mut i = 0usize;
+        if len >= 16 {
+            let v1 = unsafe { _mm_set1_epi8(n1 as i8) };
+            let v2 = unsafe { _mm_set1_epi8(n2 as i8) };
+            let v3 = unsafe { _mm_set1_epi8(n3 as i8) };
+            while i + 16 <= len {
+                let chunk = unsafe { _mm_loadu_si128(ptr.add(i) as *const __m128i) };
+                let eq12 = unsafe { _mm_or_si128(_mm_cmpeq_epi8(chunk, v1), _mm_cmpeq_epi8(chunk, v2)) };
+                let eq = unsafe { _mm_or_si128(eq12, _mm_cmpeq_epi8(chunk, v3)) };
+                let mask = unsafe { _mm_movemask_epi8(eq) } as u32;
+                if mask != 0 {
+                    return Some(i + mask.trailing_zeros() as usize);
+                }
+                i += 16;
+            }
+        }
+        while i < len {
+            let b = unsafe { *ptr.add(i) };
+            if b == n1 || b == n2 || b == n3 {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        hay.iter().position(|&b| b == n1 || b == n2 || b == n3)
+    }
+}
+
 #[inline]
 fn is_xml_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
@@ -19,7 +234,7 @@ fn is_xml_ws(b: u8) -> bool {
 
 #[inline]
 fn local_tag_name(raw: &[u8]) -> &[u8] {
-    match raw.iter().position(|&b| b == b':') {
+    match simd_memchr(b':', raw) {
         Some(colon) => &raw[colon + 1..],
         None => raw,
     }
@@ -62,7 +277,7 @@ fn parse_lt_at(buf: &[u8], at: usize) -> Result<Option<XmlSlice>> {
                 return Ok(Some(XmlSlice::CData { end: at + 9 + rel + 3 }));
             }
             // DOCTYPE or other declaration
-            let Some(rel) = rest[2..].iter().position(|&b| b == b'>') else {
+            let Some(rel) = simd_memchr(b'>', &rest[2..]) else {
                 return Ok(None);
             };
             Ok(Some(XmlSlice::DeclOrPi { end: at + 2 + rel + 1 }))
@@ -108,23 +323,30 @@ fn parse_lt_at(buf: &[u8], at: usize) -> Result<Option<XmlSlice>> {
             ensure!(name_end > at + 1, "无效起始标签");
             let mut quote: u8 = 0;
             while i < rest.len() {
-                let b = rest[i];
                 if quote != 0 {
-                    if b == quote {
-                        quote = 0;
+                    let Some(rel) = simd_memchr(quote, &rest[i..]) else {
+                        return Ok(None);
+                    };
+                    i += rel + 1;
+                    quote = 0;
+                } else {
+                    let Some(rel) = simd_memchr3(b'>', b'"', b'\'', &rest[i..]) else {
+                        return Ok(None);
+                    };
+                    i += rel;
+                    let b = rest[i];
+                    if b == b'>' {
+                        let empty = i >= 2 && rest[i - 1] == b'/';
+                        return Ok(Some(XmlSlice::Start {
+                            end: at + i + 1,
+                            name_start: at + 1,
+                            name_end,
+                            empty,
+                        }));
                     }
-                } else if b == b'"' || b == b'\'' {
                     quote = b;
-                } else if b == b'>' {
-                    let empty = i >= 2 && rest[i - 1] == b'/';
-                    return Ok(Some(XmlSlice::Start {
-                        end: at + i + 1,
-                        name_start: at + 1,
-                        name_end,
-                        empty,
-                    }));
+                    i += 1;
                 }
-                i += 1;
             }
             Ok(None)
         }
@@ -139,7 +361,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let first = needle[0];
     let mut pos = 0;
     while pos + needle.len() <= haystack.len() {
-        let rel = haystack[pos..].iter().position(|&b| b == first)?;
+        let rel = simd_memchr(first, &haystack[pos..])?;
         pos += rel;
         if pos + needle.len() > haystack.len() {
             return None;
@@ -158,19 +380,31 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn find_matching_close(buf: &[u8], mut cursor: usize, local_target: &[u8]) -> Result<Option<usize>> {
     if local_target == b"row" {
         let mut search = cursor;
-        while let Some(rel) = buf[search..].iter().position(|&b| b == b'w') {
+        while let Some(rel) = simd_memchr(b'w', &buf[search..]) {
             let w = search + rel;
             if w >= cursor + 4 && w + 1 < buf.len() && &buf[w - 4..w + 2] == b"</row>" {
-                if !buf[cursor..w - 4].contains(&b'!') {
+                if find_subslice(&buf[cursor..w - 4], b"<!").is_none() {
                     return Ok(Some(w + 2));
                 }
                 break;
             }
             search = w + 1;
         }
+    } else if local_target == b"si" {
+        let mut search = cursor;
+        while let Some(rel) = simd_memchr(b'i', &buf[search..]) {
+            let idx = search + rel;
+            if idx >= cursor + 3 && idx + 1 < buf.len() && &buf[idx - 3..idx + 2] == b"</si>" {
+                if find_subslice(&buf[cursor..idx - 3], b"<!").is_none() {
+                    return Ok(Some(idx + 2));
+                }
+                break;
+            }
+            search = idx + 1;
+        }
     }
     while cursor < buf.len() {
-        let Some(rel) = buf[cursor..].iter().position(|&b| b == b'<') else {
+        let Some(rel) = simd_memchr(b'<', &buf[cursor..]) else {
             return Ok(None);
         };
         let at = cursor + rel;
@@ -212,18 +446,25 @@ fn find_matching_close(buf: &[u8], mut cursor: usize, local_target: &[u8]) -> Re
                 let mut quote = 0u8;
                 let mut closed_tag = None;
                 while i < rest.len() {
-                    let b = rest[i];
                     if quote != 0 {
-                        if b == quote {
-                            quote = 0;
+                        let Some(qrel) = simd_memchr(quote, &rest[i..]) else {
+                            break;
+                        };
+                        i += qrel + 1;
+                        quote = 0;
+                    } else {
+                        let Some(trel) = simd_memchr3(b'>', b'"', b'\'', &rest[i..]) else {
+                            break;
+                        };
+                        i += trel;
+                        let b = rest[i];
+                        if b == b'>' {
+                            closed_tag = Some(at + i + 1);
+                            break;
                         }
-                    } else if b == b'"' || b == b'\'' {
                         quote = b;
-                    } else if b == b'>' {
-                        closed_tag = Some(at + i + 1);
-                        break;
+                        i += 1;
                     }
-                    i += 1;
                 }
                 let Some(end) = closed_tag else {
                     return Ok(None);
@@ -239,7 +480,7 @@ fn find_matching_close(buf: &[u8], mut cursor: usize, local_target: &[u8]) -> Re
 fn find_nested_close(buf: &[u8], mut cursor: usize, raw_name: &[u8]) -> Result<Option<usize>> {
     let mut depth = 1usize;
     while cursor < buf.len() {
-        let Some(rel) = buf[cursor..].iter().position(|&b| b == b'<') else {
+        let Some(rel) = simd_memchr(b'<', &buf[cursor..]) else {
             return Ok(None);
         };
         let at = cursor + rel;
@@ -322,35 +563,55 @@ fn extract_row_attr(tag_bytes: &[u8]) -> Result<Option<u32>> {
     Ok(None)
 }
 
-/// Fast zero-allocation decode for standard `<si><t>...</t></si>` and `<si><t xml:space="preserve">...</t></si>`
+const SST_BATCH_BYTES: usize = 1024 * 1024;
+const SST_PARALLEL_MIN_ITEMS: usize = 2048;
+
+#[inline]
+fn empty_shared_arc() -> &'static std::sync::Arc<str> {
+    static EMPTY: std::sync::OnceLock<std::sync::Arc<str>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| std::sync::Arc::from(""))
+}
+
+/// Fast decode for standard `<si><t>...</t></si>` and `<si><t xml:space="preserve">...</t></si>`
 /// items that contain no nested XML tags, entities (`&`), or CR (`\r`).
-fn try_fast_si(si_bytes: &[u8], table: &mut Strings) -> Result<bool> {
+#[inline]
+fn try_fast_si_arc(
+    si_bytes: &[u8],
+    empty_arc: &std::sync::Arc<str>,
+) -> Result<Option<std::sync::Arc<str>>> {
     if si_bytes == b"<si/>" || si_bytes == b"<si></si>" {
-        table.text.push_str("");
-        return Ok(true);
+        return Ok(Some(std::sync::Arc::clone(empty_arc)));
     }
-    let Some(body) = si_bytes.strip_prefix(b"<si>").and_then(|b| b.strip_suffix(b"</si>")) else {
-        return Ok(false);
+    let Some(body) = si_bytes
+        .strip_prefix(b"<si>")
+        .and_then(|b| b.strip_suffix(b"</si>"))
+    else {
+        return Ok(None);
     };
     let body = trim_ascii_ws(body);
     if body == b"<t/>" || body == b"<t></t>" {
-        table.text.push_str("");
-        return Ok(true);
+        return Ok(Some(std::sync::Arc::clone(empty_arc)));
     }
     let (inner, preserve) = if let Some(rest) = body.strip_prefix(b"<t>") {
-        let Some(inner) = rest.strip_suffix(b"</t>") else { return Ok(false) };
+        let Some(inner) = rest.strip_suffix(b"</t>") else {
+            return Ok(None);
+        };
         (inner, false)
     } else if let Some(rest) = body.strip_prefix(b"<t xml:space=\"preserve\">") {
-        let Some(inner) = rest.strip_suffix(b"</t>") else { return Ok(false) };
+        let Some(inner) = rest.strip_suffix(b"</t>") else {
+            return Ok(None);
+        };
         (inner, true)
     } else if let Some(rest) = body.strip_prefix(b"<t xml:space='preserve'>") {
-        let Some(inner) = rest.strip_suffix(b"</t>") else { return Ok(false) };
+        let Some(inner) = rest.strip_suffix(b"</t>") else {
+            return Ok(None);
+        };
         (inner, true)
     } else {
-        return Ok(false);
+        return Ok(None);
     };
-    if inner.iter().any(|&b| b == b'<' || b == b'&' || b == b'\r') {
-        return Ok(false);
+    if simd_memchr3(b'<', b'&', b'\r', inner).is_some() {
+        return Ok(None);
     }
     let raw = std::str::from_utf8(inner)?;
     let trimmed = if preserve {
@@ -358,9 +619,107 @@ fn try_fast_si(si_bytes: &[u8], table: &mut Strings) -> Result<bool> {
     } else {
         raw.trim_matches([' ', '\t', '\r', '\n'])
     };
+    if trimmed.is_empty() {
+        return Ok(Some(std::sync::Arc::clone(empty_arc)));
+    }
     let decoded = office_text(trimmed);
-    table.text.push_str(&decoded);
-    Ok(true)
+    Ok(Some(std::sync::Arc::from(decoded.as_ref())))
+}
+
+fn decode_si_slice(
+    si_bytes: &[u8],
+    empty_arc: &std::sync::Arc<str>,
+) -> Result<(std::sync::Arc<str>, Vec<crate::richtext::RichRun>)> {
+    if let Some(arc) = try_fast_si_arc(si_bytes, empty_arc)? {
+        return Ok((arc, Vec::new()));
+    }
+    let xml = std::str::from_utf8(si_bytes)?;
+    let mut one = Reader::from_str(xml);
+    let (text, runs) = match one.read_event()? {
+        Event::Start(_) => string_item(&mut one)?,
+        Event::Empty(_) => Default::default(),
+        _ => anyhow::bail!("无效共享字符串条目"),
+    };
+    let arc = if text.is_empty() {
+        std::sync::Arc::clone(empty_arc)
+    } else {
+        std::sync::Arc::from(text)
+    };
+    Ok((arc, runs))
+}
+
+fn flush_si_batch(
+    buf: &[u8],
+    si_ranges: &mut Vec<(usize, usize)>,
+    table: &mut Strings,
+    empty_arc: &std::sync::Arc<str>,
+) -> Result<()> {
+    if si_ranges.is_empty() {
+        return Ok(());
+    }
+    let count = si_ranges.len();
+    let workers = if count >= SST_PARALLEL_MIN_ITEMS {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8)
+    } else {
+        1
+    };
+    if workers <= 1 {
+        table.text.reserve(count);
+        for &(start, end) in si_ranges.iter() {
+            let (arc, runs) = decode_si_slice(&buf[start..end], empty_arc)?;
+            if !runs.is_empty() {
+                table.rich.insert(table.text.len(), runs);
+            }
+            table.text.push_arc(arc);
+        }
+        si_ranges.clear();
+        return Ok(());
+    }
+
+    let chunk_len = count.div_ceil(workers);
+    let base_idx = table.text.len();
+    type PartOut = Result<(
+        Vec<std::sync::Arc<str>>,
+        Vec<(usize, Vec<crate::richtext::RichRun>)>,
+    )>;
+    let parts: Vec<PartOut> = std::thread::scope(|pool| {
+        let mut handles = Vec::with_capacity(workers);
+        for (chunk_idx, sub) in si_ranges.chunks(chunk_len).enumerate() {
+            let offset = base_idx + chunk_idx * chunk_len;
+            handles.push(pool.spawn(move || -> PartOut {
+                let mut arcs = Vec::with_capacity(sub.len());
+                let mut rich = Vec::new();
+                for (local_i, &(start, end)) in sub.iter().enumerate() {
+                    let (arc, runs) = decode_si_slice(&buf[start..end], empty_arc)?;
+                    if !runs.is_empty() {
+                        rich.push((offset + local_i, runs));
+                    }
+                    arcs.push(arc);
+                }
+                Ok((arcs, rich))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .map_err(|_| anyhow::anyhow!("sharedStrings 并行解码线程异常退出"))?
+            })
+            .collect()
+    });
+    si_ranges.clear();
+    table.text.reserve(count);
+    for part in parts {
+        let (arcs, rich) = part?;
+        table.text.extend_arcs(arcs);
+        for (idx, runs) in rich {
+            table.rich.insert(idx, runs);
+        }
+    }
+    Ok(())
 }
 
 #[inline]
@@ -379,6 +738,7 @@ struct StreamBuf<R> {
     buf: Vec<u8>,
     pos: usize,
     eof: bool,
+    pending_err: Option<std::io::Error>,
     scratch: Vec<u8>,
 }
 
@@ -389,6 +749,7 @@ impl<R: Read> StreamBuf<R> {
             buf: Vec::with_capacity(READ_BUF_BYTES * 2),
             pos: 0,
             eof: false,
+            pending_err: None,
             scratch: vec![0u8; READ_BUF_BYTES],
         }
     }
@@ -401,6 +762,9 @@ impl<R: Read> StreamBuf<R> {
     }
 
     fn fill_more(&mut self) -> Result<bool> {
+        if let Some(err) = self.pending_err.take() {
+            return Err(err.into());
+        }
         if self.eof {
             return Ok(false);
         }
@@ -414,6 +778,31 @@ impl<R: Read> StreamBuf<R> {
         Ok(true)
     }
 
+    /// Prefetch up to `target_rem` unread bytes without invalidating existing offsets unless
+    /// `self.pos > 0` has already been flushed; defers any `io::Error` until buffered items
+    /// have been consumed.
+    fn prefetch_window(&mut self, target_rem: usize) {
+        if self.eof || self.pending_err.is_some() {
+            return;
+        }
+        self.compact();
+        while self.rem().len() < target_rem {
+            match self.input.read(&mut self.scratch) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    self.buf.extend_from_slice(&self.scratch[..n]);
+                }
+                Err(e) => {
+                    self.pending_err = Some(e);
+                    break;
+                }
+            }
+        }
+    }
+
     #[inline]
     fn rem(&self) -> &[u8] {
         &self.buf[self.pos..]
@@ -423,17 +812,26 @@ impl<R: Read> StreamBuf<R> {
 pub(super) fn string_table(input: impl Read, table: &mut Strings) -> Result<()> {
     let mut sb = StreamBuf::new(input);
     let (mut opened, mut closed) = (false, false);
+    let empty_arc = empty_shared_arc();
+    let mut si_ranges: Vec<(usize, usize)> = Vec::new();
 
     loop {
+        if opened && !closed && si_ranges.is_empty() && sb.rem().len() < READ_BUF_BYTES {
+            sb.prefetch_window(SST_BATCH_BYTES);
+        }
         let rel = loop {
-            if let Some(p) = sb.rem().iter().position(|&b| b == b'<') {
+            if let Some(p) = simd_memchr(b'<', sb.rem()) {
                 break Some(p);
             }
             let rem_str = std::str::from_utf8(sb.rem())?;
             ensure!(!closed || rem_str.trim().is_empty(), "sharedStrings.xml 根元素外存在内容");
+            flush_si_batch(&sb.buf, &mut si_ranges, table, empty_arc)?;
             sb.pos = sb.buf.len();
             if !sb.fill_more()? {
                 break None;
+            }
+            if opened && !closed && sb.rem().len() < READ_BUF_BYTES {
+                sb.prefetch_window(SST_BATCH_BYTES);
             }
         };
         let Some(rel) = rel else { break };
@@ -446,6 +844,7 @@ pub(super) fn string_table(input: impl Read, table: &mut Strings) -> Result<()> 
             if let Some(tok) = parse_lt_at(&sb.buf, sb.pos)? {
                 break tok;
             }
+            flush_si_batch(&sb.buf, &mut si_ranges, table, empty_arc)?;
             ensure!(sb.fill_more()?, "sharedStrings.xml 标签未闭合");
         };
         match tok {
@@ -455,6 +854,29 @@ pub(super) fn string_table(input: impl Read, table: &mut Strings) -> Result<()> 
             }
             XmlSlice::CData { .. } => anyhow::bail!("无效共享字符串 CDATA"),
             XmlSlice::Start { end, name_start, name_end, empty } => {
+                if opened && !closed && local_tag_name(&sb.buf[name_start..name_end]) == b"si" {
+                    let rel_end = end - sb.pos;
+                    let rel_item_end = if empty {
+                        rel_end
+                    } else {
+                        let mut rel_search = rel_end;
+                        loop {
+                            if let Some(close_end) =
+                                find_matching_close(&sb.buf, sb.pos + rel_search, b"si")?
+                            {
+                                break close_end - sb.pos;
+                            }
+                            flush_si_batch(&sb.buf, &mut si_ranges, table, empty_arc)?;
+                            rel_search = sb.rem().len().saturating_sub(8).max(rel_end);
+                            ensure!(sb.fill_more()?, "sharedStrings.xml 条目未闭合");
+                            sb.prefetch_window(SST_BATCH_BYTES);
+                        }
+                    };
+                    let item_end = sb.pos + rel_item_end;
+                    si_ranges.push((sb.pos, item_end));
+                    sb.pos = item_end;
+                    continue;
+                }
                 let raw_name = sb.buf[name_start..name_end].to_vec();
                 let local = local_tag_name(&raw_name);
                 if !opened {
@@ -476,21 +898,10 @@ pub(super) fn string_table(input: impl Read, table: &mut Strings) -> Result<()> 
                     sb.pos = end;
                 } else {
                     ensure!(!closed, "共享字符串根元素重复");
-                    let is_si = local == b"si";
+                    flush_si_batch(&sb.buf, &mut si_ranges, table, empty_arc)?;
                     let rel_end = end - sb.pos;
                     let rel_item_end = if empty {
                         rel_end
-                    } else if is_si {
-                        let mut rel_search = rel_end;
-                        loop {
-                            if let Some(close_end) =
-                                find_matching_close(&sb.buf, sb.pos + rel_search, b"si")?
-                            {
-                                break close_end - sb.pos;
-                            }
-                            rel_search = sb.rem().len().saturating_sub(8).max(rel_end);
-                            ensure!(sb.fill_more()?, "sharedStrings.xml 条目未闭合");
-                        }
                     } else {
                         loop {
                             if let Some(close_end) =
@@ -502,35 +913,20 @@ pub(super) fn string_table(input: impl Read, table: &mut Strings) -> Result<()> 
                         }
                     };
                     let item_end = sb.pos + rel_item_end;
-                    let slice = &sb.buf[sb.pos..item_end];
-                    if is_si {
-                        if !try_fast_si(slice, table)? {
-                            let xml = std::str::from_utf8(slice)?;
-                            let mut one = Reader::from_str(xml);
-                            let (text, runs) = match one.read_event()? {
-                                Event::Start(_) => string_item(&mut one)?,
-                                Event::Empty(_) => Default::default(),
-                                _ => anyhow::bail!("无效共享字符串条目"),
-                            };
-                            if !runs.is_empty() {
-                                table.rich.insert(table.text.len(), runs);
-                            }
-                            table.text.push(text);
-                        }
-                    } else {
-                        let _ = std::str::from_utf8(slice)?;
-                    }
+                    let _ = std::str::from_utf8(&sb.buf[sb.pos..item_end])?;
                     sb.pos = item_end;
                 }
             }
             XmlSlice::End { end, name_start, name_end } => {
                 ensure!(opened && !closed, "sharedStrings.xml 结束标签无效");
                 ensure!(local_tag_name(&sb.buf[name_start..name_end]) == b"sst", "sharedStrings.xml 根结束标签不匹配");
+                flush_si_batch(&sb.buf, &mut si_ranges, table, empty_arc)?;
                 closed = true;
                 sb.pos = end;
             }
         }
     }
+    flush_si_batch(&sb.buf, &mut si_ranges, table, empty_arc)?;
     ensure!(opened && closed, "sharedStrings.xml 未正常结束");
     Ok(())
 }
@@ -548,6 +944,7 @@ struct Rows {
     row_layout: RowLayout,
     shared: Formulas,
     shell: String,
+    all_rows_clean: bool,
 }
 
 #[inline]
@@ -590,31 +987,81 @@ fn parse_a1_bytes(b: &[u8]) -> Option<(u32, u32)> {
 }
 
 #[inline]
-fn fast_parse_f64_bytes(b: &[u8]) -> Option<f64> {
-    if !b.is_empty() && b.len() <= 16 {
-        let (neg, digits) = match b[0] {
+pub(crate) fn fast_parse_f64_bytes(b: &[u8]) -> Option<f64> {
+    let b = trim_ascii_ws(b);
+    if !b.is_empty() && b.len() <= 24 {
+        let (neg, rest) = match b[0] {
             b'-' => (true, &b[1..]),
             b'+' => (false, &b[1..]),
             _ => (false, b),
         };
-        if !digits.is_empty() && digits.len() <= 15 {
-            let mut acc = 0u64;
-            let mut all_digits = true;
-            for &ch in digits {
+        if !rest.is_empty() {
+            let mut mantissa: u64 = 0;
+            let mut sig_digits: u32 = 0;
+            let mut scale: usize = 0;
+            let mut seen_dot = false;
+            let mut any_digit = false;
+            let mut fast = true;
+            for &ch in rest {
                 let d = ch.wrapping_sub(b'0');
                 if d <= 9 {
-                    acc = acc * 10 + u64::from(d);
+                    any_digit = true;
+                    if mantissa == 0 && d == 0 {
+                        if seen_dot {
+                            scale += 1;
+                        }
+                    } else {
+                        sig_digits += 1;
+                        if sig_digits > 15 {
+                            fast = false;
+                            break;
+                        }
+                        mantissa = mantissa * 10 + u64::from(d);
+                        if seen_dot {
+                            scale += 1;
+                        }
+                    }
+                } else if ch == b'.' && !seen_dot {
+                    seen_dot = true;
                 } else {
-                    all_digits = false;
+                    fast = false;
                     break;
                 }
             }
-            if all_digits {
-                return Some(if neg { -(acc as f64) } else { acc as f64 });
+            if fast && any_digit && scale <= 22 {
+                static POW10: [f64; 23] = [
+                    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+                    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+                ];
+                let val = if scale == 0 {
+                    mantissa as f64
+                } else if mantissa == 0 {
+                    0.0
+                } else {
+                    (mantissa as f64) / POW10[scale]
+                };
+                return Some(if neg { -val } else { val });
             }
         }
     }
     std::str::from_utf8(b).ok()?.parse::<f64>().ok()
+}
+
+#[inline]
+fn fast_normalize_formula_arc(raw: &str) -> std::sync::Arc<str> {
+    let body = raw.trim_start_matches('=');
+    if body.len() < 255 {
+        let mut stack = [0u8; 256];
+        stack[0] = b'=';
+        stack[1..1 + body.len()].copy_from_slice(body.as_bytes());
+        let s = unsafe { std::str::from_utf8_unchecked(&stack[..1 + body.len()]) };
+        crate::normalize_formula_cow(s).as_ref().into()
+    } else {
+        let mut with_eq = String::with_capacity(body.len() + 1);
+        with_eq.push('=');
+        with_eq.push_str(body);
+        crate::normalize_formula_cow(&with_eq).as_ref().into()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -624,9 +1071,10 @@ enum FastRow {
     FallbackChunk,
 }
 
-/// Fast raw-byte decoder for an individual plain `<row ...>...</row>` containing no entities,
-/// comments, namespaces, formulas, or inline strings. Returns `FallbackRow` on complex cells
-/// (e.g. formulas) so only that row uses `quick-xml`, or `FallbackChunk` if row numbering is implicit.
+/// Fast raw-byte decoder for an individual `<row ...>...</row>` (including real Excel attributes
+/// like `spans="1:20"` / `x14ac:dyDescent="0.25"` and plain `<f>...</f>` formulas). Returns
+/// `FallbackRow` on complex cells (shared/array formulas, entities, inline strings, rich SST)
+/// so only that row uses `quick-xml`, or `FallbackChunk` if row numbering is implicit.
 fn try_fast_decode_row(
     row: &[u8],
     table: &Strings,
@@ -718,7 +1166,7 @@ fn try_fast_decode_row(
                 row_idx = Some(n);
             }
             b"ht" => {
-                ht = std::str::from_utf8(val).ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                ht = fast_parse_f64_bytes(val).map(|v| v as f32).unwrap_or(0.0);
             }
             b"customHeight" => {
                 custom_ht = val == b"1" || val == b"true";
@@ -732,6 +1180,9 @@ fn try_fast_decode_row(
             b"outlineLevel" => {
                 row_lv = parse_u32_ascii(val).and_then(|v| u8::try_from(v).ok()).unwrap_or(0);
             }
+            b"collapsed" | b"thickTop" | b"thickBot" | b"ph" => {
+                return FastRow::FallbackRow;
+            }
             _ => {}
         }
     }
@@ -739,6 +1190,9 @@ fn try_fast_decode_row(
     let Some(r_idx) = row_idx else {
         return FastRow::FallbackChunk;
     };
+    if ht > 0.0 && !custom_ht {
+        return FastRow::FallbackRow;
+    }
     let row_has_xf = row_s > 0;
     if row_lv > 0 {
         row_layout.row_levels.push((r_idx, row_lv));
@@ -857,12 +1311,12 @@ fn try_fast_decode_row(
                     xf = Some(s);
                 }
                 b"t" => {
-                    if !matches!(val, b"" | b"n" | b"s" | b"b") {
+                    if !matches!(val, b"" | b"n" | b"s" | b"b" | b"str" | b"e") {
                         return FastRow::FallbackRow;
                     }
                     typ = val;
                 }
-                b"cm" => return FastRow::FallbackRow,
+                b"cm" | b"vm" | b"ph" => return FastRow::FallbackRow,
                 _ => {}
             }
         }
@@ -886,20 +1340,76 @@ fn try_fast_decode_row(
             p += 4;
             continue;
         }
-        if !body[p..].starts_with(b"<v>") {
-            return FastRow::FallbackRow;
+
+        let mut formula: Option<std::sync::Arc<str>> = None;
+        if body[p..].starts_with(b"<f/>") {
+            p += 4;
+            while p < body.len() && is_xml_ws(body[p]) {
+                p += 1;
+            }
+        } else if body[p..].starts_with(b"<f>") {
+            p += 3;
+            let f_start = p;
+            let Some(f_lt) = simd_memchr(b'<', &body[p..]) else {
+                return FastRow::FallbackRow;
+            };
+            let f_end = p + f_lt;
+            if !body[f_end..].starts_with(b"</f>") {
+                return FastRow::FallbackRow;
+            }
+            let f_bytes = &body[f_start..f_end];
+            if simd_memchr2(b'&', b'\r', f_bytes).is_some() {
+                return FastRow::FallbackRow;
+            }
+            p = f_end + 4;
+            if !f_bytes.is_empty() {
+                let Ok(f_str) = std::str::from_utf8(f_bytes) else {
+                    return FastRow::FallbackRow;
+                };
+                formula = Some(fast_normalize_formula_arc(f_str));
+            }
+            while p < body.len() && is_xml_ws(body[p]) {
+                p += 1;
+            }
         }
-        p += 3;
-        let v_start = p;
-        let Some(lt_rel) = body[p..].iter().position(|&b| b == b'<') else {
+
+        if body[p..].starts_with(b"</c>") {
+            p += 4;
+            if let Some(formula) = formula {
+                cells.push((
+                    (cr, cc),
+                    crate::model::Cell {
+                        value: crate::model::Value::Empty,
+                        formula: Some(formula),
+                    },
+                ));
+            }
+            continue;
+        }
+
+        let v_bytes: &[u8] = if body[p..].starts_with(b"<v/>") {
+            p += 4;
+            b""
+        } else if body[p..].starts_with(b"<v>") {
+            p += 3;
+            let v_start = p;
+            let Some(lt_rel) = simd_memchr(b'<', &body[p..]) else {
+                return FastRow::FallbackRow;
+            };
+            let v_end = p + lt_rel;
+            if !body[v_end..].starts_with(b"</v>") {
+                return FastRow::FallbackRow;
+            }
+            let slice = &body[v_start..v_end];
+            if simd_memchr2(b'&', b'\r', slice).is_some() {
+                return FastRow::FallbackRow;
+            }
+            p = v_end + 4;
+            slice
+        } else {
             return FastRow::FallbackRow;
         };
-        let v_end = p + lt_rel;
-        if !body[v_end..].starts_with(b"</v>") {
-            return FastRow::FallbackRow;
-        }
-        let v_bytes = &body[v_start..v_end];
-        p = v_end + 4;
+
         while p < body.len() && is_xml_ws(body[p]) {
             p += 1;
         }
@@ -922,6 +1432,23 @@ fn try_fast_decode_row(
                 };
                 crate::model::Value::Text(std::sync::Arc::clone(arc))
             }
+            b"str" => {
+                let Ok(s) = std::str::from_utf8(v_bytes) else {
+                    return FastRow::FallbackRow;
+                };
+                crate::model::Value::Text(office_text(s).as_ref().into())
+            }
+            b"e" if !v_bytes.is_empty() => match v_bytes {
+                b"#N/A" => crate::model::Value::Error(crate::formula::ErrKind::Na),
+                b"#VALUE!" => crate::model::Value::Error(crate::formula::ErrKind::Value),
+                b"#REF!" => crate::model::Value::Error(crate::formula::ErrKind::Ref),
+                b"#DIV/0!" => crate::model::Value::Error(crate::formula::ErrKind::Div0),
+                b"#NUM!" => crate::model::Value::Error(crate::formula::ErrKind::Num),
+                b"#NAME?" => crate::model::Value::Error(crate::formula::ErrKind::Name),
+                b"#NULL!" => crate::model::Value::Error(crate::formula::ErrKind::Null),
+                b"#SPILL!" => crate::model::Value::Error(crate::formula::ErrKind::Spill),
+                _ => return FastRow::FallbackRow,
+            },
             _ if v_bytes.is_empty() => crate::model::Value::Empty,
             b"" => match fast_parse_f64_bytes(v_bytes) {
                 Some(n) => crate::model::Value::Number(n),
@@ -948,14 +1475,9 @@ fn try_fast_decode_row(
             }
             _ => return FastRow::FallbackRow,
         };
-        if !value.is_empty() {
-            cells.push((
-                (cr, cc),
-                crate::model::Cell {
-                    value,
-                    formula: None,
-                },
-            ));
+        let cell = crate::model::Cell { value, formula };
+        if !cell.is_blank() {
+            cells.push(((cr, cc), cell));
         }
     }
     FastRow::Ok
@@ -977,16 +1499,13 @@ impl Rows {
         let mut shared = Formulas::default();
         let mut shell = String::new();
 
-        // Try fast raw-byte row decoding when `style_lookup` is active and the chunk has no
-        // comments/PIs/entities/namespace prefixes. Any individual row containing formulas,
-        // inline strings, rich SST items, or implicit coordinates falls back seamlessly to
-        // `parse_section`.
-        let can_fast = style_lookup.is_some()
-            && !chunk
-                .bytes
-                .iter()
-                .any(|&b| b == b'!' || b == b'?' || b == b'&' || b == b':' || b == b'\r');
+        // Try fast raw-byte row decoding whenever `style_lookup` is active (including real Excel
+        // rows with `spans="1:20"`, `x14ac:dyDescent="..."`, or plain `<f>...</f>` formulas).
+        // Any individual row containing shared/array formulas, entities, inline strings, rich SST
+        // items, or implicit cell coordinates falls back seamlessly to `parse_section`.
+        let can_fast = style_lookup.is_some();
         let mut used_fast = false;
+        let mut had_fallback_row = false;
         if can_fast {
             let lookup = style_lookup.unwrap();
             let bytes = chunk.bytes.as_slice();
@@ -1013,8 +1532,33 @@ impl Rows {
                     fast_ok = false;
                     break;
                 }
-                // Find end of this `<row ...>` element
-                let Some(open_gt) = bytes[pos..].iter().position(|&b| b == b'>') else {
+                // Find end of this `<row ...>` open tag with quote awareness.
+                let open_slice = &bytes[pos..];
+                let mut ti = 4usize;
+                let mut quote = 0u8;
+                let mut open_gt_opt = None;
+                while ti < open_slice.len() {
+                    if quote != 0 {
+                        let Some(qrel) = simd_memchr(quote, &open_slice[ti..]) else {
+                            break;
+                        };
+                        ti += qrel + 1;
+                        quote = 0;
+                    } else {
+                        let Some(trel) = simd_memchr3(b'>', b'"', b'\'', &open_slice[ti..]) else {
+                            break;
+                        };
+                        ti += trel;
+                        let b = open_slice[ti];
+                        if b == b'>' {
+                            open_gt_opt = Some(ti);
+                            break;
+                        }
+                        quote = b;
+                        ti += 1;
+                    }
+                }
+                let Some(open_gt) = open_gt_opt else {
                     fast_ok = false;
                     break;
                 };
@@ -1022,17 +1566,7 @@ impl Rows {
                 let row_end = if open_gt >= 1 && bytes[pos + open_gt - 1] == b'/' {
                     open_end
                 } else {
-                    let mut search = open_end;
-                    let mut found = None;
-                    while let Some(rel) = bytes[search..].iter().position(|&b| b == b'w') {
-                        let w = search + rel;
-                        if w >= open_end + 4 && w + 1 < bytes.len() && &bytes[w - 4..w + 2] == b"</row>" {
-                            found = Some(w + 2);
-                            break;
-                        }
-                        search = w + 1;
-                    }
-                    let Some(e) = found else {
+                    let Ok(Some(e)) = find_matching_close(bytes, open_end, b"row") else {
                         fast_ok = false;
                         break;
                     };
@@ -1062,6 +1596,7 @@ impl Rows {
                         break;
                     }
                     FastRow::FallbackRow => {
+                        had_fallback_row = true;
                         cells.truncate(saved_lens.0);
                         styles.truncate(saved_lens.1);
                         row_layout.row_heights.truncate(saved_lens.2);
@@ -1153,10 +1688,12 @@ impl Rows {
             row_layout,
             shared,
             shell,
+            all_rows_clean: used_fast && !had_fallback_row,
         })
     }
 
     fn append(self, out: &mut Loaded, formulas: &mut Formulas, shell: &mut String) -> Result<()> {
+        out.all_rows_clean &= self.all_rows_clean;
         out.sheet.source_needs_dom_repair |= self.local.sheet.source_needs_dom_repair;
         for ((r, c), cell) in self.cells {
             out.sheet.set(r, c, cell);
@@ -1217,7 +1754,7 @@ fn scan_worksheet_stream<R: Read>(
 
     loop {
         let rel = loop {
-            if let Some(p) = sb.rem().iter().position(|&b| b == b'<') {
+            if let Some(p) = simd_memchr(b'<', sb.rem()) {
                 break Some(p);
             }
             if sb.rem().is_empty() {
@@ -1437,6 +1974,59 @@ pub(super) fn record_col_xfs(cols_xml: &str, col_has_xf_out: &RwLock<Vec<bool>>)
     }
 }
 
+fn collapse_empty_sheet_data(shell: &str) -> Option<String> {
+    let trimmed = shell.trim_start_matches('\u{feff}').trim_start();
+    let after_decl = if let Some(rest) = trimmed.strip_prefix("<?xml") {
+        let end_decl = rest.find("?>")?;
+        rest[end_decl + 2..].trim_start()
+    } else {
+        trimmed
+    };
+    if !after_decl.starts_with("<worksheet")
+        || !after_decl
+            .as_bytes()
+            .get("<worksheet".len())
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>')
+    {
+        return None;
+    }
+    if shell.contains("<sheetData/>") {
+        return Some(shell.to_owned());
+    }
+    let sd_pos = shell.find("<sheetData")?;
+    let after_sd = &shell[sd_pos + "<sheetData".len()..];
+    let gt_rel = after_sd.find('>')?;
+    let tag_attrs = &after_sd[..gt_rel];
+    if tag_attrs.trim() == "/" {
+        let mut out = String::with_capacity(shell.len());
+        out.push_str(&shell[..sd_pos]);
+        out.push_str("<sheetData/>");
+        out.push_str(&after_sd[gt_rel + 1..]);
+        return Some(out);
+    }
+    if !tag_attrs.trim().is_empty() {
+        return None;
+    }
+    let inner_start = sd_pos + "<sheetData".len() + gt_rel + 1;
+    let close_pos = shell.rfind("</sheetData>")?;
+    if close_pos < inner_start {
+        return None;
+    }
+    if !shell.as_bytes()[inner_start..close_pos]
+        .iter()
+        .all(|&b| is_xml_ws(b))
+    {
+        return None;
+    }
+    let footer_start = close_pos + "</sheetData>".len();
+    let mut out = String::with_capacity(sd_pos + 12 + (shell.len() - footer_start));
+    out.push_str(&shell[..sd_pos]);
+    out.push_str("<sheetData/>");
+    out.push_str(&shell[footer_start..]);
+    Some(out)
+}
+
+#[cfg(test)]
 pub(super) fn worksheet(
     input: impl Read,
     table: &Strings,
@@ -1483,6 +2073,9 @@ pub(super) fn worksheet_with_styles(
                 Ok(())
             }
         })?;
+        if out.all_rows_clean && shared.masters.is_empty() && shared.children.is_empty() {
+            out.clean_shell = collapse_empty_sheet_data(&shell).map(std::sync::Arc::from);
+        }
         expand_shared(out, shared)?;
         return Ok(shell);
     }
@@ -1582,6 +2175,9 @@ pub(super) fn worksheet_with_styles(
         scan_res
     })?;
 
+    if out.all_rows_clean && shared.masters.is_empty() && shared.children.is_empty() {
+        out.clean_shell = collapse_empty_sheet_data(&shell).map(std::sync::Arc::from);
+    }
     expand_shared(out, shared)?;
     Ok(shell)
 }
@@ -1639,5 +2235,82 @@ mod tests {
         assert_eq!(table.text.get(0), Some("first"));
         assert_eq!(table.text.get(1), Some(""));
         assert_eq!(table.text.get(2), Some("third"));
+    }
+
+    #[test]
+    fn fast_parse_f64_bytes_matches_std_parse_bit_for_bit() {
+        let samples = [
+            "0",
+            "-0",
+            "0.0",
+            "1",
+            "-42",
+            "0.1",
+            "0.2",
+            "0.3",
+            "123456.789",
+            "-987654321.125",
+            "9007199254740991",
+            "0.000000125",
+            "3.141592653589793",
+            "1.7976931348623157e308",
+            "5e-324",
+            "  25.5  ",
+        ];
+        for s in samples {
+            let want = s.trim().parse::<f64>().unwrap();
+            let got = fast_parse_f64_bytes(s.as_bytes()).unwrap();
+            assert_eq!(got.to_bits(), want.to_bits(), "sample={s}");
+        }
+        assert!(fast_parse_f64_bytes(b"").is_none());
+        assert!(fast_parse_f64_bytes(b"12a").is_none());
+    }
+
+    #[test]
+    fn real_excel_dy_descent_cross_sheet_formula_and_parallel_sst_fast_path() {
+        // 1. Parallel SST batch (>= 2048 <si> items)
+        let mut sst_xml = String::from("<sst count=\"2500\" uniqueCount=\"2500\">");
+        for i in 0..2500 {
+            if i % 10 == 0 {
+                sst_xml.push_str(&format!("<si><t>富文本 &amp; {i}</t></si>"));
+            } else {
+                sst_xml.push_str(&format!("<si><t>item_{i}</t></si>"));
+            }
+        }
+        sst_xml.push_str("</sst>");
+        let mut table = Strings::default();
+        string_table(sst_xml.as_bytes(), &mut table).unwrap();
+        assert_eq!(table.text.get(0), Some("富文本 & 0"));
+        assert_eq!(table.text.get(2499), Some("item_2499"));
+
+        // 2. Real Excel <row spans="..." x14ac:dyDescent="0.25"> + cross-sheet `!`, `&`, `\r\n`
+        let ws_xml = concat!(
+            "<worksheet xmlns:x14ac=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac\">\r\n",
+            "<sheetData>\r\n",
+            "<row r=\"1\" spans=\"1:4\" x14ac:dyDescent=\"0.25\">",
+            "<c r=\"A1\" t=\"s\"><v>0</v></c>",
+            "<c r=\"B1\"><f>Sheet2!A1+1.5</f><v>42.5</v></c>",
+            "<c r=\"C1\" t=\"str\"><f>\"A\"&amp;\"B\"</f><v>AB</v></c>",
+            "<c r=\"D1\" t=\"e\"><v>#DIV/0!</v></c>",
+            "</row>\r\n",
+            "</sheetData></worksheet>"
+        );
+        let mut out = Loaded::empty("Sheet1", "xl/worksheets/sheet1.xml");
+        worksheet(ws_xml.as_bytes(), &table, &mut out, 1, 1).unwrap();
+        assert_eq!(out.sheet.value(0, 0), crate::Value::Text("富文本 & 0".into()));
+        assert_eq!(out.sheet.value(0, 1), crate::Value::Number(42.5));
+        assert_eq!(
+            out.sheet.get(0, 1).unwrap().formula.as_deref(),
+            Some("=Sheet2!A1+1.5")
+        );
+        assert_eq!(out.sheet.value(0, 2), crate::Value::Text("AB".into()));
+        assert_eq!(
+            out.sheet.get(0, 2).unwrap().formula.as_deref(),
+            Some("=\"A\"&\"B\"")
+        );
+        assert_eq!(
+            out.sheet.value(0, 3),
+            crate::Value::Error(crate::formula::ErrKind::Div0)
+        );
     }
 }

@@ -37,6 +37,8 @@ pub(crate) struct SourceCells {
     arrays: Arc<Vec<(CellRef, Rect)>>,
     spill_shapes: crate::model::CellMetadata<CellRef, (u32, u32)>,
     spilled: crate::model::CellSet<CellRef>,
+    clean_shell: Option<Arc<str>>,
+    sst_arcs: Option<Arc<[Arc<str>]>>,
 }
 
 type Rect = (u32, u32, u32, u32);
@@ -165,7 +167,10 @@ impl SavedStyles {
     }
 }
 
-fn signature(zip: &mut ZipArchive<File>, part: &str) -> Option<(u32, u64)> {
+fn signature<R: std::io::Read + std::io::Seek>(
+    zip: &mut ZipArchive<R>,
+    part: &str,
+) -> Option<(u32, u64)> {
     let entry = zip.by_index_raw(zip.index_for_name(part)?).ok()?;
     Some((entry.crc32(), entry.size()))
 }
@@ -187,7 +192,11 @@ struct NoteSource {
 }
 
 impl NoteSource {
-    fn matches_legacy_notes(&self, zip: &mut ZipArchive<File>, sheet: &Sheet) -> bool {
+    fn matches_legacy_notes<R: std::io::Read + std::io::Seek>(
+        &self,
+        zip: &mut ZipArchive<R>,
+        sheet: &Sheet,
+    ) -> bool {
         let mut comments = self.targets.iter().filter(|t| t.kind != "vmlDrawing");
         let Some(target) = comments.next() else {
             return sheet.notes.is_empty();
@@ -204,7 +213,11 @@ impl NoteSource {
         })
     }
 
-    fn capture(zip: &mut ZipArchive<File>, part: &str, prior: Option<&Self>) -> Result<Self> {
+    fn capture<R: std::io::Read + std::io::Seek>(
+        zip: &mut ZipArchive<R>,
+        part: &str,
+        prior: Option<&Self>,
+    ) -> Result<Self> {
         let (dir, name) = part.rsplit_once('/').context("工作表部件路径无效")?;
         let relname = format!("{dir}/_rels/{name}.rels");
         let rels = signature(zip, &relname);
@@ -370,6 +383,15 @@ impl SourceCells {
         self.style_map = Some(styles);
     }
 
+    pub(super) fn set_clean_fast_meta(
+        &mut self,
+        clean_shell: Option<Arc<str>>,
+        sst_arcs: Option<Arc<[Arc<str>]>>,
+    ) {
+        self.clean_shell = clean_shell;
+        self.sst_arcs = sst_arcs;
+    }
+
     pub(super) fn base_styles(&self) -> &CellStyles {
         &self.styles
     }
@@ -394,7 +416,11 @@ impl SourceCells {
         (self.signature, self.strings, self.style_part)
     }
 
-    pub(super) fn capture(zip: &mut ZipArchive<File>, part: &str, sheet: &Sheet) -> Option<Self> {
+    pub(super) fn capture<R: std::io::Read + std::io::Seek>(
+        zip: &mut ZipArchive<R>,
+        part: &str,
+        sheet: &Sheet,
+    ) -> Option<Self> {
         let style_part = signature(zip, "xl/styles.xml");
         let style_map = sheet
             .source_cells
@@ -419,12 +445,26 @@ impl SourceCells {
                         })
                     })
             });
+        let strings = signature(zip, "xl/sharedStrings.xml");
+        let keep_shell = prior
+            .filter(|_| {
+                !sheet.layout_dirty
+                    && !sheet.freeze_dirty
+                    && !sheet.filter_dirty
+                    && !sheet.page_dirty
+                    && !sheet.merges_dirty
+                    && !sheet.col_styles_dirty
+            })
+            .and_then(|old| old.clean_shell.clone());
+        let keep_sst_arcs = prior
+            .filter(|old| old.strings == strings)
+            .and_then(|old| old.sst_arcs.clone());
         Some(Self {
             layout: crate::patch::layout_xml::Baseline::capture(sheet),
             store,
             notes,
             signature: signature(zip, part)?,
-            strings: signature(zip, "xl/sharedStrings.xml"),
+            strings,
             style_part,
             style_map,
             styles: sheet.styles.clone(),
@@ -434,6 +474,8 @@ impl SourceCells {
             arrays: Arc::new(sheet.arrays.clone()),
             spill_shapes: sheet.spill_shapes.clone(),
             spilled: sheet.spilled.clone(),
+            clean_shell: keep_shell,
+            sst_arcs: keep_sst_arcs,
         })
     }
 }
@@ -472,6 +514,8 @@ fn formula_range_rect(s: &str) -> Option<Rect> {
 
 struct Changes {
     keys: BTreeSet<CellRef>,
+    bulk_dirty_count: usize,
+    any_text_changed: bool,
     styles: StyleChanges,
     formula_changed: bool,
     layout: Option<crate::patch::layout_xml::Changes>,
@@ -484,12 +528,34 @@ impl Default for Changes {
     fn default() -> Self {
         Self {
             keys: BTreeSet::new(),
+            bulk_dirty_count: 0,
+            any_text_changed: false,
             styles: StyleChanges::default(),
             formula_changed: false,
             layout: None,
             freeze_edit: false,
             filter_xml: None,
             page_edit: false,
+        }
+    }
+}
+
+impl Changes {
+    #[inline]
+    fn dirty_count(&self) -> usize {
+        self.bulk_dirty_count.max(self.keys.len())
+    }
+
+    fn ensure_keys_populated(&mut self, sheet: &Sheet, base: &Store) {
+        if self.bulk_dirty_count > 0 && self.keys.is_empty() {
+            let mut raw = Vec::with_capacity(self.bulk_dirty_count);
+            raw.extend(sheet.cells().changed_keys(base));
+            raw.extend(
+                base.changed_keys(sheet.cells())
+                    .filter(|k| !sheet.contains(k.row, k.col)),
+            );
+            raw.sort_unstable();
+            self.keys = raw.into_iter().collect();
         }
     }
 }
@@ -542,6 +608,15 @@ fn cache_only_arrays(sheet: &Sheet, source: &SourceCells, keys: &BTreeSet<CellRe
     restricted.is_empty()
 }
 
+#[inline]
+fn same_opt_str(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => (x.as_ptr() == y.as_ptr() && x.len() == y.len()) || x == y,
+        _ => false,
+    }
+}
+
 fn coordinates(
     sheet: &Sheet,
     source: &SourceCells,
@@ -551,19 +626,86 @@ fn coordinates(
 ) -> Option<Changes> {
     let editable_dynamic = dynamic_index.is_some();
     let base = &source.store;
-    let mut keys = BTreeSet::new();
+    let can_bulk_fast = source.clean_shell.is_some()
+        && sheet.len() >= 32_768
+        && !sheet.source_needs_dom_repair
+        && !sheet.styles_dirty
+        && sheet.style_edits.is_empty()
+        && !sheet.row_styles_dirty
+        && !sheet.col_styles_dirty
+        && sheet.row_styles.is_empty()
+        && sheet.col_styles.is_empty()
+        && !sheet.merges_dirty
+        && !sheet.rich_dirty
+        && !sheet.layout_dirty
+        && !sheet.freeze_dirty
+        && !sheet.filter_dirty
+        && !sheet.page_dirty
+        && sheet.arrays.is_empty()
+        && source.arrays.is_empty()
+        && sheet.spill_shapes.is_empty()
+        && source.spill_shapes.is_empty()
+        && sheet.spilled.is_empty()
+        && source.spilled.is_empty()
+        && sheet.rich.is_empty()
+        && source.rich.is_empty();
+    let mut raw_keys = Vec::new();
+    let mut bulk_dirty_count = 0usize;
     let mut formula_changed = false;
-    for key in sheet
-        .cells()
-        .changed_keys(base)
-        .chain(base.changed_keys(sheet.cells()))
-    {
-        if !keys.insert(key) {
-            continue;
+    let mut any_text_changed = false;
+    let track_text = source.sst_arcs.is_some();
+    for key in sheet.cells().changed_keys(base) {
+        if !formula_changed {
+            let bf = base.formula_of(key.row, key.col);
+            let sf = sheet.formula_of(key.row, key.col);
+            formula_changed |= !same_opt_str(bf, sf);
         }
-        formula_changed |=
-            base.formula_of(key.row, key.col) != sheet.formula_of(key.row, key.col);
+        if track_text && !any_text_changed {
+            any_text_changed = matches!(sheet.value(key.row, key.col), crate::model::Value::Text(_))
+                || base
+                    .get(key.row, key.col)
+                    .is_some_and(|v| matches!(v.value, crate::model::Value::Text(_)));
+        }
+        if can_bulk_fast && raw_keys.len() > 4_096 {
+            if bulk_dirty_count == 0 {
+                bulk_dirty_count = raw_keys.len() + 1;
+                raw_keys.clear();
+                raw_keys.shrink_to_fit();
+            } else {
+                bulk_dirty_count += 1;
+            }
+        } else if bulk_dirty_count > 0 {
+            bulk_dirty_count += 1;
+        } else {
+            raw_keys.push(key);
+        }
     }
+    for key in base
+        .changed_keys(sheet.cells())
+        .filter(|k| !sheet.contains(k.row, k.col))
+    {
+        formula_changed |= base.formula_of(key.row, key.col).is_some();
+        if track_text && !any_text_changed {
+            any_text_changed = base
+                .get(key.row, key.col)
+                .is_some_and(|v| matches!(v.value, crate::model::Value::Text(_)));
+        }
+        if bulk_dirty_count > 0 {
+            bulk_dirty_count += 1;
+        } else if can_bulk_fast && raw_keys.len() > 4_096 {
+            bulk_dirty_count = raw_keys.len() + 1;
+            raw_keys.clear();
+            raw_keys.shrink_to_fit();
+        } else {
+            raw_keys.push(key);
+        }
+    }
+    let mut keys: BTreeSet<CellRef> = if bulk_dirty_count > 0 {
+        BTreeSet::new()
+    } else {
+        raw_keys.sort_unstable();
+        raw_keys.into_iter().collect()
+    };
     if sheet.rich_dirty {
         for &(row, col) in sheet.rich.keys().chain(source.rich.keys()) {
             let key = CellRef::new(row, col);
@@ -686,6 +828,8 @@ fn coordinates(
     }
     Some(Changes {
         keys,
+        bulk_dirty_count,
+        any_text_changed,
         styles: changed_styles,
         formula_changed,
         ..Default::default()
@@ -745,140 +889,187 @@ fn replacement(
         style = xf.map(u32::from);
     }
     let same_formula = old.and_then(|c| c.formula.as_ref()) == new.and_then(|c| c.formula.as_ref());
-    let mut xml = Reader::from_str(body);
     let mut definition: Option<std::borrow::Cow<'_, str>> = None;
     let mut saw_formula_tag = false;
-    loop {
-        let offset = xml.buffer_position() as usize;
-        let event = xml.read_event().ok()?;
-        match event {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                let tag = e.name();
-                if !matches!(tag.as_ref(), "f" | "v" | "is") {
-                    return None;
-                }
-                if matches!(event, Event::Start(_)) {
-                    xml.read_to_end(tag).ok()?;
-                }
-                if tag.as_ref() == "f" {
-                    saw_formula_tag = true;
-                    let raw_def = &body[offset..xml.buffer_position() as usize];
-                    // A what-if table anchor, for example, has an OOXML formula
-                    // definition even though the model only knows its cached number.
+    let body_bytes = body.as_bytes();
+    let fast_body_ok = if body_bytes.is_empty() {
+        true
+    } else if body_bytes.starts_with(b"<v>") && body_bytes.ends_with(b"</v>") && body_bytes.len() >= 7 {
+        super::sheets::stream::simd_memchr(b'<', &body_bytes[3..body_bytes.len() - 4]).is_none()
+    } else if body_bytes.starts_with(b"<f>") && shapes.is_none() {
+        if let Some(rel) = super::sheets::stream::simd_memchr(b'<', &body_bytes[3..]) {
+            let f_close = 3 + rel;
+            if body_bytes[f_close..].starts_with(b"</f>") {
+                let after_f = &body_bytes[f_close + 4..];
+                let v_ok = after_f.is_empty()
+                    || (after_f.starts_with(b"<v>")
+                        && after_f.ends_with(b"</v>")
+                        && after_f.len() >= 7
+                        && super::sheets::stream::simd_memchr(
+                            b'<',
+                            &after_f[3..after_f.len() - 4],
+                        )
+                        .is_none());
+                if v_ok {
                     if old.and_then(|c| c.formula.as_ref()).is_none() {
                         return None;
                     }
-                    if let Some((Some(rect),_)) = shapes {
-                        if attr(e,"t").as_deref() != Some("array") || crate::arr::parse_a1_range(&attr(e,"ref")?)? != *rect
-                            || e.attributes().count() != 2 { return None; }
-                        definition = Some(std::borrow::Cow::Borrowed(raw_def));
-                    } else if shapes.is_none() && attr(e, "t").as_deref() == Some("shared") {
-                        for a in e.attributes() {
-                            let a = a.ok()?;
-                            if !matches!(a.key.as_ref(), "t" | "si" | "ref") {
-                                return None;
-                            }
+                    saw_formula_tag = true;
+                    if same_formula {
+                        definition = Some(std::borrow::Cow::Borrowed(&body[..f_close + 4]));
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !fast_body_ok {
+        let mut xml = Reader::from_str(body);
+        loop {
+            let offset = xml.buffer_position() as usize;
+            let event = xml.read_event().ok()?;
+            match event {
+                Event::Start(ref e) | Event::Empty(ref e) => {
+                    let tag = e.name();
+                    if !matches!(tag.as_ref(), "f" | "v" | "is") {
+                        return None;
+                    }
+                    if matches!(event, Event::Start(_)) {
+                        xml.read_to_end(tag).ok()?;
+                    }
+                    if tag.as_ref() == "f" {
+                        saw_formula_tag = true;
+                        let raw_def = &body[offset..xml.buffer_position() as usize];
+                        // A what-if table anchor, for example, has an OOXML formula
+                        // definition even though the model only knows its cached number.
+                        if old.and_then(|c| c.formula.as_ref()).is_none() {
+                            return None;
                         }
-                        let si: u32 = attr(e, "si")?.parse().ok()?;
-                        if let Some(ref_str) = attr(e, "ref") {
-                            if same_formula {
-                                definition = Some(std::borrow::Cow::Borrowed(raw_def));
-                            } else {
-                                let rect = formula_range_rect(&ref_str)?;
-                                if (rect.0, rect.1) != (key.row, key.col) {
+                        if let Some((Some(rect),_)) = shapes {
+                            if attr(e,"t").as_deref() != Some("array") || crate::arr::parse_a1_range(&attr(e,"ref")?)? != *rect
+                                || e.attributes().count() != 2 { return None; }
+                            definition = Some(std::borrow::Cow::Borrowed(raw_def));
+                        } else if shapes.is_none() && attr(e, "t").as_deref() == Some("shared") {
+                            for a in e.attributes() {
+                                let a = a.ok()?;
+                                if !matches!(a.key.as_ref(), "t" | "si" | "ref") {
                                     return None;
                                 }
-                                if rect.0 == rect.2 || rect.1 == rect.3 {
-                                    // 1D shared formula range: promote the next untouched child in `rect` to master.
-                                    let mut promoted = None;
-                                    for rr in rect.0..=rect.2 {
-                                        for cc in rect.1..=rect.3 {
-                                            if (rr, cc) <= (key.row, key.col) {
-                                                continue;
+                            }
+                            let si: u32 = attr(e, "si")?.parse().ok()?;
+                            if let Some(ref_str) = attr(e, "ref") {
+                                if same_formula {
+                                    definition = Some(std::borrow::Cow::Borrowed(raw_def));
+                                } else {
+                                    let rect = formula_range_rect(&ref_str)?;
+                                    if (rect.0, rect.1) != (key.row, key.col) {
+                                        return None;
+                                    }
+                                    if rect.0 == rect.2 || rect.1 == rect.3 {
+                                        // 1D shared formula range: promote the next untouched child in `rect` to master.
+                                        let mut promoted = None;
+                                        for rr in rect.0..=rect.2 {
+                                            for cc in rect.1..=rect.3 {
+                                                if (rr, cc) <= (key.row, key.col) {
+                                                    continue;
+                                                }
+                                                let b_f = base.formula_of(rr, cc);
+                                                let s_f = sheet.formula_of(rr, cc);
+                                                if b_f.is_some() && b_f == s_f {
+                                                    promoted = Some(CellRef::new(rr, cc));
+                                                    break;
+                                                }
                                             }
-                                            let b_f = base.formula_of(rr, cc);
-                                            let s_f = sheet.formula_of(rr, cc);
-                                            if b_f.is_some() && b_f == s_f {
-                                                promoted = Some(CellRef::new(rr, cc));
+                                            if promoted.is_some() {
                                                 break;
                                             }
                                         }
-                                        if promoted.is_some() {
-                                            break;
+                                        if let Some(nk) = promoted {
+                                            shared_state
+                                                .promote_master
+                                                .insert(nk, (si, (nk.row, nk.col, rect.2, rect.3)));
+                                            extra_keys.push(nk);
                                         }
-                                    }
-                                    if let Some(nk) = promoted {
-                                        shared_state
-                                            .promote_master
-                                            .insert(nk, (si, (nk.row, nk.col, rect.2, rect.3)));
-                                        extra_keys.push(nk);
-                                    }
-                                } else {
-                                    let area = u64::from(rect.2 - rect.0 + 1)
-                                        .saturating_mul(u64::from(rect.3 - rect.1 + 1));
-                                    if area > 16_384 {
-                                        return None;
-                                    }
-                                    for rr in rect.0..=rect.2 {
-                                        for cc in rect.1..=rect.3 {
-                                            if (rr, cc) <= (key.row, key.col) {
-                                                continue;
-                                            }
-                                            let b_f = base.formula_of(rr, cc);
-                                            let s_f = sheet.formula_of(rr, cc);
-                                            if b_f.is_some() && b_f == s_f {
-                                                let ck = CellRef::new(rr, cc);
-                                                shared_state.unshare.insert(ck);
-                                                extra_keys.push(ck);
+                                    } else {
+                                        let area = u64::from(rect.2 - rect.0 + 1)
+                                            .saturating_mul(u64::from(rect.3 - rect.1 + 1));
+                                        if area > 16_384 {
+                                            return None;
+                                        }
+                                        for rr in rect.0..=rect.2 {
+                                            for cc in rect.1..=rect.3 {
+                                                if (rr, cc) <= (key.row, key.col) {
+                                                    continue;
+                                                }
+                                                let b_f = base.formula_of(rr, cc);
+                                                let s_f = sheet.formula_of(rr, cc);
+                                                if b_f.is_some() && b_f == s_f {
+                                                    let ck = CellRef::new(rr, cc);
+                                                    shared_state.unshare.insert(ck);
+                                                    extra_keys.push(ck);
+                                                }
                                             }
                                         }
                                     }
+                                    definition = None;
+                                }
+                            } else if let Some((want_si, new_rect)) = shared_state.promote_master.remove(&key) {
+                                if si != want_si || !same_formula {
+                                    return None;
+                                }
+                                let formula = new?.formula.as_deref()?;
+                                let f = crate::add_fn_prefixes(formula.strip_prefix('=').unwrap_or(formula));
+                                definition = Some(std::borrow::Cow::Owned(format!(
+                                    "<f t=\"shared\" ref=\"{}\" si=\"{si}\">{}</f>",
+                                    super::dynamic::reference(new_rect),
+                                    xml_text(&f)?
+                                )));
+                            } else if shared_state.unshare.remove(&key) {
+                                if !same_formula {
+                                    return None;
                                 }
                                 definition = None;
+                            } else if same_formula {
+                                definition = Some(std::borrow::Cow::Borrowed(raw_def));
+                            } else {
+                                // Child shared formula edited or cleared: standalone replacement needs no master rewrite.
+                                definition = None;
                             }
-                        } else if let Some((want_si, new_rect)) = shared_state.promote_master.remove(&key) {
-                            if si != want_si || !same_formula {
-                                return None;
-                            }
-                            let formula = new?.formula.as_deref()?;
-                            let f = crate::add_fn_prefixes(formula.strip_prefix('=').unwrap_or(formula));
-                            definition = Some(std::borrow::Cow::Owned(format!(
-                                "<f t=\"shared\" ref=\"{}\" si=\"{si}\">{}</f>",
-                                super::dynamic::reference(new_rect),
-                                xml_text(&f)?
-                            )));
-                        } else if shared_state.unshare.remove(&key) {
-                            if !same_formula {
-                                return None;
-                            }
-                            definition = None;
+                        } else if (shapes.is_some() || !same_formula)
+                            && e.attributes().next().is_some()
+                        {
+                            return None;
                         } else if same_formula {
                             definition = Some(std::borrow::Cow::Borrowed(raw_def));
-                        } else {
-                            // Child shared formula edited or cleared: standalone replacement needs no master rewrite.
-                            definition = None;
                         }
-                    } else if (shapes.is_some() || !same_formula)
-                        && e.attributes().next().is_some()
-                    {
-                        return None;
-                    } else if same_formula {
-                        definition = Some(std::borrow::Cow::Borrowed(raw_def));
                     }
                 }
+                Event::Text(t) if t.as_ref().trim().is_empty() => {}
+                Event::Eof => break,
+                _ => return None,
             }
-            Event::Text(t) if t.as_ref().trim().is_empty() => {}
-            Event::Eof => break,
-            _ => return None,
         }
     }
     if shared_state.promote_master.contains_key(&key) || shared_state.unshare.contains(&key) {
         return None;
     }
-    let reference = crate::model::cell_name(key.row, key.col);
-    let mut out = format!("<c r=\"{reference}\"");
+    let mut ref_buf = [0u8; 16];
+    let reference = super::fresh::format_a1_buf(key.row, key.col, &mut ref_buf);
+    let mut out = String::with_capacity(64);
+    out.push_str("<c r=\"");
+    out.push_str(reference);
+    out.push('"');
     if let Some(style) = style {
-        out.push_str(&format!(" s=\"{style}\""));
+        use std::fmt::Write as _;
+        let _ = write!(out, " s=\"{style}\"");
     }
 
     let Some(cell) = new else {
@@ -924,21 +1115,25 @@ pub(super) fn cell_with_runs(out: String, cell: &Cell, original_formula: Option<
 }
 
 pub(super) fn model_cell_xml(mut out: String, cell: &Cell, original_formula: Option<&str>) -> Option<String> {
-    let (kind, value) = match &cell.value {
-        Value::Empty => ("", String::new()),
-        Value::Number(n) if n.is_finite() => ("", format!("<v>{n}</v>")),
+    match &cell.value {
+        Value::Empty => {}
+        Value::Number(n) if n.is_finite() => {}
         Value::Number(_) => return None,
-        Value::Bool(b) => ("b", format!("<v>{}</v>", u8::from(*b))),
+        Value::Bool(_) => out.push_str(" t=\"b\""),
         Value::Error(crate::formula::ErrKind::Spill) => return None,
-        Value::Error(e) => ("e", format!("<v>{}</v>", e.text())),
-        Value::Text(s) if cell.formula.is_some() => ("str", format!("<v>{}</v>", xml_text(s)?)),
-        Value::Text(s) => (
-            "inlineStr",
-            format!("<is><t xml:space=\"preserve\">{}</t></is>", xml_text(s)?),
-        ),
-    };
-    if !kind.is_empty() {
-        out.push_str(&format!(" t=\"{kind}\""));
+        Value::Error(_) => out.push_str(" t=\"e\""),
+        Value::Text(s) if cell.formula.is_some() => {
+            if !safe_xml_text(s) {
+                return None;
+            }
+            out.push_str(" t=\"str\"");
+        }
+        Value::Text(s) => {
+            if !safe_xml_text(s) {
+                return None;
+            }
+            out.push_str(" t=\"inlineStr\"");
+        }
     }
     out.push('>');
     if let Some(f) = &cell.formula {
@@ -949,10 +1144,39 @@ pub(super) fn model_cell_xml(mut out: String, cell: &Cell, original_formula: Opt
             out.push_str(definition);
         } else {
             let f = crate::add_fn_prefixes(f.strip_prefix('=').unwrap_or(f));
-            out.push_str(&format!("<f>{}</f>", xml_text(&f)?));
+            let esc = xml_text(&f)?;
+            out.push_str("<f>");
+            out.push_str(&esc);
+            out.push_str("</f>");
         }
     }
-    out.push_str(&value);
+    match &cell.value {
+        Value::Empty => {}
+        Value::Number(n) => {
+            out.push_str("<v>");
+            // SAFETY: `push_f64_xml` only appends valid ASCII decimal bytes.
+            super::fresh::push_f64_xml(unsafe { out.as_mut_vec() }, *n);
+            out.push_str("</v>");
+        }
+        Value::Bool(b) => {
+            out.push_str(if *b { "<v>1</v>" } else { "<v>0</v>" });
+        }
+        Value::Error(e) => {
+            out.push_str("<v>");
+            out.push_str(e.text());
+            out.push_str("</v>");
+        }
+        Value::Text(s) if cell.formula.is_some() => {
+            out.push_str("<v>");
+            out.push_str(&quick_xml::escape::escape(s.as_ref()));
+            out.push_str("</v>");
+        }
+        Value::Text(s) => {
+            out.push_str("<is><t xml:space=\"preserve\">");
+            out.push_str(&quick_xml::escape::escape(s.as_ref()));
+            out.push_str("</t></is>");
+        }
+    }
     out.push_str("</c>");
     Some(out)
 }
@@ -1572,6 +1796,296 @@ fn plain_new_sheet_supported(sheet: &Sheet) -> bool {
         })
 }
 
+fn contains_subslice_fast(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let first = needle[0];
+    let last_start = haystack.len() - needle.len();
+    let mut pos = 0usize;
+    while pos <= last_start {
+        let Some(rel) = super::sheets::stream::simd_memchr(first, &haystack[pos..=last_start])
+        else {
+            return false;
+        };
+        let i = pos + rel;
+        if &haystack[i..i + needle.len()] == needle {
+            return true;
+        }
+        pos = i + 1;
+    }
+    false
+}
+
+fn sst_root_has_count_attrs(input: impl std::io::Read) -> Result<Option<bool>> {
+    use std::io::Read as _;
+    let mut head = Vec::with_capacity(1024);
+    input.take(1024).read_to_end(&mut head)?;
+    if super::sheets::utf16_encoding(&head).is_some() {
+        return Ok(None);
+    }
+    let body = head.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&head);
+    let Ok(s) = std::str::from_utf8(body) else {
+        // Truncated multi-byte UTF-8 only happens after `<sst ...>`, trim trailing incomplete UTF-8.
+        let valid_up_to = match std::str::from_utf8(body) {
+            Ok(_) => body.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_up_to == 0 {
+            return Ok(None);
+        }
+        let prefix = std::str::from_utf8(&body[..valid_up_to]).ok();
+        let Some(prefix) = prefix else {
+            return Ok(None);
+        };
+        return parse_sst_root_counts(prefix);
+    };
+    parse_sst_root_counts(s)
+}
+
+fn parse_sst_root_counts(prefix: &str) -> Result<Option<bool>> {
+    let mut reader = Reader::from_str(prefix);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
+                if e.local_name().as_ref() != "sst" {
+                    return Ok(None);
+                }
+                for a in e.attributes() {
+                    let Ok(a) = a else {
+                        return Ok(None);
+                    };
+                    if matches!(a.key.as_ref(), "count" | "uniqueCount") {
+                        return Ok(Some(true));
+                    }
+                }
+                return Ok(Some(false));
+            }
+            Ok(Event::Decl(_) | Event::Comment(_) | Event::PI(_) | Event::Text(_)) => {}
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Fast multi-core worksheet rewrite inside `xlsx_delta` when a large sheet has >= 16,384
+/// dirty cells covering >= 50% of the sheet (e.g., 1M-formula chain recalculation or bulk fill),
+/// preserving base `<worksheet>` header/footer verbatim while generating & deflating `<sheetData>`
+/// across CPU cores via `fresh::write_sheet_parallel_zip`.
+#[allow(clippy::too_many_arguments)]
+fn try_parallel_high_dirty_sheet<R: std::io::Read + std::io::Seek>(
+    zip: &mut ZipArchive<R>,
+    part: &str,
+    wb: &Workbook,
+    sheet: &Sheet,
+    changes: &Changes,
+    sst_exists: bool,
+) -> Result<Option<(Vec<u8>, Option<(u32, u64)>, bool)>> {
+    let dirty_n = changes.dirty_count();
+    let high_dirty = dirty_n > 4_096
+        || (sheet.len() >= 32_768 && dirty_n.saturating_mul(10) >= sheet.len());
+    let large_clean = sheet.len() >= 131_072
+        && sheet
+            .source_cells
+            .as_ref()
+            .is_some_and(|s| s.clean_shell.is_some());
+    if wb.load_incomplete
+        || sheet.source_needs_dom_repair
+        || sheet.merges_dirty
+        || sheet.rich_dirty
+        || (!high_dirty && !large_clean)
+        || !changes.styles.rows.is_empty()
+        || !changes.styles.cols.is_empty()
+        || !changes.styles.updates.is_empty()
+        || !changes.styles.dynamic.is_empty()
+        || changes.layout.is_some()
+        || changes.freeze_edit
+        || changes.filter_xml.is_some()
+        || changes.page_edit
+        || !sheet.arrays.is_empty()
+        || !sheet.spill_shapes.is_empty()
+        || !sheet.spilled.is_empty()
+        || !sheet.rich.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let mut direct_xf: Vec<Option<u16>> = vec![Some(0)];
+    let has_any_styles = !sheet.styles.is_empty()
+        || !sheet.row_styles.is_empty()
+        || !sheet.col_styles.is_empty()
+        || sheet
+            .source_cells
+            .as_ref()
+            .is_some_and(|s| !s.styles.is_empty() || !s.row_styles.is_empty() || !s.col_styles.is_empty());
+    if has_any_styles {
+        let Some(map) = sheet.source_cells.as_ref().and_then(|s| s.style_map.as_ref()) else {
+            return Ok(None);
+        };
+        if !map.derived_from.is_empty() || !map.origin_only.is_empty() {
+            return Ok(None);
+        }
+        direct_xf.resize(wb.styles.len().max(1), None);
+        direct_xf[0] = Some(0);
+        for (&sid, &opt) in &map.xfs {
+            let Some(xf) = opt else {
+                return Ok(None);
+            };
+            if map.xf(sid, &wb.styles) != Some(xf) {
+                return Ok(None);
+            }
+            let idx = usize::from(sid);
+            if idx >= direct_xf.len() {
+                direct_xf.resize(idx + 1, None);
+            }
+            direct_xf[idx] = Some(xf);
+        }
+        if direct_xf[0] != Some(0) {
+            return Ok(None);
+        }
+    }
+
+    // Zero-decompression fast path when `load_diag` captured a verified clean `<worksheet>` shell!
+    if let Some(source) = sheet.source_cells.as_ref()
+        && let Some(cached_shell) = source.clean_shell.as_deref()
+        && let Some(sd_pos) = cached_shell.find("<sheetData/>")
+    {
+        let header = &cached_shell[..sd_pos];
+        let footer = &cached_shell[sd_pos + "<sheetData/>".len()..];
+        let updated_header = super::fresh::update_dimension_in_header(
+            header,
+            "worksheet",
+            super::fresh::sheet_styled_bounds(sheet),
+        );
+        let mut shell = String::with_capacity(updated_header.len() + 12 + footer.len());
+        shell.push_str(&updated_header);
+        shell.push_str("<sheetData/>");
+        shell.push_str(footer);
+
+        let mut str_map: HashMap<&str, u32> = HashMap::new();
+        let mut ptr_map: HashMap<(usize, usize), u32> = HashMap::new();
+        let sst_lookup = if let Some(arcs) = source.sst_arcs.as_deref() {
+            str_map.reserve(arcs.len());
+            ptr_map.reserve(arcs.len());
+            for (idx, arc) in arcs.iter().enumerate() {
+                let id = idx as u32;
+                ptr_map.insert((arc.as_ptr() as usize, arc.len()), id);
+                str_map.entry(arc.as_ref()).or_insert(id);
+            }
+            Some(super::fresh::SheetSstLookup::from_maps(&str_map, &ptr_map))
+        } else {
+            None
+        };
+        let used_sst_before = sst_exists
+            && if source.sst_arcs.is_some() {
+                changes.any_text_changed
+            } else {
+                true
+            };
+        let Some((mini, sig)) =
+            super::fresh::write_sheet_parallel_zip(part, &shell, sheet, sst_lookup, &direct_xf)?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some((mini, sig, used_sst_before)));
+    }
+
+    let base_xml = super::read_zip_text(zip, part)?;
+    let trimmed = base_xml.trim_start_matches('\u{feff}').trim_start();
+    let after_decl = if let Some(rest) = trimmed.strip_prefix("<?xml") {
+        let Some(end_decl) = rest.find("?>") else {
+            return Ok(None);
+        };
+        rest[end_decl + 2..].trim_start()
+    } else {
+        trimmed
+    };
+    if !after_decl.starts_with("<worksheet")
+        || !after_decl
+            .as_bytes()
+            .get("<worksheet".len())
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>')
+    {
+        return Ok(None);
+    }
+
+    let bytes = base_xml.as_bytes();
+    let Some(sd_rel) = super::sheets::stream::simd_memchr(b'<', bytes).and_then(|_| {
+        let mut search = 0usize;
+        while search + 10 <= bytes.len() {
+            let rel = super::sheets::stream::simd_memchr(b's', &bytes[search..])?;
+            let pos = search + rel;
+            if pos > 0
+                && bytes[pos - 1] == b'<'
+                && bytes[pos..].starts_with(b"sheetData")
+                && bytes
+                    .get(pos + 9)
+                    .is_some_and(|b| *b == b'>' || *b == b'/' || b.is_ascii_whitespace())
+            {
+                return Some(pos - 1);
+            }
+            search = pos + 1;
+        }
+        None
+    }) else {
+        return Ok(None);
+    };
+    let Some(gt_rel) = super::sheets::stream::simd_memchr(b'>', &bytes[sd_rel + 10..]) else {
+        return Ok(None);
+    };
+    let sd_gt = sd_rel + 10 + gt_rel;
+    let header = &base_xml[..sd_rel];
+    let (data_inner, footer) = if bytes[sd_gt - 1] == b'/' {
+        (&[][..], &base_xml[sd_gt + 1..])
+    } else {
+        let Some(close_pos) = base_xml.rfind("</sheetData>") else {
+            return Ok(None);
+        };
+        if close_pos < sd_gt + 1 {
+            return Ok(None);
+        }
+        (
+            &bytes[sd_gt + 1..close_pos],
+            &base_xml[close_pos + "</sheetData>".len()..],
+        )
+    };
+
+    // Reject unmodeled `<row>` / `<c>` attributes if present in base `<sheetData>`.
+    if contains_subslice_fast(data_inner, b"dataTable")
+        || contains_subslice_fast(data_inner, b"vm=")
+        || contains_subslice_fast(data_inner, b"cm=")
+        || contains_subslice_fast(data_inner, b"ph=")
+        || contains_subslice_fast(data_inner, b"collapsed=")
+        || contains_subslice_fast(data_inner, b"thickTop=")
+        || contains_subslice_fast(data_inner, b"thickBot=")
+        || (sheet.rows.is_empty() && contains_subslice_fast(data_inner, b"ht="))
+        || (sheet.hidden_rows.is_empty() && contains_subslice_fast(data_inner, b"hidden="))
+        || (sheet.row_levels.is_empty() && contains_subslice_fast(data_inner, b"outlineLevel="))
+    {
+        return Ok(None);
+    }
+
+    let used_sst_before = sst_exists && contains_subslice_fast(data_inner, b"t=\"s\"");
+    let updated_header = super::fresh::update_dimension_in_header(
+        header,
+        "worksheet",
+        super::fresh::sheet_styled_bounds(sheet),
+    );
+    let mut shell = String::with_capacity(updated_header.len() + 12 + footer.len());
+    shell.push_str(&updated_header);
+    shell.push_str("<sheetData/>");
+    shell.push_str(footer);
+
+    let Some((mini, sig)) =
+        super::fresh::write_sheet_parallel_zip(part, &shell, sheet, None, &direct_xf)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((mini, sig, used_sst_before)))
+}
+
 pub(super) fn write_with_style_receipt(
     base: &Path, target: &Path, wb: &Workbook, saved_styles: &mut Option<SavedStyles>,
 ) -> Result<DeltaSummary> {
@@ -1714,7 +2228,7 @@ pub(super) fn write_with_style_receipt(
             }
         }
         formula_changed |= changes.formula_changed;
-        let has_sheet_work = !changes.keys.is_empty()
+        let has_sheet_work = changes.dirty_count() > 0
             || sheet.merges_dirty
             || !changes.styles.rows.is_empty()
             || !changes.styles.cols.is_empty()
@@ -1854,8 +2368,13 @@ pub(super) fn write_with_style_receipt(
 
     // Parallelize multiple dirty worksheets across CPU cores into single-entry temp ZIPs,
     // then splice via O(1) `raw_copy_file`.
-    let mut parallel_sheets: HashMap<String, tempfile::TempPath> = HashMap::new();
+    enum ParallelDeltaPart {
+        Mini(Vec<u8>),
+        Temp(tempfile::TempPath),
+    }
+    let mut parallel_sheets: HashMap<String, ParallelDeltaPart> = HashMap::new();
     let mut changed_sst = false;
+    let sst_exists = sst.is_some();
     if sheets.len() >= 2 {
         let mut jobs: Vec<(String, usize, &Sheet, &Store, Changes)> =
             Vec::with_capacity(sheets.len());
@@ -1872,7 +2391,7 @@ pub(super) fn write_with_style_receipt(
             .min(jobs.len());
         let job_queue = std::sync::Mutex::new(jobs.into_iter());
         let results: std::sync::Mutex<
-            Vec<Result<Option<(String, tempfile::TempPath, bool, Option<(u32, u64)>)>>>,
+            Vec<Result<Option<(String, ParallelDeltaPart, bool, Option<(u32, u64)>)>>>,
         > = std::sync::Mutex::new(Vec::new());
         std::thread::scope(|scope| {
             for _ in 0..workers {
@@ -1881,13 +2400,31 @@ pub(super) fn write_with_style_receipt(
                 scope.spawn(move || {
                     loop {
                         let next = { q.lock().unwrap().next() };
-                        let Some((part, idx, sheet, store, changes)) = next else {
+                        let Some((part, idx, sheet, store, mut changes)) = next else {
                             break;
                         };
                         let one = (|| -> Result<
-                            Option<(String, tempfile::TempPath, bool, Option<(u32, u64)>)>,
+                            Option<(String, ParallelDeltaPart, bool, Option<(u32, u64)>)>,
                         > {
                             let mut z = ZipArchive::new(File::open(base)?)?;
+                            if let Some((mini, sig, used_sst_before)) =
+                                try_parallel_high_dirty_sheet(
+                                    &mut z,
+                                    &part,
+                                    wb,
+                                    sheet,
+                                    &changes,
+                                    sst_exists,
+                                )?
+                            {
+                                return Ok(Some((
+                                    part,
+                                    ParallelDeltaPart::Mini(mini),
+                                    used_sst_before,
+                                    sig,
+                                )));
+                            }
+                            changes.ensure_keys_populated(sheet, store);
                             let (f, tp) = tempfile::NamedTempFile::new_in(dir)?.into_parts();
                             let mut zw = ZipWriter::new(BufWriter::with_capacity(128 * 1024, f));
                             zw.start_file(
@@ -1917,7 +2454,7 @@ pub(super) fn write_with_style_receipt(
                             }
                             let sig = vw.finish(Some("worksheet"))?;
                             zw.finish()?.flush()?;
-                            Ok(Some((part, tp, local_sst, sig)))
+                            Ok(Some((part, ParallelDeltaPart::Temp(tp), local_sst, sig)))
                         })();
                         res.lock().unwrap().push(one);
                     }
@@ -1925,14 +2462,14 @@ pub(super) fn write_with_style_receipt(
             }
         });
         for item in results.into_inner().unwrap() {
-            let Some((part, tp, local_sst, sig)) = item? else {
+            let Some((part, pp, local_sst, sig)) = item? else {
                 return Ok(DeltaSummary::default());
             };
             changed_sst |= local_sst;
             if let Some(s) = sig {
                 trusted_parts.insert(part.clone(), s);
             }
-            parallel_sheets.insert(part, tp);
+            parallel_sheets.insert(part, pp);
         }
     }
 
@@ -1955,27 +2492,54 @@ pub(super) fn write_with_style_receipt(
                     .compression_level(Some(1)),
             )?;
             out.write_all(&data)?;
-        } else if let Some(tp) = parallel_sheets.remove(&part) {
-            let mut part_zip = ZipArchive::new(File::open(&tp)?)?;
-            out.raw_copy_file(part_zip.by_index_raw(0)?)?;
-        } else if let Some((sheet, store, changes)) = sheets.remove(&part) {
-            let entry = zip.by_index(index)?;
-            let Some(sig_opt) = super::fresh::write_parallel_deflate_entry(
-                &mut out,
-                &part,
-                1,
-                Some("worksheet"),
-                |mut w| {
-                    stream_supported(stream::xml_input(entry, &part, |input| {
-                        stream::worksheet(input, &mut w, sheet, store, changes, &mut changed_sst)
-                    }))
-                },
-            )?
-            else {
-                return Ok(DeltaSummary::default());
-            };
-            if let Some(s) = sig_opt {
-                trusted_parts.insert(part, s);
+        } else if let Some(pp) = parallel_sheets.remove(&part) {
+            match pp {
+                ParallelDeltaPart::Mini(mini) => {
+                    let mut mini_zip = ZipArchive::new(std::io::Cursor::new(mini))?;
+                    out.raw_copy_file(mini_zip.by_index_raw(0)?)?;
+                }
+                ParallelDeltaPart::Temp(tp) => {
+                    let mut part_zip = ZipArchive::new(File::open(&tp)?)?;
+                    out.raw_copy_file(part_zip.by_index_raw(0)?)?;
+                }
+            }
+        } else if let Some((sheet, store, mut changes)) = sheets.remove(&part) {
+            if let Some((mini, sig, used_sst_before)) =
+                try_parallel_high_dirty_sheet(&mut zip, &part, wb, sheet, &changes, sst_exists)?
+            {
+                changed_sst |= used_sst_before;
+                let mut mini_zip = ZipArchive::new(std::io::Cursor::new(mini))?;
+                out.raw_copy_file(mini_zip.by_index_raw(0)?)?;
+                if let Some(s) = sig {
+                    trusted_parts.insert(part, s);
+                }
+            } else {
+                changes.ensure_keys_populated(sheet, store);
+                let entry = zip.by_index(index)?;
+                let Some(sig_opt) = super::fresh::write_parallel_deflate_entry(
+                    &mut out,
+                    &part,
+                    1,
+                    Some("worksheet"),
+                    |mut w| {
+                        stream_supported(stream::xml_input(entry, &part, |input| {
+                            stream::worksheet(
+                                input,
+                                &mut w,
+                                sheet,
+                                store,
+                                changes,
+                                &mut changed_sst,
+                            )
+                        }))
+                    },
+                )?
+                else {
+                    return Ok(DeltaSummary::default());
+                };
+                if let Some(s) = sig_opt {
+                    trusted_parts.insert(part, s);
+                }
             }
         } else if let Some(sheet) = new_plain_sheets.remove(&part) {
             out.start_file(
@@ -1988,7 +2552,11 @@ pub(super) fn write_with_style_receipt(
                 trusted_parts.insert(part, s);
             }
         } else {
-            out.raw_copy_file(zip.by_index_raw(index)?)?;
+            let raw = zip.by_index_raw(index)?;
+            if !wb.load_incomplete && (raw.size() == 0 || raw.compressed_size() > 0) {
+                trusted_parts.insert(part, (raw.crc32(), raw.size()));
+            }
+            out.raw_copy_file(raw)?;
         }
     }
     if !sheets.is_empty() || !parallel_sheets.is_empty() || !new_plain_sheets.is_empty() || !parts.is_empty() {
@@ -2004,19 +2572,62 @@ pub(super) fn write_with_style_receipt(
         out.write_all(super::dynamic::METADATA.as_bytes())?;
     }
     if let Some(i) = zip.index_for_name("xl/sharedStrings.xml") {
-        if changed_sst {
-            // Some indexed references became inline strings. Both counters are
-            // optional; preserve indices, rich runs and every original <si>.
-            out.start_file("xl/sharedStrings.xml", SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated).compression_level(Some(1)))?;
-            let mut vw = super::fresh::VerifiedXmlWriter::new(&mut out);
-            if !stream_supported(stream::xml_input(zip.by_index(i)?, "xl/sharedStrings.xml", |input|
-                stream::shared_strings(input, &mut vw)))? { return Ok(DeltaSummary::default()); }
-            if let Some(s) = vw.finish(Some("sst"))? {
-                trusted_parts.insert("xl/sharedStrings.xml".to_owned(), s);
+        let need_strip_counts = if changed_sst {
+            match sst_root_has_count_attrs(zip.by_index(i)?)? {
+                Some(false) => false,
+                _ => true,
             }
         } else {
-            out.raw_copy_file(zip.by_index_raw(i)?)?;
+            false
+        };
+        if need_strip_counts {
+            // Some indexed references became inline strings. Both counters are
+            // optional; preserve indices, rich runs and every original <si>.
+            let raw_size = zip.by_index_raw(i)?.size();
+            if raw_size >= 2 * 1024 * 1024 {
+                let entry = zip.by_index(i)?;
+                let Some(sig_opt) = super::fresh::write_parallel_deflate_entry(
+                    &mut out,
+                    "xl/sharedStrings.xml",
+                    1,
+                    Some("sst"),
+                    |mut w| {
+                        stream_supported(stream::xml_input(entry, "xl/sharedStrings.xml", |input| {
+                            stream::shared_strings(input, &mut w)
+                        }))
+                    },
+                )?
+                else {
+                    return Ok(DeltaSummary::default());
+                };
+                if let Some(s) = sig_opt {
+                    trusted_parts.insert("xl/sharedStrings.xml".to_owned(), s);
+                }
+            } else {
+                out.start_file(
+                    "xl/sharedStrings.xml",
+                    SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated)
+                        .compression_level(Some(1)),
+                )?;
+                let mut vw = super::fresh::VerifiedXmlWriter::new(&mut out);
+                if !stream_supported(stream::xml_input(
+                    zip.by_index(i)?,
+                    "xl/sharedStrings.xml",
+                    |input| stream::shared_strings(input, &mut vw),
+                ))? {
+                    return Ok(DeltaSummary::default());
+                }
+                if let Some(s) = vw.finish(Some("sst"))? {
+                    trusted_parts.insert("xl/sharedStrings.xml".to_owned(), s);
+                }
+            }
+        } else {
+            let raw = zip.by_index_raw(i)?;
+            if !wb.load_incomplete && (raw.size() == 0 || raw.compressed_size() > 0) {
+                trusted_parts.insert("xl/sharedStrings.xml".to_owned(), (raw.crc32(), raw.size()));
+            }
+            out.raw_copy_file(raw)?;
         }
     }
     out.finish()?.flush()?;
@@ -3097,5 +3708,77 @@ mod tests {
         assert_eq!(s0.filter.as_ref().unwrap().range, (0, 0, 2, 1));
         assert!(s0.page.landscape);
         assert_eq!(s0.page.print_area, Some((0, 0, 2, 1)));
+    }
+
+    #[test]
+    fn high_dirty_parallel_rewrite_sst_header_precheck_and_trusted_parts_roundtrip() {
+        // 1. SST root count attribute header precheck
+        assert_eq!(
+            sst_root_has_count_attrs(
+                b"<?xml version=\"1.0\"?><sst xmlns=\"u\" count=\"5\" uniqueCount=\"3\"><si><t>a</t></si></sst>"
+                    .as_slice()
+            )
+            .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            sst_root_has_count_attrs(
+                b"<?xml version=\"1.0\"?><sst xmlns=\"u\"><si><t>a</t></si></sst>".as_slice()
+            )
+            .unwrap(),
+            Some(false)
+        );
+
+        // 2. High-dirty sheet (>= 16,384 dirty cells) triggers parallel rewrite inside xlsx_delta
+        // while preserving `<extLst>` outside `<sheetData>` and raw-copying untouched Sheet2.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("high-dirty-chain.xlsx");
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, num(1.0));
+        for r in 1..20_000u32 {
+            wb.sheets[0].set(
+                r,
+                0,
+                Cell {
+                    value: Value::Number(f64::from(r + 1)),
+                    formula: Some(format!("=A{r}+1").into()),
+                },
+            );
+        }
+        let mut sh2 = Sheet::new("Sheet2");
+        sh2.set(
+            0,
+            0,
+            Cell {
+                value: Value::Text("保留不变".into()),
+                formula: None,
+            },
+        );
+        wb.sheets.push(sh2);
+        save(&path, &wb).unwrap();
+
+        // Inject an unmodeled `<extLst>` footer into sheet1.xml to prove shell preservation.
+        let s1_part = crate::patch::sheet_targets(&path).unwrap()["Sheet1"].clone();
+        let mut raw_s1 = String::from_utf8(read_part(&path, &s1_part).unwrap()).unwrap();
+        let close = raw_s1.rfind("</worksheet>").unwrap();
+        raw_s1.insert_str(close, "<extLst><ext uri=\"{12345678-1234-1234-1234-1234567890AB}\"/></extLst>");
+        crate::fixups::write_parts(&path, &[(s1_part.clone(), raw_s1.into_bytes())]).unwrap();
+
+        let (mut loaded, _) = load_diag(&path).unwrap();
+        loaded.sheets[0].set(0, 0, num(100.0));
+        crate::formula::recalc_all(&mut loaded);
+
+        let out = dir.path().join("high-dirty-saved.xlsx");
+        let receipt = save_atomic_with_receipt(&out, &loaded).unwrap();
+        assert!(receipt.used_cell_delta);
+
+        let saved_s1 = String::from_utf8(read_part(&out, &s1_part).unwrap()).unwrap();
+        assert!(saved_s1.contains("{12345678-1234-1234-1234-1234567890AB}"));
+
+        let (back, diag) = load_diag(&out).unwrap();
+        assert!(diag.is_complete());
+        assert_eq!(back.sheets[0].value(0, 0), Value::Number(100.0));
+        assert_eq!(back.sheets[0].value(19_999, 0), Value::Number(20_099.0));
+        assert_eq!(back.sheets[1].value(0, 0), Value::Text("保留不变".into()));
     }
 }

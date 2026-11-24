@@ -396,12 +396,13 @@ impl Selection {
         } else if format == self.html {
             cf_html(&self.range.html())
         } else {
-            self.range
-                .text()
-                .encode_utf16()
-                .chain(Some(0))
-                .flat_map(u16::to_le_bytes)
-                .collect()
+            let text = self.range.text();
+            let mut out = Vec::with_capacity(text.len().saturating_mul(2) + 2);
+            for u in text.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            out.extend_from_slice(&[0, 0]);
+            out
         }
     }
 
@@ -601,6 +602,7 @@ impl Owner {
                     IsClipboardFormatAvailable(f) != 0
                 });
             if ready {
+                super::record_internal_clipboard_seq();
                 SELECTION.with_borrow_mut(|s| {
                     *s = Some(Selection {
                         range,

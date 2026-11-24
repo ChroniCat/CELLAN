@@ -35,7 +35,7 @@ fn apply_xls_meta_fallback(path: &Path, stream: &[u8], wb: &mut Workbook) {
     }
 }
 #[path = "xlsx_load.rs"]
-mod sheets;
+pub(crate) mod sheets;
 #[path = "xlsx_delta.rs"]
 mod delta;
 #[path = "xlsx_fresh.rs"]
@@ -313,7 +313,14 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     // .xls：先让 calamine 读（它对真实 Excel 文件最稳），读不了再走内置 BIFF 读取器
     //（我们自己写出的容器就属于后一种）。
     let is_ooxml = crate::crypto::has_magic(path, b"PK");
-    let (mut shared_zip, package_stamp) = is_ooxml.then(|| sheets::open_stamped(path)).transpose()?.unzip();
+    let archive_bytes = is_ooxml.then(|| sheets::ArchiveBytes::open(path)).transpose()?;
+    let (mut shared_zip, package_stamp) = match archive_bytes.as_ref() {
+        Some(ab) => {
+            let (z, s) = sheets::open_bytes_stamped(ab.as_slice(), true)?;
+            (Some(z), s)
+        }
+        None => (None, None),
+    };
     let (
         zip_has_vba,
         zip_has_xlinks,
@@ -415,7 +422,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
 
     let is_cfb = !is_ooxml && crate::crypto::has_magic(path, &[0xD0, 0xCF, 0x11, 0xE0]);
     let mut defined_names = crate::patch::defined_names_xml(&workbook_xml);
-    let manual_hidden = crate::patch::manual_hidden_from_names(&defined_names);
+    let manual_hidden = crate::patch::manual_hidden_intervals_from_names(&defined_names);
     defined_names.retain(|(name, _, _)| name != crate::patch::MANUAL_HIDDEN_NAME);
     let has_source_names = defined_names.iter().any(|(n, _, _)| n.starts_with("_sc_src_"))
         || workbook_xml.contains("_sc_src_");
@@ -556,6 +563,13 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
     }
     let states = crate::patch::sheet_states_xml(&workbook_xml);
     drop(workbook_xml);
+    let mut clean_fast_meta_outer: std::collections::HashMap<
+        String,
+        (
+            Option<std::sync::Arc<str>>,
+            Option<std::sync::Arc<[std::sync::Arc<str>]>>,
+        ),
+    > = std::collections::HashMap::new();
     let mut layouts = std::collections::HashMap::new();
     if let Some(header) = &header {
         let style_lookup = sheets::StyleLookup::new(
@@ -564,7 +578,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             &header.parsed_styles,
         );
         let loaded_res = sheets::worksheets(
-            path,
+            Some(path),
             shared_zip.as_mut().unwrap(),
             header,
             &targets,
@@ -578,6 +592,12 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         style_ids = ids_back;
         let loaded = loaded_res?;
         for mut part in loaded {
+            if part.clean_shell.is_some() {
+                clean_fast_meta_outer.insert(
+                    part.sheet.name.clone(),
+                    (part.clean_shell.take(), part.sst_arcs.take()),
+                );
+            }
             if let Some(layout) = part.layout {
                 layouts.insert(part.sheet.name.clone(), layout);
             }
@@ -774,11 +794,11 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 }
                 sheet.cols.set_many(lay.col_widths.iter().map(|(c, w)| (*c, *w)));
                 sheet.rows.set_many(lay.row_heights.iter().map(|(r, h)| (*r, *h)));
-                for c in lay.hidden_cols.iter() {
-                    sheet.hidden_cols.insert(*c);
+                if !lay.hidden_cols.is_empty() {
+                    sheet.hidden_cols = lay.hidden_cols.iter().copied().collect();
                 }
-                for r in lay.hidden_rows.iter() {
-                    sheet.hidden_rows_user.insert(*r);
+                if !lay.hidden_rows.is_empty() {
+                    sheet.hidden_rows_user = lay.hidden_rows.iter().copied().collect();
                 }
                 for (r, lv) in lay.row_levels.iter() {
                     sheet.row_levels.insert(*r, *lv);
@@ -832,21 +852,42 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
                 }
                 if let Some(f) = &sheet.filter {
                     if !f.allows.is_empty() || !f.criteria.is_empty() {
-                        let fh = f.hidden_rows(sheet);
-                        // 文件里 row hidden 既可能来自手动隐藏，也可能来自筛选。
-                        // 先把筛选能解释的行从手动集合移出，否则关闭筛选时
-                        // union 会把它们永久当成手动隐藏。同时存在手动和筛选重叠的行
-                        // 无法从 OOXML 区分，这里按筛选隐藏处理；清除/关闭筛选时该行恢复。
-                        for r in &fh {
-                            sheet.hidden_rows_user.remove(r);
+                        if let Some(map) = &manual_hidden {
+                            let user_ivs = map.get(&sheet.name).cloned().unwrap_or_default();
+                            if user_ivs.is_empty() && !sheet.hidden_rows_user.is_empty() {
+                                let (r1, _, r2, _) = f.range;
+                                sheet.hidden_rows = crate::layout::HiddenIndices::from_intervals(
+                                    clip_intervals(sheet.hidden_rows_user.intervals(), r1.saturating_add(1), r2),
+                                );
+                                sheet.hidden_rows_user.clear();
+                            } else {
+                                sheet.hidden_rows = f.hidden_row_intervals(sheet);
+                                sheet.hidden_rows_user =
+                                    crate::layout::HiddenIndices::from_intervals(user_ivs);
+                            }
+                        } else {
+                            let fh = f.hidden_row_intervals(sheet);
+                            if !sheet.hidden_rows_user.is_empty() && !fh.is_empty() {
+                                sheet.hidden_rows_user = crate::layout::HiddenIndices::from_intervals(
+                                    subtract_intervals(
+                                        sheet.hidden_rows_user.intervals(),
+                                        fh.intervals(),
+                                    ),
+                                );
+                            }
+                            sheet.hidden_rows = fh;
                         }
-                        sheet.hidden_rows = fh.into();
+                    } else if let Some(map) = &manual_hidden {
+                        sheet.hidden_rows_user = crate::layout::HiddenIndices::from_intervals(
+                            map.get(&sheet.name).cloned().unwrap_or_default(),
+                        );
                     }
-                }
-                if let Some(map) = &manual_hidden {
+                } else if let Some(map) = &manual_hidden {
                     // 本应用保存的手动隐藏行来源：它明确区分了
                     // 筛选隐藏与手动隐藏，包括两者重叠的行，不再靠猜 hidden 。
-                    sheet.hidden_rows_user = map.get(&sheet.name).cloned().unwrap_or_default().into();
+                    sheet.hidden_rows_user = crate::layout::HiddenIndices::from_intervals(
+                        map.get(&sheet.name).cloned().unwrap_or_default(),
+                    );
                 }
             }
         }
@@ -936,7 +977,12 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             sheet.saved_cells = Some(sheet.cell_version().clone());
             if let (Some(zip), Some(part)) = (shared_zip.as_mut(), sheet.source_part.as_deref()) {
                 sheet.source_cells = SourceCells::capture(zip, part, sheet);
-                if let Some(source) = &mut sheet.source_cells { source.set_style_map(delta_styles.clone()); }
+                if let Some(source) = &mut sheet.source_cells {
+                    source.set_style_map(delta_styles.clone());
+                    if let Some((cs, sa)) = clean_fast_meta_outer.remove(&sheet.name) {
+                        source.set_clean_fast_meta(cs, sa);
+                    }
+                }
             }
         }
         wb.pivot_cache_base = std::sync::Arc::new(crate::model::PivotCacheBase {
@@ -970,18 +1016,68 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             }
         }
     }
+    drop(shared_zip);
+    drop(archive_bytes);
     if let Some(stamp) = package_stamp {
         anyhow::ensure!(sheets::package_stamp(path)? == stamp, "读取期间工作簿已被替换，请重新打开");
     }
     Ok((wb, diag))
 }
 
-fn pivot_definitions(path: &Path) -> Vec<(String, Vec<u8>)> {
-    pivot_definitions_with_zip(None, path)
+fn clip_intervals(a: &[(u32, u32)], lo: u32, hi: u32) -> Vec<(u32, u32)> {
+    if lo > hi {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &(s, e) in a {
+        if e < lo {
+            continue;
+        }
+        if s > hi {
+            break;
+        }
+        out.push((s.max(lo), e.min(hi)));
+    }
+    out
 }
 
-fn pivot_definitions_with_zip(
-    shared_zip: Option<&mut zip::ZipArchive<std::fs::File>>,
+fn subtract_intervals(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    if a.is_empty() || b.is_empty() {
+        return a.to_vec();
+    }
+    let mut out = Vec::with_capacity(a.len());
+    let mut j = 0usize;
+    for &(mut s, e) in a {
+        while j < b.len() && b[j].1 < s {
+            j += 1;
+        }
+        let mut cur_ok = true;
+        let mut k = j;
+        while k < b.len() && b[k].0 <= e {
+            let (bs, be) = b[k];
+            if bs > s {
+                out.push((s, bs - 1));
+            }
+            if be >= e {
+                cur_ok = false;
+                break;
+            }
+            s = be + 1;
+            k += 1;
+        }
+        if cur_ok && s <= e {
+            out.push((s, e));
+        }
+    }
+    out
+}
+
+fn pivot_definitions(path: &Path) -> Vec<(String, Vec<u8>)> {
+    pivot_definitions_with_zip::<std::fs::File>(None, path)
+}
+
+fn pivot_definitions_with_zip<R: std::io::Read + std::io::Seek>(
+    shared_zip: Option<&mut zip::ZipArchive<R>>,
     path: &Path,
 ) -> Vec<(String, Vec<u8>)> {
     use std::io::Read;
@@ -1673,7 +1769,10 @@ pub(crate) fn patch_xml_text<'a>(bytes: &'a [u8], part: &str) -> Result<std::bor
     }
 }
 
-pub(crate) fn read_zip_text(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
+pub(crate) fn read_zip_text<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Result<String> {
     sheets::xml_part(zip, name).with_context(|| format!("读取 {name} 失败"))
 }
 
@@ -2410,10 +2509,336 @@ pub fn load_with_password(path: &Path, password: &str) -> Result<Workbook> {
     load_with_password_diag(path, password).map(|(wb, _)| wb)
 }
 
-/// 带密码打开并返回诊断：加密文件里的工作表坏了同样要报"不完整"，
-/// 不能因为是加密包就把诊断丢掉。
+fn try_load_ooxml_from_memory(path: &Path, plain: &[u8]) -> Option<Result<(Workbook, LoadDiag)>> {
+    if !plain.starts_with(b"PK")
+        || injected(&INJECT_WORKER_PANIC, path)
+        || injected(&INJECT_SIDE_PANIC, path)
+    {
+        return None;
+    }
+    let (mut shared_zip, _) = match sheets::open_bytes_stamped(plain, false) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    let mut zip_has_vba = false;
+    for name in shared_zip.file_names() {
+        if name == "xl/vbaProject.bin" {
+            zip_has_vba = true;
+        } else if name == "docProps/custom.xml"
+            || name.contains("worksheets/_rels/")
+            || name.contains("externalLink")
+            || name.contains("drawing")
+            || name.contains("tables/table")
+            || name.contains("charts/chart")
+            || name.contains("comments")
+            || name.contains("threadedComment")
+        {
+            return None;
+        }
+    }
+    let meta = match sheets::workbook_metadata(&mut shared_zip) {
+        Ok(m) => m,
+        Err(e) => return Some(Err(e)),
+    };
+    let Some(header) = meta.header else {
+        return None;
+    };
+    let workbook_xml = meta.xml;
+    let targets = meta.targets;
+    if workbook_xml.contains("_sc_src_") || workbook_xml.contains("externalReference") {
+        return None;
+    }
+
+    set_load_kind(LOAD_KIND_OOXML);
+    let mut diag = LoadDiag::default();
+    let mut defined_names = crate::patch::defined_names_xml(&workbook_xml);
+    let manual_hidden = crate::patch::manual_hidden_intervals_from_names(&defined_names);
+    defined_names.retain(|(name, _, _)| name != crate::patch::MANUAL_HIDDEN_NAME);
+    let (calc_iterate, calc_max_iterations, calc_max_change) =
+        crate::patch::calc_iteration_xml(&workbook_xml).unwrap_or((false, 100, 0.001));
+    let mut wb = Workbook {
+        load_incomplete: false,
+        names: defined_names,
+        sources: Vec::new(),
+        links: Vec::new(),
+        names_dirty: false,
+        pivot_shifts: Vec::new(),
+        pivot_cache_base: Default::default(),
+        pivot_session: Default::default(),
+        has_vba: zip_has_vba,
+        date_system: if crate::patch::date1904_xml(&workbook_xml) {
+            crate::model::DateSystem::D1904
+        } else {
+            crate::model::DateSystem::D1900
+        },
+        pivot_calc_fields: Vec::new(),
+        pivots_pending: Vec::new(),
+        pivots_pending2: Vec::new(),
+        calc_manual: crate::patch::calc_manual_xml(&workbook_xml),
+        calc_iterate,
+        calc_max_iterations,
+        calc_max_change,
+        calc_pending: false,
+        calc_pending_sheets: std::collections::BTreeSet::new(),
+        sheets: Vec::new(),
+        path: Some(path.to_path_buf()),
+        decrypted: None,
+        encryption: None,
+        source_encryption: None,
+        dirty: false,
+        styles: crate::style::StyleTable::new(),
+        chart_edits: Vec::new(),
+    };
+
+    let mut page_names = std::collections::HashMap::new();
+    if workbook_xml.contains("definedName") {
+        for i in 0..header.names.len() as u32 {
+            let settings = crate::page::parse_defined_names(&workbook_xml, i);
+            if settings != (None, None, None) {
+                page_names.insert(i, settings);
+            }
+        }
+    }
+    let states = crate::patch::sheet_states_xml(&workbook_xml);
+    drop(workbook_xml);
+
+    let style_lookup = sheets::StyleLookup::new(
+        std::mem::replace(&mut wb.styles, crate::style::StyleTable::new()),
+        std::collections::HashMap::new(),
+        &header.parsed_styles,
+    );
+    let loaded_res = sheets::worksheets(
+        None,
+        &mut shared_zip,
+        &header,
+        &targets,
+        &style_lookup,
+        &header.parsed_styles.dxfs,
+        header.parsed_styles.dxf_ext,
+        false,
+    );
+    let (styles_back, mut style_ids) = style_lookup.into_inner();
+    wb.styles = styles_back;
+    let loaded = match loaded_res {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    let mut clean_fast_meta_outer: std::collections::HashMap<
+        String,
+        (
+            Option<std::sync::Arc<str>>,
+            Option<std::sync::Arc<[std::sync::Arc<str>]>>,
+        ),
+    > = std::collections::HashMap::new();
+    let mut layouts = std::collections::HashMap::new();
+    for mut part in loaded {
+        if part.clean_shell.is_some() {
+            clean_fast_meta_outer.insert(
+                part.sheet.name.clone(),
+                (part.clean_shell.take(), part.sst_arcs.take()),
+            );
+        }
+        if let Some(layout) = part.layout {
+            layouts.insert(part.sheet.name.clone(), layout);
+        }
+        if let Some((area, rows, cols)) = page_names.get(&(wb.sheets.len() as u32)) {
+            part.sheet.page.print_area = *area;
+            part.sheet.page.title_rows = *rows;
+            part.sheet.page.title_cols = *cols;
+        }
+        part.sheet.loading = false;
+        part.sheet.edited = false;
+        diag.problems.extend(part.diag.problems);
+        wb.sheets.push(part.sheet);
+    }
+    if wb.sheets.is_empty() {
+        wb.sheets.push(Sheet::new("Sheet1"));
+    }
+
+    {
+        let wb_sheets = &mut wb.sheets;
+        let wb_styles = &mut wb.styles;
+        let mut loaded_style_id = |idx: u16, styles: &mut crate::style::StyleTable| {
+            *style_ids.entry(idx).or_insert_with(|| {
+                let (cs, theme_xf, pattern, quote) = header.parsed_styles.resolve_xf(idx as usize);
+                let id = styles.intern(cs);
+                if (idx as usize) < header.parsed_styles.xf_count() {
+                    styles.set_theme(id, theme_xf);
+                }
+                if let Some(p) = pattern {
+                    styles.set_pattern(id, p);
+                }
+                if quote {
+                    styles.set_quote(id, true);
+                }
+                id
+            })
+        };
+        for sheet in wb_sheets.iter_mut() {
+            if let Some(lay) = layouts.get(&sheet.name) {
+                sheet.source_needs_dom_repair |= lay.invalid_column_bounds;
+                sheet.merges = lay.merges.clone();
+                if let Some(w) = lay.col_default {
+                    sheet.cols.set_default(w);
+                }
+                if let Some(h) = lay.row_default {
+                    sheet.rows.set_default(h);
+                }
+                sheet.cols.set_many(lay.col_widths.iter().map(|(c, w)| (*c, *w)));
+                sheet.rows.set_many(lay.row_heights.iter().map(|(r, h)| (*r, *h)));
+                if !lay.hidden_cols.is_empty() {
+                    sheet.hidden_cols = lay.hidden_cols.iter().copied().collect();
+                }
+                if !lay.hidden_rows.is_empty() {
+                    sheet.hidden_rows_user = lay.hidden_rows.iter().copied().collect();
+                }
+                for (r, lv) in lay.row_levels.iter() {
+                    sheet.row_levels.insert(*r, *lv);
+                }
+                for (r, c) in lay.ignored_errors.iter() {
+                    sheet.ignored_errors.insert((*r, *c));
+                }
+                if lay.scenario_settings.has_source() || !lay.scenarios.is_empty() {
+                    sheet.scenarios = lay.scenarios.clone();
+                    sheet.scenario_settings = lay.scenario_settings.clone();
+                }
+                if let Some((below, right, symbols)) = lay.outline_pr {
+                    sheet.outline_summary_below = below;
+                    sheet.outline_summary_right = right;
+                    sheet.outline_symbols = symbols;
+                }
+                for (c, lv) in lay.col_levels.iter() {
+                    sheet.col_levels.insert(*c, *lv);
+                }
+                for &(pos, xf) in &lay.col_xfs {
+                    if let Ok(xf) = u16::try_from(xf) {
+                        let id = loaded_style_id(xf, wb_styles);
+                        if id != 0 {
+                            sheet.set_col_style_loaded(pos, id);
+                        }
+                    }
+                }
+                for &(pos, xf) in &lay.row_xfs {
+                    if let Ok(xf) = u16::try_from(xf) {
+                        let id = loaded_style_id(xf, wb_styles);
+                        if id != 0 {
+                            sheet.set_row_style_loaded(pos, id);
+                        }
+                    }
+                }
+                if !sheet.row_styles.is_empty() || !sheet.col_styles.is_empty() {
+                    sheet.apply_loaded_xf_zero(loaded_style_id(0, wb_styles));
+                }
+                sheet.tab_color = lay.tab_color;
+                sheet.protection = lay.protection.clone();
+                sheet.cf.blocks = lay.cf.clone();
+                sheet.cf.dxfs = lay.dxfs.clone();
+                sheet.cf.unknown_ext = lay.cf_ext;
+                sheet.cf.dxf_unsupported = lay.dxf_ext;
+                sheet.dv = lay.dv.clone();
+                sheet.freeze = lay.freeze;
+                if lay.filter.is_some() {
+                    sheet.filter = lay.filter.clone();
+                }
+                if let Some(f) = &sheet.filter {
+                    if !f.allows.is_empty() || !f.criteria.is_empty() {
+                        if let Some(map) = &manual_hidden {
+                            let user_ivs = map.get(&sheet.name).cloned().unwrap_or_default();
+                            if user_ivs.is_empty() && !sheet.hidden_rows_user.is_empty() {
+                                let (r1, _, r2, _) = f.range;
+                                sheet.hidden_rows = crate::layout::HiddenIndices::from_intervals(
+                                    clip_intervals(sheet.hidden_rows_user.intervals(), r1.saturating_add(1), r2),
+                                );
+                                sheet.hidden_rows_user.clear();
+                            } else {
+                                sheet.hidden_rows = f.hidden_row_intervals(sheet);
+                                sheet.hidden_rows_user =
+                                    crate::layout::HiddenIndices::from_intervals(user_ivs);
+                            }
+                        } else {
+                            let fh = f.hidden_row_intervals(sheet);
+                            if !sheet.hidden_rows_user.is_empty() && !fh.is_empty() {
+                                sheet.hidden_rows_user = crate::layout::HiddenIndices::from_intervals(
+                                    subtract_intervals(
+                                        sheet.hidden_rows_user.intervals(),
+                                        fh.intervals(),
+                                    ),
+                                );
+                            }
+                            sheet.hidden_rows = fh;
+                        }
+                    } else if let Some(map) = &manual_hidden {
+                        sheet.hidden_rows_user = crate::layout::HiddenIndices::from_intervals(
+                            map.get(&sheet.name).cloned().unwrap_or_default(),
+                        );
+                    }
+                } else if let Some(map) = &manual_hidden {
+                    sheet.hidden_rows_user = crate::layout::HiddenIndices::from_intervals(
+                        map.get(&sheet.name).cloned().unwrap_or_default(),
+                    );
+                }
+            }
+        }
+    }
+
+    let delta_styles = delta::StyleMap::new(&style_ids, &wb.styles);
+    for sheet in wb.sheets.iter_mut() {
+        if let Some(&hide) = states.get(&sheet.name) {
+            sheet.hidden = hide;
+        }
+        sheet.saved_cells = Some(sheet.cell_version().clone());
+        if let Some(part) = sheet.source_part.as_deref() {
+            sheet.source_cells = SourceCells::capture(&mut shared_zip, part, sheet);
+            if let Some(source) = &mut sheet.source_cells {
+                source.set_style_map(delta_styles.clone());
+                if let Some((cs, sa)) = clean_fast_meta_outer.remove(&sheet.name) {
+                    source.set_clean_fast_meta(cs, sa);
+                }
+            }
+        }
+    }
+    wb.pivot_cache_base = std::sync::Arc::new(crate::model::PivotCacheBase {
+        definitions: pivot_definitions_with_zip(Some(&mut shared_zip), path),
+        sheets: wb.sheets.iter().map(|s| (s.identity, s.name.clone())).collect(),
+    });
+    wb.load_incomplete = diag.has_fatal();
+    for sheet in &wb.sheets {
+        for (cref, cell) in sheet.formula_cells() {
+            let Some(formula) = cell.formula.as_deref() else {
+                continue;
+            };
+            if let Some(reason) = crate::formula::unsupported_reference_combo(formula) {
+                diag.push(
+                    Some(&sheet.name),
+                    sheet.source_part.as_deref().unwrap_or("xl/worksheets"),
+                    "兼容提示",
+                    format!(
+                        "{} 的公式 {} 使用{reason}，当前版本暂不参与重算；保留文件里的缓存值，可另存为 .xlsx 或改为单工作簿引用。",
+                        crate::model::cell_name(cref.row, cref.col),
+                        formula
+                    ),
+                    false,
+                );
+            }
+        }
+    }
+    Some(Ok((wb, diag)))
+}
+
+/// 带密码打开并返回诊断：优先直接在解密内存 `Cursor` 上流式加载（零明文临时文件落盘）；
+/// 仅当加密包含绘图/图表/批注/外部关系等需路径辅助扫描的部件时，才回退到私有临时目录。
 pub fn load_with_password_diag(path: &Path, password: &str) -> Result<(Workbook, LoadDiag)> {
     let (plain, len, fp) = crate::crypto::decrypt_with_fingerprint(path, password)?;
+    if let Some(res) = try_load_ooxml_from_memory(path, &plain) {
+        decrypted_cache_put_with_meta(path, password, plain, Some((len, fp)));
+        let (mut wb, diag) = res?;
+        wb.path = Some(path.to_path_buf());
+        wb.decrypted = None;
+        wb.encryption = Some(crate::crypto::EncryptionSettings::new(password));
+        wb.source_encryption.clone_from(&wb.encryption);
+        wb.load_incomplete = diag.has_fatal();
+        return Ok((wb, diag));
+    }
     let scratch = private_workbook_dir()?;
     let tmp = scratch.path().join("source.xlsx");
     std::fs::write(&tmp, &plain).with_context(|| "写入解密临时文件失败")?;
@@ -3157,20 +3582,16 @@ fn save_plain_at(
     {
         must_save!("layout", crate::patch::apply_layout(path, wb));
     }
-    // 手动隐藏行来源写成隐藏 definedName
-    let manual_hidden: std::collections::BTreeMap<String, Vec<u32>> = wb
+    // 手动隐藏行来源写成隐藏 definedName（直接存闭区间 SCMH2，避免百万行展开 HashSet）
+    let manual_hidden: std::collections::BTreeMap<String, Vec<(u32, u32)>> = wb
         .sheets
         .iter()
         .filter(|s| !s.hidden_rows_user.is_empty())
-        .map(|s| {
-            let mut rows: Vec<u32> = s.hidden_rows_user.iter().copied().collect();
-            rows.sort_unstable();
-            (s.name.clone(), rows)
-        })
+        .map(|s| (s.name.clone(), s.hidden_rows_user.intervals().to_vec()))
         .collect();
     must_save!(
         "manual-hidden",
-        crate::patch::write_manual_hidden(path, &manual_hidden)
+        crate::patch::write_manual_hidden_intervals(path, &manual_hidden)
     );
     // 关闭筛选后清掉 workbook.xml 的 _FilterDatabase
     for sheet in &wb.sheets {

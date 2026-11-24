@@ -1205,45 +1205,109 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 读本应用写入的手动隐藏行来源；无定义名时返回 None。
+fn coalesce_sorted_u32_intervals(rows: &[u32]) -> Vec<(u32, u32)> {
+    let mut sorted: Vec<u32> = rows.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for r in sorted {
+        match out.last_mut() {
+            Some((_, hi)) if r == hi.saturating_add(1) => *hi = r,
+            _ => out.push((r, r)),
+        }
+    }
+    out
+}
+
+/// 读本应用写入的手动隐藏行来源；无定义名时返回 None。兼容 `SCMH2:` 区间编码与旧版 `SCMH1:`。
 pub fn read_manual_hidden(
     path: &Path,
 ) -> Option<std::collections::HashMap<String, std::collections::HashSet<u32>>> {
     manual_hidden_from_names(&read_defined_names(path))
 }
 
-pub(crate) fn manual_hidden_from_names(
+pub(crate) fn manual_hidden_intervals_from_names(
     names: &[(String, Option<usize>, String)],
-) -> Option<std::collections::HashMap<String, std::collections::HashSet<u32>>> {
-    let (_, _, text) = names.iter()
+) -> Option<std::collections::HashMap<String, Vec<(u32, u32)>>> {
+    let (_, _, text) = names
+        .iter()
         .find(|(name, _, _)| name == MANUAL_HIDDEN_NAME)?;
     let text = text.trim().trim_start_matches('=').trim();
     let text = text
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
         .unwrap_or(text);
+    if let Some(hex) = text.strip_prefix("SCMH2:") {
+        let bytes = hex_decode(hex)?;
+        let map: std::collections::BTreeMap<String, Vec<(u32, u32)>> =
+            serde_json::from_slice(&bytes).ok()?;
+        return Some(map.into_iter().collect());
+    }
     let hex = text.strip_prefix("SCMH1:")?;
     let bytes = hex_decode(hex)?;
     let map: std::collections::BTreeMap<String, Vec<u32>> = serde_json::from_slice(&bytes).ok()?;
     Some(
         map.into_iter()
-            .map(|(sheet, rows)| (sheet, rows.into_iter().collect()))
+            .map(|(sheet, rows)| (sheet, coalesce_sorted_u32_intervals(&rows)))
             .collect(),
     )
 }
 
+pub(crate) fn manual_hidden_from_names(
+    names: &[(String, Option<usize>, String)],
+) -> Option<std::collections::HashMap<String, std::collections::HashSet<u32>>> {
+    let intervals = manual_hidden_intervals_from_names(names)?;
+    Some(
+        intervals
+            .into_iter()
+            .map(|(sheet, ivs)| {
+                let total: usize = ivs.iter().map(|&(a, b)| (b.saturating_sub(a) as usize) + 1).sum();
+                let mut set = std::collections::HashSet::with_capacity(total);
+                for (lo, hi) in ivs {
+                    if lo <= hi {
+                        set.extend(lo..=hi);
+                    }
+                }
+                (sheet, set)
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn encode_manual_hidden_intervals(
+    map: &std::collections::BTreeMap<String, Vec<(u32, u32)>>,
+) -> Result<String> {
+    if map.is_empty() {
+        return Ok(String::new());
+    }
+    let bytes = serde_json::to_vec(map)?;
+    Ok(format!("\"SCMH2:{}\"", hex_encode(&bytes)))
+}
+
+/// 写入手动隐藏行来源（闭区间 `SCMH2:` 编码）；空表则删除来源定义名。
+pub fn write_manual_hidden_intervals(
+    path: &Path,
+    map: &std::collections::BTreeMap<String, Vec<(u32, u32)>>,
+) -> Result<()> {
+    let text = encode_manual_hidden_intervals(map)?;
+    write_manual_hidden_encoded(path, &text)
+}
+
 /// 写入手动隐藏行来源；空表则删除来源定义名。
-/// 使用隐藏的工作簿级 definedName；内容用 hex 包装，避免表名和 JSON 字符串影响 definedName 语法。
+/// 自动合并为 `SCMH2:` 闭区间，避免百万连续隐藏行膨胀至十余 MB。
 pub fn write_manual_hidden(
     path: &Path,
     map: &std::collections::BTreeMap<String, Vec<u32>>,
 ) -> Result<()> {
-    let text = if map.is_empty() {
-        String::new()
-    } else {
-        let bytes = serde_json::to_vec(map)?;
-        format!("\"SCMH1:{}\"", hex_encode(&bytes))
-    };
+    let iv_map: std::collections::BTreeMap<String, Vec<(u32, u32)>> = map
+        .iter()
+        .filter(|(_, rows)| !rows.is_empty())
+        .map(|(k, rows)| (k.clone(), coalesce_sorted_u32_intervals(rows)))
+        .collect();
+    write_manual_hidden_intervals(path, &iv_map)
+}
+
+fn write_manual_hidden_encoded(path: &Path, text: &str) -> Result<()> {
     rewrite_zip_where(
         path,
         |n| n == "xl/workbook.xml",
@@ -1253,44 +1317,45 @@ pub fn write_manual_hidden(
                 return xml.into_bytes();
             }
             let mut out = String::with_capacity(xml.len() + text.len() + 80);
-        let mut rest = xml.as_str();
-        while let Some(i) = rest.find("<definedName ") {
-            out.push_str(&rest[..i]);
-            let Some(head_end) = rest[i..].find('>').map(|e| i + e) else {
-                out.push_str(&rest[i..]);
-                return out.into_bytes();
-            };
-            let Some(tail) = rest[head_end..]
-                .find("</definedName>")
-                .map(|e| head_end + e)
-            else {
-                out.push_str(&rest[i..]);
-                return out.into_bytes();
-            };
-            let end = tail + "</definedName>".len();
-            if !rest[i..head_end].contains(&format!("name=\"{MANUAL_HIDDEN_NAME}\"")) {
-                out.push_str(&rest[i..end]);
+            let mut rest = xml.as_str();
+            while let Some(i) = rest.find("<definedName ") {
+                out.push_str(&rest[..i]);
+                let Some(head_end) = rest[i..].find('>').map(|e| i + e) else {
+                    out.push_str(&rest[i..]);
+                    return out.into_bytes();
+                };
+                let Some(tail) = rest[head_end..]
+                    .find("</definedName>")
+                    .map(|e| head_end + e)
+                else {
+                    out.push_str(&rest[i..]);
+                    return out.into_bytes();
+                };
+                let end = tail + "</definedName>".len();
+                if !rest[i..head_end].contains(&format!("name=\"{MANUAL_HIDDEN_NAME}\"")) {
+                    out.push_str(&rest[i..end]);
+                }
+                rest = &rest[end..];
             }
-            rest = &rest[end..];
-        }
-        out.push_str(rest);
-        if !text.is_empty() {
-            let def = format!(
-                "<definedName name=\"{MANUAL_HIDDEN_NAME}\" hidden=\"1\">{text}</definedName>"
-            );
-            if let Some(i) = out.find("</definedNames>") {
-                out.insert_str(i, &def);
-            } else if let Some((i, tag)) = ["<definedNames/>", "<definedNames />"]
-                .iter()
-                .find_map(|tag| out.find(tag).map(|i| (i, *tag)))
-            {
-                out.replace_range(i..i + tag.len(), &format!("<definedNames>{def}</definedNames>"));
-            } else if let Some(i) = out.find("</sheets>") {
-                out.insert_str(i + "</sheets>".len(), &format!("<definedNames>{def}</definedNames>"));
+            out.push_str(rest);
+            if !text.is_empty() {
+                let def = format!(
+                    "<definedName name=\"{MANUAL_HIDDEN_NAME}\" hidden=\"1\">{text}</definedName>"
+                );
+                if let Some(i) = out.find("</definedNames>") {
+                    out.insert_str(i, &def);
+                } else if let Some((i, tag)) = ["<definedNames/>", "<definedNames />"]
+                    .iter()
+                    .find_map(|tag| out.find(tag).map(|i| (i, *tag)))
+                {
+                    out.replace_range(i..i + tag.len(), &format!("<definedNames>{def}</definedNames>"));
+                } else if let Some(i) = out.find("</sheets>") {
+                    out.insert_str(i + "</sheets>".len(), &format!("<definedNames>{def}</definedNames>"));
+                }
             }
-        }
-        out.into_bytes()
-    })
+            out.into_bytes()
+        },
+    )
 }
 
 /// 关闭筛选后删除 workbook.xml 中指向该表的 _xlnm._FilterDatabase。
@@ -3495,4 +3560,39 @@ pub fn set_calc_iteration(xml: &str, iterate: bool, max_iterations: u32, max_cha
 fn fmt_change(v: f64) -> String {
     let s = format!("{v}");
     if s.contains('e') || s.contains('E') { format!("{v:.10}").trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
+}
+
+#[cfg(test)]
+mod scmh2_tests {
+    use super::*;
+
+    #[test]
+    fn scmh2_manual_hidden_intervals_and_scmh1_backward_compat() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("Sheet1".to_string(), vec![(0, 4), (9, 9), (20, 100_000)]);
+        let encoded = encode_manual_hidden_intervals(&map).unwrap();
+        assert!(encoded.starts_with("\"SCMH2:"));
+
+        let names = vec![(MANUAL_HIDDEN_NAME.to_string(), None, encoded)];
+        let ivs = manual_hidden_intervals_from_names(&names).unwrap();
+        assert_eq!(ivs["Sheet1"], vec![(0, 4), (9, 9), (20, 100_000)]);
+
+        // Legacy SCMH1 backward compatibility
+        let mut old_map = std::collections::BTreeMap::new();
+        old_map.insert("Sheet1".to_string(), vec![1u32, 3, 4]);
+        let old_hex = hex_encode(&serde_json::to_vec(&old_map).unwrap());
+        let old_names = vec![(
+            MANUAL_HIDDEN_NAME.to_string(),
+            None,
+            format!("\"SCMH1:{old_hex}\""),
+        )];
+        let old_ivs = manual_hidden_intervals_from_names(&old_names).unwrap();
+        assert_eq!(old_ivs["Sheet1"], vec![(1, 1), (3, 4)]);
+        let legacy_sets = manual_hidden_from_names(&old_names).unwrap();
+        assert!(
+            legacy_sets["Sheet1"].contains(&1)
+                && legacy_sets["Sheet1"].contains(&3)
+                && legacy_sets["Sheet1"].contains(&4)
+        );
+    }
 }

@@ -63,6 +63,8 @@ pub(super) struct ParsedCsv {
     pub delim: char,
     pub encoding: Encoding,
     pub raw_bytes: Option<Arc<Vec<u8>>>,
+    pub decoded_text: Option<Arc<str>>,
+    pub utf8_verified: bool,
 }
 
 fn read_csv_bytes(path: &Path, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
@@ -109,10 +111,17 @@ fn read_csv_summary(
     if !within_grid((0, 0), summary.row_count, summary.cols) {
         return Err("数据超出工作表边界".into());
     }
-    drop(text);
-    // Retain raw file bytes up to 64 MiB so confirming the wizard avoids re-reading disk,
-    // without holding hundreds of megabytes of per-cell String objects in memory.
-    let raw_bytes = (bytes.len() <= 64 * 1024 * 1024).then(|| Arc::new(bytes));
+    const RETAIN_CAP: usize = 256 * 1024 * 1024;
+    let (raw_bytes, decoded_text, utf8_verified) = match text {
+        std::borrow::Cow::Borrowed(_) if bytes.len() <= RETAIN_CAP => {
+            (Some(Arc::new(bytes)), None, encoding == Encoding::Utf8)
+        }
+        std::borrow::Cow::Owned(s) if s.len() <= RETAIN_CAP => {
+            drop(bytes);
+            (None, Some(Arc::<str>::from(s)), false)
+        }
+        _ => (None, None, false),
+    };
     Ok(ParsedCsv {
         preview_rows: summary.preview_rows,
         row_count: summary.row_count,
@@ -120,6 +129,8 @@ fn read_csv_summary(
         delim: summary.delim,
         encoding: summary.encoding,
         raw_bytes,
+        decoded_text,
+        utf8_verified,
     })
 }
 
@@ -223,7 +234,9 @@ impl CsvDlg {
 
     fn discard_records(&mut self) {
         if let Some(data) = self.records.take() {
-            if data.raw_bytes.as_ref().is_some_and(|b| b.len() > 1024 * 1024) {
+            let big = data.raw_bytes.as_ref().is_some_and(|b| b.len() > 1024 * 1024)
+                || data.decoded_text.as_ref().is_some_and(|s| s.len() > 1024 * 1024);
+            if big {
                 std::thread::spawn(move || drop(data));
             }
         }
@@ -367,42 +380,64 @@ fn prepare(
             parsed,
         } => {
             let owned_bytes;
-            let (raw_slice, actual_delim, actual_enc) = if let Some(ref data) = parsed {
-                if data.row_count == 0 {
-                    return Err("这个文件里没有可导入的内容".into());
-                }
-                if !within_grid(target.at, data.row_count, data.cols) {
-                    return Err("数据超出工作表边界".into());
-                }
-                let slice: &[u8] = if let Some(ref arc) = data.raw_bytes {
-                    arc.as_slice()
+            let decoded_cow;
+            let (text_ref, actual_delim, used_enc): (&str, char, Encoding) =
+                if let Some(ref data) = parsed {
+                    if data.row_count == 0 {
+                        return Err("这个文件里没有可导入的内容".into());
+                    }
+                    if !within_grid(target.at, data.row_count, data.cols) {
+                        return Err("数据超出工作表边界".into());
+                    }
+                    let actual_enc = opts.encoding.unwrap_or(data.encoding);
+                    if actual_enc == data.encoding
+                        && let Some(ref arc_str) = data.decoded_text
+                    {
+                        (arc_str.as_ref(), delim, actual_enc)
+                    } else if actual_enc == data.encoding
+                        && data.utf8_verified
+                        && let Some(ref arc_bytes) = data.raw_bytes
+                    {
+                        let raw = arc_bytes.as_slice();
+                        let stripped = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
+                        // SAFETY: `raw` was validated via `std::str::from_utf8` in `read_csv_summary`.
+                        let s = unsafe { std::str::from_utf8_unchecked(stripped) };
+                        (s, delim, actual_enc)
+                    } else {
+                        let slice: &[u8] = if let Some(ref arc) = data.raw_bytes {
+                            arc.as_slice()
+                        } else {
+                            owned_bytes = read_csv_bytes(&path, cancel)?;
+                            owned_bytes.as_slice()
+                        };
+                        let (t, enc, bad) = csv::decode_cow(slice, Some(actual_enc));
+                        check_cancelled(cancel)?;
+                        if bad {
+                            return Err("所选编码无法完整解码这个文件".into());
+                        }
+                        decoded_cow = t;
+                        (decoded_cow.as_ref(), delim, enc)
+                    }
                 } else {
                     owned_bytes = read_csv_bytes(&path, cancel)?;
-                    owned_bytes.as_slice()
+                    let (t, enc, bad) = csv::decode_cow(&owned_bytes, opts.encoding);
+                    check_cancelled(cancel)?;
+                    if bad {
+                        return Err("所选编码无法完整解码这个文件".into());
+                    }
+                    let d = if delim == ',' && !t.lines().next().unwrap_or("").contains(',') {
+                        csv::sniff(&t)
+                    } else {
+                        delim
+                    };
+                    decoded_cow = t;
+                    (decoded_cow.as_ref(), d, enc)
                 };
-                (slice, delim, data.encoding)
-            } else {
-                owned_bytes = read_csv_bytes(&path, cancel)?;
-                let (probe, enc, bad) = csv::decode_cow(&owned_bytes, opts.encoding);
-                if bad {
-                    return Err("所选编码无法完整解码这个文件".into());
-                }
-                let d = if delim == ',' && !probe.lines().next().unwrap_or("").contains(',') {
-                    csv::sniff(&probe)
-                } else {
-                    delim
-                };
-                (owned_bytes.as_slice(), d, enc)
-            };
-            let (text, used_enc, bad) = csv::decode_cow(raw_slice, Some(actual_enc));
             check_cancelled(cancel)?;
-            if bad {
-                return Err("所选编码无法完整解码这个文件".into());
-            }
             opts.encoding = Some(used_enc);
             let (rows, cols, imported_keys) = external::import_csv_str_parallel(
                 &mut result,
-                &text,
+                text_ref,
                 actual_delim,
                 opts.quote,
                 header,

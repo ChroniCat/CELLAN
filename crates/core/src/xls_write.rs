@@ -861,17 +861,52 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
         bail!(".xls 最多 255 张工作表");
     }
     for sheet in &wb.sheets {
-        let coordinates = sheet.iter().map(|(pos, _)| (pos.row, pos.col))
-            .chain(sheet.styles.keys().chain(sheet.notes.keys().copied()).map(|pos| (pos.row, pos.col)))
+        let cells_over = sheet
+            .used_bounds()
+            .is_some_and(|(_, _, max_r, max_c)| max_r > u16::MAX as u32 || max_c > u8::MAX as u32);
+        let styles_over = sheet
+            .styles
+            .max_coords()
+            .is_some_and(|(max_r, max_c)| max_r > u16::MAX as u32 || max_c > u8::MAX as u32);
+        if cells_over || styles_over {
+            let coordinates = sheet
+                .iter()
+                .map(|(pos, _)| (pos.row, pos.col))
+                .chain(sheet.styles.keys().map(|pos| (pos.row, pos.col)));
+            for (r, c) in coordinates {
+                if r > u16::MAX as u32 || c > u8::MAX as u32 {
+                    bail!(
+                        "工作表 {} 的第 {} 行、第 {} 列超出 .xls 的 65536 行、256 列范围，请另存为 .xlsx",
+                        sheet.name,
+                        u64::from(r) + 1,
+                        u64::from(c) + 1
+                    );
+                }
+            }
+        }
+        let meta_coords = sheet
+            .notes
+            .keys()
+            .copied()
+            .map(|pos| (pos.row, pos.col))
             .chain(sheet.rows.custom_pairs().into_iter().map(|(row, _)| (row, 0)))
             .chain(sheet.cols.custom_pairs().into_iter().map(|(col, _)| (0, col)))
             .chain(sheet.row_styles.keys().map(|&row| (row, 0)))
             .chain(sheet.col_styles.keys().map(|&col| (0, col)))
-            .chain(sheet.merges.iter().flat_map(|&(r1, c1, r2, c2)| [(r1, c1), (r2, c2)]));
-        for (r, c) in coordinates {
+            .chain(
+                sheet
+                    .merges
+                    .iter()
+                    .flat_map(|&(r1, c1, r2, c2)| [(r1, c1), (r2, c2)]),
+            );
+        for (r, c) in meta_coords {
             if r > u16::MAX as u32 || c > u8::MAX as u32 {
-                bail!("工作表 {} 的第 {} 行、第 {} 列超出 .xls 的 65536 行、256 列范围，请另存为 .xlsx",
-                    sheet.name, u64::from(r) + 1, u64::from(c) + 1);
+                bail!(
+                    "工作表 {} 的第 {} 行、第 {} 列超出 .xls 的 65536 行、256 列范围，请另存为 .xlsx",
+                    sheet.name,
+                    u64::from(r) + 1,
+                    u64::from(c) + 1
+                );
             }
         }
     }

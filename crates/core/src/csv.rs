@@ -106,6 +106,43 @@ mod tests {
         let rows = parse_auto("a,b\n\n\n1,2\n");
         assert_eq!(rows.len(), 2);
     }
+
+    #[test]
+    fn simd_scan_partition_and_streaming_csv_export_roundtrip() {
+        let mut csv_text = String::with_capacity(600_000);
+        csv_text.push_str("id,label,amount\n");
+        for i in 0..20_000usize {
+            if i % 500 == 0 {
+                csv_text.push_str(&format!("{i},\"含,逗号与\"\"引号\"\"\n第二行\",{}.25\n", i * 10));
+            } else {
+                csv_text.push_str(&format!("{i},item_{i},{}.5\n", i));
+            }
+        }
+        let summary = scan_summary_while(&csv_text, ',', '"', Encoding::Utf8, 8, || true).unwrap();
+        assert_eq!(summary.row_count, 20_001);
+        assert_eq!(summary.cols, 3);
+        assert_eq!(summary.preview_rows.len(), 8);
+
+        let chunks = partition_csv_chunks(&csv_text, ',', '"', 4).unwrap();
+        assert!(chunks.len() >= 2);
+        let mut total_rows = 0usize;
+        for &(s, e, start_r) in &chunks {
+            assert_eq!(start_r, total_rows);
+            let parsed = records_strict(&csv_text[s..e], ',').unwrap();
+            total_rows += parsed.len();
+        }
+        assert_eq!(total_rows, 20_001);
+
+        let mut wb = crate::model::Workbook::new_blank();
+        let sh = &mut wb.sheets[0];
+        sh.set(0, 0, crate::model::Cell { value: crate::model::Value::Text("姓名,部门".into()), formula: None });
+        sh.set(0, 2, crate::model::Cell { value: crate::model::Value::Number(123.45), formula: None });
+        sh.set(1, 1, crate::model::Cell { value: crate::model::Value::Bool(true), formula: None });
+        let mut exported = Vec::new();
+        export_sheet_csv_writer(sh, &wb.styles, wb.date_system, &mut exported, ',').unwrap();
+        let out_str = String::from_utf8(exported).unwrap();
+        assert_eq!(out_str, "\"姓名,部门\",,123.45\n,TRUE,\n");
+    }
 }
 
 /// CSV 文本编码。BOM 优先，其次按 UTF-8 严格解码，失败再按 GB18030。
@@ -362,7 +399,7 @@ pub fn decode_cow(bytes: &[u8], wanted: Option<Encoding>) -> (std::borrow::Cow<'
 pub fn read_preview_head(
     path: &std::path::Path,
     wanted: Option<Encoding>,
-    quote: char,
+    _quote: char,
     max_rows: usize,
 ) -> Option<(Vec<Vec<String>>, usize, char, Encoding)> {
     use std::io::Read;
@@ -445,12 +482,60 @@ pub fn scan_summary_while(
         let qb = quote as u8;
         let mut i = 0usize;
         let mut seg_start = 0usize;
+        let mut last_cancel_check = 0usize;
         while i < bytes.len() {
-            if (i & 8191) == 0 && !keep_going() {
+            if i.saturating_sub(last_cancel_check) >= 8192 {
+                last_cancel_check = i;
+                if !keep_going() {
+                    return Err("CSV 读取已取消".into());
+                }
+            } else if (i & 8191) == 0 && !keep_going() {
                 return Err("CSV 读取已取消".into());
             }
-            let b = bytes[i];
             let collecting = row_count < preview_limit;
+            if in_quotes && !collecting {
+                let rem = &bytes[i..];
+                let window = &rem[..rem.len().min(8192)];
+                match crate::xlsx::sheets::stream::simd_memchr2(qb, b'\n', window) {
+                    Some(rel) => {
+                        if rel > 0 {
+                            field_non_empty = true;
+                            if !field_non_ws
+                                && window[..rel].iter().any(|b| !b.is_ascii_whitespace())
+                            {
+                                field_non_ws = true;
+                            }
+                            i += rel;
+                        }
+                    }
+                    None => {
+                        field_non_empty = true;
+                        if !field_non_ws && window.iter().any(|b| !b.is_ascii_whitespace()) {
+                            field_non_ws = true;
+                        }
+                        i += window.len();
+                        continue;
+                    }
+                }
+            } else if !in_quotes
+                && !closed
+                && !collecting
+                && field_non_empty
+                && (cur_cols > 0 || field_non_ws)
+            {
+                let rem = &bytes[i..];
+                let window = &rem[..rem.len().min(8192)];
+                match crate::xlsx::sheets::stream::simd_memchr2(db, b'\n', window) {
+                    Some(rel) => {
+                        i += rel;
+                    }
+                    None => {
+                        i += window.len();
+                        continue;
+                    }
+                }
+            }
+            let b = bytes[i];
             if in_quotes {
                 if b == qb {
                     if bytes.get(i + 1) == Some(&qb) {
@@ -645,6 +730,29 @@ pub fn partition_csv_chunks(
     let mut i = 0usize;
 
     while i < bytes.len() {
+        if in_quotes {
+            if let Some(rel) = crate::xlsx::sheets::stream::simd_memchr(qb, &bytes[i..]) {
+                i += rel;
+                if bytes.get(i + 1) == Some(&qb) {
+                    i += 2;
+                    continue;
+                }
+                in_quotes = false;
+                i += 1;
+                continue;
+            } else {
+                break;
+            }
+        } else if field_non_empty && (cur_cols > 0 || field_non_ws) {
+            match crate::xlsx::sheets::stream::simd_memchr2(db, b'\n', &bytes[i..]) {
+                Some(rel) => {
+                    i += rel;
+                }
+                None => {
+                    break;
+                }
+            }
+        }
         let b = bytes[i];
         if in_quotes {
             if b == qb {
@@ -722,4 +830,132 @@ pub fn records(text: &str, delim: char) -> Vec<Vec<String>> {
         .into_iter()
         .filter(|r| !(r.len() == 1 && r[0].trim().is_empty()))
         .collect()
+}
+
+fn write_csv_escaped_bytes(out: &mut Vec<u8>, s: &str, delim: char) {
+    let bytes = s.as_bytes();
+    let need_quote = if delim.is_ascii() {
+        let db = delim as u8;
+        crate::xlsx::sheets::stream::simd_memchr3(db, b'"', b'\n', bytes).is_some()
+            || crate::xlsx::sheets::stream::simd_memchr(b'\r', bytes).is_some()
+    } else {
+        s.chars().any(|c| c == delim || c == '"' || c == '\n' || c == '\r')
+    };
+    if !need_quote {
+        out.extend_from_slice(bytes);
+        return;
+    }
+    out.push(b'"');
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        match crate::xlsx::sheets::stream::simd_memchr(b'"', &bytes[pos..]) {
+            Some(rel) => {
+                out.extend_from_slice(&bytes[pos..pos + rel + 1]);
+                out.push(b'"');
+                pos += rel + 1;
+            }
+            None => {
+                out.extend_from_slice(&bytes[pos..]);
+                break;
+            }
+        }
+    }
+    out.push(b'"');
+}
+
+/// Stream `sheet` to `writer` as RFC-4180 CSV/TSV without materializing an intermediate
+/// `Vec<Vec<String>>`, formatting numbers via `zmij` when `num_format` is General/empty.
+pub fn export_sheet_csv_writer(
+    sheet: &crate::model::Sheet,
+    styles: &crate::style::StyleTable,
+    date_system: crate::model::DateSystem,
+    mut writer: impl std::io::Write,
+    delim: char,
+) -> std::io::Result<()> {
+    let Some((min_r, min_c, max_r, max_c)) = sheet.used_bounds() else {
+        return writer.flush();
+    };
+    let _ = min_r;
+    let _ = min_c;
+    let mut delim_utf8 = [0u8; 4];
+    let delim_bytes = delim.encode_utf8(&mut delim_utf8).as_bytes();
+    let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+    let mut it = sheet.cells().iter_rect_views((0, 0, max_r, max_c)).peekable();
+
+    for r in 0..=max_r {
+        let mut next_col = 0u32;
+        while let Some(&(pos, view)) = it.peek() {
+            if pos.row != r {
+                break;
+            }
+            let _ = it.next();
+            while next_col < pos.col {
+                buf.extend_from_slice(delim_bytes);
+                next_col += 1;
+            }
+            let sid = sheet.style_of(pos.row, pos.col);
+            let fmt = if sid == 0 {
+                ""
+            } else {
+                styles.get(sid).format.as_str()
+            };
+            let plain_num = fmt.is_empty() || fmt.eq_ignore_ascii_case("General");
+            let val_cow = view.value();
+            match val_cow.as_ref() {
+                crate::model::Value::Empty => {}
+                crate::model::Value::Number(n) if plain_num && n.is_finite() => {
+                    let n = if *n == 0.0 { 0.0 } else { *n };
+                    let iv = n as i64;
+                    if (iv as f64) == n && iv.unsigned_abs() < 10_000_000_000_000_000 {
+                        let _ = std::io::Write::write_fmt(&mut buf, format_args!("{iv}"));
+                    } else {
+                        let _ = serde_json::to_writer(&mut buf, &n);
+                    }
+                }
+                crate::model::Value::Bool(b) if plain_num => {
+                    buf.extend_from_slice(if *b { b"TRUE" } else { b"FALSE" });
+                }
+                crate::model::Value::Error(e) => {
+                    buf.extend_from_slice(e.text().as_bytes());
+                }
+                crate::model::Value::Text(s) if plain_num => {
+                    write_csv_escaped_bytes(&mut buf, s.as_ref(), delim);
+                }
+                owned => {
+                    let rendered = crate::style::format_value_in(date_system, owned, fmt);
+                    write_csv_escaped_bytes(&mut buf, &rendered, delim);
+                }
+            }
+            if pos.col < max_c {
+                buf.extend_from_slice(delim_bytes);
+            }
+            next_col = pos.col + 1;
+        }
+        while next_col < max_c {
+            buf.extend_from_slice(delim_bytes);
+            next_col += 1;
+        }
+        buf.push(b'\n');
+        if buf.len() >= 192 * 1024 {
+            writer.write_all(&buf)?;
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        writer.write_all(&buf)?;
+    }
+    writer.flush()
+}
+
+/// Stream `sheet` to `path` as UTF-8 CSV/TSV with a 256 KiB buffered writer.
+pub fn export_sheet_csv(
+    sheet: &crate::model::Sheet,
+    styles: &crate::style::StyleTable,
+    date_system: crate::model::DateSystem,
+    path: &std::path::Path,
+    delim: char,
+) -> std::io::Result<()> {
+    let file = std::fs::File::create(path)?;
+    let writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+    export_sheet_csv_writer(sheet, styles, date_system, writer, delim)
 }
