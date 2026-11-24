@@ -211,10 +211,51 @@ pub(crate) fn from_sheet(
     plan: &SortPermutation,
     pending: impl Fn() -> bool,
 ) -> Option<SortBatch> {
+    let (r1, c1, r2, c2) = plan.region;
+    let active_offsets: Option<Vec<u32>> = if !plan.horizontal
+        && sh.row_styles.keys().all(|&r| !(r1..=r2).contains(&r))
+    {
+        let offset_len = (c2 - c1 + 1) as usize;
+        let mut used = vec![false; offset_len];
+        let mut count = 0usize;
+        for &c in sh.col_styles.keys() {
+            if (c1..=c2).contains(&c) && !std::mem::replace(&mut used[(c - c1) as usize], true) {
+                count += 1;
+            }
+        }
+        if count < offset_len {
+            for (k, _) in sh.iter_rect(plan.region) {
+                if !std::mem::replace(&mut used[(k.col - c1) as usize], true) {
+                    count += 1;
+                    if count == offset_len {
+                        break;
+                    }
+                }
+            }
+        }
+        if count < offset_len {
+            for (k, _) in sh.styles.iter_rect(plan.region) {
+                if !std::mem::replace(&mut used[(k.col - c1) as usize], true) {
+                    count += 1;
+                    if count == offset_len {
+                        break;
+                    }
+                }
+            }
+        }
+        Some(
+            used.into_iter()
+                .enumerate()
+                .filter_map(|(i, on)| on.then_some(c1 + i as u32))
+                .collect(),
+        )
+    } else {
+        None
+    };
     let mut styles = std::collections::HashMap::new();
     SortBatch::expand_while(
         plan,
-        None,
+        active_offsets.as_deref(),
         |r, c| {
             let style = styles
                 .entry(sh.style_of(r, c))
@@ -293,37 +334,15 @@ impl RoomGrids {
         let (offset_start, offset_end) = if plan.horizontal { (r1, r2) } else { (c1, c2) };
         let offset_len = (offset_end - offset_start + 1) as usize;
         let mut occupied_offset = vec![false; offset_len];
-        let mut mark = |r: u32, c: u32| {
+        let mut occupied_count = 0usize;
+        let mark_slot = |occupied: &mut [bool], count: &mut usize, r: u32, c: u32| {
             let off = if plan.horizontal { r } else { c };
-            occupied_offset[(off - offset_start) as usize] = true;
+            let slot = &mut occupied[(off - offset_start) as usize];
+            if !*slot {
+                *slot = true;
+                *count += 1;
+            }
         };
-
-        let mut cell_map: std::collections::HashMap<(u32, u32), (ValueWire, Option<Arc<str>>)> =
-            std::collections::HashMap::new();
-        let mut style_map: std::collections::HashMap<(u32, u32), Arc<CellStyle>> =
-            std::collections::HashMap::new();
-        let mut base_style_cache: std::collections::HashMap<u64, Vec<Arc<CellStyle>>> =
-            std::collections::HashMap::new();
-
-        if let Some(base) = &self.baseline {
-            base.for_each_cell_in_rect(plan.sheet, plan.region, |r, c, cell| {
-                mark(r, c);
-                cell_map.insert((r, c), ((&cell.value).into(), cell.formula.clone()));
-            });
-            base.for_each_style_in_rect(plan.sheet, plan.region, |r, c, st| {
-                mark(r, c);
-                let h = sheetcore::sync::cell_style_hash(st);
-                let bucket = base_style_cache.entry(h).or_default();
-                let shared = if let Some(found) = bucket.iter().find(|s| s.as_ref() == st) {
-                    found.clone()
-                } else {
-                    let arc = Arc::new(st.clone());
-                    bucket.push(arc.clone());
-                    arc
-                };
-                style_map.insert((r, c), shared);
-            });
-        }
 
         let sheet_axis = self.axis_styles.get(&plan.sheet);
         let mut fill_all_offsets = false;
@@ -333,42 +352,61 @@ impl RoomGrids {
                     fill_all_offsets = true;
                 } else {
                     for (&r, _) in ax.rows.range(r1..=r2) {
-                        mark(r, c1);
+                        mark_slot(&mut occupied_offset, &mut occupied_count, r, c1);
                     }
                 }
             } else if ax.rows.range(r1..=r2).next().is_some() {
                 fill_all_offsets = true;
             } else {
                 for (&c, _) in ax.cols.range(c1..=c2) {
-                    mark(r1, c);
+                    mark_slot(&mut occupied_offset, &mut occupied_count, r1, c);
                 }
             }
         }
 
-        for (&(_, r, c), op) in self
+        let mut has_cell_overlay = false;
+        for (&(_, r, c), _) in self
             .cells
             .range((plan.sheet, r1, c1)..=(plan.sheet, r2, c2))
         {
             if (c1..=c2).contains(&c) {
-                mark(r, c);
-                if matches!(op.value, ValueWire::Empty) && op.formula.is_none() {
-                    cell_map.remove(&(r, c));
-                } else {
-                    cell_map.insert((r, c), (op.value.clone(), op.formula.clone()));
+                has_cell_overlay = true;
+                if !fill_all_offsets {
+                    mark_slot(&mut occupied_offset, &mut occupied_count, r, c);
                 }
             }
         }
-        for (&(_, r, c), st) in self
+
+        let mut has_style_overlay = false;
+        for (&(_, r, c), _) in self
             .styles
             .range((plan.sheet, r1, c1)..=(plan.sheet, r2, c2))
         {
             if (c1..=c2).contains(&c) {
-                mark(r, c);
-                style_map.insert((r, c), st.clone());
+                has_style_overlay = true;
+                if !fill_all_offsets {
+                    mark_slot(&mut occupied_offset, &mut occupied_count, r, c);
+                }
             }
         }
+
         if fill_all_offsets {
             occupied_offset.fill(true);
+        } else if let Some(base) = &self.baseline {
+            if occupied_count < offset_len {
+                base.for_each_cell_in_rect(plan.sheet, plan.region, |r, c, _| {
+                    if occupied_count < offset_len {
+                        mark_slot(&mut occupied_offset, &mut occupied_count, r, c);
+                    }
+                });
+            }
+            if occupied_count < offset_len {
+                base.for_each_style_in_rect(plan.sheet, plan.region, |r, c, _| {
+                    if occupied_count < offset_len {
+                        mark_slot(&mut occupied_offset, &mut occupied_count, r, c);
+                    }
+                });
+            }
         }
 
         let active_offsets: Vec<u32> = occupied_offset
@@ -377,16 +415,40 @@ impl RoomGrids {
             .filter_map(|(i, used)| used.then_some(offset_start + i as u32))
             .collect();
 
+        let mut style_id_cache: std::collections::HashMap<u16, Arc<CellStyle>> =
+            std::collections::HashMap::new();
+
         SortBatch::expand_while(
             plan,
             Some(&active_offsets),
             |r, c| {
-                let (val, formula) = cell_map
-                    .get(&(r, c))
-                    .cloned()
-                    .unwrap_or((ValueWire::Empty, None));
-                let st = if let Some(explicit) = style_map.get(&(r, c)) {
+                let (val, formula) = if has_cell_overlay
+                    && let Some(op) = self.cells.get(&(plan.sheet, r, c))
+                {
+                    if matches!(op.value, ValueWire::Empty) && op.formula.is_none() {
+                        (ValueWire::Empty, None)
+                    } else {
+                        (op.value.clone(), op.formula.clone())
+                    }
+                } else if let Some(base) = &self.baseline
+                    && let Some(vf) = base.cell_value_wire(plan.sheet, r, c)
+                {
+                    vf
+                } else {
+                    (ValueWire::Empty, None)
+                };
+
+                let st = if has_style_overlay
+                    && let Some(explicit) = self.styles.get(&(plan.sheet, r, c))
+                {
                     explicit.clone()
+                } else if let Some(base) = &self.baseline
+                    && let Some(sid) = base.cell_style_id(plan.sheet, r, c)
+                {
+                    style_id_cache
+                        .entry(sid)
+                        .or_insert_with(|| Arc::new(base.styles.get(sid).clone()))
+                        .clone()
                 } else if let Some(axis_st) = sheet_axis.and_then(|ax| ax.get(r, c)) {
                     axis_st.clone()
                 } else {

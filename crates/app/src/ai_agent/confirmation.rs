@@ -85,8 +85,8 @@ impl SheetApp {
                     if u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1) > 50_000 {
                         return Err("公式填充区域超过 50000 格".into());
                     }
-                    if !(r1..=r2)
-                        .any(|r| (c1..=c2).any(|c| sheet.get(r, c).is_some_and(|v| !v.is_blank())))
+                    if !sheetcore::sync::iter_sheet_rect(sheet, (r1, c1, r2, c2))
+                        .any(|(_, v)| !v.is_blank())
                     {
                         return Ok(None);
                     }

@@ -23,11 +23,13 @@ const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 pub const BINARY_V3_MAGIC: u8 = 0x02;
 /// v3 二进制帧体最小长度：`1B flags + 8B counter + 32B HMAC-SHA256`
 pub const BINARY_V3_MIN_BODY_LEN: usize = 1 + 8 + 32;
-/// v3 flags 标志位：`bit0 = compressed`，`bits 1..=2 = dir`，`bit6 = v3 域分离标记`
+/// v3 flags 标志位：`bit0 = compressed`，`bits 1..=2 = dir`，`bit3 = compact_bin`，`bit6 = v3 域分离标记`
 const V3_FLAG_COMPRESSED: u8 = 0x01;
 const V3_FLAG_DIR_MASK: u8 = 0x06;
+pub const V3_FLAG_COMPACT_BIN: u8 = 0x08;
 const V3_FLAG_MARKER: u8 = 0x40;
-const V3_FLAG_ALLOWED_MASK: u8 = V3_FLAG_MARKER | V3_FLAG_DIR_MASK | V3_FLAG_COMPRESSED;
+const V3_FLAG_ALLOWED_MASK: u8 =
+    V3_FLAG_MARKER | V3_FLAG_COMPACT_BIN | V3_FLAG_DIR_MASK | V3_FLAG_COMPRESSED;
 
 #[inline(always)]
 fn init_chacha_state(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u32; 16] {
@@ -484,12 +486,20 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// v3 二进制帧解密后的明文载荷：兼容 UTF-8 JSON 文本帧与紧凑二进制内层帧。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodedWireFrame {
+    Text(String),
+    Compact(Vec<u8>),
+}
+
 /// 预处理的帧负载：供宿主广播给多个 peer 时仅做一次可选 deflate 压缩，
 /// 各 peer 只需按自身会话密钥执行 ChaCha20 加密 + HMAC-SHA256 认证。
 #[derive(Clone, Debug)]
 pub struct PreparedPayload {
     payload: Vec<u8>,
     compressed: bool,
+    compact_bin: bool,
 }
 
 impl PreparedPayload {
@@ -498,10 +508,41 @@ impl PreparedPayload {
         self.compressed
     }
 
+    /// 该预处理负载是否为 v3 紧凑二进制内层格式
+    pub fn is_compact_bin(&self) -> bool {
+        self.compact_bin
+    }
+
     /// 预处理后（压缩或原始）负载的字节长度
     pub fn payload_len(&self) -> usize {
         self.payload.len()
     }
+}
+
+/// 预处理待发送的紧凑二进制内层帧（仅压缩一次，供多客户端零重复序列化广播）
+pub fn prepare_compact_payload(raw_bytes: Vec<u8>, compress: bool) -> std::sync::Arc<PreparedPayload> {
+    if compress && raw_bytes.len() >= COMPRESS_MIN_BYTES {
+        let mut compressed_buf = Vec::with_capacity(raw_bytes.len().min(65_536));
+        let ok = {
+            let mut enc = flate2::write::DeflateEncoder::new(
+                &mut compressed_buf,
+                flate2::Compression::fast(),
+            );
+            enc.write_all(&raw_bytes).is_ok() && enc.finish().is_ok()
+        };
+        if ok && compressed_buf.len() < raw_bytes.len() {
+            return std::sync::Arc::new(PreparedPayload {
+                payload: compressed_buf,
+                compressed: true,
+                compact_bin: true,
+            });
+        }
+    }
+    std::sync::Arc::new(PreparedPayload {
+        payload: raw_bytes,
+        compressed: false,
+        compact_bin: true,
+    })
 }
 
 /// 预处理待发送的明文 JSON 帧：
@@ -522,12 +563,14 @@ pub fn prepare_payload(plain: &str, compress: bool) -> std::sync::Arc<PreparedPa
             return std::sync::Arc::new(PreparedPayload {
                 payload: compressed_buf,
                 compressed: true,
+                compact_bin: false,
             });
         }
     }
     std::sync::Arc::new(PreparedPayload {
         payload: raw_bytes.to_vec(),
         compressed: false,
+        compact_bin: false,
     })
 }
 
@@ -641,12 +684,16 @@ impl Session {
     }
 
     #[inline]
-    fn v3_flags(&self, compressed: bool) -> u8 {
-        V3_FLAG_MARKER | ((self.send_dir & 0x03) << 1) | u8::from(compressed)
+    fn v3_flags(&self, compressed: bool, compact_bin: bool) -> u8 {
+        V3_FLAG_MARKER
+            | (if compact_bin { V3_FLAG_COMPACT_BIN } else { 0 })
+            | ((self.send_dir & 0x03) << 1)
+            | u8::from(compressed)
     }
 
     /// 使用预处理的共享负载加密一帧 v2 文本帧（与 `seal`/`open` 线缆格式 100% 兼容）
     pub fn seal_prepared(&mut self, prepared: &PreparedPayload) -> String {
+        debug_assert!(!prepared.compact_bin, "v2 text frame requires UTF-8 JSON payload");
         self.send_ctr = self.send_ctr.wrapping_add(1);
         let ctr = self.send_ctr as u32;
         let wire_dir = if prepared.compressed {
@@ -666,12 +713,12 @@ impl Session {
 
     /// 使用预处理的共享负载封装一帧 v3 二进制帧并直接写入复用缓冲区 `out`（零二次分配、无 Base64 膨胀）。
     ///
-    /// 线缆格式：`[0x02][4B LE body_len][1B flags: bit0=compressed][8B LE counter][ciphertext][32B HMAC-SHA256]`。
+    /// 线缆格式：`[0x02][4B LE body_len][1B flags: bit0=compressed, bit3=compact_bin][8B LE counter][ciphertext][32B HMAC-SHA256]`。
     /// 其中 `HMAC-SHA256` 覆盖 `flags || counter || ciphertext`。
     pub fn seal_prepared_binary_into(&mut self, prepared: &PreparedPayload, out: &mut Vec<u8>) {
         self.send_ctr = self.send_ctr.wrapping_add(1);
         let ctr = self.send_ctr;
-        let flags = self.v3_flags(prepared.compressed);
+        let flags = self.v3_flags(prepared.compressed, prepared.compact_bin);
         let body_len = 1 + 8 + prepared.payload.len() + 32;
         let body_len_u32 =
             u32::try_from(body_len).expect("v3 binary frame body length exceeds u32::MAX");
@@ -695,11 +742,15 @@ impl Session {
         out
     }
 
-    /// 加密一帧为 v3 二进制帧并直接写入复用缓冲区 `out`（原地可选 deflate + ChaCha20 + HMAC-SHA256）
-    pub fn seal_binary_into(&mut self, plain: &str, compress: bool, out: &mut Vec<u8>) {
+    fn seal_bytes_v3_into(
+        &mut self,
+        raw_bytes: &[u8],
+        compress: bool,
+        compact_bin: bool,
+        out: &mut Vec<u8>,
+    ) {
         self.send_ctr = self.send_ctr.wrapping_add(1);
         let ctr = self.send_ctr;
-        let raw_bytes = plain.as_bytes();
         out.clear();
         out.reserve(5 + 1 + 8 + raw_bytes.len().min(65_536) + 32);
         // 占位 14 字节：[0x02][4B LE body_len][1B flags][8B LE counter]
@@ -725,7 +776,7 @@ impl Session {
             out.extend_from_slice(raw_bytes);
             false
         };
-        let flags = self.v3_flags(compressed);
+        let flags = self.v3_flags(compressed, compact_bin);
         let body_len = (out.len() - 5) + 32;
         let body_len_u32 =
             u32::try_from(body_len).expect("v3 binary frame body length exceeds u32::MAX");
@@ -734,6 +785,16 @@ impl Session {
         apply_keystream(&self.enc, 1, &Self::nonce_v3(flags, ctr), &mut out[ct_start..]);
         let tag = self.mac_tag(&out[5..]);
         out.extend_from_slice(&tag);
+    }
+
+    /// 加密一帧明文 JSON 为 v3 二进制帧并直接写入复用缓冲区 `out`
+    pub fn seal_binary_into(&mut self, plain: &str, compress: bool, out: &mut Vec<u8>) {
+        self.seal_bytes_v3_into(plain.as_bytes(), compress, false, out);
+    }
+
+    /// 加密一帧紧凑二进制内层载荷为 v3 二进制帧并直接写入复用缓冲区 `out`
+    pub fn seal_compact_binary_into(&mut self, raw_bytes: &[u8], compress: bool, out: &mut Vec<u8>) {
+        self.seal_bytes_v3_into(raw_bytes, compress, true, out);
     }
 
     /// 加密一帧为完整 v3 二进制帧（默认启用 deflate 自适应压缩）
@@ -861,6 +922,9 @@ impl Session {
     /// 解密并验签 v3 二进制帧体（不含 5 字节 `[0x02][4B len]` 外层头，即 `[flags][8B ctr][ciphertext][32B HMAC]`）。
     pub fn open_binary(&mut self, body: &[u8]) -> Option<String> {
         let (flags, ctr, compressed, mac_offset) = self.verify_binary_body(body)?;
+        if (flags & V3_FLAG_COMPACT_BIN) != 0 {
+            return None;
+        }
         self.recv_ctr = ctr;
         let mut plain = body[9..mac_offset].to_vec();
         apply_keystream(&self.enc, 1, &Self::nonce_v3(flags, ctr), &mut plain);
@@ -879,11 +943,20 @@ impl Session {
     }
 
     /// 零拷贝原地解密并验签已拥有缓冲区的 v3 二进制帧体（避免密文二次复制）。
-    pub fn open_binary_owned(&mut self, mut body: Vec<u8>) -> Option<String> {
+    pub fn open_binary_owned(&mut self, body: Vec<u8>) -> Option<String> {
+        match self.open_binary_frame_owned(body)? {
+            DecodedWireFrame::Text(s) => Some(s),
+            DecodedWireFrame::Compact(_) => None,
+        }
+    }
+
+    /// 零拷贝原地解密并验签 v3 二进制帧体，自动按 `V3_FLAG_COMPACT_BIN` 区分紧凑二进制内层帧与 UTF-8 JSON 帧。
+    pub fn open_binary_frame_owned(&mut self, mut body: Vec<u8>) -> Option<DecodedWireFrame> {
         let (flags, ctr, compressed, mac_offset) = self.verify_binary_body(&body)?;
+        let compact_bin = (flags & V3_FLAG_COMPACT_BIN) != 0;
         self.recv_ctr = ctr;
         apply_keystream(&self.enc, 1, &Self::nonce_v3(flags, ctr), &mut body[9..mac_offset]);
-        if compressed {
+        let raw = if compressed {
             let mut dec = flate2::read::DeflateDecoder::new(&body[9..mac_offset])
                 .take(MAX_DECOMPRESSED_BYTES + 1);
             let mut out =
@@ -892,11 +965,16 @@ impl Session {
             if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
                 return None;
             }
-            String::from_utf8(out).ok()
+            out
         } else {
             body.truncate(mac_offset);
             body.drain(..9);
-            String::from_utf8(body).ok()
+            body
+        };
+        if compact_bin {
+            Some(DecodedWireFrame::Compact(raw))
+        } else {
+            String::from_utf8(raw).ok().map(DecodedWireFrame::Text)
         }
     }
 }
@@ -1264,5 +1342,42 @@ mod tests {
         let mut h_a = Session::host_side(&room, b"same-v3");
         let mut h_b = Session::host_side(&room, b"same-v3");
         assert_eq!(h_a.seal_binary(&big), h_b.seal_prepared_binary(&prepared));
+    }
+
+    #[test]
+    fn v3_compact_binary_flag_roundtrip_and_type_separation() {
+        let room = RoomKey::derive_with_iters("compact-pw", b"compact-salt", 8);
+        let mut host = Session::host_side(&room, b"conn-compact");
+        let mut client = Session::client_side(&room, b"conn-compact");
+
+        // 1. 小型紧凑二进制帧（不压缩）
+        let raw_small = vec![0x08, 42, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0];
+        let mut scratch = Vec::new();
+        host.seal_compact_binary_into(&raw_small, true, &mut scratch);
+        assert_eq!(scratch[0], BINARY_V3_MAGIC);
+        assert_ne!(scratch[5] & V3_FLAG_COMPACT_BIN, 0);
+        // JSON 专用解码入口必须拒绝 V3_FLAG_COMPACT_BIN（类型安全隔离）
+        let mut probe_json = Session::client_side(&room, b"conn-compact");
+        assert!(probe_json.open_binary(&scratch[5..]).is_none());
+        match client.open_binary_frame_owned(scratch[5..].to_vec()) {
+            Some(DecodedWireFrame::Compact(got)) => assert_eq!(got, raw_small),
+            other => panic!("expected Compact frame, got {other:?}"),
+        }
+
+        // 2. 大型紧凑二进制帧（自动 deflate 压缩 + prepare_compact_payload 共享广播）
+        let mut raw_big = Vec::with_capacity(4096);
+        for i in 0..512u32 {
+            raw_big.extend_from_slice(&i.to_le_bytes());
+            raw_big.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let prep = prepare_compact_payload(raw_big.clone(), true);
+        assert!(prep.is_compact_bin());
+        assert!(prep.is_compressed());
+        host.seal_prepared_binary_into(&prep, &mut scratch);
+        assert_ne!(scratch[5] & (V3_FLAG_COMPACT_BIN | V3_FLAG_COMPRESSED), 0);
+        match client.open_binary_frame_owned(scratch[5..].to_vec()) {
+            Some(DecodedWireFrame::Compact(got)) => assert_eq!(got, raw_big),
+            other => panic!("expected decompressed Compact frame, got {other:?}"),
+        }
     }
 }

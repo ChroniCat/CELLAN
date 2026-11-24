@@ -562,9 +562,27 @@ impl SheetApp {
             if changes < 2_000 { seeds.push((sheet,op.row,op.col)); }
             changes += 1;
         }
-        for (r,c,style) in &batch.styles {
-            let id = self.wb.styles.intern(style.clone());
-            sh.set_style(*r,*c,id);
+        let mut style_intern_cache: std::collections::HashMap<
+            u64,
+            Vec<(sheetcore::style::CellStyle, u16)>,
+        > = std::collections::HashMap::new();
+        for (r, c, style) in &batch.styles {
+            let h = sheetcore::sync::cell_style_hash(style);
+            let id = if let Some(found) = style_intern_cache
+                .get(&h)
+                .and_then(|b| b.iter().find(|(s, _)| s == style))
+                .map(|(_, id)| *id)
+            {
+                found
+            } else {
+                let id = self.wb.styles.intern(style.clone());
+                style_intern_cache
+                    .entry(h)
+                    .or_default()
+                    .push((style.clone(), id));
+                id
+            };
+            sh.set_style(*r, *c, id);
         }
         if changes == 0 && batch.styles.is_empty() { return; }
         let name = sh.name.clone();
@@ -803,15 +821,15 @@ impl SheetApp {
                             },
                         ));
                     }
-                    let mut total = 0;
-                    let mut sample = Vec::new();
-                    let mut collab = collab_palette.as_ref().map(|_| Vec::new());
+                    let (total, sample) = order.apply_to_sheet_with_sample(
+                        &mut prepared,
+                        sheetcore::revision::MAX_CELLS,
+                    );
+                    let mut collab = collab_palette.as_ref().map(|_| Vec::with_capacity(total));
                     let mut style_cache: std::collections::HashMap<u16, sheetcore::style::CellStyle> =
                         std::collections::HashMap::new();
-                    for d in order.deltas() {
-                        if d.before != d.after { prepared.set(d.row, d.col, d.after.clone()); }
-                        if d.before_style != d.after_style { prepared.set_style(d.row, d.col, d.after_style); }
-                        if let (Some(out), Some(pal)) = (collab.as_mut(), collab_palette.as_ref()) {
+                    if let (Some(out), Some(pal)) = (collab.as_mut(), collab_palette.as_ref()) {
+                        for d in order.deltas() {
                             let effective_st = if d.before_style != d.after_style {
                                 let sid = prepared.style_of(d.row, d.col);
                                 Some(
@@ -823,16 +841,9 @@ impl SheetApp {
                             } else {
                                 None
                             };
-                            out.push((
-                                d.row,
-                                d.col,
-                                (&d.after.value).into(),
-                                d.after.formula.clone(),
-                                effective_st,
-                            ));
+                            let val_wire = (&d.after.value).into();
+                            out.push((d.row, d.col, val_wire, d.after.formula, effective_st));
                         }
-                        if total < sheetcore::revision::MAX_CELLS { sample.push(d); }
-                        total += 1;
                     }
                     return Ok((snapshot, prepared, PreparedChanges::Permutation { order, total, sample, collab }));
                 }
