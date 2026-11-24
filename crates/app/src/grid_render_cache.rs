@@ -8,10 +8,27 @@ use sheetcore::{
     style::Border,
     Sheet, Workbook,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{mpsc, Arc};
 
 pub(crate) type MergeRect = (u32, u32, u32, u32);
+pub(crate) type CfViewportCache = (
+    (
+        usize,
+        u64,
+        u64,
+        u32,
+        Option<u32>,
+        u32,
+        Option<u32>,
+        u32,
+        u32,
+        (u64, Option<u32>),
+        (u64, Option<u32>),
+    ),
+    Arc<HashMap<(u32, u32), cf::Overlay>>,
+    HashSet<(u32, u32)>,
+);
 
 /// 缓存未乘 `zoom`（`z = 1.0`）但已合入隐藏行列的基础坐标轴：
 /// - 隐藏行列直接通过区间段表 `Axis::hide_hidden` 在 `O(spans + intervals)` 内归并，零 `Vec<u32>` 展开；
@@ -39,7 +56,6 @@ pub(crate) struct FormulaBarKey {
     pub protected: bool,
 }
 
-#[derive(Default)]
 pub(super) struct PageBreaks {
     source: Option<(u64, Option<(u32, u32, u32, u32)>, u64, u64, PageSetup)>,
     lines: Arc<(Vec<f32>, Vec<f32>)>,
@@ -55,9 +71,37 @@ pub(super) struct PageBreaks {
     pub(crate) formula_bar: Option<(FormulaBarKey, Arc<str>)>,
     /// 并排比较副窗格持久复用的 `Rules`（防止每帧 `std::mem::take` 重建与销毁副窗格缓存和后台统计线程）。
     pub(crate) compare_cf_inputs: Option<Box<Rules>>,
+    /// 并排比较副窗格持久复用的条件格式统计与视口缓存（消除每帧重置 `cf_stats_gen = u64::MAX`）。
+    pub(crate) compare_cf_stats: cf::CfStats,
+    pub(crate) compare_cf_gen: u64,
+    pub(crate) compare_cf_cache: Option<CfViewportCache>,
+}
+
+impl Default for PageBreaks {
+    fn default() -> Self {
+        Self {
+            source: None,
+            lines: Arc::new((Vec::new(), Vec::new())),
+            replace_broadcast: VecDeque::new(),
+            last_font_scan: None,
+            wheel_zoom_until: None,
+            base_axes: std::cell::RefCell::new(None),
+            formula_bar: None,
+            compare_cf_inputs: None,
+            compare_cf_stats: cf::CfStats::default(),
+            compare_cf_gen: u64::MAX,
+            compare_cf_cache: None,
+        }
+    }
 }
 
 impl PageBreaks {
+    pub(crate) fn reset_compare_cache(&mut self) {
+        self.compare_cf_inputs = None;
+        self.compare_cf_stats = cf::CfStats::default();
+        self.compare_cf_gen = u64::MAX;
+        self.compare_cf_cache = None;
+    }
     pub fn get(&mut self, sheet: &Sheet) -> Arc<(Vec<f32>, Vec<f32>)> {
         // Large explicit print areas are clamped to used bounds by page_breaks.
         let area = sheet.used_bounds();
@@ -101,6 +145,7 @@ pub(crate) struct MergeCache {
     sorted_by_top: Vec<MergeRect>,
     prefix_max_bottom: Vec<u32>,
     max_row: u32,
+    max_col: u32,
 }
 
 impl MergeCache {
@@ -117,12 +162,20 @@ impl MergeCache {
         self.prefix_max_bottom.clear();
         self.prefix_max_bottom.reserve(self.sorted_by_top.len());
         let mut max_r = 0u32;
-        for &(_, _, r2, _) in &self.sorted_by_top {
+        let mut max_c = 0u32;
+        for &(_, _, r2, c2) in &self.sorted_by_top {
             max_r = max_r.max(r2);
+            max_c = max_c.max(c2);
             self.prefix_max_bottom.push(max_r);
         }
         self.max_row = max_r;
+        self.max_col = max_c;
         self.key = Some(k);
+    }
+
+    #[inline]
+    pub fn matches(&self, sheet: &Sheet) -> bool {
+        self.key == Some((sheet.identity, sheet.merges_revision()))
     }
 
     #[inline]
@@ -136,6 +189,26 @@ impl MergeCache {
     #[inline]
     pub fn max_row(&self) -> u32 {
         self.max_row
+    }
+
+    #[inline]
+    pub fn max_col(&self) -> u32 {
+        self.max_col
+    }
+
+    /// O(log M + k) 判定矩形 `[r1..=r2, c1..=c2]` 是否与任一合并块相交。
+    pub fn has_overlap(&self, r1: u32, c1: u32, r2: u32, c2: u32) -> bool {
+        if self.sorted_by_top.is_empty() {
+            return false;
+        }
+        let start = self.prefix_max_bottom.partition_point(|&end| end < r1);
+        let end = self.sorted_by_top.partition_point(|m| m.0 <= r2);
+        for &(mr1, mc1, mr2, mc2) in &self.sorted_by_top[start..end] {
+            if mr1 <= r2 && mr2 >= r1 && mc1 <= c2 && mc2 >= c1 {
+                return true;
+            }
+        }
+        false
     }
 
     /// 用行区间二分替代全表 `sheet.merges.iter().filter(...)` 线性扫描，提取当前视口可见合并块。
@@ -267,6 +340,59 @@ pub(crate) struct CellCacheEpoch {
     pub sparklines_len: usize,
 }
 
+impl CellCacheEpoch {
+    /// 结构/布局/样式/缩放/条件格式等全局前提是否一致（允许 `doc_gen` / `cells` 内容变化走增量失效）。
+    #[inline]
+    pub fn same_layout(&self, other: &Self) -> bool {
+        self.sheet_id == other.sheet_id
+            && self.wb_epoch == other.wb_epoch
+            && self.style_rev == other.style_rev
+            && self.cf_gen == other.cf_gen
+            && self.cols_rev == other.cols_rev
+            && self.rows_rev == other.rows_rev
+            && self.hidden_cols_rev == other.hidden_cols_rev
+            && self.font_zoom_bits == other.font_zoom_bits
+            && self.layout_zoom_bits == other.layout_zoom_bits
+            && self.paint_scale_bits == other.paint_scale_bits
+            && self.show_formulas == other.show_formulas
+            && self.text_spill == other.text_spill
+            && self.fonts_gen == other.fonts_gen
+            && self.tables_fp == other.tables_fp
+            && self.sparklines_len == other.sparklines_len
+    }
+}
+
+#[inline]
+pub(crate) fn value_eq_fast(a: &sheetcore::Value, b: &sheetcore::Value) -> bool {
+    use sheetcore::Value;
+    match (a, b) {
+        (Value::Empty, Value::Empty) => true,
+        (Value::Number(x), Value::Number(y)) => x.to_bits() == y.to_bits(),
+        (Value::Text(x), Value::Text(y)) => Arc::ptr_eq(x, y) || x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Error(x), Value::Error(y)) => x == y,
+        _ => false,
+    }
+}
+
+#[inline]
+pub(crate) fn cell_eq_fast(a: Option<&sheetcore::Cell>, b: Option<&sheetcore::Cell>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            if !value_eq_fast(&x.value, &y.value) {
+                return false;
+            }
+            match (&x.formula, &y.formula) {
+                (None, None) => true,
+                (Some(fx), Some(fy)) => Arc::ptr_eq(fx, fy) || fx == fy,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum PreparedText {
     Empty,
@@ -319,6 +445,11 @@ pub(crate) enum PreparedText {
 pub(crate) struct PreparedCell {
     pub width_bits: u32,
     pub height_bits: u32,
+    pub verified_rev: u64,
+    pub cell_snap: Option<sheetcore::Cell>,
+    pub has_link: bool,
+    pub has_rich: bool,
+    pub depends_on_row_neighbors: bool,
     pub bg_fill: Option<Color32>,
     pub cf_bar: Option<(f32, Color32)>,
     pub cf_borders: Option<Box<[Option<(f32, Color32)>; 4]>>,
@@ -500,6 +631,8 @@ impl QuadrantBorderBuilder {
 #[derive(Default)]
 pub(crate) struct RetainedGridCache {
     pub epoch: Option<CellCacheEpoch>,
+    /// 内容修订代数：仅单格/小批量值改动时递增而不整表 `cells.clear()`，由渲染命中时按 `cell_snap` 增量校验。
+    pub content_rev: u64,
     pub cells: HashMap<(u32, u32), PreparedCell>,
     /// 行内非空列有序缓存（加速 `spill_clip` 左右邻居探测，避免重复访问 `Store` 页哈希表）。
     pub row_occupied_cols: HashMap<u32, Vec<u32>>,
@@ -507,20 +640,61 @@ pub(crate) struct RetainedGridCache {
 }
 
 impl RetainedGridCache {
+    #[inline]
+    pub fn invalidate_viewport(&mut self) {
+        self.viewport.key = None;
+        self.viewport.body_batches.clear();
+        self.viewport.frozen_batches.clear();
+        self.viewport.extra_sparks.clear();
+        self.viewport.extra_icons.clear();
+    }
+
+    /// 局部淘汰单格/小批量脏格及其同行依赖溢出的邻格，保留其余未改动单元格的 `Galley`。
+    pub fn mark_cells_dirty(&mut self, cells: impl IntoIterator<Item = (u32, u32)>) {
+        let mut dirty_rows: Vec<u32> = Vec::new();
+        for (r, c) in cells {
+            self.cells.remove(&(r, c));
+            if !dirty_rows.contains(&r) {
+                dirty_rows.push(r);
+            }
+        }
+        if dirty_rows.is_empty() {
+            return;
+        }
+        for &r in &dirty_rows {
+            self.row_occupied_cols.remove(&r);
+        }
+        self.cells.retain(|&(r, _), cell| {
+            !(cell.depends_on_row_neighbors && dirty_rows.contains(&r))
+        });
+        self.invalidate_viewport();
+    }
+
     pub fn ensure_epoch(&mut self, epoch: &CellCacheEpoch) {
-        if self.epoch.as_ref() != Some(epoch) {
-            self.cells.clear();
+        if self.epoch.as_ref() == Some(epoch) {
+            if self.cells.len() > 24_576 {
+                // 长时间全表漫游滚动时限制单元缓存体积在 ~2MB 以内
+                self.cells.clear();
+                self.row_occupied_cols.clear();
+            }
+            return;
+        }
+        let same_layout = self.epoch.as_ref().is_some_and(|prev| prev.same_layout(epoch));
+        if same_layout {
+            // 仅值/公式变化：保留未改动单元的 `PreparedCell`，递增 `content_rev` 在命中时按单元增量校验。
+            self.content_rev = self.content_rev.wrapping_add(1);
             self.row_occupied_cols.clear();
-            self.viewport.key = None;
-            self.viewport.body_batches.clear();
-            self.viewport.frozen_batches.clear();
-            self.viewport.extra_sparks.clear();
-            self.viewport.extra_icons.clear();
+            self.invalidate_viewport();
             self.epoch = Some(epoch.clone());
-        } else if self.cells.len() > 24_576 {
-            // 长时间全表漫游滚动时限制单元缓存体积在 ~2MB 以内
+            if self.cells.len() > 24_576 {
+                self.cells.clear();
+            }
+        } else {
+            self.content_rev = self.content_rev.wrapping_add(1);
             self.cells.clear();
             self.row_occupied_cols.clear();
+            self.invalidate_viewport();
+            self.epoch = Some(epoch.clone());
         }
     }
 
@@ -568,21 +742,40 @@ impl CfStatsWorker {
         let (tx, jobs) = mpsc::channel::<CfStatsJob>();
         let (done_tx, rx) = mpsc::channel::<CfStatsDone>();
         std::thread::spawn(move || {
+            // 持久保留最近 16 张表的 CfStats，避免每次新建 default() 导致 cf.rs 的 slice_cache 100% 失效。
+            const MAX_SHEETS: usize = 16;
+            let mut per_sheet: HashMap<u64, cf::CfStats> = HashMap::new();
+            let mut lru: VecDeque<u64> = VecDeque::new();
             while let Ok(mut job) = jobs.recv() {
                 // 若主线程连续编辑，跳过已被取代的排队快照，只算最新一版
                 while let Ok(newer) = jobs.try_recv() {
                     job = newer;
                 }
                 job.snapshot.cf = job.cf.clone();
-                let mut stats = cf::CfStats::default();
-                cf::refresh_stats(&job.snapshot, &mut stats);
+                let sheet_id = job.sheet_id;
+                if !per_sheet.contains_key(&sheet_id) {
+                    if lru.len() >= MAX_SHEETS {
+                        if let Some(evict) = lru.pop_front() {
+                            per_sheet.remove(&evict);
+                        }
+                    }
+                    lru.push_back(sheet_id);
+                } else if lru.back().copied() != Some(sheet_id) {
+                    if let Some(pos) = lru.iter().position(|&id| id == sheet_id) {
+                        lru.remove(pos);
+                    }
+                    lru.push_back(sheet_id);
+                }
+                let stats = per_sheet.entry(sheet_id).or_default();
+                cf::refresh_stats(&job.snapshot, stats);
+                let out_stats = stats.clone();
                 let wake = job.wake.clone();
                 if done_tx
                     .send(CfStatsDone {
-                        sheet_id: job.sheet_id,
+                        sheet_id,
                         cells: job.cells,
                         cf: job.cf,
-                        stats,
+                        stats: out_stats,
                     })
                     .is_err()
                 {
@@ -643,11 +836,16 @@ pub(super) struct Rules {
     pub(crate) merges: MergeCache,
     pub(crate) sparks: SparkCache,
     pub(crate) grid: RetainedGridCache,
-    pub(crate) charts: HashMap<(usize, [u32; 4]), Arc<[Shape]>>,
-    pub(crate) charts_epoch: Option<(u64, u64, u64, CellVersion, u64, u64)>,
+    /// 图表局部坐标系 `(0, 0, w, h)` 形状缓存，键为 `(chart_idx, [w_bits, h_bits])`，滚动时 100% 命中。
+    pub(crate) charts: HashMap<(usize, [u32; 2]), Arc<[Shape]>>,
+    pub(crate) charts_epoch: Option<(u64, u64, u64, u64)>,
 }
 
 impl Rules {
+    #[inline]
+    pub fn has_definitions(&self) -> bool {
+        !self.definitions.blocks.is_empty()
+    }
     pub fn refresh(
         &mut self,
         sh: &Sheet,
@@ -741,8 +939,9 @@ impl Rules {
             });
             self.stat_area = cf_stat_area(&sh.cf);
         }
+        let has_rules = !sh.cf.blocks.is_empty();
         let ext_expr = self.cross_expressions || (self.expressions && has_wb_names);
-        let dirty = local_changed || definitions_changed || ext_expr;
+        let dirty = definitions_changed || (has_rules && (local_changed || ext_expr));
         if dirty {
             if local_changed || definitions_changed || forced {
                 let offload = !dumping && sh.len() > 16_384 && self.stat_area > 16_384;
@@ -779,7 +978,7 @@ impl Rules {
         &mut self,
         painter: &egui::Painter,
         sh: &Sheet,
-        doc_gen: u64,
+        _doc_gen: u64,
         wb_epoch: u64,
         fonts_gen: u64,
         ci: usize,
@@ -787,34 +986,40 @@ impl Rules {
         ch: &sheetcore::charts::Chart,
     ) -> Arc<[Shape]> {
         let fp = charts_fingerprint(&sh.charts);
-        let epoch = (
-            sh.identity,
-            doc_gen,
-            wb_epoch,
-            sh.cell_version().clone(),
-            fonts_gen,
-            fp,
-        );
-        if self.charts_epoch.as_ref() != Some(&epoch) {
+        let epoch = (sh.identity, wb_epoch, fonts_gen, fp);
+        if self.charts_epoch != Some(epoch) {
             self.charts.clear();
             self.charts_epoch = Some(epoch);
         }
-        let rkey = [
-            rect.min.x.to_bits(),
-            rect.min.y.to_bits(),
-            rect.max.x.to_bits(),
-            rect.max.y.to_bits(),
-        ];
+        let rkey = [rect.width().to_bits(), rect.height().to_bits()];
         if let Some(cached) = self.charts.get(&(ci, rkey)) {
             return cached.clone();
         }
-        let built: Arc<[Shape]> = crate::chart_view::build_chart_shapes(painter, rect, ch).into();
+        let local_rect = Rect::from_min_size(Pos2::ZERO, rect.size());
+        let built: Arc<[Shape]> = crate::chart_view::build_chart_shapes(painter, local_rect, ch).into();
         if self.charts.len() > 256 {
             self.charts.clear();
         }
         self.charts.insert((ci, rkey), built.clone());
         built
     }
+}
+
+/// 把局部坐标系 `(0, 0, w, h)` 缓存的图表 `Shape` 平移到屏幕位置 `delta = rect.min.to_vec2()` 绘制。
+#[inline]
+pub(crate) fn paint_translated_shapes(painter: &egui::Painter, shapes: &[Shape], delta: Vec2) {
+    if shapes.is_empty() {
+        return;
+    }
+    if delta == Vec2::ZERO {
+        painter.extend(shapes.iter().cloned());
+        return;
+    }
+    painter.extend(shapes.iter().map(|s| {
+        let mut s = s.clone();
+        s.translate(delta);
+        s
+    }));
 }
 
 pub(crate) fn tables_fingerprint(tables: &[sheetcore::table::Table]) -> u64 {
@@ -861,8 +1066,21 @@ pub(crate) fn charts_fingerprint(charts: &[sheetcore::charts::Chart]) -> u64 {
         std::mem::discriminant(&ch.kind).hash(&mut h);
         ch.title.hash(&mut h);
         ch.legend.hash(&mut h);
+        ch.legend_pos.hash(&mut h);
         ch.anchor.hash(&mut h);
         ch.show_labels.hash(&mut h);
+        ch.label_opts.show_cat.hash(&mut h);
+        ch.label_opts.show_ser.hash(&mut h);
+        ch.label_opts.show_pct.hash(&mut h);
+        ch.label_opts.show_legend_key.hash(&mut h);
+        ch.label_opts.leader_lines.hash(&mut h);
+        ch.label_opts.position.hash(&mut h);
+        ch.radar_style.hash(&mut h);
+        ch.axis_x.hash(&mut h);
+        ch.axis_y.hash(&mut h);
+        ch.y_fmt.hash(&mut h);
+        ch.y_min.map(f64::to_bits).hash(&mut h);
+        ch.y_max.map(f64::to_bits).hash(&mut h);
         ch.series.len().hash(&mut h);
         for s in &ch.series {
             s.name.hash(&mut h);
@@ -872,6 +1090,9 @@ pub(crate) fn charts_fingerprint(charts: &[sheetcore::charts::Chart]) -> u64 {
             s.vals.len().hash(&mut h);
             if let Some(first) = s.vals.first() {
                 first.to_bits().hash(&mut h);
+            }
+            if let Some(mid) = s.vals.get(s.vals.len() / 2) {
+                mid.to_bits().hash(&mut h);
             }
             if let Some(last) = s.vals.last() {
                 last.to_bits().hash(&mut h);
@@ -1589,5 +1810,219 @@ mod tests {
             elapsed.as_millis() < 1500,
             "current_region_fast took {elapsed:?} on >200k sheet with sparse anchor col"
         );
+    }
+
+    #[test]
+    fn chart_shapes_reuses_arc_across_scroll_and_unrelated_doc_gen() {
+        let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
+        let mut sh = Sheet::new("ChartScroll");
+        let ch = sheetcore::charts::Chart {
+            kind: sheetcore::charts::ChartKind::Line,
+            title: "Scroll Reuse".into(),
+            series: vec![sheetcore::charts::Series {
+                name: "S1".into(),
+                cats: vec!["A".into(), "B".into(), "C".into()],
+                vals: vec![10.0, 25.0, 18.0],
+                ..Default::default()
+            }],
+            legend: true,
+            anchor: (1, 1, 10, 6),
+            legend_pos: "r".into(),
+            part: "xl/charts/chart1.xml".into(),
+            drawing: "xl/drawings/drawing1.xml".into(),
+            show_labels: false,
+            label_opts: Default::default(),
+            radar_style: String::new(),
+            ref_fixes: Vec::new(),
+            axis_x: "X".into(),
+            axis_y: "Y".into(),
+            y_fmt: String::new(),
+            y_min: None,
+            y_max: None,
+        };
+        sh.charts.push(ch);
+
+        let mut rules = Rules::default();
+        let fonts_gen = crate::system_fonts::generation();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut keep_a2: Option<Arc<[Shape]>> = None;
+        let mut a4_out: Option<Arc<[Shape]>> = None;
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let painter = ui.painter();
+                let r1 = egui::Rect::from_min_size(egui::pos2(40.0, 50.0), egui::vec2(320.0, 200.0));
+                let r2 = egui::Rect::from_min_size(egui::pos2(120.0, 260.0), egui::vec2(320.0, 200.0));
+                let r3 = egui::Rect::from_min_size(egui::pos2(120.0, 260.0), egui::vec2(360.0, 200.0));
+                let a1 = rules.chart_shapes(painter, &sh, 1, 0, fonts_gen, 0, r1, &sh.charts[0]);
+                // Scrolling position + unrelated doc_gen increment must still hit local-coords cache.
+                let a2 = rules.chart_shapes(painter, &sh, 99, 0, fonts_gen, 0, r2, &sh.charts[0]);
+                // Resizing width must miss and rebuild.
+                let a3 = rules.chart_shapes(painter, &sh, 99, 0, fonts_gen, 0, r3, &sh.charts[0]);
+                assert!(Arc::ptr_eq(&a1, &a2), "chart shapes must reuse Arc across scroll and unrelated doc_gen");
+                assert!(!Arc::ptr_eq(&a2, &a3), "chart shapes must rebuild when chart dimensions change");
+                keep_a2 = Some(a2);
+            });
+        });
+
+        // Mutating chart title must invalidate charts_epoch even at the same size.
+        sh.charts[0].title = "Updated Title".into();
+        let raw2 = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw2, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r2 = egui::Rect::from_min_size(egui::pos2(120.0, 260.0), egui::vec2(320.0, 200.0));
+                a4_out = Some(rules.chart_shapes(ui.painter(), &sh, 99, 0, fonts_gen, 0, r2, &sh.charts[0]));
+            });
+        });
+        let a2 = keep_a2.unwrap();
+        let a4 = a4_out.unwrap();
+        assert!(!Arc::ptr_eq(&a2, &a4), "chart title change must invalidate cached chart shapes");
+    }
+
+    #[test]
+    fn merge_cache_max_col_and_has_overlap_match_linear_scan() {
+        let mut sh = Sheet::new("Merges");
+        sh.merges.push((2, 3, 4, 6));
+        sh.merges.push((10, 1, 12, 15));
+        let mut cache = MergeCache::default();
+        cache.ensure(&sh, 0, 0);
+        assert_eq!(cache.max_col(), 15);
+        assert!(cache.has_overlap(3, 5, 5, 7));
+        assert!(!cache.has_overlap(0, 0, 1, 2));
+        assert!(cache.has_overlap(11, 0, 11, 2));
+        assert!(!cache.has_overlap(5, 0, 9, 20));
+    }
+
+    #[test]
+    fn retained_grid_cache_preserves_unaffected_cells_across_single_cell_edit() {
+        let mut sh = Sheet::new("Retained");
+        sh.set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+        let v1 = sh.cell_version().clone();
+        sh.set(2, 2, Cell { value: Value::Number(2.0), formula: None });
+        let v2 = sh.cell_version().clone();
+
+        let mut cache = RetainedGridCache::default();
+        let epoch1 = CellCacheEpoch {
+            sheet_id: sh.identity,
+            doc_gen: 1,
+            wb_epoch: 0,
+            cells: v1,
+            style_rev: 0,
+            cf_gen: 0,
+            cols_rev: 0,
+            rows_rev: 0,
+            hidden_cols_rev: 0,
+            font_zoom_bits: 1.0_f32.to_bits(),
+            layout_zoom_bits: 1.0_f32.to_bits(),
+            paint_scale_bits: 1.0_f32.to_bits(),
+            show_formulas: false,
+            text_spill: true,
+            fonts_gen: 0,
+            tables_fp: 0,
+            sparklines_len: 0,
+        };
+        cache.ensure_epoch(&epoch1);
+        let mk = |rev: u64, dep: bool| PreparedCell {
+            width_bits: 64.0_f32.to_bits(),
+            height_bits: 20.0_f32.to_bits(),
+            verified_rev: rev,
+            cell_snap: Some(Cell { value: Value::Number(1.0), formula: None }),
+            has_link: false,
+            has_rich: false,
+            depends_on_row_neighbors: dep,
+            bg_fill: None,
+            cf_bar: None,
+            cf_borders: None,
+            diagonal: None,
+            borders: Default::default(),
+            cf_icon: None,
+            spark_idx: None,
+            text: PreparedText::Empty,
+        };
+        cache.cells.insert((0, 0), mk(cache.content_rev, false));
+        cache.cells.insert((2, 2), mk(cache.content_rev, false));
+        cache.cells.insert((2, 1), mk(cache.content_rev, true));
+        cache.cells.insert((5, 5), mk(cache.content_rev, false));
+
+        // Explicit dirty mark removes edited cell + row-dependent neighbor, keeps other rows.
+        cache.mark_cells_dirty([(2, 2)]);
+        assert!(!cache.cells.contains_key(&(2, 2)));
+        assert!(!cache.cells.contains_key(&(2, 1)));
+        assert!(cache.cells.contains_key(&(0, 0)));
+        assert!(cache.cells.contains_key(&(5, 5)));
+
+        // Content-only epoch bump preserves remaining entries and advances content_rev.
+        let rev_before = cache.content_rev;
+        let epoch2 = CellCacheEpoch { doc_gen: 2, cells: v2, ..epoch1.clone() };
+        cache.ensure_epoch(&epoch2);
+        assert!(cache.content_rev > rev_before);
+        assert!(cache.cells.contains_key(&(0, 0)));
+        assert!(cache.cells.contains_key(&(5, 5)));
+
+        // Zoom/layout epoch change clears all prepared cells.
+        let epoch3 = CellCacheEpoch { font_zoom_bits: 1.25_f32.to_bits(), ..epoch2 };
+        cache.ensure_epoch(&epoch3);
+        assert!(cache.cells.is_empty());
+    }
+
+    #[test]
+    fn cf_stats_worker_reuses_slice_cache_across_refreshes() {
+        let mut sh = Sheet::new("CfWorkerReuse");
+        for r in 0..20u32 {
+            sh.set(r, 0, Cell { value: Value::Number((r + 1) as f64), formula: None });
+        }
+        sh.cf.blocks.push(sheetcore::cf::CfBlock {
+            ranges: vec![(0, 0, 19, 0)],
+            rules: vec![sheetcore::cf::CfRule {
+                priority: 1,
+                stop: false,
+                kind: sheetcore::cf::CfKind::Bar {
+                    color: [99, 142, 198],
+                    min: sheetcore::cf::Cfvo::min(),
+                    max: sheetcore::cf::Cfvo::max(),
+                },
+            }],
+        });
+        let worker = CfStatsWorker::new();
+        let ctx = egui::Context::default();
+        worker
+            .tx
+            .send(CfStatsJob {
+                sheet_id: sh.identity,
+                cells: sh.cell_version().clone(),
+                cf: sh.cf.clone(),
+                snapshot: sh.clone(),
+                wake: ctx.clone(),
+            })
+            .unwrap();
+        let done1 = worker
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("first cf stats job must finish");
+        assert_eq!(done1.stats.ranges.get(&0), Some(&(1.0, 20.0)));
+
+        // Second refresh on same sheet_id updates range incrementally while worker keeps per-sheet CfStats.
+        sh.set(19, 0, Cell { value: Value::Number(40.0), formula: None });
+        worker
+            .tx
+            .send(CfStatsJob {
+                sheet_id: sh.identity,
+                cells: sh.cell_version().clone(),
+                cf: sh.cf.clone(),
+                snapshot: sh.clone(),
+                wake: ctx,
+            })
+            .unwrap();
+        let done2 = worker
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("second cf stats job must finish");
+        assert_eq!(done2.stats.ranges.get(&0), Some(&(1.0, 40.0)));
     }
 }
