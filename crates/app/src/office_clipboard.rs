@@ -178,6 +178,64 @@ pub fn has_rich_table_format() -> bool {
     }
 }
 
+pub enum RichClipboard {
+    Block(OfficeBlock),
+    Sparse(sheetcore::clipboard_xmlss::SparseBlock),
+}
+
+/// 单次读取系统剪贴板富格式：优先一次性读取 `"XML Spreadsheet"` 并直接走流式稀疏解析
+///（不再二次读剪贴板、不再构建双份稠密矩阵、超阈值时不跌落慢速 `parse_html`）；
+/// 仅当剪贴板不存在 XMLSS 时才读取 `"HTML Format"`。
+pub fn read_rich_table() -> Option<RichClipboard> {
+    #[cfg(test)]
+    {
+        return None;
+    }
+    #[cfg(not(test))]
+    unsafe {
+        let xml_fmt = RegisterClipboardFormatW(wide("XML Spreadsheet").as_ptr());
+        if xml_fmt != 0 && IsClipboardFormatAvailable(xml_fmt) != 0 {
+            if let Some(raw) = read_format_raw(xml_fmt) {
+                let text = String::from_utf8_lossy(&raw);
+                let xml = text.trim_end_matches('\0');
+                if let Some(sparse) = sheetcore::clipboard_xmlss::parse_sparse(xml) {
+                    if sparse.rows > 0 && sparse.cols > 0 {
+                        return Some(RichClipboard::Sparse(sparse));
+                    }
+                }
+                let parsed = sheetcore::clipboard_xmlss::parse(xml);
+                if !parsed.is_empty() {
+                    return Some(RichClipboard::Block(convert_block(parsed)));
+                }
+                // XMLSS existed on clipboard (e.g. giant malformed/empty export) — do not fall back
+                // to slow HTML parsing when XMLSS already carried an explicit spreadsheet table.
+                if contains_ascii_ci(xml, b"expandedrowcount=") {
+                    return None;
+                }
+            }
+        }
+        read_html_table().map(RichClipboard::Block)
+    }
+}
+
+#[cfg(not(test))]
+unsafe fn read_html_table() -> Option<OfficeBlock> {
+    unsafe {
+        let fmt = RegisterClipboardFormatW(wide("HTML Format").as_ptr());
+        if fmt == 0 || IsClipboardFormatAvailable(fmt) == 0 {
+            return None;
+        }
+        let raw = read_format(fmt)?;
+        let text = String::from_utf8_lossy(&raw);
+        let html = match (text.find("<!--StartFragment"), text.rfind("<!--EndFragment")) {
+            (Some(a), Some(b)) if b > a => &text[a..b],
+            _ => text.as_ref(),
+        };
+        let block = parse_html(html);
+        (!block.is_empty()).then_some(block)
+    }
+}
+
 /// 读取超 50 万格或外部 Excel 整列（`ExpandedRowCount="1048576"`）的稀疏 XML Spreadsheet。
 pub fn read_sparse_xmlss() -> Option<sheetcore::clipboard_xmlss::SparseBlock> {
     #[cfg(test)]
@@ -208,41 +266,62 @@ pub fn read_table() -> Option<OfficeBlock> {
         // 单测不读机器上的真实剪贴板；需要富格式时直接测 parse_html/convert_block。
         return None;
     }
-    if let Some(b) = read_xmlss() {
-        if !b.is_empty() {
-            return Some(b);
+    #[cfg(not(test))]
+    {
+        if let Some(b) = read_xmlss() {
+            if !b.is_empty() {
+                return Some(b);
+            }
         }
-    }
-    unsafe {
-        let fmt = {
-            let name = wide("HTML Format");
-            RegisterClipboardFormatW(name.as_ptr())
-        };
-        if fmt == 0 || IsClipboardFormatAvailable(fmt) == 0 {
-            return None;
-        }
-        let raw = read_format(fmt)?;
-        let text = String::from_utf8_lossy(&raw).to_string();
-        let html = match (text.find("<!--StartFragment"), text.rfind("<!--EndFragment")) {
-            (Some(a), Some(b)) if b > a => &text[a..b],
-            _ => text.as_str(),
-        };
-        let block = parse_html(html);
-        if block.is_empty() {
-            None
-        } else {
-            Some(block)
-        }
+        unsafe { read_html_table() }
     }
 }
 
-/// 解析 `<table>`：只认 tr/td，属性看 style 和 colspan/rowspan
-fn parse_style_classes(lower: &str, html: &str) -> HashMap<String, String> {
+#[inline]
+fn starts_with_ascii_ci(bytes: &[u8], needle_lower: &[u8]) -> bool {
+    bytes.len() >= needle_lower.len()
+        && bytes[..needle_lower.len()]
+            .iter()
+            .zip(needle_lower)
+            .all(|(&a, &b)| a.to_ascii_lowercase() == b)
+}
+
+#[inline]
+fn find_ascii_ci(haystack: &str, needle_lower: &[u8]) -> Option<usize> {
+    let hb = haystack.as_bytes();
+    let n = needle_lower.len();
+    if n == 0 {
+        return Some(0);
+    }
+    if hb.len() < n {
+        return None;
+    }
+    let first = needle_lower[0];
+    let first_upper = first.to_ascii_uppercase();
+    let mut i = 0usize;
+    let limit = hb.len() - n;
+    while i <= limit {
+        let b = hb[i];
+        if (b == first || b == first_upper) && starts_with_ascii_ci(&hb[i..], needle_lower) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[inline]
+fn contains_ascii_ci(haystack: &str, needle_lower: &[u8]) -> bool {
+    find_ascii_ci(haystack, needle_lower).is_some()
+}
+
+/// 解析 `<table>`：只认 tr/td，属性看 style 和 colspan/rowspan（字节级 ASCII 不区分大小写扫描，零全量拷贝）
+fn parse_style_classes(html: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    let Some(a) = lower.find("<style") else {
+    let Some(a) = find_ascii_ci(html, b"<style") else {
         return map;
     };
-    let Some(rel_b) = lower[a..].find("</style>") else {
+    let Some(rel_b) = find_ascii_ci(&html[a..], b"</style>") else {
         return map;
     };
     let css = &html[a..a + rel_b];
@@ -254,7 +333,7 @@ fn parse_style_classes(lower: &str, html: &str) -> HashMap<String, String> {
             .find(|c: char| c.is_whitespace() || c == '{' || c == ',')
             .map(|p| name_start + p)
             .unwrap_or(css.len());
-        let name = css[name_start..name_end].trim().to_lowercase();
+        let name = css[name_start..name_end].trim().to_ascii_lowercase();
         if name.is_empty() {
             i = at + 1;
             continue;
@@ -337,24 +416,30 @@ fn decode_entities(s: &str) -> String {
 
 pub fn parse_html(html: &str) -> OfficeBlock {
     let mut block = OfficeBlock::default();
-    let lower = html.to_lowercase();
-    let classes = parse_style_classes(&lower, html);
+    let classes = parse_style_classes(html);
     let mut row: Vec<OfficeCell> = Vec::new();
     let mut i = 0usize;
-    let bytes = lower.as_bytes();
+    let bytes = html.as_bytes();
     while i < bytes.len() {
-        let at = |pat: &str| lower.get(i..).map(|s| s.starts_with(pat)).unwrap_or(false);
-        if at("<tr") {
+        let Some(rel) = bytes[i..].iter().position(|&b| b == b'<') else {
+            break;
+        };
+        i += rel;
+        let rest = &bytes[i..];
+        if starts_with_ascii_ci(rest, b"<tr") {
             if !row.is_empty() {
                 block.rows.push(std::mem::take(&mut row));
             }
             i += 3;
-        } else if at("<td") || at("<th") {
-            let tag_end = lower[i..].find('>').map(|p| i + p).unwrap_or(bytes.len() - 1);
+        } else if starts_with_ascii_ci(rest, b"<td") || starts_with_ascii_ci(rest, b"<th") {
+            let tag_end = bytes[i..]
+                .iter()
+                .position(|&b| b == b'>')
+                .map(|p| i + p)
+                .unwrap_or(bytes.len().saturating_sub(1));
             let attrs = &html[i..tag_end];
-            let close = lower[tag_end..]
-                .find("</td")
-                .or_else(|| lower[tag_end..].find("</th"))
+            let close = find_ascii_ci(&html[tag_end..], b"</td")
+                .or_else(|| find_ascii_ci(&html[tag_end..], b"</th"))
                 .map(|p| tag_end + p)
                 .unwrap_or_else(|| html.len().min(tag_end + 1));
             let inner = if close > tag_end {
@@ -363,8 +448,8 @@ pub fn parse_html(html: &str) -> OfficeBlock {
                 ""
             };
             row.push(parse_cell(attrs, inner, &classes));
-            i = close + 5;
-        } else if at("</table") {
+            i = (close + 5).min(bytes.len());
+        } else if starts_with_ascii_ci(rest, b"</table") {
             break;
         } else {
             i += 1;
@@ -380,22 +465,22 @@ pub fn parse_html(html: &str) -> OfficeBlock {
 
 fn parse_cell(attrs: &str, inner: &str, classes: &HashMap<String, String>) -> OfficeCell {
     let mut cell = OfficeCell { colspan: 1, rowspan: 1, ..Default::default() };
-    if let Some(v) = attr_value(attrs, "colspan").and_then(|s| s.parse::<u32>().ok()) {
+    if let Some(v) = attr_value(attrs, b"colspan").and_then(|s| s.parse::<u32>().ok()) {
         cell.colspan = v.max(1);
     }
-    if let Some(v) = attr_value(attrs, "rowspan").and_then(|s| s.parse::<u32>().ok()) {
+    if let Some(v) = attr_value(attrs, b"rowspan").and_then(|s| s.parse::<u32>().ok()) {
         cell.rowspan = v.max(1);
     }
-    let mut style = attr_value(attrs, "style").unwrap_or_default();
-    if let Some(class) = attr_value(attrs, "class") {
+    let mut style = attr_value(attrs, b"style").unwrap_or_default();
+    if let Some(class) = attr_value(attrs, b"class") {
         for name in class.split_whitespace() {
-            if let Some(css) = classes.get(&name.to_lowercase()) {
+            if let Some(css) = classes.get(&name.to_ascii_lowercase()) {
                 style.push(';');
                 style.push_str(css);
             }
         }
     }
-    let style = style.to_lowercase();
+    let style = style.to_ascii_lowercase();
     cell.bold = style.contains("font-weight:700")
         || style.contains("font-weight:bold")
         || style.contains("font-weight: 700")
@@ -418,20 +503,30 @@ fn parse_cell(attrs: &str, inner: &str, classes: &HashMap<String, String>) -> Of
     if let Some(nf) = style_value(&style, "mso-number-format") {
         cell.num_format = nf;
     }
-    if let Some(v) = attr_value(attrs, "x:num") {
+    if let Some(v) = attr_value(attrs, b"x:num") {
         cell.raw = Some(clean_text(&v));
-    } else if attrs.to_lowercase().contains("x:str") {
+    } else if contains_ascii_ci(attrs, b"x:str") {
         cell.raw = Some(clean_text(inner));
     }
     cell.text = clean_text(inner);
     cell
 }
 
-fn attr_value(attrs: &str, name: &str) -> Option<String> {
-    let lower = attrs.to_lowercase();
-    let pat = format!("{name}=");
-    let at = lower.find(&pat)?;
-    let rest = &attrs[at + pat.len()..];
+fn attr_value(attrs: &str, name_lower: &[u8]) -> Option<String> {
+    let hb = attrs.as_bytes();
+    let n = name_lower.len();
+    if hb.len() <= n {
+        return None;
+    }
+    let mut at = None;
+    for i in 0..=(hb.len() - n - 1) {
+        if hb[i + n] == b'=' && starts_with_ascii_ci(&hb[i..], name_lower) {
+            at = Some(i);
+            break;
+        }
+    }
+    let at = at?;
+    let rest = &attrs[at + n + 1..];
     let rest = rest.trim_start();
     if let Some(stripped) = rest.strip_prefix('"') {
         Some(stripped[..stripped.find('"')?].to_string())

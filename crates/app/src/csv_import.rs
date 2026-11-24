@@ -257,14 +257,20 @@ pub(super) struct PendingImport {
     worker: Worker<PreparedImport>,
 }
 
+enum PreparedHistory {
+    Action(PreparedAction),
+    Cow(Option<undo::PreparedCowBatch>),
+}
+
 struct PreparedImport {
     before: Sheet,
     result: Sheet,
     keys: Vec<(u32, u32)>,
+    rects: Vec<(u32, u32, u32, u32)>,
     broadcast: Vec<(usize, u32, u32)>,
     sources: Vec<Source>,
     registration: Option<Registration>,
-    history: PreparedAction,
+    history: PreparedHistory,
     revision_sample: Vec<undo::CellDelta>,
     changed: usize,
     label: &'static str,
@@ -341,6 +347,7 @@ fn prepare(
 ) -> Result<PreparedImport, String> {
     let mut result = before.reorder_snapshot();
     let mut keys = Vec::new();
+    let mut rects: Vec<(u32, u32, u32, u32)> = Vec::new();
     let mut location = Workbook::new_blank();
     location.path = path;
     let sizes = |sources: &[Source]| {
@@ -411,6 +418,14 @@ fn prepare(
                 return Err("数据超出工作表边界".into());
             }
             keys = imported_keys;
+            if rows > 0 && cols > 0 {
+                rects.push((
+                    target.at.0,
+                    target.at.1,
+                    target.at.0 + rows - 1,
+                    target.at.1 + cols - 1,
+                ));
+            }
             let size = (rows, cols);
             registration = Some(Registration {
                 file: path,
@@ -508,6 +523,16 @@ fn prepare(
                 check_cancelled(cancel)?;
                 match size {
                     Ok((rows, cols)) => {
+                        let eff_r = rows.max(src.rows);
+                        let eff_c = cols.max(src.cols);
+                        if eff_r > 0 && eff_c > 0 {
+                            rects.push((
+                                src.at.0,
+                                src.at.1,
+                                src.at.0 + eff_r - 1,
+                                src.at.1 + eff_c - 1,
+                            ));
+                        }
                         src.rows = rows;
                         src.cols = cols;
                         ok += 1;
@@ -545,79 +570,129 @@ fn prepare(
             )
         }
     };
-    if !keys.windows(2).all(|w| w[0] < w[1]) {
-        keys.sort_unstable();
-        keys.dedup();
-    }
-    let mut deltas = Vec::with_capacity(keys.len().min(65_536));
-    if before.is_empty() {
+    let use_cow_batch =
+        target.room.is_none() && keys.len() > undo::COW_BATCH_THRESHOLD && !rects.is_empty();
+    let (changed, broadcast, revision_sample, history) = if use_cow_batch {
+        // Sample up to MAX_CELLS leading deltas for revision logs, then free millions of
+        // coordinate tuples and build a zero-CellDelta CoW batch directly from Sheet snapshots.
         let sheet_idx = target.sheet;
+        let mut revision_sample = Vec::with_capacity(sheetcore::revision::MAX_CELLS);
+        let blank = sheetcore::Cell::default();
         for (i, &(r, c)) in keys.iter().enumerate() {
             if (i & 4095) == 0 {
                 check_cancelled(cancel)?;
             }
-            let after_style = result.style_of(r, c);
-            if let Some(after) = result.get(r, c) {
-                if !after.is_blank() || after_style != 0 {
+            let bc = before.get(r, c).unwrap_or(&blank);
+            let ac = result.get(r, c).unwrap_or(&blank);
+            let bs = before.style_of(r, c);
+            let as_ = result.style_of(r, c);
+            if !bc.same_input(ac) || bs != as_ {
+                revision_sample.push(undo::CellDelta {
+                    sheet: sheet_idx,
+                    row: r,
+                    col: c,
+                    before: bc.clone(),
+                    after: ac.clone(),
+                    before_style: bs,
+                    after_style: as_,
+                });
+                if revision_sample.len() >= sheetcore::revision::MAX_CELLS {
+                    break;
+                }
+            }
+        }
+        keys = Vec::new();
+        check_cancelled(cancel)?;
+        let batch = undo::PreparedCowBatch::from_sheets_with(
+            label,
+            target.sheet,
+            &before,
+            &result,
+            (target.sheet, target.at.0, target.at.1),
+            0,
+            refresh_sizes,
+        );
+        let changed = batch.as_ref().map_or(0, |b| b.changed_count());
+        (changed, Vec::new(), revision_sample, PreparedHistory::Cow(batch))
+    } else {
+        if !keys.windows(2).all(|w| w[0] < w[1]) {
+            keys.sort_unstable();
+            keys.dedup();
+        }
+        let mut deltas = Vec::with_capacity(keys.len().min(65_536));
+        if before.is_empty() {
+            let sheet_idx = target.sheet;
+            for (i, &(r, c)) in keys.iter().enumerate() {
+                if (i & 4095) == 0 {
+                    check_cancelled(cancel)?;
+                }
+                let after_style = result.style_of(r, c);
+                if let Some(after) = result.get(r, c) {
+                    if !after.is_blank() || after_style != 0 {
+                        deltas.push(undo::CellDelta {
+                            sheet: sheet_idx,
+                            row: r,
+                            col: c,
+                            before: sheetcore::Cell::default(),
+                            after: after.clone(),
+                            before_style: 0,
+                            after_style,
+                        });
+                    }
+                } else if after_style != 0 {
                     deltas.push(undo::CellDelta {
                         sheet: sheet_idx,
                         row: r,
                         col: c,
                         before: sheetcore::Cell::default(),
-                        after: after.clone(),
+                        after: sheetcore::Cell::default(),
                         before_style: 0,
                         after_style,
                     });
                 }
-            } else if after_style != 0 {
-                deltas.push(undo::CellDelta {
-                    sheet: sheet_idx,
-                    row: r,
-                    col: c,
-                    before: sheetcore::Cell::default(),
-                    after: sheetcore::Cell::default(),
-                    before_style: 0,
-                    after_style,
-                });
+            }
+        } else {
+            for chunk in keys.chunks(4096) {
+                check_cancelled(cancel)?;
+                deltas.extend(undo::finish(
+                    undo::capture(&before, target.sheet, chunk),
+                    &result,
+                ));
             }
         }
-    } else {
-        for chunk in keys.chunks(4096) {
-            check_cancelled(cancel)?;
-            deltas.extend(undo::finish(
-                undo::capture(&before, target.sheet, chunk),
-                &result,
-            ));
-        }
-    }
-    let changed = deltas.len();
-    let broadcast = if target.room.is_some() {
-        deltas.iter().map(|d| (d.sheet, d.row, d.col)).collect()
-    } else {
-        Vec::new()
+        let changed = deltas.len();
+        let broadcast = if target.room.is_some() {
+            deltas.iter().map(|d| (d.sheet, d.row, d.col)).collect()
+        } else {
+            Vec::new()
+        };
+        let revision_sample = deltas
+            .iter()
+            .take(sheetcore::revision::MAX_CELLS)
+            .cloned()
+            .collect();
+        let history = PreparedHistory::Action(
+            Action {
+                label: label.into(),
+                deltas,
+                focus: (target.sheet, target.at.0, target.at.1),
+                refresh_sizes,
+                by_site: 0,
+                snap_before: None,
+                snap_after: None,
+                pictures: None,
+                shapes: None,
+                merges: None,
+            }
+            .prepare(),
+        );
+        (changed, broadcast, revision_sample, history)
     };
-    let revision_sample = deltas
-        .iter()
-        .take(sheetcore::revision::MAX_CELLS)
-        .cloned()
-        .collect();
-    let history = Action {
-        label: label.into(),
-        deltas,
-        focus: (target.sheet, target.at.0, target.at.1),
-        refresh_sizes,
-        by_site: 0,
-        snap_before: None,
-        snap_after: None,
-        pictures: None,
-        shapes: None,
-        merges: None,
-    }
-    .prepare();
     Ok(PreparedImport {
         before,
         result,
         keys,
+        rects,
         broadcast,
         sources,
         history,
@@ -795,19 +870,49 @@ impl SheetApp {
                 && s.coordinate_revision() == before.coordinate_revision()
                 && s.same_cells_in(before, &[*rect], false))
         });
-        if source_changed || (!whole_snapshot_matches && !live.csv_inputs_match(&update.before, &update.keys)) {
+        let use_rects = update.keys.is_empty() && !update.rects.is_empty();
+        let inputs_ok = whole_snapshot_matches
+            || if use_rects {
+                live.csv_inputs_match_rects(&update.before, &update.rects)
+            } else {
+                live.csv_inputs_match(&update.before, &update.keys)
+            };
+        if source_changed || !inputs_ok {
             self.status = "来源表或目标表已改变，请重新操作".into();
             std::thread::spawn(move || drop(update));
             return;
         }
-        if !self.write_preflight_on(idx, &update.keys, update.label) {
+        let preflight_ok = if use_rects {
+            let rects = update.rects.clone();
+            let mut ok = true;
+            for rect in rects {
+                if !self.check_sparse_rect_preflight(idx, rect, &[], update.label) {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
+        } else {
+            self.write_preflight_on(idx, &update.keys, update.label)
+        };
+        if !preflight_ok {
             std::thread::spawn(move || drop(update));
             return;
         }
         let live = self.wb.sheet_mut(idx);
         if !whole_snapshot_matches {
-            live.rebase_row_changes(&update.before, &mut update.result,
-                |k| update.keys.binary_search(&(k.row, k.col)).is_ok());
+            if use_rects {
+                let rects = &update.rects;
+                live.rebase_row_changes(&update.before, &mut update.result, |k| {
+                    rects.iter().any(|&(r1, c1, r2, c2)| {
+                        (r1..=r2).contains(&k.row) && (c1..=c2).contains(&k.col)
+                    })
+                });
+            } else {
+                live.rebase_row_changes(&update.before, &mut update.result, |k| {
+                    update.keys.binary_search(&(k.row, k.col)).is_ok()
+                });
+            }
         }
         live.take_row_changes(&mut update.result);
         if let Some(registration) = update.registration {
@@ -819,7 +924,11 @@ impl SheetApp {
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.tasks.last_edit = Some(std::time::Instant::now());
         self.record_revision_sample(update.label, &update.revision_sample, update.changed);
-        self.undo.push_prepared(update.history);
+        match update.history {
+            PreparedHistory::Action(action) => self.undo.push_prepared(action),
+            PreparedHistory::Cow(Some(batch)) => self.undo.push_prepared_cow_batch(batch),
+            PreparedHistory::Cow(None) => {}
+        }
         self.broadcast_cells(&update.broadcast);
         if update.changed != 0 {
             self.wb.calc_manual |= self.manual_calc;

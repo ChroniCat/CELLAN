@@ -566,9 +566,40 @@ impl CellJournal {
         let _ = self.remove(key);
     }
 
-    #[inline]
-    pub(crate) fn raw_pages(&self) -> &HashMap<(u32, u32), [u64; 4]> {
-        &self.pages
+    /// Bitwise OR a 256-row mask directly into page `(p, col)` without decoding coordinates.
+    pub(crate) fn or_page_mask(&mut self, p: u32, col: u32, mask: [u64; 4]) {
+        if mask == [0; 4] {
+            return;
+        }
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        let entry = pages.entry((p, col)).or_default();
+        for w in 0..4 {
+            let added = mask[w] & !entry[w];
+            if added != 0 {
+                entry[w] |= added;
+                self.len += added.count_ones() as usize;
+            }
+        }
+    }
+
+    /// Bitwise clear a 256-row mask from page `(p, col)` without decoding coordinates.
+    pub(crate) fn clear_page_mask(&mut self, p: u32, col: u32, mask: [u64; 4]) {
+        if self.len == 0 || mask == [0; 4] || !self.pages.contains_key(&(p, col)) {
+            return;
+        }
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        if let Some(entry) = pages.get_mut(&(p, col)) {
+            for w in 0..4 {
+                let removed = entry[w] & mask[w];
+                if removed != 0 {
+                    entry[w] &= !removed;
+                    self.len -= removed.count_ones() as usize;
+                }
+            }
+            if *entry == [0; 4] {
+                pages.remove(&(p, col));
+            }
+        }
     }
 
     pub fn payload_bytes(&self) -> usize {
@@ -1183,6 +1214,41 @@ impl Sheet {
                 }))
     }
 
+    /// Rectangle-based CSV preflight validation: O(merges + arrays + spilled + changed_pages)
+    /// without materializing millions of `(row, col)` coordinates.
+    pub fn csv_inputs_match_rects(&self, before: &Self, rects: &[(u32, u32, u32, u32)]) -> bool {
+        let hit = |k: CellRef| {
+            rects
+                .iter()
+                .any(|&(r1, c1, r2, c2)| (r1..=r2).contains(&k.row) && (c1..=c2).contains(&k.col))
+        };
+        let intersects = |&(a, b, c, d): &(u32, u32, u32, u32)| {
+            rects
+                .iter()
+                .any(|&(r1, c1, r2, c2)| a <= r2 && c >= r1 && b <= c2 && d >= c1)
+        };
+        self.merges
+            .iter()
+            .filter(|r| intersects(r))
+            .eq(before.merges.iter().filter(|r| intersects(r)))
+            && self
+                .arrays
+                .iter()
+                .filter(|(_, r)| intersects(r))
+                .eq(before.arrays.iter().filter(|(_, r)| intersects(r)))
+            && !self.spilled.symmetric_difference(&before.spilled).any(|k| hit(*k))
+            && (self.cell_version() == before.cell_version()
+                || self
+                    .changed_cells(before)
+                    .chain(before.changed_cells(self))
+                    .filter(|k| hit(*k))
+                    .all(|k| {
+                        self.get(k.row, k.col)
+                            .zip(before.get(k.row, k.col))
+                            .is_some_and(|(a, b)| a.same_input(b))
+                    }))
+    }
+
     pub fn same_sort_region(&self, before: &Self, rect: (u32,u32,u32,u32)) -> bool {
         let (r1,c1,r2,c2) = rect;
         let inside = |k: CellRef| (r1..=r2).contains(&k.row) && (c1..=c2).contains(&k.col);
@@ -1276,7 +1342,8 @@ impl Sheet {
         if self.cleared.is_empty() {
             self.cleared = std::mem::take(&mut result.cleared);
         } else {
-            self.cleared.extend(result.cleared.drain());
+            self.cleared.union_from(&result.cleared);
+            result.cleared.clear();
         }
         if result.styles_dirty {
             std::mem::swap(&mut self.styles, &mut result.styles);
@@ -1285,7 +1352,8 @@ impl Sheet {
             if self.style_edits.is_empty() {
                 self.style_edits = std::mem::take(&mut result.style_edits);
             } else {
-                self.style_edits.extend(result.style_edits.drain());
+                self.style_edits.union_from(&result.style_edits);
+                result.style_edits.clear();
             }
         }
         self.edited = true;
@@ -1350,14 +1418,19 @@ impl Sheet {
         self.hidden_dirty = true;
     }
 
+    #[inline]
     pub fn style_of(&self, r: u32, c: u32) -> u16 {
         if let Some(&id) = self.styles.get(&CellRef::new(r, c)) {
             return id;
         }
-        if let Some(&id) = self.row_styles.get(&r) {
+        if !self.row_styles.is_empty()
+            && let Some(&id) = self.row_styles.get(&r)
+        {
             return id;
         }
-        if let Some(&id) = self.col_styles.get(&c) {
+        if !self.col_styles.is_empty()
+            && let Some(&id) = self.col_styles.get(&c)
+        {
             return id;
         }
         0
@@ -1512,7 +1585,9 @@ impl Sheet {
         self.merges.max_col()
     }
 
-    /// 批量写入矩形区域样式：整页全覆盖时自动压缩为 `Uniform(id)` 共享页
+    /// 批量写入矩形区域样式：整页全覆盖时自动压缩为 `Uniform(id)` 共享页；
+    /// `id == 0` 走页级 `remove_rect_recording`，仅对命中整行/整列样式的行列写回显式 `0`，
+    /// 避免全选清除样式时遍历 1.7×10¹⁰ 个空坐标。
     pub fn set_style_rect(&mut self, r1: u32, c1: u32, r2: u32, c2: u32, id: u16) {
         let (r1, r2) = (r1.min(r2), r1.max(r2));
         let (c1, c2) = (c1.min(c2), c1.max(c2));
@@ -1525,18 +1600,77 @@ impl Sheet {
             self.styles.insert_rect(r1, c1, r2, c2, id);
             self.style_edits.insert_rect(r1, c1, r2, c2);
         } else {
-            for r in r1..=r2 {
-                for c in c1..=c2 {
-                    let key = CellRef::new(r, c);
-                    if self.row_styles.contains_key(&r) || self.col_styles.contains_key(&c) {
-                        self.styles.insert(key, 0);
-                    } else {
-                        self.styles.remove(&key);
-                    }
+            self.styles
+                .remove_rect_recording(r1, c1, r2, c2, &mut self.style_edits);
+            if !self.row_styles.is_empty() {
+                let hit_rows: Vec<u32> = self
+                    .row_styles
+                    .keys()
+                    .copied()
+                    .filter(|&r| r >= r1 && r <= r2)
+                    .collect();
+                for r in hit_rows {
+                    self.styles.insert_rect(r, c1, r, c2, 0);
+                    self.style_edits.insert_rect(r, c1, r, c2);
                 }
             }
-            self.style_edits.insert_rect(r1, c1, r2, c2);
+            if !self.col_styles.is_empty() {
+                let hit_cols: Vec<u32> = self
+                    .col_styles
+                    .keys()
+                    .copied()
+                    .filter(|&c| c >= c1 && c <= c2)
+                    .collect();
+                for c in hit_cols {
+                    self.styles.insert_rect(r1, c, r2, c, 0);
+                    self.style_edits.insert_rect(r1, c, r2, c);
+                }
+            }
         }
+    }
+
+    /// 批量清空矩形区域单元格内容（跳过空页并整块释放完整列页），返回被清空的非空格数。
+    pub fn clear_cells_rect(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) -> usize {
+        let (r1, r2) = (r1.min(r2), r1.max(r2));
+        let (c1, c2) = (c1.min(c2), c1.max(c2));
+        let removed = self.cells.clear_rect(r1, c1, r2, c2, &mut self.cleared);
+        if removed > 0 && !self.loading {
+            self.edited = true;
+        }
+        removed
+    }
+
+    /// 仅在 `[c1..=c2]` 列带内将 `>= at` 行的单元格与显式样式整块下移或删除上移。
+    pub(crate) fn shift_col_band_rows(&mut self, c1: u32, c2: u32, at: u32, n: u32, delete: bool) {
+        self.cells
+            .shift_col_band_rows(c1, c2, at, n, delete, &mut self.cleared);
+        let styles_before = self.style_edits.len();
+        self.styles
+            .shift_col_band_rows(c1, c2, at, n, delete, &mut self.style_edits);
+        if self.style_edits.len() != styles_before {
+            self.display_style_revision = next_sheet_identity();
+            if !self.loading {
+                self.styles_dirty = true;
+            }
+        }
+        if !self.loading {
+            self.edited = true;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn cells_mut(&mut self) -> &mut Store {
+        &mut self.cells
+    }
+
+    #[inline]
+    pub(crate) fn cells_and_cleared_mut(&mut self) -> (&mut Store, &mut CellJournal) {
+        (&mut self.cells, &mut self.cleared)
+    }
+
+    #[inline]
+    pub(crate) fn bump_display_style_revision(&mut self) {
+        self.display_style_revision = next_sheet_identity();
     }
 
     /// 已用区域 (r1, c1, r2, c2)，0-based
