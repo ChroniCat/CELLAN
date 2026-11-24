@@ -1,6 +1,7 @@
 # Rust build and packaging output
 /target/
 /dist/
+/.worktrees/
 
 # Keep legacy local distribution keys out of source control
 /.cellan-ai-key.local

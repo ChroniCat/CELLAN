@@ -13,13 +13,14 @@
   - 本仓库使用 **Windows 原生 MSVC Rust 工具链**（位于 Windows 侧 `%USERPROFILE%\.cargo\bin\cargo.exe`，仓库 Windows 路径为 `F:\finance-native-sheets-ready`，WSL 挂载路径为 `/mnt/f/finance-native-sheets-ready`）。
   - **若当前 Agent 运行在 WSL / Linux Bash 环境**：必须通过 `powershell.exe` 调用 Windows 侧的 `cargo` 与脚本，并始终附带 `-NoProfile -NonInteractive -InputFormat None` 及 `< /dev/null` 防止标准输入挂起。
   - 优先追加 `--offline` 使用本地依赖缓存构建与测试。
-  - 本机常规 Rust 编译与测试使用 D 盘。PowerShell 中设置 `$env:CARGO_TARGET_DIR = "D:\CELLAN-build\target"` 并将本次进程的 `TEMP`、`TMP` 指向 D 盘已创建的临时目录。正式发版时把专用发布 worktree 建在 D 盘，由脚本使用该 worktree 自己的 `target`。
+  - **目录收敛约束**：所有开发、测试与发布 worktree 统一创建在本仓库根目录的 `.worktrees/` 下（已在 `.gitignore` 中忽略），**严禁**在仓库外部（如 `../LANCell-*` 或 `F:\` 等盘符根目录）散落临时目录。常规开发测试如需跨 worktree 复用编译缓存可按需设置 `CARGO_TARGET_DIR`；正式发版由 `scripts/publish.ps1` 自动使用发布 worktree 自身的 `target`。
 
 ### 每个任务使用独立 worktree
 
 - 开始编辑前，先用 `git worktree list` 查看已有工作目录，用 `git status --short --branch` 检查当前目录。每个 AI 任务使用专属 worktree 和分支；续做同一任务时复用自己的 worktree。
-- 新任务默认从最新的远端 `main` 开始。在仓库目录运行 `git fetch origin main`，再运行 `git worktree add --no-track -b codex/<任务名> ../LANCell-<任务名> origin/main`。将占位符替换为实际名称，后续编辑、测试和提交都在新目录中进行。用户指定基线时遵照指定基线。
-- 不在其他 AI 或用户使用的目录切换分支、暂存、提交、覆盖、还原或清理文件。不要对共享工作目录执行 `git stash`、`git reset --hard` 或 `git clean`，也不要移除其他任务的 worktree。
+- 新任务默认从最新的远端 `main` 开始。在主仓库目录运行 `git fetch origin main`，再运行 `git worktree add --no-track -b codex/<任务名> .worktrees/<任务名> origin/main`。将占位符替换为实际名称，后续编辑、测试和提交都在 `.worktrees/<任务名>` 中进行，不要在仓库外部新建目录。用户指定基线时遵照指定基线。
+- 不在其他 AI 或用户使用的目录切换分支、暂存、提交、覆盖、还原或清理文件。不要对共享工作目录执行 `git stash`、`git reset --hard` 或 `git clean`，也不要移除其他未完成任务的 worktree。
+- 自己的任务分支合入 `main` 并确认不再需要后，先核对工作区干净且无进程占用，再在主仓库执行 `git worktree remove .worktrees/<任务名>` 及时清理，避免 `target/` 和旧目录堆积。
 - 开工时说明自己负责的文件或模块。若同一文件已由其他 AI 修改，先协调归属和集成顺序；独立 worktree 只能隔离磁盘写入，合并时仍可能有逻辑冲突。等待协调期间可以继续处理互不重叠的文件。
 
 ### 集成到 main
@@ -52,8 +53,8 @@
 ### 发布前选定 main 提交
 
 1. 先将本次要交付的代码、发版脚本和“关于”显示提交号的实现合入远端 `main`，通过相关测试。构建时从 Git 取得提交号并嵌入 exe；无法取得时停止发布。
-2. 运行 `git fetch origin main` 和 `git rev-parse origin/main`，记录完整提交号。用 `git worktree add --detach ../LANCell-release-<短提交号> <完整提交号>` 创建专用发布目录。进入该目录，核对 `git rev-parse HEAD` 与记录一致，且 `git status --porcelain` 输出为空。
-3. 在发布 worktree 根目录调用下文的脚本，使用该目录自己的 `target` 和 `dist`。脚本会在编译前同步版本号及签名公钥；正式发布应先将目标版本、对应公钥和依赖锁文件的必要变更合入 `main`，再显式传入相同版本，确保实际编译的源码与记录的提交一致。私钥始终留在仓库外。
+2. 在主仓库目录运行 `git fetch origin main` 和 `git rev-parse origin/main`，记录完整提交号。用 `git worktree add --detach .worktrees/release-<短提交号> <完整提交号>` 在项目内部创建专用发布目录（不要建在仓库外的 `F:\` 根目录）。进入该目录，核对 `git rev-parse HEAD` 与记录一致，且 `git status --porcelain` 输出为空。
+3. 在 `.worktrees/release-<短提交号>` 根目录调用下文的脚本，使用该目录自己的 `target` 和 `dist`。脚本会在编译前同步版本号及签名公钥；正式发布应先将目标版本、对应公钥和依赖锁文件的必要变更合入 `main`，再显式传入相同版本，确保实际编译的源码与记录的提交一致。私钥始终留在仓库外。
 
 ### 严禁手工裸拷 `target/release/app.exe`
 **不要**只跑 `cargo build --release` 然后手动复制 `target/release/app.exe` 到 `dist/CELLAN/CELLAN.exe`！原因：
@@ -116,6 +117,7 @@ powershell.exe -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Byp
 
 内网服务就绪后，还须验收实际交付的文件：
 
-1. 从发布 worktree 的 `dist/CELLAN/CELLAN.exe` 启动已签名的程序，打开“关于”。产品版本须与脚本的目标版本一致，Git 短提交号须至少 7 位，并与第 2 节记录的完整提交号前缀一致。任一项缺失或不匹配时，停止交付并报告差异。
-2. 将验收通过的签名发布包（含 `manifest.txt`）归档至 `dist/<短提交号>/`。保留脚本原有的 `dist/CELLAN/` 和内网服务路径；归档使用脚本产物。
-3. 交接时报告产品版本、完整 Git 提交号、签名产物路径和验证结果。
+1. 从发布 worktree 的 `.worktrees/release-<短提交号>/dist/CELLAN/CELLAN.exe` 启动已签名的程序，打开“关于”。产品版本须与脚本的目标版本一致，Git 短提交号须至少 7 位，并与第 2 节记录的完整提交号前缀一致。任一项缺失或不匹配时，停止交付并报告差异。验收完成后关闭该测试进程。
+2. 将验收通过的签名发布包（`dist/CELLAN/` 下完整文件，含 `CELLAN.exe`、`manifest.txt`、`版本.txt` 等）归档至**主仓库**的 `dist/<短提交号>/`，并同步更新主仓库的 `dist/CELLAN/`（同时保留内网服务路径 `%LOCALAPPDATA%\CELLAN\publish-server\`）。
+3. 确认归档完成且无进程占用后，在主仓库执行 `git worktree remove --force .worktrees/release-<短提交号>` 清理临时发布目录（仅保留主仓库 `dist/` 中的归档产物）。
+4. 交接时报告产品版本、完整 Git 提交号、主仓库归档产物路径和验证结果。
