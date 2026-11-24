@@ -154,6 +154,23 @@ impl<'a> ReadOnlyFormulaIndex<'a> {
     }
 
     #[inline]
+    fn point_near(&self, slot_hint: usize, key: CellKey, out: &mut Vec<usize>) {
+        if slot_hint > 0 && self.keys[slot_hint - 1] == key {
+            if self.values[slot_hint - 1].is_none() {
+                out.push(slot_hint - 1);
+            }
+            return;
+        }
+        if slot_hint + 1 < self.keys.len() && self.keys[slot_hint + 1] == key {
+            if self.values[slot_hint + 1].is_none() {
+                out.push(slot_hint + 1);
+            }
+            return;
+        }
+        self.point(key, out);
+    }
+
+    #[inline]
     fn point(&self, key: CellKey, out: &mut Vec<usize>) {
         let (si, row, col) = key;
         if si >= self.sheet_has_unresolved.len() || !self.sheet_has_unresolved[si] {
@@ -291,6 +308,7 @@ fn collect_slot_prerequisites(
     wb: &Workbook,
     name_index: Option<&NameIndex>,
     has_tables: bool,
+    slot_hint: usize,
     key: CellKey,
     index: &ReadOnlyFormulaIndex<'_>,
     lambda_names: &FxHashSet<String>,
@@ -304,14 +322,15 @@ fn collect_slot_prerequisites(
     };
 
     // Fast path for projected scalar formulas (same-sheet OR cross-sheet arithmetic)
-    if !has_tables {
+    let may_use_table_ref = has_tables && formula_arc.as_bytes().contains(&b'[');
+    if !may_use_table_ref {
         let mut fast_done = false;
         let mut has_lambda = false;
         let _ = compiled::with_eval_arc(formula_arc, row, col, |node, dr, dc, kind| {
             if kind != compiled::ScalarKind::None {
                 compiled::visit_projected_refs(node, dr, dc, &mut |sheet_opt, r, c| {
                     let target_si = resolve_sheet_idx(wb, sheet_opt, si);
-                    index.point((target_si, r, c), direct_slots);
+                    index.point_near(slot_hint, (target_si, r, c), direct_slots);
                 });
                 fast_done = true;
             } else if !lambda_names.is_empty() && uses_named_lambda(node, lambda_names) {
@@ -335,14 +354,21 @@ fn collect_slot_prerequisites(
         return false;
     }
 
-    let Some(areas) = deps::parallel_inputs_arc(wb, name_index, has_tables, key, formula_arc)
-    else {
+    let mut areas_ok = true;
+    let inputs_ok = deps::visit_parallel_inputs_arc(
+        wb,
+        name_index,
+        may_use_table_ref,
+        key,
+        formula_arc,
+        |area| {
+            if areas_ok && !index.collect(area, local_vcache, direct_slots, virt_keys) {
+                areas_ok = false;
+            }
+        },
+    );
+    if !inputs_ok || !areas_ok {
         return false;
-    };
-    for area in areas {
-        if !index.collect(area, local_vcache, direct_slots, virt_keys) {
-            return false;
-        }
     }
     direct_slots.sort_unstable();
     direct_slots.dedup();
@@ -431,6 +457,7 @@ impl Plan {
                     wb,
                     name_ix_ref,
                     has_tables,
+                    slot,
                     key,
                     &index,
                     &lambda_names,
@@ -508,6 +535,7 @@ impl Plan {
                             wb,
                             name_ix_ref,
                             has_tables,
+                            slot,
                             keys[slot],
                             &index,
                             &lambda_names,
@@ -714,6 +742,133 @@ fn estimate_workload(wb: &Workbook, keys: &[CellKey], pending: usize) -> usize {
     pending.saturating_mul(weight_sum) / samples
 }
 
+/// Ultra-fast zero-DAG-allocation streaming evaluator for width-1 sequential scalar chains
+/// (e.g. `chain 1M` `A2=A1+1` or running balances `B2=B1+A2`). When strided sampling proves
+/// `keys[s]` directly depends on `keys[s - 1]` (parallelism width == 1), building a 110 MB
+/// multi-core CSR `Plan` + waking 15 idle worker threads is pure overhead.
+pub(super) fn try_eval_tight_forward_chain(
+    wb: &Workbook,
+    keys: &[CellKey],
+    is_dirty_subset: bool,
+    cancel: Option<&AtomicBool>,
+    done: Option<&AtomicUsize>,
+) -> Option<Batch> {
+    if keys.len() < 256 || cancelled(cancel) {
+        return None;
+    }
+    let has_tables = wb.sheets.iter().any(|s| !s.tables.is_empty());
+    const SAMPLES: usize = 16;
+    let span = keys.len() - 1;
+    let stride = (span / SAMPLES).max(1);
+    let mut hits_prev = 0usize;
+    for i in 0..SAMPLES {
+        let slot = 1 + ((i * stride + i * 13) % span);
+        let key = keys[slot];
+        let prev = keys[slot - 1];
+        if key.0 != prev.0 {
+            continue;
+        }
+        let Some(f_arc) = wb.sheets[key.0].formula_arc_of(key.1, key.2) else {
+            return None;
+        };
+        if has_tables && f_arc.as_bytes().contains(&b'[') {
+            return None;
+        }
+        let mut saw_prev = false;
+        let mut all_backward = true;
+        let ok = compiled::with_eval_arc(f_arc, key.1, key.2, |node, dr, dc, kind| {
+            if kind != compiled::ScalarKind::SameSheet {
+                return false;
+            }
+            compiled::visit_projected_refs(node, dr, dc, &mut |_, rr, cc| {
+                let target = (key.0, rr, cc);
+                if target == prev {
+                    saw_prev = true;
+                }
+                if target >= key {
+                    all_backward = false;
+                }
+            });
+            true
+        })
+        .unwrap_or(false);
+        if !ok || !all_backward {
+            return None;
+        }
+        if saw_prev {
+            hits_prev += 1;
+        }
+    }
+    if hits_prev + 1 < SAMPLES {
+        return None;
+    }
+
+    let n = keys.len();
+    let mut out: Vec<(usize, u32, u32, FValue)> = Vec::with_capacity(n);
+    for slot in 0..n {
+        if slot & 4095 == 0 {
+            if cancelled(cancel) {
+                return None;
+            }
+            if let Some(d) = done {
+                d.store(slot, Ordering::Relaxed);
+            }
+        }
+        let (si, r, c) = keys[slot];
+        let f_arc = wb.sheets[si].formula_arc_of(r, c)?;
+        if has_tables && f_arc.as_bytes().contains(&b'[') {
+            return None;
+        }
+        let val = compiled::with_eval_arc(f_arc, r, c, |node, dr, dc, kind| match kind {
+            compiled::ScalarKind::SameSheet => {
+                compiled::eval_projected_scalar(node, dr, dc, &mut |_, rr, cc| {
+                    if slot > 0 {
+                        let prev = &out[slot - 1];
+                        if (prev.0, prev.1, prev.2) == (si, rr, cc) {
+                            return Some(prev.3.clone());
+                        }
+                    }
+                    match wb.sheets[si].get_view(rr, cc) {
+                        None => Some(FValue::Empty),
+                        Some(crate::store::CellView::Number(num)) => Some(FValue::Number(num)),
+                        Some(crate::store::CellView::Value(v)) => Some(super::to_fvalue(v)),
+                        Some(crate::store::CellView::Cell(cell)) => {
+                            if cell.formula.is_none() {
+                                return Some(super::to_fvalue(&cell.value));
+                            }
+                            let target = (si, rr, cc);
+                            if target < (si, r, c) {
+                                if let Ok(dep_slot) = keys[..slot].binary_search(&target) {
+                                    return Some(out[dep_slot].3.clone());
+                                }
+                            } else if keys[slot..].binary_search(&target).is_ok() {
+                                return None;
+                            }
+                            if is_dirty_subset && !super::callable_cache_candidate(&cell.value) {
+                                Some(super::to_fvalue(&cell.value))
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                })
+            }
+            _ => None,
+        })
+        .ok()
+        .flatten()
+        .filter(|v| !matches!(v, FValue::Array(_) | FValue::Lambda(_)))?;
+        out.push((si, r, c, val));
+    }
+    if let Some(d) = done {
+        d.store(n, Ordering::Relaxed);
+    }
+    Some(Batch {
+        values: out,
+        pending: Vec::new(),
+    })
+}
+
 pub(super) fn evaluate<'a>(
     wb: &'a Workbook,
     keys: &[CellKey],
@@ -724,6 +879,12 @@ pub(super) fn evaluate<'a>(
     cancel: Option<&AtomicBool>,
     done: Option<&AtomicUsize>,
 ) -> Option<Batch> {
+    if initial.is_none()
+        && let Some(chain_batch) =
+            try_eval_tight_forward_chain(wb, keys, scope.is_some(), cancel, done)
+    {
+        return Some(chain_batch);
+    }
     let workers = pool::max_workers();
     evaluate_with_workers(wb, keys, initial, scope, Some(shared), ctx, cancel, done, workers)
 }
@@ -814,6 +975,7 @@ fn evaluate_with_workers<'a>(
     pool::run_parallel(effective_workers, |_| {
         let mut calc = Calc::new_worker(wb, ctx, scope, Some(shared_ref));
         calc.fast_scope = fast_scope_ref;
+        calc.cancel = cancel;
         calc.scheduling = true;
         calc.parallel_values = Some(pvals);
 
@@ -876,8 +1038,8 @@ fn evaluate_with_workers<'a>(
             // Fast zero-overhead direct scalar path (arithmetic, IF, IFERROR, IFNA):
             // reads prerequisites directly from `plan.inputs` via `pvals.get_by_slot` without
             // touching `Calc::memo`, `Calc::visiting`, or `pvals.binary_search`.
-            let fast_val = if !has_tables
-                && let Some(f_arc) = wb.sheets[si].formula_arc_of(r, c)
+            let fast_val = if let Some(f_arc) = wb.sheets[si].formula_arc_of(r, c)
+                && (!has_tables || !f_arc.as_bytes().contains(&b'['))
             {
                 compiled::with_eval_arc(f_arc, r, c, |node, dr, dc, kind| match kind {
                     compiled::ScalarKind::SameSheet => {

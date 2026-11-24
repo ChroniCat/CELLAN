@@ -71,18 +71,82 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
             let index = |line: usize, offset: usize| {
                 if by_col { offset * cols + line } else { line * cols + offset }
             };
-            // Preserve the first original row/column (including its value types).
-            // A vector key keeps boundaries distinct even when a cell contains separators.
-            let mut first = std::collections::HashMap::new();
+
+            #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+            enum UniqueAtom<'a> {
+                Empty,
+                Num(u64),
+                Text(&'a str),
+                Bool(bool),
+                Err(ErrKind),
+                Func,
+            }
+
+            #[inline]
+            fn atom_of(mut v: &FValue) -> UniqueAtom<'_> {
+                while let FValue::Array(a) = v {
+                    v = a.data.first().unwrap_or(&FValue::Empty);
+                }
+                match v {
+                    FValue::Empty => UniqueAtom::Empty,
+                    FValue::Number(n) => {
+                        let c = if *n == 0.0 { 0.0 } else { *n };
+                        UniqueAtom::Num(c.to_bits())
+                    }
+                    FValue::Text(s) => UniqueAtom::Text(s.as_ref()),
+                    FValue::Bool(b) => UniqueAtom::Bool(*b),
+                    FValue::Error(e) => UniqueAtom::Err(*e),
+                    FValue::Lambda(_) => UniqueAtom::Func,
+                    FValue::Array(_) => unreachable!(),
+                }
+            }
+
             let mut keep = Vec::with_capacity(lines);
             let mut repeated = vec![false; if once { lines } else { 0 }];
-            for line in 0..lines {
-                let key: Vec<_> = (0..width).map(|offset| data[index(line, offset)].display()).collect();
-                let first_line = *first.entry(key).or_insert(line);
-                if first_line == line {
-                    keep.push(line);
-                } else if once {
-                    repeated[first_line] = true;
+            if width == 1 {
+                let mut first: super::fxhash::FxHashMap<UniqueAtom<'_>, usize> =
+                    super::fxhash::FxHashMap::default();
+                for line in 0..lines {
+                    let k = atom_of(&data[index(line, 0)]);
+                    let first_line = *first.entry(k).or_insert(line);
+                    if first_line == line {
+                        keep.push(line);
+                    } else if once {
+                        repeated[first_line] = true;
+                    }
+                }
+            } else if width <= 4 {
+                let mut first: super::fxhash::FxHashMap<[UniqueAtom<'_>; 4], usize> =
+                    super::fxhash::FxHashMap::default();
+                for line in 0..lines {
+                    let mut k = [UniqueAtom::Empty; 4];
+                    for offset in 0..width {
+                        k[offset] = atom_of(&data[index(line, offset)]);
+                    }
+                    let first_line = *first.entry(k).or_insert(line);
+                    if first_line == line {
+                        keep.push(line);
+                    } else if once {
+                        repeated[first_line] = true;
+                    }
+                }
+            } else {
+                let mut first: super::fxhash::FxHashMap<Vec<UniqueAtom<'_>>, usize> =
+                    super::fxhash::FxHashMap::default();
+                let mut scratch = Vec::with_capacity(width);
+                for line in 0..lines {
+                    scratch.clear();
+                    for offset in 0..width {
+                        scratch.push(atom_of(&data[index(line, offset)]));
+                    }
+                    if let Some(&first_line) = first.get(&scratch) {
+                        if once {
+                            repeated[first_line] = true;
+                        }
+                    } else {
+                        first.insert(scratch.clone(), line);
+                        keep.push(line);
+                    }
                 }
             }
             if once {
@@ -384,7 +448,7 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
                 let row = &n1[i * c1..(i + 1) * c1];
                 for j in 0..c2 {
                     let col = &n2_t[j * c1..(j + 1) * c1];
-                    let s: f64 = row.iter().zip(col).map(|(a, b)| a * b).sum();
+                    let s = super::dot_f64_8way(row, col);
                     out.push(FValue::number(s));
                 }
             }

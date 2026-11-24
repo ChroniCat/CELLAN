@@ -9,23 +9,68 @@ use super::{
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+const SORTED_BLOCK: usize = 256;
+const EXACT_INT_LIMIT: u64 = 1 << 53;
+
 // A single numeric inequality can be answered from two cut points in a sorted column.
 // Only exactly summable integer amounts may change summation order.
-#[derive(Clone)]
+// Uses 256-entry block prefix sums so value-column delta patching touches O(changed_rows + blocks)
+// instead of rewriting an O(N) prefix array!
+#[derive(Clone, Debug)]
 pub(crate) struct Sorted {
-    keys: Vec<f64>,
-    prefix: Option<Vec<i64>>,
-    prefix_cnt: Option<Vec<u32>>,
+    keys: Arc<Vec<f64>>,
+    weights: Option<Arc<Vec<i64>>>,
+    present_bits: Option<Arc<Vec<u64>>>,
+    block_prefix: Option<Vec<i64>>,
+    block_cnt_prefix: Option<Vec<u32>>,
     /// Fast path when every row in `vals` has the identical exact integer `w`:
-    /// eliminates 200k random page dereferences and `prefix`/`prefix_cnt` allocations!
+    /// eliminates 200k random page dereferences and `weights`/`block_prefix` allocations!
     uniform_weight: Option<i64>,
     total: i64,
     total_cnt: u32,
+    abs_total: u64,
 }
 
 impl Sorted {
+    fn compute_block_prefixes(
+        weights: &[i64],
+        present_bits: &[u64],
+        from_block: usize,
+        bp: &mut Vec<i64>,
+        bc: &mut Vec<u32>,
+    ) {
+        let m = weights.len();
+        let num_blocks = m.div_ceil(SORTED_BLOCK);
+        bp.resize(num_blocks + 1, 0);
+        bc.resize(num_blocks + 1, 0);
+        let start_b = from_block.min(num_blocks);
+        let mut run_sum = bp[start_b];
+        let mut run_cnt = bc[start_b];
+        for b in start_b..num_blocks {
+            let s = b * SORTED_BLOCK;
+            let e = (s + SORTED_BLOCK).min(m);
+            let mut bsum = 0i64;
+            for &w in &weights[s..e] {
+                bsum += w;
+            }
+            let sw = b * (SORTED_BLOCK / 64);
+            let ew = e / 64;
+            let mut bcnt = 0u32;
+            for &word in &present_bits[sw..ew] {
+                bcnt += word.count_ones();
+            }
+            let rem = e & 63;
+            if rem != 0 {
+                bcnt += (present_bits[ew] & ((1u64 << rem) - 1)).count_ones();
+            }
+            run_sum += bsum;
+            run_cnt += bcnt;
+            bp[b + 1] = run_sum;
+            bc[b + 1] = run_cnt;
+        }
+    }
+
     fn build(keys: &[FValue], amounts: Option<&[FValue]>) -> Option<Self> {
-        const EXACT: u64 = 1 << 53;
         let n = keys.len().min(amounts.map_or(usize::MAX, |v| v.len()));
         let mut rows = Vec::with_capacity(n);
         let mut total = 0i64;
@@ -36,12 +81,12 @@ impl Sorted {
                 None => (1i64, 1u32),
                 Some(v) => match v[i].to_number() {
                     Ok(x) => {
-                        if !x.is_finite() || x.fract() != 0.0 || x.abs() > EXACT as f64 {
+                        if !x.is_finite() || x.fract() != 0.0 || x.abs() > EXACT_INT_LIMIT as f64 {
                             return None;
                         }
                         let weight = x as i64;
                         absolute += weight.unsigned_abs();
-                        if absolute > EXACT {
+                        if absolute > EXACT_INT_LIMIT {
                             return None;
                         }
                         (weight, 1u32)
@@ -59,33 +104,46 @@ impl Sorted {
             }
         }
         rows.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        let mut prefix = amounts.map(|_| {
-            let mut v = Vec::with_capacity(rows.len() + 1);
-            v.push(0i64);
-            v
-        });
-        let mut prefix_cnt = amounts.map(|_| {
-            let mut v = Vec::with_capacity(rows.len() + 1);
-            v.push(0u32);
-            v
-        });
-        let mut sorted_keys = Vec::with_capacity(rows.len());
-        for (value, amount, has_num) in rows {
-            if let Some(p) = &mut prefix {
-                p.push(p.last().copied().unwrap_or(0) + amount);
+        let m = rows.len();
+        let mut sorted_keys = Vec::with_capacity(m);
+        if amounts.is_none() {
+            for (value, _, _) in rows {
+                sorted_keys.push(value);
             }
-            if let Some(c) = &mut prefix_cnt {
-                c.push(c.last().copied().unwrap_or(0) + has_num);
-            }
-            sorted_keys.push(value);
+            return Some(Self {
+                keys: Arc::new(sorted_keys),
+                weights: None,
+                present_bits: None,
+                block_prefix: None,
+                block_cnt_prefix: None,
+                uniform_weight: None,
+                total,
+                total_cnt,
+                abs_total: absolute,
+            });
         }
+        let mut weights = Vec::with_capacity(m);
+        let mut present_bits = vec![0u64; m.div_ceil(64)];
+        for (i, (value, amount, has_num)) in rows.into_iter().enumerate() {
+            sorted_keys.push(value);
+            weights.push(amount);
+            if has_num != 0 {
+                present_bits[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+        let mut bp = Vec::new();
+        let mut bc = Vec::new();
+        Self::compute_block_prefixes(&weights, &present_bits, 0, &mut bp, &mut bc);
         Some(Self {
-            keys: sorted_keys,
-            prefix,
-            prefix_cnt,
+            keys: Arc::new(sorted_keys),
+            weights: Some(Arc::new(weights)),
+            present_bits: Some(Arc::new(present_bits)),
+            block_prefix: Some(bp),
+            block_cnt_prefix: Some(bc),
             uniform_weight: None,
             total,
             total_cnt,
+            abs_total: absolute,
         })
     }
 
@@ -94,14 +152,13 @@ impl Sorted {
         cond: &SharedCondColumn,
         vals: Option<&SharedCondColumn>,
     ) -> Option<Self> {
-        const EXACT: u64 = 1 << 53;
         let sorted = cond.sorted_nums()?;
         let n = cond.len.min(vals.map_or(usize::MAX, |v| v.len));
         let full_span = vals.is_none_or(|v| v.len == n) && cond.len == n;
 
         let mut uniform_weight: Option<i64> = None;
-        let (total, total_cnt) = match vals {
-            None => (n as i64, n as u32),
+        let (total, total_cnt, abs_total) = match vals {
+            None => (n as i64, n as u32, n as u64),
             Some(vc) if full_span => {
                 let mut tot = 0i64;
                 let mut abs_sum = 0u64;
@@ -121,7 +178,7 @@ impl Sorted {
                     }
                     tot = tot.wrapping_add(p.int_sum);
                     abs_sum = abs_sum.saturating_add(p.int_abs_sum);
-                    if abs_sum > EXACT {
+                    if abs_sum > EXACT_INT_LIMIT {
                         return None;
                     }
                     cnt += p.num_count as u32;
@@ -129,7 +186,7 @@ impl Sorted {
                 if all_uniform && let Some(fv) = first_val {
                     uniform_weight = Some(fv as i64);
                 }
-                (tot, cnt)
+                (tot, cnt, abs_sum)
             }
             Some(vc) => {
                 let mut tot = 0i64;
@@ -137,19 +194,19 @@ impl Sorted {
                 let mut cnt = 0u32;
                 for row in 0..n {
                     if let Some(x) = vc.coerced_number_at(row) {
-                        if !x.is_finite() || x.fract() != 0.0 || x.abs() > EXACT as f64 {
+                        if !x.is_finite() || x.fract() != 0.0 || x.abs() > EXACT_INT_LIMIT as f64 {
                             return None;
                         }
                         let w = x as i64;
                         abs_sum = abs_sum.saturating_add(w.unsigned_abs());
-                        if abs_sum > EXACT {
+                        if abs_sum > EXACT_INT_LIMIT {
                             return None;
                         }
                         tot += w;
                         cnt += 1;
                     }
                 }
-                (tot, cnt)
+                (tot, cnt, abs_sum)
             }
         };
 
@@ -170,24 +227,24 @@ impl Sorted {
                 }
             }
             return Some(Self {
-                keys: sorted_keys,
-                prefix: None,
-                prefix_cnt: None,
+                keys: Arc::new(sorted_keys),
+                weights: None,
+                present_bits: None,
+                block_prefix: None,
+                block_cnt_prefix: None,
                 uniform_weight,
                 total,
                 total_cnt,
+                abs_total,
             });
         }
         let vc = vals.unwrap();
-        let mut prefix = Vec::with_capacity(m + 1);
-        let mut prefix_cnt = Vec::with_capacity(m + 1);
-        prefix.push(0i64);
-        prefix_cnt.push(0u32);
-        let mut acc = 0i64;
-        let mut acc_cnt = 0u32;
+        let mut weights = Vec::with_capacity(m);
+        let mut present_bits = vec![0u64; m.div_ceil(64)];
         let vr1 = vc.r1;
         let v_first_page = vr1 >> 8;
         let v_pages = vc.pages.as_slice();
+        let mut pos = 0usize;
         for &(k, r) in sorted.iter() {
             if (r as usize) >= n {
                 continue;
@@ -197,20 +254,124 @@ impl Sorted {
             let page = &v_pages[p_idx];
             let local = (abs_row & 255) as usize - page.start_in_slab as usize;
             if (page.coerced_ok[local >> 6] & (1u64 << (local & 63))) != 0 {
-                acc += page.coerced_nums[local] as i64;
-                acc_cnt += 1;
+                weights.push(page.coerced_nums[local] as i64);
+                present_bits[pos >> 6] |= 1u64 << (pos & 63);
+            } else {
+                weights.push(0);
             }
             sorted_keys.push(k);
-            prefix.push(acc);
-            prefix_cnt.push(acc_cnt);
+            pos += 1;
         }
+        let mut bp = Vec::new();
+        let mut bc = Vec::new();
+        Self::compute_block_prefixes(&weights, &present_bits, 0, &mut bp, &mut bc);
         Some(Self {
-            keys: sorted_keys,
-            prefix: Some(prefix),
-            prefix_cnt: Some(prefix_cnt),
+            keys: Arc::new(sorted_keys),
+            weights: Some(Arc::new(weights)),
+            present_bits: Some(Arc::new(present_bits)),
+            block_prefix: Some(bp),
+            block_cnt_prefix: Some(bc),
             uniform_weight: None,
             total,
             total_cnt,
+            abs_total,
+        })
+    }
+
+    /// O(changed_rows * log M + blocks) incremental value-column patch when `cond` is unchanged!
+    fn try_patch_values_from_cond(
+        &self,
+        cond: &SharedCondColumn,
+        old_vals: &SharedCondColumn,
+        new_vals: &SharedCondColumn,
+        changed_val_pages: &[usize],
+    ) -> Option<Self> {
+        let n = cond.len;
+        if old_vals.len != n || new_vals.len != n || old_vals.r1 != new_vals.r1 {
+            return None;
+        }
+        if self.uniform_weight.is_some() {
+            // If previously uniform, check if still uniform with same weight; else rebuild weights once
+            return None;
+        }
+        let sorted = cond.sorted_nums()?;
+        if sorted.len() != self.keys.len() {
+            return None;
+        }
+        let mut weights_arc = self.weights.clone()?;
+        let mut bits_arc = self.present_bits.clone()?;
+        let mut bp = self.block_prefix.clone()?;
+        let mut bc = self.block_cnt_prefix.clone()?;
+        let mut total = self.total;
+        let mut total_cnt = self.total_cnt;
+        let mut abs_total = self.abs_total;
+        let mut min_dirty_pos = usize::MAX;
+        let mut any_row_diff = false;
+
+        for &p_idx in changed_val_pages {
+            let new_p = new_vals.pages.get(p_idx)?;
+            let old_p = old_vals.pages.get(p_idx)?;
+            if !new_p.all_exact_int || new_p.rows_in_page != old_p.rows_in_page {
+                return None;
+            }
+            let base_row = new_vals.page_offsets[p_idx] as usize;
+            for local in 0..new_p.rows_in_page as usize {
+                let old_has = (old_p.coerced_ok[local >> 6] & (1u64 << (local & 63))) != 0;
+                let new_has = (new_p.coerced_ok[local >> 6] & (1u64 << (local & 63))) != 0;
+                let old_w = if old_has { old_p.coerced_nums[local] as i64 } else { 0 };
+                let new_w = if new_has { new_p.coerced_nums[local] as i64 } else { 0 };
+                if old_has == new_has && old_w == new_w {
+                    continue;
+                }
+                total = total.wrapping_add(new_w - old_w);
+                total_cnt = total_cnt
+                    .wrapping_add(u32::from(new_has))
+                    .wrapping_sub(u32::from(old_has));
+                abs_total = abs_total
+                    .saturating_sub(old_w.unsigned_abs())
+                    .saturating_add(new_w.unsigned_abs());
+                if abs_total > EXACT_INT_LIMIT {
+                    return None;
+                }
+                let row = base_row + local;
+                if let Some(k) = cond.coerced_number_at(row) {
+                    let row_u32 = row as u32;
+                    let pos = sorted
+                        .binary_search_by(|&(sk, sr)| sk.total_cmp(&k).then_with(|| sr.cmp(&row_u32)))
+                        .ok()?;
+                    Arc::make_mut(&mut weights_arc)[pos] = new_w;
+                    let bits = Arc::make_mut(&mut bits_arc);
+                    if new_has {
+                        bits[pos >> 6] |= 1u64 << (pos & 63);
+                    } else {
+                        bits[pos >> 6] &= !(1u64 << (pos & 63));
+                    }
+                    min_dirty_pos = min_dirty_pos.min(pos);
+                    any_row_diff = true;
+                }
+            }
+        }
+
+        if any_row_diff {
+            Self::compute_block_prefixes(
+                &weights_arc,
+                &bits_arc,
+                min_dirty_pos / SORTED_BLOCK,
+                &mut bp,
+                &mut bc,
+            );
+        }
+
+        Some(Self {
+            keys: self.keys.clone(),
+            weights: Some(weights_arc),
+            present_bits: Some(bits_arc),
+            block_prefix: Some(bp),
+            block_cnt_prefix: Some(bc),
+            uniform_weight: None,
+            total,
+            total_cnt,
+            abs_total,
         })
     }
 
@@ -219,46 +380,71 @@ impl Sorted {
         self.query_fn(0, op, n)
     }
 
+    #[inline]
+    fn sum_at(&self, pos: usize) -> i64 {
+        if let Some(w) = self.uniform_weight {
+            return pos as i64 * w;
+        }
+        let (Some(bp), Some(ws)) = (&self.block_prefix, &self.weights) else {
+            return pos as i64;
+        };
+        let blk = pos / SORTED_BLOCK;
+        let mut s = bp[blk];
+        for &w in &ws[blk * SORTED_BLOCK..pos] {
+            s += w;
+        }
+        s
+    }
+
+    #[inline]
+    fn cnt_at(&self, pos: usize) -> u32 {
+        if self.uniform_weight.is_some() {
+            return pos as u32;
+        }
+        let (Some(bc), Some(pb)) = (&self.block_cnt_prefix, &self.present_bits) else {
+            return pos as u32;
+        };
+        let blk = pos / SORTED_BLOCK;
+        let mut c = bc[blk];
+        let start_word = blk * (SORTED_BLOCK / 64);
+        let end_word = pos >> 6;
+        for &word in &pb[start_word..end_word] {
+            c += word.count_ones();
+        }
+        let rem = pos & 63;
+        if rem != 0 {
+            c += (pb[end_word] & ((1u64 << rem) - 1)).count_ones();
+        }
+        c
+    }
+
     fn query_fn(&self, function: u8, op: &str, n: f64) -> FValue {
-        let at_sum = |pos: usize| {
-            if let Some(w) = self.uniform_weight {
-                pos as i64 * w
-            } else {
-                self.prefix.as_ref().map_or(pos as i64, |p| p[pos])
-            }
-        };
-        let at_cnt = |pos: usize| {
-            if self.uniform_weight.is_some() {
-                pos as u32
-            } else {
-                self.prefix_cnt.as_ref().map_or(pos as u32, |c| c[pos])
-            }
-        };
-        let numeric_sum = at_sum(self.keys.len());
-        let numeric_cnt = at_cnt(self.keys.len());
+        let m = self.keys.len();
+        let numeric_sum = self.sum_at(m);
+        let numeric_cnt = self.cnt_at(m);
         let (sum, cnt) = match op {
             "<" => {
                 let p = self.keys.partition_point(|x| *x < n);
-                (at_sum(p), at_cnt(p))
+                (self.sum_at(p), self.cnt_at(p))
             }
             "<=" => {
                 let p = self.keys.partition_point(|x| *x <= n);
-                (at_sum(p), at_cnt(p))
+                (self.sum_at(p), self.cnt_at(p))
             }
             ">" => {
                 let p = self.keys.partition_point(|x| *x <= n);
-                (numeric_sum - at_sum(p), numeric_cnt - at_cnt(p))
+                (numeric_sum - self.sum_at(p), numeric_cnt - self.cnt_at(p))
             }
             ">=" => {
                 let p = self.keys.partition_point(|x| *x < n);
-                (numeric_sum - at_sum(p), numeric_cnt - at_cnt(p))
+                (numeric_sum - self.sum_at(p), numeric_cnt - self.cnt_at(p))
             }
             "<>" => {
                 let lo = self.keys.partition_point(|x| x - n < -f64::EPSILON);
                 let hi = self.keys.partition_point(|x| x - n <= f64::EPSILON);
                 (
-                    self.total - (at_sum(hi) - at_sum(lo)),
-                    self.total_cnt - (at_cnt(hi) - at_cnt(lo)),
+                    self.total - (self.sum_at(hi) - self.sum_at(lo)),
+                    self.total_cnt - (self.cnt_at(hi) - self.cnt_at(lo)),
                 )
             }
             _ => unreachable!(),
@@ -276,7 +462,7 @@ impl Sorted {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct MinMaxOrdered {
     keys: Vec<f64>,
     prefix_min: Vec<f64>,
@@ -436,7 +622,7 @@ impl MinMaxOrdered {
 
 const BLOCK_ROWS: usize = 256;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct BlockBounds {
     min_key: f64,
     max_key: f64,
@@ -446,11 +632,11 @@ struct BlockBounds {
 
 /// Preserves exact IEEE-754 source-order summation for fractional SUMIFS/AVERAGEIF/AVERAGEIFS
 /// while skipping non-matching 256-row blocks in O(1) and avoiding repeated FValue coercions.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PagedOrdered {
-    key_nums: Vec<f64>,
-    val_nums: Vec<f64>,
-    blocks: Vec<BlockBounds>,
+    key_nums: Arc<Vec<f64>>,
+    val_nums: Arc<Vec<f64>>,
+    blocks: Arc<Vec<BlockBounds>>,
 }
 
 impl PagedOrdered {
@@ -499,9 +685,9 @@ impl PagedOrdered {
             });
         }
         Some(Self {
-            key_nums,
-            val_nums,
-            blocks,
+            key_nums: Arc::new(key_nums),
+            val_nums: Arc::new(val_nums),
+            blocks: Arc::new(blocks),
         })
     }
 
@@ -545,9 +731,45 @@ impl PagedOrdered {
             });
         }
         Some(Self {
-            key_nums,
-            val_nums,
-            blocks,
+            key_nums: Arc::new(key_nums),
+            val_nums: Arc::new(val_nums),
+            blocks: Arc::new(blocks),
+        })
+    }
+
+    fn try_patch_values_from_cond(
+        &self,
+        cond: &SharedCondColumn,
+        old_vals: &SharedCondColumn,
+        new_vals: &SharedCondColumn,
+        changed_val_pages: &[usize],
+    ) -> Option<Self> {
+        if cond.has_non_finite || new_vals.has_non_finite {
+            return None;
+        }
+        let n = cond.len.min(new_vals.len);
+        if n != self.val_nums.len() || old_vals.len.min(cond.len) != n {
+            return None;
+        }
+        let mut val_nums_arc = self.val_nums.clone();
+        let vals_mut = Arc::make_mut(&mut val_nums_arc);
+        for &p_idx in changed_val_pages {
+            let new_p = new_vals.pages.get(p_idx)?;
+            let base_row = new_vals.page_offsets[p_idx] as usize;
+            let end_row = (base_row + new_p.rows_in_page as usize).min(n);
+            for row in base_row..end_row {
+                let local = row - base_row;
+                vals_mut[row] = if (new_p.coerced_ok[local >> 6] & (1u64 << (local & 63))) != 0 {
+                    new_p.coerced_nums[local]
+                } else {
+                    f64::NAN
+                };
+            }
+        }
+        Some(Self {
+            key_nums: self.key_nums.clone(),
+            val_nums: val_nums_arc,
+            blocks: self.blocks.clone(),
         })
     }
 
@@ -633,7 +855,7 @@ impl PagedOrdered {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct BuiltOrdered {
     len: usize,
     exact: Option<Sorted>,
@@ -642,6 +864,54 @@ pub(crate) struct BuiltOrdered {
 }
 
 impl BuiltOrdered {
+    /// Incrementally patch `BuiltOrdered` in O(changed_rows * log M + blocks) when `cond` is
+    /// unchanged (`Arc::ptr_eq`) and only `<= 4` pages of `vals` changed!
+    pub(crate) fn try_patch_values_from_cond(
+        &self,
+        cond: &SharedCondColumn,
+        old_vals: &SharedCondColumn,
+        new_vals: &SharedCondColumn,
+        need_minmax: bool,
+    ) -> Option<Self> {
+        if need_minmax || old_vals.pages.len() != new_vals.pages.len() {
+            return None;
+        }
+        let mut changed_val_pages = Vec::new();
+        for (idx, (op, np)) in old_vals.pages.iter().zip(new_vals.pages.iter()).enumerate() {
+            if !Arc::ptr_eq(op, np) {
+                changed_val_pages.push(idx);
+                if changed_val_pages.len() > 4 {
+                    return None;
+                }
+            }
+        }
+        if changed_val_pages.is_empty() {
+            return Some(self.clone());
+        }
+        if let Some(ref ex) = self.exact
+            && let Some(patched_ex) =
+                ex.try_patch_values_from_cond(cond, old_vals, new_vals, &changed_val_pages)
+        {
+            return Some(Self {
+                len: self.len,
+                exact: Some(patched_ex),
+                minmax: None,
+                paged: None,
+            });
+        }
+        if let Some(ref pg) = self.paged
+            && let Some(patched_pg) =
+                pg.try_patch_values_from_cond(cond, old_vals, new_vals, &changed_val_pages)
+        {
+            return Some(Self {
+                len: self.len,
+                exact: None,
+                minmax: None,
+                paged: Some(patched_pg),
+            });
+        }
+        None
+    }
     fn build(keys: &[FValue], amounts: Option<&[FValue]>, need_minmax: bool) -> Option<Self> {
         let len = keys.len().min(amounts.map_or(usize::MAX, |v| v.len()));
         if amounts.is_none() {
