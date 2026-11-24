@@ -866,10 +866,16 @@ pub fn clear_sheet_notes(path: &std::path::Path, sheet_name: &str) -> anyhow::Re
         Err(e) => anyhow::bail!("关系部件 {rels_part} 不是合法 XML：{e}"),
     };
     let mut removed: Vec<String> = Vec::new();
+    let mut removed_vml_ids: Vec<String> = Vec::new();
     let mut keep_ids: Vec<String> = Vec::new();
     for node in doc.descendants().filter(|n| n.has_tag_name("Relationship")) {
-        let ty = node.attribute("Type").unwrap_or("");
-        if ty.ends_with("/comments") || ty.ends_with("/vmlDrawing") {
+        let ty = node.attribute("Type").unwrap_or("").trim_end_matches('/');
+        if ty.ends_with("/comments") || ty.ends_with("/vmlDrawing") || ty.ends_with("/threadedComment") {
+            if ty.ends_with("/vmlDrawing") {
+                if let Some(id) = node.attribute("Id") {
+                    removed_vml_ids.push(id.to_string());
+                }
+            }
             if node.attribute("TargetMode") != Some("External") {
                 if let Some(t) = node.attribute("Target") {
                     removed.push(resolve(dir, t));
@@ -879,7 +885,7 @@ pub fn clear_sheet_notes(path: &std::path::Path, sheet_name: &str) -> anyhow::Re
             keep_ids.push(id.to_string());
         }
     }
-    if removed.is_empty() {
+    if removed.is_empty() && removed_vml_ids.is_empty() {
         return Ok(());
     }
     for p in &removed {
@@ -911,9 +917,419 @@ pub fn clear_sheet_notes(path: &std::path::Path, sheet_name: &str) -> anyhow::Re
     }
     out.push_str("</Relationships>");
     roxmltree::Document::parse(&out).map_err(|e| anyhow::anyhow!("重建的关系 XML 非法：{e}"))?;
-    crate::fixups::write_parts(path, &[(rels_part, out.into_bytes())])?;
+    let mut pending = vec![(rels_part, out.into_bytes())];
+    if !removed_vml_ids.is_empty() {
+        if let Some(raw_sheet) = crate::fixups::read_part(path, part) {
+            if let Ok(sheet_xml) = crate::xlsx::patch_xml_text(&raw_sheet, part) {
+                let updated = strip_legacy_drawing(&sheet_xml, Some(&removed_vml_ids));
+                if updated != sheet_xml.as_ref() {
+                    pending.push((part.clone(), updated.into_bytes()));
+                }
+            }
+        }
+    }
+    crate::fixups::write_parts(path, &pending)?;
     let _ = crate::fixups::prune_content_types(path);
     Ok(())
+}
+
+/// 原生写入工作表批注（`xl/commentsN.xml` + `xl/drawings/vmlDrawingN.vml` + 关系 + `<legacyDrawing>` + Content_Types）。
+pub fn write_sheet_notes(
+    path: &std::path::Path,
+    sheet_name: &str,
+    notes: &HashMap<crate::model::CellRef, Note>,
+) -> anyhow::Result<()> {
+    if notes.is_empty() {
+        return clear_sheet_notes(path, sheet_name);
+    }
+    let targets = crate::patch::sheet_targets(path)?;
+    let Some(part) = targets.get(sheet_name).cloned() else {
+        return Ok(());
+    };
+    let Some((dir, file)) = part.rsplit_once('/') else {
+        return Ok(());
+    };
+    let rels_part = format!("{dir}/_rels/{file}.rels");
+    let all_entries: std::collections::HashSet<String> = crate::fixups::entries_of(path).into_iter().collect();
+
+    let mut existing_comments: Option<String> = None;
+    let mut existing_vml: Option<(String, String)> = None; // (rid, part)
+    let mut extra_removed: Vec<String> = Vec::new();
+    let mut kept_rels: Vec<String> = Vec::new();
+    let mut taken_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rels_ns_header = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+    );
+
+    if let Some(raw_rels) = crate::fixups::read_part(path, &rels_part) {
+        let rels_text = crate::xlsx::patch_xml_text(&raw_rels, &rels_part)?;
+        let doc = roxmltree::Document::parse(&rels_text)
+            .map_err(|e| anyhow::anyhow!("关系部件 {rels_part} 不是合法 XML：{e}"))?;
+        let root = doc.root_element();
+        let mut hdr = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships");
+        let mut has_default_ns = false;
+        for ns in root.namespaces() {
+            match ns.name() {
+                Some(p) => hdr.push_str(&format!(" xmlns:{}=\"{}\"", p, xml_escape(ns.uri()))),
+                None => {
+                    has_default_ns = true;
+                    hdr.push_str(&format!(" xmlns=\"{}\"", xml_escape(ns.uri())));
+                }
+            }
+        }
+        if !has_default_ns {
+            hdr.push_str(" xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"");
+        }
+        for a in root.attributes() {
+            hdr.push_str(&format!(" {}=\"{}\"", a.name(), xml_escape(a.value())));
+        }
+        hdr.push('>');
+        rels_ns_header = hdr;
+
+        for node in doc.descendants().filter(|n| n.has_tag_name("Relationship")) {
+            let ty = node.attribute("Type").unwrap_or("").trim_end_matches('/');
+            let external = node
+                .attribute("TargetMode")
+                .is_some_and(|m| m.eq_ignore_ascii_case("External"));
+            if !external && ty.ends_with("/comments") {
+                if let Some(t) = node.attribute("Target") {
+                    let resolved = resolve(dir, t);
+                    if existing_comments.is_none() {
+                        existing_comments = Some(resolved);
+                    } else {
+                        extra_removed.push(resolved);
+                    }
+                }
+                continue;
+            }
+            if !external && ty.ends_with("/vmlDrawing") {
+                if let (Some(id), Some(t)) = (node.attribute("Id"), node.attribute("Target")) {
+                    let resolved = resolve(dir, t);
+                    if existing_vml.is_none() {
+                        existing_vml = Some((id.to_string(), resolved));
+                    } else {
+                        extra_removed.push(resolved);
+                    }
+                }
+                continue;
+            }
+            if !external && ty.ends_with("/threadedComment") {
+                if let Some(t) = node.attribute("Target") {
+                    extra_removed.push(resolve(dir, t));
+                }
+                continue;
+            }
+            if let Some(id) = node.attribute("Id") {
+                taken_ids.insert(id.to_string());
+            }
+            let mut tag = String::from("<Relationship");
+            for a in node.attributes() {
+                tag.push_str(&format!(" {}=\"{}\"", a.name(), xml_escape(a.value())));
+            }
+            tag.push_str("/>");
+            kept_rels.push(tag);
+        }
+    }
+
+    let comments_part = existing_comments.unwrap_or_else(|| {
+        let mut n = 1usize;
+        loop {
+            let cand = format!("xl/comments{n}.xml");
+            if !all_entries.contains(&cand) {
+                break cand;
+            }
+            n += 1;
+        }
+    });
+    let (vml_rid, vml_part) = match existing_vml {
+        Some((rid, p)) if !taken_ids.contains(&rid) => {
+            taken_ids.insert(rid.clone());
+            (rid, p)
+        }
+        Some((_, p)) => {
+            let rid = next_rid(&taken_ids);
+            taken_ids.insert(rid.clone());
+            (rid, p)
+        }
+        None => {
+            let rid = next_rid(&taken_ids);
+            taken_ids.insert(rid.clone());
+            let mut n = 1usize;
+            let p = loop {
+                let cand = format!("xl/drawings/vmlDrawing{n}.vml");
+                if !all_entries.contains(&cand) {
+                    break cand;
+                }
+                n += 1;
+            };
+            (rid, p)
+        }
+    };
+    let comments_rid = next_rid(&taken_ids);
+
+    // 1) comments XML
+    let mut items: Vec<(u32, u32, &Note)> = notes
+        .iter()
+        .map(|(k, n)| (k.row, k.col, n))
+        .collect();
+    items.sort_unstable_by_key(|&(r, c, _)| (r, c));
+
+    let mut authors: Vec<String> = Vec::new();
+    let mut author_map: HashMap<String, usize> = HashMap::new();
+    let mut comment_list = String::new();
+    for &(r, c, note) in &items {
+        let author = if note.author.is_empty() {
+            "Hermes"
+        } else {
+            note.author.as_str()
+        };
+        let aid = if let Some(&id) = author_map.get(author) {
+            id
+        } else {
+            let id = authors.len();
+            authors.push(author.to_string());
+            author_map.insert(author.to_string(), id);
+            id
+        };
+        let coord = crate::model::cell_name(r, c);
+        let text_xml = escape_note_xml(&note.text);
+        comment_list.push_str(&format!(
+            "<comment ref=\"{coord}\" authorId=\"{aid}\"><text><r><rPr><sz val=\"9\"/><color indexed=\"81\"/><rFont val=\"Calibri\"/></rPr><t xml:space=\"preserve\">{text_xml}</t></r></text></comment>"
+        ));
+    }
+    let mut comments_xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><comments xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><authors>",
+    );
+    for a in &authors {
+        comments_xml.push_str("<author>");
+        comments_xml.push_str(&escape_note_xml(a));
+        comments_xml.push_str("</author>");
+    }
+    comments_xml.push_str("</authors><commentList>");
+    comments_xml.push_str(&comment_list);
+    comments_xml.push_str("</commentList></comments>");
+
+    // 2) VML drawing XML
+    let mut vml_xml = String::from(
+        "<xml xmlns:v=\"urn:schemas-microsoft-com:vml\" xmlns:o=\"urn:schemas-microsoft-com:office:office\" xmlns:x=\"urn:schemas-microsoft-com:office:excel\">\
+<o:shapelayout v:ext=\"edit\"><o:idmap v:ext=\"edit\" data=\"1\"/></o:shapelayout>\
+<v:shapetype id=\"_x0000_t202\" coordsize=\"21600,21600\" o:spt=\"202\" path=\"m,l,21600r21600,l21600,xe\">\
+<v:stroke joinstyle=\"miter\"/><v:path gradientshapeok=\"t\" o:connecttype=\"rect\"/>\
+</v:shapetype>",
+    );
+    for (idx, &(r, c, _)) in items.iter().enumerate() {
+        let shape_id = 1025 + idx;
+        let z = idx + 1;
+        let c1 = c.saturating_add(1);
+        let c2 = c.saturating_add(3);
+        let r2 = r.saturating_add(4);
+        vml_xml.push_str(&format!(
+            "<v:shape id=\"_x0000_s{shape_id}\" type=\"#_x0000_t202\" style=\"position:absolute;margin-left:59.25pt;margin-top:1.5pt;width:108pt;height:59.25pt;z-index:{z};visibility:hidden\" fillcolor=\"#ffffe1\" o:insetmode=\"auto\">\
+<v:fill color2=\"#ffffe1\"/><v:shadow on=\"t\" color=\"black\" obscured=\"t\"/><v:path o:connecttype=\"none\"/>\
+<v:textbox style=\"mso-direction-alt:auto\"><div style=\"text-align:left\"></div></v:textbox>\
+<x:ClientData ObjectType=\"Note\"><x:MoveWithCells/><x:SizeWithCells/>\
+<x:Anchor>{c1}, 15, {r}, 10, {c2}, 15, {r2}, 4</x:Anchor>\
+<x:AutoFill>False</x:AutoFill><x:Row>{r}</x:Row><x:Column>{c}</x:Column>\
+</x:ClientData></v:shape>"
+        ));
+    }
+    vml_xml.push_str("</xml>");
+
+    // 3) sheet rels XML
+    let comments_rel_target = relative_path(dir, &comments_part);
+    let vml_rel_target = relative_path(dir, &vml_part);
+    let mut rels_out = rels_ns_header;
+    for tag in kept_rels {
+        rels_out.push_str(&tag);
+    }
+    rels_out.push_str(&format!(
+        "<Relationship Id=\"{vml_rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing\" Target=\"{}\"/>",
+        xml_escape(&vml_rel_target)
+    ));
+    rels_out.push_str(&format!(
+        "<Relationship Id=\"{comments_rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"{}\"/>",
+        xml_escape(&comments_rel_target)
+    ));
+    rels_out.push_str("</Relationships>");
+
+    // 4) worksheet XML: ensure <legacyDrawing r:id="..."/> and xmlns:r
+    let mut pending: Vec<(String, Vec<u8>)> = vec![
+        (comments_part.clone(), comments_xml.into_bytes()),
+        (vml_part, vml_xml.into_bytes()),
+        (rels_part, rels_out.into_bytes()),
+    ];
+    if let Some(raw_sheet) = crate::fixups::read_part(path, &part) {
+        let sheet_xml = crate::xlsx::patch_xml_text(&raw_sheet, &part)?;
+        let updated = set_legacy_drawing(&sheet_xml, &vml_rid);
+        if updated != sheet_xml.as_ref() {
+            pending.push((part, updated.into_bytes()));
+        }
+    }
+
+    // 5) [Content_Types].xml
+    if let Some(raw_ct) = crate::fixups::read_part(path, "[Content_Types].xml") {
+        let ct_xml = crate::xlsx::patch_xml_text(&raw_ct, "[Content_Types].xml")?;
+        let mut ct = ct_xml.into_owned();
+        let mut changed = false;
+        if !ct.contains("Extension=\"vml\"") && !ct.contains("Extension='vml'") {
+            if let Some(pos) = ct.rfind("</Types>") {
+                ct.insert_str(
+                    pos,
+                    "<Default Extension=\"vml\" ContentType=\"application/vnd.openxmlformats-officedocument.vmlDrawing\"/>",
+                );
+                changed = true;
+            }
+        }
+        let part_override = format!("PartName=\"/{comments_part}\"");
+        if !ct.contains(&part_override) {
+            if let Some(pos) = ct.rfind("</Types>") {
+                ct.insert_str(
+                    pos,
+                    &format!(
+                        "<Override PartName=\"/{comments_part}\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml\"/>"
+                    ),
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            pending.push(("[Content_Types].xml".to_string(), ct.into_bytes()));
+        }
+    }
+
+    for p in extra_removed {
+        if p != comments_part {
+            let _ = crate::patch::remove_entry(path, &p);
+        }
+    }
+    crate::patch::append_entries(path, &pending)?;
+    Ok(())
+}
+
+fn next_rid(taken: &std::collections::HashSet<String>) -> String {
+    let mut n = 1usize;
+    loop {
+        let cand = format!("rId{n}");
+        if !taken.contains(&cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+fn relative_path(from_dir: &str, to_part: &str) -> String {
+    let from_segs: Vec<&str> = from_dir.split('/').filter(|s| !s.is_empty()).collect();
+    let to_segs: Vec<&str> = to_part.split('/').filter(|s| !s.is_empty()).collect();
+    let mut common = 0usize;
+    while common < from_segs.len() && common < to_segs.len() && from_segs[common] == to_segs[common] {
+        common += 1;
+    }
+    let mut out = Vec::new();
+    for _ in common..from_segs.len() {
+        out.push("..");
+    }
+    for &seg in &to_segs[common..] {
+        out.push(seg);
+    }
+    out.join("/")
+}
+
+fn escape_note_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\r' => out.push_str("&#13;"),
+            '\t' | '\n' => out.push(ch),
+            c if c < ' ' || c == '\u{fffe}' || c == '\u{ffff}' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn strip_legacy_drawing(xml: &str, only_rids: Option<&[String]>) -> String {
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return xml.to_string();
+    };
+    let mut ranges = Vec::new();
+    for child in doc.root_element().children().filter(|n| n.is_element()) {
+        if child.tag_name().name() == "legacyDrawing" {
+            let matches = match only_rids {
+                None => true,
+                Some(ids) => child
+                    .attributes()
+                    .find(|a| a.name() == "id")
+                    .is_some_and(|a| ids.iter().any(|id| id == a.value())),
+            };
+            if matches {
+                ranges.push(child.range());
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return xml.to_string();
+    }
+    let mut out = xml.to_string();
+    for r in ranges.into_iter().rev() {
+        out.replace_range(r, "");
+    }
+    out
+}
+
+fn set_legacy_drawing(xml: &str, rid: &str) -> String {
+    let stripped = strip_legacy_drawing(xml, None);
+    let Ok(doc) = roxmltree::Document::parse(&stripped) else {
+        return stripped;
+    };
+    let root = doc.root_element();
+    let root_ns = root.tag_name().namespace();
+    let prefix = root_ns
+        .and_then(|uri| root.lookup_prefix(uri))
+        .map(|p| format!("{p}:"))
+        .unwrap_or_default();
+    let mut out = stripped.clone();
+    let needs_r_ns = !root
+        .namespaces()
+        .any(|ns| ns.name() == Some("r"));
+    let insert_at = root
+        .children()
+        .filter(|n| n.is_element())
+        .find(|n| {
+            matches!(
+                n.tag_name().name(),
+                "legacyDrawingHF"
+                    | "picture"
+                    | "oleObjects"
+                    | "controls"
+                    | "webPublishItems"
+                    | "tableParts"
+                    | "extLst"
+            )
+        })
+        .map(|n| n.range().start)
+        .or_else(|| out.rfind("</"))
+        .unwrap_or(out.len());
+    let tag = format!("<{prefix}legacyDrawing r:id=\"{rid}\"/>");
+    out.insert_str(insert_at, &tag);
+    if needs_r_ns {
+        if let Some(gt) = out[root.range().start..].find('>') {
+            let pos = root.range().start + gt;
+            let insert_pos = if out.as_bytes().get(pos.saturating_sub(1)) == Some(&b'/') {
+                pos - 1
+            } else {
+                pos
+            };
+            out.insert_str(
+                insert_pos,
+                " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
+            );
+        }
+    }
+    out
 }
 
 fn xml_escape(s: &str) -> String {

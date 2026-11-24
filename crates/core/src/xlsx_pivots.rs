@@ -227,28 +227,3 @@ pub(super) fn strip_plan(path: &Path, session: &str) -> Result<StripPlan> {
     })?);
     Ok(plan)
 }
-
-/// umya can renumber an imported cache/table when the original part numbers
-/// have gaps. The restored workbook and worksheet relationships still point to
-/// the original parts, so preserve that graph and remove only serializer-added
-/// pivot parts absent from the prepared baseline. Baseline orphans stay intact.
-pub(super) fn restore_imported_parts(path: &Path, base: &Path) -> Result<()> {
-    if !base.exists() { return Ok(()); }
-    let is_pivot_part = |name: &str| name.starts_with("xl/pivotCache/") || name.starts_with("xl/pivotTables/");
-    let expected: HashSet<_> = crate::fixups::parts(base).into_iter().filter(|p| is_pivot_part(p)).collect();
-    let extra: Vec<_> = crate::fixups::parts(path).into_iter().filter(|p| is_pivot_part(p) && !expected.contains(p)).collect();
-    for name in &expected {
-        // Definitions already contain explicit source renames/structural edits.
-        if !(name.contains("pivotCacheDefinition") && name.ends_with(".xml")) {
-            crate::patch::stage_raw_copy(name, name);
-        }
-    }
-    crate::patch::apply_raw_copies(path, base).context("保留导入透视表部件失败")?;
-    if !extra.is_empty() {
-        crate::patch::begin_stage();
-        for name in extra { crate::patch::remove_entry(path, &name)?; }
-        crate::patch::commit_stage(path).context("清理重复透视表部件失败")?;
-        crate::fixups::prune_content_types(path)?;
-    }
-    Ok(())
-}
