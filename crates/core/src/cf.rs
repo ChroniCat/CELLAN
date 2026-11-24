@@ -336,14 +336,55 @@ impl SliceSummary {
         let mut count = 0usize;
         let end = slice.end.min(slice.cells.len());
         if slice.start < end {
-            for cell in &slice.cells[slice.start..end] {
-                if let Value::Number(v) = &cell.value
-                    && v.is_finite()
-                {
-                    min = min.min(*v);
-                    max = max.max(*v);
-                    sum += *v;
-                    count += 1;
+            match slice.cells.as_ref() {
+                crate::store::ColSlab::Numbers(ns) => {
+                    let len = end - slice.start;
+                    if crate::store::NumberSlab::all_present_in(&ns.present, slice.start, len) {
+                        for &v in &ns.values[slice.start..end] {
+                            if v.is_finite() {
+                                min = min.min(v);
+                                max = max.max(v);
+                                sum += v;
+                                count += 1;
+                            }
+                        }
+                    } else {
+                        for ro in slice.start..end {
+                            if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                                let v = ns.values[ro];
+                                if v.is_finite() {
+                                    min = min.min(v);
+                                    max = max.max(v);
+                                    sum += v;
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                crate::store::ColSlab::Values(vs) => {
+                    for val in &vs[slice.start..end] {
+                        if let Value::Number(v) = val
+                            && v.is_finite()
+                        {
+                            min = min.min(*v);
+                            max = max.max(*v);
+                            sum += *v;
+                            count += 1;
+                        }
+                    }
+                }
+                crate::store::ColSlab::Mixed(cs) => {
+                    for cell in &cs[slice.start..end] {
+                        if let Value::Number(v) = &cell.value
+                            && v.is_finite()
+                        {
+                            min = min.min(*v);
+                            max = max.max(*v);
+                            sum += *v;
+                            count += 1;
+                        }
+                    }
                 }
             }
         }
@@ -377,14 +418,14 @@ pub(crate) struct PageSlice {
     pub col: u32,
     pub start: usize,
     pub end: usize,
-    pub cells: std::sync::Arc<Vec<crate::Cell>>,
+    pub cells: std::sync::Arc<crate::store::ColSlab>,
 }
 
 impl PartialEq for PageSlice {
     fn eq(&self, other: &Self) -> bool {
         (self.page, self.col, self.start, self.end) == (other.page, other.col, other.start, other.end)
             && (std::sync::Arc::ptr_eq(&self.cells, &other.cells)
-                || self.cells[self.start..self.end] == other.cells[other.start..other.end])
+                || self.cells.slice_eq(self.start, self.end, &other.cells, other.start, other.end))
     }
 }
 
@@ -569,21 +610,21 @@ fn compute_stats_with_slices(
                 }
             } else {
                 let collect_vals = needs_sort || needs_top;
-                let mut visit = |cell: &crate::model::Cell| {
+                let mut visit = |cell: crate::store::CellView<'_>| {
                     if needs_num
-                        && let Value::Number(v) = &cell.value
+                        && let Some(v) = cell.as_f64()
                         && v.is_finite()
                     {
-                        min = min.min(*v);
-                        max = max.max(*v);
-                        sum += *v;
+                        min = min.min(v);
+                        max = max.max(v);
+                        sum += v;
                         n += 1;
                         if collect_vals {
-                            vals.push(*v);
+                            vals.push(v);
                         }
                     }
                     if needs_dup {
-                        let key = cell.value.display();
+                        let key = cell.value().display();
                         if !key.is_empty() {
                             *dups.entry(key).or_insert(0) += 1;
                         }
@@ -591,15 +632,15 @@ fn compute_stats_with_slices(
                 };
                 if ranges_pairwise_disjoint(&clamped) {
                     for &rect in &clamped {
-                        for (_, cell) in sheet.iter_rect(rect) {
+                        for (_, cell) in sheet.iter_rect_views(rect) {
                             visit(cell);
                         }
                     }
                 } else {
-                    // Overlapping multi-range block: visit each rect via `iter_rect` and skip
+                    // Overlapping multi-range block: visit each rect via `iter_rect_views` and skip
                     // cells already covered by an earlier clamped rect (never scans outside block!).
                     for (ri, &rect) in clamped.iter().enumerate() {
-                        for (cref, cell) in sheet.iter_rect(rect) {
+                        for (cref, cell) in sheet.iter_rect_views(rect) {
                             let already = clamped[..ri].iter().any(|&(r1, c1, r2, c2)| {
                                 cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2
                             });
@@ -832,7 +873,8 @@ impl<'a> RowRules<'a> {
         let r = self.row;
         let mut out = Overlay::default();
         if self.order.is_empty() { return out; }
-        let raw = sheet.value_ref(r, c);
+        let raw_cow = sheet.value_ref(r, c);
+        let raw = raw_cow.as_ref();
         for &(_, bi, ri) in &self.order {
             let block = &cf.blocks[bi];
             if !in_block(block, r, c) { continue; }
@@ -899,11 +941,11 @@ impl<'a> RowRules<'a> {
                     } else {
                         let mut cnt = 0usize;
                         for (ri_idx, &rect) in block.ranges.iter().enumerate() {
-                            for (cref, cell) in sheet.iter_rect(rect) {
+                            for (cref, cell) in sheet.iter_rect_views(rect) {
                                 let dup_rect = block.ranges[..ri_idx].iter().any(|&(r1, c1, r2, c2)| {
                                     cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2
                                 });
-                                if !dup_rect && cell.value.display() == key {
+                                if !dup_rect && cell.value().display() == key {
                                     cnt += 1;
                                 }
                             }

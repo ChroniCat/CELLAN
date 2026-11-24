@@ -290,36 +290,40 @@ impl<'a> XlsSst<'a> {
     fn from_workbook(wb: &'a Workbook) -> Self {
         let mut counts: HashMap<&'a str, u32> = HashMap::new();
         for sh in &wb.sheets {
-            for (_, cell) in sh.iter() {
-                if cell.formula.is_some() {
-                    continue;
-                }
-                if let Value::Text(t) = &cell.value {
-                    let s: &'a str = t;
-                    // 单条 XLUnicodeString <= 8216 字节保证一定能整条放进首条 SST(8224-8) 或单条 CONTINUE(8224)
-                    if s.len() <= 8213 {
-                        *counts.entry(s).or_insert(0) += 1;
-                    }
+            for (_, cell) in sh.iter_views() {
+                let s: &'a str = match cell {
+                    crate::store::CellView::Value(Value::Text(t)) => t.as_ref(),
+                    crate::store::CellView::Cell(c) if c.formula.is_none() => match &c.value {
+                        Value::Text(t) => t.as_ref(),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                // 单条 XLUnicodeString <= 8216 字节保证一定能整条放进首条 SST(8224-8) 或单条 CONTINUE(8224)
+                if s.len() <= 8213 {
+                    *counts.entry(s).or_insert(0) += 1;
                 }
             }
         }
         let mut sst = Self::default();
         for sh in &wb.sheets {
-            for (_, cell) in sh.iter() {
-                if cell.formula.is_some() {
-                    continue;
-                }
-                if let Value::Text(t) = &cell.value {
-                    let s: &'a str = t;
-                    if let Some(&cnt) = counts.get(s) {
-                        if cnt >= 2 && Self::encoded_len(s) <= 8216 {
-                            if !sst.map.contains_key(s) {
-                                let idx = sst.entries.len() as u32;
-                                sst.map.insert(s, idx);
-                                sst.entries.push(s);
-                            }
-                            sst.total_refs = sst.total_refs.saturating_add(1);
+            for (_, cell) in sh.iter_views() {
+                let s: &'a str = match cell {
+                    crate::store::CellView::Value(Value::Text(t)) => t.as_ref(),
+                    crate::store::CellView::Cell(c) if c.formula.is_none() => match &c.value {
+                        Value::Text(t) => t.as_ref(),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                if let Some(&cnt) = counts.get(s) {
+                    if cnt >= 2 && Self::encoded_len(s) <= 8216 {
+                        if !sst.map.contains_key(s) {
+                            let idx = sst.entries.len() as u32;
+                            sst.map.insert(s, idx);
+                            sst.entries.push(s);
                         }
+                        sst.total_refs = sst.total_refs.saturating_add(1);
                     }
                 }
             }
@@ -659,8 +663,8 @@ fn sheet_stream(
     // 单遍收集非空单元格并同步统计 rmax / cmax
     let mut rmax = 0u32;
     let mut cmax = 0u32;
-    let mut cells: Vec<(u32, u32, &crate::model::Cell)> = Vec::with_capacity(sheet.len());
-    for (cref, cell) in sheet.iter() {
+    let mut cells: Vec<(u32, u32, crate::store::CellView<'_>)> = Vec::with_capacity(sheet.len());
+    for (cref, cell) in sheet.iter_views() {
         rmax = rmax.max(cref.row);
         cmax = cmax.max(cref.col);
         if !cell.is_blank() {
@@ -717,7 +721,7 @@ fn sheet_stream(
                 v
             }
         };
-        if let Some(text) = cell.formula.as_deref() {
+        if let Some(text) = cell.formula() {
             let node = crate::formula::parse(text.trim_start_matches('='))
                 .map_err(|e| anyhow::anyhow!(
                     "{}!{} 的公式 {text} 解析失败（{e:?}），无法写入 .xls",
@@ -739,7 +743,8 @@ fn sheet_stream(
                     crate::model::cell_name(r, c)
                 )
             })?;
-            let (cached, follow) = cached_value(&cell.value);
+            let val = cell.value();
+            let (cached, follow) = cached_value(val.as_ref());
             let s = begin_rec(&mut out, FORMULA);
             push_u16(&mut out, r as u16);
             push_u16(&mut out, c as u16);
@@ -757,7 +762,8 @@ fn sheet_stream(
             }
             continue;
         }
-        match &cell.value {
+        let val = cell.value();
+        match val.as_ref() {
             Value::Number(n) => {
                 if let Some(rk) = encode_rk(*n) {
                     let s = begin_rec(&mut out, RK);

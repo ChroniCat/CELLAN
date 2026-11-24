@@ -18,9 +18,11 @@ fn cell_has_cached_scalar(
     r: u32,
     c: u32,
 ) -> bool {
-    match wb.sheet(sheet).get(r, c) {
-        None => true,
-        Some(cell) => {
+    match wb.sheet(sheet).get_view(r, c) {
+        None
+        | Some(crate::store::CellView::Number(_))
+        | Some(crate::store::CellView::Value(_)) => true,
+        Some(crate::store::CellView::Cell(cell)) => {
             if cell.formula.is_none() {
                 true
             } else {
@@ -50,12 +52,21 @@ fn literal(
             let c_i = reference.col + if reference.col_abs { 0 } else { dc };
             let r = u32::try_from(r_i).ok()?;
             let c = u32::try_from(c_i).ok()?;
-            let cell = wb.sheet(sheet).get(r, c)?;
-            if !cell_has_cached_scalar(wb, scope, sheet, r, c) {
-                return None;
-            }
-            match &cell.value {
-                crate::Value::Number(value) => Some(*value),
+            match wb.sheet(sheet).get_view(r, c)? {
+                crate::store::CellView::Number(value) => Some(value),
+                crate::store::CellView::Value(crate::Value::Number(value)) => Some(*value),
+                crate::store::CellView::Cell(cell) => {
+                    if cell.formula.is_some()
+                        && (!scope.is_some_and(|s| !s.contains(&(sheet, r, c)))
+                            || super::callable_cache_candidate(&cell.value))
+                    {
+                        return None;
+                    }
+                    match cell.value {
+                        crate::Value::Number(value) => Some(value),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         }
@@ -205,14 +216,24 @@ fn evaluate_cell<'a>(
     (sheet, row, col): CellKey,
     worker: &mut Option<Calc<'a>>,
 ) -> Option<FValue> {
-    let formula_arc = wb.sheet(sheet).get(row, col)?.formula.as_ref()?;
+    let formula_arc = wb.sheet(sheet).formula_arc_of(row, col)?;
     super::compiled::with_eval_arc(formula_arc, row, col, |node, dr, dc, kind| match kind {
         super::compiled::ScalarKind::SameSheet => {
             super::compiled::eval_projected_scalar(node, dr, dc, &mut |_, r, c| {
-                match wb.sheet(sheet).get(r, c) {
-                    Some(_) if !cell_has_cached_scalar(wb, scope, sheet, r, c) => None,
-                    Some(cell) => Some(super::to_fvalue(&cell.value)),
+                match wb.sheet(sheet).get_view(r, c) {
                     None => Some(FValue::Empty),
+                    Some(crate::store::CellView::Number(n)) => Some(FValue::Number(n)),
+                    Some(crate::store::CellView::Value(v)) => Some(super::to_fvalue(v)),
+                    Some(crate::store::CellView::Cell(cell)) => {
+                        if cell.formula.is_some()
+                            && (!scope.is_some_and(|s| !s.contains(&(sheet, r, c)))
+                                || super::callable_cache_candidate(&cell.value))
+                        {
+                            None
+                        } else {
+                            Some(super::to_fvalue(&cell.value))
+                        }
+                    }
                 }
             })
         }
@@ -225,10 +246,20 @@ fn evaluate_cell<'a>(
                         .position(|s| s.name.eq_ignore_ascii_case(name))?,
                     None => sheet,
                 };
-                match wb.sheet(target_si).get(r, c) {
-                    Some(_) if !cell_has_cached_scalar(wb, scope, target_si, r, c) => None,
-                    Some(cell) => Some(super::to_fvalue(&cell.value)),
+                match wb.sheet(target_si).get_view(r, c) {
                     None => Some(FValue::Empty),
+                    Some(crate::store::CellView::Number(n)) => Some(FValue::Number(n)),
+                    Some(crate::store::CellView::Value(v)) => Some(super::to_fvalue(v)),
+                    Some(crate::store::CellView::Cell(cell)) => {
+                        if cell.formula.is_some()
+                            && (!scope.is_some_and(|s| !s.contains(&(target_si, r, c)))
+                                || super::callable_cache_candidate(&cell.value))
+                        {
+                            None
+                        } else {
+                            Some(super::to_fvalue(&cell.value))
+                        }
+                    }
                 }
             })
         }
@@ -380,7 +411,7 @@ mod tests {
         wb: &Workbook,
         (sheet, row, col): CellKey,
     ) -> Option<Result<f64, crate::formula::ErrKind>> {
-        let src = wb.sheet(sheet).get(row, col)?.formula.as_deref()?;
+        let src = wb.sheet(sheet).formula_of(row, col)?;
         let node = super::super::compile_at(src.trim_start_matches('='), row, col).ok()?;
         numeric_binary(wb, None, sheet, &node, 0, 0)
     }

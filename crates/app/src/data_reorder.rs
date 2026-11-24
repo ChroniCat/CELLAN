@@ -346,7 +346,7 @@ fn pending_sort_does_not_cross_room_boundaries() {
             assert!(start.elapsed().as_secs() < 30);
             std::thread::yield_now();
         }
-        assert_eq!(app.wb.sheets[0].get(0,0),Some(&number(2.)));
+        assert_eq!(app.wb.sheets[0].get(0,0).as_deref(),Some(&number(2.)));
         assert_eq!(app.undo.depth(),(0,0));
     }
 }
@@ -553,7 +553,7 @@ impl SheetApp {
             if !peer.apply_shared(op.clone()) { continue; }
             let cell = sheetcore::Cell { value: (&op.value).into(), formula: op.formula.as_deref().map(Into::into) };
             if sample.len() < sheetcore::revision::MAX_CELLS {
-                let old = sh.get(op.row,op.col).cloned().unwrap_or_default();
+                let old = sh.get(op.row,op.col).map(|c| c.into_owned()).unwrap_or_default();
                 sample.push(sheetcore::revision::Change { r: op.row, c: op.col,
                     before: sheetcore::revision::Snap::from_cell(&old), after: sheetcore::revision::Snap::from_cell(&cell),
                     before_style: None, after_style: None });
@@ -594,7 +594,8 @@ impl SheetApp {
         let mut style_cache: std::collections::HashMap<u16, sheetcore::style::CellStyle> =
             std::collections::HashMap::new();
         for (r,c,style) in cells {
-            ops.push(peer.local_set_shared(sheet, r, c, sh.get(r,c).unwrap_or(&blank)));
+            let cell = sh.get(r, c);
+            ops.push(peer.local_set_shared(sheet, r, c, cell.as_deref().unwrap_or(&blank)));
             if style {
                 let sid = sh.style_of(r, c);
                 let st = style_cache

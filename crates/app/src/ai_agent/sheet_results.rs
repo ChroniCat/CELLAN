@@ -144,7 +144,7 @@ impl SheetApp {
                     let live = self.wb.sheet(si);
                     let target = copy.sheet_mut(si);
                     match live.get(r, c) {
-                        Some(cell) => target.set(r, c, cell.clone()),
+                        Some(cell) => target.set(r, c, cell.into_owned()),
                         None => {
                             let _ = target.remove(r, c);
                         }
@@ -631,7 +631,7 @@ impl WorkbookToolView<'_> {
         'search: for si in sheets {
             let sh = self.wb.sheet(si);
             for (cr, cell) in sheetcore::sync::iter_sheet_rect(sh, (0, 0, u32::MAX, u32::MAX)) {
-                if prepared.matches_cell(cell) {
+                if prepared.matches_cell(cell.as_ref()) {
                     if hits.len() == HIT_LIMIT {
                         has_more = true;
                         break 'search;

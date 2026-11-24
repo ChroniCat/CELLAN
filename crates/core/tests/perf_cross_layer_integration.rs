@@ -36,10 +36,12 @@ fn cross_layer_1_arc_str_zero_copy_across_io_storage_formula_and_collab() {
 
     let loaded = sheetcore::xlsx::load(&path).unwrap();
     let sh = loaded.sheet(0);
-    let Some(Value::Text(a0)) = sh.get(0, 0).map(|c| &c.value) else {
+    let v0 = sh.value_ref(0, 0);
+    let Value::Text(ref a0) = *v0 else {
         panic!("expected text at (0,0)");
     };
-    let Some(Value::Text(a2)) = sh.get(2, 0).map(|c| &c.value) else {
+    let v2 = sh.value_ref(2, 0);
+    let Value::Text(ref a2) = *v2 else {
         panic!("expected text at (2,0)");
     };
     assert!(

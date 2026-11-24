@@ -5,7 +5,7 @@
 
 use crate::model::{Cell, Sheet, Value};
 use crate::sort_filter::{FxHashMap, parallel_stable_sort};
-use crate::store::{GatheredColumn, GatheredSlab, PAGE_ROWS, StyleColumn};
+use crate::store::{ColSlab, GatheredColumn, GatheredSlab, NumberSlab, PAGE_ROWS, StyleColumn};
 use crate::undo::CellDelta;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -182,8 +182,8 @@ fn build_compact_keys_for_rows(
     };
 
     for &r in rows {
-        let v = sheet.value_ref(r, spec.col);
-        match v {
+        let v_cow = sheet.value_ref(r, spec.col);
+        match v_cow.as_ref() {
             Value::Number(n) => keys.push(CompactKey {
                 kind: CompactKey::KIND_NUM,
                 custom: u32::MAX,
@@ -294,11 +294,11 @@ impl NumericSort {
         let has_styles = !sheet.styles.is_empty() || !sheet.row_styles.is_empty() || !sheet.col_styles.is_empty();
         for r in r1..=r2 {
             for c in c1..=c2 {
-                let Some(Cell { value: Value::Number(n), formula: None }) = sheet.get(r, c) else {
+                let Some(n) = sheet.get_f64_plain(r, c) else {
                     return Ok(None);
                 };
                 if !n.is_finite() { return Ok(None); }
-                values.push(*n);
+                values.push(n);
                 if has_styles { styles.push(sheet.style_of(r, c)); }
             }
         }
@@ -367,52 +367,13 @@ impl NumericSort {
                 let base = pi * PAGE_ROWS;
                 let lo = r1.saturating_sub(base) as usize;
                 let hi = (r2 - base).min(PAGE_ROWS - 1) as usize;
-                let old_slab = old_slabs[page_idx].unwrap_or(&[]);
-                let mut old_count: isize = 0;
-                for cell in old_slab {
-                    if !cell.is_blank() {
-                        old_count += 1;
-                    }
-                }
-                let target_len = old_slab.len().max(hi + 1);
-                let push_mode = lo == 0 && hi + 1 >= old_slab.len();
-                let mut out_vec = if push_mode {
-                    Vec::with_capacity(target_len)
-                } else {
-                    vec![Cell::default(); target_len]
-                };
-                let mut new_count: isize = 0;
-                let mut row_mask = [0u64; 4];
-                if !push_mode {
-                    for r in 0..lo.min(old_slab.len()) {
-                        if !old_slab[r].is_blank() {
-                            if let Some(f) = old_slab[r].formula.as_deref() {
-                                has_formula = true;
-                                if f.contains('!') {
-                                    has_qual_formula = true;
-                                }
-                            }
-                            new_count += 1;
-                            row_mask[r / 64] |= 1u64 << (r % 64);
-                            out_vec[r] = old_slab[r].clone();
-                        }
-                    }
-                    for r in (hi + 1)..old_slab.len() {
-                        if !old_slab[r].is_blank() {
-                            if let Some(f) = old_slab[r].formula.as_deref() {
-                                has_formula = true;
-                                if f.contains('!') {
-                                    has_qual_formula = true;
-                                }
-                            }
-                            new_count += 1;
-                            row_mask[r / 64] |= 1u64 << (r % 64);
-                            out_vec[r] = old_slab[r].clone();
-                        }
-                    }
-                }
+                let old_slab = old_slabs[page_idx];
+                let old_len = old_slab.map_or(0, ColSlab::len);
+                let old_count = old_slab.map_or(0, ColSlab::occupied_count) as isize;
+                let target_len = old_len.max(hi + 1);
+                let push_mode = lo == 0 && hi + 1 >= old_len;
+                let keep_numbers = push_mode || old_slab.is_none_or(ColSlab::is_numbers);
 
-                let mut occ_mask = [0u64; 4];
                 let mut style_dense = [None::<u16>; PAGE_ROWS as usize];
                 let mut st_edit_mask = [0u64; 4];
                 let old_style_col = if has_styles {
@@ -429,63 +390,177 @@ impl NumericSort {
                     }
                 }
 
-                for r_off in lo..=hi {
-                    let dst_r = base + r_off as u32;
-                    let dst = (dst_r - r1) as usize;
-                    let src = self.order[dst] as usize;
-                    let a_idx = dst * width + col_off;
-                    let b_idx = src * width + col_off;
-                    let val = self.values[b_idx];
-                    let val_diff = dst != src && self.values[a_idx] != val;
-                    let mut st_diff = false;
-                    if has_styles {
-                        let before_st = self.styles[a_idx];
-                        let after_st = self.styles[b_idx];
-                        if dst != src && before_st != after_st {
-                            st_diff = true;
-                            style_changed = true;
-                            st_edit_mask[r_off / 64] |= 1u64 << (r_off % 64);
-                            let explicit = (after_st != 0
-                                || has_col_style
-                                || (!sheet.row_styles.is_empty()
-                                    && sheet.row_styles.contains_key(&dst_r)))
-                            .then_some(after_st);
-                            style_dense[r_off] = explicit;
-                        } else {
-                            style_dense[r_off] =
-                                old_style_col.and_then(|osc| osc.get(r_off as u32).copied());
+                let mut occ_mask = [0u64; 4];
+                if keep_numbers {
+                    let mut out_vals = if push_mode {
+                        Vec::with_capacity(target_len)
+                    } else {
+                        vec![0.0; target_len]
+                    };
+                    let mut present = [0u64; 4];
+                    let mut new_count: isize = 0;
+                    if !push_mode
+                        && let Some(ColSlab::Numbers(ons)) = old_slab
+                    {
+                        for r in 0..lo.min(ons.values.len()) {
+                            if ons.contains(r as u32) {
+                                out_vals[r] = ons.values[r];
+                                present[r / 64] |= 1u64 << (r % 64);
+                                new_count += 1;
+                            }
+                        }
+                        for r in (hi + 1)..ons.values.len() {
+                            if ons.contains(r as u32) {
+                                out_vals[r] = ons.values[r];
+                                present[r / 64] |= 1u64 << (r % 64);
+                                new_count += 1;
+                            }
                         }
                     }
-                    if val_diff || st_diff {
-                        changed += 1;
+
+                    for r_off in lo..=hi {
+                        let dst_r = base + r_off as u32;
+                        let dst = (dst_r - r1) as usize;
+                        let src = self.order[dst] as usize;
+                        let a_idx = dst * width + col_off;
+                        let b_idx = src * width + col_off;
+                        let val = self.values[b_idx];
+                        let val_diff = dst != src && self.values[a_idx] != val;
+                        let mut st_diff = false;
+                        if has_styles {
+                            let before_st = self.styles[a_idx];
+                            let after_st = self.styles[b_idx];
+                            if dst != src && before_st != after_st {
+                                st_diff = true;
+                                style_changed = true;
+                                st_edit_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                                let explicit = (after_st != 0
+                                    || has_col_style
+                                    || (!sheet.row_styles.is_empty()
+                                        && sheet.row_styles.contains_key(&dst_r)))
+                                .then_some(after_st);
+                                style_dense[r_off] = explicit;
+                            } else {
+                                style_dense[r_off] =
+                                    old_style_col.and_then(|osc| osc.get(r_off as u32).copied());
+                            }
+                        }
+                        if val_diff || st_diff {
+                            changed += 1;
+                        }
+                        new_count += 1;
+                        present[r_off / 64] |= 1u64 << (r_off % 64);
+                        if track_cleared {
+                            occ_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                        }
+                        if push_mode {
+                            out_vals.push(val);
+                        } else {
+                            out_vals[r_off] = val;
+                        }
                     }
-                    let cell = Cell {
-                        value: Value::Number(val),
-                        formula: None,
-                    };
-                    new_count += 1;
-                    row_mask[r_off / 64] |= 1u64 << (r_off % 64);
-                    if track_cleared {
-                        occ_mask[r_off / 64] |= 1u64 << (r_off % 64);
+
+                    len_delta += new_count - old_count;
+                    if track_cleared && occ_mask != [0; 4] {
+                        occupied_masks.push((pi, occ_mask));
                     }
-                    if push_mode {
-                        out_vec.push(cell);
+                    new_slabs.push((present != [0; 4]).then(|| GatheredSlab {
+                        cells: Arc::new(ColSlab::Numbers(NumberSlab {
+                            present,
+                            values: out_vals,
+                        })),
+                        row_mask: present,
+                    }));
+                } else {
+                    let mut out_vec = vec![Cell::default(); target_len];
+                    let mut new_count: isize = 0;
+                    let mut row_mask = [0u64; 4];
+                    if let Some(os) = old_slab {
+                        for r in 0..lo.min(old_len) {
+                            if let Some(v) = os.get_view(r as u32) {
+                                if let Some(f) = v.formula() {
+                                    has_formula = true;
+                                    if f.contains('!') {
+                                        has_qual_formula = true;
+                                    }
+                                }
+                                new_count += 1;
+                                row_mask[r / 64] |= 1u64 << (r % 64);
+                                out_vec[r] = v.to_cell();
+                            }
+                        }
+                        for r in (hi + 1)..old_len {
+                            if let Some(v) = os.get_view(r as u32) {
+                                if let Some(f) = v.formula() {
+                                    has_formula = true;
+                                    if f.contains('!') {
+                                        has_qual_formula = true;
+                                    }
+                                }
+                                new_count += 1;
+                                row_mask[r / 64] |= 1u64 << (r % 64);
+                                out_vec[r] = v.to_cell();
+                            }
+                        }
+                    }
+                    for r_off in lo..=hi {
+                        let dst_r = base + r_off as u32;
+                        let dst = (dst_r - r1) as usize;
+                        let src = self.order[dst] as usize;
+                        let a_idx = dst * width + col_off;
+                        let b_idx = src * width + col_off;
+                        let val = self.values[b_idx];
+                        let val_diff = dst != src && self.values[a_idx] != val;
+                        let mut st_diff = false;
+                        if has_styles {
+                            let before_st = self.styles[a_idx];
+                            let after_st = self.styles[b_idx];
+                            if dst != src && before_st != after_st {
+                                st_diff = true;
+                                style_changed = true;
+                                st_edit_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                                let explicit = (after_st != 0
+                                    || has_col_style
+                                    || (!sheet.row_styles.is_empty()
+                                        && sheet.row_styles.contains_key(&dst_r)))
+                                .then_some(after_st);
+                                style_dense[r_off] = explicit;
+                            } else {
+                                style_dense[r_off] =
+                                    old_style_col.and_then(|osc| osc.get(r_off as u32).copied());
+                            }
+                        }
+                        if val_diff || st_diff {
+                            changed += 1;
+                        }
+                        new_count += 1;
+                        row_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                        if track_cleared {
+                            occ_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                        }
+                        out_vec[r_off] = Cell {
+                            value: Value::Number(val),
+                            formula: None,
+                        };
+                    }
+                    while out_vec.last().is_some_and(Cell::is_blank) {
+                        out_vec.pop();
+                    }
+                    len_delta += new_count - old_count;
+                    if track_cleared && occ_mask != [0; 4] {
+                        occupied_masks.push((pi, occ_mask));
+                    }
+                    let slab = if has_formula {
+                        ColSlab::Mixed(out_vec)
                     } else {
-                        out_vec[r_off] = cell;
-                    }
+                        ColSlab::Values(out_vec.into_iter().map(|c| c.value).collect())
+                    };
+                    new_slabs.push((!slab.is_empty()).then(|| GatheredSlab {
+                        cells: Arc::new(slab),
+                        row_mask,
+                    }));
                 }
 
-                while out_vec.last().is_some_and(Cell::is_blank) {
-                    out_vec.pop();
-                }
-                len_delta += new_count - old_count;
-                if track_cleared && occ_mask != [0; 4] {
-                    occupied_masks.push((pi, occ_mask));
-                }
-                new_slabs.push((!out_vec.is_empty()).then(|| GatheredSlab {
-                    cells: Arc::new(out_vec),
-                    row_mask,
-                }));
                 if let Some(ref mut slabs) = style_slabs {
                     slabs.push(StyleColumn::from_dense(&style_dense));
                     if st_edit_mask != [0; 4] {
@@ -857,8 +932,8 @@ impl CompactSort {
                                     sheet: *index,
                                     row,
                                     col,
-                                    before: before.cloned().unwrap_or_default(),
-                                    after: after.cloned().unwrap_or_default(),
+                                    before: before.map(|c| c.into_owned()).unwrap_or_default(),
+                                    after: after.map(|c| c.into_owned()).unwrap_or_default(),
                                     before_style: 0,
                                     after_style: 0,
                                 });
@@ -912,38 +987,51 @@ fn apply_horizontal_gather(
             let base = pi * PAGE_ROWS;
             let lo = r1.saturating_sub(base) as usize;
             let hi = (r2 - base).min(PAGE_ROWS - 1) as usize;
-            let old_slab = old_slabs[page_idx].unwrap_or(&[]);
-            let src_slab = src_slabs[page_idx].unwrap_or(&[]);
-            let old_count: isize = old_slab.iter().filter(|c| !c.is_blank()).count() as isize;
+            let old_slab = old_slabs[page_idx];
+            let src_slab = src_slabs[page_idx];
+            let old_len = old_slab.map_or(0, ColSlab::len);
+            let old_count = old_slab.map_or(0, ColSlab::occupied_count) as isize;
 
-            let target_len = old_slab.len().max(hi + 1);
+            let target_len = old_len.max(hi + 1);
             let mut out_vec = vec![Cell::default(); target_len];
             let mut new_count: isize = 0;
             let mut row_mask = [0u64; 4];
-            for r in 0..lo.min(old_slab.len()) {
-                if !old_slab[r].is_blank() {
-                    if let Some(f) = old_slab[r].formula.as_deref() {
-                        has_formula = true;
-                        if f.contains('!') {
-                            has_qual_formula = true;
+            let mut slab_has_formula = false;
+            let mut slab_all_numbers = true;
+            if let Some(os) = old_slab {
+                for r in 0..lo.min(old_len) {
+                    if let Some(v) = os.get_view(r as u32) {
+                        if let Some(f) = v.formula() {
+                            has_formula = true;
+                            slab_has_formula = true;
+                            slab_all_numbers = false;
+                            if f.contains('!') {
+                                has_qual_formula = true;
+                            }
+                        } else if v.as_f64().is_none() {
+                            slab_all_numbers = false;
                         }
+                        new_count += 1;
+                        row_mask[r / 64] |= 1u64 << (r % 64);
+                        out_vec[r] = v.to_cell();
                     }
-                    new_count += 1;
-                    row_mask[r / 64] |= 1u64 << (r % 64);
-                    out_vec[r] = old_slab[r].clone();
                 }
-            }
-            for r in (hi + 1)..old_slab.len() {
-                if !old_slab[r].is_blank() {
-                    if let Some(f) = old_slab[r].formula.as_deref() {
-                        has_formula = true;
-                        if f.contains('!') {
-                            has_qual_formula = true;
+                for r in (hi + 1)..old_len {
+                    if let Some(v) = os.get_view(r as u32) {
+                        if let Some(f) = v.formula() {
+                            has_formula = true;
+                            slab_has_formula = true;
+                            slab_all_numbers = false;
+                            if f.contains('!') {
+                                has_qual_formula = true;
+                            }
+                        } else if v.as_f64().is_none() {
+                            slab_all_numbers = false;
                         }
+                        new_count += 1;
+                        row_mask[r / 64] |= 1u64 << (r % 64);
+                        out_vec[r] = v.to_cell();
                     }
-                    new_count += 1;
-                    row_mask[r / 64] |= 1u64 << (r % 64);
-                    out_vec[r] = old_slab[r].clone();
                 }
             }
 
@@ -963,11 +1051,11 @@ fn apply_horizontal_gather(
 
             for r_off in lo..=hi {
                 let row = base + r_off as u32;
-                let src_cell = src_slab.get(r_off).filter(|c| !c.is_blank());
-                let old_cell = old_slab.get(r_off).filter(|c| !c.is_blank());
+                let src_view = src_slab.and_then(|s| s.get_view(r_off as u32));
+                let old_view = old_slab.and_then(|s| s.get_view(r_off as u32));
                 let mut cell_diff = false;
-                if let Some(sc) = src_cell {
-                    let mut cell = sc.clone();
+                if let Some(sv) = src_view {
+                    let mut cell = sv.to_cell();
                     if dc != 0
                         && let Some(f) = cell.formula.as_deref()
                     {
@@ -978,20 +1066,24 @@ fn apply_horizontal_gather(
                         };
                         cell.formula = Some(nf);
                     }
-                    if old_cell != Some(&cell) {
+                    if old_view.is_none_or(|ov| !ov.eq_cell(&cell)) {
                         cell_diff = true;
                     }
                     if let Some(f) = cell.formula.as_deref() {
                         has_formula = true;
+                        slab_has_formula = true;
+                        slab_all_numbers = false;
                         if f.contains('!') {
                             has_qual_formula = true;
                         }
+                    } else if !matches!(cell.value, Value::Number(_)) {
+                        slab_all_numbers = false;
                     }
                     new_count += 1;
                     row_mask[r_off / 64] |= 1u64 << (r_off % 64);
                     occ_mask[r_off / 64] |= 1u64 << (r_off % 64);
                     out_vec[r_off] = cell;
-                } else if old_cell.is_some() {
+                } else if old_view.is_some() {
                     cell_diff = true;
                     vac_mask[r_off / 64] |= 1u64 << (r_off % 64);
                 }
@@ -1032,8 +1124,26 @@ fn apply_horizontal_gather(
             if occ_mask != [0; 4] {
                 occupied_masks.push((pi, occ_mask));
             }
-            new_slabs.push((!out_vec.is_empty()).then(|| GatheredSlab {
-                cells: Arc::new(out_vec),
+            let slab = if out_vec.is_empty() {
+                None
+            } else if slab_has_formula {
+                Some(ColSlab::Mixed(out_vec))
+            } else if slab_all_numbers {
+                let mut vals = vec![0.0; out_vec.len()];
+                for (r, c) in out_vec.iter().enumerate() {
+                    if let Value::Number(n) = c.value {
+                        vals[r] = n;
+                    }
+                }
+                Some(ColSlab::Numbers(NumberSlab {
+                    present: row_mask,
+                    values: vals,
+                }))
+            } else {
+                Some(ColSlab::Values(out_vec.into_iter().map(|c| c.value).collect()))
+            };
+            new_slabs.push(slab.map(|s| GatheredSlab {
+                cells: Arc::new(s),
                 row_mask,
             }));
             if let Some(ref mut slabs) = style_slabs {
@@ -1144,6 +1254,7 @@ fn reorder_delta_cached(
         None => (None, before_style),
     };
     let translated = source
+        .as_deref()
         .and_then(|cell| cell.formula.as_deref())
         .filter(|_| !dedup)
         .map(|formula| {
@@ -1159,11 +1270,11 @@ fn reorder_delta_cached(
     if translated.is_none() && before == source && before_style == after_style {
         return None;
     }
-    let mut after = source.cloned().unwrap_or_default();
+    let mut after = source.map(|c| c.into_owned()).unwrap_or_default();
     if let Some(f) = translated {
         after.formula = Some(f);
     }
-    let before = before.cloned().unwrap_or_default();
+    let before = before.map(|c| c.into_owned()).unwrap_or_default();
     if before != after || before_style != after_style {
         return Some(CellDelta {
             sheet: sheet_idx,
@@ -1484,7 +1595,7 @@ fn values_same_display(a: &Value, b: &Value) -> bool {
 
 fn rows_match_on_cols(sheet: &Sheet, r_a: u32, r_b: u32, cols: &[u32]) -> bool {
     cols.iter()
-        .all(|&c| values_same_display(sheet.value_ref(r_a, c), sheet.value_ref(r_b, c)))
+        .all(|&c| values_same_display(sheet.value_ref(r_a, c).as_ref(), sheet.value_ref(r_b, c).as_ref()))
 }
 
 fn distinct_rows(
@@ -1529,10 +1640,10 @@ fn distinct_rows(
         // `sheet.iter_rect` visits in ascending `(row, col)` order!
         let mut sorted_cols = use_cols.clone();
         sorted_cols.sort_unstable();
-        for (k, cell) in sheet.iter_rect((r1, min_sel, r2, max_sel)) {
+        for (k, cell) in sheet.iter_rect_views((r1, min_sel, r2, max_sel)) {
             if selected.contains(&k.col) {
                 let entry = row_hashes.entry(k.row).or_insert(FNV_OFFSET);
-                *entry = hash_display_field(*entry, k.col, &cell.value);
+                *entry = hash_display_field(*entry, k.col, cell.value().as_ref());
             }
         }
         let mut seen_blank_row = false;
@@ -1555,7 +1666,7 @@ fn distinct_rows(
         for row in r1..=r2 {
             let mut h = FNV_OFFSET;
             for &c in &use_cols {
-                h = hash_display_field(h, c, sheet.value_ref(row, c));
+                h = hash_display_field(h, c, sheet.value_ref(row, c).as_ref());
             }
             let bucket = buckets.entry(h).or_default();
             if !bucket.iter().any(|&prev| rows_match_on_cols(sheet, prev, row, &use_cols)) {
@@ -1769,7 +1880,7 @@ pub fn text_to_columns_ex(
         let last = sheet.used_bounds().map(|b| b.3).unwrap_or(c2).max(c2);
         for cc in (c1 + 1..=last).rev() {
             for rr in r1..=r2 {
-                if let Some(cell) = sheet.get(rr, cc).cloned() {
+                if let Some(cell) = sheet.get(rr, cc).map(|c| c.into_owned()) {
                     sheet.set(rr, cc + shift, cell);
                     let st = sheet.style_of(rr, cc);
                     sheet.set_style(rr, cc + shift, st);

@@ -12,7 +12,7 @@ fn main() {
             if let Some((sheet, addr)) = left.split_once('!') {
                 let idx = wb.sheets.iter().position(|s| s.name == sheet).unwrap_or(0);
                 let rc = sheetcore::sparse::parse_ref(addr.trim()).expect("地址");
-                let mut cell = wb.sheets[idx].get(rc.0, rc.1).cloned().unwrap_or_default();
+                let mut cell = wb.sheets[idx].get(rc.0, rc.1).map(|c| c.into_owned()).unwrap_or_default();
                 cell.value = sheetcore::model::Value::Text(val.trim().into());
                 cell.formula = None;
                 wb.sheets[idx].set(rc.0, rc.1, cell);

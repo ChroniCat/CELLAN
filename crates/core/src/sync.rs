@@ -952,7 +952,7 @@ impl Msg {
 pub fn iter_sheet_rect(
     sheet: &Sheet,
     rect: (u32, u32, u32, u32),
-) -> impl Iterator<Item = (crate::model::CellRef, &Cell)> {
+) -> impl Iterator<Item = (crate::model::CellRef, std::borrow::Cow<'_, Cell>)> {
     sheet.cells().iter_rect(rect)
 }
 
@@ -1007,7 +1007,7 @@ impl BaselineBook {
     ) {
         let Some(sh) = self.sheets.get(sheet) else { return };
         for (k, cell) in sh.cells().iter_rect(rect) {
-            f(k.row, k.col, cell);
+            f(k.row, k.col, &cell);
         }
     }
 
@@ -1560,9 +1560,9 @@ impl Peer {
         if let Some(base) = self.cells.baseline() {
             for (si, sh) in base.sheets.iter().enumerate() {
                 if let Some(dst) = wb.sheets.get_mut(si) {
-                    for (k, cell) in sh.iter() {
+                    for (k, cell) in sh.iter_views() {
                         if !self.cells.removed_baseline.contains(&(si, k.row, k.col)) {
-                            dst.set(k.row, k.col, cell.clone());
+                            dst.set(k.row, k.col, cell.to_cell());
                         }
                     }
                 }
@@ -1580,9 +1580,9 @@ impl Peer {
     pub fn apply_to_sheet(&self, sheet: &mut Sheet) {
         if let Some(base) = self.cells.baseline() {
             if let Some(src) = base.sheets.first() {
-                for (k, cell) in src.iter() {
+                for (k, cell) in src.iter_views() {
                     if !self.cells.removed_baseline.contains(&(0, k.row, k.col)) {
-                        sheet.set(k.row, k.col, cell.clone());
+                        sheet.set(k.row, k.col, cell.to_cell());
                     }
                 }
             }

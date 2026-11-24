@@ -239,7 +239,7 @@ fn target_hash(
                                 sheet,
                                 r,
                                 c,
-                                cell,
+                                cell.as_ref(),
                                 values,
                                 calculated,
                                 &mut needs_calculation,
@@ -254,7 +254,7 @@ fn target_hash(
                         sheet,
                         at.row,
                         at.col,
-                        cell,
+                        cell.as_ref(),
                         values,
                         calculated,
                         &mut needs_calculation,
@@ -270,7 +270,7 @@ fn target_hash(
                         sheet,
                         r,
                         c,
-                        cell,
+                        cell.as_ref(),
                         values,
                         calculated,
                         &mut needs_calculation,
@@ -1243,7 +1243,7 @@ impl SheetApp {
                     for (cr, cell) in
                         sheetcore::sync::iter_sheet_rect(sh, (band_start, 0, band_end, u32::MAX))
                     {
-                        if prepared.matches_cell(cell) {
+                        if prepared.matches_cell(cell.as_ref()) {
                             band_hits.push((
                                 cr.row,
                                 cr.col,

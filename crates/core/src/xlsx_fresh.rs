@@ -23,22 +23,54 @@ pub(super) fn supported(sheet: &Sheet) -> bool {
         runs.is_empty()
             || sheet
                 .get(r, c)
-                .is_some_and(|cell| super::delta::supports_runs(cell, runs))
-    }) && sheet.iter().all(|(key, cell)| {
-        key.row < crate::sync::MAX_ROWS
-            && key.col < crate::sync::MAX_COLS
-            && cell
-                .formula
-                .as_ref()
-                .is_none_or(|f| super::delta::safe_xml_text(f))
-            && match &cell.value {
-                Value::Number(n) => n.is_finite(),
-                Value::Text(s) => super::delta::safe_xml_text(s),
-                Value::Error(crate::formula::ErrKind::Spill) => {
-                    sheet.spill_shapes.contains_key(&key)
-                }
-                _ => true,
+                .is_some_and(|cell| super::delta::supports_runs(&cell, runs))
+    }) && sheet.cells().iter_pages().all(|(pi, page)| {
+        let base = pi * crate::store::PAGE_ROWS;
+        page.cols.iter_entries().all(|(col, slab)| {
+            if col >= crate::sync::MAX_COLS {
+                return false;
             }
+            match slab.as_ref() {
+                crate::store::ColSlab::Numbers(ns) => {
+                    base + (ns.values.len().saturating_sub(1) as u32) < crate::sync::MAX_ROWS
+                        && ns.values.iter().all(|n| n.is_finite())
+                }
+                crate::store::ColSlab::Values(vs) => vs.iter().enumerate().all(|(r, v)| {
+                    if v.is_empty() {
+                        return true;
+                    }
+                    let row = base + r as u32;
+                    row < crate::sync::MAX_ROWS
+                        && match v {
+                            Value::Number(n) => n.is_finite(),
+                            Value::Text(s) => super::delta::safe_xml_text(s),
+                            Value::Error(crate::formula::ErrKind::Spill) => {
+                                sheet.spill_shapes.contains_key(&CellRef::new(row, col))
+                            }
+                            _ => true,
+                        }
+                }),
+                crate::store::ColSlab::Mixed(cs) => cs.iter().enumerate().all(|(r, cell)| {
+                    if cell.is_blank() {
+                        return true;
+                    }
+                    let row = base + r as u32;
+                    row < crate::sync::MAX_ROWS
+                        && cell
+                            .formula
+                            .as_ref()
+                            .is_none_or(|f| super::delta::safe_xml_text(f))
+                        && match &cell.value {
+                            Value::Number(n) => n.is_finite(),
+                            Value::Text(s) => super::delta::safe_xml_text(s),
+                            Value::Error(crate::formula::ErrKind::Spill) => {
+                                sheet.spill_shapes.contains_key(&CellRef::new(row, col))
+                            }
+                            _ => true,
+                        }
+                }),
+            }
+        })
     })
 }
 
@@ -1120,23 +1152,58 @@ impl<'a> FreshSst<'a> {
         let mut counts: HashMap<&'a str, u32> = HashMap::new();
         let mut repeated_in_order: Vec<&'a str> = Vec::new();
         for &(_, sheet) in ordered_sheets {
-            for (key, cell) in sheet.iter() {
-                if sheet.spilled.contains(&key) || cell.formula.is_some() {
-                    continue;
-                }
-                if sheet
-                    .rich
-                    .get(&(key.row, key.col))
-                    .is_some_and(|runs| !runs.is_empty())
-                {
-                    continue;
-                }
-                if let Value::Text(s) = &cell.value {
-                    let text: &str = s.as_ref();
-                    let entry = counts.entry(text).or_insert(0);
-                    *entry += 1;
-                    if *entry == 2 {
-                        repeated_in_order.push(text);
+            let has_spilled = !sheet.spilled.is_empty();
+            let has_rich = !sheet.rich.is_empty();
+            for (pi, page) in sheet.cells().iter_pages() {
+                let base = pi * crate::store::PAGE_ROWS;
+                for (col, slab) in page.cols.iter_entries() {
+                    match slab.as_ref() {
+                        crate::store::ColSlab::Numbers(_) => continue, // O(1) skip: zero strings!
+                        crate::store::ColSlab::Values(vs) => {
+                            for (r_off, val) in vs.iter().enumerate() {
+                                let Value::Text(s) = val else { continue };
+                                let row = base + r_off as u32;
+                                if (has_spilled && sheet.spilled.contains(&CellRef::new(row, col)))
+                                    || (has_rich
+                                        && sheet
+                                            .rich
+                                            .get(&(row, col))
+                                            .is_some_and(|runs| !runs.is_empty()))
+                                {
+                                    continue;
+                                }
+                                let text: &'a str = s.as_ref();
+                                let entry = counts.entry(text).or_insert(0);
+                                *entry += 1;
+                                if *entry == 2 {
+                                    repeated_in_order.push(text);
+                                }
+                            }
+                        }
+                        crate::store::ColSlab::Mixed(cs) => {
+                            for (r_off, cell) in cs.iter().enumerate() {
+                                if cell.formula.is_some() {
+                                    continue;
+                                }
+                                let Value::Text(s) = &cell.value else { continue };
+                                let row = base + r_off as u32;
+                                if (has_spilled && sheet.spilled.contains(&CellRef::new(row, col)))
+                                    || (has_rich
+                                        && sheet
+                                            .rich
+                                            .get(&(row, col))
+                                            .is_some_and(|runs| !runs.is_empty()))
+                                {
+                                    continue;
+                                }
+                                let text: &'a str = s.as_ref();
+                                let entry = counts.entry(text).or_insert(0);
+                                *entry += 1;
+                                if *entry == 2 {
+                                    repeated_in_order.push(text);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1705,7 +1772,7 @@ fn write_value_buf(
     arrays: &HashMap<CellRef, (u32, u32, u32, u32)>,
     sst: Option<&HashMap<&str, u32>>,
     key: CellRef,
-    cell: &Cell,
+    cell: crate::store::CellView<'_>,
     xf: Option<u16>,
 ) -> Result<()> {
     let runs = if sheet.rich.is_empty() {
@@ -1716,23 +1783,13 @@ fn write_value_buf(
     let has_runs = runs.is_some_and(|r| !r.is_empty());
 
     // Zero-allocation fast path for ordinary scalar numbers, booleans, blanks, and repeated SST strings.
-    if cell.formula.is_none()
+    if !cell.has_formula()
         && !has_runs
         && (sheet.spill_shapes.is_empty() || !sheet.spill_shapes.contains_key(&key))
     {
-        match &cell.value {
-            Value::Empty => {
-                if let Some(xf) = xf {
-                    buf.extend_from_slice(b"<c r=\"");
-                    push_a1(buf, key.row, key.col);
-                    buf.extend_from_slice(b"\" s=\"");
-                    push_u16(buf, xf);
-                    buf.extend_from_slice(b"\"/>");
-                }
-                return Ok(());
-            }
-            Value::Number(n) if n.is_finite() => {
-                let n = if *n == 0.0 { 0.0 } else { *n };
+        match cell {
+            crate::store::CellView::Number(n) if n.is_finite() => {
+                let n = if n == 0.0 { 0.0 } else { n };
                 buf.extend_from_slice(b"<c r=\"");
                 push_a1(buf, key.row, key.col);
                 if let Some(xf) = xf {
@@ -1749,38 +1806,74 @@ fn write_value_buf(
                 buf.extend_from_slice(b"</v></c>");
                 return Ok(());
             }
-            Value::Bool(b) => {
-                buf.extend_from_slice(b"<c r=\"");
-                push_a1(buf, key.row, key.col);
-                if let Some(xf) = xf {
-                    buf.extend_from_slice(b"\" s=\"");
-                    push_u16(buf, xf);
-                }
-                buf.extend_from_slice(if *b {
-                    b"\" t=\"b\"><v>1</v></c>"
-                } else {
-                    b"\" t=\"b\"><v>0</v></c>"
-                });
-                return Ok(());
-            }
-            Value::Text(s) => {
-                let text: &str = s.as_ref();
-                if let Some(&sst_idx) = sst.and_then(|m| m.get(text)) {
-                    buf.extend_from_slice(b"<c r=\"");
-                    push_a1(buf, key.row, key.col);
-                    if let Some(xf) = xf {
-                        buf.extend_from_slice(b"\" s=\"");
-                        push_u16(buf, xf);
+            crate::store::CellView::Value(val) | crate::store::CellView::Cell(Cell { value: val, .. }) => {
+                match val {
+                    Value::Empty => {
+                        if let Some(xf) = xf {
+                            buf.extend_from_slice(b"<c r=\"");
+                            push_a1(buf, key.row, key.col);
+                            buf.extend_from_slice(b"\" s=\"");
+                            push_u16(buf, xf);
+                            buf.extend_from_slice(b"\"/>");
+                        }
+                        return Ok(());
                     }
-                    buf.extend_from_slice(b"\" t=\"s\"><v>");
-                    push_u32(buf, sst_idx);
-                    buf.extend_from_slice(b"</v></c>");
-                    return Ok(());
+                    Value::Number(n) if n.is_finite() => {
+                        let n = if *n == 0.0 { 0.0 } else { *n };
+                        buf.extend_from_slice(b"<c r=\"");
+                        push_a1(buf, key.row, key.col);
+                        if let Some(xf) = xf {
+                            buf.extend_from_slice(b"\" s=\"");
+                            push_u16(buf, xf);
+                        }
+                        buf.extend_from_slice(b"\"><v>");
+                        let iv = n as i64;
+                        if (iv as f64) == n && iv.unsigned_abs() < 10_000_000_000_000_000 {
+                            push_i64(buf, iv);
+                        } else {
+                            write!(buf, "{n}")?;
+                        }
+                        buf.extend_from_slice(b"</v></c>");
+                        return Ok(());
+                    }
+                    Value::Bool(b) => {
+                        buf.extend_from_slice(b"<c r=\"");
+                        push_a1(buf, key.row, key.col);
+                        if let Some(xf) = xf {
+                            buf.extend_from_slice(b"\" s=\"");
+                            push_u16(buf, xf);
+                        }
+                        buf.extend_from_slice(if *b {
+                            b"\" t=\"b\"><v>1</v></c>"
+                        } else {
+                            b"\" t=\"b\"><v>0</v></c>"
+                        });
+                        return Ok(());
+                    }
+                    Value::Text(s) => {
+                        let text: &str = s.as_ref();
+                        if let Some(&sst_idx) = sst.and_then(|m| m.get(text)) {
+                            buf.extend_from_slice(b"<c r=\"");
+                            push_a1(buf, key.row, key.col);
+                            if let Some(xf) = xf {
+                                buf.extend_from_slice(b"\" s=\"");
+                                push_u16(buf, xf);
+                            }
+                            buf.extend_from_slice(b"\" t=\"s\"><v>");
+                            push_u32(buf, sst_idx);
+                            buf.extend_from_slice(b"</v></c>");
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
         }
     }
+
+    let cell_cow = cell.to_cow();
+    let cell = cell_cow.as_ref();
 
     let mut a1_buf = [0u8; 16];
     let reference = format_a1_buf(key.row, key.col, &mut a1_buf);
@@ -2059,7 +2152,7 @@ fn write_sheet(
 
         let emit_entry = |buf: &mut Vec<u8>,
                               key: CellRef,
-                              cell: Option<&Cell>,
+                              cell: Option<crate::store::CellView<'_>>,
                               explicit: Option<u16>,
                               override_xf: Option<u16>|
          -> Result<()> {
@@ -2249,7 +2342,7 @@ fn write_sheet_parallel_zip(
                     let body_start = buf.len();
                     let has_col_styles = !sheet.col_styles.is_empty();
                     let mut open_row: Option<u32> = None;
-                    for (key, cell) in sheet.cells().iter_rect((r1, 0, r2, u32::MAX)) {
+                    for (key, cell) in sheet.cells().iter_rect_views((r1, 0, r2, u32::MAX)) {
                         if open_row != Some(key.row) {
                             if open_row.is_some() {
                                 buf.extend_from_slice(b"</row>");
@@ -2332,7 +2425,7 @@ pub(super) fn write_plain_new_sheet(sheet: &Sheet, out: &mut dyn Write) -> Resul
         }
         buf.extend_from_slice(b"\"/><sheetData>");
         let mut open_row: Option<u32> = None;
-        for (key, cell) in sheet.cells().iter_rect((top, 0, bottom, u32::MAX)) {
+        for (key, cell) in sheet.cells().iter_rect_views((top, 0, bottom, u32::MAX)) {
             if open_row != Some(key.row) {
                 if open_row.is_some() {
                     buf.extend_from_slice(b"</row>");
@@ -2771,7 +2864,7 @@ mod tests {
         crate::xlsx::save_atomic(&path,&saved).unwrap();
         let reopened = crate::xlsx::load(&path).unwrap();
         assert!(!reopened.sheets[0].rich.contains_key(&(0,1)));
-        assert_eq!(reopened.sheets[0].get(0,1),Some(&text));
+        assert_eq!(reopened.sheets[0].get(0,1).as_deref(),Some(&text));
         let xml = String::from_utf8(crate::fixups::read_part_file(&path,&part).unwrap()).unwrap();
         assert!(xml.contains(raw));
     }
@@ -2917,16 +3010,16 @@ mod tests {
         let mut back = crate::xlsx::load(&path).unwrap();
         assert_eq!(back.sheets[0].scenarios, [scenario]);
         assert_eq!(back.sheets[0].get(16_383, 2), wb.sheets[0].get(16_383, 2));
-        assert_eq!(back.sheets[0].get(1, 3), Some(&text));
-        assert_eq!(back.sheets[0].get(4, 4), Some(&formula));
+        assert_eq!(back.sheets[0].get(1, 3).as_deref(), Some(&text));
+        assert_eq!(back.sheets[0].get(4, 4).as_deref(), Some(&formula));
         for r in 5..=8 {
             assert_eq!(back.sheets[0].get(r, 0), wb.sheets[0].get(r, 0));
         }
-        assert_eq!(back.sheets[1].get(5, 5), Some(&text));
+        assert_eq!(back.sheets[1].get(5, 5).as_deref(), Some(&text));
         back.sheets[0].set(16_383, 2, formula.clone());
         crate::xlsx::save_atomic(&path, &back).unwrap();
         assert_eq!(
-            crate::xlsx::load(&path).unwrap().sheets[0].get(16_383, 2),
+            crate::xlsx::load(&path).unwrap().sheets[0].get(16_383, 2).as_deref(),
             Some(&formula)
         );
     }

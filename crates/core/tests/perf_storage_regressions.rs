@@ -48,11 +48,11 @@ fn arc_text_sharing_string_pool_and_value_ref() {
     let mut sh = Sheet::new("Pool");
     sh.set(0, 0, Cell { value: Value::Text(a.clone()), formula: None });
     let cloned = sh.clone();
-    match (sh.value_ref(0, 0), cloned.value_ref(0, 0)) {
+    match (sh.value_ref(0, 0).as_ref(), cloned.value_ref(0, 0).as_ref()) {
         (Value::Text(x), Value::Text(y)) => assert!(Arc::ptr_eq(x, y)),
         _ => panic!("expected Value::Text"),
     }
-    assert_eq!(sh.value_ref(999, 999), &Value::Empty);
+    assert_eq!(sh.value_ref(999, 999).as_ref(), &Value::Empty);
 }
 
 #[test]

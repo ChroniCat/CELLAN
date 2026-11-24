@@ -1,6 +1,6 @@
 use super::fxhash::{FxBuildHasher, FxHashMap};
 use super::{ErrKind, FValue, RangeKey, deps::CellKey};
-use crate::store::{CellVersion, PAGE_ROWS};
+use crate::store::{CellVersion, CellView, ColSlab, NumberSlab, PAGE_ROWS, row_range_mask};
 use crate::{Cell, Value};
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -196,7 +196,7 @@ type Key = (RangeKey, bool);
 
 #[derive(Clone, Debug)]
 struct PageKeyRecord {
-    slab: Option<Arc<Vec<Cell>>>,
+    slab: Option<Arc<ColSlab>>,
     has_formula: bool,
     has_invalid_formula_cache: bool,
     nonempty_keys: Arc<Vec<(LookupKey, u32)>>,
@@ -219,13 +219,32 @@ enum Keys {
 // slots within it. Those slots do not change a lookup.
 fn occupied_keys(
     pages: &[crate::cf::PageSlice],
-) -> impl Iterator<Item = ((u32, usize), &Cell)> {
+) -> impl Iterator<Item = ((u32, usize), CellView<'_>)> {
     pages.iter().flat_map(|p| {
-        (p.start..p.end).filter_map(move |row| {
-            let cell = &p.cells[row];
-            (!cell.is_blank()).then_some(((p.page, row), cell))
+        let end = p.end.min(p.cells.len());
+        let start = p.start.min(end);
+        (start..end).filter_map(move |row| {
+            p.cells
+                .get_view(row as u32)
+                .map(|v| ((p.page, row), v))
         })
     })
+}
+
+fn same_occupied_keys(a: &[crate::cf::PageSlice], b: &[crate::cf::PageSlice]) -> bool {
+    let mut ia = occupied_keys(a);
+    let mut ib = occupied_keys(b);
+    loop {
+        match (ia.next(), ib.next()) {
+            (Some((ka, va)), Some((kb, vb))) => {
+                if ka != kb || va.formula() != vb.formula() || va.value() != vb.value() {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
 }
 
 fn invalid_formula_cache(cell: &Cell) -> bool {
@@ -238,7 +257,7 @@ fn build_page_key_record(
     page_idx: u32,
     r1: u32,
     r2: u32,
-    slab: Option<&Arc<Vec<Cell>>>,
+    slab: Option<&Arc<ColSlab>>,
 ) -> PageKeyRecord {
     let base = page_idx * PAGE_ROWS;
     let start = r1.saturating_sub(base) as usize;
@@ -262,20 +281,51 @@ fn build_page_key_record(
     }
     let mut has_formula = false;
     let mut has_invalid = false;
-    let mut out = Vec::new();
-    for ro in start..slice_end {
-        let cell = &cells[ro];
-        if cell.is_blank() {
-            continue;
-        }
-        if cell.formula.is_some() {
-            has_formula = true;
-            if invalid_formula_cache(cell) {
-                has_invalid = true;
+    let mut out = Vec::with_capacity(slice_end - start);
+    match cells.as_ref() {
+        ColSlab::Numbers(ns) => {
+            if NumberSlab::all_present_in(&ns.present, start, slice_end - start) {
+                for (i, &n) in ns.values[start..slice_end].iter().enumerate() {
+                    let ro = start + i;
+                    let bits = if n == 0.0 { 0 } else { n.to_bits() };
+                    out.push((LookupKey::Number(bits), base + ro as u32 - r1));
+                }
+            } else {
+                for ro in start..slice_end {
+                    if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                        let n = ns.values[ro];
+                        let bits = if n == 0.0 { 0 } else { n.to_bits() };
+                        out.push((LookupKey::Number(bits), base + ro as u32 - r1));
+                    }
+                }
             }
         }
-        let global_row = base + ro as u32;
-        out.push((LookupKey::from_value(&cell.value), global_row - r1));
+        ColSlab::Values(vs) => {
+            for ro in start..slice_end {
+                let v = &vs[ro];
+                if v.is_empty() {
+                    continue;
+                }
+                let global_row = base + ro as u32;
+                out.push((LookupKey::from_value(v), global_row - r1));
+            }
+        }
+        ColSlab::Mixed(cs) => {
+            for ro in start..slice_end {
+                let cell = &cs[ro];
+                if cell.is_blank() {
+                    continue;
+                }
+                if cell.formula.is_some() {
+                    has_formula = true;
+                    if invalid_formula_cache(cell) {
+                        has_invalid = true;
+                    }
+                }
+                let global_row = base + ro as u32;
+                out.push((LookupKey::from_value(&cell.value), global_row - r1));
+            }
+        }
     }
     PageKeyRecord {
         slab: Some(cells.clone()),
@@ -290,7 +340,7 @@ fn column_slabs(
     r1: u32,
     r2: u32,
     col: u32,
-) -> Vec<Option<Arc<Vec<Cell>>>> {
+) -> Vec<Option<Arc<ColSlab>>> {
     let first_page = r1 / PAGE_ROWS;
     let last_page = r2 / PAGE_ROWS;
     let count = (last_page - first_page + 1) as usize;
@@ -311,7 +361,7 @@ impl Keys {
         } else {
             Self::Row(
                 (c1..=c2)
-                    .map(|c| sheet.get(r1 as u32, c as u32).cloned().unwrap_or_default())
+                    .map(|c| sheet.get(r1 as u32, c as u32).map(std::borrow::Cow::into_owned).unwrap_or_default())
                     .collect(),
             )
         }
@@ -361,12 +411,12 @@ impl Keys {
             }
             Self::PlainColumn(old) => {
                 let now = sheet.cf_pages((r1 as u32, c1 as u32, r2 as u32, c1 as u32));
-                old == &now || occupied_keys(old).eq(occupied_keys(&now))
+                old == &now || same_occupied_keys(old, &now)
             }
             Self::Row(old) => (c1..=c2).zip(old).all(|(c, v)| {
                 sheet
-                    .get(r1 as u32, c as u32)
-                    .map_or_else(|| v.is_blank(), |cell| cell == v)
+                    .get_view(r1 as u32, c as u32)
+                    .map_or_else(|| v.is_blank(), |cell| cell.eq_cell(v))
             }),
         }
     }
@@ -384,10 +434,7 @@ impl Keys {
             }
             Self::PlainColumn(pages) => pages
                 .iter()
-                .map(|p| {
-                    p.cells.capacity() * std::mem::size_of::<Cell>()
-                        + std::mem::size_of::<crate::cf::PageSlice>()
-                })
+                .map(|p| p.cells.payload_bytes() + std::mem::size_of::<crate::cf::PageSlice>())
                 .sum(),
             Self::Row(cells) => cells.capacity() * std::mem::size_of::<Cell>(),
         }
@@ -410,7 +457,7 @@ struct Entry {
 
 #[derive(Debug)]
 pub(crate) struct CondPage {
-    pub slab: Option<Arc<Vec<Cell>>>,
+    pub slab: Option<Arc<ColSlab>>,
     pub start_in_slab: u16,
     pub rows_in_page: u16,
     pub has_formula: bool,
@@ -445,16 +492,43 @@ impl CondPage {
     pub(crate) fn text_dict(&self) -> &FxHashMap<Arc<str>, Vec<u16>> {
         self.page_text_dict.get_or_init(|| {
             let mut dict: FxHashMap<Arc<str>, Vec<u16>> = FxHashMap::default();
-            let slice = self.slab.as_ref().map(|v| v.as_slice()).unwrap_or_default();
             let start = self.start_in_slab as usize;
             let empty_arc: Arc<str> = "".into();
-            for idx in 0..self.rows_in_page as usize {
-                let ro = start + idx;
-                let txt = match slice.get(ro).filter(|c| !c.is_blank()) {
-                    None => empty_arc.clone(),
-                    Some(cell) => value_to_coerced_lower_text(&cell.value),
-                };
-                dict.entry(txt).or_default().push(idx as u16);
+            match self.slab.as_deref() {
+                None => {
+                    dict.insert(empty_arc, (0..self.rows_in_page).collect());
+                }
+                Some(ColSlab::Numbers(ns)) => {
+                    for idx in 0..self.rows_in_page as usize {
+                        let ro = start + idx;
+                        let txt = if let Some(n) = ns.get(ro as u32) {
+                            crate::model::format_number(n).into()
+                        } else {
+                            empty_arc.clone()
+                        };
+                        dict.entry(txt).or_default().push(idx as u16);
+                    }
+                }
+                Some(ColSlab::Values(vs)) => {
+                    for idx in 0..self.rows_in_page as usize {
+                        let ro = start + idx;
+                        let txt = match vs.get(ro).filter(|v| !v.is_empty()) {
+                            None => empty_arc.clone(),
+                            Some(v) => value_to_coerced_lower_text(v),
+                        };
+                        dict.entry(txt).or_default().push(idx as u16);
+                    }
+                }
+                Some(ColSlab::Mixed(cs)) => {
+                    for idx in 0..self.rows_in_page as usize {
+                        let ro = start + idx;
+                        let txt = match cs.get(ro).filter(|c| !c.is_blank()) {
+                            None => empty_arc.clone(),
+                            Some(cell) => value_to_coerced_lower_text(&cell.value),
+                        };
+                        dict.entry(txt).or_default().push(idx as u16);
+                    }
+                }
             }
             dict
         })
@@ -495,7 +569,7 @@ fn build_cond_page(
     page_idx: u32,
     r1: u32,
     r2: u32,
-    slab: Option<&Arc<Vec<Cell>>>,
+    slab: Option<&Arc<ColSlab>>,
 ) -> Arc<CondPage> {
     const EXACT: u64 = 1 << 53;
     let base = page_idx * PAGE_ROWS;
@@ -517,35 +591,56 @@ fn build_cond_page(
     let mut int_sum = 0i64;
     let mut int_abs_sum = 0u64;
 
-    let slice = slab.map(|v| v.as_slice()).unwrap_or_default();
-
-    for idx in 0..rows_in_page as usize {
-        let ro = start + idx;
-        let word = idx / 64;
-        let bit = 1u64 << (idx % 64);
-        match slice.get(ro).filter(|c| !c.is_blank()) {
-            None => {
-                // Blank cell: to_number() -> 0.0
-                coerced_ok[word] |= bit;
-                num_count += 1;
-                min_num = min_num.min(0.0);
-                max_num = max_num.max(0.0);
-                sorted_nums.push((0.0, idx as u16));
+    match slab.map(Arc::as_ref) {
+        None => {
+            if rows_in_page > 0 {
+                coerced_ok = row_range_mask(0, rows_in_page as u32 - 1);
+                num_count = rows_in_page;
+                min_num = 0.0;
+                max_num = 0.0;
+                for idx in 0..rows_in_page {
+                    sorted_nums.push((0.0, idx));
+                }
             }
-            Some(cell) => {
-                if cell.formula.is_some() {
-                    has_formula = true;
-                    if invalid_formula_cache(cell) {
-                        has_invalid_formula_cache = true;
+        }
+        Some(ColSlab::Numbers(ns)) => {
+            let n_rows = rows_in_page as usize;
+            if n_rows > 0 {
+                coerced_ok = row_range_mask(0, rows_in_page as u32 - 1);
+            }
+            if end <= ns.values.len() && NumberSlab::all_present_in(&ns.present, start, n_rows) {
+                // Dense pure numeric page: memcpy f64s + tight unbranched summary loop!
+                coerced_nums.copy_from_slice(&ns.values[start..end]);
+                strict_num_ok = coerced_ok;
+                for (idx, &n) in coerced_nums.iter().enumerate() {
+                    if n.is_finite() {
+                        num_count += 1;
+                        min_num = min_num.min(n);
+                        max_num = max_num.max(n);
+                        sorted_nums.push((n, idx as u16));
+                        if all_exact_int {
+                            if n.fract() != 0.0 || n.abs() > EXACT as f64 {
+                                all_exact_int = false;
+                            } else {
+                                let w = n as i64;
+                                int_sum = int_sum.wrapping_add(w);
+                                int_abs_sum = int_abs_sum.saturating_add(w.unsigned_abs());
+                                if int_abs_sum > EXACT {
+                                    all_exact_int = false;
+                                }
+                            }
+                        }
+                    } else {
+                        has_non_finite = true;
+                        all_exact_int = false;
                     }
                 }
-                if matches!(cell.value, Value::Number(_)) {
-                    strict_num_ok[word] |= bit;
-                }
-                match value_to_coerced_number(&cell.value) {
-                    Ok(n) => {
+            } else {
+                for idx in 0..n_rows {
+                    let ro = start + idx;
+                    if let Some(n) = ns.get(ro as u32) {
+                        strict_num_ok[idx / 64] |= 1u64 << (idx % 64);
                         coerced_nums[idx] = n;
-                        coerced_ok[word] |= bit;
                         if n.is_finite() {
                             num_count += 1;
                             min_num = min_num.min(n);
@@ -567,9 +662,121 @@ fn build_cond_page(
                             has_non_finite = true;
                             all_exact_int = false;
                         }
+                    } else {
+                        num_count += 1;
+                        min_num = min_num.min(0.0);
+                        max_num = max_num.max(0.0);
+                        sorted_nums.push((0.0, idx as u16));
                     }
-                    Err(_) => {
-                        has_non_num = true;
+                }
+            }
+        }
+        Some(ColSlab::Values(vs)) => {
+            for idx in 0..rows_in_page as usize {
+                let ro = start + idx;
+                let word = idx / 64;
+                let bit = 1u64 << (idx % 64);
+                match vs.get(ro).filter(|v| !v.is_empty()) {
+                    None => {
+                        coerced_ok[word] |= bit;
+                        num_count += 1;
+                        min_num = min_num.min(0.0);
+                        max_num = max_num.max(0.0);
+                        sorted_nums.push((0.0, idx as u16));
+                    }
+                    Some(val) => {
+                        if matches!(val, Value::Number(_)) {
+                            strict_num_ok[word] |= bit;
+                        }
+                        match value_to_coerced_number(val) {
+                            Ok(n) => {
+                                coerced_nums[idx] = n;
+                                coerced_ok[word] |= bit;
+                                if n.is_finite() {
+                                    num_count += 1;
+                                    min_num = min_num.min(n);
+                                    max_num = max_num.max(n);
+                                    sorted_nums.push((n, idx as u16));
+                                    if all_exact_int {
+                                        if n.fract() != 0.0 || n.abs() > EXACT as f64 {
+                                            all_exact_int = false;
+                                        } else {
+                                            let w = n as i64;
+                                            int_sum = int_sum.wrapping_add(w);
+                                            int_abs_sum =
+                                                int_abs_sum.saturating_add(w.unsigned_abs());
+                                            if int_abs_sum > EXACT {
+                                                all_exact_int = false;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    has_non_finite = true;
+                                    all_exact_int = false;
+                                }
+                            }
+                            Err(_) => {
+                                has_non_num = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(ColSlab::Mixed(cs)) => {
+            for idx in 0..rows_in_page as usize {
+                let ro = start + idx;
+                let word = idx / 64;
+                let bit = 1u64 << (idx % 64);
+                match cs.get(ro).filter(|c| !c.is_blank()) {
+                    None => {
+                        coerced_ok[word] |= bit;
+                        num_count += 1;
+                        min_num = min_num.min(0.0);
+                        max_num = max_num.max(0.0);
+                        sorted_nums.push((0.0, idx as u16));
+                    }
+                    Some(cell) => {
+                        if cell.formula.is_some() {
+                            has_formula = true;
+                            if invalid_formula_cache(cell) {
+                                has_invalid_formula_cache = true;
+                            }
+                        }
+                        if matches!(cell.value, Value::Number(_)) {
+                            strict_num_ok[word] |= bit;
+                        }
+                        match value_to_coerced_number(&cell.value) {
+                            Ok(n) => {
+                                coerced_nums[idx] = n;
+                                coerced_ok[word] |= bit;
+                                if n.is_finite() {
+                                    num_count += 1;
+                                    min_num = min_num.min(n);
+                                    max_num = max_num.max(n);
+                                    sorted_nums.push((n, idx as u16));
+                                    if all_exact_int {
+                                        if n.fract() != 0.0 || n.abs() > EXACT as f64 {
+                                            all_exact_int = false;
+                                        } else {
+                                            let w = n as i64;
+                                            int_sum = int_sum.wrapping_add(w);
+                                            int_abs_sum =
+                                                int_abs_sum.saturating_add(w.unsigned_abs());
+                                            if int_abs_sum > EXACT {
+                                                all_exact_int = false;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    has_non_finite = true;
+                                    all_exact_int = false;
+                                }
+                            }
+                            Err(_) => {
+                                has_non_num = true;
+                            }
+                        }
                     }
                 }
             }

@@ -1046,8 +1046,8 @@ pub fn build_xmlss_rows(
             }
             let cell_opt = sh.get(r, c);
             let style = sh.style_of(r, c);
-            let has_formula = cell_opt.and_then(|cell| cell.formula.as_deref()).is_some();
-            let has_value = cell_opt.is_some_and(|cell| !matches!(cell.value, sheetcore::Value::Empty));
+            let has_formula = cell_opt.as_deref().and_then(|cell| cell.formula.as_deref()).is_some();
+            let has_value = cell_opt.as_deref().is_some_and(|cell| !matches!(cell.value, sheetcore::Value::Empty));
             if !has_formula && !has_value && style == 0 && merge.is_none() {
                 continue;
             }
@@ -1078,14 +1078,14 @@ pub fn build_xmlss_rows(
             }
             expected_col = c + span_cols;
 
-            if let Some(f) = cell_opt.and_then(|cell| cell.formula.as_deref()) {
+            if let Some(f) = cell_opt.as_deref().and_then(|cell| cell.formula.as_deref()) {
                 let r1c1 = sheetcore::clipboard_xmlss::a1_to_r1c1(f, r, c);
                 body.push_str(" ss:Formula=\"");
                 xml_escape_into(&mut body, &r1c1);
                 body.push('"');
             }
 
-            match cell_opt.map(|cell| &cell.value) {
+            match cell_opt.as_deref().map(|cell| &cell.value) {
                 None | Some(sheetcore::Value::Empty) => {
                     body.push_str("/>");
                 }

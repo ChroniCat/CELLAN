@@ -240,7 +240,7 @@ impl Range {
         let mut out = Vec::with_capacity(coords.len());
         for (rel_r, rel_c, src_r) in coords {
             let src_c = c1 + rel_c;
-            let cell = sh.get(src_r, src_c).cloned();
+            let cell = sh.get(src_r, src_c).map(|c| c.into_owned());
             let style = sh.style_of(src_r, src_c);
             if cell.as_ref().is_some_and(|c| !c.is_blank()) || style != 0 {
                 out.push((rel_r, rel_c, src_r, cell, style));
@@ -287,7 +287,7 @@ impl Range {
             let sh = self.book.sheet(0);
             let build_row = |r: u32| -> Vec<(sheetcore::Cell, u16)> {
                 (c1..=c2)
-                    .map(|c| (sh.get(r, c).cloned().unwrap_or_default(), sh.style_of(r, c)))
+                    .map(|c| (sh.get(r, c).map(|cell| cell.into_owned()).unwrap_or_default(), sh.style_of(r, c)))
                     .collect()
             };
             match &self.visible_rows {
@@ -920,7 +920,7 @@ mod tests {
         assert_eq!(app.wb.sheets[0].value(0, 3), Value::Number(7.0));
         assert!(app.wb.styles.get(app.wb.sheets[0].style_of(0, 3)).bold);
         assert_eq!(
-            app.wb.sheets[0].get(900_000, 4).and_then(|c| c.formula.as_deref()),
+            app.wb.sheets[0].formula_of(900_000, 4),
             Some("=D$1*2")
         );
         assert_eq!(app.wb.sheets[0].value(900_000, 4), Value::Number(14.0));
@@ -979,7 +979,7 @@ mod tests {
         assert_eq!(app.wb.sheets[1].value(2, 1), Value::Number(5.0), "status={}", app.status);
         assert!(app.wb.styles.get(app.wb.sheets[1].style_of(2, 1)).bold);
         assert_eq!(
-            app.wb.sheets[1].get(100_001, 10).and_then(|c| c.formula.as_deref()),
+            app.wb.sheets[1].formula_of(100_001, 10),
             Some("=B3*3")
         );
         assert_eq!(app.wb.sheets[1].value(100_001, 10), Value::Number(15.0));

@@ -1362,8 +1362,8 @@ fn table_fill_calculated_column_is_a_real_command_entry() {
     app.sel_end = (1, 2);
     app.fill_table_calculated_column();
     let sh = app.wb.sheet(0);
-    assert_eq!(sh.get(2, 2).and_then(|c| c.formula.as_deref()), Some("=A3*B3"));
-    assert_eq!(sh.get(3, 2).and_then(|c| c.formula.as_deref()), Some("=A4*B4"));
+    assert_eq!(sh.formula_of(2, 2), Some("=A3*B3"));
+    assert_eq!(sh.formula_of(3, 2), Some("=A4*B4"));
     assert_eq!(sh.get(2, 2).map(|c| c.value.clone()), Some(sheetcore::model::Value::Number(4.0)));
     assert_eq!(sh.get(3, 2).map(|c| c.value.clone()), Some(sheetcore::model::Value::Number(6.0)));
 }
@@ -3163,7 +3163,7 @@ fn ctx_menu_paste_values_keeps_number_but_drops_formula() {
     app.sel = (2, 2);
     app.sel_end = (2, 2);
     app.ctx_menu_run(CtxAct::PasteValues, 0, &ctx);
-    let cell = app.wb.sheets[0].get(2, 2).cloned().unwrap();
+    let cell = app.wb.sheets[0].get(2, 2).map(|c| c.into_owned()).unwrap();
     assert!(cell.formula.is_none(), "只粘数值，不带公式");
     assert_eq!(cell.value, Value::Number(5.0));
 }
@@ -6007,7 +6007,7 @@ fn paste_special_formula_translates_negative_and_positive_offsets() {
     app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
-        cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), 0)]],
+        cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().into_owned(), 0)]],
         cut: false,
     });
     // C3 → B2：相对 A1 平移 (-1,-1) → #REF!；$B$1 不变
@@ -6048,8 +6048,8 @@ fn paste_special_transpose_keeps_original_source_coordinates() {
         sheet: 0,
         rect: (0, 0, 1, 0),
         cells: vec![
-            vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), 0)],
-            vec![(app.wb.sheet(0).get(1, 0).unwrap().clone(), 0)],
+            vec![(app.wb.sheet(0).get(0, 0).unwrap().into_owned(), 0)],
+            vec![(app.wb.sheet(0).get(1, 0).unwrap().into_owned(), 0)],
         ],
         cut: false,
     });
@@ -6085,7 +6085,7 @@ fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
     app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
-        cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), sid)]],
+        cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().into_owned(), sid)]],
         cut: false,
     });
     // 全部：公式 + 样式都过去
@@ -6103,7 +6103,7 @@ fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
     app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
-        cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().clone(), 0)]],
+        cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().into_owned(), 0)]],
         cut: false,
     });
     app.ps_kind = 1;
@@ -6273,7 +6273,7 @@ fn paste_special_all_translates_formula_offsets() {
     app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
-        cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), sid)]],
+        cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().into_owned(), sid)]],
         cut: false,
     });
     app.ps_kind = 0;
@@ -6305,7 +6305,7 @@ fn paste_special_transpose_negative_offset_is_ref_error() {
     app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
-        cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().clone(), 0)]],
+        cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().into_owned(), 0)]],
         cut: false,
     });
     app.ps_kind = 2;
@@ -7980,7 +7980,7 @@ fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
     let sh = app.wb.sheet(0);
     assert_eq!(sh.tables[0].columns[0], "金额", "表格列定义要跟着改");
     assert_eq!(
-        sh.get(0, 4).and_then(|c| c.formula.as_deref()),
+        sh.formula_of(0, 4),
         Some("=SUM(Sales[金额])"),
         "结构化引用里的列名要一起改"
     );

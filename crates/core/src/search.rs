@@ -116,15 +116,16 @@ impl<'a> PreparedSearch<'a> {
         style0_general: bool,
         row: u32,
         col: u32,
-        cell: &Cell,
+        cell: crate::store::CellView<'_>,
     ) -> bool {
         if self.opts.in_formula {
-            let Some(f) = cell.formula.as_deref() else {
+            let Some(f) = cell.formula() else {
                 return false;
             };
             return self.matches_str(f);
         }
-        match &cell.value {
+        let val_cow = cell.value();
+        match val_cow.as_ref() {
             crate::model::Value::Empty => false,
             v => {
                 let id = if has_any_styles { sh.style_of(row, col) } else { 0 };
@@ -201,15 +202,18 @@ fn search_sheet_pages_parallel(
             if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                 return None;
             }
+            if prep.opts.in_formula && !page.may_have_formula {
+                continue;
+            }
             let base = pi * crate::store::PAGE_ROWS;
-            for col in page.iter_nonempty_cols(0, u32::MAX) {
-                let Some(slab) = page.cols.get(col as usize).and_then(Option::as_deref) else {
+            for (col, slab) in page.cols.iter_entries() {
+                if prep.opts.in_formula && !slab.is_mixed() {
                     continue;
-                };
-                for (r_off, cell) in slab.iter().enumerate() {
-                    if cell.is_blank() {
+                }
+                for r_off in 0..slab.len() {
+                    let Some(cell) = slab.get_view(r_off as u32) else {
                         continue;
-                    }
+                    };
                     visited += 1;
                     if visited % 512 == 0
                         && cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
@@ -252,17 +256,18 @@ fn search_sheet_pages_parallel(
                             aborted_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                             return Vec::new();
                         }
+                        if prep.opts.in_formula && !page.may_have_formula {
+                            continue;
+                        }
                         let base = pi * crate::store::PAGE_ROWS;
-                        for col in page.iter_nonempty_cols(0, u32::MAX) {
-                            let Some(slab) =
-                                page.cols.get(col as usize).and_then(Option::as_deref)
-                            else {
+                        for (col, slab) in page.cols.iter_entries() {
+                            if prep.opts.in_formula && !slab.is_mixed() {
                                 continue;
-                            };
-                            for (r_off, cell) in slab.iter().enumerate() {
-                                if cell.is_blank() {
+                            }
+                            for r_off in 0..slab.len() {
+                                let Some(cell) = slab.get_view(r_off as u32) else {
                                     continue;
-                                }
+                                };
                                 visited += 1;
                                 if visited % 512 == 0
                                     && cancelled.is_some_and(|c| {
@@ -405,7 +410,7 @@ pub fn cell_matches(
     let Some(cell) = wb.sheets.get(sheet).and_then(|sh| sh.get(row, col)) else {
         return false;
     };
-    matches_at(wb, sheet, row, col, cell, needle, opts)
+    matches_at(wb, sheet, row, col, cell.as_ref(), needle, opts)
 }
 
 fn matches_at(wb: &Workbook, sheet: usize, row: u32, col: u32, cell: &Cell,
@@ -415,7 +420,15 @@ fn matches_at(wb: &Workbook, sheet: usize, row: u32, col: u32, cell: &Cell,
         let has_any_styles =
             !sh.styles.is_empty() || !sh.row_styles.is_empty() || !sh.col_styles.is_empty();
         let style0_general = is_general_format(&wb.styles.get(0).format);
-        return prep.matches_cell_on_sheet(wb, sh, has_any_styles, style0_general, row, col, cell);
+        return prep.matches_cell_on_sheet(
+            wb,
+            sh,
+            has_any_styles,
+            style0_general,
+            row,
+            col,
+            crate::store::CellView::Cell(cell),
+        );
     }
     let Some(text) = cell_text_at(wb, sheet, row, col, cell, opts.in_formula) else {
         return false;

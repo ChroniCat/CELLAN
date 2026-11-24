@@ -299,11 +299,7 @@ fn collect_slot_prerequisites(
     virt_keys: &mut Vec<VKey>,
 ) -> bool {
     let (si, row, col) = key;
-    let Some(formula_arc) = wb
-        .sheet(si)
-        .get(row, col)
-        .and_then(|c| c.formula.as_ref())
-    else {
+    let Some(formula_arc) = wb.sheet(si).formula_arc_of(row, col) else {
         return false;
     };
 
@@ -697,8 +693,7 @@ fn estimate_workload(wb: &Workbook, keys: &[CellKey], pending: usize) -> usize {
         let (si, r, c) = keys[(i * stride) % keys.len()];
         let heavy = wb
             .sheet(si)
-            .get(r, c)
-            .and_then(|cell| cell.formula.as_deref())
+            .formula_of(r, c)
             .is_some_and(|f| {
                 let b = f.as_bytes();
                 b.contains(&b':')
@@ -882,7 +877,7 @@ fn evaluate_with_workers<'a>(
             // reads prerequisites directly from `plan.inputs` via `pvals.get_by_slot` without
             // touching `Calc::memo`, `Calc::visiting`, or `pvals.binary_search`.
             let fast_val = if !has_tables
-                && let Some(f_arc) = wb.sheets[si].get(r, c).and_then(|cell| cell.formula.as_ref())
+                && let Some(f_arc) = wb.sheets[si].formula_arc_of(r, c)
             {
                 compiled::with_eval_arc(f_arc, r, c, |node, dr, dc, kind| match kind {
                     compiled::ScalarKind::SameSheet => {
@@ -892,10 +887,14 @@ fn evaluate_with_workers<'a>(
                                     return pvals.get_by_slot(in_slot).cloned();
                                 }
                             }
-                            match wb.sheets[si].get(rr, cc) {
+                            match wb.sheets[si].get_view(rr, cc) {
                                 None => Some(FValue::Empty),
-                                Some(c2) if c2.formula.is_none() => Some(super::to_fvalue(&c2.value)),
-                                Some(c2)
+                                Some(crate::store::CellView::Number(n)) => Some(FValue::Number(n)),
+                                Some(crate::store::CellView::Value(v)) => Some(super::to_fvalue(v)),
+                                Some(crate::store::CellView::Cell(c2)) if c2.formula.is_none() => {
+                                    Some(super::to_fvalue(&c2.value))
+                                }
+                                Some(crate::store::CellView::Cell(c2))
                                     if fast_scope_ref.is_some_and(|fs| !fs.contains((si, rr, cc)))
                                         && !super::callable_cache_candidate(&c2.value) =>
                                 {
@@ -919,10 +918,14 @@ fn evaluate_with_workers<'a>(
                                     return pvals.get_by_slot(in_slot).cloned();
                                 }
                             }
-                            match wb.sheets[target_si].get(rr, cc) {
+                            match wb.sheets[target_si].get_view(rr, cc) {
                                 None => Some(FValue::Empty),
-                                Some(c2) if c2.formula.is_none() => Some(super::to_fvalue(&c2.value)),
-                                Some(c2)
+                                Some(crate::store::CellView::Number(n)) => Some(FValue::Number(n)),
+                                Some(crate::store::CellView::Value(v)) => Some(super::to_fvalue(v)),
+                                Some(crate::store::CellView::Cell(c2)) if c2.formula.is_none() => {
+                                    Some(super::to_fvalue(&c2.value))
+                                }
+                                Some(crate::store::CellView::Cell(c2))
                                     if fast_scope_ref
                                         .is_some_and(|fs| !fs.contains((target_si, rr, cc)))
                                         && !super::callable_cache_candidate(&c2.value) =>

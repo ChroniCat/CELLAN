@@ -361,12 +361,28 @@ fn bench_cell_memory_1m_num() {
     let rss_after = rss_mb();
     let (pages, slabs, slots) = wb.sheet(0).cells_stats();
     let raw_slots_mb = (slots * std::mem::size_of::<Cell>()) as f64 / 1_048_576.0;
+    let payload_mb = wb.sheet(0).unique_payload_bytes() as f64 / 1_048_576.0;
+    black_box(&wb);
+    drop(wb);
+
+    let mut xfd_wb = Workbook::new_blank();
+    {
+        let sh = xfd_wb.sheet_mut(0);
+        for r in 0..100_000u32 {
+            sh.set(r, 16_383, Cell { value: Value::Number(r as f64), formula: None });
+        }
+    }
+    let xfd_100k_payload_mb = xfd_wb.sheet(0).unique_payload_bytes() as f64 / 1_048_576.0;
+    black_box(&xfd_wb);
+
     emit(
         "cell_memory_1m_num",
         serde_json::json!({
             "cells": rows * cols,
             "size_of_cell": std::mem::size_of::<Cell>(),
             "raw_slots_mb": (raw_slots_mb * 100.0).round() / 100.0,
+            "payload_mb": (payload_mb * 100.0).round() / 100.0,
+            "xfd_100k_payload_mb": (xfd_100k_payload_mb * 100.0).round() / 100.0,
             "fill_ms": (fill_ms * 100.0).round() / 100.0,
             "rss_delta_mb": ((rss_after - rss_before) * 10.0).round() / 10.0,
             "pages": pages,

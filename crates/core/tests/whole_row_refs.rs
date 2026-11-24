@@ -133,15 +133,14 @@ fn whole_row_formula_survives_actual_save_and_reload() {
     sheetcore::xlsx::save(&path, &wb).expect("save");
     let back = sheetcore::xlsx::load(&path).expect("load");
     assert_eq!(
-        back.sheets[0].get(4, 1).and_then(|c| c.formula.as_deref()),
+        back.sheets[0].formula_of(4, 1),
         Some("=SUM(3:4)"),
         "xlsx 加载不能把整行公式改写成 A1:XFD"
     );
     // 实际加载后的整行引用再走复制/插列，检查左右不变、上下按行平移、
     // 行绝对引用不动，且不会变成 A1:XFD1 / #REF!.
     let raw = back.sheets[0]
-        .get(4, 1)
-        .and_then(|c| c.formula.as_deref())
+        .formula_of(4, 1)
         .expect("loaded formula");
     assert_eq!(sheetcore::cf::shift_formula(raw, 0, 1), raw);
     assert_eq!(sheetcore::cf::shift_formula(raw, 1, 0), "=SUM(4:5)");

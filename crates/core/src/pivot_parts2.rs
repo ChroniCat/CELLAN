@@ -178,7 +178,8 @@ pub fn build_sheet(
         let is_value = value_cols.contains(&col);
         let mut saw_num = false;
         for r in (r1 + 1)..=r2 {
-            match sheet.value_ref(r, col) {
+            let cell_val = sheet.value_ref(r, col);
+            match cell_val.as_ref() {
                 Value::Empty => {}
                 Value::Number(v) => {
                     let v = *v;
@@ -195,7 +196,7 @@ pub fn build_sheet(
                 }
                 Value::Text(t) => {
                     if !t.is_empty() {
-                        idx_of(&mut shared[i], &mut shared_map[i], t);
+                        idx_of(&mut shared[i], &mut shared_map[i], t.as_ref());
                     }
                 }
                 other => {
@@ -400,7 +401,7 @@ pub fn build_sheet(
             let col = c1 + i as u32;
             let v = sheet.value_ref(r, col);
             if numeric[i] {
-                match v {
+                match v.as_ref() {
                     Value::Number(n) => {
                         let _ = write!(recs, "<n v=\"{n}\"/>");
                     }
@@ -412,7 +413,7 @@ pub fn build_sheet(
                     }
                 }
             } else {
-                let idx_opt = match v {
+                let idx_opt = match v.as_ref() {
                     Value::Empty => None,
                     Value::Text(t) if !t.is_empty() => shared_map[i].get(t.as_ref()).copied(),
                     other => {

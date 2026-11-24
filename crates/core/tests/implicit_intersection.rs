@@ -102,7 +102,7 @@ fn implicit_intersection_is_a_dependency_and_survives_save_reload() {
     sheetcore::xlsx::save(&path, &wb).expect("保存 @ 公式失败");
     let back = sheetcore::xlsx::load(&path).expect("重新加载 @ 公式失败");
     assert_eq!(
-        back.sheets[0].get(1, 3).and_then(|c| c.formula.as_deref()),
+        back.sheets[0].formula_of(1, 3),
         Some("=@A1:A2"),
         "保存重开必须保留 @ 语法"
     );

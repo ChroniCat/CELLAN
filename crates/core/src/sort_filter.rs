@@ -4,7 +4,7 @@
 //! 数字按大小、文本按不区分大小写的字典序、布尔按真假。
 //! 筛选不删数据，只把不匹配的行隐藏起来（隐藏 = 行高 0，和 Excel 一致）。
 
-use crate::model::{Cell, Sheet, Value};
+use crate::model::{Sheet, Value};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -376,12 +376,42 @@ pub(crate) fn sort_order(
     };
 
     if !horizontal {
-        for (base_row, slice) in sheet.column_slices(first, last, key) {
+        for (base_row, slice) in sheet.column_typed_slices(first, last, key) {
             let start_idx = (base_row - first) as usize;
-            for (i, cell) in slice.iter().enumerate() {
-                if !cell.value.is_empty() {
-                    let line = base_row + i as u32;
-                    entries[start_idx + i] = encode_value(line, &cell.value);
+            match slice {
+                crate::store::ColSlice::Numbers { present, start, values } => {
+                    if crate::store::ColSlice::numbers_all_present(&present, start, values.len()) {
+                        for (i, &n) in values.iter().enumerate() {
+                            let line = base_row + i as u32;
+                            entries[start_idx + i] =
+                                SortEntry::new(line, SortEntry::KIND_NUM, 0, n.to_bits());
+                        }
+                    } else {
+                        for (i, &n) in values.iter().enumerate() {
+                            let ro = start + i;
+                            if (present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                                let line = base_row + i as u32;
+                                entries[start_idx + i] =
+                                    SortEntry::new(line, SortEntry::KIND_NUM, 0, n.to_bits());
+                            }
+                        }
+                    }
+                }
+                crate::store::ColSlice::Values(vs) => {
+                    for (i, val) in vs.iter().enumerate() {
+                        if !val.is_empty() {
+                            let line = base_row + i as u32;
+                            entries[start_idx + i] = encode_value(line, val);
+                        }
+                    }
+                }
+                crate::store::ColSlice::Mixed(cs) => {
+                    for (i, cell) in cs.iter().enumerate() {
+                        if !cell.value.is_empty() {
+                            let line = base_row + i as u32;
+                            entries[start_idx + i] = encode_value(line, &cell.value);
+                        }
+                    }
                 }
             }
         }
@@ -390,7 +420,7 @@ pub(crate) fn sort_order(
             let line = first + i as u32;
             let v = sheet.value_ref(key, line);
             if !v.is_empty() {
-                entries[i] = encode_value(line, v);
+                entries[i] = encode_value(line, v.as_ref());
             }
         }
     }
@@ -482,10 +512,7 @@ pub fn has_header_col(sheet: &Sheet, r1: u32, c1: u32, r2: u32, c2: u32) -> bool
         return false;
     }
     let all_text = (r1..=r2).all(|r| {
-        matches!(
-            sheet.get(r, c1).map(|x| &x.value),
-            Some(Value::Text(t)) if !t.is_empty()
-        )
+        sheet.value_ref(r, c1).as_str().is_some_and(|t| !t.is_empty())
     });
     if !all_text {
         return false;
@@ -514,10 +541,7 @@ pub fn has_header(sheet: &Sheet, r1: u32, c1: u32, r2: u32, c2: u32) -> bool {
         return false;
     }
     let all_text = (c1..=c2).all(|c| {
-        matches!(
-            sheet.get(r1, c).map(|x| &x.value),
-            Some(Value::Text(t)) if !t.is_empty()
-        )
+        sheet.value_ref(r1, c).as_str().is_some_and(|t| !t.is_empty())
     });
     if !all_text {
         return false;
@@ -531,9 +555,9 @@ fn has_numeric(sheet: &Sheet, rect: (u32, u32, u32, u32)) -> bool {
     let area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
     if area > 4096 && area > sheet.len() as u64 * 4 {
         sheet.stored_cells().any(|(k, cell)| (r1..=r2).contains(&k.row)
-            && (c1..=c2).contains(&k.col) && matches!(cell.value, Value::Number(_)))
+            && (c1..=c2).contains(&k.col) && cell.as_f64().is_some())
     } else {
-        (r1..=r2).any(|r| (c1..=c2).any(|c| matches!(sheet.get(r, c).map(|x| &x.value), Some(Value::Number(_)))))
+        (r1..=r2).any(|r| (c1..=c2).any(|c| sheet.get_f64(r, c).is_some()))
     }
 }
 
@@ -983,7 +1007,7 @@ impl Filter {
                     && rules
                         .iter()
                         .enumerate()
-                        .all(|(i, r)| i == req_idx || r.passes(sheet.value_ref(key.row, r.col)))
+                        .all(|(i, r)| i == req_idx || r.passes(sheet.value_ref(key.row, r.col).as_ref()))
                 {
                     if next < key.row {
                         intervals.push((next, key.row - 1));
@@ -1035,7 +1059,7 @@ pub fn unique_values(sheet: &Sheet, range: (u32, u32, u32, u32), col: u32) -> Ve
 /// Shares the source column's pages; a pending popup never retains drawings or other columns.
 #[derive(Clone)]
 pub struct FilterColumn {
-    pages: Vec<(u32, std::sync::Arc<Vec<Cell>>)>,
+    pages: Vec<(u32, std::sync::Arc<crate::store::ColSlab>)>,
     header: u32,
     last: u32,
 }
@@ -1065,10 +1089,30 @@ impl FilterColumn {
             let start = self.header.saturating_add(1).saturating_sub(base) as usize;
             if self.last < base || start >= cells.len() { continue; }
             let end = ((self.last - base) as usize + 1).min(cells.len());
-            for cell in cells.iter().take(end).skip(start) {
-                if !cell.is_blank() {
-                    populated += 1;
-                    unique.insert(cell.value.display());
+            match cells.as_ref() {
+                crate::store::ColSlab::Numbers(ns) => {
+                    for ro in start..end {
+                        if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                            populated += 1;
+                            unique.insert(crate::model::format_number(ns.values[ro]));
+                        }
+                    }
+                }
+                crate::store::ColSlab::Values(vs) => {
+                    for v in &vs[start..end] {
+                        if !v.is_empty() {
+                            populated += 1;
+                            unique.insert(v.display());
+                        }
+                    }
+                }
+                crate::store::ColSlab::Mixed(cs) => {
+                    for cell in &cs[start..end] {
+                        if !cell.is_blank() {
+                            populated += 1;
+                            unique.insert(cell.value.display());
+                        }
+                    }
                 }
             }
         }
@@ -1096,6 +1140,7 @@ impl FilterColumn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Cell;
 
     fn sheet() -> Sheet {
         let mut s = Sheet::new("T");

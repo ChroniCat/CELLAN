@@ -134,8 +134,8 @@ fn shift_sparse_ray(
         return;
     }
     let cells: Vec<(CellRef, crate::model::Cell)> = sheet
-        .iter_rect(ray)
-        .map(|(k, c)| (k, c.clone()))
+        .iter_rect_views(ray)
+        .map(|(k, c)| (k, c.to_cell()))
         .collect();
     for (k, _) in &cells {
         sheet.remove(k.row, k.col);

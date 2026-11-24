@@ -2928,7 +2928,7 @@ fn visit_stats_values(
             for r in r1..=r2 {
                 for c in c1..=c2 {
                     if let Some(cell) = sheet.get(r, c).filter(|cell| !cell.is_blank()) {
-                        add(r, c, cell);
+                        add(r, c, cell.as_ref());
                     }
                 }
             }
@@ -2937,7 +2937,7 @@ fn visit_stats_values(
                 if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                     return;
                 }
-                add(key.row, key.col, cell);
+                add(key.row, key.col, cell.as_ref());
             }
         }
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
@@ -6683,7 +6683,7 @@ impl SheetApp {
                 for r in 0..=1u32 {
                     let mut row = Vec::new();
                     for c in 0..=1u32 {
-                        let cell = self.wb.sheet(self.sheet_idx).get(r, c).cloned().unwrap_or_else(|| Cell {
+                        let cell = self.wb.sheet(self.sheet_idx).get(r, c).map(|c| c.into_owned()).unwrap_or_else(|| Cell {
                             value: Value::Text(cell_name(r, c).into()),
                             formula: None,
                         });
@@ -7295,7 +7295,7 @@ impl SheetApp {
                 let b = before_opt.unwrap_or_default();
                 let a = self.wb.sheets[op.sheet]
                     .get(op.row, op.col)
-                    .cloned()
+                    .map(|c| c.into_owned())
                     .unwrap_or_default();
                 if b.value == a.value && b.formula == a.formula {
                     continue;
@@ -7577,7 +7577,8 @@ impl SheetApp {
                     Some((_, _, er, ec)) => (ec - c + 1, er - r + 1),
                     None => (1, 1),
                 };
-                let cell = sh.get(r, c).unwrap_or(&blank_cell);
+                let cell_opt = sh.get(r, c);
+                let cell = cell_opt.as_deref().unwrap_or(&blank_cell);
                 let sid = sh.style_of(r, c);
                 let st = wb.styles.get(sid);
                 let formatted = if matches!(cell.value, sheetcore::model::Value::Empty) {
@@ -7751,7 +7752,7 @@ impl SheetApp {
         for &r in &visible_rows {
             let mut row = Vec::with_capacity((c2 - c1 + 1) as usize);
             for c in c1..=c2 {
-                let cell = self.wb.sheet(si).get(r, c).cloned().unwrap_or(sheetcore::model::Cell {
+                let cell = self.wb.sheet(si).get(r, c).map(|c| c.into_owned()).unwrap_or(sheetcore::model::Cell {
                     value: sheetcore::model::Value::Empty,
                     formula: None,
                 });
@@ -8050,11 +8051,11 @@ impl SheetApp {
                         let cc = c + j as u32;
                         let need_sample = sample.len() < sheetcore::revision::MAX_CELLS;
                         let (prev_cell, prev_st) = if need_sample {
-                            (sh.get(rr, cc).cloned().unwrap_or_default(), sh.style_of(rr, cc))
+                            (sh.get(rr, cc).map(|c| c.into_owned()).unwrap_or_default(), sh.style_of(rr, cc))
                         } else {
                             (Cell::default(), 0)
                         };
-                        let cell_changed = sh.get(rr, cc).map_or(!cell.is_blank(), |old| old != cell);
+                        let cell_changed = sh.get(rr, cc).as_deref().map_or(!cell.is_blank(), |old| old != cell);
                         sh.set(rr, cc, cell.clone());
                         let new_st = if !values_only && !tsv_paste {
                             sh.set_style(rr, cc, *st);
@@ -8629,7 +8630,8 @@ impl SheetApp {
             let blank = sheetcore::Cell::default();
             for chunk in keys.chunks(sheetcore::sync::LIVE_OP_BATCH) {
                 let ops = chunk.iter().map(|&(si, r, c)| {
-                    peer.local_set(si, r, c, self.wb.sheet(si).get(r, c).unwrap_or(&blank))
+                    let cell = self.wb.sheet(si).get(r, c);
+                    peer.local_set(si, r, c, cell.as_deref().unwrap_or(&blank))
                 }).collect();
                 net.broadcast_ops(ops);
             }
@@ -8724,7 +8726,7 @@ impl SheetApp {
                 let sh = self.wb.sheet_mut(si);
                 if down {
                     let sources: Vec<(u32, Cell)> = (c1..=c2)
-                        .filter_map(|col| sh.get(r1, col).map(|cell| (col, cell.clone())))
+                        .filter_map(|col| sh.get(r1, col).map(|cell| (col, cell.into_owned())))
                         .collect();
                     for (col, source) in sources {
                         has_formula |= source.formula.is_some();
@@ -8736,12 +8738,12 @@ impl SheetApp {
                                     .as_deref()
                                     .map(|f| formulas.translate(f, i64::from(row - r1), 0).into()),
                             };
-                            if sh.get(row, col) == Some(&after) {
+                            if sh.get(row, col).as_deref() == Some(&after) {
                                 continue;
                             }
                             if sample.len() < sheetcore::revision::MAX_CELLS {
                                 let style = sh.style_of(row, col);
-                                let before = sh.get(row, col).cloned().unwrap_or_default();
+                                let before = sh.get(row, col).map(|c| c.into_owned()).unwrap_or_default();
                                 sample.push(sheetcore::undo::CellDelta {
                                     sheet: si,
                                     row,
@@ -8758,7 +8760,7 @@ impl SheetApp {
                     }
                 } else {
                     let sources: Vec<(u32, Cell)> = (r1..=r2)
-                        .filter_map(|row| sh.get(row, c1).map(|cell| (row, cell.clone())))
+                        .filter_map(|row| sh.get(row, c1).map(|cell| (row, cell.into_owned())))
                         .collect();
                     for (row, source) in sources {
                         has_formula |= source.formula.is_some();
@@ -8770,12 +8772,12 @@ impl SheetApp {
                                     .as_deref()
                                     .map(|f| formulas.translate(f, 0, i64::from(col - c1)).into()),
                             };
-                            if sh.get(row, col) == Some(&after) {
+                            if sh.get(row, col).as_deref() == Some(&after) {
                                 continue;
                             }
                             if sample.len() < sheetcore::revision::MAX_CELLS {
                                 let style = sh.style_of(row, col);
-                                let before = sh.get(row, col).cloned().unwrap_or_default();
+                                let before = sh.get(row, col).map(|c| c.into_owned()).unwrap_or_default();
                                 sample.push(sheetcore::undo::CellDelta {
                                     sheet: si,
                                     row,
@@ -8837,9 +8839,9 @@ impl SheetApp {
                 value: source.value.clone(),
                 formula: source.formula.as_deref().map(|f| formulas.translate(f, i64::from(row - sr), i64::from(col - sc)).into()),
             };
-            if sh.get(row, col) == Some(&after) { continue; }
+            if sh.get(row, col).as_deref() == Some(&after) { continue; }
             let style = sh.style_of(row, col);
-            let before = sh.get(row, col).cloned().unwrap_or_default();
+            let before = sh.get(row, col).map(|c| c.into_owned()).unwrap_or_default();
             sh.set(row, col, after.clone());
             changes.push(sheetcore::undo::CellDelta {
                 sheet: si, row, col, before, after, before_style: style, after_style: style,
@@ -12368,7 +12370,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     fn replace_current(&mut self) {
         let si = self.sheet_idx;
         let (r, c) = self.sel;
-        let Some(cell) = self.wb.sheet(si).get(r, c).cloned() else {
+        let Some(cell) = self.wb.sheet(si).get(r, c).map(|c| c.into_owned()) else {
             self.find_next(false);
             return;
         };
@@ -13694,7 +13696,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                     .wb
                     .sheet(self.sheet_idx)
                     .get(r, c)
-                    .cloned()
+                    .map(|c| c.into_owned())
                     .unwrap_or(cell_clone);
                 let op = peer.local_set(self.sheet_idx, r, c, &live_cell);
                 net.broadcast_op(op);
@@ -15225,7 +15227,7 @@ fn clear_values(&mut self) {
         let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
         let txn = self.txn_begin(&keys);
         for cc in c1..=c2 {
-            let src = self.wb.sheet(self.sheet_idx).get(r1, cc).cloned();
+            let src = self.wb.sheet(self.sheet_idx).get(r1, cc).map(|c| c.into_owned());
             let style_id = self.wb.sheet(self.sheet_idx).style_of(r1, cc);
             for rr in r1 + 1..=r2 {
                 match &src {
@@ -15367,7 +15369,7 @@ fn clear_values(&mut self) {
         let mut cells: Vec<(u32, u32, sheetcore::model::Cell, Option<u16>)> = Vec::new();
         for r in r1..=r2 {
             for c in c1..=c2 {
-                if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c).cloned() {
+                if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c).map(|c| c.into_owned()) {
                     let st = self.wb.sheet(self.sheet_idx).styles.get(&sheetcore::model::CellRef::new(r, c)).copied();
                     cells.push((r - r1, c - c1, cell, st));
                 }
@@ -15520,7 +15522,7 @@ fn clear_values(&mut self) {
         let mut cells: Vec<(u32, u32, sheetcore::model::Cell, Option<u16>)> = Vec::new();
         for r in r1..=r2 {
             for c in c1..=c2 {
-                if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c).cloned() {
+                if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c).map(|c| c.into_owned()) {
                     let st = self
                         .wb
                         .sheet(self.sheet_idx)
@@ -15632,7 +15634,7 @@ fn clear_values(&mut self) {
         let mut cells: Vec<(u32, u32, sheetcore::model::Cell, Option<u16>)> = Vec::new();
         for r in r1..=r2 {
             for c in c1..=c2 {
-                if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c).cloned() {
+                if let Some(cell) = self.wb.sheet(self.sheet_idx).get(r, c).map(|c| c.into_owned()) {
                     let st = self
                         .wb
                         .sheet(self.sheet_idx)
@@ -15873,7 +15875,7 @@ fn clear_values(&mut self) {
         let mut touched: Vec<usize> = Vec::new();
         for (si, r, c, old, _new) in items {
             let sh = self.wb.sheet_mut(si);
-            let Some(cell) = sh.get(r, c).cloned() else {
+            let Some(cell) = sh.get(r, c).map(|c| c.into_owned()) else {
                 continue;
             };
             let sheetcore::model::Value::Text(t) = &cell.value else {
@@ -15882,7 +15884,7 @@ fn clear_values(&mut self) {
             if t.as_ref() != old.as_str() {
                 continue;
             }
-            let new = sheetcore::zhconv::to_traditional_with(t, v);
+            let new = sheetcore::zhconv::to_traditional_with(t.as_ref(), v);
             let mut cell = cell;
             cell.value = sheetcore::model::Value::Text(new.into());
             sh.set(r, c, cell);
@@ -16071,7 +16073,7 @@ fn clear_values(&mut self) {
                 continue;
             }
             let sh = self.wb.sheet_mut(self.sheet_idx);
-            let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
+            let mut cell = sh.get(*r, *c).map(|c| c.into_owned()).unwrap_or_default();
             cell.value = sheetcore::model::Value::Text(fixed.into());
             sh.set(*r, *c, cell);
             n += 1;
@@ -16117,7 +16119,7 @@ fn clear_values(&mut self) {
                 continue;
             }
             let sh = self.wb.sheet_mut(self.sheet_idx);
-            let mut cell = sh.get(*r, *c).cloned().unwrap_or_default();
+            let mut cell = sh.get(*r, *c).map(|c| c.into_owned()).unwrap_or_default();
             cell.value = sheetcore::model::Value::Text(fixed.into());
             sh.set(*r, *c, cell);
             n += 1;
@@ -16502,7 +16504,7 @@ fn clear_values(&mut self) {
         let n = work.len();
         for (r, c, text) in work {
             let sh = self.wb.sheet_mut(self.sheet_idx);
-            let mut cell = sh.get(r, c).cloned().unwrap_or_default();
+            let mut cell = sh.get(r, c).map(|c| c.into_owned()).unwrap_or_default();
             cell.value = sheetcore::model::Value::Text(text.into());
             sh.set(r, c, cell);
         }
@@ -17053,7 +17055,7 @@ fn clear_selection(&mut self) {
         let mut removed_cells: Vec<(u32, u32, sheetcore::model::Cell)> = Vec::new();
         {
             let sheet = self.wb.sheet(self.sheet_idx);
-            anchor = sheet.get(r1, c1).cloned().unwrap_or_default();
+            anchor = sheet.get(r1, c1).map(|c| c.into_owned()).unwrap_or_default();
             for r in r1..=r2 {
                 for c in c1..=c2 {
                     if r == r1 && c == c1 {
@@ -17062,7 +17064,7 @@ fn clear_selection(&mut self) {
                     if let Some(cell) = sheet.get(r, c) {
                         if !cell.is_blank() {
                             loss += 1;
-                            removed_cells.push((r, c, cell.clone()));
+                            removed_cells.push((r, c, cell.into_owned()));
                         }
                     }
                 }
@@ -17154,7 +17156,7 @@ fn clear_selection(&mut self) {
         }
         if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
             for (r, c, _) in removed_cells.iter() {
-                let cell = self.wb.sheet(self.sheet_idx).get(*r, *c).cloned().unwrap_or_default();
+                let cell = self.wb.sheet(self.sheet_idx).get(*r, *c).map(|c| c.into_owned()).unwrap_or_default();
                 let op = peer.local_set(self.sheet_idx, *r, *c, &cell);
                 net.broadcast_op(op);
             }
@@ -17257,7 +17259,7 @@ fn clear_selection(&mut self) {
             let sid = p.styles[((row - tr1) % sh) as usize][((col - tc1) % sw) as usize];
             let before_style = sheet.style_of(row, col);
             if before_style != sid {
-                let value = sheet.get(row, col).cloned().unwrap_or_default();
+                let value = sheet.get(row, col).map(|c| c.into_owned()).unwrap_or_default();
                 changes.push(sheetcore::undo::CellDelta { sheet: si, row, col,
                     before: value.clone(), after: value, before_style, after_style: sid });
             }
@@ -17512,7 +17514,7 @@ fn clear_selection(&mut self) {
     /// 把一个数字写进格子并按依赖图重算受影响的公式（不记撤销，求解器内部用）
     fn poke_cell(&mut self, deps: &sheetcore::formula::deps::Deps, r: u32, c: u32, v: f64) {
         let sh = self.wb.sheet_mut(self.sheet_idx);
-        let mut cell = sh.get(r, c).cloned().unwrap_or_default();
+        let mut cell = sh.get(r, c).map(|c| c.into_owned()).unwrap_or_default();
         cell.value = sheetcore::model::Value::Number(v);
         cell.formula = None;
         sh.set(r, c, cell);
@@ -17578,7 +17580,7 @@ fn clear_selection(&mut self) {
         if f1.abs() < 1e-6 {
             // 重算只改了模型里的值，保存时公式格的缓存值要按「已编辑」重写
             self.poke_cell(&deps, vr, vc, x1);
-            if let Some(cell) = self.wb.sheet(self.sheet_idx).get(tr, tc).cloned() {
+            if let Some(cell) = self.wb.sheet(self.sheet_idx).get(tr, tc).map(|c| c.into_owned()) {
                 self.wb.sheet_mut(self.sheet_idx).set(tr, tc, cell);
             }
             Ok(x1)
@@ -18014,7 +18016,7 @@ fn clear_selection(&mut self) {
         let sheet = self.wb.sheet_mut(sheet_index);
         for ((row,col),v) in &sc.cells {
             let cell = sheetcore::Cell { value: sheetcore::scenarios::apply_value(v), formula: None };
-            if sheet.get(*row,*col).cloned().unwrap_or_default() != cell {
+            if sheet.get(*row,*col).map(|c| c.into_owned()).unwrap_or_default() != cell {
                 sheet.set(*row,*col,cell);
             }
         }
@@ -18320,7 +18322,7 @@ fn clear_selection(&mut self) {
                 .map(|x| x.value.clone())
                 .unwrap_or_default();
             let sh = self.wb.sheet_mut(self.sheet_idx);
-            let mut cell = sh.get(r, c).cloned().unwrap_or_default();
+            let mut cell = sh.get(r, c).map(|c| c.into_owned()).unwrap_or_default();
             cell.value = out;
             cell.formula = None;
             sh.set(r, c, cell);
@@ -19041,7 +19043,7 @@ fn clear_selection(&mut self) {
                     .wb
                     .sheet(self.sheet_idx)
                     .get(r, c)
-                    .cloned()
+                    .map(|c| c.into_owned())
                     .unwrap_or(sheetcore::model::Cell {
                         value: sheetcore::model::Value::Empty,
                         formula: None,
@@ -19170,7 +19172,7 @@ fn clear_selection(&mut self) {
             for (i, row) in matrix.iter().enumerate() {
                 for j in 0..row.len() {
                     let (r, c) = (r0 + i as u32, c0 + j as u32);
-                    let cell = self.wb.sheet(self.sheet_idx).get(r, c).cloned().unwrap_or_default();
+                    let cell = self.wb.sheet(self.sheet_idx).get(r, c).map(|c| c.into_owned()).unwrap_or_default();
                     let op = peer.local_set(self.sheet_idx, r, c, &cell);
                     net.broadcast_op(op);
                 }
@@ -24204,7 +24206,7 @@ impl SheetApp {
         let has_rich = !sh.rich.is_empty() && sh.rich.contains_key(&(r, c));
         let mut depends_on_row_neighbors = false;
 
-        let text = if let Some(cell) = cell_opt {
+        let text = if let Some(cell) = cell_opt.as_deref() {
             let cap = (((w_rect / rc.layout_zoom.max(0.01)) - 5.0) / 8.0)
                 .floor()
                 .max(1.0) as usize;
@@ -24478,7 +24480,7 @@ impl SheetApp {
             width_bits: w_rect.to_bits(),
             height_bits: h_rect.to_bits(),
             verified_rev: caches.grid.content_rev,
-            cell_snap: cell_opt.cloned(),
+            cell_snap: cell_opt.map(|c| c.into_owned()),
             has_link,
             has_rich,
             depends_on_row_neighbors,
@@ -24520,7 +24522,10 @@ impl SheetApp {
                     && (sh.rich.is_empty() || !sh.rich.contains_key(&(r, c)))
                     && entry.has_link
                         == (!sh.hyperlinks.is_empty() && sh.hyperlinks.contains_key(&(r, c)))
-                    && grid_render_cache::cell_eq_fast(entry.cell_snap.as_ref(), sh.get(r, c))
+                    && grid_render_cache::cell_eq_fast(
+                        entry.cell_snap.as_ref(),
+                        sh.get(r, c).as_deref(),
+                    )
                 {
                     entry.verified_rev = cur_rev;
                     true
@@ -26163,7 +26168,8 @@ impl SheetApp {
             .iter()
             .filter(|ch| {
                 let sheet = self.wb.sheet(si);
-                if !ch.after.same(sheet.get(ch.r, ch.c)) {
+                let cur = sheet.get(ch.r, ch.c);
+                if !ch.after.same(cur.as_deref()) {
                     return true;
                 }
                 if let Some(after_style) = &ch.after_style {
@@ -35836,7 +35842,7 @@ impl SheetApp {
         if std::env::var("SC_PASTE_CHECK").is_ok() {
             // 改一下被引用的格子，看粘进来的公式是不是活的
             let key = (self.sheet_idx, 0u32, 0u32);
-            if let Some(c) = self.wb.sheet(self.sheet_idx).get(0, 0).cloned() {
+            if let Some(c) = self.wb.sheet(self.sheet_idx).get(0, 0).map(|c| c.into_owned()) {
                 let mut c2 = c;
                 c2.value = Value::Number(5.0);
                 self.wb.sheet_mut(self.sheet_idx).set(0, 0, c2);
@@ -38399,7 +38405,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                                 if let Some(sheet) = self.wb.sheets.get_mut(op.sheet) {
                                     if want_rev {
                                         let cur = sheet.get(op.row, op.col);
-                                        let changed = match cur {
+                                        let changed = match cur.as_deref() {
                                             Some(b) => {
                                                 b.value != new_cell.value
                                                     || b.formula != new_cell.formula
@@ -38414,7 +38420,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                                             let before =
                                                 if group_sampled < sheetcore::revision::MAX_CELLS {
                                                     group_sampled += 1;
-                                                    cur.cloned()
+                                                    cur.map(|c| c.into_owned())
                                                 } else {
                                                     None
                                                 };

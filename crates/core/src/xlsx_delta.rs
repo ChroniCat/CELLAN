@@ -503,13 +503,13 @@ fn cache_only_arrays(sheet: &Sheet, source: &SourceCells, keys: &BTreeSet<CellRe
         let rows = CellRef::new(top,0)..=CellRef::new(bottom,u32::MAX);
         let inside = |k: &&CellRef| (left..=right).contains(&k.col);
         let cache = |key: &CellRef| {
-            let before = source.store.get(key.row,key.col);
-            let after = sheet.get(key.row,key.col);
+            let before_f = source.store.formula_of(key.row, key.col);
+            let after_f = sheet.formula_of(key.row, key.col);
             if rich_changed(sheet,*key) { return false; }
             if *key == anchor {
-                return before.and_then(|c| c.formula.as_ref()).is_some_and(|f| Some(f)==after.and_then(|c| c.formula.as_ref()));
+                return before_f.is_some_and(|f| Some(f) == after_f);
             }
-            sheet.spilled.contains(key) && before.is_none_or(|c| c.formula.is_none()) && after.is_none_or(|c| c.formula.is_none())
+            sheet.spilled.contains(key) && before_f.is_none() && after_f.is_none()
         };
         let mut changed = keys.range(rows.clone()).filter(inside).peekable();
         let ownership: Vec<_> = restricted.range(rows).filter(inside).copied().collect();
@@ -545,12 +545,8 @@ fn coordinates(
         if !keys.insert(key) {
             continue;
         }
-        formula_changed |= base
-            .get(key.row, key.col)
-            .and_then(|c| c.formula.as_deref())
-            != sheet
-                .get(key.row, key.col)
-                .and_then(|c| c.formula.as_deref());
+        formula_changed |=
+            base.formula_of(key.row, key.col) != sheet.formula_of(key.row, key.col);
     }
     if sheet.rich_dirty {
         for &(row, col) in sheet.rich.keys().chain(source.rich.keys()) {
@@ -784,8 +780,8 @@ fn replacement(
                                             if (rr, cc) <= (key.row, key.col) {
                                                 continue;
                                             }
-                                            let b_f = base.get(rr, cc).and_then(|c| c.formula.as_ref());
-                                            let s_f = sheet.get(rr, cc).and_then(|c| c.formula.as_ref());
+                                            let b_f = base.formula_of(rr, cc);
+                                            let s_f = sheet.formula_of(rr, cc);
                                             if b_f.is_some() && b_f == s_f {
                                                 promoted = Some(CellRef::new(rr, cc));
                                                 break;
@@ -812,8 +808,8 @@ fn replacement(
                                             if (rr, cc) <= (key.row, key.col) {
                                                 continue;
                                             }
-                                            let b_f = base.get(rr, cc).and_then(|c| c.formula.as_ref());
-                                            let s_f = sheet.get(rr, cc).and_then(|c| c.formula.as_ref());
+                                            let b_f = base.formula_of(rr, cc);
+                                            let s_f = sheet.formula_of(rr, cc);
                                             if b_f.is_some() && b_f == s_f {
                                                 let ck = CellRef::new(rr, cc);
                                                 shared_state.unshare.insert(ck);
@@ -959,12 +955,13 @@ fn new_cell(key: CellRef, sheet: &Sheet, base: &Store, styles: &StyleChanges) ->
     }
     let mut dummy_shared = SharedFormulaState::default();
     let mut dummy_extra = Vec::new();
+    let cur = sheet.get(key.row, key.col);
     replacement(
         key,
         &BytesStart::new("c"),
         "",
         None,
-        sheet.get(key.row, key.col),
+        cur.as_deref(),
         styles,
         sheet,
         base,
@@ -1111,8 +1108,8 @@ fn row_edits(
                             key,
                             e,
                             body,
-                            old,
-                            new,
+                            old.as_deref(),
+                            new.as_deref(),
                             styles,
                             sheet,
                             base,

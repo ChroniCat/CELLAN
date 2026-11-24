@@ -582,8 +582,10 @@ fn prepare(
             if (i & 4095) == 0 {
                 check_cancelled(cancel)?;
             }
-            let bc = before.get(r, c).unwrap_or(&blank);
-            let ac = result.get(r, c).unwrap_or(&blank);
+            let bc_opt = before.get(r, c);
+            let ac_opt = result.get(r, c);
+            let bc = bc_opt.as_deref().unwrap_or(&blank);
+            let ac = ac_opt.as_deref().unwrap_or(&blank);
             let bs = before.style_of(r, c);
             let as_ = result.style_of(r, c);
             if !bc.same_input(ac) || bs != as_ {
@@ -634,7 +636,7 @@ fn prepare(
                             row: r,
                             col: c,
                             before: sheetcore::Cell::default(),
-                            after: after.clone(),
+                            after: after.into_owned(),
                             before_style: 0,
                             after_style,
                         });

@@ -134,7 +134,7 @@ pub fn scan(sheet: &Sheet) -> Vec<Issue> {
 pub fn scan_wb(wb: &crate::model::Workbook, si: usize) -> Vec<Issue> {
     let mut out = Vec::new();
     visit_issues(wb, si, &std::sync::atomic::AtomicBool::new(false), |key, cell, kind| {
-        let text = if kind == IssueKind::NumberAsText { cell.value.display() } else { kind.error_text().into() };
+        let text = if kind == IssueKind::NumberAsText { cell.value().display() } else { kind.error_text().into() };
         out.push(Issue { row: key.row, col: key.col, kind, text });
     });
     out.sort_by_key(|i| (i.row, i.col));
@@ -155,12 +155,12 @@ pub fn mark_positions(wb: &crate::Workbook, si: usize, check_text: bool, check_e
 }
 
 fn visit_issues(wb: &crate::Workbook, si:usize, stop:&std::sync::atomic::AtomicBool,
-    mut visit: impl FnMut(crate::CellRef, &crate::Cell, IssueKind)) {
+    mut visit: impl FnMut(crate::CellRef, crate::store::CellView<'_>, IssueKind)) {
     let sheet = wb.sheet(si);
     for (i, (key, cell)) in sheet.stored_cells().enumerate() {
         if i % 256 == 0 && stop.load(std::sync::atomic::Ordering::Relaxed) { return; }
         if sheet.ignored_errors.contains(&(key.row, key.col)) { continue; }
-        let kind = match &cell.value {
+        let kind = match cell.value().as_ref() {
             Value::Text(t) => error_kind(t),
             Value::Number(_) if wb.styles.get(sheet.style_of(key.row,key.col)).format.trim() == "@" => Some(IssueKind::NumberAsText),
             _ => None,

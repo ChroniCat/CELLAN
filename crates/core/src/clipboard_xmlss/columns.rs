@@ -324,7 +324,8 @@ pub fn sparse_column_xmlss(wb: &Workbook, si: usize, rect: (u32, u32, u32, u32))
                     write!(body, " ss:MergeDown=\"{}\"", z - a).unwrap();
                 }
             }
-            write_cell(&mut body, sh.get(r, c), r, c, wb.styles.quote_of(id));
+            let cell = sh.get(r, c);
+            write_cell(&mut body, cell.as_deref(), r, c, wb.styles.quote_of(id));
         }
         body.push_str("</Row>");
     }

@@ -2197,9 +2197,11 @@ impl<'a> Calc<'a> {
         {
             return v.clone();
         }
-        let cell = match self.wb.sheets.get(si).and_then(|s| s.get(r, c)) {
-            Some(c) if !c.is_blank() => c,
-            _ => return FValue::Empty,
+        let cell = match self.wb.sheets.get(si).and_then(|s| s.get_view(r, c)) {
+            None => return FValue::Empty,
+            Some(crate::store::CellView::Number(n)) => return FValue::Number(n),
+            Some(crate::store::CellView::Value(v)) => return to_fvalue(v),
+            Some(crate::store::CellView::Cell(c)) => c,
         };
         let Some(f_arc) = cell.formula.as_ref() else {
             return to_fvalue(&cell.value);
@@ -2430,8 +2432,11 @@ impl<'a> Calc<'a> {
         let (r1, r2, col) = (r1_i as u32, r2_i as u32, c1_i as u32);
         let pages = sheet.cf_pages((r1, col, r2, col));
         for p in &pages {
+            let crate::store::ColSlab::Mixed(cs) = p.cells.as_ref() else {
+                continue; // O(1) skip: Numbers and Values slabs never contain formulas!
+            };
             for ro in p.start..p.end {
-                let cell = &p.cells[ro];
+                let cell = &cs[ro];
                 if cell.formula.is_some() {
                     let abs_row = p.page * crate::store::PAGE_ROWS + ro as u32;
                     let k = (si, abs_row, col);
@@ -2452,28 +2457,57 @@ impl<'a> Calc<'a> {
         let mut values = vec![FValue::Empty; length];
         for p in &pages {
             let page_base = p.page * crate::store::PAGE_ROWS;
-            for ro in p.start..p.end {
-                let cell = &p.cells[ro];
-                if cell.is_blank() {
-                    continue;
-                }
-                let abs_row = page_base + ro as u32;
-                let idx = (abs_row - r1) as usize;
-                let fv = if cell.formula.is_some() {
-                    let k = (si, abs_row, col);
-                    if let Some(m) = self.get_memo(k) {
-                        m.scalar()
-                    } else if let Some(pv) = self.parallel_values
-                        && let Some(val) = pv.get(k)
-                    {
-                        val.scalar()
+            match p.cells.as_ref() {
+                crate::store::ColSlab::Numbers(ns) => {
+                    let span = p.end - p.start;
+                    let dst_base = (page_base + p.start as u32 - r1) as usize;
+                    if crate::store::NumberSlab::all_present_in(&ns.present, p.start, span) {
+                        for (i, &n) in ns.values[p.start..p.end].iter().enumerate() {
+                            values[dst_base + i] = FValue::Number(n);
+                        }
                     } else {
-                        to_fvalue(&cell.value)
+                        for ro in p.start..p.end {
+                            if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                                let idx = (page_base + ro as u32 - r1) as usize;
+                                values[idx] = FValue::Number(ns.values[ro]);
+                            }
+                        }
                     }
-                } else {
-                    to_fvalue(&cell.value)
-                };
-                values[idx] = fv;
+                }
+                crate::store::ColSlab::Values(vs) => {
+                    for ro in p.start..p.end {
+                        let v = &vs[ro];
+                        if !v.is_empty() {
+                            let idx = (page_base + ro as u32 - r1) as usize;
+                            values[idx] = to_fvalue(v);
+                        }
+                    }
+                }
+                crate::store::ColSlab::Mixed(cs) => {
+                    for ro in p.start..p.end {
+                        let cell = &cs[ro];
+                        if cell.is_blank() {
+                            continue;
+                        }
+                        let abs_row = page_base + ro as u32;
+                        let idx = (abs_row - r1) as usize;
+                        let fv = if cell.formula.is_some() {
+                            let k = (si, abs_row, col);
+                            if let Some(m) = self.get_memo(k) {
+                                m.scalar()
+                            } else if let Some(pv) = self.parallel_values
+                                && let Some(val) = pv.get(k)
+                            {
+                                val.scalar()
+                            } else {
+                                to_fvalue(&cell.value)
+                            }
+                        } else {
+                            to_fvalue(&cell.value)
+                        };
+                        values[idx] = fv;
+                    }
+                }
             }
         }
         self.range_reads += length;
@@ -2931,9 +2965,7 @@ impl<'a> Calc<'a> {
                     Ok(idx) => {
                         let r = self.r_row(re).max(0) as u32;
                         let c = self.r_col(re).max(0) as u32;
-                        let formula = self.wb.sheets[idx]
-                            .get(r, c)
-                            .and_then(|cell| cell.formula.as_deref());
+                        let formula = self.wb.sheets[idx].formula_of(r, c);
                         match formula {
                             Some(f) if id == FuncId::FormulaText => {
                                 FValue::Text(format!("={}", f.trim_start_matches('=')).into())
@@ -4257,8 +4289,11 @@ impl<'a> Calc<'a> {
         let (r1, r2, col) = (r1_i as u32, r2_i as u32, c1_i as u32);
         let pages = sheet.cf_pages((r1, col, r2, col));
         for p in &pages {
+            let crate::store::ColSlab::Mixed(cs) = p.cells.as_ref() else {
+                continue; // O(1) skip: Numbers and Values slabs never contain formulas!
+            };
             for ro in p.start..p.end {
-                let cell = &p.cells[ro];
+                let cell = &cs[ro];
                 if cell.formula.is_some() {
                     let abs_row = p.page * crate::store::PAGE_ROWS + ro as u32;
                     let k = (si, abs_row, col);
@@ -4283,64 +4318,133 @@ impl<'a> Calc<'a> {
         let mut max_v = f64::NEG_INFINITY;
         for p in &pages {
             let page_base = p.page * crate::store::PAGE_ROWS;
-            for ro in p.start..p.end {
-                let cell = &p.cells[ro];
-                if cell.is_blank() {
-                    continue;
-                }
-                if cell.formula.is_none() {
-                    match &cell.value {
-                        crate::Value::Empty => {}
-                        crate::Value::Number(n) => {
-                            non_empty += 1;
-                            num_count += 1;
-                            sum += *n;
-                            min_v = min_v.min(*n);
-                            max_v = max_v.max(*n);
-                        }
-                        crate::Value::Error(e) => {
-                            if id == FuncId::CountA {
-                                non_empty += 1;
-                            } else {
-                                self.range_reads += len;
-                                return Some(FValue::Error(*e));
+            match p.cells.as_ref() {
+                crate::store::ColSlab::Numbers(ns) => {
+                    let span = p.end - p.start;
+                    if id == FuncId::CountA {
+                        non_empty +=
+                            crate::store::NumberSlab::present_count_in(&ns.present, p.start, span);
+                    } else if crate::store::NumberSlab::all_present_in(&ns.present, p.start, span) {
+                        non_empty += span;
+                        num_count += span;
+                        match id {
+                            FuncId::Sum | FuncId::Average => {
+                                let mut s = 0.0f64;
+                                for &n in &ns.values[p.start..p.end] {
+                                    s += n;
+                                }
+                                sum += s;
+                            }
+                            FuncId::Max => {
+                                for &n in &ns.values[p.start..p.end] {
+                                    max_v = max_v.max(n);
+                                }
+                            }
+                            _ => {
+                                for &n in &ns.values[p.start..p.end] {
+                                    min_v = min_v.min(n);
+                                }
                             }
                         }
-                        _ => {
-                            non_empty += 1;
+                    } else {
+                        for ro in p.start..p.end {
+                            if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                                let n = ns.values[ro];
+                                non_empty += 1;
+                                num_count += 1;
+                                sum += n;
+                                min_v = min_v.min(n);
+                                max_v = max_v.max(n);
+                            }
                         }
                     }
-                } else {
-                    let abs_row = page_base + ro as u32;
-                    let k = (si, abs_row, col);
-                    let fv = if let Some(m) = self.get_memo(k) {
-                        m.scalar()
-                    } else if let Some(pv) = self.parallel_values
-                        && let Some(val) = pv.get(k)
-                    {
-                        val.scalar()
-                    } else {
-                        to_fvalue(&cell.value)
-                    };
-                    match fv {
-                        FValue::Empty => {}
-                        FValue::Number(n) => {
-                            non_empty += 1;
-                            num_count += 1;
-                            sum += n;
-                            min_v = min_v.min(n);
-                            max_v = max_v.max(n);
-                        }
-                        FValue::Error(e) => {
-                            if id == FuncId::CountA {
+                }
+                crate::store::ColSlab::Values(vs) => {
+                    for val in &vs[p.start..p.end] {
+                        match val {
+                            crate::Value::Empty => {}
+                            crate::Value::Number(n) => {
                                 non_empty += 1;
-                            } else {
-                                self.range_reads += len;
-                                return Some(FValue::Error(e));
+                                num_count += 1;
+                                sum += *n;
+                                min_v = min_v.min(*n);
+                                max_v = max_v.max(*n);
+                            }
+                            crate::Value::Error(e) => {
+                                if id == FuncId::CountA {
+                                    non_empty += 1;
+                                } else {
+                                    self.range_reads += len;
+                                    return Some(FValue::Error(*e));
+                                }
+                            }
+                            _ => {
+                                non_empty += 1;
                             }
                         }
-                        _ => {
-                            non_empty += 1;
+                    }
+                }
+                crate::store::ColSlab::Mixed(cs) => {
+                    for ro in p.start..p.end {
+                        let cell = &cs[ro];
+                        if cell.is_blank() {
+                            continue;
+                        }
+                        if cell.formula.is_none() {
+                            match &cell.value {
+                                crate::Value::Empty => {}
+                                crate::Value::Number(n) => {
+                                    non_empty += 1;
+                                    num_count += 1;
+                                    sum += *n;
+                                    min_v = min_v.min(*n);
+                                    max_v = max_v.max(*n);
+                                }
+                                crate::Value::Error(e) => {
+                                    if id == FuncId::CountA {
+                                        non_empty += 1;
+                                    } else {
+                                        self.range_reads += len;
+                                        return Some(FValue::Error(*e));
+                                    }
+                                }
+                                _ => {
+                                    non_empty += 1;
+                                }
+                            }
+                        } else {
+                            let abs_row = page_base + ro as u32;
+                            let k = (si, abs_row, col);
+                            let fv = if let Some(m) = self.get_memo(k) {
+                                m.scalar()
+                            } else if let Some(pv) = self.parallel_values
+                                && let Some(val) = pv.get(k)
+                            {
+                                val.scalar()
+                            } else {
+                                to_fvalue(&cell.value)
+                            };
+                            match fv {
+                                FValue::Empty => {}
+                                FValue::Number(n) => {
+                                    non_empty += 1;
+                                    num_count += 1;
+                                    sum += n;
+                                    min_v = min_v.min(n);
+                                    max_v = max_v.max(n);
+                                }
+                                FValue::Error(e) => {
+                                    if id == FuncId::CountA {
+                                        non_empty += 1;
+                                    } else {
+                                        self.range_reads += len;
+                                        return Some(FValue::Error(e));
+                                    }
+                                }
+                                _ => {
+                                    non_empty += 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -4390,6 +4494,36 @@ impl<'a> Calc<'a> {
         let pages = sheet.cf_pages((r1, col, r2, col));
         let build_text_index = crit.indexable() && crit.num.is_none() && len <= 2_097_152;
         let skip_numbers_fast = crit.num.is_none() && crit.op == "=";
+        let numbers_const_match = crit.num.is_none().then(|| crit.matches_number(0.0));
+
+        // Ultra-fast single-thread O(pages) POPCNT path when ALL slabs are `ColSlab::Numbers`
+        // and the criterion is a text/non-numeric criterion (`numbers_const_match.is_some()`):
+        // counts 200k numeric rows via hardware POPCNT without loading a single f64 or spawning threads!
+        if let Some(match_all_nums) = numbers_const_match
+            && pages.iter().all(|p| p.cells.is_numbers())
+        {
+            let mut total_non_blank = 0usize;
+            for p in &pages {
+                if let crate::store::ColSlab::Numbers(ns) = p.cells.as_ref() {
+                    total_non_blank += crate::store::NumberSlab::present_count_in(
+                        &ns.present,
+                        p.start,
+                        p.end - p.start,
+                    );
+                }
+            }
+            let mut total_count = if match_all_nums { total_non_blank } else { 0 };
+            let blank_rows = len - total_non_blank;
+            if crit.matches(&FValue::Empty) {
+                total_count += blank_rows;
+            }
+            if build_text_index {
+                self.count_indexes
+                    .insert_streamed_text(gk, 0, FxHashMap::default(), blank_rows);
+            }
+            self.range_reads += len;
+            return Some(FValue::number(total_count as f64));
+        }
 
         // Multi-core parallel page scan for large single-column scans (>= 16k rows) when no
         // per-Calc memo/parallel_values/scope lookups are needed (e.g. 200k numeric column scan).
@@ -4439,52 +4573,134 @@ impl<'a> Calc<'a> {
 
                         for p in &pages_slice[ps..pe] {
                             let page_base = p.page * crate::store::PAGE_ROWS;
-                            for ro in p.start..p.end {
-                                let cell = &p.cells[ro];
-                                if cell.formula.is_none() {
-                                    match &cell.value {
-                                        crate::Value::Empty => continue,
-                                        crate::Value::Number(_) if skip_numbers_fast => {
-                                            non_blank_seen += 1;
-                                            continue;
+                            match p.cells.as_ref() {
+                                crate::store::ColSlab::Numbers(ns) => {
+                                    let span = p.end - p.start;
+                                    if let Some(m) = numbers_const_match {
+                                        let cnt = crate::store::NumberSlab::present_count_in(
+                                            &ns.present,
+                                            p.start,
+                                            span,
+                                        );
+                                        non_blank_seen += cnt;
+                                        if m {
+                                            count += cnt;
                                         }
-                                        _ => {}
-                                    }
-                                    non_blank_seen += 1;
-                                    if crit.matches_value(&cell.value) {
-                                        count += 1;
-                                    }
-                                    if build_text_index && !text_overflow {
-                                        match &cell.value {
-                                            crate::Value::Number(_) | crate::Value::Error(_) => {}
-                                            crate::Value::Empty => empty_value_seen += 1,
-                                            crate::Value::Text(s) => {
-                                                let row_off = (page_base + ro as u32 - r1) as usize;
-                                                let key_s = if s.is_ascii() {
-                                                    s.to_ascii_lowercase()
-                                                } else {
-                                                    s.to_string()
-                                                };
-                                                text_map.entry(key_s).or_default().push(row_off);
-                                                text_entries += 1;
-                                                if text_entries > 2_097_152 {
-                                                    text_overflow = true;
+                                    } else if crate::store::NumberSlab::all_present_in(
+                                        &ns.present,
+                                        p.start,
+                                        span,
+                                    ) {
+                                        non_blank_seen += span;
+                                        for &n in &ns.values[p.start..p.end] {
+                                            if crit.matches_number(n) {
+                                                count += 1;
+                                            }
+                                        }
+                                    } else {
+                                        for ro in p.start..p.end {
+                                            if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                                                non_blank_seen += 1;
+                                                if crit.matches_number(ns.values[ro]) {
+                                                    count += 1;
                                                 }
                                             }
-                                            crate::Value::Bool(b) => {
-                                                let row_off = (page_base + ro as u32 - r1) as usize;
-                                                text_map
-                                                    .entry(if *b { "true".to_string() } else { "false".to_string() })
-                                                    .or_default()
-                                                    .push(row_off);
-                                                text_entries += 1;
+                                        }
+                                    }
+                                }
+                                crate::store::ColSlab::Values(vs) => {
+                                    for ro in p.start..p.end {
+                                        let val = &vs[ro];
+                                        match val {
+                                            crate::Value::Empty => continue,
+                                            crate::Value::Number(_) if skip_numbers_fast => {
+                                                non_blank_seen += 1;
+                                                continue;
+                                            }
+                                            _ => {}
+                                        }
+                                        non_blank_seen += 1;
+                                        if crit.matches_value(val) {
+                                            count += 1;
+                                        }
+                                        if build_text_index && !text_overflow {
+                                            match val {
+                                                crate::Value::Number(_) | crate::Value::Error(_) => {}
+                                                crate::Value::Empty => empty_value_seen += 1,
+                                                crate::Value::Text(s) => {
+                                                    let row_off = (page_base + ro as u32 - r1) as usize;
+                                                    let key_s = if s.is_ascii() {
+                                                        s.to_ascii_lowercase()
+                                                    } else {
+                                                        s.to_string()
+                                                    };
+                                                    text_map.entry(key_s).or_default().push(row_off);
+                                                    text_entries += 1;
+                                                    if text_entries > 2_097_152 {
+                                                        text_overflow = true;
+                                                    }
+                                                }
+                                                crate::Value::Bool(b) => {
+                                                    let row_off = (page_base + ro as u32 - r1) as usize;
+                                                    text_map
+                                                        .entry(if *b { "true".to_string() } else { "false".to_string() })
+                                                        .or_default()
+                                                        .push(row_off);
+                                                    text_entries += 1;
+                                                }
                                             }
                                         }
                                     }
-                                } else {
-                                    // Formula cell with no memo/scope -> abort parallel stream and fall back
-                                    aborted.store(true, Ordering::Relaxed);
-                                    return;
+                                }
+                                crate::store::ColSlab::Mixed(cs) => {
+                                    for ro in p.start..p.end {
+                                        let cell = &cs[ro];
+                                        if cell.formula.is_none() {
+                                            match &cell.value {
+                                                crate::Value::Empty => continue,
+                                                crate::Value::Number(_) if skip_numbers_fast => {
+                                                    non_blank_seen += 1;
+                                                    continue;
+                                                }
+                                                _ => {}
+                                            }
+                                            non_blank_seen += 1;
+                                            if crit.matches_value(&cell.value) {
+                                                count += 1;
+                                            }
+                                            if build_text_index && !text_overflow {
+                                                match &cell.value {
+                                                    crate::Value::Number(_) | crate::Value::Error(_) => {}
+                                                    crate::Value::Empty => empty_value_seen += 1,
+                                                    crate::Value::Text(s) => {
+                                                        let row_off = (page_base + ro as u32 - r1) as usize;
+                                                        let key_s = if s.is_ascii() {
+                                                            s.to_ascii_lowercase()
+                                                        } else {
+                                                            s.to_string()
+                                                        };
+                                                        text_map.entry(key_s).or_default().push(row_off);
+                                                        text_entries += 1;
+                                                        if text_entries > 2_097_152 {
+                                                            text_overflow = true;
+                                                        }
+                                                    }
+                                                    crate::Value::Bool(b) => {
+                                                        let row_off = (page_base + ro as u32 - r1) as usize;
+                                                        text_map
+                                                            .entry(if *b { "true".to_string() } else { "false".to_string() })
+                                                            .or_default()
+                                                            .push(row_off);
+                                                        text_entries += 1;
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // Formula cell with no memo/scope -> abort parallel stream and fall back
+                                            aborted.store(true, Ordering::Relaxed);
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4557,87 +4773,163 @@ impl<'a> Calc<'a> {
 
         for p in &pages {
             let page_base = p.page * crate::store::PAGE_ROWS;
-            for ro in p.start..p.end {
-                let cell = &p.cells[ro];
-                if cell.is_blank() {
-                    continue;
-                }
-                non_blank_seen += 1;
-                if cell.formula.is_none() {
-                    if skip_numbers_fast && matches!(cell.value, crate::Value::Number(_)) {
-                        continue;
-                    }
-                    if crit.matches_value(&cell.value) {
-                        count += 1;
-                    }
-                    if build_text_index && !text_overflow {
-                        match &cell.value {
-                            crate::Value::Number(_) | crate::Value::Error(_) => {}
-                            crate::Value::Empty => empty_value_seen += 1,
-                            crate::Value::Text(s) => {
-                                let row_off = (page_base + ro as u32 - r1) as usize;
-                                let key_s = if s.is_ascii() {
-                                    s.to_ascii_lowercase()
-                                } else {
-                                    s.to_string()
-                                };
-                                text_map.entry(key_s).or_default().push(row_off);
-                                text_entries += 1;
-                                if text_entries > 2_097_152 {
-                                    text_overflow = true;
-                                }
+            match p.cells.as_ref() {
+                crate::store::ColSlab::Numbers(ns) => {
+                    let span = p.end - p.start;
+                    if let Some(m) = numbers_const_match {
+                        let cnt = crate::store::NumberSlab::present_count_in(
+                            &ns.present,
+                            p.start,
+                            span,
+                        );
+                        non_blank_seen += cnt;
+                        if m {
+                            count += cnt;
+                        }
+                    } else if crate::store::NumberSlab::all_present_in(&ns.present, p.start, span) {
+                        non_blank_seen += span;
+                        for &n in &ns.values[p.start..p.end] {
+                            if crit.matches_number(n) {
+                                count += 1;
                             }
-                            crate::Value::Bool(b) => {
-                                let row_off = (page_base + ro as u32 - r1) as usize;
-                                text_map
-                                    .entry(if *b { "true".to_string() } else { "false".to_string() })
-                                    .or_default()
-                                    .push(row_off);
-                                text_entries += 1;
+                        }
+                    } else {
+                        for ro in p.start..p.end {
+                            if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                                non_blank_seen += 1;
+                                if crit.matches_number(ns.values[ro]) {
+                                    count += 1;
+                                }
                             }
                         }
                     }
-                } else {
-                    let abs_row = page_base + ro as u32;
-                    let k = (si, abs_row, col);
-                    let fv = if let Some(m) = self.get_memo(k) {
-                        m.scalar()
-                    } else if let Some(pv) = self.parallel_values
-                        && let Some(val) = pv.get(k)
-                    {
-                        val.scalar()
-                    } else if self.outside_scope(k) && !callable_cache_candidate(&cell.value) {
-                        to_fvalue(&cell.value)
-                    } else {
-                        return None;
-                    };
-                    if crit.matches(&fv) {
-                        count += 1;
-                    }
-                    if build_text_index && !text_overflow {
-                        match fv {
-                            FValue::Number(_) | FValue::Error(_) | FValue::Array(_) | FValue::Lambda(_) => {}
-                            FValue::Empty => empty_value_seen += 1,
-                            FValue::Text(s) => {
-                                let row_off = (abs_row - r1) as usize;
-                                let key_s = if s.is_ascii() {
-                                    s.to_ascii_lowercase()
-                                } else {
-                                    s.to_string()
-                                };
-                                text_map.entry(key_s).or_default().push(row_off);
-                                text_entries += 1;
-                                if text_entries > 2_097_152 {
-                                    text_overflow = true;
+                }
+                crate::store::ColSlab::Values(vs) => {
+                    for ro in p.start..p.end {
+                        let val = &vs[ro];
+                        if val.is_empty() {
+                            continue;
+                        }
+                        non_blank_seen += 1;
+                        if skip_numbers_fast && matches!(val, crate::Value::Number(_)) {
+                            continue;
+                        }
+                        if crit.matches_value(val) {
+                            count += 1;
+                        }
+                        if build_text_index && !text_overflow {
+                            match val {
+                                crate::Value::Number(_) | crate::Value::Error(_) => {}
+                                crate::Value::Empty => empty_value_seen += 1,
+                                crate::Value::Text(s) => {
+                                    let row_off = (page_base + ro as u32 - r1) as usize;
+                                    let key_s = if s.is_ascii() {
+                                        s.to_ascii_lowercase()
+                                    } else {
+                                        s.to_string()
+                                    };
+                                    text_map.entry(key_s).or_default().push(row_off);
+                                    text_entries += 1;
+                                    if text_entries > 2_097_152 {
+                                        text_overflow = true;
+                                    }
+                                }
+                                crate::Value::Bool(b) => {
+                                    let row_off = (page_base + ro as u32 - r1) as usize;
+                                    text_map
+                                        .entry(if *b { "true".to_string() } else { "false".to_string() })
+                                        .or_default()
+                                        .push(row_off);
+                                    text_entries += 1;
                                 }
                             }
-                            FValue::Bool(b) => {
-                                let row_off = (abs_row - r1) as usize;
-                                text_map
-                                    .entry(if b { "true".to_string() } else { "false".to_string() })
-                                    .or_default()
-                                    .push(row_off);
-                                text_entries += 1;
+                        }
+                    }
+                }
+                crate::store::ColSlab::Mixed(cs) => {
+                    for ro in p.start..p.end {
+                        let cell = &cs[ro];
+                        if cell.is_blank() {
+                            continue;
+                        }
+                        non_blank_seen += 1;
+                        if cell.formula.is_none() {
+                            if skip_numbers_fast && matches!(cell.value, crate::Value::Number(_)) {
+                                continue;
+                            }
+                            if crit.matches_value(&cell.value) {
+                                count += 1;
+                            }
+                            if build_text_index && !text_overflow {
+                                match &cell.value {
+                                    crate::Value::Number(_) | crate::Value::Error(_) => {}
+                                    crate::Value::Empty => empty_value_seen += 1,
+                                    crate::Value::Text(s) => {
+                                        let row_off = (page_base + ro as u32 - r1) as usize;
+                                        let key_s = if s.is_ascii() {
+                                            s.to_ascii_lowercase()
+                                        } else {
+                                            s.to_string()
+                                        };
+                                        text_map.entry(key_s).or_default().push(row_off);
+                                        text_entries += 1;
+                                        if text_entries > 2_097_152 {
+                                            text_overflow = true;
+                                        }
+                                    }
+                                    crate::Value::Bool(b) => {
+                                        let row_off = (page_base + ro as u32 - r1) as usize;
+                                        text_map
+                                            .entry(if *b { "true".to_string() } else { "false".to_string() })
+                                            .or_default()
+                                            .push(row_off);
+                                        text_entries += 1;
+                                    }
+                                }
+                            }
+                        } else {
+                            let abs_row = page_base + ro as u32;
+                            let k = (si, abs_row, col);
+                            let fv = if let Some(m) = self.get_memo(k) {
+                                m.scalar()
+                            } else if let Some(pv) = self.parallel_values
+                                && let Some(val) = pv.get(k)
+                            {
+                                val.scalar()
+                            } else if self.outside_scope(k) && !callable_cache_candidate(&cell.value) {
+                                to_fvalue(&cell.value)
+                            } else {
+                                return None;
+                            };
+                            if crit.matches(&fv) {
+                                count += 1;
+                            }
+                            if build_text_index && !text_overflow {
+                                match fv {
+                                    FValue::Number(_) | FValue::Error(_) | FValue::Array(_) | FValue::Lambda(_) => {}
+                                    FValue::Empty => empty_value_seen += 1,
+                                    FValue::Text(s) => {
+                                        let row_off = (abs_row - r1) as usize;
+                                        let key_s = if s.is_ascii() {
+                                            s.to_ascii_lowercase()
+                                        } else {
+                                            s.to_string()
+                                        };
+                                        text_map.entry(key_s).or_default().push(row_off);
+                                        text_entries += 1;
+                                        if text_entries > 2_097_152 {
+                                            text_overflow = true;
+                                        }
+                                    }
+                                    FValue::Bool(b) => {
+                                        let row_off = (abs_row - r1) as usize;
+                                        text_map
+                                            .entry(if b { "true".to_string() } else { "false".to_string() })
+                                            .or_default()
+                                            .push(row_off);
+                                        text_entries += 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -5270,7 +5562,7 @@ impl<'a> Calc<'a> {
             for j in 0..cols {
                 let col = origin.1 + j as u32;
                 let index = i * cols + j;
-                if hidden || (skip_subtotals && sheet.get(row, col).and_then(|c| c.formula.as_deref())
+                if hidden || (skip_subtotals && sheet.formula_of(row, col)
                     .is_some_and(|src| contains_subtotal(self.wb, si, src, row, col))) {
                     // Preserve shared materialized ranges until a value is actually omitted.
                     out.get_or_insert_with(|| values[..index].to_vec());
@@ -5780,8 +6072,7 @@ pub(crate) fn probe_blocked_spill_shape(wb: &Workbook, key: deps::CellKey) -> Sp
     let Some(f) = wb
         .sheets
         .get(si)
-        .and_then(|s| s.get(r, c))
-        .and_then(|cell| cell.formula.as_deref())
+        .and_then(|s| s.formula_of(r, c))
     else {
         return SpillProbe::NotSpillAnchor;
     };

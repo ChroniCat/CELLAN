@@ -31,7 +31,8 @@ pub struct CellDelta {
 impl CellDelta {
     fn can_replay(&self, sheet: &Sheet, redo: bool, guard: &mut impl FnMut(usize,u32,u32,&Cell) -> bool) -> bool {
         let blank = Cell::default();
-        let current = sheet.get(self.row, self.col).unwrap_or(&blank);
+        let current = sheet.get(self.row, self.col);
+        let current = current.as_deref().unwrap_or(&blank);
         let (expected, style) = if redo { (&self.before,self.before_style) } else { (&self.after,self.after_style) };
         current.same_input(expected)
             && (self.before_style == self.after_style || sheet.style_of(self.row,self.col) == style)
@@ -61,8 +62,8 @@ pub fn snapshot_sheet(sheet: &Sheet, idx: usize) -> SheetSnapshot {
     SheetSnapshot {
         sheet: idx,
         cells: sheet
-            .iter()
-            .map(|(k, c)| (k.row, k.col, c.clone(), sheet.style_of(k.row, k.col)))
+            .iter_views()
+            .map(|(k, c)| (k.row, k.col, c.to_cell(), sheet.style_of(k.row, k.col)))
             .collect(),
         merges: sheet.merges.to_vec(),
     }
@@ -842,9 +843,11 @@ impl CowBatchAction {
             }
             let has_cell = self.cell_mask.contains(&k);
             let has_style = self.style_mask.contains(&k);
-            let current = sheet.get(k.row, k.col).unwrap_or(&blank);
+            let current = sheet.get(k.row, k.col);
+            let current = current.as_deref().unwrap_or(&blank);
             let ok_cell = !has_cell || {
-                let expected = exp_cells.get(k.row, k.col).unwrap_or(&blank);
+                let expected = exp_cells.get(k.row, k.col);
+                let expected = expected.as_deref().unwrap_or(&blank);
                 current.same_input(expected)
             };
             let ok_style = !has_style || {
@@ -918,10 +921,29 @@ impl CowBatchAction {
             sheet.set_col_style(c, tgt);
             axis_replayed = true;
             let mut col_cells = Vec::new();
-            for (base_row, slice) in sheet.cells().column_slices(0, u32::MAX, c) {
-                for (i, cell) in slice.iter().enumerate() {
-                    if !cell.is_blank() {
-                        col_cells.push(base_row + i as u32);
+            for (base_row, slice) in sheet.cells().column_typed_slices(0, u32::MAX, c) {
+                match slice {
+                    crate::store::ColSlice::Numbers { present, start, values } => {
+                        for i in 0..values.len() {
+                            let ro = start + i;
+                            if (present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                                col_cells.push(base_row + i as u32);
+                            }
+                        }
+                    }
+                    crate::store::ColSlice::Values(vs) => {
+                        for (i, v) in vs.iter().enumerate() {
+                            if !v.is_empty() {
+                                col_cells.push(base_row + i as u32);
+                            }
+                        }
+                    }
+                    crate::store::ColSlice::Mixed(cs) => {
+                        for (i, cell) in cs.iter().enumerate() {
+                            if !cell.is_blank() {
+                                col_cells.push(base_row + i as u32);
+                            }
+                        }
                     }
                 }
             }
@@ -971,7 +993,7 @@ impl CowBatchAction {
                         sheet.cleared.remove_if_present(&k);
                     }
                 } else if let Some(tgt) = tgt_cells.get(k.row, k.col) {
-                    sheet.set(k.row, k.col, tgt.clone());
+                    sheet.set(k.row, k.col, tgt.into_owned());
                 } else {
                     sheet.remove(k.row, k.col);
                 }
@@ -1181,7 +1203,7 @@ impl StructureSnapshot {
                 ForeignReferences {
                     sheet: scope.sheet,
                     identity: sheet.identity,
-                    cells: scope.cells.iter().map(|(key, _)| (*key, sheet.get(key.row, key.col).cloned().unwrap_or_default())).collect(),
+                    cells: scope.cells.iter().map(|(key, _)| (*key, sheet.get(key.row, key.col).map(|c| c.into_owned()).unwrap_or_default())).collect(),
                     cf: scope.cf.as_ref().map(|_| sheet.cf.clone()),
                     dv: scope.dv.as_ref().map(|_| sheet.dv.clone()),
                     charts: scope.charts.as_ref().map(|_| sheet.charts.clone()),
@@ -1238,7 +1260,7 @@ fn same_input(a: Option<&Cell>, b: Option<&Cell>) -> bool {
 /// A literal written into a previous tail, even the same value, is user input.
 fn sheet_inputs_match(a: &Sheet, b: &Sheet) -> bool {
     if a.cell_version() == b.cell_version() && a.spilled == b.spilled { return true; }
-    fn input(sheet: &Sheet, k: CellRef) -> Option<&Cell> {
+    fn input<'a>(sheet: &'a Sheet, k: CellRef) -> Option<std::borrow::Cow<'a, Cell>> {
         if sheet.spilled.contains(&k) { None } else { sheet.get(k.row, k.col) }
     }
     a.changed_cells(b).chain(b.changed_cells(a)).chain(a.spilled.symmetric_difference(&b.spilled).copied())
@@ -1249,8 +1271,10 @@ fn sheet_inputs_match(a: &Sheet, b: &Sheet) -> bool {
                 && b.arrays.iter().any(|&(anchor, (r1, c1, r2, c2))| {
                     anchor != k && !b.spill_shapes.contains_key(&anchor)
                         && (r1..=r2).contains(&k.row) && (c1..=c2).contains(&k.col)
-                }) && b.get(k.row, k.col).is_none_or(|cell| cell.formula.is_none());
-            legacy_cache || same_input(input(a, k), input(b, k))
+                }) && b.formula_of(k.row, k.col).is_none();
+            let ia = input(a, k);
+            let ib = input(b, k);
+            legacy_cache || same_input(ia.as_deref(), ib.as_deref())
         })
 }
 
@@ -1280,7 +1304,10 @@ impl StructureSnapshot {
             && self.foreign.iter().all(|expected| {
                 let Some(sheet) = wb.sheets.get(expected.sheet) else { return false };
                 sheet.identity == expected.identity
-                    && expected.cells.iter().all(|(k, cell)| same_input(sheet.get(k.row, k.col), (!cell.is_blank()).then_some(cell)))
+                    && expected.cells.iter().all(|(k, cell)| {
+                        let cur = sheet.get(k.row, k.col);
+                        same_input(cur.as_deref(), (!cell.is_blank()).then_some(cell))
+                    })
                     && expected.cf.as_ref().is_none_or(|cf| &sheet.cf == cf)
                     && expected.dv.as_ref().is_none_or(|dv| &sheet.dv == dv)
                     && expected.charts.as_ref().is_none_or(|ch| chart_refs_match(&sheet.charts, ch))
@@ -1373,12 +1400,37 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
         changed_cols.sort_unstable();
         changed_cols.dedup();
         for c in changed_cols {
-            for (base_row, slice) in target.cells().column_slices(0, u32::MAX, c) {
-                for (i, cell) in slice.iter().enumerate() {
-                    if !cell.is_blank() {
-                        let r = base_row + i as u32;
-                        if target.style_of(r, c) != current.style_of(r, c) {
-                            touched.push((snap.sheet, r, c));
+            for (base_row, slice) in target.cells().column_typed_slices(0, u32::MAX, c) {
+                match slice {
+                    crate::store::ColSlice::Numbers { present, start, values } => {
+                        for i in 0..values.len() {
+                            let ro = start + i;
+                            if (present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                                let r = base_row + i as u32;
+                                if target.style_of(r, c) != current.style_of(r, c) {
+                                    touched.push((snap.sheet, r, c));
+                                }
+                            }
+                        }
+                    }
+                    crate::store::ColSlice::Values(vs) => {
+                        for (i, v) in vs.iter().enumerate() {
+                            if !v.is_empty() {
+                                let r = base_row + i as u32;
+                                if target.style_of(r, c) != current.style_of(r, c) {
+                                    touched.push((snap.sheet, r, c));
+                                }
+                            }
+                        }
+                    }
+                    crate::store::ColSlice::Mixed(cs) => {
+                        for (i, cell) in cs.iter().enumerate() {
+                            if !cell.is_blank() {
+                                let r = base_row + i as u32;
+                                if target.style_of(r, c) != current.style_of(r, c) {
+                                    touched.push((snap.sheet, r, c));
+                                }
+                            }
                         }
                     }
                 }
@@ -2083,7 +2135,7 @@ pub fn capture(sheet: &Sheet, sheet_idx: usize, keys: &[(u32, u32)]) -> Vec<Cell
             sheet: sheet_idx,
             row: *r,
             col: *c,
-            before: sheet.get(*r, *c).cloned().unwrap_or(Cell {
+            before: sheet.get(*r, *c).map(|c| c.into_owned()).unwrap_or(Cell {
                 value: crate::model::Value::Empty,
                 formula: None,
             }),
@@ -2109,10 +2161,10 @@ mod tests {
     }
 
     fn edit(wb: &mut Workbook, r: u32, c: u32, v: f64) -> Action {
-        let before = wb.sheets[0].get(r, c).cloned().unwrap();
+        let before = wb.sheets[0].get(r, c).map(|c| c.into_owned()).unwrap();
         let bs = wb.sheets[0].style_of(r, c);
         wb.sheets[0].set(r, c, Cell { value: Value::Number(v), formula: None });
-        let after = wb.sheets[0].get(r, c).cloned().unwrap();
+        let after = wb.sheets[0].get(r, c).map(|c| c.into_owned()).unwrap();
         Action {
             label: "编辑".into(),
             merges: None,
@@ -2343,7 +2395,7 @@ fn undo_values_eq(a: &crate::model::Value, b: &crate::model::Value) -> bool {
 /// 把 capture 出来的「体检表」补上 after，并去掉没变化的格子（零字符串格式化分配）
 pub fn finish(mut deltas: Vec<CellDelta>, sheet: &Sheet) -> Vec<CellDelta> {
     deltas.retain_mut(|d| {
-        let cur = sheet.get(d.row, d.col).cloned().unwrap_or(Cell {
+        let cur = sheet.get(d.row, d.col).map(|c| c.into_owned()).unwrap_or(Cell {
             value: crate::model::Value::Empty,
             formula: None,
         });

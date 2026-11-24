@@ -189,7 +189,7 @@ fn load_legacy_sheet(
             for (row, col, f) in range.cells().filter(|(_, _, f)| !f.is_empty()) {
                 let r = r0 + row as u32;
                 let c = c0 + col as u32;
-                let mut cell = sheet.get(r, c).cloned().unwrap_or_default();
+                let mut cell = sheet.get(r, c).map(|c| c.into_owned()).unwrap_or_default();
                 let f = f.strip_prefix('=').unwrap_or(f);
                 cell.formula = Some(crate::normalize_formula(&format!("={f}")).into());
                 sheet.set(r, c, cell);
@@ -241,7 +241,7 @@ fn load_xlsx_cells(
     for (row, col, index) in children {
         let ((r, c), master) = masters.get(&index).context("共享公式缺少主单元格")?;
         let translated = crate::refs::translate(master, i64::from(row) - i64::from(*r), i64::from(col) - i64::from(*c), &sheet.name);
-        let mut cell = sheet.get(row, col).cloned().unwrap_or_default();
+        let mut cell = sheet.get(row, col).map(|c| c.into_owned()).unwrap_or_default();
         cell.formula = Some(crate::normalize_formula(&format!("={translated}")).into());
         sheet.set(row, col, cell);
     }

@@ -937,6 +937,26 @@ impl Crit {
         }
     }
 
+    /// Zero-conversion criterion match directly on a raw `f64` from `ColSlab::Numbers`.
+    #[inline]
+    pub(crate) fn matches_number(&self, n: f64) -> bool {
+        if let Some(t) = self.num {
+            return match self.op {
+                ">=" => n >= t,
+                "<=" => n <= t,
+                ">" => n > t,
+                "<" => n < t,
+                "<>" => (n - t).abs() > f64::EPSILON,
+                _ => (n - t).abs() <= f64::EPSILON,
+            };
+        }
+        match self.op {
+            "<>" => true,
+            ">" => !self.text.is_empty(),
+            _ => false,
+        }
+    }
+
     /// Zero-conversion criterion match directly on a stored `crate::Value` in a Sheet page slab.
     #[inline]
     pub(crate) fn matches_value(&self, v: &crate::Value) -> bool {

@@ -230,7 +230,7 @@ fn suite_one(kind: &str, cells: usize, dir: &std::path::Path) -> String {
     let deps = sheetcore::formula::deps::Deps::build(&wb);
     let deps_ms = ms(t.elapsed());
     let t = Instant::now();
-    let cell = wb.sheets[0].get(0, 0).cloned().unwrap_or(Cell {
+    let cell = wb.sheets[0].get(0, 0).map(|c| c.into_owned()).unwrap_or(Cell {
         value: Value::Number(0.0),
         formula: None,
     });
