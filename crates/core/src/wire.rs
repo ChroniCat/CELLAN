@@ -517,6 +517,24 @@ impl PreparedPayload {
     pub fn payload_len(&self) -> usize {
         self.payload.len()
     }
+
+    /// 提取紧凑二进制内层原始字节（若已预压缩则按上限安全解压），供降级回退到 v2/JSON 通道时转码使用。
+    pub fn decode_compact_bytes(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        if !self.compact_bin {
+            return None;
+        }
+        if !self.compressed {
+            return Some(std::borrow::Cow::Borrowed(&self.payload));
+        }
+        let mut dec = flate2::read::DeflateDecoder::new(self.payload.as_slice())
+            .take(MAX_DECOMPRESSED_BYTES + 1);
+        let mut out = Vec::with_capacity(self.payload.len().saturating_mul(4).min(4 * 1024 * 1024));
+        dec.read_to_end(&mut out).ok()?;
+        if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+            return None;
+        }
+        Some(std::borrow::Cow::Owned(out))
+    }
 }
 
 /// 预处理待发送的紧凑二进制内层帧（仅压缩一次，供多客户端零重复序列化广播）

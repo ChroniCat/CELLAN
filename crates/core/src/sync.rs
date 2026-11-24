@@ -1550,6 +1550,140 @@ pub fn calc_snapshot_workbook(wb: &crate::model::Workbook) -> crate::model::Work
     out
 }
 
+/// 将后台监督线程组装完成的列式快照无损移交至加入者工作簿：
+/// - 先清空现有全部工作表的单元格、动态溢出与显式单元格/整行/整列样式（包含快照未触及的尾表），
+/// - 100% 保留每张工作表的 `name`、`identity`、`source_part`、`cols`/`rows`（列宽行高）、`freeze`、
+///   `charts`、`pictures`、`cf`、`dv`、`notes`、`tables`、`filter`、隐藏行列及原文件基础 `merges`，
+/// - 保留原文件 `StyleTable` 的 `themes`/`patterns`/`quotes`（已用 `&wb.styles` 作种子时 `O(1)` 替换，未作种子时自动重映射），
+/// - 最后按序回放房间增量 `merge_ops`（含 `on == false` 拆并原文件基础合并格）。
+pub fn install_guest_snapshot_into_workbook(
+    wb: &mut crate::model::Workbook,
+    src_sheets: Vec<Sheet>,
+    src_styles: crate::style::StyleTable,
+    has_seed_styles: bool,
+    merge_ops: &[(usize, u32, u32, u32, u32, bool)],
+) {
+    let mut prior_state = Vec::with_capacity(wb.sheets.len());
+    for dst in &mut wb.sheets {
+        let had_cells = !dst.is_empty();
+        let old_styles = std::mem::take(&mut dst.styles);
+        let old_row_styles = std::mem::take(&mut dst.row_styles);
+        let old_col_styles = std::mem::take(&mut dst.col_styles);
+        prior_state.push((had_cells, old_styles, old_row_styles, old_col_styles));
+        dst.clear();
+        dst.spilled.clear();
+        dst.spill_shapes.clear();
+        dst.shared_lookup = Default::default();
+        dst.coordinates_shifted();
+    }
+
+    let trivial_base_styles = wb.styles.is_empty()
+        || (wb.styles.len() == 1
+            && !src_styles.is_empty()
+            && wb.styles.get(0) == src_styles.get(0)
+            && wb.styles.theme_of(0) == Default::default()
+            && wb.styles.pattern_of(0).is_none()
+            && !wb.styles.quote_of(0));
+
+    if has_seed_styles || trivial_base_styles {
+        wb.styles = src_styles;
+        for (si, mut src) in src_sheets.into_iter().enumerate() {
+            if let Some(dst) = wb.sheets.get_mut(si) {
+                dst.replace_cell_store(src.cells().clone());
+                dst.row_styles = std::mem::take(&mut src.row_styles);
+                dst.col_styles = std::mem::take(&mut src.col_styles);
+                dst.styles = std::mem::take(&mut src.styles);
+                dst.coordinates_shifted();
+            } else {
+                src.loading = false;
+                src.edited = !src.is_empty()
+                    || !src.styles.is_empty()
+                    || !src.row_styles.is_empty()
+                    || !src.col_styles.is_empty();
+                src.row_styles_dirty = !src.row_styles.is_empty();
+                src.col_styles_dirty = !src.col_styles.is_empty();
+                src.styles_dirty =
+                    !src.styles.is_empty() || src.row_styles_dirty || src.col_styles_dirty;
+                wb.sheets.push(src);
+            }
+        }
+    } else {
+        let mut remap = Vec::with_capacity(src_styles.len());
+        remap.push(0u16);
+        for idx in 1..src_styles.len() {
+            remap.push(wb.styles.intern(src_styles.get(idx as u16).clone()));
+        }
+        let map_id = |id: u16| -> u16 {
+            if id == 0 {
+                0
+            } else {
+                remap.get(id as usize).copied().unwrap_or(0)
+            }
+        };
+        for (si, src) in src_sheets.into_iter().enumerate() {
+            if si >= wb.sheets.len() {
+                let mut extra = Sheet::new(src.name.clone());
+                extra.loading = false;
+                wb.sheets.push(extra);
+            }
+            let dst = &mut wb.sheets[si];
+            dst.replace_cell_store(src.cells().clone());
+            for (&r, &id) in &src.row_styles {
+                dst.set_row_style_loaded(r, map_id(id));
+            }
+            for (&c, &id) in &src.col_styles {
+                dst.set_col_style_loaded(c, map_id(id));
+            }
+            for (pos, &id) in src.styles.iter() {
+                dst.set_style_loaded(pos.row, pos.col, map_id(id));
+            }
+            if si >= prior_state.len() {
+                dst.row_styles_dirty = !dst.row_styles.is_empty();
+                dst.col_styles_dirty = !dst.col_styles.is_empty();
+                dst.styles_dirty =
+                    !dst.styles.is_empty() || dst.row_styles_dirty || dst.col_styles_dirty;
+                dst.edited = !dst.is_empty() || dst.styles_dirty;
+            }
+            dst.coordinates_shifted();
+        }
+    }
+
+    for (si, (had_cells, old_styles, old_row_styles, old_col_styles)) in
+        prior_state.into_iter().enumerate()
+    {
+        let dst = &mut wb.sheets[si];
+        if had_cells || !dst.is_empty() {
+            dst.edited = true;
+        }
+        if dst.row_styles != old_row_styles {
+            dst.row_styles_dirty = true;
+            dst.styles_dirty = true;
+            dst.edited = true;
+        }
+        if dst.col_styles != old_col_styles {
+            dst.col_styles_dirty = true;
+            dst.styles_dirty = true;
+            dst.edited = true;
+        }
+        if dst.styles != old_styles {
+            dst.styles_dirty = true;
+            dst.edited = true;
+        }
+    }
+
+    for &(sheet, r1, c1, r2, c2, on) in merge_ops {
+        while wb.sheets.len() <= sheet {
+            let idx = wb.sheets.len() + 1;
+            wb.sheets.push(Sheet::new(format!("Sheet{idx}")));
+        }
+        if on {
+            wb.sheets[sheet].merge_range(r1, c1, r2, c2);
+        } else {
+            wb.sheets[sheet].unmerge_range(r1, c1, r2, c2);
+        }
+    }
+}
+
 /// 宿主开房时的零拷贝 CoW 基准工作簿快照（基于 `Sheet::search_snapshot` 列块共享）
 #[derive(Clone, Debug)]
 pub struct BaselineBook {
@@ -2513,5 +2647,109 @@ mod tests {
         let busy_reject = encode_update_slice_compact(2, 5, "1.77", 0, 0, &[], true);
         let decoded_reject = decode_msg_compact(&busy_reject).expect("decode busy reject");
         assert!(decoded_reject.is_within_limits());
+    }
+
+    #[test]
+    fn install_guest_snapshot_preserves_sheet_metadata_themes_and_save_dirty_flags() {
+        let mut wb = crate::model::Workbook::new_blank();
+        // 单样式原表挂载主题色与 quotePrefix，验证无种子重映射也不会覆盖索引 0 样式扩展
+        let custom_theme = crate::style_theme::XfTheme {
+            font: Some(crate::style_theme::ThemeRef { idx: 4, tint: 0.25 }),
+            fill: None,
+        };
+        wb.styles.set_theme(0, custom_theme);
+        wb.styles.set_quote(0, true);
+
+        let sh0 = &mut wb.sheets[0];
+        sh0.cols.set(0, 165.0);
+        sh0.rows.set(0, 28.0);
+        sh0.freeze = Some((1, 1));
+        sh0.merge_range(4, 0, 5, 1);
+        sh0.merge_range(7, 0, 8, 1);
+        sh0.cf.blocks.push(crate::cf::CfBlock {
+            ranges: vec![(0, 0, 10, 0)],
+            rules: Vec::new(),
+        });
+        sh0.dv.push(crate::dv::DataValidation {
+            ranges: vec![(0, 0, 5, 0)],
+            kind: crate::dv::DvKind::List,
+            op: crate::dv::DvOp::Between,
+            f1: "A,B,C".into(),
+            f2: String::new(),
+            allow_blank: true,
+            show_dropdown: true,
+            error_style: crate::dv::DvStyle::Stop,
+            show_error: true,
+            show_prompt: false,
+            error_title: String::new(),
+            error_msg: String::new(),
+            prompt_title: String::new(),
+            prompt_msg: String::new(),
+        });
+        sh0.tables.push(crate::table::Table {
+            name: "TblBudget".into(),
+            display: "TblBudget".into(),
+            range: (0, 0, 3, 1),
+            columns: vec!["科目".into(), "金额".into()],
+            column_ids: vec![1, 2],
+            header_row: true,
+            totals_row: false,
+        });
+        sh0.charts.push(crate::charts::Chart {
+            kind: crate::charts::ChartKind::Column,
+            title: "预算柱状图".into(),
+            series: Vec::new(),
+            legend: true,
+            anchor: (0, 3, 10, 8),
+            legend_pos: "r".into(),
+            part: "xl/charts/chart1.xml".into(),
+            drawing: "xl/drawings/drawing1.xml".into(),
+            show_labels: false,
+            label_opts: Default::default(),
+            radar_style: String::new(),
+            ref_fixes: Vec::new(),
+            axis_x: String::new(),
+            axis_y: String::new(),
+            y_fmt: String::new(),
+            y_min: None,
+            y_max: None,
+        });
+        sh0.edited = false;
+        sh0.styles_dirty = false;
+        sh0.merges_dirty = false;
+
+        let mut src_styles = crate::style::StyleTable::new();
+        let mut bold = crate::style::CellStyle::default();
+        bold.bold = true;
+        let bold_src_id = src_styles.intern(bold);
+
+        let mut src_sh0 = Sheet::new("Sheet1");
+        src_sh0.loading = true;
+        src_sh0.set(0, 0, Cell { value: Value::Number(88.0), formula: None });
+        src_sh0.set_style_loaded(0, 0, bold_src_id);
+
+        install_guest_snapshot_into_workbook(
+            &mut wb,
+            vec![src_sh0],
+            src_styles,
+            false,
+            &[(0, 7, 0, 8, 1, false), (0, 1, 0, 2, 1, true)],
+        );
+
+        assert_eq!(wb.styles.theme_of(0), custom_theme);
+        assert!(wb.styles.quote_of(0));
+        assert_eq!(wb.sheets[0].value(0, 0), Value::Number(88.0));
+        assert!(wb.styles.get(wb.sheets[0].style_of(0, 0)).bold);
+        assert!(wb.sheets[0].edited && wb.sheets[0].styles_dirty);
+        assert!((wb.sheets[0].cols.pos(1) - 165.0).abs() < 0.05);
+        assert!((wb.sheets[0].rows.pos(1) - 28.0).abs() < 0.05);
+        assert_eq!(wb.sheets[0].freeze, Some((1, 1)));
+        assert_eq!(wb.sheets[0].cf.blocks.len(), 1);
+        assert_eq!(wb.sheets[0].dv.len(), 1);
+        assert_eq!(wb.sheets[0].tables.len(), 1);
+        assert_eq!(wb.sheets[0].charts.len(), 1);
+        assert_eq!(wb.sheets[0].merge_at(4, 0), Some((4, 0, 5, 1)));
+        assert_eq!(wb.sheets[0].merge_at(7, 0), None);
+        assert_eq!(wb.sheets[0].merge_at(1, 0), Some((1, 0, 2, 1)));
     }
 }
