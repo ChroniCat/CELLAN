@@ -56,6 +56,30 @@ pub(crate) struct FormulaBarKey {
     pub protected: bool,
 }
 
+pub(crate) struct PrintPreviewCache {
+    pub key: (
+        u64,
+        u64,
+        CellVersion,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        PageSetup,
+        Option<std::path::PathBuf>,
+    ),
+    pub layout: Arc<sheetcore::print::Layout>,
+    pub page_ops: Option<(usize, Arc<sheetcore::print::Out>)>,
+}
+
+pub(crate) struct Pivot2BaseItemsCache {
+    pub key: (u64, u64, CellVersion, (u32, u32, u32, u32), u32),
+    pub items: Arc<Vec<String>>,
+}
+
 pub(super) struct PageBreaks {
     source: Option<(u64, Option<(u32, u32, u32, u32)>, u64, u64, PageSetup)>,
     lines: Arc<(Vec<f32>, Vec<f32>)>,
@@ -69,6 +93,10 @@ pub(super) struct PageBreaks {
     pub(crate) base_axes: std::cell::RefCell<Option<BaseAxesCache>>,
     /// 空闲态公式栏文本缓存（消除空闲/悬停帧重复 `display_formula` 与 `Value::display` 分配）。
     pub(crate) formula_bar: Option<(FormulaBarKey, Arc<str>)>,
+    /// 打印预览分页与当前页绘制指令缓存（按表修订号与页面设置失效，避免每帧重算 `paginate` / `page_ops`）。
+    pub(crate) print_preview: Option<PrintPreviewCache>,
+    /// 多维透视对话框基准项去重列表缓存（按源表版本与列号失效，避免每帧全列扫描）。
+    pub(crate) pivot2_base_items: Option<Pivot2BaseItemsCache>,
     /// 并排比较副窗格持久复用的 `Rules`（防止每帧 `std::mem::take` 重建与销毁副窗格缓存和后台统计线程）。
     pub(crate) compare_cf_inputs: Option<Box<Rules>>,
     /// 并排比较副窗格持久复用的条件格式统计与视口缓存（消除每帧重置 `cf_stats_gen = u64::MAX`）。
@@ -87,6 +115,8 @@ impl Default for PageBreaks {
             wheel_zoom_until: None,
             base_axes: std::cell::RefCell::new(None),
             formula_bar: None,
+            print_preview: None,
+            pivot2_base_items: None,
             compare_cf_inputs: None,
             compare_cf_stats: cf::CfStats::default(),
             compare_cf_gen: u64::MAX,
@@ -494,10 +524,14 @@ pub(crate) struct RetainedViewport {
     pub extra_icons: Vec<(Rect, Rect, cf::IconMark)>,
 }
 
-/// 录制象限绘制输出：合并连续同裁剪矩形的 `Shape`，让悬停/选区拖拽帧直接按批次零重排重放。
+/// 录制象限绘制输出：
+/// - 象限主裁剪区（`primary`）全量合批为单个 `(quad_clip, Vec<Shape>)`，不会因中间出现少数溢出裁剪单元格而碎裂成上百个 Scissor 批次；
+/// - 仅真正超出单格/溢出宽度的少量文本落入 `batches` 独立裁剪；顶层筛选漏斗等覆盖物落入 `overlays` 保持在文本之上。
 #[derive(Default)]
 pub(crate) struct BatchRecorder {
+    pub primary: Option<(Rect, Vec<Shape>)>,
     pub batches: Vec<(Rect, Vec<Shape>)>,
+    pub overlays: Vec<(Rect, Vec<Shape>)>,
 }
 
 impl BatchRecorder {
@@ -515,8 +549,73 @@ impl BatchRecorder {
         self.batches.push((clip, vec![shape]));
     }
 
+    /// 录制象限内单元格文本/装饰图元：凡裁剪矩形等于 `quad_clip` 的图元全部归入同一 `primary` 合批桶，
+    /// 彻底消除穿插溢出格导致的 DX12 Scissor DrawCall 乒乓切换。
+    #[inline]
+    pub fn push_quadrant(&mut self, quad_clip: Rect, clip: Rect, shape: Shape) {
+        if clip.width() <= 0.0 || clip.height() <= 0.0 {
+            return;
+        }
+        if clip == quad_clip {
+            match &mut self.primary {
+                Some((p_clip, list)) if *p_clip == quad_clip => {
+                    list.push(shape);
+                    return;
+                }
+                None => {
+                    self.primary = Some((quad_clip, vec![shape]));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.push(clip, shape);
+    }
+
+    #[inline]
+    pub fn push_overlay(&mut self, clip: Rect, shape: Shape) {
+        if clip.width() <= 0.0 || clip.height() <= 0.0 {
+            return;
+        }
+        if let Some((last_clip, list)) = self.overlays.last_mut() {
+            if *last_clip == clip {
+                list.push(shape);
+                return;
+            }
+        }
+        self.overlays.push((clip, vec![shape]));
+    }
+
+    pub fn flush_into(&mut self, out: &mut BatchRecorder) {
+        if let Some((clip, shapes)) = self.primary.take() {
+            for s in shapes {
+                out.push(clip, s);
+            }
+        }
+        for (clip, shapes) in std::mem::take(&mut self.batches) {
+            for s in shapes {
+                out.push(clip, s);
+            }
+        }
+        for (clip, shapes) in std::mem::take(&mut self.overlays) {
+            for s in shapes {
+                out.push(clip, s);
+            }
+        }
+    }
+
     pub fn replay_into(&self, painter: &egui::Painter) {
+        if let Some((clip, shapes)) = &self.primary {
+            if !shapes.is_empty() {
+                painter.with_clip_rect(*clip).extend(shapes.iter().cloned());
+            }
+        }
         for (clip, shapes) in &self.batches {
+            if !shapes.is_empty() {
+                painter.with_clip_rect(*clip).extend(shapes.iter().cloned());
+            }
+        }
+        for (clip, shapes) in &self.overlays {
             if !shapes.is_empty() {
                 painter.with_clip_rect(*clip).extend(shapes.iter().cloned());
             }
@@ -672,11 +771,6 @@ impl RetainedGridCache {
 
     pub fn ensure_epoch(&mut self, epoch: &CellCacheEpoch) {
         if self.epoch.as_ref() == Some(epoch) {
-            if self.cells.len() > 24_576 {
-                // 长时间全表漫游滚动时限制单元缓存体积在 ~2MB 以内
-                self.cells.clear();
-                self.row_occupied_cols.clear();
-            }
             return;
         }
         let same_layout = self.epoch.as_ref().is_some_and(|prev| prev.same_layout(epoch));
@@ -686,15 +780,33 @@ impl RetainedGridCache {
             self.row_occupied_cols.clear();
             self.invalidate_viewport();
             self.epoch = Some(epoch.clone());
-            if self.cells.len() > 24_576 {
-                self.cells.clear();
-            }
         } else {
             self.content_rev = self.content_rev.wrapping_add(1);
             self.cells.clear();
             self.row_occupied_cols.clear();
             self.invalidate_viewport();
             self.epoch = Some(epoch.clone());
+        }
+    }
+
+    /// 按视口行带就近保留淘汰：当长距离滚动使保留单元超过阈值时，保留当前视口上下 ±128 行及冻结行，
+    /// 彻底消除 `cells.clear()` 全清造成的周期性整屏重排帧尖峰。
+    pub fn prune_distant_rows(&mut self, view_r1: u32, view_r2: u32, frozen_fy: u32) {
+        const MAX_RETAINED_CELLS: usize = 24_576;
+        if self.cells.len() <= MAX_RETAINED_CELLS {
+            return;
+        }
+        let keep_r1 = view_r1.saturating_sub(128);
+        let keep_r2 = view_r2.saturating_add(128);
+        self.cells
+            .retain(|&(r, _), _| r < frozen_fy || (r >= keep_r1 && r <= keep_r2));
+        self.row_occupied_cols
+            .retain(|&r, _| r < frozen_fy || (r >= keep_r1 && r <= keep_r2));
+        if self.cells.len() > MAX_RETAINED_CELLS {
+            self.cells
+                .retain(|&(r, _), _| r < frozen_fy || (r >= view_r1 && r <= view_r2));
+            self.row_occupied_cols
+                .retain(|&r, _| r < frozen_fy || (r >= view_r1 && r <= view_r2));
         }
     }
 

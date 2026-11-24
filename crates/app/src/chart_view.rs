@@ -515,15 +515,23 @@ fn paint_line(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     for (si, s) in chart.series.iter().enumerate() {
         let color = PALETTE[si % PALETTE.len()];
         let pts = decimate_line_points(&s.vals, n, lo, hi, plot);
-        for w in pts.windows(2) {
-            painter.line_segment([w[0], w[1]], Stroke::new(1.8, color));
+        let draw_dots = plot.width() / (s.vals.len().max(1) as f32) >= 3.5;
+        let draw_labels = chart.show_labels && s.vals.len() <= 12;
+        if !draw_dots && !draw_labels {
+            if pts.len() >= 2 {
+                painter.add(egui::Shape::line(pts, Stroke::new(1.8, color)));
+            }
+            continue;
         }
-        if plot.width() / (s.vals.len().max(1) as f32) >= 3.5 {
+        if pts.len() >= 2 {
+            painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.8, color)));
+        }
+        if draw_dots {
             for p in &pts {
                 painter.circle_filled(*p, 2.2, color);
             }
         }
-        if chart.show_labels && s.vals.len() <= 12 {
+        if draw_labels {
             for (p, &v) in pts.iter().zip(s.vals.iter()) {
                 painter.text(
                     Pos2::new(p.x, p.y - 4.0),

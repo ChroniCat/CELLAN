@@ -174,11 +174,22 @@ impl SheetApp {
         sheetcore::sort_filter::current_region(sheet, r, c)
     }
 
-    /// 选中行自动调整行高（批量：单遍稀疏区域扫描 + 字号单行缓存 + 单次 `rows.set_many` 重建）
+    /// 选中行自动调整行高（批量：单遍稀疏区域扫描 + 字号单行缓存 + 单次 `rows.set_many` 重建 + Undo）
     pub(crate) fn autofit_sel_rows(&mut self, ctx: &egui::Context) {
-        let (r1, _, r2, _) = self.sel_rect();
-        if r2 - r1 > 2000 {
-            self.status = "选中行数过多，请缩小范围后再自适应行高".into();
+        let (r1, _, mut r2, _) = self.sel_rect();
+        if r2 - r1 > 2_000 {
+            if let Some((_, _, ur2, _)) = self.wb.sheet(self.sheet_idx).used_bounds() {
+                if ur2 >= r1 {
+                    r2 = r2.min(ur2);
+                } else {
+                    r2 = r1;
+                }
+            } else {
+                r2 = r1;
+            }
+        }
+        if r2 - r1 > 50_000 {
+            self.status = "选中非空行数过多，请缩小范围后再自适应行高".into();
             return;
         }
         if r1 == r2 {
@@ -186,21 +197,26 @@ impl SheetApp {
             return;
         }
         let updates = self.compute_autofit_rows(ctx, r1, r2);
-        {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            sh.rows.set_many(updates);
-            sh.layout_dirty = true;
-        }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.status = format!("第 {}–{} 行行高已自适应", r1 + 1, r2 + 1);
+        let msg = format!("第 {}–{} 行行高已自适应", r1 + 1, r2 + 1);
+        self.apply_row_heights_undoable(updates, msg);
     }
 
-    /// 选中列自动调整列宽（批量：共享二分 `MergeIndex` + O(1) 宽度上界粗筛 + 单次 `cols.set_many` 重建）
+    /// 选中列自动调整列宽（批量：共享二分 `MergeIndex` + O(1) 数值格式宽度上界粗筛 + 并行扫描 + Undo）
     pub(crate) fn autofit_sel_cols(&mut self, ctx: &egui::Context) {
-        let (_, c1, _, c2) = self.sel_rect();
+        let (_, c1, _, mut c2) = self.sel_rect();
         if c2 - c1 > 500 {
-            self.status = "选中列数过多，请缩小范围后再自适应列宽".into();
+            if let Some((_, _, _, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
+                if uc2 >= c1 {
+                    c2 = c2.min(uc2);
+                } else {
+                    c2 = c1;
+                }
+            } else {
+                c2 = c1;
+            }
+        }
+        if c2 - c1 > 2_048 {
+            self.status = "选中非空列数过多，请缩小范围后再自适应列宽".into();
             return;
         }
         if c1 == c2 {
@@ -208,18 +224,12 @@ impl SheetApp {
             return;
         }
         let updates = self.compute_autofit_cols(c1, c2);
-        {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            sh.cols.set_many(updates);
-            sh.layout_dirty = true;
-        }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.status = format!(
+        let msg = format!(
             "{}–{} 列宽已自适应",
             super::cell_name(0, c1).trim_end_matches('1'),
             super::cell_name(0, c2).trim_end_matches('1')
         );
+        self.apply_col_widths_undoable(updates, msg);
     }
 
     /// WPS：高亮重复项（条件格式）
