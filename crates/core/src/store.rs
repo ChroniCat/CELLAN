@@ -1073,11 +1073,15 @@ pub struct CellStyles {
     pages: Vec<Option<Arc<StylePage>>>,
     page_bits: Vec<u64>,
     far_pages: Option<Box<BTreeMap<u32, Arc<StylePage>>>>,
+    pub(crate) version: CellVersion,
     len: usize,
 }
 
 impl PartialEq for CellStyles {
     fn eq(&self, other: &Self) -> bool {
+        if self.version == other.version {
+            return true;
+        }
         if self.len != other.len || self.page_bits != other.page_bits {
             return false;
         }
@@ -1747,6 +1751,7 @@ impl CellStyles {
                 return Some(id);
             }
         }
+        self.version.advance();
         let page = self.page_mut_or_insert(pi);
         let slot = page
             .cols
@@ -1764,6 +1769,7 @@ impl CellStyles {
         if r1 > r2 || c1 > c2 {
             return;
         }
+        self.version.advance();
         let first_p = r1 / PAGE_ROWS;
         let last_p = r2 / PAGE_ROWS;
         let uniform = Arc::new(StyleColumn::Uniform(id));
@@ -1816,6 +1822,7 @@ impl CellStyles {
                 }
             }
             self.len -= 1;
+            self.version.advance();
         }
         old
     }
@@ -1895,7 +1902,10 @@ impl CellStyles {
                 self.remove_page(pi);
             }
         }
-        self.len -= total_removed;
+        if total_removed > 0 {
+            self.len -= total_removed;
+            self.version.advance();
+        }
         total_removed
     }
 
@@ -1984,14 +1994,14 @@ impl CellStyles {
         })
     }
 
-    /// Re-key complete style pages when possible. Repack split pages in ascending
-    /// row order so a run of equal styles never shifts the packed vector per cell,
-    /// and preserve `StyleColumn::Uniform(sid)` pages via contiguous `insert_rect`.
+    /// Re-key complete style pages when possible, leaving untouched prefix pages (`< at / PAGE_ROWS`)
+    /// in place in `O(1)` and repacking non-aligned pages in parallel without per-cell hash/page lookups.
     pub(crate) fn remap_axis(&mut self, rows: bool, at: u32, map: impl Fn(u32) -> Option<u32>) {
         if self.len == 0 {
             return;
         }
-        if rows && self.iter_pages_in(at / PAGE_ROWS, u32::MAX).next().is_none() {
+        let first_pi = if rows { at / PAGE_ROWS } else { 0 };
+        if rows && self.iter_pages_in(first_pi, u32::MAX).next().is_none() {
             return;
         }
         if !rows
@@ -2001,89 +2011,275 @@ impl CellStyles {
         {
             return;
         }
-        let old = std::mem::take(self);
-        let mut out = CellStyles::default();
-        for (p, page_arc) in old.iter_pages() {
-            let base = p * PAGE_ROWS;
-            if rows && base + PAGE_ROWS <= at {
-                let page_len: usize = page_arc
-                    .iter_nonempty_cols(0, u32::MAX)
-                    .filter_map(|c| page_arc.get_col(c))
-                    .map(|sc| sc.len())
-                    .sum();
-                out.insert_page_arc(p, page_arc.clone());
-                out.len += page_len;
+        self.version.advance();
+
+        if !rows {
+            let page_ids: Vec<u32> = self
+                .iter_pages()
+                .filter(|(_, p)| p.iter_nonempty_cols(at, u32::MAX).next().is_some())
+                .map(|(pi, _)| pi)
+                .collect();
+            for pi in page_ids {
+                let Some(page) = self.page_mut_existing(pi) else {
+                    continue;
+                };
+                let old_entries = std::mem::take(&mut page.cols).into_entries();
+                let mut new_cols = PageCols::default();
+                let mut old_cnt = 0usize;
+                let mut new_cnt = 0usize;
+                for (c, sc) in old_entries {
+                    old_cnt += sc.len();
+                    if c < at {
+                        new_cnt += sc.len();
+                        new_cols.set(c, sc);
+                    } else if let Some(nc) = map(c) {
+                        new_cnt += sc.len();
+                        new_cols.set(nc, sc);
+                    }
+                }
+                page.cols = new_cols;
+                let empty = page.is_empty();
+                self.len = self.len - old_cnt + new_cnt;
+                if empty {
+                    self.remove_page(pi);
+                }
+            }
+            return;
+        }
+
+        // Extract only pages `>= first_pi`, leaving all prefix pages untouched in O(1)!
+        let mut source_pages: Vec<(u32, Arc<StylePage>)> = Vec::new();
+        if first_pi < DIRECT_PAGE_LIMIT && !self.page_bits.is_empty() {
+            let start_w = (first_pi / 64) as usize;
+            for w in start_w..self.page_bits.len() {
+                let mut bits = self.page_bits[w];
+                if w == start_w {
+                    let keep_mask = (1u64 << (first_pi % 64)) - 1;
+                    let take_bits = bits & !keep_mask;
+                    self.page_bits[w] = bits & keep_mask;
+                    bits = take_bits;
+                } else {
+                    self.page_bits[w] = 0;
+                }
+                while bits != 0 {
+                    let tz = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    let pi = w as u32 * 64 + tz;
+                    if let Some(slot) = self.pages.get_mut(pi as usize)
+                        && let Some(page) = slot.take()
+                    {
+                        source_pages.push((pi, page));
+                    }
+                }
+            }
+            while self.page_bits.last() == Some(&0) {
+                self.page_bits.pop();
+            }
+        }
+        if let Some(mut far) = self.far_pages.take() {
+            if first_pi <= DIRECT_PAGE_LIMIT {
+                source_pages.extend(*far);
+            } else {
+                let tail = far.split_off(&first_pi);
+                if !far.is_empty() {
+                    self.far_pages = Some(far);
+                }
+                source_pages.extend(tail);
+            }
+        }
+        if source_pages.is_empty() {
+            return;
+        }
+
+        let mut split_sources: Vec<(u32, Arc<StylePage>, Vec<(std::ops::Range<u32>, u32, u32)>)> =
+            Vec::new();
+        for (pi, page_arc) in source_pages {
+            let base = pi * PAGE_ROWS;
+            let page_len: usize = page_arc
+                .iter_nonempty_cols(0, u32::MAX)
+                .filter_map(|c| page_arc.get_col(c))
+                .map(|sc| sc.len())
+                .sum();
+            if base + PAGE_ROWS <= at {
+                self.insert_page_arc(pi, page_arc);
                 continue;
             }
-            if rows
-                && base >= at
+            self.len -= page_len;
+            if base >= at
                 && let Some(target0) = map(base)
                 && target0 % PAGE_ROWS == 0
                 && map(base + PAGE_ROWS - 1) == Some(target0 + PAGE_ROWS - 1)
             {
                 let dest = target0 / PAGE_ROWS;
-                if out.page(dest).is_none() {
-                    let page_len: usize = page_arc
-                        .iter_nonempty_cols(0, u32::MAX)
-                        .filter_map(|c| page_arc.get_col(c))
-                        .map(|sc| sc.len())
-                        .sum();
-                    out.insert_page_arc(dest, page_arc.clone());
-                    out.len += page_len;
+                if self.page(dest).is_none() {
+                    self.insert_page_arc(dest, page_arc);
+                    self.len += page_len;
                     continue;
                 }
             }
-            for c in page_arc.iter_nonempty_cols(0, u32::MAX) {
-                let Some(sc) = page_arc.get_col(c) else { continue };
-                let same_key = if !rows {
-                    if c < at {
-                        Some((p, c))
-                    } else {
-                        map(c).map(|col| (p, col))
-                    }
-                } else if base + PAGE_ROWS <= at {
-                    Some((p, c))
+            let mut spans: Vec<(std::ops::Range<u32>, u32, u32)> = Vec::new();
+            for r in 0..PAGE_ROWS {
+                let Some(target) = map(base + r) else { continue };
+                let (dest, offset) = (target / PAGE_ROWS, target % PAGE_ROWS);
+                if let Some((source, pid, start)) = spans.last_mut()
+                    && *pid == dest
+                    && source.end == r
+                    && *start + (source.end - source.start) == offset
+                {
+                    source.end += 1;
                 } else {
-                    map(base)
-                        .filter(|r| {
-                            r % PAGE_ROWS == 0
-                                && map(base + PAGE_ROWS - 1) == Some(r + PAGE_ROWS - 1)
-                        })
-                        .map(|r| (r / PAGE_ROWS, c))
-                };
-                if let Some((dp, dc)) = same_key {
-                    let dp_mut = out.page_mut_or_insert(dp);
-                    let prev = dp_mut.set_col(dc, sc.clone());
-                    out.len = out.len - prev + sc.len();
-                } else if rows {
-                    if let StyleColumn::Uniform(sid) = sc.as_ref() {
-                        let mut run: Option<(u32, u32)> = None;
-                        for off in 0..PAGE_ROWS {
-                            if let Some(target) = map(base + off) {
-                                match &mut run {
-                                    Some((_, end)) if target == *end + 1 => *end = target,
-                                    Some((start, end)) => {
-                                        out.insert_rect(*start, c, *end, c, *sid);
-                                        run = Some((target, target));
-                                    }
-                                    None => run = Some((target, target)),
-                                }
+                    spans.push((r..r + 1, dest, offset));
+                }
+            }
+            if !spans.is_empty() {
+                split_sources.push((pi, page_arc, spans));
+            }
+        }
+        if split_sources.is_empty() {
+            return;
+        }
+
+        // Group `(src_idx, src_range, dst_offset)` by `dest_pi` so every destination page is built independently.
+        let mut dest_map: BTreeMap<u32, Vec<(usize, std::ops::Range<u32>, u32)>> = BTreeMap::new();
+        for (src_idx, (_, _, spans)) in split_sources.iter().enumerate() {
+            for (src_r, dest_pi, dst_off) in spans {
+                dest_map
+                    .entry(*dest_pi)
+                    .or_default()
+                    .push((src_idx, src_r.clone(), *dst_off));
+            }
+        }
+        // Pull any pre-existing page at a destination index into `split_sources` as an identity source
+        // so parallel workers build complete pages without merging afterwards.
+        let dest_keys: Vec<u32> = dest_map.keys().copied().collect();
+        for dpi in dest_keys {
+            if let Some(existing) = self.page(dpi).cloned() {
+                let existing_len: usize = existing
+                    .iter_nonempty_cols(0, u32::MAX)
+                    .filter_map(|c| existing.get_col(c))
+                    .map(|sc| sc.len())
+                    .sum();
+                self.remove_page(dpi);
+                self.len -= existing_len;
+                let src_idx = split_sources.len();
+                split_sources.push((dpi, existing, Vec::new()));
+                dest_map
+                    .get_mut(&dpi)
+                    .unwrap()
+                    .insert(0, (src_idx, 0..PAGE_ROWS, 0));
+            }
+        }
+        let dest_plan: Vec<(u32, Vec<(usize, std::ops::Range<u32>, u32)>)> =
+            dest_map.into_iter().collect();
+
+        let build_dest = |dpi: u32, parts: &[(usize, std::ops::Range<u32>, u32)]| -> Option<(u32, Arc<StylePage>, usize)> {
+            let mut cols_set: Vec<u32> = Vec::new();
+            for &(src_idx, _, _) in parts {
+                for c in split_sources[src_idx].1.iter_nonempty_cols(0, u32::MAX) {
+                    cols_set.push(c);
+                }
+            }
+            cols_set.sort_unstable();
+            cols_set.dedup();
+            if cols_set.is_empty() {
+                return None;
+            }
+            let mut page_cols = PageCols::default();
+            let mut page_total = 0usize;
+            for col in cols_set {
+                // Fast Uniform preservation if a single full-page source or matching Uniform covers all 256 rows
+                if parts.len() == 1
+                    && parts[0].1 == (0..PAGE_ROWS)
+                    && parts[0].2 == 0
+                    && let Some(sc) = split_sources[parts[0].0].1.get_col(col)
+                {
+                    page_total += sc.len();
+                    page_cols.set(col, sc.clone());
+                    continue;
+                }
+                let mut col_sc = StyleColumn::default();
+                for &(src_idx, ref src_range, dst_off) in parts {
+                    let Some(sc) = split_sources[src_idx].1.get_col(col) else {
+                        continue;
+                    };
+                    let len = src_range.end - src_range.start;
+                    match sc.as_ref() {
+                        StyleColumn::Uniform(sid) => {
+                            col_sc.insert_range(dst_off, dst_off + len - 1, *sid);
+                        }
+                        StyleColumn::Sparse { rows, ids } => {
+                            let m = row_range_mask(src_range.start, src_range.end - 1);
+                            if (rows[0] & m[0]) == 0
+                                && (rows[1] & m[1]) == 0
+                                && (rows[2] & m[2]) == 0
+                                && (rows[3] & m[3]) == 0
+                            {
+                                continue;
                             }
-                        }
-                        if let Some((start, end)) = run {
-                            out.insert_rect(start, c, end, c, *sid);
-                        }
-                    } else {
-                        for (cref, &id) in sc.iter_entries(p, c) {
-                            if let Some(target) = map(cref.row) {
-                                out.insert(CellRef::new(target, c), id);
+                            let mut rank = count_bits_below(rows, src_range.start);
+                            for w in (src_range.start as usize / 64)..=((src_range.end - 1) as usize / 64) {
+                                let mut bits = rows[w] & m[w];
+                                while bits != 0 {
+                                    let tz = bits.trailing_zeros();
+                                    bits &= bits - 1;
+                                    let src_ro = w as u32 * 64 + tz;
+                                    let target_ro = dst_off + (src_ro - src_range.start);
+                                    col_sc.insert(target_ro, ids[rank]);
+                                    rank += 1;
+                                }
                             }
                         }
                     }
                 }
+                let clen = col_sc.len();
+                if clen > 0 {
+                    page_total += clen;
+                    page_cols.set(col, Arc::new(col_sc));
+                }
             }
+            (page_total > 0).then(|| (dpi, Arc::new(StylePage { cols: page_cols }), page_total))
+        };
+
+        let built: Vec<(u32, Arc<StylePage>, usize)> = if dest_plan.len() >= 16 {
+            let n_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(8)
+                .min(dest_plan.len());
+            let chunk_size = dest_plan.len().div_ceil(n_threads);
+            let mut out = Vec::with_capacity(dest_plan.len());
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(n_threads);
+                for chunk in dest_plan.chunks(chunk_size) {
+                    let b_ref = &build_dest;
+                    handles.push(s.spawn(move || {
+                        let mut local = Vec::with_capacity(chunk.len());
+                        for (dpi, parts) in chunk {
+                            if let Some(res) = b_ref(*dpi, parts) {
+                                local.push(res);
+                            }
+                        }
+                        local
+                    }));
+                }
+                for h in handles {
+                    if let Ok(local) = h.join() {
+                        out.extend(local);
+                    }
+                }
+            });
+            out
+        } else {
+            dest_plan
+                .iter()
+                .filter_map(|(dpi, parts)| build_dest(*dpi, parts))
+                .collect()
+        };
+
+        for (dpi, page_arc, cnt) in built {
+            self.insert_page_arc(dpi, page_arc);
+            self.len += cnt;
         }
-        *self = out;
     }
 
     /// Shift rows `>= at` ONLY for columns `[c1..=c2]` (insert down by `n` or delete `[at..at+n)`),
@@ -2109,6 +2305,7 @@ impl CellStyles {
         if hit_pages.is_empty() {
             return;
         }
+        self.version.advance();
         let mut extracted: Vec<(u32, u32, Arc<StyleColumn>)> = Vec::new();
         for pi in hit_pages {
             let base = pi * PAGE_ROWS;
@@ -2212,6 +2409,9 @@ impl CellStyles {
         p_lo: u32,
         new_slabs: Vec<Option<Arc<StyleColumn>>>,
     ) {
+        if !new_slabs.is_empty() {
+            self.version.advance();
+        }
         for (i, slab_opt) in new_slabs.into_iter().enumerate() {
             let pi = p_lo + i as u32;
             match slab_opt {
@@ -2244,6 +2444,7 @@ impl CellStyles {
         if lo >= hi || self.is_empty() {
             return;
         }
+        self.version.advance();
         let p_lo = lo / PAGE_ROWS;
         let p_hi = (hi - 1) / PAGE_ROWS;
         if !rows {
@@ -2448,6 +2649,28 @@ impl CellStyles {
             keys.dedup();
             for pi in keys {
                 check_pair(pi, self.page(pi), other.page(pi));
+            }
+        }
+    }
+
+    /// Word-level intersection of `journal` (`CellJournal`) with non-empty cells in `self` (`CellStyles`),
+    /// writing matching `[u64; 4]` page masks directly into `out`.
+    pub(crate) fn intersect_journal_into(&self, journal: &CellJournal, out: &mut CellJournal) {
+        if self.len == 0 || journal.is_empty() {
+            return;
+        }
+        for (&(pi, col), &j_mask) in journal.page_masks() {
+            if let Some(sc) = self.page_col(pi, col) {
+                let s_mask = sc.row_mask();
+                let both = [
+                    j_mask[0] & s_mask[0],
+                    j_mask[1] & s_mask[1],
+                    j_mask[2] & s_mask[2],
+                    j_mask[3] & s_mask[3],
+                ];
+                if both != [0; 4] {
+                    out.or_page_mask(pi, col, both);
+                }
             }
         }
     }
@@ -2684,15 +2907,1457 @@ impl NumberSlab {
     }
 }
 
+const SPARSE_SLAB_CAP: usize = 32;
+const DICT_TEXT_MAX_UNIQUE: usize = 128;
+
+#[inline]
+fn rank_in_rows(present: &[u64; 4], w: usize, bit: u64) -> usize {
+    let prefix: u32 = present[..w].iter().map(|&word| word.count_ones()).sum();
+    (prefix + (present[w] & (bit - 1)).count_ones()) as usize
+}
+
+#[inline]
+fn next_bit_from(present: &[u64; 4], lo: usize) -> Option<u32> {
+    if lo >= PAGE_ROWS as usize {
+        return None;
+    }
+    let start_w = lo / 64;
+    let first_bits = present[start_w] & (!0u64 << (lo % 64));
+    if first_bits != 0 {
+        return Some((start_w * 64 + first_bits.trailing_zeros() as usize) as u32);
+    }
+    for w in (start_w + 1)..4 {
+        if present[w] != 0 {
+            return Some((w * 64 + present[w].trailing_zeros() as usize) as u32);
+        }
+    }
+    None
+}
+
+#[inline]
+fn prev_bit_before(present: &[u64; 4], hi_excl: usize) -> Option<u32> {
+    let hi = hi_excl.min(PAGE_ROWS as usize);
+    if hi == 0 {
+        return None;
+    }
+    let last_idx = hi - 1;
+    let end_w = last_idx / 64;
+    let rem = last_idx % 64;
+    let top_mask = if rem == 63 { !0u64 } else { (1u64 << (rem + 1)) - 1 };
+    let end_bits = present[end_w] & top_mask;
+    if end_bits != 0 {
+        return Some((end_w * 64 + (63 - end_bits.leading_zeros() as usize)) as u32);
+    }
+    for w in (0..end_w).rev() {
+        if present[w] != 0 {
+            return Some((w * 64 + (63 - present[w].leading_zeros() as usize)) as u32);
+        }
+    }
+    None
+}
+
+#[inline]
+fn first_last_bits(present: &[u64; 4]) -> Option<(u32, u32)> {
+    let first = next_bit_from(present, 0)?;
+    let last = prev_bit_before(present, PAGE_ROWS as usize).unwrap();
+    Some((first, last))
+}
+
+#[inline]
+fn has_bits_in(present: &[u64; 4], lo: usize, hi_excl: usize) -> bool {
+    let hi = hi_excl.min(PAGE_ROWS as usize);
+    if lo >= hi {
+        return false;
+    }
+    let m = row_range_mask(lo as u32, (hi - 1) as u32);
+    (present[0] & m[0]) != 0
+        || (present[1] & m[1]) != 0
+        || (present[2] & m[2]) != 0
+        || (present[3] & m[3]) != 0
+}
+
+#[inline]
+fn mask_from_offset(present: &[u64; 4], begin: usize) -> [u64; 4] {
+    if begin >= PAGE_ROWS as usize {
+        return [0; 4];
+    }
+    let m = row_range_mask(begin as u32, PAGE_ROWS - 1);
+    [
+        present[0] & m[0],
+        present[1] & m[1],
+        present[2] & m[2],
+        present[3] & m[3],
+    ]
+}
+
+#[inline]
+fn dict_lookup_or_insert(dict: &mut Vec<Value>, text: &Arc<str>) -> Option<u8> {
+    // Fast 1-slot MRU check on the most recently inserted dictionary entry.
+    if dict.len() > 1
+        && let Value::Text(last) = &dict[dict.len() - 1]
+        && Arc::ptr_eq(last, text)
+    {
+        return Some((dict.len() - 1) as u8);
+    }
+    // Pointer equality pass first (nanoseconds for interned/SST strings).
+    for (idx, item) in dict.iter().enumerate().skip(1) {
+        if let Value::Text(existing) = item
+            && Arc::ptr_eq(existing, text)
+        {
+            return Some(idx as u8);
+        }
+    }
+    // Content equality fallback.
+    for (idx, item) in dict.iter().enumerate().skip(1) {
+        if let Value::Text(existing) = item
+            && existing.as_ref() == text.as_ref()
+        {
+            return Some(idx as u8);
+        }
+    }
+    if dict.len() > DICT_TEXT_MAX_UNIQUE {
+        return None;
+    }
+    let code = dict.len() as u8;
+    dict.push(Value::Text(Arc::clone(text)));
+    Some(code)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ValueSlabRepr {
+    /// Packed non-empty `Value`s (`<= 32` items), indexed in `O(1)` via `count_bits_below(&present, ro)`.
+    Sparse(Vec<Value>),
+    /// Page-level 1-byte dictionary text slab (`dict[0] = Value::Empty`, `dict[1..=K]` = distinct `Value::Text`).
+    Dict {
+        codes: Vec<u8>,
+        dict: Vec<Value>,
+    },
+    /// General dense `Vec<Value>` (`len == highest_bit_plus_one(&present)`).
+    Dense(Vec<Value>),
+}
+
+/// Non-formula column page slab with `[u64; 4]` occupancy bitmap, sparse packing for low-density
+/// pages (`<= 32` cells), and 1-byte dictionary compression (`DictText`) for categorical text columns.
+/// Implements `Deref<Target = [Value]>` so external slice consumers (`formula`, `xlsx`) work transparently.
+#[derive(Debug)]
+pub struct ValueSlab {
+    pub(crate) present: [u64; 4],
+    len: u16,
+    pub(crate) repr: ValueSlabRepr,
+    dense_cache: OnceLock<Box<[Value]>>,
+}
+
+impl Default for ValueSlab {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            present: [0; 4],
+            len: 0,
+            repr: ValueSlabRepr::Sparse(Vec::new()),
+            dense_cache: OnceLock::new(),
+        }
+    }
+}
+
+impl Clone for ValueSlab {
+    fn clone(&self) -> Self {
+        Self {
+            present: self.present,
+            len: self.len,
+            repr: self.repr.clone(),
+            dense_cache: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for ValueSlab {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len || self.present != other.present {
+            return false;
+        }
+        for w in 0..4 {
+            let mut bits = self.present[w];
+            while bits != 0 {
+                let tz = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let ro = w * 64 + tz;
+                if self.get_val(ro) != other.get_val(ro) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+impl From<Vec<Value>> for ValueSlab {
+    #[inline]
+    fn from(vals: Vec<Value>) -> Self {
+        Self::from_vec(vals)
+    }
+}
+
+impl FromIterator<Value> for ValueSlab {
+    #[inline]
+    fn from_iter<T: IntoIterator<Item = Value>>(iter: T) -> Self {
+        Self::from_vec(iter.into_iter().collect())
+    }
+}
+
+impl std::ops::Deref for ValueSlab {
+    type Target = [Value];
+
+    #[inline]
+    fn deref(&self) -> &[Value] {
+        match &self.repr {
+            ValueSlabRepr::Dense(v) => v.as_slice(),
+            _ => self.dense_cache.get_or_init(|| self.materialize_boxed()),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a ValueSlab {
+    type Item = &'a Value;
+    type IntoIter = std::slice::Iter<'a, Value>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        let slice: &'a [Value] = self;
+        slice.iter()
+    }
+}
+
+impl ValueSlab {
+    pub fn from_vec(mut vals: Vec<Value>) -> Self {
+        while vals.last().is_some_and(Value::is_empty) {
+            vals.pop();
+        }
+        if vals.is_empty() {
+            return Self::default();
+        }
+        let len = vals.len();
+        let mut present = [0u64; 4];
+        let mut occupied = 0usize;
+        let mut all_text = true;
+        for (r, v) in vals.iter().enumerate() {
+            if !v.is_empty() {
+                present[r / 64] |= 1u64 << (r % 64);
+                occupied += 1;
+                if !matches!(v, Value::Text(_)) {
+                    all_text = false;
+                }
+            }
+        }
+        if occupied == 0 {
+            return Self::default();
+        }
+        if occupied <= SPARSE_SLAB_CAP {
+            let mut items = Vec::with_capacity(occupied);
+            for v in vals {
+                if !v.is_empty() {
+                    items.push(v);
+                }
+            }
+            return Self {
+                present,
+                len: len as u16,
+                repr: ValueSlabRepr::Sparse(items),
+                dense_cache: OnceLock::new(),
+            };
+        }
+        if all_text {
+            let mut dict = Vec::with_capacity(16);
+            dict.push(Value::Empty);
+            let mut codes = Vec::with_capacity(len);
+            let mut ok = true;
+            for v in &vals {
+                match v {
+                    Value::Empty => codes.push(0),
+                    Value::Text(s) => {
+                        if let Some(code) = dict_lookup_or_insert(&mut dict, s) {
+                            codes.push(code);
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if ok {
+                dict.shrink_to_fit();
+                return Self {
+                    present,
+                    len: len as u16,
+                    repr: ValueSlabRepr::Dict { codes, dict },
+                    dense_cache: OnceLock::new(),
+                };
+            }
+        }
+        Self {
+            present,
+            len: len as u16,
+            repr: ValueSlabRepr::Dense(vals),
+            dense_cache: OnceLock::new(),
+        }
+    }
+
+    fn materialize_boxed(&self) -> Box<[Value]> {
+        let len = self.len as usize;
+        if len == 0 {
+            return Box::new([]);
+        }
+        match &self.repr {
+            ValueSlabRepr::Dense(v) => v.clone().into_boxed_slice(),
+            ValueSlabRepr::Dict { codes, dict } => codes[..len]
+                .iter()
+                .map(|&c| dict[c as usize].clone())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            ValueSlabRepr::Sparse(items) => {
+                let mut out = vec![Value::Empty; len];
+                let mut rank = 0usize;
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        out[w * 64 + tz] = items[rank].clone();
+                        rank += 1;
+                    }
+                }
+                out.into_boxed_slice()
+            }
+        }
+    }
+
+    pub fn into_vec(self) -> Vec<Value> {
+        let len = self.len as usize;
+        if len == 0 {
+            return Vec::new();
+        }
+        match self.repr {
+            ValueSlabRepr::Dense(mut v) => {
+                v.truncate(len);
+                v
+            }
+            ValueSlabRepr::Dict { codes, dict } => codes[..len]
+                .iter()
+                .map(|&c| dict[c as usize].clone())
+                .collect(),
+            ValueSlabRepr::Sparse(items) => {
+                let mut out = vec![Value::Empty; len];
+                let mut iter = items.into_iter();
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        if let Some(v) = iter.next() {
+                            out[w * 64 + tz] = v;
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[Value] {
+        self
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.present == [0; 4]
+    }
+
+    #[inline]
+    pub fn first_last_occupied(&self) -> Option<(u32, u32)> {
+        first_last_bits(&self.present)
+    }
+
+    #[inline]
+    pub fn has_any_in(&self, lo: usize, hi_excl: usize) -> bool {
+        has_bits_in(&self.present, lo, hi_excl)
+    }
+
+    #[inline]
+    pub fn next_occupied_from(&self, lo: usize) -> Option<u32> {
+        next_bit_from(&self.present, lo)
+    }
+
+    #[inline]
+    pub fn prev_occupied_before(&self, hi_excl: usize) -> Option<u32> {
+        prev_bit_before(&self.present, hi_excl)
+    }
+
+    #[inline]
+    pub fn row_mask_from(&self, begin: usize) -> [u64; 4] {
+        mask_from_offset(&self.present, begin)
+    }
+
+    #[inline]
+    pub fn is_dict_text(&self) -> bool {
+        matches!(self.repr, ValueSlabRepr::Dict { .. })
+    }
+
+    #[inline]
+    pub fn is_sparse(&self) -> bool {
+        matches!(self.repr, ValueSlabRepr::Sparse(_))
+    }
+
+    /// Borrow `(codes, dict)` when this slab is stored in 1-byte `DictText` form.
+    /// `dict[0]` is `Value::Empty`, and `dict[1..]` are distinct `Value::Text` values.
+    #[inline]
+    pub fn dict_text(&self) -> Option<(&[u8], &[Value])> {
+        match &self.repr {
+            ValueSlabRepr::Dict { codes, dict } => Some((&codes[..self.len as usize], dict.as_slice())),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        match &self.repr {
+            ValueSlabRepr::Sparse(v) => v.capacity(),
+            ValueSlabRepr::Dict { codes, .. } => codes.capacity(),
+            ValueSlabRepr::Dense(v) => v.capacity(),
+        }
+    }
+
+    #[inline]
+    pub fn heap_payload_bytes(&self) -> usize {
+        let base = match &self.repr {
+            ValueSlabRepr::Sparse(v) => v.capacity() * std::mem::size_of::<Value>(),
+            ValueSlabRepr::Dict { codes, dict } => {
+                codes.capacity() * std::mem::size_of::<u8>()
+                    + dict.capacity() * std::mem::size_of::<Value>()
+            }
+            ValueSlabRepr::Dense(v) => v.capacity() * std::mem::size_of::<Value>(),
+        };
+        let cache = self
+            .dense_cache
+            .get()
+            .map_or(0, |b| b.len() * std::mem::size_of::<Value>());
+        base + cache
+    }
+
+    #[inline]
+    pub fn occupied_count(&self) -> usize {
+        (self.present[0].count_ones()
+            + self.present[1].count_ones()
+            + self.present[2].count_ones()
+            + self.present[3].count_ones()) as usize
+    }
+
+    #[inline]
+    pub fn contains(&self, ro: u32) -> bool {
+        ro < PAGE_ROWS && (self.present[(ro / 64) as usize] & (1u64 << (ro % 64))) != 0
+    }
+
+    /// Fast non-materializing lookup of an occupied cell at row offset `ro`.
+    #[inline]
+    pub fn get_val(&self, ro: usize) -> Option<&Value> {
+        if ro >= self.len as usize {
+            return None;
+        }
+        let w = ro / 64;
+        let bit = 1u64 << (ro % 64);
+        if (self.present[w] & bit) == 0 {
+            return None;
+        }
+        match &self.repr {
+            ValueSlabRepr::Sparse(items) => {
+                let rank = rank_in_rows(&self.present, w, bit);
+                items.get(rank)
+            }
+            ValueSlabRepr::Dict { codes, dict } => {
+                let code = *codes.get(ro)?;
+                dict.get(code as usize)
+            }
+            ValueSlabRepr::Dense(vals) => vals.get(ro),
+        }
+    }
+
+    /// Visit every occupied `(ro, &Value)` in ascending row order without materializing `dense_cache`.
+    #[inline]
+    pub fn for_each_occupied(&self, mut f: impl FnMut(usize, &Value)) {
+        match &self.repr {
+            ValueSlabRepr::Sparse(items) => {
+                let mut rank = 0usize;
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        f(w * 64 + tz, &items[rank]);
+                        rank += 1;
+                    }
+                }
+            }
+            ValueSlabRepr::Dict { codes, dict } => {
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let ro = w * 64 + tz;
+                        f(ro, &dict[codes[ro] as usize]);
+                    }
+                }
+            }
+            ValueSlabRepr::Dense(vals) => {
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let ro = w * 64 + tz;
+                        f(ro, &vals[ro]);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn all_numbers(&self) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        match &self.repr {
+            ValueSlabRepr::Dict { .. } => false,
+            ValueSlabRepr::Sparse(items) => items.iter().all(|v| matches!(v, Value::Number(_))),
+            ValueSlabRepr::Dense(vals) => {
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        if !matches!(vals[w * 64 + tz], Value::Number(_)) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    fn to_number_slab(&self) -> NumberSlab {
+        let len = self.len as usize;
+        let mut values = vec![0.0; len];
+        self.for_each_occupied(|ro, v| {
+            if let Value::Number(n) = *v {
+                values[ro] = n;
+            }
+        });
+        NumberSlab {
+            present: self.present,
+            values,
+        }
+    }
+
+    fn expand_to_dense(&mut self) -> &mut Vec<Value> {
+        if !matches!(self.repr, ValueSlabRepr::Dense(_)) {
+            let len = self.len as usize;
+            let mut out = Vec::with_capacity(len.max(64).min(PAGE_ROWS as usize));
+            out.resize(len, Value::Empty);
+            match &mut self.repr {
+                ValueSlabRepr::Sparse(items) => {
+                    let mut iter = std::mem::take(items).into_iter();
+                    for w in 0..4 {
+                        let mut bits = self.present[w];
+                        while bits != 0 {
+                            let tz = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            if let Some(v) = iter.next() {
+                                out[w * 64 + tz] = v;
+                            }
+                        }
+                    }
+                }
+                ValueSlabRepr::Dict { codes, dict } => {
+                    for (ro, &c) in codes[..len.min(codes.len())].iter().enumerate() {
+                        if c != 0 {
+                            out[ro] = dict[c as usize].clone();
+                        }
+                    }
+                }
+                ValueSlabRepr::Dense(_) => unreachable!(),
+            }
+            self.repr = ValueSlabRepr::Dense(out);
+        }
+        match &mut self.repr {
+            ValueSlabRepr::Dense(v) => v,
+            _ => unreachable!(),
+        }
+    }
+
+    fn upgrade_sparse_after_insert(&mut self) {
+        let ValueSlabRepr::Sparse(items) = &mut self.repr else {
+            return;
+        };
+        if items.len() <= SPARSE_SLAB_CAP {
+            return;
+        }
+        let len = self.len as usize;
+        let all_text = items.iter().all(|v| matches!(v, Value::Text(_)));
+        if all_text {
+            let mut dict = Vec::with_capacity(16);
+            dict.push(Value::Empty);
+            let mut codes = vec![0u8; len];
+            let mut ok = true;
+            let mut rank = 0usize;
+            'outer: for w in 0..4 {
+                let mut bits = self.present[w];
+                while bits != 0 {
+                    let tz = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let ro = w * 64 + tz;
+                    if let Value::Text(s) = &items[rank] {
+                        if let Some(code) = dict_lookup_or_insert(&mut dict, s) {
+                            codes[ro] = code;
+                        } else {
+                            ok = false;
+                            break 'outer;
+                        }
+                    }
+                    rank += 1;
+                }
+            }
+            if ok {
+                codes.reserve((PAGE_ROWS as usize).saturating_sub(codes.len()));
+                self.repr = ValueSlabRepr::Dict { codes, dict };
+                return;
+            }
+        }
+        self.expand_to_dense();
+    }
+
+    pub fn set(&mut self, ro: u32, value: Value) -> bool {
+        debug_assert!(!value.is_empty() && ro < PAGE_ROWS);
+        self.dense_cache.take();
+        let idx = ro as usize;
+        let w = idx / 64;
+        let bit = 1u64 << (idx % 64);
+        let existed = (self.present[w] & bit) != 0;
+        let rank_before = rank_in_rows(&self.present, w, bit);
+        self.present[w] |= bit;
+        if (idx + 1) as u16 > self.len {
+            self.len = (idx + 1) as u16;
+        }
+        match &mut self.repr {
+            ValueSlabRepr::Sparse(items) => {
+                if existed {
+                    items[rank_before] = value;
+                } else {
+                    items.insert(rank_before, value);
+                    if items.len() > SPARSE_SLAB_CAP {
+                        self.upgrade_sparse_after_insert();
+                    }
+                }
+            }
+            ValueSlabRepr::Dict { codes, dict } => {
+                if let Value::Text(ref s) = value
+                    && let Some(code) = dict_lookup_or_insert(dict, s)
+                {
+                    if codes.len() < self.len as usize {
+                        codes.resize(self.len as usize, 0);
+                    }
+                    codes[idx] = code;
+                } else {
+                    let target_len = self.len as usize;
+                    let dense = self.expand_to_dense();
+                    grow_slab_vec(dense, target_len, Value::Empty);
+                    dense[idx] = value;
+                }
+            }
+            ValueSlabRepr::Dense(vals) => {
+                grow_slab_vec(vals, self.len as usize, Value::Empty);
+                vals[idx] = value;
+            }
+        }
+        existed
+    }
+
+    pub fn remove(&mut self, ro: u32) -> Option<Value> {
+        let idx = ro as usize;
+        if idx >= self.len as usize {
+            return None;
+        }
+        let w = idx / 64;
+        let bit = 1u64 << (idx % 64);
+        if (self.present[w] & bit) == 0 {
+            return None;
+        }
+        self.dense_cache.take();
+        let rank = rank_in_rows(&self.present, w, bit);
+        self.present[w] &= !bit;
+        self.len = highest_bit_plus_one(&self.present) as u16;
+        let old = match &mut self.repr {
+            ValueSlabRepr::Sparse(items) => items.remove(rank),
+            ValueSlabRepr::Dict { codes, dict } => {
+                let code = codes[idx] as usize;
+                codes[idx] = 0;
+                codes.truncate(self.len as usize);
+                dict[code].clone()
+            }
+            ValueSlabRepr::Dense(vals) => {
+                let old = std::mem::take(&mut vals[idx]);
+                vals.truncate(self.len as usize);
+                old
+            }
+        };
+        if self.present == [0; 4] {
+            self.repr = ValueSlabRepr::Sparse(Vec::new());
+        } else {
+            self.maybe_compact_sparse();
+        }
+        Some(old)
+    }
+
+    fn maybe_compact_sparse(&mut self) {
+        if matches!(self.repr, ValueSlabRepr::Sparse(_)) {
+            return;
+        }
+        let occ = self.occupied_count();
+        if occ <= SPARSE_SLAB_CAP / 2 {
+            let mut items = Vec::with_capacity(occ);
+            self.for_each_occupied(|_, v| items.push(v.clone()));
+            self.repr = ValueSlabRepr::Sparse(items);
+        }
+    }
+
+    pub fn clear_range(&mut self, lo: usize, hi_incl: usize) -> (usize, [u64; 4]) {
+        let end = (hi_incl + 1).min(self.len as usize);
+        if lo >= end {
+            return (0, [0; 4]);
+        }
+        let m = row_range_mask(lo as u32, (end - 1) as u32);
+        let removed_mask = [
+            self.present[0] & m[0],
+            self.present[1] & m[1],
+            self.present[2] & m[2],
+            self.present[3] & m[3],
+        ];
+        let removed = (removed_mask[0].count_ones()
+            + removed_mask[1].count_ones()
+            + removed_mask[2].count_ones()
+            + removed_mask[3].count_ones()) as usize;
+        if removed == 0 {
+            return (0, [0; 4]);
+        }
+        self.dense_cache.take();
+        match &mut self.repr {
+            ValueSlabRepr::Sparse(items) => {
+                let lo_rank = count_bits_below(&self.present, lo as u32);
+                items.drain(lo_rank..lo_rank + removed);
+            }
+            ValueSlabRepr::Dict { codes, .. } => {
+                codes[lo..end].fill(0);
+            }
+            ValueSlabRepr::Dense(vals) => {
+                for v in &mut vals[lo..end] {
+                    *v = Value::Empty;
+                }
+            }
+        }
+        for w in 0..4 {
+            self.present[w] &= !m[w];
+        }
+        self.len = highest_bit_plus_one(&self.present) as u16;
+        match &mut self.repr {
+            ValueSlabRepr::Sparse(_) => {}
+            ValueSlabRepr::Dict { codes, .. } => codes.truncate(self.len as usize),
+            ValueSlabRepr::Dense(vals) => vals.truncate(self.len as usize),
+        }
+        if self.present == [0; 4] {
+            self.repr = ValueSlabRepr::Sparse(Vec::new());
+        } else {
+            self.maybe_compact_sparse();
+        }
+        (removed, removed_mask)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum MixedSlabRepr {
+    Sparse(Vec<Cell>),
+    Dense(Vec<Cell>),
+}
+
+/// Formula-capable 256-row column slab with `[u64; 4]` occupancy + formula bitmaps,
+/// sparse packing (`<= 32` cells), and `Deref<Target = [Cell]>` compatibility.
+#[derive(Debug)]
+pub struct MixedSlab {
+    pub(crate) present: [u64; 4],
+    pub(crate) formula_mask: [u64; 4],
+    len: u16,
+    dirty_mut: bool,
+    pub(crate) repr: MixedSlabRepr,
+    dense_cache: OnceLock<Box<[Cell]>>,
+}
+
+impl Default for MixedSlab {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            present: [0; 4],
+            formula_mask: [0; 4],
+            len: 0,
+            dirty_mut: false,
+            repr: MixedSlabRepr::Sparse(Vec::new()),
+            dense_cache: OnceLock::new(),
+        }
+    }
+}
+
+impl Clone for MixedSlab {
+    fn clone(&self) -> Self {
+        Self {
+            present: self.present,
+            formula_mask: self.formula_mask,
+            len: self.len,
+            dirty_mut: self.dirty_mut,
+            repr: self.repr.clone(),
+            dense_cache: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for MixedSlab {
+    fn eq(&self, other: &Self) -> bool {
+        let pm_a = self.row_mask();
+        let pm_b = other.row_mask();
+        if pm_a != pm_b {
+            return false;
+        }
+        if !self.dirty_mut && !other.dirty_mut && self.formula_mask != other.formula_mask {
+            return false;
+        }
+        for w in 0..4 {
+            let mut bits = pm_a[w];
+            while bits != 0 {
+                let tz = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let ro = w * 64 + tz;
+                if self.get_cell(ro) != other.get_cell(ro) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+impl From<Vec<Cell>> for MixedSlab {
+    #[inline]
+    fn from(cells: Vec<Cell>) -> Self {
+        Self::from_vec(cells)
+    }
+}
+
+impl FromIterator<Cell> for MixedSlab {
+    #[inline]
+    fn from_iter<T: IntoIterator<Item = Cell>>(iter: T) -> Self {
+        Self::from_vec(iter.into_iter().collect())
+    }
+}
+
+impl std::ops::Deref for MixedSlab {
+    type Target = [Cell];
+
+    #[inline]
+    fn deref(&self) -> &[Cell] {
+        match &self.repr {
+            MixedSlabRepr::Dense(v) => v.as_slice(),
+            MixedSlabRepr::Sparse(_) => self.dense_cache.get_or_init(|| self.materialize_boxed()),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a MixedSlab {
+    type Item = &'a Cell;
+    type IntoIter = std::slice::Iter<'a, Cell>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        let slice: &'a [Cell] = self;
+        slice.iter()
+    }
+}
+
+impl MixedSlab {
+    #[inline]
+    pub fn as_slice(&self) -> &[Cell] {
+        self
+    }
+
+    pub fn from_vec(mut cells: Vec<Cell>) -> Self {
+        while cells.last().is_some_and(Cell::is_blank) {
+            cells.pop();
+        }
+        if cells.is_empty() {
+            return Self::default();
+        }
+        let len = cells.len();
+        let mut present = [0u64; 4];
+        let mut formula_mask = [0u64; 4];
+        let mut occupied = 0usize;
+        for (r, c) in cells.iter().enumerate() {
+            if !c.is_blank() {
+                present[r / 64] |= 1u64 << (r % 64);
+                occupied += 1;
+                if c.formula.is_some() {
+                    formula_mask[r / 64] |= 1u64 << (r % 64);
+                }
+            }
+        }
+        if occupied == 0 {
+            return Self::default();
+        }
+        if occupied <= SPARSE_SLAB_CAP {
+            let mut items = Vec::with_capacity(occupied);
+            for c in cells {
+                if !c.is_blank() {
+                    items.push(c);
+                }
+            }
+            return Self {
+                present,
+                formula_mask,
+                len: len as u16,
+                dirty_mut: false,
+                repr: MixedSlabRepr::Sparse(items),
+                dense_cache: OnceLock::new(),
+            };
+        }
+        Self {
+            present,
+            formula_mask,
+            len: len as u16,
+            dirty_mut: false,
+            repr: MixedSlabRepr::Dense(cells),
+            dense_cache: OnceLock::new(),
+        }
+    }
+
+    fn materialize_boxed(&self) -> Box<[Cell]> {
+        let len = self.len();
+        if len == 0 {
+            return Box::new([]);
+        }
+        match &self.repr {
+            MixedSlabRepr::Dense(v) => v.clone().into_boxed_slice(),
+            MixedSlabRepr::Sparse(items) => {
+                let mut out = vec![Cell::default(); len];
+                let mut rank = 0usize;
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        out[w * 64 + tz] = items[rank].clone();
+                        rank += 1;
+                    }
+                }
+                out.into_boxed_slice()
+            }
+        }
+    }
+
+    pub fn into_vec(self) -> Vec<Cell> {
+        match self.repr {
+            MixedSlabRepr::Dense(mut v) => {
+                while v.last().is_some_and(Cell::is_blank) {
+                    v.pop();
+                }
+                v
+            }
+            MixedSlabRepr::Sparse(items) => {
+                let len = self.len as usize;
+                if len == 0 {
+                    return Vec::new();
+                }
+                let mut out = vec![Cell::default(); len];
+                let mut iter = items.into_iter();
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        if let Some(c) = iter.next() {
+                            out[w * 64 + tz] = c;
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        if self.dirty_mut
+            && let MixedSlabRepr::Dense(cells) = &self.repr
+        {
+            return cells
+                .iter()
+                .rposition(|c| !c.is_blank())
+                .map_or(0, |idx| idx + 1);
+        }
+        self.len as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        if self.dirty_mut
+            && let MixedSlabRepr::Dense(cells) = &self.repr
+        {
+            return cells.iter().all(Cell::is_blank);
+        }
+        self.present == [0; 4]
+    }
+
+    #[inline]
+    pub fn has_formulas(&self) -> bool {
+        if self.dirty_mut
+            && let MixedSlabRepr::Dense(cells) = &self.repr
+        {
+            return cells.iter().any(|c| c.formula.is_some());
+        }
+        self.formula_mask != [0; 4]
+    }
+
+    #[inline]
+    pub fn row_mask(&self) -> [u64; 4] {
+        if self.dirty_mut
+            && let MixedSlabRepr::Dense(cells) = &self.repr
+        {
+            let mut m = [0u64; 4];
+            for (r, c) in cells.iter().enumerate() {
+                if !c.is_blank() {
+                    m[r / 64] |= 1u64 << (r % 64);
+                }
+            }
+            return m;
+        }
+        self.present
+    }
+
+    #[inline]
+    pub fn row_mask_from(&self, begin: usize) -> [u64; 4] {
+        let pm = self.row_mask();
+        mask_from_offset(&pm, begin)
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        match &self.repr {
+            MixedSlabRepr::Sparse(v) => v.capacity(),
+            MixedSlabRepr::Dense(v) => v.capacity(),
+        }
+    }
+
+    #[inline]
+    pub fn heap_payload_bytes(&self) -> usize {
+        let base = match &self.repr {
+            MixedSlabRepr::Sparse(v) => v.capacity() * std::mem::size_of::<Cell>(),
+            MixedSlabRepr::Dense(v) => v.capacity() * std::mem::size_of::<Cell>(),
+        };
+        let cache = self
+            .dense_cache
+            .get()
+            .map_or(0, |b| b.len() * std::mem::size_of::<Cell>());
+        base + cache
+    }
+
+    #[inline]
+    pub fn occupied_count(&self) -> usize {
+        let pm = self.row_mask();
+        (pm[0].count_ones() + pm[1].count_ones() + pm[2].count_ones() + pm[3].count_ones()) as usize
+    }
+
+    #[inline]
+    pub fn contains(&self, ro: u32) -> bool {
+        if self.dirty_mut
+            && let MixedSlabRepr::Dense(cells) = &self.repr
+        {
+            return cells.get(ro as usize).is_some_and(|c| !c.is_blank());
+        }
+        ro < PAGE_ROWS && (self.present[(ro / 64) as usize] & (1u64 << (ro % 64))) != 0
+    }
+
+    #[inline]
+    pub fn first_last_occupied(&self) -> Option<(u32, u32)> {
+        let pm = self.row_mask();
+        first_last_bits(&pm)
+    }
+
+    #[inline]
+    pub fn has_any_in(&self, lo: usize, hi_excl: usize) -> bool {
+        let pm = self.row_mask();
+        has_bits_in(&pm, lo, hi_excl)
+    }
+
+    #[inline]
+    pub fn next_occupied_from(&self, lo: usize) -> Option<u32> {
+        let pm = self.row_mask();
+        next_bit_from(&pm, lo)
+    }
+
+    #[inline]
+    pub fn prev_occupied_before(&self, hi_excl: usize) -> Option<u32> {
+        let pm = self.row_mask();
+        prev_bit_before(&pm, hi_excl)
+    }
+
+    #[inline]
+    pub fn get_cell(&self, ro: usize) -> Option<&Cell> {
+        if self.dirty_mut
+            && let MixedSlabRepr::Dense(cells) = &self.repr
+        {
+            return cells.get(ro).filter(|c| !c.is_blank());
+        }
+        if ro >= self.len as usize {
+            return None;
+        }
+        let w = ro / 64;
+        let bit = 1u64 << (ro % 64);
+        if (self.present[w] & bit) == 0 {
+            return None;
+        }
+        match &self.repr {
+            MixedSlabRepr::Sparse(items) => {
+                let rank = rank_in_rows(&self.present, w, bit);
+                items.get(rank)
+            }
+            MixedSlabRepr::Dense(cells) => cells.get(ro),
+        }
+    }
+
+    #[inline]
+    pub fn for_each_occupied(&self, mut f: impl FnMut(usize, &Cell)) {
+        if self.dirty_mut
+            && let MixedSlabRepr::Dense(cells) = &self.repr
+        {
+            for (ro, c) in cells.iter().enumerate() {
+                if !c.is_blank() {
+                    f(ro, c);
+                }
+            }
+            return;
+        }
+        match &self.repr {
+            MixedSlabRepr::Sparse(items) => {
+                let mut rank = 0usize;
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        f(w * 64 + tz, &items[rank]);
+                        rank += 1;
+                    }
+                }
+            }
+            MixedSlabRepr::Dense(cells) => {
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let ro = w * 64 + tz;
+                        f(ro, &cells[ro]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn expand_to_dense(&mut self) -> &mut Vec<Cell> {
+        if !matches!(self.repr, MixedSlabRepr::Dense(_)) {
+            let len = self.len as usize;
+            let mut out = Vec::with_capacity(len.max(64).min(PAGE_ROWS as usize));
+            out.resize(len, Cell::default());
+            if let MixedSlabRepr::Sparse(items) = &mut self.repr {
+                let mut iter = std::mem::take(items).into_iter();
+                for w in 0..4 {
+                    let mut bits = self.present[w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        if let Some(c) = iter.next() {
+                            out[w * 64 + tz] = c;
+                        }
+                    }
+                }
+            }
+            self.repr = MixedSlabRepr::Dense(out);
+        }
+        match &mut self.repr {
+            MixedSlabRepr::Dense(v) => v,
+            _ => unreachable!(),
+        }
+    }
+
+    fn maybe_compact_sparse(&mut self) {
+        if self.dirty_mut || matches!(self.repr, MixedSlabRepr::Sparse(_)) {
+            return;
+        }
+        let occ = self.occupied_count();
+        if occ <= SPARSE_SLAB_CAP / 2 {
+            let mut items = Vec::with_capacity(occ);
+            self.for_each_occupied(|_, c| items.push(c.clone()));
+            self.repr = MixedSlabRepr::Sparse(items);
+        }
+    }
+
+    /// Recompute bitmaps after external `&mut Cell` mutation via legacy `get_mut`.
+    pub(crate) fn refresh_masks_from_dense(&mut self) {
+        self.dense_cache.take();
+        self.dirty_mut = false;
+        let MixedSlabRepr::Dense(cells) = &mut self.repr else {
+            return;
+        };
+        while cells.last().is_some_and(Cell::is_blank) {
+            cells.pop();
+        }
+        self.len = cells.len() as u16;
+        self.present = [0; 4];
+        self.formula_mask = [0; 4];
+        for (r, c) in cells.iter().enumerate() {
+            if !c.is_blank() {
+                self.present[r / 64] |= 1u64 << (r % 64);
+                if c.formula.is_some() {
+                    self.formula_mask[r / 64] |= 1u64 << (r % 64);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn get_mut_cell_legacy(&mut self, ro: u32) -> Option<&mut Cell> {
+        if self.dirty_mut {
+            self.refresh_masks_from_dense();
+        }
+        self.dense_cache.take();
+        self.dirty_mut = true;
+        let idx = ro as usize;
+        let vec = self.expand_to_dense();
+        vec.get_mut(idx)
+    }
+
+    pub fn set(&mut self, ro: u32, cell: Cell) -> (bool, bool) {
+        debug_assert!(!cell.is_blank() && ro < PAGE_ROWS);
+        if self.dirty_mut {
+            self.refresh_masks_from_dense();
+        }
+        self.dense_cache.take();
+        let idx = ro as usize;
+        let w = idx / 64;
+        let bit = 1u64 << (idx % 64);
+        let existed = (self.present[w] & bit) != 0;
+        let old_f = (self.formula_mask[w] & bit) != 0;
+        let rank_before = rank_in_rows(&self.present, w, bit);
+        self.present[w] |= bit;
+        if cell.formula.is_some() {
+            self.formula_mask[w] |= bit;
+        } else {
+            self.formula_mask[w] &= !bit;
+        }
+        if (idx + 1) as u16 > self.len {
+            self.len = (idx + 1) as u16;
+        }
+        match &mut self.repr {
+            MixedSlabRepr::Sparse(items) => {
+                if existed {
+                    items[rank_before] = cell;
+                } else {
+                    items.insert(rank_before, cell);
+                    if items.len() > SPARSE_SLAB_CAP {
+                        self.expand_to_dense();
+                    }
+                }
+            }
+            MixedSlabRepr::Dense(cells) => {
+                grow_slab_vec(cells, self.len as usize, Cell::default());
+                cells[idx] = cell;
+            }
+        }
+        (existed, old_f)
+    }
+
+    pub fn set_formula_in_place(&mut self, ro: u32, formula: Arc<str>) -> bool {
+        if self.dirty_mut {
+            self.refresh_masks_from_dense();
+        }
+        let idx = ro as usize;
+        if idx >= self.len as usize {
+            return false;
+        }
+        let w = idx / 64;
+        let bit = 1u64 << (idx % 64);
+        if (self.present[w] & bit) == 0 {
+            return false;
+        }
+        self.dense_cache.take();
+        let had_formula = (self.formula_mask[w] & bit) != 0;
+        self.formula_mask[w] |= bit;
+        match &mut self.repr {
+            MixedSlabRepr::Sparse(items) => {
+                let rank = rank_in_rows(&self.present, w, bit);
+                items[rank].formula = Some(formula);
+            }
+            MixedSlabRepr::Dense(cells) => {
+                cells[idx].formula = Some(formula);
+            }
+        }
+        !had_formula
+    }
+
+    pub fn set_cached_value(&mut self, ro: u32, value: Value) -> bool {
+        if self.dirty_mut {
+            self.refresh_masks_from_dense();
+        }
+        let idx = ro as usize;
+        if idx >= self.len as usize {
+            return false;
+        }
+        let w = idx / 64;
+        let bit = 1u64 << (idx % 64);
+        if (self.present[w] & bit) == 0 {
+            return false;
+        }
+        self.dense_cache.take();
+        match &mut self.repr {
+            MixedSlabRepr::Sparse(items) => {
+                let rank = rank_in_rows(&self.present, w, bit);
+                items[rank].value = value;
+                if items[rank].is_blank() {
+                    items.remove(rank);
+                    self.present[w] &= !bit;
+                    self.formula_mask[w] &= !bit;
+                    self.len = highest_bit_plus_one(&self.present) as u16;
+                    return true;
+                }
+                false
+            }
+            MixedSlabRepr::Dense(cells) => {
+                cells[idx].value = value;
+                if cells[idx].is_blank() {
+                    self.present[w] &= !bit;
+                    self.formula_mask[w] &= !bit;
+                    self.len = highest_bit_plus_one(&self.present) as u16;
+                    cells.truncate(self.len as usize);
+                    self.maybe_compact_sparse();
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    pub fn remove(&mut self, ro: u32) -> Option<Cell> {
+        if self.dirty_mut {
+            self.refresh_masks_from_dense();
+        }
+        let idx = ro as usize;
+        if idx >= self.len as usize {
+            return None;
+        }
+        let w = idx / 64;
+        let bit = 1u64 << (idx % 64);
+        if (self.present[w] & bit) == 0 {
+            return None;
+        }
+        self.dense_cache.take();
+        let rank = rank_in_rows(&self.present, w, bit);
+        self.present[w] &= !bit;
+        self.formula_mask[w] &= !bit;
+        self.len = highest_bit_plus_one(&self.present) as u16;
+        let old = match &mut self.repr {
+            MixedSlabRepr::Sparse(items) => items.remove(rank),
+            MixedSlabRepr::Dense(cells) => {
+                let old = std::mem::take(&mut cells[idx]);
+                cells.truncate(self.len as usize);
+                old
+            }
+        };
+        if self.present == [0; 4] {
+            self.repr = MixedSlabRepr::Sparse(Vec::new());
+        } else {
+            self.maybe_compact_sparse();
+        }
+        Some(old)
+    }
+
+    pub fn clear_range(&mut self, lo: usize, hi_incl: usize) -> (usize, [u64; 4]) {
+        if self.dirty_mut {
+            self.refresh_masks_from_dense();
+        }
+        let end = (hi_incl + 1).min(self.len as usize);
+        if lo >= end {
+            return (0, [0; 4]);
+        }
+        let m = row_range_mask(lo as u32, (end - 1) as u32);
+        let removed_mask = [
+            self.present[0] & m[0],
+            self.present[1] & m[1],
+            self.present[2] & m[2],
+            self.present[3] & m[3],
+        ];
+        let removed = (removed_mask[0].count_ones()
+            + removed_mask[1].count_ones()
+            + removed_mask[2].count_ones()
+            + removed_mask[3].count_ones()) as usize;
+        if removed == 0 {
+            return (0, [0; 4]);
+        }
+        self.dense_cache.take();
+        match &mut self.repr {
+            MixedSlabRepr::Sparse(items) => {
+                let lo_rank = count_bits_below(&self.present, lo as u32);
+                items.drain(lo_rank..lo_rank + removed);
+            }
+            MixedSlabRepr::Dense(cells) => {
+                for c in &mut cells[lo..end] {
+                    *c = Cell::default();
+                }
+            }
+        }
+        for w in 0..4 {
+            self.present[w] &= !m[w];
+            self.formula_mask[w] &= !m[w];
+        }
+        self.len = highest_bit_plus_one(&self.present) as u16;
+        if let MixedSlabRepr::Dense(cells) = &mut self.repr {
+            cells.truncate(self.len as usize);
+        }
+        if self.present == [0; 4] {
+            self.repr = MixedSlabRepr::Sparse(Vec::new());
+        } else {
+            self.maybe_compact_sparse();
+        }
+        (removed, removed_mask)
+    }
+}
+
 /// Typed 256-row column slab:
 /// - `Numbers`: pure `f64` column page (8 B/row + 32 B presence bitmap, zero formula overhead).
-/// - `Values`: non-formula value column page (24 B/row, preserving `Arc<str>` zero-copy).
-/// - `Mixed`: formula-bearing (or `get_mut`-promoted) column page (40 B/row).
+/// - `Values`: non-formula value column page (`Sparse` / 1-byte `DictText` / `Dense`, `[u64; 4]` bitmap).
+/// - `Mixed`: formula-bearing column page (`Sparse` / `Dense`, `[u64; 4]` occupancy + formula bitmaps).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ColSlab {
     Numbers(NumberSlab),
-    Values(Vec<Value>),
-    Mixed(Vec<Cell>),
+    Values(ValueSlab),
+    Mixed(MixedSlab),
 }
 
 /// Zero-copy borrowed slice of a column slab across `[start..end)` of a single 256-row page.
@@ -2900,12 +4565,12 @@ impl ColSlab {
 
     #[inline]
     pub fn new_values() -> Self {
-        Self::Values(Vec::new())
+        Self::Values(ValueSlab::default())
     }
 
     #[inline]
     pub fn new_mixed() -> Self {
-        Self::Mixed(Vec::new())
+        Self::Mixed(MixedSlab::default())
     }
 
     #[inline]
@@ -2955,8 +4620,8 @@ impl ColSlab {
         std::mem::size_of::<Self>()
             + match self {
                 Self::Numbers(ns) => ns.values.capacity() * std::mem::size_of::<f64>(),
-                Self::Values(vs) => vs.capacity() * std::mem::size_of::<Value>(),
-                Self::Mixed(cs) => cs.capacity() * std::mem::size_of::<Cell>(),
+                Self::Values(vs) => vs.heap_payload_bytes(),
+                Self::Mixed(cs) => cs.heap_payload_bytes(),
             }
     }
 
@@ -2964,8 +4629,8 @@ impl ColSlab {
     pub fn contains(&self, ro: u32) -> bool {
         match self {
             Self::Numbers(ns) => ns.contains(ro),
-            Self::Values(vs) => vs.get(ro as usize).is_some_and(|v| !v.is_empty()),
-            Self::Mixed(cs) => cs.get(ro as usize).is_some_and(|c| !c.is_blank()),
+            Self::Values(vs) => vs.contains(ro),
+            Self::Mixed(cs) => cs.contains(ro),
         }
     }
 
@@ -2973,14 +4638,8 @@ impl ColSlab {
     pub fn get_view(&self, ro: u32) -> Option<CellView<'_>> {
         match self {
             Self::Numbers(ns) => ns.get(ro).map(CellView::Number),
-            Self::Values(vs) => {
-                let v = vs.get(ro as usize)?;
-                (!v.is_empty()).then_some(CellView::Value(v))
-            }
-            Self::Mixed(cs) => {
-                let c = cs.get(ro as usize)?;
-                (!c.is_blank()).then_some(CellView::Cell(c))
-            }
+            Self::Values(vs) => vs.get_val(ro as usize).map(CellView::Value),
+            Self::Mixed(cs) => cs.get_cell(ro as usize).map(CellView::Cell),
         }
     }
 
@@ -2993,11 +4652,11 @@ impl ColSlab {
     pub fn get_f64(&self, ro: u32) -> Option<f64> {
         match self {
             Self::Numbers(ns) => ns.get(ro),
-            Self::Values(vs) => match vs.get(ro as usize)? {
+            Self::Values(vs) => match vs.get_val(ro as usize)? {
                 Value::Number(n) => Some(*n),
                 _ => None,
             },
-            Self::Mixed(cs) => match &cs.get(ro as usize)?.value {
+            Self::Mixed(cs) => match &cs.get_cell(ro as usize)?.value {
                 Value::Number(n) => Some(*n),
                 _ => None,
             },
@@ -3008,12 +4667,12 @@ impl ColSlab {
     pub fn get_f64_plain(&self, ro: u32) -> Option<f64> {
         match self {
             Self::Numbers(ns) => ns.get(ro),
-            Self::Values(vs) => match vs.get(ro as usize)? {
+            Self::Values(vs) => match vs.get_val(ro as usize)? {
                 Value::Number(n) => Some(*n),
                 _ => None,
             },
             Self::Mixed(cs) => {
-                let c = cs.get(ro as usize)?;
+                let c = cs.get_cell(ro as usize)?;
                 if c.formula.is_some() {
                     return None;
                 }
@@ -3029,14 +4688,8 @@ impl ColSlab {
     pub fn value_ref(&self, ro: u32) -> Option<Cow<'_, Value>> {
         match self {
             Self::Numbers(ns) => ns.get(ro).map(|n| Cow::Owned(Value::Number(n))),
-            Self::Values(vs) => {
-                let v = vs.get(ro as usize)?;
-                (!v.is_empty()).then_some(Cow::Borrowed(v))
-            }
-            Self::Mixed(cs) => {
-                let c = cs.get(ro as usize)?;
-                (!c.is_blank()).then_some(Cow::Borrowed(&c.value))
-            }
+            Self::Values(vs) => vs.get_val(ro as usize).map(Cow::Borrowed),
+            Self::Mixed(cs) => cs.get_cell(ro as usize).map(|c| Cow::Borrowed(&c.value)),
         }
     }
 
@@ -3044,9 +4697,9 @@ impl ColSlab {
     pub fn value(&self, ro: u32) -> Value {
         match self {
             Self::Numbers(ns) => ns.get(ro).map_or(Value::Empty, Value::Number),
-            Self::Values(vs) => vs.get(ro as usize).cloned().unwrap_or_default(),
+            Self::Values(vs) => vs.get_val(ro as usize).cloned().unwrap_or_default(),
             Self::Mixed(cs) => cs
-                .get(ro as usize)
+                .get_cell(ro as usize)
                 .map(|c| c.value.clone())
                 .unwrap_or_default(),
         }
@@ -3056,7 +4709,7 @@ impl ColSlab {
     pub fn formula_of(&self, ro: u32) -> Option<&str> {
         match self {
             Self::Numbers(_) | Self::Values(_) => None,
-            Self::Mixed(cs) => cs.get(ro as usize)?.formula.as_deref(),
+            Self::Mixed(cs) => cs.get_cell(ro as usize)?.formula.as_deref(),
         }
     }
 
@@ -3064,7 +4717,7 @@ impl ColSlab {
     pub fn formula_arc_of(&self, ro: u32) -> Option<&Arc<str>> {
         match self {
             Self::Numbers(_) | Self::Values(_) => None,
-            Self::Mixed(cs) => cs.get(ro as usize)?.formula.as_ref(),
+            Self::Mixed(cs) => cs.get_cell(ro as usize)?.formula.as_ref(),
         }
     }
 
@@ -3072,61 +4725,17 @@ impl ColSlab {
     pub fn row_mask(&self) -> [u64; 4] {
         match self {
             Self::Numbers(ns) => ns.present,
-            Self::Values(vs) => {
-                let mut m = [0u64; 4];
-                for (r, v) in vs.iter().enumerate() {
-                    if !v.is_empty() {
-                        m[r / 64] |= 1u64 << (r % 64);
-                    }
-                }
-                m
-            }
-            Self::Mixed(cs) => {
-                let mut m = [0u64; 4];
-                for (r, c) in cs.iter().enumerate() {
-                    if !c.is_blank() {
-                        m[r / 64] |= 1u64 << (r % 64);
-                    }
-                }
-                m
-            }
+            Self::Values(vs) => vs.present,
+            Self::Mixed(cs) => cs.row_mask(),
         }
     }
 
     #[inline]
     pub fn row_mask_from(&self, begin: usize) -> [u64; 4] {
         match self {
-            Self::Numbers(ns) => {
-                if begin >= PAGE_ROWS as usize {
-                    [0; 4]
-                } else {
-                    let m = row_range_mask(begin as u32, PAGE_ROWS - 1);
-                    [
-                        ns.present[0] & m[0],
-                        ns.present[1] & m[1],
-                        ns.present[2] & m[2],
-                        ns.present[3] & m[3],
-                    ]
-                }
-            }
-            Self::Values(vs) => {
-                let mut m = [0u64; 4];
-                for (r, v) in vs.iter().enumerate().skip(begin) {
-                    if !v.is_empty() {
-                        m[r / 64] |= 1u64 << (r % 64);
-                    }
-                }
-                m
-            }
-            Self::Mixed(cs) => {
-                let mut m = [0u64; 4];
-                for (r, c) in cs.iter().enumerate().skip(begin) {
-                    if !c.is_blank() {
-                        m[r / 64] |= 1u64 << (r % 64);
-                    }
-                }
-                m
-            }
+            Self::Numbers(ns) => mask_from_offset(&ns.present, begin),
+            Self::Values(vs) => vs.row_mask_from(begin),
+            Self::Mixed(cs) => cs.row_mask_from(begin),
         }
     }
 
@@ -3134,8 +4743,8 @@ impl ColSlab {
     pub fn occupied_count(&self) -> usize {
         match self {
             Self::Numbers(ns) => ns.occupied_count(),
-            Self::Values(vs) => vs.iter().filter(|v| !v.is_empty()).count(),
-            Self::Mixed(cs) => cs.iter().filter(|c| !c.is_blank()).count(),
+            Self::Values(vs) => vs.occupied_count(),
+            Self::Mixed(cs) => cs.occupied_count(),
         }
     }
 
@@ -3143,16 +4752,8 @@ impl ColSlab {
     pub fn first_last_occupied(&self) -> Option<(u32, u32)> {
         match self {
             Self::Numbers(ns) => ns.first_last_occupied(),
-            Self::Values(vs) => {
-                let first = vs.iter().position(|v| !v.is_empty())?;
-                let last = vs.iter().rposition(|v| !v.is_empty()).unwrap();
-                Some((first as u32, last as u32))
-            }
-            Self::Mixed(cs) => {
-                let first = cs.iter().position(|c| !c.is_blank())?;
-                let last = cs.iter().rposition(|c| !c.is_blank()).unwrap();
-                Some((first as u32, last as u32))
-            }
+            Self::Values(vs) => vs.first_last_occupied(),
+            Self::Mixed(cs) => cs.first_last_occupied(),
         }
     }
 
@@ -3160,14 +4761,8 @@ impl ColSlab {
     pub fn has_any_in(&self, lo: usize, hi_excl: usize) -> bool {
         match self {
             Self::Numbers(ns) => ns.has_any_in(lo, hi_excl),
-            Self::Values(vs) => {
-                let hi = hi_excl.min(vs.len());
-                lo < hi && vs[lo..hi].iter().any(|v| !v.is_empty())
-            }
-            Self::Mixed(cs) => {
-                let hi = hi_excl.min(cs.len());
-                lo < hi && cs[lo..hi].iter().any(|c| !c.is_blank())
-            }
+            Self::Values(vs) => vs.has_any_in(lo, hi_excl),
+            Self::Mixed(cs) => cs.has_any_in(lo, hi_excl),
         }
     }
 
@@ -3175,16 +4770,8 @@ impl ColSlab {
     pub fn next_occupied_from(&self, lo: usize) -> Option<u32> {
         match self {
             Self::Numbers(ns) => ns.next_occupied_from(lo),
-            Self::Values(vs) => vs
-                .iter()
-                .enumerate()
-                .skip(lo)
-                .find_map(|(i, v)| (!v.is_empty()).then_some(i as u32)),
-            Self::Mixed(cs) => cs
-                .iter()
-                .enumerate()
-                .skip(lo)
-                .find_map(|(i, c)| (!c.is_blank()).then_some(i as u32)),
+            Self::Values(vs) => vs.next_occupied_from(lo),
+            Self::Mixed(cs) => cs.next_occupied_from(lo),
         }
     }
 
@@ -3192,24 +4779,8 @@ impl ColSlab {
     pub fn prev_occupied_before(&self, hi_excl: usize) -> Option<u32> {
         match self {
             Self::Numbers(ns) => ns.prev_occupied_before(hi_excl),
-            Self::Values(vs) => {
-                let hi = hi_excl.min(vs.len());
-                for i in (0..hi).rev() {
-                    if !vs[i].is_empty() {
-                        return Some(i as u32);
-                    }
-                }
-                None
-            }
-            Self::Mixed(cs) => {
-                let hi = hi_excl.min(cs.len());
-                for i in (0..hi).rev() {
-                    if !cs[i].is_blank() {
-                        return Some(i as u32);
-                    }
-                }
-                None
-            }
+            Self::Values(vs) => vs.prev_occupied_before(hi_excl),
+            Self::Mixed(cs) => cs.prev_occupied_before(hi_excl),
         }
     }
 
@@ -3241,60 +4812,79 @@ impl ColSlab {
         if len_a != len_b {
             return false;
         }
-        match (self, other) {
-            (Self::Numbers(na), Self::Numbers(nb)) if a_start == b_start => {
-                if len_a == 0 {
-                    return true;
-                }
-                let m = row_range_mask(a_start as u32, (a_end - 1) as u32);
-                if (na.present[0] & m[0]) != (nb.present[0] & m[0])
-                    || (na.present[1] & m[1]) != (nb.present[1] & m[1])
-                    || (na.present[2] & m[2]) != (nb.present[2] & m[2])
-                    || (na.present[3] & m[3]) != (nb.present[3] & m[3])
-                {
-                    return false;
-                }
+        if len_a == 0 {
+            return true;
+        }
+        if a_start == b_start {
+            let m = row_range_mask(a_start as u32, (a_end - 1) as u32);
+            let ma = self.row_mask();
+            let mb = other.row_mask();
+            if (ma[0] & m[0]) != (mb[0] & m[0])
+                || (ma[1] & m[1]) != (mb[1] & m[1])
+                || (ma[2] & m[2]) != (mb[2] & m[2])
+                || (ma[3] & m[3]) != (mb[3] & m[3])
+            {
+                return false;
+            }
+            if let (Self::Numbers(na), Self::Numbers(nb)) = (self, other) {
                 let sa = &na.values[a_start..a_end.min(na.values.len())];
                 let sb = &nb.values[b_start..b_end.min(nb.values.len())];
-                sa == sb
-            }
-            (Self::Values(va), Self::Values(vb)) => {
-                va.get(a_start..a_end) == vb.get(b_start..b_end)
-            }
-            (Self::Mixed(ca), Self::Mixed(cb)) => {
-                ca.get(a_start..a_end) == cb.get(b_start..b_end)
-            }
-            _ => {
-                for i in 0..len_a {
-                    let va = self.get_view((a_start + i) as u32);
-                    let vb = other.get_view((b_start + i) as u32);
-                    let same = match (va, vb) {
-                        (None, None) => true,
-                        (Some(x), Some(y)) => x.formula() == y.formula() && x.value() == y.value(),
-                        _ => false,
-                    };
-                    if !same {
-                        return false;
-                    }
-                }
-                true
+                return sa == sb;
             }
         }
+        for i in 0..len_a {
+            let va = self.get_view((a_start + i) as u32);
+            let vb = other.get_view((b_start + i) as u32);
+            let same = match (va, vb) {
+                (None, None) => true,
+                (Some(x), Some(y)) => x.formula() == y.formula() && x.value() == y.value(),
+                _ => false,
+            };
+            if !same {
+                return false;
+            }
+        }
+        true
     }
 
-    pub fn promote_to_values(&mut self) -> &mut Vec<Value> {
+    pub fn promote_to_values(&mut self) -> &mut ValueSlab {
         match self {
             Self::Numbers(ns) => {
                 let len = ns.values.len();
-                let mut vals = Vec::with_capacity(ns.values.capacity().min(PAGE_ROWS as usize));
-                for r in 0..len {
-                    if (ns.present[r / 64] & (1u64 << (r % 64))) != 0 {
-                        vals.push(Value::Number(ns.values[r]));
-                    } else {
-                        vals.push(Value::Empty);
+                let occ = ns.occupied_count();
+                let vs = if occ <= SPARSE_SLAB_CAP {
+                    let mut items = Vec::with_capacity(occ);
+                    for w in 0..4 {
+                        let mut bits = ns.present[w];
+                        while bits != 0 {
+                            let tz = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            items.push(Value::Number(ns.values[w * 64 + tz]));
+                        }
                     }
-                }
-                *self = Self::Values(vals);
+                    ValueSlab {
+                        present: ns.present,
+                        len: len as u16,
+                        repr: ValueSlabRepr::Sparse(items),
+                        dense_cache: OnceLock::new(),
+                    }
+                } else {
+                    let mut vals = Vec::with_capacity(len);
+                    for r in 0..len {
+                        if (ns.present[r / 64] & (1u64 << (r % 64))) != 0 {
+                            vals.push(Value::Number(ns.values[r]));
+                        } else {
+                            vals.push(Value::Empty);
+                        }
+                    }
+                    ValueSlab {
+                        present: ns.present,
+                        len: len as u16,
+                        repr: ValueSlabRepr::Dense(vals),
+                        dense_cache: OnceLock::new(),
+                    }
+                };
+                *self = Self::Values(vs);
                 match self {
                     Self::Values(v) => v,
                     _ => unreachable!(),
@@ -3305,33 +4895,95 @@ impl ColSlab {
         }
     }
 
-    pub fn promote_to_mixed(&mut self) -> &mut Vec<Cell> {
+    pub fn promote_to_mixed(&mut self) -> &mut MixedSlab {
         match self {
             Self::Numbers(ns) => {
                 let len = ns.values.len();
-                let mut cells = Vec::with_capacity(ns.values.capacity().min(PAGE_ROWS as usize));
-                for r in 0..len {
-                    if (ns.present[r / 64] & (1u64 << (r % 64))) != 0 {
-                        cells.push(Cell {
-                            value: Value::Number(ns.values[r]),
-                            formula: None,
-                        });
-                    } else {
-                        cells.push(Cell::default());
+                let occ = ns.occupied_count();
+                let ms = if occ <= SPARSE_SLAB_CAP {
+                    let mut items = Vec::with_capacity(occ);
+                    for w in 0..4 {
+                        let mut bits = ns.present[w];
+                        while bits != 0 {
+                            let tz = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            items.push(Cell {
+                                value: Value::Number(ns.values[w * 64 + tz]),
+                                formula: None,
+                            });
+                        }
                     }
-                }
-                *self = Self::Mixed(cells);
+                    MixedSlab {
+                        present: ns.present,
+                        formula_mask: [0; 4],
+                        len: len as u16,
+                        dirty_mut: false,
+                        repr: MixedSlabRepr::Sparse(items),
+                        dense_cache: OnceLock::new(),
+                    }
+                } else {
+                    let mut cells = Vec::with_capacity(len);
+                    for r in 0..len {
+                        if (ns.present[r / 64] & (1u64 << (r % 64))) != 0 {
+                            cells.push(Cell {
+                                value: Value::Number(ns.values[r]),
+                                formula: None,
+                            });
+                        } else {
+                            cells.push(Cell::default());
+                        }
+                    }
+                    MixedSlab {
+                        present: ns.present,
+                        formula_mask: [0; 4],
+                        len: len as u16,
+                        dirty_mut: false,
+                        repr: MixedSlabRepr::Dense(cells),
+                        dense_cache: OnceLock::new(),
+                    }
+                };
+                *self = Self::Mixed(ms);
             }
             Self::Values(vs) => {
                 let owned = std::mem::take(vs);
-                let cells: Vec<Cell> = owned
-                    .into_iter()
-                    .map(|value| Cell {
-                        value,
-                        formula: None,
-                    })
-                    .collect();
-                *self = Self::Mixed(cells);
+                let present = owned.present;
+                let len = owned.len;
+                let occ = owned.occupied_count();
+                let ms = if occ <= SPARSE_SLAB_CAP {
+                    let mut items = Vec::with_capacity(occ);
+                    owned.for_each_occupied(|_, v| {
+                        items.push(Cell {
+                            value: v.clone(),
+                            formula: None,
+                        });
+                    });
+                    MixedSlab {
+                        present,
+                        formula_mask: [0; 4],
+                        len,
+                        dirty_mut: false,
+                        repr: MixedSlabRepr::Sparse(items),
+                        dense_cache: OnceLock::new(),
+                    }
+                } else {
+                    let cells: Vec<Cell> = owned
+                        .into_vec()
+                        .into_iter()
+                        .map(|value| Cell {
+                            value,
+                            formula: None,
+                        })
+                        .collect();
+                    MixedSlab {
+                        present,
+                        formula_mask: [0; 4],
+                        len,
+                        dirty_mut: false,
+                        repr: MixedSlabRepr::Dense(cells),
+                        dense_cache: OnceLock::new(),
+                    }
+                };
+                *self = Self::Mixed(ms);
             }
             Self::Mixed(_) => {}
         }
@@ -3341,72 +4993,95 @@ impl ColSlab {
         }
     }
 
-    /// Write a non-blank `cell` at row offset `ro`, upgrading the slab in place if necessary.
+    /// Automatically demote `Mixed -> Numbers / Values` when all formulas are cleared,
+    /// and `Values -> Numbers` when all remaining occupied cells are plain numbers.
+    pub fn try_demote(&mut self) {
+        match self {
+            Self::Numbers(_) => {}
+            Self::Values(vs) => {
+                if vs.all_numbers() {
+                    *self = Self::Numbers(vs.to_number_slab());
+                }
+            }
+            Self::Mixed(cs) => {
+                if cs.is_empty() || cs.has_formulas() {
+                    return;
+                }
+                if cs.dirty_mut {
+                    cs.refresh_masks_from_dense();
+                }
+                let present = cs.present;
+                let len = cs.len as usize;
+                let mut all_num = true;
+                cs.for_each_occupied(|_, c| {
+                    if !matches!(c.value, Value::Number(_)) {
+                        all_num = false;
+                    }
+                });
+                if all_num {
+                    let mut values = vec![0.0; len];
+                    cs.for_each_occupied(|ro, c| {
+                        if let Value::Number(n) = c.value {
+                            values[ro] = n;
+                        }
+                    });
+                    *self = Self::Numbers(NumberSlab { present, values });
+                } else {
+                    let owned = std::mem::take(cs);
+                    let vals: Vec<Value> = owned.into_vec().into_iter().map(|c| c.value).collect();
+                    *self = Self::Values(ValueSlab::from_vec(vals));
+                }
+            }
+        }
+    }
+
+    /// Write a non-blank `cell` at row offset `ro`, upgrading/demoting the slab in place if necessary.
     /// Returns `(existed, old_has_formula)`.
     #[inline]
     pub fn set(&mut self, ro: u32, cell: Cell) -> (bool, bool) {
         debug_assert!(!cell.is_blank() && ro < PAGE_ROWS);
-        let idx = ro as usize;
         if cell.formula.is_none() {
             if let Value::Number(n) = cell.value {
-                match self {
-                    Self::Numbers(ns) => return (ns.set(ro, n), false),
+                return match self {
+                    Self::Numbers(ns) => (ns.set(ro, n), false),
                     Self::Values(vs) => {
-                        let existed = vs.get(idx).is_some_and(|v| !v.is_empty());
-                        grow_slab_vec(vs, idx + 1, Value::Empty);
-                        vs[idx] = Value::Number(n);
-                        return (existed, false);
+                        let existed = vs.set(ro, Value::Number(n));
+                        if existed && vs.all_numbers() {
+                            *self = Self::Numbers(vs.to_number_slab());
+                        }
+                        (existed, false)
                     }
                     Self::Mixed(cs) => {
-                        let (existed, old_f) = cs
-                            .get(idx)
-                            .filter(|c| !c.is_blank())
-                            .map_or((false, false), |c| (true, c.formula.is_some()));
-                        grow_slab_vec(cs, idx + 1, Cell::default());
-                        cs[idx] = cell;
-                        return (existed, old_f);
+                        let (existed, old_f) = cs.set(ro, cell);
+                        if old_f && !cs.has_formulas() {
+                            self.try_demote();
+                        }
+                        (existed, old_f)
                     }
-                }
+                };
             }
             match self {
                 Self::Numbers(_) => {
                     let vs = self.promote_to_values();
-                    let existed = vs.get(idx).is_some_and(|v| !v.is_empty());
-                    grow_slab_vec(vs, idx + 1, Value::Empty);
-                    vs[idx] = cell.value;
-                    (existed, false)
+                    (vs.set(ro, cell.value), false)
                 }
-                Self::Values(vs) => {
-                    let existed = vs.get(idx).is_some_and(|v| !v.is_empty());
-                    grow_slab_vec(vs, idx + 1, Value::Empty);
-                    vs[idx] = cell.value;
-                    (existed, false)
-                }
+                Self::Values(vs) => (vs.set(ro, cell.value), false),
                 Self::Mixed(cs) => {
-                    let (existed, old_f) = cs
-                        .get(idx)
-                        .filter(|c| !c.is_blank())
-                        .map_or((false, false), |c| (true, c.formula.is_some()));
-                    grow_slab_vec(cs, idx + 1, Cell::default());
-                    cs[idx] = cell;
+                    let (existed, old_f) = cs.set(ro, cell);
+                    if old_f && !cs.has_formulas() {
+                        self.try_demote();
+                    }
                     (existed, old_f)
                 }
             }
         } else {
             let cs = self.promote_to_mixed();
-            let (existed, old_f) = cs
-                .get(idx)
-                .filter(|c| !c.is_blank())
-                .map_or((false, false), |c| (true, c.formula.is_some()));
-            grow_slab_vec(cs, idx + 1, Cell::default());
-            cs[idx] = cell;
-            (existed, old_f)
+            cs.set(ro, cell)
         }
     }
 
     #[inline]
     pub fn set_formula_cache(&mut self, ro: u32, value: Value) -> bool {
-        let idx = ro as usize;
         match self {
             Self::Numbers(ns) => match value {
                 Value::Empty => {
@@ -3419,51 +5094,39 @@ impl ColSlab {
                 }
                 other => {
                     let vs = self.promote_to_values();
-                    grow_slab_vec(vs, idx + 1, Value::Empty);
-                    vs[idx] = other;
+                    vs.set(ro, other);
                     false
                 }
             },
             Self::Values(vs) => {
-                if let Some(slot) = vs.get_mut(idx) {
-                    *slot = value;
-                    let blank = slot.is_empty();
-                    if blank {
-                        while vs.last().is_some_and(Value::is_empty) {
-                            vs.pop();
-                        }
+                if !vs.contains(ro) {
+                    return false;
+                }
+                if value.is_empty() {
+                    vs.remove(ro);
+                    if vs.all_numbers() {
+                        *self = Self::Numbers(vs.to_number_slab());
                     }
-                    blank
+                    true
                 } else {
+                    vs.set(ro, value);
                     false
                 }
             }
-            Self::Mixed(cs) => {
-                if let Some(slot) = cs.get_mut(idx) {
-                    slot.value = value;
-                    slot.is_blank()
-                } else {
-                    false
-                }
-            }
+            Self::Mixed(cs) => cs.set_cached_value(ro, value),
         }
     }
 
     pub fn remove(&mut self, ro: u32) -> Option<Cell> {
-        let idx = ro as usize;
         match self {
             Self::Numbers(ns) => ns.remove(ro).map(|n| Cell {
                 value: Value::Number(n),
                 formula: None,
             }),
             Self::Values(vs) => {
-                let slot = vs.get_mut(idx)?;
-                if slot.is_empty() {
-                    return None;
-                }
-                let old = std::mem::take(slot);
-                while vs.last().is_some_and(Value::is_empty) {
-                    vs.pop();
+                let old = vs.remove(ro)?;
+                if !matches!(old, Value::Number(_)) && vs.all_numbers() {
+                    *self = Self::Numbers(vs.to_number_slab());
                 }
                 Some(Cell {
                     value: old,
@@ -3471,13 +5134,9 @@ impl ColSlab {
                 })
             }
             Self::Mixed(cs) => {
-                let slot = cs.get_mut(idx)?;
-                if slot.is_blank() {
-                    return None;
-                }
-                let old = std::mem::take(slot);
-                while cs.last().is_some_and(Cell::is_blank) {
-                    cs.pop();
+                let old = cs.remove(ro)?;
+                if old.formula.is_some() && !cs.has_formulas() {
+                    self.try_demote();
                 }
                 Some(old)
             }
@@ -3488,47 +5147,23 @@ impl ColSlab {
         match self {
             Self::Numbers(ns) => ns.clear_range(lo, hi_incl),
             Self::Values(vs) => {
-                let end = (hi_incl + 1).min(vs.len());
-                if lo >= end {
-                    return (0, [0; 4]);
+                let res = vs.clear_range(lo, hi_incl);
+                if res.0 > 0 && vs.all_numbers() {
+                    *self = Self::Numbers(vs.to_number_slab());
                 }
-                let mut removed = 0usize;
-                let mut mask = [0u64; 4];
-                for r in lo..end {
-                    if !vs[r].is_empty() {
-                        vs[r] = Value::Empty;
-                        mask[r / 64] |= 1u64 << (r % 64);
-                        removed += 1;
-                    }
-                }
-                while vs.last().is_some_and(Value::is_empty) {
-                    vs.pop();
-                }
-                (removed, mask)
+                res
             }
             Self::Mixed(cs) => {
-                let end = (hi_incl + 1).min(cs.len());
-                if lo >= end {
-                    return (0, [0; 4]);
+                let res = cs.clear_range(lo, hi_incl);
+                if res.0 > 0 && !cs.has_formulas() {
+                    self.try_demote();
                 }
-                let mut removed = 0usize;
-                let mut mask = [0u64; 4];
-                for r in lo..end {
-                    if !cs[r].is_blank() {
-                        cs[r] = Cell::default();
-                        mask[r / 64] |= 1u64 << (r % 64);
-                        removed += 1;
-                    }
-                }
-                while cs.last().is_some_and(Cell::is_blank) {
-                    cs.pop();
-                }
-                (removed, mask)
+                res
             }
         }
     }
 
-    /// Extract rows `lo..len` into a same-typed tail slab, clearing them from `self`.
+    /// Extract rows `lo..len` into a compact tail slab, clearing them from `self`.
     pub fn take_tail(&mut self, lo: usize) -> Option<(ColSlab, [u64; 4])> {
         if self.len() <= lo {
             return None;
@@ -3562,42 +5197,54 @@ impl ColSlab {
                 ))
             }
             Self::Values(vs) => {
+                let bits = vs.row_mask_from(lo);
+                if bits == [0; 4] {
+                    return None;
+                }
                 let mut tail = vec![Value::Empty; vs.len()];
-                let mut bits = [0u64; 4];
-                let mut any = false;
-                for r in lo..vs.len() {
-                    if !vs[r].is_empty() {
-                        bits[r / 64] |= 1u64 << (r % 64);
-                        tail[r] = std::mem::take(&mut vs[r]);
-                        any = true;
+                for w in (lo / 64)..4 {
+                    let mut b = bits[w];
+                    while b != 0 {
+                        let tz = b.trailing_zeros() as usize;
+                        b &= b - 1;
+                        let r = w * 64 + tz;
+                        if let Some(v) = vs.get_val(r) {
+                            tail[r] = v.clone();
+                        }
                     }
                 }
-                while vs.last().is_some_and(Value::is_empty) {
-                    vs.pop();
+                vs.clear_range(lo, PAGE_ROWS as usize - 1);
+                if vs.all_numbers() {
+                    *self = Self::Numbers(vs.to_number_slab());
                 }
-                while tail.last().is_some_and(Value::is_empty) {
-                    tail.pop();
-                }
-                any.then_some((Self::Values(tail), bits))
+                let mut tail_slab = Self::Values(ValueSlab::from_vec(tail));
+                tail_slab.try_demote();
+                Some((tail_slab, bits))
             }
             Self::Mixed(cs) => {
+                let bits = cs.row_mask_from(lo);
+                if bits == [0; 4] {
+                    return None;
+                }
                 let mut tail = vec![Cell::default(); cs.len()];
-                let mut bits = [0u64; 4];
-                let mut any = false;
-                for r in lo..cs.len() {
-                    if !cs[r].is_blank() {
-                        bits[r / 64] |= 1u64 << (r % 64);
-                        tail[r] = std::mem::take(&mut cs[r]);
-                        any = true;
+                for w in (lo / 64)..4 {
+                    let mut b = bits[w];
+                    while b != 0 {
+                        let tz = b.trailing_zeros() as usize;
+                        b &= b - 1;
+                        let r = w * 64 + tz;
+                        if let Some(c) = cs.get_cell(r) {
+                            tail[r] = c.clone();
+                        }
                     }
                 }
-                while cs.last().is_some_and(Cell::is_blank) {
-                    cs.pop();
+                cs.clear_range(lo, PAGE_ROWS as usize - 1);
+                if !cs.has_formulas() {
+                    self.try_demote();
                 }
-                while tail.last().is_some_and(Cell::is_blank) {
-                    tail.pop();
-                }
-                any.then_some((Self::Mixed(tail), bits))
+                let mut tail_slab = Self::Mixed(MixedSlab::from_vec(tail));
+                tail_slab.try_demote();
+                Some((tail_slab, bits))
             }
         }
     }
@@ -3623,192 +5270,63 @@ impl ColSlab {
         if src_start >= end {
             return;
         }
-        let span = end - src_start;
-        match (self, dst) {
-            (Self::Numbers(sa), Self::Numbers(db)) => {
-                let m = row_range_mask(src_start as u32, (end - 1) as u32);
-                let mut has_any = false;
-                let mut max_dst = 0usize;
-                for r in src_start..end {
-                    if (sa.present[r / 64] & (1u64 << (r % 64))) != 0 {
-                        has_any = true;
-                        max_dst = dst_off + (r - src_start);
-                    }
-                }
-                if !has_any {
-                    return;
-                }
-                if db.values.len() <= max_dst {
-                    grow_slab_vec(&mut db.values, max_dst + 1, 0.0);
-                }
-                for i in 0..span {
-                    let sr = src_start + i;
-                    let sw = sr / 64;
-                    let sb = 1u64 << (sr % 64);
-                    if (sa.present[sw] & sb) != 0 {
-                        let dr = dst_off + i;
-                        db.values[dr] = sa.values[sr];
-                        db.present[dr / 64] |= 1u64 << (dr % 64);
-                        sa.values[sr] = 0.0;
-                    }
-                }
-                for w in 0..4 {
-                    sa.present[w] &= !m[w];
+        let m = row_range_mask(src_start as u32, (end - 1) as u32);
+        let sm = self.row_mask();
+        let active = [
+            sm[0] & m[0],
+            sm[1] & m[1],
+            sm[2] & m[2],
+            sm[3] & m[3],
+        ];
+        if active == [0; 4] {
+            return;
+        }
+        if let (Self::Numbers(sa), Self::Numbers(db)) = (&mut *self, &mut *dst) {
+            let last_src = prev_bit_before(&active, end).unwrap() as usize;
+            let max_dst = dst_off + (last_src - src_start);
+            if db.values.len() <= max_dst {
+                grow_slab_vec(&mut db.values, max_dst + 1, 0.0);
+            }
+            for w in (src_start / 64)..=((end - 1) / 64) {
+                let mut bits = active[w];
+                while bits != 0 {
+                    let tz = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let sr = w * 64 + tz;
+                    let dr = dst_off + (sr - src_start);
+                    db.values[dr] = sa.values[sr];
+                    db.present[dr / 64] |= 1u64 << (dr % 64);
+                    sa.values[sr] = 0.0;
                 }
             }
-            (Self::Numbers(sa), Self::Values(db)) => {
-                let m = row_range_mask(src_start as u32, (end - 1) as u32);
-                let mut max_dst = None;
-                for r in src_start..end {
-                    if (sa.present[r / 64] & (1u64 << (r % 64))) != 0 {
-                        max_dst = Some(dst_off + (r - src_start));
-                    }
-                }
-                let Some(max_dst) = max_dst else { return };
-                grow_slab_vec(db, max_dst + 1, Value::Empty);
-                for i in 0..span {
-                    let sr = src_start + i;
-                    if (sa.present[sr / 64] & (1u64 << (sr % 64))) != 0 {
-                        db[dst_off + i] = Value::Number(sa.values[sr]);
-                        sa.values[sr] = 0.0;
-                    }
-                }
-                for w in 0..4 {
-                    sa.present[w] &= !m[w];
-                }
+            for w in 0..4 {
+                sa.present[w] &= !m[w];
             }
-            (Self::Values(sa), dst_slab @ Self::Numbers(_)) => {
-                let db = dst_slab.promote_to_values();
-                let mut max_dst = None;
-                for r in src_start..end {
-                    if !sa[r].is_empty() {
-                        max_dst = Some(dst_off + (r - src_start));
-                    }
-                }
-                let Some(max_dst) = max_dst else { return };
-                grow_slab_vec(db, max_dst + 1, Value::Empty);
-                for i in 0..span {
-                    let sr = src_start + i;
-                    if !sa[sr].is_empty() {
-                        db[dst_off + i] = std::mem::take(&mut sa[sr]);
-                    }
-                }
-            }
-            (Self::Values(sa), Self::Values(db)) => {
-                let mut max_dst = None;
-                for r in src_start..end {
-                    if !sa[r].is_empty() {
-                        max_dst = Some(dst_off + (r - src_start));
-                    }
-                }
-                let Some(max_dst) = max_dst else { return };
-                grow_slab_vec(db, max_dst + 1, Value::Empty);
-                for i in 0..span {
-                    let sr = src_start + i;
-                    if !sa[sr].is_empty() {
-                        db[dst_off + i] = std::mem::take(&mut sa[sr]);
-                    }
-                }
-            }
-            (src_slab, dst_slab) => {
-                let db = dst_slab.promote_to_mixed();
-                match src_slab {
-                    Self::Numbers(sa) => {
-                        let m = row_range_mask(src_start as u32, (end - 1) as u32);
-                        let mut max_dst = None;
-                        for r in src_start..end {
-                            if (sa.present[r / 64] & (1u64 << (r % 64))) != 0 {
-                                max_dst = Some(dst_off + (r - src_start));
-                            }
-                        }
-                        let Some(max_dst) = max_dst else { return };
-                        grow_slab_vec(db, max_dst + 1, Cell::default());
-                        for i in 0..span {
-                            let sr = src_start + i;
-                            if (sa.present[sr / 64] & (1u64 << (sr % 64))) != 0 {
-                                db[dst_off + i] = Cell {
-                                    value: Value::Number(sa.values[sr]),
-                                    formula: None,
-                                };
-                                sa.values[sr] = 0.0;
-                            }
-                        }
-                        for w in 0..4 {
-                            sa.present[w] &= !m[w];
-                        }
-                    }
-                    Self::Values(sa) => {
-                        let mut max_dst = None;
-                        for r in src_start..end {
-                            if !sa[r].is_empty() {
-                                max_dst = Some(dst_off + (r - src_start));
-                            }
-                        }
-                        let Some(max_dst) = max_dst else { return };
-                        grow_slab_vec(db, max_dst + 1, Cell::default());
-                        for i in 0..span {
-                            let sr = src_start + i;
-                            if !sa[sr].is_empty() {
-                                db[dst_off + i] = Cell {
-                                    value: std::mem::take(&mut sa[sr]),
-                                    formula: None,
-                                };
-                            }
-                        }
-                    }
-                    Self::Mixed(sa) => {
-                        let mut max_dst = None;
-                        for r in src_start..end {
-                            if !sa[r].is_blank() {
-                                max_dst = Some(dst_off + (r - src_start));
-                            }
-                        }
-                        let Some(max_dst) = max_dst else { return };
-                        grow_slab_vec(db, max_dst + 1, Cell::default());
-                        for i in 0..span {
-                            let sr = src_start + i;
-                            if !sa[sr].is_blank() {
-                                db[dst_off + i] = std::mem::take(&mut sa[sr]);
-                            }
-                        }
-                    }
+            sa.values.truncate(highest_bit_plus_one(&sa.present));
+            return;
+        }
+        for w in (src_start / 64)..=((end - 1) / 64) {
+            let mut bits = active[w];
+            while bits != 0 {
+                let tz = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let sr = w * 64 + tz;
+                let dr = (dst_off + (sr - src_start)) as u32;
+                if let Some(view) = self.get_view(sr as u32) {
+                    dst.set(dr, view.to_cell());
                 }
             }
         }
+        self.clear_range(src_start, end - 1);
     }
 
     /// Recompute row mask and max row (+1) for this slab; returns `None` if completely empty.
     pub fn scan_mask(&self) -> Option<([u64; 4], u32)> {
-        match self {
-            Self::Numbers(ns) => {
-                if ns.is_empty() {
-                    None
-                } else {
-                    Some((ns.present, highest_bit_plus_one(&ns.present) as u32))
-                }
-            }
-            Self::Values(vs) => {
-                let mut m = [0u64; 4];
-                let mut max_r = 0u32;
-                for (r, v) in vs.iter().enumerate() {
-                    if !v.is_empty() {
-                        m[r / 64] |= 1u64 << (r % 64);
-                        max_r = r as u32 + 1;
-                    }
-                }
-                (max_r > 0).then_some((m, max_r))
-            }
-            Self::Mixed(cs) => {
-                let mut m = [0u64; 4];
-                let mut max_r = 0u32;
-                for (r, c) in cs.iter().enumerate() {
-                    if !c.is_blank() {
-                        m[r / 64] |= 1u64 << (r % 64);
-                        max_r = r as u32 + 1;
-                    }
-                }
-                (max_r > 0).then_some((m, max_r))
-            }
+        let pm = self.row_mask();
+        if pm == [0; 4] {
+            None
+        } else {
+            Some((pm, highest_bit_plus_one(&pm) as u32))
         }
     }
 }
@@ -3851,6 +5369,14 @@ impl Page {
         let row_mask = &mut self.row_mask;
         let n_rows = &mut self.n_rows;
         self.cols.retain_mut(|_c, arc| {
+            if let Some(slab) = Arc::get_mut(arc) {
+                if let ColSlab::Mixed(cs) = slab
+                    && cs.dirty_mut
+                {
+                    cs.refresh_masks_from_dense();
+                }
+                slab.try_demote();
+            }
             if let Some((m, max_r)) = arc.scan_mask() {
                 for w in 0..4 {
                     row_mask[w] |= m[w];
@@ -3905,8 +5431,9 @@ impl Page {
         if !slot.contains(r_off) {
             return None;
         }
-        let vec = Arc::make_mut(slot).promote_to_mixed();
-        vec.get_mut(r_off as usize)
+        Arc::make_mut(slot)
+            .promote_to_mixed()
+            .get_mut_cell_legacy(r_off)
     }
 
     /// Iterate non-empty column indices in `[c1..=c2]` in ascending order via bit-scan.
@@ -4320,6 +5847,7 @@ impl Store {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn get_f64_plain(&self, r: u32, c: u32) -> Option<f64> {
         let (pi, ro) = Self::split(r);
         self.page(pi)?.cols.get(c)?.get_f64_plain(ro)
@@ -4414,20 +5942,192 @@ impl Store {
         self.version.advance();
     }
 
+    pub(crate) fn set_formula_in_place(&mut self, r: u32, c: u32, formula: Arc<str>) -> bool {
+        let (pi, ro) = Self::split(r);
+        if !self.page(pi).is_some_and(|p| p.contains(ro, c)) {
+            return false;
+        }
+        let has_qual = formula.contains('!');
+        let page = self.page_mut_existing(pi).unwrap();
+        page.may_have_formula = true;
+        page.may_have_qualified_formula |= has_qual;
+        let slot = page.cols.get_mut(c).unwrap();
+        let added = Arc::make_mut(slot)
+            .promote_to_mixed()
+            .set_formula_in_place(ro, formula);
+        if added && let Some(fc) = self.formula_count.get_mut() {
+            *fc += 1;
+        }
+        self.version.advance();
+        true
+    }
+
+    pub(crate) fn strip_formulas_in_rect(
+        &mut self,
+        r1: u32,
+        c1: u32,
+        r2: u32,
+        c2: u32,
+        cleared: &mut CellJournal,
+    ) -> usize {
+        if r1 > r2 || c1 > c2 || self.len == 0 {
+            return 0;
+        }
+        let p1 = r1 / PAGE_ROWS;
+        let p2 = r2 / PAGE_ROWS;
+        let hit_pages: Vec<u32> = self
+            .iter_pages_in(p1, p2)
+            .filter(|(_, p)| p.may_have_formula && p.iter_nonempty_cols(c1, c2).next().is_some())
+            .map(|(pi, _)| pi)
+            .collect();
+        if hit_pages.is_empty() {
+            return 0;
+        }
+        let mut stripped = 0usize;
+        let mut removed_cells = 0usize;
+        for pi in hit_pages {
+            let base = pi * PAGE_ROWS;
+            let lo = r1.saturating_sub(base);
+            let hi = (r2 - base).min(PAGE_ROWS - 1);
+            let rm = row_range_mask(lo, hi);
+            let Some(page) = self.page_mut_existing(pi) else {
+                continue;
+            };
+            let cols: Vec<u32> = page.iter_nonempty_cols(c1, c2).collect();
+            let mut page_changed = false;
+            for col in cols {
+                let Some(slot) = page.cols.get_mut(col) else {
+                    continue;
+                };
+                if !slot.is_mixed() {
+                    continue;
+                }
+                let ColSlab::Mixed(cs_ro) = slot.as_ref() else {
+                    continue;
+                };
+                if !cs_ro.dirty_mut
+                    && (cs_ro.formula_mask[0] & rm[0]) == 0
+                    && (cs_ro.formula_mask[1] & rm[1]) == 0
+                    && (cs_ro.formula_mask[2] & rm[2]) == 0
+                    && (cs_ro.formula_mask[3] & rm[3]) == 0
+                {
+                    continue;
+                }
+                let slab = Arc::make_mut(slot);
+                let ColSlab::Mixed(cs) = slab else {
+                    unreachable!()
+                };
+                if cs.dirty_mut {
+                    cs.refresh_masks_from_dense();
+                }
+                let target_f = [
+                    cs.formula_mask[0] & rm[0],
+                    cs.formula_mask[1] & rm[1],
+                    cs.formula_mask[2] & rm[2],
+                    cs.formula_mask[3] & rm[3],
+                ];
+                let cnt = (target_f[0].count_ones()
+                    + target_f[1].count_ones()
+                    + target_f[2].count_ones()
+                    + target_f[3].count_ones()) as usize;
+                if cnt == 0 {
+                    continue;
+                }
+                stripped += cnt;
+                let mut blank_mask = [0u64; 4];
+                match &mut cs.repr {
+                    MixedSlabRepr::Sparse(items) => {
+                        let mut new_items = Vec::with_capacity(items.len());
+                        let mut rank = 0usize;
+                        for w in 0..4 {
+                            let mut bits = cs.present[w];
+                            while bits != 0 {
+                                let tz = bits.trailing_zeros();
+                                let bit = 1u64 << tz;
+                                bits &= bits - 1;
+                                let mut c = items[rank].clone();
+                                rank += 1;
+                                if (target_f[w] & bit) != 0 {
+                                    c.formula = None;
+                                }
+                                if c.is_blank() {
+                                    cs.present[w] &= !bit;
+                                    blank_mask[w] |= bit;
+                                    removed_cells += 1;
+                                } else {
+                                    new_items.push(c);
+                                }
+                            }
+                            cs.formula_mask[w] &= !target_f[w];
+                        }
+                        cs.len = highest_bit_plus_one(&cs.present) as u16;
+                        *items = new_items;
+                    }
+                    MixedSlabRepr::Dense(cells) => {
+                        for w in 0..4 {
+                            let mut bits = target_f[w];
+                            while bits != 0 {
+                                let tz = bits.trailing_zeros() as usize;
+                                let bit = 1u64 << tz;
+                                bits &= bits - 1;
+                                let ro = w * 64 + tz;
+                                cells[ro].formula = None;
+                                if cells[ro].is_blank() {
+                                    cs.present[w] &= !bit;
+                                    blank_mask[w] |= bit;
+                                    removed_cells += 1;
+                                }
+                            }
+                            cs.formula_mask[w] &= !target_f[w];
+                        }
+                        cs.len = highest_bit_plus_one(&cs.present) as u16;
+                        cells.truncate(cs.len as usize);
+                        cs.maybe_compact_sparse();
+                    }
+                }
+                cs.dense_cache.take();
+                if blank_mask != [0; 4] {
+                    cleared.or_page_mask(pi, col, blank_mask);
+                }
+                if !cs.has_formulas() {
+                    slab.try_demote();
+                }
+                if slab.is_empty() {
+                    page.cols.remove(col);
+                }
+                page_changed = true;
+            }
+            if page_changed {
+                page.rebuild_masks();
+                if page.is_empty() {
+                    self.remove_page(pi);
+                }
+            }
+        }
+        if stripped > 0 {
+            if let Some(fc) = self.formula_count.get_mut() {
+                *fc = fc.saturating_sub(stripped);
+            }
+            if removed_cells > 0 {
+                self.len = self.len.saturating_sub(removed_cells);
+                if self.len == 0 {
+                    self.clear();
+                    return stripped;
+                }
+                self.bounds.take();
+            }
+            self.version.advance();
+        }
+        stripped
+    }
+
     pub(crate) fn foreign_formula_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.iter_pages()
             .filter(|(_, page)| page.may_have_qualified_formula)
             .flat_map(|(pi, page)| {
                 page.cols.iter_entries().flat_map(move |(col, slab)| {
-                    let cells: &[Cell] = match slab.as_ref() {
-                        ColSlab::Mixed(cs) => cs.as_slice(),
-                        ColSlab::Numbers(_) | ColSlab::Values(_) => &[],
-                    };
-                    cells.iter().enumerate().filter_map(move |(row, cell)| {
-                        cell.formula
-                            .as_deref()
-                            .is_some_and(|f| f.contains('!'))
-                            .then_some((CellRef::new(pi * PAGE_ROWS + row as u32, col), cell))
+                    MixedFormulaIter::new(pi * PAGE_ROWS, col, slab.as_ref()).filter(|(_, cell)| {
+                        cell.formula.as_deref().is_some_and(|f| f.contains('!'))
                     })
                 })
             })
@@ -4437,17 +6137,9 @@ impl Store {
         self.iter_pages()
             .filter(|(_, p)| p.may_have_formula)
             .flat_map(|(pi, p)| {
-                p.cols.iter_entries().flat_map(move |(c, slab)| {
-                    let col: &[Cell] = match slab.as_ref() {
-                        ColSlab::Mixed(cs) => cs.as_slice(),
-                        ColSlab::Numbers(_) | ColSlab::Values(_) => &[],
-                    };
-                    col.iter().enumerate().filter_map(move |(row, cell)| {
-                        cell.formula
-                            .is_some()
-                            .then_some((CellRef::new(pi * PAGE_ROWS + row as u32, c), cell))
-                    })
-                })
+                p.cols
+                    .iter_entries()
+                    .flat_map(move |(c, slab)| MixedFormulaIter::new(pi * PAGE_ROWS, c, slab.as_ref()))
             })
     }
 
@@ -4937,7 +6629,8 @@ impl Store {
     }
 
     /// Rebuild only the affected page band once. Pages strictly before `at / PAGE_ROWS`
-    /// (for row edits) stay untouched in `O(1)`. Whole-page multiples move `Arc<Page>` directly.
+    /// (for row edits) stay untouched in `O(1)`. Whole-page multiples move `Arc<Page>` directly;
+    /// non-256-aligned page splits build destination pages in parallel across threads.
     pub(crate) fn remap_axis(
         &mut self,
         rows: bool,
@@ -4997,17 +6690,12 @@ impl Store {
             return;
         }
 
-        let mut dirty_pages = Vec::<u32>::new();
-
-        for (pi, page_arc) in source_pages {
-            let base = pi * PAGE_ROWS;
-            if (rows && base + PAGE_ROWS <= at)
-                || (!rows && page_arc.cols.max_col().is_none_or(|m| m < at))
-            {
-                self.insert_page_arc(pi, page_arc);
-                continue;
-            }
-            if !rows {
+        if !rows {
+            for (pi, page_arc) in source_pages {
+                if page_arc.cols.max_col().is_none_or(|m| m < at) {
+                    self.insert_page_arc(pi, page_arc);
+                    continue;
+                }
                 let mut page = Arc::unwrap_or_clone(page_arc);
                 let old_entries = std::mem::take(&mut page.cols).into_entries();
                 let mut new_cols = PageCols::default();
@@ -5026,9 +6714,43 @@ impl Store {
                     page.rebuild_masks();
                     self.insert_page_arc(pi, Arc::new(page));
                 }
+            }
+            cleared.retain_page_masks(|pi, col, bits| {
+                if col >= at
+                    && let Some(dest) = self.page(pi).and_then(|p| p.cols.get(col))
+                {
+                    let dm = dest.row_mask();
+                    for w in 0..4 {
+                        bits[w] &= !dm[w];
+                    }
+                }
+            });
+            for (pi, col, words) in occupied {
+                let dm = self
+                    .page(pi)
+                    .and_then(|p| p.cols.get(col))
+                    .map_or([0; 4], |s| s.row_mask());
+                let vac = [
+                    words[0] & !dm[0],
+                    words[1] & !dm[1],
+                    words[2] & !dm[2],
+                    words[3] & !dm[3],
+                ];
+                if vac != [0; 4] {
+                    cleared.or_page_mask(pi, col, vac);
+                }
+            }
+            return;
+        }
+
+        let mut split_sources: Vec<(u32, Arc<Page>, Vec<(std::ops::Range<usize>, u32, usize)>)> =
+            Vec::new();
+        for (pi, page_arc) in source_pages {
+            let base = pi * PAGE_ROWS;
+            if base + PAGE_ROWS <= at {
+                self.insert_page_arc(pi, page_arc);
                 continue;
             }
-
             // Whole-page fast path when shifting by an exact multiple of PAGE_ROWS:
             // reuse `Arc<Page>` directly without cloning `Page` or touching `Arc<ColSlab>`.
             if base >= at
@@ -5037,104 +6759,334 @@ impl Store {
                 && map(base + PAGE_ROWS - 1) == Some(target0 + PAGE_ROWS - 1)
             {
                 let dest = target0 / PAGE_ROWS;
-                for (c, slab) in page_arc.cols.iter_entries() {
-                    occupied.push((pi, c, slab.row_mask()));
-                }
                 if self.page(dest).is_none() {
+                    for (c, slab) in page_arc.cols.iter_entries() {
+                        occupied.push((pi, c, slab.row_mask()));
+                    }
                     self.insert_page_arc(dest, page_arc);
                     continue;
                 }
             }
 
-            let page = Arc::unwrap_or_clone(page_arc);
-            let mut spans: Vec<(std::ops::Range<usize>, u32, u32)> = Vec::new();
-            for r in 0..page.n_rows {
+            let begin = at.saturating_sub(base) as usize;
+            let mut page_cells = 0usize;
+            for (col, slab) in page_arc.cols.iter_entries() {
+                if !slab.is_empty() {
+                    occupied.push((pi, col, slab.row_mask_from(begin)));
+                    page_cells += slab.occupied_count();
+                }
+            }
+            self.len -= page_cells;
+
+            let mut spans: Vec<(std::ops::Range<usize>, u32, usize)> = Vec::new();
+            for r in 0..page_arc.n_rows {
                 let Some(target) = map(base + r) else { continue };
                 let (dest, offset) = Self::split(target);
+                let offset = offset as usize;
                 if let Some((source, pid, start)) = spans.last_mut()
                     && *pid == dest
                     && source.end == r as usize
-                    && *start + source.len() as u32 == offset
+                    && *start + source.len() == offset
                 {
                     source.end += 1;
                 } else {
                     spans.push((r as usize..r as usize + 1, dest, offset));
                 }
             }
-            for &(_, dest, _) in &spans {
-                if dirty_pages.last() != Some(&dest) {
-                    dirty_pages.push(dest);
+            if !spans.is_empty() {
+                split_sources.push((pi, page_arc, spans));
+            }
+        }
+
+        if !split_sources.is_empty() {
+            let mut dest_map: BTreeMap<u32, Vec<(usize, std::ops::Range<usize>, usize)>> =
+                BTreeMap::new();
+            for (src_idx, (_, _, spans)) in split_sources.iter().enumerate() {
+                for (src_r, dest_pi, dst_off) in spans {
+                    dest_map
+                        .entry(*dest_pi)
+                        .or_default()
+                        .push((src_idx, src_r.clone(), *dst_off));
                 }
             }
-            let page_formula = page.may_have_formula;
-            let page_qual = page.may_have_qualified_formula;
-            let page_row_mask = page.row_mask;
-            for (col, slab) in page.cols.into_entries() {
-                if slab.is_empty() {
-                    continue;
-                }
-                let begin = at.saturating_sub(base) as usize;
-                occupied.push((pi, col, slab.row_mask_from(begin)));
-                if let [(source, dest, 0)] = spans.as_slice()
-                    && source.start == 0
-                    && source.end >= slab.len()
-                    && map(base + PAGE_ROWS - 1) == Some(*dest * PAGE_ROWS + PAGE_ROWS - 1)
-                {
-                    let p = self.page_mut_or_insert(*dest);
-                    p.n_rows = p.n_rows.max(slab.len() as u32);
-                    for w in 0..4 {
-                        p.row_mask[w] |= page_row_mask[w];
-                    }
-                    p.cols.set(col, slab);
-                    p.may_have_formula |= page_formula;
-                    p.may_have_qualified_formula |= page_qual;
-                    continue;
-                }
-                let mut src_slab = Arc::unwrap_or_clone(slab);
-                for (source, dest, offset) in &spans {
-                    let end = source.end.min(src_slab.len());
-                    if source.start >= end {
-                        break;
-                    }
-                    let dest_p = self.page_mut_or_insert(*dest);
-                    dest_p.may_have_formula |= page_formula;
-                    dest_p.may_have_qualified_formula |= page_qual;
-                    let slot = dest_p
+            let dest_keys: Vec<u32> = dest_map.keys().copied().collect();
+            for dpi in dest_keys {
+                if let Some(existing) = self.page(dpi).cloned() {
+                    let existing_cells: usize = existing
                         .cols
-                        .get_or_insert_with(col, || Arc::new(src_slab.new_empty_like()));
-                    src_slab.move_range_into(
-                        source.start,
-                        end,
-                        Arc::make_mut(slot),
-                        *offset as usize,
-                    );
-                }
-                self.len -= src_slab.occupied_count();
-            }
-        }
-
-        dirty_pages.sort_unstable();
-        dirty_pages.dedup();
-        for pi in dirty_pages {
-            if let Some(p) = self.page_mut_existing(pi) {
-                p.rebuild_masks();
-                if p.is_empty() {
-                    self.remove_page(pi);
-                }
-            }
-        }
-
-        cleared.retain(|k| (if rows { k.row } else { k.col }) < at || !self.contains(k.row, k.col));
-        for (pi, col, words) in occupied {
-            let dest = self.page(pi).and_then(|p| p.cols.get(col));
-            for (word, mut bits) in words.into_iter().enumerate() {
-                while bits != 0 {
-                    let r = word * 64 + bits.trailing_zeros() as usize;
-                    if dest.is_none_or(|slab| !slab.contains(r as u32)) {
-                        cleared.insert(CellRef::new(pi * PAGE_ROWS + r as u32, col));
+                        .iter_entries()
+                        .map(|(_, s)| s.occupied_count())
+                        .sum();
+                    self.remove_page(dpi);
+                    self.len -= existing_cells;
+                    let src_idx = split_sources.len();
+                    let n_r = existing.n_rows as usize;
+                    split_sources.push((dpi, existing, Vec::new()));
+                    if n_r > 0 {
+                        dest_map
+                            .get_mut(&dpi)
+                            .unwrap()
+                            .insert(0, (src_idx, 0..n_r, 0));
                     }
-                    bits &= bits - 1;
                 }
+            }
+            let dest_plan: Vec<(u32, Vec<(usize, std::ops::Range<usize>, usize)>)> =
+                dest_map.into_iter().collect();
+
+            let build_dest = |dpi: u32,
+                              parts: &[(usize, std::ops::Range<usize>, usize)]|
+             -> Option<(u32, Arc<Page>, usize)> {
+                let mut cols_set: Vec<u32> = Vec::new();
+                let mut may_have_formula = false;
+                let mut may_have_qualified_formula = false;
+                for &(src_idx, _, _) in parts {
+                    let sp = &split_sources[src_idx].1;
+                    may_have_formula |= sp.may_have_formula;
+                    may_have_qualified_formula |= sp.may_have_qualified_formula;
+                    for c in sp.iter_nonempty_cols(0, u32::MAX) {
+                        cols_set.push(c);
+                    }
+                }
+                cols_set.sort_unstable();
+                cols_set.dedup();
+                if cols_set.is_empty() {
+                    return None;
+                }
+                let mut page_cols = PageCols::default();
+                let mut page_row_mask = [0u64; 4];
+                let mut page_n_rows = 0u32;
+                let mut page_cells = 0usize;
+                let mut actual_mixed = false;
+
+                for col in cols_set {
+                    // Single full-slab identity copy fast path
+                    if parts.len() == 1
+                        && parts[0].1.start == 0
+                        && parts[0].2 == 0
+                        && let Some(slab) = split_sources[parts[0].0].1.cols.get(col)
+                        && parts[0].1.end >= slab.len()
+                    {
+                        let rm = slab.row_mask();
+                        let occ = slab.occupied_count();
+                        if occ > 0 {
+                            for w in 0..4 {
+                                page_row_mask[w] |= rm[w];
+                            }
+                            page_n_rows = page_n_rows.max(highest_bit_plus_one(&rm) as u32);
+                            page_cells += occ;
+                            actual_mixed |= slab.is_mixed();
+                            page_cols.set(col, slab.clone());
+                        }
+                        continue;
+                    }
+
+                    let mut all_numbers = true;
+                    let mut any_mixed_src = false;
+                    let mut max_dst_end = 0usize;
+                    let mut any_hit = false;
+                    for &(src_idx, ref sr, dst_off) in parts {
+                        if let Some(slab) = split_sources[src_idx].1.cols.get(col) {
+                            let end = sr.end.min(slab.len());
+                            if sr.start < end && slab.has_any_in(sr.start, end) {
+                                any_hit = true;
+                                max_dst_end = max_dst_end.max(dst_off + (end - sr.start));
+                                match slab.as_ref() {
+                                    ColSlab::Numbers(_) => {}
+                                    ColSlab::Values(_) => all_numbers = false,
+                                    ColSlab::Mixed(_) => {
+                                        all_numbers = false;
+                                        any_mixed_src = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !any_hit {
+                        continue;
+                    }
+
+                    let built_slab = if all_numbers {
+                        let mut values = vec![0.0; max_dst_end];
+                        let mut present = [0u64; 4];
+                        for &(src_idx, ref sr, dst_off) in parts {
+                            let Some(slab) = split_sources[src_idx].1.cols.get(col) else {
+                                continue;
+                            };
+                            let ColSlab::Numbers(ns) = slab.as_ref() else {
+                                unreachable!()
+                            };
+                            let end = sr.end.min(ns.values.len());
+                            if sr.start >= end {
+                                continue;
+                            }
+                            let span = end - sr.start;
+                            values[dst_off..dst_off + span]
+                                .copy_from_slice(&ns.values[sr.start..end]);
+                            let m = row_range_mask(sr.start as u32, (end - 1) as u32);
+                            for w in (sr.start / 64)..=((end - 1) / 64) {
+                                let mut bits = ns.present[w] & m[w];
+                                while bits != 0 {
+                                    let tz = bits.trailing_zeros() as usize;
+                                    bits &= bits - 1;
+                                    let dr = dst_off + (w * 64 + tz - sr.start);
+                                    present[dr / 64] |= 1u64 << (dr % 64);
+                                }
+                            }
+                        }
+                        values.truncate(highest_bit_plus_one(&present));
+                        ColSlab::Numbers(NumberSlab { present, values })
+                    } else if !any_mixed_src {
+                        let mut out_vals = vec![Value::Empty; max_dst_end];
+                        for &(src_idx, ref sr, dst_off) in parts {
+                            let Some(slab) = split_sources[src_idx].1.cols.get(col) else {
+                                continue;
+                            };
+                            let end = sr.end.min(slab.len());
+                            if sr.start >= end {
+                                continue;
+                            }
+                            let sm = slab.row_mask();
+                            let m = row_range_mask(sr.start as u32, (end - 1) as u32);
+                            for w in (sr.start / 64)..=((end - 1) / 64) {
+                                let mut bits = sm[w] & m[w];
+                                while bits != 0 {
+                                    let tz = bits.trailing_zeros() as usize;
+                                    bits &= bits - 1;
+                                    let r = w * 64 + tz;
+                                    let dr = dst_off + (r - sr.start);
+                                    out_vals[dr] = slab.value(r as u32);
+                                }
+                            }
+                        }
+                        let mut s = ColSlab::Values(ValueSlab::from_vec(out_vals));
+                        s.try_demote();
+                        s
+                    } else {
+                        let mut out_cells = vec![Cell::default(); max_dst_end];
+                        for &(src_idx, ref sr, dst_off) in parts {
+                            let Some(slab) = split_sources[src_idx].1.cols.get(col) else {
+                                continue;
+                            };
+                            let end = sr.end.min(slab.len());
+                            if sr.start >= end {
+                                continue;
+                            }
+                            let sm = slab.row_mask();
+                            let m = row_range_mask(sr.start as u32, (end - 1) as u32);
+                            for w in (sr.start / 64)..=((end - 1) / 64) {
+                                let mut bits = sm[w] & m[w];
+                                while bits != 0 {
+                                    let tz = bits.trailing_zeros() as usize;
+                                    bits &= bits - 1;
+                                    let r = w * 64 + tz;
+                                    let dr = dst_off + (r - sr.start);
+                                    if let Some(view) = slab.get_view(r as u32) {
+                                        out_cells[dr] = view.to_cell();
+                                    }
+                                }
+                            }
+                        }
+                        let mut s = ColSlab::Mixed(MixedSlab::from_vec(out_cells));
+                        s.try_demote();
+                        s
+                    };
+
+                    let rm = built_slab.row_mask();
+                    let occ = built_slab.occupied_count();
+                    if occ > 0 {
+                        for w in 0..4 {
+                            page_row_mask[w] |= rm[w];
+                        }
+                        page_n_rows = page_n_rows.max(highest_bit_plus_one(&rm) as u32);
+                        page_cells += occ;
+                        actual_mixed |= built_slab.is_mixed();
+                        page_cols.set(col, Arc::new(built_slab));
+                    }
+                }
+
+                (page_cells > 0).then(|| {
+                    (
+                        dpi,
+                        Arc::new(Page {
+                            may_have_qualified_formula: actual_mixed && may_have_qualified_formula,
+                            may_have_formula: actual_mixed && may_have_formula,
+                            n_rows: page_n_rows,
+                            row_mask: page_row_mask,
+                            cols: page_cols,
+                        }),
+                        page_cells,
+                    )
+                })
+            };
+
+            let built: Vec<(u32, Arc<Page>, usize)> = if dest_plan.len() >= 16 {
+                let n_threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .min(8)
+                    .min(dest_plan.len());
+                let chunk_size = dest_plan.len().div_ceil(n_threads);
+                let mut out = Vec::with_capacity(dest_plan.len());
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(n_threads);
+                    for chunk in dest_plan.chunks(chunk_size) {
+                        let b_ref = &build_dest;
+                        handles.push(s.spawn(move || {
+                            let mut local = Vec::with_capacity(chunk.len());
+                            for (dpi, parts) in chunk {
+                                if let Some(res) = b_ref(*dpi, parts) {
+                                    local.push(res);
+                                }
+                            }
+                            local
+                        }));
+                    }
+                    for h in handles {
+                        if let Ok(local) = h.join() {
+                            out.extend(local);
+                        }
+                    }
+                });
+                out
+            } else {
+                dest_plan
+                    .iter()
+                    .filter_map(|(dpi, parts)| build_dest(*dpi, parts))
+                    .collect()
+            };
+
+            for (dpi, page_arc, cnt) in built {
+                self.insert_page_arc(dpi, page_arc);
+                self.len += cnt;
+            }
+        }
+
+        cleared.retain_page_masks(|pi, col, bits| {
+            let base = pi * PAGE_ROWS;
+            if base + PAGE_ROWS <= at {
+                return;
+            }
+            if let Some(dest) = self.page(pi).and_then(|p| p.cols.get(col)) {
+                let begin = at.saturating_sub(base) as usize;
+                let dm = dest.row_mask_from(begin);
+                for w in 0..4 {
+                    bits[w] &= !dm[w];
+                }
+            }
+        });
+        for (pi, col, words) in occupied {
+            let dm = self
+                .page(pi)
+                .and_then(|p| p.cols.get(col))
+                .map_or([0; 4], |s| s.row_mask());
+            let vac = [
+                words[0] & !dm[0],
+                words[1] & !dm[1],
+                words[2] & !dm[2],
+                words[3] & !dm[3],
+            ];
+            if vac != [0; 4] {
+                cleared.or_page_mask(pi, col, vac);
             }
         }
     }
@@ -5178,17 +7130,30 @@ impl Store {
                 }
                 page.rebuild_masks();
             }
-            cleared.retain(|k| k.col < lo || k.col >= hi || !self.contains(k.row, k.col));
-            for (pi, col, words) in old_occupied {
-                let dest = self.page(pi).and_then(|p| p.cols.get(col));
-                for (w, mut bits) in words.into_iter().enumerate() {
-                    while bits != 0 {
-                        let r = w * 64 + bits.trailing_zeros() as usize;
-                        if dest.is_none_or(|slab| !slab.contains(r as u32)) {
-                            cleared.insert(CellRef::new(pi * PAGE_ROWS + r as u32, col));
-                        }
-                        bits &= bits - 1;
+            cleared.retain_page_masks(|pi, col, bits| {
+                if col >= lo
+                    && col < hi
+                    && let Some(dest) = self.page(pi).and_then(|p| p.cols.get(col))
+                {
+                    let dm = dest.row_mask();
+                    for w in 0..4 {
+                        bits[w] &= !dm[w];
                     }
+                }
+            });
+            for (pi, col, words) in old_occupied {
+                let dm = self
+                    .page(pi)
+                    .and_then(|p| p.cols.get(col))
+                    .map_or([0; 4], |s| s.row_mask());
+                let vac = [
+                    words[0] & !dm[0],
+                    words[1] & !dm[1],
+                    words[2] & !dm[2],
+                    words[3] & !dm[3],
+                ];
+                if vac != [0; 4] {
+                    cleared.or_page_mask(pi, col, vac);
                 }
             }
             return;
@@ -5255,7 +7220,21 @@ impl Store {
                 }
             }
         }
-        cleared.retain(|k| k.row < lo || k.row >= hi || !self.contains(k.row, k.col));
+        cleared.retain_page_masks(|pi, col, bits| {
+            let base = pi * PAGE_ROWS;
+            if base + PAGE_ROWS <= lo || base >= hi {
+                return;
+            }
+            if let Some(dest) = self.page(pi).and_then(|p| p.cols.get(col)) {
+                let r_lo = lo.saturating_sub(base);
+                let r_hi = (hi - 1 - base).min(PAGE_ROWS - 1);
+                let bm = row_range_mask(r_lo, r_hi);
+                let dm = dest.row_mask();
+                for w in 0..4 {
+                    bits[w] &= !(dm[w] & bm[w]);
+                }
+            }
+        });
         for k in old_coords {
             if !self.contains(k.row, k.col) {
                 cleared.insert(k);
@@ -5516,21 +7495,29 @@ impl Store {
                 match slab.as_ref() {
                     ColSlab::Numbers(_) => {} // O(1) skip: pure f64 slabs have 0 string/formula bytes!
                     ColSlab::Values(vs) => {
-                        for v in vs {
-                            if let Value::Text(t) = v {
-                                total += t.len();
+                        if let Some((_, dict)) = vs.dict_text() {
+                            for v in &dict[1..] {
+                                if let Value::Text(t) = v {
+                                    total += t.len();
+                                }
                             }
+                        } else {
+                            vs.for_each_occupied(|_, v| {
+                                if let Value::Text(t) = v {
+                                    total += t.len();
+                                }
+                            });
                         }
                     }
                     ColSlab::Mixed(cs) => {
-                        for cell in cs {
+                        cs.for_each_occupied(|_, cell| {
                             if let Some(f) = cell.formula.as_deref() {
                                 total += f.len();
                             }
                             if let Value::Text(t) = &cell.value {
                                 total += t.len();
                             }
-                        }
+                        });
                     }
                 }
             }
@@ -5773,22 +7760,33 @@ impl Store {
             }
         }
 
-        cleared.retain(|k| {
-            k.col < c1 || k.col > c2 || k.row < at || !self.contains(k.row, k.col)
-        });
-        for (pi, col, words) in occupied {
-            let dest = self.page(pi).and_then(|p| p.cols.get(col));
-            let mut cleared_mask = [0u64; 4];
-            for (word, mut bits) in words.into_iter().enumerate() {
-                while bits != 0 {
-                    let tz = bits.trailing_zeros();
-                    let r = word * 64 + tz as usize;
-                    if dest.is_none_or(|slab| !slab.contains(r as u32)) {
-                        cleared_mask[word] |= 1u64 << tz;
-                    }
-                    bits &= bits - 1;
+        cleared.retain_page_masks(|pi, col, bits| {
+            if col < c1 || col > c2 {
+                return;
+            }
+            let base = pi * PAGE_ROWS;
+            if base + PAGE_ROWS <= at {
+                return;
+            }
+            if let Some(dest) = self.page(pi).and_then(|p| p.cols.get(col)) {
+                let begin = at.saturating_sub(base) as usize;
+                let dm = dest.row_mask_from(begin);
+                for w in 0..4 {
+                    bits[w] &= !dm[w];
                 }
             }
+        });
+        for (pi, col, words) in occupied {
+            let dm = self
+                .page(pi)
+                .and_then(|p| p.cols.get(col))
+                .map_or([0; 4], |s| s.row_mask());
+            let cleared_mask = [
+                words[0] & !dm[0],
+                words[1] & !dm[1],
+                words[2] & !dm[2],
+                words[3] & !dm[3],
+            ];
             if cleared_mask != [0; 4] {
                 cleared.or_page_mask(pi, col, cleared_mask);
             }
@@ -5798,7 +7796,8 @@ impl Store {
     /// Parallel page-level formula rewrite: visits only `may_have_formula` pages
     /// (and `may_have_qualified_formula` when `foreign_sheet` is `Some`), skips
     /// `ColSlab::Numbers` and `ColSlab::Values` in `O(1)`, clones each modified
-    /// `Mixed` column slab at most once, and uses `std::thread::scope` for large sheets.
+    /// `Mixed` column slab at most once (preserving `Sparse` packing), and uses
+    /// `std::thread::scope` for large sheets.
     pub(crate) fn rewrite_formulas_parallel<F>(
         &mut self,
         foreign_sheet: Option<&str>,
@@ -5836,12 +7835,16 @@ impl Store {
         let process_page = |pi: u32, page: &Arc<Page>| -> Option<(u32, Arc<Page>)> {
             let mut updated_cols: Vec<(u32, Arc<ColSlab>)> = Vec::new();
             let mut any_qual = page.may_have_qualified_formula;
+            let base = pi * PAGE_ROWS;
             for (col, slab) in page.cols.iter_entries() {
-                let ColSlab::Mixed(cells) = slab.as_ref() else {
+                let ColSlab::Mixed(cs) = slab.as_ref() else {
                     continue;
                 };
-                let mut cloned: Option<Vec<Cell>> = None;
-                for (r_off, cell) in cells.iter().enumerate() {
+                if !cs.dirty_mut && cs.formula_mask == [0; 4] {
+                    continue;
+                }
+                let mut cloned: Option<MixedSlab> = None;
+                for (cell_ref, cell) in MixedFormulaIter::new(base, col, slab.as_ref()) {
                     let Some(old) = cell.formula.as_deref() else {
                         continue;
                     };
@@ -5850,12 +7853,12 @@ impl Store {
                     }
                     if let Some(new_f) = rewrite_one(old) {
                         any_qual |= new_f.contains('!');
-                        let vec = cloned.get_or_insert_with(|| cells.clone());
-                        vec[r_off].formula = Some(new_f);
+                        let ms = cloned.get_or_insert_with(|| cs.clone());
+                        ms.set_formula_in_place(cell_ref.row - base, new_f);
                     }
                 }
-                if let Some(vec) = cloned {
-                    updated_cols.push((col, Arc::new(ColSlab::Mixed(vec))));
+                if let Some(ms) = cloned {
+                    updated_cols.push((col, Arc::new(ColSlab::Mixed(ms))));
                 }
             }
             if updated_cols.is_empty() {
@@ -6168,15 +8171,20 @@ impl Store {
                         Some(ColSlab::Numbers(ns)) => Some(ns),
                         _ => None,
                     };
-                    let page_order =
-                        &order[(base - r1) as usize..(base - r1) as usize + (hi + 1)];
-                    for (r_off, &src_r) in page_order.iter().enumerate() {
-                        let sp = ((src_r / PAGE_ROWS) - p_lo) as usize;
-                        let so = src_r % PAGE_ROWS;
-                        let src_num = match src_slabs[sp] {
-                            Some(ColSlab::Numbers(ns)) => ns.get(so),
-                            _ => None,
-                        };
+                    let ord_base = (base - r1) as usize;
+                    for r_off in 0..=hi {
+                        let src_num = order
+                            .get(ord_base + r_off)
+                            .copied()
+                            .filter(|&sr| sr != u32::MAX)
+                            .and_then(|src_r| {
+                                let sp = ((src_r / PAGE_ROWS) - p_lo) as usize;
+                                let so = src_r % PAGE_ROWS;
+                                match src_slabs[sp] {
+                                    Some(ColSlab::Numbers(ns)) => ns.get(so),
+                                    _ => None,
+                                }
+                            });
                         if let Some(n) = src_num {
                             let same = if let Some(ons) = old_ns {
                                 ons.get(r_off as u32) == Some(n)
@@ -6222,19 +8230,24 @@ impl Store {
                     continue;
                 }
 
-                // Fast path 2: non-formula value column -> direct `ColSlab::Values` (24 B/cell, zero Cell)
+                // Fast path 2: non-formula value column -> direct `ColSlab::Values` (Sparse / 1B DictText / Dense)
                 if !col_has_formula && push_mode {
                     let mut out_vals = Vec::with_capacity(hi + 1);
                     let old_count = old_slab.map_or(0, ColSlab::occupied_count) as isize;
                     let mut new_count: isize = 0;
                     let mut row_mask = [0u64; 4];
                     let mut vac_mask = [0u64; 4];
-                    let page_order =
-                        &order[(base - r1) as usize..(base - r1) as usize + (hi + 1)];
-                    for (r_off, &src_r) in page_order.iter().enumerate() {
-                        let sp = ((src_r / PAGE_ROWS) - p_lo) as usize;
-                        let so = src_r % PAGE_ROWS;
-                        let src_view = src_slabs[sp].and_then(|s| s.get_view(so));
+                    let ord_base = (base - r1) as usize;
+                    for r_off in 0..=hi {
+                        let src_view = order
+                            .get(ord_base + r_off)
+                            .copied()
+                            .filter(|&sr| sr != u32::MAX)
+                            .and_then(|src_r| {
+                                let sp = ((src_r / PAGE_ROWS) - p_lo) as usize;
+                                let so = src_r % PAGE_ROWS;
+                                src_slabs[sp].and_then(|s| s.get_view(so))
+                            });
                         let old_view = old_slab.and_then(|s| s.get_view(r_off as u32));
                         if let Some(sv) = src_view {
                             let val = sv.value().into_owned();
@@ -6266,9 +8279,13 @@ impl Store {
                     if track_cleared && row_mask != [0; 4] {
                         occupied_masks.push((pi, row_mask));
                     }
-                    slabs.push((!out_vals.is_empty()).then(|| GatheredSlab {
-                        cells: Arc::new(ColSlab::Values(out_vals)),
-                        row_mask,
+                    slabs.push((!out_vals.is_empty()).then(|| {
+                        let mut s = ColSlab::Values(ValueSlab::from_vec(out_vals));
+                        s.try_demote();
+                        GatheredSlab {
+                            cells: Arc::new(s),
+                            row_mask,
+                        }
                     }));
                     continue;
                 }
@@ -6301,16 +8318,21 @@ impl Store {
                         }
                         let mut vac_mask = [0u64; 4];
                         let mut occ_mask = [0u64; 4];
-                        let page_order = &order[(base + lo as u32 - r1) as usize
-                            ..(base + hi as u32 - r1) as usize + 1];
-                        for (i, &src_r) in page_order.iter().enumerate() {
+                        let ord_base = (base + lo as u32 - r1) as usize;
+                        for i in 0..=(hi - lo) {
                             let r_off = lo + i;
-                            let sp = ((src_r / PAGE_ROWS) - p_lo) as usize;
-                            let so = src_r % PAGE_ROWS;
-                            let src_num = match src_slabs[sp] {
-                                Some(ColSlab::Numbers(ns)) => ns.get(so),
-                                _ => None,
-                            };
+                            let src_num = order
+                                .get(ord_base + i)
+                                .copied()
+                                .filter(|&sr| sr != u32::MAX)
+                                .and_then(|src_r| {
+                                    let sp = ((src_r / PAGE_ROWS) - p_lo) as usize;
+                                    let so = src_r % PAGE_ROWS;
+                                    match src_slabs[sp] {
+                                        Some(ColSlab::Numbers(ns)) => ns.get(so),
+                                        _ => None,
+                                    }
+                                });
                             let old_num = match old_slab {
                                 Some(ColSlab::Numbers(ons)) => ons.get(r_off as u32),
                                 _ => None,
@@ -6367,13 +8389,18 @@ impl Store {
                         }
                         let mut vac_mask = [0u64; 4];
                         let mut occ_mask = [0u64; 4];
-                        let page_order = &order[(base + lo as u32 - r1) as usize
-                            ..(base + hi as u32 - r1) as usize + 1];
-                        for (i, &src_r) in page_order.iter().enumerate() {
+                        let ord_base = (base + lo as u32 - r1) as usize;
+                        for i in 0..=(hi - lo) {
                             let r_off = lo + i;
-                            let sp = ((src_r / PAGE_ROWS) - p_lo) as usize;
-                            let so = src_r % PAGE_ROWS;
-                            let src_view = src_slabs[sp].and_then(|s| s.get_view(so));
+                            let src_view = order
+                                .get(ord_base + i)
+                                .copied()
+                                .filter(|&sr| sr != u32::MAX)
+                                .and_then(|src_r| {
+                                    let sp = ((src_r / PAGE_ROWS) - p_lo) as usize;
+                                    let so = src_r % PAGE_ROWS;
+                                    src_slabs[sp].and_then(|s| s.get_view(so))
+                                });
                             let old_view = old_slab.and_then(|s| s.get_view(r_off as u32));
                             if let Some(sv) = src_view {
                                 let val = sv.value().into_owned();
@@ -6401,15 +8428,19 @@ impl Store {
                         if track_cleared && occ_mask != [0; 4] {
                             occupied_masks.push((pi, occ_mask));
                         }
-                        slabs.push((!out_vals.is_empty()).then(|| GatheredSlab {
-                            cells: Arc::new(ColSlab::Values(out_vals)),
-                            row_mask,
+                        slabs.push((!out_vals.is_empty()).then(|| {
+                            let mut s = ColSlab::Values(ValueSlab::from_vec(out_vals));
+                            s.try_demote();
+                            GatheredSlab {
+                                cells: Arc::new(s),
+                                row_mask,
+                            }
                         }));
                     }
                     continue;
                 }
 
-                // General formula-bearing column path -> `ColSlab::Mixed`
+                // General formula-bearing column path -> `ColSlab::Mixed` (auto-demoting if formula-free)
                 let old_count = old_slab.map_or(0, ColSlab::occupied_count) as isize;
                 let target_len = old_len.max(hi + 1);
                 let mut out_vec: Vec<Cell>;
@@ -6451,16 +8482,21 @@ impl Store {
 
                 let mut vac_mask = [0u64; 4];
                 let mut occ_mask = [0u64; 4];
-                let page_order = &order[(base + lo as u32 - r1) as usize
-                    ..(base + hi as u32 - r1) as usize + 1];
-                for (i, &src_r) in page_order.iter().enumerate() {
+                let ord_base = (base + lo as u32 - r1) as usize;
+                for i in 0..=(hi - lo) {
                     let r_off = lo + i;
                     let dst_r = base + r_off as u32;
-                    let sp = ((src_r / PAGE_ROWS) - p_lo) as usize;
-                    let so = src_r % PAGE_ROWS;
-                    let src_view = src_slabs[sp].and_then(|s| s.get_view(so));
+                    let src_pair = order
+                        .get(ord_base + i)
+                        .copied()
+                        .filter(|&sr| sr != u32::MAX)
+                        .and_then(|src_r| {
+                            let sp = ((src_r / PAGE_ROWS) - p_lo) as usize;
+                            let so = src_r % PAGE_ROWS;
+                            src_slabs[sp].and_then(|s| s.get_view(so)).map(|v| (src_r, v))
+                        });
                     let old_view = old_slab.and_then(|s| s.get_view(r_off as u32));
-                    if let Some(sv) = src_view {
+                    if let Some((src_r, sv)) = src_pair {
                         let mut cell = sv.to_cell();
                         if dst_r != src_r
                             && let Some(f) = cell.formula.as_deref()
@@ -6517,9 +8553,13 @@ impl Store {
                 if track_cleared && occ_mask != [0; 4] {
                     occupied_masks.push((pi, occ_mask));
                 }
-                slabs.push((!out_vec.is_empty()).then(|| GatheredSlab {
-                    cells: Arc::new(ColSlab::Mixed(out_vec)),
-                    row_mask,
+                slabs.push((!out_vec.is_empty()).then(|| {
+                    let mut s = ColSlab::Mixed(MixedSlab::from_vec(out_vec));
+                    s.try_demote();
+                    GatheredSlab {
+                        cells: Arc::new(s),
+                        row_mask,
+                    }
                 }));
             }
 
@@ -6836,6 +8876,131 @@ impl<'a> Iterator for PageMergedStylesIter<'a> {
 impl Drop for Store {
     fn drop(&mut self) {
         let _ = Value::Empty;
+    }
+}
+
+enum MixedFormulaMode<'a> {
+    Empty,
+    Sparse {
+        items: &'a [Cell],
+        present: [u64; 4],
+        formula_mask: [u64; 4],
+        word: usize,
+        rank: usize,
+    },
+    Dense {
+        cells: &'a [Cell],
+        formula_mask: [u64; 4],
+        word: usize,
+    },
+    DirtyDense {
+        cells: &'a [Cell],
+        idx: usize,
+    },
+}
+
+struct MixedFormulaIter<'a> {
+    base: u32,
+    col: u32,
+    mode: MixedFormulaMode<'a>,
+}
+
+impl<'a> MixedFormulaIter<'a> {
+    #[inline]
+    fn new(base: u32, col: u32, slab: &'a ColSlab) -> Self {
+        let mode = match slab {
+            ColSlab::Numbers(_) | ColSlab::Values(_) => MixedFormulaMode::Empty,
+            ColSlab::Mixed(cs) => {
+                if cs.dirty_mut {
+                    match &cs.repr {
+                        MixedSlabRepr::Dense(cells) => MixedFormulaMode::DirtyDense {
+                            cells: cells.as_slice(),
+                            idx: 0,
+                        },
+                        MixedSlabRepr::Sparse(_) => MixedFormulaMode::Empty,
+                    }
+                } else if cs.formula_mask == [0; 4] {
+                    MixedFormulaMode::Empty
+                } else {
+                    match &cs.repr {
+                        MixedSlabRepr::Sparse(items) => MixedFormulaMode::Sparse {
+                            items: items.as_slice(),
+                            present: cs.present,
+                            formula_mask: cs.formula_mask,
+                            word: 0,
+                            rank: 0,
+                        },
+                        MixedSlabRepr::Dense(cells) => MixedFormulaMode::Dense {
+                            cells: cells.as_slice(),
+                            formula_mask: cs.formula_mask,
+                            word: 0,
+                        },
+                    }
+                }
+            }
+        };
+        Self { base, col, mode }
+    }
+}
+
+impl<'a> Iterator for MixedFormulaIter<'a> {
+    type Item = (CellRef, &'a Cell);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.mode {
+            MixedFormulaMode::Empty => None,
+            MixedFormulaMode::Dense {
+                cells,
+                formula_mask,
+                word,
+            } => {
+                while *word < 4 && formula_mask[*word] == 0 {
+                    *word += 1;
+                }
+                if *word >= 4 {
+                    return None;
+                }
+                let tz = formula_mask[*word].trailing_zeros() as usize;
+                formula_mask[*word] &= formula_mask[*word] - 1;
+                let ro = *word * 64 + tz;
+                let cell = cells.get(ro)?;
+                Some((CellRef::new(self.base + ro as u32, self.col), cell))
+            }
+            MixedFormulaMode::Sparse {
+                items,
+                present,
+                formula_mask,
+                word,
+                rank,
+            } => loop {
+                while *word < 4 && present[*word] == 0 {
+                    *word += 1;
+                }
+                if *word >= 4 {
+                    return None;
+                }
+                let tz = present[*word].trailing_zeros();
+                let bit = 1u64 << tz;
+                present[*word] &= present[*word] - 1;
+                let idx = *rank;
+                *rank += 1;
+                if (formula_mask[*word] & bit) != 0 {
+                    let ro = *word as u32 * 64 + tz;
+                    return Some((CellRef::new(self.base + ro, self.col), &items[idx]));
+                }
+            },
+            MixedFormulaMode::DirtyDense { cells, idx } => {
+                while *idx < cells.len() {
+                    let ro = *idx;
+                    *idx += 1;
+                    if cells[ro].formula.is_some() {
+                        return Some((CellRef::new(self.base + ro as u32, self.col), &cells[ro]));
+                    }
+                }
+                None
+            }
+        }
     }
 }
 
@@ -7326,5 +9491,134 @@ mod tests {
             Value::Text(t) => assert!(Arc::ptr_eq(t, &shared)),
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+}
+
+
+#[cfg(test)]
+mod wave5_storage_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_and_dict_text_slabs_bound_memory_and_demote_mixed_after_formula_removal() {
+        let mut store = Store::default();
+        // 1) Low-density page (5 text cells across 256 rows) stays Sparse without 256-slot Vec
+        for r in [0u32, 50, 100, 180, 255] {
+            store.set(
+                r,
+                0,
+                Cell {
+                    value: Value::Text(format!("sparse-{r}").into()),
+                    formula: None,
+                },
+            );
+        }
+        match store.page(0).unwrap().cols.get(0).unwrap().as_ref() {
+            ColSlab::Values(vs) => {
+                assert!(vs.is_sparse());
+                assert!(vs.heap_payload_bytes() <= 8 * std::mem::size_of::<Value>());
+            }
+            other => panic!("expected Values slab, got {other:?}"),
+        }
+
+        // 2) Categorical text column (256 rows, 4 categories) compresses to 1-byte DictText
+        let cats: [Arc<str>; 4] = ["华东".into(), "华南".into(), "华北".into(), "西南".into()];
+        for r in 0..256u32 {
+            store.set(
+                r,
+                1,
+                Cell {
+                    value: Value::Text(cats[(r as usize) % 4].clone()),
+                    formula: None,
+                },
+            );
+        }
+        match store.page(0).unwrap().cols.get(1).unwrap().as_ref() {
+            ColSlab::Values(vs) => {
+                assert!(vs.is_dict_text());
+                assert!(
+                    vs.heap_payload_bytes() < 900,
+                    "DictText should use < 900 B vs 4,096 B Dense Vec<Value>, got {}",
+                    vs.heap_payload_bytes()
+                );
+            }
+            other => panic!("expected Values slab, got {other:?}"),
+        }
+
+        // 3) MixedSlab auto-demotes to Numbers when all formulas are stripped or overwritten
+        for r in 0..64u32 {
+            store.set(
+                r,
+                2,
+                Cell {
+                    value: Value::Number(r as f64),
+                    formula: (r < 2).then(|| format!("={r}").into()),
+                },
+            );
+        }
+        assert!(store.page(0).unwrap().cols.get(2).unwrap().is_mixed());
+        let mut cleared = CellJournal::default();
+        let stripped = store.strip_formulas_in_rect(0, 2, 10, 2, &mut cleared);
+        assert_eq!(stripped, 2);
+        assert!(
+            matches!(
+                store.page(0).unwrap().cols.get(2).unwrap().as_ref(),
+                ColSlab::Numbers(_)
+            ),
+            "stripping all formulas in numeric MixedSlab must auto-demote to ColSlab::Numbers"
+        );
+    }
+
+    #[test]
+    fn parallel_non_aligned_remap_axis_preserves_prefix_cow_and_shifts_cells_and_styles() {
+        let mut store = Store::default();
+        let mut styles = CellStyles::default();
+        let cats: [Arc<str>; 3] = ["甲".into(), "乙".into(), "丙".into()];
+        // 6,000 rows (~24 pages >= 16 parallel threshold)
+        for r in 0..6_000u32 {
+            store.set(r, 0, Cell { value: Value::Number(r as f64), formula: None });
+            store.set(
+                r,
+                1,
+                Cell {
+                    value: Value::Text(cats[(r as usize) % 3].clone()),
+                    formula: None,
+                },
+            );
+            if r % 17 == 0 {
+                styles.insert(CellRef::new(r, 0), 7);
+            }
+        }
+        styles.insert_rect(512, 1, 1023, 1, 9);
+        let prefix_cell_page = store.page(0).unwrap().clone();
+        let prefix_style_page = styles.page(0).unwrap().clone();
+
+        // Insert 5 rows at non-page-aligned row 260
+        let mut cleared = CellJournal::default();
+        store.remap_axis(
+            true,
+            260,
+            |r| if r >= 260 { Some(r + 5) } else { Some(r) },
+            &mut cleared,
+        );
+        styles.remap_axis(true, 260, |r| if r >= 260 { Some(r + 5) } else { Some(r) });
+
+        // Prefix page 0 (< 256) must remain untouched Arc pointer!
+        assert!(Arc::ptr_eq(store.page(0).unwrap(), &prefix_cell_page));
+        assert!(Arc::ptr_eq(styles.page(0).unwrap(), &prefix_style_page));
+
+        assert_eq!(store.get_f64(259, 0), Some(259.0));
+        assert_eq!(store.get_f64(260, 0), None);
+        assert_eq!(store.get_f64(264, 0), None);
+        assert_eq!(store.get_f64(265, 0), Some(260.0));
+        assert_eq!(store.get_f64(6_004, 0), Some(5_999.0));
+        assert_eq!(
+            store.value_ref(6_004, 1).as_ref(),
+            &Value::Text(cats[5_999 % 3].clone())
+        );
+        assert_eq!(styles.get(&CellRef::new(255, 0)), Some(&7)); // 255 = 15 * 17
+        assert_eq!(styles.get(&CellRef::new(272 + 5, 0)), Some(&7)); // 272 = 16 * 17
+        assert_eq!(styles.get(&CellRef::new(517, 1)), Some(&9));
+        assert_eq!(styles.get(&CellRef::new(1028, 1)), Some(&9));
     }
 }

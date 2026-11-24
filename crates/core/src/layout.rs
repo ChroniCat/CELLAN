@@ -326,6 +326,98 @@ impl HiddenIndices {
         self.refresh_meta();
     }
 
+    /// Return sorted disjoint closed intervals in `[start, end]` that are NOT in `self` (`O(intervals)`).
+    pub fn complement_in(&self, start: u32, end: u32) -> Vec<(u32, u32)> {
+        if start > end {
+            return Vec::new();
+        }
+        if self.intervals.is_empty() {
+            return vec![(start, end)];
+        }
+        let mut out = Vec::new();
+        let mut cur = start;
+        let idx = self.intervals.partition_point(|&(_, hi)| hi < start);
+        for &(lo, hi) in &self.intervals[idx..] {
+            if lo > end {
+                break;
+            }
+            if cur < lo {
+                out.push((cur, lo - 1));
+            }
+            let Some(next) = hi.checked_add(1) else {
+                return out;
+            };
+            cur = cur.max(next);
+            if cur > end {
+                return out;
+            }
+        }
+        if cur <= end {
+            out.push((cur, end));
+        }
+        out
+    }
+
+    /// Delete all indices inside sorted disjoint closed `del_intervals` and shift surviving
+    /// intervals down in a single `O(self.intervals + del_intervals)` two-pointer pass.
+    pub fn shift_delete_intervals(&mut self, del_intervals: &[(u32, u32)]) -> bool {
+        if del_intervals.is_empty() || self.intervals.is_empty() {
+            return false;
+        }
+        let first_del = del_intervals[0].0;
+        if self.intervals.last().is_some_and(|&(_, hi)| hi < first_del) {
+            return false;
+        }
+        let mut raw: Vec<(u32, u32)> = Vec::with_capacity(self.intervals.len());
+        let mut di = 0usize;
+        let mut deleted_before = 0u32;
+
+        for &(mut lo, hi) in self.intervals.iter() {
+            while di < del_intervals.len() && del_intervals[di].1 < lo {
+                let (d_lo, d_hi) = del_intervals[di];
+                deleted_before = deleted_before.saturating_add(d_hi - d_lo + 1);
+                di += 1;
+            }
+            let mut cur_del_idx = di;
+            let mut cur_shift = deleted_before;
+            while cur_del_idx < del_intervals.len() {
+                let (d_lo, d_hi) = del_intervals[cur_del_idx];
+                if d_lo > hi {
+                    break;
+                }
+                if lo < d_lo {
+                    raw.push((lo - cur_shift, (d_lo - 1) - cur_shift));
+                }
+                cur_shift = cur_shift.saturating_add(d_hi - d_lo + 1);
+                cur_del_idx += 1;
+                let Some(next_lo) = d_hi.checked_add(1) else {
+                    lo = u32::MAX;
+                    break;
+                };
+                lo = next_lo;
+                if lo > hi {
+                    break;
+                }
+            }
+            if lo <= hi {
+                raw.push((lo - cur_shift, hi - cur_shift));
+            }
+            while di < del_intervals.len() && del_intervals[di].1 <= hi {
+                let (d_lo, d_hi) = del_intervals[di];
+                deleted_before = deleted_before.saturating_add(d_hi - d_lo + 1);
+                di += 1;
+            }
+        }
+
+        let (merged, _) = coalesce_sorted_intervals(raw);
+        if merged == *self.intervals {
+            return false;
+        }
+        self.intervals = Arc::new(merged);
+        self.refresh_meta();
+        true
+    }
+
     /// Shift all hidden intervals in `O(intervals)` time for a structural insert or delete.
     pub fn shift_axis(&mut self, at: u32, n: u32, delete: bool) -> bool {
         if n == 0 || self.intervals.is_empty() {
@@ -876,6 +968,106 @@ impl Axis {
         self.hide_ranges(&runs);
     }
 
+    /// Shift custom spans in `O(spans)` time for a structural insert or delete,
+    /// without expanding million-row hidden/uniform spans into per-row loops.
+    pub fn shift_axis(&mut self, at: u32, n: u32, delete: bool) -> bool {
+        if n == 0 || self.spans.is_empty() {
+            return false;
+        }
+        if self.spans.last().is_some_and(|s| s.end < at) {
+            return false;
+        }
+        let mut raw: Vec<(u32, u32, f32)> = Vec::with_capacity(self.spans.len() + 1);
+        if delete {
+            let end_del = at.saturating_add(n);
+            for s in self.spans.iter() {
+                if s.end < at {
+                    raw.push((s.start, s.end, s.size));
+                } else if s.start >= end_del {
+                    raw.push((s.start - n, s.end - n, s.size));
+                } else {
+                    if s.start < at {
+                        raw.push((s.start, at - 1, s.size));
+                    }
+                    if s.end >= end_del {
+                        raw.push((at, s.end - n, s.size));
+                    }
+                }
+            }
+        } else {
+            for s in self.spans.iter() {
+                if s.end < at {
+                    raw.push((s.start, s.end, s.size));
+                } else if s.start >= at {
+                    raw.push((s.start.saturating_add(n), s.end.saturating_add(n), s.size));
+                } else {
+                    raw.push((s.start, at - 1, s.size));
+                    raw.push((at.saturating_add(n), s.end.saturating_add(n), s.size));
+                }
+            }
+        }
+        let prev_def_zero = self.default <= 0.0;
+        self.install_raw_spans(raw, prev_def_zero);
+        true
+    }
+
+    /// Delete sorted disjoint closed intervals from custom spans in a single `O(spans + intervals)` pass.
+    pub fn shift_delete_intervals(&mut self, del_intervals: &[(u32, u32)]) -> bool {
+        if del_intervals.is_empty() || self.spans.is_empty() {
+            return false;
+        }
+        let first_del = del_intervals[0].0;
+        if self.spans.last().is_some_and(|s| s.end < first_del) {
+            return false;
+        }
+        let mut raw: Vec<(u32, u32, f32)> = Vec::with_capacity(self.spans.len());
+        let mut di = 0usize;
+        let mut deleted_before = 0u32;
+
+        for s in self.spans.iter() {
+            let mut lo = s.start;
+            let hi = s.end;
+            while di < del_intervals.len() && del_intervals[di].1 < lo {
+                let (d_lo, d_hi) = del_intervals[di];
+                deleted_before = deleted_before.saturating_add(d_hi - d_lo + 1);
+                di += 1;
+            }
+            let mut cur_di = di;
+            let mut cur_shift = deleted_before;
+            while cur_di < del_intervals.len() {
+                let (d_lo, d_hi) = del_intervals[cur_di];
+                if d_lo > hi {
+                    break;
+                }
+                if lo < d_lo {
+                    raw.push((lo - cur_shift, (d_lo - 1) - cur_shift, s.size));
+                }
+                cur_shift = cur_shift.saturating_add(d_hi - d_lo + 1);
+                cur_di += 1;
+                let Some(next_lo) = d_hi.checked_add(1) else {
+                    lo = u32::MAX;
+                    break;
+                };
+                lo = next_lo;
+                if lo > hi {
+                    break;
+                }
+            }
+            if lo <= hi {
+                raw.push((lo - cur_shift, hi - cur_shift, s.size));
+            }
+            while di < del_intervals.len() && del_intervals[di].1 <= hi {
+                let (d_lo, d_hi) = del_intervals[di];
+                deleted_before = deleted_before.saturating_add(d_hi - d_lo + 1);
+                di += 1;
+            }
+        }
+
+        let prev_def_zero = self.default <= 0.0;
+        self.install_raw_spans(raw, prev_def_zero);
+        true
+    }
+
     pub(crate) fn remap_indices(&mut self, map: impl Fn(u32) -> Option<u32>) -> bool {
         if self.spans.is_empty() {
             return false;
@@ -888,26 +1080,30 @@ impl Axis {
         if !any_changed {
             return false;
         }
-        let mut raw: Vec<(u32, u32, f32)> = Vec::new();
-        for s in self.spans.iter() {
-            if let Some(lo) = map(s.start)
-                && map(s.end) == Some(lo + (s.end - s.start))
-            {
-                raw.push((lo, lo + (s.end - s.start), s.size));
-            } else {
-                for idx in s.start..=s.end {
-                    if let Some(ni) = map(idx) {
-                        if let Some(last) = raw.last_mut()
-                            && ni == last.1 + 1
-                            && last.2.to_bits() == s.size.to_bits()
-                        {
-                            last.1 = ni;
-                        } else {
-                            raw.push((ni, ni, s.size));
-                        }
+        fn split_span(
+            lo: u32,
+            hi: u32,
+            size: f32,
+            map: &impl Fn(u32) -> Option<u32>,
+            out: &mut Vec<(u32, u32, f32)>,
+        ) {
+            match (map(lo), map(hi)) {
+                (Some(a), Some(b)) if b >= a && b - a == hi - lo => out.push((a, b, size)),
+                _ if lo == hi => {
+                    if let Some(a) = map(lo) {
+                        out.push((a, a, size));
                     }
                 }
+                _ => {
+                    let mid = lo + (hi - lo) / 2;
+                    split_span(lo, mid, size, map, out);
+                    split_span(mid + 1, hi, size, map, out);
+                }
             }
+        }
+        let mut raw: Vec<(u32, u32, f32)> = Vec::with_capacity(self.spans.len());
+        for s in self.spans.iter() {
+            split_span(s.start, s.end, s.size, &map, &mut raw);
         }
         raw.sort_unstable_by_key(|&(lo, _, _)| lo);
         let prev_def_zero = self.default <= 0.0;

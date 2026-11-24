@@ -58,22 +58,59 @@ impl FormulaValues {
         let mut others = self.other.iter().peekable();
         let mut numbers = self.numbers.iter();
         let mut changes = Vec::new();
-        for (i, (key, cell)) in store
-            .iter()
-            .filter(|(_, c)| c.formula.is_some())
-            .enumerate()
-        {
-            if let Some(run) = others.peek().filter(|r| r.first <= i) {
-                if cell.value != run.value {
-                    changes.push((key, run.value.clone()));
+        let mut formula_idx = 0usize;
+        for (pi, page) in store.iter_pages() {
+            if !page.may_have_formula {
+                continue;
+            }
+            let base = pi * crate::store::PAGE_ROWS;
+            let mut mixed_cols: Vec<(u32, &crate::store::MixedSlab)> = Vec::new();
+            let mut fmask = [0u64; 4];
+            for (col, slab) in page.cols.iter_entries() {
+                if let crate::store::ColSlab::Mixed(cs) = slab.as_ref()
+                    && cs.has_formulas()
+                {
+                    let cm = cs.row_mask();
+                    for w in 0..4 {
+                        fmask[w] |= cm[w];
+                    }
+                    mixed_cols.push((col, cs));
                 }
-                if i + 1 == run.end {
-                    others.next();
-                }
-            } else {
-                let n = *numbers.next()?;
-                if !matches!(cell.value,Value::Number(v) if v.to_bits() == n.to_bits()) {
-                    changes.push((key, Value::Number(n)));
+            }
+            if mixed_cols.is_empty() {
+                continue;
+            }
+            for w in 0..4usize {
+                let mut bits = fmask[w];
+                while bits != 0 {
+                    let tz = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let ro = w * 64 + tz;
+                    let row = base + ro as u32;
+                    for &(col, cs) in &mixed_cols {
+                        let Some(cell) = cs.get_cell(ro) else {
+                            continue;
+                        };
+                        if cell.formula.is_none() {
+                            continue;
+                        }
+                        let i = formula_idx;
+                        formula_idx += 1;
+                        let key = CellRef::new(row, col);
+                        if let Some(run) = others.peek().filter(|r| r.first <= i) {
+                            if cell.value != run.value {
+                                changes.push((key, run.value.clone()));
+                            }
+                            if i + 1 == run.end {
+                                others.next();
+                            }
+                        } else {
+                            let n = *numbers.next()?;
+                            if !matches!(cell.value, Value::Number(v) if v.to_bits() == n.to_bits()) {
+                                changes.push((key, Value::Number(n)));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -214,26 +251,22 @@ fn compute_slab_digest_unfiltered(slab: &crate::store::ColSlab) -> Option<[u8; 3
             }
         }
         crate::store::ColSlab::Values(vs) => {
-            for (r_off, v) in vs.iter().enumerate() {
-                if !v.is_empty() {
-                    any = true;
-                    hash_slab_value(&mut hash, &mut buf, &mut pos, r_off as u16, v);
-                }
-            }
+            vs.for_each_occupied(|r_off, v| {
+                any = true;
+                hash_slab_value(&mut hash, &mut buf, &mut pos, r_off as u16, v);
+            });
         }
         crate::store::ColSlab::Mixed(cs) => {
-            for (r_off, cell) in cs.iter().enumerate() {
-                if !cell.is_blank() {
-                    any = true;
-                    hash_slab_view(
-                        &mut hash,
-                        &mut buf,
-                        &mut pos,
-                        r_off as u16,
-                        crate::store::CellView::Cell(cell),
-                    );
-                }
-            }
+            cs.for_each_occupied(|r_off, cell| {
+                any = true;
+                hash_slab_view(
+                    &mut hash,
+                    &mut buf,
+                    &mut pos,
+                    r_off as u16,
+                    crate::store::CellView::Cell(cell),
+                );
+            });
         }
     }
     if !any {
@@ -394,7 +427,7 @@ impl CellHistory {
                             let crate::store::ColSlab::Mixed(cs) = slab.as_ref() else {
                                 continue;
                             };
-                            let Some(cell) = cs.get(ro as usize).filter(|c| !c.is_blank()) else {
+                            let Some(cell) = cs.get_cell(ro as usize) else {
                                 continue;
                             };
                             if let Some(f_desired) = cell.formula.as_deref() {
@@ -503,17 +536,10 @@ impl CellHistory {
             |v| shift.map(v),
             &mut Default::default(),
         );
-        let changes: Vec<_> = store
-            .formula_cells()
-            .filter_map(|(k, cell)| {
-                let text = cell.formula.as_deref()?;
-                let restored = crate::refs::rewrite(text, &shift);
-                (restored != text).then(|| (k, restored.into()))
-            })
-            .collect();
-        for (k, f) in changes {
-            store.get_mut(k.row, k.col).unwrap().formula = Some(f);
-        }
+        store.rewrite_formulas_parallel(None, |text| {
+            let restored = crate::refs::rewrite(text, &shift);
+            (restored != text).then(|| restored.into())
+        });
         for (k, cell) in &self.exceptions {
             if cell.is_blank() {
                 store.remove(k.row, k.col);

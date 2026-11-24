@@ -336,6 +336,9 @@ impl SliceSummary {
         let mut count = 0usize;
         let end = slice.end.min(slice.cells.len());
         if slice.start < end {
+            let hi = end - 1;
+            let start_w = slice.start / 64;
+            let end_w = hi / 64;
             match slice.cells.as_ref() {
                 crate::store::ColSlab::Numbers(ns) => {
                     let len = end - slice.start;
@@ -349,9 +352,18 @@ impl SliceSummary {
                             }
                         }
                     } else {
-                        for ro in slice.start..end {
-                            if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
-                                let v = ns.values[ro];
+                        for w in start_w..=end_w {
+                            let mut bits = ns.present[w];
+                            if w == start_w {
+                                bits &= !0u64 << (slice.start % 64);
+                            }
+                            if w == end_w && (hi % 64) < 63 {
+                                bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                            }
+                            while bits != 0 {
+                                let tz = bits.trailing_zeros() as usize;
+                                bits &= bits - 1;
+                                let v = ns.values[w * 64 + tz];
                                 if v.is_finite() {
                                     min = min.min(v);
                                     max = max.max(v);
@@ -363,32 +375,197 @@ impl SliceSummary {
                     }
                 }
                 crate::store::ColSlab::Values(vs) => {
-                    for val in &vs[slice.start..end] {
-                        if let Value::Number(v) = val
-                            && v.is_finite()
-                        {
-                            min = min.min(*v);
-                            max = max.max(*v);
-                            sum += *v;
-                            count += 1;
+                    if !vs.is_dict_text() {
+                        for w in start_w..=end_w {
+                            let mut bits = vs.present[w];
+                            if w == start_w {
+                                bits &= !0u64 << (slice.start % 64);
+                            }
+                            if w == end_w && (hi % 64) < 63 {
+                                bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                            }
+                            while bits != 0 {
+                                let tz = bits.trailing_zeros() as usize;
+                                bits &= bits - 1;
+                                if let Some(Value::Number(v)) = vs.get_val(w * 64 + tz)
+                                    && v.is_finite()
+                                {
+                                    min = min.min(*v);
+                                    max = max.max(*v);
+                                    sum += *v;
+                                    count += 1;
+                                }
+                            }
                         }
                     }
                 }
                 crate::store::ColSlab::Mixed(cs) => {
-                    for cell in &cs[slice.start..end] {
-                        if let Value::Number(v) = &cell.value
-                            && v.is_finite()
-                        {
-                            min = min.min(*v);
-                            max = max.max(*v);
-                            sum += *v;
-                            count += 1;
+                    let pm = cs.row_mask();
+                    for w in start_w..=end_w {
+                        let mut bits = pm[w];
+                        if w == start_w {
+                            bits &= !0u64 << (slice.start % 64);
+                        }
+                        if w == end_w && (hi % 64) < 63 {
+                            bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                        }
+                        while bits != 0 {
+                            let tz = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            if let Some(cell) = cs.get_cell(w * 64 + tz)
+                                && let Value::Number(v) = cell.value
+                                && v.is_finite()
+                            {
+                                min = min.min(v);
+                                max = max.max(v);
+                                sum += v;
+                                count += 1;
+                            }
                         }
                     }
                 }
             }
         }
         Self { min, max, sum, count }
+    }
+}
+
+fn dup_slice_counts(slice: &PageSlice) -> std::sync::Arc<Vec<(String, usize)>> {
+    let end = slice.end.min(slice.cells.len());
+    if slice.start >= end {
+        return std::sync::Arc::new(Vec::new());
+    }
+    let hi = end - 1;
+    let start_w = slice.start / 64;
+    let end_w = hi / 64;
+    let mut map: crate::sort_filter::FxHashMap<String, usize> = Default::default();
+    let mut record = |v: &Value| {
+        v.with_display_str(|s| {
+            if !s.is_empty() {
+                if let Some(cnt) = map.get_mut(s) {
+                    *cnt += 1;
+                } else {
+                    map.insert(s.to_string(), 1);
+                }
+            }
+        });
+    };
+    match slice.cells.as_ref() {
+        crate::store::ColSlab::Numbers(ns) => {
+            let mut num_counts: crate::sort_filter::FxHashMap<u64, (f64, usize)> =
+                Default::default();
+            for w in start_w..=end_w {
+                let mut bits = ns.present[w];
+                if w == start_w {
+                    bits &= !0u64 << (slice.start % 64);
+                }
+                if w == end_w && (hi % 64) < 63 {
+                    bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                }
+                while bits != 0 {
+                    let tz = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let n = ns.values[w * 64 + tz];
+                    let nb = if n == 0.0 { 0u64 } else { n.to_bits() };
+                    num_counts
+                        .entry(nb)
+                        .and_modify(|e| e.1 += 1)
+                        .or_insert((n, 1));
+                }
+            }
+            for (_, (n, cnt)) in num_counts {
+                *map.entry(crate::model::format_number(n)).or_insert(0) += cnt;
+            }
+        }
+        crate::store::ColSlab::Values(vs) => {
+            if let Some((codes, dict)) = vs.dict_text() {
+                let mut code_counts = [0u16; 129];
+                for &code in &codes[slice.start..end] {
+                    code_counts[code as usize] += 1;
+                }
+                for (code, &cnt) in code_counts.iter().enumerate().take(dict.len()).skip(1) {
+                    if cnt > 0
+                        && let Value::Text(s) = &dict[code]
+                        && !s.is_empty()
+                    {
+                        *map.entry(s.to_string()).or_insert(0) += cnt as usize;
+                    }
+                }
+            } else {
+                for w in start_w..=end_w {
+                    let mut bits = vs.present[w];
+                    if w == start_w {
+                        bits &= !0u64 << (slice.start % 64);
+                    }
+                    if w == end_w && (hi % 64) < 63 {
+                        bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                    }
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        if let Some(v) = vs.get_val(w * 64 + tz) {
+                            record(v);
+                        }
+                    }
+                }
+            }
+        }
+        crate::store::ColSlab::Mixed(cs) => {
+            let pm = cs.row_mask();
+            for w in start_w..=end_w {
+                let mut bits = pm[w];
+                if w == start_w {
+                    bits &= !0u64 << (slice.start % 64);
+                }
+                if w == end_w && (hi % 64) < 63 {
+                    bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                }
+                while bits != 0 {
+                    let tz = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if let Some(cell) = cs.get_cell(w * 64 + tz) {
+                        record(&cell.value);
+                    }
+                }
+            }
+        }
+    }
+    std::sync::Arc::new(map.into_iter().collect())
+}
+
+#[inline]
+fn slice_cache_key(slice: &PageSlice) -> SliceCacheKey {
+    (
+        std::sync::Arc::as_ptr(&slice.cells) as usize,
+        slice.page,
+        slice.col,
+        slice.start,
+        slice.end,
+    )
+}
+
+fn percentile_inc_quickselect(vals: &mut [f64], p: f64) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    if vals.len() == 1 {
+        return vals[0];
+    }
+    let p = p.clamp(0.0, 1.0);
+    let k = (vals.len() - 1) as f64 * p;
+    let lo = k.floor() as usize;
+    let hi = k.ceil() as usize;
+    let (_, pivot_lo, right) = vals.select_nth_unstable_by(lo, |a, b| a.total_cmp(b));
+    let v_lo = *pivot_lo;
+    if lo == hi {
+        v_lo
+    } else {
+        let v_hi = right
+            .iter()
+            .copied()
+            .min_by(|a, b| a.total_cmp(b))
+            .unwrap_or(v_lo);
+        v_lo + (v_hi - v_lo) * (k - lo as f64)
     }
 }
 
@@ -399,13 +576,16 @@ type SliceCacheKey = (usize, u32, u32, usize, usize);
 pub struct CfStats {
     inputs: Option<Vec<BlockInputs>>,
     slice_cache: HashMap<SliceCacheKey, SliceSummary>,
+    dup_slice_cache: HashMap<SliceCacheKey, std::sync::Arc<Vec<(String, usize)>>>,
     /// block 序号 → (min, max)
     pub ranges: HashMap<usize, (f64, f64)>,
     /// 平均/计数用于 avg、top 规则
     pub averages: HashMap<usize, f64>,
     pub counts: HashMap<usize, usize>,
-    /// 每个块的数值升序（百分位规则要用）
+    /// 每个块的数值升序（百分位规则小表时保留）
     pub sorted: HashMap<usize, Vec<f64>>,
+    /// 大表百分位规则通过 `select_nth_unstable_by` `O(N)` 预计算的精确分位值 `(block_idx, pct_bits) -> val`
+    pub percentiles: HashMap<(usize, u64), f64>,
     /// 前/后 N 项规则通过 `select_nth_unstable_by` 预计算的精确阈值 `(block_idx, rule_idx) -> threshold`
     pub top_thresholds: HashMap<(usize, usize), f64>,
     /// 重复值/唯一值规则预聚合频次表（block 序号 → 显示文本 → 频次），避免逐格整列扫描
@@ -432,7 +612,7 @@ impl PartialEq for PageSlice {
 #[derive(Clone, Debug, PartialEq)]
 struct BlockInputs {
     numeric: bool,
-    sort: bool,
+    percentile_bits: Vec<u64>,
     top_specs: Vec<(usize, bool, u32, bool)>,
     duplicates: bool,
     ranges: Vec<((u32, u32, u32, u32), Vec<PageSlice>)>,
@@ -448,9 +628,9 @@ fn top_rank_k(len: usize, n: u32, percent: bool) -> usize {
     .min(len)
 }
 
-fn requirements(block: &CfBlock) -> (bool, bool, Vec<(usize, bool, u32, bool)>, bool) {
+fn requirements(block: &CfBlock) -> (bool, Vec<u64>, Vec<(usize, bool, u32, bool)>, bool) {
     let mut numeric = false;
-    let mut sort = false;
+    let mut percentile_bits = Vec::new();
     let mut top_specs = Vec::new();
     let mut duplicates = false;
     for (ri, rule) in block.rules.iter().enumerate() {
@@ -462,21 +642,36 @@ fn requirements(block: &CfBlock) -> (bool, bool, Vec<(usize, bool, u32, bool)>, 
             CfKind::Avg { .. } => numeric = true,
             CfKind::Scale { points } => {
                 numeric = true;
-                sort |= points.iter().any(|(t, _)| t.kind == CfvoKind::Percentile);
+                for (t, _) in points {
+                    if t.kind == CfvoKind::Percentile {
+                        percentile_bits.push(t.val.to_bits());
+                    }
+                }
             }
             CfKind::IconSet { thresholds, .. } => {
                 numeric = true;
-                sort |= thresholds.iter().any(|t| t.kind == CfvoKind::Percentile);
+                for t in thresholds {
+                    if t.kind == CfvoKind::Percentile {
+                        percentile_bits.push(t.val.to_bits());
+                    }
+                }
             }
             CfKind::Bar { min, max, .. } => {
                 numeric = true;
-                sort |= min.kind == CfvoKind::Percentile || max.kind == CfvoKind::Percentile;
+                if min.kind == CfvoKind::Percentile {
+                    percentile_bits.push(min.val.to_bits());
+                }
+                if max.kind == CfvoKind::Percentile {
+                    percentile_bits.push(max.val.to_bits());
+                }
             }
             CfKind::Dup { .. } => duplicates = true,
             _ => {}
         }
     }
-    (numeric, sort, top_specs, duplicates)
+    percentile_bits.sort_unstable();
+    percentile_bits.dedup();
+    (numeric, percentile_bits, top_specs, duplicates)
 }
 
 fn ranges_pairwise_disjoint(ranges: &[(u32, u32, u32, u32)]) -> bool {
@@ -494,20 +689,20 @@ fn ranges_pairwise_disjoint(ranges: &[(u32, u32, u32, u32)]) -> bool {
     true
 }
 
-/// Compare only the stored pages touched by statistical rules. Unchanged 256-row
-/// `PageSlice`s reuse their cached `(min, max, sum, count)` in `O(1)` without rescanning cells.
+/// Compare only the stored pages touched by statistical rules. Unchanged blocks and unchanged
+/// 256-row `PageSlice`s reuse their cached numeric/duplicate summaries in `O(1)`.
 pub fn refresh_stats(sheet: &Sheet, into: &mut CfStats) -> bool {
     let inputs: Vec<_> = sheet.cf.blocks.iter().map(|block| {
-        let (numeric, sort, top_specs, duplicates) = requirements(block);
+        let (numeric, percentile_bits, top_specs, duplicates) = requirements(block);
         let ranges = if numeric || duplicates {
             block.ranges.iter().map(|&rect| (rect, sheet.cf_pages(rect))).collect()
         } else { Vec::new() };
-        BlockInputs { numeric, sort, top_specs, duplicates, ranges }
+        BlockInputs { numeric, percentile_bits, top_specs, duplicates, ranges }
     }).collect();
     if into.inputs.as_ref() == Some(&inputs) { return false; }
     // Keep `prev_inputs` alive until `next_cache` is built so `Arc::as_ptr` keys cannot be ABA-reused.
     let prev_inputs = into.inputs.take();
-    compute_stats_with_slices(&sheet.cf, sheet, Some(&inputs), into);
+    compute_stats_with_slices(&sheet.cf, sheet, prev_inputs.as_deref(), Some(&inputs), into);
     drop(prev_inputs);
     into.inputs = Some(inputs);
     true
@@ -516,35 +711,90 @@ pub fn refresh_stats(sheet: &Sheet, into: &mut CfStats) -> bool {
 pub fn compute_stats(cf: &CfSheet, sheet: &Sheet, into: &mut CfStats) {
     into.inputs = None;
     into.slice_cache.clear();
-    compute_stats_with_slices(cf, sheet, None, into);
+    into.dup_slice_cache.clear();
+    compute_stats_with_slices(cf, sheet, None, None, into);
+}
+
+fn clear_block_stats(into: &mut CfStats, bi: usize) {
+    into.ranges.remove(&bi);
+    into.averages.remove(&bi);
+    into.counts.remove(&bi);
+    into.sorted.remove(&bi);
+    into.percentiles.retain(|&(b, _), _| b != bi);
+    into.top_thresholds.retain(|&(b, _), _| b != bi);
+    into.dup_counts.remove(&bi);
 }
 
 fn compute_stats_with_slices(
     cf: &CfSheet,
     sheet: &Sheet,
+    prev_inputs: Option<&[BlockInputs]>,
     precomputed: Option<&[BlockInputs]>,
     into: &mut CfStats,
 ) {
-    into.ranges.clear();
-    into.averages.clear();
-    into.counts.clear();
-    into.sorted.clear();
-    into.top_thresholds.clear();
-    into.dup_counts.clear();
+    let can_reuse_blocks = prev_inputs.is_some_and(|prev| prev.len() == cf.blocks.len())
+        && precomputed.is_some_and(|cur| cur.len() == cf.blocks.len());
+    if !can_reuse_blocks {
+        into.ranges.clear();
+        into.averages.clear();
+        into.counts.clear();
+        into.sorted.clear();
+        into.percentiles.clear();
+        into.top_thresholds.clear();
+        into.dup_counts.clear();
+    }
     if cf.blocks.is_empty() {
         into.slice_cache.clear();
+        into.dup_slice_cache.clear();
         return;
     }
     let bounds = sheet.used_bounds();
     let mut next_slice_cache: HashMap<SliceCacheKey, SliceSummary> = HashMap::new();
+    let mut next_dup_slice_cache: HashMap<SliceCacheKey, std::sync::Arc<Vec<(String, usize)>>> =
+        HashMap::new();
 
     for (i, block) in cf.blocks.iter().enumerate() {
-        let (needs_num, needs_sort, top_specs, needs_dup) = requirements(block);
+        // Fast per-block reuse when block `i`'s rules and intersecting `PageSlice`s did not change!
+        if can_reuse_blocks
+            && let (Some(prev_bi), Some(cur_bi)) =
+                (prev_inputs.and_then(|p| p.get(i)), precomputed.and_then(|c| c.get(i)))
+            && prev_bi == cur_bi
+        {
+            for (_, slices) in &cur_bi.ranges {
+                for slice in slices {
+                    let key = slice_cache_key(slice);
+                    if let Some(&sum) = into.slice_cache.get(&key) {
+                        next_slice_cache.insert(key, sum);
+                    }
+                    if let Some(dup_arc) = into.dup_slice_cache.get(&key) {
+                        next_dup_slice_cache.insert(key, dup_arc.clone());
+                    }
+                }
+            }
+            continue;
+        }
+        if can_reuse_blocks {
+            // Keep existing `dup_counts[&i]` temporarily for incremental diff update if applicable.
+            into.ranges.remove(&i);
+            into.averages.remove(&i);
+            into.counts.remove(&i);
+            into.sorted.remove(&i);
+            into.percentiles.retain(|&(b, _), _| b != i);
+            into.top_thresholds.retain(|&(b, _), _| b != i);
+            if !block.rules.iter().any(|r| matches!(r.kind, CfKind::Dup { .. })) {
+                into.dup_counts.remove(&i);
+            }
+        }
+
+        let (needs_num, percentile_bits, top_specs, needs_dup) = requirements(block);
+        let needs_sort = !percentile_bits.is_empty();
         let needs_top = !top_specs.is_empty();
         if !needs_num && !needs_dup {
+            clear_block_stats(into, i);
             continue;
         }
         let Some((ur1, uc1, ur2, uc2)) = bounds else {
+            clear_block_stats(into, i);
             if needs_num {
                 into.counts.insert(i, 0);
             }
@@ -563,95 +813,208 @@ fn compute_stats_with_slices(
                 clamped.push((cr1, cc1, cr2, cc2));
             }
         }
+        if clamped.is_empty() {
+            clear_block_stats(into, i);
+            if needs_num {
+                into.counts.insert(i, 0);
+            }
+            if needs_dup {
+                into.dup_counts.insert(i, HashMap::new());
+            }
+            continue;
+        }
+
+        let disjoint = ranges_pairwise_disjoint(&block.ranges);
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
         let mut sum = 0.0;
         let mut n = 0usize;
         let mut vals: Vec<f64> = Vec::new();
-        let mut dups: HashMap<String, usize> = HashMap::new();
 
-        if !clamped.is_empty() {
-            let disjoint = ranges_pairwise_disjoint(&block.ranges);
-            // Incremental `PageSlice` summary merge for numeric-only rules (ColorScale / DataBar / Avg)
-            if disjoint && needs_num && !needs_sort && !needs_top && !needs_dup {
-                let mut consume_slice = |slice: &PageSlice| {
-                    let key: SliceCacheKey = (
-                        std::sync::Arc::as_ptr(&slice.cells) as usize,
-                        slice.page,
-                        slice.col,
-                        slice.start,
-                        slice.end,
-                    );
-                    let summary = into
-                        .slice_cache
+        // 1. Disjoint `PageSlice` fast path for `CfKind::Dup` (incremental O(changed_256_rows) delta update!)
+        let mut handled_dup_via_slices = false;
+        if disjoint && needs_dup {
+            handled_dup_via_slices = true;
+            let local_slices: Vec<PageSlice>;
+            let cur_slices_iter: Vec<&PageSlice> = if let Some(bi) = precomputed.and_then(|v| v.get(i)) {
+                bi.ranges.iter().flat_map(|(_, s)| s.iter()).collect()
+            } else {
+                local_slices = clamped.iter().flat_map(|&r| sheet.cf_pages(r)).collect();
+                local_slices.iter().collect()
+            };
+
+            let mut updated_in_place = false;
+            if can_reuse_blocks
+                && let Some(prev_bi) = prev_inputs.and_then(|p| p.get(i))
+                && prev_bi.duplicates
+                && ranges_pairwise_disjoint(
+                    &prev_bi.ranges.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+                )
+                && into.dup_counts.contains_key(&i)
+            {
+                let mut old_keys: crate::sort_filter::FxHashMap<SliceCacheKey, usize> =
+                    Default::default();
+                for (_, s_list) in &prev_bi.ranges {
+                    for s in s_list {
+                        *old_keys.entry(slice_cache_key(s)).or_insert(0) += 1;
+                    }
+                }
+                let mut added: Vec<&PageSlice> = Vec::new();
+                for &s in &cur_slices_iter {
+                    let key = slice_cache_key(s);
+                    if let Some(cnt) = old_keys.get_mut(&key)
+                        && *cnt > 0
+                    {
+                        *cnt -= 1;
+                        if let Some(cached) = into.dup_slice_cache.get(&key) {
+                            next_dup_slice_cache.insert(key, cached.clone());
+                        } else {
+                            added.push(s);
+                            *cnt += 1;
+                        }
+                    } else {
+                        added.push(s);
+                    }
+                }
+                let removed_keys: Vec<(SliceCacheKey, usize)> =
+                    old_keys.into_iter().filter(|&(_, c)| c > 0).collect();
+                let all_removed_cached = removed_keys
+                    .iter()
+                    .all(|(k, _)| into.dup_slice_cache.contains_key(k));
+                if all_removed_cached
+                    && removed_keys.len() + added.len() <= cur_slices_iter.len() / 2 + 2
+                {
+                    let dups = into.dup_counts.get_mut(&i).unwrap();
+                    for (old_k, mult) in removed_keys {
+                        if let Some(entries) = into.dup_slice_cache.get(&old_k) {
+                            for (text, cnt) in entries.iter() {
+                                let sub = cnt * mult;
+                                if let Some(cur_cnt) = dups.get_mut(text) {
+                                    if *cur_cnt <= sub {
+                                        dups.remove(text);
+                                    } else {
+                                        *cur_cnt -= sub;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for s in added {
+                        let key = slice_cache_key(s);
+                        let entries = into
+                            .dup_slice_cache
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| dup_slice_counts(s));
+                        for (text, cnt) in entries.iter() {
+                            *dups.entry(text.clone()).or_insert(0) += *cnt;
+                        }
+                        next_dup_slice_cache.insert(key, entries);
+                    }
+                    updated_in_place = true;
+                }
+            }
+
+            if !updated_in_place {
+                let mut dups: HashMap<String, usize> = HashMap::new();
+                for s in cur_slices_iter {
+                    let key = slice_cache_key(s);
+                    let entries = into
+                        .dup_slice_cache
                         .get(&key)
-                        .copied()
-                        .unwrap_or_else(|| SliceSummary::from_slice(slice));
-                    next_slice_cache.insert(key, summary);
-                    if summary.count > 0 {
-                        min = min.min(summary.min);
-                        max = max.max(summary.max);
-                        sum += summary.sum;
-                        n += summary.count;
+                        .cloned()
+                        .unwrap_or_else(|| dup_slice_counts(s));
+                    for (text, cnt) in entries.iter() {
+                        *dups.entry(text.clone()).or_insert(0) += *cnt;
                     }
-                };
-                if let Some(bi) = precomputed.and_then(| v | v.get(i)) {
-                    for (_, slices) in &bi.ranges {
-                        for slice in slices {
-                            consume_slice(slice);
-                        }
-                    }
-                } else {
-                    for &rect in &clamped {
-                        for slice in sheet.cf_pages(rect) {
-                            consume_slice(&slice);
-                        }
+                    next_dup_slice_cache.insert(key, entries);
+                }
+                into.dup_counts.insert(i, dups);
+            }
+        }
+
+        // 2. Numeric & fallback multi-range evaluation
+        if disjoint && needs_num && !needs_sort && !needs_top {
+            let mut consume_slice = |slice: &PageSlice| {
+                let key = slice_cache_key(slice);
+                let summary = into
+                    .slice_cache
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_else(|| SliceSummary::from_slice(slice));
+                next_slice_cache.insert(key, summary);
+                if summary.count > 0 {
+                    min = min.min(summary.min);
+                    max = max.max(summary.max);
+                    sum += summary.sum;
+                    n += summary.count;
+                }
+            };
+            if let Some(bi) = precomputed.and_then(|v| v.get(i)) {
+                for (_, slices) in &bi.ranges {
+                    for slice in slices {
+                        consume_slice(slice);
                     }
                 }
             } else {
-                let collect_vals = needs_sort || needs_top;
-                let mut visit = |cell: crate::store::CellView<'_>| {
-                    if needs_num
-                        && let Some(v) = cell.as_f64()
-                        && v.is_finite()
-                    {
-                        min = min.min(v);
-                        max = max.max(v);
-                        sum += v;
-                        n += 1;
-                        if collect_vals {
-                            vals.push(v);
-                        }
+                for &rect in &clamped {
+                    for slice in sheet.cf_pages(rect) {
+                        consume_slice(&slice);
                     }
-                    if needs_dup {
-                        let key = cell.value().display();
-                        if !key.is_empty() {
-                            *dups.entry(key).or_insert(0) += 1;
-                        }
+                }
+            }
+        } else if needs_num || (needs_dup && !handled_dup_via_slices) {
+            let mut dups: HashMap<String, usize> = HashMap::new();
+            let collect_vals = needs_sort || needs_top;
+            let want_dup = needs_dup && !handled_dup_via_slices;
+            let mut visit = |cell: crate::store::CellView<'_>| {
+                if needs_num
+                    && let Some(v) = cell.as_f64()
+                    && v.is_finite()
+                {
+                    min = min.min(v);
+                    max = max.max(v);
+                    sum += v;
+                    n += 1;
+                    if collect_vals {
+                        vals.push(v);
                     }
-                };
-                if ranges_pairwise_disjoint(&clamped) {
-                    for &rect in &clamped {
-                        for (_, cell) in sheet.iter_rect_views(rect) {
-                            visit(cell);
-                        }
-                    }
-                } else {
-                    // Overlapping multi-range block: visit each rect via `iter_rect_views` and skip
-                    // cells already covered by an earlier clamped rect (never scans outside block!).
-                    for (ri, &rect) in clamped.iter().enumerate() {
-                        for (cref, cell) in sheet.iter_rect_views(rect) {
-                            let already = clamped[..ri].iter().any(|&(r1, c1, r2, c2)| {
-                                cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2
-                            });
-                            if !already {
-                                visit(cell);
+                }
+                if want_dup {
+                    cell.value().with_display_str(|s| {
+                        if !s.is_empty() {
+                            if let Some(c) = dups.get_mut(s) {
+                                *c += 1;
+                            } else {
+                                dups.insert(s.to_string(), 1);
                             }
+                        }
+                    });
+                }
+            };
+            if ranges_pairwise_disjoint(&clamped) {
+                for &rect in &clamped {
+                    for (_, cell) in sheet.iter_rect_views(rect) {
+                        visit(cell);
+                    }
+                }
+            } else {
+                for (ri, &rect) in clamped.iter().enumerate() {
+                    for (cref, cell) in sheet.iter_rect_views(rect) {
+                        let already = clamped[..ri].iter().any(|&(r1, c1, r2, c2)| {
+                            cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2
+                        });
+                        if !already {
+                            visit(cell);
                         }
                     }
                 }
             }
+            if want_dup {
+                into.dup_counts.insert(i, dups);
+            }
         }
+
         if needs_num {
             if n > 0 {
                 into.ranges.insert(i, (min, max));
@@ -659,15 +1022,23 @@ fn compute_stats_with_slices(
             }
             into.counts.insert(i, n);
             if !vals.is_empty() {
-                if needs_sort {
+                if needs_sort && vals.len() <= 4_096 {
                     vals.sort_unstable_by(|a, b| a.total_cmp(b));
                     for &(ri, top, rank, percent) in &top_specs {
                         let k = top_rank_k(vals.len(), rank, percent);
                         let threshold = if top { vals[vals.len() - k] } else { vals[k - 1] };
                         into.top_thresholds.insert((i, ri), threshold);
                     }
+                    for &p_bits in &percentile_bits {
+                        let pv = percentile_inc(&vals, f64::from_bits(p_bits) / 100.0);
+                        into.percentiles.insert((i, p_bits), pv);
+                    }
                     into.sorted.insert(i, vals);
-                } else if needs_top {
+                } else {
+                    for &p_bits in &percentile_bits {
+                        let pv = percentile_inc_quickselect(&mut vals, f64::from_bits(p_bits) / 100.0);
+                        into.percentiles.insert((i, p_bits), pv);
+                    }
                     for &(ri, top, rank, percent) in &top_specs {
                         let k = top_rank_k(vals.len(), rank, percent);
                         let idx = if top { vals.len() - k } else { k - 1 };
@@ -677,11 +1048,9 @@ fn compute_stats_with_slices(
                 }
             }
         }
-        if needs_dup {
-            into.dup_counts.insert(i, dups);
-        }
     }
     into.slice_cache = next_slice_cache;
+    into.dup_slice_cache = next_dup_slice_cache;
 }
 
 /// 判断某格是否落在块范围内
@@ -932,28 +1301,35 @@ impl<'a> RowRules<'a> {
                     }
                 }
                 CfKind::Dup { unique, dxf } => {
-                    let key = raw.display();
-                    if key.is_empty() {
-                        continue;
-                    }
-                    let n = if let Some(dups) = stats.dup_counts.get(&bi) {
-                        dups.get(&key).copied().unwrap_or(0)
-                    } else {
-                        let mut cnt = 0usize;
-                        for (ri_idx, &rect) in block.ranges.iter().enumerate() {
-                            for (cref, cell) in sheet.iter_rect_views(rect) {
-                                let dup_rect = block.ranges[..ri_idx].iter().any(|&(r1, c1, r2, c2)| {
-                                    cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2
-                                });
-                                if !dup_rect && cell.value().display() == key {
-                                    cnt += 1;
+                    let matched = raw.with_display_str(|key| {
+                        if key.is_empty() {
+                            return false;
+                        }
+                        let n = if let Some(dups) = stats.dup_counts.get(&bi) {
+                            dups.get(key).copied().unwrap_or(0)
+                        } else {
+                            let mut cnt = 0usize;
+                            for (ri_idx, &rect) in block.ranges.iter().enumerate() {
+                                for (cref, cell) in sheet.iter_rect_views(rect) {
+                                    let dup_rect =
+                                        block.ranges[..ri_idx].iter().any(|&(r1, c1, r2, c2)| {
+                                            cref.row >= r1
+                                                && cref.row <= r2
+                                                && cref.col >= c1
+                                                && cref.col <= c2
+                                        });
+                                    if !dup_rect
+                                        && cell.value().with_display_str(|s| s == key)
+                                    {
+                                        cnt += 1;
+                                    }
                                 }
                             }
-                        }
-                        cnt
-                    };
-                    let want = if *unique { n == 1 } else { n > 1 };
-                    if want {
+                            cnt
+                        };
+                        if *unique { n == 1 } else { n > 1 }
+                    });
+                    if matched {
                         apply_dxf(cf, *dxf, &mut out);
                         hit = true;
                     }
@@ -996,10 +1372,41 @@ impl<'a> RowRules<'a> {
                 CfKind::Scale { points } => {
                     if let (Value::Number(v), Some((min, max))) = (&raw, stats.ranges.get(&bi)) {
                         let sorted = stats.sorted.get(&bi).map_or(&[][..], Vec::as_slice);
-                        let abs: Vec<(f64, [u8; 3])> =
-                            points.iter().map(|(t, c)| (t.resolve(*min, *max, sorted), *c)).collect();
-                        if let Some(rgb) = scale_color(&abs, *v) {
-                            if out.fill.is_none() {
+                        if points.len() <= 8 {
+                            let mut stack_abs = [(0.0f64, [0u8; 3]); 8];
+                            for (dst, (t, col)) in stack_abs.iter_mut().zip(points.iter()) {
+                                let resolved = if t.kind == CfvoKind::Percentile
+                                    && let Some(&pv) = stats.percentiles.get(&(bi, t.val.to_bits()))
+                                {
+                                    pv
+                                } else {
+                                    t.resolve(*min, *max, sorted)
+                                };
+                                *dst = (resolved, *col);
+                            }
+                            if let Some(rgb) = scale_color(&stack_abs[..points.len()], *v)
+                                && out.fill.is_none()
+                            {
+                                out.fill = Some(rgb);
+                            }
+                        } else {
+                            let abs: Vec<(f64, [u8; 3])> = points
+                                .iter()
+                                .map(|(t, col)| {
+                                    let resolved = if t.kind == CfvoKind::Percentile
+                                        && let Some(&pv) =
+                                            stats.percentiles.get(&(bi, t.val.to_bits()))
+                                    {
+                                        pv
+                                    } else {
+                                        t.resolve(*min, *max, sorted)
+                                    };
+                                    (resolved, *col)
+                                })
+                                .collect();
+                            if let Some(rgb) = scale_color(&abs, *v)
+                                && out.fill.is_none()
+                            {
                                 out.fill = Some(rgb);
                             }
                         }
@@ -1013,16 +1420,20 @@ impl<'a> RowRules<'a> {
                             let sorted = stats.sorted.get(&bi).map_or(&[][..], Vec::as_slice);
                             let mut idx = 0u8;
                             for (i, th) in thresholds.iter().enumerate().skip(1) {
-                                let t = th.resolve(min, max, sorted);
+                                let t = if th.kind == CfvoKind::Percentile
+                                    && let Some(&pv) =
+                                        stats.percentiles.get(&(bi, th.val.to_bits()))
                                 {
-                                    if *v >= t {
-                                        idx = i as u8;
-                                    } else {
-                                        break;
-                                    }
+                                    pv
+                                } else {
+                                    th.resolve(min, max, sorted)
+                                };
+                                if *v >= t {
+                                    idx = i as u8;
+                                } else {
+                                    break;
                                 }
                             }
-                            let _ = (min, max);
                             let idx = if *reverse { levels.saturating_sub(1 + idx) } else { idx };
                             out.icon = Some(IconMark {
                                 style,
@@ -1035,8 +1446,20 @@ impl<'a> RowRules<'a> {
                 CfKind::Bar { color, min: lo, max: hi } => {
                     if let (Value::Number(v), Some((min, max))) = (&raw, stats.ranges.get(&bi)) {
                         let sorted = stats.sorted.get(&bi).map_or(&[][..], Vec::as_slice);
-                        let a = lo.resolve(*min, *max, sorted);
-                        let b = hi.resolve(*min, *max, sorted);
+                        let a = if lo.kind == CfvoKind::Percentile
+                            && let Some(&pv) = stats.percentiles.get(&(bi, lo.val.to_bits()))
+                        {
+                            pv
+                        } else {
+                            lo.resolve(*min, *max, sorted)
+                        };
+                        let b = if hi.kind == CfvoKind::Percentile
+                            && let Some(&pv) = stats.percentiles.get(&(bi, hi.val.to_bits()))
+                        {
+                            pv
+                        } else {
+                            hi.resolve(*min, *max, sorted)
+                        };
                         let span = (b - a).max(f64::MIN_POSITIVE);
                         let t = ((v - a) / span).clamp(0.0, 1.0) as f32;
                         out.bar = Some((t, *color));
@@ -1994,7 +2417,7 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
     let mut in_font = false;
     let mut in_fill = false;
     let mut in_border = false;
-    /// 正在读对角/内部这类未建模边框：其中的 color 不能落进填充
+    // 正在读对角/内部这类未建模边框：其中的 color 不能落进填充
     let mut skip_color = false;
     let mut side: Option<usize> = None;
 
@@ -2237,5 +2660,77 @@ mod parse_tests {
         assert_eq!(d[0].fill, Some([255, 199, 206]));
         assert!(d[1].bold);
         assert_eq!(d[1].fill, Some([198, 239, 206]));
+    }
+}
+
+
+#[cfg(test)]
+mod wave5_cf_incremental_tests {
+    use super::*;
+    use crate::model::{Cell, Sheet, Value};
+
+    #[test]
+    fn large_percentile_quickselect_and_incremental_dup_page_slice_update() {
+        let mut sh = Sheet::new("CFWave5");
+        // Block 0: 5,000 numbers (> 4,096 quickselect threshold) with Percentile(50) ColorScale
+        let mut raw = Vec::with_capacity(5_000);
+        for r in 0..5_000u32 {
+            let v = ((r * 7919) % 10_000) as f64 * 0.25;
+            sh.set(r, 0, Cell { value: Value::Number(v), formula: None });
+            raw.push(v);
+        }
+        raw.sort_unstable_by(|a, b| a.total_cmp(b));
+        let expected_p50 = percentile_inc(&raw, 0.5);
+
+        // Block 1: 1,000 categorical text rows with CfKind::Dup
+        for r in 0..1_000u32 {
+            let txt = if r == 900 {
+                "UNIQUE_ONE".to_string()
+            } else {
+                format!("CAT-{}", r % 20)
+            };
+            sh.set(r, 1, Cell { value: Value::Text(txt.into()), formula: None });
+        }
+
+        sh.cf.dxfs.push(Dxf { fill: Some([255, 199, 206]), ..Default::default() });
+        sh.cf.blocks.push(CfBlock {
+            ranges: vec![(0, 0, 4_999, 0)],
+            rules: vec![CfRule {
+                kind: CfKind::Scale {
+                    points: vec![
+                        (Cfvo::min(), [255, 0, 0]),
+                        (Cfvo::new(CfvoKind::Percentile, 50.0), [255, 255, 0]),
+                        (Cfvo::max(), [0, 255, 0]),
+                    ],
+                },
+                stop: false,
+                priority: 1,
+            }],
+        });
+        sh.cf.blocks.push(CfBlock {
+            ranges: vec![(0, 1, 999, 1)],
+            rules: vec![CfRule {
+                kind: CfKind::Dup { unique: false, dxf: 0 },
+                stop: false,
+                priority: 1,
+            }],
+        });
+
+        let mut st = CfStats::default();
+        assert!(refresh_stats(&sh, &mut st));
+        assert!(st.sorted.get(&0).is_none(), "> 4096 rows should use O(N) quickselect without retaining sorted Vec");
+        let got_p50 = st.percentiles[&(0, 50.0f64.to_bits())];
+        assert!((got_p50 - expected_p50).abs() < 1e-9);
+        assert!(overlay_at(&sh.cf, &st, &sh, 900, 1, |_, _, _| false).fill.is_none());
+
+        // Edit 1 cell in Block 1 (turn UNIQUE_ONE into duplicate by writing UNIQUE_ONE at row 10):
+        // Block 0 stays untouched and Block 1 updates incrementally via PageSlice delta!
+        sh.set(10, 1, Cell { value: Value::Text("UNIQUE_ONE".into()), formula: None });
+        assert!(refresh_stats(&sh, &mut st));
+        assert_eq!(st.dup_counts[&1].get("UNIQUE_ONE"), Some(&2));
+        assert_eq!(
+            overlay_at(&sh.cf, &st, &sh, 900, 1, |_, _, _| false).fill,
+            Some([255, 199, 206])
+        );
     }
 }

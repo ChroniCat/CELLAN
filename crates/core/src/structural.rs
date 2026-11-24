@@ -245,7 +245,7 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, *at, *n, false));
+                self.layout_dirty |= self.rows.shift_axis(*at, *n, false);
                 self.shift_axis_metadata(&shift);
             }
             Structural::DeleteRows { at, n } => {
@@ -261,7 +261,7 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, *at, *n, true));
+                self.layout_dirty |= self.rows.shift_axis(*at, *n, true);
                 self.shift_axis_metadata(&shift);
             }
             Structural::InsertCols { at, n } => {
@@ -280,7 +280,7 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, *at, *n, false));
+                self.layout_dirty |= self.cols.shift_axis(*at, *n, false);
                 self.shift_axis_metadata(&shift);
             }
             Structural::DeleteCols { at, n } => {
@@ -296,7 +296,7 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
-                self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, *at, *n, true));
+                self.layout_dirty |= self.cols.shift_axis(*at, *n, true);
                 self.shift_axis_metadata(&shift);
             }
         }
@@ -319,52 +319,95 @@ impl Sheet {
         if shift.n != 0 { self.coordinates_shifted(); }
         let rows = shift.axis == crate::refs::Axis::Row;
         if shift.n == 0 { return; }
-        // 刚从 OOXML 读入、尚未重算时，CSE 尾格还没有 spilled 标记。
-        // 先登记旧范围；即使本次删掉了锚点，剩余的缓存尾格也能被清理。
-        for &(anchor, (r1, c1, r2, c2)) in &self.arrays {
-            for r in r1..=r2 {
-                for c in c1..=c2 {
-                    let key = CellRef::new(r, c);
-                    if key != anchor && self.get(r, c).is_none_or(|cell| cell.formula.is_none()) {
-                        self.spilled.insert(key);
+        let min_at = if shift.insertions.is_empty() {
+            shift.at
+        } else {
+            shift.insertions.first().copied().unwrap_or(shift.at)
+        };
+        if !self.arrays.is_empty() {
+            // 刚从 OOXML 读入、尚未重算时，CSE 尾格还没有 spilled 标记。
+            // 先登记旧范围；即使本次删掉了锚点，剩余的缓存尾格也能被清理。
+            for &(anchor, (r1, c1, r2, c2)) in &self.arrays {
+                let end_coord = if rows { r2 } else { c2 };
+                if end_coord < min_at {
+                    continue;
+                }
+                for r in r1..=r2 {
+                    for c in c1..=c2 {
+                        let key = CellRef::new(r, c);
+                        if key != anchor && self.get(r, c).is_none_or(|cell| cell.formula.is_none()) {
+                            self.spilled.insert(key);
+                        }
                     }
                 }
             }
         }
-        self.spilled = self.spilled.iter().filter_map(|key| {
-            let (r, c) = if rows {
-                (shift.map(key.row)?, key.col)
-            } else {
-                (key.row, shift.map(key.col)?)
-            };
-            Some(CellRef::new(r, c))
-        }).collect();
-        self.hyperlinks = std::mem::take(&mut self.hyperlinks).into_iter().filter_map(|((r, c), mut link)| {
-            let (start, span) = if rows { (r, link.span.0) } else { (c, link.span.1) };
-            let end = start.saturating_add(span);
-            let moved = shift.map_range(start, end);
-            self.hyperlinks_dirty |= moved != Some((start, end));
-            let (first, last) = moved?;
-            let anchor = if rows {
-                link.span.0 = last - first;
-                (first, c)
-            } else {
-                link.span.1 = last - first;
-                (r, first)
-            };
-            Some((anchor, link))
-        }).collect::<std::collections::HashMap<_, _>>().into();
-        self.arrays = self.arrays.iter().filter_map(|&(anchor, (r1, c1, r2, c2))| {
-            if rows {
-                let row = shift.map(anchor.row)?;
-                let (r1, r2) = shift.map_range(r1, r2)?;
-                Some((CellRef::new(row, anchor.col), (r1, c1, r2, c2)))
-            } else {
-                let col = shift.map(anchor.col)?;
-                let (c1, c2) = shift.map_range(c1, c2)?;
-                Some((CellRef::new(anchor.row, col), (r1, c1, r2, c2)))
-            }
-        }).collect();
+        if !self.spilled.is_empty()
+            && self
+                .spilled
+                .iter()
+                .any(|k| (if rows { k.row } else { k.col }) >= min_at)
+        {
+            self.spilled = self
+                .spilled
+                .iter()
+                .filter_map(|key| {
+                    let (r, c) = if rows {
+                        (shift.map(key.row)?, key.col)
+                    } else {
+                        (key.row, shift.map(key.col)?)
+                    };
+                    Some(CellRef::new(r, c))
+                })
+                .collect();
+        }
+        if !self.hyperlinks.is_empty()
+            && self.hyperlinks.iter().any(|(&(r, c), link)| {
+                let end = if rows {
+                    r.saturating_add(link.span.0)
+                } else {
+                    c.saturating_add(link.span.1)
+                };
+                end >= min_at
+            })
+        {
+            self.hyperlinks = std::mem::take(&mut self.hyperlinks)
+                .into_iter()
+                .filter_map(|((r, c), mut link)| {
+                    let (start, span) = if rows { (r, link.span.0) } else { (c, link.span.1) };
+                    let end = start.saturating_add(span);
+                    let moved = shift.map_range(start, end);
+                    self.hyperlinks_dirty |= moved != Some((start, end));
+                    let (first, last) = moved?;
+                    let anchor = if rows {
+                        link.span.0 = last - first;
+                        (first, c)
+                    } else {
+                        link.span.1 = last - first;
+                        (r, first)
+                    };
+                    Some((anchor, link))
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+                .into();
+        }
+        if !self.arrays.is_empty() {
+            self.arrays = self
+                .arrays
+                .iter()
+                .filter_map(|&(anchor, (r1, c1, r2, c2))| {
+                    if rows {
+                        let row = shift.map(anchor.row)?;
+                        let (r1, r2) = shift.map_range(r1, r2)?;
+                        Some((CellRef::new(row, anchor.col), (r1, c1, r2, c2)))
+                    } else {
+                        let col = shift.map(anchor.col)?;
+                        let (c1, c2) = shift.map_range(c1, c2)?;
+                        Some((CellRef::new(anchor.row, col), (r1, c1, r2, c2)))
+                    }
+                })
+                .collect();
+        }
     }
 
     fn shift_cells(&mut self, rows: bool, at: u32, n: u32, delete: bool) {
@@ -712,7 +755,11 @@ impl Sheet {
         self.shift_dv(shift);
         self.shift_sparklines(shift);
         if let Some((r, c)) = self.freeze { self.freeze = Some((shift.map(r).unwrap(), c)); }
-        self.layout_dirty |= self.rows.remap_indices(|r| shift.map(r));
+        self.layout_dirty |= if shift.insertions.is_empty() {
+            self.rows.shift_axis(shift.at, shift.n, shift.delete)
+        } else {
+            self.rows.remap_indices(|r| shift.map(r))
+        };
         if let Some(f) = &mut self.filter {
             let moved = shift.map_range(f.range.0, f.range.2).unwrap();
             self.filter_dirty |= (f.range.0, f.range.2) != moved;
@@ -754,7 +801,7 @@ impl Sheet {
             let nf = if fr >= at + n { fr - n } else { at.min(fr) };
             self.freeze = Some((nf, fc));
         }
-        self.layout_dirty |= self.rows.remap_indices(|i| shift_axis(i, at, n, true));
+        self.layout_dirty |= self.rows.shift_axis(at, n, true);
         self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
@@ -792,7 +839,7 @@ impl Sheet {
                 self.freeze = Some((fr, fc + n));
             }
         }
-        self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, at, n, false));
+        self.layout_dirty |= self.cols.shift_axis(at, n, false);
         self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
@@ -829,7 +876,7 @@ impl Sheet {
             let nf = if fc >= at + n { fc - n } else { at.min(fc) };
             self.freeze = Some((fr, nf));
         }
-        self.layout_dirty |= self.cols.remap_indices(|i| shift_axis(i, at, n, true));
+        self.layout_dirty |= self.cols.shift_axis(at, n, true);
         self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
@@ -838,6 +885,11 @@ impl Sheet {
     fn shift_axis_metadata(&mut self, shift: &MappedShift) {
         let rows = shift.axis == crate::refs::Axis::Row;
         if shift.n == 0 { return; }
+        let min_at = if shift.insertions.is_empty() {
+            shift.at
+        } else {
+            shift.insertions.first().copied().unwrap_or(shift.at)
+        };
         crate::scenarios::shift_references(self, shift);
         let mut move_hidden = |hidden: &mut crate::layout::HiddenIndices| {
             if !hidden.is_empty() {
@@ -856,13 +908,15 @@ impl Sheet {
             move_hidden(&mut self.hidden_cols);
         }
         let levels = if rows { &mut self.row_levels } else { &mut self.col_levels };
-        if !levels.is_empty() {
-            *levels = std::mem::take(levels).into_iter()
-                .filter_map(|(pos, level)| Some((shift.map(pos)?, level))).collect();
+        if !levels.is_empty() && levels.keys().any(|&pos| pos >= min_at) {
+            *levels = std::mem::take(levels)
+                .into_iter()
+                .filter_map(|(pos, level)| Some((shift.map(pos)?, level)))
+                .collect();
             self.layout_dirty = true;
         }
         let map = if rows { &mut self.row_styles } else { &mut self.col_styles };
-        if map.is_empty() {
+        if map.is_empty() || !map.keys().any(|&idx| idx >= min_at) {
             return;
         }
         let old = std::mem::take(map);
@@ -883,10 +937,25 @@ impl Sheet {
     }
 
     fn shift_notes(&mut self, shift: &MappedShift) {
+        if self.notes.is_empty() {
+            return;
+        }
         let rows = shift.axis == crate::refs::Axis::Row;
+        let min_at = if shift.insertions.is_empty() {
+            shift.at
+        } else {
+            shift.insertions.first().copied().unwrap_or(shift.at)
+        };
+        if !self
+            .notes
+            .keys()
+            .any(|k| (if rows { k.row } else { k.col }) >= min_at)
+        {
+            return;
+        }
         let old = std::mem::take(&mut self.notes);
-        let mut out = std::collections::HashMap::new();
-        self.notes_dirty |= !old.is_empty();
+        let mut out = std::collections::HashMap::with_capacity(old.len());
+        self.notes_dirty = true;
         for (k, mut v) in old {
             let pos = if rows { k.row } else { k.col };
             if let Some(np) = shift.map(pos) {
@@ -987,11 +1056,11 @@ fn shift_rule_ranges(ranges: &mut Vec<(u32, u32, u32, u32)>, shift: &MappedShift
 /// 行高/列宽的轴：插入删除时把后面的挪一挪（保持视觉位置）
 impl crate::layout::Axis {
     pub fn insert_at(&mut self, at: u32, n: u32) {
-        self.remap_indices(|i| shift_axis(i, at, n, false));
+        self.shift_axis(at, n, false);
     }
 
     pub fn delete_at(&mut self, at: u32, n: u32) {
-        self.remap_indices(|i| shift_axis(i, at, n, true));
+        self.shift_axis(at, n, true);
     }
 }
 
@@ -1188,4 +1257,699 @@ fn update_workbook_references(
 /// 供撤销用：一行/一列里有哪些格子
 pub fn collect_region(sheet: &Sheet, r1: u32, c1: u32, r2: u32, c2: u32) -> HashSet<CellRef> {
     sheet.iter_rect((r1, c1, r2, c2)).map(|(cref, _)| cref).collect()
+}
+
+/// Sorted, non-adjacent closed deletion intervals `[(lo_0, hi_0), ...]` (`lo_{j+1} >= hi_j + 2`)
+/// with prefix deleted row counts for `O(log K)` coordinate/range remapping and `O(|formula| log K)`
+/// single-pass formula rewriting.
+pub(crate) struct RowDeleteMap {
+    pub(crate) intervals: Vec<(u32, u32)>,
+    /// `prefix_deleted[i]` = total deleted rows across `intervals[..i]` (`len == intervals.len() + 1`).
+    prefix_deleted: Vec<u32>,
+}
+
+impl RowDeleteMap {
+    pub(crate) fn from_intervals(raw: &[(u32, u32)]) -> Option<Self> {
+        let mut sorted: Vec<(u32, u32)> = raw.iter().copied().filter(|&(lo, hi)| lo <= hi).collect();
+        if sorted.is_empty() {
+            return None;
+        }
+        sorted.sort_unstable_by_key(|&(lo, _)| lo);
+        let mut intervals: Vec<(u32, u32)> = Vec::with_capacity(sorted.len());
+        for (lo, hi) in sorted {
+            if let Some(last) = intervals.last_mut()
+                && lo <= last.1.saturating_add(1)
+            {
+                last.1 = last.1.max(hi);
+            } else {
+                intervals.push((lo, hi));
+            }
+        }
+        let mut prefix_deleted = Vec::with_capacity(intervals.len() + 1);
+        prefix_deleted.push(0);
+        let mut acc = 0u32;
+        for &(lo, hi) in &intervals {
+            acc = acc.saturating_add(hi - lo + 1);
+            prefix_deleted.push(acc);
+        }
+        Some(Self {
+            intervals,
+            prefix_deleted,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn min_at(&self) -> u32 {
+        self.intervals[0].0
+    }
+
+    /// Map a single row index in `O(log K)`; returns `None` if `r` falls inside a deleted interval.
+    #[inline]
+    pub(crate) fn map(&self, r: u32) -> Option<u32> {
+        let k = self.intervals.partition_point(|&(lo, _)| lo <= r);
+        if k > 0 && r <= self.intervals[k - 1].1 {
+            return None;
+        }
+        Some(r - self.prefix_deleted[k])
+    }
+
+    /// Map a closed row range `[a, b]` (`O(log K)`), shrinking deleted edges or returning `None` if wholly deleted.
+    #[inline]
+    pub(crate) fn map_range(&self, a: u32, b: u32) -> Option<(u32, u32)> {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let k_lo = self.intervals.partition_point(|&(start, _)| start <= lo);
+        let first_surviving = if k_lo > 0 && lo <= self.intervals[k_lo - 1].1 {
+            self.intervals[k_lo - 1].1.checked_add(1)?
+        } else {
+            lo
+        };
+        if first_surviving > hi {
+            return None;
+        }
+        let k_hi = self.intervals.partition_point(|&(start, _)| start <= hi);
+        let last_surviving = if k_hi > 0 && hi <= self.intervals[k_hi - 1].1 {
+            self.intervals[k_hi - 1].0.checked_sub(1)?
+        } else {
+            hi
+        };
+        if first_surviving > last_surviving {
+            return None;
+        }
+        Some((self.map(first_surviving)?, self.map(last_surviving)?))
+    }
+
+    /// Map a freeze boundary `fr` (matching sequential `DeleteRows`: `if fr >= at + n { fr - n } else { at.min(fr) }`).
+    #[inline]
+    pub(crate) fn map_freeze_or_clamp(&self, fr: u32) -> u32 {
+        let k = self.intervals.partition_point(|&(lo, _)| lo <= fr);
+        if k > 0 && fr <= self.intervals[k - 1].1 {
+            self.intervals[k - 1].0 - self.prefix_deleted[k - 1]
+        } else {
+            fr - self.prefix_deleted[k]
+        }
+    }
+
+    /// Rewrite `formula` against all deleted intervals in `O(|formula| * log K)` by coalescing
+    /// contiguous runs of intervals that do not contain any row token mentioned in `formula`.
+    pub(crate) fn rewrite_formula(&self, formula: &str, own_sheet: &str, target_sheet: &str) -> String {
+        let base_shift = crate::refs::Shift {
+            axis: crate::refs::Axis::Row,
+            at: self.min_at(),
+            n: 1,
+            delete: true,
+            own_sheet: own_sheet.to_string(),
+            target_sheet: target_sheet.to_string(),
+            ..Default::default()
+        };
+        if !formula_may_be_affected(
+            formula,
+            &MappedShift {
+                shift: &base_shift,
+                insertions: &[],
+            },
+        ) {
+            return formula.to_string();
+        }
+
+        // Extract sorted 0-based row integers appearing in `formula` (`<= |formula| / 2`, usually 1..4).
+        let bytes = formula.as_bytes();
+        let mut mentioned: Vec<u32> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i].is_ascii_digit() {
+                let mut val = 0u64;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    val = val.saturating_mul(10).saturating_add((bytes[i] - b'0') as u64);
+                    i += 1;
+                }
+                if (1..=1_048_576).contains(&val) {
+                    mentioned.push((val - 1) as u32);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if mentioned.is_empty() {
+            return formula.to_string();
+        }
+        mentioned.sort_unstable();
+        mentioned.dedup();
+        let max_r = *mentioned.last().unwrap();
+        let end_idx = self.intervals.partition_point(|&(lo, _)| lo <= max_r);
+        if end_idx == 0 {
+            return formula.to_string();
+        }
+
+        // Partition `self.intervals[..end_idx]` around `mentioned` in `O(mentioned.len() * log K)`.
+        let mut steps: Vec<(u32, u32)> = Vec::with_capacity(mentioned.len() * 2 + 1);
+        let mut cur_idx = 0usize;
+        for &r in &mentioned {
+            if cur_idx >= end_idx {
+                break;
+            }
+            // All intervals in `cur_idx..before_r` have `hi < r` and contain NO mentioned row -> merge into 1 Shift!
+            let before_r = cur_idx + self.intervals[cur_idx..end_idx].partition_point(|&(_, hi)| hi < r);
+            if before_r > cur_idx {
+                let at = self.intervals[cur_idx].0;
+                let n = self.prefix_deleted[before_r] - self.prefix_deleted[cur_idx];
+                steps.push((at, n));
+                cur_idx = before_r;
+            }
+            // If `intervals[cur_idx]` straddles/contains `r`, emit it unmerged.
+            if cur_idx < end_idx && self.intervals[cur_idx].0 <= r && r <= self.intervals[cur_idx].1 {
+                let (lo, hi) = self.intervals[cur_idx];
+                steps.push((lo, hi - lo + 1));
+                cur_idx += 1;
+            }
+        }
+        if cur_idx < end_idx {
+            let at = self.intervals[cur_idx].0;
+            let n = self.prefix_deleted[end_idx] - self.prefix_deleted[cur_idx];
+            steps.push((at, n));
+        }
+
+        let mut cur = formula.to_string();
+        let mut sh = base_shift;
+        for &(at, n) in steps.iter().rev() {
+            sh.at = at;
+            sh.n = n;
+            cur = crate::refs::rewrite(&cur, &sh);
+        }
+        cur
+    }
+}
+
+impl Sheet {
+    /// Return sorted disjoint closed intervals of visible rows in `[r1, r2]`
+    /// (excluding filter `hidden_rows`, manual `hidden_rows_user`, and `0`-height `rows` spans)
+    /// in `O(intervals + spans)` time.
+    pub fn visible_row_intervals(&self, r1: u32, r2: u32) -> Vec<(u32, u32)> {
+        if r1 > r2 {
+            return Vec::new();
+        }
+        let mut hidden_raw: Vec<(u32, u32)> = Vec::new();
+        for &(lo, hi) in self.hidden_rows.intervals() {
+            if hi >= r1 && lo <= r2 {
+                hidden_raw.push((lo.max(r1), hi.min(r2)));
+            }
+        }
+        for &(lo, hi) in self.hidden_rows_user.intervals() {
+            if hi >= r1 && lo <= r2 {
+                hidden_raw.push((lo.max(r1), hi.min(r2)));
+            }
+        }
+        for sp in self.rows.spans() {
+            if sp.size <= 0.0 && sp.end >= r1 && sp.start <= r2 {
+                hidden_raw.push((sp.start.max(r1), sp.end.min(r2)));
+            }
+        }
+        if hidden_raw.is_empty() {
+            return if self.rows.default_size() > 0.0 {
+                vec![(r1, r2)]
+            } else {
+                Vec::new()
+            };
+        }
+        let hidden = crate::layout::HiddenIndices::from_intervals(hidden_raw);
+        hidden.complement_in(r1, r2)
+    }
+
+    /// Delete multiple sorted/unsorted closed row intervals `[(r1, r2), ...]` in a single pass
+    /// over cells, styles, axis spans, hidden intervals, and sheet metadata (`O(affected_pages + K)`).
+    pub fn delete_row_intervals(&mut self, intervals: &[(u32, u32)]) {
+        let Some(del_map) = RowDeleteMap::from_intervals(intervals) else {
+            return;
+        };
+        if del_map.intervals.len() == 1 {
+            let (lo, hi) = del_map.intervals[0];
+            self.delete_rows(lo, hi - lo + 1);
+            return;
+        }
+        let min_at = del_map.min_at();
+        self.coordinates_shifted();
+
+        if !self.arrays.is_empty() {
+            for &(anchor, (r1, c1, r2, c2)) in &self.arrays {
+                if r2 < min_at {
+                    continue;
+                }
+                for r in r1..=r2 {
+                    for c in c1..=c2 {
+                        let key = CellRef::new(r, c);
+                        if key != anchor && self.get(r, c).is_none_or(|cell| cell.formula.is_none()) {
+                            self.spilled.insert(key);
+                        }
+                    }
+                }
+            }
+        }
+        if !self.spilled.is_empty() && self.spilled.iter().any(|k| k.row >= min_at) {
+            self.spilled = self
+                .spilled
+                .iter()
+                .filter_map(|key| Some(CellRef::new(del_map.map(key.row)?, key.col)))
+                .collect();
+        }
+        if !self.hyperlinks.is_empty()
+            && self
+                .hyperlinks
+                .iter()
+                .any(|(&(r, _), link)| r.saturating_add(link.span.0) >= min_at)
+        {
+            self.hyperlinks = std::mem::take(&mut self.hyperlinks)
+                .into_iter()
+                .filter_map(|((r, c), mut link)| {
+                    let end = r.saturating_add(link.span.0);
+                    let moved = del_map.map_range(r, end);
+                    self.hyperlinks_dirty |= moved != Some((r, end));
+                    let (first, last) = moved?;
+                    link.span.0 = last - first;
+                    Some(((first, c), link))
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+                .into();
+        }
+        if !self.arrays.is_empty() {
+            self.arrays = self
+                .arrays
+                .iter()
+                .filter_map(|&(anchor, (r1, c1, r2, c2))| {
+                    let row = del_map.map(anchor.row)?;
+                    let (nr1, nr2) = del_map.map_range(r1, r2)?;
+                    Some((CellRef::new(row, anchor.col), (nr1, c1, nr2, c2)))
+                })
+                .collect();
+        }
+
+        // Single-pass cell & style page compaction across all K intervals!
+        self.remap_cell_axis(true, min_at, |r| del_map.map(r));
+
+        self.merges = self
+            .merges
+            .iter()
+            .filter_map(|&(r1, c1, r2, c2)| {
+                let a = del_map.map(r1)?;
+                let b = del_map.map(r2)?;
+                Some((a, c1, b.max(a), c2))
+            })
+            .collect();
+
+        if !self.notes.is_empty() && self.notes.keys().any(|k| k.row >= min_at) {
+            let old = std::mem::take(&mut self.notes);
+            let mut out = std::collections::HashMap::with_capacity(old.len());
+            self.notes_dirty = true;
+            for (k, mut v) in old {
+                if let Some(nr) = del_map.map(k.row) {
+                    let key = CellRef::new(nr, k.col);
+                    v.r = nr;
+                    v.c = k.col;
+                    out.insert(key, v);
+                }
+            }
+            self.notes = out.into();
+        }
+
+        if !self.cf.blocks.is_empty() {
+            self.cf_dirty = true;
+            for block in &mut self.cf.blocks {
+                block.ranges.retain_mut(|(r1, _, r2, _)| {
+                    if *r1 == 0 && *r2 == 1_048_575 {
+                        return true;
+                    }
+                    match (del_map.map(*r1), del_map.map(*r2)) {
+                        (Some(a), Some(b)) => {
+                            *r1 = a;
+                            *r2 = b.max(a);
+                            true
+                        }
+                        (Some(pos), None) | (None, Some(pos)) => {
+                            *r1 = pos;
+                            *r2 = pos;
+                            true
+                        }
+                        (None, None) => false,
+                    }
+                });
+            }
+            self.cf.blocks.retain(|b| !b.ranges.is_empty());
+        }
+
+        if !self.dv.is_empty() {
+            self.dv_dirty = true;
+            for rule in &mut self.dv {
+                rule.ranges.retain_mut(|(r1, _, r2, _)| {
+                    if *r1 == 0 && *r2 == 1_048_575 {
+                        return true;
+                    }
+                    match (del_map.map(*r1), del_map.map(*r2)) {
+                        (Some(a), Some(b)) => {
+                            *r1 = a;
+                            *r2 = b.max(a);
+                            true
+                        }
+                        (Some(pos), None) | (None, Some(pos)) => {
+                            *r1 = pos;
+                            *r2 = pos;
+                            true
+                        }
+                        (None, None) => false,
+                    }
+                });
+            }
+            self.dv.retain(|r| !r.ranges.is_empty());
+        }
+
+        if !self.sparklines.is_empty() {
+            let old = std::mem::take(&mut self.sparklines);
+            let mut out = Vec::with_capacity(old.len());
+            for mut sp in old {
+                let Some(na) = del_map.map(sp.r) else {
+                    continue;
+                };
+                sp.r = na;
+                if sp.source_sheet.is_none() {
+                    let (r1, c1, r2, c2) = sp.rect;
+                    match (del_map.map(r1), del_map.map(r2)) {
+                        (None, None) => continue,
+                        (Some(a), Some(b)) => sp.rect = (a, c1, b.max(a), c2),
+                        (Some(pos), None) | (None, Some(pos)) => sp.rect = (pos, c1, pos, c2),
+                    }
+                }
+                out.push(sp);
+            }
+            self.sparklines = out;
+            self.sparklines_dirty = true;
+        }
+
+        if let Some((fr, fc)) = self.freeze {
+            self.freeze = Some((del_map.map_freeze_or_clamp(fr), fc));
+        }
+
+        self.layout_dirty |= self.rows.shift_delete_intervals(&del_map.intervals);
+        for &(lo, hi) in del_map.intervals.iter().rev() {
+            let sh = (Structural::DeleteRows {
+                at: lo,
+                n: hi - lo + 1,
+            })
+            .reference_shift();
+            crate::scenarios::shift_references(self, &MappedShift { shift: &sh, insertions: &[] });
+        }
+        self.layout_dirty |= self.hidden_rows.shift_delete_intervals(&del_map.intervals);
+        self.layout_dirty |= self.hidden_rows_user.shift_delete_intervals(&del_map.intervals);
+
+        if !self.row_levels.is_empty() && self.row_levels.keys().any(|&r| r >= min_at) {
+            self.row_levels = std::mem::take(&mut self.row_levels)
+                .into_iter()
+                .filter_map(|(r, lv)| Some((del_map.map(r)?, lv)))
+                .collect();
+            self.layout_dirty = true;
+        }
+        if !self.row_styles.is_empty() && self.row_styles.keys().any(|&r| r >= min_at) {
+            let old = std::mem::take(&mut self.row_styles);
+            let mut out = std::collections::HashMap::with_capacity(old.len());
+            for (idx, st) in old {
+                if let Some(nidx) = del_map.map(idx) {
+                    out.insert(nidx, st);
+                }
+            }
+            self.row_styles = out.into();
+            self.row_styles_dirty = true;
+            self.styles_dirty = true;
+        }
+        self.merges_dirty = true;
+        self.freeze_dirty = true;
+    }
+}
+
+/// Workbook-level single-pass deletion of multiple closed row intervals `[(r1, r2), ...]`
+/// (for example deleting all visible rows in a filtered sheet without touching hidden rows).
+pub fn delete_row_intervals_wb(
+    wb: &mut crate::model::Workbook,
+    sheet_idx: usize,
+    intervals: &[(u32, u32)],
+) {
+    let Some(del_map) = RowDeleteMap::from_intervals(intervals) else {
+        return;
+    };
+    if del_map.intervals.len() == 1 {
+        let (lo, hi) = del_map.intervals[0];
+        apply_structural_wb(
+            wb,
+            sheet_idx,
+            &Structural::DeleteRows {
+                at: lo,
+                n: hi - lo + 1,
+            },
+        );
+        return;
+    }
+    let Some(target_name) = wb.sheets.get(sheet_idx).map(|s| s.name.clone()) else {
+        return;
+    };
+    wb.sheets[sheet_idx].delete_row_intervals(&del_map.intervals);
+
+    for sheet in &mut wb.sheets {
+        let own_name = sheet.name.clone();
+        let foreign = (!own_name.eq_ignore_ascii_case(&target_name)).then_some(target_name.as_str());
+        let changed = sheet.cells_mut().rewrite_formulas_parallel(foreign, |old| {
+            let new = del_map.rewrite_formula(old, &own_name, &target_name);
+            (new != old).then(|| new.into())
+        });
+        sheet.edited |= changed;
+
+        for blk in sheet.cf.blocks.iter_mut() {
+            for rule in blk.rules.iter_mut() {
+                let mut rewrite_threshold = |formula: &mut String| {
+                    let rewritten = del_map.rewrite_formula(formula, &own_name, &target_name);
+                    if *formula != rewritten {
+                        *formula = rewritten;
+                        sheet.cf_dirty = true;
+                    }
+                };
+                match &mut rule.kind {
+                    crate::cf::CfKind::Expr { formula, .. } => rewrite_threshold(formula),
+                    crate::cf::CfKind::CellIs { a, b, .. } => {
+                        rewrite_threshold(a);
+                        rewrite_threshold(b);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for dv in sheet.dv.iter_mut() {
+            let f1 = del_map.rewrite_formula(&dv.f1, &own_name, &target_name);
+            let f2 = del_map.rewrite_formula(&dv.f2, &own_name, &target_name);
+            sheet.dv_dirty |= dv.f1 != f1 || dv.f2 != f2;
+            (dv.f1, dv.f2) = (f1, f2);
+        }
+        if !sheet.charts.is_empty() {
+            for &(lo, hi) in del_map.intervals.iter().rev() {
+                let sh = crate::refs::Shift {
+                    axis: crate::refs::Axis::Row,
+                    at: lo,
+                    n: hi - lo + 1,
+                    delete: true,
+                    target_sheet: target_name.clone(),
+                    own_sheet: own_name.clone(),
+                    ..Default::default()
+                };
+                let ms = MappedShift {
+                    shift: &sh,
+                    insertions: &[],
+                };
+                for ch in sheet.charts.iter_mut() {
+                    if ch.rewrite_mapped_refs(&ms) {
+                        sheet.charts_dirty = true;
+                    }
+                }
+            }
+        }
+        for sp in sheet.sparklines.iter_mut() {
+            if sp.source_sheet.as_deref() != Some(target_name.as_str()) {
+                continue;
+            }
+            let (r1, c1, r2, c2) = sp.rect;
+            match (del_map.map(r1), del_map.map(r2)) {
+                (Some(a), Some(b)) => sp.rect = (a, c1, b.max(a), c2),
+                (Some(pos), None) | (None, Some(pos)) => sp.rect = (pos, c1, pos, c2),
+                (None, None) => {
+                    let fallback = del_map.map_freeze_or_clamp(r1);
+                    sp.rect = (fallback, c1, fallback, c2);
+                }
+            }
+            sheet.sparklines_dirty = true;
+        }
+    }
+
+    for &(lo, hi) in del_map.intervals.iter().rev() {
+        wb.pivot_shifts
+            .push((target_name.clone(), 0, lo, hi - lo + 1, true));
+    }
+
+    for (_, local, text) in wb.names.iter_mut() {
+        let own = match local {
+            Some(i) => wb.sheets.get(*i).map(|s| s.name.clone()).unwrap_or_default(),
+            None => String::new(),
+        };
+        let nt = del_map.rewrite_formula(text, &own, &target_name);
+        if nt != *text {
+            *text = nt;
+            wb.names_dirty = true;
+        }
+    }
+
+    wb.pivots_pending.retain_mut(|(idx, spec, _, rect, _)| {
+        if *idx != sheet_idx {
+            return true;
+        }
+        let map_rect = |(r1, c1, r2, c2): (u32, u32, u32, u32)| {
+            if r1 > r2 || c1 > c2 {
+                return None;
+            }
+            del_map.map_range(r1, r2).map(|(a, b)| (a, c1, b, c2))
+        };
+        let Some(source) = map_rect(spec.source) else {
+            return false;
+        };
+        let Some(output) = map_rect(*rect) else {
+            return false;
+        };
+        spec.source = source;
+        *rect = output;
+        true
+    });
+}
+
+
+#[cfg(test)]
+mod wave5_structural_tests {
+    use super::*;
+    use crate::cf::{CfBlock, CfKind, CfOp, CfRule};
+    use crate::dv::{DataValidation, DvKind};
+    use crate::model::{Cell, CellRef, Sheet, Value, Workbook};
+
+    #[test]
+    fn hidden_950k_rows_structural_insert_preserves_single_span_fast() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "S1".into();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+        wb.sheets[0].rows.hide_ranges(&[(10, 950_010)]);
+        assert_eq!(wb.sheets[0].rows.spans().len(), 1);
+
+        let t0 = std::time::Instant::now();
+        apply_structural_wb(&mut wb, 0, &Structural::InsertRows { at: 500, n: 5 });
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(elapsed_ms < 25.0, "expected O(spans) < 25 ms, got {elapsed_ms:.2} ms");
+        assert!(
+            wb.sheets[0].rows.spans().len() <= 2,
+            "950k zero-height span must shift as intervals without expanding, got {}",
+            wb.sheets[0].rows.spans().len()
+        );
+        assert_eq!(wb.sheets[0].rows.size(502), crate::layout::DEFAULT_ROW_H);
+        assert_eq!(wb.sheets[0].rows.size(950_015), 0.0);
+    }
+
+    #[test]
+    fn delete_row_intervals_wb_matches_reverse_sequential_delete_rows_and_visible_intervals() {
+        let mut base = Workbook::new_blank();
+        base.sheets[0].name = "明细".into();
+        {
+            let s = &mut base.sheets[0];
+            s.hidden_rows = vec![(3, 5), (12, 14)].into();
+            s.hidden_rows_user = vec![(5, 6), (20, 20)].into();
+            assert_eq!(
+                s.visible_row_intervals(2, 22),
+                vec![(2, 2), (7, 11), (15, 19), (21, 22)]
+            );
+            for r in 0..32u32 {
+                s.set(r, 0, Cell { value: Value::Text(format!("R{r}").into()), formula: None });
+                s.set(r, 1, Cell { value: Value::Number((r + 1) as f64), formula: None });
+                s.set(
+                    r,
+                    2,
+                    Cell {
+                        value: Value::Number(0.0),
+                        formula: Some(format!("=B{}+SUM($B$2:$B$28)+B16", r + 1).into()),
+                    },
+                );
+                if r % 3 == 0 {
+                    s.set_style(r, 1, 4);
+                    s.rows.set(r, 26.0);
+                }
+            }
+            s.merge_range(7, 0, 10, 0);
+            s.cf.blocks.push(CfBlock {
+                ranges: vec![(1, 1, 28, 1), (14, 1, 16, 1)],
+                rules: vec![CfRule {
+                    kind: CfKind::CellIs {
+                        op: CfOp::Greater,
+                        a: "10".into(),
+                        b: String::new(),
+                        dxf: 0,
+                    },
+                    stop: false,
+                    priority: 1,
+                }],
+            });
+            s.dv.push(DataValidation {
+                ranges: vec![(2, 1, 26, 1)],
+                kind: DvKind::List,
+                f1: "\"A,B\"".into(),
+                ..Default::default()
+            });
+            s.notes.insert(
+                CellRef::new(18, 0),
+                crate::notes::Note {
+                    r: 18,
+                    c: 0,
+                    text: "note-18".into(),
+                    author: "U".into(),
+                },
+            );
+        }
+        let mut summary = Sheet::new("汇总");
+        summary.set(
+            0,
+            0,
+            Cell {
+                value: Value::Number(0.0),
+                formula: Some("=SUM(明细!B2:B30)+明细!B16+明细!B25".into()),
+            },
+        );
+        base.sheets.push(summary);
+
+        let intervals = [(2u32, 4u32), (9, 10), (14, 16), (22, 25)];
+        let mut via_batch = base.clone();
+        delete_row_intervals_wb(&mut via_batch, 0, &intervals);
+
+        let mut via_seq = base.clone();
+        for &(lo, hi) in intervals.iter().rev() {
+            apply_structural_wb(
+                &mut via_seq,
+                0,
+                &Structural::DeleteRows {
+                    at: lo,
+                    n: hi - lo + 1,
+                },
+            );
+        }
+
+        let s_batch = &via_batch.sheets[0];
+        let s_seq = &via_seq.sheets[0];
+        assert_eq!(s_batch.len(), s_seq.len());
+        for r in 0..32u32 {
+            for c in 0..3u32 {
+                assert_eq!(s_batch.get(r, c), s_seq.get(r, c), "cell mismatch at ({r},{c})");
+                assert_eq!(s_batch.style_of(r, c), s_seq.style_of(r, c), "style mismatch at ({r},{c})");
+            }
+            assert_eq!(s_batch.rows.size(r), s_seq.rows.size(r), "row height mismatch at {r}");
+        }
+        assert_eq!(s_batch.merges, s_seq.merges);
+        assert_eq!(s_batch.cf.blocks[0].ranges, s_seq.cf.blocks[0].ranges);
+        assert_eq!(s_batch.dv[0].ranges, s_seq.dv[0].ranges);
+        assert_eq!(s_batch.hidden_rows.intervals(), s_seq.hidden_rows.intervals());
+        assert_eq!(s_batch.hidden_rows_user.intervals(), s_seq.hidden_rows_user.intervals());
+        assert_eq!(s_batch.notes, s_seq.notes);
+        assert_eq!(via_batch.sheets[1].get(0, 0), via_seq.sheets[1].get(0, 0));
+    }
 }

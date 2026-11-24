@@ -98,17 +98,69 @@ impl StringPool {
     }
 }
 
-/// 数字显示：整数不带小数点，小数最多 10 位并去掉尾零
-pub fn format_number(n: f64) -> String {
+/// 零堆分配栈缓冲数字格式化回调：整数走纯整数除法，普通小数走 64B 栈缓冲并去除尾零。
+#[inline]
+pub fn with_formatted_number<R>(n: f64, f: impl FnOnce(&str) -> R) -> R {
+    use std::fmt::Write;
     if n.is_nan() || n.is_infinite() {
-        return "#NUM!".to_string();
+        return f("#NUM!");
     }
     if n.fract() == 0.0 && n.abs() < 1e15 {
-        format!("{}", n as i64)
-    } else {
-        let s = format!("{:.10}", n);
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
+        let mut buf = [0u8; 24];
+        return f(crate::style::format_i64_into(n as i64, &mut buf));
     }
+    let mut stack = crate::style::StackFmt::<64>::new();
+    if write!(stack, "{:.10}", n).is_ok() {
+        stack.trim_decimal_zeros_from(0);
+        let s = stack.as_str();
+        if s == "-0" {
+            return f("0");
+        }
+        return f(s);
+    }
+    let s = format!("{:.10}", n);
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    f(if trimmed == "-0" { "0" } else { trimmed })
+}
+
+/// 数字显示：整数不带小数点，小数最多 10 位并去掉尾零
+#[inline]
+pub fn format_number(n: f64) -> String {
+    with_formatted_number(n, str::to_owned)
+}
+
+/// 线程局部短字符串直接映射驻留池（2048 槽，仅驻留 `<= 128 B` 文本），
+/// 让运行期 `parse_input`、查找替换、分列等高频路径自动共享同一 `Arc<str>` 分配。
+#[inline]
+pub fn intern_short_str(s: &str) -> std::sync::Arc<str> {
+    if s.is_empty() {
+        return StringPool::empty_arc();
+    }
+    if s.len() > 128 {
+        return s.into();
+    }
+    const SLOTS: usize = 2048;
+    thread_local! {
+        static CACHE: std::cell::RefCell<Box<[Option<std::sync::Arc<str>>]>> =
+            std::cell::RefCell::new(vec![None; SLOTS].into_boxed_slice());
+    }
+    let mut h = 0xcbf29ce484222325u64 ^ (s.len() as u64);
+    for &b in s.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let idx = ((h ^ (h >> 32)) as usize) & (SLOTS - 1);
+    CACHE.with(|cell| {
+        let mut slots = cell.borrow_mut();
+        if let Some(existing) = &slots[idx]
+            && existing.as_ref() == s
+        {
+            return existing.clone();
+        }
+        let arc: std::sync::Arc<str> = s.into();
+        slots[idx] = Some(arc.clone());
+        arc
+    })
 }
 
 impl Value {
@@ -130,7 +182,19 @@ impl Value {
         }
     }
 
-    /// 用户输入解析：能当数字就当数字，TRUE/FALSE 当布尔，其余当文本
+    /// 零堆分配访问显示字符串（`Text`/`Bool`/`Error`/`Empty` 直接借用，`Number` 走栈缓冲）
+    #[inline]
+    pub fn with_display_str<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        match self {
+            Value::Empty => f(""),
+            Value::Number(n) => with_formatted_number(*n, f),
+            Value::Text(s) => f(s.as_ref()),
+            Value::Bool(b) => f(if *b { "TRUE" } else { "FALSE" }),
+            Value::Error(e) => f(e.text()),
+        }
+    }
+
+    /// 用户输入解析：能当数字就当数字，TRUE/FALSE 当布尔，其余当文本（短文本自动驻留去重）
     pub fn parse_input(s: &str) -> Value {
         let t = s.trim();
         if t.is_empty() {
@@ -139,11 +203,15 @@ impl Value {
         if let Ok(n) = t.parse::<f64>() {
             return Value::Number(n);
         }
-        match t.to_ascii_uppercase().as_str() {
-            "TRUE" => Value::Bool(true),
-            "FALSE" => Value::Bool(false),
-            _ => Value::Text(s.into()),
+        if t.len() <= 5 {
+            if t.eq_ignore_ascii_case("TRUE") {
+                return Value::Bool(true);
+            }
+            if t.eq_ignore_ascii_case("FALSE") {
+                return Value::Bool(false);
+            }
         }
+        Value::Text(intern_short_str(s))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -483,6 +551,11 @@ impl CellJournal {
     pub fn is_empty(&self) -> bool { self.len == 0 }
 
     #[inline]
+    pub(crate) fn page_masks(&self) -> &HashMap<(u32, u32), [u64; 4]> {
+        &self.pages
+    }
+
+    #[inline]
     pub fn contains(&self, key: &CellRef) -> bool {
         let Some(bits) = self.pages.get(&(key.row / crate::store::PAGE_ROWS, key.col)) else {
             return false;
@@ -601,6 +674,25 @@ impl CellJournal {
                 pages.remove(&(p, col));
             }
         }
+    }
+
+    /// Word-level retention across `(page, col)` bitmasks without per-cell decoding.
+    pub(crate) fn retain_page_masks(&mut self, mut f: impl FnMut(u32, u32, &mut [u64; 4])) {
+        if self.len == 0 {
+            return;
+        }
+        let pages = std::sync::Arc::make_mut(&mut self.pages);
+        let mut new_len = 0usize;
+        pages.retain(|&(pi, col), bits| {
+            f(pi, col, bits);
+            let cnt = (bits[0].count_ones()
+                + bits[1].count_ones()
+                + bits[2].count_ones()
+                + bits[3].count_ones()) as usize;
+            new_len += cnt;
+            cnt > 0
+        });
+        self.len = new_len;
     }
 
     pub fn payload_bytes(&self) -> usize {
@@ -964,6 +1056,7 @@ impl Sheet {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn get_f64_plain(&self, r: u32, c: u32) -> Option<f64> {
         self.cells.get_f64_plain(r, c)
     }
@@ -980,6 +1073,26 @@ impl Sheet {
 
     pub fn get_mut(&mut self, r: u32, c: u32) -> Option<&mut Cell> {
         self.cells.get_mut(r, c)
+    }
+
+    /// Update the formula of an existing cell without promoting sparse slabs via `get_mut`.
+    pub(crate) fn set_formula_in_place(&mut self, r: u32, c: u32, formula: std::sync::Arc<str>) -> bool {
+        let changed = self.cells.set_formula_in_place(r, c, formula);
+        if changed && !self.loading {
+            self.edited = true;
+        }
+        changed
+    }
+
+    /// Strip formulas (keeping cached values and auto-demoting `Mixed` -> `Numbers`/`Values` slabs)
+    /// across rectangle `[r1..=r2, c1..=c2]`. Returns count of cells whose formula was cleared.
+    #[allow(dead_code)]
+    pub(crate) fn strip_formulas_in_rect(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) -> usize {
+        let cleared = self.cells.strip_formulas_in_rect(r1, c1, r2, c2, &mut self.cleared);
+        if cleared > 0 && !self.loading {
+            self.edited = true;
+        }
+        cleared
     }
 
     pub(crate) fn foreign_formula_cells<'a>(&'a self, sheet_name: &'a str) -> impl Iterator<Item = (CellRef, &'a Cell)> {
@@ -1078,11 +1191,10 @@ impl Sheet {
         self.cells.remap_axis(rows, at, map, &mut self.cleared);
         let old_styles = self.styles.clone();
         self.styles.remap_axis(rows, at, map);
-        self.style_edits.extend(old_styles.changed_keys(&self.styles));
-        self.style_edits.extend(self.styles.changed_keys(&old_styles));
+        old_styles.diff_into_journal(&self.styles, &mut self.style_edits);
         // Removing an old cell on disk also removes its format. Reapply any
         // explicitly styled blank which now occupies that same position.
-        self.style_edits.extend(self.cleared.iter().filter(|k| self.styles.get(k).is_some()));
+        self.styles.intersect_journal_into(&self.cleared, &mut self.style_edits);
         if !self.style_edits.is_empty() {
             self.styles_dirty = true;
             self.display_style_revision = next_sheet_identity();
@@ -1097,9 +1209,8 @@ impl Sheet {
         self.cells.permute_band(rows, lo, hi, map, &mut self.cleared);
         let old_styles = self.styles.clone();
         self.styles.permute_band(rows, lo, hi, map);
-        self.style_edits.extend(old_styles.changed_keys(&self.styles));
-        self.style_edits.extend(self.styles.changed_keys(&old_styles));
-        self.style_edits.extend(self.cleared.iter().filter(|k| self.styles.get(k).is_some()));
+        old_styles.diff_into_journal(&self.styles, &mut self.style_edits);
+        self.styles.intersect_journal_into(&self.cleared, &mut self.style_edits);
         if !self.style_edits.is_empty() {
             self.styles_dirty = true;
             self.display_style_revision = next_sheet_identity();

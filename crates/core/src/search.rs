@@ -141,32 +141,12 @@ impl<'a> PreparedSearch<'a> {
                             return self.matches_str(if *b { "TRUE" } else { "FALSE" });
                         }
                         crate::model::Value::Error(e) => return self.matches_str(e.text()),
-                        crate::model::Value::Number(n)
-                            if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 =>
-                        {
-                            let mut buf = [0u8; 24];
-                            let mut pos = buf.len();
-                            let iv = *n as i64;
-                            let neg = iv < 0;
-                            let mut u = iv.unsigned_abs();
-                            if u == 0 {
-                                pos -= 1;
-                                buf[pos] = b'0';
-                            } else {
-                                while u > 0 {
-                                    pos -= 1;
-                                    buf[pos] = b'0' + (u % 10) as u8;
-                                    u /= 10;
-                                }
-                            }
-                            if neg {
-                                pos -= 1;
-                                buf[pos] = b'-';
-                            }
-                            let s = unsafe { std::str::from_utf8_unchecked(&buf[pos..]) };
-                            return self.matches_str(s);
+                        crate::model::Value::Number(n) => {
+                            return crate::model::with_formatted_number(*n, |s| {
+                                self.matches_str(s)
+                            });
                         }
-                        _ => {}
+                        crate::model::Value::Empty => return false,
                     }
                 }
                 let fmt = &wb.styles.get(id).format;
@@ -175,6 +155,124 @@ impl<'a> PreparedSearch<'a> {
             }
         }
     }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn scan_slab_in_range(
+    wb: &Workbook,
+    si: usize,
+    sh: &crate::model::Sheet,
+    prep: &PreparedSearch<'_>,
+    has_any_styles: bool,
+    style0_general: bool,
+    base: u32,
+    col: u32,
+    slab: &crate::store::ColSlab,
+    r_lo: u32,
+    r_hi: u32,
+    prior_rects: &[(u32, u32, u32, u32)],
+    visited: &mut usize,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+    out: &mut Vec<Hit>,
+) -> bool {
+    if prep.opts.in_formula {
+        match slab {
+            crate::store::ColSlab::Mixed(cs) if cs.has_formulas() => {}
+            _ => return true,
+        }
+    }
+    let start = r_lo as usize;
+    let end = (r_hi as usize + 1).min(slab.len());
+    if start >= end {
+        return true;
+    }
+
+    // Fast path for unstyled DictText columns: evaluate `matches_str` at most once per unique
+    // dictionary entry (<= 128) instead of 256 per-row lookups!
+    if !prep.opts.in_formula
+        && !has_any_styles
+        && style0_general
+        && let crate::store::ColSlab::Values(vs) = slab
+        && let Some((codes, dict)) = vs.dict_text()
+    {
+        let mut dict_hit = [false; 129];
+        let mut any_hit = false;
+        for (idx, item) in dict.iter().enumerate().skip(1) {
+            if let crate::model::Value::Text(s) = item
+                && prep.matches_str(s)
+            {
+                dict_hit[idx] = true;
+                any_hit = true;
+            }
+        }
+        *visited += end - start;
+        if *visited >= 512 {
+            *visited &= 511;
+            if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return false;
+            }
+        }
+        if !any_hit {
+            return true;
+        }
+        for (off, &code) in codes[start..end].iter().enumerate() {
+            if dict_hit[code as usize] {
+                let row = base + (start + off) as u32;
+                if !prior_rects
+                    .iter()
+                    .any(|&(pr1, pc1, pr2, pc2)| pr1 <= row && row <= pr2 && pc1 <= col && col <= pc2)
+                {
+                    out.push(Hit { sheet: si, row, col });
+                }
+            }
+        }
+        return true;
+    }
+
+    let hi = end - 1;
+    let start_w = start / 64;
+    let end_w = hi / 64;
+    let mask = slab.row_mask();
+    for w in start_w..=end_w {
+        let mut bits = mask[w];
+        if w == start_w {
+            bits &= !0u64 << (start % 64);
+        }
+        if w == end_w && (hi % 64) < 63 {
+            bits &= (1u64 << ((hi % 64) + 1)) - 1;
+        }
+        while bits != 0 {
+            let tz = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let r_off = (w * 64 + tz) as u32;
+            let row = base + r_off;
+            if !prior_rects
+                .iter()
+                .any(|&(pr1, pc1, pr2, pc2)| pr1 <= row && row <= pr2 && pc1 <= col && col <= pc2)
+                && let Some(cell) = slab.get_view(r_off)
+            {
+                *visited += 1;
+                if (*visited & 511) == 0
+                    && cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    return false;
+                }
+                if prep.matches_cell_on_sheet(
+                    wb,
+                    sh,
+                    has_any_styles,
+                    style0_general,
+                    row,
+                    col,
+                    cell,
+                ) {
+                    out.push(Hit { sheet: si, row, col });
+                }
+            }
+        }
+    }
+    true
 }
 
 fn search_sheet_pages_parallel(
@@ -207,31 +305,24 @@ fn search_sheet_pages_parallel(
             }
             let base = pi * crate::store::PAGE_ROWS;
             for (col, slab) in page.cols.iter_entries() {
-                if prep.opts.in_formula && !slab.is_mixed() {
-                    continue;
-                }
-                for r_off in 0..slab.len() {
-                    let Some(cell) = slab.get_view(r_off as u32) else {
-                        continue;
-                    };
-                    visited += 1;
-                    if visited % 512 == 0
-                        && cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-                    {
-                        return None;
-                    }
-                    let row = base + r_off as u32;
-                    if prep.matches_cell_on_sheet(
-                        wb,
-                        sh,
-                        has_any_styles,
-                        style0_general,
-                        row,
-                        col,
-                        cell,
-                    ) {
-                        out.push(Hit { sheet: si, row, col });
-                    }
+                if !scan_slab_in_range(
+                    wb,
+                    si,
+                    sh,
+                    prep,
+                    has_any_styles,
+                    style0_general,
+                    base,
+                    col,
+                    slab,
+                    0,
+                    crate::store::PAGE_ROWS - 1,
+                    &[],
+                    &mut visited,
+                    cancelled,
+                    &mut out,
+                ) {
+                    return None;
                 }
             }
         }
@@ -261,35 +352,152 @@ fn search_sheet_pages_parallel(
                         }
                         let base = pi * crate::store::PAGE_ROWS;
                         for (col, slab) in page.cols.iter_entries() {
-                            if prep.opts.in_formula && !slab.is_mixed() {
-                                continue;
+                            if !scan_slab_in_range(
+                                wb,
+                                si,
+                                sh,
+                                prep,
+                                has_any_styles,
+                                style0_general,
+                                base,
+                                col,
+                                slab,
+                                0,
+                                crate::store::PAGE_ROWS - 1,
+                                &[],
+                                &mut visited,
+                                cancelled,
+                                &mut local,
+                            ) {
+                                aborted_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return Vec::new();
                             }
-                            for r_off in 0..slab.len() {
-                                let Some(cell) = slab.get_view(r_off as u32) else {
-                                    continue;
-                                };
-                                visited += 1;
-                                if visited % 512 == 0
-                                    && cancelled.is_some_and(|c| {
-                                        c.load(std::sync::atomic::Ordering::Relaxed)
-                                    })
-                                {
-                                    aborted_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    return Vec::new();
-                                }
-                                let row = base + r_off as u32;
-                                if prep.matches_cell_on_sheet(
-                                    wb,
-                                    sh,
-                                    has_any_styles,
-                                    style0_general,
-                                    row,
-                                    col,
-                                    cell,
-                                ) {
-                                    local.push(Hit { sheet: si, row, col });
-                                }
-                            }
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+    });
+    if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let total: usize = partial.iter().map(Vec::len).sum();
+    let mut merged = Vec::with_capacity(total);
+    for v in partial {
+        merged.extend(v);
+    }
+    Some(merged)
+}
+
+fn search_rects_pages_parallel(
+    wb: &Workbook,
+    si: usize,
+    sh: &crate::model::Sheet,
+    rects: &[(u32, u32, u32, u32)],
+    prep: &PreparedSearch<'_>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<Vec<Hit>> {
+    if rects.is_empty() {
+        return Some(Vec::new());
+    }
+    let norm_rects: Vec<(u32, u32, u32, u32)> = rects
+        .iter()
+        .map(|&(r1, c1, r2, c2)| (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)))
+        .collect();
+    let min_p = norm_rects.iter().map(|r| r.0 / crate::store::PAGE_ROWS).min().unwrap_or(0);
+    let max_p = norm_rects.iter().map(|r| r.2 / crate::store::PAGE_ROWS).max().unwrap_or(0);
+    let pages: Vec<(u32, &std::sync::Arc<crate::store::Page>)> =
+        sh.cells().iter_pages_in(min_p, max_p).collect();
+    if pages.is_empty() {
+        return Some(Vec::new());
+    }
+    let has_any_styles =
+        !sh.styles.is_empty() || !sh.row_styles.is_empty() || !sh.col_styles.is_empty();
+    let style0_general = is_general_format(&wb.styles.get(0).format);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8);
+
+    let scan_page = |pi: u32,
+                     page: &crate::store::Page,
+                     visited: &mut usize,
+                     out: &mut Vec<Hit>|
+     -> bool {
+        if prep.opts.in_formula && !page.may_have_formula {
+            return true;
+        }
+        let base = pi * crate::store::PAGE_ROWS;
+        let page_hi = base + crate::store::PAGE_ROWS - 1;
+        for (i, &(r1, c1, r2, c2)) in norm_rects.iter().enumerate() {
+            if r2 < base || r1 > page_hi {
+                continue;
+            }
+            let r_lo = r1.saturating_sub(base);
+            let r_hi = (r2 - base).min(crate::store::PAGE_ROWS - 1);
+            let prior = &norm_rects[..i];
+            for (col, slab) in page.cols.iter_entries_in(c1, c2) {
+                if !scan_slab_in_range(
+                    wb,
+                    si,
+                    sh,
+                    prep,
+                    has_any_styles,
+                    style0_general,
+                    base,
+                    col,
+                    slab,
+                    r_lo,
+                    r_hi,
+                    prior,
+                    visited,
+                    cancelled,
+                    out,
+                ) {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+
+    if pages.len() < 8 || threads <= 1 {
+        let mut out = Vec::new();
+        let mut visited = 0usize;
+        for (pi, page) in pages {
+            if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return None;
+            }
+            if !scan_page(pi, page, &mut visited, &mut out) {
+                return None;
+            }
+        }
+        return Some(out);
+    }
+
+    let chunk_size = pages.len().div_ceil(threads);
+    let aborted = std::sync::atomic::AtomicBool::new(false);
+    let partial: Vec<Vec<Hit>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = pages
+            .chunks(chunk_size)
+            .map(|chunk| {
+                let aborted_ref = &aborted;
+                scope.spawn(move || {
+                    let mut local = Vec::new();
+                    let mut visited = 0usize;
+                    for &(pi, page) in chunk {
+                        if aborted_ref.load(std::sync::atomic::Ordering::Relaxed)
+                            || cancelled
+                                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                        {
+                            aborted_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Vec::new();
+                        }
+                        if !scan_page(pi, page, &mut visited, &mut local) {
+                            aborted_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Vec::new();
                         }
                     }
                     local
@@ -323,31 +531,15 @@ pub fn scoped_hits(
     let mut hits = Vec::new();
     for (si, sh) in wb.sheets.iter().enumerate() {
         if sheet.is_some_and(|only| only != si) { continue; }
-        if rects.is_empty() {
-            let Some(sheet_hits) = search_sheet_pages_parallel(wb, si, sh, &prep, Some(cancelled)) else {
-                return Vec::new();
-            };
-            hits.extend(sheet_hits);
+        let sheet_hits = if rects.is_empty() {
+            search_sheet_pages_parallel(wb, si, sh, &prep, Some(cancelled))
         } else {
-            let has_any_styles =
-                !sh.styles.is_empty() || !sh.row_styles.is_empty() || !sh.col_styles.is_empty();
-            let style0_general = is_general_format(&wb.styles.get(0).format);
-            let mut visited = 0usize;
-            for (i, &rect) in rects.iter().enumerate() {
-                for (k, v) in sh.cells().stored_cells_in(rect) {
-                    if rects[..i].iter().any(|&(r1, c1, r2, c2)| r1 <= k.row && k.row <= r2 && c1 <= k.col && k.col <= c2) {
-                        continue;
-                    }
-                    visited += 1;
-                    if visited % 256 == 0 && cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Vec::new();
-                    }
-                    if prep.matches_cell_on_sheet(wb, sh, has_any_styles, style0_general, k.row, k.col, v) {
-                        hits.push(Hit { sheet: si, row: k.row, col: k.col });
-                    }
-                }
-            }
-        }
+            search_rects_pages_parallel(wb, si, sh, rects, &prep, Some(cancelled))
+        };
+        let Some(sheet_hits) = sheet_hits else {
+            return Vec::new();
+        };
+        hits.extend(sheet_hits);
     }
     hits.sort_unstable_by_key(|h| ordered_key(h, order));
     hits
@@ -475,23 +667,7 @@ pub fn hits_in_rect(
         return Vec::new();
     };
     let prep = PreparedSearch::new(needle, opts);
-    let has_any_styles =
-        !sh.styles.is_empty() || !sh.row_styles.is_empty() || !sh.col_styles.is_empty();
-    let style0_general = is_general_format(&wb.styles.get(0).format);
-    let (r1, c1, r2, c2) = rect;
-    let norm_rect = (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2));
-    let mut out: Vec<Hit> = sh
-        .cells()
-        .stored_cells_in(norm_rect)
-        .filter_map(|(k, cell)| {
-            prep.matches_cell_on_sheet(wb, sh, has_any_styles, style0_general, k.row, k.col, cell)
-                .then_some(Hit {
-                    sheet,
-                    row: k.row,
-                    col: k.col,
-                })
-        })
-        .collect();
+    let mut out = search_rects_pages_parallel(wb, sheet, sh, &[rect], &prep, None).unwrap_or_default();
     match order {
         SearchOrder::RowMajor => out.sort_unstable(),
         SearchOrder::ColumnMajor => out.sort_unstable_by_key(|h| (h.sheet, h.col, h.row)),
@@ -552,14 +728,47 @@ fn lower_with_map(s: &str) -> (String, Vec<usize>) {
     let mut map: Vec<usize> = Vec::with_capacity(s.len() + 1);
     for (idx, ch) in s.char_indices() {
         map.resize(lower.len(), idx);
-        let folded: String = ch.to_lowercase().collect();
-        for _ in 0..folded.len() {
-            map.push(idx);
+        let prev_len = lower.len();
+        for lc in ch.to_lowercase() {
+            lower.push(lc);
         }
-        lower.push_str(&folded);
+        let added = lower.len() - prev_len;
+        map.resize(map.len() + added, idx);
     }
     map.resize(lower.len() + 1, s.len());
     (lower, map)
+}
+
+#[inline]
+fn replace_ascii_ci(text: &str, needle: &str, with: &str) -> String {
+    let tb = text.as_bytes();
+    let nb = needle.as_bytes();
+    if tb.len() < nb.len() {
+        return text.to_string();
+    }
+    let b0 = nb[0].to_ascii_lowercase();
+    let limit = tb.len() - nb.len();
+    let mut out = String::new();
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i <= limit {
+        if tb[i].to_ascii_lowercase() == b0 && tb[i..i + nb.len()].eq_ignore_ascii_case(nb) {
+            if out.is_empty() {
+                out.reserve(text.len() + with.len());
+            }
+            out.push_str(&text[copied..i]);
+            out.push_str(with);
+            i += nb.len();
+            copied = i;
+        } else {
+            i += 1;
+        }
+    }
+    if copied == 0 {
+        return text.to_string();
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// 大小写不敏感替换：按原串边界切，不按小写串索引切。
@@ -568,6 +777,14 @@ pub fn replace_in_text(text: &str, needle: &str, with: &str, match_case: bool) -
         return text.to_string();
     }
     if match_case {
+        return text.replace(needle, with);
+    }
+    if text.is_ascii() && needle.is_ascii() {
+        return replace_ascii_ci(text, needle, with);
+    }
+    if needle.chars().all(|ch| {
+        ('\u{4E00}'..='\u{9FFF}').contains(&ch) || (ch.is_ascii() && !ch.is_ascii_alphabetic())
+    }) {
         return text.replace(needle, with);
     }
     let (hay, map) = lower_with_map(text);
@@ -597,4 +814,66 @@ pub fn replace_in_text(text: &str, needle: &str, with: &str, match_case: bool) -
     }
     out.push_str(&text[copied..]);
     out
+}
+
+#[cfg(test)]
+mod wave5_search_tests {
+    use super::*;
+    use crate::model::{Cell, Value, Workbook};
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn parallel_rect_search_handles_dict_text_overlapping_rects_and_zero_alloc_replace() {
+        let mut wb = Workbook::new_blank();
+        let cats: [Arc<str>; 4] = ["华东中心".into(), "华南中心".into(), "华北分部".into(), "西南分部".into()];
+        // 5,000 rows (~20 pages >= 8 parallel rect threshold)
+        for r in 0..5_000u32 {
+            wb.sheets[0].set(
+                r,
+                0,
+                Cell {
+                    value: Value::Text(cats[(r as usize) % 4].clone()),
+                    formula: None,
+                },
+            );
+            wb.sheets[0].set(
+                r,
+                1,
+                Cell {
+                    value: Value::Number((r as f64) + 0.25),
+                    formula: None,
+                },
+            );
+        }
+        let cancelled = AtomicBool::new(false);
+        let opts = SearchOpts::default();
+        // Overlapping selection rects: [100..=3000] and [2000..=4500] must deduplicate [2000..=3000]
+        let hits = scoped_hits(
+            &wb,
+            Some(0),
+            &[(100, 0, 3_000, 0), (2_000, 0, 4_500, 0)],
+            "华东",
+            &opts,
+            SearchOrder::RowMajor,
+            &cancelled,
+        );
+        let expected_count = (100u32..=4_500).filter(|r| r % 4 == 0).count();
+        assert_eq!(hits.len(), expected_count);
+        assert_eq!(hits.first().unwrap().row, 100);
+        assert_eq!(hits.last().unwrap().row, 4_500);
+
+        // Decimal number search via stack-formatted `with_formatted_number`
+        let num_hits = hits_in_rect(&wb, 0, (0, 1, 4_999, 1), "4321.25", &opts, SearchOrder::RowMajor);
+        assert_eq!(num_hits, vec![Hit { sheet: 0, row: 4321, col: 1 }]);
+
+        // Case-insensitive ASCII & CJK replace_in_text
+        assert_eq!(
+            replace_in_text("abCDefAbc_ABC", "abc", "XYZ", false),
+            "XYZDefXYZ_XYZ"
+        );
+        assert_eq!(
+            replace_in_text("华东A区-华东a区", "华东a", "华南B", false),
+            "华南B区-华南B区"
+        );
+    }
 }

@@ -184,29 +184,33 @@ struct Acc {
 }
 
 impl Acc {
+    #[inline]
+    fn push_num(&mut self, n: f64) {
+        self.count_nonempty += 1;
+        self.numeric += 1;
+        self.sum += n;
+        self.min = Some(self.min.map_or(n, |m| m.min(n)));
+        self.max = Some(self.max.map_or(n, |m| m.max(n)));
+    }
+
     fn push(&mut self, v: Option<&Value>) {
         let Some(v) = v else { return };
         match v {
             Value::Empty => {}
-            Value::Number(n) => {
-                self.count_nonempty += 1;
-                self.numeric += 1;
-                self.sum += *n;
-                self.min = Some(self.min.map_or(*n, |m| m.min(*n)));
-                self.max = Some(self.max.map_or(*n, |m| m.max(*n)));
-            }
+            Value::Number(n) => self.push_num(*n),
             other => {
-                let t = other.display();
-                if t.is_empty() {
-                    return;
-                }
-                self.count_nonempty += 1;
-                if let Ok(n) = t.parse::<f64>() {
-                    self.numeric += 1;
-                    self.sum += n;
-                    self.min = Some(self.min.map_or(n, |m| m.min(n)));
-                    self.max = Some(self.max.map_or(n, |m| m.max(n)));
-                }
+                other.with_display_str(|t| {
+                    if t.is_empty() {
+                        return;
+                    }
+                    self.count_nonempty += 1;
+                    if let Ok(n) = t.parse::<f64>() {
+                        self.numeric += 1;
+                        self.sum += n;
+                        self.min = Some(self.min.map_or(n, |m| m.min(n)));
+                        self.max = Some(self.max.map_or(n, |m| m.max(n)));
+                    }
+                });
             }
         }
     }
@@ -300,6 +304,518 @@ fn emit_row(
     grid.rows.push(row);
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum PathIds {
+    Inline { len: u8, ids: [u32; 4] },
+    Heap(Box<[u32]>),
+}
+
+impl PathIds {
+    #[inline]
+    fn from_slice(s: &[u32]) -> Self {
+        if s.len() <= 4 {
+            let mut ids = [0u32; 4];
+            ids[..s.len()].copy_from_slice(s);
+            Self::Inline {
+                len: s.len() as u8,
+                ids,
+            }
+        } else {
+            Self::Heap(s.into())
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Inline { len, ids } => &ids[..*len as usize],
+            Self::Heap(b) => b,
+        }
+    }
+
+    #[inline]
+    fn remap(&self, map: &[u32]) -> Self {
+        match self {
+            Self::Inline { len, ids } => {
+                let n = *len as usize;
+                let mut out = [0u32; 4];
+                for i in 0..n {
+                    out[i] = map[ids[i] as usize];
+                }
+                Self::Inline { len: *len, ids: out }
+            }
+            Self::Heap(b) => Self::Heap(b.iter().map(|&id| map[id as usize]).collect()),
+        }
+    }
+}
+
+struct PivotInterner {
+    strings: Vec<String>,
+    map: crate::sort_filter::FxHashMap<String, u32>,
+}
+
+impl PivotInterner {
+    fn new() -> Self {
+        let mut map: crate::sort_filter::FxHashMap<String, u32> = Default::default();
+        map.insert(String::new(), 0);
+        Self {
+            strings: vec![String::new()],
+            map,
+        }
+    }
+
+    #[inline]
+    fn intern_owned(&mut self, s: String) -> u32 {
+        if s.is_empty() {
+            return 0;
+        }
+        if let Some(&id) = self.map.get(&s) {
+            return id;
+        }
+        let id = self.strings.len() as u32;
+        self.strings.push(s.clone());
+        self.map.insert(s, id);
+        id
+    }
+
+    #[inline]
+    fn intern_str(&mut self, s: &str) -> u32 {
+        if s.is_empty() {
+            return 0;
+        }
+        if let Some(&id) = self.map.get(s) {
+            return id;
+        }
+        let owned = s.to_string();
+        let id = self.strings.len() as u32;
+        self.strings.push(owned.clone());
+        self.map.insert(owned, id);
+        id
+    }
+}
+
+struct FieldEncoder<'a> {
+    col: u32,
+    group: &'a GroupBy,
+    empty_id: u32,
+    ptr_cache: crate::sort_filter::FxHashMap<usize, u32>,
+    num_cache: crate::sort_filter::FxHashMap<u64, u32>,
+}
+
+impl<'a> FieldEncoder<'a> {
+    fn new(col: u32, group: &'a GroupBy, interner: &mut PivotInterner) -> Self {
+        let empty_id = interner.intern_owned(group_key(&Value::Empty, group));
+        Self {
+            col,
+            group,
+            empty_id,
+            ptr_cache: Default::default(),
+            num_cache: Default::default(),
+        }
+    }
+
+    #[inline]
+    fn encode_val(&mut self, v: &Value, interner: &mut PivotInterner) -> u32 {
+        match v {
+            Value::Empty => self.empty_id,
+            Value::Text(s) => {
+                let ptr = s.as_ptr() as usize;
+                if let Some(&id) = self.ptr_cache.get(&ptr) {
+                    return id;
+                }
+                let id = if matches!(self.group, GroupBy::None) {
+                    interner.intern_str(s)
+                } else {
+                    interner.intern_owned(group_key(v, self.group))
+                };
+                self.ptr_cache.insert(ptr, id);
+                id
+            }
+            Value::Number(n) => {
+                let nb = if *n == 0.0 { 0u64 } else { n.to_bits() };
+                if let Some(&id) = self.num_cache.get(&nb) {
+                    return id;
+                }
+                let id = interner.intern_owned(group_key(v, self.group));
+                self.num_cache.insert(nb, id);
+                id
+            }
+            other => interner.intern_owned(group_key(other, self.group)),
+        }
+    }
+
+    #[inline]
+    fn encode_from_slab(
+        &mut self,
+        slab: Option<&crate::store::ColSlab>,
+        dict_table: Option<&[u32; 129]>,
+        ro: usize,
+        interner: &mut PivotInterner,
+    ) -> u32 {
+        let Some(slab) = slab else {
+            return self.empty_id;
+        };
+        if let Some(tbl) = dict_table
+            && let crate::store::ColSlab::Values(vs) = slab
+            && let Some((codes, _)) = vs.dict_text()
+        {
+            return if ro < codes.len() {
+                tbl[codes[ro] as usize]
+            } else {
+                self.empty_id
+            };
+        }
+        match slab {
+            crate::store::ColSlab::Numbers(ns) => match ns.get(ro as u32) {
+                None => self.empty_id,
+                Some(n) => {
+                    let nb = if n == 0.0 { 0u64 } else { n.to_bits() };
+                    if let Some(&id) = self.num_cache.get(&nb) {
+                        id
+                    } else {
+                        let id = interner.intern_owned(group_key(&Value::Number(n), self.group));
+                        self.num_cache.insert(nb, id);
+                        id
+                    }
+                }
+            },
+            crate::store::ColSlab::Values(vs) => match vs.get_val(ro) {
+                None => self.empty_id,
+                Some(v) => self.encode_val(v, interner),
+            },
+            crate::store::ColSlab::Mixed(cs) => match cs.get_cell(ro) {
+                None => self.empty_id,
+                Some(cell) => self.encode_val(&cell.value, interner),
+            },
+        }
+    }
+}
+
+struct PivotChunkResult {
+    strings: Vec<String>,
+    row_mins: crate::sort_filter::FxHashMap<PathIds, u32>,
+    col_mins: crate::sort_filter::FxHashMap<PathIds, u32>,
+    cells: crate::sort_filter::FxHashMap<(PathIds, PathIds), Vec<Acc>>,
+}
+
+fn aggregate_pivot_pages(
+    sheet: &Sheet,
+    spec: &PivotSpec2,
+    compiled_filters: &[(u32, crate::sort_filter::FxHashSet<&str>, bool)],
+    empty_passes_filters: bool,
+    first_row: u32,
+    last_row: u32,
+    p_lo: u32,
+    p_hi: u32,
+) -> PivotChunkResult {
+    let mut interner = PivotInterner::new();
+    let mut row_encs: Vec<FieldEncoder<'_>> = spec
+        .rows
+        .iter()
+        .map(|f| FieldEncoder::new(f.col, &f.group, &mut interner))
+        .collect();
+    let mut col_encs: Vec<FieldEncoder<'_>> = spec
+        .cols
+        .iter()
+        .map(|f| FieldEncoder::new(f.col, &f.group, &mut interner))
+        .collect();
+
+    let empty_row_ids: Vec<u32> = row_encs.iter().map(|e| e.empty_id).collect();
+    let empty_col_ids: Vec<u32> = col_encs.iter().map(|e| e.empty_id).collect();
+    let empty_row_path = PathIds::from_slice(&empty_row_ids);
+    let empty_col_path = PathIds::from_slice(&empty_col_ids);
+
+    let mut row_mins: crate::sort_filter::FxHashMap<PathIds, u32> = Default::default();
+    let mut col_mins: crate::sort_filter::FxHashMap<PathIds, u32> = Default::default();
+    let mut cells: crate::sort_filter::FxHashMap<(PathIds, PathIds), Vec<Acc>> = Default::default();
+    let n_vals = spec.values.len();
+    let mut min_empty_row: Option<u32> = None;
+
+    let mut row_buf = vec![0u32; row_encs.len()];
+    let mut col_buf = vec![0u32; col_encs.len()];
+    let mut row_dict_tables: Vec<Option<[u32; 129]>> = vec![None; row_encs.len()];
+    let mut col_dict_tables: Vec<Option<[u32; 129]>> = vec![None; col_encs.len()];
+    let mut filter_dict_tables: Vec<Option<[bool; 129]>> = vec![None; compiled_filters.len()];
+
+    for pi in p_lo..=p_hi {
+        let base = pi * crate::store::PAGE_ROWS;
+        let r_start = first_row.max(base);
+        let r_end = last_row.min(base + crate::store::PAGE_ROWS - 1);
+        if r_start > r_end {
+            continue;
+        }
+        let Some(page) = sheet.cells().page(pi) else {
+            if empty_passes_filters {
+                min_empty_row = Some(min_empty_row.map_or(r_start, |m| m.min(r_start)));
+            }
+            continue;
+        };
+
+        let lo = (r_start - base) as usize;
+        let hi = (r_end - base) as usize;
+        let start_w = lo / 64;
+        let end_w = hi / 64;
+        let mut range_mask = [0u64; 4];
+        for (w, slot) in range_mask.iter_mut().enumerate().take(end_w + 1).skip(start_w) {
+            let mut m = !0u64;
+            if w == start_w {
+                m &= !0u64 << (lo % 64);
+            }
+            if w == end_w && (hi % 64) < 63 {
+                m &= (1u64 << ((hi % 64) + 1)) - 1;
+            }
+            *slot = m;
+        }
+
+        let filter_slabs: Vec<Option<&crate::store::ColSlab>> = compiled_filters
+            .iter()
+            .map(|(c, _, _)| page.cols.get(*c).map(|a| a.as_ref()))
+            .collect();
+        // Fast page skip if a required non-blank filter column is completely absent on this page!
+        let mut impossible_page = false;
+        for (fi, &(_, ref allowed, empty_ok)) in compiled_filters.iter().enumerate() {
+            filter_dict_tables[fi] = None;
+            match filter_slabs[fi] {
+                None if !empty_ok => {
+                    impossible_page = true;
+                    break;
+                }
+                Some(slab) if !empty_ok && !slab.has_any_in(lo, hi + 1) => {
+                    impossible_page = true;
+                    break;
+                }
+                Some(crate::store::ColSlab::Values(vs)) => {
+                    if let Some((_, dict)) = vs.dict_text() {
+                        let mut tbl = [false; 129];
+                        tbl[0] = empty_ok;
+                        let mut any_match = empty_ok;
+                        for (code, item) in dict.iter().enumerate().skip(1) {
+                            let ok = match item {
+                                Value::Text(s) => allowed.contains(s.as_ref()),
+                                other => other.with_display_str(|s| allowed.contains(s)),
+                            };
+                            tbl[code] = ok;
+                            any_match |= ok;
+                        }
+                        if !any_match {
+                            impossible_page = true;
+                            break;
+                        }
+                        filter_dict_tables[fi] = Some(tbl);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if impossible_page {
+            continue;
+        }
+
+        let row_slabs: Vec<Option<&crate::store::ColSlab>> = row_encs
+            .iter()
+            .map(|e| page.cols.get(e.col).map(|a| a.as_ref()))
+            .collect();
+        let col_slabs: Vec<Option<&crate::store::ColSlab>> = col_encs
+            .iter()
+            .map(|e| page.cols.get(e.col).map(|a| a.as_ref()))
+            .collect();
+        let val_slabs: Vec<Option<&crate::store::ColSlab>> = spec
+            .values
+            .iter()
+            .map(|v| page.cols.get(v.col).map(|a| a.as_ref()))
+            .collect();
+
+        // Compute union occupancy mask across all referenced columns on this page.
+        let mut union_mask = [0u64; 4];
+        for slab in filter_slabs
+            .iter()
+            .chain(row_slabs.iter())
+            .chain(col_slabs.iter())
+            .chain(val_slabs.iter())
+            .flatten()
+        {
+            let m = slab.row_mask();
+            union_mask[0] |= m[0];
+            union_mask[1] |= m[1];
+            union_mask[2] |= m[2];
+            union_mask[3] |= m[3];
+        }
+
+        // Handle all completely blank rows in `lo..=hi` in O(1)!
+        if empty_passes_filters {
+            for w in start_w..=end_w {
+                let blank_bits = (!union_mask[w]) & range_mask[w];
+                if blank_bits != 0 {
+                    let first_blank_ro = w * 64 + blank_bits.trailing_zeros() as usize;
+                    let blank_r = base + first_blank_ro as u32;
+                    min_empty_row = Some(min_empty_row.map_or(blank_r, |m| m.min(blank_r)));
+                    break;
+                }
+            }
+        }
+
+        let active_mask = [
+            union_mask[0] & range_mask[0],
+            union_mask[1] & range_mask[1],
+            union_mask[2] & range_mask[2],
+            union_mask[3] & range_mask[3],
+        ];
+        if active_mask == [0; 4] {
+            continue;
+        }
+
+        // Pre-map `DictText` slabs once per 256-row page for row & col fields!
+        for (i, enc) in row_encs.iter_mut().enumerate() {
+            row_dict_tables[i] = if let Some(crate::store::ColSlab::Values(vs)) = row_slabs[i]
+                && let Some((_, dict)) = vs.dict_text()
+            {
+                let mut tbl = [enc.empty_id; 129];
+                for (code, item) in dict.iter().enumerate().skip(1) {
+                    tbl[code] = enc.encode_val(item, &mut interner);
+                }
+                Some(tbl)
+            } else {
+                None
+            };
+        }
+        for (i, enc) in col_encs.iter_mut().enumerate() {
+            col_dict_tables[i] = if let Some(crate::store::ColSlab::Values(vs)) = col_slabs[i]
+                && let Some((_, dict)) = vs.dict_text()
+            {
+                let mut tbl = [enc.empty_id; 129];
+                for (code, item) in dict.iter().enumerate().skip(1) {
+                    tbl[code] = enc.encode_val(item, &mut interner);
+                }
+                Some(tbl)
+            } else {
+                None
+            };
+        }
+
+        for (w, &word_bits) in active_mask.iter().enumerate().take(end_w + 1).skip(start_w) {
+            let mut bits = word_bits;
+            while bits != 0 {
+                let tz = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let ro = w * 64 + tz;
+                let r = base + ro as u32;
+
+                // 1. Check filters
+                let mut keep = true;
+                for (fi, &(_, ref allowed, empty_ok)) in compiled_filters.iter().enumerate() {
+                    let ok = match filter_slabs[fi] {
+                        None => empty_ok,
+                        Some(slab) => {
+                            if let Some(ref tbl) = filter_dict_tables[fi]
+                                && let crate::store::ColSlab::Values(vs) = slab
+                                && let Some((codes, _)) = vs.dict_text()
+                            {
+                                if ro < codes.len() {
+                                    tbl[codes[ro] as usize]
+                                } else {
+                                    empty_ok
+                                }
+                            } else {
+                                match slab.value_ref(ro as u32) {
+                                    None => empty_ok,
+                                    Some(v) => match v.as_ref() {
+                                        Value::Empty => empty_ok,
+                                        Value::Text(t) => allowed.contains(t.as_ref()),
+                                        other => other.with_display_str(|s| allowed.contains(s)),
+                                    },
+                                }
+                            }
+                        }
+                    };
+                    if !ok {
+                        keep = false;
+                        break;
+                    }
+                }
+                if !keep {
+                    continue;
+                }
+
+                // 2. Encode row & col path IDs without allocating Strings
+                for (i, enc) in row_encs.iter_mut().enumerate() {
+                    row_buf[i] = enc.encode_from_slab(
+                        row_slabs[i],
+                        row_dict_tables[i].as_ref(),
+                        ro,
+                        &mut interner,
+                    );
+                }
+                for (i, enc) in col_encs.iter_mut().enumerate() {
+                    col_buf[i] = enc.encode_from_slab(
+                        col_slabs[i],
+                        col_dict_tables[i].as_ref(),
+                        ro,
+                        &mut interner,
+                    );
+                }
+                let rpath = PathIds::from_slice(&row_buf);
+                let cpath = PathIds::from_slice(&col_buf);
+
+                row_mins
+                    .entry(rpath.clone())
+                    .and_modify(|m| *m = (*m).min(r))
+                    .or_insert(r);
+                col_mins
+                    .entry(cpath.clone())
+                    .and_modify(|m| *m = (*m).min(r))
+                    .or_insert(r);
+
+                let accs = cells
+                    .entry((rpath, cpath))
+                    .or_insert_with(|| vec![Acc::default(); n_vals]);
+                for (vi, slab_opt) in val_slabs.iter().enumerate() {
+                    let Some(slab) = *slab_opt else {
+                        continue;
+                    };
+                    match slab {
+                        crate::store::ColSlab::Numbers(ns) => {
+                            if let Some(n) = ns.get(ro as u32) {
+                                accs[vi].push_num(n);
+                            }
+                        }
+                        crate::store::ColSlab::Values(vs) => {
+                            if let Some(v) = vs.get_val(ro) {
+                                accs[vi].push(Some(v));
+                            }
+                        }
+                        crate::store::ColSlab::Mixed(cs) => {
+                            if let Some(cell) = cs.get_cell(ro) {
+                                accs[vi].push(Some(&cell.value));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(r) = min_empty_row {
+        row_mins
+            .entry(empty_row_path.clone())
+            .and_modify(|m| *m = (*m).min(r))
+            .or_insert(r);
+        col_mins
+            .entry(empty_col_path.clone())
+            .and_modify(|m| *m = (*m).min(r))
+            .or_insert(r);
+        cells
+            .entry((empty_row_path, empty_col_path))
+            .or_insert_with(|| vec![Acc::default(); n_vals]);
+    }
+
+    PivotChunkResult {
+        strings: interner.strings,
+        row_mins,
+        col_mins,
+        cells,
+    }
+}
+
 /// 计算多字段透视
 pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
     let (r1, _c1, r2, _c2) = spec.source;
@@ -317,58 +833,152 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec2) -> PivotGrid {
         ..Default::default()
     };
 
-    // 预编译筛选允许集：O(1) 哈希匹配替代逐行 Vec 线性扫描
-    let compiled_filters: Vec<(u32, std::collections::HashSet<&str>)> = spec
+    // 预编译筛选允许集：O(1) FxHashSet 匹配替代逐行 Vec 线性扫描
+    let compiled_filters: Vec<(u32, crate::sort_filter::FxHashSet<&str>, bool)> = spec
         .filters
         .iter()
         .filter(|f| !f.keep.is_empty())
-        .map(|f| (f.col, f.keep.iter().map(String::as_str).collect()))
+        .map(|f| {
+            let set: crate::sort_filter::FxHashSet<&str> =
+                f.keep.iter().map(String::as_str).collect();
+            let empty_ok = set.contains("");
+            (f.col, set, empty_ok)
+        })
         .collect();
+    let empty_passes_filters = compiled_filters.iter().all(|&(_, _, empty_ok)| empty_ok);
 
-    // 收集：行路径 → 列路径 → 每个值字段的累计
+    // 收集：行路径 → 列路径 → 每个值字段的累计（支持 256 行页字典编码 + 大表多线程分片归并）
     let mut data: BTreeMap<Vec<String>, CellMap> = BTreeMap::new();
-    // 首次出现序号：排序口径切到「数据源顺序」时用
     let mut row_first: std::collections::HashMap<Vec<String>, usize> = Default::default();
     let mut col_first: std::collections::HashMap<Vec<String>, usize> = Default::default();
-    for r in (r1 + 1)..=r2 {
-        let mut keep = true;
-        for (col, allowed) in &compiled_filters {
-            let v = sheet.value_ref(r, *col);
-            let matched = match v.as_ref() {
-                Value::Text(t) => allowed.contains(t.as_ref()),
-                other => allowed.contains(other.display().as_str()),
-            };
-            if !matched {
-                keep = false;
-                break;
+
+    let first_row = r1.saturating_add(1);
+    if first_row <= r2 {
+        let p_first = first_row / crate::store::PAGE_ROWS;
+        let p_last = r2 / crate::store::PAGE_ROWS;
+        let page_span = (p_last - p_first + 1) as usize;
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+
+        let chunks: Vec<PivotChunkResult> = if (r2 - first_row + 1) >= 8_192
+            && page_span >= 16
+            && n_threads > 1
+        {
+            let pages_per_worker = page_span.div_ceil(n_threads) as u32;
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                let mut cur_p = p_first;
+                while cur_p <= p_last {
+                    let end_p = (cur_p + pages_per_worker - 1).min(p_last);
+                    let filt_ref = &compiled_filters;
+                    handles.push(scope.spawn(move || {
+                        aggregate_pivot_pages(
+                            sheet,
+                            spec,
+                            filt_ref,
+                            empty_passes_filters,
+                            first_row,
+                            r2,
+                            cur_p,
+                            end_p,
+                        )
+                    }));
+                    cur_p = end_p + 1;
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        } else {
+            vec![aggregate_pivot_pages(
+                sheet,
+                spec,
+                &compiled_filters,
+                empty_passes_filters,
+                first_row,
+                r2,
+                p_first,
+                p_last,
+            )]
+        };
+
+        let mut global_interner = PivotInterner::new();
+        let mut global_row_min: crate::sort_filter::FxHashMap<PathIds, u32> = Default::default();
+        let mut global_col_min: crate::sort_filter::FxHashMap<PathIds, u32> = Default::default();
+        let mut global_cells: crate::sort_filter::FxHashMap<(PathIds, PathIds), Vec<Acc>> =
+            Default::default();
+
+        for chunk in chunks {
+            let mut id_remap = vec![0u32; chunk.strings.len()];
+            for (local_id, s) in chunk.strings.into_iter().enumerate() {
+                id_remap[local_id] = global_interner.intern_owned(s);
+            }
+            for (rp, min_r) in chunk.row_mins {
+                let grp = rp.remap(&id_remap);
+                global_row_min
+                    .entry(grp)
+                    .and_modify(|m| *m = (*m).min(min_r))
+                    .or_insert(min_r);
+            }
+            for (cp, min_r) in chunk.col_mins {
+                let gcp = cp.remap(&id_remap);
+                global_col_min
+                    .entry(gcp)
+                    .and_modify(|m| *m = (*m).min(min_r))
+                    .or_insert(min_r);
+            }
+            for ((rp, cp), accs) in chunk.cells {
+                let key = (rp.remap(&id_remap), cp.remap(&id_remap));
+                match global_cells.get_mut(&key) {
+                    Some(dst) => {
+                        for (d, s) in dst.iter_mut().zip(accs.iter()) {
+                            d.merge(s);
+                        }
+                    }
+                    None => {
+                        global_cells.insert(key, accs);
+                    }
+                }
             }
         }
-        if !keep {
-            continue;
+
+        let decode_path = |p: &PathIds, pool: &[String]| -> Vec<String> {
+            p.as_slice().iter().map(|&id| pool[id as usize].clone()).collect()
+        };
+
+        // Reconstruct exact source appearance order (`min_r` ascending)
+        let mut row_sorted: Vec<(u32, PathIds)> =
+            global_row_min.into_iter().map(|(p, r)| (r, p)).collect();
+        row_sorted.sort_unstable_by_key(|&(r, _)| r);
+        let mut row_vec_cache: crate::sort_filter::FxHashMap<PathIds, Vec<String>> =
+            Default::default();
+        for (ord, (_, rp)) in row_sorted.into_iter().enumerate() {
+            let vec_p = decode_path(&rp, &global_interner.strings);
+            row_first.insert(vec_p.clone(), ord);
+            row_vec_cache.insert(rp, vec_p);
         }
-        let row_path: Vec<String> = spec
-            .rows
-            .iter()
-            .map(|f| group_key(sheet.value_ref(r, f.col).as_ref(), &f.group))
-            .collect();
-        let col_path: Vec<String> = spec
-            .cols
-            .iter()
-            .map(|f| group_key(sheet.value_ref(r, f.col).as_ref(), &f.group))
-            .collect();
-        if !row_first.contains_key(&row_path) {
-            row_first.insert(row_path.clone(), row_first.len());
+
+        let mut col_sorted: Vec<(u32, PathIds)> =
+            global_col_min.into_iter().map(|(p, r)| (r, p)).collect();
+        col_sorted.sort_unstable_by_key(|&(r, _)| r);
+        let mut col_vec_cache: crate::sort_filter::FxHashMap<PathIds, Vec<String>> =
+            Default::default();
+        for (ord, (_, cp)) in col_sorted.into_iter().enumerate() {
+            let vec_p = decode_path(&cp, &global_interner.strings);
+            col_first.insert(vec_p.clone(), ord);
+            col_vec_cache.insert(cp, vec_p);
         }
-        if !col_first.contains_key(&col_path) {
-            col_first.insert(col_path.clone(), col_first.len());
-        }
-        let entry = data.entry(row_path).or_default().entry(col_path).or_default();
-        if entry.len() < spec.values.len() {
-            entry.resize(spec.values.len(), Acc::default());
-        }
-        for (i, vf) in spec.values.iter().enumerate() {
-            let v = sheet.value_ref(r, vf.col);
-            entry[i].push((!matches!(v.as_ref(), Value::Empty)).then_some(v.as_ref()));
+
+        for ((rp, cp), accs) in global_cells {
+            let r_vec = row_vec_cache
+                .get(&rp)
+                .cloned()
+                .unwrap_or_else(|| decode_path(&rp, &global_interner.strings));
+            let c_vec = col_vec_cache
+                .get(&cp)
+                .cloned()
+                .unwrap_or_else(|| decode_path(&cp, &global_interner.strings));
+            data.entry(r_vec).or_default().insert(c_vec, accs);
         }
     }
 
@@ -839,7 +1449,7 @@ pub fn append_calc_item_expr(
     // 否则「华东*2」只会算出第一条明细（Excel 里计算项是对整组求和）。
     let find = |item: &str| -> Option<usize> {
         let sub_label = format!("{item} 汇总");
-        let is_live = |r: usize, row: &Vec<Value>| Some(r) != grid.grand_total_row;
+        let is_live = |r: usize, _row: &Vec<Value>| Some(r) != grid.grand_total_row;
         if let Some(r) = grid.rows.iter().enumerate().position(|(r, row)| {
             is_live(r, row) && row.first().is_some_and(|v| v.display() == sub_label)
         }) {
@@ -946,4 +1556,63 @@ pub fn append_calc_item_row(grid: &mut PivotGrid, name: &str, sources: &[&str]) 
         *g += 1;
     }
     Some(at)
+}
+
+
+#[cfg(test)]
+mod wave5_pivot_multi_tests {
+    use super::*;
+    use crate::model::{Cell, Sheet, Value};
+
+    #[test]
+    fn parallel_dict_encoded_pivot_multi_matches_sequential_totals_and_source_order() {
+        let mut sh = Sheet::new("BigPivot");
+        for (c, h) in ["区域", "品类", "渠道", "销量"].iter().enumerate() {
+            sh.set(0, c as u32, Cell { value: Value::Text((*h).into()), formula: None });
+        }
+        let regions = ["华南", "华东", "华北", "西南"];
+        let cats = ["A类", "B类", "C类"];
+        let channels = ["线上", "线下"];
+        // 10,000 rows (>= 8,192 parallel threshold, ~40 pages >= 16)
+        for r in 1..=10_000u32 {
+            sh.set(r, 0, Cell { value: Value::Text(regions[(r as usize) % 4].into()), formula: None });
+            sh.set(r, 1, Cell { value: Value::Text(cats[(r as usize) % 3].into()), formula: None });
+            sh.set(r, 2, Cell { value: Value::Text(channels[(r as usize) % 2].into()), formula: None });
+            sh.set(r, 3, Cell { value: Value::Number(10.0), formula: None });
+        }
+        let mut spec = PivotSpec2 {
+            source: (0, 0, 10_000, 3),
+            rows: vec![AxisField::plain(0)],
+            cols: vec![AxisField::plain(1)],
+            values: vec![ValueField {
+                col: 3,
+                agg: Agg::Sum,
+                label: None,
+                show_as: ShowAs::Normal,
+                base: None,
+            }],
+            filters: vec![FilterField {
+                col: 2,
+                keep: vec!["线下".into()], // odd rows only -> 5,000 rows * 10.0 = 50,000.0
+            }],
+            layout: PivotLayout {
+                tabular: true,
+                subtotals: false,
+                grand_totals: true,
+                sort: AxisSort::Source,
+            },
+        };
+        let grid = compute(&sh, &spec);
+        // First odd row is r=1 -> region = regions[1] = "华东", r=3 -> regions[3] = "西南" (even indices 0/2 filtered out!)
+        assert_eq!(grid.rows[0][0], Value::Text("华东".into()));
+        assert_eq!(grid.rows[1][0], Value::Text("西南".into()));
+        let gt = grid.grand_total_row.unwrap();
+        let last_col = grid.rows[gt].len() - 1;
+        assert_eq!(grid.rows[gt][last_col], Value::Number(50_000.0));
+
+        // Pinyin sort order check
+        spec.layout.sort = AxisSort::Pinyin;
+        let grid_py = compute(&sh, &spec);
+        assert_eq!(grid_py.rows[0][0], Value::Text("华东".into()));
+    }
 }

@@ -409,25 +409,25 @@ pub fn attach(path: &Path, sheet_name: &str, tables: &[Table]) -> anyhow::Result
 /// 结构化引用里的单引号是列名转义符，不是字符串/表名引号；
 /// 只有 `'Sheet 1'!` 这类真正的工作表限定符才应跳过。
 fn split_quoted_structured(text: &str) -> Vec<(bool, &str)> {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let bytes = text.as_bytes();
     let mut out: Vec<(bool, &str)> = Vec::new();
     let mut start = 0usize;
-    let mut k = 0usize;
-    while k < chars.len() {
-        let (i, c) = chars[k];
-        if c == '"' {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
             if i > start {
                 out.push((false, &text[start..i]));
             }
-            let mut end = i + c.len_utf8();
-            let mut j = k + 1;
-            while j < chars.len() {
-                let (p, q) = chars[j];
-                if q == '"' {
-                    if chars.get(j + 1).map(|(_, n)| *n == '"').unwrap_or(false) {
-                        j += 1;
+            let mut j = i + 1;
+            let mut end = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b'"' {
+                    if j + 1 < bytes.len() && bytes[j + 1] == b'"' {
+                        j += 2;
+                        continue;
                     } else {
-                        end = p + q.len_utf8();
+                        end = j + 1;
                         break;
                     }
                 }
@@ -435,36 +435,36 @@ fn split_quoted_structured(text: &str) -> Vec<(bool, &str)> {
             }
             out.push((true, &text[i..end]));
             start = end;
-            k = j + 1;
+            i = j + 1;
             continue;
         }
-        if c == '\'' {
+        if b == b'\'' {
             // 先看这是否是 `'Sheet'!` / `'Start 1:End 3'!`。
-            let mut end = i + c.len_utf8();
-            let mut j = k + 1;
-            while j < chars.len() {
-                let (p, q) = chars[j];
-                if q == '\'' {
-                    if chars.get(j + 1).map(|(_, n)| *n == '\'').unwrap_or(false) {
-                        j += 1;
+            let mut j = i + 1;
+            let mut end = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b'\'' {
+                    if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                        j += 2;
+                        continue;
                     } else {
-                        end = p + q.len_utf8();
+                        end = j + 1;
                         break;
                     }
                 }
                 j += 1;
             }
-            if j + 1 < chars.len() && chars[j + 1].1 == '!' {
+            if j + 1 < bytes.len() && bytes[j + 1] == b'!' {
                 if i > start {
                     out.push((false, &text[start..i]));
                 }
                 out.push((true, &text[i..end]));
                 start = end;
-                k = j + 1;
+                i = j + 1;
                 continue;
             }
         }
-        k += 1;
+        i += 1;
     }
     if start < text.len() {
         out.push((false, &text[start..]));
@@ -483,19 +483,19 @@ fn same_col_name(a: &str, b: &str) -> bool {
 
 /// 结构化引用列名的转义：`[ ] # ' @` 在公式里用单引号转义。
 fn unescape_ident(s: &str) -> String {
+    if !s.contains('\'') {
+        return s.to_string();
+    }
     let mut out = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i] == '\'' {
-            if let Some(next) = chars.get(i + 1) {
-                out.push(*next);
-                i += 2;
+    let mut it = s.chars();
+    while let Some(ch) = it.next() {
+        if ch == '\'' {
+            if let Some(next) = it.next() {
+                out.push(next);
                 continue;
             }
         }
-        out.push(chars[i]);
-        i += 1;
+        out.push(ch);
     }
     out
 }
@@ -580,31 +580,29 @@ fn rename_specs(inner: &str, old: &str, new: &str) -> String {
     out
 }
 
-/// 返回方括号组的内部文本和整个组的字节长度。
-fn bracket_group(s: &str) -> Option<(String, usize)> {
-    if !s.starts_with('[') {
+/// 返回方括号组的内部切片和整个组的字节长度。
+fn bracket_group(s: &str) -> Option<(&str, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'[') {
         return None;
     }
-    let chars: Vec<char> = s.chars().collect();
     let mut depth = 0usize;
     let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i] == '\'' {
-            // 结构化引用的单引号是转义符，后面的括号不参与深度计数。
-            i += 2;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            // 结构化引用的单引号是转义符，后面的下一个字符不参与深度计数。
+            i += 1;
+            if i < bytes.len() {
+                i += s[i..].chars().next().map_or(1, char::len_utf8);
+            }
             continue;
         }
-        match chars[i] {
-            '[' => depth += 1,
-            ']' => {
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    let inner: String = chars[1..i].iter().collect();
-                    return Some((inner, s[..]
-                        .char_indices()
-                        .nth(i + 1)
-                        .map(|(pos, _)| pos)
-                        .unwrap_or(s.len())));
+                    return Some((&s[1..i], i + 1));
                 }
             }
             _ => {}
@@ -723,29 +721,43 @@ pub fn rename_table_column(
         (idx, t.name.clone())
     };
     for sh in &mut wb.sheets {
-        let mut edits: Vec<(u32, u32, std::sync::Arc<str>)> = Vec::new();
-        for (cref, cell) in sh.iter() {
-            let Some(f) = cell.formula.as_deref() else { continue };
-            let inside = sh.tables.iter().any(|t| {
-                t.name.eq_ignore_ascii_case(&actual_name)
-                    && cref.row >= t.range.0
-                    && cref.row <= t.range.2
-                    && cref.col >= t.range.1
-                    && cref.col <= t.range.3
+        if sh.formula_cells().next().is_none() {
+            continue;
+        }
+        let table_ranges: Vec<(u32, u32, u32, u32)> = sh
+            .tables
+            .iter()
+            .filter(|t| t.name.eq_ignore_ascii_case(&actual_name))
+            .map(|t| t.range)
+            .collect();
+        if table_ranges.is_empty() {
+            sh.cells_mut().rewrite_formulas_parallel(None, |f: &str| {
+                if !f.contains('[') {
+                    return None;
+                }
+                let nf = rewrite_table_column_refs(f, &actual_name, old, new, false);
+                (nf != f).then(|| nf.into())
             });
-            let nf = rewrite_table_column_refs(f, &actual_name, old, new, inside);
-            if nf != f {
-                edits.push((cref.row, cref.col, nf.into()));
+        } else {
+            let edits: Vec<(u32, u32, std::sync::Arc<str>)> = sh
+                .formula_cells()
+                .filter_map(|(cref, cell)| {
+                    let f = cell.formula.as_deref()?;
+                    if !f.contains('[') {
+                        return None;
+                    }
+                    let inside = table_ranges.iter().any(|&(r1, c1, r2, c2)| {
+                        cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2
+                    });
+                    let nf = rewrite_table_column_refs(f, &actual_name, old, new, inside);
+                    (nf != f).then(|| (cref.row, cref.col, nf.into()))
+                })
+                .collect();
+            for (r, c, f) in edits {
+                sh.set_formula_in_place(r, c, f);
             }
         }
-        for (r, c, f) in edits {
-            if let Some(cell) = sh.get_mut(r, c) {
-                cell.formula = Some(f);
-            }
-        }
-        if sh.iter().any(|(_, cell)| cell.formula.is_some()) {
-            sh.edited = true;
-        }
+        sh.edited = true;
     }
     let (header_row, header_col) = {
         let t = &wb.sheets[si].tables[ti];
@@ -898,18 +910,22 @@ pub fn convert_table_to_range(wb: &mut crate::model::Workbook, table_name: &str)
         .unwrap_or_default();
     let mut edits: Vec<(usize, u32, u32, std::sync::Arc<str>)> = Vec::new();
     for (sidx, sh) in wb.sheets.iter().enumerate() {
-        for (cref, cell) in sh.iter() {
+        let table_ranges: Vec<(u32, u32, u32, u32)> = if sidx == si {
+            sh.tables
+                .iter()
+                .filter(|t| t.name.eq_ignore_ascii_case(&table_name))
+                .map(|t| t.range)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (cref, cell) in sh.formula_cells() {
             let Some(f) = cell.formula.as_deref() else { continue; };
             if !f.contains('[') { continue; }
             let body = f.strip_prefix('=').unwrap_or(f);
-            let inside = sidx == si
-                && sh.tables.iter().any(|t| {
-                    t.name.eq_ignore_ascii_case(&table_name)
-                        && cref.row >= t.range.0
-                        && cref.row <= t.range.2
-                        && cref.col >= t.range.1
-                        && cref.col <= t.range.3
-                });
+            let inside = table_ranges.iter().any(|&(r1, c1, r2, c2)| {
+                cref.row >= r1 && cref.row <= r2 && cref.col >= c1 && cref.col <= c2
+            });
             if let Some(e) =
                 convert_target_table_refs(wb, sidx, cref.row, cref.col, body, &table_name, inside)
             {
@@ -921,10 +937,7 @@ pub fn convert_table_to_range(wb: &mut crate::model::Workbook, table_name: &str)
         }
     }
     for (sidx, r, c, f) in edits {
-        if let Some(cell) = wb.sheets[sidx].get_mut(r, c) {
-            cell.formula = Some(f);
-        }
-        wb.sheets[sidx].edited = true;
+        wb.sheets[sidx].set_formula_in_place(r, c, f);
     }
     let sh = &mut wb.sheets[si];
     let before = sh.tables.len();
@@ -967,32 +980,63 @@ pub fn fill_calculated_column(
     if data_start > data_end {
         return 0;
     }
-    let Some((src_row, src_formula)) = (data_start..=data_end).find_map(|r| {
-        let f = sheet.formula_of(r, col)?;
-        Some((r, f.to_string()))
-    }) else {
-        return 0;
-    };
-    let mut filled = 0;
-    for r in data_start..=data_end {
-        if r == src_row || sheet.get(r, col).is_some_and(|c| c.formula.is_some()) {
+    // Find first formula row in `[data_start..=data_end]` scanning only formula-bearing pages/slabs!
+    let p1 = data_start / crate::store::PAGE_ROWS;
+    let p2 = data_end / crate::store::PAGE_ROWS;
+    let mut found_src: Option<(u32, std::sync::Arc<str>)> = None;
+    for (pi, page) in sheet.cells().iter_pages_in(p1, p2) {
+        if !page.may_have_formula {
             continue;
         }
-        let delta = r as i64 - src_row as i64;
-        let shift = crate::refs::Shift {
-            axis: crate::refs::Axis::Row,
-            translate: Some((delta, 0)),
-            target_sheet: sheet.name.clone(),
-            own_sheet: sheet.name.clone(),
-            ..Default::default()
+        let Some(slab) = page.cols.get(col) else {
+            continue;
         };
-        let f = crate::refs::rewrite(&src_formula, &shift);
+        if !slab.is_mixed() {
+            continue;
+        }
+        let base = pi * crate::store::PAGE_ROWS;
+        let lo = data_start.saturating_sub(base);
+        let hi = (data_end - base).min(crate::store::PAGE_ROWS - 1);
+        for ro in lo..=hi {
+            if let Some(f_arc) = slab.formula_arc_of(ro) {
+                found_src = Some((base + ro, f_arc.clone()));
+                break;
+            }
+        }
+        if found_src.is_some() {
+            break;
+        }
+    }
+    let Some((src_row, src_formula_arc)) = found_src else {
+        return 0;
+    };
+    let src_formula = src_formula_arc.as_ref().to_string();
+    let mut shift = crate::refs::Shift {
+        axis: crate::refs::Axis::Row,
+        translate: Some((1, 0)),
+        target_sheet: sheet.name.clone(),
+        own_sheet: sheet.name.clone(),
+        ..Default::default()
+    };
+    // Fast check: pure structured-ref formulas like `=[@单价]*[@数量]` are invariant under row translation!
+    let row_invariant = crate::refs::rewrite(&src_formula, &shift) == src_formula;
+    let mut filled = 0;
+    for r in data_start..=data_end {
+        if r == src_row || sheet.formula_of(r, col).is_some() {
+            continue;
+        }
+        let formula_arc = if row_invariant {
+            src_formula_arc.clone()
+        } else {
+            shift.translate = Some((r as i64 - src_row as i64, 0));
+            crate::refs::rewrite(&src_formula, &shift).into()
+        };
         sheet.set(
             r,
             col,
             crate::model::Cell {
                 value: crate::model::Value::Empty,
-                formula: Some(f.into()),
+                formula: Some(formula_arc),
             },
         );
         filled += 1;
@@ -1047,99 +1091,64 @@ fn expand_segment_at(
     if !body.contains('[') {
         return None;
     }
-    let chars: Vec<char> = body.chars().collect();
+    let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len() + 16);
     let mut changed = false;
     let mut i = 0usize;
-    while i < chars.len() {
-        let ch = chars[i];
+    while i < bytes.len() {
+        let b = bytes[i];
         // 表内当前行简写：`[@金额]` / `[[#This Row],[金额]]`（没有表名）。
         // 必须先按公式单元格定位所属表，否则同一行多张表会取错。
-        if ch == '[' {
-            let mut j = i;
-            let mut depth = 0i32;
-            while j < chars.len() {
-                if chars[j] == '\'' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '[' {
-                    depth += 1;
-                } else if chars[j] == ']' {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                j += 1;
-            }
-            if j < chars.len() {
-                let inner: String = chars[i + 1..j].iter().collect();
-                if inner.trim_start().starts_with('@')
-                    || inner.to_ascii_uppercase().contains("#THIS ROW")
-                {
+        if b == b'[' {
+            if let Some((inner, end_len)) = bracket_group(&body[i..]) {
+                let is_this_row = inner.trim_start().starts_with('@')
+                    || inner
+                        .as_bytes()
+                        .windows(9)
+                        .any(|w| w.eq_ignore_ascii_case(b"#THIS ROW"));
+                if is_this_row {
                     let (Some(row), Some(col)) = (cur_row, cur_col) else {
                         out.push_str("#VALUE!");
                         changed = true;
-                        i = j + 1;
+                        i += end_len;
                         continue;
                     };
                     if let Some((tbl, on_si)) = find_table_at(wb, si, row, col) {
-                        out.push_str(&expand_table_spec(wb, si, on_si, cur_row, &tbl, &inner));
+                        out.push_str(&expand_table_spec(wb, si, on_si, cur_row, tbl, inner));
                     } else {
                         out.push_str("#VALUE!");
                     }
                     changed = true;
-                    i = j + 1;
+                    i += end_len;
                     continue;
                 }
             }
         }
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '\\' {
+        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'\\') {
             let start = i;
-            while i < chars.len()
-                && (chars[i].is_ascii_alphanumeric()
-                    || chars[i] == '_'
-                    || chars[i] == '.'
-                    || chars[i] == '\\')
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.' | b'\\'))
             {
                 i += 1;
             }
-            let name: String = chars[start..i].iter().collect();
+            let name = &body[start..i];
             // 表名可以出现在公式体开头（`Sales[Amount]`），不能要求 start > 0。
-            if i < chars.len() && chars[i] == '[' {
-                let mut j = i;
-                let mut depth = 0i32;
-                while j < chars.len() {
-                    if chars[j] == '\'' {
-                        j += 2;
-                        continue;
-                    }
-                    if chars[j] == '[' {
-                        depth += 1;
-                    } else if chars[j] == ']' {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    j += 1;
-                }
-                if j < chars.len() {
-                    let inner: String = chars[i + 1..j].iter().collect();
-                    if let Some((tbl, on_si)) = find_table(wb, si, &name) {
-                        out.push_str(&expand_table_spec(wb, si, on_si, cur_row, &tbl, &inner));
-                        changed = true;
-                        i = j + 1;
-                        continue;
-                    }
-                }
+            if i < bytes.len()
+                && bytes[i] == b'['
+                && let Some((inner, end_len)) = bracket_group(&body[i..])
+                && let Some((tbl, on_si)) = find_table(wb, si, name)
+            {
+                out.push_str(&expand_table_spec(wb, si, on_si, cur_row, tbl, inner));
+                changed = true;
+                i += end_len;
+                continue;
             }
-            out.push_str(&name);
+            out.push_str(name);
             continue;
         }
+        let ch = body[i..].chars().next().unwrap();
         out.push(ch);
-        i += 1;
+        i += ch.len_utf8();
     }
     if changed { Some(out) } else { None }
 }
@@ -1176,23 +1185,26 @@ fn strip_outer_brackets(s: &str) -> &str {
 }
 
 /// 按顶层逗号切分说明符；列名里的逗号在 `[...]` 内，不切。
-fn split_specs(s: &str) -> Vec<String> {
-    let chars: Vec<char> = s.chars().collect();
+fn split_specs(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut depth = 0i32;
     let mut i = 0usize;
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '\'' {
-            i += 2;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            i += 1;
+            if i < bytes.len() {
+                i += s[i..].chars().next().map_or(1, char::len_utf8);
+            }
             continue;
         }
-        match ch {
-            '[' => depth += 1,
-            ']' => depth -= 1,
-            ',' if depth == 0 => {
-                let piece: String = chars[start..i].iter().collect();
+        match b {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            b',' if depth == 0 => {
+                let piece = &s[start..i];
                 if !piece.trim().is_empty() {
                     out.push(piece);
                 }
@@ -1202,8 +1214,8 @@ fn split_specs(s: &str) -> Vec<String> {
         }
         i += 1;
     }
-    if start < chars.len() {
-        let piece: String = chars[start..].iter().collect();
+    if start < bytes.len() {
+        let piece = &s[start..];
         if !piece.trim().is_empty() {
             out.push(piece);
         }
@@ -1211,22 +1223,23 @@ fn split_specs(s: &str) -> Vec<String> {
     out
 }
 
-fn split_colon(s: &str) -> Option<(String, String)> {
-    let chars: Vec<char> = s.chars().collect();
+fn split_colon(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
     let mut depth = 0i32;
     let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i] == '\'' {
-            i += 2;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i += 1;
+            if i < bytes.len() {
+                i += s[i..].chars().next().map_or(1, char::len_utf8);
+            }
             continue;
         }
-        match chars[i] {
-            '[' => depth += 1,
-            ']' => depth -= 1,
-            ':' if depth == 0 => {
-                let a: String = chars[..i].iter().collect();
-                let b: String = chars[i + 1..].iter().collect();
-                return Some((a, b));
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            b':' if depth == 0 => {
+                return Some((&s[..i], &s[i + 1..]));
             }
             _ => {}
         }
@@ -1262,9 +1275,9 @@ fn expand_table_spec(
         return "#REF!".to_string();
     }
     for raw in specs {
-        let outer = raw.trim().to_string();
+        let outer = raw.trim();
         let mut escaped = outer.starts_with('\'');
-        let mut tok = unescape_ident(&outer);
+        let mut tok = unescape_ident(outer);
         if !escaped {
             if let Some(rest) = tok.strip_prefix('@') {
                 this_row = true;
@@ -1275,8 +1288,8 @@ fn expand_table_spec(
         // 列区间 [Col1]:[Col2] 的冒号在方括号外，必须先切冒号，
         // 否则整串会被误当成一个 `[... ]` 说明符。
         if let Some((a, b)) = split_colon(&tok) {
-            let ca = unescape_ident(strip_outer_brackets(&a).trim());
-            let cb = unescape_ident(strip_outer_brackets(&b).trim());
+            let ca = unescape_ident(strip_outer_brackets(a).trim());
+            let cb = unescape_ident(strip_outer_brackets(b).trim());
             if ca.is_empty() || cb.is_empty() {
                 bad = true;
                 continue;
@@ -1407,29 +1420,39 @@ fn find_table_at(
     si: usize,
     row: u32,
     col: u32,
-) -> Option<(Table, usize)> {
+) -> Option<(&Table, usize)> {
     wb.sheets.get(si)?.tables.iter().find_map(|t| {
         if t.range.0 <= row && row <= t.range.2 && t.range.1 <= col && col <= t.range.3 {
-            Some((t.clone(), si))
+            Some((t, si))
         } else {
             None
         }
     })
 }
 
-fn find_table(
-    wb: &crate::model::Workbook,
+fn find_table<'a>(
+    wb: &'a crate::model::Workbook,
     si: usize,
     name: &str,
-) -> Option<(Table, usize)> {
-    for (idx, sheet) in wb.sheets.iter().enumerate() {
+) -> Option<(&'a Table, usize)> {
+    // Fast-check active sheet first before scanning other sheets.
+    if let Some(sheet) = wb.sheets.get(si) {
         for t in sheet.tables.iter() {
             if t.name.eq_ignore_ascii_case(name) || t.display.eq_ignore_ascii_case(name) {
-                return Some((t.clone(), idx));
+                return Some((t, si));
             }
         }
     }
-    let _ = si;
+    for (idx, sheet) in wb.sheets.iter().enumerate() {
+        if idx == si {
+            continue;
+        }
+        for t in sheet.tables.iter() {
+            if t.name.eq_ignore_ascii_case(name) || t.display.eq_ignore_ascii_case(name) {
+                return Some((t, idx));
+            }
+        }
+    }
     None
 }
 
@@ -1686,4 +1709,48 @@ fn table_display_name_that_is_not_a_cell_reference_is_kept() {
     };
     let xml = crate::table::table_xml(&t, 1);
     assert!(xml.contains("displayName=\"Sales\""), "{xml}");
+}
+
+#[test]
+fn wave5_rename_table_column_keeps_numeric_slabs_unpromoted_and_rewrites_structured_refs() {
+    let mut wb = crate::model::Workbook::new_blank();
+    wb.sheets[0].name = "订单".into();
+    wb.sheets[0].set(0, 0, crate::model::Cell { value: crate::model::Value::Text("单价".into()), formula: None });
+    wb.sheets[0].set(0, 1, crate::model::Cell { value: crate::model::Value::Text("含税".into()), formula: None });
+    for r in 1..=20u32 {
+        wb.sheets[0].set(r, 0, crate::model::Cell { value: crate::model::Value::Number((r * 10) as f64), formula: None });
+        wb.sheets[0].set(
+            r,
+            1,
+            crate::model::Cell {
+                value: crate::model::Value::Number(0.0),
+                formula: Some("=[@单价]*1.13".into()),
+            },
+        );
+    }
+    wb.sheets[0].tables.push(crate::table::Table {
+        name: "Orders".into(),
+        display: "Orders".into(),
+        range: (0, 0, 20, 1),
+        columns: vec!["单价".into(), "含税".into()],
+        column_ids: vec![1, 2],
+        header_row: true,
+        totals_row: false,
+    });
+    let mut summary = crate::model::Sheet::new("汇总");
+    summary.set(
+        0,
+        0,
+        crate::model::Cell {
+            value: crate::model::Value::Number(0.0),
+            formula: Some("=SUM(Orders[单价])".into()),
+        },
+    );
+    wb.sheets.push(summary);
+
+    assert!(rename_table_column(&mut wb, "Orders", "单价", "净价"));
+    assert_eq!(wb.sheets[0].formula_of(1, 1), Some("=[@净价]*1.13"));
+    assert_eq!(wb.sheets[1].formula_of(0, 0), Some("=SUM(Orders[净价])"));
+    // Column 0 on page 0 only changed its row-0 text header; rows 1..=20 + header remain Values (not Mixed!)
+    assert!(!wb.sheets[0].cells().page(0).unwrap().cols.get(0).unwrap().is_mixed());
 }
