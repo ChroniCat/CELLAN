@@ -631,10 +631,7 @@ impl SheetApp {
             "InsertCellsRight" => self.shift_cells(true, true),
             "DeleteRow" => {
                 let (r1, _c1, r2, _c2) = self.sel_rect();
-                self.structural(sheetcore::structural::Structural::DeleteRows {
-                    at: r1,
-                    n: r2 - r1 + 1,
-                });
+                self.delete_rows_range(r1, r2);
             }
             "DeleteColumn" => {
                 let (_r1, c1, _r2, c2) = self.sel_rect();

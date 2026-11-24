@@ -2315,8 +2315,7 @@ fn slider(
         egui::Slider::new(&mut z, min..=max).show_value(false),
     );
     if r.changed() {
-        app.zoom = z.clamp(min, max);
-        ui.ctx().set_zoom_factor(app.zoom);
+        app.set_zoom_interactive(z.clamp(min, max), ui.ctx());
     }
 }
 

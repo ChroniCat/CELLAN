@@ -716,6 +716,9 @@ impl SheetApp {
         self.clip_pic = Some((w, h, png));
         self.clip = None;
         self.clip_stamp = None;
+        self.clip_seq = None;
+        self.clip_seq_pending_sync = false;
+        self.clip_copied_at = None;
         #[cfg(not(test))]
         {
             let img = arboard::ImageData {
@@ -771,6 +774,9 @@ impl SheetApp {
         }
         self.clip_pic = None;
         self.clip_stamp = Some(tsv);
+        self.clip_seq = crate::current_os_clipboard_seq();
+        self.clip_seq_pending_sync = true;
+        self.clip_copied_at = Some(std::time::Instant::now());
         self.clip = Some(Clip { deferred: None,
             source_rows: None,
             sheet: self.sheet_idx,
@@ -1255,8 +1261,99 @@ impl SheetApp {
             return;
         }
         let area = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
-        if area > 200_000 {
-            self.status = "填充范围过大（单次最多支持 20 万个单元格）".into();
+        let max_area = if self.net.is_none() {
+            sheetcore::undo::MAX_DENSE_RECT_KEYS as u64
+        } else {
+            200_000
+        };
+        if area > max_area {
+            self.status = format!(
+                "填充范围过大（单次最多支持 {} 万个单元格）",
+                max_area / 10_000
+            );
+            return;
+        }
+        let si = self.sheet_idx;
+        if self.net.is_none() && area > sheetcore::undo::COW_BATCH_THRESHOLD as u64 {
+            if !self.check_sparse_rect_preflight(si, (r1, c1, r2 - 1, c2), &[], "向上填充") {
+                return;
+            }
+            let before_sheet = self.wb.sheet(si).clone();
+            let mut formulas = sheetcore::refs::FillFormulas::default();
+            let mut changed = 0usize;
+            let mut sample = Vec::with_capacity(sheetcore::revision::MAX_CELLS);
+            let mut has_formula = false;
+            {
+                let sh = self.wb.sheet_mut(si);
+                for c in c1..=c2 {
+                    let src = sh.get(r2, c).map(|cell| cell.into_owned());
+                    let sid = sh.style_of(r2, c);
+                    if let Some(source) = src {
+                        has_formula |= source.formula.is_some();
+                        for r in r1..r2 {
+                            let after = Cell {
+                                value: source.value.clone(),
+                                formula: source.formula.as_deref().map(|f| {
+                                    formulas.translate(f, r as i64 - r2 as i64, 0).into()
+                                }),
+                            };
+                            if sample.len() < sheetcore::revision::MAX_CELLS {
+                                let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
+                                let before_style = sh.style_of(r, c);
+                                sample.push(sheetcore::undo::CellDelta {
+                                    sheet: si,
+                                    row: r,
+                                    col: c,
+                                    before,
+                                    after: after.clone(),
+                                    before_style,
+                                    after_style: sid,
+                                });
+                            }
+                            sh.set(r, c, after);
+                            changed += 1;
+                        }
+                    } else {
+                        for r in r1..r2 {
+                            if sh.get(r, c).is_some() {
+                                if sample.len() < sheetcore::revision::MAX_CELLS {
+                                    let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
+                                    let before_style = sh.style_of(r, c);
+                                    sample.push(sheetcore::undo::CellDelta {
+                                        sheet: si,
+                                        row: r,
+                                        col: c,
+                                        before,
+                                        after: Cell::default(),
+                                        before_style,
+                                        after_style: sid,
+                                    });
+                                }
+                                sh.remove(r, c);
+                                changed += 1;
+                            }
+                        }
+                    }
+                    sh.set_style_rect(r1, c, r2 - 1, c, sid);
+                }
+            }
+            self.record_revision_sample("向上填充", &sample, changed.max(1));
+            self.undo.push_cow_batch(
+                "向上填充",
+                si,
+                &before_sheet,
+                self.wb.sheet(si),
+                (si, self.sel.0, self.sel.1),
+            );
+            self.wb.calc_manual |= self.manual_calc;
+            if has_formula || !self.deps.is_empty() {
+                self.recalc_all_and_deps_adaptive();
+            }
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.tasks.last_edit = Some(std::time::Instant::now());
+            std::thread::spawn(move || drop(before_sheet));
+            self.status = format!("已用底行向上填充 {}-{} 行", r1 + 1, r2 + 1);
             return;
         }
         let gate = sheetcore::undo::rect_keys(r1, c1, r2 - 1, c2);
@@ -1264,7 +1361,7 @@ impl SheetApp {
             return;
         }
         let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-        let sheet_name = self.wb.sheet(self.sheet_idx).name.clone();
+        let mut formulas = sheetcore::refs::FillFormulas::default();
         let txn = self.txn_begin(&keys);
         let mut touched = Vec::new();
         for c in c1..=c2 {
@@ -1274,10 +1371,7 @@ impl SheetApp {
                 if let Some(ref s) = src {
                     let mut cell = s.clone();
                     if let Some(ref f) = s.formula {
-                        cell.formula = Some(
-                            sheetcore::refs::translate(f, r as i64 - r2 as i64, 0, &sheet_name)
-                                .into(),
-                        );
+                        cell.formula = Some(formulas.translate(f, r as i64 - r2 as i64, 0).into());
                     }
                     self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
                 } else {
@@ -1305,8 +1399,99 @@ impl SheetApp {
             return;
         }
         let area = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
-        if area > 200_000 {
-            self.status = "填充范围过大（单次最多支持 20 万个单元格）".into();
+        let max_area = if self.net.is_none() {
+            sheetcore::undo::MAX_DENSE_RECT_KEYS as u64
+        } else {
+            200_000
+        };
+        if area > max_area {
+            self.status = format!(
+                "填充范围过大（单次最多支持 {} 万个单元格）",
+                max_area / 10_000
+            );
+            return;
+        }
+        let si = self.sheet_idx;
+        if self.net.is_none() && area > sheetcore::undo::COW_BATCH_THRESHOLD as u64 {
+            if !self.check_sparse_rect_preflight(si, (r1, c1, r2, c2 - 1), &[], "向左填充") {
+                return;
+            }
+            let before_sheet = self.wb.sheet(si).clone();
+            let mut formulas = sheetcore::refs::FillFormulas::default();
+            let mut changed = 0usize;
+            let mut sample = Vec::with_capacity(sheetcore::revision::MAX_CELLS);
+            let mut has_formula = false;
+            {
+                let sh = self.wb.sheet_mut(si);
+                for r in r1..=r2 {
+                    let src = sh.get(r, c2).map(|cell| cell.into_owned());
+                    let sid = sh.style_of(r, c2);
+                    if let Some(source) = src {
+                        has_formula |= source.formula.is_some();
+                        for c in c1..c2 {
+                            let after = Cell {
+                                value: source.value.clone(),
+                                formula: source.formula.as_deref().map(|f| {
+                                    formulas.translate(f, 0, c as i64 - c2 as i64).into()
+                                }),
+                            };
+                            if sample.len() < sheetcore::revision::MAX_CELLS {
+                                let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
+                                let before_style = sh.style_of(r, c);
+                                sample.push(sheetcore::undo::CellDelta {
+                                    sheet: si,
+                                    row: r,
+                                    col: c,
+                                    before,
+                                    after: after.clone(),
+                                    before_style,
+                                    after_style: sid,
+                                });
+                            }
+                            sh.set(r, c, after);
+                            changed += 1;
+                        }
+                    } else {
+                        for c in c1..c2 {
+                            if sh.get(r, c).is_some() {
+                                if sample.len() < sheetcore::revision::MAX_CELLS {
+                                    let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
+                                    let before_style = sh.style_of(r, c);
+                                    sample.push(sheetcore::undo::CellDelta {
+                                        sheet: si,
+                                        row: r,
+                                        col: c,
+                                        before,
+                                        after: Cell::default(),
+                                        before_style,
+                                        after_style: sid,
+                                    });
+                                }
+                                sh.remove(r, c);
+                                changed += 1;
+                            }
+                        }
+                    }
+                    sh.set_style_rect(r, c1, r, c2 - 1, sid);
+                }
+            }
+            self.record_revision_sample("向左填充", &sample, changed.max(1));
+            self.undo.push_cow_batch(
+                "向左填充",
+                si,
+                &before_sheet,
+                self.wb.sheet(si),
+                (si, self.sel.0, self.sel.1),
+            );
+            self.wb.calc_manual |= self.manual_calc;
+            if has_formula || !self.deps.is_empty() {
+                self.recalc_all_and_deps_adaptive();
+            }
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.tasks.last_edit = Some(std::time::Instant::now());
+            std::thread::spawn(move || drop(before_sheet));
+            self.status = format!("已用最右列向左填充至 {} 列", col_label(c1));
             return;
         }
         let gate = sheetcore::undo::rect_keys(r1, c1, r2, c2 - 1);
@@ -1314,7 +1499,7 @@ impl SheetApp {
             return;
         }
         let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-        let sheet_name = self.wb.sheet(self.sheet_idx).name.clone();
+        let mut formulas = sheetcore::refs::FillFormulas::default();
         let txn = self.txn_begin(&keys);
         let mut touched = Vec::new();
         for r in r1..=r2 {
@@ -1324,10 +1509,7 @@ impl SheetApp {
                 if let Some(ref s) = src {
                     let mut cell = s.clone();
                     if let Some(ref f) = s.formula {
-                        cell.formula = Some(
-                            sheetcore::refs::translate(f, 0, c as i64 - c2 as i64, &sheet_name)
-                                .into(),
-                        );
+                        cell.formula = Some(formulas.translate(f, 0, c as i64 - c2 as i64).into());
                     }
                     self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
                 } else {
@@ -1414,10 +1596,19 @@ impl SheetApp {
 
         if r1 == r2 && c1 == c2 {
             if let Some(lim) = stop {
+                let cap = if self.net.is_none() {
+                    if cfg.by_row {
+                        16_384 - c1
+                    } else {
+                        1_048_576 - r1
+                    }
+                } else {
+                    5_000
+                };
                 let count = if cfg.kind == 1 {
                     let mut cur = start_val;
                     let mut k = 1u32;
-                    while k < 5000 {
+                    while k < cap {
                         cur *= step;
                         if step <= 0.0
                             || (step - 1.0).abs() < 1e-9
@@ -1430,27 +1621,22 @@ impl SheetApp {
                     }
                     k
                 } else if step.abs() > 1e-9 {
-                    (((lim - start_val) / step).floor().max(0.0) as u32 + 1).min(5000)
+                    (((lim - start_val) / step).floor().max(0.0) as u32 + 1).min(cap)
                 } else {
                     1
                 };
                 if cfg.by_row {
-                    c2 = c1 + count.saturating_sub(1);
+                    c2 = (c1 + count.saturating_sub(1)).min(16_383);
                 } else {
-                    r2 = r1 + count.saturating_sub(1);
+                    r2 = (r1 + count.saturating_sub(1)).min(1_048_575);
                 }
             }
         }
-        if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 200_000 {
+        let area = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
+        if area > 200_000 {
             self.status = "序列填充区域超过 20 万格，请缩小选区或指定终止值".into();
             return;
         }
-        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
-        if !self.write_preflight(&keys, "序列填充") {
-            return;
-        }
-        let txn = self.txn_begin(&keys);
-        let mut touched = Vec::new();
         let is_date = cfg.kind == 2;
         let step_i = step.round() as i64;
         let advance_serial = |idx: u32, base: f64| -> f64 {
@@ -1462,8 +1648,6 @@ impl SheetApp {
             } else {
                 match cfg.date_unit {
                     1 => {
-                        // Excel serial 0 ≈ 1899-12-30 (Sunday): serial % 7 == 0 星期六, == 1 星期日
-                        // O(1) 整周跳过计算，避免大区域逐日累加造成 O(N^2) 死循环
                         let mut cur = base.round() as i64;
                         let dir = if step_i >= 0 { 1 } else { -1 };
                         let total = (idx as i64) * step_i.abs();
@@ -1488,7 +1672,8 @@ impl SheetApp {
             }
         };
 
-        let src_sid = self.wb.sheet(self.sheet_idx).style_of(r1, c1);
+        let si = self.sheet_idx;
+        let src_sid = self.wb.sheet(si).style_of(r1, c1);
         let target_sid = if is_date && self.wb.styles.get(src_sid).format.is_empty() {
             let mut st = self.wb.styles.get(src_sid).clone();
             st.format = "yyyy-mm-dd".into();
@@ -1496,6 +1681,137 @@ impl SheetApp {
         } else {
             src_sid
         };
+
+        if self.net.is_none() && area > sheetcore::undo::COW_BATCH_THRESHOLD as u64 {
+            if !self.check_sparse_rect_preflight(si, (r1, c1, r2, c2), &[], "序列填充") {
+                return;
+            }
+            let before_sheet = self.wb.sheet(si).clone();
+            let mut written = 0usize;
+            let mut sample = Vec::with_capacity(sheetcore::revision::MAX_CELLS);
+            {
+                let sh = self.wb.sheet_mut(si);
+                if cfg.by_row {
+                    for r in r1..=r2 {
+                        let base = sh
+                            .get(r, c1)
+                            .and_then(|c| match c.value {
+                                Value::Number(n) => Some(n),
+                                _ => None,
+                            })
+                            .unwrap_or(start_val);
+                        let mut last_c = None;
+                        for c in c1..=c2 {
+                            let v = advance_serial(c - c1, base);
+                            if let Some(lim) = stop {
+                                if (step >= 0.0 && v > lim + 1e-9) || (step < 0.0 && v < lim - 1e-9)
+                                {
+                                    break;
+                                }
+                            }
+                            let after = Cell {
+                                value: Value::Number(v),
+                                formula: None,
+                            };
+                            if sample.len() < sheetcore::revision::MAX_CELLS {
+                                let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
+                                let before_style = sh.style_of(r, c);
+                                sample.push(sheetcore::undo::CellDelta {
+                                    sheet: si,
+                                    row: r,
+                                    col: c,
+                                    before,
+                                    after: after.clone(),
+                                    before_style,
+                                    after_style: if target_sid != 0 { target_sid } else { before_style },
+                                });
+                            }
+                            sh.set(r, c, after);
+                            last_c = Some(c);
+                            written += 1;
+                        }
+                        if target_sid != 0
+                            && let Some(lc) = last_c
+                        {
+                            sh.set_style_rect(r, c1, r, lc, target_sid);
+                        }
+                    }
+                } else {
+                    for c in c1..=c2 {
+                        let base = sh
+                            .get(r1, c)
+                            .and_then(|cell| match cell.value {
+                                Value::Number(n) => Some(n),
+                                _ => None,
+                            })
+                            .unwrap_or(start_val);
+                        let mut last_r = None;
+                        for r in r1..=r2 {
+                            let v = advance_serial(r - r1, base);
+                            if let Some(lim) = stop {
+                                if (step >= 0.0 && v > lim + 1e-9) || (step < 0.0 && v < lim - 1e-9)
+                                {
+                                    break;
+                                }
+                            }
+                            let after = Cell {
+                                value: Value::Number(v),
+                                formula: None,
+                            };
+                            if sample.len() < sheetcore::revision::MAX_CELLS {
+                                let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
+                                let before_style = sh.style_of(r, c);
+                                sample.push(sheetcore::undo::CellDelta {
+                                    sheet: si,
+                                    row: r,
+                                    col: c,
+                                    before,
+                                    after: after.clone(),
+                                    before_style,
+                                    after_style: if target_sid != 0 { target_sid } else { before_style },
+                                });
+                            }
+                            sh.set(r, c, after);
+                            last_r = Some(r);
+                            written += 1;
+                        }
+                        if target_sid != 0
+                            && let Some(lr) = last_r
+                        {
+                            sh.set_style_rect(r1, c, lr, c, target_sid);
+                        }
+                    }
+                }
+            }
+            if written > 0 {
+                self.record_revision_sample("序列填充", &sample, written);
+                self.undo.push_cow_batch(
+                    "序列填充",
+                    si,
+                    &before_sheet,
+                    self.wb.sheet(si),
+                    (si, self.sel.0, self.sel.1),
+                );
+                self.wb.calc_manual |= self.manual_calc;
+                if !self.deps.is_empty() {
+                    self.recalc_all_and_deps_adaptive();
+                }
+                self.tasks.last_edit = Some(std::time::Instant::now());
+            }
+            std::thread::spawn(move || drop(before_sheet));
+            self.sel_end = (r2, c2);
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.status = format!("已完成序列填充（{written} 格）");
+            return;
+        }
+
+        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        if !self.write_preflight(&keys, "序列填充") {
+            return;
+        }
+        let txn = self.txn_begin(&keys);
+        let mut touched = Vec::new();
 
         if cfg.by_row {
             for r in r1..=r2 {

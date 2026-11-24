@@ -944,15 +944,71 @@ impl SheetApp {
         let (layout, ops, page_no, total, cur_page) = {
             let sheet = self.wb.sheet(self.sheet_idx);
             let setup = if self.page_setup_open && self.page_setup_sheet == sheet.identity {
-                &self.page_setup_draft
+                self.page_setup_draft.clone()
             } else {
-                &sheet.page
+                sheet.page.clone()
             };
-            let layout = sheetcore::print::paginate(sheet, setup);
+            let cache_key = (
+                self.doc_uid,
+                sheet.identity,
+                sheet.cell_version().clone(),
+                sheet.display_style_revision(),
+                sheet.rows.revision(),
+                sheet.cols.revision(),
+                sheet.hidden_rows.revision(),
+                sheet.hidden_rows_user.revision(),
+                sheet.hidden_cols.revision(),
+                sheet.merges_revision(),
+                setup.clone(),
+                self.wb.path.clone(),
+            );
+            let layout_hit = self
+                .normal_page_breaks
+                .print_preview
+                .as_ref()
+                .is_some_and(|c| c.key == cache_key);
+            if !layout_hit {
+                let built = std::sync::Arc::new(sheetcore::print::paginate(sheet, &setup));
+                self.normal_page_breaks.print_preview =
+                    Some(crate::grid_render_cache::PrintPreviewCache {
+                        key: cache_key,
+                        layout: built,
+                        page_ops: None,
+                    });
+            }
+            let layout = self
+                .normal_page_breaks
+                .print_preview
+                .as_ref()
+                .unwrap()
+                .layout
+                .clone();
             let total = layout.pages.len().max(1);
             let page_no = self.preview_page.min(total - 1);
-            let ops = sheetcore::print::page_ops_with(&self.wb, self.sheet_idx, &layout, page_no, self.wb.path.as_deref());
-            (layout, ops, page_no, total, setup.clone())
+            let cached_ops = self
+                .normal_page_breaks
+                .print_preview
+                .as_ref()
+                .and_then(|c| c.page_ops.as_ref())
+                .filter(|(p, _)| *p == page_no)
+                .map(|(_, ops)| ops.clone());
+            let ops = match cached_ops {
+                Some(hit) => hit,
+                None => {
+                    let built = std::sync::Arc::new(sheetcore::print::page_ops_with(
+                        &self.wb,
+                        self.sheet_idx,
+                        &layout,
+                        page_no,
+                        self.wb.path.as_deref(),
+                    ));
+                    if let Some(cache) = self.normal_page_breaks.print_preview.as_mut() {
+                        cache.page_ops = Some((page_no, built.clone()));
+                    }
+                    built
+                }
+            };
+            (layout, ops, page_no, total, setup)
         };
 
         let (pw, ph) = layout.page_size;
