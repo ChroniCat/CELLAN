@@ -1191,18 +1191,19 @@ impl SheetApp {
                     })
                     .inner_margin(egui::Margin::same(0))
                     .show(ui, |ui| {
-                        ui.set_min_size(card_rect.size());
-                        ui.set_max_size(card_rect.size());
+                        let inner_rect = ui.max_rect();
+                        ui.set_min_size(inner_rect.size());
+                        ui.set_max_size(inner_rect.size());
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
 
                         // 1. 顶部工具栏式卡片头（浅灰蓝微底 + 品牌星标徽章 + 胶囊动作按钮）
                         let hdr_h = 40.0;
                         let (hdr_rect, _) = ui.allocate_exact_size(
-                            Vec2::new(card_rect.width(), hdr_h),
+                            Vec2::new(inner_rect.width(), hdr_h),
                             Sense::hover(),
                         );
                         ui.painter().rect_filled(
-                            hdr_rect.shrink(1.0),
+                            hdr_rect,
                             egui::CornerRadius {
                                 nw: 7,
                                 ne: 7,
@@ -1213,13 +1214,13 @@ impl SheetApp {
                         );
                         ui.painter().line_segment(
                             [
-                                egui::pos2(hdr_rect.left() + 1.0, hdr_rect.bottom()),
-                                egui::pos2(hdr_rect.right() - 1.0, hdr_rect.bottom()),
+                                egui::pos2(hdr_rect.left(), hdr_rect.bottom()),
+                                egui::pos2(hdr_rect.right(), hdr_rect.bottom()),
                             ],
                             Stroke::new(1.0_f32, ui_kit::SEP),
                         );
 
-                        let hdr_inner = hdr_rect.shrink2(Vec2::new(10.0, 6.0));
+                        let hdr_inner = hdr_rect.shrink2(Vec2::new(9.0, 6.0));
                         let mut hdr_ui = ui.new_child(
                             egui::UiBuilder::new()
                                 .max_rect(hdr_inner)
@@ -1321,10 +1322,10 @@ impl SheetApp {
                             },
                         );
 
-                        // 2. 卡片内容主体区域（内留 10px 左右边距、8px 上下边距）
+                        // 2. 卡片内容主体区域（内留 10px 左右边距、8px 上下边距，严格限制在描边内侧）
                         let body_rect = Rect::from_min_max(
-                            egui::pos2(card_rect.left() + 10.0, hdr_rect.bottom() + 8.0),
-                            egui::pos2(card_rect.right() - 10.0, card_rect.bottom() - 8.0),
+                            egui::pos2(inner_rect.left() + 9.0, hdr_rect.bottom() + 8.0),
+                            egui::pos2(inner_rect.right() - 9.0, inner_rect.bottom() - 7.0),
                         );
                         if body_rect.width() <= 20.0 || body_rect.height() <= 20.0 {
                             return;
@@ -1697,13 +1698,16 @@ impl SheetApp {
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::symmetric(10, 8))
                                     .show(ui, |ui| {
+                                        let avail_w = ui.available_width();
+                                        ui.set_max_width(avail_w);
                                         ui.add(
                                             egui::TextEdit::multiline(&mut self.ai.draft)
                                                 .id(te_id)
                                                 .frame(false)
+                                                .margin(egui::Margin::ZERO)
                                                 .font(FontId::proportional(12.0))
                                                 .desired_rows(3)
-                                                .desired_width(ui.available_width())
+                                                .desired_width(avail_w)
                                                 .hint_text(
                                                     egui::RichText::new(
                                                         "输入需求，例如：按部门汇总金额并把负数标红",
@@ -2947,5 +2951,53 @@ mod grouped_undo_tests {
         assert!(joined.contains("表格操作步骤"), "{joined}");
         assert!(joined.contains("4 步"), "{joined}");
         assert!(joined.contains("撤销本轮表格编辑"), "{joined}");
+    }
+
+    #[test]
+    fn ai_panel_width_stays_stable_without_creep_across_frames() {
+        let _env = crate::test_env::TestEnv::new("ai_panel_width_no_creep");
+        let mut app = edited_by_ai();
+        app.ai.open = true;
+        app.ai.request_input_focus = true;
+
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1440.0, 900.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut baseline_width: Option<f32> = None;
+        for frame in 0..30 {
+            if frame == 8 {
+                app.ai.settings_open = true;
+            } else if frame == 14 {
+                app.ai.settings_open = false;
+                app.ai.confirmation_label = Some("即将覆盖 Sheet1!A1:D20 中的已有数据".into());
+            } else if frame == 20 {
+                app.ai.confirmation_label = None;
+                if let Some(last) = app.ai.messages.last_mut() {
+                    last.reasoning = "检查数据区域与公式依赖".into();
+                    last.reasoning_open = true;
+                    last.tool_logs = vec!["读取工作簿概览".into(), "填充公式 C2:C100".into()];
+                    last.content = "已完成汇总。".into();
+                }
+            }
+            let _ = ctx.run(raw.clone(), |ctx| {
+                app.draw_ai_panel(ctx);
+                let panel_w = 1440.0 - ctx.available_rect().right();
+                let expected = *baseline_width.get_or_insert(panel_w);
+                assert!(
+                    (panel_w - expected).abs() < 0.01,
+                    "AI panel width drifted on frame {frame}: baseline={expected}, got={panel_w}"
+                );
+                assert!(
+                    (panel_w - 376.0).abs() <= 10.0,
+                    "unexpected initial AI panel width on frame {frame}: {panel_w}"
+                );
+            });
+        }
     }
 }
