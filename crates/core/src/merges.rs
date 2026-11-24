@@ -572,6 +572,93 @@ mod tests {
         let m = parse_merges(xml);
         assert_eq!(m, vec![(0, 0, 1, 1), (4, 3, 8, 5)]);
     }
+
+    #[test]
+    fn page_bucket_and_tall_preserve_overlapping_index_precedence() {
+        // Overlapping imported merges: earlier index must win regardless of tall vs bucketed.
+        let tall_first = vec![(0, 0, 100_000, 0), (10, 0, 12, 2), (2_000_000, 3, 2_000_002, 5)];
+        let m1 = Merges::from(tall_first.clone());
+        let mut idx1 = MergeIndex::default();
+        idx1.refresh(&tall_first);
+        let mut idx1_ref = MergeIndex::default();
+        idx1_ref.refresh_merges(&m1);
+        for (r, c, want) in [
+            (10, 0, Some((0, 0, 100_000, 0))),
+            (10, 1, Some((10, 0, 12, 2))),
+            (50_000, 0, Some((0, 0, 100_000, 0))),
+            (2_000_001, 4, Some((2_000_000, 3, 2_000_002, 5))),
+            (2_000_001, 0, None),
+        ] {
+            assert_eq!(m1.at(r, c), want, "m1 at ({r},{c})");
+            assert_eq!(idx1.at(r, c), want, "idx1 at ({r},{c})");
+            assert_eq!(idx1_ref.at(r, c), want, "idx1_ref at ({r},{c})");
+        }
+
+        let short_first = vec![(10, 0, 12, 2), (0, 0, 100_000, 0)];
+        let m2 = Merges::from(short_first.clone());
+        let mut idx2 = MergeIndex::default();
+        idx2.refresh(&short_first);
+        assert_eq!(m2.at(10, 0), Some((10, 0, 12, 2)));
+        assert_eq!(idx2.at(10, 0), Some((10, 0, 12, 2)));
+        assert_eq!(m2.at(13, 0), Some((0, 0, 100_000, 0)));
+        assert_eq!(idx2.at(13, 0), Some((0, 0, 100_000, 0)));
+    }
+
+    #[test]
+    fn batch_merge_ranges_matches_sequential_semantics_including_transitive_overlaps() {
+        let mut expected: Vec<MergeRect> = Vec::new();
+        let mut naive_merge = |batch: &[MergeRect]| {
+            for &(r1, c1, r2, c2) in batch {
+                let (r1, r2) = (r1.min(r2), r1.max(r2));
+                let (c1, c2) = (c1.min(c2), c1.max(c2));
+                if r1 == r2 && c1 == c2 {
+                    continue;
+                }
+                expected.retain(|&(a, b, cc, d)| a > r2 || cc < r1 || b > c2 || d < c1);
+                expected.push((r1, c1, r2, c2));
+            }
+            expected.sort_unstable();
+        };
+
+        let base: Vec<MergeRect> = vec![
+            (10, 0, 11, 1),     // killed by incoming X (which is later killed by Y)
+            (0, 10, 50_000, 10), // tall existing merge
+            (500, 0, 502, 2),
+            (1000, 1, 1001, 3),
+        ];
+        let incoming: Vec<MergeRect> = vec![
+            (0, 0, 1, 1),        // A: killed by B
+            (1, 1, 2, 2),        // B: kills A, killed by C
+            (2, 2, 3, 3),        // C: kills B, survives
+            (11, 1, 12, 2),      // X: kills existing (10,0,11,1), killed by Y
+            (12, 2, 13, 3),      // Y: kills X, survives
+            (25_000, 9, 25_001, 11), // kills tall existing merge
+            (500, 0, 502, 2),    // exact duplicate
+            (500, 0, 502, 2),    // exact duplicate again
+            (7, 7, 7, 7),        // single cell ignored
+            (800, 5, 799, 4),    // reversed coords normalized
+            (0, 20, 60_000, 20), // tall incoming
+            (100, 20, 101, 21),  // kills tall incoming
+        ];
+
+        naive_merge(&base);
+        naive_merge(&incoming);
+
+        let mut actual = Merges::new();
+        assert!(actual.merge_ranges(base));
+        assert!(actual.merge_ranges(incoming));
+        assert_eq!(actual.as_ref(), expected.as_slice());
+
+        // Verify spatial queries match brute force on all corners and interiors.
+        for &(r1, c1, r2, c2) in &expected {
+            assert_eq!(actual.at(r1, c1), Some((r1, c1, r2, c2)));
+            assert_eq!(actual.at(r2, c2), Some((r1, c1, r2, c2)));
+        }
+        assert_eq!(actual.at(0, 0), None);
+        assert_eq!(actual.at(10, 0), None);
+        assert_eq!(actual.at(0, 10), None);
+        assert_eq!(actual.at(0, 20), None);
+    }
 }
 
 
@@ -582,65 +669,227 @@ fn next_merge_revision() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-#[derive(Debug)]
+const MERGE_PAGE_SHIFT: u32 = 8; // 256 rows per page
+const TALL_PAGE_LIMIT: u32 = 16; // spans > 16 pages go into `tall`
+const MAX_DENSE_PAGES: usize = 4096; // covers rows 0..1_048_576 in O(1)
+
+#[derive(Clone, Debug, Default)]
+struct PageBucket {
+    entries: Vec<(usize, MergeRect)>,
+    ends: Vec<u32>,
+}
+
+impl PageBucket {
+    fn finalize(&mut self) {
+        if self.entries.len() > 1
+            && !self
+                .entries
+                .windows(2)
+                .all(|w| (w[0].1.0, w[0].0) <= (w[1].1.0, w[1].0))
+        {
+            self.entries.sort_unstable_by_key(|&(i, rect)| (rect.0, i));
+        }
+        self.ends.clear();
+        self.ends.reserve(self.entries.len());
+        let mut bottom = 0u32;
+        for &(_, rect) in &self.entries {
+            bottom = bottom.max(rect.2);
+            self.ends.push(bottom);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 struct MergesMeta {
     max_row: Option<u32>,
     max_col: Option<u32>,
-    order: Vec<usize>,
-    ends: Vec<u32>,
+    dense_buckets: Vec<PageBucket>,
+    overflow_buckets: HashMap<u32, PageBucket>,
+    tall: Vec<(usize, MergeRect)>,
 }
 
 impl MergesMeta {
     fn build(rects: &[MergeRect]) -> Self {
         if rects.is_empty() {
-            return Self {
-                max_row: None,
-                max_col: None,
-                order: Vec::new(),
-                ends: Vec::new(),
-            };
+            return Self::default();
         }
         let mut max_r = 0u32;
         let mut max_c = 0u32;
-        for &(_, _, r2, c2) in rects {
+        let mut max_dense_page: Option<usize> = None;
+        for &(r1, c1, r2, c2) in rects {
             max_r = max_r.max(r2);
             max_c = max_c.max(c2);
+            if r1 <= r2 && c1 <= c2 {
+                let p1 = r1 >> MERGE_PAGE_SHIFT;
+                let p2 = r2 >> MERGE_PAGE_SHIFT;
+                if p2 - p1 < TALL_PAGE_LIMIT && (p2 as usize) < MAX_DENSE_PAGES {
+                    let p2_u = p2 as usize;
+                    max_dense_page = Some(max_dense_page.map_or(p2_u, |cur| cur.max(p2_u)));
+                }
+            }
         }
-        let mut order: Vec<usize> = (0..rects.len()).collect();
-        order.sort_unstable_by_key(|&i| rects[i].0);
-        let mut bottom = 0u32;
-        let ends: Vec<u32> = order
-            .iter()
-            .map(|&i| {
-                bottom = bottom.max(rects[i].2);
-                bottom
-            })
-            .collect();
+
+        let mut dense_buckets = match max_dense_page {
+            Some(mp) => vec![PageBucket::default(); mp + 1],
+            None => Vec::new(),
+        };
+        let mut overflow_buckets: HashMap<u32, PageBucket> = HashMap::new();
+        let mut tall: Vec<(usize, MergeRect)> = Vec::new();
+
+        for (idx, &rect) in rects.iter().enumerate() {
+            let (r1, c1, r2, c2) = rect;
+            if r1 > r2 || c1 > c2 {
+                continue;
+            }
+            let p1 = r1 >> MERGE_PAGE_SHIFT;
+            let p2 = r2 >> MERGE_PAGE_SHIFT;
+            if p2 - p1 >= TALL_PAGE_LIMIT {
+                tall.push((idx, rect));
+            } else {
+                for p in p1..=p2 {
+                    if let Some(bucket) = dense_buckets.get_mut(p as usize) {
+                        bucket.entries.push((idx, rect));
+                    } else {
+                        overflow_buckets.entry(p).or_default().entries.push((idx, rect));
+                    }
+                }
+            }
+        }
+
+        for bucket in &mut dense_buckets {
+            if !bucket.entries.is_empty() {
+                bucket.finalize();
+            }
+        }
+        for bucket in overflow_buckets.values_mut() {
+            bucket.finalize();
+        }
+
         Self {
             max_row: Some(max_r),
             max_col: Some(max_c),
-            order,
-            ends,
+            dense_buckets,
+            overflow_buckets,
+            tall,
         }
     }
 
     #[inline]
-    fn at(&self, rects: &[MergeRect], r: u32, c: u32) -> Option<MergeRect> {
+    fn at(&self, r: u32, c: u32) -> Option<MergeRect> {
         if r > self.max_row? || c > self.max_col? {
             return None;
         }
-        let start = self.ends.partition_point(|&end| end < r);
-        let end = self.order.partition_point(|&i| rects[i].0 <= r);
-        self.order
-            .get(start..end)?
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let (_, left, bottom, right) = rects[i];
-                r <= bottom && left <= c && c <= right
-            })
-            .min()
-            .map(|i| rects[i])
+        let mut best: Option<(usize, MergeRect)> = None;
+        // `tall` is ordered by ascending original index, so the first match is minimal in `tall`.
+        for &(idx, rect) in &self.tall {
+            if rect.0 <= r && r <= rect.2 && rect.1 <= c && c <= rect.3 {
+                best = Some((idx, rect));
+                break;
+            }
+        }
+        let page = r >> MERGE_PAGE_SHIFT;
+        let bucket = if let Some(b) = self.dense_buckets.get(page as usize) {
+            (!b.entries.is_empty()).then_some(b)
+        } else {
+            self.overflow_buckets.get(&page)
+        };
+        if let Some(bucket) = bucket {
+            let entries = &bucket.entries;
+            let slice = if entries.len() <= 8 {
+                entries.as_slice()
+            } else {
+                let start = bucket.ends.partition_point(|&end| end < r);
+                let end = entries.partition_point(|&(_, rect)| rect.0 <= r);
+                if start < end {
+                    &entries[start..end]
+                } else {
+                    &[]
+                }
+            };
+            for &(idx, rect) in slice {
+                if let Some((best_idx, _)) = best
+                    && idx >= best_idx
+                {
+                    continue;
+                }
+                if rect.0 <= r && r <= rect.2 && rect.1 <= c && c <= rect.3 {
+                    best = Some((idx, rect));
+                }
+            }
+        }
+        best.map(|(_, rect)| rect)
+    }
+}
+
+#[inline]
+fn rects_overlap(a: MergeRect, b: MergeRect) -> bool {
+    a.0 <= b.2 && a.2 >= b.0 && a.1 <= b.3 && a.3 >= b.1
+}
+
+#[inline]
+fn rect_contains(outer: MergeRect, inner: MergeRect) -> bool {
+    outer.0 <= inner.0 && outer.1 <= inner.1 && outer.2 >= inner.2 && outer.3 >= inner.3
+}
+
+/// Temporary fine-grained page-bucket conflict index for O(K + M) batch `merge_ranges`.
+#[derive(Default)]
+struct ConflictIndex {
+    buckets: HashMap<u32, Vec<MergeRect>>,
+    tall: Vec<MergeRect>,
+}
+
+impl ConflictIndex {
+    const SHIFT: u32 = 4; // 16 rows per bucket
+    const TALL_SPAN: u32 = 16; // > 256 rows goes to `tall`
+
+    fn insert(&mut self, rect: MergeRect) {
+        let p1 = rect.0 >> Self::SHIFT;
+        let p2 = rect.2 >> Self::SHIFT;
+        if p2 - p1 >= Self::TALL_SPAN {
+            self.tall.push(rect);
+        } else {
+            for p in p1..=p2 {
+                self.buckets.entry(p).or_default().push(rect);
+            }
+        }
+    }
+
+    fn overlaps_status(&self, rect: MergeRect) -> (bool, bool) {
+        for &o in &self.tall {
+            if rects_overlap(o, rect) {
+                return (true, rect_contains(o, rect));
+            }
+        }
+        let p1 = rect.0 >> Self::SHIFT;
+        let p2 = rect.2 >> Self::SHIFT;
+        if p2 - p1 < Self::TALL_SPAN {
+            for p in p1..=p2 {
+                if let Some(list) = self.buckets.get(&p) {
+                    for &o in list {
+                        if rects_overlap(o, rect) {
+                            return (true, rect_contains(o, rect));
+                        }
+                    }
+                }
+            }
+        } else {
+            for (&p, list) in &self.buckets {
+                if p < p1 || p > p2 {
+                    continue;
+                }
+                for &o in list {
+                    if rects_overlap(o, rect) {
+                        return (true, rect_contains(o, rect));
+                    }
+                }
+            }
+        }
+        (false, false)
+    }
+
+    #[inline]
+    fn overlaps_any(&self, rect: MergeRect) -> bool {
+        self.overlaps_status(rect).0
     }
 }
 
@@ -662,7 +911,7 @@ impl Clone for MergesInner {
 }
 
 /// Copy-on-write merge list with monotonic `revision()`, cached `max_row()` / `max_col()`,
-/// and built-in `O(log M)` interval lookup (`at(r, c)`).
+/// and built-in 256-row page-bucketed spatial lookup (`at(r, c)`).
 #[derive(Clone, Debug)]
 pub struct Merges(std::sync::Arc<MergesInner>);
 
@@ -675,12 +924,7 @@ impl Default for Merges {
                     std::sync::Arc::new(MergesInner {
                         rects: Vec::new(),
                         revision: 0,
-                        meta: std::sync::OnceLock::from(MergesMeta {
-                            max_row: None,
-                            max_col: None,
-                            order: Vec::new(),
-                            ends: Vec::new(),
-                        }),
+                        meta: std::sync::OnceLock::from(MergesMeta::default()),
                     })
                 })
                 .clone(),
@@ -749,7 +993,7 @@ impl Merges {
         if self.0.rects.is_empty() {
             return None;
         }
-        self.meta().at(&self.0.rects, r, c)
+        self.meta().at(r, c)
     }
 
     pub fn merge_range(&mut self, r1: u32, c1: u32, r2: u32, c2: u32) -> bool {
@@ -778,17 +1022,36 @@ impl Merges {
             return false;
         }
         let rects: &mut Vec<MergeRect> = &mut *self;
+        if normalized.len() <= 4 && rects.len() <= 32 {
+            if !rects.is_empty() {
+                rects.retain(|&existing| normalized.iter().all(|&inc| !rects_overlap(existing, inc)));
+            }
+            for rect in normalized {
+                rects.retain(|&existing| !rects_overlap(existing, rect));
+                rects.push(rect);
+            }
+            rects.sort_unstable();
+            return true;
+        }
+
+        // Process incoming in reverse: an incoming rect survives iff no later incoming rect
+        // overlaps it, and every incoming rect (even one killed by a later rect) kills any
+        // earlier incoming or existing rect it overlaps.
+        let mut seen = ConflictIndex::default();
+        let mut kept_incoming = Vec::with_capacity(normalized.len());
+        for rect in normalized.into_iter().rev() {
+            let (overlaps, covered) = seen.overlaps_status(rect);
+            if !overlaps {
+                kept_incoming.push(rect);
+            }
+            if !covered {
+                seen.insert(rect);
+            }
+        }
         if !rects.is_empty() {
-            rects.retain(|&(a, b, cc, d)| {
-                normalized
-                    .iter()
-                    .all(|&(r1, c1, r2, c2)| a > r2 || cc < r1 || b > c2 || d < c1)
-            });
+            rects.retain(|&existing| !seen.overlaps_any(existing));
         }
-        for rect in normalized {
-            rects.retain(|&(a, b, cc, d)| a > rect.2 || cc < rect.0 || b > rect.3 || d < rect.1);
-            rects.push(rect);
-        }
+        rects.extend(kept_incoming);
         rects.sort_unstable();
         true
     }
@@ -892,86 +1155,60 @@ impl<'a> IntoIterator for &'a mut Merges {
     }
 }
 
-/// Row intervals ordered by their first row, with prefix maxima for the last row.
-/// Retain source indices so overlapping imported merges keep their original precedence.
+/// 256-row page-bucketed spatial index with a separate `tall` list for >16-page merges.
+/// Retains source indices so overlapping imported merges keep their original precedence.
 #[derive(Default, Clone, Debug)]
 pub struct MergeIndex {
     revision: Option<u64>,
+    shared: Option<std::sync::Arc<MergesInner>>,
     source: Vec<MergeRect>,
-    order: Vec<usize>,
-    ends: Vec<u32>,
-    max_row: Option<u32>,
-    max_col: Option<u32>,
+    meta: MergesMeta,
 }
 
 impl MergeIndex {
-    /// O(1) revision-checked refresh against `Sheet::merges`.
+    /// O(1) revision-checked refresh against `Sheet::merges`, sharing the CoW `MergesMeta` index.
     pub fn refresh_merges(&mut self, merges: &Merges) {
         let rev = merges.revision();
         if self.revision == Some(rev) {
             return;
         }
-        self.rebuild_from_slice(&merges.0.rects);
+        self.shared = Some(merges.0.clone());
         self.revision = Some(rev);
+        self.source.clear();
     }
 
     pub fn refresh(&mut self, merges: &[MergeRect]) {
-        if self.source == merges {
+        if self.revision.is_none() && self.shared.is_none() && self.source == merges {
             return;
         }
-        self.rebuild_from_slice(merges);
+        self.shared = None;
         self.revision = None;
-    }
-
-    fn rebuild_from_slice(&mut self, merges: &[MergeRect]) {
         self.source.clear();
         self.source.extend_from_slice(merges);
-        self.order.clear();
-        self.order.extend(0..merges.len());
-        self.order.sort_unstable_by_key(|&i| merges[i].0);
-        let mut bottom = 0u32;
-        let mut right_max = 0u32;
-        self.ends.clear();
-        self.ends.reserve(merges.len());
-        for &i in &self.order {
-            bottom = bottom.max(merges[i].2);
-            right_max = right_max.max(merges[i].3);
-            self.ends.push(bottom);
-        }
-        if merges.is_empty() {
-            self.max_row = None;
-            self.max_col = None;
+        self.meta = MergesMeta::build(&self.source);
+    }
+
+    #[inline]
+    fn active_meta(&self) -> &MergesMeta {
+        if let Some(ref inner) = self.shared {
+            inner.meta.get_or_init(|| MergesMeta::build(&inner.rects))
         } else {
-            self.max_row = Some(bottom);
-            self.max_col = Some(right_max);
+            &self.meta
         }
     }
 
     #[inline]
     pub fn max_row(&self) -> Option<u32> {
-        self.max_row
+        self.active_meta().max_row
     }
 
     #[inline]
     pub fn max_col(&self) -> Option<u32> {
-        self.max_col
+        self.active_meta().max_col
     }
 
+    #[inline]
     pub fn at(&self, r: u32, c: u32) -> Option<MergeRect> {
-        if self.source.is_empty() || r > self.max_row? || c > self.max_col? {
-            return None;
-        }
-        let start = self.ends.partition_point(|&end| end < r);
-        let end = self.order.partition_point(|&i| self.source[i].0 <= r);
-        self.order
-            .get(start..end)?
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let (_, left, bottom, right) = self.source[i];
-                r <= bottom && left <= c && c <= right
-            })
-            .min()
-            .map(|i| self.source[i])
+        self.active_meta().at(r, c)
     }
 }

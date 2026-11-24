@@ -395,20 +395,59 @@ pub fn read_workbook_stream_file(path: &std::path::Path) -> Option<Vec<u8>> {
 
     let difat = read_difat_sectors(&mut f, file_len, sector_size, &head).ok()?;
     let per_fat = sector_size / 4;
-    let mut fat = Vec::with_capacity(difat.len() * per_fat);
-    let mut sec_buf = vec![0u8; sector_size];
-    for &s in difat.iter().take(n_fat.max(difat.len())) {
-        if !read_sector_at(&mut f, file_len, sector_size, s, &mut sec_buf) {
-            continue;
-        }
-        for i in 0..per_fat {
-            fat.push(u32le(&sec_buf, i * 4));
+    let fat_count = difat.len().min(n_fat.max(difat.len()));
+    let fat_sectors = &difat[..fat_count];
+    let mut fat = Vec::with_capacity(fat_sectors.len() * per_fat);
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut run_buf = Vec::new();
+        let mut idx = 0usize;
+        while idx < fat_sectors.len() {
+            let start_sid = fat_sectors[idx];
+            let Some(run_off) = (start_sid as u64)
+                .checked_add(1)
+                .and_then(|n| n.checked_mul(sector_size as u64))
+            else {
+                idx += 1;
+                continue;
+            };
+            if run_off
+                .checked_add(sector_size as u64)
+                .is_none_or(|end| end > file_len)
+            {
+                idx += 1;
+                continue;
+            }
+            let mut run_len = 1usize;
+            while idx + run_len < fat_sectors.len()
+                && fat_sectors[idx + run_len - 1].checked_add(1) == Some(fat_sectors[idx + run_len])
+            {
+                let next_bytes = ((run_len + 1) as u64).checked_mul(sector_size as u64);
+                let next_end = next_bytes.and_then(|b| run_off.checked_add(b));
+                if next_end.is_none_or(|end| end > file_len) {
+                    break;
+                }
+                run_len += 1;
+            }
+            let byte_len = run_len * sector_size;
+            run_buf.resize(byte_len, 0);
+            if f.seek(SeekFrom::Start(run_off)).is_ok() && f.read_exact(&mut run_buf).is_ok() {
+                for chunk in run_buf.chunks_exact(4) {
+                    fat.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                }
+            }
+            idx += run_len;
         }
     }
 
     let read_file_chain = |f: &mut std::fs::File, start: u32, expected: Option<usize>| -> Vec<u8> {
-        let mut out = Vec::with_capacity(expected.unwrap_or(sector_size * 4));
-        let mut buf = vec![0u8; sector_size];
+        use std::io::{Read, Seek, SeekFrom};
+        let max_sectors_needed = expected.map(|lim| lim.div_ceil(sector_size));
+        let init_cap = match expected {
+            Some(lim) => lim.min(file_len as usize),
+            None => sector_size * 4,
+        };
+        let mut out = Vec::with_capacity(init_cap);
         let mut cur = start;
         let mut guard = 0usize;
         while cur != END && cur != FREE && guard < 200_000 {
@@ -417,12 +456,60 @@ pub fn read_workbook_stream_file(path: &std::path::Path) -> Option<Vec<u8>> {
                     break;
                 }
             }
-            if !read_sector_at(f, file_len, sector_size, cur, &mut buf) {
+            let Some(run_off) = (cur as u64)
+                .checked_add(1)
+                .and_then(|n| n.checked_mul(sector_size as u64))
+            else {
+                break;
+            };
+            if run_off
+                .checked_add(sector_size as u64)
+                .is_none_or(|end| end > file_len)
+            {
                 break;
             }
-            out.extend_from_slice(&buf);
-            cur = *fat.get(cur as usize).unwrap_or(&END);
+            let mut run_sectors = 1usize;
+            let mut last_sid = cur;
             guard += 1;
+            cur = *fat.get(cur as usize).unwrap_or(&END);
+
+            while cur != END
+                && cur != FREE
+                && guard < 200_000
+                && last_sid.checked_add(1) == Some(cur)
+            {
+                if let Some(max_sec) = max_sectors_needed {
+                    if guard >= max_sec {
+                        break;
+                    }
+                }
+                let next_bytes = ((run_sectors + 1) as u64).checked_mul(sector_size as u64);
+                let next_end = next_bytes.and_then(|b| run_off.checked_add(b));
+                if next_end.is_none_or(|end| end > file_len) {
+                    break;
+                }
+                last_sid = cur;
+                run_sectors += 1;
+                guard += 1;
+                cur = *fat.get(cur as usize).unwrap_or(&END);
+            }
+
+            let run_bytes = run_sectors * sector_size;
+            let to_read = match expected {
+                Some(lim) => run_bytes.min(lim.saturating_sub(out.len())),
+                None => run_bytes,
+            };
+            if to_read == 0 {
+                break;
+            }
+            let old_len = out.len();
+            out.resize(old_len + to_read, 0);
+            if f.seek(SeekFrom::Start(run_off)).is_err()
+                || f.read_exact(&mut out[old_len..old_len + to_read]).is_err()
+            {
+                out.truncate(old_len);
+                break;
+            }
         }
         if let Some(lim) = expected {
             out.truncate(lim);
@@ -486,5 +573,115 @@ pub fn read_workbook_stream_file(path: &std::path::Path) -> Option<Vec<u8>> {
         }
         out.truncate(target_len);
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal valid 512-byte-sector CFB file with custom FAT layout and Workbook stream.
+    fn build_synthetic_cfb(sector_order: &[u32], payload: &[u8]) -> Vec<u8> {
+        let sector_size = 512usize;
+        let max_data_sid = sector_order.iter().copied().max().unwrap_or(0);
+        let dir_sid = max_data_sid + 1;
+        let fat_sid = dir_sid + 1;
+        let total_sectors = (fat_sid + 1) as usize;
+        let mut img = vec![0u8; (total_sectors + 1) * sector_size];
+
+        // Header (512 bytes)
+        img[0..8].copy_from_slice(&SIGNATURE);
+        img[30..32].copy_from_slice(&9u16.to_le_bytes()); // sector_shift = 9 (512B)
+        img[32..34].copy_from_slice(&6u16.to_le_bytes()); // mini_shift = 6 (64B)
+        img[44..48].copy_from_slice(&1u32.to_le_bytes()); // n_fat = 1
+        img[48..52].copy_from_slice(&dir_sid.to_le_bytes()); // dir_start
+        img[56..60].copy_from_slice(&4096u32.to_le_bytes()); // mini_cutoff = 4096
+        img[60..64].copy_from_slice(&END.to_le_bytes()); // minifat_start
+        img[64..68].copy_from_slice(&0u32.to_le_bytes()); // n_minifat = 0
+        img[68..72].copy_from_slice(&END.to_le_bytes()); // difat_start
+        img[72..76].copy_from_slice(&0u32.to_le_bytes()); // n_difat = 0
+        for i in 0..109 {
+            let v = if i == 0 { fat_sid } else { FREE };
+            img[76 + i * 4..80 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+
+        // Write payload slices according to `sector_order`
+        for (k, &sid) in sector_order.iter().enumerate() {
+            let src_start = k * sector_size;
+            let src_end = (src_start + sector_size).min(payload.len());
+            if src_start < src_end {
+                let dst = (sid as usize + 1) * sector_size;
+                img[dst..dst + (src_end - src_start)].copy_from_slice(&payload[src_start..src_end]);
+            }
+        }
+
+        // Directory sector: entry 0 = Root Entry, entry 1 = Workbook
+        let dir_off = (dir_sid as usize + 1) * sector_size;
+        let write_entry = |buf: &mut [u8], name: &str, kind: u8, start: u32, size: u32| {
+            let utf16: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            for (i, u) in utf16.iter().enumerate() {
+                buf[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+            }
+            buf[64..66].copy_from_slice(&((utf16.len() * 2) as u16).to_le_bytes());
+            buf[66] = kind;
+            buf[116..120].copy_from_slice(&start.to_le_bytes());
+            buf[120..124].copy_from_slice(&size.to_le_bytes());
+        };
+        write_entry(&mut img[dir_off..dir_off + 128], "Root Entry", 5, END, 0);
+        write_entry(
+            &mut img[dir_off + 128..dir_off + 256],
+            "Workbook",
+            2,
+            sector_order[0],
+            payload.len() as u32,
+        );
+
+        // FAT sector
+        let fat_off = (fat_sid as usize + 1) * sector_size;
+        for i in 0..(sector_size / 4) {
+            img[fat_off + i * 4..fat_off + i * 4 + 4].copy_from_slice(&FREE.to_le_bytes());
+        }
+        for w in sector_order.windows(2) {
+            let p = fat_off + w[0] as usize * 4;
+            img[p..p + 4].copy_from_slice(&w[1].to_le_bytes());
+        }
+        let last_p = fat_off + *sector_order.last().unwrap() as usize * 4;
+        img[last_p..last_p + 4].copy_from_slice(&END.to_le_bytes());
+        let dir_p = fat_off + dir_sid as usize * 4;
+        img[dir_p..dir_p + 4].copy_from_slice(&END.to_le_bytes());
+        let fat_p = fat_off + fat_sid as usize * 4;
+        img[fat_p..fat_p + 4].copy_from_slice(&0xFFFF_FFFDu32.to_le_bytes());
+
+        img
+    }
+
+    #[test]
+    fn coalesced_fat_reads_contiguous_fragmented_and_unaligned_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        // 5000 bytes (> 4096 mini_cutoff, unaligned to 512B -> 10 sectors, last sector partial)
+        let payload: Vec<u8> = (0..5000usize).map(|i| ((i * 31 + 7) & 0xFF) as u8).collect();
+
+        // 1) Pure contiguous run 0..10
+        let p1 = dir.path().join("contiguous.xls");
+        std::fs::write(&p1, build_synthetic_cfb(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], &payload)).unwrap();
+        assert_eq!(read_workbook_stream_file(&p1).unwrap(), payload);
+
+        // 2) Mixed contiguous runs & jumps: [0,1,2] -> [6,7] -> [3,4,5] -> [9] -> [8]
+        let p2 = dir.path().join("fragmented.xls");
+        std::fs::write(&p2, build_synthetic_cfb(&[0, 1, 2, 6, 7, 3, 4, 5, 9, 8], &payload)).unwrap();
+        assert_eq!(read_workbook_stream_file(&p2).unwrap(), payload);
+
+        // 3) Truncated stream whose last FAT sector lies past EOF stops cleanly without panic
+        let mut trunc_img = build_synthetic_cfb(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], &payload);
+        // Point sector 9 to an out-of-bounds sector 99 and claim size 6000
+        let dir_off = (10usize + 1) * 512;
+        trunc_img[dir_off + 128 + 120..dir_off + 128 + 124].copy_from_slice(&6000u32.to_le_bytes());
+        let fat_off = (11usize + 1) * 512;
+        trunc_img[fat_off + 9 * 4..fat_off + 9 * 4 + 4].copy_from_slice(&99u32.to_le_bytes());
+        let p3 = dir.path().join("truncated.xls");
+        std::fs::write(&p3, &trunc_img).unwrap();
+        let got = read_workbook_stream_file(&p3).unwrap();
+        assert_eq!(got.len(), 10 * 512);
+        assert_eq!(&got[..5000], payload.as_slice());
     }
 }

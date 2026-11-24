@@ -273,6 +273,17 @@ impl<T> CellSet<T> {
             self.0 = Default::default();
         }
     }
+
+    #[inline]
+    pub fn remove_if_present(&mut self, value: &T) -> bool
+    where
+        T: Eq + std::hash::Hash + Clone,
+    {
+        if self.0.is_empty() || !self.0.contains(value) {
+            return false;
+        }
+        std::sync::Arc::make_mut(&mut self.0).remove(value)
+    }
 }
 
 impl<T> std::ops::Deref for CellSet<T> {
@@ -954,9 +965,7 @@ impl Sheet {
         // 往溢出区里写东西 = 用户覆盖：从这个集合里摘掉，重算时才会判成 #SPILL!，
         // 而不是被 clear_spills 当成旧溢出值删掉（那会静默吞掉用户输入）。
         // 溢出写回自己是先 set 再 insert，顺序不受影响。
-        if !self.spilled.is_empty() {
-            self.spilled.remove(&key);
-        }
+        self.spilled.remove_if_present(&key);
         if cell.is_blank() {
             if self.cells.remove(r, c).is_some() {
                 self.cleared.insert(key);
@@ -1207,7 +1216,7 @@ impl Sheet {
         }
         for k in self.spilled.symmetric_difference(&before.spilled).filter(|k| !in_target(**k)) {
             if self.spilled.contains(k) { prepared.spilled.insert(*k); }
-            else { prepared.spilled.remove(k); }
+            else { prepared.spilled.remove_if_present(k); }
         }
         if prepared.styles_dirty {
             for k in self.styles.changed_keys(&before.styles) {
@@ -1413,7 +1422,9 @@ impl Sheet {
             self.col_styles_dirty = true;
         }
         if id == 0 {
-            self.col_styles.remove(&c);
+            if self.col_styles.contains_key(&c) {
+                self.col_styles.remove(&c);
+            }
         } else {
             self.col_styles.insert(c, id);
         }
@@ -1423,7 +1434,9 @@ impl Sheet {
     pub fn set_col_style_loaded(&mut self, c: u32, id: u16) {
         self.display_style_revision = next_sheet_identity();
         if id == 0 {
-            self.col_styles.remove(&c);
+            if self.col_styles.contains_key(&c) {
+                self.col_styles.remove(&c);
+            }
         } else {
             self.col_styles.insert(c, id);
         }
@@ -1438,7 +1451,9 @@ impl Sheet {
             self.row_styles_dirty = true;
         }
         if id == 0 {
-            self.row_styles.remove(&r);
+            if self.row_styles.contains_key(&r) {
+                self.row_styles.remove(&r);
+            }
         } else {
             self.row_styles.insert(r, id);
         }
@@ -1448,7 +1463,9 @@ impl Sheet {
     pub fn set_row_style_loaded(&mut self, r: u32, id: u16) {
         self.display_style_revision = next_sheet_identity();
         if id == 0 {
-            self.row_styles.remove(&r);
+            if self.row_styles.contains_key(&r) {
+                self.row_styles.remove(&r);
+            }
         } else {
             self.row_styles.insert(r, id);
         }
@@ -1805,6 +1822,28 @@ mod tests {
         assert_eq!(Value::Number(42.0).display(), "42");
         assert_eq!(Value::Number(3.5).display(), "3.5");
         assert_eq!(Value::Number(0.1 + 0.2).display(), "0.3");
+    }
+
+    #[test]
+    fn cell_set_remove_if_present_preserves_cow_when_absent() {
+        let mut sh = Sheet::new("SpillCow");
+        for r in 0..16u32 {
+            sh.spilled.insert(CellRef::new(r, 1));
+        }
+        let snap = sh.clone();
+        assert!(sh.spilled.ptr_eq(&snap.spilled));
+
+        // Writing outside `spilled` must NOT break CoW sharing of `spilled`.
+        sh.set(100, 0, Cell { value: Value::Number(42.0), formula: None });
+        assert!(sh.spilled.ptr_eq(&snap.spilled));
+        assert!(!sh.spilled.remove_if_present(&CellRef::new(999, 9)));
+        assert!(sh.spilled.ptr_eq(&snap.spilled));
+
+        // Writing onto a spilled cell must detach and remove that entry.
+        sh.set(5, 1, Cell { value: Value::Number(7.0), formula: None });
+        assert!(!sh.spilled.ptr_eq(&snap.spilled));
+        assert!(!sh.spilled.contains(&CellRef::new(5, 1)));
+        assert!(snap.spilled.contains(&CellRef::new(5, 1)));
     }
 }
 
