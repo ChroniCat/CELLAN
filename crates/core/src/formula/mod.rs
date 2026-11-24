@@ -76,7 +76,7 @@ pub enum Node {
         name: String,
     },
     Number(f64),
-    Text(String),
+    Text(std::sync::Arc<str>),
     Bool(bool),
     Err(ErrKind),
     Ref(RefExpr),
@@ -566,7 +566,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Node, ErrKind> {
         match self.next() {
             Some(Tok::Num(n)) => Ok(Node::Number(n)),
-            Some(Tok::Str(s)) => Ok(Node::Text(s)),
+            Some(Tok::Str(s)) => Ok(Node::Text(s.into())),
             Some(Tok::LParen) => {
                 let e = self.parse_expr()?;
                 if !self.eat(&Tok::RParen) {
@@ -959,20 +959,32 @@ impl NameIndex {
 pub(super) struct FastScope {
     packed: FxHashSet<PackedCellKey>,
     fallback: FxHashSet<deps::CellKey>,
+    dirty_cols: FxHashSet<(usize, u32)>,
 }
 
 impl FastScope {
     pub(super) fn from_std(scope: &HashSet<deps::CellKey>) -> Self {
         let mut packed = FxHashSet::with_capacity_and_hasher(scope.len(), FxBuildHasher);
         let mut fallback = FxHashSet::default();
+        let mut dirty_cols = FxHashSet::default();
         for &k in scope {
+            dirty_cols.insert((k.0, k.2));
             if let Some(pk) = PackedCellKey::pack(k) {
                 packed.insert(pk);
             } else {
                 fallback.insert(k);
             }
         }
-        Self { packed, fallback }
+        Self {
+            packed,
+            fallback,
+            dirty_cols,
+        }
+    }
+
+    #[inline]
+    pub(super) fn col_may_be_dirty(&self, si: usize, col: u32) -> bool {
+        self.dirty_cols.contains(&(si, col))
     }
 
     #[inline]
@@ -1092,6 +1104,8 @@ struct SharedCacheShard {
     cond_cols: FxHashMap<RangeKey, conditional_index::ColumnIndex>,
     criteria: FxHashMap<CriteriaKey, FValue>,
     ext_lookups: FxHashMap<(usize, usize, i64, i64, i64, i64, bool), lookup_cache::Index>,
+    ext_ranges: FxHashMap<(usize, usize, u32, u32, u32, u32), std::sync::Arc<Vec<FValue>>>,
+    ext_range_vals: usize,
 }
 
 pub(crate) struct SharedCalcCaches {
@@ -1228,54 +1242,6 @@ impl SharedCalcCaches {
         }
     }
 
-    fn get_or_build_ordered_from_cond(
-        &self,
-        wb: &Workbook,
-        scope: Option<&HashSet<deps::CellKey>>,
-        val_range: Option<RangeKey>,
-        cond_range: RangeKey,
-        need_minmax: bool,
-    ) -> (Option<std::sync::Arc<conditional_index::BuiltOrdered>>, usize) {
-        if let Some(hit) = self.get_ordered(val_range, cond_range, need_minmax) {
-            return (Some(hit), 0);
-        }
-        let _guard = self.ordered_cond_mu.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = self.get_ordered(val_range, cond_range, need_minmax) {
-            return (Some(hit), 0);
-        }
-        let mut total_reads = 0usize;
-        let get_col = |rk: RangeKey, reads_acc: &mut usize| -> Option<std::sync::Arc<lookup_cache::SharedCondColumn>> {
-            let (si_c, r1_c, c1_c, r2_c, c2_c) = rk;
-            if c1_c != c2_c || (r2_c - r1_c + 1) < 256 {
-                return None;
-            }
-            let sheet = wb.sheets.get(si_c)?;
-            let (sc, r) = sheet.shared_lookup.get_or_build_cond_column(sheet, rk, scope)?;
-            *reads_acc += r;
-            Some(sc)
-        };
-        let Some(cond_sc) = get_col(cond_range, &mut total_reads) else {
-            return (None, total_reads);
-        };
-        let val_sc = match val_range {
-            Some(vr) => match get_col(vr, &mut total_reads) {
-                Some(sc) => Some(sc),
-                None => return (None, total_reads),
-            },
-            None => None,
-        };
-        let built = conditional_index::BuiltOrdered::build_from_cond(
-            &cond_sc,
-            val_sc.as_deref(),
-            need_minmax,
-        )
-        .map(std::sync::Arc::new);
-        if let Some(ref b) = built {
-            self.put_ordered(val_range, cond_range, need_minmax, b.clone());
-        }
-        (built, total_reads)
-    }
-
     fn get_cond_col(&self, rk: RangeKey) -> Option<conditional_index::ColumnIndex> {
         self.shard_of(&rk).read().ok()?.cond_cols.get(&rk).cloned()
     }
@@ -1347,6 +1313,116 @@ impl SharedCalcCaches {
             g.ext_lookups.entry(key).or_insert_with(|| ix.clone());
         }
     }
+
+    fn get_ext_range(
+        &self,
+        key: &(usize, usize, u32, u32, u32, u32),
+    ) -> Option<std::sync::Arc<Vec<FValue>>> {
+        self.shard_of(key).read().ok()?.ext_ranges.get(key).cloned()
+    }
+
+    fn put_ext_range(
+        &self,
+        key: (usize, usize, u32, u32, u32, u32),
+        vals: &std::sync::Arc<Vec<FValue>>,
+    ) {
+        const SHARD_VAL_CAP: usize = 1_048_576;
+        if vals.len() > SHARD_VAL_CAP {
+            return;
+        }
+        if let Ok(mut g) = self.shard_of(&key).write() {
+            if g.ext_ranges.contains_key(&key) {
+                return;
+            }
+            if g.ext_range_vals + vals.len() > SHARD_VAL_CAP {
+                g.ext_ranges.clear();
+                g.ext_range_vals = 0;
+            }
+            g.ext_range_vals += vals.len();
+            g.ext_ranges.insert(key, vals.clone());
+        }
+    }
+}
+
+#[inline]
+pub(super) fn sum_f64_8way(slice: &[f64]) -> f64 {
+    let mut acc = [0.0f64; 8];
+    let mut chunks = slice.chunks_exact(8);
+    for c in &mut chunks {
+        acc[0] += c[0];
+        acc[1] += c[1];
+        acc[2] += c[2];
+        acc[3] += c[3];
+        acc[4] += c[4];
+        acc[5] += c[5];
+        acc[6] += c[6];
+        acc[7] += c[7];
+    }
+    let mut rem = 0.0f64;
+    for &x in chunks.remainder() {
+        rem += x;
+    }
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + ((acc[6] + acc[7]) + rem))
+}
+
+#[inline]
+pub(super) fn min_f64_4way(slice: &[f64]) -> f64 {
+    let mut acc = [f64::INFINITY; 4];
+    let mut chunks = slice.chunks_exact(4);
+    for c in &mut chunks {
+        acc[0] = acc[0].min(c[0]);
+        acc[1] = acc[1].min(c[1]);
+        acc[2] = acc[2].min(c[2]);
+        acc[3] = acc[3].min(c[3]);
+    }
+    let mut out = acc[0].min(acc[1]).min(acc[2].min(acc[3]));
+    for &x in chunks.remainder() {
+        out = out.min(x);
+    }
+    out
+}
+
+#[inline]
+pub(super) fn max_f64_4way(slice: &[f64]) -> f64 {
+    let mut acc = [f64::NEG_INFINITY; 4];
+    let mut chunks = slice.chunks_exact(4);
+    for c in &mut chunks {
+        acc[0] = acc[0].max(c[0]);
+        acc[1] = acc[1].max(c[1]);
+        acc[2] = acc[2].max(c[2]);
+        acc[3] = acc[3].max(c[3]);
+    }
+    let mut out = acc[0].max(acc[1]).max(acc[2].max(acc[3]));
+    for &x in chunks.remainder() {
+        out = out.max(x);
+    }
+    out
+}
+
+#[inline]
+pub(super) fn dot_f64_8way(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    let a = &a[..n];
+    let b = &b[..n];
+    let mut acc = [0.0f64; 8];
+    let mut i = 0usize;
+    while i + 8 <= n {
+        acc[0] += a[i] * b[i];
+        acc[1] += a[i + 1] * b[i + 1];
+        acc[2] += a[i + 2] * b[i + 2];
+        acc[3] += a[i + 3] * b[i + 3];
+        acc[4] += a[i + 4] * b[i + 4];
+        acc[5] += a[i + 5] * b[i + 5];
+        acc[6] += a[i + 6] * b[i + 6];
+        acc[7] += a[i + 7] * b[i + 7];
+        i += 8;
+    }
+    let mut rem = 0.0f64;
+    while i < n {
+        rem += a[i] * b[i];
+        i += 1;
+    }
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + ((acc[6] + acc[7]) + rem))
 }
 
 fn named_definition(wb: &Workbook, name: &str, si: usize, scoped: bool) -> Option<usize> {
@@ -1359,12 +1435,44 @@ fn named_definition(wb: &Workbook, name: &str, si: usize, scoped: bool) -> Optio
     global
 }
 
+#[derive(Clone, Copy)]
+struct BatchResults<'a> {
+    values: &'a [(usize, u32, u32, FValue)],
+    pending: &'a [usize],
+}
+
+impl<'a> BatchResults<'a> {
+    #[inline]
+    fn find_ready_slot(&self, key: deps::CellKey) -> Option<usize> {
+        let slot = self
+            .values
+            .binary_search_by_key(&key, |&(si, r, c, _)| (si, r, c))
+            .ok()?;
+        if !self.pending.is_empty() && self.pending.binary_search(&slot).is_ok() {
+            return None;
+        }
+        Some(slot)
+    }
+
+    #[inline]
+    fn is_ready(&self, key: deps::CellKey) -> bool {
+        self.find_ready_slot(key).is_some()
+    }
+
+    #[inline]
+    fn get(&self, key: deps::CellKey) -> Option<&'a FValue> {
+        let slot = self.find_ready_slot(key)?;
+        Some(&self.values[slot].3)
+    }
+}
+
 pub struct Calc<'a> {
     wb: &'a Workbook,
     ctx: functions::EvalCtx,
     restore_tls: bool,
     shared: Option<&'a SharedCalcCaches>,
     parallel_values: Option<dependency_batch::ParallelValues<'a>>,
+    batch_results: Option<BatchResults<'a>>,
     memo: FxHashMap<PackedCellKey, FValue>,
     memo_overflow: FxHashMap<deps::CellKey, FValue>,
     visiting: FxHashSet<PackedCellKey>,
@@ -1395,6 +1503,7 @@ pub struct Calc<'a> {
     range_cache: FxHashMap<RangeKey, (std::sync::Arc<Vec<FValue>>, u64)>,
     /// 每张表的实际使用范围（最大行、最大列）
     bounds: FxHashMap<usize, (u32, u32)>,
+    col_bounds: FxHashMap<(usize, u32), u32>,
     ext_bounds: FxHashMap<(usize, usize), (u32, u32)>,
     ext_range_cache: FxHashMap<(usize, usize, u32, u32, u32, u32), std::sync::Arc<Vec<FValue>>>,
     ext_lookup_index: FxHashMap<(usize, usize, i64, i64, i64, i64, bool), lookup_cache::Index>,
@@ -1406,6 +1515,10 @@ pub struct Calc<'a> {
     /// 增量重算的范围：不在其中的公式单元格一律用缓存值
     scope: Option<&'a std::collections::HashSet<self::deps::CellKey>>,
     pub(super) fast_scope: Option<&'a FastScope>,
+    pub(super) cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    pub(super) deadline: Option<std::time::Instant>,
+    pub(super) aborted: bool,
+    pub(super) deps_watch: Option<&'a self::deps::Deps>,
     /// 区域物化实际读取的单元格数（测试/诊断用）
     pub range_reads: usize,
     /// 区域聚合结果缓存
@@ -1568,6 +1681,7 @@ impl<'a> Calc<'a> {
             restore_tls,
             shared,
             parallel_values: None,
+            batch_results: None,
             memo: FxHashMap::default(),
             memo_overflow: FxHashMap::default(),
             visiting: FxHashSet::default(),
@@ -1580,6 +1694,7 @@ impl<'a> Calc<'a> {
             array_index: None,
             range_cache: FxHashMap::default(),
             bounds: FxHashMap::default(),
+            col_bounds: FxHashMap::default(),
             ext_bounds: FxHashMap::default(),
             ext_range_cache: FxHashMap::default(),
             ext_lookup_index: FxHashMap::default(),
@@ -1588,6 +1703,10 @@ impl<'a> Calc<'a> {
             position_count: 0,
             scope,
             fast_scope: None,
+            cancel: None,
+            deadline: None,
+            aborted: false,
+            deps_watch: None,
             scheduling: false,
             requested: None,
             range_remainder: None,
@@ -1618,21 +1737,55 @@ impl<'a> Calc<'a> {
     }
 
     #[inline]
-    pub(super) fn has_memo(&self, key: deps::CellKey) -> bool {
-        if let Some(pk) = PackedCellKey::pack(key) {
+    pub(super) fn check_abort(&mut self) -> bool {
+        if self.aborted {
+            return true;
+        }
+        if self
+            .cancel
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            || self
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            self.aborted = true;
+            return true;
+        }
+        false
+    }
+
+    #[inline]
+    fn ready_dirty_value_at(&self, si: usize, abs_row: u32, col: u32) -> Option<crate::Value> {
+        let k = (si, abs_row, col);
+        if let Some(m) = self.get_memo(k) {
+            return Some(from_fvalue(&m.scalar()));
+        }
+        if let Some(pv) = self.parallel_values
+            && let Some(v) = pv.get(k)
+        {
+            return Some(from_fvalue(&v.scalar()));
+        }
+        None
+    }
+
+    #[inline]
+    fn has_memo(&self, key: deps::CellKey) -> bool {
+        let in_local = if let Some(pk) = PackedCellKey::pack(key) {
             self.memo.contains_key(&pk)
         } else {
             self.memo_overflow.contains_key(&key)
-        }
+        };
+        in_local || self.batch_results.is_some_and(|br| br.is_ready(key))
     }
 
     #[inline]
     fn get_memo(&self, key: deps::CellKey) -> Option<&FValue> {
-        if let Some(pk) = PackedCellKey::pack(key) {
+        let local = if let Some(pk) = PackedCellKey::pack(key) {
             self.memo.get(&pk)
         } else {
             self.memo_overflow.get(&key)
-        }
+        };
+        local.or_else(|| self.batch_results.and_then(|br| br.get(key)))
     }
 
     #[inline]
@@ -1864,6 +2017,19 @@ impl<'a> Calc<'a> {
                 cols,
             });
         }
+        if let Some(shared) = self.shared
+            && let Some(cached) = shared.get_ext_range(&ekey)
+        {
+            if self.ext_range_cache.len() >= 16 {
+                self.ext_range_cache.clear();
+            }
+            self.ext_range_cache.insert(ekey, cached.clone());
+            return Ok(Arg::Range {
+                values: cached,
+                rows,
+                cols,
+            });
+        }
         let link = &self.wb.links[li];
         let mut vals = vec![FValue::Empty; rows * cols];
         for (&(_, r, c), v) in link.cache.range((slot, r1, c1)..=(slot, r2, c2)) {
@@ -1873,6 +2039,9 @@ impl<'a> Calc<'a> {
         }
         let arc_vals = std::sync::Arc::new(vals);
         if rows * cols <= 1_000_000 {
+            if let Some(shared) = self.shared {
+                shared.put_ext_range(ekey, &arc_vals);
+            }
             if self.ext_range_cache.len() >= 16 {
                 self.ext_range_cache.clear();
             }
@@ -2191,6 +2360,7 @@ impl<'a> Calc<'a> {
 
     pub(super) fn cell_value_inner(&mut self, si: usize, r: u32, c: u32, evaluate: bool) -> FValue {
         if self.requested.is_some() { return FValue::Error(ErrKind::Ref); }
+        if self.check_abort() { return FValue::Error(ErrKind::Value); }
         let key = (si, r, c);
         if (!self.memo.is_empty() || !self.memo_overflow.is_empty())
             && let Some(v) = self.get_memo(key)
@@ -2208,6 +2378,11 @@ impl<'a> Calc<'a> {
         };
         if let Some(pv) = self.parallel_values
             && let Some(fv) = pv.get(key)
+        {
+            return fv.clone();
+        }
+        if let Some(br) = self.batch_results
+            && let Some(fv) = br.get(key)
         {
             return fv.clone();
         }
@@ -2245,6 +2420,9 @@ impl<'a> Calc<'a> {
         self.ref_offset = (0, 0);
         if !self.volatile_counts.is_empty() {
             self.volatile_counts.remove(&key);
+        }
+        if let Some(dw) = self.deps_watch {
+            dw.clear_dynamic_watch(key);
         }
         let eval_dispatch = |this: &mut Self, node: &Node, dr: i64, dc: i64, kind: compiled::ScalarKind| {
             let fast = if this.env_stack.is_empty() {
@@ -2291,7 +2469,7 @@ impl<'a> Calc<'a> {
         }
         (self.cur_sheet, self.cur, self.ref_offset) = previous;
         self.remove_visiting(key);
-        if self.requested.is_none() {
+        if self.requested.is_none() && !self.aborted {
             self.insert_memo(key, v.clone());
         }
         v
@@ -2455,7 +2633,10 @@ impl<'a> Calc<'a> {
             }
         }
         let mut values = vec![FValue::Empty; length];
-        for p in &pages {
+        for (pi, p) in pages.iter().enumerate() {
+            if (pi & 31) == 31 && self.check_abort() {
+                return None;
+            }
             let page_base = p.page * crate::store::PAGE_ROWS;
             match p.cells.as_ref() {
                 crate::store::ColSlab::Numbers(ns) => {
@@ -2531,12 +2712,23 @@ impl<'a> Calc<'a> {
             }
             return Ok(self.cache_put(key, arc));
         }
+        if self.aborted {
+            return Err(ErrKind::Value);
+        }
         let mut values = Vec::with_capacity(length);
         let (si, r1, c1, r2, c2) = key;
+        let mut step = 0usize;
         for row in r1..=r2 {
             for col in c1..=c2 {
+                if (step & 8191) == 8191 && self.check_abort() {
+                    return Err(ErrKind::Value);
+                }
+                step += 1;
                 self.range_reads += 1;
                 values.push(self.cell_value(si, row as u32, col as u32).scalar());
+                if self.aborted {
+                    return Err(ErrKind::Value);
+                }
                 if self.requested.is_some() {
                     self.range_remainder = Some(RangeRemainder { range: key, offsets: values.len()..length });
                     return Err(ErrKind::Ref);
@@ -2544,10 +2736,13 @@ impl<'a> Calc<'a> {
             }
         }
         let arc = std::sync::Arc::new(values);
-        if let Some(shared) = self.shared {
-            shared.put_range(key, &arc);
+        if !self.aborted {
+            if let Some(shared) = self.shared {
+                shared.put_range(key, &arc);
+            }
+            return Ok(self.cache_put(key, arc));
         }
-        Ok(self.cache_put(key, arc))
+        Ok(arc)
     }
 
     fn range_values_coords(&mut self, si: usize, ar: i64, ac: i64, br: i64, bc: i64) -> Result<Arg, ErrKind> {
@@ -2793,7 +2988,7 @@ impl<'a> Calc<'a> {
                 FValue::Error(ErrKind::Name)
             }
             Node::Number(n) => FValue::Number(*n),
-            Node::Text(s) => FValue::Text(s.as_str().into()),
+            Node::Text(s) => FValue::Text(s.clone()),
             Node::Bool(b) => FValue::Bool(*b),
             Node::Err(e) => FValue::Error(*e),
             Node::Implicit(e) => self.implicit_value(e, si),
@@ -3317,6 +3512,16 @@ impl<'a> Calc<'a> {
                                 Ok(i) => i,
                                 Err(e) => return FValue::Error(e),
                             };
+                            if let Some(dw) = self.deps_watch {
+                                dw.record_dynamic_watch(
+                                    (self.cur_sheet, self.cur.0, self.cur.1),
+                                    idx,
+                                    ra.row,
+                                    ra.col,
+                                    rb.row,
+                                    rb.col,
+                                );
+                            }
                             match self.range_values_coords(idx, ra.row, ra.col, rb.row, rb.col) {
                                 Ok(Arg::Range { values, rows, cols }) => FValue::Array(
                                     std::sync::Arc::new(value::Array::from_shared(rows, cols, values)),
@@ -3331,6 +3536,16 @@ impl<'a> Calc<'a> {
                     match parse_a1(rest.trim()) {
                         Some(re) => match self.sheet_index(sheet, si) {
                             Ok(idx) if re.row >= 0 && re.col >= 0 => {
+                                if let Some(dw) = self.deps_watch {
+                                    dw.record_dynamic_watch(
+                                        (self.cur_sheet, self.cur.0, self.cur.1),
+                                        idx,
+                                        re.row,
+                                        re.col,
+                                        re.row,
+                                        re.col,
+                                    );
+                                }
                                 self.cell_value(idx, re.row as u32, re.col as u32).scalar()
                             }
                             _ => FValue::Error(ErrKind::Ref),
@@ -3370,6 +3585,16 @@ impl<'a> Calc<'a> {
                     Ok(i) => i,
                     Err(e) => return FValue::Error(e),
                 };
+                if let Some(dw) = self.deps_watch {
+                    dw.record_dynamic_watch(
+                        (self.cur_sheet, self.cur.0, self.cur.1),
+                        idx,
+                        r0,
+                        c0,
+                        r0 + h - 1,
+                        c0 + w - 1,
+                    );
+                }
                 match self.range_values_coords(idx, r0, c0, r0 + h - 1, c0 + w - 1) {
                     Ok(Arg::Range { values, rows, cols }) => FValue::Array(
                         std::sync::Arc::new(value::Array::from_shared(rows, cols, values)),
@@ -3450,10 +3675,22 @@ impl<'a> Calc<'a> {
                 };
                 self.eval_lookup_fast(id, key, lr, nodes, si)
             }
-            // ============ 区域聚合缓存 + 零物化流式 COUNTIF / 单列聚合
+            // ============ SUMPRODUCT 列式零拷贝切片点积快路径
+            FuncId::SumProduct
+                if (2..=4).contains(&nodes.len())
+                    && (self.env_stack.is_empty()
+                        || !self.env_stack.iter().rev().any(|m| m.contains_key("SUMPRODUCT"))) =>
+            {
+                if let Some(v) = self.try_stream_sumproduct(nodes, si) {
+                    return v;
+                }
+                self.call_generic_id(id, name.as_str(), nodes, si)
+            }
+            // ============ 区域聚合缓存 + 零物化流式 COUNTIF / 单列及二维/多参聚合
             FuncId::Sum
             | FuncId::SumIf
             | FuncId::CountIf
+            | FuncId::Count
             | FuncId::CountA
             | FuncId::Average
             | FuncId::Max
@@ -3464,8 +3701,19 @@ impl<'a> Calc<'a> {
             {
                 let simple = matches!(
                     id,
-                    FuncId::Sum | FuncId::CountA | FuncId::Average | FuncId::Max | FuncId::Min
+                    FuncId::Sum
+                        | FuncId::Count
+                        | FuncId::CountA
+                        | FuncId::Average
+                        | FuncId::Max
+                        | FuncId::Min
                 );
+                if simple && nodes.len() > 1 {
+                    if let Some(streamed) = self.try_stream_multi_arg_agg(id, nodes, si) {
+                        return streamed;
+                    }
+                    return self.call_generic_id(id, name.as_str(), nodes, si);
+                }
                 let ok_arity = if simple { nodes.len() == 1 } else { nodes.len() >= 2 };
                 if ok_arity {
                     if let Some(rr) = self.resolve_range_node(&nodes[0], si) {
@@ -3517,7 +3765,8 @@ impl<'a> Calc<'a> {
                                 FuncId::CountA => 4,
                                 FuncId::Average => 5,
                                 FuncId::Max => 6,
-                                _ => 7,
+                                FuncId::Min => 7,
+                                _ => 8,
                             },
                             crit,
                         };
@@ -3539,14 +3788,25 @@ impl<'a> Calc<'a> {
                             return streamed;
                         }
                         let out = match id {
-                            FuncId::Sum | FuncId::CountA | FuncId::Average | FuncId::Max | FuncId::Min => {
+                            FuncId::Sum
+                            | FuncId::Count
+                            | FuncId::CountA
+                            | FuncId::Average
+                            | FuncId::Max
+                            | FuncId::Min => {
                                 let (rows, cols, data) = self.cached_grid_coords(si2, rr.r1(), rr.c1(), rr.r2(), rr.c2());
                                 let range = Arg::Range { values: data, rows, cols };
                                 functions::call_id_in(self.ctx, id, name.as_str(), &[range])
                             }
                             FuncId::CountIf => {
                                 let c = functions::Crit::parse(&key.crit);
-                                let gk = self.grid_key_coords(si2, rr.r1(), rr.c1(), rr.r2(), rr.c2());
+                                let gk = self.grid_key_coords(si2, rr.r1(), rr.c1(), rr.r2(), rr.c2()).map(|mut g| {
+                                    if g.2 == g.4 && (g.3 - g.1) >= 255 && !c.matches(&FValue::Empty) {
+                                        let cm = self.col_max_row(si2, g.2 as u32);
+                                        g.3 = aligned_col_end_row(g.1, cm, g.3);
+                                    }
+                                    g
+                                });
                                 if self.requested.is_none()
                                     && let Some(gk) = gk
                                     && let Some(ix) = self.count_indexes.lookup_ready(gk, &c)
@@ -3573,7 +3833,18 @@ impl<'a> Calc<'a> {
                                 }
                             }
                             _ => {
-                                // SUMIF
+                                // SUMIF: route through persistent SharedCondColumn + OrderedCriteria / sorted_nums / text_dict first!
+                                if let Some(fast_sumif) =
+                                    self.try_eval_sumif_cond_col(range_tuple, sum_spec, &key.crit)
+                                {
+                                    if let Some(start) = t0 {
+                                        prof_record(&format!("{name}#agg"), start.elapsed().as_secs_f64());
+                                    }
+                                    if self.requested.is_none() {
+                                        self.agg_cache.insert(key, fast_sumif.clone());
+                                    }
+                                    return fast_sumif;
+                                }
                                 let c = functions::Crit::parse(&key.crit);
                                 let gk = self.grid_key_coords(si2, rr.r1(), rr.c1(), rr.r2(), rr.c2());
                                 // Fast zero-materialization path for text criteria on pure-numeric columns:
@@ -3909,11 +4180,26 @@ impl<'a> Calc<'a> {
             if col_idx == 0 || col_idx > limit {
                 return FValue::Error(ErrKind::Ref);
             }
-            let (sr1, sc1, sr2, sc2) = if vertical {
-                (r1, c1, lr2, c1)
+            let (sr1, sc1, mut sr2, sc2) = if vertical {
+                let mut eff_sr2 = lr2;
+                if (r1 == 0 && eff_sr2 == 1_048_575)
+                    || (eff_sr2 - r1 + 1).saturating_mul(lc2 - c1 + 1) > 200_000
+                {
+                    eff_sr2 = eff_sr2.min(max_r as i64).max(r1);
+                }
+                (r1, c1, eff_sr2, c1)
             } else {
                 (r1, c1, r1, lc2)
             };
+            if vertical
+                && ext_target.is_none()
+                && !matches!(key, FValue::Empty)
+                && (sr2 - sr1) >= 256
+                && c1 >= 0
+            {
+                let cm = self.col_max_row(idx, c1 as u32);
+                sr2 = aligned_col_end_row(sr1, cm, sr2);
+            }
             let best = if approx {
                 if ext_target.is_some() {
                     let Ok(Arg::Range { values, rows: s_rows, cols: s_cols }) =
@@ -4000,16 +4286,34 @@ impl<'a> Calc<'a> {
                 return FValue::Error(ErrKind::Ref);
             }
             let vertical = !(raw_rows == 1 && raw_cols > 1);
+            let mut eff_lr2 = lr2;
+            if ext_target.is_none() {
+                if (lr1 == 0 && eff_lr2 == 1_048_575)
+                    || (eff_lr2 - lr1 + 1).saturating_mul(lc2 - lc1 + 1) > 200_000
+                {
+                    let (max_r, _) = self.sheet_bounds(idx);
+                    eff_lr2 = eff_lr2.min(max_r as i64).max(lr1);
+                }
+                if vertical
+                    && lc1 == lc2
+                    && lc1 >= 0
+                    && !matches!(key, FValue::Empty)
+                    && (eff_lr2 - lr1) >= 256
+                {
+                    let cm = self.col_max_row(idx, lc1 as u32);
+                    eff_lr2 = aligned_col_end_row(lr1, cm, eff_lr2);
+                }
+            }
             if mode == 0.0 && (search_mode == 1 || search_mode == -1) && !(id == FuncId::Match && has_wildcard) {
                 let lk = lookup_cache::LookupKey::from_fvalue(&key);
                 let hit = if let Some((li, slot)) = ext_target {
                     let ix = self.ext_lookup_hash_coords(li, slot, lr1, lc1, lr2, lc2, vertical);
                     if search_mode == -1 { ix.get_last(&lk) } else { ix.get_first(&lk) }
                 } else {
-                    if self.grid_key_coords(idx, lr1, lc1, lr2, lc2).is_none() {
+                    if self.grid_key_coords(idx, lr1, lc1, eff_lr2, lc2).is_none() {
                         return FValue::Error(ErrKind::Ref);
                     }
-                    let ix = self.lookup_hash_coords(idx, lr1, lc1, lr2, lc2, vertical);
+                    let ix = self.lookup_hash_coords(idx, lr1, lc1, eff_lr2, lc2, vertical);
                     if search_mode == -1 { ix.get_last(&lk) } else { ix.get_first(&lk) }
                 };
                 return hit
@@ -4022,7 +4326,7 @@ impl<'a> Calc<'a> {
                     _ => return FValue::Error(ErrKind::Ref),
                 }
             } else {
-                self.cached_grid_coords(idx, lr1, lc1, lr2, lc2)
+                self.cached_grid_coords(idx, lr1, lc1, eff_lr2, lc2)
             };
             if rows == 0 || cols == 0 {
                 return FValue::Error(ErrKind::Ref);
@@ -4038,7 +4342,7 @@ impl<'a> Calc<'a> {
                         .unwrap_or(FValue::Error(ErrKind::Na));
                 }
                 let hit = if ext_target.is_none() {
-                    self.approximate_match((idx, lr1, lc1, lr2, lc2), &data, n, stride, &key, mode > 0.0)
+                    self.approximate_match((idx, lr1, lc1, eff_lr2, lc2), &data, n, stride, &key, mode > 0.0)
                 } else {
                     functions::xlookup_search(
                         &data,
@@ -4058,7 +4362,7 @@ impl<'a> Calc<'a> {
             }
             let mm = mode.trunc() as i64;
             let pos = if search_mode.abs() == 2 && ext_target.is_none() {
-                self.get_or_build_approx_positions((idx, lr1, lc1, lr2, lc2), &data, n, stride, &key)
+                self.get_or_build_approx_positions((idx, lr1, lc1, eff_lr2, lc2), &data, n, stride, &key)
             } else {
                 None
             };
@@ -4099,16 +4403,34 @@ impl<'a> Calc<'a> {
             return FValue::Error(ErrKind::Ref);
         }
         let vertical = !(raw_rows == 1 && raw_cols > 1);
+        let mut eff_lr2 = lr2;
+        if ext_target.is_none() {
+            if (lr1 == 0 && eff_lr2 == 1_048_575)
+                || (eff_lr2 - lr1 + 1).saturating_mul(lc2 - lc1 + 1) > 200_000
+            {
+                let (max_r, _) = self.sheet_bounds(idx);
+                eff_lr2 = eff_lr2.min(max_r as i64).max(lr1);
+            }
+            if vertical
+                && lc1 == lc2
+                && lc1 >= 0
+                && !matches!(key, FValue::Empty)
+                && (eff_lr2 - lr1) >= 256
+            {
+                let cm = self.col_max_row(idx, lc1 as u32);
+                eff_lr2 = aligned_col_end_row(lr1, cm, eff_lr2);
+            }
+        }
 
         let hit = if match_mode == 0 && (search_mode == 1 || search_mode == -1) {
             let lk = lookup_cache::LookupKey::from_fvalue(&key);
             if let Some((li, slot)) = ext_target {
                 let ix = self.ext_lookup_hash_coords(li, slot, lr1, lc1, lr2, lc2, vertical);
                 if search_mode == -1 { ix.get_last(&lk) } else { ix.get_first(&lk) }
-            } else if self.grid_key_coords(idx, lr1, lc1, lr2, lc2).is_none() {
+            } else if self.grid_key_coords(idx, lr1, lc1, eff_lr2, lc2).is_none() {
                 None
             } else {
-                let ix = self.lookup_hash_coords(idx, lr1, lc1, lr2, lc2, vertical);
+                let ix = self.lookup_hash_coords(idx, lr1, lc1, eff_lr2, lc2, vertical);
                 if search_mode == -1 { ix.get_last(&lk) } else { ix.get_first(&lk) }
             }
         } else {
@@ -4118,7 +4440,7 @@ impl<'a> Calc<'a> {
                     _ => return FValue::Error(ErrKind::Ref),
                 }
             } else {
-                self.cached_grid_coords(idx, lr1, lc1, lr2, lc2)
+                self.cached_grid_coords(idx, lr1, lc1, eff_lr2, lc2)
             };
             if rows == 0 || cols == 0 {
                 None
@@ -4126,7 +4448,7 @@ impl<'a> Calc<'a> {
                 let n = if vertical { rows } else { cols };
                 let stride = if vertical { cols } else { 1 };
                 let pos = if search_mode.abs() == 2 && ext_target.is_none() {
-                    self.get_or_build_approx_positions((idx, lr1, lc1, lr2, lc2), &data, n, stride, &key)
+                    self.get_or_build_approx_positions((idx, lr1, lc1, eff_lr2, lc2), &data, n, stride, &key)
                 } else {
                     None
                 };
@@ -4261,6 +4583,225 @@ impl<'a> Calc<'a> {
         }
     }
 
+    fn stream_rect_into_agg(
+        &mut self,
+        id: FuncId,
+        si: usize,
+        r1: u32,
+        c1: u32,
+        r2: u32,
+        c2: u32,
+        sum: &mut f64,
+        num_count: &mut usize,
+        non_empty: &mut usize,
+        min_v: &mut f64,
+        max_v: &mut f64,
+        earliest_err: &mut Option<((u32, u32), ErrKind)>,
+        reads: &mut usize,
+    ) -> bool {
+        let Some(sheet) = self.wb.sheets.get(si) else {
+            return false;
+        };
+        let ignore_err = matches!(id, FuncId::Count | FuncId::CountA);
+        let rows_per_col = (r2 - r1 + 1) as usize;
+        for col in c1..=c2 {
+            let pages = sheet.cf_pages((r1, col, r2, col));
+            for p in &pages {
+                let crate::store::ColSlab::Mixed(cs) = p.cells.as_ref() else {
+                    continue;
+                };
+                for ro in p.start..p.end {
+                    let cell = &cs[ro];
+                    if cell.formula.is_some() {
+                        let abs_row = p.page * crate::store::PAGE_ROWS + ro as u32;
+                        let k = (si, abs_row, col);
+                        if self.has_memo(k) {
+                            continue;
+                        }
+                        if self.parallel_values.is_some_and(|pv| pv.is_ready(k)) {
+                            continue;
+                        }
+                        let out_of_scope_valid =
+                            self.outside_scope(k) && !callable_cache_candidate(&cell.value);
+                        if !out_of_scope_valid {
+                            return false;
+                        }
+                    }
+                }
+            }
+            for (pi, p) in pages.iter().enumerate() {
+                if (pi & 31) == 31 && self.check_abort() {
+                    return false;
+                }
+                let page_base = p.page * crate::store::PAGE_ROWS;
+                match p.cells.as_ref() {
+                    crate::store::ColSlab::Numbers(ns) => {
+                        let span = p.end - p.start;
+                        if id == FuncId::CountA {
+                            *non_empty +=
+                                crate::store::NumberSlab::present_count_in(&ns.present, p.start, span);
+                        } else if id == FuncId::Count {
+                            *num_count +=
+                                crate::store::NumberSlab::present_count_in(&ns.present, p.start, span);
+                        } else if crate::store::NumberSlab::all_present_in(&ns.present, p.start, span)
+                        {
+                            *non_empty += span;
+                            *num_count += span;
+                            let slice = &ns.values[p.start..p.end];
+                            match id {
+                                FuncId::Sum | FuncId::Average => {
+                                    *sum += sum_f64_8way(slice);
+                                }
+                                FuncId::Max => {
+                                    *max_v = (*max_v).max(max_f64_4way(slice));
+                                }
+                                _ => {
+                                    *min_v = (*min_v).min(min_f64_4way(slice));
+                                }
+                            }
+                        } else {
+                            for ro in p.start..p.end {
+                                if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
+                                    let n = ns.values[ro];
+                                    *non_empty += 1;
+                                    *num_count += 1;
+                                    *sum += n;
+                                    *min_v = (*min_v).min(n);
+                                    *max_v = (*max_v).max(n);
+                                }
+                            }
+                        }
+                    }
+                    crate::store::ColSlab::Values(vs) => {
+                        for (off, val) in vs[p.start..p.end].iter().enumerate() {
+                            match val {
+                                crate::Value::Empty => {}
+                                crate::Value::Number(n) => {
+                                    *non_empty += 1;
+                                    *num_count += 1;
+                                    *sum += *n;
+                                    *min_v = (*min_v).min(*n);
+                                    *max_v = (*max_v).max(*n);
+                                }
+                                crate::Value::Error(e) => {
+                                    if id == FuncId::CountA {
+                                        *non_empty += 1;
+                                    } else if !ignore_err {
+                                        let pos = (page_base + (p.start + off) as u32, col);
+                                        if earliest_err.is_none_or(|(prev, _)| pos < prev) {
+                                            *earliest_err = Some((pos, *e));
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    *non_empty += 1;
+                                }
+                            }
+                        }
+                    }
+                    crate::store::ColSlab::Mixed(cs) => {
+                        for ro in p.start..p.end {
+                            let cell = &cs[ro];
+                            if cell.is_blank() {
+                                continue;
+                            }
+                            let abs_row = page_base + ro as u32;
+                            if cell.formula.is_none() {
+                                match &cell.value {
+                                    crate::Value::Empty => {}
+                                    crate::Value::Number(n) => {
+                                        *non_empty += 1;
+                                        *num_count += 1;
+                                        *sum += *n;
+                                        *min_v = (*min_v).min(*n);
+                                        *max_v = (*max_v).max(*n);
+                                    }
+                                    crate::Value::Error(e) => {
+                                        if id == FuncId::CountA {
+                                            *non_empty += 1;
+                                        } else if !ignore_err {
+                                            let pos = (abs_row, col);
+                                            if earliest_err.is_none_or(|(prev, _)| pos < prev) {
+                                                *earliest_err = Some((pos, *e));
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        *non_empty += 1;
+                                    }
+                                }
+                            } else {
+                                let k = (si, abs_row, col);
+                                let fv = if let Some(m) = self.get_memo(k) {
+                                    m.scalar()
+                                } else if let Some(pv) = self.parallel_values
+                                    && let Some(val) = pv.get(k)
+                                {
+                                    val.scalar()
+                                } else {
+                                    to_fvalue(&cell.value)
+                                };
+                                match fv {
+                                    FValue::Empty => {}
+                                    FValue::Number(n) => {
+                                        *non_empty += 1;
+                                        *num_count += 1;
+                                        *sum += n;
+                                        *min_v = (*min_v).min(n);
+                                        *max_v = (*max_v).max(n);
+                                    }
+                                    FValue::Error(e) => {
+                                        if id == FuncId::CountA {
+                                            *non_empty += 1;
+                                        } else if !ignore_err {
+                                            let pos = (abs_row, col);
+                                            if earliest_err.is_none_or(|(prev, _)| pos < prev) {
+                                                *earliest_err = Some((pos, e));
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        *non_empty += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            *reads += rows_per_col;
+        }
+        true
+    }
+
+    fn finish_streamed_agg(
+        id: FuncId,
+        sum: f64,
+        num_count: usize,
+        non_empty: usize,
+        min_v: f64,
+        max_v: f64,
+        earliest_err: Option<((u32, u32), ErrKind)>,
+    ) -> FValue {
+        if let Some((_, e)) = earliest_err {
+            return FValue::Error(e);
+        }
+        match id {
+            FuncId::Sum => FValue::number(sum),
+            FuncId::Count => FValue::number(num_count as f64),
+            FuncId::CountA => FValue::number(non_empty as f64),
+            FuncId::Average => {
+                if num_count == 0 {
+                    FValue::Error(ErrKind::Div0)
+                } else {
+                    FValue::number(sum / num_count as f64)
+                }
+            }
+            FuncId::Max => FValue::number(if num_count > 0 { max_v } else { 0.0 }),
+            _ => FValue::number(if num_count > 0 { min_v } else { 0.0 }),
+        }
+    }
+
     fn try_stream_single_col_agg(
         &mut self,
         id: FuncId,
@@ -4275,195 +4816,443 @@ impl<'a> Calc<'a> {
         }
         let gk = self.grid_key_coords(si, ar, ac, br, bc)?;
         let (_, r1_i, c1_i, r2_i, c2_i) = gk;
-        if c1_i != c2_i || r1_i < 0 || c1_i < 0 || r2_i < r1_i {
+        if r1_i < 0 || c1_i < 0 || r2_i < r1_i || c2_i < c1_i {
             return None;
         }
-        let len = (r2_i - r1_i + 1) as usize;
-        if len < 256
-            || self.range_cache.contains_key(&gk)
-            || self.shared.is_some_and(|s| s.get_range(gk).is_some())
+        let rows = (r2_i - r1_i + 1) as usize;
+        let cols = (c2_i - c1_i + 1) as usize;
+        let area = rows.saturating_mul(cols);
+        if area < 64
+            || (cols == 1
+                && (self.range_cache.contains_key(&gk)
+                    || self.shared.is_some_and(|s| s.get_range(gk).is_some())))
         {
             return None;
-        }
-        let sheet = self.wb.sheets.get(si)?;
-        let (r1, r2, col) = (r1_i as u32, r2_i as u32, c1_i as u32);
-        let pages = sheet.cf_pages((r1, col, r2, col));
-        for p in &pages {
-            let crate::store::ColSlab::Mixed(cs) = p.cells.as_ref() else {
-                continue; // O(1) skip: Numbers and Values slabs never contain formulas!
-            };
-            for ro in p.start..p.end {
-                let cell = &cs[ro];
-                if cell.formula.is_some() {
-                    let abs_row = p.page * crate::store::PAGE_ROWS + ro as u32;
-                    let k = (si, abs_row, col);
-                    if self.has_memo(k) {
-                        continue;
-                    }
-                    if self.parallel_values.is_some_and(|pv| pv.is_ready(k)) {
-                        continue;
-                    }
-                    let out_of_scope_valid = self.outside_scope(k)
-                        && !callable_cache_candidate(&cell.value);
-                    if !out_of_scope_valid {
-                        return None;
-                    }
-                }
-            }
         }
         let mut sum = 0.0f64;
         let mut num_count = 0usize;
         let mut non_empty = 0usize;
         let mut min_v = f64::INFINITY;
         let mut max_v = f64::NEG_INFINITY;
-        for p in &pages {
-            let page_base = p.page * crate::store::PAGE_ROWS;
-            match p.cells.as_ref() {
-                crate::store::ColSlab::Numbers(ns) => {
-                    let span = p.end - p.start;
-                    if id == FuncId::CountA {
-                        non_empty +=
-                            crate::store::NumberSlab::present_count_in(&ns.present, p.start, span);
-                    } else if crate::store::NumberSlab::all_present_in(&ns.present, p.start, span) {
-                        non_empty += span;
-                        num_count += span;
-                        match id {
-                            FuncId::Sum | FuncId::Average => {
-                                let mut s = 0.0f64;
-                                for &n in &ns.values[p.start..p.end] {
-                                    s += n;
-                                }
-                                sum += s;
-                            }
-                            FuncId::Max => {
-                                for &n in &ns.values[p.start..p.end] {
-                                    max_v = max_v.max(n);
-                                }
-                            }
-                            _ => {
-                                for &n in &ns.values[p.start..p.end] {
-                                    min_v = min_v.min(n);
-                                }
-                            }
-                        }
-                    } else {
-                        for ro in p.start..p.end {
-                            if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
-                                let n = ns.values[ro];
-                                non_empty += 1;
-                                num_count += 1;
-                                sum += n;
-                                min_v = min_v.min(n);
-                                max_v = max_v.max(n);
-                            }
+        let mut earliest_err = None;
+        let mut reads = 0usize;
+        if !self.stream_rect_into_agg(
+            id,
+            si,
+            r1_i as u32,
+            c1_i as u32,
+            r2_i as u32,
+            c2_i as u32,
+            &mut sum,
+            &mut num_count,
+            &mut non_empty,
+            &mut min_v,
+            &mut max_v,
+            &mut earliest_err,
+            &mut reads,
+        ) {
+            return None;
+        }
+        self.range_reads += reads;
+        Some(Self::finish_streamed_agg(
+            id,
+            sum,
+            num_count,
+            non_empty,
+            min_v,
+            max_v,
+            earliest_err,
+        ))
+    }
+
+    fn try_stream_multi_arg_agg(
+        &mut self,
+        id: FuncId,
+        nodes: &[Node],
+        si: usize,
+    ) -> Option<FValue> {
+        if self.requested.is_some() {
+            return None;
+        }
+        let mut sum = 0.0f64;
+        let mut num_count = 0usize;
+        let mut non_empty = 0usize;
+        let mut min_v = f64::INFINITY;
+        let mut max_v = f64::NEG_INFINITY;
+        let mut reads = 0usize;
+        let ignore_err = matches!(id, FuncId::Count | FuncId::CountA);
+        let mut saw_large_range = false;
+
+        for node in nodes {
+            if let Some(rr) = self.resolve_range_node(node, si) {
+                if rr.is_3d() || rr.is_ext() {
+                    return None;
+                }
+                let Ok(si2) = self.sheet_index(rr.sheet.as_deref(), si) else {
+                    return Some(FValue::Error(ErrKind::Ref));
+                };
+                let gk = self.grid_key_coords(si2, rr.r1(), rr.c1(), rr.r2(), rr.c2())?;
+                let (_, r1_i, c1_i, r2_i, c2_i) = gk;
+                if r1_i < 0 || c1_i < 0 || r2_i < r1_i || c2_i < c1_i {
+                    return None;
+                }
+                let area = ((r2_i - r1_i + 1) as usize).saturating_mul((c2_i - c1_i + 1) as usize);
+                saw_large_range |= area >= 64;
+                let mut arg_err = None;
+                if !self.stream_rect_into_agg(
+                    id,
+                    si2,
+                    r1_i as u32,
+                    c1_i as u32,
+                    r2_i as u32,
+                    c2_i as u32,
+                    &mut sum,
+                    &mut num_count,
+                    &mut non_empty,
+                    &mut min_v,
+                    &mut max_v,
+                    &mut arg_err,
+                    &mut reads,
+                ) {
+                    return None;
+                }
+                if let Some((_, e)) = arg_err {
+                    self.range_reads += reads;
+                    return Some(FValue::Error(e));
+                }
+            } else {
+                // Only accept scalar literal/expression arguments when at least one range arg exists;
+                // bail to generic on arrays/lambdas so semantics stay 100% identical.
+                if matches!(node, Node::Empty) {
+                    continue;
+                }
+                let v = self.eval_node(node, si);
+                if self.requested.is_some() {
+                    return None;
+                }
+                if matches!(v, FValue::Array(_) | FValue::Lambda(_)) {
+                    return None;
+                }
+                match v {
+                    FValue::Empty => {}
+                    FValue::Number(n) => {
+                        non_empty += 1;
+                        num_count += 1;
+                        sum += n;
+                        min_v = min_v.min(n);
+                        max_v = max_v.max(n);
+                    }
+                    FValue::Bool(_) => {
+                        non_empty += 1;
+                        if id == FuncId::Count {
+                            num_count += 1;
                         }
                     }
-                }
-                crate::store::ColSlab::Values(vs) => {
-                    for val in &vs[p.start..p.end] {
-                        match val {
-                            crate::Value::Empty => {}
-                            crate::Value::Number(n) => {
-                                non_empty += 1;
-                                num_count += 1;
-                                sum += *n;
-                                min_v = min_v.min(*n);
-                                max_v = max_v.max(*n);
-                            }
-                            crate::Value::Error(e) => {
-                                if id == FuncId::CountA {
-                                    non_empty += 1;
-                                } else {
-                                    self.range_reads += len;
-                                    return Some(FValue::Error(*e));
-                                }
-                            }
-                            _ => {
-                                non_empty += 1;
-                            }
+                    FValue::Text(_) => {
+                        non_empty += 1;
+                    }
+                    FValue::Error(e) => {
+                        if id == FuncId::CountA {
+                            non_empty += 1;
+                        } else if !ignore_err {
+                            self.range_reads += reads;
+                            return Some(FValue::Error(e));
                         }
                     }
+                    FValue::Array(_) | FValue::Lambda(_) => unreachable!(),
                 }
-                crate::store::ColSlab::Mixed(cs) => {
+            }
+        }
+        if !saw_large_range {
+            return None;
+        }
+        self.range_reads += reads;
+        Some(Self::finish_streamed_agg(
+            id, sum, num_count, non_empty, min_v, max_v, None,
+        ))
+    }
+
+    fn try_stream_sumproduct(&mut self, nodes: &[Node], si: usize) -> Option<FValue> {
+        if self.requested.is_some() {
+            return None;
+        }
+        let mut cols_spec: Vec<(usize, u32, u32, u32)> = Vec::with_capacity(nodes.len());
+        let mut rows_len: Option<usize> = None;
+        for node in nodes {
+            let rr = self.resolve_range_node(node, si)?;
+            if rr.is_3d() || rr.is_ext() {
+                return None;
+            }
+            let si2 = self.sheet_index(rr.sheet.as_deref(), si).ok()?;
+            let gk = self.grid_key_coords(si2, rr.r1(), rr.c1(), rr.r2(), rr.c2())?;
+            let (_, r1_i, c1_i, r2_i, c2_i) = gk;
+            if c1_i != c2_i || r1_i < 0 || c1_i < 0 || r2_i < r1_i {
+                return None;
+            }
+            let len = (r2_i - r1_i + 1) as usize;
+            if let Some(prev) = rows_len {
+                if prev != len {
+                    return None;
+                }
+            } else {
+                if len < 128 {
+                    return None;
+                }
+                rows_len = Some(len);
+            }
+            cols_spec.push((si2, r1_i as u32, r2_i as u32, c1_i as u32));
+        }
+        let len = rows_len?;
+        let (_, base_r1, base_r2, _) = cols_spec[0];
+        if cols_spec.iter().any(|&(_, r1, r2, _)| r1 != base_r1 || r2 != base_r2) {
+            return None;
+        }
+        // Verify no unready formulas in any column
+        for &(si2, r1, r2, col) in &cols_spec {
+            let sheet = self.wb.sheets.get(si2)?;
+            for p in sheet.cf_pages((r1, col, r2, col)) {
+                if let crate::store::ColSlab::Mixed(cs) = p.cells.as_ref() {
                     for ro in p.start..p.end {
                         let cell = &cs[ro];
-                        if cell.is_blank() {
-                            continue;
-                        }
-                        if cell.formula.is_none() {
-                            match &cell.value {
-                                crate::Value::Empty => {}
-                                crate::Value::Number(n) => {
-                                    non_empty += 1;
-                                    num_count += 1;
-                                    sum += *n;
-                                    min_v = min_v.min(*n);
-                                    max_v = max_v.max(*n);
-                                }
-                                crate::Value::Error(e) => {
-                                    if id == FuncId::CountA {
-                                        non_empty += 1;
-                                    } else {
-                                        self.range_reads += len;
-                                        return Some(FValue::Error(*e));
-                                    }
-                                }
-                                _ => {
-                                    non_empty += 1;
-                                }
-                            }
-                        } else {
-                            let abs_row = page_base + ro as u32;
-                            let k = (si, abs_row, col);
-                            let fv = if let Some(m) = self.get_memo(k) {
-                                m.scalar()
-                            } else if let Some(pv) = self.parallel_values
-                                && let Some(val) = pv.get(k)
+                        if cell.formula.is_some() {
+                            let k = (si2, p.page * crate::store::PAGE_ROWS + ro as u32, col);
+                            if !self.has_memo(k)
+                                && !self.parallel_values.is_some_and(|pv| pv.is_ready(k))
+                                && !(self.outside_scope(k) && !callable_cache_candidate(&cell.value))
                             {
-                                val.scalar()
-                            } else {
-                                to_fvalue(&cell.value)
-                            };
-                            match fv {
-                                FValue::Empty => {}
-                                FValue::Number(n) => {
-                                    non_empty += 1;
-                                    num_count += 1;
-                                    sum += n;
-                                    min_v = min_v.min(n);
-                                    max_v = max_v.max(n);
-                                }
-                                FValue::Error(e) => {
-                                    if id == FuncId::CountA {
-                                        non_empty += 1;
-                                    } else {
-                                        self.range_reads += len;
-                                        return Some(FValue::Error(e));
-                                    }
-                                }
-                                _ => {
-                                    non_empty += 1;
-                                }
+                                return None;
                             }
                         }
                     }
                 }
             }
         }
-        self.range_reads += len;
-        Some(match id {
-            FuncId::Sum => FValue::number(sum),
-            FuncId::CountA => FValue::number(non_empty as f64),
-            FuncId::Average => {
-                if num_count == 0 {
-                    FValue::Error(ErrKind::Div0)
-                } else {
-                    FValue::number(sum / num_count as f64)
+        let p_start = base_r1 / crate::store::PAGE_ROWS;
+        let p_end = base_r2 / crate::store::PAGE_ROWS;
+        let mut total = 0.0f64;
+        for pi in p_start..=p_end {
+            if ((pi - p_start) & 31) == 31 && self.check_abort() {
+                return None;
+            }
+            let page_base = pi * crate::store::PAGE_ROWS;
+            let s_off = base_r1.saturating_sub(page_base) as usize;
+            let e_off = ((base_r2 - page_base) as usize + 1).min(crate::store::PAGE_ROWS as usize);
+            let span = e_off - s_off;
+            if cols_spec.len() == 2 {
+                let (s0, _, _, c0) = cols_spec[0];
+                let (s1, _, _, c1) = cols_spec[1];
+                let sl0 = self.wb.sheets[s0].cf_pages((page_base + s_off as u32, c0, page_base + e_off as u32 - 1, c0));
+                let sl1 = self.wb.sheets[s1].cf_pages((page_base + s_off as u32, c1, page_base + e_off as u32 - 1, c1));
+                let (Some(p0), Some(p1)) = (sl0.first(), sl1.first()) else {
+                    continue;
+                };
+                if let (
+                    crate::store::ColSlab::Numbers(n0),
+                    crate::store::ColSlab::Numbers(n1),
+                ) = (p0.cells.as_ref(), p1.cells.as_ref())
+                    && p0.start == s_off
+                    && p0.end == e_off
+                    && p1.start == s_off
+                    && p1.end == e_off
+                    && crate::store::NumberSlab::all_present_in(&n0.present, s_off, span)
+                    && crate::store::NumberSlab::all_present_in(&n1.present, s_off, span)
+                {
+                    total += dot_f64_8way(&n0.values[s_off..e_off], &n1.values[s_off..e_off]);
+                    continue;
                 }
             }
-            FuncId::Max => FValue::number(if num_count > 0 { max_v } else { 0.0 }),
-            _ => FValue::number(if num_count > 0 { min_v } else { 0.0 }),
-        })
+            for ro in s_off..e_off {
+                let abs_r = page_base + ro as u32;
+                let mut prod = 1.0f64;
+                for &(si2, _, _, col) in &cols_spec {
+                    let v_num = match self.wb.sheets[si2].get_view(abs_r, col) {
+                        None => 0.0,
+                        Some(crate::store::CellView::Number(n)) => n,
+                        Some(crate::store::CellView::Value(v)) => {
+                            to_fvalue(v).to_number().unwrap_or(0.0)
+                        }
+                        Some(crate::store::CellView::Cell(cell)) => {
+                            if cell.formula.is_some() {
+                                let k = (si2, abs_r, col);
+                                let fv = if let Some(m) = self.get_memo(k) {
+                                    m.scalar()
+                                } else if let Some(pv) = self.parallel_values
+                                    && let Some(val) = pv.get(k)
+                                {
+                                    val.scalar()
+                                } else {
+                                    to_fvalue(&cell.value)
+                                };
+                                fv.to_number().unwrap_or(0.0)
+                            } else {
+                                to_fvalue(&cell.value).to_number().unwrap_or(0.0)
+                            }
+                        }
+                    };
+                    if v_num == 0.0 {
+                        prod = 0.0;
+                        break;
+                    }
+                    prod *= v_num;
+                }
+                total += prod;
+            }
+        }
+        self.range_reads += len * cols_spec.len();
+        Some(FValue::number(total))
+    }
+
+    fn try_eval_sumif_cond_col(
+        &mut self,
+        range_tuple: RangeKey,
+        sum_spec: Option<RangeKey>,
+        crit_str: &str,
+    ) -> Option<FValue> {
+        if self.requested.is_some() {
+            return None;
+        }
+        let c = functions::Crit::parse(crit_str);
+        let mut cond_gk = self.grid_key_coords(
+            range_tuple.0,
+            range_tuple.1,
+            range_tuple.2,
+            range_tuple.3,
+            range_tuple.4,
+        )?;
+        if cond_gk.2 != cond_gk.4 || (cond_gk.3 - cond_gk.1) < 255 {
+            return None;
+        }
+        let mut val_gk = match sum_spec {
+            Some(sr) => self.grid_key_coords(sr.0, sr.1, sr.2, sr.3, sr.4)?,
+            None => cond_gk,
+        };
+        if val_gk.2 != val_gk.4 || (val_gk.3 - val_gk.1) != (cond_gk.3 - cond_gk.1) {
+            return None;
+        }
+        if !c.matches(&FValue::Empty) {
+            let cm = self.col_max_row(cond_gk.0, cond_gk.2 as u32);
+            let new_cond_r2 = aligned_col_end_row(cond_gk.1, cm, cond_gk.3);
+            if new_cond_r2 < cond_gk.3 && (new_cond_r2 - cond_gk.1) >= 255 {
+                let shrunk = cond_gk.3 - new_cond_r2;
+                cond_gk.3 = new_cond_r2;
+                val_gk.3 -= shrunk;
+            }
+        }
+        let cond_sc = self.shared_cond_col_internal(cond_gk)?;
+        let val_sc = if val_gk == cond_gk {
+            cond_sc.clone()
+        } else {
+            self.shared_cond_col_internal(val_gk)?
+        };
+        if val_sc.has_error || val_sc.has_non_finite {
+            return None;
+        }
+
+        // 1. Numeric inequality (<, <=, >, >=, <>) via O(log N) OrderedCriteria prefix sum!
+        if c.numeric_bounds().is_some()
+            && !cond_sc.has_coerced_non_strict
+            && !val_sc.has_coerced_non_strict
+            && (!cond_sc.has_empty
+                || c.matches(&FValue::Empty) == c.matches_coerced(&FValue::Empty))
+        {
+            let ckey = CriteriaKey {
+                function: 0,
+                ranges: vec![val_gk, cond_gk],
+                criteria: vec![crit_str.to_string()],
+            };
+            let mut ordered = std::mem::take(&mut self.ordered_criteria);
+            let shared_ref = self.shared;
+            let cond_clone = cond_sc.clone();
+            let val_clone = val_sc.clone();
+            let res = ordered.lookup_lazy(
+                &ckey,
+                &mut |vr, cr| shared_ref.and_then(|s| s.get_ordered(vr, cr, false)),
+                &mut |vr, cr, built| {
+                    if let Some(s) = shared_ref {
+                        s.put_ordered(vr, cr, false, built);
+                    }
+                },
+                &mut |rk| rk == cond_gk || rk == val_gk,
+                &mut |vr, cr, mm| {
+                    if cr != cond_gk || vr != Some(val_gk) {
+                        return None;
+                    }
+                    self.wb
+                        .sheets
+                        .get(cond_gk.0)
+                        .and_then(|sh| {
+                            sh.shared_lookup.get_or_build_ordered_persistent(
+                                Some(val_gk),
+                                cond_gk,
+                                mm,
+                                &cond_clone,
+                                Some(&val_clone),
+                            )
+                        })
+                        .or_else(|| {
+                            conditional_index::BuiltOrdered::build_from_cond(
+                                &cond_clone,
+                                Some(&val_clone),
+                                mm,
+                            )
+                            .map(std::sync::Arc::new)
+                        })
+                },
+                &mut |_| None,
+            );
+            self.ordered_criteria = ordered;
+            if let Some(ans) = res {
+                return Some(ans);
+            }
+        }
+
+        // 2. Exact numeric equality (`c.op == "="`, `c.num == Some(target)`) via O(log N + K) sorted_nums!
+        if c.indexable()
+            && let Some(target) = c.num
+            && target.is_finite()
+            && (!cond_sc.has_coerced_non_strict
+                || target.fract() != 0.0
+                || (target != 0.0 && target != 1.0))
+        {
+            // Note: if cond_sc has coerced booleans TRUE(1)/FALSE(0), SUMIF does NOT match Bool as 1/0,
+            // so when `cond_sc.has_coerced_non_strict` is true we only take sorted_nums if we verify non-bool,
+            // or simply require `!cond_sc.has_coerced_non_strict` for 100% strict safety!
+            if !cond_sc.has_coerced_non_strict
+                && let Some(sorted) = cond_sc.sorted_nums()
+            {
+                let lo = sorted.partition_point(|&(v, _)| v - target < -f64::EPSILON);
+                let hi = sorted.partition_point(|&(v, _)| v - target <= f64::EPSILON);
+                let check_non_empty = target.abs() <= f64::EPSILON && cond_sc.has_empty;
+                let mut sum = 0.0f64;
+                for &(_, row_off) in &sorted[lo..hi] {
+                    let ro = row_off as usize;
+                    if check_non_empty && !cond_sc.is_non_empty_at(ro) {
+                        continue;
+                    }
+                    sum += val_sc.strict_number_at(ro);
+                }
+                return Some(FValue::number(sum));
+            }
+        }
+
+        // 3. Exact non-empty text equality via O(1 + K) persistent text_dict!
+        if c.indexable() && c.num.is_none() && !c.text.is_empty() {
+            if !cond_sc.has_non_num && !cond_sc.has_coerced_non_strict {
+                return Some(FValue::number(0.0));
+            }
+            if let Some(dict) = cond_sc.text_dict() {
+                let Some(rows) = dict.get(c.text.as_str()) else {
+                    return Some(FValue::number(0.0));
+                };
+                let mut sum = 0.0f64;
+                for &row_off in rows.iter() {
+                    sum += val_sc.strict_number_at(row_off as usize);
+                }
+                return Some(FValue::number(sum));
+            }
+        }
+
+        None
     }
 
     /// Zero-materialization single-column page streaming for `COUNTIF` (and `SUMIF` text pre-index).
@@ -4530,6 +5319,7 @@ impl<'a> Calc<'a> {
         if pages.len() >= 64
             && self.memo.is_empty()
             && self.memo_overflow.is_empty()
+            && self.batch_results.is_none()
             && self.parallel_values.is_none()
             && self.scope.is_none()
         {
@@ -4553,9 +5343,17 @@ impl<'a> Calc<'a> {
                     .collect();
                 let pages_slice = pages.as_slice();
 
+                let cancel_flag = self.cancel;
+                let deadline_opt = self.deadline;
                 pool::run_parallel(workers, |_| {
                     loop {
                         if aborted.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if cancel_flag.is_some_and(|c| c.load(Ordering::Relaxed))
+                            || deadline_opt.is_some_and(|d| std::time::Instant::now() >= d)
+                        {
+                            aborted.store(true, Ordering::Relaxed);
                             return;
                         }
                         let ci = next_chunk.fetch_add(1, Ordering::Relaxed);
@@ -4717,6 +5515,7 @@ impl<'a> Calc<'a> {
                 });
 
                 if aborted.load(Ordering::Relaxed) {
+                    let _ = self.check_abort();
                     return None;
                 }
                 let mut total_count = 0usize;
@@ -4771,7 +5570,10 @@ impl<'a> Calc<'a> {
         let mut text_entries = 0usize;
         let mut text_overflow = false;
 
-        for p in &pages {
+        for (pi, p) in pages.iter().enumerate() {
+            if (pi & 31) == 31 && self.check_abort() {
+                return None;
+            }
             let page_base = p.page * crate::store::PAGE_ROWS;
             match p.cells.as_ref() {
                 crate::store::ColSlab::Numbers(ns) => {
@@ -4955,16 +5757,34 @@ impl<'a> Calc<'a> {
 
     fn shared_cond_col_internal(&mut self, rk: RangeKey) -> Option<std::sync::Arc<lookup_cache::SharedCondColumn>> {
         let (si_c, r1_c, c1_c, r2_c, c2_c) = rk;
-        if c1_c != c2_c || (r2_c - r1_c + 1) < 256 {
+        if c1_c != c2_c || (r2_c - r1_c + 1) < 256 || self.check_abort() {
             return None;
         }
         let sheet = self.wb.sheets.get(si_c)?;
-        let (sc, reads) = sheet.shared_lookup.get_or_build_cond_column(sheet, rk, self.scope)?;
+        let col_u32 = c1_c as u32;
+        let has_scope = self.scope.is_some() || self.fast_scope.is_some();
+        let overlay_cb = |abs_row: u32| self.ready_dirty_value_at(si_c, abs_row, col_u32);
+        let eval_scope = lookup_cache::LookupEvalScope {
+            scope: self.scope,
+            fast_scope: self.fast_scope,
+            overlay: has_scope.then_some(&overlay_cb as &dyn Fn(u32) -> Option<crate::Value>),
+            cancel: self.cancel,
+            deadline: self.deadline,
+        };
+        let (sc, reads) = sheet
+            .shared_lookup
+            .get_or_build_cond_column(sheet, rk, &eval_scope)?;
         self.range_reads += reads;
+        if self.check_abort() {
+            return None;
+        }
         Some(sc)
     }
 
     fn try_eval_criteria_lazy(&mut self, id: FuncId, name: &str, nodes: &[Node], si: usize) -> Option<FValue> {
+        if self.check_abort() {
+            return Some(FValue::Error(ErrKind::Value));
+        }
         let function = match id {
             FuncId::SumIfs => 0u8,
             FuncId::CountIfs => 1,
@@ -4998,6 +5818,9 @@ impl<'a> Calc<'a> {
                 if self.requested.is_some() {
                     return Some(FValue::Error(ErrKind::Ref));
                 }
+                if self.aborted {
+                    return Some(FValue::Error(ErrKind::Value));
+                }
                 key.criteria.push(cv.to_text().ok()?);
             } else {
                 let rr = self.resolve_range_node(node, si)?;
@@ -5007,6 +5830,40 @@ impl<'a> Calc<'a> {
                 let sheet = self.sheet_index(rr.sheet.as_deref(), si).ok()?;
                 let gk = self.grid_key_coords(sheet, rr.r1(), rr.c1(), rr.r2(), rr.c2())?;
                 key.ranges.push(gk);
+            }
+        }
+        // Per-column used-row trimming: if at least one condition column cannot match Empty,
+        // no row beyond that column's last occupied row can ever satisfy all conditions!
+        if key.ranges.iter().all(|r| r.2 == r.4 && r.2 >= 0) {
+            let first_len = key.ranges.first().map(|r| r.3 - r.1).unwrap_or(0);
+            if first_len >= 511 && key.ranges.iter().all(|r| r.3 - r.1 == first_len) {
+                let cond_slice: &[RangeKey] = match function {
+                    1 => &key.ranges,
+                    2 => key.ranges.get(..1).unwrap_or(&[]),
+                    _ => key.ranges.get(1..).unwrap_or(&[]),
+                };
+                if cond_slice.len() == key.criteria.len() {
+                    let mut min_cap_off: Option<i64> = None;
+                    for (crk, ctext) in cond_slice.iter().zip(key.criteria.iter()) {
+                        let parsed_c = functions::Crit::parse(ctext);
+                        if !parsed_c.matches_coerced(&FValue::Empty) {
+                            let cm = self.col_max_row(crk.0, crk.2 as u32);
+                            let cap_off = aligned_col_end_row(crk.1, cm, crk.3) - crk.1;
+                            min_cap_off = Some(match min_cap_off {
+                                Some(prev) => prev.min(cap_off),
+                                None => cap_off,
+                            });
+                        }
+                    }
+                    if let Some(cap_off) = min_cap_off
+                        && cap_off >= 255
+                        && cap_off < first_len
+                    {
+                        for rk in &mut key.ranges {
+                            rk.3 = rk.1 + cap_off;
+                        }
+                    }
+                }
             }
         }
         if let Some(v) = self.criteria_cache.get(&key) {
@@ -5024,14 +5881,46 @@ impl<'a> Calc<'a> {
             return Some(v);
         }
 
+        // Pre-resolve single-column `SharedCondColumn`s once (supports O(1) FastScope + dirty overlay!)
+        let all_single_cols_256 = key
+            .ranges
+            .iter()
+            .all(|r| r.2 == r.4 && (r.3 - r.1 + 1) >= 256);
+        let mut resolved_cond_cols: Vec<(RangeKey, std::sync::Arc<lookup_cache::SharedCondColumn>)> =
+            Vec::new();
+        if all_single_cols_256 {
+            let mut ok = true;
+            for &rk in &key.ranges {
+                if let Some((_, sc)) = resolved_cond_cols.iter().find(|(k, _)| *k == rk) {
+                    let sc_clone = sc.clone();
+                    resolved_cond_cols.push((rk, sc_clone));
+                } else if let Some(sc) = self.shared_cond_col_internal(rk) {
+                    if let Some(s) = self.shared
+                        && s.get_cond_col(rk).is_none()
+                    {
+                        s.put_cond_col(&conditional_index::ColumnIndex::from_shared(rk, sc.clone()));
+                    }
+                    resolved_cond_cols.push((rk, sc));
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                resolved_cond_cols.clear();
+            }
+        }
+        if self.aborted {
+            return Some(FValue::Error(ErrKind::Value));
+        }
+
         // 1. OrderedCriteria (<, <=, >, >=, <>)
         let mut ans = {
             let mut ordered = std::mem::take(&mut self.ordered_criteria);
             let shared_ref = self.shared;
             let wb_ref = self.wb;
-            let scope_ref = self.scope;
             let need_mm = matches!(key.function, 4 | 5);
-            let mut extra_reads = 0usize;
+            let pre_cols = &resolved_cond_cols;
             let res = ordered.lookup_lazy(
                 &key,
                 &mut |vr, cr| shared_ref.and_then(|s| s.get_ordered(vr, cr, need_mm)),
@@ -5048,55 +5937,130 @@ impl<'a> Calc<'a> {
                             .is_some_and(|sh| sh.shared_lookup.has_cond_column(rk))
                 },
                 &mut |vr, cr, mm| {
-                    if let Some(s) = shared_ref {
-                        let (built, reads) =
-                            s.get_or_build_ordered_from_cond(wb_ref, scope_ref, vr, cr, mm);
-                        extra_reads += reads;
-                        return built;
+                    let _sf = shared_ref.map(|s| {
+                        s.ordered_cond_mu.lock().unwrap_or_else(|e| e.into_inner())
+                    });
+                    if let Some(s) = shared_ref
+                        && let Some(hit) = s.get_ordered(vr, cr, mm)
+                    {
+                        return Some(hit);
                     }
-                    let get_col = |rk: RangeKey, reads_acc: &mut usize| -> Option<std::sync::Arc<lookup_cache::SharedCondColumn>> {
-                        let (si_c, r1_c, c1_c, r2_c, c2_c) = rk;
-                        if c1_c != c2_c || (r2_c - r1_c + 1) < 256 {
-                            return None;
-                        }
-                        let sheet = wb_ref.sheets.get(si_c)?;
-                        let (sc, r) = sheet.shared_lookup.get_or_build_cond_column(sheet, rk, scope_ref)?;
-                        *reads_acc += r;
-                        Some(sc)
-                    };
-                    let cond_sc = get_col(cr, &mut extra_reads)?;
+                    let cond_sc = pre_cols.iter().find(|(k, _)| *k == cr).map(|(_, c)| c)?;
                     let val_sc = match vr {
-                        Some(v) => Some(get_col(v, &mut extra_reads)?),
+                        Some(v) => Some(pre_cols.iter().find(|(k, _)| *k == v).map(|(_, c)| c)?),
                         None => None,
                     };
-                    conditional_index::BuiltOrdered::build_from_cond(&cond_sc, val_sc.as_deref(), mm)
-                        .map(std::sync::Arc::new)
+                    wb_ref
+                        .sheets
+                        .get(cr.0)
+                        .and_then(|sh| {
+                            sh.shared_lookup.get_or_build_ordered_persistent(
+                                vr,
+                                cr,
+                                mm,
+                                cond_sc,
+                                val_sc,
+                            )
+                        })
+                        .or_else(|| {
+                            conditional_index::BuiltOrdered::build_from_cond(
+                                cond_sc,
+                                val_sc.map(std::sync::Arc::as_ref),
+                                mm,
+                            )
+                            .map(std::sync::Arc::new)
+                        })
                 },
                 &mut |rk| {
                     let len = ((rk.3 - rk.1 + 1) as usize).saturating_mul((rk.4 - rk.2 + 1) as usize);
                     self.materialize_range(rk, len).ok()
                 },
             );
-            self.range_reads += extra_reads;
             self.ordered_criteria = ordered;
             res
         };
         if self.requested.is_some() {
             return Some(FValue::Error(ErrKind::Ref));
         }
+        if self.aborted {
+            return Some(FValue::Error(ErrKind::Value));
+        }
 
-        // 2. GroupedCriteria (multi-column exact equality group-by hash table)
+        // 2. GroupedCriteria (multi-column exact equality group-by hash table, persisted across recalcs!)
         if ans.is_none() {
             let group_slot = usize::from(key.function == 1);
             let mut grouped = std::mem::take(&mut self.grouped_criteria[group_slot]);
             let shared_ref = self.shared;
+            let wb_ref = self.wb;
+            let cancel_ref = self.cancel;
+            let deadline_ref = self.deadline;
+            let pre_cols = &resolved_cond_cols;
             let res = grouped.lookup_lazy(
                 &key,
-                &mut |vr, cr, nm| shared_ref.and_then(|s| s.get_grouped(vr, cr, nm)),
+                &mut |vr, cr, nm| {
+                    if let Some(hit) = shared_ref.and_then(|s| s.get_grouped(vr, cr, nm)) {
+                        return Some(hit);
+                    }
+                    if !pre_cols.is_empty() {
+                        let mut c_scs = Vec::with_capacity(cr.len());
+                        for &rk in cr {
+                            c_scs.push(pre_cols.iter().find(|(k, _)| *k == rk)?.1.clone());
+                        }
+                        let v_sc = match vr {
+                            Some(v) => Some(pre_cols.iter().find(|(k, _)| *k == v)?.1.clone()),
+                            None => None,
+                        };
+                        let sh_idx = cr.first()?.0;
+                        if let Some(hit) = wb_ref.sheets.get(sh_idx).and_then(|sh| {
+                            sh.shared_lookup
+                                .get_grouped_persistent(vr, cr, nm, &c_scs, v_sc.as_ref())
+                        }) {
+                            if let Some(s) = shared_ref {
+                                s.put_grouped(vr, cr.to_vec(), nm.to_vec(), hit.clone());
+                            }
+                            return Some(hit);
+                        }
+                    }
+                    None
+                },
                 &mut |vr, cr, nm, built| {
                     if let Some(s) = shared_ref {
                         s.put_grouped(vr, cr, nm, built);
                     }
+                },
+                &mut |vr, cr, nm, limit| {
+                    if pre_cols.is_empty() {
+                        return None;
+                    }
+                    let mut c_scs = Vec::with_capacity(cr.len());
+                    for &rk in cr {
+                        c_scs.push(pre_cols.iter().find(|(k, _)| *k == rk)?.1.clone());
+                    }
+                    let v_sc = match vr {
+                        Some(v) => Some(pre_cols.iter().find(|(k, _)| *k == v)?.1.clone()),
+                        None => None,
+                    };
+                    let built = std::sync::Arc::new(functions::BuiltGroups::build_from_cond_cols(
+                        &c_scs,
+                        v_sc.as_deref(),
+                        nm,
+                        limit,
+                        cancel_ref,
+                        deadline_ref,
+                    )?);
+                    if let Some(&first_cr) = cr.first()
+                        && let Some(sh) = wb_ref.sheets.get(first_cr.0)
+                    {
+                        sh.shared_lookup.put_grouped_persistent(
+                            vr,
+                            cr.to_vec(),
+                            nm.to_vec(),
+                            c_scs,
+                            v_sc,
+                            built.clone(),
+                        );
+                    }
+                    Some(built)
                 },
                 &mut |rk| {
                     let len = ((rk.3 - rk.1 + 1) as usize).saturating_mul((rk.4 - rk.2 + 1) as usize);
@@ -5109,14 +6073,15 @@ impl<'a> Calc<'a> {
         if self.requested.is_some() {
             return Some(FValue::Error(ErrKind::Ref));
         }
+        if self.aborted {
+            return Some(FValue::Error(ErrKind::Value));
+        }
 
         // 3. MatchIndexes (column index + persistent 256-row page cache + high-selectivity sparse row probe)
         if ans.is_none() {
             let mut match_ix = std::mem::take(&mut self.match_indexes);
             let shared_ref = self.shared;
-            let wb_ref = self.wb;
-            let scope_ref = self.scope;
-            let mut extra_reads = 0usize;
+            let pre_cols = &resolved_cond_cols;
             let res = match_ix.lookup_lazy(
                 &key,
                 &mut |rk| {
@@ -5125,15 +6090,8 @@ impl<'a> Calc<'a> {
                     {
                         return Some(col);
                     }
-                    let (si_c, r1_c, c1_c, r2_c, c2_c) = rk;
-                    if c1_c == c2_c
-                        && (r2_c - r1_c + 1) >= 256
-                        && let Some(sheet) = wb_ref.sheets.get(si_c)
-                        && let Some((sc, reads)) =
-                            sheet.shared_lookup.get_or_build_cond_column(sheet, rk, scope_ref)
-                    {
-                        extra_reads += reads;
-                        let ci = conditional_index::ColumnIndex::from_shared(rk, sc);
+                    if let Some((_, sc)) = pre_cols.iter().find(|(k, _)| *k == rk) {
+                        let ci = conditional_index::ColumnIndex::from_shared(rk, sc.clone());
                         if let Some(s) = shared_ref {
                             s.put_cond_col(&ci);
                         }
@@ -5148,12 +6106,14 @@ impl<'a> Calc<'a> {
                 },
                 self,
             );
-            self.range_reads += extra_reads;
             self.match_indexes = match_ix;
             ans = res;
         }
         if self.requested.is_some() {
             return Some(FValue::Error(ErrKind::Ref));
+        }
+        if self.aborted {
+            return Some(FValue::Error(ErrKind::Value));
         }
 
         // 4. Fallback for < 256-row ranges: materialize only this query's columns and cache in criteria_cache
@@ -5164,10 +6124,13 @@ impl<'a> Calc<'a> {
                 if self.requested.is_some() {
                     return Some(FValue::Error(ErrKind::Ref));
                 }
+                if self.aborted {
+                    return Some(FValue::Error(ErrKind::Value));
+                }
                 functions::call_id_in(self.ctx, id, name, &args)
             }
         };
-        if self.requested.is_none() {
+        if self.requested.is_none() && !self.aborted {
             if let Some(s) = self.shared {
                 s.put_criteria(key.clone(), out.clone());
             }
@@ -5282,6 +6245,22 @@ impl<'a> Calc<'a> {
         b
     }
 
+    /// 单列精确非空末行（通过 Store `page_bits` + `prev_occupied_before` O(1) 位图获取并缓存）
+    fn col_max_row(&mut self, si: usize, col: u32) -> u32 {
+        if let Some(&r) = self.col_bounds.get(&(si, col)) {
+            return r;
+        }
+        let (sheet_max_r, _) = self.sheet_bounds(si);
+        let r = self
+            .wb
+            .sheets
+            .get(si)
+            .and_then(|sheet| sheet.next_occupied_in_col(col, sheet_max_r.saturating_add(1), false))
+            .unwrap_or(0);
+        self.col_bounds.insert((si, col), r);
+        r
+    }
+
     fn get_or_build_approx_positions(
         &mut self,
         range: RangeKey,
@@ -5350,17 +6329,32 @@ impl<'a> Calc<'a> {
         }
         let sheet = &self.wb.sheets[si];
         let span = if vertical { key.3 - key.1 } else { key.4 - key.2 };
-        if vertical
-            && key.2 == key.4
-            && span >= 255
-            && let Some((ix, reads)) = sheet.shared_lookup.get_or_build_vertical(sheet, key, self.scope)
-        {
-            self.range_reads += reads;
-            if let Some(shared) = self.shared {
-                shared.put_lookup(local, &ix);
+        if vertical && key.2 == key.4 && span >= 255 {
+            let col_u32 = key.2 as u32;
+            let has_scope = self.scope.is_some() || self.fast_scope.is_some();
+            let overlay_cb = |abs_row: u32| self.ready_dirty_value_at(si, abs_row, col_u32);
+            let eval_scope = lookup_cache::LookupEvalScope {
+                scope: self.scope,
+                fast_scope: self.fast_scope,
+                overlay: has_scope
+                    .then_some(&overlay_cb as &dyn Fn(u32) -> Option<crate::Value>),
+                cancel: self.cancel,
+                deadline: self.deadline,
+            };
+            if let Some((ix, reads)) =
+                sheet
+                    .shared_lookup
+                    .get_or_build_vertical(sheet, key, &eval_scope)
+            {
+                self.range_reads += reads;
+                if !self.check_abort() {
+                    if let Some(shared) = self.shared {
+                        shared.put_lookup(local, &ix);
+                    }
+                    self.lookup_index.insert(local, ix.clone());
+                }
+                return ix;
             }
-            self.lookup_index.insert(local, ix.clone());
-            return ix;
         }
         if !vertical && span >= 255 && let Some(ix) = sheet.shared_lookup.get(sheet, local) {
             if let Some(shared) = self.shared {
@@ -5383,7 +6377,7 @@ impl<'a> Calc<'a> {
             }
         }
         let index = std::sync::Arc::new(map);
-        if self.requested.is_none() {
+        if self.requested.is_none() && !self.aborted {
             if !vertical && count >= 256 {
                 let sheet = &self.wb.sheets[si];
                 let (_, r1, c1, _, _) = key;
@@ -5833,6 +6827,11 @@ impl conditional_index::CriteriaDataSource for Calc<'_> {
 }
 
 #[inline]
+fn aligned_col_end_row(r1: i64, max_r: u32, orig_r2: i64) -> i64 {
+    i64::from(max_r).max(r1 + 255).min(orig_r2)
+}
+
+#[inline]
 fn row_off_div(off: usize, cols: usize) -> usize {
     off / cols
 }
@@ -6187,7 +7186,7 @@ pub fn write_back(wb: &mut Workbook, results: Vec<(usize, u32, u32, FValue)>) {
                         )
                     {
                         wb.sheets[si].spill_shapes.insert(anchor, (0, 0));
-                    } else {
+                    } else if !wb.sheets[si].spill_shapes.is_empty() {
                         wb.sheets[si].spill_shapes.remove(&anchor);
                     }
                     wb.sheets[si].set_formula_cache(r, c, from_fvalue(&other));
@@ -6312,7 +7311,8 @@ fn apply_dirty_results_local(
 ) -> Result<Vec<deps::CellKey>, ()> {
     let any_spill_touch = results.iter().any(|(si, r, c, v)| {
         matches!(v, FValue::Array(_))
-            || wb.sheets[*si].spill_shapes.contains_key(&CellRef::new(*r, *c))
+            || (!wb.sheets[*si].spill_shapes.is_empty()
+                && wb.sheets[*si].spill_shapes.contains_key(&CellRef::new(*r, *c)))
     });
     if !any_spill_touch {
         write_back(wb, results);
@@ -6443,29 +7443,68 @@ fn recalc_dirty_impl(
             sheet.spilled.remove(&CellRef::new(r, c));
         }
     }
-    let dirty = if deps.requires_full_recalc() || edit_touches_spill(wb, deps, seeds, true) {
+    let dirty_vec = if deps.requires_full_recalc() || edit_touches_spill(wb, deps, seeds, true) {
         None
     } else {
-        Some(deps.edit_closure_cancelable(seeds, cancel)?)
+        Some(deps.edit_closure_vec_cancelable(seeds, cancel)?)
     };
-    let Some(mut dirty) = dirty else {
+    let Some(mut order) = dirty_vec else {
         let count = wb.sheets.iter().map(|s| s.formula_cells().count()).sum();
         return recalc_all_force_impl(wb, cancel, None).then_some(count);
     };
     // 修改的公式也必须计算，不能只算它的下游。
     for &key in seeds {
-        if wb.sheets.get(key.0).and_then(|s| s.get(key.1, key.2))
-            .is_some_and(|c| c.formula.is_some()) {
-            dirty.insert(key);
+        if wb
+            .sheets
+            .get(key.0)
+            .and_then(|s| s.formula_arc_of(key.1, key.2))
+            .is_some()
+        {
+            order.push(key);
         }
     }
-    if dirty.is_empty() {
+    if order.is_empty() {
         return Some(0);
     }
+    if !order.is_sorted() {
+        order.sort_unstable();
+    }
+    order.dedup();
     let prev_now = functions::ensure_now_snapshot_in(wb.date_system);
     let eval_ctx = functions::EvalCtx::for_workbook(wb.date_system);
-    let mut order: Vec<deps::CellKey> = dirty.iter().cloned().collect();
-    order.sort_unstable();
+
+    // Ultra-fast path for width-1 sequential chains (`chain 1M`): skips building both 32 MB
+    // `HashSet<CellKey>` AND `Plan::build` CSR structures completely!
+    if !wb.calc_iterate
+        && !profile_enabled()
+        && order.len() >= 256
+        && let Some(chain_batch) =
+            dependency_batch::try_eval_tight_forward_chain(wb, &order, true, cancel, None)
+        && chain_batch.pending.is_empty()
+    {
+        let total_evaluated = order.len();
+        let Ok(changed_tails) = apply_dirty_results_local(wb, deps, chain_batch.values) else {
+            functions::set_now_snapshot(prev_now);
+            let count = wb.sheets.iter().map(|s| s.formula_cells().count()).sum();
+            return recalc_all_force_impl(wb, cancel, None).then_some(count);
+        };
+        if changed_tails.is_empty() {
+            functions::set_now_snapshot(prev_now);
+            return Some(total_evaluated);
+        }
+        // Rare spill-tail follow-up after a chain: continue from `changed_tails`
+        let mut dirty = deps.closure_excluding_watches(&order, &order.iter().copied().collect());
+        dirty.extend(deps.closure(&changed_tails));
+        dirty.extend(deps.dynamic_cells_touching(&changed_tails));
+        if dirty.is_empty() {
+            functions::set_now_snapshot(prev_now);
+            return Some(total_evaluated);
+        }
+        order = dirty.iter().copied().collect();
+        order.sort_unstable();
+    }
+
+    let mut dirty: HashSet<deps::CellKey> = order.iter().copied().collect();
 
     if wb.calc_iterate {
         let passes = wb.calc_max_iterations.max(1) as usize;
@@ -6531,43 +7570,68 @@ fn recalc_dirty_impl(
             return None;
         }
         let fast_scope = (dirty.len() >= 16).then(|| FastScope::from_std(&dirty));
-        let results = {
+        let results = if let Some(mut batch) = parallel {
+            if !batch.pending.is_empty() {
+                let mut pending_updates = Vec::with_capacity(batch.pending.len());
+                {
+                    let mut calc = Calc::new(wb);
+                    calc.scope = Some(&dirty);
+                    calc.fast_scope = fast_scope.as_ref();
+                    calc.cancel = cancel;
+                    calc.deps_watch = Some(deps);
+                    calc.shared = Some(&shared_caches);
+                    calc.batch_results = Some(BatchResults {
+                        values: &batch.values,
+                        pending: &batch.pending,
+                    });
+                    calc.volatile_values = std::mem::take(&mut volatile_values);
+                    for &slot in &batch.pending {
+                        if cancelled() || calc.aborted {
+                            drop(calc);
+                            functions::set_now_snapshot(prev_now);
+                            return None;
+                        }
+                        let (si, r, c) = order[slot];
+                        let v = calc.cell_value(si, r, c);
+                        if calc.aborted {
+                            drop(calc);
+                            functions::set_now_snapshot(prev_now);
+                            return None;
+                        }
+                        pending_updates.push((slot, v));
+                    }
+                    volatile_values = std::mem::take(&mut calc.volatile_values);
+                }
+                for (slot, v) in pending_updates {
+                    batch.values[slot].3 = v;
+                }
+            }
+            batch.values
+        } else {
             let mut calc = Calc::new(wb);
             calc.scope = Some(&dirty);
             calc.fast_scope = fast_scope.as_ref();
+            calc.cancel = cancel;
+            calc.deps_watch = Some(deps);
             calc.shared = Some(&shared_caches);
             calc.volatile_values = std::mem::take(&mut volatile_values);
-            let out = if let Some(mut batch) = parallel {
-                let mut pending = batch.pending.iter().copied().peekable();
-                for (slot, (s, r, c, v)) in batch.values.iter().enumerate() {
-                    if pending.next_if_eq(&slot).is_none() {
-                        calc.insert_memo((*s, *r, *c), v.clone());
-                    }
+            let mut results = Vec::with_capacity(order.len());
+            for &(si, r, c) in &order {
+                if cancelled() || calc.aborted {
+                    drop(calc);
+                    functions::set_now_snapshot(prev_now);
+                    return None;
                 }
-                for slot in batch.pending {
-                    if cancelled() {
-                        drop(calc);
-                        functions::set_now_snapshot(prev_now);
-                        return None;
-                    }
-                    let (si, r, c) = order[slot];
-                    batch.values[slot].3 = calc.cell_value(si, r, c);
+                let v = calc.cell_value(si, r, c);
+                if calc.aborted {
+                    drop(calc);
+                    functions::set_now_snapshot(prev_now);
+                    return None;
                 }
-                batch.values
-            } else {
-                let mut results = Vec::with_capacity(order.len());
-                for &(si, r, c) in &order {
-                    if cancelled() {
-                        drop(calc);
-                        functions::set_now_snapshot(prev_now);
-                        return None;
-                    }
-                    results.push((si, r, c, calc.cell_value(si, r, c)));
-                }
-                results
-            };
+                results.push((si, r, c, v));
+            }
             volatile_values = std::mem::take(&mut calc.volatile_values);
-            out
+            results
         };
         total_evaluated += order.len();
         let Ok(changed_tails) = apply_dirty_results_local(wb, deps, results) else {
@@ -6579,7 +7643,7 @@ fn recalc_dirty_impl(
             break;
         }
         let mut next_dirty = deps.closure_excluding_watches(&changed_tails, &dirty);
-        next_dirty.extend(deps.dynamic_cells());
+        next_dirty.extend(deps.dynamic_cells_touching(&changed_tails));
         if next_dirty.is_empty() {
             break;
         }
@@ -6605,17 +7669,26 @@ fn large_spill(&(rows, cols): &(u32, u32)) -> bool {
     u64::from(rows) * u64::from(cols) > 4096
 }
 
-/// 仅即时计算 `seeds` 中本身带有公式的单元格（供提交编辑时在广播前毫秒级算出当前格结果）。
-/// 若遇到需整表物化的动态数组溢出返回 `false`，普通标量公式写回后返回 `true`。
-pub fn eval_formula_seeds_immediate(wb: &mut Workbook, seeds: &[deps::CellKey]) -> bool {
+const INTERACTIVE_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+
+fn eval_formula_seeds_until(
+    wb: &mut Workbook,
+    seeds: &[deps::CellKey],
+    deadline: Option<std::time::Instant>,
+    deps_watch: Option<&deps::Deps>,
+) -> Result<bool, ()> {
     if wb.calc_manual || seeds.is_empty() {
-        return true;
+        return Ok(true);
     }
     // Both the edit broadcaster and the interactive planner use this path.
     // Avoid evaluating a known large anchor once here and then again on the worker.
-    if seeds.iter().any(|&(si, r, c)| wb.sheets.get(si)
-        .and_then(|sh| sh.spill_shapes.get(&CellRef::new(r, c))).is_some_and(large_spill)) {
-        return false;
+    if seeds.iter().any(|&(si, r, c)| {
+        wb.sheets
+            .get(si)
+            .and_then(|sh| sh.spill_shapes.get(&CellRef::new(r, c)))
+            .is_some_and(large_spill)
+    }) {
+        return Ok(false);
     }
     let mut formula_seeds: Vec<deps::CellKey> = seeds
         .iter()
@@ -6623,26 +7696,53 @@ pub fn eval_formula_seeds_immediate(wb: &mut Workbook, seeds: &[deps::CellKey]) 
         .filter(|&(si, r, c)| {
             wb.sheets
                 .get(si)
-                .and_then(|s| s.get(r, c))
-                .is_some_and(|cell| cell.formula.is_some())
+                .and_then(|s| s.formula_arc_of(r, c))
+                .is_some()
         })
         .collect();
     if formula_seeds.is_empty() {
-        return true;
+        return Ok(true);
     }
     formula_seeds.sort_unstable();
     formula_seeds.dedup();
     let scope: HashSet<deps::CellKey> = formula_seeds.iter().copied().collect();
+    let fast_scope = (scope.len() >= 16).then(|| FastScope::from_std(&scope));
     let mut results = Vec::with_capacity(formula_seeds.len());
     {
         let mut calc = Calc::new(wb);
         calc.scope = Some(&scope);
+        calc.fast_scope = fast_scope.as_ref();
+        calc.deadline = deadline;
+        calc.deps_watch = deps_watch;
         for &(si, r, c) in &formula_seeds {
+            if calc.check_abort() {
+                return Err(());
+            }
             let v = calc.cell_value(si, r, c);
+            if calc.aborted {
+                return Err(());
+            }
             results.push((si, r, c, v));
         }
     }
-    write_dirty_results(wb, results)
+    Ok(write_dirty_results(wb, results))
+}
+
+/// 仅即时计算 `seeds` 中本身带有公式的单元格（供提交编辑时在广播前毫秒级算出当前格结果）。
+/// 若遇到需整表物化的动态数组溢出返回 `false`，普通标量公式写回后返回 `true`。
+pub fn eval_formula_seeds_immediate(wb: &mut Workbook, seeds: &[deps::CellKey]) -> bool {
+    eval_formula_seeds_until(wb, seeds, None, None).unwrap_or(false)
+}
+
+/// 带帧预算的即时公式种子求值（供 UI 主线程提交编辑时防止长区间公式阻塞渲染帧）：
+/// 超时时不会把残缺中断值写回工作表，而是安全返回 `false` 交给后台线程完成。
+pub fn eval_formula_seeds_budgeted(
+    wb: &mut Workbook,
+    seeds: &[deps::CellKey],
+    budget: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    eval_formula_seeds_until(wb, seeds, Some(deadline), None).unwrap_or(false)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6661,7 +7761,7 @@ pub fn recalc_interactive(
     recalc_interactive_plan(wb, deps, seeds, deps_ready) == InteractiveRecalc::Complete
 }
 
-/// Determine the smallest safe follow-up job for an interactive edit.
+/// Determine the smallest safe follow-up job for an interactive edit within an 8ms UI frame budget.
 pub fn recalc_interactive_plan(
     wb: &mut Workbook,
     deps: &deps::Deps,
@@ -6678,29 +7778,49 @@ pub fn recalc_interactive_plan(
     }
     let total_cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
     // Blank spill tails consume calculation time without increasing Sheet::len().
-    if deps_ready && total_cells <= 1_200
-        && !wb.sheets.iter().any(|sh| sh.spill_shapes.values().any(large_spill)) {
+    if deps_ready
+        && total_cells <= 1_200
+        && !wb.sheets.iter().any(|sh| sh.spill_shapes.values().any(large_spill))
+    {
         recalc_dirty(wb, deps, seeds);
         return Complete;
     }
+    let deadline = std::time::Instant::now() + INTERACTIVE_FRAME_BUDGET;
     let touches_spill = edit_touches_spill(wb, deps, seeds, deps_ready);
     for &(si, r, c) in seeds {
         if let Some(sheet) = wb.sheets.get_mut(si) {
             sheet.spilled.remove(&CellRef::new(r, c));
         }
     }
-    if !eval_formula_seeds_immediate(wb, seeds) {
+    let can_bg_dirty =
+        deps_ready && !deps.requires_full_recalc() && !touches_spill && !wb.calc_iterate;
+    match eval_formula_seeds_until(
+        wb,
+        seeds,
+        Some(deadline),
+        deps_ready.then_some(deps),
+    ) {
+        Ok(true) => {}
+        Ok(false) => return BackgroundFull,
+        Err(()) => return if can_bg_dirty { BackgroundDirty } else { BackgroundFull },
+    }
+    if !can_bg_dirty {
         return BackgroundFull;
     }
-    if !deps_ready || deps.requires_full_recalc() || touches_spill || wb.calc_iterate {
-        return BackgroundFull;
-    }
-    let Some(dirty) = deps.edit_closure_limited(seeds, 96) else { return BackgroundDirty; };
+    let Some(dirty) = deps.edit_closure_limited(seeds, 96) else {
+        return BackgroundDirty;
+    };
     // Large materialized arrays can take longer than a frame to compare.
     let mut has_tail = false;
     for &(s, r, c) in &dirty {
-        if let Some(shape) = wb.sheets.get(s).and_then(|sh| sh.spill_shapes.get(&CellRef::new(r, c))) {
-            if large_spill(shape) { return BackgroundDirty; }
+        if let Some(shape) = wb
+            .sheets
+            .get(s)
+            .and_then(|sh| sh.spill_shapes.get(&CellRef::new(r, c)))
+        {
+            if large_spill(shape) {
+                return BackgroundDirty;
+            }
             has_tail |= shape.0 > 1 || shape.1 > 1;
         }
     }
@@ -6709,27 +7829,35 @@ pub fn recalc_interactive_plan(
     }
     let mut order: Vec<deps::CellKey> = dirty.iter().copied().collect();
     order.sort_unstable();
-    let t0 = std::time::Instant::now();
-    let budget = std::time::Duration::from_millis(12);
+    let fast_scope = (dirty.len() >= 16).then(|| FastScope::from_std(&dirty));
     let mut results = Vec::with_capacity(order.len());
     let mut timed_out = false;
     {
         let mut calc = Calc::new(wb);
         calc.scope = Some(&dirty);
-        for (idx, &(si, r, c)) in order.iter().enumerate() {
-            if idx >= 4 && t0.elapsed() > budget {
+        calc.fast_scope = fast_scope.as_ref();
+        calc.deadline = Some(deadline);
+        calc.deps_watch = Some(deps);
+        for &(si, r, c) in &order {
+            if calc.check_abort() {
                 timed_out = true;
                 break;
             }
             let v = calc.cell_value(si, r, c);
+            if calc.aborted {
+                timed_out = true;
+                break;
+            }
             results.push((si, r, c, v));
         }
     }
-    if timed_out && has_tail { return BackgroundDirty; }
+    if timed_out && has_tail {
+        return BackgroundDirty;
+    }
     if write_dirty_results(wb, results.clone()) {
         return if timed_out { BackgroundDirty } else { Complete };
     }
-    if timed_out {
+    if timed_out || std::time::Instant::now() >= deadline {
         return BackgroundDirty;
     }
     // Check if any new array in `results` exceeds the interactive spill limit or legacy CSE
@@ -6766,7 +7894,9 @@ pub fn recalc_interactive_plan(
             }
         }
     }
-    if deps.edit_closure_limited(&prospective, 96).is_none() {
+    if deps.edit_closure_limited(&prospective, 96).is_none()
+        || std::time::Instant::now() >= deadline
+    {
         return BackgroundDirty;
     }
     let Ok(changed_tails) = apply_dirty_results_local(wb, deps, results) else {
@@ -6774,16 +7904,28 @@ pub fn recalc_interactive_plan(
     };
     if !changed_tails.is_empty() {
         let mut next_dirty = deps.closure_excluding_watches(&changed_tails, &dirty);
-        next_dirty.extend(deps.dynamic_cells());
+        next_dirty.extend(deps.dynamic_cells_touching(&changed_tails));
         if !next_dirty.is_empty() {
+            if next_dirty.len() > 96 || std::time::Instant::now() >= deadline {
+                return BackgroundFull;
+            }
             let mut next_order: Vec<deps::CellKey> = next_dirty.iter().copied().collect();
             next_order.sort_unstable();
             let mut follow_results = Vec::with_capacity(next_order.len());
             {
                 let mut calc = Calc::new(wb);
                 calc.scope = Some(&next_dirty);
+                calc.deadline = Some(deadline);
+                calc.deps_watch = Some(deps);
                 for &(si, r, c) in &next_order {
-                    follow_results.push((si, r, c, calc.cell_value(si, r, c)));
+                    if calc.check_abort() {
+                        return BackgroundFull;
+                    }
+                    let v = calc.cell_value(si, r, c);
+                    if calc.aborted {
+                        return BackgroundFull;
+                    }
+                    follow_results.push((si, r, c, v));
                 }
             }
             let Ok(more_changed) = apply_dirty_results_local(wb, deps, follow_results) else {
@@ -6965,70 +8107,103 @@ fn recalc_selected(
         };
         let remaining = pending.as_ref().map_or(formulas.len(), Vec::len);
         if remaining > 0 {
-            let mut calc = Calc::new(wb);
-            calc.scope = scope.as_ref();
-            calc.shared = Some(&shared_caches);
-            if let Some(ref pend_vec) = pending {
-                // Sequential formulas may refer to any parallel batch result, even across sheets.
-                // Keep the original sheet untouched until the complete pass is ready to publish.
-                let mut pend_iter = pend_vec.iter().copied().peekable();
-                for (slot, &(s, r, c, ref value)) in results.iter().enumerate() {
-                    if pend_iter.next_if_eq(&slot).is_none() {
-                        calc.insert_memo((s, r, c), value.clone());
-                    }
+            let mut pending_updates: Vec<(usize, FValue)> = if pending.is_some() {
+                Vec::with_capacity(remaining)
+            } else {
+                Vec::new()
+            };
+            let mut seq_results: Vec<(usize, u32, u32, FValue)> = if pending.is_none() {
+                Vec::with_capacity(formulas.len())
+            } else {
+                Vec::new()
+            };
+            {
+                let mut calc = Calc::new(wb);
+                calc.scope = scope.as_ref();
+                calc.cancel = cancel;
+                calc.shared = Some(&shared_caches);
+                if let Some(ref pend_vec) = pending {
+                    // Sequential formulas may refer to any parallel batch result, even across sheets.
+                    // Borrow the sorted parallel batch slice directly via O(log N) lookup instead of
+                    // cloning up to 1M scalar values into `Calc::memo` FxHashMap!
+                    calc.batch_results = Some(BatchResults {
+                        values: &results,
+                        pending: pend_vec,
+                    });
                 }
-            }
-            calc.volatile_values = std::mem::take(&mut volatile_values);
-            let profile = profile_enabled();
-            let mut slow: Vec<(f64, usize, u32, u32, String)> = Vec::new();
-            for i in 0..remaining {
-                let slot = pending.as_ref().map_or(i, |indices| indices[i]);
-                let (si, r, c) = formulas[slot];
-                if let Some(flag) = cancel {
-                    // 每 256 个公式查一次，取消时立刻放弃本轮（尚未写回）
-                    if i % 256 == 0 && flag.load(Ordering::Relaxed) {
+                calc.volatile_values = std::mem::take(&mut volatile_values);
+                let profile = profile_enabled();
+                let mut slow: Vec<(f64, usize, u32, u32, String)> = Vec::new();
+                for i in 0..remaining {
+                    let slot = pending.as_ref().map_or(i, |indices| indices[i]);
+                    let (si, r, c) = formulas[slot];
+                    if let Some(flag) = cancel {
+                        // 每 256 个公式查一次，取消时立刻放弃本轮（尚未写回）
+                        if i % 256 == 0 && flag.load(Ordering::Relaxed) {
+                            drop(calc);
+                            return mark_cancelled(wb);
+                        }
+                    }
+                    if let Some((done, _)) = progress {
+                        done.store(formulas.len() - remaining + i, Ordering::Relaxed);
+                    }
+                    let t0 = profile.then(std::time::Instant::now);
+                    let v = calc.cell_value(si, r, c);
+                    if calc.aborted {
                         drop(calc);
                         return mark_cancelled(wb);
                     }
+                    if let Some(start) = t0 {
+                        slow.push((
+                            start.elapsed().as_secs_f64(),
+                            si,
+                            r,
+                            c,
+                            wb.sheets[si]
+                                .get(r, c)
+                                .and_then(|x| x.formula.as_deref().map(|f| f.to_string()))
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    if pending.is_some() {
+                        pending_updates.push((slot, v));
+                    } else {
+                        seq_results.push((si, r, c, v));
+                    }
                 }
-                if let Some((done, _)) = progress {
-                    done.store(formulas.len() - remaining + i, Ordering::Relaxed);
+                if profile {
+                    for (n, c, t) in prof_dump().into_iter().take(15) {
+                        eprintln!("  [fn] {n:<12} {c:>8} 次  {t:>8.2}s");
+                    }
+                    slow.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                    let total: f64 = slow.iter().map(|x| x.0).sum();
+                    eprintln!(
+                        "[profile] 公式数 {} 总耗时 {:.2}s  聚合缓存命中 {} 未命中 {}",
+                        slow.len(),
+                        total,
+                        calc.agg_hits,
+                        calc.agg_miss
+                    );
+                    for (d, si, r, c, f) in slow.iter().take(12) {
+                        eprintln!(
+                            "  {:>7.3}s  {}!R{}C{}  {}",
+                            d,
+                            si,
+                            r + 1,
+                            c + 1,
+                            f.chars().take(90).collect::<String>().as_str()
+                        );
+                    }
                 }
-                let t0 = profile.then(std::time::Instant::now);
-                let v = calc.cell_value(si, r, c);
-                if let Some(start) = t0 {
-                    slow.push((
-                        start.elapsed().as_secs_f64(),
-                        si,
-                        r,
-                        c,
-                        wb.sheets[si]
-                            .get(r, c)
-                            .and_then(|x| x.formula.as_deref().map(|f| f.to_string()))
-                            .unwrap_or_default(),
-                    ));
-                }
-                if pending.is_some() { results[slot].3 = v; }
-                else { results.push((si, r, c, v)); }
+                volatile_values = std::mem::take(&mut calc.volatile_values);
             }
-            if profile {
-                for (n, c, t) in prof_dump().into_iter().take(15) {
-                    eprintln!("  [fn] {n:<12} {c:>8} 次  {t:>8.2}s");
+            if pending.is_some() {
+                for (slot, v) in pending_updates {
+                    results[slot].3 = v;
                 }
-                slow.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-                let total: f64 = slow.iter().map(|x| x.0).sum();
-                eprintln!(
-                    "[profile] 公式数 {} 总耗时 {:.2}s  聚合缓存命中 {} 未命中 {}",
-                    slow.len(),
-                    total,
-                    calc.agg_hits,
-                    calc.agg_miss
-                );
-                for (d, si, r, c, f) in slow.iter().take(12) {
-                    eprintln!("  {:>7.3}s  {}!R{}C{}  {}", d, si, r + 1, c + 1, f.chars().take(90).collect::<String>().as_str());
-                }
+            } else {
+                results = seq_results;
             }
-            volatile_values = std::mem::take(&mut calc.volatile_values);
         }
 
         mark!("求值");
@@ -7082,6 +8257,11 @@ fn recalc_selected(
             }
             changed_after_wb.sort_unstable();
             changed_after_wb.dedup();
+            if cached_graph.is_none()
+                && !deps::any_formula_depends_on_sorted(wb, selected, &formulas, &changed_after_wb)
+            {
+                break;
+            }
             let graph = cached_graph.get_or_insert_with(|| deps::Deps::build_filtered(wb, selected));
             let mut affected = graph.closure(&changed_after_wb);
             affected.extend(graph.dynamic_cells());
@@ -7108,45 +8288,64 @@ fn recalc_selected(
                 if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                     return mark_cancelled(wb);
                 }
-                let mut sub_results = Vec::new();
                 let mut produced_array = false;
-                {
-                    let mut calc = Calc::new(wb);
-                    calc.scope = Some(&affected);
-                    calc.shared = Some(&sub_shared);
-                    calc.volatile_values = std::mem::take(&mut volatile_values);
-                    if let Some(mut batch) = sub_parallel {
-                        let mut pend = batch.pending.iter().copied().peekable();
-                        for (slot, (s, r, c, v)) in batch.values.iter().enumerate() {
-                            if pend.next_if_eq(&slot).is_none() {
-                                calc.insert_memo((*s, *r, *c), v.clone());
+                let sub_results = if let Some(mut batch) = sub_parallel {
+                    if !batch.pending.is_empty() {
+                        let mut pending_updates = Vec::with_capacity(batch.pending.len());
+                        {
+                            let mut calc = Calc::new(wb);
+                            calc.scope = Some(&affected);
+                            calc.cancel = cancel;
+                            calc.shared = Some(&sub_shared);
+                            calc.batch_results = Some(BatchResults {
+                                values: &batch.values,
+                                pending: &batch.pending,
+                            });
+                            calc.volatile_values = std::mem::take(&mut volatile_values);
+                            for &slot in &batch.pending {
+                                if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                                    drop(calc);
+                                    return mark_cancelled(wb);
+                                }
+                                let (si, r, c) = sub_order[slot];
+                                let v = calc.cell_value(si, r, c);
+                    if calc.aborted {
+                        drop(calc);
+                        return mark_cancelled(wb);
+                    }
+                                produced_array |= matches!(v, FValue::Array(_));
+                                pending_updates.push((slot, v));
                             }
+                            volatile_values = std::mem::take(&mut calc.volatile_values);
                         }
-                        for slot in batch.pending {
-                            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                                drop(calc);
-                                return mark_cancelled(wb);
-                            }
-                            let (si, r, c) = sub_order[slot];
-                            let v = calc.cell_value(si, r, c);
-                            produced_array |= matches!(v, FValue::Array(_));
+                        for (slot, v) in pending_updates {
                             batch.values[slot].3 = v;
                         }
-                        sub_results = batch.values;
-                    } else {
-                        sub_results.reserve(sub_order.len());
-                        for &(si, r, c) in &sub_order {
-                            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                                drop(calc);
-                                return mark_cancelled(wb);
-                            }
-                            let v = calc.cell_value(si, r, c);
-                            produced_array |= matches!(v, FValue::Array(_));
-                            sub_results.push((si, r, c, v));
+                    }
+                    batch.values
+                } else {
+                    let mut calc = Calc::new(wb);
+                    calc.scope = Some(&affected);
+                    calc.cancel = cancel;
+                    calc.shared = Some(&sub_shared);
+                    calc.volatile_values = std::mem::take(&mut volatile_values);
+                    let mut sub_results = Vec::with_capacity(sub_order.len());
+                    for &(si, r, c) in &sub_order {
+                        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                            drop(calc);
+                            return mark_cancelled(wb);
                         }
+                        let v = calc.cell_value(si, r, c);
+                    if calc.aborted {
+                        drop(calc);
+                        return mark_cancelled(wb);
+                    }
+                        produced_array |= matches!(v, FValue::Array(_));
+                        sub_results.push((si, r, c, v));
                     }
                     volatile_values = std::mem::take(&mut calc.volatile_values);
-                }
+                    sub_results
+                };
                 if !produced_array {
                     write_back(wb, sub_results);
                     break;
@@ -7206,6 +8405,7 @@ fn recalc_selected(
         }
     }
     mark!("结束");
+    let _ = t_phase;
     if phase {
         eprintln!("[recalc] 总耗时 {:.2}s（{} 遍）", t_all.elapsed().as_secs_f64(), pass_done);
     }
@@ -7269,18 +8469,35 @@ pub fn set_formula(sheet: &mut Sheet, r: u32, c: u32, formula: &str, cached: FVa
 /// 只强制重算某张工作表：手动模式下“计算工作表”用。
 /// 走 `formula_cells()` 稀疏页位图 + 多核 `recalc_selected`，不把其它表的无关易失函数拉进来。
 pub fn recalc_sheet(wb: &mut Workbook, sheet: usize) -> usize {
+    recalc_sheet_with_progress(wb, sheet, None, None).unwrap_or(0)
+}
+
+/// 可取消、带实时进度的单表重算（消除前置 `formula_cells().count()` 重复扫描）。
+pub fn recalc_sheet_with_progress(
+    wb: &mut Workbook,
+    sheet: usize,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: Option<(&std::sync::atomic::AtomicUsize, &std::sync::atomic::AtomicUsize)>,
+) -> Option<usize> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     if sheet >= wb.sheets.len() {
-        return 0;
+        return Some(0);
     }
-    let count = wb.sheets[sheet].formula_cells().count();
+    let local_done = AtomicUsize::new(0);
+    let local_total = AtomicUsize::new(0);
+    let eff_progress = Some(progress.unwrap_or((&local_done, &local_total)));
     let mut pending_sheets = std::mem::take(&mut wb.calc_pending_sheets);
     let mut mask = vec![false; wb.sheets.len()];
     mask[sheet] = true;
-    let _ = recalc_selected(wb, Some(&mask), None, None);
-    pending_sheets.remove(&sheet);
+    let completed = recalc_selected(wb, Some(&mask), cancel, eff_progress);
+    if completed {
+        pending_sheets.remove(&sheet);
+    } else {
+        pending_sheets.insert(sheet);
+    }
     wb.calc_pending_sheets = pending_sheets;
     wb.calc_pending = !wb.calc_pending_sheets.is_empty();
-    count
+    completed.then(|| eff_progress.unwrap().1.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]

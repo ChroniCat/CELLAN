@@ -793,3 +793,377 @@ fn approximate_lookups_skip_holes_and_use_only_keys_of_the_lookup_type() {
         FValue::number(3.0)
     );
 }
+
+#[test]
+fn wave5_p0_02_parallel_batch_borrows_without_memo_clone_and_converges_spills() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "CalcSheet".into();
+    wb.sheets.push(Sheet::new("SpillSheet"));
+    for r in 0..2_000u32 {
+        number(&mut wb, r, 0, (r + 1) as f64);
+        formula(&mut wb, r, 1, &format!("=A{}*2", r + 1));
+    }
+    // Sequential dynamic array on Sheet 1 reading parallel scalar result from Sheet 0
+    set_formula(
+        &mut wb.sheets[1],
+        0,
+        0,
+        "=SEQUENCE(4,1,CalcSheet!B2000,10)",
+        FValue::Empty,
+    );
+    // Case A: no formula reads spill tails -> Pass-0 precheck skips full Deps rebuild
+    recalc_all_force(&mut wb);
+    assert_eq!(wb.sheets[1].value(0, 0), Value::Number(4000.0));
+    assert_eq!(wb.sheets[1].value(3, 0), Value::Number(4030.0));
+
+    // Case B: formula reads spill tail -> Pass-0 precheck detects dependency and converges locally
+    set_formula(&mut wb.sheets[1], 0, 2, "=SUM(A1:A4)", FValue::Empty);
+    number(&mut wb, 1_999, 0, 500.0);
+    recalc_all_force(&mut wb);
+    assert_eq!(wb.sheets[1].value(0, 0), Value::Number(1000.0));
+    assert_eq!(wb.sheets[1].value(3, 0), Value::Number(1030.0));
+    assert_eq!(wb.sheets[1].value(0, 2), Value::Number(4060.0));
+}
+
+#[test]
+fn wave5_p0_07_deep_chain_dirty_recalc_and_incremental_tail_and_overlay_indexes() {
+    // 1. Width-1 forward chain dirty recalc (`try_eval_tight_forward_chain` + bitset BFS)
+    let mut chain_wb = Workbook::new_blank();
+    number(&mut chain_wb, 0, 0, 1.0);
+    for r in 1..4_000u32 {
+        formula(&mut chain_wb, r, 0, &format!("=A{}+1", r));
+    }
+    recalc_all_force(&mut chain_wb);
+    let chain_deps = deps::Deps::build_after_recalc(&chain_wb);
+    number(&mut chain_wb, 0, 0, 101.0);
+    assert_eq!(recalc_dirty(&mut chain_wb, &chain_deps, &[(0, 0, 0)]), 3_999);
+    assert_eq!(chain_wb.sheets[0].value(3_999, 0), Value::Number(4_100.0));
+
+    // 2. Tail row append crossing 256-row page boundary incrementally patches LookupMap & SharedCondColumn
+    let mut sheet = Sheet::new("Data");
+    for r in 0..2048u32 {
+        sheet.set(
+            r,
+            0,
+            Cell {
+                value: Value::Text(format!("k{r}").into()),
+                formula: None,
+            },
+        );
+        sheet.set(
+            r,
+            1,
+            Cell {
+                value: Value::Number((r % 100) as f64),
+                formula: None,
+            },
+        );
+    }
+    let (_, r0) = sheet
+        .shared_lookup
+        .get_or_build_vertical(&sheet, (0, 0, 0, 2047, 0), &lookup_cache::LookupEvalScope::UNSCOPED)
+        .unwrap();
+    assert_eq!(r0, 2048);
+    let (sc0, _) = sheet
+        .shared_lookup
+        .get_or_build_cond_column(&sheet, (0, 0, 1, 2047, 1), &lookup_cache::LookupEvalScope::UNSCOPED)
+        .unwrap();
+    let _ = sc0.sorted_nums().unwrap();
+    let (sc_txt0, _) = sheet
+        .shared_lookup
+        .get_or_build_cond_column(&sheet, (0, 0, 0, 2047, 0), &lookup_cache::LookupEvalScope::UNSCOPED)
+        .unwrap();
+    let _ = sc_txt0.text_dict().unwrap();
+
+    // Append row 2048 (page 8, crossing 256-row boundary!)
+    let mut grown = sheet.clone();
+    grown.set(
+        2048,
+        0,
+        Cell {
+            value: Value::Text("k2048".into()),
+            formula: None,
+        },
+    );
+    grown.set(
+        2048,
+        1,
+        Cell {
+            value: Value::Number(777.0),
+            formula: None,
+        },
+    );
+    let (idx_grown, v_reads) = grown
+        .shared_lookup
+        .get_or_build_vertical(&grown, (0, 0, 0, 2048, 0), &lookup_cache::LookupEvalScope::UNSCOPED)
+        .unwrap();
+    assert!(v_reads <= 256, "expected incremental tail patch <= 256 reads, got {v_reads}");
+    assert_eq!(
+        idx_grown.get_first(&lookup_cache::LookupKey::from_fvalue(&FValue::text("k2048"))),
+        Some(2048)
+    );
+    let (sc_grown, c_reads) = grown
+        .shared_lookup
+        .get_or_build_cond_column(&grown, (0, 0, 1, 2048, 1), &lookup_cache::LookupEvalScope::UNSCOPED)
+        .unwrap();
+    assert!(c_reads <= 256, "expected incremental cond tail patch <= 256 reads, got {c_reads}");
+    let fresh_sc = lookup_cache::SharedLookup::default()
+        .get_or_build_cond_column(&grown, (0, 0, 1, 2048, 1), &lookup_cache::LookupEvalScope::UNSCOPED)
+        .unwrap()
+        .0;
+    assert_eq!(sc_grown.sorted_nums(), fresh_sc.sorted_nums());
+    let (sc_txt_grown, t_reads) = grown
+        .shared_lookup
+        .get_or_build_cond_column(&grown, (0, 0, 0, 2048, 0), &lookup_cache::LookupEvalScope::UNSCOPED)
+        .unwrap();
+    assert!(t_reads <= 256);
+    let fresh_txt = lookup_cache::SharedLookup::default()
+        .get_or_build_cond_column(&grown, (0, 0, 0, 2048, 0), &lookup_cache::LookupEvalScope::UNSCOPED)
+        .unwrap()
+        .0;
+    assert_eq!(sc_txt_grown.text_dict(), fresh_txt.text_dict());
+
+    // 3. Formula key column dirty overlay + persistent BuiltOrdered value-delta patch & BuiltGroups reuse
+    let mut fwb = Workbook::new_blank();
+    for r in 0..1024u32 {
+        fwb.sheets[0].set(
+            r,
+            1,
+            Cell {
+                value: Value::Text(format!("item{r}").into()),
+                formula: None,
+            },
+        );
+        number(&mut fwb, r, 2, r as f64);
+        number(&mut fwb, r, 3, (r % 10) as f64);
+        number(&mut fwb, r, 4, (r * 3) as f64);
+        number(&mut fwb, r, 5, (r % 7) as f64 / 10.0);
+        formula(&mut fwb, r, 0, &format!("=B{}&\"-\"&C{}", r + 1, r + 1));
+    }
+    formula(&mut fwb, 0, 6, "=XLOOKUP(\"patched-5\",A1:A1024,E1:E1024,-1)");
+    formula(&mut fwb, 1, 6, "=SUMIFS(E1:E1024,D1:D1024,\">4\")");
+    formula(&mut fwb, 2, 6, "=SUMIFS(F1:F1024,D1:D1024,\">4\")");
+    formula(&mut fwb, 3, 6, "=SUMIFS(E1:E1024,D1:D1024,3)");
+    formula(&mut fwb, 4, 6, "=SUMIFS(E1:E1024,D1:D1024,5)");
+    recalc_all_force(&mut fwb);
+    let fdeps = deps::Deps::build_after_recalc(&fwb);
+    assert_eq!(fwb.sheets[0].value(0, 6), Value::Number(-1.0));
+
+    // Edit B6 -> A6 becomes "patched-5", XLOOKUP finds row 5 (`5 * 3 = 15.0`) via dirty overlay
+    fwb.sheets[0].set(
+        5,
+        1,
+        Cell {
+            value: Value::Text("patched".into()),
+            formula: None,
+        },
+    );
+    recalc_dirty(&mut fwb, &fdeps, &[(0, 5, 1)]);
+    assert_eq!(fwb.sheets[0].value(0, 6), Value::Number(15.0));
+
+    // Edit 1 value cell in E and F while D is unchanged -> exercises BuiltOrdered exact + paged delta patch!
+    number(&mut fwb, 9, 4, 10_000.0); // D10 is 9 (> 4)
+    number(&mut fwb, 9, 5, 99.25);
+    recalc_dirty(&mut fwb, &fdeps, &[(0, 9, 4), (0, 9, 5)]);
+    let fresh_exact = Calc::new(&fwb).eval_node(&parse("SUMIFS(E1:E1024,D1:D1024,\">4\")").unwrap(), 0);
+    let fresh_frac = Calc::new(&fwb).eval_node(&parse("SUMIFS(F1:F1024,D1:D1024,\">4\")").unwrap(), 0);
+    assert_eq!(to_fvalue(&fwb.sheets[0].value(1, 6)), fresh_exact);
+    assert_eq!(to_fvalue(&fwb.sheets[0].value(2, 6)), fresh_frac);
+}
+
+#[test]
+fn wave5_p0_08_p1_05_columnar_fast_paths_sumif_unique_and_template_sharing() {
+    let mut wb = Workbook::new_blank();
+    for r in 0..1024u32 {
+        if r % 5 != 0 {
+            number(&mut wb, r, 0, (r + 1) as f64);
+        }
+        number(&mut wb, r, 1, ((r % 20) + 1) as f64);
+        number(&mut wb, r, 2, 2.0);
+    }
+    // Tall column A (up to row 5000) next to short column G (only 10 rows) -> col_max_row trimming!
+    number(&mut wb, 5000, 0, 1.0);
+    for r in 0..10u32 {
+        wb.sheets[0].set(
+            r,
+            6,
+            Cell {
+                value: Value::Text((if r % 2 == 0 { "East" } else { "West" }).into()),
+                formula: None,
+            },
+        );
+        number(&mut wb, r, 7, 10.0);
+    }
+
+    let mut calc = Calc::new(&wb);
+    // COUNT POPCNT + 2D & multi-arg streaming aggregates + streaming SUMPRODUCT
+    for src in [
+        "COUNT(A1:A1024)",
+        "SUM(A1:C1024)",
+        "AVERAGE(A1:C1024)",
+        "MIN(A1:C1024)",
+        "MAX(A1:C1024)",
+        "COUNT(A1:C1024)",
+        "COUNTA(A1:C1024)",
+        "SUM(A1:A512,B1:B512,10)",
+        "SUMPRODUCT(B1:B1024,C1:C1024)",
+        "SUMIF(B1:B1024,\">10\",C1:C1024)",
+        "SUMIF(B1:B1024,5,C1:C1024)",
+    ] {
+        let node = parse(src).unwrap();
+        let Node::Func(ref fname, ref fargs) = node else { unreachable!() };
+        let got = calc.eval_node(&node, 0);
+        let want = Calc::new(&wb).call_generic(fname.as_str(), fargs, 0);
+        assert!((got.to_number().unwrap() - want.to_number().unwrap()).abs() < 1e-9, "{src}: {got:?} vs {want:?}");
+    }
+
+    // Per-column G:G trimming despite A5001 existing on the same sheet!
+    let mut trim_calc = Calc::new(&wb);
+    assert_eq!(
+        trim_calc.eval_node(&parse("SUMIF(G:G,\"East\",H:H)").unwrap(), 0),
+        FValue::number(50.0)
+    );
+    assert!(
+        trim_calc.range_reads <= 512,
+        "expected per-column G:G trimming <= 512 reads, got {}",
+        trim_calc.range_reads
+    );
+
+    // UNIQUE typed hashing: 12 vs "12", Empty vs "", TRUE vs "TRUE" stay distinct!
+    let u_val = eval_formula(&wb, 0, "UNIQUE({12;\"12\";12;TRUE;\"TRUE\";\"\"})");
+    let FValue::Array(u_arr) = u_val else { panic!("expected UNIQUE array") };
+    assert_eq!(u_arr.rows, 5);
+
+    // Template sharing for Defined Names, scoped names, LET, LAMBDA, and array literals
+    for pattern in [
+        ("=TaxRate*A1+{1,2}", "=TaxRate*A2+{1,2}"),
+        ("=Sheet1!LocalRate+B1", "=Sheet1!LocalRate+B2"),
+        ("=LET(x,A1*2,y,x+1,y)", "=LET(x,A2*2,y,x+1,y)"),
+        ("=LAMBDA(v,v+A1)(5)", "=LAMBDA(v,v+A2)(5)"),
+    ] {
+        let (p1, dr1) = compiled::with_shifted(pattern.0.trim_start_matches('='), 0, 2, |node, dr, _| {
+            (node as *const Node as usize, dr)
+        })
+        .unwrap();
+        let (p2, dr2) = compiled::with_shifted(pattern.1.trim_start_matches('='), 1, 2, |node, dr, _| {
+            (node as *const Node as usize, dr)
+        })
+        .unwrap();
+        assert_eq!(
+            (p1, dr2 - dr1),
+            (p2, 1),
+            "expected shared Template Node pointer for {:?}",
+            pattern
+        );
+    }
+}
+
+#[test]
+fn wave5_p0_09_p1_06_cancel_frame_budget_today_baseline_and_dynamic_watch() {
+    use std::sync::atomic::AtomicBool;
+
+    // 1. Mid-formula cancellation & recalc_sheet_with_progress
+    let mut wb = Workbook::new_blank();
+    for r in 0..16_384u32 {
+        number(&mut wb, r, 0, r as f64);
+    }
+    formula(&mut wb, 0, 1, "=SUM(A1:A16384)");
+    let cancel = AtomicBool::new(true);
+    assert_eq!(recalc_sheet_with_progress(&mut wb, 0, Some(&cancel), None), None);
+    assert!(wb.calc_pending);
+    let not_cancelled = AtomicBool::new(false);
+    assert_eq!(
+        recalc_sheet_with_progress(&mut wb, 0, Some(&not_cancelled), None),
+        Some(1)
+    );
+    assert!(!wb.calc_pending);
+
+    // 2. Budgeted seed evaluation with expired deadline never writes partial/error values
+    wb.sheets[0].set_formula_cache(0, 1, Value::Number(123.0));
+    assert!(!eval_formula_seeds_budgeted(
+        &mut wb,
+        &[(0, 0, 1)],
+        std::time::Duration::ZERO
+    ));
+    assert_eq!(wb.sheets[0].value(0, 1), Value::Number(123.0));
+
+    // 3. TODAY() cached baseline certification
+    let mut today_wb = Workbook::new_blank();
+    formula(&mut today_wb, 0, 0, "=TODAY()");
+    formula(&mut today_wb, 1, 0, "=A1+1");
+    recalc_all_force(&mut today_wb);
+    let certified = deps::Deps::build_with_cached_baseline(&today_wb, true);
+    assert!(certified.can_reuse_calculated_sheets(&today_wb));
+    today_wb.sheets[0].set_formula_cache(0, 0, Value::Number(1.0)); // stale date serial
+    let uncertified = deps::Deps::build_with_cached_baseline(&today_wb, true);
+    assert!(!uncertified.can_reuse_calculated_sheets(&today_wb));
+
+    // 4. OFFSET / INDIRECT dynamic watch pruning on unrelated spill-tail hops
+    let mut dwb = Workbook::new_blank();
+    number(&mut dwb, 0, 0, 3.0);
+    number(&mut dwb, 0, 4, 42.0);
+    formula(&mut dwb, 0, 1, "=SEQUENCE(A1,1,1,1)"); // spills B1:B3
+    formula(&mut dwb, 0, 2, "=SUM(B1:B5)"); // reads spill tail
+    formula(&mut dwb, 0, 3, "=OFFSET(E1,0,0)"); // unrelated dynamic cell watching E1
+    recalc_all_force(&mut dwb);
+    let ddeps = deps::Deps::build_after_recalc(&dwb);
+    // Prime dynamic watch on D1 (`(0, 0, 3)`), then trigger spill growth on B1 (`A1 = 4`)
+    number(&mut dwb, 0, 0, 4.0);
+    let evaluated = recalc_dirty(&mut dwb, &ddeps, &[(0, 0, 0)]);
+    assert_eq!(dwb.sheets[0].value(0, 2), Value::Number(10.0));
+    assert_eq!(dwb.sheets[0].value(0, 3), Value::Number(42.0));
+    // First hop evaluates B1, C1, D1 (3 cells); second hop after B4 tail materializes ONLY re-evaluates C1 (1 cell, skipping D1!)
+    assert_eq!(evaluated, 4);
+
+    // 5. Cold XLOOKUP index build respects expired frame budget deadline via LookupEvalScope
+    let mut lwb = Workbook::new_blank();
+    for r in 0..16_384u32 {
+        number(&mut lwb, r, 0, r as f64);
+        number(&mut lwb, r, 1, (r * 10) as f64);
+    }
+    formula(&mut lwb, 0, 2, "=XLOOKUP(16000,A1:A16384,B1:B16384,-1)");
+    lwb.sheets[0].set_formula_cache(0, 2, Value::Number(777.0));
+    assert!(!eval_formula_seeds_budgeted(
+        &mut lwb,
+        &[(0, 0, 2)],
+        std::time::Duration::ZERO
+    ));
+    assert_eq!(lwb.sheets[0].value(0, 2), Value::Number(777.0));
+}
+
+#[test]
+fn wave5_multi_arg_scalar_coercion_blank_key_lookup_and_xlinks_utf8_safety() {
+    let mut wb = Workbook::new_blank();
+    for r in 0..300u32 {
+        number(&mut wb, r, 0, (r + 1) as f64);
+    }
+    number(&mut wb, 2_000, 5, 99.0); // extend sheet_bounds max_r to 2000 while col A ends at 299
+
+    let mut calc = Calc::new(&wb);
+    for src in [
+        "SUM(A1:A300,TRUE,\"123\",\"abc\")",
+        "AVERAGE(A1:A300,TRUE,\"123\",\"abc\")",
+        "MIN(A1:A300,FALSE,\"-999\")",
+        "MAX(A1:A300,TRUE,\"9999\")",
+        "COUNT(A1:A300,TRUE,FALSE,\"123\",\"abc\")",
+        "COUNTA(A1:A300,TRUE,\"\",\"abc\")",
+    ] {
+        let node = parse(src).unwrap();
+        let Node::Func(ref fname, ref fargs) = node else { unreachable!() };
+        let got = calc.eval_node(&node, 0);
+        let want = Calc::new(&wb).call_generic(fname.as_str(), fargs, 0);
+        assert_eq!(got, want, "{src}");
+    }
+
+    // Dense prefix A1:A300 with trailing blanks A301:A1000 -> Empty lookup finds first (301) and last (1000) blank!
+    assert_eq!(eval_formula(&wb, 0, "MATCH(Z99,A1:A1000,0)"), FValue::number(301.0));
+    assert_eq!(eval_formula(&wb, 0, "XMATCH(Z99,A1:A1000,0,1)"), FValue::number(301.0));
+    assert_eq!(eval_formula(&wb, 0, "XMATCH(Z99,A1:A1000,0,-1)"), FValue::number(1000.0));
+    assert_eq!(eval_formula(&wb, 0, "VLOOKUP(Z99,A1:B1000,2,FALSE)"), FValue::Empty);
+
+    // Byte-scanned xlinks::books_in_formula handles UTF-8 sheet names, string literals, and structured table refs
+    assert_eq!(
+        crate::xlinks::books_in_formula("=\"[Fake.xlsx]Sheet1!A1\" & '[预算2026.xlsx]一月明细'!B2 + 表1[金额]"),
+        vec!["预算2026.xlsx".to_string()]
+    );
+}

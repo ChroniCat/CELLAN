@@ -739,12 +739,34 @@ impl PointColumn {
         }
     }
 
-    fn query_sorted_rows(&self, rows: &[CellKey], mut emit: impl FnMut(u32) -> bool) -> bool {
+    fn query_sorted_rows_with_cursor(
+        &self,
+        rows: &[CellKey],
+        cursor: &mut usize,
+        mut emit: impl FnMut(u32) -> bool,
+    ) -> bool {
         if !self.sorted.is_empty() {
             let sorted = self.sorted.as_slice();
-            let mut lo = 0usize;
+            let mut lo = if *cursor < sorted.len()
+                && rows.first().is_some_and(|first| sorted[*cursor].0 <= first.1)
+            {
+                *cursor
+            } else {
+                0
+            };
             for &(_, r, _) in rows {
-                lo += sorted[lo..].partition_point(|&(pr, _)| pr < r);
+                if lo < sorted.len() && sorted[lo].0 < r {
+                    // Fast sequential / galloping step for linear column chains (`chain 1M`):
+                    // avoids 20-step binary searches when consecutive waves advance by 1 row!
+                    let probe = (lo + 4).min(sorted.len() - 1);
+                    if sorted[probe].0 >= r {
+                        while lo < sorted.len() && sorted[lo].0 < r {
+                            lo += 1;
+                        }
+                    } else {
+                        lo += sorted[lo..].partition_point(|&(pr, _)| pr < r);
+                    }
+                }
                 let mut k = lo;
                 while k < sorted.len() && sorted[k].0 == r {
                     if !emit(sorted[k].1) {
@@ -752,7 +774,9 @@ impl PointColumn {
                     }
                     k += 1;
                 }
+                lo = k;
             }
+            *cursor = lo;
         }
         if !self.unsorted.is_empty() {
             for &(pr, id) in self.unsorted.iter() {
@@ -762,6 +786,36 @@ impl PointColumn {
             }
         }
         true
+    }
+}
+
+#[derive(Clone, Debug)]
+enum DynamicWatch {
+    One(CompactRect),
+    Many(Vec<CompactRect>),
+}
+
+impl DynamicWatch {
+    fn push(&mut self, cr: CompactRect) {
+        match self {
+            Self::One(existing) => {
+                if *existing != cr {
+                    *self = Self::Many(vec![*existing, cr]);
+                }
+            }
+            Self::Many(list) => {
+                if !list.contains(&cr) {
+                    list.push(cr);
+                }
+            }
+        }
+    }
+
+    fn as_slice(&self) -> &[CompactRect] {
+        match self {
+            Self::One(r) => std::slice::from_ref(r),
+            Self::Many(v) => v.as_slice(),
+        }
     }
 }
 
@@ -790,11 +844,15 @@ pub struct Deps {
     untracked_spill_errors: CowSet<CellKey>,
     has_spill_op_refs: bool,
     volatile: CowSet<CellKey>,
+    today_only_cells: CowSet<CellKey>,
     volatile_refs: CowSet<CellKey>,
     visibility: CowSet<CellKey>,
     runtime_refs: CowSet<CellKey>,
     structural_sensitive: CowSet<CellKey>,
     indirect_definitions: CowSet<CellKey>,
+    /// Last resolved target rectangle(s) of `OFFSET`/`INDIRECT` cells so spill-tail hops
+    /// prune unrelated dynamic formulas instead of re-evaluating every dynamic cell!
+    dynamic_watches: Arc<std::sync::RwLock<FxHashMap<CellKey, DynamicWatch>>>,
     computed_baseline: bool,
     pub rect_count: usize,
 }
@@ -848,6 +906,116 @@ impl Deps {
             .iter()
             .chain(self.volatile_refs.iter())
             .copied()
+    }
+
+    pub(crate) fn clear_dynamic_watch(&self, key: CellKey) {
+        if self.volatile_refs.contains(&key) || self.runtime_refs.contains(&key) {
+            if let Ok(mut guard) = self.dynamic_watches.write() {
+                guard.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn record_dynamic_watch(
+        &self,
+        key: CellKey,
+        sheet: usize,
+        r1: i64,
+        c1: i64,
+        r2: i64,
+        c2: i64,
+    ) {
+        if !(self.volatile_refs.contains(&key) || self.runtime_refs.contains(&key)) {
+            return;
+        }
+        let Some(cr) = CompactRect::from_rect(Rect {
+            sheet,
+            r1: r1.min(r2).max(0),
+            c1: c1.min(c2).max(0),
+            r2: r1.max(r2).max(0),
+            c2: c1.max(c2).max(0),
+        }) else {
+            return;
+        };
+        if let Ok(rg) = self.dynamic_watches.read()
+            && let Some(existing) = rg.get(&key)
+            && existing.as_slice().contains(&cr)
+        {
+            return;
+        }
+        if let Ok(mut wg) = self.dynamic_watches.write() {
+            match wg.get_mut(&key) {
+                Some(existing) => existing.push(cr),
+                None => {
+                    wg.insert(key, DynamicWatch::One(cr));
+                }
+            }
+        }
+    }
+
+    /// Filter `dynamic_cells()` against `sorted_targets` using recorded `OFFSET`/`INDIRECT`
+    /// target rectangles + static argument references so spill follow-up hops skip unrelated dynamic cells!
+    pub(crate) fn dynamic_cells_touching(&self, sorted_targets: &[CellKey]) -> Vec<CellKey> {
+        if sorted_targets.is_empty() {
+            return Vec::new();
+        }
+        let max_sheet = sorted_targets.last().map(|t| t.0).unwrap_or(0);
+        let mut bboxes: Vec<Option<(i64, i64, i64, i64)>> = vec![None; max_sheet + 1];
+        for &(s, r, c) in sorted_targets {
+            let (ri, ci) = (i64::from(r), i64::from(c));
+            match &mut bboxes[s] {
+                Some((r1, c1, r2, c2)) => {
+                    *r1 = (*r1).min(ri);
+                    *c1 = (*c1).min(ci);
+                    *r2 = (*r2).max(ri);
+                    *c2 = (*c2).max(ci);
+                }
+                slot @ None => *slot = Some((ri, ci, ri, ci)),
+            }
+        }
+        let Ok(watches) = self.dynamic_watches.read() else {
+            return self.dynamic_cells().collect();
+        };
+        let mut out = Vec::new();
+        for key in self.dynamic_cells() {
+            let Some(dw) = watches.get(&key) else {
+                // Never evaluated yet -> conservatively include
+                out.push(key);
+                continue;
+            };
+            let hit_watch = dw.as_slice().iter().any(|cr| {
+                rect_hits_sorted_targets(
+                    cr.sheet as usize,
+                    i64::from(cr.r1),
+                    i64::from(cr.c1),
+                    i64::from(cr.r2),
+                    i64::from(cr.c2),
+                    &bboxes,
+                    sorted_targets,
+                )
+            });
+            if hit_watch {
+                out.push(key);
+                continue;
+            }
+            let hit_static_arg = self.refs.get(&key).is_some_and(|refs| {
+                refs.as_slice().iter().any(|cr| {
+                    rect_hits_sorted_targets(
+                        cr.sheet as usize,
+                        i64::from(cr.r1),
+                        i64::from(cr.c1),
+                        i64::from(cr.r2),
+                        i64::from(cr.c2),
+                        &bboxes,
+                        sorted_targets,
+                    )
+                })
+            });
+            if hit_static_arg {
+                out.push(key);
+            }
+        }
+        out
     }
 
     /// Recalculate visibility-aware formulas that could read the filtered sheet, plus
@@ -957,6 +1125,8 @@ fn sumif_amount_rect_shifted(
 struct Dependencies {
     rects: Vec<Rect>,
     volatile: bool,
+    has_today: bool,
+    has_other_volatile: bool,
     volatile_ref: bool,
     visibility: bool,
     runtime: bool,
@@ -1242,7 +1412,14 @@ impl Walker<'_> {
                 }
                 self.result.volatile_ref |= id.is_volatile_ref();
                 self.result.visibility |= id.is_visibility();
-                self.result.volatile |= id.is_volatile();
+                if id.is_volatile() {
+                    self.result.volatile = true;
+                    if id == FuncId::Today {
+                        self.result.has_today = true;
+                    } else {
+                        self.result.has_other_volatile = true;
+                    }
+                }
                 let sumif_rect = if id == FuncId::SumIf {
                     sumif_amount_rect_shifted(wb, si, args, dr, dc)
                 } else {
@@ -1288,6 +1465,205 @@ pub(super) fn parallel_inputs_arc(
     let info = dependencies_arc(wb, name_index, has_tables, key, formula);
     (!info.runtime && !info.volatile && !info.volatile_ref && !info.visibility)
         .then_some(info.rects)
+}
+
+pub(super) fn visit_parallel_inputs_arc(
+    wb: &crate::Workbook,
+    name_index: Option<&super::NameIndex>,
+    has_tables: bool,
+    key: CellKey,
+    formula: &Arc<str>,
+    mut visit: impl FnMut(Rect),
+) -> bool {
+    if !has_tables || !formula.as_bytes().contains(&b'[') {
+        let fast = super::compiled::with_ref_summary_arc(
+            formula,
+            key.1,
+            key.2,
+            |summary, _node, dr, dc| match summary {
+                super::compiled::TemplateRefSummary::PureNoRefs {
+                    volatile,
+                    visibility,
+                } => Some(!volatile && !visibility),
+                super::compiled::TemplateRefSummary::SameSheet {
+                    count,
+                    volatile,
+                    visibility,
+                    spans,
+                } => {
+                    if volatile || visibility {
+                        return Some(false);
+                    }
+                    for span in &spans[..count as usize] {
+                        let (r1, c1, r2, c2) = span.resolve(dr, dc);
+                        visit(Rect {
+                            sheet: key.0,
+                            r1,
+                            c1,
+                            r2,
+                            c2,
+                        });
+                    }
+                    Some(true)
+                }
+                super::compiled::TemplateRefSummary::Complex => None,
+            },
+        );
+        match fast {
+            Ok(Some(ok)) => return ok,
+            Err(_) => return true,
+            Ok(None) => {}
+        }
+    }
+    let info = dependencies_arc(wb, name_index, has_tables, key, formula);
+    if info.runtime || info.volatile || info.volatile_ref || info.visibility {
+        return false;
+    }
+    for r in info.rects {
+        visit(r);
+    }
+    true
+}
+
+#[inline]
+fn rect_hits_sorted_targets(
+    sheet: usize,
+    r1: i64,
+    c1: i64,
+    r2: i64,
+    c2: i64,
+    bboxes: &[Option<(i64, i64, i64, i64)>],
+    sorted_targets: &[CellKey],
+) -> bool {
+    let Some(&(br1, bc1, br2, bc2)) = bboxes.get(sheet).and_then(|b| b.as_ref()) else {
+        return false;
+    };
+    if r2 < br1 || r1 > br2 || c2 < bc1 || c1 > bc2 {
+        return false;
+    }
+    let lo_r = r1.max(0) as u32;
+    let hi_r = r2.max(0) as u32;
+    let lo_c = c1.max(0) as u32;
+    let hi_c = c2.max(0) as u32;
+    let idx = sorted_targets.partition_point(|&(s, r, c)| (s, r, c) < (sheet, lo_r, lo_c));
+    for &(s, r, c) in &sorted_targets[idx..] {
+        if s != sheet || r > hi_r {
+            break;
+        }
+        if c >= lo_c && c <= hi_c {
+            return true;
+        }
+    }
+    false
+}
+
+/// Fast zero-allocation pre-check for Pass-0 spill convergence: returns `false` if no formula
+/// in `formulas` is dynamic (`INDIRECT`/`OFFSET`/runtime) or directly references any cell in
+/// `sorted_targets`, allowing `recalc_selected` to skip a full 1M-formula `Deps::build_filtered`.
+pub(super) fn any_formula_depends_on_sorted(
+    wb: &crate::Workbook,
+    selected: Option<&[bool]>,
+    formulas: &[CellKey],
+    sorted_targets: &[CellKey],
+) -> bool {
+    if formulas.is_empty() {
+        return false;
+    }
+    if wb
+        .sheets
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| selected.is_none_or(|s| s[*i]))
+        .any(|(_, sh)| sh.spill_shapes.values().any(|&shape| shape == (0, 0)))
+    {
+        return true;
+    }
+    let mut bboxes: Vec<Option<(i64, i64, i64, i64)>> = vec![None; wb.sheets.len()];
+    for &(si, r, c) in sorted_targets {
+        if let Some(slot) = bboxes.get_mut(si) {
+            let (ri, ci) = (i64::from(r), i64::from(c));
+            *slot = Some(match *slot {
+                Some((r1, c1, r2, c2)) => (r1.min(ri), c1.min(ci), r2.max(ri), c2.max(ci)),
+                None => (ri, ci, ri, ci),
+            });
+        }
+    }
+    let has_tables = wb.sheets.iter().any(|s| !s.tables.is_empty());
+    let name_index = super::NameIndex::build_if_needed(wb);
+    let check_one = |&(si, row, col): &CellKey| -> bool {
+        let Some(f_arc) = wb
+            .sheets
+            .get(si)
+            .and_then(|s| s.formula_arc_of(row, col))
+        else {
+            return false;
+        };
+        if !has_tables || !f_arc.as_bytes().contains(&b'[') {
+            let fast = super::compiled::with_ref_summary_arc(
+                f_arc,
+                row,
+                col,
+                |summary, _node, dr, dc| match summary {
+                    super::compiled::TemplateRefSummary::PureNoRefs { .. } => Some(false),
+                    super::compiled::TemplateRefSummary::SameSheet { count, spans, .. } => {
+                        if bboxes.get(si).is_none_or(Option::is_none) {
+                            return Some(false);
+                        }
+                        for span in &spans[..count as usize] {
+                            let (r1, c1, r2, c2) = span.resolve(dr, dc);
+                            if rect_hits_sorted_targets(si, r1, c1, r2, c2, &bboxes, sorted_targets)
+                            {
+                                return Some(true);
+                            }
+                        }
+                        Some(false)
+                    }
+                    super::compiled::TemplateRefSummary::Complex => None,
+                },
+            );
+            match fast {
+                Ok(Some(hit)) => return hit,
+                Err(_) => return false,
+                Ok(None) => {}
+            }
+        }
+        let info = dependencies_arc(wb, name_index.as_ref(), has_tables, (si, row, col), f_arc);
+        info.runtime
+            || info.volatile_ref
+            || info.rects.iter().any(|r| {
+                rect_hits_sorted_targets(r.sheet, r.r1, r.c1, r.r2, r.c2, &bboxes, sorted_targets)
+            })
+    };
+
+    const CHUNK: usize = 1024;
+    if formulas.len() < CHUNK * 2 {
+        return formulas.iter().any(check_one);
+    }
+    let workers = super::pool::max_workers()
+        .min(formulas.len().div_ceil(CHUNK))
+        .clamp(1, 16);
+    if workers < 2 {
+        return formulas.iter().any(check_one);
+    }
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let hit = AtomicBool::new(false);
+    let next_chunk = AtomicUsize::new(0);
+    let total_chunks = formulas.len().div_ceil(CHUNK);
+    super::pool::run_parallel(workers, |_| {
+        while !hit.load(Ordering::Relaxed) {
+            let ci = next_chunk.fetch_add(1, Ordering::Relaxed);
+            if ci >= total_chunks {
+                break;
+            }
+            let start = ci * CHUNK;
+            let end = (start + CHUNK).min(formulas.len());
+            if formulas[start..end].iter().any(&check_one) {
+                hit.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+    });
+    hit.load(Ordering::Relaxed)
 }
 
 fn dependencies(wb: &crate::Workbook, key: CellKey, formula: &str) -> Dependencies {
@@ -1437,15 +1813,42 @@ impl Deps {
     }
 
     /// Build a dependency graph and optionally certify an imported/saved workbook's cached
-    /// `<v>` values when all formula cells carry cached values and no volatile formulas exist.
+    /// `<v>` values when all formula cells carry cached values and either no volatile formulas
+    /// exist or only `TODAY()` formulas exist whose cached values already match today's date!
     pub fn build_with_cached_baseline(wb: &crate::Workbook, trust_cached_values: bool) -> Self {
         let mut graph = Self::build(wb);
-        if trust_cached_values && !wb.calc_manual && !wb.calc_pending && graph.volatile.is_empty() {
-            let all_cached = wb.sheets.iter().all(|sh| {
-                sh.formula_cells()
-                    .all(|(_, cell)| cell.value != crate::Value::Empty)
-            });
-            graph.computed_baseline = all_cached;
+        if trust_cached_values && !wb.calc_manual && !wb.calc_pending {
+            let today_valid = if graph.volatile.is_empty() {
+                true
+            } else if graph.volatile.len() == graph.today_only_cells.len()
+                && graph.today_only_cells.len() <= 256
+            {
+                let today_serial = super::functions::now_serial_uncached_in(wb.date_system).floor();
+                graph.today_only_cells.iter().all(|&(si, r, c)| {
+                    let Some(cell) = wb.sheets.get(si).and_then(|s| s.get(r, c)) else {
+                        return false;
+                    };
+                    if cell.value == crate::Value::Empty {
+                        return false;
+                    }
+                    if let Some(f) = cell.formula.as_deref() {
+                        let raw = f.trim().trim_start_matches('=').trim();
+                        if raw.eq_ignore_ascii_case("TODAY()") {
+                            return cell.value == crate::Value::Number(today_serial);
+                        }
+                    }
+                    super::from_fvalue(&super::eval_cell(wb, si, r, c)) == cell.value
+                })
+            } else {
+                false
+            };
+            if today_valid {
+                let all_cached = wb.sheets.iter().all(|sh| {
+                    sh.formula_cells()
+                        .all(|(_, cell)| cell.value != crate::Value::Empty)
+                });
+                graph.computed_baseline = all_cached;
+            }
         }
         graph
     }
@@ -1614,6 +2017,9 @@ impl Deps {
         }
         if info.volatile || info.volatile_ref {
             self.volatile.insert(key);
+            if info.has_today && !info.has_other_volatile && !info.volatile_ref {
+                self.today_only_cells.insert(key);
+            }
         }
         let compact: Vec<CompactRect> = info
             .rects
@@ -1674,7 +2080,11 @@ impl Deps {
         self.volatile_refs.remove(&key);
         self.visibility.remove(&key);
         self.volatile.remove(&key);
+        self.today_only_cells.remove(&key);
         self.untracked_spill_errors.remove(&key);
+        if let Ok(mut wg) = self.dynamic_watches.write() {
+            wg.remove(&key);
+        }
         if let Some((old_watch_id, _)) = self.spill_watches.remove(&key)
             && self.slots.tombstone(old_watch_id)
         {
@@ -2077,12 +2487,151 @@ impl Deps {
         self.collect(seeds, true, limit, None, None)
     }
 
+    #[allow(dead_code)]
     pub(super) fn edit_closure_cancelable(
         &self,
         seeds: &[CellKey],
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Option<HashSet<CellKey>> {
         self.collect(seeds, true, usize::MAX, cancel, None)
+    }
+
+    pub(super) fn edit_closure_vec_cancelable(
+        &self,
+        seeds: &[CellKey],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Option<Vec<CellKey>> {
+        if self.slots.len() >= 512 {
+            self.collect_vec_unbounded(seeds, true, cancel)
+        } else {
+            let set = self.collect(seeds, true, usize::MAX, cancel, None)?;
+            Some(set.into_iter().collect())
+        }
+    }
+
+    /// High-throughput unbounded BFS using a compact L2-resident `[u64]` slot bitset (`125 KB` for 1M
+    /// formulas instead of a 32 MB SipHash `HashSet<CellKey>`) and a cached per-column cursor.
+    fn collect_vec_unbounded(
+        &self,
+        seeds: &[CellKey],
+        edit: bool,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Option<Vec<CellKey>> {
+        let mut seen_bits = vec![0u64; self.slots.len().div_ceil(64)];
+        let mut dirty_vec: Vec<CellKey> = Vec::new();
+        let mut frontier: Vec<CellKey> = seeds.to_vec();
+        if edit && !seeds.is_empty() {
+            for &vkey in self.volatile.iter() {
+                if let Some(&vid) = self.formula_ids.get(&vkey) {
+                    let idx = vid as usize;
+                    if idx < self.slots.len() {
+                        seen_bits[idx >> 6] |= 1u64 << (idx & 63);
+                    }
+                }
+                dirty_vec.push(vkey);
+                frontier.push(vkey);
+            }
+        }
+        let mut triggered_areas: FxHashSet<u32> = FxHashSet::default();
+        let mut next = Vec::new();
+        let mut cached_sc: Option<(u32, u32)> = None;
+        let mut cached_points: Option<&PointColumn> = None;
+        let mut point_cursor = 0usize;
+        let mut wave_idx = 0usize;
+
+        while !frontier.is_empty() {
+            if wave_idx & 255 == 0
+                && cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return None;
+            }
+            wave_idx += 1;
+            if frontier.len() > 1 {
+                frontier.sort_unstable_by_key(|&(s, r, c)| (s, c, r));
+                frontier.dedup();
+            }
+            let mut add = |id: u32| -> bool {
+                let idx = id as usize;
+                let word = idx >> 6;
+                let bit = 1u64 << (idx & 63);
+                if word < seen_bits.len() {
+                    if (seen_bits[word] & bit) != 0 {
+                        return true;
+                    }
+                    seen_bits[word] |= bit;
+                }
+                if let Some(key) = self.slots.get(id) {
+                    dirty_vec.push(key);
+                    next.push(key);
+                }
+                true
+            };
+            for column in frontier.chunk_by(|a, b| a.0 == b.0 && a.2 == b.2) {
+                let (sheet, _, col) = column[0];
+                let Ok(sheet_u32) = u32::try_from(sheet) else {
+                    continue;
+                };
+                let sc = (sheet_u32, col);
+                if cached_sc != Some(sc) {
+                    cached_sc = Some(sc);
+                    cached_points = self.points_by_col.get(&sc);
+                    point_cursor = 0;
+                }
+                if let Some(points) = cached_points {
+                    let _ = points.query_sorted_rows_with_cursor(column, &mut point_cursor, &mut add);
+                }
+                if self.range_cols.contains(&sc) {
+                    for shift in ROW_SHIFTS {
+                        for rows in column.chunk_by(|a, b| bucket(a.1, shift) == bucket(b.1, shift))
+                        {
+                            let bin = bucket(rows[0].1, shift);
+                            if let Some(entries) = self.by_col.get(&(sheet_u32, col, shift, bin)) {
+                                for entry in entries.iter() {
+                                    if triggered_areas.contains(&entry.area_id) {
+                                        continue;
+                                    }
+                                    let p = rows.partition_point(|k| k.1 < entry.first);
+                                    if p < rows.len() && rows[p].1 <= entry.last {
+                                        triggered_areas.insert(entry.area_id);
+                                        if let Some(area) = self.areas.get(entry.area_id as usize) {
+                                            let _ = area.visit_subscribers(&mut add);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if self.wide_sheets.contains(&sheet_u32) {
+                    for shift in ROW_SHIFTS {
+                        for rows in column.chunk_by(|a, b| bucket(a.1, shift) == bucket(b.1, shift))
+                        {
+                            let bin = bucket(rows[0].1, shift);
+                            if let Some(entries) = self.wide_by_row.get(&(sheet_u32, shift, bin)) {
+                                for entry in entries.iter() {
+                                    if col < entry.c1
+                                        || col > entry.c2
+                                        || triggered_areas.contains(&entry.area_id)
+                                    {
+                                        continue;
+                                    }
+                                    let p = rows.partition_point(|k| k.1 < entry.r1);
+                                    if p < rows.len() && rows[p].1 <= entry.r2 {
+                                        triggered_areas.insert(entry.area_id);
+                                        if let Some(area) = self.areas.get(entry.area_id as usize) {
+                                            let _ = area.visit_subscribers(&mut add);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            frontier.clear();
+            std::mem::swap(&mut frontier, &mut next);
+        }
+        Some(dirty_vec)
     }
 
     fn collect(
@@ -2105,12 +2654,17 @@ impl Deps {
         let mut triggered_areas: FxHashSet<u32> = FxHashSet::default();
         let mut next = Vec::new();
         let mut first_wave = true;
+        let mut cached_sc: Option<(u32, u32)> = None;
+        let mut cached_points: Option<&PointColumn> = None;
+        let mut point_cursor = 0usize;
         while !frontier.is_empty() {
             if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                 return None;
             }
-            frontier.sort_unstable_by_key(|&(s, r, c)| (s, c, r));
-            frontier.dedup();
+            if frontier.len() > 1 {
+                frontier.sort_unstable_by_key(|&(s, r, c)| (s, c, r));
+                frontier.dedup();
+            }
             let skip_now = if first_wave {
                 skip_first_wave_ids
             } else {
@@ -2133,10 +2687,16 @@ impl Deps {
                 let Ok(sheet_u32) = u32::try_from(sheet) else {
                     continue;
                 };
+                let sc = (sheet_u32, col);
+                if cached_sc != Some(sc) {
+                    cached_sc = Some(sc);
+                    cached_points = self.points_by_col.get(&sc);
+                    point_cursor = 0;
+                }
 
-                // 1. O(log N) sorted point lookup on (sheet, col)
-                if let Some(points) = self.points_by_col.get(&(sheet_u32, col))
-                    && !points.query_sorted_rows(column, &mut add)
+                // 1. O(log N) / O(1) cursor-assisted sorted point lookup on (sheet, col)
+                if let Some(points) = cached_points
+                    && !points.query_sorted_rows_with_cursor(column, &mut point_cursor, &mut add)
                 {
                     return None;
                 }

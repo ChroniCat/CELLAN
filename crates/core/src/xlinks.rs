@@ -1866,23 +1866,24 @@ pub fn break_link(wb: &mut Workbook, link_idx: usize) -> usize {
             .map(|(c, _)| c)
             .collect();
         for cref in coords {
-            let Some(orig) = sheet.get(cref.row, cref.col).and_then(|c| c.formula.clone()) else {
+            let Some(orig) = sheet.formula_arc_of(cref.row, cref.col).cloned() else {
                 continue;
             };
-            let b: Vec<char> = orig.chars().collect();
+            let bytes = orig.as_bytes();
+            if !bytes.contains(&b'[') && !bytes.contains(&b'\'') {
+                continue;
+            }
             let mut out = String::with_capacity(orig.len());
             let mut uses_broken = false;
             let mut changed = false;
             let mut i = 0usize;
-            while i < b.len() {
-                if b[i] == '"' {
-                    out.push('"');
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    let s0 = i;
                     i += 1;
-                    while i < b.len() {
-                        out.push(b[i]);
-                        if b[i] == '"' {
-                            if i + 1 < b.len() && b[i + 1] == '"' {
-                                out.push('"');
+                    while i < bytes.len() {
+                        if bytes[i] == b'"' {
+                            if bytes.get(i + 1) == Some(&b'"') {
                                 i += 2;
                                 continue;
                             }
@@ -1891,16 +1892,17 @@ pub fn break_link(wb: &mut Workbook, link_idx: usize) -> usize {
                         }
                         i += 1;
                     }
+                    out.push_str(&orig[s0..i]);
                     continue;
                 }
-                if b[i] == '[' {
-                    if let Some(close) = b[i + 1..].iter().position(|c| *c == ']') {
-                        let inner: String = b[i + 1..i + 1 + close].iter().collect();
-                        let starts_in_sq = i > 0 && b[i - 1] == '\'';
-                        let looks_like_book = inner.chars().all(|c| c.is_ascii_digit())
-                            || has_bang_after(&b, i + close + 2, starts_in_sq);
+                if bytes[i] == b'[' {
+                    if let Some(close) = bytes[i + 1..].iter().position(|&c| c == b']') {
+                        let inner = &orig[i + 1..i + 1 + close];
+                        let starts_in_sq = i > 0 && bytes[i - 1] == b'\'';
+                        let looks_like_book = inner.bytes().all(|c| c.is_ascii_digit())
+                            || has_bang_after_bytes(&orig, i + close + 2, starts_in_sq);
                         if looks_like_book {
-                            if matches_broken(&inner) {
+                            if matches_broken(inner) {
                                 uses_broken = true;
                                 break;
                             }
@@ -1917,13 +1919,13 @@ pub fn break_link(wb: &mut Workbook, link_idx: usize) -> usize {
                         }
                     }
                 }
-                if b[i] == '\'' {
+                if bytes[i] == b'\'' {
                     let start_q = i;
                     let mut j = i + 1;
                     let mut qname = String::new();
-                    while j < b.len() {
-                        if b[j] == '\'' {
-                            if j + 1 < b.len() && b[j + 1] == '\'' {
+                    while j < bytes.len() {
+                        if bytes[j] == b'\'' {
+                            if bytes.get(j + 1) == Some(&b'\'') {
                                 qname.push('\'');
                                 j += 2;
                                 continue;
@@ -1931,23 +1933,23 @@ pub fn break_link(wb: &mut Workbook, link_idx: usize) -> usize {
                             j += 1;
                             break;
                         }
-                        qname.push(b[j]);
-                        j += 1;
+                        let ch = orig[j..].chars().next().unwrap();
+                        qname.push(ch);
+                        j += ch.len_utf8();
                     }
-                    if b.get(j) == Some(&'!') && !qname.contains('[') && matches_broken(&qname) {
+                    if bytes.get(j) == Some(&b'!') && !qname.contains('[') && matches_broken(&qname) {
                         uses_broken = true;
                         break;
                     }
-                    if b.get(j) == Some(&'!') && !qname.contains('[') {
-                        for k in start_q..=j {
-                            out.push(b[k]);
-                        }
+                    if bytes.get(j) == Some(&b'!') && !qname.contains('[') {
+                        out.push_str(&orig[start_q..=j]);
                         i = j + 1;
                         continue;
                     }
                 }
-                out.push(b[i]);
-                i += 1;
+                let ch = orig[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
             }
             if uses_broken {
                 if let Some(cell) = sheet.get_mut(cref.row, cref.col) {
@@ -1969,19 +1971,20 @@ pub fn break_link(wb: &mut Workbook, link_idx: usize) -> usize {
 }
 
 fn map_books<F: Fn(&str) -> String>(f: &str, map: F) -> String {
-    let b: Vec<char> = f.chars().collect();
+    let bytes = f.as_bytes();
+    if !bytes.contains(&b'[') {
+        return f.to_string();
+    }
     let mut out = String::with_capacity(f.len());
     let mut i = 0;
-    while i < b.len() {
+    while i < bytes.len() {
         // 双引号字符串字面量里的 `[1]` 只是普通文本，不能被重写。
-        if b[i] == '"' {
-            out.push('"');
+        if bytes[i] == b'"' {
+            let s0 = i;
             i += 1;
-            while i < b.len() {
-                out.push(b[i]);
-                if b[i] == '"' {
-                    if i + 1 < b.len() && b[i + 1] == '"' {
-                        out.push('"');
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if bytes.get(i + 1) == Some(&b'"') {
                         i += 2;
                         continue;
                     }
@@ -1990,22 +1993,22 @@ fn map_books<F: Fn(&str) -> String>(f: &str, map: F) -> String {
                 }
                 i += 1;
             }
+            out.push_str(&f[s0..i]);
             continue;
         }
-        if b[i] == '[' {
-            if let Some(close) = b[i + 1..].iter().position(|c| *c == ']') {
-                let inner: String = b[i + 1..i + 1 + close].iter().collect();
-                // 只换「书名」形态：数字序号、文件名、带路径的文件名；
-                // 结构化引用（表[列]）里的列名不匹配任何链接，map 会原样返回
+        if bytes[i] == b'[' {
+            if let Some(close) = bytes[i + 1..].iter().position(|&c| c == b']') {
+                let inner = &f[i + 1..i + 1 + close];
                 out.push('[');
-                out.push_str(&map(&inner));
+                out.push_str(&map(inner));
                 out.push(']');
                 i += close + 2;
                 continue;
             }
         }
-        out.push(b[i]);
-        i += 1;
+        let ch = f[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -2046,15 +2049,18 @@ pub fn is_external_formula(f: &str) -> bool {
 
 /// 公式里引用了哪些外部工作簿（用于"用户手输公式后自动建链接"）
 pub fn books_in_formula(f: &str) -> Vec<String> {
-    let b: Vec<char> = f.chars().collect();
+    let bytes = f.as_bytes();
+    if !bytes.contains(&b'[') {
+        return Vec::new();
+    }
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
-    while i < b.len() {
-        if b[i] == '"' {
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
             i += 1;
-            while i < b.len() {
-                if b[i] == '"' {
-                    if i + 1 < b.len() && b[i + 1] == '"' {
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if bytes.get(i + 1) == Some(&b'"') {
                         i += 2;
                         continue;
                     }
@@ -2065,23 +2071,21 @@ pub fn books_in_formula(f: &str) -> Vec<String> {
             }
             continue;
         }
-        if b[i] == '[' {
-            if let Some(close) = b[i + 1..].iter().position(|c| *c == ']') {
-                let inner: String = b[i + 1..i + 1 + close].iter().collect();
-                let after = b.get(i + 1 + close + 1).copied();
-                let starts_in_sq = i > 0 && b[i - 1] == '\'';
-                // 书名的特征是 `]` 后面跟表名（可选三维 `First:Third` / 带引号）与 `!`，
-                // 或直接跟 `!`（工作簿级外部名称 `[1]!Rate`），或纯数字序号；`表[列]` 后面不会有 `!`。
+        if bytes[i] == b'[' {
+            if let Some(close) = bytes[i + 1..].iter().position(|&c| c == b']') {
+                let inner = &f[i + 1..i + 1 + close];
+                let after_idx = i + close + 2;
+                let starts_in_sq = i > 0 && bytes[i - 1] == b'\'';
                 if !inner.is_empty()
-                    && (inner.chars().all(|c| c.is_ascii_digit())
-                        || has_bang_after(&b, i + close + 2, starts_in_sq))
-                    && after.is_some()
+                    && after_idx < bytes.len()
+                    && (inner.bytes().all(|c| c.is_ascii_digit())
+                        || has_bang_after_bytes(f, after_idx, starts_in_sq))
                 {
-                    if !out.iter().any(|x| x.eq_ignore_ascii_case(&inner)) {
-                        out.push(inner);
+                    if !out.iter().any(|x| x.eq_ignore_ascii_case(inner)) {
+                        out.push(inner.to_string());
                     }
                 }
-                i += close + 2;
+                i = after_idx;
                 continue;
             }
         }
@@ -2090,31 +2094,49 @@ pub fn books_in_formula(f: &str) -> Vec<String> {
     out
 }
 
-fn has_bang_after(b: &[char], from: usize, starts_in_sq: bool) -> bool {
+fn has_bang_after_bytes(s: &str, from: usize, starts_in_sq: bool) -> bool {
+    let bytes = s.as_bytes();
     let mut i = from;
     let mut in_sq = starts_in_sq;
-    let limit = (from + 160).min(b.len());
-    while i < limit {
-        let c = b[i];
+    let mut scanned = 0usize;
+    while i < bytes.len() && scanned < 160 {
+        scanned += 1;
+        let b = bytes[i];
         if in_sq {
-            if c == '\'' {
-                if b.get(i + 1) == Some(&'\'') {
+            if b == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
                     i += 2;
                     continue;
                 }
                 in_sq = false;
             }
-            i += 1;
+            let step = if b < 0x80 {
+                1
+            } else {
+                s[i..].chars().next().map_or(1, char::len_utf8)
+            };
+            i += step;
             continue;
         }
-        match c {
-            '!' => return true,
-            '\'' => in_sq = true,
-            '[' | ']' | ',' | '(' | ')' | '+' | '-' | '*' | '/' | '&' | '=' => return false,
-            ch if ch.is_whitespace() => return false,
-            _ => {}
+        match b {
+            b'!' => return true,
+            b'\'' => {
+                in_sq = true;
+                i += 1;
+            }
+            b'[' | b']' | b',' | b'(' | b')' | b'+' | b'-' | b'*' | b'/' | b'&' | b'=' => {
+                return false;
+            }
+            c if c < 0x80 && c.is_ascii_whitespace() => return false,
+            c if c >= 0x80 => {
+                let ch = s[i..].chars().next().unwrap();
+                if ch.is_whitespace() {
+                    return false;
+                }
+                i += ch.len_utf8();
+            }
+            _ => i += 1,
         }
-        i += 1;
     }
     false
 }

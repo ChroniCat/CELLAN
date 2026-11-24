@@ -319,7 +319,7 @@ pub(crate) struct Crit {
     pub(super) wild: bool,
 }
 
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum GroupValue {
     Number(u64),
     Text(std::sync::Arc<str>),
@@ -340,13 +340,154 @@ pub(crate) struct GroupStats {
     pub count_num: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct BuiltGroups {
     pub distinct_nums: Vec<Option<Vec<f64>>>,
     pub map: FxHashMap<Vec<GroupValue>, GroupStats>,
 }
 
 impl BuiltGroups {
+    /// Zero-`Vec<FValue>` group-by builder directly from persistent `SharedCondColumn`s!
+    pub(crate) fn build_from_cond_cols(
+        cond_cols: &[std::sync::Arc<super::lookup_cache::SharedCondColumn>],
+        val_col: Option<&super::lookup_cache::SharedCondColumn>,
+        numeric: &[bool],
+        limit: usize,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<BuiltGroups> {
+        let rows = cond_cols
+            .iter()
+            .map(|c| c.len)
+            .min()?
+            .min(val_col.map_or(usize::MAX, |v| v.len));
+        if rows == 0 || cond_cols.len() != numeric.len() {
+            return None;
+        }
+        if let Some(vc) = val_col
+            && vc.has_non_finite
+        {
+            return None;
+        }
+        let mut distinct_nums: Vec<Option<Vec<f64>>> = Vec::with_capacity(cond_cols.len());
+        for (col, &is_num) in cond_cols.iter().zip(numeric) {
+            if !is_num {
+                distinct_nums.push(None);
+                continue;
+            }
+            if col.has_non_finite {
+                return None;
+            }
+            let all_int = col.len == rows && col.pages.iter().all(|p| p.all_exact_int);
+            if all_int {
+                distinct_nums.push(None);
+                continue;
+            }
+            let mut any_fract = false;
+            for r in 0..rows {
+                if let Some(n) = col.coerced_number_at(r)
+                    && n.fract() != 0.0
+                {
+                    any_fract = true;
+                    break;
+                }
+            }
+            if !any_fract {
+                distinct_nums.push(None);
+            } else {
+                let mut vals = if col.len == rows
+                    && let Some(sorted) = col.sorted_nums()
+                {
+                    let mut v: Vec<f64> = sorted
+                        .iter()
+                        .map(|&(n, _)| if n == 0.0 { 0.0 } else { n })
+                        .collect();
+                    v.dedup_by(|a, b| a.to_bits() == b.to_bits());
+                    v
+                } else {
+                    let mut v = Vec::new();
+                    for r in 0..rows {
+                        if let Some(n) = col.coerced_number_at(r) {
+                            v.push(if n == 0.0 { 0.0 } else { n });
+                        }
+                    }
+                    v.sort_unstable_by(f64::total_cmp);
+                    v.dedup_by(|a, b| a.to_bits() == b.to_bits());
+                    v
+                };
+                if vals.windows(2).any(|w| w[1] - w[0] <= 2.0 * f64::EPSILON) {
+                    return None;
+                }
+                vals.shrink_to_fit();
+                distinct_nums.push(Some(vals));
+            }
+        }
+
+        let empty_arc: std::sync::Arc<str> = "".into();
+        let mut map: FxHashMap<Vec<GroupValue>, GroupStats> = FxHashMap::default();
+        let mut key = Vec::with_capacity(cond_cols.len());
+        'row: for row in 0..rows {
+            if (row & 8191) == 0
+                && (cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    || deadline.is_some_and(|d| std::time::Instant::now() >= d))
+            {
+                return None;
+            }
+            key.clear();
+            for (j, (col, &is_num)) in cond_cols.iter().zip(numeric).enumerate() {
+                key.push(if is_num {
+                    let Some(n) = col.coerced_number_at(row) else {
+                        continue 'row;
+                    };
+                    let canonical = if let Some(ref vals) = distinct_nums[j] {
+                        let c = if n == 0.0 { 0.0 } else { n };
+                        let idx = vals.binary_search_by(|x| x.total_cmp(&c)).ok()?;
+                        vals[idx]
+                    } else {
+                        n
+                    };
+                    GroupValue::Number(GroupValue::canonical_bits(canonical))
+                } else {
+                    GroupValue::Text(col.coerced_lower_text_at(row, &empty_arc))
+                });
+            }
+            let (add_sum, add_min, add_max, add_cnt) = match val_col {
+                None => (1.0, 1.0, 1.0, 1u32),
+                Some(vc) => match vc.coerced_number_at(row) {
+                    Some(n) => (n, n, n, 1u32),
+                    None => (0.0, f64::INFINITY, f64::NEG_INFINITY, 0u32),
+                },
+            };
+            if let Some(stats) = map.get_mut(&key) {
+                stats.sum += add_sum;
+                if add_cnt > 0 {
+                    if stats.count_num == 0 {
+                        stats.min = add_min;
+                        stats.max = add_max;
+                    } else {
+                        stats.min = stats.min.min(add_min);
+                        stats.max = stats.max.max(add_max);
+                    }
+                    stats.count_num += add_cnt;
+                }
+            } else {
+                if map.len() >= limit {
+                    return None;
+                }
+                map.insert(
+                    std::mem::take(&mut key),
+                    GroupStats {
+                        sum: add_sum,
+                        min: if add_cnt > 0 { add_min } else { f64::INFINITY },
+                        max: if add_cnt > 0 { add_max } else { f64::NEG_INFINITY },
+                        count_num: add_cnt,
+                    },
+                );
+            }
+        }
+        Some(BuiltGroups { distinct_nums, map })
+    }
+
     pub(crate) fn answer(&self, function: u8, raw_criteria: &[Crit]) -> Option<FValue> {
         let mut query = Vec::with_capacity(raw_criteria.len());
         for (crit, distinct) in raw_criteria.iter().zip(&self.distinct_nums) {
@@ -437,6 +578,12 @@ impl GroupedCriteria {
         key: &super::CriteriaKey,
         shared_get: &mut dyn FnMut(Option<super::RangeKey>, &[super::RangeKey], &[bool]) -> Option<std::sync::Arc<BuiltGroups>>,
         shared_put: &mut dyn FnMut(Option<super::RangeKey>, Vec<super::RangeKey>, Vec<bool>, std::sync::Arc<BuiltGroups>),
+        shared_build_from_cond: &mut dyn FnMut(
+            Option<super::RangeKey>,
+            &[super::RangeKey],
+            &[bool],
+            usize,
+        ) -> Option<std::sync::Arc<BuiltGroups>>,
         load_col: &mut dyn FnMut(super::RangeKey) -> Option<std::sync::Arc<Vec<FValue>>>,
     ) -> Option<FValue> {
         let (val_range, cond_ranges) = key.split_ranges()?;
@@ -497,35 +644,43 @@ impl GroupedCriteria {
         };
         let mut entry = self.entries.remove(slot)?;
         if !entry.attempted {
-            let mut cols_owned = Vec::with_capacity(cond_ranges.len());
-            for &rk in cond_ranges {
-                let Some(col) = load_col(rk) else {
-                    self.entries.push_back(entry);
-                    return None;
-                };
-                cols_owned.push(col);
-            }
-            let amounts_owned = match val_range {
-                Some(vr) => {
-                    let Some(col) = load_col(vr) else {
-                        self.entries.push_back(entry);
-                        return None;
-                    };
-                    Some(col)
-                }
-                None => None,
-            };
-            entry.attempted = true;
-            let col_slices: Vec<&[FValue]> = cols_owned.iter().map(|c| c.as_slice()).collect();
             let used: usize = self
                 .entries
                 .iter()
                 .filter_map(|e| e.groups.as_ref())
                 .map(|g| g.map.len())
                 .sum();
-            let built = entry
-                .build_groups(&col_slices, amounts_owned.as_deref().map(Vec::as_slice), 65_536usize.saturating_sub(used))
-                .map(std::sync::Arc::new);
+            let limit = 65_536usize.saturating_sub(used);
+            let built = if let Some(b) =
+                shared_build_from_cond(val_range, cond_ranges, &entry.numeric, limit)
+            {
+                entry.attempted = true;
+                Some(b)
+            } else {
+                let mut cols_owned = Vec::with_capacity(cond_ranges.len());
+                for &rk in cond_ranges {
+                    let Some(col) = load_col(rk) else {
+                        self.entries.push_back(entry);
+                        return None;
+                    };
+                    cols_owned.push(col);
+                }
+                let amounts_owned = match val_range {
+                    Some(vr) => {
+                        let Some(col) = load_col(vr) else {
+                            self.entries.push_back(entry);
+                            return None;
+                        };
+                        Some(col)
+                    }
+                    None => None,
+                };
+                entry.attempted = true;
+                let col_slices: Vec<&[FValue]> = cols_owned.iter().map(|c| c.as_slice()).collect();
+                entry
+                    .build_groups(&col_slices, amounts_owned.as_deref().map(Vec::as_slice), limit)
+                    .map(std::sync::Arc::new)
+            };
             if let Some(ref g) = built {
                 shared_put(entry.val_range, entry.cond_ranges.clone(), entry.numeric.clone(), g.clone());
             }

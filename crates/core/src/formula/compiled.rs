@@ -27,12 +27,187 @@ fn shard<T: std::hash::Hash + ?Sized>(key: &T) -> &'static RwLock<Cache> {
     &CACHE[(fx_hash_one(key) as usize) & (SHARDS - 1)]
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InlineSameSheetSpan {
+    pub r1: i64,
+    pub c1: i64,
+    pub r2: i64,
+    pub c2: i64,
+    pub r1_abs: bool,
+    pub c1_abs: bool,
+    pub r2_abs: bool,
+    pub c2_abs: bool,
+}
+
+impl InlineSameSheetSpan {
+    const EMPTY: Self = Self {
+        r1: 0,
+        c1: 0,
+        r2: 0,
+        c2: 0,
+        r1_abs: true,
+        c1_abs: true,
+        r2_abs: true,
+        c2_abs: true,
+    };
+
+    #[inline]
+    pub fn resolve(&self, dr: i64, dc: i64) -> (i64, i64, i64, i64) {
+        let ar = if self.r1_abs { self.r1 } else { self.r1 + dr };
+        let ac = if self.c1_abs { self.c1 } else { self.c1 + dc };
+        let br = if self.r2_abs { self.r2 } else { self.r2 + dr };
+        let bc = if self.c2_abs { self.c2 } else { self.c2 + dc };
+        (
+            ar.min(br).max(0),
+            ac.min(bc).max(0),
+            ar.max(br).max(0),
+            ac.max(bc).max(0),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TemplateRefSummary {
+    PureNoRefs {
+        volatile: bool,
+        visibility: bool,
+    },
+    SameSheet {
+        count: u8,
+        volatile: bool,
+        visibility: bool,
+        spans: [InlineSameSheetSpan; 4],
+    },
+    Complex,
+}
+
+pub(crate) fn summarize_template_refs(node: &Node) -> TemplateRefSummary {
+    struct Acc {
+        count: usize,
+        volatile: bool,
+        visibility: bool,
+        complex: bool,
+        spans: [InlineSameSheetSpan; 4],
+    }
+    fn walk(node: &Node, acc: &mut Acc) {
+        if acc.complex {
+            return;
+        }
+        match node {
+            Node::Ref(r) => {
+                if r.book.is_some() || r.sheet.is_some() || r.sheet2.is_some() || acc.count >= 4 {
+                    acc.complex = true;
+                    return;
+                }
+                acc.spans[acc.count] = InlineSameSheetSpan {
+                    r1: r.row,
+                    c1: r.col,
+                    r2: r.row,
+                    c2: r.col,
+                    r1_abs: r.row_abs,
+                    c1_abs: r.col_abs,
+                    r2_abs: r.row_abs,
+                    c2_abs: r.col_abs,
+                };
+                acc.count += 1;
+            }
+            Node::Range(a, b) => {
+                if a.book.is_some()
+                    || b.book.is_some()
+                    || a.sheet.is_some()
+                    || b.sheet.is_some()
+                    || a.sheet2.is_some()
+                    || b.sheet2.is_some()
+                    || acc.count >= 4
+                {
+                    acc.complex = true;
+                    return;
+                }
+                acc.spans[acc.count] = InlineSameSheetSpan {
+                    r1: a.row,
+                    c1: a.col,
+                    r2: b.row,
+                    c2: b.col,
+                    r1_abs: a.row_abs,
+                    c1_abs: a.col_abs,
+                    r2_abs: b.row_abs,
+                    c2_abs: b.col_abs,
+                };
+                acc.count += 1;
+            }
+            Node::Spill(_) | Node::Name(_) | Node::ScopedName { .. } => {
+                acc.complex = true;
+            }
+            Node::Func(name, args) => {
+                let id = name.id();
+                if !id.is_known_builtin()
+                    || matches!(
+                        id,
+                        super::FuncId::Let | super::FuncId::Lambda | super::FuncId::InternalCall
+                    )
+                    || id.is_volatile_ref()
+                    || (id == super::FuncId::SumIf && args.len() >= 3)
+                {
+                    acc.complex = true;
+                    return;
+                }
+                acc.volatile |= id.is_volatile();
+                acc.visibility |= id.is_visibility();
+                for a in args {
+                    walk(a, acc);
+                    if acc.complex {
+                        return;
+                    }
+                }
+            }
+            Node::Implicit(x) | Node::Unary(_, x) | Node::Percent(x) => walk(x, acc),
+            Node::Binary(_, l, r) => {
+                walk(l, acc);
+                if !acc.complex {
+                    walk(r, acc);
+                }
+            }
+            Node::Empty
+            | Node::Number(_)
+            | Node::Text(_)
+            | Node::Bool(_)
+            | Node::Err(_)
+            | Node::Array(..) => {}
+        }
+    }
+
+    let mut acc = Acc {
+        count: 0,
+        volatile: false,
+        visibility: false,
+        complex: false,
+        spans: [InlineSameSheetSpan::EMPTY; 4],
+    };
+    walk(node, &mut acc);
+    if acc.complex {
+        TemplateRefSummary::Complex
+    } else if acc.count == 0 {
+        TemplateRefSummary::PureNoRefs {
+            volatile: acc.volatile,
+            visibility: acc.visibility,
+        }
+    } else {
+        TemplateRefSummary::SameSheet {
+            count: acc.count as u8,
+            volatile: acc.volatile,
+            visibility: acc.visibility,
+            spans: acc.spans,
+        }
+    }
+}
+
 pub(super) struct Template {
     node: Arc<Node>,
     row: u32,
     col: u32,
     scalar: bool,
     cross_sheet_scalar: bool,
+    ref_summary: TemplateRefSummary,
     min_rel_row: i64,
     max_rel_row: i64,
     min_rel_col: i64,
@@ -43,9 +218,11 @@ impl Template {
     fn from_node(node: Arc<Node>, row: u32, col: u32) -> Self {
         let mut bounds = RelBounds::default();
         collect_rel_bounds(&node, &mut bounds);
+        let ref_summary = summarize_template_refs(&node);
         Self {
             scalar: projectable(&node, false),
             cross_sheet_scalar: projectable(&node, true),
+            ref_summary,
             node,
             row,
             col,
@@ -457,6 +634,26 @@ pub(crate) fn with_shifted_arc<T>(
     }
 }
 
+/// Fast dependency inspection using cached `TemplateRefSummary` when available.
+#[inline]
+pub(crate) fn with_ref_summary_arc<T>(
+    formula: &Arc<str>,
+    row: u32,
+    col: u32,
+    visit: impl FnOnce(TemplateRefSummary, &Node, i64, i64) -> T,
+) -> Result<T, ErrKind> {
+    match resolve_compiled_arc(formula, row, col) {
+        CachedCompiled::Exact(node, _, _) => {
+            let summary = summarize_template_refs(&node);
+            Ok(visit(summary, &node, 0, 0))
+        }
+        CachedCompiled::Shifted { template, dr, dc } => {
+            Ok(visit(template.ref_summary, &template.node, dr, dc))
+        }
+        CachedCompiled::Err(e) => Err(e),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScalarKind {
     None,
@@ -542,7 +739,7 @@ pub(super) fn eval_projected_scalar(
     Some(match node {
         Node::Number(v) => FValue::Number(*v),
         Node::Bool(b) => FValue::Bool(*b),
-        Node::Text(s) => FValue::Text(s.as_str().into()),
+        Node::Text(s) => FValue::Text(s.clone()),
         Node::Err(e) => FValue::Error(*e),
         Node::Empty => FValue::Empty,
         Node::Ref(r) => {
@@ -596,6 +793,24 @@ pub(super) fn eval_projected_scalar(
                 } else {
                     v
                 }
+            }
+            super::func_id::FuncId::Abs if args.len() == 1 => {
+                eval_projected_scalar(&args[0], dr, dc, read)?
+                    .to_number()
+                    .map(|v| FValue::number(v.abs()))
+                    .unwrap_or_else(FValue::Error)
+            }
+            super::func_id::FuncId::Int if args.len() == 1 => {
+                eval_projected_scalar(&args[0], dr, dc, read)?
+                    .to_number()
+                    .map(|v| FValue::number(v.floor()))
+                    .unwrap_or_else(FValue::Error)
+            }
+            super::func_id::FuncId::Not if args.len() == 1 => {
+                eval_projected_scalar(&args[0], dr, dc, read)?
+                    .to_bool()
+                    .map(|b| FValue::Bool(!b))
+                    .unwrap_or_else(FValue::Error)
             }
             _ => return None,
         },
@@ -743,6 +958,13 @@ fn projectable(node: &Node, allow_sheet: bool) -> bool {
             super::func_id::FuncId::IfError | super::func_id::FuncId::IfNa if args.len() == 2 => {
                 args.iter().all(|a| projectable(a, allow_sheet))
             }
+            super::func_id::FuncId::Abs
+            | super::func_id::FuncId::Int
+            | super::func_id::FuncId::Not
+                if args.len() == 1 =>
+            {
+                projectable(&args[0], allow_sheet)
+            }
             _ => false,
         },
         _ => false,
@@ -856,8 +1078,14 @@ fn relative_key_opts(
 ) -> Option<()> {
     let bytes = src.as_bytes();
     out.clear();
-    let (mut i, mut saw_ref, mut need_ref, mut was_ref, mut after_bang) =
-        (0usize, false, false, false, false);
+    let (
+        mut i,
+        mut saw_ref,
+        mut need_ref,
+        mut was_ref,
+        mut after_bang,
+        mut after_3d_or_book_bang,
+    ) = (0usize, false, false, false, false, false);
     while i < bytes.len() {
         let byte = bytes[i];
 
@@ -907,7 +1135,9 @@ fn relative_key_opts(
             }
             let start = i;
             let mut end = scan_quoted_ident(bytes, start)?;
+            let mut is_3d = false;
             if bytes.get(end) == Some(&b':') {
+                is_3d = true;
                 if bytes.get(end + 1) == Some(&b'\'') {
                     end = scan_quoted_ident(bytes, end + 1)?;
                 } else {
@@ -929,11 +1159,13 @@ fn relative_key_opts(
             if bytes.get(end) != Some(&b'!') {
                 return None;
             }
+            let has_book = bytes[start..end].contains(&b'[') || bytes[start..end].contains(&b':');
             i = end + 1;
             out.push(5);
             out.extend_from_slice(&(i - start).to_le_bytes());
             out.extend_from_slice(&bytes[start..i]);
             after_bang = true;
+            after_3d_or_book_bang = is_3d || has_book;
             was_ref = false;
             continue;
         }
@@ -963,6 +1195,7 @@ fn relative_key_opts(
             saw_ref = true;
             was_ref = false;
             after_bang = false;
+            after_3d_or_book_bang = false;
             continue;
         }
 
@@ -988,6 +1221,7 @@ fn relative_key_opts(
             saw_ref = true;
             was_ref = false;
             after_bang = false;
+            after_3d_or_book_bang = false;
             continue;
         }
 
@@ -1049,6 +1283,7 @@ fn relative_key_opts(
                     out.extend_from_slice(&(i - start).to_le_bytes());
                     out.extend_from_slice(&bytes[start..i]);
                     after_bang = true;
+                    after_3d_or_book_bang = false;
                     was_ref = false;
                     continue;
                 }
@@ -1067,6 +1302,7 @@ fn relative_key_opts(
                         out.extend_from_slice(&(i - start).to_le_bytes());
                         out.extend_from_slice(&bytes[start..i]);
                         after_bang = true;
+                        after_3d_or_book_bang = true;
                         was_ref = false;
                         continue;
                     }
@@ -1134,6 +1370,7 @@ fn relative_key_opts(
                 was_ref = !need_ref;
                 need_ref = false;
                 after_bang = false;
+                after_3d_or_book_bang = false;
                 continue;
             }
 
@@ -1146,6 +1383,27 @@ fn relative_key_opts(
                 out.push(3);
                 out.push(u8::from(word.len() == 4));
                 was_ref = false;
+                continue;
+            }
+
+            // Defined Name, scoped name (`Sheet1!Rate`), or LET/LAMBDA local identifier:
+            // syntax is coordinate-invariant (evaluated against `self.cur` / `env_stack`),
+            // so homogeneous rows with `=A2*TaxRate` or `=LET(x, A2*1.13, ROUND(x, 2))` share 1 Template!
+            if extended
+                && !need_ref
+                && !after_3d_or_book_bang
+                && !word.contains('$')
+                && !matches!(bytes.get(i), Some(b'[' | b':' | b'!'))
+            {
+                out.push(8);
+                out.push(u8::from(after_bang));
+                out.extend_from_slice(&word.len().to_le_bytes());
+                for &b in word.as_bytes() {
+                    out.push(b.to_ascii_uppercase());
+                }
+                was_ref = false;
+                after_bang = false;
+                after_3d_or_book_bang = false;
                 continue;
             }
 
@@ -1185,7 +1443,7 @@ fn relative_key_opts(
                 | b'('
                 | b')'
                 | b':'
-        ) || (extended && byte == b'@');
+        ) || (extended && matches!(byte, b'@' | b'{' | b'}' | b';'));
         if !allowed_punct {
             return None;
         }

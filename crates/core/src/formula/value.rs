@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ErrKind {
     Null,      // #NULL!
     Div0,      // #DIV/0!
