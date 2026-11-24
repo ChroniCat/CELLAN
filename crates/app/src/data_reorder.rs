@@ -458,6 +458,13 @@ pub(crate) struct Pending {
 
 enum PreparedChanges {
     Cells(data_tools::RowChanges),
+    CowSort {
+        order_perm: data_tools::LinePermutation,
+        moved_lines: usize,
+        total: usize,
+        sample: Vec<sheetcore::undo::CellDelta>,
+        batch: Option<sheetcore::undo::PreparedCowBatch>,
+    },
     Permutation {
         order: data_tools::CompactSort,
         total: usize,
@@ -732,6 +739,7 @@ impl SheetApp {
             .is_some()
             .then(|| std::sync::Arc::new(self.wb.styles.clone()));
         let index = self.sheet_idx;
+        let focus = (index, self.sel.0, self.sel.1);
         self.status = format!("正在计算{}…", operation.label());
         let (tx, rx) = mpsc::channel();
         let op = std::sync::Arc::new(operation);
@@ -764,38 +772,68 @@ impl SheetApp {
                     Operation::Dedup { .. } => None,
                 };
                 if let Some(order) = sort {
-                        let mut total = 0;
-                        let mut sample = Vec::new();
-                        let mut collab = collab_palette.as_ref().map(|_| Vec::new());
-                        let mut style_cache: std::collections::HashMap<u16, sheetcore::style::CellStyle> =
-                            std::collections::HashMap::new();
-                        for d in order.deltas() {
-                            if d.before != d.after { prepared.set(d.row, d.col, d.after.clone()); }
-                            if d.before_style != d.after_style { prepared.set_style(d.row, d.col, d.after_style); }
-                            if let (Some(out), Some(pal)) = (collab.as_mut(), collab_palette.as_ref()) {
-                                let effective_st = if d.before_style != d.after_style {
-                                    let sid = prepared.style_of(d.row, d.col);
-                                    Some(
-                                        style_cache
-                                            .entry(sid)
-                                            .or_insert_with(|| pal.get(sid).clone())
-                                            .clone(),
-                                    )
-                                } else {
-                                    None
-                                };
-                                out.push((
-                                    d.row,
-                                    d.col,
-                                    (&d.after.value).into(),
-                                    d.after.formula.clone(),
-                                    effective_st,
-                                ));
-                            }
-                            if total < sheetcore::revision::MAX_CELLS { sample.push(d); }
-                            total += 1;
+                    if collab_palette.is_none() {
+                        let (total, sample) = order.apply_to_sheet_with_sample(
+                            &mut prepared,
+                            sheetcore::revision::MAX_CELLS,
+                        );
+                        let moved_lines = order.moved_lines();
+                        let order_perm = order.permutation();
+                        let batch = (total > 0).then(|| {
+                            sheetcore::undo::PreparedCowBatch::from_sheets(
+                                worker_op.label(),
+                                index,
+                                &snapshot,
+                                &prepared,
+                                focus,
+                                0,
+                            )
+                        }).flatten();
+                        drop(order);
+                        return Ok((
+                            snapshot,
+                            prepared,
+                            PreparedChanges::CowSort {
+                                order_perm,
+                                moved_lines,
+                                total,
+                                sample,
+                                batch,
+                            },
+                        ));
+                    }
+                    let mut total = 0;
+                    let mut sample = Vec::new();
+                    let mut collab = collab_palette.as_ref().map(|_| Vec::new());
+                    let mut style_cache: std::collections::HashMap<u16, sheetcore::style::CellStyle> =
+                        std::collections::HashMap::new();
+                    for d in order.deltas() {
+                        if d.before != d.after { prepared.set(d.row, d.col, d.after.clone()); }
+                        if d.before_style != d.after_style { prepared.set_style(d.row, d.col, d.after_style); }
+                        if let (Some(out), Some(pal)) = (collab.as_mut(), collab_palette.as_ref()) {
+                            let effective_st = if d.before_style != d.after_style {
+                                let sid = prepared.style_of(d.row, d.col);
+                                Some(
+                                    style_cache
+                                        .entry(sid)
+                                        .or_insert_with(|| pal.get(sid).clone())
+                                        .clone(),
+                                )
+                            } else {
+                                None
+                            };
+                            out.push((
+                                d.row,
+                                d.col,
+                                (&d.after.value).into(),
+                                d.after.formula.clone(),
+                                effective_st,
+                            ));
                         }
-                        return Ok((snapshot, prepared, PreparedChanges::Permutation { order, total, sample, collab }));
+                        if total < sheetcore::revision::MAX_CELLS { sample.push(d); }
+                        total += 1;
+                    }
+                    return Ok((snapshot, prepared, PreparedChanges::Permutation { order, total, sample, collab }));
                 }
                 let changes = worker_op.plan(&snapshot, index, rect)?;
                 changes.apply(&mut prepared);
@@ -852,6 +890,31 @@ impl SheetApp {
             match changes {
                 PreparedChanges::Cells(changes) => {
                     self.finish_reorder(&pending.operation, Ok(changes), Some(&mut prepared), focus);
+                }
+                PreparedChanges::CowSort {
+                    order_perm,
+                    moved_lines,
+                    total,
+                    sample,
+                    batch,
+                } => {
+                    let operation = &pending.operation;
+                    self.status = operation.completed(moved_lines);
+                    if total == 0 {
+                        std::thread::spawn(move || drop((source, prepared)));
+                        return;
+                    }
+                    self.wb.sheet_mut(pending.sheet).take_row_changes(&mut prepared);
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                    self.recalc_all_and_deps_adaptive();
+                    self.record_revision_sample(operation.label(), &sample, total);
+                    if let Some(batch) = batch {
+                        self.undo.push_prepared_cow_batch(batch);
+                        self.undo.tag_sorted_cells(order_perm);
+                    }
+                    self.tasks.last_edit = Some(std::time::Instant::now());
+                    std::thread::spawn(move || drop((source, prepared)));
                 }
                 PreparedChanges::Permutation { order, total, sample, collab } => {
                     let operation = &pending.operation;

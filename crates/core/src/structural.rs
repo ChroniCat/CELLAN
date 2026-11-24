@@ -63,6 +63,118 @@ struct TableRowFill {
     style: Option<u16>,
 }
 
+/// Conservative O(formula.len()) pre-filter: returns `false` ONLY when it is guaranteed
+/// that `crate::refs::rewrite_mapped(formula, shift)` will return `formula` verbatim.
+/// Any lowercase letters, leading zeros, reversed ranges, `translate`, or coordinates `>= min_at`
+/// conservatively return `true` so no reference (including cross-sheet, whole-row/col, `$`) is missed.
+fn formula_may_be_affected(formula: &str, shift: &MappedShift) -> bool {
+    if shift.translate.is_some() {
+        return true;
+    }
+    let min_at = if shift.insertions.is_empty() {
+        shift.at
+    } else {
+        shift.insertions.iter().copied().min().unwrap_or(shift.at)
+    };
+    let b = formula.as_bytes();
+    match shift.axis {
+        crate::refs::Axis::Row => {
+            let threshold = min_at as u64 + 1;
+            let mut i = 0usize;
+            let mut saw_colon = false;
+            let mut prev_num: Option<u64> = None;
+            while i < b.len() {
+                let ch = b[i];
+                if ch.is_ascii_lowercase() {
+                    return true;
+                }
+                if ch == b':' {
+                    saw_colon = true;
+                    i += 1;
+                    continue;
+                }
+                if ch.is_ascii_digit() {
+                    let start = i;
+                    let mut val = 0u64;
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        val = val.saturating_mul(10).saturating_add((b[i] - b'0') as u64);
+                        i += 1;
+                    }
+                    if i - start > 1 && b[start] == b'0' {
+                        return true;
+                    }
+                    if val >= threshold {
+                        return true;
+                    }
+                    if saw_colon {
+                        if prev_num.is_some_and(|p| p > val) {
+                            return true;
+                        }
+                        saw_colon = false;
+                    }
+                    prev_num = Some(val);
+                    continue;
+                }
+                i += 1;
+            }
+            false
+        }
+        crate::refs::Axis::Col => {
+            let mut i = 0usize;
+            let mut saw_colon = false;
+            let mut prev_col: Option<u32> = None;
+            while i < b.len() {
+                let ch = b[i];
+                if ch.is_ascii_lowercase() {
+                    return true;
+                }
+                if ch == b':' {
+                    saw_colon = true;
+                    i += 1;
+                    continue;
+                }
+                if ch.is_ascii_digit() {
+                    let start = i;
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if i - start > 1 && b[start] == b'0' {
+                        return true;
+                    }
+                    continue;
+                }
+                if ch.is_ascii_uppercase() {
+                    let start = i;
+                    let mut col = 0u32;
+                    while i < b.len() && b[i].is_ascii_uppercase() {
+                        col = col
+                            .saturating_mul(26)
+                            .saturating_add((b[i] - b'A') as u32 + 1);
+                        i += 1;
+                    }
+                    let len = i - start;
+                    if len <= 3 && col > 0 && col <= 16_384 && b.get(i) != Some(&b'(') {
+                        let c0 = col - 1;
+                        if c0 >= min_at {
+                            return true;
+                        }
+                        if saw_colon {
+                            if prev_col.is_some_and(|p| p > c0) {
+                                return true;
+                            }
+                            saw_colon = false;
+                        }
+                        prev_col = Some(c0);
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            false
+        }
+    }
+}
+
 impl Sheet {
     /// 把所有公式里的引用按 shift 改写（含条件格式、数据验证里的公式）
     pub fn rewrite_references(&mut self, shift: &crate::refs::Shift) {
@@ -70,20 +182,19 @@ impl Sheet {
     }
 
     fn rewrite_mapped_references(&mut self, shift: &MappedShift) {
-        let rewrite = |(key, cell): (crate::model::CellRef, &crate::model::Cell)| {
-            let old = cell.formula.as_deref()?;
-            let new = crate::refs::rewrite_mapped(old, shift);
-            (new != old).then(|| (key, new.into()))
-        };
-        let changes: Vec<_> = if shift.translate.is_none() && !shift.own_sheet.eq_ignore_ascii_case(&shift.target_sheet) {
-            self.foreign_formula_cells(&shift.target_sheet).filter_map(rewrite).collect()
-        } else {
-            self.formula_cells().filter_map(rewrite).collect()
-        };
-        self.edited |= !changes.is_empty();
-        for (key, formula) in changes {
-            self.get_mut(key.row, key.col).unwrap().formula = Some(formula);
-        }
+        let foreign_sheet = (shift.translate.is_none()
+            && !shift.own_sheet.eq_ignore_ascii_case(&shift.target_sheet))
+        .then_some(shift.target_sheet.as_str());
+        let changed = self
+            .cells_mut()
+            .rewrite_formulas_parallel(foreign_sheet, |old| {
+                if !formula_may_be_affected(old, shift) {
+                    return None;
+                }
+                let new = crate::refs::rewrite_mapped(old, shift);
+                (new != old).then(|| new.into())
+            });
+        self.edited |= changed;
         for blk in self.cf.blocks.iter_mut() {
             for rule in blk.rules.iter_mut() {
                 let mut rewrite_threshold = |formula: &mut String| {

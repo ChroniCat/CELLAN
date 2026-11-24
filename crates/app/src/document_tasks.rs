@@ -40,6 +40,9 @@ pub(crate) struct DocumentTasks {
     pub last_edit: Option<Instant>,
     pub autosave_dirty_since: Option<Instant>,
     pub autosave_retry_at: Option<Instant>,
+    /// Elapsed wall-clock milliseconds of the most recent completed save (drives adaptive autosave backoff).
+    pub last_save_ms: Option<u64>,
+    pub save_started_at: Option<Instant>,
     /// Ctrl+S requested a second snapshot while the previous one was being written.
     pub manual_save_queued: bool,
     /// A shared document inherits the host preference until the room switch is changed.
@@ -197,8 +200,16 @@ impl DocumentTasks {
         if self.manual_save_queued {
             return true;
         }
-        let quiet = self.last_edit.unwrap_or(first) + Duration::from_millis(400);
-        let mut due = quiet.min(first + Duration::from_secs(2));
+        let total_cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
+        let last_ms = self.last_save_ms.unwrap_or(0);
+        let (quiet_ms, max_ms) = if last_ms > 250 || total_cells > 50_000 {
+            let backoff_ms = last_ms.saturating_mul(8).clamp(5_000, 60_000);
+            (backoff_ms, backoff_ms)
+        } else {
+            (400, 2_000)
+        };
+        let quiet = self.last_edit.unwrap_or(first) + Duration::from_millis(quiet_ms);
+        let mut due = quiet.min(first + Duration::from_millis(max_ms));
         if let Some(retry) = self.autosave_retry_at {
             due = due.max(retry);
         }
@@ -231,7 +242,14 @@ impl DocumentTasks {
         let mut snapshot = wb.clone();
         let (tx, rx) = mpsc::channel();
         let used_dirty_graph = deps.is_some() && !self.needs_full && !snapshot.calc_iterate;
-        self.saving = Some(PendingSave { target: target.clone(), rx, quiet: false, used_dirty_graph, host: None });
+        self.save_started_at = Some(Instant::now());
+        self.saving = Some(PendingSave {
+            target: target.clone(),
+            rx,
+            quiet: false,
+            used_dirty_graph,
+            host: None,
+        });
         // Subsequent edits set this back to true. Completion never clears it.
         wb.dirty = false;
         self.autosave_dirty_since = None;
@@ -276,8 +294,12 @@ impl DocumentTasks {
             Err(TryRecvError::Disconnected) => Err("保存线程意外退出，改动尚未保存".into()),
         };
         let pending = self.saving.take().unwrap();
+        let started_at = self.save_started_at.take();
         Some(match result {
             Ok((receipt, calculated)) => {
+                if let Some(t) = started_at {
+                    self.last_save_ms = Some(t.elapsed().as_millis() as u64);
+                }
                 self.autosave_retry_at = None;
                 if wb.path.as_ref() != Some(&pending.target)
                     || (self.autosave_after_detach == Some(true) && !wb.dirty)

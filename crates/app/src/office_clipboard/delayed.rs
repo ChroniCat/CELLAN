@@ -155,6 +155,14 @@ impl Range {
     pub fn sparse_entries(
         &self,
     ) -> Result<Vec<(u32, u32, u32, Option<sheetcore::Cell>, u16)>, &'static str> {
+        self.sparse_entries_with_limit(Some(sheetcore::undo::MAX_DENSE_RECT_KEYS))
+    }
+
+    /// 稀疏提取选区内的非空或带非零有效样式的单元格；`max_keys == None` 表示单人 CoW 路径不受 50 万格限制。
+    pub fn sparse_entries_with_limit(
+        &self,
+        max_keys: Option<usize>,
+    ) -> Result<Vec<(u32, u32, u32, Option<sheetcore::Cell>, u16)>, &'static str> {
         use std::collections::{BTreeSet, HashMap};
         let (r1, c1, r2, c2) = self.rect;
         let sh = self.book.sheet(0);
@@ -176,12 +184,12 @@ impl Range {
 
         // Collect sparse coordinates `(rel_row, rel_col, src_row)`
         let mut coords: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
-        let max_keys = sheetcore::undo::MAX_DENSE_RECT_KEYS;
+        let over_limit = |len: usize| max_keys.is_some_and(|limit| len > limit);
 
         for (k, _) in sh.iter_rect(self.rect) {
             if let Some(rr) = map_row(k.row) {
                 coords.insert((rr, k.col - c1, k.row));
-                if coords.len() > max_keys {
+                if over_limit(coords.len()) {
                     return Err("粘贴内容过大（实际非空或带格式单元格超过 50 万个）");
                 }
             }
@@ -189,7 +197,7 @@ impl Range {
         for (k, _) in sh.styles.iter_rect(self.rect) {
             if let Some(rr) = map_row(k.row) {
                 coords.insert((rr, k.col - c1, k.row));
-                if coords.len() > max_keys {
+                if over_limit(coords.len()) {
                     return Err("粘贴内容过大（实际非空或带格式单元格超过 50 万个）");
                 }
             }
@@ -199,7 +207,7 @@ impl Range {
                 if let Some(rr) = map_row(r) {
                     for col in c1..=c2 {
                         coords.insert((rr, col - c1, r));
-                        if coords.len() > max_keys {
+                        if over_limit(coords.len()) {
                             return Err("粘贴内容过大（实际非空或带格式单元格超过 50 万个）");
                         }
                     }
@@ -212,7 +220,7 @@ impl Range {
                     Some(rows) => {
                         for (idx, &r) in rows.iter().enumerate() {
                             coords.insert((idx as u32, col - c1, r));
-                            if coords.len() > max_keys {
+                            if over_limit(coords.len()) {
                                 return Err("粘贴内容过大（实际非空或带格式单元格超过 50 万个）");
                             }
                         }
@@ -220,7 +228,7 @@ impl Range {
                     None => {
                         for r in r1..=r2 {
                             coords.insert((r - r1, col - c1, r));
-                            if coords.len() > max_keys {
+                            if over_limit(coords.len()) {
                                 return Err("粘贴内容过大（实际非空或带格式单元格超过 50 万个）");
                             }
                         }
@@ -293,8 +301,45 @@ impl Range {
         let mut text = String::new();
         let (r1, c1, r2, c2) = self.rect;
         let sh = self.book.sheet(0);
+        let area = match &self.visible_rows {
+            Some(rows) => (rows.len() as u64).saturating_mul(u64::from(c2 - c1 + 1)),
+            None => u64::from(r2 - r1 + 1).saturating_mul(u64::from(c2 - c1 + 1)),
+        };
+        let trim_empty = r2 >= 1_000_000 || c2 >= 16_000 || area > 4_096;
+        let (eff_r2, eff_c2) = if trim_empty {
+            let Some((_, _, ur2, uc2)) = sh.used_bounds() else {
+                return String::new();
+            };
+            let er = r2.min(ur2);
+            let ec = c2.min(uc2);
+            if er < r1 || ec < c1 {
+                return String::new();
+            }
+            if self.visible_rows.is_none() && (er - r1) >= 256 && (ec - c1) <= 64 {
+                // Tighten trailing empty rows for copied full columns using O(pages) reverse scan.
+                let mut tight_r: Option<u32> = None;
+                for col in c1..=ec {
+                    let hit = if sh.get(er, col).is_some() {
+                        Some(er)
+                    } else {
+                        sh.next_occupied_in_col(col, er, false).filter(|&r| r >= r1)
+                    };
+                    if let Some(r) = hit {
+                        tight_r = Some(tight_r.map_or(r, |m| m.max(r)));
+                    }
+                }
+                let Some(tr) = tight_r else {
+                    return String::new();
+                };
+                (tr, ec)
+            } else {
+                (er, ec)
+            }
+        } else {
+            (r2, c2)
+        };
         let mut append_row = |r: u32| {
-            for c in c1..=c2 {
+            for c in c1..=eff_c2 {
                 if c != c1 {
                     text.push('\t');
                 }
@@ -311,12 +356,19 @@ impl Range {
         };
         match &self.visible_rows {
             Some(rows) => {
-                for &r in rows {
-                    append_row(r);
+                let last_idx = if trim_empty {
+                    rows.iter().rposition(|&r| r <= eff_r2)
+                } else {
+                    rows.len().checked_sub(1)
+                };
+                if let Some(end) = last_idx {
+                    for &r in &rows[..=end] {
+                        append_row(r);
+                    }
                 }
             }
             None => {
-                for r in r1..=r2 {
+                for r in r1..=eff_r2 {
                     append_row(r);
                 }
             }
@@ -952,5 +1004,66 @@ mod tests {
         assert_eq!(app.wb.sheets[1].value(10, 0), Value::Number(5.0));
         app.do_undo(false);
         assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(5.0));
+    }
+
+    #[test]
+    fn full_column_text_and_html_trim_trailing_empty_rows_and_cols() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Text("A1".into()), formula: None });
+        wb.sheets[0].set(2, 0, Cell { value: Value::Number(99.0), formula: None });
+        // Distant column data must not bloat full-column A copy.
+        wb.sheets[0].set(500_000, 5, Cell { value: Value::Number(1.0), formula: None });
+
+        let full_col_a = Range::new(&wb, 0, (0, 0, sheetcore::sync::MAX_ROWS - 1, 0));
+        assert_eq!(full_col_a.text(), "A1\n\n99\n");
+
+        let empty_col_b = Range::new(&wb, 0, (0, 1, sheetcore::sync::MAX_ROWS - 1, 1));
+        assert_eq!(empty_col_b.text(), "");
+
+        let full_row_0 = Range::new(&wb, 0, (0, 0, 0, sheetcore::sync::MAX_COLS - 1));
+        assert_eq!(full_row_0.text(), "A1\t\t\t\t\t\n");
+
+        let html = full_col_a.html();
+        assert!(html.contains("A1") && html.contains("99"));
+        assert!(html.len() < 4096, "full-column HTML must be trimmed, got {} bytes", html.len());
+    }
+
+    #[test]
+    fn over_500k_dense_copy_paste_uses_cow_batch_and_undoes_cleanly() {
+        let _env = crate::test_env::TestEnv::new("over-500k-cow-paste");
+        let ctx = eframe::egui::Context::default();
+        let mut app = crate::SheetApp::new_with_context(&ctx, None);
+        // 55,000 rows x 10 cols = 550,000 non-empty cells (> 500,000 old cap)
+        {
+            let sh = &mut app.wb.sheets[0];
+            for r in 0..55_000u32 {
+                for c in 0..10u32 {
+                    sh.set(r, c, Cell { value: Value::Number((r * 10 + c) as f64), formula: None });
+                }
+            }
+        }
+        app.wb.sheets.push(sheetcore::Sheet::new("Dest"));
+        app.sheet_idx = 0;
+        app.sel = (0, 0);
+        app.sel_end = (54_999, 9);
+        app.clip_copy(false, &ctx);
+        assert!(
+            app.clip.as_ref().and_then(|c| c.deferred.as_ref()).is_some(),
+            "55 万非空格复制不应被 50 万上限拒绝: {}",
+            app.status
+        );
+
+        app.sheet_idx = 1;
+        app.sel = (0, 0);
+        app.sel_end = (0, 0);
+        app.clip_paste(false, None);
+        assert_eq!(app.wb.sheets[1].len(), 550_000, "status={}", app.status);
+        assert_eq!(app.wb.sheets[1].value(54_999, 9), Value::Number(549_999.0));
+
+        app.do_undo(false);
+        assert_eq!(app.wb.sheets[1].len(), 0);
+        app.do_undo(true);
+        assert_eq!(app.wb.sheets[1].len(), 550_000);
+        assert_eq!(app.wb.sheets[1].value(54_999, 9), Value::Number(549_999.0));
     }
 }

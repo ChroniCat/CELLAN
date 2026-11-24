@@ -5,17 +5,196 @@
 //! 筛选不删数据，只把不匹配的行隐藏起来（隐藏 = 行高 0，和 Excel 一致）。
 
 use crate::model::{Cell, Sheet, Value};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 
-/// 排序键：数字 < 文本 < 布尔，空格单独处理
-fn key_of(v: &Value) -> Option<(u8, f64, String)> {
-    match v {
-        Value::Number(n) => Some((0, *n, String::new())),
-        Value::Text(t) => Some((1, 0.0, t.to_lowercase())),
-        Value::Bool(b) => Some((2, if *b { 1.0 } else { 0.0 }, String::new())),
-        // 错误值排在最后（Excel 同序），同类之间按错误文本稳定排序
-        Value::Error(e) => Some((3, 0.0, e.text().to_string())),
-        Value::Empty => None,
+/// Fast non-cryptographic FxHasher (zero external crate dependency) for sort key dedup.
+#[derive(Default)]
+pub(crate) struct FxHasher {
+    hash: u64,
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517cc1b727220a95;
+        let mut h = self.hash;
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let v = u64::from_ne_bytes(chunk.try_into().unwrap());
+            h = (h.rotate_left(5) ^ v).wrapping_mul(K);
+        }
+        let rem = chunks.remainder();
+        if rem.len() >= 4 {
+            let v = u32::from_ne_bytes(rem[..4].try_into().unwrap()) as u64;
+            h = (h.rotate_left(5) ^ v).wrapping_mul(K);
+            for &b in &rem[4..] {
+                h = (h.rotate_left(5) ^ b as u64).wrapping_mul(K);
+            }
+        } else {
+            for &b in rem {
+                h = (h.rotate_left(5) ^ b as u64).wrapping_mul(K);
+            }
+        }
+        self.hash = h;
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        const K: u64 = 0x517cc1b727220a95;
+        self.hash = (self.hash.rotate_left(5) ^ (i as u64)).wrapping_mul(K);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        const K: u64 = 0x517cc1b727220a95;
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(K);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+pub(crate) type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+#[inline]
+pub(crate) fn prefix_u64(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = bytes.len().min(8);
+    buf[..n].copy_from_slice(&bytes[..n]);
+    u64::from_be_bytes(buf)
+}
+
+#[inline]
+fn append_lowercase_into(s: &str, arena: &mut Vec<u8>) {
+    if s.is_ascii() {
+        arena.extend(s.bytes().map(|b| b.to_ascii_lowercase()));
+    } else if s.contains('Σ') {
+        arena.extend_from_slice(s.to_lowercase().as_bytes());
+    } else {
+        let mut buf = [0u8; 4];
+        for ch in s.chars() {
+            for lc in ch.to_lowercase() {
+                arena.extend_from_slice(lc.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+}
+
+#[inline]
+fn merge_two_stable<T: Copy, F: Fn(&T, &T) -> Ordering>(
+    a: &[T],
+    b: &[T],
+    out: &mut [T],
+    cmp: &F,
+) {
+    let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if cmp(&a[i], &b[j]) != Ordering::Greater {
+            out[k] = a[i];
+            i += 1;
+        } else {
+            out[k] = b[j];
+            j += 1;
+        }
+        k += 1;
+    }
+    if i < a.len() {
+        out[k..k + (a.len() - i)].copy_from_slice(&a[i..]);
+    } else if j < b.len() {
+        out[k..k + (b.len() - j)].copy_from_slice(&b[j..]);
+    }
+}
+
+/// Stable parallel merge sort using `std::thread::scope` for slices > 16,384 elements.
+pub(crate) fn parallel_stable_sort<T, F>(slice: &mut [T], cmp: &F)
+where
+    T: Copy + Send + Sync,
+    F: Fn(&T, &T) -> Ordering + Sync,
+{
+    const PAR_THRESHOLD: usize = 16_384;
+    if slice.len() <= PAR_THRESHOLD {
+        slice.sort_by(cmp);
+        return;
+    }
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8);
+    if n_threads <= 1 {
+        slice.sort_by(cmp);
+        return;
+    }
+    let chunk_size = slice.len().div_ceil(n_threads);
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::with_capacity(n_threads);
+    {
+        let mut start = 0usize;
+        while start < slice.len() {
+            let end = (start + chunk_size).min(slice.len());
+            runs.push(start..end);
+            start = end;
+        }
+    }
+    std::thread::scope(|s| {
+        for chunk in slice.chunks_mut(chunk_size) {
+            s.spawn(move || chunk.sort_by(cmp));
+        }
+    });
+    let mut scratch = slice.to_vec();
+    let mut in_scratch = false;
+    while runs.len() > 1 {
+        let mut next_runs = Vec::with_capacity(runs.len().div_ceil(2));
+        let (src, dst): (&[T], &mut [T]) = if in_scratch {
+            (&scratch, slice)
+        } else {
+            (slice, &mut scratch)
+        };
+        let mut tasks: Vec<(&[T], Option<&[T]>, &mut [T])> = Vec::with_capacity(runs.len().div_ceil(2));
+        let mut rem_dst = dst;
+        let mut idx = 0usize;
+        while idx < runs.len() {
+            if idx + 1 < runs.len() {
+                let a = &runs[idx];
+                let b = &runs[idx + 1];
+                let len = b.end - a.start;
+                let (out_chunk, rest) = rem_dst.split_at_mut(len);
+                rem_dst = rest;
+                tasks.push((&src[a.clone()], Some(&src[b.clone()]), out_chunk));
+                next_runs.push(a.start..b.end);
+                idx += 2;
+            } else {
+                let a = &runs[idx];
+                let len = a.end - a.start;
+                let (out_chunk, rest) = rem_dst.split_at_mut(len);
+                rem_dst = rest;
+                tasks.push((&src[a.clone()], None, out_chunk));
+                next_runs.push(a.clone());
+                idx += 1;
+            }
+        }
+        if tasks.len() > 1 {
+            std::thread::scope(|s| {
+                for (a, b_opt, out) in tasks {
+                    s.spawn(move || match b_opt {
+                        Some(b) => merge_two_stable(a, b, out, cmp),
+                        None => out.copy_from_slice(a),
+                    });
+                }
+            });
+        } else if let Some((a, b_opt, out)) = tasks.into_iter().next() {
+            match b_opt {
+                Some(b) => merge_two_stable(a, b, out, cmp),
+                None => out.copy_from_slice(a),
+            }
+        }
+        runs = next_runs;
+        in_scratch = !in_scratch;
+    }
+    if in_scratch {
+        slice.copy_from_slice(&scratch);
     }
 }
 
@@ -82,11 +261,62 @@ pub fn plan_sort_axis(
     Ok(crate::data_tools::reorder_lines(sheet, sheet_idx, region, order, horizontal, false))
 }
 
+#[derive(Clone, Copy)]
+struct SortEntry {
+    /// For Number: `f64::to_bits()`.
+    /// For Text/Error: big-endian 8-byte prefix (or dense `u32` rank when ranked).
+    /// For Bool: 0 or 1. For Empty: 0.
+    payload: u64,
+    line: u32,
+    /// Top 3 bits: kind (0=Number, 1=Text, 2=Bool, 3=Error, 4=Empty); bottom 29 bits: span index.
+    kind_aux: u32,
+}
+
+impl SortEntry {
+    const KIND_NUM: u8 = 0;
+    const KIND_TEXT: u8 = 1;
+    const KIND_BOOL: u8 = 2;
+    const KIND_ERR: u8 = 3;
+    const KIND_EMPTY: u8 = 4;
+
+    #[inline]
+    fn new(line: u32, kind: u8, aux: u32, payload: u64) -> Self {
+        Self {
+            payload,
+            line,
+            kind_aux: ((kind as u32) << 29) | (aux & 0x1fff_ffff),
+        }
+    }
+
+    #[inline]
+    fn empty(line: u32) -> Self {
+        Self::new(line, Self::KIND_EMPTY, 0, 0)
+    }
+
+    #[inline]
+    fn kind(self) -> u8 {
+        (self.kind_aux >> 29) as u8
+    }
+
+    #[inline]
+    fn aux(self) -> u32 {
+        self.kind_aux & 0x1fff_ffff
+    }
+}
+
 pub(crate) fn sort_order(
-    sheet: &Sheet, region: (u32, u32, u32, u32), key: u32, asc: bool, horizontal: bool,
+    sheet: &Sheet,
+    region: (u32, u32, u32, u32),
+    key: u32,
+    asc: bool,
+    horizontal: bool,
 ) -> Result<Vec<u32>, String> {
     let (r1, c1, r2, c2) = region;
-    let (first, last, lo, hi) = if horizontal { (c1, c2, r1, r2) } else { (r1, r2, c1, c2) };
+    let (first, last, lo, hi) = if horizontal {
+        (c1, c2, r1, r2)
+    } else {
+        (r1, r2, c1, c2)
+    };
     if last <= first {
         return Ok(Default::default());
     }
@@ -99,41 +329,151 @@ pub(crate) fn sort_order(
         .into());
     }
     validate_sort_region(sheet, region)?;
-    let mut lower_cache: HashMap<usize, String> = HashMap::new();
-    let mut lines: Vec<_> = (first..=last)
-        .map(|line| {
-            let (r, c) = if horizontal { (key, line) } else { (line, key) };
-            let v = sheet.value_ref(r, c);
-            let k = match v {
-                Value::Number(n) => Some((0u8, *n, String::new())),
-                Value::Text(t) => {
-                    let ptr = std::sync::Arc::as_ptr(t) as *const () as usize;
-                    let low = lower_cache
-                        .entry(ptr)
-                        .or_insert_with(|| t.to_lowercase())
-                        .clone();
-                    Some((1u8, 0.0, low))
+
+    let len = (last - first + 1) as usize;
+    let mut entries: Vec<SortEntry> = (first..=last).map(SortEntry::empty).collect();
+    let mut arena: Vec<u8> = Vec::new();
+    let mut spans: Vec<(u32, u32)> = Vec::new();
+    let mut ptr_cache: FxHashMap<usize, (u32, u64)> = FxHashMap::default();
+    let mut text_count = 0usize;
+
+    let mut encode_value = |line: u32, v: &Value| -> SortEntry {
+        match v {
+            Value::Number(n) => SortEntry::new(line, SortEntry::KIND_NUM, 0, n.to_bits()),
+            Value::Text(t) => {
+                text_count += 1;
+                let shared = std::sync::Arc::strong_count(t) > 1;
+                let ptr = std::sync::Arc::as_ptr(t) as *const () as usize;
+                if shared
+                    && let Some(&(span_id, pref)) = ptr_cache.get(&ptr)
+                {
+                    return SortEntry::new(line, SortEntry::KIND_TEXT, span_id, pref);
                 }
-                Value::Bool(b) => Some((2u8, if *b { 1.0 } else { 0.0 }, String::new())),
-                Value::Error(e) => Some((3u8, 0.0, e.text().to_string())),
-                Value::Empty => None,
-            };
-            (k, line)
-        })
-        .collect();
-    lines.sort_by(|a, b| match (&a.0, &b.0) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (Some(x), Some(y)) => {
-            let ord =
-                x.0.cmp(&y.0)
-                    .then_with(|| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .then_with(|| x.2.cmp(&y.2));
-            if asc { ord } else { ord.reverse() }
+                let off = arena.len() as u32;
+                append_lowercase_into(t, &mut arena);
+                let byte_len = (arena.len() as u32) - off;
+                let pref = prefix_u64(&arena[off as usize..(off + byte_len) as usize]);
+                let span_id = spans.len() as u32;
+                spans.push((off, byte_len));
+                if shared {
+                    ptr_cache.insert(ptr, (span_id, pref));
+                }
+                SortEntry::new(line, SortEntry::KIND_TEXT, span_id, pref)
+            }
+            Value::Bool(b) => SortEntry::new(line, SortEntry::KIND_BOOL, 0, u64::from(*b)),
+            Value::Error(e) => {
+                let s = e.text().as_bytes();
+                let off = arena.len() as u32;
+                arena.extend_from_slice(s);
+                let byte_len = s.len() as u32;
+                let pref = prefix_u64(s);
+                let span_id = spans.len() as u32;
+                spans.push((off, byte_len));
+                SortEntry::new(line, SortEntry::KIND_ERR, span_id, pref)
+            }
+            Value::Empty => SortEntry::empty(line),
         }
-    });
-    Ok(lines.into_iter().map(|(_, line)| line).collect())
+    };
+
+    if !horizontal {
+        for (base_row, slice) in sheet.column_slices(first, last, key) {
+            let start_idx = (base_row - first) as usize;
+            for (i, cell) in slice.iter().enumerate() {
+                if !cell.value.is_empty() {
+                    let line = base_row + i as u32;
+                    entries[start_idx + i] = encode_value(line, &cell.value);
+                }
+            }
+        }
+    } else {
+        for i in 0..len {
+            let line = first + i as u32;
+            let v = sheet.value_ref(key, line);
+            if !v.is_empty() {
+                entries[i] = encode_value(line, v);
+            }
+        }
+    }
+
+    // Deduplicated text rank fast path: when many rows share text keys, sort unique spans once
+    // and assign dense `u32` ranks so comparison is pure integer order without touching `arena`.
+    let text_ranked = if text_count > 0 && spans.len() * 2 <= text_count && spans.len() > 1 {
+        let mut unique: Vec<(u64, u32)> = spans
+            .iter()
+            .enumerate()
+            .map(|(id, &(off, blen))| {
+                let bytes = &arena[off as usize..(off + blen) as usize];
+                (prefix_u64(bytes), id as u32)
+            })
+            .collect();
+        let arena_ref = arena.as_slice();
+        let spans_ref = spans.as_slice();
+        parallel_stable_sort(&mut unique, &|a, b| {
+            a.0.cmp(&b.0).then_with(|| {
+                let (oa, la) = spans_ref[a.1 as usize];
+                let (ob, lb) = spans_ref[b.1 as usize];
+                arena_ref[oa as usize..(oa + la) as usize]
+                    .cmp(&arena_ref[ob as usize..(ob + lb) as usize])
+            })
+        });
+        let mut ranks = vec![0u32; spans.len()];
+        let mut cur_rank = 0u32;
+        for i in 0..unique.len() {
+            if i > 0 {
+                let prev_id = unique[i - 1].1 as usize;
+                let cur_id = unique[i].1 as usize;
+                let (op, lp) = spans[prev_id];
+                let (oc, lc) = spans[cur_id];
+                if arena[op as usize..(op + lp) as usize]
+                    != arena[oc as usize..(oc + lc) as usize]
+                {
+                    cur_rank += 1;
+                }
+            }
+            ranks[unique[i].1 as usize] = cur_rank;
+        }
+        for e in &mut entries {
+            let k = e.kind();
+            if k == SortEntry::KIND_TEXT || k == SortEntry::KIND_ERR {
+                e.payload = ranks[e.aux() as usize] as u64;
+            }
+        }
+        true
+    } else {
+        false
+    };
+
+    let arena_ref = arena.as_slice();
+    let spans_ref = spans.as_slice();
+    let cmp = |a: &SortEntry, b: &SortEntry| -> Ordering {
+        let ka = a.kind();
+        let kb = b.kind();
+        if ka == SortEntry::KIND_EMPTY || kb == SortEntry::KIND_EMPTY {
+            return ka.cmp(&kb);
+        }
+        let ord = ka.cmp(&kb).then_with(|| match ka {
+            SortEntry::KIND_NUM => f64::from_bits(a.payload)
+                .partial_cmp(&f64::from_bits(b.payload))
+                .unwrap_or(Ordering::Equal),
+            SortEntry::KIND_BOOL => a.payload.cmp(&b.payload),
+            _ => {
+                if text_ranked {
+                    a.payload.cmp(&b.payload)
+                } else {
+                    a.payload.cmp(&b.payload).then_with(|| {
+                        let (oa, la) = spans_ref[a.aux() as usize];
+                        let (ob, lb) = spans_ref[b.aux() as usize];
+                        arena_ref[oa as usize..(oa + la) as usize]
+                            .cmp(&arena_ref[ob as usize..(ob + lb) as usize])
+                    })
+                }
+            }
+        });
+        if asc { ord } else { ord.reverse() }
+    };
+
+    parallel_stable_sort(&mut entries, &cmp);
+    Ok(entries.into_iter().map(|e| e.line).collect())
 }
 
 /// 区域第一列是不是表头列：整列都是非空文本，且右侧出现过数字（按行排序时跳过它）
