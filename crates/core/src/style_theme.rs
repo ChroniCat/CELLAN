@@ -39,7 +39,7 @@ pub struct ThemeBook {
 }
 
 /// Office 默认主题 12 色（当工作簿未内嵌 theme1.xml 时的标准回退：dk1, lt1, dk2, lt2, accent1..6, hlink, folHlink）
-const DEFAULT_THEME_PALETTE: [[u8; 3]; 12] = [
+pub(crate) const DEFAULT_THEME_PALETTE: [[u8; 3]; 12] = [
     [0x00, 0x00, 0x00], // dk1
     [0xFF, 0xFF, 0xFF], // lt1
     [0x44, 0x54, 0x6A], // dk2
@@ -55,7 +55,7 @@ const DEFAULT_THEME_PALETTE: [[u8; 3]; 12] = [
 ];
 
 /// OOXML 标准 64 项索引调色板（ECMA-376 §18.8.27，WPS 与旧模板大量使用 indexed="0..63"）
-const DEFAULT_INDEXED_PALETTE: [[u8; 3]; 64] = [
+pub(crate) const DEFAULT_INDEXED_PALETTE: [[u8; 3]; 64] = [
     [0, 0, 0],       [255, 255, 255], [255, 0, 0],     [0, 255, 0],
     [0, 0, 255],     [255, 255, 0],   [255, 0, 255],   [0, 255, 255],
     [0, 0, 0],       [255, 255, 255], [255, 0, 0],     [0, 255, 0],
@@ -663,7 +663,7 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [u8; 3] {
 
 /// `theme=` 用的是 clrMap 槽位，不是 clrScheme 的 XML 顺序：
 /// 0=bg1→lt1、1=tx1→dk1、2=bg2→lt2、3=tx2→dk2，4 起才是 accent1…
-fn scheme_index(i: u8) -> usize {
+pub(crate) fn scheme_index(i: u8) -> usize {
     match i {
         0 => 1,
         1 => 0,

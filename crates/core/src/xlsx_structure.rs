@@ -283,12 +283,12 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
     let prepared = PreparedBase { path, temporary: true };
     let mut zip = zip::ZipArchive::new(std::fs::File::open(base)?)?;
-    let mut out = zip::ZipWriter::new(file);
+    let mut out = zip::ZipWriter::new(std::io::BufWriter::with_capacity(256 * 1024, file));
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i)?;
-        let name = entry.name().to_string();
+        let name = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
         if removed_parts.contains(&name) { continue; }
         let pivot = if name.contains("pivotCacheDefinition") && name.ends_with(".xml") {
+            let mut entry = zip.by_index(i)?;
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes)?;
             Some(rewrite_pivot_source(&bytes, &changes)?)
@@ -303,7 +303,7 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
             out.start_file(name, zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated))?;
             out.write_all(bytes)?;
         } else {
-            out.raw_copy_file(entry)?;
+            out.raw_copy_file(zip.by_index_raw(i)?)?;
         }
     }
     for (part, _) in added {

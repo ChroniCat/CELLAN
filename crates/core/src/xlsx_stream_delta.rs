@@ -42,14 +42,14 @@ pub(in crate::xlsx) struct Window<R> {
 
 impl<R: Read> Window<R> {
     pub(in crate::xlsx) fn start(input: R, out: &mut impl Write) -> Result<Reader<Self>> {
-        let mut input = BufReader::new(input);
+        let mut input = BufReader::with_capacity(256 * 1024, input);
         if input.fill_buf()?.starts_with(b"\xef\xbb\xbf") {
             out.write_all(b"\xef\xbb\xbf")?;
             input.consume(3);
         }
         Ok(Reader::from_reader(Self {
             input,
-            bytes: Vec::new(),
+            bytes: Vec::with_capacity(64 * 1024),
             first: 0,
             offset: 0,
         }))
@@ -81,7 +81,7 @@ impl<R: Read> BufRead for Window<R> {
         if self.first == self.bytes.len() {
             self.bytes.clear();
             self.first = 0;
-        } else if self.first >= 8192 {
+        } else if self.first >= 128 * 1024 {
             self.bytes.drain(..self.first);
             self.first = 0;
         }
@@ -487,6 +487,472 @@ pub(in crate::xlsx) fn repair_dom_input(input: impl Read, out: &mut impl Write) 
     }
 }
 
+enum FastSheetOutcome<R> {
+    FinishedSheetData(Window<R>),
+    DoneEarly(Window<R>),
+    Declined,
+}
+
+#[inline]
+fn parse_row_r_attr(tag_inner: &[u8]) -> Option<u32> {
+    let mut i = 0usize;
+    let len = tag_inner.len();
+    while i < len {
+        while i < len && tag_inner[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || tag_inner[i] == b'/' || tag_inner[i] == b'>' {
+            break;
+        }
+        let name_start = i;
+        while i < len && !matches!(tag_inner[i], b'=' | b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>') {
+            i += 1;
+        }
+        let name = &tag_inner[name_start..i];
+        while i < len && tag_inner[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || tag_inner[i] != b'=' {
+            return None;
+        }
+        i += 1;
+        while i < len && tag_inner[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || !matches!(tag_inner[i], b'"' | b'\'') {
+            return None;
+        }
+        let quote = tag_inner[i];
+        i += 1;
+        let val_start = i;
+        while i < len && tag_inner[i] != quote {
+            i += 1;
+        }
+        if i >= len {
+            return None;
+        }
+        if name == b"r" {
+            let mut val: u32 = 0;
+            let digits = &tag_inner[val_start..i];
+            if digits.is_empty() {
+                return None;
+            }
+            for &d in digits {
+                if !d.is_ascii_digit() {
+                    return None;
+                }
+                val = val.checked_mul(10)?.checked_add(u32::from(d - b'0'))?;
+            }
+            return val.checked_sub(1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the end offset (exclusive, right after `</row>`) inside `slice` (which starts immediately
+/// after `<row ...>`). Returns `Ok(Some(end))` when found, `Ok(None)` if more bytes are needed,
+/// or `Err(())` if malformed/nested markup is encountered.
+fn find_row_close(slice: &[u8], scan_from: usize) -> std::result::Result<Option<usize>, ()> {
+    let mut search = scan_from;
+    while let Some(rel) = slice[search..].iter().position(|&b| b == b'w') {
+        let w = search + rel;
+        if w >= 4 && w + 1 < slice.len() && &slice[w - 4..w + 2] == b"</row>" {
+            let end = w + 2;
+            // Fast path: if no '!' appears in the row body, neither comments nor CDATA exist.
+            if !slice[..w - 4].contains(&b'!') {
+                return Ok(Some(end));
+            }
+            return find_row_close_aware(slice);
+        }
+        search = w + 1;
+    }
+    if slice.contains(&b'!') && slice.windows(2).any(|p| p == b"<!") {
+        // Ensure a comment or CDATA didn't already finish or run past current buffer.
+        return find_row_close_aware(slice);
+    }
+    Ok(None)
+}
+
+fn find_row_close_aware(slice: &[u8]) -> std::result::Result<Option<usize>, ()> {
+    let mut i = 0usize;
+    let len = slice.len();
+    while i < len {
+        let Some(rel) = slice[i..].iter().position(|&b| b == b'<') else {
+            return Ok(None);
+        };
+        i += rel;
+        if i + 6 <= len && &slice[i..i + 6] == b"</row>" {
+            return Ok(Some(i + 6));
+        }
+        if slice[i..].starts_with(b"<!--") {
+            if let Some(end_rel) = slice[i + 4..].windows(3).position(|w| w == b"-->") {
+                i = i + 4 + end_rel + 3;
+                continue;
+            }
+            return Ok(None);
+        }
+        if slice[i..].starts_with(b"<![CDATA[") {
+            if let Some(end_rel) = slice[i + 9..].windows(3).position(|w| w == b"]]>") {
+                i = i + 9 + end_rel + 3;
+                continue;
+            }
+            return Ok(None);
+        }
+        if slice[i..].starts_with(b"<row")
+            && slice
+                .get(i + 4)
+                .is_some_and(|&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/'))
+        {
+            return Err(());
+        }
+        i += 1;
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_sheet_data_fast<R: Read>(
+    mut win: Window<R>,
+    out: &mut impl Write,
+    sheet: &Sheet,
+    base: &Store,
+    keys: &mut BTreeSet<CellRef>,
+    axis_rows: &mut BTreeMap<u32, Option<u16>>,
+    layout_rows: &mut BTreeMap<u32, crate::patch::layout_xml::Change>,
+    styles: &StyleChanges,
+    changed_sst: &mut bool,
+    shared_state: &mut SharedFormulaState,
+) -> Result<FastSheetOutcome<R>> {
+    let mut buf = Vec::with_capacity(512 * 1024);
+    buf.extend_from_slice(&win.bytes[win.first..]);
+    win.bytes.clear();
+    win.first = 0;
+
+    let mut pos = 0usize;
+    let mut copy_start = 0usize;
+    let mut last_row: Option<u32> = None;
+
+    let refill = |buf: &mut Vec<u8>,
+                  pos: &mut usize,
+                  copy_start: &mut usize,
+                  win: &mut Window<R>,
+                  out: &mut dyn Write|
+     -> Result<bool> {
+        if *pos > *copy_start {
+            out.write_all(&buf[*copy_start..*pos])?;
+            *copy_start = *pos;
+        }
+        if *copy_start > 0 {
+            buf.drain(..*copy_start);
+            *pos -= *copy_start;
+            *copy_start = 0;
+        }
+        let chunk = win.input.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(false);
+        }
+        buf.extend_from_slice(chunk);
+        let n = chunk.len();
+        win.input.consume(n);
+        Ok(true)
+    };
+
+    loop {
+        loop {
+            while pos < buf.len() && buf[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if buf.len() - pos >= 12 {
+                break;
+            }
+            if !refill(&mut buf, &mut pos, &mut copy_start, &mut win, out)? {
+                break;
+            }
+        }
+        if pos >= buf.len() {
+            return Ok(FastSheetOutcome::Declined);
+        }
+        if buf[pos..].starts_with(b"</sheetData>") {
+            if pos > copy_start {
+                out.write_all(&buf[copy_start..pos])?;
+            }
+            if !missing_rows(
+                out,
+                "",
+                u32::MAX,
+                keys,
+                axis_rows,
+                layout_rows,
+                sheet,
+                base,
+                styles,
+                shared_state,
+            )? {
+                return Ok(FastSheetOutcome::Declined);
+            }
+            out.write_all(b"</sheetData>")?;
+            pos += b"</sheetData>".len();
+            win.bytes.extend_from_slice(&buf[pos..]);
+            win.first = 0;
+            return Ok(FastSheetOutcome::FinishedSheetData(win));
+        }
+        if buf[pos..].starts_with(b"<!--") {
+            let mut search = pos + 4;
+            loop {
+                if let Some(rel) = buf[search..].windows(3).position(|w| w == b"-->") {
+                    pos = search + rel + 3;
+                    break;
+                }
+                let advance_to = buf.len().saturating_sub(3).max(pos);
+                pos = advance_to;
+                if !refill(&mut buf, &mut pos, &mut copy_start, &mut win, out)? {
+                    return Ok(FastSheetOutcome::Declined);
+                }
+                search = pos;
+            }
+            continue;
+        }
+        if !(buf[pos..].starts_with(b"<row")
+            && matches!(
+                buf.get(pos + 4).copied(),
+                Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')
+            ))
+        {
+            return Ok(FastSheetOutcome::Declined);
+        }
+
+        // Find end of `<row ...>` open tag
+        let open_end = {
+            let mut scan = pos + 4;
+            let mut quote: Option<u8> = None;
+            loop {
+                let mut found = None;
+                while scan < buf.len() {
+                    let b = buf[scan];
+                    if let Some(q) = quote {
+                        if b == q {
+                            quote = None;
+                        } else if b == b'<' {
+                            return Ok(FastSheetOutcome::Declined);
+                        }
+                    } else {
+                        match b {
+                            b'"' | b'\'' => quote = Some(b),
+                            b'>' => {
+                                found = Some(scan + 1);
+                                break;
+                            }
+                            b'<' => return Ok(FastSheetOutcome::Declined),
+                            _ => {}
+                        }
+                    }
+                    scan += 1;
+                }
+                if let Some(e) = found {
+                    break e;
+                }
+                let scan_off = scan - pos;
+                if !refill(&mut buf, &mut pos, &mut copy_start, &mut win, out)? {
+                    return Ok(FastSheetOutcome::Declined);
+                }
+                scan = pos + scan_off;
+            }
+        };
+
+        let is_empty = buf[open_end - 2] == b'/';
+        let Some(r) = parse_row_r_attr(&buf[pos + 4..open_end]) else {
+            return Ok(FastSheetOutcome::Declined);
+        };
+        if last_row.is_some_and(|p| p >= r) {
+            return Ok(FastSheetOutcome::Declined);
+        }
+
+        let need_missing = keys.first().is_some_and(|k| k.row < r)
+            || axis_rows.first_key_value().is_some_and(|(&ar, _)| ar < r)
+            || layout_rows.first_key_value().is_some_and(|(&lr, _)| lr < r);
+        if need_missing {
+            if pos > copy_start {
+                out.write_all(&buf[copy_start..pos])?;
+                copy_start = pos;
+            }
+            if !missing_rows(
+                out,
+                "",
+                r,
+                keys,
+                axis_rows,
+                layout_rows,
+                sheet,
+                base,
+                styles,
+                shared_state,
+            )? {
+                return Ok(FastSheetOutcome::Declined);
+            }
+        }
+        last_row = Some(r);
+
+        let is_dirty = keys.first().is_some_and(|k| k.row == r)
+            || axis_rows.contains_key(&r)
+            || layout_rows.contains_key(&r);
+
+        let tag_len = open_end - pos;
+        let row_end = if is_empty {
+            open_end
+        } else {
+            let mut scan_rel = 0usize;
+            loop {
+                match find_row_close(&buf[pos + tag_len..], scan_rel) {
+                    Ok(Some(rel_end)) => break pos + tag_len + rel_end,
+                    Ok(None) => {
+                        let body_len = buf.len() - (pos + tag_len);
+                        scan_rel = body_len.saturating_sub(6);
+                        if !refill(&mut buf, &mut pos, &mut copy_start, &mut win, out)? {
+                            return Ok(FastSheetOutcome::Declined);
+                        }
+                    }
+                    Err(()) => return Ok(FastSheetOutcome::Declined),
+                }
+            }
+        };
+
+        if !is_dirty {
+            pos = row_end;
+            if pos - copy_start >= 128 * 1024 {
+                out.write_all(&buf[copy_start..pos])?;
+                copy_start = pos;
+            }
+            continue;
+        }
+
+        // Flush untouched bytes before this dirty row
+        if pos > copy_start {
+            out.write_all(&buf[copy_start..pos])?;
+        }
+        let raw_slice = &buf[pos..row_end];
+        let axis_xf = axis_rows.remove(&r);
+        let mut lchg = layout_rows.remove(&r);
+        if let Some(xf) = axis_xf {
+            lchg.get_or_insert_with(Default::default).style = Some(xf);
+        }
+        let styled;
+        let raw = if let Some(ch) = lchg {
+            let (tag, body) = raw_slice.split_at(tag_len);
+            let Ok(styled_tag) =
+                crate::patch::layout_xml::update_row_tag(std::str::from_utf8(tag)?, &ch)
+            else {
+                return Ok(FastSheetOutcome::Declined);
+            };
+            let mut bytes = styled_tag.into_bytes();
+            bytes.extend_from_slice(body);
+            styled = bytes;
+            styled.as_slice()
+        } else {
+            raw_slice
+        };
+
+        if keys.first().is_some_and(|k| k.row == r) {
+            let mut row_keys = BTreeSet::new();
+            while keys.first().is_some_and(|k| k.row == r) {
+                row_keys.insert(keys.pop_first().unwrap());
+            }
+            let raw_xml = std::str::from_utf8(raw)?;
+            let normalized;
+            let xml = if !raw_xml.contains("xmlns") {
+                raw_xml
+            } else {
+                let Some(adapted) = rebind(raw_xml, "", "") else {
+                    return Ok(FastSheetOutcome::Declined);
+                };
+                normalized = adapted;
+                &normalized
+            };
+            let Some(edits) = row_edits(
+                xml,
+                sheet,
+                base,
+                row_keys,
+                styles,
+                changed_sst,
+                shared_state,
+                keys,
+            ) else {
+                return Ok(FastSheetOutcome::Declined);
+            };
+            write_spans(out, xml, &edits)?;
+        } else {
+            out.write_all(raw)?;
+        }
+
+        pos = row_end;
+        copy_start = pos;
+
+        if keys.is_empty()
+            && axis_rows.is_empty()
+            && layout_rows.is_empty()
+            && shared_state.promote_master.is_empty()
+            && shared_state.unshare.is_empty()
+        {
+            win.bytes.extend_from_slice(&buf[pos..]);
+            win.first = 0;
+            return Ok(FastSheetOutcome::DoneEarly(win));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_worksheet_tail<R: Read>(
+    win: Window<R>,
+    out: &mut impl Write,
+    sheet: &Sheet,
+    need_suffix_patch: bool,
+    fast_forward_suffix: bool,
+    filter_xml: Option<&str>,
+    page_edit: bool,
+    shared_state: &SharedFormulaState,
+) -> Result<bool> {
+    if !shared_state.promote_master.is_empty() || !shared_state.unshare.is_empty() {
+        return Ok(false);
+    }
+    if need_suffix_patch {
+        let wrapper_prefix = b"<worksheet><sheetPr/><sheetData/>";
+        let mut suffix = wrapper_prefix.to_vec();
+        if fast_forward_suffix {
+            if !fast_forward_sheet_data_end(win, out, &mut suffix)? {
+                return Ok(false);
+            }
+        } else {
+            win.copy_rest(&mut suffix)?;
+        }
+        let mut xml = std::str::from_utf8(&suffix)?.to_owned();
+        if let Some(af) = filter_xml {
+            xml = crate::patch::insert_auto_filter(&xml, af);
+        }
+        if sheet.merges_dirty {
+            let Some(edit) = merge_edit(&xml, sheet) else {
+                return Ok(false);
+            };
+            let mut next = String::with_capacity(xml.len() + edit.text.len());
+            next.push_str(&xml[..edit.from]);
+            next.push_str(&edit.text);
+            next.push_str(&xml[edit.to..]);
+            xml = next;
+        }
+        if page_edit {
+            xml = crate::patch::set_page_xml(&xml, &sheet.page);
+            xml = crate::patch::set_page_setup(&xml, &sheet.page);
+        }
+        let Some(sd_pos) = xml.find("<sheetData/>") else {
+            return Ok(false);
+        };
+        out.write_all(&xml.as_bytes()[sd_pos + "<sheetData/>".len()..])?;
+    } else {
+        win.copy_rest(out)?;
+    }
+    Ok(true)
+}
+
 pub(super) fn worksheet(
     input: impl Read,
     out: &mut impl Write,
@@ -686,6 +1152,43 @@ pub(super) fn worksheet(
                         fast_forward_suffix = true;
                         break;
                     }
+                } else if prefix.is_empty() {
+                    let end = reader.buffer_position();
+                    out.write_all(reader.get_mut().through(end)?)?;
+                    return match stream_sheet_data_fast(
+                        reader.into_inner(),
+                        out,
+                        sheet,
+                        base,
+                        &mut keys,
+                        &mut axis_rows,
+                        &mut layout_rows,
+                        &styles,
+                        changed_sst,
+                        &mut shared_state,
+                    )? {
+                        FastSheetOutcome::FinishedSheetData(win) => finish_worksheet_tail(
+                            win,
+                            out,
+                            sheet,
+                            need_suffix_patch,
+                            false,
+                            filter_xml.as_deref(),
+                            page_edit,
+                            &shared_state,
+                        ),
+                        FastSheetOutcome::DoneEarly(win) => finish_worksheet_tail(
+                            win,
+                            out,
+                            sheet,
+                            need_suffix_patch,
+                            true,
+                            filter_xml.as_deref(),
+                            page_edit,
+                            &shared_state,
+                        ),
+                        FastSheetOutcome::Declined => Ok(false),
+                    };
                 }
             }
             Event::Start(ref e) | Event::Empty(ref e)
