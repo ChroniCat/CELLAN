@@ -651,7 +651,9 @@ impl GroupedRange {
 #[derive(Default)]
 pub(super) struct CountIndex {
     numbers: Vec<(f64, usize)>,
+    numbers_ready: bool,
     text: std::collections::HashMap<String, Vec<usize>>,
+    text_ready: bool,
 }
 
 #[test]
@@ -671,28 +673,57 @@ fn count_index_agrees_with_single_criterion_scan() {
 }
 
 impl CountIndex {
+    #[allow(dead_code)]
     pub(super) fn new(data: &[FValue]) -> Self {
         let mut index = Self::default();
+        index.ensure_numbers(data);
+        index.ensure_text(data);
+        index
+    }
+
+    fn ensure_numbers(&mut self, data: &[FValue]) {
+        if self.numbers_ready {
+            return;
+        }
         for (row, value) in data.iter().enumerate() {
-            let text = match value {
-                FValue::Number(n) => {
-                    if n.is_finite() { index.numbers.push((*n, row)); }
-                    continue;
-                }
+            match value {
+                FValue::Number(n) if n.is_finite() => self.numbers.push((*n, row)),
                 FValue::Text(s) => {
                     if let Ok(n) = s.trim().parse::<f64>() {
-                        if n.is_finite() { index.numbers.push((n, row)); }
+                        if n.is_finite() {
+                            self.numbers.push((n, row));
+                        }
                     }
-                    if s.is_ascii() { s.to_ascii_lowercase() } else { s.to_string() }
+                }
+                _ => {}
+            }
+        }
+        self.numbers
+            .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        self.numbers_ready = true;
+    }
+
+    fn ensure_text(&mut self, data: &[FValue]) {
+        if self.text_ready {
+            return;
+        }
+        for (row, value) in data.iter().enumerate() {
+            let text = match value {
+                FValue::Number(_) => continue,
+                FValue::Text(s) => {
+                    if s.is_ascii() {
+                        s.to_ascii_lowercase()
+                    } else {
+                        s.to_string()
+                    }
                 }
                 FValue::Bool(b) => b.to_string(),
                 FValue::Empty => String::new(),
                 _ => continue,
             };
-            index.text.entry(text).or_default().push(row);
+            self.text.entry(text).or_default().push(row);
         }
-        index.numbers.sort_unstable_by(|a,b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        index
+        self.text_ready = true;
     }
 
     fn matching_offsets(&self, crit: &Crit) -> (&[(f64, usize)], &[usize]) {
@@ -744,10 +775,16 @@ impl CountIndexes {
                 self.ranges.clear();
                 self.indexed_values = 0;
             }
-            self.ranges.insert(range, Some(CountIndex::new(data)));
+            self.ranges.insert(range, Some(CountIndex::default()));
             self.indexed_values += data.len();
         }
-        self.ranges.get(&range)?.as_ref()
+        let index = self.ranges.get_mut(&range)?.as_mut()?;
+        if crit.num.is_some() {
+            index.ensure_numbers(data);
+        } else {
+            index.ensure_text(data);
+        }
+        Some(index)
     }
 }
 
@@ -792,10 +829,8 @@ impl Crit {
         }
     }
 
+    #[inline]
     pub(crate) fn matches(&self, v: &FValue) -> bool {
-        if matches!(v, FValue::Empty) && self.num.is_some() {
-            return self.op == "<>";
-        }
         if let Some(t) = self.num {
             let n = match v {
                 FValue::Number(n) => *n,
@@ -826,14 +861,10 @@ impl Crit {
             }
             FValue::Empty => self.text.is_empty(),
             FValue::Bool(b) => (if *b { "true" } else { "false" }) == self.text,
-            FValue::Number(n) => {
-                let t = if n.fract() == 0.0 && n.abs() < 1e15 {
-                    format!("{}", *n as i64)
-                } else {
-                    format!("{n}")
-                };
-                t == self.text
-            }
+            // When `self.num.is_none()`, the criterion text failed `parse::<f64>()`,
+            // so no formatted numeric cell can equal `self.text` (and Excel wildcards
+            // never match numeric cells). Avoid per-cell `format!()` allocations.
+            FValue::Number(_) => false,
             _ => false,
         };
         match self.op {
@@ -854,6 +885,13 @@ impl Crit {
                 "<>" => (n - target).abs() > f64::EPSILON,
                 _ => (n - target).abs() <= f64::EPSILON,
             };
+        }
+        if let FValue::Number(n) = v
+            && n.is_finite()
+            && !self.wild
+            && matches!(self.op, "=" | "<>")
+        {
+            return self.op == "<>";
         }
         let display;
         let text = match v {
@@ -3271,5 +3309,35 @@ mod round_precision {
         assert_eq!(round_sig15(-2.5).round(), -3.0);
         assert_eq!(round_sig15(0.0), 0.0);
         assert_eq!(round_sig15(1234.5678 * 100.0).round() / 100.0, 1234.57);
+    }
+
+    #[test]
+    fn text_criteria_on_numbers_short_circuits_accurately() {
+        use super::{Crit, FValue};
+        let n = FValue::Number(42.0);
+        for (crit, want) in [
+            ("apple", false),
+            ("=apple", false),
+            ("<>apple", true),
+            (">apple", true),
+            ("<apple", false),
+            (">=apple", false),
+            ("<=apple", false),
+            ("", false),
+            ("<>", true),
+            (">", false),
+            ("4*", false),
+            ("<>4*", true),
+            ("*", false),
+            ("?", false),
+            ("42", true),
+            ("=42", true),
+            ("<>42", false),
+            (">41", true),
+            ("<=42", true),
+        ] {
+            let c = Crit::parse(crit);
+            assert_eq!(c.matches(&n), want, "Crit::matches({crit:?}) on 42.0");
+        }
     }
 }

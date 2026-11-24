@@ -363,8 +363,10 @@ pub struct CfStats {
     /// 平均/计数用于 avg、top 规则
     pub averages: HashMap<usize, f64>,
     pub counts: HashMap<usize, usize>,
-    /// 每个块的数值升序（前 N 项规则要用；超大块不存）
+    /// 每个块的数值升序（百分位规则要用）
     pub sorted: HashMap<usize, Vec<f64>>,
+    /// 前/后 N 项规则通过 `select_nth_unstable_by` 预计算的精确阈值 `(block_idx, rule_idx) -> threshold`
+    pub top_thresholds: HashMap<(usize, usize), f64>,
     /// 重复值/唯一值规则预聚合频次表（block 序号 → 显示文本 → 频次），避免逐格整列扫描
     pub dup_counts: HashMap<usize, HashMap<String, usize>>,
 }
@@ -390,17 +392,32 @@ impl PartialEq for PageSlice {
 struct BlockInputs {
     numeric: bool,
     sort: bool,
+    top_specs: Vec<(usize, bool, u32, bool)>,
     duplicates: bool,
     ranges: Vec<((u32, u32, u32, u32), Vec<PageSlice>)>,
 }
 
-fn requirements(block: &CfBlock) -> (bool, bool, bool) {
+#[inline]
+fn top_rank_k(len: usize, n: u32, percent: bool) -> usize {
+    if percent {
+        ((len as f64) * (n as f64) / 100.0).ceil().max(1.0) as usize
+    } else {
+        (n as usize).max(1)
+    }
+    .min(len)
+}
+
+fn requirements(block: &CfBlock) -> (bool, bool, Vec<(usize, bool, u32, bool)>, bool) {
     let mut numeric = false;
     let mut sort = false;
+    let mut top_specs = Vec::new();
     let mut duplicates = false;
-    for rule in &block.rules {
+    for (ri, rule) in block.rules.iter().enumerate() {
         match &rule.kind {
-            CfKind::Top { .. } => { numeric = true; sort = true; }
+            CfKind::Top { top, n, percent, .. } => {
+                numeric = true;
+                top_specs.push((ri, *top, *n, *percent));
+            }
             CfKind::Avg { .. } => numeric = true,
             CfKind::Scale { points } => {
                 numeric = true;
@@ -418,7 +435,7 @@ fn requirements(block: &CfBlock) -> (bool, bool, bool) {
             _ => {}
         }
     }
-    (numeric, sort, duplicates)
+    (numeric, sort, top_specs, duplicates)
 }
 
 fn ranges_pairwise_disjoint(ranges: &[(u32, u32, u32, u32)]) -> bool {
@@ -440,11 +457,11 @@ fn ranges_pairwise_disjoint(ranges: &[(u32, u32, u32, u32)]) -> bool {
 /// `PageSlice`s reuse their cached `(min, max, sum, count)` in `O(1)` without rescanning cells.
 pub fn refresh_stats(sheet: &Sheet, into: &mut CfStats) -> bool {
     let inputs: Vec<_> = sheet.cf.blocks.iter().map(|block| {
-        let (numeric, sort, duplicates) = requirements(block);
+        let (numeric, sort, top_specs, duplicates) = requirements(block);
         let ranges = if numeric || duplicates {
             block.ranges.iter().map(|&rect| (rect, sheet.cf_pages(rect))).collect()
         } else { Vec::new() };
-        BlockInputs { numeric, sort, duplicates, ranges }
+        BlockInputs { numeric, sort, top_specs, duplicates, ranges }
     }).collect();
     if into.inputs.as_ref() == Some(&inputs) { return false; }
     // Keep `prev_inputs` alive until `next_cache` is built so `Arc::as_ptr` keys cannot be ABA-reused.
@@ -471,6 +488,7 @@ fn compute_stats_with_slices(
     into.averages.clear();
     into.counts.clear();
     into.sorted.clear();
+    into.top_thresholds.clear();
     into.dup_counts.clear();
     if cf.blocks.is_empty() {
         into.slice_cache.clear();
@@ -480,7 +498,8 @@ fn compute_stats_with_slices(
     let mut next_slice_cache: HashMap<SliceCacheKey, SliceSummary> = HashMap::new();
 
     for (i, block) in cf.blocks.iter().enumerate() {
-        let (needs_num, needs_sort, needs_dup) = requirements(block);
+        let (needs_num, needs_sort, top_specs, needs_dup) = requirements(block);
+        let needs_top = !top_specs.is_empty();
         if !needs_num && !needs_dup {
             continue;
         }
@@ -513,7 +532,7 @@ fn compute_stats_with_slices(
         if !clamped.is_empty() {
             let disjoint = ranges_pairwise_disjoint(&block.ranges);
             // Incremental `PageSlice` summary merge for numeric-only rules (ColorScale / DataBar / Avg)
-            if disjoint && needs_num && !needs_sort && !needs_dup {
+            if disjoint && needs_num && !needs_sort && !needs_top && !needs_dup {
                 let mut consume_slice = |slice: &PageSlice| {
                     let key: SliceCacheKey = (
                         std::sync::Arc::as_ptr(&slice.cells) as usize,
@@ -549,6 +568,7 @@ fn compute_stats_with_slices(
                     }
                 }
             } else {
+                let collect_vals = needs_sort || needs_top;
                 let mut visit = |cell: &crate::model::Cell| {
                     if needs_num
                         && let Value::Number(v) = &cell.value
@@ -558,7 +578,7 @@ fn compute_stats_with_slices(
                         max = max.max(*v);
                         sum += *v;
                         n += 1;
-                        if needs_sort {
+                        if collect_vals {
                             vals.push(*v);
                         }
                     }
@@ -598,8 +618,22 @@ fn compute_stats_with_slices(
             }
             into.counts.insert(i, n);
             if !vals.is_empty() {
-                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                into.sorted.insert(i, vals);
+                if needs_sort {
+                    vals.sort_unstable_by(|a, b| a.total_cmp(b));
+                    for &(ri, top, rank, percent) in &top_specs {
+                        let k = top_rank_k(vals.len(), rank, percent);
+                        let threshold = if top { vals[vals.len() - k] } else { vals[k - 1] };
+                        into.top_thresholds.insert((i, ri), threshold);
+                    }
+                    into.sorted.insert(i, vals);
+                } else if needs_top {
+                    for &(ri, top, rank, percent) in &top_specs {
+                        let k = top_rank_k(vals.len(), rank, percent);
+                        let idx = if top { vals.len() - k } else { k - 1 };
+                        let (_, pivot, _) = vals.select_nth_unstable_by(idx, |a, b| a.total_cmp(b));
+                        into.top_thresholds.insert((i, ri), *pivot);
+                    }
+                }
             }
         }
         if needs_dup {
@@ -617,54 +651,109 @@ fn in_block(block: &CfBlock, r: u32, c: u32) -> bool {
         .any(|(r1, c1, r2, c2)| r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2)
 }
 
-/// 解析公式里的比较值：数字或带引号的文本
-fn parse_lit(s: &str) -> Option<Value> {
-    let s = s.trim();
-    if let Some(inner) = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-        return Some(Value::Text(inner.into()));
-    }
-    if let Some(inner) = s.strip_prefix("DATE(").and_then(|x| x.strip_suffix(')')) {
-        // DATE(y,m,d) → 序列号（Excel 1900 体系）
-        let parts: Vec<&str> = inner.split(',').collect();
-        if parts.len() == 3 {
-            let y = parts[0].trim().parse::<i32>().ok()?;
-            let m = parts[1].trim().parse::<u32>().ok()?;
-            let d = parts[2].trim().parse::<u32>().ok()?;
-            return crate::formula::date_to_serial_pub(y, m, d).map(Value::Number);
-        }
-    }
-    s.parse::<f64>().ok().map(Value::Number)
+#[derive(Clone, Copy)]
+enum LitVal<'a> {
+    Number(f64),
+    Text(&'a str),
 }
 
-fn cmp_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x.partial_cmp(y),
-        (Value::Text(x), Value::Text(y)) => Some(x.to_lowercase().cmp(&y.to_lowercase())),
-        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+/// 零分配解析公式里的比较值：数字、带引号文本或 `DATE(y,m,d)`。
+fn parse_lit_ref(s: &str) -> Option<LitVal<'_>> {
+    let s = s.trim();
+    if let Some(inner) = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        return Some(LitVal::Text(inner));
+    }
+    if let Some(inner) = s.strip_prefix("DATE(").and_then(|x| x.strip_suffix(')')) {
+        let mut parts = inner.split(',');
+        let y = parts.next()?.trim().parse::<i32>().ok()?;
+        let m = parts.next()?.trim().parse::<u32>().ok()?;
+        let d = parts.next()?.trim().parse::<u32>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return crate::formula::date_to_serial_pub(y, m, d).map(LitVal::Number);
+    }
+    s.parse::<f64>().ok().map(LitVal::Number)
+}
+
+#[inline]
+fn cmp_text_ci(x: &str, y: &str) -> std::cmp::Ordering {
+    if x.is_ascii() && y.is_ascii() {
+        x.bytes()
+            .map(|b| b.to_ascii_lowercase())
+            .cmp(y.bytes().map(|b| b.to_ascii_lowercase()))
+    } else {
+        x.to_lowercase().cmp(&y.to_lowercase())
+    }
+}
+
+#[inline]
+fn cmp_value_lit(v: &Value, lit: LitVal<'_>) -> Option<std::cmp::Ordering> {
+    match (v, lit) {
+        (Value::Number(x), LitVal::Number(y)) => x.partial_cmp(&y),
+        (Value::Text(x), LitVal::Text(y)) => Some(cmp_text_ci(x, y)),
         _ => None,
     }
 }
 
-fn test_op(op: CfOp, v: &Value, a: &Value, b: &Value) -> bool {
-    let ordering = cmp_values(v, a);
+#[inline]
+fn test_op_lit(op: CfOp, v: &Value, a: LitVal<'_>, b: Option<LitVal<'_>>) -> bool {
     match op {
-        CfOp::Less => matches!(ordering, Some(std::cmp::Ordering::Less)),
-        CfOp::LessEq => matches!(ordering, Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)),
-        CfOp::Equal => matches!(ordering, Some(std::cmp::Ordering::Equal)),
-        CfOp::NotEqual => matches!(ordering, Some(o) if o != std::cmp::Ordering::Equal),
-        CfOp::GreaterEq => matches!(ordering, Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)),
-        CfOp::Greater => matches!(ordering, Some(std::cmp::Ordering::Greater)),
+        CfOp::Less => matches!(cmp_value_lit(v, a), Some(std::cmp::Ordering::Less)),
+        CfOp::LessEq => matches!(
+            cmp_value_lit(v, a),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ),
+        CfOp::Equal => match (v, a) {
+            (Value::Number(x), LitVal::Number(y)) => {
+                x.partial_cmp(&y) == Some(std::cmp::Ordering::Equal)
+            }
+            (Value::Text(x), LitVal::Text(y)) => {
+                if x.is_ascii() && y.is_ascii() {
+                    x.eq_ignore_ascii_case(y)
+                } else {
+                    x.to_lowercase() == y.to_lowercase()
+                }
+            }
+            _ => false,
+        },
+        CfOp::NotEqual => match (v, a) {
+            (Value::Number(x), LitVal::Number(y)) => {
+                matches!(x.partial_cmp(&y), Some(o) if o != std::cmp::Ordering::Equal)
+            }
+            (Value::Text(x), LitVal::Text(y)) => {
+                if x.is_ascii() && y.is_ascii() {
+                    !x.eq_ignore_ascii_case(y)
+                } else {
+                    x.to_lowercase() != y.to_lowercase()
+                }
+            }
+            _ => false,
+        },
+        CfOp::GreaterEq => matches!(
+            cmp_value_lit(v, a),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        ),
+        CfOp::Greater => matches!(cmp_value_lit(v, a), Some(std::cmp::Ordering::Greater)),
         CfOp::Between => {
-            let lo = cmp_values(v, a);
-            let hi = cmp_values(v, b);
-            matches!(lo, Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal))
-                && matches!(hi, Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal))
+            let Some(b) = b else { return false };
+            matches!(
+                cmp_value_lit(v, a),
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            ) && matches!(
+                cmp_value_lit(v, b),
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            )
         }
         CfOp::NotBetween => {
-            let lo = cmp_values(v, a);
-            let hi = cmp_values(v, b);
-            !(matches!(lo, Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal))
-                && matches!(hi, Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)))
+            let Some(b) = b else { return false };
+            !(matches!(
+                cmp_value_lit(v, a),
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            ) && matches!(
+                cmp_value_lit(v, b),
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            ))
         }
     }
 }
@@ -759,18 +848,20 @@ impl<'a> RowRules<'a> {
                     if matches!(raw, Value::Empty) {
                         continue;
                     }
-                    let av = parse_lit(a);
-                    let bv = parse_lit(b);
-                    let need_b = matches!(op, CfOp::Between | CfOp::NotBetween);
-                    if let Some(av) = av {
-                        if need_b && bv.is_none() {
+                    let Some(av) = parse_lit_ref(a) else {
+                        continue;
+                    };
+                    let bv = if matches!(op, CfOp::Between | CfOp::NotBetween) {
+                        let Some(bv) = parse_lit_ref(b) else {
                             continue;
-                        }
-                        let bv = bv.unwrap_or_else(|| av.clone());
-                        if test_op(*op, raw, &av, &bv) {
-                            apply_dxf(cf, *dxf, &mut out);
-                            hit = true;
-                        }
+                        };
+                        Some(bv)
+                    } else {
+                        None
+                    };
+                    if test_op_lit(*op, raw, av, bv) {
+                        apply_dxf(cf, *dxf, &mut out);
+                        hit = true;
                     }
                 }
                 CfKind::Text { contains, dxf } => {
@@ -826,21 +917,21 @@ impl<'a> RowRules<'a> {
                     }
                 }
                 CfKind::Top { top, n, percent, dxf } => {
-                    if let (Value::Number(v), Some(vals)) = (&raw, stats.sorted.get(&bi)) {
-                        if vals.is_empty() {
-                            continue;
-                        }
-                        let k = if *percent {
-                            ((vals.len() as f64) * (*n as f64) / 100.0).ceil().max(1.0) as usize
-                        } else {
-                            (*n as usize).max(1)
-                        }
-                        .min(vals.len());
-                        let threshold = if *top { vals[vals.len() - k] } else { vals[k - 1] };
-                        let ok = if *top { *v >= threshold } else { *v <= threshold };
-                        if ok {
-                            apply_dxf(cf, *dxf, &mut out);
-                            hit = true;
+                    if let Value::Number(v) = raw {
+                        let threshold = stats.top_thresholds.get(&(bi, ri)).copied().or_else(|| {
+                            let vals = stats.sorted.get(&bi)?;
+                            if vals.is_empty() {
+                                return None;
+                            }
+                            let k = top_rank_k(vals.len(), *n, *percent);
+                            Some(if *top { vals[vals.len() - k] } else { vals[k - 1] })
+                        });
+                        if let Some(threshold) = threshold {
+                            let ok = if *top { *v >= threshold } else { *v <= threshold };
+                            if ok {
+                                apply_dxf(cf, *dxf, &mut out);
+                                hit = true;
+                            }
                         }
                     }
                 }
@@ -862,8 +953,7 @@ impl<'a> RowRules<'a> {
                 }
                 CfKind::Scale { points } => {
                     if let (Value::Number(v), Some((min, max))) = (&raw, stats.ranges.get(&bi)) {
-                        let empty: Vec<f64> = Vec::new();
-                        let sorted = stats.sorted.get(&bi).unwrap_or(&empty);
+                        let sorted = stats.sorted.get(&bi).map_or(&[][..], Vec::as_slice);
                         let abs: Vec<(f64, [u8; 3])> =
                             points.iter().map(|(t, c)| (t.resolve(*min, *max, sorted), *c)).collect();
                         if let Some(rgb) = scale_color(&abs, *v) {
@@ -878,8 +968,7 @@ impl<'a> RowRules<'a> {
                         let (min, max) = (*min, *max);
                         if let Some((style, levels)) = IconMark::from_set(set) {
                             // 阈值是「各档下限」；第一档通常是最小值
-                            let empty: Vec<f64> = Vec::new();
-                            let sorted = stats.sorted.get(&bi).unwrap_or(&empty);
+                            let sorted = stats.sorted.get(&bi).map_or(&[][..], Vec::as_slice);
                             let mut idx = 0u8;
                             for (i, th) in thresholds.iter().enumerate().skip(1) {
                                 let t = th.resolve(min, max, sorted);
@@ -903,8 +992,7 @@ impl<'a> RowRules<'a> {
                 }
                 CfKind::Bar { color, min: lo, max: hi } => {
                     if let (Value::Number(v), Some((min, max))) = (&raw, stats.ranges.get(&bi)) {
-                        let empty: Vec<f64> = Vec::new();
-                        let sorted = stats.sorted.get(&bi).unwrap_or(&empty);
+                        let sorted = stats.sorted.get(&bi).map_or(&[][..], Vec::as_slice);
                         let a = lo.resolve(*min, *max, sorted);
                         let b = hi.resolve(*min, *max, sorted);
                         let span = (b - a).max(f64::MIN_POSITIVE);
@@ -1393,6 +1481,19 @@ mod tests {
         assert_eq!(st.ranges[&0], (5.0, 80.0));
         sh.cf.blocks[0].rules[0].kind = CfKind::Top { top: true, n: 1, percent: false, dxf: 0 };
         assert!(refresh_stats(&sh, &mut st));
+        assert!(st.sorted.is_empty(), "Top-N only block should use quickselect without full sort");
+        assert_eq!(st.top_thresholds.get(&(0, 0)), Some(&80.0));
+        sh.cf.blocks[0].rules[0].kind = CfKind::Top { top: true, n: 2, percent: false, dxf: 0 };
+        assert!(refresh_stats(&sh, &mut st));
+        assert_eq!(st.top_thresholds.get(&(0, 0)), Some(&25.0));
+        sh.cf.blocks[0].rules[0].kind = CfKind::Scale {
+            points: vec![
+                (Cfvo::min(), [255, 0, 0]),
+                (Cfvo::new(CfvoKind::Percentile, 50.0), [255, 255, 0]),
+                (Cfvo::max(), [0, 255, 0]),
+            ],
+        };
+        assert!(refresh_stats(&sh, &mut st));
         assert_eq!(st.sorted[&0], [5.0, 25.0, 80.0]);
     }
 
@@ -1404,6 +1505,95 @@ mod tests {
         assert_eq!(shift_formula("\"A1\"&A1", 1, 0), "\"A1\"&A2");
         // Long function names used to overflow the column accumulator in debug builds.
         assert_eq!(shift_formula("NOT(ISERROR(A1))", 1, 0), "NOT(ISERROR(A2))");
+    }
+
+    #[test]
+    fn cell_is_ascii_ci_and_top_n_quickselect_boundaries() {
+        let mut sh = Sheet::new("CFEdge");
+        // Column A: text for CellIs ASCII/Unicode CI & Between
+        sh.set(0, 0, Cell { value: Value::Text("Apple".into()), formula: None });
+        sh.set(1, 0, Cell { value: Value::Text("banana".into()), formula: None });
+        sh.set(2, 0, Cell { value: Value::Text("CHERRY".into()), formula: None });
+        // Column B: numbers with ties for Top/Bottom & percent
+        for (r, v) in [(0, 10.0), (1, 30.0), (2, 20.0), (3, 30.0), (4, 5.0)] {
+            sh.set(r, 1, Cell { value: Value::Number(v), formula: None });
+        }
+        let cf = CfSheet {
+            blocks: vec![
+                CfBlock {
+                    ranges: vec![(0, 0, 2, 0)],
+                    rules: vec![
+                        CfRule {
+                            kind: CfKind::CellIs {
+                                op: CfOp::Equal,
+                                a: "\"APPLE\"".into(),
+                                b: String::new(),
+                                dxf: 0,
+                            },
+                            stop: false,
+                            priority: 1,
+                        },
+                        CfRule {
+                            kind: CfKind::CellIs {
+                                op: CfOp::Between,
+                                a: "\"b\"".into(),
+                                b: "\"c\"".into(),
+                                dxf: 1,
+                            },
+                            stop: false,
+                            priority: 2,
+                        },
+                    ],
+                },
+                CfBlock {
+                    ranges: vec![(0, 1, 4, 1)],
+                    rules: vec![
+                        CfRule {
+                            kind: CfKind::Top { top: true, n: 2, percent: false, dxf: 0 },
+                            stop: false,
+                            priority: 1,
+                        },
+                        CfRule {
+                            kind: CfKind::Top { top: false, n: 20, percent: true, dxf: 1 },
+                            stop: false,
+                            priority: 2,
+                        },
+                    ],
+                },
+                CfBlock {
+                    // Empty range must not panic
+                    ranges: vec![(0, 5, 10, 5)],
+                    rules: vec![CfRule {
+                        kind: CfKind::Top { top: true, n: 3, percent: false, dxf: 0 },
+                        stop: false,
+                        priority: 1,
+                    }],
+                },
+            ],
+            dxfs: vec![
+                Dxf { fill: Some([255, 0, 0]), ..Default::default() },
+                Dxf { fill: Some([0, 255, 0]), ..Default::default() },
+            ],
+            unknown_ext: false,
+            dxf_unsupported: false,
+        };
+        let mut st = CfStats::default();
+        compute_stats(&cf, &sh, &mut st);
+        assert_eq!(overlay_at(&cf, &st, &sh, 0, 0, |_, _, _| false).fill, Some([255, 0, 0]));
+        assert_eq!(overlay_at(&cf, &st, &sh, 1, 0, |_, _, _| false).fill, Some([0, 255, 0]));
+        assert_eq!(overlay_at(&cf, &st, &sh, 2, 0, |_, _, _| false).fill, None);
+
+        // Top 2 of [5, 10, 20, 30, 30] -> threshold 30.0 (both 30s match, 20 does not)
+        assert_eq!(st.top_thresholds.get(&(1, 0)), Some(&30.0));
+        assert_eq!(overlay_at(&cf, &st, &sh, 1, 1, |_, _, _| false).fill, Some([255, 0, 0]));
+        assert_eq!(overlay_at(&cf, &st, &sh, 3, 1, |_, _, _| false).fill, Some([255, 0, 0]));
+        assert_eq!(overlay_at(&cf, &st, &sh, 2, 1, |_, _, _| false).fill, None);
+        // Bottom 20% of 5 = 1 item -> threshold 5.0
+        assert_eq!(st.top_thresholds.get(&(1, 1)), Some(&5.0));
+        assert_eq!(overlay_at(&cf, &st, &sh, 4, 1, |_, _, _| false).fill, Some([0, 255, 0]));
+        // Empty block produces no threshold and empty overlay
+        assert_eq!(st.top_thresholds.get(&(2, 0)), None);
+        assert!(overlay_at(&cf, &st, &sh, 0, 5, |_, _, _| false).is_empty());
     }
 }
 

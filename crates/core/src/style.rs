@@ -520,73 +520,277 @@ pub fn format_value_fit(v: &crate::model::Value, fmt: &str, cap: usize) -> Strin
     format_value(v, fmt)
 }
 
-// Rendered values vary by cell. The format sections, signs and literal parts
-// of ordinary numeric patterns can be shared by all cells using that format.
+// Rendered values vary by cell. The format sections, signs, date token programs,
+// and literal parts of ordinary numeric patterns can be shared by all cells using that format.
 struct FormatSection {
     raw: String,
     color: Option<[u8; 3]>,
-    number: Option<NumberSection>,
+    dbnum: Option<crate::dbnum::DbNumKind>,
+    kind: SectionKind,
+}
+
+enum SectionKind {
+    General,
+    Date(DateSection),
+    DbNum(crate::dbnum::DbNumKind),
+    Scientific {
+        dec: usize,
+        exp_digits: usize,
+        plus: bool,
+        scale: f64,
+    },
+    Number(NumberSection),
+    Fallback,
+}
+
+impl FormatSection {
+    fn compile(raw: String) -> Self {
+        let color = section_color(&raw);
+        let trimmed = raw.trim();
+        let dbnum = crate::dbnum::detect_dbnum(trimmed);
+        let kind = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("general") {
+            SectionKind::General
+        } else if is_date_format(trimmed) {
+            SectionKind::Date(DateSection::compile(trimmed))
+        } else if let Some(kind) = dbnum {
+            SectionKind::DbNum(kind)
+        } else {
+            let cleaned = strip_brackets(trimmed);
+            let sec = cleaned.trim();
+            let pct = sec.matches('%').count() as i32;
+            let permille = sec.matches('‰').count() as i32;
+            let scale = 100f64.powi(pct) * 1000f64.powi(permille);
+            if let Some(epos) = sec.find(['E', 'e']) {
+                let before = &sec[..epos];
+                let after = &sec[epos + 1..];
+                if after.starts_with('+') || after.starts_with('-') {
+                    SectionKind::Scientific {
+                        dec: decimals_in(before),
+                        exp_digits: after.chars().filter(|c| *c == '0').count().max(1),
+                        plus: after.starts_with('+'),
+                        scale,
+                    }
+                } else if sec.contains('/') && sec.contains('?') {
+                    SectionKind::Fallback
+                } else if let Some(num) = NumberSection::from_numeric_pattern(sec) {
+                    SectionKind::Number(num)
+                } else {
+                    SectionKind::Fallback
+                }
+            } else if sec.contains('/') && sec.contains('?') {
+                SectionKind::Fallback
+            } else if let Some(num) = NumberSection::from_numeric_pattern(sec) {
+                SectionKind::Number(num)
+            } else {
+                SectionKind::Fallback
+            }
+        };
+        Self {
+            raw,
+            color,
+            dbnum,
+            kind,
+        }
+    }
 }
 
 struct NumberSection {
     prefix: String,
-    pattern: String,
     suffix: String,
-    percent: i32,
-    permille: i32,
+    scale: f64,
+    dec: usize,
+    thousands: bool,
+    trim_trailing_zeros: bool,
+    zero_spaces: Option<usize>,
 }
 
 impl NumberSection {
-    fn compile(raw: &str) -> Option<Self> {
-        let raw = raw.trim();
-        if raw.is_empty() || raw.eq_ignore_ascii_case("general")
-            || is_date_format(raw) || crate::dbnum::detect_dbnum(raw).is_some() {
-            return None;
-        }
-        let cleaned = strip_brackets(raw);
-        let sec = cleaned.trim();
-        if sec.contains(['E', 'e']) || (sec.contains('/') && sec.contains('?')) {
-            return None;
-        }
-        Self::from_numeric_pattern(sec)
-    }
-
     fn from_numeric_pattern(sec: &str) -> Option<Self> {
         let start = sec.find(['0', '#', '?'])?;
-        let end = sec[start..].find(|c| !matches!(c, '0' | '#' | '?' | ',' | '.'))
+        let end = sec[start..]
+            .find(|c| !matches!(c, '0' | '#' | '?' | ',' | '.'))
             .map_or(sec.len(), |i| start + i);
+        let pattern = &sec[start..end];
+        let dec_part = pattern.split_once('.').map(|(_, f)| f).unwrap_or("");
+        let dec = dec_part.chars().filter(|c| matches!(c, '0' | '#')).count();
+        let int_part = pattern.split('.').next().unwrap_or("");
+        let thousands = int_part.contains(',');
+        let trim_trailing_zeros = !dec_part.is_empty() && dec_part.chars().all(|c| c == '#');
+        let zero_spaces = (!pattern.contains('0'))
+            .then(|| pattern.chars().filter(|c| matches!(c, '0' | '#' | '?')).count());
+        let percent = sec.matches('%').count() as i32;
+        let permille = sec.matches('‰').count() as i32;
+        let scale = 100f64.powi(percent) * 1000f64.powi(permille);
         Some(Self {
             prefix: render_literals(&sec[..start]),
-            pattern: sec[start..end].to_owned(),
             suffix: render_literals(&sec[end..]),
-            percent: sec.matches('%').count() as i32,
-            permille: sec.matches('‰').count() as i32,
+            scale,
+            dec,
+            thousands,
+            trim_trailing_zeros,
+            zero_spaces,
         })
     }
 
     fn render(&self, val: f64) -> String {
-        let scaled = val * 100f64.powi(self.percent) * 1000f64.powi(self.permille);
-        format!("{}{}{}", self.prefix, render_number(scaled, &self.pattern), self.suffix)
+        use std::fmt::Write;
+        let a = (val * self.scale).abs();
+        let mut out = String::with_capacity(self.prefix.len() + self.suffix.len() + 24);
+        out.push_str(&self.prefix);
+        if a == 0.0
+            && let Some(spaces) = self.zero_spaces
+        {
+            for _ in 0..spaces {
+                out.push(' ');
+            }
+            out.push_str(&self.suffix);
+            return out;
+        }
+        let num_start = out.len();
+        if self.thousands {
+            let mut stack = StackFmt::<64>::new();
+            if write!(stack, "{:.*}", self.dec, a).is_ok() {
+                push_grouped_ascii(&mut out, stack.as_str());
+            } else {
+                let s = format!("{:.*}", self.dec, a);
+                push_grouped_ascii(&mut out, &s);
+            }
+        } else {
+            let _ = write!(out, "{:.*}", self.dec, a);
+        }
+        if self.trim_trailing_zeros {
+            while out.len() > num_start && out.ends_with('0') {
+                out.pop();
+            }
+            if out.len() > num_start && out.ends_with('.') {
+                out.pop();
+            }
+        }
+        out.push_str(&self.suffix);
+        out
+    }
+}
+
+struct StackFmt<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackFmt<N> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        // SAFETY: only valid UTF-8 chunks from `Write::write_str` are appended.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) }
+    }
+}
+
+impl<const N: usize> std::fmt::Write for StackFmt<N> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        if self.len + bytes.len() > N {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+}
+
+#[inline]
+fn push_grouped_ascii(out: &mut String, formatted: &str) {
+    let (int_part, frac) = match formatted.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (formatted, None),
+    };
+    let ib = int_part.as_bytes();
+    if ib.len() <= 3 || !ib.iter().all(|b| b.is_ascii_digit()) {
+        out.push_str(int_part);
+    } else {
+        let first = ib.len() % 3;
+        let mut pos = if first == 0 { 3 } else { first };
+        out.push_str(&int_part[..pos]);
+        while pos < ib.len() {
+            out.push(',');
+            out.push_str(&int_part[pos..pos + 3]);
+            pos += 3;
+        }
+    }
+    if let Some(f) = frac {
+        out.push('.');
+        out.push_str(f);
+    }
+}
+
+/// Two-generation compiled format cache (2 × 512 = 1024 entries) plus a 1-slot MRU fast path
+/// so repeated calls with the same format avoid hashing and >128 distinct formats never thrash.
+#[derive(Default)]
+struct FormatCache {
+    last_key: String,
+    last_val: Option<std::rc::Rc<[FormatSection]>>,
+    hot: HashMap<String, std::rc::Rc<[FormatSection]>>,
+    cold: HashMap<String, std::rc::Rc<[FormatSection]>>,
+}
+
+impl FormatCache {
+    const GEN_CAP: usize = 512;
+
+    fn get_or_compile(&mut self, fmt: &str) -> std::rc::Rc<[FormatSection]> {
+        if let Some(ref hit) = self.last_val
+            && self.last_key == fmt
+        {
+            return hit.clone();
+        }
+        if let Some(hit) = self.hot.get(fmt) {
+            let hit = hit.clone();
+            if fmt.len() <= 4096 {
+                self.last_key.clear();
+                self.last_key.push_str(fmt);
+                self.last_val = Some(hit.clone());
+            }
+            return hit;
+        }
+        if let Some(hit) = self.cold.remove(fmt) {
+            if self.hot.len() >= Self::GEN_CAP {
+                self.cold = std::mem::take(&mut self.hot);
+            }
+            self.hot.insert(fmt.to_owned(), hit.clone());
+            if fmt.len() <= 4096 {
+                self.last_key.clear();
+                self.last_key.push_str(fmt);
+                self.last_val = Some(hit.clone());
+            }
+            return hit;
+        }
+        let sections: std::rc::Rc<[_]> = split_sections(fmt)
+            .into_iter()
+            .map(FormatSection::compile)
+            .collect();
+        if fmt.len() <= 4096 {
+            if self.hot.len() >= Self::GEN_CAP {
+                self.cold = std::mem::take(&mut self.hot);
+            }
+            self.hot.insert(fmt.to_owned(), sections.clone());
+            self.last_key.clear();
+            self.last_key.push_str(fmt);
+            self.last_val = Some(sections.clone());
+        }
+        sections
     }
 }
 
 fn format_sections(fmt: &str) -> std::rc::Rc<[FormatSection]> {
     thread_local! {
-        static CACHE: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<[FormatSection]>>> =
-            Default::default();
+        static CACHE: std::cell::RefCell<FormatCache> = Default::default();
     }
-    CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(hit) = cache.get(fmt) { return hit.clone(); }
-        let sections: std::rc::Rc<[_]> = split_sections(fmt).into_iter().map(|raw| {
-            FormatSection { color: section_color(&raw), number: NumberSection::compile(&raw), raw }
-        }).collect();
-        if fmt.len() <= 4096 {
-            if cache.len() >= 128 { cache.clear(); }
-            cache.insert(fmt.to_owned(), sections.clone());
-        }
-        sections
-    })
+    CACHE.with(|cache| cache.borrow_mut().get_or_compile(fmt))
 }
 
 pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
@@ -615,14 +819,33 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
             } else {
                 (&sections[0], *n, false)
             };
-            let mut out = match &sec.number {
-                Some(pattern) => pattern.render(val),
-                None => render_section(val, &sec.raw),
+            let mut out = match &sec.kind {
+                SectionKind::General => general_number(val),
+                SectionKind::Date(date) => {
+                    if let Some(s) = date.render(crate::formula::current_date_system(), val) {
+                        match sec.dbnum {
+                            Some(kind) => crate::dbnum::map_digits_for_date(&s, kind),
+                            None => s,
+                        }
+                    } else {
+                        render_section_non_date(val, &sec.raw, sec.dbnum)
+                    }
+                }
+                SectionKind::DbNum(kind) => crate::dbnum::format_dbnum(val, *kind, &sec.raw)
+                    .unwrap_or_else(|| render_section_numeric(val, &sec.raw)),
+                SectionKind::Scientific {
+                    dec,
+                    exp_digits,
+                    plus,
+                    scale,
+                } => render_scientific(val * *scale, *dec, *exp_digits, *plus),
+                SectionKind::Number(pattern) => pattern.render(val),
+                SectionKind::Fallback => render_section_numeric(val, &sec.raw),
             };
             // Excel 单段格式对负数：先取绝对值套格式，再在最前面补一个负号
             // （`(#,##0.00)` → `-(1,234.50)`；`[Red]-#,##0.00` → `--987.65`）
             if need_minus {
-                if sec.number.is_none() && crate::dbnum::detect_dbnum(&sec.raw).is_some() {
+                if sec.dbnum.is_some() {
                     if !out.starts_with('负') {
                         out.insert(0, '负');
                     }
@@ -871,25 +1094,24 @@ fn strip_brackets(s: &str) -> String {
     out
 }
 
-fn render_section(val: f64, sec: &str) -> String {
+fn render_section_non_date(
+    val: f64,
+    sec: &str,
+    dbnum: Option<crate::dbnum::DbNumKind>,
+) -> String {
     let raw = sec.trim();
+    if let Some(kind) = dbnum
+        && let Some(s) = crate::dbnum::format_dbnum(val, kind, raw)
+    {
+        return s;
+    }
+    render_section_numeric(val, raw)
+}
+
+fn render_section_numeric(val: f64, raw: &str) -> String {
+    let raw = raw.trim();
     if raw.is_empty() || raw.eq_ignore_ascii_case("general") {
         return general_number(val);
-    }
-    let dbnum = crate::dbnum::detect_dbnum(raw);
-    // 日期判断要用原始格式（[h] 这类耗时令牌不能被清掉）
-    if is_date_format(raw) {
-        if let Some(s) = format_date(val, raw) {
-            return match dbnum {
-                Some(kind) => crate::dbnum::map_digits_for_date(&s, kind),
-                None => s,
-            };
-        }
-    }
-    if let Some(kind) = dbnum {
-        if let Some(s) = crate::dbnum::format_dbnum(val, kind, raw) {
-            return s;
-        }
     }
     let cleaned = strip_brackets(raw);
     let sec = cleaned.trim();
@@ -933,38 +1155,6 @@ fn general_number(v: f64) -> String {
         let s = format!("{}", v);
         s
     }
-}
-
-fn render_number(val: f64, pattern: &str) -> String {
-    let plus = val >= 0.0;
-    let a = val.abs();
-    let dec_part = pattern.split_once('.').map(|(_, f)| f).unwrap_or("");
-    let dec = dec_part.chars().filter(|c| matches!(c, '0' | '#')).count();
-    let int_part = pattern.split('.').next().unwrap_or("");
-    let thousands = int_part.contains(',');
-    // 只有 ? / # 的零值段：Excel 用空格占位（会计格式的零就是 "-" 后面跟空格）
-    if a == 0.0 && !pattern.contains('0') {
-        let n = pattern.chars().filter(|c| matches!(c, '0' | '#' | '?')).count();
-        return " ".repeat(n);
-    }
-    let mut s = if thousands {
-        group_thousands(a, dec)
-    } else {
-        format!("{:.*}", dec, a)
-    };
-    // 小数位全是 # 时，去掉末尾 0 和小数点
-    if !dec_part.is_empty() && dec_part.chars().all(|c| c == '#') {
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
-        }
-    }
-    if !plus && !thousands {
-        // 单段格式的负号由调用方补，这里只处理数字本体
-    }
-    s
 }
 
 fn render_scientific(val: f64, dec: usize, exp_digits: usize, plus: bool) -> String {
@@ -1101,38 +1291,19 @@ fn decimals_in(fmt: &str) -> usize {
         .count()
 }
 
-fn group_thousands(n: f64, dec: usize) -> String {
-    let s = format!("{:.*}", dec, n.abs());
-    let (int_part, frac) = match s.split_once('.') {
-        Some((i, f)) => (i.to_string(), Some(f.to_string())),
-        None => (s.clone(), None),
-    };
-    let mut out = String::new();
-    let chars: Vec<char> = int_part.chars().collect();
-    for (i, ch) in chars.iter().enumerate() {
-        if i > 0 && (chars.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(*ch);
-    }
-    if n < 0.0 {
-        out.insert(0, '-');
-    }
-    if let Some(f) = frac {
-        out.push('.');
-        out.push_str(&f);
-    }
-    out
-}
-
 fn is_date_format(fmt: &str) -> bool {
     let f = strip_literals(fmt).to_lowercase();
     f.contains('y')
         || f.contains('d')
         || f.contains("h:")
+        || f.contains(":s")
         || f.contains("[h]")
+        || f.contains("[m]")
+        || f.contains("[s]")
         || f.contains("am/pm")
+        || f.contains("a/p")
         || f.contains("上午/下午")
+        || f.contains("aaa")
         || (f.contains('m') && !f.contains('0') && !f.contains('#'))
 }
 
@@ -1160,7 +1331,13 @@ fn strip_literals(fmt: &str) -> String {
                     }
                     buf.push(c2);
                 }
-                if buf.starts_with('h') || buf.starts_with('m') || buf.starts_with('s') {
+                if buf.starts_with('h')
+                    || buf.starts_with('H')
+                    || buf.starts_with('m')
+                    || buf.starts_with('M')
+                    || buf.starts_with('s')
+                    || buf.starts_with('S')
+                {
                     out.push('[');
                     out.push_str(&buf);
                     out.push(']');
@@ -1172,179 +1349,511 @@ fn strip_literals(fmt: &str) -> String {
     out
 }
 
-fn format_date(serial: f64, fmt: &str) -> Option<String> {
-    format_date_in(crate::formula::current_date_system(), serial, fmt)
+#[derive(Clone, Copy, Debug)]
+enum DateTok {
+    Lit(usize, usize),
+    Year4,
+    Year2,
+    Year1,
+    MonthFull,
+    MonthShort,
+    Month2,
+    Month1,
+    Min2,
+    Min1,
+    DayFull,
+    DayShort,
+    CnDayFull,
+    CnDayShort,
+    Day2,
+    Day1,
+    Hour2,
+    Hour1,
+    Sec2,
+    Sec1,
+    FracSec(u8),
+    AmPm,
+    ShortAmPm,
+    CnAmPm,
+    ElapsedHour,
+    ElapsedMin,
+    ElapsedSec,
 }
 
-fn format_date_in(sys: crate::model::DateSystem, serial: f64, fmt: &str) -> Option<String> {
-    let (y, mo, d) = crate::formula::serial_to_date_in(sys, serial)?;
-    let total = (serial.fract().abs() * 86400.0).round() as u32;
-    let (hh, mi, ss) = (total / 3600, (total % 3600) / 60, total % 60);
-    let elapsed = serial.abs() * 86400.0;
-    let month_names = [
-        "January", "February", "March", "April", "May", "June", "July", "August",
-        "September", "October", "November", "December",
-    ];
-    let day_names = [
-        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
-    ];
-    // 1900 体系：serial 25569 = 1970-01-01（周四）；1904 体系：serial 0 = 1904-01-01（周五）
-    let wd = if sys.is_1904() {
-        (((serial.abs().floor() as i64) % 7 + 7 + 5) % 7) as usize
+struct DateSection {
+    lits: String,
+    tokens: Vec<DateTok>,
+    has_ampm: bool,
+    needs_time: bool,
+    needs_weekday: bool,
+    needs_elapsed: bool,
+    frac_digits: u8,
+    est_len: usize,
+}
+
+#[inline]
+fn starts_with_ascii_ci(s: &str, pat: &[u8]) -> bool {
+    s.len() >= pat.len() && s.as_bytes()[..pat.len()].eq_ignore_ascii_case(pat)
+}
+
+#[inline]
+fn push_lit_char(lits: &mut String, tokens: &mut Vec<DateTok>, c: char) {
+    if let Some(DateTok::Lit(_, end)) = tokens.last_mut()
+        && *end == lits.len()
+    {
+        lits.push(c);
+        *end = lits.len();
+        return;
+    }
+    let start = lits.len();
+    lits.push(c);
+    tokens.push(DateTok::Lit(start, lits.len()));
+}
+
+#[inline]
+fn push_lit_str(lits: &mut String, tokens: &mut Vec<DateTok>, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    if let Some(DateTok::Lit(_, end)) = tokens.last_mut()
+        && *end == lits.len()
+    {
+        lits.push_str(s);
+        *end = lits.len();
+        return;
+    }
+    let start = lits.len();
+    lits.push_str(s);
+    tokens.push(DateTok::Lit(start, lits.len()));
+}
+
+#[inline]
+fn push_u32_decimal(out: &mut String, mut v: u32) {
+    if v < 10 {
+        out.push((b'0' + v as u8) as char);
+        return;
+    }
+    if v < 100 {
+        let buf = [b'0' + (v / 10) as u8, b'0' + (v % 10) as u8];
+        // SAFETY: ASCII digits only.
+        out.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut pos = buf.len();
+    while v > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    // SAFETY: ASCII digits only.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[pos..]) });
+}
+
+#[inline]
+fn push_i64_decimal(out: &mut String, v: i64) {
+    if v >= 0 && v <= u32::MAX as i64 {
+        push_u32_decimal(out, v as u32);
+        return;
+    }
+    if v < 0 {
+        out.push('-');
+    }
+    let mut mag = v.unsigned_abs();
+    let mut buf = [0u8; 20];
+    let mut pos = buf.len();
+    if mag == 0 {
+        out.push('0');
+        return;
+    }
+    while mag > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (mag % 10) as u8;
+        mag /= 10;
+    }
+    // SAFETY: ASCII digits only.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[pos..]) });
+}
+
+#[inline]
+fn push_2digits(out: &mut String, v: u32) {
+    if v < 100 {
+        let buf = [b'0' + (v / 10) as u8, b'0' + (v % 10) as u8];
+        // SAFETY: ASCII digits only.
+        out.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
     } else {
-        (((serial.abs().floor() as i64 - 25569) % 7 + 7 + 4) % 7) as usize
-    };
-    let lower_fmt = fmt.to_lowercase();
-    let cn_ampm = fmt.contains("上午/下午");
-    let has_ampm = lower_fmt.contains("am/pm") || lower_fmt.contains("a/p") || cn_ampm;
-    let chars: Vec<char> = fmt.chars().collect();
-    let mut out = String::new();
-    let mut i = 0usize;
-    let mut after_hour = false;
-    while i < chars.len() {
-        let c = chars[i];
-        let rem: String = chars[i..].iter().collect();
-        let low = rem.to_lowercase();
-        if c == '"' {
-            i += 1;
-            while i < chars.len() && chars[i] != '"' {
-                out.push(chars[i]);
+        push_u32_decimal(out, v);
+    }
+}
+
+#[inline]
+fn push_2digits_signed(out: &mut String, v: i32) {
+    if (0..100).contains(&v) {
+        push_2digits(out, v as u32);
+    } else {
+        use std::fmt::Write;
+        let _ = write!(out, "{v:02}");
+    }
+}
+
+#[inline]
+fn push_4digits(out: &mut String, v: i32) {
+    if (0..=9999).contains(&v) {
+        let n = v as u32;
+        let buf = [
+            b'0' + (n / 1000) as u8,
+            b'0' + ((n / 100) % 10) as u8,
+            b'0' + ((n / 10) % 10) as u8,
+            b'0' + (n % 10) as u8,
+        ];
+        // SAFETY: ASCII digits only.
+        out.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+    } else {
+        use std::fmt::Write;
+        let _ = write!(out, "{v:04}");
+    }
+}
+
+#[inline]
+fn push_frac_digits(out: &mut String, frac: u32, digits: u8) {
+    out.push('.');
+    match digits {
+        1 => out.push((b'0' + (frac % 10) as u8) as char),
+        2 => push_2digits(out, frac % 100),
+        _ => {
+            let n = frac % 1000;
+            let buf = [
+                b'0' + (n / 100) as u8,
+                b'0' + ((n / 10) % 10) as u8,
+                b'0' + (n % 10) as u8,
+            ];
+            // SAFETY: ASCII digits only.
+            out.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+        }
+    }
+}
+
+impl DateSection {
+    fn compile(fmt: &str) -> Self {
+        let cn_ampm = fmt.contains("上午/下午");
+        let mut lits = String::new();
+        let mut tokens = Vec::new();
+        let mut has_ampm = false;
+        let mut needs_time = false;
+        let mut needs_weekday = false;
+        let mut needs_elapsed = false;
+        let mut frac_digits = 0u8;
+        let mut after_hour = false;
+        let mut after_sec = false;
+        let mut i = 0usize;
+
+        while i < fmt.len() {
+            let rem = &fmt[i..];
+            let Some(c) = rem.chars().next() else {
+                break;
+            };
+            if c == '"' {
                 i += 1;
-            }
-            i += 1;
-            after_hour = false;
-            continue;
-        }
-        if c == '\\' {
-            if i + 1 < chars.len() {
-                out.push(chars[i + 1]);
-                i += 2;
-            } else {
-                i += 1;
-            }
-            after_hour = false;
-            continue;
-        }
-        if c == '_' {
-            out.push(' ');
-            i = (i + 2).min(chars.len());
-            after_hour = false;
-            continue;
-        }
-        if c == '*' {
-            i = (i + 2).min(chars.len());
-            continue;
-        }
-        if c == '[' {
-            let mut buf = String::new();
-            i += 1;
-            while i < chars.len() && chars[i] != ']' {
-                buf.push(chars[i]);
-                i += 1;
-            }
-            i += 1;
-            match buf.to_lowercase().as_str() {
-                "h" => out.push_str(&format!("{}", (elapsed / 3600.0).floor() as i64)),
-                "m" => out.push_str(&format!("{}", (elapsed / 60.0).floor() as i64)),
-                "s" => out.push_str(&format!("{}", elapsed.floor() as i64)),
-                _ => {}
-            }
-            after_hour = false;
-            continue;
-        }
-        let (tok, len) = if low.starts_with("yyyy") {
-            ("yyyy", 4)
-        } else if low.starts_with("yy") {
-            ("yy", 2)
-        } else if low.starts_with("mmmm") {
-            ("mmmm", 4)
-        } else if low.starts_with("mmm") {
-            ("mmm", 3)
-        } else if low.starts_with("dddd") {
-            ("dddd", 4)
-        } else if low.starts_with("ddd") {
-            ("ddd", 3)
-        } else if low.starts_with("dd") {
-            ("dd", 2)
-        } else if low.starts_with("hh") {
-            ("hh", 2)
-        } else if low.starts_with("ss") {
-            ("ss", 2)
-        } else if low.starts_with("am/pm") {
-            ("am/pm", 5)
-        } else if cn_ampm && rem.starts_with("上午/下午") {
-            ("cnampm", 5)
-        } else if low.starts_with("mm") {
-            let next = low.get(2..).unwrap_or("");
-            if after_hour || next.starts_with(":s") {
-                ("mi2", 2)
-            } else {
-                ("mo2", 2)
-            }
-        } else if low.starts_with('m') {
-            if after_hour {
-                ("mi", 1)
-            } else {
-                ("mo", 1)
-            }
-        } else if low.starts_with('y') {
-            ("y", 1)
-        } else if low.starts_with('d') {
-            ("d", 1)
-        } else if low.starts_with('h') {
-            ("h", 1)
-        } else if low.starts_with('s') {
-            ("s", 1)
-        } else {
-            out.push(c);
-            i += 1;
-            if c != ':' {
-                after_hour = false;
-            }
-            continue;
-        };
-        i += len;
-        match tok {
-            "yyyy" => out.push_str(&format!("{y:04}")),
-            "yy" => out.push_str(&format!("{:02}", y % 100)),
-            "y" => out.push_str(&format!("{y}")),
-            "mmmm" => out.push_str(month_names[(mo as usize).saturating_sub(1).min(11)]),
-            "mmm" => out.push_str(&month_names[(mo as usize).saturating_sub(1).min(11)][..3]),
-            "mo2" => out.push_str(&format!("{mo:02}")),
-            "mo" => out.push_str(&format!("{mo}")),
-            "mi2" => out.push_str(&format!("{mi:02}")),
-            "mi" => out.push_str(&format!("{mi}")),
-            "dddd" => out.push_str(day_names[wd]),
-            "ddd" => out.push_str(&day_names[wd][..3]),
-            "dd" => out.push_str(&format!("{d:02}")),
-            "d" => out.push_str(&format!("{d}")),
-            "hh" | "h" => {
-                let h = if has_ampm {
-                    if hh % 12 == 0 {
-                        12
-                    } else {
-                        hh % 12
-                    }
+                let start = i;
+                if let Some(rel_end) = fmt[i..].find('"') {
+                    push_lit_str(&mut lits, &mut tokens, &fmt[start..i + rel_end]);
+                    i += rel_end + 1;
                 } else {
-                    hh
-                };
-                if tok == "hh" {
-                    out.push_str(&format!("{h:02}"));
-                } else {
-                    out.push_str(&format!("{h}"));
+                    push_lit_str(&mut lits, &mut tokens, &fmt[start..]);
+                    i = fmt.len();
                 }
-                after_hour = true;
+                after_hour = false;
+                after_sec = false;
                 continue;
             }
-            "ss" => out.push_str(&format!("{ss:02}")),
-            "s" => out.push_str(&format!("{ss}")),
-            "am/pm" => out.push_str(if hh < 12 { "AM" } else { "PM" }),
-            "cnampm" => out.push_str(if hh < 12 { "上午" } else { "下午" }),
-            _ => {}
+            if c == '\\' {
+                i += 1;
+                if let Some(esc) = fmt[i..].chars().next() {
+                    push_lit_char(&mut lits, &mut tokens, esc);
+                    i += esc.len_utf8();
+                }
+                after_hour = false;
+                after_sec = false;
+                continue;
+            }
+            if c == '_' {
+                push_lit_char(&mut lits, &mut tokens, ' ');
+                i += 1;
+                if let Some(skip) = fmt[i..].chars().next() {
+                    i += skip.len_utf8();
+                }
+                after_hour = false;
+                after_sec = false;
+                continue;
+            }
+            if c == '*' {
+                i += 1;
+                if let Some(skip) = fmt[i..].chars().next() {
+                    i += skip.len_utf8();
+                }
+                after_sec = false;
+                continue;
+            }
+            if c == '[' {
+                i += 1;
+                let inner = if let Some(rel_end) = fmt[i..].find(']') {
+                    let s = &fmt[i..i + rel_end];
+                    i += rel_end + 1;
+                    s
+                } else {
+                    let s = &fmt[i..];
+                    i = fmt.len();
+                    s
+                };
+                if inner.eq_ignore_ascii_case("h") {
+                    tokens.push(DateTok::ElapsedHour);
+                    needs_elapsed = true;
+                    after_hour = true;
+                    after_sec = false;
+                } else if inner.eq_ignore_ascii_case("m") {
+                    tokens.push(DateTok::ElapsedMin);
+                    needs_elapsed = true;
+                    after_hour = false;
+                    after_sec = false;
+                } else if inner.eq_ignore_ascii_case("s") {
+                    tokens.push(DateTok::ElapsedSec);
+                    needs_elapsed = true;
+                    after_hour = false;
+                    after_sec = true;
+                } else {
+                    after_hour = false;
+                    after_sec = false;
+                }
+                continue;
+            }
+            if after_sec && c == '.' {
+                let zeros = rem.as_bytes()[1..]
+                    .iter()
+                    .take_while(|&&b| b == b'0')
+                    .count();
+                if zeros > 0 {
+                    let d = zeros.min(3) as u8;
+                    tokens.push(DateTok::FracSec(d));
+                    frac_digits = frac_digits.max(d);
+                    needs_time = true;
+                    if zeros > 3 {
+                        for _ in 0..(zeros - 3) {
+                            push_lit_char(&mut lits, &mut tokens, '0');
+                        }
+                    }
+                    i += 1 + zeros;
+                    after_hour = false;
+                    after_sec = false;
+                    continue;
+                }
+            }
+
+            let (tok, advance): (DateTok, usize) = if starts_with_ascii_ci(rem, b"yyyy") {
+                (DateTok::Year4, 4)
+            } else if starts_with_ascii_ci(rem, b"yy") {
+                (DateTok::Year2, 2)
+            } else if starts_with_ascii_ci(rem, b"mmmm") {
+                (DateTok::MonthFull, 4)
+            } else if starts_with_ascii_ci(rem, b"mmm") {
+                (DateTok::MonthShort, 3)
+            } else if starts_with_ascii_ci(rem, b"dddd") {
+                needs_weekday = true;
+                (DateTok::DayFull, 4)
+            } else if starts_with_ascii_ci(rem, b"ddd") {
+                needs_weekday = true;
+                (DateTok::DayShort, 3)
+            } else if starts_with_ascii_ci(rem, b"aaaa") {
+                needs_weekday = true;
+                (DateTok::CnDayFull, 4)
+            } else if starts_with_ascii_ci(rem, b"aaa") {
+                needs_weekday = true;
+                (DateTok::CnDayShort, 3)
+            } else if starts_with_ascii_ci(rem, b"dd") {
+                (DateTok::Day2, 2)
+            } else if starts_with_ascii_ci(rem, b"hh") {
+                needs_time = true;
+                (DateTok::Hour2, 2)
+            } else if starts_with_ascii_ci(rem, b"ss") {
+                needs_time = true;
+                (DateTok::Sec2, 2)
+            } else if starts_with_ascii_ci(rem, b"am/pm") {
+                has_ampm = true;
+                needs_time = true;
+                (DateTok::AmPm, 5)
+            } else if starts_with_ascii_ci(rem, b"a/p") {
+                has_ampm = true;
+                needs_time = true;
+                (DateTok::ShortAmPm, 3)
+            } else if cn_ampm && rem.starts_with("上午/下午") {
+                has_ampm = true;
+                needs_time = true;
+                (DateTok::CnAmPm, "上午/下午".len())
+            } else if starts_with_ascii_ci(rem, b"mm") {
+                let next = &rem[2..];
+                if after_hour || starts_with_ascii_ci(next, b":s") {
+                    needs_time = true;
+                    (DateTok::Min2, 2)
+                } else {
+                    (DateTok::Month2, 2)
+                }
+            } else if starts_with_ascii_ci(rem, b"m") {
+                let next = &rem[1..];
+                if after_hour || starts_with_ascii_ci(next, b":s") {
+                    needs_time = true;
+                    (DateTok::Min1, 1)
+                } else {
+                    (DateTok::Month1, 1)
+                }
+            } else if starts_with_ascii_ci(rem, b"y") {
+                (DateTok::Year1, 1)
+            } else if starts_with_ascii_ci(rem, b"d") {
+                (DateTok::Day1, 1)
+            } else if starts_with_ascii_ci(rem, b"h") {
+                needs_time = true;
+                (DateTok::Hour1, 1)
+            } else if starts_with_ascii_ci(rem, b"s") {
+                needs_time = true;
+                (DateTok::Sec1, 1)
+            } else {
+                push_lit_char(&mut lits, &mut tokens, c);
+                i += c.len_utf8();
+                if c != ':' {
+                    after_hour = false;
+                }
+                after_sec = false;
+                continue;
+            };
+
+            i += advance;
+            after_hour = matches!(tok, DateTok::Hour2 | DateTok::Hour1);
+            after_sec = matches!(tok, DateTok::Sec2 | DateTok::Sec1);
+            tokens.push(tok);
         }
-        after_hour = false;
+
+        let est_len = tokens
+            .iter()
+            .map(|t| match *t {
+                DateTok::Lit(s, e) => e - s,
+                DateTok::Year4 | DateTok::Year1 => 4,
+                DateTok::MonthFull | DateTok::DayFull | DateTok::CnDayFull => 9,
+                DateTok::CnDayShort | DateTok::CnAmPm => 6,
+                DateTok::MonthShort | DateTok::DayShort => 3,
+                DateTok::FracSec(d) => 1 + d as usize,
+                _ => 2,
+            })
+            .sum();
+
+        Self {
+            lits,
+            tokens,
+            has_ampm,
+            needs_time,
+            needs_weekday,
+            needs_elapsed,
+            frac_digits,
+            est_len,
+        }
     }
-    Some(out)
+
+    fn render(&self, sys: crate::model::DateSystem, serial: f64) -> Option<String> {
+        const MONTH_NAMES: [&str; 12] = [
+            "January", "February", "March", "April", "May", "June", "July", "August",
+            "September", "October", "November", "December",
+        ];
+        const DAY_NAMES: [&str; 7] = [
+            "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+        ];
+        const CN_DAY_FULL: [&str; 7] = [
+            "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六",
+        ];
+        const CN_DAY_SHORT: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+        let (y, mo, d) = crate::formula::serial_to_date_in(sys, serial)?;
+        let (hh, mi, ss, frac_val) = if self.needs_time {
+            if self.frac_digits == 0 {
+                let total = (serial.fract().abs() * 86400.0).round() as u32;
+                (total / 3600, (total % 3600) / 60, total % 60, 0u32)
+            } else {
+                let scale: u64 = match self.frac_digits {
+                    1 => 10,
+                    2 => 100,
+                    _ => 1000,
+                };
+                let ticks = (serial.fract().abs() * 86400.0 * scale as f64).round() as u64;
+                let total = (ticks / scale) as u32;
+                let frac = (ticks % scale) as u32;
+                (total / 3600, (total % 3600) / 60, total % 60, frac)
+            }
+        } else {
+            (0, 0, 0, 0)
+        };
+        let elapsed = if self.needs_elapsed {
+            serial.abs() * 86400.0
+        } else {
+            0.0
+        };
+        // 1900 体系：serial 25569 = 1970-01-01（周四）；1904 体系：serial 0 = 1904-01-01（周五）
+        let wd = if self.needs_weekday {
+            if sys.is_1904() {
+                (((serial.abs().floor() as i64) % 7 + 7 + 5) % 7) as usize
+            } else {
+                (((serial.abs().floor() as i64 - 25569) % 7 + 7 + 4) % 7) as usize
+            }
+        } else {
+            0
+        };
+
+        let mut out = String::with_capacity(self.est_len);
+        for &tok in &self.tokens {
+            match tok {
+                DateTok::Lit(s, e) => out.push_str(&self.lits[s..e]),
+                DateTok::Year4 => push_4digits(&mut out, y),
+                DateTok::Year2 => push_2digits_signed(&mut out, y % 100),
+                DateTok::Year1 => push_i64_decimal(&mut out, y as i64),
+                DateTok::MonthFull => out.push_str(MONTH_NAMES[(mo as usize).saturating_sub(1).min(11)]),
+                DateTok::MonthShort => out.push_str(&MONTH_NAMES[(mo as usize).saturating_sub(1).min(11)][..3]),
+                DateTok::Month2 => push_2digits(&mut out, mo),
+                DateTok::Month1 => push_u32_decimal(&mut out, mo),
+                DateTok::Min2 => push_2digits(&mut out, mi),
+                DateTok::Min1 => push_u32_decimal(&mut out, mi),
+                DateTok::DayFull => out.push_str(DAY_NAMES[wd]),
+                DateTok::DayShort => out.push_str(&DAY_NAMES[wd][..3]),
+                DateTok::CnDayFull => out.push_str(CN_DAY_FULL[wd]),
+                DateTok::CnDayShort => out.push_str(CN_DAY_SHORT[wd]),
+                DateTok::Day2 => push_2digits(&mut out, d),
+                DateTok::Day1 => push_u32_decimal(&mut out, d),
+                DateTok::Hour2 | DateTok::Hour1 => {
+                    let h = if self.has_ampm {
+                        if hh % 12 == 0 { 12 } else { hh % 12 }
+                    } else {
+                        hh
+                    };
+                    if matches!(tok, DateTok::Hour2) {
+                        push_2digits(&mut out, h);
+                    } else {
+                        push_u32_decimal(&mut out, h);
+                    }
+                }
+                DateTok::Sec2 => push_2digits(&mut out, ss),
+                DateTok::Sec1 => push_u32_decimal(&mut out, ss),
+                DateTok::FracSec(digits) => {
+                    let v = match self.frac_digits.saturating_sub(digits) {
+                        0 => frac_val,
+                        1 => frac_val / 10,
+                        _ => frac_val / 100,
+                    };
+                    push_frac_digits(&mut out, v, digits);
+                }
+                DateTok::AmPm => out.push_str(if hh < 12 { "AM" } else { "PM" }),
+                DateTok::ShortAmPm => out.push_str(if hh < 12 { "A" } else { "P" }),
+                DateTok::CnAmPm => out.push_str(if hh < 12 { "上午" } else { "下午" }),
+                DateTok::ElapsedHour => push_i64_decimal(&mut out, (elapsed / 3600.0).floor() as i64),
+                DateTok::ElapsedMin => push_i64_decimal(&mut out, (elapsed / 60.0).floor() as i64),
+                DateTok::ElapsedSec => push_i64_decimal(&mut out, elapsed.floor() as i64),
+            }
+        }
+        Some(out)
+    }
 }
 
 #[cfg(test)]
@@ -1454,6 +1963,38 @@ mod tests {
         assert_eq!(format_value(&n(0.5), "上午/下午 h:mm"), "下午 12:00");
         assert_eq!(format_value(&n(1234.5), "#,##0.00 元"), "1,234.50 元");
         assert_eq!(format_value(&n(1234.5), "[$€-407]#,##0.00"), "€1,234.50");
+    }
+
+    #[test]
+    fn compiled_date_tokens_and_large_format_cache() {
+        let n = |v: f64| Value::Number(v);
+        // 1970-01-01 13:05:09.256 (Thursday)
+        let s = 25569.0 + (13.0 * 3600.0 + 5.0 * 60.0 + 9.256) / 86400.0;
+        assert_eq!(format_value(&n(s), "yyyy-mm-dd hh:mm:ss"), "1970-01-01 13:05:09");
+        assert_eq!(format_value(&n(s), "yy/m/d h:m:s a/p"), "70/1/1 1:5:9 P");
+        assert_eq!(format_value(&n(s), "mmmm mmm dddd ddd"), "January Jan Thursday Thu");
+        assert_eq!(format_value(&n(s), "yyyy-mm-dd aaaa aaa"), "1970-01-01 星期四 周四");
+        assert_eq!(format_value(&n(s), "hh:mm:ss.000"), "13:05:09.256");
+        assert_eq!(format_value(&n(s), "hh:mm:ss.00"), "13:05:09.26");
+        assert_eq!(format_value(&n(s), "hh:mm:ss.0"), "13:05:09.3");
+        assert_eq!(format_value(&n(s), "mm:ss.000"), "05:09.256");
+        assert_eq!(format_value(&n(1.5), "[h]:mm"), "36:00");
+        assert_eq!(format_value(&n(1.5), "[m]:ss"), "2160:00");
+        assert_eq!(format_value(&n(1.5), "[s]"), "129600");
+        assert_eq!(
+            format_value(&n(25569.0), "yyyy\"年\"mm\"月\"dd\"日\"_0\\!"),
+            "1970年01月01日 !"
+        );
+        // 1904 date system: serial 0 = 1904-01-01 (Friday)
+        assert_eq!(
+            format_value_in(crate::model::DateSystem::D1904, &n(0.0), "yyyy-mm-dd dddd aaaa"),
+            "1904-01-01 Friday 星期五"
+        );
+        // >128 distinct formats must remain accurate across two-generation cache rotation.
+        for i in 0..600usize {
+            let fmt = format!("yyyy-mm-dd\" #{i}\"");
+            assert_eq!(format_value(&n(25569.0), &fmt), format!("1970-01-01 #{i}"));
+        }
     }
 
     #[test]
