@@ -283,6 +283,12 @@ fn bench_sort_200k_x10() {
         .unwrap();
     let plan_ms = ms(t_plan.elapsed());
 
+    let mut gather_sheet = wb.sheet(0).clone();
+    let t_gather = Instant::now();
+    let gather_changed = plan.apply_to_sheet(&mut gather_sheet);
+    let apply_gather_ms = ms(t_gather.elapsed());
+    assert_eq!(gather_sheet.value(0, 0), Value::Text("SKU-000001".into()));
+
     let t_apply = Instant::now();
     let mut applied = 0usize;
     for d in plan.deltas() {
@@ -296,6 +302,9 @@ fn bench_sort_200k_x10() {
             "rows": rows,
             "cols": cols,
             "plan_ms": (plan_ms * 100.0).round() / 100.0,
+            "apply_gather_ms": (apply_gather_ms * 100.0).round() / 100.0,
+            "total_gather_ms": ((plan_ms + apply_gather_ms) * 100.0).round() / 100.0,
+            "gather_changed": gather_changed,
             "apply_ms": (apply_ms * 100.0).round() / 100.0,
             "total_ms": ((plan_ms + apply_ms) * 100.0).round() / 100.0,
             "deltas": applied,
