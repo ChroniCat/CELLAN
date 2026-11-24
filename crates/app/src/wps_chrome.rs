@@ -1007,10 +1007,13 @@ impl SheetApp {
         let view_w = (self.last_view.x - crate::HEAD_W).max(1.0);
         let hard_max_x = (cols.pos(16_384) - view_w).max(0.0);
         let mut sx = self.scroll.x;
+        self.cf_inputs
+            .merges
+            .ensure(self.wb.sheet(self.sheet_idx), self.doc_gen, self.wb_epoch);
         let calc_total_w = |app: &SheetApp, cur_sx: f32| -> f32 {
             let sh = app.wb.sheet(app.sheet_idx);
             let used_c2 = sh.used_bounds().map(|(_, _, _, c2)| c2).unwrap_or(0);
-            let merge_c2 = sh.merges.iter().map(|m| m.3).max().unwrap_or(0);
+            let merge_c2 = app.cf_inputs.merges.max_col();
             let sel_c2 = app.sel.1.max(app.sel_end.1);
             let view_c2 = cols.index_at((cur_sx + view_w).max(0.0));
             let eff_cols = (used_c2.max(merge_c2).max(sel_c2).max(view_c2) + 16).clamp(32, 16_384);
