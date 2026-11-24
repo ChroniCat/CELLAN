@@ -1949,3 +1949,38 @@ mod tests {
         assert!(state.wire_history.back().unwrap().0.ends_with("已截短）"));
     }
 }
+
+#[cfg(test)]
+impl SheetApp {
+    pub(crate) fn bench_ai_set_cells_footprint(&mut self, edits: usize) -> std::time::Duration {
+        let sheet_name = self.wb.sheet(0).name.clone();
+        let edit_vals: Vec<JsonValue> = (0..edits)
+            .map(|i| json!({ "cell": format!("A{}", i + 1), "value": i }))
+            .collect();
+        let call = ToolCallSpec {
+            name: "set_cells".into(),
+            arguments: json!({ "sheet": sheet_name, "edits": edit_vals }),
+        };
+        self.ai.active_round = Some(ActiveTurn {
+            prompt: "bench".into(),
+            cfg: self.ai.cfg.clone(),
+            messages: Vec::new(),
+            pending_calls: VecDeque::new(),
+            calculation: None,
+            view: self.ai_view_now(),
+            footprint: Vec::new(),
+            reads: Vec::new(),
+            awaiting_write_results: false,
+            retry_check: Default::default(),
+            revision: (self.doc_gen, self.wb_epoch),
+            content_start: 0,
+            reasoning_start: 0,
+        });
+        let t = std::time::Instant::now();
+        self.note_ai_footprint(&call, &json!({ "ok": true }));
+        self.refresh_ai_baseline();
+        let dt = t.elapsed();
+        self.ai.active_round = None;
+        dt
+    }
+}

@@ -6538,3 +6538,43 @@ mod integrity_tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) fn bench_collab_hotpaths(wm_entries: u32, peers: usize) -> (f64, f64, usize) {
+    let mut wm = HostWatermark::default();
+    for i in 0..wm_entries {
+        wm.seq += 1;
+        wm.op_seqs.insert((0, i, 0), wm.seq);
+        wm.style_seqs.insert((0, i, 0), wm.seq);
+    }
+    let t_wm = std::time::Instant::now();
+    let cloned = wm.clone();
+    let wm_clone_ms = t_wm.elapsed().as_secs_f64() * 1000.0;
+    std::hint::black_box(cloned.seq);
+
+    let key = sheetcore::wire::RoomKey::derive_with_iters("bench", b"salt", 1);
+    let mut sessions: Vec<_> = (0..peers)
+        .map(|i| sheetcore::wire::Session::host_side(&key, &i.to_le_bytes()))
+        .collect();
+    let mut payload = String::with_capacity(65_536);
+    payload.push_str(r#"{"Op":{"ops":["#);
+    for i in 0..800 {
+        if i > 0 {
+            payload.push(',');
+        }
+        payload.push_str(&format!(
+            r#"{{"s":0,"r":{i},"c":1,"v":{{"N":{i}.5}},"ts":{i},"site":1}}"#
+        ));
+    }
+    payload.push_str("]}}");
+
+    let t_seal = std::time::Instant::now();
+    let mut total_bytes = 0usize;
+    for s in &mut sessions {
+        let line = payload.clone();
+        let frame = s.seal(&line);
+        total_bytes += frame.len();
+    }
+    let seal_ms = t_seal.elapsed().as_secs_f64() * 1000.0;
+    (wm_clone_ms, seal_ms, total_bytes)
+}

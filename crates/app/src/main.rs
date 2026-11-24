@@ -37,6 +37,8 @@ mod edit_regression_tests;
 mod wps_regression_tests;
 #[cfg(test)]
 mod test_env;
+#[cfg(test)]
+mod perf_wave_bench;
 mod net;
 mod net_sort;
 mod office_clipboard;
