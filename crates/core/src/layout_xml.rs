@@ -346,6 +346,14 @@ fn start_end(xml: &str, start: usize) -> Result<usize> {
 }
 
 pub(crate) fn styled_columns(header: &str, updates: &BTreeMap<u32, Option<u16>>) -> Result<String> {
+    styled_columns_root(header, "worksheet", updates)
+}
+
+pub(crate) fn styled_columns_root(
+    header: &str,
+    root_name: &str,
+    updates: &BTreeMap<u32, Option<u16>>,
+) -> Result<String> {
     let changes = updates
         .iter()
         .map(|(&col, &style)| {
@@ -358,7 +366,45 @@ pub(crate) fn styled_columns(header: &str, updates: &BTreeMap<u32, Option<u16>>)
             )
         })
         .collect();
-    columns(header, "worksheet", &changes)
+    columns(header, root_name, &changes)
+}
+
+/// Remove non-standard child elements inside `<col ...>...</col>` (e.g. `<extLst/>`)
+/// by converting them into self-closing `<col .../>` tags so column splits succeed.
+pub(crate) fn strip_col_children(header: &str) -> Result<String> {
+    let mut reader = quick_xml::Reader::from_str(header);
+    let root_name = loop {
+        match reader.read_event()? {
+            Event::Start(tag) => break tag.name().as_ref().to_owned(),
+            Event::Eof => return Ok(header.to_owned()),
+            _ => {}
+        }
+    };
+    let closed = format!("{header}</{root_name}>");
+    let doc = roxmltree::Document::parse(&closed)?;
+    let root = doc.root_element();
+    let named = |n: roxmltree::Node, name| {
+        n.is_element()
+            && n.tag_name().name() == name
+            && n.tag_name().namespace() == root.tag_name().namespace()
+    };
+    let mut edits = Vec::new();
+    for group in root.children().filter(|n| named(*n, "cols")) {
+        for col in group.children().filter(|n| named(*n, "col")) {
+            let range = col.range();
+            let open = start_end(header, range.start)?;
+            if open < range.end {
+                let open_tag = &header[range.start..open];
+                if let Some(stem) = open_tag.strip_suffix('>') {
+                    edits.push((range, format!("{stem}/>")));
+                }
+            }
+        }
+    }
+    if edits.is_empty() {
+        return Ok(header.to_owned());
+    }
+    render(header, edits)
 }
 
 pub(crate) fn styled_row(tag: &str, style: Option<u16>) -> Result<String> {

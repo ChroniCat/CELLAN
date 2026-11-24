@@ -41,6 +41,63 @@ pub(crate) fn date1904_xml(xml: &str) -> bool {
     }
 }
 
+pub(crate) fn set_date1904(xml: &str, is_1904: bool) -> String {
+    if date1904_xml(xml) == is_1904 {
+        return xml.to_string();
+    }
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return xml.to_string();
+    };
+    let root = doc.root_element();
+    let prefix = root
+        .tag_name()
+        .namespace()
+        .and_then(|uri| root.lookup_prefix(uri))
+        .map(|p| format!("{p}:"))
+        .unwrap_or_default();
+    if let Some(pr) = root
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "workbookPr")
+    {
+        let mut out = xml.to_string();
+        if let Some(attr) = pr.attribute_node("date1904") {
+            if is_1904 {
+                out.replace_range(attr.range_value(), "1");
+            } else {
+                out.replace_range(attr.range(), "");
+            }
+        } else if is_1904 {
+            let r = pr.range();
+            let raw = &xml[r.clone()];
+            if let Some(gt) = raw.find('>') {
+                let insert_at = if raw.as_bytes().get(gt.saturating_sub(1)) == Some(&b'/') {
+                    r.start + gt - 1
+                } else {
+                    r.start + gt
+                };
+                out.insert_str(insert_at, " date1904=\"1\"");
+            }
+        }
+        return out;
+    }
+    if !is_1904 {
+        return xml.to_string();
+    }
+    let mut out = xml.to_string();
+    let insert_at = root
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "fileVersion")
+        .map(|n| n.range().end)
+        .or_else(|| {
+            xml[root.range().start..]
+                .find('>')
+                .map(|gt| root.range().start + gt + 1)
+        })
+        .unwrap_or(0);
+    out.insert_str(insert_at, &format!("<{prefix}workbookPr date1904=\"1\"/>"));
+    out
+}
+
 /// 表名 → zip 内的 worksheet 路径
 pub fn sheet_targets(path: &Path) -> Result<HashMap<String, String>> {
     let staged_here = stage_active_for(path);

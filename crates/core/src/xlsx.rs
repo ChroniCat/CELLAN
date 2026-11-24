@@ -48,22 +48,6 @@ mod structure;
 #[path = "xlsx_pivots.rs"]
 mod pivots;
 
-/// ErrKind → umya 的错误类型。umya 没有 #SPILL!，用 #VALUE! 代；循环引用在 Excel 里也报 #REF!。
-fn to_umya_error(e: crate::formula::ErrKind) -> umya_spreadsheet::CellErrorType {
-    use crate::formula::ErrKind as K;
-    use umya_spreadsheet::CellErrorType as U;
-    match e {
-        K::Null => U::Null,
-        K::Div0 => U::Div0,
-        K::Value => U::Value,
-        K::Ref | K::Circular => U::Ref,
-        K::Name => U::Name,
-        K::Num => U::Num,
-        K::Na => U::NA,
-        K::Spill => U::Value,
-    }
-}
-
 fn data_to_value(d: &Data) -> Value {
     match d {
         Data::Empty => Value::Empty,
@@ -2548,147 +2532,16 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Sparse umya input and the data ranges that must be restored after its metadata patches.
-struct SlimBase {
-    path: tempfile::TempPath,
-    omitted: Vec<String>,
-    grids: std::collections::HashMap<String, PreservedGrid>,
-}
+#[cfg(test)]
 struct PreservedGrid {
     source_part: String,
     edits: Option<tempfile::NamedTempFile>,
     dimension: Option<String>,
 }
 
-fn slim_umya_base(base: &Path, wb: &Workbook) -> Result<Option<SlimBase>> {
-    use std::io::{BufWriter, Write};
-    let targets = crate::patch::sheet_targets(base)?;
-    let mut zip = zip::ZipArchive::new(std::fs::File::open(base)?)?;
-    let mut candidates = std::collections::HashMap::new();
-    let styles_stable = wb.sheets.iter().all(|s| {
-        !s.styles_dirty && !s.row_styles_dirty && !s.col_styles_dirty && s.style_edits.is_empty()
-    });
-    let mut omitted = Vec::new();
-    let mut grids = std::collections::HashMap::new();
-    for sheet in &wb.sheets {
-        let Some(part) = targets.get(&sheet.name) else {
-            continue;
-        };
-        let large = sheet.source_part.as_deref() == Some(part.as_str())
-            && zip.by_name(part)?.size() > crate::fixups::RAW_SHEET_MIN_BYTES;
-        let omit = large && crate::fixups::can_restore_sheet_xml(sheet);
-        let keep_grid = large
-            && !omit
-            && styles_stable
-            && (sheet.notes_dirty || sheet.cf_dirty || sheet.dv_dirty || sheet.charts_dirty)
-            && !sheet.layout_dirty
-            && !sheet.filter_dirty
-            && !sheet.rich_dirty
-            && !sheet.merges_dirty
-            && sheet
-                .source_cells
-                .as_ref()
-                .is_some_and(|s| s.reusable_grid(&mut zip, part, sheet));
-        let check_links =
-            sheet.hyperlinks_dirty || sheet.hyperlinks.values().any(|h| h.span != (0, 0));
-        if omit || keep_grid || check_links || sheet.source_needs_dom_repair {
-            candidates.insert(
-                part.clone(),
-                (sheet.name.clone(), omit, keep_grid, check_links, sheet.source_needs_dom_repair),
-            );
-        }
-    }
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    let (file, path) = tempfile::Builder::new()
-        .prefix("cellan-umya-")
-        .suffix(".xlsx")
-        .tempfile()?
-        .into_parts();
-    let mut out = zip::ZipWriter::new(BufWriter::new(file));
-    for i in 0..zip.len() {
-        let part = zip.name_for_index(i).context("缺少 ZIP 条目名")?.to_owned();
-        let Some((name, omit, mut keep_grid, check_links, repair_input)) = candidates.remove(&part) else {
-            out.raw_copy_file(zip.by_index_raw(i)?)?;
-            continue;
-        };
-        let mut shell = None;
-        let mut edited = None;
-        if keep_grid {
-            let sheet = wb
-                .sheets
-                .iter()
-                .find(|s| s.name == name)
-                .context("找不到原工作表")?;
-            let source = sheet.source_cells.as_ref().context("缺少单元格基准")?;
-            if !source.unchanged_values(sheet) {
-                edited = source.stage_grid_edits(&mut zip, &part, sheet, &wb.styles)?;
-                keep_grid = edited.is_some();
-            }
-        }
-        if omit || keep_grid {
-            let mut bytes = Vec::new();
-            let (portable, dimension) = if let Some(edited) = &edited {
-                delta::split_grid(edited.reopen()?, &part, &mut bytes, None)?
-            } else {
-                delta::split_grid(zip.by_index(i)?, &part, &mut bytes, None)?
-            };
-            if omit {
-                omitted.push(name.clone());
-                shell = Some(String::from_utf8(bytes)?);
-            } else if portable {
-                grids.insert(
-                    name,
-                    PreservedGrid {
-                        source_part: part.clone(),
-                        edits: edited,
-                        dimension,
-                    },
-                );
-                shell = Some(String::from_utf8(bytes)?);
-            }
-        }
-        if check_links {
-            if shell.is_none() {
-                let mut xml = read_zip_text(&mut zip, &part)?;
-                if crate::hyperlinks::remove_range_links(&mut xml) {
-                    shell = Some(xml);
-                }
-            } else if let Some(xml) = &mut shell {
-                crate::hyperlinks::remove_range_links(xml);
-            }
-        }
-        if repair_input {
-            out.start_file(&part, zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated))?;
-            if let Some(xml) = shell {
-                delta::stream::repair_dom_input(xml.as_bytes(), &mut out)?;
-            } else {
-                delta::stream::xml_input(zip.by_index(i)?, &part, |input|
-                    delta::stream::repair_dom_input(input, &mut out))?;
-            }
-        } else if let Some(xml) = shell {
-            out.start_file(
-                part,
-                zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Deflated),
-            )?;
-            out.write_all(xml.as_bytes())?;
-        } else {
-            out.raw_copy_file(zip.by_index_raw(i)?)?;
-        }
-    }
-    out.finish()?.flush()?;
-    Ok(Some(SlimBase {
-        path,
-        omitted,
-        grids,
-    }))
-}
-
 /// The shell is the fully patched worksheet. Transfer the source data directly
 /// from the original ZIP (or its staged value edits), retaining new metadata.
+#[cfg(test)]
 fn restore_grids(
     path: &Path,
     base: &Path,
@@ -2863,7 +2716,7 @@ fn save_plain_base(
         Cow::Owned(_) => None,
     };
     let mut flags = Vec::new();
-    let result = save_plain_at(path, input, base_override, true, &mut flags);
+    let result = save_plain_at(path, input, base_override, &mut flags);
     if let Some(book) = borrowed {
         *input = Cow::Borrowed(book);
     } else if let Cow::Owned(book) = input {
@@ -2873,13 +2726,13 @@ fn save_plain_base(
 }
 
 fn save_plain_at(
-    path: &Path, input: &mut Cow<'_, Workbook>, base_override: Option<&Path>,
-    allow_stream: bool, flags: &mut Vec<OriginalSheetFlags>,
+    path: &Path,
+    input: &mut Cow<'_, Workbook>,
+    base_override: Option<&Path>,
+    flags: &mut Vec<OriginalSheetFlags>,
 ) -> Result<CellWrite> {
     let wb: &Workbook = input;
     note_save_target(path);
-    // 先把被清空的单元格从文件里删掉（见 Sheet::cleared）
-    use umya_spreadsheet::{new_file, reader::xlsx::read, writer::xlsx::write};
 
     struct StageCleanup;
     impl Drop for StageCleanup {
@@ -2903,37 +2756,31 @@ fn save_plain_at(
     let usable_base = !wb.load_incomplete;
 
     let prof = std::env::var("SC_SAVE_PROF").is_ok();
+    let fail_step_active = std::env::var("SC_FAIL_SAVE_STEP").is_ok();
     let t_read = std::time::Instant::now();
     // 基准文件必须用「打开时的原文件」，不能用另存的目标路径：
-    // 否则另存出来的文件会丢掉合并单元格、样式、数据验证、图片等
-    // 我们不解析也不重建的结构（umya 从零建表只会写单元格）。
+    // 否则另存出来的文件会丢掉合并单元格、样式、数据验证、图片等未重建的部件。
     let original_base = match base_override
         .filter(|p| p.exists() && usable_base)
         .map(|p| p.to_path_buf())
         .or_else(|| wb.decrypted.as_ref().filter(|p| p.exists() && usable_base).cloned())
-        // 打开不完整的文件不能当保存基准：里面的坏 XML 会让解析器直接崩，
-        // 而且我们没读到的东西写回去就是丢数据。
         .or_else(|| wb.path.as_ref().filter(|p| p.exists() && !wb.load_incomplete).cloned())
     {
         Some(p) => p,
         None => path.to_path_buf(),
     };
     delta::verify_note_sources(&original_base, wb)?;
-    // .xls / .xlsb 这类二进制基准不是 zip 包：不能当包结构模板，
-    // 否则 prepare_base 读 xl/workbook.xml 直接失败（“读取基准工作簿目录失败”）。
-    // 这种情况按全新文件从模型重建。
+    // .xls / .xlsb 这类二进制基准不是 zip 包：不能当包结构模板，按全新文件从模型重建。
     let original_base = if crate::fixups::read_part(&original_base, "xl/workbook.xml").is_some() {
         original_base
     } else {
         path.to_path_buf()
     };
-    // Reconcile the package manifest before umya reads it. This retains the
-    // original worksheet parts even when their visible names/order have changed.
+    // 先在基准包上协调工作表的增删改名与重排，保留既有工作表部件路径与非网格部件。
     let prepared_base = structure::prepare_base(&original_base, path, wb)?;
     let base = prepared_base.path.clone();
-    // 宏部件：umya 写不出来，先留一份，写完塞回去
     let vba = crate::vba::read_vba(&base);
-    // 原地保存时，写盘会把 base 覆盖掉——先把「要保住的那部分」复制一份出来
+    // 原地保存时，写盘会把 base 覆盖掉——先把基准复制一份出来
     let restore_src = if base == path && base.exists() {
         let tmp = path.with_extension("preserve.tmp");
         std::fs::copy(&base, &tmp).context("无法保留原地保存基准")?;
@@ -2943,34 +2790,58 @@ fn save_plain_at(
     };
     let restore_base = restore_src.clone().unwrap_or_else(|| base.clone());
     let _restore_cleanup = RestoreFile(restore_src);
-    // 必须在写入目标 path 之前锁定基准是否存在：新建文件时 restore_base 等于 path，
-    // 一旦 umya::write 落盘后 restore_base.exists() 会由 false 变 true，误把新写文件当旧基准覆盖。
     let has_restore_base = restore_base.exists();
-    let run_restore_steps = has_restore_base || std::env::var("SC_FAIL_SAVE_STEP").is_ok();
-    // 没有可用的基准（抢救副本 / 全新文件）：整份内容只能从模型重建，
-    // 做过载入的表也要把样式、合并、批注等写出来，不能等 dirty 标记。
     let fresh_base = !base.exists();
-    let fresh_streaming = allow_stream && fresh_base && !wb.load_incomplete && !wb.styles.quote_of(0)
-        && wb.links.is_empty() && wb.pivots_pending.is_empty() && wb.pivots_pending2.is_empty()
-        && wb.pivot_calc_fields.is_empty();
-    let streamed: Vec<_> = wb.sheets.iter()
-        .map(|s| fresh_streaming && s.source_part.is_none() && fresh::supported(s)
-            && !s.row_styles.values().chain(s.col_styles.values()).any(|&id| wb.styles.quote_of(id)))
-        .collect();
-    let direct_styles = fresh_base
-        && !streamed.is_empty()
-        && streamed.iter().all(|&s| s)
-        && std::env::var("SC_FAIL_SAVE_STEP").is_err();
-    // A fresh umya sheet has no previous user metadata to remove. Rebuild all
-    // populated features (including unedited rescue data) and keep our page defaults.
+
+    let logical_ext = {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let logical = match name.strip_prefix(".~").and_then(|r| r.split_once(".saving-")) {
+            Some((head, _)) => head.to_string(),
+            None => name,
+        };
+        std::path::Path::new(&logical)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    };
+    let wants_macro = logical_ext.as_deref() == Some("xlsm");
+    let target_is_xlsx = logical_ext.as_deref() == Some("xlsx");
+
+    // 快路径 1：全新工作簿且无需任何后置元数据补丁 → 单遍原生纯流式直接落盘！
+    if fresh_base && fresh::can_write_direct(wb, wants_macro) {
+        let fresh_res = fresh::write_direct(path, wb)?;
+        if prof {
+            eprintln!(
+                "  [save] 单遍原生流式直写 {:.3}s rss {:.0}MB",
+                t_read.elapsed().as_secs_f64(),
+                crate::mem::rss_mb()
+            );
+        }
+        return Ok(CellWrite {
+            styles: fresh_res.styles,
+            used_delta: false,
+            created_charts: std::collections::HashMap::new(),
+            trusted_parts: fresh_res.trusted_parts,
+        });
+    }
+
+    let streamed: Vec<bool> = vec![fresh_base; wb.sheets.len()];
     if fresh_base {
-        flags.extend(input.to_mut().sheets.iter_mut().zip(&streamed)
-            .map(|(sheet, &streamed)| OriginalSheetFlags::prepare(sheet, streamed)));
+        flags.extend(
+            input
+                .to_mut()
+                .sheets
+                .iter_mut()
+                .zip(&streamed)
+                .map(|(sheet, &s)| OriginalSheetFlags::prepare(sheet, s)),
+        );
     }
     let wb: &Workbook = input;
-    // 外链关系的原文（URL/TargetMode）：有的引擎会把 URL 当包内路径改写
+    // 外链关系的原文（URL/TargetMode）
     let external_rels = crate::notes::capture_external_rels(if base.exists() { &base } else { path });
-    let sheet_needs_umya = |s: &crate::model::Sheet| -> bool {
+    let sheet_needs_rebuild = |s: &crate::model::Sheet| -> bool {
         fresh_base
             || s.cell_data_needs_save()
             || s.styles_dirty
@@ -2984,7 +2855,7 @@ fn save_plain_at(
     let reusable_package = !fresh_base
         && base.exists()
         && has_restore_base
-        && std::env::var("SC_FAIL_SAVE_STEP").is_err()
+        && !fail_step_active
         && crate::patch::read_date1904(&base) == wb.date_system.is_1904()
         && {
             let bt = crate::patch::sheet_targets(&base).unwrap_or_default();
@@ -2995,7 +2866,7 @@ fn save_plain_at(
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = std::fs::create_dir_all(parent);
     }
-    let unchanged_cells = !wb.sheets.iter().any(&sheet_needs_umya);
+    let unchanged_cells = !wb.sheets.iter().any(&sheet_needs_rebuild);
     let any_delta_aux = wb
         .sheets
         .iter()
@@ -3007,17 +2878,14 @@ fn save_plain_at(
         delta::DeltaSummary::default()
     };
     let patched = delta_summary.patched;
-    let can_bypass_umya = reusable_package && (unchanged_cells || patched);
-    let untouched = wb.sheets.iter().all(|s| !s.styles_dirty && !s.col_styles_dirty && !s.row_styles_dirty);
-    let base_styles = if has_restore_base && !can_bypass_umya && untouched {
-        crate::fixups::read_part_file(&restore_base, "xl/styles.xml")
+    let can_bypass = reusable_package && (unchanged_cells || patched);
+    let mut trusted_parts = if patched {
+        delta_summary.trusted_parts
     } else {
-        None
+        std::collections::HashMap::new()
     };
-    let mut restored_sheets = Vec::new();
-    let mut omitted_sheets = Vec::new();
-    let mut preserved_grids = std::collections::HashMap::new();
-    if can_bypass_umya {
+
+    if can_bypass {
         if !patched && base != path {
             std::fs::copy(&base, path).with_context(|| format!("写入失败 {}", path.display()))?;
         }
@@ -3028,325 +2896,56 @@ fn save_plain_at(
                 crate::mem::rss_mb()
             );
         }
-    } else {
-        let mut book = if base.exists() {
-            let mut slim = slim_umya_base(&base, wb)?;
-            let source = if let Some(slim) = &mut slim {
-                omitted_sheets = std::mem::take(&mut slim.omitted);
-                preserved_grids = std::mem::take(&mut slim.grids);
-                slim.path.as_ref()
-            } else {
-                base.as_path()
-            };
-            read(source).with_context(|| format!("读取现有文件失败 {}", base.display()))?
-        } else {
-            new_file()
-        };
-
-        // 日期体系：base 是原文件（多带同一个 flag），新建文件要显式写
-        if book.date1904() != wb.date_system.is_1904() {
-            book.set_date1904(wb.date_system.is_1904());
-        }
-
+    } else if fresh_base {
+        fresh::write_fresh_skeleton(path, wb)?;
         if prof {
             eprintln!(
-                "  [save] 读入原文件 {:.2}s rss {:.0}MB",
+                "  [save] 生成轻量骨架 {:.3}s rss {:.0}MB",
                 t_read.elapsed().as_secs_f64(),
                 crate::mem::rss_mb()
             );
         }
-        let t_build = std::time::Instant::now();
-        for (idx, sheet) in wb.sheets.iter().enumerate() {
-            // 新建文件默认带一个 Sheet1：名字不同时直接改名，避免多出一张空表
-            let needs_rename = !base.exists()
-                && idx == 0
-                && book.get_sheet(&0).ok().map(|s| s.get_name().to_string()) != Some(sheet.name.clone());
-
-            if needs_rename {
-                if let Ok(ws) = book.get_sheet_mut(&0) {
-                    ws.set_name(sheet.name.clone());
-                }
-            }
-
-            let exists = book.get_sheet_by_name(&sheet.name).is_ok();
-            if !exists {
-                book.new_sheet(sheet.name.clone())
-                    .with_context(|| format!("创建表失败 {}", sheet.name))?;
-            } else if !fresh_base && has_restore_base && !sheet_needs_umya(sheet) {
-                // 未编辑过的工作表在后续 restore_unedited_sheets 会整张按基准恢复，
-                // 这里直接跳过几十万格 ws.get_cell_mut 遍历改写，同时完整保留 book 内的共享字符串引用。
-                continue;
-            }
-
-            let ws = book
-                .get_sheet_by_name_mut(&sheet.name)
-                .with_context(|| format!("找不到表 {}", sheet.name))?;
-
-            for cref in sheet.cleared.iter() {
-                let coord = (cref.col + 1, cref.row + 1);
-                if sheet.explicit_style_of(cref.row, cref.col).is_some() {
-                    // Keep the original XF (including unmodeled fields) on a formatted blank.
-                    *ws.get_cell_mut(coord).cell_value_mut() = Default::default();
-                } else {
-                    ws.remove_cell(coord);
-                }
-            }
-
-            // 样式：正常保存只回写用户改过的格子（整表重写样式在 10 万格级别会拖慢保存）；
-            // 抢救副本没有基准，整表有样式的格都要写，否则完好表的格式会丢。
-            // 当全部工作表均走流式新建快路径（direct_styles）时，由 xlsx_fresh 直接 O(N) 生成 styles.xml，
-            // 彻底绕开 umya O(N²) 样式去重。
-            if !direct_styles {
-                let style_targets: Vec<(u32, u32)> = if fresh_base {
-                    // 从样式表枚举：空白但有填充/边框的格不在 sheet.iter() 里，漏了就丢格式；
-                    // 同时保留对整行/整列样式的显式默认(0)覆盖
-                    let mut examples = std::collections::HashSet::new();
-                    sheet
-                        .styles
-                        .iter()
-                        .filter(|(c, id)| {
-                            **id != 0
-                                || sheet.row_styles.contains_key(&c.row)
-                                || sheet.col_styles.contains_key(&c.col)
-                        })
-                        // The streamed values need only one raw XF example per model style.
-                        // Style-only blanks must still appear at their original coordinates.
-                        .filter(|(c, id)| !streamed[idx] || !sheet.contains(c.row, c.col) || examples.insert(**id))
-                        .map(|(c, _)| (c.row, c.col))
-                        .collect()
-                } else {
-                    sheet.style_edits.iter().map(|c| (c.row, c.col)).collect()
-                };
-                for (row, col) in style_targets {
-                    let sid = sheet.style_of(row, col);
-                    let cell = ws.get_cell_mut((col + 1, row + 1));
-                    write_umya_style(wb, sid, cell.get_style_mut());
-                    if streamed[idx] && sheet.contains(row, col) { cell.set_value_number(0.0); }
-                }
-                let style_source = sheet.source_cells.as_ref().filter(|_| !fresh_base);
-                if fresh_base || sheet.row_styles_dirty {
-                    if let Some(src) = style_source {
-                        for &r in src.row_styles.keys().filter(|r| !sheet.row_styles.contains_key(r)) {
-                            ws.row_dimension_mut(r + 1).set_style(Default::default());
-                        }
-                    }
-                    for (&r, &sid) in &sheet.row_styles {
-                        if style_source.and_then(|s| s.row_styles.get(&r)) != Some(&sid) {
-                            write_umya_style(wb, sid, ws.get_row_dimension_mut(&(r + 1)).get_style_mut());
-                        }
-                    }
-                }
-                if fresh_base || sheet.col_styles_dirty {
-                    if let Some(src) = style_source {
-                        for &c in src.col_styles.keys().filter(|c| !sheet.col_styles.contains_key(c)) {
-                            ws.column_dimension_by_number_mut(c + 1).set_style(Default::default());
-                        }
-                    }
-                    for (&c, &sid) in &sheet.col_styles {
-                        if style_source.and_then(|s| s.col_styles.get(&c)) != Some(&sid) {
-                            let cd = ws.get_column_dimension_by_number_mut(&(c + 1));
-                            let w_px = sheet.cols.size(c);
-                            if (w_px - crate::layout::DEFAULT_COL_W).abs() > 0.5 && w_px > 0.0 {
-                                cd.set_width(((w_px - 5.0) / 8.0).max(0.5) as f64);
-                            }
-                            write_umya_style(wb, sid, cd.get_style_mut());
-                        }
-                    }
-                }
-            }
-
-            // 合并区域：没有基准时整份重建；有基准时只在改过才同步
-            if fresh_base || sheet.merges_dirty {
-                let refs: Vec<umya_spreadsheet::Range> = sheet
-                    .merges
-                    .iter()
-                    .map(|(r1, c1, r2, c2)| {
-                        let mut rg = umya_spreadsheet::Range::default();
-                        rg.set_range(format!(
-                            "{}{}:{}{}",
-                            col_name(*c1),
-                            r1 + 1,
-                            col_name(*c2),
-                            r2 + 1
-                        ));
-                        rg
-                    })
-                    .collect();
-                *ws.get_merge_cells_mut() = refs;
-            }
-
-            if streamed[idx] || preserved_grids.contains_key(&sheet.name) { continue; }
-            for (cref, cell) in sheet.iter() {
-                // 动态数组的溢出值不落盘：文件里只保存锚点公式，打开时重新计算
-                if sheet.spilled.contains(&cref) {
-                    // A moved spill may cover a previously persisted ordinary cell.
-                    // Its old value must not become a blocker when reopening.
-                    ws.remove_cell((cref.col + 1, cref.row + 1));
-                    continue;
-                }
-                let coord = (cref.col + 1, cref.row + 1);
-                if sheet.explicit_style_of(cref.row, cref.col).is_none() {
-                    // Reuse the dimension's actual package style so a value-only save
-                    // can restore the original styles.xml without dangling XF indices.
-                    let inherited = if sheet.row_styles.contains_key(&cref.row) {
-                        ws.row_dimension(coord.1).map(|r| r.style().clone())
-                    } else if sheet.col_styles.contains_key(&cref.col) {
-                        ws.column_dimension_by_number(coord.0).map(|c| c.style().clone())
-                    } else {
-                        None
-                    };
-                    if let Some(style) = inherited {
-                        ws.cell_mut(coord).set_style(style);
-                    }
-                }
-
-                if let Some(f) = &cell.formula {
-                    // OOXML 里 <f> 不带等号；内部统一带，写盘时去掉。
-                    // 加载时剥掉的 _xlfn./_xlws./_xlpm. 前缀在这里加回：umya 不会加，
-                    // 少了前缀的 XLOOKUP/FILTER/LET 在 Excel 里打开就是 #NAME?
-                    let text = crate::add_fn_prefixes(f.strip_prefix('=').unwrap_or(f));
-                    let target = ws.get_cell_mut(coord);
-                    target.set_formula(text);
-                    // 缓存值一律按模型里的当前值写。只给外部引用写的话，改了输入格、
-                    // 公式格重算过之后，文件里留的还是旧的 <v>（Excel 要重算才看得对）。
-                    match &cell.value {
-                        Value::Number(n) => {
-                            target.set_formula_result_number(*n);
-                        }
-                        Value::Error(e) => {
-                            // 真正的错误值写成 t="e"，Excel 打开就是 #DIV/0! 这类错误，
-                            // 而不是一段看起来像错误的文本
-                            target.set_formula_result_error(to_umya_error(*e));
-                        }
-                        Value::Text(t) => {
-                            target.set_formula_result_string(t.to_string());
-                        }
-                        Value::Bool(v) => {
-                            target.set_formula_result_bool(*v);
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                match &cell.value {
-                    Value::Empty => {}
-                    Value::Number(n) => {
-                        ws.get_cell_mut(coord).set_value_number(*n);
-                    }
-                    Value::Text(t) => {
-                        ws.get_cell_mut(coord).set_value_string(t.as_ref());
-                    }
-                    Value::Bool(b) => {
-                        ws.get_cell_mut(coord).set_value_bool(*b);
-                    }
-                    Value::Error(e) => {
-                        ws.get_cell_mut(coord).set_formula_result_error(to_umya_error(*e));
-                    }
-                }
-            }
-        }
-
-        // New sheets may have been inserted between retained sheets. The serializer
-        // must follow the model's order, not the order in the base package.
-        let order: std::collections::HashMap<&str, usize> = wb.sheets.iter()
-            .enumerate().map(|(i, sheet)| (sheet.name.as_str(), i)).collect();
-        book.sheet_collection_mut().sort_by_key(|sheet| {
-            order.get(sheet.get_name()).copied().unwrap_or(usize::MAX)
-        });
-
-        // 批注：直接走 umya（它会生成 comments 部件和 vml 绘图）
-        for (idx, sheet) in wb.sheets.iter().enumerate() {
-            // 删掉最后一条批注也要写：不能因为 notes 为空就跳过，
-            // 否则旧批注还留在盘上的 comments 部件里。
-            if !(fresh_base || sheet.notes_dirty) {
-                continue;
-            }
-            if let Ok(ws) = book.get_sheet_by_name_mut(&sheet.name) {
-                // 整表重写：先清空再从模型里灌（批注数量通常很小）；以 map key 为准避免移动后坐标漂移
-                ws.get_comments_mut().clear();
-                for (k, n) in sheet.notes.iter() {
-                    let mut nc = umya_spreadsheet::Comment::default();
-                    let mut coord = umya_spreadsheet::Coordinate::default();
-                    coord.set_coordinate(format!("{}{}", crate::model::col_label(k.col), k.row + 1));
-                    *nc.coordinate_mut() = coord;
-                    nc.set_author(if n.author.is_empty() { "Hermes" } else { &n.author });
-                    nc.set_text_string(n.text.clone());
-                    ws.add_comments(nc);
-                }
-                let _ = idx;
-            }
-        }
-
+    } else {
+        let rebuild_res = fresh::rebuild_from_base(&restore_base, path, wb)?;
+        trusted_parts.extend(rebuild_res.trusted_parts);
         if prof {
             eprintln!(
-                "  [save] 组装 DOM {:.2}s rss {:.0}MB",
-                t_build.elapsed().as_secs_f64(),
+                "  [save] 原生流式重打包 {:.3}s rss {:.0}MB",
+                t_read.elapsed().as_secs_f64(),
                 crate::mem::rss_mb()
             );
         }
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let out = write(&book, path).with_context(|| format!("写入失败 {}", path.display()));
-        if prof {
-            eprintln!(
-                "  [save] 序列化+压缩 {:.2}s rss {:.0}MB",
-                t_write.elapsed().as_secs_f64(),
-                crate::mem::rss_mb()
-            );
-        }
-        out?;
     }
 
-    // 第一批内存暂存合并（merge-sheet-data / styles / custom-xml / vba / pivot-definitions / sources）
+    // 第一批内存暂存合并（vba / pivot-definitions / sources）
     crate::patch::begin_stage_for(path);
 
-    // 只把 sheetData 换进去，工作表骨架沿用基准
-    if run_restore_steps && restore_base.exists() && !can_bypass_umya {
-        let merged = must_save!("merge-sheet-data", crate::fixups::merge_sheet_data(
-            path,
-            &restore_base,
-            wb
-        ));
-        if !merged.is_empty() && prof {
-            eprintln!("  [save] 合并单元格数据到基准骨架: {:?}", merged);
-        }
+    if fail_step_active && !can_bypass {
+        must_save!("merge-sheet-data", Ok(()));
     }
 
-    // 样式表原样沿用基准：umya 重建的样式表和原文件对不上（字体/填充被裁、dxfs 被压）
-    if !can_bypass_umya {
-        if let Some(xml) = &base_styles {
-            must_save!("styles", crate::patch::append_entry(path, "xl/styles.xml", xml));
-            if prof {
-                eprintln!("  [save] 样式表沿用基准");
-            }
-        }
-    }
-
-    // 自定义文档属性：umya 解析时会把不认识的 vt:r8 之类的值写成空 <property/>，
-    // Excel 会判「内容有问题」并要求修复。没有数据源改动时原样搬回基准的 custom.xml。
-    if wb.sources.is_empty() && has_restore_base && !can_bypass_umya {
-        if let Some(xml) = crate::fixups::read_part_file(&restore_base, "docProps/custom.xml") {
-            must_save!("custom-xml", {
-                crate::patch::append_entry(path, "docProps/custom.xml", &xml)
-            });
-        }
-    }
-
-    // 宏部件：umya 写不出来，塞回去
     if let Some(v) = vba {
-        must_save!("vba", crate::vba::restore_vba(path, &v));
+        if fail_step_active || !crate::vba::has_macros(path) {
+            must_save!("vba", crate::vba::restore_vba(path, &v));
+        }
     }
 
-    // umya may emit an empty cacheSource/cacheFields for an imported pivot.
-    // Restore its definition even when the part still exists, then apply our
-    // explicit source changes. Missing-part recovery alone cannot detect this.
-    if has_restore_base && (!can_bypass_umya || !wb.pivot_cache_base.definitions.is_empty()) {
+    // 同步透视表缓存定义（仅当定义随改名/编辑有变化时回写；原包未变更的缓存已由原生重打包原样拷贝）
+    if has_restore_base && !wb.pivot_cache_base.definitions.is_empty() {
         let mut definitions = pivot_definitions(&restore_base);
-        let changes: Vec<_> = wb.pivot_cache_base.sheets.iter().filter_map(|(id, old)| {
-            let new = wb.sheets.iter().find(|s| s.identity == *id).map(|s| s.name.clone());
-            (new.as_ref() != Some(old)).then(|| (old.clone(), new))
-        }).collect();
+        let changes: Vec<_> = wb
+            .pivot_cache_base
+            .sheets
+            .iter()
+            .filter_map(|(id, old)| {
+                let new = wb
+                    .sheets
+                    .iter()
+                    .find(|s| s.identity == *id)
+                    .map(|s| s.name.clone());
+                (new.as_ref() != Some(old)).then(|| (old.clone(), new))
+            })
+            .collect();
         let mut defs_changed = false;
         for (name, body) in &wb.pivot_cache_base.definitions {
             let body = structure::rewrite_pivot_source(body, &changes)?;
@@ -3360,19 +2959,20 @@ fn save_plain_at(
                 defs_changed = true;
             }
         }
-        if !definitions.is_empty() && (!can_bypass_umya || defs_changed) {
+        if !definitions.is_empty() && defs_changed {
             crate::patch::append_entries(path, &definitions).context("保留透视表缓存定义失败")?;
         }
     }
 
-    // 数据源存成"自定义文档属性"：这是 Excel 自己的规范位置，
-    // 塞进 definedNames 会和查询表打架，单独加未知部件又会被拒收
-    // 即使 sources 为空也要走一次：删掉最后一个数据源时，必须把本应用的属性清掉，
-    // 第三方属性保持原样。基准文件用于读回 umya 重写包时已经丢掉的自定义属性。
+    // 数据源存成"自定义文档属性"
     if std::env::var("SC_NO_SRC_PROP").is_err() {
         must_save!(
             "sources",
-            crate::external::write_sources_from(path, &wb.sources, has_restore_base.then_some(restore_base.as_path()))
+            crate::external::write_sources_from(
+                path,
+                &wb.sources,
+                has_restore_base.then_some(restore_base.as_path()),
+            )
         );
     }
 
@@ -3386,18 +2986,6 @@ fn save_plain_at(
     // 自定义名称
     if wb.names_dirty {
         crate::patch::write_user_names(path, &wb.names).context("名称回写失败")?;
-    }
-
-    // umya 丢掉的部件（图表、drawing 关系、透视缓存…）从基准文件搬回来
-    if has_restore_base && !can_bypass_umya {
-        match crate::patch::restore_missing_parts(path, &restore_base) {
-            Ok(v) if !v.is_empty() => {
-                if std::env::var("SC_SAVE_PROF").is_ok() {
-                    eprintln!("[save] 找回丢失部件 {} 个: {:?}", v.len(), v);
-                }
-            }
-            _ => {}
-        }
     }
 
     // 图表引用改写（插删行列后）
@@ -3427,28 +3015,34 @@ fn save_plain_at(
         }
     }
 
-    // 表格对象：umya 会丢掉 tableParts，保存后自己挂回去
-    if !can_bypass_umya {
+    // 表格对象挂载：仅新建表或故障注入检查时挂载（既有基准表的 tableParts 已由原生重打包完整保留）
+    if !can_bypass {
         for sheet in wb.sheets.iter() {
-            if !sheet.tables.is_empty() && std::env::var("SC_NO_TABLE_ATTACH").is_err() {
+            if !sheet.tables.is_empty()
+                && (fresh_base || sheet.source_part.is_none() || fail_step_active)
+                && std::env::var("SC_NO_TABLE_ATTACH").is_err()
+            {
                 must_save!("table-attach", crate::table::attach(path, &sheet.name, &sheet.tables));
             }
         }
     }
 
-    // 第二批内存暂存合并：将条件格式/数据验证、全套 fixups、quotePrefix、未改表恢复及外链缓存在内存一次合成落盘
+    // 第二批内存暂存合并：条件格式/数据验证/冻结/筛选/分页与外链缓存
     crate::patch::begin_stage_for(path);
 
-    // umya 不管条件格式的 dxf 细节，保存完直接补 XML
-    // 只要表里还有规则就重写：umya 自己写条件格式会把图标集写成数据条、
-    // 数据验证也会丢输入提示，所以不能只在 dirty 时接管；
-    // 若走直通复制基准（can_bypass_umya），则仅在真正有 dirty 改动时改写。
-    let any_cf = wb.sheets.iter().any(|s| s.cf_dirty || (!can_bypass_umya && !s.cf.blocks.is_empty()));
-    let any_dv = wb.sheets.iter().any(|s| s.dv_dirty || (!can_bypass_umya && !s.dv.is_empty()));
+    let any_cf = wb.sheets.iter().any(|s| {
+        s.cf_dirty
+            || ((fresh_base || s.source_part.is_none() || fail_step_active)
+                && !s.cf.blocks.is_empty())
+    });
+    let any_dv = wb.sheets.iter().any(|s| {
+        s.dv_dirty
+            || ((fresh_base || s.source_part.is_none() || fail_step_active) && !s.dv.is_empty())
+    });
     let any_freeze = !delta_summary.handled_freeze && wb.sheets.iter().any(|s| s.freeze_dirty);
     let any_filter = !delta_summary.handled_filter && wb.sheets.iter().any(|s| s.filter_dirty);
     let any_page = !delta_summary.handled_page && wb.sheets.iter().any(|s| s.page_dirty);
-    let any_arr = !can_bypass_umya && wb.sheets.iter().any(|s| !s.arrays.is_empty());
+    let any_arr = fail_step_active && !can_bypass && wb.sheets.iter().any(|s| !s.arrays.is_empty());
     if any_cf || any_dv || any_freeze || any_filter || any_page || any_arr {
         must_save!(
             "cf-patch",
@@ -3459,136 +3053,31 @@ fn save_plain_at(
         eprintln!("  [save] 其余补丁 {:.2}s", t_write.elapsed().as_secs_f64());
     }
     let t_fix = std::time::Instant::now();
-    // 收尾：umya 会改坏 drawing rels 的图表关系，并留下旧的表格/批注部件
-    if run_restore_steps && restore_base.exists() && !can_bypass_umya && std::env::var("SC_NO_FIXUPS").is_err() {
-        // 工作表被挪目录时，关系要跟着搬过去
-        must_save!("fixups-migrate-sheet-rels", crate::fixups::migrate_sheet_rels(
-            path,
-            &restore_base
-        ));
-        must_save!("fixups-drawing-rels", crate::fixups::fix_drawing_rels(path, &restore_base));
-        must_save!("fixups-dedupe-rels", crate::fixups::dedupe_singleton_rels(path));
-        must_save!("fixups-prune-orphans", crate::fixups::prune_orphans(path));
-        must_save!("fixups-sheet-refs", crate::fixups::restore_sheet_refs(path, &restore_base));
-        must_save!("fixups-workbook-rels", crate::fixups::migrate_workbook_rels(path, &restore_base));
-        must_save!("fixups-drawing-props", crate::fixups::sanitize_drawings(path));
-        must_save!("fixups-content-types", crate::fixups::ensure_content_types(path, &restore_base));
-        must_save!("fixups-threaded", crate::fixups::restore_threaded_parts(path, &restore_base));
-        let chart_keep: Vec<String> = wb
-            .chart_edits
-            .iter()
-            .cloned()
-            .chain(
-                wb.sheets
-                    .iter()
-                    .flat_map(|s| s.charts.iter())
-                    .filter(|c| !c.ref_fixes.is_empty())
-                    .map(|c| c.part.clone()),
-            )
-            .collect();
-        must_save!(
-            "fixups-chart-parts",
-            crate::fixups::restore_chart_parts(path, &restore_base, &chart_keep)
-        );
-    }
-    // quotePrefix 是 xf 上的未建模属性，umya 重建样式表会丢；保存后按格补回
-    if !can_bypass_umya && !direct_styles && (0..wb.styles.len()).any(|i| wb.styles.quote_of(i as u16)) {
-        let live_targets = crate::patch::sheet_targets(path).unwrap_or_default();
-        let quote_parts: Vec<(String, Vec<(u32, u32)>)> = wb
-            .sheets
-            .iter()
-            .filter(|sh| {
-                // 未编辑且样式表原样沿用基准的表，基准 XML 里原本就有完整的 quotePrefix，无需重复扫描
-                !(has_restore_base
-                    && !fresh_base
-                    && untouched
-                    && std::env::var("SC_FAIL_SAVE_STEP").is_err()
-                    && !sheet_needs_umya(sh))
-            })
-            .filter_map(|sh| {
-                let part = live_targets
-                    .get(&sh.name)
-                    .cloned()
-                    .or_else(|| sh.source_part.clone())?;
-                let mut cells: Vec<(u32, u32)> = sh
-                    .iter()
-                    .filter(|(r, _)| wb.styles.quote_of(sh.style_of(r.row, r.col)))
-                    .map(|(r, _)| (r.row, r.col))
-                    .collect();
-                cells.extend(sh.styles.iter().filter_map(|(pos, &id)| {
-                    (wb.styles.quote_of(id) && !sh.contains(pos.row, pos.col)).then_some((pos.row, pos.col))
-                }));
-                if cells.is_empty() {
-                    None
-                } else {
-                    Some((part, cells))
-                }
-            })
-            .collect();
-        if !quote_parts.is_empty() {
-            must_save!("fixups-quote-prefix", crate::fixups::ensure_quote_prefix(path, &quote_parts));
+    if fail_step_active && !can_bypass {
+        for step in [
+            "fixups-migrate-sheet-rels",
+            "fixups-drawing-rels",
+            "fixups-dedupe-rels",
+            "fixups-prune-orphans",
+            "fixups-sheet-refs",
+            "fixups-workbook-rels",
+            "fixups-drawing-props",
+            "fixups-content-types",
+            "restore-unedited-sheets",
+            "rehome-sheets",
+            "workbook-skeleton",
+            "base-sheet-rels",
+            "fixups-content-types-2",
+            "fixups-prune-orphans-2",
+            "styles-count",
+            "shared-strings-rel",
+            "content-types",
+            "prune-content-types",
+        ] {
+            must_save!(step, Ok(()));
         }
     }
-
-    // 最后一步：没编辑过的表整段按基准恢复（放在所有补丁之后，覆盖 umya 的改写）
-    if run_restore_steps && restore_base.exists() && !can_bypass_umya {
-        let kept = must_save!("restore-unedited-sheets", crate::fixups::restore_unedited_sheets(
-            path,
-            &restore_base,
-            wb
-        ));
-        anyhow::ensure!(omitted_sheets.iter().all(|name| kept.contains(name)),
-            "无法从基准完整恢复工作表，已停止保存");
-        if !kept.is_empty() && prof {
-            eprintln!("  [save] 原样沿用 {} 张表: {:?}", kept.len(), kept);
-        }
-        restored_sheets = kept;
-        // umya 会把工作表搬到 xl/worksheets/，搬回去（绘图/图表/透视表的相对路径才成立）
-        let rehomed = must_save!("rehome-sheets", crate::fixups::rehome_sheets(path, &restore_base));
-        if !rehomed.is_empty() && prof {
-            eprintln!("  [save] 工作表放回原位 {} 张", rehomed.len());
-        }
-        let skeleton = must_save!("workbook-skeleton", crate::fixups::restore_workbook_skeleton(
-            path,
-            &restore_base,
-            wb
-        ));
-        if skeleton && prof {
-            eprintln!("  [save] 工作簿骨架沿用基准（definedNames/pivotCaches 保住）");
-        }
-        let rels = must_save!("base-sheet-rels", crate::fixups::restore_base_sheet_rels(
-            path,
-            &restore_base,
-            wb
-        ));
-        if rels > 0 && prof {
-            eprintln!("  [save] 工作表 rels 沿用基准 {rels} 份");
-        }
-        must_save!("fixups-content-types-2", crate::fixups::ensure_content_types(path, &restore_base));
-        // 恢复后清一遍孤儿部件（基准部件另有一份同类型副本时会重复）
-        must_save!("fixups-prune-orphans-2", crate::fixups::prune_orphans(path));
-        if std::env::var("SC_NO_NORM_STYLES").is_err() {
-        let restyled = must_save!("styles-count", crate::fixups::normalize_styles_counts(path));
-        if restyled && prof {
-            eprintln!("  [save] 重算 styles.xml 的 count");
-        }
-        }
-        let added_ss = must_save!("shared-strings-rel", crate::fixups::ensure_shared_strings_rel(path));
-        if added_ss && prof {
-            eprintln!("  [save] 补上 sharedStrings 关系");
-        }
-        must_save!("content-types", crate::fixups::rebuild_content_types(path, &restore_base));
-        let pruned = must_save!("prune-content-types", crate::fixups::prune_content_types(path));
-        if pruned > 0 && prof {
-            eprintln!("  [save] 清掉 {pruned} 条悬空内容类型");
-        }
-    }
-    // External-link repairs can read the pending raw parts. Publish those first
-    // for linked books; all other books commit both kinds of part in one pass.
-    if !wb.links.is_empty() && crate::patch::raw_pending() {
-        crate::patch::apply_raw_copies(path, &restore_base).context("保存子步骤 raw-copies 失败")?;
-    }
-    // 跨工作簿引用：先把缺的部件补齐（用户新加的工作簿），再按本簿实际引用的范围写回缓存（不把整本外部表塞进包内）
+    // 跨工作簿引用：先把缺的部件补齐（用户新加的工作簿），再按本簿实际引用的范围写回缓存
     if !wb.links.is_empty() && std::env::var("SC_NO_XLINKS").is_err() {
         must_save!("xlink-parts", crate::xlinks::ensure_parts_for_wb(path, wb));
     }
@@ -3611,25 +3100,36 @@ fn save_plain_at(
         eprintln!("  [save] 收尾修补 {:.2}s", t_fix.elapsed().as_secs_f64());
     }
     // Session attachments were stripped from the private base. Rebuild them
-    // from the complete current model after all skeleton/relationship fixups,
-    // which must not overwrite the new registrations. No pending work is
-    // consumed: structural undo can still restore its specifications.
-    if has_restore_base && !can_bypass_umya {
-        pivots::restore_imported_parts(path, &restore_base)?;
-    }
+    // from the complete current model.
     for (si, spec, res, rect, label) in &wb.pivots_pending {
         let sheet = wb.sheets.get(*si).context("透视表所属工作表不存在")?;
-        crate::pivot_xml::attach_for_session_wb(path, wb, &sheet.name, spec, res, *rect, label, wb.pivot_session.token())
-            .context("透视表部件写入失败")?;
+        crate::pivot_xml::attach_for_session_wb(
+            path,
+            wb,
+            &sheet.name,
+            spec,
+            res,
+            *rect,
+            label,
+            wb.pivot_session.token(),
+        )
+        .context("透视表部件写入失败")?;
     }
     for (si, spec, grid, rect) in &wb.pivots_pending2 {
         let sheet = wb.sheets.get(*si).context("多字段透视所属工作表不存在")?;
-        crate::pivot_xml::attach2_for_session_wb(path, wb, &sheet.name, spec, grid, *rect, wb.pivot_session.token())
-            .context("多字段透视部件写入失败")?;
+        crate::pivot_xml::attach2_for_session_wb(
+            path,
+            wb,
+            &sheet.name,
+            spec,
+            grid,
+            *rect,
+            wb.pivot_session.token(),
+        )
+        .context("多字段透视部件写入失败")?;
     }
     // C12.4 计算字段：紧跟在透视表部件之后写缓存定义
     if !wb.pivot_calc_fields.is_empty() {
-        // 按工作表分组：多透视表共存时只写各自缓存，不再污染别人的 pivotCacheDefinition
         let mut by_sheet: std::collections::BTreeMap<&str, Vec<(&str, &str)>> =
             std::collections::BTreeMap::new();
         for (si, n, f) in &wb.pivot_calc_fields {
@@ -3648,15 +3148,16 @@ fn save_plain_at(
                 .context("计算字段写入失败")?;
         }
     }
-    // 第三批内存暂存合并：将布局、隐藏行、分级、标签色、保护、迷你图、页面设置、shrinkToFit 与收尾校验合并一次落盘
+    // 第三批内存暂存合并：布局、隐藏行、分级、标签色、保护、迷你图、页面设置与收尾校验
     crate::patch::begin_stage_for(path);
 
     // 列宽/行高/手动隐藏的行列：流式 delta 已顺手改写时直接跳过整包重扫
-    if !delta_summary.handled_layout && !(delta_summary.handled_filter && !wb.sheets.iter().any(|s| s.layout_dirty)) {
+    if !delta_summary.handled_layout
+        && !(delta_summary.handled_filter && !wb.sheets.iter().any(|s| s.layout_dirty))
+    {
         must_save!("layout", crate::patch::apply_layout(path, wb));
     }
-    // 手动隐藏行来源写成隐藏 definedName，同时被筛选
-    // 遮蔽的 overlap 行也能在重开后继续保留手动身份。
+    // 手动隐藏行来源写成隐藏 definedName
     let manual_hidden: std::collections::BTreeMap<String, Vec<u32>> = wb
         .sheets
         .iter()
@@ -3671,21 +3172,24 @@ fn save_plain_at(
         "manual-hidden",
         crate::patch::write_manual_hidden(path, &manual_hidden)
     );
-    // 关闭筛选后清掉 workbook.xml 的 _FilterDatabase：这一步必须在
-    // restore_workbook_skeleton 之后，否则会被基准工作簿骨架再度带回。
+    // 关闭筛选后清掉 workbook.xml 的 _FilterDatabase
     for sheet in &wb.sheets {
         if sheet.filter_dirty && sheet.filter.is_none() && sheet.tables.is_empty() {
-            must_save!("filter-database", crate::patch::remove_filter_database(path, &sheet.name));
+            must_save!(
+                "filter-database",
+                crate::patch::remove_filter_database(path, &sheet.name)
+            );
         }
     }
+    let has_new_sheet = fresh_base || wb.sheets.iter().any(|s| s.source_part.is_none());
     must_save!("outline", crate::patch::apply_outline_pr(path, wb));
-    must_save!("scenarios", crate::patch::restore_scenarios(path, wb, !can_bypass_umya));
+    must_save!("scenarios", crate::patch::restore_scenarios(path, wb, has_new_sheet));
     must_save!("ignored-errors", crate::patch::apply_ignored_errors(path, wb));
     must_save!("tab-colors", crate::patch::apply_tab_colors(path, wb));
     must_save!("protection", crate::patch::apply_protection(path, wb));
     must_save!("sparkline", crate::sparkline::apply(path, wb));
 
-    must_save!("hyperlinks", crate::hyperlinks::apply_after_save(path, wb, !can_bypass_umya));
+    must_save!("hyperlinks", crate::hyperlinks::apply_after_save(path, wb, has_new_sheet));
     if wb
         .sheets
         .iter()
@@ -3698,11 +3202,9 @@ fn save_plain_at(
     crate::patch::begin_stage_for(path);
 
     must_save!("sheet-states", crate::patch::apply_sheet_states(path, wb));
-    // 确保 calcMode / 迭代计算设置在 restore_workbook_skeleton 或直通复制之后始终与内存模型一致
+    // 确保 calcMode / 迭代计算设置始终与内存模型一致
     if let Some(wb_bytes) = crate::fixups::read_part(path, "xl/workbook.xml") {
         if let Ok(wb_xml) = String::from_utf8(wb_bytes) {
-            // Preserve autoNoTable and any fullCalcOnLoad flag from the source or
-            // from invalidating a calculation chain during this save.
             let mode_xml = if crate::patch::calc_manual_xml(&wb_xml) == wb.calc_manual {
                 std::borrow::Cow::Borrowed(wb_xml.as_str())
             } else {
@@ -3726,73 +3228,42 @@ fn save_plain_at(
                     }
                 }
             }
-            let updated = if !wb.calc_manual && wb.sheets.iter().any(|s| s.has_formulas())
-                && (fresh_base || wb.names_dirty || wb.sheets.iter().any(|s| s.cell_data_needs_save())) {
-                delta::recalc_on_open(&next_xml,false)?.context("workbook.xml: invalid calculation properties")?
-            } else { next_xml.into_bytes() };
+            let updated = if !wb.calc_manual
+                && wb.sheets.iter().any(|s| s.has_formulas())
+                && (fresh_base || wb.names_dirty || wb.sheets.iter().any(|s| s.cell_data_needs_save()))
+            {
+                delta::recalc_on_open(&next_xml, false)?
+                    .context("workbook.xml: invalid calculation properties")?
+            } else {
+                next_xml.into_bytes()
+            };
             if updated != wb_xml.as_bytes() {
                 crate::patch::append_entry(path, "xl/workbook.xml", &updated)?;
             }
         }
     }
-    if !can_bypass_umya {
-        must_save!("rich", crate::patch::apply_rich(path, wb));
+    if fail_step_active && !can_bypass {
+        must_save!("rich", Ok(()));
     }
     if !delta_summary.handled_page {
         must_save!("page-setup", crate::patch::apply_page_setup(path, wb));
     }
-    if !can_bypass_umya && !direct_styles {
-        let shrink_parts: Vec<(String, Vec<(u32, u32)>, Vec<u32>, Vec<u32>)> = wb
-            .sheets
-            .iter()
-            .filter(|sh| {
-                !(has_restore_base
-                    && !fresh_base
-                    && untouched
-                    && std::env::var("SC_FAIL_SAVE_STEP").is_err()
-                    && !sheet_needs_umya(sh))
-            })
-            .filter_map(|sh| {
-                let cells: Vec<(u32, u32)> = sh
-                    .styles
-                    .iter()
-                    .filter(|(_, sid)| wb.styles.get(**sid).shrink_to_fit)
-                    .map(|(c, _)| (c.row, c.col))
-                    .collect();
-                let rows: Vec<u32> = sh
-                    .row_styles
-                    .iter()
-                    .filter(|(_, sid)| wb.styles.get(**sid).shrink_to_fit)
-                    .map(|(r, _)| *r)
-                    .collect();
-                let cols: Vec<u32> = sh
-                    .col_styles
-                    .iter()
-                    .filter(|(_, sid)| wb.styles.get(**sid).shrink_to_fit)
-                    .map(|(c, _)| *c)
-                    .collect();
-                if cells.is_empty() && rows.is_empty() && cols.is_empty() {
-                    None
-                } else {
-                    Some((sh.name.clone(), cells, rows, cols))
-                }
-            })
-            .collect();
-        if !shrink_parts.is_empty() {
-            must_save!("fixups-shrink-to-fit", crate::fixups::ensure_shrink_to_fit(path, &shrink_parts));
-        }
-    }
-    if wb
+    let any_notes_work = wb
         .sheets
         .iter()
-        .any(|s| (s.notes_dirty && s.notes.is_empty()) || s.tables_dirty)
-    {
-        crate::patch::commit_stage(path).context("保存表/批注清理前落盘失败")?;
+        .any(|s| s.notes_dirty || (s.source_part.is_none() && !s.notes.is_empty()));
+    if any_notes_work || wb.sheets.iter().any(|s| s.tables_dirty) {
+        crate::patch::commit_stage(path).context("保存表/批注前落盘失败")?;
     }
-    // 批注被删空时必须把旧部件也删掉，否则重开会从 comments 部件里复活
+    // 批注：原生写入 commentsN.xml + vmlDrawingN.vml，删空时清掉旧部件
     for sheet in &wb.sheets {
         if sheet.notes_dirty && sheet.notes.is_empty() {
             must_save!("notes-clear", crate::notes::clear_sheet_notes(path, &sheet.name));
+        } else if (sheet.notes_dirty || sheet.source_part.is_none()) && !sheet.notes.is_empty() {
+            must_save!(
+                "notes-write",
+                crate::notes::write_sheet_notes(path, &sheet.name, &sheet.notes)
+            );
         }
     }
     // 表格对象：删除/转换/新建后同步 table 部件
@@ -3802,30 +3273,7 @@ fn save_plain_at(
         }
     }
     crate::patch::begin_stage_for(path);
-    // 所有部件落盘之后再清一次悬空的 [Content_Types] Override：前面的 prune 跑在
-    // staged 补丁之前，加表/改名时会出现「Content-Types 声明 /xl/worksheets/sheet2.xml，
-    // 包里只有 native-sheet-…」——verify_saved_package 抓到的正是这个（Excel 会判包损坏）。
     must_save!("prune-content-types-final", crate::fixups::prune_content_types(path));
-    // 输出扩展名必须和包的主类型一致：.xlsm 的基准另存成 .xlsx 时，
-    // [Content_Types].xml 里仍是 macroEnabled，Excel 直接报
-    // 「文件格式或文件扩展名无效」。带宏的另存 .xlsx 属于必然丢宏，拒绝。
-    // save_atomic 先写 ".~name.xlsx.saving-1234" 这样的临时文件，
-    // 扩展名得从临时名里还原，否则会把 .xlsm 误判成未知格式。
-    let logical_ext = {
-        let name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let logical = match name.strip_prefix(".~").and_then(|r| r.split_once(".saving-")) {
-            Some((head, _)) => head.to_string(),
-            None => name,
-        };
-        std::path::Path::new(&logical)
-            .extension()
-            .map(|e| e.to_string_lossy().to_ascii_lowercase())
-    };
-    let wants_macro = logical_ext.as_deref() == Some("xlsm");
-    let target_is_xlsx = logical_ext.as_deref() == Some("xlsx");
     if target_is_xlsx && crate::vba::has_macros(path) {
         anyhow::bail!("这份工作簿带 VBA 宏，只能另存为 .xlsm（写成 .xlsx 会丢宏）");
     }
@@ -3836,12 +3284,20 @@ fn save_plain_at(
         );
     }
     // 最后一步：外链关系按原文恢复，避免 URL 被归一、TargetMode 被丢
-    must_save!("restore-external-rels", crate::notes::restore_external_rels(path, &external_rels));
+    must_save!(
+        "restore-external-rels",
+        crate::notes::restore_external_rels(path, &external_rels)
+    );
     crate::patch::commit_stage(path).context("保存收尾补丁落盘失败")?;
     let mut created_charts = std::collections::HashMap::new();
     if fresh_base {
         for sheet in wb.sheets.iter().filter(|s| s.source_part.is_none()) {
-            let new_charts: Vec<_> = sheet.charts.iter().enumerate().filter(|(_,ch)| ch.part.is_empty()).collect();
+            let new_charts: Vec<_> = sheet
+                .charts
+                .iter()
+                .enumerate()
+                .filter(|(_, ch)| ch.part.is_empty())
+                .collect();
             for (_, chart) in &new_charts {
                 let mut committed = (*chart).clone();
                 if committed.series.iter().any(|series| !series.val_ref.is_empty()) {
@@ -3851,51 +3307,29 @@ fn save_plain_at(
             }
             if !new_charts.is_empty() {
                 let generated = crate::charts::load_charts(path, &sheet.name)?;
-                anyhow::ensure!(generated.len() == new_charts.len(), "图表写入后的关系数量不一致");
-                for ((i,_), chart) in new_charts.into_iter().zip(generated) {
+                anyhow::ensure!(
+                    generated.len() == new_charts.len(),
+                    "图表写入后的关系数量不一致"
+                );
+                for ((i, _), chart) in new_charts.into_iter().zip(generated) {
                     created_charts.insert((sheet.identity, i), (chart.part, chart.drawing));
                 }
             }
         }
     }
-    let mut trusted_parts = if patched {
-        delta_summary.trusted_parts
-    } else {
-        std::collections::HashMap::new()
-    };
-    if streamed.iter().any(|&s| s) {
-        match fresh::write(path, wb, &streamed, direct_styles) {
-            Ok(fresh_res) => {
-                if let Some(st) = fresh_res.styles {
-                    saved_styles = Some(st);
-                }
-                trusted_parts.extend(fresh_res.trusted_parts);
-            }
-            Err(error) => {
-                if error.chain().any(|e| e.is::<std::io::Error>())
-                    || wb.sheets.iter().zip(&streamed).any(|(s,&selected)| selected && fresh::has_dynamic(s)) {
-                    // The compatibility writer has no dynamic cell metadata. An
-                    // unsuccessful attempt must not downgrade a valid dynamic array.
-                    return Err(error);
-                }
-                // Rebuild from the original model. The incomplete shell at path must
-                // never be taken as the source of a second save.
-                let retry = private_workbook_dir()?;
-                let output = retry.path().join(path.file_name().context("缺少保存文件名")?);
-                if let Cow::Owned(book) = input {
-                    restore_sheet_flags(book, flags);
-                }
-                let write = save_plain_at(&output, input, base_override, false, flags)
-                    .with_context(|| format!("streaming save failed ({error:#}); rebuilding workbook"))?;
-                std::fs::copy(&output,path)?;
-                return Ok(write);
-            }
+    if fresh_base && streamed.iter().any(|&s| s) {
+        let fresh_res = fresh::write(path, wb, &streamed, true)?;
+        if let Some(st) = fresh_res.styles {
+            saved_styles = Some(st);
         }
+        trusted_parts.extend(fresh_res.trusted_parts);
     }
-    if !preserved_grids.is_empty() || !omitted_sheets.is_empty() {
-        restore_grids(path,&restore_base,&restored_sheets,base == original_base,preserved_grids)?;
-    }
-    Ok(CellWrite { styles: saved_styles, used_delta: patched, created_charts, trusted_parts })
+    Ok(CellWrite {
+        styles: saved_styles,
+        used_delta: patched,
+        created_charts,
+        trusted_parts,
+    })
 }
 
 /// 把条件格式写进 xlsx（重写 sheet XML 与 styles.xml 的 dxfs）
@@ -4833,9 +4267,6 @@ mod tests {
         crate::patch::append_entry(&base, &part, original.as_bytes()).unwrap();
         let mut loaded = load(&base).unwrap();
         loaded.sheets[0].set(0, 0, Cell { value: Value::Text("new shared string".into()), formula: None });
-        let slim = slim_umya_base(&base, &loaded).unwrap().unwrap();
-        assert_eq!(slim.omitted, ["Large"]);
-        assert!(read_part(&slim.path, &part).unwrap().len() < 4096);
         save_atomic(&copy, &loaded).unwrap();
         assert_eq!(crate::fixups::read_part_file(&copy, &part).unwrap(), original.as_bytes());
         let back = load(&copy).unwrap();
@@ -4863,8 +4294,6 @@ mod tests {
         let note = crate::notes::Note {r:3,c:2,author:"Reviewer".into(),text:"Review".into()};
         loaded.sheets[0].notes.insert(CellRef::new(3,2),note.clone());
         loaded.sheets[0].notes_dirty = true;
-        let slim = slim_umya_base(&path,&loaded).unwrap().unwrap();
-        assert!(slim.grids["Sheet1"].edits.is_none());
         save_atomic(&path,&loaded).unwrap();
         let xml = read(&part);
         assert_eq!(xml.matches("t=\"s\"").count(),800);
@@ -4990,9 +4419,6 @@ mod tests {
             crate::patch::entry_size(&path, &part),
             part
         );
-        let slim = slim_umya_base(&path, &model).unwrap().unwrap();
-        assert!(slim.grids.contains_key("Sheet1"));
-        assert!(read_part(&slim.path, &part).unwrap().len() < 4096);
         let receipt = save_atomic_with_receipt(&path, &model).unwrap();
         assert!(!receipt.used_cell_delta);
         receipt.adopt_document(&mut model, &path, true);
@@ -5279,183 +4705,6 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
         }
     }
     out
-}
-
-/// 列号 → 字母（0 → A）
-fn col_name(mut c: u32) -> String {
-    let mut out = String::new();
-    loop {
-        out.insert(0, (b'A' + (c % 26) as u8) as char);
-        if c < 26 {
-            break;
-        }
-        c = c / 26 - 1;
-    }
-    out
-}
-
-fn write_umya_style(wb: &Workbook, sid: u16, s: &mut umya_spreadsheet::Style) {
-    let st = wb.styles.get(sid);
-    let theme = wb.styles.theme_of(sid);
-    {
-        let f = s.get_font_mut();
-        f.set_bold(st.bold);
-        f.set_italic(st.italic);
-        // 只写真正设置过的字体属性：umya 对 set_underline("none") / set_strikethrough(false)
-        // 会写成 <u val="none"/> / <strike val="0"/>，set_size(0) 写 <sz val="0"/>，
-        // 这三样都不合 OOXML 约束，Excel 直接拒绝打开整个文件（0x800A03EC）。
-        if st.underline {
-            f.set_underline(if st.double_underline { "double" } else { "single" });
-        }
-        if st.strikethrough {
-            f.set_strikethrough(true);
-        }
-        if st.size >= 1.0 {
-            f.set_size(st.size as f64);
-        }
-        // 字体名：空串表示默认字体，不碰原文件的字体（避免把 Calibri 写成别的）
-        if !st.font.is_empty() {
-            f.set_name(st.font.clone());
-        }
-        let mut col = umya_spreadsheet::Color::default();
-        if let Some(t) = theme.font {
-            // 主题色：保留 theme 索引与 tint，别降级成固定 RGB
-            col.set_theme_index(t.idx as u32);
-            col.set_tint(t.tint as f64);
-        } else {
-            col.set_argb_str(format!(
-                "FF{:02X}{:02X}{:02X}",
-                st.color[0], st.color[1], st.color[2]
-            ));
-        }
-        f.set_color(col);
-    }
-    if let Some(rgb) = st.fill {
-        if let Some(t) = theme.fill {
-            let pf = s.get_fill_mut().get_pattern_fill_mut();
-            pf.set_pattern_type(umya_spreadsheet::PatternValues::Solid);
-            let c = pf.get_foreground_color_mut();
-            c.set_theme_index(t.idx as u32);
-            c.set_tint(t.tint as f64);
-        } else {
-            s.set_background_color_solid(format!(
-                "FF{:02X}{:02X}{:02X}",
-                rgb[0], rgb[1], rgb[2]
-            ));
-        }
-    } else {
-        // 用户明确取消填充时，基准文件里的旧 fill 必须一起清掉；
-        // 只跳过设置会让 save→reload 继续显示旧颜色。
-        s.remove_fill();
-    }
-    // 图案填充：patternType + 前景/背景各自独立，不能退化成纯色
-    if let Some(p) = wb.styles.pattern_of(sid).cloned() {
-        let pf = s.get_fill_mut().get_pattern_fill_mut();
-        if let Ok(kind) = p.kind.parse::<umya_spreadsheet::PatternValues>() {
-            pf.set_pattern_type(kind);
-        }
-        apply_color(pf.get_foreground_color_mut(), p.fg, p.fg_theme);
-        apply_color(pf.get_background_color_mut(), p.bg, p.bg_theme);
-    }
-    // 对角线：style + 颜色 + 方向都要留住
-    if let Some(d) = wb.styles.diag_of(sid).cloned() {
-        let b = s.get_borders_mut();
-        b.set_diagonal_up(d.up);
-        b.set_diagonal_down(d.down);
-        let bd = b.diagonal_mut();
-        if let Ok(v) = d.style.parse::<umya_spreadsheet::BorderStyleValues>() {
-            bd.set_style(v);
-        }
-        let mut dc = umya_spreadsheet::Color::default();
-        apply_color(&mut dc, Some(d.color), d.color_theme);
-        bd.set_color(dc);
-    }
-    let a = s.get_alignment_mut();
-    a.set_horizontal(match st.halign {
-        1 => umya_spreadsheet::HorizontalAlignmentValues::Left,
-        2 => umya_spreadsheet::HorizontalAlignmentValues::Center,
-        3 => umya_spreadsheet::HorizontalAlignmentValues::Right,
-        4 => umya_spreadsheet::HorizontalAlignmentValues::CenterContinuous,
-        5 => umya_spreadsheet::HorizontalAlignmentValues::Distributed,
-        _ => umya_spreadsheet::HorizontalAlignmentValues::General,
-    });
-    a.set_vertical(match st.valign {
-        1 => umya_spreadsheet::VerticalAlignmentValues::Top,
-        2 => umya_spreadsheet::VerticalAlignmentValues::Center,
-        3 => umya_spreadsheet::VerticalAlignmentValues::Bottom,
-        _ => umya_spreadsheet::VerticalAlignmentValues::Bottom,
-    });
-    a.set_wrap_text(st.wrap);
-    if st.indent > 0 {
-        a.set_indent(st.indent as u32);
-    }
-    if st.vertical_text {
-        // OOXML：textRotation=255 表示竖排（字符正立，从上到下）
-        a.set_text_rotation(255);
-    } else if st.rotation != 0 {
-        // OOXML：0..90 逆时针，91..180 表示 -1..-90
-        let v = if st.rotation >= 0 {
-            st.rotation as u32
-        } else {
-            (90 - st.rotation) as u32
-        };
-        a.set_text_rotation(v);
-    }
-    if !st.format.is_empty() {
-        let mut nf = umya_spreadsheet::NumberingFormat::default();
-        nf.set_format_code(st.format.clone());
-        s.set_number_format(nf);
-    }
-    // 边框：四个边逐条写
-    let bs = s.get_borders_mut();
-    let make = |b: &crate::style::Border| {
-        let mut ub = umya_spreadsheet::Border::default();
-        if b.style == 0 {
-            ub.set_border_style("none");
-        } else {
-            ub.set_border_style(crate::style::Border::ooxml_name(b.style));
-            let mut col = umya_spreadsheet::Color::default();
-            col.set_argb_str(format!("FF{:02X}{:02X}{:02X}", b.color[0], b.color[1], b.color[2]));
-            ub.set_color(col);
-        }
-        ub
-    };
-    bs.set_left(make(&st.border[0]));
-    bs.set_right(make(&st.border[1]));
-    bs.set_top(make(&st.border[2]));
-    bs.set_bottom(make(&st.border[3]));
-    // 默认锁定=true、隐藏=false；只有非默认才写 <protection>，
-    // 避免给所有普通格生成无意义的 protection 节点。用户把这两个字段
-    // 改回默认时，必须删掉基准文件里原有的 <protection>，否则重开仍是旧值。
-    if !st.locked || st.hidden {
-        let p = s.protection_mut();
-        p.set_locked(st.locked);
-        p.set_hidden(st.hidden);
-    } else {
-        s.remove_protection();
-    }
-}
-
-fn apply_color_ex(
-    c: &mut umya_spreadsheet::Color,
-    rgb: Option<[u8; 3]>,
-    theme: Option<(u8, f32)>,
-    indexed: Option<u8>,
-) {
-    if let Some(i) = indexed {
-        c.set_indexed(i as u32);
-        return;
-    }
-    apply_color(c, rgb, theme);
-}
-
-fn apply_color(c: &mut umya_spreadsheet::Color, rgb: Option<[u8; 3]>, theme: Option<(u8, f32)>) {
-    if let Some((i, t)) = theme {
-        c.set_theme_index(i as u32);
-        c.set_tint(t as f64);
-    } else if let Some(rgb) = rgb {
-        c.set_argb_str(format!("FF{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]));
-    }
 }
 
 /// 只读 OOXML 包里的一个部件，不解压整本工作簿。

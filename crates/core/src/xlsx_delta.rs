@@ -40,8 +40,10 @@ pub(crate) struct SourceCells {
 }
 
 type Rect = (u32, u32, u32, u32);
+#[cfg(test)]
 pub(super) use stream::sst;
 
+#[cfg(test)]
 pub(super) fn split_grid(
     input: impl std::io::Read,
     part: &str,
@@ -354,10 +356,6 @@ impl SourceCells {
         Ok(ok.then_some(staged))
     }
 
-    pub(super) fn unchanged_values(&self, sheet: &Sheet) -> bool {
-        &self.store.version == sheet.cell_version()
-    }
-
     fn original_xf(&self, sheet: &Sheet, key: CellRef, styles: &StyleTable) -> Option<(u16, u16)> {
         match self.styles.get(&key).copied() {
             Some(id) => Some((id, self.style_map.as_ref()?.editing_origin(id, styles)?)),
@@ -370,6 +368,24 @@ impl SourceCells {
 
     pub(super) fn set_style_map(&mut self, styles: Arc<StyleMap>) {
         self.style_map = Some(styles);
+    }
+
+    pub(super) fn base_styles(&self) -> &CellStyles {
+        &self.styles
+    }
+
+    pub(super) fn style_unchanged(&self, id: u16, current: &StyleTable) -> bool {
+        self.style_map
+            .as_ref()
+            .is_none_or(|m| m.unchanged(id, current))
+    }
+
+    pub(super) fn existing_xf(&self, id: u16, current: &StyleTable) -> Option<u16> {
+        let map = self.style_map.as_ref()?;
+        if map.derived_from.contains_key(&id) {
+            return None;
+        }
+        map.xf(id, current)
     }
 
     pub(super) fn trusted_signatures(
@@ -1322,7 +1338,7 @@ fn replace_spans(xml: &str, edits: impl IntoIterator<Item = Edit>) -> Vec<u8> {
 
 type PackageParts = HashMap<String, Vec<u8>>;
 
-fn invalidate_chain(
+pub(super) fn invalidate_chain(
     zip: &mut ZipArchive<File>,
     manual: bool,
 ) -> Result<Option<(PackageParts, HashSet<String>)>> {
