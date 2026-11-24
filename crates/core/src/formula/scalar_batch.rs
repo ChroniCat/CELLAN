@@ -1,8 +1,11 @@
-//! Independent scalar expressions split across all cores with dynamic work stealing,
-//! direct `FValue` transport (zero `Value <-> FValue` roundtrips), and `scope` support.
+//! Independent scalar expressions split across all cores via the persistent thread pool
+//! with dynamic work stealing, direct `FValue` transport, and `scope` support.
 use super::{
-    BinOp, Calc, FValue, Node, RefExpr, SharedCalcCaches, Workbook, bin_scalar, deps::CellKey,
+    BinOp, Calc, FValue, Node, RefExpr, SharedCalcCaches, Workbook, bin_scalar,
+    deps::CellKey,
+    func_id::FuncId,
     functions::EvalCtx,
+    pool,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,6 +36,8 @@ fn literal(
     scope: Option<&HashSet<CellKey>>,
     sheet: usize,
     node: &Node,
+    dr: i64,
+    dc: i64,
 ) -> Option<f64> {
     match node {
         Node::Number(value) => Some(*value),
@@ -41,8 +46,10 @@ fn literal(
                 && reference.sheet2.is_none()
                 && reference.book.is_none() =>
         {
-            let r = u32::try_from(reference.row).ok()?;
-            let c = u32::try_from(reference.col).ok()?;
+            let r_i = reference.row + if reference.row_abs { 0 } else { dr };
+            let c_i = reference.col + if reference.col_abs { 0 } else { dc };
+            let r = u32::try_from(r_i).ok()?;
+            let c = u32::try_from(c_i).ok()?;
             let cell = wb.sheet(sheet).get(r, c)?;
             if !cell_has_cached_scalar(wb, scope, sheet, r, c) {
                 return None;
@@ -61,6 +68,8 @@ fn numeric_binary(
     scope: Option<&HashSet<CellKey>>,
     sheet: usize,
     node: &Node,
+    dr: i64,
+    dc: i64,
 ) -> Option<Result<f64, super::ErrKind>> {
     let Node::Binary(
         op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow),
@@ -70,8 +79,8 @@ fn numeric_binary(
     else {
         return None;
     };
-    let lhs = FValue::Number(literal(wb, scope, sheet, lhs)?);
-    let rhs = FValue::Number(literal(wb, scope, sheet, rhs)?);
+    let lhs = FValue::Number(literal(wb, scope, sheet, lhs, dr, dc)?);
+    let rhs = FValue::Number(literal(wb, scope, sheet, rhs, dr, dc)?);
     match bin_scalar(*op, &lhs, &rhs) {
         FValue::Number(n) => Some(Ok(n)),
         FValue::Error(e) => Some(Err(e)),
@@ -85,15 +94,24 @@ fn literal_area(
     sheet: usize,
     a: &RefExpr,
     b: &RefExpr,
+    dr: i64,
+    dc: i64,
 ) -> bool {
     if a.book.is_some()
         || b.book.is_some()
         || a.sheet2.is_some()
         || b.sheet2.is_some()
-        || a.row.min(b.row) < 0
-        || a.col.min(b.col) < 0
-        || a.row.max(b.row) >= 1_048_576
-        || a.col.max(b.col) >= 16_384
+    {
+        return false;
+    }
+    let ar = a.row + if a.row_abs { 0 } else { dr };
+    let ac = a.col + if a.col_abs { 0 } else { dc };
+    let br = b.row + if b.row_abs { 0 } else { dr };
+    let bc = b.col + if b.col_abs { 0 } else { dc };
+    if ar.min(br) < 0
+        || ac.min(bc) < 0
+        || ar.max(br) >= 1_048_576
+        || ac.max(bc) >= 16_384
     {
         return false;
     }
@@ -109,8 +127,8 @@ fn literal_area(
         },
         None => sheet,
     };
-    let (top, bottom) = (a.row.min(b.row) as u32, a.row.max(b.row) as u32);
-    let (left, right) = (a.col.min(b.col) as u32, a.col.max(b.col) as u32);
+    let (top, bottom) = (ar.min(br) as u32, ar.max(br) as u32);
+    let (left, right) = (ac.min(bc) as u32, ac.max(bc) as u32);
     // Larger ranges are handled by dependency_batch + SharedCalcCaches.
     u64::from(bottom - top + 1) * u64::from(right - left + 1) <= 16
         && (top..=bottom).all(|r| {
@@ -123,55 +141,57 @@ fn independent(
     scope: Option<&HashSet<CellKey>>,
     sheet: usize,
     node: &Node,
+    dr: i64,
+    dc: i64,
 ) -> bool {
     match node {
         Node::Number(_) | Node::Text(_) | Node::Bool(_) | Node::Empty | Node::Err(_) => true,
-        Node::Ref(a) => literal_area(wb, scope, sheet, a, a),
-        Node::Range(a, b) => literal_area(wb, scope, sheet, a, b),
-        Node::Unary(_, v) | Node::Percent(v) => independent(wb, scope, sheet, v),
+        Node::Ref(a) => literal_area(wb, scope, sheet, a, a, dr, dc),
+        Node::Range(a, b) => literal_area(wb, scope, sheet, a, b, dr, dc),
+        Node::Unary(_, v) | Node::Percent(v) => independent(wb, scope, sheet, v, dr, dc),
         Node::Binary(_, a, b) => {
-            independent(wb, scope, sheet, a) && independent(wb, scope, sheet, b)
+            independent(wb, scope, sheet, a, dr, dc) && independent(wb, scope, sheet, b, dr, dc)
         }
         Node::Func(name, args)
             if matches!(
-                name.as_str(),
-                "IF"
-                    | "IFERROR"
-                    | "IFNA"
-                    | "ABS"
-                    | "ROUND"
-                    | "ROUNDUP"
-                    | "ROUNDDOWN"
-                    | "INT"
-                    | "MOD"
-                    | "TRUNC"
-                    | "SIGN"
-                    | "SQRT"
-                    | "POWER"
-                    | "EXP"
-                    | "LN"
-                    | "LOG10"
-                    | "CEILING"
-                    | "FLOOR"
-                    | "AND"
-                    | "OR"
-                    | "NOT"
-                    | "LEN"
-                    | "LOWER"
-                    | "UPPER"
-                    | "TRIM"
-                    | "LEFT"
-                    | "RIGHT"
-                    | "MID"
-                    | "SUM"
-                    | "MIN"
-                    | "MAX"
-                    | "AVERAGE"
-                    | "COUNT"
-                    | "COUNTA"
+                name.id(),
+                FuncId::If
+                    | FuncId::IfError
+                    | FuncId::IfNa
+                    | FuncId::Abs
+                    | FuncId::Round
+                    | FuncId::RoundUp
+                    | FuncId::RoundDown
+                    | FuncId::Int
+                    | FuncId::Mod
+                    | FuncId::Trunc
+                    | FuncId::Sign
+                    | FuncId::Sqrt
+                    | FuncId::Power
+                    | FuncId::Exp
+                    | FuncId::Ln
+                    | FuncId::Log10
+                    | FuncId::Ceiling
+                    | FuncId::Floor
+                    | FuncId::And
+                    | FuncId::Or
+                    | FuncId::Not
+                    | FuncId::Len
+                    | FuncId::Lower
+                    | FuncId::Upper
+                    | FuncId::Trim
+                    | FuncId::Left
+                    | FuncId::Right
+                    | FuncId::Mid
+                    | FuncId::Sum
+                    | FuncId::Min
+                    | FuncId::Max
+                    | FuncId::Average
+                    | FuncId::Count
+                    | FuncId::CountA
             ) =>
         {
-            args.iter().all(|v| independent(wb, scope, sheet, v))
+            args.iter().all(|v| independent(wb, scope, sheet, v, dr, dc))
         }
         _ => false,
     }
@@ -185,31 +205,49 @@ fn evaluate_cell<'a>(
     (sheet, row, col): CellKey,
     worker: &mut Option<Calc<'a>>,
 ) -> Option<FValue> {
-    let formula = wb.sheet(sheet).get(row, col)?.formula.as_deref()?;
-    let source = formula.strip_prefix('=').unwrap_or(formula);
-    if let Some(template) = super::compiled::scalar_at(source, row, col) {
-        let result = template.evaluate(|r, c| match wb.sheet(sheet).get(r, c) {
-            Some(_) if !cell_has_cached_scalar(wb, scope, sheet, r, c) => None,
-            Some(cell) => Some(super::to_fvalue(&cell.value)),
-            None => Some(FValue::Empty),
-        })?;
-        return Some(result);
-    }
-    super::compiled::with_node(source, row, col, |node| {
-        if let Some(value) = numeric_binary(wb, scope, sheet, node) {
-            return Some(value.map_or_else(FValue::Error, FValue::Number));
+    let formula_arc = wb.sheet(sheet).get(row, col)?.formula.as_ref()?;
+    super::compiled::with_eval_arc(formula_arc, row, col, |node, dr, dc, kind| match kind {
+        super::compiled::ScalarKind::SameSheet => {
+            super::compiled::eval_projected_scalar(node, dr, dc, &mut |_, r, c| {
+                match wb.sheet(sheet).get(r, c) {
+                    Some(_) if !cell_has_cached_scalar(wb, scope, sheet, r, c) => None,
+                    Some(cell) => Some(super::to_fvalue(&cell.value)),
+                    None => Some(FValue::Empty),
+                }
+            })
         }
-        if !independent(wb, scope, sheet, node) {
-            return None;
+        super::compiled::ScalarKind::CrossSheet => {
+            super::compiled::eval_projected_scalar(node, dr, dc, &mut |sh_opt, r, c| {
+                let target_si = match sh_opt {
+                    Some(name) => wb
+                        .sheets
+                        .iter()
+                        .position(|s| s.name.eq_ignore_ascii_case(name))?,
+                    None => sheet,
+                };
+                match wb.sheet(target_si).get(r, c) {
+                    Some(_) if !cell_has_cached_scalar(wb, scope, target_si, r, c) => None,
+                    Some(cell) => Some(super::to_fvalue(&cell.value)),
+                    None => Some(FValue::Empty),
+                }
+            })
         }
-        let calc = worker.get_or_insert_with(|| Calc::new_worker(wb, ctx, scope, shared));
-        calc.cur = (row, col);
-        calc.cur_sheet = sheet;
-        let value = calc.eval_node(node, sheet);
-        if matches!(value, FValue::Array(_) | FValue::Lambda(_)) {
-            return None;
+        super::compiled::ScalarKind::None => {
+            if let Some(value) = numeric_binary(wb, scope, sheet, node, dr, dc) {
+                return Some(value.map_or_else(FValue::Error, FValue::Number));
+            }
+            if !independent(wb, scope, sheet, node, dr, dc) {
+                return None;
+            }
+            let calc = worker.get_or_insert_with(|| Calc::new_worker(wb, ctx, scope, shared));
+            calc.cur = (row, col);
+            calc.cur_sheet = sheet;
+            let value = calc.eval_node_shifted(node, sheet, dr, dc);
+            if matches!(value, FValue::Array(_) | FValue::Lambda(_)) {
+                return None;
+            }
+            Some(value)
         }
-        Some(value)
     })
     .ok()
     .flatten()
@@ -247,16 +285,12 @@ pub(super) fn evaluate_in<'a>(
     cancel: Option<&AtomicBool>,
     done: Option<&AtomicUsize>,
 ) -> Option<Batch> {
-    const MIN_PER_WORKER: usize = 4_096;
+    const MIN_PER_WORKER: usize = 2_048;
     const CHUNK: usize = 512;
     if keys.len() < MIN_PER_WORKER * 2 {
         return None;
     }
-    let workers = std::thread::available_parallelism()
-        .ok()?
-        .get()
-        .min(32)
-        .min(keys.len() / MIN_PER_WORKER);
+    let workers = pool::max_workers().min(keys.len() / MIN_PER_WORKER);
     if workers < 2 {
         return None;
     }
@@ -275,46 +309,38 @@ pub(super) fn evaluate_in<'a>(
     let num_chunks = keys.len().div_ceil(CHUNK);
     let next_chunk = AtomicUsize::new(0);
     let aborted = AtomicBool::new(false);
-    let chunk_outputs: Vec<std::sync::Mutex<Vec<Option<FValue>>>> =
-        (0..num_chunks).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let chunk_outputs: Vec<std::sync::Mutex<Vec<Option<FValue>>>> = (0..num_chunks)
+        .map(|_| std::sync::Mutex::new(Vec::new()))
+        .collect();
 
-    std::thread::scope(|pool| {
-        for _ in 0..workers {
-            let next_chunk = &next_chunk;
-            let aborted = &aborted;
-            let chunk_outputs = &chunk_outputs;
-            pool.spawn(move || {
-                let mut worker = None;
-                loop {
-                    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                        aborted.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    let ci = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    if ci >= num_chunks {
-                        return;
-                    }
-                    let start = ci * CHUNK;
-                    let end = (start + CHUNK).min(keys.len());
-                    let mut vals = Vec::with_capacity(end - start);
-                    let mut completed = 0usize;
-                    for (idx, &key) in keys[start..end].iter().enumerate() {
-                        if idx % 256 == 0
-                            && cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
-                        {
-                            aborted.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                        let v = evaluate_cell(wb, scope, shared, ctx, key, &mut worker);
-                        completed += usize::from(v.is_some());
-                        vals.push(v);
-                    }
-                    if let Some(done) = done {
-                        done.fetch_add(completed, Ordering::Relaxed);
-                    }
-                    *chunk_outputs[ci].lock().unwrap() = vals;
+    pool::run_parallel(workers, |_| {
+        let mut worker = None;
+        loop {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                aborted.store(true, Ordering::Relaxed);
+                return;
+            }
+            let ci = next_chunk.fetch_add(1, Ordering::Relaxed);
+            if ci >= num_chunks {
+                return;
+            }
+            let start = ci * CHUNK;
+            let end = (start + CHUNK).min(keys.len());
+            let mut vals = Vec::with_capacity(end - start);
+            let mut completed = 0usize;
+            for (idx, &key) in keys[start..end].iter().enumerate() {
+                if idx % 256 == 0 && cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    aborted.store(true, Ordering::Relaxed);
+                    return;
                 }
-            });
+                let v = evaluate_cell(wb, scope, shared, ctx, key, &mut worker);
+                completed += usize::from(v.is_some());
+                vals.push(v);
+            }
+            if let Some(done) = done {
+                done.fetch_add(completed, Ordering::Relaxed);
+            }
+            *chunk_outputs[ci].lock().unwrap() = vals;
         }
     });
 
@@ -356,7 +382,7 @@ mod tests {
     ) -> Option<Result<f64, crate::formula::ErrKind>> {
         let src = wb.sheet(sheet).get(row, col)?.formula.as_deref()?;
         let node = super::super::compile_at(src.trim_start_matches('='), row, col).ok()?;
-        numeric_binary(wb, None, sheet, &node)
+        numeric_binary(wb, None, sheet, &node, 0, 0)
     }
 
     #[test]
