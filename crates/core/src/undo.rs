@@ -272,6 +272,16 @@ pub struct Applied {
     pub merge_changes: Vec<(usize, (u32, u32, u32, u32), bool)>,
     /// 合并结构与当前表冲突，整个动作（含 CellDelta）未应用
     pub merge_conflict: bool,
+    /// Exact changed cell count when offline CoW fast-swap caps `touched` to a 2,001-cell sentinel.
+    total_touched: usize,
+}
+
+impl Applied {
+    /// Total number of cells changed by this undo/redo step (exact even when `touched` is capped in offline CoW fast-swap).
+    #[inline]
+    pub fn touched_count(&self) -> usize {
+        self.total_touched.max(self.touched.len())
+    }
 }
 
 const HISTORY_PAYLOAD_BUDGET: usize = 256 * 1024 * 1024;
@@ -779,6 +789,7 @@ impl CowBatchAction {
 
     fn apply(
         &mut self,
+        site: u32,
         stamp: &mut EntryStamp,
         sheets: &mut [Sheet],
         redo: bool,
@@ -795,6 +806,7 @@ impl CowBatchAction {
             refresh_sizes: None,
             merge_changes: Vec::new(),
             merge_conflict: false,
+            total_touched: 0,
         };
         let Some(sheet) = sheets.get(self.sheet) else {
             applied.skipped = self.all_mask.len().saturating_sub(self.excluded.len());
@@ -832,6 +844,92 @@ impl CowBatchAction {
                 &self.before_col_styles,
             )
         };
+
+        // True O(1) CoW snapshot swap in offline single-user mode (`site == 0 && self.by_site == 0`)
+        // when neither cells nor styles have diverged since the snapshot was recorded.
+        let offline_untouched = site == 0
+            && self.by_site == 0
+            && self.from_snapshots
+            && self.excluded.is_empty()
+            && self.row_style_deltas.is_empty()
+            && self.col_style_deltas.is_empty()
+            && (self.cell_mask.is_empty() || sheet.cells().version == exp_cells.version)
+            && (self.style_mask.is_empty()
+                || (sheet.styles.version == exp_styles.version
+                    && sheet.row_styles == *exp_row_styles
+                    && sheet.col_styles == *exp_col_styles));
+        if offline_untouched {
+            if let Some(merge_edit) = &self.merges {
+                let Some(changes) = merge_edit.apply(sheets, redo) else {
+                    applied.merge_conflict = true;
+                    return (applied, true);
+                };
+                applied.merge_changes = changes;
+            }
+            let Some(sheet) = sheets.get_mut(self.sheet) else {
+                return (applied, false);
+            };
+            if !self.cell_mask.is_empty() {
+                *sheet.cells_mut() = tgt_cells.clone();
+                let had_cleared = !sheet.cleared.is_empty();
+                for (&(pi, col), &change_mask) in self.cell_mask.page_masks() {
+                    let tgt_mask = tgt_cells
+                        .page(pi)
+                        .and_then(|p| p.cols.get(col))
+                        .map_or([0; 4], |s| s.row_mask());
+                    let vac = [
+                        change_mask[0] & !tgt_mask[0],
+                        change_mask[1] & !tgt_mask[1],
+                        change_mask[2] & !tgt_mask[2],
+                        change_mask[3] & !tgt_mask[3],
+                    ];
+                    if vac != [0; 4] {
+                        sheet.cleared.or_page_mask(pi, col, vac);
+                    }
+                    if had_cleared {
+                        let occ = [
+                            change_mask[0] & tgt_mask[0],
+                            change_mask[1] & tgt_mask[1],
+                            change_mask[2] & tgt_mask[2],
+                            change_mask[3] & tgt_mask[3],
+                        ];
+                        if occ != [0; 4] {
+                            sheet.cleared.clear_page_mask(pi, col, occ);
+                        }
+                    }
+                }
+                if !sheet.loading {
+                    sheet.edited = true;
+                }
+            }
+            if !self.style_mask.is_empty() {
+                sheet.styles = tgt_styles.clone();
+                sheet.style_edits.union_from(&self.style_mask);
+                sheet.bump_display_style_revision();
+                if !sheet.loading {
+                    sheet.edited = true;
+                    sheet.styles_dirty = true;
+                }
+                let scap = self.style_mask.len().min(2_001);
+                applied.style_changes = Vec::with_capacity(scap);
+                for k in self.style_mask.iter().take(2_001) {
+                    applied.style_changes.push((self.sheet, k.row, k.col));
+                }
+            }
+            let total = self.all_mask.len();
+            applied.total_touched = total;
+            let cap = total.min(2_001);
+            applied.touched = Vec::with_capacity(cap);
+            for k in self.all_mask.iter().take(2_001) {
+                applied.touched.push((self.sheet, k.row, k.col));
+            }
+            applied.refresh_sizes = self
+                .refresh_sizes
+                .clone()
+                .map(|(b, a)| if redo { a } else { b });
+            return (applied, true);
+        }
+
         let blank = Cell::default();
         // 1) Validate per-cell changes before mutating inherited row/col styles or merges.
         let mut accepted: Vec<(CellRef, bool, bool)> =
@@ -970,6 +1068,33 @@ impl CowBatchAction {
 
         if can_fast_cells {
             *sheet.cells_mut() = tgt_cells.clone();
+            let had_cleared = !sheet.cleared.is_empty();
+            for (&(pi, col), &change_mask) in self.cell_mask.page_masks() {
+                let tgt_mask = tgt_cells
+                    .page(pi)
+                    .and_then(|p| p.cols.get(col))
+                    .map_or([0; 4], |s| s.row_mask());
+                let vac = [
+                    change_mask[0] & !tgt_mask[0],
+                    change_mask[1] & !tgt_mask[1],
+                    change_mask[2] & !tgt_mask[2],
+                    change_mask[3] & !tgt_mask[3],
+                ];
+                if vac != [0; 4] {
+                    sheet.cleared.or_page_mask(pi, col, vac);
+                }
+                if had_cleared {
+                    let occ = [
+                        change_mask[0] & tgt_mask[0],
+                        change_mask[1] & tgt_mask[1],
+                        change_mask[2] & tgt_mask[2],
+                        change_mask[3] & tgt_mask[3],
+                    ];
+                    if occ != [0; 4] {
+                        sheet.cleared.clear_page_mask(pi, col, occ);
+                    }
+                }
+            }
             if !sheet.loading {
                 sheet.edited = true;
             }
@@ -985,14 +1110,8 @@ impl CowBatchAction {
         }
 
         for (k, has_cell, has_style) in accepted {
-            if has_cell {
-                if can_fast_cells {
-                    if tgt_cells.get(k.row, k.col).is_none() {
-                        sheet.cleared.insert(k);
-                    } else {
-                        sheet.cleared.remove_if_present(&k);
-                    }
-                } else if let Some(tgt) = tgt_cells.get(k.row, k.col) {
+            if has_cell && !can_fast_cells {
+                if let Some(tgt) = tgt_cells.get(k.row, k.col) {
                     sheet.set(k.row, k.col, tgt.into_owned());
                 } else {
                     sheet.remove(k.row, k.col);
@@ -1013,10 +1132,12 @@ impl CowBatchAction {
             }
             applied.touched.push((self.sheet, k.row, k.col));
         }
+        applied.total_touched = applied.touched.len();
 
         if axis_replayed {
             applied.touched.sort_unstable();
             applied.touched.dedup();
+            applied.total_touched = applied.touched.len();
             applied.style_changes.sort_unstable();
             applied.style_changes.dedup();
         }
@@ -1059,6 +1180,7 @@ impl NumericSortAction {
         let mut applied = Applied {
             touched: Vec::new(), style_changes: Vec::new(), label: self.label.clone(), focus: self.focus,
             skipped: 0, structural: false, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false,
+            total_touched: 0,
         };
         if let Some(sheet) = sheets.get_mut(self.sort.sheet()) {
             let mut apply = |d: CellDelta| {
@@ -1075,6 +1197,7 @@ impl NumericSortAction {
             if redo { self.sort.deltas().for_each(&mut apply); }
             else { self.sort.deltas().rev().for_each(apply); }
         }
+        applied.total_touched = applied.touched.len();
         stamp.payload_bytes += (self.excluded.capacity() - previous_capacity) * (size_of::<(u32,u32)>() + 1);
         applied
     }
@@ -1122,6 +1245,7 @@ impl SheetTabAction {
         Some(Applied {
             touched: Vec::new(), label: self.label.clone(), focus, skipped: 0,
             structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false,
+            total_touched: 0,
         })
     }
 }
@@ -1367,10 +1491,10 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
         .diff_both_sides(target.cells(), snap.sheet, &mut cleared, &mut touched);
     target.cleared = cleared;
     target.style_edits.union_from(&current.style_edits);
-    for k in current.styles.changed_keys(&target.styles).chain(target.styles.changed_keys(&current.styles)) {
-        touched.push((snap.sheet, k.row, k.col));
-        target.style_edits.insert(k);
-    }
+    let mut style_diff = crate::model::CellJournal::default();
+    current.styles.diff_into_journal(&target.styles, &mut style_diff);
+    target.style_edits.union_from(&style_diff);
+    touched.extend(style_diff.iter().map(|k| (snap.sheet, k.row, k.col)));
     if current.row_styles != target.row_styles {
         let mut changed_rows: Vec<u32> = current
             .row_styles
@@ -1835,7 +1959,8 @@ impl UndoStack {
         let Entry::Structure(_, action) = self.done.last()? else { unreachable!() };
         let (before, after) = action.history.snapshots()?;
         let touched = restore_structure(wb, before, after)?;
-        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false };
+        let total_touched = touched.len();
+        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false, total_touched };
         self.undone.push(self.done.pop()?);
         Some(applied)
     }
@@ -1852,7 +1977,8 @@ impl UndoStack {
         let Entry::Structure(_, action) = self.undone.last()? else { unreachable!() };
         let (before, after) = action.history.snapshots()?;
         let touched = restore_structure(wb, after, before)?;
-        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false };
+        let total_touched = touched.len();
+        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false, total_touched };
         self.done.push(self.undone.pop()?);
         Some(applied)
     }
@@ -1874,6 +2000,7 @@ impl UndoStack {
         {
             return None;
         }
+        let site = self.site;
         if let Some(Entry::NumericSort(stamp, action)) = self.done.last_mut() {
             let applied = action.apply(stamp, sheets, false, guard);
             let entry = self.done.pop()?;
@@ -1881,7 +2008,7 @@ impl UndoStack {
             return Some(applied);
         }
         if let Some(Entry::CowBatch(stamp, action)) = self.done.last_mut() {
-            let (applied, keep) = action.apply(stamp, sheets, false, guard);
+            let (applied, keep) = action.apply(site, stamp, sheets, false, guard);
             if applied.merge_conflict {
                 return Some(applied);
             }
@@ -1908,6 +2035,7 @@ impl UndoStack {
                 refresh_sizes: None,
                 style_changes, merge_changes,
                 merge_conflict: false,
+                total_touched: 0,
             };
             self.undone.push(Entry::Cells(id, action, permutation));
             return Some(applied);
@@ -1926,6 +2054,7 @@ impl UndoStack {
                 refresh_sizes: None,
                 style_changes, merge_changes,
                 merge_conflict: false,
+                total_touched: 0,
             };
             self.undone.push(Entry::Cells(id, action, permutation));
             return Some(applied);
@@ -1939,13 +2068,14 @@ impl UndoStack {
             let label = action.label.clone();
             let focus = action.focus;
             self.done.push(Entry::Cells(id, action, permutation));
-            return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true });
+            return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true, total_touched: 0 });
         }
         if let Some(snap) = action.snap_before.clone() {
             if let Some(sheet) = sheets.get_mut(snap.sheet) {
                 restore_sheet(sheet, &snap);
             }
             touched.extend(snap.cells.iter().map(|(r, c, _, _)| (snap.sheet, *r, *c)));
+            let total_touched = touched.len();
             let applied = Applied {
                 touched,
                 label: action.label.clone(),
@@ -1955,6 +2085,7 @@ impl UndoStack {
                 refresh_sizes: action.refresh_sizes.clone().map(|(b, _)| b),
                 style_changes, merge_changes,
                 merge_conflict: false,
+                total_touched,
             };
             self.undone.push(Entry::Cells(id, action, permutation));
             return Some(applied);
@@ -1975,6 +2106,7 @@ impl UndoStack {
             action.deltas.retain(|_| { let keep = !excluded.contains(&i); i += 1; keep });
             permutation = None;
         }
+        let total_touched = touched.len();
         let applied = Applied {
             touched,
             label: action.label.clone(),
@@ -1984,6 +2116,7 @@ impl UndoStack {
             refresh_sizes: action.refresh_sizes.clone().map(|(b, _)| b),
             style_changes, merge_changes,
             merge_conflict: false,
+            total_touched,
         };
         if !action.is_empty() { self.undone.push(Entry::Cells(id, action, permutation)); }
         Some(applied)
@@ -2005,6 +2138,7 @@ impl UndoStack {
         {
             return None;
         }
+        let site = self.site;
         if let Some(Entry::NumericSort(stamp, action)) = self.undone.last_mut() {
             let applied = action.apply(stamp, sheets, true, guard);
             let entry = self.undone.pop()?;
@@ -2012,7 +2146,7 @@ impl UndoStack {
             return Some(applied);
         }
         if let Some(Entry::CowBatch(stamp, action)) = self.undone.last_mut() {
-            let (applied, keep) = action.apply(stamp, sheets, true, guard);
+            let (applied, keep) = action.apply(site, stamp, sheets, true, guard);
             if applied.merge_conflict {
                 return Some(applied);
             }
@@ -2039,6 +2173,7 @@ impl UndoStack {
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
                 style_changes, merge_changes,
                 merge_conflict: false,
+                total_touched: 0,
             };
             self.done.push(Entry::Cells(id, action, permutation));
             return Some(applied);
@@ -2057,6 +2192,7 @@ impl UndoStack {
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
                 style_changes, merge_changes,
                 merge_conflict: false,
+                total_touched: 0,
             };
             self.done.push(Entry::Cells(id, action, permutation));
             return Some(applied);
@@ -2070,13 +2206,14 @@ impl UndoStack {
             let label = action.label.clone();
             let focus = action.focus;
             self.undone.push(Entry::Cells(id, action, permutation));
-            return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true });
+            return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true, total_touched: 0 });
         }
         if let Some(snap) = action.snap_after.clone() {
             if let Some(sheet) = sheets.get_mut(snap.sheet) {
                 restore_sheet(sheet, &snap);
             }
             touched.extend(snap.cells.iter().map(|(r, c, _, _)| (snap.sheet, *r, *c)));
+            let total_touched = touched.len();
             let applied = Applied {
                 touched,
                 label: action.label.clone(),
@@ -2086,6 +2223,7 @@ impl UndoStack {
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
                 style_changes, merge_changes,
                 merge_conflict: false,
+                total_touched,
             };
             self.done.push(Entry::Cells(id, action, permutation));
             return Some(applied);
@@ -2106,6 +2244,7 @@ impl UndoStack {
             action.deltas.retain(|_| { let keep = !excluded.contains(&i); i += 1; keep });
             permutation = None;
         }
+        let total_touched = touched.len();
         let applied = Applied {
             touched,
             label: action.label.clone(),
@@ -2115,6 +2254,7 @@ impl UndoStack {
             refresh_sizes: action.refresh_sizes.clone().map(|(_, after)| after),
             style_changes, merge_changes,
             merge_conflict: false,
+            total_touched,
         };
         if !action.is_empty() { self.done.push(Entry::Cells(id, action, permutation)); }
         Some(applied)
@@ -2362,21 +2502,103 @@ mod tests {
         assert!(st.can_undo());
 
         let base_len = before.len();
+        let t_undo = std::time::Instant::now();
         let undone = st.undo(&mut wb.sheets, |_, _, _, _| true).unwrap();
+        let undo_ms = t_undo.elapsed().as_secs_f64() * 1000.0;
         assert!(!undone.merge_conflict);
-        assert_eq!(undone.touched.len(), 520_000);
+        assert_eq!(undone.touched_count(), 520_000);
+        assert!(undone.touched.len() > 2_000);
+        assert!(undo_ms < 25.0, "520k CoW undo must be O(1) fast swap, took {undo_ms:.2} ms");
         assert_eq!(wb.sheets[0].len(), base_len);
         assert!(wb.sheets[0].styles.is_empty());
         assert!(wb.sheets[0].merges.is_empty());
         assert_eq!(wb.sheets[0].get(500, 20).unwrap().value, crate::model::Value::Number(500.0));
 
+        let t_redo = std::time::Instant::now();
         let redone = st.redo(&mut wb.sheets, |_, _, _, _| true).unwrap();
+        let redo_ms = t_redo.elapsed().as_secs_f64() * 1000.0;
         assert!(!redone.merge_conflict);
-        assert_eq!(redone.touched.len(), 520_000);
+        assert_eq!(redone.touched_count(), 520_000);
+        assert!(redone.touched.len() > 2_000);
+        assert!(redo_ms < 25.0, "520k CoW redo must be O(1) fast swap, took {redo_ms:.2} ms");
         assert_eq!(wb.sheets[0].len(), 520_000 + 1024);
         assert_eq!(wb.sheets[0].style_of(12_345, 3), 5);
         assert!(wb.sheets[0].styles.uniform_page_count() >= 2000);
         assert_eq!(wb.sheets[0].merges.as_slice(), &[(0, 10, 1, 11)]);
+    }
+
+    #[test]
+    fn delete_row_intervals_wb_integrates_with_structural_undo_redo_and_compaction() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "数据".into();
+        for r in 0..40u32 {
+            wb.sheets[0].set(
+                r,
+                0,
+                Cell {
+                    value: crate::model::Value::Number((r + 1) as f64),
+                    formula: None,
+                },
+            );
+            wb.sheets[0].set(
+                r,
+                1,
+                Cell {
+                    value: crate::model::Value::Number(0.0),
+                    formula: Some(format!("=A{}+SUM($A$2:$A$35)", r + 1).into()),
+                },
+            );
+            if r % 2 == 0 {
+                wb.sheets[0].set_style(r, 0, 3);
+            }
+        }
+        wb.sheets[0].hidden_rows = vec![(4, 6), (12, 15)].into();
+        let mut summary = Sheet::new("汇总");
+        summary.set(
+            0,
+            0,
+            Cell {
+                value: crate::model::Value::Number(0.0),
+                formula: Some("=SUM(数据!A2:A36)+数据!A18".into()),
+            },
+        );
+        wb.sheets.push(summary);
+        let original = wb.clone();
+
+        let intervals = wb.sheets[0].visible_row_intervals(2, 18);
+        assert_eq!(intervals, vec![(2, 3), (7, 11), (16, 18)]);
+        let min_at = intervals[0].0;
+        let total_deleted: u32 = intervals.iter().map(|&(a, b)| b - a + 1).sum();
+        let op = crate::structural::Structural::DeleteRows {
+            at: min_at,
+            n: total_deleted,
+        };
+        let before = snapshot_structure(&wb, 0, &op);
+        crate::structural::delete_row_intervals_wb(&mut wb, 0, &intervals);
+        let after = before.capture_after(&wb);
+        let expected_after = wb.clone();
+
+        let mut stack = UndoStack::new();
+        stack.push_structure("删除可见行", before, after, (0, min_at, 0));
+
+        let undone = stack.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+        assert!(undone.structural);
+        for r in 0..40u32 {
+            assert_eq!(wb.sheets[0].get(r, 0), original.sheets[0].get(r, 0));
+            assert_eq!(wb.sheets[0].get(r, 1), original.sheets[0].get(r, 1));
+            assert_eq!(wb.sheets[0].style_of(r, 0), original.sheets[0].style_of(r, 0));
+        }
+        assert_eq!(wb.sheets[0].hidden_rows.intervals(), original.sheets[0].hidden_rows.intervals());
+        assert_eq!(wb.sheets[1].get(0, 0), original.sheets[1].get(0, 0));
+
+        let redone = stack.redo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+        assert!(redone.structural);
+        for r in 0..40u32 {
+            assert_eq!(wb.sheets[0].get(r, 0), expected_after.sheets[0].get(r, 0));
+            assert_eq!(wb.sheets[0].get(r, 1), expected_after.sheets[0].get(r, 1));
+            assert_eq!(wb.sheets[0].style_of(r, 0), expected_after.sheets[0].style_of(r, 0));
+        }
+        assert_eq!(wb.sheets[1].get(0, 0), expected_after.sheets[1].get(0, 0));
     }
 }
 

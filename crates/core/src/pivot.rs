@@ -145,14 +145,130 @@ pub fn group_key(v: &Value, g: &GroupBy) -> String {
 /// 切片器用它列出可勾选项；exclude 里的项也照样返回（勾选状态由调用方决定）。
 pub fn row_values(sheet: &Sheet, spec: &PivotSpec) -> Vec<String> {
     let (r1, _, r2, _) = spec.source;
-    let mut labels = HashSet::new();
-    for r in (r1 + 1)..=r2 {
-        let raw = sheet.value_ref(r, spec.row_field);
-        let key = group_key(raw.as_ref(), &spec.group);
-        if key.is_empty() {
+    let first = r1.saturating_add(1);
+    if first > r2 {
+        return Vec::new();
+    }
+    let mut labels: crate::sort_filter::FxHashSet<String> = Default::default();
+    let mut seen_ptrs: crate::sort_filter::FxHashSet<usize> = Default::default();
+    let mut seen_nums: crate::sort_filter::FxHashSet<u64> = Default::default();
+    let p1 = first / crate::store::PAGE_ROWS;
+    let p2 = r2 / crate::store::PAGE_ROWS;
+    for (pi, page) in sheet.cells().iter_pages_in(p1, p2) {
+        let Some(slab) = page.cols.get(spec.row_field) else {
+            continue;
+        };
+        let base = pi * crate::store::PAGE_ROWS;
+        let start = first.saturating_sub(base) as usize;
+        let end = ((r2 - base).min(crate::store::PAGE_ROWS - 1) as usize + 1).min(slab.len());
+        if start >= end {
             continue;
         }
-        labels.insert(key);
+        let hi = end - 1;
+        let start_w = start / 64;
+        let end_w = hi / 64;
+        let mut add_val = |v: &Value| {
+            match v {
+                Value::Empty => {}
+                Value::Text(s) => {
+                    if seen_ptrs.insert(s.as_ptr() as usize) {
+                        let key = group_key(v, &spec.group);
+                        if !key.is_empty() {
+                            labels.insert(key);
+                        }
+                    }
+                }
+                Value::Number(n) => {
+                    let nb = if *n == 0.0 { 0u64 } else { n.to_bits() };
+                    if seen_nums.insert(nb) {
+                        let key = group_key(v, &spec.group);
+                        if !key.is_empty() {
+                            labels.insert(key);
+                        }
+                    }
+                }
+                _ => {
+                    let key = group_key(v, &spec.group);
+                    if !key.is_empty() {
+                        labels.insert(key);
+                    }
+                }
+            }
+        };
+        match slab.as_ref() {
+            crate::store::ColSlab::Numbers(ns) => {
+                for w in start_w..=end_w {
+                    let mut bits = ns.present[w];
+                    if w == start_w {
+                        bits &= !0u64 << (start % 64);
+                    }
+                    if w == end_w && (hi % 64) < 63 {
+                        bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                    }
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let n = ns.values[w * 64 + tz];
+                        let nb = if n == 0.0 { 0u64 } else { n.to_bits() };
+                        if seen_nums.insert(nb) {
+                            let key = group_key(&Value::Number(n), &spec.group);
+                            if !key.is_empty() {
+                                labels.insert(key);
+                            }
+                        }
+                    }
+                }
+            }
+            crate::store::ColSlab::Values(vs) => {
+                if let Some((codes, dict)) = vs.dict_text() {
+                    let mut page_codes = [false; 129];
+                    for &code in &codes[start..end] {
+                        page_codes[code as usize] = true;
+                    }
+                    for (code, seen) in page_codes.iter().enumerate().take(dict.len()).skip(1) {
+                        if *seen {
+                            add_val(&dict[code]);
+                        }
+                    }
+                } else {
+                    for w in start_w..=end_w {
+                        let mut bits = vs.present[w];
+                        if w == start_w {
+                            bits &= !0u64 << (start % 64);
+                        }
+                        if w == end_w && (hi % 64) < 63 {
+                            bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                        }
+                        while bits != 0 {
+                            let tz = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            if let Some(v) = vs.get_val(w * 64 + tz) {
+                                add_val(v);
+                            }
+                        }
+                    }
+                }
+            }
+            crate::store::ColSlab::Mixed(cs) => {
+                let pm = cs.row_mask();
+                for w in start_w..=end_w {
+                    let mut bits = pm[w];
+                    if w == start_w {
+                        bits &= !0u64 << (start % 64);
+                    }
+                    if w == end_w && (hi % 64) < 63 {
+                        bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                    }
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        if let Some(cell) = cs.get_cell(w * 64 + tz) {
+                            add_val(&cell.value);
+                        }
+                    }
+                }
+            }
+        }
     }
     let mut out: Vec<_> = labels.into_iter().collect();
     out.sort_unstable();
@@ -241,11 +357,15 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
     let col_name = spec.col_field.map(&header);
     let value_caption = format!("{}:{}", agg_prefix(spec.agg), value_name);
 
-    // 流式聚合：按源表出现顺序用 O(1) HashMap 索引 (row_id, col_id) -> PivotAcc
+    // 流式聚合：按 256 行页直接读取列块，并对重复字符串/数值缓存 group_key 结果，避免百万行逐行 String 分配
     let mut row_order: Vec<String> = Vec::new();
-    let mut row_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut row_map: crate::sort_filter::FxHashMap<String, usize> = Default::default();
+    let mut row_ptr_cache: crate::sort_filter::FxHashMap<usize, Option<usize>> = Default::default();
+    let mut row_num_cache: crate::sort_filter::FxHashMap<u64, Option<usize>> = Default::default();
     let mut col_order: Vec<String> = Vec::new();
-    let mut col_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut col_map: crate::sort_filter::FxHashMap<String, usize> = Default::default();
+    let mut col_ptr_cache: crate::sort_filter::FxHashMap<usize, usize> = Default::default();
+    let mut col_num_cache: crate::sort_filter::FxHashMap<u64, usize> = Default::default();
     let mut cells: Vec<Vec<PivotAcc>> = Vec::new();
     let excluded: HashSet<&str> = spec.exclude.iter().map(String::as_str).collect();
 
@@ -254,55 +374,230 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
         col_order.push(value_name.clone());
     }
 
-    for r in (r1 + 1)..=r2 {
-        let raw = sheet.value_ref(r, spec.row_field);
-        let key = group_key(raw.as_ref(), &spec.group);
-        if key.is_empty() || excluded.contains(key.as_str()) {
-            continue;
-        }
-        let ci = match spec.col_field {
-            Some(cc) => {
-                let col_val = sheet.value_ref(r, cc);
-                if let Value::Text(t) = col_val.as_ref()
-                    && let Some(&idx) = col_map.get(t.as_ref())
-                {
-                    idx
-                } else {
-                    let ck = col_val.display();
-                    match col_map.get(&ck) {
-                        Some(&idx) => idx,
-                        None => {
-                            let idx = col_order.len();
-                            col_map.insert(ck.clone(), idx);
-                            col_order.push(ck);
-                            idx
+    let first = r1.saturating_add(1);
+    if first <= r2 {
+        let p1 = first / crate::store::PAGE_ROWS;
+        let p2 = r2 / crate::store::PAGE_ROWS;
+        let is_bucket = matches!(spec.group, GroupBy::Bucket(w) if w > 0.0);
+        let page_indices: Vec<u32> = if is_bucket {
+            (p1..=p2).collect()
+        } else {
+            sheet.cells().iter_pages_in(p1, p2).map(|(pi, _)| pi).collect()
+        };
+        for pi in page_indices {
+            let page_opt = sheet.cells().page(pi);
+            let Some(row_slab) = page_opt.and_then(|p| p.cols.get(spec.row_field)) else {
+                if !is_bucket {
+                    continue;
+                }
+                let base = pi * crate::store::PAGE_ROWS;
+                let lo = first.max(base);
+                let hi = r2.min(base + crate::store::PAGE_ROWS - 1);
+                for r in lo..=hi {
+                    let key = group_key(&Value::Empty, &spec.group);
+                    if key.is_empty() || excluded.contains(key.as_str()) {
+                        continue;
+                    }
+                    let ci = match spec.col_field {
+                        Some(cc) => {
+                            let cv = sheet.value_ref(r, cc);
+                            let ck = cv.display();
+                            *col_map.entry(ck.clone()).or_insert_with(|| {
+                                let idx = col_order.len();
+                                col_order.push(ck);
+                                idx
+                            })
+                        }
+                        None => 0,
+                    };
+                    let v = sheet.value_ref(r, spec.value_field);
+                    let (n, nonempty) = match v.as_ref() {
+                        Value::Number(n) => (Some(*n), true),
+                        Value::Empty => (None, false),
+                        Value::Text(t) => (t.trim().parse::<f64>().ok(), !t.is_empty()),
+                        other => (other.display().parse::<f64>().ok(), true),
+                    };
+                    let ri = *row_map.entry(key.clone()).or_insert_with(|| {
+                        let idx = row_order.len();
+                        row_order.push(key);
+                        cells.push(Vec::new());
+                        idx
+                    });
+                    if cells[ri].len() <= ci {
+                        cells[ri].resize(ci + 1, PivotAcc::default());
+                    }
+                    cells[ri][ci].push(n, nonempty, spec.agg);
+                }
+                continue;
+            };
+            let page = page_opt.unwrap();
+            let col_slab = spec.col_field.and_then(|cc| page.cols.get(cc));
+            let val_slab = page.cols.get(spec.value_field);
+            let base = pi * crate::store::PAGE_ROWS;
+            let lo = first.saturating_sub(base) as usize;
+            let hi_incl = (r2 - base).min(crate::store::PAGE_ROWS - 1) as usize;
+            let is_bucket = matches!(spec.group, GroupBy::Bucket(w) if w > 0.0);
+            for ro in lo..=hi_incl {
+                if !is_bucket && !row_slab.contains(ro as u32) {
+                    continue;
+                }
+                let ri_opt = match row_slab.as_ref() {
+                    crate::store::ColSlab::Numbers(ns) if ns.contains(ro as u32) => {
+                        let num = ns.values[ro];
+                        let nb = if num == 0.0 { 0u64 } else { num.to_bits() };
+                        if let Some(&cached) = row_num_cache.get(&nb) {
+                            cached
+                        } else {
+                            let key = group_key(&Value::Number(num), &spec.group);
+                            let res = if key.is_empty() || excluded.contains(key.as_str()) {
+                                None
+                            } else {
+                                Some(*row_map.entry(key.clone()).or_insert_with(|| {
+                                    let idx = row_order.len();
+                                    row_order.push(key);
+                                    cells.push(Vec::new());
+                                    idx
+                                }))
+                            };
+                            row_num_cache.insert(nb, res);
+                            res
                         }
                     }
+                    _ => {
+                        let rv = row_slab.value_ref(ro as u32);
+                        let raw_v = rv.as_deref().unwrap_or(&Value::Empty);
+                        match raw_v {
+                            Value::Text(s) => {
+                                let ptr = s.as_ptr() as usize;
+                                if let Some(&cached) = row_ptr_cache.get(&ptr) {
+                                    cached
+                                } else {
+                                    let key = group_key(raw_v, &spec.group);
+                                    let res = if key.is_empty() || excluded.contains(key.as_str()) {
+                                        None
+                                    } else {
+                                        Some(*row_map.entry(key.clone()).or_insert_with(|| {
+                                            let idx = row_order.len();
+                                            row_order.push(key);
+                                            cells.push(Vec::new());
+                                            idx
+                                        }))
+                                    };
+                                    row_ptr_cache.insert(ptr, res);
+                                    res
+                                }
+                            }
+                            Value::Number(num) => {
+                                let nb = if *num == 0.0 { 0u64 } else { num.to_bits() };
+                                if let Some(&cached) = row_num_cache.get(&nb) {
+                                    cached
+                                } else {
+                                    let key = group_key(raw_v, &spec.group);
+                                    let res = if key.is_empty() || excluded.contains(key.as_str()) {
+                                        None
+                                    } else {
+                                        Some(*row_map.entry(key.clone()).or_insert_with(|| {
+                                            let idx = row_order.len();
+                                            row_order.push(key);
+                                            cells.push(Vec::new());
+                                            idx
+                                        }))
+                                    };
+                                    row_num_cache.insert(nb, res);
+                                    res
+                                }
+                            }
+                            other => {
+                                let key = group_key(other, &spec.group);
+                                if key.is_empty() || excluded.contains(key.as_str()) {
+                                    None
+                                } else {
+                                    Some(*row_map.entry(key.clone()).or_insert_with(|| {
+                                        let idx = row_order.len();
+                                        row_order.push(key);
+                                        cells.push(Vec::new());
+                                        idx
+                                    }))
+                                }
+                            }
+                        }
+                    }
+                };
+                let Some(ri) = ri_opt else {
+                    continue;
+                };
+                let ci = match spec.col_field {
+                    Some(_) => {
+                        let cv = col_slab.and_then(|s| s.value_ref(ro as u32));
+                        match cv.as_deref().unwrap_or(&Value::Empty) {
+                            Value::Text(t) => {
+                                let ptr = t.as_ptr() as usize;
+                                if let Some(&idx) = col_ptr_cache.get(&ptr) {
+                                    idx
+                                } else {
+                                    let idx = match col_map.get(t.as_ref()) {
+                                        Some(&idx) => idx,
+                                        None => {
+                                            let idx = col_order.len();
+                                            let ck = t.to_string();
+                                            col_map.insert(ck.clone(), idx);
+                                            col_order.push(ck);
+                                            idx
+                                        }
+                                    };
+                                    col_ptr_cache.insert(ptr, idx);
+                                    idx
+                                }
+                            }
+                            Value::Number(num) => {
+                                let nb = if *num == 0.0 { 0u64 } else { num.to_bits() };
+                                if let Some(&idx) = col_num_cache.get(&nb) {
+                                    idx
+                                } else {
+                                    let ck = crate::model::format_number(*num);
+                                    let idx = *col_map.entry(ck.clone()).or_insert_with(|| {
+                                        let idx = col_order.len();
+                                        col_order.push(ck);
+                                        idx
+                                    });
+                                    col_num_cache.insert(nb, idx);
+                                    idx
+                                }
+                            }
+                            other => {
+                                let ck = other.display();
+                                *col_map.entry(ck.clone()).or_insert_with(|| {
+                                    let idx = col_order.len();
+                                    col_order.push(ck);
+                                    idx
+                                })
+                            }
+                        }
+                    }
+                    None => 0,
+                };
+                let (n, nonempty) = match val_slab.map(|s| s.as_ref()) {
+                    None => (None, false),
+                    Some(crate::store::ColSlab::Numbers(ns)) => match ns.get(ro as u32) {
+                        Some(v) => (Some(v), true),
+                        None => (None, false),
+                    },
+                    Some(other_slab) => match other_slab.value_ref(ro as u32) {
+                        None => (None, false),
+                        Some(v) => match v.as_ref() {
+                            Value::Number(n) => (Some(*n), true),
+                            Value::Empty => (None, false),
+                            Value::Text(t) => (t.trim().parse::<f64>().ok(), !t.is_empty()),
+                            other => (other.with_display_str(|s| s.parse::<f64>().ok()), true),
+                        },
+                    },
+                };
+                if cells[ri].len() <= ci {
+                    cells[ri].resize(ci + 1, PivotAcc::default());
                 }
+                cells[ri][ci].push(n, nonempty, spec.agg);
             }
-            None => 0,
-        };
-        let v = sheet.value_ref(r, spec.value_field);
-        let (n, nonempty) = match v.as_ref() {
-            Value::Number(n) => (Some(*n), true),
-            Value::Empty => (None, false),
-            Value::Text(t) => (t.trim().parse::<f64>().ok(), !t.is_empty()),
-            other => (other.display().parse::<f64>().ok(), true),
-        };
-        let ri = match row_map.get(&key) {
-            Some(&idx) => idx,
-            None => {
-                let idx = row_order.len();
-                row_map.insert(key.clone(), idx);
-                row_order.push(key);
-                cells.push(Vec::new());
-                idx
-            }
-        };
-        if cells[ri].len() <= ci {
-            cells[ri].resize(ci + 1, PivotAcc::default());
         }
-        cells[ri][ci].push(n, nonempty, spec.agg);
     }
 
     let n_cols = if row_order.is_empty() && spec.col_field.is_none() {
@@ -359,15 +654,6 @@ pub fn compute(sheet: &Sheet, spec: &PivotSpec) -> PivotResult {
         col_name,
         value_caption,
     }
-}
-
-/// 排序键：非 ASCII 文本按 GBK 编码比较（GB2312 一级汉字按拼音排列，与 Excel 中文排序一致）
-fn collate_key(s: &str) -> Vec<u8> {
-    if s.is_ascii() {
-        return s.as_bytes().to_vec();
-    }
-    let (bytes, _, _) = encoding_rs::GBK.encode(s);
-    bytes.into_owned()
 }
 
 /// Excel 值字段标题的前缀

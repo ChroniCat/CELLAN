@@ -401,10 +401,34 @@ pub fn format_value_in(
     crate::formula::with_date_system(sys, || format_value(v, fmt))
 }
 
+/// Fast stack-allocated ASCII integer formatter into `[u8; 24]`.
+#[inline]
+pub(crate) fn format_i64_into(v: i64, buf: &mut [u8; 24]) -> &str {
+    if v == 0 {
+        buf[23] = b'0';
+        return "0";
+    }
+    let neg = v < 0;
+    let mut u = v.unsigned_abs();
+    let mut pos = 24usize;
+    while u > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (u % 10) as u8;
+        u /= 10;
+    }
+    if neg {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    // SAFETY: only ASCII digits and '-' written into `buf[pos..24]`.
+    unsafe { std::str::from_utf8_unchecked(&buf[pos..24]) }
+}
+
 /// Excel「常规」在列宽放不下时的显示规则（实测 Excel 16.0）：
 /// 最多 11 个字符；整数 11 位以内原样、12 位起科学计数；小数按可用宽度
 /// 四舍五入并去掉尾零；有效位不足 3 位时改科学计数；科学计数尾零同样去掉。
 pub fn general_display(n: f64, cap: usize) -> String {
+    use std::fmt::Write;
     if n == 0.0 {
         return "0".into();
     }
@@ -415,36 +439,69 @@ pub fn general_display(n: f64, cap: usize) -> String {
     let neg = n < 0.0;
     let a = n.abs();
     let avail = cap.saturating_sub(usize::from(neg));
-    // 用 15 位有效数字定指数，避免 log10 在 1eN 边界上的浮点误差
-    let sci = format!("{a:.15e}");
-    let (mant, exp_s) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+
+    // Fast stack path for exact integers up to 11 digits (covers >80% of IDs/counts/amounts).
+    if a.fract() == 0.0 && a < 1e11 {
+        let mut ibuf = [0u8; 24];
+        let digits = format_i64_into(a as i64, &mut ibuf);
+        if digits.len() <= 11.min(avail) {
+            if neg {
+                let mut out = String::with_capacity(digits.len() + 1);
+                out.push('-');
+                out.push_str(digits);
+                return out;
+            }
+            return digits.to_owned();
+        }
+    }
+
+    // 用 15 位有效数字定指数，避免 log10 在 1eN 边界上的浮点误差（栈缓冲零堆分配）
+    let mut sci_buf = StackFmt::<48>::new();
+    let _ = write!(sci_buf, "{a:.15e}");
+    let sci = sci_buf.as_str();
+    let (_, exp_s) = sci.split_once('e').unwrap_or((sci, "0"));
     let exp: i32 = exp_s.parse().unwrap_or(0);
-    let _ = mant;
     let exp_chars = if exp.abs() >= 100 { 5 } else { 4 }; // E+11 / E+100
     // 列够宽时 Excel 的 11 字符上限只算数字主体，负号另占一格；
     // 窄列（默认 8.43）则连负号一起算进总宽。
     let sci_avail = if neg && cap < 11 { cap - 1 } else { cap };
-    let mut out;
+    let mut out_buf = StackFmt::<64>::new();
+    if neg {
+        let _ = out_buf.write_str("-");
+    }
+    let body_start = out_buf.len;
+
     if exp >= 0 {
         let int_digits = exp as usize + 1;
         if int_digits <= 11.min(avail) {
             if a.fract() == 0.0 {
-                out = format!("{a:.0}");
+                if write!(out_buf, "{a:.0}").is_err() {
+                    let mut fb = format!("{a:.0}");
+                    if neg {
+                        fb.insert(0, '-');
+                    }
+                    return fb;
+                }
             } else {
                 let decimals = avail.saturating_sub(int_digits + 1);
-                out = trim_zeros(format!("{a:.decimals$}"));
-                if out.is_empty() {
-                    out = "0".into();
+                if write!(out_buf, "{a:.decimals$}").is_err() {
+                    let mut fb = trim_zeros(format!("{a:.decimals$}"));
+                    if fb.is_empty() {
+                        fb = "0".into();
+                    }
+                    if neg {
+                        fb.insert(0, '-');
+                    }
+                    return fb;
+                }
+                out_buf.trim_decimal_zeros_from(body_start);
+                if out_buf.len == body_start {
+                    let _ = out_buf.write_str("0");
                 }
             }
         } else {
-            let mut decimals = sci_avail.saturating_sub(1 + 1 + exp_chars);
-            decimals = decimals.min(5);
-            out = sci_text(a, exp, decimals);
-            // 9.999…E+10 四舍五入后会变成 1E+11，指数要进位
-            if out.starts_with("10") {
-                out = sci_text(a, exp + 1, decimals);
-            }
+            let decimals = sci_avail.saturating_sub(1 + 1 + exp_chars).min(5);
+            write_sci_into(&mut out_buf, a, exp, decimals);
         }
     } else {
         let decimals_avail = avail.saturating_sub(2);
@@ -452,20 +509,17 @@ pub fn general_display(n: f64, cap: usize) -> String {
         // 固定小数至少能写出 3 位有效数字，否则 Excel 改科学计数
         if leading + 3 <= decimals_avail {
             let decimals = decimals_avail.min(15);
-            out = trim_zeros(format!("{a:.decimals$}"));
-            if out.is_empty() {
-                out = "0".into();
+            let _ = write!(out_buf, "{a:.decimals$}");
+            out_buf.trim_decimal_zeros_from(body_start);
+            if out_buf.len == body_start {
+                let _ = out_buf.write_str("0");
             }
         } else {
-            let mut decimals = sci_avail.saturating_sub(1 + 1 + exp_chars);
-            decimals = decimals.min(5);
-            out = sci_text(a, exp, decimals);
+            let decimals = sci_avail.saturating_sub(1 + 1 + exp_chars).min(5);
+            write_sci_into(&mut out_buf, a, exp, decimals);
         }
     }
-    if neg {
-        out.insert(0, '-');
-    }
-    out
+    out_buf.as_str().to_owned()
 }
 
 fn trim_zeros(mut s: String) -> String {
@@ -480,23 +534,28 @@ fn trim_zeros(mut s: String) -> String {
     s
 }
 
-fn sci_text(a: f64, exp: i32, decimals: usize) -> String {
+#[inline]
+fn write_sci_into<const N: usize>(out: &mut StackFmt<N>, a: f64, mut exp: i32, decimals: usize) {
+    use std::fmt::Write;
+    let mut m_buf = StackFmt::<32>::new();
     let mant = a / 10f64.powi(exp);
-    let m = trim_zeros(format!("{mant:.decimals$}"));
-    signed_exp(&m, exp, decimals, a)
-}
-
-fn signed_exp(m: &str, exp: i32, decimals: usize, _a: f64) -> String {
-    // 四舍五入把 9.99 变 10.0 时进位（调用方还会再校正一次）
-    let mut m = m.to_string();
-    let mut exp = exp;
-    if m.starts_with("10") {
-        if let Ok(v) = m.parse::<f64>() {
-            m = trim_zeros(format!("{:.decimals$}", v / 10.0));
-            exp += 1;
-        }
+    let _ = write!(m_buf, "{mant:.decimals$}");
+    m_buf.trim_decimal_zeros_from(0);
+    // 9.999…E+10 四舍五入后会变成 10 -> 1E+11，指数要进位
+    if m_buf.as_str().starts_with("10") {
+        exp += 1;
+        m_buf.len = 0;
+        let mant2 = a / 10f64.powi(exp);
+        let _ = write!(m_buf, "{mant2:.decimals$}");
+        m_buf.trim_decimal_zeros_from(0);
     }
-    format!("{}E{}{:02}", m, if exp < 0 { '-' } else { '+' }, exp.abs())
+    let _ = write!(
+        out,
+        "{}E{}{:02}",
+        m_buf.as_str(),
+        if exp < 0 { '-' } else { '+' },
+        exp.abs()
+    );
 }
 
 /// 带列宽上限的通用入口：只有「常规」受 cap 影响，其他格式原样走 format_value。
@@ -671,14 +730,14 @@ impl NumberSection {
     }
 }
 
-struct StackFmt<const N: usize> {
-    buf: [u8; N],
-    len: usize,
+pub(crate) struct StackFmt<const N: usize> {
+    pub(crate) buf: [u8; N],
+    pub(crate) len: usize,
 }
 
 impl<const N: usize> StackFmt<N> {
     #[inline]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buf: [0u8; N],
             len: 0,
@@ -686,9 +745,21 @@ impl<const N: usize> StackFmt<N> {
     }
 
     #[inline]
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         // SAFETY: only valid UTF-8 chunks from `Write::write_str` are appended.
         unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) }
+    }
+
+    #[inline]
+    pub(crate) fn trim_decimal_zeros_from(&mut self, start: usize) {
+        if self.buf[start..self.len].contains(&b'.') {
+            while self.len > start && self.buf[self.len - 1] == b'0' {
+                self.len -= 1;
+            }
+            if self.len > start && self.buf[self.len - 1] == b'.' {
+                self.len -= 1;
+            }
+        }
     }
 }
 
@@ -2059,5 +2130,18 @@ mod tests {
         assert_ne!(t.intern(song.clone()), a, "换了字体必须是另一个样式");
         assert_ne!(t.intern(hei), a);
         assert_eq!(t.intern(song), t.intern(CellStyle { font: "宋体".into(), size: 11.0, ..Default::default() }));
+    }
+
+    #[test]
+    fn wave5_stack_number_formatting_matches_excel_general_and_zero_trimming() {
+        assert_eq!(general_display(0.0, 11), "0");
+        assert_eq!(general_display(-0.0, 11), "0");
+        assert_eq!(general_display(99_999_999_999.0, 11), "99999999999");
+        assert_eq!(general_display(100_000_000_000.0, 11), "1E+11");
+        assert_eq!(general_display(-12345.0, 11), "-12345");
+        assert_eq!(general_display(9.9999999999e11, 11), "1E+12");
+        assert_eq!(crate::model::format_number(-0.0), "0");
+        assert_eq!(crate::model::format_number(123.45000), "123.45");
+        assert_eq!(crate::model::format_number(f64::NAN), "#NUM!");
     }
 }

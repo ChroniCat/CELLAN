@@ -59,6 +59,7 @@ impl Hasher for FxHasher {
 }
 
 pub(crate) type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub(crate) type FxHashSet<K> = HashSet<K, BuildHasherDefault<FxHasher>>;
 
 #[inline]
 pub(crate) fn prefix_u64(bytes: &[u8]) -> u64 {
@@ -902,14 +903,14 @@ impl CompiledCriterion {
                 if let Some(b) = self.num1 {
                     self.matches_num(*n, b)
                 } else {
-                    self.matches_str(&v.display())
+                    v.with_display_str(|s| self.matches_str(s))
                 }
             }
             Value::Text(t) => self.matches_str(t),
             Value::Empty => self.matches_str(""),
             Value::Bool(b) => self.matches_str(if *b { "TRUE" } else { "FALSE" }),
             Value::Error(e) => self.matches_str(e.text()),
-            Value::Number(_) => self.matches_str(&v.display()),
+            Value::Number(_) => v.with_display_str(|s| self.matches_str(s)),
         }
     }
 }
@@ -967,7 +968,9 @@ impl Filter {
                         Value::Text(t) => allows.contains(t.as_ref()),
                         Value::Bool(b) => allows.contains(if *b { "TRUE" } else { "FALSE" }),
                         Value::Error(e) => allows.contains(e.text()),
-                        Value::Number(_) => allows.contains(&v.display()),
+                        Value::Number(n) => {
+                            crate::model::with_formatted_number(*n, |s| allows.contains(s))
+                        }
                         Value::Empty => unreachable!(),
                     };
                     if !ok {
@@ -1002,8 +1005,9 @@ impl Filter {
             let req = &rules[req_idx];
             let mut intervals: Vec<(u32, u32)> = Vec::new();
             let mut next = first;
-            for (key, cell) in sheet.iter_rect((first, req.col, r2, req.col)) {
-                if req.passes(&cell.value)
+            for (key, cell) in sheet.cells().stored_cells_in((first, req.col, r2, req.col)) {
+                let val_cow = cell.value();
+                if req.passes(val_cow.as_ref())
                     && rules
                         .iter()
                         .enumerate()
@@ -1022,8 +1026,8 @@ impl Filter {
         } else {
             let mut rows = Vec::new();
             for rule in &rules {
-                for (key, cell) in sheet.iter_rect((first, rule.col, r2, rule.col)) {
-                    if !rule.passes(&cell.value) {
+                for (key, cell) in sheet.cells().stored_cells_in((first, rule.col, r2, rule.col)) {
+                    if !rule.passes(cell.value().as_ref()) {
                         rows.push(key.row);
                     }
                 }
@@ -1082,35 +1086,135 @@ impl FilterColumn {
     }
 
     pub fn choices_while(self, keep: impl Fn() -> bool) -> Option<(Vec<String>, bool)> {
-        let mut unique = HashSet::new();
-        let mut populated = 0;
+        let mut unique: FxHashSet<String> = FxHashSet::default();
+        let mut seen_ptrs: FxHashSet<usize> = FxHashSet::default();
+        let mut seen_num_bits: FxHashSet<u64> = FxHashSet::default();
+        let mut seen_empty = false;
+        let mut seen_true = false;
+        let mut seen_false = false;
+        let mut populated = 0u32;
+
+        let mut insert_val = |v: &Value| {
+            match v {
+                Value::Empty => {
+                    if !seen_empty {
+                        seen_empty = true;
+                        unique.insert(String::new());
+                    }
+                }
+                Value::Number(n) => {
+                    let nb = if *n == 0.0 { 0u64 } else { n.to_bits() };
+                    if seen_num_bits.insert(nb) {
+                        unique.insert(crate::model::format_number(*n));
+                    }
+                }
+                Value::Text(s) => {
+                    let ptr = s.as_ptr() as usize;
+                    if seen_ptrs.insert(ptr) && !unique.contains(s.as_ref()) {
+                        unique.insert(s.to_string());
+                    }
+                }
+                Value::Bool(true) => {
+                    if !seen_true {
+                        seen_true = true;
+                        unique.insert("TRUE".to_string());
+                    }
+                }
+                Value::Bool(false) => {
+                    if !seen_false {
+                        seen_false = true;
+                        unique.insert("FALSE".to_string());
+                    }
+                }
+                Value::Error(e) => {
+                    let t = e.text();
+                    if !unique.contains(t) {
+                        unique.insert(t.to_string());
+                    }
+                }
+            }
+        };
+
         for (base, cells) in self.pages {
             if !keep() { return None; }
             let start = self.header.saturating_add(1).saturating_sub(base) as usize;
             if self.last < base || start >= cells.len() { continue; }
             let end = ((self.last - base) as usize + 1).min(cells.len());
+            if start >= end { continue; }
+            let hi = end - 1;
+            let start_w = start / 64;
+            let end_w = hi / 64;
             match cells.as_ref() {
                 crate::store::ColSlab::Numbers(ns) => {
-                    for ro in start..end {
-                        if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
-                            populated += 1;
-                            unique.insert(crate::model::format_number(ns.values[ro]));
+                    for w in start_w..=end_w {
+                        let mut bits = ns.present[w];
+                        if w == start_w {
+                            bits &= !0u64 << (start % 64);
+                        }
+                        if w == end_w && (hi % 64) < 63 {
+                            bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                        }
+                        populated += bits.count_ones();
+                        while bits != 0 {
+                            let tz = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            insert_val(&Value::Number(ns.values[w * 64 + tz]));
                         }
                     }
                 }
                 crate::store::ColSlab::Values(vs) => {
-                    for v in &vs[start..end] {
-                        if !v.is_empty() {
-                            populated += 1;
-                            unique.insert(v.display());
+                    if let Some((codes, dict)) = vs.dict_text() {
+                        populated += crate::store::NumberSlab::present_count_in(
+                            &vs.present,
+                            start,
+                            end - start,
+                        ) as u32;
+                        let mut seen_codes = [false; 129];
+                        for &code in &codes[start..end] {
+                            seen_codes[code as usize] = true;
+                        }
+                        for (code, seen) in seen_codes.iter().enumerate().take(dict.len()).skip(1) {
+                            if *seen {
+                                insert_val(&dict[code]);
+                            }
+                        }
+                    } else {
+                        for w in start_w..=end_w {
+                            let mut bits = vs.present[w];
+                            if w == start_w {
+                                bits &= !0u64 << (start % 64);
+                            }
+                            if w == end_w && (hi % 64) < 63 {
+                                bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                            }
+                            populated += bits.count_ones();
+                            while bits != 0 {
+                                let tz = bits.trailing_zeros() as usize;
+                                bits &= bits - 1;
+                                if let Some(v) = vs.get_val(w * 64 + tz) {
+                                    insert_val(v);
+                                }
+                            }
                         }
                     }
                 }
                 crate::store::ColSlab::Mixed(cs) => {
-                    for cell in &cs[start..end] {
-                        if !cell.is_blank() {
-                            populated += 1;
-                            unique.insert(cell.value.display());
+                    let pm = cs.row_mask();
+                    for w in start_w..=end_w {
+                        let mut bits = pm[w];
+                        if w == start_w {
+                            bits &= !0u64 << (start % 64);
+                        }
+                        if w == end_w && (hi % 64) < 63 {
+                            bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                        }
+                        populated += bits.count_ones();
+                        while bits != 0 {
+                            let tz = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            if let Some(cell) = cs.get_cell(w * 64 + tz) {
+                                insert_val(&cell.value);
+                            }
                         }
                     }
                 }
@@ -1339,5 +1443,52 @@ mod tests {
         s.set(0, 0, crate::model::Cell { value: Value::Number(1.0), formula: None });
         s.set(0, 1, crate::model::Cell { value: Value::Number(2.0), formula: None });
         assert!(sort_region_by_row(&mut s, (0, 0, 0, 1), 5, true).is_err());
+    }
+
+    #[test]
+    fn wave5_choices_while_short_circuits_dict_text_and_number_bits_with_blanks() {
+        let mut s = Sheet::new("Choices");
+        s.set(0, 0, crate::model::Cell { value: Value::Text("状态".into()), formula: None });
+        s.set(0, 1, crate::model::Cell { value: Value::Text("金额".into()), formula: None });
+        let items: [std::sync::Arc<str>; 3] = ["已完成".into(), "处理中".into(), "待审核".into()];
+        for r in 1..=600u32 {
+            if r != 300 {
+                s.set(
+                    r,
+                    0,
+                    crate::model::Cell {
+                        value: Value::Text(items[(r as usize) % 3].clone()),
+                        formula: None,
+                    },
+                );
+            }
+            let n = if r % 2 == 0 { -0.0 } else { 12.5 };
+            s.set(r, 1, crate::model::Cell { value: Value::Number(n), formula: None });
+        }
+        let (text_choices, text_numeric) = FilterColumn::new(&s, (0, 0, 600, 1), 0).choices();
+        assert!(!text_numeric);
+        assert!(text_choices.iter().any(String::is_empty), "row 300 blank must insert empty choice");
+        assert_eq!(text_choices.len(), 4);
+
+        let (num_choices, num_numeric) = FilterColumn::new(&s, (0, 0, 600, 1), 1).choices();
+        assert!(num_numeric);
+        assert_eq!(num_choices, vec!["0".to_string(), "12.5".to_string()]);
+
+        // Column 2: 100% populated by unevaluated formulas (`formula: Some`, cached `Value::Empty`)
+        // must still include `""` in `choices()`.
+        s.set(0, 2, crate::model::Cell { value: Value::Text("待算".into()), formula: None });
+        for r in 1..=600u32 {
+            s.set(
+                r,
+                2,
+                crate::model::Cell {
+                    value: Value::Empty,
+                    formula: Some("=B2".into()),
+                },
+            );
+        }
+        let (empty_f_choices, empty_f_numeric) = FilterColumn::new(&s, (0, 0, 600, 2), 2).choices();
+        assert!(!empty_f_numeric);
+        assert_eq!(empty_f_choices, vec![String::new()]);
     }
 }

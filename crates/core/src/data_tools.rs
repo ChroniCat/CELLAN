@@ -285,29 +285,113 @@ impl NumericSort {
     ) -> Result<Option<Self>, String> {
         let (r1, c1, r2, c2) = region;
         if r1 >= r2 || c1 > c2 || !(c1..=c2).contains(&key) { return Ok(None); }
+        let rows = (r2 - r1 + 1) as usize;
         let width = (c2 - c1 + 1) as usize;
-        let area = width as u64 * u64::from(r2 - r1 + 1);
+        let area = width as u64 * rows as u64;
         if area <= 100_000 || area > sheet.len() as u64 { return Ok(None); }
         crate::sort_filter::validate_sort_region(sheet, region)?;
-        let mut values = Vec::new();
-        let mut styles = Vec::new();
-        let has_styles = !sheet.styles.is_empty() || !sheet.row_styles.is_empty() || !sheet.col_styles.is_empty();
-        for r in r1..=r2 {
+
+        // Fast O(pages * cols) bitmap & slab-kind pre-check: reject trailing blanks, DictText,
+        // or formulas in microseconds BEFORE allocating any multi-megabyte row-major buffers!
+        let p_lo = r1 / PAGE_ROWS;
+        let p_hi = r2 / PAGE_ROWS;
+        let cells = sheet.cells();
+        for pi in p_lo..=p_hi {
+            let Some(page) = cells.page(pi) else {
+                return Ok(None);
+            };
+            let base = pi * PAGE_ROWS;
+            let lo = r1.saturating_sub(base) as usize;
+            let hi = (r2 - base).min(PAGE_ROWS - 1) as usize;
+            let span_len = hi - lo + 1;
             for c in c1..=c2 {
-                let Some(n) = sheet.get_f64_plain(r, c) else {
+                let Some(slab) = page.cols.get(c) else {
                     return Ok(None);
                 };
-                if !n.is_finite() { return Ok(None); }
-                values.push(n);
-                if has_styles { styles.push(sheet.style_of(r, c)); }
+                match slab.as_ref() {
+                    ColSlab::Numbers(ns) => {
+                        if ns.values.len() <= hi || !NumberSlab::all_present_in(&ns.present, lo, span_len) {
+                            return Ok(None);
+                        }
+                    }
+                    ColSlab::Values(vs) => {
+                        if vs.is_dict_text()
+                            || vs.len() <= hi
+                            || !NumberSlab::all_present_in(&vs.present, lo, span_len)
+                        {
+                            return Ok(None);
+                        }
+                    }
+                    ColSlab::Mixed(cs) => {
+                        if cs.len() <= hi
+                            || cs.has_formulas()
+                            || !NumberSlab::all_present_in(&cs.row_mask(), lo, span_len)
+                        {
+                            return Ok(None);
+                        }
+                    }
+                }
             }
         }
-        let mut order: Vec<u32> = (0..=r2 - r1).collect();
+
+        let total = rows * width;
+        let mut values = vec![0.0f64; total];
+        for pi in p_lo..=p_hi {
+            let page = cells.page(pi).unwrap();
+            let base = pi * PAGE_ROWS;
+            let lo = r1.saturating_sub(base) as usize;
+            let hi = (r2 - base).min(PAGE_ROWS - 1) as usize;
+            for c in c1..=c2 {
+                let col_off = (c - c1) as usize;
+                let slab = page.cols.get(c).unwrap();
+                match slab.as_ref() {
+                    ColSlab::Numbers(ns) => {
+                        for (i, &n) in ns.values[lo..=hi].iter().enumerate() {
+                            if !n.is_finite() {
+                                return Ok(None);
+                            }
+                            let dst_row = (base as usize + lo + i) - r1 as usize;
+                            values[dst_row * width + col_off] = n;
+                        }
+                    }
+                    _ => {
+                        for r_off in lo..=hi {
+                            let Some(n) = slab.get_f64_plain(r_off as u32) else {
+                                return Ok(None);
+                            };
+                            if !n.is_finite() {
+                                return Ok(None);
+                            }
+                            let dst_row = (base as usize + r_off) - r1 as usize;
+                            values[dst_row * width + col_off] = n;
+                        }
+                    }
+                }
+            }
+        }
+
+        let has_styles = !sheet.styles.is_empty() || !sheet.row_styles.is_empty() || !sheet.col_styles.is_empty();
+        let mut styles = Vec::new();
+        if has_styles {
+            styles.resize(total, 0u16);
+            for r in r1..=r2 {
+                let row_off = (r - r1) as usize * width;
+                for c in c1..=c2 {
+                    styles[row_off + (c - c1) as usize] = sheet.style_of(r, c);
+                }
+            }
+        }
+
         let key_col = (key - c1) as usize;
-        let values_ref = values.as_slice();
+        let mut keys: Vec<f64> = Vec::with_capacity(rows);
+        for r in 0..rows {
+            keys.push(values[r * width + key_col]);
+        }
+        let mut order: Vec<u32> = (0..rows as u32).collect();
+        let keys_ref = keys.as_slice();
         parallel_stable_sort(&mut order, &|&a, &b| {
-            let left = values_ref[a as usize * width + key_col];
-            let right = values_ref[b as usize * width + key_col];
+            let left = keys_ref[a as usize];
+            let right = keys_ref[b as usize];
             let cmp = left.partial_cmp(&right).expect("numeric sort has finite keys");
             if asc { cmp } else { cmp.reverse() }
         });
@@ -551,7 +635,7 @@ impl NumericSort {
                         occupied_masks.push((pi, occ_mask));
                     }
                     let slab = if has_formula {
-                        ColSlab::Mixed(out_vec)
+                        ColSlab::Mixed(out_vec.into())
                     } else {
                         ColSlab::Values(out_vec.into_iter().map(|c| c.value).collect())
                     };
@@ -1127,7 +1211,7 @@ fn apply_horizontal_gather(
             let slab = if out_vec.is_empty() {
                 None
             } else if slab_has_formula {
-                Some(ColSlab::Mixed(out_vec))
+                Some(ColSlab::Mixed(out_vec.into()))
             } else if slab_all_numbers {
                 let mut vals = vec![0.0; out_vec.len()];
                 for (r, c) in out_vec.iter().enumerate() {
@@ -1568,8 +1652,7 @@ fn hash_display_field(h: u64, col: u32, v: &Value) -> u64 {
             h = fnv_mix(h, &(s.len() as u64).to_le_bytes());
             fnv_mix(h, s)
         }
-        Value::Number(_) => {
-            let text = v.display();
+        Value::Number(n) => crate::model::with_formatted_number(*n, |text| {
             if text.is_empty() {
                 h
             } else {
@@ -1577,19 +1660,20 @@ fn hash_display_field(h: u64, col: u32, v: &Value) -> u64 {
                 h = fnv_mix(h, &(text.len() as u64).to_le_bytes());
                 fnv_mix(h, text.as_bytes())
             }
-        }
+        }),
     }
 }
 
+#[inline]
 fn values_same_display(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Empty, Value::Empty) => true,
         (Value::Empty, Value::Text(t)) | (Value::Text(t), Value::Empty) => t.is_empty(),
-        (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::Text(x), Value::Text(y)) => Arc::ptr_eq(x, y) || x == y,
         (Value::Number(x), Value::Number(y)) if x == y => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Error(x), Value::Error(y)) => x == y,
-        _ => a.display() == b.display(),
+        _ => a.with_display_str(|sa| b.with_display_str(|sb| sa == sb)),
     }
 }
 
@@ -1629,15 +1713,15 @@ fn distinct_rows(
     use_cols.retain(|c| col_seen.insert(*c));
 
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    let mut buckets: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut buckets: FxHashMap<u64, Vec<u32>> = FxHashMap::default();
     let mut keep = Vec::new();
     let area = (r2 - r1 + 1) as u64 * use_cols.len() as u64;
     if area > 4096 && area > sheet.len() as u64 * 4 {
         let selected: HashSet<u32> = use_cols.iter().copied().collect();
         let min_sel = use_cols.iter().copied().min().unwrap_or(c1);
         let max_sel = use_cols.iter().copied().max().unwrap_or(c2);
-        let mut row_hashes: HashMap<u32, u64> = HashMap::new();
-        // `sheet.iter_rect` visits in ascending `(row, col)` order!
+        let mut row_hashes: FxHashMap<u32, u64> = FxHashMap::default();
+        // `sheet.iter_rect_views` visits in ascending `(row, col)` order!
         let mut sorted_cols = use_cols.clone();
         sorted_cols.sort_unstable();
         for (k, cell) in sheet.iter_rect_views((r1, min_sel, r2, max_sel)) {
@@ -1663,10 +1747,22 @@ fn distinct_rows(
             }
         }
     } else {
+        let p_lo = r1 / PAGE_ROWS;
+        let p_hi = r2 / PAGE_ROWS;
+        let col_slabs: Vec<(u32, Vec<Option<&ColSlab>>)> = use_cols
+            .iter()
+            .map(|&c| (c, sheet.cells().col_page_slices(c, p_lo, p_hi)))
+            .collect();
         for row in r1..=r2 {
+            let pi_idx = ((row / PAGE_ROWS) - p_lo) as usize;
+            let r_off = row % PAGE_ROWS;
             let mut h = FNV_OFFSET;
-            for &c in &use_cols {
-                h = hash_display_field(h, c, sheet.value_ref(row, c).as_ref());
+            for &(c, ref slabs) in &col_slabs {
+                if let Some(slab) = slabs[pi_idx]
+                    && let Some(val) = slab.value_ref(r_off)
+                {
+                    h = hash_display_field(h, c, val.as_ref());
+                }
             }
             let bucket = buckets.entry(h).or_default();
             if !bucket.iter().any(|&prev| rows_match_on_cols(sheet, prev, row, &use_cols)) {
@@ -1697,7 +1793,97 @@ pub fn plan_remove_duplicates(
 }
 
 pub fn remove_duplicates(sheet: &mut Sheet, region: (u32, u32, u32, u32), cols: &[u32], header: bool) -> usize {
-    let changes = plan_remove_duplicates(sheet, 0, region, cols, header);
+    let Some((rect, keep)) = distinct_rows(sheet, region, cols, header) else {
+        return 0;
+    };
+    let (r1, c1, r2, c2) = rect;
+    let total_rows = (r2 - r1 + 1) as usize;
+    let removed = total_rows - keep.len();
+    if removed == 0 {
+        return 0;
+    }
+    let p_lo = r1 / PAGE_ROWS;
+    let p_hi = r2 / PAGE_ROWS;
+    let rect_has_formulas = sheet
+        .cells()
+        .iter_pages_in(p_lo, p_hi)
+        .any(|(_, p)| p.may_have_formula);
+    if !rect_has_formulas {
+        let source = sheet.search_snapshot();
+        let (cells, cleared) = sheet.cells_and_cleared_mut();
+        let cell_changed = cells.gather_rows(source.cells(), rect, &keep, &source.name, cleared);
+        let has_styles = !source.styles.is_empty()
+            || !source.row_styles.is_empty()
+            || !source.col_styles.is_empty();
+        let mut style_changed = false;
+        if has_styles {
+            let n_pages = (p_hi - p_lo + 1) as usize;
+            let has_row_styles = !sheet.row_styles.is_empty();
+            for col in c1..=c2 {
+                let has_col_style = sheet.col_styles.contains_key(&col);
+                let mut slabs = Vec::with_capacity(n_pages);
+                let mut edits = Vec::new();
+                let mut col_ch = false;
+                for page_idx in 0..n_pages {
+                    let pi = p_lo + page_idx as u32;
+                    let base = pi * PAGE_ROWS;
+                    let lo = r1.saturating_sub(base) as usize;
+                    let hi = (r2 - base).min(PAGE_ROWS - 1) as usize;
+                    let mut dense = [None::<u16>; PAGE_ROWS as usize];
+                    let old_sc = sheet.styles.page_col(pi, col);
+                    if let Some(osc) = old_sc {
+                        for r in 0..PAGE_ROWS as usize {
+                            dense[r] = osc.get(r as u32).copied();
+                        }
+                    }
+                    let mut edit_mask = [0u64; 4];
+                    for r_off in lo..=hi {
+                        let dst_r = base + r_off as u32;
+                        let ord_idx = (dst_r - r1) as usize;
+                        // Cleared tail retains existing styles; moved surviving rows carry their source style!
+                        let Some(&src_r) = keep.get(ord_idx) else {
+                            continue;
+                        };
+                        if src_r == dst_r {
+                            continue;
+                        }
+                        let before_st = source.style_of(dst_r, col);
+                        let after_st = source.style_of(src_r, col);
+                        if before_st != after_st {
+                            col_ch = true;
+                            edit_mask[r_off / 64] |= 1u64 << (r_off % 64);
+                            dense[r_off] = (after_st != 0
+                                || has_col_style
+                                || (has_row_styles && sheet.row_styles.contains_key(&dst_r)))
+                            .then_some(after_st);
+                        }
+                    }
+                    slabs.push(StyleColumn::from_dense(&dense));
+                    if edit_mask != [0; 4] {
+                        edits.push((pi, edit_mask));
+                    }
+                }
+                if col_ch {
+                    style_changed = true;
+                    sheet.styles.install_col_pages(col, p_lo, slabs);
+                    for (pi, mask) in edits {
+                        sheet.style_edits.or_page_mask(pi, col, mask);
+                    }
+                }
+            }
+            if style_changed {
+                sheet.bump_display_style_revision();
+                if !sheet.loading {
+                    sheet.styles_dirty = true;
+                }
+            }
+        }
+        if (cell_changed > 0 || style_changed) && !sheet.loading {
+            sheet.edited = true;
+        }
+        return removed;
+    }
+    let changes = reorder_lines(sheet, 0, rect, keep, false, true);
     changes.apply(sheet);
     changes.count
 }
@@ -1799,32 +1985,40 @@ pub fn split_fields(line: &str, opts: &SplitOpts) -> Vec<String> {
 fn detect_value(text: &str, opts: &SplitOpts) -> (Value, bool) {
     let t = text.trim();
     if !opts.detect_types || t.is_empty() {
-        return (Value::Text(text.to_string().into()), false);
+        return (Value::Text(crate::model::intern_short_str(text)), false);
     }
     // 前导零（00123、007）当文本，避免变成 123
-    if t.len() > 1 && t.starts_with('0') && t.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return (Value::Text(text.to_string().into()), false);
+    if t.len() > 1 && t.starts_with('0') && t.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return (Value::Text(crate::model::intern_short_str(text)), false);
     }
     if let Ok(n) = t.parse::<f64>() {
         return (Value::Number(n), false);
     }
-    // 日期：2026-03-05 / 2026/3/5
-    let norm = t.replace('/', "-");
-    let parts: Vec<&str> = norm.split('-').collect();
-    if parts.len() == 3 {
-        if let (Ok(y), Ok(m), Ok(d)) = (
-            parts[0].parse::<i32>(),
-            parts[1].parse::<u32>(),
-            parts[2].parse::<u32>(),
-        ) {
-            if (1900..=9999).contains(&y) && parts[0].len() == 4 {
-                if let Some(serial) = crate::formula::date_to_serial_in(opts.date_system, y, m, d) {
-                    return (Value::Number(serial), true);
-                }
+    // 日期：2026-03-05 / 2026/3/5（零堆分配切分）
+    if t.len() >= 8 && t.len() <= 10 && t.is_ascii() {
+        let sep = if t.as_bytes().get(4) == Some(&b'-') {
+            Some(b'-')
+        } else if t.as_bytes().get(4) == Some(&b'/') {
+            Some(b'/')
+        } else {
+            None
+        };
+        if let Some(sep_b) = sep
+            && let Some(rel) = t.as_bytes()[5..].iter().position(|&b| b == sep_b)
+        {
+            let p2 = 5 + rel;
+            if let (Ok(y), Ok(m), Ok(d)) = (
+                t[..4].parse::<i32>(),
+                t[5..p2].parse::<u32>(),
+                t[p2 + 1..].parse::<u32>(),
+            ) && (1900..=9999).contains(&y)
+                && let Some(serial) = crate::formula::date_to_serial_in(opts.date_system, y, m, d)
+            {
+                return (Value::Number(serial), true);
             }
         }
     }
-    (Value::Text(text.to_string().into()), false)
+    (Value::Text(crate::model::intern_short_str(text)), false)
 }
 
 /// 分列：把区域每一行按分隔符拆开写回，右边原有的内容整体右移。
@@ -1839,15 +2033,17 @@ pub fn text_to_columns_ex(
     let (r1, c1, r2, c2) = region;
     let mut report = SplitReport::default();
     let mut rows: Vec<(u32, Vec<String>)> = Vec::new();
-    for r in r1..=r2 {
-        let text = sheet
-            .get(r, c1)
-            .map(|x| x.value.display())
-            .unwrap_or_default();
-        if text.is_empty() {
+    for (k, cell) in sheet.iter_rect_views((r1, c1, r2, c1)) {
+        let fields = cell.value().with_display_str(|text| {
+            if text.is_empty() {
+                None
+            } else {
+                Some(split_fields(text, opts))
+            }
+        });
+        let Some(fields) = fields else {
             continue;
-        }
-        let fields = split_fields(&text, opts);
+        };
         let kept = match &opts.col_modes {
             Some(modes) => fields
                 .iter()
@@ -1857,7 +2053,7 @@ pub fn text_to_columns_ex(
             None => fields.len(),
         };
         report.width = report.width.max(kept);
-        rows.push((r, fields));
+        rows.push((k.row, fields));
     }
     let shift = report.width.saturating_sub(1) as u32;
     if dry_run {
@@ -1865,9 +2061,8 @@ pub fn text_to_columns_ex(
             for (i, _) in fields.iter().enumerate().skip(1) {
                 let c = c1 + i as u32;
                 let occupied = sheet
-                    .get(*r, c)
-                    .map(|x| !matches!(x.value, Value::Empty) && !x.value.display().is_empty())
-                    .unwrap_or(false);
+                    .get_view(*r, c)
+                    .is_some_and(|x| x.value().with_display_str(|s| !s.is_empty()));
                 if occupied {
                     report.overwritten += 1;
                 }
@@ -1875,16 +2070,18 @@ pub fn text_to_columns_ex(
         }
         return report;
     }
-    // 右侧被推开的列：整块只搬一次，从最右往左
+    // 右侧被推开的列：仅稀疏提取实际非空格，按列从最右往左写回（消除远端列导致的稠密空扫）
     if shift > 0 {
         let last = sheet.used_bounds().map(|b| b.3).unwrap_or(c2).max(c2);
-        for cc in (c1 + 1..=last).rev() {
-            for rr in r1..=r2 {
-                if let Some(cell) = sheet.get(rr, cc).map(|c| c.into_owned()) {
-                    sheet.set(rr, cc + shift, cell);
-                    let st = sheet.style_of(rr, cc);
-                    sheet.set_style(rr, cc + shift, st);
-                }
+        if c1 + 1 <= last {
+            let mut to_shift: Vec<(u32, u32, Cell, u16)> = sheet
+                .iter_rect_views((r1, c1 + 1, r2, last))
+                .map(|(k, v)| (k.row, k.col, v.to_cell(), sheet.style_of(k.row, k.col)))
+                .collect();
+            to_shift.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for (rr, cc, cell, st) in to_shift {
+                sheet.set(rr, cc + shift, cell);
+                sheet.set_style(rr, cc + shift, st);
             }
         }
     }
@@ -1900,13 +2097,13 @@ pub fn text_to_columns_ex(
                 continue;
             }
             let (v, is_date) = match mode {
-                ColMode::Text => (Value::Text(f.clone().into()), false),
+                ColMode::Text => (Value::Text(crate::model::intern_short_str(f)), false),
                 ColMode::Date => {
                     let (v, d) = detect_value(f, opts);
                     if d {
                         (v, true)
                     } else {
-                        (Value::Text(f.clone().into()), false)
+                        (Value::Text(crate::model::intern_short_str(f)), false)
                     }
                 }
                 _ => detect_value(f, opts),
@@ -2435,5 +2632,81 @@ mod compact_sort_gather_tests {
         assert_eq!(sheet.get(0, 0).unwrap().value, Value::Text("SKU-000001".into()));
         assert_eq!(sheet.get(rows - 1, 0).unwrap().value, Value::Text("SKU-200000".into()));
         assert_eq!(sheet.len(), (rows * cols) as usize);
+    }
+}
+
+
+#[cfg(test)]
+mod wave5_data_tools_tests {
+    use super::*;
+    use crate::model::{Cell, Sheet, Value};
+
+    #[test]
+    fn numeric_sort_precheck_falls_back_cleanly_on_trailing_blank_and_dedup_gathers_columns() {
+        // 1) 25,000 x 5 numeric sheet with last row key blank -> precheck falls back to General and puts blank last
+        let mut sh = Sheet::new("SortPrecheck");
+        for r in 0..25_000u32 {
+            if r < 24_999 {
+                sh.set(r, 0, Cell { value: Value::Number((25_000 - r) as f64), formula: None });
+            }
+            for c in 1..5u32 {
+                sh.set(r, c, Cell { value: Value::Number((r * 10 + c) as f64), formula: None });
+            }
+        }
+        let plan = CompactSort::plan(&sh, 0, (0, 0, 24_999, 4), 0, true, false)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(plan, CompactSort::Mixed { .. }));
+        plan.apply_to_sheet(&mut sh);
+        assert_eq!(sh.get(0, 0).unwrap().value, Value::Number(2.0));
+        assert!(sh.get(24_999, 0).is_none(), "blank key must remain at bottom row");
+        assert_eq!(sh.get(24_999, 1).unwrap().value, Value::Number(249_991.0));
+
+        // 2) Columnar remove_duplicates preserves first rows, styles, and translates surviving formulas
+        let mut dedup_sh = Sheet::new("Dedup");
+        dedup_sh.set(0, 0, Cell { value: Value::Text("部门".into()), formula: None });
+        dedup_sh.set(0, 1, Cell { value: Value::Text("基数".into()), formula: None });
+        dedup_sh.set(0, 2, Cell { value: Value::Text("十倍".into()), formula: None });
+        for r in 1..=600u32 {
+            let dept = format!("D{}", r % 15);
+            dedup_sh.set(r, 0, Cell { value: Value::Text(dept.into()), formula: None });
+            dedup_sh.set(r, 1, Cell { value: Value::Number(r as f64), formula: None });
+            dedup_sh.set(
+                r,
+                2,
+                Cell {
+                    value: Value::Number((r * 10) as f64),
+                    formula: Some(format!("=B{}*10", r + 1).into()),
+                },
+            );
+            dedup_sh.set_style(r, 0, ((r % 5) + 1) as u16);
+        }
+        let removed = remove_duplicates(&mut dedup_sh, (0, 0, 600, 2), &[0], true);
+        assert_eq!(removed, 585);
+        assert_eq!(dedup_sh.used_bounds(), Some((0, 0, 15, 2)));
+        for r in 1..=15u32 {
+            assert_eq!(dedup_sh.formula_of(r, 2), Some(format!("=B{}*10", r + 1).as_str()));
+            assert_eq!(dedup_sh.style_of(r, 0), ((r % 5) + 1) as u16);
+        }
+
+        // 3) Formula-free columnar gather_rows fast path (`!rect_has_formulas`) + tail style retention
+        let mut pure_sh = Sheet::new("PureDedup");
+        pure_sh.set(0, 0, Cell { value: Value::Text("地区".into()), formula: None });
+        pure_sh.set(0, 1, Cell { value: Value::Text("销量".into()), formula: None });
+        let regions = ["华东", "华南", "华北", "西南"];
+        for r in 1..=1_000u32 {
+            pure_sh.set(r, 0, Cell { value: Value::Text(regions[(r as usize) % 4].into()), formula: None });
+            pure_sh.set(r, 1, Cell { value: Value::Number(r as f64), formula: None });
+            pure_sh.set_style(r, 0, ((r % 4) + 10) as u16);
+        }
+        let pure_removed = remove_duplicates(&mut pure_sh, (0, 0, 1_000, 1), &[0], true);
+        assert_eq!(pure_removed, 996);
+        assert_eq!(pure_sh.used_bounds(), Some((0, 0, 4, 1)));
+        assert_eq!(pure_sh.get(1, 0).unwrap().value, Value::Text("华南".into()));
+        assert_eq!(pure_sh.get(4, 0).unwrap().value, Value::Text("华东".into()));
+        assert!(pure_sh.get(5, 0).is_none());
+        // Cleared tail retains existing styles while moved surviving rows keep their source styles
+        assert_eq!(pure_sh.style_of(1, 0), 11);
+        assert_eq!(pure_sh.style_of(500, 0), ((500 % 4) + 10) as u16);
     }
 }

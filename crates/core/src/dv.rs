@@ -449,13 +449,21 @@ fn parse_rect(text: &str) -> Option<(u32, u32, u32, u32)> {
 /// 取矩形里的非空显示文本；大区域（整列）走稀疏迭代，不逐格扫一百万行。
 fn collect_rect(sheet: &Sheet, rect: (u32, u32, u32, u32)) -> Vec<String> {
     let (r1, c1, r2, c2) = rect;
-    let area = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
-    if area <= 65_536 {
+    if c1 == c2 {
+        sheet
+            .cells()
+            .stored_cells_in(rect)
+            .filter_map(|(_, cell)| {
+                let t = cell.value().display();
+                (!t.is_empty()).then_some(t)
+            })
+            .collect()
+    } else if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 <= 65_536 {
         let mut out = Vec::new();
         for r in r1..=r2 {
             for c in c1..=c2 {
-                if let Some(v) = sheet.get(r, c) {
-                    let t = v.value.display();
+                if let Some(v) = sheet.get_view(r, c) {
+                    let t = v.value().display();
                     if !t.is_empty() {
                         out.push(t);
                     }
@@ -464,21 +472,159 @@ fn collect_rect(sheet: &Sheet, rect: (u32, u32, u32, u32)) -> Vec<String> {
         }
         out
     } else {
-        sheet.iter_rect(rect)
-            .map(|(_, cell)| cell.value.display())
-            .filter(|text| !text.is_empty())
+        sheet
+            .iter_rect_views(rect)
+            .filter_map(|(_, cell)| {
+                let t = cell.value().display();
+                (!t.is_empty()).then_some(t)
+            })
             .collect()
     }
 }
 
+/// Build deduplicated `HashSet<String>` directly from slab bitmasks (`DictText` / `Arc::as_ptr` / `f64::to_bits`)
+/// without per-row `String` allocations on repeated items.
+fn collect_rect_set(sheet: &Sheet, rect: (u32, u32, u32, u32)) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    let mut seen_ptrs: crate::sort_filter::FxHashSet<usize> = Default::default();
+    let mut seen_nums: crate::sort_filter::FxHashSet<u64> = Default::default();
+    let mut seen_true = false;
+    let mut seen_false = false;
+    let (r1, c1, r2, c2) = rect;
+    let p1 = r1 / crate::store::PAGE_ROWS;
+    let p2 = r2 / crate::store::PAGE_ROWS;
+    for (pi, page) in sheet.cells().iter_pages_in(p1, p2) {
+        let base = pi * crate::store::PAGE_ROWS;
+        let lo = r1.saturating_sub(base) as usize;
+        let hi_incl = (r2 - base).min(crate::store::PAGE_ROWS - 1) as usize;
+        for (_, slab) in page.cols.iter_entries_in(c1, c2) {
+            let end = (hi_incl + 1).min(slab.len());
+            if lo >= end {
+                continue;
+            }
+            let hi = end - 1;
+            let start_w = lo / 64;
+            let end_w = hi / 64;
+            match slab.as_ref() {
+                crate::store::ColSlab::Numbers(ns) => {
+                    for w in start_w..=end_w {
+                        let mut bits = ns.present[w];
+                        if w == start_w {
+                            bits &= !0u64 << (lo % 64);
+                        }
+                        if w == end_w && (hi % 64) < 63 {
+                            bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                        }
+                        while bits != 0 {
+                            let tz = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            let n = ns.values[w * 64 + tz];
+                            let nb = if n == 0.0 { 0u64 } else { n.to_bits() };
+                            if seen_nums.insert(nb) {
+                                set.insert(crate::model::format_number(n));
+                            }
+                        }
+                    }
+                }
+                crate::store::ColSlab::Values(vs) => {
+                    if let Some((codes, dict)) = vs.dict_text() {
+                        let mut page_codes = [false; 129];
+                        for &code in &codes[lo..end] {
+                            page_codes[code as usize] = true;
+                        }
+                        for (code, seen) in page_codes.iter().enumerate().take(dict.len()).skip(1) {
+                            if *seen
+                                && let Value::Text(s) = &dict[code]
+                                && !s.is_empty()
+                            {
+                                let ptr = s.as_ptr() as usize;
+                                if seen_ptrs.insert(ptr) && !set.contains(s.as_ref()) {
+                                    set.insert(s.to_string());
+                                }
+                            }
+                        }
+                    } else {
+                        for w in start_w..=end_w {
+                            let mut bits = vs.present[w];
+                            if w == start_w {
+                                bits &= !0u64 << (lo % 64);
+                            }
+                            if w == end_w && (hi % 64) < 63 {
+                                bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                            }
+                            while bits != 0 {
+                                let tz = bits.trailing_zeros() as usize;
+                                bits &= bits - 1;
+                                if let Some(v) = vs.get_val(w * 64 + tz) {
+                                    v.with_display_str(|s| {
+                                        if !s.is_empty() && !set.contains(s) {
+                                            set.insert(s.to_string());
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                crate::store::ColSlab::Mixed(cs) => {
+                    let pm = cs.row_mask();
+                    for w in start_w..=end_w {
+                        let mut bits = pm[w];
+                        if w == start_w {
+                            bits &= !0u64 << (lo % 64);
+                        }
+                        if w == end_w && (hi % 64) < 63 {
+                            bits &= (1u64 << ((hi % 64) + 1)) - 1;
+                        }
+                        while bits != 0 {
+                            let tz = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            if let Some(cell) = cs.get_cell(w * 64 + tz) {
+                                match &cell.value {
+                                    Value::Empty => {}
+                                    Value::Text(s) if !s.is_empty() => {
+                                        let ptr = s.as_ptr() as usize;
+                                        if seen_ptrs.insert(ptr) && !set.contains(s.as_ref()) {
+                                            set.insert(s.to_string());
+                                        }
+                                    }
+                                    Value::Bool(true) => {
+                                        if !seen_true {
+                                            seen_true = true;
+                                            set.insert("TRUE".to_string());
+                                        }
+                                    }
+                                    Value::Bool(false) => {
+                                        if !seen_false {
+                                            seen_false = true;
+                                            set.insert("FALSE".to_string());
+                                        }
+                                    }
+                                    v => v.with_display_str(|s| {
+                                        if !s.is_empty() && !set.contains(s) {
+                                            set.insert(s.to_string());
+                                        }
+                                    }),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    set
+}
+
 fn count_rect(sheet: &Sheet, rect: (u32, u32, u32, u32), numeric_only: bool) -> f64 {
     sheet
-        .iter_rect(rect)
+        .cells()
+        .stored_cells_in(rect)
         .filter(|(_, v)| {
             if numeric_only {
-                matches!(v.value, Value::Number(_))
+                v.as_f64().is_some()
             } else {
-                !matches!(v.value, Value::Empty)
+                !matches!(v.value().as_ref(), Value::Empty)
             }
         })
         .count() as f64
@@ -827,7 +973,7 @@ pub struct ListMembership<'a> {
     rule: &'a DataValidation,
     expr: &'a str,
     last_expression: Option<String>,
-    items: Option<std::collections::HashSet<String>>,
+    items: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 }
 
 impl<'a> ListMembership<'a> {
@@ -839,13 +985,13 @@ impl<'a> ListMembership<'a> {
         let (ar, ac) = range_anchor(self.rule, r, c);
         let expr = crate::cf::shift_formula(self.expr, r - ar, c - ac);
         if self.last_expression.as_ref() != Some(&expr) {
-            self.items = resolve_list(self.wb, self.sheet, &expr).map(|items| items.into_iter().collect());
+            self.items = cached_list_set_for_shifted(self.wb, self.sheet, &expr);
             self.last_expression = Some(expr);
         }
         self.items.as_ref().map(|items| match value {
             Value::Empty => self.rule.allow_blank,
             Value::Text(s) => items.contains(s.as_ref()),
-            _ => items.contains(&value.display()),
+            _ => value.with_display_str(|s| items.contains(s)),
         })
     }
 }
@@ -956,29 +1102,78 @@ where
     validate_impl(dv, value, sheet, r, c, None, formula_eval)
 }
 
-type CachedRectSetKey = (u64, crate::store::CellVersion, (u32, u32, u32, u32));
+struct CachedRectEntry {
+    sheet_id: u64,
+    rect: (u32, u32, u32, u32),
+    last_version: crate::store::CellVersion,
+    slabs: Vec<(u32, u32, std::sync::Arc<crate::store::ColSlab>)>,
+    set: std::sync::Arc<std::collections::HashSet<String>>,
+}
 
-fn cached_list_set_wb(
+fn rect_slabs(
+    sheet: &Sheet,
+    (r1, c1, r2, c2): (u32, u32, u32, u32),
+) -> Vec<(u32, u32, std::sync::Arc<crate::store::ColSlab>)> {
+    let p1 = r1 / crate::store::PAGE_ROWS;
+    let p2 = r2 / crate::store::PAGE_ROWS;
+    let mut out = Vec::new();
+    for (pi, page) in sheet.cells().iter_pages_in(p1, p2) {
+        let base = pi * crate::store::PAGE_ROWS;
+        let lo = r1.saturating_sub(base) as usize;
+        let hi_excl = ((r2 - base).min(crate::store::PAGE_ROWS - 1) + 1) as usize;
+        for (col, slab) in page.cols.iter_entries_in(c1, c2) {
+            if slab.has_any_in(lo, hi_excl) {
+                out.push((pi, col, slab.clone()));
+            }
+        }
+    }
+    out
+}
+
+#[inline]
+fn slabs_match_rect(
+    sheet: &Sheet,
+    (r1, c1, r2, c2): (u32, u32, u32, u32),
+    cached: &[(u32, u32, std::sync::Arc<crate::store::ColSlab>)],
+) -> bool {
+    let p1 = r1 / crate::store::PAGE_ROWS;
+    let p2 = r2 / crate::store::PAGE_ROWS;
+    let mut idx = 0usize;
+    for (pi, page) in sheet.cells().iter_pages_in(p1, p2) {
+        let base = pi * crate::store::PAGE_ROWS;
+        let lo = r1.saturating_sub(base) as usize;
+        let hi_excl = ((r2 - base).min(crate::store::PAGE_ROWS - 1) + 1) as usize;
+        for (col, slab) in page.cols.iter_entries_in(c1, c2) {
+            if slab.has_any_in(lo, hi_excl) {
+                let Some((cpi, ccol, cslab)) = cached.get(idx) else {
+                    return false;
+                };
+                if *cpi != pi || *ccol != col || !std::sync::Arc::ptr_eq(cslab, slab) {
+                    return false;
+                }
+                idx += 1;
+            }
+        }
+    }
+    idx == cached.len()
+}
+
+fn cached_list_set_for_shifted(
     wb: &crate::model::Workbook,
     si: usize,
-    dv: &DataValidation,
-    r: u32,
-    c: u32,
+    shifted: &str,
 ) -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
-    let expr = list_expression(wb, si, dv);
-    let (ar, ac) = range_anchor(dv, r, c);
-    let shifted = crate::cf::shift_formula(expr, r - ar, c - ac);
     if shifted.is_empty() {
         return Some(Default::default());
     }
-    if let Some(items) = inline_items(&shifted) {
+    if let Some(items) = inline_items(shifted) {
         thread_local! {
             static INLINE_CACHE: std::cell::RefCell<Vec<(String, std::sync::Arc<std::collections::HashSet<String>>)>> =
                 const { std::cell::RefCell::new(Vec::new()) };
         }
         return INLINE_CACHE.with(|cell| {
             let mut cache = cell.borrow_mut();
-            if let Some(pos) = cache.iter().position(|(k, _)| k == &shifted) {
+            if let Some(pos) = cache.iter().position(|(k, _)| k == shifted) {
                 let arc = cache[pos].1.clone();
                 if pos != 0 {
                     cache.swap(0, pos);
@@ -990,11 +1185,11 @@ fn cached_list_set_wb(
             if cache.len() >= 8 {
                 cache.pop();
             }
-            cache.insert(0, (shifted, set.clone()));
+            cache.insert(0, (shifted.to_string(), set.clone()));
             Some(set)
         });
     }
-    let (sheet_name, range) = split_sheet_prefix(&shifted);
+    let (sheet_name, range) = split_sheet_prefix(shifted);
     if let Some(rect) = parse_rect(&range) {
         let sheet = match sheet_name.as_deref() {
             Some(n) if !n.is_empty() => wb
@@ -1003,30 +1198,57 @@ fn cached_list_set_wb(
                 .find(|s| s.name == n || s.name.eq_ignore_ascii_case(n))?,
             _ => wb.sheet(si),
         };
-        let key: CachedRectSetKey = (sheet.identity, sheet.cell_version().clone(), rect);
         thread_local! {
-            static RECT_CACHE: std::cell::RefCell<Vec<(CachedRectSetKey, std::sync::Arc<std::collections::HashSet<String>>)>> =
+            static RECT_CACHE: std::cell::RefCell<Vec<CachedRectEntry>> =
                 const { std::cell::RefCell::new(Vec::new()) };
         }
         return RECT_CACHE.with(|cell| {
             let mut cache = cell.borrow_mut();
-            if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
-                let arc = cache[pos].1.clone();
+            let cur_ver = sheet.cell_version();
+            if let Some(pos) = cache.iter().position(|e| {
+                e.sheet_id == sheet.identity
+                    && e.rect == rect
+                    && (&e.last_version == cur_ver || slabs_match_rect(sheet, rect, &e.slabs))
+            }) {
+                cache[pos].last_version = cur_ver.clone();
+                let arc = cache[pos].set.clone();
                 if pos != 0 {
                     cache.swap(0, pos);
                 }
                 return Some(arc);
             }
-            let set: std::sync::Arc<std::collections::HashSet<String>> =
-                std::sync::Arc::new(collect_rect(sheet, rect).into_iter().collect());
+            let set = std::sync::Arc::new(collect_rect_set(sheet, rect));
+            let slabs = rect_slabs(sheet, rect);
             if cache.len() >= 8 {
                 cache.pop();
             }
-            cache.insert(0, (key, set.clone()));
+            cache.insert(
+                0,
+                CachedRectEntry {
+                    sheet_id: sheet.identity,
+                    rect,
+                    last_version: cur_ver.clone(),
+                    slabs,
+                    set: set.clone(),
+                },
+            );
             Some(set)
         });
     }
-    dynamic_source(wb, si, &shifted).map(|v| std::sync::Arc::new(v.into_iter().collect()))
+    dynamic_source(wb, si, shifted).map(|v| std::sync::Arc::new(v.into_iter().collect()))
+}
+
+fn cached_list_set_wb(
+    wb: &crate::model::Workbook,
+    si: usize,
+    dv: &DataValidation,
+    r: u32,
+    c: u32,
+) -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+    let expr = list_expression(wb, si, dv);
+    let (ar, ac) = range_anchor(dv, r, c);
+    let shifted = crate::cf::shift_formula(expr, r - ar, c - ac);
+    cached_list_set_for_shifted(wb, si, &shifted)
 }
 
 /// 带工作簿上下文的校验入口：列表来源可解析为命名区域或跨表区域，并复用版本安全的候选集合缓存。
@@ -1054,7 +1276,7 @@ where
         }
         return match value {
             Value::Text(s) => set.contains(s.as_ref()),
-            _ => set.contains(&value.display()),
+            _ => value.with_display_str(|s| set.contains(s)),
         };
     }
     validate_impl(dv, value, wb.sheet(si), r, c, None, formula_eval)
@@ -1634,5 +1856,42 @@ mod c07_offset_tests {
             list_items_wb(&wb, 0, &dv2, 0, 0).as_deref(),
             Some(&["100".to_string(), "200".to_string(), "300".to_string(), "400".to_string(), "500".to_string()][..])
         );
+    }
+}
+
+
+#[cfg(test)]
+mod wave5_dv_cache_tests {
+    use super::*;
+    use crate::model::{Cell, Value, Workbook};
+
+    #[test]
+    fn same_sheet_range_list_cache_stays_warm_across_unrelated_edits_and_invalidates_on_source_edit() {
+        let mut wb = Workbook::new_blank();
+        for (r, item) in ["合格", "待检", "报废"].iter().enumerate() {
+            wb.sheets[0].set(r as u32, 0, Cell { value: Value::Text((*item).into()), formula: None });
+        }
+        let dv = DataValidation {
+            ranges: vec![(0, 1, 5_000, 1)],
+            kind: DvKind::List,
+            f1: "=$A$1:$A$10".into(),
+            ..Default::default()
+        };
+        let arc_before = cached_list_set_wb(&wb, 0, &dv, 10, 1).unwrap();
+        assert!(validate_wb(&wb, 0, &dv, &Value::Text("合格".into()), 10, 1, |_, _, _| crate::formula::FValue::Bool(true)));
+
+        // Edit 100 cells in column B on the SAME sheet: A1:A10 slab pointers are unchanged -> exact Arc hit!
+        for r in 0..100u32 {
+            wb.sheets[0].set(r, 1, Cell { value: Value::Text("合格".into()), formula: None });
+        }
+        let arc_after_unrelated = cached_list_set_wb(&wb, 0, &dv, 50, 1).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&arc_before, &arc_after_unrelated),
+            "same-sheet edits outside DV source range must keep cached HashSet warm"
+        );
+
+        // Edit A4 inside source range -> cache must invalidate and accept new item
+        wb.sheets[0].set(3, 0, Cell { value: Value::Text("返修".into()), formula: None });
+        assert!(validate_wb(&wb, 0, &dv, &Value::Text("返修".into()), 50, 1, |_, _, _| crate::formula::FValue::Bool(true)));
     }
 }

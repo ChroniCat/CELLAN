@@ -67,6 +67,147 @@ fn col_w(sheet: &Sheet, c: u32) -> f32 {
     }
 }
 
+#[inline]
+fn axis_segment_at(
+    axis: &crate::layout::Axis,
+    h1: &[(u32, u32)],
+    h2: &[(u32, u32)],
+    pos: u32,
+    max_end: u32,
+) -> (u32, f32) {
+    let k1 = h1.partition_point(|&(lo, _)| lo <= pos);
+    if k1 > 0 && pos <= h1[k1 - 1].1 {
+        return (h1[k1 - 1].1.min(max_end), 0.0);
+    }
+    let next_h1 = h1.get(k1).map_or(u32::MAX, |&(lo, _)| lo);
+
+    let k2 = h2.partition_point(|&(lo, _)| lo <= pos);
+    if k2 > 0 && pos <= h2[k2 - 1].1 {
+        return (h2[k2 - 1].1.min(max_end), 0.0);
+    }
+    let next_h2 = h2.get(k2).map_or(u32::MAX, |&(lo, _)| lo);
+
+    let spans = axis.spans();
+    let ks = spans.partition_point(|s| s.start <= pos);
+    let (span_end, sz) = if ks > 0 && pos <= spans[ks - 1].end {
+        (spans[ks - 1].end, spans[ks - 1].size)
+    } else {
+        let next_s = spans.get(ks).map_or(u32::MAX, |s| s.start);
+        (next_s - 1, axis.size(pos))
+    };
+    let seg_end = max_end
+        .min(span_end)
+        .min(next_h1 - 1)
+        .min(next_h2 - 1);
+    (seg_end, sz)
+}
+
+fn sum_axis_px(
+    axis: &crate::layout::Axis,
+    h1: &[(u32, u32)],
+    h2: &[(u32, u32)],
+    lo: u32,
+    hi: u32,
+) -> f32 {
+    if lo > hi {
+        return 0.0;
+    }
+    let mut total = 0.0f64;
+    let mut pos = lo;
+    while pos <= hi {
+        let (seg_end, sz) = axis_segment_at(axis, h1, h2, pos, hi);
+        total += (seg_end - pos + 1) as f64 * f64::from(sz);
+        match seg_end.checked_add(1) {
+            Some(next) => pos = next,
+            None => break,
+        }
+    }
+    total as f32
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paginate_axis(
+    axis: &crate::layout::Axis,
+    h1: &[(u32, u32)],
+    h2: &[(u32, u32)],
+    sorted_breaks: &[u32],
+    start_idx: u32,
+    end_idx: u32,
+    px: f32,
+    body_limit: f32,
+) -> Vec<(u32, u32)> {
+    if start_idx > end_idx {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut page_start = start_idx;
+    let mut break_cursor = sorted_breaks.partition_point(|&b| b <= start_idx);
+    while page_start <= end_idx {
+        while break_cursor < sorted_breaks.len() && sorted_breaks[break_cursor] <= page_start {
+            break_cursor += 1;
+        }
+        let mut used = 0.0f32;
+        let mut cur = page_start;
+        while cur <= end_idx {
+            if cur > page_start && sorted_breaks.get(break_cursor) == Some(&cur) {
+                break;
+            }
+            let next_brk_limit = sorted_breaks
+                .get(break_cursor)
+                .map_or(end_idx, |&b| (b - 1).min(end_idx));
+            let (seg_end, sz) = axis_segment_at(axis, h1, h2, cur, next_brk_limit);
+            let item_pt = sz * px;
+            if item_pt <= 0.0 {
+                match seg_end.checked_add(1) {
+                    Some(next) => cur = next,
+                    None => {
+                        cur = end_idx.saturating_add(1);
+                        break;
+                    }
+                }
+                continue;
+            }
+            if cur == page_start && used + item_pt > body_limit {
+                cur += 1;
+                break;
+            }
+            if cur > page_start && used + item_pt > body_limit {
+                break;
+            }
+            let seg_len = seg_end - cur + 1;
+            if seg_len >= 4 {
+                let avail = (body_limit - used).max(0.0);
+                let jump = ((avail / item_pt).floor() as u32)
+                    .min(seg_len)
+                    .saturating_sub(1);
+                if jump > 0 {
+                    used += jump as f32 * item_pt;
+                    cur += jump;
+                }
+            }
+            let mut stopped = false;
+            while cur <= seg_end {
+                if cur > page_start && used + item_pt > body_limit {
+                    stopped = true;
+                    break;
+                }
+                used += item_pt;
+                cur += 1;
+            }
+            if stopped {
+                break;
+            }
+        }
+        let page_end = cur.saturating_sub(1).min(end_idx).max(page_start);
+        out.push((page_start, page_end));
+        match page_end.checked_add(1) {
+            Some(next) => page_start = next,
+            None => break,
+        }
+    }
+    out
+}
+
 /// 分页：按列宽/行高累加，超出可打印区就换页。
 ///
 /// 打印标题（顶端标题行 / 左侧标题列）每页重复，正文从标题之后开始：
@@ -98,9 +239,13 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
     r2 = r2.max(r1);
     c2 = c2.max(c1);
 
+    let hr1 = sheet.hidden_rows.intervals();
+    let hr2 = sheet.hidden_rows_user.intervals();
+    let hc1 = sheet.hidden_cols.intervals();
+
     let mut scale = if setup.fit_to_page {
         let target_w = printable.0 * setup.fit_width.max(1) as f32;
-        let total_w: f32 = (c1..=c2).map(|c| col_w(sheet, c)).sum();
+        let total_w = sum_axis_px(&sheet.cols, hc1, &[], c1, c2);
         if total_w > 0.0 {
             (target_w / (total_w * 0.75)).min(1.0)
         } else {
@@ -111,7 +256,7 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
     };
     if setup.fit_to_page && setup.fit_height > 0 {
         let target_h = printable.1 * setup.fit_height as f32;
-        let total_h: f32 = (r1..=r2).map(|r| row_h(sheet, r)).sum();
+        let total_h = sum_axis_px(&sheet.rows, hr1, hr2, r1, r2);
         if total_h > 0.0 {
             scale = scale.min((target_h / (total_h * 0.75)).min(1.0));
         }
@@ -121,11 +266,11 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
     let title_rows = setup.title_rows.map(|(a, b)| (a, b.min(r2))).filter(|(a, b)| a <= b);
     let title_cols = setup.title_cols.map(|(a, b)| (a, b.min(c2))).filter(|(a, b)| a <= b);
     let head_rows_h: f32 = match title_rows {
-        Some((a, b)) => (a..=b).map(|r| row_h(sheet, r) * px).sum(),
+        Some((a, b)) => sum_axis_px(&sheet.rows, hr1, hr2, a, b) * px,
         None => 0.0,
     };
     let head_cols_w: f32 = match title_cols {
-        Some((a, b)) => (a..=b).map(|c| col_w(sheet, c) * px).sum(),
+        Some((a, b)) => sum_axis_px(&sheet.cols, hc1, &[], a, b) * px,
         None => 0.0,
     };
 
@@ -134,44 +279,32 @@ pub fn paginate(sheet: &Sheet, setup: &PageSetup) -> Layout {
     let br1 = title_rows.map(|(_, b)| b + 1).unwrap_or(r1).max(r1).min(r2);
     let bc1 = title_cols.map(|(_, b)| b + 1).unwrap_or(c1).max(c1).min(c2);
 
-    let mut pages = Vec::new();
-    let mut row = br1;
-    while row <= r2 {
-        let mut used = 0.0f32;
-        let mut last_row = row;
-        while last_row <= r2 {
-            // 手动分页：用户在该行之前插入了分页符
-            if last_row > row && setup.row_breaks.contains(&last_row) {
-                break;
-            }
-            let h = row_h(sheet, last_row) * px;
-            if used + h > body_top && last_row > row {
-                break;
-            }
-            used += h;
-            last_row += 1;
+    let mut row_breaks: Vec<u32> = setup
+        .row_breaks
+        .iter()
+        .copied()
+        .filter(|&b| b > br1 && b <= r2)
+        .collect();
+    row_breaks.sort_unstable();
+    row_breaks.dedup();
+
+    let mut col_breaks: Vec<u32> = setup
+        .col_breaks
+        .iter()
+        .copied()
+        .filter(|&b| b > bc1 && b <= c2)
+        .collect();
+    col_breaks.sort_unstable();
+    col_breaks.dedup();
+
+    let row_spans = paginate_axis(&sheet.rows, hr1, hr2, &row_breaks, br1, r2, px, body_top);
+    let col_spans = paginate_axis(&sheet.cols, hc1, &[], &col_breaks, bc1, c2, px, body_left);
+
+    let mut pages = Vec::with_capacity(row_spans.len() * col_spans.len());
+    for &rows in &row_spans {
+        for &cols in &col_spans {
+            pages.push(PageSpan { rows, cols });
         }
-        let rows_end = last_row.saturating_sub(1).min(r2).max(row);
-        let mut col = bc1;
-        while col <= c2 {
-            let mut wused = 0.0f32;
-            let mut last_col = col;
-            while last_col <= c2 {
-                if last_col > col && setup.col_breaks.contains(&last_col) {
-                    break;
-                }
-                let w = col_w(sheet, last_col) * px;
-                if wused + w > body_left && last_col > col {
-                    break;
-                }
-                wused += w;
-                last_col += 1;
-            }
-            let cols_end = last_col.saturating_sub(1).min(c2).max(col);
-            pages.push(PageSpan { rows: (row, rows_end), cols: (col, cols_end) });
-            col = cols_end + 1;
-        }
-        row = rows_end + 1;
     }
     if pages.is_empty() {
         pages.push(PageSpan { rows: (r1, r2), cols: (c1, c2) });
@@ -508,10 +641,13 @@ fn grid_rect(
     // anchor 语义：to 是边界格（不含），from/to 各带 EMU 偏移；1px = 9525 EMU。
     // 不用「逐格累加」——那会把 to 也画进去，图片比 Excel 宽一整列。
     let e = |v: i64| v as f32 / 9525.0;
-    let x1: f32 = (0..c1).map(|c| col_w(sheet, c)).sum::<f32>() + e(off[0]);
-    let x2: f32 = (0..c2).map(|c| col_w(sheet, c)).sum::<f32>() + e(off[2]);
-    let t1: f32 = (0..r1).map(|r| row_h(sheet, r)).sum::<f32>() + e(off[1]);
-    let t2: f32 = (0..r2).map(|r| row_h(sheet, r)).sum::<f32>() + e(off[3]);
+    let hc = sheet.hidden_cols.intervals();
+    let hr1 = sheet.hidden_rows.intervals();
+    let hr2 = sheet.hidden_rows_user.intervals();
+    let x1: f32 = if c1 > 0 { sum_axis_px(&sheet.cols, hc, &[], 0, c1 - 1) } else { 0.0 } + e(off[0]);
+    let x2: f32 = if c2 > 0 { sum_axis_px(&sheet.cols, hc, &[], 0, c2 - 1) } else { 0.0 } + e(off[2]);
+    let t1: f32 = if r1 > 0 { sum_axis_px(&sheet.rows, hr1, hr2, 0, r1 - 1) } else { 0.0 } + e(off[1]);
+    let t2: f32 = if r2 > 0 { sum_axis_px(&sheet.rows, hr1, hr2, 0, r2 - 1) } else { 0.0 } + e(off[3]);
     let (xa, xb) = (x1 * px + sx, x2 * px + sx);
     let (ta, tb) = (t1 * px, t2 * px);
     let w = (xb - xa).max(1.0);
@@ -1272,4 +1408,38 @@ fn nice_max(v: f64) -> f64 {
         }
     }
     base * 10.0
+}
+
+
+#[cfg(test)]
+mod wave5_print_tests {
+    use super::*;
+    use crate::model::{Cell, Sheet, Value};
+
+    #[test]
+    fn paginate_million_row_filtered_sheet_and_fit_to_page_runs_in_o_spans() {
+        let mut sh = Sheet::new("MillionPrint");
+        sh.set(0, 0, Cell { value: Value::Text("Title".into()), formula: None });
+        sh.set(999_999, 3, Cell { value: Value::Number(42.0), formula: None });
+        // Hide rows 20..=999_989 as a single filtered interval -> only 30 visible rows!
+        sh.hidden_rows = vec![(20, 999_989)].into();
+
+        let mut setup = PageSetup::default();
+        let t0 = std::time::Instant::now();
+        let layout = paginate(&sh, &setup);
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(elapsed_ms < 20.0, "expected O(spans) < 20 ms, got {elapsed_ms:.2} ms");
+        assert_eq!(layout.pages.len(), 1, "30 visible rows with 999,970 hidden rows must fit on 1 page");
+        assert_eq!(layout.pages[0].rows, (0, 999_999));
+
+        // Fit-to-page on 1M visible rows also finishes in O(spans)
+        sh.hidden_rows = Default::default();
+        setup.fit_to_page = true;
+        setup.fit_width = 1;
+        setup.fit_height = 1;
+        let t1 = std::time::Instant::now();
+        let fit_layout = paginate(&sh, &setup);
+        assert!(t1.elapsed().as_secs_f64() * 1000.0 < 20.0);
+        assert!(!fit_layout.pages.is_empty());
+    }
 }
