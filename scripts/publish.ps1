@@ -7,6 +7,7 @@ param(
     [int]$Port = 48768,
     [string]$UpdateUrl = "",
     [string]$PgoProfdata = "",
+    [switch]$NoPgo,
     [switch]$NoServe,
     [switch]$PrepareOnly
 )
@@ -205,32 +206,104 @@ if ($LASTEXITCODE -ne 0 -or $pending) {
     throw "Release sources must be clean. Review and commit the prepared version and public key before building."
 }
 
-# 4. Build static single-file release executable with embedded update endpoint
+# 4. Build static single-file release executable with embedded update endpoint (x86-64-v3 + optional/auto PGO)
+function Test-ValidLlvmProfdata([string]$Candidate) {
+    if ([string]::IsNullOrWhiteSpace($Candidate) -or -not (Test-Path -LiteralPath $Candidate)) {
+        return $false
+    }
+    $resolved = (Resolve-Path -LiteralPath $Candidate).Path
+    if ($resolved -match '\s') {
+        return $false
+    }
+    $item = Get-Item -LiteralPath $resolved -ErrorAction SilentlyContinue
+    if (-not $item -or $item.Length -lt 64) {
+        return $false
+    }
+    $hdr = New-Object byte[] 8
+    $stream = [System.IO.File]::Open($resolved, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        if ($stream.Read($hdr, 0, 8) -ne 8) { return $false }
+    } finally {
+        $stream.Dispose()
+    }
+    # LLVM indexed instrprof magic: 0xff6c70726f666981 (little-endian: 81 'i' 'f' 'o' 'r' 'p' 'l' ff)
+    $isLe = ($hdr[0] -eq 0x81 -and $hdr[1] -eq 0x69 -and $hdr[2] -eq 0x66 -and $hdr[3] -eq 0x6F -and
+             $hdr[4] -eq 0x72 -and $hdr[5] -eq 0x70 -and $hdr[6] -eq 0x6C -and $hdr[7] -eq 0xFF)
+    $isBe = ($hdr[0] -eq 0xFF -and $hdr[1] -eq 0x6C -and $hdr[2] -eq 0x70 -and $hdr[3] -eq 0x72 -and
+             $hdr[4] -eq 0x6F -and $hdr[5] -eq 0x66 -and $hdr[6] -eq 0x69 -and $hdr[7] -eq 0x81)
+    return ($isLe -or $isBe)
+}
+
+function Invoke-ReleaseCargoBuild([switch]$AllowOnlineFallback) {
+    & cargo build --release --locked --offline -p app --features wgpu,glow
+    if ($LASTEXITCODE -eq 0) { return $true }
+    if (-not $AllowOnlineFallback) { return $false }
+    Write-Host "[build] Offline cache incomplete, retrying cargo build without --offline..." -ForegroundColor Yellow
+    & cargo build --release --locked -p app --features wgpu,glow
+    return ($LASTEXITCODE -eq 0)
+}
+
 $env:CELLAN_RELEASE_COMMIT = $releaseCommit
 $env:CARGO_TARGET_DIR = Join-Path $repoRoot "target"
-$rustFlags = "-C target-feature=+crt-static -C target-cpu=x86-64-v2"
-if (-not [string]::IsNullOrWhiteSpace($PgoProfdata)) {
-    if (-not (Test-Path -LiteralPath $PgoProfdata)) {
-        throw "PGO profile data file not found: $PgoProfdata"
+$baseRustFlags = "-C target-feature=+crt-static -C target-cpu=x86-64-v3"
+$rustFlags = $baseRustFlags
+$autoDetectedPgo = $false
+
+if (-not $NoPgo) {
+    if (-not [string]::IsNullOrWhiteSpace($PgoProfdata)) {
+        if (-not (Test-Path -LiteralPath $PgoProfdata)) {
+            throw "PGO profile data file not found: $PgoProfdata"
+        }
+        $resolvedProfdata = (Resolve-Path -LiteralPath $PgoProfdata).Path
+        if ($resolvedProfdata -match '\s') {
+            throw "PGO profile data path must not contain whitespace (RUSTFLAGS is space-delimited): $resolvedProfdata"
+        }
+        if (-not (Test-ValidLlvmProfdata $resolvedProfdata)) {
+            throw "Invalid or corrupted LLVM .profdata file: $resolvedProfdata"
+        }
+        $rustFlags = "$baseRustFlags -C profile-use=$resolvedProfdata -C llvm-args=-pgo-warn-missing-function"
+        Write-Host "[pgo] Using explicit profile data: $resolvedProfdata" -ForegroundColor Cyan
+    } else {
+        $pgoCandidates = @()
+        if (-not [string]::IsNullOrWhiteSpace($env:CELLAN_PGO_PROFDATA)) {
+            $pgoCandidates += $env:CELLAN_PGO_PROFDATA
+        }
+        $pgoCandidates += @(
+            "D:\CELLAN-build\pgo\cellan.profdata",
+            (Join-Path $keyDir "cellan.profdata"),
+            (Join-Path $repoRoot "target\pgo\cellan.profdata")
+        )
+        $validPgoItems = @(
+            $pgoCandidates |
+                Where-Object { Test-ValidLlvmProfdata $_ } |
+                ForEach-Object { Get-Item -LiteralPath (Resolve-Path -LiteralPath $_).Path } |
+                Sort-Object LastWriteTimeUtc -Descending
+        )
+        if ($validPgoItems.Count -gt 0) {
+            $resolvedProfdata = $validPgoItems[0].FullName
+            $autoDetectedPgo = $true
+            $rustFlags = "$baseRustFlags -C profile-use=$resolvedProfdata -C llvm-args=-pgo-warn-missing-function"
+            Write-Host "[pgo] Auto-detected latest valid profile data: $resolvedProfdata" -ForegroundColor Cyan
+        } else {
+            Write-Host "[pgo] No local .profdata detected; building with x86-64-v3 + fat LTO." -ForegroundColor DarkGray
+        }
     }
-    $resolvedProfdata = (Resolve-Path -LiteralPath $PgoProfdata).Path
-    if ($resolvedProfdata -match '\s') {
-        throw "PGO profile data path must not contain whitespace (RUSTFLAGS is space-delimited): $resolvedProfdata"
-    }
-    $rustFlags = "$rustFlags -C profile-use=$resolvedProfdata -C llvm-args=-pgo-warn-missing-function"
-    Write-Host "[pgo] Using profile data: $resolvedProfdata" -ForegroundColor Cyan
 }
+
 $env:RUSTFLAGS = $rustFlags
 $env:CELLAN_DEFAULT_UPDATE_URL = $UpdateUrl
 $env:CELLAN_UPDATE_PUBKEY = $pubHex
 
-Write-Host "[build] Building static release CELLAN.exe (wgpu + glow)..." -ForegroundColor Yellow
-& cargo build --release --locked --offline -p app --features wgpu,glow
-if ($LASTEXITCODE -ne 0) {
-    if ($NoServe) { throw "Offline cargo build failed with exit code $LASTEXITCODE" }
-    Write-Host "[build] Offline cache incomplete, retrying cargo build without --offline..." -ForegroundColor Yellow
-    & cargo build --release --locked -p app --features wgpu,glow
-    if ($LASTEXITCODE -ne 0) {
+Write-Host "[build] Building static release CELLAN.exe (wgpu + glow, x86-64-v3)..." -ForegroundColor Yellow
+$allowOnline = (-not $NoServe)
+if (-not (Invoke-ReleaseCargoBuild -AllowOnlineFallback:$allowOnline)) {
+    if ($autoDetectedPgo) {
+        Write-Warning "[pgo] Build with auto-detected .profdata failed (possibly stale toolchain version); falling back to standard x86-64-v3 build..."
+        $env:RUSTFLAGS = $baseRustFlags
+        if (-not (Invoke-ReleaseCargoBuild -AllowOnlineFallback:$allowOnline)) {
+            throw "cargo build failed with exit code $LASTEXITCODE"
+        }
+    } else {
         throw "cargo build failed with exit code $LASTEXITCODE"
     }
 }

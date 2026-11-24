@@ -15,6 +15,13 @@ codegen-units = 1
 strip = "symbols"
 panic = "abort"
 
+# 基准测试与高频剖析采用 thin LTO + 16 并行代码生成单元（继承 release 的 opt-level = 3），
+# 将大型套件编译耗时从 ~9 分钟缩短至 ~1 分钟；正式发版仍走上方 fat LTO。
+[profile.bench]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 # 协作房间口令用 PBKDF2 拉伸（故意慢），工作簿加密也要跑 10 万轮 SHA-512。
 # 调试构建里未优化的哈希压缩函数会慢一个数量级，让测试里的握手超时；
 # 只对哈希库开优化，不影响其余代码的调试体验。

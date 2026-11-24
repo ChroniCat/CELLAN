@@ -4366,7 +4366,6 @@ dependencies = [
  "indexmap",
  "memchr",
  "typed-path 0.12.4",
- "zopfli",
 ]
 
 [[package]]
