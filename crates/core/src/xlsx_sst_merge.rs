@@ -3,10 +3,10 @@
 use super::{SHEET_NS, STRICT_NS, Window, attr, inherited_attribute, xml_input};
 use anyhow::{Context, Result, ensure};
 use quick_xml::{
-    Writer,
+    NsReader, Writer,
     events::{BytesStart, Event},
+    name::ResolveResult,
 };
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -16,75 +16,178 @@ use zip::{ZipArchive, write::SimpleFileOptions};
 
 pub(in crate::xlsx) const PART: &str = "xl/sharedStrings.xml";
 
+#[derive(PartialEq, Eq, Hash)]
+enum ItemKey {
+    Plain { preserve: bool, text: Box<str> },
+    Raw(Box<[u8]>),
+}
+
 /// umya adds an empty phoneticPr to every SI, even to plain strings without
 /// phonetic runs. Only canonicalize this exact shape; preserve rich runs, actual
 /// pronunciation data, foreign elements and unknown attributes by raw identity.
-fn item_key(item: &[u8]) -> Result<[u8; 32]> {
-    const XML: &str = "http://www.w3.org/XML/1998/namespace";
+fn item_key(item: &[u8]) -> Result<ItemKey> {
+    const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
     let xml = std::str::from_utf8(item)?;
-    let raw = || {
-        let mut hash = Sha256::new();
-        hash.update([0]);
-        hash.update(item);
-        <[u8; 32]>::from(hash.finalize())
-    };
+    let raw = || ItemKey::Raw(item.to_vec().into_boxed_slice());
     if xml.contains("<r>") || xml.contains("<rPh") {
         return Ok(raw());
     }
-    let Ok(doc) = roxmltree::Document::parse(xml) else {
-        return Ok(raw());
-    };
-    let si = doc.root_element();
-    let ns = si.tag_name().namespace();
-    let plain_attributes = |node: roxmltree::Node| {
-        node.attributes().all(|a| {
-            a.namespace() == Some(XML)
-                && a.name() == "space"
-                && matches!(a.value(), "default" | "preserve")
-        })
-    };
-    let plain = || {
-        if !matches!(ns, Some(SHEET_NS | STRICT_NS))
-            || si.tag_name().name() != "si"
-            || !plain_attributes(si)
-        {
-            return None;
-        }
-        let mut children = si
-            .children()
-            .filter(|n| !n.is_text() || !n.text().unwrap_or("").trim().is_empty());
-        let t = children.next()?;
-        if !t.has_tag_name((ns?, "t"))
-            || !plain_attributes(t)
-            || !t.children().all(|n| n.is_text())
-            || t.children().count() > 1
-        {
-            return None;
-        }
-        if let Some(pr) = children.next() {
-            if !pr.has_tag_name((ns?, "phoneticPr"))
-                || pr.attributes().len() != 1
-                || pr.attribute("fontId") != Some("1")
-                || pr.has_children()
-                || children.next().is_some()
-            {
-                return None;
+    let plain = (|| -> Option<(String, bool)> {
+        let mut reader = NsReader::from_str(xml);
+        let mut si_ns = String::new();
+        let mut si_space: Option<String> = None;
+        let mut t_space: Option<String> = None;
+        let mut saw_t = false;
+        let mut saw_phonetic = false;
+        let mut in_t = false;
+        let mut in_phonetic = false;
+        let mut text = String::new();
+        let mut depth = 0usize;
+
+        let check_plain_attrs = |reader: &NsReader<&[u8]>,
+                                 e: &BytesStart<'_>|
+         -> Option<Option<String>> {
+            let mut space = None;
+            for a in e.attributes() {
+                let a = a.ok()?;
+                let k = a.key.as_ref();
+                if k == "xmlns" || k.starts_with("xmlns:") {
+                    continue;
+                }
+                let (ns, local) = reader.resolver().resolve(a.key, false);
+                let is_xml = matches!(ns, ResolveResult::Bound(n) if n.0 == XML_NS);
+                if !is_xml || local.as_ref() != "space" {
+                    return None;
+                }
+                let val = quick_xml::escape::unescape(&a.value).ok()?;
+                if !matches!(val.as_ref(), "default" | "preserve") {
+                    return None;
+                }
+                space = Some(val.into_owned());
+            }
+            Some(space)
+        };
+
+        loop {
+            let (ns, ev) = reader.read_resolved_event().ok()?;
+            let bound = match ns {
+                ResolveResult::Bound(n) => Some(n.0),
+                ResolveResult::Unbound => None,
+                ResolveResult::Unknown(_) => return None,
+            };
+            match ev {
+                Event::Start(ref e) | Event::Empty(ref e) => {
+                    let empty = matches!(ev, Event::Empty(_));
+                    let local = e.local_name();
+                    if depth == 0 {
+                        let ns_str = bound?;
+                        if !matches!(ns_str, SHEET_NS | STRICT_NS) || local.as_ref() != "si" {
+                            return None;
+                        }
+                        si_ns = ns_str.to_owned();
+                        si_space = check_plain_attrs(&reader, e)?;
+                        if empty {
+                            return None; // no <t> child
+                        }
+                        depth = 1;
+                    } else if depth == 1 {
+                        if bound != Some(si_ns.as_str()) {
+                            return None;
+                        }
+                        if !saw_t {
+                            if local.as_ref() != "t" {
+                                return None;
+                            }
+                            t_space = check_plain_attrs(&reader, e)?;
+                            saw_t = true;
+                            if !empty {
+                                in_t = true;
+                                depth = 2;
+                            }
+                        } else if !saw_phonetic {
+                            if local.as_ref() != "phoneticPr" {
+                                return None;
+                            }
+                            let mut attr_count = 0usize;
+                            let mut font_id_ok = false;
+                            for a in e.attributes() {
+                                let a = a.ok()?;
+                                let k = a.key.as_ref();
+                                if k == "xmlns" || k.starts_with("xmlns:") {
+                                    continue;
+                                }
+                                attr_count += 1;
+                                if k == "fontId"
+                                    && quick_xml::escape::unescape(&a.value).ok().as_deref() == Some("1")
+                                {
+                                    font_id_ok = true;
+                                }
+                            }
+                            if attr_count != 1 || !font_id_ok {
+                                return None;
+                            }
+                            saw_phonetic = true;
+                            if !empty {
+                                in_phonetic = true;
+                                depth = 2;
+                            }
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+                Event::Text(t) => {
+                    if in_t {
+                        text.push_str(&t.xml10_content());
+                    } else if in_phonetic || (depth == 1 && !t.as_ref().trim().is_empty()) {
+                        return None;
+                    }
+                }
+                Event::GeneralRef(g) => {
+                    if in_t {
+                        if let Ok(Some(ch)) = g.resolve_char_ref() {
+                            text.push(ch);
+                        } else {
+                            let s = crate::model::resolve_entity(g.as_ref().as_ref());
+                            if s.is_empty() {
+                                return None;
+                            }
+                            text.push_str(&s);
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+                Event::CData(_) | Event::Comment(_) | Event::PI(_) => {
+                    if depth >= 1 {
+                        return None;
+                    }
+                }
+                Event::End(_) => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 1 {
+                        in_t = false;
+                        in_phonetic = false;
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
             }
         }
-        let text = t.text().unwrap_or("");
-        let preserve = t
-            .attribute((XML, "space"))
-            .or_else(|| si.attribute((XML, "space")))
-            == Some("preserve")
-            && (text.starts_with([' ', '\r', '\n', '\t'])
-                || text.ends_with([' ', '\r', '\n', '\t']));
+        if depth != 0 || !saw_t {
+            return None;
+        }
+        let preserve = t_space.as_deref().or(si_space.as_deref()) == Some("preserve")
+            && (text.starts_with([' ', '\r', '\n', '\t']) || text.ends_with([' ', '\r', '\n', '\t']));
         Some((text, preserve))
-    };
-    if let Some((text, preserve)) = plain() {
-        let mut hash = Sha256::new();
-        hash.update([1, u8::from(preserve)]);
-        hash.update(text.as_bytes());
-        Ok(hash.finalize().into())
+    })();
+    if let Some((text, preserve)) = plain {
+        Ok(ItemKey::Plain {
+            preserve,
+            text: text.into_boxed_str(),
+        })
     } else {
         Ok(raw())
     }
@@ -185,29 +288,45 @@ impl Merge {
             keys.push(if used.contains(&keys.len()) { Some(item_key(item)?) } else { None });
             Ok(())
         })?;
-        let mut matches: HashMap<_, Option<usize>> = keys
+        let mut matches: HashMap<&ItemKey, Option<usize>> = keys
             .iter()
             .flatten()
-            .map(|&k| (k, None))
+            .map(|k| (k, None))
             .collect();
         let mut count = 0;
         let mut unmatched = matches.len();
         visit(source, |item| {
-            if unmatched != 0 && let Some(id) = matches.get_mut(&item_key(item)?) && id.is_none() {
-                *id = Some(count);
-                unmatched -= 1;
+            if unmatched != 0 {
+                let key = item_key(item)?;
+                if let Some(id) = matches.get_mut(&key) && id.is_none() {
+                    *id = Some(count);
+                    unmatched -= 1;
+                }
             }
             count += 1;
             Ok(())
         })?;
         ensure!(used.iter().all(|&i| i < keys.len()), "共享字符串索引越界");
+        let mut resolved_ids: HashMap<ItemKey, Option<usize>> = matches
+            .into_iter()
+            .map(|(k, v)| {
+                let cloned = match k {
+                    ItemKey::Plain { preserve, text } => ItemKey::Plain {
+                        preserve: *preserve,
+                        text: text.clone(),
+                    },
+                    ItemKey::Raw(b) => ItemKey::Raw(b.clone()),
+                };
+                (cloned, v)
+            })
+            .collect();
         for (i, key) in keys.into_iter().enumerate() {
             let Some(key) = key else {
                 merge.indices.push(i);
                 merge.append.push(false);
                 continue;
             };
-            let id = matches.get_mut(&key).context("missing shared string")?;
+            let id = resolved_ids.get_mut(&key).context("missing shared string")?;
             merge.append.push(id.is_none());
             merge.indices.push(*id.get_or_insert_with(|| {
                 count += 1;

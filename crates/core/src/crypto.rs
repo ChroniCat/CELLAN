@@ -67,46 +67,9 @@ pub fn has_magic(path: &Path, magic: &[u8]) -> bool {
     f.read_exact(&mut buf).is_ok() && buf.as_slice() == magic
 }
 
-/// 是否是 CFB 容器里的 Office 加密文件（流式扫描，绝不整包分配大文件内存）
+/// 是否是 CFB 容器里的 Office 加密文件（按需读 CFB 头与目录扇区，不整包扫描）
 pub fn needs_password(path: &Path) -> bool {
-    const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut magic = [0u8; 8];
-    if f.read_exact(&mut magic).is_err() || magic != CFB_MAGIC {
-        return false;
-    }
-    if f.seek(std::io::SeekFrom::Start(0)).is_err() {
-        return false;
-    }
-    // CFB 目录项名是 UTF-16LE "EncryptedPackage"（32 字节）
-    let needle: [u8; 32] = [
-        b'E', 0, b'n', 0, b'c', 0, b'r', 0, b'y', 0, b'p', 0, b't', 0, b'e', 0,
-        b'd', 0, b'P', 0, b'a', 0, b'c', 0, b'k', 0, b'a', 0, b'g', 0, b'e', 0,
-    ];
-    let overlap = needle.len() - 1;
-    let mut buf = [0u8; 65536];
-    let mut carry = 0usize;
-    loop {
-        let n = match f.read(&mut buf[carry..]) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return false,
-        };
-        let total = carry + n;
-        if find_bytes(&buf[..total], &needle).is_some() {
-            return true;
-        }
-        if total >= overlap {
-            buf.copy_within(total - overlap..total, 0);
-            carry = overlap;
-        } else {
-            carry = total;
-        }
-    }
-    false
+    crate::cfb::has_encrypted_package_file(path)
 }
 
 pub fn needs_password_bytes(bytes: &[u8]) -> bool {
@@ -151,19 +114,44 @@ fn utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
-/// 迭代哈希到 H_final（spinCount 次）
+const SHA512_IV: [u64; 8] = [
+    0x6a09e667f3bcc908,
+    0xbb67ae8584caa73b,
+    0x3c6ef372fe94f82b,
+    0xa54ff53a5f1d36f1,
+    0x510e527fade682d1,
+    0x9b05688c2b3e6c1f,
+    0x1f83d9abfb41bd6b,
+    0x5be0cd19137e2179,
+];
+
+const PARALLEL_THRESHOLD: usize = 64 * 1024;
+
+/// 迭代哈希到 H_final（spinCount 次）。
+///
+/// 热循环每轮固定输入 68 字节 `LE32(i) || H_prev(64B)`，恰好装入单个 128 字节 SHA-512 块，
+/// 直接调用 `sha2::block_api::compress512` 消除每轮 `Sha512::new()/update()/finalize()` 抽象与拷贝开销。
 fn hash_final(password: &str, salt: &[u8], spin: u32) -> [u8; 64] {
+    use sha2::block_api::compress512;
     let mut h = Sha512::new();
     h.update(salt);
     h.update(utf16le(password));
-    let mut cur: [u8; 64] = h.finalize().into();
+    let init: [u8; 64] = h.finalize().into();
+
+    let mut block = [0u8; 128];
+    block[4..68].copy_from_slice(&init);
+    block[68] = 0x80;
+    block[120..128].copy_from_slice(&(68u64 * 8).to_be_bytes());
     for i in 0..spin {
-        let mut d = Sha512::new();
-        // 规范：H(pack("<I", i) || H_prev)，序号在前
-        d.update(i.to_le_bytes());
-        d.update(cur);
-        cur = d.finalize().into();
+        block[0..4].copy_from_slice(&i.to_le_bytes());
+        let mut st = SHA512_IV;
+        compress512(&mut st, &[block]);
+        for k in 0..8 {
+            block[4 + k * 8..12 + k * 8].copy_from_slice(&st[k].to_be_bytes());
+        }
     }
+    let mut cur = [0u8; 64];
+    cur.copy_from_slice(&block[4..68]);
     cur
 }
 
@@ -175,33 +163,90 @@ fn derive_key(h_final: &[u8; 64], block: &[u8; 8], key_bytes: usize) -> Vec<u8> 
     d.finalize()[..key_bytes].to_vec()
 }
 
-/// AES-256-CBC 解密（不做 PKCS#7：Office 的分段是零填充）
+/// AES-256-CBC 解密（小载荷单次调用；不做 PKCS#7，Office 分段为零填充）
 fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    use aes::cipher::{BlockCipherDecrypt, KeyInit};
+    use aes::cipher::KeyInit;
     if key.len() != 32 || iv.len() != 16 {
         bail!("AES 密钥/IV 长度不对");
     }
     let cipher = aes::Aes256::new_from_slice(key).map_err(|e| anyhow!("AES key: {e}"))?;
-    let mut out = Vec::with_capacity(data.len());
-    let mut prev = [0u8; 16];
-    prev.copy_from_slice(iv);
-    for chunk in data.chunks(16) {
-        let mut block = [0u8; 16];
-        block[..chunk.len()].copy_from_slice(chunk);
-        let mut b = block.into();
-        cipher.decrypt_block(&mut b);
-        let plain = b;
-        for i in 0..16 {
-            out.push(plain[i] ^ prev[i]);
-        }
-        prev.copy_from_slice(&block);
-    }
+    let iv_arr: [u8; 16] = iv.try_into().unwrap();
+    let padded = data.len().div_ceil(16) * 16;
+    let mut out = vec![0u8; padded];
+    decrypt_chunk_into(&cipher, &iv_arr, data, &mut out);
     Ok(out)
 }
 
-/// AES-256-CBC 加密（数据需 16 字节对齐）
+/// 复用已展开轮密钥的 `Aes256` 对一段（最多 4 KB）做批量 CBC 解密（利用 `decrypt_blocks` AES-NI 流水线）。
+fn decrypt_chunk_into(cipher: &aes::Aes256, iv: &[u8; 16], src: &[u8], dst: &mut [u8]) {
+    use aes::cipher::{Array, BlockCipherDecrypt};
+    if src.is_empty() {
+        return;
+    }
+    // 常规 4 KB 分段走栈缓冲零堆分配；若传入超过 4 KB 则按 4 KB 分批
+    let mut prev = u128::from_ne_bytes(*iv);
+    let mut off = 0usize;
+    let mut blocks = [Array::default(); SEGMENT / 16];
+    while off < src.len() {
+        let take = (src.len() - off).min(SEGMENT);
+        let chunk = &src[off..off + take];
+        let full = take / 16;
+        let rem = take % 16;
+        let n_blocks = full + usize::from(rem != 0);
+        for i in 0..full {
+            blocks[i].as_mut_slice().copy_from_slice(&chunk[i * 16..(i + 1) * 16]);
+        }
+        if rem != 0 {
+            let b = blocks[full].as_mut_slice();
+            b[..rem].copy_from_slice(&chunk[full * 16..]);
+            b[rem..].fill(0);
+        }
+        cipher.decrypt_blocks(&mut blocks[..n_blocks]);
+        for i in 0..full {
+            let ct = u128::from_ne_bytes(chunk[i * 16..(i + 1) * 16].try_into().unwrap());
+            let pt = u128::from_ne_bytes(blocks[i].into()) ^ prev;
+            dst[off + i * 16..off + (i + 1) * 16].copy_from_slice(&pt.to_ne_bytes());
+            prev = ct;
+        }
+        if rem != 0 {
+            let pt = u128::from_ne_bytes(blocks[full].into()) ^ prev;
+            dst[off + full * 16..off + (full + 1) * 16].copy_from_slice(&pt.to_ne_bytes());
+            let mut last_ct = [0u8; 16];
+            last_ct[..rem].copy_from_slice(&chunk[full * 16..]);
+            prev = u128::from_ne_bytes(last_ct);
+        }
+        off += take;
+    }
+}
+
+/// 复用已展开轮密钥的 `Aes256` 对一段做零分配 CBC 加密（不足 16 字节尾部自动补 0）。
+fn encrypt_chunk_into(cipher: &aes::Aes256, iv: &[u8; 16], src: &[u8], dst: &mut [u8]) {
+    use aes::cipher::{Array, BlockCipherEncrypt};
+    let full = src.len() / 16;
+    let rem = src.len() % 16;
+    let mut prev = u128::from_ne_bytes(*iv);
+    for i in 0..full {
+        let pt = u128::from_ne_bytes(src[i * 16..(i + 1) * 16].try_into().unwrap());
+        let mut b = Array::from((pt ^ prev).to_ne_bytes());
+        cipher.encrypt_block(&mut b);
+        let ct: [u8; 16] = b.into();
+        dst[i * 16..(i + 1) * 16].copy_from_slice(&ct);
+        prev = u128::from_ne_bytes(ct);
+    }
+    if rem != 0 {
+        let mut tail = [0u8; 16];
+        tail[..rem].copy_from_slice(&src[full * 16..]);
+        let pt = u128::from_ne_bytes(tail);
+        let mut b = Array::from((pt ^ prev).to_ne_bytes());
+        cipher.encrypt_block(&mut b);
+        let ct: [u8; 16] = b.into();
+        dst[full * 16..(full + 1) * 16].copy_from_slice(&ct);
+    }
+}
+
+/// AES-256-CBC 加密（小载荷单次调用，数据需 16 字节对齐）
 fn aes_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+    use aes::cipher::KeyInit;
     if key.len() != 32 || iv.len() != 16 {
         bail!("AES 密钥/IV 长度不对");
     }
@@ -209,20 +254,9 @@ fn aes_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         bail!("AES 明文未按 16 字节对齐");
     }
     let cipher = aes::Aes256::new_from_slice(key).map_err(|e| anyhow!("AES key: {e}"))?;
-    let mut out = Vec::with_capacity(data.len());
-    let mut prev = [0u8; 16];
-    prev.copy_from_slice(iv);
-    for chunk in data.chunks(16) {
-        let mut block = [0u8; 16];
-        for i in 0..16 {
-            block[i] = chunk[i] ^ prev[i];
-        }
-        let mut b = block.into();
-        cipher.encrypt_block(&mut b);
-        let cipher_block = b;
-        out.extend_from_slice(&cipher_block);
-        prev.copy_from_slice(&cipher_block);
-    }
+    let iv_arr: [u8; 16] = iv.try_into().unwrap();
+    let mut out = vec![0u8; data.len()];
+    encrypt_chunk_into(&cipher, &iv_arr, data, &mut out);
     Ok(out)
 }
 
@@ -253,6 +287,43 @@ fn hmac_sha512(key: &[u8], msg: &[u8]) -> [u8; 64] {
     outer.finalize().into()
 }
 
+struct SegmentIvGen<'a> {
+    salt: &'a [u8],
+    template: Option<[u8; 128]>,
+}
+
+impl<'a> SegmentIvGen<'a> {
+    fn new(salt: &'a [u8]) -> Self {
+        let template = if salt.len() <= 107 {
+            let mut block = [0u8; 128];
+            block[..salt.len()].copy_from_slice(salt);
+            block[salt.len() + 4] = 0x80;
+            let bit_len = ((salt.len() + 4) as u64) * 8;
+            block[120..128].copy_from_slice(&bit_len.to_be_bytes());
+            Some(block)
+        } else {
+            None
+        };
+        Self { salt, template }
+    }
+
+    #[inline]
+    fn iv(&self, index: u32) -> [u8; 16] {
+        if let Some(mut block) = self.template {
+            let off = self.salt.len();
+            block[off..off + 4].copy_from_slice(&index.to_le_bytes());
+            let mut st = SHA512_IV;
+            sha2::block_api::compress512(&mut st, &[block]);
+            let mut iv = [0u8; 16];
+            iv[..8].copy_from_slice(&st[0].to_be_bytes());
+            iv[8..16].copy_from_slice(&st[1].to_be_bytes());
+            iv
+        } else {
+            segment_iv(self.salt, index)
+        }
+    }
+}
+
 fn segment_iv(salt: &[u8], index: u32) -> [u8; 16] {
     let mut d = Sha512::new();
     d.update(salt);
@@ -263,20 +334,16 @@ fn segment_iv(salt: &[u8], index: u32) -> [u8; 16] {
     iv
 }
 
-/// 解出明文 xlsx 字节
-pub fn decrypt(path: &Path, password: &str) -> Result<Vec<u8>> {
-    let bytes = std::fs::read(path).with_context(|| format!("读取 {} 失败", path.display()))?;
-    decrypt_bytes(&bytes, password)
+fn segment_workers(payload_len: usize, num_segments: usize) -> usize {
+    if payload_len < PARALLEL_THRESHOLD || num_segments < 16 {
+        return 1;
+    }
+    let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    avail.min(8).min(num_segments / 8).max(1)
 }
 
-pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
-    let mut cf = cfb::CompoundFile::open(std::io::Cursor::new(bytes.to_vec()))
-        .map_err(|e| anyhow!("不是有效的 CFB 容器：{e}"))?;
-    let mut info = Vec::new();
-    cf.open_stream("EncryptionInfo")
-        .map_err(|e| anyhow!("缺少 EncryptionInfo：{e}"))?
-        .read_to_end(&mut info)?;
-    let xml = parse_info(&info)?;
+fn verify_and_extract_key(info: &[u8], password: &str) -> Result<(Vec<u8>, Vec<u8>, usize)> {
+    let xml = parse_info(info)?;
     if let Some(obj) = xml.cipher_algorithm.as_deref() {
         if !obj.eq_ignore_ascii_case("AES") {
             bail!("不支持的加密算法 {obj}");
@@ -307,6 +374,51 @@ pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
     if key.len() < key_bytes {
         bail!("包密钥长度不足");
     }
+    Ok((salt_pkg, key, key_bytes))
+}
+
+/// 轻量口令校验：仅解析 `EncryptionInfo` 并校验 `EncryptedVerifierHash`，不读取或解密正文。
+pub fn verify_password(path: &Path, password: &str) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("读取 {} 失败", path.display()))?;
+    let mut cf = cfb::CompoundFile::open(file)
+        .map_err(|e| anyhow!("不是有效的 CFB 容器：{e}"))?;
+    let mut info = Vec::new();
+    cf.open_stream("EncryptionInfo")
+        .map_err(|e| anyhow!("缺少 EncryptionInfo：{e}"))?
+        .read_to_end(&mut info)?;
+    let _ = verify_and_extract_key(&info, password)?;
+    Ok(())
+}
+
+/// 解出明文 xlsx 字节
+pub fn decrypt(path: &Path, password: &str) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path).with_context(|| format!("读取 {} 失败", path.display()))?;
+    decrypt_bytes(&bytes, password)
+}
+
+/// 解出明文 xlsx 字节并顺手返回 `(file_len, cfb_fingerprint)`，供 `load_with_password_diag` 写入缓存时免去二次打开源文件。
+pub(crate) fn decrypt_with_fingerprint(path: &Path, password: &str) -> Result<(Vec<u8>, u64, [u8; 32])> {
+    let bytes = std::fs::read(path).with_context(|| format!("读取 {} 失败", path.display()))?;
+    let len = bytes.len() as u64;
+    let fp = cfb_fingerprint_bytes(&bytes);
+    let plain = decrypt_bytes(&bytes, password)?;
+    Ok((plain, len, fp))
+}
+
+pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
+    use aes::cipher::KeyInit;
+    let mut cf = cfb::CompoundFile::open(std::io::Cursor::new(bytes))
+        .map_err(|e| anyhow!("不是有效的 CFB 容器：{e}"))?;
+    let mut info = Vec::new();
+    cf.open_stream("EncryptionInfo")
+        .map_err(|e| anyhow!("缺少 EncryptionInfo：{e}"))?
+        .read_to_end(&mut info)?;
+    let (salt_pkg, key, key_bytes) = verify_and_extract_key(&info, password)?;
+    if key_bytes != 32 {
+        bail!("AES 密钥/IV 长度不对");
+    }
+    let cipher = aes::Aes256::new_from_slice(&key[..32]).map_err(|e| anyhow!("AES key: {e}"))?;
 
     let mut pkg = Vec::new();
     cf.open_stream("EncryptedPackage")
@@ -315,14 +427,57 @@ pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
     if pkg.len() < 8 {
         bail!("EncryptedPackage 太短");
     }
-    let mut size = [0u8; 8];
-    size.copy_from_slice(&pkg[..8]);
-    let size = u64::from_le_bytes(size) as usize;
-    let mut out = Vec::with_capacity(size);
-    for (i, seg) in pkg[8..].chunks(SEGMENT).enumerate() {
-        let iv = segment_iv(&salt_pkg, i as u32);
-        let plain = aes_cbc_decrypt(&key[..key_bytes], &iv, seg)?;
-        out.extend_from_slice(&plain);
+    let mut size_bytes = [0u8; 8];
+    size_bytes.copy_from_slice(&pkg[..8]);
+    let size = u64::from_le_bytes(size_bytes) as usize;
+    let payload = &pkg[8..];
+    if payload.is_empty() || size == 0 {
+        return Ok(Vec::new());
+    }
+    let n_segs = payload.len().div_ceil(SEGMENT);
+    let last_len = payload.len() - (n_segs - 1) * SEGMENT;
+    let total_out = (n_segs - 1) * SEGMENT + last_len.div_ceil(16) * 16;
+    let mut out = vec![0u8; total_out];
+    let iv_gen = SegmentIvGen::new(&salt_pkg);
+    let workers = segment_workers(payload.len(), n_segs);
+
+    if workers == 1 {
+        for (i, seg) in payload.chunks(SEGMENT).enumerate() {
+            let dst_off = i * SEGMENT;
+            let dst_len = seg.len().div_ceil(16) * 16;
+            let iv = iv_gen.iv(i as u32);
+            decrypt_chunk_into(&cipher, &iv, seg, &mut out[dst_off..dst_off + dst_len]);
+        }
+    } else {
+        let segs_per_worker = n_segs.div_ceil(workers);
+        std::thread::scope(|s| {
+            let mut rem_out = out.as_mut_slice();
+            let mut seg_start = 0usize;
+            while seg_start < n_segs {
+                let seg_end = (seg_start + segs_per_worker).min(n_segs);
+                let src_start = seg_start * SEGMENT;
+                let src_end = (seg_end * SEGMENT).min(payload.len());
+                let src_slice = &payload[src_start..src_end];
+                let out_len = if seg_end == n_segs {
+                    rem_out.len()
+                } else {
+                    (seg_end - seg_start) * SEGMENT
+                };
+                let (dst_slice, rest) = rem_out.split_at_mut(out_len);
+                rem_out = rest;
+                let cipher = &cipher;
+                let iv_gen = &iv_gen;
+                s.spawn(move || {
+                    for (local_i, seg) in src_slice.chunks(SEGMENT).enumerate() {
+                        let dst_off = local_i * SEGMENT;
+                        let dst_len = seg.len().div_ceil(16) * 16;
+                        let iv = iv_gen.iv((seg_start + local_i) as u32);
+                        decrypt_chunk_into(cipher, &iv, seg, &mut dst_slice[dst_off..dst_off + dst_len]);
+                    }
+                });
+                seg_start = seg_end;
+            }
+        });
     }
     out.truncate(size);
     Ok(out)
@@ -392,14 +547,109 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
     Ok(v)
 }
 
+/// 计算加密 CFB 字节流的首尾指纹（与 `xlsx::encrypted_file_key` 保持字节级一致）：
+/// `SHA256(len_le64 || head[..8192] || tail[len-4096..])`。
+pub(crate) fn cfb_fingerprint_bytes(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let len = bytes.len() as u64;
+    let mut hasher = Sha256::new();
+    hasher.update(len.to_le_bytes());
+    let hn = bytes.len().min(8192);
+    hasher.update(&bytes[..hn]);
+    if bytes.len() > 8192 {
+        let tail_start = bytes.len().saturating_sub(4096).max(hn);
+        hasher.update(&bytes[tail_start..]);
+    }
+    hasher.finalize().into()
+}
+
 /// 把明文 xlsx 加密写成 CFB 容器（Agile，AES-256-CBC/SHA-512）
 pub fn encrypt(path: &Path, plain: &[u8], settings: &EncryptionSettings) -> Result<()> {
+    encrypt_with_fingerprint(path, plain, settings).map(|_| ())
+}
+
+/// 同 `encrypt`，并在内存构建 CFB 时顺手校验必要流并返回 `(file_len, cfb_fingerprint)`，
+/// 让原子保存免去立即二次 `File::open` 重读刚写出的 CFB 文件。
+pub(crate) fn encrypt_with_fingerprint(
+    path: &Path,
+    plain: &[u8],
+    settings: &EncryptionSettings,
+) -> Result<Option<(u64, [u8; 32])>> {
+    use aes::cipher::KeyInit;
     let salt = random_bytes(16)?;      // 口令派生/验证器
     let salt_pkg = random_bytes(16)?;  // 包分段 IV
     let verifier = random_bytes(16)?;
     let key = random_bytes(32)?;
+    let hmac_key = random_bytes(64)?;
     let spin = settings.spin.max(1);
-    let h = hash_final(&settings.password, &salt, spin);
+    let cipher = aes::Aes256::new_from_slice(&key).map_err(|e| anyhow!("AES key: {e}"))?;
+
+    // 包：8 字节长度 + 4096 字节分段；与 10 万轮口令 KDF 并行执行，掩盖正文加密与 HMAC 开销
+    let n_segs = plain.len().div_ceil(SEGMENT);
+    let enc_payload_len = if n_segs == 0 {
+        0
+    } else {
+        let last_len = plain.len() - (n_segs - 1) * SEGMENT;
+        (n_segs - 1) * SEGMENT + last_len.div_ceil(16) * 16
+    };
+    let mut pkg = vec![0u8; 8 + enc_payload_len];
+    pkg[..8].copy_from_slice(&(plain.len() as u64).to_le_bytes());
+
+    let (h, hmac_value) = std::thread::scope(|s| {
+        let kdf_handle = s.spawn(|| hash_final(&settings.password, &salt, spin));
+
+        let iv_gen = SegmentIvGen::new(&salt_pkg);
+        let workers = segment_workers(plain.len(), n_segs);
+        let out_payload = &mut pkg[8..];
+        if workers == 1 {
+            for (i, seg) in plain.chunks(SEGMENT).enumerate() {
+                let dst_off = i * SEGMENT;
+                let dst_len = seg.len().div_ceil(16) * 16;
+                let iv = iv_gen.iv(i as u32);
+                encrypt_chunk_into(&cipher, &iv, seg, &mut out_payload[dst_off..dst_off + dst_len]);
+            }
+        } else {
+            let segs_per_worker = n_segs.div_ceil(workers);
+            std::thread::scope(|inner| {
+                let mut rem_out = out_payload;
+                let mut seg_start = 0usize;
+                while seg_start < n_segs {
+                    let seg_end = (seg_start + segs_per_worker).min(n_segs);
+                    let src_start = seg_start * SEGMENT;
+                    let src_end = (seg_end * SEGMENT).min(plain.len());
+                    let src_slice = &plain[src_start..src_end];
+                    let out_len = if seg_end == n_segs {
+                        rem_out.len()
+                    } else {
+                        (seg_end - seg_start) * SEGMENT
+                    };
+                    let (dst_slice, rest) = rem_out.split_at_mut(out_len);
+                    rem_out = rest;
+                    let cipher = &cipher;
+                    let iv_gen = &iv_gen;
+                    inner.spawn(move || {
+                        for (local_i, seg) in src_slice.chunks(SEGMENT).enumerate() {
+                            let dst_off = local_i * SEGMENT;
+                            let dst_len = seg.len().div_ceil(16) * 16;
+                            let iv = iv_gen.iv((seg_start + local_i) as u32);
+                            encrypt_chunk_into(
+                                cipher,
+                                &iv,
+                                seg,
+                                &mut dst_slice[dst_off..dst_off + dst_len],
+                            );
+                        }
+                    });
+                    seg_start = seg_end;
+                }
+            });
+        }
+        // 数据完整性：对「长度头 + 密文」做 HMAC-SHA512
+        let hmac_val = hmac_sha512(&hmac_key, &pkg);
+        let h = kdf_handle.join().expect("kdf thread panicked");
+        (h, hmac_val)
+    });
+
     let k_verifier = derive_key(&h, &BLOCK_VERIFIER_INPUT, 32);
     let k_hash = derive_key(&h, &BLOCK_VERIFIER_HASH, 32);
     let k_value = derive_key(&h, &BLOCK_KEY_VALUE, 32);
@@ -409,34 +659,29 @@ pub fn encrypt(path: &Path, plain: &[u8], settings: &EncryptionSettings) -> Resu
     let vhash: [u8; 64] = d.finalize().into();
     let enc_hash = aes_cbc_encrypt(&k_hash, &salt, &vhash)?;
     let enc_key = aes_cbc_encrypt(&k_value, &salt, &key)?;
-    // 包：8 字节长度 + 4096 字节分段
-    let mut pkg = Vec::with_capacity(plain.len() + 32);
-    pkg.extend_from_slice(&(plain.len() as u64).to_le_bytes());
-    for (i, seg) in plain.chunks(SEGMENT).enumerate() {
-        let mut block = seg.to_vec();
-        let pad = (16 - block.len() % 16) % 16;
-        block.resize(block.len() + pad, 0);
-        let iv = segment_iv(&salt_pkg, i as u32);
-        pkg.extend_from_slice(&aes_cbc_encrypt(&key, &iv, &block)?);
-    }
 
-    // 数据完整性：对「长度头 + 密文」做 HMAC-SHA512
-    let hmac_key = random_bytes(64)?;
     let iv1 = {
         let mut d = Sha512::new();
         d.update(&salt_pkg);
         d.update(BLOCK_HMAC_KEY);
-        d.finalize()[..16].to_vec()
+        let h = d.finalize();
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&h[..16]);
+        iv
     };
     let iv2 = {
         let mut d = Sha512::new();
         d.update(&salt_pkg);
         d.update(BLOCK_HMAC_VALUE);
-        d.finalize()[..16].to_vec()
+        let h = d.finalize();
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&h[..16]);
+        iv
     };
-    let enc_hmac_key = aes_cbc_encrypt(&key, &iv1, &hmac_key)?;
-    let hmac_value = hmac_sha512(&hmac_key, &pkg);
-    let enc_hmac_value = aes_cbc_encrypt(&key, &iv2, &hmac_value)?;
+    let mut enc_hmac_key = vec![0u8; hmac_key.len()];
+    encrypt_chunk_into(&cipher, &iv1, &hmac_key, &mut enc_hmac_key);
+    let mut enc_hmac_value = vec![0u8; hmac_value.len()];
+    encrypt_chunk_into(&cipher, &iv2, &hmac_value, &mut enc_hmac_value);
     let b64s = |v: &[u8]| base64::engine::general_purpose::STANDARD.encode(v);
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
@@ -466,8 +711,8 @@ encryptedVerifierHashValue=\"{evh}\" encryptedKeyValue=\"{ekv}\"/>\
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     let mut staged = tempfile::Builder::new().prefix(".~cipher-").tempfile_in(dir)?;
-    {
-        let mut cf = cfb::CompoundFile::create(staged.as_file_mut())
+    let write_cfb = |writer: &mut dyn WriteSeek| -> Result<()> {
+        let mut cf = cfb::CompoundFile::create(writer)
             .map_err(|e| anyhow!("创建 CFB 失败：{e}"))?;
         // DataSpaces：Excel 打开强加密文件必需
         let dec = |v: &str| b64(v).unwrap_or_default();
@@ -505,10 +750,39 @@ encryptedVerifierHashValue=\"{evh}\" encryptedKeyValue=\"{ekv}\"/>\
             s.write_all(&pkg)?;
         }
         cf.flush()?;
-    }
+        Ok(())
+    };
+    let meta_info = if pkg.len() <= 64 * 1024 * 1024 {
+        // 内存构建 CFB 再一次性顺序写出，消除 Windows 上数百次 512B/4KB 随机 seek/write 系统调用
+        let mut mem = std::io::Cursor::new(Vec::with_capacity(pkg.len() + 32 * 1024));
+        write_cfb(&mut mem)?;
+        let cfb_bytes = mem.into_inner();
+        // 内存自检：确认 CFB 头与 EncryptionInfo/EncryptedPackage 两个必需流完整可读
+        {
+            let mut verify_cf = cfb::CompoundFile::open(std::io::Cursor::new(cfb_bytes.as_slice()))
+                .map_err(|e| anyhow!("生成的 CFB 加密容器无效：{e}"))?;
+            let info_len = verify_cf.open_stream("EncryptionInfo").map(|s| s.len()).unwrap_or(0);
+            let pkg_len = verify_cf.open_stream("EncryptedPackage").map(|s| s.len()).unwrap_or(0);
+            if info_len < 8 || pkg_len < 8 {
+                bail!("生成的加密流长度异常（EncryptionInfo={info_len}, EncryptedPackage={pkg_len}）");
+            }
+        }
+        let fp = cfb_fingerprint_bytes(&cfb_bytes);
+        let total_len = cfb_bytes.len() as u64;
+        staged.as_file_mut().write_all(&cfb_bytes)?;
+        staged.as_file_mut().flush()?;
+        Some((total_len, fp))
+    } else {
+        write_cfb(staged.as_file_mut())?;
+        staged.as_file_mut().flush()?;
+        None
+    };
     staged.persist(path).with_context(|| format!("写入 {} 失败", path.display()))?;
-    Ok(())
+    Ok(meta_info)
 }
+
+trait WriteSeek: Read + Write + Seek {}
+impl<T: Read + Write + Seek> WriteSeek for T {}
 
 #[cfg(test)]
 mod tests {
@@ -548,8 +822,43 @@ mod tests {
         let plain = b"PK\x03\x04hello-office-encryption".to_vec();
         encrypt(&p, &plain, &EncryptionSettings::new("p@ss word")).unwrap();
         assert!(needs_password(&p));
+        verify_password(&p, "p@ss word").unwrap();
+        assert!(verify_password(&p, "wrong").is_err());
         assert_eq!(decrypt(&p, "p@ss word").unwrap(), plain);
         let err = decrypt(&p, "wrong").unwrap_err().to_string();
         assert!(err.contains("密码"), "{err}");
+    }
+
+    #[test]
+    fn compress512_kdf_and_parallel_segments_match_reference() {
+        let salt = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00];
+        let pw = "Cellan测试Password!2026";
+        for spin in [0u32, 1, 17, 257] {
+            let fast = hash_final(pw, &salt, spin);
+            let mut h = Sha512::new();
+            h.update(salt);
+            h.update(utf16le(pw));
+            let mut slow: [u8; 64] = h.finalize().into();
+            for i in 0..spin {
+                let mut d = Sha512::new();
+                d.update(i.to_le_bytes());
+                d.update(slow);
+                slow = d.finalize().into();
+            }
+            assert_eq!(fast, slow, "mismatch at spin={spin}");
+        }
+        let iv_gen = SegmentIvGen::new(&salt);
+        for idx in [0u32, 1, 15, 255, 1024] {
+            assert_eq!(iv_gen.iv(idx), segment_iv(&salt, idx));
+        }
+
+        // > 64 KB 非 16 字节对齐载荷，触发并行 4 KB 分段加解密
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big_enc.xlsx");
+        let plain: Vec<u8> = (0..(150 * 1024 + 13)).map(|i| ((i * 131 + 17) & 0xFF) as u8).collect();
+        encrypt(&p, &plain, &EncryptionSettings { password: pw.into(), spin: 32 }).unwrap();
+        verify_password(&p, pw).unwrap();
+        assert!(verify_password(&p, "bad").is_err());
+        assert_eq!(decrypt(&p, pw).unwrap(), plain);
     }
 }

@@ -154,34 +154,560 @@ fn local_bytes(q: &[u8]) -> &[u8] {
 }
 
 #[inline]
+fn unescape_cow<'a>(raw: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'a, str> {
+    match raw {
+        std::borrow::Cow::Borrowed(s) => {
+            if s.as_bytes().contains(&b'&') {
+                match quick_xml::escape::unescape(s) {
+                    Ok(c) => std::borrow::Cow::Owned(c.into_owned()),
+                    Err(_) => std::borrow::Cow::Borrowed(s),
+                }
+            } else {
+                std::borrow::Cow::Borrowed(s)
+            }
+        }
+        std::borrow::Cow::Owned(s) => {
+            if s.as_bytes().contains(&b'&') {
+                match quick_xml::escape::unescape(&s) {
+                    Ok(c) => std::borrow::Cow::Owned(c.into_owned()),
+                    Err(_) => std::borrow::Cow::Owned(s),
+                }
+            } else {
+                std::borrow::Cow::Owned(s)
+            }
+        }
+    }
+}
+
+#[inline]
+fn parse_ascii_usize(s: &[u8]) -> Option<usize> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut acc = 0usize;
+    for &b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+    Some(acc)
+}
+
+#[inline]
+fn decode_kind_bytes(v: &[u8]) -> Kind {
+    match v {
+        b"String" => Kind::Text,
+        b"Boolean" => Kind::Bool,
+        b"DateTime" => Kind::DateTime,
+        b"Error" => Kind::Error,
+        _ => Kind::Number,
+    }
+}
+
+enum FastTableErr {
+    Reject,
+    Fallback,
+}
+
+#[inline]
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    i
+}
+
+#[inline]
+fn is_name_end(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>' | b'=')
+}
+
+/// 扫描 `<Tag ...>` 的单个属性 `(local_key, raw_value_slice)`，返回下一起始偏移或遇到 `>`/`/>`。
+/// 遇到语法异常返回 `Err(FastTableErr::Fallback)` 交由通用 quick-xml 处理。
+#[inline]
+fn next_attr<'a>(b: &'a [u8], pos: &mut usize) -> Result<Option<(&'a [u8], &'a [u8])>, FastTableErr> {
+    let mut i = skip_ws(b, *pos);
+    if i >= b.len() {
+        return Err(FastTableErr::Fallback);
+    }
+    if b[i] == b'>' || b[i] == b'/' {
+        *pos = i;
+        return Ok(None);
+    }
+    let kstart = i;
+    while i < b.len() && !is_name_end(b[i]) {
+        i += 1;
+    }
+    if i == kstart {
+        return Err(FastTableErr::Fallback);
+    }
+    let key = local_bytes(&b[kstart..i]);
+    i = skip_ws(b, i);
+    if i >= b.len() || b[i] != b'=' {
+        return Err(FastTableErr::Fallback);
+    }
+    i = skip_ws(b, i + 1);
+    if i >= b.len() || (b[i] != b'"' && b[i] != b'\'') {
+        return Err(FastTableErr::Fallback);
+    }
+    let quote = b[i];
+    i += 1;
+    let vstart = i;
+    while i < b.len() && b[i] != quote {
+        i += 1;
+    }
+    if i >= b.len() {
+        return Err(FastTableErr::Fallback);
+    }
+    let val = &b[vstart..i];
+    *pos = i + 1;
+    Ok(Some((key, val)))
+}
+
+#[inline]
+fn finish_tag_head(b: &[u8], pos: &mut usize) -> Result<bool, FastTableErr> {
+    let i = skip_ws(b, *pos);
+    if i >= b.len() {
+        return Err(FastTableErr::Fallback);
+    }
+    if b[i] == b'>' {
+        *pos = i + 1;
+        Ok(false)
+    } else if b[i] == b'/' && b.get(i + 1) == Some(&b'>') {
+        *pos = i + 2;
+        Ok(true)
+    } else {
+        Err(FastTableErr::Fallback)
+    }
+}
+
+/// 在 `<Table ...>` 与 `</Table>` 之间走单遍零拷贝字节快速路径，
+/// 避免 100k 行 / 200k 格场景下 quick-xml 的百万次事件与重复属性扫描开销。
+#[allow(clippy::too_many_arguments)]
+fn parse_sparse_table_fast(
+    xml: &str,
+    start_pos: usize,
+    style_lookup: &std::collections::HashMap<String, u32>,
+    col_styles: &mut std::collections::HashMap<u32, u32>,
+    cells: &mut Vec<SparseCell>,
+    max_rows: &mut usize,
+    max_cols: &mut usize,
+) -> Result<usize, FastTableErr> {
+    const MAX_R: usize = 1_048_576;
+    const MAX_C: usize = 16_384;
+
+    let b = xml.as_bytes();
+    let len = b.len();
+    let mut i = start_pos;
+    let mut col_cursor = 0usize;
+    let mut row_cursor = 0usize;
+    let mut in_row = false;
+    let mut row_index = 0usize;
+    let mut row_span = 1usize;
+    let mut row_style_idx: Option<u32> = None;
+    let mut next_col = 0usize;
+
+    // 按 XML 字节长度预估容量，避免大选区 20 次 Vec 扩容搬移
+    let est = ((len.saturating_sub(start_pos)) / 48).min(crate::undo::MAX_DENSE_RECT_KEYS);
+    if est > cells.capacity() {
+        cells.reserve(est - cells.len());
+    }
+
+    let include_bounds = |rows: usize, cols: usize, mr: &mut usize, mc: &mut usize| -> Result<(), FastTableErr> {
+        *mr = (*mr).max(rows);
+        *mc = (*mc).max(cols);
+        if *mr <= MAX_R && *mc <= MAX_C {
+            Ok(())
+        } else {
+            Err(FastTableErr::Reject)
+        }
+    };
+
+    while i < len {
+        // 跳到下一个 `<`
+        while i < len && b[i] != b'<' {
+            i += 1;
+        }
+        if i >= len {
+            return Err(FastTableErr::Fallback);
+        }
+        i += 1; // 跳过 `<`
+        if i >= len {
+            return Err(FastTableErr::Fallback);
+        }
+        let first = b[i];
+        if first == b'!' || first == b'?' {
+            // 注释 / CDATA / PI：回退给 quick-xml 完整处理
+            return Err(FastTableErr::Fallback);
+        }
+        if first == b'/' {
+            // 闭合标签
+            i += 1;
+            let nstart = i;
+            while i < len && !matches!(b[i], b'>' | b' ' | b'\t' | b'\r' | b'\n') {
+                i += 1;
+            }
+            let close_local = local_bytes(&b[nstart..i]);
+            i = skip_ws(b, i);
+            if i >= len || b[i] != b'>' {
+                return Err(FastTableErr::Fallback);
+            }
+            i += 1;
+            match close_local {
+                b"Row" => {
+                    if !in_row {
+                        return Err(FastTableErr::Fallback);
+                    }
+                    in_row = false;
+                    row_cursor = row_index + row_span;
+                    row_style_idx = None;
+                }
+                b"Table" => {
+                    if in_row {
+                        return Err(FastTableErr::Fallback);
+                    }
+                    return Ok(i);
+                }
+                _ => return Err(FastTableErr::Fallback),
+            }
+            continue;
+        }
+
+        // 开始标签名
+        let nstart = i;
+        while i < len && !is_name_end(b[i]) {
+            i += 1;
+        }
+        let tag_local = local_bytes(&b[nstart..i]);
+
+        match tag_local {
+            b"Row" => {
+                if in_row {
+                    return Err(FastTableErr::Fallback);
+                }
+                let mut idx_attr: Option<usize> = None;
+                let mut span_attr: usize = 0;
+                let mut sty_attr: Option<u32> = None;
+                if i < len && b[i] == b'>' {
+                    i += 1;
+                    // 最热路径：无属性 `<Row>`
+                    let ri = row_cursor;
+                    include_bounds(ri.checked_add(1).ok_or(FastTableErr::Reject)?, 1, max_rows, max_cols)?;
+                    in_row = true;
+                    row_index = ri;
+                    row_span = 1;
+                    row_style_idx = None;
+                    next_col = 0;
+                    continue;
+                }
+                while let Some((k, v)) = next_attr(b, &mut i)? {
+                    match k {
+                        b"Index" => idx_attr = Some(parse_ascii_usize(v).ok_or(FastTableErr::Reject)?),
+                        b"Span" => span_attr = parse_ascii_usize(v).ok_or(FastTableErr::Reject)?,
+                        b"StyleID" => {
+                            if let Ok(s) = std::str::from_utf8(v) {
+                                let cow = unescape_cow(std::borrow::Cow::Borrowed(s));
+                                sty_attr = style_lookup.get(cow.as_ref()).copied().filter(|&id| id != 0);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let self_closing = finish_tag_head(b, &mut i)?;
+                let ri = idx_attr.unwrap_or(row_cursor + 1).checked_sub(1).ok_or(FastTableErr::Reject)?;
+                let span = span_attr.checked_add(1).ok_or(FastTableErr::Reject)?;
+                if ri < row_cursor {
+                    return Err(FastTableErr::Reject);
+                }
+                include_bounds(ri.checked_add(span).ok_or(FastTableErr::Reject)?, 1, max_rows, max_cols)?;
+                if self_closing {
+                    row_cursor = ri + span;
+                } else {
+                    in_row = true;
+                    row_index = ri;
+                    row_span = span;
+                    row_style_idx = sty_attr;
+                    next_col = 0;
+                }
+            }
+            b"Cell" => {
+                if !in_row {
+                    return Err(FastTableErr::Fallback);
+                }
+                let (col, across, down, style_idx, has_explicit_style, r1c1_formula, self_closing) =
+                    if i < len && b[i] == b'>' {
+                        // 最热路径：无属性 `<Cell>`
+                        i += 1;
+                        let col = next_col;
+                        include_bounds(
+                            row_index.checked_add(1).ok_or(FastTableErr::Reject)?,
+                            col.checked_add(1).ok_or(FastTableErr::Reject)?,
+                            max_rows,
+                            max_cols,
+                        )?;
+                        next_col = col + 1;
+                        let style_idx = row_style_idx
+                            .or_else(|| {
+                                if col_styles.is_empty() {
+                                    None
+                                } else {
+                                    col_styles.get(&(col as u32)).copied()
+                                }
+                            })
+                            .unwrap_or(0);
+                        (col, 1usize, 1usize, style_idx, style_idx != 0, None, false)
+                    } else {
+                        let mut idx_attr: Option<usize> = None;
+                        let mut across_attr = 0usize;
+                        let mut down_attr = 0usize;
+                        let mut raw_style: Option<&[u8]> = None;
+                        let mut raw_formula: Option<&[u8]> = None;
+                        while let Some((k, v)) = next_attr(b, &mut i)? {
+                            match k {
+                                b"Index" => {
+                                    idx_attr = Some(parse_ascii_usize(v).ok_or(FastTableErr::Reject)?);
+                                }
+                                b"MergeAcross" => {
+                                    across_attr = parse_ascii_usize(v).ok_or(FastTableErr::Reject)?;
+                                }
+                                b"MergeDown" => {
+                                    down_attr = parse_ascii_usize(v).ok_or(FastTableErr::Reject)?;
+                                }
+                                b"StyleID" => raw_style = Some(v),
+                                b"Formula" => raw_formula = Some(v),
+                                _ => {}
+                            }
+                        }
+                        let self_closing = finish_tag_head(b, &mut i)?;
+                        let col = idx_attr.unwrap_or(next_col + 1).checked_sub(1).ok_or(FastTableErr::Reject)?;
+                        let across = across_attr.checked_add(1).ok_or(FastTableErr::Reject)?;
+                        let down = down_attr.checked_add(1).ok_or(FastTableErr::Reject)?;
+                        if col < next_col {
+                            return Err(FastTableErr::Reject);
+                        }
+                        include_bounds(
+                            row_index.checked_add(down).ok_or(FastTableErr::Reject)?,
+                            col.checked_add(across).ok_or(FastTableErr::Reject)?,
+                            max_rows,
+                            max_cols,
+                        )?;
+                        next_col = col + across;
+                        let has_raw_style = raw_style.is_some();
+                        let style_idx = raw_style
+                            .and_then(|v| std::str::from_utf8(v).ok())
+                            .and_then(|s| {
+                                let cow = unescape_cow(std::borrow::Cow::Borrowed(s));
+                                style_lookup.get(cow.as_ref()).copied()
+                            })
+                            .or(row_style_idx)
+                            .or_else(|| {
+                                if col_styles.is_empty() {
+                                    None
+                                } else {
+                                    col_styles.get(&(col as u32)).copied()
+                                }
+                            })
+                            .unwrap_or(0);
+                        let r1c1_formula = raw_formula
+                            .and_then(|v| std::str::from_utf8(v).ok())
+                            .map(|s| unescape_cow(std::borrow::Cow::Borrowed(s)).into_owned());
+                        (
+                            col,
+                            across,
+                            down,
+                            style_idx,
+                            has_raw_style || style_idx != 0,
+                            r1c1_formula,
+                            self_closing,
+                        )
+                    };
+
+                let mut text = String::new();
+                let mut kind = Kind::Number;
+                let mut had_data = false;
+
+                if !self_closing {
+                    // 读取 `<Cell>` 内部直至 `</Cell>`
+                    loop {
+                        while i < len && b[i] != b'<' {
+                            i += 1;
+                        }
+                        if i + 1 >= len {
+                            return Err(FastTableErr::Fallback);
+                        }
+                        i += 1;
+                        if b[i] == b'!' || b[i] == b'?' {
+                            return Err(FastTableErr::Fallback);
+                        }
+                        if b[i] == b'/' {
+                            i += 1;
+                            let cs = i;
+                            while i < len && !matches!(b[i], b'>' | b' ' | b'\t' | b'\r' | b'\n') {
+                                i += 1;
+                            }
+                            let cl = local_bytes(&b[cs..i]);
+                            i = skip_ws(b, i);
+                            if i >= len || b[i] != b'>' || cl != b"Cell" {
+                                return Err(FastTableErr::Fallback);
+                            }
+                            i += 1;
+                            break;
+                        }
+                        let cs = i;
+                        while i < len && !is_name_end(b[i]) {
+                            i += 1;
+                        }
+                        let child = local_bytes(&b[cs..i]);
+                        if child == b"Data" {
+                            let mut dtype = Kind::Number;
+                            while let Some((k, v)) = next_attr(b, &mut i)? {
+                                if k == b"Type" {
+                                    dtype = decode_kind_bytes(v);
+                                }
+                            }
+                            let data_empty = finish_tag_head(b, &mut i)?;
+                            if !data_empty {
+                                // 直接扫描到 `</Data>`；若含子标签或 CDATA/注释则回退 quick-xml
+                                let tstart = i;
+                                let mut has_amp = false;
+                                while i < len && b[i] != b'<' {
+                                    if b[i] == b'&' {
+                                        has_amp = true;
+                                    }
+                                    i += 1;
+                                }
+                                if i + 2 >= len || b[i + 1] != b'/' {
+                                    return Err(FastTableErr::Fallback);
+                                }
+                                let raw_str = &xml[tstart..i];
+                                i += 2; // 跳过 `</`
+                                let es = i;
+                                while i < len && !matches!(b[i], b'>' | b' ' | b'\t' | b'\r' | b'\n') {
+                                    i += 1;
+                                }
+                                if local_bytes(&b[es..i]) != b"Data" {
+                                    return Err(FastTableErr::Fallback);
+                                }
+                                i = skip_ws(b, i);
+                                if i >= len || b[i] != b'>' {
+                                    return Err(FastTableErr::Fallback);
+                                }
+                                i += 1;
+                                text = if has_amp {
+                                    match quick_xml::escape::unescape(raw_str) {
+                                        Ok(c) => c.into_owned(),
+                                        Err(_) => return Err(FastTableErr::Fallback),
+                                    }
+                                } else {
+                                    raw_str.to_owned()
+                                };
+                                kind = dtype;
+                                had_data = true;
+                            }
+                        } else {
+                            // 如 `<Comment>` / `<NamedCell>` 等子标签：回退 quick-xml
+                            return Err(FastTableErr::Fallback);
+                        }
+                    }
+                }
+
+                let meaningful = had_data
+                    || !text.is_empty()
+                    || r1c1_formula.is_some()
+                    || has_explicit_style
+                    || across > 1
+                    || down > 1;
+                if meaningful {
+                    if cells.len() >= crate::undo::MAX_DENSE_RECT_KEYS {
+                        return Err(FastTableErr::Reject);
+                    }
+                    cells.push(SparseCell {
+                        row: row_index as u32,
+                        col: col as u32,
+                        text,
+                        kind,
+                        r1c1_formula,
+                        style_idx,
+                        has_explicit_style,
+                        colspan: across as u32,
+                        rowspan: down as u32,
+                    });
+                }
+            }
+            b"Column" => {
+                if in_row {
+                    return Err(FastTableErr::Fallback);
+                }
+                let mut idx_attr: Option<usize> = None;
+                let mut span_attr = 0usize;
+                let mut raw_style: Option<&[u8]> = None;
+                while let Some((k, v)) = next_attr(b, &mut i)? {
+                    match k {
+                        b"Index" => idx_attr = Some(parse_ascii_usize(v).ok_or(FastTableErr::Reject)?),
+                        b"Span" => span_attr = parse_ascii_usize(v).ok_or(FastTableErr::Reject)?,
+                        b"StyleID" => raw_style = Some(v),
+                        _ => {}
+                    }
+                }
+                let self_closing = finish_tag_head(b, &mut i)?;
+                if !self_closing {
+                    // 消费 `</Column>`
+                    while i < len && b[i] != b'<' {
+                        i += 1;
+                    }
+                    if i + 2 >= len || b[i + 1] != b'/' {
+                        return Err(FastTableErr::Fallback);
+                    }
+                    i += 2;
+                    let cs = i;
+                    while i < len && !matches!(b[i], b'>' | b' ' | b'\t' | b'\r' | b'\n') {
+                        i += 1;
+                    }
+                    if local_bytes(&b[cs..i]) != b"Column" {
+                        return Err(FastTableErr::Fallback);
+                    }
+                    i = skip_ws(b, i);
+                    if i >= len || b[i] != b'>' {
+                        return Err(FastTableErr::Fallback);
+                    }
+                    i += 1;
+                }
+                let c_idx = idx_attr.unwrap_or(col_cursor + 1).checked_sub(1).ok_or(FastTableErr::Reject)?;
+                let c_span = span_attr.checked_add(1).ok_or(FastTableErr::Reject)?;
+                if c_idx < col_cursor {
+                    return Err(FastTableErr::Reject);
+                }
+                include_bounds(0, c_idx.checked_add(c_span).ok_or(FastTableErr::Reject)?, max_rows, max_cols)?;
+                if let Some(sid) = raw_style
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                    .and_then(|s| {
+                        let cow = unescape_cow(std::borrow::Cow::Borrowed(s));
+                        style_lookup.get(cow.as_ref()).copied()
+                    })
+                {
+                    if sid != 0 {
+                        for cc in c_idx..(c_idx + c_span) {
+                            col_styles.insert(cc as u32, sid);
+                        }
+                    }
+                }
+                col_cursor = c_idx + c_span;
+            }
+            _ => return Err(FastTableErr::Fallback),
+        }
+    }
+    Err(FastTableErr::Fallback)
+}
+
+#[inline]
 fn attr_cow<'a>(
     e: &'a quick_xml::events::BytesStart<'a>,
     key: &[u8],
 ) -> Option<std::borrow::Cow<'a, str>> {
     for a in e.attributes().flatten() {
         if local_bytes(a.key.as_ref().as_bytes()) == key {
-            return Some(match a.value {
-                std::borrow::Cow::Borrowed(raw) => {
-                    if raw.contains('&') {
-                        match quick_xml::escape::unescape(raw) {
-                            Ok(c) => std::borrow::Cow::Owned(c.into_owned()),
-                            Err(_) => std::borrow::Cow::Borrowed(raw),
-                        }
-                    } else {
-                        std::borrow::Cow::Borrowed(raw)
-                    }
-                }
-                std::borrow::Cow::Owned(raw) => {
-                    if raw.contains('&') {
-                        match quick_xml::escape::unescape(&raw) {
-                            Ok(c) => std::borrow::Cow::Owned(c.into_owned()),
-                            Err(_) => std::borrow::Cow::Owned(raw),
-                        }
-                    } else {
-                        std::borrow::Cow::Owned(raw)
-                    }
-                }
-            });
+            return Some(unescape_cow(a.value));
         }
     }
     None
@@ -585,6 +1111,27 @@ pub fn parse_sparse(xml: &str) -> Option<SparseBlock> {
                         include_bounds(er, ec, &mut max_rows, &mut max_cols)?;
                         if attr_cow(&e, b"FullColumns").as_deref() == Some("1") || er == MAX_R {
                             full_columns = true;
+                        }
+                        let table_body_start = r.buffer_position() as usize;
+                        let saved_mr = max_rows;
+                        let saved_mc = max_cols;
+                        match parse_sparse_table_fast(
+                            xml,
+                            table_body_start,
+                            &style_lookup,
+                            &mut col_styles,
+                            &mut cells,
+                            &mut max_rows,
+                            &mut max_cols,
+                        ) {
+                            Ok(_end_pos) => break,
+                            Err(FastTableErr::Reject) => return None,
+                            Err(FastTableErr::Fallback) => {
+                                cells.clear();
+                                col_styles.clear();
+                                max_rows = saved_mr;
+                                max_cols = saved_mc;
+                            }
                         }
                     }
                     b"Column" => {

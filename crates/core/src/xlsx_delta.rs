@@ -145,6 +145,17 @@ pub(super) struct SavedStyles {
 }
 
 impl SavedStyles {
+    pub(super) fn from_direct(
+        signature: Signature,
+        ids: &HashMap<u16, u16>,
+        styles: &StyleTable,
+    ) -> Self {
+        Self {
+            signature,
+            map: StyleMap::new(ids, styles),
+        }
+    }
+
     pub(super) fn attach(&self, source: &mut SourceCells) {
         if source.style_part == Some(self.signature) {
             source.set_style_map(self.map.clone());
@@ -411,13 +422,14 @@ impl SourceCells {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct DeltaSummary {
     pub patched: bool,
     pub handled_layout: bool,
     pub handled_freeze: bool,
     pub handled_filter: bool,
     pub handled_page: bool,
+    pub trusted_parts: HashMap<String, (u32, u64)>,
 }
 
 #[derive(Default)]
@@ -1498,12 +1510,62 @@ fn filter_xml_for_sheet(sheet: &Sheet) -> String {
     }
 }
 
+fn plain_new_sheet_supported(sheet: &Sheet) -> bool {
+    sheet.styles.is_empty()
+        && sheet.row_styles.is_empty()
+        && sheet.col_styles.is_empty()
+        && sheet.merges.is_empty()
+        && sheet.notes.is_empty()
+        && sheet.charts.is_empty()
+        && sheet.pictures.is_empty()
+        && sheet.tables.is_empty()
+        && sheet.cf.blocks.is_empty()
+        && sheet.dv.is_empty()
+        && sheet.rich.is_empty()
+        && sheet.arrays.is_empty()
+        && sheet.spill_shapes.is_empty()
+        && sheet.hyperlinks.is_empty()
+        && sheet.textboxes.is_empty()
+        && sheet.sparklines.is_empty()
+        && sheet.scenarios.is_empty()
+        && sheet.ignored_errors.is_empty()
+        && sheet.protection.is_none()
+        && sheet.tab_color.is_none()
+        && sheet.freeze.is_none()
+        && sheet.filter.is_none()
+        && sheet.cols.is_empty()
+        && sheet.rows.is_empty()
+        && sheet.hidden_cols.is_empty()
+        && sheet.hidden_rows.is_empty()
+        && sheet.hidden_rows_user.is_empty()
+        && sheet.row_levels.is_empty()
+        && sheet.col_levels.is_empty()
+        && !sheet.layout_dirty
+        && !sheet.freeze_dirty
+        && !sheet.filter_dirty
+        && !sheet.page_dirty
+        && !sheet.merges_dirty
+        && !sheet.notes_dirty
+        && sheet.iter().all(|(key, cell)| {
+            key.row < crate::sync::MAX_ROWS
+                && key.col < crate::sync::MAX_COLS
+                && cell.formula.as_ref().is_none_or(|f| safe_xml_text(f))
+                && match &cell.value {
+                    Value::Number(n) => n.is_finite(),
+                    Value::Text(s) => safe_xml_text(s),
+                    Value::Error(crate::formula::ErrKind::Spill) => false,
+                    _ => true,
+                }
+        })
+}
+
 pub(super) fn write_with_style_receipt(
     base: &Path, target: &Path, wb: &Workbook, saved_styles: &mut Option<SavedStyles>,
 ) -> Result<DeltaSummary> {
     let mut zip = ZipArchive::new(File::open(base)?)?;
     check_note_sources(&mut zip, wb)?;
     let mut sheets = HashMap::new();
+    let mut new_plain_sheets: HashMap<String, &Sheet> = HashMap::new();
     let mut parts = PackageParts::new();
     let mut formula_changed = false;
     let mut need_new_metadata = false;
@@ -1515,6 +1577,7 @@ pub(super) fn write_with_style_receipt(
     let style_part = signature(&mut zip, "xl/styles.xml");
     let style_xml = std::cell::OnceCell::new();
     let dynamic = std::cell::OnceCell::new();
+    let mut base_targets: Option<HashMap<String, String>> = None;
     let mut changed_xfs = None;
     let mut base_map = None;
     for sheet in &wb.sheets {
@@ -1531,6 +1594,36 @@ pub(super) fn write_with_style_receipt(
             continue;
         }
         let (Some(part), Some(source)) = (&sheet.source_part, &sheet.source_cells) else {
+            if sheet.source_part.is_none()
+                && sheet.source_cells.is_none()
+                && wb.pivots_pending.is_empty()
+                && wb.pivots_pending2.is_empty()
+                && plain_new_sheet_supported(sheet)
+            {
+                let targets = match &base_targets {
+                    Some(t) => t,
+                    None => {
+                        let book = super::read_zip_text(&mut zip, "xl/workbook.xml").ok();
+                        let rels = super::read_zip_text(&mut zip, "xl/_rels/workbook.xml.rels").ok();
+                        let map = crate::patch::sheet_targets_xml(book.as_deref(), rels.as_deref());
+                        base_targets.insert(map)
+                    }
+                };
+                let Some(part) = targets.get(&sheet.name).cloned() else {
+                    return Ok(DeltaSummary::default());
+                };
+                let placeholder = super::read_zip_text(&mut zip, &part).ok();
+                if placeholder
+                    .as_deref()
+                    .is_some_and(|xml| xml.ends_with("<sheetData/></worksheet>"))
+                {
+                    formula_changed |= sheet.has_formulas();
+                    if new_plain_sheets.insert(part, sheet).is_some() {
+                        return Ok(DeltaSummary::default());
+                    }
+                    continue;
+                }
+            }
             return Ok(DeltaSummary::default());
         };
         if sheet.source_needs_dom_repair
@@ -1625,7 +1718,9 @@ pub(super) fn write_with_style_receipt(
             }
         }
     }
+    let mut trusted_parts: HashMap<String, (u32, u64)> = HashMap::new();
     let mut updated_map = None;
+    let mut updated_styles_sig: Option<Signature> = None;
     if let Some((xml, additions)) = changed_xfs.and_then(font_delta::Styles::finish) {
         let Some(old) = base_map else { return Ok(DeltaSummary::default()); };
         let mut mapped = old.xfs.clone();
@@ -1642,7 +1737,13 @@ pub(super) fn write_with_style_receipt(
         let origin_only=old.origin_only.iter().filter(|(id,_)|old.unchanged(**id,&wb.styles))
             .map(|(&id,&origin)|(id,origin)).collect();
         updated_map = Some(Arc::new(StyleMap { xfs: mapped, derived_from, origin_only, original: wb.styles.clone() }));
-        parts.insert("xl/styles.xml".to_owned(), xml.into_bytes());
+        let style_bytes = xml.into_bytes();
+        let mut crc = flate2::Crc::new();
+        crc.update(&style_bytes);
+        let sig = (crc.sum(), style_bytes.len() as u64);
+        updated_styles_sig = Some(sig);
+        trusted_parts.insert("xl/styles.xml".to_owned(), sig);
+        parts.insert("xl/styles.xml".to_owned(), style_bytes);
     }
     let mut deleted = HashSet::new();
     if formula_changed {
@@ -1653,6 +1754,61 @@ pub(super) fn write_with_style_receipt(
         for (name, data) in chain {
             if parts.insert(name, data).is_some() {
                 return Ok(DeltaSummary::default());
+            }
+        }
+    }
+    // Fold calcMode / calcIteration / print_names / recalc_on_open into xl/workbook.xml
+    // during this single ZIP write so save_plain_at does not perform a 2nd full-ZIP copy.
+    if !wb.names_dirty && zip.index_for_name("xl/workbook.xml").is_some() {
+        let wb_bytes = match parts.get("xl/workbook.xml") {
+            Some(b) => Some(b.clone()),
+            None => {
+                let mut b = Vec::new();
+                use std::io::Read;
+                zip.by_name("xl/workbook.xml")
+                    .ok()
+                    .and_then(|mut e| e.read_to_end(&mut b).ok().map(|_| b))
+            }
+        };
+        if let Some(wb_bytes) = wb_bytes
+            && let Ok(wb_xml) = String::from_utf8(wb_bytes.clone())
+        {
+            let mode_xml = if crate::patch::calc_manual_xml(&wb_xml) == wb.calc_manual {
+                std::borrow::Cow::Borrowed(wb_xml.as_str())
+            } else {
+                std::borrow::Cow::Owned(crate::patch::set_calc_mode(&wb_xml, wb.calc_manual))
+            };
+            let mut next_xml = crate::patch::set_calc_iteration(
+                &mode_xml,
+                wb.calc_iterate,
+                wb.calc_max_iterations,
+                wb.calc_max_change,
+            );
+            if any_page {
+                for (idx, sheet) in wb.sheets.iter().enumerate() {
+                    if sheet.page_dirty {
+                        next_xml = crate::patch::set_print_names(
+                            &next_xml,
+                            idx as u32,
+                            &sheet.name,
+                            &sheet.page,
+                        );
+                    }
+                }
+            }
+            let need_recalc = !wb.calc_manual
+                && wb.sheets.iter().any(|s| s.has_formulas())
+                && wb.sheets.iter().any(|s| s.cell_data_needs_save());
+            let updated = if need_recalc {
+                match recalc_on_open(&next_xml, false)? {
+                    Some(bytes) => bytes,
+                    None => return Ok(DeltaSummary::default()),
+                }
+            } else {
+                next_xml.into_bytes()
+            };
+            if updated != wb_bytes {
+                parts.insert("xl/workbook.xml".to_owned(), updated);
             }
         }
     }
@@ -1673,19 +1829,103 @@ pub(super) fn write_with_style_receipt(
     }
     if parts
         .keys()
-        .any(|name| sheets.contains_key(name) || deleted.contains(name))
+        .any(|name| sheets.contains_key(name) || new_plain_sheets.contains_key(name) || deleted.contains(name))
     {
         return Ok(DeltaSummary::default());
     }
-    let tmp = tempfile::NamedTempFile::new_in(
-        target
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )?;
-    let (file, tmp) = tmp.into_parts();
-    let mut out = ZipWriter::new(BufWriter::new(file));
+
+    let dir = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+
+    // Parallelize multiple dirty worksheets across CPU cores into single-entry temp ZIPs,
+    // then splice via O(1) `raw_copy_file`.
+    let mut parallel_sheets: HashMap<String, tempfile::TempPath> = HashMap::new();
     let mut changed_sst = false;
+    if sheets.len() >= 2 {
+        let mut jobs: Vec<(String, usize, &Sheet, &Store, Changes)> =
+            Vec::with_capacity(sheets.len());
+        for (part, (sheet, store, changes)) in sheets.drain() {
+            let Some(idx) = zip.index_for_name(&part) else {
+                return Ok(DeltaSummary::default());
+            };
+            jobs.push((part, idx, sheet, store, changes));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .min(8)
+            .min(jobs.len());
+        let job_queue = std::sync::Mutex::new(jobs.into_iter());
+        let results: std::sync::Mutex<
+            Vec<Result<Option<(String, tempfile::TempPath, bool, Option<(u32, u64)>)>>>,
+        > = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let q = &job_queue;
+                let res = &results;
+                scope.spawn(move || {
+                    loop {
+                        let next = { q.lock().unwrap().next() };
+                        let Some((part, idx, sheet, store, changes)) = next else {
+                            break;
+                        };
+                        let one = (|| -> Result<
+                            Option<(String, tempfile::TempPath, bool, Option<(u32, u64)>)>,
+                        > {
+                            let mut z = ZipArchive::new(File::open(base)?)?;
+                            let (f, tp) = tempfile::NamedTempFile::new_in(dir)?.into_parts();
+                            let mut zw = ZipWriter::new(BufWriter::with_capacity(128 * 1024, f));
+                            zw.start_file(
+                                part.as_str(),
+                                SimpleFileOptions::default()
+                                    .compression_method(zip::CompressionMethod::Deflated)
+                                    .compression_level(Some(1)),
+                            )?;
+                            let mut local_sst = false;
+                            let mut vw = super::fresh::VerifiedXmlWriter::new(&mut zw);
+                            let supported = stream_supported(stream::xml_input(
+                                z.by_index(idx)?,
+                                &part,
+                                |input| {
+                                    stream::worksheet(
+                                        input,
+                                        &mut vw,
+                                        sheet,
+                                        store,
+                                        changes,
+                                        &mut local_sst,
+                                    )
+                                },
+                            ))?;
+                            if !supported {
+                                return Ok(None);
+                            }
+                            let sig = vw.finish(Some("worksheet"))?;
+                            zw.finish()?.flush()?;
+                            Ok(Some((part, tp, local_sst, sig)))
+                        })();
+                        res.lock().unwrap().push(one);
+                    }
+                });
+            }
+        });
+        for item in results.into_inner().unwrap() {
+            let Some((part, tp, local_sst, sig)) = item? else {
+                return Ok(DeltaSummary::default());
+            };
+            changed_sst |= local_sst;
+            if let Some(s) = sig {
+                trusted_parts.insert(part.clone(), s);
+            }
+            parallel_sheets.insert(part, tp);
+        }
+    }
+
+    let tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let (file, tmp) = tmp.into_parts();
+    let mut out = ZipWriter::new(BufWriter::with_capacity(256 * 1024, file));
     for index in 0..zip.len() {
         let part = zip
             .name_for_index(index)
@@ -1702,18 +1942,43 @@ pub(super) fn write_with_style_receipt(
                     .compression_level(Some(1)),
             )?;
             out.write_all(&data)?;
+        } else if let Some(tp) = parallel_sheets.remove(&part) {
+            let mut part_zip = ZipArchive::new(File::open(&tp)?)?;
+            out.raw_copy_file(part_zip.by_index_raw(0)?)?;
         } else if let Some((sheet, store, changes)) = sheets.remove(&part) {
-            out.start_file(&part, SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated).compression_level(Some(1)))?;
-            if !stream_supported(stream::xml_input(zip.by_index(index)?, &part, |input|
-                stream::worksheet(input, &mut out, sheet, store, changes, &mut changed_sst)))? {
+            let entry = zip.by_index(index)?;
+            let Some(sig_opt) = super::fresh::write_parallel_deflate_entry(
+                &mut out,
+                &part,
+                1,
+                Some("worksheet"),
+                |mut w| {
+                    stream_supported(stream::xml_input(entry, &part, |input| {
+                        stream::worksheet(input, &mut w, sheet, store, changes, &mut changed_sst)
+                    }))
+                },
+            )?
+            else {
                 return Ok(DeltaSummary::default());
+            };
+            if let Some(s) = sig_opt {
+                trusted_parts.insert(part, s);
+            }
+        } else if let Some(sheet) = new_plain_sheets.remove(&part) {
+            out.start_file(
+                &part,
+                SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .compression_level(Some(1)),
+            )?;
+            if let Some(s) = super::fresh::write_plain_new_sheet(sheet, &mut out)? {
+                trusted_parts.insert(part, s);
             }
         } else {
             out.raw_copy_file(zip.by_index_raw(index)?)?;
         }
     }
-    if !sheets.is_empty() || !parts.is_empty() {
+    if !sheets.is_empty() || !parallel_sheets.is_empty() || !new_plain_sheets.is_empty() || !parts.is_empty() {
         return Ok(DeltaSummary::default());
     }
     if need_new_metadata {
@@ -1731,8 +1996,12 @@ pub(super) fn write_with_style_receipt(
             // optional; preserve indices, rich runs and every original <si>.
             out.start_file("xl/sharedStrings.xml", SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated).compression_level(Some(1)))?;
+            let mut vw = super::fresh::VerifiedXmlWriter::new(&mut out);
             if !stream_supported(stream::xml_input(zip.by_index(i)?, "xl/sharedStrings.xml", |input|
-                stream::shared_strings(input, &mut out)))? { return Ok(DeltaSummary::default()); }
+                stream::shared_strings(input, &mut vw)))? { return Ok(DeltaSummary::default()); }
+            if let Some(s) = vw.finish(Some("sst"))? {
+                trusted_parts.insert("xl/sharedStrings.xml".to_owned(), s);
+            }
         } else {
             out.raw_copy_file(zip.by_index_raw(i)?)?;
         }
@@ -1740,8 +2009,7 @@ pub(super) fn write_with_style_receipt(
     out.finish()?.flush()?;
     drop(zip);
     if let Some(map) = updated_map {
-        let mut written = ZipArchive::new(File::open(&tmp)?)?;
-        let signature = signature(&mut written, "xl/styles.xml").context("缺少更新的样式表")?;
+        let signature = updated_styles_sig.context("缺少更新的样式表")?;
         *saved_styles = Some(SavedStyles { signature, map });
     }
     tmp.persist(target)?;
@@ -1751,6 +2019,7 @@ pub(super) fn write_with_style_receipt(
         handled_freeze: any_freeze,
         handled_filter: any_filter,
         handled_page: any_page,
+        trusted_parts,
     })
 }
 #[cfg(test)]
