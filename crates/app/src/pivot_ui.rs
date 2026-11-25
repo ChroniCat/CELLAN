@@ -935,13 +935,12 @@ impl SheetApp {
             detail_sh.cols.set(ci as u32, *w);
         }
         if !col_w.is_empty() && data_rows > 0 {
-            detail_sh.filter = Some(sheetcore::sort_filter::Filter {
-                range: (0, 0, data_rows as u32, col_w.len() as u32 - 1),
-                allows: Default::default(),
-                criteria: Default::default(),
-                date_groups: Default::default(),
-                color_filters: Default::default(),
-            });
+            detail_sh.filter = Some(sheetcore::sort_filter::Filter::new(
+                0,
+                0,
+                data_rows as u32,
+                col_w.len() as u32 - 1,
+            ));
             detail_sh.filter_dirty = true;
         }
         detail_sh.layout_dirty = true;

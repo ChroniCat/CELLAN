@@ -92,6 +92,7 @@ fn main() {
             line: Some([127, 127, 127]),
             align: 0,
             wrap: true,
+            ..Default::default()
         });
     }
     sheet.sparklines_dirty = true;

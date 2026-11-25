@@ -426,9 +426,10 @@ pub(crate) fn sort_order(
         }
     }
 
-    // Deduplicated text rank fast path: when many rows share text keys, sort unique spans once
-    // and assign dense `u32` ranks so comparison is pure integer order without touching `arena`.
-    let text_ranked = if text_count > 0 && spans.len() * 2 <= text_count && spans.len() > 1 {
+    // Deduplicated text rank fast path: use Chinese Pinyin collation when any non-ASCII text exists
+    // (unifying Quick Sort with Multi-Key Sort and Chinese Excel!), keeping ASCII pure-byte fast path.
+    let has_non_ascii = text_count > 0 && !arena.is_ascii();
+    let text_ranked = if text_count > 0 && ((spans.len() * 2 <= text_count && spans.len() > 1) || (has_non_ascii && spans.len() > 1)) {
         let mut unique: Vec<(u64, u32)> = spans
             .iter()
             .enumerate()
@@ -439,34 +440,60 @@ pub(crate) fn sort_order(
             .collect();
         let arena_ref = arena.as_slice();
         let spans_ref = spans.as_slice();
-        parallel_stable_sort(&mut unique, &|a, b| {
-            a.0.cmp(&b.0).then_with(|| {
-                let (oa, la) = spans_ref[a.1 as usize];
-                let (ob, lb) = spans_ref[b.1 as usize];
-                arena_ref[oa as usize..(oa + la) as usize]
-                    .cmp(&arena_ref[ob as usize..(ob + lb) as usize])
-            })
-        });
-        let mut ranks = vec![0u32; spans.len()];
-        let mut cur_rank = 0u32;
-        for i in 0..unique.len() {
-            if i > 0 {
-                let prev_id = unique[i - 1].1 as usize;
-                let cur_id = unique[i].1 as usize;
-                let (op, lp) = spans[prev_id];
-                let (oc, lc) = spans[cur_id];
-                if arena[op as usize..(op + lp) as usize]
-                    != arena[oc as usize..(oc + lc) as usize]
-                {
+        if has_non_ascii {
+            let mut key_cache = crate::collate::SortKeyCache::new();
+            let col_keys: Vec<Box<[u8]>> = spans
+                .iter()
+                .map(|&(off, blen)| {
+                    let s = std::str::from_utf8(&arena_ref[off as usize..(off + blen) as usize]).unwrap_or("");
+                    key_cache.get_or_compute(s).into()
+                })
+                .collect();
+            parallel_stable_sort(&mut unique, &|a, b| col_keys[a.1 as usize].cmp(&col_keys[b.1 as usize]));
+            let mut ranks = vec![0u32; spans.len()];
+            let mut cur_rank = 0u32;
+            for i in 0..unique.len() {
+                if i > 0 && col_keys[unique[i - 1].1 as usize] != col_keys[unique[i].1 as usize] {
                     cur_rank += 1;
                 }
+                ranks[unique[i].1 as usize] = cur_rank;
             }
-            ranks[unique[i].1 as usize] = cur_rank;
-        }
-        for e in &mut entries {
-            let k = e.kind();
-            if k == SortEntry::KIND_TEXT || k == SortEntry::KIND_ERR {
-                e.payload = ranks[e.aux() as usize] as u64;
+            for e in &mut entries {
+                let k = e.kind();
+                if k == SortEntry::KIND_TEXT || k == SortEntry::KIND_ERR {
+                    e.payload = ranks[e.aux() as usize] as u64;
+                }
+            }
+        } else {
+            parallel_stable_sort(&mut unique, &|a, b| {
+                a.0.cmp(&b.0).then_with(|| {
+                    let (oa, la) = spans_ref[a.1 as usize];
+                    let (ob, lb) = spans_ref[b.1 as usize];
+                    arena_ref[oa as usize..(oa + la) as usize]
+                        .cmp(&arena_ref[ob as usize..(ob + lb) as usize])
+                })
+            });
+            let mut ranks = vec![0u32; spans.len()];
+            let mut cur_rank = 0u32;
+            for i in 0..unique.len() {
+                if i > 0 {
+                    let prev_id = unique[i - 1].1 as usize;
+                    let cur_id = unique[i].1 as usize;
+                    let (op, lp) = spans[prev_id];
+                    let (oc, lc) = spans[cur_id];
+                    if arena[op as usize..(op + lp) as usize]
+                        != arena[oc as usize..(oc + lc) as usize]
+                    {
+                        cur_rank += 1;
+                    }
+                }
+                ranks[unique[i].1 as usize] = cur_rank;
+            }
+            for e in &mut entries {
+                let k = e.kind();
+                if k == SortEntry::KIND_TEXT || k == SortEntry::KIND_ERR {
+                    e.payload = ranks[e.aux() as usize] as u64;
+                }
             }
         }
         true
@@ -573,34 +600,54 @@ pub fn sort_region(sheet: &mut Sheet, region: (u32, u32, u32, u32), col: u32, as
 }
 
 /// 以 (r, c) 为中心找出连续的数据区域（Excel 的「当前区域」）。
-/// 使用 `Store` 页级 `row_mask` 与 `col_nonempty` 位图检测空行/空列，跳过百万空行无需逐格查询。
+/// 采用逐轮 1 格边界扩展：使用 `Store` 页级 `row_mask` 与 `col_nonempty` 位图，
+/// 既可在微秒级跳过百万空行，又严格止步于空白分隔行/列，绝不误串隔空表。
 pub fn current_region(sheet: &Sheet, r: u32, c: u32) -> (u32, u32, u32, u32) {
     let Some((ur1, uc1, ur2, uc2)) = sheet.used_bounds() else {
         return (r, c, r, c);
     };
+    if r > ur2.saturating_add(1)
+        || r.saturating_add(1) < ur1
+        || c > uc2.saturating_add(1)
+        || c.saturating_add(1) < uc1
+    {
+        return (r, c, r, c);
+    }
     let min_r = ur1.min(r);
     let max_r = ur2.max(r);
     let min_c = uc1.min(c);
     let max_c = uc2.max(c);
     let cells = sheet.cells();
-    let is_blank_row = |rr: u32| !cells.row_has_any_in(rr, min_c, max_c);
-    let is_blank_col = |cc: u32| !cells.col_has_any_in(cc, min_r, max_r);
 
     let mut r1 = r;
-    while r1 > min_r && !is_blank_row(r1 - 1) {
-        r1 -= 1;
-    }
     let mut r2 = r;
-    while r2 < max_r && !is_blank_row(r2 + 1) {
-        r2 += 1;
-    }
     let mut c1 = c;
-    while c1 > min_c && !is_blank_col(c1 - 1) {
-        c1 -= 1;
-    }
     let mut c2 = c;
-    while c2 < max_c && !is_blank_col(c2 + 1) {
-        c2 += 1;
+    loop {
+        let mut changed = false;
+        let c_lo = c1.saturating_sub(1).max(min_c);
+        let c_hi = c2.saturating_add(1).min(max_c);
+        while r1 > min_r && cells.row_has_any_in(r1 - 1, c_lo, c_hi) {
+            r1 -= 1;
+            changed = true;
+        }
+        while r2 < max_r && cells.row_has_any_in(r2 + 1, c_lo, c_hi) {
+            r2 += 1;
+            changed = true;
+        }
+        let r_lo = r1.saturating_sub(1).max(min_r);
+        let r_hi = r2.saturating_add(1).min(max_r);
+        while c1 > min_c && cells.col_has_any_in(c1 - 1, r_lo, r_hi) {
+            c1 -= 1;
+            changed = true;
+        }
+        while c2 < max_c && cells.col_has_any_in(c2 + 1, r_lo, r_hi) {
+            c2 += 1;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
     }
     (r1, c1, r2, c2)
 }
@@ -684,13 +731,89 @@ impl CmpOp {
     }
 }
 
-/// 一条筛选条件
+/// Excel 风格通配符匹配（大小写不敏感；`*` 任意串、`?` 单字符、`~` 转义）。
+pub fn wildcard_match_ci(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    #[derive(Clone, Copy)]
+    enum Tok {
+        Star,
+        Any,
+        Lit(char),
+    }
+    let mut toks: Vec<Tok> = Vec::new();
+    let pat_lower = pattern.to_lowercase();
+    let mut it = pat_lower.chars();
+    while let Some(ch) = it.next() {
+        match ch {
+            '~' => {
+                if let Some(next) = it.next() {
+                    toks.push(Tok::Lit(next));
+                } else {
+                    toks.push(Tok::Lit('~'));
+                }
+            }
+            '*' => {
+                if !matches!(toks.last(), Some(Tok::Star)) {
+                    toks.push(Tok::Star);
+                }
+            }
+            '?' => toks.push(Tok::Any),
+            other => toks.push(Tok::Lit(other)),
+        }
+    }
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < t.len() {
+        if pi < toks.len() {
+            match toks[pi] {
+                Tok::Star => {
+                    star_pi = Some(pi);
+                    star_ti = ti;
+                    pi += 1;
+                    continue;
+                }
+                Tok::Any => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                Tok::Lit(c) if c == t[ti] => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if let Some(sp) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = sp + 1;
+        } else {
+            return false;
+        }
+    }
+    while pi < toks.len() && matches!(toks[pi], Tok::Star) {
+        pi += 1;
+    }
+    pi == toks.len()
+}
+
+#[inline]
+fn pattern_has_wildcard(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('~')
+}
+
+/// 一条筛选条件（支持 Between 及 Excel 双条件 AND / OR 组合与通配符 `*`/`?`/`~`）
 #[derive(Clone, Debug, PartialEq)]
 pub struct Criterion {
     pub op: CmpOp,
     pub val: String,
     /// 只有 Between 用
     pub val2: Option<String>,
+    /// 可选第二子条件：`(is_and, op2, val2)`，对应 Excel 自定义筛选「与 / 或」
+    pub second: Option<(bool, CmpOp, String)>,
 }
 
 impl Criterion {
@@ -699,6 +822,7 @@ impl Criterion {
             op,
             val: val.into(),
             val2: None,
+            second: None,
         }
     }
 
@@ -707,30 +831,65 @@ impl Criterion {
             op: CmpOp::Between,
             val: a.into(),
             val2: Some(b.into()),
+            second: None,
         }
     }
 
-    /// 这条条件是否放行某个显示文本
-    pub fn matches(&self, text: &str) -> bool {
-        match self.op {
-            CmpOp::Contains => text.to_lowercase().contains(&self.val.to_lowercase()),
-            CmpOp::NotContains => !text.to_lowercase().contains(&self.val.to_lowercase()),
-            CmpOp::Begins => text.to_lowercase().starts_with(&self.val.to_lowercase()),
-            CmpOp::Ends => text.to_lowercase().ends_with(&self.val.to_lowercase()),
+    pub fn compound(
+        op1: CmpOp,
+        val1: impl Into<String>,
+        is_and: bool,
+        op2: CmpOp,
+        val2: impl Into<String>,
+    ) -> Self {
+        Self {
+            op: op1,
+            val: val1.into(),
+            val2: None,
+            second: Some((is_and, op2, val2.into())),
+        }
+    }
+
+    fn matches_single(op: CmpOp, val: &str, val2: Option<&str>, text: &str) -> bool {
+        match op {
+            CmpOp::Contains => {
+                if pattern_has_wildcard(val) {
+                    wildcard_match_ci(text, &format!("*{val}*"))
+                } else {
+                    text.to_lowercase().contains(&val.to_lowercase())
+                }
+            }
+            CmpOp::NotContains => !Self::matches_single(CmpOp::Contains, val, None, text),
+            CmpOp::Begins => {
+                if pattern_has_wildcard(val) {
+                    wildcard_match_ci(text, &format!("{val}*"))
+                } else {
+                    text.to_lowercase().starts_with(&val.to_lowercase())
+                }
+            }
+            CmpOp::Ends => {
+                if pattern_has_wildcard(val) {
+                    wildcard_match_ci(text, &format!("*{val}"))
+                } else {
+                    text.to_lowercase().ends_with(&val.to_lowercase())
+                }
+            }
             _ => {
+                if matches!(op, CmpOp::Eq | CmpOp::Ne) && pattern_has_wildcard(val) {
+                    let hit = wildcard_match_ci(text, val);
+                    return if op == CmpOp::Eq { hit } else { !hit };
+                }
                 // 数值优先，转不动就按文本比
-                if let (Ok(a), Ok(b)) = (text.trim().parse::<f64>(), self.val.trim().parse::<f64>()) {
-                    return match self.op {
-                        CmpOp::Eq => a == b,
-                        CmpOp::Ne => a != b,
+                if let (Ok(a), Ok(b)) = (text.trim().parse::<f64>(), val.trim().parse::<f64>()) {
+                    return match op {
+                        CmpOp::Eq => (a - b).abs() <= 1e-12 * (1.0 + a.abs().max(b.abs())),
+                        CmpOp::Ne => (a - b).abs() > 1e-12 * (1.0 + a.abs().max(b.abs())),
                         CmpOp::Gt => a > b,
                         CmpOp::Ge => a >= b,
                         CmpOp::Lt => a < b,
                         CmpOp::Le => a <= b,
                         CmpOp::Between => {
-                            let hi = self
-                                .val2
-                                .as_deref()
+                            let hi = val2
                                 .and_then(|v| v.trim().parse::<f64>().ok())
                                 .unwrap_or(b);
                             a >= b.min(hi) && a <= b.max(hi)
@@ -739,8 +898,8 @@ impl Criterion {
                     };
                 }
                 let t = text.to_lowercase();
-                let v = self.val.to_lowercase();
-                match self.op {
+                let v = val.to_lowercase();
+                match op {
                     CmpOp::Eq => t == v,
                     CmpOp::Ne => t != v,
                     CmpOp::Gt => t > v,
@@ -748,13 +907,150 @@ impl Criterion {
                     CmpOp::Lt => t < v,
                     CmpOp::Le => t <= v,
                     CmpOp::Between => {
-                        let hi = self.val2.as_deref().unwrap_or("").to_lowercase();
+                        let hi = val2.unwrap_or("").to_lowercase();
                         let (lo, hi) = if v <= hi { (v, hi) } else { (hi, v) };
                         t >= lo && t <= hi
                     }
                     _ => true,
                 }
             }
+        }
+    }
+
+    /// 这条条件是否放行某个显示文本
+    pub fn matches(&self, text: &str) -> bool {
+        let first = Self::matches_single(self.op, &self.val, self.val2.as_deref(), text);
+        if let Some((is_and, op2, val2)) = &self.second {
+            let second = Self::matches_single(*op2, val2, None, text);
+            if *is_and { first && second } else { first || second }
+        } else {
+            first
+        }
+    }
+}
+
+/// 前 N 项 / 后 N 项 / 前 N% / 后 N% 筛选（OOXML `<top10>`）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TopFilter {
+    pub top: bool,
+    pub count: u32,
+    pub percent: bool,
+}
+
+/// 动态筛选：高于/低于平均值与动态日期（OOXML `<dynamicFilter>`）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynamicFilter {
+    AboveAverage,
+    BelowAverage,
+    Today,
+    Yesterday,
+    Tomorrow,
+    ThisWeek,
+    LastWeek,
+    NextWeek,
+    ThisMonth,
+    LastMonth,
+    NextMonth,
+    ThisYear,
+    LastYear,
+    NextYear,
+}
+
+impl DynamicFilter {
+    pub fn from_ooxml(s: &str) -> Option<Self> {
+        Some(match s {
+            "aboveAverage" => Self::AboveAverage,
+            "belowAverage" => Self::BelowAverage,
+            "today" => Self::Today,
+            "yesterday" => Self::Yesterday,
+            "tomorrow" => Self::Tomorrow,
+            "thisWeek" => Self::ThisWeek,
+            "lastWeek" => Self::LastWeek,
+            "nextWeek" => Self::NextWeek,
+            "thisMonth" => Self::ThisMonth,
+            "lastMonth" => Self::LastMonth,
+            "nextMonth" => Self::NextMonth,
+            "thisYear" => Self::ThisYear,
+            "lastYear" => Self::LastYear,
+            "nextYear" => Self::NextYear,
+            _ => return None,
+        })
+    }
+    pub fn as_ooxml(self) -> &'static str {
+        match self {
+            Self::AboveAverage => "aboveAverage",
+            Self::BelowAverage => "belowAverage",
+            Self::Today => "today",
+            Self::Yesterday => "yesterday",
+            Self::Tomorrow => "tomorrow",
+            Self::ThisWeek => "thisWeek",
+            Self::LastWeek => "lastWeek",
+            Self::NextWeek => "nextWeek",
+            Self::ThisMonth => "thisMonth",
+            Self::LastMonth => "lastMonth",
+            Self::NextMonth => "nextMonth",
+            Self::ThisYear => "thisYear",
+            Self::LastYear => "lastYear",
+            Self::NextYear => "nextYear",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AboveAverage => "高于平均值",
+            Self::BelowAverage => "低于平均值",
+            Self::Today => "今天",
+            Self::Yesterday => "昨天",
+            Self::Tomorrow => "明天",
+            Self::ThisWeek => "本周",
+            Self::LastWeek => "上周",
+            Self::NextWeek => "下周",
+            Self::ThisMonth => "本月",
+            Self::LastMonth => "上月",
+            Self::NextMonth => "下月",
+            Self::ThisYear => "今年",
+            Self::LastYear => "去年",
+            Self::NextYear => "明年",
+        }
+    }
+    pub fn is_date(self) -> bool {
+        !matches!(self, Self::AboveAverage | Self::BelowAverage)
+    }
+    pub fn matches_date(self, serial: f64, today_serial: i64, sys: crate::model::DateSystem) -> bool {
+        let Some((y, m, _)) = crate::formula::functions::serial_to_date_in(sys, serial) else {
+            return false;
+        };
+        let Some((ty, tm, _)) = crate::formula::functions::serial_to_date_in(sys, today_serial as f64) else {
+            return false;
+        };
+        let d = serial.floor() as i64;
+        match self {
+            Self::Today => d == today_serial,
+            Self::Yesterday => d == today_serial - 1,
+            Self::Tomorrow => d == today_serial + 1,
+            Self::ThisWeek | Self::LastWeek | Self::NextWeek => {
+                let dow = (today_serial - 1).rem_euclid(7);
+                let ws = today_serial - dow;
+                let (lo, hi) = match self {
+                    Self::ThisWeek => (ws, ws + 6),
+                    Self::LastWeek => (ws - 7, ws - 1),
+                    Self::NextWeek => (ws + 7, ws + 13),
+                    _ => unreachable!(),
+                };
+                d >= lo && d <= hi
+            }
+            Self::ThisMonth => y == ty && m == tm,
+            Self::LastMonth => {
+                let (wy, wm) = if tm == 1 { (ty - 1, 12) } else { (ty, tm - 1) };
+                y == wy && m == wm
+            }
+            Self::NextMonth => {
+                let (wy, wm) = if tm == 12 { (ty + 1, 1) } else { (ty, tm + 1) };
+                y == wy && m == wm
+            }
+            Self::ThisYear => y == ty,
+            Self::LastYear => y == ty - 1,
+            Self::NextYear => y == ty + 1,
+            Self::AboveAverage | Self::BelowAverage => false,
         }
     }
 }
@@ -804,18 +1100,22 @@ pub struct ColumnFilterMeta {
     pub font_colors: Vec<[u8; 3]>,
 }
 
-/// 一个筛选器：区域 + 每列允许的值 / 条件 / 日期分组 / 颜色筛选
+/// 一个筛选器：区域 + 每列允许的值 / 条件 / 日期分组 / 颜色筛选 / Top10 / 动态筛选
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Filter {
     pub range: (u32, u32, u32, u32),
     /// 列号 → 允许出现文本值；没有条目的列不过滤（CoW 共享，避免 Sheet 克隆深拷几万唯一值）
     pub allows: crate::model::CellMetadata<u32, HashSet<String>>,
-    /// 列号 → 条件（文本筛选/数字筛选）；和 allows 是「与」关系
+    /// 列号 → 条件（文本筛选/数字筛选/AND-OR/通配符）；和 allows 是「与」关系
     pub criteria: HashMap<u32, Criterion>,
     /// 列号 → 允许的日期层级分组（年 / 月 / 日）
     pub date_groups: HashMap<u32, Vec<DateGroupItem>>,
     /// 列号 → 按单元格填充色或字体色筛选
     pub color_filters: HashMap<u32, ColorFilter>,
+    /// 列号 → 前/后 N 项或 N% 筛选
+    pub top_filters: HashMap<u32, TopFilter>,
+    /// 列号 → 高于/低于平均或动态日期筛选
+    pub dynamic_filters: HashMap<u32, DynamicFilter>,
 }
 
 #[inline]
@@ -845,6 +1145,9 @@ struct CompiledCriterion {
     lower1: String,
     lower2: String,
     ascii_only: bool,
+    has_wild: bool,
+    raw_val: String,
+    second: Option<(bool, Box<CompiledCriterion>)>,
 }
 
 impl CompiledCriterion {
@@ -865,6 +1168,10 @@ impl CompiledCriterion {
         let lower1 = c.val.to_lowercase();
         let lower2 = c.val2.as_deref().unwrap_or("").to_lowercase();
         let ascii_only = lower1.is_ascii() && lower2.is_ascii();
+        let has_wild = pattern_has_wildcard(&c.val);
+        let second = c.second.as_ref().map(|(is_and, op2, v2)| {
+            (*is_and, Box::new(CompiledCriterion::new(&Criterion::new(*op2, v2.clone()))))
+        });
         Self {
             op: c.op,
             num1,
@@ -872,14 +1179,17 @@ impl CompiledCriterion {
             lower1,
             lower2,
             ascii_only,
+            has_wild,
+            raw_val: c.val.clone(),
+            second,
         }
     }
 
     #[inline]
     fn matches_num(&self, a: f64, b: f64) -> bool {
         match self.op {
-            CmpOp::Eq => a == b,
-            CmpOp::Ne => a != b,
+            CmpOp::Eq => (a - b).abs() <= 1e-12 * (1.0 + a.abs().max(b.abs())),
+            CmpOp::Ne => (a - b).abs() > 1e-12 * (1.0 + a.abs().max(b.abs())),
             CmpOp::Gt => a > b,
             CmpOp::Ge => a >= b,
             CmpOp::Lt => a < b,
@@ -892,7 +1202,18 @@ impl CompiledCriterion {
         }
     }
 
-    fn matches_str(&self, text: &str) -> bool {
+    fn matches_str_single(&self, text: &str) -> bool {
+        if self.has_wild {
+            return match self.op {
+                CmpOp::Eq => wildcard_match_ci(text, &self.raw_val),
+                CmpOp::Ne => !wildcard_match_ci(text, &self.raw_val),
+                CmpOp::Contains => wildcard_match_ci(text, &format!("*{}*", self.raw_val)),
+                CmpOp::NotContains => !wildcard_match_ci(text, &format!("*{}*", self.raw_val)),
+                CmpOp::Begins => wildcard_match_ci(text, &format!("{}*", self.raw_val)),
+                CmpOp::Ends => wildcard_match_ci(text, &format!("*{}", self.raw_val)),
+                _ => false,
+            };
+        }
         if self.op.is_text() {
             if self.ascii_only && text.is_ascii() {
                 let tb = text.as_bytes();
@@ -945,21 +1266,40 @@ impl CompiledCriterion {
         }
     }
 
+    fn matches_str(&self, text: &str) -> bool {
+        let a = self.matches_str_single(text);
+        if let Some((is_and, b)) = &self.second {
+            if *is_and { a && b.matches_str(text) } else { a || b.matches_str(text) }
+        } else {
+            a
+        }
+    }
+
     #[inline]
-    fn matches_value(&self, v: &Value) -> bool {
+    fn matches_value_single(&self, v: &Value) -> bool {
         match v {
-            Value::Number(n) if !self.op.is_text() => {
+            Value::Number(n) if !self.op.is_text() && !self.has_wild => {
                 if let Some(b) = self.num1 {
                     self.matches_num(*n, b)
                 } else {
-                    v.with_display_str(|s| self.matches_str(s))
+                    v.with_display_str(|s| self.matches_str_single(s))
                 }
             }
-            Value::Text(t) => self.matches_str(t),
-            Value::Empty => self.matches_str(""),
-            Value::Bool(b) => self.matches_str(if *b { "TRUE" } else { "FALSE" }),
-            Value::Error(e) => self.matches_str(e.text()),
-            Value::Number(_) => v.with_display_str(|s| self.matches_str(s)),
+            Value::Text(t) => self.matches_str_single(t),
+            Value::Empty => self.matches_str_single(""),
+            Value::Bool(b) => self.matches_str_single(if *b { "TRUE" } else { "FALSE" }),
+            Value::Error(e) => self.matches_str_single(e.text()),
+            Value::Number(_) => v.with_display_str(|s| self.matches_str_single(s)),
+        }
+    }
+
+    #[inline]
+    fn matches_value(&self, v: &Value) -> bool {
+        let a = self.matches_value_single(v);
+        if let Some((is_and, b)) = &self.second {
+            if *is_and { a && b.matches_value(v) } else { a || b.matches_value(v) }
+        } else {
+            a
         }
     }
 }
@@ -972,6 +1312,8 @@ impl Filter {
             criteria: HashMap::new(),
             date_groups: HashMap::new(),
             color_filters: HashMap::new(),
+            top_filters: HashMap::new(),
+            dynamic_filters: HashMap::new(),
         }
     }
 
@@ -1099,14 +1441,18 @@ impl Filter {
         out
     }
 
-    /// 支持日期分组与颜色筛选的完整隐藏行区间计算（需要样式表与日期体系）。
+    /// 支持日期分组、颜色、Top-N 与动态筛选的完整隐藏行区间计算（需要样式表与日期体系）。
     pub fn hidden_row_intervals_with_styles(
         &self,
         sheet: &Sheet,
         styles: &crate::style::StyleTable,
         sys: crate::model::DateSystem,
     ) -> crate::layout::HiddenIndices {
-        if self.date_groups.is_empty() && self.color_filters.is_empty() {
+        if self.date_groups.is_empty()
+            && self.color_filters.is_empty()
+            && self.top_filters.is_empty()
+            && self.dynamic_filters.is_empty()
+        {
             return self.hidden_row_intervals(sheet);
         }
         let (r1, c1, mut r2, c2) = self.range;
@@ -1121,6 +1467,54 @@ impl Filter {
             return crate::layout::HiddenIndices::default();
         }
         let mut hidden = self.hidden_row_intervals(sheet);
+
+        // 预计算 Top-N 阈值与 Above/Below Average 均值
+        let mut top_thresh: HashMap<u32, (bool, f64)> = HashMap::new();
+        for (&col, tf) in &self.top_filters {
+            if col < c1 || col > c2 {
+                continue;
+            }
+            let mut vals: Vec<f64> = Vec::new();
+            for r in (r1 + 1)..=r2 {
+                if let Value::Number(v) = sheet.value_ref(r, col).as_ref()
+                    && v.is_finite()
+                {
+                    vals.push(*v);
+                }
+            }
+            if !vals.is_empty() {
+                vals.sort_unstable_by(|a, b| a.total_cmp(b));
+                let k = if tf.percent {
+                    ((vals.len() as f64) * (tf.count.max(1) as f64) / 100.0).ceil().max(1.0) as usize
+                } else {
+                    (tf.count as usize).max(1)
+                }
+                .min(vals.len());
+                let thr = if tf.top { vals[vals.len() - k] } else { vals[k - 1] };
+                top_thresh.insert(col, (tf.top, thr));
+            }
+        }
+        let mut avg_map: HashMap<u32, f64> = HashMap::new();
+        let today = crate::cf::today_excel_serial();
+        for (&col, df) in &self.dynamic_filters {
+            if col < c1 || col > c2 || df.is_date() {
+                continue;
+            }
+            let mut sum = 0.0;
+            let mut cnt = 0usize;
+            for r in (r1 + 1)..=r2 {
+                if let Value::Number(v) = sheet.value_ref(r, col).as_ref()
+                    && v.is_finite()
+                {
+                    sum += *v;
+                    cnt += 1;
+                }
+            }
+            if cnt > 0 {
+                avg_map.insert(col, sum / cnt as f64);
+            }
+        }
+
         let mut extra_hidden: Vec<u32> = Vec::new();
         for r in (r1 + 1)..=r2 {
             if hidden.contains(&r) {
@@ -1160,6 +1554,39 @@ impl Filter {
                     }
                 }
             }
+            if keep {
+                for (&col, &(is_top, thr)) in &top_thresh {
+                    let matched = match sheet.value_ref(r, col).as_ref() {
+                        Value::Number(v) if v.is_finite() => {
+                            if is_top { *v >= thr } else { *v <= thr }
+                        }
+                        _ => false,
+                    };
+                    if !matched {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
+            if keep {
+                for (&col, df) in &self.dynamic_filters {
+                    if col < c1 || col > c2 {
+                        continue;
+                    }
+                    let matched = match sheet.value_ref(r, col).as_ref() {
+                        Value::Number(v) if v.is_finite() => match df {
+                            DynamicFilter::AboveAverage => avg_map.get(&col).is_some_and(|&a| *v > a),
+                            DynamicFilter::BelowAverage => avg_map.get(&col).is_some_and(|&a| *v < a),
+                            _ => df.matches_date(*v, today, sys),
+                        },
+                        _ => false,
+                    };
+                    if !matched {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
             if !keep {
                 extra_hidden.push(r);
             }
@@ -1184,12 +1611,248 @@ impl Filter {
         out
     }
 
-    /// 这列有没有任何筛选（值列表、条件、日期分组或颜色筛选）
+    /// 构造去掉 `except_col` 筛选条件后的副本，用于级联筛选（仅展示其他列已放行行里的候选项）。
+    pub fn without_col(&self, except_col: u32) -> Self {
+        let mut f = self.clone();
+        f.allows.remove(&except_col);
+        f.criteria.remove(&except_col);
+        f.date_groups.remove(&except_col);
+        f.color_filters.remove(&except_col);
+        f.top_filters.remove(&except_col);
+        f.dynamic_filters.remove(&except_col);
+        f
+    }
+
+    /// 这列有没有任何筛选（值列表、条件、日期分组、颜色、Top10 或动态筛选）
     pub fn is_filtered(&self, col: u32) -> bool {
         self.allows.get(&col).map(|a| !a.is_empty()).unwrap_or(false)
             || self.criteria.contains_key(&col)
             || self.date_groups.get(&col).is_some_and(|g| !g.is_empty())
             || self.color_filters.contains_key(&col)
+            || self.top_filters.contains_key(&col)
+            || self.dynamic_filters.contains_key(&col)
+    }
+
+    /// 任意列是否存在活动筛选
+    pub fn has_any_active(&self) -> bool {
+        !self.allows.is_empty()
+            || !self.criteria.is_empty()
+            || self.date_groups.values().any(|g| !g.is_empty())
+            || !self.color_filters.is_empty()
+            || !self.top_filters.is_empty()
+            || !self.dynamic_filters.is_empty()
+    }
+}
+
+/// 级联筛选候选项：仅收集满足**其他列**筛选条件的行，同时返回 `(原始显示键, 带数字/日期格式展示标签)`。
+pub fn cascading_column_choices(
+    sheet: &Sheet,
+    filter: &Filter,
+    col: u32,
+    styles: &crate::style::StyleTable,
+    sys: crate::model::DateSystem,
+) -> (Vec<(String, String)>, bool) {
+    let other = filter.without_col(col);
+    let other_hidden = if other.has_any_active() {
+        Some(other.hidden_row_intervals_with_styles(sheet, styles, sys))
+    } else {
+        None
+    };
+    let (r1, _, mut r2, _) = filter.range;
+    let used_max_r = sheet.used_bounds().map(|(_, _, ur2, _)| ur2).unwrap_or(r1);
+    if r2 > used_max_r.saturating_add(64) {
+        r2 = used_max_r.saturating_add(1).min(r2);
+    }
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut all_numeric = true;
+    let mut any_nonempty = false;
+    let cap_end = r2.min(r1.saturating_add(200_000));
+    for r in (r1 + 1)..=cap_end {
+        if other_hidden.as_ref().is_some_and(|h| h.contains(&r)) {
+            continue;
+        }
+        let v = sheet.value_ref(r, col);
+        let raw_key = v.display();
+        if !raw_key.is_empty() {
+            any_nonempty = true;
+            if !matches!(v.as_ref(), Value::Number(_)) && raw_key.trim().parse::<f64>().is_err() {
+                all_numeric = false;
+            }
+        }
+        map.entry(raw_key.clone()).or_insert_with(|| {
+            if raw_key.is_empty() {
+                String::new()
+            } else {
+                let fmt = &styles.get(sheet.style_of(r, col)).format;
+                if fmt.is_empty() || fmt.eq_ignore_ascii_case("General") {
+                    raw_key
+                } else {
+                    crate::style::format_value_in(sys, v.as_ref(), fmt)
+                }
+            }
+        });
+    }
+    let mut pairs: Vec<(Option<f64>, String, String)> = map
+        .into_iter()
+        .map(|(k, lbl)| (k.trim().parse::<f64>().ok(), k, lbl))
+        .collect();
+    pairs.sort_unstable_by(|(an, a, _), (bn, b, _)| match (an, bn) {
+        (Some(x), Some(y)) => x.total_cmp(y).then_with(|| a.cmp(b)),
+        (Some(_), None) if !b.is_empty() => Ordering::Less,
+        (None, Some(_)) if !a.is_empty() => Ordering::Greater,
+        _ => a.cmp(b),
+    });
+    let out = pairs.into_iter().map(|(_, k, lbl)| (k, lbl)).collect();
+    (out, any_nonempty && all_numeric)
+}
+
+/// 高级筛选结果
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdvFilterReport {
+    pub matched: usize,
+    pub total: usize,
+    pub copied_range: Option<(u32, u32, u32, u32)>,
+}
+
+fn parse_adv_cell_criterion(expr: &str) -> Criterion {
+    let s = expr.trim();
+    if let Some(rest) = s.strip_prefix(">=") {
+        Criterion::new(CmpOp::Ge, rest.trim())
+    } else if let Some(rest) = s.strip_prefix("<=") {
+        Criterion::new(CmpOp::Le, rest.trim())
+    } else if let Some(rest) = s.strip_prefix("<>") {
+        Criterion::new(CmpOp::Ne, rest.trim())
+    } else if let Some(rest) = s.strip_prefix('>') {
+        Criterion::new(CmpOp::Gt, rest.trim())
+    } else if let Some(rest) = s.strip_prefix('<') {
+        Criterion::new(CmpOp::Lt, rest.trim())
+    } else if let Some(rest) = s.strip_prefix('=') {
+        Criterion::new(CmpOp::Eq, rest.trim())
+    } else if pattern_has_wildcard(s) {
+        Criterion::new(CmpOp::Eq, s)
+    } else {
+        Criterion::new(CmpOp::Eq, s)
+    }
+}
+
+/// Excel 高级筛选：支持条件区域（同行 AND、多行 OR、比较运算符与 `*`/`?` 通配符）、原地隐藏或复制到目标位置、选择不重复记录。
+pub fn advanced_filter(
+    sheet: &mut Sheet,
+    list_range: (u32, u32, u32, u32),
+    criteria_range: Option<(u32, u32, u32, u32)>,
+    copy_to: Option<(u32, u32)>,
+    unique_only: bool,
+) -> Result<AdvFilterReport, String> {
+    let (lr1, lc1, lr2, lc2) = list_range;
+    if lr2 <= lr1 || lc2 < lc1 {
+        return Err("列表区域至少包含表头和一行数据".into());
+    }
+    let headers: Vec<String> = (lc1..=lc2)
+        .map(|c| sheet.value(lr1, c).display().trim().to_lowercase())
+        .collect();
+
+    // 解析条件区域：每行是一条 OR 分支，行内每个非空列是 AND 约束
+    let mut or_branches: Vec<Vec<(u32, Criterion)>> = Vec::new();
+    if let Some((cr1, cc1, cr2, cc2)) = criteria_range {
+        if cr2 <= cr1 {
+            return Err("条件区域至少包含标题行和一行条件".into());
+        }
+        let crit_cols: Vec<Option<u32>> = (cc1..=cc2)
+            .map(|c| {
+                let h = sheet.value(cr1, c).display().trim().to_lowercase();
+                headers.iter().position(|lh| !h.is_empty() && lh == &h).map(|off| lc1 + off as u32)
+            })
+            .collect();
+        for r in (cr1 + 1)..=cr2 {
+            let mut and_terms: Vec<(u32, Criterion)> = Vec::new();
+            for (idx, c) in (cc1..=cc2).enumerate() {
+                let raw = sheet.value(r, c).display();
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                if let Some(target_col) = crit_cols[idx] {
+                    and_terms.push((target_col, parse_adv_cell_criterion(&raw)));
+                }
+            }
+            if !and_terms.is_empty() {
+                or_branches.push(and_terms);
+            }
+        }
+    }
+
+    let mut matched_rows: Vec<u32> = Vec::new();
+    let mut seen_unique: HashSet<Vec<String>> = HashSet::new();
+    let total = (lr2 - lr1) as usize;
+    for r in (lr1 + 1)..=lr2 {
+        let passes = if or_branches.is_empty() {
+            true
+        } else {
+            or_branches.iter().any(|branch| {
+                branch.iter().all(|(col, crit)| {
+                    let v = sheet.value(r, *col).display();
+                    crit.matches(&v)
+                })
+            })
+        };
+        if !passes {
+            continue;
+        }
+        if unique_only {
+            let sig: Vec<String> = (lc1..=lc2).map(|c| sheet.value(r, c).display()).collect();
+            if !seen_unique.insert(sig) {
+                continue;
+            }
+        }
+        matched_rows.push(r);
+    }
+
+    if let Some((dr, dc)) = copy_to {
+        // 复制表头 + 命中行到目标位置
+        let width = lc2 - lc1 + 1;
+        for off in 0..width {
+            let src_c = lc1 + off;
+            if let Some(cell) = sheet.get(lr1, src_c) {
+                sheet.set(dr, dc + off, cell.into_owned());
+            }
+            let sid = sheet.style_of(lr1, src_c);
+            if sid != 0 {
+                sheet.set_style(dr, dc + off, sid);
+            }
+        }
+        for (i, &src_r) in matched_rows.iter().enumerate() {
+            let dst_r = dr + 1 + i as u32;
+            for off in 0..width {
+                let src_c = lc1 + off;
+                let cell = sheet.get(src_r, src_c).map(|c| c.into_owned()).unwrap_or_default();
+                sheet.set(dst_r, dc + off, cell);
+                let sid = sheet.style_of(src_r, src_c);
+                sheet.set_style(dst_r, dc + off, sid);
+            }
+        }
+        let end_r = dr + matched_rows.len() as u32;
+        let end_c = dc + width - 1;
+        sheet.edited = true;
+        Ok(AdvFilterReport {
+            matched: matched_rows.len(),
+            total,
+            copied_range: Some((dr, dc, end_r, end_c)),
+        })
+    } else {
+        // 原地筛选：隐藏未命中的行
+        let kept: HashSet<u32> = matched_rows.iter().copied().collect();
+        let mut hidden = crate::layout::HiddenIndices::default();
+        for r in (lr1 + 1)..=lr2 {
+            if !kept.contains(&r) {
+                hidden.insert(r);
+            }
+        }
+        sheet.hidden_rows = hidden;
+        sheet.filter_dirty = true;
+        Ok(AdvFilterReport {
+            matched: matched_rows.len(),
+            total,
+            copied_range: None,
+        })
     }
 }
 

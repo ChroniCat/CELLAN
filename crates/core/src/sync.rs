@@ -109,6 +109,97 @@ pub struct Cursor {
     pub sheet: usize,
     pub row: u32,
     pub col: u32,
+    /// 多格选区终点（可选，兼容旧版单格光标）
+    #[serde(default)]
+    pub end_row: Option<u32>,
+    #[serde(default)]
+    pub end_col: Option<u32>,
+}
+
+/// 协同工作表标签结构同步
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum SheetTabSync {
+    Add { name: String },
+    Rename { index: usize, name: String },
+    Delete { index: usize },
+    Move { from: usize, to: usize },
+    Visibility { name: String, hidden: bool, very_hidden: bool },
+}
+
+/// 高频非单元格元数据同步载荷（避免访客修改列宽/隐藏/批注/筛选/CF/DV/标签后被锁死保存）
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum SheetMetaKind {
+    ColWidths(Vec<(u32, f32)>),
+    RowHeights(Vec<(u32, f32)>),
+    HiddenRows(Vec<(u32, bool)>),
+    HiddenCols(Vec<(u32, bool)>),
+    Freeze(Option<(u32, u32)>),
+    Note {
+        row: u32,
+        col: u32,
+        text: Option<String>,
+        author: String,
+    },
+    Hyperlink {
+        row: u32,
+        col: u32,
+        target: Option<String>,
+        tooltip: String,
+    },
+    AutoFilter {
+        range: Option<(u32, u32, u32, u32)>,
+    },
+    SheetTab(SheetTabSync),
+}
+
+impl SheetMetaKind {
+    pub fn valid(&self, sheet: usize) -> bool {
+        if sheet >= MAX_SHEET_INDEX {
+            return false;
+        }
+        match self {
+            SheetMetaKind::ColWidths(v) => {
+                v.len() <= MAX_COLS as usize
+                    && v.iter().all(|&(c, w)| c < MAX_COLS && w.is_finite() && w >= 0.0 && w <= 4096.0)
+            }
+            SheetMetaKind::RowHeights(v) => {
+                v.len() <= 100_000
+                    && v.iter().all(|&(r, h)| r < MAX_ROWS && h.is_finite() && h >= 0.0 && h <= 4096.0)
+            }
+            SheetMetaKind::HiddenRows(v) => {
+                v.len() <= 100_000 && v.iter().all(|&(r, _)| r < MAX_ROWS)
+            }
+            SheetMetaKind::HiddenCols(v) => {
+                v.len() <= MAX_COLS as usize && v.iter().all(|&(c, _)| c < MAX_COLS)
+            }
+            SheetMetaKind::Freeze(f) => f.is_none_or(|(r, c)| r < MAX_ROWS && c < MAX_COLS),
+            SheetMetaKind::Note { row, col, text, author } => {
+                cell_in_bounds(sheet, *row, *col)
+                    && author.len() <= MAX_SHORT_TEXT
+                    && text.as_ref().is_none_or(|t| t.len() <= 64 * 1024)
+            }
+            SheetMetaKind::Hyperlink { row, col, target, tooltip } => {
+                cell_in_bounds(sheet, *row, *col)
+                    && tooltip.len() <= 1024
+                    && target.as_ref().is_none_or(|t| t.len() <= 4096)
+            }
+            SheetMetaKind::AutoFilter { range } => range.is_none_or(|(r1, c1, r2, c2)| {
+                cell_in_bounds(sheet, r1, c1)
+                    && cell_in_bounds(sheet, r2, c2)
+                    && r1 <= r2
+                    && c1 <= c2
+            }),
+            SheetMetaKind::SheetTab(tab) => match tab {
+                SheetTabSync::Add { name } => !name.is_empty() && name.len() <= MAX_SHORT_TEXT,
+                SheetTabSync::Rename { index, name } => {
+                    *index < MAX_SHEET_INDEX && !name.is_empty() && name.len() <= MAX_SHORT_TEXT
+                }
+                SheetTabSync::Delete { index } => *index < MAX_SHEET_INDEX,
+                SheetTabSync::Move { from, to } => *from < MAX_SHEET_INDEX && *to < MAX_SHEET_INDEX,
+                SheetTabSync::Visibility { name, .. } => name.len() <= 256,
+            },
+        }
+    }
 }
 
 /// 默认单元格编辑租约时长（毫秒）
@@ -566,6 +657,17 @@ pub enum Msg {
         c2: u32,
         on: bool,
     },
+    /// 工作表高频非单元格元数据同步（列宽/行高/隐藏行列/冻结/批注/超链接/筛选/工作表标签）
+    SheetMetaOp {
+        site: u32,
+        sheet: usize,
+        ts: u64,
+        kind: SheetMetaKind,
+    },
+    /// 入房/重连时下发的元数据历史快照
+    SheetMetaSnapshot {
+        items: Vec<(usize, SheetMetaKind)>,
+    },
     /// 加入后补一份现有样式（key: (sheet,row,col)）
     StyleSnapshot {
         items: Vec<(usize, u32, u32, crate::style::CellStyle)>,
@@ -690,6 +792,7 @@ pub fn cell_style_hash(s: &crate::style::CellStyle) -> u64 {
     s.double_underline.hash(&mut h);
     s.vertical_text.hash(&mut h);
     s.strikethrough.hash(&mut h);
+    s.vert_align.hash(&mut h);
     s.rotation.hash(&mut h);
     s.font.hash(&mut h);
     s.size.to_bits().hash(&mut h);
@@ -851,7 +954,12 @@ impl Msg {
             Msg::SortReply { first_ts, .. } => ts_ok(*first_ts),
             Msg::Op(op) => op.is_valid(),
             Msg::Ops { ops } => !ops.is_empty() && ops.len() <= LIVE_OP_BATCH && ops.iter().all(Op::is_valid),
-            Msg::CursorMsg(c) => cell_in_bounds(c.sheet, c.row, c.col) && c.name.len() <= MAX_SHORT_TEXT,
+            Msg::CursorMsg(c) => {
+                cell_in_bounds(c.sheet, c.row, c.col)
+                    && c.end_row.is_none_or(|r| r < MAX_ROWS)
+                    && c.end_col.is_none_or(|col| col < MAX_COLS)
+                    && c.name.len() <= MAX_SHORT_TEXT
+            }
             Msg::StyleOp { sheet, ts, items, .. } => {
                 *sheet < MAX_SHEET_INDEX
                     && ts_ok(*ts)
@@ -876,6 +984,10 @@ impl Msg {
                     && r1 <= r2
                     && c1 <= c2
                     && ts_ok(*ts)
+            }
+            Msg::SheetMetaOp { sheet, ts, kind, .. } => ts_ok(*ts) && kind.valid(*sheet),
+            Msg::SheetMetaSnapshot { items } => {
+                items.len() <= 10_000 && items.iter().all(|(s, k)| k.valid(*s))
             }
             Msg::StyleSnapshot { items } => {
                 items.len() <= MAX_BATCH_ITEMS
@@ -1289,7 +1401,8 @@ pub fn encode_msg_compact_into(msg: &Msg, out: &mut Vec<u8>) {
         Msg::CursorMsg(cur) => {
             let nb = cur.name.as_bytes();
             let nlen = nb.len().min(u16::MAX as usize);
-            out.reserve(1 + 4 + 1 + 4 + 4 + 4 + 2 + nlen);
+            let has_end = cur.end_row.is_some() || cur.end_col.is_some();
+            out.reserve(1 + 4 + 1 + 4 + 4 + 4 + 2 + nlen + if has_end { 8 } else { 0 });
             out.push(COMPACT_TAG_CURSOR);
             out.extend_from_slice(&cur.site.to_le_bytes());
             out.push(cur.color);
@@ -1298,6 +1411,10 @@ pub fn encode_msg_compact_into(msg: &Msg, out: &mut Vec<u8>) {
             out.extend_from_slice(&cur.col.to_le_bytes());
             out.extend_from_slice(&(nlen as u16).to_le_bytes());
             out.extend_from_slice(&nb[..nlen]);
+            if has_end {
+                out.extend_from_slice(&cur.end_row.unwrap_or(cur.row).to_le_bytes());
+                out.extend_from_slice(&cur.end_col.unwrap_or(cur.col).to_le_bytes());
+            }
         }
         Msg::Watermark {
             seq,
@@ -1450,10 +1567,20 @@ pub fn decode_msg_compact(bytes: &[u8]) -> Option<Msg> {
             let row = read_u32(&mut cur)?;
             let col = read_u32(&mut cur)?;
             let nlen = read_u16(&mut cur)? as usize;
-            if cur.len() != nlen {
+            if cur.len() < nlen {
                 return None;
             }
-            let name = std::str::from_utf8(cur).ok()?.to_string();
+            let (nb, mut tail) = cur.split_at(nlen);
+            let name = std::str::from_utf8(nb).ok()?.to_string();
+            let (end_row, end_col) = if tail.is_empty() {
+                (None, None)
+            } else if tail.len() == 8 {
+                let er = read_u32(&mut tail)?;
+                let ec = read_u32(&mut tail)?;
+                (Some(er), Some(ec))
+            } else {
+                return None;
+            };
             Some(Msg::CursorMsg(Cursor {
                 site,
                 name,
@@ -1461,6 +1588,8 @@ pub fn decode_msg_compact(bytes: &[u8]) -> Option<Msg> {
                 sheet,
                 row,
                 col,
+                end_row,
+                end_col,
             }))
         }
         COMPACT_TAG_WATERMARK => {
@@ -2619,10 +2748,12 @@ mod tests {
             sheet: 0,
             row: 8,
             col: 4,
+            end_row: Some(12),
+            end_col: Some(6),
         });
         assert!(matches!(
             decode_msg_compact(&encode_msg_compact(&cur)),
-            Some(Msg::CursorMsg(ref c)) if c.name == "张三" && (c.row, c.col) == (8, 4)
+            Some(Msg::CursorMsg(ref c)) if c.name == "张三" && (c.row, c.col) == (8, 4) && (c.end_row, c.end_col) == (Some(12), Some(6))
         ));
 
         let rename = Msg::Rename { site: 2, name: "新名字".into() };
@@ -2694,25 +2825,17 @@ mod tests {
             column_ids: vec![1, 2],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         sh0.charts.push(crate::charts::Chart {
             kind: crate::charts::ChartKind::Column,
             title: "预算柱状图".into(),
-            series: Vec::new(),
             legend: true,
             anchor: (0, 3, 10, 8),
             legend_pos: "r".into(),
             part: "xl/charts/chart1.xml".into(),
             drawing: "xl/drawings/drawing1.xml".into(),
-            show_labels: false,
-            label_opts: Default::default(),
-            radar_style: String::new(),
-            ref_fixes: Vec::new(),
-            axis_x: String::new(),
-            axis_y: String::new(),
-            y_fmt: String::new(),
-            y_min: None,
-            y_max: None,
+            ..Default::default()
         });
         sh0.edited = false;
         sh0.styles_dirty = false;

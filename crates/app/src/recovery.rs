@@ -16,11 +16,14 @@ pub struct RecoveryEntry {
     pub saved_unix_secs: u64,
     pub pid: u32,
     pub doc_uid: u64,
+    /// 快照文件扩展名（`xlsx` 或 `xlsm`，兼容旧版无此字段的 `.meta` 默认 `xlsx`）
+    pub ext: String,
 }
 
 impl RecoveryEntry {
     pub fn snapshot_path(&self) -> PathBuf {
-        recovery_dir().join(format!("{}.xlsx", self.token))
+        let ext = if self.ext.is_empty() { "xlsx" } else { self.ext.as_str() };
+        recovery_dir().join(format!("{}.{ext}", self.token))
     }
 
     pub fn meta_path(&self) -> PathBuf {
@@ -30,9 +33,10 @@ impl RecoveryEntry {
     fn encode_meta(&self) -> String {
         let orig = self.original_path.as_deref().unwrap_or("").replace('\n', " ");
         let title = self.title.replace('\n', " ");
+        let ext = if self.ext.is_empty() { "xlsx" } else { self.ext.as_str() };
         format!(
-            "token={}\ntitle={}\noriginal_path={}\nsaved_unix_secs={}\npid={}\ndoc_uid={}\n",
-            self.token, title, orig, self.saved_unix_secs, self.pid, self.doc_uid
+            "token={}\ntitle={}\noriginal_path={}\nsaved_unix_secs={}\npid={}\ndoc_uid={}\next={}\n",
+            self.token, title, orig, self.saved_unix_secs, self.pid, self.doc_uid, ext
         )
     }
 
@@ -43,6 +47,7 @@ impl RecoveryEntry {
         let mut saved_unix_secs = 0u64;
         let mut pid = 0u32;
         let mut doc_uid = 0u64;
+        let mut ext = String::from("xlsx");
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k.trim() {
@@ -56,6 +61,12 @@ impl RecoveryEntry {
                 "saved_unix_secs" => saved_unix_secs = v.trim().parse().unwrap_or(0),
                 "pid" => pid = v.trim().parse().unwrap_or(0),
                 "doc_uid" => doc_uid = v.trim().parse().unwrap_or(0),
+                "ext" => {
+                    let e = v.trim();
+                    if e == "xlsx" || e == "xlsm" {
+                        ext = e.to_string();
+                    }
+                }
                 _ => {}
             }
         }
@@ -66,6 +77,7 @@ impl RecoveryEntry {
             saved_unix_secs,
             pid,
             doc_uid,
+            ext,
         })
     }
 }
@@ -93,11 +105,11 @@ fn is_process_alive(pid: u32) -> bool {
     if pid == std::process::id() {
         return true;
     }
-    // Check via OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + GetExitCodeProcess
     unsafe {
         use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
         use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW,
+            PROCESS_QUERY_LIMITED_INFORMATION,
         };
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
@@ -105,14 +117,59 @@ fn is_process_alive(pid: u32) -> bool {
         }
         let mut code: u32 = 0;
         let ok = GetExitCodeProcess(handle, &mut code);
+        let mut same_exe = true;
+        if ok != 0 && code == STILL_ACTIVE as u32 {
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            if QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) != 0 && len > 0 {
+                let other_path = String::from_utf16_lossy(&buf[..len as usize]);
+                let other_name = Path::new(&other_path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if let Ok(cur_exe) = std::env::current_exe() {
+                    let cur_name = cur_exe.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if !cur_name.is_empty() && !other_name.is_empty() {
+                        same_exe = other_name.eq_ignore_ascii_case(cur_name);
+                    }
+                }
+            }
+        }
         CloseHandle(handle);
-        ok != 0 && code == STILL_ACTIVE as u32
+        ok != 0 && code == STILL_ACTIVE as u32 && same_exe
     }
 }
 
 #[cfg(not(windows))]
 fn is_process_alive(pid: u32) -> bool {
     pid == std::process::id()
+}
+
+fn replace_file_atomic(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let src_w: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let dst_w: Vec<u16> = dest.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let ok = unsafe {
+            MoveFileExW(
+                src_w.as_ptr(),
+                dst_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, dest)
+    }
 }
 
 /// 同步写入一份恢复草稿（供后台线程与单测调用）。
@@ -124,8 +181,7 @@ pub fn write_recovery_snapshot(entry: &RecoveryEntry, wb: &Workbook) -> anyhow::
     sheetcore::xlsx::save_atomic(&snap, wb)?;
     let tmp_meta = dir.join(format!("{}.meta.tmp", entry.token));
     std::fs::write(&tmp_meta, entry.encode_meta())?;
-    let _ = std::fs::remove_file(&meta);
-    std::fs::rename(&tmp_meta, &meta)?;
+    replace_file_atomic(&tmp_meta, &meta)?;
     Ok(())
 }
 
@@ -133,6 +189,7 @@ pub fn write_recovery_snapshot(entry: &RecoveryEntry, wb: &Workbook) -> anyhow::
 pub fn remove_recovery(token: &str) {
     let dir = recovery_dir();
     let _ = std::fs::remove_file(dir.join(format!("{token}.xlsx")));
+    let _ = std::fs::remove_file(dir.join(format!("{token}.xlsm")));
     let _ = std::fs::remove_file(dir.join(format!("{token}.meta")));
     let _ = std::fs::remove_file(dir.join(format!("{token}.meta.json")));
     let _ = std::fs::remove_file(dir.join(format!("{token}.meta.tmp")));
@@ -180,8 +237,17 @@ pub fn scan_orphaned_entries() -> Vec<RecoveryEntry> {
     out
 }
 
-pub fn build_entry(doc_uid: u64, title: &str, original_path: Option<&Path>) -> RecoveryEntry {
+pub fn build_entry(
+    doc_uid: u64,
+    title: &str,
+    original_path: Option<&Path>,
+    has_vba: bool,
+) -> RecoveryEntry {
     let pid = std::process::id();
+    let is_xlsm = has_vba
+        || original_path
+            .and_then(|p| p.extension().and_then(|e| e.to_str()))
+            .is_some_and(|e| e.eq_ignore_ascii_case("xlsm"));
     RecoveryEntry {
         token: make_token(pid, doc_uid),
         title: title.to_string(),
@@ -189,31 +255,51 @@ pub fn build_entry(doc_uid: u64, title: &str, original_path: Option<&Path>) -> R
         saved_unix_secs: now_unix_secs(),
         pid,
         doc_uid,
+        ext: if is_xlsm { "xlsm".into() } else { "xlsx".into() },
     }
 }
 
 enum WorkerCmd {
-    Save(RecoveryEntry, Workbook),
+    Save(RecoveryEntry, Workbook, u64),
     Remove(String),
+}
+
+pub struct RecoveryResult {
+    pub doc_uid: u64,
+    pub doc_gen: u64,
+    pub err: Option<String>,
 }
 
 /// 常驻轻量后台写盘线程：把恢复草稿序列化与压缩移出界面线程。
 pub struct RecoveryWorker {
     tx: mpsc::Sender<WorkerCmd>,
+    rx: mpsc::Receiver<RecoveryResult>,
 }
 
 impl RecoveryWorker {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<WorkerCmd>();
+        let (tx, rx_cmd) = mpsc::channel::<WorkerCmd>();
+        let (tx_res, rx) = mpsc::channel::<RecoveryResult>();
         let _ = std::thread::Builder::new()
             .name("cellan-recovery".into())
             .spawn(move || {
-                while let Ok(cmd) = rx.recv() {
+                while let Ok(cmd) = rx_cmd.recv() {
                     match cmd {
-                        WorkerCmd::Save(entry, wb) => {
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                let _ = write_recovery_snapshot(&entry, &wb);
+                        WorkerCmd::Save(entry, wb, doc_gen) => {
+                            let doc_uid = entry.doc_uid;
+                            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                write_recovery_snapshot(&entry, &wb)
                             }));
+                            let err = match res {
+                                Ok(Ok(())) => None,
+                                Ok(Err(e)) => Some(format!("{e:#}")),
+                                Err(_) => Some("自动恢复写入线程异常".into()),
+                            };
+                            let _ = tx_res.send(RecoveryResult {
+                                doc_uid,
+                                doc_gen,
+                                err,
+                            });
                         }
                         WorkerCmd::Remove(token) => {
                             remove_recovery(&token);
@@ -221,11 +307,19 @@ impl RecoveryWorker {
                     }
                 }
             });
-        Self { tx }
+        Self { tx, rx }
     }
 
-    pub fn enqueue_save(&self, entry: RecoveryEntry, wb: Workbook) {
-        let _ = self.tx.send(WorkerCmd::Save(entry, wb));
+    pub fn enqueue_save(&self, entry: RecoveryEntry, wb: Workbook, doc_gen: u64) {
+        let _ = self.tx.send(WorkerCmd::Save(entry, wb, doc_gen));
+    }
+
+    pub fn poll_results(&self) -> Vec<RecoveryResult> {
+        let mut out = Vec::new();
+        while let Ok(r) = self.rx.try_recv() {
+            out.push(r);
+        }
+        out
     }
 
     pub fn enqueue_remove(&self, token: String) {
@@ -265,6 +359,7 @@ mod tests {
             saved_unix_secs: 1_700_000_000,
             pid: 0,
             doc_uid: 42,
+            ext: "xlsx".into(),
         };
         write_recovery_snapshot(&entry, &wb).unwrap();
         let found = scan_orphaned_entries();

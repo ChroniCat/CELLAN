@@ -199,20 +199,73 @@ fn find_invalid(wb: &Workbook, si: usize, cancel: &AtomicBool) -> Option<Circles
     Some(result)
 }
 
+pub(crate) fn subtract_rect(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> Vec<(u32, u32, u32, u32)> {
+    let (ar1, ac1, ar2, ac2) = a;
+    let (br1, bc1, br2, bc2) = b;
+    if ar1 > br2 || br1 > ar2 || ac1 > bc2 || bc1 > ac2 {
+        return vec![a];
+    }
+    let mut out = Vec::new();
+    if ar1 < br1 {
+        out.push((ar1, ac1, br1 - 1, ac2));
+    }
+    if ar2 > br2 {
+        out.push((br2 + 1, ac1, ar2, ac2));
+    }
+    let mr1 = ar1.max(br1);
+    let mr2 = ar2.min(br2);
+    if ac1 < bc1 {
+        out.push((mr1, ac1, mr2, bc1 - 1));
+    }
+    if ac2 > bc2 {
+        out.push((mr1, bc2 + 1, mr2, ac2));
+    }
+    out
+}
+
 impl SheetApp {
     pub(super) fn replace_validation_rule(&mut self, rect: (u32, u32, u32, u32),
                                           rule: Option<dv::DataValidation>) -> bool {
-        let (r1, c1, r2, c2) = rect;
-        let sheet = self.wb.sheet_mut(self.sheet_idx);
-        let before = sheet.dv.len();
-        sheet.dv.retain(|d| !d.ranges.iter().any(|&(a, b, x, y)| a <= r2 && x >= r1 && b <= c2 && y >= c1));
-        if let Some(mut rule) = rule {
-            rule.ranges = vec![rect];
-            sheet.dv.push(rule);
-        } else if sheet.dv.len() == before {
+        if self.block_unsynced_guest_edit("数据验证") {
             return false;
         }
+        let si = self.sheet_idx;
+        let before_dv = self.wb.sheet(si).dv.clone();
+        let sheet = self.wb.sheet_mut(si);
+        let mut changed = false;
+        for d in &mut sheet.dv {
+            let mut next = Vec::with_capacity(d.ranges.len());
+            for &r in &d.ranges {
+                let carved = subtract_rect(r, rect);
+                if carved.len() != 1 || carved[0] != r {
+                    changed = true;
+                }
+                next.extend(carved);
+            }
+            d.ranges = next;
+        }
+        sheet.dv.retain(|d| !d.ranges.is_empty());
+        let label = if let Some(mut rule) = rule {
+            rule.ranges = vec![rect];
+            sheet.dv.push(rule);
+            changed = true;
+            "设置数据验证"
+        } else if !changed {
+            return false;
+        } else {
+            "清除数据验证"
+        };
         sheet.dv_dirty = true;
+        let after_dv = sheet.dv.clone();
+        self.undo.push_meta(
+            label,
+            (si, rect.0, rect.1),
+            sheetcore::undo::MetaEdit {
+                sheet: si,
+                dv: Some((before_dv, after_dv)),
+                ..Default::default()
+            },
+        );
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.tasks.last_edit = Some(std::time::Instant::now());

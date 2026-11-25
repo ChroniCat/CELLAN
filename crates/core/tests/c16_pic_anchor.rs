@@ -15,6 +15,7 @@ fn wb_with(off: [i64; 4]) -> Workbook {
         data: Some(std::sync::Arc::new(b"not-a-real-png".to_vec())),
         ext: "png".into(),
         name: "图片 1".into(),
+        ..Default::default()
     });
     sh.pictures_dirty = true;
     // 空表没有单元格，分页范围会是 A1；显式给打印区域，图片才在页内

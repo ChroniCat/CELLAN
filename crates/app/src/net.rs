@@ -103,6 +103,13 @@ pub enum NetEvent {
     },
     /// 远端合并变更
     Merge { site: u32, sheet: usize, rect: (u32, u32, u32, u32), on: bool },
+    /// 远端工作表高频元数据变更（列宽/行高/隐藏/冻结/批注/超链接/筛选/标签结构）
+    SheetMeta {
+        site: u32,
+        sheet: usize,
+        kind: sheetcore::sync::SheetMetaKind,
+        snapshot: bool,
+    },
     /// 自己申请编辑被拒绝
     LockDeny { holder: u32, holder_name: String, sheet: usize, row: u32, col: u32 },
     /// 自己发起的写入/格式/合并因他人持有活跃租约被宿主驳回
@@ -1594,6 +1601,7 @@ pub struct Net {
     delta_styles:
         Option<SharedStyles>,
     delta_merges: Option<Arc<Mutex<Vec<(usize, u32, u32, u32, u32, bool)>>>>,
+    host_meta_log: Option<Arc<Mutex<Vec<(usize, sheetcore::sync::SheetMetaKind)>>>>,
     host_structs: Option<Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>>>,
     host_file_path: Option<Arc<Mutex<Option<std::path::PathBuf>>>>,
     staged_save_cursor: Mutex<Option<(u64, u64, usize)>>,
@@ -3826,6 +3834,31 @@ impl Net {
         }
     }
 
+    /// 广播工作表高频非单元格元数据变更（列宽/行高/隐藏/冻结/批注/超链接/筛选/工作表标签）
+    pub fn broadcast_sheet_meta(&self, sheet: usize, kind: sheetcore::sync::SheetMetaKind) {
+        if !kind.valid(sheet) {
+            return;
+        }
+        if let Some(log) = &self.host_meta_log {
+            let mut g = log.lock().unwrap();
+            if g.len() >= 10_000 {
+                g.remove(0);
+            }
+            g.push((sheet, kind.clone()));
+        }
+        let msg = Msg::SheetMetaOp {
+            site: self.site,
+            sheet,
+            ts: 0,
+            kind,
+        };
+        if let Some(roster) = &self.host_roster {
+            queue_room_change(&self.cmd, roster, None, RoomChange::Message(msg));
+        } else if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(s));
+        }
+    }
+
     /// 广播结构性改动（宿主顺手把本地快照日志、租约与光标也搬家）
     pub fn broadcast_structural(&self, sheet: usize, op: &sheetcore::structural::Structural) -> Result<(), String> {
         let message = Msg::Structural { site: self.site, sheet, op: op.clone() };
@@ -4413,6 +4446,8 @@ fn host_initialized(
     let delta_styles: SharedStyles = Default::default();
     let delta_merges: Arc<Mutex<Vec<(usize, u32, u32, u32, u32, bool)>>> =
         Arc::new(Mutex::new(Vec::new()));
+    let meta_log: Arc<Mutex<Vec<(usize, sheetcore::sync::SheetMetaKind)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let structs: Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let structs_for_self = structs.clone();
@@ -4427,6 +4462,7 @@ fn host_initialized(
     let host_base_hash_for_self = host_base_hash.clone();
     let delta_styles_for_self = delta_styles.clone();
     let delta_merges_for_self = delta_merges.clone();
+    let meta_log_for_self = meta_log.clone();
     let evt_tx_self = evt_tx.clone();
     let t0 = std::time::Instant::now();
     let now_ms = {
@@ -4502,6 +4538,7 @@ fn host_initialized(
         let styles_outer = styles.clone();
         let delta_styles_outer = delta_styles.clone();
         let delta_merges_outer = delta_merges.clone();
+        let meta_log_outer = meta_log.clone();
         let structs_outer = structs.clone();
         let update_dl_outer = host_update_dl.clone();
         let seed_override_outer = host_seed_override.clone();
@@ -4558,6 +4595,7 @@ fn host_initialized(
                 let styles = styles_outer.clone();
                 let delta_styles = delta_styles_outer.clone();
                 let delta_merges = delta_merges_outer.clone();
+                let meta_log = meta_log_outer.clone();
                 let structs = structs_outer.clone();
                 let update_dl = update_dl_outer.clone();
                 let seed_override = seed_override_outer.clone();
@@ -5238,6 +5276,15 @@ fn host_initialized(
                                             .unwrap(),
                                         ));
                                     }
+                                    let meta_items = meta_log.lock().unwrap().clone();
+                                    if !meta_items.is_empty() {
+                                        let _ = tx.send(IntroFrame::Line(
+                                            serde_json::to_string(&Msg::SheetMetaSnapshot {
+                                                items: meta_items,
+                                            })
+                                            .unwrap(),
+                                        ));
+                                    }
                                     if !stream_snapshot_ops(
                                         base_arc.as_deref(),
                                         &ops_grid,
@@ -5841,6 +5888,37 @@ fn host_initialized(
                                     on,
                                 });
                             }
+                            Msg::SheetMetaOp { site, sheet, ts, kind } => {
+                                let Some(conn_site) = hello_site else { break };
+                                if site != conn_site || !kind.valid(sheet) {
+                                    continue;
+                                }
+                                let _order = room_order.lock().unwrap();
+                                {
+                                    let mut g = meta_log.lock().unwrap();
+                                    if g.len() >= 10_000 {
+                                        g.remove(0);
+                                    }
+                                    g.push((sheet, kind.clone()));
+                                }
+                                queue_room_change(
+                                    &cmd,
+                                    &roster,
+                                    Some(conn_site),
+                                    RoomChange::Message(Msg::SheetMetaOp {
+                                        site: conn_site,
+                                        sheet,
+                                        ts,
+                                        kind: kind.clone(),
+                                    }),
+                                );
+                                let _ = evt_tx.send(NetEvent::SheetMeta {
+                                    site: conn_site,
+                                    sheet,
+                                    kind,
+                                    snapshot: false,
+                                });
+                            }
                             Msg::LockReq { site, name: _, sheet, row, col } => {
                                 let Some(conn_site) = hello_site else { break };
                                 if site != conn_site {
@@ -6190,6 +6268,7 @@ fn host_initialized(
         host_styles: Some(styles_for_self),
         delta_styles: Some(delta_styles_for_self),
         delta_merges: Some(delta_merges_for_self),
+        host_meta_log: Some(meta_log_for_self),
         pending_structure: Default::default(),
         #[cfg(test)]
         unconfirmed_styles: Default::default(),
@@ -7285,6 +7364,24 @@ fn join_session(
                                 });
                             }
                         }
+                        Msg::SheetMetaOp { site: msite, sheet, ts: _, kind } => {
+                            let _ = evt_tx.send(NetEvent::SheetMeta {
+                                site: msite,
+                                sheet,
+                                kind,
+                                snapshot: false,
+                            });
+                        }
+                        Msg::SheetMetaSnapshot { items } => {
+                            for (sheet, kind) in items {
+                                let _ = evt_tx.send(NetEvent::SheetMeta {
+                                    site: 0,
+                                    sheet,
+                                    kind,
+                                    snapshot: true,
+                                });
+                            }
+                        }
                         Msg::LockOk { site, name, sheet, row, col } => {
                             let _ = evt_tx.send(NetEvent::LockOk { site, name, sheet, row, col });
                         }
@@ -7499,6 +7596,7 @@ fn join_session(
         host_styles: None,
         delta_styles: None,
         delta_merges: None,
+        host_meta_log: None,
         sheet_names: Default::default(),
         structure_seen: Default::default(),
         pending_structure,
@@ -7688,7 +7786,7 @@ mod tests {
         let id = wb.styles.intern(style.clone());
         for row in 0..2501 { wb.sheet_mut(0).set_style(row, 0, id); }
         host.seed_snapshot(&sheetcore::sync::Peer::new(1), &wb, Cursor {
-            sheet: 0, row: 0, col: 0, site: 1, name: "Host".into(), color: 1,
+            sheet: 0, row: 0, col: 0, site: 1, name: "Host".into(), color: 1, end_row: None, end_col: None,
         });
         let client = join(2, "Guest".into(), "Styles".into(), &format!("127.0.0.1:{port}"),
                           "style-room".into()).unwrap();
@@ -7889,6 +7987,8 @@ mod presence_tests {
             row: 6,
             col: 3,
             color: 4,
+            end_row: None,
+            end_col: None,
         });
         host_net.request_lock(0, 6, 3, "王芳@财务部");
         std::thread::sleep(Duration::from_millis(120));
@@ -8264,7 +8364,7 @@ mod integrity_tests {
             peer.seed_cell(s,r,c,&cell);
             book.sheets[s].set(r,c,cell);
         }
-        host.seed_snapshot(&peer,&book,Cursor { site:1,name:"H".into(),color:1,sheet:0,row:0,col:0 });
+        host.seed_snapshot(&peer,&book,Cursor { site:1,name:"H".into(),color:1,sheet:0,row:0,col:0,end_row:None,end_col:None });
         let addr = format!("127.0.0.1:{port}");
         let guest = join(2,"G".into(),"doc".into(),&addr,"pw".into()).unwrap();
         assert!(wait_event(&guest,3000,|e| matches!(e,NetEvent::SnapshotDone)).is_some());
@@ -8684,6 +8784,8 @@ mod integrity_tests {
                 sheet: 0,
                 row: 0,
                 col: 0,
+                end_row: None,
+                end_col: None,
             },
         );
         host.peer = Some(peer_host);
@@ -8788,6 +8890,8 @@ mod integrity_tests {
                 sheet: 0,
                 row: 0,
                 col: 0,
+                end_row: None,
+                end_col: None,
             },
         );
 
@@ -8915,6 +9019,8 @@ mod integrity_tests {
                 sheet: 0,
                 row: 0,
                 col: 0,
+                end_row: None,
+                end_col: None,
             },
         );
         host.peer = Some(peer_host);
@@ -9572,6 +9678,8 @@ mod integrity_tests {
                 sheet: 0,
                 row: 0,
                 col: 0,
+                end_row: None,
+                end_col: None,
             },
         );
 
@@ -9724,6 +9832,8 @@ mod integrity_tests {
                 sheet: 0,
                 row: 0,
                 col: 0,
+                end_row: None,
+                end_col: None,
             },
         );
         host.broadcast_merge(0, (2, 0, 3, 1), true);
@@ -9798,6 +9908,8 @@ mod integrity_tests {
                 sheet: 0,
                 row: 0,
                 col: 0,
+                end_row: None,
+                end_col: None,
             },
         );
         // 宿主开房后编辑一格 (ts=5) + 拆并原文件合并格 (8,0,9,1) + 新增房间合并格 (2,0,3,1)
@@ -9858,25 +9970,17 @@ mod integrity_tests {
                 column_ids: vec![1, 2, 3],
                 header_row: true,
                 totals_row: false,
+                ..Default::default()
             });
             guest_wb.sheets[0].charts.push(sheetcore::charts::Chart {
                 kind: sheetcore::charts::ChartKind::Line,
                 title: "趋势图".into(),
-                series: Vec::new(),
                 legend: true,
                 anchor: (0, 4, 12, 10),
                 legend_pos: "r".into(),
                 part: "xl/charts/chart1.xml".into(),
                 drawing: "xl/drawings/drawing1.xml".into(),
-                show_labels: false,
-                label_opts: Default::default(),
-                radar_style: String::new(),
-                ref_fixes: Vec::new(),
-                axis_x: String::new(),
-                axis_y: String::new(),
-                y_fmt: String::new(),
-                y_min: None,
-                y_max: None,
+                ..Default::default()
             });
             guest_wb.sheets[0].merge_range(5, 0, 6, 1); // 原文件基础合并格（宿主未动，必须保留）
             guest_wb.sheets[0].merge_range(8, 0, 9, 1); // 原文件基础合并格（宿主已拆并，必须移除）
@@ -9985,6 +10089,8 @@ mod integrity_tests {
                 sheet: 0,
                 row: 0,
                 col: 0,
+                end_row: None,
+                end_col: None,
             },
         );
 
@@ -10105,6 +10211,8 @@ mod integrity_tests {
                 sheet: 0,
                 row: r,
                 col: 1,
+                end_row: None,
+                end_col: None,
             });
         }
         let mut seen_rows = Vec::new();

@@ -18,6 +18,7 @@ fn table_book() -> Workbook {
         column_ids: vec![11, 12, 13],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     let headers = ["Amount", "Tax", "Total"];
     for (c, h) in headers.iter().enumerate() {
@@ -238,6 +239,7 @@ fn converting_one_table_leaves_other_tables_structured_refs_untouched() {
             column_ids: vec![21, 22],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         sh.set(0, 4, Cell { value: Value::Text("Amount".into()), formula: None });
         sh.set(0, 5, Cell { value: Value::Text("Out".into()), formula: None });
@@ -317,6 +319,7 @@ fn rename_table_column_does_not_panic_on_chinese_formula_slices() {
             column_ids: vec![1, 2, 3],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         for (c, h) in ["金额", "税率", "小计"].iter().enumerate() {
             sh.set(0, c as u32, Cell { value: Value::Text((*h).into()), formula: None });

@@ -558,7 +558,7 @@ impl Owner {
                     .iter_rect(range.rect)
                     .any(|(_, cell)| cell.formula.is_some()),
             };
-            let xml_only = (!range.is_filtered() && is_full_columns(range.rect)) || has_formula;
+            let full_cols = !range.is_filtered() && is_full_columns(range.rect);
             let class = wide("CellanDelayedClipboard");
             let instance = GetModuleHandleW(std::ptr::null());
             let wc = WNDCLASSW {
@@ -591,8 +591,11 @@ impl Owner {
                 DestroyWindow(hwnd);
                 return;
             }
-            let pending = if xml_only {
+            let pending = if full_cols {
                 vec![xml]
+            } else if has_formula {
+                // 含公式选区：省略 HTML 以防 WPS 优先用 HTML 丢公式，但保留 CF_UNICODETEXT 供纯文本应用粘贴显示值
+                vec![xml, 13]
             } else {
                 vec![xml, html, 13]
             };

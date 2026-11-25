@@ -79,8 +79,9 @@ impl Sorted {
         for (i, key) in keys[..n].iter().enumerate() {
             let (amount, has_num) = match amounts {
                 None => (1i64, 1u32),
-                Some(v) => match v[i].to_number() {
-                    Ok(x) => {
+                Some(v) => match v[i] {
+                    FValue::Error(_) => return None,
+                    FValue::Number(x) => {
                         if !x.is_finite() || x.fract() != 0.0 || x.abs() > EXACT_INT_LIMIT as f64 {
                             return None;
                         }
@@ -91,16 +92,23 @@ impl Sorted {
                         }
                         (weight, 1u32)
                     }
-                    Err(_) => (0i64, 0u32),
+                    _ => (0i64, 0u32),
                 },
             };
             total += amount;
             total_cnt += has_num;
-            if let Ok(value) = key.to_number() {
-                if !value.is_finite() {
+            match key {
+                FValue::Number(value) => {
+                    if !value.is_finite() {
+                        return None;
+                    }
+                    rows.push((*value, amount, has_num));
+                }
+                FValue::Text(s) if s.trim().parse::<f64>().is_ok() => {
+                    // Numeric strings match `<>` differently from `<`/`<=`/`>`/`>=` in Excel.
                     return None;
                 }
-                rows.push((value, amount, has_num));
+                _ => {}
             }
         }
         rows.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
@@ -152,6 +160,9 @@ impl Sorted {
         cond: &SharedCondColumn,
         vals: Option<&SharedCondColumn>,
     ) -> Option<Self> {
+        if cond.has_coerced_non_strict || vals.is_some_and(|v| v.has_error) {
+            return None;
+        }
         let sorted = cond.sorted_nums()?;
         let n = cond.len.min(vals.map_or(usize::MAX, |v| v.len));
         let full_span = vals.is_none_or(|v| v.len == n) && cond.len == n;
@@ -193,7 +204,7 @@ impl Sorted {
                 let mut abs_sum = 0u64;
                 let mut cnt = 0u32;
                 for row in 0..n {
-                    if let Some(x) = vc.coerced_number_at(row) {
+                    if let Some(x) = vc.strict_number_opt_at(row) {
                         if !x.is_finite() || x.fract() != 0.0 || x.abs() > EXACT_INT_LIMIT as f64 {
                             return None;
                         }
@@ -253,7 +264,7 @@ impl Sorted {
             let p_idx = ((abs_row >> 8) - v_first_page) as usize;
             let page = &v_pages[p_idx];
             let local = (abs_row & 255) as usize - page.start_in_slab as usize;
-            if (page.coerced_ok[local >> 6] & (1u64 << (local & 63))) != 0 {
+            if (page.strict_num_ok[local >> 6] & (1u64 << (local & 63))) != 0 {
                 weights.push(page.coerced_nums[local] as i64);
                 present_bits[pos >> 6] |= 1u64 << (pos & 63);
             } else {
@@ -287,7 +298,12 @@ impl Sorted {
         changed_val_pages: &[usize],
     ) -> Option<Self> {
         let n = cond.len;
-        if old_vals.len != n || new_vals.len != n || old_vals.r1 != new_vals.r1 {
+        if old_vals.len != n
+            || new_vals.len != n
+            || old_vals.r1 != new_vals.r1
+            || new_vals.has_error
+            || cond.has_coerced_non_strict
+        {
             return None;
         }
         if self.uniform_weight.is_some() {
@@ -316,8 +332,8 @@ impl Sorted {
             }
             let base_row = new_vals.page_offsets[p_idx] as usize;
             for local in 0..new_p.rows_in_page as usize {
-                let old_has = (old_p.coerced_ok[local >> 6] & (1u64 << (local & 63))) != 0;
-                let new_has = (new_p.coerced_ok[local >> 6] & (1u64 << (local & 63))) != 0;
+                let old_has = (old_p.strict_num_ok[local >> 6] & (1u64 << (local & 63))) != 0;
+                let new_has = (new_p.strict_num_ok[local >> 6] & (1u64 << (local & 63))) != 0;
                 let old_w = if old_has { old_p.coerced_nums[local] as i64 } else { 0 };
                 let new_w = if new_has { new_p.coerced_nums[local] as i64 } else { 0 };
                 if old_has == new_has && old_w == new_w {
@@ -334,7 +350,7 @@ impl Sorted {
                     return None;
                 }
                 let row = base_row + local;
-                if let Some(k) = cond.coerced_number_at(row) {
+                if let Some(k) = cond.strict_number_opt_at(row) {
                     let row_u32 = row as u32;
                     let pos = sorted
                         .binary_search_by(|&(sk, sr)| sk.total_cmp(&k).then_with(|| sr.cmp(&row_u32)))
@@ -480,23 +496,25 @@ impl MinMaxOrdered {
         let mut non_key_min = f64::INFINITY;
         let mut non_key_max = f64::NEG_INFINITY;
         for i in 0..n {
-            let val = match amounts[i].to_number() {
-                Ok(v) => {
+            let val = match amounts[i] {
+                FValue::Error(_) => return None,
+                FValue::Number(v) => {
                     if !v.is_finite() {
                         return None;
                     }
                     Some(v)
                 }
-                Err(_) => None,
+                _ => None,
             };
-            match keys[i].to_number() {
-                Ok(k) => {
+            match &keys[i] {
+                FValue::Number(k) => {
                     if !k.is_finite() {
                         return None;
                     }
-                    rows.push((k, val));
+                    rows.push((*k, val));
                 }
-                Err(_) => {
+                FValue::Text(s) if s.trim().parse::<f64>().is_ok() => return None,
+                _ => {
                     if let Some(v) = val {
                         non_key_min = non_key_min.min(v);
                         non_key_max = non_key_max.max(v);
@@ -509,7 +527,7 @@ impl MinMaxOrdered {
     }
 
     fn build_from_cond(cond: &SharedCondColumn, vals: &SharedCondColumn) -> Option<Self> {
-        if vals.has_non_finite {
+        if vals.has_non_finite || vals.has_error || cond.has_coerced_non_strict {
             return None;
         }
         let sorted = cond.sorted_nums()?;
@@ -527,7 +545,7 @@ impl MinMaxOrdered {
                         break;
                     }
                     if !page.has_coerced_num(local)
-                        && let Some(v) = vals.coerced_number_at(row)
+                        && let Some(v) = vals.strict_number_opt_at(row)
                     {
                         non_key_min = non_key_min.min(v);
                         non_key_max = non_key_max.max(v);
@@ -540,7 +558,7 @@ impl MinMaxOrdered {
             if (r as usize) >= n {
                 continue;
             }
-            rows.push((k, vals.coerced_number_at(r as usize)));
+            rows.push((k, vals.strict_number_opt_at(r as usize)));
         }
         Some(Self::finish_from_sorted(rows, non_key_min, non_key_max))
     }
@@ -652,29 +670,31 @@ impl PagedOrdered {
             let mut any_num_key = false;
             let mut has_non_num_key = false;
             for i in chunk_start..chunk_end {
-                match keys[i].to_number() {
-                    Ok(k) => {
+                match &keys[i] {
+                    FValue::Number(k) => {
                         if !k.is_finite() {
                             return None;
                         }
-                        min_key = min_key.min(k);
-                        max_key = max_key.max(k);
+                        min_key = min_key.min(*k);
+                        max_key = max_key.max(*k);
                         any_num_key = true;
-                        key_nums.push(k);
+                        key_nums.push(*k);
                     }
-                    Err(_) => {
+                    FValue::Text(s) if s.trim().parse::<f64>().is_ok() => return None,
+                    _ => {
                         has_non_num_key = true;
                         key_nums.push(f64::NAN);
                     }
                 }
-                match amounts[i].to_number() {
-                    Ok(v) => {
+                match amounts[i] {
+                    FValue::Error(_) => return None,
+                    FValue::Number(v) => {
                         if !v.is_finite() {
                             return None;
                         }
                         val_nums.push(v);
                     }
-                    Err(_) => val_nums.push(f64::NAN),
+                    _ => val_nums.push(f64::NAN),
                 }
             }
             blocks.push(BlockBounds {
@@ -692,7 +712,7 @@ impl PagedOrdered {
     }
 
     fn build_from_cond(cond: &SharedCondColumn, vals: &SharedCondColumn) -> Option<Self> {
-        if cond.has_non_finite || vals.has_non_finite {
+        if cond.has_non_finite || vals.has_non_finite || vals.has_error || cond.has_coerced_non_strict {
             return None;
         }
         let n = cond.len.min(vals.len);
@@ -706,7 +726,7 @@ impl PagedOrdered {
             let mut any_num_key = false;
             let mut has_non_num_key = false;
             for row in chunk_start..chunk_end {
-                match cond.coerced_number_at(row) {
+                match cond.strict_number_opt_at(row) {
                     Some(k) => {
                         min_key = min_key.min(k);
                         max_key = max_key.max(k);
@@ -718,7 +738,7 @@ impl PagedOrdered {
                         key_nums.push(f64::NAN);
                     }
                 }
-                match vals.coerced_number_at(row) {
+                match vals.strict_number_opt_at(row) {
                     Some(v) => val_nums.push(v),
                     None => val_nums.push(f64::NAN),
                 }
@@ -744,7 +764,11 @@ impl PagedOrdered {
         new_vals: &SharedCondColumn,
         changed_val_pages: &[usize],
     ) -> Option<Self> {
-        if cond.has_non_finite || new_vals.has_non_finite {
+        if cond.has_non_finite
+            || new_vals.has_non_finite
+            || new_vals.has_error
+            || cond.has_coerced_non_strict
+        {
             return None;
         }
         let n = cond.len.min(new_vals.len);
@@ -759,7 +783,7 @@ impl PagedOrdered {
             let end_row = (base_row + new_p.rows_in_page as usize).min(n);
             for row in base_row..end_row {
                 let local = row - base_row;
-                vals_mut[row] = if (new_p.coerced_ok[local >> 6] & (1u64 << (local & 63))) != 0 {
+                vals_mut[row] = if (new_p.strict_num_ok[local >> 6] & (1u64 << (local & 63))) != 0 {
                     new_p.coerced_nums[local]
                 } else {
                     f64::NAN
@@ -1175,6 +1199,7 @@ pub(crate) struct ColumnIndex {
     pub(crate) text: Option<Arc<TextDict>>,
     pub(crate) tried_numbers: bool,
     pub(crate) tried_text: bool,
+    pub(crate) has_numeric_text: bool,
     pub(crate) shared_col: Option<Arc<SharedCondColumn>>,
 }
 
@@ -1187,11 +1212,13 @@ impl ColumnIndex {
             text: None,
             tried_numbers: false,
             tried_text: false,
+            has_numeric_text: false,
             shared_col: None,
         }
     }
 
     pub(crate) fn from_shared(range: RangeKey, sc: Arc<SharedCondColumn>) -> Self {
+        let has_numeric_text = sc.has_coerced_non_strict;
         Self {
             range,
             len: sc.len,
@@ -1199,6 +1226,7 @@ impl ColumnIndex {
             text: None,
             tried_numbers: false,
             tried_text: false,
+            has_numeric_text,
             shared_col: Some(sc),
         }
     }
@@ -1238,12 +1266,25 @@ impl ColumnIndex {
         let mut sorted = Vec::with_capacity(input.len());
         let mut finite = true;
         for (i, value) in input.iter().enumerate() {
-            if let Ok(v) = value.to_number() {
-                if !v.is_finite() {
-                    finite = false;
-                    break;
+            match value {
+                FValue::Number(v) => {
+                    if !v.is_finite() {
+                        finite = false;
+                        break;
+                    }
+                    sorted.push((*v, i as u32));
                 }
-                sorted.push((v, i as u32));
+                FValue::Text(s) => {
+                    if let Ok(v) = s.trim().parse::<f64>() {
+                        if !v.is_finite() {
+                            finite = false;
+                            break;
+                        }
+                        self.has_numeric_text = true;
+                        sorted.push((v, i as u32));
+                    }
+                }
+                _ => {}
             }
         }
         if finite {
@@ -1264,11 +1305,13 @@ impl ColumnIndex {
         let mut bytes = 0usize;
         for (i, v) in input.iter().enumerate() {
             let text: Arc<str> = match v {
+                FValue::Number(_) => continue,
                 FValue::Text(t) => super::lookup_cache::lowercase_arc(t),
                 FValue::Bool(true) => "true".into(),
                 FValue::Bool(false) => "false".into(),
+                FValue::Error(e) => e.text().to_ascii_lowercase().into(),
                 FValue::Empty => "".into(),
-                _ => super::lookup_cache::lowercase_str(&v.display()),
+                _ => continue,
             };
             if !raw.contains_key(&text) {
                 bytes += text.len();
@@ -1342,6 +1385,10 @@ impl ColumnIndex {
         let mut set = |row: u32| bits[row as usize / 64] |= 1 << (row % 64);
         if let Some((op, n)) = criterion.numeric_query() {
             self.ensure_numbers_from_shared();
+            let is_relational = matches!(op, ">" | ">=" | "<" | "<=");
+            if is_relational && self.has_numeric_text && self.shared_col.is_none() {
+                return false;
+            }
             if n.is_finite()
                 && let Some(sorted) = &self.numbers
             {
@@ -1356,6 +1403,17 @@ impl ColumnIndex {
                     "<=" => 0..sorted.partition_point(|x| x.0 <= n),
                     _ => eq(),
                 };
+                if is_relational && self.has_numeric_text {
+                    if let Some(sc) = &self.shared_col {
+                        for &(_, row) in &sorted[hits] {
+                            if sc.is_strict_num_at(row as usize) {
+                                set(row);
+                            }
+                        }
+                        return true;
+                    }
+                    return false;
+                }
                 for &(_, row) in &sorted[hits] {
                     set(row);
                 }
@@ -1368,9 +1426,12 @@ impl ColumnIndex {
             }
             false
         } else {
+            if criterion.wild || !matches!(criterion.op, "=" | "<>") {
+                return false;
+            }
             self.ensure_text_from_shared();
             if let Some(words) = &self.text {
-                if !criterion.wild && criterion.op == "=" {
+                if criterion.op == "=" {
                     if let Some(rows) = words.get(criterion.text.as_str()) {
                         for &row in rows.iter() {
                             set(row);
@@ -1378,7 +1439,7 @@ impl ColumnIndex {
                     }
                     return true;
                 }
-                if !criterion.wild && criterion.op == "<>" {
+                if criterion.op == "<>" {
                     if let Some(rows) = words.get(criterion.text.as_str()) {
                         for &row in rows.iter() {
                             set(row);
@@ -1389,14 +1450,6 @@ impl ColumnIndex {
                     }
                     return true;
                 }
-                for (word, rows) in words.iter() {
-                    if criterion.matches_coerced_text(word) {
-                        for &row in rows.iter() {
-                            set(row);
-                        }
-                    }
-                }
-                return true;
             }
             false
         }
@@ -1416,7 +1469,7 @@ impl ColumnIndex {
         }
         let mut set = |row: u32| bits[row as usize / 64] |= 1 << (row % 64);
         for (i, v) in input.iter().enumerate() {
-            if criterion.matches_coerced(v) {
+            if criterion.matches(v) {
                 set(i as u32);
             }
         }
@@ -1560,13 +1613,17 @@ impl MatchIndexes {
             while word != 0 {
                 let row = i * 64 + word.trailing_zeros() as usize;
                 word &= word - 1;
-                if let Ok(n) = values[row].to_number() {
-                    hits += 1;
-                    match function {
-                        4 => best = Some(best.map_or(n, |v| v.min(n))),
-                        5 => best = Some(best.map_or(n, |v| v.max(n))),
-                        _ => total += n,
+                match values[row] {
+                    FValue::Error(e) => return FValue::Error(e),
+                    FValue::Number(n) => {
+                        hits += 1;
+                        match function {
+                            4 => best = Some(best.map_or(n, |v| v.min(n))),
+                            5 => best = Some(best.map_or(n, |v| v.max(n))),
+                            _ => total += n,
+                        }
                     }
+                    _ => {}
                 }
             }
         }
@@ -1590,7 +1647,7 @@ impl MatchIndexes {
             while word != 0 {
                 let row = i * 64 + word.trailing_zeros() as usize;
                 word &= word - 1;
-                if let Some(n) = vals.coerced_number_at(row) {
+                if let Some(n) = vals.strict_number_opt_at(row) {
                     hits += 1;
                     match function {
                         4 => best = Some(best.map_or(n, |v| v.min(n))),
@@ -1714,7 +1771,7 @@ impl MatchIndexes {
                             continue;
                         }
                         let v = data_src.probe_cell(other_rk, row)?;
-                        if !other_crit.matches_coerced(&v) {
+                        if !other_crit.matches(&v) {
                             all_ok = false;
                             break;
                         }
@@ -1726,13 +1783,17 @@ impl MatchIndexes {
                         hits += 1;
                     } else if let Some(vr) = val_range {
                         let v = data_src.probe_cell(vr, row)?;
-                        if let Ok(n) = v.to_number() {
-                            hits += 1;
-                            match key.function {
-                                4 => best = Some(best.map_or(n, |b| b.min(n))),
-                                5 => best = Some(best.map_or(n, |b| b.max(n))),
-                                _ => total += n,
+                        match v {
+                            FValue::Error(e) => return Some(FValue::Error(e)),
+                            FValue::Number(n) => {
+                                hits += 1;
+                                match key.function {
+                                    4 => best = Some(best.map_or(n, |b| b.min(n))),
+                                    5 => best = Some(best.map_or(n, |b| b.max(n))),
+                                    _ => total += n,
+                                }
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -1762,7 +1823,9 @@ impl MatchIndexes {
             return Some(Self::eval_masks(1, len, &masks, &[]));
         }
         let vr = val_range?;
-        if let Some(val_sc) = data_src.shared_cond_col(vr) {
+        if let Some(val_sc) = data_src.shared_cond_col(vr)
+            && !val_sc.has_error
+        {
             return Some(Self::eval_masks_from_cond(key.function, len, &masks, &val_sc));
         }
         let values = data_src.load_col(vr)?;
@@ -1932,7 +1995,6 @@ mod tests {
         let data = [
             FValue::Empty,
             FValue::Bool(true),
-            FValue::Text(" 1 ".into()),
             FValue::Error(super::super::ErrKind::Value),
             FValue::Text("abc".into()),
             FValue::Number(-0.0),
@@ -1950,9 +2012,12 @@ mod tests {
                 let expected = data
                     .iter()
                     .enumerate()
-                    .filter(|(_, v)| crit.matches_coerced(v))
+                    .filter(|(_, v)| crit.matches(v))
                     .map(|(i, _)| {
-                        weights.map_or(1.0, |w| w[i].to_number().unwrap_or(0.0))
+                        weights.map_or(1.0, |w| match w[i] {
+                            FValue::Number(x) => x,
+                            _ => 0.0,
+                        })
                     })
                     .sum::<f64>();
                 assert_eq!(sorted.query(op, n), FValue::number(expected), "{pattern}");

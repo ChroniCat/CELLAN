@@ -303,6 +303,14 @@ impl SheetApp {
             {
                 return false;
             }
+            if cmd.action == "Redo"
+                && layer == Layer::Grid
+                && !self.undo.can_redo()
+                && self.last_repeat_action.is_some()
+            {
+                self.repeat_last_action(ctx);
+                return true;
+            }
             self.command_exec(cmd.action, ctx);
             return true;
         }

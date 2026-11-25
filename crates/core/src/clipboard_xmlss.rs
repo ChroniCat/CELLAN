@@ -31,14 +31,45 @@ pub enum Kind {
 pub struct Style {
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
     pub font: String,
     pub size: f32,
     pub color: Option<[u8; 3]>,
     pub fill: Option<[u8; 3]>,
     pub border: Option<[u8; 3]>,
+    /// 四边独立边框颜色：[Top, Bottom, Left, Right]
+    pub borders: [Option<[u8; 3]>; 4],
     pub num_format: String,
     /// 0 常规 1 左 2 中 3 右
     pub halign: u8,
+    /// 0 下 1 中 2 上
+    pub valign: u8,
+    pub wrap: bool,
+}
+
+/// 序列号（含小数时间部分）→ XMLSS ISO DateTime 字符串（保留毫秒精度）
+pub fn serial_to_iso(sys: crate::model::DateSystem, serial: f64) -> Option<String> {
+    if !serial.is_finite() || serial < 0.0 {
+        return None;
+    }
+    let mut day = serial.floor();
+    let mut ms = ((serial - day) * 86_400_000.0).round() as i64;
+    if ms >= 86_400_000 {
+        day += 1.0;
+        ms -= 86_400_000;
+    }
+    if ms < 0 {
+        ms = 0;
+    }
+    let (y, m, d) = crate::formula::serial_to_date_in(sys, day)?;
+    let hh = ms / 3_600_000;
+    let rem = ms % 3_600_000;
+    let mm = rem / 60_000;
+    let rem = rem % 60_000;
+    let ss = rem / 1000;
+    let sub = rem % 1000;
+    Some(format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{sub:03}"))
 }
 
 /// XMLSS 的 `<Data ss:Type="DateTime">1904-01-02T00:00:00</Data>` → 目标簿的序列号。
@@ -854,6 +885,10 @@ fn apply_style_tag(tag_local: &[u8], e: &quick_xml::events::BytesStart<'_>, cur_
         b"Font" => {
             cur_style.bold = matches!(attr_cow(e, b"Bold").as_deref(), Some("1" | "true"));
             cur_style.italic = matches!(attr_cow(e, b"Italic").as_deref(), Some("1" | "true"));
+            cur_style.underline = attr_cow(e, b"Underline").as_deref().is_some_and(|u| {
+                !u.is_empty() && !u.eq_ignore_ascii_case("None") && u != "0" && !u.eq_ignore_ascii_case("false")
+            });
+            cur_style.strike = matches!(attr_cow(e, b"StrikeThrough").as_deref(), Some("1" | "true"));
             cur_style.font = attr_cow(e, b"FontName").map(|c| c.into_owned()).unwrap_or_default();
             if let Some(sz) = attr_cow(e, b"Size").and_then(|s| s.parse::<f32>().ok()) {
                 if sz > 0.0 {
@@ -869,8 +904,23 @@ fn apply_style_tag(tag_local: &[u8], e: &quick_xml::events::BytesStart<'_>, cur_
             }
         }
         b"Border" => {
-            if let Some(c) = attr_cow(e, b"Color").and_then(|c| hex_rgb(&c)) {
-                cur_style.border.get_or_insert(c);
+            let line_style = attr_cow(e, b"LineStyle");
+            let explicit_none = line_style.as_deref().is_some_and(|ls| ls.eq_ignore_ascii_case("None"));
+            if explicit_none {
+                return;
+            }
+            let color = attr_cow(e, b"Color").and_then(|c| hex_rgb(&c));
+            let has_line = line_style.as_deref().is_some_and(|ls| !ls.is_empty())
+                || attr_cow(e, b"Weight").is_some();
+            if let Some(rgb) = color.or_else(|| has_line.then_some([0, 0, 0])) {
+                match attr_cow(e, b"Position").as_deref() {
+                    Some("Top") => cur_style.borders[0] = Some(rgb),
+                    Some("Bottom") => cur_style.borders[1] = Some(rgb),
+                    Some("Left") => cur_style.borders[2] = Some(rgb),
+                    Some("Right") => cur_style.borders[3] = Some(rgb),
+                    _ => {}
+                }
+                cur_style.border.get_or_insert(rgb);
             }
         }
         b"NumberFormat" => {
@@ -885,6 +935,12 @@ fn apply_style_tag(tag_local: &[u8], e: &quick_xml::events::BytesStart<'_>, cur_
                 Some("Right") => 3,
                 _ => 0,
             };
+            cur_style.valign = match attr_cow(e, b"Vertical").as_deref() {
+                Some("Top") => 2,
+                Some("Center") => 1,
+                _ => 0,
+            };
+            cur_style.wrap = matches!(attr_cow(e, b"WrapText").as_deref(), Some("1" | "true"));
         }
         _ => {}
     }

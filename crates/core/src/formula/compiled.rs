@@ -132,7 +132,12 @@ pub(crate) fn summarize_template_refs(node: &Node) -> TemplateRefSummary {
                 };
                 acc.count += 1;
             }
-            Node::Spill(_) | Node::Name(_) | Node::ScopedName { .. } => {
+            Node::Spill(_)
+            | Node::Name(_)
+            | Node::ScopedName { .. }
+            | Node::DynRange(..)
+            | Node::Intersect(..)
+            | Node::Union(_) => {
                 acc.complex = true;
             }
             Node::Func(name, args) => {
@@ -276,9 +281,14 @@ fn collect_rel_bounds(node: &Node, b: &mut RelBounds) {
             }
         }
         Node::Implicit(n) | Node::Percent(n) | Node::Unary(_, n) => collect_rel_bounds(n, b),
-        Node::Binary(_, l, r) => {
+        Node::Binary(_, l, r) | Node::DynRange(l, r) | Node::Intersect(l, r) => {
             collect_rel_bounds(l, b);
             collect_rel_bounds(r, b);
+        }
+        Node::Union(items) => {
+            for a in items {
+                collect_rel_bounds(a, b);
+            }
         }
         _ => {}
     }
@@ -1510,7 +1520,12 @@ pub(super) fn relocate(node: &mut Node, dr: i64, dc: i64) -> bool {
             .iter_mut()
             .fold(true, |valid, a| relocate(a, dr, dc) && valid),
         Node::Implicit(n) | Node::Percent(n) | Node::Unary(_, n) => relocate(n, dr, dc),
-        Node::Binary(_, a, b) => relocate(a, dr, dc) & relocate(b, dr, dc),
+        Node::Binary(_, a, b) | Node::DynRange(a, b) | Node::Intersect(a, b) => {
+            relocate(a, dr, dc) & relocate(b, dr, dc)
+        }
+        Node::Union(items) => items
+            .iter_mut()
+            .fold(true, |valid, a| relocate(a, dr, dc) && valid),
         _ => true,
     }
 }

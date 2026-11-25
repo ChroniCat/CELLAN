@@ -380,39 +380,6 @@ pub(crate) struct PreparedSearchQuery {
     pub can_match_false: bool,
 }
 
-struct StackFmt<const N: usize> {
-    buf: [u8; N],
-    len: usize,
-}
-
-impl<const N: usize> StackFmt<N> {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            buf: [0u8; N],
-            len: 0,
-        }
-    }
-
-    #[inline]
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
-    }
-}
-
-impl<const N: usize> std::fmt::Write for StackFmt<N> {
-    #[inline]
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let bytes = s.as_bytes();
-        if self.len + bytes.len() > N {
-            return Err(std::fmt::Error);
-        }
-        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
-        self.len += bytes.len();
-        Ok(())
-    }
-}
-
 impl PreparedSearchQuery {
     pub(super) fn new(query: &str) -> Self {
         let q_low = query.to_lowercase();
@@ -467,36 +434,7 @@ impl PreparedSearchQuery {
         if !self.can_match_num {
             return false;
         }
-        if n.fract() == 0.0 && n.abs() < 1e15 {
-            let v = n as i64;
-            let mut raw = [0u8; 24];
-            let mut pos = raw.len();
-            let mut u = v.unsigned_abs();
-            if u == 0 {
-                pos -= 1;
-                raw[pos] = b'0';
-            } else {
-                while u > 0 {
-                    pos -= 1;
-                    raw[pos] = b'0' + (u % 10) as u8;
-                    u /= 10;
-                }
-                if v < 0 {
-                    pos -= 1;
-                    raw[pos] = b'-';
-                }
-            }
-            let s = std::str::from_utf8(&raw[pos..]).unwrap_or("");
-            return self.matches_str(s);
-        }
-        use std::fmt::Write as _;
-        let mut fmt = StackFmt::<64>::new();
-        if write!(&mut fmt, "{:.10}", n).is_ok() {
-            let s = fmt.as_str().trim_end_matches('0').trim_end_matches('.');
-            self.matches_str(s)
-        } else {
-            self.matches_str(&sheetcore::model::format_number(n))
-        }
+        sheetcore::model::with_formatted_number(n, |s| self.matches_str(s))
     }
 
     #[inline]

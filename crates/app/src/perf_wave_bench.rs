@@ -124,15 +124,9 @@ fn perf_wave_app_suite() {
         legend_pos: "r".into(),
         part: "xl/charts/chart1.xml".into(),
         drawing: "xl/drawings/drawing1.xml".into(),
-        show_labels: false,
-        label_opts: LabelOpts::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
         axis_x: "X".into(),
         axis_y: "Y".into(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        ..Default::default()
     };
     app.wb.sheet_mut(0).charts = (0..5).map(|_| base_chart.clone()).collect();
     app.chart_sel = Some(0);

@@ -15,6 +15,7 @@ fn opts(whole: bool, formula: bool) -> SearchOpts {
         match_case: false,
         whole_cell: whole,
         in_formula: formula,
+        ..SearchOpts::default()
     }
 }
 

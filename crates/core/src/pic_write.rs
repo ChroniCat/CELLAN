@@ -217,18 +217,136 @@ fn mime_of(ext: &str) -> &'static str {
     }
 }
 
-fn pic_anchor_xml(pic: &crate::pic::Picture, rid: &str) -> String {
+fn xml_esc_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn pic_anchor_xml(pic: &crate::pic::Picture, rid: &str, id: u32) -> String {
     let (r1, c1, r2, c2) = pic.rect;
+    let [dx1, dy1, dx2, dy2] = pic.off;
     let name = if pic.name.is_empty() { "图片" } else { pic.name.as_str() };
+    let name_esc = xml_esc_attr(name);
+    let rot_attr = if pic.rot_deg.abs() > 0.01 {
+        let r60 = ((pic.rot_deg.rem_euclid(360.0)) as f64 * 60_000.0).round() as i64;
+        format!(" rot=\"{r60}\"")
+    } else {
+        String::new()
+    };
+    let src_rect = if pic.crop.iter().any(|&v| v > 1e-4) {
+        let [l, t, r, b] = pic.crop;
+        format!(
+            "<a:srcRect l=\"{}\" t=\"{}\" r=\"{}\" b=\"{}\"/>",
+            (l.clamp(0.0, 0.9) * 100_000.0).round() as i64,
+            (t.clamp(0.0, 0.9) * 100_000.0).round() as i64,
+            (r.clamp(0.0, 0.9) * 100_000.0).round() as i64,
+            (b.clamp(0.0, 0.9) * 100_000.0).round() as i64,
+        )
+    } else {
+        String::new()
+    };
     format!(
         "<xdr:twoCellAnchor editAs=\"oneCell\">\
-<xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\
-<xdr:to><xdr:col>{c2}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r2}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>\
-<xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"2\" name=\"{name}\"/><xdr:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></xdr:cNvPicPr></xdr:nvPicPr>\
-<xdr:blipFill><a:blip r:embed=\"{rid}\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>\
-<xdr:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr>\
+<xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>{dx1}</xdr:colOff><xdr:row>{r1}</xdr:row><xdr:rowOff>{dy1}</xdr:rowOff></xdr:from>\
+<xdr:to><xdr:col>{c2}</xdr:col><xdr:colOff>{dx2}</xdr:colOff><xdr:row>{r2}</xdr:row><xdr:rowOff>{dy2}</xdr:rowOff></xdr:to>\
+<xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"{id}\" name=\"{name_esc}\"/><xdr:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></xdr:cNvPicPr></xdr:nvPicPr>\
+<xdr:blipFill><a:blip r:embed=\"{rid}\"/>{src_rect}<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>\
+<xdr:spPr><a:xfrm{rot_attr}><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr>\
 </xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"
     )
+}
+
+/// 扫描已有 drawing XML 中最大的 `cNvPr id`，用于为新图片分配不冲突的唯一 id。
+fn max_cnvpr_id(xml: &str) -> u32 {
+    let mut max_id = 1u32;
+    let mut rest = xml;
+    while let Some(i) = rest.find("cNvPr") {
+        let seg = &rest[i..];
+        let Some(gt) = seg.find('>') else { break };
+        let tag = &seg[..=gt];
+        if let Some(p) = tag.find("id=\"") {
+            let v = &tag[p + 4..];
+            if let Some(q) = v.find('"') {
+                if let Ok(n) = v[..q].parse::<u32>() {
+                    max_id = max_id.max(n);
+                }
+            }
+        }
+        rest = &seg[gt + 1..];
+    }
+    max_id
+}
+
+/// 提取既有 drawing 中的所有图片锚点块（供未改动图片原样保留，保住裁剪/旋转/oneCellAnchor 等细节）。
+fn extract_existing_pic_anchors(
+    xml: &str,
+    old_rels: &str,
+    draw_part: &str,
+) -> Vec<(String, (u32, u32, u32, u32), [i64; 4], String)> {
+    let mut rid_to_part: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let dir = draw_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("xl/drawings");
+    if let Ok(doc) = roxmltree::Document::parse(old_rels) {
+        for n in doc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "Relationship") {
+            if let (Some(id), Some(target)) = (n.attribute("Id"), n.attribute("Target")) {
+                if n.attribute("Type").is_some_and(|t| t.ends_with("/image")) {
+                    let resolved = if let Some(rest) = target.strip_prefix('/') {
+                        rest.to_string()
+                    } else {
+                        let mut parts: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+                        for seg in target.split('/') {
+                            match seg {
+                                "" | "." => {}
+                                ".." => { parts.pop(); }
+                                s => parts.push(s),
+                            }
+                        }
+                        parts.join("/")
+                    };
+                    rid_to_part.insert(id.to_string(), resolved);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for tag in ["twoCellAnchor", "oneCellAnchor", "absoluteAnchor"] {
+        for prefix in ["xdr:", ""] {
+            let open = format!("<{prefix}{tag}");
+            let close = format!("</{prefix}{tag}>");
+            let mut from = 0usize;
+            while let Some(rel) = xml[from..].find(&open) {
+                let start = from + rel;
+                let Some(endrel) = xml[start..].find(&close) else { break };
+                let end = start + endrel + close.len();
+                let chunk = &xml[start..end];
+                if chunk.contains("<xdr:pic") || chunk.contains("<pic") {
+                    if let Some((r1, c1, r2, c2, off, rid)) = crate::pic::parse_drawing(chunk).into_iter().next() {
+                        if let Some(part) = rid_to_part.get(&rid) {
+                            out.push((part.clone(), (r1, c1, r2, c2), off, chunk.to_string()));
+                        }
+                    }
+                }
+                from = end;
+            }
+        }
+    }
+    out
+}
+
+/// 替换原图片锚点块里的 `r:embed="..."`（或 `embed="..."`）与可选 `cNvPr id`，其余属性/样式原样保留。
+fn rebind_pic_anchor_rid(block: &str, new_rid: &str) -> String {
+    for pat in ["r:embed=\"", "embed=\""] {
+        if let Some(p) = block.find(pat) {
+            let start = p + pat.len();
+            if let Some(q) = block[start..].find('"') {
+                let mut out = block.to_string();
+                out.replace_range(start..start + q, new_rid);
+                return out;
+            }
+        }
+    }
+    block.to_string()
 }
 
 /// 去掉所有含 `<xdr:pic>` 的锚点，保留图表/文本框等其他锚点
@@ -338,6 +456,8 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
             crate::textbox::drawing_relationships(path,&draw_rels)?
         } else { empty_rels() };
         let mut rels = keep_other_rels(&old_rels)?;
+        let mut existing_pics = extract_existing_pic_anchors(&existing, &old_rels, &draw_part);
+        let mut next_id = max_cnvpr_id(&existing).saturating_add(1);
         let mut anchors = String::new();
         for (i, pic) in sheet.pictures.iter().enumerate() {
             let rid_i = format!("rIdPic{}", i + 1);
@@ -364,7 +484,24 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
             if !ext.is_empty() && !exts.contains(&ext) {
                 exts.push(ext);
             }
-            anchors.push_str(&pic_anchor_xml(pic, &rid_i));
+            if let Some(pos) = existing_pics.iter().position(|(ep, er, eo, raw)| {
+                let (erot, ecrop) = crate::pic::parse_pic_transform(raw);
+                ep == &media
+                    && *er == pic.rect
+                    && *eo == pic.off
+                    && (erot - pic.rot_deg).abs() < 0.05
+                    && ecrop
+                        .iter()
+                        .zip(pic.crop.iter())
+                        .all(|(a, b)| (a - b).abs() < 1e-3)
+            }) {
+                let (_, _, _, raw_block) = existing_pics.remove(pos);
+                anchors.push_str(&rebind_pic_anchor_rid(&raw_block, &rid_i));
+            } else {
+                let id = next_id;
+                next_id = next_id.saturating_add(1);
+                anchors.push_str(&pic_anchor_xml(pic, &rid_i, id));
+            }
         }
         let body = rewrite_drawing(&existing, &anchors);
         if crate::textbox::has_part(path, &draw_part) {

@@ -352,6 +352,283 @@ pub fn parse_tag(tag: &str) -> Option<SheetProtection> {
     })
 }
 
+/// 工作簿结构保护（`xl/workbook.xml` 的 `<workbookProtection .../>`）
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkbookProtection {
+    pub algorithm: String,
+    pub hash: String,
+    pub salt: String,
+    pub spin: u32,
+    pub legacy: Option<u16>,
+    pub lock_structure: bool,
+    pub lock_windows: bool,
+}
+
+impl Default for WorkbookProtection {
+    fn default() -> Self {
+        Self {
+            algorithm: String::new(),
+            hash: String::new(),
+            salt: String::new(),
+            spin: 0,
+            legacy: None,
+            lock_structure: true,
+            lock_windows: false,
+        }
+    }
+}
+
+impl WorkbookProtection {
+    pub fn new_with_password(pw: &str, lock_structure: bool, lock_windows: bool) -> Self {
+        if pw.is_empty() {
+            return Self {
+                lock_structure,
+                lock_windows,
+                ..Default::default()
+            };
+        }
+        let salt = random_salt();
+        let spin = 100_000u32;
+        let hash = hash_password(pw, &salt, spin);
+        Self {
+            algorithm: "SHA-512".into(),
+            hash: base64::engine::general_purpose::STANDARD.encode(hash),
+            salt: base64::engine::general_purpose::STANDARD.encode(salt),
+            spin,
+            legacy: None,
+            lock_structure,
+            lock_windows,
+        }
+    }
+
+    pub fn has_password(&self) -> bool {
+        !self.hash.is_empty() || self.legacy.is_some()
+    }
+
+    pub fn verify(&self, pw: &str) -> bool {
+        if self.algorithm.eq_ignore_ascii_case("SHA-512") && !self.salt.is_empty() {
+            let Ok(salt) = base64::engine::general_purpose::STANDARD.decode(&self.salt) else {
+                return false;
+            };
+            let Ok(want) = base64::engine::general_purpose::STANDARD.decode(&self.hash) else {
+                return false;
+            };
+            return hash_password(pw, &salt, self.spin.max(1)) == want;
+        }
+        match self.legacy {
+            Some(h) => legacy_hash(pw) == h,
+            None => true,
+        }
+    }
+
+    pub fn to_xml(&self) -> String {
+        let mut attrs = String::new();
+        if self.lock_structure {
+            attrs.push_str(" lockStructure=\"1\"");
+        }
+        if self.lock_windows {
+            attrs.push_str(" lockWindows=\"1\"");
+        }
+        if self.algorithm.eq_ignore_ascii_case("SHA-512") && !self.hash.is_empty() {
+            attrs.push_str(&format!(
+                " workbookAlgorithmName=\"SHA-512\" workbookHashValue=\"{}\" workbookSaltValue=\"{}\" workbookSpinCount=\"{}\"",
+                self.hash, self.salt, self.spin.max(1)
+            ));
+        } else if let Some(h) = self.legacy {
+            attrs.push_str(&format!(" workbookPassword=\"{:04X}\"", h));
+        }
+        format!("<workbookProtection{attrs}/>")
+    }
+}
+
+/// 从 `workbook.xml` 解析 `<workbookProtection .../>`
+pub fn parse_workbook_tag(xml: &str) -> Option<WorkbookProtection> {
+    let i = xml.find("<workbookProtection")?;
+    let tail = &xml[i..];
+    let gt = tail.find('>')?;
+    let tag = &tail[..=gt];
+    let attr = |name: &str| -> Option<String> {
+        let pat = format!("{name}=\"");
+        let p = tag.find(&pat)? + pat.len();
+        let rest = &tag[p..];
+        let q = rest.find('"')?;
+        Some(rest[..q].to_string())
+    };
+    let lock_structure = matches!(attr("lockStructure").as_deref(), Some("1") | Some("true"));
+    let lock_windows = matches!(attr("lockWindows").as_deref(), Some("1") | Some("true"));
+    let algorithm = attr("workbookAlgorithmName").unwrap_or_default();
+    let hash = attr("workbookHashValue").unwrap_or_default();
+    let salt = attr("workbookSaltValue").unwrap_or_default();
+    let spin = attr("workbookSpinCount").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let legacy = attr("workbookPassword").and_then(|v| u16::from_str_radix(v.trim(), 16).ok());
+    if !lock_structure && !lock_windows && hash.is_empty() && legacy.is_none() {
+        return None;
+    }
+    Some(WorkbookProtection {
+        algorithm,
+        hash,
+        salt,
+        spin,
+        legacy,
+        lock_structure,
+        lock_windows,
+    })
+}
+
+/// 工作表允许用户编辑的区域（OOXML `<protectedRanges><protectedRange .../></protectedRanges>`）
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProtectedRange {
+    pub title: String,
+    pub sqref: Vec<(u32, u32, u32, u32)>,
+    pub algorithm: String,
+    pub hash: String,
+    pub salt: String,
+    pub spin: u32,
+    pub legacy: Option<u16>,
+}
+
+impl ProtectedRange {
+    pub fn new(title: impl Into<String>, sqref: Vec<(u32, u32, u32, u32)>, password: &str) -> Self {
+        let title = title.into();
+        if password.is_empty() {
+            return Self {
+                title,
+                sqref,
+                algorithm: String::new(),
+                hash: String::new(),
+                salt: String::new(),
+                spin: 0,
+                legacy: None,
+            };
+        }
+        let salt = random_salt();
+        let spin = 100_000u32;
+        let hash = hash_password(password, &salt, spin);
+        Self {
+            title,
+            sqref,
+            algorithm: "SHA-512".into(),
+            hash: base64::engine::general_purpose::STANDARD.encode(hash),
+            salt: base64::engine::general_purpose::STANDARD.encode(salt),
+            spin,
+            legacy: None,
+        }
+    }
+
+    pub fn has_password(&self) -> bool {
+        !self.hash.is_empty() || self.legacy.is_some()
+    }
+
+    pub fn verify(&self, pw: &str) -> bool {
+        if self.algorithm.eq_ignore_ascii_case("SHA-512") && !self.salt.is_empty() {
+            let Ok(salt) = base64::engine::general_purpose::STANDARD.decode(&self.salt) else {
+                return false;
+            };
+            let Ok(want) = base64::engine::general_purpose::STANDARD.decode(&self.hash) else {
+                return false;
+            };
+            return hash_password(pw, &salt, self.spin.max(1)) == want;
+        }
+        match self.legacy {
+            Some(h) => legacy_hash(pw) == h,
+            None => true,
+        }
+    }
+
+    pub fn contains(&self, r: u32, c: u32) -> bool {
+        self.sqref.iter().any(|&(r1, c1, r2, c2)| {
+            let (ra, rb) = (r1.min(r2), r1.max(r2));
+            let (ca, cb) = (c1.min(c2), c1.max(c2));
+            r >= ra && r <= rb && c >= ca && c <= cb
+        })
+    }
+
+    pub fn sqref_string(&self) -> String {
+        self.sqref
+            .iter()
+            .map(|&(r1, c1, r2, c2)| {
+                let (ra, rb) = (r1.min(r2), r1.max(r2));
+                let (ca, cb) = (c1.min(c2), c1.max(c2));
+                let a = crate::model::cell_name(ra, ca);
+                if ra == rb && ca == cb {
+                    a
+                } else {
+                    format!("{a}:{}", crate::model::cell_name(rb, cb))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub fn to_xml(&self) -> String {
+        let mut attrs = format!(
+            " name=\"{}\" sqref=\"{}\"",
+            crate::model::xml_escape(&self.title),
+            self.sqref_string()
+        );
+        if self.algorithm.eq_ignore_ascii_case("SHA-512") && !self.hash.is_empty() {
+            attrs.push_str(&format!(
+                " algorithmName=\"SHA-512\" hashValue=\"{}\" saltValue=\"{}\" spinCount=\"{}\"",
+                self.hash, self.salt, self.spin.max(1)
+            ));
+        } else if let Some(h) = self.legacy {
+            attrs.push_str(&format!(" password=\"{:04X}\"", h));
+        }
+        format!("<protectedRange{attrs}/>")
+    }
+}
+
+pub fn parse_protected_range_tag(tag: &str) -> Option<ProtectedRange> {
+    let attr = |name: &str| -> Option<String> {
+        let pat = format!("{name}=\"");
+        let i = tag.find(&pat)? + pat.len();
+        let rest = &tag[i..];
+        let j = rest.find('"')?;
+        Some(crate::model::xml_unescape(&rest[..j]))
+    };
+    let title = attr("name").unwrap_or_default();
+    let sqref_raw = attr("sqref")?;
+    let mut sqref = Vec::new();
+    for part in sqref_raw.split_whitespace() {
+        if let Some(rect) = crate::merges::parse_range(part) {
+            sqref.push(rect);
+        } else if let Some((r, c)) = crate::merges::parse_cell(part) {
+            sqref.push((r, c, r, c));
+        }
+    }
+    if sqref.is_empty() {
+        return None;
+    }
+    let algorithm = attr("algorithmName").unwrap_or_default();
+    let hash = attr("hashValue").unwrap_or_default();
+    let salt = attr("saltValue").unwrap_or_default();
+    let spin = attr("spinCount").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let legacy = attr("password").and_then(|v| u16::from_str_radix(v.trim(), 16).ok());
+    Some(ProtectedRange {
+        title,
+        sqref,
+        algorithm,
+        hash,
+        salt,
+        spin,
+        legacy,
+    })
+}
+
+pub fn protected_ranges_to_xml(ranges: &[ProtectedRange]) -> String {
+    if ranges.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("<protectedRanges>");
+    for r in ranges {
+        if !r.sqref.is_empty() {
+            s.push_str(&r.to_xml());
+        }
+    }
+    s.push_str("</protectedRanges>");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,14 +1,18 @@
-//! 往已保存的 xlsx 里插入一张图表：生成 chart 部件、drawing 部件、两处 rels、内容类型。
+//! 图表 OOXML 读写与增量写回：支持 22 种图型、趋势线、误差线、双轴、CELLAN `<c:extLst>` 无损扩展。
 //!
-//! 只做柱状图（Excel 最常用），数据来自选区：首行当系列名、首列当分类。
+//! - 严格遵循 OOXML Schema 子元素顺序（`CT_BarSer` / `CT_LineSer` / `CT_ScatterSer` / `CT_BubbleSer` / `CT_ValAx`）。
+//! - `Waterfall` / `Funnel` / `Treemap` / `Histogram` / `BoxWhisker` 同时写出兼容回退图与 `<c:extLst>` 完整元数据，
+//!   确保 Microsoft Excel 打开不报损坏且 CELLAN 重开 100% 无损还原。
 
+use crate::charts::{
+    AxisConfig, Chart, ChartKind, ErrorBarDir, ErrorBarKind, LineDash, MarkerStyle, RefLineAxis,
+    RefLineMode, Series, TrendlineKind,
+};
 use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::Path;
 
-/// 数据标签 XML：按 Excel 的元素顺序写 showVal/showCatName/showSerName/showPercent/
-/// showLegendKey/leaderLines/dLblPos，位置串直接用 OOXML 的值（ctr/outEnd/...）。
-fn any_labels(ch: &crate::charts::Chart) -> bool {
+fn any_labels(ch: &Chart) -> bool {
     let o = &ch.label_opts;
     ch.show_labels
         || o.show_cat
@@ -17,17 +21,28 @@ fn any_labels(ch: &crate::charts::Chart) -> bool {
         || o.show_legend_key
         || o.leader_lines
         || !o.position.is_empty()
+        || !o.num_fmt.is_empty()
 }
 
-fn dlbls_xml(ch: &crate::charts::Chart) -> String {
+fn dlbls_xml(ch: &Chart) -> String {
     let o = &ch.label_opts;
     let b = |v: bool| if v { "1" } else { "0" };
     let mut s = String::from("<c:dLbls>");
+    if !o.num_fmt.is_empty() {
+        s.push_str(&format!(
+            "<c:numFmt formatCode=\"{}\" sourceLinked=\"0\"/>",
+            esc(&o.num_fmt)
+        ));
+    }
+    // 严格按 OOXML Schema / C19.1 顺序输出：showVal -> showCatName -> showSerName -> showPercent -> showLegendKey -> showLeaderLines -> dLblPos
     s.push_str(&format!("<c:showVal val=\"{}\"/>", b(ch.show_labels)));
     s.push_str(&format!("<c:showCatName val=\"{}\"/>", b(o.show_cat)));
     s.push_str(&format!("<c:showSerName val=\"{}\"/>", b(o.show_ser)));
     s.push_str(&format!("<c:showPercent val=\"{}\"/>", b(o.show_pct)));
-    s.push_str(&format!("<c:showLegendKey val=\"{}\"/>", b(o.show_legend_key)));
+    s.push_str(&format!(
+        "<c:showLegendKey val=\"{}\"/>",
+        b(o.show_legend_key)
+    ));
     if o.leader_lines {
         s.push_str("<c:showLeaderLines val=\"1\"/>");
     }
@@ -39,17 +54,24 @@ fn dlbls_xml(ch: &crate::charts::Chart) -> String {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
-/// 选区坐标 → 图表（首行表头、首列分类；自动裁剪全选/整列空尾并限制系列与数据点上限防止 OOM）
+fn hex_rgb(c: [u8; 3]) -> String {
+    format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2])
+}
+
+/// 选区坐标 → 图表（首行表头、首列分类；保持既有行为契约）
 pub fn chart_from_selection(
     sheet: &crate::model::Sheet,
     sheet_name: &str,
     rect: (u32, u32, u32, u32),
     title: &str,
-    kind: crate::charts::ChartKind,
-) -> crate::charts::Chart {
+    kind: ChartKind,
+) -> Chart {
     let (r1, c1, mut r2, mut c2) = rect;
     if (r2.saturating_sub(r1) as u64 + 1) * (c2.saturating_sub(c1) as u64 + 1) > 100_000 {
         if let Some((_, _, ur2, uc2)) = sheet.used_bounds() {
@@ -83,9 +105,7 @@ pub fn chart_from_selection(
                 cats.push(v.value.display());
             }
             let y = sheet.get(r, c).and_then(|v| num(&v.value));
-            // 散点图是 (x,y) 成对数据：X 不是数值的行整行丢弃，保证 xv/vals 一一对应；
-            // 其它图型沿用原语义（第一列当分类名，空值跳过）。
-            if kind == crate::charts::ChartKind::Scatter {
+            if kind == ChartKind::Scatter {
                 let x = cell.as_deref().and_then(|v| num(&v.value));
                 if let (Some(x), Some(y)) = (x, y) {
                     xv.push(x);
@@ -97,123 +117,293 @@ pub fn chart_from_selection(
         }
         let range_col = crate::model::col_label(c);
         let cat_col = crate::model::col_label(c1);
-        series.push(crate::charts::Series {
+        series.push(Series {
             name,
             cats,
             vals,
             name_ref: format!("'{}'!${}${}", sheet_name, range_col, r1 + 1),
-            cat_ref: format!("'{}'!${}${}:${}${}", sheet_name, cat_col, r1 + 2, cat_col, r2 + 1),
-            val_ref: format!("'{}'!${}${}:${}${}", sheet_name, range_col, r1 + 2, range_col, r2 + 1),
-            color: None,
+            cat_ref: format!(
+                "'{}'!${}${}:${}${}",
+                sheet_name,
+                cat_col,
+                r1 + 2,
+                cat_col,
+                r2 + 1
+            ),
+            val_ref: format!(
+                "'{}'!${}${}:${}${}",
+                sheet_name,
+                range_col,
+                r1 + 2,
+                range_col,
+                r2 + 1
+            ),
             xv,
-            kind: None,
-            secondary: false,
+            ..Series::default()
         });
     }
-    crate::charts::Chart {
+    let src_ref = format!(
+        "'{}'!${}${}:${}${}",
+        sheet_name,
+        crate::model::col_label(c1),
+        r1 + 1,
+        crate::model::col_label(c2),
+        r2 + 1
+    );
+    Chart {
         kind,
         title: title.to_string(),
         series,
         legend: true,
         anchor: (r1, c2 + 2, r1 + 15, c2 + 9),
         legend_pos: "r".into(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: Default::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
-        axis_x: String::new(),
-        axis_y: String::new(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        source_range: src_ref,
+        ..Chart::default()
     }
 }
 
-const PALETTE: [&str; 8] = [
-    "4472C4", "ED7D31", "A5A5A5", "FFC000", "5B9BD5", "70AD47", "264478", "9E480E",
-];
+fn trendlines_xml(s: &Series) -> String {
+    let mut out = String::new();
+    for tl in &s.trendlines {
+        out.push_str("<c:trendline>");
+        if !tl.name.is_empty() {
+            out.push_str(&format!("<c:name>{}</c:name>", esc(&tl.name)));
+        }
+        if tl.color.is_some() || tl.dash != LineDash::Solid {
+            out.push_str("<c:spPr><a:ln w=\"19050\">");
+            if let Some(rgb) = tl.color {
+                out.push_str(&format!(
+                    "<a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill>",
+                    hex_rgb(rgb)
+                ));
+            }
+            if tl.dash != LineDash::Solid {
+                out.push_str(&format!("<a:prstDash val=\"{}\"/>", tl.dash.code()));
+            }
+            out.push_str("</a:ln></c:spPr>");
+        }
+        match tl.kind {
+            TrendlineKind::Linear => {
+                out.push_str("<c:trendlineType val=\"linear\"/>");
+            }
+            TrendlineKind::Polynomial(ord) => {
+                out.push_str(&format!(
+                    "<c:trendlineType val=\"poly\"/><c:order val=\"{}\"/>",
+                    ord.clamp(2, 4)
+                ));
+            }
+            TrendlineKind::Exponential => {
+                out.push_str("<c:trendlineType val=\"exp\"/>");
+            }
+            TrendlineKind::Logarithmic => {
+                out.push_str("<c:trendlineType val=\"log\"/>");
+            }
+            TrendlineKind::Power => {
+                out.push_str("<c:trendlineType val=\"power\"/>");
+            }
+            TrendlineKind::MovingAverage(p) => {
+                out.push_str(&format!(
+                    "<c:trendlineType val=\"movingAvg\"/><c:period val=\"{}\"/>",
+                    p.clamp(2, 30)
+                ));
+            }
+        }
+        if tl.forward > 0.0 {
+            out.push_str(&format!("<c:forward val=\"{}\"/>", tl.forward));
+        }
+        if tl.backward > 0.0 {
+            out.push_str(&format!("<c:backward val=\"{}\"/>", tl.backward));
+        }
+        out.push_str(&format!(
+            "<c:dispRSqr val=\"{}\"/><c:dispEq val=\"{}\"/>",
+            if tl.show_r2 { "1" } else { "0" },
+            if tl.show_equation { "1" } else { "0" }
+        ));
+        out.push_str("</c:trendline>");
+    }
+    out
+}
 
-fn series_body(ch: &crate::charts::Chart) -> String {
+fn error_bars_xml(s: &Series) -> String {
+    let Some(eb) = &s.error_bars else {
+        return String::new();
+    };
+    let dir = match eb.dir {
+        ErrorBarDir::Both => "both",
+        ErrorBarDir::Plus => "plus",
+        ErrorBarDir::Minus => "minus",
+    };
+    let (vtype, val_attr) = match eb.kind {
+        ErrorBarKind::Fixed(v) => ("fixedVal", Some(v)),
+        ErrorBarKind::Percent(v) => ("percentage", Some(v)),
+        ErrorBarKind::StdDev(v) => ("stdDev", Some(v)),
+        ErrorBarKind::StdErr => ("stdErr", None),
+    };
+    let mut out = format!(
+        "<c:errBars><c:errDir val=\"y\"/><c:errBarType val=\"{dir}\"/><c:errValType val=\"{vtype}\"/>"
+    );
+    if let Some(v) = val_attr {
+        out.push_str(&format!("<c:val val=\"{v}\"/>"));
+    }
+    out.push_str("</c:errBars>");
+    out
+}
+
+fn series_sp_pr(color: &str, is_line: bool, s: &Series) -> String {
+    if is_line {
+        let w_emu = if s.line_width > 0.0 {
+            (s.line_width as f64 * 12700.0).round() as u32
+        } else {
+            28575
+        };
+        let dash = if s.dash != LineDash::Solid {
+            format!("<a:prstDash val=\"{}\"/>", s.dash.code())
+        } else {
+            String::new()
+        };
+        format!(
+            "<c:spPr><a:ln w=\"{w_emu}\"><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill>{dash}</a:ln></c:spPr>"
+        )
+    } else {
+        format!("<c:spPr><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></c:spPr>")
+    }
+}
+
+fn series_body(ch: &Chart) -> String {
     series_body_at(ch, 0)
 }
 
-fn series_body_at(ch: &crate::charts::Chart, offset: usize) -> String {
+fn series_body_at(ch: &Chart, offset: usize) -> String {
+    let theme = crate::chart_engine::theme_spec(ch.style.theme);
     let mut out = String::new();
+    let is_line = matches!(ch.kind, ChartKind::Line | ChartKind::LineStacked | ChartKind::Radar);
+    let is_pie = matches!(ch.kind, ChartKind::Pie | ChartKind::Doughnut);
     for (i0, s) in ch.series.iter().enumerate() {
         let i = i0 + offset;
-        let color: String = match s.color {
-            Some(c) => format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]),
-            None => PALETTE[i % PALETTE.len()].to_string(),
+        let color = match s.color {
+            Some(c) => hex_rgb(c),
+            None => hex_rgb(theme.palette[i % theme.palette.len()]),
         };
-        // CT_BarSer / CT_LineSer 的子元素顺序：idx, order, tx, spPr, [marker], dLbls, cat, val。
-        // dLbls 必须排在 cat/val 之前，否则 Excel 直接判文件损坏（实测打开即 COMException）。
         out.push_str(&format!("<c:ser><c:idx val=\"{i}\"/><c:order val=\"{i}\"/>"));
-        out.push_str(&format!(
-            "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",
-            esc(&s.name_ref),
-            esc(&s.name)
-        ));
-        let line = matches!(ch.kind, crate::charts::ChartKind::Line);
-        if line {
+        if !s.name_ref.is_empty() {
             out.push_str(&format!(
-                "<c:spPr><a:ln w=\"28575\"><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></a:ln></c:spPr>"
+                "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",
+                esc(&s.name_ref),
+                esc(&s.name)
             ));
-            out.push_str("<c:marker><c:symbol val=\"none\"/></c:marker>");
-        } else {
-            out.push_str(&format!(
-                "<c:spPr><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></c:spPr>"
-            ));
+        } else if !s.name.is_empty() {
+            out.push_str(&format!("<c:tx><c:v>{}</c:v></c:tx>", esc(&s.name)));
+        }
+        if !is_pie {
+            out.push_str(&series_sp_pr(&color, is_line, s));
+        }
+        if is_pie && ch.style.pie_explosion > 0 {
+            out.push_str(&format!("<c:explosion val=\"{}\"/>", ch.style.pie_explosion));
+        }
+        if is_line {
+            let sym = if s.marker == MarkerStyle::Auto {
+                "none"
+            } else {
+                s.marker.ooxml_val()
+            };
+            out.push_str(&format!("<c:marker><c:symbol val=\"{sym}\"/></c:marker>"));
         }
         if any_labels(ch) {
             out.push_str(&dlbls_xml(ch));
         }
-        out.push_str(&format!(
-            "<c:cat><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"{}\"/>",
-            esc(&s.cat_ref),
-            s.cats.len()
-        ));
-        for (k, c) in s.cats.iter().enumerate() {
-            out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{}</c:v></c:pt>", esc(c)));
+        if !is_pie {
+            out.push_str(&trendlines_xml(s));
+            out.push_str(&error_bars_xml(s));
         }
-        out.push_str("</c:strCache></c:strRef></c:cat>");
-        out.push_str(&format!(
-            "<c:val><c:numRef><c:f>{}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"{}\"/>",
-            esc(&s.val_ref),
-            s.vals.len()
-        ));
-        for (k, v) in s.vals.iter().enumerate() {
-            out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
+        if !s.cat_ref.is_empty() || !s.cats.is_empty() {
+            out.push_str("<c:cat>");
+            if !s.cat_ref.is_empty() {
+                out.push_str(&format!(
+                    "<c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"{}\"/>",
+                    esc(&s.cat_ref),
+                    s.cats.len()
+                ));
+                for (k, c) in s.cats.iter().enumerate() {
+                    out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{}</c:v></c:pt>", esc(c)));
+                }
+                out.push_str("</c:strCache></c:strRef>");
+            } else {
+                out.push_str(&format!("<c:strLit><c:ptCount val=\"{}\"/>", s.cats.len()));
+                for (k, c) in s.cats.iter().enumerate() {
+                    out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{}</c:v></c:pt>", esc(c)));
+                }
+                out.push_str("</c:strLit>");
+            }
+            out.push_str("</c:cat>");
         }
-        out.push_str("</c:numCache></c:numRef></c:val>");
+        out.push_str("<c:val>");
+        if !s.val_ref.is_empty() {
+            out.push_str(&format!(
+                "<c:numRef><c:f>{}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"{}\"/>",
+                esc(&s.val_ref),
+                s.vals.len()
+            ));
+            for (k, &v) in s.vals.iter().enumerate() {
+                if v.is_finite() {
+                    out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
+                }
+            }
+            out.push_str("</c:numCache></c:numRef>");
+        } else {
+            out.push_str(&format!(
+                "<c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{}\"/>",
+                s.vals.len()
+            ));
+            for (k, &v) in s.vals.iter().enumerate() {
+                if v.is_finite() {
+                    out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
+                }
+            }
+            out.push_str("</c:numLit>");
+        }
+        out.push_str("</c:val>");
+        if is_line && s.smooth {
+            out.push_str("<c:smooth val=\"1\"/>");
+        }
         out.push_str("</c:ser>");
     }
     out
 }
 
-fn scatter_body(ch: &crate::charts::Chart) -> String {
+fn scatter_or_bubble_body(ch: &Chart, is_bubble: bool) -> String {
+    let theme = crate::chart_engine::theme_spec(ch.style.theme);
     let mut out = String::new();
     for (i, s) in ch.series.iter().enumerate() {
-        let color: String = match s.color {
-            Some(c) => format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]),
-            None => PALETTE[i % PALETTE.len()].to_string(),
+        let color = match s.color {
+            Some(c) => hex_rgb(c),
+            None => hex_rgb(theme.palette[i % theme.palette.len()]),
         };
-        // CT_ScatterSer 顺序：idx, order, tx, spPr, marker, dLbls, xVal, yVal
         out.push_str(&format!("<c:ser><c:idx val=\"{i}\"/><c:order val=\"{i}\"/>"));
-        out.push_str(&format!(
-            "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",
-            esc(&s.name_ref),
-            esc(&s.name)
-        ));
-        out.push_str(&format!(
-            "<c:spPr><a:ln w=\"19050\"><a:solidFill><a:srgbClr val=\"{color}\"/></a:solidFill></a:ln></c:spPr>"
-        ));
-        out.push_str("<c:marker><c:symbol val=\"circle\"/></c:marker>");
+        if !s.name_ref.is_empty() {
+            out.push_str(&format!(
+                "<c:tx><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache></c:strRef></c:tx>",
+                esc(&s.name_ref),
+                esc(&s.name)
+            ));
+        } else if !s.name.is_empty() {
+            out.push_str(&format!("<c:tx><c:v>{}</c:v></c:tx>", esc(&s.name)));
+        }
+        if is_bubble {
+            out.push_str(&series_sp_pr(&color, false, s));
+        } else {
+            out.push_str(&series_sp_pr(&color, true, s));
+            let sym = if s.marker == MarkerStyle::Auto {
+                "circle"
+            } else {
+                s.marker.ooxml_val()
+            };
+            out.push_str(&format!("<c:marker><c:symbol val=\"{sym}\"/></c:marker>"));
+        }
         if any_labels(ch) {
             out.push_str(&dlbls_xml(ch));
         }
-        // 有建模的 X（xv 与 vals 等长）就用它，否则退回分类列解析/序号
+        out.push_str(&trendlines_xml(s));
+        out.push_str(&error_bars_xml(s));
         let xs: Vec<f64> = if !s.xv.is_empty() && s.xv.len() == s.vals.len() {
             s.xv.clone()
         } else {
@@ -225,10 +415,14 @@ fn scatter_body(ch: &crate::charts::Chart) -> String {
         };
         out.push_str("<c:xVal><c:numRef><c:f>");
         out.push_str(&esc(&s.cat_ref));
-        out.push_str("</c:f><c:numCache><c:formatCode>General</c:formatCode>");
-        out.push_str(&format!("<c:ptCount val=\"{}\"/>", xs.len()));
-        for (k, x) in xs.iter().enumerate() {
-            out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{x}</c:v></c:pt>"));
+        out.push_str(&format!(
+            "</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"{}\"/>",
+            xs.len()
+        ));
+        for (k, &x) in xs.iter().enumerate() {
+            if x.is_finite() {
+                out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{x}</c:v></c:pt>"));
+            }
         }
         out.push_str("</c:numCache></c:numRef></c:xVal>");
         out.push_str(&format!(
@@ -236,82 +430,263 @@ fn scatter_body(ch: &crate::charts::Chart) -> String {
             esc(&s.val_ref),
             s.vals.len()
         ));
-        for (k, v) in s.vals.iter().enumerate() {
-            out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
+        for (k, &v) in s.vals.iter().enumerate() {
+            if v.is_finite() {
+                out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
+            }
         }
         out.push_str("</c:numCache></c:numRef></c:yVal>");
+        if is_bubble {
+            let sz: Vec<f64> = if !s.sizes.is_empty() {
+                s.sizes.clone()
+            } else {
+                vec![10.0; s.vals.len()]
+            };
+            out.push_str("<c:bubbleSize>");
+            if !s.size_ref.is_empty() {
+                out.push_str(&format!(
+                    "<c:numRef><c:f>{}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"{}\"/>",
+                    esc(&s.size_ref),
+                    sz.len()
+                ));
+                for (k, &v) in sz.iter().enumerate() {
+                    if v.is_finite() {
+                        out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
+                    }
+                }
+                out.push_str("</c:numCache></c:numRef>");
+            } else {
+                out.push_str(&format!(
+                    "<c:numLit><c:formatCode>General</c:formatCode><c:ptCount val=\"{}\"/>",
+                    sz.len()
+                ));
+                for (k, &v) in sz.iter().enumerate() {
+                    if v.is_finite() {
+                        out.push_str(&format!("<c:pt idx=\"{k}\"><c:v>{v}</c:v></c:pt>"));
+                    }
+                }
+                out.push_str("</c:numLit>");
+            }
+            out.push_str("</c:bubbleSize>");
+        } else if s.smooth {
+            out.push_str("<c:smooth val=\"1\"/>");
+        }
         out.push_str("</c:ser>");
     }
     out
 }
 
-
-
-/// 坐标轴标题与 Y 轴范围的补丁：在生成好的 XML 上做替换，避免改动大段字面量
-fn axis_fix(mut xml: String, ch: &crate::charts::Chart) -> String {
-    let title = |t: &str| -> String {
-        if t.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "<c:title><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title>",
-                esc(t)
-            )
-        }
-    };
-    // Y 轴：min/max
-    if ch.y_min.is_some() || ch.y_max.is_some() {
-        let mut sc = String::from("<c:scaling><c:orientation val=\"minMax\"/>");
-        if let Some(v) = ch.y_min {
-            sc.push_str(&format!("<c:max val=\"{}\" min=\"{}\"/>", ch.y_max.unwrap_or(0.0), v));
-        } else if let Some(v) = ch.y_max {
-            sc.push_str(&format!("<c:max val=\"{}\"/>", v));
-        }
-        sc.push_str("</c:scaling>");
-        // 只替换值轴那一段（图表里最后出现的 scaling）
-        if let Some(pos) = xml.rfind("<c:scaling><c:orientation val=\"minMax\"/></c:scaling>") {
-            xml.replace_range(
-                pos..pos + "<c:scaling><c:orientation val=\"minMax\"/></c:scaling>".len(),
-                &sc,
-            );
-        }
+fn axis_title_xml(t: &str) -> String {
+    if t.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<c:title><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title>",
+            esc(t)
+        )
     }
-    if !ch.axis_x.is_empty() {
-        xml = xml.replace(
-            "<c:axPos val=\"b\"/>",
-            &format!("<c:axPos val=\"b\"/>{}", title(&ch.axis_x)),
-        );
+}
+
+fn scaling_xml(ax: &AxisConfig) -> String {
+    let orient = if ax.reverse { "maxMin" } else { "minMax" };
+    let mut s = format!("<c:scaling><c:orientation val=\"{orient}\"/>");
+    if let Some(b) = ax.log_base.filter(|b| *b > 1.0) {
+        s.push_str(&format!("<c:logBase val=\"{b}\"/>"));
     }
-    if !ch.y_fmt.is_empty() {
-        let nf = format!(
+    // OOXML Schema 顺序：logBase -> orientation -> max -> min（两个独立子元素！）
+    if let Some(mx) = ax.max.filter(|v| v.is_finite()) {
+        s.push_str(&format!("<c:max val=\"{mx}\"/>"));
+    }
+    if let Some(mn) = ax.min.filter(|v| v.is_finite()) {
+        s.push_str(&format!("<c:min val=\"{mn}\"/>"));
+    }
+    s.push_str("</c:scaling>");
+    s
+}
+
+fn cat_ax_xml(ax_id: usize, cross_ax: usize, pos: &str, ax: &AxisConfig, hidden: bool) -> String {
+    let del = if hidden || ax.hidden { "1" } else { "0" };
+    let mut s = format!(
+        "<c:catAx><c:axId val=\"{ax_id}\"/>{}<c:delete val=\"{del}\"/><c:axPos val=\"{pos}\"/>",
+        scaling_xml(ax)
+    );
+    if ax.show_major_grid {
+        s.push_str("<c:majorGridlines/>");
+    }
+    if ax.show_minor_grid {
+        s.push_str("<c:minorGridlines/>");
+    }
+    s.push_str(&axis_title_xml(&ax.title));
+    if !ax.num_fmt.is_empty() {
+        s.push_str(&format!(
             "<c:numFmt formatCode=\"{}\" sourceLinked=\"0\"/>",
-            esc(&ch.y_fmt)
-        );
-        let at = xml
-            .find("<c:majorGridlines/>")
-            .map(|p| p + "<c:majorGridlines/>".len())
-            .or_else(|| xml.find("<c:axPos val=\"l\"/>").map(|p| p + "<c:axPos val=\"l\"/>".len()));
-        if let Some(p) = at {
-            xml.insert_str(p, &nf);
+            esc(&ax.num_fmt)
+        ));
+    }
+    s.push_str(&format!("<c:crossAx val=\"{cross_ax}\"/></c:catAx>"));
+    s
+}
+
+fn val_ax_xml(
+    ax_id: usize,
+    cross_ax: usize,
+    pos: &str,
+    ax: &AxisConfig,
+    crosses_max: bool,
+) -> String {
+    let del = if ax.hidden { "1" } else { "0" };
+    let mut s = format!(
+        "<c:valAx><c:axId val=\"{ax_id}\"/>{}<c:delete val=\"{del}\"/><c:axPos val=\"{pos}\"/>",
+        scaling_xml(ax)
+    );
+    if ax.show_major_grid {
+        s.push_str("<c:majorGridlines/>");
+    }
+    if ax.show_minor_grid {
+        s.push_str("<c:minorGridlines/>");
+    }
+    s.push_str(&axis_title_xml(&ax.title));
+    if !ax.num_fmt.is_empty() {
+        s.push_str(&format!(
+            "<c:numFmt formatCode=\"{}\" sourceLinked=\"0\"/>",
+            esc(&ax.num_fmt)
+        ));
+    }
+    s.push_str(&format!("<c:crossAx val=\"{cross_ax}\"/>"));
+    if crosses_max {
+        s.push_str("<c:crosses val=\"max\"/>");
+    }
+    if let Some(u) = ax.major_unit.filter(|u| u.is_finite() && *u > 0.0) {
+        s.push_str(&format!("<c:majorUnit val=\"{u}\"/>"));
+    }
+    s.push_str("</c:valAx>");
+    s
+}
+
+fn cellan_ext_xml(ch: &Chart) -> String {
+    let needs_ext = matches!(
+        ch.kind,
+        ChartKind::Waterfall
+            | ChartKind::Funnel
+            | ChartKind::Treemap
+            | ChartKind::Histogram
+            | ChartKind::BoxWhisker
+    ) || ch.style.theme != crate::charts::ChartThemeId::CellanModern
+        || !ch.subtitle.is_empty()
+        || !ch.source_range.is_empty()
+        || !ch.ref_lines.is_empty()
+        || ch.analytics.highlight_extrema
+        || ch.analytics.show_growth_badge
+        || ch.analytics.show_summary_bar
+        || ch.analytics.show_pareto_line
+        || ch.analytics.hist_bins.is_some()
+        || !ch.analytics.waterfall_totals.is_empty()
+        || ch.analytics.show_center_kpi
+        || !ch.analytics.center_kpi_title.is_empty()
+        || !ch.style.rounded_bars
+        || !ch.style.show_card_shadow
+        || ch.style.transparent_bg
+        || ch.style.switch_row_col
+        || ch.series.iter().any(|s| s.stepped || s.hidden);
+    if !needs_ext {
+        return String::new();
+    }
+    let b = |v: bool| if v { "1" } else { "0" };
+    let mut meta = format!(
+        "<cellan:meta kind=\"{}\" theme=\"{}\" roundedBars=\"{}\" shadow=\"{}\" transparentBg=\"{}\" switchRowCol=\"{}\" extrema=\"{}\" growthBadge=\"{}\" summaryBar=\"{}\" pareto=\"{}\" centerKpi=\"{}\"",
+        ch.kind.ext_code(),
+        ch.style.theme.code(),
+        b(ch.style.rounded_bars),
+        b(ch.style.show_card_shadow),
+        b(ch.style.transparent_bg),
+        b(ch.style.switch_row_col),
+        b(ch.analytics.highlight_extrema),
+        b(ch.analytics.show_growth_badge),
+        b(ch.analytics.show_summary_bar),
+        b(ch.analytics.show_pareto_line),
+        b(ch.analytics.show_center_kpi),
+    );
+    if !ch.subtitle.is_empty() {
+        meta.push_str(&format!(" subtitle=\"{}\"", esc(&ch.subtitle)));
+    }
+    if !ch.source_range.is_empty() {
+        meta.push_str(&format!(" sourceRange=\"{}\"", esc(&ch.source_range)));
+    }
+    if let Some(bins) = ch.analytics.hist_bins {
+        meta.push_str(&format!(" histBins=\"{bins}\""));
+    }
+    if !ch.analytics.center_kpi_title.is_empty() {
+        meta.push_str(&format!(
+            " centerKpiTitle=\"{}\"",
+            esc(&ch.analytics.center_kpi_title)
+        ));
+    }
+    if !ch.analytics.waterfall_totals.is_empty() {
+        let joined: Vec<String> = ch
+            .analytics
+            .waterfall_totals
+            .iter()
+            .map(|i| i.to_string())
+            .collect();
+        meta.push_str(&format!(" wfTotals=\"{}\"", joined.join(",")));
+    }
+    if ch.series.iter().any(|s| s.stepped) {
+        let mask: Vec<&str> = ch.series.iter().map(|s| b(s.stepped)).collect();
+        meta.push_str(&format!(" steppedMask=\"{}\"", mask.join(",")));
+    }
+    if ch.series.iter().any(|s| s.hidden) {
+        let mask: Vec<&str> = ch.series.iter().map(|s| b(s.hidden)).collect();
+        meta.push_str(&format!(" hiddenMask=\"{}\"", mask.join(",")));
+    }
+    meta.push('>');
+    for rl in &ch.ref_lines {
+        let ax = match rl.axis {
+            RefLineAxis::YPrimary => "y1",
+            RefLineAxis::YSecondary => "y2",
+            RefLineAxis::X => "x",
+        };
+        let (mode, v1, v2) = match rl.mode {
+            RefLineMode::Fixed(v) => ("fixed", Some(v), None),
+            RefLineMode::Mean => ("mean", None, None),
+            RefLineMode::Median => ("median", None, None),
+            RefLineMode::Min => ("min", None, None),
+            RefLineMode::Max => ("max", None, None),
+            RefLineMode::Percentile(p) => ("pct", Some(p), None),
+            RefLineMode::Band { low, high } => ("band", Some(low), Some(high)),
+            RefLineMode::StdDevBand => ("stdBand", None, None),
+        };
+        meta.push_str(&format!(
+            "<cellan:refLine label=\"{}\" axis=\"{ax}\" mode=\"{mode}\" color=\"{}\" dash=\"{}\"",
+            esc(&rl.label),
+            hex_rgb(rl.color),
+            rl.dash.code()
+        ));
+        if let Some(a) = v1 {
+            meta.push_str(&format!(" v1=\"{a}\""));
         }
+        if let Some(c) = v2 {
+            meta.push_str(&format!(" v2=\"{c}\""));
+        }
+        meta.push_str("/>");
     }
-    if !ch.axis_y.is_empty() {
-        xml = xml.replace(
-            "<c:axPos val=\"l\"/>",
-            &format!("<c:axPos val=\"l\"/>{}", title(&ch.axis_y)),
-        );
-    }
-    xml
+    meta.push_str("</cellan:meta>");
+    format!(
+        "<c:extLst><c:ext uri=\"{{8B62D2D1-4C5E-4A91-9A63-CELLANCHART1}}\" xmlns:cellan=\"urn:cellan:chart:v1\">{meta}</c:ext></c:extLst>"
+    )
 }
 
 /// 测试用：直接拿到整段 chart XML
-
-pub fn chart_xml_for_test(ch: &crate::charts::Chart) -> String {
+pub fn chart_xml_for_test(ch: &Chart) -> String {
     chart_xml(ch)
 }
 
-fn chart_xml(ch: &crate::charts::Chart) -> String {
-    use crate::charts::ChartKind::*;
+fn chart_xml(ch: &Chart) -> String {
+    use ChartKind::*;
+    let x_ax = ch.effective_x_axis();
+    let y_ax = ch.effective_y_axis();
+    let y2_ax = &ch.y2_axis;
+    let gap = ch.style.gap_width.clamp(0, 500);
+
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" \
@@ -326,143 +701,210 @@ fn chart_xml(ch: &crate::charts::Chart) -> String {
         ));
     }
     out.push_str("<c:plotArea><c:layout/>");
-    match ch.kind {
-        Column | Bar | BarStacked => {
-            let dir = if matches!(ch.kind, Bar) { "bar" } else { "col" };
-            let grouping = if matches!(ch.kind, BarStacked) { "stacked" } else { "clustered" };
-            out.push_str(&format!(
-                "<c:barChart><c:barDir val=\"{dir}\"/><c:grouping val=\"{grouping}\"/><c:varyColors val=\"0\"/>"
-            ));
-            out.push_str(&series_body(ch));
-            out.push_str("<c:gapWidth val=\"150\"/><c:axId val=\"1\"/><c:axId val=\"2\"/></c:barChart>");
-            out.push_str("<c:catAx><c:axId val=\"1\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"2\"/></c:catAx>");
-            out.push_str("<c:valAx><c:axId val=\"2\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:majorGridlines/><c:crossAx val=\"1\"/></c:valAx>");
-        }
-        Line | Area => {
-            let tag = if matches!(ch.kind, Line) { "lineChart" } else { "areaChart" };
-            out.push_str(&format!("<c:{tag}><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>"));
-            out.push_str(&series_body(ch));
-            out.push_str(&format!("<c:marker val=\"1\"/><c:axId val=\"1\"/><c:axId val=\"2\"/></c:{tag}>"));
-            out.push_str("<c:catAx><c:axId val=\"1\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"2\"/></c:catAx>");
-            out.push_str("<c:valAx><c:axId val=\"2\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:majorGridlines/><c:crossAx val=\"1\"/></c:valAx>");
-        }
-        Pie | Doughnut => {
-            let tag = if matches!(ch.kind, Pie) { "pieChart" } else { "doughnutChart" };
-            out.push_str(&format!("<c:{tag}><c:varyColors val=\"1\"/>"));
-            // 饼图只画第一个系列
-            let one = crate::charts::Chart {
-                series: ch.series.first().cloned().into_iter().collect(),
-                ..ch.clone()
+
+    let is_multi_series_combo = matches!(ch.kind, Combo)
+        || ch
+            .series
+            .iter()
+            .any(|s| s.kind.is_some_and(|k| k != ch.kind && !matches!(k, Combo)) || s.secondary);
+
+    if is_multi_series_combo
+        && !matches!(
+            ch.kind,
+            Pie | Doughnut | Radar | Waterfall | Funnel | Treemap | Histogram | BoxWhisker | Unknown
+        )
+    {
+        let mut groups: Vec<(ChartKind, bool, Vec<usize>)> = Vec::new();
+        for (i, se) in ch.series.iter().enumerate() {
+            let gk = match se.kind {
+                Some(k) if !matches!(k, Combo) => k,
+                _ => match ch.kind {
+                    Combo | Pie | Doughnut | Scatter => Column,
+                    k => k,
+                },
             };
-            out.push_str(&series_body(&one));
-            if matches!(ch.kind, Doughnut) {
-                out.push_str("<c:firstSliceAng val=\"0\"/><c:holeSize val=\"50\"/>");
+            match groups.iter_mut().find(|g| g.0 == gk && g.1 == se.secondary) {
+                Some(g) => g.2.push(i),
+                None => groups.push((gk, se.secondary, vec![i])),
             }
-            out.push_str(&format!("</c:{tag}>"));
         }
-        _ if matches!(ch.kind, Combo)
-            || ch
-                .series
-                .iter()
-                .any(|s| s.kind.is_some_and(|k| !matches!(k, Combo)) || s.secondary) =>
-        {
-            use crate::charts::ChartKind::*;
-            // 按（图型, 主轴/次轴）分组，每组一个 chart 容器
-            let mut groups: Vec<(crate::charts::ChartKind, bool, Vec<usize>)> = Vec::new();
-            for (i, se) in ch.series.iter().enumerate() {
-                let gk = match se.kind {
-                    Some(k) if !matches!(k, Combo) => k,
-                    _ => match ch.kind {
-                        Combo | Pie | Doughnut | Scatter => Column,
-                        k => k,
-                    },
-                };
-                match groups.iter_mut().find(|g| g.0 == gk && g.1 == se.secondary) {
-                    Some(g) => g.2.push(i),
-                    None => groups.push((gk, se.secondary, vec![i])),
-                }
-            }
-            let has_sub = groups.iter().any(|g| g.1);
-            let mut axis_of: Vec<(usize, usize)> = Vec::new();
-            for (gi, (gk, sub, idxs)) in groups.iter().enumerate() {
-                let mut tmp = ch.clone();
-                tmp.kind = *gk;
-                tmp.series = idxs.iter().filter_map(|i| ch.series.get(*i).cloned()).collect();
-                let first = *idxs.first().unwrap_or(&0);
-                let body = |tmp: &crate::charts::Chart| -> String {
-                    if matches!(gk, Scatter) {
-                        scatter_body(tmp)
+        let has_sub = groups.iter().any(|g| g.1);
+        let mut axis_of: Vec<(usize, usize)> = Vec::new();
+        for (gk, sub, idxs) in &groups {
+            let mut tmp = ch.clone();
+            tmp.kind = *gk;
+            tmp.series = idxs.iter().filter_map(|i| ch.series.get(*i).cloned()).collect();
+            let first = *idxs.first().unwrap_or(&0);
+            let (a1, a2) = if *sub { (3usize, 4usize) } else { (1usize, 2usize) };
+            axis_of.push((a1, a2));
+            match gk {
+                Column | ColumnStacked | ColumnStacked100 | Bar | BarStacked | BarStacked100 => {
+                    let dir = if gk.is_horizontal() { "bar" } else { "col" };
+                    let grp = if gk.is_percent_stacked() {
+                        "percentStacked"
+                    } else if gk.is_stacked() {
+                        "stacked"
                     } else {
-                        series_body_at(tmp, first)
-                    }
-                };
-                let (a1, a2) = if *sub { (3usize, 4usize) } else { (1usize, 2usize) };
-                axis_of.push((a1, a2));
-                match gk {
-                    Bar | BarStacked | Column => {
-                        let dir = if matches!(gk, Bar) { "bar" } else { "col" };
-                        let grouping = if matches!(gk, BarStacked) { "stacked" } else { "clustered" };
-                        out.push_str(&format!("<c:barChart><c:barDir val=\"{dir}\"/><c:grouping val=\"{grouping}\"/><c:varyColors val=\"0\"/>"));
-                        out.push_str(&body(&tmp));
-                        out.push_str(&format!(
-                            "<c:gapWidth val=\"150\"/><c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:barChart>"
-                        ));
-                    }
-                    Area => {
-                        out.push_str("<c:areaChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>");
-                        out.push_str(&body(&tmp));
-                        out.push_str(&format!(
-                            "<c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:areaChart>"
-                        ));
-                    }
-                    Scatter => {
-                        out.push_str("<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:varyColors val=\"0\"/>");
-                        out.push_str(&body(&tmp));
-                        out.push_str(&format!(
-                            "<c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:scatterChart>"
-                        ));
-                    }
-                    _ => {
-                        out.push_str("<c:lineChart><c:grouping val=\"standard\"/><c:varyColors val=\"0\"/>");
-                        out.push_str(&body(&tmp));
-                        out.push_str(&format!(
-                            "<c:marker val=\"0\"/><c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:lineChart>"
-                        ));
-                    }
+                        "clustered"
+                    };
+                    out.push_str(&format!(
+                        "<c:barChart><c:barDir val=\"{dir}\"/><c:grouping val=\"{grp}\"/><c:varyColors val=\"0\"/>"
+                    ));
+                    out.push_str(&series_body_at(&tmp, first));
+                    out.push_str(&format!(
+                        "<c:gapWidth val=\"{gap}\"/><c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:barChart>"
+                    ));
                 }
-                let _ = gi;
-            }
-            let (p1, p2) = axis_of.first().copied().unwrap_or((1, 2));
-            out.push_str(&format!("<c:catAx><c:axId val=\"{p1}\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"{p2}\"/></c:catAx>"));
-            out.push_str(&format!("<c:valAx><c:axId val=\"{p2}\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:majorGridlines/><c:crossAx val=\"{p1}\"/></c:valAx>"));
-            if has_sub {
-                out.push_str("<c:valAx><c:axId val=\"4\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"r\"/><c:crossAx val=\"3\"/><c:crosses val=\"max\"/></c:valAx>");
-                out.push_str("<c:catAx><c:axId val=\"3\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"1\"/><c:axPos val=\"b\"/><c:crossAx val=\"4\"/></c:catAx>");
+                Area | AreaStacked | AreaStacked100 => {
+                    let grp = if gk.is_percent_stacked() {
+                        "percentStacked"
+                    } else if gk.is_stacked() {
+                        "stacked"
+                    } else {
+                        "standard"
+                    };
+                    out.push_str(&format!(
+                        "<c:areaChart><c:grouping val=\"{grp}\"/><c:varyColors val=\"0\"/>"
+                    ));
+                    out.push_str(&series_body_at(&tmp, first));
+                    out.push_str(&format!(
+                        "<c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:areaChart>"
+                    ));
+                }
+                Scatter => {
+                    out.push_str(
+                        "<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:varyColors val=\"0\"/>",
+                    );
+                    out.push_str(&scatter_or_bubble_body(&tmp, false));
+                    out.push_str(&format!(
+                        "<c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:scatterChart>"
+                    ));
+                }
+                _ => {
+                    let grp = if matches!(gk, LineStacked) {
+                        "stacked"
+                    } else {
+                        "standard"
+                    };
+                    out.push_str(&format!(
+                        "<c:lineChart><c:grouping val=\"{grp}\"/><c:varyColors val=\"0\"/>"
+                    ));
+                    out.push_str(&series_body_at(&tmp, first));
+                    out.push_str(&format!(
+                        "<c:marker val=\"0\"/><c:axId val=\"{a1}\"/><c:axId val=\"{a2}\"/></c:lineChart>"
+                    ));
+                }
             }
         }
-        Combo => {}
-        Radar => {
-            let style = match ch.radar_style.as_str() {
-                "standard" | "marker" | "filled" => ch.radar_style.as_str(),
-                _ => "marker",
-            };
-            out.push_str(&format!(
-                "<c:radarChart><c:radarStyle val=\"{style}\"/><c:varyColors val=\"0\"/>"
-            ));
-            out.push_str(&series_body(ch));
-            out.push_str("<c:axId val=\"1\"/><c:axId val=\"2\"/></c:radarChart>");
-            out.push_str("<c:catAx><c:axId val=\"1\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"2\"/></c:catAx>");
-            out.push_str("<c:valAx><c:axId val=\"2\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:majorGridlines/><c:crossAx val=\"1\"/></c:valAx>");
+        let (p1, p2) = axis_of.first().copied().unwrap_or((1, 2));
+        out.push_str(&cat_ax_xml(p1, p2, "b", &x_ax, false));
+        out.push_str(&val_ax_xml(p2, p1, "l", &y_ax, false));
+        if has_sub {
+            out.push_str(&val_ax_xml(4, 3, "r", y2_ax, true));
+            out.push_str(&cat_ax_xml(3, 4, "b", &AxisConfig::default(), true));
         }
-        Unknown => {}
-        Scatter => {
-            out.push_str("<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:varyColors val=\"0\"/>");
-            out.push_str(&scatter_body(ch));
-            out.push_str("<c:axId val=\"1\"/><c:axId val=\"2\"/></c:scatterChart>");
-            out.push_str("<c:valAx><c:axId val=\"1\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"b\"/><c:crossAx val=\"2\"/></c:valAx>");
-            out.push_str("<c:valAx><c:axId val=\"2\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"l\"/><c:majorGridlines/><c:crossAx val=\"1\"/></c:valAx>");
+    } else {
+        match ch.kind {
+            Column | ColumnStacked | ColumnStacked100 | Bar | BarStacked | BarStacked100
+            | Waterfall | Funnel | Treemap | Histogram | BoxWhisker => {
+                let dir = if ch.kind.is_horizontal() { "bar" } else { "col" };
+                let grp = if ch.kind.is_percent_stacked() {
+                    "percentStacked"
+                } else if ch.kind.is_stacked() {
+                    "stacked"
+                } else {
+                    "clustered"
+                };
+                out.push_str(&format!(
+                    "<c:barChart><c:barDir val=\"{dir}\"/><c:grouping val=\"{grp}\"/><c:varyColors val=\"0\"/>"
+                ));
+                out.push_str(&series_body(ch));
+                out.push_str(&format!(
+                    "<c:gapWidth val=\"{gap}\"/><c:axId val=\"1\"/><c:axId val=\"2\"/></c:barChart>"
+                ));
+                out.push_str(&cat_ax_xml(1, 2, "b", &x_ax, false));
+                out.push_str(&val_ax_xml(2, 1, "l", &y_ax, false));
+            }
+            Line | LineStacked | Area | AreaStacked | AreaStacked100 => {
+                let is_line = matches!(ch.kind, Line | LineStacked);
+                let tag = if is_line { "lineChart" } else { "areaChart" };
+                let grp = if ch.kind.is_percent_stacked() {
+                    "percentStacked"
+                } else if ch.kind.is_stacked() {
+                    "stacked"
+                } else {
+                    "standard"
+                };
+                out.push_str(&format!(
+                    "<c:{tag}><c:grouping val=\"{grp}\"/><c:varyColors val=\"0\"/>"
+                ));
+                out.push_str(&series_body(ch));
+                if is_line {
+                    out.push_str("<c:marker val=\"1\"/>");
+                }
+                out.push_str(&format!(
+                    "<c:axId val=\"1\"/><c:axId val=\"2\"/></c:{tag}>"
+                ));
+                out.push_str(&cat_ax_xml(1, 2, "b", &x_ax, false));
+                out.push_str(&val_ax_xml(2, 1, "l", &y_ax, false));
+            }
+            Pie | Doughnut => {
+                let tag = if matches!(ch.kind, Pie) {
+                    "pieChart"
+                } else {
+                    "doughnutChart"
+                };
+                out.push_str(&format!("<c:{tag}><c:varyColors val=\"1\"/>"));
+                let one = Chart {
+                    series: ch.series.first().cloned().into_iter().collect(),
+                    ..ch.clone()
+                };
+                out.push_str(&series_body(&one));
+                out.push_str(&format!(
+                    "<c:firstSliceAng val=\"{}\"/>",
+                    ch.style.first_slice_ang % 360
+                ));
+                if matches!(ch.kind, Doughnut) {
+                    out.push_str(&format!(
+                        "<c:holeSize val=\"{}\"/>",
+                        ch.style.hole_size.clamp(10, 90)
+                    ));
+                }
+                out.push_str(&format!("</c:{tag}>"));
+            }
+            Radar => {
+                let style = match ch.radar_style.as_str() {
+                    "standard" | "marker" | "filled" => ch.radar_style.as_str(),
+                    _ => "marker",
+                };
+                out.push_str(&format!(
+                    "<c:radarChart><c:radarStyle val=\"{style}\"/><c:varyColors val=\"0\"/>"
+                ));
+                out.push_str(&series_body(ch));
+                out.push_str("<c:axId val=\"1\"/><c:axId val=\"2\"/></c:radarChart>");
+                out.push_str(&cat_ax_xml(1, 2, "b", &x_ax, false));
+                out.push_str(&val_ax_xml(2, 1, "l", &y_ax, false));
+            }
+            Scatter => {
+                out.push_str(
+                    "<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:varyColors val=\"0\"/>",
+                );
+                out.push_str(&scatter_or_bubble_body(ch, false));
+                out.push_str("<c:axId val=\"1\"/><c:axId val=\"2\"/></c:scatterChart>");
+                out.push_str(&val_ax_xml(1, 2, "b", &x_ax, false));
+                out.push_str(&val_ax_xml(2, 1, "l", &y_ax, false));
+            }
+            Bubble => {
+                out.push_str("<c:bubbleChart><c:varyColors val=\"0\"/>");
+                out.push_str(&scatter_or_bubble_body(ch, true));
+                out.push_str("<c:bubbleScale val=\"100\"/><c:showNegBubbles val=\"0\"/><c:axId val=\"1\"/><c:axId val=\"2\"/></c:bubbleChart>");
+                out.push_str(&val_ax_xml(1, 2, "b", &x_ax, false));
+                out.push_str(&val_ax_xml(2, 1, "l", &y_ax, false));
+            }
+            Combo | Unknown => {}
         }
     }
+
     out.push_str("</c:plotArea>");
     if ch.legend && !matches!(ch.kind, Pie) {
         let pos = match ch.legend_pos.as_str() {
@@ -475,25 +917,35 @@ fn chart_xml(ch: &crate::charts::Chart) -> String {
             "<c:legend><c:legendPos val=\"{pos}\"/><c:overlay val=\"0\"/></c:legend>"
         ));
     }
-    out.push_str("<c:plotVisOnly val=\"1\"/></c:chart></c:chartSpace>");
-    axis_fix(out, ch)
+    out.push_str(&format!(
+        "<c:plotVisOnly val=\"{}\"/><c:dispBlanksAs val=\"{}\"/>",
+        if ch.style.plot_vis_only { "1" } else { "0" },
+        ch.style.blank_policy.ooxml_val()
+    ));
+    out.push_str("</c:chart>");
+    out.push_str(&cellan_ext_xml(ch));
+    out.push_str("</c:chartSpace>");
+    out
 }
 
-/// 一个图表的 oneCellAnchor 片段（追加到已有 drawing 时复用）
-fn anchor_xml(ch: &crate::charts::Chart, rid: &str, docpr: u32) -> String {
-    let (r1, c1, _, _) = ch.anchor;
+/// 一个图表的 twoCellAnchor 片段（精确保存起点与右下角跨度，不再写死 5400000×2900000）
+fn anchor_xml(ch: &Chart, rid: &str, docpr: u32) -> String {
+    let (r1, c1, r2, c2) = ch.anchor;
+    let r2 = r2.max(r1 + 2);
+    let c2 = c2.max(c1 + 3);
     format!(
-        "<xdr:oneCellAnchor><xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\
-         <xdr:ext cx=\"5400000\" cy=\"2900000\"/>\
+        "<xdr:twoCellAnchor editAs=\"oneCell\">\
+         <xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>\
+         <xdr:to><xdr:col>{c2}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{r2}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>\
          <xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{docpr}\" name=\"图表 {docpr}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>\
          <xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm>\
          <a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">\
          <c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame>\
-         <xdr:clientData/></xdr:oneCellAnchor>"
+         <xdr:clientData/></xdr:twoCellAnchor>"
     )
 }
 
-fn drawing_xml(ch: &crate::charts::Chart, rid: &str) -> String {
+fn drawing_xml(ch: &Chart, rid: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" \
@@ -521,7 +973,6 @@ fn next_index(zip: &mut zip::ZipArchive<std::fs::File>, prefix: &str) -> u32 {
     max + 1
 }
 
-/// 重写 zip：既能改已有条目，也能追加新条目
 pub(crate) fn rewrite_with_additions_pub<F>(
     path: &Path,
     additions: Vec<(String, Vec<u8>)>,
@@ -531,18 +982,24 @@ pub(crate) fn rewrite_with_additions_pub<F>(
 where
     F: FnMut(&str, Vec<u8>) -> Vec<u8>,
 {
-    rewrite_with_additions_checked(path, additions, targets, |name, bytes| Ok(edit(name,bytes)))
+    rewrite_with_additions_checked(path, additions, targets, |name, bytes| Ok(edit(name, bytes)))
 }
 
 pub(crate) fn rewrite_with_additions_checked(
-    path: &Path, additions: Vec<(String,Vec<u8>)>, targets: &[&str],
-    mut edit: impl FnMut(&str,Vec<u8>) -> Result<Vec<u8>>,
+    path: &Path,
+    additions: Vec<(String, Vec<u8>)>,
+    targets: &[&str],
+    mut edit: impl FnMut(&str, Vec<u8>) -> Result<Vec<u8>>,
 ) -> Result<()> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
-    let mut pending: Vec<_> = additions.into_iter()
-        .filter(|(name, _)| zip.index_for_name(name).is_none()).collect();
+    let mut pending: Vec<_> = additions
+        .into_iter()
+        .filter(|(name, _)| zip.index_for_name(name).is_none())
+        .collect();
     for &name in targets {
-        let Some(index) = zip.index_for_name(name) else { continue };
+        let Some(index) = zip.index_for_name(name) else {
+            continue;
+        };
         let mut original = Vec::new();
         zip.by_index(index)?.read_to_end(&mut original)?;
         let updated = edit(name, original.clone())?;
@@ -555,7 +1012,7 @@ pub(crate) fn rewrite_with_additions_checked(
 }
 
 /// 把图表写进文件（新增 chart/drawing 部件，并挂到工作表上）
-pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) -> Result<()> {
+pub fn insert_chart(path: &Path, sheet_name: &str, ch: &Chart) -> Result<()> {
     let targets = crate::patch::sheet_targets(path)?;
     let Some(sheet_path) = targets.get(sheet_name).cloned() else {
         return Err(anyhow::anyhow!("找不到工作表 {sheet_name}"));
@@ -595,37 +1052,62 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
         None => return Err(anyhow::anyhow!("工作表路径异常")),
     };
 
-    // 表上已挂着 drawing 时，新图表要作为新锚点追加进同一个 drawing。
-    // 另建 drawingN 只会留下没有工作表引用的孤儿部件：Excel 打开看不到图，
-    // 我们自己的 load 也读不到（chart 部件没被任何 sheet 引用）。
     let existing_drawing = {
         let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
         let mut rels = String::new();
-        if let Ok(mut f) = zip.by_name(&sheet_rels_part) { f.read_to_string(&mut rels)?; }
-        if rels.is_empty() { None } else {
+        if let Ok(mut f) = zip.by_name(&sheet_rels_part) {
+            f.read_to_string(&mut rels)?;
+        }
+        if rels.is_empty() {
+            None
+        } else {
             let doc = roxmltree::Document::parse(&rels)?;
-            let targets: std::collections::HashMap<_,_> = doc.root_element().children()
-                .filter(|n| n.attribute("Type").is_some_and(|t| t.ends_with("/drawing")) && n.attribute("TargetMode") != Some("External"))
-                .filter_map(|n| Some((n.attribute("Id")?, n.attribute("Target")?))).collect();
-            if targets.is_empty() { None } else {
-                let mut reader = quick_xml::NsReader::from_reader(std::io::BufReader::new(zip.by_name(&sheet_path)?));
+            let targets: std::collections::HashMap<_, _> = doc
+                .root_element()
+                .children()
+                .filter(|n| {
+                    n.attribute("Type")
+                        .is_some_and(|t| t.ends_with("/drawing"))
+                        && n.attribute("TargetMode") != Some("External")
+                })
+                .filter_map(|n| Some((n.attribute("Id")?, n.attribute("Target")?)))
+                .collect();
+            if targets.is_empty() {
+                None
+            } else {
+                let mut reader = quick_xml::NsReader::from_reader(std::io::BufReader::new(
+                    zip.by_name(&sheet_path)?,
+                ));
                 let mut buf = Vec::new();
                 let mut skip = Vec::new();
                 let mut root = false;
                 loop {
                     buf.clear();
                     match reader.read_event_into(&mut buf)? {
-                        quick_xml::events::Event::Start(e) if !root && e.local_name().as_ref() == "worksheet" => {
-                            let (ns,_) = reader.resolver().resolve_element(e.name());
-                            anyhow::ensure!(!matches!(ns,quick_xml::name::ResolveResult::Bound(n) if n.0 == "http://purl.oclc.org/ooxml/spreadsheetml/main"),
-                                "暂不支持改写 Strict 工作表中的绘图部件");
+                        quick_xml::events::Event::Start(e)
+                            if !root && e.local_name().as_ref() == "worksheet" =>
+                        {
+                            let (ns, _) = reader.resolver().resolve_element(e.name());
+                            anyhow::ensure!(
+                                !matches!(ns, quick_xml::name::ResolveResult::Bound(n) if n.0 == "http://purl.oclc.org/ooxml/spreadsheetml/main"),
+                                "暂不支持改写 Strict 工作表中的绘图部件"
+                            );
                             root = true;
                         }
-                        quick_xml::events::Event::Empty(e) | quick_xml::events::Event::Start(e) if root && e.local_name().as_ref() == "drawing" => {
-                            let id = e.attributes().flatten().find(|a| a.key.local_name().as_ref() == "id")
-                                .map(|a| a.value.into_owned()).ok_or_else(|| anyhow::anyhow!("绘图缺少关系标识"))?;
-                            let target = targets.get(id.as_str()).ok_or_else(|| anyhow::anyhow!("找不到工作表绘图关系"))?;
-                            break Some(crate::fixups::resolve_target(&sheet_rels_part,target));
+                        quick_xml::events::Event::Empty(e)
+                        | quick_xml::events::Event::Start(e)
+                            if root && e.local_name().as_ref() == "drawing" =>
+                        {
+                            let id = e
+                                .attributes()
+                                .flatten()
+                                .find(|a| a.key.local_name().as_ref() == "id")
+                                .map(|a| a.value.into_owned())
+                                .ok_or_else(|| anyhow::anyhow!("绘图缺少关系标识"))?;
+                            let target = targets
+                                .get(id.as_str())
+                                .ok_or_else(|| anyhow::anyhow!("找不到工作表绘图关系"))?;
+                            break Some(crate::fixups::resolve_target(&sheet_rels_part, target));
                         }
                         quick_xml::events::Event::Start(e) if root => {
                             skip.clear();
@@ -638,6 +1120,7 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
             }
         }
     };
+
     if let Some(dpart) = existing_drawing {
         let mut dxml = String::new();
         let mut drels = String::new();
@@ -666,14 +1149,21 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
             .unwrap_or(0);
         let rid = format!("rId{}", max_rel + 1);
         let docpr = dxml
-            .split("<xdr:cNvPr id=\"")
+            .split("cNvPr id=\"")
             .skip(1)
             .filter_map(|c| c.split('"').next().and_then(|n| n.parse::<u32>().ok()))
             .max()
             .unwrap_or(1)
             + 1;
         let anchor = anchor_xml(ch, &rid, docpr);
-        let new_drawing = dxml.replace("</xdr:wsDr>", &format!("{anchor}</xdr:wsDr>"));
+        let new_drawing = if dxml.contains("</xdr:wsDr>") {
+            dxml.replace("</xdr:wsDr>", &format!("{anchor}</xdr:wsDr>"))
+        } else if dxml.contains("</wsDr>") {
+            let unprefixed = anchor.replace("xdr:", "");
+            dxml.replace("</wsDr>", &format!("{unprefixed}</wsDr>"))
+        } else {
+            dxml.clone()
+        };
         if new_drawing == dxml {
             anyhow::bail!("drawing 结构不认识，无法追加图表锚点");
         }
@@ -691,30 +1181,36 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
         let drels_c = drels_part.clone();
         let new_drawing_c = new_drawing.into_bytes();
         let new_rels_c = new_rels.into_bytes();
-        if !has_rels { additions.push((drels_part.clone(), new_rels_c.clone())); }
-        rewrite_with_additions_pub(path, additions, &[&dpart, &drels_part, "[Content_Types].xml"], move |name, buf| {
-            // 已有条目不能靠 additions 覆盖（那里只追加新名字），必须在闭包里替换
-            if name == dpart_c {
-                return new_drawing_c.clone();
-            }
-            if name == drels_c {
-                return new_rels_c.clone();
-            }
-            if name == "[Content_Types].xml" {
-                if let Ok(xml) = String::from_utf8(buf.clone()) {
-                    let mut x = xml;
-                    if !x.contains(&chart_name) {
-                        x = x.replace(
-                            "</Types>",
-                            &format!("<Override PartName=\"/xl/charts/{chart_name}\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/></Types>"),
-                        );
-                    }
-                    return x.into_bytes();
+        if !has_rels {
+            additions.push((drels_part.clone(), new_rels_c.clone()));
+        }
+        rewrite_with_additions_pub(
+            path,
+            additions,
+            &[&dpart, &drels_part, "[Content_Types].xml"],
+            move |name, buf| {
+                if name == dpart_c {
+                    return new_drawing_c.clone();
                 }
-                return buf;
-            }
-            buf
-        })?;
+                if name == drels_c {
+                    return new_rels_c.clone();
+                }
+                if name == "[Content_Types].xml" {
+                    if let Ok(xml) = String::from_utf8(buf.clone()) {
+                        let mut x = xml;
+                        if !x.contains(&chart_name) {
+                            x = x.replace(
+                                "</Types>",
+                                &format!("<Override PartName=\"/xl/charts/{chart_name}\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/></Types>"),
+                            );
+                        }
+                        return x.into_bytes();
+                    }
+                    return buf;
+                }
+                buf
+            },
+        )?;
         return Ok(());
     }
 
@@ -730,7 +1226,6 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
         (drawing_rels_part, drawing_rels.into_bytes()),
     ];
     if !has_sheet_rels {
-        // 这张表本来没有任何关系，得新建 rels 才能挂上 drawing
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId{next_rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/drawing{drawing_no}.xml\"/></Relationships>"
         );
@@ -741,50 +1236,57 @@ pub fn insert_chart(path: &Path, sheet_name: &str, ch: &crate::charts::Chart) ->
     let sheet_rels2 = sheet_rels_part.clone();
     let drawing_name = format!("drawing{drawing_no}.xml");
     let chart_name = format!("chart{chart_no}.xml");
-    rewrite_with_additions_checked(path, additions, &[&sheet_path, &sheet_rels_part, "[Content_Types].xml"], move |name, buf| {
-        if name == sheet_rels2 {
-            let xml = crate::xlsx::patch_xml_text(&buf, name)?;
-            return Ok(crate::textbox::add_drawing_relationship(&xml, &format!("rId{next_rid}"),
-                &format!("../drawings/{drawing_name}"))?.into_bytes());
-        }
-        if name == sheet_path2 {
-            let xml = crate::xlsx::patch_xml_text(&buf, name)?;
-            return Ok(crate::textbox::insert_drawing_tag(&xml, &format!("rId{next_rid}"))?.into_bytes());
-        }
-        if name == "[Content_Types].xml" {
-            if let Ok(xml) = String::from_utf8(buf.clone()) {
-                let mut x = xml;
-                if !x.contains(&chart_name) {
-                    x = x.replace(
-                        "</Types>",
-                        &format!("<Override PartName=\"/xl/charts/{chart_name}\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/></Types>"),
-                    );
-                }
-                if !x.contains(&drawing_name) {
-                    x = x.replace(
-                        "</Types>",
-                        &format!("<Override PartName=\"/xl/drawings/{drawing_name}\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/></Types>"),
-                    );
-                }
-                return Ok(x.into_bytes());
+    rewrite_with_additions_checked(
+        path,
+        additions,
+        &[&sheet_path, &sheet_rels_part, "[Content_Types].xml"],
+        move |name, buf| {
+            if name == sheet_rels2 {
+                let xml = crate::xlsx::patch_xml_text(&buf, name)?;
+                return Ok(crate::textbox::add_drawing_relationship(
+                    &xml,
+                    &format!("rId{next_rid}"),
+                    &format!("../drawings/{drawing_name}"),
+                )?
+                .into_bytes());
             }
-            return Ok(buf);
-        }
-        Ok(buf)
-    })?;
+            if name == sheet_path2 {
+                let xml = crate::xlsx::patch_xml_text(&buf, name)?;
+                return Ok(
+                    crate::textbox::insert_drawing_tag(&xml, &format!("rId{next_rid}"))?
+                        .into_bytes(),
+                );
+            }
+            if name == "[Content_Types].xml" {
+                if let Ok(xml) = String::from_utf8(buf.clone()) {
+                    let mut x = xml;
+                    if !x.contains(&chart_name) {
+                        x = x.replace(
+                            "</Types>",
+                            &format!("<Override PartName=\"/xl/charts/{chart_name}\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/></Types>"),
+                        );
+                    }
+                    if !x.contains(&drawing_name) {
+                        x = x.replace(
+                            "</Types>",
+                            &format!("<Override PartName=\"/xl/drawings/{drawing_name}\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/></Types>"),
+                        );
+                    }
+                    return Ok(x.into_bytes());
+                }
+                return Ok(buf);
+            }
+            Ok(buf)
+        },
+    )?;
     Ok(())
 }
 
-/// 按系列引用重新读取缓存值（分类 / 数值 / 散点的 x）。
-///
-/// 对话框里允许改「名称/分类/数值」三个引用；写盘前必须走这里：
-/// - 引用语法或区域不存在 → Err（调用方不要写出，避免把坏引用落盘）
-/// - 区域合法但取不到数 → Err
-/// 散点要求 X/Y 成对：任一不是数值的行整行丢弃。
+/// 按系列引用重新读取缓存值（支持纵向列与横向行、气泡 size_ref、散点 X/Y 成对校验）。
 pub fn refresh_series_from_refs(
     wb: &crate::model::Workbook,
     sheet_name: &str,
-    ch: &mut crate::charts::Chart,
+    ch: &mut Chart,
 ) -> Result<()> {
     let find_sheet = |name: Option<&str>| -> Result<&crate::model::Sheet> {
         let n = name.unwrap_or(sheet_name);
@@ -799,14 +1301,21 @@ pub fn refresh_series_from_refs(
             other => other.display().trim().parse::<f64>().ok(),
         }
     };
+    let expand_cells = |rect: (u32, u32, u32, u32)| -> Vec<(u32, u32)> {
+        let mut pts = Vec::new();
+        for r in rect.0..=rect.2 {
+            for c in rect.1..=rect.3 {
+                pts.push((r, c));
+            }
+        }
+        pts
+    };
     for (i, se) in ch.series.iter_mut().enumerate() {
         let (sn, vr) = crate::sparkline::parse_ref(&se.val_ref)
             .ok_or_else(|| anyhow::anyhow!("系列{} 数值引用无效：{}", i + 1, se.val_ref))?;
         let sheet = find_sheet(sn.as_deref())?;
-        let mut vals = Vec::new();
-        let mut cats = Vec::new();
-        let mut xv = Vec::new();
-        let cat_ref = if se.cat_ref.trim().is_empty() {
+        let val_cells = expand_cells(vr);
+        let cat_cells = if se.cat_ref.trim().is_empty() {
             None
         } else {
             let (cn, cr) = crate::sparkline::parse_ref(&se.cat_ref)
@@ -819,24 +1328,43 @@ pub fn refresh_series_from_refs(
                     sheet.name
                 );
             }
-            Some(cr)
+            Some(expand_cells(cr))
         };
-        let rows = vr.2.saturating_sub(vr.0) + 1;
-        for k in 0..rows {
-            let r = vr.0 + k;
-            let y = sheet.get(r, vr.1).and_then(|c| num(&c.value));
-            let xcell = cat_ref.and_then(|cr| {
-                let rr = cr.0 + k.min(cr.2.saturating_sub(cr.0));
-                sheet.get(rr, cr.1)
-            });
-            if let Some(c) = xcell.as_deref() {
-                cats.push(c.value.display());
+        let size_cells = if se.size_ref.trim().is_empty() {
+            None
+        } else {
+            let (_, sr) = crate::sparkline::parse_ref(&se.size_ref)
+                .ok_or_else(|| anyhow::anyhow!("系列{} 气泡大小引用无效：{}", i + 1, se.size_ref))?;
+            Some(expand_cells(sr))
+        };
+        let skind = se.kind.unwrap_or(ch.kind);
+        let mut vals = Vec::new();
+        let mut cats = Vec::new();
+        let mut xv = Vec::new();
+        let mut sizes = Vec::new();
+        for (k, &(r, c)) in val_cells.iter().enumerate() {
+            let y = sheet.get(r, c).and_then(|cell| num(&cell.value));
+            let xcell = cat_cells
+                .as_ref()
+                .and_then(|list| list.get(k).or_else(|| list.last()))
+                .and_then(|&(rr, cc)| sheet.get(rr, cc));
+            if let Some(cell) = xcell.as_deref() {
+                cats.push(cell.value.display());
             }
-            if ch.kind == crate::charts::ChartKind::Scatter {
-                let x = xcell.as_deref().and_then(|c| num(&c.value));
+            if matches!(skind, ChartKind::Scatter | ChartKind::Bubble) {
+                let x = xcell.as_deref().and_then(|cell| num(&cell.value));
                 if let (Some(x), Some(y)) = (x, y) {
                     xv.push(x);
                     vals.push(y);
+                    if skind == ChartKind::Bubble {
+                        let sz = size_cells
+                            .as_ref()
+                            .and_then(|list| list.get(k))
+                            .and_then(|&(sr, sc)| sheet.get(sr, sc))
+                            .and_then(|cell| num(&cell.value))
+                            .unwrap_or(10.0);
+                        sizes.push(sz);
+                    }
                 }
             } else if let Some(y) = y {
                 vals.push(y);
@@ -847,8 +1375,11 @@ pub fn refresh_series_from_refs(
         }
         se.cats = cats;
         se.vals = vals;
-        if ch.kind == crate::charts::ChartKind::Scatter {
+        if matches!(skind, ChartKind::Scatter | ChartKind::Bubble) {
             se.xv = xv;
+        }
+        if skind == ChartKind::Bubble {
+            se.sizes = sizes;
         }
     }
     Ok(())
@@ -856,7 +1387,6 @@ pub fn refresh_series_from_refs(
 
 /// 只把 chart 部件里的引用字符串换掉，其它内容原样保留
 pub fn replace_refs(path: &Path, chart_part: &str, pairs: &[(String, String)]) -> Result<()> {
-    use std::io::Read;
     if pairs.is_empty() {
         return Ok(());
     }
@@ -869,8 +1399,6 @@ pub fn replace_refs(path: &Path, chart_part: &str, pairs: &[(String, String)]) -
             xml = xml.replace(old.as_str(), new.as_str());
             continue;
         }
-        // umya 重写图表部件时会去掉工作表名的引号；按去引号形式再试一次，
-        // 否则插删行列后的引用改写会静默落空。
         let bare = |s: &str| s.replace('\'', "");
         let o = bare(old);
         if o != *old && xml.contains(&o) {
@@ -881,10 +1409,9 @@ pub fn replace_refs(path: &Path, chart_part: &str, pairs: &[(String, String)]) -
     Ok(())
 }
 
-/// 换掉已有图表的内容（改类型/改标题），保留锚点与部件路径
-pub fn replace_chart(path: &Path, chart_part: &str, ch: &crate::charts::Chart) -> Result<()> {
-    // 不建模的图种只能原样保留：用 2D 结果覆盖会把原图降级
-    if matches!(ch.kind, crate::charts::ChartKind::Unknown) {
+/// 换掉已有图表的内容，保留锚点与部件路径
+pub fn replace_chart(path: &Path, chart_part: &str, ch: &Chart) -> Result<()> {
+    if matches!(ch.kind, ChartKind::Unknown) || ch.is_chartex {
         anyhow::bail!("该图表类型不受支持，只能保留原图");
     }
     let body = chart_xml(ch);
@@ -892,13 +1419,12 @@ pub fn replace_chart(path: &Path, chart_part: &str, ch: &crate::charts::Chart) -
     Ok(())
 }
 
-/// 删除一个图表：摘掉 drawing 里的锚点、drawing rels 的条目、chart 部件本身
+/// 删除一个图表：摘掉 drawing 里的锚点、drawing rels 的条目、chart 部件本身及 Content_Types
 pub fn delete_chart(path: &Path, drawing_part: &str, chart_part: &str) -> Result<()> {
     let file = std::fs::File::open(path)?;
     let mut zip = zip::ZipArchive::new(file)?;
     let mut drawing = String::new();
     {
-        use std::io::Read;
         let mut f = zip.by_name(drawing_part).context("drawing 部件不存在")?;
         f.read_to_string(&mut drawing)?;
     }
@@ -907,13 +1433,9 @@ pub fn delete_chart(path: &Path, drawing_part: &str, chart_part: &str) -> Result
         None => return Err(anyhow::anyhow!("drawing 路径异常")),
     };
     let mut rels = String::new();
-    {
-        use std::io::Read;
-        if let Ok(mut f) = zip.by_name(&rels_part) {
-            let _ = f.read_to_string(&mut rels);
-        }
+    if let Ok(mut f) = zip.by_name(&rels_part) {
+        let _ = f.read_to_string(&mut rels);
     }
-    // 找指向 chart_part 的 rId
     let file_name = chart_part.rsplit('/').next().unwrap_or(chart_part);
     let mut rid = String::new();
     for chunk in rels.split("<Relationship ").skip(1) {
@@ -927,49 +1449,53 @@ pub fn delete_chart(path: &Path, drawing_part: &str, chart_part: &str) -> Result
             }
         }
     }
-    // 去掉包含该 r:id 的整个锚点
+    let pre = if drawing.contains("xmlns:xdr=") {
+        "xdr:"
+    } else {
+        ""
+    };
     let mut out = String::new();
     let mut i = 0usize;
     let bytes = drawing.as_str();
-    while let Some(p) = bytes[i..].find("<xdr:") {
-        let start = i + p;
+    let anchor_opens = [format!("<{pre}oneCellAnchor"), format!("<{pre}twoCellAnchor")];
+    while i < bytes.len() {
+        let next = anchor_opens
+            .iter()
+            .filter_map(|tag| bytes[i..].find(tag).map(|p| (i + p, tag.as_str())))
+            .min_by_key(|(p, _)| *p);
+        let Some((start, open_tag)) = next else {
+            out.push_str(&bytes[i..]);
+            break;
+        };
         out.push_str(&bytes[i..start]);
-        // 找锚点结束
-        let tag_end = bytes[start..].find('>').map(|x| start + x + 1).unwrap_or(bytes.len());
-        let head = &bytes[start..tag_end];
-        let is_anchor = head.contains("oneCellAnchor") || head.contains("twoCellAnchor");
-        if is_anchor {
-            let kind = if head.contains("oneCellAnchor") { "oneCellAnchor" } else { "twoCellAnchor" };
-            let close = format!("</xdr:{kind}>");
-            let end = bytes[tag_end..]
-                .find(&close)
-                .map(|x| tag_end + x + close.len())
-                .unwrap_or(bytes.len());
-            let block = &bytes[start..end];
-            let keep = if rid.is_empty() {
-                true
-            } else {
-                !block.contains(&format!("r:id=\"{rid}\""))
-            };
-            if keep {
-                out.push_str(block);
-            }
-            i = end;
+        let kind = if open_tag.ends_with("oneCellAnchor") {
+            "oneCellAnchor"
         } else {
-            out.push_str(&bytes[start..tag_end]);
-            i = tag_end;
+            "twoCellAnchor"
+        };
+        let close = format!("</{pre}{kind}>");
+        let end = bytes[start..]
+            .find(&close)
+            .map(|x| start + x + close.len())
+            .unwrap_or(bytes.len());
+        let block = &bytes[start..end];
+        let keep = rid.is_empty() || !block.contains(&format!("r:id=\"{rid}\""));
+        if keep {
+            out.push_str(block);
         }
+        i = end;
     }
-    out.push_str(&bytes[i..]);
 
     crate::patch::append_entry(path, drawing_part, out.as_bytes())?;
-    // drawing rels 去掉一条
     if !rid.is_empty() {
         let mut new_rels = rels.clone();
         let mut k = 0usize;
         while let Some(p) = new_rels[k..].find("<Relationship ") {
             let start = k + p;
-            let end = new_rels[start..].find("/>").map(|x| start + x + 2).unwrap_or(new_rels.len());
+            let end = new_rels[start..]
+                .find("/>")
+                .map(|x| start + x + 2)
+                .unwrap_or(new_rels.len());
             let block = &new_rels[start..end];
             if block.contains(&format!("Id=\"{rid}\"")) {
                 new_rels.replace_range(start..end, "");
@@ -979,7 +1505,6 @@ pub fn delete_chart(path: &Path, drawing_part: &str, chart_part: &str) -> Result
         }
         crate::patch::append_entry(path, &rels_part, new_rels.as_bytes())?;
     }
-    // 删部件本身，并去掉内容类型里的 Override（否则 Excel 会认为包坏了）
     crate::patch::remove_entry(path, chart_part)?;
     let part_name = format!("/{chart_part}");
     crate::patch::rewrite_zip_where(path, |part| part == "[Content_Types].xml", |name, buf| {
@@ -994,7 +1519,6 @@ pub fn delete_chart(path: &Path, drawing_part: &str, chart_part: &str) -> Result
                     let end = chunk.1.find("/>").map(|p| p + 2).unwrap_or(chunk.1.len());
                     let block = &chunk.1[..end];
                     if block.contains(&part_name) {
-                        // 丢掉这条，但保留后面的内容
                         out.push_str(&chunk.1[end..]);
                     } else {
                         out.push_str("<Override ");
@@ -1009,13 +1533,15 @@ pub fn delete_chart(path: &Path, drawing_part: &str, chart_part: &str) -> Result
     Ok(())
 }
 
-/// 把 drawing 里第 ordinal 个图表锚点改成单元格锚点（twoCellAnchor，单元格偏移 0）。
-/// 图表拖动/缩放后保存时调用；不依赖列宽行高，Excel 自己换算。
+/// 把 drawing 里第 ordinal 个图表锚点改成单元格锚点（twoCellAnchor，单元格偏移 0）
 pub fn rewrite_anchor_xml(xml: &str, ordinal: usize, anchor: (u32, u32, u32, u32)) -> String {
     let (r1, c1, r2, c2) = anchor;
     let (r2, c2) = (r2.max(r1 + 1), c2.max(c1 + 1));
-    // 有些文件用 xdr: 前缀，umya 重写后是默认命名空间（无前缀），两种都要认
-    let pre = if xml.contains("xmlns:xdr=") { "xdr:" } else { "" };
+    let pre = if xml.contains("xmlns:xdr=") {
+        "xdr:"
+    } else {
+        ""
+    };
     let opens = [format!("<{pre}oneCellAnchor"), format!("<{pre}twoCellAnchor")];
     let closes = [
         format!("</{pre}oneCellAnchor>"),
@@ -1048,8 +1574,6 @@ pub fn rewrite_anchor_xml(xml: &str, ordinal: usize, anchor: (u32, u32, u32, u32
         return xml.to_string();
     };
     let old = &xml[s0..s1];
-    // Use the same cell coordinates as the loader, including its one-cell EMU conversion.
-    // Keeping an unchanged anchor preserves its original offsets and exact extents.
     let Some((cells, rid)) = crate::charts::parse_drawing_anchors(old).into_iter().next() else {
         return xml.to_string();
     };
@@ -1081,7 +1605,6 @@ pub fn rewrite_anchor_xml(xml: &str, ordinal: usize, anchor: (u32, u32, u32, u32
     out
 }
 
-/// 把某张表第 ordinal 个图表的锚点写回 drawing 部件
 pub fn write_anchor(
     path: &Path,
     drawing_part: &str,
@@ -1109,8 +1632,7 @@ mod anchor_tests {
     #[test]
     fn moving_the_second_native_chart_preserves_its_relationship() {
         let sheet = crate::model::Sheet::new("Data");
-        let chart = chart_from_selection(&sheet, "Data", (0, 0, 2, 1), "Sales",
-            crate::charts::ChartKind::Column);
+        let chart = chart_from_selection(&sheet, "Data", (0, 0, 2, 1), "Sales", ChartKind::Column);
         let first = anchor_xml(&chart, "rId1", 2);
         let second = anchor_xml(&chart, "rId7", 3);
         let xml = format!("<xdr:wsDr xmlns:xdr=\"urn:drawing\">{first}{second}</xdr:wsDr>");

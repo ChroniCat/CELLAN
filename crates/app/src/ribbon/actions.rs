@@ -184,13 +184,18 @@ impl SheetApp {
                 st.swatch = Some(egui::Color32::from_rgb(c[0], c[1], c[2]));
             }
             "NumberFormat" => st.text = Some(fmt_label(&cur.format).to_string()),
-            "PrintGridlines" => st.checked = self.wb.sheet(self.sheet_idx).page.gridlines,
-            "PrintHeadings" => st.checked = self.wb.sheet(self.sheet_idx).page.headings,
-            "ShowGridlines" => st.checked = self.show_gridlines,
-            "ShowHeadings" => st.checked = self.show_headings,
+            "PrintGridlines" | "PrintGridlinesToggle" | "PrintPrintGridlines" => {
+                st.checked = self.wb.sheet(self.sheet_idx).page.gridlines;
+            }
+            "PrintHeadings" | "PrintHeadingsToggle" => {
+                st.checked = self.wb.sheet(self.sheet_idx).page.headings;
+            }
+            "ShowGridlines" | "ViewGridlines" => st.checked = self.show_gridlines,
+            "ShowHeadings" | "ViewHeadings" => st.checked = self.show_headings,
             "ShowFormulaBar" => st.checked = self.show_formula_bar,
             "TextSpill" => st.checked = self.text_spill,
             "ShowFormulas" => st.checked = self.show_formulas,
+            "ShowAllComments" => st.checked = self.show_all_comments,
             "DataFilter" => {
                 st.checked = self.wb.sheet(self.sheet_idx).filter.is_some();
                 if st.checked {
@@ -217,9 +222,9 @@ impl SheetApp {
                 st.label = Some(if on { "撤销保护" } else { "保护工作表" }.into());
             }
             "FileShare" | "ReviewShare" | "JoinAddress" | "RoomPassword" | "JoinRoom"
-            | "AutoShare" => {
+            | "AutoShare" | "AutoAutoShare" => {
                 st.visible = self.net.is_none();
-                if id == "AutoShare" {
+                if id == "AutoShare" || id == "AutoAutoShare" {
                     st.checked = self.auto_share;
                 }
             }
@@ -293,17 +298,37 @@ impl SheetApp {
             }
             "ChartTitle" => {
                 if let Some(ch) = self.chart_at_sel() {
-                    st.text = Some(ch.title.clone());
+                    st.text = Some(if ch.title.is_empty() {
+                        ch.kind.label().to_string()
+                    } else {
+                        ch.title.clone()
+                    });
                 } else {
                     st.visible = false;
                 }
             }
             "ChartMeta" => {
                 if let Some(ch) = self.chart_at_sel() {
-                    st.text = Some(format!("{:?} · {} 个系列", ch.kind, ch.series.len()));
+                    st.text = Some(format!(
+                        "{} · {} · {} 系列",
+                        ch.kind.label(),
+                        ch.style.theme.label(),
+                        ch.series.len()
+                    ));
                 } else {
                     st.visible = false;
                 }
+            }
+            "ChartStudioToggle" => {
+                st.checked = self.chart_studio.sidebar_open && self.chart_at_sel().is_some();
+            }
+            "ChartToggleLabels" => {
+                st.checked = self.chart_at_sel().is_some_and(|c| c.show_labels);
+            }
+            "ChartToggleTrendline" => {
+                st.checked = self
+                    .chart_at_sel()
+                    .is_some_and(|c| c.series.iter().any(|s| !s.trendlines.is_empty()));
             }
             "SparkTypeLine" => {
                 if let Some(sp) = self.spark_at_sel() {
@@ -436,6 +461,13 @@ impl SheetApp {
                     st.visible = false;
                 }
             }
+            "TableStyleChip" => {
+                if let Some(t) = self.table_at_sel() {
+                    st.text = Some(t.style_name.clone());
+                } else {
+                    st.visible = false;
+                }
+            }
             _ => {}
         }
         if crate::debug_flags::ribbon_state_matches(id) {
@@ -463,14 +495,9 @@ impl SheetApp {
         if let Some(name) = action.strip_prefix("InsertFn:") {
             let name = name.to_string();
             if self.editing.is_none() {
-                self.begin_edit(None);
-            }
-            if let Some(ed) = self.editing.as_mut() {
-                if !ed.buf.starts_with('=') {
-                    ed.buf.insert(0, '=');
-                }
-                ed.buf.push_str(&name);
-                ed.buf.push('(');
+                self.begin_edit(Some(format!("={name}(")));
+            } else {
+                self.insert_formula_at_caret(&format!("{name}("));
             }
             return;
         }
@@ -523,6 +550,8 @@ impl SheetApp {
                 self.print_preview = true;
             }
             "ExportPdf" => self.export_pdf_dialog(),
+            "ExportWorkbookPdf" => self.export_workbook_pdf_dialog(),
+            "ExportCsv" => self.csv_export_dlg = Some(crate::CsvExportDlg::default()),
             "Undo" => self.do_undo(false),
             "Redo" => self.do_undo(true),
             "NewTab" => self.open_in_new_tab(std::path::PathBuf::new()),
@@ -586,6 +615,9 @@ impl SheetApp {
                     return;
                 }
                 let mut styles = Vec::with_capacity((r2 - r1 + 1) as usize);
+                let mut merges = Vec::new();
+                let mut cf_blocks = Vec::new();
+                let mut cf_dxfs = Vec::new();
                 {
                     let sheet = self.wb.sheet(self.sheet_idx);
                     for r in r1..=r2 {
@@ -595,12 +627,41 @@ impl SheetApp {
                         }
                         styles.push(row);
                     }
+                    for &(mr1, mc1, mr2, mc2) in sheet.merges.iter() {
+                        if mr1 >= r1 && mc1 >= c1 && mr2 <= r2 && mc2 <= c2 {
+                            merges.push((mr1 - r1, mc1 - c1, mr2 - r1, mc2 - c1));
+                        }
+                    }
+                    for blk in &sheet.cf.blocks {
+                        let mut rel_ranges = Vec::new();
+                        for &(cr1, cc1, cr2, cc2) in &blk.ranges {
+                            let ir1 = cr1.max(r1);
+                            let ic1 = cc1.max(c1);
+                            let ir2 = cr2.min(r2);
+                            let ic2 = cc2.min(c2);
+                            if ir1 <= ir2 && ic1 <= ic2 {
+                                rel_ranges.push((ir1 - r1, ic1 - c1, ir2 - r1, ic2 - c1));
+                            }
+                        }
+                        if !rel_ranges.is_empty() {
+                            cf_blocks.push(sheetcore::cf::CfBlock {
+                                ranges: rel_ranges,
+                                rules: blk.rules.clone(),
+                            });
+                        }
+                    }
+                    if !cf_blocks.is_empty() {
+                        cf_dxfs = sheet.cf.dxfs.clone();
+                    }
                 }
                 let continuous = self.painter_double;
                 self.painter_double = false;
                 self.format_painter = Some(FormatPainter {
                     rect: (r1, c1, r2, c2),
                     styles,
+                    merges,
+                    cf_blocks,
+                    cf_dxfs,
                     continuous,
                     wb_epoch: self.wb_epoch,
                     sheet: self.sheet_idx,
@@ -611,12 +672,12 @@ impl SheetApp {
                     "格式刷：选择目标区域".into()
                 };
             }
-            "GrowFont" => {
+            "GrowFont" | "FontGrow" => {
                 let cur = self.current_style();
                 let s2 = (cur.size + 1.0).min(72.0);
                 self.apply_style(move |s| s.size = s2);
             }
-            "ShrinkFont" => {
+            "ShrinkFont" | "FontShrink" => {
                 let cur = self.current_style();
                 let s2 = (cur.size - 1.0).max(6.0);
                 self.apply_style(move |s| s.size = s2);
@@ -741,6 +802,11 @@ impl SheetApp {
                 self.set_repeat_action(crate::RepeatAction::RibbonCmd("CenterAcross".into()));
             }
             "NumberFormatApply" => {}
+            "NumberFormat:General" => {
+                self.apply_style(|s| s.format.clear());
+                self.set_repeat_action(crate::RepeatAction::NumberFormat(String::new()));
+                self.status = "已应用常规数字格式".into();
+            }
             "CurrencyStyle" => {
                 self.apply_style(|s| s.format = "¥#,##0.00".into());
                 self.set_repeat_action(crate::RepeatAction::RibbonCmd("CurrencyStyle".into()));
@@ -763,9 +829,9 @@ impl SheetApp {
             }
             "ConditionalFormatting" => self.cf_mgr = true,
             "FormatAsTable" => self.make_table(),
-            "CellStyles" => self.fmt_dlg = true,
+            "CellStyles" => self.open_format_dialog(),
             "FormatDialogLauncher" => self.fmt_pending = true,
-            "FormatCellsDialog" => self.fmt_dlg = true,
+            "FormatCellsDialog" => self.open_format_dialog(),
             "InsertRow" => {
                 let (r1, _c1, r2, _c2) = self.sel_rect();
                 self.structural(sheetcore::structural::Structural::InsertRows {
@@ -850,24 +916,32 @@ impl SheetApp {
             "SelectDataValidation" => self.select_special(crate::wps_menus::SpecialTarget::DataValidation),
 
             // ---------------------------------------------------- 插入
-            "Hyperlink" => {
-                let (r, c) = self.sel;
-                let text = self.wb.sheet(self.sheet_idx).value(r, c).display();
-                self.hyper_dlg = Some((String::new(), text));
-            }
-            "ColumnChart" => self.insert_chart_from_selection(),
+            "Hyperlink" => self.open_hyperlink_dialog(),
+            "ChartWizard" | "ColumnChart" => self.insert_chart_from_selection(),
+            "ColumnClusteredChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Column),
+            "ColumnStackedChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::ColumnStacked),
+            "ColumnStacked100Chart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::ColumnStacked100),
             "LineChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Line),
+            "LineStackedChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::LineStacked),
             "PieChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Pie),
             "BarChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Bar),
             "BarStackedChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::BarStacked),
+            "BarStacked100Chart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::BarStacked100),
             "AreaChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Area),
+            "AreaStackedChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::AreaStacked),
+            "AreaStacked100Chart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::AreaStacked100),
             "DoughnutChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Doughnut),
             "ScatterChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Scatter),
+            "BubbleChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Bubble),
             "RadarChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Radar),
             "ComboChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Combo),
+            "WaterfallChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Waterfall),
+            "FunnelChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Funnel),
+            "TreemapChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Treemap),
+            "HistogramChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Histogram),
+            "BoxWhiskerChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::BoxWhisker),
             "ChartManager" => {
                 self.chart_mgr = true;
-                self.reload_charts();
             }
             "InsertPivot" => self.open_pivot_create_wizard(None),
             "InsertPicture" => {
@@ -973,6 +1047,9 @@ impl SheetApp {
             "FilterReapply" => {
                 self.reapply_filter();
             }
+            "FilterAdvanced" => {
+                self.open_adv_filter_dialog();
+            }
             "HeaderFooter" => self.hf_dlg = true,
             // ---------------------------------------------------- 文本框
             "InsertTextBox" => {
@@ -982,6 +1059,27 @@ impl SheetApp {
                 let x = cols.pos(c) + 4.0;
                 let y = rows.pos(r) + 2.0;
                 self.tb_create(x, y, 200.0, 60.0);
+                if let Some(i) = self.tb_sel {
+                    self.tb_open_edit(i);
+                }
+            }
+            a if a.starts_with("InsertShape:") => {
+                let tag = &a["InsertShape:".len()..];
+                let kind = match tag {
+                    "Rect" => sheetcore::textbox::ShapeKind::Rect,
+                    "RoundedRect" => sheetcore::textbox::ShapeKind::RoundedRect,
+                    "RightArrow" => sheetcore::textbox::ShapeKind::RightArrow,
+                    "Line" => sheetcore::textbox::ShapeKind::Line,
+                    "Ellipse" => sheetcore::textbox::ShapeKind::Ellipse,
+                    "Diamond" => sheetcore::textbox::ShapeKind::Diamond,
+                    "Callout" => sheetcore::textbox::ShapeKind::Callout,
+                    _ => sheetcore::textbox::ShapeKind::TextBox,
+                };
+                let (r, c) = self.sel;
+                let (cols, rows) = self.view_axes();
+                let x = cols.pos(c) + 4.0;
+                let y = rows.pos(r) + 2.0;
+                self.tb_create_kind(x, y, 160.0, 64.0, kind);
                 if let Some(i) = self.tb_sel {
                     self.tb_open_edit(i);
                 }
@@ -1058,6 +1156,8 @@ impl SheetApp {
             "GroupSelection" => self.group_selection(),
             "UngroupSelection" => self.ungroup_selection(),
             "OutlineSettings" => self.outline_set_dlg = true,
+            "OutlineAuto" => self.auto_outline(),
+            "OutlineClear" => self.clear_outline(),
             "HideDetail" => self.toggle_detail(true),
             "ShowDetail" => self.toggle_detail(false),
             "ImportCsv" => self.import_csv(),
@@ -1100,6 +1200,8 @@ impl SheetApp {
                 self.fc_dlg = Some(crate::ForecastDlg {
                     range,
                     periods: 6,
+                    season_len: 0,
+                    confidence: 95,
                     msg: String::new(),
                 });
             }
@@ -1121,24 +1223,13 @@ impl SheetApp {
                     } else {
                         String::new()
                     },
+                    replace_existing: true,
+                    page_break_between_groups: false,
                     msg: String::new(),
                 });
             }
             "FlashFill" => {
-                let (r1, c1, mut r2, mut c2) = self.sel_rect();
-                if (r2 - r1 + 1) as u64 > 200_000 {
-                    if let Some((_, _, ur2, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
-                        r2 = r2.min(ur2.max(r1));
-                        c2 = c2.min(uc2.max(c1));
-                    }
-                }
-                self.ff_dlg = Some(crate::FlashDlg {
-                    range: format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2)),
-                    src_col: col_label(c1),
-                    dst_col: col_label(c1 + 1),
-                    aux_col: if c2 > c1 + 1 { col_label(c2) } else { String::new() },
-                    msg: String::new(),
-                });
+                self.flash_fill_instant_or_dialog();
             }
             "Consolidate" => {
                 self.cs_dlg = Some(crate::ConsDlg {
@@ -1187,16 +1278,7 @@ impl SheetApp {
                     size: 0.0,
                 });
             }
-            "ProtectSheet" => {
-                if self.wb.sheet(self.sheet_idx).protection.is_some() {
-                    self.protect_dlg = Some(crate::ProtectDlg {
-                        unprotect: true,
-                        ..Default::default()
-                    });
-                } else {
-                    self.protect_dlg = Some(crate::ProtectDlg::default());
-                }
-            }
+            "ProtectSheet" => self.open_protect_sheet_dialog(),
             "TrackChanges" => self.rev_open = true,
             // 审阅：显示更改（复用修订日志）、批注导航、辅助功能检查器
             "ShowChanges" => {
@@ -1228,6 +1310,14 @@ impl SheetApp {
             "PrevComment" => self.note_step(false),
             "NextComment" => self.note_step(true),
             "ShowComment" => self.note_show(),
+            "ShowAllComments" => {
+                self.show_all_comments = !self.show_all_comments;
+                self.status = if self.show_all_comments {
+                    "已显示当前工作表的全部批注".into()
+                } else {
+                    "已隐藏全部批注（悬停或选中单元格时自动展开）".into()
+                };
+            }
             "A11yChecker" => {
                 self.a11y_scan();
                 self.a11y_open = true;
@@ -1235,8 +1325,20 @@ impl SheetApp {
             "AutoShare" => self.auto_share = !self.auto_share,
 
             // ---------------------------------------------------- 视图
-            "ShowGridlines" => self.show_gridlines = !self.show_gridlines,
-            "ShowHeadings" => self.show_headings = !self.show_headings,
+            "ShowGridlines" => {
+                self.show_gridlines = !self.show_gridlines;
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.show_gridlines = self.show_gridlines;
+                sh.view_dirty = true;
+                self.wb.dirty = true;
+            }
+            "ShowHeadings" => {
+                self.show_headings = !self.show_headings;
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.show_headings = self.show_headings;
+                sh.view_dirty = true;
+                self.wb.dirty = true;
+            }
             "ShowFormulaBar" => self.show_formula_bar = !self.show_formula_bar,
             "TextSpill" => self.text_spill = !self.text_spill,
             "Zoom100" => self.set_zoom(1.0),
@@ -1367,16 +1469,35 @@ impl SheetApp {
                 self.wb.dirty = true;
                 self.status = format!("已删除第 {} 行、第 {} 列的分页符", r + 1, c + 1);
             }
+            "PageBreakResetAll" => {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.page.row_breaks.clear();
+                sh.page.col_breaks.clear();
+                sh.page_dirty = true;
+                self.wb.dirty = true;
+                self.status = "已重置当前工作表的所有手动分页符".into();
+            }
             "ZoomToSelection" => {
                 let (r1, c1, r2, c2) = self.sel_rect();
-                let sh = self.wb.sheet(self.sheet_idx);
-                let w: f32 = sh.cols.pos(c2.saturating_add(1)) - sh.cols.pos(c1);
-                let h: f32 = sh.rows.pos(r2.saturating_add(1)) - sh.rows.pos(r1);
+                let (cur_cols, cur_rows) = self.view_axes();
+                let cur_z = self.zoom.clamp(0.1, 4.0);
+                // 还原为 100% 真实可见尺寸（已自动跳过隐藏行列）
+                let w = ((cur_cols.pos(c2.saturating_add(1)) - cur_cols.pos(c1)) / cur_z).max(0.0);
+                let h = ((cur_rows.pos(r2.saturating_add(1)) - cur_rows.pos(r1)) / cur_z).max(0.0);
+                let x0_unscaled = (cur_cols.pos(c1) / cur_z).max(0.0);
+                let y0_unscaled = (cur_rows.pos(r1) / cur_z).max(0.0);
                 let view = self.last_view;
-                if w > 1.0 && h > 1.0 && view.x > 10.0 && view.y > 10.0 {
-                    let z = ((view.x - 40.0) / w).min((view.y - 40.0) / h).clamp(0.5, 2.5);
+                if w > 1.0 && h > 1.0 && view.x > 60.0 && view.y > 40.0 {
+                    let z = (((view.x - 52.0) / w).min((view.y - 32.0) / h)).clamp(0.1, 4.0);
                     self.set_zoom(z);
-                    self.scroll = egui::Vec2::new(c1 as f32 * 8.0, r1 as f32 * 4.0);
+                    let (fy, fx) = self.wb.sheet(self.sheet_idx).freeze.unwrap_or((0, 0));
+                    let (new_cols, new_rows) = self.view_axes();
+                    let fw = new_cols.pos(fx.min(16_383));
+                    let fh = new_rows.pos(fy.min(1_048_575));
+                    self.scroll = egui::Vec2::new(
+                        (x0_unscaled * z - fw).max(0.0),
+                        (y0_unscaled * z - fh).max(0.0),
+                    );
                     self.status = format!("缩放到选定区域：{:.0}%", z * 100.0);
                 }
             }
@@ -1438,13 +1559,36 @@ impl SheetApp {
                     self.toggle_totals_row(&t.name);
                 }
             }
-
-            // ---------------------------------------------------- 图表工具
-            "ChartEdit" => {
-                if let Some(ch) = self.chart_at_sel().cloned() {
-                    self.chart_edit = Some(ch);
+            a if a.starts_with("TableTotalsFn:") => {
+                if let Some(fn_name) = a.strip_prefix("TableTotalsFn:") {
+                    self.set_table_totals_fn(fn_name);
                 }
             }
+
+            // ---------------------------------------------------- 图表工具
+            "ChartEdit" => self.open_chart_studio_for_selected(),
+            "ChartStudioToggle" => {
+                if self.chart_studio.sidebar_open {
+                    self.chart_studio.sidebar_open = false;
+                } else {
+                    self.open_chart_studio_for_selected();
+                }
+            }
+            "ChartSwitchRowCol" => self.switch_selected_chart_row_col(),
+            "ChartCycleTheme" => self.cycle_selected_chart_theme(),
+            "ChartToggleLabels" => self.toggle_selected_chart_labels(),
+            "ChartToggleTrendline" => self.toggle_selected_chart_trendline(),
+            "ChartExportSvg" => {
+                if let Some(ci) = self.chart_sel {
+                    self.export_chart_svg_dialog(ci);
+                }
+            }
+            "ChartDuplicate" => {
+                if let Some(ci) = self.chart_sel {
+                    self.duplicate_chart_at(ci);
+                }
+            }
+            "ChartDelete" => self.delete_selected_chart(),
 
             "Noop" => {}
             "DoubleUnderline" => {

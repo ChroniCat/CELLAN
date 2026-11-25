@@ -111,13 +111,14 @@ impl SheetApp {
         let mut apply_fill_direct = false;
         let mut apply_font_direct = false;
 
+        let pal = crate::theme::palette();
         egui::Area::new(egui::Id::new("wps_mini_toolbar"))
             .order(egui::Order::Foreground)
             .fixed_pos(mini_rect.min)
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                    .fill(pal.card_bg)
+                    .stroke(Stroke::new(1.0, pal.card_border))
                     .corner_radius(8.0)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 4],
@@ -138,8 +139,8 @@ impl SheetApp {
                             ui.painter().rect(
                                 fr,
                                 4.0,
-                                if fresp.hovered() || pop_mode == 1 { ui_kit::HOVER } else { Color32::from_rgb(248, 250, 252) },
-                                Stroke::new(1.0, ui_kit::CARD_BORDER),
+                                if fresp.hovered() || pop_mode == 1 { pal.hover } else { pal.grid_bg },
+                                Stroke::new(1.0, pal.card_border),
                                 egui::StrokeKind::Inside,
                             );
                             ui.painter().with_clip_rect(fr.shrink2(Vec2::new(5.0, 2.0))).text(
@@ -147,9 +148,9 @@ impl SheetApp {
                                 Align2::LEFT_CENTER,
                                 flabel,
                                 FontId::proportional(11.0),
-                                ui_kit::TEXT,
+                                pal.text,
                             );
-                            ui_kit::caret(ui, egui::pos2(fr.right() - 7.0, fr.center().y), ui_kit::TEXT_WEAK);
+                            ui_kit::caret(ui, egui::pos2(fr.right() - 7.0, fr.center().y), pal.text_muted);
                             if fresp.on_hover_text("字体").clicked() {
                                 pop_mode = if pop_mode == 1 { 0 } else { 1 };
                             }
@@ -158,8 +159,8 @@ impl SheetApp {
                             ui.painter().rect(
                                 sr,
                                 4.0,
-                                if sresp.hovered() || pop_mode == 2 { ui_kit::HOVER } else { Color32::from_rgb(248, 250, 252) },
-                                Stroke::new(1.0, ui_kit::CARD_BORDER),
+                                if sresp.hovered() || pop_mode == 2 { pal.hover } else { pal.grid_bg },
+                                Stroke::new(1.0, pal.card_border),
                                 egui::StrokeKind::Inside,
                             );
                             ui.painter().text(
@@ -167,18 +168,18 @@ impl SheetApp {
                                 Align2::LEFT_CENTER,
                                 format!("{}", cur.size as i32),
                                 FontId::proportional(11.0),
-                                ui_kit::TEXT,
+                                pal.text,
                             );
-                            ui_kit::caret(ui, egui::pos2(sr.right() - 6.0, sr.center().y), ui_kit::TEXT_WEAK);
+                            ui_kit::caret(ui, egui::pos2(sr.right() - 6.0, sr.center().y), pal.text_muted);
                             if sresp.on_hover_text("字号").clicked() {
                                 pop_mode = if pop_mode == 2 { 0 } else { 2 };
                             }
 
                             if ui_kit::small_on(ui, Icon::FontGrow, false, "增大字号").clicked() {
-                                act = Some("FontGrow".into());
+                                act = Some("GrowFont".into());
                             }
                             if ui_kit::small_on(ui, Icon::FontShrink, false, "减小字号").clicked() {
-                                act = Some("FontShrink".into());
+                                act = Some("ShrinkFont".into());
                             }
                             if ui_kit::text_toggle(ui, "B", cur.bold, "加粗", true, false, false).clicked() {
                                 act = Some("Bold".into());
@@ -254,8 +255,8 @@ impl SheetApp {
                 .fixed_pos(pop_pos)
                 .show(ctx, |ui| {
                     egui::Frame::NONE
-                        .fill(Color32::WHITE)
-                        .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                        .fill(pal.card_bg)
+                        .stroke(Stroke::new(1.0, pal.card_border))
                         .corner_radius(6.0)
                         .shadow(egui::epaint::Shadow {
                             offset: [0, 4],
@@ -330,6 +331,7 @@ impl SheetApp {
         );
         let mut toggle_pop = false;
         let mut pick_mode: Option<FillMode> = None;
+        let pal = crate::theme::palette();
 
         egui::Area::new(egui::Id::new("wps_fill_badge"))
             .order(egui::Order::Foreground)
@@ -339,8 +341,8 @@ impl SheetApp {
                 ui.painter().rect(
                     r,
                     5.0,
-                    if resp.hovered() || is_open { Color32::WHITE } else { Color32::from_rgb(248, 250, 252) },
-                    Stroke::new(1.0, if is_open { ui_kit::ACCENT } else { ui_kit::CARD_BORDER }),
+                    if resp.hovered() || is_open { pal.card_bg } else { pal.page_bg },
+                    Stroke::new(1.0, if is_open { pal.accent } else { pal.card_border }),
                     egui::StrokeKind::Inside,
                 );
                 ui.painter().text(
@@ -348,9 +350,9 @@ impl SheetApp {
                     Align2::LEFT_CENTER,
                     "填充选项",
                     FontId::proportional(11.0),
-                    ui_kit::TEXT,
+                    pal.text,
                 );
-                ui_kit::caret(ui, egui::pos2(r.right() - 9.0, r.center().y), ui_kit::TEXT_WEAK);
+                ui_kit::caret(ui, egui::pos2(r.right() - 9.0, r.center().y), pal.text_weak);
                 if resp.on_hover_text("切换填充方式（复制 / 填充序列 / 仅格式 / 不带格式）").clicked() {
                     toggle_pop = true;
                 }
@@ -366,8 +368,8 @@ impl SheetApp {
                 .fixed_pos(pop_pos)
                 .show(ctx, |ui| {
                     egui::Frame::NONE
-                        .fill(Color32::WHITE)
-                        .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                        .fill(pal.card_bg)
+                        .stroke(Stroke::new(1.0, pal.card_border))
                         .corner_radius(6.0)
                         .shadow(egui::epaint::Shadow {
                             offset: [0, 4],
@@ -377,16 +379,21 @@ impl SheetApp {
                         })
                         .inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
-                            ui.set_width(136.0);
+                            ui.set_width(148.0);
                             for (lbl, mode) in [
                                 ("智能填充（默认）", FillMode::Smart),
                                 ("复制单元格", FillMode::CopyCells),
                                 ("填充序列", FillMode::FillSeries),
                                 ("仅填充格式", FillMode::FormatsOnly),
                                 ("不带格式填充", FillMode::ValuesOnly),
+                                ("按工作日填充", FillMode::Weekdays),
+                                ("按月填充", FillMode::Months),
+                                ("按年填充", FillMode::Years),
+                                ("线性趋势", FillMode::LinearTrend),
+                                ("增长趋势", FillMode::GrowthTrend),
                             ] {
                                 let mark = if cur_mode == mode { format!("√ {lbl}") } else { format!("   {lbl}") };
-                                if ui_kit::popup_item(ui, &mark, true, 134.0).clicked() {
+                                if ui_kit::popup_item(ui, &mark, true, 146.0).clicked() {
                                     pick_mode = Some(mode);
                                 }
                             }
@@ -420,6 +427,7 @@ impl SheetApp {
         );
         let mut toggle_pop = false;
         let mut pick_mode: Option<u8> = None;
+        let pal = crate::theme::palette();
 
         egui::Area::new(egui::Id::new("wps_paste_badge"))
             .order(egui::Order::Foreground)
@@ -429,8 +437,8 @@ impl SheetApp {
                 ui.painter().rect(
                     r,
                     5.0,
-                    if resp.hovered() || is_open { Color32::WHITE } else { Color32::from_rgb(248, 250, 252) },
-                    Stroke::new(1.0, if is_open { ui_kit::ACCENT } else { ui_kit::CARD_BORDER }),
+                    if resp.hovered() || is_open { pal.card_bg } else { pal.page_bg },
+                    Stroke::new(1.0, if is_open { pal.accent } else { pal.card_border }),
                     egui::StrokeKind::Inside,
                 );
                 ui.painter().text(
@@ -438,9 +446,9 @@ impl SheetApp {
                     Align2::LEFT_CENTER,
                     "粘贴选项",
                     FontId::proportional(11.0),
-                    ui_kit::TEXT,
+                    pal.text,
                 );
-                ui_kit::caret(ui, egui::pos2(r.right() - 9.0, r.center().y), ui_kit::TEXT_WEAK);
+                ui_kit::caret(ui, egui::pos2(r.right() - 9.0, r.center().y), pal.text_weak);
                 if resp.on_hover_text("切换粘贴方式（保留格式 / 值 / 数字格式 / 公式 / 格式 / 无边框 / 转置）").clicked() {
                     toggle_pop = true;
                 }
@@ -456,8 +464,8 @@ impl SheetApp {
                 .fixed_pos(pop_pos)
                 .show(ctx, |ui| {
                     egui::Frame::NONE
-                        .fill(Color32::WHITE)
-                        .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                        .fill(pal.card_bg)
+                        .stroke(Stroke::new(1.0, pal.card_border))
                         .corner_radius(6.0)
                         .shadow(egui::epaint::Shadow {
                             offset: [0, 4],
@@ -930,387 +938,8 @@ impl SheetApp {
         }
     }
 
-    /// WPS 升级版左右实时分栏打印预览 (`Ctrl+P`, ~920×660)
+    /// 一体化打印与出版工作室 (`Ctrl+P`)：委托至 `print_studio::draw_print_studio`
     pub(crate) fn draw_print_preview_wps(&mut self, ctx: &egui::Context) {
-        if !self.print_preview {
-            return;
-        }
-        let mut open = true;
-        let mut do_print = false;
-        let mut do_export = false;
-        let mut do_page_setup = false;
-        let mut do_refresh_printers = false;
-        let mut goto_page: Option<usize> = None;
-        if self.page_setup_printers.is_empty() && self.bg_printers_rx.is_none() {
-            self.refresh_printers();
-        }
-        let printing_now = self.bg_print_rx.is_some();
-
-        let (layout, ops, page_no, total, cur_page) = {
-            let sheet = self.wb.sheet(self.sheet_idx);
-            let setup = if self.page_setup_open && self.page_setup_sheet == sheet.identity {
-                self.page_setup_draft.clone()
-            } else {
-                sheet.page.clone()
-            };
-            let cache_key = (
-                self.doc_uid,
-                sheet.identity,
-                sheet.cell_version().clone(),
-                sheet.display_style_revision(),
-                sheet.rows.revision(),
-                sheet.cols.revision(),
-                sheet.hidden_rows.revision(),
-                sheet.hidden_rows_user.revision(),
-                sheet.hidden_cols.revision(),
-                sheet.merges_revision(),
-                setup.clone(),
-                self.wb.path.clone(),
-            );
-            let layout_hit = self
-                .normal_page_breaks
-                .print_preview
-                .as_ref()
-                .is_some_and(|c| c.key == cache_key);
-            if !layout_hit {
-                let built = std::sync::Arc::new(sheetcore::print::paginate(sheet, &setup));
-                self.normal_page_breaks.print_preview =
-                    Some(crate::grid_render_cache::PrintPreviewCache {
-                        key: cache_key,
-                        layout: built,
-                        page_ops: None,
-                    });
-            }
-            let layout = self
-                .normal_page_breaks
-                .print_preview
-                .as_ref()
-                .unwrap()
-                .layout
-                .clone();
-            let total = layout.pages.len().max(1);
-            let page_no = self.preview_page.min(total - 1);
-            let cached_ops = self
-                .normal_page_breaks
-                .print_preview
-                .as_ref()
-                .and_then(|c| c.page_ops.as_ref())
-                .filter(|(p, _)| *p == page_no)
-                .map(|(_, ops)| ops.clone());
-            let ops = match cached_ops {
-                Some(hit) => hit,
-                None => {
-                    let built = std::sync::Arc::new(sheetcore::print::page_ops_with(
-                        &self.wb,
-                        self.sheet_idx,
-                        &layout,
-                        page_no,
-                        self.wb.path.as_deref(),
-                    ));
-                    if let Some(cache) = self.normal_page_breaks.print_preview.as_mut() {
-                        cache.page_ops = Some((page_no, built.clone()));
-                    }
-                    built
-                }
-            };
-            (layout, ops, page_no, total, setup)
-        };
-
-        let (pw, ph) = layout.page_size;
-        let margins = cur_page.margins;
-        let page_h = 460.0 * self.preview_zoom.clamp(0.5, 2.0);
-        let page_w = page_h * pw / ph;
-
-        ui_kit::window(ctx, "打印与预览", 920.0)
-            .open(&mut open)
-            .default_size([920.0, 600.0])
-            .resizable(true)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                ui.horizontal_top(|ui| {
-                    // 左侧 272px 设置列
-                    ui.vertical(|ui| {
-                        ui.set_width(272.0);
-                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 5.0);
-                        ui.horizontal(|ui| {
-                            if printing_now {
-                                ui.spinner();
-                                ui.label(egui::RichText::new("正在打印…").size(12.0));
-                            } else if ui_kit::primary_button(ui, "立即打印").clicked() {
-                                do_print = true;
-                            }
-                            if ui_kit::secondary_button(ui, "导出 PDF…").clicked() {
-                                do_export = true;
-                            }
-                        });
-                        ui.separator();
-
-                        // 统一打印机选择与刷新（后台 winspool 快速枚举，不阻塞 UI）
-                        ui.horizontal(|ui| {
-                            ui.label("打印机：");
-                            let cur_prn = if self.page_setup_printer.is_empty() {
-                                "系统默认打印机"
-                            } else {
-                                self.page_setup_printer.as_str()
-                            };
-                            egui::ComboBox::from_id_salt("print_preview_printer")
-                                .width(154.0)
-                                .selected_text(cur_prn)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.page_setup_printer,
-                                        String::new(),
-                                        "系统默认打印机",
-                                    );
-                                    for p in &self.page_setup_printers {
-                                        ui.selectable_value(
-                                            &mut self.page_setup_printer,
-                                            p.clone(),
-                                            p,
-                                        );
-                                    }
-                                });
-                            if ui.small_button("刷新").on_hover_text("重新读取系统打印机列表").clicked() {
-                                do_refresh_printers = true;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("打印份数：");
-                            let mut cp = self.print_copies as f64;
-                            if ui_kit::spin(ui, &mut cp, 1.0, 99.0, 1.0, 64.0) {
-                                self.print_copies = cp as u32;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("页面范围：");
-                            ui.selectable_value(&mut self.print_range, 0, "全部");
-                            ui.selectable_value(&mut self.print_range, 1, "当前页");
-                            ui.selectable_value(&mut self.print_range, 2, "自定义");
-                        });
-                        if self.print_range == 2 {
-                            ui.horizontal(|ui| {
-                                ui.label("从第");
-                                let mut a = self.print_from as f64;
-                                if ui_kit::spin(ui, &mut a, 1.0, total as f64, 1.0, 48.0) {
-                                    self.print_from = a as u32;
-                                }
-                                ui.label("到第");
-                                let mut b = self.print_to as f64;
-                                if ui_kit::spin(ui, &mut b, 1.0, total as f64, 1.0, 48.0) {
-                                    self.print_to = b as u32;
-                                }
-                                ui.label("页");
-                            });
-                        }
-
-                        ui.separator();
-                        crate::dlg_section(ui, "页面与纸张（实时生效）");
-                        ui.horizontal(|ui| {
-                            ui.label("方向：");
-                            if ui.selectable_label(!cur_page.landscape, "纵向").clicked() {
-                                self.set_page(|p| p.landscape = false);
-                            }
-                            if ui.selectable_label(cur_page.landscape, "横向").clicked() {
-                                self.set_page(|p| p.landscape = true);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("纸张：");
-                            for (lbl, id) in [("A4", 9u16), ("A3", 8), ("Letter", 1)] {
-                                if ui.selectable_label(cur_page.paper == id, lbl).clicked() {
-                                    self.set_page(|p| p.paper = id);
-                                }
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("页边距：");
-                            let is_narrow = (margins[0] - 0.25).abs() < 0.05;
-                            let is_wide = (margins[0] - 1.0).abs() < 0.05;
-                            if ui.selectable_label(!is_narrow && !is_wide, "常规").clicked() {
-                                self.set_page(|p| p.margins = [0.7, 0.7, 0.75, 0.75, 0.3, 0.3]);
-                            }
-                            if ui.selectable_label(is_narrow, "窄").clicked() {
-                                self.set_page(|p| p.margins = [0.25, 0.25, 0.75, 0.75, 0.3, 0.3]);
-                            }
-                            if ui.selectable_label(is_wide, "宽").clicked() {
-                                self.set_page(|p| p.margins = [1.0, 1.0, 1.0, 1.0, 0.5, 0.5]);
-                            }
-                        });
-
-                        crate::dlg_section(ui, "一键适应页面缩放");
-                        let fit_mode = if !cur_page.fit_to_page {
-                            0u8
-                        } else if cur_page.fit_width == 1 && cur_page.fit_height == 1 {
-                            1
-                        } else if cur_page.fit_width == 1 {
-                            2
-                        } else {
-                            3
-                        };
-                        for (m, lbl) in [
-                            (0u8, "无缩放（按实际大小 100%）"),
-                            (1, "将工作表调整为一页 (1×1)"),
-                            (2, "将所有列调整为一页宽"),
-                            (3, "将所有行调整为一页高"),
-                        ] {
-                            if ui.selectable_label(fit_mode == m, lbl).clicked() {
-                                self.set_page(|p| match m {
-                                    1 => {
-                                        p.fit_to_page = true;
-                                        p.fit_width = 1;
-                                        p.fit_height = 1;
-                                    }
-                                    2 => {
-                                        p.fit_to_page = true;
-                                        p.fit_width = 1;
-                                        p.fit_height = 0;
-                                    }
-                                    3 => {
-                                        p.fit_to_page = true;
-                                        p.fit_width = 0;
-                                        p.fit_height = 1;
-                                    }
-                                    _ => {
-                                        p.fit_to_page = false;
-                                        p.fit_width = 0;
-                                        p.fit_height = 0;
-                                    }
-                                });
-                            }
-                        }
-
-                        if fit_mode == 0 {
-                            ui.horizontal(|ui| {
-                                ui.label("缩放比例：");
-                                let mut sc = cur_page.scale as f64;
-                                if ui_kit::spin(ui, &mut sc, 10.0, 400.0, 5.0, 64.0) {
-                                    self.set_page(|p| p.scale = sc as u16);
-                                }
-                                ui.label("%");
-                            });
-                        }
-
-                        ui.separator();
-                        let mut g = cur_page.gridlines;
-                        if ui.checkbox(&mut g, "打印网格线").changed() {
-                            self.set_page(|p| p.gridlines = g);
-                        }
-                        let mut h = cur_page.headings;
-                        if ui.checkbox(&mut h, "打印行号与列标").changed() {
-                            self.set_page(|p| p.headings = h);
-                        }
-                        let mut ch = cur_page.center_h;
-                        if ui.checkbox(&mut ch, "水平居中打印").changed() {
-                            self.set_page(|p| p.center_h = ch);
-                        }
-                        let mut cv = cur_page.center_v;
-                        if ui.checkbox(&mut cv, "垂直居中打印").changed() {
-                            self.set_page(|p| p.center_v = cv);
-                        }
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            if ui_kit::secondary_button(ui, "页眉/页脚…").clicked() {
-                                self.hf_dlg = true;
-                            }
-                            if ui_kit::secondary_button(ui, "高级页面设置…").clicked() {
-                                do_page_setup = true;
-                            }
-                        });
-                    });
-
-                    ui.separator();
-
-                    // 右侧：实时纸张预览区 + 底部翻页缩放条
-                    ui.vertical(|ui| {
-                        let avail_w = ui.available_width().max(320.0);
-                        ui.set_width(avail_w);
-                        egui::Frame::NONE
-                            .fill(Color32::from_rgb(236, 240, 245))
-                            .corner_radius(6.0)
-                            .inner_margin(egui::Margin::same(12))
-                            .show(ui, |ui| {
-                                ui.set_min_height(490.0);
-                                egui::ScrollArea::both().max_height(490.0).show(ui, |ui| {
-                                    ui.vertical_centered(|ui| {
-                                        let (resp, painter) = ui.allocate_painter(Vec2::new(page_w, page_h), Sense::hover());
-                                        let page_rect = resp.rect;
-                                        painter.rect_filled(page_rect.translate(Vec2::new(3.0, 4.0)), 2.0, Color32::from_black_alpha(24));
-                                        painter.rect_filled(page_rect, 2.0, Color32::WHITE);
-                                        painter.rect_stroke(page_rect, 2.0, Stroke::new(1.0, Color32::from_gray(165)), egui::StrokeKind::Inside);
-
-                                        let s_pt = page_h / ph;
-                                        let inner = Rect::from_min_max(
-                                            page_rect.min + Vec2::new(margins[0] * 72.0 * s_pt, margins[2] * 72.0 * s_pt),
-                                            page_rect.max - Vec2::new(margins[1] * 72.0 * s_pt, margins[3] * 72.0 * s_pt),
-                                        );
-                                        painter.rect_stroke(inner, 0.0, Stroke::new(0.8, Color32::from_gray(218)), egui::StrokeKind::Inside);
-
-                                        let to_xy = |x: f32, y: f32| egui::pos2(page_rect.min.x + x * s_pt, page_rect.min.y + (ph - y) * s_pt);
-                                        for (x, y, w, h, color) in &ops.rects {
-                                            let a = to_xy(*x, *y + *h);
-                                            let b = to_xy(*x + *w, *y);
-                                            painter.rect_filled(Rect::from_min_max(a, b), 0.0, Color32::from_rgb(color[0], color[1], color[2]));
-                                        }
-                                        for (x1, y1, x2, y2, lw, color) in &ops.lines {
-                                            painter.line_segment(
-                                                [to_xy(*x1, *y1), to_xy(*x2, *y2)],
-                                                Stroke::new((lw * s_pt).max(0.4), Color32::from_rgb(color[0], color[1], color[2])),
-                                            );
-                                        }
-                                        for t in &ops.texts {
-                                            painter.text(
-                                                to_xy(t.x, t.baseline),
-                                                Align2::LEFT_BOTTOM,
-                                                &t.text,
-                                                FontId::proportional((t.size * s_pt).max(3.0)),
-                                                Color32::from_rgb(t.color[0], t.color[1], t.color[2]),
-                                            );
-                                        }
-                                    });
-                                });
-                            });
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui_kit::secondary_button(ui, "< 上一页").clicked() && page_no > 0 {
-                                goto_page = Some(page_no - 1);
-                            }
-                            ui.label(format!("第 {} / {} 页", page_no + 1, total));
-                            if ui_kit::secondary_button(ui, "下一页 >").clicked() && page_no + 1 < total {
-                                goto_page = Some(page_no + 1);
-                            }
-                            ui.separator();
-                            ui.label(format!(
-                                "{} · 内容缩放 {:.0}%",
-                                cur_page.paper_label(),
-                                layout.scale * 100.0
-                            ));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.add(egui::Slider::new(&mut self.preview_zoom, 0.5..=2.0).text("预览缩放"));
-                            });
-                        });
-                    });
-                });
-            });
-
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            open = false;
-        }
-        if let Some(p) = goto_page {
-            self.preview_page = p;
-        }
-        if do_refresh_printers {
-            self.page_setup_printers.clear();
-            self.refresh_printers();
-        }
-        if do_print {
-            self.print_to_printer();
-        }
-        if do_export {
-            self.export_pdf_dialog();
-        }
-        if do_page_setup {
-            self.open_page_setup();
-        }
-        self.print_preview = open;
+        self.draw_print_studio(ctx);
     }
 }

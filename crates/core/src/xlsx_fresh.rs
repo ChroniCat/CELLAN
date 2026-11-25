@@ -378,6 +378,14 @@ fn direct_sheet_shell_xml(sheet: &Sheet, tab_selected: bool) -> Result<String> {
             sheet.outline_symbols,
         );
     }
+    if sheet.zoom_scale != 100 || !sheet.show_gridlines || !sheet.show_headings {
+        shell = crate::patch::set_sheet_view_xml(
+            &shell,
+            sheet.zoom_scale,
+            sheet.show_gridlines,
+            sheet.show_headings,
+        );
+    }
     if sheet.freeze.is_some() {
         shell = crate::patch::set_freeze_xml(&shell, sheet.freeze);
     }
@@ -412,8 +420,12 @@ fn direct_sheet_shell_xml(sheet: &Sheet, tab_selected: bool) -> Result<String> {
             }
         }
     }
-    if sheet.protection.is_some() {
-        shell = crate::patch::set_sheet_protection(&shell, sheet.protection.as_ref());
+    if sheet.protection.is_some() || !sheet.protected_ranges.is_empty() {
+        shell = crate::patch::set_sheet_protection_and_ranges(
+            &shell,
+            sheet.protection.as_ref(),
+            (!sheet.protected_ranges.is_empty()).then_some(sheet.protected_ranges.as_slice()),
+        );
     }
     if let Some(f) = &sheet.filter
         && f.color_filters.is_empty()
@@ -478,14 +490,19 @@ fn build_fresh_package_xmls(
     } else {
         ""
     };
+    let wb_prot_xml = if include_direct_workbook_meta {
+        wb.protection.as_ref().map(|p| p.to_xml()).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let mut wb_xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-<workbookPr{date_attr}/>\
+<workbookPr{date_attr}/>{wb_prot_xml}\
 <bookViews><workbookView xWindow=\"0\" yWindow=\"0\" windowWidth=\"24000\" windowHeight=\"12000\"/></bookViews>\
 <sheets>"
     );
-    let any_visible_sheet = wb.sheets.iter().any(|s| !s.hidden);
+    let any_visible_sheet = wb.sheets.iter().any(|s| !s.is_hidden());
     for (idx, name) in sheet_names.iter().enumerate() {
         let n = idx + 1;
         let _ = write!(
@@ -496,11 +513,12 @@ fn build_fresh_package_xmls(
             wb_rels,
             "<Relationship Id=\"rId{n}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{n}.xml\"/>"
         );
-        let state_attr = if include_direct_workbook_meta
-            && any_visible_sheet
-            && wb.sheets.get(idx).is_some_and(|s| s.hidden)
-        {
-            " state=\"hidden\""
+        let state_attr = if include_direct_workbook_meta && any_visible_sheet {
+            match wb.sheets.get(idx).map(|s| s.visibility()) {
+                Some(crate::model::SheetVisibility::VeryHidden) => " state=\"veryHidden\"",
+                Some(crate::model::SheetVisibility::Hidden) => " state=\"hidden\"",
+                _ => "",
+            }
         } else {
             ""
         };
@@ -698,6 +716,7 @@ pub(super) fn can_write_direct(wb: &Workbook, wants_macro: bool) -> bool {
         s.cf.dxfs.is_empty()
             && s.filter.as_ref().is_none_or(|f| f.color_filters.is_empty())
             && s.notes.is_empty()
+            && s.threads.is_empty()
             && !s.scenario_settings.has_source()
             && s.scenarios.is_empty()
             && s.sparklines.is_empty()
@@ -6064,6 +6083,7 @@ mod tests {
             data: Some(png.clone()),
             ext: "png".into(),
             name: "Logo".into(),
+            ..Default::default()
         });
         crate::formula::recalc_all(&mut wb);
         assert!(supported(&wb.sheets[0]));

@@ -299,12 +299,8 @@ pub fn list_items(dv: &DataValidation, sheet: &Sheet) -> Vec<String> {
     if src.is_empty() {
         return Vec::new();
     }
-    if let Some(rest) = src.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-        return rest
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+    if let Some(items) = inline_items(src) {
+        return items;
     }
     // 区域引用
     let clean: String = src.chars().filter(|c| *c != '$' && *c != '=').collect();
@@ -324,13 +320,43 @@ pub fn list_items(dv: &DataValidation, sheet: &Sheet) -> Vec<String> {
             return out;
         }
     }
+    if let Some(items) = inline_items_unquoted(src) {
+        return items;
+    }
     Vec::new()
 }
 
-/// 内联序列 `"甲,乙"`（Excel 只认英文双引号）。
+/// 内联序列 `"甲,乙"`（Excel 英文双引号格式）。
 fn inline_items(src: &str) -> Option<Vec<String>> {
     let rest = src.trim().strip_prefix('"')?.strip_suffix('"')?;
-    Some(rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+    Some(
+        rest.split(|c| c == ',' || c == '，')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
+}
+
+/// 兼容未加双引号的逗号分隔字面量序列（如 UI 提示中的 `甲,乙,丙`），
+/// 仅在不含公式前缀 `=`、括号 `(` 与工作表引用 `!`/`:` 时生效，避免误拦截公式或命名区域。
+fn inline_items_unquoted(src: &str) -> Option<Vec<String>> {
+    let t = src.trim();
+    if t.is_empty()
+        || t.starts_with('=')
+        || t.starts_with('"')
+        || t.contains('(')
+        || t.contains('!')
+        || t.contains(':')
+        || (!t.contains(',') && !t.contains('，'))
+    {
+        return None;
+    }
+    let items: Vec<String> = t
+        .split(|c| c == ',' || c == '，')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!items.is_empty()).then_some(items)
 }
 
 /// 按 `!` 拆工作表前缀：跳过单引号表名（`''` 是转义的单引号）和双引号字符串。
@@ -962,7 +988,9 @@ fn resolve_list(wb: &crate::Workbook, si: usize, expr: &str) -> Option<Vec<Strin
     if expr.is_empty() {
         return Some(Vec::new());
     }
-    inline_items(expr).or_else(|| resolve_any(wb, si, expr))
+    inline_items(expr)
+        .or_else(|| resolve_any(wb, si, expr))
+        .or_else(|| inline_items_unquoted(expr))
 }
 
 /// Membership for a single rule during a read-only validation pass. Compare the
@@ -1045,19 +1073,52 @@ fn num_of(v: &Value) -> Option<f64> {
     }
 }
 
-fn parse_bound(s: &str) -> Option<f64> {
-    let s = s.trim().trim_start_matches('=');
+fn parse_bound_in(expr: &str, sys: crate::model::DateSystem) -> Option<f64> {
+    let trimmed = expr.trim();
+    let is_formula = trimmed.starts_with('=');
+    let s = trimmed.trim_start_matches('=').trim();
     if let Ok(v) = s.parse::<f64>() {
         return Some(v);
     }
-    // DATE(2026,1,1)
-    if let Some(inner) = s.strip_prefix("DATE(").and_then(|x| x.strip_suffix(')')) {
+    // DATE(2026,1,1)（大小写不敏感）
+    if s.len() > 6
+        && s[..5].eq_ignore_ascii_case("DATE(")
+        && s.ends_with(')')
+    {
+        let inner = &s[5..s.len() - 1];
         let p: Vec<&str> = inner.split(',').collect();
         if p.len() == 3 {
             let y = p[0].trim().parse::<i32>().ok()?;
             let m = p[1].trim().parse::<u32>().ok()?;
             let d = p[2].trim().parse::<u32>().ok()?;
-            return crate::formula::date_to_serial_pub(y, m, d);
+            return crate::formula::functions::date_to_serial_in(sys, y, m, d);
+        }
+    }
+    // TIME(h,m,s)
+    if s.len() > 6
+        && s[..5].eq_ignore_ascii_case("TIME(")
+        && s.ends_with(')')
+    {
+        let inner = &s[5..s.len() - 1];
+        let p: Vec<&str> = inner.split(',').collect();
+        if p.len() == 3 {
+            let h = p[0].trim().parse::<f64>().ok()?;
+            let m = p[1].trim().parse::<f64>().ok()?;
+            let sec = p[2].trim().parse::<f64>().ok()?;
+            let secs = h * 3600.0 + m * 60.0 + sec;
+            if secs >= 0.0 {
+                return Some((secs / 86400.0).rem_euclid(1.0));
+            }
+        }
+    }
+    // 非 `=` 开头时支持用户直接键入日期/时间字面量（如 2026-01-01、2026/1/1、08:30、09:00:00），
+    // 防止 2026-01-01 跌落到公式求值器被算成减法 2024！
+    if !is_formula {
+        let parsed = crate::input_parse::parse_cell_input(s, "", sys);
+        if parsed.auto_format.is_some()
+            && let Value::Number(n) = parsed.value
+        {
+            return Some(n);
         }
     }
     None
@@ -1076,14 +1137,19 @@ fn cmp_ok(op: DvOp, v: f64, a: f64, b: Option<f64>) -> bool {
     }
 }
 
-/// 求值一个数值边界。先尝试字面量/日期，再走公式求值器；
+/// 求值一个数值边界。先尝试字面量/日期/时间，再走公式求值器；
 /// 支持命名区域、`=A1*2` 这类阈值，而不是把无法解析的公式静默当 0。
-fn bound_value<F>(expr: &str, r: u32, c: u32, formula_eval: &mut F) -> Option<f64>
+fn bound_value_in<F>(
+    expr: &str,
+    r: u32,
+    c: u32,
+    sys: crate::model::DateSystem,
+    formula_eval: &mut F,
+) -> Option<f64>
 where
     F: FnMut(&str, u32, u32) -> crate::formula::FValue,
 {
-    let raw = expr.trim().trim_start_matches('=').trim();
-    if let Some(n) = parse_bound(raw) {
+    if let Some(n) = parse_bound_in(expr, sys) {
         return Some(n);
     }
     match formula_eval(expr, r, c) {
@@ -1099,7 +1165,16 @@ pub fn validate<F>(dv: &DataValidation, value: &Value, sheet: &Sheet, r: u32, c:
 where
     F: FnMut(&str, u32, u32) -> crate::formula::FValue,
 {
-    validate_impl(dv, value, sheet, r, c, None, formula_eval)
+    validate_impl(
+        dv,
+        value,
+        sheet,
+        r,
+        c,
+        crate::formula::current_date_system(),
+        None,
+        formula_eval,
+    )
 }
 
 struct CachedRectEntry {
@@ -1235,7 +1310,9 @@ fn cached_list_set_for_shifted(
             Some(set)
         });
     }
-    dynamic_source(wb, si, shifted).map(|v| std::sync::Arc::new(v.into_iter().collect()))
+    dynamic_source(wb, si, shifted)
+        .or_else(|| inline_items_unquoted(shifted))
+        .map(|v| std::sync::Arc::new(v.into_iter().collect()))
 }
 
 fn cached_list_set_wb(
@@ -1279,7 +1356,7 @@ where
             _ => value.with_display_str(|s| set.contains(s)),
         };
     }
-    validate_impl(dv, value, wb.sheet(si), r, c, None, formula_eval)
+    validate_impl(dv, value, wb.sheet(si), r, c, wb.date_system, None, formula_eval)
 }
 
 fn validate_impl<F>(
@@ -1288,6 +1365,7 @@ fn validate_impl<F>(
     sheet: &Sheet,
     r: u32,
     c: u32,
+    sys: crate::model::DateSystem,
     resolved_list: Option<&[String]>,
     mut formula_eval: F,
 ) -> bool
@@ -1322,9 +1400,9 @@ where
         }
         DvKind::TextLength => {
             let len = value.display().chars().count() as f64;
-            let Some(a) = bound_value(&dv.f1, r, c, &mut formula_eval) else { return false };
+            let Some(a) = bound_value_in(&dv.f1, r, c, sys, &mut formula_eval) else { return false };
             let b = if dv.op.needs_pair() {
-                bound_value(&dv.f2, r, c, &mut formula_eval)
+                bound_value_in(&dv.f2, r, c, sys, &mut formula_eval)
             } else {
                 None
             };
@@ -1338,9 +1416,9 @@ where
             if dv.kind == DvKind::Whole && (v.fract() != 0.0) {
                 return false;
             }
-            let Some(a) = bound_value(&dv.f1, r, c, &mut formula_eval) else { return false };
+            let Some(a) = bound_value_in(&dv.f1, r, c, sys, &mut formula_eval) else { return false };
             let b = if dv.op.needs_pair() {
-                bound_value(&dv.f2, r, c, &mut formula_eval)
+                bound_value_in(&dv.f2, r, c, sys, &mut formula_eval)
             } else {
                 None
             };

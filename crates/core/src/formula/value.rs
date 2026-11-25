@@ -13,6 +13,8 @@ pub enum ErrKind {
     Na,        // #N/A
     Circular,  // 循环引用
     Spill,     // #SPILL!（溢出区域被占用）
+    Calc,      // #CALC!（动态数组/空数组/不支持的嵌套计算错误）
+    Field,     // #FIELD!（字段/结构化属性错误）
 }
 
 impl ErrKind {
@@ -27,6 +29,8 @@ impl ErrKind {
             ErrKind::Na => "#N/A",
             ErrKind::Circular => "#REF!",
             ErrKind::Spill => "#SPILL!",
+            ErrKind::Calc => "#CALC!",
+            ErrKind::Field => "#FIELD!",
         }
     }
 }
@@ -43,6 +47,8 @@ impl ErrKind {
             "#NUM!" => ErrKind::Num,
             "#N/A" => ErrKind::Na,
             "#SPILL!" => ErrKind::Spill,
+            "#CALC!" => ErrKind::Calc,
+            "#FIELD!" => ErrKind::Field,
             _ => return None,
         })
     }
@@ -275,7 +281,7 @@ impl FValue {
             FValue::Text(s) => {
                 let t = s.trim();
                 if t.is_empty() {
-                    return Ok(0.0);
+                    return Err(ErrKind::Value);
                 }
                 t.parse::<f64>().map_err(|_| ErrKind::Value)
             }
@@ -333,7 +339,14 @@ impl FValue {
         }
         Ok(match (self, other) {
             (FValue::Error(e), _) | (_, FValue::Error(e)) => return Err(*e),
-            (FValue::Number(x), FValue::Number(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+            (FValue::Number(x), FValue::Number(y)) => {
+                let scale = x.abs().max(y.abs());
+                if scale > 0.0 && (x - y).abs() <= scale * 1e-14 {
+                    Ordering::Equal
+                } else {
+                    x.partial_cmp(y).unwrap_or(Ordering::Equal)
+                }
+            }
             (FValue::Text(x), FValue::Text(y)) => compare_text(x, y),
             (FValue::Bool(x), FValue::Bool(y)) => x.cmp(y),
             (FValue::Empty, FValue::Number(n)) => 0.0_f64.partial_cmp(n).unwrap_or(Ordering::Equal),

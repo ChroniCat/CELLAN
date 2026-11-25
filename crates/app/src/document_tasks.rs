@@ -310,26 +310,47 @@ impl CalculatedSnapshot {
 }
 
 impl DocumentTasks {
-    pub fn start_pdf_export(
+    pub fn start_pdf_export_pack(
         &mut self,
         wb: Workbook,
         sheet_idx: usize,
         out_path: PathBuf,
-        regular: sheetcore::pdf::Font,
-        bold: Option<sheetcore::pdf::Font>,
+        pack: sheetcore::print::PdfFontPack,
+        page_indices: Option<Vec<usize>>,
     ) {
         let (tx, rx) = mpsc::channel();
         self.pdf_export = Some(rx);
         std::thread::spawn(move || {
             let wb_path = wb.path.clone();
-            let res = sheetcore::print::export_pdf_pages_with_fonts(
+            let res = sheetcore::print::export_pdf_sheet_with_pack(
                 &wb,
                 sheet_idx,
                 &out_path,
-                regular,
-                bold,
+                pack,
                 wb_path.as_deref(),
-                None,
+                page_indices.as_deref(),
+            )
+            .map(|n| (out_path, n))
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+        });
+    }
+
+    pub fn start_workbook_pdf_export(
+        &mut self,
+        wb: Workbook,
+        out_path: PathBuf,
+        pack: sheetcore::print::PdfFontPack,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        self.pdf_export = Some(rx);
+        std::thread::spawn(move || {
+            let wb_path = wb.path.clone();
+            let res = sheetcore::print::export_workbook_pdf_with_pack(
+                &wb,
+                &out_path,
+                pack,
+                wb_path.as_deref(),
             )
             .map(|n| (out_path, n))
             .map_err(|e| format!("{e:#}"));

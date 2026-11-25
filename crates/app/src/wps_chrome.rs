@@ -537,7 +537,7 @@ impl SheetApp {
                     self.enc_dlg = Some((String::new(), String::new(), String::new()));
                 }
                 FileMenuAction::Protect => {
-                    self.protect_dlg = Some(crate::ProtectDlg::default());
+                    self.open_protect_sheet_dialog();
                 }
                 FileMenuAction::Share => {
                     if self.net.is_none() {

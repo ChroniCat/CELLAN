@@ -45,11 +45,23 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
             let min = opt_num(args, 2, 0.0)?;
             let max = opt_num(args, 3, 1.0)?;
             let whole = args.get(4).map(|a| a.first().to_bool().unwrap_or(false)).unwrap_or(false);
+            if min > max {
+                return Err(ErrKind::Value);
+            }
             let mut data = Vec::with_capacity(rows * cols);
             for _ in 0..rows * cols {
                 let t = pseudo_random();
-                let x = min + (max - min) * t;
-                data.push(FValue::number(if whole { x.floor() } else { x }));
+                let val = if whole {
+                    let lo = min.ceil();
+                    let hi = max.floor();
+                    if lo > hi {
+                        return Err(ErrKind::Value);
+                    }
+                    (lo + ((hi - lo + 1.0) * t).floor()).min(hi)
+                } else {
+                    min + (max - min) * t
+                };
+                data.push(FValue::number(val));
             }
             Ok(arr(Array::new(rows, cols, data)))
         }),
@@ -167,17 +179,48 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
         }),
         "SORT" => r(|| {
             let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
-            let idx = match args.get(1) {
-                Some(_) => (int_arg(args, 1)?.max(1) as usize) - 1,
-                None => 0,
-            };
-            let desc = opt_num(args, 2, 1.0)? < 0.0;
             let by_col = args.get(3).map(|a| a.first().to_bool().unwrap_or(false)).unwrap_or(false);
+            let limit = if by_col { rows } else { cols };
+            let indices: Vec<usize> = match args.get(1) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => {
+                    let mut out = Vec::new();
+                    for v in a.slice() {
+                        let k = v.to_number()?.trunc() as i64;
+                        if k < 1 || k as usize > limit {
+                            return Err(ErrKind::Value);
+                        }
+                        out.push((k - 1) as usize);
+                    }
+                    if out.is_empty() { vec![0] } else { out }
+                }
+                _ => vec![0],
+            };
+            let orders: Vec<bool> = match args.get(2) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => {
+                    let mut out = Vec::new();
+                    for v in a.slice() {
+                        let o = v.to_number()?.trunc() as i64;
+                        if o != 1 && o != -1 {
+                            return Err(ErrKind::Value);
+                        }
+                        out.push(o < 0);
+                    }
+                    if out.is_empty() { vec![false] } else { out }
+                }
+                _ => vec![false],
+            };
             if by_col {
                 let mut order: Vec<usize> = (0..cols).collect();
                 order.sort_by(|&a, &b| {
-                    let cmp = sort_key_cmp(&data[idx.min(rows - 1) * cols + a], &data[idx.min(rows - 1) * cols + b]);
-                    if desc { cmp.reverse() } else { cmp }
+                    for (ki, &idx) in indices.iter().enumerate() {
+                        let desc = orders.get(ki).copied().unwrap_or(orders[0]);
+                        let cmp = sort_key_cmp(&data[idx * cols + a], &data[idx * cols + b]);
+                        let ord = if desc { cmp.reverse() } else { cmp };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
                 });
                 let mut out = Vec::with_capacity(rows * cols);
                 for i in 0..rows {
@@ -189,8 +232,15 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
             } else {
                 let mut order: Vec<usize> = (0..rows).collect();
                 order.sort_by(|&a, &b| {
-                    let cmp = sort_key_cmp(&data[a * cols + idx.min(cols - 1)], &data[b * cols + idx.min(cols - 1)]);
-                    if desc { cmp.reverse() } else { cmp }
+                    for (ki, &idx) in indices.iter().enumerate() {
+                        let desc = orders.get(ki).copied().unwrap_or(orders[0]);
+                        let cmp = sort_key_cmp(&data[a * cols + idx], &data[b * cols + idx]);
+                        let ord = if desc { cmp.reverse() } else { cmp };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
                 });
                 let mut out = Vec::with_capacity(rows * cols);
                 for &row in &order {
@@ -201,16 +251,38 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
         }),
         "SORTBY" => r(|| {
             let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
-            let mut order: Vec<usize> = (0..rows).collect();
-            // 依次按每个 key 排序（稳定排序，逆序从最后一组往前做）
+            if args.len() < 2 {
+                return Err(ErrKind::Value);
+            }
+            let (br0, bc0, _) = args[1].grid_slice();
+            let by_col = br0 == 1 && bc0 == cols && !(bc0 == 1 && br0 == rows);
+            let expected_len = if by_col { cols } else { rows };
             let mut keys: Vec<(&[FValue], bool)> = Vec::new();
             let mut i = 1;
             while i < args.len() {
-                let by = args[i].slice();
-                let desc = args.get(i + 1).map(|a| a.first().to_number().unwrap_or(1.0) < 0.0).unwrap_or(false);
-                keys.push((by, desc));
+                let (kr, kc, by) = args[i].grid_slice();
+                let valid = if by_col {
+                    kr == 1 && kc == expected_len
+                } else {
+                    kc == 1 && kr == expected_len
+                };
+                if !valid && by.len() != expected_len {
+                    return Err(ErrKind::Value);
+                }
+                let desc = match args.get(i + 1) {
+                    Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => {
+                        let o = a.first().to_number()?.trunc() as i64;
+                        if o != 1 && o != -1 {
+                            return Err(ErrKind::Value);
+                        }
+                        o < 0
+                    }
+                    _ => false,
+                };
+                keys.push((args[i].slice(), desc));
                 i += 2;
             }
+            let mut order: Vec<usize> = (0..expected_len).collect();
             for (by, desc) in keys.iter().rev() {
                 order.sort_by(|&a, &b| {
                     let va = by.get(a).unwrap_or(&FValue::Empty);
@@ -219,11 +291,21 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
                     if *desc { cmp.reverse() } else { cmp }
                 });
             }
-            let mut out = Vec::with_capacity(rows * cols);
-            for &row in &order {
-                out.extend_from_slice(&data[row * cols..(row + 1) * cols]);
+            if by_col {
+                let mut out = Vec::with_capacity(rows * cols);
+                for r0 in 0..rows {
+                    for &c in &order {
+                        out.push(data[r0 * cols + c].clone());
+                    }
+                }
+                Ok(arr(Array::new(rows, cols, out)))
+            } else {
+                let mut out = Vec::with_capacity(rows * cols);
+                for &row in &order {
+                    out.extend_from_slice(&data[row * cols..(row + 1) * cols]);
+                }
+                Ok(arr(Array::new(rows, cols, out)))
             }
-            Ok(arr(Array::new(rows, cols, out)))
         }),
         "FILTER" => r(|| {
             let first_arg = args.first().ok_or(ErrKind::Value)?;
@@ -399,20 +481,44 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
         "TOROW" | "TOCOL" => r(|| {
             let first_arg = args.first().ok_or(ErrKind::Value)?;
             let (rows, cols, data) = first_arg.grid_slice();
-            if name == "TOCOL" {
-                let mut v = Vec::with_capacity(rows * cols);
+            let ignore = if args.len() > 1 { int_arg(args, 1)? } else { 0 };
+            let scan_by_col = args
+                .get(2)
+                .map(|a| a.first().to_bool().unwrap_or(false))
+                .unwrap_or(false);
+            let keep = |v: &FValue| -> bool {
+                match ignore {
+                    1 => !matches!(v, FValue::Empty),
+                    2 => !v.is_error(),
+                    3 => !matches!(v, FValue::Empty) && !v.is_error(),
+                    _ => true,
+                }
+            };
+            let mut v = Vec::with_capacity(rows * cols);
+            if scan_by_col {
                 for c in 0..cols {
                     for r0 in 0..rows {
-                        v.push(data[r0 * cols + c].clone());
+                        let item = &data[r0 * cols + c];
+                        if keep(item) {
+                            v.push(item.clone());
+                        }
                     }
                 }
-                Ok(arr(Array::new(rows * cols, 1, v)))
             } else {
-                match first_arg {
-                    Arg::Range { values, .. } => Ok(arr(Array::from_shared(1, rows * cols, values.clone()))),
-                    Arg::Val(FValue::Array(a)) => Ok(arr(Array::from_shared(1, rows * cols, a.data.clone()))),
-                    _ => Ok(arr(Array::new(1, rows * cols, data.into_owned()))),
+                for item in data.iter() {
+                    if keep(item) {
+                        v.push(item.clone());
+                    }
                 }
+            }
+            if v.is_empty() {
+                return Err(ErrKind::Value);
+            }
+            let len = v.len();
+            if name == "TOCOL" {
+                Ok(arr(Array::new(len, 1, v)))
+            } else {
+                Ok(arr(Array::new(1, len, v)))
             }
         }),
         "EXPAND" => r(|| {

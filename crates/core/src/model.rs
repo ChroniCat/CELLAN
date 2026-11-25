@@ -98,19 +98,55 @@ impl StringPool {
     }
 }
 
-/// 零堆分配栈缓冲数字格式化回调：整数走纯整数除法，普通小数走 64B 栈缓冲并去除尾零。
+/// 零堆分配栈缓冲数字格式化回调：保留 Excel 15 位有效数字精度，避免极小数截断成 0。
 #[inline]
 pub fn with_formatted_number<R>(n: f64, f: impl FnOnce(&str) -> R) -> R {
     use std::fmt::Write;
     if n.is_nan() || n.is_infinite() {
         return f("#NUM!");
     }
-    if n.fract() == 0.0 && n.abs() < 1e15 {
+    if n == 0.0 {
+        return f("0");
+    }
+    let abs = n.abs();
+    if n.fract() == 0.0 && abs < 1e15 {
         let mut buf = [0u8; 24];
         return f(crate::style::format_i64_into(n as i64, &mut buf));
     }
+    if abs >= 1e15 || abs < 1e-10 {
+        let mut stack = crate::style::StackFmt::<64>::new();
+        if write!(stack, "{:.14e}", n).is_ok() {
+            let s = stack.as_str();
+            if let Some((mant, exp_s)) = s.split_once('e') {
+                let mut m = mant.trim_end_matches('0');
+                if let Some(stripped) = m.strip_suffix('.') {
+                    m = stripped;
+                }
+                if m == "-0" {
+                    return f("0");
+                }
+                let exp: i32 = exp_s.parse().unwrap_or(0);
+                let mut out = crate::style::StackFmt::<64>::new();
+                if write!(
+                    out,
+                    "{}E{}{:02}",
+                    m,
+                    if exp < 0 { '-' } else { '+' },
+                    exp.abs()
+                )
+                .is_ok()
+                {
+                    return f(out.as_str());
+                }
+            }
+        }
+        return f(&format!("{n:E}"));
+    }
+    // 1e-10 <= |n| < 1e15：按 15 位有效数字决定小数位数，再去掉尾零
+    let exp = abs.log10().floor() as i32;
+    let dec = (14 - exp).clamp(0, 24) as usize;
     let mut stack = crate::style::StackFmt::<64>::new();
-    if write!(stack, "{:.10}", n).is_ok() {
+    if write!(stack, "{n:.dec$}").is_ok() {
         stack.trim_decimal_zeros_from(0);
         let s = stack.as_str();
         if s == "-0" {
@@ -118,7 +154,7 @@ pub fn with_formatted_number<R>(n: f64, f: impl FnOnce(&str) -> R) -> R {
         }
         return f(s);
     }
-    let s = format!("{:.10}", n);
+    let s = format!("{n:.dec$}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
     f(if trimmed == "-0" { "0" } else { trimmed })
 }
@@ -864,6 +900,10 @@ pub struct Sheet {
     pub notes: CellMetadata<CellRef, crate::notes::Note>,
     /// 批注被改过
     pub notes_dirty: bool,
+    /// Excel 365 原生线程批注（支持多轮回复与已解决状态，保存时写入 `xl/threadedComments/` + `xl/persons/`）
+    pub threads: std::collections::HashMap<CellRef, crate::notes::ThreadedComment>,
+    /// 线程批注被改过
+    pub threads_dirty: bool,
     /// 冻结窗格：(冻结行数, 冻结列数)
     pub freeze: Option<(u32, u32)>,
     /// 冻结设置被改过
@@ -902,10 +942,12 @@ pub struct Sheet {
     pub page: crate::page::PageSetup,
     /// 页面设置被改过
     pub page_dirty: bool,
-    /// 图表（只读展示，原样保留；CoW 共享避免渲染与快照每帧深拷）
+    /// 图表（CoW 共享避免渲染与快照每帧深拷）
     pub charts: SharedList<crate::charts::Chart>,
-    /// 图表引用被改过：保存时要重写 chart 部件
+    /// 图表增删改/锚点/引用被改过：保存时同步写回 chart/drawing 部件
     pub charts_dirty: bool,
+    /// 在内存中删除、待保存时从 zip 摘除的 `(drawing_part, chart_part)` 列表
+    pub deleted_charts: Vec<(String, String)>,
     /// 工作表标签颜色（RGB）
     pub tab_color: Option<[u8; 3]>,
     /// 标签颜色被改过：保存时要写 <sheetPr><tabColor>
@@ -916,6 +958,10 @@ pub struct Sheet {
     pub protection: Option<crate::protection::SheetProtection>,
     /// 保护状态被改过
     pub protect_dirty: bool,
+    /// 允许编辑的区域（OOXML `<protectedRanges>`）
+    pub protected_ranges: Vec<crate::protection::ProtectedRange>,
+    /// 允许编辑区域被改过
+    pub protected_ranges_dirty: bool,
     /// 单元格富文本（有记录时优先于纯文本绘制）
     pub rich: CellMetadata<(u32, u32), Vec<crate::richtext::RichRun>>,
     /// 富文本被改过
@@ -933,7 +979,26 @@ pub struct Sheet {
     pub textboxes_dirty: bool,
     /// 工作表被隐藏（workbook.xml 的 `state="hidden"`）
     pub hidden: bool,
+    /// 工作表深度隐藏（workbook.xml 的 `state="veryHidden"`；普通取消隐藏不可见）
+    pub very_hidden: bool,
     pub hidden_dirty: bool,
+    /// 每表视图缩放百分比（10..=400，默认 100；持久化到 `<sheetView zoomScale="..."/>`）
+    pub zoom_scale: u16,
+    /// 是否显示网格线（默认 true；持久化到 `<sheetView showGridLines="..."/>`）
+    pub show_gridlines: bool,
+    /// 是否显示行列标题（默认 true；持久化到 `<sheetView showRowColHeaders="..."/>`）
+    pub show_headings: bool,
+    /// 视图设置（缩放/网格线/标题）被改过
+    pub view_dirty: bool,
+}
+
+/// 工作表可见性状态（对齐 OOXML `<sheet state="..."/>`）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SheetVisibility {
+    #[default]
+    Visible,
+    Hidden,
+    VeryHidden,
 }
 
 impl Sheet {
@@ -975,6 +1040,8 @@ impl Sheet {
             dv_dirty: false,
             notes: Default::default(),
             notes_dirty: false,
+            threads: std::collections::HashMap::new(),
+            threads_dirty: false,
             freeze: None,
             freeze_dirty: false,
             filter: None,
@@ -998,11 +1065,14 @@ impl Sheet {
             page_dirty: false,
             charts: SharedList::default(),
             charts_dirty: false,
+            deleted_charts: Vec::new(),
             tab_color: None,
             tab_color_dirty: false,
             tables_dirty: false,
             protection: None,
             protect_dirty: false,
+            protected_ranges: Vec::new(),
+            protected_ranges_dirty: false,
             rich: Default::default(),
             rich_dirty: false,
             hyperlinks: Default::default(),
@@ -1012,8 +1082,45 @@ impl Sheet {
             textboxes: Vec::new(),
             textboxes_dirty: false,
             hidden: false,
+            very_hidden: false,
             hidden_dirty: false,
+            zoom_scale: 100,
+            show_gridlines: true,
+            show_headings: true,
+            view_dirty: false,
         }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.hidden || self.very_hidden
+    }
+
+    pub fn visibility(&self) -> SheetVisibility {
+        if self.very_hidden {
+            SheetVisibility::VeryHidden
+        } else if self.hidden {
+            SheetVisibility::Hidden
+        } else {
+            SheetVisibility::Visible
+        }
+    }
+
+    pub fn set_visibility(&mut self, v: SheetVisibility) {
+        let (h, vh) = match v {
+            SheetVisibility::Visible => (false, false),
+            SheetVisibility::Hidden => (true, false),
+            SheetVisibility::VeryHidden => (true, true),
+        };
+        if self.hidden != h || self.very_hidden != vh {
+            self.hidden = h;
+            self.very_hidden = vh;
+            self.hidden_dirty = true;
+        }
+    }
+
+    /// 查找覆盖 `(r, c)` 的「允许编辑区域」条目
+    pub fn cell_in_protected_range(&self, r: u32, c: u32) -> Option<&crate::protection::ProtectedRange> {
+        self.protected_ranges.iter().find(|pr| pr.contains(r, c))
     }
 
     /// A copy inserted as a new sheet must not inherit the original identity.
@@ -1123,10 +1230,22 @@ impl Sheet {
         // 溢出写回自己是先 set 再 insert，顺序不受影响。
         self.spilled.remove_if_present(&key);
         if cell.is_blank() {
+            if !self.loading && !self.rich.is_empty() && self.rich.remove(&(r, c)).is_some() {
+                self.rich_dirty = true;
+            }
             if self.cells.remove(r, c).is_some() {
                 self.cleared.insert(key);
             }
             return;
+        }
+        if !self.loading && !self.rich.is_empty() {
+            let keep_rich = match (&cell.value, &cell.formula, self.rich.get(&(r, c))) {
+                (Value::Text(t), None, Some(runs)) => crate::richtext::runs_text(runs) == t.as_ref(),
+                _ => false,
+            };
+            if !keep_rich && self.rich.remove(&(r, c)).is_some() {
+                self.rich_dirty = true;
+            }
         }
         self.cleared.remove_if_present(&key);
         self.cells.set(r, c, cell);
@@ -1135,6 +1254,9 @@ impl Sheet {
     pub fn remove(&mut self, r: u32, c: u32) -> Option<Cell> {
         if !self.loading {
             self.edited = true;
+            if !self.rich.is_empty() && self.rich.remove(&(r, c)).is_some() {
+                self.rich_dirty = true;
+            }
         }
         let key = CellRef::new(r, c);
         let out = self.cells.remove(r, c);
@@ -1245,11 +1367,12 @@ impl Sheet {
     pub(crate) fn has_pending_sheet_metadata(&self) -> bool {
         self.styles_dirty || self.row_styles_dirty || self.col_styles_dirty || !self.style_edits.is_empty()
             || self.pictures_dirty || self.merges_dirty || self.cf_dirty || self.dv_dirty
-            || self.notes_dirty || self.freeze_dirty || self.layout_dirty || self.scenarios_dirty
+            || self.notes_dirty || self.threads_dirty || self.freeze_dirty || self.layout_dirty || self.scenarios_dirty
             || self.ignored_errors_dirty || self.outline_pr_dirty || self.filter_dirty || self.page_dirty
             || self.charts_dirty || self.tab_color_dirty || self.tables_dirty || self.protect_dirty
+            || self.protected_ranges_dirty
             || self.rich_dirty || self.hyperlinks_dirty || self.sparklines_dirty || self.textboxes_dirty
-            || self.hidden_dirty
+            || self.hidden_dirty || self.view_dirty
     }
 
     pub fn set_formula_cache(&mut self, r: u32, c: u32, value: Value) {
@@ -1547,7 +1670,9 @@ impl Sheet {
         self.tab_color_dirty = true;
         self.tables_dirty = true;
         self.protect_dirty = true;
+        self.protected_ranges_dirty = true;
         self.hidden_dirty = true;
+        self.view_dirty = true;
     }
 
     #[inline]
@@ -1801,7 +1926,7 @@ impl Sheet {
     }
 
     #[inline]
-    pub(crate) fn bump_display_style_revision(&mut self) {
+    pub fn bump_display_style_revision(&mut self) {
         self.display_style_revision = next_sheet_identity();
     }
 
@@ -1988,6 +2113,10 @@ pub struct Workbook {
     pub encryption: Option<crate::crypto::EncryptionSettings>,
     /// Credentials for the package at `path`, independent of the next save's password.
     pub source_encryption: Option<crate::crypto::EncryptionSettings>,
+    /// 工作簿结构/窗口保护（`<workbookProtection .../>`）
+    pub protection: Option<crate::protection::WorkbookProtection>,
+    /// 工作簿保护被改过
+    pub protection_dirty: bool,
     pub dirty: bool,
     /// 用户在应用里改过图表的部件名（保存时不要按基准还原这些部件）
     pub chart_edits: Vec<String>,
@@ -2015,6 +2144,8 @@ impl Workbook {
             decrypted: None,
             encryption: None,
             source_encryption: None,
+            protection: None,
+            protection_dirty: false,
             date_system: DateSystem::D1900,
             calc_manual: false,
             calc_iterate: false,
@@ -2152,6 +2283,22 @@ mod tests {
         assert!(!sh.spilled.contains(&CellRef::new(5, 1)));
         assert!(snap.spilled.contains(&CellRef::new(5, 1)));
     }
+}
+
+/// XML 属性/文本转义
+pub fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// XML 属性/文本里的实体还原（够用即可）

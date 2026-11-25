@@ -251,6 +251,10 @@ pub struct UndoStack {
     pub limit: usize,
     /// 我是谁（协作站点号）；0 表示单人。撤销只退自己的动作
     pub site: u32,
+    /// 最近一次 MetaEdit 撤销/重做产出的协作元数据广播载荷
+    last_meta_sync: Vec<(usize, crate::sync::SheetMetaKind)>,
+    /// 最近一次撤销/重做涉及定义名称等需触发重算的簿级变更
+    last_needs_recalc: bool,
 }
 
 /// 撤销/重做实际改了哪些格子
@@ -362,7 +366,7 @@ impl Action {
 }
 
 
-/// 轻量级工作表元数据改动（列宽/行高/隐藏行列/批注/忽略错误）：无需整表快照，支持单人及协作模式一键撤销。
+/// 轻量级工作表元数据改动（列宽/行高/隐藏行列/批注/忽略错误/条件格式）：无需整表快照，支持单人及协作模式一键撤销。
 #[derive(Clone, Debug, Default)]
 pub struct MetaEdit {
     pub sheet: usize,
@@ -372,6 +376,38 @@ pub struct MetaEdit {
     pub hidden_cols: Vec<(u32, bool, bool)>,
     pub notes: Vec<((u32, u32), Option<crate::notes::Note>, Option<crate::notes::Note>)>,
     pub ignored_errors: Vec<((u32, u32), bool, bool)>,
+    pub cf: Option<(crate::cf::CfSheet, crate::cf::CfSheet)>,
+    pub filter: Option<(
+        Option<crate::sort_filter::Filter>,
+        Option<crate::sort_filter::Filter>,
+        crate::layout::HiddenIndices,
+        crate::layout::HiddenIndices,
+    )>,
+    pub tables: Option<(Vec<crate::table::Table>, Vec<crate::table::Table>)>,
+    pub outline: Option<(
+        std::collections::HashMap<u32, u8>,
+        std::collections::HashMap<u32, u8>,
+        std::collections::HashMap<u32, u8>,
+        std::collections::HashMap<u32, u8>,
+    )>,
+    pub rich: Vec<(
+        (u32, u32),
+        Cell,
+        Cell,
+        Option<Vec<crate::richtext::RichRun>>,
+        Option<Vec<crate::richtext::RichRun>>,
+    )>,
+    pub dv: Option<(Vec<crate::dv::DataValidation>, Vec<crate::dv::DataValidation>)>,
+    pub hyperlinks: Vec<(
+        (u32, u32),
+        Option<crate::hyperlinks::Hyperlink>,
+        Option<crate::hyperlinks::Hyperlink>,
+    )>,
+    pub sparklines: Option<(Vec<crate::sparkline::Sparkline>, Vec<crate::sparkline::Sparkline>)>,
+    pub names: Option<(
+        Vec<(String, Option<usize>, String)>,
+        Vec<(String, Option<usize>, String)>,
+    )>,
 }
 
 impl MetaEdit {
@@ -382,31 +418,51 @@ impl MetaEdit {
             && self.hidden_cols.is_empty()
             && self.notes.is_empty()
             && self.ignored_errors.is_empty()
+            && self.cf.is_none()
+            && self.filter.is_none()
+            && self.tables.is_none()
+            && self.outline.is_none()
+            && self.rich.is_empty()
+            && self.dv.is_none()
+            && self.hyperlinks.is_empty()
+            && self.sparklines.is_none()
+            && self.names.is_none()
     }
 
-    fn apply(&self, sheets: &mut [Sheet], redo: bool) {
+    fn apply(&self, sheets: &mut [Sheet], redo: bool) -> Vec<(usize, crate::sync::SheetMetaKind)> {
+        use crate::sync::SheetMetaKind;
+        let mut syncs = Vec::new();
         let Some(sh) = sheets.get_mut(self.sheet) else {
-            return;
+            return syncs;
         };
         if !self.col_widths.is_empty() {
             let def = sh.cols.default_size();
+            let mut items = Vec::with_capacity(self.col_widths.len());
             for &(c, before, after) in &self.col_widths {
                 let target = if redo { after } else { before };
-                sh.cols.set(c, target.unwrap_or(def));
+                let w = target.unwrap_or(def);
+                sh.cols.set(c, w);
+                items.push((c, w));
             }
             sh.layout_dirty = true;
             sh.bump_display_style_revision();
+            syncs.push((self.sheet, SheetMetaKind::ColWidths(items)));
         }
         if !self.row_heights.is_empty() {
             let def = sh.rows.default_size();
+            let mut items = Vec::with_capacity(self.row_heights.len());
             for &(r, before, after) in &self.row_heights {
                 let target = if redo { after } else { before };
-                sh.rows.set(r, target.unwrap_or(def));
+                let h = target.unwrap_or(def);
+                sh.rows.set(r, h);
+                items.push((r, h));
             }
             sh.layout_dirty = true;
             sh.bump_display_style_revision();
+            syncs.push((self.sheet, SheetMetaKind::RowHeights(items)));
         }
         if !self.hidden_rows_user.is_empty() {
+            let mut items = Vec::with_capacity(self.hidden_rows_user.len());
             for &(r, before, after) in &self.hidden_rows_user {
                 let hide = if redo { after } else { before };
                 if hide {
@@ -414,11 +470,14 @@ impl MetaEdit {
                 } else {
                     sh.hidden_rows_user.remove(&r);
                 }
+                items.push((r, hide));
             }
             sh.layout_dirty = true;
             sh.bump_display_style_revision();
+            syncs.push((self.sheet, SheetMetaKind::HiddenRows(items)));
         }
         if !self.hidden_cols.is_empty() {
+            let mut items = Vec::with_capacity(self.hidden_cols.len());
             for &(c, before, after) in &self.hidden_cols {
                 let hide = if redo { after } else { before };
                 if hide {
@@ -426,9 +485,11 @@ impl MetaEdit {
                 } else {
                     sh.hidden_cols.remove(&c);
                 }
+                items.push((c, hide));
             }
             sh.layout_dirty = true;
             sh.bump_display_style_revision();
+            syncs.push((self.sheet, SheetMetaKind::HiddenCols(items)));
         }
         if !self.notes.is_empty() {
             for (pos, before, after) in &self.notes {
@@ -437,9 +498,27 @@ impl MetaEdit {
                 match target {
                     Some(n) => {
                         sh.notes.insert(cref, n.clone());
+                        syncs.push((
+                            self.sheet,
+                            SheetMetaKind::Note {
+                                row: pos.0,
+                                col: pos.1,
+                                author: n.author.clone(),
+                                text: Some(n.text.clone()),
+                            },
+                        ));
                     }
                     None => {
                         sh.notes.remove(&cref);
+                        syncs.push((
+                            self.sheet,
+                            SheetMetaKind::Note {
+                                row: pos.0,
+                                col: pos.1,
+                                author: String::new(),
+                                text: None,
+                            },
+                        ));
                     }
                 }
             }
@@ -457,6 +536,103 @@ impl MetaEdit {
             }
             sh.bump_display_style_revision();
         }
+        if let Some((before, after)) = &self.cf {
+            sh.cf = if redo { after.clone() } else { before.clone() };
+            sh.cf_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if let Some((fb, fa, hb, ha)) = &self.filter {
+            sh.filter = if redo { fa.clone() } else { fb.clone() };
+            sh.hidden_rows = if redo { ha.clone() } else { hb.clone() };
+            sh.filter_dirty = true;
+            sh.layout_dirty = true;
+            sh.bump_display_style_revision();
+            syncs.push((
+                self.sheet,
+                SheetMetaKind::AutoFilter {
+                    range: sh.filter.as_ref().map(|f| f.range),
+                },
+            ));
+        }
+        if let Some((tb, ta)) = &self.tables {
+            sh.tables = if redo { ta.clone() } else { tb.clone() };
+            sh.tables_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if let Some((rb, ra, cb, ca)) = &self.outline {
+            sh.row_levels = if redo { ra.clone() } else { rb.clone() };
+            sh.col_levels = if redo { ca.clone() } else { cb.clone() };
+            sh.layout_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if !self.rich.is_empty() {
+            for (pos, before_cell, after_cell, before_runs, after_runs) in &self.rich {
+                let target_cell = if redo { after_cell } else { before_cell };
+                let target_runs = if redo { after_runs } else { before_runs };
+                sh.set(pos.0, pos.1, target_cell.clone());
+                match target_runs {
+                    Some(runs) if !runs.is_empty() => {
+                        sh.rich.insert(*pos, runs.clone());
+                    }
+                    _ => {
+                        sh.rich.remove(pos);
+                    }
+                }
+            }
+            sh.rich_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if let Some((before, after)) = &self.dv {
+            sh.dv = if redo { after.clone() } else { before.clone() };
+            sh.dv_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if !self.hyperlinks.is_empty() {
+            for (pos, before, after) in &self.hyperlinks {
+                let target = if redo { after } else { before };
+                match target {
+                    Some(link) => {
+                        sh.hyperlinks.insert(*pos, link.clone());
+                        let url = if !link.target.is_empty() {
+                            link.target.clone()
+                        } else if !link.location.is_empty() {
+                            format!("#{}", link.location)
+                        } else {
+                            String::new()
+                        };
+                        syncs.push((
+                            self.sheet,
+                            SheetMetaKind::Hyperlink {
+                                row: pos.0,
+                                col: pos.1,
+                                target: Some(url),
+                                tooltip: link.tooltip.clone(),
+                            },
+                        ));
+                    }
+                    None => {
+                        sh.hyperlinks.remove(pos);
+                        syncs.push((
+                            self.sheet,
+                            SheetMetaKind::Hyperlink {
+                                row: pos.0,
+                                col: pos.1,
+                                target: None,
+                                tooltip: String::new(),
+                            },
+                        ));
+                    }
+                }
+            }
+            sh.hyperlinks_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if let Some((before, after)) = &self.sparklines {
+            sh.sparklines = if redo { after.clone() } else { before.clone() };
+            sh.sparklines_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        syncs
     }
 }
 
@@ -615,6 +791,55 @@ impl PivotUndoAction {
 
 pub const COW_BATCH_THRESHOLD: usize = 16_384;
 
+/// 一等公民图表撤销/重做记录（覆盖插入、编辑、拖拽/缩放、行列互换、克隆与删除，绝不清空历史撤销栈）
+#[derive(Clone, Debug)]
+pub struct ChartUndoEdit {
+    pub sheet: usize,
+    pub charts_before: crate::model::SharedList<crate::charts::Chart>,
+    pub charts_after: crate::model::SharedList<crate::charts::Chart>,
+    pub deleted_before: Vec<(String, String)>,
+    pub deleted_after: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+struct ChartUndoAction {
+    label: String,
+    focus: (usize, u32, u32),
+    by_site: u32,
+    edit: ChartUndoEdit,
+}
+
+impl ChartUndoAction {
+    fn apply(&mut self, wb: &mut Workbook, redo: bool) -> Applied {
+        if let Some(sh) = wb.sheets.get_mut(self.edit.sheet) {
+            sh.charts = if redo {
+                self.edit.charts_after.clone()
+            } else {
+                self.edit.charts_before.clone()
+            };
+            sh.deleted_charts = if redo {
+                self.edit.deleted_after.clone()
+            } else {
+                self.edit.deleted_before.clone()
+            };
+            sh.charts_dirty = true;
+        }
+        wb.dirty = true;
+        Applied {
+            touched: Vec::new(),
+            style_changes: Vec::new(),
+            label: self.label.clone(),
+            focus: self.focus,
+            skipped: 0,
+            structural: false,
+            refresh_sizes: None,
+            merge_changes: Vec::new(),
+            merge_conflict: false,
+            total_touched: 0,
+        }
+    }
+}
+
 enum Entry {
     Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>, Option<ArrayEdit>),
     CowBatch(EntryStamp, Box<CowBatchAction>),
@@ -623,6 +848,7 @@ enum Entry {
     SheetTab(EntryStamp, SheetTabAction),
     Meta(EntryStamp, Box<MetaAction>),
     Pivot(EntryStamp, Box<PivotUndoAction>),
+    Chart(EntryStamp, Box<ChartUndoAction>),
 }
 
 impl Entry {
@@ -636,7 +862,8 @@ impl Entry {
             | Self::Structure(s, _)
             | Self::SheetTab(s, _)
             | Self::Meta(s, _)
-            | Self::Pivot(s, _) => *s,
+            | Self::Pivot(s, _)
+            | Self::Chart(s, _) => *s,
         }
     }
 
@@ -648,7 +875,8 @@ impl Entry {
             | Self::Structure(s, _)
             | Self::SheetTab(s, _)
             | Self::Meta(s, _)
-            | Self::Pivot(s, _) => s,
+            | Self::Pivot(s, _)
+            | Self::Chart(s, _) => s,
         }
     }
 
@@ -685,6 +913,7 @@ impl Entry {
             Self::SheetTab(_, a) => &a.label,
             Self::Meta(_, a) => &a.label,
             Self::Pivot(_, a) => &a.label,
+            Self::Chart(_, a) => &a.label,
         }
     }
     fn by_site(&self) -> u32 {
@@ -696,6 +925,7 @@ impl Entry {
             Self::SheetTab(_, a) => a.by_site,
             Self::Meta(_, a) => a.by_site,
             Self::Pivot(_, a) => a.by_site,
+            Self::Chart(_, a) => a.by_site,
         }
     }
 }
@@ -1466,6 +1696,13 @@ impl NumericSortAction {
 
 enum SheetTabChange {
     Append { removed: Option<Box<Sheet>> },
+    Insert { removed: Option<Box<Sheet>> },
+    Delete {
+        sheet: Option<Box<Sheet>>,
+        local_names: Vec<(String, Option<usize>, String)>,
+        references: crate::sheet_ops::RenameReferences,
+    },
+    Move { from: usize, to: usize },
     Rename { before: String, after: String, references: crate::sheet_ops::RenameReferences },
 }
 
@@ -1496,10 +1733,51 @@ impl SheetTabAction {
                     || wb.pivots_pending.iter().any(|(sheet, ..)| *sheet == self.index)
                     || wb.pivots_pending2.iter().any(|(sheet, ..)| *sheet == self.index)
                 { return None; }
-                // Pop only the appended sheet. A normal delete rewrites formulas in other
-                // sheets, including unresolved references that existed before this append.
                 *removed = wb.sheets.pop().map(Box::new);
                 wb.calc_pending_sheets.remove(&self.index);
+            }
+            SheetTabChange::Insert { removed } if redo => {
+                if self.index > wb.sheets.len() { return None; }
+                let sh = *removed.take()?;
+                if !crate::sheet_ops::insert_sheet(wb, self.index, sh) {
+                    return None;
+                }
+                focus = (self.index, 0, 0);
+            }
+            SheetTabChange::Insert { removed } => {
+                if wb.sheets.len() <= 1 || self.index >= wb.sheets.len()
+                    || wb.sheets[self.index].identity != self.identity
+                { return None; }
+                let rec = crate::sheet_ops::delete_with_history(wb, self.index)?;
+                *removed = Some(Box::new(rec.sheet));
+                wb.calc_pending_sheets.remove(&self.index);
+            }
+            SheetTabChange::Delete { sheet, local_names, references } if redo => {
+                if wb.sheets.len() <= 1 || self.index >= wb.sheets.len()
+                    || wb.sheets[self.index].identity != self.identity
+                { return None; }
+                let rec = crate::sheet_ops::delete_with_history(wb, self.index)?;
+                *sheet = Some(Box::new(rec.sheet));
+                *local_names = rec.local_names;
+                *references = rec.references;
+                focus = (self.index.min(wb.sheets.len() - 1), 0, 0);
+            }
+            SheetTabChange::Delete { sheet, local_names, references } => {
+                let sh = *sheet.take()?;
+                if !crate::sheet_ops::restore_deleted_sheet(wb, self.index, sh, local_names, references) {
+                    return None;
+                }
+                focus = (self.index, self.previous_focus.1, self.previous_focus.2);
+            }
+            SheetTabChange::Move { from, to } => {
+                let (src, dst) = if redo { (*from, *to) } else { (*to, *from) };
+                if src >= wb.sheets.len() || dst >= wb.sheets.len()
+                    || wb.sheets[src].identity != self.identity
+                { return None; }
+                if !crate::sheet_ops::reorder_sheet(wb, src, dst) {
+                    return None;
+                }
+                focus = (dst, self.previous_focus.1, self.previous_focus.2);
             }
         }
         wb.dirty = true;
@@ -1887,13 +2165,29 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
 
 impl Default for UndoStack {
     fn default() -> Self {
-        Self { done: Vec::new(), undone: Vec::new(), pending_compaction: false, limit: 200, site: 0 }
+        Self {
+            done: Vec::new(),
+            undone: Vec::new(),
+            pending_compaction: false,
+            limit: 200,
+            site: 0,
+            last_meta_sync: Vec::new(),
+            last_needs_recalc: false,
+        }
     }
 }
 
 impl UndoStack {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn take_meta_sync(&mut self) -> Vec<(usize, crate::sync::SheetMetaKind)> {
+        std::mem::take(&mut self.last_meta_sync)
+    }
+
+    pub fn take_needs_recalc(&mut self) -> bool {
+        std::mem::take(&mut self.last_needs_recalc)
     }
 
     /// 记一步。相同格子在一步里只记第一次（后写的 after 覆盖）
@@ -2087,6 +2381,23 @@ impl UndoStack {
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
+    /// 把跨表联动改写的 `CellDelta` 合并到最近一条 `Entry::Cells` 撤销记录中，
+    /// 让移动单元格及其跨表公式同步改写成为单步原子 Undo。
+    pub fn extend_last_deltas(&mut self, extra: Vec<CellDelta>) {
+        if extra.is_empty() {
+            return;
+        }
+        if let Some(Entry::Cells(stamp, action, _, _)) = self.done.last_mut() {
+            let add_bytes: usize = extra.len() * std::mem::size_of::<CellDelta>()
+                + extra
+                    .iter()
+                    .map(|d| cell_heap_bytes(&d.before) + cell_heap_bytes(&d.after))
+                    .sum::<usize>();
+            stamp.payload_bytes += add_bytes;
+            action.deltas.extend(extra);
+        }
+    }
+
     pub fn undo_labels(&self, limit: usize) -> Vec<String> {
         self.done
             .iter()
@@ -2233,18 +2544,81 @@ impl UndoStack {
         self.done.last().map(Entry::id)
     }
 
+    pub fn push_chart_edit(
+        &mut self,
+        label: impl Into<String>,
+        focus: (usize, u32, u32),
+        edit: ChartUndoEdit,
+    ) {
+        self.undone.clear();
+        let approx_bytes = 512 + edit.charts_after.len() * 256;
+        self.done.push(Entry::Chart(
+            next_entry(approx_bytes),
+            Box::new(ChartUndoAction {
+                label: label.into(),
+                focus,
+                by_site: self.site,
+                edit,
+            }),
+        ));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
     pub fn undo_is_structure(&self) -> bool {
-        matches!(self.done.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..)))
+        matches!(self.done.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..) | Entry::Chart(..)))
     }
 
     pub fn redo_is_structure(&self) -> bool {
-        matches!(self.undone.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..)))
+        matches!(self.undone.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..) | Entry::Chart(..)))
     }
 
     pub fn record_appended_sheet(&mut self, wb: &Workbook, previous_focus: (usize, u32, u32)) {
         let index = wb.sheets.len() - 1;
         self.push_sheet_tab(index, wb.sheets[index].identity, previous_focus, "新建工作表",
             SheetTabChange::Append { removed: None });
+    }
+
+    pub fn record_inserted_sheet(&mut self, wb: &Workbook, index: usize, label: &str, previous_focus: (usize, u32, u32)) {
+        if let Some(sh) = wb.sheets.get(index) {
+            self.push_sheet_tab(index, sh.identity, previous_focus, label,
+                SheetTabChange::Insert { removed: None });
+        }
+    }
+
+    pub fn delete_sheet(&mut self, wb: &mut Workbook, index: usize, previous_focus: (usize, u32, u32)) -> bool {
+        let Some(rec) = crate::sheet_ops::delete_with_history(wb, index) else {
+            return false;
+        };
+        let identity = rec.sheet.identity;
+        self.push_sheet_tab(
+            index,
+            identity,
+            previous_focus,
+            "删除工作表",
+            SheetTabChange::Delete {
+                sheet: Some(Box::new(rec.sheet)),
+                local_names: rec.local_names,
+                references: rec.references,
+            },
+        );
+        true
+    }
+
+    pub fn move_sheet(&mut self, wb: &mut Workbook, from: usize, to: usize, previous_focus: (usize, u32, u32)) -> bool {
+        let Some(identity) = wb.sheets.get(from).map(|s| s.identity) else {
+            return false;
+        };
+        if !crate::sheet_ops::reorder_sheet(wb, from, to) {
+            return false;
+        }
+        self.push_sheet_tab(
+            to,
+            identity,
+            previous_focus,
+            "移动工作表",
+            SheetTabChange::Move { from, to },
+        );
+        true
     }
 
     pub fn rename_sheet(&mut self, wb: &mut Workbook, index: usize, name: &str, focus: (usize, u32, u32)) -> bool {
@@ -2261,8 +2635,12 @@ impl UndoStack {
                       label: &str, change: SheetTabChange) {
         let bytes = match &change {
             SheetTabChange::Rename { before, after, references } => before.len() + after.len() + references.payload_bytes(),
-            SheetTabChange::Append { .. } => 0,
+            SheetTabChange::Delete { sheet, references, .. } => {
+                sheet.as_ref().map_or(0, |s| s.allocated_bytes() + 1024) + references.payload_bytes()
+            }
+            SheetTabChange::Append { .. } | SheetTabChange::Insert { .. } | SheetTabChange::Move { .. } => 0,
         };
+        self.undone.clear();
         self.done.push(Entry::SheetTab(next_entry(bytes), SheetTabAction {
             label: label.into(), index, identity, previous_focus, change, by_site: self.site,
         }));
@@ -2290,7 +2668,20 @@ impl UndoStack {
 
     pub fn undo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
         self.settle_before_replay();
-        if !self.undo_is_structure() { return self.undo(&mut wb.sheets, guard); }
+        self.last_meta_sync.clear();
+        self.last_needs_recalc = false;
+        if !self.undo_is_structure() {
+            if let Some(Entry::Meta(_, action)) = self.done.last() {
+                if action.by_site == 0 || self.site == 0 || action.by_site == self.site {
+                    if let Some((before_names, _)) = &action.edit.names {
+                        wb.names = before_names.clone();
+                        wb.names_dirty = true;
+                        self.last_needs_recalc = true;
+                    }
+                }
+            }
+            return self.undo(&mut wb.sheets, guard);
+        }
         if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::SheetTab(_, action)) = self.done.last_mut() {
             let applied = action.apply(wb, false)?;
@@ -2298,6 +2689,11 @@ impl UndoStack {
             return Some(applied);
         }
         if let Some(Entry::Pivot(_, action)) = self.done.last_mut() {
+            let applied = action.apply(wb, false);
+            self.undone.push(self.done.pop()?);
+            return Some(applied);
+        }
+        if let Some(Entry::Chart(_, action)) = self.done.last_mut() {
             let applied = action.apply(wb, false);
             self.undone.push(self.done.pop()?);
             return Some(applied);
@@ -2313,7 +2709,20 @@ impl UndoStack {
 
     pub fn redo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
         self.settle_before_replay();
-        if !self.redo_is_structure() { return self.redo(&mut wb.sheets, guard); }
+        self.last_meta_sync.clear();
+        self.last_needs_recalc = false;
+        if !self.redo_is_structure() {
+            if let Some(Entry::Meta(_, action)) = self.undone.last() {
+                if action.by_site == 0 || self.site == 0 || action.by_site == self.site {
+                    if let Some((_, after_names)) = &action.edit.names {
+                        wb.names = after_names.clone();
+                        wb.names_dirty = true;
+                        self.last_needs_recalc = true;
+                    }
+                }
+            }
+            return self.redo(&mut wb.sheets, guard);
+        }
         if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::SheetTab(_, action)) = self.undone.last_mut() {
             let applied = action.apply(wb, true)?;
@@ -2321,6 +2730,11 @@ impl UndoStack {
             return Some(applied);
         }
         if let Some(Entry::Pivot(_, action)) = self.undone.last_mut() {
+            let applied = action.apply(wb, true);
+            self.done.push(self.undone.pop()?);
+            return Some(applied);
+        }
+        if let Some(Entry::Chart(_, action)) = self.undone.last_mut() {
             let applied = action.apply(wb, true);
             self.done.push(self.undone.pop()?);
             return Some(applied);
@@ -2353,7 +2767,7 @@ impl UndoStack {
         }
         let site = self.site;
         if let Some(Entry::Meta(_, action)) = self.done.last() {
-            action.edit.apply(sheets, false);
+            let syncs = action.edit.apply(sheets, false);
             let applied = Applied {
                 touched: Vec::new(),
                 label: action.label.clone(),
@@ -2366,6 +2780,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
+            self.last_meta_sync = syncs;
             let entry = self.done.pop()?;
             self.undone.push(entry);
             return Some(applied);
@@ -2512,7 +2927,7 @@ impl UndoStack {
         }
         let site = self.site;
         if let Some(Entry::Meta(_, action)) = self.undone.last() {
-            action.edit.apply(sheets, true);
+            let syncs = action.edit.apply(sheets, true);
             let applied = Applied {
                 touched: Vec::new(),
                 label: action.label.clone(),
@@ -2525,6 +2940,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
+            self.last_meta_sync = syncs;
             let entry = self.undone.pop()?;
             self.done.push(entry);
             return Some(applied);

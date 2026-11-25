@@ -283,6 +283,71 @@ fn parse_color_tag(
     ParsedColor { theme, rgb }
 }
 
+pub(crate) fn resolve_color_attrs(
+    e: &quick_xml::events::BytesStart<'_>,
+    palette: &[[u8; 3]],
+    indexed_palette: &[[u8; 3]; 64],
+) -> Option<[u8; 3]> {
+    let pal = if palette.is_empty() {
+        &DEFAULT_THEME_PALETTE[..]
+    } else {
+        palette
+    };
+    parse_color_tag(e, pal, indexed_palette).rgb
+}
+
+pub(crate) fn parse_indexed_palette(styles_xml: &str) -> [[u8; 3]; 64] {
+    let mut indexed_palette = DEFAULT_INDEXED_PALETTE;
+    let mut r = Reader::from_str(styles_xml);
+    let mut in_indexed = false;
+    let mut slot = 0usize;
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e)) => {
+                let lname = local_name(e.name().as_ref()).to_string();
+                if lname == "indexedColors" {
+                    in_indexed = true;
+                    slot = 0;
+                } else if in_indexed && lname == "rgbColor" {
+                    for a in e.attributes().flatten() {
+                        if local_name(a.key.as_ref()) == "rgb" {
+                            if let Some(c) = hex6(&a.value.to_string()) {
+                                if slot < indexed_palette.len() {
+                                    indexed_palette[slot] = c;
+                                }
+                            }
+                        }
+                    }
+                    slot += 1;
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let lname = local_name(e.name().as_ref()).to_string();
+                if in_indexed && lname == "rgbColor" {
+                    for a in e.attributes().flatten() {
+                        if local_name(a.key.as_ref()) == "rgb" {
+                            if let Some(c) = hex6(&a.value.to_string()) {
+                                if slot < indexed_palette.len() {
+                                    indexed_palette[slot] = c;
+                                }
+                            }
+                        }
+                    }
+                    slot += 1;
+                }
+            }
+            Ok(Event::End(e)) => {
+                if local_name(e.name().as_ref()) == "indexedColors" {
+                    break;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    indexed_palette
+}
+
 /// fonts/fills/cellXfs：取每个 xf 的主题字体色与主题填充色
 pub fn parse_xfs(styles_xml: &str) -> Vec<XfTheme> {
     parse_styles_with_palette(styles_xml, &DEFAULT_THEME_PALETTE).0
@@ -292,57 +357,7 @@ pub fn parse_styles_with_palette(
     styles_xml: &str,
     palette: &[[u8; 3]],
 ) -> (Vec<XfTheme>, Vec<XfResolved>) {
-    let mut indexed_palette = DEFAULT_INDEXED_PALETTE;
-    // 先扫自定义 <indexedColors><rgbColor rgb="..."/></indexedColors>（若存在）
-    {
-        let mut r = Reader::from_str(styles_xml);
-        let mut in_indexed = false;
-        let mut slot = 0usize;
-        loop {
-            match r.read_event() {
-                Ok(Event::Start(e)) => {
-                    let lname = local_name(e.name().as_ref()).to_string();
-                    if lname == "indexedColors" {
-                        in_indexed = true;
-                        slot = 0;
-                    } else if in_indexed && lname == "rgbColor" {
-                        for a in e.attributes().flatten() {
-                            if local_name(a.key.as_ref()) == "rgb" {
-                                if let Some(c) = hex6(&a.value.to_string()) {
-                                    if slot < indexed_palette.len() {
-                                        indexed_palette[slot] = c;
-                                    }
-                                }
-                            }
-                        }
-                        slot += 1;
-                    }
-                }
-                Ok(Event::Empty(e)) => {
-                    let lname = local_name(e.name().as_ref()).to_string();
-                    if in_indexed && lname == "rgbColor" {
-                        for a in e.attributes().flatten() {
-                            if local_name(a.key.as_ref()) == "rgb" {
-                                if let Some(c) = hex6(&a.value.to_string()) {
-                                    if slot < indexed_palette.len() {
-                                        indexed_palette[slot] = c;
-                                    }
-                                }
-                            }
-                        }
-                        slot += 1;
-                    }
-                }
-                Ok(Event::End(e)) => {
-                    if local_name(e.name().as_ref()) == "indexedColors" {
-                        break;
-                    }
-                }
-                Ok(Event::Eof) | Err(_) => break,
-                _ => {}
-            }
-        }
-    }
+    let indexed_palette = parse_indexed_palette(styles_xml);
 
     let mut font_cols: Vec<ParsedColor> = Vec::new();
     let mut fill_cols: Vec<ParsedColor> = Vec::new();

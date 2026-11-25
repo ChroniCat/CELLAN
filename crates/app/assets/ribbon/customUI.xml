@@ -23,6 +23,7 @@
           <button id="FilePrintPreview" label="打印预览" size="large" imageMso="Print" onAction="PrintPreview"/>
           <box boxStyle="vertical">
             <button id="ExportPdf" label="导出 PDF" imageMso="PdfExport" screentip="把当前表导出成 PDF" onAction="ExportPdf" sizeString="90"/>
+            <button id="ExportCsv" label="导出 CSV" imageMso="ImportCsv" screentip="导出当前表为 CSV/TSV（支持 UTF-8 BOM / GB18030 / 自定义分隔符）" onAction="ExportCsv" sizeString="90"/>
           </box>
         </group>
         <group id="GroupUndo" label="编辑">
@@ -503,6 +504,15 @@
       <tab id="TabInsert" label="插入" keytip="N">
         <group id="GroupHeaderFooter" label="文本">
           <button id="InsertTextBox" label="文本框" size="large" imageMso="TextBox" screentip="在当前单元格上放一个文本框" onAction="InsertTextBox" keytip="X"/>
+          <menu id="InsertShapesMenu" label="形状" size="large" imageMso="TextBox" screentip="插入矢量形状（矩形/圆角矩形/箭头/直线/椭圆/菱形/标注框）" keytip="SH">
+            <button id="ShapeRect" label="矩形" onAction="InsertShape:Rect"/>
+            <button id="ShapeRoundRect" label="圆角矩形" onAction="InsertShape:RoundedRect"/>
+            <button id="ShapeRightArrow" label="右箭头" onAction="InsertShape:RightArrow"/>
+            <button id="ShapeLine" label="直线" onAction="InsertShape:Line"/>
+            <button id="ShapeEllipse" label="椭圆" onAction="InsertShape:Ellipse"/>
+            <button id="ShapeDiamond" label="菱形" onAction="InsertShape:Diamond"/>
+            <button id="ShapeCallout" label="标注框" onAction="InsertShape:Callout"/>
+          </menu>
           <box boxStyle="vertical">
             <button id="DrawTextBox" label="绘制横排文本框" imageMso="TextBoxDraw" screentip="在表格上拖出一个横排文本框" onAction="DrawTextBox" sizeString="124"/>
             <button id="EditTextBox" label="编辑文本框" imageMso="FontColor" screentip="改文字/字号/颜色/填充" onAction="EditTextBox" sizeString="124"/>
@@ -515,18 +525,33 @@
         </group>
         <group id="GroupCharts" label="图表">
           <splitButton id="ChartSplit" size="large" sizeString="48" imageMso="Chart" label="图表">
-            <button id="ColumnChart" label="图表" imageMso="Chart" screentip="按选区插入图表（默认柱状图，点箭头可选折线/饼图/散点等）" onAction="ColumnChart"/>
+            <button id="ColumnChart" label="智能图表" imageMso="Chart" screentip="打开智能图表向导：自动分析数据画像并推荐最佳图型，支持 22 种专业图表与实时预览" onAction="ColumnChart"/>
             <menu id="ChartMenu">
-              <button id="ChartColItem" label="柱状图" imageMso="Chart" onAction="ColumnChart"/>
-              <button id="ChartLineItem" label="折线图" imageMso="SparkLine" onAction="LineChart"/>
-              <button id="ChartPieItem" label="饼图" imageMso="Chart" onAction="PieChart"/>
+              <button id="ChartWizardItem" label="★ 智能推荐图表向导…" imageMso="Chart" onAction="ChartWizard"/>
+              <menuSeparator id="ChartSep0"/>
+              <button id="ChartColItem" label="柱状图" imageMso="Chart" onAction="ColumnClusteredChart"/>
+              <button id="ChartColStackItem" label="堆积柱状图" imageMso="Chart" onAction="ColumnStackedChart"/>
+              <button id="ChartCol100Item" label="百分比堆积柱图" imageMso="Chart" onAction="ColumnStacked100Chart"/>
               <button id="ChartBarItem" label="条形图" imageMso="SparkColumn" onAction="BarChart"/>
               <button id="ChartBarStackItem" label="堆积条形图" imageMso="SparkColumn" onAction="BarStackedChart"/>
+              <button id="ChartBar100Item" label="百分比堆积条图" imageMso="SparkColumn" onAction="BarStacked100Chart"/>
+              <menuSeparator id="ChartSepLine"/>
+              <button id="ChartLineItem" label="折线图" imageMso="SparkLine" onAction="LineChart"/>
               <button id="ChartAreaItem" label="面积图" imageMso="Chart" onAction="AreaChart"/>
-              <button id="ChartDoughnutItem" label="圆环图" imageMso="Chart" onAction="DoughnutChart"/>
+              <button id="ChartAreaStackItem" label="堆积面积图" imageMso="Chart" onAction="AreaStackedChart"/>
+              <button id="ChartComboItem" label="组合图（双轴柱+线）" imageMso="Chart" onAction="ComboChart"/>
+              <menuSeparator id="ChartSepFin"/>
+              <button id="ChartWaterfallItem" label="财务瀑布图（损益桥）" imageMso="Chart" onAction="WaterfallChart"/>
+              <button id="ChartFunnelItem" label="转化漏斗图" imageMso="Chart" onAction="FunnelChart"/>
+              <button id="ChartTreemapItem" label="矩形树图" imageMso="Chart" onAction="TreemapChart"/>
+              <button id="ChartPieItem" label="饼图" imageMso="Chart" onAction="PieChart"/>
+              <button id="ChartDoughnutItem" label="圆环图（中心 KPI）" imageMso="Chart" onAction="DoughnutChart"/>
+              <menuSeparator id="ChartSepStat"/>
               <button id="ChartScatterItem" label="散点图" imageMso="Chart" onAction="ScatterChart"/>
+              <button id="ChartBubbleItem" label="气泡图（三维）" imageMso="Chart" onAction="BubbleChart"/>
+              <button id="ChartHistogramItem" label="直方图 / 帕累托" imageMso="Chart" onAction="HistogramChart"/>
+              <button id="ChartBoxWhiskerItem" label="箱线图（四分位）" imageMso="Chart" onAction="BoxWhiskerChart"/>
               <button id="ChartRadarItem" label="雷达图" imageMso="Chart" onAction="RadarChart"/>
-              <button id="ChartComboItem" label="组合图（柱状+折线）" imageMso="Chart" onAction="ComboChart"/>
               <menuSeparator id="ChartSep1"/>
               <button id="ChartMenuMgr" label="管理本表图表…" imageMso="ChartList" onAction="ChartManager"/>
             </menu>
@@ -597,6 +622,7 @@
             <menu id="PageBreaksMenu" label="分隔符" imageMso="PageBreak" sizeString="82" screentip="插入或删除分页符" keytip="B">
               <button id="InsertPageBreak" label="插入分页符" onAction="PageBreakInsert"/>
               <button id="RemovePageBreak" label="删除分页符" onAction="PageBreakRemove"/>
+              <button id="ResetAllPageBreaks" label="重置所有分页符" onAction="PageBreakResetAll"/>
             </menu>
           </box>
         </group>
@@ -657,6 +683,7 @@
         </group>
         <group id="GroupPrintPage" label="打印">
           <button id="PagePrintPreview" label="打印预览" size="large" imageMso="Print" onAction="PrintPreview"/>
+          <button id="PageExportWorkbookPdf" label="整簿 PDF" size="large" imageMso="PdfExport" screentip="导出整本工作簿（含各表侧边栏书签目录）为 PDF" onAction="ExportWorkbookPdf"/>
         </group>
       </tab>
 
@@ -792,11 +819,12 @@
           <box boxStyle="vertical" paddingTop="0" gap="2">
             <button id="GroupSelection" label="组合" imageMso="GroupRows" screentip="整列选区组合列，其余组合行" onAction="GroupSelection" sizeString="88"/>
             <button id="UngroupSelection" label="取消组合" imageMso="UngroupRows" screentip="整列选区拆列，其余拆行" onAction="UngroupSelection" sizeString="88"/>
-            <button id="OutlineSettings" label="分级设置" imageMso="OutlineLevels" screentip="明细在下方/右侧、显示分级符号" onAction="OutlineSettings" sizeString="88"/>
+            <button id="OutlineSettings" label="分级设置" imageMso="OutlineLevels" screentip="明细在下方/右侧、自动分级与清除分级" onAction="OutlineSettings" sizeString="88"/>
           </box>
-          <box boxStyle="vertical" paddingTop="10" gap="6">
+          <box boxStyle="vertical" paddingTop="0" gap="2">
             <button id="HideDetail" label="隐藏明细" imageMso="HideDetail" onAction="HideDetail" sizeString="84"/>
             <button id="ShowDetail" label="显示明细" imageMso="ShowDetail" onAction="ShowDetail" sizeString="84"/>
+            <button id="OutlineAuto" label="自动分级" imageMso="OutlineLevels" screentip="按表内 SUBTOTAL/SUM 汇总自动生成分级" onAction="OutlineAuto" sizeString="84"/>
           </box>
         </group>
         <group id="GroupGetData" label="获取数据">
@@ -819,9 +847,10 @@
             <toggleButton id="DataFilter" label="筛选" imageMso="Filter" keytip="F" screentip="按当前区域启用筛选" onAction="Filter" sizeString="78"/>
             <button id="MultiSort" label="排序..." imageMso="SortDialog" onAction="MultiSort" sizeString="78" keytip="SS"/>
           </box>
-          <box boxStyle="vertical" paddingTop="10" gap="6">
+          <box boxStyle="vertical" paddingTop="0" gap="2">
             <button id="FilterClear" label="清除" imageMso="Eraser" onAction="FilterClear" sizeString="84" keytip="C"/>
             <button id="FilterReapply" label="重新应用" imageMso="FilterReapply" onAction="FilterReapply" sizeString="84" keytip="Y"/>
+            <button id="FilterAdvanced" label="高级筛选" imageMso="Filter" screentip="按条件区域原地筛选或复制到其他位置（支持唯一记录）" onAction="FilterAdvanced" sizeString="84" keytip="Q"/>
           </box>
         </group>
         <group id="GroupDataTools" label="数据工具">
@@ -882,6 +911,7 @@
             <button id="NextComment" label="下一条批注" imageMso="CommentNext" onAction="NextComment" sizeString="104" keytip="N"/>
             <button id="ShowShowCommentBtn" label="显示批注" imageMso="ShowComment" onAction="ShowComment" sizeString="104" keytip="H1"/>
           </box>
+          <toggleButton id="ShowAllComments" label="显示所有批注" size="large" imageMso="ShowComment" screentip="切换常驻显示当前工作表的全部批注与线程会话" onAction="ShowAllComments" keytip="H2"/>
         </group>
         <group id="GroupA11y" label="辅助功能">
           <button id="A11yChecker" label="检查辅助功能" size="large" imageMso="A11y" screentip="合并单元格/空表头/缺替代文字等" onAction="A11yChecker" keytip="A"/>
@@ -936,7 +966,7 @@
             <box boxStyle="horizontal">
               <button id="ZoomIn" imageMso="ZoomIn" screentip="放大" onAction="ZoomIn"/>
               <labelControl id="ZoomPercent" fontSize="11"/>
-              <slider id="ZoomSlider" sizeString="96" min="0.5" max="2.5"/>
+              <slider id="ZoomSlider" sizeString="96" min="0.1" max="4.0"/>
             </box>
           </box>
         </group>
@@ -1010,6 +1040,17 @@
             <box boxStyle="vertical">
               <button id="TableFilter" label="筛选" imageMso="Filter" screentip="在表格标题行上加筛选" onAction="Filter" sizeString="100"/>
               <toggleButton id="TableTotals" label="汇总行" imageMso="Sum" screentip="在表格底部加/去汇总行" onAction="ToggleTotals" sizeString="100"/>
+              <menu id="TableTotalsFnMenu" label="汇总函数" imageMso="Sum" sizeString="100">
+                <button id="TableTotSum" label="求和 (SUBTOTAL 109)" onAction="TableTotalsFn:sum"/>
+                <button id="TableTotAvg" label="平均值 (SUBTOTAL 101)" onAction="TableTotalsFn:average"/>
+                <button id="TableTotCnt" label="计数 (SUBTOTAL 103)" onAction="TableTotalsFn:count"/>
+                <button id="TableTotCntNum" label="数值计数 (SUBTOTAL 102)" onAction="TableTotalsFn:countNums"/>
+                <button id="TableTotMax" label="最大值 (SUBTOTAL 104)" onAction="TableTotalsFn:max"/>
+                <button id="TableTotMin" label="最小值 (SUBTOTAL 105)" onAction="TableTotalsFn:min"/>
+                <button id="TableTotStd" label="标准偏差 (SUBTOTAL 107)" onAction="TableTotalsFn:stdDev"/>
+                <button id="TableTotVar" label="方差 (SUBTOTAL 110)" onAction="TableTotalsFn:var"/>
+                <button id="TableTotNone" label="无" onAction="TableTotalsFn:none"/>
+              </menu>
             </box>
           </group>
           <group id="GroupTableStyle" label="表格样式">
@@ -1053,10 +1094,25 @@
       </tabSet>
       <tabSet idMso="TabSetChartTools" label="图表工具">
         <tab id="TabChartTools" label="图表工具">
-          <group id="GroupChartTools" label="图表">
+          <group id="GroupChartStudio" label="设计器">
+            <toggleButton id="ChartStudioToggle" label="设计器面板" size="large" imageMso="ChartEdit" screentip="打开或关闭右侧 Chart Studio 实时设计器（22 图型/主题/坐标轴/回归趋势/参考线）" onAction="ChartStudioToggle"/>
             <box boxStyle="vertical">
-              <button id="ChartEdit" label="编辑图表" imageMso="ChartEdit" screentip="改类型/标题/系列" onAction="ChartEdit" sizeString="104"/>
-              <button id="ChartToolsManager" label="图表管理" imageMso="Chart" screentip="查看本表所有图表" onAction="ChartManager" sizeString="104"/>
+              <button id="ChartCycleTheme" label="切换配色主题" imageMso="Chart" screentip="轮换 8 套出版级配色主题" onAction="ChartCycleTheme" sizeString="108"/>
+              <button id="ChartSwitchRowCol" label="切换行/列" imageMso="SortDialog" screentip="一键互换分类轴与数据系列方向" onAction="ChartSwitchRowCol" sizeString="108"/>
+            </box>
+          </group>
+          <group id="GroupChartAnalytics" label="元素与分析">
+            <box boxStyle="vertical">
+              <toggleButton id="ChartToggleLabels" label="数据标签" imageMso="ShowComment" screentip="显示或隐藏数值数据标签" onAction="ChartToggleLabels" sizeString="96"/>
+              <toggleButton id="ChartToggleTrendline" label="回归趋势线" imageMso="SparkLine" screentip="快速添加/移除线性回归趋势线（显示公式与 R²）" onAction="ChartToggleTrendline" sizeString="96"/>
+            </box>
+          </group>
+          <group id="GroupChartTools" label="导出与管理">
+            <button id="ChartExportSvg" label="导出 SVG" size="large" imageMso="Image" screentip="导出无损出版级矢量图 SVG 文件" onAction="ChartExportSvg"/>
+            <box boxStyle="vertical">
+              <button id="ChartDuplicate" label="复制图表" imageMso="Chart" screentip="克隆当前图表及全部样式分析配置" onAction="ChartDuplicate" sizeString="92"/>
+              <button id="ChartToolsManager" label="图表管理" imageMso="ChartList" screentip="管理本表所有图表" onAction="ChartManager" sizeString="92"/>
+              <button id="ChartDelete" label="删除图表" imageMso="Close" screentip="删除当前选中图表（Ctrl+Z 可恢复）" onAction="ChartDelete" sizeString="92"/>
             </box>
           </group>
           <group id="GroupCurrentChart" label="当前图表">

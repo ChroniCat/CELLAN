@@ -152,10 +152,10 @@ impl PageBreaks {
 
     /// 计算当前帧用于字体光栅化的有效缩放比 `(raster_zoom, is_debouncing)`。
     pub(crate) fn effective_font_zoom(&mut self, zoom: f32) -> (f32, bool) {
-        let z = zoom.clamp(0.5, 2.5);
+        let z = zoom.clamp(0.1, 4.0);
         if let Some(until) = self.wheel_zoom_until {
             if std::time::Instant::now() < until {
-                let quantized = ((z * 20.0).round() / 20.0).clamp(0.5, 2.5);
+                let quantized = ((z * 20.0).round() / 20.0).clamp(0.1, 4.0);
                 return (quantized, (quantized - z).abs() > 0.0005);
             }
             self.wheel_zoom_until = None;
@@ -448,10 +448,25 @@ pub(crate) enum PreparedText {
         strikethrough: bool,
     },
     Rich {
-        runs: Arc<[(f32, f32, Arc<egui::Galley>, Color32)]>,
+        galley: Arc<egui::Galley>,
+        offset: Vec2,
+        color: Color32,
+        fits: bool,
         spill_lr: (f32, f32),
         underline: u8,
+        strikethrough: bool,
+        multiline: bool,
+    },
+    Accounting {
+        left: Option<Arc<egui::Galley>>,
+        fill: Option<(f32, Arc<egui::Galley>)>,
+        right: Option<Arc<egui::Galley>>,
+        left_x: f32,
+        right_x: f32,
+        y: f32,
         color: Color32,
+        underline: u8,
+        strikethrough: bool,
     },
     Vertical {
         chars: Arc<[(f32, f32, Arc<egui::Galley>)]>,
@@ -481,7 +496,8 @@ pub(crate) struct PreparedCell {
     pub has_rich: bool,
     pub depends_on_row_neighbors: bool,
     pub bg_fill: Option<Color32>,
-    pub cf_bar: Option<(f32, Color32)>,
+    pub pattern: Option<sheetcore::style_ext::FillPattern>,
+    pub cf_bar: Option<cf::BarOverlay>,
     pub cf_borders: Option<Box<[Option<(f32, Color32)>; 4]>>,
     pub diagonal: Option<(u8, Color32, bool, bool)>,
     pub borders: [Border; 4],
@@ -495,6 +511,9 @@ pub(crate) struct ViewportCacheKey {
     pub cell_epoch: CellCacheEpoch,
     pub scroll_x_bits: u32,
     pub scroll_y_bits: u32,
+    pub is_split: bool,
+    pub split_scroll_x_bits: u32,
+    pub split_scroll_y_bits: u32,
     pub origin_x_bits: u32,
     pub origin_y_bits: u32,
     pub avail_x_bits: u32,
@@ -1120,14 +1139,42 @@ impl Rules {
         &mut self,
         painter: &egui::Painter,
         sh: &Sheet,
-        _doc_gen: u64,
+        doc_gen: u64,
         wb_epoch: u64,
         fonts_gen: u64,
         ci: usize,
         rect: Rect,
         ch: &sheetcore::charts::Chart,
     ) -> Arc<[Shape]> {
-        let fp = charts_fingerprint(&sh.charts);
+        self.chart_shapes_in(
+            painter,
+            sh,
+            doc_gen,
+            wb_epoch,
+            fonts_gen,
+            ci,
+            rect,
+            ch,
+            DateSystem::D1900,
+        )
+    }
+
+    pub(crate) fn chart_shapes_in(
+        &mut self,
+        painter: &egui::Painter,
+        sh: &Sheet,
+        _doc_gen: u64,
+        wb_epoch: u64,
+        fonts_gen: u64,
+        ci: usize,
+        rect: Rect,
+        ch: &sheetcore::charts::Chart,
+        date_system: DateSystem,
+    ) -> Arc<[Shape]> {
+        let mut fp = charts_fingerprint(&sh.charts);
+        if date_system == DateSystem::D1904 {
+            fp ^= 0x9e37_79b9_7f4a_7c15;
+        }
         let epoch = (sh.identity, wb_epoch, fonts_gen, fp);
         if self.charts_epoch != Some(epoch) {
             self.charts.clear();
@@ -1138,7 +1185,8 @@ impl Rules {
             return cached.clone();
         }
         let local_rect = Rect::from_min_size(Pos2::ZERO, rect.size());
-        let built: Arc<[Shape]> = crate::chart_view::build_chart_shapes(painter, local_rect, ch).into();
+        let built: Arc<[Shape]> =
+            crate::chart_view::build_chart_shapes_in(painter, local_rect, ch, date_system).into();
         if self.charts.len() > 256 {
             self.charts.clear();
         }
@@ -1175,6 +1223,8 @@ pub(crate) fn tables_fingerprint(tables: &[sheetcore::table::Table]) -> u64 {
         t.range.hash(&mut h);
         t.header_row.hash(&mut h);
         t.totals_row.hash(&mut h);
+        t.style_name.hash(&mut h);
+        t.totals_fns.hash(&mut h);
     }
     h.finish()
 }
@@ -1194,6 +1244,26 @@ pub(crate) fn filter_fingerprint(
         x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         acc ^= x;
     }
+    for &c in f.date_groups.keys() {
+        let mut x = (u64::from(c) << 2) | 3;
+        x = (x ^ (x >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        acc ^= x;
+    }
+    for &c in f.color_filters.keys() {
+        let mut x = (u64::from(c) << 3) | 5;
+        x = (x ^ (x >> 28)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        acc ^= x;
+    }
+    for &c in f.top_filters.keys() {
+        let mut x = (u64::from(c) << 4) | 7;
+        x = (x ^ (x >> 26)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        acc ^= x;
+    }
+    for &c in f.dynamic_filters.keys() {
+        let mut x = (u64::from(c) << 5) | 11;
+        x = (x ^ (x >> 25)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        acc ^= x;
+    }
     Some((f.range, acc))
 }
 
@@ -1202,11 +1272,24 @@ pub(crate) fn charts_fingerprint(charts: &[sheetcore::charts::Chart]) -> u64 {
     if charts.is_empty() {
         return 0;
     }
+    let hash_axis = |ax: &sheetcore::charts::AxisConfig, h: &mut std::collections::hash_map::DefaultHasher| {
+        ax.title.hash(h);
+        ax.min.map(f64::to_bits).hash(h);
+        ax.max.map(f64::to_bits).hash(h);
+        ax.major_unit.map(f64::to_bits).hash(h);
+        ax.log_base.map(f64::to_bits).hash(h);
+        ax.reverse.hash(h);
+        ax.num_fmt.hash(h);
+        ax.show_major_grid.hash(h);
+        ax.show_minor_grid.hash(h);
+        ax.hidden.hash(h);
+    };
     let mut h = std::collections::hash_map::DefaultHasher::new();
     charts.len().hash(&mut h);
     for ch in charts {
         std::mem::discriminant(&ch.kind).hash(&mut h);
         ch.title.hash(&mut h);
+        ch.subtitle.hash(&mut h);
         ch.legend.hash(&mut h);
         ch.legend_pos.hash(&mut h);
         ch.anchor.hash(&mut h);
@@ -1217,17 +1300,86 @@ pub(crate) fn charts_fingerprint(charts: &[sheetcore::charts::Chart]) -> u64 {
         ch.label_opts.show_legend_key.hash(&mut h);
         ch.label_opts.leader_lines.hash(&mut h);
         ch.label_opts.position.hash(&mut h);
+        ch.label_opts.num_fmt.hash(&mut h);
         ch.radar_style.hash(&mut h);
         ch.axis_x.hash(&mut h);
         ch.axis_y.hash(&mut h);
         ch.y_fmt.hash(&mut h);
         ch.y_min.map(f64::to_bits).hash(&mut h);
         ch.y_max.map(f64::to_bits).hash(&mut h);
+        ch.style.theme.hash(&mut h);
+        ch.style.rounded_bars.hash(&mut h);
+        ch.style.show_card_shadow.hash(&mut h);
+        ch.style.transparent_bg.hash(&mut h);
+        ch.style.gap_width.hash(&mut h);
+        ch.style.hole_size.hash(&mut h);
+        ch.style.first_slice_ang.hash(&mut h);
+        ch.style.pie_explosion.hash(&mut h);
+        ch.style.plot_vis_only.hash(&mut h);
+        ch.style.blank_policy.hash(&mut h);
+        ch.style.switch_row_col.hash(&mut h);
+        hash_axis(&ch.x_axis, &mut h);
+        hash_axis(&ch.y_axis, &mut h);
+        hash_axis(&ch.y2_axis, &mut h);
+        ch.analytics.highlight_extrema.hash(&mut h);
+        ch.analytics.show_growth_badge.hash(&mut h);
+        ch.analytics.show_summary_bar.hash(&mut h);
+        ch.analytics.show_pareto_line.hash(&mut h);
+        ch.analytics.hist_bins.hash(&mut h);
+        ch.analytics.waterfall_totals.hash(&mut h);
+        ch.analytics.center_kpi_title.hash(&mut h);
+        ch.analytics.show_center_kpi.hash(&mut h);
+        ch.ref_lines.len().hash(&mut h);
+        for rl in &ch.ref_lines {
+            rl.label.hash(&mut h);
+            rl.axis.hash(&mut h);
+            std::mem::discriminant(&rl.mode).hash(&mut h);
+            match rl.mode {
+                sheetcore::charts::RefLineMode::Fixed(v)
+                | sheetcore::charts::RefLineMode::Percentile(v) => v.to_bits().hash(&mut h),
+                sheetcore::charts::RefLineMode::Band { low, high } => {
+                    low.to_bits().hash(&mut h);
+                    high.to_bits().hash(&mut h);
+                }
+                _ => {}
+            }
+            rl.color.hash(&mut h);
+            rl.dash.hash(&mut h);
+        }
         ch.series.len().hash(&mut h);
         for s in &ch.series {
             s.name.hash(&mut h);
             s.color.hash(&mut h);
+            s.kind.hash(&mut h);
             s.secondary.hash(&mut h);
+            s.smooth.hash(&mut h);
+            s.stepped.hash(&mut h);
+            s.marker.hash(&mut h);
+            s.line_width.to_bits().hash(&mut h);
+            s.dash.hash(&mut h);
+            s.hidden.hash(&mut h);
+            s.trendlines.len().hash(&mut h);
+            for tl in &s.trendlines {
+                tl.kind.hash(&mut h);
+                tl.forward.to_bits().hash(&mut h);
+                tl.backward.to_bits().hash(&mut h);
+                tl.show_equation.hash(&mut h);
+                tl.show_r2.hash(&mut h);
+                tl.color.hash(&mut h);
+                tl.dash.hash(&mut h);
+            }
+            s.error_bars.is_some().hash(&mut h);
+            if let Some(eb) = &s.error_bars {
+                std::mem::discriminant(&eb.kind).hash(&mut h);
+                match eb.kind {
+                    sheetcore::charts::ErrorBarKind::Fixed(v)
+                    | sheetcore::charts::ErrorBarKind::Percent(v)
+                    | sheetcore::charts::ErrorBarKind::StdDev(v) => v.to_bits().hash(&mut h),
+                    sheetcore::charts::ErrorBarKind::StdErr => {}
+                }
+                eb.dir.hash(&mut h);
+                eb.color.hash(&mut h);
+            }
             (s.vals.as_ptr() as usize).hash(&mut h);
             s.vals.len().hash(&mut h);
             if let Some(first) = s.vals.first() {
@@ -1239,6 +1391,10 @@ pub(crate) fn charts_fingerprint(charts: &[sheetcore::charts::Chart]) -> u64 {
             if let Some(last) = s.vals.last() {
                 last.to_bits().hash(&mut h);
             }
+            (s.xv.as_ptr() as usize).hash(&mut h);
+            s.xv.len().hash(&mut h);
+            (s.sizes.as_ptr() as usize).hash(&mut h);
+            s.sizes.len().hash(&mut h);
             (s.cats.as_ptr() as usize).hash(&mut h);
             s.cats.len().hash(&mut h);
         }
@@ -1745,6 +1901,7 @@ mod tests {
             column_ids: vec![1, 2],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         let run_frame = |app: &mut SheetApp| {
             let raw = egui::RawInput {
@@ -1839,17 +1996,7 @@ mod tests {
             legend: true,
             anchor: (1, 1, 12, 6),
             legend_pos: "r".into(),
-            part: String::new(),
-            drawing: String::new(),
-            show_labels: false,
-            label_opts: Default::default(),
-            radar_style: String::new(),
-            ref_fixes: Vec::new(),
-            axis_x: String::new(),
-            axis_y: String::new(),
-            y_fmt: String::new(),
-            y_min: None,
-            y_max: None,
+            ..Default::default()
         });
         let run_frame = |app: &mut SheetApp| {
             let raw = egui::RawInput {
@@ -1973,15 +2120,9 @@ mod tests {
             legend_pos: "r".into(),
             part: "xl/charts/chart1.xml".into(),
             drawing: "xl/drawings/drawing1.xml".into(),
-            show_labels: false,
-            label_opts: Default::default(),
-            radar_style: String::new(),
-            ref_fixes: Vec::new(),
             axis_x: "X".into(),
             axis_y: "Y".into(),
-            y_fmt: String::new(),
-            y_min: None,
-            y_max: None,
+            ..Default::default()
         };
         sh.charts.push(ch);
 
@@ -2079,6 +2220,7 @@ mod tests {
             has_rich: false,
             depends_on_row_neighbors: dep,
             bg_fill: None,
+            pattern: None,
             cf_bar: None,
             cf_borders: None,
             diagonal: None,
@@ -2124,11 +2266,11 @@ mod tests {
             rules: vec![sheetcore::cf::CfRule {
                 priority: 1,
                 stop: false,
-                kind: sheetcore::cf::CfKind::Bar {
-                    color: [99, 142, 198],
-                    min: sheetcore::cf::Cfvo::min(),
-                    max: sheetcore::cf::Cfvo::max(),
-                },
+                kind: sheetcore::cf::CfKind::bar_default(
+                    [99, 142, 198],
+                    sheetcore::cf::Cfvo::min(),
+                    sheetcore::cf::Cfvo::max(),
+                ),
             }],
         });
         let worker = CfStatsWorker::new();

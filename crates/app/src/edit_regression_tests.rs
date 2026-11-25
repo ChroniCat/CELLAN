@@ -291,8 +291,10 @@ fn filtered_copy_compacts_visible_rows_and_paste_skips_filtered_rows() {
     app.sel_end = (0, 3);
     app.clip_paste(false, None);
     assert_eq!(app.wb.sheets[0].value(0, 3), Value::Text("R0".into()));
-    assert_eq!(app.wb.sheets[0].value(1, 3), Value::Text("R2".into()));
-    assert_eq!(app.wb.sheets[0].value(2, 3), Value::Text("R3".into()));
+    // P0 #27: 筛选态下粘贴跳过隐藏行，绝不暗中覆写隐藏行 (1, 3)。
+    assert_eq!(app.wb.sheets[0].value(1, 3), Value::Empty);
+    assert_eq!(app.wb.sheets[0].value(2, 3), Value::Text("R2".into()));
+    assert_eq!(app.wb.sheets[0].value(3, 3), Value::Text("R3".into()));
 
     // 用户手动隐藏的行（hidden_rows_user）在 Excel 中仍会被复制；不能被筛选逻辑误伤。
     app.wb.sheet_mut(0).hidden_rows.clear();
@@ -641,19 +643,32 @@ fn cross_sheet_cut_undo_restores_both_sides_styles_and_dependencies() {
     app.sheet_idx = 1;
     app.clip_paste(false, None);
     assert_eq!(app.wb.sheets[0].value(0, 0), Value::Empty);
-    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(1.0));
+    // P0 #22: 跨表剪切遵循 Excel 语义，原表指向被剪切格的公式自动改写到目标表。
+    assert_eq!(
+        app.wb.sheets[0].get(0, 2).unwrap().formula.as_deref(),
+        Some("=Other!A1+1")
+    );
+    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(2.0));
     assert_eq!(app.wb.sheets[0].style_of(0, 0), 0);
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(1.0));
     assert_eq!(app.wb.sheets[1].style_of(0, 0), bold);
     app.do_undo(false);
     assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(1.0));
+    assert_eq!(
+        app.wb.sheets[0].get(0, 2).unwrap().formula.as_deref(),
+        Some("=A1+1")
+    );
     assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(2.0));
     assert_eq!(app.wb.sheets[0].style_of(0, 0), bold);
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(8.0));
     assert_eq!(app.wb.sheets[1].style_of(0, 0), 0);
     app.do_undo(true);
     assert_eq!(app.wb.sheets[0].value(0, 0), Value::Empty);
-    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(1.0));
+    assert_eq!(
+        app.wb.sheets[0].get(0, 2).unwrap().formula.as_deref(),
+        Some("=Other!A1+1")
+    );
+    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(2.0));
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(1.0));
 }
 
@@ -988,7 +1003,7 @@ fn sorting_rebuilds_dependencies_for_edit_undo_and_redo() {
         app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
         app.sel_end = (1, 1);
         if multi {
-            app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into(), sort_mode: 0, custom: String::new(), merge_consecutive: false, quote: false, detect_types: false, sort_by_row: false, split_fixed: false, widths: String::new(), col_modes: String::new() });
+            app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into(), sort_mode: 0, custom: String::new(), merge_consecutive: false, quote: false, detect_types: false, sort_by_row: false, split_fixed: false, widths: String::new(), col_modes: String::new(), ..Default::default() });
         } else {
             app.do_sort(0, true);
         }
@@ -1326,6 +1341,7 @@ fn table_design_tab_is_offered_inside_a_table_range() {
         columns: vec!["A".into(), "B".into(), "C".into()],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     app.sel = (2, 1);
     app.sel_end = (2, 1);
@@ -1348,6 +1364,7 @@ fn table_fill_calculated_column_is_a_real_command_entry() {
             column_ids: vec![1, 2, 3],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         sh.set(0, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Text("Amount".into()), formula: None });
         sh.set(0, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Text("Tax".into()), formula: None });
@@ -1375,21 +1392,8 @@ fn chart_selection_exposes_the_chart_tools_tab() {
     let ch = sheetcore::charts::Chart {
         kind: sheetcore::charts::ChartKind::Column,
         title: "测试图".into(),
-        series: Vec::new(),
-        legend: false,
         anchor: (1, 4, 10, 9),
-        legend_pos: String::new(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: sheetcore::charts::LabelOpts::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
-        axis_x: String::new(),
-        axis_y: String::new(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        ..Default::default()
     };
     app.wb.sheet_mut(0).charts.push(ch);
     assert!(app.chart_at_sel().is_none(), "没选中时没有图表工具");
@@ -1432,21 +1436,8 @@ fn dragging_a_chart_moves_its_anchor_and_marks_dirty() {
     let ch = sheetcore::charts::Chart {
         kind: sheetcore::charts::ChartKind::Column,
         title: "拖动测试".into(),
-        series: Vec::new(),
-        legend: false,
         anchor: (1, 2, 8, 6),
-        legend_pos: String::new(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: sheetcore::charts::LabelOpts::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
-        axis_x: String::new(),
-        axis_y: String::new(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        ..Default::default()
     };
     app.wb.sheet_mut(0).charts.push(ch);
     let start = egui::pos2(HEAD_W + 2.0 * 72.0 + 40.0, HEAD_H + 19.0 + 30.0);
@@ -1833,11 +1824,11 @@ fn shift_arrows_extend_selection_and_plain_arrow_collapses() {
     app.sel = (0, 0);
     app.sel_end = (0, 0);
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowRight, true)]);
-    assert_eq!((app.sel, app.sel_end), ((0, 1), (0, 0)), "Shift+→ 应从 A1 扩到 B1");
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (0, 1)), "Excel 语义：Shift+→ 活动格留在 A1，尾角扩到 B1");
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, true)]);
-    assert_eq!((app.sel, app.sel_end), ((1, 1), (0, 0)), "继续 Shift+↓ 应扩到 B2");
-    run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowLeft, false)]);
-    assert_eq!((app.sel, app.sel_end), ((1, 0), (1, 0)), "普通方向键应收起选区");
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (1, 1)), "继续 Shift+↓ 尾角扩到 B2，活动格仍是 A1");
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowRight, false)]);
+    assert_eq!((app.sel, app.sel_end), ((0, 1), (0, 1)), "普通方向键从活动格移动并收起选区");
 }
 
 #[test]
@@ -2916,6 +2907,7 @@ fn deleting_a_picture_is_one_undo_step_and_restores_its_anchor() {
         data: Some(std::sync::Arc::new(png)),
         ext: "png".into(),
         name: "图片 1".into(),
+        ..Default::default()
     });
     let depth = app.undo.depth();
     app.pic_sel = Some(0);
@@ -2943,6 +2935,7 @@ fn moving_a_picture_is_undoable() {
         data: Some(std::sync::Arc::new(vec![1, 2, 3])),
         ext: "png".into(),
         name: "图片 1".into(),
+        ..Default::default()
     });
     let before = app.wb.sheet(0).pictures.clone();
     app.wb.sheet_mut(0).pictures[0].rect = (8, 4, 12, 9);
@@ -4140,6 +4133,7 @@ fn pasting_an_excel_error_cell_keeps_it_an_error_value() {
         size: 0.0,
         num_format: String::new(),
         raw: None,
+        ..Default::default()
     };
     // 真正走一遍 XMLSS 解析：Excel 的 ss:Type="Error" 必须映射成 kind=4
     let xml = r#"<?xml version="1.0"?>
@@ -4934,6 +4928,7 @@ fn every_write_entry_is_blocked_by_one_remote_lock() {
                     split_fixed: false,
                     widths: String::new(),
                     col_modes: String::new(),
+                    ..Default::default()
                 })
             }),
         ),
@@ -6416,6 +6411,9 @@ fn format_painter_is_rejected_after_document_switch_even_with_same_style_id() {
     app.format_painter = Some(FormatPainter {
         rect: (0, 0, 0, 0),
         styles: vec![vec![a_sid]],
+        merges: Vec::new(),
+        cf_blocks: Vec::new(),
+        cf_dxfs: Vec::new(),
         continuous: false,
         wb_epoch: app.wb_epoch,
         sheet: 0,
@@ -7773,6 +7771,7 @@ fn split_preview_confirms_overwrite_and_undo_restores_expanded_region() {
         split_fixed: false,
         widths: String::new(),
         col_modes: String::new(),
+        ..Default::default()
     };
     app.run_split(&dlg);
     assert!(app.status.contains("覆盖"), "第一次应只预览：{}", app.status);
@@ -7846,6 +7845,7 @@ fn multi_level_sort_respects_level_order_and_selection_range() {
         split_fixed: false,
         widths: String::new(),
         col_modes: String::new(),
+        ..Default::default()
     };
     app.run_sort(&dlg);
     let order: Vec<String> = (1..=4)
@@ -7956,6 +7956,7 @@ fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
             column_ids: vec![1, 2, 3],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         for (c, h) in ["Amount", "Tax", "Total"].iter().enumerate() {
             sh.set(0, c as u32, sheetcore::model::Cell {
@@ -9351,7 +9352,8 @@ const CLICK_MATRIX_SKIP: &[&str] = &[
     "FileOpen",       // rfd 打开对话框
     "FileSaveAs",     // rfd 保存对话框
     "FileSave",       // 无路径时转「另存为」对话框
-    "ExportPdf",      // rfd 选 PDF 路径
+    "ExportPdf",         // rfd 选 PDF 路径
+    "ExportWorkbookPdf", // rfd 选整簿 PDF 路径
     "CompareBooks",   // rfd 选比较文件
     "MacroExport",    // rfd 选导出路径（有宏时）
     "InsertPicture",  // rfd 选图片
@@ -11074,6 +11076,7 @@ fn run_split_fixed_width_writes_columns() {
         split_fixed: true,
         widths: "2,2".into(),
         col_modes: String::new(),
+        ..Default::default()
     });
     // 第一段落回原列，后续列往右写；断点之后的剩余部分并入最后一列（Excel 语义）
     assert_eq!(a.wb.sheets[0].value(0, 0).display(), "AB");
@@ -11102,6 +11105,7 @@ fn run_split_fixed_width_rejects_bad_widths() {
         split_fixed: true,
         widths: "2,0".into(),
         col_modes: String::new(),
+        ..Default::default()
     });
     assert!(a.status.contains("正整数"), "应提示宽度非法：{}", a.status);
     assert_eq!(a.wb.sheets[0].value(0, 0).display(), "ABCDEF", "非法宽度不改数据");
@@ -11138,6 +11142,7 @@ fn run_sort_by_row_reorders_columns() {
         split_fixed: false,
         widths: String::new(),
         col_modes: String::new(),
+        ..Default::default()
     });
     let row2: Vec<String> = (0..4)
         .map(|c| a.wb.sheets[0].value(2, c).display())
@@ -11180,6 +11185,7 @@ fn run_split_skips_column_and_shifts_left() {
         split_fixed: false,
         widths: String::new(),
         col_modes: "常规,跳过,常规".into(),
+        ..Default::default()
     });
     assert_eq!(a.wb.sheets[0].value(0, 0).display(), "甲");
     assert_eq!(a.wb.sheets[0].value(0, 1).display(), "丙", "跳过的列不占位，后面的列左移");
@@ -11414,13 +11420,25 @@ fn filtered_cut_tracks_source_rows_for_formulas_clearing_and_undo() {
     assert_eq!(sh.value(1, 0), Value::Text("keep A2".into()));
     assert_eq!(sh.value(10, 1), Value::Text("hidden".into()));
     assert!(sh.get(9, 1).is_none() && sh.get(11, 1).is_none());
-    assert_eq!(sh.get(19, 3).unwrap().formula.as_deref(), Some("=C20"));
-    assert_eq!(sh.get(20, 3).unwrap().formula.as_deref(), Some("=C21"));
+    // P0 #22: 剪切不平移指向剪切源外部格子的相对引用（Excel 剪切语义）。
+    assert_eq!(sh.get(19, 3).unwrap().formula.as_deref(), Some("=A10"));
+    assert_eq!(sh.get(20, 3).unwrap().formula.as_deref(), Some("=A12"));
     app.do_undo(false);
     let sh = app.wb.sheet(0);
     assert_eq!(sh.get(9, 1).unwrap().formula.as_deref(), Some("=A10"));
     assert_eq!(sh.get(11, 1).unwrap().formula.as_deref(), Some("=A12"));
     assert!(sh.get(19, 3).is_none() && sh.get(20, 3).is_none());
+    // 同样的筛选选区执行复制时，应按每行原始 source_row 精确平移公式引用。
+    app.sel = (9, 1);
+    app.sel_end = (11, 1);
+    app.clip_copy(false, &ctx);
+    let from_windows_copy = app.clip_stamp.as_ref().unwrap().replace('\n', "\r\n");
+    app.sel = (19, 3);
+    app.sel_end = app.sel;
+    app.clip_paste(false, Some(from_windows_copy));
+    let sh = app.wb.sheet(0);
+    assert_eq!(sh.get(19, 3).unwrap().formula.as_deref(), Some("=C20"));
+    assert_eq!(sh.get(20, 3).unwrap().formula.as_deref(), Some("=C21"));
 }
 
 #[test]
@@ -11516,3 +11534,411 @@ fn scenario_show_after_row_delete_preserves_the_next_formula_and_is_undoable() {
     app.do_undo(true);
     assert_eq!(app.wb.sheet(0).value(1,0), Value::Number(8.));
 }
+
+#[test]
+fn gap9_cursor_aware_formula_assist_skips_strings_and_preserves_tail() {
+    // 1) ref_byte_spans 必须跳过字符串字面量里的 "B2"
+    let f = r#"=IF(A1="B2",C3,0)"#;
+    let spans: Vec<&str> = ref_byte_spans(f).into_iter().map(|(s, e, _)| &f[s..e]).collect();
+    assert_eq!(spans, vec!["A1", "C3"], "字符串里的 \"B2\" 绝不能当引用着色");
+
+    // 2) cycle_formula_ref_at 按光标定位：光标在 A1 上只循环 A1，不误改末尾 B2，且跳过字符串
+    let mut s1 = "=A1+B2".to_string();
+    let c1 = cycle_formula_ref_at(&mut s1, 3).expect("光标在 A1 末尾应循环 A1");
+    assert_eq!(s1, "=$A$1+B2");
+    assert_eq!(c1, 5);
+    let mut s_str = "=IF(A1=\"C3\",1,0)".to_string();
+    assert_eq!(cycle_formula_ref_at(&mut s_str, 10), None, "字符串内部不能触发 F4 循环");
+    assert_eq!(s_str, "=IF(A1=\"C3\",1,0)");
+
+    // 3) formula_help_at 按光标计算 active_arg 且忽略字符串内逗号/括号
+    let f2 = r#"=IF(A1="a,b(c", B1, C1)"#;
+    let h_arg1 = formula_help_at(f2, 16).expect("逗号后应在第 2 个参数");
+    assert_eq!(h_arg1.active_arg, Some(1));
+    let h_arg2 = formula_help_at(f2, 20).expect("第二个逗号后应在第 3 个参数");
+    assert_eq!(h_arg2.active_arg, Some(2));
+    // 光标在字符串内部不弹函数补全
+    let h_in_str = formula_help_at(r#"=IF(A1="SU"#, 10);
+    assert!(h_in_str.as_ref().is_none_or(|h| h.suggestions.is_empty()));
+
+    // 4) 公式中间接受自动补全：替换光标所在 token 且保留后半截公式
+    let mut ed = EditState::new("=SU+B1".into());
+    ed.caret = 3; // 光标在 SU 后、+B1 前
+    let help = formula_help_at(&ed.buf, ed.caret).expect("中间应弹出 SUM 补全");
+    let sum_idx = help.suggestions.iter().position(|(n, _)| n == "SUM").unwrap();
+    apply_formula_pick(&mut ed, &help, sum_idx);
+    assert_eq!(ed.buf, "=SUM(+B1", "补全不能吞掉光标后的 +B1");
+    assert_eq!(ed.caret, 5, "光标应落在左括号之后");
+}
+
+#[test]
+fn gap9_fn_wizard_prefills_existing_formula_and_name_box_full_features() {
+    let _env = crate::test_env::TestEnv::new("gap9-wiz-namebox");
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::Sheet::new("Sheet 2"));
+
+    // 1) 函数向导回填已有公式
+    app.wb.sheet_mut(0).set(
+        0,
+        0,
+        Cell {
+            value: Value::Empty,
+            formula: Some("=VLOOKUP(A2, B1:D10, 3, FALSE)".into()),
+        },
+    );
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.open_fn_wizard();
+    let wiz = app.fn_wizard.as_ref().expect("向导应打开");
+    assert_eq!(wiz.name, "VLOOKUP");
+    assert_eq!(wiz.args, vec!["A2", "B1:D10", "3", "FALSE"]);
+    app.fn_wizard = None;
+
+    // 2) 名称框支持 $A$1、跨表 'Sheet 2'!$B$2:$D$4、整列 A:C、整行 2:4
+    app.name_buf = "$C$5".into();
+    app.goto_name();
+    assert_eq!((app.sel, app.sel_end), ((4, 2), (4, 2)));
+
+    app.name_buf = "A:C".into();
+    app.goto_name();
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (1_048_575, 2)));
+
+    app.name_buf = "2:4".into();
+    app.goto_name();
+    assert_eq!((app.sel, app.sel_end), ((1, 0), (3, 16_383)));
+
+    app.name_buf = "'Sheet 2'!$B$2:$C$4".into();
+    app.goto_name();
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!((app.sel, app.sel_end), ((1, 1), (3, 2)));
+
+    // 3) 名称框输入合法新标识符 -> 创建定义名称 + 反显 + 撤销
+    app.name_buf = "Q1_Sales".into();
+    app.goto_name();
+    assert_eq!(app.matching_defined_name_for_sel().as_deref(), Some("Q1_Sales"));
+    assert!(app.wb.names.iter().any(|(n, _, _)| n == "Q1_Sales"));
+    app.do_undo(false);
+    assert!(app.matching_defined_name_for_sel().is_none());
+    assert!(!app.wb.names.iter().any(|(n, _, _)| n == "Q1_Sales"));
+}
+
+#[test]
+fn gap9_commit_normalizes_plus_formula_closes_parens_and_wraps_multiline() {
+    let _env = crate::test_env::TestEnv::new("gap9-commit-norm");
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, number(10.0));
+    app.wb.sheet_mut(0).set(0, 1, number(25.0));
+
+    // +A1+B1 -> =A1+B1
+    app.sel = (0, 2);
+    app.sel_end = (0, 2);
+    app.begin_edit(Some("+A1+B1".into()));
+    assert!(app.commit_edit(None));
+    assert_eq!(app.wb.sheet(0).formula_of(0, 2), Some("=A1+B1"));
+    assert_eq!(app.wb.sheet(0).value(0, 2), Value::Number(35.0));
+
+    // 缺右括号自动补全
+    app.sel = (0, 3);
+    app.sel_end = (0, 3);
+    app.begin_edit(Some("=SUM(A1:B1".into()));
+    assert!(app.commit_edit(None));
+    assert_eq!(app.wb.sheet(0).formula_of(0, 3), Some("=SUM(A1:B1)"));
+    assert_eq!(app.wb.sheet(0).value(0, 3), Value::Number(35.0));
+
+    // Alt+Enter 多行文本自动开换行并撑高行高
+    app.sel = (2, 0);
+    app.sel_end = (2, 0);
+    let h_before = app.wb.sheet(0).rows.size(2);
+    app.begin_edit(Some("第一行\n第二行\n第三行".into()));
+    assert!(app.commit_edit(None));
+    let sid = app.wb.sheet(0).style_of(2, 0);
+    assert!(app.wb.styles.get(sid).wrap, "含换行的多行输入必须自动开启自动换行");
+    assert!(
+        app.wb.sheet(0).rows.size(2) > h_before + 10.0,
+        "三行文本必须自动撑高行高: before={h_before}, after={}",
+        app.wb.sheet(0).rows.size(2)
+    );
+}
+
+#[test]
+fn gap10_palette_cmdusage_toggles_and_mini_toolbar_aliases() {
+    let _env = crate::test_env::TestEnv::new("gap10-palette-toggles");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+
+    // 1) 命令面板收录无文字图标命令（如加粗/倾斜）且排除空壳父菜单容器
+    let entries = crate::palette::entries(&app);
+    assert!(
+        entries.iter().any(|e| e.action == "Bold" && e.label.contains("加粗")),
+        "命令面板应通过 screentip 回退收录加粗命令"
+    );
+    assert!(
+        entries.iter().any(|e| e.action == "Italic"),
+        "命令面板应收录倾斜命令"
+    );
+    for e in &entries {
+        assert!(!e.action.is_empty(), "命令面板不得出现空 action 条目");
+    }
+
+    // 2) cmdusage 内存缓存写入与读取（且按 TestEnv 隔离）
+    crate::cmdusage::touch("Gap10BenchAction");
+    crate::cmdusage::touch("Gap10BenchAction");
+    assert!(
+        crate::cmdusage::load()
+            .get("Gap10BenchAction")
+            .copied()
+            .unwrap_or(0)
+            >= 2
+    );
+
+    // 3) 修复的 6 个 Ribbon Toggle 控件 checked 状态对齐
+    app.show_gridlines = false;
+    assert!(!app.ctl_state("ViewGridlines").checked);
+    app.show_headings = false;
+    assert!(!app.ctl_state("ViewHeadings").checked);
+    app.wb.sheet_mut(0).page.gridlines = true;
+    assert!(app.ctl_state("PrintGridlinesToggle").checked);
+    assert!(app.ctl_state("PrintPrintGridlines").checked);
+    app.wb.sheet_mut(0).page.headings = true;
+    assert!(app.ctl_state("PrintHeadingsToggle").checked);
+    app.auto_share = true;
+    assert!(app.ctl_state("AutoAutoShare").checked);
+
+    // 4) ShowAllComments 与 FontGrow/FontShrink 别名
+    assert!(!app.ctl_state("ShowAllComments").checked);
+    app.ribbon_action("ShowAllComments", &ctx);
+    assert!(app.ctl_state("ShowAllComments").checked);
+    let sz0 = app.current_style().size;
+    app.ribbon_action("FontGrow", &ctx);
+    assert!(app.current_style().size > sz0);
+    app.ribbon_action("FontShrink", &ctx);
+    assert!((app.current_style().size - sz0).abs() < 0.01);
+
+    // 5) 7 套内置财务模板就绪
+    assert_eq!(crate::templates::ALL.len(), 7);
+}
+
+#[test]
+fn gap10_hyperlinks_formula_jump_and_dialog_prefill() {
+    let _env = crate::test_env::TestEnv::new("gap10-hyperlinks");
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::Sheet::new("明细表"));
+    app.wb.sheet_mut(0).set(0, 0, text("查看明细"));
+    app.wb.sheet_mut(0).hyperlinks.insert(
+        (0, 0),
+        sheetcore::hyperlinks::Hyperlink {
+            external: false,
+            target: String::new(),
+            location: "明细表!C5".into(),
+            tooltip: "跳转到明细表 C5".into(),
+            ..Default::default()
+        },
+    );
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.open_hyperlink_dialog();
+    let (u, t, tip) = app.hyper_dlg.clone().expect("应打开并预填超链接编辑框");
+    assert_eq!(u, "#明细表!C5");
+    assert_eq!(t, "查看明细");
+    assert_eq!(tip, "跳转到明细表 C5");
+    app.hyper_dlg = None;
+
+    // 内部跨表跳转与同表 #A10 跳转
+    let link = app.wb.sheet(0).hyperlinks.get(&(0, 0)).unwrap().clone();
+    app.open_hyperlink(&link);
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!(app.sel, (4, 2));
+
+    let same_sheet_link = sheetcore::hyperlinks::Hyperlink {
+        external: false,
+        location: "B12".into(),
+        ..Default::default()
+    };
+    app.open_hyperlink(&same_sheet_link);
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!(app.sel, (11, 1));
+
+    // =HYPERLINK(...) 公式目标提取（含静态字面量与动态拼接）
+    app.wb.sheet_mut(1).set(0, 0, text("docs"));
+    app.wb.sheet_mut(1).set(
+        0,
+        1,
+        sheetcore::model::Cell {
+            value: Value::Text("官网".into()),
+            formula: Some("=HYPERLINK(\"https://example.com/\"&A1, \"官网\")".into()),
+        },
+    );
+    assert_eq!(
+        app.formula_hyperlink_target(0, 1).as_deref(),
+        Some("https://example.com/docs")
+    );
+}
+
+#[test]
+fn gap10_picture_transforms_shapes_and_sparkline_batch_edit() {
+    let _env = crate::test_env::TestEnv::new("gap10-pic-shapes-spark");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+
+    // 1) 图片旋转 90°、裁剪、置顶/置底、复制及撤销
+    for i in 0..2u32 {
+        app.wb.sheet_mut(0).pictures.push(sheetcore::pic::Picture {
+            rect: (i * 3, 0, i * 3 + 2, 2),
+            off: [0; 4],
+            part: format!("xl/media/test_{i}.png"),
+            data: Some(std::sync::Arc::new(vec![1, 2, 3, 4])),
+            ext: "png".into(),
+            name: format!("图{i}"),
+            ..Default::default()
+        });
+    }
+    app.pic_rotate_90(0);
+    assert!((app.wb.sheet(0).pictures[0].rot_deg - 90.0).abs() < 0.01);
+    app.do_undo(false);
+    assert!((app.wb.sheet(0).pictures[0].rot_deg - 0.0).abs() < 0.01);
+
+    app.pic_set_crop(0, [0.1, 0.2, 0.15, 0.05]);
+    assert!((app.wb.sheet(0).pictures[0].crop[1] - 0.2).abs() < 0.001);
+    app.pic_zorder(0, true);
+    assert_eq!(app.wb.sheet(0).pictures[1].name, "图0");
+    app.pic_duplicate(1);
+    assert_eq!(app.wb.sheet(0).pictures.len(), 3);
+
+    // 2) 矢量形状插入与撤销
+    app.ribbon_action("InsertShape:RightArrow", &ctx);
+    assert_eq!(app.wb.sheet(0).textboxes.len(), 1);
+    assert_eq!(
+        app.wb.sheet(0).textboxes[0].kind,
+        sheetcore::textbox::ShapeKind::RightArrow
+    );
+
+    // 3) 迷你图多格批量编辑：自动合并源区域并可批量更新属性
+    app.wb.sheet_mut(0).sparklines.push(sheetcore::sparkline::Sparkline {
+        r: 0,
+        c: 4,
+        rect: (0, 0, 0, 2),
+        kind: sheetcore::sparkline::SparkKind::Line,
+        ..Default::default()
+    });
+    app.wb.sheet_mut(0).sparklines.push(sheetcore::sparkline::Sparkline {
+        r: 1,
+        c: 4,
+        rect: (1, 0, 1, 2),
+        kind: sheetcore::sparkline::SparkKind::Line,
+        ..Default::default()
+    });
+    app.sel = (0, 4);
+    app.sel_end = (1, 4);
+    app.spark_open_edit();
+    let mut dlg = app.spark_dlg.take().expect("应打开批量编辑迷你图对话框");
+    assert_eq!(dlg.source, "A1:C2");
+    assert_eq!(dlg.location, "E1:E2");
+    dlg.kind = sheetcore::sparkline::SparkKind::Column;
+    dlg.high = true;
+    let updated = app.spark_commit(&dlg).expect("多格迷你图批量提交应成功");
+    assert_eq!(updated, 2);
+    assert!(app
+        .wb
+        .sheet(0)
+        .sparklines
+        .iter()
+        .all(|s| s.kind == sheetcore::sparkline::SparkKind::Column && s.high));
+}
+
+#[test]
+fn gap10_shortcuts_table_borders_general_note_and_new_sheet() {
+    let _env = crate::test_env::TestEnv::new("gap10-shortcuts");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for r in 0..3u32 {
+        app.wb.sheet_mut(0).set(r, 0, if r == 0 { text("项目") } else { text("A") });
+        app.wb.sheet_mut(0).set(r, 1, if r == 0 { text("金额") } else { number(100.0) });
+    }
+    app.sel = (0, 0);
+    app.sel_end = (2, 1);
+
+    // Ctrl+T -> 创建超级表
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::COMMAND;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::T,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    assert_eq!(app.wb.sheet(0).tables.len(), 1, "Ctrl+T 应创建超级表");
+
+    // Ctrl+Shift+7 -> 外框线; Ctrl+Shift+- -> 清除边框
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::Num7,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    let s_after_7 = app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).clone();
+    assert!(s_after_7.border[0].style > 0 && s_after_7.border[2].style > 0, "Ctrl+Shift+7 应加外框线");
+
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::Minus,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    let s_after_minus = app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).clone();
+    assert!(s_after_minus.border.iter().all(|b| b.style == 0), "Ctrl+Shift+- 应清除所有边框");
+
+    // Ctrl+Shift+~ -> 常规数字格式（且不触发 ShowFormulas）
+    app.apply_style(|s| s.format = "0.00%".into());
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::Backtick,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).format.is_empty());
+    assert!(!app.show_formulas, "Ctrl+Shift+~ 不应误触发显示公式");
+
+    // Shift+F2 -> 打开批注编辑
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::SHIFT;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::F2,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::SHIFT,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    assert!(app.note_edit.is_some(), "Shift+F2 应打开批注编辑器");
+    app.note_edit = None;
+
+    // Shift+F11 -> 新增工作表
+    let n_before = app.wb.sheets.len();
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::SHIFT;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::F11,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::SHIFT,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    assert_eq!(app.wb.sheets.len(), n_before + 1, "Shift+F11 应新增工作表");
+}
+
+

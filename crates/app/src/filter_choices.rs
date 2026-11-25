@@ -40,6 +40,8 @@ fn ascii_contains_ci(haystack: &[u8], needle_lower: &[u8]) -> bool {
 #[derive(Default)]
 pub(super) struct Choices {
     pub(super) items: Vec<(String, bool)>,
+    /// 与 `items` 一一对应的格式化展示文本（空表示直接使用 `items[i].0`）
+    pub(super) labels: Vec<String>,
     /// 非 ASCII 项的小写紧凑拼接池；纯 ASCII 项记 `(u32::MAX, 0)` 直接零分配字节匹配，
     /// 百万唯一单号/数字列节省 ~32MB 独立 `String` 分配。
     folded_arena: String,
@@ -86,7 +88,7 @@ impl Choices {
     #[inline]
     fn matches_folded(&self, idx: usize, q_lower: &str, q_ascii: bool) -> bool {
         let (off, len) = self.folded_spans[idx];
-        if off == u32::MAX {
+        let raw_hit = if off == u32::MAX {
             if q_ascii {
                 ascii_contains_ci(self.items[idx].0.as_bytes(), q_lower.as_bytes())
             } else {
@@ -95,7 +97,19 @@ impl Choices {
         } else {
             let s = &self.folded_arena[off as usize..(off + len) as usize];
             s.contains(q_lower)
+        };
+        if raw_hit {
+            return true;
         }
+        if let Some(lbl) = self.labels.get(idx) {
+            if !lbl.is_empty() && lbl != &self.items[idx].0 {
+                if q_ascii && lbl.is_ascii() {
+                    return ascii_contains_ci(lbl.as_bytes(), q_lower.as_bytes());
+                }
+                return lbl.to_lowercase().contains(q_lower);
+            }
+        }
+        false
     }
 
     /// 消费选项表生成最终放行集合（移动已有 `String` 所有权，零克隆）。
@@ -246,10 +260,16 @@ impl Choices {
                         let i = self.shown_index(row - 1);
                         let on = self.item_checked(i);
                         let value = &self.items[i].0;
-                        let label = if value.is_empty() {
+                        let disp = self
+                            .labels
+                            .get(i)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.as_str())
+                            .unwrap_or(value.as_str());
+                        let label = if disp.is_empty() {
                             "（空白）"
                         } else {
-                            value.as_str()
+                            disp
                         };
                         if checkbox(ui, label, on, false) {
                             let next = !on;
@@ -322,6 +342,88 @@ impl FilterPopup {
         Self::open_with_ctx(sheet, doc_gen, col, anchor, None)
     }
 
+    pub(super) fn open_with_styles(
+        sheet: &Sheet,
+        styles: &sheetcore::style::StyleTable,
+        sys: sheetcore::model::DateSystem,
+        doc_gen: u64,
+        col: u32,
+        anchor: egui::Pos2,
+        wake: Option<egui::Context>,
+    ) -> Option<Self> {
+        let filter = sheet.filter.as_ref()?;
+        let range = filter.range;
+        let column = FilterColumn::new(sheet, range, col);
+        let allows = filter.allows.get(&col).cloned().map(Arc::new);
+        let mut popup = Self {
+            col,
+            list: Choices {
+                wake: wake.clone(),
+                ..Choices::default()
+            },
+            loading: None,
+            source: (sheet.identity, sheet.cell_revision(), doc_gen, range),
+            column_snapshot: column,
+            initial_allows: allows.clone(),
+            changed_choices: Arc::default(),
+            cancel_load: Arc::default(),
+            search: String::new(),
+            anchor,
+            crit_dlg: None,
+            crit_and: true,
+            crit_op2: None,
+            crit_val2: String::new(),
+            top_dlg: None,
+            ops_open: false,
+            ops_anchor: egui::Pos2::ZERO,
+            focus_search: true,
+            meta: None,
+            date_selected: std::collections::HashSet::new(),
+            date_mode: false,
+            color_open: false,
+            use_cascading: range.2.saturating_sub(range.0) <= 100_000,
+        };
+        if popup.use_cascading {
+            let (pairs, numeric) = sheetcore::sort_filter::cascading_column_choices(
+                sheet,
+                filter,
+                col,
+                styles,
+                sys,
+            );
+            let mut list = Choices {
+                numeric,
+                items: Vec::with_capacity(pairs.len()),
+                labels: Vec::with_capacity(pairs.len()),
+                folded_spans: Vec::with_capacity(pairs.len()),
+                all_shown: true,
+                wake,
+                ..Choices::default()
+            };
+            for (raw, lbl) in pairs {
+                let checked = allows.as_deref().is_none_or(|a| a.contains(&raw));
+                list.checked += usize::from(checked);
+                if raw.is_ascii() {
+                    list.folded_spans.push((u32::MAX, 0));
+                } else {
+                    let start = list.folded_arena.len() as u32;
+                    for ch in raw.chars().flat_map(|c| c.to_lowercase()) {
+                        list.folded_arena.push(ch);
+                    }
+                    let len = list.folded_arena.len() as u32 - start;
+                    list.folded_spans.push((start, len));
+                }
+                list.labels.push(lbl);
+                list.items.push((raw, checked));
+            }
+            list.checked_total = list.checked;
+            popup.list = list;
+        } else {
+            popup.prepare_choices();
+        }
+        Some(popup)
+    }
+
     pub(super) fn open_with_ctx(
         sheet: &Sheet,
         doc_gen: u64,
@@ -347,6 +449,10 @@ impl FilterPopup {
             search: String::new(),
             anchor,
             crit_dlg: None,
+            crit_and: true,
+            crit_op2: None,
+            crit_val2: String::new(),
+            top_dlg: None,
             ops_open: false,
             ops_anchor: egui::Pos2::ZERO,
             focus_search: true,
@@ -354,6 +460,7 @@ impl FilterPopup {
             date_selected: std::collections::HashSet::new(),
             date_mode: false,
             color_open: false,
+            use_cascading: false,
         };
         popup.prepare_choices();
         Some(popup)

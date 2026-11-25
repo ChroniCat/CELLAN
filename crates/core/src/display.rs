@@ -14,6 +14,13 @@ pub struct CellView {
     pub color: [u8; 3],
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
+    pub double_underline: bool,
+    pub strikethrough: bool,
+    pub vertical_text: bool,
+    pub shrink_to_fit: bool,
+    /// 0 正常，1 上标，2 下标
+    pub vert_align: u8,
     pub size: f32,
     /// 0 左 1 中 2 右（General 已按值类型解析）
     pub halign: u8,
@@ -26,8 +33,22 @@ pub struct CellView {
     /// 合并范围（含锚点自身）；None = 单格
     pub merge: Option<(u32, u32, u32, u32)>,
     pub fill: Option<[u8; 3]>,
+    /// 图案填充（斜纹/网格/点阵）
+    pub pattern: Option<crate::style_ext::FillPattern>,
+    /// 会计/重复填充拆分（`*<ch>` -> (左侧文本, 填充字符, 右侧文本)）
+    pub accounting: Option<(String, char, String)>,
     /// 数据条：比例 0..1 与颜色
     pub bar: Option<(f32, [u8; 3])>,
+    /// 增强数据条（正负双向/零轴/隐藏数值）
+    pub bar_ext: Option<crate::cf::BarOverlay>,
+    /// 条件格式图标集标记
+    pub icon: Option<crate::cf::IconMark>,
+    /// 条件格式差异边框
+    pub cf_border: Option<crate::cf::DxfBorder>,
+    /// 富文本多段运行（打印与预览原生逐段着色与加粗斜体）
+    pub rich_runs: Option<Vec<crate::richtext::RichRun>>,
+    /// 原始值是否为错误值（供打印错误替换策略使用）
+    pub is_error: bool,
 }
 
 impl CellView {
@@ -106,13 +127,19 @@ pub(crate) fn view_with_merge(
     merge: Option<(u32, u32, u32, u32)>,
 ) -> Option<CellView> {
     let cell = sheet.get(r, c);
-    let st: &CellStyle = wb.styles.get(sheet.style_of(r, c));
+    let sid = sheet.style_of(r, c);
+    let st: &CellStyle = wb.styles.get(sid);
+    let pattern = wb.styles.pattern_of(sid).cloned();
     let has_style = st.fill.is_some()
+        || pattern.is_some()
         || st.border.iter().any(|b| b.style != 0)
         || st.diagonal.is_some()
         || !st.format.is_empty()
         || st.bold
-        || st.italic;
+        || st.italic
+        || st.underline
+        || st.double_underline
+        || st.strikethrough;
     if cell.is_none() && !has_style && overlay.is_none() {
         return None;
     }
@@ -120,6 +147,7 @@ pub(crate) fn view_with_merge(
         .cloned()
         .or_else(|| cell.map(|x| x.value.clone()))
         .unwrap_or(Value::Empty);
+    let is_error = matches!(value, Value::Error(_));
     let text = if matches!(value, Value::Empty) {
         String::new()
     } else {
@@ -128,10 +156,14 @@ pub(crate) fn view_with_merge(
             None => format_value(wb.date_system, &value, st),
         }
     };
-    // 富文本用纯文本兜底：逐段字体是屏幕层的富文本路径，打印暂不拆段
-    let text = match sheet.rich.get(&(r, c)) {
-        Some(runs) if !runs.is_empty() => runs.iter().map(|x| x.text.as_str()).collect::<String>(),
-        _ => text,
+    let rich_runs = sheet
+        .rich
+        .get(&(r, c))
+        .filter(|runs| !runs.is_empty())
+        .cloned();
+    let text = match &rich_runs {
+        Some(runs) => runs.iter().map(|x| x.text.as_str()).collect::<String>(),
+        None => text,
     };
     let halign = match st.halign {
         1 => 0,
@@ -150,21 +182,45 @@ pub(crate) fn view_with_merge(
     let mut italic = st.italic;
     let mut fill = st.fill;
     let mut bar = None;
+    let mut bar_ext = None;
+    let mut icon = None;
+    let mut cf_border = None;
+    let mut text = text;
     if let Some(ov) = overlay {
         if let Some(c2) = ov.color {
             color = c2;
         }
         bold |= ov.bold;
+        italic |= ov.italic;
         if ov.fill.is_some() {
             fill = ov.fill;
         }
         bar = ov.bar;
+        bar_ext = ov.bar_ext;
+        icon = ov.icon.clone();
+        cf_border = ov.border.clone();
+        let hide_val = ov.icon.as_ref().is_some_and(|m| !m.show_value)
+            || ov.bar_ext.is_some_and(|b| !b.show_value);
+        if hide_val {
+            text.clear();
+        }
     }
+    let accounting = if rich_runs.is_none() && !matches!(value, Value::Empty) && !text.is_empty() {
+        crate::style::format_accounting_split(wb.date_system, &value, &st.format)
+    } else {
+        None
+    };
     Some(CellView {
         text,
         color,
         bold,
         italic,
+        underline: st.underline,
+        double_underline: st.double_underline,
+        strikethrough: st.strikethrough,
+        vertical_text: st.vertical_text,
+        shrink_to_fit: st.shrink_to_fit,
+        vert_align: st.vert_align,
         size: if st.size > 0.0 { st.size } else { 11.0 },
         halign,
         valign,
@@ -173,7 +229,14 @@ pub(crate) fn view_with_merge(
         indent: st.indent,
         merge,
         fill,
+        pattern,
+        accounting,
         bar,
+        bar_ext,
+        icon,
+        cf_border,
+        rich_runs,
+        is_error,
     })
 }
 

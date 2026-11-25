@@ -1,16 +1,12 @@
-//! Office 打开密码：ECMA-376 Agile Encryption（AES-256-CBC + SHA-512）。
+//! Office 打开密码：同时支持 ECMA-376 Standard（Excel 2007，AES-128/192/256-ECB + SHA-1）
+//! 与 ECMA-376 Agile（Excel 2010/2013/2016/365，AES-128/192/256-CBC + SHA-1/256/384/512 + HMAC 完整性校验）。
 //!
-//! 文件是 CFB 容器，两个流：`EncryptionInfo`（版本头 + Agile XML）和
-//! `EncryptedPackage`（8 字节明文长度 + 4096 字节分段的 AES-CBC 密文）。
-//! 派生方式与 Excel 365 一致：
-//!   H0 = SHA512(salt || UTF16LE(password))
-//!   Hi = SHA512(H(i-1) || LE32(i))
-//!   key = SHA512(H_final || blockKey)[..keyBytes]
-//! 三段 blockKey：验证器输入、验证器哈希、包密钥。
+//! 文件是 CFB 容器，两个流：`EncryptionInfo`（版本头 + 二进制 Standard 头或 Agile XML）和
+//! `EncryptedPackage`（8 字节明文长度 + 分段密文）。
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 
@@ -342,42 +338,662 @@ fn segment_workers(payload_len: usize, num_segments: usize) -> usize {
     avail.min(8).min(num_segments / 8).max(1)
 }
 
-fn verify_and_extract_key(info: &[u8], password: &str) -> Result<(Vec<u8>, Vec<u8>, usize)> {
+/// 哈希算法枚举（兼容 Agile SHA1/SHA256/SHA384/SHA512 及 Standard SHA1）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashAlg {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl HashAlg {
+    fn from_name(name: &str) -> Result<Self> {
+        match name.trim().to_ascii_uppercase().as_str() {
+            "SHA1" | "SHA-1" => Ok(Self::Sha1),
+            "SHA256" | "SHA-256" => Ok(Self::Sha256),
+            "SHA384" | "SHA-384" => Ok(Self::Sha384),
+            "SHA512" | "SHA-512" => Ok(Self::Sha512),
+            other => bail!("不支持的哈希算法 {other}"),
+        }
+    }
+
+    fn digest_len(self) -> usize {
+        match self {
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
+        }
+    }
+
+    fn block_len(self) -> usize {
+        match self {
+            Self::Sha1 | Self::Sha256 => 64,
+            Self::Sha384 | Self::Sha512 => 128,
+        }
+    }
+
+    fn hash_slices(self, parts: &[&[u8]]) -> Vec<u8> {
+        match self {
+            Self::Sha1 => sha1_slices(parts).to_vec(),
+            Self::Sha256 => {
+                let mut d = Sha256::new();
+                for p in parts {
+                    d.update(p);
+                }
+                d.finalize().to_vec()
+            }
+            Self::Sha384 => {
+                let mut d = Sha384::new();
+                for p in parts {
+                    d.update(p);
+                }
+                d.finalize().to_vec()
+            }
+            Self::Sha512 => {
+                let mut d = Sha512::new();
+                for p in parts {
+                    d.update(p);
+                }
+                d.finalize().to_vec()
+            }
+        }
+    }
+}
+
+/// 纯 Rust FIPS 180-4 SHA-1（离线构建零新增依赖，用于 Excel 2007 Standard 与 2010 Agile-SHA1 解密）。
+fn sha1_slices(parts: &[&[u8]]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let total_len: u64 = parts.iter().map(|p| p.len() as u64).sum();
+    let mut buf = [0u8; 64];
+    let mut used = 0usize;
+    let compress = |h: &mut [u32; 5], blk: &[u8; 64]| {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                blk[i * 4],
+                blk[i * 4 + 1],
+                blk[i * 4 + 2],
+                blk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    };
+    for part in parts {
+        let mut off = 0usize;
+        while off < part.len() {
+            let take = (64 - used).min(part.len() - off);
+            buf[used..used + take].copy_from_slice(&part[off..off + take]);
+            used += take;
+            off += take;
+            if used == 64 {
+                compress(&mut h, &buf);
+                used = 0;
+            }
+        }
+    }
+    buf[used] = 0x80;
+    used += 1;
+    if used > 56 {
+        buf[used..].fill(0);
+        compress(&mut h, &buf);
+        used = 0;
+    }
+    buf[used..56].fill(0);
+    buf[56..64].copy_from_slice(&(total_len * 8).to_be_bytes());
+    compress(&mut h, &buf);
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// 通用 RFC 2104 HMAC（支持 SHA1 / SHA256 / SHA384 / SHA512）。
+fn hmac_generic(alg: HashAlg, key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let bl = alg.block_len();
+    let mut k = vec![0u8; bl];
+    if key.len() > bl {
+        let h = alg.hash_slices(&[key]);
+        k[..h.len()].copy_from_slice(&h);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = vec![0x36u8; bl];
+    let mut opad = vec![0x5cu8; bl];
+    for i in 0..bl {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let ih = alg.hash_slices(&[&ipad, msg]);
+    alg.hash_slices(&[&opad, &ih])
+}
+
+/// Agile 通用迭代哈希（SHA-512 走 `compress512` 极速路径，SHA-1/256/384 走通用路径）。
+fn hash_final_alg(alg: HashAlg, password: &str, salt: &[u8], spin: u32) -> Vec<u8> {
+    if alg == HashAlg::Sha512 {
+        return hash_final(password, salt, spin).to_vec();
+    }
+    let pw = utf16le(password);
+    let mut cur = alg.hash_slices(&[salt, &pw]);
+    for i in 0..spin {
+        let le = i.to_le_bytes();
+        cur = alg.hash_slices(&[&le, &cur]);
+    }
+    cur
+}
+
+/// ECMA-376 §2.3.4.11：key = Hash(H_final || blockKey)，不足 key_bytes 补 `0x36`，超出截断。
+fn derive_key_alg(alg: HashAlg, h_final: &[u8], block: &[u8], key_bytes: usize) -> Vec<u8> {
+    let mut h = alg.hash_slices(&[h_final, block]);
+    if h.len() < key_bytes {
+        h.resize(key_bytes, 0x36);
+    } else {
+        h.truncate(key_bytes);
+    }
+    h
+}
+
+/// 通用 Agile 分段 IV：`Hash(salt || extra)`，不足 16 字节补 `0x36`，超出截断到 16 字节。
+fn derive_iv_alg(alg: HashAlg, salt: &[u8], extra: &[u8]) -> [u8; 16] {
+    let mut h = alg.hash_slices(&[salt, extra]);
+    if h.len() < 16 {
+        h.resize(16, 0x36);
+    }
+    let mut iv = [0u8; 16];
+    iv.copy_from_slice(&h[..16]);
+    iv
+}
+
+/// 通用 AES-128/192/256-CBC 解密（Office 分段零填充）。
+fn aes_cbc_decrypt_any(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    use aes::cipher::{Array, BlockCipherDecrypt, KeyInit};
+    if iv.len() != 16 {
+        bail!("AES IV 长度不对");
+    }
+    if key.len() == 32 {
+        return aes_cbc_decrypt(key, iv, data);
+    }
+    let iv_arr: [u8; 16] = iv.try_into().unwrap();
+    let padded = data.len().div_ceil(16) * 16;
+    let mut out = vec![0u8; padded];
+    let mut prev = u128::from_ne_bytes(iv_arr);
+    let mut run = |dec: &dyn Fn(&mut Array<u8, _>), dst: &mut [u8]| {
+        let full = data.len() / 16;
+        let rem = data.len() % 16;
+        for i in 0..full {
+            let chunk: [u8; 16] = data[i * 16..(i + 1) * 16].try_into().unwrap();
+            let mut b = Array::from(chunk);
+            dec(&mut b);
+            let pt = u128::from_ne_bytes(b.into()) ^ prev;
+            dst[i * 16..(i + 1) * 16].copy_from_slice(&pt.to_ne_bytes());
+            prev = u128::from_ne_bytes(chunk);
+        }
+        if rem != 0 {
+            let mut last = [0u8; 16];
+            last[..rem].copy_from_slice(&data[full * 16..]);
+            let mut b = Array::from(last);
+            dec(&mut b);
+            let pt = u128::from_ne_bytes(b.into()) ^ prev;
+            dst[full * 16..(full + 1) * 16].copy_from_slice(&pt.to_ne_bytes());
+        }
+    };
+    match key.len() {
+        16 => {
+            let c = aes::Aes128::new_from_slice(key).map_err(|e| anyhow!("AES-128 key: {e}"))?;
+            run(&|b| c.decrypt_block(b), &mut out);
+        }
+        24 => {
+            let c = aes::Aes192::new_from_slice(key).map_err(|e| anyhow!("AES-192 key: {e}"))?;
+            run(&|b| c.decrypt_block(b), &mut out);
+        }
+        other => bail!("不支持的 AES 密钥长度 {other}"),
+    }
+    Ok(out)
+}
+
+/// 通用 AES-128/192/256-CBC 加密（需 16 字节对齐，用于测试构造多种 Agile 加密包）。
+fn aes_cbc_encrypt_any(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
+    if iv.len() != 16 {
+        bail!("AES IV 长度不对");
+    }
+    if key.len() == 32 && data.len() % 16 == 0 {
+        return aes_cbc_encrypt(key, iv, data);
+    }
+    let padded = data.len().div_ceil(16) * 16;
+    let mut out = vec![0u8; padded];
+    let mut prev = u128::from_ne_bytes(iv.try_into().unwrap());
+    let mut run = |enc: &dyn Fn(&mut Array<u8, _>), dst: &mut [u8]| {
+        let full = data.len() / 16;
+        let rem = data.len() % 16;
+        for i in 0..full {
+            let pt = u128::from_ne_bytes(data[i * 16..(i + 1) * 16].try_into().unwrap());
+            let mut b = Array::from((pt ^ prev).to_ne_bytes());
+            enc(&mut b);
+            let ct: [u8; 16] = b.into();
+            dst[i * 16..(i + 1) * 16].copy_from_slice(&ct);
+            prev = u128::from_ne_bytes(ct);
+        }
+        if rem != 0 {
+            let mut tail = [0u8; 16];
+            tail[..rem].copy_from_slice(&data[full * 16..]);
+            let pt = u128::from_ne_bytes(tail);
+            let mut b = Array::from((pt ^ prev).to_ne_bytes());
+            enc(&mut b);
+            let ct: [u8; 16] = b.into();
+            dst[full * 16..(full + 1) * 16].copy_from_slice(&ct);
+        }
+    };
+    match key.len() {
+        16 => {
+            let c = aes::Aes128::new_from_slice(key).map_err(|e| anyhow!("AES-128 key: {e}"))?;
+            run(&|b| c.encrypt_block(b), &mut out);
+        }
+        24 => {
+            let c = aes::Aes192::new_from_slice(key).map_err(|e| anyhow!("AES-192 key: {e}"))?;
+            run(&|b| c.encrypt_block(b), &mut out);
+        }
+        32 => {
+            let c = aes::Aes256::new_from_slice(key).map_err(|e| anyhow!("AES-256 key: {e}"))?;
+            run(&|b| c.encrypt_block(b), &mut out);
+        }
+        other => bail!("不支持的 AES 密钥长度 {other}"),
+    }
+    Ok(out)
+}
+
+/// AES-128/192/256-ECB 解密（用于 Excel 2007 Standard Encryption）。
+fn aes_ecb_decrypt_any(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    use aes::cipher::{Array, BlockCipherDecrypt, KeyInit};
+    let blocks = data.len() / 16;
+    let mut out = vec![0u8; blocks * 16];
+    let mut run = |dec: &dyn Fn(&mut Array<u8, _>), dst: &mut [u8]| {
+        for i in 0..blocks {
+            let mut b = Array::from(<[u8; 16]>::try_from(&data[i * 16..(i + 1) * 16]).unwrap());
+            dec(&mut b);
+            let pt: [u8; 16] = b.into();
+            dst[i * 16..(i + 1) * 16].copy_from_slice(&pt);
+        }
+    };
+    match key.len() {
+        16 => {
+            let c = aes::Aes128::new_from_slice(key).map_err(|e| anyhow!("AES-128 key: {e}"))?;
+            run(&|b| c.decrypt_block(b), &mut out);
+        }
+        24 => {
+            let c = aes::Aes192::new_from_slice(key).map_err(|e| anyhow!("AES-192 key: {e}"))?;
+            run(&|b| c.decrypt_block(b), &mut out);
+        }
+        32 => {
+            let c = aes::Aes256::new_from_slice(key).map_err(|e| anyhow!("AES-256 key: {e}"))?;
+            run(&|b| c.decrypt_block(b), &mut out);
+        }
+        other => bail!("不支持的 Standard AES 密钥长度 {other}"),
+    }
+    Ok(out)
+}
+
+fn aes_ecb_encrypt_any(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
+    let padded = data.len().div_ceil(16) * 16;
+    let mut out = vec![0u8; padded];
+    let mut run = |enc: &dyn Fn(&mut Array<u8, _>), dst: &mut [u8]| {
+        let blocks = padded / 16;
+        for i in 0..blocks {
+            let mut blk = [0u8; 16];
+            let s = i * 16;
+            let e = (s + 16).min(data.len());
+            if e > s {
+                blk[..e - s].copy_from_slice(&data[s..e]);
+            }
+            let mut b = Array::from(blk);
+            enc(&mut b);
+            let ct: [u8; 16] = b.into();
+            dst[s..s + 16].copy_from_slice(&ct);
+        }
+    };
+    match key.len() {
+        16 => {
+            let c = aes::Aes128::new_from_slice(key).map_err(|e| anyhow!("AES-128 key: {e}"))?;
+            run(&|b| c.encrypt_block(b), &mut out);
+        }
+        24 => {
+            let c = aes::Aes192::new_from_slice(key).map_err(|e| anyhow!("AES-192 key: {e}"))?;
+            run(&|b| c.encrypt_block(b), &mut out);
+        }
+        32 => {
+            let c = aes::Aes256::new_from_slice(key).map_err(|e| anyhow!("AES-256 key: {e}"))?;
+            run(&|b| c.encrypt_block(b), &mut out);
+        }
+        other => bail!("不支持的 Standard AES 密钥长度 {other}"),
+    }
+    Ok(out)
+}
+
+/// 判断 `EncryptionInfo` 流是否为 ECMA-376 Standard Encryption（Excel 2007，minor == 2）。
+fn is_standard_encryption_info(info: &[u8]) -> bool {
+    if info.len() < 8 {
+        return false;
+    }
+    let major = u16::from_le_bytes([info[0], info[1]]);
+    let minor = u16::from_le_bytes([info[2], info[3]]);
+    minor == 2 && matches!(major, 2 | 3 | 4)
+}
+
+/// ECMA-376 §2.3.4.7 Standard Encryption 密钥派生与口令校验（AES-128/192/256-ECB + SHA-1 50,000 轮）。
+fn verify_and_extract_standard_key(info: &[u8], password: &str) -> Result<Vec<u8>> {
+    if info.len() < 48 {
+        bail!("Standard EncryptionInfo 过短");
+    }
+    let rd_u32 = |off: usize| -> Result<u32> {
+        let s = info
+            .get(off..off + 4)
+            .ok_or_else(|| anyhow!("Standard EncryptionInfo 越界"))?;
+        Ok(u32::from_le_bytes(s.try_into().unwrap()))
+    };
+    let header_size = rd_u32(8)? as usize;
+    let header_start = 12usize;
+    let verifier_start = header_start
+        .checked_add(header_size)
+        .ok_or_else(|| anyhow!("Standard EncryptionHeader 长度溢出"))?;
+    if header_size < 32 || verifier_start + 4 + 16 + 16 + 4 + 32 > info.len() {
+        bail!("Standard EncryptionInfo 结构损坏");
+    }
+    let alg_id = rd_u32(header_start + 8)?;
+    let alg_id_hash = rd_u32(header_start + 12)?;
+    let key_size_bits = rd_u32(header_start + 16)?;
+    let key_bytes = match (alg_id, key_size_bits) {
+        (0x0000_660E, _) | (0, 0 | 128) => 16usize,
+        (0x0000_660F, _) | (0, 192) => 24usize,
+        (0x0000_6610, _) | (0, 256) => 32usize,
+        _ => bail!("不支持的 Standard 加密算法 0x{alg_id:08X} ({key_size_bits} bit)"),
+    };
+    if alg_id_hash != 0 && alg_id_hash != 0x0000_8004 {
+        bail!("不支持的 Standard 哈希算法 0x{alg_id_hash:08X}");
+    }
+    let salt_size = rd_u32(verifier_start)? as usize;
+    if salt_size != 16 {
+        bail!("Standard saltSize={salt_size} 非标准 16 字节");
+    }
+    let salt = &info[verifier_start + 4..verifier_start + 20];
+    let enc_verifier = &info[verifier_start + 20..verifier_start + 36];
+    let hash_size = rd_u32(verifier_start + 36)? as usize;
+    let enc_verifier_hash = &info[verifier_start + 40..verifier_start + 72];
+    if hash_size != 20 {
+        bail!("Standard verifierHashSize={hash_size} 非 SHA-1");
+    }
+
+    // Standard KDF: H0 = SHA1(salt || UTF16LE(pw)); 50000 rounds Hi = SHA1(LE32(i) || H_{i-1})
+    let pw = utf16le(password);
+    let mut h = sha1_slices(&[salt, &pw]);
+    for i in 0..50_000u32 {
+        let le = i.to_le_bytes();
+        h = sha1_slices(&[&le, &h]);
+    }
+    let zero = 0u32.to_le_bytes();
+    let h_final = sha1_slices(&[&h, &zero]);
+    let mut b1 = [0x36u8; 64];
+    let mut b2 = [0x5Cu8; 64];
+    for i in 0..20 {
+        b1[i] ^= h_final[i];
+        b2[i] ^= h_final[i];
+    }
+    let x1 = sha1_slices(&[&b1]);
+    let x2 = sha1_slices(&[&b2]);
+    let mut x = [0u8; 40];
+    x[..20].copy_from_slice(&x1);
+    x[20..].copy_from_slice(&x2);
+    let key = x[..key_bytes].to_vec();
+
+    // 验证口令
+    let verifier = aes_ecb_decrypt_any(&key, enc_verifier)?;
+    let dec_hash = aes_ecb_decrypt_any(&key, enc_verifier_hash)?;
+    let got_hash = sha1_slices(&[&verifier]);
+    if got_hash[..] != dec_hash[..20] {
+        bail!("打开密码不正确");
+    }
+    Ok(key)
+}
+
+/// 构造 Excel 2007 Standard Encryption（AES-128-ECB + SHA-1）CFB 字节流（用于兼容性测试与互通验证）。
+pub fn encrypt_standard_bytes(plain: &[u8], password: &str) -> Result<Vec<u8>> {
+    let salt = random_bytes(16)?;
+    let verifier = random_bytes(16)?;
+    let pw = utf16le(password);
+    let mut h = sha1_slices(&[&salt, &pw]);
+    for i in 0..50_000u32 {
+        let le = i.to_le_bytes();
+        h = sha1_slices(&[&le, &h]);
+    }
+    let h_final = sha1_slices(&[&h, &0u32.to_le_bytes()]);
+    let mut b1 = [0x36u8; 64];
+    let mut b2 = [0x5Cu8; 64];
+    for i in 0..20 {
+        b1[i] ^= h_final[i];
+        b2[i] ^= h_final[i];
+    }
+    let x1 = sha1_slices(&[&b1]);
+    let x2 = sha1_slices(&[&b2]);
+    let mut x = [0u8; 40];
+    x[..20].copy_from_slice(&x1);
+    x[20..].copy_from_slice(&x2);
+    let key = &x[..16];
+
+    let enc_verifier = aes_ecb_encrypt_any(key, &verifier)?;
+    let vhash = sha1_slices(&[&verifier]);
+    let mut vhash_padded = [0u8; 32];
+    vhash_padded[..20].copy_from_slice(&vhash);
+    let enc_vhash = aes_ecb_encrypt_any(key, &vhash_padded)?;
+
+    // EncryptionInfo: version(3,2) + flags(0x24) + headerSize + EncryptionHeader + EncryptionVerifier
+    let csp = utf16le("Microsoft Enhanced RSA and AES Cryptographic Provider\0");
+    let header_size = (32 + csp.len()) as u32;
+    let mut info = Vec::new();
+    info.extend_from_slice(&3u16.to_le_bytes()); // major
+    info.extend_from_slice(&2u16.to_le_bytes()); // minor
+    info.extend_from_slice(&0x0000_0024u32.to_le_bytes()); // fCryptoAPI | fAES
+    info.extend_from_slice(&header_size.to_le_bytes());
+    info.extend_from_slice(&0x0000_0024u32.to_le_bytes()); // flags
+    info.extend_from_slice(&0u32.to_le_bytes()); // sizeExtra
+    info.extend_from_slice(&0x0000_660Eu32.to_le_bytes()); // CALG_AES_128
+    info.extend_from_slice(&0x0000_8004u32.to_le_bytes()); // CALG_SHA1
+    info.extend_from_slice(&128u32.to_le_bytes()); // keySize
+    info.extend_from_slice(&24u32.to_le_bytes()); // providerType (PROV_RSA_AES)
+    info.extend_from_slice(&0u32.to_le_bytes()); // reserved1
+    info.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+    info.extend_from_slice(&csp);
+    info.extend_from_slice(&16u32.to_le_bytes()); // saltSize
+    info.extend_from_slice(&salt);
+    info.extend_from_slice(&enc_verifier);
+    info.extend_from_slice(&20u32.to_le_bytes()); // verifierHashSize
+    info.extend_from_slice(&enc_vhash);
+
+    let enc_pkg = aes_ecb_encrypt_any(key, plain)?;
+    let mut pkg = Vec::with_capacity(8 + enc_pkg.len());
+    pkg.extend_from_slice(&(plain.len() as u64).to_le_bytes());
+    pkg.extend_from_slice(&enc_pkg);
+
+    let mut cur = std::io::Cursor::new(Vec::new());
+    {
+        let mut cf = cfb::CompoundFile::create(&mut cur)?;
+        cf.create_stream("EncryptionInfo")?.write_all(&info)?;
+        cf.create_stream("EncryptedPackage")?.write_all(&pkg)?;
+        cf.flush()?;
+    }
+    Ok(cur.into_inner())
+}
+
+/// 构造自定义算法组合（AES-128/192/256-CBC + SHA1/SHA256/SHA384/SHA512 + dataIntegrity HMAC）的 Agile 加密包。
+pub fn encrypt_agile_bytes_with(
+    plain: &[u8],
+    password: &str,
+    key_bits: u32,
+    hash_name: &str,
+    spin: u32,
+) -> Result<Vec<u8>> {
+    let alg = HashAlg::from_name(hash_name)?;
+    let key_bytes = (key_bits / 8) as usize;
+    let hash_bytes = alg.digest_len();
+    let salt = random_bytes(16)?;
+    let salt_pkg = random_bytes(16)?;
+    let verifier = random_bytes(16)?;
+    let key = random_bytes(key_bytes)?;
+    let hmac_key = random_bytes(hash_bytes)?;
+    let spin = spin.max(1);
+
+    let h = hash_final_alg(alg, password, &salt, spin);
+    let k_vi = derive_key_alg(alg, &h, &BLOCK_VERIFIER_INPUT, key_bytes);
+    let k_vh = derive_key_alg(alg, &h, &BLOCK_VERIFIER_HASH, key_bytes);
+    let k_kv = derive_key_alg(alg, &h, &BLOCK_KEY_VALUE, key_bytes);
+    let enc_vi = aes_cbc_encrypt_any(&k_vi, &salt, &verifier)?;
+    let mut vhash = alg.hash_slices(&[&verifier]);
+    let vhash_pad = vhash.len().div_ceil(16) * 16;
+    vhash.resize(vhash_pad, 0);
+    let enc_vh = aes_cbc_encrypt_any(&k_vh, &salt, &vhash)?;
+    let enc_kv = aes_cbc_encrypt_any(&k_kv, &salt, &key)?;
+
+    let mut pkg = Vec::with_capacity(8 + plain.len() + 16);
+    pkg.extend_from_slice(&(plain.len() as u64).to_le_bytes());
+    for (i, seg) in plain.chunks(SEGMENT).enumerate() {
+        let iv = derive_iv_alg(alg, &salt_pkg, &(i as u32).to_le_bytes());
+        let ct = aes_cbc_encrypt_any(&key, &iv, seg)?;
+        pkg.extend_from_slice(&ct);
+    }
+
+    let hmac_val = hmac_generic(alg, &hmac_key, &pkg);
+    let mut hk_pad = hmac_key.clone();
+    let hk_pad_len = hk_pad.len().div_ceil(16) * 16;
+    hk_pad.resize(hk_pad_len, 0);
+    let mut hv_pad = hmac_val.clone();
+    let hv_pad_len = hv_pad.len().div_ceil(16) * 16;
+    hv_pad.resize(hv_pad_len, 0);
+    let enc_hk = aes_cbc_encrypt_any(&key, &derive_iv_alg(alg, &salt_pkg, &BLOCK_HMAC_KEY), &hk_pad)?;
+    let enc_hv = aes_cbc_encrypt_any(&key, &derive_iv_alg(alg, &salt_pkg, &BLOCK_HMAC_VALUE), &hv_pad)?;
+
+    let b = |v: &[u8]| base64::engine::general_purpose::STANDARD.encode(v);
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<encryption xmlns=\"http://schemas.microsoft.com/office/2006/encryption\" \
+xmlns:p=\"http://schemas.microsoft.com/office/2006/keyEncryptor/password\">\
+<keyData saltSize=\"16\" blockSize=\"16\" keyBits=\"{key_bits}\" hashSize=\"{hash_bytes}\" \
+cipherAlgorithm=\"AES\" cipherChaining=\"ChainingModeCBC\" hashAlgorithm=\"{hash_name}\" \
+saltValue=\"{}\"/>\
+<dataIntegrity encryptedHmacKey=\"{}\" encryptedHmacValue=\"{}\"/>\
+<keyEncryptors><keyEncryptor uri=\"http://schemas.microsoft.com/office/2006/keyEncryptor/password\">\
+<p:encryptedKey spinCount=\"{spin}\" saltSize=\"16\" blockSize=\"16\" keyBits=\"{key_bits}\" \
+hashSize=\"{hash_bytes}\" cipherAlgorithm=\"AES\" cipherChaining=\"ChainingModeCBC\" \
+hashAlgorithm=\"{hash_name}\" saltValue=\"{}\" encryptedVerifierHashInput=\"{}\" \
+encryptedVerifierHashValue=\"{}\" encryptedKeyValue=\"{}\"/>\
+</keyEncryptor></keyEncryptors></encryption>",
+        b(&salt_pkg),
+        b(&enc_hk),
+        b(&enc_hv),
+        b(&salt),
+        b(&enc_vi),
+        b(&enc_vh),
+        b(&enc_kv)
+    );
+    let mut info = Vec::with_capacity(8 + xml.len());
+    info.extend_from_slice(&[4, 0, 4, 0, 0x40, 0, 0, 0]);
+    info.extend_from_slice(xml.as_bytes());
+
+    let mut cur = std::io::Cursor::new(Vec::new());
+    {
+        let mut cf = cfb::CompoundFile::create(&mut cur)?;
+        cf.create_stream("EncryptionInfo")?.write_all(&info)?;
+        cf.create_stream("EncryptedPackage")?.write_all(&pkg)?;
+        cf.flush()?;
+    }
+    Ok(cur.into_inner())
+}
+
+struct AgileKeyMaterial {
+    salt_pkg: Vec<u8>,
+    key: Vec<u8>,
+    key_bytes: usize,
+    data_hash_alg: HashAlg,
+    enc_hmac_key: Option<Vec<u8>>,
+    enc_hmac_value: Option<Vec<u8>>,
+}
+
+fn verify_and_extract_key(info: &[u8], password: &str) -> Result<AgileKeyMaterial> {
     let xml = parse_info(info)?;
     if let Some(obj) = xml.cipher_algorithm.as_deref() {
         if !obj.eq_ignore_ascii_case("AES") {
             bail!("不支持的加密算法 {obj}");
         }
     }
-    if xml.hash_algorithm != "SHA512" {
-        bail!("不支持的哈希算法 {}", xml.hash_algorithm);
-    }
-    if xml.cipher_chaining.as_deref().is_none_or(|c| !c.eq_ignore_ascii_case("ChainingModeCBC")) {
+    let key_alg = HashAlg::from_name(&xml.hash_algorithm)?;
+    let data_alg = HashAlg::from_name(&xml.data_hash_algorithm)?;
+    if xml
+        .cipher_chaining
+        .as_deref()
+        .is_none_or(|c| !c.eq_ignore_ascii_case("ChainingModeCBC"))
+    {
         bail!("只支持 CBC 链接模式");
     }
     let salt_pkg = b64(&xml.salt_data)?;
     let salt = b64(&xml.salt_key)?;
     let key_bytes = (xml.key_bits / 8) as usize;
-    let h = hash_final(password, &salt, xml.spin_count.max(1));
-    let k_verifier = derive_key(&h, &BLOCK_VERIFIER_INPUT, key_bytes);
-    let k_hash = derive_key(&h, &BLOCK_VERIFIER_HASH, key_bytes);
-    let k_value = derive_key(&h, &BLOCK_KEY_VALUE, key_bytes);
-    let verifier = aes_cbc_decrypt(&k_verifier, &salt, &b64(&xml.enc_verifier_input)?)?;
-    let want_hash = aes_cbc_decrypt(&k_hash, &salt, &b64(&xml.enc_verifier_hash)?)?;
-    let mut d = Sha512::new();
-    d.update(&verifier);
-    let got: [u8; 64] = d.finalize().into();
-    if got[..] != want_hash[..64] {
+    let enc_key_bytes = (xml.enc_key_bits / 8) as usize;
+    let h = hash_final_alg(key_alg, password, &salt, xml.spin_count.max(1));
+    let k_verifier = derive_key_alg(key_alg, &h, &BLOCK_VERIFIER_INPUT, enc_key_bytes);
+    let k_hash = derive_key_alg(key_alg, &h, &BLOCK_VERIFIER_HASH, enc_key_bytes);
+    let k_value = derive_key_alg(key_alg, &h, &BLOCK_KEY_VALUE, enc_key_bytes);
+    let verifier = aes_cbc_decrypt_any(&k_verifier, &salt, &b64(&xml.enc_verifier_input)?)?;
+    let want_hash = aes_cbc_decrypt_any(&k_hash, &salt, &b64(&xml.enc_verifier_hash)?)?;
+    let got = key_alg.hash_slices(&[&verifier]);
+    let hlen = key_alg.digest_len();
+    if want_hash.len() < hlen || got[..hlen] != want_hash[..hlen] {
         bail!("打开密码不正确");
     }
-    let key = aes_cbc_decrypt(&k_value, &salt, &b64(&xml.enc_key_value)?)?;
+    let mut key = aes_cbc_decrypt_any(&k_value, &salt, &b64(&xml.enc_key_value)?)?;
     if key.len() < key_bytes {
         bail!("包密钥长度不足");
     }
-    Ok((salt_pkg, key, key_bytes))
+    key.truncate(key_bytes);
+    let enc_hmac_key = xml.enc_hmac_key.as_deref().map(b64).transpose()?;
+    let enc_hmac_value = xml.enc_hmac_value.as_deref().map(b64).transpose()?;
+    Ok(AgileKeyMaterial {
+        salt_pkg,
+        key,
+        key_bytes,
+        data_hash_alg: data_alg,
+        enc_hmac_key,
+        enc_hmac_value,
+    })
 }
 
-/// 轻量口令校验：仅解析 `EncryptionInfo` 并校验 `EncryptedVerifierHash`，不读取或解密正文。
+/// 轻量口令校验：同时支持 Excel 2007 Standard 与 2010–365 Agile，不读取或解密正文。
 pub fn verify_password(path: &Path, password: &str) -> Result<()> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("读取 {} 失败", path.display()))?;
@@ -387,7 +1003,11 @@ pub fn verify_password(path: &Path, password: &str) -> Result<()> {
     cf.open_stream("EncryptionInfo")
         .map_err(|e| anyhow!("缺少 EncryptionInfo：{e}"))?
         .read_to_end(&mut info)?;
-    let _ = verify_and_extract_key(&info, password)?;
+    if is_standard_encryption_info(&info) {
+        let _ = verify_and_extract_standard_key(&info, password)?;
+    } else {
+        let _ = verify_and_extract_key(&info, password)?;
+    }
     Ok(())
 }
 
@@ -418,7 +1038,28 @@ pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
         info.reserve(s.len() as usize);
         s.read_to_end(&mut info)?;
     }
-    // Overlap reading EncryptedPackage sectors from CFB with the 100k-spin SHA-512 KDF.
+
+    // 分支 1：Excel 2007 Standard Encryption（AES-128/192/256-ECB + SHA-1）
+    if is_standard_encryption_info(&info) {
+        let key = verify_and_extract_standard_key(&info, password)?;
+        let mut pkg = Vec::new();
+        cf.open_stream("EncryptedPackage")
+            .map_err(|e| anyhow!("缺少 EncryptedPackage：{e}"))?
+            .read_to_end(&mut pkg)?;
+        if pkg.len() < 8 {
+            bail!("EncryptedPackage 太短");
+        }
+        let size = u64::from_le_bytes(pkg[..8].try_into().unwrap()) as usize;
+        let payload = &pkg[8..];
+        if payload.is_empty() || size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = aes_ecb_decrypt_any(&key, payload)?;
+        out.truncate(size);
+        return Ok(out);
+    }
+
+    // 分支 2：Excel 2010/2013/2016/365 Agile Encryption（AES-128/192/256-CBC + SHA1/256/384/512 + HMAC 校验）
     let (key_res, pkg_res) = std::thread::scope(|s| {
         let kdf = s.spawn(|| verify_and_extract_key(&info, password));
         let pkg = (|| -> Result<Vec<u8>> {
@@ -431,15 +1072,32 @@ pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
         })();
         (kdf.join().expect("kdf thread panicked"), pkg)
     });
-    let (salt_pkg, key, key_bytes) = key_res?;
-    if key_bytes != 32 {
-        bail!("AES 密钥/IV 长度不对");
-    }
-    let cipher = aes::Aes256::new_from_slice(&key[..32]).map_err(|e| anyhow!("AES key: {e}"))?;
+    let mat = key_res?;
     let pkg = pkg_res?;
     if pkg.len() < 8 {
         bail!("EncryptedPackage 太短");
     }
+
+    // HMAC dataIntegrity 完整性校验（若 EncryptionInfo 提供）
+    if let (Some(enc_hk), Some(enc_hv)) = (&mat.enc_hmac_key, &mat.enc_hmac_value) {
+        let hlen = mat.data_hash_alg.digest_len();
+        let iv_hk = derive_iv_alg(mat.data_hash_alg, &mat.salt_pkg, &BLOCK_HMAC_KEY);
+        let iv_hv = derive_iv_alg(mat.data_hash_alg, &mat.salt_pkg, &BLOCK_HMAC_VALUE);
+        let dec_hk = aes_cbc_decrypt_any(&mat.key, &iv_hk, enc_hk)?;
+        let dec_hv = aes_cbc_decrypt_any(&mat.key, &iv_hv, enc_hv)?;
+        if dec_hk.len() >= hlen && dec_hv.len() >= hlen {
+            let computed = hmac_generic(mat.data_hash_alg, &dec_hk[..hlen], &pkg);
+            // 常量时间比对，防止密文被篡改静默解出损坏包
+            let mut diff = 0u8;
+            for i in 0..hlen {
+                diff |= computed[i] ^ dec_hv[i];
+            }
+            if diff != 0 {
+                bail!("加密包 HMAC 完整性校验失败：文件可能已被篡改或损坏");
+            }
+        }
+    }
+
     let mut size_bytes = [0u8; 8];
     size_bytes.copy_from_slice(&pkg[..8]);
     let size = u64::from_le_bytes(size_bytes) as usize;
@@ -447,11 +1105,25 @@ pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
     if payload.is_empty() || size == 0 {
         return Ok(Vec::new());
     }
+
+    // 非 AES-256 或非 SHA-512 路径（Excel 2010/2013 AES-128 + SHA-1/SHA-256 等）
+    if mat.key_bytes != 32 || mat.data_hash_alg != HashAlg::Sha512 {
+        let mut out = Vec::with_capacity(size.saturating_add(16));
+        for (i, seg) in payload.chunks(SEGMENT).enumerate() {
+            let iv = derive_iv_alg(mat.data_hash_alg, &mat.salt_pkg, &(i as u32).to_le_bytes());
+            let pt = aes_cbc_decrypt_any(&mat.key, &iv, seg)?;
+            out.extend_from_slice(&pt);
+        }
+        out.truncate(size);
+        return Ok(out);
+    }
+
+    let cipher = aes::Aes256::new_from_slice(&mat.key[..32]).map_err(|e| anyhow!("AES key: {e}"))?;
     let n_segs = payload.len().div_ceil(SEGMENT);
     let last_len = payload.len() - (n_segs - 1) * SEGMENT;
     let total_out = (n_segs - 1) * SEGMENT + last_len.div_ceil(16) * 16;
     let mut out = vec![0u8; total_out];
-    let iv_gen = SegmentIvGen::new(&salt_pkg);
+    let iv_gen = SegmentIvGen::new(&mat.salt_pkg);
     let workers = segment_workers(payload.len(), n_segs);
 
     if workers == 1 {
@@ -503,12 +1175,16 @@ struct InfoXml {
     salt_key: String,
     spin_count: u32,
     key_bits: u32,
+    enc_key_bits: u32,
     hash_algorithm: String,
+    data_hash_algorithm: String,
     cipher_algorithm: Option<String>,
     cipher_chaining: Option<String>,
     enc_verifier_input: String,
     enc_verifier_hash: String,
     enc_key_value: String,
+    enc_hmac_key: Option<String>,
+    enc_hmac_value: Option<String>,
 }
 
 /// EncryptionInfo 流：8 字节版本头（4,4,0x40,0）+ XML
@@ -519,16 +1195,26 @@ fn parse_info(bytes: &[u8]) -> Result<InfoXml> {
         .or_else(|| bytes.windows(12).position(|w| w == b"<encryption "))
         .ok_or_else(|| anyhow!("EncryptionInfo 里找不到 XML"))?;
     let xml = std::str::from_utf8(&bytes[start..]).context("EncryptionInfo 不是 UTF-8")?;
-    // keyData 管包加密，p:encryptedKey 管口令校验，两段盐不同
+    // keyData 管包加密，p:encryptedKey 管口令校验，dataIntegrity 管 HMAC 校验
     let key_data = tag_block(xml, "<keyData").unwrap_or(xml);
+    let data_integrity = tag_block(xml, "<dataIntegrity");
     let enc_key = tag_block(xml, "<p:encryptedKey")
         .or_else(|| tag_block(xml, "<encryptedKey"))
         .ok_or_else(|| anyhow!("缺少 encryptedKey（口令加密段）"))?;
     let key_bits = attr(key_data, "keyBits").and_then(|v| v.parse().ok()).unwrap_or(256);
+    let enc_key_bits = attr(enc_key, "keyBits").and_then(|v| v.parse().ok()).unwrap_or(key_bits);
     let spin_count = attr(enc_key, "spinCount").and_then(|v| v.parse().ok()).unwrap_or(SPIN);
     let salt_data = attr(key_data, "saltValue")
         .ok_or_else(|| anyhow!("keyData 缺少 saltValue"))?
         .to_string();
+    let key_hash = attr(enc_key, "hashAlgorithm")
+        .unwrap_or("SHA512")
+        .trim()
+        .to_ascii_uppercase();
+    let data_hash = attr(key_data, "hashAlgorithm")
+        .unwrap_or(&key_hash)
+        .trim()
+        .to_ascii_uppercase();
     Ok(InfoXml {
         salt_data,
         salt_key: attr(enc_key, "saltValue")
@@ -536,10 +1222,9 @@ fn parse_info(bytes: &[u8]) -> Result<InfoXml> {
             .into(),
         spin_count,
         key_bits,
-        hash_algorithm: attr(enc_key, "hashAlgorithm")
-            .unwrap_or("SHA512")
-            .trim()
-            .to_ascii_uppercase(),
+        enc_key_bits,
+        hash_algorithm: key_hash,
+        data_hash_algorithm: data_hash,
         cipher_algorithm: attr(enc_key, "cipherAlgorithm").map(|s| s.to_string()),
         cipher_chaining: attr(enc_key, "cipherChaining").map(|s| s.to_string()),
         enc_verifier_input: attr(enc_key, "encryptedVerifierHashInput")
@@ -551,6 +1236,12 @@ fn parse_info(bytes: &[u8]) -> Result<InfoXml> {
         enc_key_value: attr(enc_key, "encryptedKeyValue")
             .ok_or_else(|| anyhow!("缺少 encryptedKeyValue"))?
             .into(),
+        enc_hmac_key: data_integrity
+            .and_then(|di| attr(di, "encryptedHmacKey"))
+            .map(str::to_string),
+        enc_hmac_value: data_integrity
+            .and_then(|di| attr(di, "encryptedHmacValue"))
+            .map(str::to_string),
     })
 }
 

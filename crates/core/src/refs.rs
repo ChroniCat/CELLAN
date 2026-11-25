@@ -587,6 +587,246 @@ fn consume_quoted_ext_qualifier(b: &[u8], formula: &str, i: usize) -> Option<usi
     None
 }
 
+/// 剪切/拖动源块 `src_rect = (r1, c1, r2, c2)` 从 `src_sheet` 平移 `(dr, dc)` 到 `dst_sheet` 后，
+/// 重写任意公式中指向 `src_rect` 内部的单元格与区域引用（包括 `$A$1` 绝对引用，与 Excel 剪切/拖拽一致）。
+pub fn relocate_moved_rect(
+    formula: &str,
+    own_sheet: &str,
+    src_sheet: &str,
+    src_rect: (u32, u32, u32, u32),
+    dst_sheet: &str,
+    dr: i64,
+    dc: i64,
+) -> String {
+    let same_sheet = src_sheet.eq_ignore_ascii_case(dst_sheet);
+    if same_sheet && dr == 0 && dc == 0 {
+        return formula.to_string();
+    }
+    let (sr1, sc1, sr2, sc2) = (
+        src_rect.0.min(src_rect.2),
+        src_rect.1.min(src_rect.3),
+        src_rect.0.max(src_rect.2),
+        src_rect.1.max(src_rect.3),
+    );
+    let in_rect = |r: u32, c: u32| r >= sr1 && r <= sr2 && c >= sc1 && c <= sc2;
+    let map_pt = |r: u32, c: u32| -> Option<(u32, u32)> {
+        let nr = (r as i64).checked_add(dr)?;
+        let nc = (c as i64).checked_add(dc)?;
+        if (0..1_048_576).contains(&nr) && (0..16_384).contains(&nc) {
+            Some((nr as u32, nc as u32))
+        } else {
+            None
+        }
+    };
+    let fmt_qual = |name: &str| -> String {
+        let needs_q = name.is_empty()
+            || !name.bytes().all(|x| x.is_ascii_alphanumeric() || x == b'_' || x >= 0x80)
+            || name.as_bytes()[0].is_ascii_digit();
+        if needs_q {
+            format!("'{}'!", name.replace('\'', "''"))
+        } else {
+            format!("{name}!")
+        }
+    };
+
+    let b = formula.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(formula.len() + 16);
+    let mut i = 0usize;
+    let mut qual: Option<(String, usize)> = None; // (sheet_name, start_in_out)
+    while i < b.len() {
+        let c = b[i];
+        if c == b'"' {
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.extend_from_slice(&b[start..i]);
+            qual = None;
+            continue;
+        }
+        if let Some(after_bang) = consume_quoted_ext_qualifier(b, formula, i) {
+            out.extend_from_slice(&b[i..after_bang]);
+            qual = Some(("\0EXT".into(), out.len()));
+            i = after_bang;
+            continue;
+        }
+        if c == b'\'' {
+            let start = i;
+            let out_start = out.len();
+            i += 1;
+            let ns = i;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            let name = &formula[ns..i];
+            if i < b.len() {
+                i += 1;
+            }
+            out.extend_from_slice(&b[start..i]);
+            if b.get(i) == Some(&b'!') {
+                qual = Some((name.replace("''", "'"), out_start));
+                out.push(b'!');
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(after_bang) = consume_ext_qualifier(b, i) {
+            out.extend_from_slice(&b[i..after_bang]);
+            qual = Some(("\0EXT".into(), out.len()));
+            i = after_bang;
+            continue;
+        }
+        if c == b'[' {
+            let start = i;
+            let mut depth = 0usize;
+            while i < b.len() {
+                match b[i] {
+                    b'[' => depth += 1,
+                    b']' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            out.extend_from_slice(&b[start..i]);
+            qual = None;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c >= 0x80 {
+            let start = i;
+            let mut j = i;
+            while j < b.len()
+                && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'.' || b[j] >= 0x80)
+            {
+                j += 1;
+            }
+            if b.get(j) == Some(&b'!') {
+                let out_start = out.len();
+                out.extend_from_slice(&b[start..=j]);
+                qual = Some((formula[start..j].to_string(), out_start));
+                i = j + 1;
+                continue;
+            }
+        }
+        if (c == b'$' || c.is_ascii_alphabetic())
+            && (i == 0 || !is_ident_byte(b[i - 1]))
+        {
+            let mut p = i;
+            let d1 = if b.get(p) == Some(&b'$') { p += 1; true } else { false };
+            let ls = p;
+            while p < b.len() && b[p].is_ascii_alphabetic() { p += 1; }
+            let letters = &b[ls..p];
+            if !letters.is_empty() && letters.len() <= 3 {
+                let d2 = if b.get(p) == Some(&b'$') { p += 1; true } else { false };
+                let ds = p;
+                while p < b.len() && b[p].is_ascii_digit() { p += 1; }
+                let digits = &b[ds..p];
+                if !digits.is_empty()
+                    && !b.get(p).is_some_and(|x| *x == b'(' || is_ident_byte(*x) || *x == b'$')
+                    && let (Some(c1), Some(r1)) = (col_index(letters), row_index(digits))
+                {
+                    let targets_src = match &qual {
+                        Some((q, _)) => q.eq_ignore_ascii_case(src_sheet),
+                        None => own_sheet.eq_ignore_ascii_case(src_sheet),
+                    };
+                    // Check range A1:B2
+                    if b.get(p) == Some(&b':') {
+                        let mut q = p + 1;
+                        let d3 = if b.get(q) == Some(&b'$') { q += 1; true } else { false };
+                        let ls2 = q;
+                        while q < b.len() && b[q].is_ascii_alphabetic() { q += 1; }
+                        let letters2 = &b[ls2..q];
+                        let d4 = if b.get(q) == Some(&b'$') { q += 1; true } else { false };
+                        let ds2 = q;
+                        while q < b.len() && b[q].is_ascii_digit() { q += 1; }
+                        let digits2 = &b[ds2..q];
+                        if !letters2.is_empty()
+                            && !digits2.is_empty()
+                            && !b.get(q).is_some_and(|x| *x == b'(' || is_ident_byte(*x) || *x == b'$')
+                            && let (Some(c2), Some(r2)) = (col_index(letters2), row_index(digits2))
+                        {
+                            if targets_src && in_rect(r1, c1) && in_rect(r2, c2) {
+                                if !same_sheet {
+                                    if let Some((_, qstart)) = qual.take() {
+                                        out.truncate(qstart);
+                                    }
+                                    if !own_sheet.eq_ignore_ascii_case(dst_sheet) {
+                                        out.extend_from_slice(fmt_qual(dst_sheet).as_bytes());
+                                    }
+                                }
+                                let txt = match (map_pt(r1, c1), map_pt(r2, c2)) {
+                                    (Some((nr1, nc1)), Some((nr2, nc2))) => format!(
+                                        "{}{}{}{}:{}{}{}{}",
+                                        if d1 { "$" } else { "" }, col_label(nc1),
+                                        if d2 { "$" } else { "" }, nr1 + 1,
+                                        if d3 { "$" } else { "" }, col_label(nc2),
+                                        if d4 { "$" } else { "" }, nr2 + 1,
+                                    ),
+                                    _ => "#REF!".to_string(),
+                                };
+                                out.extend_from_slice(txt.as_bytes());
+                            } else {
+                                out.extend_from_slice(&b[i..q]);
+                            }
+                            i = q;
+                            qual = None;
+                            continue;
+                        }
+                    }
+                    if targets_src && in_rect(r1, c1) {
+                        if !same_sheet {
+                            if let Some((_, qstart)) = qual.take() {
+                                out.truncate(qstart);
+                            }
+                            if !own_sheet.eq_ignore_ascii_case(dst_sheet) {
+                                out.extend_from_slice(fmt_qual(dst_sheet).as_bytes());
+                            }
+                        }
+                        let txt = match map_pt(r1, c1) {
+                            Some((nr, nc)) => format!(
+                                "{}{}{}{}",
+                                if d1 { "$" } else { "" }, col_label(nc),
+                                if d2 { "$" } else { "" }, nr + 1,
+                            ),
+                            None => "#REF!".to_string(),
+                        };
+                        out.extend_from_slice(txt.as_bytes());
+                    } else {
+                        out.extend_from_slice(&b[i..p]);
+                    }
+                    i = p;
+                    qual = None;
+                    continue;
+                }
+            }
+        }
+        if matches!(c, b'!' | b'+' | b'-' | b'*' | b'/' | b'^' | b'&' | b',' | b';' | b'(' | b')' | b'=' | b'<' | b'>') {
+            qual = None;
+        }
+        out.push(c);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 /// 改写一条公式（不带前导 `=` 也可以）
 pub fn rewrite(formula: &str, sh: &Shift) -> String {
     rewrite_mapped(formula, &MappedShift { shift: sh, insertions: &[] })
@@ -841,7 +1081,7 @@ pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
             out.extend_from_slice(&b[start..i]);
             continue;
         }
-        if let Some((after_bang, a, z, qe)) = scan_quoted_3d(b, formula, i) {
+        if let Some((after_bang, a, z, _qe)) = scan_quoted_3d(b, formula, i) {
             let hit_a = a.eq_ignore_ascii_case(old);
             let hit_z = z.eq_ignore_ascii_case(old);
             if let Some(new) = new {

@@ -151,6 +151,9 @@ pub struct CellStyle {
     /// 删除线
     #[serde(default)]
     pub strikethrough: bool,
+    /// 上下标：0 常规，1 上标 (superscript)，2 下标 (subscript)
+    #[serde(default)]
+    pub vert_align: u8,
     /// 文字旋转角度（度，逆时针为正：0 / 45 / 90 / -45 / -90）
     #[serde(default)]
     pub rotation: i16,
@@ -200,6 +203,7 @@ impl Default for CellStyle {
             double_underline: false,
             vertical_text: false,
             strikethrough: false,
+            vert_align: 0,
             rotation: 0,
             font: String::new(),
             size: 0.0,
@@ -279,6 +283,7 @@ fn hash_of(s: &CellStyle) -> u64 {
         s.double_underline.hash(&mut h);
         s.vertical_text.hash(&mut h);
     s.strikethrough.hash(&mut h);
+    s.vert_align.hash(&mut h);
     s.rotation.hash(&mut h);
     s.font.hash(&mut h);
     s.size.to_bits().hash(&mut h);
@@ -313,7 +318,12 @@ impl StyleTable {
     pub fn intern(&mut self, s: CellStyle) -> u16 {
         let k = hash_of(&s);
         if let Some(&id) = self.0.index.get(&k) {
-            if self.0.styles[id as usize] == s {
+            if self.0.styles[id as usize] == s
+                && self.0.themes.get(id as usize).copied().unwrap_or_default()
+                    == crate::style_theme::XfTheme::default()
+                && self.0.patterns.get(id as usize).and_then(|p| p.as_ref()).is_none()
+                && !self.0.quotes.get(id as usize).copied().unwrap_or(false)
+            {
                 return id;
             }
         }
@@ -323,8 +333,74 @@ impl StyleTable {
         inner.themes.push(crate::style_theme::XfTheme::default());
         inner.patterns.push(None);
         inner.quotes.push(false);
-        inner.index.insert(k, id);
+        inner.index.entry(k).or_insert(id);
         id
+    }
+
+    /// 完整保留扩展元数据（主题色、图案填充、quotePrefix）的样式驻留。
+    pub fn intern_with_ext(
+        &mut self,
+        s: CellStyle,
+        theme: crate::style_theme::XfTheme,
+        pattern: Option<crate::style_ext::FillPattern>,
+        quote: bool,
+    ) -> u16 {
+        let is_plain = theme == crate::style_theme::XfTheme::default()
+            && pattern.is_none()
+            && !quote;
+        if is_plain {
+            return self.intern(s);
+        }
+        for (i, st) in self.0.styles.iter().enumerate() {
+            if *st == s
+                && self.0.themes.get(i).copied().unwrap_or_default() == theme
+                && self.0.patterns.get(i).and_then(|p| p.as_ref()) == pattern.as_ref()
+                && self.0.quotes.get(i).copied().unwrap_or(false) == quote
+            {
+                return i as u16;
+            }
+        }
+        let inner = std::sync::Arc::make_mut(&mut self.0);
+        let id = inner.styles.len() as u16;
+        inner.styles.push(s);
+        inner.themes.push(theme);
+        inner.patterns.push(pattern);
+        inner.quotes.push(quote);
+        id
+    }
+
+    /// 基于已有样式 ID 派生修改后的新样式：凡未改动的颜色/填充/前导撇号，自动继承原主题色、图案与 quotePrefix。
+    pub fn intern_derived(&mut self, base_id: u16, s: CellStyle) -> u16 {
+        let base = self.get(base_id).clone();
+        if s == base {
+            return base_id;
+        }
+        let mut theme = self.theme_of(base_id);
+        if s.color != base.color {
+            theme.font = None;
+        }
+        if s.fill != base.fill {
+            theme.fill = None;
+        }
+        let pattern = if s.fill != base.fill {
+            None
+        } else {
+            self.pattern_of(base_id).cloned()
+        };
+        let quote = self.quote_of(base_id);
+        self.intern_with_ext(s, theme, pattern, quote)
+    }
+
+    /// 将另一工作簿的样式 ID（含主题色、图案填充、quotePrefix）迁移驻留到本样式表。
+    pub fn copy_from(&mut self, other: &StyleTable, sid: u16) -> u16 {
+        if sid == 0 {
+            return 0;
+        }
+        let s = other.get(sid).clone();
+        let theme = other.theme_of(sid);
+        let pattern = other.pattern_of(sid).cloned();
+        let quote = other.quote_of(sid);
+        self.intern_with_ext(s, theme, pattern, quote)
     }
 
     /// 记录样式号的主题色引用（不参与去重键：主题不同的两格颜色已由解析结果区分）
@@ -446,6 +522,15 @@ pub fn format_value_in(
     fmt: &str,
 ) -> String {
     crate::formula::with_date_system(sys, || format_value(v, fmt))
+}
+
+/// 按字面格式串格式化（供 `TEXT()` 使用，不把 `mm-dd-yy` 改写成本机区域短日期）。
+pub fn format_value_literal_in(
+    sys: crate::model::DateSystem,
+    v: &crate::model::Value,
+    fmt: &str,
+) -> String {
+    crate::formula::with_date_system(sys, || format_value_core(v, fmt, false))
 }
 
 /// Fast stack-allocated ASCII integer formatter into `[u8; 24]`.
@@ -628,9 +713,40 @@ pub fn format_value_fit(v: &crate::model::Value, fmt: &str, cap: usize) -> Strin
 
 // Rendered values vary by cell. The format sections, signs, date token programs,
 // and literal parts of ordinary numeric patterns can be shared by all cells using that format.
+#[derive(Clone, Copy, Debug)]
+enum CondOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SectionCond {
+    op: CondOp,
+    val: f64,
+}
+
+impl SectionCond {
+    fn matches(self, n: f64) -> bool {
+        match self.op {
+            CondOp::Eq => (n - self.val).abs() <= f64::EPSILON,
+            CondOp::Ne => (n - self.val).abs() > f64::EPSILON,
+            CondOp::Lt => n < self.val,
+            CondOp::Le => n <= self.val,
+            CondOp::Gt => n > self.val,
+            CondOp::Ge => n >= self.val,
+        }
+    }
+}
+
 struct FormatSection {
     raw: String,
     color: Option<[u8; 3]>,
+    cond: Option<SectionCond>,
+    has_neg_marker: bool,
     dbnum: Option<crate::dbnum::DbNumKind>,
     kind: SectionKind,
 }
@@ -640,20 +756,42 @@ enum SectionKind {
     Date(DateSection),
     DbNum(crate::dbnum::DbNumKind),
     Scientific {
-        dec: usize,
+        prefix: String,
+        suffix: String,
+        int_slots: usize,
+        dec_slots: Vec<char>,
         exp_digits: usize,
         plus: bool,
         scale: f64,
     },
+    Mask(MaskSection),
     Number(NumberSection),
     Fallback,
 }
 
 impl FormatSection {
+    fn renders_number(&self) -> bool {
+        match &self.kind {
+            SectionKind::General
+            | SectionKind::Date(_)
+            | SectionKind::DbNum(_)
+            | SectionKind::Scientific { .. }
+            | SectionKind::Mask(_)
+            | SectionKind::Number(_) => true,
+            SectionKind::Fallback => {
+                let cleaned = strip_brackets(self.raw.trim());
+                cleaned.contains('/') && cleaned.contains('?')
+            }
+        }
+    }
+
     fn compile(raw: String) -> Self {
         let color = section_color(&raw);
+        let cond = section_cond(&raw);
         let trimmed = raw.trim();
         let dbnum = crate::dbnum::detect_dbnum(trimmed);
+        let cleaned_for_neg = strip_brackets(trimmed);
+        let has_neg_marker = cleaned_for_neg.contains('-') || cleaned_for_neg.contains('(');
         let kind = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("general") {
             SectionKind::General
         } else if is_date_format(trimmed) {
@@ -661,23 +799,65 @@ impl FormatSection {
         } else if let Some(kind) = dbnum {
             SectionKind::DbNum(kind)
         } else {
-            let cleaned = strip_brackets(trimmed);
-            let sec = cleaned.trim();
-            let pct = sec.matches('%').count() as i32;
-            let permille = sec.matches('‰').count() as i32;
-            let scale = 100f64.powi(pct) * 1000f64.powi(permille);
-            if let Some(epos) = sec.find(['E', 'e']) {
+            let sec = cleaned_for_neg.trim();
+            let pct = count_unquoted(sec, '%') as i32;
+            let permille = count_unquoted(sec, '‰') as i32;
+            let base_scale = 100f64.powi(pct) * 1000f64.powi(permille);
+            if let Some(epos) = find_unquoted_exp(sec) {
                 let before = &sec[..epos];
                 let after = &sec[epos + 1..];
                 if after.starts_with('+') || after.starts_with('-') {
+                    let (prefix, int_slots, dec_slots, scale_commas) =
+                        if let Some((ns, ne)) = find_numeric_pattern_span(before) {
+                            let pat = &before[ns..ne];
+                            let pat_trim = pat.trim_end_matches(',');
+                            let mut sc = (pat.len() - pat_trim.len()) as i32;
+                            let (raw_i, dec_p) = pat_trim.split_once('.').unwrap_or((pat_trim, ""));
+                            let int_trim = raw_i.trim_end_matches(',');
+                            sc += (raw_i.len() - int_trim.len()) as i32;
+                            let islots = int_trim
+                                .chars()
+                                .filter(|c| matches!(c, '0' | '#' | '?'))
+                                .count()
+                                .max(1);
+                            let dslots: Vec<char> = dec_p
+                                .chars()
+                                .filter(|c| matches!(c, '0' | '#' | '?'))
+                                .collect();
+                            (render_literals(&before[..ns]), islots, dslots, sc)
+                        } else {
+                            (
+                                String::new(),
+                                1,
+                                vec!['0'; decimals_in(before)],
+                                0,
+                            )
+                        };
+                    let after_sign = &after[1..];
+                    let mut exp_digits = 0usize;
+                    let mut exp_end = 1usize;
+                    for (rel, ch) in after_sign.char_indices() {
+                        if matches!(ch, '0' | '#' | '?') {
+                            exp_digits += 1;
+                            exp_end = 1 + rel + ch.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                    let suffix = render_literals(&after[exp_end..]);
                     SectionKind::Scientific {
-                        dec: decimals_in(before),
-                        exp_digits: after.chars().filter(|c| *c == '0').count().max(1),
+                        prefix,
+                        suffix,
+                        int_slots,
+                        dec_slots,
+                        exp_digits: exp_digits.max(1),
                         plus: after.starts_with('+'),
-                        scale,
+                        scale: base_scale / 1000f64.powi(scale_commas),
                     }
                 } else if sec.contains('/') && sec.contains('?') {
                     SectionKind::Fallback
+                } else if let Some(mask) = MaskSection::from_pattern(sec, base_scale) {
+                    SectionKind::Mask(mask)
                 } else if let Some(num) = NumberSection::from_numeric_pattern(sec) {
                     SectionKind::Number(num)
                 } else {
@@ -685,6 +865,8 @@ impl FormatSection {
                 }
             } else if sec.contains('/') && sec.contains('?') {
                 SectionKind::Fallback
+            } else if let Some(mask) = MaskSection::from_pattern(sec, base_scale) {
+                SectionKind::Mask(mask)
             } else if let Some(num) = NumberSection::from_numeric_pattern(sec) {
                 SectionKind::Number(num)
             } else {
@@ -694,9 +876,321 @@ impl FormatSection {
         Self {
             raw,
             color,
+            cond,
+            has_neg_marker,
             dbnum,
             kind,
         }
+    }
+}
+
+fn find_numeric_pattern_span(sec: &str) -> Option<(usize, usize)> {
+    let mut it = sec.char_indices().peekable();
+    let mut start = None;
+    while let Some((idx, c)) = it.next() {
+        match c {
+            '"' => {
+                for (_, c2) in it.by_ref() {
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' | '_' | '*' => {
+                let _ = it.next();
+            }
+            '0' | '#' | '?' => {
+                start = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let start = start?;
+    let mut end = sec.len();
+    for (rel, c) in sec[start..].char_indices() {
+        if !matches!(c, '0' | '#' | '?' | ',' | '.') {
+            end = start + rel;
+            break;
+        }
+    }
+    Some((start, end))
+}
+
+fn find_unquoted_exp(sec: &str) -> Option<usize> {
+    let mut it = sec.char_indices().peekable();
+    while let Some((idx, c)) = it.next() {
+        match c {
+            '"' => {
+                for (_, c2) in it.by_ref() {
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' | '_' | '*' => {
+                let _ = it.next();
+            }
+            'E' | 'e' => {
+                let after = &sec[idx + 1..];
+                if after.starts_with('+') || after.starts_with('-') {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn count_unquoted(sec: &str, needle: char) -> usize {
+    let mut n = 0usize;
+    let mut it = sec.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '"' => {
+                for c2 in it.by_ref() {
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' | '_' | '*' => {
+                let _ = it.next();
+            }
+            x if x == needle => n += 1,
+            _ => {}
+        }
+    }
+    n
+}
+
+fn section_cond(sec: &str) -> Option<SectionCond> {
+    let mut chars = sec.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                for c2 in chars.by_ref() {
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                let _ = chars.next();
+            }
+            '[' => {
+                let mut buf = String::new();
+                for c2 in chars.by_ref() {
+                    if c2 == ']' {
+                        break;
+                    }
+                    buf.push(c2);
+                }
+                let t = buf.trim();
+                let (op, rest) = if let Some(r) = t.strip_prefix(">=") {
+                    (CondOp::Ge, r)
+                } else if let Some(r) = t.strip_prefix("<=") {
+                    (CondOp::Le, r)
+                } else if let Some(r) = t.strip_prefix("<>") {
+                    (CondOp::Ne, r)
+                } else if let Some(r) = t.strip_prefix('>') {
+                    (CondOp::Gt, r)
+                } else if let Some(r) = t.strip_prefix('<') {
+                    (CondOp::Lt, r)
+                } else if let Some(r) = t.strip_prefix('=') {
+                    (CondOp::Eq, r)
+                } else {
+                    continue;
+                };
+                if let Ok(val) = rest.trim().parse::<f64>()
+                    && val.is_finite()
+                {
+                    return Some(SectionCond { op, val });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn select_numeric_section(sections: &[FormatSection], n: f64) -> Option<(&FormatSection, f64, bool)> {
+    let num_len = sections.len().min(3);
+    let num_secs = &sections[..num_len];
+    if num_secs.iter().any(|s| s.cond.is_some()) {
+        for s in num_secs {
+            if s.cond.map_or(true, |c| c.matches(n)) {
+                let neg_cond_handles_sign = matches!(
+                    s.cond,
+                    Some(SectionCond { op: CondOp::Lt | CondOp::Le, val }) if val <= 0.0
+                ) && s.has_neg_marker;
+                let need_minus = n < 0.0 && s.renders_number() && !neg_cond_handles_sign;
+                return Some((s, n.abs(), need_minus));
+            }
+        }
+        return None;
+    }
+    if n < 0.0 {
+        if sections.len() >= 2 {
+            Some((&sections[1], -n, false))
+        } else {
+            Some((&sections[0], -n, sections[0].renders_number()))
+        }
+    } else if n == 0.0 && sections.len() >= 3 {
+        Some((&sections[2], 0.0, false))
+    } else {
+        Some((&sections[0], n, false))
+    }
+}
+
+enum MaskTok {
+    Digit(char),
+    Lit(String),
+}
+
+/// 掩码数字格式（如 `000-0000`、`0000 0000`、`000-00-0000`、`(000) 000-0000`）：
+/// 无小数点且数字占位符被字面量分隔为多段时，按右对齐逐位填槽，超出部分挂到最左数字槽前。
+struct MaskSection {
+    tokens: Vec<MaskTok>,
+    digit_count: usize,
+    has_zero: bool,
+    scale: f64,
+}
+
+impl MaskSection {
+    fn from_pattern(sec: &str, scale: f64) -> Option<Self> {
+        let mut tokens: Vec<MaskTok> = Vec::new();
+        let mut digit_count = 0usize;
+        let mut digit_runs = 0usize;
+        let mut in_run = false;
+        let mut has_zero = false;
+        let mut has_dot = false;
+        let mut lit_buf = String::new();
+        let flush_lit = |buf: &mut String, toks: &mut Vec<MaskTok>| {
+            if !buf.is_empty() {
+                toks.push(MaskTok::Lit(std::mem::take(buf)));
+            }
+        };
+        let mut it = sec.chars().peekable();
+        while let Some(c) = it.next() {
+            match c {
+                '"' => {
+                    in_run = false;
+                    for c2 in it.by_ref() {
+                        if c2 == '"' {
+                            break;
+                        }
+                        lit_buf.push(c2);
+                    }
+                }
+                '\\' => {
+                    in_run = false;
+                    if let Some(c2) = it.next() {
+                        lit_buf.push(c2);
+                    }
+                }
+                '_' => {
+                    in_run = false;
+                    let _ = it.next();
+                    lit_buf.push(' ');
+                }
+                '*' => {
+                    in_run = false;
+                    let _ = it.next();
+                }
+                '[' => {
+                    in_run = false;
+                    let mut buf = String::new();
+                    for c2 in it.by_ref() {
+                        if c2 == ']' {
+                            break;
+                        }
+                        buf.push(c2);
+                    }
+                    if let Some(rest) = buf.strip_prefix('$') {
+                        lit_buf.push_str(rest.split('-').next().unwrap_or(""));
+                    }
+                }
+                '.' => {
+                    has_dot = true;
+                    break;
+                }
+                '0' | '#' | '?' => {
+                    flush_lit(&mut lit_buf, &mut tokens);
+                    if !in_run {
+                        digit_runs += 1;
+                        in_run = true;
+                    }
+                    if c == '0' {
+                        has_zero = true;
+                    }
+                    digit_count += 1;
+                    tokens.push(MaskTok::Digit(c));
+                }
+                ',' if in_run => {
+                    // 千分位逗号不属于掩码分隔，交由普通 NumberSection 处理
+                    return None;
+                }
+                '@' => {
+                    in_run = false;
+                }
+                _ => {
+                    in_run = false;
+                    lit_buf.push(c);
+                }
+            }
+        }
+        if has_dot || digit_runs < 2 || digit_count == 0 {
+            return None;
+        }
+        flush_lit(&mut lit_buf, &mut tokens);
+        Some(Self {
+            tokens,
+            digit_count,
+            has_zero,
+            scale,
+        })
+    }
+
+    fn render(&self, val: f64) -> String {
+        let a = (val * self.scale).abs().round();
+        let digits: Vec<char> = if a == 0.0 && !self.has_zero {
+            Vec::new()
+        } else {
+            format!("{:.0}", a).chars().collect()
+        };
+        let n_slots = self.digit_count;
+        let overflow = digits.len().saturating_sub(n_slots);
+        let pad = n_slots.saturating_sub(digits.len());
+        let mut out = String::with_capacity(self.tokens.len() + overflow + 4);
+        let mut slot_idx = 0usize;
+        for tok in &self.tokens {
+            match tok {
+                MaskTok::Lit(s) => out.push_str(s),
+                MaskTok::Digit(kind) => {
+                    if slot_idx == 0 && overflow > 0 {
+                        for &ch in &digits[..overflow] {
+                            out.push(ch);
+                        }
+                    }
+                    if slot_idx < pad {
+                        match kind {
+                            '0' => out.push('0'),
+                            '?' => out.push(' '),
+                            _ => {}
+                        }
+                    } else {
+                        let di = overflow + (slot_idx - pad);
+                        if let Some(&ch) = digits.get(di) {
+                            out.push(ch);
+                        }
+                    }
+                    slot_idx += 1;
+                }
+            }
+        }
+        out
     }
 }
 
@@ -705,35 +1199,50 @@ struct NumberSection {
     suffix: String,
     scale: f64,
     dec: usize,
+    dec_slots: Vec<char>,
+    min_int: usize,
+    q_int: usize,
     thousands: bool,
-    trim_trailing_zeros: bool,
     zero_spaces: Option<usize>,
 }
 
 impl NumberSection {
     fn from_numeric_pattern(sec: &str) -> Option<Self> {
-        let start = sec.find(['0', '#', '?'])?;
-        let end = sec[start..]
-            .find(|c| !matches!(c, '0' | '#' | '?' | ',' | '.'))
-            .map_or(sec.len(), |i| start + i);
+        let (start, end) = find_numeric_pattern_span(sec)?;
         let pattern = &sec[start..end];
-        let dec_part = pattern.split_once('.').map(|(_, f)| f).unwrap_or("");
-        let dec = dec_part.chars().filter(|c| matches!(c, '0' | '#')).count();
-        let int_part = pattern.split('.').next().unwrap_or("");
-        let thousands = int_part.contains(',');
-        let trim_trailing_zeros = !dec_part.is_empty() && dec_part.chars().all(|c| c == '#');
-        let zero_spaces = (!pattern.contains('0'))
-            .then(|| pattern.chars().filter(|c| matches!(c, '0' | '#' | '?')).count());
-        let percent = sec.matches('%').count() as i32;
-        let permille = sec.matches('‰').count() as i32;
-        let scale = 100f64.powi(percent) * 1000f64.powi(permille);
+        let pattern_trimmed = pattern.trim_end_matches(',');
+        let mut scale_commas = (pattern.len() - pattern_trimmed.len()) as i32;
+        let (raw_int, dec_part) = match pattern_trimmed.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (pattern_trimmed, ""),
+        };
+        let int_trimmed = raw_int.trim_end_matches(',');
+        scale_commas += (raw_int.len() - int_trimmed.len()) as i32;
+        let dec_slots: Vec<char> = dec_part
+            .chars()
+            .filter(|c| matches!(c, '0' | '#' | '?'))
+            .collect();
+        let dec = dec_slots.len();
+        let min_int = int_trimmed.chars().filter(|c| *c == '0').count();
+        let q_int = int_trimmed
+            .chars()
+            .filter(|c| matches!(c, '0' | '?'))
+            .count();
+        let thousands = int_trimmed.contains(',');
+        let zero_spaces = (!pattern_trimmed.contains('0'))
+            .then(|| pattern_trimmed.chars().filter(|c| matches!(c, '0' | '#' | '?')).count());
+        let percent = count_unquoted(sec, '%') as i32;
+        let permille = count_unquoted(sec, '‰') as i32;
+        let scale = 100f64.powi(percent) * 1000f64.powi(permille) / 1000f64.powi(scale_commas);
         Some(Self {
             prefix: render_literals(&sec[..start]),
             suffix: render_literals(&sec[end..]),
             scale,
             dec,
+            dec_slots,
+            min_int,
+            q_int,
             thousands,
-            trim_trailing_zeros,
             zero_spaces,
         })
     }
@@ -752,28 +1261,83 @@ impl NumberSection {
             out.push_str(&self.suffix);
             return out;
         }
-        let num_start = out.len();
-        if self.thousands {
-            let mut stack = StackFmt::<64>::new();
-            if write!(stack, "{:.*}", self.dec, a).is_ok() {
-                push_grouped_ascii(&mut out, stack.as_str());
-            } else {
-                let s = format!("{:.*}", self.dec, a);
-                push_grouped_ascii(&mut out, &s);
-            }
+        let mut stack = StackFmt::<64>::new();
+        let owned;
+        let raw = if write!(stack, "{:.*}", self.dec, a).is_ok() {
+            stack.as_str()
         } else {
-            let _ = write!(out, "{:.*}", self.dec, a);
+            owned = format!("{:.*}", self.dec, a);
+            &owned
+        };
+        let (int_part, frac_part) = match raw.split_once('.') {
+            Some((i, f)) => (i, Some(f)),
+            None => (raw, None),
+        };
+        // 整数部分：先补强制 '0'（min_int），再按需补 '?' 前导空格（q_int）
+        let zero_pad = self.min_int.saturating_sub(int_part.len());
+        let int_with_zeros_len = int_part.len() + zero_pad;
+        let space_pad = self.q_int.saturating_sub(int_with_zeros_len);
+        for _ in 0..space_pad {
+            out.push(' ');
         }
-        if self.trim_trailing_zeros {
-            while out.len() > num_start && out.ends_with('0') {
-                out.pop();
+        if zero_pad > 0 {
+            let mut padded = String::with_capacity(int_with_zeros_len);
+            for _ in 0..zero_pad {
+                padded.push('0');
             }
-            if out.len() > num_start && out.ends_with('.') {
-                out.pop();
+            padded.push_str(int_part);
+            if self.thousands {
+                push_grouped_ascii(&mut out, &padded);
+            } else {
+                out.push_str(&padded);
             }
+        } else if self.thousands {
+            push_grouped_ascii(&mut out, int_part);
+        } else {
+            out.push_str(int_part);
+        }
+        // 小数部分：精确按每个槽位类型处理 '0'（保留） / '#'（尾零省略） / '?'（尾零转空格对齐）
+        if let Some(f) = frac_part {
+            append_formatted_frac(&mut out, f, &self.dec_slots);
         }
         out.push_str(&self.suffix);
         out
+    }
+}
+
+fn append_formatted_frac(out: &mut String, frac: &str, slots: &[char]) {
+    if frac.is_empty() || slots.is_empty() {
+        return;
+    }
+    let bytes = frac.as_bytes();
+    let n = bytes.len().min(slots.len());
+    // 找到最后一个显著位（非 '0' 或槽位为 '0'）
+    let mut last_sig: Option<usize> = None;
+    for i in (0..n).rev() {
+        if bytes[i] != b'0' || slots[i] == '0' {
+            last_sig = Some(i);
+            break;
+        }
+    }
+    let mut rendered = String::with_capacity(n);
+    let mut any_digit = false;
+    let mut any_space = false;
+    for i in 0..n {
+        if last_sig.is_some_and(|ls| i <= ls) {
+            rendered.push(bytes[i] as char);
+            any_digit = true;
+        } else if slots[i] == '?' {
+            rendered.push(' ');
+            any_space = true;
+        }
+    }
+    if any_digit {
+        out.push('.');
+        out.push_str(&rendered);
+    } else if any_space {
+        // 小数全为 '?' 空格时，小数点也用空格占位以对齐小数点列
+        out.push(' ');
+        out.push_str(&rendered);
     }
 }
 
@@ -912,6 +1476,10 @@ fn format_sections(fmt: &str) -> std::rc::Rc<[FormatSection]> {
 }
 
 pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
+    format_value_core(v, fmt, true)
+}
+
+fn format_value_core(v: &crate::model::Value, fmt: &str, localize_short_date: bool) -> String {
     use crate::model::Value;
     if fmt.trim().is_empty() || fmt.eq_ignore_ascii_case("general") {
         return match v {
@@ -921,26 +1489,29 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
     }
     // Excel 的内建 14 号格式是「系统区域短日期」，不同机器显示不同；
     // 读盘时它被还原成 mm-dd-yy，这里按系统设置换成本机的写法（和 Excel 一致）。
-    let localized = localize_builtin_date(fmt);
+    let localized = if localize_short_date {
+        localize_builtin_date(fmt)
+    } else {
+        None
+    };
     let fmt: &str = localized.as_deref().unwrap_or(fmt);
     let sections = format_sections(fmt);
     match v {
         Value::Number(n) => {
-            let (sec, val, need_minus) = if *n < 0.0 {
-                if sections.len() >= 2 {
-                    (&sections[1], -*n, false)
-                } else {
-                    (&sections[0], -*n, true)
-                }
-            } else if *n == 0.0 && sections.len() >= 3 {
-                (&sections[2], 0.0, false)
-            } else {
-                (&sections[0], *n, false)
+            let Some((sec, val, need_minus)) = select_numeric_section(&sections, *n) else {
+                return general_number(*n);
             };
             let mut out = match &sec.kind {
                 SectionKind::General => general_number(val),
                 SectionKind::Date(date) => {
-                    if let Some(s) = date.render(crate::formula::current_date_system(), val) {
+                    let sys = crate::formula::current_date_system();
+                    if !sys.is_1904() && *n < 0.0 {
+                        return "###".to_string();
+                    }
+                    if let Some(s) = date.render(sys, val) {
+                        if s == "###" {
+                            return s;
+                        }
                         match sec.dbnum {
                             Some(kind) => crate::dbnum::map_digits_for_date(&s, kind),
                             None => s,
@@ -952,11 +1523,23 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
                 SectionKind::DbNum(kind) => crate::dbnum::format_dbnum(val, *kind, &sec.raw)
                     .unwrap_or_else(|| render_section_numeric(val, &sec.raw)),
                 SectionKind::Scientific {
-                    dec,
+                    prefix,
+                    suffix,
+                    int_slots,
+                    dec_slots,
                     exp_digits,
                     plus,
                     scale,
-                } => render_scientific(val * *scale, *dec, *exp_digits, *plus),
+                } => render_scientific_full(
+                    val * *scale,
+                    prefix,
+                    suffix,
+                    *int_slots,
+                    dec_slots,
+                    *exp_digits,
+                    *plus,
+                ),
+                SectionKind::Mask(mask) => mask.render(val),
                 SectionKind::Number(pattern) => pattern.render(val),
                 SectionKind::Fallback => render_section_numeric(val, &sec.raw),
             };
@@ -1047,33 +1630,156 @@ fn system_short_date() -> String {
     "yyyy-mm-dd".into()
 }
 
+/// 会计/重复字符格式（含未加引号的 `*<ch>`）拆分：
+/// 返回 `(左段文本, 填充字符, 右段文本)`，供 GPU 网格与打印导出做左右贴边与中间平铺填充。
+pub fn format_accounting_split(
+    sys: crate::model::DateSystem,
+    v: &crate::model::Value,
+    fmt: &str,
+) -> Option<(String, char, String)> {
+    use crate::model::Value;
+    if !fmt.contains('*') {
+        return None;
+    }
+    let sections = format_sections(fmt);
+    const SENTINEL: char = '\u{E000}';
+    let find_star = |raw: &str| -> Option<(usize, char, usize)> {
+        let mut it = raw.char_indices().peekable();
+        while let Some((idx, c)) = it.next() {
+            match c {
+                '"' => {
+                    for (_, c2) in it.by_ref() {
+                        if c2 == '"' {
+                            break;
+                        }
+                    }
+                }
+                '\\' | '_' => {
+                    let _ = it.next();
+                }
+                '[' => {
+                    for (_, c2) in it.by_ref() {
+                        if c2 == ']' {
+                            break;
+                        }
+                    }
+                }
+                '*' => {
+                    if let Some((_, rep)) = it.next() {
+                        let after = idx + 1 + rep.len_utf8();
+                        return Some((idx, rep, after));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+
+    match v {
+        Value::Number(n) => {
+            let (sec, val, need_minus) = select_numeric_section(&sections, *n)?;
+            let (spos, rep, after) = find_star(&sec.raw)?;
+            let mut marked = String::with_capacity(sec.raw.len() + 4);
+            marked.push_str(&sec.raw[..spos]);
+            marked.push('"');
+            marked.push(SENTINEL);
+            marked.push('"');
+            marked.push_str(&sec.raw[after..]);
+            let compiled = FormatSection::compile(marked);
+            let mut rendered = match &compiled.kind {
+                SectionKind::General => general_number(val),
+                SectionKind::Date(date) => date
+                    .render(sys, val)
+                    .unwrap_or_else(|| render_section_non_date(val, &compiled.raw, compiled.dbnum)),
+                SectionKind::DbNum(kind) => crate::dbnum::format_dbnum(val, *kind, &compiled.raw)
+                    .unwrap_or_else(|| render_section_numeric(val, &compiled.raw)),
+                SectionKind::Scientific {
+                    prefix,
+                    suffix,
+                    int_slots,
+                    dec_slots,
+                    exp_digits,
+                    plus,
+                    scale,
+                } => render_scientific_full(
+                    val * *scale,
+                    prefix,
+                    suffix,
+                    *int_slots,
+                    dec_slots,
+                    *exp_digits,
+                    *plus,
+                ),
+                SectionKind::Mask(mask) => mask.render(val),
+                SectionKind::Number(pattern) => pattern.render(val),
+                SectionKind::Fallback => render_section_numeric(val, &compiled.raw),
+            };
+            if rendered == "###" {
+                return None;
+            }
+            if need_minus {
+                if compiled.dbnum.is_some() {
+                    if !rendered.starts_with('负') {
+                        rendered.insert(0, '负');
+                    }
+                } else {
+                    rendered.insert(0, '-');
+                }
+            }
+            let (left, right) = rendered.split_once(SENTINEL)?;
+            Some((left.to_owned(), rep, right.to_owned()))
+        }
+        Value::Text(t) => {
+            let raw = if sections.len() >= 4 {
+                &sections[3].raw
+            } else if sections[0].raw.contains('@') {
+                &sections[0].raw
+            } else {
+                return None;
+            };
+            let (spos, rep, after) = find_star(raw)?;
+            let mut marked = String::with_capacity(raw.len() + 4);
+            marked.push_str(&raw[..spos]);
+            marked.push('"');
+            marked.push(SENTINEL);
+            marked.push('"');
+            marked.push_str(&raw[after..]);
+            let rendered = render_text_section(t, &marked);
+            let (left, right) = rendered.split_once(SENTINEL)?;
+            Some((left.to_owned(), rep, right.to_owned()))
+        }
+        _ => None,
+    }
+}
+
 /// 格式代码里指定的文字颜色（[Red] / [Color3] 这类）；没有就返回 None
 pub fn format_color(v: &crate::model::Value, fmt: &str) -> Option<[u8; 3]> {
     use crate::model::Value;
     if !fmt.contains('[') { return None; }
     let sections = format_sections(fmt);
-    let idx = match v {
-        Value::Number(n) if *n < 0.0 && sections.len() >= 2 => 1,
-        Value::Number(n) if *n == 0.0 && sections.len() >= 3 => 2,
-        Value::Text(_) if sections.len() >= 4 => 3,
-        _ => 0,
-    };
-    sections[idx].color
+    match v {
+        Value::Number(n) => select_numeric_section(&sections, *n).and_then(|(s, _, _)| s.color),
+        Value::Text(_) if sections.len() >= 4 => sections[3].color,
+        _ => sections.first().and_then(|s| s.color),
+    }
 }
 
 fn section_color(sec: &str) -> Option<[u8; 3]> {
-    let palette = [
-        [0, 0, 0],
-        [255, 255, 255],
-        [255, 0, 0],
-        [0, 255, 0],
-        [0, 0, 255],
-        [255, 255, 0],
-        [255, 0, 255],
-        [0, 255, 255],
-    ];
     let mut chars = sec.chars().peekable();
     while let Some(c) = chars.next() {
+        if c == '"' {
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '\\' {
+            let _ = chars.next();
+            continue;
+        }
         if c == '[' {
             let mut buf = String::new();
             for c2 in chars.by_ref() {
@@ -1098,8 +1804,10 @@ fn section_color(sec: &str) -> Option<[u8; 3]> {
                 return named;
             }
             if let Some(rest) = b.strip_prefix("color") {
-                if let Ok(n) = rest.trim().parse::<usize>() {
-                    return Some(palette.get(n.saturating_sub(1)).copied().unwrap_or([0, 0, 0]));
+                if let Ok(n) = rest.trim().parse::<usize>()
+                    && (1..=56).contains(&n)
+                {
+                    return Some(crate::style_theme::DEFAULT_INDEXED_PALETTE[8 + (n - 1)]);
                 }
             }
         }
@@ -1241,13 +1949,52 @@ fn render_section_numeric(val: f64, raw: &str) -> String {
     v *= 1000f64.powi(permille);
 
     // 科学计数法
-    if let Some(epos) = sec.find(['E', 'e']) {
+    if let Some(epos) = find_unquoted_exp(sec) {
         let before = &sec[..epos];
         let after = &sec[epos + 1..];
         if after.starts_with('+') || after.starts_with('-') {
-            let dec = decimals_in(before);
-            let exp_digits = after.chars().filter(|c| *c == '0').count().max(1);
-            return render_scientific(v, dec, exp_digits, after.starts_with('+'));
+            let (prefix, int_slots, dec_slots, scale_commas) =
+                if let Some((ns, ne)) = find_numeric_pattern_span(before) {
+                    let pat = &before[ns..ne];
+                    let pat_trim = pat.trim_end_matches(',');
+                    let mut sc = (pat.len() - pat_trim.len()) as i32;
+                    let (raw_i, dec_p) = pat_trim.split_once('.').unwrap_or((pat_trim, ""));
+                    let int_trim = raw_i.trim_end_matches(',');
+                    sc += (raw_i.len() - int_trim.len()) as i32;
+                    let islots = int_trim
+                        .chars()
+                        .filter(|c| matches!(c, '0' | '#' | '?'))
+                        .count()
+                        .max(1);
+                    let dslots: Vec<char> = dec_p
+                        .chars()
+                        .filter(|c| matches!(c, '0' | '#' | '?'))
+                        .collect();
+                    (render_literals(&before[..ns]), islots, dslots, sc)
+                } else {
+                    (String::new(), 1, vec!['0'; decimals_in(before)], 0)
+                };
+            let after_sign = &after[1..];
+            let mut exp_digits = 0usize;
+            let mut exp_end = 1usize;
+            for (rel, ch) in after_sign.char_indices() {
+                if matches!(ch, '0' | '#' | '?') {
+                    exp_digits += 1;
+                    exp_end = 1 + rel + ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let suffix = render_literals(&after[exp_end..]);
+            return render_scientific_full(
+                v / 1000f64.powi(scale_commas),
+                &prefix,
+                &suffix,
+                int_slots,
+                &dec_slots,
+                exp_digits.max(1),
+                after.starts_with('+'),
+            );
         }
     }
 
@@ -1258,7 +2005,10 @@ fn render_section_numeric(val: f64, raw: &str) -> String {
         }
     }
 
-    if let Some(pattern) = NumberSection::from_numeric_pattern(sec) {
+    let base_scale = 100f64.powi(pct) * 1000f64.powi(permille);
+    if let Some(mask) = MaskSection::from_pattern(sec, base_scale) {
+        mask.render(val)
+    } else if let Some(pattern) = NumberSection::from_numeric_pattern(sec) {
         pattern.render(val)
     } else {
         let literal = render_literals(sec);
@@ -1275,20 +2025,59 @@ fn general_number(v: f64) -> String {
     }
 }
 
-fn render_scientific(val: f64, dec: usize, exp_digits: usize, plus: bool) -> String {
-    if val == 0.0 {
-        return format!("{:.*}E{}{:0width$}", dec, 0.0, if plus { "+" } else { "-" }, 0, width = exp_digits);
-    }
-    let mut exp = val.abs().log10().floor() as i32;
-    let mut m = val / 10f64.powi(exp);
-    if m >= 10.0 {
-        m /= 10.0;
-        exp += 1;
-    }
-    if m < 1.0 {
-        m *= 10.0;
-        exp -= 1;
-    }
+fn render_scientific_full(
+    val: f64,
+    prefix: &str,
+    suffix: &str,
+    int_slots: usize,
+    dec_slots: &[char],
+    exp_digits: usize,
+    plus: bool,
+) -> String {
+    use std::fmt::Write;
+    let dec = dec_slots.len();
+    let neg = val < 0.0;
+    let abs_v = val.abs();
+    let engineering = int_slots >= 3;
+    let (m, exp) = if abs_v == 0.0 || !abs_v.is_finite() {
+        (0.0, 0i32)
+    } else if engineering {
+        let mut exp = (abs_v.log10().floor() as i32).div_euclid(3) * 3;
+        let mut m = abs_v / 10f64.powi(exp);
+        if dec <= 15 {
+            let factor = 10f64.powi(dec as i32);
+            let rounded = (m * factor + 1e-12).round() / factor;
+            if rounded >= 1000.0 {
+                m = rounded / 1000.0;
+                exp += 3;
+            } else {
+                m = rounded;
+            }
+        }
+        (m, exp)
+    } else {
+        let mut exp = abs_v.log10().floor() as i32;
+        let mut m = abs_v / 10f64.powi(exp);
+        if m >= 10.0 {
+            m /= 10.0;
+            exp += 1;
+        }
+        if m < 1.0 {
+            m *= 10.0;
+            exp -= 1;
+        }
+        if dec <= 15 {
+            let factor = 10f64.powi(dec as i32);
+            let rounded = (m * factor + 1e-12).round() / factor;
+            if rounded >= 10.0 {
+                m = rounded / 10.0;
+                exp += 1;
+            } else {
+                m = rounded;
+            }
+        }
+        (m, exp)
+    };
     let sign = if exp < 0 {
         "-"
     } else if plus {
@@ -1296,64 +2085,161 @@ fn render_scientific(val: f64, dec: usize, exp_digits: usize, plus: bool) -> Str
     } else {
         ""
     };
-    format!(
-        "{:.*}E{}{:0width$}",
-        dec,
-        m,
-        sign,
-        exp.abs(),
-        width = exp_digits
-    )
+    let raw = format!("{:.*}", dec, m);
+    let (int_p, frac_p) = raw.split_once('.').unwrap_or((&raw, ""));
+    let mut out = String::with_capacity(prefix.len() + suffix.len() + raw.len() + exp_digits + 6);
+    if neg {
+        out.push('-');
+    }
+    out.push_str(prefix);
+    out.push_str(int_p);
+    if !frac_p.is_empty() {
+        append_formatted_frac(&mut out, frac_p, dec_slots);
+    }
+    let _ = write!(out, "E{}{:0width$}", sign, exp.abs(), width = exp_digits);
+    out.push_str(suffix);
+    out
 }
 
 fn render_fraction(val: f64, sec: &str) -> Option<String> {
-    let a = val.abs();
-    let (int_part, rest) = (a.trunc(), a.fract());
-    let den_pat = sec.split('/').nth(1)?;
-    let fixed: Option<u32> = den_pat
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .ok();
-    let max = fixed.unwrap_or_else(|| {
-        let n = den_pat.chars().filter(|c| *c == '?' || *c == '#').count().max(1) as u32;
-        10u32.pow(n.min(4)).saturating_sub(1).max(9)
-    });
-    let (mut num, mut den) = (0u32, 1u32);
-    let mut best = f64::MAX;
-    for d in 1..=max {
-        let n = (rest * d as f64).round();
-        let err = (rest - n / d as f64).abs();
-        if err < best {
-            best = err;
-            num = n as u32;
-            den = d;
-        }
-        if err < 1e-12 {
+    let slash = sec.find('/')?;
+    let left_all = &sec[..slash];
+    let right_all = &sec[slash + 1..];
+
+    // 解析分子和整数段：在 slash 左侧定位分子占位符，其左若以空格分隔且存在数字占位符则为带分数
+    let mut num_start = left_all.len();
+    for (idx, ch) in left_all.char_indices().rev() {
+        if matches!(ch, '?' | '#' | '0') {
+            num_start = idx;
+        } else if num_start < left_all.len() {
             break;
         }
     }
-    let mixed = sec[..sec.find('/').unwrap_or(0)]
-        .chars()
-        .any(|c| c == '#' || c == '0' || c == '?')
-        && sec.contains(' ');
+    if num_start == left_all.len() {
+        return None;
+    }
+    let num_pat = &left_all[num_start..];
+    let before_num = &left_all[..num_start];
+    let (prefix_raw, int_pat, mixed) = if let Some(sp) = before_num.rfind(' ') {
+        let candidate = &before_num[..sp];
+        let mut int_start = candidate.len();
+        for (idx, ch) in candidate.char_indices().rev() {
+            if matches!(ch, '?' | '#' | '0' | ',') {
+                int_start = idx;
+            } else if int_start < candidate.len() {
+                break;
+            }
+        }
+        if int_start < candidate.len() {
+            (&candidate[..int_start], &candidate[int_start..], true)
+        } else {
+            (before_num, "", false)
+        }
+    } else {
+        (before_num, "", false)
+    };
+
+    // 解析分母段和后续字面量
+    let mut den_end = 0usize;
+    for (idx, ch) in right_all.char_indices() {
+        if ch.is_ascii_digit() || matches!(ch, '?' | '#') {
+            den_end = idx + ch.len_utf8();
+        } else if den_end > 0 {
+            break;
+        }
+    }
+    let den_pat = &right_all[..den_end];
+    let suffix_raw = &right_all[den_end..];
+    let prefix = render_literals(prefix_raw);
+    let suffix = render_literals(suffix_raw);
+
+    let a = val.abs();
+    let (mut int_part, rest) = (a.trunc(), a.fract());
+    let fixed: Option<u32> = {
+        let d: String = den_pat.chars().filter(|c| c.is_ascii_digit()).collect();
+        (!d.is_empty()).then(|| d.parse::<u32>().ok()).flatten().filter(|&v| v > 0)
+    };
+    let (mut num, den) = if let Some(d) = fixed {
+        ((rest * d as f64).round() as u32, d)
+    } else {
+        let n = den_pat
+            .chars()
+            .filter(|c| matches!(c, '?' | '#' | '0'))
+            .count()
+            .max(1) as u32;
+        let max = 10u32.pow(n.min(4)).saturating_sub(1).max(9);
+        let (mut best_n, mut best_d) = (0u32, 1u32);
+        let mut best = f64::MAX;
+        for d in 1..=max {
+            let cand = (rest * d as f64).round();
+            let err = (rest - cand / d as f64).abs();
+            if err < best {
+                best = err;
+                best_n = cand as u32;
+                best_d = d;
+            }
+            if err < 1e-12 {
+                break;
+            }
+        }
+        (best_n, best_d)
+    };
+
+    // 进位修正：0.9999 四舍五入为 d/d 时归入整数部分，避免输出 "0 1/1"
+    if num >= den {
+        int_part += (num / den) as f64;
+        num %= den;
+    }
+
+    let num_q = num_pat.chars().filter(|c| *c == '?').count();
+    let den_q = den_pat.chars().filter(|c| *c == '?').count();
+    let int_has_zero = int_pat.contains('0');
+
     let mut out = String::new();
+    if val < 0.0 {
+        out.push('-');
+    }
+    out.push_str(&prefix);
     if mixed {
-        out.push_str(&format!("{}", int_part as i64));
-        out.push(' ');
+        if num == 0 {
+            out.push_str(&format!("{}", int_part as i64));
+        } else {
+            let show_int = int_part != 0.0 || int_has_zero;
+            if show_int {
+                out.push_str(&format!("{} ", int_part as i64));
+            }
+            let ns = num.to_string();
+            let ds = den.to_string();
+            for _ in 0..num_q.saturating_sub(ns.len()) {
+                out.push(' ');
+            }
+            out.push_str(&ns);
+            out.push('/');
+            out.push_str(&ds);
+            for _ in 0..den_q.saturating_sub(ds.len()) {
+                out.push(' ');
+            }
+        }
     } else {
         num += (int_part as u32) * den;
+        if num == 0 {
+            out.push('0');
+        } else {
+            let ns = num.to_string();
+            let ds = den.to_string();
+            for _ in 0..num_q.saturating_sub(ns.len()) {
+                out.push(' ');
+            }
+            out.push_str(&ns);
+            out.push('/');
+            out.push_str(&ds);
+            for _ in 0..den_q.saturating_sub(ds.len()) {
+                out.push(' ');
+            }
+        }
     }
-    if num == 0 {
-        out.push('0');
-    } else {
-        out.push_str(&format!("{num}/{den}"));
-    }
-    if val < 0.0 {
-        out.insert(0, '-');
-    }
-    Some(out.trim_end().to_string())
+    out.push_str(&suffix);
+    Some(out)
 }
 
 fn render_literals(s: &str) -> String {
@@ -1409,15 +2295,31 @@ fn decimals_in(fmt: &str) -> usize {
         .count()
 }
 
+fn has_elapsed_bracket(lower: &str) -> bool {
+    let mut rest = lower;
+    while let Some(open) = rest.find('[') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find(']') else { break };
+        let inner = &rest[..close];
+        if !inner.is_empty()
+            && (inner.bytes().all(|b| b == b'h')
+                || inner.bytes().all(|b| b == b'm')
+                || inner.bytes().all(|b| b == b's'))
+        {
+            return true;
+        }
+        rest = &rest[close + 1..];
+    }
+    false
+}
+
 pub fn is_date_format(fmt: &str) -> bool {
     let f = strip_literals(fmt).to_lowercase();
     f.contains('y')
         || f.contains('d')
         || f.contains("h:")
         || f.contains(":s")
-        || f.contains("[h]")
-        || f.contains("[m]")
-        || f.contains("[s]")
+        || has_elapsed_bracket(&f)
         || f.contains("am/pm")
         || f.contains("a/p")
         || f.contains("上午/下午")
@@ -1497,9 +2399,9 @@ enum DateTok {
     AmPm,
     ShortAmPm,
     CnAmPm,
-    ElapsedHour,
-    ElapsedMin,
-    ElapsedSec,
+    ElapsedHour(u8),
+    ElapsedMin(u8),
+    ElapsedSec(u8),
 }
 
 struct DateSection {
@@ -1727,18 +2629,18 @@ impl DateSection {
                     i = fmt.len();
                     s
                 };
-                if inner.eq_ignore_ascii_case("h") {
-                    tokens.push(DateTok::ElapsedHour);
+                if !inner.is_empty() && inner.bytes().all(|b| b.eq_ignore_ascii_case(&b'h')) {
+                    tokens.push(DateTok::ElapsedHour(inner.len().min(8) as u8));
                     needs_elapsed = true;
                     after_hour = true;
                     after_sec = false;
-                } else if inner.eq_ignore_ascii_case("m") {
-                    tokens.push(DateTok::ElapsedMin);
+                } else if !inner.is_empty() && inner.bytes().all(|b| b.eq_ignore_ascii_case(&b'm')) {
+                    tokens.push(DateTok::ElapsedMin(inner.len().min(8) as u8));
                     needs_elapsed = true;
                     after_hour = false;
                     after_sec = false;
-                } else if inner.eq_ignore_ascii_case("s") {
-                    tokens.push(DateTok::ElapsedSec);
+                } else if !inner.is_empty() && inner.bytes().all(|b| b.eq_ignore_ascii_case(&b's')) {
+                    tokens.push(DateTok::ElapsedSec(inner.len().min(8) as u8));
                     needs_elapsed = true;
                     after_hour = false;
                     after_sec = true;
@@ -1890,36 +2792,65 @@ impl DateSection {
         ];
         const CN_DAY_SHORT: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
-        let (y, mo, d) = crate::formula::serial_to_date_in(sys, serial)?;
-        let (hh, mi, ss, frac_val) = if self.needs_time {
-            if self.frac_digits == 0 {
-                let total = (serial.fract().abs() * 86400.0).round() as u32;
-                (total / 3600, (total % 3600) / 60, total % 60, 0u32)
-            } else {
-                let scale: u64 = match self.frac_digits {
-                    1 => 10,
-                    2 => 100,
-                    _ => 1000,
-                };
-                let ticks = (serial.fract().abs() * 86400.0 * scale as f64).round() as u64;
+        // 1900 日期体系不支持负序列号（Excel 显示 ###）
+        if !sys.is_1904() && serial < 0.0 {
+            return Some("###".to_string());
+        }
+
+        let scale: u64 = match self.frac_digits {
+            0 => 1,
+            1 => 10,
+            2 => 100,
+            _ => 1000,
+        };
+        let (adj_serial, hh, mi, ss, frac_val, elapsed_h, elapsed_m, elapsed_s) =
+            if self.needs_elapsed {
+                let total_ticks = (serial.abs() * 86400.0 * scale as f64).round() as u64;
+                let total_secs = total_ticks / scale;
+                let frac = (total_ticks % scale) as u32;
+                let h = ((total_secs / 3600) % 24) as u32;
+                let m = ((total_secs % 3600) / 60) as u32;
+                let s = (total_secs % 60) as u32;
+                (
+                    serial,
+                    h,
+                    m,
+                    s,
+                    frac,
+                    (total_secs / 3600) as i64,
+                    (total_secs / 60) as i64,
+                    total_secs as i64,
+                )
+            } else if self.needs_time {
+                let mut ticks = (serial.fract().abs() * 86400.0 * scale as f64).round() as u64;
+                let mut carry = 0.0f64;
+                if ticks >= 86400 * scale {
+                    ticks -= 86400 * scale;
+                    carry = if serial < 0.0 { -1.0 } else { 1.0 };
+                }
                 let total = (ticks / scale) as u32;
                 let frac = (ticks % scale) as u32;
-                (total / 3600, (total % 3600) / 60, total % 60, frac)
-            }
-        } else {
-            (0, 0, 0, 0)
-        };
-        let elapsed = if self.needs_elapsed {
-            serial.abs() * 86400.0
-        } else {
-            0.0
-        };
+                (
+                    serial.trunc() + carry,
+                    total / 3600,
+                    (total % 3600) / 60,
+                    total % 60,
+                    frac,
+                    0,
+                    0,
+                    0,
+                )
+            } else {
+                (serial, 0, 0, 0, 0, 0, 0, 0)
+            };
+
+        let (y, mo, d) = crate::formula::serial_to_date_in(sys, adj_serial)?;
         // 1900 体系：serial 25569 = 1970-01-01（周四）；1904 体系：serial 0 = 1904-01-01（周五）
         let wd = if self.needs_weekday {
             if sys.is_1904() {
-                (((serial.abs().floor() as i64) % 7 + 7 + 5) % 7) as usize
+                (((adj_serial.abs().floor() as i64) % 7 + 7 + 5) % 7) as usize
             } else {
-                (((serial.abs().floor() as i64 - 25569) % 7 + 7 + 4) % 7) as usize
+                (((adj_serial.abs().floor() as i64 - 25569) % 7 + 7 + 4) % 7) as usize
             }
         } else {
             0
@@ -1969,12 +2900,28 @@ impl DateSection {
                 DateTok::AmPm => out.push_str(if hh < 12 { "AM" } else { "PM" }),
                 DateTok::ShortAmPm => out.push_str(if hh < 12 { "A" } else { "P" }),
                 DateTok::CnAmPm => out.push_str(if hh < 12 { "上午" } else { "下午" }),
-                DateTok::ElapsedHour => push_i64_decimal(&mut out, (elapsed / 3600.0).floor() as i64),
-                DateTok::ElapsedMin => push_i64_decimal(&mut out, (elapsed / 60.0).floor() as i64),
-                DateTok::ElapsedSec => push_i64_decimal(&mut out, elapsed.floor() as i64),
+                DateTok::ElapsedHour(w) => push_padded_i64(&mut out, elapsed_h, w as usize),
+                DateTok::ElapsedMin(w) => push_padded_i64(&mut out, elapsed_m, w as usize),
+                DateTok::ElapsedSec(w) => push_padded_i64(&mut out, elapsed_s, w as usize),
             }
         }
         Some(out)
+    }
+}
+
+#[inline]
+fn push_padded_i64(out: &mut String, v: i64, min_width: usize) {
+    if min_width <= 1 {
+        push_i64_decimal(out, v);
+        return;
+    }
+    let start = out.len();
+    push_i64_decimal(out, v);
+    let written = out.len() - start;
+    if written < min_width {
+        let pad = min_width - written;
+        let zeros = "00000000";
+        out.insert_str(start, &zeros[..pad.min(zeros.len())]);
     }
 }
 

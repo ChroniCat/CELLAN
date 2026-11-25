@@ -365,7 +365,7 @@ impl BuiltGroups {
             return None;
         }
         if let Some(vc) = val_col
-            && vc.has_non_finite
+            && (vc.has_non_finite || vc.has_error)
         {
             return None;
         }
@@ -378,7 +378,9 @@ impl BuiltGroups {
             if col.has_non_finite {
                 return None;
             }
-            let all_int = col.len == rows && col.pages.iter().all(|p| p.all_exact_int);
+            let all_int = col.len == rows
+                && !col.has_coerced_non_strict
+                && col.pages.iter().all(|p| p.all_exact_int);
             if all_int {
                 distinct_nums.push(None);
                 continue;
@@ -448,12 +450,15 @@ impl BuiltGroups {
                     };
                     GroupValue::Number(GroupValue::canonical_bits(canonical))
                 } else {
-                    GroupValue::Text(col.coerced_lower_text_at(row, &empty_arc))
+                    let Some(t) = col.lower_text_opt_at(row, &empty_arc) else {
+                        continue 'row;
+                    };
+                    GroupValue::Text(t)
                 });
             }
             let (add_sum, add_min, add_max, add_cnt) = match val_col {
                 None => (1.0, 1.0, 1.0, 1u32),
-                Some(vc) => match vc.coerced_number_at(row) {
+                Some(vc) => match vc.strict_number_opt_at(row) {
                     Some(n) => (n, n, n, 1u32),
                     None => (0.0, f64::INFINITY, f64::NEG_INFINITY, 0u32),
                 },
@@ -704,6 +709,18 @@ impl GroupedRange {
             .map(|col| col.len())
             .min()?
             .min(amounts.map_or(usize::MAX, |v| v.len()));
+        let eq_num = |v: &FValue| -> Option<f64> {
+            match v {
+                FValue::Number(n) => Some(*n),
+                FValue::Text(s) => s.trim().parse::<f64>().ok(),
+                _ => None,
+            }
+        };
+        if let Some(vals) = amounts
+            && vals[..rows].iter().any(FValue::is_error)
+        {
+            return None;
+        }
         let mut distinct_nums: Vec<Option<Vec<f64>>> = Vec::with_capacity(columns.len());
         for (col, &is_num) in columns.iter().zip(&self.numeric) {
             if !is_num {
@@ -712,7 +729,7 @@ impl GroupedRange {
             }
             let mut any_fract = false;
             for v in &col[..rows] {
-                if let Ok(n) = v.to_number() {
+                if let Some(n) = eq_num(v) {
                     if !n.is_finite() {
                         return None;
                     }
@@ -726,7 +743,7 @@ impl GroupedRange {
             } else {
                 let mut vals = Vec::new();
                 for v in &col[..rows] {
-                    if let Ok(n) = v.to_number() {
+                    if let Some(n) = eq_num(v) {
                         vals.push(if n == 0.0 { 0.0 } else { n });
                     }
                 }
@@ -746,7 +763,7 @@ impl GroupedRange {
             for (j, (col, &numeric)) in columns.iter().zip(&self.numeric).enumerate() {
                 let value = &col[row];
                 key.push(if numeric {
-                    let Ok(n) = value.to_number() else { continue 'row };
+                    let Some(n) = eq_num(value) else { continue 'row };
                     let canonical = if let Some(ref vals) = distinct_nums[j] {
                         let c = if n == 0.0 { 0.0 } else { n };
                         let idx = vals.binary_search_by(|x| x.total_cmp(&c)).ok()?;
@@ -761,6 +778,8 @@ impl GroupedRange {
                         FValue::Empty => "".into(),
                         FValue::Bool(true) => "true".into(),
                         FValue::Bool(false) => "false".into(),
+                        FValue::Error(e) => e.text().to_ascii_lowercase().into(),
+                        FValue::Number(_) => continue 'row,
                         other => other.display().to_lowercase().into(),
                     };
                     GroupValue::Text(text)
@@ -768,9 +787,9 @@ impl GroupedRange {
             }
             let (add_sum, add_min, add_max, add_cnt) = match amounts {
                 None => (1.0, 1.0, 1.0, 1u32),
-                Some(values) => match values[row].to_number() {
-                    Ok(n) => (n, n, n, 1u32),
-                    Err(_) => (0.0, f64::INFINITY, f64::NEG_INFINITY, 0u32),
+                Some(values) => match values[row] {
+                    FValue::Number(n) => (n, n, n, 1u32),
+                    _ => (0.0, f64::INFINITY, f64::NEG_INFINITY, 0u32),
                 },
             };
             if let Some(stats) = map.get_mut(&key) {
@@ -875,10 +894,11 @@ impl CountIndex {
                     if s.is_ascii() {
                         s.to_ascii_lowercase()
                     } else {
-                        s.to_string()
+                        s.to_lowercase()
                     }
                 }
                 FValue::Bool(b) => b.to_string(),
+                FValue::Error(e) => e.text().to_ascii_lowercase(),
                 FValue::Empty => String::new(),
                 _ => continue,
             };
@@ -1066,29 +1086,47 @@ impl Crit {
                 _ => (n - t).abs() <= f64::EPSILON,
             };
         }
-        let eq = match v {
+        match v {
             FValue::Text(s) => {
-                if self.wild {
-                    wildcard_match_ci(&self.text, s)
-                } else if self.text.is_ascii() {
-                    s.eq_ignore_ascii_case(&self.text)
-                } else {
-                    s.as_ref() == self.text
+                if self.wild && matches!(self.op, "=" | "<>") {
+                    let m = wildcard_match_ci(&self.text, s);
+                    return if self.op == "<>" { !m } else { m };
+                }
+                let ord = super::value::compare_text(s, &self.text);
+                match self.op {
+                    "<>" => !ord.is_eq(),
+                    ">" => ord.is_gt(),
+                    "<" => ord.is_lt(),
+                    ">=" => !ord.is_lt(),
+                    "<=" => !ord.is_gt(),
+                    _ => ord.is_eq(),
                 }
             }
-            FValue::Empty => self.text.is_empty(),
-            FValue::Bool(b) => (if *b { "true" } else { "false" }) == self.text,
+            FValue::Empty => match self.op {
+                "=" => self.text.is_empty(),
+                "<>" => !self.text.is_empty(),
+                _ => false,
+            },
+            FValue::Bool(b) => {
+                let eq = (if *b { "true" } else { "false" }) == self.text;
+                match self.op {
+                    "=" => eq,
+                    "<>" => !eq,
+                    _ => false,
+                }
+            }
+            FValue::Error(e) => {
+                let eq = e.text().eq_ignore_ascii_case(&self.text);
+                match self.op {
+                    "=" => eq,
+                    "<>" => !eq,
+                    _ => false,
+                }
+            }
             // When `self.num.is_none()`, the criterion text failed `parse::<f64>()`,
-            // so no formatted numeric cell can equal `self.text` (and Excel wildcards
-            // never match numeric cells). Avoid per-cell `format!()` allocations.
-            FValue::Number(_) => false,
-            _ => false,
-        };
-        match self.op {
-            "<>" => !eq,
-            ">" => !eq && !self.text.is_empty(),
-            "<" => false,
-            _ => eq,
+            // so no numeric cell can equal `self.text`, match wildcards, or satisfy text `<`/`>`.
+            FValue::Number(_) => self.op == "<>",
+            _ => self.op == "<>",
         }
     }
 
@@ -1105,11 +1143,7 @@ impl Crit {
                 _ => (n - t).abs() <= f64::EPSILON,
             };
         }
-        match self.op {
-            "<>" => true,
-            ">" => !self.text.is_empty(),
-            _ => false,
-        }
+        self.op == "<>"
     }
 
     /// Zero-conversion criterion match directly on a stored `crate::Value` in a Sheet page slab.
@@ -1135,26 +1169,44 @@ impl Crit {
                 _ => (n - t).abs() <= f64::EPSILON,
             };
         }
-        let eq = match v {
+        match v {
             crate::Value::Text(s) => {
-                if self.wild {
-                    wildcard_match_ci(&self.text, s)
-                } else if self.text.is_ascii() {
-                    s.eq_ignore_ascii_case(&self.text)
-                } else {
-                    s.as_ref() == self.text
+                if self.wild && matches!(self.op, "=" | "<>") {
+                    let m = wildcard_match_ci(&self.text, s);
+                    return if self.op == "<>" { !m } else { m };
+                }
+                let ord = super::value::compare_text(s, &self.text);
+                match self.op {
+                    "<>" => !ord.is_eq(),
+                    ">" => ord.is_gt(),
+                    "<" => ord.is_lt(),
+                    ">=" => !ord.is_lt(),
+                    "<=" => !ord.is_gt(),
+                    _ => ord.is_eq(),
                 }
             }
-            crate::Value::Empty => self.text.is_empty(),
-            crate::Value::Bool(b) => (if *b { "true" } else { "false" }) == self.text,
-            crate::Value::Number(_) => false,
-            crate::Value::Error(_) => false,
-        };
-        match self.op {
-            "<>" => !eq,
-            ">" => !eq && !self.text.is_empty(),
-            "<" => false,
-            _ => eq,
+            crate::Value::Empty => match self.op {
+                "=" => self.text.is_empty(),
+                "<>" => !self.text.is_empty(),
+                _ => false,
+            },
+            crate::Value::Bool(b) => {
+                let eq = (if *b { "true" } else { "false" }) == self.text;
+                match self.op {
+                    "=" => eq,
+                    "<>" => !eq,
+                    _ => false,
+                }
+            }
+            crate::Value::Error(e) => {
+                let eq = e.text().eq_ignore_ascii_case(&self.text);
+                match self.op {
+                    "=" => eq,
+                    "<>" => !eq,
+                    _ => false,
+                }
+            }
+            crate::Value::Number(_) => self.op == "<>",
         }
     }
 
@@ -1338,7 +1390,7 @@ fn wildcard_unicode_ci(text: &str, pat: &str) -> bool {
 }
 
 pub(crate) fn match_criteria(v: &FValue, crit: &str) -> bool {
-    Crit::parse(crit).matches_coerced(v)
+    Crit::parse(crit).matches(v)
 }
 
 pub(super) fn criteria_pairs(args: &[Arg]) -> Vec<(&[FValue], Crit)> {
@@ -1582,7 +1634,7 @@ pub(crate) fn range_get(a: &Arg, r: usize, c: usize) -> FValue {
 /// Excel 的算术只保留 15 位有效数字：57*275.75*0.62 在二进制里是
 /// 9745.004999999998，Excel 看到的是 9745.005，于是 ROUND 进位到 9745.01。
 /// 先把中间结果收到 15 位有效数字，再按"四舍五入远离零"取整，才能对上。
-fn round_sig15(x: f64) -> f64 {
+pub(super) fn round_sig15(x: f64) -> f64 {
     if !x.is_finite() || x == 0.0 {
         return x;
     }
@@ -1819,7 +1871,7 @@ pub(super) fn call_by_id_in(
         }),
         FuncId::Even => r(|| {
             let n = num(args, 0)?;
-            let v = (n / 2.0).ceil().abs() * 2.0;
+            let v = (n.abs() / 2.0).ceil() * 2.0;
             Ok(FValue::number(if n < 0.0 { -v } else { v }))
         }),
         FuncId::Odd => r(|| {
@@ -1862,12 +1914,19 @@ pub(super) fn call_by_id_in(
                 }
             }
             let total = rows * cols;
+            let cell_num = |v: &FValue| -> Result<f64, ErrKind> {
+                match v {
+                    FValue::Error(e) => Err(*e),
+                    FValue::Number(n) => Ok(*n),
+                    _ => Ok(0.0),
+                }
+            };
             if grids.len() == 2 && grids[0].0 == rows && grids[0].1 == cols && grids[1].0 == rows && grids[1].1 == cols {
                 let a = &grids[0].2[..total];
                 let b = &grids[1].2[..total];
                 let mut sum = 0.0;
                 for i in 0..total {
-                    sum += a[i].to_number().unwrap_or(0.0) * b[i].to_number().unwrap_or(0.0);
+                    sum += cell_num(&a[i])? * cell_num(&b[i])?;
                 }
                 return Ok(FValue::number(sum));
             }
@@ -1877,9 +1936,7 @@ pub(super) fn call_by_id_in(
                 let c = &grids[2].2[..total];
                 let mut sum = 0.0;
                 for i in 0..total {
-                    sum += a[i].to_number().unwrap_or(0.0)
-                        * b[i].to_number().unwrap_or(0.0)
-                        * c[i].to_number().unwrap_or(0.0);
+                    sum += cell_num(&a[i])? * cell_num(&b[i])? * cell_num(&c[i])?;
                 }
                 return Ok(FValue::number(sum));
             }
@@ -1888,7 +1945,7 @@ pub(super) fn call_by_id_in(
                 let mut p = 1.0;
                 for (r, c, data) in &grids {
                     let idx = if *r == 1 && *c == 1 { 0 } else { i };
-                    p *= data[idx].to_number().unwrap_or(0.0);
+                    p *= cell_num(&data[idx])?;
                 }
                 sum += p;
             }
@@ -1922,9 +1979,11 @@ pub(super) fn call_by_id_in(
             let mut s = 0.0;
             let pairs = criteria_pairs(args.get(1..).unwrap_or_default());
             for (i, v) in sum_range.iter().enumerate() {
-                if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches_coerced(x))) {
-                    if let Ok(n) = v.to_number() {
-                        s += n;
+                if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches(x))) {
+                    match v {
+                        FValue::Number(n) => s += n,
+                        FValue::Error(e) => return Err(*e),
+                        _ => {}
                     }
                 }
             }
@@ -2040,7 +2099,7 @@ pub(super) fn call_by_id_in(
             let pairs = criteria_pairs(args);
             let len = pairs.iter().map(|(r, _)| r.len()).min().unwrap_or(0);
             for i in 0..len {
-                if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches_coerced(x))) {
+                if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches(x))) {
                     count += 1;
                 }
             }
@@ -2053,10 +2112,16 @@ pub(super) fn call_by_id_in(
             let mut s = 0.0;
             let mut n = 0.0;
             for (i, v) in target.iter().enumerate() {
-                if crit.matches_coerced(v) {
-                    if let Some(Ok(x)) = vals.get(i).map(|x| x.to_number()) {
-                        s += x;
-                        n += 1.0;
+                if crit.matches(v) {
+                    if let Some(sv) = vals.get(i) {
+                        match sv {
+                            FValue::Number(x) => {
+                                s += x;
+                                n += 1.0;
+                            }
+                            FValue::Error(e) => return Err(*e),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -2410,21 +2475,29 @@ pub(super) fn call_by_id_in(
         FuncId::Find | FuncId::Search => r(|| {
             let needle = text(args, 0)?;
             let hay = text(args, 1)?;
-            let start = opt_num(args, 2, 1.0)?.max(1.0) as usize;
-            let hay_part: String = hay.chars().skip(start - 1).collect();
-            let found = if name == "FIND" {
-                hay_part.find(&needle).map(|p| (p, needle.len()))
-            } else {
+            let start_f = opt_num(args, 2, 1.0)?;
+            if start_f < 1.0 {
+                return Err(ErrKind::Value);
+            }
+            let start = start_f.trunc() as usize;
+            let hay_len = hay.chars().count();
+            if start > hay_len + 1 {
+                return Err(ErrKind::Value);
+            }
+            let byte_off = hay
+                .char_indices()
+                .nth(start - 1)
+                .map_or(hay.len(), |(idx, _)| idx);
+            let hay_part = &hay[byte_off..];
+            let found_chars = if name == "FIND" {
                 hay_part
-                    .to_lowercase()
-                    .find(&needle.to_lowercase())
-                    .map(|p| (p, needle.len()))
+                    .find(&needle)
+                    .map(|byte_pos| hay_part[..byte_pos].chars().count())
+            } else {
+                search_wildcard_char_pos(hay_part, &needle)
             };
-            match found {
-                Some((p, _)) => {
-                    let prefix_chars = hay_part.chars().take(p).count();
-                    Ok(FValue::number((start + prefix_chars) as f64))
-                }
+            match found_chars {
+                Some(prefix_chars) => Ok(FValue::number((start + prefix_chars) as f64)),
                 None => Err(ErrKind::Value),
             }
         }),
@@ -2457,6 +2530,9 @@ pub(super) fn call_by_id_in(
         }),
         FuncId::Text => r(|| {
             let v = arg(args, 0);
+            if let FValue::Error(e) = v {
+                return Err(e);
+            }
             let fmt = text(args, 1)?;
             Ok(FValue::Text(format_value_in(ctx.date_system, &v, &fmt).into()))
         }),
@@ -2826,13 +2902,19 @@ pub(super) fn call_by_id_in(
         }),
         FuncId::Weekday => r(|| {
             let serial = num(args, 0)?;
-            let t = opt_num(args, 1, 1.0)? as i64;
-            let days = (serial.floor() as i64 + 6) % 7; // 0=Sunday
+            let t = opt_num(args, 1, 1.0)?.trunc() as i64;
+            let adj = serial.floor() as i64 + if ctx.date_system.is_1904() { 1462 } else { 0 };
+            let sun0 = (adj + 6).rem_euclid(7); // 0=Sunday .. 6=Saturday
             let v = match t {
-                1 => days + 1,
-                2 => (days + 6) % 7 + 1,
-                3 => (days + 6) % 7,
-                _ => days + 1,
+                1 | 17 => sun0 + 1,
+                2 | 11 => (sun0 + 6) % 7 + 1,
+                3 => (sun0 + 6) % 7,
+                12 => (sun0 + 5) % 7 + 1,
+                13 => (sun0 + 4) % 7 + 1,
+                14 => (sun0 + 3) % 7 + 1,
+                15 => (sun0 + 2) % 7 + 1,
+                16 => (sun0 + 1) % 7 + 1,
+                _ => return Err(ErrKind::Num),
             };
             Ok(FValue::number(v as f64))
         }),
@@ -2883,35 +2965,87 @@ pub(super) fn call_by_id_in(
         }),
         FuncId::WeekNum => r(|| {
             let serial = num(args, 0)?.floor();
+            let rt = opt_num(args, 1, 1.0)?.trunc() as i64;
+            if rt == 21 {
+                // ISO 8601 周数（周一为周首，含当年首个周四的周为第 1 周）
+                let adj = serial as i64 + if ctx.date_system.is_1904() { 1462 } else { 0 };
+                let mon0 = (adj + 5).rem_euclid(7); // 0=Mon..6=Sun
+                let thu_serial = serial + (3 - mon0) as f64;
+                let (iso_y, _, _) = serial_to_date_in(ctx.date_system, thu_serial).ok_or(ErrKind::Num)?;
+                let jan4 = date_to_serial_in(ctx.date_system, iso_y, 1, 4).ok_or(ErrKind::Num)?;
+                let jan4_adj = jan4 as i64 + if ctx.date_system.is_1904() { 1462 } else { 0 };
+                let jan4_mon0 = (jan4_adj + 5).rem_euclid(7);
+                let week1_mon = jan4 - jan4_mon0 as f64;
+                let wn = ((serial - week1_mon) / 7.0).floor() + 1.0;
+                return Ok(FValue::number(wn));
+            }
+            let start_dow: i64 = match rt {
+                1 | 17 => 0, // Sun
+                2 | 11 => 1, // Mon
+                12 => 2,     // Tue
+                13 => 3,     // Wed
+                14 => 4,     // Thu
+                15 => 5,     // Fri
+                16 => 6,     // Sat
+                _ => return Err(ErrKind::Num),
+            };
             let (y, _, _) = serial_to_date_in(ctx.date_system, serial).ok_or(ErrKind::Num)?;
             let jan1 = date_to_serial_in(ctx.date_system, y, 1, 1).ok_or(ErrKind::Num)?;
-            let offset = ((jan1 as i64 + 6) % 7) as f64; // 周日为一周开始
+            let jan1_adj = jan1 as i64 + if ctx.date_system.is_1904() { 1462 } else { 0 };
+            let jan1_sun0 = (jan1_adj + 6).rem_euclid(7);
+            let offset = (jan1_sun0 - start_dow).rem_euclid(7) as f64;
             Ok(FValue::number(((serial - jan1 + offset) / 7.0).floor() + 1.0))
         }),
         FuncId::NetworkDays => r(|| {
             let a = num(args, 0)?.floor() as i64;
             let b = num(args, 1)?.floor() as i64;
-            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            let mut n = 0;
+            let mut holidays = Vec::new();
+            if let Some(h_arg) = args.get(2) {
+                for v in h_arg.slice() {
+                    match v {
+                        FValue::Empty => {}
+                        FValue::Error(e) => return Err(*e),
+                        _ => holidays.push(v.to_number()?.floor() as i64),
+                    }
+                }
+            }
+            let date_off = if ctx.date_system.is_1904() { 1462 } else { 0 };
+            let (lo, hi, sign) = if a <= b { (a, b, 1.0) } else { (b, a, -1.0) };
+            let mut n = 0i64;
             for d in lo..=hi {
-                // (d+6)%7：0=周日 1=周一 … 6=周六
-                let wd = (d + 6) % 7;
-                if wd != 0 && wd != 6 {
+                let wd = (d + date_off + 6).rem_euclid(7); // 0=周日 .. 6=周六
+                if wd != 0 && wd != 6 && !holidays.contains(&d) {
                     n += 1;
                 }
             }
-            Ok(FValue::number(n as f64))
+            Ok(FValue::number(sign * n as f64))
         }),
         FuncId::Workday => r(|| {
             let start = num(args, 0)?.floor() as i64;
             let days = int_arg(args, 1)?;
+            let mut holidays = Vec::new();
+            if let Some(h_arg) = args.get(2) {
+                for v in h_arg.slice() {
+                    match v {
+                        FValue::Empty => {}
+                        FValue::Error(e) => return Err(*e),
+                        _ => holidays.push(v.to_number()?.floor() as i64),
+                    }
+                }
+            }
+            let date_off = if ctx.date_system.is_1904() { 1462 } else { 0 };
             let mut d = start;
             let mut left = days.abs();
             let step = if days >= 0 { 1 } else { -1 };
+            let mut guard = 0usize;
             while left > 0 {
+                guard += 1;
+                if guard > 5_000_000 {
+                    return Err(ErrKind::Num);
+                }
                 d += step;
-                let wd = (d + 6) % 7;
-                if wd != 0 && wd != 6 {
+                let wd = (d + date_off + 6).rem_euclid(7);
+                if wd != 0 && wd != 6 && !holidays.contains(&d) {
                     left -= 1;
                 }
             }
@@ -2975,12 +3109,13 @@ pub(super) fn call_by_id_in(
             let nper = num(args, 2)?;
             let pv_ = num(args, 3)?;
             let fv_ = opt_num(args, 4, 0.0)?;
-            let t = opt_num(args, 5, 0.0)?;
+            let t = if opt_num(args, 5, 0.0)? != 0.0 { 1.0 } else { 0.0 };
+            if per < 1.0 || per > nper {
+                return Err(ErrKind::Num);
+            }
             let p = pmt(rate, nper, pv_, fv_, t);
-            // fv() 是 FV 口径（余额与 pv 反号），这里要的是与 pv 同号的贷款余额。
-            // Excel：pv=-300000、rate=5%/12 时 IPMT 第 1 期 = +1250，PPMT = +360.46。
-            let balance = -fv_after(rate, per - 1.0, p, pv_, t);
-            Ok(FValue::number(-(balance * rate)))
+            let interest = ipmt_calc(rate, per, p, pv_, t);
+            Ok(FValue::number(interest))
         }),
         FuncId::Ppmt => r(|| {
             let rate = num(args, 0)?;
@@ -2988,10 +3123,12 @@ pub(super) fn call_by_id_in(
             let nper = num(args, 2)?;
             let pv_ = num(args, 3)?;
             let fv_ = opt_num(args, 4, 0.0)?;
-            let t = opt_num(args, 5, 0.0)?;
+            let t = if opt_num(args, 5, 0.0)? != 0.0 { 1.0 } else { 0.0 };
+            if per < 1.0 || per > nper {
+                return Err(ErrKind::Num);
+            }
             let p = pmt(rate, nper, pv_, fv_, t);
-            let balance = -fv_after(rate, per - 1.0, p, pv_, t);
-            let interest = -(balance * rate);
+            let interest = ipmt_calc(rate, per, p, pv_, t);
             Ok(FValue::number(p - interest))
         }),
         FuncId::Npv => r(|| {
@@ -3059,6 +3196,8 @@ pub(super) fn call_by_id_in(
                 ErrKind::Na => 7.0,
                 ErrKind::Circular => 4.0,
                 ErrKind::Spill => 9.0,
+                ErrKind::Field => 11.0,
+                ErrKind::Calc => 14.0,
             })),
             _ => Err(ErrKind::Na),
         }),
@@ -3119,7 +3258,7 @@ fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, t: f64) -> f64 {
     -(rate * (pv * p + fv)) / ((1.0 + rate * t) * (p - 1.0))
 }
 
-fn year_fraction_in(sys: DateSystem, start: f64, end: f64, basis: i32) -> Result<f64, ErrKind> {
+pub(super) fn year_fraction_in(sys: DateSystem, start: f64, end: f64, basis: i32) -> Result<f64, ErrKind> {
     if start < 0.0 || end > date_to_serial_in(sys, 9999, 12, 31).ok_or(ErrKind::Num)? {
         return Err(ErrKind::Num);
     }
@@ -3329,107 +3468,144 @@ fn strip_format_brackets(s: &str) -> String {
     out
 }
 
-fn format_value_in(sys: DateSystem, v: &FValue, fmt: &str) -> String {
-    // TEXT 的分段语义：正数;负数;零;文本。文本值走第 4 段（@ 占位），
-    // 没有第 4 段就原样返回；`[Red]`/`[$-409]` 这类标记先剥掉。
-    let sections = split_format_sections(fmt);
-    if let FValue::Text(t) = v {
-        let sec = if sections.len() >= 4 {
-            strip_format_brackets(&sections[3])
+fn ipmt_calc(rate: f64, per: f64, p: f64, pv_: f64, t: f64) -> f64 {
+    if rate == 0.0 {
+        return 0.0;
+    }
+    if t != 0.0 {
+        if per <= 1.0 {
+            0.0
         } else {
-            strip_format_brackets(&sections[0])
-        };
-        let sec = sec.replace('"', "");
-        return if sec.contains('@') { sec.replace('@', t) } else { t.to_string() };
-    }
-    if !matches!(v, FValue::Number(_) | FValue::Empty) {
-        return v.display();
-    }
-    let raw = v.to_number().unwrap_or(0.0);
-    let (sec_raw, is_neg) = if raw < 0.0 && sections.len() >= 2 {
-        (sections[1].clone(), true)
-    } else if raw == 0.0 && sections.len() >= 3 {
-        (sections[2].clone(), false)
+            fv(rate, per - 1.0, p, pv_, 1.0) * rate / (1.0 + rate)
+        }
     } else {
-        (sections[0].clone(), raw < 0.0)
+        fv(rate, per - 1.0, p, pv_, 0.0) * rate
+    }
+}
+
+fn search_wildcard_char_pos(hay: &str, pat: &str) -> Option<usize> {
+    if pat.is_empty() {
+        return Some(0);
+    }
+    #[derive(Clone, Copy)]
+    enum Tok {
+        Star,
+        Any,
+        Lit(char),
+    }
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut chars = pat.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if !matches!(toks.last(), Some(Tok::Star)) {
+                    toks.push(Tok::Star);
+                }
+            }
+            '?' => toks.push(Tok::Any),
+            '~' => {
+                let lit = chars.next().unwrap_or('~');
+                for lc in lit.to_lowercase() {
+                    toks.push(Tok::Lit(lc));
+                }
+            }
+            other => {
+                for lc in other.to_lowercase() {
+                    toks.push(Tok::Lit(lc));
+                }
+            }
+        }
+    }
+    if toks.is_empty() || matches!(toks.as_slice(), [Tok::Star]) {
+        return Some(0);
+    }
+    // Map each lowercased char in `hay` back to its 0-based original char index in `hay`.
+    let mut hay_lc: Vec<char> = Vec::with_capacity(hay.len());
+    let mut orig_start: Vec<usize> = Vec::with_capacity(hay.len());
+    for (ci, ch) in hay.chars().enumerate() {
+        for lc in ch.to_lowercase() {
+            hay_lc.push(lc);
+            orig_start.push(ci);
+        }
+    }
+    let match_prefix = |slice: &[char]| -> bool {
+        let (mut ti, mut pi) = (0usize, 0usize);
+        let mut star_pi: Option<usize> = None;
+        let mut star_ti: usize = 0;
+        loop {
+            if pi == toks.len() {
+                return true;
+            }
+            match toks[pi] {
+                Tok::Star => {
+                    pi += 1;
+                    if pi == toks.len() {
+                        return true;
+                    }
+                    star_pi = Some(pi);
+                    star_ti = ti;
+                    continue;
+                }
+                Tok::Any if ti < slice.len() => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                Tok::Lit(pc) if ti < slice.len() && slice[ti] == pc => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(sp) = star_pi
+                && star_ti < slice.len()
+            {
+                star_ti += 1;
+                ti = star_ti;
+                pi = sp;
+            } else {
+                return false;
+            }
+        }
     };
-    let sec = strip_format_brackets(&sec_raw);
-    if sec.trim().eq_ignore_ascii_case("general") {
-        let d = v.display();
-        return if is_neg { format!("-{}", d.trim_start_matches('-')) } else { d };
+    let mut ci_idx = 0usize;
+    while ci_idx <= hay_lc.len() {
+        // Only start matching at original character boundaries
+        let at_boundary = ci_idx == 0
+            || ci_idx == hay_lc.len()
+            || orig_start[ci_idx] != orig_start[ci_idx - 1];
+        if at_boundary && match_prefix(&hay_lc[ci_idx..]) {
+            return Some(if ci_idx < orig_start.len() {
+                orig_start[ci_idx]
+            } else {
+                hay.chars().count()
+            });
+        }
+        ci_idx += 1;
     }
-    let fmt: &str = sec.as_str();
-    // 负数段只对绝对值排版，负号由该段里的字面 '-' 提供（Excel 同一口径）
-    let sign = if is_neg && fmt.contains('-') { "-" } else { "" };
-    let n = if is_neg { raw.abs() } else { raw };
-    // 整段没有数字占位符（如零段写成 "零"）：按字面输出
-    let literal_only = !sec
-        .chars()
-        .any(|c| matches!(c, '0' | '#' | '?' | '.' | ',' | '%' | 'y' | 'Y' | 'm' | 'M' | 'd' | 'D'));
-    if literal_only {
-        return format!("{sign}{}", sec.replace('"', ""));
-    }
-    // 常见占位符：0、0.00、#,##0、0%、0.00%、yyyy-mm-dd
-    if fmt.chars().any(|c| matches!(c, 'y' | 'Y' | 'm' | 'M' | 'd' | 'D')) {
-        if let Some((y, m, d)) = serial_to_date_in(sys, n) {
-            if let Some(out) = format_date_tokens(fmt, y, m, d) {
-                return format!("{sign}{out}");
+    None
+}
+
+fn format_value_in(sys: DateSystem, v: &FValue, fmt: &str) -> String {
+    let mv = match v {
+        FValue::Number(n) => crate::model::Value::Number(*n),
+        FValue::Empty => crate::model::Value::Number(0.0),
+        FValue::Bool(b) => crate::model::Value::Bool(*b),
+        FValue::Error(e) => crate::model::Value::Error(*e),
+        FValue::Text(t) => {
+            if !fmt.contains('@')
+                && let Ok(n) = t.trim().parse::<f64>()
+                && n.is_finite()
+            {
+                crate::model::Value::Number(n)
+            } else {
+                crate::model::Value::Text(t.clone())
             }
         }
-    }
-    let percent = fmt.contains('%');
-    let mut val = if percent { n * 100.0 } else { n };
-    let decimals = fmt
-        .split('.')
-        .nth(1)
-        .map(|s| s.chars().filter(|c| *c == '0' || *c == '#').count())
-        .unwrap_or(0);
-    let thousand = fmt.contains('#') && fmt.contains(',');
-    let mut s = format!("{val:.decimals$}");
-    // 整数格式里的 0 是"至少几位"：TEXT(12.3,"000.00") = "012.30"
-    let min_int = fmt
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| *c == '0')
-        .count();
-    if min_int > 0 {
-        let (ip, rest) = match s.find('.') {
-            Some(i) => (s[..i].to_string(), s[i..].to_string()),
-            None => (s.clone(), String::new()),
-        };
-        let neg = ip.starts_with('-');
-        let digits = ip.trim_start_matches('-');
-        if digits.len() < min_int {
-            let padded = format!("{}{}", "0".repeat(min_int - digits.len()), digits);
-            s = format!("{}{}{}", if neg { "-" } else { "" }, padded, rest);
-        }
-    }
-    if thousand {
-        let int_part = s.split('.').next().unwrap_or("").to_string();
-        let neg = int_part.starts_with('-');
-        let digits = int_part.trim_start_matches('-').to_string();
-        let mut grouped = String::new();
-        for (i, ch) in digits.chars().rev().enumerate() {
-            if i > 0 && i % 3 == 0 {
-                grouped.push(',');
-            }
-            grouped.push(ch);
-        }
-        let g: String = grouped.chars().rev().collect();
-        let mut rest = String::new();
-        if let Some(dot) = s.find('.') {
-            rest = s[dot..].to_string();
-        }
-        s = format!("{}{}{}", if neg { "-" } else { "" }, g, rest);
-    }
-    if percent {
-        s.push('%');
-    }
-    val = 0.0;
-    let _ = val;
-    format!("{sign}{s}")
+        other => crate::model::Value::Text(other.display().into()),
+    };
+    crate::style::format_value_literal_in(sys, &mv, fmt)
 }
 
 /// 已实现的函数名列表（用于覆盖率统计与文档）
@@ -3445,7 +3621,7 @@ pub(super) fn listed_builtin(name: &str) -> bool {
 
 const IMPLEMENTED: &[&str] = &[
     "ABS","ACOS","ACOSH","ACOT","AND","ARABIC","ARRAYTOTEXT","ASIN","ASINH","ATAN","ATAN2","ATANH","AVEDEV","AVERAGE","AVERAGEA","AVERAGEIF","BASE","BETA.DIST","BETA.INV","BETADIST","BETAINV","BIN2DEC","BIN2HEX","BIN2OCT","BINOM.DIST","BINOM.INV","BINOMDIST","BITAND","BITLSHIFT","BITOR","BITRSHIFT","BITXOR","CEILING","CEILING.MATH","CEILING.PRECISE","CHAR","CHIDIST","CHIINV","CHISQ.DIST","CHISQ.DIST.RT","CHISQ.INV","CHISQ.INV.RT","CHOOSE","CHOOSECOLS","CHOOSEROWS","CODE","COLUMN","COLUMNS","COMBIN","COMBINA","COMPLEX","CONCAT","CONCATENATE","CONFIDENCE","CONFIDENCE.NORM","CONFIDENCE.T","CORREL","COS","COSH","COT","COTH","COUNT","COUNTA","COUNTBLANK","COUNTIF","COUNTIFS","CRITBINOM","CSC","CSCH","CUMIPMT","CUMPRINC","DATE","DATEDIF","DAVERAGE","DAY","DAYS","DB","DCOUNT","DCOUNTA","DDB","DEC2BIN","DEC2HEX","DEC2OCT","DECIMAL","DEGREES","DELTA","DEVSQ","DGET","DMAX","DMIN","DOLLARDE","DOLLARFR","DPRODUCT","DROP","DSTDEV","DSTDEVP","DSUM","DVAR","DVARP","EDATE","EFFECT","EOMONTH","ERF","ERF.PRECISE","ERFC","ERFC.PRECISE","ERROR.TYPE","EVEN","EXACT","EXP","EXPAND","EXPON.DIST","EXPONDIST","F.DIST","F.DIST.RT","F.INV","F.INV.RT","FACT","FACTDOUBLE","FALSE","FDIST","FILTER","FIND","FINV","FISHER","FISHERINV","FLOOR","FLOOR.MATH","FLOOR.PRECISE","FV","FVSCHEDULE","GAMMA.DIST","GAMMA.INV","GAMMADIST","GAMMAINV","GAMMALN","GAMMALN.PRECISE","GCD","GEOMEAN","GESTEP","HARMEAN","HEX2BIN","HEX2DEC","HEX2OCT","HLOOKUP","HOUR","HSTACK","HYPGEOM.DIST","HYPGEOMDIST","IF","IFERROR","IFNA","IFS","IMABS","IMADD","IMAGINARY","IMARGUMENT","IMCONJUGATE","IMCOS","IMDIV","IMEXP","IMLN","IMLOG10","IMLOG2","IMMUL","IMPOWER","IMPRODUCT","IMREAL","IMSIN","IMSQRT","IMSUB","IMSUM","IMTAN","INDEX","INT","INTERCEPT","IPMT","IRR","ISBLANK","ISERR","ISERROR","ISEVEN","ISLOGICAL","ISNA","ISNONTEXT","ISNUMBER","ISO.CEILING","ISODD","ISREF","ISTEXT","KURT","LARGE","LCM","LEFT","LEN","LET","LN","LOG","LOG10","LOGINV","LOGNORM.DIST","LOGNORM.INV","LOGNORMDIST","LOOKUP","LOWER","MATCH","MAX","MAXA","MAXIFS","MEDIAN","MID","MIN","MINA","MINIFS","MINUTE","MIRR","MMULT","MOD","MODE","MONTH","MROUND","MULTINOMIAL","N","NA","NEGBINOM.DIST","NEGBINOMDIST","NETWORKDAYS","NOMINAL","NORM.DIST","NORM.INV","NORM.S.DIST","NORM.S.INV","NORMDIST","NORMINV","NORMSDIST","NORMSINV","NOT","NOW","NPER","NPV","OCT2BIN","OCT2DEC","OCT2HEX","ODD","OR","PDURATION","PERCENTILE","PERCENTILE.INC","PERMUT","PI","PMT","POISSON","POISSON.DIST","POWER","PPMT","PRODUCT","PROPER","PV","QUARTILE","QUARTILE.INC","QUOTIENT","RADIANS","RAND","RANDARRAY","RANDBETWEEN","RANK","RANK.EQ","RATE","REPLACE","REPT","RIGHT","ROMAN","ROUND","ROUNDDOWN","ROUNDUP","ROW","ROWS","RRI","SEARCH","SEC","SECH","SECOND","SEQUENCE","SERIESSUM","SIGN","SIN","SINH","SKEW","SKEW.P","SLN","SLOPE","SMALL","SORT","SORTBY","SQRT","SQRTPI","STANDARDIZE","STDEV","STDEV.P","STDEV.S","STDEVP","SUBSTITUTE","SUBTOTAL","SUM","SUMIF","SUMIFS","SUMPRODUCT","SUMSQ","SUMX2MY2","SUMX2PY2","SUMXMY2","SWITCH","SYD","T","T.DIST","T.DIST.2T","T.DIST.RT","T.INV","T.INV.2T","TAKE","TAN","TANH","TEXT","TEXTAFTER","TEXTBEFORE","TEXTJOIN","TIME","TINV","TOCOL","TODAY","TOROW","TRANSPOSE","TRIM","TRIMMEAN","TRUE","TRUNC","TYPE","UNICHAR","UNICODE","UNIQUE","UPPER","VALUE","VALUETOTEXT","VAR","VAR.P","VAR.S","VARP","VLOOKUP","VSTACK","WEEKDAY","WEEKNUM","WEIBULL","WEIBULL.DIST","WORKDAY","XIRR","XLOOKUP","XMATCH","XNPV","XOR","YEAR","YEARFRAC","Z.TEST","ZTEST","T.TEST","F.TEST","CHISQ.TEST","RSQ","FORECAST","FORECAST.LINEAR","STEYX","TREND","GROWTH","LINEST","PERCENTRANK","PERCENTRANK.INC","PERCENTILE.EXC","QUARTILE.EXC","RANK.AVG","CONVERT","VDB","DURATION","MDURATION","TBILLPRICE","TBILLYIELD","TBILLEQ","AMORLINC","AMORDEGRC","AVERAGEIFS","MODE.SNGL","MODE.MULT","AGGREGATE","FREQUENCY","PROB","STDEVA","VARA","COVARIANCE.P","COVARIANCE.S","COVARIANCE","PEARSON","HYPERLINK","ENCODEURL","TEXTSPLIT","WRAPROWS","WRAPCOLS","ISFORMULA","FORMULATEXT","SHEET","SHEETS","ADDRESS","INDIRECT","OFFSET","LAMBDA","MAP","REDUCE","SCAN","BYROW","BYCOL","MAKEARRAY","ISOMITTED",
-    "ACOTH","GAMMA","GAUSS","PHI","PERMUTATIONA","BINOM.DIST.RANGE","COVAR","PERCENTOF","PERCENTRANK.EXC","LOGEST","MDETERM","MINVERSE","CLEAN","ASC","DOLLAR","FIXED","NUMBERVALUE","DAYS360","DATEVALUE","TIMEVALUE","ISOWEEKNUM","CELL","AREAS","INFO","COUPPCD","COUPNCD","COUPNUM","COUPDAYS","COUPDAYBS","COUPDAYSNC","PRICE","YIELD","DISC","INTRATE","RECEIVED","PRICEDISC","YIELDDISC","PRICEMAT","YIELDMAT","REGEXTEST","REGEXEXTRACT","REGEXREPLACE","NETWORKDAYS.INTL","WORKDAY.INTL","ODDFPRICE","ODDFYIELD","ODDLPRICE","ODDLYIELD","BESSELI","BESSELJ","BESSELK","BESSELY","FORECAST.ETS","FORECAST.ETS.CONFINT","FORECAST.ETS.SEASONALITY","FORECAST.ETS.STAT",
+    "ACOTH","GAMMA","GAUSS","PHI","PERMUTATIONA","BINOM.DIST.RANGE","COVAR","PERCENTOF","PERCENTRANK.EXC","LOGEST","MDETERM","MINVERSE","CLEAN","ASC","DOLLAR","FIXED","NUMBERVALUE","DAYS360","DATEVALUE","TIMEVALUE","ISOWEEKNUM","CELL","AREAS","INFO","COUPPCD","COUPNCD","COUPNUM","COUPDAYS","COUPDAYBS","COUPDAYSNC","PRICE","YIELD","DISC","INTRATE","RECEIVED","PRICEDISC","YIELDDISC","PRICEMAT","YIELDMAT","REGEXTEST","REGEXEXTRACT","REGEXREPLACE","NETWORKDAYS.INTL","WORKDAY.INTL","ODDFPRICE","ODDFYIELD","ODDLPRICE","ODDLYIELD","BESSELI","BESSELJ","BESSELK","BESSELY","FORECAST.ETS","FORECAST.ETS.CONFINT","FORECAST.ETS.SEASONALITY","FORECAST.ETS.STAT","LENB","LEFTB","RIGHTB","MIDB","FINDB","SEARCHB","NUMBERSTRING","ACCRINT","ACCRINTM",
 ];
 
 #[cfg(test)]
@@ -3616,7 +3792,7 @@ mod round_precision {
             ("apple", false),
             ("=apple", false),
             ("<>apple", true),
-            (">apple", true),
+            (">apple", false),
             ("<apple", false),
             (">=apple", false),
             ("<=apple", false),

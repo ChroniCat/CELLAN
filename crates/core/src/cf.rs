@@ -161,35 +161,295 @@ pub fn percentile_inc(sorted: &[f64], p: f64) -> f64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextOp {
+    Contains,
+    NotContains,
+    BeginsWith,
+    EndsWith,
+}
+
+impl TextOp {
+    pub fn from_ooxml(s: &str) -> Option<Self> {
+        Some(match s {
+            "containsText" => TextOp::Contains,
+            "notContainsText" => TextOp::NotContains,
+            "beginsWith" => TextOp::BeginsWith,
+            "endsWith" => TextOp::EndsWith,
+            _ => return None,
+        })
+    }
+    pub fn ooxml_type(self) -> &'static str {
+        match self {
+            TextOp::Contains => "containsText",
+            TextOp::NotContains => "notContainsText",
+            TextOp::BeginsWith => "beginsWith",
+            TextOp::EndsWith => "endsWith",
+        }
+    }
+    pub fn ooxml_operator(self) -> &'static str {
+        match self {
+            TextOp::Contains => "containsText",
+            TextOp::NotContains => "notContains",
+            TextOp::BeginsWith => "beginsWith",
+            TextOp::EndsWith => "endsWith",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            TextOp::Contains => "文本包含",
+            TextOp::NotContains => "文本不包含",
+            TextOp::BeginsWith => "开头为",
+            TextOp::EndsWith => "结尾为",
+        }
+    }
+}
+
+/// 发生日期条件（OOXML cfRule type="timePeriod" @timePeriod）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimePeriod {
+    Today,
+    Yesterday,
+    Tomorrow,
+    Last7Days,
+    ThisWeek,
+    LastWeek,
+    NextWeek,
+    ThisMonth,
+    LastMonth,
+    NextMonth,
+}
+
+impl TimePeriod {
+    pub const ALL: [TimePeriod; 10] = [
+        TimePeriod::Today,
+        TimePeriod::Yesterday,
+        TimePeriod::Tomorrow,
+        TimePeriod::Last7Days,
+        TimePeriod::ThisWeek,
+        TimePeriod::LastWeek,
+        TimePeriod::NextWeek,
+        TimePeriod::ThisMonth,
+        TimePeriod::LastMonth,
+        TimePeriod::NextMonth,
+    ];
+    pub fn from_ooxml(s: &str) -> Option<Self> {
+        Some(match s {
+            "today" => TimePeriod::Today,
+            "yesterday" => TimePeriod::Yesterday,
+            "tomorrow" => TimePeriod::Tomorrow,
+            "last7Days" => TimePeriod::Last7Days,
+            "thisWeek" => TimePeriod::ThisWeek,
+            "lastWeek" => TimePeriod::LastWeek,
+            "nextWeek" => TimePeriod::NextWeek,
+            "thisMonth" => TimePeriod::ThisMonth,
+            "lastMonth" => TimePeriod::LastMonth,
+            "nextMonth" => TimePeriod::NextMonth,
+            _ => return None,
+        })
+    }
+    pub fn as_ooxml(self) -> &'static str {
+        match self {
+            TimePeriod::Today => "today",
+            TimePeriod::Yesterday => "yesterday",
+            TimePeriod::Tomorrow => "tomorrow",
+            TimePeriod::Last7Days => "last7Days",
+            TimePeriod::ThisWeek => "thisWeek",
+            TimePeriod::LastWeek => "lastWeek",
+            TimePeriod::NextWeek => "nextWeek",
+            TimePeriod::ThisMonth => "thisMonth",
+            TimePeriod::LastMonth => "lastMonth",
+            TimePeriod::NextMonth => "nextMonth",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            TimePeriod::Today => "今天",
+            TimePeriod::Yesterday => "昨天",
+            TimePeriod::Tomorrow => "明天",
+            TimePeriod::Last7Days => "过去7天",
+            TimePeriod::ThisWeek => "本周",
+            TimePeriod::LastWeek => "上周",
+            TimePeriod::NextWeek => "下周",
+            TimePeriod::ThisMonth => "本月",
+            TimePeriod::LastMonth => "上月",
+            TimePeriod::NextMonth => "下月",
+        }
+    }
+    /// 按 Excel 1900 日期序列号判断某天是否命中目标日期段
+    pub fn matches_serial(self, serial: f64, today_serial: i64) -> bool {
+        if !serial.is_finite() || serial < 1.0 {
+            return false;
+        }
+        let d = serial.floor() as i64;
+        match self {
+            TimePeriod::Today => d == today_serial,
+            TimePeriod::Yesterday => d == today_serial - 1,
+            TimePeriod::Tomorrow => d == today_serial + 1,
+            TimePeriod::Last7Days => d >= today_serial - 6 && d <= today_serial,
+            TimePeriod::ThisWeek | TimePeriod::LastWeek | TimePeriod::NextWeek => {
+                // Excel 1900 serial: 1900-01-01 = 1 (Mon? serial 1 is Sun-offset; serial 44927 = 2023-01-01 Sunday, 44927 % 7 == 1)
+                // Verify: 2023-01-01 is Sunday. serial(2023,1,1) = 44927. (44927 - 1) % 7 = 0 -> Sunday = 0, Monday = 1 ... Saturday = 6.
+                let dow = (today_serial - 1).rem_euclid(7);
+                let week_start = today_serial - dow;
+                let (lo, hi) = match self {
+                    TimePeriod::ThisWeek => (week_start, week_start + 6),
+                    TimePeriod::LastWeek => (week_start - 7, week_start - 1),
+                    TimePeriod::NextWeek => (week_start + 7, week_start + 13),
+                    _ => unreachable!(),
+                };
+                d >= lo && d <= hi
+            }
+            TimePeriod::ThisMonth | TimePeriod::LastMonth | TimePeriod::NextMonth => {
+                let (ty, tm, _) = serial_to_ymd_1900(today_serial);
+                let (y, m, _) = serial_to_ymd_1900(d);
+                let (want_y, want_m) = match self {
+                    TimePeriod::ThisMonth => (ty, tm),
+                    TimePeriod::LastMonth => {
+                        if tm == 1 { (ty - 1, 12) } else { (ty, tm - 1) }
+                    }
+                    TimePeriod::NextMonth => {
+                        if tm == 12 { (ty + 1, 1) } else { (ty, tm + 1) }
+                    }
+                    _ => unreachable!(),
+                };
+                y == want_y && m == want_m
+            }
+        }
+    }
+}
+
+/// 纯整数 Excel 1900 序列号转 (年, 月, 日)（兼容 1900-02-29 历史闰年槽）
+fn serial_to_ymd_1900(serial: i64) -> (i32, u32, u32) {
+    if serial <= 60 {
+        if serial == 60 {
+            return (1900, 2, 29);
+        }
+        if serial <= 31 {
+            return (1900, 1, serial.max(1) as u32);
+        }
+        return (1900, 2, (serial - 31) as u32);
+    }
+    // 1899-12-30 + serial days -> Howard Hinnant civil_from_days (days since 1970-01-01 = serial - 25569)
+    let z = serial - 25569 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + i64::from(m <= 2);
+    (y as i32, m as u32, d as u32)
+}
+
+/// 当前日期的 Excel 1900 序列号（天粒度）
+pub fn today_excel_serial() -> i64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // 1970-01-01 在 Excel 1900 序列中是 25569
+    25569 + secs.div_euclid(86_400)
+}
+
+/// 数据条双向渲染几何信息（支持正负双向、零轴线与隐藏数值）
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarOverlay {
+    /// 条左端在单元格宽度的比例 0..1
+    pub start: f32,
+    /// 条右端在单元格宽度的比例 0..1
+    pub end: f32,
+    /// 当数据区跨 0 时，零轴线所在位置 0..1
+    pub axis: Option<f32>,
+    /// 填充色
+    pub color: [u8; 3],
+    /// 是否负值条
+    pub is_neg: bool,
+    /// false 时仅画数据条、隐藏单元格数值（OOXML dataBar showValue="0"）
+    pub show_value: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum CfKind {
     CellIs { op: CfOp, a: String, b: String, dxf: usize },
     Text { contains: String, dxf: usize },
+    /// 文本匹配扩展（不含/开头/结尾/包含）
+    TextMatch { op: TextOp, text: String, dxf: usize },
+    /// 发生日期（今天/昨天/明天/过去7天/本周/上周/下周/本月/上月/下月）
+    TimePeriod { period: TimePeriod, dxf: usize },
+    /// 空值 / 非空值
+    Blanks { blank: bool, dxf: usize },
+    /// 错误值 / 无错误
+    Errors { error: bool, dxf: usize },
     Dup { unique: bool, dxf: usize },
     Top { top: bool, n: u32, percent: bool, dxf: usize },
     Avg { above: bool, dxf: usize },
     Expr { formula: String, dxf: usize },
     Scale { points: Vec<(Cfvo, [u8; 3])> },
-    Bar { color: [u8; 3], min: Cfvo, max: Cfvo },
+    Bar {
+        color: [u8; 3],
+        neg_color: Option<[u8; 3]>,
+        min: Cfvo,
+        max: Cfvo,
+        show_value: bool,
+    },
     /// 图标集：set 是 OOXML 的 iconSet 名，thresholds 是各档下限（min/max/percent/…）
     IconSet { set: String, reverse: bool, thresholds: Vec<Cfvo>, show_value: bool },
 }
 
 impl CfKind {
+    pub fn bar_default(color: [u8; 3], min: Cfvo, max: Cfvo) -> Self {
+        CfKind::Bar {
+            color,
+            neg_color: Some([220, 53, 69]),
+            min,
+            max,
+            show_value: true,
+        }
+    }
+
+    pub fn dxf_id(&self) -> Option<usize> {
+        match self {
+            CfKind::CellIs { dxf, .. }
+            | CfKind::Text { dxf, .. }
+            | CfKind::TextMatch { dxf, .. }
+            | CfKind::TimePeriod { dxf, .. }
+            | CfKind::Blanks { dxf, .. }
+            | CfKind::Errors { dxf, .. }
+            | CfKind::Dup { dxf, .. }
+            | CfKind::Top { dxf, .. }
+            | CfKind::Avg { dxf, .. }
+            | CfKind::Expr { dxf, .. } => Some(*dxf),
+            CfKind::Scale { .. } | CfKind::Bar { .. } | CfKind::IconSet { .. } => None,
+        }
+    }
+
+    pub fn remap_dxf(&mut self, map: &[usize]) {
+        let slot = match self {
+            CfKind::CellIs { dxf, .. }
+            | CfKind::Text { dxf, .. }
+            | CfKind::TextMatch { dxf, .. }
+            | CfKind::TimePeriod { dxf, .. }
+            | CfKind::Blanks { dxf, .. }
+            | CfKind::Errors { dxf, .. }
+            | CfKind::Dup { dxf, .. }
+            | CfKind::Top { dxf, .. }
+            | CfKind::Avg { dxf, .. }
+            | CfKind::Expr { dxf, .. } => dxf,
+            CfKind::Scale { .. } | CfKind::Bar { .. } | CfKind::IconSet { .. } => return,
+        };
+        if let Some(&mapped) = map.get(*slot) {
+            *slot = mapped;
+        }
+    }
+
     /// 管理窗口里显示的一句话说明
     pub fn describe(&self) -> String {
         match self {
             CfKind::CellIs { op, a, b, .. } => {
-                let name = match op {
-                    CfOp::Greater => "大于",
-                    CfOp::Less => "小于",
-                    CfOp::GreaterEq => "大于等于",
-                    CfOp::LessEq => "小于等于",
-                    CfOp::Equal => "等于",
-                    CfOp::NotEqual => "不等于",
-                    CfOp::Between => "介于",
-                    CfOp::NotBetween => "不介于",
-                };
+                let name = op.label();
                 if matches!(op, CfOp::Between | CfOp::NotBetween) {
                     format!("{name} {a} 和 {b}")
                 } else {
@@ -197,6 +457,14 @@ impl CfKind {
                 }
             }
             CfKind::Text { contains, .. } => format!("文本包含\"{contains}\""),
+            CfKind::TextMatch { op, text, .. } => format!("{}\"{text}\"", op.label()),
+            CfKind::TimePeriod { period, .. } => format!("发生日期: {}", period.label()),
+            CfKind::Blanks { blank, .. } => {
+                if *blank { "空值".into() } else { "非空值".into() }
+            }
+            CfKind::Errors { error, .. } => {
+                if *error { "错误值".into() } else { "无错误".into() }
+            }
             CfKind::Dup { unique, .. } => {
                 if *unique { "唯一值".into() } else { "重复值".into() }
             }
@@ -212,11 +480,59 @@ impl CfKind {
                 if *above { "高于平均值".into() } else { "低于平均值".into() }
             }
             CfKind::Expr { formula, .. } => format!("公式 {formula}"),
-            CfKind::Scale { .. } => "色阶".into(),
-            CfKind::Bar { .. } => "数据条".into(),
-            CfKind::IconSet { set, .. } => format!("图标集 {set}"),
+            CfKind::Scale { points } => format!("{}色阶", points.len()),
+            CfKind::Bar { show_value, .. } => {
+                if *show_value { "数据条".into() } else { "数据条(仅显示条)".into() }
+            }
+            CfKind::IconSet { set, reverse, show_value, .. } => {
+                let mut s = format!("图标集 {set}");
+                if *reverse { s.push_str("(反转)"); }
+                if !*show_value { s.push_str("(仅图标)"); }
+                s
+            }
         }
     }
+}
+
+/// 从矩形列表中精确挖掉 `cut` 矩形，保留其余未重叠区域（最多拆成上下左右 4 块）。
+pub fn subtract_rect(
+    ranges: &[(u32, u32, u32, u32)],
+    cut: (u32, u32, u32, u32),
+) -> Vec<(u32, u32, u32, u32)> {
+    let (cr1, cc1, cr2, cc2) = (
+        cut.0.min(cut.2),
+        cut.1.min(cut.3),
+        cut.0.max(cut.2),
+        cut.1.max(cut.3),
+    );
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(r1, c1, r2, c2) in ranges {
+        if r2 < cr1 || r1 > cr2 || c2 < cc1 || c1 > cc2 {
+            out.push((r1, c1, r2, c2));
+            continue;
+        }
+        let ir1 = r1.max(cr1);
+        let ir2 = r2.min(cr2);
+        let ic1 = c1.max(cc1);
+        let ic2 = c2.min(cc2);
+        // 上方完整条
+        if r1 < ir1 {
+            out.push((r1, c1, ir1 - 1, c2));
+        }
+        // 下方完整条
+        if r2 > ir2 {
+            out.push((ir2 + 1, c1, r2, c2));
+        }
+        // 中间左侧条
+        if c1 < ic1 {
+            out.push((ir1, c1, ir2, ic1 - 1));
+        }
+        // 中间右侧条
+        if c2 > ic2 {
+            out.push((ir1, ic2 + 1, ir2, c2));
+        }
+    }
+    out
 }
 
 /// 图标集按「形状 + 级数」归类，渲染时据此画
@@ -238,6 +554,8 @@ pub struct IconMark {
     pub levels: u8,
     /// 0 = 最低档
     pub idx: u8,
+    /// false 时仅显示图标、隐藏单元格文本（对应 OOXML iconSet showValue="0"）
+    pub show_value: bool,
 }
 
 impl IconMark {
@@ -298,10 +616,13 @@ pub struct Overlay {
     pub fill: Option<[u8; 3]>,
     pub color: Option<[u8; 3]>,
     pub bold: bool,
+    pub italic: bool,
     /// 条件格式里指定的字体名（dxf 的 <font>）
     pub font: Option<String>,
-    /// 数据条：比例 0..1 与颜色
+    /// 数据条：比例 0..1 与颜色（保持向后兼容）
     pub bar: Option<(f32, [u8; 3])>,
+    /// 增强数据条：支持正负双向、零轴与隐藏数值
+    pub bar_ext: Option<BarOverlay>,
     /// 图标集
     pub icon: Option<IconMark>,
     /// 条件格式带来的差异边框（填充/字体之外的第四个维度）
@@ -313,8 +634,10 @@ impl Overlay {
         self.fill.is_none()
             && self.color.is_none()
             && !self.bold
+            && !self.italic
             && self.font.is_none()
             && self.bar.is_none()
+            && self.bar_ext.is_none()
             && self.icon.is_none()
             && self.border.is_none()
     }
@@ -1080,9 +1403,10 @@ enum LitVal<'a> {
     Text(&'a str),
 }
 
-/// 零分配解析公式里的比较值：数字、带引号文本或 `DATE(y,m,d)`。
+/// 零分配解析公式里的比较值：数字、带引号文本或 `DATE(y,m,d)`（自动剥离可选前导 `=`）。
 fn parse_lit_ref(s: &str) -> Option<LitVal<'_>> {
     let s = s.trim();
+    let s = s.strip_prefix('=').map(str::trim).unwrap_or(s);
     if let Some(inner) = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
         return Some(LitVal::Text(inner));
     }
@@ -1097,6 +1421,150 @@ fn parse_lit_ref(s: &str) -> Option<LitVal<'_>> {
         return crate::formula::date_to_serial_pub(y, m, d).map(LitVal::Number);
     }
     s.parse::<f64>().ok().map(LitVal::Number)
+}
+
+/// 解析 CellIs 的单格/公式参数：字面量优先；否则支持直接单元格引用（如 `$B$1`/`B1` 按相对偏移平移）或外部公式求值器。
+fn resolve_cell_is_arg<FV>(
+    expr_str: &str,
+    sheet: &Sheet,
+    dr: u32,
+    dc: u32,
+    eval_val: &mut FV,
+) -> Option<Value>
+where
+    FV: FnMut(&str, u32, u32) -> Option<Value>,
+{
+    if let Some(lit) = parse_lit_ref(expr_str) {
+        return Some(match lit {
+            LitVal::Number(n) => Value::Number(n),
+            LitVal::Text(t) => Value::Text(t.into()),
+        });
+    }
+    let clean = expr_str.trim().strip_prefix('=').unwrap_or(expr_str.trim()).trim();
+    if clean.is_empty() {
+        return None;
+    }
+    if let Some(v) = eval_val(clean, dr, dc) {
+        if !matches!(v, Value::Empty | Value::Error(_)) {
+            return Some(v);
+        }
+    }
+    // 轻量回退：当调用方未提供完整公式引擎时，仍直接解析单格引用（含相对平移）
+    let shifted = shift_formula(clean, dr, dc);
+    if let Some((rr, cc)) = parse_a1(&shifted) {
+        let v = sheet.value(rr, cc);
+        if !matches!(v, Value::Empty) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn resolve_cfvo_with_eval<FV>(
+    cfvo: &Cfvo,
+    bi: usize,
+    min: f64,
+    max: f64,
+    sorted: &[f64],
+    stats: &CfStats,
+    sheet: &Sheet,
+    eval_val: &mut FV,
+) -> f64
+where
+    FV: FnMut(&str, u32, u32) -> Option<Value>,
+{
+    match cfvo.kind {
+        CfvoKind::Percentile => stats
+            .percentiles
+            .get(&(bi, cfvo.val.to_bits()))
+            .copied()
+            .unwrap_or_else(|| cfvo.resolve(min, max, sorted)),
+        CfvoKind::Formula => {
+            let f = cfvo.formula.trim().strip_prefix('=').unwrap_or(cfvo.formula.trim()).trim();
+            if let Ok(n) = f.parse::<f64>() {
+                return n;
+            }
+            if let Some(Value::Number(n)) = eval_val(f, 0, 0)
+                && n.is_finite()
+            {
+                return n;
+            }
+            if let Some((rr, cc)) = parse_a1(f)
+                && let Value::Number(n) = sheet.value(rr, cc)
+                && n.is_finite()
+            {
+                return n;
+            }
+            cfvo.resolve(min, max, sorted)
+        }
+        _ => cfvo.resolve(min, max, sorted),
+    }
+}
+
+fn text_matches_op(op: TextOp, hay: &str, needle: &str) -> bool {
+    let matched = if hay.is_ascii() && needle.is_ascii() {
+        let hb = hay.as_bytes();
+        let nb = needle.as_bytes();
+        match op {
+            TextOp::Contains | TextOp::NotContains => {
+                if nb.is_empty() {
+                    true
+                } else if hb.len() < nb.len() {
+                    false
+                } else {
+                    let b0 = nb[0].to_ascii_lowercase();
+                    (0..=hb.len() - nb.len()).any(|idx| {
+                        hb[idx].to_ascii_lowercase() == b0
+                            && hb[idx..idx + nb.len()].eq_ignore_ascii_case(nb)
+                    })
+                }
+            }
+            TextOp::BeginsWith => {
+                hb.len() >= nb.len() && hb[..nb.len()].eq_ignore_ascii_case(nb)
+            }
+            TextOp::EndsWith => {
+                hb.len() >= nb.len() && hb[hb.len() - nb.len()..].eq_ignore_ascii_case(nb)
+            }
+        }
+    } else {
+        let hl = hay.to_lowercase();
+        let nl = needle.to_lowercase();
+        match op {
+            TextOp::Contains | TextOp::NotContains => hl.contains(&nl),
+            TextOp::BeginsWith => hl.starts_with(&nl),
+            TextOp::EndsWith => hl.ends_with(&nl),
+        }
+    };
+    if op == TextOp::NotContains { !matched } else { matched }
+}
+
+fn test_op_val(op: CfOp, v: &Value, a: &Value, b: Option<&Value>) -> bool {
+    let cmp = |lhs: &Value, rhs: &Value| -> Option<std::cmp::Ordering> {
+        match (lhs, rhs) {
+            (Value::Number(x), Value::Number(y)) => x.partial_cmp(y),
+            (Value::Text(x), Value::Text(y)) => Some(cmp_text_ci(x, y)),
+            (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+            _ => None,
+        }
+    };
+    match op {
+        CfOp::Less => matches!(cmp(v, a), Some(std::cmp::Ordering::Less)),
+        CfOp::LessEq => matches!(cmp(v, a), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
+        CfOp::Equal => matches!(cmp(v, a), Some(std::cmp::Ordering::Equal)),
+        CfOp::NotEqual => matches!(cmp(v, a), Some(o) if o != std::cmp::Ordering::Equal),
+        CfOp::GreaterEq => matches!(cmp(v, a), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+        CfOp::Greater => matches!(cmp(v, a), Some(std::cmp::Ordering::Greater)),
+        CfOp::Between => {
+            let Some(b) = b else { return false };
+            matches!(cmp(v, a), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
+                && matches!(cmp(v, b), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
+        }
+        CfOp::NotBetween => {
+            let Some(b) = b else { return false };
+            !(matches!(cmp(v, a), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
+                && matches!(cmp(v, b), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)))
+        }
+    }
 }
 
 #[inline]
@@ -1199,6 +1667,37 @@ where
     RowRules::new(cf, r).overlay_at(stats, sheet, c, expr)
 }
 
+/// 带完整公式值求值器的条件格式叠加（统一供 Expr、CellIs 引用/公式 与 CfvoKind::Formula 共用，避免双闭包可变借用冲突）。
+pub fn overlay_at_with_eval<FV>(
+    cf: &CfSheet,
+    stats: &CfStats,
+    sheet: &Sheet,
+    r: u32,
+    c: u32,
+    eval_val: FV,
+) -> Overlay
+where
+    FV: FnMut(&str, u32, u32) -> Option<Value>,
+{
+    RowRules::new(cf, r).overlay_at_with_eval_on_day(stats, sheet, c, eval_val, None)
+}
+
+/// 同 `overlay_at_with_eval`，额外允许注入 `today_serial` 以便日期规则单元测试可完全确定性复现。
+pub fn overlay_at_with_eval_on_day<FV>(
+    cf: &CfSheet,
+    stats: &CfStats,
+    sheet: &Sheet,
+    r: u32,
+    c: u32,
+    eval_val: FV,
+    today_serial: i64,
+) -> Overlay
+where
+    FV: FnMut(&str, u32, u32) -> Option<Value>,
+{
+    RowRules::new(cf, r).overlay_at_with_eval_on_day(stats, sheet, c, eval_val, Some(today_serial))
+}
+
 /// Sparse row interval lookup for all ranges in the active rule definitions.
 #[derive(Default)]
 pub struct RuleIndex {
@@ -1250,13 +1749,49 @@ impl<'a> RowRules<'a> {
     }
 
     pub fn overlay_at<F>(&self, stats: &CfStats, sheet: &Sheet, c: u32, mut expr: F) -> Overlay
-    where F: FnMut(&str, u32, u32) -> bool {
+    where
+        F: FnMut(&str, u32, u32) -> bool,
+    {
+        self.overlay_at_with_eval_on_day(
+            stats,
+            sheet,
+            c,
+            move |f, dr, dc| Some(Value::Bool(expr(f, dr, dc))),
+            None,
+        )
+    }
+
+    pub fn overlay_at_with_eval<FV>(
+        &self,
+        stats: &CfStats,
+        sheet: &Sheet,
+        c: u32,
+        eval_val: FV,
+    ) -> Overlay
+    where
+        FV: FnMut(&str, u32, u32) -> Option<Value>,
+    {
+        self.overlay_at_with_eval_on_day(stats, sheet, c, eval_val, None)
+    }
+
+    pub fn overlay_at_with_eval_on_day<FV>(
+        &self,
+        stats: &CfStats,
+        sheet: &Sheet,
+        c: u32,
+        mut eval_val: FV,
+        today_override: Option<i64>,
+    ) -> Overlay
+    where
+        FV: FnMut(&str, u32, u32) -> Option<Value>,
+    {
         let cf = self.cf;
         let r = self.row;
         let mut out = Overlay::default();
         if self.order.is_empty() { return out; }
         let raw_cow = sheet.value_ref(r, c);
         let raw = raw_cow.as_ref();
+        let mut cached_today: Option<i64> = today_override;
         for &(_, bi, ri) in &self.order {
             let block = &cf.blocks[bi];
             if !in_block(block, r, c) { continue; }
@@ -1266,51 +1801,95 @@ impl<'a> RowRules<'a> {
                 .first()
                 .map(|(r1, c1, _, _)| (*r1, *c1))
                 .unwrap_or((0, 0));
+            let dr = r.saturating_sub(ar);
+            let dc = c.saturating_sub(ac);
             let mut hit = false;
             match &rule.kind {
                 CfKind::CellIs { op, a, b, dxf } => {
                     if matches!(raw, Value::Empty) {
                         continue;
                     }
-                    let Some(av) = parse_lit_ref(a) else {
-                        continue;
-                    };
-                    let bv = if matches!(op, CfOp::Between | CfOp::NotBetween) {
-                        let Some(bv) = parse_lit_ref(b) else {
-                            continue;
+                    // 零分配快路径：字面量直接比较；含单元格引用/公式时回退至完整值求值
+                    if let Some(av) = parse_lit_ref(a) {
+                        if matches!(op, CfOp::Between | CfOp::NotBetween) {
+                            if let Some(bv) = parse_lit_ref(b) {
+                                if test_op_lit(*op, raw, av, Some(bv)) {
+                                    apply_dxf(cf, *dxf, &mut out);
+                                    hit = true;
+                                }
+                            } else if let Some(bv_val) = resolve_cell_is_arg(b, sheet, dr, dc, &mut eval_val) {
+                                let av_val = match av {
+                                    LitVal::Number(n) => Value::Number(n),
+                                    LitVal::Text(t) => Value::Text(t.into()),
+                                };
+                                if test_op_val(*op, raw, &av_val, Some(&bv_val)) {
+                                    apply_dxf(cf, *dxf, &mut out);
+                                    hit = true;
+                                }
+                            }
+                        } else if test_op_lit(*op, raw, av, None) {
+                            apply_dxf(cf, *dxf, &mut out);
+                            hit = true;
+                        }
+                    } else if let Some(av_val) = resolve_cell_is_arg(a, sheet, dr, dc, &mut eval_val) {
+                        let bv_val = if matches!(op, CfOp::Between | CfOp::NotBetween) {
+                            let Some(v) = resolve_cell_is_arg(b, sheet, dr, dc, &mut eval_val) else {
+                                continue;
+                            };
+                            Some(v)
+                        } else {
+                            None
                         };
-                        Some(bv)
-                    } else {
-                        None
-                    };
-                    if test_op_lit(*op, raw, av, bv) {
-                        apply_dxf(cf, *dxf, &mut out);
-                        hit = true;
+                        if test_op_val(*op, raw, &av_val, bv_val.as_ref()) {
+                            apply_dxf(cf, *dxf, &mut out);
+                            hit = true;
+                        }
                     }
                 }
                 CfKind::Text { contains, dxf } => {
                     if let Value::Text(t) = raw {
-                        let matched = if t.is_ascii() && contains.is_ascii() {
-                            if contains.is_empty() {
-                                true
-                            } else if t.len() < contains.len() {
-                                false
-                            } else {
-                                let tb = t.as_bytes();
-                                let cb = contains.as_bytes();
-                                let b0 = cb[0].to_ascii_lowercase();
-                                (0..=tb.len() - cb.len()).any(|idx| {
-                                    tb[idx].to_ascii_lowercase() == b0
-                                        && tb[idx..idx + cb.len()].eq_ignore_ascii_case(cb)
-                                })
-                            }
-                        } else {
-                            t.to_lowercase().contains(&contains.to_lowercase())
-                        };
-                        if matched {
+                        if text_matches_op(TextOp::Contains, t, contains) {
                             apply_dxf(cf, *dxf, &mut out);
                             hit = true;
                         }
+                    }
+                }
+                CfKind::TextMatch { op, text, dxf } => {
+                    let matched = match raw {
+                        Value::Text(t) => text_matches_op(*op, t, text),
+                        Value::Empty => *op == TextOp::NotContains && !text.is_empty(),
+                        _ => raw.with_display_str(|s| text_matches_op(*op, s, text)),
+                    };
+                    if matched {
+                        apply_dxf(cf, *dxf, &mut out);
+                        hit = true;
+                    }
+                }
+                CfKind::TimePeriod { period, dxf } => {
+                    if let Value::Number(v) = raw {
+                        let today = *cached_today.get_or_insert_with(today_excel_serial);
+                        if period.matches_serial(*v, today) {
+                            apply_dxf(cf, *dxf, &mut out);
+                            hit = true;
+                        }
+                    }
+                }
+                CfKind::Blanks { blank, dxf } => {
+                    let is_blank = match raw {
+                        Value::Empty => true,
+                        Value::Text(s) => s.trim().is_empty(),
+                        _ => false,
+                    };
+                    if is_blank == *blank {
+                        apply_dxf(cf, *dxf, &mut out);
+                        hit = true;
+                    }
+                }
+                CfKind::Errors { error, dxf } => {
+                    let is_err = matches!(raw, Value::Error(_));
+                    if is_err == *error {
+                        apply_dxf(cf, *dxf, &mut out);
+                        hit = true;
                     }
                 }
                 CfKind::Dup { unique, dxf } => {
@@ -1376,8 +1955,12 @@ impl<'a> RowRules<'a> {
                     }
                 }
                 CfKind::Expr { formula, dxf } => {
-                    // 公式相对块左上角书写，计算时按相对位移平移
-                    if expr(formula, r.saturating_sub(ar), c.saturating_sub(ac)) {
+                    let truthy = match eval_val(formula, dr, dc) {
+                        Some(Value::Bool(b)) => b,
+                        Some(Value::Number(n)) => n != 0.0 && n.is_finite(),
+                        _ => false,
+                    };
+                    if truthy {
                         apply_dxf(cf, *dxf, &mut out);
                         hit = true;
                     }
@@ -1388,13 +1971,7 @@ impl<'a> RowRules<'a> {
                         if points.len() <= 8 {
                             let mut stack_abs = [(0.0f64, [0u8; 3]); 8];
                             for (dst, (t, col)) in stack_abs.iter_mut().zip(points.iter()) {
-                                let resolved = if t.kind == CfvoKind::Percentile
-                                    && let Some(&pv) = stats.percentiles.get(&(bi, t.val.to_bits()))
-                                {
-                                    pv
-                                } else {
-                                    t.resolve(*min, *max, sorted)
-                                };
+                                let resolved = resolve_cfvo_with_eval(t, bi, *min, *max, sorted, stats, sheet, &mut eval_val);
                                 *dst = (resolved, *col);
                             }
                             if let Some(rgb) = scale_color(&stack_abs[..points.len()], *v)
@@ -1406,14 +1983,7 @@ impl<'a> RowRules<'a> {
                             let abs: Vec<(f64, [u8; 3])> = points
                                 .iter()
                                 .map(|(t, col)| {
-                                    let resolved = if t.kind == CfvoKind::Percentile
-                                        && let Some(&pv) =
-                                            stats.percentiles.get(&(bi, t.val.to_bits()))
-                                    {
-                                        pv
-                                    } else {
-                                        t.resolve(*min, *max, sorted)
-                                    };
+                                    let resolved = resolve_cfvo_with_eval(t, bi, *min, *max, sorted, stats, sheet, &mut eval_val);
                                     (resolved, *col)
                                 })
                                 .collect();
@@ -1425,22 +1995,14 @@ impl<'a> RowRules<'a> {
                         }
                     }
                 }
-                CfKind::IconSet { set, reverse, thresholds, .. } => {
+                CfKind::IconSet { set, reverse, thresholds, show_value } => {
                     if let (Value::Number(v), Some((min, max))) = (&raw, stats.ranges.get(&bi)) {
                         let (min, max) = (*min, *max);
                         if let Some((style, levels)) = IconMark::from_set(set) {
-                            // 阈值是「各档下限」；第一档通常是最小值
                             let sorted = stats.sorted.get(&bi).map_or(&[][..], Vec::as_slice);
                             let mut idx = 0u8;
                             for (i, th) in thresholds.iter().enumerate().skip(1) {
-                                let t = if th.kind == CfvoKind::Percentile
-                                    && let Some(&pv) =
-                                        stats.percentiles.get(&(bi, th.val.to_bits()))
-                                {
-                                    pv
-                                } else {
-                                    th.resolve(min, max, sorted)
-                                };
+                                let t = resolve_cfvo_with_eval(th, bi, min, max, sorted, stats, sheet, &mut eval_val);
                                 if *v >= t {
                                     idx = i as u8;
                                 } else {
@@ -1452,30 +2014,64 @@ impl<'a> RowRules<'a> {
                                 style,
                                 levels,
                                 idx: idx.min(levels.saturating_sub(1)),
+                                show_value: *show_value,
                             });
                         }
                     }
                 }
-                CfKind::Bar { color, min: lo, max: hi } => {
+                CfKind::Bar { color, neg_color, min: lo, max: hi, show_value } => {
                     if let (Value::Number(v), Some((min, max))) = (&raw, stats.ranges.get(&bi)) {
                         let sorted = stats.sorted.get(&bi).map_or(&[][..], Vec::as_slice);
-                        let a = if lo.kind == CfvoKind::Percentile
-                            && let Some(&pv) = stats.percentiles.get(&(bi, lo.val.to_bits()))
-                        {
-                            pv
+                        let a = resolve_cfvo_with_eval(lo, bi, *min, *max, sorted, stats, sheet, &mut eval_val);
+                        let b = resolve_cfvo_with_eval(hi, bi, *min, *max, sorted, stats, sheet, &mut eval_val);
+                        let neg_col = neg_color.unwrap_or([220, 53, 69]);
+                        if a < 0.0 && b > 0.0 {
+                            // 跨零双向数据条：零轴位于 |a| / (b - a)，正值向右、负值向左
+                            let span = (b - a).max(f64::MIN_POSITIVE);
+                            let zero_pos = ((-a) / span).clamp(0.0, 1.0) as f32;
+                            let val_pos = ((*v - a) / span).clamp(0.0, 1.0) as f32;
+                            let is_neg = *v < 0.0;
+                            let (start, end, bar_col) = if is_neg {
+                                (val_pos, zero_pos, neg_col)
+                            } else {
+                                (zero_pos, val_pos, *color)
+                            };
+                            let frac = (end - start).clamp(0.0, 1.0);
+                            out.bar = Some((frac, bar_col));
+                            out.bar_ext = Some(BarOverlay {
+                                start,
+                                end,
+                                axis: Some(zero_pos),
+                                color: bar_col,
+                                is_neg,
+                                show_value: *show_value,
+                            });
+                        } else if b <= 0.0 && a < b {
+                            // 全负区间：零轴在最右侧，负值向左延伸
+                            let span = (0.0 - a).max(f64::MIN_POSITIVE);
+                            let frac = ((-(*v).min(0.0)) / span).clamp(0.0, 1.0) as f32;
+                            out.bar = Some((frac, neg_col));
+                            out.bar_ext = Some(BarOverlay {
+                                start: 1.0 - frac,
+                                end: 1.0,
+                                axis: Some(1.0),
+                                color: neg_col,
+                                is_neg: true,
+                                show_value: *show_value,
+                            });
                         } else {
-                            lo.resolve(*min, *max, sorted)
-                        };
-                        let b = if hi.kind == CfvoKind::Percentile
-                            && let Some(&pv) = stats.percentiles.get(&(bi, hi.val.to_bits()))
-                        {
-                            pv
-                        } else {
-                            hi.resolve(*min, *max, sorted)
-                        };
-                        let span = (b - a).max(f64::MIN_POSITIVE);
-                        let t = ((v - a) / span).clamp(0.0, 1.0) as f32;
-                        out.bar = Some((t, *color));
+                            let span = (b - a).max(f64::MIN_POSITIVE);
+                            let t = ((*v - a) / span).clamp(0.0, 1.0) as f32;
+                            out.bar = Some((t, *color));
+                            out.bar_ext = Some(BarOverlay {
+                                start: 0.0,
+                                end: t,
+                                axis: None,
+                                color: *color,
+                                is_neg: false,
+                                show_value: *show_value,
+                            });
+                        }
                     }
                 }
             }
@@ -1510,6 +2106,7 @@ fn apply_dxf(cf: &CfSheet, idx: usize, out: &mut Overlay) {
             }
         }
         out.bold |= d.bold;
+        out.italic |= d.italic;
     }
 }
 
@@ -1905,7 +2502,7 @@ mod tests {
         let cf = CfSheet {
             blocks: vec![CfBlock {
                 ranges: vec![(0, 0, 1, 0)],
-                rules: vec![CfRule { kind: CfKind::Bar { color: [99, 142, 198], min: Cfvo::min(), max: Cfvo::max() }, stop: false, priority: 1 }],
+                rules: vec![CfRule { kind: CfKind::bar_default([99, 142, 198], Cfvo::min(), Cfvo::max()), stop: false, priority: 1 }],
             }],
             dxfs: vec![],
             unknown_ext: false,
@@ -1945,7 +2542,7 @@ mod tests {
         let mut sh = sheet_with(&[(10, 0, 5.0), (20, 0, 25.0)]);
         sh.cf.blocks.push(CfBlock {
             ranges: vec![(10, 0, 20, 0)],
-            rules: vec![CfRule { kind: CfKind::Bar { color: [0; 3], min: Cfvo::min(), max: Cfvo::max() }, stop: false, priority: 1 }],
+            rules: vec![CfRule { kind: CfKind::bar_default([0; 3], Cfvo::min(), Cfvo::max()), stop: false, priority: 1 }],
         });
         let mut st = CfStats::default();
         assert!(refresh_stats(&sh, &mut st));
@@ -2158,8 +2755,13 @@ pub fn xml_has_cf_ext(xml: &str) -> bool {
 }
 
 pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
+    parse_cf_blocks_with_theme(xml, &crate::style_theme::ThemeBook::default())
+}
+
+pub fn parse_cf_blocks_with_theme(xml: &str, theme: &crate::style_theme::ThemeBook) -> Vec<CfBlock> {
     let mut out: Vec<CfBlock> = Vec::new();
     let mut r = Reader::from_str(xml);
+    let indexed = crate::style_theme::DEFAULT_INDEXED_PALETTE;
     // 当前块、当前规则的临时状态
     let mut cur_block: Option<CfBlock> = None;
     let mut cur_rule: Option<(String, HashMap<String, String>)> = None;
@@ -2168,6 +2770,7 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
     let mut cfvo: Vec<Cfvo> = Vec::new();
     let mut cfvo_open: Option<Cfvo> = None;
     let mut bar_color: Option<[u8; 3]> = None;
+    let mut bar_show_value = true;
     let mut icon_set_name = String::new();
     let mut icon_reverse = false;
     let mut icon_show = true;
@@ -2197,6 +2800,7 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                     scale_colors.clear();
                     cfvo.clear();
                     bar_color = None;
+                    bar_show_value = true;
                     last_color = None;
                     icon_set_name.clear();
                     icon_reverse = false;
@@ -2216,39 +2820,46 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                             icon_show = v != "0" && v != "false";
                         }
                     }
+                } else if depth_rule > 0 && name.ends_with("dataBar") {
+                    depth_rule += 1;
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("showValue") {
+                            let v = a.value.to_string();
+                            bar_show_value = v != "0" && v != "false";
+                        }
+                    }
                 } else if depth_rule > 0 {
                     depth_rule += 1;
                     if name.ends_with("formula") {
                         text_buf.clear();
                     } else if name.ends_with("color") {
-                        for a in e.attributes().flatten() {
-                            if a.key.as_ref().ends_with("rgb") {
-                                last_color = hex_rgb(&a.value.to_string());
-                                let is_scale = cur_rule.as_ref().map(|(_, at)| at.get("type").map(|t| t.as_str()) == Some("colorScale")).unwrap_or(false);
-                                if is_scale {
-                                    if let Some(c) = last_color {
-                                        scale_colors.push(c);
-                                    }
-                                }
-                                if cur_rule.as_ref().map(|(_, at)| at.get("type").map(|t| t.as_str()) == Some("dataBar")).unwrap_or(false) {
-                                    bar_color = last_color;
-                                }
+                        if let Some(c) = crate::style_theme::resolve_color_attrs(&e, &theme.palette, &indexed) {
+                            last_color = Some(c);
+                            let rty = cur_rule.as_ref().and_then(|(_, at)| at.get("type").map(|t| t.as_str()));
+                            if rty == Some("colorScale") {
+                                scale_colors.push(c);
+                            } else if rty == Some("dataBar") {
+                                bar_color = Some(c);
                             }
                         }
                     } else if name.ends_with("cfvo") {
-                        // <cfvo type="percent" val="50"/> 或 <cfvo type="formula">…</cfvo>
                         let mut ty = String::new();
-                        let mut val: Option<f64> = None;
+                        let mut val_raw: Option<String> = None;
                         for a in e.attributes().flatten() {
                             let k = a.key.as_ref();
                             let v = crate::model::xml_unescape(&a.value.to_string());
                             if k.ends_with("val") {
-                                val = v.parse::<f64>().ok();
+                                val_raw = Some(v);
                             } else if k.ends_with("type") {
                                 ty = v;
                             }
                         }
-                        let cv = Cfvo::from_type(&ty, val);
+                        let mut cv = Cfvo::from_type(&ty, val_raw.as_deref().and_then(|s| s.parse::<f64>().ok()));
+                        if cv.kind == CfvoKind::Formula {
+                            if let Some(raw) = val_raw {
+                                cv.formula = raw;
+                            }
+                        }
                         text_buf.clear();
                         cfvo_open = Some(cv);
                     }
@@ -2257,36 +2868,52 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
             Ok(Event::Empty(e)) => {
                 let name = e.name();
                 let name = name.as_ref();
-                if depth_rule > 0 {
-                    if name.ends_with("color") {
+                if name.ends_with("cfRule") && !name.contains(':') {
+                    // 自闭合 <cfRule type="duplicateValues" dxfId="0" priority="1"/> 等规则
+                    if let Some(block) = cur_block.as_mut() {
+                        let mut attrs = HashMap::new();
                         for a in e.attributes().flatten() {
-                            if a.key.as_ref().ends_with("rgb") {
-                                last_color = hex_rgb(&a.value.to_string());
-                                let is_scale = cur_rule.as_ref().map(|(_, at)| at.get("type").map(|t| t.as_str()) == Some("colorScale")).unwrap_or(false);
-                                if is_scale {
-                                    if let Some(c) = last_color {
-                                        scale_colors.push(c);
-                                    }
-                                }
-                                if cur_rule.as_ref().map(|(_, at)| at.get("type").map(|t| t.as_str()) == Some("dataBar")).unwrap_or(false) {
-                                    bar_color = last_color;
-                                }
+                            attrs.insert(a.key.as_ref().to_string(), crate::model::xml_unescape(&a.value.to_string()));
+                        }
+                        if let Some(kind) = build_rule(&attrs, &[], &[], &None, None, true, "", false, true) {
+                            let priority = attrs.get("priority").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                            block.rules.push(CfRule {
+                                kind,
+                                stop: attrs.get("stopIfTrue").map(|v| v == "1" || v == "true").unwrap_or(false),
+                                priority,
+                            });
+                        }
+                    }
+                } else if depth_rule > 0 {
+                    if name.ends_with("color") {
+                        if let Some(c) = crate::style_theme::resolve_color_attrs(&e, &theme.palette, &indexed) {
+                            last_color = Some(c);
+                            let rty = cur_rule.as_ref().and_then(|(_, at)| at.get("type").map(|t| t.as_str()));
+                            if rty == Some("colorScale") {
+                                scale_colors.push(c);
+                            } else if rty == Some("dataBar") {
+                                bar_color = Some(c);
                             }
                         }
                     } else if name.ends_with("cfvo") {
                         let mut ty = String::new();
-                        let mut val: Option<f64> = None;
+                        let mut val_raw: Option<String> = None;
                         for a in e.attributes().flatten() {
                             let k = a.key.as_ref();
                             let v = crate::model::xml_unescape(&a.value.to_string());
                             if k.ends_with("val") {
-                                val = v.parse::<f64>().ok();
+                                val_raw = Some(v);
                             } else if k.ends_with("type") {
                                 ty = v;
                             }
                         }
-                        cfvo.push(Cfvo::from_type(&ty, val));
-                        // <color> 紧跟在 cfvo 后面：先记着，交给下面统一收
+                        let mut cv = Cfvo::from_type(&ty, val_raw.as_deref().and_then(|s| s.parse::<f64>().ok()));
+                        if cv.kind == CfvoKind::Formula {
+                            if let Some(raw) = val_raw {
+                                cv.formula = raw;
+                            }
+                        }
+                        cfvo.push(cv);
                     }
                 }
             }
@@ -2308,13 +2935,16 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
                 let name = name.as_ref();
                 if name.ends_with("cfvo") {
                     if let Some(mut cv) = cfvo_open.take() {
-                        cv.formula = text_buf.trim().to_string();
+                        let trimmed = text_buf.trim();
+                        if !trimmed.is_empty() {
+                            cv.formula = trimmed.to_string();
+                        }
                         text_buf.clear();
                         cfvo.push(cv);
                     }
                 } else if name.ends_with("cfRule") {
                     if let (Some((_, attrs)), Some(block)) = (cur_rule.take(), cur_block.as_mut()) {
-                        if let Some(mut kind) = build_rule(&attrs, &formulas, &cfvo, &last_color, bar_color, &icon_set_name, icon_reverse, icon_show) {
+                        if let Some(mut kind) = build_rule(&attrs, &formulas, &cfvo, &last_color, bar_color, bar_show_value, &icon_set_name, icon_reverse, icon_show) {
                             if let CfKind::Scale { points } = &mut kind {
                                 if points.is_empty() {
                                     *points = cfvo
@@ -2358,12 +2988,14 @@ pub fn parse_cf_blocks(xml: &str) -> Vec<CfBlock> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_rule(
     attrs: &HashMap<String, String>,
     formulas: &[String],
     cfvo: &[Cfvo],
     last_color: &Option<[u8; 3]>,
     bar_color: Option<[u8; 3]>,
+    bar_show_value: bool,
     icon_set: &str,
     icon_reverse: bool,
     icon_show: bool,
@@ -2381,10 +3013,36 @@ fn build_rule(
                 dxf,
             }
         }
-        "containsText" | "beginsWith" | "endsWith" => CfKind::Text {
+        "containsText" => CfKind::Text {
             contains: attrs.get("text").cloned().unwrap_or_default(),
             dxf,
         },
+        "notContainsText" => CfKind::TextMatch {
+            op: TextOp::NotContains,
+            text: attrs.get("text").cloned().unwrap_or_default(),
+            dxf,
+        },
+        "beginsWith" => CfKind::TextMatch {
+            op: TextOp::BeginsWith,
+            text: attrs.get("text").cloned().unwrap_or_default(),
+            dxf,
+        },
+        "endsWith" => CfKind::TextMatch {
+            op: TextOp::EndsWith,
+            text: attrs.get("text").cloned().unwrap_or_default(),
+            dxf,
+        },
+        "timePeriod" => {
+            let period = attrs
+                .get("timePeriod")
+                .and_then(|s| TimePeriod::from_ooxml(s))
+                .unwrap_or(TimePeriod::Today);
+            CfKind::TimePeriod { period, dxf }
+        }
+        "containsBlanks" => CfKind::Blanks { blank: true, dxf },
+        "notContainsBlanks" => CfKind::Blanks { blank: false, dxf },
+        "containsErrors" => CfKind::Errors { error: true, dxf },
+        "notContainsErrors" => CfKind::Errors { error: false, dxf },
         "duplicateValues" => CfKind::Dup { unique: false, dxf },
         "uniqueValues" => CfKind::Dup { unique: true, dxf },
         "top10" => CfKind::Top {
@@ -2398,14 +3056,13 @@ fn build_rule(
             dxf,
         },
         "expression" => CfKind::Expr { formula: f0, dxf },
-        "colorScale" => {
-            // cfvo/color 交替：从 attrs 无法拿到，交给 scale_points（见调用方）
-            CfKind::Scale { points: Vec::new() }
-        }
+        "colorScale" => CfKind::Scale { points: Vec::new() },
         "dataBar" => CfKind::Bar {
             color: bar_color.or(*last_color).unwrap_or([99, 142, 198]),
+            neg_color: Some([220, 53, 69]),
             min: cfvo.first().cloned().unwrap_or_else(Cfvo::min),
             max: cfvo.get(1).cloned().unwrap_or_else(Cfvo::max),
+            show_value: bar_show_value,
         },
         "iconSet" => CfKind::IconSet {
             set: if icon_set.is_empty() {
@@ -2421,16 +3078,22 @@ fn build_rule(
     })
 }
 
-/// 解析 xl/styles.xml 里的 <dxfs>
+/// 解析 xl/styles.xml 里的 <dxfs>（使用默认主题调色板）
 pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
+    parse_dxfs_with_theme(xml, &crate::style_theme::ThemeBook::default())
+}
+
+/// 解析 xl/styles.xml 里的 <dxfs>（完整解析 rgb / theme+tint / indexed 含自定义调色板）
+pub fn parse_dxfs_with_theme(xml: &str, theme: &crate::style_theme::ThemeBook) -> Vec<Dxf> {
     let mut out = Vec::new();
+    let indexed_palette = crate::style_theme::parse_indexed_palette(xml);
+    let palette = &theme.palette;
     let mut r = Reader::from_str(xml);
     let mut in_dxfs = false;
     let mut cur: Option<Dxf> = None;
     let mut in_font = false;
     let mut in_fill = false;
     let mut in_border = false;
-    // 正在读对角/内部这类未建模边框：其中的 color 不能落进填充
     let mut skip_color = false;
     let mut side: Option<usize> = None;
 
@@ -2448,6 +3111,8 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
     fn on_open(
         e: &quick_xml::events::BytesStart<'_>,
         empty: bool,
+        palette: &[[u8; 3]],
+        indexed_palette: &[[u8; 3]; 64],
         in_dxfs: &mut bool,
         cur: &mut Option<Dxf>,
         in_font: &mut bool,
@@ -2483,7 +3148,6 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
                 "diagonal" | "vertical" | "horizontal" | "start" | "end"
             )
         {
-            // 未建模方向：读样式存在性即可，颜色不参与填充/四边
             *skip_color = true;
         }
         if name.ends_with("numFmt") {
@@ -2500,11 +3164,17 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
             return;
         }
         if *in_font && (lname0 == "b" || lname0.ends_with(":b")) {
-            d.bold = true;
+            let off = attr_val(e, "val").is_some_and(|v| v == "0" || v == "false");
+            if !off {
+                d.bold = true;
+            }
             return;
         }
         if *in_font && (lname0 == "i" || lname0.ends_with(":i")) {
-            d.italic = true;
+            let off = attr_val(e, "val").is_some_and(|v| v == "0" || v == "false");
+            if !off {
+                d.italic = true;
+            }
             return;
         }
         let lname = name.to_ascii_lowercase();
@@ -2512,7 +3182,6 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
         if *in_border
             && matches!(local, "diagonal" | "vertical" | "horizontal" | "start" | "end")
         {
-            // 未建模方向：样式存在性由 dxfs_unsupported 告警，这里不改四边、不碰填充
             *skip_color = true;
             return;
         }
@@ -2534,24 +3203,23 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
             return;
         }
         if lname.ends_with("color") {
-            for a in e.attributes().flatten() {
-                if a.key.as_ref().ends_with("rgb") {
-                    if let Some(c) = hex_rgb(&a.value.to_string()) {
-                        if *in_font {
-                            d.color = Some(c);
-                        } else if *skip_color {
-                            // 对角/内部边框的颜色：不写进填充
-                        } else if *in_border {
-                            if let Some(idx) = *side {
-                                if let Some(b) = d.border.as_mut() {
-                                    if let Some(slot) = b.sides[idx].as_mut() {
-                                        slot.1 = c;
-                                    }
-                                }
+            if let Some(c) = crate::style_theme::resolve_color_attrs(e, palette, indexed_palette) {
+                if *in_font {
+                    d.color = Some(c);
+                } else if *skip_color {
+                    // 对角/内部边框的颜色：不写进填充
+                } else if *in_border {
+                    if let Some(idx) = *side {
+                        if let Some(b) = d.border.as_mut() {
+                            if let Some(slot) = b.sides[idx].as_mut() {
+                                slot.1 = c;
                             }
-                        } else if *in_fill {
-                            d.fill = Some(c);
                         }
+                    }
+                } else if *in_fill {
+                    // patternFill 内 bgColor 与 fgColor：Excel dxf solid 填充优先用 bgColor，无 bgColor 时回退 fgColor
+                    if local == "bgcolor" || d.fill.is_none() {
+                        d.fill = Some(c);
                     }
                 }
             }
@@ -2561,12 +3229,12 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
     loop {
         match r.read_event() {
             Ok(Event::Start(e)) => on_open(
-                &e, false, &mut in_dxfs, &mut cur, &mut in_font, &mut in_fill, &mut in_border,
-                &mut skip_color, &mut side,
+                &e, false, palette, &indexed_palette, &mut in_dxfs, &mut cur, &mut in_font,
+                &mut in_fill, &mut in_border, &mut skip_color, &mut side,
             ),
             Ok(Event::Empty(e)) => on_open(
-                &e, true, &mut in_dxfs, &mut cur, &mut in_font, &mut in_fill, &mut in_border,
-                &mut skip_color, &mut side,
+                &e, true, palette, &indexed_palette, &mut in_dxfs, &mut cur, &mut in_font,
+                &mut in_fill, &mut in_border, &mut skip_color, &mut side,
             ),
             Ok(Event::End(e)) => {
                 let name = e.name().as_ref().to_string();
@@ -2586,6 +3254,9 @@ pub fn parse_dxfs(xml: &str) -> Vec<Dxf> {
                 } else if name.ends_with("dxf") {
                     side = None;
                     in_font = false;
+                    in_fill = false;
+                    in_border = false;
+                    skip_color = false;
                     if let Some(d) = cur.take() {
                         out.push(d);
                     }

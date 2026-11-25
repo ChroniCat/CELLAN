@@ -15,9 +15,7 @@ fn sample() -> Chart {
                 cat_ref: "Sheet1!$A$2:$A$3".into(),
                 val_ref: "Sheet1!$B$2:$B$3".into(),
                 color: Some([0xE0, 0x4A, 0x2F]),
-                xv: Vec::new(),
-                kind: None,
-                secondary: false,
+                ..Series::default()
             },
             Series {
                 name: "二季".into(),
@@ -27,25 +25,18 @@ fn sample() -> Chart {
                 cat_ref: "Sheet1!$A$2:$A$3".into(),
                 val_ref: "Sheet1!$C$2:$C$3".into(),
                 color: Some([0x2E, 0x86, 0xC1]),
-                xv: Vec::new(),
-                kind: None,
-                secondary: false,
+                ..Series::default()
             },
         ],
         legend: true,
         anchor: (0, 0, 8, 6),
         legend_pos: "r".into(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: sheetcore::charts::LabelOpts::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
         axis_x: "月份".into(),
         axis_y: "件数".into(),
         y_fmt: "0.0".into(),
         y_min: Some(0.0),
         y_max: Some(100.0),
+        ..Chart::default()
     }
 }
 

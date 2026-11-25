@@ -1167,7 +1167,9 @@ fn home_page_clean_minimal_layout_without_subtitle_sidecards_or_preset_templates
         joined2.contains("report_8.xlsx"),
         "900p 高度下最近打开卡片应自适应铺满并显示第 8 条记录，实际：\n{joined2}"
     );
-    assert_eq!(templates::ALL.len(), 1);
+    // 主页保持极简（只展示『空白工作簿』+『打开本地文件』），后台「新建」内置 1 个空白 + 6 套财务模板
+    assert_eq!(templates::ALL.len(), 7);
+    assert_eq!(templates::ALL[0].name, "空白工作簿");
 }
 
 #[test]

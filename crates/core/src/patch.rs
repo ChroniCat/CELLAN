@@ -534,7 +534,6 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                         "<cfRule type=\"containsText\" operator=\"containsText\" text=\"{}\" dxfId=\"{dxf}\" priority=\"{prio}\"{stop}>",
                         esc(contains)
                     ));
-                    // Excel 里包含文本还带一个 SEARCH 公式，用于部分阅读器
                     let anchor = b.ranges.first().map(|r| format!("{}{}", crate::model::col_label(r.1), r.0 + 1)).unwrap_or_else(|| "A1".into());
                     out.push_str(&format!(
                         "<formula>NOT(ISERROR(SEARCH(\"{}\",{})))</formula>",
@@ -542,6 +541,52 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                         anchor
                     ));
                     out.push_str("</cfRule>");
+                }
+                CfKind::TextMatch { op, text, dxf } => {
+                    let ty = op.ooxml_type();
+                    let oper = op.ooxml_operator();
+                    let anchor = b.ranges.first().map(|r| format!("{}{}", crate::model::col_label(r.1), r.0 + 1)).unwrap_or_else(|| "A1".into());
+                    let fml = match op {
+                        crate::cf::TextOp::Contains => format!("NOT(ISERROR(SEARCH(\"{}\",{})))", esc(text), anchor),
+                        crate::cf::TextOp::NotContains => format!("ISERROR(SEARCH(\"{}\",{}))", esc(text), anchor),
+                        crate::cf::TextOp::BeginsWith => format!("LEFT({},{})= \"{}\"", anchor, text.chars().count(), esc(text)),
+                        crate::cf::TextOp::EndsWith => format!("RIGHT({},{})=\"{}\"", anchor, text.chars().count(), esc(text)),
+                    };
+                    out.push_str(&format!(
+                        "<cfRule type=\"{ty}\" operator=\"{oper}\" text=\"{}\" dxfId=\"{dxf}\" priority=\"{prio}\"{stop}><formula>{fml}</formula></cfRule>",
+                        esc(text)
+                    ));
+                }
+                CfKind::TimePeriod { period, dxf } => {
+                    let tp = period.as_ooxml();
+                    let anchor = b.ranges.first().map(|r| format!("{}{}", crate::model::col_label(r.1), r.0 + 1)).unwrap_or_else(|| "A1".into());
+                    out.push_str(&format!(
+                        "<cfRule type=\"timePeriod\" timePeriod=\"{tp}\" dxfId=\"{dxf}\" priority=\"{prio}\"{stop}><formula>FLOOR({anchor},1)=TODAY()</formula></cfRule>"
+                    ));
+                }
+                CfKind::Blanks { blank, dxf } => {
+                    let ty = if *blank { "containsBlanks" } else { "notContainsBlanks" };
+                    let anchor = b.ranges.first().map(|r| format!("{}{}", crate::model::col_label(r.1), r.0 + 1)).unwrap_or_else(|| "A1".into());
+                    let fml = if *blank {
+                        format!("LEN(TRIM({anchor}))=0")
+                    } else {
+                        format!("LEN(TRIM({anchor}))&gt;0")
+                    };
+                    out.push_str(&format!(
+                        "<cfRule type=\"{ty}\" dxfId=\"{dxf}\" priority=\"{prio}\"{stop}><formula>{fml}</formula></cfRule>"
+                    ));
+                }
+                CfKind::Errors { error, dxf } => {
+                    let ty = if *error { "containsErrors" } else { "notContainsErrors" };
+                    let anchor = b.ranges.first().map(|r| format!("{}{}", crate::model::col_label(r.1), r.0 + 1)).unwrap_or_else(|| "A1".into());
+                    let fml = if *error {
+                        format!("ISERROR({anchor})")
+                    } else {
+                        format!("NOT(ISERROR({anchor}))")
+                    };
+                    out.push_str(&format!(
+                        "<cfRule type=\"{ty}\" dxfId=\"{dxf}\" priority=\"{prio}\"{stop}><formula>{fml}</formula></cfRule>"
+                    ));
                 }
                 CfKind::Dup { unique, dxf } => {
                     let ty = if *unique { "uniqueValues" } else { "duplicateValues" };
@@ -594,8 +639,9 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                     }
                     out.push_str("</iconSet></cfRule>");
                 }
-                CfKind::Bar { color, min, max } => {
-                    out.push_str(&format!("<cfRule type=\"dataBar\" priority=\"{prio}\"{stop}><dataBar>"));
+                CfKind::Bar { color, neg_color: _, min, max, show_value } => {
+                    let sv = if *show_value { "" } else { " showValue=\"0\"" };
+                    out.push_str(&format!("<cfRule type=\"dataBar\" priority=\"{prio}\"{stop}><dataBar{sv}>"));
                     out.push_str(&cfvo_xml(min));
                     out.push_str(&cfvo_xml(max));
                     out.push_str(&format!("<color rgb=\"FF{:02X}{:02X}{:02X}\"/>", color[0], color[1], color[2]));
@@ -629,10 +675,10 @@ pub fn strip_cf(xml: &str) -> String {
 
 /// 把条件格式块插到 worksheet 里正确的位置（mergeCells 之后、dataValidations 之前）
 pub fn insert_cf(xml: &str, blocks_xml: &str) -> String {
-    if blocks_xml.is_empty() {
-        return xml.to_string();
-    }
     let xml = strip_cf(xml);
+    if blocks_xml.is_empty() {
+        return xml;
+    }
     const ANCHORS: [&str; 10] = [
         "<dataValidations",
         "<hyperlinks",
@@ -839,8 +885,17 @@ pub fn dv_xml(list: &[crate::dv::DataValidation]) -> String {
             out.push_str(&format!(" prompt=\"{}\"", esc(&d.prompt_msg)));
         }
         let f1 = match d.kind {
-            DvKind::List if !d.f1.trim_start().starts_with('"') && !d.f1.contains('!') && !d.f1.contains(':') => {
-                format!("\"{}\"", d.f1)
+            DvKind::List => {
+                let t = d.f1.trim();
+                let is_formula_or_ref = t.starts_with('"')
+                    || t.starts_with('=')
+                    || t.contains('!')
+                    || t.contains(':');
+                if !is_formula_or_ref && (t.contains(',') || t.contains('，')) {
+                    format!("\"{}\"", t.replace('，', ","))
+                } else {
+                    d.f1.clone()
+                }
             }
             _ => d.f1.clone(),
         };
@@ -1098,6 +1153,8 @@ pub fn auto_filter_xml_with_dxfs(
         .keys()
         .chain(f.date_groups.keys())
         .chain(f.color_filters.keys())
+        .chain(f.top_filters.keys())
+        .chain(f.dynamic_filters.keys())
     {
         if !cols.contains(c) {
             cols.push(*c);
@@ -1109,6 +1166,22 @@ pub fn auto_filter_xml_with_dxfs(
             continue;
         }
         let col_id = col - c1;
+        if let Some(tf) = f.top_filters.get(&col) {
+            out.push_str(&format!(
+                "<filterColumn colId=\"{col_id}\"><top10 top=\"{}\" percent=\"{}\" val=\"{}\"/></filterColumn>",
+                if tf.top { 1 } else { 0 },
+                if tf.percent { 1 } else { 0 },
+                tf.count.max(1)
+            ));
+            continue;
+        }
+        if let Some(df) = f.dynamic_filters.get(&col) {
+            out.push_str(&format!(
+                "<filterColumn colId=\"{col_id}\"><dynamicFilter type=\"{}\"/></filterColumn>",
+                df.as_ooxml()
+            ));
+            continue;
+        }
         if let Some(cf) = f.color_filters.get(&col) {
             match cf {
                 crate::sort_filter::ColorFilter::Fill(None) => {
@@ -1144,27 +1217,62 @@ pub fn auto_filter_xml_with_dxfs(
             continue;
         }
         if let Some(crit) = f.criteria.get(&col) {
-            // 条件筛选：介于写成两条 and="1"
-            out.push_str(&format!(
-                "<filterColumn colId=\"{col_id}\"><customFilters and=\"1\">"
-            ));
-            match crit.op {
-                crate::sort_filter::CmpOp::Between => {
-                    let hi = crit.val2.clone().unwrap_or_default();
-                    out.push_str(&format!(
-                        "<customFilter operator=\"greaterThanOrEqual\" val=\"{}\"/>",
-                        esc(&crit.val)
-                    ));
-                    out.push_str(&format!(
-                        "<customFilter operator=\"lessThanOrEqual\" val=\"{}\"/>",
-                        esc(&hi)
-                    ));
+            // 条件筛选：介于写成两条 and="1"；文本筛选使用 OOXML 标准 equal/notEqual + 通配符
+            let esc_wild = |s: &str| -> String {
+                let mut out = String::with_capacity(s.len());
+                for ch in s.chars() {
+                    if matches!(ch, '~' | '*' | '?') {
+                        out.push('~');
+                    }
+                    out.push(ch);
                 }
-                op => out.push_str(&format!(
-                    "<customFilter operator=\"{}\" val=\"{}\"/>",
-                    op.xml_operator(),
+                out
+            };
+            let write_one_custom = |out: &mut String, op: crate::sort_filter::CmpOp, val: &str| {
+                match op {
+                    crate::sort_filter::CmpOp::Contains => {
+                        let pat = format!("*{}*", esc_wild(val));
+                        out.push_str(&format!("<customFilter operator=\"equal\" val=\"{}\"/>", esc(&pat)));
+                    }
+                    crate::sort_filter::CmpOp::NotContains => {
+                        let pat = format!("*{}*", esc_wild(val));
+                        out.push_str(&format!("<customFilter operator=\"notEqual\" val=\"{}\"/>", esc(&pat)));
+                    }
+                    crate::sort_filter::CmpOp::Begins => {
+                        let pat = format!("{}*", esc_wild(val));
+                        out.push_str(&format!("<customFilter operator=\"equal\" val=\"{}\"/>", esc(&pat)));
+                    }
+                    crate::sort_filter::CmpOp::Ends => {
+                        let pat = format!("*{}", esc_wild(val));
+                        out.push_str(&format!("<customFilter operator=\"equal\" val=\"{}\"/>", esc(&pat)));
+                    }
+                    other => out.push_str(&format!(
+                        "<customFilter operator=\"{}\" val=\"{}\"/>",
+                        other.xml_operator(),
+                        esc(val)
+                    )),
+                }
+            };
+            let is_and = crit.second.as_ref().map(|(a, _, _)| *a).unwrap_or(true);
+            let and_attr = if is_and { " and=\"1\"" } else { "" };
+            out.push_str(&format!(
+                "<filterColumn colId=\"{col_id}\"><customFilters{and_attr}>"
+            ));
+            if crit.op == crate::sort_filter::CmpOp::Between {
+                let hi = crit.val2.clone().unwrap_or_default();
+                out.push_str(&format!(
+                    "<customFilter operator=\"greaterThanOrEqual\" val=\"{}\"/>",
                     esc(&crit.val)
-                )),
+                ));
+                out.push_str(&format!(
+                    "<customFilter operator=\"lessThanOrEqual\" val=\"{}\"/>",
+                    esc(&hi)
+                ));
+            } else {
+                write_one_custom(&mut out, crit.op, &crit.val);
+                if let Some((_, op2, val2)) = &crit.second {
+                    write_one_custom(&mut out, *op2, val2);
+                }
             }
             out.push_str("</customFilters></filterColumn>");
             continue;
@@ -1581,67 +1689,124 @@ fn strip_tag(xml: &str, tag: &str) -> String {
     let mut out = String::with_capacity(xml.len());
     let mut rest = xml;
     while let Some(i) = rest.find(&open) {
+        let after = rest.as_bytes().get(i + open.len()).copied();
+        if !matches!(after, Some(b' ' | b'>' | b'/' | b'\t' | b'\r' | b'\n')) {
+            out.push_str(&rest[..i + open.len()]);
+            rest = &rest[i + open.len()..];
+            continue;
+        }
         out.push_str(&rest[..i]);
-        if let Some(e) = rest[i..].find(&close) {
-            rest = &rest[i + e + close.len()..];
-        } else if let Some(e) = rest[i..].find("/>") {
-            rest = &rest[i + e + 2..];
-        } else {
+        let tail = &rest[i..];
+        let Some(gt) = tail.find('>') else {
             rest = "";
+            break;
+        };
+        if tail[..gt].ends_with('/') {
+            rest = &tail[gt + 1..];
+        } else if let Some(e) = tail[gt + 1..].find(&close) {
+            rest = &tail[gt + 1 + e + close.len()..];
+        } else {
+            rest = &tail[gt + 1..];
         }
     }
     out.push_str(rest);
     out
 }
 
-/// 改工作表里的页面设置：四段一起重写，插在 </worksheet> 前（顺序按 schema）
-pub fn set_page_xml(xml: &str, ps: &crate::page::PageSetup) -> String {
-    let mut x = xml.to_string();
-    for t in ["printOptions", "pageMargins", "pageSetup", "headerFooter"] {
-        x = strip_tag(&x, t);
+/// 序列化 `<headerFooter>` 元素（含首页不同 / 奇偶页不同）
+fn header_footer_xml(ps: &crate::page::PageSetup) -> String {
+    let any = !ps.header.is_empty()
+        || !ps.footer.is_empty()
+        || (ps.different_first_page && (!ps.first_header.is_empty() || !ps.first_footer.is_empty()))
+        || (ps.different_odd_even && (!ps.even_header.is_empty() || !ps.even_footer.is_empty()));
+    if !any {
+        return String::new();
     }
-    let mut body = String::new();
-    if ps.gridlines || ps.headings || ps.center_h || ps.center_v {
-        body.push_str(&format!(
-            "<printOptions gridLines=\"{}\" headings=\"{}\" horizontalCentered=\"{}\" verticalCentered=\"{}\"/>",
-            if ps.gridlines { 1 } else { 0 },
-            if ps.headings { 1 } else { 0 },
-            if ps.center_h { 1 } else { 0 },
-            if ps.center_v { 1 } else { 0 }
+    let mut out = String::from("<headerFooter");
+    if ps.different_first_page {
+        out.push_str(" differentFirst=\"1\"");
+    }
+    if ps.different_odd_even {
+        out.push_str(" differentOddEven=\"1\"");
+    }
+    out.push('>');
+    if !ps.header.is_empty() {
+        out.push_str(&format!("<oddHeader>{}</oddHeader>", esc(&ps.header)));
+    }
+    if !ps.footer.is_empty() {
+        out.push_str(&format!("<oddFooter>{}</oddFooter>", esc(&ps.footer)));
+    }
+    if ps.different_odd_even {
+        if !ps.even_header.is_empty() {
+            out.push_str(&format!("<evenHeader>{}</evenHeader>", esc(&ps.even_header)));
+        }
+        if !ps.even_footer.is_empty() {
+            out.push_str(&format!("<evenFooter>{}</evenFooter>", esc(&ps.even_footer)));
+        }
+    }
+    if ps.different_first_page {
+        if !ps.first_header.is_empty() {
+            out.push_str(&format!("<firstHeader>{}</firstHeader>", esc(&ps.first_header)));
+        }
+        if !ps.first_footer.is_empty() {
+            out.push_str(&format!("<firstFooter>{}</firstFooter>", esc(&ps.first_footer)));
+        }
+    }
+    out.push_str("</headerFooter>");
+    out
+}
+
+/// 序列化 `<pageSetup .../>` 完整属性（含分页顺序、黑白/草稿、起始页码、批注与错误打印策略）
+fn page_setup_attrs_xml(p: &crate::page::PageSetup) -> String {
+    let landscape = if p.landscape { "landscape" } else { "portrait" };
+    let fit = if p.fit_to_page {
+        format!(
+            " fitToWidth=\"{}\" fitToHeight=\"{}\"",
+            p.fit_width, p.fit_height
+        )
+    } else {
+        String::new()
+    };
+    let scale = if p.fit_to_page {
+        String::new()
+    } else {
+        format!(" scale=\"{}\"", p.scale.clamp(10, 400))
+    };
+    let mut extra = String::new();
+    if p.page_order_over_then_down {
+        extra.push_str(" pageOrder=\"overThenDown\"");
+    }
+    if p.black_and_white {
+        extra.push_str(" blackAndWhite=\"1\"");
+    }
+    if p.draft {
+        extra.push_str(" draft=\"1\"");
+    }
+    if let Some(fpn) = p.first_page_number {
+        extra.push_str(&format!(
+            " useFirstPageNumber=\"1\" firstPageNumber=\"{fpn}\""
         ));
     }
-    body.push_str(&format!(
-        "<pageMargins left=\"{}\" right=\"{}\" top=\"{}\" bottom=\"{}\" header=\"{}\" footer=\"{}\"/>",
-        ps.margins[0], ps.margins[1], ps.margins[2], ps.margins[3], ps.margins[4], ps.margins[5]
-    ));
-    body.push_str(&format!(
-        "<pageSetup paperSize=\"{}\" orientation=\"{}\" {} fitToWidth=\"{}\" fitToHeight=\"{}\" scale=\"{}\"/>",
-        ps.paper,
-        if ps.landscape { "landscape" } else { "portrait" },
-        "",
-        if ps.fit_to_page { ps.fit_width } else { 0 },
-        if ps.fit_to_page { ps.fit_height } else { 0 },
-        if ps.fit_to_page { 100 } else { ps.scale }
-    ));
-    if !ps.header.is_empty() || !ps.footer.is_empty() {
-        body.push_str("<headerFooter>");
-        if !ps.header.is_empty() {
-            body.push_str(&format!("<oddHeader>{}</oddHeader>", esc(&ps.header)));
-        }
-        if !ps.footer.is_empty() {
-            body.push_str(&format!("<oddFooter>{}</oddFooter>", esc(&ps.footer)));
-        }
-        body.push_str("</headerFooter>");
+    match p.print_comments {
+        1 => extra.push_str(" cellComments=\"atEnd\""),
+        2 => extra.push_str(" cellComments=\"asDisplayed\""),
+        _ => {}
     }
-    if let Some(i) = x.find("</worksheet>") {
-        let mut out = String::with_capacity(x.len() + body.len());
-        out.push_str(&x[..i]);
-        out.push_str(&body);
-        out.push_str(&x[i..]);
-        return out;
+    match p.print_errors {
+        1 => extra.push_str(" errors=\"blank\""),
+        2 => extra.push_str(" errors=\"dash\""),
+        3 => extra.push_str(" errors=\"NA\""),
+        _ => {}
     }
-    x.push_str(&body);
-    x
+    format!(
+        "<pageSetup paperSize=\"{}\" orientation=\"{landscape}\"{scale}{fit}{extra}/>",
+        p.paper
+    )
+}
+
+/// 改工作表里的页面设置：严格按 ISO/IEC 29500 Schema 顺序插在 `<drawing>/<tableParts>/<extLst>/</worksheet>` 之前
+pub fn set_page_xml(xml: &str, ps: &crate::page::PageSetup) -> String {
+    set_page_setup(xml, ps)
 }
 
 /// 更新 workbook.xml 里某张表的 Print_Area / Print_Titles
@@ -2906,10 +3071,19 @@ pub(crate) fn rewrite_zip_skip_where(
     Ok(())
 }
 
-/// 写/删工作表保护标签（schema 位置：紧跟 </sheetData> 之后）
+/// 写/删工作表保护标签及允许编辑区域（schema 位置：紧跟 </sheetData> 之后）
 pub fn set_sheet_protection(
     xml: &str,
     prot: Option<&crate::protection::SheetProtection>,
+) -> String {
+    set_sheet_protection_and_ranges(xml, prot, None)
+}
+
+/// 同时写回 `<sheetProtection>` 与 `<protectedRanges>`（`ranges = Some(...)` 时重写 `<protectedRanges>`）
+pub fn set_sheet_protection_and_ranges(
+    xml: &str,
+    prot: Option<&crate::protection::SheetProtection>,
+    ranges: Option<&[crate::protection::ProtectedRange]>,
 ) -> String {
     let mut x = xml.to_string();
     while let Some(i) = x.find("<sheetProtection") {
@@ -2919,107 +3093,257 @@ pub fn set_sheet_protection(
             break;
         }
     }
-    let Some(p) = prot else { return x };
-    let tag = p.to_xml();
+    if ranges.is_some() {
+        x = strip_tag(&x, "protectedRanges");
+    }
+    let mut insert_xml = String::new();
+    if let Some(p) = prot {
+        insert_xml.push_str(&p.to_xml());
+    }
+    if let Some(rs) = ranges {
+        insert_xml.push_str(&crate::protection::protected_ranges_to_xml(rs));
+    }
+    if insert_xml.is_empty() {
+        return x;
+    }
     if let Some(i) = x.find("</sheetData>") {
         let at = i + "</sheetData>".len();
-        x.insert_str(at, &tag);
+        x.insert_str(at, &insert_xml);
     } else if let Some(i) = x.find("<sheetData/>") {
         let at = i + "<sheetData/>".len();
-        x.insert_str(at, &tag);
+        x.insert_str(at, &insert_xml);
     }
     x
 }
 
-/// 保存收尾：只给改过保护状态的表写 <sheetProtection>
+/// 保存收尾：只给改过保护状态或允许编辑区域的表写 `<sheetProtection>` / `<protectedRanges>`
 pub fn apply_protection(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
-    if !wb.sheets.iter().any(|s| s.protect_dirty) {
+    if !wb.sheets.iter().any(|s| s.protect_dirty || s.protected_ranges_dirty) {
         return Ok(());
     }
     let targets = sheet_targets(path)?;
     let mut map: std::collections::HashMap<
         String,
-        Option<crate::protection::SheetProtection>,
+        (
+            Option<crate::protection::SheetProtection>,
+            Option<Vec<crate::protection::ProtectedRange>>,
+        ),
     > = std::collections::HashMap::new();
     for s in &wb.sheets {
-        if s.protect_dirty {
+        if s.protect_dirty || s.protected_ranges_dirty {
             if let Some(part) = targets.get(&s.name) {
-                map.insert(part.clone(), s.protection.clone());
+                let ranges = (s.protected_ranges_dirty || !s.protected_ranges.is_empty())
+                    .then(|| s.protected_ranges.clone());
+                map.insert(part.clone(), (s.protection.clone(), ranges));
             }
         }
     }
     if map.is_empty() {
         return Ok(());
     }
-    rewrite_sheet_metadata(path, &map, |xml, p| Ok(set_sheet_protection(xml, p.as_ref())))
+    rewrite_sheet_metadata(path, &map, |xml, (p, rs)| {
+        Ok(set_sheet_protection_and_ranges(xml, p.as_ref(), rs.as_deref()))
+    })
 }
 
-/// 页面设置写回：printOptions / pageMargins / pageSetup 三个元素
-pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
-    let mut x = xml.to_string();
-    for tag in ["printOptions", "pageMargins", "pageSetup"] {
-        while let Some(i) = x.find(&format!("<{tag}")) {
-            if let Some(gt) = x[i..].find('>') {
-                x.replace_range(i..i + gt + 1, "");
+/// 写回 `<sheetView zoomScale showGridLines showRowColHeaders>` 属性（保留已有 `<pane>` 等子元素）
+pub fn set_sheet_view_xml(
+    xml: &str,
+    zoom_scale: u16,
+    show_gridlines: bool,
+    show_headings: bool,
+) -> String {
+    let z = zoom_scale.clamp(10, 400);
+    let mut extra = String::new();
+    if z != 100 {
+        extra.push_str(&format!(" zoomScale=\"{z}\""));
+    }
+    if !show_gridlines {
+        extra.push_str(" showGridLines=\"0\"");
+    }
+    if !show_headings {
+        extra.push_str(" showRowColHeaders=\"0\"");
+    }
+    let mut found = None;
+    let mut from = 0usize;
+    while let Some(rel) = xml[from..].find("<sheetView") {
+        let i = from + rel;
+        let after = xml[i + "<sheetView".len()..].chars().next();
+        if matches!(after, Some(' ') | Some('>') | Some('/')) {
+            found = Some(i);
+            break;
+        }
+        from = i + 1;
+    }
+    let Some(i) = found else {
+        if extra.is_empty() {
+            return xml.to_string();
+        }
+        let anchor = xml
+            .find("<sheetFormatPr")
+            .or_else(|| xml.find("<cols"))
+            .or_else(|| xml.find("<sheetData"));
+        let Some(at) = anchor else {
+            return xml.to_string();
+        };
+        let block = format!("<sheetViews><sheetView{extra} workbookViewId=\"0\"/></sheetViews>");
+        let mut out = String::with_capacity(xml.len() + block.len());
+        out.push_str(&xml[..at]);
+        out.push_str(&block);
+        out.push_str(&xml[at..]);
+        return out;
+    };
+    let Some(gt_rel) = xml[i..].find('>') else {
+        return xml.to_string();
+    };
+    let gt = i + gt_rel;
+    let tag = &xml[i..=gt];
+    let strip_attr = |src: &str, attr: &str| -> String {
+        let pat = format!(" {attr}=\"");
+        let mut cur = src;
+        let mut out = String::with_capacity(src.len());
+        while let Some(p) = cur.find(&pat) {
+            out.push_str(&cur[..p]);
+            let rest = &cur[p + pat.len()..];
+            if let Some(q) = rest.find('"') {
+                cur = &rest[q + 1..];
             } else {
+                cur = "";
                 break;
             }
         }
+        out.push_str(cur);
+        out
+    };
+    let mut clean = strip_attr(tag, "zoomScale");
+    clean = strip_attr(&clean, "showGridLines");
+    clean = strip_attr(&clean, "showRowColHeaders");
+    if !extra.is_empty() {
+        if let Some(slash) = clean.rfind("/>") {
+            clean.insert_str(slash, &extra);
+        } else if let Some(end_gt) = clean.rfind('>') {
+            clean.insert_str(end_gt, &extra);
+        }
     }
-    let landscape = if p.landscape { "landscape" } else { "portrait" };
-    let fit = if p.fit_to_page {
-        format!(
-            " fitToWidth=\"{}\" fitToHeight=\"{}\"",
-            p.fit_width, p.fit_height
-        )
-    } else {
-        String::new()
+    let mut out = String::with_capacity(xml.len() + extra.len());
+    out.push_str(&xml[..i]);
+    out.push_str(&clean);
+    out.push_str(&xml[gt + 1..]);
+    out
+}
+
+/// 保存收尾：只给改过视图状态的表写回 `<sheetView>`
+pub fn apply_sheet_views(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
+    if !wb.sheets.iter().any(|s| s.view_dirty) {
+        return Ok(());
+    }
+    let targets = sheet_targets(path)?;
+    let mut map: std::collections::HashMap<String, (u16, bool, bool)> = std::collections::HashMap::new();
+    for s in &wb.sheets {
+        if s.view_dirty {
+            if let Some(part) = targets.get(&s.name) {
+                map.insert(part.clone(), (s.zoom_scale, s.show_gridlines, s.show_headings));
+            }
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    rewrite_sheet_metadata(path, &map, |xml, &(z, g, h)| {
+        Ok(set_sheet_view_xml(xml, z, g, h))
+    })
+}
+
+/// 写/删工作簿保护标签 `<workbookProtection .../>`（OOXML 顺序：`<workbookPr>` 后、`<bookViews>`/`<sheets>` 前）
+pub fn set_workbook_protection(
+    xml: &str,
+    prot: Option<&crate::protection::WorkbookProtection>,
+) -> String {
+    let mut x = xml.to_string();
+    while let Some(i) = x.find("<workbookProtection") {
+        if let Some(gt) = x[i..].find('>') {
+            x.replace_range(i..i + gt + 1, "");
+        } else {
+            break;
+        }
+    }
+    let Some(p) = prot else {
+        return x;
     };
-    let scale = if p.fit_to_page {
-        String::new()
-    } else {
-        format!(" scale=\"{}\"", p.scale.clamp(10, 400))
-    };
-    let block = format!(
+    let tag = p.to_xml();
+    let markers = ["<bookViews", "<sheets", "<definedNames", "<calcPr", "</workbook>"];
+    let at = markers
+        .iter()
+        .filter_map(|m| x.find(m))
+        .min()
+        .unwrap_or(x.len());
+    x.insert_str(at, &tag);
+    x
+}
+
+/// 保存收尾：把工作簿结构/窗口保护写回 `xl/workbook.xml`
+pub fn apply_workbook_protection(
+    path: &std::path::Path,
+    wb: &crate::model::Workbook,
+) -> anyhow::Result<()> {
+    if !wb.protection_dirty {
+        return Ok(());
+    }
+    let part = "xl/workbook.xml";
+    let bytes = crate::fixups::read_part(path, part).context("缺少工作簿部件")?;
+    let xml = crate::xlsx::patch_xml_text(&bytes, part)?;
+    let next = set_workbook_protection(&xml, wb.protection.as_ref());
+    if next != xml {
+        crate::patch::append_entry(path, part, next.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// 页面设置写回：严格按 OOXML Schema 顺序写回 printOptions / pageMargins / pageSetup / headerFooter / rowBreaks / colBreaks
+pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
+    let mut x = xml.to_string();
+    for tag in ["printOptions", "pageMargins", "pageSetup", "headerFooter", "rowBreaks", "colBreaks"] {
+        x = strip_tag(&x, tag);
+    }
+    let page_setup_el = page_setup_attrs_xml(p);
+    let hf_el = header_footer_xml(p);
+    let mut block = format!(
         "<printOptions gridLines=\"{}\" headings=\"{}\" horizontalCentered=\"{}\" verticalCentered=\"{}\"/>\
 <pageMargins left=\"{}\" right=\"{}\" top=\"{}\" bottom=\"{}\" header=\"{}\" footer=\"{}\"/>\
-<pageSetup paperSize=\"{}\" orientation=\"{landscape}\"{scale}{fit}/>",
+{page_setup_el}{hf_el}",
         if p.gridlines { 1 } else { 0 },
         if p.headings { 1 } else { 0 },
         if p.center_h { 1 } else { 0 },
         if p.center_v { 1 } else { 0 },
         p.margins[0], p.margins[1], p.margins[2], p.margins[3], p.margins[4], p.margins[5],
-        p.paper,
     );
-    let mut breaks = String::new();
     if !p.row_breaks.is_empty() {
-        breaks.push_str(&format!(
+        block.push_str(&format!(
             "<rowBreaks count=\"{}\" manualBreakCount=\"{}\">",
             p.row_breaks.len(),
             p.row_breaks.len()
         ));
         for r in &p.row_breaks {
-            breaks.push_str(&format!("<brk id=\"{r}\" max=\"16383\" man=\"1\"/>"));
+            block.push_str(&format!("<brk id=\"{r}\" max=\"16383\" man=\"1\"/>"));
         }
-        breaks.push_str("</rowBreaks>");
+        block.push_str("</rowBreaks>");
     }
     if !p.col_breaks.is_empty() {
-        breaks.push_str(&format!(
+        block.push_str(&format!(
             "<colBreaks count=\"{}\" manualBreakCount=\"{}\">",
             p.col_breaks.len(),
             p.col_breaks.len()
         ));
         for c in &p.col_breaks {
-            breaks.push_str(&format!("<brk id=\"{c}\" max=\"1048575\" man=\"1\"/>"));
+            block.push_str(&format!("<brk id=\"{c}\" max=\"1048575\" man=\"1\"/>"));
         }
-        breaks.push_str("</colBreaks>");
+        block.push_str("</colBreaks>");
     }
     // fitToPage 由 sheetPr/pageSetUpPr 控制；不关掉的话 Excel 会忽略 scale
     let fit_flag = if p.fit_to_page { "1" } else { "0" };
     if let Some(sp) = x.find("<sheetPr") {
         let end = x[sp..].find('>').map(|e| sp + e + 1).unwrap_or(sp);
         if x[sp..end].ends_with("/>") {
-            // <sheetPr/> 自闭合：展开成带 pageSetUpPr 的形式
             let inner = format!("<pageSetUpPr fitToPage=\"{fit_flag}\"/>");
             let open = x[sp..end].replace("/>", ">");
             x.replace_range(sp..end, &format!("{open}{inner}</sheetPr>"));
@@ -3034,12 +3358,14 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
                 let v1 = tag[v0..].find('"').map(|q| v0 + q).unwrap_or(v0);
                 newtag.replace_range(v0..v1, fit_flag);
             } else {
-                newtag = newtag.replacen("<pageSetUpPr", &format!("<pageSetUpPr fitToPage=\"{fit_flag}\" "), 1);
+                newtag = newtag.replacen(
+                    "<pageSetUpPr",
+                    &format!("<pageSetUpPr fitToPage=\"{fit_flag}\" "),
+                    1,
+                );
             }
             x.replace_range(at..=pe, &newtag);
         } else {
-            // schema 顺序：tabColor → outlinePr → pageSetUpPr。不能紧贴
-            // <sheetPr> 开标签插入，否则会跑到已有的 outlinePr 前面。
             fn after_child(xml: &str, start: usize, tag: &str) -> Option<usize> {
                 let rel = xml.get(start..)?.find(&format!("<{tag}"))?;
                 let at = start + rel;
@@ -3058,33 +3384,26 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
                 .unwrap_or(end);
             x.insert_str(at, &format!("<pageSetUpPr fitToPage=\"{fit_flag}\"/>"));
         }
-    } else {
-        // 没有 sheetPr：作为 worksheet 的第一个子元素插入（不能插到 XML 声明后面）
-        if let Some(ws) = x.find("<worksheet") {
-            if let Some(gt) = x[ws..].find('>') {
-                let at = ws + gt + 1;
-                x.insert_str(
-                    at,
-                    &format!("<sheetPr><pageSetUpPr fitToPage=\"{fit_flag}\"/></sheetPr>"),
-                );
-            }
-        }
-    }
-    // 旧的分页符先清掉，避免重复
-    for tag in ["rowBreaks", "colBreaks"] {
-        while let Some(i) = x.find(&format!("<{tag}")) {
-            let Some(rel) = x[i..].find(&format!("</{tag}>")) else { break };
-            let end = i + rel + format!("</{tag}>").len();
-            x.replace_range(i..end, "");
-        }
+    } else if let Some(ws) = x.find("<worksheet")
+        && let Some(gt) = x[ws..].find('>')
+    {
+        let at = ws + gt + 1;
+        x.insert_str(
+            at,
+            &format!("<sheetPr><pageSetUpPr fitToPage=\"{fit_flag}\"/></sheetPr>"),
+        );
     }
     let markers = [
-        "<headerFooter",
-        "<rowBreaks",
-        "<colBreaks",
         "<customProperties",
+        "<cellWatches",
+        "<ignoredErrors",
+        "<smartTags",
         "<drawing",
         "<legacyDrawing",
+        "<picture",
+        "<oleObjects",
+        "<controls",
+        "<webPublishItems",
         "<tableParts",
         "<extLst",
         "</worksheet>",
@@ -3095,14 +3414,6 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
         .min()
         .unwrap_or(x.len());
     x.insert_str(at, &block);
-    if !breaks.is_empty() {
-        // schema：rowBreaks/colBreaks 在 headerFooter 之后
-        let after = x
-            .find("</headerFooter>")
-            .map(|e| e + "</headerFooter>".len())
-            .unwrap_or_else(|| x.find("</worksheet>").unwrap_or(x.len()));
-        x.insert_str(after, &breaks);
-    }
     x
 }
 
@@ -3150,12 +3461,21 @@ pub fn apply_rich(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow
     rewrite_sheet_xml(path, &map, |xml, cells| crate::richtext::patch_sheet_rich(xml, cells))
 }
 
-/// 读 workbook.xml 里每张表的可见性：true = hidden
+/// 读 workbook.xml 里每张表的可见性：true = hidden / veryHidden
 pub fn read_sheet_states(path: &std::path::Path) -> std::collections::HashMap<String, bool> {
     workbook_xml(path).map(|xml| sheet_states_xml(&xml)).unwrap_or_default()
 }
 
 pub(crate) fn sheet_states_xml(xml: &str) -> std::collections::HashMap<String, bool> {
+    sheet_visibility_xml(xml)
+        .into_iter()
+        .map(|(k, v)| (k, v != crate::model::SheetVisibility::Visible))
+        .collect()
+}
+
+pub(crate) fn sheet_visibility_xml(
+    xml: &str,
+) -> std::collections::HashMap<String, crate::model::SheetVisibility> {
     let mut out = std::collections::HashMap::new();
     let mut from = 0usize;
     while let Some(i) = xml[from..].find("<sheet ") {
@@ -3171,19 +3491,24 @@ pub(crate) fn sheet_states_xml(xml: &str) -> std::collections::HashMap<String, b
             Some(crate::model::xml_unescape(&rest[..q]))
         };
         if let Some(name) = attr("name") {
-            out.insert(name, attr("state").as_deref() == Some("hidden"));
+            let vis = match attr("state").as_deref() {
+                Some("veryHidden") => crate::model::SheetVisibility::VeryHidden,
+                Some("hidden") => crate::model::SheetVisibility::Hidden,
+                _ => crate::model::SheetVisibility::Visible,
+            };
+            out.insert(name, vis);
         }
     }
     out
 }
 
-/// 保存收尾：把工作表可见性写回 workbook.xml（只处理 dirty 的表）
+/// 保存收尾：把工作表可见性（visible / hidden / veryHidden）写回 workbook.xml（只处理 dirty 的表）
 pub fn apply_sheet_states(path: &std::path::Path, wb: &crate::model::Workbook) -> anyhow::Result<()> {
-    let want: std::collections::HashMap<String, bool> = wb
+    let want: std::collections::HashMap<String, crate::model::SheetVisibility> = wb
         .sheets
         .iter()
         .filter(|s| s.hidden_dirty)
-        .map(|s| (s.name.clone(), s.hidden))
+        .map(|s| (s.name.clone(), s.visibility()))
         .collect();
     if want.is_empty() {
         return Ok(());
@@ -3192,7 +3517,7 @@ pub fn apply_sheet_states(path: &std::path::Path, wb: &crate::model::Workbook) -
     let bytes = crate::fixups::read_part(path,part).context("缺少工作簿部件")?;
     let xml = crate::xlsx::patch_xml_text(&bytes, part)?;
     // 至少要留一张可见表
-    if !wb.sheets.iter().any(|s| !s.hidden) {
+    if !wb.sheets.iter().any(|s| !s.is_hidden()) {
         return Err(anyhow::anyhow!("不能把全部工作表都隐藏"));
     }
     let mut out = String::with_capacity(xml.len() + 32);
@@ -3215,7 +3540,7 @@ pub fn apply_sheet_states(path: &std::path::Path, wb: &crate::model::Workbook) -
         };
         let name = attr("name").map(|n| crate::model::xml_unescape(&n));
         match name.as_deref().and_then(|n| want.get(n).map(|h| (n, *h))) {
-            Some((_, hide)) => {
+            Some((_, vis)) => {
                 // 去掉旧的 state 属性再按需补
                 let mut clean = String::new();
                 let mut seg = tag;
@@ -3232,11 +3557,16 @@ pub fn apply_sheet_states(path: &std::path::Path, wb: &crate::model::Workbook) -
                     };
                     seg = &after[q + 1..];
                 }
-                if hide {
+                let state_attr = match vis {
+                    crate::model::SheetVisibility::Visible => None,
+                    crate::model::SheetVisibility::Hidden => Some(" state=\"hidden\""),
+                    crate::model::SheetVisibility::VeryHidden => Some(" state=\"veryHidden\""),
+                };
+                if let Some(attr_str) = state_attr {
                     if let Some(slash) = clean.rfind("/>") {
-                        clean.insert_str(slash, " state=\"hidden\"");
+                        clean.insert_str(slash, attr_str);
                     } else if let Some(gt2) = clean.rfind('>') {
-                        clean.insert_str(gt2, " state=\"hidden\"");
+                        clean.insert_str(gt2, attr_str);
                     }
                 }
                 out.push_str(&clean);
@@ -3635,7 +3965,7 @@ pub fn set_calc_iteration(xml: &str, iterate: bool, max_iterations: u32, max_cha
         ));
     }
     tag.push_str(if calc.self_closing { "/>" } else { ">" });
-    format!("{}{}{}", &xml[..calc.start], tag, &xml[calc.end..])
+    format!("{}{}{}", &xml[..calc.start], tag, &xml[calc.end + 1..])
 }
 
 fn fmt_change(v: f64) -> String {

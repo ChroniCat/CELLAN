@@ -906,7 +906,8 @@ fn sheet_handlers_update_references_dependencies_and_indexed_state() {
     app.wb.sheets.push(other);
     app.wb.names.push(("LocalValue".into(), Some(1), "Other!$A$1".into()));
     assert!(app.set_sheet_name(0, "源表"));
-    assert_eq!(app.undo.depth(), (0, 0));
+    // P0 #26: 工作表重命名应写入撤销栈而非清空已有撤销历史（1 条编辑 + 1 条改名）。
+    assert_eq!(app.undo.depth(), (2, 0));
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(1.0));
     put(&mut app.wb, 10.0);
     sheetcore::formula::recalc_dirty(&mut app.wb, &app.deps, &[(0, 0, 0)]);

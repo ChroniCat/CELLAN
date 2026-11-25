@@ -168,6 +168,7 @@ fn audit_1_3_close_prompts_on_named_dirty_file_and_autorecover_handles_unnamed()
         saved_unix_secs: 1,
         pid: std::process::id(),
         doc_uid: 987654,
+        ext: "xlsx".into(),
     };
     recovery::write_recovery_snapshot(&entry, &unnamed).unwrap();
     assert!(entry.snapshot_path().exists());
@@ -960,6 +961,208 @@ fn reg_m7_m8_l4_l7_ctrl_enter_cse_undo_merge_across_chart_filter_and_shortcuts()
     app.ribbon_action("Help", &ctx);
     assert!(app.help_open && !app.about_open);
     app.help_open = false;
+
+    drop(env);
+}
+
+#[test]
+fn p0_bleeding_fixes_app_regression_suite() {
+    let env = crate::test_env::TestEnv::new("p0-bleeding-app");
+    let ctx = egui::Context::default();
+    let mut app = new_app(&ctx);
+
+    // #10 decimals() UTF-8 currency prefix must not panic and adjusts decimals safely
+    let cny = app.wb.styles.intern(sheetcore::style::CellStyle {
+        format: "￥#,##0".into(),
+        ..Default::default()
+    });
+    app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(1234.5), formula: None });
+    app.wb.sheet_mut(0).set_style(0, 0, cny);
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.decimals(1);
+    assert_eq!(app.current_style().format, "￥#,##0.0");
+    app.decimals(-1);
+    assert_eq!(app.current_style().format, "￥#,##0");
+
+    // #19 '@' text format cell keeps '=1+1' as literal text instead of formula
+    let txt_sid = app.wb.styles.intern(sheetcore::style::CellStyle {
+        format: "@".into(),
+        ..Default::default()
+    });
+    app.wb.sheet_mut(0).set_style(1, 0, txt_sid);
+    app.sel = (1, 0);
+    app.sel_end = (1, 0);
+    app.begin_edit(Some("=1+1".into()));
+    assert!(app.commit_edit(None));
+    assert_eq!(app.wb.sheet(0).get(1, 0).unwrap().formula, None);
+    assert_eq!(app.wb.sheet(0).value(1, 0), Value::Text("=1+1".into()));
+
+    // #23 Ctrl+Z single press in real update() frame undoes ONLY ONCE (no double-trigger!)
+    app.sel = (2, 0);
+    app.sel_end = (2, 0);
+    app.begin_edit(Some("10".into()));
+    assert!(app.commit_edit(None));
+    app.sel = (3, 0);
+    app.sel_end = (3, 0);
+    app.begin_edit(Some("20".into()));
+    assert!(app.commit_edit(None));
+    let mut raw_z = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0))),
+        modifiers: egui::Modifiers { command: true, ctrl: true, ..Default::default() },
+        events: vec![egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers { command: true, ctrl: true, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let mut frame = eframe::Frame::_new_kittest();
+    let _ = ctx.run(raw_z.clone(), |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+    assert_eq!(app.wb.sheet(0).value(3, 0), Value::Empty, "first Ctrl+Z undoes A4");
+    assert_eq!(
+        app.wb.sheet(0).value(2, 0),
+        Value::Number(10.0),
+        "single Ctrl+Z must NOT double-trigger and undo A3"
+    );
+    // Clear key press for subsequent frames
+    raw_z.events.clear();
+    let _ = ctx.run(raw_z, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+
+    // #24 ProtectSheet from CtxAct & hidden formula blocks Evaluate Formula + ProtOp guards
+    app.wb.sheet_mut(0).set(4, 0, Cell { value: Value::Number(30.0), formula: Some("=10+20".into()) });
+    let hid_sid = app.wb.styles.intern(sheetcore::style::CellStyle {
+        locked: false,
+        hidden: true,
+        ..Default::default()
+    });
+    app.wb.sheet_mut(0).set_style(4, 0, hid_sid);
+    let mut prot = sheetcore::protection::SheetProtection::new_with_password("secret");
+    prot.perms.auto_filter = false;
+    app.wb.sheet_mut(0).protection = Some(prot);
+    app.ctx_menu_run(CtxAct::ProtectSheet, 0, &ctx);
+    assert!(
+        app.protect_dlg.as_ref().is_some_and(|d| d.unprotect),
+        "CtxAct::ProtectSheet on protected sheet must open unprotect verification dialog"
+    );
+    app.protect_dlg = None;
+    app.sel = (4, 0);
+    app.sel_end = (4, 0);
+    app.open_evaluate_formula();
+    assert!(app.eval_formula_dlg.is_none(), "hidden formula must not open Evaluate Formula");
+    app.begin_edit(None);
+    assert_eq!(
+        app.editing.as_ref().map(|e| e.buf.as_str()),
+        Some(""),
+        "F2 on unlocked+hidden formula must not leak formula text"
+    );
+    app.cancel_edit();
+    app.start_filter();
+    assert!(app.wb.sheet(0).filter.is_none(), "ProtOp::AutoFilter=false must block start_filter");
+    app.wb.sheet_mut(0).protection = None;
+
+    // #26 add_sheet and set_sheet_name preserve existing UndoStack instead of wiping it
+    app.sel = (5, 0);
+    app.sel_end = (5, 0);
+    app.begin_edit(Some("999".into()));
+    assert!(app.commit_edit(None));
+    let depth_before = app.undo.depth().0;
+    app.add_sheet();
+    assert_eq!(app.undo.depth().0, depth_before + 1, "add_sheet must push onto undo, not wipe it");
+    assert!(app.set_sheet_name(1, "明细表"));
+    assert_eq!(app.undo.depth().0, depth_before + 2, "rename_sheet must push onto undo, not wipe it");
+    assert!(app.apply_undo(false));
+    assert_eq!(app.wb.sheets[1].name, "Sheet2");
+    assert!(app.apply_undo(false));
+    assert_eq!(app.wb.sheets.len(), 1);
+    assert!(app.apply_undo(false));
+    assert_eq!(app.wb.sheet(0).value(5, 0), Value::Empty, "prior cell edit undo survived sheet ops");
+
+    // #27 filter_by_cell_value matches formatted percentage numbers properly
+    let pct_sid = app.wb.styles.intern(sheetcore::style::CellStyle {
+        format: "0%".into(),
+        ..Default::default()
+    });
+    app.wb.sheet_mut(0).set(10, 0, Cell { value: Value::Text("比率".into()), formula: None });
+    app.wb.sheet_mut(0).set(11, 0, Cell { value: Value::Number(0.15), formula: None });
+    app.wb.sheet_mut(0).set_style(11, 0, pct_sid);
+    app.wb.sheet_mut(0).set(12, 0, Cell { value: Value::Number(0.30), formula: None });
+    app.wb.sheet_mut(0).set_style(12, 0, pct_sid);
+    app.sel = (11, 0);
+    app.sel_end = (11, 0);
+    app.filter_by_cell_value();
+    assert!(!app.wb.sheet(0).hidden_rows.contains(&11), "0.15 row must stay visible");
+    assert!(app.wb.sheet(0).hidden_rows.contains(&12), "0.30 row must be hidden");
+    app.disable_filter();
+
+    // #28 DV formula validation + partial range carving on clear
+    let dv = sheetcore::dv::DataValidation {
+        ranges: vec![(20, 0, 25, 0)],
+        kind: sheetcore::dv::DvKind::Whole,
+        op: sheetcore::dv::DvOp::Between,
+        f1: "1".into(),
+        f2: "100".into(),
+        ..Default::default()
+    };
+    app.replace_validation_rule((20, 0, 25, 0), Some(dv));
+    assert!(app.check_dv_for_cell(20, 0, "=20+30", false).is_ok(), "=20+30 (50) must pass Whole 1..100");
+    assert!(app.check_dv_for_cell(20, 0, "=200+1", false).is_err(), "=200+1 (201) must fail Whole 1..100");
+    // Clear single cell (22, 0) must carve out only (22, 0), leaving 20..21 and 23..25 intact
+    assert!(app.replace_validation_rule((22, 0, 22, 0), None));
+    assert!(sheetcore::dv::find(&app.wb.sheet(0).dv, 22, 0).is_none());
+    assert!(sheetcore::dv::find(&app.wb.sheet(0).dv, 20, 0).is_some());
+    assert!(sheetcore::dv::find(&app.wb.sheet(0).dv, 25, 0).is_some());
+
+    // #29 Right-click PasteValues resets stale ps_op; PasteSpecial arithmetic wraps target formula;
+    // InsertFn starts clean formula; Outline level 1 collapses level 1 rows
+    app.wb.sheet_mut(0).set(30, 0, Cell { value: Value::Number(5.0), formula: None });
+    app.wb.sheet_mut(0).set(30, 1, Cell { value: Value::Number(10.0), formula: Some("=5+5".into()) });
+    app.sel = (30, 0);
+    app.sel_end = (30, 0);
+    app.clip_copy(false, &ctx);
+    app.ps_op = 1; // stale Add
+    app.sel = (30, 2);
+    app.sel_end = (30, 2);
+    app.wb.sheet_mut(0).set(30, 2, Cell { value: Value::Number(100.0), formula: None });
+    app.ctx_menu_run(CtxAct::PasteValues, 0, &ctx);
+    assert_eq!(app.wb.sheet(0).value(30, 2), Value::Number(5.0), "CtxAct::PasteValues must clear stale ps_op");
+    // Now explicit Paste Special Add onto formula cell B31 (=5+5) wraps formula -> =(5+5)+5 = 15
+    app.ps_kind = 1;
+    app.ps_op = 1;
+    app.sel = (30, 1);
+    app.sel_end = (30, 1);
+    app.paste_special_apply(&ctx);
+    assert_eq!(app.wb.sheet(0).get(30, 1).unwrap().formula.as_deref(), Some("=(5+5)+5"));
+    assert_eq!(app.wb.sheet(0).value(30, 1), Value::Number(15.0));
+
+    // InsertFn: on cell with existing number 100 starts clean =SUM(
+    app.wb.sheet_mut(0).set(31, 0, Cell { value: Value::Number(100.0), formula: None });
+    app.sel = (31, 0);
+    app.sel_end = (31, 0);
+    app.ribbon_action("InsertFn:SUM", &ctx);
+    assert_eq!(app.editing.as_ref().map(|e| e.buf.as_str()), Some("=SUM("));
+    app.cancel_edit();
+
+    // Outline level 1 collapses level-1 rows and marks layout_dirty
+    app.wb.sheet_mut(0).row_levels.insert(40, 1);
+    app.wb.sheet_mut(0).row_levels.insert(41, 1);
+    app.wb.sheet_mut(0).layout_dirty = false;
+    app.set_outline_level(true, 1);
+    assert!(app.wb.sheet(0).hidden_rows_user.contains(&40));
+    assert!(app.wb.sheet(0).layout_dirty);
+    app.set_outline_level(true, 2);
+    assert!(!app.wb.sheet(0).hidden_rows_user.contains(&40));
+
+    // Merged cell keyboard nav & begin_edit_at normalize to merge anchor
+    app.wb.sheet_mut(0).merge_range(50, 0, 51, 1);
+    app.sel = (51, 1);
+    app.sel_end = (51, 1);
+    app.begin_edit(Some("merged".into()));
+    assert_eq!(app.sel, (50, 0), "begin_edit_at must snap covered merge cell to anchor");
+    assert!(app.commit_edit(None));
+    assert_eq!(app.wb.sheet(0).value(50, 0), Value::Text("merged".into()));
 
     drop(env);
 }

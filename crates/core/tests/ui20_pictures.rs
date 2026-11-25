@@ -80,6 +80,7 @@ fn picture_inserted_in_memory_only_is_not_written_until_save() {
         data: Some(std::sync::Arc::new(png.clone())),
         ext: "png".into(),
         name: "图片 1".into(),
+        ..Default::default()
     });
     wb.sheets[0].pictures_dirty = true;
     drop(wb);
@@ -107,6 +108,7 @@ fn saved_picture_has_anchor_and_media_and_survives_a_second_save() {
         data: Some(std::sync::Arc::new(png.clone())),
         ext: "png".into(),
         name: "图片 1".into(),
+        ..Default::default()
     });
     wb.sheets[0].pictures_dirty = true;
     sheetcore::xlsx::save(&path, &wb).unwrap();
@@ -162,6 +164,7 @@ fn moved_picture_rewrites_anchor_and_deleting_it_removes_anchor() {
         data: Some(std::sync::Arc::new(png.clone())),
         ext: "png".into(),
         name: "图片 1".into(),
+        ..Default::default()
     });
     wb.sheets[0].pictures_dirty = true;
     sheetcore::xlsx::save(&path, &wb).unwrap();
@@ -204,7 +207,7 @@ fn two_sheets_saved_together_own_distinct_drawings_through_a_utf16_edit() {
                 let data = tiny_png();
                 sheet.pictures.push(Picture { rect: (index as u32,0,5,5), off: [0;4],
                     part: sheetcore::pic_write::memory_part(&data,"png"), data: Some(data.into()),
-                    ext:"png".into(), name: format!("pic{index}") });
+                    ext:"png".into(), name: format!("pic{index}"), ..Default::default() });
                 sheet.pictures_dirty = true;
             } else {
                 assert_eq!(sheet.pictures.len(),1);

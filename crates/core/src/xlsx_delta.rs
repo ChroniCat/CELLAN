@@ -487,6 +487,7 @@ pub(super) struct DeltaSummary {
     pub handled_freeze: bool,
     pub handled_filter: bool,
     pub handled_page: bool,
+    pub handled_note_sheets: HashSet<u64>,
     pub trusted_parts: HashMap<String, (u32, u64)>,
 }
 
@@ -2100,6 +2101,7 @@ pub(super) fn write_with_style_receipt(
     let mut any_freeze = false;
     let mut any_filter = false;
     let mut any_page = false;
+    let mut handled_note_sheets: HashSet<u64> = HashSet::new();
     let sst = signature(&mut zip, "xl/sharedStrings.xml");
     let style_part = signature(&mut zip, "xl/styles.xml");
     let style_xml = std::cell::OnceCell::new();
@@ -2234,6 +2236,7 @@ pub(super) fn write_with_style_receipt(
                     return Ok(DeltaSummary::default());
                 }
             }
+            handled_note_sheets.insert(sheet.identity);
         }
         formula_changed |= changes.formula_changed;
         let has_sheet_work = changes.dirty_count() > 0
@@ -2656,6 +2659,7 @@ pub(super) fn write_with_style_receipt(
         handled_freeze: any_freeze,
         handled_filter: any_filter && !any_color_filter_dirty,
         handled_page: any_page,
+        handled_note_sheets,
         trusted_parts,
     })
 }

@@ -431,7 +431,7 @@ fn biff_error_code(e: crate::formula::ErrKind) -> u8 {
         K::Name => 0x1D,
         K::Num => 0x24,
         K::Na => 0x2A,
-        K::Spill => 0x0F, // BIFF8 没有 #SPILL!，用 #VALUE! 兜底
+        K::Spill | K::Calc | K::Field => 0x0F, // BIFF8 没有新错误类型，用 #VALUE! 兜底
     }
 }
 
@@ -850,6 +850,66 @@ fn sheet_stream(
     Ok(out)
 }
 
+/// 检查工作簿另存为旧版 `.xls`（BIFF8）时的兼容性降级风险，返回面向用户的中文提醒列表。
+pub fn compatibility_warnings(wb: &Workbook) -> Vec<String> {
+    let mut warns = Vec::new();
+    let mut has_cf = false;
+    let mut has_dv = false;
+    let mut has_sparks = false;
+    let mut has_tables = false;
+    let mut has_charts = false;
+    let mut has_pics = false;
+    let mut has_tbs = false;
+    let mut has_notes = false;
+    let mut has_spills = false;
+    let mut over_bounds = false;
+    for sh in &wb.sheets {
+        if sh
+            .used_bounds()
+            .is_some_and(|(_, _, r2, c2)| r2 > u16::MAX as u32 || c2 > u8::MAX as u32)
+        {
+            over_bounds = true;
+        }
+        has_cf |= !sh.cf.blocks.is_empty();
+        has_dv |= !sh.dv.is_empty();
+        has_sparks |= !sh.sparklines.is_empty();
+        has_tables |= !sh.tables.is_empty();
+        has_charts |= !sh.charts.is_empty();
+        has_pics |= !sh.pictures.is_empty();
+        has_tbs |= !sh.textboxes.is_empty();
+        has_notes |= !sh.notes.is_empty();
+        has_spills |= !sh.spilled.is_empty();
+    }
+    if over_bounds {
+        warns.push("存在超出 .xls 上限（65536 行 / 256 列）的数据，将无法保存为 .xls".into());
+    }
+    if has_cf {
+        warns.push("条件格式规则在旧版 .xls 中不会被保留".into());
+    }
+    if has_dv {
+        warns.push("数据验证规则在旧版 .xls 中不会被保留".into());
+    }
+    if has_tables {
+        warns.push("超级表（ListObject）将降级为普通单元格区域".into());
+    }
+    if has_sparks {
+        warns.push("迷你图（Sparklines）在旧版 .xls 中不支持，将被丢弃".into());
+    }
+    if has_spills {
+        warns.push("动态数组溢出公式在 .xls 中仅保留当前计算结果".into());
+    }
+    if has_charts || has_pics || has_tbs {
+        warns.push("图表、图片与形状/文本框在旧版 .xls 写入器中不会被保留".into());
+    }
+    if has_notes {
+        warns.push("批注与线程批注在旧版 .xls 写入器中不会被保留".into());
+    }
+    if wb.date_system.is_1904() {
+        warns.push("工作簿采用 1904 日期体系，请确认目标环境兼容".into());
+    }
+    warns
+}
+
 pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
     if wb.encryption.is_some() {
         bail!("当前 .xls 写入器无法保留打开密码，请另存为 .xlsx 或 .xlsm");
@@ -1060,7 +1120,7 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
         let mut es = Vec::new();
         es.extend_from_slice(&w16(externs.entries.len() as u16));
         for (sup, first, last) in externs.entries.iter() {
-            es.extend_from_slice(&w16(*sup));
+            es.extend_from_slice(&w16(externs.resolved_supbook(*sup)));
             es.extend_from_slice(&w16(*first));
             es.extend_from_slice(&w16(*last));
         }

@@ -17,6 +17,10 @@ fn series_color(sp: &Sparkline) -> Color32 {
 }
 
 const NEGATIVE: Color32 = Color32::from_rgb(0xD0, 0x00, 0x00);
+const HIGH_COL: Color32 = Color32::from_rgb(0x15, 0x80, 0x3D);
+const LOW_COL: Color32 = Color32::from_rgb(0xDC, 0x26, 0x26);
+const FIRST_COL: Color32 = Color32::from_rgb(0xD9, 0x77, 0x06);
+const LAST_COL: Color32 = Color32::from_rgb(0x7C, 0x3A, 0xED);
 const AXIS: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
 const MARKER: Color32 = Color32::from_rgb(0xD0, 0x00, 0x00);
 
@@ -109,30 +113,49 @@ pub fn draw(painter: &egui::Painter, rect: Rect, sp: &Sparkline, raw: &[Option<f
         }
     };
 
+    // 预先计算首点、末点、高点、低点索引（供折线、柱形与盈亏迷你图统一生效）
+    let first_idx = pts.first().map(|(i, _)| *i);
+    let last_idx = pts.last().map(|(i, _)| *i);
+    let high_idx = pts
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| *i);
+    let low_idx = pts
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| *i);
+    let bar_color_for = |i: usize, v: f64| -> Color32 {
+        if sp.high && high_idx == Some(i) {
+            HIGH_COL
+        } else if sp.low && low_idx == Some(i) {
+            LOW_COL
+        } else if sp.first && first_idx == Some(i) {
+            FIRST_COL
+        } else if sp.last && last_idx == Some(i) {
+            LAST_COL
+        } else if sp.negative && v < 0.0 {
+            NEGATIVE
+        } else {
+            color
+        }
+    };
+
     match sp.kind {
         SparkKind::WinLoss => {
-            // 每点一根等高分柱：中线以上为正、以下为负
+            // 每点一根等高分柱：中线以上为正、以下为负（支持高/低/首/末/负点高亮色）
             let mid = area.center().y;
             let half = area.height() / 2.0;
             let slot = area.width() / n as f32;
             let bw = (slot - 1.0).max(1.0);
             for (i, v) in vals.iter().enumerate() {
+                let Some(val) = v else { continue };
                 let x = area.left() + slot * i as f32 + (slot - bw) / 2.0;
-                let bar = match v {
-                    Some(val) if *val >= 0.0 => {
-                        Rect::from_min_max(egui::pos2(x, mid - half), egui::pos2(x + bw, mid))
-                    }
-                    Some(_) => {
-                        Rect::from_min_max(egui::pos2(x, mid), egui::pos2(x + bw, mid + half))
-                    }
-                    None => continue,
-                };
-                let col = if sp.negative && v.unwrap_or(0.0) < 0.0 {
-                    NEGATIVE
+                let bar = if *val >= 0.0 {
+                    Rect::from_min_max(egui::pos2(x, mid - half), egui::pos2(x + bw, mid))
                 } else {
-                    color
+                    Rect::from_min_max(egui::pos2(x, mid), egui::pos2(x + bw, mid + half))
                 };
-                painter.rect_filled(bar, 0.0, col);
+                painter.rect_filled(bar, 0.0, bar_color_for(i, *val));
             }
             if sp.axis {
                 painter.line_segment(
@@ -169,8 +192,7 @@ pub fn draw(painter: &egui::Painter, rect: Rect, sp: &Sparkline, raw: &[Option<f
                     egui::pos2(x, y.min(y0)),
                     egui::pos2(x + bw, y.max(y0)),
                 );
-                let col = if sp.negative && *v < 0.0 { NEGATIVE } else { color };
-                painter.rect_filled(bar, 0.0, col);
+                painter.rect_filled(bar, 0.0, bar_color_for(i, *v));
             }
             if sp.axis {
                 painter.line_segment(

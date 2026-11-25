@@ -18,6 +18,482 @@ pub struct Note {
     pub author: String,
 }
 
+/// Excel 365 原生线程批注中的单条发言（主贴或回复）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadEntry {
+    pub id: String,
+    pub author: String,
+    pub timestamp: String,
+    pub text: String,
+}
+
+/// Excel 365 原生线程批注会话（绑定到单元格，支持多轮回复与已解决/重新打开状态）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadedComment {
+    pub r: u32,
+    pub c: u32,
+    pub resolved: bool,
+    pub entries: Vec<ThreadEntry>,
+}
+
+impl ThreadedComment {
+    /// 供旧版只读摘要与悬浮预览展示的纯文本汇总。
+    pub fn summary_text(&self) -> String {
+        let mut lines = Vec::with_capacity(self.entries.len());
+        for (i, e) in self.entries.iter().enumerate() {
+            if i == 0 {
+                lines.push(e.text.clone());
+            } else if e.author.is_empty() {
+                lines.push(e.text.clone());
+            } else {
+                lines.push(format!("{}：{}", e.author, e.text));
+            }
+        }
+        if self.resolved {
+            lines.push("[已解决]".into());
+        }
+        lines.join("\n")
+    }
+
+    pub fn root_author(&self) -> &str {
+        self.entries
+            .first()
+            .map(|e| e.author.as_str())
+            .unwrap_or("")
+    }
+}
+
+/// 加载整本工作簿中所有 Excel 365 原生线程批注（`xl/threadedComments/threadedCommentN.xml` + `xl/persons/person.xml`）。
+pub fn load_threaded_comments(path: &Path) -> Result<HashMap<String, Vec<ThreadedComment>>> {
+    let head = {
+        let mut f = std::fs::File::open(path)?;
+        let mut b = [0u8; 4];
+        let n = f.read(&mut b).unwrap_or(0);
+        (n, b)
+    };
+    if head.0 >= 4 && head.1 == [0xD0, 0xCF, 0x11, 0xE0] {
+        return Ok(HashMap::new());
+    }
+    let targets = crate::patch::sheet_targets(path)?;
+    let file = std::fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut persons: HashMap<String, String> = HashMap::new();
+    for i in 0..zip.len() {
+        let pname = match zip.by_index(i) {
+            Ok(zf) => zf.name().to_string(),
+            Err(_) => continue,
+        };
+        if pname.starts_with("xl/persons/") && pname.ends_with(".xml") {
+            if let Ok(mut f) = zip.by_name(&pname) {
+                let mut px = String::new();
+                if f.read_to_string(&mut px).is_ok() {
+                    for (id, disp) in parse_persons(&px) {
+                        persons.insert(id, disp);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for (name, sheet_path) in targets.iter() {
+        let (dir, base) = match sheet_path.rsplit_once('/') {
+            Some(v) => v,
+            None => ("xl/worksheets", sheet_path.as_str()),
+        };
+        let rels = format!("{dir}/_rels/{base}.rels");
+        let mut xml = String::new();
+        {
+            let Ok(mut f) = zip.by_name(&rels) else { continue };
+            let _ = f.read_to_string(&mut xml);
+        }
+        let (_, threaded_targets) = find_comment_targets(&xml);
+        let mut list = Vec::new();
+        for target in threaded_targets {
+            let entry = resolve_comment_part(dir, &target);
+            let mut tx = String::new();
+            if let Ok(mut f) = zip.by_name(&entry) {
+                if f.read_to_string(&mut tx).is_ok() {
+                    list.extend(parse_threaded_comments_structured(&tx, &persons));
+                }
+            }
+        }
+        if !list.is_empty() {
+            out.insert(name.clone(), list);
+        }
+    }
+    Ok(out)
+}
+
+/// 将 `xl/threadedComments/threadedCommentN.xml` 解析为结构化线程批注（保留每条发言 ID、作者、时间戳与 `done="1"` 已解决标志）。
+pub fn parse_threaded_comments_structured(
+    xml: &str,
+    persons: &HashMap<String, String>,
+) -> Vec<ThreadedComment> {
+    let mut r = Reader::from_str(xml);
+    r.config_mut().trim_text(false);
+    let mut grouped: HashMap<(u32, u32), ThreadedComment> = HashMap::new();
+    let mut order: Vec<(u32, u32)> = Vec::new();
+    // (r, c, id, author, dt, done, is_reply, text)
+    let mut cur: Option<(u32, u32, String, String, String, bool, bool, String)> = None;
+    let mut in_text = false;
+
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = local(e.name().as_ref()).to_string();
+                if name == "threadedComment" {
+                    let mut coord = String::new();
+                    let mut pid = String::new();
+                    let mut id = String::new();
+                    let mut dt = String::new();
+                    let mut done = false;
+                    let mut has_parent = false;
+                    for a in e.attributes().flatten() {
+                        let k = local(a.key.as_ref());
+                        let v = crate::model::xml_unescape(&a.value.to_string());
+                        match k {
+                            "ref" => coord = v,
+                            "personId" => pid = v,
+                            "id" => id = v,
+                            "dT" => dt = v,
+                            "done" => done = v == "1" || v.eq_ignore_ascii_case("true"),
+                            "parentId" if !v.is_empty() => has_parent = true,
+                            _ => {}
+                        }
+                    }
+                    if let Some((row, col)) = parse_a1(&coord) {
+                        let author = persons.get(&pid).cloned().unwrap_or_default();
+                        cur = Some((row, col, id, author, dt, done, has_parent, String::new()));
+                    }
+                } else if cur.is_some() && (name == "text" || name == "t") {
+                    in_text = true;
+                }
+            }
+            Ok(Event::Text(t)) if in_text => {
+                if let Some(c) = cur.as_mut() {
+                    c.7.push_str(&crate::model::xml_unescape(&t));
+                }
+            }
+            Ok(Event::CData(c)) if in_text => {
+                if let Some(st) = cur.as_mut() {
+                    st.7.push_str(c.as_ref());
+                }
+            }
+            Ok(Event::GeneralRef(g)) if in_text => {
+                let gname = String::from_utf8_lossy(g.as_ref().as_ref()).to_string();
+                if let Some(ch) = decode_general_ref(&gname) {
+                    if let Some(st) = cur.as_mut() {
+                        st.7.push(ch);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = local(e.name().as_ref()).to_string();
+                if name == "text" || name == "t" {
+                    in_text = false;
+                } else if name == "threadedComment" {
+                    if let Some((row, col, id, author, timestamp, done, has_parent, raw_txt)) = cur.take() {
+                        let txt = normalize_note_text(&raw_txt);
+                        if !txt.is_empty() {
+                            let key = (row, col);
+                            let entry = ThreadEntry {
+                                id,
+                                author,
+                                timestamp,
+                                text: txt,
+                            };
+                            if let Some(existing) = grouped.get_mut(&key) {
+                                if !has_parent && done {
+                                    existing.resolved = true;
+                                }
+                                existing.entries.push(entry);
+                            } else {
+                                order.push(key);
+                                grouped.insert(
+                                    key,
+                                    ThreadedComment {
+                                        r: row,
+                                        c: col,
+                                        resolved: done,
+                                        entries: vec![entry],
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|k| grouped.remove(&k))
+        .collect()
+}
+
+/// 将指定工作表的 Excel 365 原生线程批注写入 `xl/threadedComments/threadedCommentN.xml`
+/// 并维护工作簿级 `xl/persons/person.xml`、sheet rels、workbook rels 及 `[Content_Types].xml`。
+pub fn write_sheet_threaded_comments(
+    path: &Path,
+    sheet_name: &str,
+    threads: &HashMap<crate::model::CellRef, ThreadedComment>,
+) -> Result<()> {
+    let targets = crate::patch::sheet_targets(path)?;
+    let Some(part) = targets.get(sheet_name).cloned() else {
+        return Ok(());
+    };
+    let (dir, base) = match part.rsplit_once('/') {
+        Some(v) => v,
+        None => ("xl/worksheets", part.as_str()),
+    };
+    let rels_part = format!("{dir}/_rels/{base}.rels");
+    let all_entries: std::collections::HashSet<String> = {
+        let mut set = std::collections::HashSet::new();
+        if let Ok(f) = std::fs::File::open(path) {
+            if let Ok(mut z) = zip::ZipArchive::new(f) {
+                for i in 0..z.len() {
+                    if let Ok(e) = z.by_index(i) {
+                        set.insert(e.name().to_string());
+                    }
+                }
+            }
+        }
+        set
+    };
+
+    let mut kept_rels: Vec<String> = Vec::new();
+    let mut taken_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut existing_tc_part: Option<String> = None;
+    let mut rels_ns_header = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+    );
+    if let Some(raw) = crate::fixups::read_part(path, &rels_part) {
+        let xml = crate::xlsx::patch_xml_text(&raw, &rels_part)?;
+        let doc = roxmltree::Document::parse(&xml)?;
+        if let Some(ns) = doc.root_element().tag_name().namespace() {
+            rels_ns_header = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"{ns}\">"
+            );
+        }
+        for node in doc
+            .root_element()
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "Relationship")
+        {
+            let ty = node.attribute("Type").unwrap_or("");
+            let external = node
+                .attribute("TargetMode")
+                .is_some_and(|m| m.eq_ignore_ascii_case("External"));
+            if !external && ty.ends_with("/threadedComment") {
+                if let Some(t) = node.attribute("Target") {
+                    existing_tc_part = Some(resolve(dir, t));
+                }
+                continue;
+            }
+            if let Some(id) = node.attribute("Id") {
+                taken_ids.insert(id.to_string());
+            }
+            let mut tag = String::from("<Relationship");
+            for a in node.attributes() {
+                tag.push_str(&format!(" {}=\"{}\"", a.name(), xml_escape(a.value())));
+            }
+            tag.push_str("/>");
+            kept_rels.push(tag);
+        }
+    }
+
+    if threads.is_empty() {
+        if let Some(old_tc) = existing_tc_part {
+            let mut rels_out = rels_ns_header;
+            for t in kept_rels {
+                rels_out.push_str(&t);
+            }
+            rels_out.push_str("</Relationships>");
+            crate::patch::append_entries(path, &[(rels_part, rels_out.into_bytes())])?;
+            let _ = crate::patch::remove_entry(path, &old_tc);
+        }
+        return Ok(());
+    }
+
+    let tc_part = existing_tc_part.unwrap_or_else(|| {
+        let mut n = 1usize;
+        loop {
+            let cand = format!("xl/threadedComments/threadedComment{n}.xml");
+            if !all_entries.contains(&cand) {
+                break cand;
+            }
+            n += 1;
+        }
+    });
+
+    // 读取或初始化 xl/persons/person.xml
+    let person_part = "xl/persons/person.xml".to_string();
+    let mut person_by_name: HashMap<String, String> = HashMap::new();
+    let mut person_list: Vec<(String, String)> = Vec::new();
+    if let Some(raw_p) = crate::fixups::read_part(path, &person_part) {
+        if let Ok(px) = crate::xlsx::patch_xml_text(&raw_p, &person_part) {
+            for (id, disp) in parse_persons(&px) {
+                person_by_name.insert(disp.clone(), id.clone());
+                person_list.push((id, disp));
+            }
+        }
+    }
+    let mut ensure_person = |name: &str| -> String {
+        let disp = if name.trim().is_empty() { "CELLAN" } else { name.trim() };
+        if let Some(id) = person_by_name.get(disp) {
+            return id.clone();
+        }
+        let idx = person_list.len() + 1;
+        let id = format!("{{CELLAN-PERSON-{idx:012}}}",);
+        person_by_name.insert(disp.to_string(), id.clone());
+        person_list.push((id.clone(), disp.to_string()));
+        id
+    };
+
+    let mut items: Vec<(u32, u32, &ThreadedComment)> = threads
+        .iter()
+        .map(|(k, tc)| (k.row, k.col, tc))
+        .collect();
+    items.sort_unstable_by_key(|&(r, c, _)| (r, c));
+
+    let mut tc_xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><ThreadedComments xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments\">",
+    );
+    let mut seq = 1usize;
+    for &(r, c, tc) in &items {
+        let coord = crate::model::cell_name(r, c);
+        let mut root_id = String::new();
+        for (i, entry) in tc.entries.iter().enumerate() {
+            let pid = ensure_person(&entry.author);
+            let eid = if entry.id.trim().is_empty() {
+                let g = format!("{{CELLAN-TC-{r}-{c}-{seq}}}");
+                seq += 1;
+                g
+            } else {
+                entry.id.clone()
+            };
+            if i == 0 {
+                root_id = eid.clone();
+            }
+            let dt = if entry.timestamp.trim().is_empty() {
+                "2026-01-01T00:00:00.00"
+            } else {
+                entry.timestamp.as_str()
+            };
+            let parent_attr = if i > 0 && !root_id.is_empty() {
+                format!(" parentId=\"{}\"", xml_escape(&root_id))
+            } else {
+                String::new()
+            };
+            let done_attr = if i == 0 && tc.resolved { " done=\"1\"" } else { "" };
+            tc_xml.push_str(&format!(
+                "<threadedComment ref=\"{coord}\" dT=\"{}\" personId=\"{}\" id=\"{}\"{parent_attr}{done_attr}><text>{}</text></threadedComment>",
+                xml_escape(dt),
+                xml_escape(&pid),
+                xml_escape(&eid),
+                escape_note_xml(&entry.text)
+            ));
+        }
+    }
+    tc_xml.push_str("</ThreadedComments>");
+
+    let mut persons_xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><personList xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments\">",
+    );
+    for (id, disp) in &person_list {
+        persons_xml.push_str(&format!(
+            "<person displayName=\"{}\" id=\"{}\" userId=\"{}\" providerId=\"None\"/>",
+            xml_escape(disp),
+            xml_escape(id),
+            xml_escape(disp)
+        ));
+    }
+    persons_xml.push_str("</personList>");
+
+    // sheet rels
+    let tc_rid = next_rid(&taken_ids);
+    let tc_rel_target = relative_path(dir, &tc_part);
+    let mut rels_out = rels_ns_header;
+    for tag in kept_rels {
+        rels_out.push_str(&tag);
+    }
+    rels_out.push_str(&format!(
+        "<Relationship Id=\"{tc_rid}\" Type=\"http://schemas.microsoft.com/office/2017/10/relationships/threadedComment\" Target=\"{}\"/>",
+        xml_escape(&tc_rel_target)
+    ));
+    rels_out.push_str("</Relationships>");
+
+    let mut pending: Vec<(String, Vec<u8>)> = vec![
+        (tc_part.clone(), tc_xml.into_bytes()),
+        (person_part.clone(), persons_xml.into_bytes()),
+        (rels_part, rels_out.into_bytes()),
+    ];
+
+    // workbook rels: ensure person relationship
+    let wb_rels_part = "xl/_rels/workbook.xml.rels".to_string();
+    if let Some(raw_wr) = crate::fixups::read_part(path, &wb_rels_part) {
+        let wr_xml = crate::xlsx::patch_xml_text(&raw_wr, &wb_rels_part)?;
+        if !wr_xml.contains("/person\"") && !wr_xml.contains("persons/person.xml") {
+            let mut wb_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            if let Ok(doc) = roxmltree::Document::parse(&wr_xml) {
+                for n in doc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "Relationship") {
+                    if let Some(id) = n.attribute("Id") {
+                        wb_ids.insert(id.to_string());
+                    }
+                }
+            }
+            let pid_rel = next_rid(&wb_ids);
+            let mut wr_out = wr_xml.into_owned();
+            if let Some(pos) = wr_out.rfind("</Relationships>") {
+                wr_out.insert_str(
+                    pos,
+                    &format!(
+                        "<Relationship Id=\"{pid_rel}\" Type=\"http://schemas.microsoft.com/office/2017/10/relationships/person\" Target=\"persons/person.xml\"/>"
+                    ),
+                );
+                pending.push((wb_rels_part, wr_out.into_bytes()));
+            }
+        }
+    }
+
+    // [Content_Types].xml
+    if let Some(raw_ct) = crate::fixups::read_part(path, "[Content_Types].xml") {
+        let ct_xml = crate::xlsx::patch_xml_text(&raw_ct, "[Content_Types].xml")?;
+        let mut ct = ct_xml.into_owned();
+        let mut changed = false;
+        let tc_ov = format!("PartName=\"/{tc_part}\"");
+        if !ct.contains(&tc_ov) {
+            if let Some(pos) = ct.rfind("</Types>") {
+                ct.insert_str(
+                    pos,
+                    &format!(
+                        "<Override PartName=\"/{tc_part}\" ContentType=\"application/vnd.ms-excel.threadedcomments+xml\"/>"
+                    ),
+                );
+                changed = true;
+            }
+        }
+        let p_ov = "PartName=\"/xl/persons/person.xml\"";
+        if !ct.contains(p_ov) {
+            if let Some(pos) = ct.rfind("</Types>") {
+                ct.insert_str(
+                    pos,
+                    "<Override PartName=\"/xl/persons/person.xml\" ContentType=\"application/vnd.ms-excel.person+xml\"/>",
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            pending.push(("[Content_Types].xml".to_string(), ct.into_bytes()));
+        }
+    }
+
+    crate::patch::append_entries(path, &pending)?;
+    Ok(())
+}
+
 /// 表名 → 批注列表（自动识别 .xlsx 与 .xls）
 pub fn load_notes(path: &Path) -> Result<HashMap<String, Vec<Note>>> {
     let head = {

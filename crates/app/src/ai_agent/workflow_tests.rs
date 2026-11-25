@@ -553,6 +553,8 @@ fn ai_manual_large_workbook_reuses_calc_base_deps_and_broadcasts_fill_formula_st
             sheet: 0,
             row: 0,
             col: 0,
+            end_row: None,
+            end_col: None,
         },
     );
     chat.app.peer = Some(peer_host);

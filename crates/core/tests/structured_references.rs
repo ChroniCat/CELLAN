@@ -15,6 +15,7 @@ fn sales_book() -> Workbook {
         columns: vec!["Region".into(), "Amount".into(), "Tax".into(), "Total".into()],
         header_row: true,
         totals_row: true,
+        ..Default::default()
     };
     wb.sheets[0].tables.push(t.clone());
     let rows = [
@@ -53,6 +54,7 @@ fn audit_two_row_samples_calculate_as_excel() {
         columns: vec!["Amount".into()],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     wb.sheets[0].set(0, 0, Cell { value: Value::Text("Amount".into()), formula: None });
     wb.sheets[0].set(1, 0, Cell { value: Value::Number(10.0), formula: None });
@@ -128,6 +130,7 @@ fn special_column_names_are_not_split_on_space_comma_or_percent() {
         columns: vec!["Amount USD".into(), "Tax, %".into()],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     };
     wb.sheets[0].tables.push(t);
     assert_eq!(
@@ -260,6 +263,7 @@ fn bare_current_row_picks_table_by_formula_column_when_row_has_two_tables() {
         columns: vec!["Amount".into(), "Tax".into()],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     wb.sheets[0].tables.push(Table {
                 column_ids: Vec::new(),
@@ -269,6 +273,7 @@ fn bare_current_row_picks_table_by_formula_column_when_row_has_two_tables() {
         columns: vec!["Rate".into(), "Out".into()],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     for (r, a, b, rate) in [(0u32, "Amount", "Tax", "Rate"), (1, "10", "0.1", "3"), (2, "20", "0.2", "4")] {
         if r == 0 {
@@ -306,6 +311,7 @@ fn original_chinese_bare_current_row_formula_evaluates_two_rows() {
         columns: vec!["金额".into(), "税率".into(), "小计".into()],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     for (r, label) in ["金额", "税率", "小计"].iter().enumerate() {
         wb.sheets[0].set(0, r as u32, Cell { value: Value::Text((*label).into()), formula: None });
@@ -346,6 +352,7 @@ fn structured_reference_escapes_brackets_pound_apostrophe_and_at() {
         column_ids: vec![1, 2, 3, 4, 5],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     let cases = [
         ("=SUM(Specials['#OfItems])", 10.0),
@@ -380,6 +387,7 @@ fn rename_escaped_special_column_updates_formula_and_header() {
         column_ids: vec![1, 2],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     sh.set(3, 4, Cell { value: Value::Empty, formula: Some("=SUM(Specials['#OfItems])".into()) });
     assert!(sheetcore::table::rename_table_column(&mut wb, "Specials", "#OfItems", "New#"));

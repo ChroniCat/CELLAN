@@ -32,8 +32,18 @@ impl ParsedInput {
     }
 }
 
-/// 按单元格当前格式与工作簿日期体系解析用户输入。
+/// 按单元格当前格式与工作簿日期体系解析用户输入（使用本地当前年份补全月/日简写）。
 pub fn parse_cell_input(raw: &str, existing_format: &str, sys: DateSystem) -> ParsedInput {
+    parse_cell_input_with_year(raw, existing_format, sys, current_local_year())
+}
+
+/// 同 `parse_cell_input`，显式指定月/日简写（如 `11/25`、`11月25日`）所使用的基准年份。
+pub fn parse_cell_input_with_year(
+    raw: &str,
+    existing_format: &str,
+    sys: DateSystem,
+    default_year: i32,
+) -> ParsedInput {
     let is_text_fmt = existing_format.trim() == "@";
     if is_text_fmt {
         if raw.is_empty() {
@@ -67,30 +77,361 @@ pub fn parse_cell_input(raw: &str, existing_format: &str, sys: DateSystem) -> Pa
 
     // 2) 纯数字（排除 inf / nan 等 Rust f64 特殊字面量）
     if let Some(n) = parse_strict_plain_f64(t) {
+        if is_percent_format(existing_format) {
+            return ParsedInput::plain(Value::Number(n / 100.0));
+        }
         return ParsedInput::plain(Value::Number(n));
     }
 
-    // 3) 百分比（如 15%、-12.5%、1,234.5%）
+    // 3) 会计括号负数（如 (1,000)、(1,000.50)、(¥1,000)、($500.25)、¥(1,000)、(15%)）
+    if let Some(parsed) = parse_paren_negative(t) {
+        return parsed;
+    }
+
+    // 4) 百分比（如 15%、-12.5%、1,234.5%）
     if let Some(parsed) = parse_percent(t) {
         return parsed;
     }
 
-    // 4) 货币金额（如 ¥1,000、￥1,234.56、$1,000.50、€50、£99.9、-$500、¥-100）
+    // 5) 货币金额（如 ¥1,000、￥1,234.56、$1,000.50、€50、£99.9、-$500、¥-100）
     if let Some(parsed) = parse_currency(t) {
         return parsed;
     }
 
-    // 5) 千分位数值（如 1,234、-1,234,567.89）
+    // 6) 千分位数值（如 1,234、-1,234,567.89）
     if let Some(parsed) = parse_grouped_number(t) {
         return parsed;
     }
 
-    // 6) 日期 / 日期时间 / 时间
-    if let Some(parsed) = parse_date_or_time(t, sys) {
+    // 7) 带分数（如 1 1/2、0 3/4、-2 3/8；遵循 Excel 规则，避免裸 3/4 与 3月4日 冲突）
+    if let Some(parsed) = parse_mixed_fraction(t) {
+        return parsed;
+    }
+
+    // 8) 日期 / 日期时间 / 时间（含 11/25、11月25日、2026-11、9:5、25:00 累计时间）
+    if let Some(parsed) = parse_date_or_time(t, sys, default_year) {
         return parsed;
     }
 
     ParsedInput::plain(Value::Text(intern_short_str(raw)))
+}
+
+fn current_local_year() -> i32 {
+    // 复用标准时间（本地近似 UTC+8 或系统 UTC 纪元换算）获取当前公历年
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // civil_from_days (Howard Hinnant algorithm)
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (y + if m <= 2 { 1 } else { 0 }) as i32
+}
+
+/// 解析会计括号负数：`(1,000.50)`、`(¥500)`、`¥(500)`、`($1,200.00)`、`(15%)`。
+fn parse_paren_negative(t: &str) -> Option<ParsedInput> {
+    // 支持货币符在括号外：¥(1,000.50) / $(500)
+    let mut outer_sym: Option<&'static str> = None;
+    let body = if let Some(inner) = t.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        inner.trim()
+    } else {
+        let mut chars = t.chars();
+        let first = chars.next()?;
+        let sym = currency_symbol(first)?;
+        let rest = chars.as_str().trim();
+        let inner = rest.strip_prefix('(')?.strip_suffix(')')?.trim();
+        outer_sym = Some(sym);
+        inner
+    };
+    if body.is_empty() || body.starts_with('-') || body.starts_with('+') {
+        return None;
+    }
+    // 括号内百分比：(15%)
+    if outer_sym.is_none() {
+        if let Some(pct_body) = body.strip_suffix('%') {
+            let (val, _, decimals) = parse_decimal_with_optional_commas(pct_body.trim())?;
+            let dec = format_decimals_suffix(decimals, 4);
+            let fmt = format!("0{dec}%;(0{dec}%)");
+            return Some(ParsedInput {
+                value: Value::Number(-val / 100.0),
+                auto_format: Some(fmt),
+                quote_prefix: false,
+            });
+        }
+    }
+    // 括号内或括号外带货币符：(¥1,000.50) / ¥(1,000.50)
+    let (sym, num_part) = if let Some(s) = outer_sym {
+        (Some(s), body)
+    } else {
+        let mut chars = body.chars();
+        if let Some(ch) = chars.next() {
+            if let Some(s) = currency_symbol(ch) {
+                (Some(s), chars.as_str().trim())
+            } else {
+                (None, body)
+            }
+        } else {
+            return None;
+        }
+    };
+    if num_part.is_empty() || num_part.starts_with('-') || num_part.starts_with('+') {
+        return None;
+    }
+    let (val, has_comma, decimals) = parse_decimal_with_optional_commas(num_part)?;
+    let dec = format_decimals_suffix(decimals, 4);
+    let fmt = if let Some(s) = sym {
+        format!("{s}#,##0{dec};({s}#,##0{dec})")
+    } else if has_comma {
+        format!("#,##0{dec};(#,##0{dec})")
+    } else {
+        format!("0{dec};(0{dec})")
+    };
+    Some(ParsedInput {
+        value: Value::Number(-val),
+        auto_format: Some(fmt),
+        quote_prefix: false,
+    })
+}
+
+/// 解析带分数：`1 1/2`、`0 3/4`、`-2 3/8`（Excel 标准输入格式）。
+fn parse_mixed_fraction(t: &str) -> Option<ParsedInput> {
+    let (neg, rest) = if let Some(r) = t.strip_prefix('-') {
+        (true, r.trim_start())
+    } else if let Some(r) = t.strip_prefix('+') {
+        (false, r.trim_start())
+    } else {
+        (false, t)
+    };
+    let (whole_s, frac_s) = rest.split_once(' ')?;
+    let frac_s = frac_s.trim();
+    if whole_s.is_empty()
+        || !whole_s.bytes().all(|b| b.is_ascii_digit())
+        || whole_s.len() > 12
+    {
+        return None;
+    }
+    let (num_s, den_s) = frac_s.split_once('/')?;
+    if num_s.is_empty()
+        || den_s.is_empty()
+        || num_s.len() > 6
+        || den_s.len() > 6
+        || !num_s.bytes().all(|b| b.is_ascii_digit())
+        || !den_s.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole: u64 = whole_s.parse().ok()?;
+    let num: u64 = num_s.parse().ok()?;
+    let den: u64 = den_s.parse().ok()?;
+    if den == 0 {
+        return None;
+    }
+    let abs_val = whole as f64 + (num as f64 / den as f64);
+    let val = if neg { -abs_val } else { abs_val };
+    if !val.is_finite() {
+        return None;
+    }
+    let fmt = if den >= 100 {
+        "# ???/???"
+    } else if den >= 10 {
+        "# ??/??"
+    } else {
+        "# ?/?"
+    };
+    Some(ParsedInput {
+        value: Value::Number(val),
+        auto_format: Some(fmt.to_string()),
+        quote_prefix: false,
+    })
+}
+
+/// 规范化公式输入：
+/// - `=` 开头的公式自动补全缺失的尾部右括号 `)`（跳过双引号字符串字面量）；
+/// - `+` / `-` 开头且主体为单元格引用、函数调用或算术表达式（而非纯有符号数字/货币/百分比/千分位/分数）时，
+///   按 Excel / Lotus 习惯转为标准 `=` 公式并补全缺失右括号。
+pub fn normalize_formula_input(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.starts_with('=') {
+        return Some(auto_close_parens(t));
+    }
+    let first = t.as_bytes()[0];
+    if first != b'+' && first != b'-' {
+        return None;
+    }
+    // 先排除合法的纯数值/百分比/货币/千分位/带分数输入
+    if parse_strict_plain_f64(t).is_some()
+        || parse_percent(t).is_some()
+        || parse_currency(t).is_some()
+        || parse_grouped_number(t).is_some()
+        || parse_mixed_fraction(t).is_some()
+    {
+        return None;
+    }
+    let body = t[1..].trim_start();
+    if body.is_empty() || !looks_like_signed_formula_body(body) {
+        return None;
+    }
+    let formula = if first == b'+' {
+        format!("={body}")
+    } else {
+        format!("=-{body}")
+    };
+    Some(auto_close_parens(&formula))
+}
+
+fn looks_like_signed_formula_body(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    // 1) 以 `(` 开头，如 `+(A1+B1)` 或 `-(1+2)*3`
+    if bytes[0] == b'(' {
+        return true;
+    }
+    // 2) 以函数调用开头，如 `+SUM(A1:A5)` / `-AVERAGE(B1:B3)`
+    if bytes[0].is_ascii_alphabetic() || bytes[0] == b'_' {
+        let mut i = 0usize;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
+        {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'(' {
+            return true;
+        }
+    }
+    // 3) 以 A1 引用或 `Sheet!A1` / `'Sheet 1'!A1` 开头
+    if starts_with_ref_or_sheet_ref(body) {
+        return true;
+    }
+    // 4) 纯数字算术表达式（含运算符 `+`/`-`/`*`/`/`/`^`，且至少两个操作数，排除日期或电话串以外的普通文字）
+    if bytes[0].is_ascii_digit() || bytes[0] == b'.' {
+        let mut has_op = false;
+        let mut ok = true;
+        for &b in bytes {
+            match b {
+                b'0'..=b'9' | b'.' | b' ' | b'(' | b')' => {}
+                b'+' | b'-' | b'*' | b'/' | b'^' => has_op = true,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        // 避免把 `-2026-11-25` 或 `+86-138-0013` 错判成公式：仅当含 `*`/`/`/`^`/`+` 或仅单一 `-` 且不含 2+ 个连字符时才视作算术式
+        let dash_count = bytes.iter().filter(|&&b| b == b'-').count();
+        if ok && has_op && (dash_count <= 1 || bytes.iter().any(|&b| matches!(b, b'+' | b'*' | b'/' | b'^'))) {
+            return true;
+        }
+    }
+    false
+}
+
+fn starts_with_ref_or_sheet_ref(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut pos = 0usize;
+    if bytes.first() == Some(&b'\'') {
+        let mut k = 1usize;
+        while k < bytes.len() {
+            if bytes[k] == b'\'' {
+                if k + 1 < bytes.len() && bytes[k + 1] == b'\'' {
+                    k += 2;
+                    continue;
+                }
+                break;
+            }
+            k += 1;
+        }
+        if k + 1 >= bytes.len() || bytes[k + 1] != b'!' {
+            return false;
+        }
+        pos = k + 2;
+    } else if let Some(bang) = s.find('!') {
+        let prefix = &s[..bang];
+        if !prefix.is_empty()
+            && prefix
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.'))
+        {
+            pos = bang + 1;
+        }
+    }
+    let tail = &bytes[pos..];
+    let mut i = 0usize;
+    if i < tail.len() && tail[i] == b'$' {
+        i += 1;
+    }
+    let cs = i;
+    while i < tail.len() && tail[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    let col_len = i - cs;
+    if !(1..=3).contains(&col_len) {
+        return false;
+    }
+    if i < tail.len() && tail[i] == b'$' {
+        i += 1;
+    }
+    let ds = i;
+    while i < tail.len() && tail[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == ds || tail[ds] == b'0' || i - ds > 7 {
+        return false;
+    }
+    // 紧随其后不能是普通字母或下划线（防止 `A1B` 被误判）
+    if i < tail.len() && (tail[i].is_ascii_alphanumeric() || tail[i] == b'_') {
+        return false;
+    }
+    true
+}
+
+/// 跳过 `"..."` 字符串字面量（含 `""` 转义）计算未闭合左括号数量，并在尾部补齐 `)`。
+fn auto_close_parens(formula: &str) -> String {
+    let bytes = formula.as_bytes();
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut open = 0i32;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'(' => open += 1,
+            b')' => open -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    if open > 0 && !in_str {
+        let mut out = String::with_capacity(formula.len() + open as usize);
+        out.push_str(formula);
+        for _ in 0..open {
+            out.push(')');
+        }
+        out
+    } else {
+        formula.to_string()
+    }
 }
 
 /// 仅当字符串是严格的数字字面量（允许正负号、小数点、科学计数，但拒绝 inf/nan）时解析为有限 f64。
@@ -300,7 +641,9 @@ fn is_valid_ymd(y: i32, m: u32, d: u32) -> bool {
     d <= max_d
 }
 
-fn parse_time_part(s: &str) -> Option<(f64, bool)> {
+/// 解析时间段：`H:M` / `H:MM` / `H:MM:SS` / `H:M:S`。
+/// 当 `allow_elapsed = true` 时，允许小时 `>= 24`（如 `25:00`、`100:30:15`），返回 `(时间值, has_sec, is_elapsed)`。
+fn parse_time_part(s: &str, allow_elapsed: bool) -> Option<(f64, bool, bool)> {
     let s = s.trim();
     let mut parts = s.split(':');
     let h_str = parts.next()?;
@@ -309,9 +652,11 @@ fn parse_time_part(s: &str) -> Option<(f64, bool)> {
     if parts.next().is_some() {
         return None;
     }
+    let max_h_len = if allow_elapsed { 5 } else { 2 };
     if h_str.is_empty()
-        || h_str.len() > 2
-        || m_str.len() != 2
+        || h_str.len() > max_h_len
+        || m_str.is_empty()
+        || m_str.len() > 2
         || !h_str.bytes().all(|b| b.is_ascii_digit())
         || !m_str.bytes().all(|b| b.is_ascii_digit())
     {
@@ -319,12 +664,12 @@ fn parse_time_part(s: &str) -> Option<(f64, bool)> {
     }
     let h: u32 = h_str.parse().ok()?;
     let m: u32 = m_str.parse().ok()?;
-    if h >= 24 || m >= 60 {
+    if (!allow_elapsed && h >= 24) || m >= 60 {
         return None;
     }
     let (sec, has_sec) = match s_opt {
         Some(ss) => {
-            if ss.len() != 2 || !ss.bytes().all(|b| b.is_ascii_digit()) {
+            if ss.is_empty() || ss.len() > 2 || !ss.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
             let v: u32 = ss.parse().ok()?;
@@ -335,8 +680,9 @@ fn parse_time_part(s: &str) -> Option<(f64, bool)> {
         }
         None => (0, false),
     };
-    let frac = (h * 3600 + m * 60 + sec) as f64 / 86_400.0;
-    Some((frac, has_sec))
+    let total_secs = (h as u64) * 3600 + (m as u64) * 60 + (sec as u64);
+    let frac = total_secs as f64 / 86_400.0;
+    Some((frac, has_sec, h >= 24))
 }
 
 fn parse_ymd_sep(s: &str, sep: char) -> Option<(i32, u32, u32)> {
@@ -364,6 +710,45 @@ fn parse_ymd_sep(s: &str, sep: char) -> Option<(i32, u32, u32)> {
     is_valid_ymd(y, m, d).then_some((y, m, d))
 }
 
+/// 解析年月：`2026-11` / `2026/11` -> `(2026, 11, 1)`。
+fn parse_ym_sep(s: &str, sep: char) -> Option<(i32, u32, u32)> {
+    let (ys, ms) = s.split_once(sep)?;
+    if ms.contains(sep) {
+        return None;
+    }
+    if ys.len() != 4
+        || ms.is_empty()
+        || ms.len() > 2
+        || !ys.bytes().all(|b| b.is_ascii_digit())
+        || !ms.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let y: i32 = ys.parse().ok()?;
+    let m: u32 = ms.parse().ok()?;
+    is_valid_ymd(y, m, 1).then_some((y, m, 1))
+}
+
+/// 解析月日简写：`11/25` / `11-25` -> `(default_year, 11, 25)`。
+fn parse_md_sep(s: &str, sep: char, default_year: i32) -> Option<(i32, u32, u32)> {
+    let (ms, ds) = s.split_once(sep)?;
+    if ds.contains(sep) {
+        return None;
+    }
+    if ms.is_empty()
+        || ms.len() > 2
+        || ds.is_empty()
+        || ds.len() > 2
+        || !ms.bytes().all(|b| b.is_ascii_digit())
+        || !ds.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let m: u32 = ms.parse().ok()?;
+    let d: u32 = ds.parse().ok()?;
+    is_valid_ymd(default_year, m, d).then_some((default_year, m, d))
+}
+
 fn parse_cn_ymd(s: &str) -> Option<(i32, u32, u32)> {
     let (ys, rest) = s.split_once('年')?;
     let (ms, rest) = rest.split_once('月')?;
@@ -385,11 +770,54 @@ fn parse_cn_ymd(s: &str) -> Option<(i32, u32, u32)> {
     is_valid_ymd(y, m, d).then_some((y, m, d))
 }
 
-fn parse_date_or_time(t: &str, sys: DateSystem) -> Option<ParsedInput> {
-    // 1) 纯时间 H:MM 或 H:MM:SS
-    if t.contains(':') && !t.contains('/') && !t.contains('-') && !t.contains('年') && !t.contains(' ') {
-        let (frac, has_sec) = parse_time_part(t)?;
-        let fmt = if has_sec { "hh:mm:ss" } else { "hh:mm" };
+/// 解析中文年月：`2026年11月` -> `(2026, 11, 1)`。
+fn parse_cn_ym(s: &str) -> Option<(i32, u32, u32)> {
+    let (ys, rest) = s.split_once('年')?;
+    let ms = rest.strip_suffix('月')?;
+    if ys.len() != 4
+        || ms.is_empty()
+        || ms.len() > 2
+        || !ys.bytes().all(|b| b.is_ascii_digit())
+        || !ms.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let y: i32 = ys.parse().ok()?;
+    let m: u32 = ms.parse().ok()?;
+    is_valid_ymd(y, m, 1).then_some((y, m, 1))
+}
+
+/// 解析中文月日简写：`11月25日` / `11月25号` -> `(default_year, 11, 25)`。
+fn parse_cn_md(s: &str, default_year: i32) -> Option<(i32, u32, u32)> {
+    if s.contains('年') {
+        return None;
+    }
+    let (ms, rest) = s.split_once('月')?;
+    let ds = rest.strip_suffix('日').or_else(|| rest.strip_suffix('号'))?;
+    if ms.is_empty()
+        || ms.len() > 2
+        || ds.is_empty()
+        || ds.len() > 2
+        || !ms.bytes().all(|b| b.is_ascii_digit())
+        || !ds.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let m: u32 = ms.parse().ok()?;
+    let d: u32 = ds.parse().ok()?;
+    is_valid_ymd(default_year, m, d).then_some((default_year, m, d))
+}
+
+fn parse_date_or_time(t: &str, sys: DateSystem, default_year: i32) -> Option<ParsedInput> {
+    // 1) 纯时间 H:M / H:MM / H:MM:SS / 累计时间 25:00 / 100:30:15
+    if t.contains(':') && !t.contains('/') && !t.contains('-') && !t.contains('年') && !t.contains('月') && !t.contains(' ') {
+        let (frac, has_sec, is_elapsed) = parse_time_part(t, true)?;
+        let fmt = match (is_elapsed, has_sec) {
+            (true, true) => "[h]:mm:ss",
+            (true, false) => "[h]:mm",
+            (false, true) => "hh:mm:ss",
+            (false, false) => "hh:mm",
+        };
         return Some(ParsedInput {
             value: Value::Number(frac),
             auto_format: Some(fmt.to_string()),
@@ -412,6 +840,18 @@ fn parse_date_or_time(t: &str, sys: DateSystem) -> Option<ParsedInput> {
         (ymd, "yyyy-mm-dd")
     } else if let Some(ymd) = parse_cn_ymd(date_part) {
         (ymd, "yyyy\"年\"m\"月\"d\"日\"")
+    } else if let Some(ymd) = parse_ym_sep(date_part, '-') {
+        (ymd, "yyyy-mm")
+    } else if let Some(ymd) = parse_ym_sep(date_part, '/') {
+        (ymd, "yyyy/mm")
+    } else if let Some(ymd) = parse_cn_ym(date_part) {
+        (ymd, "yyyy\"年\"m\"月\"")
+    } else if let Some(ymd) = parse_md_sep(date_part, '/', default_year) {
+        (ymd, "m/d")
+    } else if let Some(ymd) = parse_md_sep(date_part, '-', default_year) {
+        (ymd, "m-d")
+    } else if let Some(ymd) = parse_cn_md(date_part, default_year) {
+        (ymd, "m\"月\"d\"日\"")
     } else {
         return None;
     };
@@ -425,7 +865,7 @@ fn parse_date_or_time(t: &str, sys: DateSystem) -> Option<ParsedInput> {
                 quote_prefix: false,
             });
         }
-        let (frac, has_sec) = parse_time_part(tm)?;
+        let (frac, has_sec, _) = parse_time_part(tm, false)?;
         let fmt = if has_sec {
             format!("{base_fmt} hh:mm:ss")
         } else {
@@ -492,6 +932,18 @@ fn format_serial_for_edit(sys: DateSystem, serial: f64, fmt: &str) -> Option<Str
     if total_secs < 0 {
         return None;
     }
+    let low = fmt.to_ascii_lowercase();
+    // 累计时间格式（[h]:mm / [hh]:mm:ss）保留总小时数而非转成 1900-01-01 日期
+    if low.contains("[h") {
+        let th = total_secs / 3600;
+        let m = (total_secs % 3600) / 60;
+        let s = total_secs % 60;
+        return if s == 0 && !low.contains('s') {
+            Some(format!("{th}:{m:02}"))
+        } else {
+            Some(format!("{th}:{m:02}:{s:02}"))
+        };
+    }
     let day = total_secs / 86_400;
     let rem = total_secs % 86_400;
     let h = rem / 3600;
@@ -499,7 +951,7 @@ fn format_serial_for_edit(sys: DateSystem, serial: f64, fmt: &str) -> Option<Str
     let s = rem % 60;
 
     if day == 0 {
-        return if s == 0 && !fmt.to_ascii_lowercase().contains('s') {
+        return if s == 0 && !low.contains('s') {
             Some(format!("{h:02}:{m:02}"))
         } else {
             Some(format!("{h:02}:{m:02}:{s:02}"))
@@ -510,7 +962,7 @@ fn format_serial_for_edit(sys: DateSystem, serial: f64, fmt: &str) -> Option<Str
     let sep = if fmt.contains('-') && !fmt.contains('/') { '-' } else { '/' };
     if rem == 0 {
         Some(format!("{y:04}{sep}{mo:02}{sep}{d:02}"))
-    } else if s == 0 && !fmt.to_ascii_lowercase().contains('s') {
+    } else if s == 0 && !low.contains('s') {
         Some(format!("{y:04}{sep}{mo:02}{sep}{d:02} {h:02}:{m:02}"))
     } else {
         Some(format!("{y:04}{sep}{mo:02}{sep}{d:02} {h:02}:{m:02}:{s:02}"))

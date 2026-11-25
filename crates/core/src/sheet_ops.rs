@@ -77,20 +77,40 @@ fn rename_impl(wb: &mut Workbook, idx: usize, name: &str, journal: Option<&mut R
 /// Delete a sheet, preserving at least one sheet. Deleted-sheet references
 /// become explicit errors, so later reuse of its name cannot retarget them.
 pub fn delete_sheet(wb: &mut Workbook, idx: usize) -> bool {
-    if wb.sheets.len() <= 1 || idx >= wb.sheets.len() { return false; }
+    delete_with_history(wb, idx).is_some()
+}
+
+pub(crate) struct DeletedSheetRecord {
+    pub sheet: Sheet,
+    pub local_names: Vec<(String, Option<usize>, String)>,
+    pub references: RenameReferences,
+}
+
+pub(crate) fn delete_with_history(wb: &mut Workbook, idx: usize) -> Option<DeletedSheetRecord> {
+    if wb.sheets.len() <= 1 || idx >= wb.sheets.len() { return None; }
     // 删除前保留完整标签顺序：三维区间的邻居必须按原区间求，
     // 不能用全局 prev/next（反向区间/唯一成员会取错）。
     let order: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
-    let old = wb.sheets.remove(idx).name;
-    let before = wb.names.len();
-    wb.names.retain(|(_, local, _)| *local != Some(idx));
-    wb.names_dirty |= wb.names.len() != before;
+    let removed_sheet = wb.sheets.remove(idx);
+    let old = removed_sheet.name.clone();
+    let mut local_names = Vec::new();
+    let mut kept_names = Vec::with_capacity(wb.names.len());
+    for entry in std::mem::take(&mut wb.names) {
+        if entry.1 == Some(idx) {
+            local_names.push(entry);
+            wb.names_dirty = true;
+        } else {
+            kept_names.push(entry);
+        }
+    }
+    wb.names = kept_names;
     for (_, local, _) in &mut wb.names {
         if let Some(i) = local.as_mut() {
             if *i > idx { *i -= 1; wb.names_dirty = true; }
         }
     }
-    rewrite_qualifiers(wb, &old, None, Some(&order), None);
+    let mut references = RenameReferences::default();
+    rewrite_qualifiers(wb, &old, None, Some(&order), Some(&mut references));
     wb.pivot_shifts.retain(|(sheet, ..)| !sheet.eq_ignore_ascii_case(&old));
     wb.pivots_pending.retain(|(sheet, ..)| *sheet != idx);
     for (sheet, ..) in &mut wb.pivots_pending {
@@ -118,6 +138,77 @@ pub fn delete_sheet(wb: &mut Workbook, idx: usize) -> bool {
         }
     }
     wb.dirty = true;
+    Some(DeletedSheetRecord {
+        sheet: removed_sheet,
+        local_names,
+        references,
+    })
+}
+
+pub(crate) fn restore_deleted_sheet(
+    wb: &mut Workbook,
+    idx: usize,
+    sheet: Sheet,
+    local_names: &[(String, Option<usize>, String)],
+    references: &RenameReferences,
+) -> bool {
+    if idx > wb.sheets.len() || !valid_name(wb, None, &sheet.name) {
+        return false;
+    }
+    // First shift names/pivots back up and re-insert sheet
+    if !insert_sheet(wb, idx, sheet) {
+        return false;
+    }
+    // Restore original sheet-scoped names
+    for (n, _, f) in local_names {
+        wb.names.push((n.clone(), Some(idx), f.clone()));
+        wb.names_dirty = true;
+    }
+    // Restore cross-sheet formula qualifiers that were rewritten to #REF!
+    // Note: field sheet indices in `references` were recorded AFTER removing `idx`,
+    // so any sheet index >= idx in `references` now points to `si + 1` in `wb`.
+    let shift_field = |f: &ReferenceField| -> ReferenceField {
+        match *f {
+            ReferenceField::Formula(si, k) => ReferenceField::Formula(if si >= idx { si + 1 } else { si }, k),
+            ReferenceField::Conditional(si, bi, ri, n) => ReferenceField::Conditional(if si >= idx { si + 1 } else { si }, bi, ri, n),
+            ReferenceField::Validation(si, vi, fi) => ReferenceField::Validation(if si >= idx { si + 1 } else { si }, vi, fi),
+            ReferenceField::Chart(si, ci, s, fi) => ReferenceField::Chart(if si >= idx { si + 1 } else { si }, ci, s, fi),
+            ReferenceField::Name(i) => ReferenceField::Name(i),
+            ReferenceField::Source(i) => ReferenceField::Source(i),
+            ReferenceField::Pivot(i) => ReferenceField::Pivot(i),
+        }
+    };
+    let remapped: std::collections::HashMap<ReferenceField, (String, String)> = references
+        .0
+        .iter()
+        .map(|(k, v)| (shift_field(k), v.clone()))
+        .collect();
+    visit_references(wb, |field, text| {
+        let (before, after) = remapped.get(&field)?;
+        (text == after).then(|| before.clone())
+    });
+    wb.dirty = true;
+    true
+}
+
+/// Move a sheet from `from` to `to` (arbitrary reorder, shifting sheets in between).
+pub fn reorder_sheet(wb: &mut Workbook, from: usize, to: usize) -> bool {
+    if from == to || from >= wb.sheets.len() || to >= wb.sheets.len() {
+        return false;
+    }
+    let mut cur = from;
+    while cur < to {
+        if !move_sheet(wb, cur, cur + 1) {
+            return false;
+        }
+        cur += 1;
+    }
+    while cur > to {
+        if !move_sheet(wb, cur, cur - 1) {
+            return false;
+        }
+        cur -= 1;
+    }
     true
 }
 

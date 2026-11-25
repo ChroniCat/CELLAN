@@ -129,16 +129,25 @@ impl SheetApp {
         if self.edit_blocked() {
             return;
         }
+        if self.prot_denied(sheetcore::protection::ProtOp::AutoFilter, "使用自动筛选") {
+            return;
+        }
         let (r, c) = self.sel;
-        let val_text = {
+        let (val_text, disp_text) = {
             let sh = self.wb.sheet(self.sheet_idx);
             let cell = sh.get(r, c);
             match cell {
                 Some(cell) => {
+                    let raw = cell.value.display();
                     let st = self.wb.styles.get(sh.style_of(r, c));
-                    sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format)
+                    let disp = sheetcore::style::format_value_in(
+                        self.wb.date_system,
+                        &cell.value,
+                        &st.format,
+                    );
+                    (raw, disp)
                 }
-                None => String::new(),
+                None => (String::new(), String::new()),
             }
         };
         let sh = self.wb.sheet_mut(self.sheet_idx);
@@ -150,18 +159,25 @@ impl SheetApp {
             }
             sh.filter = Some(sheetcore::sort_filter::Filter::new(reg.0, reg.1, reg.2, reg.3));
         }
-        if let Some(f) = self.wb.sheet_mut(self.sheet_idx).filter.as_mut() {
+        if let Some(f) = sh.filter.as_mut() {
             if c >= f.range.1 && c <= f.range.3 {
                 f.criteria.remove(&c);
+                f.date_groups.remove(&c);
+                f.color_filters.remove(&c);
                 let mut set = std::collections::HashSet::new();
                 set.insert(val_text.clone());
                 f.allows.insert(c, set);
+                sh.filter_dirty = true;
             }
         }
         self.recalc_filter_hidden();
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
-        let disp = if val_text.is_empty() { "(空白)" } else { val_text.as_str() };
+        let disp = if disp_text.is_empty() {
+            "(空白)"
+        } else {
+            disp_text.as_str()
+        };
         self.status = format!("已按所选值 \"{disp}\" 筛选");
     }
 
@@ -178,6 +194,9 @@ impl SheetApp {
 
     /// 选中行自动调整行高（批量：单遍稀疏区域扫描 + 字号单行缓存 + 单次 `rows.set_many` 重建 + Undo）
     pub(crate) fn autofit_sel_rows(&mut self, ctx: &egui::Context) {
+        if self.prot_denied(sheetcore::protection::ProtOp::FormatRows, "调整行高") {
+            return;
+        }
         let (r1, _, mut r2, _) = self.sel_rect();
         if r2 - r1 > 2_000 {
             if let Some((_, _, ur2, _)) = self.wb.sheet(self.sheet_idx).used_bounds() {
@@ -205,6 +224,9 @@ impl SheetApp {
 
     /// 选中列自动调整列宽（批量：共享二分 `MergeIndex` + O(1) 数值格式宽度上界粗筛 + 并行扫描 + Undo）
     pub(crate) fn autofit_sel_cols(&mut self, ctx: &egui::Context) {
+        if self.prot_denied(sheetcore::protection::ProtOp::FormatColumns, "调整列宽") {
+            return;
+        }
         let (_, c1, _, mut c2) = self.sel_rect();
         if c2 - c1 > 500 {
             if let Some((_, _, _, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
@@ -249,36 +271,30 @@ impl SheetApp {
                 return;
             }
         }
-        let sh = self.wb.sheet_mut(self.sheet_idx);
-        let dxf_idx = sh.cf.dxfs.len();
-        sh.cf.dxfs.push(sheetcore::cf::Dxf {
-            fill: Some([255, 199, 206]),
-            color: Some([156, 0, 6]),
-            ..Default::default()
-        });
-        let next_prio = sh
-            .cf
-            .blocks
-            .iter()
-            .flat_map(|b| b.rules.iter().map(|r| r.priority))
-            .max()
-            .unwrap_or(0)
-            + 1;
-        sh.cf.blocks.push(sheetcore::cf::CfBlock {
-            ranges: vec![(r1, c1, r2, c2)],
-            rules: vec![sheetcore::cf::CfRule {
-                kind: sheetcore::cf::CfKind::Dup {
-                    unique: false,
-                    dxf: dxf_idx,
-                },
-                stop: false,
-                priority: next_prio,
-            }],
-        });
-        sh.cf_dirty = true;
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.status = format!("已高亮 {}:{} 中的重复值", cell_name(r1, c1), cell_name(r2, c2));
+        let dxf_idx = self.cf_dxf(false, Some([156, 0, 6]), Some([255, 199, 206]));
+        if self.mutate_cf("高亮重复值", |cf| {
+            let next_prio = cf
+                .blocks
+                .iter()
+                .flat_map(|b| b.rules.iter().map(|r| r.priority))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            cf.blocks.push(sheetcore::cf::CfBlock {
+                ranges: vec![(r1, c1, r2, c2)],
+                rules: vec![sheetcore::cf::CfRule {
+                    kind: sheetcore::cf::CfKind::Dup {
+                        unique: false,
+                        dxf: dxf_idx,
+                    },
+                    stop: false,
+                    priority: next_prio,
+                }],
+            });
+            true
+        }) {
+            self.status = format!("已高亮 {}:{} 中的重复值", cell_name(r1, c1), cell_name(r2, c2));
+        }
     }
 
     /// WPS：拒绝录入重复项（=COUNTIF($A$1:$A$100,A1)<=1 数据验证）
@@ -305,7 +321,9 @@ impl SheetApp {
         );
         let top_left = cell_name(r1, c1);
         let formula = format!("=COUNTIF({abs_range},{top_left})<=1");
-        let sh = self.wb.sheet_mut(self.sheet_idx);
+        let si = self.sheet_idx;
+        let before_dv = self.wb.sheet(si).dv.clone();
+        let sh = self.wb.sheet_mut(si);
         sh.dv.push(sheetcore::dv::DataValidation {
             ranges: vec![(r1, c1, r2, c2)],
             kind: sheetcore::dv::DvKind::Custom,
@@ -323,6 +341,16 @@ impl SheetApp {
             prompt_msg: String::new(),
         });
         sh.dv_dirty = true;
+        let after_dv = sh.dv.clone();
+        self.undo.push_meta(
+            "拒绝录入重复项",
+            (si, r1, c1),
+            sheetcore::undo::MetaEdit {
+                sheet: si,
+                dv: Some((before_dv, after_dv)),
+                ..Default::default()
+            },
+        );
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已设置 {}:{} 拒绝录入重复值", cell_name(r1, c1), cell_name(r2, c2));
@@ -752,13 +780,36 @@ impl SheetApp {
                     let gen_cell = if mode == FillMode::CopyCells {
                         scell.clone()
                     } else if let Some(ref nv) = nums {
-                        let val = if nv.len() >= 2 {
-                            let d = nv[1] - nv[0];
-                            nv[nv.len() - 1] + d * (step_k as f64)
-                        } else if mode == FillMode::FillSeries || is_date {
-                            nv[0] + (dir_sign as f64) * (step_k as f64)
-                        } else {
-                            nv[0]
+                        let val = match mode {
+                            FillMode::Weekdays | FillMode::Months | FillMode::Years => {
+                                fill_seq::next_date_serial(
+                                    *nv.last().unwrap(),
+                                    mode,
+                                    dir_sign,
+                                    step_k,
+                                    self.wb.date_system,
+                                )
+                            }
+                            FillMode::LinearTrend => {
+                                if nv.len() >= 2 {
+                                    fill_seq::fit_linear_trend(nv, step_k)
+                                } else {
+                                    nv[0] + (dir_sign as f64) * (step_k as f64)
+                                }
+                            }
+                            FillMode::GrowthTrend => {
+                                fill_seq::fit_growth_trend(nv, step_k)
+                                    .unwrap_or_else(|| fill_seq::fit_linear_trend(nv, step_k))
+                            }
+                            _ => {
+                                if nv.len() >= 2 {
+                                    fill_seq::fit_linear_trend(nv, step_k)
+                                } else if mode == FillMode::FillSeries || is_date {
+                                    nv[0] + (dir_sign as f64) * (step_k as f64)
+                                } else {
+                                    nv[0]
+                                }
+                            }
                         };
                         Some(Cell { value: Value::Number(val), formula: None })
                     } else if let Some(refs) = &text_samples {
@@ -830,13 +881,36 @@ impl SheetApp {
                     let gen_cell = if mode == FillMode::CopyCells {
                         scell.clone()
                     } else if let Some(ref nv) = nums {
-                        let val = if nv.len() >= 2 {
-                            let d = nv[1] - nv[0];
-                            nv[nv.len() - 1] + d * (step_k as f64)
-                        } else if mode == FillMode::FillSeries || is_date {
-                            nv[0] + (dir_sign as f64) * (step_k as f64)
-                        } else {
-                            nv[0]
+                        let val = match mode {
+                            FillMode::Weekdays | FillMode::Months | FillMode::Years => {
+                                fill_seq::next_date_serial(
+                                    *nv.last().unwrap(),
+                                    mode,
+                                    dir_sign,
+                                    step_k,
+                                    self.wb.date_system,
+                                )
+                            }
+                            FillMode::LinearTrend => {
+                                if nv.len() >= 2 {
+                                    fill_seq::fit_linear_trend(nv, step_k)
+                                } else {
+                                    nv[0] + (dir_sign as f64) * (step_k as f64)
+                                }
+                            }
+                            FillMode::GrowthTrend => {
+                                fill_seq::fit_growth_trend(nv, step_k)
+                                    .unwrap_or_else(|| fill_seq::fit_linear_trend(nv, step_k))
+                            }
+                            _ => {
+                                if nv.len() >= 2 {
+                                    fill_seq::fit_linear_trend(nv, step_k)
+                                } else if mode == FillMode::FillSeries || is_date {
+                                    nv[0] + (dir_sign as f64) * (step_k as f64)
+                                } else {
+                                    nv[0]
+                                }
+                            }
                         };
                         Some(Cell { value: Value::Number(val), formula: None })
                     } else if let Some(refs) = &text_samples {

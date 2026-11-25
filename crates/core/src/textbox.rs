@@ -26,12 +26,79 @@ pub fn sz_to_pt(sz: i64) -> f32 {
     sz as f32 / 100.0
 }
 
+/// 向量形状类别（对应 OOXML `<a:prstGeom prst="..."/>`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShapeKind {
+    #[default]
+    TextBox,
+    Rect,
+    RoundedRect,
+    RightArrow,
+    Line,
+    Ellipse,
+    Diamond,
+    Callout,
+}
+
+impl ShapeKind {
+    pub const ALL: [ShapeKind; 8] = [
+        ShapeKind::TextBox,
+        ShapeKind::Rect,
+        ShapeKind::RoundedRect,
+        ShapeKind::RightArrow,
+        ShapeKind::Line,
+        ShapeKind::Ellipse,
+        ShapeKind::Diamond,
+        ShapeKind::Callout,
+    ];
+
+    pub fn prst_geom(self) -> &'static str {
+        match self {
+            ShapeKind::TextBox | ShapeKind::Rect => "rect",
+            ShapeKind::RoundedRect => "roundRect",
+            ShapeKind::RightArrow => "rightArrow",
+            ShapeKind::Line => "line",
+            ShapeKind::Ellipse => "ellipse",
+            ShapeKind::Diamond => "diamond",
+            ShapeKind::Callout => "wedgeRoundRectCallout",
+        }
+    }
+
+    pub fn from_prst(prst: &str, is_tx_box: bool) -> Self {
+        match prst.trim() {
+            "roundRect" => ShapeKind::RoundedRect,
+            "rightArrow" | "leftArrow" | "upArrow" | "downArrow" => ShapeKind::RightArrow,
+            "line" | "straightConnector1" => ShapeKind::Line,
+            "ellipse" => ShapeKind::Ellipse,
+            "diamond" => ShapeKind::Diamond,
+            "wedgeRoundRectCallout" | "wedgeRectCallout" | "cloudCallout" => ShapeKind::Callout,
+            _ if is_tx_box => ShapeKind::TextBox,
+            _ => ShapeKind::Rect,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShapeKind::TextBox => "文本框",
+            ShapeKind::Rect => "矩形",
+            ShapeKind::RoundedRect => "圆角矩形",
+            ShapeKind::RightArrow => "右箭头",
+            ShapeKind::Line => "直线",
+            ShapeKind::Ellipse => "椭圆",
+            ShapeKind::Diamond => "菱形",
+            ShapeKind::Callout => "标注框",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextBox {
     /// cNvPr 的 id（写回时保持稳定，Excel 用它做对象标识）
     pub id: u32,
     /// 显示名（`文本框 1`）
     pub name: String,
+    /// 形状类型（默认 `ShapeKind::TextBox`；支持圆角矩形/箭头/直线/椭圆/菱形/标注框等矢量几何）
+    pub kind: ShapeKind,
     /// 左上锚点：(列, 列内偏移 EMU, 行, 行内偏移 EMU)
     pub from: (u32, i64, u32, i64),
     /// 右下锚点（同上）
@@ -57,6 +124,7 @@ impl Default for TextBox {
         Self {
             id: 2,
             name: "文本框 1".into(),
+            kind: ShapeKind::TextBox,
             from: (0, 0, 0, 0),
             to: (2, 0, 2, 0),
             text: String::new(),
@@ -239,6 +307,18 @@ pub fn parse_drawing(xml: &str) -> Vec<TextBox> {
                 if let Some(c) = solid_fill_in(chunk) {
                     tb.color = c;
                 }
+                // 形状预设几何：prstGeom + cNvSpPr txBox
+                let is_tx = find_tag(chunk, "xdr:cNvSpPr")
+                    .or_else(|| find_tag(chunk, "cNvSpPr"))
+                    .and_then(|t| attr(&t, "txBox"))
+                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                if let Some(pg) = find_tag(chunk, "a:prstGeom") {
+                    if let Some(prst) = attr(&pg, "prst") {
+                        tb.kind = ShapeKind::from_prst(&prst, is_tx);
+                    }
+                } else if !is_tx {
+                    tb.kind = ShapeKind::Rect;
+                }
                 // 填充 / 边框：spPr 里的 solidFill 与 a:ln
                 let sp_pr = find_block(chunk, "xdr:spPr").or_else(|| find_block(chunk, "spPr"));
                 if let Some(sp) = sp_pr {
@@ -362,9 +442,13 @@ pub fn anchor_xml(tb: &TextBox) -> String {
         "{:02X}{:02X}{:02X}",
         tb.color[0], tb.color[1], tb.color[2]
     );
-    let mut sp_pr = String::from(
-        "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>",
-    );
+    let prst = tb.kind.prst_geom();
+    let mut sp_pr = format!("<a:prstGeom prst=\"{prst}\"><a:avLst/></a:prstGeom>");
+    let tx_attr = if tb.kind == ShapeKind::TextBox {
+        " txBox=\"1\""
+    } else {
+        ""
+    };
     if let Some(f) = tb.fill {
         sp_pr.push_str(&format!(
             "<a:solidFill><a:srgbClr val=\"{:02X}{:02X}{:02X}\"/></a:solidFill>",
@@ -407,7 +491,7 @@ pub fn anchor_xml(tb: &TextBox) -> String {
 <xdr:from><xdr:col>{}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:from>\
 <xdr:to><xdr:col>{}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:to>\
 <xdr:sp macro=\"\" textlink=\"\">\
-<xdr:nvSpPr><xdr:cNvPr id=\"{}\" name=\"{}\"/><xdr:cNvSpPr txBox=\"1\"/></xdr:nvSpPr>\
+<xdr:nvSpPr><xdr:cNvPr id=\"{}\" name=\"{}\"/><xdr:cNvSpPr{tx_attr}/></xdr:nvSpPr>\
 <xdr:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></a:xfrm>{sp_pr}</xdr:spPr>\
 <xdr:txBody><a:bodyPr wrap=\"{}\" rtlCol=\"0\" anchor=\"t\"/><a:lstStyle/>{body}</xdr:txBody>\
 </xdr:sp><xdr:clientData/></xdr:twoCellAnchor>",
@@ -548,8 +632,6 @@ fn anchor_len(xml: &str) -> Option<usize> {
         }
     }
     let tag = used_tag?;
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
     // 自闭合
     let head_end = xml.find('>')?;
     if xml[..head_end].ends_with('/') {
@@ -585,9 +667,55 @@ fn anchor_len(xml: &str) -> Option<usize> {
     Some(from)
 }
 
-/// 命中形状的「原地改」：只换文字，并按模型调整 rPr（字号/粗体/斜体/颜色）。
-/// 返回 None 表示结构不认识，让调用方退回整块重写。
+/// 替换锚点中的 `<xdr:from>...</xdr:from>` 或 `<xdr:to>...</xdr:to>` 坐标，保留前缀与其它元素。
+fn replace_anchor_point(block: &str, which: &str, pt: (u32, i64, u32, i64)) -> Option<String> {
+    for prefix in ["xdr:", ""] {
+        let open = format!("<{prefix}{which}>");
+        let close = format!("</{prefix}{which}>");
+        if let Some(i) = block.find(&open) {
+            let rest = &block[i..];
+            let end_rel = rest.find(&close)?;
+            let end = i + end_rel + close.len();
+            let rep = format!(
+                "<{prefix}{which}><{prefix}col>{}</{prefix}col><{prefix}colOff>{}</{prefix}colOff><{prefix}row>{}</{prefix}row><{prefix}rowOff>{}</{prefix}rowOff></{prefix}{which}>",
+                pt.0, pt.1, pt.2, pt.3
+            );
+            let mut out = String::with_capacity(block.len() + rep.len());
+            out.push_str(&block[..i]);
+            out.push_str(&rep);
+            out.push_str(&block[end..]);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// 命中形状的「原地改」：同步锚点位置、文字、rPr（字号/粗体/斜体/颜色）、对齐与换行；
+/// 若填充或边框样式相对原块发生变化且无法原地修补，则返回 None 退回整块重写以防修改静默丢失。
 fn edit_block(block: &str, tb: &TextBox) -> Option<String> {
+    let orig = parse_drawing(block).into_iter().next();
+    // 填充/边框被用户改动时，原地修补 spPr（若 spPr 缺失或结构异常则退回整块重写）
+    let mut work = block.to_string();
+    if anchor_points(&work).is_none_or(|(f, t)| f != tb.from || t != tb.to) {
+        work = replace_anchor_point(&work, "from", tb.from)?;
+        work = replace_anchor_point(&work, "to", tb.to)?;
+    }
+    if let Some(ref parsed) = orig {
+        if parsed.kind != tb.kind {
+            // 形状几何类别改变时，直接退回整块重写以更新 prstGeom 与 txBox 属性
+            return None;
+        }
+        if parsed.fill != tb.fill || parsed.line != tb.line {
+            work = patch_sp_pr_style(&work, tb)?;
+        }
+        if parsed.align != tb.align {
+            work = patch_ppr_align(&work, tb.align);
+        }
+        if parsed.wrap != tb.wrap {
+            work = patch_body_wrap(&work, tb.wrap);
+        }
+    }
+    let block = work.as_str();
     // 空形状（Excel 写 <a:p/>，没有 <a:t>）：把文字插进第一个段落，仍然保留整块
     if !block.contains("<a:t") {
         // <a:endParaRPr> 必须是 <a:p> 的最后一个子元素，文字要插在它前面
@@ -621,6 +749,91 @@ fn edit_block(block: &str, tb: &TextBox) -> Option<String> {
     }
     out.push_str(rest);
     Some(tune_runs(&out, tb))
+}
+
+fn patch_sp_pr_style(block: &str, tb: &TextBox) -> Option<String> {
+    let (open_pat, close_pat) = if block.contains("<xdr:spPr") {
+        ("<xdr:spPr", "</xdr:spPr>")
+    } else if block.contains("<spPr") {
+        ("<spPr", "</spPr>")
+    } else {
+        return None;
+    };
+    let s = block.find(open_pat)?;
+    let gt = s + block[s..].find('>')?;
+    let e = gt + block[gt..].find(close_pat)?;
+    let inner = &block[gt + 1..e];
+    // 去掉旧填充与旧边框，保留 xfrm / prstGeom / effectLst 等其它子元素
+    let mut cleaned = strip_block(inner, "a:ln");
+    cleaned = strip_block(&cleaned, "a:solidFill");
+    cleaned = strip_block(&cleaned, "a:noFill");
+    cleaned = strip_block(&cleaned, "a:gradFill");
+    cleaned = strip_block(&cleaned, "a:pattFill");
+    let fill_xml = match tb.fill {
+        Some(f) => format!(
+            "<a:solidFill><a:srgbClr val=\"{:02X}{:02X}{:02X}\"/></a:solidFill>",
+            f[0], f[1], f[2]
+        ),
+        None => "<a:noFill/>".to_string(),
+    };
+    let line_xml = match tb.line {
+        Some(l) => format!(
+            "<a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"{:02X}{:02X}{:02X}\"/></a:solidFill></a:ln>",
+            l[0], l[1], l[2]
+        ),
+        None => "<a:ln><a:noFill/></a:ln>".to_string(),
+    };
+    // OOXML CT_ShapeProperties 顺序：xfrm → prstGeom/custGeom → fill → ln → effectLst
+    let insert_at = cleaned
+        .find("<a:effectLst")
+        .or_else(|| cleaned.find("<a:scene3d"))
+        .or_else(|| cleaned.find("<a:sp3d"))
+        .or_else(|| cleaned.find("<a:extLst"))
+        .unwrap_or(cleaned.len());
+    cleaned.insert_str(insert_at, &format!("{fill_xml}{line_xml}"));
+    let mut out = String::with_capacity(block.len() + 64);
+    out.push_str(&block[..gt + 1]);
+    out.push_str(&cleaned);
+    out.push_str(&block[e..]);
+    Some(out)
+}
+
+fn patch_ppr_align(xml: &str, align: u8) -> String {
+    let algn = match align {
+        1 => "ctr",
+        2 => "r",
+        _ => "l",
+    };
+    if !xml.contains("<a:pPr") {
+        return xml.replacen("<a:p>", &format!("<a:p><a:pPr algn=\"{algn}\"/>"), 1);
+    }
+    let mut out = String::with_capacity(xml.len() + 16);
+    let mut rest = xml;
+    while let Some(i) = rest.find("<a:pPr") {
+        out.push_str(&rest[..i]);
+        let seg = &rest[i..];
+        let Some(gt) = seg.find('>') else {
+            out.push_str(seg);
+            return out;
+        };
+        let tag = set_attr(&seg[..=gt], "algn", algn);
+        out.push_str(&tag);
+        rest = &seg[gt + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn patch_body_wrap(xml: &str, wrap: bool) -> String {
+    let val = if wrap { "square" } else { "none" };
+    if let Some(i) = xml.find("<a:bodyPr") {
+        let seg = &xml[i..];
+        if let Some(gt) = seg.find('>') {
+            let tag = set_attr(&seg[..=gt], "wrap", val);
+            return format!("{}{}{}", &xml[..i], tag, &seg[gt + 1..]);
+        }
+    }
+    xml.to_string()
 }
 
 /// 把 `<a:rPr>` 的字号/粗体/斜体/颜色对齐模型；没有 rPr 就不动
@@ -694,12 +907,25 @@ fn anchor_name(block: &str) -> Option<String> {
     Some(crate::model::xml_unescape(&rest[..q]))
 }
 
-/// 文本与锚点几何都没变 → 保留原块（我们的 anchor_xml 写不出 Excel 的细节）
+/// 文本、锚点几何与全部已建模样式都没变 → 保留原块（避免丢 Excel 细节）
 fn block_matches(block: &str, tb: &TextBox) -> bool {
     if anchor_text(block) != tb.text {
         return false;
     }
-    anchor_points(block).map(|(f, t)| f == tb.from && t == tb.to).unwrap_or(false)
+    if !anchor_points(block).is_some_and(|(f, t)| f == tb.from && t == tb.to) {
+        return false;
+    }
+    let Some(parsed) = parse_drawing(block).into_iter().next() else {
+        return false;
+    };
+    parsed.fill == tb.fill
+        && parsed.line == tb.line
+        && (parsed.size - tb.size).abs() < 0.01
+        && parsed.bold == tb.bold
+        && parsed.italic == tb.italic
+        && parsed.color == tb.color
+        && parsed.align == tb.align
+        && parsed.wrap == tb.wrap
 }
 
 fn anchor_text(block: &str) -> String {
@@ -1082,6 +1308,7 @@ mod tests {
         let tb = TextBox {
             id: 7,
             name: "文本框 2".into(),
+            kind: ShapeKind::TextBox,
             from: (1, 5000, 2, 6000),
             to: (4, 10000, 8, 12000),
             text: "第一行\n第二行".into(),
