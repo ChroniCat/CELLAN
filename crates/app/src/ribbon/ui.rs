@@ -1072,7 +1072,8 @@ fn menu_a11y(
             if bg != Color32::TRANSPARENT {
                 ui.painter().rect_filled(rect, 4.0, bg);
             }
-            let fg = if enabled { ui_kit::TEXT } else { ui_kit::DISABLED };
+            let pal = crate::theme::palette();
+            let fg = if enabled { pal.text } else { ui_kit::DISABLED };
             if let Some(g) = galley {
                 let pos = Align2::LEFT_CENTER
                     .anchor_size(egui::pos2(rect.left() + 8.0, rect.center().y), g.size())
@@ -1082,7 +1083,7 @@ fn menu_a11y(
             ui_kit::caret(
                 ui,
                 egui::pos2(rect.right() - 8.0, rect.center().y + 0.5),
-                if enabled { Color32::from_rgb(100, 116, 139) } else { ui_kit::DISABLED },
+                if enabled { pal.text_weak } else { ui_kit::DISABLED },
             );
             if rc.a11y {
                 let tip = tip_of(ctl);
@@ -1126,25 +1127,26 @@ fn dropdown(
             .unwrap_or_else(|| 96.0_f32.max(galley.size().x + 30.0));
         let (rect, r) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
         let enabled = ui.is_enabled();
+        let pal = crate::theme::palette();
         let hover = r.hovered() && enabled;
         ui.painter().rect(
             rect,
             5.0,
             if !enabled {
-                ui_kit::HOVER
+                pal.hover
             } else if hover {
-                Color32::from_rgb(244, 247, 251)
+                pal.hover
             } else {
-                Color32::from_rgb(250, 251, 253)
+                pal.card_bg
             },
             egui::Stroke::new(
                 1.0,
                 if !enabled {
-                    Color32::from_rgb(226, 232, 240)
+                    pal.card_border
                 } else if hover {
-                    Color32::from_rgb(176, 188, 204)
+                    pal.accent
                 } else {
-                    ui_kit::CARD_BORDER
+                    pal.card_border
                 },
             ),
             egui::StrokeKind::Inside,
@@ -1155,12 +1157,12 @@ fn dropdown(
         ui.painter().galley(
             pos,
             galley,
-            if enabled { ui.visuals().text_color() } else { ui_kit::DISABLED },
+            if enabled { pal.text } else { ui_kit::DISABLED },
         );
         ui_kit::caret(
             ui,
             egui::pos2(rect.right() - 8.0, rect.center().y),
-            if enabled { Color32::from_rgb(68, 68, 68) } else { ui_kit::DISABLED },
+            if enabled { pal.text_weak } else { ui_kit::DISABLED },
         );
         attach_lazy_tip(r, st.tip.as_deref(), c)
     });
@@ -1211,25 +1213,26 @@ fn combo(
     let clicked = ui.add_enabled_ui(enabled, |ui| {
         let w = c.width.unwrap_or(width).max(52.0);
         let (rect, r) = ui.allocate_exact_size(Vec2::new(w, 22.0), Sense::click());
+        let pal = crate::theme::palette();
         let hover = r.hovered() && enabled;
         ui.painter().rect(
             rect,
             5.0,
             if !enabled {
-                ui_kit::HOVER
+                pal.hover
             } else if hover {
-                Color32::from_rgb(244, 247, 251)
+                pal.hover
             } else {
-                Color32::from_rgb(250, 251, 253)
+                pal.card_bg
             },
             egui::Stroke::new(
                 1.0,
                 if !enabled {
-                    Color32::from_rgb(226, 232, 240)
+                    pal.card_border
                 } else if hover {
-                    Color32::from_rgb(176, 188, 204)
+                    pal.accent
                 } else {
-                    ui_kit::CARD_BORDER
+                    pal.card_border
                 },
             ),
             egui::StrokeKind::Inside,
@@ -1239,12 +1242,12 @@ fn combo(
             Align2::LEFT_CENTER,
             cur,
             FontId::proportional(12.0),
-            if enabled { ui_kit::TEXT } else { ui_kit::DISABLED },
+            if enabled { pal.text } else { ui_kit::DISABLED },
         );
         ui_kit::caret(
             ui,
             egui::pos2(rect.right() - 8.0, rect.center().y),
-            if enabled { Color32::from_rgb(68, 68, 68) } else { ui_kit::DISABLED },
+            if enabled { pal.text_weak } else { ui_kit::DISABLED },
         );
         attach_lazy_tip(r, st.tip.as_deref(), c)
     });
@@ -1326,20 +1329,21 @@ fn label(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, l: &Labe
                 );
                 x += 24.0;
             }
-            ui.label(egui::RichText::new(text).size(l.size).color(ui_kit::TEXT_WEAK));
+            ui.label(egui::RichText::new(text).size(l.size).color(crate::theme::palette().text_weak));
         });
         return;
     }
 
     if l.id == "AreaLabel" {
+        let pal = crate::theme::palette();
         ui.add_space(12.0);
         let cw = 76.0_f32.max(measure(ui, text, 12.0) + 18.0);
         let (cr, _) = ui.allocate_exact_size(Vec2::new(cw, 46.0), Sense::hover());
         ui.painter().rect(
             cr,
             6.0,
-            Color32::from_rgb(248, 250, 252),
-            egui::Stroke::new(1.0, ui_kit::CARD_BORDER),
+            pal.card_bg,
+            egui::Stroke::new(1.0, pal.card_border),
             egui::StrokeKind::Inside,
         );
         ui.painter().text(
@@ -1347,14 +1351,14 @@ fn label(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, l: &Labe
             Align2::CENTER_CENTER,
             "当前区域",
             FontId::proportional(10.0),
-            ui_kit::TEXT_WEAK,
+            pal.text_weak,
         );
         ui.painter().text(
             egui::pos2(cr.center().x, cr.bottom() - 13.0),
             Align2::CENTER_CENTER,
             text,
             FontId::monospace(12.0),
-            ui_kit::BRAND_NAVY,
+            pal.info_fg,
         );
         return;
     }
@@ -1370,7 +1374,7 @@ fn label(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, l: &Labe
 
     let mut t = egui::RichText::new(text).size(l.size);
     if mono {
-        t = t.monospace().color(ui_kit::TEXT);
+        t = t.monospace().color(crate::theme::palette().text);
     }
     if weak {
         t = t.weak();
@@ -1578,7 +1582,7 @@ fn paste_visual_grid(
         ui.label(
             egui::RichText::new("粘贴选项")
                 .size(11.0)
-                .color(ui_kit::TEXT_WEAK),
+                .color(crate::theme::palette().text_weak),
         );
     });
     ui.add_space(3.0);
@@ -2064,12 +2068,13 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
     let mut arrow_pos = egui::pos2(0.0, 0.0);
     let mut arrow_clicked = false;
     {
+        let pal = crate::theme::palette();
         let (crect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
         ui.painter().rect(
             crect,
             5.0,
-            Color32::from_rgb(250, 251, 253),
-            egui::Stroke::new(1.0, ui_kit::CARD_BORDER),
+            pal.card_bg,
+            egui::Stroke::new(1.0, pal.card_border),
             egui::StrokeKind::Inside,
         );
         let arrow_rect = Rect::from_min_max(
@@ -2102,7 +2107,7 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
                 egui::Align2::LEFT_CENTER,
                 "思源黑体",
                 egui::FontId::proportional(12.0),
-                ui_kit::TEXT,
+                crate::theme::palette().text,
             );
         }
         lost = fr.lost_focus();
@@ -2118,7 +2123,7 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
         }
         arrow_pos = egui::pos2(crect.left(), crect.bottom());
         let c = arrow_rect.center();
-        ui_kit::caret(ui, c, Color32::from_rgb(68, 68, 68));
+        ui_kit::caret(ui, c, crate::theme::palette().text_weak);
         if ar.clicked() {
             arrow_clicked = true;
         }
@@ -2193,12 +2198,13 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
     let mut arrow_pos = egui::pos2(0.0, 0.0);
     let mut arrow_clicked = false;
     {
+        let pal = crate::theme::palette();
         let (crect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
         ui.painter().rect(
             crect,
             5.0,
-            Color32::from_rgb(250, 251, 253),
-            egui::Stroke::new(1.0, ui_kit::CARD_BORDER),
+            pal.card_bg,
+            egui::Stroke::new(1.0, pal.card_border),
             egui::StrokeKind::Inside,
         );
         let arrow_rect = Rect::from_min_max(
@@ -2235,7 +2241,7 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
         }
         arrow_pos = egui::pos2(crect.left(), crect.bottom());
         let c = arrow_rect.center();
-        ui_kit::caret(ui, c, Color32::from_rgb(68, 68, 68));
+        ui_kit::caret(ui, c, crate::theme::palette().text_weak);
         if ar.clicked() {
             arrow_clicked = true;
         }
@@ -2383,7 +2389,7 @@ fn gallery(
             Align2::CENTER_CENTER,
             &it.label,
             FontId::proportional(9.0),
-            ui_kit::TEXT_WEAK,
+            crate::theme::palette().text_weak,
         );
         if resp.clicked() && enabled {
             fire = Some(it.id.clone());

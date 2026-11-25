@@ -176,7 +176,7 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
 }
 
 pub(crate) fn sheet_layout(xml: &str, dxfs: &[crate::cf::Dxf], dxf_ext: bool) -> SheetLayout {
-    let mut layout = parse_layout(xml);
+    let mut layout = parse_layout_with_dxfs(xml, dxfs);
     (layout.scenario_settings, layout.scenarios) = crate::scenarios::parse_with_settings(xml);
     layout.cf = crate::cf::parse_cf_blocks(xml);
     layout.cf_ext = crate::cf::xml_has_cf_ext(xml);
@@ -187,13 +187,22 @@ pub(crate) fn sheet_layout(xml: &str, dxfs: &[crate::cf::Dxf], dxf_ext: bool) ->
 }
 
 /// 一次扫描拿到合并区域、列宽、行高、冻结窗格
+#[cfg(test)]
 fn parse_layout(xml: &str) -> SheetLayout {
+    parse_layout_with_dxfs(xml, &[])
+}
+
+fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
     let mut out = SheetLayout::default();
     let mut af_range: Option<(u32, u32, u32, u32)> = None;
     let mut cur_col: Option<u32> = None;
     let mut af_criteria: std::collections::HashMap<u32, crate::sort_filter::Criterion> =
         std::collections::HashMap::new();
     let mut af_allows: std::collections::HashMap<u32, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut af_date_groups: std::collections::HashMap<u32, Vec<crate::sort_filter::DateGroupItem>> =
+        std::collections::HashMap::new();
+    let mut af_color_filters: std::collections::HashMap<u32, crate::sort_filter::ColorFilter> =
         std::collections::HashMap::new();
     let mut freeze_y = 0u32;
     let mut freeze_x = 0u32;
@@ -439,6 +448,62 @@ fn parse_layout(xml: &str) -> SheetLayout {
                             }
                         }
                     }
+                } else if name.ends_with("dateGroupItem") {
+                    if let (Some(col), Some(range)) = (cur_col, af_range) {
+                        let mut year: Option<i32> = None;
+                        let mut month: Option<u32> = None;
+                        let mut day: Option<u32> = None;
+                        let mut grouping = String::new();
+                        for a in e.attributes().flatten() {
+                            let k = a.key.as_ref();
+                            let v = crate::model::xml_unescape(&a.value.to_string());
+                            if k.ends_with("year") {
+                                year = v.parse().ok();
+                            } else if k.ends_with("month") {
+                                month = v.parse().ok();
+                            } else if k.ends_with("day") {
+                                day = v.parse().ok();
+                            } else if k.ends_with("dateTimeGrouping") {
+                                grouping = v;
+                            }
+                        }
+                        if let Some(y) = year {
+                            let item = match grouping.as_str() {
+                                "year" => crate::sort_filter::DateGroupItem { year: y, month: None, day: None },
+                                "month" => crate::sort_filter::DateGroupItem { year: y, month, day: None },
+                                _ => crate::sort_filter::DateGroupItem { year: y, month, day },
+                            };
+                            af_date_groups.entry(range.1 + col).or_default().push(item);
+                        }
+                    }
+                } else if name.ends_with("colorFilter") {
+                    if let (Some(col), Some(range)) = (cur_col, af_range) {
+                        let mut dxf_id: Option<usize> = None;
+                        let mut cell_color = true;
+                        for a in e.attributes().flatten() {
+                            let k = a.key.as_ref();
+                            let v = crate::model::xml_unescape(&a.value.to_string());
+                            if k.ends_with("dxfId") {
+                                dxf_id = v.parse().ok();
+                            } else if k.ends_with("cellColor") {
+                                cell_color = v != "0" && !v.eq_ignore_ascii_case("false");
+                            }
+                        }
+                        let key = range.1 + col;
+                        if cell_color {
+                            match dxf_id.and_then(|id| dxfs.get(id)) {
+                                Some(dxf) if dxf.fill.is_some() => {
+                                    af_color_filters.insert(key, crate::sort_filter::ColorFilter::Fill(dxf.fill));
+                                }
+                                None => {
+                                    af_color_filters.insert(key, crate::sort_filter::ColorFilter::Fill(None));
+                                }
+                                _ => {}
+                            }
+                        } else if let Some(rgb) = dxf_id.and_then(|id| dxfs.get(id)).and_then(|d| d.color) {
+                            af_color_filters.insert(key, crate::sort_filter::ColorFilter::Font(rgb));
+                        }
+                    }
                 } else if name.ends_with("pane") {
                     let mut x = 0u32;
                     let mut y = 0u32;
@@ -472,6 +537,8 @@ fn parse_layout(xml: &str) -> SheetLayout {
         let mut f = crate::sort_filter::Filter::new(range.0, range.1, range.2, range.3);
         f.allows = af_allows.into();
         f.criteria = af_criteria;
+        f.date_groups = af_date_groups;
+        f.color_filters = af_color_filters;
         out.filter = Some(f);
     }
     out

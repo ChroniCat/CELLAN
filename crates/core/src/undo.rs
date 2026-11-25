@@ -467,10 +467,52 @@ struct MetaAction {
     edit: MetaEdit,
 }
 
+/// 数组公式登记（Ctrl+Shift+Enter）的前后快照：用于单步撤销/重做 CSE 数组范围。
+#[derive(Clone, Debug)]
+pub struct ArrayEdit {
+    pub sheet: usize,
+    pub before: Vec<(CellRef, (u32, u32, u32, u32))>,
+    pub after: Vec<(CellRef, (u32, u32, u32, u32))>,
+}
+
+impl ArrayEdit {
+    fn apply(&self, sheets: &mut [Sheet], redo: bool, touched: &mut Vec<(usize, u32, u32)>) {
+        let Some(sheet) = sheets.get_mut(self.sheet) else {
+            return;
+        };
+        let target = if redo { &self.after } else { &self.before };
+        for &(anchor, (r1, c1, r2, c2)) in self.before.iter().chain(&self.after) {
+            touched.push((self.sheet, anchor.row, anchor.col));
+            if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 <= 4_096 {
+                for r in r1..=r2 {
+                    for c in c1..=c2 {
+                        touched.push((self.sheet, r, c));
+                    }
+                }
+            }
+        }
+        // 清理原有 CSE 范围的溢出尾格（撤销回到普通公式时避免残留旧数组值）
+        let prev = if redo { &self.before } else { &self.after };
+        for &(anchor, (r1, c1, r2, c2)) in prev {
+            sheet.spill_shapes.remove(&anchor);
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    let k = CellRef::new(r, c);
+                    if k != anchor && sheet.spilled.remove_if_present(&k) {
+                        sheet.remove(r, c);
+                    }
+                }
+            }
+        }
+        sheet.arrays = target.clone();
+        sheet.bump_display_style_revision();
+    }
+}
+
 pub const COW_BATCH_THRESHOLD: usize = 16_384;
 
 enum Entry {
-    Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>),
+    Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>, Option<ArrayEdit>),
     CowBatch(EntryStamp, Box<CowBatchAction>),
     NumericSort(EntryStamp, NumericSortAction),
     Structure(EntryStamp, StructureAction),
@@ -483,7 +525,7 @@ impl Entry {
 
     fn stamp(&self) -> EntryStamp {
         match self {
-            Self::Cells(s, _, _)
+            Self::Cells(s, _, _, _)
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
@@ -494,7 +536,7 @@ impl Entry {
 
     fn stamp_mut(&mut self) -> &mut EntryStamp {
         match self {
-            Self::Cells(s, _, _)
+            Self::Cells(s, _, _, _)
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
@@ -505,7 +547,7 @@ impl Entry {
 
     fn simple_cells(&self) -> Option<Box<dyn Iterator<Item = (usize, u32, u32)> + '_>> {
         match self {
-            Self::Cells(_, a, _) if a.snap_before.is_none() && a.snap_after.is_none()
+            Self::Cells(_, a, _, None) if a.snap_before.is_none() && a.snap_after.is_none()
                 && a.merges.is_none() && a.shapes.is_none() && a.pictures.is_none()
                 && a.refresh_sizes.is_none() => Some(Box::new(a.deltas.iter().map(|d| (d.sheet, d.row, d.col)))),
             Self::CowBatch(_, a)
@@ -529,7 +571,7 @@ impl Entry {
 
     fn label(&self) -> &str {
         match self {
-            Self::Cells(_, a, _) => &a.label,
+            Self::Cells(_, a, _, _) => &a.label,
             Self::CowBatch(_, a) => &a.label,
             Self::NumericSort(_, a) => &a.label,
             Self::Structure(_, a) => &a.label,
@@ -539,7 +581,7 @@ impl Entry {
     }
     fn by_site(&self) -> u32 {
         match self {
-            Self::Cells(_, a, _) => a.by_site,
+            Self::Cells(_, a, _, _) => a.by_site,
             Self::CowBatch(_, a) => a.by_site,
             Self::NumericSort(_, a) => a.by_site,
             Self::Structure(_, a) => a.by_site,
@@ -1756,6 +1798,18 @@ impl UndoStack {
         self.push_prepared(action.prepare());
     }
 
+    pub fn push_with_arrays(&mut self, mut action: Action, arrays: Option<ArrayEdit>) {
+        if action.is_empty() && arrays.is_none() {
+            return;
+        }
+        if action.by_site == 0 {
+            action.by_site = self.site;
+        }
+        let bytes = action.payload_bytes();
+        self.done.push(Entry::Cells(next_entry(bytes), action, None, arrays));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
     pub fn push_prepared(&mut self, PreparedAction(action, bytes): PreparedAction) {
         if action.is_empty() {
             return;
@@ -1768,7 +1822,7 @@ impl UndoStack {
         if let Some((cow, cow_bytes)) = CowBatchAction::from_action(&action) {
             self.done.push(Entry::CowBatch(next_entry(cow_bytes), Box::new(cow)));
         } else {
-            self.done.push(Entry::Cells(next_entry(bytes), action, None));
+            self.done.push(Entry::Cells(next_entry(bytes), action, None, None));
         }
         // 新动作让「重做」失效
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
@@ -2013,7 +2067,7 @@ impl UndoStack {
     /// Called immediately after recording the nonempty cell action for a sort.
     pub fn tag_sorted_cells(&mut self, order: crate::data_tools::LinePermutation) {
         match self.done.last_mut() {
-            Some(Entry::Cells(stamp, _, slot)) => {
+            Some(Entry::Cells(stamp, _, slot, _)) => {
                 stamp.payload_bytes += order.2.capacity() * size_of::<u32>();
                 *slot = Some(order);
                 self.trim_history(HISTORY_PAYLOAD_BUDGET);
@@ -2030,7 +2084,7 @@ impl UndoStack {
     pub fn next_sort_permutation(&self, redo: bool) -> Option<crate::data_tools::LinePermutation> {
         let entry = if redo { self.undone.last()? } else { self.done.last()? };
         let (region, horizontal, mut order) = match entry {
-            Entry::Cells(_, _, Some(p)) => p.clone(),
+            Entry::Cells(_, _, Some(p), _) => p.clone(),
             Entry::CowBatch(_, a) if a.excluded.is_empty() => a.permutation.clone()?,
             Entry::NumericSort(_, a) if a.excluded.is_empty() => a.sort.permutation(),
             _ => return None,
@@ -2190,7 +2244,7 @@ impl UndoStack {
             if keep { self.undone.push(entry); }
             return Some(applied);
         }
-        let Entry::Cells(id, mut action, mut permutation) = self.done.pop()? else { unreachable!() };
+        let Entry::Cells(id, mut action, mut permutation, arrays) = self.done.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
@@ -2211,7 +2265,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
-            self.undone.push(Entry::Cells(id, action, permutation));
+            self.undone.push(Entry::Cells(id, action, permutation, arrays));
             return Some(applied);
         }
         if let Some(sh) = action.shapes.clone() {
@@ -2230,7 +2284,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
-            self.undone.push(Entry::Cells(id, action, permutation));
+            self.undone.push(Entry::Cells(id, action, permutation, arrays));
             return Some(applied);
         }
         let merged = action.merges.as_ref().map(|edit| {
@@ -2241,7 +2295,7 @@ impl UndoStack {
         if merge_conflict {
             let label = action.label.clone();
             let focus = action.focus;
-            self.done.push(Entry::Cells(id, action, permutation));
+            self.done.push(Entry::Cells(id, action, permutation, arrays));
             return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true, total_touched: 0 });
         }
         if let Some(snap) = action.snap_before.clone() {
@@ -2261,7 +2315,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched,
             };
-            self.undone.push(Entry::Cells(id, action, permutation));
+            self.undone.push(Entry::Cells(id, action, permutation, arrays));
             return Some(applied);
         }
         let mut excluded = std::collections::HashSet::new();
@@ -2273,6 +2327,9 @@ impl UndoStack {
             }
             d.replay(sheet, false, &mut style_changes);
             touched.push((d.sheet,d.row,d.col));
+        }
+        if let Some(arr) = &arrays {
+            arr.apply(sheets, false, &mut touched);
         }
         skipped = excluded.len();
         if skipped != 0 {
@@ -2292,7 +2349,7 @@ impl UndoStack {
             merge_conflict: false,
             total_touched,
         };
-        if !action.is_empty() { self.undone.push(Entry::Cells(id, action, permutation)); }
+        if !action.is_empty() || arrays.is_some() { self.undone.push(Entry::Cells(id, action, permutation, arrays)); }
         Some(applied)
     }
 
@@ -2346,7 +2403,7 @@ impl UndoStack {
             if keep { self.done.push(entry); }
             return Some(applied);
         }
-        let Entry::Cells(id, mut action, mut permutation) = self.undone.pop()? else { unreachable!() };
+        let Entry::Cells(id, mut action, mut permutation, arrays) = self.undone.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
@@ -2367,7 +2424,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
-            self.done.push(Entry::Cells(id, action, permutation));
+            self.done.push(Entry::Cells(id, action, permutation, arrays));
             return Some(applied);
         }
         if let Some(sh) = action.shapes.clone() {
@@ -2386,7 +2443,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
-            self.done.push(Entry::Cells(id, action, permutation));
+            self.done.push(Entry::Cells(id, action, permutation, arrays));
             return Some(applied);
         }
         let merged = action.merges.as_ref().map(|edit| {
@@ -2397,7 +2454,7 @@ impl UndoStack {
         if merge_conflict {
             let label = action.label.clone();
             let focus = action.focus;
-            self.undone.push(Entry::Cells(id, action, permutation));
+            self.undone.push(Entry::Cells(id, action, permutation, arrays));
             return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true, total_touched: 0 });
         }
         if let Some(snap) = action.snap_after.clone() {
@@ -2417,7 +2474,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched,
             };
-            self.done.push(Entry::Cells(id, action, permutation));
+            self.done.push(Entry::Cells(id, action, permutation, arrays));
             return Some(applied);
         }
         let mut excluded = std::collections::HashSet::new();
@@ -2429,6 +2486,9 @@ impl UndoStack {
             }
             d.replay(sheet, true, &mut style_changes);
             touched.push((d.sheet,d.row,d.col));
+        }
+        if let Some(arr) = &arrays {
+            arr.apply(sheets, true, &mut touched);
         }
         skipped = excluded.len();
         if skipped != 0 {
@@ -2448,7 +2508,7 @@ impl UndoStack {
             merge_conflict: false,
             total_touched,
         };
-        if !action.is_empty() { self.done.push(Entry::Cells(id, action, permutation)); }
+        if !action.is_empty() || arrays.is_some() { self.done.push(Entry::Cells(id, action, permutation, arrays)); }
         Some(applied)
     }
 
@@ -2860,4 +2920,56 @@ pub fn sparse_rect_keys(sheet: &Sheet, r1: u32, c1: u32, r2: u32, c2: u32) -> Ve
     keys.sort_unstable();
     keys.dedup();
     keys
+}
+
+#[cfg(test)]
+mod array_edit_tests {
+    use super::*;
+    use crate::model::{Cell, Value, Workbook};
+
+    #[test]
+    fn array_edit_undo_and_redo_restore_cse_range_and_cells() {
+        let mut wb = Workbook::new_blank();
+        let mut undo = UndoStack::new();
+        let before_arrays = wb.sheet(0).arrays.clone();
+        let keys = vec![(0u32, 0u32), (1, 0)];
+        let txn = capture(&wb.sheets[0], 0, &keys);
+        {
+            let sh = wb.sheet_mut(0);
+            sh.arrays.push((CellRef::new(0, 0), (0, 0, 1, 0)));
+            sh.set(0, 0, Cell { value: Value::Number(2.0), formula: Some("=1+1".into()) });
+            sh.set(1, 0, Cell { value: Value::Number(2.0), formula: Some("=1+1".into()) });
+        }
+        let after_arrays = wb.sheet(0).arrays.clone();
+        let deltas = finish(txn, &wb.sheets[0]);
+        undo.push_with_arrays(
+            Action {
+                label: "数组公式".into(),
+                deltas,
+                merges: None,
+                focus: (0, 0, 0),
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                pictures: None,
+                shapes: None,
+                refresh_sizes: None,
+            },
+            Some(ArrayEdit {
+                sheet: 0,
+                before: before_arrays,
+                after: after_arrays,
+            }),
+        );
+
+        assert_eq!(wb.sheet(0).arrays.len(), 1);
+        assert!(undo.undo(&mut wb.sheets, |_, _, _, _| true).is_some());
+        assert!(wb.sheet(0).arrays.is_empty());
+        assert_eq!(wb.sheet(0).value(0, 0), Value::Empty);
+
+        assert!(undo.redo(&mut wb.sheets, |_, _, _, _| true).is_some());
+        assert_eq!(wb.sheet(0).arrays.len(), 1);
+        assert_eq!(wb.sheet(0).value(0, 0), Value::Number(2.0));
+        assert_eq!(wb.sheet(0).value(1, 0), Value::Number(2.0));
+    }
 }

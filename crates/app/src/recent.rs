@@ -161,7 +161,48 @@ fn trim_preserving_pinned(list: &mut Vec<RecentEntry>) {
 
 fn is_network_path(p: &Path) -> bool {
     let s = p.to_string_lossy();
-    s.starts_with("\\\\") || s.starts_with("//")
+    if s.starts_with("\\\\") || s.starts_with("//") {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // 识别 Windows 映射网络驱动器（例如 Z:\report.xlsx），含暂时断线/不可达的持久化映射盘，
+        // 避免手动清理最近文件时把网络盘条目误删。
+        let bytes = s.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            let letter = bytes[0].to_ascii_uppercase() as u16;
+            let root_w = [letter, b':' as u16, b'\\' as u16, 0u16];
+            let local_w = [letter, b':' as u16, 0u16];
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+            }
+            const DRIVE_REMOTE: u32 = 4;
+            let dtype = unsafe { GetDriveTypeW(root_w.as_ptr()) };
+            if dtype == DRIVE_REMOTE {
+                return true;
+            }
+            // 映射盘暂时断开时 GetDriveTypeW 可能返回 DRIVE_NO_ROOT_DIR(1)，进一步向 MPR 查询持久映射表。
+            #[link(name = "mpr")]
+            unsafe extern "system" {
+                fn WNetGetConnectionW(
+                    lp_local_name: *const u16,
+                    lp_remote_name: *mut u16,
+                    lpn_length: *mut u32,
+                ) -> u32;
+            }
+            const NO_ERROR: u32 = 0;
+            const ERROR_MORE_DATA: u32 = 234;
+            const ERROR_CONNECTION_UNAVAIL: u32 = 1201;
+            let mut buf = [0u16; 260];
+            let mut len = buf.len() as u32;
+            let rc = unsafe { WNetGetConnectionW(local_w.as_ptr(), buf.as_mut_ptr(), &mut len) };
+            if matches!(rc, NO_ERROR | ERROR_MORE_DATA | ERROR_CONNECTION_UNAVAIL) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn same(a: &Path, b: &Path) -> bool {

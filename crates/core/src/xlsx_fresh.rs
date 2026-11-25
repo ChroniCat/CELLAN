@@ -415,7 +415,9 @@ fn direct_sheet_shell_xml(sheet: &Sheet, tab_selected: bool) -> Result<String> {
     if sheet.protection.is_some() {
         shell = crate::patch::set_sheet_protection(&shell, sheet.protection.as_ref());
     }
-    if let Some(f) = &sheet.filter {
+    if let Some(f) = &sheet.filter
+        && f.color_filters.is_empty()
+    {
         shell = crate::patch::insert_auto_filter(&shell, &crate::patch::auto_filter_xml(f));
     }
     if !sheet.cf.blocks.is_empty() && sheet.cf.dxfs.is_empty() {
@@ -692,6 +694,7 @@ pub(super) fn can_write_direct(wb: &Workbook, wants_macro: bool) -> bool {
     }
     wb.sheets.iter().all(|s| {
         s.cf.dxfs.is_empty()
+            && s.filter.as_ref().is_none_or(|f| f.color_filters.is_empty())
             && s.notes.is_empty()
             && !s.scenario_settings.has_source()
             && s.scenarios.is_empty()

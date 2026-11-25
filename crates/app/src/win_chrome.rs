@@ -32,7 +32,36 @@ pub fn system_wheel_scroll_lines() -> u32 {
     3
 }
 
-/// 校验恢复的窗口外框位置是否与当前任意可用显示器工作区相交；若落在屏外则返回 `None`。
+/// 返回当前主显示器的 DPI 缩放倍数（1.0 = 96 DPI，1.5 = 144 DPI，2.0 = 192 DPI）。
+#[cfg(windows)]
+pub fn primary_dpi_scale() -> f32 {
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn GetDeviceCaps(hdc: *mut core::ffi::c_void, index: i32) -> i32;
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetDC(hwnd: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        fn ReleaseDC(hwnd: *mut core::ffi::c_void, hdc: *mut core::ffi::c_void) -> i32;
+    }
+    const LOGPIXELSX: i32 = 88;
+    unsafe {
+        let hdc = GetDC(std::ptr::null_mut());
+        if hdc.is_null() {
+            return 1.0;
+        }
+        let dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+        ReleaseDC(std::ptr::null_mut(), hdc);
+        if dpi >= 48 && dpi <= 960 {
+            dpi as f32 / 96.0
+        } else {
+            1.0
+        }
+    }
+}
+
+/// 校验恢复的窗口外框逻辑坐标是否落在当前可用显示器工作区内（与物理像素做 DPI 换算，
+/// 避免高 DPI 笔记本拔掉外接屏后按物理边界误放行导致窗口开到屏幕外）。
 pub fn validate_window_position(x: f32, y: f32, w: f32, h: f32) -> Option<(f32, f32)> {
     if !x.is_finite() || !y.is_finite() || !w.is_finite() || !h.is_finite() || w < 200.0 || h < 200.0 {
         return None;
@@ -43,11 +72,16 @@ pub fn validate_window_position(x: f32, y: f32, w: f32, h: f32) -> Option<(f32, 
         use windows_sys::Win32::Graphics::Gdi::{
             GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
         };
+        let scale = primary_dpi_scale().max(0.5);
+        let px = (x * scale).round() as i32;
+        let py = (y * scale).round() as i32;
+        let pw = (w * scale).round() as i32;
+        let ph = (h * scale).round() as i32;
         let rect = RECT {
-            left: x.round() as i32,
-            top: y.round() as i32,
-            right: (x + w).round() as i32,
-            bottom: (y + h).round() as i32,
+            left: px,
+            top: py,
+            right: px.saturating_add(pw),
+            bottom: py.saturating_add(ph),
         };
         let mon = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) };
         if !mon.is_null() {
@@ -55,11 +89,24 @@ pub fn validate_window_position(x: f32, y: f32, w: f32, h: f32) -> Option<(f32, 
             info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
             if unsafe { GetMonitorInfoW(mon, &mut info) } != 0 {
                 let wa = info.rcWork;
-                let max_x = (wa.right - 120).max(wa.left);
-                let max_y = (wa.bottom - 80).max(wa.top);
-                let cx = (x.round() as i32).clamp(wa.left - (w as i32 / 2), max_x) as f32;
-                let cy = (y.round() as i32).clamp(wa.top, max_y) as f32;
-                return Some((cx, cy));
+                let margin_x = (120.0 * scale).round() as i32;
+                let margin_y = (80.0 * scale).round() as i32;
+                let min_x = wa.left.saturating_sub(pw / 2);
+                let max_x = wa.right.saturating_sub(margin_x).max(wa.left);
+                let max_y = wa.bottom.saturating_sub(margin_y).max(wa.top);
+                // 若原窗口与最近显示器工作区完全不相交（例如外接副屏已拔出），则整窗拉回工作区内。
+                let intersects = rect.right > wa.left + margin_x
+                    && rect.left < wa.right - margin_x
+                    && rect.bottom > wa.top + margin_y
+                    && rect.top < wa.bottom - margin_y;
+                let (cx, cy) = if intersects {
+                    (px.clamp(min_x, max_x), py.clamp(wa.top, max_y))
+                } else {
+                    let fit_x = wa.right.saturating_sub(pw).max(wa.left);
+                    let fit_y = wa.bottom.saturating_sub(ph).max(wa.top);
+                    (px.clamp(wa.left, fit_x), py.clamp(wa.top, fit_y))
+                };
+                return Some((cx as f32 / scale, cy as f32 / scale));
             }
         }
     }

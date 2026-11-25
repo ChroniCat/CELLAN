@@ -2204,8 +2204,14 @@ pub(super) fn write_with_style_receipt(
             any_freeze = true;
         }
         if sheet.filter_dirty {
-            changes.filter_xml = Some(filter_xml_for_sheet(sheet));
-            any_filter = true;
+            if sheet
+                .filter
+                .as_ref()
+                .is_none_or(|f| f.color_filters.is_empty())
+            {
+                changes.filter_xml = Some(filter_xml_for_sheet(sheet));
+                any_filter = true;
+            }
         }
         if sheet.page_dirty {
             changes.page_edit = true;
@@ -2636,11 +2642,17 @@ pub(super) fn write_with_style_receipt(
         *saved_styles = Some(SavedStyles { signature, map });
     }
     tmp.persist(target)?;
+    let any_color_filter_dirty = wb.sheets.iter().any(|s| {
+        s.filter_dirty
+            && s.filter
+                .as_ref()
+                .is_some_and(|f| !f.color_filters.is_empty())
+    });
     Ok(DeltaSummary {
         patched: true,
         handled_layout: any_layout,
         handled_freeze: any_freeze,
-        handled_filter: any_filter,
+        handled_filter: any_filter && !any_color_filter_dirty,
         handled_page: any_page,
         trusted_parts,
     })

@@ -916,6 +916,36 @@ impl Deps {
         Deps::default()
     }
 
+    /// Clone this dependency graph with an isolated `dynamic_watches` table (`OFFSET`/`INDIRECT`)
+    /// so speculative/trial evaluations (e.g. Goal Seek) never pollute the live workbook's watches.
+    pub fn fork_isolated(&self) -> Self {
+        let mut cloned = self.clone();
+        let watch_copy = self
+            .dynamic_watches
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        cloned.dynamic_watches = Arc::new(std::sync::RwLock::new(watch_copy));
+        cloned
+    }
+
+    /// Refresh only the spill watch rectangle for `key` after a local recalculation changes its
+    /// materialized `spill_shapes` or `#SPILL!` status.
+    pub fn refresh_spill_watch(&mut self, wb: &crate::Workbook, key: CellKey) {
+        self.untracked_spill_errors.remove(&key);
+        if let Some((old_watch_id, _)) = self.spill_watches.remove(&key)
+            && self.slots.tombstone(old_watch_id)
+        {
+            self.tombstones += 1;
+        }
+        if let Some(cell) = wb.sheets.get(key.0).and_then(|s| s.get(key.1, key.2))
+            && cell.formula.is_some()
+        {
+            let is_spill_err = super::is_cached_spill_error(&cell.value);
+            self.index_cell_spill(wb, key, is_spill_err);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.refs.is_empty()
             && self.volatile.is_empty()
@@ -931,7 +961,7 @@ impl Deps {
     }
 
     #[inline]
-    pub(crate) fn tracks_spill(&self, key: CellKey) -> bool {
+    pub fn tracks_spill(&self, key: CellKey) -> bool {
         self.spill_watches.contains_key(&key)
     }
 
@@ -2641,6 +2671,55 @@ impl Deps {
                 }
             }
         }
+        // Include dynamic array spill anchors & blocked spill watches whose footprint
+        // touches or crosses the structural edit boundary (mirrors `recalc_structural`).
+        if let Some(sh) = wb.sheets.get(sheet) {
+            for (&anchor, &(h, w)) in &sh.spill_shapes {
+                let touches_shift = h == 0
+                    || w == 0
+                    || match shift.axis {
+                        crate::refs::Axis::Row => {
+                            anchor.row.saturating_add(h.saturating_sub(1)) >= shift.at
+                        }
+                        crate::refs::Axis::Col => {
+                            anchor.col.saturating_add(w.saturating_sub(1)) >= shift.at
+                        }
+                    };
+                if touches_shift {
+                    let old_key = (sheet, anchor.row, anchor.col);
+                    slots.insert(old_key);
+                    if let Some((nr, nc)) =
+                        crate::sync::shift_structural_coord(anchor.row, anchor.col, op)
+                    {
+                        slots.insert((sheet, nr, nc));
+                    }
+                    if slots.len() > limit {
+                        return None;
+                    }
+                }
+            }
+        }
+        for (&old_anchor, &(_, watch_rect)) in self.spill_watches.iter() {
+            if watch_rect.sheet as usize == sheet {
+                let end = match shift.axis {
+                    crate::refs::Axis::Row => watch_rect.r2,
+                    crate::refs::Axis::Col => watch_rect.c2,
+                };
+                if end >= shift.at {
+                    slots.insert(old_anchor);
+                    if old_anchor.0 == sheet {
+                        if let Some((nr, nc)) =
+                            crate::sync::shift_structural_coord(old_anchor.1, old_anchor.2, op)
+                        {
+                            slots.insert((sheet, nr, nc));
+                        }
+                    }
+                    if slots.len() > limit {
+                        return None;
+                    }
+                }
+            }
+        }
         Some(slots.into_iter().collect())
     }
 
@@ -3506,5 +3585,104 @@ mod structural_lambda_tests {
         let mut calc = formula::Calc::new(&wb);
         calc.scope = Some(&keys);
         assert_eq!(calc.cell_value(0, 0, 3), FValue::Number(6.));
+    }
+
+    #[test]
+    fn structural_updates_recalcs_dynamic_spill_cut_by_row_insert_and_delete() {
+        let mut wb = Workbook::new_blank();
+        for r in 0..8u32 {
+            wb.sheet_mut(0).set(
+                r,
+                0,
+                crate::Cell {
+                    value: Value::Number((r + 1) as f64),
+                    formula: None,
+                },
+            );
+        }
+        formula::set_formula(
+            wb.sheet_mut(0),
+            0,
+            3,
+            "=FILTER(A1:A8,A1:A8>0)",
+            FValue::Empty,
+        );
+        formula::set_formula(wb.sheet_mut(0), 0, 4, "=SUM(D1:D12)", FValue::Empty);
+        formula::recalc_all_force(&mut wb);
+        assert_eq!(wb.sheet(0).value(7, 3), Value::Number(8.0));
+        assert_eq!(wb.sheet(0).value(0, 4), Value::Number(36.0));
+
+        // 在第 4 行（穿过 D1:D8 溢出区中间）插入一行，验证快速路径 structural_updates 不会漏掉溢出锚点 D1。
+        let mut deps = Deps::build_after_recalc(&wb);
+        let ins = Structural::InsertRows { at: 3, n: 1 };
+        let seeds = deps
+            .structural_updates(&wb, 0, &ins, 10_000)
+            .expect("fast structural path");
+        apply_structural_wb(&mut wb, 0, &ins);
+        assert!(
+            seeds.contains(&(0, 0, 3)),
+            "被插入行切断的溢出锚点 D1 必须进入重算种子：{seeds:?}"
+        );
+        for &k in &seeds {
+            deps.update_cell(&wb, k);
+        }
+        formula::recalc_dirty(&mut wb, &deps, &seeds);
+        deps.refresh_spill_watch(&wb, (0, 0, 3));
+        assert_eq!(wb.sheet(0).value(3, 3), Value::Number(4.0));
+        assert_eq!(wb.sheet(0).value(7, 3), Value::Number(8.0));
+        assert_eq!(wb.sheet(0).value(0, 4), Value::Number(36.0));
+
+        // 再删除一行穿过溢出区：锚点仍需重算，溢出尾部不残留空洞。
+        let del = Structural::DeleteRows { at: 2, n: 1 };
+        let seeds2 = deps
+            .structural_updates(&wb, 0, &del, 10_000)
+            .expect("fast structural path on delete");
+        apply_structural_wb(&mut wb, 0, &del);
+        assert!(seeds2.contains(&(0, 0, 3)));
+        for &k in &seeds2 {
+            deps.update_cell(&wb, k);
+        }
+        formula::recalc_dirty(&mut wb, &deps, &seeds2);
+        let mut full = wb.clone();
+        formula::recalc_all_force(&mut full);
+        for r in 0..10 {
+            assert_eq!(
+                wb.sheet(0).value(r, 3),
+                full.sheet(0).value(r, 3),
+                "删行后 D{} 应与整簿重算一致",
+                r + 1
+            );
+        }
+        assert_eq!(wb.sheet(0).value(0, 4), full.sheet(0).value(0, 4));
+    }
+
+    #[test]
+    fn fork_isolated_keeps_live_dynamic_watches_untouched() {
+        let mut wb = Workbook::new_blank();
+        wb.sheet_mut(0).set(0, 0, crate::Cell { value: Value::Text("B1".into()), formula: None });
+        wb.sheet_mut(0).set(0, 1, crate::Cell { value: Value::Number(10.0), formula: None });
+        wb.sheet_mut(0).set(1, 1, crate::Cell { value: Value::Number(20.0), formula: None });
+        formula::set_formula(wb.sheet_mut(0), 0, 2, "=INDIRECT(A1)", FValue::Empty);
+        formula::recalc_all_force(&mut wb);
+        let live_deps = Deps::build(&wb);
+        // 首次求值登记 live dynamic_watches: C1 -> B1
+        formula::recalc_dirty(&mut wb, &live_deps, &[(0, 0, 0)]);
+        assert_eq!(wb.sheet(0).value(0, 2), Value::Number(10.0));
+
+        // 在隔离副本上做试算，让 INDIRECT 临时指向 B2
+        let isolated = live_deps.fork_isolated();
+        let mut trial_wb = wb.clone();
+        trial_wb.sheet_mut(0).set(0, 0, crate::Cell { value: Value::Text("B2".into()), formula: None });
+        formula::recalc_dirty(&mut trial_wb, &isolated, &[(0, 0, 0)]);
+        assert_eq!(trial_wb.sheet(0).value(0, 2), Value::Number(20.0));
+
+        // 正式工作簿修改 B1=99，live_deps 必须仍追踪 B1 并正确更新 C1=99
+        wb.sheet_mut(0).set(0, 1, crate::Cell { value: Value::Number(99.0), formula: None });
+        formula::recalc_dirty(&mut wb, &live_deps, &[(0, 0, 1)]);
+        assert_eq!(
+            wb.sheet(0).value(0, 2),
+            Value::Number(99.0),
+            "隔离试算不得污染正式 Deps 的 INDIRECT 追踪表"
+        );
     }
 }

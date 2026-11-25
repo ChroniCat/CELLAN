@@ -1067,6 +1067,23 @@ mod freeze_tests {
 // ---------------------------------------------------------------------------
 
 pub fn auto_filter_xml(f: &crate::sort_filter::Filter) -> String {
+    let mut tmp = Vec::new();
+    auto_filter_xml_with_dxfs(f, &mut tmp)
+}
+
+fn intern_color_filter_dxf(dxfs: &mut Vec<crate::cf::Dxf>, want: crate::cf::Dxf) -> usize {
+    if let Some(pos) = dxfs.iter().position(|d| *d == want) {
+        return pos;
+    }
+    let idx = dxfs.len();
+    dxfs.push(want);
+    idx
+}
+
+pub fn auto_filter_xml_with_dxfs(
+    f: &crate::sort_filter::Filter,
+    dxfs: &mut Vec<crate::cf::Dxf>,
+) -> String {
     let (r1, c1, r2, c2) = f.range;
     let mut out = format!(
         "<autoFilter ref=\"{}{}:{}{}\">",
@@ -1076,7 +1093,12 @@ pub fn auto_filter_xml(f: &crate::sort_filter::Filter) -> String {
         r2 + 1
     );
     let mut cols: Vec<u32> = f.allows.keys().copied().collect();
-    for c in f.criteria.keys() {
+    for c in f
+        .criteria
+        .keys()
+        .chain(f.date_groups.keys())
+        .chain(f.color_filters.keys())
+    {
         if !cols.contains(c) {
             cols.push(*c);
         }
@@ -1087,6 +1109,40 @@ pub fn auto_filter_xml(f: &crate::sort_filter::Filter) -> String {
             continue;
         }
         let col_id = col - c1;
+        if let Some(cf) = f.color_filters.get(&col) {
+            match cf {
+                crate::sort_filter::ColorFilter::Fill(None) => {
+                    out.push_str(&format!(
+                        "<filterColumn colId=\"{col_id}\"><colorFilter cellColor=\"1\"/></filterColumn>"
+                    ));
+                }
+                crate::sort_filter::ColorFilter::Fill(Some(rgb)) => {
+                    let id = intern_color_filter_dxf(
+                        dxfs,
+                        crate::cf::Dxf {
+                            fill: Some(*rgb),
+                            ..Default::default()
+                        },
+                    );
+                    out.push_str(&format!(
+                        "<filterColumn colId=\"{col_id}\"><colorFilter dxfId=\"{id}\" cellColor=\"1\"/></filterColumn>"
+                    ));
+                }
+                crate::sort_filter::ColorFilter::Font(rgb) => {
+                    let id = intern_color_filter_dxf(
+                        dxfs,
+                        crate::cf::Dxf {
+                            color: Some(*rgb),
+                            ..Default::default()
+                        },
+                    );
+                    out.push_str(&format!(
+                        "<filterColumn colId=\"{col_id}\"><colorFilter dxfId=\"{id}\" cellColor=\"0\"/></filterColumn>"
+                    ));
+                }
+            }
+            continue;
+        }
         if let Some(crit) = f.criteria.get(&col) {
             // 条件筛选：介于写成两条 and="1"
             out.push_str(&format!(
@@ -1113,14 +1169,39 @@ pub fn auto_filter_xml(f: &crate::sort_filter::Filter) -> String {
             out.push_str("</customFilters></filterColumn>");
             continue;
         }
-        let Some(set) = f.allows.get(&col) else {
+        let set = f.allows.get(&col);
+        let dgs = f.date_groups.get(&col).filter(|v| !v.is_empty());
+        if set.is_none() && dgs.is_none() {
             continue;
-        };
+        }
         out.push_str(&format!("<filterColumn colId=\"{col_id}\"><filters>"));
-        let mut vals: Vec<&String> = set.iter().collect();
-        vals.sort();
-        for v in vals {
-            out.push_str(&format!("<filter val=\"{}\"/>", esc(v)));
+        if let Some(set) = set {
+            let mut vals: Vec<&String> = set.iter().collect();
+            vals.sort();
+            for v in vals {
+                out.push_str(&format!("<filter val=\"{}\"/>", esc(v)));
+            }
+        }
+        if let Some(groups) = dgs {
+            let mut sorted = groups.clone();
+            sorted.sort();
+            sorted.dedup();
+            for dg in sorted {
+                match (dg.month, dg.day) {
+                    (Some(m), Some(d)) => out.push_str(&format!(
+                        "<dateGroupItem year=\"{}\" month=\"{}\" day=\"{}\" dateTimeGrouping=\"day\"/>",
+                        dg.year, m, d
+                    )),
+                    (Some(m), None) => out.push_str(&format!(
+                        "<dateGroupItem year=\"{}\" month=\"{}\" dateTimeGrouping=\"month\"/>",
+                        dg.year, m
+                    )),
+                    _ => out.push_str(&format!(
+                        "<dateGroupItem year=\"{}\" dateTimeGrouping=\"year\"/>",
+                        dg.year
+                    )),
+                }
+            }
         }
         out.push_str("</filters></filterColumn>");
     }

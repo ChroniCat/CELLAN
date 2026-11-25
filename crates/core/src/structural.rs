@@ -227,7 +227,8 @@ impl Sheet {
     pub fn apply_structural_structure_only(&mut self, op: &Structural) {
         let shift = op.reference_shift();
         let shift = MappedShift { shift: &shift, insertions: &[] };
-        self.shift_array_and_hyperlink_ranges(&shift);
+        let orphans = self.shift_array_and_hyperlink_ranges(&shift);
+        self.clear_orphan_spill_tails(&orphans);
         match op {
             Structural::InsertRows { at, n } => {
                 self.merges = self
@@ -315,10 +316,12 @@ impl Sheet {
 
     /// 数组元数据与单元格使用同一坐标变换。旧溢出尾格仍需登记，
     /// 后续重算才能清除它们，而不会把它们误当成用户输入的阻塞项。
-    fn shift_array_and_hyperlink_ranges(&mut self, shift: &MappedShift) {
+    /// 返回已映射到新坐标系的断尾溢出矩形，必须在单元格坐标搬移完成后再清理。
+    fn shift_array_and_hyperlink_ranges(&mut self, shift: &MappedShift) -> Vec<(u32, u32, u32, u32)> {
         if shift.n != 0 { self.coordinates_shifted(); }
         let rows = shift.axis == crate::refs::Axis::Row;
-        if shift.n == 0 { return; }
+        if shift.n == 0 { return Vec::new(); }
+        let mut orphan_tails: Vec<(u32, u32, u32, u32)> = Vec::new();
         let min_at = if shift.insertions.is_empty() {
             shift.at
         } else {
@@ -372,7 +375,6 @@ impl Sheet {
             })
         {
             let mut next_shapes = crate::model::CellMetadata::default();
-            let mut orphan_tails: Vec<(u32, u32, u32, u32)> = Vec::new();
             for (&anchor, &(h, w)) in &self.spill_shapes {
                 let mapped_anchor = if rows {
                     shift.map(anchor.row).map(|r| CellRef::new(r, anchor.col))
@@ -431,16 +433,6 @@ impl Sheet {
                 }
             }
             self.spill_shapes = next_shapes;
-            for (r1, c1, r2, c2) in orphan_tails {
-                for r in r1..=r2 {
-                    for c in c1..=c2 {
-                        let k = CellRef::new(r, c);
-                        if self.spilled.remove_if_present(&k) {
-                            self.remove(r, c);
-                        }
-                    }
-                }
-            }
         }
         if !self.hyperlinks.is_empty()
             && self.hyperlinks.iter().any(|(&(r, c), link)| {
@@ -488,6 +480,21 @@ impl Sheet {
                     }
                 })
                 .collect();
+        }
+        orphan_tails
+    }
+
+    /// 清理被结构性插删切断或失去锚点的旧溢出尾格（必须在单元格完成坐标搬移后调用）。
+    fn clear_orphan_spill_tails(&mut self, orphan_tails: &[(u32, u32, u32, u32)]) {
+        for &(r1, c1, r2, c2) in orphan_tails {
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    let k = CellRef::new(r, c);
+                    if self.spilled.remove_if_present(&k) {
+                        self.remove(r, c);
+                    }
+                }
+            }
         }
     }
 
@@ -823,10 +830,11 @@ impl Sheet {
     }
 
     fn insert_mapped_rows_inner(&mut self, shift: &MappedShift, move_cells: bool) {
-        self.shift_array_and_hyperlink_ranges(shift);
+        let orphans = self.shift_array_and_hyperlink_ranges(shift);
         if move_cells {
             self.remap_cell_axis(true, shift.at, |row| shift.map(row));
         }
+        self.clear_orphan_spill_tails(&orphans);
         for (r1, _, r2, _) in &mut self.merges {
             *r1 = shift.map(*r1).unwrap();
             *r2 = shift.map(*r2).unwrap();
@@ -861,10 +869,11 @@ impl Sheet {
         }
         let shift = (Structural::DeleteRows { at, n }).reference_shift();
         let shift = MappedShift { shift: &shift, insertions: &[] };
-        self.shift_array_and_hyperlink_ranges(&shift);
+        let orphans = self.shift_array_and_hyperlink_ranges(&shift);
         if move_cells {
             self.shift_cells(true, at, n, true);
         }
+        self.clear_orphan_spill_tails(&orphans);
         self.merges = self
             .merges
             .iter()
@@ -898,10 +907,11 @@ impl Sheet {
         }
         let shift = (Structural::InsertCols { at, n }).reference_shift();
         let shift = MappedShift { shift: &shift, insertions: &[] };
-        self.shift_array_and_hyperlink_ranges(&shift);
+        let orphans = self.shift_array_and_hyperlink_ranges(&shift);
         if move_cells {
             self.shift_cells(false, at, n, false);
         }
+        self.clear_orphan_spill_tails(&orphans);
         self.merges = self
             .merges
             .iter()
@@ -936,10 +946,11 @@ impl Sheet {
         }
         let shift = (Structural::DeleteCols { at, n }).reference_shift();
         let shift = MappedShift { shift: &shift, insertions: &[] };
-        self.shift_array_and_hyperlink_ranges(&shift);
+        let orphans = self.shift_array_and_hyperlink_ranges(&shift);
         if move_cells {
             self.shift_cells(false, at, n, true);
         }
+        self.clear_orphan_spill_tails(&orphans);
         self.merges = self
             .merges
             .iter()
@@ -1573,6 +1584,7 @@ impl Sheet {
                 .filter_map(|key| Some(CellRef::new(del_map.map(key.row)?, key.col)))
                 .collect();
         }
+        let mut orphan_tails: Vec<(u32, u32, u32, u32)> = Vec::new();
         if !self.spill_shapes.is_empty()
             && self
                 .spill_shapes
@@ -1580,7 +1592,6 @@ impl Sheet {
                 .any(|(k, &(h, _))| k.row.saturating_add(h.saturating_sub(1)) >= min_at)
         {
             let mut next_shapes = crate::model::CellMetadata::default();
-            let mut orphan_tails: Vec<(u32, u32, u32, u32)> = Vec::new();
             for (&anchor, &(h, w)) in &self.spill_shapes {
                 let Some(new_r) = del_map.map(anchor.row) else {
                     if h > 0 && w > 0 {
@@ -1612,16 +1623,6 @@ impl Sheet {
                 }
             }
             self.spill_shapes = next_shapes;
-            for (r1, c1, r2, c2) in orphan_tails {
-                for r in r1..=r2 {
-                    for c in c1..=c2 {
-                        let k = CellRef::new(r, c);
-                        if self.spilled.remove_if_present(&k) {
-                            self.remove(r, c);
-                        }
-                    }
-                }
-            }
         }
         if !self.hyperlinks.is_empty()
             && self
@@ -1656,6 +1657,7 @@ impl Sheet {
 
         // Single-pass cell & style page compaction across all K intervals!
         self.remap_cell_axis(true, min_at, |r| del_map.map(r));
+        self.clear_orphan_spill_tails(&orphan_tails);
 
         self.merges = self
             .merges

@@ -169,6 +169,17 @@ fn is_terminal(node: &Node) -> bool {
     )
 }
 
+const MAX_EVAL_INLINE_RANGE_CELLS: u64 = 64;
+const MAX_EVAL_ARRAY_PREVIEW_ITEMS: usize = 32;
+
+fn range_cell_count(a: &RefExpr, b: &RefExpr) -> u64 {
+    let r1 = a.row.min(b.row).max(0) as u64;
+    let r2 = a.row.max(b.row).max(0) as u64;
+    let c1 = a.col.min(b.col).max(0) as u64;
+    let c2 = a.col.max(b.col).max(0) as u64;
+    (r2 - r1 + 1).saturating_mul(c2 - c1 + 1)
+}
+
 fn fvalue_to_node(v: &FValue) -> Node {
     match v {
         FValue::Empty => Node::Empty,
@@ -179,6 +190,10 @@ fn fvalue_to_node(v: &FValue) -> Node {
         FValue::Array(a) => {
             if a.rows == 1 && a.cols == 1 {
                 fvalue_to_node(&a.data[0])
+            } else if a.rows.saturating_mul(a.cols) > MAX_EVAL_ARRAY_PREVIEW_ITEMS * 4 {
+                let take = a.data.len().min(MAX_EVAL_ARRAY_PREVIEW_ITEMS);
+                let vals: Vec<Value> = a.data[..take].iter().map(from_fvalue).collect();
+                Node::Array(a.rows, a.cols, vals)
             } else {
                 let vals: Vec<Value> = a.data.iter().map(from_fvalue).collect();
                 Node::Array(a.rows, a.cols, vals)
@@ -196,8 +211,11 @@ fn render_terminal(node: &Node) -> String {
         Node::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
         Node::Err(e) => e.text().into(),
         Node::Array(rows, cols, vals) => {
+            let total = rows.saturating_mul(*cols);
             let mut s = String::from("{");
-            for r in 0..*rows {
+            let mut emitted = 0usize;
+            let limit = MAX_EVAL_ARRAY_PREVIEW_ITEMS;
+            'outer: for r in 0..*rows {
                 if r > 0 {
                     s.push(';');
                 }
@@ -205,13 +223,20 @@ fn render_terminal(node: &Node) -> String {
                     if c > 0 {
                         s.push(',');
                     }
-                    if let Some(v) = vals.get(r * *cols + c) {
-                        match v {
-                            Value::Text(t) => s.push_str(&format!("\"{}\"", t.replace('"', "\"\""))),
-                            _ => s.push_str(&v.display()),
-                        }
+                    let idx = r * *cols + c;
+                    if emitted >= limit || idx >= vals.len() {
+                        s.push_str(&format!("… (共 {}×{} 项)", rows, cols));
+                        break 'outer;
                     }
+                    match &vals[idx] {
+                        Value::Text(t) => s.push_str(&format!("\"{}\"", t.replace('"', "\"\""))),
+                        v => s.push_str(&v.display()),
+                    }
+                    emitted += 1;
                 }
+            }
+            if total > emitted && !s.contains('…') {
+                s.push_str(&format!("… (共 {}×{} 项)", rows, cols));
             }
             s.push('}');
             s
@@ -220,8 +245,7 @@ fn render_terminal(node: &Node) -> String {
     }
 }
 
-fn render_ref(r: &RefExpr) -> String {
-    let mut s = String::new();
+fn push_ref_sheet_prefix(r: &RefExpr, s: &mut String) {
     if let Some(sh) = &r.sheet {
         if let Some(sh2) = &r.sheet2 {
             s.push_str(&format!("'{sh}:{sh2}'!"));
@@ -232,6 +256,11 @@ fn render_ref(r: &RefExpr) -> String {
             s.push('!');
         }
     }
+}
+
+fn render_ref(r: &RefExpr) -> String {
+    let mut s = String::new();
+    push_ref_sheet_prefix(r, &mut s);
     if r.col_abs {
         s.push('$');
     }
@@ -241,6 +270,42 @@ fn render_ref(r: &RefExpr) -> String {
     }
     s.push_str(&(r.row.max(0) + 1).to_string());
     s
+}
+
+fn render_range(a: &RefExpr, b: &RefExpr) -> String {
+    let min_r = a.row.min(b.row);
+    let max_r = a.row.max(b.row);
+    let min_c = a.col.min(b.col);
+    let max_c = a.col.max(b.col);
+    if min_r == 0 && max_r >= 1_048_575 {
+        let mut s = String::new();
+        push_ref_sheet_prefix(a, &mut s);
+        if a.col_abs {
+            s.push('$');
+        }
+        s.push_str(&crate::model::col_label(a.col.max(0) as u32));
+        s.push(':');
+        if b.col_abs {
+            s.push('$');
+        }
+        s.push_str(&crate::model::col_label(b.col.max(0) as u32));
+        return s;
+    }
+    if min_c == 0 && max_c >= 16_383 {
+        let mut s = String::new();
+        push_ref_sheet_prefix(a, &mut s);
+        if a.row_abs {
+            s.push('$');
+        }
+        s.push_str(&(a.row.max(0) + 1).to_string());
+        s.push(':');
+        if b.row_abs {
+            s.push('$');
+        }
+        s.push_str(&(b.row.max(0) + 1).to_string());
+        return s;
+    }
+    format!("{}:{}", render_ref(a), render_ref(b))
 }
 
 fn render_plain(node: &Node) -> String {
@@ -253,7 +318,7 @@ fn render_plain(node: &Node) -> String {
         Node::Array(..) => render_terminal(node),
         Node::Ref(r) => render_ref(r),
         Node::Spill(r) => format!("{}#", render_ref(r)),
-        Node::Range(a, b) => format!("{}:{}", render_ref(a), render_ref(b)),
+        Node::Range(a, b) => render_range(a, b),
         Node::Name(n) => n.clone(),
         Node::ScopedName { book, sheet, name } => {
             let mut out = String::new();
@@ -335,24 +400,30 @@ fn find_redex_inner(node: &Node, wb: &Workbook, sheet: usize, path: &mut Vec<usi
             true
         }
         Node::Implicit(x) | Node::Unary(_, x) | Node::Percent(x) => {
-            path.push(0);
-            if find_redex_inner(x, wb, sheet, path) {
-                return true;
+            if !matches!(x.as_ref(), Node::Range(a, b) if range_cell_count(a, b) > MAX_EVAL_INLINE_RANGE_CELLS) {
+                path.push(0);
+                if find_redex_inner(x, wb, sheet, path) {
+                    return true;
+                }
+                path.pop();
             }
-            path.pop();
             true
         }
         Node::Binary(_, l, r) => {
-            path.push(0);
-            if find_redex_inner(l, wb, sheet, path) {
-                return true;
+            if !matches!(l.as_ref(), Node::Range(a, b) if range_cell_count(a, b) > MAX_EVAL_INLINE_RANGE_CELLS) {
+                path.push(0);
+                if find_redex_inner(l, wb, sheet, path) {
+                    return true;
+                }
+                path.pop();
             }
-            path.pop();
-            path.push(1);
-            if find_redex_inner(r, wb, sheet, path) {
-                return true;
+            if !matches!(r.as_ref(), Node::Range(a, b) if range_cell_count(a, b) > MAX_EVAL_INLINE_RANGE_CELLS) {
+                path.push(1);
+                if find_redex_inner(r, wb, sheet, path) {
+                    return true;
+                }
+                path.pop();
             }
-            path.pop();
             true
         }
         Node::Func(name, args) => {
@@ -362,19 +433,28 @@ fn find_redex_inner(node: &Node, wb: &Workbook, sheet: usize, path: &mut Vec<usi
                 upper.as_str(),
                 "SUM"
                     | "AVERAGE"
+                    | "AVERAGEIF"
+                    | "AVERAGEIFS"
                     | "COUNT"
                     | "COUNTA"
+                    | "COUNTBLANK"
                     | "MIN"
                     | "MAX"
+                    | "MINIFS"
+                    | "MAXIFS"
                     | "SUMIF"
                     | "SUMIFS"
+                    | "SUMPRODUCT"
+                    | "SUMSQ"
                     | "COUNTIF"
                     | "COUNTIFS"
                     | "VLOOKUP"
                     | "HLOOKUP"
                     | "XLOOKUP"
+                    | "LOOKUP"
                     | "INDEX"
                     | "MATCH"
+                    | "XMATCH"
                     | "SUBTOTAL"
                     | "AGGREGATE"
                     | "OFFSET"
@@ -383,6 +463,46 @@ fn find_redex_inner(node: &Node, wb: &Workbook, sheet: usize, path: &mut Vec<usi
                     | "ROWS"
                     | "COLUMNS"
                     | "ISREF"
+                    | "UNIQUE"
+                    | "SORT"
+                    | "SORTBY"
+                    | "FILTER"
+                    | "MEDIAN"
+                    | "LARGE"
+                    | "SMALL"
+                    | "RANK"
+                    | "TEXTJOIN"
+                    | "CONCAT"
+                    | "TRANSPOSE"
+                    | "MMULT"
+                    | "TAKE"
+                    | "DROP"
+                    | "TOCOL"
+                    | "TOROW"
+                    | "HSTACK"
+                    | "VSTACK"
+                    | "CHOOSECOLS"
+                    | "CHOOSEROWS"
+                    | "STDEV"
+                    | "STDEVP"
+                    | "STDEV.S"
+                    | "STDEV.P"
+                    | "VAR"
+                    | "VARP"
+                    | "VAR.S"
+                    | "VAR.P"
+                    | "NPV"
+                    | "IRR"
+                    | "XNPV"
+                    | "XIRR"
+                    | "PERCENTILE"
+                    | "QUARTILE"
+                    | "FREQUENCY"
+                    | "MODE"
+                    | "CORREL"
+                    | "SLOPE"
+                    | "INTERCEPT"
+                    | "FORECAST"
             );
             if upper == "IF" && !args.is_empty() {
                 path.push(0);
@@ -410,7 +530,12 @@ fn find_redex_inner(node: &Node, wb: &Workbook, sheet: usize, path: &mut Vec<usi
                 return true;
             }
             for (i, a) in args.iter().enumerate() {
-                if ref_preserving && matches!(a, Node::Range(..) | Node::Spill(_)) {
+                if let Node::Range(r1, r2) = a {
+                    if ref_preserving || range_cell_count(r1, r2) > MAX_EVAL_INLINE_RANGE_CELLS {
+                        continue;
+                    }
+                }
+                if ref_preserving && matches!(a, Node::Spill(_)) {
                     continue;
                 }
                 if matches!(upper.as_str(), "ROW" | "COLUMN" | "ROWS" | "COLUMNS" | "OFFSET" | "ISREF")
@@ -432,6 +557,34 @@ fn find_redex_inner(node: &Node, wb: &Workbook, sheet: usize, path: &mut Vec<usi
 
 fn replace_at_path(node: &mut Node, path: &[usize], wb: &Workbook, sheet: usize) {
     if path.is_empty() {
+        // 整列/整行或超大区域独立求值时，裁切到工作表实际已用区间（避免 1,048,576 格全量展开卡死界面）。
+        if let Node::Range(a, b) = node
+            && range_cell_count(a, b) > MAX_EVAL_INLINE_RANGE_CELLS * 4
+        {
+            let target_si = resolve_sheet(wb, a.sheet.as_deref(), sheet).unwrap_or(sheet);
+            let mut ca = a.clone();
+            let mut cb = b.clone();
+            if let Some(sh) = wb.sheets.get(target_si) {
+                let (ur1, uc1, ur2, uc2) = sh.used_bounds().unwrap_or((0, 0, 0, 0));
+                let r1 = ca.row.min(cb.row).max(0);
+                let r2 = ca.row.max(cb.row).max(0).min(ur2 as i64);
+                let c1 = ca.col.min(cb.col).max(0);
+                let c2 = ca.col.max(cb.col).max(0).min(uc2 as i64);
+                if r1 <= r2 && c1 <= c2 {
+                    ca.row = r1.max(ur1 as i64);
+                    cb.row = r2;
+                    ca.col = c1.max(uc1 as i64);
+                    cb.col = c2;
+                    let s = format!("={}", render_range(&ca, &cb));
+                    let val = eval_formula(wb, sheet, &s);
+                    *node = fvalue_to_node(&val);
+                    return;
+                } else {
+                    *node = Node::Empty;
+                    return;
+                }
+            }
+        }
         let s = format!("={}", render_plain(node));
         let val = eval_formula(wb, sheet, &s);
         *node = fvalue_to_node(&val);
@@ -493,9 +646,7 @@ fn render_node(
             out.push('#');
         }
         Node::Range(a, b) => {
-            out.push_str(&render_ref(a));
-            out.push(':');
-            out.push_str(&render_ref(b));
+            out.push_str(&render_range(a, b));
         }
         Node::Name(n) => out.push_str(n),
         Node::ScopedName { book, sheet: s, name } => {
@@ -622,5 +773,38 @@ mod tests {
         let done = ev.current(&wb);
         assert!(done.done);
         assert_eq!(done.expr, "15");
+    }
+
+    #[test]
+    fn evaluate_whole_column_references_does_not_hang_or_expand_million_cells() {
+        let mut wb = Workbook::new_blank();
+        wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+        wb.sheet_mut(0).set(1, 0, Cell { value: Value::Number(2.0), formula: None });
+        wb.sheet_mut(0).set(2, 0, Cell { value: Value::Number(3.0), formula: None });
+        wb.sheet_mut(0).set(0, 1, Cell { value: Value::Number(10.0), formula: None });
+        wb.sheet_mut(0).set(1, 1, Cell { value: Value::Number(20.0), formula: None });
+        wb.sheet_mut(0).set(2, 1, Cell { value: Value::Number(30.0), formula: None });
+
+        let t0 = std::time::Instant::now();
+        let mut ev1 = FormulaEvaluator::new(&wb, 0, 0, 2, "=SUM(A:A)");
+        assert_eq!(ev1.current(&wb).expr, "=SUM($A:$A)");
+        while ev1.step(&wb) {}
+        assert!(ev1.current(&wb).done);
+        assert_eq!(ev1.current(&wb).expr, "6");
+
+        let mut ev2 = FormulaEvaluator::new(&wb, 0, 0, 3, "=SUMPRODUCT(A:A,B:B)");
+        assert_eq!(ev2.current(&wb).expr, "=SUMPRODUCT($A:$A,$B:$B)");
+        while ev2.step(&wb) {}
+        assert!(ev2.current(&wb).done);
+        assert_eq!(ev2.current(&wb).expr, "140");
+
+        let mut ev3 = FormulaEvaluator::new(&wb, 0, 0, 4, "=A:A");
+        while ev3.step(&wb) {}
+        assert!(ev3.current(&wb).done);
+        assert!(
+            t0.elapsed().as_millis() < 2000,
+            "整列公式求值必须在毫秒级完成，实际耗时 {:?}",
+            t0.elapsed()
+        );
     }
 }

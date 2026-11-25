@@ -1306,7 +1306,6 @@ impl SheetApp {
         } else {
             r2
         };
-        self.last_repeat_action = Some(crate::RepeatAction::FillUp);
         if self.net.is_none() && area > sheetcore::undo::COW_BATCH_THRESHOLD as u64 {
             if !self.check_sparse_rect_preflight(si, (r1, c1, src_row - 1, c2), &[], "向上填充") {
                 return;
@@ -1394,6 +1393,7 @@ impl SheetApp {
             }
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.set_repeat_action(crate::RepeatAction::FillUp);
             self.tasks.last_edit = Some(std::time::Instant::now());
             std::thread::spawn(move || drop(before_sheet));
             self.status = format!("已用底行向上填充 {}-{} 行", r1 + 1, r2 + 1);
@@ -1438,6 +1438,7 @@ impl SheetApp {
         self.recalc_and_broadcast(&touched);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.set_repeat_action(crate::RepeatAction::FillUp);
         self.status = format!("已用底行向上填充 {}-{} 行", r1 + 1, r2 + 1);
     }
 
@@ -1467,7 +1468,6 @@ impl SheetApp {
         let si = self.sheet_idx;
         let has_hidden = !self.wb.sheet(si).hidden_rows.is_empty()
             && self.wb.sheet(si).hidden_rows.intersects_range(r1, r2);
-        self.last_repeat_action = Some(crate::RepeatAction::FillLeft);
         if self.net.is_none() && area > sheetcore::undo::COW_BATCH_THRESHOLD as u64 {
             if !self.check_sparse_rect_preflight(si, (r1, c1, r2, c2 - 1), &[], "向左填充") {
                 return;
@@ -1552,6 +1552,7 @@ impl SheetApp {
             }
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.set_repeat_action(crate::RepeatAction::FillLeft);
             self.tasks.last_edit = Some(std::time::Instant::now());
             std::thread::spawn(move || drop(before_sheet));
             self.status = format!("已用最右列向左填充至 {} 列", col_label(c1));
@@ -1596,6 +1597,7 @@ impl SheetApp {
         self.recalc_and_broadcast(&touched);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.set_repeat_action(crate::RepeatAction::FillLeft);
         self.status = format!("已用最右列向左填充至 {} 列", col_label(c1));
     }
 

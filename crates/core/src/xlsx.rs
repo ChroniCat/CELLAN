@@ -3534,7 +3534,14 @@ fn save_plain_at(
             || ((fresh_base || s.source_part.is_none() || fail_step_active) && !s.dv.is_empty())
     });
     let any_freeze = !delta_summary.handled_freeze && wb.sheets.iter().any(|s| s.freeze_dirty);
-    let any_filter = !delta_summary.handled_filter && wb.sheets.iter().any(|s| s.filter_dirty);
+    let any_filter = !delta_summary.handled_filter
+        && wb.sheets.iter().any(|s| {
+            s.filter_dirty
+                || ((fresh_base || s.source_part.is_none())
+                    && s.filter
+                        .as_ref()
+                        .is_some_and(|f| !f.color_filters.is_empty()))
+        });
     let any_page = !delta_summary.handled_page && wb.sheets.iter().any(|s| s.page_dirty);
     let any_arr = fail_step_active && !can_bypass && wb.sheets.iter().any(|s| !s.arrays.is_empty());
     if any_cf || any_dv || any_freeze || any_filter || any_page || any_arr {
@@ -3867,10 +3874,21 @@ fn apply_cf_patch(
             Vec<crate::arr::ArrayFml>,
         ),
     > = std::collections::HashMap::new();
+    // dxfs 必须和实际写出的 cfRule 及 colorFilter 对得上：先初始化现有 dxfs，再按需追加颜色筛选 dxf
+    let mut dxfs: Vec<crate::cf::Dxf> = wb
+        .sheets
+        .iter()
+        .find(|s| s.cf_dirty || !s.cf.dxfs.is_empty())
+        .map(|s| s.cf.dxfs.clone())
+        .unwrap_or_default();
     for sheet in wb.sheets.iter() {
         if let Some(t) = targets.get(&sheet.name) {
             let cf = if do_cf { crate::patch::cf_blocks_xml(&sheet.cf.blocks) } else { String::new() };
             let dv = if do_dv { crate::patch::dv_xml(&sheet.dv) } else { String::new() };
+            let has_color_filter = sheet
+                .filter
+                .as_ref()
+                .is_some_and(|f| !f.color_filters.is_empty());
             let af = if do_filter {
                 // 表格对象的 autoFilter 写在 tableN.xml 里；工作表上再写一份会重复，
                 // 打开时 Excel 会看到两个筛选源。
@@ -3887,7 +3905,7 @@ fn apply_cf_patch(
                                     && t.range.3 >= f.range.3
                             }) =>
                     {
-                        crate::patch::auto_filter_xml(f)
+                        crate::patch::auto_filter_xml_with_dxfs(f, &mut dxfs)
                     }
                     _ => String::new(),
                 }
@@ -3900,6 +3918,7 @@ fn apply_cf_patch(
                 || sheet.dv_dirty
                 || sheet.freeze_dirty
                 || sheet.filter_dirty
+                || (do_filter && has_color_filter)
                 || sheet.page_dirty
                 || arrays_by_sheet.contains_key(&sheet.name)
             {
@@ -3919,7 +3938,7 @@ fn apply_cf_patch(
                             hidden.extend(sheet.hidden_rows_user.iter().copied());
                             hidden
                         },
-                        sheet.filter_dirty,
+                        sheet.filter_dirty || (do_filter && has_color_filter),
                         sheet.page.clone(),
                         sheet.page_dirty,
                         arrays_by_sheet.get(&sheet.name).cloned().unwrap_or_default(),
@@ -3928,14 +3947,6 @@ fn apply_cf_patch(
             }
         }
     }
-    // dxfs 必须和实际写出的 cfRule 对得上：以前只在 dirty 时取，
-    // 现在只要重写条件格式就用「有 dxfs 的那张表」，否则 dxfId 会越界
-    let dxfs: Vec<crate::cf::Dxf> = wb
-        .sheets
-        .iter()
-        .find(|s| s.cf_dirty || !s.cf.dxfs.is_empty())
-        .map(|s| s.cf.dxfs.clone())
-        .unwrap_or_default();
     let has_dxfs = !dxfs.is_empty();
     crate::patch::rewrite_zip_borrowed(
         path,
@@ -4969,6 +4980,102 @@ mod tests {
         assert_eq!(s.value(1, 0), Value::Number(42.0));
         assert_eq!(s.value(2, 1), Value::Number(3.5));
         assert_eq!(s.value(9, 9), Value::Empty);
+    }
+
+    #[test]
+    fn date_group_and_color_filter_roundtrip_fresh_and_delta_saves() {
+        let dir = std::env::temp_dir().join("sheets_native_filter_rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("date_color_filter.xlsx");
+        let _ = std::fs::remove_file(&path);
+
+        let mut wb = Workbook::new_blank();
+        let fill_sid = wb.styles.intern(crate::style::CellStyle {
+            fill: Some([255, 240, 200]),
+            ..Default::default()
+        });
+        let font_sid = wb.styles.intern(crate::style::CellStyle {
+            color: [192, 0, 0],
+            ..Default::default()
+        });
+        {
+            let sh = wb.sheet_mut(0);
+            sh.set(0, 0, Cell { value: Value::Text("日期".into()), formula: None });
+            sh.set(0, 1, Cell { value: Value::Text("底色".into()), formula: None });
+            sh.set(0, 2, Cell { value: Value::Text("字色".into()), formula: None });
+            sh.set(1, 0, Cell { value: Value::Number(46351.0), formula: None });
+            sh.set(1, 1, Cell { value: Value::Text("A".into()), formula: None });
+            sh.set_style(1, 1, fill_sid);
+            sh.set(1, 2, Cell { value: Value::Text("B".into()), formula: None });
+            sh.set_style(1, 2, font_sid);
+            let mut flt = crate::sort_filter::Filter::new(0, 0, 1, 2);
+            flt.date_groups.insert(
+                0,
+                vec![
+                    crate::sort_filter::DateGroupItem { year: 2026, month: Some(11), day: None },
+                    crate::sort_filter::DateGroupItem { year: 2025, month: None, day: None },
+                ],
+            );
+            flt.color_filters
+                .insert(1, crate::sort_filter::ColorFilter::Fill(Some([255, 240, 200])));
+            flt.color_filters
+                .insert(2, crate::sort_filter::ColorFilter::Font([192, 0, 0]));
+            sh.filter = Some(flt);
+            sh.filter_dirty = true;
+        }
+        let receipt = save_atomic_with_receipt(&path, &wb).expect("fresh save");
+        receipt.adopt_document(&mut wb, &path, true);
+
+        let back = load(&path).expect("reload fresh");
+        let flt = back.sheet(0).filter.as_ref().expect("filter preserved");
+        let mut expected_dates = vec![
+            crate::sort_filter::DateGroupItem { year: 2025, month: None, day: None },
+            crate::sort_filter::DateGroupItem { year: 2026, month: Some(11), day: None },
+        ];
+        expected_dates.sort();
+        assert_eq!(flt.date_groups.get(&0), Some(&expected_dates));
+        assert_eq!(
+            flt.color_filters.get(&1),
+            Some(&crate::sort_filter::ColorFilter::Fill(Some([255, 240, 200])))
+        );
+        assert_eq!(
+            flt.color_filters.get(&2),
+            Some(&crate::sort_filter::ColorFilter::Font([192, 0, 0]))
+        );
+
+        // 二次增量保存修改为“无填充”颜色筛选与单日筛选
+        {
+            let sh = wb.sheet_mut(0);
+            let f = sh.filter.as_mut().unwrap();
+            f.date_groups.insert(
+                0,
+                vec![crate::sort_filter::DateGroupItem {
+                    year: 2026,
+                    month: Some(11),
+                    day: Some(25),
+                }],
+            );
+            f.color_filters
+                .insert(1, crate::sort_filter::ColorFilter::Fill(None));
+            sh.filter_dirty = true;
+        }
+        let r2 = save_atomic_with_receipt(&path, &wb).expect("delta save");
+        r2.adopt_document(&mut wb, &path, true);
+        let back2 = load(&path).expect("reload delta");
+        let flt2 = back2.sheet(0).filter.as_ref().expect("filter preserved after delta");
+        assert_eq!(
+            flt2.date_groups.get(&0),
+            Some(&vec![crate::sort_filter::DateGroupItem {
+                year: 2026,
+                month: Some(11),
+                day: Some(25),
+            }])
+        );
+        assert_eq!(
+            flt2.color_filters.get(&1),
+            Some(&crate::sort_filter::ColorFilter::Fill(None))
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

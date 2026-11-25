@@ -35,6 +35,7 @@ impl SheetApp {
             self.push_recent_color(c);
         }
         self.apply_style(move |s| s.fill = rgb);
+        self.set_repeat_action(crate::RepeatAction::FillColor(rgb));
     }
 
     /// 立即套用字体颜色并记忆
@@ -42,6 +43,7 @@ impl SheetApp {
         self.last_font_color = rgb;
         self.push_recent_color(rgb);
         self.apply_style(move |s| s.color = rgb);
+        self.set_repeat_action(crate::RepeatAction::FontColor(rgb));
     }
 
     /// 聚光灯（阅读模式）开关，持久化到 UiPrefs

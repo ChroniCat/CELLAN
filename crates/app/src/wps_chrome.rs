@@ -81,18 +81,19 @@ pub(crate) fn paint_wps_color_palette(
     clear_clicked: &mut bool,
     picked: &mut Option<[u8; 3]>,
 ) {
+    let pal = crate::theme::palette();
     if let Some(lbl) = none_label {
         let is_none = selected.is_none();
         let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(216.0), 24.0), Sense::click());
         if resp.hovered() {
-            ui.painter().rect_filled(r, 4.0, ui_kit::HOVER);
+            ui.painter().rect_filled(r, 4.0, pal.hover);
         }
         let sw = Rect::from_min_size(egui::pos2(r.left() + 6.0, r.center().y - 7.0), Vec2::splat(14.0));
         ui.painter().rect(
             sw,
             2.0,
             Color32::WHITE,
-            Stroke::new(1.0, Color32::from_rgb(180, 184, 192)),
+            Stroke::new(1.0, pal.card_border),
             egui::StrokeKind::Inside,
         );
         if lbl.contains("无") {
@@ -108,10 +109,10 @@ pub(crate) fn paint_wps_color_palette(
             Align2::LEFT_CENTER,
             lbl,
             FontId::proportional(12.0),
-            ui_kit::TEXT,
+            pal.text,
         );
         if is_none && lbl.contains("无") {
-            ui.painter().rect_stroke(r, 4.0, Stroke::new(1.0, ui_kit::ACCENT), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(r, 4.0, Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
         }
         if resp.clicked() {
             *clear_clicked = true;
@@ -119,7 +120,7 @@ pub(crate) fn paint_wps_color_palette(
         ui.add_space(4.0);
     }
 
-    ui.label(egui::RichText::new("主题颜色").size(11.0).color(ui_kit::TEXT_WEAK));
+    ui.label(egui::RichText::new("主题颜色").size(11.0).color(pal.text_weak));
     let matrix = wps_theme_matrix();
     let cell_sz = Vec2::new(17.0, 15.0);
     let gap = 4.0;
@@ -148,7 +149,7 @@ pub(crate) fn paint_wps_color_palette(
     }
 
     ui.add_space(4.0);
-    ui.label(egui::RichText::new("标准色").size(11.0).color(ui_kit::TEXT_WEAK));
+    ui.label(egui::RichText::new("标准色").size(11.0).color(pal.text_weak));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
         for rgb in WPS_STANDARD_COLORS {
@@ -172,7 +173,7 @@ pub(crate) fn paint_wps_color_palette(
 
     if !recent.is_empty() {
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("最近使用").size(11.0).color(ui_kit::TEXT_WEAK));
+        ui.label(egui::RichText::new("最近使用").size(11.0).color(pal.text_weak));
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for rgb in recent.iter().take(10) {
@@ -249,10 +250,11 @@ enum FileMenuAction {
 }
 
 fn menu_sep_line(ui: &mut egui::Ui) {
+    let pal = crate::theme::palette();
     let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(16.0), 7.0), Sense::hover());
     ui.painter().line_segment(
         [egui::pos2(r.left() + 6.0, r.center().y), egui::pos2(r.right() - 6.0, r.center().y)],
-        Stroke::new(1.0, ui_kit::SEP),
+        Stroke::new(1.0, pal.card_border),
     );
 }
 
@@ -283,13 +285,14 @@ impl SheetApp {
         let mut rects = Vec::new();
         let mut sub_anchor_y = pos.y + 42.0;
 
+        let pal = crate::theme::palette();
         let main_resp = egui::Area::new(egui::Id::new("wps_file_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                    .fill(pal.dialog_bg)
+                    .stroke(Stroke::new(1.0, pal.card_border))
                     .corner_radius(8.0)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 6],
@@ -314,13 +317,13 @@ impl SheetApp {
                                 Sense::click(),
                             );
                             if resp.hovered() || sub_on {
-                                ui.painter().rect_filled(r, 5.0, ui_kit::HOVER);
+                                ui.painter().rect_filled(r, 5.0, pal.hover);
                             }
                             ui_icons::draw_excel(
                                 ui.painter(),
                                 Rect::from_center_size(egui::pos2(r.left() + 14.0, r.center().y), Vec2::splat(15.0)),
                                 icon,
-                                ui_kit::TEXT,
+                                pal.text,
                                 true,
                             );
                             ui.painter().text(
@@ -328,7 +331,7 @@ impl SheetApp {
                                 Align2::LEFT_CENTER,
                                 label,
                                 FontId::proportional(12.5),
-                                ui_kit::TEXT,
+                                pal.text,
                             );
                             if !shortcut.is_empty() {
                                 ui.painter().text(
@@ -336,14 +339,14 @@ impl SheetApp {
                                     Align2::RIGHT_CENTER,
                                     shortcut,
                                     FontId::proportional(11.0),
-                                    ui_kit::TEXT_WEAK,
+                                    pal.text_weak,
                                 );
                             }
                             if has_sub {
                                 ui_kit::caret_right(
                                     ui,
                                     egui::pos2(r.right() - 10.0, r.center().y),
-                                    ui_kit::TEXT_WEAK,
+                                    pal.text_weak,
                                 );
                             }
                             resp
@@ -602,13 +605,14 @@ impl SheetApp {
         let mut show_custom = ctx.data_mut(|d| d.get_temp::<bool>(custom_id).unwrap_or(false));
         let recent = self.recent_colors.clone();
 
+        let pal = crate::theme::palette();
         let area_resp = egui::Area::new(egui::Id::new("wps_color_popup"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                    .fill(pal.dialog_bg)
+                    .stroke(Stroke::new(1.0, pal.card_border))
                     .corner_radius(8.0)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 6],
@@ -760,14 +764,14 @@ impl SheetApp {
                         painter.rect(
                             hb,
                             rad,
-                            Color32::WHITE,
-                            Stroke::new(1.0, ui_kit::CARD_BORDER),
+                            pal.card_bg,
+                            Stroke::new(1.0, pal.card_border),
                             egui::StrokeKind::Inside,
                         );
                         painter.rect_filled(
                             Rect::from_min_max(egui::pos2(hb.left() + 8.0, hb.top()), egui::pos2(hb.right() - 8.0, hb.top() + 2.5)),
                             1.5,
-                            ui_kit::ACCENT,
+                            pal.accent,
                         );
                     } else if !dark {
                         painter.rect(
@@ -781,7 +785,7 @@ impl SheetApp {
                         painter.rect_filled(hb, 6.0, hover);
                     }
                     let hic = if home_active {
-                        ui_kit::TEXT
+                        pal.text
                     } else if !dark && hresp.hovered() {
                         ui_kit::BRAND_NAVY
                     } else if !dark {
@@ -856,22 +860,22 @@ impl SheetApp {
                             painter.rect(
                                 tab,
                                 rad,
-                                Color32::WHITE,
-                                Stroke::new(1.0, ui_kit::CARD_BORDER),
+                                pal.card_bg,
+                                Stroke::new(1.0, pal.card_border),
                                 egui::StrokeKind::Inside,
                             );
                             painter.rect_filled(
                                 Rect::from_min_max(egui::pos2(tab.left() + 8.0, tab.top()), egui::pos2(tab.right() - 8.0, tab.top() + 2.5)),
                                 1.5,
-                                ui_kit::ACCENT,
+                                pal.accent,
                             );
                         } else if tr.hovered() || cr.hovered() {
-                            painter.rect_filled(tab, rad, Color32::from_rgb(233, 237, 244));
-                        } else if self.show_start {
+                            painter.rect_filled(tab, rad, hover);
+                        } else if self.show_start && !dark {
                             painter.rect_filled(tab, rad, Color32::from_rgba_unmultiplied(255, 255, 255, 150));
                         }
                         let text_rect = Rect::from_min_max(egui::pos2(tab.left() + 10.0, tab.top()), egui::pos2(tab.right() - 28.0, tab.bottom()));
-                        let tc = if *active { ui_kit::TEXT } else { Color32::from_rgb(71, 85, 105) };
+                        let tc = if *active { pal.text } else { pal.text_weak };
                         painter.with_clip_rect(text_rect).text(
                             egui::pos2(text_rect.left(), tab.center().y),
                             Align2::LEFT_CENTER,
@@ -883,9 +887,9 @@ impl SheetApp {
                             painter.circle_filled(egui::pos2(tab.right() - 24.0, tab.center().y), 3.0, Color32::from_rgb(217, 119, 6));
                         }
                         if cr.hovered() {
-                            painter.circle_filled(close.center(), 7.5, Color32::from_rgb(225, 228, 234));
+                            painter.circle_filled(close.center(), 7.5, pal.pressed);
                         }
-                        let cc = if cr.hovered() { ui_kit::TEXT } else { Color32::from_rgb(120, 124, 132) };
+                        let cc = if cr.hovered() { pal.text } else { pal.text_weak };
                         let cc0 = close.center();
                         painter.line_segment([egui::pos2(cc0.x - 3.2, cc0.y - 3.2), egui::pos2(cc0.x + 3.2, cc0.y + 3.2)], Stroke::new(1.1, cc));
                         painter.line_segment([egui::pos2(cc0.x + 3.2, cc0.y - 3.2), egui::pos2(cc0.x - 3.2, cc0.y + 3.2)], Stroke::new(1.1, cc));
@@ -912,8 +916,8 @@ impl SheetApp {
                             painter.rect_filled(plus, 5.0, hover);
                         }
                         let pc = plus.center();
-                        painter.line_segment([egui::pos2(pc.x - 4.5, pc.y), egui::pos2(pc.x + 4.5, pc.y)], Stroke::new(1.3, ui_kit::TEXT_WEAK));
-                        painter.line_segment([egui::pos2(pc.x, pc.y - 4.5), egui::pos2(pc.x, pc.y + 4.5)], Stroke::new(1.3, ui_kit::TEXT_WEAK));
+                        painter.line_segment([egui::pos2(pc.x - 4.5, pc.y), egui::pos2(pc.x + 4.5, pc.y)], Stroke::new(1.3, pal.text_weak));
+                        painter.line_segment([egui::pos2(pc.x, pc.y - 4.5), egui::pos2(pc.x, pc.y + 4.5)], Stroke::new(1.3, pal.text_weak));
                         if pr.on_hover_text("新建空白标签页 (Ctrl+N)").clicked() {
                             new_tab = true;
                         }
@@ -933,12 +937,12 @@ impl SheetApp {
                 // 4. 搜索框
                 if show_search {
                     let sr = Rect::from_min_size(egui::pos2(sx, rect.center().y - 13.0), Vec2::new(search_w, 26.0));
-                    painter.rect(sr, 13.0, Color32::WHITE, Stroke::new(1.0, ui_kit::CARD_BORDER), egui::StrokeKind::Inside);
+                    painter.rect(sr, 13.0, pal.card_bg, Stroke::new(1.0, pal.card_border), egui::StrokeKind::Inside);
                     ui_icons::draw_excel(
                         &painter,
                         Rect::from_center_size(egui::pos2(sr.left() + 15.0, sr.center().y), Vec2::splat(13.0)),
                         Icon::Find,
-                        Color32::from_rgb(112, 110, 108),
+                        pal.text_weak,
                         true,
                     );
                     let te_rect = Rect::from_min_max(egui::pos2(sr.left() + 28.0, sr.top() + 3.0), egui::pos2(sr.right() - 10.0, sr.bottom() - 3.0));
@@ -1096,10 +1100,11 @@ impl SheetApp {
         };
         let ratio = self.sheet_tab_split_ratio.clamp(0.2, 0.8);
 
+        let pal = crate::theme::palette();
         egui::TopBottomPanel::bottom("tabs")
             .show_separator_line(false)
             .exact_height(if self.show_start { 0.0 } else { tokens::size::SHEET_TAB_H })
-            .frame(egui::Frame::NONE.fill(ui_kit::PAGE_BG))
+            .frame(egui::Frame::NONE.fill(pal.page_bg))
             .show(ctx, |ui| {
                 if self.show_start {
                     return;
@@ -1108,7 +1113,7 @@ impl SheetApp {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 ui.painter().line_segment(
                     [rect.left_top(), rect.right_top()],
-                    Stroke::new(1.0, ui_kit::CARD_BORDER),
+                    Stroke::new(1.0, pal.card_border),
                 );
                 let mut goto: Option<usize> = None;
                 let mut ren: Option<(usize, String)> = None;
@@ -1127,14 +1132,14 @@ impl SheetApp {
                     let resp = ui.interact(b, egui::Id::new(("tabscroll", i)), Sense::click());
                     ui_kit::a11y_name(&resp, if *dir == "left" { "工作表标签左移" } else { "工作表标签右移" }, can, None);
                     if resp.hovered() && can {
-                        ui.painter().rect_filled(b.shrink(4.0), 3.0, ui_kit::HOVER_ON_PAGE);
+                        ui.painter().rect_filled(b.shrink(4.0), 3.0, pal.hover_on_page);
                     }
                     if resp.clicked() && can {
                         let delta = if *dir == "left" { -160.0 } else { 160.0 };
                         self.tab_scroll = (self.tab_scroll + delta).max(0.0);
                     }
                     let c = b.center();
-                    let st = Stroke::new(1.1, if can { Color32::from_rgb(96, 94, 92) } else { Color32::from_rgb(200, 198, 196) });
+                    let st = Stroke::new(1.1, if can { pal.text_weak } else { pal.text_muted });
                     let d = if *dir == "left" { -1.0 } else { 1.0 };
                     ui.painter().line_segment([egui::pos2(c.x - d * 2.5, c.y - 4.5), egui::pos2(c.x + d * 2.5, c.y)], st);
                     ui.painter().line_segment([egui::pos2(c.x + d * 2.5, c.y), egui::pos2(c.x - d * 2.5, c.y + 4.5)], st);
@@ -1271,10 +1276,10 @@ impl SheetApp {
                 let nb = Rect::from_min_size(egui::pos2(left_rect.right() - 32.0, left_rect.top() + 1.0), Vec2::new(30.0, 31.0));
                 let nresp = ui.interact(nb, egui::Id::new("newsheet"), Sense::click());
                 if nresp.hovered() {
-                    ui.painter().rect_filled(nb.shrink2(Vec2::new(2.0, 4.0)), 5.0, ui_kit::HOVER_ON_PAGE);
+                    ui.painter().rect_filled(nb.shrink2(Vec2::new(2.0, 4.0)), 5.0, pal.hover_on_page);
                 }
                 let c = nb.center();
-                let st = Stroke::new(1.2, Color32::from_rgb(68, 68, 68));
+                let st = Stroke::new(1.2, pal.text);
                 ui.painter().line_segment([egui::pos2(c.x - 4.5, c.y), egui::pos2(c.x + 4.5, c.y)], st);
                 ui.painter().line_segment([egui::pos2(c.x, c.y - 4.5), egui::pos2(c.x, c.y + 4.5)], st);
                 if nresp.on_hover_text("新建工作表").clicked() {

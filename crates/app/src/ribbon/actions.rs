@@ -538,18 +538,22 @@ impl SheetApp {
             "Bold" => {
                 let v = !self.current_style().bold;
                 self.apply_style(move |s| s.bold = v);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("Bold".into()));
             }
             "Italic" => {
                 let v = !self.current_style().italic;
                 self.apply_style(move |s| s.italic = v);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("Italic".into()));
             }
             "Underline" => {
                 let v = !self.current_style().underline;
                 self.apply_style(move |s| s.underline = v);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("Underline".into()));
             }
             "StrikeThrough" => {
                 let v = !self.current_style().strikethrough;
                 self.apply_style(move |s| s.strikethrough = v);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("StrikeThrough".into()));
             }
             "BordersDefault" => {
                 let act = self.last_border_action.clone();
@@ -574,6 +578,7 @@ impl SheetApp {
                     }
                     if action == "BorderNone" { s.diagonal = None; }
                 });
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd(action.into()));
             }
             "BorderDraw" => self.set_border_brush(crate::BorderBrush::Outline),
             "BorderDrawGrid" => self.set_border_brush(crate::BorderBrush::Grid),
@@ -581,44 +586,95 @@ impl SheetApp {
             "MoreBorders" => { self.open_format_dialog(); self.fmt_tab = 3; }
             "FillColor" => self.apply_fill_color(Some(self.last_fill_color)),
             "FontColor" => self.apply_font_color(self.last_font_color),
-            "ClearFormat" => self.clear_formats(),
-            "AlignTop" => self.apply_style(|s| s.valign = 1),
-            "AlignMiddle" => self.apply_style(|s| s.valign = 2),
-            "AlignBottom" => self.apply_style(|s| s.valign = 3),
-            "AlignLeft" => self.apply_style(|s| s.halign = 1),
-            "AlignCenter" => self.apply_style(|s| s.halign = 2),
-            "AlignRight" => self.apply_style(|s| s.halign = 3),
-            "DecreaseIndent" => self.apply_style(|s| s.indent = s.indent.saturating_sub(1)),
-            "IncreaseIndent" => self.apply_style(|s| s.indent = (s.indent + 1).min(15)),
+            "ClearFormat" => {
+                self.clear_formats();
+                self.set_repeat_action(crate::RepeatAction::Clear(crate::ClearPart::Formats));
+            }
+            "AlignTop" => {
+                self.apply_style(|s| s.valign = 1);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("AlignTop".into()));
+            }
+            "AlignMiddle" => {
+                self.apply_style(|s| s.valign = 2);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("AlignMiddle".into()));
+            }
+            "AlignBottom" => {
+                self.apply_style(|s| s.valign = 3);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("AlignBottom".into()));
+            }
+            "AlignLeft" => {
+                self.apply_style(|s| s.halign = 1);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("AlignLeft".into()));
+            }
+            "AlignCenter" => {
+                self.apply_style(|s| s.halign = 2);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("AlignCenter".into()));
+            }
+            "AlignRight" => {
+                self.apply_style(|s| s.halign = 3);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("AlignRight".into()));
+            }
+            "DecreaseIndent" => {
+                self.apply_style(|s| s.indent = s.indent.saturating_sub(1));
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("DecreaseIndent".into()));
+            }
+            "IncreaseIndent" => {
+                self.apply_style(|s| s.indent = (s.indent + 1).min(15));
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("IncreaseIndent".into()));
+            }
             "WrapText" => {
                 let v = !self.current_style().wrap;
-                self.last_repeat_action = Some(crate::RepeatAction::ToggleWrap);
                 self.apply_style(move |s| s.wrap = v);
                 if v {
                     self.autofit_sel_rows_for_wrap();
                 }
+                self.set_repeat_action(crate::RepeatAction::ToggleWrap);
             }
             "MergeCenter" => {
                 let was_merged = self.ctl_state("MergeCenter").checked;
                 let on = !was_merged;
-                self.last_repeat_action = Some(crate::RepeatAction::MergeToggle);
                 self.toggle_merge(on);
                 if on && self.merge_pending.is_none() && self.ctl_state("MergeCenter").checked {
                     self.apply_style(|s| s.halign = 2);
                 }
+                self.set_repeat_action(crate::RepeatAction::MergeToggle);
             }
             "MergeAcross" => self.merge_across(),
-            "MergeCells" => self.toggle_merge(true),
+            "MergeCells" => {
+                self.toggle_merge(true);
+                self.set_repeat_action(crate::RepeatAction::MergeToggle);
+            }
             "MergeContents" => self.merge_contents(),
-            "UnmergeCells" => self.toggle_merge(false),
+            "UnmergeCells" => {
+                self.toggle_merge(false);
+                self.set_repeat_action(crate::RepeatAction::MergeToggle);
+            }
             "UnmergeFill" => self.unmerge_and_fill(),
-            "CenterAcross" => self.apply_style(|s| s.halign = 4),
+            "CenterAcross" => {
+                self.apply_style(|s| s.halign = 4);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("CenterAcross".into()));
+            }
             "NumberFormatApply" => {}
-            "CurrencyStyle" => self.apply_style(|s| s.format = "¥#,##0.00".into()),
-            "PercentStyle" => self.apply_style(|s| s.format = "0%".into()),
-            "CommaStyle" => self.apply_style(|s| s.format = "#,##0.00".into()),
-            "IncreaseDecimal" => self.decimals(1),
-            "DecreaseDecimal" => self.decimals(-1),
+            "CurrencyStyle" => {
+                self.apply_style(|s| s.format = "¥#,##0.00".into());
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("CurrencyStyle".into()));
+            }
+            "PercentStyle" => {
+                self.apply_style(|s| s.format = "0%".into());
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("PercentStyle".into()));
+            }
+            "CommaStyle" => {
+                self.apply_style(|s| s.format = "#,##0.00".into());
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("CommaStyle".into()));
+            }
+            "IncreaseDecimal" => {
+                self.decimals(1);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("IncreaseDecimal".into()));
+            }
+            "DecreaseDecimal" => {
+                self.decimals(-1);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("DecreaseDecimal".into()));
+            }
             "ConditionalFormatting" => self.cf_mgr = true,
             "FormatAsTable" => self.make_table(),
             "CellStyles" => self.fmt_dlg = true,
@@ -630,23 +686,39 @@ impl SheetApp {
                     at: r1,
                     n: r2 - r1 + 1,
                 });
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("InsertRow".into()));
             }
             "InsertColumn" => {
                 let (_r1, c1, _r2, c2) = self.sel_rect();
                 self.structural(sheetcore::structural::Structural::InsertCols { at: c1, n: c2 - c1 + 1 });
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("InsertColumn".into()));
             }
-            "InsertCellsDown" => self.shift_cells(true, false),
-            "InsertCellsRight" => self.shift_cells(true, true),
+            "InsertCellsDown" => {
+                self.shift_cells(true, false);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("InsertCellsDown".into()));
+            }
+            "InsertCellsRight" => {
+                self.shift_cells(true, true);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("InsertCellsRight".into()));
+            }
             "DeleteRow" => {
                 let (r1, _c1, r2, _c2) = self.sel_rect();
                 self.delete_rows_range(r1, r2);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("DeleteRow".into()));
             }
             "DeleteColumn" => {
                 let (_r1, c1, _r2, c2) = self.sel_rect();
                 self.structural(sheetcore::structural::Structural::DeleteCols { at: c1, n: c2 - c1 + 1 });
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("DeleteColumn".into()));
             }
-            "DeleteCellsUp" => self.shift_cells(false, false),
-            "DeleteCellsLeft" => self.shift_cells(false, true),
+            "DeleteCellsUp" => {
+                self.shift_cells(false, false);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("DeleteCellsUp".into()));
+            }
+            "DeleteCellsLeft" => {
+                self.shift_cells(false, true);
+                self.set_repeat_action(crate::RepeatAction::RibbonCmd("DeleteCellsLeft".into()));
+            }
             "RowHeight" => {
                 self.size_dlg = Some((
                     false,
@@ -1246,7 +1318,8 @@ impl SheetApp {
             }
 
             // ---------------------------------------------------- 帮助
-            "Help" | "About" => self.about_open = true,
+            "Help" => self.help_open = true,
+            "About" => self.about_open = true,
 
             // ---------------------------------------------------- 表设计
             "TablePivot" => {

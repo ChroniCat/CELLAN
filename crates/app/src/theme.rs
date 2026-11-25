@@ -94,14 +94,34 @@ pub struct ThemePalette {
     pub info_fg: Color32,
 }
 
+#[cfg(not(test))]
 static ACTIVE_THEME: AtomicU8 = AtomicU8::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ACTIVE_THEME: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 pub fn current_theme() -> AppTheme {
-    AppTheme::from_u8(ACTIVE_THEME.load(Ordering::Relaxed))
+    #[cfg(not(test))]
+    {
+        AppTheme::from_u8(ACTIVE_THEME.load(Ordering::Relaxed))
+    }
+    #[cfg(test)]
+    {
+        TEST_ACTIVE_THEME.with(|c| AppTheme::from_u8(c.get()))
+    }
 }
 
 pub fn set_current_theme(theme: AppTheme) {
-    ACTIVE_THEME.store(theme as u8, Ordering::Relaxed);
+    #[cfg(not(test))]
+    {
+        ACTIVE_THEME.store(theme as u8, Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    {
+        TEST_ACTIVE_THEME.with(|c| c.set(theme as u8));
+    }
 }
 
 pub fn palette_for(theme: AppTheme) -> ThemePalette {
@@ -246,39 +266,71 @@ pub fn palette() -> ThemePalette {
 pub fn apply_app_theme(ctx: &egui::Context, theme: AppTheme) {
     set_current_theme(theme);
     let p = palette_for(theme);
-    let mut visuals = if theme.is_dark() {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    };
-    visuals.panel_fill = p.page_bg;
-    visuals.window_fill = p.dialog_bg;
-    visuals.faint_bg_color = p.hover;
-    visuals.extreme_bg_color = p.grid_bg;
-    visuals.override_text_color = Some(p.text);
-    visuals.selection.bg_fill = p.accent_tint;
-    visuals.selection.stroke = Stroke::new(1.5, p.accent);
-    visuals.widgets.noninteractive.bg_fill = p.card_bg;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.card_border);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
-    visuals.widgets.inactive.bg_fill = p.card_bg;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, p.card_border);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, p.text);
-    visuals.widgets.hovered.bg_fill = p.hover;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, p.accent);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, p.text);
-    visuals.widgets.active.bg_fill = p.pressed;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.5, p.accent);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, p.text);
-    visuals.window_stroke = Stroke::new(1.0, p.card_border);
-
     let egui_theme = if theme.is_dark() {
         egui::Theme::Dark
     } else {
         egui::Theme::Light
     };
     ctx.style_mut_of(egui_theme, |s| {
-        s.visuals = visuals;
+        let v = &mut s.visuals;
+        v.dark_mode = theme.is_dark();
+        v.panel_fill = p.page_bg;
+        v.window_fill = p.dialog_bg;
+        v.faint_bg_color = p.hover;
+        v.extreme_bg_color = p.grid_bg;
+        // 浅色/护眼主题不强写 override_text_color（保留控件各自语义色），深色/高对比主题确保默认文本清晰可见。
+        v.override_text_color = if theme.is_dark() { Some(p.text) } else { None };
+        match theme {
+            AppTheme::Light => {
+                v.selection.bg_fill = Color32::from_rgb(186, 224, 204);
+                v.selection.stroke = Stroke::new(1.0, Color32::from_rgb(20, 74, 45));
+                v.text_cursor.stroke = Stroke::new(1.25, p.text);
+                v.hyperlink_color = Color32::from_rgb(5, 99, 193);
+            }
+            AppTheme::EyeCare => {
+                v.selection.bg_fill = Color32::from_rgb(176, 218, 186);
+                v.selection.stroke = Stroke::new(1.0, Color32::from_rgb(20, 74, 45));
+                v.text_cursor.stroke = Stroke::new(1.25, p.text);
+                v.hyperlink_color = Color32::from_rgb(14, 92, 168);
+            }
+            AppTheme::Dark => {
+                v.selection.bg_fill = Color32::from_rgb(44, 96, 148);
+                v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+                v.text_cursor.stroke = Stroke::new(1.25, Color32::WHITE);
+                v.hyperlink_color = Color32::from_rgb(120, 186, 255);
+            }
+            AppTheme::HighContrast => {
+                v.selection.bg_fill = Color32::from_rgb(0, 90, 180);
+                v.selection.stroke = Stroke::new(1.5, Color32::WHITE);
+                v.text_cursor.stroke = Stroke::new(1.5, Color32::from_rgb(255, 230, 0));
+                v.hyperlink_color = Color32::from_rgb(120, 225, 255);
+            }
+        }
+        v.widgets.noninteractive.bg_fill = p.card_bg;
+        v.widgets.noninteractive.weak_bg_fill = p.card_bg;
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.card_border);
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
+        v.widgets.inactive.bg_fill = if theme == AppTheme::Light {
+            Color32::from_rgb(245, 247, 250)
+        } else {
+            p.card_bg
+        };
+        v.widgets.inactive.weak_bg_fill = p.card_bg;
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, p.card_border);
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0, p.text);
+        v.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        v.widgets.hovered.bg_fill = p.hover;
+        v.widgets.hovered.weak_bg_fill = p.hover;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, p.accent);
+        v.widgets.hovered.fg_stroke = Stroke::new(1.0, p.text);
+        v.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        v.widgets.active.bg_fill = p.pressed;
+        v.widgets.active.weak_bg_fill = p.pressed;
+        v.widgets.active.bg_stroke = Stroke::new(1.5, p.accent);
+        v.widgets.active.fg_stroke = Stroke::new(1.0, p.text);
+        v.widgets.active.corner_radius = egui::CornerRadius::same(6);
+        v.widgets.open = v.widgets.active;
+        v.window_stroke = Stroke::new(1.0, p.card_border);
     });
     ctx.set_theme(if theme.is_dark() {
         egui::ThemePreference::Dark

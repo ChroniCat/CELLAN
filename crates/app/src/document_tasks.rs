@@ -110,6 +110,19 @@ fn sheet_calc_is_self_contained(sheet: &sheetcore::Sheet, other_sheets_have_tabl
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApplyOutcome {
+    /// All sheets matched snapshot revisions and were fully installed.
+    FullySynced,
+    /// Concurrent edits occurred, but every untainted formula cell across ALL sheets
+    /// (including untouched cross-sheet formulas) was safely adopted; only `concurrent_edits`
+    /// and their dependents remain dirty.
+    PartialUntaintedAdopted,
+    /// At least one sheet could not be safely partially adopted (e.g. spills, iterative calc,
+    /// missing/incomplete dependency graph, or workbook-level invariants changed).
+    NeedsFullRecalc,
+}
+
 impl CalculatedSnapshot {
     fn workbook_invariants_match(&self, live: &Workbook) -> bool {
         let calc = &self.workbook;
@@ -175,7 +188,7 @@ impl CalculatedSnapshot {
     /// and returns `true`. If some sheet was edited concurrently, still preserves calculated caches
     /// for untouched self-contained sheets while returning `false` so dirty sheets remain scheduled.
     pub fn apply(self, live: &mut Workbook) -> bool {
-        self.apply_with_deps_and_edits(live, None, &[])
+        self.apply_with_deps_and_edits(live, None, &[]) == ApplyOutcome::FullySynced
     }
 
     #[allow(dead_code)]
@@ -184,22 +197,26 @@ impl CalculatedSnapshot {
         live: &mut Workbook,
         deps: Option<&sheetcore::formula::deps::Deps>,
     ) -> bool {
-        self.apply_with_deps_and_edits(live, deps, &[])
+        self.apply_with_deps_and_edits(live, deps, &[]) == ApplyOutcome::FullySynced
     }
 
     /// Install calculated results onto `live`.
-    /// - If all sheets stayed untouched, installs everything and returns `true`.
-    /// - If concurrent edits occurred in `concurrent_edits` and `deps` is available,
-    ///   adopts calculated formula caches for all cells OUTSIDE `deps.edit_closure(concurrent_edits)`
-    ///   so unrelated edits / continuous typing / collab traffic never waste completed background work!
+    /// - If all sheets stayed untouched, installs everything and returns `ApplyOutcome::FullySynced`.
+    /// - If concurrent edits occurred in `concurrent_edits` and `deps` is available (without
+    ///   requiring full recalc / iterative calc / spills), adopts calculated formula caches for
+    ///   EVERY formula cell OUTSIDE `deps.edit_closure(concurrent_edits)` across ALL sheets
+    ///   (including untouched sheets with cross-sheet refs or defined names) and returns
+    ///   `ApplyOutcome::PartialUntaintedAdopted`.
+    /// - Otherwise returns `ApplyOutcome::NeedsFullRecalc` so callers keep `needs_full = true`
+    ///   and preserve `fullCalcOnLoad="1"` on save until recalculation truly finishes.
     pub(crate) fn apply_with_deps_and_edits(
         mut self,
         live: &mut Workbook,
         deps: Option<&sheetcore::formula::deps::Deps>,
         concurrent_edits: &[(usize, u32, u32)],
-    ) -> bool {
+    ) -> ApplyOutcome {
         if !self.workbook_invariants_match(live) {
-            return false;
+            return ApplyOutcome::NeedsFullRecalc;
         }
         let calc = &mut self.workbook;
         let clean_flags: Vec<bool> = live
@@ -216,9 +233,10 @@ impl CalculatedSnapshot {
             live.calc_pending = calc.calc_pending;
             live.calc_pending_sheets = std::mem::take(&mut calc.calc_pending_sheets);
             live.mark_recalc_synced();
-            return true;
+            return ApplyOutcome::FullySynced;
         }
         // 1) Adopt completely untouched self-contained sheets
+        let mut adopted_full = vec![false; live.sheets.len()];
         if live.names.is_empty() && !live.calc_iterate {
             let table_sheet_count = live.sheets.iter().filter(|s| !s.tables.is_empty()).count();
             for (si, ((sheet, result), &is_clean)) in live
@@ -239,10 +257,12 @@ impl CalculatedSnapshot {
                 if sheet_calc_is_self_contained(sheet, other_sheets_have_tables) {
                     sheet.take_calculation(result);
                     live.calc_pending_sheets.remove(&si);
+                    adopted_full[si] = true;
                 }
             }
         }
-        // 2) Partial cell-level adoption on concurrently-edited sheets outside the tainted closure
+        // 2) Partial cell-level adoption across ALL non-fully-adopted sheets (including untouched
+        //    sheets with cross-sheet refs or defined names) outside the tainted closure.
         if !concurrent_edits.is_empty()
             && !live.calc_iterate
             && let Some(d) = deps
@@ -250,14 +270,18 @@ impl CalculatedSnapshot {
         {
             let mut tainted = d.edit_closure(concurrent_edits);
             tainted.extend(concurrent_edits.iter().copied());
-            for (si, ((sheet, result), &is_clean)) in live
+            let mut all_covered = true;
+            for (si, (sheet, result)) in live
                 .sheets
                 .iter_mut()
                 .zip(&calc.sheets)
-                .zip(&clean_flags)
                 .enumerate()
             {
-                if is_clean || !result.spill_shapes.is_empty() || !sheet.spill_shapes.is_empty() {
+                if adopted_full[si] {
+                    continue;
+                }
+                if !result.spill_shapes.is_empty() || !sheet.spill_shapes.is_empty() {
+                    all_covered = false;
                     continue;
                 }
                 let mut updates: Vec<(u32, u32, sheetcore::Value)> = Vec::new();
@@ -277,8 +301,11 @@ impl CalculatedSnapshot {
                     sheet.set_formula_cache(r, c, val);
                 }
             }
+            if all_covered {
+                return ApplyOutcome::PartialUntaintedAdopted;
+            }
         }
-        false
+        ApplyOutcome::NeedsFullRecalc
     }
 }
 
@@ -422,7 +449,12 @@ impl DocumentTasks {
         // Subsequent edits set this back to true. Completion never clears it.
         wb.dirty = false;
         self.autosave_dirty_since = None;
-        let recalc = self.recalc_pending() && !snapshot.calc_manual;
+        let pending_recalc = self.recalc_pending();
+        let recalc = pending_recalc && !snapshot.calc_manual;
+        if pending_recalc && snapshot.calc_manual {
+            // 手动计算且存在未重算改动：写出时明确标记 calc_pending，避免 Excel 盲信旧缓存。
+            snapshot.calc_pending = true;
+        }
         let structure = self.structural_recalc.as_ref()
             .filter(|s| recalc && self.needs_full && Some(s.generation) == generation).cloned();
         let incremental = deps.filter(|_| recalc && !self.needs_full && !snapshot.calc_iterate)
@@ -439,6 +471,9 @@ impl DocumentTasks {
                 } else if !structure.is_some_and(|s| s.apply(&mut snapshot,&false.into()).is_some()) {
                     sheetcore::formula::recalc_all(&mut snapshot);
                 }
+                snapshot.calc_pending = false;
+                snapshot.calc_pending_sheets.clear();
+                snapshot.mark_recalc_synced();
                 revisions
             });
             // The core owns the temporary write, history, and atomic replacement.

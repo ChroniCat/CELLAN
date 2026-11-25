@@ -367,6 +367,16 @@ pub const GROUP_LABEL_H: f32 = 16.0;
 thread_local! {
     static GROUP_FIRST: Cell<bool> = const { Cell::new(true) };
     static GROUP_PAD: Cell<f32> = const { Cell::new(8.0) };
+    /// 当前正在绘制的 `Dlg` 是否为非模态浮动面板（协作面板、查找替换、监视窗口等）。
+    /// 非模态面板内的 `primary_button` 绝不在表格无控件聚焦时抢吃回车键。
+    static CURRENT_DLG_NON_MODAL: Cell<bool> = const { Cell::new(false) };
+}
+
+struct NonModalDlgGuard(bool);
+impl Drop for NonModalDlgGuard {
+    fn drop(&mut self) {
+        CURRENT_DLG_NON_MODAL.with(|c| c.set(self.0));
+    }
 }
 
 /// 每组 ribbon 内容开始前调用：第一组不画左侧分隔线
@@ -380,11 +390,12 @@ pub fn set_group_pad(pad: f32) {
 }
 
 pub fn accent(_v: &egui::Visuals) -> Color32 {
-    ACCENT
+    crate::theme::palette().accent
 }
 
 pub(crate) fn text_color(v: &egui::Visuals) -> Color32 {
-    v.override_text_color.unwrap_or(TEXT)
+    v.override_text_color
+        .unwrap_or_else(|| crate::theme::palette().text)
 }
 
 /// Excel 浅色主题；深色沿用原来的深灰配色（Excel 也有深色模式）。
@@ -488,25 +499,25 @@ pub fn apply_theme(ctx: &egui::Context) {
 
     ctx.set_style_of(egui::Theme::Dark, dark);
     ctx.set_style_of(egui::Theme::Light, light);
+    // 禁用 egui 内置 Ctrl+-/Ctrl+= 整窗缩放，防止与 Excel 删除/插入单元格快捷键冲突
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
     // Excel 默认浅色；界面按浅色做像素对齐
     ctx.set_theme(egui::ThemePreference::Light);
 }
 
 /// 统一商用下拉菜单 / 气泡浮层外壳（8px 圆角、柔和弥散投影、1px CARD_BORDER）
 pub fn popup_frame(style: &egui::Style) -> egui::Frame {
-    let dark = style.visuals.dark_mode;
+    let pal = crate::theme::palette();
+    let dark = style.visuals.dark_mode || pal.theme.is_dark();
     egui::Frame::NONE
-        .fill(if dark { style.visuals.window_fill } else { Color32::WHITE })
-        .stroke(Stroke::new(
-            1.0,
-            if dark { Color32::from_rgb(62, 68, 79) } else { CARD_BORDER },
-        ))
+        .fill(pal.dialog_bg)
+        .stroke(Stroke::new(1.0, pal.card_border))
         .corner_radius(egui::CornerRadius::same(8))
         .shadow(egui::epaint::Shadow {
             offset: [0, 6],
             blur: 18,
             spread: 0,
-            color: Color32::from_black_alpha(if dark { 64 } else { 26 }),
+            color: Color32::from_black_alpha(if dark { 80 } else { 26 }),
         })
         .inner_margin(egui::Margin::same(6))
 }
@@ -524,10 +535,11 @@ pub fn popup_item(ui: &mut egui::Ui, label: &str, enabled: bool, min_w: f32) -> 
     let w = (galley.size().x + 24.0).max(min_w).max(ui.available_width());
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 27.0), sense);
+    let pal = crate::theme::palette();
     if enabled && resp.is_pointer_button_down_on() {
-        ui.painter().rect_filled(rect, 5.0, PRESSED);
+        ui.painter().rect_filled(rect, 5.0, pal.pressed);
     } else if enabled && resp.hovered() {
-        ui.painter().rect_filled(rect, 5.0, HOVER);
+        ui.painter().rect_filled(rect, 5.0, pal.hover);
     }
     let pos = Align2::LEFT_CENTER
         .anchor_size(egui::pos2(rect.left() + 10.0, rect.center().y), galley.size())
@@ -1627,22 +1639,34 @@ impl BtnResp {
 }
 
 pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
+    let pal = crate::theme::palette();
+    let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
+    let fg = if is_hc { Color32::BLACK } else { Color32::WHITE };
+    let bg_idle = pal.accent;
+    let bg_hov = pal.accent_hover;
+    let bg_act = if is_hc {
+        Color32::from_rgb(220, 195, 0)
+    } else if pal.theme.is_dark() {
+        Color32::from_rgb(32, 148, 96)
+    } else {
+        Color32::from_rgb(20, 77, 46)
+    };
     let resp = ui
         .scope(|ui| {
             let w = &mut ui.visuals_mut().widgets;
-            w.inactive.weak_bg_fill = ACCENT;
-            w.inactive.bg_fill = ACCENT;
+            w.inactive.weak_bg_fill = bg_idle;
+            w.inactive.bg_fill = bg_idle;
             w.inactive.bg_stroke = Stroke::NONE;
-            w.hovered.weak_bg_fill = Color32::from_rgb(26, 97, 58);
-            w.hovered.bg_fill = Color32::from_rgb(26, 97, 58);
+            w.hovered.weak_bg_fill = bg_hov;
+            w.hovered.bg_fill = bg_hov;
             w.hovered.bg_stroke = Stroke::NONE;
-            w.active.weak_bg_fill = Color32::from_rgb(20, 77, 46);
-            w.active.bg_fill = Color32::from_rgb(20, 77, 46);
+            w.active.weak_bg_fill = bg_act;
+            w.active.bg_fill = bg_act;
             w.active.bg_stroke = Stroke::NONE;
             let btn = egui::Button::new(
                 RichText::new(label)
                     .font(medium_in(ui.ctx(), crate::tokens::text::BODY))
-                    .color(Color32::WHITE),
+                    .color(fg),
             )
             .corner_radius(6.0)
             .min_size(Vec2::new(84.0, 32.0));
@@ -1653,11 +1677,13 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
         ui.painter().rect_stroke(
             resp.rect.expand(2.0),
             7.5,
-            Stroke::new(1.5, ACCENT.gamma_multiply(0.55)),
+            Stroke::new(1.5, pal.accent.gamma_multiply(0.55)),
             egui::StrokeKind::Outside,
         );
     }
-    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter))
+    let in_non_modal = CURRENT_DLG_NON_MODAL.with(|c| c.get());
+    let enter = !in_non_modal
+        && ui.input(|i| i.key_pressed(egui::Key::Enter))
         && ui.ctx().memory(|m| m.focused().is_none())
         && !ui.ctx().memory(|m| m.any_popup_open());
     BtnResp {
@@ -1665,22 +1691,23 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
     }
 }
 
-/// 次要按钮（取消/关闭）：与主按钮严格同高同宽（84×32）、6px 圆角、白底细灰边
+/// 次要按钮（取消/关闭）：与主按钮严格同高同宽（84×32）、6px 圆角、随主题适配底色与文字
 pub fn secondary_button(ui: &mut egui::Ui, label: &str) -> Response {
+    let pal = crate::theme::palette();
     ui.scope(|ui| {
         let w = &mut ui.visuals_mut().widgets;
-        w.inactive.weak_bg_fill = Color32::WHITE;
-        w.inactive.bg_fill = Color32::WHITE;
-        w.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(210, 214, 222));
-        w.hovered.weak_bg_fill = Color32::from_rgb(245, 247, 250);
-        w.hovered.bg_fill = Color32::from_rgb(245, 247, 250);
-        w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(184, 190, 200));
-        w.active.weak_bg_fill = Color32::from_rgb(236, 239, 244);
-        w.active.bg_fill = Color32::from_rgb(236, 239, 244);
-        w.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(164, 172, 184));
+        w.inactive.weak_bg_fill = pal.card_bg;
+        w.inactive.bg_fill = pal.card_bg;
+        w.inactive.bg_stroke = Stroke::new(1.0, pal.card_border);
+        w.hovered.weak_bg_fill = pal.hover;
+        w.hovered.bg_fill = pal.hover;
+        w.hovered.bg_stroke = Stroke::new(1.0, pal.accent);
+        w.active.weak_bg_fill = pal.pressed;
+        w.active.bg_fill = pal.pressed;
+        w.active.bg_stroke = Stroke::new(1.0, pal.accent);
         let btn = egui::Button::new(
             RichText::new(label)
-                .color(Color32::from_rgb(52, 58, 68))
+                .color(pal.text)
                 .size(crate::tokens::text::BODY),
         )
         .corner_radius(6.0)
@@ -1690,8 +1717,9 @@ pub fn secondary_button(ui: &mut egui::Ui, label: &str) -> Response {
     .inner
 }
 
-/// 商用表单单行输入框：34px 舒适高度、左右 10px 内边距、浅灰底悬停提亮、聚焦深海蓝外发光圈
+/// 商用表单单行输入框：34px 舒适高度、左右 10px 内边距、随主题适配底色/文字/描边
 pub fn text_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> Response {
+    let pal = crate::theme::palette();
     let desired_w = ui.available_width().max(120.0);
     let (outer, _) = ui.allocate_exact_size(Vec2::new(desired_w, 34.0), Sense::hover());
     let bg_slot = ui.painter().add(egui::Shape::Noop);
@@ -1707,27 +1735,30 @@ pub fn text_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> Response {
             .frame(false)
             .desired_width(inner.width())
             .font(FontId::proportional(12.0))
+            .text_color(pal.text)
             .hint_text(
                 RichText::new(hint)
                     .size(12.0)
-                    .color(Color32::from_rgb(156, 163, 175)),
+                    .color(pal.text_muted),
             ),
     );
     let has_focus = te_resp.has_focus() || focused_id == Some(te_resp.id);
     let hovered = ui.rect_contains_pointer(outer);
     let bg = if has_focus {
-        Color32::WHITE
+        pal.grid_bg
     } else if hovered {
-        Color32::from_rgb(252, 252, 253)
+        pal.hover
+    } else if pal.theme.is_dark() {
+        pal.card_bg
     } else {
         Color32::from_rgb(248, 249, 251)
     };
     let border = if has_focus {
-        Stroke::new(1.5, BRAND_NAVY)
+        Stroke::new(1.5, pal.accent)
     } else if hovered {
-        Stroke::new(1.0, Color32::from_rgb(180, 186, 198))
+        Stroke::new(1.0, pal.text_muted)
     } else {
-        Stroke::new(1.0, Color32::from_rgb(216, 220, 228))
+        Stroke::new(1.0, pal.card_border)
     };
     ui.painter().set(
         bg_slot,
@@ -1738,7 +1769,7 @@ pub fn text_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> Response {
         p.rect_stroke(
             outer.expand(1.5),
             7.5,
-            Stroke::new(2.5, Color32::from_rgba_unmultiplied(27, 53, 129, 28)),
+            Stroke::new(2.5, pal.accent.gamma_multiply(0.22)),
             egui::StrokeKind::Outside,
         );
     }
@@ -1827,11 +1858,12 @@ pub fn sheet_tab(
     let text_pos = Align2::CENTER_CENTER
         .anchor_size(rect.center(), galley.size())
         .min;
+    let pal = crate::theme::palette();
     if let Some(fill) = tab_rgb {
         // 有颜色的标签：整块铺色；深色配白字
         ui.painter().rect_filled(chip, rad, fill);
         if active {
-            ui.painter().rect_stroke(chip, rad, Stroke::new(1.5, ACCENT), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(chip, rad, Stroke::new(1.5, pal.accent), egui::StrokeKind::Inside);
         }
         let lum = 0.299 * fill.r() as f32 + 0.587 * fill.g() as f32 + 0.114 * fill.b() as f32;
         let mut color = if lum > 165.0 {
@@ -1846,36 +1878,36 @@ pub fn sheet_tab(
         return resp;
     }
     if active {
-        // 活动页：白底上缘与上方表格底栏无缝衔接，底部以 2.5px 主题绿横条清晰标出当前表
+        // 活动页：底色与上方表格底栏衔接，底部以 2.5px 主题强调条清晰标出当前表
         let chip = Rect::from_min_max(
             egui::pos2(rect.left() + 1.0, rect.top()),
             egui::pos2(rect.right() - 1.0, rect.bottom() - 3.0),
         );
         let active_rad = egui::CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 };
-        ui.painter().rect_filled(chip, active_rad, Color32::WHITE);
+        ui.painter().rect_filled(chip, active_rad, pal.card_bg);
         ui.painter().line_segment(
             [chip.left_top(), chip.left_bottom() - Vec2::new(0.0, 4.0)],
-            Stroke::new(1.0, CARD_BORDER),
+            Stroke::new(1.0, pal.card_border),
         );
         ui.painter().line_segment(
             [chip.right_top(), chip.right_bottom() - Vec2::new(0.0, 4.0)],
-            Stroke::new(1.0, CARD_BORDER),
+            Stroke::new(1.0, pal.card_border),
         );
         let bar = egui::Rect::from_min_size(
             egui::pos2(chip.left() + 8.0, chip.bottom() - 2.5),
             Vec2::new((chip.width() - 16.0).max(4.0), 2.5),
         );
-        ui.painter().rect_filled(bar, 1.25, ACCENT);
-        ui.painter().galley_with_override_text_color(text_pos, galley, ACCENT);
+        ui.painter().rect_filled(bar, 1.25, pal.accent);
+        ui.painter().galley_with_override_text_color(text_pos, galley, pal.accent);
         return resp;
     } else if resp.hovered() {
-        let hover = if dark { hov_bg } else { HOVER_ON_PAGE };
+        let hover = if dark { hov_bg } else { pal.hover_on_page };
         ui.painter().rect_filled(rect.shrink2(Vec2::new(2.0, 4.0)), 5.0, hover);
     }
     let color = if dark {
         weak_col
     } else {
-        Color32::from_rgb(71, 85, 105)
+        pal.text_weak
     };
     ui.painter().galley_with_override_text_color(text_pos, galley, color);
     ui.painter().line_segment(
@@ -1883,7 +1915,7 @@ pub fn sheet_tab(
             egui::pos2(rect.right(), rect.center().y - 6.0),
             egui::pos2(rect.right(), rect.center().y + 6.0),
         ],
-        Stroke::new(1.0, Color32::from_rgb(214, 220, 230)),
+        Stroke::new(1.0, pal.card_border),
     );
     resp
 }
@@ -2191,6 +2223,9 @@ impl Dlg {
                             top: 16,
                             bottom: 18,
                         });
+                        let _non_modal_guard = NonModalDlgGuard(
+                            CURRENT_DLG_NON_MODAL.with(|c| c.replace(!self.block_background)),
+                        );
                         let inner = body
                             .show(ui, |ui| {
                                 ui.set_width(w - 40.0);
