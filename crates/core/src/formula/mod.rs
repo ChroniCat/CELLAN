@@ -3112,6 +3112,59 @@ impl<'a> Calc<'a> {
         match id {
             FuncId::If if nodes.len() >= 2 => {
                 let cond = self.eval_node(&nodes[0], si);
+                if let FValue::Array(ca) = cond {
+                    let any_true = ca.data.iter().any(|v| matches!(v.to_bool(), Ok(true)));
+                    let any_false = ca.data.iter().any(|v| matches!(v.to_bool(), Ok(false)));
+                    let tv = if any_true {
+                        self.operand_block(&nodes[1], si)
+                    } else {
+                        Arg::Val(FValue::Bool(false))
+                    };
+                    let fv = if any_false {
+                        if nodes.len() >= 3 {
+                            self.operand_block(&nodes[2], si)
+                        } else {
+                            Arg::Val(FValue::Bool(false))
+                        }
+                    } else {
+                        Arg::Val(FValue::Bool(false))
+                    };
+                    let (tr, tc) = functions::range_dims(&tv);
+                    let (fr, fc) = functions::range_dims(&fv);
+                    let Some((r1, c1)) = broadcast_dims((ca.rows, ca.cols), (tr, tc)) else {
+                        return FValue::Error(ErrKind::Value);
+                    };
+                    let Some((rows, cols)) = broadcast_dims((r1, c1), (fr, fc)) else {
+                        return FValue::Error(ErrKind::Value);
+                    };
+                    if rows.saturating_mul(cols) > 1_000_000 {
+                        return FValue::Error(ErrKind::Value);
+                    }
+                    let ts = tv.slice();
+                    let fs = fv.slice();
+                    let mut out = Vec::with_capacity(rows * cols);
+                    for i in 0..rows {
+                        for j in 0..cols {
+                            let ci = (if ca.rows == 1 { 0 } else { i }) * ca.cols
+                                + (if ca.cols == 1 { 0 } else { j });
+                            let val = match ca.data[ci].to_bool() {
+                                Ok(true) => {
+                                    let ti = (if tr == 1 { 0 } else { i }) * tc
+                                        + (if tc == 1 { 0 } else { j });
+                                    ts.get(ti).cloned().unwrap_or(FValue::Empty)
+                                }
+                                Ok(false) => {
+                                    let fi = (if fr == 1 { 0 } else { i }) * fc
+                                        + (if fc == 1 { 0 } else { j });
+                                    fs.get(fi).cloned().unwrap_or(FValue::Empty)
+                                }
+                                Err(e) => FValue::Error(e),
+                            };
+                            out.push(val);
+                        }
+                    }
+                    return FValue::Array(std::sync::Arc::new(value::Array::new(rows, cols, out)));
+                }
                 match cond.to_bool() {
                     Ok(true) => self.eval_node(&nodes[1], si),
                     Ok(false) => {
@@ -3124,13 +3177,58 @@ impl<'a> Calc<'a> {
                     Err(e) => FValue::Error(e),
                 }
             }
-            FuncId::IfError if nodes.len() >= 2 => {
-                let v = self.eval_node(&nodes[0], si);
-                if v.is_error() {
-                    self.eval_node(&nodes[1], si)
-                } else {
-                    v
+            FuncId::IfError | FuncId::IfNa if nodes.len() >= 2 => {
+                let na_only = id == FuncId::IfNa;
+                let matches_err = |v: &FValue| {
+                    if na_only {
+                        matches!(v, FValue::Error(ErrKind::Na))
+                    } else {
+                        v.is_error()
+                    }
+                };
+                let v = self.operand_block(&nodes[0], si);
+                let (vr, vc) = functions::range_dims(&v);
+                if vr == 1 && vc == 1 {
+                    let sv = v.first();
+                    return if matches_err(&sv) {
+                        self.eval_node(&nodes[1], si)
+                    } else {
+                        sv
+                    };
                 }
+                let vs = v.slice();
+                if !vs.iter().any(matches_err) {
+                    return FValue::Array(std::sync::Arc::new(value::Array::new(
+                        vr,
+                        vc,
+                        vs.to_vec(),
+                    )));
+                }
+                let fb = self.operand_block(&nodes[1], si);
+                let (fr, fc) = functions::range_dims(&fb);
+                let Some((rows, cols)) = broadcast_dims((vr, vc), (fr, fc)) else {
+                    return FValue::Error(ErrKind::Value);
+                };
+                if rows.saturating_mul(cols) > 1_000_000 {
+                    return FValue::Error(ErrKind::Value);
+                }
+                let fbs = fb.slice();
+                let mut out = Vec::with_capacity(rows * cols);
+                for i in 0..rows {
+                    for j in 0..cols {
+                        let vi = (if vr == 1 { 0 } else { i }) * vc
+                            + (if vc == 1 { 0 } else { j });
+                        let elem = vs.get(vi).cloned().unwrap_or(FValue::Empty);
+                        if matches_err(&elem) {
+                            let fi = (if fr == 1 { 0 } else { i }) * fc
+                                + (if fc == 1 { 0 } else { j });
+                            out.push(fbs.get(fi).cloned().unwrap_or(FValue::Empty));
+                        } else {
+                            out.push(elem);
+                        }
+                    }
+                }
+                FValue::Array(std::sync::Arc::new(value::Array::new(rows, cols, out)))
             }
             // LET(x, 1, y, x+1, y*2)：使用内联小帧（<= 4 绑定零堆分配）
             FuncId::Let if nodes.len() >= 3 => {
@@ -3155,6 +3253,50 @@ impl<'a> Calc<'a> {
                 let out = self.eval_node(nodes.last().unwrap(), si);
                 self.env_stack.pop();
                 out
+            }
+            FuncId::IsRef => {
+                let is_ref = match nodes.first() {
+                    Some(Node::Ref(re)) => {
+                        let ok_sheet = re.book.is_some()
+                            || self.sheet_index(re.sheet.as_deref(), si).is_ok();
+                        ok_sheet && self.r_row(re) >= 0 && self.r_col(re) >= 0
+                    }
+                    Some(Node::Range(a, b)) => {
+                        let ok_sheet = a.book.is_some()
+                            || self.sheet_index(a.sheet.as_deref(), si).is_ok();
+                        ok_sheet
+                            && self.r_row(a) >= 0
+                            && self.r_col(a) >= 0
+                            && self.r_row(b) >= 0
+                            && self.r_col(b) >= 0
+                    }
+                    Some(Node::Spill(re)) => {
+                        self.sheet_index(re.sheet.as_deref(), si).is_ok()
+                            && self.r_row(re) >= 0
+                            && self.r_col(re) >= 0
+                    }
+                    Some(Node::Name(nm)) => {
+                        let in_env = self.env_stack.iter().rev().any(|m| m.contains_key(nm));
+                        if in_env {
+                            false
+                        } else if let Some(idx) = named_definition(self.wb, nm, si, false) {
+                            let body = self.wb.names[idx].2.trim_start_matches('=');
+                            matches!(parse(body), Ok(Node::Ref(_) | Node::Range(..) | Node::Spill(_)))
+                        } else {
+                            false
+                        }
+                    }
+                    Some(n @ Node::Func(f, _))
+                        if matches!(
+                            f.id(),
+                            FuncId::Indirect | FuncId::Offset | FuncId::Index | FuncId::XLookup
+                        ) =>
+                    {
+                        !self.eval_node(n, si).is_error()
+                    }
+                    _ => false,
+                };
+                FValue::Bool(is_ref)
             }
             FuncId::IsFormula | FuncId::FormulaText => {
                 let Some(Node::Ref(re)) = nodes.first() else {
@@ -3974,6 +4116,49 @@ impl<'a> Calc<'a> {
                 self.volatile_values.insert(key, value.clone());
                 value
             }
+        } else if supports_scalar_array_lift(id)
+            && args.iter().any(|a| {
+                let (r, c) = functions::range_dims(a);
+                r > 1 || c > 1
+            })
+        {
+            let mut shape = (1usize, 1usize);
+            let mut valid = true;
+            for a in &args {
+                let d = functions::range_dims(a);
+                if let Some(next) = broadcast_dims(shape, d) {
+                    shape = next;
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            let (rows, cols) = shape;
+            if !valid || rows == 0 || cols == 0 || rows.saturating_mul(cols) > 1_000_000 {
+                FValue::Error(ErrKind::Value)
+            } else {
+                let dims: Vec<(usize, usize)> = args.iter().map(functions::range_dims).collect();
+                let mut cell_args: Vec<Arg> = Vec::with_capacity(args.len());
+                let mut out_data = Vec::with_capacity(rows * cols);
+                for i in 0..rows {
+                    for j in 0..cols {
+                        cell_args.clear();
+                        for (a, &(ar, ac)) in args.iter().zip(&dims) {
+                            let idx = (if ar == 1 { 0 } else { i }) * ac
+                                + (if ac == 1 { 0 } else { j });
+                            let v = a.slice().get(idx).cloned().unwrap_or(FValue::Empty);
+                            cell_args.push(Arg::Val(v));
+                        }
+                        out_data.push(functions::call_id_in(
+                            self.ctx,
+                            id,
+                            name.as_str(),
+                            &cell_args,
+                        ));
+                    }
+                }
+                FValue::Array(std::sync::Arc::new(value::Array::new(rows, cols, out_data)))
+            }
         } else {
             functions::call_by_id_in(self.ctx, id, name.as_str(), &args, &mut || {
                 if bound.is_some() { FValue::Error(ErrKind::Value) }
@@ -4473,14 +4658,7 @@ impl<'a> Calc<'a> {
 
         let Some(i) = hit else {
             return match nodes.get(3) {
-                Some(n) if !matches!(n, Node::Empty) => {
-                    let fallback = self.eval_node(n, si);
-                    if matches!(fallback, FValue::Empty) {
-                        FValue::Error(ErrKind::Na)
-                    } else {
-                        fallback
-                    }
-                }
+                Some(n) if !matches!(n, Node::Empty) => self.eval_node(n, si),
                 _ => FValue::Error(ErrKind::Na),
             };
         };
@@ -5072,9 +5250,11 @@ impl<'a> Calc<'a> {
                     let v_num = match self.wb.sheets[si2].get_view(abs_r, col) {
                         None => 0.0,
                         Some(crate::store::CellView::Number(n)) => n,
-                        Some(crate::store::CellView::Value(v)) => {
-                            to_fvalue(v).to_number().unwrap_or(0.0)
-                        }
+                        Some(crate::store::CellView::Value(v)) => match v {
+                            crate::Value::Error(e) => return Some(FValue::Error(*e)),
+                            crate::Value::Number(n) => *n,
+                            _ => 0.0,
+                        },
                         Some(crate::store::CellView::Cell(cell)) => {
                             if cell.formula.is_some() {
                                 let k = (si2, abs_r, col);
@@ -5087,16 +5267,20 @@ impl<'a> Calc<'a> {
                                 } else {
                                     to_fvalue(&cell.value)
                                 };
-                                fv.to_number().unwrap_or(0.0)
+                                match fv {
+                                    FValue::Error(e) => return Some(FValue::Error(e)),
+                                    FValue::Number(n) => n,
+                                    _ => 0.0,
+                                }
                             } else {
-                                to_fvalue(&cell.value).to_number().unwrap_or(0.0)
+                                match &cell.value {
+                                    crate::Value::Error(e) => return Some(FValue::Error(*e)),
+                                    crate::Value::Number(n) => *n,
+                                    _ => 0.0,
+                                }
                             }
                         }
                     };
-                    if v_num == 0.0 {
-                        prod = 0.0;
-                        break;
-                    }
                     prod *= v_num;
                 }
                 total += prod;
@@ -5156,8 +5340,6 @@ impl<'a> Calc<'a> {
         if c.numeric_bounds().is_some()
             && !cond_sc.has_coerced_non_strict
             && !val_sc.has_coerced_non_strict
-            && (!cond_sc.has_empty
-                || c.matches(&FValue::Empty) == c.matches_coerced(&FValue::Empty))
         {
             let ckey = CriteriaKey {
                 function: 0,
@@ -5427,14 +5609,22 @@ impl<'a> Calc<'a> {
                                         }
                                         if build_text_index && !text_overflow {
                                             match val {
-                                                crate::Value::Number(_) | crate::Value::Error(_) => {}
+                                                crate::Value::Number(_) => {}
+                                                crate::Value::Error(e) => {
+                                                    let row_off = (page_base + ro as u32 - r1) as usize;
+                                                    text_map
+                                                        .entry(e.text().to_ascii_lowercase())
+                                                        .or_default()
+                                                        .push(row_off);
+                                                    text_entries += 1;
+                                                }
                                                 crate::Value::Empty => empty_value_seen += 1,
                                                 crate::Value::Text(s) => {
                                                     let row_off = (page_base + ro as u32 - r1) as usize;
                                                     let key_s = if s.is_ascii() {
                                                         s.to_ascii_lowercase()
                                                     } else {
-                                                        s.to_string()
+                                                        s.to_lowercase()
                                                     };
                                                     text_map.entry(key_s).or_default().push(row_off);
                                                     text_entries += 1;
@@ -5472,14 +5662,22 @@ impl<'a> Calc<'a> {
                                             }
                                             if build_text_index && !text_overflow {
                                                 match &cell.value {
-                                                    crate::Value::Number(_) | crate::Value::Error(_) => {}
+                                                    crate::Value::Number(_) => {}
+                                                    crate::Value::Error(e) => {
+                                                        let row_off = (page_base + ro as u32 - r1) as usize;
+                                                        text_map
+                                                            .entry(e.text().to_ascii_lowercase())
+                                                            .or_default()
+                                                            .push(row_off);
+                                                        text_entries += 1;
+                                                    }
                                                     crate::Value::Empty => empty_value_seen += 1,
                                                     crate::Value::Text(s) => {
                                                         let row_off = (page_base + ro as u32 - r1) as usize;
                                                         let key_s = if s.is_ascii() {
                                                             s.to_ascii_lowercase()
                                                         } else {
-                                                            s.to_string()
+                                                            s.to_lowercase()
                                                         };
                                                         text_map.entry(key_s).or_default().push(row_off);
                                                         text_entries += 1;
@@ -5625,14 +5823,22 @@ impl<'a> Calc<'a> {
                         }
                         if build_text_index && !text_overflow {
                             match val {
-                                crate::Value::Number(_) | crate::Value::Error(_) => {}
+                                crate::Value::Number(_) => {}
+                                crate::Value::Error(e) => {
+                                    let row_off = (page_base + ro as u32 - r1) as usize;
+                                    text_map
+                                        .entry(e.text().to_ascii_lowercase())
+                                        .or_default()
+                                        .push(row_off);
+                                    text_entries += 1;
+                                }
                                 crate::Value::Empty => empty_value_seen += 1,
                                 crate::Value::Text(s) => {
                                     let row_off = (page_base + ro as u32 - r1) as usize;
                                     let key_s = if s.is_ascii() {
                                         s.to_ascii_lowercase()
                                     } else {
-                                        s.to_string()
+                                        s.to_lowercase()
                                     };
                                     text_map.entry(key_s).or_default().push(row_off);
                                     text_entries += 1;
@@ -5668,14 +5874,22 @@ impl<'a> Calc<'a> {
                             }
                             if build_text_index && !text_overflow {
                                 match &cell.value {
-                                    crate::Value::Number(_) | crate::Value::Error(_) => {}
+                                    crate::Value::Number(_) => {}
+                                    crate::Value::Error(e) => {
+                                        let row_off = (page_base + ro as u32 - r1) as usize;
+                                        text_map
+                                            .entry(e.text().to_ascii_lowercase())
+                                            .or_default()
+                                            .push(row_off);
+                                        text_entries += 1;
+                                    }
                                     crate::Value::Empty => empty_value_seen += 1,
                                     crate::Value::Text(s) => {
                                         let row_off = (page_base + ro as u32 - r1) as usize;
                                         let key_s = if s.is_ascii() {
                                             s.to_ascii_lowercase()
                                         } else {
-                                            s.to_string()
+                                            s.to_lowercase()
                                         };
                                         text_map.entry(key_s).or_default().push(row_off);
                                         text_entries += 1;
@@ -5712,14 +5926,22 @@ impl<'a> Calc<'a> {
                             }
                             if build_text_index && !text_overflow {
                                 match fv {
-                                    FValue::Number(_) | FValue::Error(_) | FValue::Array(_) | FValue::Lambda(_) => {}
+                                    FValue::Number(_) | FValue::Array(_) | FValue::Lambda(_) => {}
+                                    FValue::Error(e) => {
+                                        let row_off = (abs_row - r1) as usize;
+                                        text_map
+                                            .entry(e.text().to_ascii_lowercase())
+                                            .or_default()
+                                            .push(row_off);
+                                        text_entries += 1;
+                                    }
                                     FValue::Empty => empty_value_seen += 1,
                                     FValue::Text(s) => {
                                         let row_off = (abs_row - r1) as usize;
                                         let key_s = if s.is_ascii() {
                                             s.to_ascii_lowercase()
                                         } else {
-                                            s.to_string()
+                                            s.to_lowercase()
                                         };
                                         text_map.entry(key_s).or_default().push(row_off);
                                         text_entries += 1;
@@ -5850,7 +6072,7 @@ impl<'a> Calc<'a> {
                     let mut min_cap_off: Option<i64> = None;
                     for (crk, ctext) in cond_slice.iter().zip(key.criteria.iter()) {
                         let parsed_c = functions::Crit::parse(ctext);
-                        if !parsed_c.matches_coerced(&FValue::Empty) {
+                        if !parsed_c.matches(&FValue::Empty) {
                             let cm = self.col_max_row(crk.0, crk.2 as u32);
                             let cap_off = aligned_col_end_row(crk.1, cm, crk.3) - crk.1;
                             min_cap_off = Some(match min_cap_off {
@@ -6828,6 +7050,120 @@ impl conditional_index::CriteriaDataSource for Calc<'_> {
             Some(v)
         }
     }
+}
+
+#[inline]
+fn broadcast_dims(a: (usize, usize), b: (usize, usize)) -> Option<(usize, usize)> {
+    let rows = if a.0 == b.0 {
+        a.0
+    } else if a.0 == 1 {
+        b.0
+    } else if b.0 == 1 {
+        a.0
+    } else {
+        return None;
+    };
+    let cols = if a.1 == b.1 {
+        a.1
+    } else if a.1 == 1 {
+        b.1
+    } else if b.1 == 1 {
+        a.1
+    } else {
+        return None;
+    };
+    Some((rows, cols))
+}
+
+#[inline]
+const fn supports_scalar_array_lift(id: FuncId) -> bool {
+    matches!(
+        id,
+        FuncId::Abs
+            | FuncId::Sign
+            | FuncId::Int
+            | FuncId::Trunc
+            | FuncId::Round
+            | FuncId::RoundUp
+            | FuncId::RoundDown
+            | FuncId::Mod
+            | FuncId::Quotient
+            | FuncId::Power
+            | FuncId::Sqrt
+            | FuncId::SqrtPi
+            | FuncId::Exp
+            | FuncId::Ln
+            | FuncId::Log10
+            | FuncId::Log
+            | FuncId::Sin
+            | FuncId::Cos
+            | FuncId::Tan
+            | FuncId::Asin
+            | FuncId::Acos
+            | FuncId::Atan
+            | FuncId::Atan2
+            | FuncId::Sinh
+            | FuncId::Cosh
+            | FuncId::Tanh
+            | FuncId::Degrees
+            | FuncId::Radians
+            | FuncId::Fact
+            | FuncId::Combin
+            | FuncId::Ceiling
+            | FuncId::CeilingMath
+            | FuncId::Floor
+            | FuncId::FloorMath
+            | FuncId::MRound
+            | FuncId::Even
+            | FuncId::Odd
+            | FuncId::Len
+            | FuncId::Left
+            | FuncId::Right
+            | FuncId::Mid
+            | FuncId::Lower
+            | FuncId::Upper
+            | FuncId::Proper
+            | FuncId::Trim
+            | FuncId::Rept
+            | FuncId::Substitute
+            | FuncId::Replace
+            | FuncId::Find
+            | FuncId::Search
+            | FuncId::Exact
+            | FuncId::Char
+            | FuncId::Code
+            | FuncId::Value
+            | FuncId::Text
+            | FuncId::T
+            | FuncId::Date
+            | FuncId::Time
+            | FuncId::Year
+            | FuncId::Month
+            | FuncId::Day
+            | FuncId::Hour
+            | FuncId::Minute
+            | FuncId::Second
+            | FuncId::Weekday
+            | FuncId::EDate
+            | FuncId::EOMonth
+            | FuncId::Days
+            | FuncId::DateDif
+            | FuncId::WeekNum
+            | FuncId::YearFrac
+            | FuncId::Not
+            | FuncId::IsBlank
+            | FuncId::IsNumber
+            | FuncId::IsText
+            | FuncId::IsNonText
+            | FuncId::IsLogical
+            | FuncId::IsEven
+            | FuncId::IsOdd
+            | FuncId::IsError
+            | FuncId::IsErr
+            | FuncId::IsNa
+            | FuncId::N
+            | FuncId::ErrorType
+    )
 }
 
 #[inline]

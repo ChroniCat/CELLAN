@@ -67,6 +67,9 @@ pub fn parse_cell_input(raw: &str, existing_format: &str, sys: DateSystem) -> Pa
 
     // 2) 纯数字（排除 inf / nan 等 Rust f64 特殊字面量）
     if let Some(n) = parse_strict_plain_f64(t) {
+        if is_percent_format(existing_format) {
+            return ParsedInput::plain(Value::Number(n / 100.0));
+        }
         return ParsedInput::plain(Value::Number(n));
     }
 

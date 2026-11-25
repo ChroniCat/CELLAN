@@ -90,6 +90,13 @@ pub fn paint_chart(painter: &egui::Painter, rect: Rect, chart: &Chart) {
     }
 }
 
+#[inline]
+fn series_color(s: Option<&sheetcore::charts::Series>, idx: usize) -> Color32 {
+    s.and_then(|x| x.color)
+        .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+        .unwrap_or(PALETTE[idx % PALETTE.len()])
+}
+
 fn paint_chart_into(painter: &mut ChartCanvas<'_>, rect: Rect, chart: &Chart) {
     if rect.width() < 40.0 || rect.height() < 30.0 {
         return;
@@ -121,7 +128,7 @@ fn paint_chart_into(painter: &mut ChartCanvas<'_>, rect: Rect, chart: &Chart) {
         let mut x = inner.min.x + 6.0;
         let y = inner.max.y - 12.0;
         for i in 0..series_count {
-            let c = PALETTE[i % PALETTE.len()];
+            let c = series_color(chart.series.get(i), i);
             painter.rect_filled(
                 Rect::from_min_size(Pos2::new(x, y - 3.0), Vec2::new(10.0, 10.0)),
                 1.0,
@@ -160,7 +167,58 @@ fn paint_chart_into(painter: &mut ChartCanvas<'_>, rect: Rect, chart: &Chart) {
         ChartKind::Combo => paint_combo(painter, plot, chart),
         ChartKind::Line => paint_line(painter, plot, chart),
         ChartKind::Area => paint_area(painter, plot, chart),
+        ChartKind::Scatter => paint_scatter(painter, plot, chart),
+        ChartKind::Radar => paint_radar(painter, plot, chart),
         _ => paint_bars(painter, plot, chart),
+    }
+}
+
+fn axis_horizontal(painter: &mut ChartCanvas<'_>, plot: Rect, labels: &[String], max: f64, min: f64) {
+    let line = Color32::from_rgb(180, 180, 180);
+    let text = Color32::from_rgb(110, 110, 110);
+    painter.line_segment(
+        [Pos2::new(plot.min.x, plot.max.y), Pos2::new(plot.max.x, plot.max.y)],
+        Stroke::new(1.0, line),
+    );
+    painter.line_segment(
+        [Pos2::new(plot.min.x, plot.min.y), Pos2::new(plot.min.x, plot.max.y)],
+        Stroke::new(1.0, line),
+    );
+    // 横轴数值刻度
+    let steps = 4;
+    for i in 0..=steps {
+        let t = i as f64 / steps as f64;
+        let x = plot.min.x + (plot.width() as f64 * t) as f32;
+        let v = min + (max - min) * t;
+        painter.line_segment(
+            [Pos2::new(x, plot.max.y), Pos2::new(x, plot.max.y + 3.0)],
+            Stroke::new(1.0, line),
+        );
+        painter.text(
+            Pos2::new(x, plot.max.y + 4.0),
+            Align2::CENTER_TOP,
+            format_num(v),
+            FontId::proportional(9.0),
+            text,
+        );
+    }
+    // 纵轴分类标签
+    if !labels.is_empty() {
+        let n = labels.len();
+        let step = (plot.height() / n as f32).max(1.0);
+        for (i, l) in labels.iter().enumerate() {
+            if n > 12 && i % (n / 12).max(1) != 0 {
+                continue;
+            }
+            let y = plot.min.y + step * (i as f32 + 0.5);
+            painter.text(
+                Pos2::new(plot.min.x - 4.0, y),
+                Align2::RIGHT_CENTER,
+                l,
+                FontId::proportional(9.0),
+                text,
+            );
+        }
     }
 }
 
@@ -351,7 +409,7 @@ fn paint_combo(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
         .fold(0.0f64, f64::max)
         .max(1e-9);
     let n = line.vals.len().max(1);
-    let color = PALETTE[split % PALETTE.len()];
+    let color = series_color(Some(line), split);
     let pts = decimate_line_points(&line.vals, n, 0.0, max, plot);
     for w in pts.windows(2) {
         painter.line_segment([w[0], w[1]], Stroke::new(2.0, color));
@@ -388,6 +446,35 @@ fn paint_bars(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     paint_bars_slice(painter, plot, &chart.series, chart.kind, chart.show_labels);
 }
 
+fn bounds_stacked(series: &[sheetcore::charts::Series]) -> (f64, f64) {
+    let n = series.iter().map(|s| s.vals.len()).max().unwrap_or(0);
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let mut lo = 0.0f64;
+    let mut hi = 0.0f64;
+    for i in 0..n {
+        let mut pos = 0.0f64;
+        let mut neg = 0.0f64;
+        for s in series {
+            if let Some(&v) = s.vals.get(i) && v.is_finite() {
+                if v >= 0.0 {
+                    pos += v;
+                } else {
+                    neg += v;
+                }
+            }
+        }
+        hi = hi.max(pos);
+        lo = lo.min(neg);
+    }
+    if (hi - lo).abs() < 1e-12 {
+        (lo, lo + 1.0)
+    } else {
+        (lo, hi)
+    }
+}
+
 fn paint_bars_slice(
     painter: &mut ChartCanvas<'_>,
     plot: Rect,
@@ -395,23 +482,44 @@ fn paint_bars_slice(
     kind: ChartKind,
     show_labels: bool,
 ) {
-    let (lo, hi) = bounds_slice(series);
+    let stacked = kind == ChartKind::BarStacked;
+    let horizontal = matches!(kind, ChartKind::Bar | ChartKind::BarStacked);
+    let (lo, hi) = if stacked {
+        bounds_stacked(series)
+    } else {
+        bounds_slice(series)
+    };
+    let span = (hi - lo).max(1e-12);
     let cats: &[String] = series.first().map(|s| s.cats.as_slice()).unwrap_or(&[]);
-    axis(painter, plot, cats, hi, lo);
+    if horizontal {
+        axis_horizontal(painter, plot, cats, hi, lo);
+    } else {
+        axis(painter, plot, cats, hi, lo);
+    }
+    let zero_t = ((0.0 - lo) / span).clamp(0.0, 1.0) as f32;
+    let zero_x = plot.min.x + plot.width() * zero_t;
+    let zero_y = plot.max.y - plot.height() * zero_t;
+    if lo < 0.0 && hi > 0.0 {
+        let zstroke = Stroke::new(1.0, Color32::from_rgb(130, 130, 130));
+        if horizontal {
+            painter.line_segment([Pos2::new(zero_x, plot.min.y), Pos2::new(zero_x, plot.max.y)], zstroke);
+        } else {
+            painter.line_segment([Pos2::new(plot.min.x, zero_y), Pos2::new(plot.max.x, zero_y)], zstroke);
+        }
+    }
 
     let n = cats
         .len()
         .max(series.iter().map(|s| s.vals.len()).max().unwrap_or(0))
         .max(1);
     let groups = series.len().max(1);
-    let horizontal = matches!(kind, ChartKind::Bar | ChartKind::BarStacked);
     let axis_px = if horizontal { plot.height() } else { plot.width() };
     let max_buckets = (axis_px.ceil() as usize).clamp(64, 2048);
 
     if n > max_buckets * 2 {
         let mut mesh = egui::Mesh::default();
         for (si, s) in series.iter().enumerate() {
-            let color = PALETTE[si % PALETTE.len()];
+            let color = series_color(Some(s), si);
             let len = s.vals.len();
             if len == 0 {
                 continue;
@@ -422,32 +530,38 @@ fn paint_bars_slice(
                 if start >= end {
                     continue;
                 }
-                let mut peak = f64::NEG_INFINITY;
+                let mut peak = 0.0f64;
+                let mut found = false;
                 for &v in &s.vals[start..end] {
-                    if v.is_finite() {
-                        peak = peak.max(v);
+                    if v.is_finite() && (!found || v.abs() > peak.abs()) {
+                        peak = v;
+                        found = true;
                     }
                 }
-                if !peak.is_finite() {
+                if !found {
                     continue;
                 }
-                let t = ((peak - lo) / (hi - lo)).clamp(0.0, 1.0) as f32;
+                let t = ((peak - lo) / span).clamp(0.0, 1.0) as f32;
                 if horizontal {
                     let slot = plot.height() / max_buckets as f32;
                     let h = (slot / groups as f32).max(1.0);
                     let y = plot.min.y + slot * b as f32 + h * si as f32;
-                    let w = (plot.width() * t).max(1.0);
+                    let vx = plot.min.x + plot.width() * t;
+                    let x0 = zero_x.min(vx);
+                    let w = (vx - zero_x).abs().max(1.0);
                     mesh.add_colored_rect(
-                        Rect::from_min_size(Pos2::new(plot.min.x, y), Vec2::new(w, h)),
+                        Rect::from_min_size(Pos2::new(x0, y), Vec2::new(w, h)),
                         color,
                     );
                 } else {
                     let slot = plot.width() / max_buckets as f32;
                     let bar_w = (slot / groups as f32).max(1.0);
                     let x = plot.min.x + slot * b as f32 + bar_w * si as f32;
-                    let h = (plot.height() * t).max(1.0);
+                    let vy = plot.max.y - plot.height() * t;
+                    let y0 = zero_y.min(vy);
+                    let h = (vy - zero_y).abs().max(1.0);
                     mesh.add_colored_rect(
-                        Rect::from_min_size(Pos2::new(x, plot.max.y - h), Vec2::new(bar_w, h)),
+                        Rect::from_min_size(Pos2::new(x, y0), Vec2::new(bar_w, h)),
                         color,
                     );
                 }
@@ -459,38 +573,97 @@ fn paint_bars_slice(
         return;
     }
 
-    let slot = plot.width() / n as f32;
-    let bar_w = (slot * 0.8 / groups as f32).max(1.0);
     let mut mesh = egui::Mesh::default();
-    for (si, s) in series.iter().enumerate() {
-        let color = PALETTE[si % PALETTE.len()];
-        for (i, v) in s.vals.iter().enumerate() {
-            let t = ((v - lo) / (hi - lo)).clamp(0.0, 1.0) as f32;
-            if horizontal {
-                let h = plot.height() / n as f32 * 0.8 / groups as f32;
-                let y = plot.min.y
-                    + plot.height() / n as f32 * i as f32
-                    + (plot.height() / n as f32 - h) / 2.0;
-                let w = plot.width() * t;
+    if stacked {
+        let mut pos_acc = vec![0.0f64; n];
+        let mut neg_acc = vec![0.0f64; n];
+        let row_slot = plot.height() / n as f32;
+        let bar_h = (row_slot * 0.72).max(1.5);
+        for (si, s) in series.iter().enumerate() {
+            let color = series_color(Some(s), si);
+            for (i, &v) in s.vals.iter().enumerate() {
+                if !v.is_finite() || i >= n {
+                    continue;
+                }
+                let (v0, v1) = if v >= 0.0 {
+                    let start = pos_acc[i];
+                    pos_acc[i] += v;
+                    (start, pos_acc[i])
+                } else {
+                    let start = neg_acc[i];
+                    neg_acc[i] += v;
+                    (neg_acc[i], start)
+                };
+                let t0 = ((v0 - lo) / span).clamp(0.0, 1.0) as f32;
+                let t1 = ((v1 - lo) / span).clamp(0.0, 1.0) as f32;
+                let x0 = plot.min.x + plot.width() * t0;
+                let x1 = plot.min.x + plot.width() * t1;
+                let y = plot.min.y + row_slot * i as f32 + (row_slot - bar_h) * 0.5;
                 mesh.add_colored_rect(
-                    Rect::from_min_size(
-                        Pos2::new(plot.min.x, y + h * si as f32),
-                        Vec2::new(w.max(1.0), h.max(1.0)),
-                    ),
+                    Rect::from_min_size(Pos2::new(x0, y), Vec2::new((x1 - x0).max(1.0), bar_h)),
                     color,
                 );
+            }
+        }
+        if !mesh.is_empty() {
+            painter.add(egui::Shape::mesh(mesh));
+        }
+        return;
+    }
+
+    let slot = plot.width() / n as f32;
+    let bar_w = (slot * 0.8 / groups as f32).max(1.0);
+    let row_slot = plot.height() / n as f32;
+    let hbar_h = (row_slot * 0.8 / groups as f32).max(1.0);
+    for (si, s) in series.iter().enumerate() {
+        let color = series_color(Some(s), si);
+        for (i, &v) in s.vals.iter().enumerate() {
+            if !v.is_finite() {
+                continue;
+            }
+            let t = ((v - lo) / span).clamp(0.0, 1.0) as f32;
+            if horizontal {
+                let y = plot.min.y + row_slot * i as f32 + row_slot * 0.1 + hbar_h * si as f32;
+                let vx = plot.min.x + plot.width() * t;
+                let x0 = zero_x.min(vx);
+                let w = (vx - zero_x).abs().max(1.0);
+                mesh.add_colored_rect(
+                    Rect::from_min_size(Pos2::new(x0, y), Vec2::new(w, hbar_h)),
+                    color,
+                );
+                if show_labels && hbar_h > 10.0 {
+                    let (lx, align) = if v >= 0.0 {
+                        (x0 + w + 2.0, Align2::LEFT_CENTER)
+                    } else {
+                        (x0 - 2.0, Align2::RIGHT_CENTER)
+                    };
+                    painter.text(
+                        Pos2::new(lx, y + hbar_h * 0.5),
+                        align,
+                        format_num(v),
+                        FontId::proportional(9.0),
+                        Color32::from_rgb(60, 60, 60),
+                    );
+                }
             } else {
                 let x = plot.min.x + slot * i as f32 + slot * 0.1 + bar_w * si as f32;
-                let h = plot.height() * t;
+                let vy = plot.max.y - plot.height() * t;
+                let y0 = zero_y.min(vy);
+                let h = (vy - zero_y).abs().max(1.0);
                 mesh.add_colored_rect(
-                    Rect::from_min_size(Pos2::new(x, plot.max.y - h), Vec2::new(bar_w, h.max(1.0))),
+                    Rect::from_min_size(Pos2::new(x, y0), Vec2::new(bar_w, h)),
                     color,
                 );
                 if show_labels && bar_w > 14.0 {
+                    let (ly, align) = if v >= 0.0 {
+                        (y0 - 2.0, Align2::CENTER_BOTTOM)
+                    } else {
+                        (y0 + h + 2.0, Align2::CENTER_TOP)
+                    };
                     painter.text(
-                        Pos2::new(x + bar_w / 2.0, plot.max.y - h - 2.0),
-                        Align2::CENTER_BOTTOM,
-                        format_num(*v),
+                        Pos2::new(x + bar_w / 2.0, ly),
+                        align,
+                        format_num(v),
                         FontId::proportional(9.0),
                         Color32::from_rgb(60, 60, 60),
                     );
@@ -500,6 +673,152 @@ fn paint_bars_slice(
     }
     if !mesh.is_empty() {
         painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+fn paint_scatter(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
+    let mut xmin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
+    let mut ymin = f64::INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+    for s in &chart.series {
+        let has_x = s.xv.len() == s.vals.len() && !s.xv.is_empty();
+        for (i, &y) in s.vals.iter().enumerate() {
+            if !y.is_finite() {
+                continue;
+            }
+            let x = if has_x { s.xv[i] } else { (i + 1) as f64 };
+            if !x.is_finite() {
+                continue;
+            }
+            xmin = xmin.min(x);
+            xmax = xmax.max(x);
+            ymin = ymin.min(y);
+            ymax = ymax.max(y);
+        }
+    }
+    if !xmin.is_finite() || !ymin.is_finite() {
+        return;
+    }
+    let xlo = xmin.min(0.0);
+    let xhi = if (xmax - xlo).abs() < 1e-12 { xlo + 1.0 } else { xmax };
+    let ylo = ymin.min(0.0);
+    let yhi = if (ymax - ylo).abs() < 1e-12 { ylo + 1.0 } else { ymax };
+    let xlabels: Vec<String> = (0..=4)
+        .map(|i| format_num(xlo + (xhi - xlo) * (i as f64 / 4.0)))
+        .collect();
+    axis(painter, plot, &xlabels, yhi, ylo);
+    let xspan = (xhi - xlo).max(1e-12);
+    let yspan = (yhi - ylo).max(1e-12);
+    for (si, s) in chart.series.iter().enumerate() {
+        let color = series_color(Some(s), si);
+        let has_x = s.xv.len() == s.vals.len() && !s.xv.is_empty();
+        for (i, &y) in s.vals.iter().enumerate() {
+            if !y.is_finite() {
+                continue;
+            }
+            let x = if has_x { s.xv[i] } else { (i + 1) as f64 };
+            if !x.is_finite() {
+                continue;
+            }
+            let px = plot.min.x + plot.width() * (((x - xlo) / xspan).clamp(0.0, 1.0) as f32);
+            let py = plot.max.y - plot.height() * (((y - ylo) / yspan).clamp(0.0, 1.0) as f32);
+            painter.circle_filled(Pos2::new(px, py), 3.0, color);
+        }
+    }
+}
+
+fn paint_radar(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
+    let n = chart
+        .series
+        .iter()
+        .map(|s| s.vals.len().max(s.cats.len()))
+        .max()
+        .unwrap_or(0);
+    if n < 3 {
+        return;
+    }
+    let max_v = chart
+        .series
+        .iter()
+        .flat_map(|s| s.vals.iter().copied())
+        .filter(|v| v.is_finite())
+        .fold(0.0f64, f64::max)
+        .max(1e-9);
+    let center = plot.center();
+    let radius = plot.width().min(plot.height()) * 0.38;
+    let web = Stroke::new(0.8, Color32::from_rgb(205, 205, 205));
+    // 同心网格与射线
+    for ring in 1..=4 {
+        let r = radius * ring as f32 / 4.0;
+        let mut pts = Vec::with_capacity(n + 1);
+        for k in 0..=n {
+            let a = -std::f32::consts::FRAC_PI_2
+                + std::f32::consts::TAU * (k % n) as f32 / n as f32;
+            pts.push(Pos2::new(center.x + r * a.cos(), center.y + r * a.sin()));
+        }
+        painter.add(egui::Shape::line(pts, web));
+    }
+    let cats: &[String] = chart.series.first().map(|s| s.cats.as_slice()).unwrap_or(&[]);
+    for k in 0..n {
+        let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * k as f32 / n as f32;
+        let tip = Pos2::new(center.x + radius * a.cos(), center.y + radius * a.sin());
+        painter.line_segment([center, tip], web);
+        if let Some(lbl) = cats.get(k) && !lbl.is_empty() {
+            let lp = Pos2::new(
+                center.x + (radius + 10.0) * a.cos(),
+                center.y + (radius + 10.0) * a.sin(),
+            );
+            painter.text(
+                lp,
+                Align2::CENTER_CENTER,
+                lbl,
+                FontId::proportional(9.0),
+                Color32::from_rgb(90, 90, 90),
+            );
+        }
+    }
+    for (si, s) in chart.series.iter().enumerate() {
+        let color = series_color(Some(s), si);
+        let mut pts = Vec::with_capacity(n);
+        for k in 0..n {
+            let v = s.vals.get(k).copied().unwrap_or(0.0);
+            let frac = if v.is_finite() {
+                (v / max_v).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * k as f32 / n as f32;
+            pts.push(Pos2::new(
+                center.x + radius * frac * a.cos(),
+                center.y + radius * frac * a.sin(),
+            ));
+        }
+        if chart.radar_style == "filled" && pts.len() >= 3 {
+            let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 80);
+            let mut mesh = egui::Mesh::default();
+            let uv = egui::epaint::WHITE_UV;
+            mesh.vertices.push(egui::epaint::Vertex { pos: center, uv, color: fill });
+            for &p in &pts {
+                mesh.vertices.push(egui::epaint::Vertex { pos: p, uv, color: fill });
+            }
+            for k in 0..pts.len() {
+                let a = (k + 1) as u32;
+                let b = ((k + 1) % pts.len() + 1) as u32;
+                mesh.indices.extend_from_slice(&[0, a, b]);
+            }
+            painter.add(egui::Shape::mesh(mesh));
+        }
+        if pts.len() >= 2 {
+            let mut closed = pts.clone();
+            closed.push(pts[0]);
+            painter.add(egui::Shape::line(closed, Stroke::new(1.8, color)));
+        }
+        if chart.radar_style != "filled" {
+            for &p in &pts {
+                painter.circle_filled(p, 2.5, color);
+            }
+        }
     }
 }
 
@@ -513,7 +832,7 @@ fn paint_line(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     axis(painter, plot, cats, hi, lo);
     let n = cats.len().max(1);
     for (si, s) in chart.series.iter().enumerate() {
-        let color = PALETTE[si % PALETTE.len()];
+        let color = series_color(Some(s), si);
         let pts = decimate_line_points(&s.vals, n, lo, hi, plot);
         let draw_dots = plot.width() / (s.vals.len().max(1) as f32) >= 3.5;
         let draw_labels = chart.show_labels && s.vals.len() <= 12;
@@ -554,8 +873,9 @@ fn paint_area(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
         .unwrap_or(&[]);
     axis(painter, plot, cats, hi, lo);
     let n = chart.series.first().map(|s| s.vals.len()).unwrap_or(0).max(1);
+    let zero_y = plot.max.y - plot.height() * (((0.0 - lo) / (hi - lo).max(1e-12)).clamp(0.0, 1.0) as f32);
     for (si, s) in chart.series.iter().enumerate() {
-        let color = PALETTE[si % PALETTE.len()];
+        let color = series_color(Some(s), si);
         let pts = decimate_line_points(&s.vals, n, lo, hi, plot);
         if pts.len() >= 2 {
             let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 110);
@@ -566,8 +886,8 @@ fn paint_area(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
                 mesh.vertices.extend_from_slice(&[
                     egui::epaint::Vertex { pos: w[0], uv, color: fill },
                     egui::epaint::Vertex { pos: w[1], uv, color: fill },
-                    egui::epaint::Vertex { pos: Pos2::new(w[1].x, plot.max.y), uv, color: fill },
-                    egui::epaint::Vertex { pos: Pos2::new(w[0].x, plot.max.y), uv, color: fill },
+                    egui::epaint::Vertex { pos: Pos2::new(w[1].x, zero_y), uv, color: fill },
+                    egui::epaint::Vertex { pos: Pos2::new(w[0].x, zero_y), uv, color: fill },
                 ]);
                 mesh.indices.extend_from_slice(&[
                     base,
@@ -586,6 +906,55 @@ fn paint_area(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     }
 }
 
+fn add_annular_slice(
+    mesh: &mut egui::Mesh,
+    center: Pos2,
+    inner_r: f32,
+    outer_r: f32,
+    start: f32,
+    sweep: f32,
+    color: Color32,
+) {
+    let segments = ((sweep / 0.1).ceil() as usize).max(3);
+    let uv = egui::epaint::WHITE_UV;
+    if inner_r <= 0.0 {
+        let c_idx = mesh.vertices.len() as u32;
+        mesh.vertices.push(egui::epaint::Vertex { pos: center, uv, color });
+        let first = mesh.vertices.len() as u32;
+        for k in 0..=segments {
+            let a = start + sweep * k as f32 / segments as f32;
+            let pos = Pos2::new(center.x + outer_r * a.cos(), center.y + outer_r * a.sin());
+            mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
+        }
+        for k in 0..segments as u32 {
+            mesh.indices.extend_from_slice(&[c_idx, first + k, first + k + 1]);
+        }
+    } else {
+        let base = mesh.vertices.len() as u32;
+        for k in 0..=segments {
+            let a = start + sweep * k as f32 / segments as f32;
+            let (ca, sa) = (a.cos(), a.sin());
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: Pos2::new(center.x + outer_r * ca, center.y + outer_r * sa),
+                uv,
+                color,
+            });
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: Pos2::new(center.x + inner_r * ca, center.y + inner_r * sa),
+                uv,
+                color,
+            });
+        }
+        for k in 0..segments as u32 {
+            let o0 = base + k * 2;
+            let i0 = o0 + 1;
+            let o1 = o0 + 2;
+            let i1 = o0 + 3;
+            mesh.indices.extend_from_slice(&[o0, o1, i1, o0, i1, i0]);
+        }
+    }
+}
+
 fn paint_pie(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     let vals: &[f64] = chart
         .series
@@ -599,50 +968,53 @@ fn paint_pie(painter: &mut ChartCanvas<'_>, plot: Rect, chart: &Chart) {
     let radius = plot.width().min(plot.height()) * 0.42;
     let center = plot.center();
     let mut start = -std::f32::consts::FRAC_PI_2;
-    let doughnut = chart.kind == ChartKind::Doughnut;
+    let inner = if chart.kind == ChartKind::Doughnut {
+        radius * 0.55
+    } else {
+        0.0
+    };
+    let mut mesh = egui::Mesh::default();
+    let mut dividers: Vec<f32> = Vec::new();
     let mut remainder_sweep = 0.0f32;
+    let mut positive_count = 0usize;
     for (i, v) in vals.iter().enumerate() {
         if !v.is_finite() || *v <= 0.0 {
             continue;
         }
+        positive_count += 1;
         let sweep = (*v / total) as f32 * std::f32::consts::TAU;
         if sweep < 0.004 && vals.len() > 360 {
             remainder_sweep += sweep;
             continue;
         }
         let color = PALETTE[i % PALETTE.len()];
-        let segments = ((sweep / 0.12).ceil() as usize).max(3);
-        let mut pts = Vec::with_capacity((segments + 1) * 2);
-        let inner = if doughnut { radius * 0.55 } else { 0.0 };
-        for k in 0..=segments {
-            let a = start + sweep * k as f32 / segments as f32;
-            pts.push(Pos2::new(center.x + radius * a.cos(), center.y + radius * a.sin()));
-        }
-        for k in (0..=segments).rev() {
-            let a = start + sweep * k as f32 / segments as f32;
-            let r = if inner > 0.0 { inner } else { 0.0 };
-            pts.push(Pos2::new(center.x + r * a.cos(), center.y + r * a.sin()));
-        }
-        painter.add(egui::Shape::convex_polygon(pts, color, Stroke::new(1.0, Color32::WHITE)));
+        add_annular_slice(&mut mesh, center, inner, radius, start, sweep, color);
+        dividers.push(start);
         start += sweep;
     }
     if remainder_sweep > 0.001 {
-        let segments = ((remainder_sweep / 0.12).ceil() as usize).max(3);
-        let mut pts = Vec::with_capacity((segments + 1) * 2);
-        let inner = if doughnut { radius * 0.55 } else { 0.0 };
-        for k in 0..=segments {
-            let a = start + remainder_sweep * k as f32 / segments as f32;
-            pts.push(Pos2::new(center.x + radius * a.cos(), center.y + radius * a.sin()));
-        }
-        for k in (0..=segments).rev() {
-            let a = start + remainder_sweep * k as f32 / segments as f32;
-            pts.push(Pos2::new(center.x + inner * a.cos(), center.y + inner * a.sin()));
-        }
-        painter.add(egui::Shape::convex_polygon(
-            pts,
+        add_annular_slice(
+            &mut mesh,
+            center,
+            inner,
+            radius,
+            start,
+            remainder_sweep,
             Color32::from_rgb(180, 180, 180),
-            Stroke::new(1.0, Color32::WHITE),
-        ));
+        );
+        dividers.push(start);
+    }
+    if !mesh.is_empty() {
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    if positive_count > 1 {
+        let sep = Stroke::new(1.0, Color32::WHITE);
+        for a in dividers {
+            let (ca, sa) = (a.cos(), a.sin());
+            let p0 = Pos2::new(center.x + inner * ca, center.y + inner * sa);
+            let p1 = Pos2::new(center.x + radius * ca, center.y + radius * sa);
+            painter.line_segment([p0, p1], sep);
+        }
     }
 }
 

@@ -585,9 +585,51 @@ fn anchor_len(xml: &str) -> Option<usize> {
     Some(from)
 }
 
-/// 命中形状的「原地改」：只换文字，并按模型调整 rPr（字号/粗体/斜体/颜色）。
-/// 返回 None 表示结构不认识，让调用方退回整块重写。
+/// 替换锚点中的 `<xdr:from>...</xdr:from>` 或 `<xdr:to>...</xdr:to>` 坐标，保留前缀与其它元素。
+fn replace_anchor_point(block: &str, which: &str, pt: (u32, i64, u32, i64)) -> Option<String> {
+    for prefix in ["xdr:", ""] {
+        let open = format!("<{prefix}{which}>");
+        let close = format!("</{prefix}{which}>");
+        if let Some(i) = block.find(&open) {
+            let rest = &block[i..];
+            let end_rel = rest.find(&close)?;
+            let end = i + end_rel + close.len();
+            let rep = format!(
+                "<{prefix}{which}><{prefix}col>{}</{prefix}col><{prefix}colOff>{}</{prefix}colOff><{prefix}row>{}</{prefix}row><{prefix}rowOff>{}</{prefix}rowOff></{prefix}{which}>",
+                pt.0, pt.1, pt.2, pt.3
+            );
+            let mut out = String::with_capacity(block.len() + rep.len());
+            out.push_str(&block[..i]);
+            out.push_str(&rep);
+            out.push_str(&block[end..]);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// 命中形状的「原地改」：同步锚点位置、文字、rPr（字号/粗体/斜体/颜色）、对齐与换行；
+/// 若填充或边框样式相对原块发生变化且无法原地修补，则返回 None 退回整块重写以防修改静默丢失。
 fn edit_block(block: &str, tb: &TextBox) -> Option<String> {
+    let orig = parse_drawing(block).into_iter().next();
+    // 填充/边框被用户改动时，原地修补 spPr（若 spPr 缺失或结构异常则退回整块重写）
+    let mut work = block.to_string();
+    if anchor_points(&work).is_none_or(|(f, t)| f != tb.from || t != tb.to) {
+        work = replace_anchor_point(&work, "from", tb.from)?;
+        work = replace_anchor_point(&work, "to", tb.to)?;
+    }
+    if let Some(ref parsed) = orig {
+        if parsed.fill != tb.fill || parsed.line != tb.line {
+            work = patch_sp_pr_style(&work, tb)?;
+        }
+        if parsed.align != tb.align {
+            work = patch_ppr_align(&work, tb.align);
+        }
+        if parsed.wrap != tb.wrap {
+            work = patch_body_wrap(&work, tb.wrap);
+        }
+    }
+    let block = work.as_str();
     // 空形状（Excel 写 <a:p/>，没有 <a:t>）：把文字插进第一个段落，仍然保留整块
     if !block.contains("<a:t") {
         // <a:endParaRPr> 必须是 <a:p> 的最后一个子元素，文字要插在它前面
@@ -621,6 +663,91 @@ fn edit_block(block: &str, tb: &TextBox) -> Option<String> {
     }
     out.push_str(rest);
     Some(tune_runs(&out, tb))
+}
+
+fn patch_sp_pr_style(block: &str, tb: &TextBox) -> Option<String> {
+    let (open_pat, close_pat) = if block.contains("<xdr:spPr") {
+        ("<xdr:spPr", "</xdr:spPr>")
+    } else if block.contains("<spPr") {
+        ("<spPr", "</spPr>")
+    } else {
+        return None;
+    };
+    let s = block.find(open_pat)?;
+    let gt = s + block[s..].find('>')?;
+    let e = gt + block[gt..].find(close_pat)?;
+    let inner = &block[gt + 1..e];
+    // 去掉旧填充与旧边框，保留 xfrm / prstGeom / effectLst 等其它子元素
+    let mut cleaned = strip_block(inner, "a:ln");
+    cleaned = strip_block(&cleaned, "a:solidFill");
+    cleaned = strip_block(&cleaned, "a:noFill");
+    cleaned = strip_block(&cleaned, "a:gradFill");
+    cleaned = strip_block(&cleaned, "a:pattFill");
+    let fill_xml = match tb.fill {
+        Some(f) => format!(
+            "<a:solidFill><a:srgbClr val=\"{:02X}{:02X}{:02X}\"/></a:solidFill>",
+            f[0], f[1], f[2]
+        ),
+        None => "<a:noFill/>".to_string(),
+    };
+    let line_xml = match tb.line {
+        Some(l) => format!(
+            "<a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"{:02X}{:02X}{:02X}\"/></a:solidFill></a:ln>",
+            l[0], l[1], l[2]
+        ),
+        None => "<a:ln><a:noFill/></a:ln>".to_string(),
+    };
+    // OOXML CT_ShapeProperties 顺序：xfrm → prstGeom/custGeom → fill → ln → effectLst
+    let insert_at = cleaned
+        .find("<a:effectLst")
+        .or_else(|| cleaned.find("<a:scene3d"))
+        .or_else(|| cleaned.find("<a:sp3d"))
+        .or_else(|| cleaned.find("<a:extLst"))
+        .unwrap_or(cleaned.len());
+    cleaned.insert_str(insert_at, &format!("{fill_xml}{line_xml}"));
+    let mut out = String::with_capacity(block.len() + 64);
+    out.push_str(&block[..gt + 1]);
+    out.push_str(&cleaned);
+    out.push_str(&block[e..]);
+    Some(out)
+}
+
+fn patch_ppr_align(xml: &str, align: u8) -> String {
+    let algn = match align {
+        1 => "ctr",
+        2 => "r",
+        _ => "l",
+    };
+    if !xml.contains("<a:pPr") {
+        return xml.replacen("<a:p>", &format!("<a:p><a:pPr algn=\"{algn}\"/>"), 1);
+    }
+    let mut out = String::with_capacity(xml.len() + 16);
+    let mut rest = xml;
+    while let Some(i) = rest.find("<a:pPr") {
+        out.push_str(&rest[..i]);
+        let seg = &rest[i..];
+        let Some(gt) = seg.find('>') else {
+            out.push_str(seg);
+            return out;
+        };
+        let tag = set_attr(&seg[..=gt], "algn", algn);
+        out.push_str(&tag);
+        rest = &seg[gt + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn patch_body_wrap(xml: &str, wrap: bool) -> String {
+    let val = if wrap { "square" } else { "none" };
+    if let Some(i) = xml.find("<a:bodyPr") {
+        let seg = &xml[i..];
+        if let Some(gt) = seg.find('>') {
+            let tag = set_attr(&seg[..=gt], "wrap", val);
+            return format!("{}{}{}", &xml[..i], tag, &seg[gt + 1..]);
+        }
+    }
+    xml.to_string()
 }
 
 /// 把 `<a:rPr>` 的字号/粗体/斜体/颜色对齐模型；没有 rPr 就不动
@@ -694,12 +821,25 @@ fn anchor_name(block: &str) -> Option<String> {
     Some(crate::model::xml_unescape(&rest[..q]))
 }
 
-/// 文本与锚点几何都没变 → 保留原块（我们的 anchor_xml 写不出 Excel 的细节）
+/// 文本、锚点几何与全部已建模样式都没变 → 保留原块（避免丢 Excel 细节）
 fn block_matches(block: &str, tb: &TextBox) -> bool {
     if anchor_text(block) != tb.text {
         return false;
     }
-    anchor_points(block).map(|(f, t)| f == tb.from && t == tb.to).unwrap_or(false)
+    if !anchor_points(block).is_some_and(|(f, t)| f == tb.from && t == tb.to) {
+        return false;
+    }
+    let Some(parsed) = parse_drawing(block).into_iter().next() else {
+        return false;
+    };
+    parsed.fill == tb.fill
+        && parsed.line == tb.line
+        && (parsed.size - tb.size).abs() < 0.01
+        && parsed.bold == tb.bold
+        && parsed.italic == tb.italic
+        && parsed.color == tb.color
+        && parsed.align == tb.align
+        && parsed.wrap == tb.wrap
 }
 
 fn anchor_text(block: &str) -> String {

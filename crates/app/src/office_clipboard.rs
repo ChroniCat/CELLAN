@@ -920,12 +920,12 @@ fn write_office_clipboard_native(xmlss: &str, html: &str, text: &str) -> bool {
     }
     text_utf16.extend_from_slice(&[0, 0]);
     let html_bytes = cf_html(html);
-    // WPS 看到 HTML/UnicodeText 会优先走它们，而 HTML 的 x:fmla 不会被普通粘贴采用，
-    // 于是公式退化成缓存值。带公式的选区只给 XMLSS，让 WPS/Excel 走 R1C1 公式通路；
-    // 不带公式的选区仍保留 HTML/文本，以保住底色/合并和跨应用纯文本兜底。
+    // WPS 看到 HTML 会优先走它并丢弃 x:fmla 公式，因此带公式选区省略 CF_HTML 让 Excel/WPS
+    // 走首位的 XML Spreadsheet 通路；但始终保留 CF_UNICODETEXT（排在 XMLSS 之后），
+    // 确保粘贴到微信/记事本/Word 等纯文本应用时仍能得到单元格显示值而非空白。
     let has_formula = xmlss.contains("ss:Formula=");
     let include_html = !has_formula;
-    let include_text = !has_formula;
+    let include_text = true;
 
     const CF_UNICODETEXT: u32 = 13;
     unsafe {

@@ -14,12 +14,24 @@ pub(crate) enum LookupKey {
     Error(u8),
 }
 
+#[inline]
+pub(crate) fn canonical_number_bits(n: f64) -> u64 {
+    if n == 0.0 {
+        return 0;
+    }
+    if !n.is_finite() || (n.fract() == 0.0 && n.abs() < 1e15) {
+        return n.to_bits();
+    }
+    let r = super::functions::round_sig15(n);
+    if r == 0.0 { 0 } else { r.to_bits() }
+}
+
 impl LookupKey {
     #[inline]
     pub(crate) fn from_fvalue(v: &FValue) -> Self {
         match v {
             FValue::Empty => Self::Empty,
-            FValue::Number(n) => Self::Number(if *n == 0.0 { 0 } else { n.to_bits() }),
+            FValue::Number(n) => Self::Number(canonical_number_bits(*n)),
             FValue::Bool(b) => Self::Bool(*b),
             FValue::Text(s) => Self::Text(lowercase_arc(s)),
             FValue::Error(e) => Self::Error(*e as u8),
@@ -32,7 +44,7 @@ impl LookupKey {
     pub(crate) fn from_value(v: &Value) -> Self {
         match v {
             Value::Empty => Self::Empty,
-            Value::Number(n) => Self::Number(if *n == 0.0 { 0 } else { n.to_bits() }),
+            Value::Number(n) => Self::Number(canonical_number_bits(*n)),
             Value::Bool(b) => Self::Bool(*b),
             Value::Text(s) => Self::Text(lowercase_arc(s)),
             Value::Error(e) => Self::Error(*e as u8),
@@ -382,14 +394,14 @@ fn build_page_key_record(
             if NumberSlab::all_present_in(&ns.present, start, slice_end - start) {
                 for (i, &n) in ns.values[start..slice_end].iter().enumerate() {
                     let ro = start + i;
-                    let bits = if n == 0.0 { 0 } else { n.to_bits() };
+                    let bits = canonical_number_bits(n);
                     out.push((LookupKey::Number(bits), base + ro as u32 - r1));
                 }
             } else {
                 for ro in start..slice_end {
                     if (ns.present[ro / 64] & (1u64 << (ro % 64))) != 0 {
                         let n = ns.values[ro];
-                        let bits = if n == 0.0 { 0 } else { n.to_bits() };
+                        let bits = canonical_number_bits(n);
                         out.push((LookupKey::Number(bits), base + ro as u32 - r1));
                     }
                 }
@@ -466,7 +478,7 @@ fn build_page_key_record_overlay(
         match cells {
             ColSlab::Numbers(ns) => {
                 if let Some(n) = ns.get(ro as u32) {
-                    let bits = if n == 0.0 { 0 } else { n.to_bits() };
+                    let bits = canonical_number_bits(n);
                     out.push((LookupKey::Number(bits), abs_row - r1));
                 }
             }
@@ -651,8 +663,8 @@ pub(crate) struct CondPage {
     pub nonempty_mask: [u64; 4],
     /// Pre-sorted finite coerced numbers `(value, local_row_offset)` within this 256-row page
     pub sorted_nums: Vec<(f64, u16)>,
-    /// Optional pre-lowercased texts for transient dirty-overlay pages
-    pub overlay_texts: Option<Vec<Arc<str>>>,
+    /// Optional pre-lowercased texts for transient dirty-overlay pages (`None` for numeric cells)
+    pub overlay_texts: Option<Vec<Option<Arc<str>>>>,
     /// Lazily materialized per-page lowercased text dictionary (only built when a text query runs!)
     page_text_dict: OnceLock<FxHashMap<Arc<str>, Vec<u16>>>,
 }
@@ -664,24 +676,24 @@ impl CondPage {
     }
 
     #[inline]
-    pub(crate) fn lower_text_at(&self, local: usize, empty_arc: &Arc<str>) -> Arc<str> {
+    pub(crate) fn lower_text_opt_at(&self, local: usize, empty_arc: &Arc<str>) -> Option<Arc<str>> {
         if let Some(ref ov) = self.overlay_texts {
-            return ov.get(local).cloned().unwrap_or_else(|| empty_arc.clone());
+            return ov.get(local).cloned().unwrap_or(Some(empty_arc.clone()));
         }
         let ro = self.start_in_slab as usize + local;
         match self.slab.as_deref() {
-            None => empty_arc.clone(),
+            None => Some(empty_arc.clone()),
             Some(ColSlab::Numbers(ns)) => match ns.get(ro as u32) {
-                Some(n) => crate::model::format_number(n).to_ascii_lowercase().into(),
-                None => empty_arc.clone(),
+                Some(_) => None,
+                None => Some(empty_arc.clone()),
             },
             Some(ColSlab::Values(vs)) => match vs.get(ro).filter(|v| !v.is_empty()) {
-                None => empty_arc.clone(),
-                Some(v) => value_to_coerced_lower_text(v),
+                None => Some(empty_arc.clone()),
+                Some(v) => value_to_non_num_lower_text(v),
             },
             Some(ColSlab::Mixed(cs)) => match cs.get(ro).filter(|c| !c.is_blank()) {
-                None => empty_arc.clone(),
-                Some(cell) => value_to_coerced_lower_text(&cell.value),
+                None => Some(empty_arc.clone()),
+                Some(cell) => value_to_non_num_lower_text(&cell.value),
             },
         }
     }
@@ -690,8 +702,10 @@ impl CondPage {
         self.page_text_dict.get_or_init(|| {
             let mut dict: FxHashMap<Arc<str>, Vec<u16>> = FxHashMap::default();
             if let Some(ref ov) = self.overlay_texts {
-                for (idx, txt) in ov.iter().enumerate() {
-                    dict.entry(txt.clone()).or_default().push(idx as u16);
+                for (idx, txt_opt) in ov.iter().enumerate() {
+                    if let Some(txt) = txt_opt {
+                        dict.entry(txt.clone()).or_default().push(idx as u16);
+                    }
                 }
                 return dict;
             }
@@ -704,32 +718,33 @@ impl CondPage {
                 Some(ColSlab::Numbers(ns)) => {
                     for idx in 0..self.rows_in_page as usize {
                         let ro = start + idx;
-                        let txt = if let Some(n) = ns.get(ro as u32) {
-                            crate::model::format_number(n).into()
-                        } else {
-                            empty_arc.clone()
-                        };
-                        dict.entry(txt).or_default().push(idx as u16);
+                        if ns.get(ro as u32).is_none() {
+                            dict.entry(empty_arc.clone()).or_default().push(idx as u16);
+                        }
                     }
                 }
                 Some(ColSlab::Values(vs)) => {
                     for idx in 0..self.rows_in_page as usize {
                         let ro = start + idx;
-                        let txt = match vs.get(ro).filter(|v| !v.is_empty()) {
-                            None => empty_arc.clone(),
-                            Some(v) => value_to_coerced_lower_text(v),
+                        let txt_opt = match vs.get(ro).filter(|v| !v.is_empty()) {
+                            None => Some(empty_arc.clone()),
+                            Some(v) => value_to_non_num_lower_text(v),
                         };
-                        dict.entry(txt).or_default().push(idx as u16);
+                        if let Some(txt) = txt_opt {
+                            dict.entry(txt).or_default().push(idx as u16);
+                        }
                     }
                 }
                 Some(ColSlab::Mixed(cs)) => {
                     for idx in 0..self.rows_in_page as usize {
                         let ro = start + idx;
-                        let txt = match cs.get(ro).filter(|c| !c.is_blank()) {
-                            None => empty_arc.clone(),
-                            Some(cell) => value_to_coerced_lower_text(&cell.value),
+                        let txt_opt = match cs.get(ro).filter(|c| !c.is_blank()) {
+                            None => Some(empty_arc.clone()),
+                            Some(cell) => value_to_non_num_lower_text(&cell.value),
                         };
-                        dict.entry(txt).or_default().push(idx as u16);
+                        if let Some(txt) = txt_opt {
+                            dict.entry(txt).or_default().push(idx as u16);
+                        }
                     }
                 }
             }
@@ -741,55 +756,54 @@ impl CondPage {
 #[inline]
 fn value_to_coerced_number(v: &Value) -> Result<f64, ErrKind> {
     match v {
-        Value::Empty => Ok(0.0),
         Value::Number(n) => Ok(*n),
-        Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
         Value::Text(s) => {
             let t = s.trim();
             if t.is_empty() {
-                Ok(0.0)
+                Err(ErrKind::Value)
             } else {
                 t.parse::<f64>().map_err(|_| ErrKind::Value)
             }
         }
+        Value::Empty | Value::Bool(_) => Err(ErrKind::Value),
         Value::Error(e) => Err(*e),
     }
 }
 
 #[inline]
-fn value_to_coerced_lower_text(v: &Value) -> Arc<str> {
+fn value_to_non_num_lower_text(v: &Value) -> Option<Arc<str>> {
     match v {
-        Value::Empty => "".into(),
-        Value::Text(s) => lowercase_arc(s),
-        Value::Bool(true) => "true".into(),
-        Value::Bool(false) => "false".into(),
-        Value::Number(n) => crate::model::format_number(*n).into(),
-        Value::Error(e) => e.text().to_ascii_lowercase().into(),
+        Value::Empty => Some("".into()),
+        Value::Text(s) => Some(lowercase_arc(s)),
+        Value::Bool(true) => Some("true".into()),
+        Value::Bool(false) => Some("false".into()),
+        Value::Error(e) => Some(e.text().to_ascii_lowercase().into()),
+        Value::Number(_) => None,
     }
 }
 
 static FULL_EMPTY_COND_PAGE: std::sync::LazyLock<Arc<CondPage>> = std::sync::LazyLock::new(|| {
     let rows_in_page = PAGE_ROWS as u16;
     let coerced_nums = vec![0.0; PAGE_ROWS as usize];
-    let coerced_ok = [u64::MAX; 4];
+    let coerced_ok = [0u64; 4];
     let strict_num_ok = [0u64; 4];
     let nonempty_mask = [0u64; 4];
-    let sorted_nums: Vec<(f64, u16)> = (0..rows_in_page).map(|idx| (0.0, idx)).collect();
+    let sorted_nums: Vec<(f64, u16)> = Vec::new();
     Arc::new(CondPage {
         slab: None,
         start_in_slab: 0,
         rows_in_page,
         has_formula: false,
         has_invalid_formula_cache: false,
-        has_non_num: false,
+        has_non_num: true,
         has_non_finite: false,
         has_error: false,
         has_empty: true,
         has_coerced_non_strict: false,
         all_exact_int: true,
-        min_num: 0.0,
-        max_num: 0.0,
-        num_count: rows_in_page,
+        min_num: f64::INFINITY,
+        max_num: f64::NEG_INFINITY,
+        num_count: 0,
         int_sum: 0,
         int_abs_sum: 0,
         coerced_ok,
@@ -839,22 +853,16 @@ fn build_cond_page(
         None => {
             if rows_in_page > 0 {
                 has_empty = true;
-                coerced_ok = row_range_mask(0, rows_in_page as u32 - 1);
-                num_count = rows_in_page;
-                min_num = 0.0;
-                max_num = 0.0;
-                for idx in 0..rows_in_page {
-                    sorted_nums.push((0.0, idx));
-                }
+                has_non_num = true;
             }
         }
         Some(ColSlab::Numbers(ns)) => {
             let n_rows = rows_in_page as usize;
-            if n_rows > 0 {
-                coerced_ok = row_range_mask(0, rows_in_page as u32 - 1);
-            }
             if end <= ns.values.len() && NumberSlab::all_present_in(&ns.present, start, n_rows) {
                 // Dense pure numeric page: memcpy f64s + tight unbranched summary loop!
+                if n_rows > 0 {
+                    coerced_ok = row_range_mask(0, rows_in_page as u32 - 1);
+                }
                 coerced_nums.copy_from_slice(&ns.values[start..end]);
                 strict_num_ok = coerced_ok;
                 nonempty_mask = coerced_ok;
@@ -886,6 +894,7 @@ fn build_cond_page(
                     let ro = start + idx;
                     if let Some(n) = ns.get(ro as u32) {
                         let bit = 1u64 << (idx % 64);
+                        coerced_ok[idx / 64] |= bit;
                         strict_num_ok[idx / 64] |= bit;
                         nonempty_mask[idx / 64] |= bit;
                         coerced_nums[idx] = n;
@@ -912,10 +921,7 @@ fn build_cond_page(
                         }
                     } else {
                         has_empty = true;
-                        num_count += 1;
-                        min_num = min_num.min(0.0);
-                        max_num = max_num.max(0.0);
-                        sorted_nums.push((0.0, idx as u16));
+                        has_non_num = true;
                     }
                 }
             }
@@ -928,11 +934,7 @@ fn build_cond_page(
                 match vs.get(ro).filter(|v| !v.is_empty()) {
                     None => {
                         has_empty = true;
-                        coerced_ok[word] |= bit;
-                        num_count += 1;
-                        min_num = min_num.min(0.0);
-                        max_num = max_num.max(0.0);
-                        sorted_nums.push((0.0, idx as u16));
+                        has_non_num = true;
                     }
                     Some(val) => {
                         nonempty_mask[word] |= bit;
@@ -951,20 +953,22 @@ fn build_cond_page(
                                 coerced_nums[idx] = n;
                                 coerced_ok[word] |= bit;
                                 if n.is_finite() {
-                                    num_count += 1;
-                                    min_num = min_num.min(n);
-                                    max_num = max_num.max(n);
                                     sorted_nums.push((n, idx as u16));
-                                    if all_exact_int {
-                                        if n.fract() != 0.0 || n.abs() > EXACT as f64 {
-                                            all_exact_int = false;
-                                        } else {
-                                            let w = n as i64;
-                                            int_sum = int_sum.wrapping_add(w);
-                                            int_abs_sum =
-                                                int_abs_sum.saturating_add(w.unsigned_abs());
-                                            if int_abs_sum > EXACT {
+                                    if is_strict {
+                                        num_count += 1;
+                                        min_num = min_num.min(n);
+                                        max_num = max_num.max(n);
+                                        if all_exact_int {
+                                            if n.fract() != 0.0 || n.abs() > EXACT as f64 {
                                                 all_exact_int = false;
+                                            } else {
+                                                let w = n as i64;
+                                                int_sum = int_sum.wrapping_add(w);
+                                                int_abs_sum =
+                                                    int_abs_sum.saturating_add(w.unsigned_abs());
+                                                if int_abs_sum > EXACT {
+                                                    all_exact_int = false;
+                                                }
                                             }
                                         }
                                     }
@@ -989,11 +993,7 @@ fn build_cond_page(
                 match cs.get(ro).filter(|c| !c.is_blank()) {
                     None => {
                         has_empty = true;
-                        coerced_ok[word] |= bit;
-                        num_count += 1;
-                        min_num = min_num.min(0.0);
-                        max_num = max_num.max(0.0);
-                        sorted_nums.push((0.0, idx as u16));
+                        has_non_num = true;
                     }
                     Some(cell) => {
                         if cell.formula.is_some() {
@@ -1004,9 +1004,10 @@ fn build_cond_page(
                         }
                         if cell.value.is_empty() {
                             has_empty = true;
-                        } else {
-                            nonempty_mask[word] |= bit;
+                            has_non_num = true;
+                            continue;
                         }
+                        nonempty_mask[word] |= bit;
                         let is_strict = matches!(cell.value, Value::Number(_));
                         if is_strict {
                             strict_num_ok[word] |= bit;
@@ -1016,26 +1017,28 @@ fn build_cond_page(
                         }
                         match value_to_coerced_number(&cell.value) {
                             Ok(n) => {
-                                if !is_strict && !cell.value.is_empty() {
+                                if !is_strict {
                                     has_coerced_non_strict = true;
                                 }
                                 coerced_nums[idx] = n;
                                 coerced_ok[word] |= bit;
                                 if n.is_finite() {
-                                    num_count += 1;
-                                    min_num = min_num.min(n);
-                                    max_num = max_num.max(n);
                                     sorted_nums.push((n, idx as u16));
-                                    if all_exact_int {
-                                        if n.fract() != 0.0 || n.abs() > EXACT as f64 {
-                                            all_exact_int = false;
-                                        } else {
-                                            let w = n as i64;
-                                            int_sum = int_sum.wrapping_add(w);
-                                            int_abs_sum =
-                                                int_abs_sum.saturating_add(w.unsigned_abs());
-                                            if int_abs_sum > EXACT {
+                                    if is_strict {
+                                        num_count += 1;
+                                        min_num = min_num.min(n);
+                                        max_num = max_num.max(n);
+                                        if all_exact_int {
+                                            if n.fract() != 0.0 || n.abs() > EXACT as f64 {
                                                 all_exact_int = false;
+                                            } else {
+                                                let w = n as i64;
+                                                int_sum = int_sum.wrapping_add(w);
+                                                int_abs_sum =
+                                                    int_abs_sum.saturating_add(w.unsigned_abs());
+                                                if int_abs_sum > EXACT {
+                                                    all_exact_int = false;
+                                                }
                                             }
                                         }
                                     }
@@ -1156,15 +1159,11 @@ fn build_cond_page_overlay(
 
         if resolved.is_empty() {
             has_empty = true;
-            coerced_ok[word] |= bit;
-            num_count += 1;
-            min_num = min_num.min(0.0);
-            max_num = max_num.max(0.0);
-            sorted_nums.push((0.0, idx as u16));
-            overlay_texts.push(empty_arc.clone());
+            has_non_num = true;
+            overlay_texts.push(Some(empty_arc.clone()));
         } else {
             nonempty_mask[word] |= bit;
-            overlay_texts.push(value_to_coerced_lower_text(&resolved));
+            overlay_texts.push(value_to_non_num_lower_text(&resolved));
             let is_strict = matches!(resolved, Value::Number(_));
             if is_strict {
                 strict_num_ok[word] |= bit;
@@ -1180,19 +1179,21 @@ fn build_cond_page_overlay(
                     coerced_nums[idx] = n;
                     coerced_ok[word] |= bit;
                     if n.is_finite() {
-                        num_count += 1;
-                        min_num = min_num.min(n);
-                        max_num = max_num.max(n);
                         sorted_nums.push((n, idx as u16));
-                        if all_exact_int {
-                            if n.fract() != 0.0 || n.abs() > EXACT as f64 {
-                                all_exact_int = false;
-                            } else {
-                                let w = n as i64;
-                                int_sum = int_sum.wrapping_add(w);
-                                int_abs_sum = int_abs_sum.saturating_add(w.unsigned_abs());
-                                if int_abs_sum > EXACT {
+                        if is_strict {
+                            num_count += 1;
+                            min_num = min_num.min(n);
+                            max_num = max_num.max(n);
+                            if all_exact_int {
+                                if n.fract() != 0.0 || n.abs() > EXACT as f64 {
                                     all_exact_int = false;
+                                } else {
+                                    let w = n as i64;
+                                    int_sum = int_sum.wrapping_add(w);
+                                    int_abs_sum = int_abs_sum.saturating_add(w.unsigned_abs());
+                                    if int_abs_sum > EXACT {
+                                        all_exact_int = false;
+                                    }
                                 }
                             }
                         }
@@ -1526,14 +1527,14 @@ impl SharedCondColumn {
     }
 
     #[inline]
-    pub(crate) fn coerced_lower_text_at(&self, row_offset: usize, empty_arc: &Arc<str>) -> Arc<str> {
+    pub(crate) fn lower_text_opt_at(&self, row_offset: usize, empty_arc: &Arc<str>) -> Option<Arc<str>> {
         let abs_row = self.r1 + row_offset as u32;
         let p_idx = ((abs_row >> 8) - (self.r1 >> 8)) as usize;
         let Some(page) = self.pages.get(p_idx) else {
-            return empty_arc.clone();
+            return Some(empty_arc.clone());
         };
         let local = (abs_row & 255) as usize - page.start_in_slab as usize;
-        page.lower_text_at(local, empty_arc)
+        page.lower_text_opt_at(local, empty_arc)
     }
 
     #[inline]
@@ -1547,18 +1548,29 @@ impl SharedCondColumn {
     }
 
     #[inline]
-    pub(crate) fn strict_number_at(&self, row_offset: usize) -> f64 {
+    pub(crate) fn strict_number_opt_at(&self, row_offset: usize) -> Option<f64> {
+        let abs_row = self.r1 + row_offset as u32;
+        let p_idx = ((abs_row >> 8) - (self.r1 >> 8)) as usize;
+        let page = self.pages.get(p_idx)?;
+        let local = (abs_row & 255) as usize - page.start_in_slab as usize;
+        ((page.strict_num_ok[local >> 6] & (1u64 << (local & 63))) != 0)
+            .then(|| page.coerced_nums[local])
+    }
+
+    #[inline]
+    pub(crate) fn is_strict_num_at(&self, row_offset: usize) -> bool {
         let abs_row = self.r1 + row_offset as u32;
         let p_idx = ((abs_row >> 8) - (self.r1 >> 8)) as usize;
         let Some(page) = self.pages.get(p_idx) else {
-            return 0.0;
+            return false;
         };
         let local = (abs_row & 255) as usize - page.start_in_slab as usize;
-        if (page.strict_num_ok[local >> 6] & (1u64 << (local & 63))) != 0 {
-            page.coerced_nums[local]
-        } else {
-            0.0
-        }
+        (page.strict_num_ok[local >> 6] & (1u64 << (local & 63))) != 0
+    }
+
+    #[inline]
+    pub(crate) fn strict_number_at(&self, row_offset: usize) -> f64 {
+        self.strict_number_opt_at(row_offset).unwrap_or(0.0)
     }
 
     #[inline]

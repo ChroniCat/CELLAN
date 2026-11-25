@@ -98,19 +98,55 @@ impl StringPool {
     }
 }
 
-/// 零堆分配栈缓冲数字格式化回调：整数走纯整数除法，普通小数走 64B 栈缓冲并去除尾零。
+/// 零堆分配栈缓冲数字格式化回调：保留 Excel 15 位有效数字精度，避免极小数截断成 0。
 #[inline]
 pub fn with_formatted_number<R>(n: f64, f: impl FnOnce(&str) -> R) -> R {
     use std::fmt::Write;
     if n.is_nan() || n.is_infinite() {
         return f("#NUM!");
     }
-    if n.fract() == 0.0 && n.abs() < 1e15 {
+    if n == 0.0 {
+        return f("0");
+    }
+    let abs = n.abs();
+    if n.fract() == 0.0 && abs < 1e15 {
         let mut buf = [0u8; 24];
         return f(crate::style::format_i64_into(n as i64, &mut buf));
     }
+    if abs >= 1e15 || abs < 1e-10 {
+        let mut stack = crate::style::StackFmt::<64>::new();
+        if write!(stack, "{:.14e}", n).is_ok() {
+            let s = stack.as_str();
+            if let Some((mant, exp_s)) = s.split_once('e') {
+                let mut m = mant.trim_end_matches('0');
+                if let Some(stripped) = m.strip_suffix('.') {
+                    m = stripped;
+                }
+                if m == "-0" {
+                    return f("0");
+                }
+                let exp: i32 = exp_s.parse().unwrap_or(0);
+                let mut out = crate::style::StackFmt::<64>::new();
+                if write!(
+                    out,
+                    "{}E{}{:02}",
+                    m,
+                    if exp < 0 { '-' } else { '+' },
+                    exp.abs()
+                )
+                .is_ok()
+                {
+                    return f(out.as_str());
+                }
+            }
+        }
+        return f(&format!("{n:E}"));
+    }
+    // 1e-10 <= |n| < 1e15：按 15 位有效数字决定小数位数，再去掉尾零
+    let exp = abs.log10().floor() as i32;
+    let dec = (14 - exp).clamp(0, 24) as usize;
     let mut stack = crate::style::StackFmt::<64>::new();
-    if write!(stack, "{:.10}", n).is_ok() {
+    if write!(stack, "{n:.dec$}").is_ok() {
         stack.trim_decimal_zeros_from(0);
         let s = stack.as_str();
         if s == "-0" {
@@ -118,7 +154,7 @@ pub fn with_formatted_number<R>(n: f64, f: impl FnOnce(&str) -> R) -> R {
         }
         return f(s);
     }
-    let s = format!("{:.10}", n);
+    let s = format!("{n:.dec$}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
     f(if trimmed == "-0" { "0" } else { trimmed })
 }

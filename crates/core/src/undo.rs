@@ -2087,6 +2087,23 @@ impl UndoStack {
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
+    /// 把跨表联动改写的 `CellDelta` 合并到最近一条 `Entry::Cells` 撤销记录中，
+    /// 让移动单元格及其跨表公式同步改写成为单步原子 Undo。
+    pub fn extend_last_deltas(&mut self, extra: Vec<CellDelta>) {
+        if extra.is_empty() {
+            return;
+        }
+        if let Some(Entry::Cells(stamp, action, _, _)) = self.done.last_mut() {
+            let add_bytes: usize = extra.len() * std::mem::size_of::<CellDelta>()
+                + extra
+                    .iter()
+                    .map(|d| cell_heap_bytes(&d.before) + cell_heap_bytes(&d.after))
+                    .sum::<usize>();
+            stamp.payload_bytes += add_bytes;
+            action.deltas.extend(extra);
+        }
+    }
+
     pub fn undo_labels(&self, limit: usize) -> Vec<String> {
         self.done
             .iter()

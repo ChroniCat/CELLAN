@@ -920,6 +920,7 @@ impl SheetApp {
                     self.wb.dirty = true;
                     self.doc_gen = self.doc_gen.wrapping_add(1);
                     self.recalc_all_and_deps_adaptive();
+                    self.recalc_filter_hidden_on(pending.sheet);
                     self.record_revision_sample(operation.label(), &sample, total);
                     if let Some(batch) = batch {
                         self.undo.push_prepared_cow_batch(batch);
@@ -936,6 +937,7 @@ impl SheetApp {
                     self.wb.dirty = true;
                     self.doc_gen = self.doc_gen.wrapping_add(1);
                     self.recalc_all_and_deps_adaptive();
+                    self.recalc_filter_hidden_on(pending.sheet);
                     let ts = if self.net.is_some() {
                         if whole_snapshot_matches {
                             if let Some(prebuilt) = collab {
@@ -995,6 +997,7 @@ impl SheetApp {
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
             self.recalc_all_and_deps_adaptive();
+            self.recalc_filter_hidden_on(focus.0);
             let ts = if self.net.is_some() && let Some(order) = changes.permutation.clone() {
                 self.broadcast_line_permutation(focus.0, order,
                     changes.deltas.iter().map(|d| (d.row,d.col,d.before_style != d.after_style)))

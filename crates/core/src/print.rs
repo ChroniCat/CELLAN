@@ -381,7 +381,7 @@ pub fn header_parts(text: &str, page: usize, total: usize) -> (String, String, S
         }
     }
     if !has_mark {
-        return (String::new(), l, String::new());
+        return (String::new(), c, String::new());
     }
     (l, c, r)
 }
@@ -533,7 +533,8 @@ fn draw_cell(
             ch = (r1..=r2).map(|rr| row_h(sheet, rr) * px).sum();
         }
     }
-    let top = y_bottom + ch - h;
+    // PDF y 向上：当前行顶边是 y_bottom + h，跨行合并格必须从顶边向下延伸 ch（底边为 y_bottom + h - ch）
+    let top = y_bottom + h - ch;
     draw_view(sheet, &wb.styles, r, c, x, top, cw, ch, scale, &view, out);
 }
 
@@ -626,9 +627,10 @@ fn draw_view(
     }
 }
 
-/// 对象锚点换算：把 (r1,c1,r2,c2) 的格范围换成纸上的 pt 矩形（左上角）
+/// 对象锚点换算：把 (r1,c1,r2,c2) 的格范围换成当前页纸上的 pt 矩形（支持多页起始行列偏移）
 fn grid_rect(
     sheet: &Sheet,
+    span: &PageSpan,
     r1: u32,
     c1: u32,
     r2: u32,
@@ -644,10 +646,20 @@ fn grid_rect(
     let hc = sheet.hidden_cols.intervals();
     let hr1 = sheet.hidden_rows.intervals();
     let hr2 = sheet.hidden_rows_user.intervals();
-    let x1: f32 = if c1 > 0 { sum_axis_px(&sheet.cols, hc, &[], 0, c1 - 1) } else { 0.0 } + e(off[0]);
-    let x2: f32 = if c2 > 0 { sum_axis_px(&sheet.cols, hc, &[], 0, c2 - 1) } else { 0.0 } + e(off[2]);
-    let t1: f32 = if r1 > 0 { sum_axis_px(&sheet.rows, hr1, hr2, 0, r1 - 1) } else { 0.0 } + e(off[1]);
-    let t2: f32 = if r2 > 0 { sum_axis_px(&sheet.rows, hr1, hr2, 0, r2 - 1) } else { 0.0 } + e(off[3]);
+    let ox: f32 = if span.cols.0 > 0 {
+        sum_axis_px(&sheet.cols, hc, &[], 0, span.cols.0 - 1)
+    } else {
+        0.0
+    };
+    let oy: f32 = if span.rows.0 > 0 {
+        sum_axis_px(&sheet.rows, hr1, hr2, 0, span.rows.0 - 1)
+    } else {
+        0.0
+    };
+    let x1: f32 = (if c1 > 0 { sum_axis_px(&sheet.cols, hc, &[], 0, c1 - 1) } else { 0.0 } - ox) + e(off[0]);
+    let x2: f32 = (if c2 > 0 { sum_axis_px(&sheet.cols, hc, &[], 0, c2 - 1) } else { 0.0 } - ox) + e(off[2]);
+    let t1: f32 = (if r1 > 0 { sum_axis_px(&sheet.rows, hr1, hr2, 0, r1 - 1) } else { 0.0 } - oy) + e(off[1]);
+    let t2: f32 = (if r2 > 0 { sum_axis_px(&sheet.rows, hr1, hr2, 0, r2 - 1) } else { 0.0 } - oy) + e(off[3]);
     let (xa, xb) = (x1 * px + sx, x2 * px + sx);
     let (ta, tb) = (t1 * px, t2 * px);
     let w = (xb - xa).max(1.0);
@@ -678,10 +690,18 @@ fn chart_text(out: &mut Out, x: f32, y: f32, size: f32, text: &str, color: [u8; 
 }
 
 /// 图表：柱/条形/折线/饼。预览与 PDF 共用同一套矩形/折线指令。
-fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f32, out: &mut Out) {
+fn draw_chart(
+    sheet: &Sheet,
+    span: &PageSpan,
+    ch: &crate::charts::Chart,
+    sx: f32,
+    sy: f32,
+    px: f32,
+    out: &mut Out,
+) {
     use crate::charts::ChartKind;
     let (a, b, c, d) = ch.anchor;
-    let (x, y, w, h) = grid_rect(sheet, a, b, c, d, [0; 4], sx, sy, px);
+    let (x, y, w, h) = grid_rect(sheet, span, a, b, c, d, [0; 4], sx, sy, px);
     if w < 20.0 || h < 20.0 {
         return;
     }
@@ -884,10 +904,17 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                         })
                         .filter(|p| p.0.is_finite() && p.1.is_finite())
                         .collect();
-                    if pts.len() >= 2 {
-                        out.polys.push((pts, color));
-                    } else if let Some(p) = pts.first() {
-                        out.rects.push((p.0 - 1.5, p.1 - 1.5, 3.0, 3.0, color));
+                    let is_scatter = matches!(series_kind(se, ch.kind), ChartKind::Scatter);
+                    if !is_scatter && pts.len() >= 2 {
+                        for seg in pts.windows(2) {
+                            out.lines.push((seg[0].0, seg[0].1, seg[1].0, seg[1].1, 1.4, color));
+                        }
+                    }
+                    if is_scatter || pts.len() <= 60 {
+                        let r = if is_scatter { 2.0 } else { 1.5 };
+                        for p in &pts {
+                            out.rects.push((p.0 - r, p.1 - r, r * 2.0, r * 2.0, color));
+                        }
                     }
                 }
                 ChartKind::Area => {
@@ -960,7 +987,7 @@ fn draw_objects(
             None => source.and_then(|p| crate::pic::read_part(p, &pic.part)),
         };
         let Some(bytes) = bytes else { continue };
-        let (x, y, w, h) = grid_rect(sheet, r1, c1, r2, c2, pic.off, sx, sy, px);
+        let (x, y, w, h) = grid_rect(sheet, span, r1, c1, r2, c2, pic.off, sx, sy, px);
         let stem = Path::new(&pic.part)
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -973,7 +1000,7 @@ fn draw_objects(
     }
     for ch in &sheet.charts {
         if contains(ch.anchor.0, ch.anchor.1) {
-            draw_chart(sheet, ch, sx, sy, px, out);
+            draw_chart(sheet, span, ch, sx, sy, px, out);
         }
     }
     for tb in &sheet.textboxes {
@@ -982,14 +1009,20 @@ fn draw_objects(
         if !contains(r1, c1) {
             continue;
         }
-        const EMU_PX: f32 = 9525.0;
-        let x = (0..c1).map(|c| col_w(sheet, c) * px).sum::<f32>() + sx + dx1 as f32 / EMU_PX * px;
-        let y_top = (0..r1).map(|r| row_h(sheet, r) * px).sum::<f32>() + dy1 as f32 / EMU_PX * px;
-        let x2 = (0..c2).map(|c| col_w(sheet, c) * px).sum::<f32>() + sx + dx2 as f32 / EMU_PX * px;
-        let y2 = (0..r2).map(|r| row_h(sheet, r) * px).sum::<f32>() + dy2 as f32 / EMU_PX * px;
-        let w = (x2 - x).max(8.0);
-        let h = (y2 - y_top).max(8.0);
-        let yy = sy - y_top - h;
+        let (x, yy, w, h) = grid_rect(
+            sheet,
+            span,
+            r1,
+            c1,
+            r2,
+            c2,
+            [dx1, dy1, dx2, dy2],
+            sx,
+            sy,
+            px,
+        );
+        let w = w.max(8.0);
+        let h = h.max(8.0);
         if let Some(fill) = tb.fill {
             out.rects.push((x, yy, w, h, fill));
         }

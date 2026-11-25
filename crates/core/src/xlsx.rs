@@ -902,7 +902,11 @@ pub fn load_diag_with_control(
                     sheet.filter = lay.filter.clone();
                 }
                 if let Some(f) = &sheet.filter {
-                    if !f.allows.is_empty() || !f.criteria.is_empty() {
+                    if !f.allows.is_empty()
+                        || !f.criteria.is_empty()
+                        || !f.date_groups.is_empty()
+                        || !f.color_filters.is_empty()
+                    {
                         if let Some(map) = &manual_hidden {
                             let user_ivs = map.get(&sheet.name).cloned().unwrap_or_default();
                             if user_ivs.is_empty() && !sheet.hidden_rows_user.is_empty() {
@@ -912,12 +916,20 @@ pub fn load_diag_with_control(
                                 );
                                 sheet.hidden_rows_user.clear();
                             } else {
-                                sheet.hidden_rows = f.hidden_row_intervals(sheet);
+                                sheet.hidden_rows = f.hidden_row_intervals_with_styles(
+                                    sheet,
+                                    wb_styles,
+                                    wb.date_system,
+                                );
                                 sheet.hidden_rows_user =
                                     crate::layout::HiddenIndices::from_intervals(user_ivs);
                             }
                         } else {
-                            let fh = f.hidden_row_intervals(sheet);
+                            let fh = f.hidden_row_intervals_with_styles(
+                                sheet,
+                                wb_styles,
+                                wb.date_system,
+                            );
                             if !sheet.hidden_rows_user.is_empty() && !fh.is_empty() {
                                 sheet.hidden_rows_user = crate::layout::HiddenIndices::from_intervals(
                                     subtract_intervals(
@@ -2803,7 +2815,11 @@ fn try_load_ooxml_from_memory(
                     sheet.filter = lay.filter.clone();
                 }
                 if let Some(f) = &sheet.filter {
-                    if !f.allows.is_empty() || !f.criteria.is_empty() {
+                    if !f.allows.is_empty()
+                        || !f.criteria.is_empty()
+                        || !f.date_groups.is_empty()
+                        || !f.color_filters.is_empty()
+                    {
                         if let Some(map) = &manual_hidden {
                             let user_ivs = map.get(&sheet.name).cloned().unwrap_or_default();
                             if user_ivs.is_empty() && !sheet.hidden_rows_user.is_empty() {
@@ -2813,12 +2829,20 @@ fn try_load_ooxml_from_memory(
                                 );
                                 sheet.hidden_rows_user.clear();
                             } else {
-                                sheet.hidden_rows = f.hidden_row_intervals(sheet);
+                                sheet.hidden_rows = f.hidden_row_intervals_with_styles(
+                                    sheet,
+                                    wb_styles,
+                                    wb.date_system,
+                                );
                                 sheet.hidden_rows_user =
                                     crate::layout::HiddenIndices::from_intervals(user_ivs);
                             }
                         } else {
-                            let fh = f.hidden_row_intervals(sheet);
+                            let fh = f.hidden_row_intervals_with_styles(
+                                sheet,
+                                wb_styles,
+                                wb.date_system,
+                            );
                             if !sheet.hidden_rows_user.is_empty() && !fh.is_empty() {
                                 sheet.hidden_rows_user = crate::layout::HiddenIndices::from_intervals(
                                     subtract_intervals(
@@ -3765,15 +3789,19 @@ fn save_plain_at(
     if !delta_summary.handled_page {
         must_save!("page-setup", crate::patch::apply_page_setup(path, wb));
     }
-    let any_notes_work = wb
-        .sheets
-        .iter()
-        .any(|s| s.notes_dirty || (s.source_part.is_none() && !s.notes.is_empty()));
+    let any_notes_work = wb.sheets.iter().any(|s| {
+        !delta_summary.handled_note_sheets.contains(&s.identity)
+            && (s.notes_dirty || (s.source_part.is_none() && !s.notes.is_empty()))
+    });
     if any_notes_work || wb.sheets.iter().any(|s| s.tables_dirty) {
         crate::patch::commit_stage(path).context("保存表/批注前落盘失败")?;
     }
-    // 批注：原生写入 commentsN.xml + vmlDrawingN.vml，删空时清掉旧部件
+    // 批注：原生写入 commentsN.xml + vmlDrawingN.vml，删空时清掉旧部件；
+    // 已由 xlsx_delta 就地补丁的表不再整份覆写，避免毁掉线程批注与 VML 控件。
     for sheet in &wb.sheets {
+        if delta_summary.handled_note_sheets.contains(&sheet.identity) {
+            continue;
+        }
         if sheet.notes_dirty && sheet.notes.is_empty() {
             must_save!("notes-clear", crate::notes::clear_sheet_notes(path, &sheet.name));
         } else if (sheet.notes_dirty || sheet.source_part.is_none()) && !sheet.notes.is_empty() {
@@ -3807,30 +3835,28 @@ fn save_plain_at(
     );
     crate::patch::commit_stage(path).context("保存收尾补丁落盘失败")?;
     let mut created_charts = std::collections::HashMap::new();
-    if fresh_base {
-        for sheet in wb.sheets.iter().filter(|s| s.source_part.is_none()) {
-            let new_charts: Vec<_> = sheet
-                .charts
-                .iter()
-                .enumerate()
-                .filter(|(_, ch)| ch.part.is_empty())
-                .collect();
-            for (_, chart) in &new_charts {
-                let mut committed = (*chart).clone();
-                if committed.series.iter().any(|series| !series.val_ref.is_empty()) {
-                    crate::chart_write::refresh_series_from_refs(wb, &sheet.name, &mut committed)?;
-                }
-                crate::chart_write::insert_chart(path, &sheet.name, &committed)?;
+    for sheet in wb.sheets.iter().filter(|s| s.source_part.is_none()) {
+        let new_charts: Vec<_> = sheet
+            .charts
+            .iter()
+            .enumerate()
+            .filter(|(_, ch)| ch.part.is_empty())
+            .collect();
+        for (_, chart) in &new_charts {
+            let mut committed = (*chart).clone();
+            if committed.series.iter().any(|series| !series.val_ref.is_empty()) {
+                crate::chart_write::refresh_series_from_refs(wb, &sheet.name, &mut committed)?;
             }
-            if !new_charts.is_empty() {
-                let generated = crate::charts::load_charts(path, &sheet.name)?;
-                anyhow::ensure!(
-                    generated.len() == new_charts.len(),
-                    "图表写入后的关系数量不一致"
-                );
-                for ((i, _), chart) in new_charts.into_iter().zip(generated) {
-                    created_charts.insert((sheet.identity, i), (chart.part, chart.drawing));
-                }
+            crate::chart_write::insert_chart(path, &sheet.name, &committed)?;
+        }
+        if !new_charts.is_empty() {
+            let generated = crate::charts::load_charts(path, &sheet.name)?;
+            anyhow::ensure!(
+                generated.len() == new_charts.len(),
+                "图表写入后的关系数量不一致"
+            );
+            for ((i, _), chart) in new_charts.into_iter().zip(generated) {
+                created_charts.insert((sheet.identity, i), (chart.part, chart.drawing));
             }
         }
     }

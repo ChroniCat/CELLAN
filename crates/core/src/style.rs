@@ -313,7 +313,12 @@ impl StyleTable {
     pub fn intern(&mut self, s: CellStyle) -> u16 {
         let k = hash_of(&s);
         if let Some(&id) = self.0.index.get(&k) {
-            if self.0.styles[id as usize] == s {
+            if self.0.styles[id as usize] == s
+                && self.0.themes.get(id as usize).copied().unwrap_or_default()
+                    == crate::style_theme::XfTheme::default()
+                && self.0.patterns.get(id as usize).and_then(|p| p.as_ref()).is_none()
+                && !self.0.quotes.get(id as usize).copied().unwrap_or(false)
+            {
                 return id;
             }
         }
@@ -323,8 +328,74 @@ impl StyleTable {
         inner.themes.push(crate::style_theme::XfTheme::default());
         inner.patterns.push(None);
         inner.quotes.push(false);
-        inner.index.insert(k, id);
+        inner.index.entry(k).or_insert(id);
         id
+    }
+
+    /// 完整保留扩展元数据（主题色、图案填充、quotePrefix）的样式驻留。
+    pub fn intern_with_ext(
+        &mut self,
+        s: CellStyle,
+        theme: crate::style_theme::XfTheme,
+        pattern: Option<crate::style_ext::FillPattern>,
+        quote: bool,
+    ) -> u16 {
+        let is_plain = theme == crate::style_theme::XfTheme::default()
+            && pattern.is_none()
+            && !quote;
+        if is_plain {
+            return self.intern(s);
+        }
+        for (i, st) in self.0.styles.iter().enumerate() {
+            if *st == s
+                && self.0.themes.get(i).copied().unwrap_or_default() == theme
+                && self.0.patterns.get(i).and_then(|p| p.as_ref()) == pattern.as_ref()
+                && self.0.quotes.get(i).copied().unwrap_or(false) == quote
+            {
+                return i as u16;
+            }
+        }
+        let inner = std::sync::Arc::make_mut(&mut self.0);
+        let id = inner.styles.len() as u16;
+        inner.styles.push(s);
+        inner.themes.push(theme);
+        inner.patterns.push(pattern);
+        inner.quotes.push(quote);
+        id
+    }
+
+    /// 基于已有样式 ID 派生修改后的新样式：凡未改动的颜色/填充/前导撇号，自动继承原主题色、图案与 quotePrefix。
+    pub fn intern_derived(&mut self, base_id: u16, s: CellStyle) -> u16 {
+        let base = self.get(base_id).clone();
+        if s == base {
+            return base_id;
+        }
+        let mut theme = self.theme_of(base_id);
+        if s.color != base.color {
+            theme.font = None;
+        }
+        if s.fill != base.fill {
+            theme.fill = None;
+        }
+        let pattern = if s.fill != base.fill {
+            None
+        } else {
+            self.pattern_of(base_id).cloned()
+        };
+        let quote = self.quote_of(base_id);
+        self.intern_with_ext(s, theme, pattern, quote)
+    }
+
+    /// 将另一工作簿的样式 ID（含主题色、图案填充、quotePrefix）迁移驻留到本样式表。
+    pub fn copy_from(&mut self, other: &StyleTable, sid: u16) -> u16 {
+        if sid == 0 {
+            return 0;
+        }
+        let s = other.get(sid).clone();
+        let theme = other.theme_of(sid);
+        let pattern = other.pattern_of(sid).cloned();
+        let quote = other.quote_of(sid);
+        self.intern_with_ext(s, theme, pattern, quote)
     }
 
     /// 记录样式号的主题色引用（不参与去重键：主题不同的两格颜色已由解析结果区分）
@@ -446,6 +517,15 @@ pub fn format_value_in(
     fmt: &str,
 ) -> String {
     crate::formula::with_date_system(sys, || format_value(v, fmt))
+}
+
+/// 按字面格式串格式化（供 `TEXT()` 使用，不把 `mm-dd-yy` 改写成本机区域短日期）。
+pub fn format_value_literal_in(
+    sys: crate::model::DateSystem,
+    v: &crate::model::Value,
+    fmt: &str,
+) -> String {
+    crate::formula::with_date_system(sys, || format_value_core(v, fmt, false))
 }
 
 /// Fast stack-allocated ASCII integer formatter into `[u8; 24]`.
@@ -628,9 +708,40 @@ pub fn format_value_fit(v: &crate::model::Value, fmt: &str, cap: usize) -> Strin
 
 // Rendered values vary by cell. The format sections, signs, date token programs,
 // and literal parts of ordinary numeric patterns can be shared by all cells using that format.
+#[derive(Clone, Copy, Debug)]
+enum CondOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SectionCond {
+    op: CondOp,
+    val: f64,
+}
+
+impl SectionCond {
+    fn matches(self, n: f64) -> bool {
+        match self.op {
+            CondOp::Eq => (n - self.val).abs() <= f64::EPSILON,
+            CondOp::Ne => (n - self.val).abs() > f64::EPSILON,
+            CondOp::Lt => n < self.val,
+            CondOp::Le => n <= self.val,
+            CondOp::Gt => n > self.val,
+            CondOp::Ge => n >= self.val,
+        }
+    }
+}
+
 struct FormatSection {
     raw: String,
     color: Option<[u8; 3]>,
+    cond: Option<SectionCond>,
+    has_neg_marker: bool,
     dbnum: Option<crate::dbnum::DbNumKind>,
     kind: SectionKind,
 }
@@ -650,10 +761,27 @@ enum SectionKind {
 }
 
 impl FormatSection {
+    fn renders_number(&self) -> bool {
+        match &self.kind {
+            SectionKind::General
+            | SectionKind::Date(_)
+            | SectionKind::DbNum(_)
+            | SectionKind::Scientific { .. }
+            | SectionKind::Number(_) => true,
+            SectionKind::Fallback => {
+                let cleaned = strip_brackets(self.raw.trim());
+                cleaned.contains('/') && cleaned.contains('?')
+            }
+        }
+    }
+
     fn compile(raw: String) -> Self {
         let color = section_color(&raw);
+        let cond = section_cond(&raw);
         let trimmed = raw.trim();
         let dbnum = crate::dbnum::detect_dbnum(trimmed);
+        let cleaned_for_neg = strip_brackets(trimmed);
+        let has_neg_marker = cleaned_for_neg.contains('-') || cleaned_for_neg.contains('(');
         let kind = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("general") {
             SectionKind::General
         } else if is_date_format(trimmed) {
@@ -661,12 +789,11 @@ impl FormatSection {
         } else if let Some(kind) = dbnum {
             SectionKind::DbNum(kind)
         } else {
-            let cleaned = strip_brackets(trimmed);
-            let sec = cleaned.trim();
-            let pct = sec.matches('%').count() as i32;
-            let permille = sec.matches('‰').count() as i32;
+            let sec = cleaned_for_neg.trim();
+            let pct = count_unquoted(sec, '%') as i32;
+            let permille = count_unquoted(sec, '‰') as i32;
             let scale = 100f64.powi(pct) * 1000f64.powi(permille);
-            if let Some(epos) = sec.find(['E', 'e']) {
+            if let Some(epos) = find_unquoted_exp(sec) {
                 let before = &sec[..epos];
                 let after = &sec[epos + 1..];
                 if after.starts_with('+') || after.starts_with('-') {
@@ -694,9 +821,171 @@ impl FormatSection {
         Self {
             raw,
             color,
+            cond,
+            has_neg_marker,
             dbnum,
             kind,
         }
+    }
+}
+
+fn find_numeric_pattern_span(sec: &str) -> Option<(usize, usize)> {
+    let mut it = sec.char_indices().peekable();
+    let mut start = None;
+    while let Some((idx, c)) = it.next() {
+        match c {
+            '"' => {
+                for (_, c2) in it.by_ref() {
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' | '_' | '*' => {
+                let _ = it.next();
+            }
+            '0' | '#' | '?' => {
+                start = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let start = start?;
+    let mut end = sec.len();
+    for (rel, c) in sec[start..].char_indices() {
+        if !matches!(c, '0' | '#' | '?' | ',' | '.') {
+            end = start + rel;
+            break;
+        }
+    }
+    Some((start, end))
+}
+
+fn find_unquoted_exp(sec: &str) -> Option<usize> {
+    let mut it = sec.char_indices().peekable();
+    while let Some((idx, c)) = it.next() {
+        match c {
+            '"' => {
+                for (_, c2) in it.by_ref() {
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' | '_' | '*' => {
+                let _ = it.next();
+            }
+            'E' | 'e' => {
+                let after = &sec[idx + 1..];
+                if after.starts_with('+') || after.starts_with('-') {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn count_unquoted(sec: &str, needle: char) -> usize {
+    let mut n = 0usize;
+    let mut it = sec.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '"' => {
+                for c2 in it.by_ref() {
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' | '_' | '*' => {
+                let _ = it.next();
+            }
+            x if x == needle => n += 1,
+            _ => {}
+        }
+    }
+    n
+}
+
+fn section_cond(sec: &str) -> Option<SectionCond> {
+    let mut chars = sec.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                for c2 in chars.by_ref() {
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                let _ = chars.next();
+            }
+            '[' => {
+                let mut buf = String::new();
+                for c2 in chars.by_ref() {
+                    if c2 == ']' {
+                        break;
+                    }
+                    buf.push(c2);
+                }
+                let t = buf.trim();
+                let (op, rest) = if let Some(r) = t.strip_prefix(">=") {
+                    (CondOp::Ge, r)
+                } else if let Some(r) = t.strip_prefix("<=") {
+                    (CondOp::Le, r)
+                } else if let Some(r) = t.strip_prefix("<>") {
+                    (CondOp::Ne, r)
+                } else if let Some(r) = t.strip_prefix('>') {
+                    (CondOp::Gt, r)
+                } else if let Some(r) = t.strip_prefix('<') {
+                    (CondOp::Lt, r)
+                } else if let Some(r) = t.strip_prefix('=') {
+                    (CondOp::Eq, r)
+                } else {
+                    continue;
+                };
+                if let Ok(val) = rest.trim().parse::<f64>()
+                    && val.is_finite()
+                {
+                    return Some(SectionCond { op, val });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn select_numeric_section(sections: &[FormatSection], n: f64) -> Option<(&FormatSection, f64, bool)> {
+    let num_len = sections.len().min(3);
+    let num_secs = &sections[..num_len];
+    if num_secs.iter().any(|s| s.cond.is_some()) {
+        for s in num_secs {
+            if s.cond.map_or(true, |c| c.matches(n)) {
+                let neg_cond_handles_sign = matches!(
+                    s.cond,
+                    Some(SectionCond { op: CondOp::Lt | CondOp::Le, val }) if val <= 0.0
+                ) && s.has_neg_marker;
+                let need_minus = n < 0.0 && s.renders_number() && !neg_cond_handles_sign;
+                return Some((s, n.abs(), need_minus));
+            }
+        }
+        return None;
+    }
+    if n < 0.0 {
+        if sections.len() >= 2 {
+            Some((&sections[1], -n, false))
+        } else {
+            Some((&sections[0], -n, sections[0].renders_number()))
+        }
+    } else if n == 0.0 && sections.len() >= 3 {
+        Some((&sections[2], 0.0, false))
+    } else {
+        Some((&sections[0], n, false))
     }
 }
 
@@ -705,6 +994,7 @@ struct NumberSection {
     suffix: String,
     scale: f64,
     dec: usize,
+    min_int: usize,
     thousands: bool,
     trim_trailing_zeros: bool,
     zero_spaces: Option<usize>,
@@ -712,26 +1002,31 @@ struct NumberSection {
 
 impl NumberSection {
     fn from_numeric_pattern(sec: &str) -> Option<Self> {
-        let start = sec.find(['0', '#', '?'])?;
-        let end = sec[start..]
-            .find(|c| !matches!(c, '0' | '#' | '?' | ',' | '.'))
-            .map_or(sec.len(), |i| start + i);
+        let (start, end) = find_numeric_pattern_span(sec)?;
         let pattern = &sec[start..end];
-        let dec_part = pattern.split_once('.').map(|(_, f)| f).unwrap_or("");
+        let pattern_trimmed = pattern.trim_end_matches(',');
+        let mut scale_commas = (pattern.len() - pattern_trimmed.len()) as i32;
+        let (raw_int, dec_part) = match pattern_trimmed.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (pattern_trimmed, ""),
+        };
+        let int_trimmed = raw_int.trim_end_matches(',');
+        scale_commas += (raw_int.len() - int_trimmed.len()) as i32;
         let dec = dec_part.chars().filter(|c| matches!(c, '0' | '#')).count();
-        let int_part = pattern.split('.').next().unwrap_or("");
-        let thousands = int_part.contains(',');
+        let min_int = int_trimmed.chars().filter(|c| *c == '0').count();
+        let thousands = int_trimmed.contains(',');
         let trim_trailing_zeros = !dec_part.is_empty() && dec_part.chars().all(|c| c == '#');
-        let zero_spaces = (!pattern.contains('0'))
-            .then(|| pattern.chars().filter(|c| matches!(c, '0' | '#' | '?')).count());
-        let percent = sec.matches('%').count() as i32;
-        let permille = sec.matches('‰').count() as i32;
-        let scale = 100f64.powi(percent) * 1000f64.powi(permille);
+        let zero_spaces = (!pattern_trimmed.contains('0'))
+            .then(|| pattern_trimmed.chars().filter(|c| matches!(c, '0' | '#' | '?')).count());
+        let percent = count_unquoted(sec, '%') as i32;
+        let permille = count_unquoted(sec, '‰') as i32;
+        let scale = 100f64.powi(percent) * 1000f64.powi(permille) / 1000f64.powi(scale_commas);
         Some(Self {
             prefix: render_literals(&sec[..start]),
             suffix: render_literals(&sec[end..]),
             scale,
             dec,
+            min_int,
             thousands,
             trim_trailing_zeros,
             zero_spaces,
@@ -753,13 +1048,39 @@ impl NumberSection {
             return out;
         }
         let num_start = out.len();
-        if self.thousands {
+        if self.thousands || self.min_int > 1 {
             let mut stack = StackFmt::<64>::new();
-            if write!(stack, "{:.*}", self.dec, a).is_ok() {
-                push_grouped_ascii(&mut out, stack.as_str());
+            let owned;
+            let raw = if write!(stack, "{:.*}", self.dec, a).is_ok() {
+                stack.as_str()
             } else {
-                let s = format!("{:.*}", self.dec, a);
-                push_grouped_ascii(&mut out, &s);
+                owned = format!("{:.*}", self.dec, a);
+                &owned
+            };
+            let (int_part, frac_part) = match raw.split_once('.') {
+                Some((i, f)) => (i, Some(f)),
+                None => (raw, None),
+            };
+            let pad = self.min_int.saturating_sub(int_part.len());
+            if pad > 0 {
+                let mut padded = String::with_capacity(pad + raw.len());
+                for _ in 0..pad {
+                    padded.push('0');
+                }
+                padded.push_str(int_part);
+                if let Some(f) = frac_part {
+                    padded.push('.');
+                    padded.push_str(f);
+                }
+                if self.thousands {
+                    push_grouped_ascii(&mut out, &padded);
+                } else {
+                    out.push_str(&padded);
+                }
+            } else if self.thousands {
+                push_grouped_ascii(&mut out, raw);
+            } else {
+                out.push_str(raw);
             }
         } else {
             let _ = write!(out, "{:.*}", self.dec, a);
@@ -912,6 +1233,10 @@ fn format_sections(fmt: &str) -> std::rc::Rc<[FormatSection]> {
 }
 
 pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
+    format_value_core(v, fmt, true)
+}
+
+fn format_value_core(v: &crate::model::Value, fmt: &str, localize_short_date: bool) -> String {
     use crate::model::Value;
     if fmt.trim().is_empty() || fmt.eq_ignore_ascii_case("general") {
         return match v {
@@ -921,21 +1246,17 @@ pub fn format_value(v: &crate::model::Value, fmt: &str) -> String {
     }
     // Excel 的内建 14 号格式是「系统区域短日期」，不同机器显示不同；
     // 读盘时它被还原成 mm-dd-yy，这里按系统设置换成本机的写法（和 Excel 一致）。
-    let localized = localize_builtin_date(fmt);
+    let localized = if localize_short_date {
+        localize_builtin_date(fmt)
+    } else {
+        None
+    };
     let fmt: &str = localized.as_deref().unwrap_or(fmt);
     let sections = format_sections(fmt);
     match v {
         Value::Number(n) => {
-            let (sec, val, need_minus) = if *n < 0.0 {
-                if sections.len() >= 2 {
-                    (&sections[1], -*n, false)
-                } else {
-                    (&sections[0], -*n, true)
-                }
-            } else if *n == 0.0 && sections.len() >= 3 {
-                (&sections[2], 0.0, false)
-            } else {
-                (&sections[0], *n, false)
+            let Some((sec, val, need_minus)) = select_numeric_section(&sections, *n) else {
+                return general_number(*n);
             };
             let mut out = match &sec.kind {
                 SectionKind::General => general_number(val),
@@ -1052,13 +1373,11 @@ pub fn format_color(v: &crate::model::Value, fmt: &str) -> Option<[u8; 3]> {
     use crate::model::Value;
     if !fmt.contains('[') { return None; }
     let sections = format_sections(fmt);
-    let idx = match v {
-        Value::Number(n) if *n < 0.0 && sections.len() >= 2 => 1,
-        Value::Number(n) if *n == 0.0 && sections.len() >= 3 => 2,
-        Value::Text(_) if sections.len() >= 4 => 3,
-        _ => 0,
-    };
-    sections[idx].color
+    match v {
+        Value::Number(n) => select_numeric_section(&sections, *n).and_then(|(s, _, _)| s.color),
+        Value::Text(_) if sections.len() >= 4 => sections[3].color,
+        _ => sections.first().and_then(|s| s.color),
+    }
 }
 
 fn section_color(sec: &str) -> Option<[u8; 3]> {

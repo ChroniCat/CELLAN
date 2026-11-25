@@ -291,8 +291,10 @@ fn filtered_copy_compacts_visible_rows_and_paste_skips_filtered_rows() {
     app.sel_end = (0, 3);
     app.clip_paste(false, None);
     assert_eq!(app.wb.sheets[0].value(0, 3), Value::Text("R0".into()));
-    assert_eq!(app.wb.sheets[0].value(1, 3), Value::Text("R2".into()));
-    assert_eq!(app.wb.sheets[0].value(2, 3), Value::Text("R3".into()));
+    // P0 #27: 筛选态下粘贴跳过隐藏行，绝不暗中覆写隐藏行 (1, 3)。
+    assert_eq!(app.wb.sheets[0].value(1, 3), Value::Empty);
+    assert_eq!(app.wb.sheets[0].value(2, 3), Value::Text("R2".into()));
+    assert_eq!(app.wb.sheets[0].value(3, 3), Value::Text("R3".into()));
 
     // 用户手动隐藏的行（hidden_rows_user）在 Excel 中仍会被复制；不能被筛选逻辑误伤。
     app.wb.sheet_mut(0).hidden_rows.clear();
@@ -641,19 +643,32 @@ fn cross_sheet_cut_undo_restores_both_sides_styles_and_dependencies() {
     app.sheet_idx = 1;
     app.clip_paste(false, None);
     assert_eq!(app.wb.sheets[0].value(0, 0), Value::Empty);
-    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(1.0));
+    // P0 #22: 跨表剪切遵循 Excel 语义，原表指向被剪切格的公式自动改写到目标表。
+    assert_eq!(
+        app.wb.sheets[0].get(0, 2).unwrap().formula.as_deref(),
+        Some("=Other!A1+1")
+    );
+    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(2.0));
     assert_eq!(app.wb.sheets[0].style_of(0, 0), 0);
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(1.0));
     assert_eq!(app.wb.sheets[1].style_of(0, 0), bold);
     app.do_undo(false);
     assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(1.0));
+    assert_eq!(
+        app.wb.sheets[0].get(0, 2).unwrap().formula.as_deref(),
+        Some("=A1+1")
+    );
     assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(2.0));
     assert_eq!(app.wb.sheets[0].style_of(0, 0), bold);
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(8.0));
     assert_eq!(app.wb.sheets[1].style_of(0, 0), 0);
     app.do_undo(true);
     assert_eq!(app.wb.sheets[0].value(0, 0), Value::Empty);
-    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(1.0));
+    assert_eq!(
+        app.wb.sheets[0].get(0, 2).unwrap().formula.as_deref(),
+        Some("=Other!A1+1")
+    );
+    assert_eq!(app.wb.sheets[0].value(0, 2), Value::Number(2.0));
     assert_eq!(app.wb.sheets[1].value(0, 0), Value::Number(1.0));
 }
 
@@ -11414,13 +11429,25 @@ fn filtered_cut_tracks_source_rows_for_formulas_clearing_and_undo() {
     assert_eq!(sh.value(1, 0), Value::Text("keep A2".into()));
     assert_eq!(sh.value(10, 1), Value::Text("hidden".into()));
     assert!(sh.get(9, 1).is_none() && sh.get(11, 1).is_none());
-    assert_eq!(sh.get(19, 3).unwrap().formula.as_deref(), Some("=C20"));
-    assert_eq!(sh.get(20, 3).unwrap().formula.as_deref(), Some("=C21"));
+    // P0 #22: 剪切不平移指向剪切源外部格子的相对引用（Excel 剪切语义）。
+    assert_eq!(sh.get(19, 3).unwrap().formula.as_deref(), Some("=A10"));
+    assert_eq!(sh.get(20, 3).unwrap().formula.as_deref(), Some("=A12"));
     app.do_undo(false);
     let sh = app.wb.sheet(0);
     assert_eq!(sh.get(9, 1).unwrap().formula.as_deref(), Some("=A10"));
     assert_eq!(sh.get(11, 1).unwrap().formula.as_deref(), Some("=A12"));
     assert!(sh.get(19, 3).is_none() && sh.get(20, 3).is_none());
+    // 同样的筛选选区执行复制时，应按每行原始 source_row 精确平移公式引用。
+    app.sel = (9, 1);
+    app.sel_end = (11, 1);
+    app.clip_copy(false, &ctx);
+    let from_windows_copy = app.clip_stamp.as_ref().unwrap().replace('\n', "\r\n");
+    app.sel = (19, 3);
+    app.sel_end = app.sel;
+    app.clip_paste(false, Some(from_windows_copy));
+    let sh = app.wb.sheet(0);
+    assert_eq!(sh.get(19, 3).unwrap().formula.as_deref(), Some("=C20"));
+    assert_eq!(sh.get(20, 3).unwrap().formula.as_deref(), Some("=C21"));
 }
 
 #[test]

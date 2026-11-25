@@ -112,7 +112,7 @@ pub fn consolidate(
             vals: vec![vec![Vec::new(); cols as usize]; rows as usize],
         };
         for i in 0..rows {
-            let lbl = if row_labels {
+            let lbl = if col_labels {
                 sh.value(dr + i, c1).display()
             } else {
                 format!("第{}行", i + 1)
@@ -121,7 +121,7 @@ pub fn consolidate(
             g.row_labels.push(lbl);
         }
         for j in 0..cols {
-            let lbl = if col_labels {
+            let lbl = if row_labels {
                 sh.value(r1, dc + j).display()
             } else {
                 format!("第{}列", j + 1)
@@ -161,14 +161,17 @@ pub fn consolidate(
         return Err("合并计算结果矩阵超过 50 万单元格上限".into());
     }
     // 写结果：左上角标签 + 表头 + 数据
+    // 参数语义（与 UI 复选框一致）：
+    // - `row_labels`: 首行作为列标签
+    // - `col_labels`: 最左列作为行标签
     let (ar, ac) = at;
     let out = wb.sheet_mut(target_sheet);
-    if col_labels {
+    if row_labels {
         out.set(
             ar,
             ac,
             Cell {
-                value: Value::Text(if row_labels { "汇总" } else { "" }.into()),
+                value: Value::Text(if col_labels { "汇总" } else { "" }.into()),
                 formula: None,
             },
         );
@@ -185,7 +188,7 @@ pub fn consolidate(
     }
     for (i, r) in rows.iter().enumerate() {
         let rr = ar + 1 + i as u32;
-        if row_labels {
+        if col_labels {
             out.set(
                 rr,
                 ac,

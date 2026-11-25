@@ -869,6 +869,54 @@ impl Chart {
     }
 }
 
+/// 按当前工作簿最新单元格数据刷新图表系列值/分类/名称（仅对带有引用公式的系列生效，保留无引用的纯缓存图表）。
+pub fn refresh_chart_from_sheets(
+    chart: &mut Chart,
+    sheets: &[Sheet],
+    default_sheet_idx: usize,
+    styles: Option<&crate::style::StyleTable>,
+    sys: crate::model::DateSystem,
+) {
+    let sheet_for = |r: &str| -> Option<&Sheet> {
+        if let Some((prefix, _)) = r.rsplit_once('!') {
+            let name = prefix.trim().trim_matches('\'').replace("''", "'");
+            sheets
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(&name))
+                .or_else(|| sheets.get(default_sheet_idx))
+        } else {
+            sheets.get(default_sheet_idx)
+        }
+    };
+    for s in chart.series.iter_mut() {
+        if !s.name_ref.is_empty()
+            && let Some(sh) = sheet_for(&s.name_ref)
+            && let Some(cells) = read_ref_in(sh, &s.name_ref, styles, sys)
+            && let Some((_, v)) = cells.first()
+        {
+            s.name = v.clone();
+        }
+        if !s.cat_ref.is_empty()
+            && let Some(sh) = sheet_for(&s.cat_ref)
+        {
+            if let Some(cells) = read_ref_in(sh, &s.cat_ref, styles, sys) {
+                s.cats = cells.iter().map(|(_, v)| v.clone()).collect();
+            }
+            if matches!(s.kind.unwrap_or(chart.kind), ChartKind::Scatter)
+                && let Some(nums) = read_ref_numbers(sh, &s.cat_ref)
+            {
+                s.xv = nums.into_iter().map(|(_, v)| v).collect();
+            }
+        }
+        if !s.val_ref.is_empty()
+            && let Some(sh) = sheet_for(&s.val_ref)
+            && let Some(cells) = read_ref_numbers(sh, &s.val_ref)
+        {
+            s.vals = cells.into_iter().map(|(_, v)| v).collect();
+        }
+    }
+}
+
 /// 用表里的实际值回填（图表只写了区间引用、没有缓存值的时候）
 pub fn resolve_series(chart: &mut Chart, sheet: &Sheet) {
     resolve_series_in(chart, sheet, None, crate::model::DateSystem::D1900)

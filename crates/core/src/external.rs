@@ -754,7 +754,7 @@ pub fn import_csv_opts(
 }
 
 #[inline]
-fn fast_parse_csv_number(t: &str) -> Option<f64> {
+fn fast_parse_csv_number(t: &str, was_quoted: bool) -> Option<f64> {
     let bytes = t.as_bytes();
     if bytes.is_empty() {
         return None;
@@ -767,7 +767,12 @@ fn fast_parse_csv_number(t: &str) -> Option<f64> {
     if digits.is_empty() {
         return None;
     }
-    if digits.len() <= 15 && digits.iter().all(|b| b.is_ascii_digit()) {
+    if digits.iter().all(|b| b.is_ascii_digit()) {
+        // 超过 15 位纯整数（如 18 位身份证号/银行卡号）转 f64 会静默截断末尾精度，必须保留文本；
+        // 带引号的前导零编码（如 "00123"）同样保留文本。
+        if digits.len() > 15 || (was_quoted && digits.len() > 1 && digits[0] == b'0') {
+            return None;
+        }
         let mut acc: u64 = 0;
         for &b in digits {
             acc = acc * 10 + u64::from(b - b'0');
@@ -850,13 +855,12 @@ fn parse_csv_slice_chunk<'a>(
             let t = raw.trim();
             if t.is_empty() {
                 Cell::default()
-            } else if let Some(n) = fast_parse_csv_number(t) {
+            } else if let Some(n) = fast_parse_csv_number(t, was_quoted) {
                 Cell {
                     value: Value::Number(n),
                     formula: None,
                 }
             } else {
-                let _ = was_quoted;
                 Cell {
                     value: text_value(t),
                     formula: None,
@@ -1286,7 +1290,7 @@ fn parse_field(f: &str) -> Cell {
     if t.is_empty() {
         return Cell::default();
     }
-    if let Some(n) = fast_parse_csv_number(t) {
+    if let Some(n) = fast_parse_csv_number(t, false) {
         return Cell { value: Value::Number(n), formula: None };
     }
     Cell { value: Value::Text(t.into()), formula: None }

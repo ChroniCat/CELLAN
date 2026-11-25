@@ -238,6 +238,8 @@ pub struct IconMark {
     pub levels: u8,
     /// 0 = 最低档
     pub idx: u8,
+    /// false 时仅显示图标、隐藏单元格文本（对应 OOXML iconSet showValue="0"）
+    pub show_value: bool,
 }
 
 impl IconMark {
@@ -1425,7 +1427,7 @@ impl<'a> RowRules<'a> {
                         }
                     }
                 }
-                CfKind::IconSet { set, reverse, thresholds, .. } => {
+                CfKind::IconSet { set, reverse, thresholds, show_value } => {
                     if let (Value::Number(v), Some((min, max))) = (&raw, stats.ranges.get(&bi)) {
                         let (min, max) = (*min, *max);
                         if let Some((style, levels)) = IconMark::from_set(set) {
@@ -1452,6 +1454,7 @@ impl<'a> RowRules<'a> {
                                 style,
                                 levels,
                                 idx: idx.min(levels.saturating_sub(1)),
+                                show_value: *show_value,
                             });
                         }
                     }

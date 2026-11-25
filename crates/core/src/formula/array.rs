@@ -45,11 +45,23 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
             let min = opt_num(args, 2, 0.0)?;
             let max = opt_num(args, 3, 1.0)?;
             let whole = args.get(4).map(|a| a.first().to_bool().unwrap_or(false)).unwrap_or(false);
+            if min > max {
+                return Err(ErrKind::Value);
+            }
             let mut data = Vec::with_capacity(rows * cols);
             for _ in 0..rows * cols {
                 let t = pseudo_random();
-                let x = min + (max - min) * t;
-                data.push(FValue::number(if whole { x.floor() } else { x }));
+                let val = if whole {
+                    let lo = min.ceil();
+                    let hi = max.floor();
+                    if lo > hi {
+                        return Err(ErrKind::Value);
+                    }
+                    (lo + ((hi - lo + 1.0) * t).floor()).min(hi)
+                } else {
+                    min + (max - min) * t
+                };
+                data.push(FValue::number(val));
             }
             Ok(arr(Array::new(rows, cols, data)))
         }),
@@ -399,20 +411,44 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
         "TOROW" | "TOCOL" => r(|| {
             let first_arg = args.first().ok_or(ErrKind::Value)?;
             let (rows, cols, data) = first_arg.grid_slice();
-            if name == "TOCOL" {
-                let mut v = Vec::with_capacity(rows * cols);
+            let ignore = if args.len() > 1 { int_arg(args, 1)? } else { 0 };
+            let scan_by_col = args
+                .get(2)
+                .map(|a| a.first().to_bool().unwrap_or(false))
+                .unwrap_or(false);
+            let keep = |v: &FValue| -> bool {
+                match ignore {
+                    1 => !matches!(v, FValue::Empty),
+                    2 => !v.is_error(),
+                    3 => !matches!(v, FValue::Empty) && !v.is_error(),
+                    _ => true,
+                }
+            };
+            let mut v = Vec::with_capacity(rows * cols);
+            if scan_by_col {
                 for c in 0..cols {
                     for r0 in 0..rows {
-                        v.push(data[r0 * cols + c].clone());
+                        let item = &data[r0 * cols + c];
+                        if keep(item) {
+                            v.push(item.clone());
+                        }
                     }
                 }
-                Ok(arr(Array::new(rows * cols, 1, v)))
             } else {
-                match first_arg {
-                    Arg::Range { values, .. } => Ok(arr(Array::from_shared(1, rows * cols, values.clone()))),
-                    Arg::Val(FValue::Array(a)) => Ok(arr(Array::from_shared(1, rows * cols, a.data.clone()))),
-                    _ => Ok(arr(Array::new(1, rows * cols, data.into_owned()))),
+                for item in data.iter() {
+                    if keep(item) {
+                        v.push(item.clone());
+                    }
                 }
+            }
+            if v.is_empty() {
+                return Err(ErrKind::Value);
+            }
+            let len = v.len();
+            if name == "TOCOL" {
+                Ok(arr(Array::new(len, 1, v)))
+            } else {
+                Ok(arr(Array::new(1, len, v)))
             }
         }),
         "EXPAND" => r(|| {

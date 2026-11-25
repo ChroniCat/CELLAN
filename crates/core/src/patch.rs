@@ -629,10 +629,10 @@ pub fn strip_cf(xml: &str) -> String {
 
 /// 把条件格式块插到 worksheet 里正确的位置（mergeCells 之后、dataValidations 之前）
 pub fn insert_cf(xml: &str, blocks_xml: &str) -> String {
-    if blocks_xml.is_empty() {
-        return xml.to_string();
-    }
     let xml = strip_cf(xml);
+    if blocks_xml.is_empty() {
+        return xml;
+    }
     const ANCHORS: [&str; 10] = [
         "<dataValidations",
         "<hyperlinks",
@@ -839,8 +839,17 @@ pub fn dv_xml(list: &[crate::dv::DataValidation]) -> String {
             out.push_str(&format!(" prompt=\"{}\"", esc(&d.prompt_msg)));
         }
         let f1 = match d.kind {
-            DvKind::List if !d.f1.trim_start().starts_with('"') && !d.f1.contains('!') && !d.f1.contains(':') => {
-                format!("\"{}\"", d.f1)
+            DvKind::List => {
+                let t = d.f1.trim();
+                let is_formula_or_ref = t.starts_with('"')
+                    || t.starts_with('=')
+                    || t.contains('!')
+                    || t.contains(':');
+                if !is_formula_or_ref && (t.contains(',') || t.contains('，')) {
+                    format!("\"{}\"", t.replace('，', ","))
+                } else {
+                    d.f1.clone()
+                }
             }
             _ => d.f1.clone(),
         };
@@ -1144,7 +1153,17 @@ pub fn auto_filter_xml_with_dxfs(
             continue;
         }
         if let Some(crit) = f.criteria.get(&col) {
-            // 条件筛选：介于写成两条 and="1"
+            // 条件筛选：介于写成两条 and="1"；文本筛选使用 OOXML 标准 equal/notEqual + 通配符
+            let esc_wild = |s: &str| -> String {
+                let mut out = String::with_capacity(s.len());
+                for ch in s.chars() {
+                    if matches!(ch, '~' | '*' | '?') {
+                        out.push('~');
+                    }
+                    out.push(ch);
+                }
+                out
+            };
             out.push_str(&format!(
                 "<filterColumn colId=\"{col_id}\"><customFilters and=\"1\">"
             ));
@@ -1158,6 +1177,34 @@ pub fn auto_filter_xml_with_dxfs(
                     out.push_str(&format!(
                         "<customFilter operator=\"lessThanOrEqual\" val=\"{}\"/>",
                         esc(&hi)
+                    ));
+                }
+                crate::sort_filter::CmpOp::Contains => {
+                    let pat = format!("*{}*", esc_wild(&crit.val));
+                    out.push_str(&format!(
+                        "<customFilter operator=\"equal\" val=\"{}\"/>",
+                        esc(&pat)
+                    ));
+                }
+                crate::sort_filter::CmpOp::NotContains => {
+                    let pat = format!("*{}*", esc_wild(&crit.val));
+                    out.push_str(&format!(
+                        "<customFilter operator=\"notEqual\" val=\"{}\"/>",
+                        esc(&pat)
+                    ));
+                }
+                crate::sort_filter::CmpOp::Begins => {
+                    let pat = format!("{}*", esc_wild(&crit.val));
+                    out.push_str(&format!(
+                        "<customFilter operator=\"equal\" val=\"{}\"/>",
+                        esc(&pat)
+                    ));
+                }
+                crate::sort_filter::CmpOp::Ends => {
+                    let pat = format!("*{}", esc_wild(&crit.val));
+                    out.push_str(&format!(
+                        "<customFilter operator=\"equal\" val=\"{}\"/>",
+                        esc(&pat)
                     ));
                 }
                 op => out.push_str(&format!(
@@ -1633,15 +1680,34 @@ pub fn set_page_xml(xml: &str, ps: &crate::page::PageSetup) -> String {
         }
         body.push_str("</headerFooter>");
     }
-    if let Some(i) = x.find("</worksheet>") {
-        let mut out = String::with_capacity(x.len() + body.len());
-        out.push_str(&x[..i]);
-        out.push_str(&body);
-        out.push_str(&x[i..]);
-        return out;
-    }
-    x.push_str(&body);
-    x
+    const AFTER_PAGE: [&str; 16] = [
+        "<rowBreaks",
+        "<colBreaks",
+        "<customProperties",
+        "<cellWatches",
+        "<ignoredErrors",
+        "<smartTags",
+        "<drawing",
+        "<legacyDrawing",
+        "<drawingHF",
+        "<picture",
+        "<oleObjects",
+        "<controls",
+        "<webPublishItems",
+        "<tableParts",
+        "<extLst",
+        "</worksheet>",
+    ];
+    let at = AFTER_PAGE
+        .iter()
+        .filter_map(|m| x.find(m))
+        .min()
+        .unwrap_or(x.len());
+    let mut out = String::with_capacity(x.len() + body.len());
+    out.push_str(&x[..at]);
+    out.push_str(&body);
+    out.push_str(&x[at..]);
+    out
 }
 
 /// 更新 workbook.xml 里某张表的 Print_Area / Print_Titles
@@ -3096,11 +3162,33 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
         .unwrap_or(x.len());
     x.insert_str(at, &block);
     if !breaks.is_empty() {
-        // schema：rowBreaks/colBreaks 在 headerFooter 之后
+        // schema：rowBreaks/colBreaks 在 headerFooter 之后、customProperties/drawing/tableParts/extLst 之前
+        const AFTER_BREAKS: [&str; 14] = [
+            "<customProperties",
+            "<cellWatches",
+            "<ignoredErrors",
+            "<smartTags",
+            "<drawing",
+            "<legacyDrawing",
+            "<drawingHF",
+            "<picture",
+            "<oleObjects",
+            "<controls",
+            "<webPublishItems",
+            "<tableParts",
+            "<extLst",
+            "</worksheet>",
+        ];
         let after = x
             .find("</headerFooter>")
             .map(|e| e + "</headerFooter>".len())
-            .unwrap_or_else(|| x.find("</worksheet>").unwrap_or(x.len()));
+            .unwrap_or_else(|| {
+                AFTER_BREAKS
+                    .iter()
+                    .filter_map(|m| x.find(m))
+                    .min()
+                    .unwrap_or(x.len())
+            });
         x.insert_str(after, &breaks);
     }
     x
@@ -3635,7 +3723,7 @@ pub fn set_calc_iteration(xml: &str, iterate: bool, max_iterations: u32, max_cha
         ));
     }
     tag.push_str(if calc.self_closing { "/>" } else { ">" });
-    format!("{}{}{}", &xml[..calc.start], tag, &xml[calc.end..])
+    format!("{}{}{}", &xml[..calc.start], tag, &xml[calc.end + 1..])
 }
 
 fn fmt_change(v: f64) -> String {

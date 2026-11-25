@@ -463,14 +463,9 @@ impl SheetApp {
         if let Some(name) = action.strip_prefix("InsertFn:") {
             let name = name.to_string();
             if self.editing.is_none() {
-                self.begin_edit(None);
-            }
-            if let Some(ed) = self.editing.as_mut() {
-                if !ed.buf.starts_with('=') {
-                    ed.buf.insert(0, '=');
-                }
-                ed.buf.push_str(&name);
-                ed.buf.push('(');
+                self.begin_edit(Some(format!("={name}(")));
+            } else {
+                self.insert_formula_at_caret(&format!("{name}("));
             }
             return;
         }
@@ -763,9 +758,9 @@ impl SheetApp {
             }
             "ConditionalFormatting" => self.cf_mgr = true,
             "FormatAsTable" => self.make_table(),
-            "CellStyles" => self.fmt_dlg = true,
+            "CellStyles" => self.open_format_dialog(),
             "FormatDialogLauncher" => self.fmt_pending = true,
-            "FormatCellsDialog" => self.fmt_dlg = true,
+            "FormatCellsDialog" => self.open_format_dialog(),
             "InsertRow" => {
                 let (r1, _c1, r2, _c2) = self.sel_rect();
                 self.structural(sheetcore::structural::Structural::InsertRows {
@@ -1187,16 +1182,7 @@ impl SheetApp {
                     size: 0.0,
                 });
             }
-            "ProtectSheet" => {
-                if self.wb.sheet(self.sheet_idx).protection.is_some() {
-                    self.protect_dlg = Some(crate::ProtectDlg {
-                        unprotect: true,
-                        ..Default::default()
-                    });
-                } else {
-                    self.protect_dlg = Some(crate::ProtectDlg::default());
-                }
-            }
+            "ProtectSheet" => self.open_protect_sheet_dialog(),
             "TrackChanges" => self.rev_open = true,
             // 审阅：显示更改（复用修订日志）、批注导航、辅助功能检查器
             "ShowChanges" => {

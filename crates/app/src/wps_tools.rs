@@ -129,16 +129,25 @@ impl SheetApp {
         if self.edit_blocked() {
             return;
         }
+        if self.prot_denied(sheetcore::protection::ProtOp::AutoFilter, "使用自动筛选") {
+            return;
+        }
         let (r, c) = self.sel;
-        let val_text = {
+        let (val_text, disp_text) = {
             let sh = self.wb.sheet(self.sheet_idx);
             let cell = sh.get(r, c);
             match cell {
                 Some(cell) => {
+                    let raw = cell.value.display();
                     let st = self.wb.styles.get(sh.style_of(r, c));
-                    sheetcore::style::format_value_in(self.wb.date_system, &cell.value, &st.format)
+                    let disp = sheetcore::style::format_value_in(
+                        self.wb.date_system,
+                        &cell.value,
+                        &st.format,
+                    );
+                    (raw, disp)
                 }
-                None => String::new(),
+                None => (String::new(), String::new()),
             }
         };
         let sh = self.wb.sheet_mut(self.sheet_idx);
@@ -150,18 +159,25 @@ impl SheetApp {
             }
             sh.filter = Some(sheetcore::sort_filter::Filter::new(reg.0, reg.1, reg.2, reg.3));
         }
-        if let Some(f) = self.wb.sheet_mut(self.sheet_idx).filter.as_mut() {
+        if let Some(f) = sh.filter.as_mut() {
             if c >= f.range.1 && c <= f.range.3 {
                 f.criteria.remove(&c);
+                f.date_groups.remove(&c);
+                f.color_filters.remove(&c);
                 let mut set = std::collections::HashSet::new();
                 set.insert(val_text.clone());
                 f.allows.insert(c, set);
+                sh.filter_dirty = true;
             }
         }
         self.recalc_filter_hidden();
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
-        let disp = if val_text.is_empty() { "(空白)" } else { val_text.as_str() };
+        let disp = if disp_text.is_empty() {
+            "(空白)"
+        } else {
+            disp_text.as_str()
+        };
         self.status = format!("已按所选值 \"{disp}\" 筛选");
     }
 
@@ -178,6 +194,9 @@ impl SheetApp {
 
     /// 选中行自动调整行高（批量：单遍稀疏区域扫描 + 字号单行缓存 + 单次 `rows.set_many` 重建 + Undo）
     pub(crate) fn autofit_sel_rows(&mut self, ctx: &egui::Context) {
+        if self.prot_denied(sheetcore::protection::ProtOp::FormatRows, "调整行高") {
+            return;
+        }
         let (r1, _, mut r2, _) = self.sel_rect();
         if r2 - r1 > 2_000 {
             if let Some((_, _, ur2, _)) = self.wb.sheet(self.sheet_idx).used_bounds() {
@@ -205,6 +224,9 @@ impl SheetApp {
 
     /// 选中列自动调整列宽（批量：共享二分 `MergeIndex` + O(1) 数值格式宽度上界粗筛 + 并行扫描 + Undo）
     pub(crate) fn autofit_sel_cols(&mut self, ctx: &egui::Context) {
+        if self.prot_denied(sheetcore::protection::ProtOp::FormatColumns, "调整列宽") {
+            return;
+        }
         let (_, c1, _, mut c2) = self.sel_rect();
         if c2 - c1 > 500 {
             if let Some((_, _, _, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {

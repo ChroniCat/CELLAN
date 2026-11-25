@@ -1060,7 +1060,7 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
         let mut es = Vec::new();
         es.extend_from_slice(&w16(externs.entries.len() as u16));
         for (sup, first, last) in externs.entries.iter() {
-            es.extend_from_slice(&w16(*sup));
+            es.extend_from_slice(&w16(externs.resolved_supbook(*sup)));
             es.extend_from_slice(&w16(*first));
             es.extend_from_slice(&w16(*last));
         }

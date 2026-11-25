@@ -401,7 +401,7 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                         }
                     }
                 } else if name.ends_with("customFilter") {
-                    // <customFilter operator="contains" val="张"/>；Between 在 Excel 里是两条 and="1"
+                    // OOXML 标准：文本筛选使用 equal/notEqual + *通配符；Between 为 Ge + Le 两条 and="1"
                     if let (Some(col), Some(range)) = (cur_col, af_range) {
                         let mut op_s = String::new();
                         let mut val = String::new();
@@ -415,9 +415,89 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                             }
                         }
                         let key = range.1 + col;
-                        if let Some(op) = crate::sort_filter::CmpOp::from_xml(&op_s) {
+                        let op_key = if op_s.is_empty() { "equal" } else { op_s.as_str() };
+                        if let Some(raw_op) = crate::sort_filter::CmpOp::from_xml(op_key) {
+                            let unesc_wild = |s: &str| -> String {
+                                let mut out = String::with_capacity(s.len());
+                                let mut chars = s.chars();
+                                while let Some(ch) = chars.next() {
+                                    if ch == '~' {
+                                        if let Some(next) = chars.next() {
+                                            out.push(next);
+                                        }
+                                    } else {
+                                        out.push(ch);
+                                    }
+                                }
+                                out
+                            };
+                            let trailing_unescaped_star = |s: &str| -> bool {
+                                if !s.ends_with('*') {
+                                    return false;
+                                }
+                                let tilde_run = s[..s.len() - 1]
+                                    .chars()
+                                    .rev()
+                                    .take_while(|&c| c == '~')
+                                    .count();
+                                tilde_run % 2 == 0
+                            };
+                            let (op, val) = match raw_op {
+                                crate::sort_filter::CmpOp::Eq => {
+                                    let lead = val.starts_with('*');
+                                    let trail = trailing_unescaped_star(&val);
+                                    if lead && trail && val.len() >= 2 {
+                                        (
+                                            crate::sort_filter::CmpOp::Contains,
+                                            unesc_wild(&val[1..val.len() - 1]),
+                                        )
+                                    } else if trail && val.len() >= 1 {
+                                        (
+                                            crate::sort_filter::CmpOp::Begins,
+                                            unesc_wild(&val[..val.len() - 1]),
+                                        )
+                                    } else if lead && val.len() >= 1 {
+                                        (
+                                            crate::sort_filter::CmpOp::Ends,
+                                            unesc_wild(&val[1..]),
+                                        )
+                                    } else {
+                                        (raw_op, val)
+                                    }
+                                }
+                                crate::sort_filter::CmpOp::Ne => {
+                                    let lead = val.starts_with('*');
+                                    let trail = trailing_unescaped_star(&val);
+                                    if lead && trail && val.len() >= 2 {
+                                        (
+                                            crate::sort_filter::CmpOp::NotContains,
+                                            unesc_wild(&val[1..val.len() - 1]),
+                                        )
+                                    } else {
+                                        (raw_op, val)
+                                    }
+                                }
+                                _ => (raw_op, val),
+                            };
                             match af_criteria.get_mut(&key) {
-                                // 第二条 between 的上界
+                                // 第二条 between 的上界（标准 OOXML: greaterThanOrEqual + lessThanOrEqual）
+                                Some(c)
+                                    if c.op == crate::sort_filter::CmpOp::Ge
+                                        && op == crate::sort_filter::CmpOp::Le
+                                        && c.val2.is_none() =>
+                                {
+                                    c.op = crate::sort_filter::CmpOp::Between;
+                                    c.val2 = Some(val);
+                                }
+                                Some(c)
+                                    if c.op == crate::sort_filter::CmpOp::Le
+                                        && op == crate::sort_filter::CmpOp::Ge
+                                        && c.val2.is_none() =>
+                                {
+                                    let hi = std::mem::replace(&mut c.val, val);
+                                    c.op = crate::sort_filter::CmpOp::Between;
+                                    c.val2 = Some(hi);
+                                }
                                 Some(c)
                                     if c.op == crate::sort_filter::CmpOp::Between
                                         && c.val2.is_none() =>

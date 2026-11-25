@@ -1133,7 +1133,13 @@ impl SheetApp {
             return;
         };
         let (_, sc1, _, sc2) = clip.rect;
-        let rows = if clip.deferred.is_some() { clip.rect.2 - clip.rect.0 + 1 } else { clip.cells.len() as u32 };
+        let rows = if let Some(ref sr) = clip.source_rows {
+            sr.len() as u32
+        } else if clip.deferred.is_some() {
+            clip.rect.2 - clip.rect.0 + 1
+        } else {
+            clip.cells.len() as u32
+        };
         if rows == 0 { return; }
         let cols = sc2 - sc1 + 1;
         if (rows as u64) * (cols as u64) > 200_000 {

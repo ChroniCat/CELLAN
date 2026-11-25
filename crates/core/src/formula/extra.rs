@@ -439,7 +439,8 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
                 return Err(ErrKind::Div0);
             }
             let m = v.iter().sum::<f64>() / n;
-            let s = (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / n).sqrt();
+            let denom = if name == "SKEW" { n - 1.0 } else { n };
+            let s = (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / denom).sqrt();
             if s == 0.0 {
                 return Err(ErrKind::Div0);
             }
@@ -457,7 +458,7 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
                 return Err(ErrKind::Div0);
             }
             let m = v.iter().sum::<f64>() / n;
-            let s = (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / n).sqrt();
+            let s = (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
             if s == 0.0 {
                 return Err(ErrKind::Div0);
             }
@@ -472,20 +473,24 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
             let pairs = super::functions::criteria_pairs(&args[1..]);
             let mut best: Option<f64> = None;
             for (i, v) in target.iter().enumerate() {
-                if !pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches_coerced(x))) {
+                if !pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches(x))) {
                     continue;
                 }
-                if let Ok(n) = v.to_number() {
-                    best = Some(match best {
-                        None => n,
-                        Some(b) => {
-                            if name == "MINIFS" {
-                                b.min(n)
-                            } else {
-                                b.max(n)
+                match v {
+                    FValue::Error(e) => return Err(*e),
+                    FValue::Number(n) => {
+                        best = Some(match best {
+                            None => *n,
+                            Some(b) => {
+                                if name == "MINIFS" {
+                                    b.min(*n)
+                                } else {
+                                    b.max(*n)
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
+                    _ => {}
                 }
             }
             match best {
@@ -621,6 +626,11 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
         "IRR" => r(|| {
             let flows = args.first().ok_or(ErrKind::Value)?.numbers()?;
             let guess = opt_num(args, 1, 0.1)?;
+            let has_pos = flows.iter().any(|&v| v > 0.0);
+            let has_neg = flows.iter().any(|&v| v < 0.0);
+            if !has_pos || !has_neg {
+                return Err(ErrKind::Num);
+            }
             let f = |rate: f64| -> f64 {
                 flows
                     .iter()
@@ -628,7 +638,15 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
                     .map(|(i, v)| v / (1.0 + rate).powi(i as i32))
                     .sum()
             };
-            Ok(FValue::number(dist::invert(f, 0.0, -0.9999, 10.0).max(-0.9999)))
+            let df = |rate: f64| -> f64 {
+                flows
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .map(|(i, v)| -(i as f64) * v / (1.0 + rate).powi(i as i32 + 1))
+                    .sum()
+            };
+            solve_financial_root(f, df, guess).map(FValue::number)
         }),
         "MIRR" => r(|| {
             let flows = args.first().ok_or(ErrKind::Value)?.numbers()?;
@@ -669,7 +687,13 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
         "XIRR" => r(|| {
             let flows = args.get(0).ok_or(ErrKind::Value)?.numbers()?;
             let dates = args.get(1).ok_or(ErrKind::Value)?.numbers()?;
+            let guess = opt_num(args, 2, 0.1)?;
             if flows.len() != dates.len() || flows.is_empty() {
+                return Err(ErrKind::Num);
+            }
+            let has_pos = flows.iter().any(|&v| v > 0.0);
+            let has_neg = flows.iter().any(|&v| v < 0.0);
+            if !has_pos || !has_neg {
                 return Err(ErrKind::Num);
             }
             let d0 = dates[0];
@@ -680,7 +704,17 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
                     .map(|(i, v)| v / (1.0 + rate).powf((dates[i] - d0) / 365.0))
                     .sum()
             };
-            Ok(FValue::number(dist::invert(f, 0.0, -0.9999, 10.0)))
+            let df = |rate: f64| -> f64 {
+                flows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let t = (dates[i] - d0) / 365.0;
+                        -t * v / (1.0 + rate).powf(t + 1.0)
+                    })
+                    .sum()
+            };
+            solve_financial_root(f, df, guess).map(FValue::number)
         }),
         "RATE" => r(|| {
             let nper = num(args, 0)?;
@@ -689,15 +723,21 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
             let fv_ = opt_num(args, 3, 0.0)?;
             let t = opt_num(args, 4, 0.0)?;
             let guess = opt_num(args, 5, 0.1)?;
+            if nper <= 0.0 {
+                return Err(ErrKind::Num);
+            }
             let f = |rate: f64| -> f64 {
-                if rate == 0.0 {
+                if rate.abs() < 1e-12 {
                     return pv + pmt_v * nper + fv_;
                 }
                 let p = (1.0 + rate).powf(nper);
                 pv * p + pmt_v * (1.0 + rate * t) * (p - 1.0) / rate + fv_
             };
-            let lo = (-0.9999f64).max(guess - 1.0);
-            Ok(FValue::number(dist::invert(f, 0.0, lo, guess.max(1.0) + 1.0)))
+            let df = |rate: f64| -> f64 {
+                let h = 1e-7;
+                (f(rate + h) - f(rate - h)) / (2.0 * h)
+            };
+            solve_financial_root(f, df, guess).map(FValue::number)
         }),
         "EFFECT" => r(|| {
             let nominal = num(args, 0)?;
@@ -819,22 +859,30 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
         "DOLLARDE" => r(|| {
             let frac = num(args, 0)?;
             let denom = int_arg(args, 1)?;
-            if denom <= 0 {
+            if denom < 0 {
+                return Err(ErrKind::Num);
+            }
+            if denom == 0 {
                 return Err(ErrKind::Div0);
             }
             let int_part = frac.trunc();
             let frac_part = frac - int_part;
-            Ok(FValue::number(int_part + frac_part * 100.0 / denom as f64))
+            let base = 10f64.powi((denom as f64).log10().ceil().max(1.0) as i32);
+            Ok(FValue::number(int_part + frac_part * base / denom as f64))
         }),
         "DOLLARFR" => r(|| {
             let dec = num(args, 0)?;
             let denom = int_arg(args, 1)?;
-            if denom <= 0 {
+            if denom < 0 {
+                return Err(ErrKind::Num);
+            }
+            if denom == 0 {
                 return Err(ErrKind::Div0);
             }
             let int_part = dec.trunc();
             let frac_part = dec - int_part;
-            Ok(FValue::number(int_part + frac_part * denom as f64 / 100.0))
+            let base = 10f64.powi((denom as f64).log10().ceil().max(1.0) as i32);
+            Ok(FValue::number(int_part + frac_part * denom as f64 / base))
         }),
 
         // ============================ 数据库函数
@@ -1356,10 +1404,14 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
             let mut sum = 0.0;
             let mut n = 0;
             for i in 0..len {
-                if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches_coerced(x))) {
-                    if let Ok(v) = avg[i].to_number() {
-                        sum += v;
-                        n += 1;
+                if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches(x))) {
+                    match &avg[i] {
+                        FValue::Number(v) => {
+                            sum += v;
+                            n += 1;
+                        }
+                        FValue::Error(e) => return Err(*e),
+                        _ => {}
                     }
                 }
             }
@@ -1572,14 +1624,15 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
             if name == "WRAPROWS" {
                 Ok(FValue::Array(Arc::new(super::value::Array::new(rows, n, data))))
             } else {
-                // 按列填充：先转置
-                let mut t = Vec::with_capacity(rows * n);
-                for r in 0..rows {
-                    for c in 0..n {
-                        t.push(data[c * rows + r].clone());
+                // WRAPCOLS: 每列高 n，共 cols = rows 列；输出 n 行 × cols 列，(r, c) 取第 c 列的第 r 个元素 data[c * n + r]
+                let cols_out = rows;
+                let mut t = Vec::with_capacity(n * cols_out);
+                for r in 0..n {
+                    for c in 0..cols_out {
+                        t.push(data[c * n + r].clone());
                     }
                 }
-                Ok(FValue::Array(Arc::new(super::value::Array::new(n, rows, t))))
+                Ok(FValue::Array(Arc::new(super::value::Array::new(n, cols_out, t))))
             }
         }),
 
@@ -1944,10 +1997,10 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
             if settlement >= maturity {
                 return Err(ErrKind::Num);
             }
-            let (s, m, e, n) = coupon_frame(sys, settlement, maturity, freq)?;
-            let dsc = e - s;
-            let a = s - m;
-            let e_len = e - m;
+            let (pcd, s, ncd, n) = coupon_frame(sys, settlement, maturity, freq)?;
+            let dsc = ncd - s;
+            let a = s - pcd;
+            let e_len = ncd - pcd;
             let frac = if e_len > 0.0 { dsc / e_len } else { 0.0 };
             let accrued_frac = if e_len > 0.0 { a / e_len } else { 0.0 };
             let c = rate * 100.0 / freq as f64;
@@ -2051,17 +2104,22 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
             let rate = num(args, 3)?;
             let dsm = maturity - settlement;
             let dim = maturity - issue;
-            if dsm <= 0.0 || dim <= 0.0 {
+            let a = settlement - issue;
+            if dsm <= 0.0 || dim <= 0.0 || a < 0.0 {
                 return Err(ErrKind::Num);
             }
             if name == "PRICEMAT" {
                 let yld = num(args, 4)?;
                 let price = (100.0 + dim * rate * 100.0 / 360.0) / (1.0 + dsm * yld / 360.0);
-                Ok(FValue::number(price - dsm * rate * 100.0 / 360.0))
+                Ok(FValue::number(price - a * rate * 100.0 / 360.0))
             } else {
                 let price = num(args, 4)?;
-                let num_ = (100.0 + dim * rate * 100.0 / 360.0) - price - dsm * rate * 100.0 / 360.0;
-                Ok(FValue::number(num_ / price * 360.0 / dsm))
+                let num_ = (100.0 + dim * rate * 100.0 / 360.0) - (price + a * rate * 100.0 / 360.0);
+                let den = price + a * rate * 100.0 / 360.0;
+                if den == 0.0 {
+                    return Err(ErrKind::Div0);
+                }
+                Ok(FValue::number(num_ / den * 360.0 / dsm))
             }
         }),
 
@@ -2189,6 +2247,9 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
                 let start = num(args, 0)?.floor() as i64;
                 let days = num(args, 1)? as i64;
                 let m = weekend_mask(args.get(2))?;
+                if m.iter().all(|&w| w) {
+                    return Err(ErrKind::Value);
+                }
                 let mut d = start;
                 let step = if days >= 0 { 1 } else { -1 };
                 let mut left = days.abs();
@@ -3314,47 +3375,124 @@ fn convert_unit(v: f64, from: &str, to: &str) -> Result<FValue, ErrKind> {
             _ => celsius + 273.15,
         }));
     }
-    let ratio = |u: &str| -> Option<f64> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Dim {
+        Length,
+        Mass,
+        Time,
+        Volume,
+        Area,
+    }
+    let ratio = |u: &str| -> Option<(Dim, f64)> {
         Some(match u {
-            "m" => 1.0,
-            "km" => 1000.0,
-            "cm" => 0.01,
-            "mm" => 0.001,
-            "mi" => 1609.344,
-            "yd" => 0.9144,
-            "ft" => 0.3048,
-            "in" => 0.0254,
-            "Nmi" => 1852.0,
-            "g" => 0.001,
-            "kg" => 1.0,
-            "lbm" => 0.45359237,
-            "ozm" => 0.028349523125,
-            "ton" => 907.18474,
-            "sec" | "s" => 1.0,
-            "min" => 60.0,
-            "hr" => 3600.0,
-            "day" => 86400.0,
-            "yr" => 31_557_600.0,
-            "l" | "L" => 1.0,
-            "ml" => 0.001,
-            "gal" => 3.785411784,
-            "qt" => 0.946352946,
-            "pt" => 0.473176473,
-            "cup" => 0.2365882365,
-            "tsp" => 0.00492892159,
-            "tbs" => 0.0147867648,
-            "m2" => 1.0,
-            "km2" => 1_000_000.0,
-            "ha" => 10_000.0,
-            "ft2" => 0.09290304,
-            "in2" => 0.00064516,
+            "m" => (Dim::Length, 1.0),
+            "km" => (Dim::Length, 1000.0),
+            "cm" => (Dim::Length, 0.01),
+            "mm" => (Dim::Length, 0.001),
+            "mi" => (Dim::Length, 1609.344),
+            "yd" => (Dim::Length, 0.9144),
+            "ft" => (Dim::Length, 0.3048),
+            "in" => (Dim::Length, 0.0254),
+            "Nmi" => (Dim::Length, 1852.0),
+            "g" => (Dim::Mass, 0.001),
+            "kg" => (Dim::Mass, 1.0),
+            "lbm" => (Dim::Mass, 0.45359237),
+            "ozm" => (Dim::Mass, 0.028349523125),
+            "ton" => (Dim::Mass, 907.18474),
+            "sec" | "s" => (Dim::Time, 1.0),
+            "min" => (Dim::Time, 60.0),
+            "hr" => (Dim::Time, 3600.0),
+            "day" => (Dim::Time, 86400.0),
+            "yr" => (Dim::Time, 31_557_600.0),
+            "l" | "L" => (Dim::Volume, 1.0),
+            "ml" => (Dim::Volume, 0.001),
+            "gal" => (Dim::Volume, 3.785411784),
+            "qt" => (Dim::Volume, 0.946352946),
+            "pt" => (Dim::Volume, 0.473176473),
+            "cup" => (Dim::Volume, 0.2365882365),
+            "tsp" => (Dim::Volume, 0.00492892159),
+            "tbs" => (Dim::Volume, 0.0147867648),
+            "m2" => (Dim::Area, 1.0),
+            "km2" => (Dim::Area, 1_000_000.0),
+            "ha" => (Dim::Area, 10_000.0),
+            "ft2" => (Dim::Area, 0.09290304),
+            "in2" => (Dim::Area, 0.00064516),
             _ => return None,
         })
     };
     match (ratio(f), ratio(t)) {
-        (Some(a), Some(b)) => Ok(FValue::number(v * a / b)),
+        (Some((da, a)), Some((db, b))) if da == db => Ok(FValue::number(v * a / b)),
         _ => Err(ErrKind::Na),
     }
+}
+
+/// 财务收益率求根（IRR / XIRR / RATE）：先从 `guess` 出发跑 Newton-Raphson，
+/// 不收敛时在分段区间内搜索变号区间并二分，无根则返回 `#NUM!`。
+fn solve_financial_root(f: impl Fn(f64) -> f64, df: impl Fn(f64) -> f64, guess: f64) -> Result<f64, ErrKind> {
+    let mut x = if guess.is_finite() && guess > -0.9999 { guess } else { 0.1 };
+    for _ in 0..80 {
+        let fx = f(x);
+        if fx.is_finite() && fx.abs() < 1e-10 {
+            return Ok(x);
+        }
+        let d = df(x);
+        if !fx.is_finite() || !d.is_finite() || d.abs() < 1e-15 {
+            break;
+        }
+        let next = x - fx / d;
+        if !next.is_finite() || next <= -0.999999 || next > 1e6 {
+            break;
+        }
+        if (next - x).abs() < 1e-12 * (1.0 + x.abs()) {
+            if f(next).abs() < 1e-5 {
+                return Ok(next);
+            }
+            break;
+        }
+        x = next;
+    }
+    // 扫描分段网格寻找变号区间再二分
+    const GRID: &[f64] = &[
+        -0.999, -0.99, -0.95, -0.9, -0.75, -0.5, -0.25, -0.1, -0.05, 0.0,
+        0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0, 100.0, 1000.0,
+    ];
+    for w in GRID.windows(2) {
+        let (mut a, mut b) = (w[0], w[1]);
+        let (mut fa, mut fb) = (f(a), f(b));
+        if !fa.is_finite() || !fb.is_finite() {
+            continue;
+        }
+        if fa.abs() < 1e-10 {
+            return Ok(a);
+        }
+        if fb.abs() < 1e-10 {
+            return Ok(b);
+        }
+        if fa * fb < 0.0 {
+            for _ in 0..100 {
+                let mid = 0.5 * (a + b);
+                let fm = f(mid);
+                if !fm.is_finite() {
+                    break;
+                }
+                if fm.abs() < 1e-10 || (b - a).abs() < 1e-13 * (1.0 + mid.abs()) {
+                    return Ok(mid);
+                }
+                if fa * fm <= 0.0 {
+                    b = mid;
+                    fb = fm;
+                } else {
+                    a = mid;
+                    fa = fm;
+                }
+            }
+            let mid = 0.5 * (a + b);
+            if f(mid).abs() < 1e-4 {
+                return Ok(mid);
+            }
+        }
+    }
+    Err(ErrKind::Num)
 }
 
 // ---------------------------------------------------------------- 罗马数字

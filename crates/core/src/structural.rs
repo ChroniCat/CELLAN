@@ -246,23 +246,37 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
+                self.shift_sparklines(&shift);
+                if let Some((r, c)) = self.freeze {
+                    self.freeze = Some((shift.map(r).unwrap(), c));
+                }
                 self.layout_dirty |= self.rows.shift_axis(*at, *n, false);
+                self.shift_filter(&shift);
+                self.adjust_tables_for_row_insert(*at, *n);
+                self.shift_objects_and_page(&shift);
                 self.shift_axis_metadata(&shift);
             }
             Structural::DeleteRows { at, n } => {
                 self.merges = self
                     .merges
                     .iter()
-                    .filter_map(|(r1, c1, r2, c2)| {
-                        let a = shift_axis(*r1, *at, *n, true)?;
-                        let b = shift_axis(*r2, *at, *n, true)?;
-                        Some((a, *c1, b.max(a), *c2))
+                    .filter_map(|&(r1, c1, r2, c2)| {
+                        let (a, b) = shift.map_range(r1, r2)?;
+                        (b > a || c2 > c1).then_some((a, c1, b, c2))
                     })
                     .collect();
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
+                self.shift_sparklines(&shift);
+                if let Some((fr, fc)) = self.freeze {
+                    let nf = if fr >= *at + *n { fr - *n } else { (*at).min(fr) };
+                    self.freeze = Some((nf, fc));
+                }
                 self.layout_dirty |= self.rows.shift_axis(*at, *n, true);
+                self.shift_filter(&shift);
+                self.shift_tables(&shift);
+                self.shift_objects_and_page(&shift);
                 self.shift_axis_metadata(&shift);
             }
             Structural::InsertCols { at, n } => {
@@ -281,27 +295,44 @@ impl Sheet {
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
+                self.shift_sparklines(&shift);
+                if let Some((fr, fc)) = self.freeze {
+                    if fc >= *at {
+                        self.freeze = Some((fr, fc + *n));
+                    }
+                }
                 self.layout_dirty |= self.cols.shift_axis(*at, *n, false);
+                self.shift_filter(&shift);
+                self.shift_tables(&shift);
+                self.shift_objects_and_page(&shift);
                 self.shift_axis_metadata(&shift);
             }
             Structural::DeleteCols { at, n } => {
                 self.merges = self
                     .merges
                     .iter()
-                    .filter_map(|(r1, c1, r2, c2)| {
-                        let a = shift_axis(*c1, *at, *n, true)?;
-                        let b = shift_axis(*c2, *at, *n, true)?;
-                        Some((*r1, a, *r2, b.max(a)))
+                    .filter_map(|&(r1, c1, r2, c2)| {
+                        let (a, b) = shift.map_range(c1, c2)?;
+                        (r2 > r1 || b > a).then_some((r1, a, r2, b))
                     })
                     .collect();
                 self.shift_notes(&shift);
                 self.shift_cf(&shift);
                 self.shift_dv(&shift);
+                self.shift_sparklines(&shift);
+                if let Some((fr, fc)) = self.freeze {
+                    let nf = if fc >= *at + *n { fc - *n } else { (*at).min(fc) };
+                    self.freeze = Some((fr, nf));
+                }
                 self.layout_dirty |= self.cols.shift_axis(*at, *n, true);
+                self.shift_filter(&shift);
+                self.shift_tables(&shift);
+                self.shift_objects_and_page(&shift);
                 self.shift_axis_metadata(&shift);
             }
         }
         self.merges_dirty = true;
+        self.freeze_dirty = true;
     }
 
     /// 应用一次结构性改动
@@ -849,11 +880,8 @@ impl Sheet {
         } else {
             self.rows.remap_indices(|r| shift.map(r))
         };
-        if let Some(f) = &mut self.filter {
-            let moved = shift.map_range(f.range.0, f.range.2).unwrap();
-            self.filter_dirty |= (f.range.0, f.range.2) != moved;
-            (f.range.0, f.range.2) = moved;
-        }
+        self.shift_filter(shift);
+        self.shift_objects_and_page(shift);
         self.shift_axis_metadata(shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
@@ -877,10 +905,9 @@ impl Sheet {
         self.merges = self
             .merges
             .iter()
-            .filter_map(|(r1, c1, r2, c2)| {
-                let a = shift_axis(*r1, at, n, true)?;
-                let b = shift_axis(*r2, at, n, true)?;
-                Some((a, *c1, b.max(a), *c2))
+            .filter_map(|&(r1, c1, r2, c2)| {
+                let (a, b) = shift.map_range(r1, r2)?;
+                (b > a || c2 > c1).then_some((a, c1, b, c2))
             })
             .collect();
         self.shift_notes(&shift);
@@ -892,6 +919,9 @@ impl Sheet {
             self.freeze = Some((nf, fc));
         }
         self.layout_dirty |= self.rows.shift_axis(at, n, true);
+        self.shift_filter(&shift);
+        self.shift_tables(&shift);
+        self.shift_objects_and_page(&shift);
         self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
@@ -931,6 +961,9 @@ impl Sheet {
             }
         }
         self.layout_dirty |= self.cols.shift_axis(at, n, false);
+        self.shift_filter(&shift);
+        self.shift_tables(&shift);
+        self.shift_objects_and_page(&shift);
         self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
@@ -954,10 +987,9 @@ impl Sheet {
         self.merges = self
             .merges
             .iter()
-            .filter_map(|(r1, c1, r2, c2)| {
-                let a = shift_axis(*c1, at, n, true)?;
-                let b = shift_axis(*c2, at, n, true)?;
-                Some((*r1, a, *r2, b.max(a)))
+            .filter_map(|&(r1, c1, r2, c2)| {
+                let (a, b) = shift.map_range(c1, c2)?;
+                (r2 > r1 || b > a).then_some((r1, a, r2, b))
             })
             .collect();
         self.shift_notes(&shift);
@@ -969,9 +1001,328 @@ impl Sheet {
             self.freeze = Some((fr, nf));
         }
         self.layout_dirty |= self.cols.shift_axis(at, n, true);
+        self.shift_filter(&shift);
+        self.shift_tables(&shift);
+        self.shift_objects_and_page(&shift);
         self.shift_axis_metadata(&shift);
         self.merges_dirty = true;
         self.freeze_dirty = true;
+    }
+
+    fn shift_filter(&mut self, shift: &MappedShift) {
+        let Some(f) = &mut self.filter else { return };
+        if shift.n == 0 {
+            return;
+        }
+        let rows = shift.axis == crate::refs::Axis::Row;
+        if rows {
+            if shift.delete && f.range.0 >= shift.at && f.range.0 < shift.at.saturating_add(shift.n) {
+                self.filter = None;
+                self.hidden_rows.clear();
+                self.filter_dirty = true;
+                self.layout_dirty = true;
+                return;
+            }
+            if let Some(moved) = shift.map_range(f.range.0, f.range.2) {
+                if (f.range.0, f.range.2) != moved {
+                    (f.range.0, f.range.2) = moved;
+                    self.filter_dirty = true;
+                }
+            } else {
+                self.filter = None;
+                self.hidden_rows.clear();
+                self.filter_dirty = true;
+                self.layout_dirty = true;
+            }
+        } else if let Some(moved) = shift.map_range(f.range.1, f.range.3) {
+            if (f.range.1, f.range.3) != moved {
+                (f.range.1, f.range.3) = moved;
+                self.filter_dirty = true;
+            }
+            if !f.allows.is_empty() {
+                f.allows = std::mem::take(&mut f.allows)
+                    .into_iter()
+                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .collect();
+                self.filter_dirty = true;
+            }
+            if !f.criteria.is_empty() {
+                f.criteria = std::mem::take(&mut f.criteria)
+                    .into_iter()
+                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .collect();
+                self.filter_dirty = true;
+            }
+            if !f.date_groups.is_empty() {
+                f.date_groups = std::mem::take(&mut f.date_groups)
+                    .into_iter()
+                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .collect();
+                self.filter_dirty = true;
+            }
+            if !f.color_filters.is_empty() {
+                f.color_filters = std::mem::take(&mut f.color_filters)
+                    .into_iter()
+                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .collect();
+                self.filter_dirty = true;
+            }
+        } else {
+            self.filter = None;
+            self.hidden_rows.clear();
+            self.filter_dirty = true;
+            self.layout_dirty = true;
+        }
+    }
+
+    fn shift_tables(&mut self, shift: &MappedShift) {
+        if self.tables.is_empty() || shift.n == 0 {
+            return;
+        }
+        let rows = shift.axis == crate::refs::Axis::Row;
+        let mut changed = false;
+        self.tables.retain_mut(|t| {
+            let (r1, c1, r2, c2) = t.range;
+            if rows {
+                if let Some((nr1, nr2)) = shift.map_range(r1, r2) {
+                    if (nr1, nr2) != (r1, r2) {
+                        t.range.0 = nr1;
+                        t.range.2 = nr2;
+                        changed = true;
+                    }
+                    true
+                } else {
+                    changed = true;
+                    false
+                }
+            } else if !shift.delete {
+                if shift.at <= c1 {
+                    t.range.1 += shift.n;
+                    t.range.3 += shift.n;
+                    changed = true;
+                } else if shift.at <= c2 {
+                    let insert_pos = (shift.at - c1) as usize;
+                    t.range.3 += shift.n;
+                    for k in 0..shift.n {
+                        let name = format!("列{}", t.columns.len() + 1);
+                        let at = (insert_pos + k as usize).min(t.columns.len());
+                        t.columns.insert(at, name);
+                    }
+                    changed = true;
+                }
+                true
+            } else if let Some((nc1, nc2)) = shift.map_range(c1, c2) {
+                let del_lo = shift.at;
+                let del_hi = shift.at.saturating_add(shift.n);
+                let mut new_cols = Vec::with_capacity(t.columns.len());
+                for (i, col_name) in t.columns.iter().enumerate() {
+                    let abs_c = c1 + i as u32;
+                    if abs_c < del_lo || abs_c >= del_hi {
+                        new_cols.push(col_name.clone());
+                    }
+                }
+                if (nc1, nc2) != (c1, c2) || new_cols.len() != t.columns.len() {
+                    t.range.1 = nc1;
+                    t.range.3 = nc2;
+                    t.columns = new_cols;
+                    changed = true;
+                }
+                true
+            } else {
+                changed = true;
+                false
+            }
+        });
+        if changed {
+            self.tables_dirty = true;
+        }
+    }
+
+    fn shift_objects_and_page(&mut self, shift: &MappedShift) {
+        if shift.n == 0 {
+            return;
+        }
+        let rows = shift.axis == crate::refs::Axis::Row;
+        let map_anchor_point = |v: u32| -> u32 {
+            if let Some(m) = shift.map(v) {
+                m
+            } else if shift.delete {
+                shift.at
+            } else {
+                v
+            }
+        };
+        if !self.pictures.is_empty() {
+            let mut changed = false;
+            for pic in &mut self.pictures {
+                let (r1, c1, r2, c2) = pic.rect;
+                let next = if rows {
+                    let nr1 = map_anchor_point(r1);
+                    let nr2 = map_anchor_point(r2).max(nr1);
+                    (nr1, c1, nr2, c2)
+                } else {
+                    let nc1 = map_anchor_point(c1);
+                    let nc2 = map_anchor_point(c2).max(nc1);
+                    (r1, nc1, r2, nc2)
+                };
+                if next != pic.rect {
+                    pic.rect = next;
+                    changed = true;
+                }
+            }
+            self.pictures_dirty |= changed;
+        }
+        if !self.textboxes.is_empty() {
+            let mut changed = false;
+            for tb in &mut self.textboxes {
+                let (c1, dx1, r1, dy1) = tb.from;
+                let (c2, dx2, r2, dy2) = tb.to;
+                if rows {
+                    let nr1 = map_anchor_point(r1);
+                    let nr2 = map_anchor_point(r2).max(nr1);
+                    if (nr1, nr2) != (r1, r2) {
+                        tb.from = (c1, dx1, nr1, dy1);
+                        tb.to = (c2, dx2, nr2, dy2);
+                        changed = true;
+                    }
+                } else {
+                    let nc1 = map_anchor_point(c1);
+                    let nc2 = map_anchor_point(c2).max(nc1);
+                    if (nc1, nc2) != (c1, c2) {
+                        tb.from = (nc1, dx1, r1, dy1);
+                        tb.to = (nc2, dx2, r2, dy2);
+                        changed = true;
+                    }
+                }
+            }
+            self.textboxes_dirty |= changed;
+        }
+        if !self.charts.is_empty() {
+            let mut changed = false;
+            for ch in &mut self.charts {
+                let (r1, c1, r2, c2) = ch.anchor;
+                let next = if rows {
+                    let nr1 = map_anchor_point(r1);
+                    let nr2 = map_anchor_point(r2).max(nr1);
+                    (nr1, c1, nr2, c2)
+                } else {
+                    let nc1 = map_anchor_point(c1);
+                    let nc2 = map_anchor_point(c2).max(nc1);
+                    (r1, nc1, r2, nc2)
+                };
+                if next != ch.anchor {
+                    ch.anchor = next;
+                    changed = true;
+                }
+            }
+            self.charts_dirty |= changed;
+        }
+        // Page setup: print_area, title_rows/title_cols, row_breaks/col_breaks
+        let mut page_changed = false;
+        if let Some((r1, c1, r2, c2)) = self.page.print_area {
+            let next = if rows {
+                shift.map_range(r1, r2).map(|(a, b)| (a, c1, b, c2))
+            } else {
+                shift.map_range(c1, c2).map(|(a, b)| (r1, a, r2, b))
+            };
+            if next != self.page.print_area {
+                self.page.print_area = next;
+                page_changed = true;
+            }
+        }
+        if rows {
+            if let Some((a, b)) = self.page.title_rows {
+                let next = shift.map_range(a, b);
+                if next != self.page.title_rows {
+                    self.page.title_rows = next;
+                    page_changed = true;
+                }
+            }
+            if !self.page.row_breaks.is_empty() {
+                let next: Vec<u32> = self
+                    .page
+                    .row_breaks
+                    .iter()
+                    .filter_map(|&b| shift.map(b))
+                    .filter(|&b| b > 0)
+                    .collect();
+                if next != self.page.row_breaks {
+                    self.page.row_breaks = next;
+                    self.page.row_breaks.sort_unstable();
+                    self.page.row_breaks.dedup();
+                    page_changed = true;
+                }
+            }
+        } else {
+            if let Some((a, b)) = self.page.title_cols {
+                let next = shift.map_range(a, b);
+                if next != self.page.title_cols {
+                    self.page.title_cols = next;
+                    page_changed = true;
+                }
+            }
+            if !self.page.col_breaks.is_empty() {
+                let next: Vec<u32> = self
+                    .page
+                    .col_breaks
+                    .iter()
+                    .filter_map(|&b| shift.map(b))
+                    .filter(|&b| b > 0)
+                    .collect();
+                if next != self.page.col_breaks {
+                    self.page.col_breaks = next;
+                    self.page.col_breaks.sort_unstable();
+                    self.page.col_breaks.dedup();
+                    page_changed = true;
+                }
+            }
+        }
+        self.page_dirty |= page_changed;
+        // Rich text runs & ignored_errors
+        if !self.rich.is_empty() {
+            let old = std::mem::take(&mut self.rich);
+            let mut changed = false;
+            let mut out = std::collections::HashMap::with_capacity(old.len());
+            for ((r, c), runs) in old {
+                let mapped = if rows {
+                    shift.map(r).map(|nr| (nr, c))
+                } else {
+                    shift.map(c).map(|nc| (r, nc))
+                };
+                if let Some(nk) = mapped {
+                    if nk != (r, c) {
+                        changed = true;
+                    }
+                    out.insert(nk, runs);
+                } else {
+                    changed = true;
+                }
+            }
+            self.rich = out.into();
+            self.rich_dirty |= changed;
+        }
+        if !self.ignored_errors.is_empty() {
+            let old = std::mem::take(&mut self.ignored_errors);
+            let mut changed = false;
+            let mut out = HashSet::with_capacity(old.len());
+            for (r, c) in old {
+                let mapped = if rows {
+                    shift.map(r).map(|nr| (nr, c))
+                } else {
+                    shift.map(c).map(|nc| (r, nc))
+                };
+                if let Some(nk) = mapped {
+                    if nk != (r, c) {
+                        changed = true;
+                    }
+                    out.insert(nk);
+                } else {
+                    changed = true;
+                }
+            }
+            self.ignored_errors = out.into();
+            self.ignored_errors_dirty |= changed;
+        }
     }
 
     fn shift_axis_metadata(&mut self, shift: &MappedShift) {
@@ -1760,9 +2111,8 @@ impl Sheet {
             .merges
             .iter()
             .filter_map(|&(r1, c1, r2, c2)| {
-                let a = del_map.map(r1)?;
-                let b = del_map.map(r2)?;
-                Some((a, c1, b.max(a), c2))
+                let (a, b) = del_map.map_range(r1, r2)?;
+                (b > a || c2 > c1).then_some((a, c1, b, c2))
             })
             .collect();
 
@@ -1849,7 +2199,11 @@ impl Sheet {
                 n: hi - lo + 1,
             })
             .reference_shift();
-            crate::scenarios::shift_references(self, &MappedShift { shift: &sh, insertions: &[] });
+            let ms = MappedShift { shift: &sh, insertions: &[] };
+            crate::scenarios::shift_references(self, &ms);
+            self.shift_filter(&ms);
+            self.shift_tables(&ms);
+            self.shift_objects_and_page(&ms);
         }
         self.layout_dirty |= self.hidden_rows.shift_delete_intervals(&del_map.intervals);
         self.layout_dirty |= self.hidden_rows_user.shift_delete_intervals(&del_map.intervals);

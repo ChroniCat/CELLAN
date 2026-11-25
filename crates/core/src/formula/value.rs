@@ -275,7 +275,7 @@ impl FValue {
             FValue::Text(s) => {
                 let t = s.trim();
                 if t.is_empty() {
-                    return Ok(0.0);
+                    return Err(ErrKind::Value);
                 }
                 t.parse::<f64>().map_err(|_| ErrKind::Value)
             }

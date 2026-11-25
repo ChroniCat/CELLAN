@@ -62,16 +62,21 @@ impl Default for PageSetup {
     }
 }
 
-/// 纸张尺寸（毫米）
+/// 纸张尺寸（毫米，遵循 OOXML ECAMA-376 paperSize 枚举）
 pub fn paper_mm(paper: u16) -> (f32, f32) {
     match paper {
         1 => (215.9, 279.4),  // Letter
         3 => (279.4, 431.8),  // Tabloid
-        4 => (215.9, 355.6),  // Legal
-        5 => (139.7, 215.9),  // Statement
+        4 => (431.8, 279.4),  // Ledger
+        5 => (215.9, 355.6),  // Legal
+        6 => (139.7, 215.9),  // Statement
+        7 => (184.15, 266.7), // Executive
         8 => (297.0, 420.0),  // A3
         9 => (210.0, 297.0),  // A4
-        10 => (148.0, 210.0), // A5
+        10 => (210.0, 297.0), // A4 Small
+        11 => (148.0, 210.0), // A5
+        12 => (250.0, 353.0), // B4 (ISO)
+        13 => (176.0, 250.0), // B5 (ISO)
         _ => (210.0, 297.0),
     }
 }
@@ -81,11 +86,15 @@ impl PageSetup {
         match self.paper {
             1 => "Letter",
             3 => "Tabloid",
-            4 => "Legal",
-            5 => "Statement",
+            4 => "Ledger",
+            5 => "Legal",
+            6 => "Statement",
+            7 => "Executive",
             8 => "A3",
-            9 => "A4",
-            10 => "A5",
+            9 | 10 => "A4",
+            11 => "A5",
+            12 => "B4",
+            13 => "B5",
             _ => "A4",
         }
     }
