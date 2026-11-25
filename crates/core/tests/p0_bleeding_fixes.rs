@@ -480,17 +480,7 @@ fn p0_30_print_merged_cell_header_line_chart_and_paper_sizes() {
         legend: false,
         anchor: (0, 2, 5, 6),
         legend_pos: String::new(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: Default::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
-        axis_x: String::new(),
-        axis_y: String::new(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        ..Chart::default()
     });
     let layout = paginate(&wb.sheets[0], &wb.sheets[0].page);
     let out = page_ops(&wb, 0, &layout, 0);
@@ -539,17 +529,7 @@ fn p0_31_structural_shifts_merges_objects_page_rich_filter_and_tables() {
         legend: false,
         anchor: (4, 1, 8, 4),
         legend_pos: String::new(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: Default::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
-        axis_x: String::new(),
-        axis_y: String::new(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        ..Chart::default()
     });
     sh.page.print_area = Some((1, 0, 10, 4));
     sh.page.title_rows = Some((0, 1));
