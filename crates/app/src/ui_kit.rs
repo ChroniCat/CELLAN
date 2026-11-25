@@ -20,9 +20,11 @@ pub const ACCENT: Color32 = Color32::from_rgb(33, 115, 70);
 /// 分区分隔线 / 控件边框
 pub const BORDER: Color32 = Color32::from_rgb(208, 208, 208);
 
-/// CELLAN 品牌双色：外圈 8 节点深海蓝 + 中心协同核心翡翠绿（取自官方矢量标志）。
-pub const BRAND_NAVY: Color32 = Color32::from_rgb(27, 53, 129);
-pub const BRAND_MINT: Color32 = Color32::from_rgb(9, 189, 141);
+/// CELLAN 品牌色板：瑞士极简 2×2 几何 C-网格（深海蓝 C + 翡翠青与叠层薄荷绿协同格，取自官方矢量标志）。
+pub const BRAND_NAVY: Color32 = Color32::from_rgb(31, 69, 158);
+pub const BRAND_MINT: Color32 = Color32::from_rgb(15, 168, 126);
+pub const BRAND_AQUA: Color32 = Color32::from_rgb(69, 214, 172);
+pub const BRAND_AQUA_LIGHT: Color32 = Color32::from_rgb(132, 238, 208);
 
 /// 悬浮卡片：纯白四圆角卡片浮于冷灰蓝 PAGE_BG 之上，配清晰利落的 1px CARD_BORDER。
 pub const PAGE_BG: Color32 = Color32::from_rgb(240, 243, 248);
@@ -35,9 +37,9 @@ pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(225, 231, 240);
 /// 卡片圆角：功能区/网格 8px，编辑栏 6px
 pub const CARD_R: u8 = 8;
 
-/// 纯矢量绘制 CELLAN 品牌标志（240×240 归一化坐标系，任意尺寸亚像素圆角与抗锯齿）。
-/// 结构：3×3 圆角矩阵，外圈 8 格深蓝正交环连，左上独立蓝触点、左下斜向蓝桥接，
-/// 中心翡翠绿核心向右上下伸出双绿触点接入右列节点。
+/// 纯矢量绘制 CELLAN 品牌标志（240×240 归一化坐标系，与 `assets/logo.svg` 严格同源）。
+/// 结构：瑞士极简 2×2 几何 C-网格——左侧深海蓝建筑感 C，右上翡翠青单元格，
+/// 右下薄荷青单元格内置叠层高光块，象征单元格级实时无锁协同。
 pub fn draw_brand_logo(painter: &egui::Painter, rect: Rect) {
     let side = rect.width().min(rect.height());
     if side < 6.0 {
@@ -48,73 +50,105 @@ pub fn draw_brand_logo(painter: &egui::Painter, rect: Rect) {
     let ty = |y: f32| sq.top() + y / 240.0 * side;
     let ts = |v: f32| v / 240.0 * side;
 
-    // 22~28px 小尺寸下略增连线墨量，避免亚像素笔画变淡
-    let boost = if side <= 24.0 { 1.22 } else if side <= 32.0 { 1.10 } else { 1.0 };
-    let w_orth = ts(8.2 * boost).max(1.1);
-    let w_diag = ts(8.4 * boost).max(1.15);
-    let r_node = ts(10.4 * if side <= 24.0 { 1.10 } else { 1.0 }).max(1.35);
-    let r_cell = ts(13.5);
+    let dark = painter.ctx().style().visuals.dark_mode;
+    let navy = if dark {
+        Color32::from_rgb(78, 128, 244)
+    } else {
+        BRAND_NAVY
+    };
+    let jade = BRAND_MINT;
+    let aqua = BRAND_AQUA;
+    let aqua_hi = BRAND_AQUA_LIGHT;
 
-    let fill_rrect = |p: &egui::Painter, x0: f32, y0: f32, w: f32, h: f32, r: f32, col: Color32| {
-        let rx = r.min(w * 0.45).min(h * 0.45);
-        let corners = [
-            (x0 + w - rx, y0 + rx, -std::f32::consts::FRAC_PI_2),
-            (x0 + w - rx, y0 + h - rx, 0.0),
-            (x0 + rx, y0 + h - rx, std::f32::consts::FRAC_PI_2),
-            (x0 + rx, y0 + rx, std::f32::consts::PI),
-        ];
-        const SEG: usize = 5;
+    // 按四角独立半径绘制凸圆角矩形 [nw, ne, se, sw]
+    let fill_rrect4 = |p: &egui::Painter, x0: f32, y0: f32, w: f32, h: f32, rad: [f32; 4], col: Color32| {
+        let max_r = (w * 0.49).min(h * 0.49);
+        let [nw, ne, se, sw] = rad.map(|r| r.clamp(0.0, max_r));
+        const SEG: usize = 6;
         let mut pts = Vec::with_capacity(4 * (SEG + 1));
-        for (cx, cy, a0) in corners {
-            for k in 0..=SEG {
-                let a = a0 + std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
-                pts.push(egui::pos2(cx + rx * a.cos(), cy + rx * a.sin()));
+        let push_corner = |pts: &mut Vec<egui::Pos2>, cx: f32, cy: f32, r: f32, a0: f32, corner: egui::Pos2| {
+            if r <= 0.05 {
+                pts.push(corner);
+            } else {
+                for k in 0..=SEG {
+                    let a = a0 + std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
+                    pts.push(egui::pos2(cx + r * a.cos(), cy + r * a.sin()));
+                }
             }
-        }
+        };
+        push_corner(&mut pts, x0 + w - ne, y0 + ne, ne, -std::f32::consts::FRAC_PI_2, egui::pos2(x0 + w, y0));
+        push_corner(&mut pts, x0 + w - se, y0 + h - se, se, 0.0, egui::pos2(x0 + w, y0 + h));
+        push_corner(&mut pts, x0 + sw, y0 + h - sw, sw, std::f32::consts::FRAC_PI_2, egui::pos2(x0, y0 + h));
+        push_corner(&mut pts, x0 + nw, y0 + nw, nw, std::f32::consts::PI, egui::pos2(x0, y0));
         p.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
     };
 
-    // 1. 中心翡翠绿斜向双触点与核心格（先画，使右上下斜线自然藏入右列深蓝圆角格底下）
-    let st_green = Stroke::new(w_diag, BRAND_MINT);
-    painter.line_segment([egui::pos2(tx(136.0), ty(104.0)), egui::pos2(tx(190.0), ty(50.0))], st_green);
-    painter.line_segment([egui::pos2(tx(136.0), ty(136.0)), egui::pos2(tx(190.0), ty(190.0))], st_green);
-    painter.circle_filled(egui::pos2(tx(163.0), ty(77.0)), r_node, BRAND_MINT);
-    painter.circle_filled(egui::pos2(tx(163.0), ty(163.0)), r_node, BRAND_MINT);
-    fill_rrect(painter, tx(86.0), ty(86.0), ts(68.0), ts(68.0), r_cell, BRAND_MINT);
-
-    // 2. 外圈正交蓝桥 + 左上触点 + 左下斜桥
-    let st_orth = Stroke::new(w_orth, BRAND_NAVY);
-    let st_diag = Stroke::new(w_diag, BRAND_NAVY);
-    for (x1, y1, x2, y2) in [
-        (34.0, 34.0, 206.0, 34.0),
-        (34.0, 206.0, 206.0, 206.0),
-        (34.0, 34.0, 34.0, 206.0),
-        (206.0, 34.0, 206.0, 206.0),
-    ] {
-        painter.line_segment([egui::pos2(tx(x1), ty(y1)), egui::pos2(tx(x2), ty(y2))], st_orth);
-    }
-    painter.line_segment([egui::pos2(tx(50.0), ty(50.0)), egui::pos2(tx(77.0), ty(77.0))], st_diag);
-    painter.line_segment([egui::pos2(tx(50.0), ty(136.0)), egui::pos2(tx(104.0), ty(190.0))], st_diag);
-    painter.circle_filled(egui::pos2(tx(77.0), ty(77.0)), r_node, BRAND_NAVY);
-    painter.circle_filled(egui::pos2(tx(77.0), ty(163.0)), r_node, BRAND_NAVY);
-
-    // 3. 外圈 8 枚深蓝圆角单元
-    for r in 0..3 {
-        for c in 0..3 {
-            if (r, c) == (1, 1) {
-                continue;
-            }
-            fill_rrect(
-                painter,
-                tx(c as f32 * 86.0),
-                ty(r as f32 * 86.0),
-                ts(68.0),
-                ts(68.0),
-                r_cell,
-                BRAND_NAVY,
-            );
+    // 绘制 C 形内腔凹圆角倒角（三角扇填充 + 弧边微抗锯齿）
+    let fill_inner_fillet = |p: &egui::Painter, corner: egui::Pos2, center: egui::Pos2, r: f32, a0: f32, a1: f32, col: Color32| {
+        if r < 0.4 {
+            return;
         }
-    }
+        const SEG: usize = 8;
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.colored_vertex(corner, col);
+        let mut arc = Vec::with_capacity(SEG + 1);
+        for k in 0..=SEG {
+            let a = a0 + (a1 - a0) * (k as f32 / SEG as f32);
+            let pt = egui::pos2(center.x + r * a.cos(), center.y + r * a.sin());
+            mesh.colored_vertex(pt, col);
+            arc.push(pt);
+        }
+        for k in 0..SEG as u32 {
+            mesh.add_triangle(0, 1 + k, 2 + k);
+        }
+        p.add(egui::Shape::mesh(mesh));
+        if side >= 14.0 {
+            // 沿弧线内缩 0.35px 补一条微细抗锯齿边，消除三角扇斜边锯齿
+            let r_aa = (r + 0.35).max(0.5);
+            let aa_pts: Vec<egui::Pos2> = (0..=SEG)
+                .map(|k| {
+                    let a = a0 + (a1 - a0) * (k as f32 / SEG as f32);
+                    egui::pos2(center.x + r_aa * a.cos(), center.y + r_aa * a.sin())
+                })
+                .collect();
+            p.add(egui::Shape::line(aa_pts, Stroke::new(0.75, col)));
+        }
+    };
+
+    // 1. 左侧深海蓝建筑感 C（0..111 × 0..240，壁厚 38，外圆角 22，内倒角 14，右口平齐）
+    let r_out = ts(22.0);
+    let r_in = ts(14.0);
+    let r_cell = ts(20.0);
+    let r_hi = ts(16.0);
+
+    fill_rrect4(painter, tx(0.0), ty(0.0), ts(38.0), ts(240.0), [r_out, 0.0, 0.0, r_out], navy);
+    fill_rrect4(painter, tx(22.0), ty(0.0), ts(89.0), ts(38.0), [0.0, 0.0, 0.0, 0.0], navy);
+    fill_rrect4(painter, tx(22.0), ty(202.0), ts(89.0), ts(38.0), [0.0, 0.0, 0.0, 0.0], navy);
+    fill_inner_fillet(
+        painter,
+        egui::pos2(tx(37.5), ty(37.5)),
+        egui::pos2(tx(52.0), ty(52.0)),
+        r_in,
+        -std::f32::consts::FRAC_PI_2,
+        -std::f32::consts::PI,
+        navy,
+    );
+    fill_inner_fillet(
+        painter,
+        egui::pos2(tx(37.5), ty(202.5)),
+        egui::pos2(tx(52.0), ty(188.0)),
+        r_in,
+        std::f32::consts::PI,
+        std::f32::consts::FRAC_PI_2,
+        navy,
+    );
+
+    // 2. 右上翡翠青单元格（129..240 × 0..111）
+    fill_rrect4(painter, tx(129.0), ty(0.0), ts(111.0), ts(111.0), [0.0, r_out, r_cell, r_cell], jade);
+
+    // 3. 右下薄荷青协同格 + 内置叠层同步高光块（129..240 × 129..240）
+    fill_rrect4(painter, tx(129.0), ty(129.0), ts(111.0), ts(111.0), [r_cell, r_cell, r_out, 0.0], aqua);
+    fill_rrect4(painter, tx(129.0), ty(129.0), ts(79.0), ts(79.0), [r_cell, 0.0, r_hi, 0.0], aqua_hi);
 }
 
 /// 把一块已经画满（直角）的区域收成圆角卡片：四角先用页面底色「抠」掉，再描 1px 边。
@@ -2564,5 +2598,23 @@ mod state_tests {
         assert_eq!(state_bg(true, true, true, false, false), PRESSED);
         assert_eq!(state_bg(true, false, true, false, false), HOVER);
         assert_eq!(state_bg(true, false, false, false, false), Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn brand_logo_renders_across_sizes_and_themes() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let p = ui.painter();
+                    for side in [0.0, 4.0, 15.0, 18.0, 20.0, 36.0, 128.0] {
+                        let r = Rect::from_min_size(egui::pos2(10.0, 10.0), Vec2::splat(side));
+                        draw_brand_logo(p, r);
+                    }
+                });
+            });
+            assert!(!out.shapes.is_empty(), "brand logo should emit vector shapes");
+        }
     }
 }

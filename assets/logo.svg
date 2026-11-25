@@ -1,30 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
   <!-- CELLAN (Concurrent Engine for Local-first, Lock-free Async Networks) Official Vector Brand Logo -->
-  <g fill="#09BD8D" stroke="#09BD8D" stroke-linecap="round">
-    <line x1="136" y1="104" x2="190" y2="50" stroke-width="8.4"/>
-    <line x1="136" y1="136" x2="190" y2="190" stroke-width="8.4"/>
-    <circle cx="163" cy="77" r="10.4" stroke="none"/>
-    <circle cx="163" cy="163" r="10.4" stroke="none"/>
-    <rect x="86" y="86" width="68" height="68" rx="13.5" ry="13.5" stroke="none"/>
-  </g>
-  <g fill="#1B3581" stroke="#1B3581" stroke-linecap="round">
-    <line x1="34" y1="34" x2="206" y2="34" stroke-width="8.2" stroke-linecap="butt"/>
-    <line x1="34" y1="206" x2="206" y2="206" stroke-width="8.2" stroke-linecap="butt"/>
-    <line x1="34" y1="34" x2="34" y2="206" stroke-width="8.2" stroke-linecap="butt"/>
-    <line x1="206" y1="34" x2="206" y2="206" stroke-width="8.2" stroke-linecap="butt"/>
-    <line x1="50" y1="50" x2="77" y2="77" stroke-width="8.4"/>
-    <line x1="50" y1="136" x2="104" y2="190" stroke-width="8.4"/>
-    <circle cx="77" cy="77" r="10.4" stroke="none"/>
-    <circle cx="77" cy="163" r="10.4" stroke="none"/>
-  </g>
-  <g fill="#1B3581">
-    <rect x="0" y="0" width="68" height="68" rx="13.5" ry="13.5"/>
-    <rect x="86" y="0" width="68" height="68" rx="13.5" ry="13.5"/>
-    <rect x="172" y="0" width="68" height="68" rx="13.5" ry="13.5"/>
-    <rect x="0" y="86" width="68" height="68" rx="13.5" ry="13.5"/>
-    <rect x="172" y="86" width="68" height="68" rx="13.5" ry="13.5"/>
-    <rect x="0" y="172" width="68" height="68" rx="13.5" ry="13.5"/>
-    <rect x="86" y="172" width="68" height="68" rx="13.5" ry="13.5"/>
-    <rect x="172" y="172" width="68" height="68" rx="13.5" ry="13.5"/>
-  </g>
+  <!-- Swiss 2x2 architectural C-grid: deep royal navy C + emerald jade & layered aqua-mint sync cells -->
+  <path fill="#1F459E" d="M22,0 H111 V38 H52 A14,14 0 0 0 38,52 V188 A14,14 0 0 0 52,202 H111 V240 H22 A22,22 0 0 1 0,218 V22 A22,22 0 0 1 22,0 Z"/>
+  <path fill="#0FA87E" d="M129,0 H218 A22,22 0 0 1 240,22 V91 A20,20 0 0 1 220,111 H149 A20,20 0 0 1 129,91 Z"/>
+  <path fill="#45D6AC" d="M149,129 H220 A20,20 0 0 1 240,149 V218 A22,22 0 0 1 218,240 H129 V149 A20,20 0 0 1 149,129 Z"/>
+  <path fill="#84EED0" d="M149,129 H208 V192 A16,16 0 0 1 192,208 H129 V149 A20,20 0 0 1 149,129 Z"/>
 </svg>
