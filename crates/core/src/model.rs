@@ -1958,6 +1958,10 @@ pub struct Workbook {
         crate::pivot_multi::PivotGrid,
         (u32, u32, u32, u32),
     )>,
+    /// 现代化一等公民数据透视表对象集合（包含导入还原与会话新建，支持跨表/样式/下钻/持久化）
+    pub pivots: Vec<crate::pivot_engine::PivotTableModel>,
+    /// 被用户修改或删除的导入透视表部件路径，保存时从基准包中干净剥离
+    pub pivots_removed_parts: Vec<String>,
     /// 样式表（单元格只存索引，见 Sheet.styles）
     pub styles: crate::style::StyleTable,
     pub sheets: Vec<Sheet>,
@@ -2004,6 +2008,8 @@ impl Workbook {
             pivots_pending: Vec::new(),
             pivot_calc_fields: Vec::new(),
             pivots_pending2: Vec::new(),
+            pivots: Vec::new(),
+            pivots_removed_parts: Vec::new(),
             sheets: vec![Sheet::new("Sheet1")],
             path: None,
             decrypted: None,

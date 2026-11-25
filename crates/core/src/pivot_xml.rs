@@ -37,13 +37,7 @@ fn esc(s: &str) -> String {
 }
 
 fn agg_label(a: Agg) -> &'static str {
-    match a {
-        Agg::Sum => "求和项",
-        Agg::Count => "计数项",
-        Agg::Avg => "平均值项",
-        Agg::Max => "最大值项",
-        Agg::Min => "最小值项",
-    }
+    crate::pivot::agg_prefix(a)
 }
 
 /// 在已保存的文件上追加透视表部件；返回 cacheId
@@ -537,6 +531,36 @@ fn attach2_impl(
             &refreshed_by,
         )?,
     };
+    write_parts(path, &plan, cache_id, table_idx, def, records, def_table)
+}
+
+/// 将一等公民 [`crate::pivot_engine::PivotTableModel`]（支持跨表源区/页筛选/排序/样式/计算字段）挂入已保存的 `.xlsx`。
+pub fn attach_model_for_session_wb(
+    path: &Path,
+    wb: &crate::model::Workbook,
+    model: &crate::pivot_engine::PivotTableModel,
+    session: &str,
+) -> Result<u32> {
+    let target_sheet = wb
+        .sheets
+        .get(model.target_sheet)
+        .context("透视表目标工作表不存在")?;
+    let plan = AttachmentPlan::read(path, &target_sheet.name)?;
+    let cache_id = plan.cache_id;
+    let table_idx = plan.table_idx;
+    let refreshed_by = format!("sheetcore:{session}");
+    let table_name = if model.name.trim().is_empty() {
+        plan.table_name.clone()
+    } else {
+        model.name.clone()
+    };
+    let (def, records, def_table) = crate::pivot_parts2::build_model_wb(
+        wb,
+        model,
+        cache_id,
+        &table_name,
+        &refreshed_by,
+    )?;
     write_parts(path, &plan, cache_id, table_idx, def, records, def_table)
 }
 

@@ -26,6 +26,7 @@ mod wps_dialogs;
 mod format_borders;
 mod wps_tools;
 mod wps_menus;
+mod pivot_ui;
 
 use document_tasks::{CalculatedSnapshot, DocumentTasks};
 use error_opts::ErrorCheckOptions;
@@ -2425,6 +2426,8 @@ struct SheetApp {
     name_err: String,
     /// 最近生成的透视表：(表索引, 规格, 结果区域)
     pivot_last: Option<(usize, sheetcore::pivot::PivotSpec, (u32, u32, u32, u32))>,
+    /// 现代化多透视表交互状态（创建向导、右侧字段停靠栏、筛选弹窗、切片器等）
+    pivot_ui: pivot_ui::PivotUiState,
     /// 点了功能区的“对话框启动器”
     fmt_pending: bool,
     /// 页面视图的绘制缩放（普通视图为 1）
@@ -2960,6 +2963,21 @@ enum CtxAct {
     SheetList,
     ProtectSheet,
     TabColor(Option<[u8; 3]>),
+    // 数据透视表上下文动作
+    PivotRefresh,
+    PivotDrillDown,
+    PivotSortValDesc,
+    PivotSortValAsc,
+    PivotSortLabelAsc,
+    PivotSortLabelDesc,
+    PivotAgg(sheetcore::pivot::Agg),
+    PivotShowAs(sheetcore::pivot_multi::ShowAs),
+    PivotExpandAll,
+    PivotCollapseAll,
+    PivotToggleFieldList,
+    PivotInsertSlicer,
+    PivotOptions,
+    PivotDelete,
 }
 
 /// 一行菜单项；`strip` 为真的行画粘贴选项图标条
@@ -4017,6 +4035,7 @@ impl SheetApp {
             name_scope_local: false,
             name_err: String::new(),
             pivot_last: None,
+            pivot_ui: pivot_ui::PivotUiState::default(),
             fmt_pending: false,
             paint_scale: 1.0,
             extra_sel: {
@@ -4337,6 +4356,15 @@ impl SheetApp {
                 "ai" => {
                     app.show_start = false;
                     app.ai.open = true;
+                }
+                "pivot_wizard" => {
+                    app.show_start = false;
+                    app.seed_pivot_demo_data();
+                    app.open_pivot_create_wizard(None);
+                }
+                "pivot_demo" => {
+                    app.show_start = false;
+                    app.seed_pivot_demo_workbook();
                 }
                 _ => {}
             }
@@ -15016,6 +15044,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.sel = (row, col);
         self.sel_end = (row, col);
         self.nav_rect = None;
+        self.pivot_ui.field_settings = None;
+        self.pivot_ui.grid_filter = None;
+        self.pivot_ui.options_pivot_id = None;
+        self.sync_pivot_sidebar_selection();
         self.ensure_visible();
         self.status = if redo {
             format!("重做：{}", applied.label)
@@ -34658,6 +34690,72 @@ impl SheetApp {
         };
 
         let mut rows = ctx_menu_rows(has_filter);
+        if self.pivot_at_sel().is_some() {
+            let mut pivot_rows = vec![
+                CtxRow::item("刷新透视表", Some(Icon::PivotRefresh), "", CtxAct::PivotRefresh),
+                CtxRow::item("查看明细（下钻）", Some(Icon::Find), "双击", CtxAct::PivotDrillDown),
+                CtxRow::parent(
+                    "透视排序",
+                    Some(Icon::SortDesc),
+                    vec![
+                        CtxRow::item("按汇总值降序（高→低）", Some(Icon::SortDesc), "", CtxAct::PivotSortValDesc),
+                        CtxRow::item("按汇总值升序（低→高）", Some(Icon::SortAsc), "", CtxAct::PivotSortValAsc),
+                        CtxRow::item("按标签升序（A→Z）", Some(Icon::SortAsc), "", CtxAct::PivotSortLabelAsc),
+                        CtxRow::item("按标签降序（Z→A）", Some(Icon::SortDesc), "", CtxAct::PivotSortLabelDesc),
+                    ],
+                ),
+                CtxRow::parent(
+                    "值汇总方式",
+                    Some(Icon::Sum),
+                    vec![
+                        CtxRow::item("求和", None, "", CtxAct::PivotAgg(sheetcore::pivot::Agg::Sum)),
+                        CtxRow::item("计数", None, "", CtxAct::PivotAgg(sheetcore::pivot::Agg::Count)),
+                        CtxRow::item("平均值", None, "", CtxAct::PivotAgg(sheetcore::pivot::Agg::Avg)),
+                        CtxRow::item("最大值", None, "", CtxAct::PivotAgg(sheetcore::pivot::Agg::Max)),
+                        CtxRow::item("最小值", None, "", CtxAct::PivotAgg(sheetcore::pivot::Agg::Min)),
+                        CtxRow::item("非重复计数", None, "", CtxAct::PivotAgg(sheetcore::pivot::Agg::DistinctCount)),
+                        CtxRow::item("中位数", None, "", CtxAct::PivotAgg(sheetcore::pivot::Agg::Median)),
+                        CtxRow::item("标准偏差", None, "", CtxAct::PivotAgg(sheetcore::pivot::Agg::StdDev)),
+                    ],
+                ),
+                CtxRow::parent(
+                    "值显示方式",
+                    Some(Icon::Percent),
+                    vec![
+                        CtxRow::item("无计算（原值）", None, "", CtxAct::PivotShowAs(sheetcore::pivot_multi::ShowAs::Normal)),
+                        CtxRow::item("总计的百分比", None, "", CtxAct::PivotShowAs(sheetcore::pivot_multi::ShowAs::PercentOfTotal)),
+                        CtxRow::item("行汇总的百分比", None, "", CtxAct::PivotShowAs(sheetcore::pivot_multi::ShowAs::PercentOfRow)),
+                        CtxRow::item("列汇总的百分比", None, "", CtxAct::PivotShowAs(sheetcore::pivot_multi::ShowAs::PercentOfColumn)),
+                        CtxRow::item("父行汇总的百分比", None, "", CtxAct::PivotShowAs(sheetcore::pivot_multi::ShowAs::PercentOfParentRow)),
+                        CtxRow::item("按行累计汇总", None, "", CtxAct::PivotShowAs(sheetcore::pivot_multi::ShowAs::RunningTotal)),
+                        CtxRow::item("降序排名（大→小）", None, "", CtxAct::PivotShowAs(sheetcore::pivot_multi::ShowAs::RankDesc)),
+                        CtxRow::item("升序排名（小→大）", None, "", CtxAct::PivotShowAs(sheetcore::pivot_multi::ShowAs::RankAsc)),
+                        CtxRow::item("与上一项的差异", None, "", CtxAct::PivotShowAs(sheetcore::pivot_multi::ShowAs::DifferencePrev)),
+                        CtxRow::item("与上一项的差异百分比", None, "", CtxAct::PivotShowAs(sheetcore::pivot_multi::ShowAs::PercentDifferencePrev)),
+                    ],
+                ),
+                CtxRow::parent(
+                    "展开/折叠",
+                    Some(Icon::ShowDetail),
+                    vec![
+                        CtxRow::item("展开全部字段", Some(Icon::ShowDetail), "", CtxAct::PivotExpandAll),
+                        CtxRow::item("折叠全部字段", Some(Icon::HideDetail), "", CtxAct::PivotCollapseAll),
+                    ],
+                ),
+                CtxRow::item("插入切片器…", Some(Icon::Filter), "", CtxAct::PivotInsertSlicer),
+                CtxRow::item(
+                    if self.pivot_ui.sidebar_open { "隐藏字段列表" } else { "显示字段列表" },
+                    Some(Icon::ViewPane),
+                    "",
+                    CtxAct::PivotToggleFieldList,
+                ),
+                CtxRow::item("透视表选项…", Some(Icon::PivotOptions), "", CtxAct::PivotOptions),
+                CtxRow::item("删除透视表", Some(Icon::Eraser), "", CtxAct::PivotDelete),
+                CtxRow::sep(),
+            ];
+            pivot_rows.extend(rows);
+            rows = pivot_rows;
+        }
         for row in &mut rows {
             if row.is_sep() {
                 continue;
@@ -35380,6 +35478,48 @@ impl SheetApp {
                         None => "已清除工作表标签颜色".into(),
                     };
                 }
+            }
+            CtxAct::PivotRefresh => {
+                self.run_pivot_command("PivotRefresh");
+            }
+            CtxAct::PivotDrillDown => {
+                self.run_pivot_command("PivotDrillDown");
+            }
+            CtxAct::PivotSortValDesc => {
+                self.pivot_quick_sort(sheetcore::pivot_engine::FieldSortMode::ValueDesc(0));
+            }
+            CtxAct::PivotSortValAsc => {
+                self.pivot_quick_sort(sheetcore::pivot_engine::FieldSortMode::ValueAsc(0));
+            }
+            CtxAct::PivotSortLabelAsc => {
+                self.pivot_quick_sort(sheetcore::pivot_engine::FieldSortMode::PinyinAsc);
+            }
+            CtxAct::PivotSortLabelDesc => {
+                self.pivot_quick_sort(sheetcore::pivot_engine::FieldSortMode::PinyinDesc);
+            }
+            CtxAct::PivotAgg(agg) => {
+                self.pivot_quick_set_agg(agg);
+            }
+            CtxAct::PivotShowAs(sa) => {
+                self.pivot_quick_set_show_as(sa);
+            }
+            CtxAct::PivotExpandAll => {
+                self.run_pivot_command("PivotExpandAll");
+            }
+            CtxAct::PivotCollapseAll => {
+                self.run_pivot_command("PivotCollapseAll");
+            }
+            CtxAct::PivotToggleFieldList => {
+                self.run_pivot_command("PivotFieldList");
+            }
+            CtxAct::PivotInsertSlicer => {
+                self.run_pivot_command("PivotInsertSlicer");
+            }
+            CtxAct::PivotOptions => {
+                self.run_pivot_command("PivotOptionsDialog");
+            }
+            CtxAct::PivotDelete => {
+                self.run_pivot_command("PivotDelete");
             }
         }
     }
@@ -38364,6 +38504,28 @@ impl SheetApp {
             }
         }
 
+        // 现代化数据透视表网格叠加层：内置数据条、极值高亮、多级展开/折叠 [+]/[-]、行列筛选 ▾、源变更刷新浮标
+        {
+            let piv_grid_vis = Rect::from_min_max(
+                egui::pos2(origin.x + head_w, origin.y + hh),
+                resp.rect.max,
+            )
+            .intersect(painter.clip_rect());
+            if piv_grid_vis.width() > 1.0 && piv_grid_vis.height() > 1.0 {
+                let piv_painter = painter.with_clip_rect(piv_grid_vis);
+                self.draw_pivot_grid_overlays(
+                    ui,
+                    &piv_painter,
+                    &px_of,
+                    &py_of,
+                    &cols,
+                    &rows,
+                    piv_grid_vis,
+                    readonly,
+                );
+            }
+        }
+
         // 复制/剪切选区蚂蚁线（仅在可见视口交集内生成单 Mesh 虚线框；聚焦且 20s 内 6Hz 步进，失焦或超时后静止 0Hz 保空闲休眠）
         if !readonly {
             if let Some(clip) = self.clip.as_ref().filter(|c| c.sheet == self.sheet_idx) {
@@ -39928,12 +40090,14 @@ impl SheetApp {
                     if self.format_painter.is_some() {
                         self.apply_format_painter();
                     }
-                    // 双击单元格进入编辑（Excel 的基础操作）
+                    // 双击单元格：落在数据透视表数值格则下钻明细，否则进入编辑（Excel 的基础操作）
                     let body_double = resp.double_clicked()
                         && pos.x > origin.x + head_w
                         && pos.y > origin.y + hh;
                     if body_double {
-                        self.begin_edit(None);
+                        if !self.try_drill_down_pivot_at(hit.0, hit.1) {
+                            self.begin_edit(None);
+                        }
                     }
                 }
             }
@@ -46689,6 +46853,16 @@ impl eframe::App for SheetApp {
         self.spark_dialog(ctx);
         self.tb_dialog(ctx);
         self.slicer_window(ctx);
+        self.poll_pivot_model_bg();
+        self.tick_pivot_auto_refresh();
+        self.draw_pivot_create_wizard(ctx);
+        self.draw_pivot_field_settings_popup(ctx);
+        self.draw_pivot_options_dialog(ctx);
+        self.draw_pivot_grid_filter_popup(ctx);
+        self.draw_pivot_slicer_picker(ctx);
+        if !self.show_start && !self.backstage {
+            self.draw_modern_pivot_slicers(ctx);
+        }
         self.forecast_dialog(ctx);
         self.subtotal_dialog(ctx);
         self.flashfill_dialog(ctx);
@@ -48065,6 +48239,9 @@ impl eframe::App for SheetApp {
         if !self.show_start && !self.backstage && self.ai.open {
             self.draw_ai_panel(ctx);
         }
+        if !self.show_start && !self.backstage {
+            self.draw_pivot_sidebar(ctx);
+        }
 
         egui::CentralPanel::default()
             .frame(if self.show_start {
@@ -48170,6 +48347,7 @@ impl eframe::App for SheetApp {
             || self.tasks.recalc_cancel.is_some()
             || self.bg_deps_rx.is_some()
             || self.bg_recalc_rx.is_some()
+            || self.pivot_ui.bg_rx.is_some()
             || self.ai.busy;
         let ants_animating = !self.show_start
             && !self.backstage

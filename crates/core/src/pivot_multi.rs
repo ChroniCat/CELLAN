@@ -29,15 +29,43 @@ pub enum ShowAs {
     PercentOfRow,
     PercentOfColumn,
     PercentOfTotal,
-    /// 与上一项（同一行里前一列）的差
+    /// 占父行汇总百分比
+    PercentOfParentRow,
+    /// 占父列汇总百分比
+    PercentOfParentCol,
+    /// 按行累计汇总
+    RunningTotal,
+    /// 按行占累计汇总百分比
+    PercentRunningTotal,
+    /// 降序排名（最大为 1）
+    RankDesc,
+    /// 升序排名（最小为 1）
+    RankAsc,
+    /// 与上一项（或基准项）的差
     DifferencePrev,
-    /// 与上一项的百分比差
+    /// 与上一项（或基准项）的百分比差
     PercentDifferencePrev,
     /// Excel 的「索引」：(值 × 总计) ÷ (行合计 × 列合计)
     Index,
 }
 
 impl ShowAs {
+    pub const ALL: &'static [ShowAs] = &[
+        ShowAs::Normal,
+        ShowAs::PercentOfTotal,
+        ShowAs::PercentOfRow,
+        ShowAs::PercentOfColumn,
+        ShowAs::PercentOfParentRow,
+        ShowAs::PercentOfParentCol,
+        ShowAs::RunningTotal,
+        ShowAs::PercentRunningTotal,
+        ShowAs::RankDesc,
+        ShowAs::RankAsc,
+        ShowAs::DifferencePrev,
+        ShowAs::PercentDifferencePrev,
+        ShowAs::Index,
+    ];
+
     /// Excel 写在 `<dataField showDataAs="...">` 里的值
     pub fn xml(self) -> Option<&'static str> {
         match self {
@@ -45,9 +73,33 @@ impl ShowAs {
             ShowAs::PercentOfRow => Some("percentOfRow"),
             ShowAs::PercentOfColumn => Some("percentOfColumn"),
             ShowAs::PercentOfTotal => Some("percentOfTotal"),
+            ShowAs::PercentOfParentRow => Some("percentOfParentRow"),
+            ShowAs::PercentOfParentCol => Some("percentOfParentCol"),
+            ShowAs::RunningTotal => Some("runTotal"),
+            ShowAs::PercentRunningTotal => Some("percentOfRunningTotal"),
+            ShowAs::RankDesc => Some("rankDescending"),
+            ShowAs::RankAsc => Some("rankAscending"),
             ShowAs::DifferencePrev => Some("difference"),
             ShowAs::PercentDifferencePrev => Some("percent"),
             ShowAs::Index => Some("index"),
+        }
+    }
+
+    pub fn from_ooxml(s: Option<&str>) -> Self {
+        match s {
+            Some("percentOfRow") => ShowAs::PercentOfRow,
+            Some("percentOfColumn") => ShowAs::PercentOfColumn,
+            Some("percentOfTotal") => ShowAs::PercentOfTotal,
+            Some("percentOfParentRow") => ShowAs::PercentOfParentRow,
+            Some("percentOfParentCol") => ShowAs::PercentOfParentCol,
+            Some("runTotal") => ShowAs::RunningTotal,
+            Some("percentOfRunningTotal") => ShowAs::PercentRunningTotal,
+            Some("rankDescending") => ShowAs::RankDesc,
+            Some("rankAscending") => ShowAs::RankAsc,
+            Some("difference") => ShowAs::DifferencePrev,
+            Some("percent") | Some("percentDiff") => ShowAs::PercentDifferencePrev,
+            Some("index") => ShowAs::Index,
+            _ => ShowAs::Normal,
         }
     }
 
@@ -58,17 +110,26 @@ impl ShowAs {
             ShowAs::PercentOfRow
                 | ShowAs::PercentOfColumn
                 | ShowAs::PercentOfTotal
+                | ShowAs::PercentOfParentRow
+                | ShowAs::PercentOfParentCol
+                | ShowAs::PercentRunningTotal
                 | ShowAs::PercentDifferencePrev
         )
     }
 
-    /// 界面上的中文名
+    /// 界面上的中文名（保留原有 7 项稳定标签，供既有测试与紧凑控件使用）
     pub fn label(self) -> &'static str {
         match self {
             ShowAs::Normal => "值",
             ShowAs::PercentOfRow => "占行合计%",
             ShowAs::PercentOfColumn => "占列合计%",
             ShowAs::PercentOfTotal => "占总计%",
+            ShowAs::PercentOfParentRow => "占父行汇总%",
+            ShowAs::PercentOfParentCol => "占父列汇总%",
+            ShowAs::RunningTotal => "累计汇总",
+            ShowAs::PercentRunningTotal => "占累计汇总%",
+            ShowAs::RankDesc => "降序排名",
+            ShowAs::RankAsc => "升序排名",
             ShowAs::DifferencePrev => "与上一项差",
             ShowAs::PercentDifferencePrev => "与上一项差%",
             ShowAs::Index => "索引",
@@ -242,6 +303,10 @@ impl Acc {
             }
             Agg::Max => self.max.map(Value::Number).unwrap_or(Value::Empty),
             Agg::Min => self.min.map(Value::Number).unwrap_or(Value::Empty),
+            Agg::CountNums | Agg::DistinctCount => Value::Number(self.numeric as f64),
+            Agg::Product | Agg::StdDev | Agg::StdDevP | Agg::Var | Agg::VarP | Agg::Median => {
+                Value::Number(self.sum)
+            }
         }
     }
 }
@@ -1296,7 +1361,13 @@ fn apply_show_as(grid: &mut PivotGrid, spec: &PivotSpec2) {
                         None => Value::Empty,
                     },
                     ShowAs::Index => ratio(v * total, row_sum * col_tot[c]),
-                    ShowAs::Normal => Value::Number(v),
+                    ShowAs::Normal
+                    | ShowAs::PercentOfParentRow
+                    | ShowAs::PercentOfParentCol
+                    | ShowAs::RunningTotal
+                    | ShowAs::PercentRunningTotal
+                    | ShowAs::RankDesc
+                    | ShowAs::RankAsc => Value::Number(v),
                 };
                 grid.rows[r][idx] = new;
                 prev = Some(v);

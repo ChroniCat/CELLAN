@@ -331,7 +331,93 @@ impl SheetApp {
             "SparkAxis" => st.checked = self.spark_at_sel().map(|s| s.axis).unwrap_or(false),
             // 没有选中文本框时，编辑/删除不可用（和 Excel 一样）
             "EditTextBox" | "DeleteTextBox" => st.enabled = self.tb_sel.is_some(),
-            "InsertSlicer" => st.enabled = self.pivot_last.is_some(),
+            "InsertSlicer" => st.enabled = self.active_pivot().is_some() || self.pivot_last.is_some(),
+            "PivotName" => {
+                if let Some(p) = self.active_pivot() {
+                    st.text = Some(format!("名称：{}", p.name));
+                } else {
+                    st.visible = false;
+                }
+            }
+            "PivotSourceRange" => {
+                if let Some(p) = self.active_pivot() {
+                    st.text = Some(format!(
+                        "源 {}!{}:{}",
+                        p.source_sheet,
+                        cell_name(p.spec.source.0, p.spec.source.1),
+                        cell_name(p.spec.source.2, p.spec.source.3)
+                    ));
+                } else {
+                    st.visible = false;
+                }
+            }
+            "PivotFieldList" => st.checked = self.pivot_ui.sidebar_open,
+            "PivotToggleAutoRefresh" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.auto_refresh);
+            }
+            "PivotToggleDataBars" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.show_data_bars);
+            }
+            "PivotToggleOutliers" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.highlight_outliers);
+            }
+            "PivotRepeatLabels" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.repeat_labels);
+            }
+            "PivotBandedRows" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.banded_rows);
+            }
+            "PivotBandedCols" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.banded_cols);
+            }
+            "PivotLayoutCompact" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.report_layout == sheetcore::pivot_engine::ReportLayout::Compact);
+            }
+            "PivotLayoutOutline" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.report_layout == sheetcore::pivot_engine::ReportLayout::Outline);
+            }
+            "PivotLayoutTabular" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.report_layout == sheetcore::pivot_engine::ReportLayout::Tabular);
+            }
+            "PivotSubtotalsOff" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.subtotal_pos == sheetcore::pivot_engine::SubtotalPos::Off);
+            }
+            "PivotSubtotalsTop" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.subtotal_pos == sheetcore::pivot_engine::SubtotalPos::Top);
+            }
+            "PivotSubtotalsBottom" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.subtotal_pos == sheetcore::pivot_engine::SubtotalPos::Bottom);
+            }
+            "PivotGrandBoth" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.row_grand_totals && p.options.col_grand_totals);
+            }
+            "PivotGrandRow" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.row_grand_totals && !p.options.col_grand_totals);
+            }
+            "PivotGrandCol" => {
+                st.checked = self.active_pivot().is_some_and(|p| !p.options.row_grand_totals && p.options.col_grand_totals);
+            }
+            "PivotGrandOff" => {
+                st.checked = self.active_pivot().is_some_and(|p| !p.options.row_grand_totals && !p.options.col_grand_totals);
+            }
+            "PivotStyleBlue" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.style_theme == sheetcore::pivot_engine::PivotStyleTheme::Blue);
+            }
+            "PivotStyleGreen" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.style_theme == sheetcore::pivot_engine::PivotStyleTheme::Green);
+            }
+            "PivotStyleSlate" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.style_theme == sheetcore::pivot_engine::PivotStyleTheme::Slate);
+            }
+            "PivotStyleAmber" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.style_theme == sheetcore::pivot_engine::PivotStyleTheme::Amber);
+            }
+            "PivotStyleDark" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.style_theme == sheetcore::pivot_engine::PivotStyleTheme::Dark);
+            }
+            "PivotStyleMinimal" => {
+                st.checked = self.active_pivot().is_some_and(|p| p.options.style_theme == sheetcore::pivot_engine::PivotStyleTheme::Minimal);
+            }
             "TableName" => {
                 if let Some(t) = self.table_at_sel() {
                     st.text = Some(format!("表名：{}", t.display));
@@ -783,24 +869,7 @@ impl SheetApp {
                 self.chart_mgr = true;
                 self.reload_charts();
             }
-            "InsertPivot" => {
-                let (r, c) = self.sel;
-                let (r1, c1, r2, c2) =
-                    sheetcore::sort_filter::current_region(self.wb.sheet(self.sheet_idx), r, c);
-                if c2 <= c1 || r2 <= r1 {
-                    self.status = "当前区域太小，选一个带表头的表格".into();
-                } else {
-                    self.pivot_edit = Some(sheetcore::pivot::PivotSpec {
-                        source: (r1, c1, r2, c2),
-                        row_field: c1,
-                        col_field: None,
-                        value_field: c2,
-                        agg: sheetcore::pivot::Agg::Sum,
-                        group: sheetcore::pivot::GroupBy::None,
-                        exclude: Vec::new(),
-                    });
-                }
-            }
+            "InsertPivot" => self.open_pivot_create_wizard(None),
             "InsertPicture" => {
                 if let Some(p) = rfd::FileDialog::new()
                     .add_filter("图片", &["png", "jpg", "jpeg", "gif", "bmp"])
@@ -814,16 +883,24 @@ impl SheetApp {
                 self.open_note_editor(Some(ctx));
             }
             "InsertSymbol" => self.symbol_dlg = true,
-            "RefreshPivot" => self.refresh_pivot(),
+            "RefreshPivot" => self.refresh_pivots_modern(false),
             "PivotOptions" => {
-                if let Some((_, spec, _)) = self.pivot_last.clone() {
+                if self.active_pivot().is_some() {
+                    self.run_pivot_command("PivotOptionsDialog");
+                } else if let Some((_, spec, _)) = self.pivot_last.clone() {
                     self.pivot_edit = Some(spec);
                 } else {
                     self.status = "先选中数据区域再新建透视表".into();
                 }
             }
             "WorkbookLinks" => self.xlink_dlg = true,
-            "InsertSlicer" => self.slicer_open(),
+            "InsertSlicer" => {
+                if self.active_pivot().is_some() {
+                    self.run_pivot_command("PivotInsertSlicer");
+                } else {
+                    self.slicer_open();
+                }
+            }
 
             // ---------------------------------------------------- 页面布局
             // UI-26：页面设置入口（功能区/命令搜索/探针共用）
@@ -1324,18 +1401,13 @@ impl SheetApp {
             // ---------------------------------------------------- 表设计
             "TablePivot" => {
                 if let Some(t) = self.table_at_sel() {
-                    let (r1, c1, r2, c2) = t.range;
-                    self.pivot_edit = Some(sheetcore::pivot::PivotSpec {
-                        source: (r1, c1, r2, c2),
-                        row_field: c1,
-                        col_field: None,
-                        group: sheetcore::pivot::GroupBy::None,
-                        exclude: Vec::new(),
-                        value_field: c2,
-                        agg: sheetcore::pivot::Agg::Sum,
-                    });
+                    self.open_pivot_create_wizard(Some(t.range));
                 }
             }
+            // ---------------------------------------------------- 数据透视表分析 & 设计
+            "PivotRefresh" | "PivotRefreshAll" | "PivotChangeSource" | "PivotToggleAutoRefresh" | "PivotInsertSlicer" | "PivotDrillDown" | "PivotExpandAll" | "PivotCollapseAll" | "PivotCalcField" | "PivotOptionsDialog" | "PivotDelete" | "PivotFieldList" => { self.run_pivot_command(action); }
+            "PivotLayoutCompact" | "PivotLayoutOutline" | "PivotLayoutTabular" | "PivotSubtotalsBottom" | "PivotSubtotalsTop" | "PivotSubtotalsOff" | "PivotGrandBoth" | "PivotGrandRow" | "PivotGrandCol" | "PivotGrandOff" | "PivotRepeatLabels" => { self.run_pivot_command(action); }
+            "PivotBandedRows" | "PivotBandedCols" | "PivotToggleDataBars" | "PivotToggleOutliers" | "PivotStyleBlue" | "PivotStyleGreen" | "PivotStyleSlate" | "PivotStyleAmber" | "PivotStyleDark" | "PivotStyleMinimal" => { self.run_pivot_command(action); }
             "TableSelect" => {
                 if let Some(t) = self.table_at_sel() {
                     self.sel = (t.range.0, t.range.1);

@@ -920,7 +920,7 @@ pub(crate) mod tests {
     fn parses_and_ids_are_unique() {
         let r = load();
         assert_eq!(r.tabs.len(), 9, "页签数");
-        assert_eq!(r.context.len(), 3, "上下文页签数（表设计 / 迷你图 / 图表工具）");
+        assert_eq!(r.context.len(), 5, "上下文页签数（表设计 / 迷你图 / 图表工具 / 透视表分析 / 透视表设计）");
         let ids = all_ids(&r);
         let mut seen = BTreeSet::new();
         for id in &ids {
@@ -941,6 +941,8 @@ pub(crate) mod tests {
         assert_eq!(r.context[0].tab.label, "表设计");
         assert_eq!(r.context[1].tab.label, "迷你图");
         assert_eq!(r.context[2].tab.label, "图表工具");
+        assert_eq!(r.context[3].tab.label, "透视表分析");
+        assert_eq!(r.context[4].tab.label, "透视表设计");
     }
 
     /// 从 ribbon_action 的 match 臂里抽出「精确命令名」集合。

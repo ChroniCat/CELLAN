@@ -29,6 +29,11 @@ pub fn insert_sheet(wb: &mut Workbook, idx: usize, mut sheet: Sheet) -> bool {
     for (i, ..) in &mut wb.pivots_pending2 {
         if *i >= idx { *i += 1; }
     }
+    for p in &mut wb.pivots {
+        if p.target_sheet >= idx {
+            p.target_sheet += 1;
+        }
+    }
     wb.sheets.insert(idx, sheet);
     wb.dirty = true;
     true
@@ -53,7 +58,17 @@ fn rename_impl(wb: &mut Workbook, idx: usize, name: &str, journal: Option<&mut R
         return false;
     }
     let old = wb.sheets[idx].name.clone();
+    let sid = wb.sheets[idx].identity;
     wb.sheets[idx].name = name.to_owned();
+    for p in &mut wb.pivots {
+        if p.source_sheet_id == Some(sid) || p.source_sheet.eq_ignore_ascii_case(&old) {
+            p.source_sheet = name.to_owned();
+            p.source_sheet_id = Some(sid);
+            if p.imported_part.is_none() {
+                p.modified = true;
+            }
+        }
+    }
     rewrite_qualifiers(wb, &old, Some(name), None, journal);
     wb.dirty = true;
     true
@@ -85,6 +100,23 @@ pub fn delete_sheet(wb: &mut Workbook, idx: usize) -> bool {
     for (sheet, ..) in &mut wb.pivots_pending2 {
         if *sheet > idx { *sheet -= 1; }
     }
+    let mut removed_parts = Vec::new();
+    wb.pivots.retain(|p| {
+        if p.target_sheet == idx {
+            if let Some(part) = &p.imported_part {
+                removed_parts.push(part.clone());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    wb.pivots_removed_parts.extend(removed_parts);
+    for p in &mut wb.pivots {
+        if p.target_sheet > idx {
+            p.target_sheet -= 1;
+        }
+    }
     wb.dirty = true;
     true
 }
@@ -103,6 +135,7 @@ pub fn move_sheet(wb: &mut Workbook, from: usize, to: usize) -> bool {
     }
     for (sheet, ..) in &mut wb.pivots_pending { *sheet = remap(*sheet); }
     for (sheet, ..) in &mut wb.pivots_pending2 { *sheet = remap(*sheet); }
+    for p in &mut wb.pivots { p.target_sheet = remap(p.target_sheet); }
     wb.dirty = true;
     true
 }

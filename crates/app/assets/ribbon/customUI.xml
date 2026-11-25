@@ -1067,6 +1067,89 @@
           </group>
         </tab>
       </tabSet>
+      <tabSet idMso="TabSetPivotAnalyze" label="透视表分析">
+        <tab id="TabPivotAnalyze" label="透视表分析">
+          <group id="GroupPivotInfo" label="数据透视表">
+            <box boxStyle="vertical">
+              <labelControl id="PivotName" fontSize="11"/>
+              <labelControl id="PivotSourceRange" style="weak" fontSize="10.5"/>
+            </box>
+          </group>
+          <group id="GroupPivotData" label="数据">
+            <button id="PivotRefresh" label="刷新" size="large" imageMso="PivotRefresh" screentip="刷新当前数据透视表" onAction="PivotRefresh"/>
+            <box boxStyle="vertical">
+              <button id="PivotRefreshAll" label="全部刷新" imageMso="Refresh" screentip="刷新工作簿内所有数据透视表" onAction="PivotRefreshAll" sizeString="100"/>
+              <button id="PivotChangeSource" label="更改数据源…" imageMso="Table" screentip="修改透视表的源数据区域与选项" onAction="PivotChangeSource" sizeString="104"/>
+              <toggleButton id="PivotToggleAutoRefresh" label="自动刷新" imageMso="AutoShare" screentip="源数据变化时自动刷新透视表" onAction="PivotToggleAutoRefresh" sizeString="100"/>
+            </box>
+          </group>
+          <group id="GroupPivotFilter" label="筛选与下钻">
+            <button id="PivotInsertSlicer" label="插入切片器" size="large" imageMso="Filter" screentip="插入可视化卡片按钮切片器，即点即刷" onAction="PivotInsertSlicer"/>
+            <box boxStyle="vertical">
+              <button id="PivotDrillDown" label="查看明细" imageMso="Find" screentip="下钻当前汇总单元格对应的原始明细行到新工作表（也可直接双击）" onAction="PivotDrillDown" sizeString="96"/>
+              <button id="PivotExpandAll" label="展开全部" imageMso="ShowDetail" screentip="展开多级透视表的所有分组" onAction="PivotExpandAll" sizeString="96"/>
+              <button id="PivotCollapseAll" label="折叠全部" imageMso="HideDetail" screentip="折叠多级透视表的外层分组" onAction="PivotCollapseAll" sizeString="96"/>
+            </box>
+          </group>
+          <group id="GroupPivotCalc" label="计算与操作">
+            <box boxStyle="vertical">
+              <button id="PivotCalcField" label="计算字段…" imageMso="Fx" screentip="添加或管理透视表计算字段与计算项" onAction="PivotCalcField" sizeString="104"/>
+              <button id="PivotOptionsDialog" label="透视表选项…" imageMso="PivotOptions" screentip="设置空值/错误显示、数据源、计算字段等" onAction="PivotOptionsDialog" sizeString="104"/>
+              <button id="PivotDelete" label="删除透视表" imageMso="Eraser" screentip="删除当前透视表并清除其结果区域（支持撤销）" onAction="PivotDelete" sizeString="104"/>
+            </box>
+          </group>
+          <group id="GroupPivotShow" label="显示">
+            <toggleButton id="PivotFieldList" label="字段列表" size="large" imageMso="ViewPane" screentip="显示或隐藏右侧「数据透视表字段」停靠面板" onAction="PivotFieldList"/>
+          </group>
+        </tab>
+      </tabSet>
+      <tabSet idMso="TabSetPivotDesign" label="透视表设计">
+        <tab id="TabPivotDesign" label="透视表设计">
+          <group id="GroupPivotLayout" label="布局">
+            <box boxStyle="vertical">
+              <toggleButton id="PivotLayoutCompact" label="压缩形式" imageMso="AlignL" screentip="行字段合并缩进在一列显示（Excel 默认）" onAction="PivotLayoutCompact" sizeString="94"/>
+              <toggleButton id="PivotLayoutOutline" label="大纲形式" imageMso="OutlineLevels" screentip="每个行字段独立分列并分层缩进" onAction="PivotLayoutOutline" sizeString="94"/>
+              <toggleButton id="PivotLayoutTabular" label="表格形式" imageMso="Table" screentip="传统二维明细表格形式，适合再加工" onAction="PivotLayoutTabular" sizeString="94"/>
+            </box>
+            <box boxStyle="vertical">
+              <toggleButton id="PivotSubtotalsBottom" label="底部小计" imageMso="Bottom" screentip="在每个分组底部显示分类汇总行" onAction="PivotSubtotalsBottom" sizeString="96"/>
+              <toggleButton id="PivotSubtotalsTop" label="顶部小计" imageMso="Top" screentip="在每个分组顶部显示分类汇总行" onAction="PivotSubtotalsTop" sizeString="96"/>
+              <toggleButton id="PivotSubtotalsOff" label="不显示小计" imageMso="Close" screentip="隐藏所有中间级分类汇总行" onAction="PivotSubtotalsOff" sizeString="96"/>
+            </box>
+            <box boxStyle="vertical">
+              <toggleButton id="PivotGrandBoth" label="行列总计" imageMso="Sum" screentip="同时显示行总计和列总计" onAction="PivotGrandBoth" sizeString="94"/>
+              <toggleButton id="PivotGrandRow" label="仅行总计" imageMso="FreezeCol" screentip="仅在右侧显示行总计列" onAction="PivotGrandRow" sizeString="94"/>
+              <toggleButton id="PivotGrandCol" label="仅列总计" imageMso="FreezeRow" screentip="仅在底部显示列总计行" onAction="PivotGrandCol" sizeString="94"/>
+            </box>
+            <box boxStyle="vertical">
+              <toggleButton id="PivotGrandOff" label="禁用总计" imageMso="Close" screentip="隐藏行总计与列总计" onAction="PivotGrandOff" sizeString="94"/>
+              <toggleButton id="PivotRepeatLabels" label="重复标签" imageMso="MergeSame" screentip="表格/大纲形式下每行重复填充外层项目标签" onAction="PivotRepeatLabels" sizeString="94"/>
+            </box>
+          </group>
+          <group id="GroupPivotStyleOpts" label="视觉增强">
+            <box boxStyle="vertical">
+              <toggleButton id="PivotBandedRows" label="镶边行" imageMso="Grid" screentip="交替行微底纹便于横向扫读" onAction="PivotBandedRows" sizeString="96"/>
+              <toggleButton id="PivotBandedCols" label="镶边列" imageMso="SplitColumns" screentip="交替列微底纹便于纵向对照" onAction="PivotBandedCols" sizeString="96"/>
+            </box>
+            <box boxStyle="vertical">
+              <toggleButton id="PivotToggleDataBars" label="内置数据条" imageMso="Cf" screentip="在数值单元格内直接绘制轻量占比数据条" onAction="PivotToggleDataBars" sizeString="102"/>
+              <toggleButton id="PivotToggleOutliers" label="极值高亮" imageMso="HighlightDup" screentip="自动标识前 10% 峰值与负值异常项" onAction="PivotToggleOutliers" sizeString="102"/>
+            </box>
+          </group>
+          <group id="GroupPivotStyles" label="透视表样式">
+            <box boxStyle="vertical">
+              <toggleButton id="PivotStyleBlue" label="商务蓝" imageMso="Fill" onAction="PivotStyleBlue" sizeString="84"/>
+              <toggleButton id="PivotStyleGreen" label="翡翠绿" imageMso="Fill" onAction="PivotStyleGreen" sizeString="84"/>
+              <toggleButton id="PivotStyleSlate" label="石墨灰" imageMso="Fill" onAction="PivotStyleSlate" sizeString="84"/>
+            </box>
+            <box boxStyle="vertical">
+              <toggleButton id="PivotStyleAmber" label="暖阳橙" imageMso="Fill" onAction="PivotStyleAmber" sizeString="84"/>
+              <toggleButton id="PivotStyleDark" label="深邃暗" imageMso="Fill" onAction="PivotStyleDark" sizeString="84"/>
+              <toggleButton id="PivotStyleMinimal" label="极简线" imageMso="Borders" onAction="PivotStyleMinimal" sizeString="84"/>
+            </box>
+          </group>
+        </tab>
+      </tabSet>
     </contextualTabs>
   </ribbon>
 </customUI>

@@ -686,6 +686,8 @@ pub(super) fn can_write_direct(wb: &Workbook, wants_macro: bool) -> bool {
         || !wb.links.is_empty()
         || !wb.pivots_pending.is_empty()
         || !wb.pivots_pending2.is_empty()
+        || !wb.pivots.is_empty()
+        || !wb.pivots_removed_parts.is_empty()
         || !wb.pivot_calc_fields.is_empty()
         || !wb.pivot_shifts.is_empty()
         || std::env::var("SC_FAIL_SAVE_STEP").is_ok()

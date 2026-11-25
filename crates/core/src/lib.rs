@@ -47,6 +47,8 @@ pub mod a11y;
 pub mod richtext;
 pub mod pivot;
 pub mod pivot_multi;
+pub mod pivot_engine;
+pub mod pivot_parse;
 pub mod refs;
 pub mod sheet_ops;
 pub mod pivot_parts;

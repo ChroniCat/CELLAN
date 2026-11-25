@@ -2125,6 +2125,8 @@ pub(super) fn write_with_style_receipt(
                 && sheet.source_cells.is_none()
                 && wb.pivots_pending.is_empty()
                 && wb.pivots_pending2.is_empty()
+                && !wb.pivots.iter().any(|p| p.modified || p.imported_part.is_none())
+                && wb.pivots_removed_parts.is_empty()
                 && plain_new_sheet_supported(sheet)
             {
                 let targets = match &base_targets {

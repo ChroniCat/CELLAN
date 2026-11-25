@@ -51,14 +51,8 @@ fn push_esc(out: &mut String, s: &str) {
     }
 }
 
-fn agg_label(a: Agg) -> &'static str {
-    match a {
-        Agg::Sum => "求和项:",
-        Agg::Count => "计数项:",
-        Agg::Avg => "平均值项:",
-        Agg::Max => "最大值项:",
-        Agg::Min => "最小值项:",
-    }
+fn agg_label(a: Agg) -> String {
+    format!("{}:", crate::pivot::agg_prefix(a))
 }
 
 #[inline]

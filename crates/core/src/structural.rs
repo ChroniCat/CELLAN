@@ -1326,6 +1326,103 @@ fn update_workbook_references(
         *rect = output;
         true
     });
+
+    // 同步一等公民 PivotTableModel 的源区域（按源表名/身份）与输出区域（按目标表索引）
+    let target_sid = wb.sheets[sheet_idx].identity;
+    let target_sname = wb.sheets[sheet_idx].name.clone();
+    wb.pivots.retain_mut(|p| {
+        let is_src = p.source_sheet_id == Some(target_sid)
+            || p.source_sheet.eq_ignore_ascii_case(&target_sname);
+        if is_src {
+            let Some(new_src) = map_rect(p.spec.source) else {
+                if let Some(part) = p.imported_part.take() {
+                    wb.pivots_removed_parts.push(part);
+                }
+                return false;
+            };
+            p.spec.source = new_src;
+            if axis == crate::refs::Axis::Col {
+                let mut keep_rows = Vec::new();
+                let mut keep_rext = Vec::new();
+                for (i, mut f) in std::mem::take(&mut p.spec.rows).into_iter().enumerate() {
+                    if let Some(nc) = sh.map(f.col) {
+                        f.col = nc;
+                        keep_rows.push(f);
+                        if let Some(ext) = p.options.row_ext.get(i).cloned() {
+                            keep_rext.push(ext);
+                        }
+                    }
+                }
+                p.spec.rows = keep_rows;
+                p.options.row_ext = keep_rext;
+
+                let mut keep_cols = Vec::new();
+                let mut keep_cext = Vec::new();
+                for (i, mut f) in std::mem::take(&mut p.spec.cols).into_iter().enumerate() {
+                    if let Some(nc) = sh.map(f.col) {
+                        f.col = nc;
+                        keep_cols.push(f);
+                        if let Some(ext) = p.options.col_ext.get(i).cloned() {
+                            keep_cext.push(ext);
+                        }
+                    }
+                }
+                p.spec.cols = keep_cols;
+                p.options.col_ext = keep_cext;
+
+                let mut keep_vals = Vec::new();
+                let mut keep_vext = Vec::new();
+                for (i, mut f) in std::mem::take(&mut p.spec.values).into_iter().enumerate() {
+                    if let Some(nc) = sh.map(f.col) {
+                        f.col = nc;
+                        if let Some((bc, item)) = f.base.take() {
+                            f.base = sh.map(bc).map(|nbc| (nbc, item));
+                        }
+                        keep_vals.push(f);
+                        if let Some(ext) = p.options.val_ext.get(i).cloned() {
+                            keep_vext.push(ext);
+                        }
+                    }
+                }
+                p.spec.values = keep_vals;
+                p.options.val_ext = keep_vext;
+
+                p.spec.filters.retain_mut(|f| match sh.map(f.col) {
+                    Some(nc) => {
+                        f.col = nc;
+                        true
+                    }
+                    None => false,
+                });
+                p.options.slicers.retain_mut(|s| match sh.map(s.col) {
+                    Some(nc) => {
+                        s.col = nc;
+                        true
+                    }
+                    None => false,
+                });
+            }
+            if p.imported_part.is_none() {
+                p.modified = true;
+            }
+        }
+        if p.target_sheet == sheet_idx {
+            let Some(new_out) = map_rect(p.rect) else {
+                if let Some(part) = p.imported_part.take() {
+                    wb.pivots_removed_parts.push(part);
+                }
+                return false;
+            };
+            p.anchor = (new_out.0, new_out.1);
+            p.rect = new_out;
+            p.last_meta.anchor = p.anchor;
+            p.last_meta.rect = new_out;
+            if p.imported_part.is_none() {
+                p.modified = true;
+            }
+        }
+        true
+    });
 }
 
 /// 供撤销用：一行/一列里有哪些格子

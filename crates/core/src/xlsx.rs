@@ -502,6 +502,8 @@ pub fn load_diag_with_control(
         pivot_calc_fields: Vec::new(),
         pivots_pending: Vec::new(),
         pivots_pending2: Vec::new(),
+        pivots: Vec::new(),
+        pivots_removed_parts: Vec::new(),
         calc_manual: crate::patch::calc_manual_xml(&workbook_xml),
         // calcPr/@iterate / maxIterations / maxChange（缺省 = 关闭 / 100 / 0.001）
         calc_iterate,
@@ -1038,6 +1040,9 @@ pub fn load_diag_with_control(
             definitions: pivot_definitions_with_zip(shared_zip.as_mut(), path),
             sheets: wb.sheets.iter().map(|s| (s.identity, s.name.clone())).collect(),
         });
+        if let Some(zip) = shared_zip.as_mut() {
+            wb.pivots = crate::pivot_parse::load_pivots_from_zip(zip, &wb);
+        }
         if std::env::var("SC_LOAD_PROF").is_ok() {
             eprintln!("[load] 总计 {:.2}s", t_all_load.elapsed().as_secs_f64());
         }
@@ -2627,6 +2632,8 @@ fn try_load_ooxml_from_memory(
         pivot_calc_fields: Vec::new(),
         pivots_pending: Vec::new(),
         pivots_pending2: Vec::new(),
+        pivots: Vec::new(),
+        pivots_removed_parts: Vec::new(),
         calc_manual: crate::patch::calc_manual_xml(&workbook_xml),
         calc_iterate,
         calc_max_iterations,
@@ -2856,6 +2863,7 @@ fn try_load_ooxml_from_memory(
         definitions: pivot_definitions_with_zip(Some(&mut shared_zip), path),
         sheets: wb.sheets.iter().map(|s| (s.identity, s.name.clone())).collect(),
     });
+    wb.pivots = crate::pivot_parse::load_pivots_from_zip(&mut shared_zip, &wb);
     wb.load_incomplete = diag.has_fatal();
     for sheet in &wb.sheets {
         for (cref, cell) in sheet.formula_cells() {
@@ -3628,6 +3636,19 @@ fn save_plain_at(
             wb.pivot_session.token(),
         )
         .context("多字段透视部件写入失败")?;
+    }
+    // 一等公民数据透视表对象：仅对新建或已修改的透视表写出真 pivotTable 部件（未改动的导入透视表原样保留）
+    for model in &wb.pivots {
+        if !model.modified && model.imported_part.is_some() {
+            continue;
+        }
+        crate::pivot_xml::attach_model_for_session_wb(
+            path,
+            wb,
+            model,
+            wb.pivot_session.token(),
+        )
+        .context("数据透视表部件写入失败")?;
     }
     // C12.4 计算字段：紧跟在透视表部件之后写缓存定义
     if !wb.pivot_calc_fields.is_empty() {

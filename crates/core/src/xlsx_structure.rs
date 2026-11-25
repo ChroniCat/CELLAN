@@ -82,7 +82,15 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
     if !base.exists() {
         return Ok(original());
     }
-    let owned = super::pivots::strip_plan(base, wb.pivot_session.token())?;
+    let mut extra_removed: Vec<String> = wb.pivots_removed_parts.clone();
+    for p in &wb.pivots {
+        if p.modified
+            && let Some(part) = &p.imported_part
+        {
+            extra_removed.push(part.clone());
+        }
+    }
+    let owned = super::pivots::strip_plan(base, wb.pivot_session.token(), &extra_removed)?;
     let xml = owned.replacements.get("xl/workbook.xml").cloned()
         .or_else(|| crate::fixups::read_part_file(base, "xl/workbook.xml"))
         .context("读取基准工作簿目录失败")?;

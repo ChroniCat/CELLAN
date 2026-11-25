@@ -8,16 +8,48 @@
 use crate::model::{Cell, Sheet, Value};
 use std::collections::HashSet;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Agg {
     Sum,
     Count,
     Avg,
     Max,
     Min,
+    /// 仅统计数值单元格个数（Excel: 数值计数 / countNums）
+    CountNums,
+    /// 非重复值个数（Excel: 非重复计数）
+    DistinctCount,
+    /// 乘积（Excel: product）
+    Product,
+    /// 样本标准差（Excel: stdDev）
+    StdDev,
+    /// 总体标准差（Excel: stdDevp）
+    StdDevP,
+    /// 样本方差（Excel: var）
+    Var,
+    /// 总体方差（Excel: varp）
+    VarP,
+    /// 中位数（进阶分析）
+    Median,
 }
 
 impl Agg {
+    pub const ALL: &'static [Agg] = &[
+        Agg::Sum,
+        Agg::Count,
+        Agg::Avg,
+        Agg::Max,
+        Agg::Min,
+        Agg::CountNums,
+        Agg::DistinctCount,
+        Agg::Median,
+        Agg::Product,
+        Agg::StdDev,
+        Agg::StdDevP,
+        Agg::Var,
+        Agg::VarP,
+    ];
+
     pub fn label(&self) -> &'static str {
         match self {
             Agg::Sum => "求和",
@@ -25,18 +57,71 @@ impl Agg {
             Agg::Avg => "平均值",
             Agg::Max => "最大值",
             Agg::Min => "最小值",
+            Agg::CountNums => "数值计数",
+            Agg::DistinctCount => "非重复计数",
+            Agg::Product => "乘积",
+            Agg::StdDev => "标准差",
+            Agg::StdDevP => "总体标准差",
+            Agg::Var => "方差",
+            Agg::VarP => "总体方差",
+            Agg::Median => "中位数",
         }
+    }
+
+    /// OOXML `<dataField subtotal="...">` 属性值；`None` 表示默认 sum。
+    pub fn ooxml_subtotal(self) -> Option<&'static str> {
+        match self {
+            Agg::Sum => None,
+            Agg::Count => Some("count"),
+            Agg::Avg => Some("average"),
+            Agg::Max => Some("max"),
+            Agg::Min => Some("min"),
+            Agg::CountNums => Some("countNums"),
+            Agg::DistinctCount => Some("count"),
+            Agg::Product => Some("product"),
+            Agg::StdDev => Some("stdDev"),
+            Agg::StdDevP => Some("stdDevp"),
+            Agg::Var => Some("var"),
+            Agg::VarP => Some("varp"),
+            Agg::Median => Some("average"),
+        }
+    }
+
+    pub fn from_ooxml_subtotal(s: Option<&str>) -> Self {
+        match s.unwrap_or("sum") {
+            "count" => Agg::Count,
+            "average" => Agg::Avg,
+            "max" => Agg::Max,
+            "min" => Agg::Min,
+            "countNums" => Agg::CountNums,
+            "product" => Agg::Product,
+            "stdDev" => Agg::StdDev,
+            "stdDevp" => Agg::StdDevP,
+            "var" => Agg::Var,
+            "varp" => Agg::VarP,
+            _ => Agg::Sum,
+        }
+    }
+
+    pub fn is_count_like(self) -> bool {
+        matches!(self, Agg::Count | Agg::CountNums | Agg::DistinctCount)
     }
 }
 
-/// 行字段的分组方式
+/// 行/列字段的分组方式
 #[derive(Clone, Debug, PartialEq)]
 pub enum GroupBy {
     None,
-    /// 日期按年
+    /// 日期按年（yyyy）
     Year,
+    /// 日期按季度（yyyy-Q1..Q4）
+    Quarter,
     /// 日期按月（yyyy-mm）
     Month,
+    /// 日期按周（ISO yyyy-Www）
+    Week,
+    /// 日期按日（yyyy-mm-dd）
+    Day,
     /// 数值按区间（桶宽）
     Bucket(f64),
 }
@@ -52,7 +137,10 @@ impl GroupBy {
         match self {
             GroupBy::None => "不分组".into(),
             GroupBy::Year => "按年".into(),
+            GroupBy::Quarter => "按季".into(),
             GroupBy::Month => "按月".into(),
+            GroupBy::Week => "按周".into(),
+            GroupBy::Day => "按日".into(),
             GroupBy::Bucket(n) => format!("每 {n} 一档"),
         }
     }
@@ -90,33 +178,88 @@ pub struct PivotResult {
     pub value_caption: String,
 }
 
-/// 计算透视结果
-/// 把行字段的原始值按分组方式变成标签
+/// 尝试从单元格值解析 `(年, 月, 日)`（兼容 Excel 日期序列号与常见中英文日期文本）。
+pub fn parse_date_ymd(v: &Value) -> Option<(i32, u32, u32)> {
+    match v {
+        Value::Number(serial) => {
+            if *serial >= 1.0 && *serial < 2_958_466.0 {
+                crate::formula::serial_to_date_pub(*serial)
+            } else {
+                None
+            }
+        }
+        Value::Text(t) => {
+            let t = t.trim();
+            if t.is_empty() {
+                return None;
+            }
+            // 去掉尾部时间部分
+            let date_part = t.split([' ', 'T']).next().unwrap_or(t);
+            let mut it = date_part
+                .split(['-', '/', '.', '年', '月', '日'])
+                .filter(|s| !s.is_empty());
+            let y = it.next().and_then(|s| s.parse::<i32>().ok())?;
+            let m = it.next().and_then(|s| s.parse::<u32>().ok())?;
+            let d = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+            if (1900..=2999).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d) {
+                Some((y, m, d))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = y as i64 - if m <= 2 { 1 } else { 0 };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
+fn iso_week(y: i32, m: u32, d: u32) -> (i32, u32) {
+    let cur = days_from_civil(y, m, d);
+    // 1970-01-01 was Thursday (ISO weekday = 4, 1=Mon..7=Sun)
+    let wd = (cur + 3).rem_euclid(7) + 1;
+    let thu = cur + (4 - wd);
+    // Find civil year of that Thursday
+    let z = thu + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let tm = if mp < 10 { mp + 3 } else { mp - 9 };
+    let iso_y = (yoe as i64 + era * 400 + if tm <= 2 { 1 } else { 0 }) as i32;
+    let jan4 = days_from_civil(iso_y, 1, 4);
+    let jan4_wd = (jan4 + 3).rem_euclid(7) + 1;
+    let week1_mon = jan4 - (jan4_wd - 1);
+    let w = ((cur - week1_mon).div_euclid(7) + 1).clamp(1, 53) as u32;
+    (iso_y, w)
+}
+
+/// 把行/列字段的原始值按分组方式变成标签
 pub fn group_key(v: &Value, g: &GroupBy) -> String {
     match g {
         GroupBy::None => v.display(),
-        GroupBy::Year | GroupBy::Month => {
-            let (y, m) = match v {
-                Value::Number(serial) => match crate::formula::serial_to_date_pub(*serial) {
-                    Some((y, m, _)) => (y, m),
-                    None => return v.display(),
-                },
-                Value::Text(t) => {
-                    let t = t.trim();
-                    let mut it = t.split(['-', '/', '年', '月']);
-                    let y = it.next().and_then(|s| s.parse::<i32>().ok());
-                    let m = it.next().and_then(|s| s.parse::<u32>().ok());
-                    match (y, m) {
-                        (Some(y), Some(m)) => (y, m),
-                        _ => return v.display(),
-                    }
-                }
-                _ => return v.display(),
+        GroupBy::Year | GroupBy::Quarter | GroupBy::Month | GroupBy::Week | GroupBy::Day => {
+            let Some((y, m, d)) = parse_date_ymd(v) else {
+                return v.display();
             };
-            if matches!(g, GroupBy::Year) {
-                format!("{y}")
-            } else {
-                format!("{y}-{m:02}")
+            match g {
+                GroupBy::Year => format!("{y}"),
+                GroupBy::Quarter => format!("{y}-Q{}", (m - 1) / 3 + 1),
+                GroupBy::Month => format!("{y}-{m:02}"),
+                GroupBy::Week => {
+                    let (iy, w) = iso_week(y, m, d);
+                    format!("{iy}-W{w:02}")
+                }
+                GroupBy::Day => format!("{y}-{m:02}-{d:02}"),
+                _ => unreachable!(),
             }
         }
         GroupBy::Bucket(w) => {
@@ -338,6 +481,10 @@ impl PivotAcc {
                 Agg::Avg => Value::Number(self.sum / self.numeric as f64),
                 Agg::Max => Value::Number(self.max),
                 Agg::Min => Value::Number(self.min),
+                Agg::CountNums | Agg::DistinctCount => Value::Number(self.numeric as f64),
+                Agg::Product | Agg::StdDev | Agg::StdDevP | Agg::Var | Agg::VarP | Agg::Median => {
+                    Value::Number(self.sum)
+                }
                 Agg::Count => unreachable!(),
             }
         }
@@ -664,6 +811,14 @@ pub fn agg_prefix(agg: Agg) -> &'static str {
         Agg::Avg => "平均值项",
         Agg::Max => "最大值项",
         Agg::Min => "最小值项",
+        Agg::CountNums => "数值计数项",
+        Agg::DistinctCount => "非重复计数项",
+        Agg::Product => "乘积项",
+        Agg::StdDev => "标准差项",
+        Agg::StdDevP => "总体标准差项",
+        Agg::Var => "方差项",
+        Agg::VarP => "总体方差项",
+        Agg::Median => "中位数项",
     }
 }
 

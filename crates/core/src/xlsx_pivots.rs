@@ -142,7 +142,7 @@ fn clean_containers(xml: &[u8]) -> Result<Vec<u8>> {
     Ok(writer.into_inner())
 }
 
-pub(super) fn strip_plan(path: &Path, session: &str) -> Result<StripPlan> {
+pub(super) fn strip_plan(path: &Path, session: &str, extra_removed_tables: &[String]) -> Result<StripPlan> {
     let mut plan = StripPlan::default();
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
     let names: Vec<String> = zip.file_names().map(str::to_owned).collect();
@@ -164,12 +164,44 @@ pub(super) fn strip_plan(path: &Path, session: &str) -> Result<StripPlan> {
             plan.removed.insert(part.clone());
         }
     }
-    if plan.removed.is_empty() { return Ok(plan); }
-
+    // 用户在当前会话修改或删除的导入透视表：一并剥离旧 pivotTable 部件（及不再被引用的缓存定义）
     let mut rels = HashMap::new();
     for (name, bytes) in &parts {
         if let Some(part) = owner(name) { rels.insert(part.clone(), relationships(bytes, &part)?); }
     }
+    let extra_set: HashSet<&str> = extra_removed_tables
+        .iter()
+        .map(|s| s.trim_start_matches('/'))
+        .collect();
+    for part in parts.keys() {
+        if extra_set.contains(part.as_str()) {
+            plan.removed.insert(part.clone());
+        }
+    }
+    // 若某个缓存定义只被已移除的 pivotTable 指向，则连同该缓存定义一并移除
+    if !extra_set.is_empty() {
+        let candidate_caches: HashSet<String> = rels
+            .iter()
+            .filter(|(part, _)| plan.removed.contains(*part))
+            .flat_map(|(_, list)| {
+                list.iter()
+                    .filter(|r| r.kind.ends_with("/pivotCacheDefinition"))
+                    .filter_map(|r| r.target.clone())
+            })
+            .collect();
+        for cache in candidate_caches {
+            let still_used_by_table = rels.iter().any(|(part, list)| {
+                part.starts_with("xl/pivotTables/")
+                    && !plan.removed.contains(part)
+                    && list.iter().any(|r| r.target.as_ref() == Some(&cache))
+            });
+            if !still_used_by_table {
+                plan.removed.insert(cache);
+            }
+        }
+    }
+    if plan.removed.is_empty() { return Ok(plan); }
+
     let wb_rels = rels.get("xl/workbook.xml").context("缺少透视表工作簿关系")?;
     let owned_rids: HashSet<String> = wb_rels.iter().filter(|r| r.target.as_ref().is_some_and(|t| plan.removed.contains(t))).map(|r| r.id.clone()).collect();
     let mut cache_ids = HashSet::new();

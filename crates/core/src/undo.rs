@@ -509,6 +509,110 @@ impl ArrayEdit {
     }
 }
 
+/// 一等公民数据透视表撤销/重做记录（支持新建表、改字段、刷新、样式切换、删除，不清空历史撤销栈）
+#[derive(Clone, Debug)]
+pub struct PivotUndoEdit {
+    pub target_sheet: usize,
+    /// 若本次新建透视表顺带创建了新工作表，记录插入序号与新表克隆
+    pub inserted_sheet: Option<(usize, Sheet)>,
+    /// 目标表受影响单元格（含样式）的精确前后差异
+    pub deltas: Vec<CellDelta>,
+    /// 自动列宽变更
+    pub col_widths: Vec<(u32, Option<f32>, Option<f32>)>,
+    pub pivots_before: Vec<crate::pivot_engine::PivotTableModel>,
+    pub pivots_after: Vec<crate::pivot_engine::PivotTableModel>,
+    pub removed_before: Vec<String>,
+    pub removed_after: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PivotUndoAction {
+    label: String,
+    focus: (usize, u32, u32),
+    by_site: u32,
+    edit: PivotUndoEdit,
+}
+
+impl PivotUndoAction {
+    fn apply(&mut self, wb: &mut Workbook, redo: bool) -> Applied {
+        let mut touched = Vec::new();
+        let mut style_changes = Vec::new();
+        if let Some((ins_idx, ref new_sh)) = self.edit.inserted_sheet {
+            if redo {
+                if ins_idx <= wb.sheets.len() {
+                    wb.sheets.insert(ins_idx, new_sh.clone());
+                }
+            } else if ins_idx < wb.sheets.len() && wb.sheets.len() > 1 {
+                wb.sheets.remove(ins_idx);
+            }
+        } else {
+            if let Some(sh) = wb.sheets.get_mut(self.edit.target_sheet) {
+                if redo {
+                    for d in &self.edit.deltas {
+                        d.replay(sh, true, &mut style_changes);
+                        touched.push((d.sheet, d.row, d.col));
+                    }
+                } else {
+                    for d in self.edit.deltas.iter().rev() {
+                        d.replay(sh, false, &mut style_changes);
+                        touched.push((d.sheet, d.row, d.col));
+                    }
+                }
+                if !self.edit.col_widths.is_empty() {
+                    let def = sh.cols.default_size();
+                    for &(c, before, after) in &self.edit.col_widths {
+                        let target = if redo { after } else { before };
+                        sh.cols.set(c, target.unwrap_or(def));
+                    }
+                    sh.layout_dirty = true;
+                }
+                sh.styles_dirty = true;
+                sh.bump_display_style_revision();
+            }
+        }
+        wb.pivots = if redo {
+            self.edit.pivots_after.clone()
+        } else {
+            self.edit.pivots_before.clone()
+        };
+        wb.pivots_removed_parts = if redo {
+            self.edit.removed_after.clone()
+        } else {
+            self.edit.removed_before.clone()
+        };
+        wb.dirty = true;
+        let total_touched = touched.len();
+        let focus = if redo {
+            if let Some((ins_idx, _)) = self.edit.inserted_sheet {
+                let anchor = wb
+                    .pivots
+                    .iter()
+                    .rev()
+                    .find(|p| p.target_sheet == ins_idx)
+                    .map(|p| p.anchor)
+                    .unwrap_or((0, 0));
+                (ins_idx, anchor.0, anchor.1)
+            } else {
+                self.focus
+            }
+        } else {
+            self.focus
+        };
+        Applied {
+            touched,
+            style_changes,
+            label: self.label.clone(),
+            focus,
+            skipped: 0,
+            structural: self.edit.inserted_sheet.is_some(),
+            refresh_sizes: None,
+            merge_changes: Vec::new(),
+            merge_conflict: false,
+            total_touched,
+        }
+    }
+}
+
 pub const COW_BATCH_THRESHOLD: usize = 16_384;
 
 enum Entry {
@@ -518,6 +622,7 @@ enum Entry {
     Structure(EntryStamp, StructureAction),
     SheetTab(EntryStamp, SheetTabAction),
     Meta(EntryStamp, Box<MetaAction>),
+    Pivot(EntryStamp, Box<PivotUndoAction>),
 }
 
 impl Entry {
@@ -530,7 +635,8 @@ impl Entry {
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
             | Self::SheetTab(s, _)
-            | Self::Meta(s, _) => *s,
+            | Self::Meta(s, _)
+            | Self::Pivot(s, _) => *s,
         }
     }
 
@@ -541,7 +647,8 @@ impl Entry {
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
             | Self::SheetTab(s, _)
-            | Self::Meta(s, _) => s,
+            | Self::Meta(s, _)
+            | Self::Pivot(s, _) => s,
         }
     }
 
@@ -577,6 +684,7 @@ impl Entry {
             Self::Structure(_, a) => &a.label,
             Self::SheetTab(_, a) => &a.label,
             Self::Meta(_, a) => &a.label,
+            Self::Pivot(_, a) => &a.label,
         }
     }
     fn by_site(&self) -> u32 {
@@ -587,6 +695,7 @@ impl Entry {
             Self::Structure(_, a) => a.by_site,
             Self::SheetTab(_, a) => a.by_site,
             Self::Meta(_, a) => a.by_site,
+            Self::Pivot(_, a) => a.by_site,
         }
     }
 }
@@ -1956,6 +2065,28 @@ impl UndoStack {
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
+    pub fn push_pivot_edit(
+        &mut self,
+        label: impl Into<String>,
+        focus: (usize, u32, u32),
+        edit: PivotUndoEdit,
+    ) {
+        self.undone.clear();
+        let approx_bytes = 512
+            + edit.deltas.len() * std::mem::size_of::<CellDelta>()
+            + edit.col_widths.len() * 16;
+        self.done.push(Entry::Pivot(
+            next_entry(approx_bytes),
+            Box::new(PivotUndoAction {
+                label: label.into(),
+                focus,
+                by_site: self.site,
+                edit,
+            }),
+        ));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
     pub fn undo_labels(&self, limit: usize) -> Vec<String> {
         self.done
             .iter()
@@ -2103,11 +2234,11 @@ impl UndoStack {
     }
 
     pub fn undo_is_structure(&self) -> bool {
-        matches!(self.done.last(), Some(Entry::Structure(..) | Entry::SheetTab(..)))
+        matches!(self.done.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..)))
     }
 
     pub fn redo_is_structure(&self) -> bool {
-        matches!(self.undone.last(), Some(Entry::Structure(..) | Entry::SheetTab(..)))
+        matches!(self.undone.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..)))
     }
 
     pub fn record_appended_sheet(&mut self, wb: &Workbook, previous_focus: (usize, u32, u32)) {
@@ -2166,6 +2297,11 @@ impl UndoStack {
             self.undone.push(self.done.pop()?);
             return Some(applied);
         }
+        if let Some(Entry::Pivot(_, action)) = self.done.last_mut() {
+            let applied = action.apply(wb, false);
+            self.undone.push(self.done.pop()?);
+            return Some(applied);
+        }
         let Entry::Structure(_, action) = self.done.last()? else { unreachable!() };
         let (before, after) = action.history.snapshots()?;
         let touched = restore_structure(wb, before, after)?;
@@ -2181,6 +2317,11 @@ impl UndoStack {
         if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::SheetTab(_, action)) = self.undone.last_mut() {
             let applied = action.apply(wb, true)?;
+            self.done.push(self.undone.pop()?);
+            return Some(applied);
+        }
+        if let Some(Entry::Pivot(_, action)) = self.undone.last_mut() {
+            let applied = action.apply(wb, true);
             self.done.push(self.undone.pop()?);
             return Some(applied);
         }

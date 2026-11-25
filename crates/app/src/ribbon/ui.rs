@@ -173,6 +173,33 @@ pub fn context_tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
             }
         }
     }
+    // 选中数据透视表时出现「透视表分析」与「透视表设计」
+    if app.active_pivot().is_some() {
+        if let Some(c) = ribbon
+            .context
+            .iter()
+            .find(|c| c.set_id == "TabSetPivotAnalyze")
+        {
+            let r = ui_kit::tab_ex(ui, &c.tab.label, app.ribbon_tab == 103, false);
+            if r.clicked() {
+                app.ribbon_tab = 103;
+                app.ribbon_collapsed = false;
+                app.ribbon_popup = None;
+            }
+        }
+        if let Some(c) = ribbon
+            .context
+            .iter()
+            .find(|c| c.set_id == "TabSetPivotDesign")
+        {
+            let r = ui_kit::tab_ex(ui, &c.tab.label, app.ribbon_tab == 104, false);
+            if r.clicked() {
+                app.ribbon_tab = 104;
+                app.ribbon_collapsed = false;
+                app.ribbon_popup = None;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -203,6 +230,9 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
         if app.ribbon_tab == 102 && app.spark_at_sel().is_none() {
             app.ribbon_tab = 1;
         }
+        if (app.ribbon_tab == 103 || app.ribbon_tab == 104) && app.active_pivot().is_none() {
+            app.ribbon_tab = 1;
+        }
     }
     let cur_style = app.current_style();
     let a11y_active = ui_kit::is_accesskit_active(ui.ctx());
@@ -224,6 +254,16 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
             .context
             .iter()
             .find(|c| c.set_id == "TabSetSparklineTools")
+            .map(|c| &c.tab),
+        103 => ribbon
+            .context
+            .iter()
+            .find(|c| c.set_id == "TabSetPivotAnalyze")
+            .map(|c| &c.tab),
+        104 => ribbon
+            .context
+            .iter()
+            .find(|c| c.set_id == "TabSetPivotDesign")
             .map(|c| &c.tab),
         n if n < ribbon.tabs.len() => Some(&ribbon.tabs[n]),
         _ => None,
