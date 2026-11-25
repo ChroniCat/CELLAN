@@ -33,6 +33,8 @@ pub struct CellView {
     pub fill: Option<[u8; 3]>,
     /// 数据条：比例 0..1 与颜色
     pub bar: Option<(f32, [u8; 3])>,
+    /// 增强数据条（正负双向/零轴/隐藏数值）
+    pub bar_ext: Option<crate::cf::BarOverlay>,
     /// 条件格式图标集标记
     pub icon: Option<crate::cf::IconMark>,
     /// 条件格式差异边框
@@ -168,22 +170,31 @@ pub(crate) fn view_with_merge(
     };
     let mut color = crate::style::format_color(&value, &st.format).unwrap_or(st.color);
     let mut bold = st.bold;
-    let italic = st.italic;
+    let mut italic = st.italic;
     let mut fill = st.fill;
     let mut bar = None;
+    let mut bar_ext = None;
     let mut icon = None;
     let mut cf_border = None;
+    let mut text = text;
     if let Some(ov) = overlay {
         if let Some(c2) = ov.color {
             color = c2;
         }
         bold |= ov.bold;
+        italic |= ov.italic;
         if ov.fill.is_some() {
             fill = ov.fill;
         }
         bar = ov.bar;
+        bar_ext = ov.bar_ext;
         icon = ov.icon.clone();
         cf_border = ov.border.clone();
+        let hide_val = ov.icon.as_ref().is_some_and(|m| !m.show_value)
+            || ov.bar_ext.is_some_and(|b| !b.show_value);
+        if hide_val {
+            text.clear();
+        }
     }
     Some(CellView {
         text,
@@ -204,6 +215,7 @@ pub(crate) fn view_with_merge(
         merge,
         fill,
         bar,
+        bar_ext,
         icon,
         cf_border,
         rich_runs,

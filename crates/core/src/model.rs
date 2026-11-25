@@ -1840,7 +1840,7 @@ impl Sheet {
     }
 
     #[inline]
-    pub(crate) fn bump_display_style_revision(&mut self) {
+    pub fn bump_display_style_revision(&mut self) {
         self.display_style_revision = next_sheet_identity();
     }
 

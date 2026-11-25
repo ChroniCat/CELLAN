@@ -176,9 +176,18 @@ pub fn load_layout(path: &Path) -> Result<HashMap<String, SheetLayout>> {
 }
 
 pub(crate) fn sheet_layout(xml: &str, dxfs: &[crate::cf::Dxf], dxf_ext: bool) -> SheetLayout {
+    sheet_layout_with_theme(xml, dxfs, dxf_ext, &crate::style_theme::ThemeBook::default())
+}
+
+pub(crate) fn sheet_layout_with_theme(
+    xml: &str,
+    dxfs: &[crate::cf::Dxf],
+    dxf_ext: bool,
+    theme: &crate::style_theme::ThemeBook,
+) -> SheetLayout {
     let mut layout = parse_layout_with_dxfs(xml, dxfs);
     (layout.scenario_settings, layout.scenarios) = crate::scenarios::parse_with_settings(xml);
-    layout.cf = crate::cf::parse_cf_blocks(xml);
+    layout.cf = crate::cf::parse_cf_blocks_with_theme(xml, theme);
     layout.cf_ext = crate::cf::xml_has_cf_ext(xml);
     layout.dxfs = dxfs.to_vec();
     layout.dxf_ext = dxf_ext;

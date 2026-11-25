@@ -1201,15 +1201,20 @@ fn draw_cell(
         return;
     }
     let overlay = state.stats.as_ref().map(|st| {
-        crate::cf::overlay_at(&sheet.cf, st, sheet, r, c, |f, r0, c0| {
-            match state.formulas.shifted(f, r0, c0) {
-                Ok(node) => matches!(
-                    state.calc.eval_node(&node, si),
-                    crate::formula::FValue::Bool(true)
-                ),
-                Err(_) => false,
-            }
-        })
+        crate::cf::overlay_at_with_eval(
+            &sheet.cf,
+            st,
+            sheet,
+            r,
+            c,
+            |f, r0, c0| {
+                state
+                    .formulas
+                    .shifted(f, r0, c0)
+                    .ok()
+                    .map(|node| fvalue_to_value(state.calc.eval_node(&node, si)))
+            },
+        )
     });
     let mut eff: Option<crate::model::Value> = None;
     if let Some(cell) = sheet.get(r, c)
@@ -1279,14 +1284,26 @@ fn draw_view(
         out.rects.push((x, top, cw, ch, fill));
     }
 
-    // 2. 条件格式数据条
-    if !draft
-        && let Some((t, col)) = view.bar
-    {
-        let bar_w = (cw * t.clamp(0.0, 1.0)).max(0.0);
-        if bar_w > 0.5 {
-            let c_bar = if bw { [190, 190, 190] } else { col };
-            out.rects.push((x + 0.5, top + 1.0, (bar_w - 1.0).max(0.5), (ch - 2.0).max(1.0), c_bar));
+    // 2. 条件格式数据条（支持正负双向与零轴线）
+    if !draft {
+        if let Some(bex) = view.bar_ext {
+            let bx0 = x + cw * bex.start.clamp(0.0, 1.0);
+            let bx1 = x + cw * bex.end.clamp(0.0, 1.0);
+            let bar_w = (bx1 - bx0).max(0.0);
+            if bar_w > 0.5 {
+                let c_bar = if bw { [190, 190, 190] } else { bex.color };
+                out.rects.push((bx0 + 0.5, top + 1.0, (bar_w - 1.0).max(0.5), (ch - 2.0).max(1.0), c_bar));
+            }
+            if let Some(ax) = bex.axis {
+                let ax_x = x + cw * ax.clamp(0.0, 1.0);
+                out.lines.push((ax_x, top + 0.5, ax_x, top + ch - 0.5, 0.5, [100, 100, 100]));
+            }
+        } else if let Some((t, col)) = view.bar {
+            let bar_w = (cw * t.clamp(0.0, 1.0)).max(0.0);
+            if bar_w > 0.5 {
+                let c_bar = if bw { [190, 190, 190] } else { col };
+                out.rects.push((x + 0.5, top + 1.0, (bar_w - 1.0).max(0.5), (ch - 2.0).max(1.0), c_bar));
+            }
         }
     }
 

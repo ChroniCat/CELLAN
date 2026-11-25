@@ -104,29 +104,120 @@ pub(crate) struct FillSeriesDlgState {
 pub(crate) enum CfRuleOp {
     Greater,
     Less,
+    GreaterEq,
+    LessEq,
     Between,
+    NotBetween,
     Equal,
+    NotEqual,
     TextContains,
+    TextNotContains,
+    TextBeginsWith,
+    TextEndsWith,
+    TimePeriod,
+    TopN,
+    BottomN,
+    AboveAvg,
+    BelowAvg,
+    Duplicate,
+    Unique,
+    Blanks,
+    NoBlanks,
+    Errors,
+    NoErrors,
+    Formula,
+    DataBar,
+    ColorScale,
+    IconSet,
 }
 
 impl CfRuleOp {
+    pub(crate) const ALL: [CfRuleOp; 27] = [
+        CfRuleOp::Greater,
+        CfRuleOp::Less,
+        CfRuleOp::GreaterEq,
+        CfRuleOp::LessEq,
+        CfRuleOp::Between,
+        CfRuleOp::NotBetween,
+        CfRuleOp::Equal,
+        CfRuleOp::NotEqual,
+        CfRuleOp::TextContains,
+        CfRuleOp::TextNotContains,
+        CfRuleOp::TextBeginsWith,
+        CfRuleOp::TextEndsWith,
+        CfRuleOp::TimePeriod,
+        CfRuleOp::TopN,
+        CfRuleOp::BottomN,
+        CfRuleOp::AboveAvg,
+        CfRuleOp::BelowAvg,
+        CfRuleOp::Duplicate,
+        CfRuleOp::Unique,
+        CfRuleOp::Blanks,
+        CfRuleOp::NoBlanks,
+        CfRuleOp::Errors,
+        CfRuleOp::NoErrors,
+        CfRuleOp::Formula,
+        CfRuleOp::DataBar,
+        CfRuleOp::ColorScale,
+        CfRuleOp::IconSet,
+    ];
     pub(crate) fn title(self) -> &'static str {
         match self {
             CfRuleOp::Greater => "大于",
             CfRuleOp::Less => "小于",
+            CfRuleOp::GreaterEq => "大于等于",
+            CfRuleOp::LessEq => "小于等于",
             CfRuleOp::Between => "介于",
+            CfRuleOp::NotBetween => "不介于",
             CfRuleOp::Equal => "等于",
+            CfRuleOp::NotEqual => "不等于",
             CfRuleOp::TextContains => "文本包含",
+            CfRuleOp::TextNotContains => "文本不包含",
+            CfRuleOp::TextBeginsWith => "文本开头为",
+            CfRuleOp::TextEndsWith => "文本结尾为",
+            CfRuleOp::TimePeriod => "发生日期",
+            CfRuleOp::TopN => "前 N 项 / 前 N%",
+            CfRuleOp::BottomN => "后 N 项 / 后 N%",
+            CfRuleOp::AboveAvg => "高于平均值",
+            CfRuleOp::BelowAvg => "低于平均值",
+            CfRuleOp::Duplicate => "重复值",
+            CfRuleOp::Unique => "唯一值",
+            CfRuleOp::Blanks => "空值",
+            CfRuleOp::NoBlanks => "非空值",
+            CfRuleOp::Errors => "错误值",
+            CfRuleOp::NoErrors => "无错误",
+            CfRuleOp::Formula => "自定义公式",
+            CfRuleOp::DataBar => "数据条（支持负值）",
+            CfRuleOp::ColorScale => "色阶",
+            CfRuleOp::IconSet => "图标集",
         }
+    }
+    fn uses_dxf(self) -> bool {
+        !matches!(self, CfRuleOp::DataBar | CfRuleOp::ColorScale | CfRuleOp::IconSet)
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct CfRuleDlgState {
+    pub edit_target: Option<(usize, usize)>,
+    pub sqref: String,
     pub op: CfRuleOp,
     pub v1: String,
     pub v2: String,
+    pub top_n: u32,
+    pub top_percent: bool,
+    pub period: sheetcore::cf::TimePeriod,
     pub style_idx: u8,
+    pub bold: bool,
+    pub italic: bool,
+    pub stop: bool,
+    pub bar_color: [u8; 3],
+    pub bar_neg_color: [u8; 3],
+    pub bar_show_value: bool,
+    pub scale_preset: u8,
+    pub icon_set: String,
+    pub icon_reverse: bool,
+    pub icon_show_value: bool,
 }
 
 pub(crate) fn style_preset_visuals(id: &str) -> (Color32, Color32, bool) {
@@ -195,12 +286,17 @@ fn shift_formula_coords(
 }
 
 fn cf_dxf_by_preset(app: &mut SheetApp, style_idx: u8) -> usize {
+    cf_dxf_by_preset_ext(app, style_idx, false, false)
+}
+
+fn cf_dxf_by_preset_ext(app: &mut SheetApp, style_idx: u8, bold: bool, italic: bool) -> usize {
     match style_idx {
-        1 => app.cf_dxf(false, Some([156, 101, 0]), Some([255, 235, 156])), // 黄填充深黄文本
-        2 => app.cf_dxf(false, Some([0, 97, 0]), Some([198, 239, 206])),   // 绿填充深绿文本
-        3 => app.cf_dxf(false, None, Some([255, 199, 206])),               // 仅浅红填充
-        4 => app.cf_dxf(false, Some([192, 0, 0]), None),                   // 仅红色文本
-        _ => app.cf_dxf(false, Some([156, 0, 6]), Some([255, 199, 206])),  // 浅红填充深红文本
+        1 => app.cf_dxf_ext(bold, italic, Some([156, 101, 0]), Some([255, 235, 156])), // 黄填充深黄文本
+        2 => app.cf_dxf_ext(bold, italic, Some([0, 97, 0]), Some([198, 239, 206])),   // 绿填充深绿文本
+        3 => app.cf_dxf_ext(bold, italic, None, Some([255, 199, 206])),               // 仅浅红填充
+        4 => app.cf_dxf_ext(bold, italic, Some([192, 0, 0]), None),                   // 仅红色文本
+        5 => app.cf_dxf_ext(bold, italic, Some([31, 78, 121]), Some([217, 225, 242])),// 浅蓝填充深蓝文本
+        _ => app.cf_dxf_ext(bold, italic, Some([156, 0, 6]), Some([255, 199, 206])),  // 浅红填充深红文本
     }
 }
 
@@ -2419,23 +2515,184 @@ impl SheetApp {
     //  条件格式快捷预设 + 聚焦规则对话框
     // ========================================================================
 
+    fn sel_sqref_string(&self) -> String {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        format!(
+            "{}{}:{}{}",
+            sheetcore::model::col_label(c1),
+            r1 + 1,
+            sheetcore::model::col_label(c2),
+            r2 + 1
+        )
+    }
+
     pub(crate) fn open_cf_rule_dlg(&mut self, op: CfRuleOp) {
         let (r, c) = self.sel;
         let cur_txt = self.wb.sheet(self.sheet_idx).value(r, c).display();
         let v1 = if cur_txt.is_empty() {
             match op {
-                CfRuleOp::TextContains => String::new(),
+                CfRuleOp::TextContains
+                | CfRuleOp::TextNotContains
+                | CfRuleOp::TextBeginsWith
+                | CfRuleOp::TextEndsWith => String::new(),
+                CfRuleOp::Formula => format!("={}{}>0", sheetcore::model::col_label(c), r + 1),
                 _ => "0".into(),
             }
+        } else if op == CfRuleOp::Formula {
+            format!("={}{}>0", sheetcore::model::col_label(c), r + 1)
         } else {
             cur_txt
         };
         self.cf_rule_dlg = Some(CfRuleDlgState {
+            edit_target: None,
+            sqref: self.sel_sqref_string(),
             op,
             v1,
             v2: "100".into(),
+            top_n: 10,
+            top_percent: false,
+            period: sheetcore::cf::TimePeriod::Today,
             style_idx: 0,
+            bold: false,
+            italic: false,
+            stop: false,
+            bar_color: [99, 142, 198],
+            bar_neg_color: [220, 53, 69],
+            bar_show_value: true,
+            scale_preset: 0,
+            icon_set: "3TrafficLights1".into(),
+            icon_reverse: false,
+            icon_show_value: true,
         });
+    }
+
+    pub(crate) fn open_cf_new_rule_dlg(&mut self) {
+        self.open_cf_rule_dlg(CfRuleOp::Greater);
+    }
+
+    pub(crate) fn open_cf_edit_rule_dlg(&mut self, bi: usize, ri: usize) {
+        let sh = self.wb.sheet(self.sheet_idx);
+        let Some(blk) = sh.cf.blocks.get(bi) else { return };
+        let Some(rule) = blk.rules.get(ri) else { return };
+        let sqref = blk
+            .ranges
+            .iter()
+            .map(|(r1, c1, r2, c2)| {
+                format!(
+                    "{}{}:{}{}",
+                    sheetcore::model::col_label(*c1),
+                    r1 + 1,
+                    sheetcore::model::col_label(*c2),
+                    r2 + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut st = CfRuleDlgState {
+            edit_target: Some((bi, ri)),
+            sqref,
+            op: CfRuleOp::Greater,
+            v1: String::new(),
+            v2: String::new(),
+            top_n: 10,
+            top_percent: false,
+            period: sheetcore::cf::TimePeriod::Today,
+            style_idx: 0,
+            bold: false,
+            italic: false,
+            stop: rule.stop,
+            bar_color: [99, 142, 198],
+            bar_neg_color: [220, 53, 69],
+            bar_show_value: true,
+            scale_preset: 0,
+            icon_set: "3TrafficLights1".into(),
+            icon_reverse: false,
+            icon_show_value: true,
+        };
+        if let Some(dxf_id) = rule.kind.dxf_id()
+            && let Some(dxf) = sh.cf.dxfs.get(dxf_id)
+        {
+            st.bold = dxf.bold;
+            st.italic = dxf.italic;
+            st.style_idx = match (dxf.color, dxf.fill) {
+                (Some([156, 101, 0]), Some([255, 235, 156])) => 1,
+                (Some([0, 97, 0]), Some([198, 239, 206])) => 2,
+                (None, Some([255, 199, 206])) => 3,
+                (Some([192, 0, 0]), None) => 4,
+                (Some([31, 78, 121]), Some([217, 225, 242])) => 5,
+                _ => 0,
+            };
+        }
+        match &rule.kind {
+            CfKind::CellIs { op, a, b, .. } => {
+                st.op = match op {
+                    CfOp::Greater => CfRuleOp::Greater,
+                    CfOp::Less => CfRuleOp::Less,
+                    CfOp::GreaterEq => CfRuleOp::GreaterEq,
+                    CfOp::LessEq => CfRuleOp::LessEq,
+                    CfOp::Equal => CfRuleOp::Equal,
+                    CfOp::NotEqual => CfRuleOp::NotEqual,
+                    CfOp::Between => CfRuleOp::Between,
+                    CfOp::NotBetween => CfRuleOp::NotBetween,
+                };
+                st.v1 = a.clone();
+                st.v2 = b.clone();
+            }
+            CfKind::Text { contains, .. } => {
+                st.op = CfRuleOp::TextContains;
+                st.v1 = contains.clone();
+            }
+            CfKind::TextMatch { op, text, .. } => {
+                st.op = match op {
+                    sheetcore::cf::TextOp::Contains => CfRuleOp::TextContains,
+                    sheetcore::cf::TextOp::NotContains => CfRuleOp::TextNotContains,
+                    sheetcore::cf::TextOp::BeginsWith => CfRuleOp::TextBeginsWith,
+                    sheetcore::cf::TextOp::EndsWith => CfRuleOp::TextEndsWith,
+                };
+                st.v1 = text.clone();
+            }
+            CfKind::TimePeriod { period, .. } => {
+                st.op = CfRuleOp::TimePeriod;
+                st.period = *period;
+            }
+            CfKind::Top { top, n, percent, .. } => {
+                st.op = if *top { CfRuleOp::TopN } else { CfRuleOp::BottomN };
+                st.top_n = (*n).max(1);
+                st.top_percent = *percent;
+            }
+            CfKind::Avg { above, .. } => {
+                st.op = if *above { CfRuleOp::AboveAvg } else { CfRuleOp::BelowAvg };
+            }
+            CfKind::Dup { unique, .. } => {
+                st.op = if *unique { CfRuleOp::Unique } else { CfRuleOp::Duplicate };
+            }
+            CfKind::Blanks { blank, .. } => {
+                st.op = if *blank { CfRuleOp::Blanks } else { CfRuleOp::NoBlanks };
+            }
+            CfKind::Errors { error, .. } => {
+                st.op = if *error { CfRuleOp::Errors } else { CfRuleOp::NoErrors };
+            }
+            CfKind::Expr { formula, .. } => {
+                st.op = CfRuleOp::Formula;
+                st.v1 = formula.clone();
+            }
+            CfKind::Bar { color, neg_color, show_value, .. } => {
+                st.op = CfRuleOp::DataBar;
+                st.bar_color = *color;
+                st.bar_neg_color = neg_color.unwrap_or([220, 53, 69]);
+                st.bar_show_value = *show_value;
+            }
+            CfKind::Scale { .. } => {
+                st.op = CfRuleOp::ColorScale;
+            }
+            CfKind::IconSet { set, reverse, show_value, .. } => {
+                st.op = CfRuleOp::IconSet;
+                st.icon_set = set.clone();
+                st.icon_reverse = *reverse;
+                st.icon_show_value = *show_value;
+            }
+        }
+        self.cf_rule_dlg = Some(st);
     }
 
     pub(crate) fn draw_cf_rule_dlg(&mut self, ctx: &egui::Context) {
@@ -2443,33 +2700,185 @@ impl SheetApp {
         let mut open = true;
         let mut apply = false;
         let mut close = false;
-        let title = format!("突出显示：{}", st.op.title());
+        let title = if st.edit_target.is_some() {
+            format!("编辑条件格式规则：{}", st.op.title())
+        } else {
+            format!("新建条件格式规则：{}", st.op.title())
+        };
 
-        ui_kit::window(ctx, &title, 360.0).open(&mut open).show(ctx, |ui| {
-            ui.set_width(330.0);
+        ui_kit::window(ctx, &title, 440.0).open(&mut open).show(ctx, |ui| {
+            ui.set_width(410.0);
             ui.horizontal(|ui| {
-                ui.label(if st.op == CfRuleOp::Between {
-                    "介于:"
-                } else {
-                    "条件值:"
-                });
-                ui.add(egui::TextEdit::singleline(&mut st.v1).desired_width(110.0));
-                if st.op == CfRuleOp::Between {
-                    ui.label("与");
-                    ui.add(egui::TextEdit::singleline(&mut st.v2).desired_width(110.0));
-                }
+                ui.label("规则类型:");
+                egui::ComboBox::from_id_salt("cf_rule_op_combo")
+                    .selected_text(st.op.title())
+                    .width(240.0)
+                    .show_ui(ui, |ui| {
+                        for op in CfRuleOp::ALL {
+                            ui.selectable_value(&mut st.op, op, op.title());
+                        }
+                    });
             });
-            ui.add_space(6.0);
-            ui.label(RichText::new("突出显示格式:").font(ui_kit::bold(ui_kit::T_BODY)));
-            for (idx, lbl) in [
-                (0u8, "浅红填充色深红色文本"),
-                (1, "黄填充色深黄色文本"),
-                (2, "绿填充色深绿色文本"),
-                (3, "仅浅红填充"),
-                (4, "仅红色文本"),
-            ] {
-                ui.radio_value(&mut st.style_idx, idx, lbl);
+            ui.horizontal(|ui| {
+                ui.label("应用区域:");
+                ui.add(egui::TextEdit::singleline(&mut st.sqref).desired_width(240.0));
+            });
+            ui.separator();
+
+            match st.op {
+                CfRuleOp::Greater
+                | CfRuleOp::Less
+                | CfRuleOp::GreaterEq
+                | CfRuleOp::LessEq
+                | CfRuleOp::Equal
+                | CfRuleOp::NotEqual => {
+                    ui.horizontal(|ui| {
+                        ui.label("条件值/引用:");
+                        ui.add(egui::TextEdit::singleline(&mut st.v1).desired_width(180.0));
+                    });
+                    ui.label(RichText::new("支持数字、带引号文本或单元格引用（如 =$B$1）").weak().small());
+                }
+                CfRuleOp::Between | CfRuleOp::NotBetween => {
+                    ui.horizontal(|ui| {
+                        ui.label("下限:");
+                        ui.add(egui::TextEdit::singleline(&mut st.v1).desired_width(110.0));
+                        ui.label("上限:");
+                        ui.add(egui::TextEdit::singleline(&mut st.v2).desired_width(110.0));
+                    });
+                }
+                CfRuleOp::TextContains
+                | CfRuleOp::TextNotContains
+                | CfRuleOp::TextBeginsWith
+                | CfRuleOp::TextEndsWith => {
+                    ui.horizontal(|ui| {
+                        ui.label("匹配文本:");
+                        ui.add(egui::TextEdit::singleline(&mut st.v1).desired_width(220.0));
+                    });
+                }
+                CfRuleOp::TimePeriod => {
+                    ui.horizontal(|ui| {
+                        ui.label("发生日期:");
+                        egui::ComboBox::from_id_salt("cf_time_period_combo")
+                            .selected_text(st.period.label())
+                            .width(160.0)
+                            .show_ui(ui, |ui| {
+                                for p in sheetcore::cf::TimePeriod::ALL {
+                                    ui.selectable_value(&mut st.period, p, p.label());
+                                }
+                            });
+                    });
+                }
+                CfRuleOp::TopN | CfRuleOp::BottomN => {
+                    ui.horizontal(|ui| {
+                        ui.label("排名数量 N:");
+                        ui.add(egui::DragValue::new(&mut st.top_n).range(1..=1000));
+                        ui.checkbox(&mut st.top_percent, "按百分比 (%)");
+                    });
+                }
+                CfRuleOp::Formula => {
+                    ui.horizontal(|ui| {
+                        ui.label("公式:");
+                        ui.add(egui::TextEdit::singleline(&mut st.v1).desired_width(280.0));
+                    });
+                    ui.label(
+                        RichText::new("相对区域左上角书写，返回 TRUE 时命中（例如 =$B2>1000 或 =MOD(ROW(),2)=0）")
+                            .weak()
+                            .small(),
+                    );
+                }
+                CfRuleOp::DataBar => {
+                    ui.horizontal(|ui| {
+                        ui.label("正值色:");
+                        for (lbl, rgb) in [
+                            ("蓝", [99u8, 142, 198]),
+                            ("绿", [99, 190, 123]),
+                            ("橙", [255, 166, 76]),
+                            ("紫", [147, 112, 219]),
+                        ] {
+                            if ui.selectable_label(st.bar_color == rgb, lbl).clicked() {
+                                st.bar_color = rgb;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("负值色:");
+                        for (lbl, rgb) in [
+                            ("深红", [220u8, 53, 69]),
+                            ("珊瑚红", [248, 105, 107]),
+                            ("琥珀", [217, 119, 6]),
+                        ] {
+                            if ui.selectable_label(st.bar_neg_color == rgb, lbl).clicked() {
+                                st.bar_neg_color = rgb;
+                            }
+                        }
+                    });
+                    let mut hide_val = !st.bar_show_value;
+                    if ui.checkbox(&mut hide_val, "仅显示数据条（隐藏单元格数值）").changed() {
+                        st.bar_show_value = !hide_val;
+                    }
+                }
+                CfRuleOp::ColorScale => {
+                    for (idx, lbl) in [
+                        (0u8, "绿-黄-红（高值绿）"),
+                        (1, "红-黄-绿（低值绿）"),
+                        (2, "蓝-白-红"),
+                        (3, "红-白-蓝"),
+                        (4, "绿-白 2 色阶"),
+                        (5, "白-绿 2 色阶"),
+                    ] {
+                        ui.radio_value(&mut st.scale_preset, idx, lbl);
+                    }
+                }
+                CfRuleOp::IconSet => {
+                    ui.horizontal(|ui| {
+                        ui.label("图标样式:");
+                        egui::ComboBox::from_id_salt("cf_icon_set_combo")
+                            .selected_text(&st.icon_set)
+                            .width(180.0)
+                            .show_ui(ui, |ui| {
+                                for s in [
+                                    "3TrafficLights1",
+                                    "3Arrows",
+                                    "5Arrows",
+                                    "3Flags",
+                                    "3Symbols",
+                                    "4Rating",
+                                    "5Rating",
+                                    "5Quarters",
+                                ] {
+                                    ui.selectable_value(&mut st.icon_set, s.to_string(), s);
+                                }
+                            });
+                    });
+                    ui.checkbox(&mut st.icon_reverse, "反转图标次序");
+                    let mut hide_val = !st.icon_show_value;
+                    if ui.checkbox(&mut hide_val, "仅显示图标（隐藏单元格数值）").changed() {
+                        st.icon_show_value = !hide_val;
+                    }
+                }
+                _ => {}
             }
+
+            if st.op.uses_dxf() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("突出显示格式:").font(ui_kit::bold(ui_kit::T_BODY)));
+                for (idx, lbl) in [
+                    (0u8, "浅红填充色深红色文本"),
+                    (1, "黄填充色深黄色文本"),
+                    (2, "绿填充色深绿色文本"),
+                    (3, "仅浅红填充"),
+                    (4, "仅红色文本"),
+                    (5, "浅蓝填充色深蓝色文本"),
+                ] {
+                    ui.radio_value(&mut st.style_idx, idx, lbl);
+                }
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut st.bold, "加粗");
+                    ui.checkbox(&mut st.italic, "斜体");
+                });
+            }
+            ui.checkbox(&mut st.stop, "如果为真则停止 (stopIfTrue)");
+
             ui_kit::footer(ui, |ui| {
                 if ui_kit::primary_button(ui, "确定").clicked() {
                     apply = true;
@@ -2481,15 +2890,90 @@ impl SheetApp {
         });
 
         if apply {
-            let dxf = cf_dxf_by_preset(self, st.style_idx);
+            let parsed_ranges = {
+                let r = sheetcore::cf::parse_sqref(&st.sqref);
+                if r.is_empty() { vec![self.sel_rect()] } else { r }
+            };
+            let dxf = if st.op.uses_dxf() {
+                cf_dxf_by_preset_ext(self, st.style_idx, st.bold, st.italic)
+            } else {
+                0
+            };
             let kind = match st.op {
                 CfRuleOp::Greater => CfKind::CellIs { op: CfOp::Greater, a: st.v1.clone(), b: String::new(), dxf },
                 CfRuleOp::Less => CfKind::CellIs { op: CfOp::Less, a: st.v1.clone(), b: String::new(), dxf },
+                CfRuleOp::GreaterEq => CfKind::CellIs { op: CfOp::GreaterEq, a: st.v1.clone(), b: String::new(), dxf },
+                CfRuleOp::LessEq => CfKind::CellIs { op: CfOp::LessEq, a: st.v1.clone(), b: String::new(), dxf },
                 CfRuleOp::Between => CfKind::CellIs { op: CfOp::Between, a: st.v1.clone(), b: st.v2.clone(), dxf },
+                CfRuleOp::NotBetween => CfKind::CellIs { op: CfOp::NotBetween, a: st.v1.clone(), b: st.v2.clone(), dxf },
                 CfRuleOp::Equal => CfKind::CellIs { op: CfOp::Equal, a: st.v1.clone(), b: String::new(), dxf },
+                CfRuleOp::NotEqual => CfKind::CellIs { op: CfOp::NotEqual, a: st.v1.clone(), b: String::new(), dxf },
                 CfRuleOp::TextContains => CfKind::Text { contains: st.v1.clone(), dxf },
+                CfRuleOp::TextNotContains => CfKind::TextMatch { op: sheetcore::cf::TextOp::NotContains, text: st.v1.clone(), dxf },
+                CfRuleOp::TextBeginsWith => CfKind::TextMatch { op: sheetcore::cf::TextOp::BeginsWith, text: st.v1.clone(), dxf },
+                CfRuleOp::TextEndsWith => CfKind::TextMatch { op: sheetcore::cf::TextOp::EndsWith, text: st.v1.clone(), dxf },
+                CfRuleOp::TimePeriod => CfKind::TimePeriod { period: st.period, dxf },
+                CfRuleOp::TopN => CfKind::Top { top: true, n: st.top_n.max(1), percent: st.top_percent, dxf },
+                CfRuleOp::BottomN => CfKind::Top { top: false, n: st.top_n.max(1), percent: st.top_percent, dxf },
+                CfRuleOp::AboveAvg => CfKind::Avg { above: true, dxf },
+                CfRuleOp::BelowAvg => CfKind::Avg { above: false, dxf },
+                CfRuleOp::Duplicate => CfKind::Dup { unique: false, dxf },
+                CfRuleOp::Unique => CfKind::Dup { unique: true, dxf },
+                CfRuleOp::Blanks => CfKind::Blanks { blank: true, dxf },
+                CfRuleOp::NoBlanks => CfKind::Blanks { blank: false, dxf },
+                CfRuleOp::Errors => CfKind::Errors { error: true, dxf },
+                CfRuleOp::NoErrors => CfKind::Errors { error: false, dxf },
+                CfRuleOp::Formula => CfKind::Expr { formula: st.v1.clone(), dxf },
+                CfRuleOp::DataBar => CfKind::Bar {
+                    color: st.bar_color,
+                    neg_color: Some(st.bar_neg_color),
+                    min: Cfvo::min(),
+                    max: Cfvo::max(),
+                    show_value: st.bar_show_value,
+                },
+                CfRuleOp::ColorScale => {
+                    let points = match st.scale_preset {
+                        1 => vec![(Cfvo::min(), [248, 105, 107]), (Cfvo::new(CfvoKind::Percentile, 50.0), [255, 235, 132]), (Cfvo::max(), [99, 190, 123])],
+                        2 => vec![(Cfvo::min(), [93, 135, 202]), (Cfvo::new(CfvoKind::Percentile, 50.0), [255, 255, 255]), (Cfvo::max(), [248, 105, 107])],
+                        3 => vec![(Cfvo::min(), [248, 105, 107]), (Cfvo::new(CfvoKind::Percentile, 50.0), [255, 255, 255]), (Cfvo::max(), [93, 135, 202])],
+                        4 => vec![(Cfvo::min(), [99, 190, 123]), (Cfvo::max(), [255, 255, 255])],
+                        5 => vec![(Cfvo::min(), [255, 255, 255]), (Cfvo::max(), [99, 190, 123])],
+                        _ => vec![(Cfvo::min(), [99, 190, 123]), (Cfvo::new(CfvoKind::Percentile, 50.0), [255, 235, 132]), (Cfvo::max(), [248, 105, 107])],
+                    };
+                    CfKind::Scale { points }
+                }
+                CfRuleOp::IconSet => {
+                    let levels = st.icon_set.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(3) as usize;
+                    let mut th = vec![Cfvo::min()];
+                    for i in 1..levels {
+                        th.push(Cfvo::new(CfvoKind::Percent, (i as f64) * 100.0 / levels as f64));
+                    }
+                    CfKind::IconSet {
+                        set: st.icon_set.clone(),
+                        reverse: st.icon_reverse,
+                        thresholds: th,
+                        show_value: st.icon_show_value,
+                    }
+                }
             };
-            self.add_cf(kind);
+            if let Some((bi, ri)) = st.edit_target {
+                let stop_v = st.stop;
+                if self.mutate_cf("编辑条件格式规则", |cf| {
+                    if let Some(blk) = cf.blocks.get_mut(bi) {
+                        blk.ranges = parsed_ranges;
+                        if let Some(rule) = blk.rules.get_mut(ri) {
+                            rule.kind = kind;
+                            rule.stop = stop_v;
+                            return true;
+                        }
+                    }
+                    false
+                }) {
+                    self.status = "已更新条件格式规则".into();
+                }
+            } else {
+                self.add_cf_with_opts(parsed_ranges, kind, st.stop);
+            }
             close = true;
         }
         if open && !close {
@@ -2549,14 +3033,16 @@ impl SheetApp {
             "CfIcon5Quarters" => self.add_cf_iconset("5Quarters", 5),
             "CfClearSel" => self.clear_cf(),
             "CfClearSheet" => {
-                let sh = self.wb.sheet_mut(self.sheet_idx);
-                if !sh.cf.blocks.is_empty() {
-                    sh.cf.blocks.clear();
-                    sh.cf_dirty = true;
-                    self.wb.dirty = true;
-                    self.cf_stats_gen = u64::MAX;
+                if self.mutate_cf("清除整表条件格式", |cf| {
+                    if cf.blocks.is_empty() {
+                        false
+                    } else {
+                        cf.blocks.clear();
+                        true
+                    }
+                }) {
                     self.status = "已清除当前工作表的全部条件格式".into();
-                } else {
+                } else if self.wb.sheet(self.sheet_idx).cf.blocks.is_empty() {
                     self.status = "当前工作表没有条件格式".into();
                 }
             }
@@ -2565,11 +3051,7 @@ impl SheetApp {
     }
 
     fn add_cf_bar(&mut self, color: [u8; 3]) {
-        self.add_cf(CfKind::Bar {
-            color,
-            min: Cfvo::min(),
-            max: Cfvo::max(),
-        });
+        self.add_cf(CfKind::bar_default(color, Cfvo::min(), Cfvo::max()));
     }
 
     fn add_cf_scale3(&mut self, c_min: [u8; 3], c_mid: [u8; 3], c_max: [u8; 3]) {

@@ -589,7 +589,7 @@ pub fn load_diag_with_control(
         } else {
             Vec::new()
         };
-        let dxfs = crate::cf::parse_dxfs(&styles_xml);
+        let dxfs = crate::cf::parse_dxfs_with_theme(&styles_xml, &theme_book);
         let dxf_ext = crate::cf::dxfs_unsupported(&styles_xml);
         (theme_book, ext_book, ooxml_styles, dxfs, dxf_ext)
     } else {
@@ -703,7 +703,7 @@ pub fn load_diag_with_control(
                         match shell {
                             Ok((shell, implicit_coordinates)) => {
                                 sheet.source_needs_dom_repair |= implicit_coordinates;
-                                layouts.insert(name.clone(), crate::merges::sheet_layout(&shell, &fallback_dxfs, fallback_dxf_ext));
+                                layouts.insert(name.clone(), crate::merges::sheet_layout_with_theme(&shell, &fallback_dxfs, fallback_dxf_ext, &theme_book));
                                 sheet.page = crate::page::parse_page_setup(&shell);
                                 sheet.textboxes = crate::textbox::load_from_sheet(path, part, &shell);
                                 sheet.hyperlinks = crate::hyperlinks::load_sheet(path, part, &shell).into();
@@ -3961,16 +3961,41 @@ fn apply_cf_patch(
             Vec<crate::arr::ArrayFml>,
         ),
     > = std::collections::HashMap::new();
-    // dxfs 必须和实际写出的 cfRule 及 colorFilter 对得上：先初始化现有 dxfs，再按需追加颜色筛选 dxf
-    let mut dxfs: Vec<crate::cf::Dxf> = wb
-        .sheets
-        .iter()
-        .find(|s| s.cf_dirty || !s.cf.dxfs.is_empty())
-        .map(|s| s.cf.dxfs.clone())
-        .unwrap_or_default();
+    // dxfs 全局唯一表：合并所有工作表的 dxfs 并按表建立 dxfId 重映射，防止跨表各自添加 dxf 后越界或串色
+    let mut dxfs: Vec<crate::cf::Dxf> = Vec::new();
+    let mut sheet_dxf_maps: Vec<Vec<usize>> = Vec::with_capacity(wb.sheets.len());
     for sheet in wb.sheets.iter() {
+        let mut map = Vec::with_capacity(sheet.cf.dxfs.len());
+        for d in &sheet.cf.dxfs {
+            if let Some(pos) = dxfs.iter().position(|x| x == d) {
+                map.push(pos);
+            } else {
+                let pos = dxfs.len();
+                dxfs.push(d.clone());
+                map.push(pos);
+            }
+        }
+        sheet_dxf_maps.push(map);
+    }
+    for (si, sheet) in wb.sheets.iter().enumerate() {
         if let Some(t) = targets.get(&sheet.name) {
-            let cf = if do_cf { crate::patch::cf_blocks_xml(&sheet.cf.blocks) } else { String::new() };
+            let cf = if do_cf {
+                let map = &sheet_dxf_maps[si];
+                let identity = map.iter().enumerate().all(|(i, &m)| i == m);
+                if identity {
+                    crate::patch::cf_blocks_xml(&sheet.cf.blocks)
+                } else {
+                    let mut remapped = sheet.cf.blocks.clone();
+                    for blk in &mut remapped {
+                        for rule in &mut blk.rules {
+                            rule.kind.remap_dxf(map);
+                        }
+                    }
+                    crate::patch::cf_blocks_xml(&remapped)
+                }
+            } else {
+                String::new()
+            };
             let dv = if do_dv { crate::patch::dv_xml(&sheet.dv) } else { String::new() };
             let has_color_filter = sheet
                 .filter

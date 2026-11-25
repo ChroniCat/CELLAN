@@ -271,36 +271,30 @@ impl SheetApp {
                 return;
             }
         }
-        let sh = self.wb.sheet_mut(self.sheet_idx);
-        let dxf_idx = sh.cf.dxfs.len();
-        sh.cf.dxfs.push(sheetcore::cf::Dxf {
-            fill: Some([255, 199, 206]),
-            color: Some([156, 0, 6]),
-            ..Default::default()
-        });
-        let next_prio = sh
-            .cf
-            .blocks
-            .iter()
-            .flat_map(|b| b.rules.iter().map(|r| r.priority))
-            .max()
-            .unwrap_or(0)
-            + 1;
-        sh.cf.blocks.push(sheetcore::cf::CfBlock {
-            ranges: vec![(r1, c1, r2, c2)],
-            rules: vec![sheetcore::cf::CfRule {
-                kind: sheetcore::cf::CfKind::Dup {
-                    unique: false,
-                    dxf: dxf_idx,
-                },
-                stop: false,
-                priority: next_prio,
-            }],
-        });
-        sh.cf_dirty = true;
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.status = format!("已高亮 {}:{} 中的重复值", cell_name(r1, c1), cell_name(r2, c2));
+        let dxf_idx = self.cf_dxf(false, Some([156, 0, 6]), Some([255, 199, 206]));
+        if self.mutate_cf("高亮重复值", |cf| {
+            let next_prio = cf
+                .blocks
+                .iter()
+                .flat_map(|b| b.rules.iter().map(|r| r.priority))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            cf.blocks.push(sheetcore::cf::CfBlock {
+                ranges: vec![(r1, c1, r2, c2)],
+                rules: vec![sheetcore::cf::CfRule {
+                    kind: sheetcore::cf::CfKind::Dup {
+                        unique: false,
+                        dxf: dxf_idx,
+                    },
+                    stop: false,
+                    priority: next_prio,
+                }],
+            });
+            true
+        }) {
+            self.status = format!("已高亮 {}:{} 中的重复值", cell_name(r1, c1), cell_name(r2, c2));
+        }
     }
 
     /// WPS：拒绝录入重复项（=COUNTIF($A$1:$A$100,A1)<=1 数据验证）

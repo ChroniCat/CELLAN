@@ -362,7 +362,7 @@ impl Action {
 }
 
 
-/// 轻量级工作表元数据改动（列宽/行高/隐藏行列/批注/忽略错误）：无需整表快照，支持单人及协作模式一键撤销。
+/// 轻量级工作表元数据改动（列宽/行高/隐藏行列/批注/忽略错误/条件格式）：无需整表快照，支持单人及协作模式一键撤销。
 #[derive(Clone, Debug, Default)]
 pub struct MetaEdit {
     pub sheet: usize,
@@ -372,6 +372,7 @@ pub struct MetaEdit {
     pub hidden_cols: Vec<(u32, bool, bool)>,
     pub notes: Vec<((u32, u32), Option<crate::notes::Note>, Option<crate::notes::Note>)>,
     pub ignored_errors: Vec<((u32, u32), bool, bool)>,
+    pub cf: Option<(crate::cf::CfSheet, crate::cf::CfSheet)>,
 }
 
 impl MetaEdit {
@@ -382,6 +383,7 @@ impl MetaEdit {
             && self.hidden_cols.is_empty()
             && self.notes.is_empty()
             && self.ignored_errors.is_empty()
+            && self.cf.is_none()
     }
 
     fn apply(&self, sheets: &mut [Sheet], redo: bool) {
@@ -455,6 +457,11 @@ impl MetaEdit {
                     sh.ignored_errors.remove(&pos);
                 }
             }
+            sh.bump_display_style_revision();
+        }
+        if let Some((before, after)) = &self.cf {
+            sh.cf = if redo { after.clone() } else { before.clone() };
+            sh.cf_dirty = true;
             sh.bump_display_style_revision();
         }
     }

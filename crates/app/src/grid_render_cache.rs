@@ -481,7 +481,7 @@ pub(crate) struct PreparedCell {
     pub has_rich: bool,
     pub depends_on_row_neighbors: bool,
     pub bg_fill: Option<Color32>,
-    pub cf_bar: Option<(f32, Color32)>,
+    pub cf_bar: Option<cf::BarOverlay>,
     pub cf_borders: Option<Box<[Option<(f32, Color32)>; 4]>>,
     pub diagonal: Option<(u8, Color32, bool, bool)>,
     pub borders: [Border; 4],
@@ -2223,11 +2223,11 @@ mod tests {
             rules: vec![sheetcore::cf::CfRule {
                 priority: 1,
                 stop: false,
-                kind: sheetcore::cf::CfKind::Bar {
-                    color: [99, 142, 198],
-                    min: sheetcore::cf::Cfvo::min(),
-                    max: sheetcore::cf::Cfvo::max(),
-                },
+                kind: sheetcore::cf::CfKind::bar_default(
+                    [99, 142, 198],
+                    sheetcore::cf::Cfvo::min(),
+                    sheetcore::cf::Cfvo::max(),
+                ),
             }],
         });
         let worker = CfStatsWorker::new();

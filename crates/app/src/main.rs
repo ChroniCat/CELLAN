@@ -14359,15 +14359,58 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
     /// 条件格式管理器：看规则、调顺序、删除、定位
     /// 按当前块/规则的先后重新编号 priority（1 起）。只在用户显式调序/删除后调用，
     /// 打开文件时不重排，保证 Excel 给的 priority 原样往返。
-    fn renumber_cf(&mut self) {
-        let sheet = self.wb.sheet_mut(self.sheet_idx);
+    fn renumber_cf_sheet(cf: &mut sheetcore::cf::CfSheet) {
         let mut p = 1u32;
-        for b in sheet.cf.blocks.iter_mut() {
+        for b in cf.blocks.iter_mut() {
             for r in b.rules.iter_mut() {
                 r.priority = p;
                 p += 1;
             }
         }
+    }
+
+    fn renumber_cf(&mut self) {
+        Self::renumber_cf_sheet(&mut self.wb.sheet_mut(self.sheet_idx).cf);
+    }
+
+    /// 统一条件格式写事务：权限校验 + 协作访客门控 + MetaEdit 撤销记录 + 脏标记 + 缓存失效。
+    pub(crate) fn mutate_cf<F>(&mut self, label: &str, f: F) -> bool
+    where
+        F: FnOnce(&mut sheetcore::cf::CfSheet) -> bool,
+    {
+        if self.prot_denied(sheetcore::protection::ProtOp::FormatCells, label)
+            || self.block_unsynced_guest_edit("条件格式")
+        {
+            return false;
+        }
+        let si = self.sheet_idx;
+        let before = self.wb.sheet(si).cf.clone();
+        let changed = {
+            let sh = self.wb.sheet_mut(si);
+            let ok = f(&mut sh.cf);
+            if ok {
+                sh.cf_dirty = true;
+                sh.bump_display_style_revision();
+            }
+            ok
+        };
+        if !changed {
+            return false;
+        }
+        let after = self.wb.sheet(si).cf.clone();
+        self.undo.push_meta(
+            label,
+            (si, self.sel.0, self.sel.1),
+            sheetcore::undo::MetaEdit {
+                sheet: si,
+                cf: Some((before, after)),
+                ..Default::default()
+            },
+        );
+        self.wb.dirty = true;
+        self.cf_stats_gen = u64::MAX;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        true
     }
 
     /// UI-30：把旧菜单里的快捷规则原样放进窗口（规则数/数据条/图标集/色阶都在这里）
@@ -14406,16 +14449,35 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
         }
         let mut open = true;
         let mut del: Option<(usize, usize)> = None;
+        let mut edit_req: Option<(usize, usize)> = None;
+        let mut toggle_stop: Option<(usize, usize, bool)> = None;
+        let mut range_apply: Option<(usize, String)> = None;
         let mut up: Option<usize> = None;
         let mut down: Option<usize> = None;
         let mut goto: Option<(u32, u32, u32, u32)> = None;
+        let mut want_new = false;
+        let mut want_clear_sel = false;
+        let mut want_clear_all = false;
         let blocks = self.wb.sheet(self.sheet_idx).cf.blocks.clone();
         let unknown_ext = self.wb.sheet(self.sheet_idx).cf.unknown_ext;
         let dxf_unsupported = self.wb.sheet(self.sheet_idx).cf.dxf_unsupported;
-        ui_kit::window(ctx, "条件格式管理", 460.0)
+        let sh_id = self.wb.sheet(self.sheet_idx).identity;
+        ui_kit::window(ctx, "条件格式规则管理器", 560.0)
             .open(&mut open)
-            .default_width(460.0)
+            .default_width(560.0)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui_kit::primary_button(ui, "+ 新建规则").clicked() {
+                        want_new = true;
+                    }
+                    if ui.button("清除选区规则").clicked() {
+                        want_clear_sel = true;
+                    }
+                    if ui.button("清除整表规则").clicked() {
+                        want_clear_all = true;
+                    }
+                });
+                ui.separator();
                 if dxf_unsupported {
                     ui.label(
                         egui::RichText::new(
@@ -14435,89 +14497,166 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                     ui.separator();
                 }
                 if blocks.is_empty() {
-                    ui.label("这张表还没有条件格式规则");
+                    ui.label("这张表还没有条件格式规则，点击上方「+ 新建规则」创建。");
                 }
-                for (bi, blk) in blocks.iter().enumerate() {
-                    let range_text = blk
-                        .ranges
-                        .iter()
-                        .map(|(r1, c1, r2, c2)| {
-                            format!(
-                                "{}{}:{}{}",
-                                sheetcore::model::col_label(*c1),
-                                r1 + 1,
-                                sheetcore::model::col_label(*c2),
-                                r2 + 1
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("区域 {range_text}")).strong());
-                        if ui.small_button("定位").clicked() {
-                            if let Some(r) = blk.ranges.first() {
-                                goto = Some(*r);
-                            }
-                        }
-                        if ui.small_button("上移").clicked() {
-                            up = Some(bi);
-                        }
-                        if ui.small_button("下移").clicked() {
-                            down = Some(bi);
-                        }
-                    });
-                    for (ri, rule) in blk.rules.iter().enumerate() {
+                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                    for (bi, blk) in blocks.iter().enumerate() {
+                        let range_text = blk
+                            .ranges
+                            .iter()
+                            .map(|(r1, c1, r2, c2)| {
+                                format!(
+                                    "{}{}:{}{}",
+                                    sheetcore::model::col_label(*c1),
+                                    r1 + 1,
+                                    sheetcore::model::col_label(*c2),
+                                    r2 + 1
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let mem_id = egui::Id::new(("cf_mgr_sqref", sh_id, bi, range_text.len()));
+                        let mut edit_sqref: String = ui.memory_mut(|m| {
+                            m.data
+                                .get_temp_mut_or_insert_with(mem_id, || range_text.clone())
+                                .clone()
+                        });
                         ui.horizontal(|ui| {
-                            ui.label(format!("  · [{}] {}", rule.priority, rule.kind.describe()));
-                            if rule.stop {
-                                ui.label(egui::RichText::new("(命中即停)").weak());
+                            ui.label(egui::RichText::new("应用于:").strong());
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut edit_sqref).desired_width(170.0),
+                            );
+                            if resp.changed() {
+                                ui.memory_mut(|m| m.data.insert_temp(mem_id, edit_sqref.clone()));
                             }
-                            if ui.small_button("删除").clicked() {
-                                del = Some((bi, ri));
+                            if edit_sqref.trim() != range_text
+                                && ui.small_button("应用区域").clicked()
+                            {
+                                range_apply = Some((bi, edit_sqref.clone()));
+                            }
+                            if ui.small_button("定位").clicked() {
+                                if let Some(r) = blk.ranges.first() {
+                                    goto = Some(*r);
+                                }
+                            }
+                            if ui.small_button("上移").clicked() {
+                                up = Some(bi);
+                            }
+                            if ui.small_button("下移").clicked() {
+                                down = Some(bi);
                             }
                         });
+                        for (ri, rule) in blk.rules.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("  · [{}] {}", rule.priority, rule.kind.describe()));
+                                let mut stop_v = rule.stop;
+                                if ui.checkbox(&mut stop_v, "命中即停").changed() {
+                                    toggle_stop = Some((bi, ri, stop_v));
+                                }
+                                if ui.small_button("编辑").clicked() {
+                                    edit_req = Some((bi, ri));
+                                }
+                                if ui.small_button("删除").clicked() {
+                                    del = Some((bi, ri));
+                                }
+                            });
+                        }
+                        ui.separator();
                     }
-                    ui.separator();
-                }
+                });
             });
-        if let Some((bi, ri)) = del {
-            let sheet = self.wb.sheet_mut(self.sheet_idx);
-            if let Some(blk) = sheet.cf.blocks.get_mut(bi) {
-                if ri < blk.rules.len() {
-                    blk.rules.remove(ri);
+        if want_new {
+            self.open_cf_new_rule_dlg();
+        }
+        if want_clear_sel {
+            self.clear_cf();
+        }
+        if want_clear_all {
+            self.apply_cf_preset("CfClearSheet");
+        }
+        if let Some((bi, ri)) = edit_req {
+            self.open_cf_edit_rule_dlg(bi, ri);
+        }
+        if let Some((bi, ri, stop_v)) = toggle_stop {
+            if self.mutate_cf("切换条件格式命中即停", |cf| {
+                if let Some(rule) = cf.blocks.get_mut(bi).and_then(|b| b.rules.get_mut(ri)) {
+                    rule.stop = stop_v;
+                    true
+                } else {
+                    false
                 }
-                if blk.rules.is_empty() {
-                    sheet.cf.blocks.remove(bi);
-                }
+            }) {
+                self.status = if stop_v {
+                    "已开启「命中即停」".into()
+                } else {
+                    "已关闭「命中即停」".into()
+                };
             }
-            sheet.cf_dirty = true;
-            self.wb.dirty = true;
-            self.renumber_cf();
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.status = "已删除一条条件格式规则".into();
+        }
+        if let Some((bi, sqref_str)) = range_apply {
+            let parsed = sheetcore::cf::parse_sqref(&sqref_str);
+            if parsed.is_empty() {
+                self.status = "条件格式区域无效，请使用 A1:B10 形式".into();
+            } else if self.mutate_cf("修改条件格式区域", |cf| {
+                if let Some(blk) = cf.blocks.get_mut(bi) {
+                    blk.ranges = parsed;
+                    true
+                } else {
+                    false
+                }
+            }) {
+                self.status = format!("已更新规则区域为 {sqref_str}");
+            }
+        }
+        if let Some((bi, ri)) = del {
+            if self.mutate_cf("删除条件格式规则", |cf| {
+                if let Some(blk) = cf.blocks.get_mut(bi) {
+                    if ri < blk.rules.len() {
+                        blk.rules.remove(ri);
+                    }
+                    if blk.rules.is_empty() {
+                        cf.blocks.remove(bi);
+                    }
+                    Self::renumber_cf_sheet(cf);
+                    true
+                } else {
+                    false
+                }
+            }) {
+                self.status = "已删除一条条件格式规则".into();
+            }
         }
         if let Some(bi) = up {
             if bi > 0 {
-                self.wb.sheet_mut(self.sheet_idx).cf.blocks.swap(bi, bi - 1);
-                self.wb.sheet_mut(self.sheet_idx).cf_dirty = true;
-                self.renumber_cf();
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.status = "规则已上移（优先级更高）".into();
+                if self.mutate_cf("上移条件格式规则", |cf| {
+                    if bi < cf.blocks.len() {
+                        cf.blocks.swap(bi, bi - 1);
+                        Self::renumber_cf_sheet(cf);
+                        true
+                    } else {
+                        false
+                    }
+                }) {
+                    self.status = "规则已上移（优先级更高）".into();
+                }
             }
         }
         if let Some(bi) = down {
-            let n = self.wb.sheet(self.sheet_idx).cf.blocks.len();
-            if bi + 1 < n {
-                self.wb.sheet_mut(self.sheet_idx).cf.blocks.swap(bi, bi + 1);
-                self.wb.sheet_mut(self.sheet_idx).cf_dirty = true;
-                self.renumber_cf();
-                self.doc_gen = self.doc_gen.wrapping_add(1);
+            if self.mutate_cf("下移条件格式规则", |cf| {
+                if bi + 1 < cf.blocks.len() {
+                    cf.blocks.swap(bi, bi + 1);
+                    Self::renumber_cf_sheet(cf);
+                    true
+                } else {
+                    false
+                }
+            }) {
                 self.status = "规则已下移".into();
             }
         }
-        if let Some((r1, c1, _, _)) = goto {
+        if let Some((r1, c1, r2, c2)) = goto {
             self.sel = (r1, c1);
-            self.sel_end = (r1, c1);
+            self.sel_end = (r2, c2);
             self.ensure_visible();
         }
         self.cf_mgr = open;
@@ -28452,72 +28591,81 @@ fn clear_selection(&mut self) {
     }
 
     fn cf_dxf(&mut self, bold: bool, color: Option<[u8; 3]>, fill: Option<[u8; 3]>) -> usize {
-        let want = sheetcore::cf::Dxf { bold, italic: false, color, fill, font: None, num_fmt: None, border: None };
-        let mut idx = None;
-        if let Some(s0) = self.wb.sheets.first() {
-            if let Some(i) = s0.cf.dxfs.iter().position(|d| *d == want) {
-                idx = Some(i);
-            }
-        }
-        match idx {
-            Some(i) => i,
-            None => {
-                let i = self.wb.sheets.first().map(|s| s.cf.dxfs.len()).unwrap_or(0);
-                for sh in self.wb.sheets.iter_mut() {
-                    sh.cf.dxfs.push(want.clone());
-                }
-                i
-            }
-        }
+        self.cf_dxf_ext(bold, false, color, fill)
     }
 
-    /// 给选区加一条条件格式规则
+    pub(crate) fn cf_dxf_ext(
+        &mut self,
+        bold: bool,
+        italic: bool,
+        color: Option<[u8; 3]>,
+        fill: Option<[u8; 3]>,
+    ) -> usize {
+        let want = sheetcore::cf::Dxf { bold, italic, color, fill, font: None, num_fmt: None, border: None };
+        let sh = self.wb.sheet_mut(self.sheet_idx);
+        if let Some(i) = sh.cf.dxfs.iter().position(|d| *d == want) {
+            return i;
+        }
+        let i = sh.cf.dxfs.len();
+        sh.cf.dxfs.push(want);
+        i
+    }
+
+    /// 给选区加一条条件格式规则（支持完整 Undo/Redo 与权限保护）
     fn add_cf(&mut self, kind: sheetcore::cf::CfKind) {
-        if self.prot_denied(sheetcore::protection::ProtOp::FormatCells, "设置条件格式")
-            || self.block_unsynced_guest_edit("条件格式")
-        {
-            return;
-        }
-        let (r1, c1, r2, c2) = self.sel_rect();
-        let sheet = self.wb.sheet_mut(self.sheet_idx);
-        // 新规则排在最后：priority 取现有最大值 +1（Excel 新建规则也是追加到末尾）
-        let next = sheet
-            .cf
-            .blocks
-            .iter()
-            .flat_map(|b| b.rules.iter().map(|r| r.priority))
-            .max()
-            .unwrap_or(0)
-            + 1;
-        sheet.cf.blocks.push(sheetcore::cf::CfBlock {
-            ranges: vec![(r1, c1, r2, c2)],
-            rules: vec![sheetcore::cf::CfRule { kind, stop: false, priority: next }],
-        });
-        sheet.cf_dirty = true;
-        self.wb.dirty = true;
-        self.cf_stats_gen = u64::MAX;
-        self.status = "已添加条件格式".into();
+        let rect = self.sel_rect();
+        self.add_cf_with_opts(vec![rect], kind, false);
     }
 
-    /// 清除与选区相交的条件格式
-    fn clear_cf(&mut self) {
-        if self.prot_denied(sheetcore::protection::ProtOp::FormatCells, "清除条件格式") {
+    pub(crate) fn add_cf_with_opts(
+        &mut self,
+        ranges: Vec<(u32, u32, u32, u32)>,
+        kind: sheetcore::cf::CfKind,
+        stop: bool,
+    ) {
+        if ranges.is_empty() {
             return;
         }
-        let (r1, c1, r2, c2) = self.sel_rect();
-        let sheet = self.wb.sheet_mut(self.sheet_idx);
-        let before = sheet.cf.blocks.len();
-        sheet.cf.blocks.retain(|b| {
-            !b.ranges
+        if self.mutate_cf("添加条件格式", |cf| {
+            let next = cf
+                .blocks
                 .iter()
-                .any(|(a, bb, cc, d)| *a <= r2 && *cc >= r1 && *bb <= c2 && *d >= c1)
+                .flat_map(|b| b.rules.iter().map(|r| r.priority))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            cf.blocks.push(sheetcore::cf::CfBlock {
+                ranges,
+                rules: vec![sheetcore::cf::CfRule { kind, stop, priority: next }],
+            });
+            true
+        }) {
+            self.status = "已添加条件格式".into();
+        }
+    }
+
+    /// 精确清除所选矩形内的条件格式：对部分相交的规则自动按上下左右拆保留未选区域！
+    fn clear_cf(&mut self) {
+        let cut = self.sel_rect();
+        let mut any = false;
+        let ok = self.mutate_cf("清除条件格式", |cf| {
+            let mut next_blocks = Vec::with_capacity(cf.blocks.len());
+            for mut blk in cf.blocks.drain(..) {
+                let before = blk.ranges.clone();
+                blk.ranges = sheetcore::cf::subtract_rect(&blk.ranges, cut);
+                if blk.ranges != before {
+                    any = true;
+                }
+                if !blk.ranges.is_empty() {
+                    next_blocks.push(blk);
+                }
+            }
+            cf.blocks = next_blocks;
+            any
         });
-        if sheet.cf.blocks.len() != before {
-            sheet.cf_dirty = true;
-            self.wb.dirty = true;
-            self.cf_stats_gen = u64::MAX;
+        if ok {
             self.status = "已清除所选范围的条件格式".into();
-        } else {
+        } else if !any {
             self.status = "所选范围没有条件格式".into();
         }
     }
@@ -28624,11 +28772,11 @@ fn clear_selection(&mut self) {
                     ("橙色", [255, 166, 76]),
                 ] {
                     if ui.button(label).clicked() {
-                        self.add_cf(sheetcore::cf::CfKind::Bar {
-                            color: rgb,
-                            min: sheetcore::cf::Cfvo::min(),
-                            max: sheetcore::cf::Cfvo::max(),
-                        });
+                        self.add_cf(sheetcore::cf::CfKind::bar_default(
+                            rgb,
+                            sheetcore::cf::Cfvo::min(),
+                            sheetcore::cf::Cfvo::max(),
+                        ));
                         ui.close_menu();
                     }
                 }
@@ -28697,6 +28845,14 @@ fn clear_selection(&mut self) {
                 }
             });
             ui.separator();
+            if ui.button("新建自定义规则（公式 / 日期 / 自定义前N项）...").clicked() {
+                self.open_cf_new_rule_dlg();
+                ui.close_menu();
+            }
+            if ui.button("管理规则...").clicked() {
+                self.cf_mgr = true;
+                ui.close_menu();
+            }
             if ui.button("清除所选范围的条件格式").clicked() {
                 self.clear_cf();
                 ui.close_menu();
@@ -29216,7 +29372,28 @@ fn clear_selection(&mut self) {
                     }
                 }
             }
-            if let Some((t, col)) = ov.bar {
+            if let Some(bar) = ov.bar_ext {
+                let x0 = rect.min.x + rect.width() * bar.start.clamp(0.0, 1.0);
+                let x1 = rect.min.x + rect.width() * bar.end.clamp(0.0, 1.0);
+                let w = (x1 - x0).max(0.0);
+                if w > 0.5 {
+                    painter.rect_filled(
+                        Rect::from_min_max(egui::pos2(x0, rect.min.y + 1.5), egui::pos2(x1, rect.max.y - 1.5)),
+                        0.0,
+                        Color32::from_rgba_unmultiplied(bar.color[0], bar.color[1], bar.color[2], 165),
+                    );
+                    if dumping {
+                        dump.push(format!("cf-bar ({},{}) w={:.0} rgb={:?}", r, c, w, bar.color));
+                    }
+                }
+                if let Some(ax) = bar.axis {
+                    let ax_x = rect.min.x + rect.width() * ax.clamp(0.0, 1.0);
+                    painter.line_segment(
+                        [egui::pos2(ax_x, rect.min.y + 0.5), egui::pos2(ax_x, rect.max.y - 0.5)],
+                        egui::Stroke::new(1.0, Color32::from_rgb(100, 108, 120)),
+                    );
+                }
+            } else if let Some((t, col)) = ov.bar {
                 let w = (rect.width() * t).max(0.0);
                 if w > 0.5 {
                     painter.rect_filled(
@@ -29244,7 +29421,10 @@ fn clear_selection(&mut self) {
                 .max(1.0) as usize;
             let hide_for_icon = ov
                 .and_then(|o| o.icon.as_ref())
-                .is_some_and(|m| !m.show_value);
+                .is_some_and(|m| !m.show_value)
+                || ov
+                    .and_then(|o| o.bar_ext)
+                    .is_some_and(|b| !b.show_value);
             let formula_hidden = self.wb.sheet(self.sheet_idx).protection.is_some() && st.hidden;
             let showing_formula = self.show_formulas && !formula_hidden && cell.formula.is_some();
             let txt = if hide_for_icon {
@@ -29950,10 +30130,7 @@ impl SheetApp {
             }
             Box::new(sides)
         });
-        let cf_bar = ov
-            .and_then(|o| o.bar)
-            .filter(|(t, _)| *t > 0.0)
-            .map(|(t, col)| (t, Color32::from_rgba_unmultiplied(col[0], col[1], col[2], 150)));
+        let cf_bar = ov.and_then(|o| o.bar_ext);
         let diagonal = st.diagonal.as_ref().map(|d| {
             (
                 sheetcore::style::Border::from_ooxml_name(&d.style),
@@ -29984,7 +30161,10 @@ impl SheetApp {
                 .max(1.0) as usize;
             let hide_for_icon = ov
                 .and_then(|o| o.icon.as_ref())
-                .is_some_and(|m| !m.show_value);
+                .is_some_and(|m| !m.show_value)
+                || ov
+                    .and_then(|o| o.bar_ext)
+                    .is_some_and(|b| !b.show_value);
             let formula_hidden = sh.protection.is_some() && st.hidden;
             let showing_formula = rc.show_formulas && !formula_hidden && cell.formula.is_some();
             let txt = if hide_for_icon {
@@ -30415,10 +30595,24 @@ impl SheetApp {
                 }
             }
         }
-        if let Some((t, col)) = entry.cf_bar {
-            let w = (rect.width() * t).max(0.0);
+        if let Some(bar) = entry.cf_bar {
+            let x0 = rect.min.x + rect.width() * bar.start.clamp(0.0, 1.0);
+            let x1 = rect.min.x + rect.width() * bar.end.clamp(0.0, 1.0);
+            let w = (x1 - x0).max(0.0);
             if w > 0.5 {
-                fills_mesh.add_colored_rect(Rect::from_min_size(rect.min, Vec2::new(w, rect.height())), col);
+                let col = Color32::from_rgba_unmultiplied(bar.color[0], bar.color[1], bar.color[2], 165);
+                fills_mesh.add_colored_rect(
+                    Rect::from_min_max(egui::pos2(x0, rect.min.y + 1.5), egui::pos2(x1, rect.max.y - 1.5)),
+                    col,
+                );
+            }
+            if let Some(ax) = bar.axis {
+                let ax_x = rect.min.x + rect.width() * ax.clamp(0.0, 1.0);
+                let ax_col = Color32::from_rgb(100, 108, 120);
+                fills_mesh.add_colored_rect(
+                    Rect::from_min_max(egui::pos2(ax_x - 0.5, rect.min.y + 0.5), egui::pos2(ax_x + 0.5, rect.max.y - 0.5)),
+                    ax_col,
+                );
             }
         }
         if let Some((kind, col, up, down)) = entry.diagonal {
@@ -37456,14 +37650,30 @@ impl SheetApp {
                                     Some(rules) if rules.row == r => rules,
                                     slot => slot.insert(self.cf_inputs.index.row(&sheet.cf, r)),
                                 };
-                                let ov = rules.overlay_at(&self.cf_stats, sheet, c, |f, r0, c0| {
-                                    formulas.shifted(f, r0, c0).is_ok_and(|node| {
-                                        matches!(
-                                            calc.eval_node(&node, si),
-                                            sheetcore::formula::FValue::Bool(true)
-                                        )
-                                    })
-                                });
+                                let ov = rules.overlay_at_with_eval(
+                                    &self.cf_stats,
+                                    sheet,
+                                    c,
+                                    |f, r0, c0| {
+                                        formulas.shifted(f, r0, c0).ok().map(|node| {
+                                            match calc.eval_node(&node, si) {
+                                                sheetcore::formula::FValue::Number(n) => sheetcore::Value::Number(n),
+                                                sheetcore::formula::FValue::Text(t) => sheetcore::Value::Text(t.into()),
+                                                sheetcore::formula::FValue::Bool(b) => sheetcore::Value::Bool(b),
+                                                sheetcore::formula::FValue::Error(e) => sheetcore::Value::Error(e),
+                                                sheetcore::formula::FValue::Empty => sheetcore::Value::Empty,
+                                                sheetcore::formula::FValue::Array(a) => a.data.first().cloned().map(|v| match v {
+                                                    sheetcore::formula::FValue::Number(n) => sheetcore::Value::Number(n),
+                                                    sheetcore::formula::FValue::Text(t) => sheetcore::Value::Text(t.into()),
+                                                    sheetcore::formula::FValue::Bool(b) => sheetcore::Value::Bool(b),
+                                                    sheetcore::formula::FValue::Error(e) => sheetcore::Value::Error(e),
+                                                    _ => sheetcore::Value::Empty,
+                                                }).unwrap_or(sheetcore::Value::Empty),
+                                                _ => sheetcore::Value::Empty,
+                                            }
+                                        })
+                                    },
+                                );
                                 if ov.is_empty() {
                                     map_mut.remove(&(r, c));
                                 } else {
@@ -37516,11 +37726,30 @@ impl SheetApp {
                             Some(rules) if rules.row == r => rules,
                             slot => slot.insert(self.cf_inputs.index.row(&sheet.cf, r)),
                         };
-                        let ov = rules.overlay_at(&self.cf_stats, sheet, c, |f, r0, c0| {
-                            formulas.shifted(f, r0, c0).is_ok_and(|node| {
-                                matches!(calc.eval_node(&node, si), sheetcore::formula::FValue::Bool(true))
-                            })
-                        });
+                        let ov = rules.overlay_at_with_eval(
+                            &self.cf_stats,
+                            sheet,
+                            c,
+                            |f, r0, c0| {
+                                formulas.shifted(f, r0, c0).ok().map(|node| {
+                                    match calc.eval_node(&node, si) {
+                                        sheetcore::formula::FValue::Number(n) => sheetcore::Value::Number(n),
+                                        sheetcore::formula::FValue::Text(t) => sheetcore::Value::Text(t.into()),
+                                        sheetcore::formula::FValue::Bool(b) => sheetcore::Value::Bool(b),
+                                        sheetcore::formula::FValue::Error(e) => sheetcore::Value::Error(e),
+                                        sheetcore::formula::FValue::Empty => sheetcore::Value::Empty,
+                                        sheetcore::formula::FValue::Array(a) => a.data.first().cloned().map(|v| match v {
+                                            sheetcore::formula::FValue::Number(n) => sheetcore::Value::Number(n),
+                                            sheetcore::formula::FValue::Text(t) => sheetcore::Value::Text(t.into()),
+                                            sheetcore::formula::FValue::Bool(b) => sheetcore::Value::Bool(b),
+                                            sheetcore::formula::FValue::Error(e) => sheetcore::Value::Error(e),
+                                            _ => sheetcore::Value::Empty,
+                                        }).unwrap_or(sheetcore::Value::Empty),
+                                        _ => sheetcore::Value::Empty,
+                                    }
+                                })
+                            },
+                        );
                         if !ov.is_empty() {
                             overlays.insert((r, c), ov);
                         }

@@ -534,7 +534,6 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                         "<cfRule type=\"containsText\" operator=\"containsText\" text=\"{}\" dxfId=\"{dxf}\" priority=\"{prio}\"{stop}>",
                         esc(contains)
                     ));
-                    // Excel 里包含文本还带一个 SEARCH 公式，用于部分阅读器
                     let anchor = b.ranges.first().map(|r| format!("{}{}", crate::model::col_label(r.1), r.0 + 1)).unwrap_or_else(|| "A1".into());
                     out.push_str(&format!(
                         "<formula>NOT(ISERROR(SEARCH(\"{}\",{})))</formula>",
@@ -542,6 +541,52 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                         anchor
                     ));
                     out.push_str("</cfRule>");
+                }
+                CfKind::TextMatch { op, text, dxf } => {
+                    let ty = op.ooxml_type();
+                    let oper = op.ooxml_operator();
+                    let anchor = b.ranges.first().map(|r| format!("{}{}", crate::model::col_label(r.1), r.0 + 1)).unwrap_or_else(|| "A1".into());
+                    let fml = match op {
+                        crate::cf::TextOp::Contains => format!("NOT(ISERROR(SEARCH(\"{}\",{})))", esc(text), anchor),
+                        crate::cf::TextOp::NotContains => format!("ISERROR(SEARCH(\"{}\",{}))", esc(text), anchor),
+                        crate::cf::TextOp::BeginsWith => format!("LEFT({},{})= \"{}\"", anchor, text.chars().count(), esc(text)),
+                        crate::cf::TextOp::EndsWith => format!("RIGHT({},{})=\"{}\"", anchor, text.chars().count(), esc(text)),
+                    };
+                    out.push_str(&format!(
+                        "<cfRule type=\"{ty}\" operator=\"{oper}\" text=\"{}\" dxfId=\"{dxf}\" priority=\"{prio}\"{stop}><formula>{fml}</formula></cfRule>",
+                        esc(text)
+                    ));
+                }
+                CfKind::TimePeriod { period, dxf } => {
+                    let tp = period.as_ooxml();
+                    let anchor = b.ranges.first().map(|r| format!("{}{}", crate::model::col_label(r.1), r.0 + 1)).unwrap_or_else(|| "A1".into());
+                    out.push_str(&format!(
+                        "<cfRule type=\"timePeriod\" timePeriod=\"{tp}\" dxfId=\"{dxf}\" priority=\"{prio}\"{stop}><formula>FLOOR({anchor},1)=TODAY()</formula></cfRule>"
+                    ));
+                }
+                CfKind::Blanks { blank, dxf } => {
+                    let ty = if *blank { "containsBlanks" } else { "notContainsBlanks" };
+                    let anchor = b.ranges.first().map(|r| format!("{}{}", crate::model::col_label(r.1), r.0 + 1)).unwrap_or_else(|| "A1".into());
+                    let fml = if *blank {
+                        format!("LEN(TRIM({anchor}))=0")
+                    } else {
+                        format!("LEN(TRIM({anchor}))&gt;0")
+                    };
+                    out.push_str(&format!(
+                        "<cfRule type=\"{ty}\" dxfId=\"{dxf}\" priority=\"{prio}\"{stop}><formula>{fml}</formula></cfRule>"
+                    ));
+                }
+                CfKind::Errors { error, dxf } => {
+                    let ty = if *error { "containsErrors" } else { "notContainsErrors" };
+                    let anchor = b.ranges.first().map(|r| format!("{}{}", crate::model::col_label(r.1), r.0 + 1)).unwrap_or_else(|| "A1".into());
+                    let fml = if *error {
+                        format!("ISERROR({anchor})")
+                    } else {
+                        format!("NOT(ISERROR({anchor}))")
+                    };
+                    out.push_str(&format!(
+                        "<cfRule type=\"{ty}\" dxfId=\"{dxf}\" priority=\"{prio}\"{stop}><formula>{fml}</formula></cfRule>"
+                    ));
                 }
                 CfKind::Dup { unique, dxf } => {
                     let ty = if *unique { "uniqueValues" } else { "duplicateValues" };
@@ -594,8 +639,9 @@ pub fn cf_blocks_xml(blocks: &[crate::cf::CfBlock]) -> String {
                     }
                     out.push_str("</iconSet></cfRule>");
                 }
-                CfKind::Bar { color, min, max } => {
-                    out.push_str(&format!("<cfRule type=\"dataBar\" priority=\"{prio}\"{stop}><dataBar>"));
+                CfKind::Bar { color, neg_color: _, min, max, show_value } => {
+                    let sv = if *show_value { "" } else { " showValue=\"0\"" };
+                    out.push_str(&format!("<cfRule type=\"dataBar\" priority=\"{prio}\"{stop}><dataBar{sv}>"));
                     out.push_str(&cfvo_xml(min));
                     out.push_str(&cfvo_xml(max));
                     out.push_str(&format!("<color rgb=\"FF{:02X}{:02X}{:02X}\"/>", color[0], color[1], color[2]));
