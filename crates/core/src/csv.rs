@@ -959,3 +959,64 @@ pub fn export_sheet_csv(
     let writer = std::io::BufWriter::with_capacity(256 * 1024, file);
     export_sheet_csv_writer(sheet, styles, date_system, writer, delim)
 }
+
+/// 将工作表导出为指定编码（UTF-8 / UTF-8 BOM / GB18030-GBK / UTF-16LE）与自定义分隔符的 CSV 字节流。
+pub fn export_sheet_csv_bytes(
+    sheet: &crate::model::Sheet,
+    styles: &crate::style::StyleTable,
+    date_system: crate::model::DateSystem,
+    delim: char,
+    encoding: Encoding,
+    utf8_bom: bool,
+) -> std::io::Result<Vec<u8>> {
+    let mut utf8_buf = Vec::new();
+    export_sheet_csv_writer(sheet, styles, date_system, &mut utf8_buf, delim)?;
+    let text = String::from_utf8(utf8_buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    match encoding {
+        Encoding::Utf8 => {
+            if utf8_bom {
+                let mut out = Vec::with_capacity(3 + text.len());
+                out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+                out.extend_from_slice(text.as_bytes());
+                Ok(out)
+            } else {
+                Ok(text.into_bytes())
+            }
+        }
+        Encoding::Gb18030 => {
+            let (cow, _, _) = encoding_rs::GB18030.encode(&text);
+            Ok(cow.into_owned())
+        }
+        Encoding::Utf16Le => {
+            let mut out = Vec::with_capacity(2 + text.len() * 2);
+            out.extend_from_slice(&[0xFF, 0xFE]);
+            for u in text.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            Ok(out)
+        }
+        Encoding::Utf16Be => {
+            let mut out = Vec::with_capacity(2 + text.len() * 2);
+            out.extend_from_slice(&[0xFE, 0xFF]);
+            for u in text.encode_utf16() {
+                out.extend_from_slice(&u.to_be_bytes());
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// 按指定编码与分隔符导出工作表到 CSV/TSV 文件。
+pub fn export_sheet_csv_encoded(
+    sheet: &crate::model::Sheet,
+    styles: &crate::style::StyleTable,
+    date_system: crate::model::DateSystem,
+    path: &std::path::Path,
+    delim: char,
+    encoding: Encoding,
+    utf8_bom: bool,
+) -> std::io::Result<()> {
+    let bytes = export_sheet_csv_bytes(sheet, styles, date_system, delim, encoding, utf8_bom)?;
+    std::fs::write(path, bytes)
+}

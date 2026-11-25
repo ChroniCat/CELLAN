@@ -900,6 +900,10 @@ pub struct Sheet {
     pub notes: CellMetadata<CellRef, crate::notes::Note>,
     /// 批注被改过
     pub notes_dirty: bool,
+    /// Excel 365 原生线程批注（支持多轮回复与已解决状态，保存时写入 `xl/threadedComments/` + `xl/persons/`）
+    pub threads: std::collections::HashMap<CellRef, crate::notes::ThreadedComment>,
+    /// 线程批注被改过
+    pub threads_dirty: bool,
     /// 冻结窗格：(冻结行数, 冻结列数)
     pub freeze: Option<(u32, u32)>,
     /// 冻结设置被改过
@@ -1036,6 +1040,8 @@ impl Sheet {
             dv_dirty: false,
             notes: Default::default(),
             notes_dirty: false,
+            threads: std::collections::HashMap::new(),
+            threads_dirty: false,
             freeze: None,
             freeze_dirty: false,
             filter: None,
@@ -1361,7 +1367,7 @@ impl Sheet {
     pub(crate) fn has_pending_sheet_metadata(&self) -> bool {
         self.styles_dirty || self.row_styles_dirty || self.col_styles_dirty || !self.style_edits.is_empty()
             || self.pictures_dirty || self.merges_dirty || self.cf_dirty || self.dv_dirty
-            || self.notes_dirty || self.freeze_dirty || self.layout_dirty || self.scenarios_dirty
+            || self.notes_dirty || self.threads_dirty || self.freeze_dirty || self.layout_dirty || self.scenarios_dirty
             || self.ignored_errors_dirty || self.outline_pr_dirty || self.filter_dirty || self.page_dirty
             || self.charts_dirty || self.tab_color_dirty || self.tables_dirty || self.protect_dirty
             || self.protected_ranges_dirty

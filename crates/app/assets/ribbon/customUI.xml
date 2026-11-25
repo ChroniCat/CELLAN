@@ -23,6 +23,7 @@
           <button id="FilePrintPreview" label="打印预览" size="large" imageMso="Print" onAction="PrintPreview"/>
           <box boxStyle="vertical">
             <button id="ExportPdf" label="导出 PDF" imageMso="PdfExport" screentip="把当前表导出成 PDF" onAction="ExportPdf" sizeString="90"/>
+            <button id="ExportCsv" label="导出 CSV" imageMso="ImportCsv" screentip="导出当前表为 CSV/TSV（支持 UTF-8 BOM / GB18030 / 自定义分隔符）" onAction="ExportCsv" sizeString="90"/>
           </box>
         </group>
         <group id="GroupUndo" label="编辑">
@@ -503,6 +504,15 @@
       <tab id="TabInsert" label="插入" keytip="N">
         <group id="GroupHeaderFooter" label="文本">
           <button id="InsertTextBox" label="文本框" size="large" imageMso="TextBox" screentip="在当前单元格上放一个文本框" onAction="InsertTextBox" keytip="X"/>
+          <menu id="InsertShapesMenu" label="形状" size="large" imageMso="TextBox" screentip="插入矢量形状（矩形/圆角矩形/箭头/直线/椭圆/菱形/标注框）" keytip="SH">
+            <button id="ShapeRect" label="矩形" onAction="InsertShape:Rect"/>
+            <button id="ShapeRoundRect" label="圆角矩形" onAction="InsertShape:RoundedRect"/>
+            <button id="ShapeRightArrow" label="右箭头" onAction="InsertShape:RightArrow"/>
+            <button id="ShapeLine" label="直线" onAction="InsertShape:Line"/>
+            <button id="ShapeEllipse" label="椭圆" onAction="InsertShape:Ellipse"/>
+            <button id="ShapeDiamond" label="菱形" onAction="InsertShape:Diamond"/>
+            <button id="ShapeCallout" label="标注框" onAction="InsertShape:Callout"/>
+          </menu>
           <box boxStyle="vertical">
             <button id="DrawTextBox" label="绘制横排文本框" imageMso="TextBoxDraw" screentip="在表格上拖出一个横排文本框" onAction="DrawTextBox" sizeString="124"/>
             <button id="EditTextBox" label="编辑文本框" imageMso="FontColor" screentip="改文字/字号/颜色/填充" onAction="EditTextBox" sizeString="124"/>
@@ -901,6 +911,7 @@
             <button id="NextComment" label="下一条批注" imageMso="CommentNext" onAction="NextComment" sizeString="104" keytip="N"/>
             <button id="ShowShowCommentBtn" label="显示批注" imageMso="ShowComment" onAction="ShowComment" sizeString="104" keytip="H1"/>
           </box>
+          <toggleButton id="ShowAllComments" label="显示所有批注" size="large" imageMso="ShowComment" screentip="切换常驻显示当前工作表的全部批注与线程会话" onAction="ShowAllComments" keytip="H2"/>
         </group>
         <group id="GroupA11y" label="辅助功能">
           <button id="A11yChecker" label="检查辅助功能" size="large" imageMso="A11y" screentip="合并单元格/空表头/缺替代文字等" onAction="A11yChecker" keytip="A"/>

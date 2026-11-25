@@ -969,6 +969,7 @@ impl SheetApp {
             data: Some(std::sync::Arc::new(png)),
             ext: "png".into(),
             name,
+            ..Default::default()
         });
         self.pic_commit("粘贴为图片", before);
         self.status = format!("已粘贴为图片（{w}×{h} px，可用 Delete 删除或 Ctrl+Z 撤销）");

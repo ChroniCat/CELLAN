@@ -22,6 +22,25 @@ pub struct Picture {
     pub ext: String,
     /// 可读名字（“图片 1”），写进 cNvPr
     pub name: String,
+    /// 顺时针旋转角度（度，对应 OOXML `<a:xfrm rot="..."/>`，1 度 = 60000 单位）
+    pub rot_deg: f32,
+    /// 裁剪比例 `[left, top, right, bottom]`（0.0..0.9，对应 OOXML `<a:srcRect l/t/r/b/>`）
+    pub crop: [f32; 4],
+}
+
+impl Default for Picture {
+    fn default() -> Self {
+        Self {
+            rect: (0, 0, 1, 1),
+            off: [0; 4],
+            part: String::new(),
+            data: None,
+            ext: "png".into(),
+            name: String::new(),
+            rot_deg: 0.0,
+            crop: [0.0; 4],
+        }
+    }
 }
 
 fn attr(tag: &str, key: &str) -> Option<String> {
@@ -79,10 +98,39 @@ fn off_of(chunk: &str, which: &str) -> (i64, i64) {
     (text("colOff"), text("rowOff"))
 }
 
-/// 从 drawing XML 里挑出图片（不含图表）
-pub fn parse_drawing(xml: &str) -> Vec<(u32, u32, u32, u32, [i64; 4], String)> {
+/// 解析图片块中的旋转角度（`xfrm rot="..."`）和裁剪比例（`srcRect l/t/r/b`）。
+pub fn parse_pic_transform(chunk: &str) -> (f32, [f32; 4]) {
+    let mut rot_deg = 0.0f32;
+    if let Some(i) = chunk.find("<a:xfrm").or_else(|| chunk.find("<xfrm")) {
+        if let Some(gt) = chunk[i..].find('>') {
+            let tag = &chunk[i..=i + gt];
+            if let Some(rv) = attr(tag, "rot").and_then(|s| s.parse::<f64>().ok()) {
+                rot_deg = ((rv / 60_000.0) % 360.0) as f32;
+                if rot_deg < 0.0 {
+                    rot_deg += 360.0;
+                }
+            }
+        }
+    }
+    let mut crop = [0.0f32; 4];
+    if let Some(i) = chunk.find("<a:srcRect").or_else(|| chunk.find("<srcRect")) {
+        if let Some(gt) = chunk[i..].find('>') {
+            let tag = &chunk[i..=i + gt];
+            let parse_c = |k: &str| -> f32 {
+                attr(tag, k)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|v| (v / 100_000.0).clamp(0.0, 0.9) as f32)
+                    .unwrap_or(0.0)
+            };
+            crop = [parse_c("l"), parse_c("t"), parse_c("r"), parse_c("b")];
+        }
+    }
+    (rot_deg, crop)
+}
+
+/// 从 drawing XML 里挑出图片（不含图表），带旋转与裁剪元数据。
+pub fn parse_drawing_full(xml: &str) -> Vec<(u32, u32, u32, u32, [i64; 4], String, f32, [f32; 4])> {
     let mut out = Vec::new();
-    // 逐个 anchor 扫：带 xdr: 前缀和不带的都要认
     for tag in ["twoCellAnchor", "oneCellAnchor", "absoluteAnchor"] {
         for prefix in ["xdr:", ""] {
             let open = format!("<{prefix}{tag}");
@@ -95,7 +143,6 @@ pub fn parse_drawing(xml: &str) -> Vec<(u32, u32, u32, u32, [i64; 4], String)> {
                     .map(|e| start + e + close.len())
                     .unwrap_or(xml.len());
                 let chunk = &xml[start..end];
-                // 只要图片，图表（graphicFrame）不算
                 let is_pic = chunk.contains("<pic") || chunk.contains("<xdr:pic");
                 if is_pic {
                     if let (Some((fr, fc)), Some(rid)) = (
@@ -103,7 +150,6 @@ pub fn parse_drawing(xml: &str) -> Vec<(u32, u32, u32, u32, [i64; 4], String)> {
                         attr(chunk, "r:embed").or_else(|| attr(chunk, "embed")),
                     ) {
                         let (tr, tc) = cell_of(chunk, "to").unwrap_or_else(|| {
-                            // oneCellAnchor：按 ext 的 EMU 估跨度（1 px = 9525 EMU）
                             let cx = attr(chunk, "cx")
                                 .and_then(|v| v.parse::<f32>().ok())
                                 .unwrap_or(1_900_000.0)
@@ -119,7 +165,17 @@ pub fn parse_drawing(xml: &str) -> Vec<(u32, u32, u32, u32, [i64; 4], String)> {
                         });
                         let (fx, fy) = off_of(chunk, "from");
                         let (tx, ty) = off_of(chunk, "to");
-                        out.push((fr, fc, tr.max(fr + 1), tc.max(fc + 1), [fx, fy, tx, ty], rid));
+                        let (rot_deg, crop) = parse_pic_transform(chunk);
+                        out.push((
+                            fr,
+                            fc,
+                            tr.max(fr + 1),
+                            tc.max(fc + 1),
+                            [fx, fy, tx, ty],
+                            rid,
+                            rot_deg,
+                            crop,
+                        ));
                     }
                 }
                 from = end;
@@ -130,6 +186,14 @@ pub fn parse_drawing(xml: &str) -> Vec<(u32, u32, u32, u32, [i64; 4], String)> {
         }
     }
     out
+}
+
+/// 从 drawing XML 里挑出图片（不含图表）
+pub fn parse_drawing(xml: &str) -> Vec<(u32, u32, u32, u32, [i64; 4], String)> {
+    parse_drawing_full(xml)
+        .into_iter()
+        .map(|(fr, fc, tr, tc, off, rid, _, _)| (fr, fc, tr, tc, off, rid))
+        .collect()
 }
 
 /// 读 drawing 的关系表：rId → 部件名（相对 xl/）
@@ -190,9 +254,9 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Picture>> {
                 draw_rels.insert(key, crate::fixups::resolve_target(&drawing_rels_path, &target));
             }
         }
-        let list: Vec<Picture> = parse_drawing(&drawing_xml)
+        let list: Vec<Picture> = parse_drawing_full(&drawing_xml)
             .into_iter()
-            .filter_map(|(r1, c1, r2, c2, off, rid)| {
+            .filter_map(|(r1, c1, r2, c2, off, rid, rot_deg, crop)| {
                 draw_rels.get(&rid).map(|p| Picture {
                     rect: (r1, c1, r2, c2),
                     off,
@@ -203,6 +267,8 @@ pub fn load(path: &Path) -> HashMap<String, Vec<Picture>> {
                         .map(|(_, e)| e.to_ascii_lowercase())
                         .unwrap_or_else(|| "png".into()),
                     name: String::new(),
+                    rot_deg,
+                    crop,
                 })
             })
             .collect();

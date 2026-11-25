@@ -111,13 +111,14 @@ impl SheetApp {
         let mut apply_fill_direct = false;
         let mut apply_font_direct = false;
 
+        let pal = crate::theme::palette();
         egui::Area::new(egui::Id::new("wps_mini_toolbar"))
             .order(egui::Order::Foreground)
             .fixed_pos(mini_rect.min)
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                    .fill(pal.card_bg)
+                    .stroke(Stroke::new(1.0, pal.card_border))
                     .corner_radius(8.0)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 4],
@@ -138,8 +139,8 @@ impl SheetApp {
                             ui.painter().rect(
                                 fr,
                                 4.0,
-                                if fresp.hovered() || pop_mode == 1 { ui_kit::HOVER } else { Color32::from_rgb(248, 250, 252) },
-                                Stroke::new(1.0, ui_kit::CARD_BORDER),
+                                if fresp.hovered() || pop_mode == 1 { pal.hover } else { pal.grid_bg },
+                                Stroke::new(1.0, pal.card_border),
                                 egui::StrokeKind::Inside,
                             );
                             ui.painter().with_clip_rect(fr.shrink2(Vec2::new(5.0, 2.0))).text(
@@ -147,9 +148,9 @@ impl SheetApp {
                                 Align2::LEFT_CENTER,
                                 flabel,
                                 FontId::proportional(11.0),
-                                ui_kit::TEXT,
+                                pal.text,
                             );
-                            ui_kit::caret(ui, egui::pos2(fr.right() - 7.0, fr.center().y), ui_kit::TEXT_WEAK);
+                            ui_kit::caret(ui, egui::pos2(fr.right() - 7.0, fr.center().y), pal.text_muted);
                             if fresp.on_hover_text("字体").clicked() {
                                 pop_mode = if pop_mode == 1 { 0 } else { 1 };
                             }
@@ -158,8 +159,8 @@ impl SheetApp {
                             ui.painter().rect(
                                 sr,
                                 4.0,
-                                if sresp.hovered() || pop_mode == 2 { ui_kit::HOVER } else { Color32::from_rgb(248, 250, 252) },
-                                Stroke::new(1.0, ui_kit::CARD_BORDER),
+                                if sresp.hovered() || pop_mode == 2 { pal.hover } else { pal.grid_bg },
+                                Stroke::new(1.0, pal.card_border),
                                 egui::StrokeKind::Inside,
                             );
                             ui.painter().text(
@@ -167,18 +168,18 @@ impl SheetApp {
                                 Align2::LEFT_CENTER,
                                 format!("{}", cur.size as i32),
                                 FontId::proportional(11.0),
-                                ui_kit::TEXT,
+                                pal.text,
                             );
-                            ui_kit::caret(ui, egui::pos2(sr.right() - 6.0, sr.center().y), ui_kit::TEXT_WEAK);
+                            ui_kit::caret(ui, egui::pos2(sr.right() - 6.0, sr.center().y), pal.text_muted);
                             if sresp.on_hover_text("字号").clicked() {
                                 pop_mode = if pop_mode == 2 { 0 } else { 2 };
                             }
 
                             if ui_kit::small_on(ui, Icon::FontGrow, false, "增大字号").clicked() {
-                                act = Some("FontGrow".into());
+                                act = Some("GrowFont".into());
                             }
                             if ui_kit::small_on(ui, Icon::FontShrink, false, "减小字号").clicked() {
-                                act = Some("FontShrink".into());
+                                act = Some("ShrinkFont".into());
                             }
                             if ui_kit::text_toggle(ui, "B", cur.bold, "加粗", true, false, false).clicked() {
                                 act = Some("Bold".into());
@@ -254,8 +255,8 @@ impl SheetApp {
                 .fixed_pos(pop_pos)
                 .show(ctx, |ui| {
                     egui::Frame::NONE
-                        .fill(Color32::WHITE)
-                        .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                        .fill(pal.card_bg)
+                        .stroke(Stroke::new(1.0, pal.card_border))
                         .corner_radius(6.0)
                         .shadow(egui::epaint::Shadow {
                             offset: [0, 4],
@@ -330,6 +331,7 @@ impl SheetApp {
         );
         let mut toggle_pop = false;
         let mut pick_mode: Option<FillMode> = None;
+        let pal = crate::theme::palette();
 
         egui::Area::new(egui::Id::new("wps_fill_badge"))
             .order(egui::Order::Foreground)
@@ -339,8 +341,8 @@ impl SheetApp {
                 ui.painter().rect(
                     r,
                     5.0,
-                    if resp.hovered() || is_open { Color32::WHITE } else { Color32::from_rgb(248, 250, 252) },
-                    Stroke::new(1.0, if is_open { ui_kit::ACCENT } else { ui_kit::CARD_BORDER }),
+                    if resp.hovered() || is_open { pal.card_bg } else { pal.page_bg },
+                    Stroke::new(1.0, if is_open { pal.accent } else { pal.card_border }),
                     egui::StrokeKind::Inside,
                 );
                 ui.painter().text(
@@ -348,9 +350,9 @@ impl SheetApp {
                     Align2::LEFT_CENTER,
                     "填充选项",
                     FontId::proportional(11.0),
-                    ui_kit::TEXT,
+                    pal.text,
                 );
-                ui_kit::caret(ui, egui::pos2(r.right() - 9.0, r.center().y), ui_kit::TEXT_WEAK);
+                ui_kit::caret(ui, egui::pos2(r.right() - 9.0, r.center().y), pal.text_weak);
                 if resp.on_hover_text("切换填充方式（复制 / 填充序列 / 仅格式 / 不带格式）").clicked() {
                     toggle_pop = true;
                 }
@@ -366,8 +368,8 @@ impl SheetApp {
                 .fixed_pos(pop_pos)
                 .show(ctx, |ui| {
                     egui::Frame::NONE
-                        .fill(Color32::WHITE)
-                        .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                        .fill(pal.card_bg)
+                        .stroke(Stroke::new(1.0, pal.card_border))
                         .corner_radius(6.0)
                         .shadow(egui::epaint::Shadow {
                             offset: [0, 4],
@@ -425,6 +427,7 @@ impl SheetApp {
         );
         let mut toggle_pop = false;
         let mut pick_mode: Option<u8> = None;
+        let pal = crate::theme::palette();
 
         egui::Area::new(egui::Id::new("wps_paste_badge"))
             .order(egui::Order::Foreground)
@@ -434,8 +437,8 @@ impl SheetApp {
                 ui.painter().rect(
                     r,
                     5.0,
-                    if resp.hovered() || is_open { Color32::WHITE } else { Color32::from_rgb(248, 250, 252) },
-                    Stroke::new(1.0, if is_open { ui_kit::ACCENT } else { ui_kit::CARD_BORDER }),
+                    if resp.hovered() || is_open { pal.card_bg } else { pal.page_bg },
+                    Stroke::new(1.0, if is_open { pal.accent } else { pal.card_border }),
                     egui::StrokeKind::Inside,
                 );
                 ui.painter().text(
@@ -443,9 +446,9 @@ impl SheetApp {
                     Align2::LEFT_CENTER,
                     "粘贴选项",
                     FontId::proportional(11.0),
-                    ui_kit::TEXT,
+                    pal.text,
                 );
-                ui_kit::caret(ui, egui::pos2(r.right() - 9.0, r.center().y), ui_kit::TEXT_WEAK);
+                ui_kit::caret(ui, egui::pos2(r.right() - 9.0, r.center().y), pal.text_weak);
                 if resp.on_hover_text("切换粘贴方式（保留格式 / 值 / 数字格式 / 公式 / 格式 / 无边框 / 转置）").clicked() {
                     toggle_pop = true;
                 }
@@ -461,8 +464,8 @@ impl SheetApp {
                 .fixed_pos(pop_pos)
                 .show(ctx, |ui| {
                     egui::Frame::NONE
-                        .fill(Color32::WHITE)
-                        .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                        .fill(pal.card_bg)
+                        .stroke(Stroke::new(1.0, pal.card_border))
                         .corner_radius(6.0)
                         .shadow(egui::epaint::Shadow {
                             offset: [0, 4],

@@ -45,13 +45,23 @@ pub fn entries(app: &SheetApp) -> Vec<Entry> {
 
 fn walk(app: &SheetApp, n: &Node, tab: &str, group: &str, out: &mut Vec<Entry>) {
     match n {
-        Node::Button(c) | Node::Toggle(c) | Node::Split { ctl: c, .. } => push(app, c, tab, group, out),
+        Node::Button(c) | Node::Toggle(c) => push(app, c, tab, group, out),
+        Node::Split { ctl, menu } => {
+            if ctl.on_action.is_some() {
+                push(app, ctl, tab, group, out);
+            }
+            walk_menu_items(app, &menu.items, tab, group, out);
+        }
         Node::Menu(m) => menu(app, m, tab, group, out),
         Node::DropDown { ctl, .. }
         | Node::Gallery { ctl, .. }
         | Node::ComboBox { ctl, .. }
-        | Node::Slider { ctl, .. } => push(app, ctl, tab, group, out),
-        Node::EditBox { ctl, .. } => push(app, ctl, tab, group, out),
+        | Node::Slider { ctl, .. }
+        | Node::EditBox { ctl, .. } => {
+            if ctl.on_action.is_some() {
+                push(app, ctl, tab, group, out);
+            }
+        }
         Node::Box { children, .. } => {
             for c in children {
                 walk(app, c, tab, group, out);
@@ -61,9 +71,14 @@ fn walk(app: &SheetApp, n: &Node, tab: &str, group: &str, out: &mut Vec<Entry>) 
     }
 }
 
-fn menu(app: &SheetApp, m: &Menu, tab: &str, group: &str, out: &mut Vec<Entry>) {
-    push(app, &m.ctl, tab, group, out);
-    for it in &m.items {
+fn walk_menu_items(
+    app: &SheetApp,
+    items: &[MenuNode],
+    tab: &str,
+    group: &str,
+    out: &mut Vec<Entry>,
+) {
+    for it in items {
         match it {
             MenuNode::Button(c) | MenuNode::Toggle(c) => push(app, c, tab, group, out),
             MenuNode::Menu(sub) => menu(app, sub, tab, group, out),
@@ -72,17 +87,47 @@ fn menu(app: &SheetApp, m: &Menu, tab: &str, group: &str, out: &mut Vec<Entry>) 
     }
 }
 
+fn menu(app: &SheetApp, m: &Menu, tab: &str, group: &str, out: &mut Vec<Entry>) {
+    // 跳过无实际执行动作的父级菜单容器（消除 24 项点选后报“未接入”的空壳条目），
+    // 直接展开其下属所有可执行子命令。
+    if m.items.is_empty() && m.ctl.on_action.is_some() {
+        push(app, &m.ctl, tab, group, out);
+    }
+    walk_menu_items(app, &m.items, tab, group, out);
+}
+
+fn fallback_label_from_tip(tip: &str) -> String {
+    let t = tip.trim();
+    // 去掉快捷键括号说明（如 "加粗（Ctrl+B）" -> "加粗"）
+    let clean = t
+        .split_once('（')
+        .or_else(|| t.split_once('('))
+        .map(|(head, _)| head.trim())
+        .unwrap_or(t);
+    clean.to_string()
+}
+
 fn push(app: &SheetApp, c: &crate::ribbon::Ctl, tab: &str, group: &str, out: &mut Vec<Entry>) {
     let st = app.ctl_state(&c.id);
     if !st.visible {
         return;
     }
-    let label = st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
+    let label = st
+        .label
+        .clone()
+        .or_else(|| c.label.clone())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| c.screentip.as_deref().map(fallback_label_from_tip))
+        .unwrap_or_default();
     if label.trim().is_empty() {
         return;
     }
+    let action = c.action();
+    if action.is_empty() {
+        return;
+    }
     out.push(Entry {
-        action: c.action().to_string(),
+        action: action.to_string(),
         label,
         group: group.to_string(),
         tab: tab.to_string(),

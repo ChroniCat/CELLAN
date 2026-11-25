@@ -792,6 +792,9 @@ pub fn load_diag_with_control(
         if let Some(xls_stream) = crate::cfb::read_workbook_stream_file(path) {
             apply_xls_meta_stream(&xls_stream, &mut wb);
             wb.calc_manual = crate::xls_read::read_calc_manual_stream(&xls_stream);
+            if crate::xls_read::read_date1904(&xls_stream) {
+                wb.date_system = crate::model::DateSystem::D1904;
+            }
         }
     }
 
@@ -995,6 +998,17 @@ pub fn load_diag_with_control(
                 if let Some(list) = side_notes.get(&sheet.name) {
                     for n in list.iter() {
                         sheet.notes.insert(crate::model::CellRef::new(n.r, n.c), n.clone());
+                    }
+                }
+            }
+        }
+        if let Ok(all_threads) = crate::notes::load_threaded_comments(path) {
+            for sheet in wb.sheets.iter_mut() {
+                if let Some(list) = all_threads.get(&sheet.name) {
+                    for tc in list {
+                        sheet
+                            .threads
+                            .insert(crate::model::CellRef::new(tc.r, tc.c), tc.clone());
                     }
                 }
             }
@@ -3864,21 +3878,29 @@ fn save_plain_at(
         !delta_summary.handled_note_sheets.contains(&s.identity)
             && (s.notes_dirty || (s.source_part.is_none() && !s.notes.is_empty()))
     });
-    if any_notes_work || wb.sheets.iter().any(|s| s.tables_dirty) {
+    if any_notes_work
+        || wb.sheets.iter().any(|s| s.tables_dirty || s.threads_dirty || (!s.threads.is_empty() && s.source_part.is_none()))
+    {
         crate::patch::commit_stage(path).context("保存表/批注前落盘失败")?;
     }
     // 批注：原生写入 commentsN.xml + vmlDrawingN.vml，删空时清掉旧部件；
     // 已由 xlsx_delta 就地补丁的表不再整份覆写，避免毁掉线程批注与 VML 控件。
     for sheet in &wb.sheets {
-        if delta_summary.handled_note_sheets.contains(&sheet.identity) {
-            continue;
+        if !delta_summary.handled_note_sheets.contains(&sheet.identity) {
+            if sheet.notes_dirty && sheet.notes.is_empty() {
+                must_save!("notes-clear", crate::notes::clear_sheet_notes(path, &sheet.name));
+            } else if (sheet.notes_dirty || sheet.source_part.is_none()) && !sheet.notes.is_empty() {
+                must_save!(
+                    "notes-write",
+                    crate::notes::write_sheet_notes(path, &sheet.name, &sheet.notes)
+                );
+            }
         }
-        if sheet.notes_dirty && sheet.notes.is_empty() {
-            must_save!("notes-clear", crate::notes::clear_sheet_notes(path, &sheet.name));
-        } else if (sheet.notes_dirty || sheet.source_part.is_none()) && !sheet.notes.is_empty() {
+        // Excel 365 原生线程批注（write_sheet_notes 若先执行，后写 threadedComments 保证不互相覆盖）
+        if sheet.threads_dirty || (sheet.source_part.is_none() && !sheet.threads.is_empty()) {
             must_save!(
-                "notes-write",
-                crate::notes::write_sheet_notes(path, &sheet.name, &sheet.notes)
+                "threaded-comments-write",
+                crate::notes::write_sheet_threaded_comments(path, &sheet.name, &sheet.threads)
             );
         }
     }

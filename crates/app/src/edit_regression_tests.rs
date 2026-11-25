@@ -2907,6 +2907,7 @@ fn deleting_a_picture_is_one_undo_step_and_restores_its_anchor() {
         data: Some(std::sync::Arc::new(png)),
         ext: "png".into(),
         name: "图片 1".into(),
+        ..Default::default()
     });
     let depth = app.undo.depth();
     app.pic_sel = Some(0);
@@ -2934,6 +2935,7 @@ fn moving_a_picture_is_undoable() {
         data: Some(std::sync::Arc::new(vec![1, 2, 3])),
         ext: "png".into(),
         name: "图片 1".into(),
+        ..Default::default()
     });
     let before = app.wb.sheet(0).pictures.clone();
     app.wb.sheet_mut(0).pictures[0].rect = (8, 4, 12, 9);
@@ -11657,4 +11659,286 @@ fn gap9_commit_normalizes_plus_formula_closes_parens_and_wraps_multiline() {
         app.wb.sheet(0).rows.size(2)
     );
 }
+
+#[test]
+fn gap10_palette_cmdusage_toggles_and_mini_toolbar_aliases() {
+    let _env = crate::test_env::TestEnv::new("gap10-palette-toggles");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+
+    // 1) 命令面板收录无文字图标命令（如加粗/倾斜）且排除空壳父菜单容器
+    let entries = crate::palette::entries(&app);
+    assert!(
+        entries.iter().any(|e| e.action == "Bold" && e.label.contains("加粗")),
+        "命令面板应通过 screentip 回退收录加粗命令"
+    );
+    assert!(
+        entries.iter().any(|e| e.action == "Italic"),
+        "命令面板应收录倾斜命令"
+    );
+    for e in &entries {
+        assert!(!e.action.is_empty(), "命令面板不得出现空 action 条目");
+    }
+
+    // 2) cmdusage 内存缓存写入与读取（且按 TestEnv 隔离）
+    crate::cmdusage::touch("Gap10BenchAction");
+    crate::cmdusage::touch("Gap10BenchAction");
+    assert!(
+        crate::cmdusage::load()
+            .get("Gap10BenchAction")
+            .copied()
+            .unwrap_or(0)
+            >= 2
+    );
+
+    // 3) 修复的 6 个 Ribbon Toggle 控件 checked 状态对齐
+    app.show_gridlines = false;
+    assert!(!app.ctl_state("ViewGridlines").checked);
+    app.show_headings = false;
+    assert!(!app.ctl_state("ViewHeadings").checked);
+    app.wb.sheet_mut(0).page.gridlines = true;
+    assert!(app.ctl_state("PrintGridlinesToggle").checked);
+    assert!(app.ctl_state("PrintPrintGridlines").checked);
+    app.wb.sheet_mut(0).page.headings = true;
+    assert!(app.ctl_state("PrintHeadingsToggle").checked);
+    app.auto_share = true;
+    assert!(app.ctl_state("AutoAutoShare").checked);
+
+    // 4) ShowAllComments 与 FontGrow/FontShrink 别名
+    assert!(!app.ctl_state("ShowAllComments").checked);
+    app.ribbon_action("ShowAllComments", &ctx);
+    assert!(app.ctl_state("ShowAllComments").checked);
+    let sz0 = app.current_style().size;
+    app.ribbon_action("FontGrow", &ctx);
+    assert!(app.current_style().size > sz0);
+    app.ribbon_action("FontShrink", &ctx);
+    assert!((app.current_style().size - sz0).abs() < 0.01);
+
+    // 5) 7 套内置财务模板就绪
+    assert_eq!(crate::templates::ALL.len(), 7);
+}
+
+#[test]
+fn gap10_hyperlinks_formula_jump_and_dialog_prefill() {
+    let _env = crate::test_env::TestEnv::new("gap10-hyperlinks");
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::Sheet::new("明细表"));
+    app.wb.sheet_mut(0).set(0, 0, text("查看明细"));
+    app.wb.sheet_mut(0).hyperlinks.insert(
+        (0, 0),
+        sheetcore::hyperlinks::Hyperlink {
+            external: false,
+            target: String::new(),
+            location: "明细表!C5".into(),
+            tooltip: "跳转到明细表 C5".into(),
+            ..Default::default()
+        },
+    );
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.open_hyperlink_dialog();
+    let (u, t, tip) = app.hyper_dlg.clone().expect("应打开并预填超链接编辑框");
+    assert_eq!(u, "#明细表!C5");
+    assert_eq!(t, "查看明细");
+    assert_eq!(tip, "跳转到明细表 C5");
+    app.hyper_dlg = None;
+
+    // 内部跨表跳转与同表 #A10 跳转
+    let link = app.wb.sheet(0).hyperlinks.get(&(0, 0)).unwrap().clone();
+    app.open_hyperlink(&link);
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!(app.sel, (4, 2));
+
+    let same_sheet_link = sheetcore::hyperlinks::Hyperlink {
+        external: false,
+        location: "B12".into(),
+        ..Default::default()
+    };
+    app.open_hyperlink(&same_sheet_link);
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!(app.sel, (11, 1));
+
+    // =HYPERLINK(...) 公式目标提取（含静态字面量与动态拼接）
+    app.wb.sheet_mut(1).set(0, 0, text("docs"));
+    app.wb.sheet_mut(1).set(
+        0,
+        1,
+        sheetcore::model::Cell {
+            value: Value::Text("官网".into()),
+            formula: Some("=HYPERLINK(\"https://example.com/\"&A1, \"官网\")".into()),
+        },
+    );
+    assert_eq!(
+        app.formula_hyperlink_target(0, 1).as_deref(),
+        Some("https://example.com/docs")
+    );
+}
+
+#[test]
+fn gap10_picture_transforms_shapes_and_sparkline_batch_edit() {
+    let _env = crate::test_env::TestEnv::new("gap10-pic-shapes-spark");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+
+    // 1) 图片旋转 90°、裁剪、置顶/置底、复制及撤销
+    for i in 0..2u32 {
+        app.wb.sheet_mut(0).pictures.push(sheetcore::pic::Picture {
+            rect: (i * 3, 0, i * 3 + 2, 2),
+            off: [0; 4],
+            part: format!("xl/media/test_{i}.png"),
+            data: Some(std::sync::Arc::new(vec![1, 2, 3, 4])),
+            ext: "png".into(),
+            name: format!("图{i}"),
+            ..Default::default()
+        });
+    }
+    app.pic_rotate_90(0);
+    assert!((app.wb.sheet(0).pictures[0].rot_deg - 90.0).abs() < 0.01);
+    app.do_undo(false);
+    assert!((app.wb.sheet(0).pictures[0].rot_deg - 0.0).abs() < 0.01);
+
+    app.pic_set_crop(0, [0.1, 0.2, 0.15, 0.05]);
+    assert!((app.wb.sheet(0).pictures[0].crop[1] - 0.2).abs() < 0.001);
+    app.pic_zorder(0, true);
+    assert_eq!(app.wb.sheet(0).pictures[1].name, "图0");
+    app.pic_duplicate(1);
+    assert_eq!(app.wb.sheet(0).pictures.len(), 3);
+
+    // 2) 矢量形状插入与撤销
+    app.ribbon_action("InsertShape:RightArrow", &ctx);
+    assert_eq!(app.wb.sheet(0).textboxes.len(), 1);
+    assert_eq!(
+        app.wb.sheet(0).textboxes[0].kind,
+        sheetcore::textbox::ShapeKind::RightArrow
+    );
+
+    // 3) 迷你图多格批量编辑：自动合并源区域并可批量更新属性
+    app.wb.sheet_mut(0).sparklines.push(sheetcore::sparkline::Sparkline {
+        r: 0,
+        c: 4,
+        rect: (0, 0, 0, 2),
+        kind: sheetcore::sparkline::SparkKind::Line,
+        ..Default::default()
+    });
+    app.wb.sheet_mut(0).sparklines.push(sheetcore::sparkline::Sparkline {
+        r: 1,
+        c: 4,
+        rect: (1, 0, 1, 2),
+        kind: sheetcore::sparkline::SparkKind::Line,
+        ..Default::default()
+    });
+    app.sel = (0, 4);
+    app.sel_end = (1, 4);
+    app.spark_open_edit();
+    let mut dlg = app.spark_dlg.take().expect("应打开批量编辑迷你图对话框");
+    assert_eq!(dlg.source, "A1:C2");
+    assert_eq!(dlg.location, "E1:E2");
+    dlg.kind = sheetcore::sparkline::SparkKind::Column;
+    dlg.high = true;
+    let updated = app.spark_commit(&dlg).expect("多格迷你图批量提交应成功");
+    assert_eq!(updated, 2);
+    assert!(app
+        .wb
+        .sheet(0)
+        .sparklines
+        .iter()
+        .all(|s| s.kind == sheetcore::sparkline::SparkKind::Column && s.high));
+}
+
+#[test]
+fn gap10_shortcuts_table_borders_general_note_and_new_sheet() {
+    let _env = crate::test_env::TestEnv::new("gap10-shortcuts");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    for r in 0..3u32 {
+        app.wb.sheet_mut(0).set(r, 0, if r == 0 { text("项目") } else { text("A") });
+        app.wb.sheet_mut(0).set(r, 1, if r == 0 { text("金额") } else { number(100.0) });
+    }
+    app.sel = (0, 0);
+    app.sel_end = (2, 1);
+
+    // Ctrl+T -> 创建超级表
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::COMMAND;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::T,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    assert_eq!(app.wb.sheet(0).tables.len(), 1, "Ctrl+T 应创建超级表");
+
+    // Ctrl+Shift+7 -> 外框线; Ctrl+Shift+- -> 清除边框
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::Num7,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    let s_after_7 = app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).clone();
+    assert!(s_after_7.border[0].style > 0 && s_after_7.border[2].style > 0, "Ctrl+Shift+7 应加外框线");
+
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::Minus,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    let s_after_minus = app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).clone();
+    assert!(s_after_minus.border.iter().all(|b| b.style == 0), "Ctrl+Shift+- 应清除所有边框");
+
+    // Ctrl+Shift+~ -> 常规数字格式（且不触发 ShowFormulas）
+    app.apply_style(|s| s.format = "0.00%".into());
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::Backtick,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).format.is_empty());
+    assert!(!app.show_formulas, "Ctrl+Shift+~ 不应误触发显示公式");
+
+    // Shift+F2 -> 打开批注编辑
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::SHIFT;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::F2,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::SHIFT,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    assert!(app.note_edit.is_some(), "Shift+F2 应打开批注编辑器");
+    app.note_edit = None;
+
+    // Shift+F11 -> 新增工作表
+    let n_before = app.wb.sheets.len();
+    let mut raw = egui::RawInput::default();
+    raw.modifiers = egui::Modifiers::SHIFT;
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::F11,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::SHIFT,
+    });
+    let _ = ctx.run(raw, |c| app.handle_keys(c));
+    assert_eq!(app.wb.sheets.len(), n_before + 1, "Shift+F11 应新增工作表");
+}
+
 

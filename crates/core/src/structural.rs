@@ -8,6 +8,78 @@ use crate::model::{Cell, CellRef, Sheet};
 use crate::refs::MappedShift;
 use std::collections::HashSet;
 
+/// 当插入/删除本表行列时，同步重写指向本表的内部超链接目标（如 `Sheet1!B5`、`#Sheet1!$A$1:$C$3`、`B5`）。
+fn shift_internal_link_location(
+    loc: &str,
+    own_sheet: &str,
+    shift: &MappedShift,
+    rows: bool,
+) -> Option<String> {
+    let trimmed = loc.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (hash_prefix, rest) = if let Some(r) = trimmed.strip_prefix('#') {
+        ("#", r)
+    } else {
+        ("", trimmed)
+    };
+    let (sheet_prefix, range_part) = if let Some((sh, rg)) = rest.rsplit_once('!') {
+        let unquoted = sh.trim().trim_matches('\'').replace("''", "'");
+        if !unquoted.eq_ignore_ascii_case(own_sheet) {
+            return None;
+        }
+        (Some(sh), rg.trim())
+    } else {
+        (None, rest.trim())
+    };
+    let map_token = |tok: &str| -> Option<String> {
+        let mut s = tok.trim();
+        let col_abs = s.starts_with('$');
+        if col_abs {
+            s = &s[1..];
+        }
+        let col_end = s.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
+        if !(1..=3).contains(&col_end) {
+            return None;
+        }
+        let col_str = &s[..col_end];
+        let mut r_part = &s[col_end..];
+        let row_abs = r_part.starts_with('$');
+        if row_abs {
+            r_part = &r_part[1..];
+        }
+        if r_part.is_empty() || !r_part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let (r, c) = crate::sparse::parse_ref(&format!("{col_str}{r_part}"))?;
+        let (nr, nc) = if rows {
+            (shift.map(r)?, c)
+        } else {
+            (r, shift.map(c)?)
+        };
+        let mut out = String::new();
+        if col_abs {
+            out.push('$');
+        }
+        out.push_str(&crate::model::col_label(nc));
+        if row_abs {
+            out.push('$');
+        }
+        out.push_str(&(nr + 1).to_string());
+        Some(out)
+    };
+    let mapped = if let Some((a, b)) = range_part.split_once(':') {
+        format!("{}:{}", map_token(a)?, map_token(b)?)
+    } else {
+        map_token(range_part)?
+    };
+    Some(match sheet_prefix {
+        Some(sh) => format!("{hash_prefix}{sh}!{mapped}"),
+        None => format!("{hash_prefix}{mapped}"),
+    })
+}
+
 /// 结构性改动
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Structural {
@@ -465,24 +537,37 @@ impl Sheet {
             }
             self.spill_shapes = next_shapes;
         }
-        if !self.hyperlinks.is_empty()
-            && self.hyperlinks.iter().any(|(&(r, c), link)| {
+        if !self.hyperlinks.is_empty() {
+            let own_name = self.name.clone();
+            let need_shift_keys = self.hyperlinks.iter().any(|(&(r, c), link)| {
                 let end = if rows {
                     r.saturating_add(link.span.0)
                 } else {
                     c.saturating_add(link.span.1)
                 };
                 end >= min_at
-            })
-        {
-            self.hyperlinks = std::mem::take(&mut self.hyperlinks)
-                .into_iter()
-                .filter_map(|((r, c), mut link)| {
+            });
+            let need_shift_locs = self
+                .hyperlinks
+                .values()
+                .any(|link| !link.location.is_empty());
+            if need_shift_keys || need_shift_locs {
+                let old = std::mem::take(&mut self.hyperlinks);
+                let mut next = std::collections::HashMap::with_capacity(old.len());
+                for ((r, c), mut link) in old {
+                    if !link.location.is_empty() {
+                        if let Some(updated_loc) = shift_internal_link_location(&link.location, &own_name, shift, rows) {
+                            if updated_loc != link.location {
+                                link.location = updated_loc;
+                                self.hyperlinks_dirty = true;
+                            }
+                        }
+                    }
                     let (start, span) = if rows { (r, link.span.0) } else { (c, link.span.1) };
                     let end = start.saturating_add(span);
                     let moved = shift.map_range(start, end);
                     self.hyperlinks_dirty |= moved != Some((start, end));
-                    let (first, last) = moved?;
+                    let Some((first, last)) = moved else { continue };
                     let anchor = if rows {
                         link.span.0 = last - first;
                         (first, c)
@@ -490,10 +575,10 @@ impl Sheet {
                         link.span.1 = last - first;
                         (r, first)
                     };
-                    Some((anchor, link))
-                })
-                .collect::<std::collections::HashMap<_, _>>()
-                .into();
+                    next.insert(anchor, link);
+                }
+                self.hyperlinks = next.into();
+            }
         }
         if !self.arrays.is_empty() {
             self.arrays = self
@@ -1404,7 +1489,7 @@ impl Sheet {
     }
 
     fn shift_notes(&mut self, shift: &MappedShift) {
-        if self.notes.is_empty() {
+        if self.notes.is_empty() && self.threads.is_empty() {
             return;
         }
         let rows = shift.axis == crate::refs::Axis::Row;
@@ -1413,30 +1498,54 @@ impl Sheet {
         } else {
             shift.insertions.first().copied().unwrap_or(shift.at)
         };
-        if !self
-            .notes
-            .keys()
-            .any(|k| (if rows { k.row } else { k.col }) >= min_at)
+        if !self.notes.is_empty()
+            && self
+                .notes
+                .keys()
+                .any(|k| (if rows { k.row } else { k.col }) >= min_at)
         {
-            return;
-        }
-        let old = std::mem::take(&mut self.notes);
-        let mut out = std::collections::HashMap::with_capacity(old.len());
-        self.notes_dirty = true;
-        for (k, mut v) in old {
-            let pos = if rows { k.row } else { k.col };
-            if let Some(np) = shift.map(pos) {
-                let key = if rows {
-                    CellRef::new(np, k.col)
-                } else {
-                    CellRef::new(k.row, np)
-                };
-                v.r = key.row;
-                v.c = key.col;
-                out.insert(key, v);
+            let old = std::mem::take(&mut self.notes);
+            let mut out = std::collections::HashMap::with_capacity(old.len());
+            self.notes_dirty = true;
+            for (k, mut v) in old {
+                let pos = if rows { k.row } else { k.col };
+                if let Some(np) = shift.map(pos) {
+                    let key = if rows {
+                        CellRef::new(np, k.col)
+                    } else {
+                        CellRef::new(k.row, np)
+                    };
+                    v.r = key.row;
+                    v.c = key.col;
+                    out.insert(key, v);
+                }
             }
+            self.notes = out.into();
         }
-        self.notes = out.into();
+        if !self.threads.is_empty()
+            && self
+                .threads
+                .keys()
+                .any(|k| (if rows { k.row } else { k.col }) >= min_at)
+        {
+            let old = std::mem::take(&mut self.threads);
+            let mut out = std::collections::HashMap::with_capacity(old.len());
+            self.threads_dirty = true;
+            for (k, mut v) in old {
+                let pos = if rows { k.row } else { k.col };
+                if let Some(np) = shift.map(pos) {
+                    let key = if rows {
+                        CellRef::new(np, k.col)
+                    } else {
+                        CellRef::new(k.row, np)
+                    };
+                    v.r = key.row;
+                    v.c = key.col;
+                    out.insert(key, v);
+                }
+            }
+            self.threads = out;
+        }
     }
 
     /// 迷你图跟着行列结构走：锚点格位移，同表的数据区一起位移；

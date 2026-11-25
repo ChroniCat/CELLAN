@@ -1071,7 +1071,9 @@ pub(crate) mod tests {
                 || a.starts_with("zoom:")
                 || a.starts_with("fitw:")
                 || a.starts_with("fith:")
-                || a.starts_with("scale:");
+                || a.starts_with("scale:")
+                || a.starts_with("TableTotalsFn:")
+                || a.starts_with("InsertShape:");
             if !known {
                 missing.push(a);
             }

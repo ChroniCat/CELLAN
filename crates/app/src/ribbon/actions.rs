@@ -184,13 +184,18 @@ impl SheetApp {
                 st.swatch = Some(egui::Color32::from_rgb(c[0], c[1], c[2]));
             }
             "NumberFormat" => st.text = Some(fmt_label(&cur.format).to_string()),
-            "PrintGridlines" => st.checked = self.wb.sheet(self.sheet_idx).page.gridlines,
-            "PrintHeadings" => st.checked = self.wb.sheet(self.sheet_idx).page.headings,
-            "ShowGridlines" => st.checked = self.show_gridlines,
-            "ShowHeadings" => st.checked = self.show_headings,
+            "PrintGridlines" | "PrintGridlinesToggle" | "PrintPrintGridlines" => {
+                st.checked = self.wb.sheet(self.sheet_idx).page.gridlines;
+            }
+            "PrintHeadings" | "PrintHeadingsToggle" => {
+                st.checked = self.wb.sheet(self.sheet_idx).page.headings;
+            }
+            "ShowGridlines" | "ViewGridlines" => st.checked = self.show_gridlines,
+            "ShowHeadings" | "ViewHeadings" => st.checked = self.show_headings,
             "ShowFormulaBar" => st.checked = self.show_formula_bar,
             "TextSpill" => st.checked = self.text_spill,
             "ShowFormulas" => st.checked = self.show_formulas,
+            "ShowAllComments" => st.checked = self.show_all_comments,
             "DataFilter" => {
                 st.checked = self.wb.sheet(self.sheet_idx).filter.is_some();
                 if st.checked {
@@ -217,9 +222,9 @@ impl SheetApp {
                 st.label = Some(if on { "撤销保护" } else { "保护工作表" }.into());
             }
             "FileShare" | "ReviewShare" | "JoinAddress" | "RoomPassword" | "JoinRoom"
-            | "AutoShare" => {
+            | "AutoShare" | "AutoAutoShare" => {
                 st.visible = self.net.is_none();
-                if id == "AutoShare" {
+                if id == "AutoShare" || id == "AutoAutoShare" {
                     st.checked = self.auto_share;
                 }
             }
@@ -546,6 +551,7 @@ impl SheetApp {
             }
             "ExportPdf" => self.export_pdf_dialog(),
             "ExportWorkbookPdf" => self.export_workbook_pdf_dialog(),
+            "ExportCsv" => self.csv_export_dlg = Some(crate::CsvExportDlg::default()),
             "Undo" => self.do_undo(false),
             "Redo" => self.do_undo(true),
             "NewTab" => self.open_in_new_tab(std::path::PathBuf::new()),
@@ -666,12 +672,12 @@ impl SheetApp {
                     "格式刷：选择目标区域".into()
                 };
             }
-            "GrowFont" => {
+            "GrowFont" | "FontGrow" => {
                 let cur = self.current_style();
                 let s2 = (cur.size + 1.0).min(72.0);
                 self.apply_style(move |s| s.size = s2);
             }
-            "ShrinkFont" => {
+            "ShrinkFont" | "FontShrink" => {
                 let cur = self.current_style();
                 let s2 = (cur.size - 1.0).max(6.0);
                 self.apply_style(move |s| s.size = s2);
@@ -796,6 +802,11 @@ impl SheetApp {
                 self.set_repeat_action(crate::RepeatAction::RibbonCmd("CenterAcross".into()));
             }
             "NumberFormatApply" => {}
+            "NumberFormat:General" => {
+                self.apply_style(|s| s.format.clear());
+                self.set_repeat_action(crate::RepeatAction::NumberFormat(String::new()));
+                self.status = "已应用常规数字格式".into();
+            }
             "CurrencyStyle" => {
                 self.apply_style(|s| s.format = "¥#,##0.00".into());
                 self.set_repeat_action(crate::RepeatAction::RibbonCmd("CurrencyStyle".into()));
@@ -905,11 +916,7 @@ impl SheetApp {
             "SelectDataValidation" => self.select_special(crate::wps_menus::SpecialTarget::DataValidation),
 
             // ---------------------------------------------------- 插入
-            "Hyperlink" => {
-                let (r, c) = self.sel;
-                let text = self.wb.sheet(self.sheet_idx).value(r, c).display();
-                self.hyper_dlg = Some((String::new(), text));
-            }
+            "Hyperlink" => self.open_hyperlink_dialog(),
             "ChartWizard" | "ColumnChart" => self.insert_chart_from_selection(),
             "ColumnClusteredChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Column),
             "ColumnStackedChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::ColumnStacked),
@@ -1052,6 +1059,27 @@ impl SheetApp {
                 let x = cols.pos(c) + 4.0;
                 let y = rows.pos(r) + 2.0;
                 self.tb_create(x, y, 200.0, 60.0);
+                if let Some(i) = self.tb_sel {
+                    self.tb_open_edit(i);
+                }
+            }
+            a if a.starts_with("InsertShape:") => {
+                let tag = &a["InsertShape:".len()..];
+                let kind = match tag {
+                    "Rect" => sheetcore::textbox::ShapeKind::Rect,
+                    "RoundedRect" => sheetcore::textbox::ShapeKind::RoundedRect,
+                    "RightArrow" => sheetcore::textbox::ShapeKind::RightArrow,
+                    "Line" => sheetcore::textbox::ShapeKind::Line,
+                    "Ellipse" => sheetcore::textbox::ShapeKind::Ellipse,
+                    "Diamond" => sheetcore::textbox::ShapeKind::Diamond,
+                    "Callout" => sheetcore::textbox::ShapeKind::Callout,
+                    _ => sheetcore::textbox::ShapeKind::TextBox,
+                };
+                let (r, c) = self.sel;
+                let (cols, rows) = self.view_axes();
+                let x = cols.pos(c) + 4.0;
+                let y = rows.pos(r) + 2.0;
+                self.tb_create_kind(x, y, 160.0, 64.0, kind);
                 if let Some(i) = self.tb_sel {
                     self.tb_open_edit(i);
                 }
@@ -1282,6 +1310,14 @@ impl SheetApp {
             "PrevComment" => self.note_step(false),
             "NextComment" => self.note_step(true),
             "ShowComment" => self.note_show(),
+            "ShowAllComments" => {
+                self.show_all_comments = !self.show_all_comments;
+                self.status = if self.show_all_comments {
+                    "已显示当前工作表的全部批注".into()
+                } else {
+                    "已隐藏全部批注（悬停或选中单元格时自动展开）".into()
+                };
+            }
             "A11yChecker" => {
                 self.a11y_scan();
                 self.a11y_open = true;

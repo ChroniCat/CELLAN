@@ -716,6 +716,7 @@ pub(super) fn can_write_direct(wb: &Workbook, wants_macro: bool) -> bool {
         s.cf.dxfs.is_empty()
             && s.filter.as_ref().is_none_or(|f| f.color_filters.is_empty())
             && s.notes.is_empty()
+            && s.threads.is_empty()
             && !s.scenario_settings.has_source()
             && s.scenarios.is_empty()
             && s.sparklines.is_empty()
@@ -6082,6 +6083,7 @@ mod tests {
             data: Some(png.clone()),
             ext: "png".into(),
             name: "Logo".into(),
+            ..Default::default()
         });
         crate::formula::recalc_all(&mut wb);
         assert!(supported(&wb.sheets[0]));

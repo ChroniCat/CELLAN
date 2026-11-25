@@ -229,13 +229,31 @@ fn pic_anchor_xml(pic: &crate::pic::Picture, rid: &str, id: u32) -> String {
     let [dx1, dy1, dx2, dy2] = pic.off;
     let name = if pic.name.is_empty() { "图片" } else { pic.name.as_str() };
     let name_esc = xml_esc_attr(name);
+    let rot_attr = if pic.rot_deg.abs() > 0.01 {
+        let r60 = ((pic.rot_deg.rem_euclid(360.0)) as f64 * 60_000.0).round() as i64;
+        format!(" rot=\"{r60}\"")
+    } else {
+        String::new()
+    };
+    let src_rect = if pic.crop.iter().any(|&v| v > 1e-4) {
+        let [l, t, r, b] = pic.crop;
+        format!(
+            "<a:srcRect l=\"{}\" t=\"{}\" r=\"{}\" b=\"{}\"/>",
+            (l.clamp(0.0, 0.9) * 100_000.0).round() as i64,
+            (t.clamp(0.0, 0.9) * 100_000.0).round() as i64,
+            (r.clamp(0.0, 0.9) * 100_000.0).round() as i64,
+            (b.clamp(0.0, 0.9) * 100_000.0).round() as i64,
+        )
+    } else {
+        String::new()
+    };
     format!(
         "<xdr:twoCellAnchor editAs=\"oneCell\">\
 <xdr:from><xdr:col>{c1}</xdr:col><xdr:colOff>{dx1}</xdr:colOff><xdr:row>{r1}</xdr:row><xdr:rowOff>{dy1}</xdr:rowOff></xdr:from>\
 <xdr:to><xdr:col>{c2}</xdr:col><xdr:colOff>{dx2}</xdr:colOff><xdr:row>{r2}</xdr:row><xdr:rowOff>{dy2}</xdr:rowOff></xdr:to>\
 <xdr:pic><xdr:nvPicPr><xdr:cNvPr id=\"{id}\" name=\"{name_esc}\"/><xdr:cNvPicPr><a:picLocks noChangeAspect=\"1\"/></xdr:cNvPicPr></xdr:nvPicPr>\
-<xdr:blipFill><a:blip r:embed=\"{rid}\"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>\
-<xdr:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr>\
+<xdr:blipFill><a:blip r:embed=\"{rid}\"/>{src_rect}<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>\
+<xdr:spPr><a:xfrm{rot_attr}><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr>\
 </xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"
     )
 }
@@ -466,10 +484,17 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
             if !ext.is_empty() && !exts.contains(&ext) {
                 exts.push(ext);
             }
-            if let Some(pos) = existing_pics
-                .iter()
-                .position(|(ep, er, eo, _)| ep == &media && *er == pic.rect && *eo == pic.off)
-            {
+            if let Some(pos) = existing_pics.iter().position(|(ep, er, eo, raw)| {
+                let (erot, ecrop) = crate::pic::parse_pic_transform(raw);
+                ep == &media
+                    && *er == pic.rect
+                    && *eo == pic.off
+                    && (erot - pic.rot_deg).abs() < 0.05
+                    && ecrop
+                        .iter()
+                        .zip(pic.crop.iter())
+                        .all(|(a, b)| (a - b).abs() < 1e-3)
+            }) {
                 let (_, _, _, raw_block) = existing_pics.remove(pos);
                 anchors.push_str(&rebind_pic_anchor_rid(&raw_block, &rid_i));
             } else {
