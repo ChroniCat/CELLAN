@@ -46,8 +46,7 @@ fn scatter_points_follow_x_scale_not_index() {
     let sh = &wb.sheets[1];
     let layout = sheetcore::print::paginate(sh, &sh.page);
     let out = sheetcore::print::page_ops_with(&wb, 1, &layout, 0, Some(&fixture()));
-    // P0 #30: 散点图按散点标记绘制（out.rects 小方块），不再错误画成闭合实心多边形（out.polys）。
-    assert!(out.polys.is_empty(), "散点图不应输出实心闭合多边形");
+    assert!(out.polys.is_empty(), "散点图不应画成闭合填充多边形");
     let pts: Vec<(f32, f32)> = out
         .rects
         .iter()

@@ -938,10 +938,12 @@ pub struct Sheet {
     pub page: crate::page::PageSetup,
     /// 页面设置被改过
     pub page_dirty: bool,
-    /// 图表（只读展示，原样保留；CoW 共享避免渲染与快照每帧深拷）
+    /// 图表（CoW 共享避免渲染与快照每帧深拷）
     pub charts: SharedList<crate::charts::Chart>,
-    /// 图表引用被改过：保存时要重写 chart 部件
+    /// 图表增删改/锚点/引用被改过：保存时同步写回 chart/drawing 部件
     pub charts_dirty: bool,
+    /// 在内存中删除、待保存时从 zip 摘除的 `(drawing_part, chart_part)` 列表
+    pub deleted_charts: Vec<(String, String)>,
     /// 工作表标签颜色（RGB）
     pub tab_color: Option<[u8; 3]>,
     /// 标签颜色被改过：保存时要写 <sheetPr><tabColor>
@@ -1034,6 +1036,7 @@ impl Sheet {
             page_dirty: false,
             charts: SharedList::default(),
             charts_dirty: false,
+            deleted_charts: Vec::new(),
             tab_color: None,
             tab_color_dirty: false,
             tables_dirty: false,

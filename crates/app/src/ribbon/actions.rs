@@ -293,17 +293,37 @@ impl SheetApp {
             }
             "ChartTitle" => {
                 if let Some(ch) = self.chart_at_sel() {
-                    st.text = Some(ch.title.clone());
+                    st.text = Some(if ch.title.is_empty() {
+                        ch.kind.label().to_string()
+                    } else {
+                        ch.title.clone()
+                    });
                 } else {
                     st.visible = false;
                 }
             }
             "ChartMeta" => {
                 if let Some(ch) = self.chart_at_sel() {
-                    st.text = Some(format!("{:?} · {} 个系列", ch.kind, ch.series.len()));
+                    st.text = Some(format!(
+                        "{} · {} · {} 系列",
+                        ch.kind.label(),
+                        ch.style.theme.label(),
+                        ch.series.len()
+                    ));
                 } else {
                     st.visible = false;
                 }
+            }
+            "ChartStudioToggle" => {
+                st.checked = self.chart_studio.sidebar_open && self.chart_at_sel().is_some();
+            }
+            "ChartToggleLabels" => {
+                st.checked = self.chart_at_sel().is_some_and(|c| c.show_labels);
+            }
+            "ChartToggleTrendline" => {
+                st.checked = self
+                    .chart_at_sel()
+                    .is_some_and(|c| c.series.iter().any(|s| !s.trendlines.is_empty()));
             }
             "SparkTypeLine" => {
                 if let Some(sp) = self.spark_at_sel() {
@@ -850,19 +870,31 @@ impl SheetApp {
                 let text = self.wb.sheet(self.sheet_idx).value(r, c).display();
                 self.hyper_dlg = Some((String::new(), text));
             }
-            "ColumnChart" => self.insert_chart_from_selection(),
+            "ChartWizard" | "ColumnChart" => self.insert_chart_from_selection(),
+            "ColumnClusteredChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Column),
+            "ColumnStackedChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::ColumnStacked),
+            "ColumnStacked100Chart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::ColumnStacked100),
             "LineChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Line),
+            "LineStackedChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::LineStacked),
             "PieChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Pie),
             "BarChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Bar),
             "BarStackedChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::BarStacked),
+            "BarStacked100Chart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::BarStacked100),
             "AreaChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Area),
+            "AreaStackedChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::AreaStacked),
+            "AreaStacked100Chart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::AreaStacked100),
             "DoughnutChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Doughnut),
             "ScatterChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Scatter),
+            "BubbleChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Bubble),
             "RadarChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Radar),
             "ComboChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Combo),
+            "WaterfallChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Waterfall),
+            "FunnelChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Funnel),
+            "TreemapChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Treemap),
+            "HistogramChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::Histogram),
+            "BoxWhiskerChart" => self.insert_chart_of_kind(sheetcore::charts::ChartKind::BoxWhisker),
             "ChartManager" => {
                 self.chart_mgr = true;
-                self.reload_charts();
             }
             "InsertPivot" => self.open_pivot_create_wizard(None),
             "InsertPicture" => {
@@ -1426,11 +1458,29 @@ impl SheetApp {
             }
 
             // ---------------------------------------------------- 图表工具
-            "ChartEdit" => {
-                if let Some(ch) = self.chart_at_sel().cloned() {
-                    self.chart_edit = Some(ch);
+            "ChartEdit" => self.open_chart_studio_for_selected(),
+            "ChartStudioToggle" => {
+                if self.chart_studio.sidebar_open {
+                    self.chart_studio.sidebar_open = false;
+                } else {
+                    self.open_chart_studio_for_selected();
                 }
             }
+            "ChartSwitchRowCol" => self.switch_selected_chart_row_col(),
+            "ChartCycleTheme" => self.cycle_selected_chart_theme(),
+            "ChartToggleLabels" => self.toggle_selected_chart_labels(),
+            "ChartToggleTrendline" => self.toggle_selected_chart_trendline(),
+            "ChartExportSvg" => {
+                if let Some(ci) = self.chart_sel {
+                    self.export_chart_svg_dialog(ci);
+                }
+            }
+            "ChartDuplicate" => {
+                if let Some(ci) = self.chart_sel {
+                    self.duplicate_chart_at(ci);
+                }
+            }
+            "ChartDelete" => self.delete_selected_chart(),
 
             "Noop" => {}
             "DoubleUnderline" => {

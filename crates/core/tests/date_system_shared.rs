@@ -270,31 +270,14 @@ fn chart_values_keep_raw_numbers_when_cells_are_formatted() {
         kind: ChartKind::Column,
         title: "t".into(),
         series: vec![Series {
-            name: String::new(),
-            cats: Vec::new(),
-            vals: Vec::new(),
-            name_ref: String::new(),
             cat_ref: "S!$A$1:$A$4".into(),
             val_ref: "S!$B$1:$B$4".into(),
-            color: None,
-            xv: Vec::new(),
-            kind: None,
-            secondary: false,
+            ..Default::default()
         }],
         legend: false,
         anchor: (0, 0, 5, 5),
         legend_pos: String::new(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: sheetcore::charts::LabelOpts::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
-        axis_x: String::new(),
-        axis_y: String::new(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        ..Default::default()
     };
     resolve_series_in(&mut chart, &wb.sheets[0], Some(&wb.styles), DateSystem::D1904);
     let s = &chart.series[0];

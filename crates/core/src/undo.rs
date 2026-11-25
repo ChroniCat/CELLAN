@@ -615,6 +615,55 @@ impl PivotUndoAction {
 
 pub const COW_BATCH_THRESHOLD: usize = 16_384;
 
+/// 一等公民图表撤销/重做记录（覆盖插入、编辑、拖拽/缩放、行列互换、克隆与删除，绝不清空历史撤销栈）
+#[derive(Clone, Debug)]
+pub struct ChartUndoEdit {
+    pub sheet: usize,
+    pub charts_before: crate::model::SharedList<crate::charts::Chart>,
+    pub charts_after: crate::model::SharedList<crate::charts::Chart>,
+    pub deleted_before: Vec<(String, String)>,
+    pub deleted_after: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+struct ChartUndoAction {
+    label: String,
+    focus: (usize, u32, u32),
+    by_site: u32,
+    edit: ChartUndoEdit,
+}
+
+impl ChartUndoAction {
+    fn apply(&mut self, wb: &mut Workbook, redo: bool) -> Applied {
+        if let Some(sh) = wb.sheets.get_mut(self.edit.sheet) {
+            sh.charts = if redo {
+                self.edit.charts_after.clone()
+            } else {
+                self.edit.charts_before.clone()
+            };
+            sh.deleted_charts = if redo {
+                self.edit.deleted_after.clone()
+            } else {
+                self.edit.deleted_before.clone()
+            };
+            sh.charts_dirty = true;
+        }
+        wb.dirty = true;
+        Applied {
+            touched: Vec::new(),
+            style_changes: Vec::new(),
+            label: self.label.clone(),
+            focus: self.focus,
+            skipped: 0,
+            structural: false,
+            refresh_sizes: None,
+            merge_changes: Vec::new(),
+            merge_conflict: false,
+            total_touched: 0,
+        }
+    }
+}
+
 enum Entry {
     Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>, Option<ArrayEdit>),
     CowBatch(EntryStamp, Box<CowBatchAction>),
@@ -623,6 +672,7 @@ enum Entry {
     SheetTab(EntryStamp, SheetTabAction),
     Meta(EntryStamp, Box<MetaAction>),
     Pivot(EntryStamp, Box<PivotUndoAction>),
+    Chart(EntryStamp, Box<ChartUndoAction>),
 }
 
 impl Entry {
@@ -636,7 +686,8 @@ impl Entry {
             | Self::Structure(s, _)
             | Self::SheetTab(s, _)
             | Self::Meta(s, _)
-            | Self::Pivot(s, _) => *s,
+            | Self::Pivot(s, _)
+            | Self::Chart(s, _) => *s,
         }
     }
 
@@ -648,7 +699,8 @@ impl Entry {
             | Self::Structure(s, _)
             | Self::SheetTab(s, _)
             | Self::Meta(s, _)
-            | Self::Pivot(s, _) => s,
+            | Self::Pivot(s, _)
+            | Self::Chart(s, _) => s,
         }
     }
 
@@ -685,6 +737,7 @@ impl Entry {
             Self::SheetTab(_, a) => &a.label,
             Self::Meta(_, a) => &a.label,
             Self::Pivot(_, a) => &a.label,
+            Self::Chart(_, a) => &a.label,
         }
     }
     fn by_site(&self) -> u32 {
@@ -696,6 +749,7 @@ impl Entry {
             Self::SheetTab(_, a) => a.by_site,
             Self::Meta(_, a) => a.by_site,
             Self::Pivot(_, a) => a.by_site,
+            Self::Chart(_, a) => a.by_site,
         }
     }
 }
@@ -2250,12 +2304,32 @@ impl UndoStack {
         self.done.last().map(Entry::id)
     }
 
+    pub fn push_chart_edit(
+        &mut self,
+        label: impl Into<String>,
+        focus: (usize, u32, u32),
+        edit: ChartUndoEdit,
+    ) {
+        self.undone.clear();
+        let approx_bytes = 512 + edit.charts_after.len() * 256;
+        self.done.push(Entry::Chart(
+            next_entry(approx_bytes),
+            Box::new(ChartUndoAction {
+                label: label.into(),
+                focus,
+                by_site: self.site,
+                edit,
+            }),
+        ));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
     pub fn undo_is_structure(&self) -> bool {
-        matches!(self.done.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..)))
+        matches!(self.done.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..) | Entry::Chart(..)))
     }
 
     pub fn redo_is_structure(&self) -> bool {
-        matches!(self.undone.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..)))
+        matches!(self.undone.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..) | Entry::Chart(..)))
     }
 
     pub fn record_appended_sheet(&mut self, wb: &Workbook, previous_focus: (usize, u32, u32)) {
@@ -2319,6 +2393,11 @@ impl UndoStack {
             self.undone.push(self.done.pop()?);
             return Some(applied);
         }
+        if let Some(Entry::Chart(_, action)) = self.done.last_mut() {
+            let applied = action.apply(wb, false);
+            self.undone.push(self.done.pop()?);
+            return Some(applied);
+        }
         let Entry::Structure(_, action) = self.done.last()? else { unreachable!() };
         let (before, after) = action.history.snapshots()?;
         let touched = restore_structure(wb, before, after)?;
@@ -2338,6 +2417,11 @@ impl UndoStack {
             return Some(applied);
         }
         if let Some(Entry::Pivot(_, action)) = self.undone.last_mut() {
+            let applied = action.apply(wb, true);
+            self.done.push(self.undone.pop()?);
+            return Some(applied);
+        }
+        if let Some(Entry::Chart(_, action)) = self.undone.last_mut() {
             let applied = action.apply(wb, true);
             self.done.push(self.undone.pop()?);
             return Some(applied);

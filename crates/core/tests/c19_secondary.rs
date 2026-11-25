@@ -20,10 +20,8 @@ fn series(name: &str, vals: Vec<f64>, secondary: bool) -> sheetcore::charts::Ser
         name_ref: format!("'进度'!$B$1"),
         cat_ref: "'进度'!$A$2:$A$3".into(),
         val_ref: "'进度'!$B$2:$B$3".into(),
-        color: None,
-        xv: Vec::new(),
-        kind: None,
         secondary,
+        ..Default::default()
     }
 }
 
@@ -40,17 +38,7 @@ fn secondary_axis_gets_its_own_nice_ticks() {
         legend: true,
         anchor: (0, 0, 4, 1),
         legend_pos: "r".into(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: Default::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
-        axis_x: String::new(),
-        axis_y: String::new(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        ..Default::default()
     };
     wb.sheets[0].charts.push(ch);
     let layout = sheetcore::print::paginate(&wb.sheets[0], &wb.sheets[0].page);
