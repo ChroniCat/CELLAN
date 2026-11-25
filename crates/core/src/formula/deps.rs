@@ -1402,7 +1402,13 @@ impl Walker<'_> {
             Node::Range(a, b) => {
                 a.book.is_some() || b.book.is_some() || a.sheet2.is_some() || b.sheet2.is_some()
             }
-            Node::Implicit(_) | Node::Spill(_) | Node::Name(_) | Node::ScopedName { .. } => true,
+            Node::Implicit(_)
+            | Node::Spill(_)
+            | Node::Name(_)
+            | Node::ScopedName { .. }
+            | Node::DynRange(..)
+            | Node::Intersect(..)
+            | Node::Union(_) => true,
             _ => false,
         };
         match node {
@@ -1514,6 +1520,16 @@ impl Walker<'_> {
                         r2,
                         c2,
                     });
+                }
+            }
+            Node::DynRange(a, b) | Node::Intersect(a, b) => {
+                self.result.volatile_ref = true;
+                self.walk(a, si, dr, dc);
+                self.walk(b, si, dr, dc);
+            }
+            Node::Union(items) => {
+                for item in items {
+                    self.walk(item, si, dr, dc);
                 }
             }
             Node::Name(n) => {

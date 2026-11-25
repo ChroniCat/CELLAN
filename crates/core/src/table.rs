@@ -1206,8 +1206,8 @@ fn expand_segment_at(
     let mut i = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
-        // 表内当前行简写：`[@金额]` / `[[#This Row],[金额]]`（没有表名）。
-        // 必须先按公式单元格定位所属表，否则同一行多张表会取错。
+        // 表内裸引用：`[@金额]` / `[[#This Row],[金额]]` 以及表内 `[金额]` / `[#Headers]` / `[#Totals]` / `[#Data]` / `[#All]`。
+        // 必须先按公式单元格定位所属表，并避开外部工作簿 `[Book1]Sheet1!A1` 语法。
         if b == b'[' {
             if let Some((inner, end_len)) = bracket_group(&body[i..]) {
                 let is_this_row = inner.trim_start().starts_with('@')
@@ -1231,17 +1231,53 @@ fn expand_segment_at(
                     i += end_len;
                     continue;
                 }
+                // 表内裸列 / 特殊段引用（如 `[金额]`、`[#Headers]`、`[[#Data],[单价]]`），排除外部工作簿 `[1]Sheet!A1`
+                let after = body[i + end_len..].trim_start();
+                let looks_like_ext_book = after.starts_with('!')
+                    || after.starts_with('\'')
+                    || after.chars().next().is_some_and(|ch| ch.is_alphabetic() || ch == '_');
+                if !looks_like_ext_book
+                    && let (Some(row), Some(col)) = (cur_row, cur_col)
+                    && let Some((tbl, on_si)) = find_table_at(wb, si, row, col)
+                {
+                    let expanded = expand_table_spec(wb, si, on_si, cur_row, tbl, inner);
+                    if expanded != "#REF!" {
+                        out.push_str(&expanded);
+                        changed = true;
+                        i += end_len;
+                        continue;
+                    }
+                }
             }
         }
-        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'\\') {
+        // 表名支持 ASCII 与 Unicode（如中文表名 `销售表[金额]`、`表1[单价]`）
+        let ch0 = if b < 0x80 {
+            b as char
+        } else {
+            body[i..].chars().next().unwrap()
+        };
+        if ch0.is_alphanumeric() || matches!(ch0, '_' | '.' | '\\') {
             let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.' | b'\\'))
-            {
-                i += 1;
+            i += ch0.len_utf8();
+            while i < bytes.len() {
+                let nb = bytes[i];
+                if nb < 0x80 {
+                    if nb.is_ascii_alphanumeric() || matches!(nb, b'_' | b'.' | b'\\') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    let ch = body[i..].chars().next().unwrap();
+                    if ch.is_alphanumeric() || matches!(ch, '_' | '.' | '\\') {
+                        i += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
             }
             let name = &body[start..i];
-            // 表名可以出现在公式体开头（`Sales[Amount]`），不能要求 start > 0。
+            // 表名可以出现在公式体开头（`Sales[Amount]` / `销售表[金额]`），不能要求 start > 0。
             if i < bytes.len()
                 && bytes[i] == b'['
                 && let Some((inner, end_len)) = bracket_group(&body[i..])
@@ -1255,9 +1291,8 @@ fn expand_segment_at(
             out.push_str(name);
             continue;
         }
-        let ch = body[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
+        out.push(ch0);
+        i += ch0.len_utf8();
     }
     if changed { Some(out) } else { None }
 }

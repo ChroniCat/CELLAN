@@ -2902,13 +2902,19 @@ pub(super) fn call_by_id_in(
         }),
         FuncId::Weekday => r(|| {
             let serial = num(args, 0)?;
-            let t = opt_num(args, 1, 1.0)? as i64;
-            let days = (serial.floor() as i64 + 6) % 7; // 0=Sunday
+            let t = opt_num(args, 1, 1.0)?.trunc() as i64;
+            let adj = serial.floor() as i64 + if ctx.date_system.is_1904() { 1462 } else { 0 };
+            let sun0 = (adj + 6).rem_euclid(7); // 0=Sunday .. 6=Saturday
             let v = match t {
-                1 => days + 1,
-                2 => (days + 6) % 7 + 1,
-                3 => (days + 6) % 7,
-                _ => days + 1,
+                1 | 17 => sun0 + 1,
+                2 | 11 => (sun0 + 6) % 7 + 1,
+                3 => (sun0 + 6) % 7,
+                12 => (sun0 + 5) % 7 + 1,
+                13 => (sun0 + 4) % 7 + 1,
+                14 => (sun0 + 3) % 7 + 1,
+                15 => (sun0 + 2) % 7 + 1,
+                16 => (sun0 + 1) % 7 + 1,
+                _ => return Err(ErrKind::Num),
             };
             Ok(FValue::number(v as f64))
         }),
@@ -2959,35 +2965,87 @@ pub(super) fn call_by_id_in(
         }),
         FuncId::WeekNum => r(|| {
             let serial = num(args, 0)?.floor();
+            let rt = opt_num(args, 1, 1.0)?.trunc() as i64;
+            if rt == 21 {
+                // ISO 8601 周数（周一为周首，含当年首个周四的周为第 1 周）
+                let adj = serial as i64 + if ctx.date_system.is_1904() { 1462 } else { 0 };
+                let mon0 = (adj + 5).rem_euclid(7); // 0=Mon..6=Sun
+                let thu_serial = serial + (3 - mon0) as f64;
+                let (iso_y, _, _) = serial_to_date_in(ctx.date_system, thu_serial).ok_or(ErrKind::Num)?;
+                let jan4 = date_to_serial_in(ctx.date_system, iso_y, 1, 4).ok_or(ErrKind::Num)?;
+                let jan4_adj = jan4 as i64 + if ctx.date_system.is_1904() { 1462 } else { 0 };
+                let jan4_mon0 = (jan4_adj + 5).rem_euclid(7);
+                let week1_mon = jan4 - jan4_mon0 as f64;
+                let wn = ((serial - week1_mon) / 7.0).floor() + 1.0;
+                return Ok(FValue::number(wn));
+            }
+            let start_dow: i64 = match rt {
+                1 | 17 => 0, // Sun
+                2 | 11 => 1, // Mon
+                12 => 2,     // Tue
+                13 => 3,     // Wed
+                14 => 4,     // Thu
+                15 => 5,     // Fri
+                16 => 6,     // Sat
+                _ => return Err(ErrKind::Num),
+            };
             let (y, _, _) = serial_to_date_in(ctx.date_system, serial).ok_or(ErrKind::Num)?;
             let jan1 = date_to_serial_in(ctx.date_system, y, 1, 1).ok_or(ErrKind::Num)?;
-            let offset = ((jan1 as i64 + 6) % 7) as f64; // 周日为一周开始
+            let jan1_adj = jan1 as i64 + if ctx.date_system.is_1904() { 1462 } else { 0 };
+            let jan1_sun0 = (jan1_adj + 6).rem_euclid(7);
+            let offset = (jan1_sun0 - start_dow).rem_euclid(7) as f64;
             Ok(FValue::number(((serial - jan1 + offset) / 7.0).floor() + 1.0))
         }),
         FuncId::NetworkDays => r(|| {
             let a = num(args, 0)?.floor() as i64;
             let b = num(args, 1)?.floor() as i64;
-            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            let mut n = 0;
+            let mut holidays = Vec::new();
+            if let Some(h_arg) = args.get(2) {
+                for v in h_arg.slice() {
+                    match v {
+                        FValue::Empty => {}
+                        FValue::Error(e) => return Err(*e),
+                        _ => holidays.push(v.to_number()?.floor() as i64),
+                    }
+                }
+            }
+            let date_off = if ctx.date_system.is_1904() { 1462 } else { 0 };
+            let (lo, hi, sign) = if a <= b { (a, b, 1.0) } else { (b, a, -1.0) };
+            let mut n = 0i64;
             for d in lo..=hi {
-                // (d+6)%7：0=周日 1=周一 … 6=周六
-                let wd = (d + 6) % 7;
-                if wd != 0 && wd != 6 {
+                let wd = (d + date_off + 6).rem_euclid(7); // 0=周日 .. 6=周六
+                if wd != 0 && wd != 6 && !holidays.contains(&d) {
                     n += 1;
                 }
             }
-            Ok(FValue::number(n as f64))
+            Ok(FValue::number(sign * n as f64))
         }),
         FuncId::Workday => r(|| {
             let start = num(args, 0)?.floor() as i64;
             let days = int_arg(args, 1)?;
+            let mut holidays = Vec::new();
+            if let Some(h_arg) = args.get(2) {
+                for v in h_arg.slice() {
+                    match v {
+                        FValue::Empty => {}
+                        FValue::Error(e) => return Err(*e),
+                        _ => holidays.push(v.to_number()?.floor() as i64),
+                    }
+                }
+            }
+            let date_off = if ctx.date_system.is_1904() { 1462 } else { 0 };
             let mut d = start;
             let mut left = days.abs();
             let step = if days >= 0 { 1 } else { -1 };
+            let mut guard = 0usize;
             while left > 0 {
+                guard += 1;
+                if guard > 5_000_000 {
+                    return Err(ErrKind::Num);
+                }
                 d += step;
-                let wd = (d + 6) % 7;
-                if wd != 0 && wd != 6 {
+                let wd = (d + date_off + 6).rem_euclid(7);
+                if wd != 0 && wd != 6 && !holidays.contains(&d) {
                     left -= 1;
                 }
             }
@@ -3138,6 +3196,8 @@ pub(super) fn call_by_id_in(
                 ErrKind::Na => 7.0,
                 ErrKind::Circular => 4.0,
                 ErrKind::Spill => 9.0,
+                ErrKind::Field => 11.0,
+                ErrKind::Calc => 14.0,
             })),
             _ => Err(ErrKind::Na),
         }),
@@ -3198,7 +3258,7 @@ fn pmt(rate: f64, nper: f64, pv: f64, fv: f64, t: f64) -> f64 {
     -(rate * (pv * p + fv)) / ((1.0 + rate * t) * (p - 1.0))
 }
 
-fn year_fraction_in(sys: DateSystem, start: f64, end: f64, basis: i32) -> Result<f64, ErrKind> {
+pub(super) fn year_fraction_in(sys: DateSystem, start: f64, end: f64, basis: i32) -> Result<f64, ErrKind> {
     if start < 0.0 || end > date_to_serial_in(sys, 9999, 12, 31).ok_or(ErrKind::Num)? {
         return Err(ErrKind::Num);
     }
@@ -3561,7 +3621,7 @@ pub(super) fn listed_builtin(name: &str) -> bool {
 
 const IMPLEMENTED: &[&str] = &[
     "ABS","ACOS","ACOSH","ACOT","AND","ARABIC","ARRAYTOTEXT","ASIN","ASINH","ATAN","ATAN2","ATANH","AVEDEV","AVERAGE","AVERAGEA","AVERAGEIF","BASE","BETA.DIST","BETA.INV","BETADIST","BETAINV","BIN2DEC","BIN2HEX","BIN2OCT","BINOM.DIST","BINOM.INV","BINOMDIST","BITAND","BITLSHIFT","BITOR","BITRSHIFT","BITXOR","CEILING","CEILING.MATH","CEILING.PRECISE","CHAR","CHIDIST","CHIINV","CHISQ.DIST","CHISQ.DIST.RT","CHISQ.INV","CHISQ.INV.RT","CHOOSE","CHOOSECOLS","CHOOSEROWS","CODE","COLUMN","COLUMNS","COMBIN","COMBINA","COMPLEX","CONCAT","CONCATENATE","CONFIDENCE","CONFIDENCE.NORM","CONFIDENCE.T","CORREL","COS","COSH","COT","COTH","COUNT","COUNTA","COUNTBLANK","COUNTIF","COUNTIFS","CRITBINOM","CSC","CSCH","CUMIPMT","CUMPRINC","DATE","DATEDIF","DAVERAGE","DAY","DAYS","DB","DCOUNT","DCOUNTA","DDB","DEC2BIN","DEC2HEX","DEC2OCT","DECIMAL","DEGREES","DELTA","DEVSQ","DGET","DMAX","DMIN","DOLLARDE","DOLLARFR","DPRODUCT","DROP","DSTDEV","DSTDEVP","DSUM","DVAR","DVARP","EDATE","EFFECT","EOMONTH","ERF","ERF.PRECISE","ERFC","ERFC.PRECISE","ERROR.TYPE","EVEN","EXACT","EXP","EXPAND","EXPON.DIST","EXPONDIST","F.DIST","F.DIST.RT","F.INV","F.INV.RT","FACT","FACTDOUBLE","FALSE","FDIST","FILTER","FIND","FINV","FISHER","FISHERINV","FLOOR","FLOOR.MATH","FLOOR.PRECISE","FV","FVSCHEDULE","GAMMA.DIST","GAMMA.INV","GAMMADIST","GAMMAINV","GAMMALN","GAMMALN.PRECISE","GCD","GEOMEAN","GESTEP","HARMEAN","HEX2BIN","HEX2DEC","HEX2OCT","HLOOKUP","HOUR","HSTACK","HYPGEOM.DIST","HYPGEOMDIST","IF","IFERROR","IFNA","IFS","IMABS","IMADD","IMAGINARY","IMARGUMENT","IMCONJUGATE","IMCOS","IMDIV","IMEXP","IMLN","IMLOG10","IMLOG2","IMMUL","IMPOWER","IMPRODUCT","IMREAL","IMSIN","IMSQRT","IMSUB","IMSUM","IMTAN","INDEX","INT","INTERCEPT","IPMT","IRR","ISBLANK","ISERR","ISERROR","ISEVEN","ISLOGICAL","ISNA","ISNONTEXT","ISNUMBER","ISO.CEILING","ISODD","ISREF","ISTEXT","KURT","LARGE","LCM","LEFT","LEN","LET","LN","LOG","LOG10","LOGINV","LOGNORM.DIST","LOGNORM.INV","LOGNORMDIST","LOOKUP","LOWER","MATCH","MAX","MAXA","MAXIFS","MEDIAN","MID","MIN","MINA","MINIFS","MINUTE","MIRR","MMULT","MOD","MODE","MONTH","MROUND","MULTINOMIAL","N","NA","NEGBINOM.DIST","NEGBINOMDIST","NETWORKDAYS","NOMINAL","NORM.DIST","NORM.INV","NORM.S.DIST","NORM.S.INV","NORMDIST","NORMINV","NORMSDIST","NORMSINV","NOT","NOW","NPER","NPV","OCT2BIN","OCT2DEC","OCT2HEX","ODD","OR","PDURATION","PERCENTILE","PERCENTILE.INC","PERMUT","PI","PMT","POISSON","POISSON.DIST","POWER","PPMT","PRODUCT","PROPER","PV","QUARTILE","QUARTILE.INC","QUOTIENT","RADIANS","RAND","RANDARRAY","RANDBETWEEN","RANK","RANK.EQ","RATE","REPLACE","REPT","RIGHT","ROMAN","ROUND","ROUNDDOWN","ROUNDUP","ROW","ROWS","RRI","SEARCH","SEC","SECH","SECOND","SEQUENCE","SERIESSUM","SIGN","SIN","SINH","SKEW","SKEW.P","SLN","SLOPE","SMALL","SORT","SORTBY","SQRT","SQRTPI","STANDARDIZE","STDEV","STDEV.P","STDEV.S","STDEVP","SUBSTITUTE","SUBTOTAL","SUM","SUMIF","SUMIFS","SUMPRODUCT","SUMSQ","SUMX2MY2","SUMX2PY2","SUMXMY2","SWITCH","SYD","T","T.DIST","T.DIST.2T","T.DIST.RT","T.INV","T.INV.2T","TAKE","TAN","TANH","TEXT","TEXTAFTER","TEXTBEFORE","TEXTJOIN","TIME","TINV","TOCOL","TODAY","TOROW","TRANSPOSE","TRIM","TRIMMEAN","TRUE","TRUNC","TYPE","UNICHAR","UNICODE","UNIQUE","UPPER","VALUE","VALUETOTEXT","VAR","VAR.P","VAR.S","VARP","VLOOKUP","VSTACK","WEEKDAY","WEEKNUM","WEIBULL","WEIBULL.DIST","WORKDAY","XIRR","XLOOKUP","XMATCH","XNPV","XOR","YEAR","YEARFRAC","Z.TEST","ZTEST","T.TEST","F.TEST","CHISQ.TEST","RSQ","FORECAST","FORECAST.LINEAR","STEYX","TREND","GROWTH","LINEST","PERCENTRANK","PERCENTRANK.INC","PERCENTILE.EXC","QUARTILE.EXC","RANK.AVG","CONVERT","VDB","DURATION","MDURATION","TBILLPRICE","TBILLYIELD","TBILLEQ","AMORLINC","AMORDEGRC","AVERAGEIFS","MODE.SNGL","MODE.MULT","AGGREGATE","FREQUENCY","PROB","STDEVA","VARA","COVARIANCE.P","COVARIANCE.S","COVARIANCE","PEARSON","HYPERLINK","ENCODEURL","TEXTSPLIT","WRAPROWS","WRAPCOLS","ISFORMULA","FORMULATEXT","SHEET","SHEETS","ADDRESS","INDIRECT","OFFSET","LAMBDA","MAP","REDUCE","SCAN","BYROW","BYCOL","MAKEARRAY","ISOMITTED",
-    "ACOTH","GAMMA","GAUSS","PHI","PERMUTATIONA","BINOM.DIST.RANGE","COVAR","PERCENTOF","PERCENTRANK.EXC","LOGEST","MDETERM","MINVERSE","CLEAN","ASC","DOLLAR","FIXED","NUMBERVALUE","DAYS360","DATEVALUE","TIMEVALUE","ISOWEEKNUM","CELL","AREAS","INFO","COUPPCD","COUPNCD","COUPNUM","COUPDAYS","COUPDAYBS","COUPDAYSNC","PRICE","YIELD","DISC","INTRATE","RECEIVED","PRICEDISC","YIELDDISC","PRICEMAT","YIELDMAT","REGEXTEST","REGEXEXTRACT","REGEXREPLACE","NETWORKDAYS.INTL","WORKDAY.INTL","ODDFPRICE","ODDFYIELD","ODDLPRICE","ODDLYIELD","BESSELI","BESSELJ","BESSELK","BESSELY","FORECAST.ETS","FORECAST.ETS.CONFINT","FORECAST.ETS.SEASONALITY","FORECAST.ETS.STAT",
+    "ACOTH","GAMMA","GAUSS","PHI","PERMUTATIONA","BINOM.DIST.RANGE","COVAR","PERCENTOF","PERCENTRANK.EXC","LOGEST","MDETERM","MINVERSE","CLEAN","ASC","DOLLAR","FIXED","NUMBERVALUE","DAYS360","DATEVALUE","TIMEVALUE","ISOWEEKNUM","CELL","AREAS","INFO","COUPPCD","COUPNCD","COUPNUM","COUPDAYS","COUPDAYBS","COUPDAYSNC","PRICE","YIELD","DISC","INTRATE","RECEIVED","PRICEDISC","YIELDDISC","PRICEMAT","YIELDMAT","REGEXTEST","REGEXEXTRACT","REGEXREPLACE","NETWORKDAYS.INTL","WORKDAY.INTL","ODDFPRICE","ODDFYIELD","ODDLPRICE","ODDLYIELD","BESSELI","BESSELJ","BESSELK","BESSELY","FORECAST.ETS","FORECAST.ETS.CONFINT","FORECAST.ETS.SEASONALITY","FORECAST.ETS.STAT","LENB","LEFTB","RIGHTB","MIDB","FINDB","SEARCHB","NUMBERSTRING","ACCRINT","ACCRINTM",
 ];
 
 #[cfg(test)]

@@ -86,6 +86,12 @@ pub enum Node {
     /// 隐式交集运算符 `@`：按公式所在行/列与引用区域求交
     Implicit(Box<Node>),
     Range(RefExpr, RefExpr),
+    /// 动态冒号区域：`A1:INDEX(A1:A10,5)` / `INDEX(...):C5`
+    DynRange(Box<Node>, Box<Node>),
+    /// 空格交集运算符：`A1:C5 B2:D6`
+    Intersect(Box<Node>, Box<Node>),
+    /// 逗号联合运算符：`(A1:A3, C1:C3)`
+    Union(Vec<Node>),
     Func(FuncName, Vec<Node>),
     Unary(bool, Box<Node>), // true = 负号
     Percent(Box<Node>),
@@ -101,7 +107,10 @@ fn contains_subtotal(wb: &Workbook, sheet: usize, src: &str, row: u32, col: u32)
         match n {
             Node::Func(name, args) => name.id() == FuncId::Subtotal || args.iter().any(has_call),
             Node::Unary(_, n) | Node::Implicit(n) | Node::Percent(n) => has_call(n),
-            Node::Binary(_, left, right) => has_call(left) || has_call(right),
+            Node::Binary(_, left, right)
+            | Node::DynRange(left, right)
+            | Node::Intersect(left, right) => has_call(left) || has_call(right),
+            Node::Union(items) => items.iter().any(has_call),
             _ => false,
         }
     }
@@ -319,11 +328,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, ErrKind> {
                 while i < bytes.len() {
                     let b = bytes[i];
                     if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'!' | b'_' | b'?') {
-                        // Note: keep exact boundary as before — '?' is NOT consumed when part of #NAME? Wait: check old line 296!
-                        if b == b'?' {
+                        i += 1;
+                        if matches!(b, b'!' | b'?') {
                             break;
                         }
-                        i += 1;
                     } else if b >= 0x80 {
                         let ch = src[i..].chars().next().unwrap();
                         if ch.is_alphanumeric() {
@@ -335,8 +343,6 @@ fn lex(src: &str) -> Result<Vec<Tok>, ErrKind> {
                         break;
                     }
                 }
-                // Check old line 296 vs #NAME?: wait — in old line 296 `?` was NOT in `is_alphanumeric() || '/' || '!' || '_'`, wait: how did #NAME? lex before?!
-                // Let's check: if bytes.get(i) == Some(&b'?') and &src[start..i] eq_ignore_ascii_case("#NAME"), consume `?`? Wait: old line 296 did NOT have `?`! Keep 100% identical to old line 296!
                 let lit = &src[start..i];
                 if lit == "#" {
                     out.push(Tok::Hash);
@@ -350,6 +356,9 @@ fn lex(src: &str) -> Result<Vec<Tok>, ErrKind> {
                     "#NAME?" => ErrKind::Name,
                     "#NUM!" => ErrKind::Num,
                     "#N/A" => ErrKind::Na,
+                    "#SPILL!" => ErrKind::Spill,
+                    "#CALC!" => ErrKind::Calc,
+                    "#FIELD!" => ErrKind::Field,
                     _ => return Err(ErrKind::Name),
                 };
                 out.push(Tok::Ident(format!("\u{0}ERR{}=", e as u8)));
@@ -428,22 +437,23 @@ impl Parser {
         self.pos += 1;
         t
     }
-    /// 空格在 Excel 里是交集运算符：A1:A2 B1:B2。
-    /// 我们的求值器不做区域相交，直接按 Excel 的"无重叠"结果返回 #NULL!。
-    fn eats_intersection(&mut self) -> bool {
-        if let Some(Tok::Ident(name)) = self.peek() {
-            if parse_a1(name).is_some() {
-                self.pos += 1;
-                if self.peek() == Some(&Tok::Colon) {
-                    self.pos += 1;
-                    if matches!(self.peek(), Some(Tok::Ident(_))) {
-                        self.pos += 1;
-                    }
+    /// 判断下一个 token 是否开始空格交集运算符右侧引用（如 `A1:C5 B2:D6`、`Sheet1!A1:C5 Sheet1!B2:D6`、`Sales Q1`）
+    fn starts_intersection_rhs(&self) -> bool {
+        match self.peek() {
+            Some(Tok::Ident(name)) => {
+                if decode_err_ident(name).is_some()
+                    || name.eq_ignore_ascii_case("TRUE")
+                    || name.eq_ignore_ascii_case("FALSE")
+                {
+                    return false;
                 }
-                return true;
+                parse_a1(name).is_some()
+                    || matches!(self.toks.get(self.pos + 1), Some(Tok::Bang | Tok::Colon))
+                    || !matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
             }
+            Some(Tok::Book(_)) => true,
+            _ => false,
         }
-        false
     }
 
     fn eat(&mut self, t: &Tok) -> bool {
@@ -557,6 +567,31 @@ impl Parser {
                 node = Node::Func(FuncName::from_id(FuncId::InternalCall), call);
             }
         }
+        // 动态冒号运算符：`INDEX(A1:A10,2):C5` / `OFFSET(A1,1,0):B5` / `A1:INDEX(...)`
+        while self.eat(&Tok::Colon) {
+            let rhs = self.parse_primary()?;
+            node = Node::DynRange(Box::new(node), Box::new(rhs));
+        }
+        // 空格交集运算符：`A1:C5 B2:D6` / `RowName ColName`
+        if matches!(
+            node,
+            Node::Ref(_)
+                | Node::Range(..)
+                | Node::DynRange(..)
+                | Node::Name(_)
+                | Node::ScopedName { .. }
+                | Node::Func(..)
+                | Node::Union(_)
+        ) {
+            while self.starts_intersection_rhs() {
+                let mut rhs = self.parse_primary()?;
+                while self.eat(&Tok::Colon) {
+                    let tail = self.parse_primary()?;
+                    rhs = Node::DynRange(Box::new(rhs), Box::new(tail));
+                }
+                node = Node::Intersect(Box::new(node), Box::new(rhs));
+            }
+        }
         while matches!(self.peek(), Some(Tok::Percent)) {
             self.pos += 1;
             node = Node::Percent(Box::new(node));
@@ -570,6 +605,20 @@ impl Parser {
             Some(Tok::Str(s)) => Ok(Node::Text(s.into())),
             Some(Tok::LParen) => {
                 let e = self.parse_expr()?;
+                if self.eat(&Tok::Comma) {
+                    // 逗号联合运算符：`(A1:A3, C1:C3)`
+                    let mut items = vec![e];
+                    loop {
+                        items.push(self.parse_expr()?);
+                        if self.eat(&Tok::RParen) {
+                            break;
+                        }
+                        if !self.eat(&Tok::Comma) {
+                            return Err(ErrKind::Value);
+                        }
+                    }
+                    return Ok(Node::Union(items));
+                }
                 if !self.eat(&Tok::RParen) {
                     return Err(ErrKind::Value);
                 }
@@ -587,23 +636,10 @@ impl Parser {
                         },
                         Some(Tok::Ident(id)) if id.eq_ignore_ascii_case("TRUE") => FValue::Bool(true),
                         Some(Tok::Ident(id)) if id.eq_ignore_ascii_case("FALSE") => FValue::Bool(false),
-                        // 数组常量里的错误字面量：`{1;#N/A}`。字面量在词法阶段被编成
-                        // "\0ERRn="，这里必须认，否则整个常量直接 #VALUE!。
+                        // 数组常量里的错误字面量：`{1;#N/A}` / `{#CALC!;#SPILL!}`
                         Some(Tok::Ident(id)) if id.starts_with('\u{0}') => {
-                            let code = id
-                                .trim_start_matches('\u{0}')
-                                .strip_prefix("ERR")
-                                .and_then(|c| c.trim_end_matches('=').parse::<u8>().ok())
-                                .ok_or(ErrKind::Name)?;
-                            FValue::Error(match code {
-                                0 => ErrKind::Null,
-                                1 => ErrKind::Div0,
-                                2 => ErrKind::Value,
-                                3 => ErrKind::Ref,
-                                4 => ErrKind::Name,
-                                5 => ErrKind::Num,
-                                _ => ErrKind::Na,
-                            })
+                            let e = decode_err_ident(&id).ok_or(ErrKind::Name)?;
+                            FValue::Error(e)
                         }
                         _ => return Err(ErrKind::Value),
                     };
@@ -764,9 +800,6 @@ impl Parser {
         if self.eat(&Tok::Hash) {
             return Ok(Node::Spill(start));
         }
-        if start.sheet2.is_none() && self.eats_intersection() {
-            return Ok(Node::Err(ErrKind::Null));
-        }
         Ok(Node::Ref(start))
     }
 
@@ -803,6 +836,19 @@ impl Parser {
             None => return Ok(Node::Name(name.to_ascii_uppercase())),
         };
         if self.eat(&Tok::Colon) {
+            // 动态冒号：`A1:INDEX(A1:A10,5)` / `A1:OFFSET(...)` / `A1:INDIRECT(...)`
+            let is_dyn_rhs = match self.peek() {
+                Some(Tok::Ident(id)) => {
+                    matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+                        || (decode_err_ident(id).is_none() && parse_a1(id).is_none())
+                }
+                Some(Tok::LParen) => true,
+                _ => false,
+            };
+            if is_dyn_rhs {
+                let rhs = self.parse_primary()?;
+                return Ok(Node::DynRange(Box::new(Node::Ref(start)), Box::new(rhs)));
+            }
             let Some(Tok::Ident(cell2)) = self.next() else {
                 return Err(ErrKind::Ref);
             };
@@ -810,16 +856,10 @@ impl Parser {
                 return Ok(Node::Err(e));
             }
             let end = parse_a1(&cell2).ok_or(ErrKind::Ref)?;
-            if self.eats_intersection() {
-                return Ok(Node::Err(ErrKind::Null));
-            }
             return Ok(Node::Range(start, end));
         }
         if self.eat(&Tok::Hash) {
             return Ok(Node::Spill(start));
-        }
-        if self.eats_intersection() {
-            return Ok(Node::Err(ErrKind::Null));
         }
         Ok(Node::Ref(start))
     }
@@ -834,6 +874,11 @@ fn decode_err_ident(name: &str) -> Option<ErrKind> {
         3 => ErrKind::Ref,
         4 => ErrKind::Name,
         5 => ErrKind::Num,
+        6 => ErrKind::Na,
+        7 => ErrKind::Circular,
+        8 => ErrKind::Spill,
+        9 => ErrKind::Calc,
+        10 => ErrKind::Field,
         _ => ErrKind::Na,
     })
 }
@@ -3093,6 +3138,62 @@ impl<'a> Calc<'a> {
                     }
                 }
             }
+            Node::DynRange(a, b) => {
+                let (idx, r1, c1, r2, c2) = match self.resolve_node_rect(node, si) {
+                    Ok(v) => v,
+                    Err(e) => return FValue::Error(e),
+                };
+                if let Some(dw) = self.deps_watch {
+                    dw.record_dynamic_watch((self.cur_sheet, self.cur.0, self.cur.1), idx, r1, c1, r2, c2);
+                }
+                let _ = (a, b);
+                match self.range_values_coords(idx, r1, c1, r2, c2) {
+                    Ok(Arg::Range { values, rows, cols }) => {
+                        if rows == 1 && cols == 1 {
+                            values.first().cloned().unwrap_or(FValue::Empty)
+                        } else {
+                            FValue::Array(std::sync::Arc::new(value::Array::from_shared(rows, cols, values)))
+                        }
+                    }
+                    Ok(Arg::Val(v)) => v,
+                    Err(e) => FValue::Error(e),
+                }
+            }
+            Node::Intersect(a, b) => {
+                let (idx, r1, c1, r2, c2) = match self.resolve_node_rect(node, si) {
+                    Ok(v) => v,
+                    Err(e) => return FValue::Error(e),
+                };
+                if let Some(dw) = self.deps_watch {
+                    dw.record_dynamic_watch((self.cur_sheet, self.cur.0, self.cur.1), idx, r1, c1, r2, c2);
+                }
+                let _ = (a, b);
+                match self.range_values_coords(idx, r1, c1, r2, c2) {
+                    Ok(Arg::Range { values, rows, cols }) => {
+                        if rows == 1 && cols == 1 {
+                            values.first().cloned().unwrap_or(FValue::Empty)
+                        } else {
+                            FValue::Array(std::sync::Arc::new(value::Array::from_shared(rows, cols, values)))
+                        }
+                    }
+                    Ok(Arg::Val(v)) => v,
+                    Err(e) => FValue::Error(e),
+                }
+            }
+            Node::Union(items) => {
+                let mut vals = Vec::new();
+                for item in items {
+                    let b = self.operand_block(item, si);
+                    vals.extend_from_slice(b.slice());
+                }
+                if vals.is_empty() {
+                    FValue::Error(ErrKind::Value)
+                } else if vals.len() == 1 {
+                    vals.into_iter().next().unwrap()
+                } else {
+                    FValue::Array(std::sync::Arc::new(value::Array::new(vals.len(), 1, vals)))
+                }
+            }
             Node::Unary(neg, e) => {
                 self.eval_numeric_unary(e, si, |n| if *neg { -n } else { n })
             }
@@ -3410,48 +3511,84 @@ impl<'a> Calc<'a> {
                     _ => FValue::Error(ErrKind::Value),
                 }
             }
-            // ============ LAMBDA 家族
+            // ============ LAMBDA 家族（支持内联 LAMBDA、LET 绑定及命名公式 LAMBDA；保留完整二维形状）
             FuncId::Map | FuncId::Reduce | FuncId::Scan | FuncId::ByRow | FuncId::ByCol | FuncId::MakeArray
                 if nodes.len() >= 2 =>
             {
                 let lam = nodes.last().unwrap();
+                let lam_val = match self.eval_node(lam, si) {
+                    FValue::Lambda(l) => Some(l),
+                    _ => None,
+                };
                 match id {
                     FuncId::Map => {
-                        let input = self.operand_block(&nodes[0], si);
-                        let vals = input.slice();
-                        let lam_val = match self.eval_node(lam, si) {
-                            FValue::Lambda(l) => Some(l),
-                            _ => None,
-                        };
-                        let out: Vec<FValue> = vals
+                        let input_nodes = &nodes[..nodes.len() - 1];
+                        let blocks: Vec<Arg> = input_nodes
                             .iter()
-                            .map(|v| match &lam_val {
-                                Some(l) => self.apply_lambda_val(l, vec![v.clone()], si),
-                                None => self.apply_lambda(lam, vec![v.clone()], si),
-                            })
+                            .map(|n| self.operand_block(n, si))
                             .collect();
-                        FValue::Array(std::sync::Arc::new(value::Array::new(1, out.len(), out)))
+                        let dims: Vec<(usize, usize)> =
+                            blocks.iter().map(functions::range_dims).collect();
+                        let mut shape = (1usize, 1usize);
+                        for &d in &dims {
+                            let Some(next) = broadcast_dims(shape, d) else {
+                                return FValue::Error(ErrKind::Value);
+                            };
+                            shape = next;
+                        }
+                        let (rows, cols) = shape;
+                        if rows == 0 || cols == 0 || rows.saturating_mul(cols) > 1_000_000 {
+                            return FValue::Error(ErrKind::Value);
+                        }
+                        let mut out = Vec::with_capacity(rows * cols);
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                let mut call_vals = Vec::with_capacity(blocks.len());
+                                for (blk, &(br, bc)) in blocks.iter().zip(&dims) {
+                                    let idx = (if br == 1 { 0 } else { r }) * bc
+                                        + (if bc == 1 { 0 } else { c });
+                                    call_vals.push(blk.slice().get(idx).cloned().unwrap_or(FValue::Empty));
+                                }
+                                let v = match &lam_val {
+                                    Some(l) => self.apply_lambda_val(l, call_vals, si),
+                                    None => self.apply_lambda(lam, call_vals, si),
+                                };
+                                out.push(v);
+                            }
+                        }
+                        FValue::Array(std::sync::Arc::new(value::Array::new(rows, cols, out)))
                     }
                     FuncId::Reduce => {
                         let mut acc = self.eval_node(&nodes[0], si);
                         let input = self.operand_block(&nodes[1], si);
                         let vals = input.slice();
                         for v in vals {
-                            acc = self.apply_lambda(lam, vec![acc, v.clone()], si);
+                            acc = match &lam_val {
+                                Some(l) => self.apply_lambda_val(l, vec![acc, v.clone()], si),
+                                None => self.apply_lambda(lam, vec![acc, v.clone()], si),
+                            };
                         }
                         acc
                     }
                     FuncId::Scan => {
                         let init = self.eval_node(&nodes[0], si);
                         let input = self.operand_block(&nodes[1], si);
+                        let (rows, cols) = functions::range_dims(&input);
                         let vals = input.slice();
                         let mut acc = init;
                         let mut out = Vec::with_capacity(vals.len());
                         for v in vals {
-                            acc = self.apply_lambda(lam, vec![acc, v.clone()], si);
+                            acc = match &lam_val {
+                                Some(l) => self.apply_lambda_val(l, vec![acc, v.clone()], si),
+                                None => self.apply_lambda(lam, vec![acc, v.clone()], si),
+                            };
                             out.push(acc.clone());
                         }
-                        FValue::Array(std::sync::Arc::new(value::Array::new(1, out.len(), out)))
+                        FValue::Array(std::sync::Arc::new(value::Array::new(
+                            rows.max(1),
+                            cols.max(1),
+                            out,
+                        )))
                     }
                     FuncId::MakeArray => {
                         let rows = self.eval_node(&nodes[0], si).to_number().unwrap_or(0.0) as usize;
@@ -3462,11 +3599,14 @@ impl<'a> Calc<'a> {
                         let mut data = Vec::with_capacity(rows * cols);
                         for r in 0..rows {
                             for c in 0..cols {
-                                data.push(self.apply_lambda(
-                                    lam,
-                                    vec![FValue::number((r + 1) as f64), FValue::number((c + 1) as f64)],
-                                    si,
-                                ));
+                                let cv = vec![
+                                    FValue::number((r + 1) as f64),
+                                    FValue::number((c + 1) as f64),
+                                ];
+                                data.push(match &lam_val {
+                                    Some(l) => self.apply_lambda_val(l, cv, si),
+                                    None => self.apply_lambda(lam, cv, si),
+                                });
                             }
                         }
                         FValue::Array(std::sync::Arc::new(value::Array::new(rows, cols, data)))
@@ -3485,7 +3625,10 @@ impl<'a> Calc<'a> {
                         for r in 0..rows {
                             let row: Vec<FValue> = (0..cols).map(|c| data[r * cols + c].clone()).collect();
                             let arg = FValue::Array(std::sync::Arc::new(value::Array::new(1, cols, row)));
-                            out.push(self.apply_lambda(lam, vec![arg], si));
+                            out.push(match &lam_val {
+                                Some(l) => self.apply_lambda_val(l, vec![arg], si),
+                                None => self.apply_lambda(lam, vec![arg], si),
+                            });
                         }
                         FValue::Array(std::sync::Arc::new(value::Array::new(rows.max(1), 1, out)))
                     }
@@ -3503,7 +3646,10 @@ impl<'a> Calc<'a> {
                         for c in 0..cols {
                             let col: Vec<FValue> = (0..rows).map(|r| data[r * cols + c].clone()).collect();
                             let arg = FValue::Array(std::sync::Arc::new(value::Array::new(rows, 1, col)));
-                            out.push(self.apply_lambda(lam, vec![arg], si));
+                            out.push(match &lam_val {
+                                Some(l) => self.apply_lambda_val(l, vec![arg], si),
+                                None => self.apply_lambda(lam, vec![arg], si),
+                            });
                         }
                         FValue::Array(std::sync::Arc::new(value::Array::new(1, cols.max(1), out)))
                     }
@@ -3612,7 +3758,11 @@ impl<'a> Calc<'a> {
                 }
             }
             FuncId::Areas => match nodes.first() {
-                Some(Node::Range(..)) | Some(Node::Ref(_)) => FValue::number(1.0),
+                Some(Node::Union(items)) => FValue::number(items.len() as f64),
+                Some(Node::Range(..))
+                | Some(Node::Ref(_))
+                | Some(Node::DynRange(..))
+                | Some(Node::Intersect(..)) => FValue::number(1.0),
                 _ => FValue::Error(ErrKind::Value),
             },
             FuncId::Info => {
@@ -3644,108 +3794,91 @@ impl<'a> Calc<'a> {
             }
             FuncId::Indirect => {
                 let txt = match nodes.first() {
-                    Some(n) => self.eval_node(n, si).to_text().unwrap_or_default(),
-                    None => String::new(),
+                    Some(n) => match self.eval_node(n, si).to_text() {
+                        Ok(s) => s,
+                        Err(e) => return FValue::Error(e),
+                    },
+                    None => return FValue::Error(ErrKind::Ref),
                 };
-                let (sheet, rest) = match txt.split_once('!') {
-                    Some((sh, r)) => (Some(sh.trim_start_matches('\'').trim_end_matches('\'')), r),
-                    None => (None, txt.as_str()),
+                let a1_style = match nodes.get(1) {
+                    Some(n) if !matches!(n, Node::Empty) => match self.eval_node(n, si).to_bool() {
+                        Ok(b) => b,
+                        Err(e) => return FValue::Error(e),
+                    },
+                    _ => true,
                 };
-                if let Some((a, b)) = rest.split_once(':') {
-                    match (parse_a1(a.trim()), parse_a1(b.trim())) {
-                        (Some(ra), Some(rb)) => {
-                            let idx = match self.sheet_index(sheet, si) {
-                                Ok(i) => i,
-                                Err(e) => return FValue::Error(e),
-                            };
-                            if let Some(dw) = self.deps_watch {
-                                dw.record_dynamic_watch(
-                                    (self.cur_sheet, self.cur.0, self.cur.1),
-                                    idx,
-                                    ra.row,
-                                    ra.col,
-                                    rb.row,
-                                    rb.col,
-                                );
-                            }
-                            match self.range_values_coords(idx, ra.row, ra.col, rb.row, rb.col) {
+                let explicit_range = txt.contains(':');
+                match self.resolve_indirect_rect(&txt, a1_style, si) {
+                    Ok((idx, r1, c1, r2, c2)) => {
+                        if let Some(dw) = self.deps_watch {
+                            dw.record_dynamic_watch((self.cur_sheet, self.cur.0, self.cur.1), idx, r1, c1, r2, c2);
+                        }
+                        if r1 == r2 && c1 == c2 && !explicit_range {
+                            self.cell_value(idx, r1 as u32, c1 as u32).scalar()
+                        } else {
+                            match self.range_values_coords(idx, r1, c1, r2, c2) {
                                 Ok(Arg::Range { values, rows, cols }) => FValue::Array(
                                     std::sync::Arc::new(value::Array::from_shared(rows, cols, values)),
                                 ),
-                                Ok(_) => FValue::Error(ErrKind::Value),
+                                Ok(Arg::Val(v)) => v,
                                 Err(e) => FValue::Error(e),
                             }
                         }
-                        _ => FValue::Error(ErrKind::Ref),
                     }
-                } else {
-                    match parse_a1(rest.trim()) {
-                        Some(re) => match self.sheet_index(sheet, si) {
-                            Ok(idx) if re.row >= 0 && re.col >= 0 => {
-                                if let Some(dw) = self.deps_watch {
-                                    dw.record_dynamic_watch(
-                                        (self.cur_sheet, self.cur.0, self.cur.1),
-                                        idx,
-                                        re.row,
-                                        re.col,
-                                        re.row,
-                                        re.col,
-                                    );
-                                }
-                                self.cell_value(idx, re.row as u32, re.col as u32).scalar()
-                            }
-                            _ => FValue::Error(ErrKind::Ref),
-                        },
-                        None => FValue::Error(ErrKind::Ref),
-                    }
+                    Err(e) => FValue::Error(e),
                 }
             }
             FuncId::Offset if nodes.len() >= 3 => {
-                let (base_sheet, base_r, base_c, base_h, base_w) = match nodes.first() {
-                    Some(Node::Ref(re)) => (re.sheet.as_deref(), self.r_row(re), self.r_col(re), 1i64, 1i64),
-                    Some(Node::Range(a, b)) => {
-                        let (ar, ac) = (self.r_row(a), self.r_col(a));
-                        let (br, bc) = (self.r_row(b), self.r_col(b));
-                        (a.sheet.as_deref(), ar, ac, (br - ar).abs() + 1, (bc - ac).abs() + 1)
-                    }
-                    _ => return FValue::Error(ErrKind::Ref),
+                let (idx, base_r, base_c, base_h, base_w) = match self.resolve_node_rect(&nodes[0], si) {
+                    Ok((sidx, r1, c1, r2, c2)) => (sidx, r1, c1, r2 - r1 + 1, c2 - c1 + 1),
+                    Err(e) => return FValue::Error(e),
                 };
-                let dr = self.eval_node(&nodes[1], si).to_number().unwrap_or(0.0) as i64;
-                let dc = self.eval_node(&nodes[2], si).to_number().unwrap_or(0.0) as i64;
-                let h = if nodes.len() > 3 {
-                    self.eval_node(&nodes[3], si).to_number().unwrap_or(1.0) as i64
-                } else {
-                    base_h
+                let dr = match self.eval_node(&nodes[1], si).to_number() {
+                    Ok(v) => v.trunc() as i64,
+                    Err(e) => return FValue::Error(e),
                 };
-                let w = if nodes.len() > 4 {
-                    self.eval_node(&nodes[4], si).to_number().unwrap_or(1.0) as i64
-                } else {
-                    base_w
+                let dc = match self.eval_node(&nodes[2], si).to_number() {
+                    Ok(v) => v.trunc() as i64,
+                    Err(e) => return FValue::Error(e),
+                };
+                let has_hw = nodes.get(3).is_some_and(|n| !matches!(n, Node::Empty))
+                    || nodes.get(4).is_some_and(|n| !matches!(n, Node::Empty));
+                let h = match nodes.get(3) {
+                    Some(n) if !matches!(n, Node::Empty) => match self.eval_node(n, si).to_number() {
+                        Ok(v) => v.trunc() as i64,
+                        Err(e) => return FValue::Error(e),
+                    },
+                    _ => base_h,
+                };
+                let w = match nodes.get(4) {
+                    Some(n) if !matches!(n, Node::Empty) => match self.eval_node(n, si).to_number() {
+                        Ok(v) => v.trunc() as i64,
+                        Err(e) => return FValue::Error(e),
+                    },
+                    _ => base_w,
                 };
                 let r0 = base_r + dr;
                 let c0 = base_c + dc;
-                if r0 < 0 || c0 < 0 || h <= 0 || w <= 0 {
+                if r0 < 0 || c0 < 0 || h == 0 || w == 0 {
                     return FValue::Error(ErrKind::Ref);
                 }
-                let idx = match self.sheet_index(base_sheet, si) {
-                    Ok(i) => i,
-                    Err(e) => return FValue::Error(e),
-                };
-                if let Some(dw) = self.deps_watch {
-                    dw.record_dynamic_watch(
-                        (self.cur_sheet, self.cur.0, self.cur.1),
-                        idx,
-                        r0,
-                        c0,
-                        r0 + h - 1,
-                        c0 + w - 1,
-                    );
+                let (r1, r2) = if h > 0 { (r0, r0 + h - 1) } else { (r0 + h + 1, r0) };
+                let (c1, c2) = if w > 0 { (c0, c0 + w - 1) } else { (c0 + w + 1, c0) };
+                if r1 < 0 || c1 < 0 || r2 > 1_048_575 || c2 > 16_383 {
+                    return FValue::Error(ErrKind::Ref);
                 }
-                match self.range_values_coords(idx, r0, c0, r0 + h - 1, c0 + w - 1) {
-                    Ok(Arg::Range { values, rows, cols }) => FValue::Array(
-                        std::sync::Arc::new(value::Array::from_shared(rows, cols, values)),
-                    ),
-                    _ => FValue::Error(ErrKind::Ref),
+                if let Some(dw) = self.deps_watch {
+                    dw.record_dynamic_watch((self.cur_sheet, self.cur.0, self.cur.1), idx, r1, c1, r2, c2);
+                }
+                if r1 == r2 && c1 == c2 && !has_hw && base_h == 1 && base_w == 1 {
+                    self.cell_value(idx, r1 as u32, c1 as u32).scalar()
+                } else {
+                    match self.range_values_coords(idx, r1, c1, r2, c2) {
+                        Ok(Arg::Range { values, rows, cols }) => FValue::Array(
+                            std::sync::Arc::new(value::Array::from_shared(rows, cols, values)),
+                        ),
+                        _ => FValue::Error(ErrKind::Ref),
+                    }
                 }
             }
             FuncId::Address if nodes.len() >= 2 => {
@@ -3795,14 +3928,32 @@ impl<'a> Calc<'a> {
                 }
                 FValue::Error(ErrKind::Na)
             }
-            // ============ INDEX O(1) / 单行单列快速路径：零整表物化
+            // ============ INDEX O(1) / 单行单列 / 多区联合 area_num 快速路径
             FuncId::Index
-                if (2..=3).contains(&nodes.len())
+                if (2..=4).contains(&nodes.len())
                     && (self.env_stack.is_empty()
                         || !self.env_stack.iter().rev().any(|m| m.contains_key("INDEX"))) =>
             {
+                if nodes.len() == 4
+                    && let Node::Union(areas) = &nodes[0]
+                {
+                    let area_num = match self.eval_node(&nodes[3], si).to_number() {
+                        Ok(n) if n >= 1.0 => n.trunc() as usize,
+                        Ok(_) => return FValue::Error(ErrKind::Ref),
+                        Err(e) => return FValue::Error(e),
+                    };
+                    if let Some(chosen) = areas.get(area_num - 1) {
+                        if let Some(rr) = self.resolve_range_node(chosen, si) {
+                            return self.eval_index_fast(&rr, &nodes[..3], si);
+                        }
+                        let mut sub_nodes = vec![chosen.clone()];
+                        sub_nodes.extend_from_slice(&nodes[1..3]);
+                        return self.call_generic_id(id, name.as_str(), &sub_nodes, si);
+                    }
+                    return FValue::Error(ErrKind::Ref);
+                }
                 if let Some(rr) = self.resolve_range_node(&nodes[0], si) {
-                    return self.eval_index_fast(&rr, nodes, si);
+                    return self.eval_index_fast(&rr, &nodes[..nodes.len().min(3)], si);
                 }
                 self.call_generic_id(id, name.as_str(), nodes, si)
             }
@@ -4095,6 +4246,27 @@ impl<'a> Calc<'a> {
                 return fast;
             }
         }
+        if bound.is_none()
+            && nodes.len() == 3
+            && matches!(
+                name.as_str(),
+                "DSUM"
+                    | "DAVERAGE"
+                    | "DCOUNT"
+                    | "DCOUNTA"
+                    | "DGET"
+                    | "DMAX"
+                    | "DMIN"
+                    | "DPRODUCT"
+                    | "DSTDEV"
+                    | "DSTDEVP"
+                    | "DVAR"
+                    | "DVARP"
+            )
+            && let Some(db_res) = self.try_eval_db_with_formula_criteria(name.as_str(), nodes, si)
+        {
+            return db_res;
+        }
         let args = self.function_args(id, nodes, si);
         if self.requested.is_some() { return FValue::Error(ErrKind::Ref); }
         let t0 = profile_enabled().then(std::time::Instant::now);
@@ -4116,7 +4288,7 @@ impl<'a> Calc<'a> {
                 self.volatile_values.insert(key, value.clone());
                 value
             }
-        } else if supports_scalar_array_lift(id)
+        } else if (supports_scalar_array_lift(id) || supports_extra_scalar_array_lift(name.as_str()))
             && args.iter().any(|a| {
                 let (r, c) = functions::range_dims(a);
                 r > 1 || c > 1
@@ -6822,6 +6994,23 @@ impl<'a> Calc<'a> {
                 Node::Ref(a) if visibility.is_some() => Some((a, a)),
                 _ => None,
             };
+            if let Node::Union(parts) = n
+                && id != FuncId::Areas
+                && id != FuncId::Index
+            {
+                for part in parts {
+                    match part {
+                        Node::Range(a, b) if a.sheet2.is_none() && b.sheet2.is_none() => {
+                            match self.range_values(a, b, si) {
+                                Ok(arg) => args.push(arg),
+                                Err(e) => args.push(Arg::Val(FValue::Error(e))),
+                            }
+                        }
+                        _ => args.push(Arg::Val(self.eval_node(part, si))),
+                    }
+                }
+                continue;
+            }
             if let Some((a, b)) = refs.filter(|(a, b)| a.sheet2.is_none() && b.sheet2.is_none()) {
                 match self.range_values(a, b, si) {
                     Ok(mut arg) => {
@@ -7028,6 +7217,568 @@ impl<'a> Calc<'a> {
         }
         FValue::Array(std::sync::Arc::new(value::Array::new(rows, cols, out)))
     }
+
+    /// 把任意产生引用的表达式节点解析成 `(sheet_idx, r1, c1, r2, c2)`（支持 `Ref`/`Range`/`Spill`/`Name`/`DynRange`/`Intersect`/`INDEX`/`OFFSET`/`INDIRECT`/`CHOOSE`）
+    fn resolve_node_rect(
+        &mut self,
+        node: &Node,
+        si: usize,
+    ) -> Result<(usize, i64, i64, i64, i64), ErrKind> {
+        match node {
+            Node::Ref(re) if re.book.is_none() && re.sheet2.is_none() => {
+                let idx = self.sheet_index(re.sheet.as_deref(), si)?;
+                let r = self.r_row(re);
+                let c = self.r_col(re);
+                if r < 0 || c < 0 {
+                    return Err(ErrKind::Ref);
+                }
+                Ok((idx, r, c, r, c))
+            }
+            Node::Range(a, b)
+                if a.book.is_none() && b.book.is_none() && a.sheet2.is_none() && b.sheet2.is_none() =>
+            {
+                let idx = self.sheet_index(a.sheet.as_deref().or(b.sheet.as_deref()), si)?;
+                let (ar, ac) = (self.r_row(a), self.r_col(a));
+                let (br, bc) = (self.r_row(b), self.r_col(b));
+                if ar < 0 || ac < 0 || br < 0 || bc < 0 {
+                    return Err(ErrKind::Ref);
+                }
+                Ok((idx, ar.min(br), ac.min(bc), ar.max(br), ac.max(bc)))
+            }
+            Node::Spill(re) if re.book.is_none() && re.sheet2.is_none() => {
+                let idx = self.sheet_index(re.sheet.as_deref(), si)?;
+                let r = self.r_row(re);
+                let c = self.r_col(re);
+                if r < 0 || c < 0 {
+                    return Err(ErrKind::Ref);
+                }
+                let anchor = crate::CellRef::new(r as u32, c as u32);
+                if let Some(&(rows, cols)) = self.wb.sheets[idx].spill_shapes.get(&anchor)
+                    && rows > 0
+                    && cols > 0
+                {
+                    Ok((idx, r, c, r + rows as i64 - 1, c + cols as i64 - 1))
+                } else {
+                    Ok((idx, r, c, r, c))
+                }
+            }
+            Node::Name(n) if !self.env_stack.iter().rev().any(|e| e.contains_key(n)) => {
+                let Some(idx) = self.defined_name_index(n, si, false) else {
+                    return Err(ErrKind::Name);
+                };
+                let src = self.wb.names[idx].2.trim_start_matches('=').to_string();
+                let parsed = compile_at(&src, self.cur.0, self.cur.1)?;
+                let prev_off = self.ref_offset;
+                self.ref_offset = (0, 0);
+                let res = self.resolve_node_rect(&parsed, si);
+                self.ref_offset = prev_off;
+                res
+            }
+            Node::ScopedName {
+                book: None,
+                sheet: Some(sh),
+                name,
+            } => {
+                let target = self.sheet_index(Some(sh), si)?;
+                let Some(idx) = self.defined_name_index(name, target, true) else {
+                    return Err(ErrKind::Name);
+                };
+                let src = self.wb.names[idx].2.trim_start_matches('=').to_string();
+                let parsed = compile_at(&src, self.cur.0, self.cur.1)?;
+                let prev_off = self.ref_offset;
+                self.ref_offset = (0, 0);
+                let res = self.resolve_node_rect(&parsed, target);
+                self.ref_offset = prev_off;
+                res
+            }
+            Node::DynRange(a, b) => {
+                let (s1, r1a, c1a, r2a, c2a) = self.resolve_node_rect(a, si)?;
+                let (s2, r1b, c1b, r2b, c2b) = self.resolve_node_rect(b, si)?;
+                if s1 != s2 {
+                    return Err(ErrKind::Ref);
+                }
+                Ok((s1, r1a.min(r1b), c1a.min(c1b), r2a.max(r2b), c2a.max(c2b)))
+            }
+            Node::Intersect(a, b) => {
+                let (s1, r1a, c1a, r2a, c2a) = self.resolve_node_rect(a, si)?;
+                let (s2, r1b, c1b, r2b, c2b) = self.resolve_node_rect(b, si)?;
+                if s1 != s2 {
+                    return Err(ErrKind::Null);
+                }
+                let r1 = r1a.max(r1b);
+                let c1 = c1a.max(c1b);
+                let r2 = r2a.min(r2b);
+                let c2 = c2a.min(c2b);
+                if r1 > r2 || c1 > c2 {
+                    return Err(ErrKind::Null);
+                }
+                Ok((s1, r1, c1, r2, c2))
+            }
+            Node::Func(fname, fargs) => match fname.id() {
+                FuncId::Index if fargs.len() >= 2 => {
+                    let base_node = if fargs.len() >= 4
+                        && let Node::Union(areas) = &fargs[0]
+                    {
+                        let k = self.eval_node(&fargs[3], si).to_number()?.trunc() as usize;
+                        areas.get(k.checked_sub(1).ok_or(ErrKind::Ref)?).ok_or(ErrKind::Ref)?
+                    } else {
+                        &fargs[0]
+                    };
+                    let (idx, br1, bc1, br2, bc2) = self.resolve_node_rect(base_node, si)?;
+                    let nrows = br2 - br1 + 1;
+                    let ncols = bc2 - bc1 + 1;
+                    let row_i = self.eval_node(&fargs[1], si).to_number()?.trunc() as i64;
+                    if row_i < 0 {
+                        return Err(ErrKind::Value);
+                    }
+                    let has_col = fargs.len() >= 3 && !matches!(fargs[2], Node::Empty);
+                    let col_i = if has_col {
+                        let v = self.eval_node(&fargs[2], si).to_number()?.trunc() as i64;
+                        if v < 0 {
+                            return Err(ErrKind::Value);
+                        }
+                        v
+                    } else {
+                        0
+                    };
+                    if !has_col && nrows == 1 && ncols > 1 {
+                        if row_i == 0 {
+                            return Ok((idx, br1, bc1, br2, bc2));
+                        }
+                        if row_i > ncols {
+                            return Err(ErrKind::Ref);
+                        }
+                        return Ok((idx, br1, bc1 + row_i - 1, br1, bc1 + row_i - 1));
+                    }
+                    let (r1, r2) = if row_i == 0 {
+                        (br1, br2)
+                    } else if row_i > nrows {
+                        return Err(ErrKind::Ref);
+                    } else {
+                        (br1 + row_i - 1, br1 + row_i - 1)
+                    };
+                    let (c1, c2) = if !has_col && ncols == 1 {
+                        (bc1, bc1)
+                    } else if col_i == 0 {
+                        (bc1, bc2)
+                    } else if col_i > ncols {
+                        return Err(ErrKind::Ref);
+                    } else {
+                        (bc1 + col_i - 1, bc1 + col_i - 1)
+                    };
+                    Ok((idx, r1, c1, r2, c2))
+                }
+                FuncId::Offset if fargs.len() >= 3 => {
+                    let (idx, br1, bc1, br2, bc2) = self.resolve_node_rect(&fargs[0], si)?;
+                    let base_h = br2 - br1 + 1;
+                    let base_w = bc2 - bc1 + 1;
+                    let dr = self.eval_node(&fargs[1], si).to_number()?.trunc() as i64;
+                    let dc = self.eval_node(&fargs[2], si).to_number()?.trunc() as i64;
+                    let h = match fargs.get(3) {
+                        Some(n) if !matches!(n, Node::Empty) => self.eval_node(n, si).to_number()?.trunc() as i64,
+                        _ => base_h,
+                    };
+                    let w = match fargs.get(4) {
+                        Some(n) if !matches!(n, Node::Empty) => self.eval_node(n, si).to_number()?.trunc() as i64,
+                        _ => base_w,
+                    };
+                    if h == 0 || w == 0 {
+                        return Err(ErrKind::Ref);
+                    }
+                    let r0 = br1 + dr;
+                    let c0 = bc1 + dc;
+                    let (r1, r2) = if h > 0 { (r0, r0 + h - 1) } else { (r0 + h + 1, r0) };
+                    let (c1, c2) = if w > 0 { (c0, c0 + w - 1) } else { (c0 + w + 1, c0) };
+                    if r1 < 0 || c1 < 0 || r2 > 1_048_575 || c2 > 16_383 {
+                        return Err(ErrKind::Ref);
+                    }
+                    Ok((idx, r1, c1, r2, c2))
+                }
+                FuncId::Indirect if !fargs.is_empty() => {
+                    let txt = self.eval_node(&fargs[0], si).to_text()?;
+                    let a1_style = match fargs.get(1) {
+                        Some(n) if !matches!(n, Node::Empty) => self.eval_node(n, si).to_bool()?,
+                        _ => true,
+                    };
+                    self.resolve_indirect_rect(&txt, a1_style, si)
+                }
+                FuncId::Choose if fargs.len() >= 2 => {
+                    let k = self.eval_node(&fargs[0], si).to_number()?.trunc() as usize;
+                    let chosen = fargs.get(k).ok_or(ErrKind::Value)?;
+                    self.resolve_node_rect(chosen, si)
+                }
+                _ => Err(ErrKind::Ref),
+            },
+            _ => Err(ErrKind::Ref),
+        }
+    }
+
+    /// 解析 `INDIRECT(ref_text, [a1])`：支持 A1、R1C1、整列/整行、命名区域与结构化表格引用
+    fn resolve_indirect_rect(
+        &mut self,
+        txt: &str,
+        a1_style: bool,
+        si: usize,
+    ) -> Result<(usize, i64, i64, i64, i64), ErrKind> {
+        let trimmed = txt.trim();
+        if trimmed.is_empty() {
+            return Err(ErrKind::Ref);
+        }
+        // 1. 尝试结构化表格引用（如 `Sales[Amount]`、`销售表[金额]`）
+        if a1_style
+            && self.has_tables
+            && trimmed.contains('[')
+            && let Some(expanded) =
+                crate::table::expand_structured_at(self.wb, si, Some(self.cur.0), Some(self.cur.1), trimmed)
+            && expanded != trimmed
+        {
+            return self.resolve_indirect_rect(&expanded, true, si);
+        }
+        // 2. 尝试工作簿/工作表命名区域（仅当不含 `!` 与 `:` 或为 `Sheet!Name`）
+        if a1_style && !trimmed.contains(':') {
+            if let Some((sh, nm)) = trimmed.split_once('!') {
+                let sh_clean = sh.trim().trim_matches('\'').replace("''", "'");
+                if parse_a1(nm.trim()).is_none()
+                    && let Ok(target) = self.sheet_index(Some(&sh_clean), si)
+                    && let Some(nidx) = self.defined_name_index(nm.trim(), target, true)
+                {
+                    let body = self.wb.names[nidx].2.trim_start_matches('=').to_string();
+                    let parsed = compile_at(&body, self.cur.0, self.cur.1)?;
+                    let prev_off = self.ref_offset;
+                    self.ref_offset = (0, 0);
+                    let res = self.resolve_node_rect(&parsed, target);
+                    self.ref_offset = prev_off;
+                    return res;
+                }
+            } else if parse_a1(trimmed).is_none()
+                && let Some(nidx) = self.defined_name_index(trimmed, si, false)
+            {
+                let body = self.wb.names[nidx].2.trim_start_matches('=').to_string();
+                let parsed = compile_at(&body, self.cur.0, self.cur.1)?;
+                let prev_off = self.ref_offset;
+                self.ref_offset = (0, 0);
+                let res = self.resolve_node_rect(&parsed, si);
+                self.ref_offset = prev_off;
+                return res;
+            }
+        }
+        let (sheet, rest) = match trimmed.split_once('!') {
+            Some((sh, r)) => (Some(sh.trim().trim_matches('\'').replace("''", "'")), r.trim()),
+            None => (None, trimmed),
+        };
+        let idx = self.sheet_index(sheet.as_deref(), si)?;
+        if !a1_style {
+            // R1C1 语法：`R2C3`、`R[1]C[-1]`、`RC`、`R1C1:R3C4`、`R2:R5`、`C1:C3`
+            let cur_r = self.cur.0 as i64;
+            let cur_c = self.cur.1 as i64;
+            if let Some((a, b)) = rest.split_once(':') {
+                let (ra1, ca1, ra2, ca2) = parse_r1c1_atom(a.trim(), cur_r, cur_c)?;
+                let (rb1, cb1, rb2, cb2) = parse_r1c1_atom(b.trim(), cur_r, cur_c)?;
+                return Ok((
+                    idx,
+                    ra1.min(rb1),
+                    ca1.min(cb1),
+                    ra2.max(rb2),
+                    ca2.max(cb2),
+                ));
+            }
+            let (r1, c1, r2, c2) = parse_r1c1_atom(rest, cur_r, cur_c)?;
+            return Ok((idx, r1, c1, r2, c2));
+        }
+        // A1 语法：支持单格、区域、整列 (`A:C`)、整行 (`1:5`)
+        if let Some((a, b)) = rest.split_once(':') {
+            let a = a.trim();
+            let b = b.trim();
+            if let (Some(ra), Some(rb)) = (parse_a1(a), parse_a1(b)) {
+                return Ok((
+                    idx,
+                    ra.row.min(rb.row),
+                    ra.col.min(rb.col),
+                    ra.row.max(rb.row),
+                    ra.col.max(rb.col),
+                ));
+            }
+            // 整列：`A:C` / `$B:$D`
+            if let (Some(ca), Some(cb)) = (parse_col_only(a), parse_col_only(b)) {
+                return Ok((idx, 0, ca.min(cb), 1_048_575, ca.max(cb)));
+            }
+            // 整行：`1:5` / `$2:$2`
+            if let (Some(ra), Some(rb)) = (parse_row_only(a), parse_row_only(b)) {
+                return Ok((idx, ra.min(rb), 0, ra.max(rb), 16_383));
+            }
+            return Err(ErrKind::Ref);
+        }
+        let re = parse_a1(rest).ok_or(ErrKind::Ref)?;
+        if re.row < 0 || re.col < 0 {
+            return Err(ErrKind::Ref);
+        }
+        Ok((idx, re.row, re.col, re.row, re.col))
+    }
+
+    /// 数据库函数（`DSUM`/`DGET`/`DCOUNT` 等）支持公式条件列：
+    /// 当条件区域某列的表头为空或不在数据库列头中且条件格包含公式（如 `=B2>100`）时，
+    /// 按行偏移 `(db_row - 1, 0)` 逐行求值该公式判断行是否命中。
+    fn try_eval_db_with_formula_criteria(
+        &mut self,
+        name: &str,
+        nodes: &[Node],
+        si: usize,
+    ) -> Option<FValue> {
+        let (db_si, dr1, dc1, dr2, dc2) = self.resolve_node_rect(&nodes[0], si).ok()?;
+        let (cr_si, cr1, cc1, cr2, cc2) = self.resolve_node_rect(&nodes[2], si).ok()?;
+        let drows = (dr2 - dr1 + 1) as usize;
+        let dcols = (dc2 - dc1 + 1) as usize;
+        let crows = (cr2 - cr1 + 1) as usize;
+        let ccols = (cc2 - cc1 + 1) as usize;
+        if drows < 2 || crows < 2 || dcols == 0 || ccols == 0 {
+            return None;
+        }
+        // 检查条件区域是否存在「非匹配表头 + 公式条件格」
+        let db_headers: Vec<String> = (0..dcols)
+            .map(|c| self.cell_value(db_si, dr1 as u32, (dc1 + c as i64) as u32).display())
+            .collect();
+        enum CritCol {
+            Header(usize),
+            Formula,
+        }
+        let mut col_kinds = Vec::with_capacity(ccols);
+        let mut has_formula_col = false;
+        for cc in 0..ccols {
+            let hdr = self.cell_value(cr_si, cr1 as u32, (cc1 + cc as i64) as u32).display();
+            if !hdr.is_empty()
+                && let Some(dc) = db_headers.iter().position(|h| h.eq_ignore_ascii_case(&hdr))
+            {
+                col_kinds.push(CritCol::Header(dc));
+            } else {
+                // 检查该条件列数据行中是否有公式
+                let any_f = (1..crows).any(|cr| {
+                    self.wb.sheets[cr_si]
+                        .formula_of((cr1 + cr as i64) as u32, (cc1 + cc as i64) as u32)
+                        .is_some()
+                });
+                if any_f {
+                    has_formula_col = true;
+                    col_kinds.push(CritCol::Formula);
+                } else {
+                    return None;
+                }
+            }
+        }
+        if !has_formula_col {
+            return None;
+        }
+        // 解析字段参数
+        let field_v = self.eval_node(&nodes[1], si).scalar();
+        let field_idx = match field_v {
+            FValue::Number(n) => {
+                let k = n.trunc() as isize;
+                if k < 1 || k as usize > dcols {
+                    return Some(FValue::Error(ErrKind::Value));
+                }
+                (k - 1) as usize
+            }
+            FValue::Text(s) => match db_headers.iter().position(|h| h.eq_ignore_ascii_case(&s)) {
+                Some(i) => i,
+                None => return Some(FValue::Error(ErrKind::Value)),
+            },
+            FValue::Error(e) => return Some(FValue::Error(e)),
+            _ => return Some(FValue::Error(ErrKind::Value)),
+        };
+
+        // 逐行过滤
+        let mut vals: Vec<FValue> = Vec::new();
+        for r in 1..drows {
+            let mut matched_any_row = false;
+            for cr in 1..crows {
+                let mut all_ok = true;
+                for (cc, kind) in col_kinds.iter().enumerate() {
+                    let crit_r = (cr1 + cr as i64) as u32;
+                    let crit_c = (cc1 + cc as i64) as u32;
+                    match kind {
+                        CritCol::Header(dc) => {
+                            let cond = self.cell_value(cr_si, crit_r, crit_c).scalar();
+                            if matches!(cond, FValue::Empty) {
+                                continue;
+                            }
+                            let target = self
+                                .cell_value(db_si, (dr1 + r as i64) as u32, (dc1 + *dc as i64) as u32)
+                                .scalar();
+                            if !functions::match_criteria(&target, &cond.display()) {
+                                all_ok = false;
+                                break;
+                            }
+                        }
+                        CritCol::Formula => {
+                            let Some(f_str) = self.wb.sheets[cr_si].formula_of(crit_r, crit_c).map(str::to_owned) else {
+                                continue;
+                            };
+                            let raw = f_str.strip_prefix('=').unwrap_or(&f_str);
+                            let Ok(parsed) = compile_at(raw, crit_r, crit_c) else {
+                                all_ok = false;
+                                break;
+                            };
+                            let shift_r = (r as i64) - 1;
+                            let prev = (self.cur_sheet, self.cur, self.ref_offset);
+                            self.cur_sheet = cr_si;
+                            self.cur = (crit_r, crit_c);
+                            self.ref_offset = (shift_r, 0);
+                            let res = self.eval_node(&parsed, cr_si).scalar();
+                            (self.cur_sheet, self.cur, self.ref_offset) = prev;
+                            if !res.to_bool().unwrap_or(false) {
+                                all_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if all_ok {
+                    matched_any_row = true;
+                    break;
+                }
+            }
+            if matched_any_row {
+                vals.push(
+                    self.cell_value(db_si, (dr1 + r as i64) as u32, (dc1 + field_idx as i64) as u32)
+                        .scalar(),
+                );
+            }
+        }
+
+        let res = match name {
+            "DCOUNT" => Ok(FValue::number(
+                vals.iter().filter(|v| matches!(v, FValue::Number(_))).count() as f64,
+            )),
+            "DCOUNTA" => Ok(FValue::number(
+                vals.iter().filter(|v| !matches!(v, FValue::Empty)).count() as f64,
+            )),
+            "DGET" => {
+                if vals.is_empty() {
+                    Err(ErrKind::Value)
+                } else if vals.len() > 1 {
+                    Err(ErrKind::Num)
+                } else {
+                    Ok(vals[0].clone())
+                }
+            }
+            _ => {
+                let nums: Vec<f64> = vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        FValue::Number(n) => Some(*n),
+                        _ => None,
+                    })
+                    .collect();
+                match name {
+                    "DSUM" => Ok(FValue::number(nums.iter().sum())),
+                    "DPRODUCT" => Ok(FValue::number(if nums.is_empty() { 0.0 } else { nums.iter().product() })),
+                    "DAVERAGE" => {
+                        if nums.is_empty() {
+                            Err(ErrKind::Div0)
+                        } else {
+                            Ok(FValue::number(nums.iter().sum::<f64>() / nums.len() as f64))
+                        }
+                    }
+                    "DMAX" => Ok(FValue::number(nums.iter().copied().fold(f64::NEG_INFINITY, f64::max)).scalar()),
+                    "DMIN" => Ok(FValue::number(nums.iter().copied().fold(f64::INFINITY, f64::min)).scalar()),
+                    "DSTDEV" | "DSTDEVP" | "DVAR" | "DVARP" => {
+                        let sample = name == "DSTDEV" || name == "DVAR";
+                        functions::std_dev(&nums, sample).map(|sd| {
+                            FValue::number(if name.starts_with("DVAR") { sd * sd } else { sd })
+                        })
+                    }
+                    _ => Err(ErrKind::Name),
+                }
+            }
+        };
+        Some(res.unwrap_or_else(FValue::Error))
+    }
+}
+
+fn parse_col_only(s: &str) -> Option<i64> {
+    let t = s.trim().trim_start_matches('$');
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut col = 0i64;
+    for b in t.bytes() {
+        col = col * 26 + (b.to_ascii_uppercase() - b'A' + 1) as i64;
+    }
+    let c = col - 1;
+    (0..16_384).contains(&c).then_some(c)
+}
+
+fn parse_row_only(s: &str) -> Option<i64> {
+    let t = s.trim().trim_start_matches('$');
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let r = t.parse::<i64>().ok()? - 1;
+    (0..1_048_576).contains(&r).then_some(r)
+}
+
+fn parse_r1c1_atom(s: &str, cur_r: i64, cur_c: i64) -> Result<(i64, i64, i64, i64), ErrKind> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut has_r = false;
+    let mut r_val = cur_r;
+    if i < bytes.len() && bytes[i].eq_ignore_ascii_case(&b'R') {
+        has_r = true;
+        i += 1;
+        if i < bytes.len() && bytes[i] == b'[' {
+            let end = s[i..].find(']').ok_or(ErrKind::Ref)? + i;
+            let off: i64 = s[i + 1..end].parse().map_err(|_| ErrKind::Ref)?;
+            r_val = cur_r + off;
+            i = end + 1;
+        } else {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > start {
+                r_val = s[start..i].parse::<i64>().map_err(|_| ErrKind::Ref)? - 1;
+            }
+        }
+    }
+    let mut has_c = false;
+    let mut c_val = cur_c;
+    if i < bytes.len() && bytes[i].eq_ignore_ascii_case(&b'C') {
+        has_c = true;
+        i += 1;
+        if i < bytes.len() && bytes[i] == b'[' {
+            let end = s[i..].find(']').ok_or(ErrKind::Ref)? + i;
+            let off: i64 = s[i + 1..end].parse().map_err(|_| ErrKind::Ref)?;
+            c_val = cur_c + off;
+            i = end + 1;
+        } else {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > start {
+                c_val = s[start..i].parse::<i64>().map_err(|_| ErrKind::Ref)? - 1;
+            }
+        }
+    }
+    if i != bytes.len() || (!has_r && !has_c) {
+        return Err(ErrKind::Ref);
+    }
+    let (r1, r2) = if has_r {
+        if !(0..1_048_576).contains(&r_val) {
+            return Err(ErrKind::Ref);
+        }
+        (r_val, r_val)
+    } else {
+        (0, 1_048_575)
+    };
+    let (c1, c2) = if has_c {
+        if !(0..16_384).contains(&c_val) {
+            return Err(ErrKind::Ref);
+        }
+        (c_val, c_val)
+    } else {
+        (0, 16_383)
+    };
+    Ok((r1, c1, r2, c2))
 }
 
 impl conditional_index::CriteriaDataSource for Calc<'_> {
@@ -7175,6 +7926,60 @@ const fn supports_scalar_array_lift(id: FuncId) -> bool {
 }
 
 #[inline]
+fn supports_extra_scalar_array_lift(name: &str) -> bool {
+    matches!(
+        name,
+        "ACOSH"
+            | "ASINH"
+            | "ATANH"
+            | "ACOT"
+            | "ACOTH"
+            | "COT"
+            | "COTH"
+            | "CSC"
+            | "CSCH"
+            | "SEC"
+            | "SECH"
+            | "CLEAN"
+            | "ASC"
+            | "DOLLAR"
+            | "FIXED"
+            | "NUMBERVALUE"
+            | "DAYS360"
+            | "DATEVALUE"
+            | "TIMEVALUE"
+            | "ISOWEEKNUM"
+            | "UNICHAR"
+            | "UNICODE"
+            | "ROMAN"
+            | "ARABIC"
+            | "BASE"
+            | "DECIMAL"
+            | "DELTA"
+            | "GESTEP"
+            | "ERF"
+            | "ERF.PRECISE"
+            | "ERFC"
+            | "ERFC.PRECISE"
+            | "GAMMA"
+            | "GAUSS"
+            | "PHI"
+            | "REGEXTEST"
+            | "REGEXEXTRACT"
+            | "REGEXREPLACE"
+            | "LENB"
+            | "LEFTB"
+            | "RIGHTB"
+            | "MIDB"
+            | "FINDB"
+            | "SEARCHB"
+            | "NUMBERSTRING"
+            | "ACCRINT"
+            | "ACCRINTM"
+    )
+}
+
+#[inline]
 fn aligned_col_end_row(r1: i64, max_r: u32, orig_r2: i64) -> i64 {
     i64::from(max_r).max(r1 + 255).min(orig_r2)
 }
@@ -7232,8 +8037,24 @@ fn bin_scalar(op: BinOp, lv: &FValue, rv: &FValue) -> FValue {
                 Err(e) => return FValue::Error(e),
             };
             match op {
-                BinOp::Add => FValue::number(a + b),
-                BinOp::Sub => FValue::number(a - b),
+                BinOp::Add => {
+                    let s = a + b;
+                    let scale = a.abs().max(b.abs());
+                    if scale > 0.0 && s.abs() <= scale * 1e-15 {
+                        FValue::number(0.0)
+                    } else {
+                        FValue::number(s)
+                    }
+                }
+                BinOp::Sub => {
+                    let s = a - b;
+                    let scale = a.abs().max(b.abs());
+                    if scale > 0.0 && s.abs() <= scale * 1e-15 {
+                        FValue::number(0.0)
+                    } else {
+                        FValue::number(s)
+                    }
+                }
                 BinOp::Mul => FValue::number(a * b),
                 BinOp::Div => {
                     if b == 0.0 {
@@ -7877,7 +8698,26 @@ fn recalc_dirty_impl(
 
     if wb.calc_iterate {
         let passes = wb.calc_max_iterations.max(1) as usize;
-        let mut prev_nums: HashMap<deps::CellKey, f64> = HashMap::new();
+        // 迭代重算前先清理上一轮残留的错误值并记录初始基线，防止上次循环引用 #REF! 污染收敛
+        let mut prev_nums: HashMap<deps::CellKey, f64> = HashMap::with_capacity(order.len());
+        for &key in &order {
+            let v = wb.sheets[key.0]
+                .get(key.1, key.2)
+                .map(|c| c.value.clone())
+                .unwrap_or(crate::model::Value::Empty);
+            match v {
+                crate::model::Value::Number(n) => {
+                    prev_nums.insert(key, n);
+                }
+                crate::model::Value::Error(_) => {
+                    wb.sheets[key.0].set_formula_cache(key.1, key.2, crate::model::Value::Number(0.0));
+                    prev_nums.insert(key, 0.0);
+                }
+                _ => {
+                    prev_nums.insert(key, 0.0);
+                }
+            }
+        }
         let mut last_count = 0usize;
         for pass in 0..passes {
             if cancelled() {
@@ -8842,7 +9682,9 @@ pub fn is_table_formula(f: &str) -> bool {
     let s = f.trim();
     let s = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')).unwrap_or(s).trim();
     let s = s.strip_prefix('=').unwrap_or(s).trim();
-    s.len() >= 7 && s[..6].eq_ignore_ascii_case("TABLE(") && s.ends_with(')')
+    s.len() >= 7
+        && s.as_bytes().get(..6).is_some_and(|b| b.eq_ignore_ascii_case(b"TABLE("))
+        && s.ends_with(')')
 }
 
 /// 解析 `=TABLE(row_in, col_in)` 的输入单元格引用。
@@ -8850,7 +9692,10 @@ pub fn parse_table_formula(f: &str) -> Option<(Option<(u32, u32)>, Option<(u32, 
     let s = f.trim();
     let s = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')).unwrap_or(s).trim();
     let s = s.strip_prefix('=').unwrap_or(s).trim();
-    if s.len() < 7 || !s[..6].eq_ignore_ascii_case("TABLE(") || !s.ends_with(')') {
+    if s.len() < 7
+        || !s.as_bytes().get(..6).is_some_and(|b| b.eq_ignore_ascii_case(b"TABLE("))
+        || !s.ends_with(')')
+    {
         return None;
     }
     let inner = &s[6..s.len() - 1];

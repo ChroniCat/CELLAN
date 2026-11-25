@@ -319,6 +319,12 @@ fn render_plain(node: &Node) -> String {
         Node::Ref(r) => render_ref(r),
         Node::Spill(r) => format!("{}#", render_ref(r)),
         Node::Range(a, b) => render_range(a, b),
+        Node::DynRange(a, b) => format!("{}:{}", render_plain(a), render_plain(b)),
+        Node::Intersect(a, b) => format!("{} {}", render_plain(a), render_plain(b)),
+        Node::Union(items) => {
+            let parts: Vec<String> = items.iter().map(render_plain).collect();
+            format!("({})", parts.join(","))
+        }
         Node::Name(n) => n.clone(),
         Node::ScopedName { book, sheet, name } => {
             let mut out = String::new();
@@ -396,7 +402,14 @@ fn find_redex_inner(node: &Node, wb: &Workbook, sheet: usize, path: &mut Vec<usi
         Node::Empty | Node::Number(_) | Node::Text(_) | Node::Bool(_) | Node::Err(_) | Node::Array(..) => {
             false
         }
-        Node::Ref(_) | Node::Spill(_) | Node::Range(..) | Node::Name(_) | Node::ScopedName { .. } => {
+        Node::Ref(_)
+        | Node::Spill(_)
+        | Node::Range(..)
+        | Node::DynRange(..)
+        | Node::Intersect(..)
+        | Node::Union(_)
+        | Node::Name(_)
+        | Node::ScopedName { .. } => {
             true
         }
         Node::Implicit(x) | Node::Unary(_, x) | Node::Percent(x) => {
@@ -647,6 +660,9 @@ fn render_node(
         }
         Node::Range(a, b) => {
             out.push_str(&render_range(a, b));
+        }
+        Node::DynRange(..) | Node::Intersect(..) | Node::Union(_) => {
+            out.push_str(&render_plain(node));
         }
         Node::Name(n) => out.push_str(n),
         Node::ScopedName { book, sheet: s, name } => {

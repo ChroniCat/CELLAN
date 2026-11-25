@@ -431,7 +431,7 @@ fn biff_error_code(e: crate::formula::ErrKind) -> u8 {
         K::Name => 0x1D,
         K::Num => 0x24,
         K::Na => 0x2A,
-        K::Spill => 0x0F, // BIFF8 没有 #SPILL!，用 #VALUE! 兜底
+        K::Spill | K::Calc | K::Field => 0x0F, // BIFF8 没有新错误类型，用 #VALUE! 兜底
     }
 }
 

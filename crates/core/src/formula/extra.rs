@@ -1003,20 +1003,88 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
             }
             Ok(FValue::number(n.atanh()))
         }),
-        "TEXTBEFORE" => r(|| {
+        "TEXTBEFORE" | "TEXTAFTER" => r(|| {
             let s = text(args, 0)?;
-            let d = text(args, 1)?;
-            match s.find(&d) {
-                Some(i) => Ok(FValue::Text(s[..i].into())),
-                None => Err(ErrKind::Na),
+            let delims: Vec<String> = {
+                let d_arg = args.get(1).ok_or(ErrKind::Value)?;
+                let mut out = Vec::new();
+                for v in d_arg.slice() {
+                    out.push(v.to_text()?);
+                }
+                if out.is_empty() {
+                    return Err(ErrKind::Value);
+                }
+                out
+            };
+            let inst = match args.get(2) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 2)?,
+                _ => 1,
+            };
+            if inst == 0 {
+                return Err(ErrKind::Value);
             }
-        }),
-        "TEXTAFTER" => r(|| {
-            let s = text(args, 0)?;
-            let d = text(args, 1)?;
-            match s.find(&d) {
-                Some(i) => Ok(FValue::Text(s[i + d.len()..].into())),
-                None => Err(ErrKind::Na),
+            let match_mode = match args.get(3) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 3)?,
+                _ => 0,
+            };
+            let match_end = match args.get(4) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 4)?,
+                _ => 0,
+            };
+            let fallback = |args: &[Arg]| -> Result<FValue, ErrKind> {
+                if let Some(a) = args.get(5)
+                    && !matches!(a, Arg::Val(FValue::Empty))
+                {
+                    Ok(a.first())
+                } else {
+                    Err(ErrKind::Na)
+                }
+            };
+            if delims.iter().any(|d| d.is_empty()) {
+                return Ok(FValue::Text(if (name == "TEXTBEFORE") == (inst > 0) {
+                    "".into()
+                } else {
+                    s.into()
+                }));
+            }
+            let ci = match_mode == 1;
+            let matches = find_delim_matches(&s, &delims, ci);
+            if inst > 0 {
+                let k = inst as usize;
+                if k <= matches.len() {
+                    let (start, end) = matches[k - 1];
+                    return Ok(FValue::Text(if name == "TEXTBEFORE" {
+                        s[..start].into()
+                    } else {
+                        s[end..].into()
+                    }));
+                }
+                if match_end == 1 && k == matches.len() + 1 {
+                    return Ok(FValue::Text(if name == "TEXTBEFORE" {
+                        s.into()
+                    } else {
+                        "".into()
+                    }));
+                }
+                fallback(args)
+            } else {
+                let k = (-inst) as usize;
+                if k <= matches.len() {
+                    let (start, end) = matches[matches.len() - k];
+                    return Ok(FValue::Text(if name == "TEXTBEFORE" {
+                        s[..start].into()
+                    } else {
+                        s[end..].into()
+                    }));
+                }
+                if match_end == 1 && k == matches.len() + 1 {
+                    return Ok(FValue::Text(if name == "TEXTBEFORE" {
+                        "".into()
+                    } else {
+                        s.into()
+                    }));
+                }
+                fallback(args)
             }
         }),
         "UNICHAR" => r(|| {
@@ -1160,34 +1228,144 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
             Ok(FValue::number((ss / (n as f64 - 2.0)).sqrt()))
         }),
         "TREND" | "GROWTH" => r(|| {
-            let ys = first_numbers(args)?;
-            let xs = args.get(1).map(|a| a.numbers()).transpose()?.unwrap_or_else(|| {
-                (1..=ys.len()).map(|i| i as f64).collect()
-            });
             let log_mode = name == "GROWTH";
-            let ys_t: Vec<f64> = if log_mode { ys.iter().map(|v| v.ln()).collect() } else { ys.clone() };
-            let (m, b) = linfit(&xs, &ys_t)?;
-            let targets = match args.get(2) {
-                Some(a) => a.slice().iter().filter_map(|v| v.to_number().ok()).collect::<Vec<f64>>(),
-                None => xs.clone(),
+            let (yr, yc, y_raw) = args.first().ok_or(ErrKind::Value)?.grid_slice();
+            let mut ys = Vec::with_capacity(y_raw.len());
+            for v in y_raw.iter() {
+                let n = v.to_number()?;
+                if log_mode && n <= 0.0 {
+                    return Err(ErrKind::Num);
+                }
+                ys.push(if log_mode { n.ln() } else { n });
+            }
+            let n = ys.len();
+            if n == 0 {
+                return Err(ErrKind::Value);
+            }
+            let horiz_y = yr == 1 && yc > 1;
+            let with_const = match args.get(3) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => a.first().to_bool()?,
+                _ => true,
             };
-            let out: Vec<FValue> = targets
-                .iter()
-                .map(|x| {
-                    let v = m * x + b;
-                    FValue::number(if log_mode { v.exp() } else { v })
-                })
-                .collect();
-            Ok(FValue::Array(Arc::new(super::value::Array::new(1, out.len(), out))))
+            let (xs_rows, k) = extract_ols_x(args.get(1), yr, yc, horiz_y)?;
+            let fit = ols_fit(&ys, &xs_rows, k, with_const)?;
+            let (new_rows, out_r, out_c) = match args.get(2) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => {
+                    let (nr, nc, nd) = a.grid_slice();
+                    if k == 1 {
+                        let mut rows = Vec::with_capacity(nd.len());
+                        for v in nd.iter() {
+                            rows.push(vec![v.to_number()?]);
+                        }
+                        (rows, nr, nc)
+                    } else if horiz_y {
+                        if nr != k {
+                            return Err(ErrKind::Ref);
+                        }
+                        let mut rows = Vec::with_capacity(nc);
+                        for j in 0..nc {
+                            let mut row = Vec::with_capacity(k);
+                            for i in 0..k {
+                                row.push(nd[i * nc + j].to_number()?);
+                            }
+                            rows.push(row);
+                        }
+                        (rows, 1, nc)
+                    } else {
+                        if nc != k {
+                            return Err(ErrKind::Ref);
+                        }
+                        let mut rows = Vec::with_capacity(nr);
+                        for i in 0..nr {
+                            let mut row = Vec::with_capacity(k);
+                            for j in 0..k {
+                                row.push(nd[i * nc + j].to_number()?);
+                            }
+                            rows.push(row);
+                        }
+                        (rows, nr, 1)
+                    }
+                }
+                _ => (xs_rows, yr, yc),
+            };
+            let mut out = Vec::with_capacity(new_rows.len());
+            for xr in &new_rows {
+                let mut pred = fit.intercept;
+                for (j, &xv) in xr.iter().enumerate() {
+                    pred += fit.slopes[j] * xv;
+                }
+                out.push(FValue::number(if log_mode { pred.exp() } else { pred }));
+            }
+            if out.len() == 1 {
+                Ok(out.into_iter().next().unwrap())
+            } else {
+                Ok(FValue::Array(Arc::new(super::value::Array::new(
+                    out_r.max(1),
+                    out_c.max(1),
+                    out,
+                ))))
+            }
         }),
         "LINEST" => r(|| {
-            let y = first_numbers(args)?;
-            let x = args.get(1).map(|a| a.numbers()).transpose()?.unwrap_or_else(|| {
-                (1..=y.len()).map(|i| i as f64).collect()
+            let (yr, yc, y_raw) = args.first().ok_or(ErrKind::Value)?.grid_slice();
+            let mut ys = Vec::with_capacity(y_raw.len());
+            for v in y_raw.iter() {
+                ys.push(v.to_number()?);
+            }
+            if ys.is_empty() {
+                return Err(ErrKind::Value);
+            }
+            let horiz_y = yr == 1 && yc > 1;
+            let with_const = match args.get(2) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => a.first().to_bool()?,
+                _ => true,
+            };
+            let stats = match args.get(3) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => a.first().to_bool()?,
+                _ => false,
+            };
+            let (xs_rows, k) = extract_ols_x(args.get(1), yr, yc, horiz_y)?;
+            let fit = ols_fit(&ys, &xs_rows, k, with_const)?;
+            let cols = k + 1;
+            // Excel 规则：斜率逆序输出 [m_k, ..., m_1, b]
+            let mut row0 = Vec::with_capacity(cols);
+            for j in (0..k).rev() {
+                row0.push(FValue::number(fit.slopes[j]));
+            }
+            row0.push(FValue::number(fit.intercept));
+            if !stats {
+                return Ok(FValue::Array(Arc::new(super::value::Array::new(1, cols, row0))));
+            }
+            let mut data = Vec::with_capacity(5 * cols);
+            data.extend(row0);
+            // Row 1: 标准误 [se_k, ..., se_1, se_b]
+            for j in (0..k).rev() {
+                data.push(FValue::number(fit.se_slopes[j]));
+            }
+            data.push(if with_const {
+                FValue::number(fit.se_intercept)
+            } else {
+                FValue::Error(ErrKind::Na)
             });
-            let (m, b) = linfit(&x, &y)?;
-            let out = vec![FValue::number(m), FValue::number(b)];
-            Ok(FValue::Array(Arc::new(super::value::Array::new(1, 2, out))))
+            // Row 2: [r2, sey, #N/A...]
+            data.push(FValue::number(fit.r2));
+            data.push(FValue::number(fit.sey));
+            for _ in 2..cols {
+                data.push(FValue::Error(ErrKind::Na));
+            }
+            // Row 3: [F, df, #N/A...]
+            data.push(FValue::number(fit.f_stat));
+            data.push(FValue::number(fit.df));
+            for _ in 2..cols {
+                data.push(FValue::Error(ErrKind::Na));
+            }
+            // Row 4: [ss_reg, ss_resid, #N/A...]
+            data.push(FValue::number(fit.ss_reg));
+            data.push(FValue::number(fit.ss_resid));
+            for _ in 2..cols {
+                data.push(FValue::Error(ErrKind::Na));
+            }
+            Ok(FValue::Array(Arc::new(super::value::Array::new(5, cols, data))))
         }),
 
         // ============================ 百分位 / 排名补充
@@ -1584,26 +1762,79 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
         }),
         "TEXTSPLIT" => r(|| {
             let s = text(args, 0)?;
-            let coldelim = text(args, 1)?;
-            let rowdelim = args.get(2).map(|a| a.first().to_text()).transpose()?.unwrap_or_default();
-            let rows_src: Vec<&str> = if rowdelim.is_empty() {
-                vec![s.as_str()]
-            } else {
-                s.split(rowdelim.as_str()).collect()
+            let col_delims: Vec<String> = match args.get(1) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => {
+                    let mut v = Vec::new();
+                    for item in a.slice() {
+                        let t = item.to_text()?;
+                        if !t.is_empty() {
+                            v.push(t);
+                        }
+                    }
+                    v
+                }
+                _ => Vec::new(),
             };
-            let grid: Vec<Vec<FValue>> = rows_src
-                .iter()
-                .map(|line| {
-                    line.split(coldelim.as_str())
-                        .map(|cell| FValue::Text(cell.into()))
-                        .collect()
-                })
-                .collect();
-            let cols = grid.iter().map(|r| r.len()).max().unwrap_or(0);
+            let row_delims: Vec<String> = match args.get(2) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => {
+                    let mut v = Vec::new();
+                    for item in a.slice() {
+                        let t = item.to_text()?;
+                        if !t.is_empty() {
+                            v.push(t);
+                        }
+                    }
+                    v
+                }
+                _ => Vec::new(),
+            };
+            if col_delims.is_empty() && row_delims.is_empty() {
+                return Err(ErrKind::Value);
+            }
+            let ignore_empty = match args.get(3) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => a.first().to_bool()?,
+                _ => false,
+            };
+            let match_mode = match args.get(4) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 4)?,
+                _ => 0,
+            };
+            let pad_with = match args.get(5) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => a.first(),
+                _ => FValue::Error(ErrKind::Na),
+            };
+            let ci = match_mode == 1;
+            let mut rows_src: Vec<String> = if row_delims.is_empty() {
+                vec![s]
+            } else {
+                split_by_delims(&s, &row_delims, ci)
+            };
+            if ignore_empty && !row_delims.is_empty() {
+                rows_src.retain(|r| !r.is_empty());
+            }
+            let mut grid: Vec<Vec<FValue>> = Vec::with_capacity(rows_src.len());
+            for line in &rows_src {
+                let mut parts = if col_delims.is_empty() {
+                    vec![line.clone()]
+                } else {
+                    split_by_delims(line, &col_delims, ci)
+                };
+                if ignore_empty {
+                    parts.retain(|p| !p.is_empty());
+                }
+                if ignore_empty && parts.is_empty() {
+                    continue;
+                }
+                grid.push(parts.into_iter().map(|c| FValue::Text(c.into())).collect());
+            }
+            if grid.is_empty() {
+                return Err(ErrKind::Calc);
+            }
+            let cols = grid.iter().map(|r| r.len()).max().unwrap_or(0).max(1);
             let mut data = Vec::with_capacity(grid.len() * cols);
             for row in &grid {
                 for c in 0..cols {
-                    data.push(row.get(c).cloned().unwrap_or(FValue::Empty));
+                    data.push(row.get(c).cloned().unwrap_or_else(|| pad_with.clone()));
                 }
             }
             Ok(FValue::Array(Arc::new(super::value::Array::new(grid.len(), cols, data))))
@@ -2123,42 +2354,278 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
             }
         }),
 
-        // ============================ 正则（Excel 365）
+        // ============================ 正则（Excel 365 全可选参数）
         "REGEXTEST" => r(|| {
             let text_ = text(args, 0)?;
             let pat = text(args, 1)?;
-            let re = cached_regex(&pat)?;
+            let ci = match args.get(2) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 2)? == 1,
+                _ => false,
+            };
+            let eff_pat = if ci { format!("(?i){pat}") } else { pat };
+            let re = cached_regex(&eff_pat)?;
             Ok(FValue::Bool(re.is_match(&text_)))
         }),
         "REGEXEXTRACT" => r(|| {
             let text_ = text(args, 0)?;
             let pat = text(args, 1)?;
-            let re = cached_regex(&pat)?;
-            match re.captures(&text_) {
-                Some(caps) => {
-                    let groups: Vec<FValue> = (0..caps.len())
-                        .map(|i| FValue::Text(caps.get(i).map(|m| m.as_str()).unwrap_or_default().into()))
+            let return_mode = match args.get(2) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 2)?,
+                _ => 0,
+            };
+            let ci = match args.get(3) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 3)? == 1,
+                _ => false,
+            };
+            let eff_pat = if ci { format!("(?i){pat}") } else { pat };
+            let re = cached_regex(&eff_pat)?;
+            match return_mode {
+                0 => match re.find(&text_) {
+                    Some(m) => Ok(FValue::Text(m.as_str().into())),
+                    None => Err(ErrKind::Na),
+                },
+                1 => {
+                    let hits: Vec<FValue> = re
+                        .find_iter(&text_)
+                        .map(|m| FValue::Text(m.as_str().into()))
                         .collect();
-                    if groups.len() == 1 {
-                        Ok(groups.into_iter().next().unwrap())
+                    if hits.is_empty() {
+                        Err(ErrKind::Na)
+                    } else if hits.len() == 1 {
+                        Ok(hits.into_iter().next().unwrap())
                     } else {
-                        Ok(FValue::Array(Arc::new(super::value::Array::new(
-                            1,
-                            groups.len(),
-                            groups,
-                        ))))
+                        Ok(FValue::Array(Arc::new(super::value::Array::new(1, hits.len(), hits))))
                     }
                 }
-                None => Err(ErrKind::Na),
+                2 => match re.captures(&text_) {
+                    Some(caps) => {
+                        let start = if caps.len() > 1 { 1 } else { 0 };
+                        let groups: Vec<FValue> = (start..caps.len())
+                            .map(|i| FValue::Text(caps.get(i).map(|m| m.as_str()).unwrap_or_default().into()))
+                            .collect();
+                        if groups.len() == 1 {
+                            Ok(groups.into_iter().next().unwrap())
+                        } else {
+                            Ok(FValue::Array(Arc::new(super::value::Array::new(
+                                1,
+                                groups.len(),
+                                groups,
+                            ))))
+                        }
+                    }
+                    None => Err(ErrKind::Na),
+                },
+                _ => Err(ErrKind::Value),
             }
         }),
         "REGEXREPLACE" => r(|| {
             let text_ = text(args, 0)?;
             let pat = text(args, 1)?;
             let rep = text(args, 2)?;
-            let re = cached_regex(&pat)?;
-            // Excel 用 $1 还是 \1：regex crate 用 $1，与 Excel 一致
-            Ok(FValue::Text(re.replace_all(&text_, rep.as_str()).as_ref().into()))
+            let occurrence = match args.get(3) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 3)?,
+                _ => 0,
+            };
+            let ci = match args.get(4) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 4)? == 1,
+                _ => false,
+            };
+            let eff_pat = if ci { format!("(?i){pat}") } else { pat };
+            let re = cached_regex(&eff_pat)?;
+            if occurrence == 0 {
+                return Ok(FValue::Text(re.replace_all(&text_, rep.as_str()).as_ref().into()));
+            }
+            let caps_list: Vec<regex::Captures<'_>> = re.captures_iter(&text_).collect();
+            let target_idx = if occurrence > 0 {
+                let k = (occurrence - 1) as usize;
+                (k < caps_list.len()).then_some(k)
+            } else {
+                let k = (-occurrence) as usize;
+                (k > 0 && k <= caps_list.len()).then(|| caps_list.len() - k)
+            };
+            let Some(ti) = target_idx else {
+                return Ok(FValue::Text(text_.into()));
+            };
+            let caps = &caps_list[ti];
+            let m = caps.get(0).unwrap();
+            let mut expanded = String::new();
+            caps.expand(&rep, &mut expanded);
+            let mut out = String::with_capacity(text_.len() + expanded.len());
+            out.push_str(&text_[..m.start()]);
+            out.push_str(&expanded);
+            out.push_str(&text_[m.end()..]);
+            Ok(FValue::Text(out.into()))
+        }),
+
+        // ============================ DBCS 双字节文本函数（中文财务常用）
+        "LENB" => r(|| {
+            let s = text(args, 0)?;
+            let n: usize = s.chars().map(dbcs_char_bytes).sum();
+            Ok(FValue::number(n as f64))
+        }),
+        "LEFTB" => r(|| {
+            let s = text(args, 0)?;
+            let n = match args.get(1) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 1)?,
+                _ => 1,
+            };
+            if n < 0 {
+                return Err(ErrKind::Value);
+            }
+            let mut budget = n as usize;
+            let mut out = String::new();
+            for ch in s.chars() {
+                let w = dbcs_char_bytes(ch);
+                if w > budget {
+                    break;
+                }
+                out.push(ch);
+                budget -= w;
+            }
+            Ok(FValue::Text(out.into()))
+        }),
+        "RIGHTB" => r(|| {
+            let s = text(args, 0)?;
+            let n = match args.get(1) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 1)?,
+                _ => 1,
+            };
+            if n < 0 {
+                return Err(ErrKind::Value);
+            }
+            let mut budget = n as usize;
+            let mut rev = Vec::new();
+            for ch in s.chars().rev() {
+                let w = dbcs_char_bytes(ch);
+                if w > budget {
+                    break;
+                }
+                rev.push(ch);
+                budget -= w;
+            }
+            rev.reverse();
+            Ok(FValue::Text(rev.into_iter().collect::<String>().into()))
+        }),
+        "MIDB" => r(|| {
+            let s = text(args, 0)?;
+            let start = int_arg(args, 1)?;
+            let count = int_arg(args, 2)?;
+            if start < 1 || count < 0 {
+                return Err(ErrKind::Value);
+            }
+            let start_b = (start - 1) as usize;
+            let end_b = start_b.saturating_add(count as usize);
+            let mut pos = 0usize;
+            let mut out = String::new();
+            for ch in s.chars() {
+                let w = dbcs_char_bytes(ch);
+                let next = pos + w;
+                if pos >= start_b && next <= end_b {
+                    out.push(ch);
+                } else if pos < start_b && next > start_b && next <= end_b {
+                    // 半个双字节字符起始：Excel 补一个空格
+                    out.push(' ');
+                }
+                pos = next;
+                if pos >= end_b {
+                    break;
+                }
+            }
+            Ok(FValue::Text(out.into()))
+        }),
+        "FINDB" | "SEARCHB" => r(|| {
+            let needle = text(args, 0)?;
+            let hay = text(args, 1)?;
+            let start = match args.get(2) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 2)?,
+                _ => 1,
+            };
+            if start < 1 {
+                return Err(ErrKind::Value);
+            }
+            let start_b = (start - 1) as usize;
+            let mut pos_b = 0usize;
+            let mut byte_idx = hay.len();
+            for (bi, ch) in hay.char_indices() {
+                if pos_b >= start_b {
+                    byte_idx = bi;
+                    break;
+                }
+                pos_b += dbcs_char_bytes(ch);
+            }
+            if pos_b < start_b {
+                return Err(ErrKind::Value);
+            }
+            let sub = &hay[byte_idx..];
+            let found_rel = if name == "FINDB" {
+                sub.find(&needle)
+            } else {
+                find_ci_wildcard(sub, &needle)
+            };
+            match found_rel {
+                Some(rel) => {
+                    let prefix_b: usize = hay[..byte_idx + rel].chars().map(dbcs_char_bytes).sum();
+                    Ok(FValue::number((prefix_b + 1) as f64))
+                }
+                None => Err(ErrKind::Value),
+            }
+        }),
+
+        // ============================ 中文数字转换（财务常用 NUMBERSTRING）
+        "NUMBERSTRING" => r(|| {
+            let n = num(args, 0)?;
+            let kind = int_arg(args, 1)?;
+            if n < 0.0 || !n.is_finite() {
+                return Err(ErrKind::Num);
+            }
+            let iv = n.trunc() as u64;
+            let s = match kind {
+                1 => format_cn_number(iv, false),
+                2 => format_cn_number(iv, true),
+                3 => format_cn_digits(iv),
+                _ => return Err(ErrKind::Value),
+            };
+            Ok(FValue::Text(s.into()))
+        }),
+
+        // ============================ 债券应计利息 ACCRINT / ACCRINTM
+        "ACCRINT" => r(|| {
+            let issue = num(args, 0)?.floor();
+            let _first_int = num(args, 1)?.floor();
+            let settlement = num(args, 2)?.floor();
+            let rate = num(args, 3)?;
+            let par = match args.get(4) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => a.first().to_number()?,
+                _ => 1000.0,
+            };
+            let freq = int_arg(args, 5)?;
+            let basis = match args.get(6) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 6)? as i32,
+                _ => 0,
+            };
+            if rate <= 0.0 || par <= 0.0 || !matches!(freq, 1 | 2 | 4) || !(0..=4).contains(&basis) || issue >= settlement {
+                return Err(ErrKind::Num);
+            }
+            let yf = super::functions::year_fraction_in(sys, issue, settlement, basis)?;
+            Ok(FValue::number(par * rate * yf))
+        }),
+        "ACCRINTM" => r(|| {
+            let issue = num(args, 0)?.floor();
+            let settlement = num(args, 1)?.floor();
+            let rate = num(args, 2)?;
+            let par = match args.get(3) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => a.first().to_number()?,
+                _ => 1000.0,
+            };
+            let basis = match args.get(4) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 4)? as i32,
+                _ => 0,
+            };
+            if rate <= 0.0 || par <= 0.0 || !(0..=4).contains(&basis) || issue >= settlement {
+                return Err(ErrKind::Num);
+            }
+            let yf = super::functions::year_fraction_in(sys, issue, settlement, basis)?;
+            Ok(FValue::number(par * rate * yf))
         }),
 
         // ============================ 国际化工作日
@@ -2210,11 +2677,6 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
                 }
                 Ok(m)
             };
-            let idx_for = |serial: f64, m: &[bool; 7]| -> usize {
-                let wd = ((serial.floor() as i64) - 1).rem_euclid(7); // 0=周日
-                // 转成 0=周一
-                (wd + 6) as usize % 7
-            };
             let holidays: Vec<i64> = match args.get(args.len() - 1) {
                 Some(a) if args.len() >= 4 => a
                     .values()
@@ -2224,8 +2686,9 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
                     .collect(),
                 _ => Vec::new(),
             };
+            let date_off = if sys.is_1904() { 1462 } else { 0 };
             let is_workday = |d: i64, m: &[bool; 7], hol: &[i64]| -> bool {
-                let wd = ((d - 1).rem_euclid(7)) as usize;
+                let wd = ((d + date_off - 1).rem_euclid(7)) as usize;
                 let mon_based = (wd + 6) % 7;
                 !m[mon_based] && !hol.contains(&d)
             };
@@ -2253,7 +2716,12 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
                 let mut d = start;
                 let step = if days >= 0 { 1 } else { -1 };
                 let mut left = days.abs();
+                let mut guard = 0usize;
                 while left > 0 {
+                    guard += 1;
+                    if guard > 5_000_000 {
+                        return Err(ErrKind::Num);
+                    }
                     d += step;
                     if is_workday(d, &m, &holidays) {
                         left -= 1;
@@ -2811,7 +3279,10 @@ fn database_fn(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
             vals.iter().filter(|v| !matches!(v, FValue::Empty)).count() as f64,
         )),
         "DGET" => {
-            if vals.len() != 1 {
+            if vals.is_empty() {
+                return Err(ErrKind::Value);
+            }
+            if vals.len() > 1 {
                 return Err(ErrKind::Num);
             }
             Ok(vals[0].clone())
@@ -3538,4 +4009,368 @@ fn from_roman(s: &str) -> Option<i64> {
         }
     }
     Some(total)
+}
+
+// ---------------------------------------------------------------- Gap #6 辅助：多分隔符 / 多元 OLS / DBCS / 中文数字
+
+fn find_delim_matches(s: &str, delims: &[String], ci: bool) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let s_low = ci.then(|| s.to_lowercase());
+    let d_lows: Vec<String> = if ci {
+        delims.iter().map(|d| d.to_lowercase()).collect()
+    } else {
+        Vec::new()
+    };
+    while i < s.len() {
+        let mut best_len = 0usize;
+        if ci {
+            // 按字符边界定位，避免 Unicode 大小写字节长度不一致
+            let rem = &s[i..];
+            for (di, d) in delims.iter().enumerate() {
+                if d.is_empty() {
+                    continue;
+                }
+                let dc = d.chars().count();
+                let mut end_b = 0usize;
+                let mut cnt = 0usize;
+                for (bi, ch) in rem.char_indices() {
+                    if cnt == dc {
+                        break;
+                    }
+                    end_b = bi + ch.len_utf8();
+                    cnt += 1;
+                }
+                if cnt == dc && rem[..end_b].to_lowercase() == d_lows[di] && end_b > best_len {
+                    best_len = end_b;
+                }
+            }
+            let _ = &s_low;
+        } else {
+            let rem = &s[i..];
+            for d in delims {
+                if !d.is_empty() && rem.starts_with(d.as_str()) && d.len() > best_len {
+                    best_len = d.len();
+                }
+            }
+        }
+        if best_len > 0 {
+            out.push((i, i + best_len));
+            i += best_len;
+        } else if let Some(ch) = s[i..].chars().next() {
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn split_by_delims(s: &str, delims: &[String], ci: bool) -> Vec<String> {
+    let matches = find_delim_matches(s, delims, ci);
+    let mut out = Vec::with_capacity(matches.len() + 1);
+    let mut pos = 0usize;
+    for (a, b) in matches {
+        out.push(s[pos..a].to_string());
+        pos = b;
+    }
+    out.push(s[pos..].to_string());
+    out
+}
+
+#[inline]
+fn dbcs_char_bytes(c: char) -> usize {
+    if (c as u32) <= 0x7F { 1 } else { 2 }
+}
+
+fn find_ci_wildcard(hay: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let h_chars: Vec<(usize, char)> = hay.char_indices().collect();
+    let n_low: Vec<char> = needle.to_lowercase().chars().collect();
+    if !needle.contains('*') && !needle.contains('?') && !needle.contains('~') {
+        let h_low: Vec<char> = h_chars
+            .iter()
+            .map(|(_, c)| c.to_lowercase().next().unwrap_or(*c))
+            .collect();
+        if n_low.len() > h_low.len() {
+            return None;
+        }
+        for i in 0..=h_low.len() - n_low.len() {
+            if h_low[i..i + n_low.len()] == n_low[..] {
+                return Some(h_chars[i].0);
+            }
+        }
+        return None;
+    }
+    // 通配符匹配：从每个起始字符尝试
+    for i in 0..=h_chars.len() {
+        let bi = h_chars.get(i).map_or(hay.len(), |(b, _)| *b);
+        let suffix = &hay[bi..];
+        let pat_any = format!("{needle}*");
+        if super::functions::wildcard_match_ci(&pat_any, suffix) {
+            return Some(bi);
+        }
+    }
+    None
+}
+
+fn format_cn_digits(n: u64) -> String {
+    const DIG: [char; 10] = ['〇', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+    n.to_string()
+        .bytes()
+        .map(|b| DIG[(b - b'0') as usize])
+        .collect()
+}
+
+fn format_cn_number(n: u64, upper: bool) -> String {
+    let digs: [char; 10] = if upper {
+        ['零', '壹', '贰', '叁', '肆', '伍', '陆', '柒', '捌', '玖']
+    } else {
+        ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九']
+    };
+    let units: [&str; 4] = if upper {
+        ["", "拾", "佰", "仟"]
+    } else {
+        ["", "十", "百", "千"]
+    };
+    let bigs: [&str; 5] = ["", "万", "亿", "兆", "京"];
+    if n == 0 {
+        return digs[0].to_string();
+    }
+    let mut groups = Vec::new();
+    let mut v = n;
+    while v > 0 {
+        groups.push((v % 10000) as usize);
+        v /= 10000;
+    }
+    let mut out = String::new();
+    let mut need_zero = false;
+    for (gi, &g) in groups.iter().enumerate().rev() {
+        if g == 0 {
+            if !out.is_empty() {
+                need_zero = true;
+            }
+            continue;
+        }
+        if need_zero || (!out.is_empty() && g < 1000) {
+            out.push(digs[0]);
+        }
+        need_zero = false;
+        let ds = [g / 1000, (g / 100) % 10, (g / 10) % 10, g % 10];
+        let mut inner_zero = false;
+        for (pos, &d) in ds.iter().enumerate() {
+            let u = 3 - pos;
+            if d == 0 {
+                if !out.is_empty() {
+                    inner_zero = true;
+                }
+            } else {
+                if inner_zero {
+                    out.push(digs[0]);
+                    inner_zero = false;
+                }
+                if !upper && d == 1 && u == 1 && out.is_empty() {
+                    out.push_str(units[u]);
+                } else {
+                    out.push(digs[d]);
+                    out.push_str(units[u]);
+                }
+            }
+        }
+        out.push_str(bigs[gi.min(bigs.len() - 1)]);
+    }
+    out
+}
+
+struct OlsResult {
+    slopes: Vec<f64>,
+    intercept: f64,
+    se_slopes: Vec<f64>,
+    se_intercept: f64,
+    r2: f64,
+    sey: f64,
+    f_stat: f64,
+    df: f64,
+    ss_reg: f64,
+    ss_resid: f64,
+}
+
+fn extract_ols_x(
+    x_arg: Option<&Arg>,
+    yr: usize,
+    yc: usize,
+    horiz_y: bool,
+) -> Result<(Vec<Vec<f64>>, usize), ErrKind> {
+    let n = yr * yc;
+    let Some(a) = x_arg.filter(|a| !matches!(a, Arg::Val(FValue::Empty))) else {
+        let rows: Vec<Vec<f64>> = (1..=n).map(|i| vec![i as f64]).collect();
+        return Ok((rows, 1));
+    };
+    let (xr, xc, xd) = a.grid_slice();
+    if xr == yr && xc == yc {
+        let mut rows = Vec::with_capacity(n);
+        for v in xd.iter() {
+            rows.push(vec![v.to_number()?]);
+        }
+        return Ok((rows, 1));
+    }
+    if horiz_y {
+        if xc != yc {
+            return Err(ErrKind::Ref);
+        }
+        let k = xr;
+        let mut rows = Vec::with_capacity(xc);
+        for j in 0..xc {
+            let mut row = Vec::with_capacity(k);
+            for i in 0..k {
+                row.push(xd[i * xc + j].to_number()?);
+            }
+            rows.push(row);
+        }
+        Ok((rows, k))
+    } else {
+        if xr != yr {
+            return Err(ErrKind::Ref);
+        }
+        let k = xc;
+        let mut rows = Vec::with_capacity(xr);
+        for i in 0..xr {
+            let mut row = Vec::with_capacity(k);
+            for j in 0..k {
+                row.push(xd[i * xc + j].to_number()?);
+            }
+            rows.push(row);
+        }
+        Ok((rows, k))
+    }
+}
+
+fn ols_fit(ys: &[f64], xs_rows: &[Vec<f64>], k: usize, with_const: bool) -> Result<OlsResult, ErrKind> {
+    let n = ys.len();
+    if n == 0 || xs_rows.len() != n || k == 0 {
+        return Err(ErrKind::Value);
+    }
+    let p = k + usize::from(with_const);
+    // 构建正规方程 X^T X 和 X^T y
+    let mut xtx = vec![0.0f64; p * p];
+    let mut xty = vec![0.0f64; p];
+    for i in 0..n {
+        let row = &xs_rows[i];
+        for a in 0..p {
+            let xa = if a < k { row[a] } else { 1.0 };
+            xty[a] += xa * ys[i];
+            for b in a..p {
+                let xb = if b < k { row[b] } else { 1.0 };
+                xtx[a * p + b] += xa * xb;
+            }
+        }
+    }
+    for a in 0..p {
+        for b in 0..a {
+            xtx[a * p + b] = xtx[b * p + a];
+        }
+    }
+    // Gauss-Jordan 求 (X^T X)^-1，同时求解 beta = (X^T X)^-1 X^T y
+    let mut aug = vec![0.0f64; p * (2 * p)];
+    for i in 0..p {
+        for j in 0..p {
+            aug[i * 2 * p + j] = xtx[i * p + j];
+        }
+        aug[i * 2 * p + p + i] = 1.0;
+    }
+    for col in 0..p {
+        let mut piv = col;
+        let mut best = aug[col * 2 * p + col].abs();
+        for r in (col + 1)..p {
+            let v = aug[r * 2 * p + col].abs();
+            if v > best {
+                best = v;
+                piv = r;
+            }
+        }
+        if best < 1e-15 {
+            return Err(ErrKind::Num);
+        }
+        if piv != col {
+            for j in 0..(2 * p) {
+                aug.swap(col * 2 * p + j, piv * 2 * p + j);
+            }
+        }
+        let diag = aug[col * 2 * p + col];
+        for j in 0..(2 * p) {
+            aug[col * 2 * p + j] /= diag;
+        }
+        for r in 0..p {
+            if r == col {
+                continue;
+            }
+            let factor = aug[r * 2 * p + col];
+            if factor != 0.0 {
+                for j in 0..(2 * p) {
+                    aug[r * 2 * p + j] -= factor * aug[col * 2 * p + j];
+                }
+            }
+        }
+    }
+    let mut inv = vec![0.0f64; p * p];
+    let mut beta = vec![0.0f64; p];
+    for i in 0..p {
+        for j in 0..p {
+            inv[i * p + j] = aug[i * 2 * p + p + j];
+            beta[i] += inv[i * p + j] * xty[j];
+        }
+    }
+    let slopes = beta[..k].to_vec();
+    let intercept = if with_const { beta[k] } else { 0.0 };
+    let y_mean = ys.iter().sum::<f64>() / n as f64;
+    let mut ss_resid = 0.0f64;
+    let mut ss_tot = 0.0f64;
+    for i in 0..n {
+        let mut pred = intercept;
+        for j in 0..k {
+            pred += slopes[j] * xs_rows[i][j];
+        }
+        ss_resid += (ys[i] - pred).powi(2);
+        ss_tot += if with_const {
+            (ys[i] - y_mean).powi(2)
+        } else {
+            ys[i].powi(2)
+        };
+    }
+    let ss_reg = (ss_tot - ss_resid).max(0.0);
+    let r2 = if ss_tot > 0.0 {
+        (1.0 - ss_resid / ss_tot).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let df = n.saturating_sub(p) as f64;
+    let mse = if df > 0.0 { ss_resid / df } else { 0.0 };
+    let sey = mse.sqrt();
+    let se_slopes: Vec<f64> = (0..k)
+        .map(|j| (mse * inv[j * p + j].max(0.0)).sqrt())
+        .collect();
+    let se_intercept = if with_const {
+        (mse * inv[k * p + k].max(0.0)).sqrt()
+    } else {
+        0.0
+    };
+    let f_stat = if df > 0.0 && mse > 0.0 {
+        (ss_reg / k as f64) / mse
+    } else {
+        0.0
+    };
+    Ok(OlsResult {
+        slopes,
+        intercept,
+        se_slopes,
+        se_intercept,
+        r2,
+        sey,
+        f_stat,
+        df,
+        ss_reg,
+        ss_resid,
+    })
 }

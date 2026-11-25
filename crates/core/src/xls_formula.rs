@@ -428,6 +428,26 @@ impl Compiler<'_> {
                     out.extend_from_slice(&[0xFF, 0x00]);
                 }
             }
+            Node::DynRange(a, b) => {
+                self.emit(a, out)?;
+                self.emit(b, out)?;
+                out.push(0x11); // tRange (:)
+            }
+            Node::Intersect(a, b) => {
+                self.emit(a, out)?;
+                self.emit(b, out)?;
+                out.push(0x0F); // tIsect ( )
+            }
+            Node::Union(items) => {
+                if let Some((first, rest)) = items.split_first() {
+                    self.emit(first, out)?;
+                    for item in rest {
+                        self.emit(item, out)?;
+                        out.push(0x10); // tUnion (,)
+                    }
+                    out.push(0x15); // tParen
+                }
+            }
         }
         Ok(())
     }
@@ -682,7 +702,7 @@ fn err_code(e: crate::formula::ErrKind) -> u8 {
         Num => 36,
         Na => 42,
         Circular => 15,
-        Spill => 15,
+        Spill | Calc | Field => 15,
     }
 }
 
