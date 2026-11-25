@@ -517,6 +517,8 @@ pub fn load_diag_with_control(
         decrypted: None,
         encryption: None,
         source_encryption: None,
+        protection: crate::protection::parse_workbook_tag(&workbook_xml),
+        protection_dirty: false,
         dirty: false,
         styles: crate::style::StyleTable::new(),
         chart_edits: Vec::new(),
@@ -611,7 +613,7 @@ pub fn load_diag_with_control(
             }
         }
     }
-    let states = crate::patch::sheet_states_xml(&workbook_xml);
+    let states = crate::patch::sheet_visibility_xml(&workbook_xml);
     drop(workbook_xml);
     let mut clean_fast_meta_outer: std::collections::HashMap<
         String,
@@ -890,6 +892,16 @@ pub fn load_diag_with_control(
                 }
                 sheet.tab_color = lay.tab_color;
                 sheet.protection = lay.protection.clone();
+                sheet.protected_ranges = lay.protected_ranges.clone();
+                if let Some(z) = lay.zoom_scale {
+                    sheet.zoom_scale = z;
+                }
+                if let Some(g) = lay.show_gridlines {
+                    sheet.show_gridlines = g;
+                }
+                if let Some(h) = lay.show_headings {
+                    sheet.show_headings = h;
+                }
                 sheet.cf.blocks = lay.cf.clone();
                 sheet.cf.dxfs = lay.dxfs.clone();
                 sheet.cf.unknown_ext = lay.cf_ext;
@@ -1034,8 +1046,9 @@ pub fn load_diag_with_control(
         // 工作表可见性（workbook.xml 的 state="hidden"）
         let delta_styles = delta::StyleMap::new(&style_ids, &wb.styles);
         for sheet in wb.sheets.iter_mut() {
-            if let Some(&hide) = states.get(&sheet.name) {
-                sheet.hidden = hide;
+            if let Some(&vis) = states.get(&sheet.name) {
+                sheet.hidden = vis != crate::model::SheetVisibility::Visible;
+                sheet.very_hidden = vis == crate::model::SheetVisibility::VeryHidden;
             }
             sheet.saved_cells = Some(sheet.cell_version().clone());
             if let (Some(zip), Some(part)) = (shared_zip.as_mut(), sheet.source_part.as_deref()) {
@@ -1502,6 +1515,8 @@ fn collect_trusted_signatures(wb: &Workbook) -> std::collections::HashMap<String
                 && !sheet.charts_dirty
                 && !sheet.tables_dirty
                 && !sheet.protect_dirty
+                && !sheet.protected_ranges_dirty
+                && !sheet.view_dirty
                 && !sheet.tab_color_dirty
                 && !sheet.outline_pr_dirty
                 && !sheet.scenarios_dirty
@@ -2663,6 +2678,8 @@ fn try_load_ooxml_from_memory(
         decrypted: None,
         encryption: None,
         source_encryption: None,
+        protection: crate::protection::parse_workbook_tag(&workbook_xml),
+        protection_dirty: false,
         dirty: false,
         styles: crate::style::StyleTable::new(),
         chart_edits: Vec::new(),
@@ -2677,7 +2694,7 @@ fn try_load_ooxml_from_memory(
             }
         }
     }
-    let states = crate::patch::sheet_states_xml(&workbook_xml);
+    let states = crate::patch::sheet_visibility_xml(&workbook_xml);
     drop(workbook_xml);
 
     let style_lookup = sheets::StyleLookup::new(
@@ -2810,6 +2827,16 @@ fn try_load_ooxml_from_memory(
                 }
                 sheet.tab_color = lay.tab_color;
                 sheet.protection = lay.protection.clone();
+                sheet.protected_ranges = lay.protected_ranges.clone();
+                if let Some(z) = lay.zoom_scale {
+                    sheet.zoom_scale = z;
+                }
+                if let Some(g) = lay.show_gridlines {
+                    sheet.show_gridlines = g;
+                }
+                if let Some(h) = lay.show_headings {
+                    sheet.show_headings = h;
+                }
                 sheet.cf.blocks = lay.cf.clone();
                 sheet.cf.dxfs = lay.dxfs.clone();
                 sheet.cf.unknown_ext = lay.cf_ext;
@@ -2874,8 +2901,9 @@ fn try_load_ooxml_from_memory(
 
     let delta_styles = delta::StyleMap::new(&style_ids, &wb.styles);
     for sheet in wb.sheets.iter_mut() {
-        if let Some(&hide) = states.get(&sheet.name) {
-            sheet.hidden = hide;
+        if let Some(&vis) = states.get(&sheet.name) {
+            sheet.hidden = vis != crate::model::SheetVisibility::Visible;
+            sheet.very_hidden = vis == crate::model::SheetVisibility::VeryHidden;
         }
         sheet.saved_cells = Some(sheet.cell_version().clone());
         if let Some(part) = sheet.source_part.as_deref() {
@@ -3226,6 +3254,8 @@ fresh_sheet_flags!(s, streamed;
     tab_color_dirty = s.tab_color.is_some(),
     tables_dirty = !s.tables.is_empty(),
     protect_dirty = s.protection.is_some(),
+    protected_ranges_dirty = !s.protected_ranges.is_empty(),
+    view_dirty = s.zoom_scale != 100 || !s.show_gridlines || !s.show_headings,
     rich_dirty = !streamed && !s.rich.is_empty(),
     sparklines_dirty = !s.sparklines.is_empty(),
     textboxes_dirty = !s.textboxes.is_empty(),
@@ -3770,6 +3800,21 @@ fn save_plain_at(
     crate::patch::begin_stage_for(path);
 
     must_save!("sheet-states", crate::patch::apply_sheet_states(path, wb));
+    must_save!("sheet-views", crate::patch::apply_sheet_views(path, wb));
+    if wb.protection_dirty || (fresh_base && wb.protection.is_some()) {
+        let mut wb_prot_tmp;
+        let wb_ref = if wb.protection_dirty {
+            wb
+        } else {
+            wb_prot_tmp = wb.clone();
+            wb_prot_tmp.protection_dirty = true;
+            &wb_prot_tmp
+        };
+        must_save!(
+            "workbook-protection",
+            crate::patch::apply_workbook_protection(path, wb_ref)
+        );
+    }
     // 确保 calcMode / 迭代计算设置始终与内存模型一致
     if let Some(wb_bytes) = crate::fixups::read_part(path, "xl/workbook.xml") {
         if let Ok(wb_xml) = String::from_utf8(wb_bytes) {

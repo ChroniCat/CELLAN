@@ -1323,6 +1323,30 @@ impl Sheet {
             self.ignored_errors = out.into();
             self.ignored_errors_dirty |= changed;
         }
+        if !self.protected_ranges.is_empty() {
+            let mut changed = false;
+            for pr in &mut self.protected_ranges {
+                let mut next_sq = Vec::with_capacity(pr.sqref.len());
+                for &(r1, c1, r2, c2) in &pr.sqref {
+                    let mapped = if rows {
+                        shift.map_range(r1, r2).map(|(nr1, nr2)| (nr1, c1, nr2, c2))
+                    } else {
+                        shift.map_range(c1, c2).map(|(nc1, nc2)| (r1, nc1, r2, nc2))
+                    };
+                    if let Some(m) = mapped {
+                        if m != (r1, c1, r2, c2) {
+                            changed = true;
+                        }
+                        next_sq.push(m);
+                    } else {
+                        changed = true;
+                    }
+                }
+                pr.sqref = next_sq;
+            }
+            self.protected_ranges.retain(|pr| !pr.sqref.is_empty());
+            self.protected_ranges_dirty |= changed;
+        }
     }
 
     fn shift_axis_metadata(&mut self, shift: &MappedShift) {

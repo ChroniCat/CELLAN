@@ -152,10 +152,10 @@ impl PageBreaks {
 
     /// 计算当前帧用于字体光栅化的有效缩放比 `(raster_zoom, is_debouncing)`。
     pub(crate) fn effective_font_zoom(&mut self, zoom: f32) -> (f32, bool) {
-        let z = zoom.clamp(0.5, 2.5);
+        let z = zoom.clamp(0.1, 4.0);
         if let Some(until) = self.wheel_zoom_until {
             if std::time::Instant::now() < until {
-                let quantized = ((z * 20.0).round() / 20.0).clamp(0.5, 2.5);
+                let quantized = ((z * 20.0).round() / 20.0).clamp(0.1, 4.0);
                 return (quantized, (quantized - z).abs() > 0.0005);
             }
             self.wheel_zoom_until = None;
@@ -511,6 +511,9 @@ pub(crate) struct ViewportCacheKey {
     pub cell_epoch: CellCacheEpoch,
     pub scroll_x_bits: u32,
     pub scroll_y_bits: u32,
+    pub is_split: bool,
+    pub split_scroll_x_bits: u32,
+    pub split_scroll_y_bits: u32,
     pub origin_x_bits: u32,
     pub origin_y_bits: u32,
     pub avail_x_bits: u32,

@@ -56,6 +56,14 @@ pub struct SheetLayout {
     pub tab_color: Option<[u8; 3]>,
     /// 工作表保护
     pub protection: Option<crate::protection::SheetProtection>,
+    /// 允许编辑的区域（`<protectedRanges>`）
+    pub protected_ranges: Vec<crate::protection::ProtectedRange>,
+    /// 每表视图缩放百分比（`<sheetView zoomScale="..."/>`）
+    pub zoom_scale: Option<u16>,
+    /// 是否显示网格线（`<sheetView showGridLines="0/1"/>`）
+    pub show_gridlines: Option<bool>,
+    /// 是否显示行列标题（`<sheetView showRowColHeaders="0/1"/>`）
+    pub show_headings: Option<bool>,
 }
 
 /// 返回 表名 → 版式
@@ -246,6 +254,35 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                     }
                     tag.push_str("/>");
                     out.protection = crate::protection::parse_tag(&tag);
+                } else if name == "protectedRange" || name.ends_with(":protectedRange") {
+                    let mut tag = String::from("<protectedRange");
+                    for a in e.attributes().flatten() {
+                        tag.push(' ');
+                        tag.push_str(a.key.as_ref());
+                        tag.push_str("=\"");
+                        tag.push_str(&crate::model::xml_escape(&crate::model::xml_unescape(&a.value.to_string())));
+                        tag.push('"');
+                    }
+                    tag.push_str("/>");
+                    if let Some(pr) = crate::protection::parse_protected_range_tag(&tag) {
+                        out.protected_ranges.push(pr);
+                    }
+                } else if name == "sheetView" || name.ends_with(":sheetView") {
+                    if out.zoom_scale.is_none() && out.show_gridlines.is_none() && out.show_headings.is_none() {
+                        for a in e.attributes().flatten() {
+                            let k = a.key.as_ref();
+                            let v = crate::model::xml_unescape(&a.value.to_string());
+                            if k == "zoomScale" {
+                                if let Ok(z) = v.trim().parse::<u16>() {
+                                    out.zoom_scale = Some(z.clamp(10, 400));
+                                }
+                            } else if k == "showGridLines" {
+                                out.show_gridlines = Some(v != "0" && !v.eq_ignore_ascii_case("false"));
+                            } else if k == "showRowColHeaders" {
+                                out.show_headings = Some(v != "0" && !v.eq_ignore_ascii_case("false"));
+                            }
+                        }
+                    }
                 } else if name.ends_with("tabColor") {
                     for a in e.attributes().flatten() {
                         if a.key.as_ref().ends_with("rgb") {
@@ -708,14 +745,14 @@ fn parse_merges(xml: &str) -> Vec<(u32, u32, u32, u32)> {
 }
 
 /// "A1:B2" → (r1, c1, r2, c2)，0-based
-fn parse_range(s: &str) -> Option<(u32, u32, u32, u32)> {
+pub(crate) fn parse_range(s: &str) -> Option<(u32, u32, u32, u32)> {
     let (a, b) = s.split_once(':')?;
     let (r1, c1) = parse_cell(a)?;
     let (r2, c2) = parse_cell(b)?;
     Some((r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)))
 }
 
-fn parse_cell(s: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_cell(s: &str) -> Option<(u32, u32)> {
     let cleaned: String = s.trim().chars().filter(|c| *c != '$').collect();
     let s = cleaned.as_str();
     let mut col = 0u32;

@@ -1586,6 +1586,13 @@ impl NumericSortAction {
 
 enum SheetTabChange {
     Append { removed: Option<Box<Sheet>> },
+    Insert { removed: Option<Box<Sheet>> },
+    Delete {
+        sheet: Option<Box<Sheet>>,
+        local_names: Vec<(String, Option<usize>, String)>,
+        references: crate::sheet_ops::RenameReferences,
+    },
+    Move { from: usize, to: usize },
     Rename { before: String, after: String, references: crate::sheet_ops::RenameReferences },
 }
 
@@ -1616,10 +1623,51 @@ impl SheetTabAction {
                     || wb.pivots_pending.iter().any(|(sheet, ..)| *sheet == self.index)
                     || wb.pivots_pending2.iter().any(|(sheet, ..)| *sheet == self.index)
                 { return None; }
-                // Pop only the appended sheet. A normal delete rewrites formulas in other
-                // sheets, including unresolved references that existed before this append.
                 *removed = wb.sheets.pop().map(Box::new);
                 wb.calc_pending_sheets.remove(&self.index);
+            }
+            SheetTabChange::Insert { removed } if redo => {
+                if self.index > wb.sheets.len() { return None; }
+                let sh = *removed.take()?;
+                if !crate::sheet_ops::insert_sheet(wb, self.index, sh) {
+                    return None;
+                }
+                focus = (self.index, 0, 0);
+            }
+            SheetTabChange::Insert { removed } => {
+                if wb.sheets.len() <= 1 || self.index >= wb.sheets.len()
+                    || wb.sheets[self.index].identity != self.identity
+                { return None; }
+                let rec = crate::sheet_ops::delete_with_history(wb, self.index)?;
+                *removed = Some(Box::new(rec.sheet));
+                wb.calc_pending_sheets.remove(&self.index);
+            }
+            SheetTabChange::Delete { sheet, local_names, references } if redo => {
+                if wb.sheets.len() <= 1 || self.index >= wb.sheets.len()
+                    || wb.sheets[self.index].identity != self.identity
+                { return None; }
+                let rec = crate::sheet_ops::delete_with_history(wb, self.index)?;
+                *sheet = Some(Box::new(rec.sheet));
+                *local_names = rec.local_names;
+                *references = rec.references;
+                focus = (self.index.min(wb.sheets.len() - 1), 0, 0);
+            }
+            SheetTabChange::Delete { sheet, local_names, references } => {
+                let sh = *sheet.take()?;
+                if !crate::sheet_ops::restore_deleted_sheet(wb, self.index, sh, local_names, references) {
+                    return None;
+                }
+                focus = (self.index, self.previous_focus.1, self.previous_focus.2);
+            }
+            SheetTabChange::Move { from, to } => {
+                let (src, dst) = if redo { (*from, *to) } else { (*to, *from) };
+                if src >= wb.sheets.len() || dst >= wb.sheets.len()
+                    || wb.sheets[src].identity != self.identity
+                { return None; }
+                if !crate::sheet_ops::reorder_sheet(wb, src, dst) {
+                    return None;
+                }
+                focus = (dst, self.previous_focus.1, self.previous_focus.2);
             }
         }
         wb.dirty = true;
@@ -2404,6 +2452,49 @@ impl UndoStack {
             SheetTabChange::Append { removed: None });
     }
 
+    pub fn record_inserted_sheet(&mut self, wb: &Workbook, index: usize, label: &str, previous_focus: (usize, u32, u32)) {
+        if let Some(sh) = wb.sheets.get(index) {
+            self.push_sheet_tab(index, sh.identity, previous_focus, label,
+                SheetTabChange::Insert { removed: None });
+        }
+    }
+
+    pub fn delete_sheet(&mut self, wb: &mut Workbook, index: usize, previous_focus: (usize, u32, u32)) -> bool {
+        let Some(rec) = crate::sheet_ops::delete_with_history(wb, index) else {
+            return false;
+        };
+        let identity = rec.sheet.identity;
+        self.push_sheet_tab(
+            index,
+            identity,
+            previous_focus,
+            "删除工作表",
+            SheetTabChange::Delete {
+                sheet: Some(Box::new(rec.sheet)),
+                local_names: rec.local_names,
+                references: rec.references,
+            },
+        );
+        true
+    }
+
+    pub fn move_sheet(&mut self, wb: &mut Workbook, from: usize, to: usize, previous_focus: (usize, u32, u32)) -> bool {
+        let Some(identity) = wb.sheets.get(from).map(|s| s.identity) else {
+            return false;
+        };
+        if !crate::sheet_ops::reorder_sheet(wb, from, to) {
+            return false;
+        }
+        self.push_sheet_tab(
+            to,
+            identity,
+            previous_focus,
+            "移动工作表",
+            SheetTabChange::Move { from, to },
+        );
+        true
+    }
+
     pub fn rename_sheet(&mut self, wb: &mut Workbook, index: usize, name: &str, focus: (usize, u32, u32)) -> bool {
         let Some(sheet) = wb.sheets.get(index) else { return false };
         let before = sheet.name.clone();
@@ -2418,8 +2509,12 @@ impl UndoStack {
                       label: &str, change: SheetTabChange) {
         let bytes = match &change {
             SheetTabChange::Rename { before, after, references } => before.len() + after.len() + references.payload_bytes(),
-            SheetTabChange::Append { .. } => 0,
+            SheetTabChange::Delete { sheet, references, .. } => {
+                sheet.as_ref().map_or(0, |s| s.allocated_bytes() + 1024) + references.payload_bytes()
+            }
+            SheetTabChange::Append { .. } | SheetTabChange::Insert { .. } | SheetTabChange::Move { .. } => 0,
         };
+        self.undone.clear();
         self.done.push(Entry::SheetTab(next_entry(bytes), SheetTabAction {
             label: label.into(), index, identity, previous_focus, change, by_site: self.site,
         }));

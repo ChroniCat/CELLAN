@@ -24,7 +24,7 @@ fn sort_apps(env: &crate::test_env::TestEnv) -> (SheetApp,SheetApp) {
     fmt.bold = true;
     let bold = host.wb.styles.intern(fmt);
     host.wb.sheet_mut(0).set_style(0,0,bold);
-    net.seed_snapshot(&peer,&host.wb,Cursor { site:1, name:"H".into(), color:1, sheet:0, row:0,col:0 });
+    net.seed_snapshot(&peer,&host.wb,Cursor { site:1, name:"H".into(), color:1, sheet:0, row:0, col:0, end_row: None, end_col: None });
     host.peer = Some(peer);
     host.net = Some(net);
     host.undo.set_site(1);

@@ -955,7 +955,7 @@
             <box boxStyle="horizontal">
               <button id="ZoomIn" imageMso="ZoomIn" screentip="放大" onAction="ZoomIn"/>
               <labelControl id="ZoomPercent" fontSize="11"/>
-              <slider id="ZoomSlider" sizeString="96" min="0.5" max="2.5"/>
+              <slider id="ZoomSlider" sizeString="96" min="0.1" max="4.0"/>
             </box>
           </box>
         </group>

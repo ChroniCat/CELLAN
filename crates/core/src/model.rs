@@ -954,6 +954,10 @@ pub struct Sheet {
     pub protection: Option<crate::protection::SheetProtection>,
     /// 保护状态被改过
     pub protect_dirty: bool,
+    /// 允许编辑的区域（OOXML `<protectedRanges>`）
+    pub protected_ranges: Vec<crate::protection::ProtectedRange>,
+    /// 允许编辑区域被改过
+    pub protected_ranges_dirty: bool,
     /// 单元格富文本（有记录时优先于纯文本绘制）
     pub rich: CellMetadata<(u32, u32), Vec<crate::richtext::RichRun>>,
     /// 富文本被改过
@@ -971,7 +975,26 @@ pub struct Sheet {
     pub textboxes_dirty: bool,
     /// 工作表被隐藏（workbook.xml 的 `state="hidden"`）
     pub hidden: bool,
+    /// 工作表深度隐藏（workbook.xml 的 `state="veryHidden"`；普通取消隐藏不可见）
+    pub very_hidden: bool,
     pub hidden_dirty: bool,
+    /// 每表视图缩放百分比（10..=400，默认 100；持久化到 `<sheetView zoomScale="..."/>`）
+    pub zoom_scale: u16,
+    /// 是否显示网格线（默认 true；持久化到 `<sheetView showGridLines="..."/>`）
+    pub show_gridlines: bool,
+    /// 是否显示行列标题（默认 true；持久化到 `<sheetView showRowColHeaders="..."/>`）
+    pub show_headings: bool,
+    /// 视图设置（缩放/网格线/标题）被改过
+    pub view_dirty: bool,
+}
+
+/// 工作表可见性状态（对齐 OOXML `<sheet state="..."/>`）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SheetVisibility {
+    #[default]
+    Visible,
+    Hidden,
+    VeryHidden,
 }
 
 impl Sheet {
@@ -1042,6 +1065,8 @@ impl Sheet {
             tables_dirty: false,
             protection: None,
             protect_dirty: false,
+            protected_ranges: Vec::new(),
+            protected_ranges_dirty: false,
             rich: Default::default(),
             rich_dirty: false,
             hyperlinks: Default::default(),
@@ -1051,8 +1076,45 @@ impl Sheet {
             textboxes: Vec::new(),
             textboxes_dirty: false,
             hidden: false,
+            very_hidden: false,
             hidden_dirty: false,
+            zoom_scale: 100,
+            show_gridlines: true,
+            show_headings: true,
+            view_dirty: false,
         }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.hidden || self.very_hidden
+    }
+
+    pub fn visibility(&self) -> SheetVisibility {
+        if self.very_hidden {
+            SheetVisibility::VeryHidden
+        } else if self.hidden {
+            SheetVisibility::Hidden
+        } else {
+            SheetVisibility::Visible
+        }
+    }
+
+    pub fn set_visibility(&mut self, v: SheetVisibility) {
+        let (h, vh) = match v {
+            SheetVisibility::Visible => (false, false),
+            SheetVisibility::Hidden => (true, false),
+            SheetVisibility::VeryHidden => (true, true),
+        };
+        if self.hidden != h || self.very_hidden != vh {
+            self.hidden = h;
+            self.very_hidden = vh;
+            self.hidden_dirty = true;
+        }
+    }
+
+    /// 查找覆盖 `(r, c)` 的「允许编辑区域」条目
+    pub fn cell_in_protected_range(&self, r: u32, c: u32) -> Option<&crate::protection::ProtectedRange> {
+        self.protected_ranges.iter().find(|pr| pr.contains(r, c))
     }
 
     /// A copy inserted as a new sheet must not inherit the original identity.
@@ -1302,8 +1364,9 @@ impl Sheet {
             || self.notes_dirty || self.freeze_dirty || self.layout_dirty || self.scenarios_dirty
             || self.ignored_errors_dirty || self.outline_pr_dirty || self.filter_dirty || self.page_dirty
             || self.charts_dirty || self.tab_color_dirty || self.tables_dirty || self.protect_dirty
+            || self.protected_ranges_dirty
             || self.rich_dirty || self.hyperlinks_dirty || self.sparklines_dirty || self.textboxes_dirty
-            || self.hidden_dirty
+            || self.hidden_dirty || self.view_dirty
     }
 
     pub fn set_formula_cache(&mut self, r: u32, c: u32, value: Value) {
@@ -1601,7 +1664,9 @@ impl Sheet {
         self.tab_color_dirty = true;
         self.tables_dirty = true;
         self.protect_dirty = true;
+        self.protected_ranges_dirty = true;
         self.hidden_dirty = true;
+        self.view_dirty = true;
     }
 
     #[inline]
@@ -2042,6 +2107,10 @@ pub struct Workbook {
     pub encryption: Option<crate::crypto::EncryptionSettings>,
     /// Credentials for the package at `path`, independent of the next save's password.
     pub source_encryption: Option<crate::crypto::EncryptionSettings>,
+    /// 工作簿结构/窗口保护（`<workbookProtection .../>`）
+    pub protection: Option<crate::protection::WorkbookProtection>,
+    /// 工作簿保护被改过
+    pub protection_dirty: bool,
     pub dirty: bool,
     /// 用户在应用里改过图表的部件名（保存时不要按基准还原这些部件）
     pub chart_edits: Vec<String>,
@@ -2069,6 +2138,8 @@ impl Workbook {
             decrypted: None,
             encryption: None,
             source_encryption: None,
+            protection: None,
+            protection_dirty: false,
             date_system: DateSystem::D1900,
             calc_manual: false,
             calc_iterate: false,
@@ -2206,6 +2277,22 @@ mod tests {
         assert!(!sh.spilled.contains(&CellRef::new(5, 1)));
         assert!(snap.spilled.contains(&CellRef::new(5, 1)));
     }
+}
+
+/// XML 属性/文本转义
+pub fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// XML 属性/文本里的实体还原（够用即可）

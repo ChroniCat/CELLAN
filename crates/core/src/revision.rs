@@ -256,6 +256,122 @@ pub fn load(file: &Path, limit: usize) -> Vec<Entry> {
     out
 }
 
+/// 持久化审计日志路径（存在 `%LOCALAPPDATA%\CELLAN\audit\`，绝不污染原工作簿目录）
+pub fn audit_log_path(doc: &Path) -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("CELLAN")
+        .join("audit");
+    let mut h = Sha256::new();
+    h.update(doc.to_string_lossy().to_lowercase().as_bytes());
+    let digest = h.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    base.join(format!("{hex}.jsonl"))
+}
+
+/// 追加一条结构化审计记录到持久化日志（超过上限自动轮转）
+pub fn append_audit(doc: &Path, entry: &Entry) -> std::io::Result<()> {
+    let p = audit_log_path(doc);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Ok(meta) = std::fs::metadata(&p)
+        && meta.len() >= ROTATE_BYTES
+    {
+        let old = p.with_extension("jsonl.old");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&p, &old);
+    }
+    let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p)?;
+    writeln!(f, "{line}")
+}
+
+/// 读取最近 N 条持久化审计记录
+pub fn load_audit(doc: &Path, limit: usize) -> Vec<Entry> {
+    let p = audit_log_path(doc);
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Entry> = text
+        .lines()
+        .rev()
+        .take(limit.max(1) * 4)
+        .filter_map(|l| serde_json::from_str::<Entry>(l).ok())
+        .collect();
+    out.reverse();
+    if out.len() > limit {
+        out.drain(0..out.len() - limit);
+    }
+    out
+}
+
+/// 按操作者、工作表、关键词过滤审计记录
+pub fn filter_entries<'a>(
+    entries: &'a [Entry],
+    who: &str,
+    sheet: &str,
+    keyword: &str,
+) -> Vec<&'a Entry> {
+    let who_q = who.trim().to_lowercase();
+    let sheet_q = sheet.trim().to_lowercase();
+    let kw_q = keyword.trim().to_lowercase();
+    entries
+        .iter()
+        .filter(|e| {
+            if !who_q.is_empty() && !e.who.to_lowercase().contains(&who_q) {
+                return false;
+            }
+            if !sheet_q.is_empty() && !e.sheet.to_lowercase().contains(&sheet_q) {
+                return false;
+            }
+            if !kw_q.is_empty() {
+                let hit = e.label.to_lowercase().contains(&kw_q)
+                    || e.note.to_lowercase().contains(&kw_q)
+                    || e.range().to_lowercase().contains(&kw_q)
+                    || e.delta_text().to_lowercase().contains(&kw_q);
+                if !hit {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// 将修订审计记录导出为标准 UTF-8 CSV（带 BOM 便于 Excel 直接打开）
+pub fn export_csv(entries: &[Entry]) -> String {
+    fn esc(s: &str) -> String {
+        if s.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    }
+    let mut out = String::from("\u{FEFF}时间戳(ms),操作者,站点,来源,工作表,操作,区域,详情\r\n");
+    for e in entries {
+        let src = if e.remote { "远端协同" } else { "本机" };
+        let detail = if !e.note.is_empty() {
+            e.note.clone()
+        } else {
+            e.delta_text()
+        };
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\r\n",
+            e.ts,
+            esc(&e.who),
+            e.site,
+            src,
+            esc(&e.sheet),
+            esc(&e.label),
+            esc(&e.range()),
+            esc(&detail),
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

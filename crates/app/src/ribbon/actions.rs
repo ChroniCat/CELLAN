@@ -1302,8 +1302,20 @@ impl SheetApp {
             "AutoShare" => self.auto_share = !self.auto_share,
 
             // ---------------------------------------------------- 视图
-            "ShowGridlines" => self.show_gridlines = !self.show_gridlines,
-            "ShowHeadings" => self.show_headings = !self.show_headings,
+            "ShowGridlines" => {
+                self.show_gridlines = !self.show_gridlines;
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.show_gridlines = self.show_gridlines;
+                sh.view_dirty = true;
+                self.wb.dirty = true;
+            }
+            "ShowHeadings" => {
+                self.show_headings = !self.show_headings;
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.show_headings = self.show_headings;
+                sh.view_dirty = true;
+                self.wb.dirty = true;
+            }
             "ShowFormulaBar" => self.show_formula_bar = !self.show_formula_bar,
             "TextSpill" => self.text_spill = !self.text_spill,
             "Zoom100" => self.set_zoom(1.0),
@@ -1444,14 +1456,25 @@ impl SheetApp {
             }
             "ZoomToSelection" => {
                 let (r1, c1, r2, c2) = self.sel_rect();
-                let sh = self.wb.sheet(self.sheet_idx);
-                let w: f32 = sh.cols.pos(c2.saturating_add(1)) - sh.cols.pos(c1);
-                let h: f32 = sh.rows.pos(r2.saturating_add(1)) - sh.rows.pos(r1);
+                let (cur_cols, cur_rows) = self.view_axes();
+                let cur_z = self.zoom.clamp(0.1, 4.0);
+                // 还原为 100% 真实可见尺寸（已自动跳过隐藏行列）
+                let w = ((cur_cols.pos(c2.saturating_add(1)) - cur_cols.pos(c1)) / cur_z).max(0.0);
+                let h = ((cur_rows.pos(r2.saturating_add(1)) - cur_rows.pos(r1)) / cur_z).max(0.0);
+                let x0_unscaled = (cur_cols.pos(c1) / cur_z).max(0.0);
+                let y0_unscaled = (cur_rows.pos(r1) / cur_z).max(0.0);
                 let view = self.last_view;
-                if w > 1.0 && h > 1.0 && view.x > 10.0 && view.y > 10.0 {
-                    let z = ((view.x - 40.0) / w).min((view.y - 40.0) / h).clamp(0.5, 2.5);
+                if w > 1.0 && h > 1.0 && view.x > 60.0 && view.y > 40.0 {
+                    let z = (((view.x - 52.0) / w).min((view.y - 32.0) / h)).clamp(0.1, 4.0);
                     self.set_zoom(z);
-                    self.scroll = egui::Vec2::new(c1 as f32 * 8.0, r1 as f32 * 4.0);
+                    let (fy, fx) = self.wb.sheet(self.sheet_idx).freeze.unwrap_or((0, 0));
+                    let (new_cols, new_rows) = self.view_axes();
+                    let fw = new_cols.pos(fx.min(16_383));
+                    let fh = new_rows.pos(fy.min(1_048_575));
+                    self.scroll = egui::Vec2::new(
+                        (x0_unscaled * z - fw).max(0.0),
+                        (y0_unscaled * z - fh).max(0.0),
+                    );
                     self.status = format!("缩放到选定区域：{:.0}%", z * 100.0);
                 }
             }
