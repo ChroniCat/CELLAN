@@ -150,6 +150,7 @@ fn main() {
         column_ids: Vec::new(),
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     wb.sheets[0].tables_dirty = true;
     }

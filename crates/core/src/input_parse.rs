@@ -75,11 +75,6 @@ pub fn parse_cell_input_with_year(
         }
     }
 
-    // 1.5) 错误字面量（#N/A、#DIV/0!、#VALUE!、#REF!、#NAME?、#NUM!、#NULL!、#SPILL!、#CALC!、#FIELD!）
-    if let Some(err) = crate::formula::ErrKind::from_text(t) {
-        return ParsedInput::plain(Value::Error(err));
-    }
-
     // 2) 纯数字（排除 inf / nan 等 Rust f64 特殊字面量）
     if let Some(n) = parse_strict_plain_f64(t) {
         if is_percent_format(existing_format) {

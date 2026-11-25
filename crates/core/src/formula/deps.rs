@@ -1522,10 +1522,64 @@ impl Walker<'_> {
                     });
                 }
             }
-            Node::DynRange(a, b) | Node::Intersect(a, b) => {
+            Node::DynRange(a, b) => {
                 self.result.volatile_ref = true;
                 self.walk(a, si, dr, dc);
                 self.walk(b, si, dr, dc);
+            }
+            Node::Intersect(a, b) => {
+                let static_rect = |n: &Node| -> Option<Rect> {
+                    match n {
+                        Node::Ref(re) if re.book.is_none() && re.sheet2.is_none() => {
+                            let r = resolve_row(re, dr).max(0);
+                            let c = resolve_col(re, dc).max(0);
+                            let sheet = sheet_index(wb, re.sheet.as_deref(), si);
+                            Some(Rect { sheet, r1: r, c1: c, r2: r, c2: c })
+                        }
+                        Node::Range(ra, rb)
+                            if ra.book.is_none()
+                                && rb.book.is_none()
+                                && ra.sheet2.is_none()
+                                && rb.sheet2.is_none() =>
+                        {
+                            let ar = resolve_row(ra, dr);
+                            let br = resolve_row(rb, dr);
+                            let ac = resolve_col(ra, dc);
+                            let bc = resolve_col(rb, dc);
+                            let sheet =
+                                sheet_index(wb, ra.sheet.as_deref().or(rb.sheet.as_deref()), si);
+                            Some(Rect {
+                                sheet,
+                                r1: ar.min(br).max(0),
+                                c1: ac.min(bc).max(0),
+                                r2: ar.max(br).max(0),
+                                c2: ac.max(bc).max(0),
+                            })
+                        }
+                        _ => None,
+                    }
+                };
+                if let (Some(ra), Some(rb)) = (static_rect(a), static_rect(b)) {
+                    if ra.sheet == rb.sheet {
+                        let r1 = ra.r1.max(rb.r1);
+                        let c1 = ra.c1.max(rb.c1);
+                        let r2 = ra.r2.min(rb.r2);
+                        let c2 = ra.c2.min(rb.c2);
+                        if r1 <= r2 && c1 <= c2 {
+                            self.result.rects.push(Rect {
+                                sheet: ra.sheet,
+                                r1,
+                                c1,
+                                r2,
+                                c2,
+                            });
+                        }
+                    }
+                } else {
+                    self.result.volatile_ref = true;
+                    self.walk(a, si, dr, dc);
+                    self.walk(b, si, dr, dc);
+                }
             }
             Node::Union(items) => {
                 for item in items {

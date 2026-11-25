@@ -113,27 +113,30 @@ fn input_parse_supports_chinese_finance_dates_times_fractions_parens_and_errors(
     assert!((match f3.value { Value::Number(v) => v, _ => panic!() } + 2.1875).abs() < 1e-12);
     assert_eq!(f3.auto_format.as_deref(), Some("# ??/??"));
 
-    // 错误字面量
-    for (raw, want) in [
-        ("#N/A", sheetcore::formula::ErrKind::Na),
-        ("#n/a", sheetcore::formula::ErrKind::Na),
-        ("#DIV/0!", sheetcore::formula::ErrKind::Div0),
-        ("#VALUE!", sheetcore::formula::ErrKind::Value),
-        ("#REF!", sheetcore::formula::ErrKind::Ref),
-        ("#NAME?", sheetcore::formula::ErrKind::Name),
-        ("#NUM!", sheetcore::formula::ErrKind::Num),
-        ("#NULL!", sheetcore::formula::ErrKind::Null),
-        ("#SPILL!", sheetcore::formula::ErrKind::Spill),
-        ("#CALC!", sheetcore::formula::ErrKind::Calc),
-    ] {
-        let p = parse_cell_input(raw, "", DateSystem::D1900);
-        assert_eq!(p.value, Value::Error(want), "raw={raw}");
-    }
-    // 文本格式 `@` 保持原样不转错误
+    // C01 契约：直接手打的 `#DIV/0!` / `#N/A` 保持纯文本（不误转错误），公式 `=#...` 才产出类型化错误
+    assert_eq!(
+        parse_cell_input("#DIV/0!", "", DateSystem::D1900).value,
+        Value::Text("#DIV/0!".into())
+    );
     assert_eq!(
         parse_cell_input("#N/A", "@", DateSystem::D1900).value,
         Value::Text("#N/A".into())
     );
+    let wb_err = sheetcore::Workbook::new_blank();
+    for (f, want) in [
+        ("=#N/A", sheetcore::formula::ErrKind::Na),
+        ("=#DIV/0!", sheetcore::formula::ErrKind::Div0),
+        ("=#VALUE!", sheetcore::formula::ErrKind::Value),
+        ("=#REF!", sheetcore::formula::ErrKind::Ref),
+        ("=#NAME?", sheetcore::formula::ErrKind::Name),
+        ("=#NUM!", sheetcore::formula::ErrKind::Num),
+        ("=#NULL!", sheetcore::formula::ErrKind::Null),
+        ("=#SPILL!", sheetcore::formula::ErrKind::Spill),
+        ("=#CALC!", sheetcore::formula::ErrKind::Calc),
+    ] {
+        let fv = sheetcore::formula::eval_formula(&wb_err, 0, f);
+        assert_eq!(sheetcore::formula::from_fvalue(&fv), Value::Error(want), "formula={f}");
+    }
 }
 
 #[test]

@@ -517,6 +517,7 @@ fn multipage_object_anchor_and_line_chart_use_stroke_polys() {
         rect: (55, 0, 60, 1),
         off: [0; 4],
         data: Some(Arc::new(make_2x2_bmp())),
+        ..Default::default()
     });
 
     let layout = paginate(&wb.sheets[0], &wb.sheets[0].page);

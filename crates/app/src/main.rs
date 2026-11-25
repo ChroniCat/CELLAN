@@ -10205,7 +10205,8 @@ impl SheetApp {
             let (sel_r1, sel_c1, sel_r2, sel_c2) = self.sel_rect();
             let sel_h = sel_r2 - sel_r1 + 1;
             let sel_w = sel_c2 - sel_c1 + 1;
-            if cut_src.is_none()
+            if !tsv_paste
+                && cut_src.is_none()
                 && base_h > 0
                 && base_w > 0
                 && (sel_h > base_h || sel_w > base_w)
@@ -12749,10 +12750,16 @@ impl SheetApp {
             &opts,
             true,
         );
-        // 分列会向右写出 width 列：权限门禁和撤销都必须覆盖目标展开后的区域
+        // 分列会向右写出 width 列：权限门禁和撤销都必须覆盖选区与目标展开后的区域
         let (dst_r1, dst_c1) = destination.unwrap_or((r1, c1));
         let dst_r2 = (dst_r1 + (r2 - r1)).min(1_048_575);
-        let dst_c2 = (dst_c1 + dry.width.max(1) as u32 - 1).min(16_383);
+        let expanded_c2 = dst_c1 + dry.width.max(1) as u32 - 1;
+        let dst_c2 = if destination.is_none() {
+            expanded_c2.max(c2)
+        } else {
+            expanded_c2
+        }
+        .min(16_383);
         if (dst_r2 - dst_r1 + 1) as u64 * (dst_c2 - dst_c1 + 1) as u64 > 200_000 {
             self.status = "分列展开后超过 20 万格，请分批处理".into();
             return;

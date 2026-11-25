@@ -517,6 +517,7 @@ fn p0_31_structural_shifts_merges_objects_page_rich_filter_and_tables() {
         data: None,
         ext: "png".into(),
         name: "P1".into(),
+        ..Default::default()
     });
     let mut tb = TextBox::default();
     tb.from = (1, 0, 4, 0);

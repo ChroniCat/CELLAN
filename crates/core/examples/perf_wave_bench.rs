@@ -92,6 +92,8 @@ fn bench_cf_stats_edit_200k() {
                     CfRule {
                         kind: CfKind::Bar {
                             color: [99, 142, 198],
+                            neg_color: None,
+                            show_value: true,
                             min: Cfvo::min(),
                             max: Cfvo::max(),
                         },
