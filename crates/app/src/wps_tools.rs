@@ -634,7 +634,16 @@ impl SheetApp {
             return;
         }
         if !self.fill_source_available((r1, c1, r2, c2)) { return; }
-        let keys = sheetcore::undo::rect_keys(fr1, fc1, fr2, fc2);
+        let has_hidden = !self.wb.sheet(self.sheet_idx).hidden_rows.is_empty();
+        let mut keys = sheetcore::undo::rect_keys(fr1, fc1, fr2, fc2);
+        if has_hidden {
+            let sh = self.wb.sheet(self.sheet_idx);
+            keys.retain(|&(r, _)| !sh.hidden_rows.contains(&r));
+        }
+        if keys.is_empty() {
+            self.status = "目标区域没有可填充的可见行（筛选隐藏行已保留）".into();
+            return;
+        }
         if !self.write_preflight(&keys, "智能填充") {
             return;
         }
@@ -680,21 +689,35 @@ impl SheetApp {
             let win_r2 = if !down && r2 - r1 >= 1024 { r1 + 1023 } else { r2 };
             let src_len = win_r2 - win_r1 + 1;
             for col in c1..=c2 {
-                // 收集源列样本与样式（最多采样靠近边缘的 1024 格，防止整列百万行深拷贝）
+                // 收集源列可见行样本与样式（最多采样靠近边缘的 1024 格，自动跳过筛选隐藏行）
                 let mut src_cells: Vec<(u32, Option<Cell>, u16)> = Vec::with_capacity(src_len as usize);
                 for sr in win_r1..=win_r2 {
                     let sh = self.wb.sheet(self.sheet_idx);
+                    if has_hidden && sh.hidden_rows.contains(&sr) {
+                        continue;
+                    }
                     src_cells.push((sr, sh.get(sr, col).map(|c| c.into_owned()), sh.style_of(sr, col)));
+                }
+                if src_cells.is_empty() {
+                    continue;
                 }
                 let src_ordered: Vec<(u32, Option<Cell>, u16)> = if down {
                     src_cells.clone()
                 } else {
                     src_cells.iter().rev().cloned().collect()
                 };
-                let step_rows: Vec<u32> = if down {
-                    ((r2 + 1)..=target).collect()
-                } else {
-                    (target..r1).rev().collect()
+                let step_rows: Vec<u32> = {
+                    let sh = self.wb.sheet(self.sheet_idx);
+                    if down {
+                        ((r2 + 1)..=target)
+                            .filter(|r| !has_hidden || !sh.hidden_rows.contains(r))
+                            .collect()
+                    } else {
+                        (target..r1)
+                            .rev()
+                            .filter(|r| !has_hidden || !sh.hidden_rows.contains(r))
+                            .collect()
+                    }
                 };
                 let nums: Option<Vec<f64>> = src_ordered
                     .iter()
@@ -756,6 +779,9 @@ impl SheetApp {
             let win_c2 = if !right && c2 - c1 >= 1024 { c1 + 1023 } else { c2 };
             let src_len = win_c2 - win_c1 + 1;
             for row in r1..=r2 {
+                if has_hidden && self.wb.sheet(self.sheet_idx).hidden_rows.contains(&row) {
+                    continue;
+                }
                 let mut src_cells: Vec<(u32, Option<Cell>, u16)> = Vec::with_capacity(src_len as usize);
                 for sc in win_c1..=win_c2 {
                     let sh = self.wb.sheet(self.sheet_idx);

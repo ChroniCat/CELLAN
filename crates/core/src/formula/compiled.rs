@@ -69,13 +69,11 @@ impl InlineSameSheetSpan {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TemplateRefSummary {
     PureNoRefs {
-        volatile: bool,
-        visibility: bool,
+        nondet_volatile: bool,
     },
     SameSheet {
         count: u8,
-        volatile: bool,
-        visibility: bool,
+        nondet_volatile: bool,
         spans: [InlineSameSheetSpan; 4],
     },
     Complex,
@@ -84,8 +82,7 @@ pub(crate) enum TemplateRefSummary {
 pub(crate) fn summarize_template_refs(node: &Node) -> TemplateRefSummary {
     struct Acc {
         count: usize,
-        volatile: bool,
-        visibility: bool,
+        nondet_volatile: bool,
         complex: bool,
         spans: [InlineSameSheetSpan; 4],
     }
@@ -151,8 +148,7 @@ pub(crate) fn summarize_template_refs(node: &Node) -> TemplateRefSummary {
                     acc.complex = true;
                     return;
                 }
-                acc.volatile |= id.is_volatile();
-                acc.visibility |= id.is_visibility();
+                acc.nondet_volatile |= id.is_nondeterministic_volatile();
                 for a in args {
                     walk(a, acc);
                     if acc.complex {
@@ -178,8 +174,7 @@ pub(crate) fn summarize_template_refs(node: &Node) -> TemplateRefSummary {
 
     let mut acc = Acc {
         count: 0,
-        volatile: false,
-        visibility: false,
+        nondet_volatile: false,
         complex: false,
         spans: [InlineSameSheetSpan::EMPTY; 4],
     };
@@ -188,14 +183,12 @@ pub(crate) fn summarize_template_refs(node: &Node) -> TemplateRefSummary {
         TemplateRefSummary::Complex
     } else if acc.count == 0 {
         TemplateRefSummary::PureNoRefs {
-            volatile: acc.volatile,
-            visibility: acc.visibility,
+            nondet_volatile: acc.nondet_volatile,
         }
     } else {
         TemplateRefSummary::SameSheet {
             count: acc.count as u8,
-            volatile: acc.volatile,
-            visibility: acc.visibility,
+            nondet_volatile: acc.nondet_volatile,
             spans: acc.spans,
         }
     }
@@ -1060,6 +1053,23 @@ fn scan_quoted_ident(bytes: &[u8], start: usize) -> Option<usize> {
         }
         j += 1;
     }
+}
+
+/// Encode a scalar formula into a relative R1C1-like byte key for OOXML shared-formula
+/// grouping on save. Returns `None` if the formula cannot be safely shared (e.g. structured
+/// table refs, external book refs, or syntax outside the fast relative encoder).
+pub(crate) fn encode_relative_formula_key(
+    src: &str,
+    row: u32,
+    col: u32,
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    let trimmed = src.trim();
+    let body = trimmed.strip_prefix('=').unwrap_or(trimmed);
+    if body.is_empty() || body.len() > MAX_SOURCE {
+        return None;
+    }
+    relative_key_opts(body, row, col, true, out)
 }
 
 /// Encode fill formulas with relative R1C1 offsets, supporting whitespace, string literals,

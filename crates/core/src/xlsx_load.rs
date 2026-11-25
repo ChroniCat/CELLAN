@@ -2394,6 +2394,29 @@ impl Loaded {
     }
 }
 
+struct ProgressCancelReader<'a, R> {
+    inner: R,
+    ctrl: &'a super::LoadControl,
+}
+
+impl<R: std::io::Read> std::io::Read for ProgressCancelReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.ctrl.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                super::LOAD_CANCELLED_ERR,
+            ));
+        }
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.ctrl
+                .done
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(n)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn worksheets<'a>(
     path_for_rels: Option<&Path>,
@@ -2404,7 +2427,11 @@ pub(super) fn worksheets<'a>(
     dxfs: &[crate::cf::Dxf],
     dxf_ext: bool,
     has_drawing: bool,
+    ctrl: Option<&super::LoadControl>,
 ) -> Result<Vec<Loaded>> {
+    if ctrl.is_some_and(|c| c.is_cancelled()) {
+        anyhow::bail!(super::LOAD_CANCELLED_ERR);
+    }
     let names = &header.names;
     let mut shared = strings(zip).context("读取 xl/sharedStrings.xml 失败")?;
     shared.dynamic.clone_from(&header.dynamic);
@@ -2412,6 +2439,10 @@ pub(super) fn worksheets<'a>(
         .iter()
         .map(|n| targets.get(n).and_then(|p| signature(zip, p)))
         .collect();
+    if let Some(c) = ctrl {
+        let total_bytes: u64 = signatures.iter().filter_map(|s| s.map(|(_, sz)| sz)).sum();
+        c.total.store(total_bytes.max(1), Ordering::Relaxed);
+    }
     // Streaming worksheets (>= 1 MiB) use bounded row chunks rather than whole-sheet buffers,
     // so only buffered sheets (< 1 MiB) count toward the uncompressed memory cap.
     let largest_buffered = signatures
@@ -2437,6 +2468,9 @@ pub(super) fn worksheets<'a>(
     let run = |zip: &mut zip::ZipArchive<Cursor<&'a [u8]>>| -> Result<Vec<(usize, Loaded)>> {
         let mut sheets = Vec::new();
         loop {
+            if ctrl.is_some_and(|c| c.is_cancelled()) {
+                anyhow::bail!(super::LOAD_CANCELLED_ERR);
+            }
             let index = next.fetch_add(1, Ordering::Relaxed);
             let Some(name) = names.get(index) else { break };
             let part = targets.get(name).context("工作表缺少部件路径")?;
@@ -2453,19 +2487,40 @@ pub(super) fn worksheets<'a>(
                 if stream_workers == 1 && cores >= 2 && sheet_size >= 4 * 1024 * 1024 {
                     stream_workers = 2;
                 }
-                super::delta::stream::xml_input(entry, part, |input| {
-                    stream::worksheet_with_styles(
-                        input,
-                        &shared,
-                        Some(style_lookup),
-                        &mut loaded,
-                        stream_workers,
-                        128 * 1024,
-                    )
-                })
+                if let Some(c) = ctrl {
+                    let tracked = ProgressCancelReader {
+                        inner: entry,
+                        ctrl: c,
+                    };
+                    super::delta::stream::xml_input(tracked, part, |input| {
+                        stream::worksheet_with_styles(
+                            input,
+                            &shared,
+                            Some(style_lookup),
+                            &mut loaded,
+                            stream_workers,
+                            128 * 1024,
+                        )
+                    })
+                } else {
+                    super::delta::stream::xml_input(entry, part, |input| {
+                        stream::worksheet_with_styles(
+                            input,
+                            &shared,
+                            Some(style_lookup),
+                            &mut loaded,
+                            stream_workers,
+                            128 * 1024,
+                        )
+                    })
+                }
             } else {
-                xml_part(zip, part)
-                    .and_then(|xml| parse(&xml, &shared, Some(style_lookup), &mut loaded, typ))
+                let res = xml_part(zip, part)
+                    .and_then(|xml| parse(&xml, &shared, Some(style_lookup), &mut loaded, typ));
+                if let Some(c) = ctrl {
+                    c.done.fetch_add(sheet_size, Ordering::Relaxed);
+                }
+                res
             };
             match parsed {
                 Ok(shell) => {

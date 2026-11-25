@@ -361,6 +361,53 @@ impl StyleTable {
         }
     }
 
+    /// Intern a style with explicit `quotePrefix` flag without mutating shared unquoted styles.
+    pub fn intern_with_quote(&mut self, s: CellStyle, quote: bool) -> u16 {
+        if !quote {
+            let k = hash_of(&s);
+            if let Some(&id) = self.0.index.get(&k) {
+                if self.0.styles[id as usize] == s && !self.quote_of(id) {
+                    return id;
+                }
+            }
+            for (idx, existing) in self.0.styles.iter().enumerate() {
+                let id = idx as u16;
+                if *existing == s
+                    && !self.quote_of(id)
+                    && self.theme_of(id) == crate::style_theme::XfTheme::default()
+                    && self.pattern_of(id).is_none()
+                {
+                    return id;
+                }
+            }
+            let inner = std::sync::Arc::make_mut(&mut self.0);
+            let id = inner.styles.len() as u16;
+            inner.styles.push(s);
+            inner.themes.push(crate::style_theme::XfTheme::default());
+            inner.patterns.push(None);
+            inner.quotes.push(false);
+            inner.index.insert(k, id);
+            return id;
+        }
+        for (idx, existing) in self.0.styles.iter().enumerate() {
+            let id = idx as u16;
+            if *existing == s
+                && self.quote_of(id)
+                && self.theme_of(id) == crate::style_theme::XfTheme::default()
+                && self.pattern_of(id).is_none()
+            {
+                return id;
+            }
+        }
+        let inner = std::sync::Arc::make_mut(&mut self.0);
+        let id = inner.styles.len() as u16;
+        inner.styles.push(s);
+        inner.themes.push(crate::style_theme::XfTheme::default());
+        inner.patterns.push(None);
+        inner.quotes.push(true);
+        id
+    }
+
     pub fn set_quote(&mut self, id: u16, q: bool) {
         if self.0.quotes.get(id as usize).copied() == Some(q) {
             return;
@@ -1362,7 +1409,7 @@ fn decimals_in(fmt: &str) -> usize {
         .count()
 }
 
-fn is_date_format(fmt: &str) -> bool {
+pub fn is_date_format(fmt: &str) -> bool {
     let f = strip_literals(fmt).to_lowercase();
     f.contains('y')
         || f.contains('d')
@@ -1376,6 +1423,10 @@ fn is_date_format(fmt: &str) -> bool {
         || f.contains("上午/下午")
         || f.contains("aaa")
         || (f.contains('m') && !f.contains('0') && !f.contains('#'))
+}
+
+pub fn is_percent_format(fmt: &str) -> bool {
+    strip_literals(fmt).contains('%')
 }
 
 /// 去掉引号/转义里的字面量，只留下格式令牌

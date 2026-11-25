@@ -592,18 +592,26 @@ impl SheetApp {
             "IncreaseIndent" => self.apply_style(|s| s.indent = (s.indent + 1).min(15)),
             "WrapText" => {
                 let v = !self.current_style().wrap;
+                self.last_repeat_action = Some(crate::RepeatAction::ToggleWrap);
                 self.apply_style(move |s| s.wrap = v);
+                if v {
+                    self.autofit_sel_rows_for_wrap();
+                }
             }
             "MergeCenter" => {
                 let was_merged = self.ctl_state("MergeCenter").checked;
                 let on = !was_merged;
+                self.last_repeat_action = Some(crate::RepeatAction::MergeToggle);
                 self.toggle_merge(on);
                 if on && self.merge_pending.is_none() && self.ctl_state("MergeCenter").checked {
                     self.apply_style(|s| s.halign = 2);
                 }
             }
+            "MergeAcross" => self.merge_across(),
             "MergeCells" => self.toggle_merge(true),
+            "MergeContents" => self.merge_contents(),
             "UnmergeCells" => self.toggle_merge(false),
+            "UnmergeFill" => self.unmerge_and_fill(),
             "CenterAcross" => self.apply_style(|s| s.halign = 4),
             "NumberFormatApply" => {}
             "CurrencyStyle" => self.apply_style(|s| s.format = "¥#,##0.00".into()),
@@ -768,10 +776,13 @@ impl SheetApp {
             "TraceDependents" => self.trace_dependents(),
             "RemoveArrows" => {
                 self.trace_arrows.clear();
+                self.cross_sheet_traces.clear();
+                self.cross_trace_popup = None;
                 self.status = "已移去追踪箭头".into();
             }
             "ShowFormulas" => self.show_formulas = !self.show_formulas,
             "ErrorChecking" => self.open_error_check(),
+            "EvaluateFormula" => self.open_evaluate_formula(),
             "CalculateNow" => self.recalc_all_async(),
             "CalculateSheet" => self.recalc_sheet_async(self.sheet_idx),
             "CalcAuto" => {

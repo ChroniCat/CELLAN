@@ -589,7 +589,7 @@ fn build_fresh_package_xmls(
     if full_calc_on_load {
         wb_xml.push_str("<calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/>");
     } else {
-        wb_xml.push_str("<calcPr calcId=\"0\"/>");
+        wb_xml.push_str("<calcPr calcId=\"191029\"/>");
     }
     wb_xml.push_str("</workbook>");
 
@@ -3082,6 +3082,167 @@ impl StyleAppender {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SharedRun {
+    r_start: u32,
+    r_end: u32,
+    si: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SharedCell {
+    Master { r_end: u32, si: u32 },
+    Child { si: u32 },
+}
+
+/// Compact per-column run plan for OOXML `<f t="shared" ...>` compression on fresh save.
+/// Memory usage is O(number of contiguous formula runs), not O(number of cells).
+struct SharedFormulaPlan {
+    by_col: HashMap<u32, Vec<SharedRun>>,
+}
+
+impl SharedFormulaPlan {
+    fn build(sheet: &Sheet, arrays: &HashMap<CellRef, (u32, u32, u32, u32)>) -> Option<Self> {
+        if !sheet.has_formulas() {
+            return None;
+        }
+        let mut by_col_cells: HashMap<u32, Vec<(u32, std::sync::Arc<str>)>> = HashMap::new();
+        for (key, cell) in sheet.formula_cells() {
+            if !arrays.is_empty() && arrays.contains_key(&key) {
+                continue;
+            }
+            if !sheet.spill_shapes.is_empty() && sheet.spill_shapes.contains_key(&key) {
+                continue;
+            }
+            if let Some(f) = cell.formula.as_ref() {
+                if f.as_bytes().contains(&b'[') {
+                    continue;
+                }
+                by_col_cells
+                    .entry(key.col)
+                    .or_default()
+                    .push((key.row, std::sync::Arc::clone(f)));
+            }
+        }
+        if by_col_cells.is_empty() {
+            return None;
+        }
+        let mut cols: Vec<u32> = by_col_cells.keys().copied().collect();
+        cols.sort_unstable();
+        let mut by_col: HashMap<u32, Vec<SharedRun>> = HashMap::new();
+        let mut next_si = 0u32;
+        let mut prev_key = Vec::with_capacity(128);
+        let mut cur_key = Vec::with_capacity(128);
+
+        for col in cols {
+            let Some(mut cells) = by_col_cells.remove(&col) else {
+                continue;
+            };
+            if cells.len() < 2 {
+                continue;
+            }
+            cells.sort_unstable_by_key(|(r, _)| *r);
+            let mut runs = Vec::new();
+            let mut run_start = 0u32;
+            let mut run_end = 0u32;
+            let mut run_active = false;
+            prev_key.clear();
+
+            for (row, f) in cells {
+                let ok = crate::formula::compiled::encode_relative_formula_key(
+                    f.as_ref(),
+                    row,
+                    col,
+                    &mut cur_key,
+                )
+                .is_some();
+                if ok && run_active && row == run_end.saturating_add(1) && cur_key == prev_key {
+                    run_end = row;
+                } else {
+                    if run_active && run_end > run_start {
+                        runs.push(SharedRun {
+                            r_start: run_start,
+                            r_end: run_end,
+                            si: next_si,
+                        });
+                        next_si += 1;
+                    }
+                    if ok {
+                        run_start = row;
+                        run_end = row;
+                        run_active = true;
+                        std::mem::swap(&mut prev_key, &mut cur_key);
+                    } else {
+                        run_active = false;
+                    }
+                }
+            }
+            if run_active && run_end > run_start {
+                runs.push(SharedRun {
+                    r_start: run_start,
+                    r_end: run_end,
+                    si: next_si,
+                });
+                next_si += 1;
+            }
+            if !runs.is_empty() {
+                by_col.insert(col, runs);
+            }
+        }
+        (!by_col.is_empty()).then_some(Self { by_col })
+    }
+
+    #[inline]
+    fn lookup(&self, key: CellRef) -> Option<SharedCell> {
+        let runs = self.by_col.get(&key.col)?;
+        let idx = runs.partition_point(|r| r.r_end < key.row);
+        let run = runs.get(idx)?;
+        if key.row < run.r_start || key.row > run.r_end {
+            return None;
+        }
+        if key.row == run.r_start {
+            Some(SharedCell::Master {
+                r_end: run.r_end,
+                si: run.si,
+            })
+        } else {
+            Some(SharedCell::Child { si: run.si })
+        }
+    }
+}
+
+#[inline]
+fn push_scalar_formula_tag(
+    buf: &mut Vec<u8>,
+    key: CellRef,
+    f_raw: &str,
+    shared: Option<&SharedFormulaPlan>,
+) {
+    match shared.and_then(|sp| sp.lookup(key)) {
+        Some(SharedCell::Master { r_end, si }) => {
+            buf.extend_from_slice(b"<f t=\"shared\" ref=\"");
+            push_a1(buf, key.row, key.col);
+            buf.push(b':');
+            push_a1(buf, r_end, key.col);
+            buf.extend_from_slice(b"\" si=\"");
+            push_u32(buf, si);
+            buf.extend_from_slice(b"\">");
+            push_formula_xml_bytes(buf, f_raw);
+            buf.extend_from_slice(b"</f>");
+        }
+        Some(SharedCell::Child { si }) => {
+            buf.extend_from_slice(b"<f t=\"shared\" si=\"");
+            push_u32(buf, si);
+            buf.extend_from_slice(b"\"/>");
+        }
+        None => {
+            buf.extend_from_slice(b"<f>");
+            push_formula_xml_bytes(buf, f_raw);
+            buf.extend_from_slice(b"</f>");
+        }
+    }
+}
+
 fn push_formula_xml_bytes(buf: &mut Vec<u8>, raw: &str) {
     let formula = crate::add_fn_prefixes(raw.strip_prefix('=').unwrap_or(raw));
     if formula
@@ -3123,6 +3284,7 @@ fn write_value_buf(
     xf: Option<u16>,
     prefix: &str,
     cm_index: Option<u32>,
+    shared: Option<&SharedFormulaPlan>,
 ) -> Result<()> {
     let runs = if sheet.rich.is_empty() {
         None
@@ -3254,43 +3416,43 @@ fn write_value_buf(
         }
         match &cell_ref.value {
             Value::Empty => {
-                buf.extend_from_slice(b"\"><f>");
-                push_formula_xml_bytes(buf, f_raw);
-                buf.extend_from_slice(b"</f></c>");
+                buf.extend_from_slice(b"\">");
+                push_scalar_formula_tag(buf, key, f_raw, shared);
+                buf.extend_from_slice(b"</c>");
             }
             Value::Number(n) => {
                 if n.is_finite() {
-                    buf.extend_from_slice(b"\"><f>");
-                    push_formula_xml_bytes(buf, f_raw);
-                    buf.extend_from_slice(b"</f><v>");
+                    buf.extend_from_slice(b"\">");
+                    push_scalar_formula_tag(buf, key, f_raw, shared);
+                    buf.extend_from_slice(b"<v>");
                     push_f64_xml(buf, *n);
                     buf.extend_from_slice(b"</v></c>");
                 } else {
-                    buf.extend_from_slice(b"\" t=\"e\"><f>");
-                    push_formula_xml_bytes(buf, f_raw);
-                    buf.extend_from_slice(b"</f><v>#NUM!</v></c>");
+                    buf.extend_from_slice(b"\" t=\"e\">");
+                    push_scalar_formula_tag(buf, key, f_raw, shared);
+                    buf.extend_from_slice(b"<v>#NUM!</v></c>");
                 }
             }
             Value::Bool(b) => {
-                buf.extend_from_slice(b"\" t=\"b\"><f>");
-                push_formula_xml_bytes(buf, f_raw);
+                buf.extend_from_slice(b"\" t=\"b\">");
+                push_scalar_formula_tag(buf, key, f_raw, shared);
                 buf.extend_from_slice(if *b {
-                    b"</f><v>1</v></c>"
+                    b"<v>1</v></c>"
                 } else {
-                    b"</f><v>0</v></c>"
+                    b"<v>0</v></c>"
                 });
             }
             Value::Error(e) => {
-                buf.extend_from_slice(b"\" t=\"e\"><f>");
-                push_formula_xml_bytes(buf, f_raw);
-                buf.extend_from_slice(b"</f><v>");
+                buf.extend_from_slice(b"\" t=\"e\">");
+                push_scalar_formula_tag(buf, key, f_raw, shared);
+                buf.extend_from_slice(b"<v>");
                 buf.extend_from_slice(e.text().as_bytes());
                 buf.extend_from_slice(b"</v></c>");
             }
             Value::Text(s) => {
-                buf.extend_from_slice(b"\" t=\"str\"><f>");
-                push_formula_xml_bytes(buf, f_raw);
-                buf.extend_from_slice(b"</f><v>");
+                buf.extend_from_slice(b"\" t=\"str\">");
+                push_scalar_formula_tag(buf, key, f_raw, shared);
+                buf.extend_from_slice(b"<v>");
                 buf.extend_from_slice(encode_xstring_xml(s.as_ref()).as_bytes());
                 buf.extend_from_slice(b"</v></c>");
             }
@@ -3751,6 +3913,7 @@ fn write_band_rows_streaming(
     row_levels: &[(u32, u8)],
     r1: u32,
     r2: u32,
+    shared: Option<&SharedFormulaPlan>,
 ) -> Result<()> {
     let lookup_xf = |id: u16| -> Result<u16> {
         direct_xf
@@ -3812,7 +3975,7 @@ fn write_band_rows_streaming(
             } else {
                 None
             };
-            write_value_buf(buf, sheet, arrays, sst, key, cell, xf, "", Some(1))?;
+            write_value_buf(buf, sheet, arrays, sst, key, cell, xf, "", Some(1), shared)?;
         }
         if open_row.is_some() {
             buf.extend_from_slice(b"</row>");
@@ -3896,7 +4059,7 @@ fn write_band_rows_streaming(
                 for (key, cell_opt, explicit) in row_entries_buf.drain(..) {
                     if let Some(cell) = cell_opt {
                         let xf = xf_for(key, explicit)?;
-                        write_value_buf(buf, sheet, arrays, sst, key, cell, xf, "", Some(1))?;
+                        write_value_buf(buf, sheet, arrays, sst, key, cell, xf, "", Some(1), shared)?;
                     } else if let Some(id) = explicit {
                         let xf = lookup_xf(id)?;
                         write_styled_blank_buf(buf, key, xf, "");
@@ -4072,6 +4235,8 @@ fn write_sheet(
     const FLUSH_AT: usize = 128 * 1024;
     let mut buf: Vec<u8> = Vec::with_capacity(FLUSH_AT + 16 * 1024);
 
+    let shared = SharedFormulaPlan::build(sheet, &arrays);
+
     // Direct empty-<sheetData/> fast path: stream all cells + styles + row metadata directly!
     if let Some(dxf) = direct_xf
         && !data.children().any(|n| n.is_element())
@@ -4091,6 +4256,7 @@ fn write_sheet(
                 &row_levels,
                 top_r,
                 bot_r,
+                shared.as_ref(),
             )?;
         }
         buf.extend_from_slice(b"</sheetData>");
@@ -4229,7 +4395,7 @@ fn write_sheet(
                     Some(xf) => Some(xf),
                     None => xf_for(key, explicit)?,
                 };
-                write_value_buf(buf, sheet, &arrays, sst, key, cell, xf, "", Some(1))?;
+                write_value_buf(buf, sheet, &arrays, sst, key, cell, xf, "", Some(1), shared.as_ref())?;
             } else if let Some(id) = explicit {
                 if id != 0
                     || sheet.row_styles.contains_key(&key.row)
@@ -4302,6 +4468,7 @@ fn write_sheet(
                     xf_for(key, explicit)?,
                     "",
                     Some(1),
+                    shared.as_ref(),
                 )?;
             }
         }
@@ -4429,6 +4596,8 @@ pub(super) fn write_sheet_parallel_zip(
     let num_bands = bands.len();
     let header_ref = header.as_str();
     let arrays_ref = &arrays;
+    let shared_plan = SharedFormulaPlan::build(sheet, arrays_ref);
+    let shared_ref = shared_plan.as_ref();
     let results: std::sync::Mutex<Vec<Result<(usize, Vec<u8>, u32, u64, bool)>>> =
         std::sync::Mutex::new(Vec::with_capacity(num_bands));
 
@@ -4457,6 +4626,7 @@ pub(super) fn write_sheet_parallel_zip(
                         row_levels_ref,
                         r1,
                         r2,
+                        shared_ref,
                     )?;
                     let body_end = buf.len();
                     if is_last {
@@ -4506,6 +4676,7 @@ pub(super) fn write_plain_new_sheet(sheet: &Sheet, out: &mut dyn Write) -> Resul
     buf.extend_from_slice(
         b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">",
     );
+    let shared_plan = SharedFormulaPlan::build(sheet, &arrays);
     if let Some((top, left, bottom, right)) = sheet.used_bounds() {
         let first = crate::model::cell_name(top, left);
         let end = crate::model::cell_name(bottom, right);
@@ -4527,7 +4698,18 @@ pub(super) fn write_plain_new_sheet(sheet: &Sheet, out: &mut dyn Write) -> Resul
                 buf.extend_from_slice(b"\">");
                 open_row = Some(key.row);
             }
-            write_value_buf(&mut buf, sheet, &arrays, None, key, cell, None, "", None)?;
+            write_value_buf(
+                &mut buf,
+                sheet,
+                &arrays,
+                None,
+                key,
+                cell,
+                None,
+                "",
+                None,
+                shared_plan.as_ref(),
+            )?;
             if buf.len() >= 128 * 1024 {
                 vw.write_all(&buf)?;
                 buf.clear();
@@ -4567,7 +4749,7 @@ pub(super) fn write_direct(path: &Path, wb: &Workbook) -> Result<FreshResult> {
         .collect();
 
     let dynamic = wb.sheets.iter().any(has_dynamic);
-    let full_calc = !wb.calc_manual && wb.sheets.iter().any(|s| s.has_formulas());
+    let full_calc = wb.needs_full_calc_on_load();
     let fresh_styles = FreshStyles::build(None, wb, &ordered_sheets)?;
     let direct_xf = fresh_styles.sid_to_xf.as_slice();
     let fresh_sst = FreshSst::build(None, &ordered_sheets)?;
@@ -5481,7 +5663,7 @@ fn write_rebuilt_sheet(
                 }
                 let xf = resolve_cell_xf(explicit, &mut resolve_new_xf)?;
                 write_value_buf(
-                    &mut buf, sheet, &arrays, sst, key, cell, xf, prefix, cm_index,
+                    &mut buf, sheet, &arrays, sst, key, cell, xf, prefix, cm_index, None,
                 )?;
             } else if let Some(sid) = explicit {
                 let keep_raw_blank = !sheet.style_edits.contains(&key)

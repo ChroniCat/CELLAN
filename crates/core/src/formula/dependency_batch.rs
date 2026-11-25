@@ -1273,9 +1273,12 @@ mod tests {
         for (row, formula) in [
             "=SEQUENCE(1,2,3)",
             "=INDIRECT(\"A1\")",
-            "=NOW()",
+            "=RAND()",
             "=D4+1",
             "=IF(FALSE,D5,7)",
+            "=NOW()",
+            "=TODAY()",
+            "=SUBTOTAL(9,A1:A5)",
         ]
         .into_iter()
         .enumerate()

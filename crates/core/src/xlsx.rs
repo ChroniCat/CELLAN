@@ -298,8 +298,55 @@ pub const LOAD_KIND_BIFF_CALAMINE: u8 = 1;
 pub const LOAD_KIND_BIFF_BUILTIN: u8 = 2;
 pub const LOAD_KIND_OOXML: u8 = 3;
 
+pub const LOAD_CANCELLED_ERR: &str = "LOAD_CANCELLED";
+
+/// 异步打开工作簿时的字节级进度与取消控制柄。
+#[derive(Debug, Default)]
+pub struct LoadControl {
+    pub done: std::sync::atomic::AtomicU64,
+    pub total: std::sync::atomic::AtomicU64,
+    pub cancel: std::sync::atomic::AtomicBool,
+}
+
+impl LoadControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn progress(&self) -> Option<f32> {
+        let total = self.total.load(std::sync::atomic::Ordering::Relaxed);
+        if total == 0 {
+            return None;
+        }
+        let done = self.done.load(std::sync::atomic::Ordering::Relaxed);
+        Some((done as f64 / total as f64).clamp(0.0, 1.0) as f32)
+    }
+}
+
+pub fn is_load_cancelled_err(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.to_string().contains(LOAD_CANCELLED_ERR))
+}
+
 pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
+    load_diag_with_control(path, None)
+}
+
+pub fn load_diag_with_control(
+    path: &Path,
+    ctrl: Option<std::sync::Arc<LoadControl>>,
+) -> Result<(Workbook, LoadDiag)> {
     set_load_kind(LOAD_KIND_UNKNOWN);
+    if ctrl.as_ref().is_some_and(|c| c.is_cancelled()) {
+        anyhow::bail!(LOAD_CANCELLED_ERR);
+    }
     if injected(&INJECT_WORKER_PANIC, path) {
         panic!("注入：主加载线程 panic");
     }
@@ -462,6 +509,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
         calc_max_change,
         calc_pending: false,
         calc_pending_sheets: std::collections::BTreeSet::new(),
+        recalc_cell_revs: Vec::new(),
         sheets: Vec::new(),
         path: Some(path.to_path_buf()),
         decrypted: None,
@@ -586,6 +634,7 @@ pub fn load_diag(path: &Path) -> Result<(Workbook, LoadDiag)> {
             &header.parsed_styles.dxfs,
             header.parsed_styles.dxf_ext,
             zip_has_drawing || zip_has_sheet_rels,
+            ctrl.as_deref(),
         );
         let (styles_back, ids_back) = style_lookup.into_inner();
         wb.styles = styles_back;
@@ -2509,7 +2558,11 @@ pub fn load_with_password(path: &Path, password: &str) -> Result<Workbook> {
     load_with_password_diag(path, password).map(|(wb, _)| wb)
 }
 
-fn try_load_ooxml_from_memory(path: &Path, plain: &[u8]) -> Option<Result<(Workbook, LoadDiag)>> {
+fn try_load_ooxml_from_memory(
+    path: &Path,
+    plain: &[u8],
+    ctrl: Option<&LoadControl>,
+) -> Option<Result<(Workbook, LoadDiag)>> {
     if !plain.starts_with(b"PK")
         || injected(&INJECT_WORKER_PANIC, path)
         || injected(&INJECT_SIDE_PANIC, path)
@@ -2580,6 +2633,7 @@ fn try_load_ooxml_from_memory(path: &Path, plain: &[u8]) -> Option<Result<(Workb
         calc_max_change,
         calc_pending: false,
         calc_pending_sheets: std::collections::BTreeSet::new(),
+        recalc_cell_revs: Vec::new(),
         sheets: Vec::new(),
         path: Some(path.to_path_buf()),
         decrypted: None,
@@ -2616,6 +2670,7 @@ fn try_load_ooxml_from_memory(path: &Path, plain: &[u8]) -> Option<Result<(Workb
         &header.parsed_styles.dxfs,
         header.parsed_styles.dxf_ext,
         false,
+        ctrl,
     );
     let (styles_back, mut style_ids) = style_lookup.into_inner();
     wb.styles = styles_back;
@@ -2828,8 +2883,22 @@ fn try_load_ooxml_from_memory(path: &Path, plain: &[u8]) -> Option<Result<(Workb
 /// 带密码打开并返回诊断：优先直接在解密内存 `Cursor` 上流式加载（零明文临时文件落盘）；
 /// 仅当加密包含绘图/图表/批注/外部关系等需路径辅助扫描的部件时，才回退到私有临时目录。
 pub fn load_with_password_diag(path: &Path, password: &str) -> Result<(Workbook, LoadDiag)> {
+    load_with_password_diag_with_control(path, password, None)
+}
+
+pub fn load_with_password_diag_with_control(
+    path: &Path,
+    password: &str,
+    ctrl: Option<std::sync::Arc<LoadControl>>,
+) -> Result<(Workbook, LoadDiag)> {
+    if ctrl.as_ref().is_some_and(|c| c.is_cancelled()) {
+        anyhow::bail!(LOAD_CANCELLED_ERR);
+    }
     let (plain, len, fp) = crate::crypto::decrypt_with_fingerprint(path, password)?;
-    if let Some(res) = try_load_ooxml_from_memory(path, &plain) {
+    if ctrl.as_ref().is_some_and(|c| c.is_cancelled()) {
+        anyhow::bail!(LOAD_CANCELLED_ERR);
+    }
+    if let Some(res) = try_load_ooxml_from_memory(path, &plain, ctrl.as_deref()) {
         decrypted_cache_put_with_meta(path, password, plain, Some((len, fp)));
         let (mut wb, diag) = res?;
         wb.path = Some(path.to_path_buf());
@@ -2843,7 +2912,7 @@ pub fn load_with_password_diag(path: &Path, password: &str) -> Result<(Workbook,
     let tmp = scratch.path().join("source.xlsx");
     std::fs::write(&tmp, &plain).with_context(|| "写入解密临时文件失败")?;
     decrypted_cache_put_with_meta(path, password, plain, Some((len, fp)));
-    let (mut wb, diag) = load_diag(&tmp)?;
+    let (mut wb, diag) = load_diag_with_control(&tmp, ctrl)?;
     wb.path = Some(path.to_path_buf());
     wb.decrypted = None;
     wb.encryption = Some(crate::crypto::EncryptionSettings::new(password));
@@ -3649,8 +3718,7 @@ fn save_plain_at(
                     }
                 }
             }
-            let updated = if !wb.calc_manual
-                && wb.sheets.iter().any(|s| s.has_formulas())
+            let updated = if wb.needs_full_calc_on_load()
                 && (fresh_base || wb.names_dirty || wb.sheets.iter().any(|s| s.cell_data_needs_save()))
             {
                 delta::recalc_on_open(&next_xml, false)?

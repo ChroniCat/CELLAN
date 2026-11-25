@@ -350,6 +350,10 @@ impl FilterPopup {
             ops_open: false,
             ops_anchor: egui::Pos2::ZERO,
             focus_search: true,
+            meta: None,
+            date_selected: std::collections::HashSet::new(),
+            date_mode: false,
+            color_open: false,
         };
         popup.prepare_choices();
         Some(popup)

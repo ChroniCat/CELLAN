@@ -266,6 +266,14 @@ impl FuncId {
         )
     }
 
+    /// True only for RNG volatile functions (`RAND`, `RANDBETWEEN`, `RANDARRAY`) that need
+    /// per-pass memoization in `Calc::volatile_values` and cannot safely run concurrently.
+    /// `TODAY()` and `NOW()` read an immutable `EvalCtx::now_snapshot` and are 100% parallel-safe.
+    #[inline]
+    pub(crate) fn is_nondeterministic_volatile(self) -> bool {
+        matches!(self, Self::Rand | Self::RandBetween | Self::RandArray)
+    }
+
     #[inline]
     pub(crate) fn is_volatile_ref(self) -> bool {
         matches!(self, Self::Indirect | Self::Offset)

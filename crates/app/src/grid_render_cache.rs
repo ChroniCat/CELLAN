@@ -953,6 +953,20 @@ pub(super) struct Rules {
     pub(crate) charts_epoch: Option<(u64, u64, u64, u64)>,
 }
 
+/// Result of `Rules::refresh_responsive`: distinguishes a full cache wipe (definitions,
+/// statistical aggregates like ColorScale/DataBar, or formula CF rules changed) from a
+/// localized cell-value edit where only the edited cell's per-cell CF rule needs refreshing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CfRefreshOutcome {
+    Unchanged,
+    /// Only cell values changed while CF definitions/stats/formulas stayed stable:
+    /// do NOT bump `cf_gen` or wipe whole-screen `RetainedGridCache`!
+    CellOnly,
+    /// Definitions, stats (min/max/percentiles/duplicates), or expression rules changed:
+    /// invalidate screen CF cache and bump `cf_gen`.
+    Full,
+}
+
 impl Rules {
     #[inline]
     pub fn has_definitions(&self) -> bool {
@@ -1014,7 +1028,7 @@ impl Rules {
         dumping: bool,
         ctx: &egui::Context,
         stats: &mut cf::CfStats,
-    ) -> bool {
+    ) -> CfRefreshOutcome {
         let mut async_applied = false;
         if let Some(w) = self.cf_worker.as_mut() {
             while let Ok(done) = w.rx.try_recv() {
@@ -1022,10 +1036,12 @@ impl Rules {
                     && done.cells == *sh.cell_version()
                     && done.cf == sh.cf
                 {
-                    *stats = done.stats;
+                    if !stats.visual_eq(&done.stats) {
+                        *stats = done.stats;
+                        self.generation = self.generation.wrapping_add(1);
+                        async_applied = true;
+                    }
                     w.in_flight = None;
-                    self.generation = self.generation.wrapping_add(1);
-                    async_applied = true;
                 }
             }
         }
@@ -1033,7 +1049,11 @@ impl Rules {
             *id != sh.identity || cells != sh.cell_version() || *sys != dates
         });
         if !local_changed && !forced && self.observed == observed {
-            return async_applied;
+            return if async_applied {
+                CfRefreshOutcome::Full
+            } else {
+                CfRefreshOutcome::Unchanged
+            };
         }
         let definitions_changed = self.definitions != sh.cf;
         if definitions_changed {
@@ -1053,37 +1073,47 @@ impl Rules {
         }
         let has_rules = !sh.cf.blocks.is_empty();
         let ext_expr = self.cross_expressions || (self.expressions && has_wb_names);
-        let dirty = definitions_changed || (has_rules && (local_changed || ext_expr));
-        if dirty {
-            if local_changed || definitions_changed || forced {
-                let offload = !dumping && sh.len() > 16_384 && self.stat_area > 16_384;
-                if offload {
-                    let target = (sh.identity, sh.cell_version().clone());
-                    let worker = self.cf_worker.get_or_insert_with(CfStatsWorker::new);
-                    if worker.in_flight.as_ref() != Some(&target) {
-                        let job = CfStatsJob {
-                            sheet_id: sh.identity,
-                            cells: sh.cell_version().clone(),
-                            cf: sh.cf.clone(),
-                            snapshot: sh.search_snapshot(),
-                            wake: ctx.clone(),
-                        };
-                        if worker.tx.send(job).is_ok() {
-                            worker.in_flight = Some(target);
-                        } else {
-                            self.cf_worker = None;
-                            cf::refresh_stats(sh, stats);
-                        }
+        let mut stats_changed = false;
+        if has_rules && (local_changed || definitions_changed || forced) && self.stat_area > 0 {
+            let offload = !dumping && sh.len() > 16_384 && self.stat_area > 16_384;
+            if offload {
+                let target = (sh.identity, sh.cell_version().clone());
+                let worker = self.cf_worker.get_or_insert_with(CfStatsWorker::new);
+                if worker.in_flight.as_ref() != Some(&target) {
+                    let job = CfStatsJob {
+                        sheet_id: sh.identity,
+                        cells: sh.cell_version().clone(),
+                        cf: sh.cf.clone(),
+                        snapshot: sh.search_snapshot(),
+                        wake: ctx.clone(),
+                    };
+                    if worker.tx.send(job).is_ok() {
+                        worker.in_flight = Some(target);
+                    } else {
+                        self.cf_worker = None;
+                        stats_changed = cf::refresh_stats(sh, stats);
                     }
-                } else {
-                    cf::refresh_stats(sh, stats);
                 }
+            } else {
+                stats_changed = cf::refresh_stats(sh, stats);
             }
+        }
+        let full_dirty = definitions_changed
+            || forced
+            || async_applied
+            || (has_rules && (stats_changed || self.expressions || ext_expr));
+        if full_dirty {
             self.generation = self.generation.wrapping_add(1);
         }
         self.sheet = Some((sh.identity, sh.cell_version().clone(), dates));
         self.observed = observed;
-        dirty || async_applied
+        if full_dirty {
+            CfRefreshOutcome::Full
+        } else if has_rules && local_changed {
+            CfRefreshOutcome::CellOnly
+        } else {
+            CfRefreshOutcome::Unchanged
+        }
     }
 
     pub(crate) fn chart_shapes(

@@ -939,7 +939,12 @@ impl SheetApp {
         let mut do_print = false;
         let mut do_export = false;
         let mut do_page_setup = false;
+        let mut do_refresh_printers = false;
         let mut goto_page: Option<usize> = None;
+        if self.page_setup_printers.is_empty() && self.bg_printers_rx.is_none() {
+            self.refresh_printers();
+        }
+        let printing_now = self.bg_print_rx.is_some();
 
         let (layout, ops, page_no, total, cur_page) = {
             let sheet = self.wb.sheet(self.sheet_idx);
@@ -1028,7 +1033,10 @@ impl SheetApp {
                         ui.set_width(272.0);
                         ui.spacing_mut().item_spacing = Vec2::new(6.0, 5.0);
                         ui.horizontal(|ui| {
-                            if ui_kit::primary_button(ui, "立即打印").clicked() {
+                            if printing_now {
+                                ui.spinner();
+                                ui.label(egui::RichText::new("正在打印…").size(12.0));
+                            } else if ui_kit::primary_button(ui, "立即打印").clicked() {
                                 do_print = true;
                             }
                             if ui_kit::secondary_button(ui, "导出 PDF…").clicked() {
@@ -1037,6 +1045,35 @@ impl SheetApp {
                         });
                         ui.separator();
 
+                        // 统一打印机选择与刷新（后台 winspool 快速枚举，不阻塞 UI）
+                        ui.horizontal(|ui| {
+                            ui.label("打印机：");
+                            let cur_prn = if self.page_setup_printer.is_empty() {
+                                "系统默认打印机"
+                            } else {
+                                self.page_setup_printer.as_str()
+                            };
+                            egui::ComboBox::from_id_salt("print_preview_printer")
+                                .width(154.0)
+                                .selected_text(cur_prn)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.page_setup_printer,
+                                        String::new(),
+                                        "系统默认打印机",
+                                    );
+                                    for p in &self.page_setup_printers {
+                                        ui.selectable_value(
+                                            &mut self.page_setup_printer,
+                                            p.clone(),
+                                            p,
+                                        );
+                                    }
+                                });
+                            if ui.small_button("刷新").on_hover_text("重新读取系统打印机列表").clicked() {
+                                do_refresh_printers = true;
+                            }
+                        });
                         ui.horizontal(|ui| {
                             ui.label("打印份数：");
                             let mut cp = self.print_copies as f64;
@@ -1048,7 +1085,23 @@ impl SheetApp {
                             ui.label("页面范围：");
                             ui.selectable_value(&mut self.print_range, 0, "全部");
                             ui.selectable_value(&mut self.print_range, 1, "当前页");
+                            ui.selectable_value(&mut self.print_range, 2, "自定义");
                         });
+                        if self.print_range == 2 {
+                            ui.horizontal(|ui| {
+                                ui.label("从第");
+                                let mut a = self.print_from as f64;
+                                if ui_kit::spin(ui, &mut a, 1.0, total as f64, 1.0, 48.0) {
+                                    self.print_from = a as u32;
+                                }
+                                ui.label("到第");
+                                let mut b = self.print_to as f64;
+                                if ui_kit::spin(ui, &mut b, 1.0, total as f64, 1.0, 48.0) {
+                                    self.print_to = b as u32;
+                                }
+                                ui.label("页");
+                            });
+                        }
 
                         ui.separator();
                         crate::dlg_section(ui, "页面与纸张（实时生效）");
@@ -1126,6 +1179,17 @@ impl SheetApp {
                             }
                         }
 
+                        if fit_mode == 0 {
+                            ui.horizontal(|ui| {
+                                ui.label("缩放比例：");
+                                let mut sc = cur_page.scale as f64;
+                                if ui_kit::spin(ui, &mut sc, 10.0, 400.0, 5.0, 64.0) {
+                                    self.set_page(|p| p.scale = sc as u16);
+                                }
+                                ui.label("%");
+                            });
+                        }
+
                         ui.separator();
                         let mut g = cur_page.gridlines;
                         if ui.checkbox(&mut g, "打印网格线").changed() {
@@ -1144,9 +1208,14 @@ impl SheetApp {
                             self.set_page(|p| p.center_v = cv);
                         }
                         ui.add_space(2.0);
-                        if ui_kit::secondary_button(ui, "更多页面设置…").clicked() {
-                            do_page_setup = true;
-                        }
+                        ui.horizontal(|ui| {
+                            if ui_kit::secondary_button(ui, "页眉/页脚…").clicked() {
+                                self.hf_dlg = true;
+                            }
+                            if ui_kit::secondary_button(ui, "高级页面设置…").clicked() {
+                                do_page_setup = true;
+                            }
+                        });
                     });
 
                     ui.separator();
@@ -1228,6 +1297,10 @@ impl SheetApp {
         }
         if let Some(p) = goto_page {
             self.preview_page = p;
+        }
+        if do_refresh_printers {
+            self.page_setup_printers.clear();
+            self.refresh_printers();
         }
         if do_print {
             self.print_to_printer();

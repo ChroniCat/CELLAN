@@ -362,6 +362,111 @@ impl Action {
 }
 
 
+/// 轻量级工作表元数据改动（列宽/行高/隐藏行列/批注/忽略错误）：无需整表快照，支持单人及协作模式一键撤销。
+#[derive(Clone, Debug, Default)]
+pub struct MetaEdit {
+    pub sheet: usize,
+    pub col_widths: Vec<(u32, Option<f32>, Option<f32>)>,
+    pub row_heights: Vec<(u32, Option<f32>, Option<f32>)>,
+    pub hidden_rows_user: Vec<(u32, bool, bool)>,
+    pub hidden_cols: Vec<(u32, bool, bool)>,
+    pub notes: Vec<((u32, u32), Option<crate::notes::Note>, Option<crate::notes::Note>)>,
+    pub ignored_errors: Vec<((u32, u32), bool, bool)>,
+}
+
+impl MetaEdit {
+    pub fn is_empty(&self) -> bool {
+        self.col_widths.is_empty()
+            && self.row_heights.is_empty()
+            && self.hidden_rows_user.is_empty()
+            && self.hidden_cols.is_empty()
+            && self.notes.is_empty()
+            && self.ignored_errors.is_empty()
+    }
+
+    fn apply(&self, sheets: &mut [Sheet], redo: bool) {
+        let Some(sh) = sheets.get_mut(self.sheet) else {
+            return;
+        };
+        if !self.col_widths.is_empty() {
+            let def = sh.cols.default_size();
+            for &(c, before, after) in &self.col_widths {
+                let target = if redo { after } else { before };
+                sh.cols.set(c, target.unwrap_or(def));
+            }
+            sh.layout_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if !self.row_heights.is_empty() {
+            let def = sh.rows.default_size();
+            for &(r, before, after) in &self.row_heights {
+                let target = if redo { after } else { before };
+                sh.rows.set(r, target.unwrap_or(def));
+            }
+            sh.layout_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if !self.hidden_rows_user.is_empty() {
+            for &(r, before, after) in &self.hidden_rows_user {
+                let hide = if redo { after } else { before };
+                if hide {
+                    sh.hidden_rows_user.insert(r);
+                } else {
+                    sh.hidden_rows_user.remove(&r);
+                }
+            }
+            sh.layout_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if !self.hidden_cols.is_empty() {
+            for &(c, before, after) in &self.hidden_cols {
+                let hide = if redo { after } else { before };
+                if hide {
+                    sh.hidden_cols.insert(c);
+                } else {
+                    sh.hidden_cols.remove(&c);
+                }
+            }
+            sh.layout_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if !self.notes.is_empty() {
+            for (pos, before, after) in &self.notes {
+                let target = if redo { after } else { before };
+                let cref = CellRef::new(pos.0, pos.1);
+                match target {
+                    Some(n) => {
+                        sh.notes.insert(cref, n.clone());
+                    }
+                    None => {
+                        sh.notes.remove(&cref);
+                    }
+                }
+            }
+            sh.notes_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if !self.ignored_errors.is_empty() {
+            for &(pos, before, after) in &self.ignored_errors {
+                let ig = if redo { after } else { before };
+                if ig {
+                    sh.ignored_errors.insert(pos);
+                } else {
+                    sh.ignored_errors.remove(&pos);
+                }
+            }
+            sh.bump_display_style_revision();
+        }
+    }
+}
+
+struct MetaAction {
+    label: String,
+    focus: (usize, u32, u32),
+    by_site: u32,
+    edit: MetaEdit,
+}
+
 pub const COW_BATCH_THRESHOLD: usize = 16_384;
 
 enum Entry {
@@ -370,6 +475,7 @@ enum Entry {
     NumericSort(EntryStamp, NumericSortAction),
     Structure(EntryStamp, StructureAction),
     SheetTab(EntryStamp, SheetTabAction),
+    Meta(EntryStamp, Box<MetaAction>),
 }
 
 impl Entry {
@@ -381,7 +487,8 @@ impl Entry {
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
-            | Self::SheetTab(s, _) => *s,
+            | Self::SheetTab(s, _)
+            | Self::Meta(s, _) => *s,
         }
     }
 
@@ -391,7 +498,8 @@ impl Entry {
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
-            | Self::SheetTab(s, _) => s,
+            | Self::SheetTab(s, _)
+            | Self::Meta(s, _) => s,
         }
     }
 
@@ -426,6 +534,7 @@ impl Entry {
             Self::NumericSort(_, a) => &a.label,
             Self::Structure(_, a) => &a.label,
             Self::SheetTab(_, a) => &a.label,
+            Self::Meta(_, a) => &a.label,
         }
     }
     fn by_site(&self) -> u32 {
@@ -435,6 +544,7 @@ impl Entry {
             Self::NumericSort(_, a) => a.by_site,
             Self::Structure(_, a) => a.by_site,
             Self::SheetTab(_, a) => a.by_site,
+            Self::Meta(_, a) => a.by_site,
         }
     }
 }
@@ -1764,6 +1874,52 @@ impl UndoStack {
         !self.undone.is_empty()
     }
 
+    pub fn push_meta(
+        &mut self,
+        label: impl Into<String>,
+        focus: (usize, u32, u32),
+        edit: MetaEdit,
+    ) {
+        if edit.is_empty() {
+            return;
+        }
+        let approx_bytes = 128
+            + edit.col_widths.len() * 16
+            + edit.row_heights.len() * 16
+            + edit.hidden_rows_user.len() * 8
+            + edit.hidden_cols.len() * 8
+            + edit.notes.len() * 96
+            + edit.ignored_errors.len() * 12;
+        self.done.push(Entry::Meta(
+            next_entry(approx_bytes),
+            Box::new(MetaAction {
+                label: label.into(),
+                focus,
+                by_site: self.site,
+                edit,
+            }),
+        ));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
+    pub fn undo_labels(&self, limit: usize) -> Vec<String> {
+        self.done
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|e| e.label().to_string())
+            .collect()
+    }
+
+    pub fn redo_labels(&self, limit: usize) -> Vec<String> {
+        self.undone
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|e| e.label().to_string())
+            .collect()
+    }
+
     pub fn undo_label(&self) -> Option<&str> {
         self.done.last().map(Entry::label)
     }
@@ -2001,6 +2157,24 @@ impl UndoStack {
             return None;
         }
         let site = self.site;
+        if let Some(Entry::Meta(_, action)) = self.done.last() {
+            action.edit.apply(sheets, false);
+            let applied = Applied {
+                touched: Vec::new(),
+                label: action.label.clone(),
+                focus: action.focus,
+                skipped: 0,
+                structural: false,
+                refresh_sizes: None,
+                style_changes: Vec::new(),
+                merge_changes: Vec::new(),
+                merge_conflict: false,
+                total_touched: 0,
+            };
+            let entry = self.done.pop()?;
+            self.undone.push(entry);
+            return Some(applied);
+        }
         if let Some(Entry::NumericSort(stamp, action)) = self.done.last_mut() {
             let applied = action.apply(stamp, sheets, false, guard);
             let entry = self.done.pop()?;
@@ -2139,6 +2313,24 @@ impl UndoStack {
             return None;
         }
         let site = self.site;
+        if let Some(Entry::Meta(_, action)) = self.undone.last() {
+            action.edit.apply(sheets, true);
+            let applied = Applied {
+                touched: Vec::new(),
+                label: action.label.clone(),
+                focus: action.focus,
+                skipped: 0,
+                structural: false,
+                refresh_sizes: None,
+                style_changes: Vec::new(),
+                merge_changes: Vec::new(),
+                merge_conflict: false,
+                total_touched: 0,
+            };
+            let entry = self.undone.pop()?;
+            self.done.push(entry);
+            return Some(applied);
+        }
         if let Some(Entry::NumericSort(stamp, action)) = self.undone.last_mut() {
             let applied = action.apply(stamp, sheets, true, guard);
             let entry = self.undone.pop()?;

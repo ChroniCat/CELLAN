@@ -361,6 +361,87 @@ impl Sheet {
                 })
                 .collect();
         }
+        if !self.spill_shapes.is_empty()
+            && self.spill_shapes.iter().any(|(k, &(h, w))| {
+                let end = if rows {
+                    k.row.saturating_add(h.saturating_sub(1))
+                } else {
+                    k.col.saturating_add(w.saturating_sub(1))
+                };
+                end >= min_at
+            })
+        {
+            let mut next_shapes = crate::model::CellMetadata::default();
+            let mut orphan_tails: Vec<(u32, u32, u32, u32)> = Vec::new();
+            for (&anchor, &(h, w)) in &self.spill_shapes {
+                let mapped_anchor = if rows {
+                    shift.map(anchor.row).map(|r| CellRef::new(r, anchor.col))
+                } else {
+                    shift.map(anchor.col).map(|c| CellRef::new(anchor.row, c))
+                };
+                let Some(new_anchor) = mapped_anchor else {
+                    if h > 0 && w > 0 {
+                        let (r1, c1) = (anchor.row, anchor.col);
+                        let (r2, c2) = (
+                            r1.saturating_add(h.saturating_sub(1)),
+                            c1.saturating_add(w.saturating_sub(1)),
+                        );
+                        if rows {
+                            if let Some((nr1, nr2)) = shift.map_range(r1, r2) {
+                                orphan_tails.push((nr1, c1, nr2, c2));
+                            }
+                        } else if let Some((nc1, nc2)) = shift.map_range(c1, c2) {
+                            orphan_tails.push((r1, nc1, r2, nc2));
+                        }
+                    }
+                    continue;
+                };
+                if h == 0 || w == 0 {
+                    next_shapes.insert(new_anchor, (0, 0));
+                    continue;
+                }
+                let span_intact = if rows {
+                    let end = anchor.row.saturating_add(h.saturating_sub(1));
+                    shift
+                        .map_range(anchor.row, end)
+                        .is_some_and(|(nr1, nr2)| nr1 == new_anchor.row && nr2 - nr1 + 1 == h)
+                } else {
+                    let end = anchor.col.saturating_add(w.saturating_sub(1));
+                    shift
+                        .map_range(anchor.col, end)
+                        .is_some_and(|(nc1, nc2)| nc1 == new_anchor.col && nc2 - nc1 + 1 == w)
+                };
+                if span_intact {
+                    next_shapes.insert(new_anchor, (h, w));
+                } else {
+                    // Spill interior was split or truncated; clear surviving tails and mark for recalc.
+                    let (r1, c1) = (anchor.row, anchor.col);
+                    let (r2, c2) = (
+                        r1.saturating_add(h.saturating_sub(1)),
+                        c1.saturating_add(w.saturating_sub(1)),
+                    );
+                    if rows {
+                        if let Some((nr1, nr2)) = shift.map_range(r1, r2) {
+                            orphan_tails.push((nr1, c1, nr2, c2));
+                        }
+                    } else if let Some((nc1, nc2)) = shift.map_range(c1, c2) {
+                        orphan_tails.push((r1, nc1, r2, nc2));
+                    }
+                    next_shapes.insert(new_anchor, (0, 0));
+                }
+            }
+            self.spill_shapes = next_shapes;
+            for (r1, c1, r2, c2) in orphan_tails {
+                for r in r1..=r2 {
+                    for c in c1..=c2 {
+                        let k = CellRef::new(r, c);
+                        if self.spilled.remove_if_present(&k) {
+                            self.remove(r, c);
+                        }
+                    }
+                }
+            }
+        }
         if !self.hyperlinks.is_empty()
             && self.hyperlinks.iter().any(|(&(r, c), link)| {
                 let end = if rows {
@@ -1491,6 +1572,56 @@ impl Sheet {
                 .iter()
                 .filter_map(|key| Some(CellRef::new(del_map.map(key.row)?, key.col)))
                 .collect();
+        }
+        if !self.spill_shapes.is_empty()
+            && self
+                .spill_shapes
+                .iter()
+                .any(|(k, &(h, _))| k.row.saturating_add(h.saturating_sub(1)) >= min_at)
+        {
+            let mut next_shapes = crate::model::CellMetadata::default();
+            let mut orphan_tails: Vec<(u32, u32, u32, u32)> = Vec::new();
+            for (&anchor, &(h, w)) in &self.spill_shapes {
+                let Some(new_r) = del_map.map(anchor.row) else {
+                    if h > 0 && w > 0 {
+                        let r2 = anchor.row.saturating_add(h.saturating_sub(1));
+                        let c2 = anchor.col.saturating_add(w.saturating_sub(1));
+                        if let Some((nr1, nr2)) = del_map.map_range(anchor.row, r2) {
+                            orphan_tails.push((nr1, anchor.col, nr2, c2));
+                        }
+                    }
+                    continue;
+                };
+                let new_anchor = CellRef::new(new_r, anchor.col);
+                if h == 0 || w == 0 {
+                    next_shapes.insert(new_anchor, (0, 0));
+                    continue;
+                }
+                let end = anchor.row.saturating_add(h.saturating_sub(1));
+                let intact = del_map
+                    .map_range(anchor.row, end)
+                    .is_some_and(|(nr1, nr2)| nr1 == new_r && nr2 - nr1 + 1 == h);
+                if intact {
+                    next_shapes.insert(new_anchor, (h, w));
+                } else {
+                    let c2 = anchor.col.saturating_add(w.saturating_sub(1));
+                    if let Some((nr1, nr2)) = del_map.map_range(anchor.row, end) {
+                        orphan_tails.push((nr1, anchor.col, nr2, c2));
+                    }
+                    next_shapes.insert(new_anchor, (0, 0));
+                }
+            }
+            self.spill_shapes = next_shapes;
+            for (r1, c1, r2, c2) in orphan_tails {
+                for r in r1..=r2 {
+                    for c in c1..=c2 {
+                        let k = CellRef::new(r, c);
+                        if self.spilled.remove_if_present(&k) {
+                            self.remove(r, c);
+                        }
+                    }
+                }
+            }
         }
         if !self.hyperlinks.is_empty()
             && self

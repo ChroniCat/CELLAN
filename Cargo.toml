@@ -13,7 +13,7 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+panic = "unwind"
 
 # 基准测试与高频剖析采用 thin LTO + 16 并行代码生成单元（继承 release 的 opt-level = 3），
 # 将大型套件编译耗时从 ~9 分钟缩短至 ~1 分钟；正式发版仍走上方 fat LTO。

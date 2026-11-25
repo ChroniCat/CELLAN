@@ -50,6 +50,15 @@ pub(crate) enum SpecialTarget {
     Comments,
     CondFormats,
     DataValidation,
+    VisibleCells,
+    CurrentRegion,
+    RowDifferences,
+    ColDifferences,
+    Precedents,
+    Dependents,
+    LastCell,
+    CurrentArray,
+    Objects,
 }
 
 impl SpecialTarget {
@@ -62,6 +71,15 @@ impl SpecialTarget {
             SpecialTarget::Comments => "批注",
             SpecialTarget::CondFormats => "条件格式",
             SpecialTarget::DataValidation => "数据验证",
+            SpecialTarget::VisibleCells => "可见单元格",
+            SpecialTarget::CurrentRegion => "当前区域",
+            SpecialTarget::RowDifferences => "行内容差异单元格",
+            SpecialTarget::ColDifferences => "列内容差异单元格",
+            SpecialTarget::Precedents => "引用单元格",
+            SpecialTarget::Dependents => "从属单元格",
+            SpecialTarget::LastCell => "最后一个单元格",
+            SpecialTarget::CurrentArray => "当前数组",
+            SpecialTarget::Objects => "对象",
         }
     }
 }
@@ -1274,8 +1292,23 @@ impl SheetApp {
             return;
         }
         let si = self.sheet_idx;
+        let has_hidden = !self.wb.sheet(si).hidden_rows.is_empty()
+            && self.wb.sheet(si).hidden_rows.intersects_range(r1, r2);
+        let src_row = if has_hidden {
+            let sh = self.wb.sheet(si);
+            match (r1..=r2).rev().find(|r| !sh.hidden_rows.contains(r)) {
+                Some(r) if r > r1 => r,
+                _ => {
+                    self.status = "选区内没有可填充的可见行（筛选隐藏行已保留）".into();
+                    return;
+                }
+            }
+        } else {
+            r2
+        };
+        self.last_repeat_action = Some(crate::RepeatAction::FillUp);
         if self.net.is_none() && area > sheetcore::undo::COW_BATCH_THRESHOLD as u64 {
-            if !self.check_sparse_rect_preflight(si, (r1, c1, r2 - 1, c2), &[], "向上填充") {
+            if !self.check_sparse_rect_preflight(si, (r1, c1, src_row - 1, c2), &[], "向上填充") {
                 return;
             }
             let before_sheet = self.wb.sheet(si).clone();
@@ -1285,37 +1318,24 @@ impl SheetApp {
             let mut has_formula = false;
             {
                 let sh = self.wb.sheet_mut(si);
+                let vis_rows = if has_hidden {
+                    crate::visible_row_intervals_in_range(&sh.hidden_rows, r1, src_row - 1)
+                } else {
+                    vec![(r1, src_row - 1)]
+                };
                 for c in c1..=c2 {
-                    let src = sh.get(r2, c).map(|cell| cell.into_owned());
-                    let sid = sh.style_of(r2, c);
+                    let src = sh.get(src_row, c).map(|cell| cell.into_owned());
+                    let sid = sh.style_of(src_row, c);
                     if let Some(source) = src {
                         has_formula |= source.formula.is_some();
-                        for r in r1..r2 {
-                            let after = Cell {
-                                value: source.value.clone(),
-                                formula: source.formula.as_deref().map(|f| {
-                                    formulas.translate(f, r as i64 - r2 as i64, 0).into()
-                                }),
-                            };
-                            if sample.len() < sheetcore::revision::MAX_CELLS {
-                                let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
-                                let before_style = sh.style_of(r, c);
-                                sample.push(sheetcore::undo::CellDelta {
-                                    sheet: si,
-                                    row: r,
-                                    col: c,
-                                    before,
-                                    after: after.clone(),
-                                    before_style,
-                                    after_style: sid,
-                                });
-                            }
-                            sh.set(r, c, after);
-                            changed += 1;
-                        }
-                    } else {
-                        for r in r1..r2 {
-                            if sh.get(r, c).is_some() {
+                        for &(vr1, vr2) in &vis_rows {
+                            for r in vr1..=vr2 {
+                                let after = Cell {
+                                    value: source.value.clone(),
+                                    formula: source.formula.as_deref().map(|f| {
+                                        formulas.translate(f, r as i64 - src_row as i64, 0).into()
+                                    }),
+                                };
                                 if sample.len() < sheetcore::revision::MAX_CELLS {
                                     let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
                                     let before_style = sh.style_of(r, c);
@@ -1324,17 +1344,40 @@ impl SheetApp {
                                         row: r,
                                         col: c,
                                         before,
-                                        after: Cell::default(),
+                                        after: after.clone(),
                                         before_style,
                                         after_style: sid,
                                     });
                                 }
-                                sh.remove(r, c);
+                                sh.set(r, c, after);
                                 changed += 1;
                             }
+                            sh.set_style_rect(vr1, c, vr2, c, sid);
+                        }
+                    } else {
+                        for &(vr1, vr2) in &vis_rows {
+                            for r in vr1..=vr2 {
+                                if sh.get(r, c).is_some() {
+                                    if sample.len() < sheetcore::revision::MAX_CELLS {
+                                        let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
+                                        let before_style = sh.style_of(r, c);
+                                        sample.push(sheetcore::undo::CellDelta {
+                                            sheet: si,
+                                            row: r,
+                                            col: c,
+                                            before,
+                                            after: Cell::default(),
+                                            before_style,
+                                            after_style: sid,
+                                        });
+                                    }
+                                    sh.remove(r, c);
+                                    changed += 1;
+                                }
+                            }
+                            sh.set_style_rect(vr1, c, vr2, c, sid);
                         }
                     }
-                    sh.set_style_rect(r1, c, r2 - 1, c, sid);
                 }
             }
             self.record_revision_sample("向上填充", &sample, changed.max(1));
@@ -1356,22 +1399,32 @@ impl SheetApp {
             self.status = format!("已用底行向上填充 {}-{} 行", r1 + 1, r2 + 1);
             return;
         }
-        let gate = sheetcore::undo::rect_keys(r1, c1, r2 - 1, c2);
+        let mut gate = sheetcore::undo::rect_keys(r1, c1, src_row - 1, c2);
+        if has_hidden {
+            let sh = self.wb.sheet(si);
+            gate.retain(|&(r, _)| !sh.hidden_rows.contains(&r));
+        }
+        if gate.is_empty() {
+            self.status = "选区内没有可填充的可见行（筛选隐藏行已保留）".into();
+            return;
+        }
         if !self.write_preflight(&gate, "向上填充") {
             return;
         }
-        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
         let mut formulas = sheetcore::refs::FillFormulas::default();
-        let txn = self.txn_begin(&keys);
+        let txn = self.txn_begin(&gate);
         let mut touched = Vec::new();
         for c in c1..=c2 {
-            let src = self.wb.sheet(self.sheet_idx).get(r2, c).map(|c| c.into_owned());
-            let sid = self.wb.sheet(self.sheet_idx).style_of(r2, c);
-            for r in r1..r2 {
+            let src = self.wb.sheet(self.sheet_idx).get(src_row, c).map(|c| c.into_owned());
+            let sid = self.wb.sheet(self.sheet_idx).style_of(src_row, c);
+            for r in r1..src_row {
+                if has_hidden && self.wb.sheet(self.sheet_idx).hidden_rows.contains(&r) {
+                    continue;
+                }
                 if let Some(ref s) = src {
                     let mut cell = s.clone();
                     if let Some(ref f) = s.formula {
-                        cell.formula = Some(formulas.translate(f, r as i64 - r2 as i64, 0).into());
+                        cell.formula = Some(formulas.translate(f, r as i64 - src_row as i64, 0).into());
                     }
                     self.wb.sheet_mut(self.sheet_idx).set(r, c, cell);
                 } else {
@@ -1412,6 +1465,9 @@ impl SheetApp {
             return;
         }
         let si = self.sheet_idx;
+        let has_hidden = !self.wb.sheet(si).hidden_rows.is_empty()
+            && self.wb.sheet(si).hidden_rows.intersects_range(r1, r2);
+        self.last_repeat_action = Some(crate::RepeatAction::FillLeft);
         if self.net.is_none() && area > sheetcore::undo::COW_BATCH_THRESHOLD as u64 {
             if !self.check_sparse_rect_preflight(si, (r1, c1, r2, c2 - 1), &[], "向左填充") {
                 return;
@@ -1423,37 +1479,24 @@ impl SheetApp {
             let mut has_formula = false;
             {
                 let sh = self.wb.sheet_mut(si);
-                for r in r1..=r2 {
-                    let src = sh.get(r, c2).map(|cell| cell.into_owned());
-                    let sid = sh.style_of(r, c2);
-                    if let Some(source) = src {
-                        has_formula |= source.formula.is_some();
-                        for c in c1..c2 {
-                            let after = Cell {
-                                value: source.value.clone(),
-                                formula: source.formula.as_deref().map(|f| {
-                                    formulas.translate(f, 0, c as i64 - c2 as i64).into()
-                                }),
-                            };
-                            if sample.len() < sheetcore::revision::MAX_CELLS {
-                                let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
-                                let before_style = sh.style_of(r, c);
-                                sample.push(sheetcore::undo::CellDelta {
-                                    sheet: si,
-                                    row: r,
-                                    col: c,
-                                    before,
-                                    after: after.clone(),
-                                    before_style,
-                                    after_style: sid,
-                                });
-                            }
-                            sh.set(r, c, after);
-                            changed += 1;
-                        }
-                    } else {
-                        for c in c1..c2 {
-                            if sh.get(r, c).is_some() {
+                let vis_rows = if has_hidden {
+                    crate::visible_row_intervals_in_range(&sh.hidden_rows, r1, r2)
+                } else {
+                    vec![(r1, r2)]
+                };
+                for &(vr1, vr2) in &vis_rows {
+                    for r in vr1..=vr2 {
+                        let src = sh.get(r, c2).map(|cell| cell.into_owned());
+                        let sid = sh.style_of(r, c2);
+                        if let Some(source) = src {
+                            has_formula |= source.formula.is_some();
+                            for c in c1..c2 {
+                                let after = Cell {
+                                    value: source.value.clone(),
+                                    formula: source.formula.as_deref().map(|f| {
+                                        formulas.translate(f, 0, c as i64 - c2 as i64).into()
+                                    }),
+                                };
                                 if sample.len() < sheetcore::revision::MAX_CELLS {
                                     let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
                                     let before_style = sh.style_of(r, c);
@@ -1462,17 +1505,37 @@ impl SheetApp {
                                         row: r,
                                         col: c,
                                         before,
-                                        after: Cell::default(),
+                                        after: after.clone(),
                                         before_style,
                                         after_style: sid,
                                     });
                                 }
-                                sh.remove(r, c);
+                                sh.set(r, c, after);
                                 changed += 1;
                             }
+                        } else {
+                            for c in c1..c2 {
+                                if sh.get(r, c).is_some() {
+                                    if sample.len() < sheetcore::revision::MAX_CELLS {
+                                        let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
+                                        let before_style = sh.style_of(r, c);
+                                        sample.push(sheetcore::undo::CellDelta {
+                                            sheet: si,
+                                            row: r,
+                                            col: c,
+                                            before,
+                                            after: Cell::default(),
+                                            before_style,
+                                            after_style: sid,
+                                        });
+                                    }
+                                    sh.remove(r, c);
+                                    changed += 1;
+                                }
+                            }
                         }
+                        sh.set_style_rect(r, c1, r, c2 - 1, sid);
                     }
-                    sh.set_style_rect(r, c1, r, c2 - 1, sid);
                 }
             }
             self.record_revision_sample("向左填充", &sample, changed.max(1));
@@ -1494,15 +1557,25 @@ impl SheetApp {
             self.status = format!("已用最右列向左填充至 {} 列", col_label(c1));
             return;
         }
-        let gate = sheetcore::undo::rect_keys(r1, c1, r2, c2 - 1);
+        let mut gate = sheetcore::undo::rect_keys(r1, c1, r2, c2 - 1);
+        if has_hidden {
+            let sh = self.wb.sheet(si);
+            gate.retain(|&(r, _)| !sh.hidden_rows.contains(&r));
+        }
+        if gate.is_empty() {
+            self.status = "选区内没有可填充的可见行（筛选隐藏行已保留）".into();
+            return;
+        }
         if !self.write_preflight(&gate, "向左填充") {
             return;
         }
-        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
         let mut formulas = sheetcore::refs::FillFormulas::default();
-        let txn = self.txn_begin(&keys);
+        let txn = self.txn_begin(&gate);
         let mut touched = Vec::new();
         for r in r1..=r2 {
+            if has_hidden && self.wb.sheet(self.sheet_idx).hidden_rows.contains(&r) {
+                continue;
+            }
             let src = self.wb.sheet(self.sheet_idx).get(r, c2).map(|c| c.into_owned());
             let sid = self.wb.sheet(self.sheet_idx).style_of(r, c2);
             for c in c1..c2 {
@@ -1673,6 +1746,8 @@ impl SheetApp {
         };
 
         let si = self.sheet_idx;
+        let has_hidden = !self.wb.sheet(si).hidden_rows.is_empty()
+            && self.wb.sheet(si).hidden_rows.intersects_range(r1, r2);
         let src_sid = self.wb.sheet(si).style_of(r1, c1);
         let target_sid = if is_date && self.wb.styles.get(src_sid).format.is_empty() {
             let mut st = self.wb.styles.get(src_sid).clone();
@@ -1691,94 +1766,111 @@ impl SheetApp {
             let mut sample = Vec::with_capacity(sheetcore::revision::MAX_CELLS);
             {
                 let sh = self.wb.sheet_mut(si);
+                let vis_rows = if has_hidden {
+                    crate::visible_row_intervals_in_range(&sh.hidden_rows, r1, r2)
+                } else {
+                    vec![(r1, r2)]
+                };
                 if cfg.by_row {
-                    for r in r1..=r2 {
-                        let base = sh
-                            .get(r, c1)
-                            .and_then(|c| match c.value {
-                                Value::Number(n) => Some(n),
-                                _ => None,
-                            })
-                            .unwrap_or(start_val);
-                        let mut last_c = None;
-                        for c in c1..=c2 {
-                            let v = advance_serial(c - c1, base);
-                            if let Some(lim) = stop {
-                                if (step >= 0.0 && v > lim + 1e-9) || (step < 0.0 && v < lim - 1e-9)
-                                {
-                                    break;
+                    for &(vr1, vr2) in &vis_rows {
+                        for r in vr1..=vr2 {
+                            let base = sh
+                                .get(r, c1)
+                                .and_then(|c| match c.value {
+                                    Value::Number(n) => Some(n),
+                                    _ => None,
+                                })
+                                .unwrap_or(start_val);
+                            let mut last_c = None;
+                            for c in c1..=c2 {
+                                let v = advance_serial(c - c1, base);
+                                if let Some(lim) = stop {
+                                    if (step >= 0.0 && v > lim + 1e-9) || (step < 0.0 && v < lim - 1e-9)
+                                    {
+                                        break;
+                                    }
                                 }
+                                let after = Cell {
+                                    value: Value::Number(v),
+                                    formula: None,
+                                };
+                                if sample.len() < sheetcore::revision::MAX_CELLS {
+                                    let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
+                                    let before_style = sh.style_of(r, c);
+                                    sample.push(sheetcore::undo::CellDelta {
+                                        sheet: si,
+                                        row: r,
+                                        col: c,
+                                        before,
+                                        after: after.clone(),
+                                        before_style,
+                                        after_style: if target_sid != 0 { target_sid } else { before_style },
+                                    });
+                                }
+                                sh.set(r, c, after);
+                                last_c = Some(c);
+                                written += 1;
                             }
-                            let after = Cell {
-                                value: Value::Number(v),
-                                formula: None,
-                            };
-                            if sample.len() < sheetcore::revision::MAX_CELLS {
-                                let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
-                                let before_style = sh.style_of(r, c);
-                                sample.push(sheetcore::undo::CellDelta {
-                                    sheet: si,
-                                    row: r,
-                                    col: c,
-                                    before,
-                                    after: after.clone(),
-                                    before_style,
-                                    after_style: if target_sid != 0 { target_sid } else { before_style },
-                                });
+                            if target_sid != 0
+                                && let Some(lc) = last_c
+                            {
+                                sh.set_style_rect(r, c1, r, lc, target_sid);
                             }
-                            sh.set(r, c, after);
-                            last_c = Some(c);
-                            written += 1;
-                        }
-                        if target_sid != 0
-                            && let Some(lc) = last_c
-                        {
-                            sh.set_style_rect(r, c1, r, lc, target_sid);
                         }
                     }
                 } else {
                     for c in c1..=c2 {
+                        let first_r = vis_rows.first().map(|&(a, _)| a).unwrap_or(r1);
                         let base = sh
-                            .get(r1, c)
+                            .get(first_r, c)
                             .and_then(|cell| match cell.value {
                                 Value::Number(n) => Some(n),
                                 _ => None,
                             })
                             .unwrap_or(start_val);
-                        let mut last_r = None;
-                        for r in r1..=r2 {
-                            let v = advance_serial(r - r1, base);
-                            if let Some(lim) = stop {
-                                if (step >= 0.0 && v > lim + 1e-9) || (step < 0.0 && v < lim - 1e-9)
-                                {
-                                    break;
+                        let mut step_idx = 0u32;
+                        'col_fill: for &(vr1, vr2) in &vis_rows {
+                            let mut last_r = None;
+                            for r in vr1..=vr2 {
+                                let v = advance_serial(step_idx, base);
+                                step_idx += 1;
+                                if let Some(lim) = stop {
+                                    if (step >= 0.0 && v > lim + 1e-9) || (step < 0.0 && v < lim - 1e-9)
+                                    {
+                                        if target_sid != 0
+                                            && let Some(lr) = last_r
+                                        {
+                                            sh.set_style_rect(vr1, c, lr, c, target_sid);
+                                        }
+                                        break 'col_fill;
+                                    }
                                 }
+                                let after = Cell {
+                                    value: Value::Number(v),
+                                    formula: None,
+                                };
+                                if sample.len() < sheetcore::revision::MAX_CELLS {
+                                    let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
+                                    let before_style = sh.style_of(r, c);
+                                    sample.push(sheetcore::undo::CellDelta {
+                                        sheet: si,
+                                        row: r,
+                                        col: c,
+                                        before,
+                                        after: after.clone(),
+                                        before_style,
+                                        after_style: if target_sid != 0 { target_sid } else { before_style },
+                                    });
+                                }
+                                sh.set(r, c, after);
+                                last_r = Some(r);
+                                written += 1;
                             }
-                            let after = Cell {
-                                value: Value::Number(v),
-                                formula: None,
-                            };
-                            if sample.len() < sheetcore::revision::MAX_CELLS {
-                                let before = sh.get(r, c).map(|x| x.into_owned()).unwrap_or_default();
-                                let before_style = sh.style_of(r, c);
-                                sample.push(sheetcore::undo::CellDelta {
-                                    sheet: si,
-                                    row: r,
-                                    col: c,
-                                    before,
-                                    after: after.clone(),
-                                    before_style,
-                                    after_style: if target_sid != 0 { target_sid } else { before_style },
-                                });
+                            if target_sid != 0
+                                && let Some(lr) = last_r
+                            {
+                                sh.set_style_rect(vr1, c, lr, c, target_sid);
                             }
-                            sh.set(r, c, after);
-                            last_r = Some(r);
-                            written += 1;
-                        }
-                        if target_sid != 0
-                            && let Some(lr) = last_r
-                        {
-                            sh.set_style_rect(r1, c, lr, c, target_sid);
                         }
                     }
                 }
@@ -1806,7 +1898,15 @@ impl SheetApp {
             return;
         }
 
-        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        let mut keys = sheetcore::undo::rect_keys(r1, c1, r2, c2);
+        if has_hidden {
+            let sh = self.wb.sheet(si);
+            keys.retain(|&(r, _)| !sh.hidden_rows.contains(&r));
+        }
+        if keys.is_empty() {
+            self.status = "选区内没有可填充的可见行（筛选隐藏行已保留）".into();
+            return;
+        }
         if !self.write_preflight(&keys, "序列填充") {
             return;
         }
@@ -1815,6 +1915,9 @@ impl SheetApp {
 
         if cfg.by_row {
             for r in r1..=r2 {
+                if has_hidden && self.wb.sheet(self.sheet_idx).hidden_rows.contains(&r) {
+                    continue;
+                }
                 let base = self
                     .wb
                     .sheet(self.sheet_idx)
@@ -1847,17 +1950,25 @@ impl SheetApp {
             }
         } else {
             for c in c1..=c2 {
+                let first_r = (r1..=r2)
+                    .find(|r| !has_hidden || !self.wb.sheet(self.sheet_idx).hidden_rows.contains(r))
+                    .unwrap_or(r1);
                 let base = self
                     .wb
                     .sheet(self.sheet_idx)
-                    .get(r1, c)
+                    .get(first_r, c)
                     .and_then(|cell| match cell.value {
                         Value::Number(n) => Some(n),
                         _ => None,
                     })
                     .unwrap_or(start_val);
+                let mut step_idx = 0u32;
                 for r in r1..=r2 {
-                    let v = advance_serial(r - r1, base);
+                    if has_hidden && self.wb.sheet(self.sheet_idx).hidden_rows.contains(&r) {
+                        continue;
+                    }
+                    let v = advance_serial(step_idx, base);
+                    step_idx += 1;
                     if let Some(lim) = stop {
                         if (step >= 0.0 && v > lim + 1e-9) || (step < 0.0 && v < lim - 1e-9) {
                             break;
@@ -1958,11 +2069,90 @@ impl SheetApp {
 
     pub(crate) fn select_special(&mut self, target: SpecialTarget) {
         self.commit_edit(None);
-        let sh = self.wb.sheet(self.sheet_idx);
-        let (sr1, sc1, sr2, sc2) = self.sel_rect();
-        let multi = sr1 != sr2 || sc1 != sc2 || !self.extra_sel.is_empty();
-        let (r1, c1, r2, c2) = if multi {
-            (sr1, sc1, sr2, sc2)
+        self.nav_rect = None;
+        let si = self.sheet_idx;
+        // 特殊快捷目标：直接求目标区域/对象，无需逐格扫描
+        match target {
+            SpecialTarget::CurrentRegion => {
+                let (r1, c1, r2, c2) = self.current_region_rect(self.sel.0, self.sel.1);
+                self.sel = (r1, c1);
+                self.sel_end = (r2, c2);
+                self.extra_sel.clear();
+                self.ensure_visible();
+                self.status = format!("已选中当前区域 {}:{}", cell_name(r1, c1), cell_name(r2, c2));
+                return;
+            }
+            SpecialTarget::LastCell => {
+                let (mr, mc) = self.used_end();
+                self.sel = (mr, mc);
+                self.sel_end = (mr, mc);
+                self.extra_sel.clear();
+                self.ensure_visible();
+                self.status = format!("已定位到最后一个单元格 {}", cell_name(mr, mc));
+                return;
+            }
+            SpecialTarget::CurrentArray => {
+                let (ar, ac) = self.sel;
+                let sh = self.wb.sheet(si);
+                let found = sh
+                    .arrays
+                    .iter()
+                    .find_map(|&(_, rect)| {
+                        (ar >= rect.0 && ar <= rect.2 && ac >= rect.1 && ac <= rect.3).then_some(rect)
+                    })
+                    .or_else(|| {
+                        sh.spill_shapes.iter().find_map(|(&anchor, &(h, w))| {
+                            let r2 = anchor.row.saturating_add(h.saturating_sub(1));
+                            let c2 = anchor.col.saturating_add(w.saturating_sub(1));
+                            (ar >= anchor.row && ar <= r2 && ac >= anchor.col && ac <= c2)
+                                .then_some((anchor.row, anchor.col, r2, c2))
+                        })
+                    });
+                if let Some((r1, c1, r2, c2)) = found {
+                    self.sel = (r1, c1);
+                    self.sel_end = (r2, c2);
+                    self.extra_sel.clear();
+                    self.ensure_visible();
+                    self.status = format!("已选中当前数组 {}:{}", cell_name(r1, c1), cell_name(r2, c2));
+                } else {
+                    self.status = "当前单元格不属于任何数组或溢出区域".into();
+                }
+                return;
+            }
+            SpecialTarget::Objects => {
+                let sh = self.wb.sheet(si);
+                if !sh.pictures.is_empty() {
+                    self.pic_sel = Some(0);
+                    self.status = format!("已选中图片对象（共 {} 个）", sh.pictures.len());
+                } else if !sh.textboxes.is_empty() {
+                    self.tb_sel = Some(0);
+                    self.status = format!("已选中文本框对象（共 {} 个）", sh.textboxes.len());
+                } else if !sh.charts.is_empty() {
+                    self.status = format!("本表有 {} 个图表对象", sh.charts.len());
+                } else {
+                    self.status = "未找到任何对象".into();
+                }
+                return;
+            }
+            SpecialTarget::Precedents => {
+                self.jump_precedents_or_dependents(true, false);
+                return;
+            }
+            SpecialTarget::Dependents => {
+                self.jump_precedents_or_dependents(false, false);
+                return;
+            }
+            _ => {}
+        }
+
+        let sh = self.wb.sheet(si);
+        let sel_rects = self.sel_rects();
+        let multi = sel_rects.len() > 1
+            || sel_rects
+                .first()
+                .is_some_and(|&(r1, c1, r2, c2)| r1 != r2 || c1 != c2);
+        let search_rects: Vec<(u32, u32, u32, u32)> = if multi {
+            sel_rects
         } else {
             let (mut mr, mut mc) = self.used_end();
             for k in sh.notes.keys() {
@@ -1983,10 +2173,14 @@ impl SheetApp {
                     let _ = (a, b);
                 }
             }
-            (0, 0, mr, mc)
+            vec![(0, 0, mr, mc)]
         };
-        if (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 > 250_000 {
-            self.status = "搜索范围超过 25 万格，请先框选需要定位的区域".into();
+        let total_area: u64 = search_rects
+            .iter()
+            .map(|&(r1, c1, r2, c2)| u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1))
+            .fold(0u64, u64::saturating_add);
+        if target != SpecialTarget::VisibleCells && total_area > 500_000 {
+            self.status = "搜索范围超过 50 万格，请先框选需要定位的区域".into();
             return;
         }
 
@@ -2004,37 +2198,96 @@ impl SheetApp {
                     .any(|&(a, b, cc, d)| r >= a && r <= cc && c >= b && c <= d)
             })
         };
+        let active_r = self.sel.0;
+        let active_c = self.sel.1;
 
         let mut count = 0usize;
         let mut rects: Vec<(u32, u32, u32, u32)> = Vec::new();
-        for r in r1..=r2 {
-            let mut run_start: Option<u32> = None;
-            for c in c1..=c2 {
-                let cell = sh.get(r, c);
-                let hit = match target {
-                    SpecialTarget::Formulas => cell.is_some_and(|x| x.formula.is_some()),
-                    SpecialTarget::Constants => {
-                        cell.is_some_and(|x| x.formula.is_none() && !matches!(x.value, Value::Empty))
+        if target == SpecialTarget::VisibleCells {
+            for &(r1, c1, r2, c2) in &search_rects {
+                // 同时跳过筛选隐藏行、手动隐藏行与隐藏列
+                let mut vis_cols: Vec<(u32, u32)> = Vec::new();
+                let mut cs: Option<u32> = None;
+                for c in c1..=c2 {
+                    let hidden_c = sh.hidden_cols.contains(&c);
+                    if !hidden_c {
+                        if cs.is_none() {
+                            cs = Some(c);
+                        }
+                    } else if let Some(s) = cs.take() {
+                        vis_cols.push((s, c - 1));
                     }
-                    SpecialTarget::Blanks => {
-                        cell.is_none_or(|x| x.formula.is_none() && matches!(x.value, Value::Empty))
+                }
+                if let Some(s) = cs {
+                    vis_cols.push((s, c2));
+                }
+                let mut rs: Option<u32> = None;
+                let mut vis_rows: Vec<(u32, u32)> = Vec::new();
+                for r in r1..=r2 {
+                    let hidden_r = sh.hidden_rows.contains(&r) || sh.hidden_rows_user.contains(&r);
+                    if !hidden_r {
+                        if rs.is_none() {
+                            rs = Some(r);
+                        }
+                    } else if let Some(s) = rs.take() {
+                        vis_rows.push((s, r - 1));
                     }
-                    SpecialTarget::Errors => cell.is_some_and(|x| matches!(x.value, Value::Error(_))),
-                    SpecialTarget::Comments => sh.notes.contains_key(&CellRef::new(r, c)),
-                    SpecialTarget::CondFormats => in_cf(r, c),
-                    SpecialTarget::DataValidation => in_dv(r, c),
-                };
-                if hit {
-                    count += 1;
-                    if run_start.is_none() {
-                        run_start = Some(c);
+                }
+                if let Some(s) = rs {
+                    vis_rows.push((s, r2));
+                }
+                for &(vr1, vr2) in &vis_rows {
+                    for &(vc1, vc2) in &vis_cols {
+                        count = count.saturating_add(
+                            (vr2 - vr1 + 1) as usize * (vc2 - vc1 + 1) as usize,
+                        );
+                        rects.push((vr1, vc1, vr2, vc2));
                     }
-                } else if let Some(cs) = run_start.take() {
-                    rects.push((r, cs, r, c - 1));
                 }
             }
-            if let Some(cs) = run_start {
-                rects.push((r, cs, r, c2));
+        } else {
+            for &(r1, c1, r2, c2) in &search_rects {
+                for r in r1..=r2 {
+                    let mut run_start: Option<u32> = None;
+                    for c in c1..=c2 {
+                        let cell = sh.get(r, c);
+                        let hit = match target {
+                            SpecialTarget::Formulas => cell.is_some_and(|x| x.formula.is_some()),
+                            SpecialTarget::Constants => cell.is_some_and(|x| {
+                                x.formula.is_none() && !matches!(x.value, Value::Empty)
+                            }),
+                            SpecialTarget::Blanks => cell.is_none_or(|x| {
+                                x.formula.is_none() && matches!(x.value, Value::Empty)
+                            }),
+                            SpecialTarget::Errors => {
+                                cell.is_some_and(|x| matches!(x.value, Value::Error(_)))
+                            }
+                            SpecialTarget::Comments => sh.notes.contains_key(&CellRef::new(r, c)),
+                            SpecialTarget::CondFormats => in_cf(r, c),
+                            SpecialTarget::DataValidation => in_dv(r, c),
+                            SpecialTarget::RowDifferences => {
+                                let base = sh.value(r, active_c);
+                                sh.value(r, c) != base
+                            }
+                            SpecialTarget::ColDifferences => {
+                                let base = sh.value(active_r, c);
+                                sh.value(r, c) != base
+                            }
+                            _ => false,
+                        };
+                        if hit {
+                            count += 1;
+                            if run_start.is_none() {
+                                run_start = Some(c);
+                            }
+                        } else if let Some(cs) = run_start.take() {
+                            rects.push((r, cs, r, c - 1));
+                        }
+                    }
+                    if let Some(cs) = run_start {
+                        rects.push((r, cs, r, c2));
+                    }
+                }
             }
         }
 
@@ -2042,10 +2295,21 @@ impl SheetApp {
             self.status = format!("未找到任何「{}」单元格", target.label());
             return;
         }
-        let first = rects[0];
+        // 垂直合并列范围相同的连续行带，显著减少多选矩形块数，并彻底解除旧 129 块硬截断
+        let mut coalesced: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(rects.len());
+        for rc in rects {
+            if let Some(prev) = coalesced.last_mut() {
+                if prev.1 == rc.1 && prev.3 == rc.3 && prev.2.saturating_add(1) == rc.0 {
+                    prev.2 = rc.2;
+                    continue;
+                }
+            }
+            coalesced.push(rc);
+        }
+        let first = coalesced[0];
         self.sel = (first.0, first.1);
         self.sel_end = (first.2, first.3);
-        self.extra_sel = rects.into_iter().skip(1).take(128).collect();
+        self.extra_sel = coalesced.into_iter().skip(1).take(65_536).collect();
         self.ensure_visible();
         self.status = format!("已选中 {count} 个「{}」单元格", target.label());
     }
@@ -2090,22 +2354,27 @@ impl SheetApp {
                 ui.label(RichText::new("选择符合以下条件的单元格:").size(12.0));
                 ui.add_space(4.0);
                 ui.columns(2, |cols| {
-                    for (idx, t) in [
+                    for t in [
                         SpecialTarget::Formulas,
                         SpecialTarget::Constants,
                         SpecialTarget::Blanks,
                         SpecialTarget::Errors,
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let _ = idx;
+                        SpecialTarget::VisibleCells,
+                        SpecialTarget::CurrentRegion,
+                        SpecialTarget::CurrentArray,
+                        SpecialTarget::LastCell,
+                    ] {
                         cols[0].radio_value(&mut st.special, t, t.label());
                     }
                     for t in [
+                        SpecialTarget::RowDifferences,
+                        SpecialTarget::ColDifferences,
+                        SpecialTarget::Precedents,
+                        SpecialTarget::Dependents,
                         SpecialTarget::Comments,
                         SpecialTarget::CondFormats,
                         SpecialTarget::DataValidation,
+                        SpecialTarget::Objects,
                     ] {
                         cols[1].radio_value(&mut st.special, t, t.label());
                     }

@@ -759,7 +759,52 @@ impl Criterion {
     }
 }
 
-/// 一个筛选器：区域 + 每列允许的值 / 每列的条件
+/// 按颜色筛选（单元格填充色或字体颜色）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ColorFilter {
+    /// 匹配指定背景填充色（`None` 表示无填充）。
+    Fill(Option<[u8; 3]>),
+    /// 匹配指定字体颜色。
+    Font([u8; 3]),
+}
+
+/// 日期层级筛选节点（年 / 年-月 / 年-月-日）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DateGroupItem {
+    pub year: i32,
+    pub month: Option<u32>,
+    pub day: Option<u32>,
+}
+
+impl DateGroupItem {
+    #[inline]
+    pub fn matches(&self, y: i32, m: u32, d: u32) -> bool {
+        if self.year != y {
+            return false;
+        }
+        if let Some(mo) = self.month
+            && mo != m
+        {
+            return false;
+        }
+        if let Some(da) = self.day
+            && da != d
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// 筛选列里的日期树（年 -> 月 -> 日）和唯一填充/字体颜色。
+#[derive(Clone, Debug, Default)]
+pub struct ColumnFilterMeta {
+    pub dates: std::collections::BTreeMap<i32, std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>>,
+    pub fill_colors: Vec<Option<[u8; 3]>>,
+    pub font_colors: Vec<[u8; 3]>,
+}
+
+/// 一个筛选器：区域 + 每列允许的值 / 条件 / 日期分组 / 颜色筛选
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Filter {
     pub range: (u32, u32, u32, u32),
@@ -767,6 +812,10 @@ pub struct Filter {
     pub allows: crate::model::CellMetadata<u32, HashSet<String>>,
     /// 列号 → 条件（文本筛选/数字筛选）；和 allows 是「与」关系
     pub criteria: HashMap<u32, Criterion>,
+    /// 列号 → 允许的日期层级分组（年 / 月 / 日）
+    pub date_groups: HashMap<u32, Vec<DateGroupItem>>,
+    /// 列号 → 按单元格填充色或字体色筛选
+    pub color_filters: HashMap<u32, ColorFilter>,
 }
 
 #[inline]
@@ -921,6 +970,8 @@ impl Filter {
             range: (r1, c1, r2, c2),
             allows: Default::default(),
             criteria: HashMap::new(),
+            date_groups: HashMap::new(),
+            color_filters: HashMap::new(),
         }
     }
 
@@ -1048,11 +1099,137 @@ impl Filter {
         out
     }
 
-    /// 这列有没有任何筛选（值列表或条件）
+    /// 支持日期分组与颜色筛选的完整隐藏行区间计算（需要样式表与日期体系）。
+    pub fn hidden_row_intervals_with_styles(
+        &self,
+        sheet: &Sheet,
+        styles: &crate::style::StyleTable,
+        sys: crate::model::DateSystem,
+    ) -> crate::layout::HiddenIndices {
+        if self.date_groups.is_empty() && self.color_filters.is_empty() {
+            return self.hidden_row_intervals(sheet);
+        }
+        let (r1, c1, mut r2, c2) = self.range;
+        if r1 >= r2 {
+            return crate::layout::HiddenIndices::default();
+        }
+        let used_max_r = sheet.used_bounds().map(|(_, _, ur2, _)| ur2).unwrap_or(r1);
+        if r2 > used_max_r.saturating_add(64) {
+            r2 = used_max_r.saturating_add(1).min(r2);
+        }
+        if r1 >= r2 {
+            return crate::layout::HiddenIndices::default();
+        }
+        let mut hidden = self.hidden_row_intervals(sheet);
+        let mut extra_hidden: Vec<u32> = Vec::new();
+        for r in (r1 + 1)..=r2 {
+            if hidden.contains(&r) {
+                continue;
+            }
+            let mut keep = true;
+            for (&col, groups) in &self.date_groups {
+                if col < c1 || col > c2 || groups.is_empty() {
+                    continue;
+                }
+                let st = styles.get(sheet.style_of(r, col));
+                let matched = match sheet.value_ref(r, col).as_ref() {
+                    Value::Number(n) if crate::style::is_date_format(&st.format) => {
+                        crate::formula::functions::serial_to_date_in(sys, *n)
+                            .is_some_and(|(y, m, d)| groups.iter().any(|g| g.matches(y, m, d)))
+                    }
+                    _ => false,
+                };
+                if !matched {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                for (&col, cf) in &self.color_filters {
+                    if col < c1 || col > c2 {
+                        continue;
+                    }
+                    let st = styles.get(sheet.style_of(r, col));
+                    let matched = match *cf {
+                        ColorFilter::Fill(target) => st.fill == target,
+                        ColorFilter::Font(target) => st.color == target,
+                    };
+                    if !matched {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
+            if !keep {
+                extra_hidden.push(r);
+            }
+        }
+        for r in extra_hidden {
+            hidden.insert(r);
+        }
+        hidden
+    }
+
+    pub fn hidden_rows_with_styles(
+        &self,
+        sheet: &Sheet,
+        styles: &crate::style::StyleTable,
+        sys: crate::model::DateSystem,
+    ) -> HashSet<u32> {
+        let intervals = self.hidden_row_intervals_with_styles(sheet, styles, sys);
+        let mut out = HashSet::with_capacity(intervals.len());
+        for &(lo, hi) in intervals.intervals() {
+            out.extend(lo..=hi);
+        }
+        out
+    }
+
+    /// 这列有没有任何筛选（值列表、条件、日期分组或颜色筛选）
     pub fn is_filtered(&self, col: u32) -> bool {
         self.allows.get(&col).map(|a| !a.is_empty()).unwrap_or(false)
             || self.criteria.contains_key(&col)
+            || self.date_groups.get(&col).is_some_and(|g| !g.is_empty())
+            || self.color_filters.contains_key(&col)
     }
+}
+
+/// 扫描筛选列内的日期层级（年 -> 月 -> 日）以及出现的填充色/字体色。
+pub fn collect_column_dates_and_colors(
+    sheet: &Sheet,
+    styles: &crate::style::StyleTable,
+    sys: crate::model::DateSystem,
+    range: (u32, u32, u32, u32),
+    col: u32,
+) -> ColumnFilterMeta {
+    let (r1, _, mut r2, _) = range;
+    let used_max_r = sheet.used_bounds().map(|(_, _, ur2, _)| ur2).unwrap_or(r1);
+    if r2 > used_max_r.saturating_add(64) {
+        r2 = used_max_r.saturating_add(1).min(r2);
+    }
+    let mut meta = ColumnFilterMeta::default();
+    if r1 >= r2 {
+        return meta;
+    }
+    let mut seen_fills: HashSet<Option<[u8; 3]>> = HashSet::new();
+    let mut seen_fonts: HashSet<[u8; 3]> = HashSet::new();
+    let cap_rows = (r2 - r1).min(200_000);
+    for r in (r1 + 1)..=(r1 + cap_rows) {
+        let sid = sheet.style_of(r, col);
+        let st = styles.get(sid);
+        if seen_fills.insert(st.fill) {
+            meta.fill_colors.push(st.fill);
+        }
+        if seen_fonts.insert(st.color) {
+            meta.font_colors.push(st.color);
+        }
+        if crate::style::is_date_format(&st.format)
+            && let Value::Number(n) = sheet.value_ref(r, col).as_ref()
+            && let Some((y, m, d)) = crate::formula::functions::serial_to_date_in(sys, *n)
+        {
+            meta.dates.entry(y).or_default().entry(m).or_default().insert(d);
+        }
+    }
+    meta
 }
 
 /// 某列在筛选区域里的去重值（按显示文本，排序后返回）

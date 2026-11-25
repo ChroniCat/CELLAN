@@ -34,6 +34,25 @@ pub struct UiPrefs {
     pub spotlight: bool,
     /// 自动将已提交的编辑写回已有文件。
     pub autosave: bool,
+    /// 默认开启后台自动恢复草稿（写入独立恢复区，含未命名工作簿，不覆盖原文件）。
+    pub autorecover: bool,
+    /// 后台自动恢复草稿间隔（秒），默认 60 秒。
+    pub autorecover_secs: u32,
+    /// 应用主题：0 浅色 / 1 护眼 / 2 深色 / 3 高对比。
+    pub theme: u8,
+    /// 记忆的窗口位置与尺寸（逻辑像素）及最大化状态。
+    pub win_x: Option<f32>,
+    pub win_y: Option<f32>,
+    pub win_w: Option<f32>,
+    pub win_h: Option<f32>,
+    pub win_maximized: bool,
+    /// 更新弹窗“稍后提醒”记住的版本号与静默截止时间（Unix 秒）。
+    pub update_snoozed_version: String,
+    pub update_snoozed_until: u64,
+    /// 鼠标滚轮平滑滚动开关（默认开启）。
+    pub smooth_scroll: bool,
+    /// 列记忆式键入自动补全开关（默认开启）。
+    pub autocomplete: bool,
     /// 最近一次自动探测成功的图形后端（`wgpu` / `glow`；空表示尚未探测或已重置）
     pub gpu_backend: String,
     /// 与 `gpu_backend` 绑定的轻量环境特征（OS-架构 | 主机名 | console/rdp 会话类型）
@@ -49,6 +68,18 @@ impl Default for UiPrefs {
             user_name: String::new(),
             spotlight: false,
             autosave: false,
+            autorecover: true,
+            autorecover_secs: 60,
+            theme: 0,
+            win_x: None,
+            win_y: None,
+            win_w: None,
+            win_h: None,
+            win_maximized: false,
+            update_snoozed_version: String::new(),
+            update_snoozed_until: 0,
+            smooth_scroll: true,
+            autocomplete: true,
             gpu_backend: String::new(),
             gpu_backend_env: String::new(),
         }
@@ -249,6 +280,30 @@ impl UiPrefs {
                 "user_name" => me.user_name = v.to_string(),
                 "spotlight" => me.spotlight = v == "1",
                 "autosave" => me.autosave = v == "1",
+                "autorecover" => me.autorecover = v == "1",
+                "autorecover_secs" => {
+                    if let Ok(n) = v.parse::<u32>() {
+                        me.autorecover_secs = n.clamp(10, 3600);
+                    }
+                }
+                "theme" => {
+                    if let Ok(n) = v.parse::<u8>() {
+                        me.theme = n.min(3);
+                    }
+                }
+                "win_x" => me.win_x = v.parse::<f32>().ok().filter(|n| n.is_finite()),
+                "win_y" => me.win_y = v.parse::<f32>().ok().filter(|n| n.is_finite()),
+                "win_w" => me.win_w = v.parse::<f32>().ok().filter(|n| n.is_finite() && *n >= 400.0),
+                "win_h" => me.win_h = v.parse::<f32>().ok().filter(|n| n.is_finite() && *n >= 300.0),
+                "win_maximized" => me.win_maximized = v == "1",
+                "update_snoozed_version" => me.update_snoozed_version = sanitize_ini_value(v),
+                "update_snoozed_until" => {
+                    if let Ok(n) = v.parse::<u64>() {
+                        me.update_snoozed_until = n;
+                    }
+                }
+                "smooth_scroll" => me.smooth_scroll = v == "1",
+                "autocomplete" => me.autocomplete = v == "1",
                 "gpu_backend" => {
                     me.gpu_backend = normalize_gpu_backend(v).unwrap_or("").to_string();
                 }
@@ -273,14 +328,27 @@ impl UiPrefs {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        let fmt_opt = |v: Option<f32>| v.map(|n| format!("{n:.1}")).unwrap_or_default();
         let text = format!(
-            "zh_variant={}\nproof_group={}\nstat_mask={}\nuser_name={}\nspotlight={}\nautosave={}\ngpu_backend={}\ngpu_backend_env={}\n",
+            "zh_variant={}\nproof_group={}\nstat_mask={}\nuser_name={}\nspotlight={}\nautosave={}\nautorecover={}\nautorecover_secs={}\ntheme={}\nwin_x={}\nwin_y={}\nwin_w={}\nwin_h={}\nwin_maximized={}\nupdate_snoozed_version={}\nupdate_snoozed_until={}\nsmooth_scroll={}\nautocomplete={}\ngpu_backend={}\ngpu_backend_env={}\n",
             self.zh_variant,
             self.proof_group as u8,
             self.stat_mask,
             sanitize_ini_value(&self.user_name),
             self.spotlight as u8,
             self.autosave as u8,
+            self.autorecover as u8,
+            self.autorecover_secs,
+            self.theme,
+            fmt_opt(self.win_x),
+            fmt_opt(self.win_y),
+            fmt_opt(self.win_w),
+            fmt_opt(self.win_h),
+            self.win_maximized as u8,
+            sanitize_ini_value(&self.update_snoozed_version),
+            self.update_snoozed_until,
+            self.smooth_scroll as u8,
+            self.autocomplete as u8,
             normalize_gpu_backend(&self.gpu_backend).unwrap_or(""),
             sanitize_ini_value(&self.gpu_backend_env),
         );
@@ -320,6 +388,7 @@ mod tests {
             autosave: true,
             gpu_backend: "wgpu".into(),
             gpu_backend_env: "windows-x86_64|DEVBOX|console".into(),
+            ..UiPrefs::default()
         };
         p.save_to(&file);
         let got = UiPrefs::load_from(&file);

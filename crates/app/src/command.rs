@@ -78,7 +78,7 @@ fn can_save(app: &SheetApp) -> bool {
 }
 
 fn can_shell(app: &SheetApp) -> bool {
-    app.tasks.saving.is_none() && app.tasks.open_rx.is_none()
+    app.tasks.saving.is_none()
 }
 
 fn can_print(app: &SheetApp) -> bool {
@@ -138,7 +138,7 @@ pub const COMMANDS: &[Command] = &[
         shift: false,
         on_start: false,
         in_cell_edit: true,
-        enabled: can_save,
+        enabled: |app| !app.show_start,
     },
     Command {
         action: "PrintPreview",
@@ -189,7 +189,8 @@ impl SheetApp {
         if self.show_start {
             return Layer::Start;
         }
-        if crate::ui_kit::take_dialog_shown(ctx) {
+        let shown = crate::ui_kit::take_dialog_shown(ctx);
+        if crate::ui_kit::is_dialog_blocking(ctx) || (shown && ctx.wants_keyboard_input()) {
             return Layer::Dialog;
         }
         if self.editing.is_some() {
@@ -222,13 +223,12 @@ impl SheetApp {
             "FileSaveAs" if self.tasks.saving.is_some() => {
                 Some("正在保存，完成后再试")
             }
-            "FileSave" | "FileSaveAs" | "CloseTab" if self.tasks.open_rx.is_some() => {
+            "FileSave" | "FileSaveAs" if self.tasks.open_rx.is_some() => {
                 Some("正在加载，完成后再试")
             }
             "FileSave" | "FileSaveAs" | "CloseTab" | "PrintPreview" if self.show_start => {
                 Some("先打开一个工作簿")
             }
-            "FileOpen" | "NewTab" if self.tasks.open_rx.is_some() => Some("正在加载，完成后再试"),
             "Undo" => Some("没有可撤销的操作"),
             "Redo" => Some("没有可重做的操作"),
             _ => None,

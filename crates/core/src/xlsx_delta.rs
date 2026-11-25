@@ -2323,8 +2323,7 @@ pub(super) fn write_with_style_receipt(
                     }
                 }
             }
-            let need_recalc = !wb.calc_manual
-                && wb.sheets.iter().any(|s| s.has_formulas())
+            let need_recalc = wb.needs_full_calc_on_load()
                 && wb.sheets.iter().any(|s| s.cell_data_needs_save());
             let updated = if need_recalc {
                 match recalc_on_open(&next_xml, false)? {

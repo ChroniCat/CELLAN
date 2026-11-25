@@ -230,6 +230,9 @@ enum FileMenuAction {
     NewBlank,
     Open,
     OpenPath(PathBuf),
+    TogglePinRecent(PathBuf),
+    RemoveRecent(PathBuf),
+    PruneRecent,
     Save,
     SaveAs,
     PrintPreview,
@@ -240,6 +243,7 @@ enum FileMenuAction {
     BackstageInfo,
     GoHome,
     CloseDoc,
+    Options,
     CheckUpdate,
     DefaultApp,
 }
@@ -404,6 +408,9 @@ impl SheetApp {
                         if row(ui, Icon::UpdateCheck, "检查更新", "", false, false).clicked() {
                             act = Some(FileMenuAction::CheckUpdate);
                         }
+                        if row(ui, Icon::PivotOptions, "选项…", "", false, false).clicked() {
+                            act = Some(FileMenuAction::Options);
+                        }
                         if row(ui, Icon::AppDefault, "设为默认电子表格应用", "", false, false).clicked() {
                             act = Some(FileMenuAction::DefaultApp);
                         }
@@ -411,23 +418,24 @@ impl SheetApp {
             });
         rects.push(main_resp.response.rect);
 
-        // 级联子菜单（最近打开）
+        // 级联子菜单（最近打开：支持固定/取消固定、移除单条与手动清理失效记录）
         if active_sub == 2 {
-            let sub_w = 300.0;
+            let sub_w = 340.0;
             let sub_x = if pos.x + menu_w + sub_w + 8.0 <= screen.right() {
                 pos.x + menu_w - 2.0
             } else {
                 (pos.x - sub_w + 2.0).max(4.0)
             };
-            let sub_y = sub_anchor_y.clamp(screen.top() + 4.0, (screen.bottom() - 260.0).max(4.0));
+            let sub_y = sub_anchor_y.clamp(screen.top() + 4.0, (screen.bottom() - 280.0).max(4.0));
             let rec_entries = self.ensure_recent_cache().to_vec();
+            let pal = crate::theme::palette();
             let sub_resp = egui::Area::new(egui::Id::new("wps_file_menu_cascade"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(sub_x, sub_y))
                 .show(ctx, |ui| {
                     egui::Frame::NONE
-                        .fill(Color32::WHITE)
-                        .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                        .fill(pal.card_bg)
+                        .stroke(Stroke::new(1.0, pal.card_border))
                         .corner_radius(8.0)
                         .shadow(egui::epaint::Shadow {
                             offset: [0, 6],
@@ -439,13 +447,38 @@ impl SheetApp {
                         .show(ui, |ui| {
                             ui.set_width(sub_w - 12.0);
                             if rec_entries.is_empty() {
-                                ui.label(egui::RichText::new("暂无最近打开的文件").size(12.0).color(ui_kit::TEXT_WEAK));
+                                ui.label(egui::RichText::new("暂无最近打开的文件").size(12.0).color(pal.text_weak));
                             } else {
-                                for ent in rec_entries.into_iter().take(10) {
-                                    let label = format!("{}  ({})", ent.name, ent.short_dir);
-                                    if ui_kit::popup_item(ui, &label, true, ui.available_width()).clicked() {
-                                        act = Some(FileMenuAction::OpenPath(ent.path));
-                                    }
+                                for ent in rec_entries.into_iter().take(12) {
+                                    ui.horizontal(|ui| {
+                                        let label = if ent.pinned {
+                                            format!("★ {}  ({})", ent.name, ent.short_dir)
+                                        } else {
+                                            format!("{}  ({})", ent.name, ent.short_dir)
+                                        };
+                                        if ui_kit::popup_item(ui, &label, true, sub_w - 68.0).clicked() {
+                                            act = Some(FileMenuAction::OpenPath(ent.path.clone()));
+                                        }
+                                        let pin_tip = if ent.pinned { "取消固定" } else { "固定到顶部" };
+                                        if ui
+                                            .small_button(if ent.pinned { "★" } else { "☆" })
+                                            .on_hover_text(pin_tip)
+                                            .clicked()
+                                        {
+                                            act = Some(FileMenuAction::TogglePinRecent(ent.path.clone()));
+                                        }
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("从最近列表移除")
+                                            .clicked()
+                                        {
+                                            act = Some(FileMenuAction::RemoveRecent(ent.path.clone()));
+                                        }
+                                    });
+                                }
+                                menu_sep_line(ui);
+                                if ui_kit::popup_item(ui, "清理已删除的本地文件记录", true, ui.available_width()).clicked() {
+                                    act = Some(FileMenuAction::PruneRecent);
                                 }
                             }
                         });
@@ -456,6 +489,32 @@ impl SheetApp {
         ctx.data_mut(|d| d.insert_temp::<u8>(sub_id, active_sub));
 
         if let Some(a) = act {
+            match a {
+                FileMenuAction::TogglePinRecent(p) => {
+                    crate::recent::toggle_pin(&p);
+                    self.recent_cache = None;
+                    self.tree.set_recent(crate::recent::load());
+                    return;
+                }
+                FileMenuAction::RemoveRecent(p) => {
+                    crate::recent::forget(&p);
+                    self.recent_cache = None;
+                    self.tree.set_recent(crate::recent::load());
+                    return;
+                }
+                FileMenuAction::PruneRecent => {
+                    let removed = crate::recent::prune_missing_manual();
+                    self.recent_cache = None;
+                    self.tree.set_recent(crate::recent::load());
+                    self.status = if removed > 0 {
+                        format!("已清理 {removed} 条失效的本地文件记录（网络共享盘路径已保留）")
+                    } else {
+                        "没有可清理的失效本地文件记录".into()
+                    };
+                    return;
+                }
+                _ => {}
+            }
             self.file_menu_open = false;
             match a {
                 FileMenuAction::NewBlank => self.new_document(),
@@ -496,8 +555,14 @@ impl SheetApp {
                     let idx = self.active_tab;
                     self.request_close_tab(idx);
                 }
+                FileMenuAction::Options => {
+                    self.options_dlg_open = true;
+                }
                 FileMenuAction::CheckUpdate => self.check_update(),
                 FileMenuAction::DefaultApp => self.register_file_association(true),
+                FileMenuAction::TogglePinRecent(_)
+                | FileMenuAction::RemoveRecent(_)
+                | FileMenuAction::PruneRecent => {}
             }
             return;
         }
@@ -621,15 +686,19 @@ impl SheetApp {
 
     /// WPS 38px 第 1 排顶栏：Logo + 单一「⌂ 主页」胶囊 + 文档标签条（+ 新建）+ 命令搜索 + 账户 + 窗口按钮
     pub(crate) fn draw_wps_title_bar(&mut self, ctx: &egui::Context) {
-        let dark = ctx.style().visuals.dark_mode;
-        let bg = if dark { Color32::from_rgb(38, 42, 49) } else { ui_kit::PAGE_BG };
-        let fg = if dark { Color32::from_rgb(226, 229, 234) } else { Color32::from_rgb(29, 29, 29) };
-        let hover = if dark { Color32::from_rgb(55, 62, 72) } else { ui_kit::HOVER_ON_PAGE };
+        let pal = crate::theme::palette();
+        let dark = pal.theme.is_dark();
+        let bg = pal.title_bg;
+        let fg = pal.text;
+        let hover = pal.hover_on_page;
 
         let mut tab_metas: Vec<(String, bool, bool)> = Vec::new();
         if self.has_open_workbook {
             for i in 0..self.tabs.len() {
-                let title = self.tab_title(i);
+                let mut title = self.tab_title(i);
+                if i == self.active_tab && self.selected_sheets.len() > 1 {
+                    title.push_str(" [工作组]");
+                }
                 let dirty = match &self.tabs[i] {
                     TabSlot::Active => self.wb.dirty || self.tasks.saving.is_some() || self.editing.is_some(),
                     TabSlot::Parked(d) => d.wb.dirty || d.tasks.saving.is_some(),
@@ -928,16 +997,22 @@ impl SheetApp {
                     self.profile_open = true;
                 }
 
-                // 6. Windows 11 控制三键
+                // 6. Windows 11 控制三键（最大化按钮上报客户区坐标以启用 Win11 Snap Layouts 贴靠布局浮层）
                 let bw = 46.0;
                 let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                let ppp = ctx.pixels_per_point();
                 for (name, x) in [("close", rect.right() - bw), ("max", rect.right() - bw * 2.0), ("min", rect.right() - bw * 3.0)] {
                     let br = Rect::from_min_size(egui::pos2(x, rect.top()), Vec2::new(bw, ui_kit::TITLE_H));
+                    if name == "max" {
+                        crate::win_chrome::set_maximize_button_rect(Some(br), ppp);
+                    }
                     let resp = ui.interact(br, egui::Id::new(("winbtn", name)), Sense::click());
-                    if resp.hovered() {
+                    let is_hovered = resp.hovered()
+                        || (name == "max" && crate::win_chrome::maximize_button_nc_hovered());
+                    if is_hovered {
                         painter.rect_filled(br, 0.0, if name == "close" { Color32::from_rgb(196, 43, 28) } else { hover });
                     }
-                    let col = if name == "close" && resp.hovered() { Color32::WHITE } else { fg };
+                    let col = if name == "close" && is_hovered { Color32::WHITE } else { fg };
                     let c = br.center();
                     match name {
                         "close" => {
@@ -955,14 +1030,14 @@ impl SheetApp {
                                 let a = Rect::from_min_size(egui::pos2(c.x - 3.5, c.y - 5.0), Vec2::new(8.0, 8.0));
                                 let b2 = Rect::from_min_size(egui::pos2(c.x - 5.5, c.y - 3.0), Vec2::new(8.0, 8.0));
                                 painter.rect_stroke(a, 1.0, st, egui::StrokeKind::Inside);
-                                painter.rect_filled(b2, 1.0, if resp.hovered() { hover } else { right_bg });
+                                painter.rect_filled(b2, 1.0, if is_hovered { hover } else { right_bg });
                                 painter.rect_stroke(b2, 1.0, st, egui::StrokeKind::Inside);
                             } else {
                                 painter.rect_stroke(Rect::from_center_size(c, Vec2::new(9.6, 9.6)), 1.0, st, egui::StrokeKind::Inside);
                             }
                         }
                     }
-                    if resp.clicked() {
+                    if resp.clicked() || (name == "max" && crate::win_chrome::take_maximize_button_click()) {
                         match name {
                             "close" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                             "max" => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
@@ -1084,7 +1159,24 @@ impl SheetApp {
                                 }
                                 let name = self.wb.sheets[i].name.clone();
                                 let tab_color = self.wb.sheets[i].tab_color;
-                                let resp = ui_kit::sheet_tab(ui, &name, self.sheet_idx == i, tab_color);
+                                let is_grouped = self.selected_sheets.len() > 1
+                                    && self.selected_sheets.contains(&i);
+                                let resp = ui_kit::sheet_tab(
+                                    ui,
+                                    &name,
+                                    self.sheet_idx == i || is_grouped,
+                                    tab_color,
+                                );
+                                if is_grouped && self.sheet_idx != i {
+                                    let r = resp.rect;
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(r.left() + 4.0, r.bottom() - 1.5),
+                                            egui::pos2(r.right() - 4.0, r.bottom() - 1.5),
+                                        ],
+                                        Stroke::new(2.0, crate::theme::palette().accent),
+                                    );
+                                }
                                 if resp.drag_started() {
                                     self.tab_drag = Some(i);
                                 }
@@ -1097,10 +1189,55 @@ impl SheetApp {
                                     self.tab_drag = None;
                                 }
                                 if resp.clicked() {
+                                    let (ctrl, shift) = ui.input(|ip| (ip.modifiers.command, ip.modifiers.shift));
                                     if self.editing.as_ref().is_some_and(|ed| ed.buf.starts_with('=')) {
                                         self.switch_sheet_for_ref(i);
+                                    } else if ctrl {
+                                        self.commit_edit(None);
+                                        if self.selected_sheets.is_empty() {
+                                            self.selected_sheets.insert(self.sheet_idx);
+                                        }
+                                        if self.selected_sheets.contains(&i) {
+                                            if self.selected_sheets.len() > 1 {
+                                                self.selected_sheets.remove(&i);
+                                                if i == self.sheet_idx {
+                                                    if let Some(&first) = self.selected_sheets.iter().next() {
+                                                        goto = Some(first);
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            self.selected_sheets.insert(i);
+                                            goto = Some(i);
+                                        }
+                                        if self.selected_sheets.len() > 1 {
+                                            self.status = format!(
+                                                "[工作组] 已选中 {} 张工作表（同步编辑）",
+                                                self.selected_sheets.len()
+                                            );
+                                        } else {
+                                            self.selected_sheets.clear();
+                                        }
+                                    } else if shift {
+                                        self.commit_edit(None);
+                                        self.selected_sheets.clear();
+                                        let lo = self.sheet_idx.min(i);
+                                        let hi = self.sheet_idx.max(i);
+                                        for s in lo..=hi {
+                                            self.selected_sheets.insert(s);
+                                        }
+                                        goto = Some(i);
+                                        if self.selected_sheets.len() > 1 {
+                                            self.status = format!(
+                                                "[工作组] 已选中 {} 张工作表（同步编辑）",
+                                                self.selected_sheets.len()
+                                            );
+                                        }
                                     } else {
                                         self.commit_edit(None);
+                                        if !self.selected_sheets.contains(&i) {
+                                            self.selected_sheets.clear();
+                                        }
                                         goto = Some(i);
                                     }
                                 }

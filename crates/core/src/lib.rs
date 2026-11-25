@@ -54,6 +54,7 @@ pub mod pivot_parts2;
 pub mod pivot_xml;
 pub mod qtable;
 pub mod model;
+pub mod input_parse;
 pub mod style;
 pub mod style_ext;
 pub mod style_theme;

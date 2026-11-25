@@ -4,7 +4,7 @@
 //!   比较(= <> < > <= >=) < 连接(&) < 加减 < 乘除 < 乘方 < 一元负号 < 百分号 < 区间(:)
 
 pub mod array;
-mod compiled;
+pub(crate) mod compiled;
 mod scalar_batch;
 mod dependency_batch;
 pub(crate) mod lookup_cache;
@@ -21,6 +21,7 @@ pub use func_id::FuncName;
 use func_id::FuncId;
 use fxhash::{FxBuildHasher, FxHashMap, FxHashSet, PackedCellKey};
 pub mod deps;
+pub mod eval_steps;
 pub mod dist;
 pub mod extra;
 pub mod fncat;
@@ -2470,6 +2471,9 @@ impl<'a> Calc<'a> {
         (self.cur_sheet, self.cur, self.ref_offset) = previous;
         self.remove_visiting(key);
         if self.requested.is_none() && !self.aborted {
+            if let Some(dw) = self.deps_watch {
+                dw.mark_dynamic_evaluated(key);
+            }
             self.insert_memo(key, v.clone());
         }
         v
@@ -3952,7 +3956,7 @@ impl<'a> Calc<'a> {
         let args = self.function_args(id, nodes, si);
         if self.requested.is_some() { return FValue::Error(ErrKind::Ref); }
         let t0 = profile_enabled().then(std::time::Instant::now);
-        let out = if id.is_volatile() {
+        let out = if id.is_nondeterministic_volatile() {
             let cell = (self.cur_sheet, self.cur.0, self.cur.1);
             let count = self.volatile_counts.entry(cell).or_default();
             let seq = *count;
@@ -7244,32 +7248,50 @@ fn edit_touches_spill(wb: &Workbook, deps: &deps::Deps, seeds: &[deps::CellKey],
         })
             || (sheet.spill_shapes.is_empty() && !sheet.spilled.is_empty())
             || (!sheet.spill_shapes.is_empty() && wb.calc_iterate)
-            || sheet.spill_shapes.len().saturating_mul(seeds.len()) > 100_000
-            || sheet.spill_shapes.iter().any(|(anchor, &(rows, cols))| {
-                let tracked = deps_ready && deps.tracks_spill((si, anchor.row, anchor.col));
-                if rows == 0 || cols == 0 {
+            || {
+                let mut untracked_count = 0usize;
+                let mut sheet_seeds_count: Option<usize> = None;
+                let mut hit = false;
+                for (anchor, &(rows, cols)) in &sheet.spill_shapes {
+                    let tracked = deps_ready && deps.tracks_spill((si, anchor.row, anchor.col));
+                    if rows == 0 || cols == 0 {
+                        if tracked {
+                            continue;
+                        }
+                        if deps_ready
+                            && matches!(
+                                probe_blocked_spill_shape(wb, (si, anchor.row, anchor.col)),
+                                SpillProbe::NotSpillAnchor
+                            )
+                        {
+                            continue;
+                        }
+                        hit = true;
+                        break;
+                    }
                     if tracked {
-                        return false;
+                        continue;
                     }
-                    if deps_ready
-                        && matches!(
-                            probe_blocked_spill_shape(wb, (si, anchor.row, anchor.col)),
-                            SpillProbe::NotSpillAnchor
-                        )
-                    {
-                        return false;
+                    untracked_count += 1;
+                    let s_cnt = *sheet_seeds_count
+                        .get_or_insert_with(|| seeds.iter().filter(|&&(s, _, _)| s == si).count());
+                    if untracked_count.saturating_mul(s_cnt) > 100_000 {
+                        hit = true;
+                        break;
                     }
-                    return true;
-                }
-                !tracked
-                    && seeds.iter().any(|&(s, r, c)| {
+                    if seeds.iter().any(|&(s, r, c)| {
                         s == si
                             && r >= anchor.row
                             && r - anchor.row < rows
                             && c >= anchor.col
                             && c - anchor.col < cols
-                    })
-            })
+                    }) {
+                        hit = true;
+                        break;
+                    }
+                }
+                hit
+            }
     })
 }
 
@@ -7446,7 +7468,7 @@ fn recalc_dirty_impl(
     let dirty_vec = if deps.requires_full_recalc() || edit_touches_spill(wb, deps, seeds, true) {
         None
     } else {
-        Some(deps.edit_closure_vec_cancelable(seeds, cancel)?)
+        Some(deps.edit_closure_vec_for_wb(wb, seeds, cancel)?)
     };
     let Some(mut order) = dirty_vec else {
         let count = wb.sheets.iter().map(|s| s.formula_cells().count()).sum();
@@ -7464,6 +7486,7 @@ fn recalc_dirty_impl(
         }
     }
     if order.is_empty() {
+        wb.mark_recalc_synced();
         return Some(0);
     }
     if !order.is_sorted() {
@@ -7490,6 +7513,7 @@ fn recalc_dirty_impl(
         };
         if changed_tails.is_empty() {
             functions::set_now_snapshot(prev_now);
+            wb.mark_recalc_synced();
             return Some(total_evaluated);
         }
         // Rare spill-tail follow-up after a chain: continue from `changed_tails`
@@ -7498,6 +7522,7 @@ fn recalc_dirty_impl(
         dirty.extend(deps.dynamic_cells_touching(&changed_tails));
         if dirty.is_empty() {
             functions::set_now_snapshot(prev_now);
+            wb.mark_recalc_synced();
             return Some(total_evaluated);
         }
         order = dirty.iter().copied().collect();
@@ -7662,6 +7687,7 @@ fn recalc_dirty_impl(
         }
     }
     functions::set_now_snapshot(prev_now);
+    wb.mark_recalc_synced();
     Some(total_evaluated)
 }
 
@@ -7936,6 +7962,7 @@ pub fn recalc_interactive_plan(
             }
         }
     }
+    wb.mark_recalc_synced();
     Complete
 }
 
@@ -8417,6 +8444,9 @@ fn recalc_selected(
         sheet.edited = *was;
     }
     functions::set_now_snapshot(prev_now);
+    if selected.is_none() {
+        wb.mark_recalc_synced();
+    }
     true
 }
 

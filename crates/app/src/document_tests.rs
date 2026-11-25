@@ -400,6 +400,10 @@ fn update_restart_waits_for_local_edits_collaboration_and_background_writes() {
     assert!(!app.safe_to_restart_after_update());
     app.switch_tab(0);
     app.tasks.saving = None;
+    // 多标签打开时禁止无人值守自动重启（避免丢失其余标签页），但允许用户手动点击立即重启（自动保存并恢复多标签会话）。
+    assert!(!app.safe_to_restart_after_update());
+    assert!(app.can_manual_restart_after_update());
+    app.force_close_tab(1);
     assert!(app.safe_to_restart_after_update());
 }
 
@@ -752,8 +756,9 @@ fn close_window_with_expired_host_request_requires_a_decision_and_keeps_original
 }
 
 #[test]
-fn native_window_close_commits_the_edit_and_flushes_the_named_file_without_a_prompt() {
+fn native_window_close_commits_the_edit_and_prompts_before_overwriting_named_file() {
     let env = crate::test_env::TestEnv::new("window-event-close");
+    // 1) 选择“保存”：写入原文件并关闭窗口
     for autosave in [false, true] {
         let path = env.path(&format!("auto-{autosave}.xlsx"));
         let mut app = app();
@@ -768,6 +773,18 @@ fn native_window_close_commits_the_edit_and_flushes_the_named_file_without_a_pro
             app.advance_save_and_exit(ctx);
         });
         assert!(closing.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::CancelClose));
+        assert_eq!(app.tab_close_confirm, Some(app.doc_uid), "关闭脏文件应先弹出保存确认框");
+        assert!(!path.exists(), "未确认前不能静默写回磁盘");
+        // 按 Enter 确认“保存”
+        let mut confirm = egui::RawInput::default();
+        confirm.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        });
+        let _ = ctx.run(confirm, |ctx| app.tab_close_confirm_dialog(ctx));
         assert!(app.has_pending_save() && app.tab_close_confirm.is_none());
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut closed = false;
@@ -780,6 +797,26 @@ fn native_window_close_commits_the_edit_and_flushes_the_named_file_without_a_pro
         assert!(closed && app.tab_close_confirm.is_none());
         assert_eq!(sheetcore::xlsx::load(&path).unwrap().sheets[0].value(0, 0), Value::Number(52.0));
     }
+    // 2) 选择“取消”（Esc）：保留工作簿且不写回原文件
+    let path_keep = env.path("keep-orig.xlsx");
+    sheetcore::xlsx::save_atomic(&path_keep, &book(10.0)).unwrap();
+    let mut app = app();
+    app.wb = sheetcore::xlsx::load(&path_keep).unwrap();
+    put(&mut app.wb, 99.0);
+    app.request_close_tab(0);
+    assert_eq!(app.tab_close_confirm, Some(app.doc_uid));
+    let ctx = egui::Context::default();
+    let mut esc = egui::RawInput::default();
+    esc.events.push(egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Default::default(),
+    });
+    let _ = ctx.run(esc, |ctx| app.tab_close_confirm_dialog(ctx));
+    assert!(app.tab_close_confirm.is_none() && app.has_open_workbook && app.wb.dirty);
+    assert_eq!(sheetcore::xlsx::load(&path_keep).unwrap().sheets[0].value(0, 0), Value::Number(10.0));
 }
 
 #[test]

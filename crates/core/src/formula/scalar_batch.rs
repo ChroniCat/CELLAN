@@ -200,6 +200,8 @@ fn independent(
                     | FuncId::Average
                     | FuncId::Count
                     | FuncId::CountA
+                    | FuncId::Today
+                    | FuncId::Now
             ) =>
         {
             args.iter().all(|v| independent(wb, scope, sheet, v, dr, dc))

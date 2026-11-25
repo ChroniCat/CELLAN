@@ -1425,12 +1425,13 @@ pub fn state_banner(
     title: &str,
     detail: &str,
 ) -> egui::Response {
+    let pal = crate::theme::palette();
     let color = state_color(kind);
     let bg = match kind {
-        StateKind::Empty => Color32::from_rgb(250, 250, 250),
-        StateKind::Error => Color32::from_rgb(253, 242, 240),
-        StateKind::Warn => Color32::from_rgb(255, 249, 240),
-        StateKind::Info => Color32::from_rgb(240, 248, 243),
+        StateKind::Empty => pal.card_bg,
+        StateKind::Error => pal.err_bg,
+        StateKind::Warn => pal.warn_bg,
+        StateKind::Info => pal.info_bg,
     };
     let resp = egui::Frame::NONE
         .fill(bg)
@@ -1457,7 +1458,7 @@ pub fn state_banner(
                         ui.label(
                             RichText::new(detail)
                                 .size(crate::tokens::text::SMALL)
-                                .color(TEXT_WEAK),
+                                .color(pal.text_weak),
                         );
                     }
                 });
@@ -1467,22 +1468,41 @@ pub fn state_banner(
     resp
 }
 
-/// UI-29.3：加载遮罩。屏幕整体压暗一层（不吃鼠标以外的输入），中间一张卡片：
-/// 旋转弧 + 标题 + 说明 + 可选进度条。`progress=None` 表示不确定进度。
+/// UI-29.3：加载遮罩。默认保留顶部标题栏（38px）可操作（允许切换标签页、最小化/关闭窗口），
+/// 支持真实百分比进度条与“取消”按钮（点击取消或按 Esc 返回 `true`）。
 pub fn loading_overlay(ctx: &egui::Context, title: &str, detail: &str, progress: Option<f32>) {
+    let _ = loading_overlay_cancellable(ctx, title, detail, progress, false);
+}
+
+pub fn loading_overlay_cancellable(
+    ctx: &egui::Context,
+    title: &str,
+    detail: &str,
+    progress: Option<f32>,
+    cancellable: bool,
+) -> bool {
+    let pal = crate::theme::palette();
     let screen = ctx.screen_rect();
+    let title_h = 38.0_f32;
+    let body = egui::Rect::from_min_max(
+        egui::pos2(screen.min.x, (screen.min.y + title_h).min(screen.max.y)),
+        screen.max,
+    );
     let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("loading_overlay"));
     let p = ctx.layer_painter(layer);
-    p.rect_filled(screen, 0.0, Color32::from_black_alpha(40));
-    let card = egui::Rect::from_center_size(
-        screen.center(),
-        Vec2::new(320.0, if progress.is_some() { 132.0 } else { 116.0 }),
-    );
-    p.rect_filled(card, crate::tokens::radius::LG, Color32::WHITE);
+    p.rect_filled(body, 0.0, pal.dialog_scrim);
+    let card_h = match (progress.is_some(), cancellable) {
+        (true, true) => 166.0,
+        (true, false) => 136.0,
+        (false, true) => 148.0,
+        (false, false) => 116.0,
+    };
+    let card = egui::Rect::from_center_size(body.center(), Vec2::new(340.0, card_h));
+    p.rect_filled(card, crate::tokens::radius::LG, pal.dialog_bg);
     p.rect_stroke(
         card,
         crate::tokens::radius::LG,
-        Stroke::new(crate::tokens::stroke::HAIR, BORDER),
+        Stroke::new(crate::tokens::stroke::HAIR, pal.card_border),
         egui::StrokeKind::Inside,
     );
     // 旋转弧：8 段，按时间推进透明度
@@ -1491,7 +1511,7 @@ pub fn loading_overlay(ctx: &egui::Context, title: &str, detail: &str, progress:
     for i in 0..8 {
         let ang = t * 3.0 + i as f32 * std::f32::consts::TAU / 8.0;
         let a = 0.15 + 0.85 * ((i as f32 / 8.0 + t * 1.5).fract());
-        let col = ACCENT.gamma_multiply(a);
+        let col = pal.accent.gamma_multiply(a);
         let dir = egui::vec2(ang.cos(), ang.sin());
         p.circle_filled(c + dir * 11.0, 2.0, col);
     }
@@ -1500,7 +1520,7 @@ pub fn loading_overlay(ctx: &egui::Context, title: &str, detail: &str, progress:
         Align2::CENTER_CENTER,
         title,
         FontId::proportional(crate::tokens::text::TITLE),
-        TEXT,
+        pal.text,
     );
     if !detail.is_empty() {
         p.text(
@@ -1508,29 +1528,60 @@ pub fn loading_overlay(ctx: &egui::Context, title: &str, detail: &str, progress:
             Align2::CENTER_CENTER,
             detail,
             FontId::proportional(crate::tokens::text::SMALL),
-            TEXT_WEAK,
+            pal.text_weak,
         );
     }
     if let Some(v) = progress {
+        let pct = v.clamp(0.0, 1.0);
+        let bar_y = if cancellable { card.max.y - 62.0 } else { card.max.y - 30.0 };
         let bar = egui::Rect::from_min_size(
-            egui::pos2(card.min.x + 24.0, card.max.y - 30.0),
-            Vec2::new(card.width() - 48.0, 6.0),
+            egui::pos2(card.min.x + 24.0, bar_y),
+            Vec2::new(card.width() - 48.0, 5.0),
         );
-        p.rect_filled(bar, 3.0, Color32::from_rgb(237, 235, 233));
-        let fill = egui::Rect::from_min_size(
-            bar.min,
-            Vec2::new(bar.width() * v.clamp(0.0, 1.0), bar.height()),
+        let track_col = if pal.theme == crate::theme::AppTheme::Light {
+            Color32::from_rgb(237, 235, 233)
+        } else {
+            pal.hover
+        };
+        p.rect_filled(bar, 2.5, track_col);
+        let fill = egui::Rect::from_min_size(bar.min, Vec2::new(bar.width() * pct, bar.height()));
+        p.rect_filled(fill, 2.5, pal.accent);
+        p.text(
+            egui::pos2(card.center().x, bar_y + 15.0),
+            Align2::CENTER_CENTER,
+            format!("{:.0}%", pct * 100.0),
+            FontId::proportional(crate::tokens::text::SMALL),
+            pal.text_weak,
         );
-        p.rect_filled(fill, 3.0, ACCENT);
     }
-    // 遮罩吃掉点击，避免用户在加载中误触下面的按钮
+    let mut cancelled = false;
+    // 遮罩仅覆盖内容区（不遮挡 38px 标题栏上的标签页与窗口按钮），卡片内放取消按钮
     let _ = egui::Area::new(egui::Id::new("loading_overlay_block"))
         .order(egui::Order::Foreground)
-        .fixed_pos(screen.min)
+        .fixed_pos(body.min)
         .show(ctx, |ui| {
-            ui.allocate_exact_size(screen.size(), Sense::click_and_drag());
+            let _ = ui.allocate_exact_size(body.size(), drag_only_sense());
         });
+    if cancellable {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancelled = true;
+        }
+        let btn_rect = egui::Rect::from_center_size(
+            egui::pos2(card.center().x, card.max.y - 22.0),
+            Vec2::new(96.0, 26.0),
+        );
+        let _ = egui::Area::new(egui::Id::new("loading_overlay_cancel"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(btn_rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(btn_rect.size());
+                if secondary_button(ui, "取消 (Esc)").clicked() {
+                    cancelled = true;
+                }
+            });
+    }
     ctx.request_repaint();
+    cancelled
 }
 
 /// 只拖动、不参与 Tab 焦点的 Sense（标题栏、缩放手柄、模态遮挡层都该用它）
@@ -1857,16 +1908,31 @@ pub fn take_dialog_shown(ctx: &egui::Context) -> bool {
     ctx.data_mut(|d| d.remove_temp::<bool>(dialog_mark()).unwrap_or(false))
 }
 
+const FLOATING_RECTS: &str = "ui_kit_floating_rects";
+
+fn floating_rects_mark() -> egui::Id {
+    egui::Id::new(FLOATING_RECTS)
+}
+
 /// 每帧起始清空一次；本帧任意 `block_background == true` 的 `Dlg::show` 执行后置 `true`，
 /// 供后续 `CentralPanel`（`handle_keys` / `draw_grid_pane`）非破坏性读取，避免漏加 `dialog_modal` 布尔位导致穿透。
 pub fn reset_dialog_blocking(ctx: &egui::Context) {
     ctx.data_mut(|d| {
         d.remove_temp::<bool>(dialog_blocking_mark());
+        d.remove_temp::<Vec<egui::Rect>>(floating_rects_mark());
     });
 }
 
 pub fn is_dialog_blocking(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<bool>(dialog_blocking_mark()).unwrap_or(false))
+}
+
+/// 判断屏幕坐标是否落在任意非模态浮动工具窗口（查找替换、监视窗口、协作面板等）内部，防止点击穿透到表格。
+pub fn pointer_over_floating_window(ctx: &egui::Context, pos: egui::Pos2) -> bool {
+    ctx.data(|d| {
+        d.get_temp::<Vec<egui::Rect>>(floating_rects_mark())
+            .is_some_and(|rects| rects.iter().any(|r| r.contains(pos)))
+    })
 }
 
 pub struct Dlg {
@@ -2013,6 +2079,7 @@ impl Dlg {
             d.insert_temp(id.with("shown"), now);
             d.insert_temp(egui::Id::new("dlg_born"), born);
         });
+        let pal = crate::theme::palette();
         // 模态遮挡：半透明深灰蓝遮罩压暗底层密集网格线，让弹窗干净浮出，并吞掉背景点击
         if self.block_background {
             egui::Area::new(id.with("block"))
@@ -2020,11 +2087,7 @@ impl Dlg {
                 .fixed_pos(screen.min)
                 .show(ctx, |ui| {
                     let r = egui::Rect::from_min_size(screen.min, screen.size());
-                    ui.painter().rect_filled(
-                        r,
-                        0.0,
-                        Color32::from_rgba_unmultiplied(15, 23, 42, 36),
-                    );
+                    ui.painter().rect_filled(r, 0.0, pal.dialog_scrim);
                     // 遮挡层只吞点击，不参与 Tab 焦点（否则 Tab 会卡在它上面，进不到对话框里）
                     let resp = ui.interact(r, id.with("blocki"), drag_only_sense());
                     let _ = resp;
@@ -2041,8 +2104,8 @@ impl Dlg {
             .default_size([w, area_h])
             .show(ctx, |ui| {
                 let frame = egui::Frame::window(&ctx.style())
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, CARD_BORDER))
+                    .fill(pal.dialog_bg)
+                    .stroke(Stroke::new(1.0, pal.card_border))
                     .corner_radius(10.0)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 12],
@@ -2065,14 +2128,14 @@ impl Dlg {
                                 egui::vec2(w, 44.0),
                             ),
                             egui::CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 },
-                            Color32::from_rgb(250, 251, 253),
+                            pal.ribbon_bg,
                         );
                         ui.painter().line_segment(
                             [
                                 egui::pos2(trect.left() + 1.0, trect.bottom() - 0.5),
                                 egui::pos2(trect.right() - 1.0, trect.bottom() - 0.5),
                             ],
-                            Stroke::new(1.0 / ctx.pixels_per_point(), Color32::from_rgb(230, 234, 241)),
+                            Stroke::new(1.0 / ctx.pixels_per_point(), pal.card_border),
                         );
                         paint_medium(
                             ui.painter(),
@@ -2080,7 +2143,7 @@ impl Dlg {
                             egui::Align2::LEFT_CENTER,
                             &self.title,
                             13.5,
-                            TEXT,
+                            pal.text,
                         );
                         // 内嵌圆角关闭按钮（替代老式铺满顶栏右角的红块）
                         let crect = egui::Rect::from_center_size(
@@ -2096,13 +2159,13 @@ impl Dlg {
                             ui.painter().rect_filled(
                                 crect,
                                 6.0,
-                                Color32::from_rgb(241, 243, 247),
+                                pal.hover,
                             );
                         }
                         let cc = if cresp.hovered() {
-                            Color32::from_rgb(17, 24, 39)
+                            pal.text
                         } else {
-                            Color32::from_rgb(107, 114, 128)
+                            pal.text_weak
                         };
                         let k = 4.2;
                         let st = Stroke::new(1.25, cc);
@@ -2186,26 +2249,50 @@ impl Dlg {
                         }
                         (inner, tresp)
                     });
-                // UI-24.1：Tab/Shift+Tab 只在对话框这一层里转，不会跑到背景网格。
-                // 关闭这一帧要把模态层降回背景，否则下一帧背景控件仍被判“被模态挡住”，
-                // 会把刚还回去的焦点又 surrender 掉。
-                let caller_closed = self.open.is_some_and(|p| unsafe { !*p });
-                let closing = closed || caller_closed || ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                // UI-24.1：模态对话框把 Tab/Shift+Tab 锁在本层内；
+                // 非模态浮动工具窗（查找替换、监视窗口、协作面板等）绝不设 modal_layer，允许自由编辑主表格。
                 let layer = ui.layer_id();
-                ui.memory_mut(|m| {
-                    if closing {
-                        m.set_modal_layer(egui::LayerId::background());
-                    } else {
-                        m.set_modal_layer(layer);
-                    }
-                });
-                fr.inner
+                let focus_in_self = ui
+                    .memory(|m| m.focused())
+                    .and_then(|fid| ui.ctx().read_response(fid))
+                    .is_some_and(|r| r.layer_id == layer);
+                let esc_close = ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                    && (self.block_background || focus_in_self);
+                let caller_closed = self.open.is_some_and(|p| unsafe { !*p });
+                let closing = closed || caller_closed || esc_close;
+                if self.block_background {
+                    ui.memory_mut(|m| {
+                        if closing {
+                            m.set_modal_layer(egui::LayerId::background());
+                        } else {
+                            m.set_modal_layer(layer);
+                        }
+                    });
+                }
+                (fr.inner, esc_close)
             });
+        let esc_close = out.inner.1;
+        if !self.block_background {
+            let rect = out.response.rect;
+            ctx.data_mut(|d| {
+                let mut rects = d
+                    .get_temp::<Vec<egui::Rect>>(floating_rects_mark())
+                    .unwrap_or_default();
+                rects.push(rect);
+                d.insert_temp(floating_rects_mark(), rects);
+            });
+        }
         let caller_closed = self.open.is_some_and(|p| unsafe { !*p });
-        if closed || caller_closed || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if closed || caller_closed || esc_close {
             if let Some(p) = self.open {
                 unsafe { *p = false; }
             }
+            // 关闭对话框的那一帧吞掉 Enter/Esc 并临时屏蔽背景网格键盘，防止关闭按键穿透到表格推进选区。
+            ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+            });
+            ctx.data_mut(|d| d.insert_temp(dialog_blocking_mark(), true));
             // UI-24.1：关闭后焦点回到触发它的控件
             if let Some(f) = ctx
                 .data(|d| d.get_temp::<egui::Id>(id.with("focus_before")))
@@ -2220,7 +2307,7 @@ impl Dlg {
             d.insert_temp(id.with("h"), h);
         });
         let _ = self.resizable;
-        Some(egui::InnerResponse::new(out.inner.0, out.response))
+        Some(egui::InnerResponse::new(out.inner.0 .0, out.response))
     }
 }
 

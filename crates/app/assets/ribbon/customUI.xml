@@ -197,9 +197,13 @@
                 <button id="MergeCenter" label="合并后居中" imageMso="Merge" sizeString="93" screentip="合并后居中" onAction="MergeCenter" keytip="M"/>
                 <menu id="MergeMenu">
                   <button id="MergeCenterItem" label="合并后居中" onAction="MergeCenter" keytip="M"/>
+                  <button id="MergeAcrossItem" label="跨越合并" onAction="MergeAcross"/>
                   <button id="MergeCellsItem" label="合并单元格" onAction="MergeCells"/>
-                  <button id="UnmergeCellsItem" label="取消合并" onAction="UnmergeCells"/>
+                  <button id="MergeContentsItem" label="合并内容" onAction="MergeContents"/>
                   <menuSeparator id="MergeSep1"/>
+                  <button id="UnmergeCellsItem" label="取消合并" onAction="UnmergeCells"/>
+                  <button id="UnmergeFillItem" label="拆分并填充内容" onAction="UnmergeFill"/>
+                  <menuSeparator id="MergeSep2"/>
                   <button id="CenterAcrossItem" label="跨列居中" onAction="CenterAcross"/>
                 </menu>
               </splitButton>
@@ -745,6 +749,7 @@
           <box boxStyle="vertical" paddingTop="0" gap="2">
             <toggleButton id="ShowFormulas" label="显示公式" imageMso="FormulaView" screentip="Ctrl+` 切换公式/结果" onAction="ShowFormulas" sizeString="96" keytip="H"/>
             <button id="ErrorChecking" label="错误检查" imageMso="ErrorCheck" screentip="扫 #DIV/0! 之类的错误" onAction="ErrorChecking" sizeString="96"/>
+            <button id="EvaluateFormula" label="公式求值" imageMso="Calc" screentip="逐步查看公式计算过程" onAction="EvaluateFormula" sizeString="96"/>
             <button id="WatchWindow" label="监视窗口" imageMso="WatchPane" onAction="WatchWindow" sizeString="96" keytip="W"/>
           </box>
         </group>

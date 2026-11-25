@@ -151,6 +151,13 @@ enum StreamMsg {
     Failed(String),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AiPendingPreview {
+    pub sheet_idx: usize,
+    pub rects: Vec<(u32, u32, u32, u32)>,
+    pub cells: Vec<(u32, u32, String, String)>,
+}
+
 pub struct AiState {
     pub open: bool,
     pub settings_open: bool,
@@ -164,6 +171,7 @@ pub struct AiState {
     /// Manual calculation only: calculated copy reused by later reads in the same turn.
     calc_base: Option<AiCalcBase>,
     confirmation_label: Option<String>,
+    pub(crate) pending_preview: Option<AiPendingPreview>,
     pub busy: bool,
     pub round: usize,
     pub status_hint: String,
@@ -201,6 +209,7 @@ impl Default for AiState {
             active_round: None,
             calc_base: None,
             confirmation_label: None,
+            pending_preview: None,
             busy: false,
             round: 0,
             status_hint: String::new(),
@@ -1254,6 +1263,7 @@ impl SheetApp {
         let mut send_prompt: Option<String> = None;
         let mut retry_requested = false;
         let mut tool_approval = None;
+        let mut jump_preview = false;
         let mut undo_requested = false;
         let mut clear_chat = false;
 
@@ -1635,6 +1645,13 @@ impl SheetApp {
                                         ui.spacing_mut().item_spacing.x = 8.0;
                                         if ui_kit::primary_button(ui, "执行此操作").clicked() {
                                             tool_approval = Some(true);
+                                        }
+                                        if self.ai.pending_preview.is_some()
+                                            && ui_kit::secondary_button(ui, "定位预览")
+                                                .on_hover_text("在表格中高亮并定位到即将修改的单元格区域")
+                                                .clicked()
+                                        {
+                                            jump_preview = true;
                                         }
                                         if ui_kit::secondary_button(ui, "取消").clicked() {
                                             tool_approval = Some(false);
@@ -2517,6 +2534,19 @@ impl SheetApp {
         }
         if undo_requested {
             self.undo_last_ai_change();
+        }
+        if jump_preview {
+            if let Some(prev) = self.ai.pending_preview.clone() {
+                if prev.sheet_idx < self.wb.sheets.len() && prev.sheet_idx != self.sheet_idx {
+                    self.switch_sheet_view(prev.sheet_idx);
+                }
+                if let Some(&(r1, c1, r2, c2)) = prev.rects.first() {
+                    self.extra_sel.clear();
+                    self.sel = (r1, c1);
+                    self.sel_end = (r2, c2);
+                    self.ensure_visible();
+                }
+            }
         }
         if let Some(approved) = tool_approval {
             self.answer_ai_confirmation(approved, ctx);

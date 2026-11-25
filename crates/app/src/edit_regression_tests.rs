@@ -1706,12 +1706,12 @@ fn common_selection_and_format_shortcuts_work() {
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::Space, true)]);
     assert_eq!((app.sel, app.sel_end), ((1, 0), (1, 16_383)), "Shift+Space 单格选整行");
 
-    app.name_focus_request = false;
+    app.goto_dlg = None;
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::F5, false)]);
-    assert!(app.name_focus_request, "F5 应请求名称框焦点");
-    app.name_focus_request = false;
+    assert!(app.goto_dlg.is_some(), "F5 应打开「定位」对话框");
+    app.goto_dlg = None;
     run_keys(&mut app, &ctx, vec![ctrl_key_event(egui::Key::G)]);
-    assert!(app.name_focus_request, "Ctrl+G 应请求名称框焦点");
+    assert!(app.goto_dlg.is_some(), "Ctrl+G 应打开「定位」对话框");
 }
 
 #[test]

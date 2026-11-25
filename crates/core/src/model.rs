@@ -194,24 +194,9 @@ impl Value {
         }
     }
 
-    /// 用户输入解析：能当数字就当数字，TRUE/FALSE 当布尔，其余当文本（短文本自动驻留去重）
+    /// 用户输入解析：识别数字、日期/时间、百分比、千分位、货币、TRUE/FALSE，前导撇号强制文本（短文本自动驻留去重）
     pub fn parse_input(s: &str) -> Value {
-        let t = s.trim();
-        if t.is_empty() {
-            return Value::Empty;
-        }
-        if let Ok(n) = t.parse::<f64>() {
-            return Value::Number(n);
-        }
-        if t.len() <= 5 {
-            if t.eq_ignore_ascii_case("TRUE") {
-                return Value::Bool(true);
-            }
-            if t.eq_ignore_ascii_case("FALSE") {
-                return Value::Bool(false);
-            }
-        }
-        Value::Text(intern_short_str(s))
+        crate::input_parse::parse_cell_input(s, "", DateSystem::D1900).value
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1267,7 +1252,7 @@ impl Sheet {
             || self.hidden_dirty
     }
 
-    pub(crate) fn set_formula_cache(&mut self, r: u32, c: u32, value: Value) {
+    pub fn set_formula_cache(&mut self, r: u32, c: u32, value: Value) {
         if self.get_view(r, c).is_some_and(|cell| cell.value().as_ref() != &value) {
             self.cells.set_formula_cache(r, c, value);
         }
@@ -1993,6 +1978,8 @@ pub struct Workbook {
     pub calc_pending: bool,
     /// 手动模式下具体哪些工作表还有未算编辑；计算单表时不能误清别的表
     pub calc_pending_sheets: std::collections::BTreeSet<usize>,
+    /// 上次完整重算/同步缓存时各工作表的 `cell_revision`；用于保存时决定是否需要 `fullCalcOnLoad="1"`。
+    pub recalc_cell_revs: Vec<u64>,
     /// 打开密码设置；另存时继续加密
     pub encryption: Option<crate::crypto::EncryptionSettings>,
     /// Credentials for the package at `path`, independent of the next save's password.
@@ -2029,6 +2016,7 @@ impl Workbook {
             calc_max_change: 0.001,
             calc_pending: false,
             calc_pending_sheets: std::collections::BTreeSet::new(),
+            recalc_cell_revs: Vec::new(),
             dirty: false,
             chart_edits: Vec::new(),
             styles: crate::style::StyleTable::new(),
@@ -2058,6 +2046,33 @@ impl Workbook {
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "未命名.xlsx".to_string())
+    }
+
+    /// 标记所有公式缓存与当前单元格修订号一致（重算完成后调用），避免保存时多余写出 `fullCalcOnLoad="1"`。
+    pub fn mark_recalc_synced(&mut self) {
+        if !self.calc_manual && !self.calc_pending {
+            self.recalc_cell_revs = self.sheets.iter().map(|s| s.cell_revision()).collect();
+        }
+    }
+
+    /// 仅在公式缓存可能过期/缺失时要求 Excel 打开全量重算；若重算已完成且缓存有效则返回 `false`。
+    pub fn needs_full_calc_on_load(&self) -> bool {
+        if self.calc_manual || !self.sheets.iter().any(|s| s.has_formulas()) {
+            return false;
+        }
+        if self.calc_pending || self.load_incomplete || self.names_dirty {
+            return true;
+        }
+        if self.recalc_cell_revs.len() == self.sheets.len()
+            && self
+                .sheets
+                .iter()
+                .zip(&self.recalc_cell_revs)
+                .all(|(s, &r)| s.cell_revision() == r)
+        {
+            return false;
+        }
+        true
     }
 }
 

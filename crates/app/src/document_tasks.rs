@@ -57,10 +57,13 @@ pub(crate) struct DocumentTasks {
     pub recalc_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub recalc_done: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     pub recalc_total: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    /// UI-29.3：加载遮罩上显示的文件名与起始时刻（打开完成即清空）
+    /// UI-29.3：加载遮罩上显示的文件名、起始时刻、路径与字节进度/取消控制器（打开完成即清空）
     pub open_label: Option<String>,
     pub open_started: Option<Instant>,
     pub open_path: Option<PathBuf>,
+    pub open_ctrl: Option<std::sync::Arc<sheetcore::xlsx::LoadControl>>,
+    /// 后台加载/手动重算发起时各表的 cell_revision 快照（纯格式变更不丢弃结果）
+    pub open_recalc_revs: Vec<u64>,
     /// 大文件快速解锁首屏后，异步补齐的磁盘 SHA-256 基准指纹
     pub base_hash_rx: Option<Receiver<(PathBuf, String)>>,
     /// 大表后台 PDF 导出通道
@@ -172,14 +175,28 @@ impl CalculatedSnapshot {
     /// and returns `true`. If some sheet was edited concurrently, still preserves calculated caches
     /// for untouched self-contained sheets while returning `false` so dirty sheets remain scheduled.
     pub fn apply(self, live: &mut Workbook) -> bool {
-        self.apply_with_deps(live, None)
+        self.apply_with_deps_and_edits(live, None, &[])
     }
 
     #[allow(dead_code)]
     pub(crate) fn apply_with_deps(
+        self,
+        live: &mut Workbook,
+        deps: Option<&sheetcore::formula::deps::Deps>,
+    ) -> bool {
+        self.apply_with_deps_and_edits(live, deps, &[])
+    }
+
+    /// Install calculated results onto `live`.
+    /// - If all sheets stayed untouched, installs everything and returns `true`.
+    /// - If concurrent edits occurred in `concurrent_edits` and `deps` is available,
+    ///   adopts calculated formula caches for all cells OUTSIDE `deps.edit_closure(concurrent_edits)`
+    ///   so unrelated edits / continuous typing / collab traffic never waste completed background work!
+    pub(crate) fn apply_with_deps_and_edits(
         mut self,
         live: &mut Workbook,
-        _deps: Option<&sheetcore::formula::deps::Deps>,
+        deps: Option<&sheetcore::formula::deps::Deps>,
+        concurrent_edits: &[(usize, u32, u32)],
     ) -> bool {
         if !self.workbook_invariants_match(live) {
             return false;
@@ -198,8 +215,10 @@ impl CalculatedSnapshot {
             }
             live.calc_pending = calc.calc_pending;
             live.calc_pending_sheets = std::mem::take(&mut calc.calc_pending_sheets);
+            live.mark_recalc_synced();
             return true;
         }
+        // 1) Adopt completely untouched self-contained sheets
         if live.names.is_empty() && !live.calc_iterate {
             let table_sheet_count = live.sheets.iter().filter(|s| !s.tables.is_empty()).count();
             for (si, ((sheet, result), &is_clean)) in live
@@ -220,6 +239,42 @@ impl CalculatedSnapshot {
                 if sheet_calc_is_self_contained(sheet, other_sheets_have_tables) {
                     sheet.take_calculation(result);
                     live.calc_pending_sheets.remove(&si);
+                }
+            }
+        }
+        // 2) Partial cell-level adoption on concurrently-edited sheets outside the tainted closure
+        if !concurrent_edits.is_empty()
+            && !live.calc_iterate
+            && let Some(d) = deps
+            && !d.requires_full_recalc()
+        {
+            let mut tainted = d.edit_closure(concurrent_edits);
+            tainted.extend(concurrent_edits.iter().copied());
+            for (si, ((sheet, result), &is_clean)) in live
+                .sheets
+                .iter_mut()
+                .zip(&calc.sheets)
+                .zip(&clean_flags)
+                .enumerate()
+            {
+                if is_clean || !result.spill_shapes.is_empty() || !sheet.spill_shapes.is_empty() {
+                    continue;
+                }
+                let mut updates: Vec<(u32, u32, sheetcore::Value)> = Vec::new();
+                for (cref, calc_cell) in result.formula_cells() {
+                    let key = (si, cref.row, cref.col);
+                    if tainted.contains(&key) {
+                        continue;
+                    }
+                    if let Some(live_cell) = sheet.get(cref.row, cref.col)
+                        && live_cell.formula == calc_cell.formula
+                        && live_cell.value != calc_cell.value
+                    {
+                        updates.push((cref.row, cref.col, calc_cell.value.clone()));
+                    }
+                }
+                for (r, c, val) in updates {
+                    sheet.set_formula_cache(r, c, val);
                 }
             }
         }

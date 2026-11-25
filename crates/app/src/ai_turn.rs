@@ -526,6 +526,7 @@ impl SheetApp {
         self.ai.active_round = None;
         self.ai.calc_base = None;
         self.ai.confirmation_label = None;
+        self.ai.pending_preview = None;
         if let Some(last) = self.ai.messages.last_mut()
             && last.role == AiRole::Assistant
             && last.content.is_empty()
@@ -541,6 +542,7 @@ impl SheetApp {
         self.ai.cancel = None;
         self.ai.busy = false;
         self.ai.confirmation_label = None;
+        self.ai.pending_preview = None;
         if !retry {
             self.ai.active_round = None;
             self.ai.calc_base = None;
@@ -848,6 +850,7 @@ impl SheetApp {
             return;
         }
         self.ai.confirmation_label = None;
+        self.ai.pending_preview = None;
         if !approved {
             self.fail_ai_round("已取消待确认的操作，本轮剩余工具未执行。".into(), false);
             return;
@@ -877,12 +880,14 @@ impl SheetApp {
                 match staged {
                     Ok(Some(label)) => {
                         // Guard the cells shown on the card until the user answers.
+                        let preview = self.build_ai_pending_preview(&call.spec);
                         self.note_ai_footprint(&call.spec, &JsonValue::Null);
                         self.refresh_ai_baseline();
                         if let Some(turn) = self.ai.active_round.as_mut() {
                             turn.pending_calls.push_front(call);
                         }
                         self.ai.confirmation_label = Some(label);
+                        self.ai.pending_preview = preview;
                         self.ai.status_hint = "正在等待你确认表格操作".into();
                         return;
                     }

@@ -474,7 +474,8 @@ fn runtime_references_recalculate_changed_target_and_dependents_only() {
     number(&mut wb, 0, 0, 8.0);
     assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 0, 0)]), 3);
     assert_eq!(wb.sheets[0].value(0, 3), Value::Number(33.0));
-    assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 9, 9)]), 2);
+    // Unrelated edit to J10 is now pruned via dynamic watch index (0 recalcs instead of 2).
+    assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, 9, 9)]), 0);
 }
 
 #[test]
@@ -1112,8 +1113,9 @@ fn wave5_p0_09_p1_06_cancel_frame_budget_today_baseline_and_dynamic_watch() {
     let evaluated = recalc_dirty(&mut dwb, &ddeps, &[(0, 0, 0)]);
     assert_eq!(dwb.sheets[0].value(0, 2), Value::Number(10.0));
     assert_eq!(dwb.sheets[0].value(0, 3), Value::Number(42.0));
-    // First hop evaluates B1, C1, D1 (3 cells); second hop after B4 tail materializes ONLY re-evaluates C1 (1 cell, skipping D1!)
-    assert_eq!(evaluated, 4);
+    // Static literal OFFSET(E1,0,0) is resolved to E1 so D1 is skipped on both hops:
+    // hop 1 evaluates B1, C1 (2 cells); hop 2 after B4 tail materializes re-evaluates C1 (1 cell) => 3 total!
+    assert_eq!(evaluated, 3);
 
     // 5. Cold XLOOKUP index build respects expired frame budget deadline via LookupEvalScope
     let mut lwb = Workbook::new_blank();

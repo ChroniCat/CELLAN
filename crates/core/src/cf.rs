@@ -592,6 +592,19 @@ pub struct CfStats {
     pub dup_counts: HashMap<usize, HashMap<String, usize>>,
 }
 
+impl CfStats {
+    /// 比较两个条件格式统计快照的可见统计输出是否完全一致（忽略内部增量切片缓存）。
+    pub fn visual_eq(&self, other: &Self) -> bool {
+        self.ranges == other.ranges
+            && self.averages == other.averages
+            && self.counts == other.counts
+            && self.sorted == other.sorted
+            && self.percentiles == other.percentiles
+            && self.top_thresholds == other.top_thresholds
+            && self.dup_counts == other.dup_counts
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PageSlice {
     pub page: u32,

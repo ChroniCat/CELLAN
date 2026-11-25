@@ -161,7 +161,9 @@ fn visit_issues(wb: &crate::Workbook, si:usize, stop:&std::sync::atomic::AtomicB
         if i % 256 == 0 && stop.load(std::sync::atomic::Ordering::Relaxed) { return; }
         if sheet.ignored_errors.contains(&(key.row, key.col)) { continue; }
         let kind = match cell.value().as_ref() {
-            Value::Text(t) => error_kind(t),
+            Value::Error(e) => error_kind(e.text()),
+            Value::Text(t) => error_kind(t)
+                .or_else(|| looks_numeric(t).then_some(IssueKind::NumberAsText)),
             Value::Number(_) if wb.styles.get(sheet.style_of(key.row,key.col)).format.trim() == "@" => Some(IssueKind::NumberAsText),
             _ => None,
         };

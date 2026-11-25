@@ -1146,6 +1146,7 @@ fn home_page_clean_minimal_layout_without_subtitle_sidecards_or_preset_templates
                 short_dir: "F:\\docs".to_string(),
                 size_txt: "12.0 KB".to_string(),
                 mtime_txt: "1 小时前".to_string(),
+                pinned: false,
             })
             .collect(),
     );
@@ -2079,10 +2080,23 @@ fn top_left_home_and_tab_close_preserve_edits_and_save_silently() {
         "回到已打开文档后未保存的内存修改必须完好无损"
     );
 
-    // 点击已命名文档的 × 后等待后台写完，无需再按确认或 Ctrl+S。
+    // 点击含未保存修改文档的 × 后先弹出「保存 / 不保存 / 取消」确认框，用户确认保存（回车）后后台写完再关闭。
     app.request_close_tab(0);
     assert!(app.has_open_workbook, "有未保存修改时点击标签 × 不得直接关闭文件");
-    assert!(app.tab_close_confirm.is_none() && app.tasks.saving.is_some());
+    assert_eq!(app.tab_close_confirm, Some(app.doc_uid), "关闭脏工作簿应先询问保存/不保存/取消");
+    wps_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        egui::Modifiers::NONE,
+    );
+    assert!(app.tab_close_confirm.is_none(), "确认保存后应关闭确认框");
     for _ in 0..80 {
         wps_frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
         if !app.has_open_workbook && app.tasks.saving.is_none() {
