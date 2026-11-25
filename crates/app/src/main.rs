@@ -27,6 +27,7 @@ mod format_borders;
 mod wps_tools;
 mod wps_menus;
 mod pivot_ui;
+mod chart_ui;
 
 use document_tasks::{CalculatedSnapshot, DocumentTasks};
 use error_opts::ErrorCheckOptions;
@@ -1899,7 +1900,7 @@ struct TbDrag {
     before: Vec<sheetcore::textbox::TextBox>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ChartDrag {
     idx: usize,
     /// 0=移动，1..8=八个手柄（顺时针，从左上开始）
@@ -1907,6 +1908,8 @@ struct ChartDrag {
     start: egui::Pos2,
     rect: (f32, f32, f32, f32),
     anchor: (u32, u32, u32, u32),
+    before_charts: sheetcore::model::SharedList<sheetcore::charts::Chart>,
+    before_deleted: Vec<(String, String)>,
 }
 
 /// 图片拖动/缩放：松手才进撤销栈
@@ -2592,6 +2595,8 @@ struct SheetApp {
     chart_reload_src: bool,
     /// 图表管理窗口
     chart_mgr: bool,
+    /// Chart Studio 现代化图表向导与实时设计器状态
+    chart_studio: chart_ui::ChartStudioState,
     /// 透视表草稿
     pivot_edit: Option<sheetcore::pivot::PivotSpec>,
     /// 多字段透视：编辑中的规格与输出锚点
@@ -4152,6 +4157,7 @@ impl SheetApp {
             chart_src: String::new(),
             chart_reload_src: false,
             chart_mgr: false,
+            chart_studio: chart_ui::ChartStudioState::default(),
             pivot_edit: None,
             pivot2_edit: None,
             pivot2_last: None,
@@ -17846,7 +17852,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         });
 
         if del_clear || bksp_edit {
-            if let Some(i) = self.pic_sel {
+            if del_clear && self.chart_sel.is_some() {
+                self.delete_selected_chart();
+            } else if let Some(i) = self.pic_sel {
                 self.pic_delete(i);
             } else {
                 self.clear_values();
@@ -31214,27 +31222,9 @@ impl SheetApp {
 
 
 
-    /// 用选区插入一张柱状图（首行标题、首列分类），写进文件后重新读图表
+    /// 打开智能图表创建向导（自动扩选当前数据区并推荐最佳图型，支持未保存空白工作簿）
     fn insert_chart_from_selection(&mut self) {
-        let (r1, c1, r2, c2) = self.sel_rect();
-        if r2 <= r1 || c2 <= c1 {
-            self.status = "先选中一块数据（首行为系列名，首列为分类）".into();
-            return;
-        }
-        if self.wb.path.is_none() {
-            self.status = "请先保存文件再插入图表".into();
-            return;
-        }
-        let name = self.wb.sheet(self.sheet_idx).name.clone();
-        let ch = sheetcore::chart_write::chart_from_selection(
-            self.wb.sheet(self.sheet_idx),
-            &name,
-            (r1, c1, r2, c2),
-            "图表",
-            sheetcore::charts::ChartKind::Column,
-        );
-        self.chart_src = sheetcore::table::a1((r1, c1, r2, c2));
-        self.chart_edit = Some(ch);
+        self.open_chart_create_wizard(None);
     }
 
     /// 真的写文件
@@ -37890,7 +37880,8 @@ impl SheetApp {
             }
         }
 
-        // 图表（浮在单元格之上；直接借用只读切片，彻底消除每帧 `charts.clone()` 深拷贝百万点数组）
+        // 图表（浮在单元格之上；实时响应公式/筛选变动 + 源数据彩色高亮 + 零延迟交互浮层）
+        self.sync_live_charts();
         let chart_rect_of = |ch: &sheetcore::charts::Chart| {
             let (r1, c1, r2, c2) = ch.anchor;
             Rect::from_min_max(
@@ -37898,12 +37889,25 @@ impl SheetApp {
                 egui::pos2(px_of(c2), py_of(r2)),
             )
         };
+        let mut chart_ui_consumed = false;
+        let mut pending_chart_interaction: Option<(usize, chart_view::ChartInteractionOut)> = None;
         if !self.wb.sheet(self.sheet_idx).charts.is_empty() {
             let clip = egui::Rect::from_min_max(
                 egui::pos2(origin.x + head_w, origin.y + hh),
                 egui::pos2(origin.x + avail.x, origin.y + avail.y),
             );
+            if !dumping && self.chart_sel.is_some() {
+                self.paint_selected_chart_source_highlight(&painter, clip, &px_of, &py_of);
+            }
             let fonts_gen = system_fonts::generation();
+            let date_sys = self.wb.date_system;
+            let ptr_pos = (!dumping).then(|| resp.hover_pos()).flatten();
+            let click_pos = (!dumping && !readonly && resp.clicked())
+                .then(|| resp.interact_pointer_pos())
+                .flatten();
+            let dbl_pos = (!dumping && !readonly && resp.double_clicked())
+                .then(|| resp.interact_pointer_pos())
+                .flatten();
             let chart_len = self.wb.sheet(self.sheet_idx).charts.len();
             for ci in 0..chart_len {
                 let (r1, c1, r2, c2) = self.wb.sheet(self.sheet_idx).charts[ci].anchor;
@@ -37923,7 +37927,7 @@ impl SheetApp {
                     } else {
                         let sh = &self.wb.sheets[self.sheet_idx];
                         let ch = &sh.charts[ci];
-                        let shapes = self.cf_inputs.chart_shapes(
+                        let shapes = self.cf_inputs.chart_shapes_in(
                             &p2,
                             sh,
                             self.doc_gen,
@@ -37932,13 +37936,14 @@ impl SheetApp {
                             ci,
                             rect,
                             ch,
+                            date_sys,
                         );
                         grid_render_cache::paint_translated_shapes(&p2, &shapes, rect.min.to_vec2());
                     }
                     if self.chart_sel == Some(ci) {
                         painter.rect_stroke(
                             rect,
-                            0.0,
+                            4.0,
                             Stroke::new(1.5, ui_kit::ACCENT),
                             egui::StrokeKind::Inside,
                         );
@@ -37954,19 +37959,46 @@ impl SheetApp {
                         ] {
                             painter.rect_filled(
                                 Rect::from_center_size(p, Vec2::splat(6.0)),
-                                0.0,
+                                1.0,
                                 Color32::WHITE,
                             );
                             painter.rect_stroke(
                                 Rect::from_center_size(p, Vec2::splat(6.0)),
-                                0.0,
+                                1.0,
                                 Stroke::new(1.0, ui_kit::ACCENT),
                                 egui::StrokeKind::Inside,
                             );
                         }
                     }
+                    if !dumping && self.chart_drag.is_none() {
+                        let ch = &self.wb.sheets[self.sheet_idx].charts[ci];
+                        let out = chart_view::paint_chart_interactive_overlay(
+                            &p2,
+                            rect,
+                            ch,
+                            ptr_pos,
+                            click_pos,
+                            dbl_pos,
+                            self.chart_sel == Some(ci),
+                            date_sys,
+                        );
+                        if out.hovered {
+                            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if out.quick_action.is_some()
+                            || out.toggled_legend_series.is_some()
+                            || out.isolated_legend_series.is_some()
+                            || out.title_double_clicked
+                        {
+                            chart_ui_consumed = true;
+                            pending_chart_interaction = Some((ci, out));
+                        }
+                    }
                 }
             }
+        }
+        if let Some((ci, out)) = pending_chart_interaction {
+            self.apply_chart_interaction(ci, out);
         }
 
         // 文本框：手柄缩放、本体拖动、双击编辑、绘制模式（屏幕坐标先换算到表格坐标）
@@ -38026,13 +38058,16 @@ impl SheetApp {
             }
         }
 
-        // 图表拖动 / 缩放（手柄优先，其次拖图表本体）
+        // 图表拖动 / 缩放（手柄优先，其次拖图表本体；松手写入可撤销历史）
         if !readonly {
-            if resp.drag_started() {
+            if resp.drag_started() && !chart_ui_consumed {
                 if let Some(pos) = resp.interact_pointer_pos() {
+                    let sh = self.wb.sheet(self.sheet_idx);
+                    let before_charts = sh.charts.clone();
+                    let before_deleted = sh.deleted_charts.clone();
                     let mut started: Option<ChartDrag> = None;
                     if let Some(i) = self.chart_sel {
-                        if let Some(ch) = self.wb.sheet(self.sheet_idx).charts.get(i) {
+                        if let Some(ch) = sh.charts.get(i) {
                             let r = chart_rect_of(ch);
                             if let Some(mode) = chart_handle_at(r, pos) {
                                 started = Some(ChartDrag {
@@ -38041,29 +38076,34 @@ impl SheetApp {
                                     start: pos,
                                     rect: (r.left(), r.top(), r.right(), r.bottom()),
                                     anchor: ch.anchor,
+                                    before_charts: before_charts.clone(),
+                                    before_deleted: before_deleted.clone(),
                                 });
                             }
                         }
                     }
                     if started.is_none() {
-                        let hit = self
-                            .wb
-                            .sheet(self.sheet_idx)
+                        let hit = sh
                             .charts
                             .iter()
                             .enumerate()
+                            .rev()
                             .find_map(|(i, ch)| {
                                 let r = chart_rect_of(ch);
-                                r.contains(pos).then_some((
-                                    i,
-                                    ChartDrag {
-                                        idx: i,
-                                        mode: 0,
-                                        start: pos,
-                                        rect: (r.left(), r.top(), r.right(), r.bottom()),
-                                        anchor: ch.anchor,
-                                    },
-                                ))
+                                r.contains(pos).then(|| {
+                                    (
+                                        i,
+                                        ChartDrag {
+                                            idx: i,
+                                            mode: 0,
+                                            start: pos,
+                                            rect: (r.left(), r.top(), r.right(), r.bottom()),
+                                            anchor: ch.anchor,
+                                            before_charts: before_charts.clone(),
+                                            before_deleted: before_deleted.clone(),
+                                        },
+                                    )
+                                })
                             });
                         if let Some((i, drag)) = hit {
                             self.chart_sel = Some(i);
@@ -38074,7 +38114,7 @@ impl SheetApp {
                 }
             }
             if resp.dragged() {
-                if let (Some(d), Some(pos)) = (self.chart_drag, resp.interact_pointer_pos()) {
+                if let (Some(d), Some(pos)) = (self.chart_drag.clone(), resp.interact_pointer_pos()) {
                     let dx = pos.x - d.start.x;
                     let dy = pos.y - d.start.y;
                     let (mut x0, mut y0, mut x1, mut y1) = d.rect;
@@ -38123,11 +38163,33 @@ impl SheetApp {
                     }
                 }
             }
-            if resp.drag_stopped() && self.chart_drag.take().is_some() {
-                let sh = self.wb.sheet_mut(self.sheet_idx);
-                sh.charts_dirty = true;
-                self.wb.dirty = true;
-                self.status = "图表位置已更新（保存后写回 Excel）".into();
+            if resp.drag_stopped() {
+                if let Some(d) = self.chart_drag.take() {
+                    let sh_idx = self.sheet_idx;
+                    let sh = self.wb.sheet_mut(sh_idx);
+                    sh.charts_dirty = true;
+                    let changed = sh
+                        .charts
+                        .get(d.idx)
+                        .is_some_and(|ch| ch.anchor != d.anchor);
+                    let after_charts = sh.charts.clone();
+                    let after_deleted = sh.deleted_charts.clone();
+                    if changed {
+                        self.undo.push_chart_edit(
+                            if d.mode == 0 { "移动图表" } else { "调整图表大小" },
+                            (sh_idx, self.sel.0, self.sel.1),
+                            sheetcore::undo::ChartUndoEdit {
+                                sheet: sh_idx,
+                                charts_before: d.before_charts,
+                                charts_after: after_charts,
+                                deleted_before: d.before_deleted,
+                                deleted_after: after_deleted,
+                            },
+                        );
+                    }
+                    self.wb.dirty = true;
+                    self.status = "图表位置已更新（Ctrl+Z 可撤销，保存后写回 Excel）".into();
+                }
             }
 
             // 图片拖动 / 缩放（和图表同一套手柄判定；松手进撤销栈）
@@ -39955,9 +40017,9 @@ impl SheetApp {
         }
 
         // 图表浮在单元格之上：先判断点是否落在图表里（直接借用只读切片，消除 `charts.clone()` 深拷贝）
-        let mut chart_hit = false;
+        let mut chart_hit = chart_ui_consumed;
         let mut pic_hit = false;
-        if !readonly && resp.clicked() {
+        if !readonly && resp.clicked() && !chart_ui_consumed {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let found_chart = self
                     .wb
@@ -39965,6 +40027,7 @@ impl SheetApp {
                     .charts
                     .iter()
                     .enumerate()
+                    .rev()
                     .find_map(|(i, ch)| {
                         let (cr1, cc1, cr2, cc2) = ch.anchor;
                         let rect = Rect::from_min_max(
@@ -39976,9 +40039,13 @@ impl SheetApp {
                 if let Some((i, title)) = found_chart {
                     chart_hit = true;
                     self.chart_sel = Some(i);
-                    self.status = format!("已选中图表：{title}");
+                    self.status = format!(
+                        "已选中图表：{}（点击右上角「设计」可打开 Chart Studio，Delete 可删除）",
+                        if title.is_empty() { "未命名图表" } else { title.as_str() }
+                    );
                 } else {
                     self.chart_sel = None;
+                    self.chart_studio.sidebar_open = false;
                     let found_pic = self
                         .wb
                         .sheet(self.sheet_idx)
@@ -46811,8 +46878,10 @@ impl eframe::App for SheetApp {
             self.b4_probe();
         }
         self.chart_dialog(ctx);
+        self.draw_chart_create_wizard(ctx);
+        self.draw_chart_inline_title_modal(ctx);
         self.show_compare_window(ctx);
-        self.chart_manager(ctx);
+        self.draw_modern_chart_manager(ctx);
         self.macro_window(ctx);
         self.poll_find_scan();
         if !self.normal_page_breaks.replace_broadcast.is_empty() {
@@ -48241,6 +48310,7 @@ impl eframe::App for SheetApp {
         }
         if !self.show_start && !self.backstage {
             self.draw_pivot_sidebar(ctx);
+            self.draw_chart_studio_sidebar(ctx);
         }
 
         egui::CentralPanel::default()

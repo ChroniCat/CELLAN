@@ -313,7 +313,6 @@ fn chart_category_axis_uses_the_workbook_date_system() {
 
     let mut ch = Chart {
         kind: ChartKind::Column,
-        title: String::new(),
         series: vec![Series {
             cat_ref: "S!$A$1:$A$2".into(),
             ..Default::default()
@@ -321,17 +320,7 @@ fn chart_category_axis_uses_the_workbook_date_system() {
         legend: false,
         anchor: (0, 0, 10, 10),
         legend_pos: String::new(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: sheetcore::charts::LabelOpts::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
-        axis_x: String::new(),
-        axis_y: String::new(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        ..Default::default()
     };
     sheetcore::charts::resolve_series_in(
         &mut ch,

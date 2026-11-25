@@ -7,6 +7,8 @@ pub mod scenarios;
 pub mod zhconv;
 pub mod proof;
 pub mod cf;
+pub mod chart_engine;
+pub mod chart_svg;
 pub mod chart_write;
 pub mod charts;
 pub mod collate;

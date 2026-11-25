@@ -515,18 +515,33 @@
         </group>
         <group id="GroupCharts" label="图表">
           <splitButton id="ChartSplit" size="large" sizeString="48" imageMso="Chart" label="图表">
-            <button id="ColumnChart" label="图表" imageMso="Chart" screentip="按选区插入图表（默认柱状图，点箭头可选折线/饼图/散点等）" onAction="ColumnChart"/>
+            <button id="ColumnChart" label="智能图表" imageMso="Chart" screentip="打开智能图表向导：自动分析数据画像并推荐最佳图型，支持 22 种专业图表与实时预览" onAction="ColumnChart"/>
             <menu id="ChartMenu">
-              <button id="ChartColItem" label="柱状图" imageMso="Chart" onAction="ColumnChart"/>
-              <button id="ChartLineItem" label="折线图" imageMso="SparkLine" onAction="LineChart"/>
-              <button id="ChartPieItem" label="饼图" imageMso="Chart" onAction="PieChart"/>
+              <button id="ChartWizardItem" label="★ 智能推荐图表向导…" imageMso="Chart" onAction="ChartWizard"/>
+              <menuSeparator id="ChartSep0"/>
+              <button id="ChartColItem" label="柱状图" imageMso="Chart" onAction="ColumnClusteredChart"/>
+              <button id="ChartColStackItem" label="堆积柱状图" imageMso="Chart" onAction="ColumnStackedChart"/>
+              <button id="ChartCol100Item" label="百分比堆积柱图" imageMso="Chart" onAction="ColumnStacked100Chart"/>
               <button id="ChartBarItem" label="条形图" imageMso="SparkColumn" onAction="BarChart"/>
               <button id="ChartBarStackItem" label="堆积条形图" imageMso="SparkColumn" onAction="BarStackedChart"/>
+              <button id="ChartBar100Item" label="百分比堆积条图" imageMso="SparkColumn" onAction="BarStacked100Chart"/>
+              <menuSeparator id="ChartSepLine"/>
+              <button id="ChartLineItem" label="折线图" imageMso="SparkLine" onAction="LineChart"/>
               <button id="ChartAreaItem" label="面积图" imageMso="Chart" onAction="AreaChart"/>
-              <button id="ChartDoughnutItem" label="圆环图" imageMso="Chart" onAction="DoughnutChart"/>
+              <button id="ChartAreaStackItem" label="堆积面积图" imageMso="Chart" onAction="AreaStackedChart"/>
+              <button id="ChartComboItem" label="组合图（双轴柱+线）" imageMso="Chart" onAction="ComboChart"/>
+              <menuSeparator id="ChartSepFin"/>
+              <button id="ChartWaterfallItem" label="财务瀑布图（损益桥）" imageMso="Chart" onAction="WaterfallChart"/>
+              <button id="ChartFunnelItem" label="转化漏斗图" imageMso="Chart" onAction="FunnelChart"/>
+              <button id="ChartTreemapItem" label="矩形树图" imageMso="Chart" onAction="TreemapChart"/>
+              <button id="ChartPieItem" label="饼图" imageMso="Chart" onAction="PieChart"/>
+              <button id="ChartDoughnutItem" label="圆环图（中心 KPI）" imageMso="Chart" onAction="DoughnutChart"/>
+              <menuSeparator id="ChartSepStat"/>
               <button id="ChartScatterItem" label="散点图" imageMso="Chart" onAction="ScatterChart"/>
+              <button id="ChartBubbleItem" label="气泡图（三维）" imageMso="Chart" onAction="BubbleChart"/>
+              <button id="ChartHistogramItem" label="直方图 / 帕累托" imageMso="Chart" onAction="HistogramChart"/>
+              <button id="ChartBoxWhiskerItem" label="箱线图（四分位）" imageMso="Chart" onAction="BoxWhiskerChart"/>
               <button id="ChartRadarItem" label="雷达图" imageMso="Chart" onAction="RadarChart"/>
-              <button id="ChartComboItem" label="组合图（柱状+折线）" imageMso="Chart" onAction="ComboChart"/>
               <menuSeparator id="ChartSep1"/>
               <button id="ChartMenuMgr" label="管理本表图表…" imageMso="ChartList" onAction="ChartManager"/>
             </menu>
@@ -1053,10 +1068,25 @@
       </tabSet>
       <tabSet idMso="TabSetChartTools" label="图表工具">
         <tab id="TabChartTools" label="图表工具">
-          <group id="GroupChartTools" label="图表">
+          <group id="GroupChartStudio" label="设计器">
+            <toggleButton id="ChartStudioToggle" label="设计器面板" size="large" imageMso="ChartEdit" screentip="打开或关闭右侧 Chart Studio 实时设计器（22 图型/主题/坐标轴/回归趋势/参考线）" onAction="ChartStudioToggle"/>
             <box boxStyle="vertical">
-              <button id="ChartEdit" label="编辑图表" imageMso="ChartEdit" screentip="改类型/标题/系列" onAction="ChartEdit" sizeString="104"/>
-              <button id="ChartToolsManager" label="图表管理" imageMso="Chart" screentip="查看本表所有图表" onAction="ChartManager" sizeString="104"/>
+              <button id="ChartCycleTheme" label="切换配色主题" imageMso="Chart" screentip="轮换 8 套出版级配色主题" onAction="ChartCycleTheme" sizeString="108"/>
+              <button id="ChartSwitchRowCol" label="切换行/列" imageMso="SortDialog" screentip="一键互换分类轴与数据系列方向" onAction="ChartSwitchRowCol" sizeString="108"/>
+            </box>
+          </group>
+          <group id="GroupChartAnalytics" label="元素与分析">
+            <box boxStyle="vertical">
+              <toggleButton id="ChartToggleLabels" label="数据标签" imageMso="ShowComment" screentip="显示或隐藏数值数据标签" onAction="ChartToggleLabels" sizeString="96"/>
+              <toggleButton id="ChartToggleTrendline" label="回归趋势线" imageMso="SparkLine" screentip="快速添加/移除线性回归趋势线（显示公式与 R²）" onAction="ChartToggleTrendline" sizeString="96"/>
+            </box>
+          </group>
+          <group id="GroupChartTools" label="导出与管理">
+            <button id="ChartExportSvg" label="导出 SVG" size="large" imageMso="Image" screentip="导出无损出版级矢量图 SVG 文件" onAction="ChartExportSvg"/>
+            <box boxStyle="vertical">
+              <button id="ChartDuplicate" label="复制图表" imageMso="Chart" screentip="克隆当前图表及全部样式分析配置" onAction="ChartDuplicate" sizeString="92"/>
+              <button id="ChartToolsManager" label="图表管理" imageMso="ChartList" screentip="管理本表所有图表" onAction="ChartManager" sizeString="92"/>
+              <button id="ChartDelete" label="删除图表" imageMso="Close" screentip="删除当前选中图表（Ctrl+Z 可恢复）" onAction="ChartDelete" sizeString="92"/>
             </box>
           </group>
           <group id="GroupCurrentChart" label="当前图表">

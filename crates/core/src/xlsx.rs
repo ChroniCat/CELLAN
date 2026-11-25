@@ -1263,7 +1263,6 @@ impl SaveReceipt {
                         dirty = true;
                         continue;
                     };
-                    // Edits made while the worker was saving append to this journal.
                     if let Some((original, part, drawing)) = &baseline.created {
                         let anchor = std::mem::replace(&mut chart.anchor, original.anchor);
                         let same = chart == original;
@@ -1274,14 +1273,20 @@ impl SaveReceipt {
                         }
                         chart.part.clone_from(part);
                         chart.drawing.clone_from(drawing);
+                        chart.content_dirty = false;
+                    } else if chart.content_dirty {
+                        chart.content_dirty = false;
                     }
                     if chart.ref_fixes.starts_with(&baseline.ref_fixes) {
                         chart.ref_fixes.drain(..baseline.ref_fixes.len());
                     }
-                    dirty |= saved_index != index || baseline.anchor != chart.anchor
+                    dirty |= saved_index != index
+                        || baseline.anchor != chart.anchor
                         || (baseline.created.is_none() && baseline.drawing != chart.drawing)
-                        || !chart.ref_fixes.is_empty();
+                        || !chart.ref_fixes.is_empty()
+                        || chart.content_dirty;
                 }
+                sheet.deleted_charts.clear();
                 sheet.charts_dirty = dirty;
             }
         }
@@ -1435,7 +1440,7 @@ fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveR
         used_cell_delta: write.used_delta,
         sheets,
         source_encryption: wb.encryption.clone(),
-        committed_charts: wb.sheets.iter().filter(|s| s.charts_dirty || write.created_charts.contains_key(&(s.identity, 0))).map(|sheet| {
+        committed_charts: wb.sheets.iter().filter(|s| s.charts_dirty || !s.deleted_charts.is_empty() || write.created_charts.keys().any(|(id, _)| *id == s.identity)).map(|sheet| {
             let charts = sheet.charts.iter().enumerate().map(|(i, chart)| SavedChart {
                 part: chart.part.clone(), drawing: chart.drawing.clone(),
                 anchor: chart.anchor, ref_fixes: chart.ref_fixes.clone(),
@@ -3490,30 +3495,51 @@ fn save_plain_at(
         crate::patch::write_user_names(path, &wb.names).context("名称回写失败")?;
     }
 
-    // 图表引用改写（插删行列后）
+    // 图表删除、内容改写、锚点移动与引用改写
     for sheet in wb.sheets.iter() {
-        if !sheet.charts_dirty {
+        if !sheet.charts_dirty && sheet.deleted_charts.is_empty() {
             continue;
         }
+        // 1. 先摘除已删除的旧图表部件（若撤销恢复后仍在 live 列表中则跳过）
+        for (drawing, part) in &sheet.deleted_charts {
+            if drawing.is_empty() || part.is_empty() {
+                continue;
+            }
+            if sheet.charts.iter().any(|c| c.part == *part) {
+                continue;
+            }
+            let _ = crate::chart_write::delete_chart(path, drawing, part);
+        }
+        // 2. 更新已有图表的锚点、内容或引用
         for (idx, ch) in sheet.charts.iter().enumerate() {
-            // 拖动/缩放后的锚点写回 drawing
+            if ch.part.is_empty() {
+                continue;
+            }
             if !ch.drawing.is_empty() {
                 let ord = sheet.charts[..idx]
                     .iter()
-                    .filter(|c| c.drawing == ch.drawing)
+                    .filter(|c| !c.part.is_empty() && c.drawing == ch.drawing)
                     .count();
                 must_save!(
                     "chart-anchor",
                     crate::chart_write::write_anchor(path, &ch.drawing, ord, ch.anchor)
                 );
             }
-            if ch.part.is_empty() || ch.ref_fixes.is_empty() {
-                continue;
+            if ch.content_dirty && !ch.is_chartex && !matches!(ch.kind, crate::charts::ChartKind::Unknown) {
+                let mut committed = ch.clone();
+                if committed.series.iter().any(|s| !s.val_ref.is_empty()) {
+                    let _ = crate::chart_write::refresh_series_from_refs(wb, &sheet.name, &mut committed);
+                }
+                must_save!(
+                    "chart-replace",
+                    crate::chart_write::replace_chart(path, &ch.part, &committed)
+                );
+            } else if !ch.ref_fixes.is_empty() {
+                must_save!(
+                    "chart-refs",
+                    crate::chart_write::replace_refs(path, &ch.part, &ch.ref_fixes)
+                );
             }
-            must_save!(
-                "chart-refs",
-                crate::chart_write::replace_refs(path, &ch.part, &ch.ref_fixes)
-            );
         }
     }
 
@@ -3806,40 +3832,52 @@ fn save_plain_at(
         crate::notes::restore_external_rels(path, &external_rels)
     );
     crate::patch::commit_stage(path).context("保存收尾补丁落盘失败")?;
-    let mut created_charts = std::collections::HashMap::new();
-    if fresh_base {
-        for sheet in wb.sheets.iter().filter(|s| s.source_part.is_none()) {
-            let new_charts: Vec<_> = sheet
-                .charts
-                .iter()
-                .enumerate()
-                .filter(|(_, ch)| ch.part.is_empty())
-                .collect();
-            for (_, chart) in &new_charts {
-                let mut committed = (*chart).clone();
-                if committed.series.iter().any(|series| !series.val_ref.is_empty()) {
-                    crate::chart_write::refresh_series_from_refs(wb, &sheet.name, &mut committed)?;
-                }
-                crate::chart_write::insert_chart(path, &sheet.name, &committed)?;
-            }
-            if !new_charts.is_empty() {
-                let generated = crate::charts::load_charts(path, &sheet.name)?;
-                anyhow::ensure!(
-                    generated.len() == new_charts.len(),
-                    "图表写入后的关系数量不一致"
-                );
-                for ((i, _), chart) in new_charts.into_iter().zip(generated) {
-                    created_charts.insert((sheet.identity, i), (chart.part, chart.drawing));
-                }
-            }
-        }
-    }
     if fresh_base && streamed.iter().any(|&s| s) {
         let fresh_res = fresh::write(path, wb, &streamed, true)?;
         if let Some(st) = fresh_res.styles {
             saved_styles = Some(st);
         }
         trusted_parts.extend(fresh_res.trusted_parts);
+    }
+    let mut created_charts = std::collections::HashMap::new();
+    for sheet in wb.sheets.iter() {
+        let new_charts: Vec<_> = sheet
+            .charts
+            .iter()
+            .enumerate()
+            .filter(|(_, ch)| ch.part.is_empty())
+            .collect();
+        if new_charts.is_empty() {
+            continue;
+        }
+        let existing_parts: std::collections::HashSet<String> = sheet
+            .charts
+            .iter()
+            .filter(|c| !c.part.is_empty())
+            .map(|c| c.part.clone())
+            .collect();
+        for (_, chart) in &new_charts {
+            let mut committed = (*chart).clone();
+            if committed.series.iter().any(|series| !series.val_ref.is_empty()) {
+                let _ = crate::chart_write::refresh_series_from_refs(wb, &sheet.name, &mut committed);
+            }
+            crate::chart_write::insert_chart(path, &sheet.name, &committed)?;
+        }
+        let generated: Vec<_> = crate::charts::load_charts(path, &sheet.name)?
+            .into_iter()
+            .filter(|c| !existing_parts.contains(&c.part))
+            .collect();
+        anyhow::ensure!(
+            generated.len() >= new_charts.len(),
+            "图表写入后的关系数量不一致"
+        );
+        let tail_start = generated.len() - new_charts.len();
+        for ((i, _), chart) in new_charts
+            .into_iter()
+            .zip(generated.into_iter().skip(tail_start))
+        {
+            created_charts.insert((sheet.identity, i), (chart.part, chart.drawing));
+        }
     }
     Ok(CellWrite {
         styles: saved_styles,

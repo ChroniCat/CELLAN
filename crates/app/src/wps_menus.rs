@@ -2843,25 +2843,7 @@ impl SheetApp {
     }
 
     pub(crate) fn insert_chart_of_kind(&mut self, kind: ChartKind) {
-        let (r1, c1, r2, c2) = self.sel_rect();
-        if r2 <= r1 || c2 <= c1 {
-            self.status = "请先选中包含表头和数据的区域再插入图表".into();
-            return;
-        }
-        if self.wb.path.is_none() {
-            self.status = "请先保存工作簿再插入图表".into();
-            return;
-        }
-        let name = self.wb.sheet(self.sheet_idx).name.clone();
-        let ch = sheetcore::chart_write::chart_from_selection(
-            self.wb.sheet(self.sheet_idx),
-            &name,
-            (r1, c1, r2, c2),
-            kind.label(),
-            kind,
-        );
-        self.chart_src = sheetcore::table::a1((r1, c1, r2, c2));
-        self.chart_edit = Some(ch);
+        self.open_chart_create_wizard(Some(kind));
     }
 
     pub(crate) fn insert_quick_symbol(&mut self, ch: char) {

@@ -46,10 +46,12 @@ fn scatter_points_follow_x_scale_not_index() {
     let sh = &wb.sheets[1];
     let layout = sheetcore::print::paginate(sh, &sh.page);
     let out = sheetcore::print::page_ops_with(&wb, 1, &layout, 0, Some(&fixture()));
+    assert!(out.polys.is_empty(), "散点图不应画成闭合填充多边形");
     let pts: Vec<(f32, f32)> = out
-        .polys
+        .rects
         .iter()
-        .flat_map(|(p, _)| p.clone())
+        .filter(|(_, _, w, h, _)| (*w - 4.0).abs() < 0.1 && (*h - 4.0).abs() < 0.1)
+        .map(|(x, y, w, h, _)| (x + w * 0.5, y + h * 0.5))
         .collect();
     assert!(pts.len() >= 5, "散点要画出来：{:?}", pts.len());
     // 非等距：相邻点的水平间距不相等（1→2 近，2→10 远）

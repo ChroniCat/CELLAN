@@ -701,43 +701,72 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
         chart_text(out, x + (w - tw) / 2.0, y + h / 2.0, 9.0, &label, [120, 90, 40]);
         return;
     }
+    let th = crate::chart_engine::theme_spec(ch.style.theme);
     let mut top = y + h - 6.0;
     if !ch.title.is_empty() {
         let tw = out.tw(&ch.title, 10.0);
-        chart_text(out, x + (w - tw) / 2.0, top, 10.0, &ch.title, [40, 40, 40]);
+        chart_text(out, x + (w - tw) / 2.0, top, 10.0, &ch.title, th.title_fg);
         top -= 14.0;
     }
-    let legend_w = if ch.legend || !ch.legend_pos.is_empty() { 62.0f32 } else { 0.0 };
-    let plot = (x + 34.0, y + 18.0, (w - 44.0 - legend_w).max(20.0), (top - y - 24.0).max(20.0));
+    if !ch.subtitle.is_empty() {
+        let tw = out.tw(&ch.subtitle, 7.5);
+        chart_text(out, x + (w - tw) / 2.0, top, 7.5, &ch.subtitle, th.subtitle_fg);
+        top -= 11.0;
+    }
+    let legend_w = if (ch.legend || !ch.legend_pos.is_empty())
+        && !matches!(ch.kind, ChartKind::Waterfall | ChartKind::Funnel | ChartKind::Treemap)
+    {
+        62.0f32
+    } else {
+        0.0
+    };
+    let plot = (
+        x + 34.0,
+        y + 18.0,
+        (w - 44.0 - legend_w).max(20.0),
+        (top - y - 24.0).max(20.0),
+    );
     let (px0, py0, pw, ph) = plot;
-    out.lines.push((px0, py0, px0 + pw, py0, 0.5, [120, 120, 120]));
-    out.lines.push((px0, py0, px0, py0 + ph, 0.5, [120, 120, 120]));
+    if !matches!(
+        ch.kind,
+        ChartKind::Pie | ChartKind::Doughnut | ChartKind::Radar | ChartKind::Funnel | ChartKind::Treemap
+    ) {
+        out.lines.push((px0, py0, px0 + pw, py0, 0.5, th.axis_line));
+        out.lines.push((px0, py0, px0, py0 + ph, 0.5, th.axis_line));
+    }
 
+    let vis_series: Vec<(usize, &crate::charts::Series)> = ch
+        .series
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.hidden)
+        .collect();
     let max_of = |secondary: bool| {
-        ch.series
+        vis_series
             .iter()
-            .filter(|s| s.secondary == secondary)
-            .flat_map(|s| s.vals.iter())
-            .cloned()
+            .filter(|(_, s)| s.secondary == secondary)
+            .flat_map(|(_, s)| s.vals.iter().copied())
+            .filter(|v| v.is_finite())
             .fold(0.0f64, f64::max)
             .max(1e-9)
     };
     let max_main = nice_max(max_of(false));
     let max_sub = nice_max(max_of(true));
-    let has_sub = ch.series.iter().any(|s| s.secondary);
-    let n = ch.series.iter().map(|s| s.vals.len()).max().unwrap_or(0);
-    if !matches!(ch.kind, ChartKind::Pie | ChartKind::Doughnut) {
-        // 数值轴刻度：按轴的数字格式显示（百分比轴显示 25% 而不是 0.25）
+    let has_sub = vis_series.iter().any(|(_, s)| s.secondary);
+    let n = vis_series.iter().map(|(_, s)| s.vals.len()).max().unwrap_or(0);
+    let y_fmt = ch.effective_y_axis().num_fmt;
+    if !matches!(
+        ch.kind,
+        ChartKind::Pie | ChartKind::Doughnut | ChartKind::Radar | ChartKind::Funnel | ChartKind::Treemap
+    ) {
         let tick = |v: f64| -> String {
-            if ch.y_fmt.is_empty() {
+            if y_fmt.is_empty() {
                 crate::model::format_number(v)
             } else {
-                crate::style::format_value(&crate::model::Value::Number(v), &ch.y_fmt)
+                crate::style::format_value(&crate::model::Value::Number(v), &y_fmt)
             }
         };
-        // 刻度步长取「整齐数」（Excel 的 0/5/10/15/20/25，而不是固定五等分）。
-        // 百分比轴 Excel 默认 10 格（max=1 → 0/10%/…/100%），数值轴常见 5 格。
-        let want = if ch.y_fmt.contains('%') { 10.0 } else { 5.0 };
+        let want = if y_fmt.contains('%') { 10.0 } else { 5.0 };
         let step = nice_step(max_main / want);
         let n_steps = ((max_main / step).ceil() as usize).clamp(1, 12);
         for k in 0..=n_steps {
@@ -745,42 +774,30 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
             let txt = tick(v);
             let tw = out.tw(&txt, 7.0);
             let frac = (v / max_main) as f32;
-            chart_text(
-                out,
-                px0 - tw - 3.0,
-                py0 + ph * frac - 2.5,
-                7.0,
-                &txt,
-                [90, 90, 90],
-            );
+            chart_text(out, px0 - tw - 3.0, py0 + ph * frac - 2.5, 7.0, &txt, [90, 90, 90]);
         }
-        // 次坐标轴刻度：Excel 在右侧另起一套「整齐」刻度，与主轴同一取整规则
         if has_sub {
-            let want2 = if ch.y_fmt.contains('%') { 10.0 } else { 5.0 };
+            let want2 = if y_fmt.contains('%') { 10.0 } else { 5.0 };
             let step2 = nice_step(max_sub / want2);
             let n2 = ((max_sub / step2).ceil() as usize).clamp(1, 12);
             for k in 0..=n2 {
                 let v = step2 * k as f64;
                 let txt = tick(v);
                 let frac = (v / max_sub) as f32;
-                chart_text(
-                    out,
-                    px0 + pw + 3.0,
-                    py0 + ph * frac - 2.5,
-                    7.0,
-                    &txt,
-                    [90, 90, 90],
-                );
+                chart_text(out, px0 + pw + 3.0, py0 + ph * frac - 2.5, 7.0, &txt, [90, 90, 90]);
             }
         }
-        // 分类标签（散点用数值 X 轴，不画分类名）
-        let scatter = ch
-            .series
-            .iter()
-            .all(|se| matches!(series_kind(se, ch.kind), ChartKind::Scatter));
-        if !scatter && n > 0 && n <= 12 {
+        let scatter = !vis_series.is_empty()
+            && vis_series
+                .iter()
+                .all(|(_, se)| matches!(series_kind(se, ch.kind), ChartKind::Scatter | ChartKind::Bubble));
+        if !scatter
+            && !matches!(ch.kind, ChartKind::Histogram | ChartKind::BoxWhisker | ChartKind::Waterfall)
+            && n > 0
+            && n <= 12
+        {
             let gw = pw / n as f32;
-            if let Some(cats) = ch.series.iter().map(|se| &se.cats).find(|c| !c.is_empty()) {
+            if let Some(cats) = vis_series.iter().map(|(_, se)| &se.cats).find(|c| !c.is_empty()) {
                 for (i, c) in cats.iter().take(n).enumerate() {
                     let tw = out.tw(c, 7.0);
                     chart_text(out, px0 + gw * (i as f32 + 0.5) - tw / 2.0, py0 - 9.0, 7.0, c, [90, 90, 90]);
@@ -789,13 +806,16 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
         }
     }
     if matches!(ch.kind, ChartKind::Pie | ChartKind::Doughnut) {
-        let vals = ch.series.first().map(|s| s.vals.clone()).unwrap_or_default();
-        let total: f64 = vals.iter().sum::<f64>().max(1e-9);
+        let vals = vis_series.first().map(|(_, s)| s.vals.clone()).unwrap_or_default();
+        let total: f64 = vals.iter().copied().filter(|v| v.is_finite() && *v > 0.0).sum::<f64>().max(1e-9);
         let cx = px0 + pw / 2.0;
         let cy = py0 + ph / 2.0;
         let rad = (pw.min(ph) / 2.0 - 4.0).max(4.0);
-        let mut start_a = std::f32::consts::FRAC_PI_2;
+        let mut start_a = std::f32::consts::FRAC_PI_2 - (ch.style.first_slice_ang as f32).to_radians();
         for (i, v) in vals.iter().enumerate() {
+            if !v.is_finite() || *v <= 0.0 {
+                continue;
+            }
             let sweep = (*v / total) as f32 * std::f32::consts::TAU;
             let steps = ((sweep / 0.15).ceil() as usize).max(2);
             let mut pts = vec![(cx, cy)];
@@ -803,15 +823,25 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                 let t = start_a - sweep * (k as f32 / steps as f32);
                 pts.push((cx + rad * t.cos(), cy + rad * t.sin()));
             }
-            out.polys.push((pts, CHART_COLORS[i % CHART_COLORS.len()]));
+            out.polys.push((pts, th.palette[i % th.palette.len()]));
             start_a -= sweep;
+        }
+        if matches!(ch.kind, ChartKind::Doughnut) {
+            let ir = rad * (ch.style.hole_size.clamp(10, 85) as f32 / 100.0);
+            let mut hole = Vec::with_capacity(28);
+            for k in 0..28 {
+                let a = std::f32::consts::TAU * k as f32 / 28.0;
+                hole.push((cx + ir * a.cos(), cy + ir * a.sin()));
+            }
+            out.polys.push((hole, th.bg));
         }
     } else if matches!(ch.kind, ChartKind::Radar) {
         let groups = n.max(2);
         let cx = px0 + pw / 2.0;
         let cy = py0 + ph / 2.0;
         let rad = (pw.min(ph) / 2.0 - 6.0).max(6.0);
-        for (si, se) in ch.series.iter().enumerate() {
+        for &(si, se) in &vis_series {
+            // 保留 c19_radar 测试默认的 CHART_COLORS 50% 白混色基线
             let color = se.color.unwrap_or(CHART_COLORS[si % CHART_COLORS.len()]);
             let pts: Vec<(f32, f32)> = se
                 .vals
@@ -823,7 +853,6 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                     (cx + r * ang.cos(), cy + r * ang.sin())
                 })
                 .collect();
-            // 填充雷达（radarStyle=filled）：Excel 用 50% 透明度的面，这里按白色混 50% 近似
             if ch.radar_style == "filled" && pts.len() >= 3 {
                 let mix = |c: u8| ((c as u16 + 255) / 2) as u8;
                 let fill = [mix(color[0]), mix(color[1]), mix(color[2])];
@@ -833,39 +862,151 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                 let a = pts[k];
                 let b = pts[(k + 1) % pts.len()];
                 out.lines.push((a.0, a.1, b.0, b.1, 1.2, color));
-                // 填充雷达不画数据点标记（Excel 的 filled 样式没有 marker）
                 if ch.radar_style != "filled" {
                     out.rects.push((a.0 - 1.5, a.1 - 1.5, 3.0, 3.0, color));
                 }
             }
         }
+    } else if matches!(ch.kind, ChartKind::Waterfall) {
+        if let Some((_, s)) = vis_series.first() {
+            let bars = crate::chart_engine::compute_waterfall(s, &ch.analytics.waterfall_totals);
+            let (mut dmin, mut dmax) = (0.0f64, 0.0f64);
+            for b in &bars {
+                dmin = dmin.min(b.y_start).min(b.y_end);
+                dmax = dmax.max(b.y_start).max(b.y_end);
+            }
+            let span = (dmax - dmin).max(1e-9);
+            let slot = pw / bars.len().max(1) as f32;
+            let bw = (slot * 0.62).max(2.0);
+            for (i, b) in bars.iter().enumerate() {
+                let bx = px0 + i as f32 * slot + (slot - bw) * 0.5;
+                let ya = py0 + ph * ((b.y_start - dmin) / span) as f32;
+                let yb = py0 + ph * ((b.y_end - dmin) / span) as f32;
+                let col = match b.kind {
+                    crate::chart_engine::WaterfallBarKind::Increase => th.pos_color,
+                    crate::chart_engine::WaterfallBarKind::Decrease => th.neg_color,
+                    crate::chart_engine::WaterfallBarKind::Total => th.total_color,
+                };
+                out.rects.push((bx, ya.min(yb), bw, (ya - yb).abs().max(1.5), col));
+                if i + 1 < bars.len() {
+                    let nx = px0 + (i + 1) as f32 * slot + (slot - bw) * 0.5;
+                    out.lines.push((bx + bw, yb, nx, yb, 0.5, th.axis_line));
+                }
+            }
+        }
+    } else if matches!(ch.kind, ChartKind::Funnel) {
+        if let Some((_, s)) = vis_series.first() {
+            let stages = crate::chart_engine::compute_funnel(s);
+            let cnt = stages.len().max(1);
+            let rh = (ph / cnt as f32).min(24.0);
+            let cx = px0 + pw * 0.5;
+            for (i, st) in stages.iter().enumerate() {
+                let wt = pw * 0.72 * st.width_frac as f32;
+                let wb = stages
+                    .get(i + 1)
+                    .map(|nx| pw * 0.72 * nx.width_frac as f32)
+                    .unwrap_or(wt * 0.8);
+                let y_top = py0 + ph - i as f32 * rh - 2.0;
+                let y_bot = y_top - rh + 4.0;
+                out.polys.push((
+                    vec![
+                        (cx - wt * 0.5, y_top),
+                        (cx + wt * 0.5, y_top),
+                        (cx + wb * 0.5, y_bot),
+                        (cx - wb * 0.5, y_bot),
+                    ],
+                    th.palette[i % th.palette.len()],
+                ));
+            }
+        }
+    } else if matches!(ch.kind, ChartKind::Treemap) {
+        if let Some((_, s)) = vis_series.first() {
+            for (i, t) in crate::chart_engine::compute_treemap(s, px0, py0, pw, ph)
+                .into_iter()
+                .enumerate()
+            {
+                let ry = py0 + ph - (t.y - py0) - t.h;
+                out.rects.push((t.x, ry, t.w.max(1.0), t.h.max(1.0), th.palette[i % th.palette.len()]));
+            }
+        }
+    } else if matches!(ch.kind, ChartKind::Histogram) {
+        if let Some((_, s)) = vis_series.first() {
+            let bins = crate::chart_engine::compute_histogram(
+                s,
+                ch.analytics.hist_bins,
+                ch.analytics.show_pareto_line,
+            );
+            let mc = bins.iter().map(|b| b.count).max().unwrap_or(1) as f64;
+            let slot = pw / bins.len().max(1) as f32;
+            let col = th.palette[0];
+            let mut ppts = Vec::new();
+            for (i, b) in bins.iter().enumerate() {
+                let bx = px0 + i as f32 * slot + 1.0;
+                let bw = (slot - 2.0).max(1.5);
+                let bh = ph * (b.count as f64 / mc) as f32;
+                out.rects.push((bx, py0, bw, bh, col));
+                ppts.push((bx + bw * 0.5, py0 + ph * b.cum_pct as f32));
+            }
+            if ch.analytics.show_pareto_line {
+                for w2 in ppts.windows(2) {
+                    out.lines.push((w2[0].0, w2[0].1, w2[1].0, w2[1].1, 1.3, th.palette[1]));
+                }
+            }
+        }
+    } else if matches!(ch.kind, ChartKind::BoxWhisker) {
+        let boxes = crate::chart_engine::compute_box_whisker(ch);
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for b in &boxes {
+            lo = lo.min(b.whisker_lo);
+            hi = hi.max(b.whisker_hi);
+        }
+        let span = (hi - lo).max(1e-9);
+        let slot = pw / boxes.len().max(1) as f32;
+        let bw = (slot * 0.42).max(4.0);
+        for (i, b) in boxes.iter().enumerate() {
+            let cx = px0 + (i as f32 + 0.5) * slot;
+            let y_of = |v: f64| py0 + ph * ((v - lo) / span) as f32;
+            let col = th.palette[i % th.palette.len()];
+            out.lines.push((cx, y_of(b.whisker_lo), cx, y_of(b.whisker_hi), 1.0, col));
+            let y1 = y_of(b.q1);
+            let y3 = y_of(b.q3);
+            out.rects.push((cx - bw * 0.5, y1.min(y3), bw, (y3 - y1).abs().max(2.0), col));
+            let ym = y_of(b.median);
+            out.lines.push((cx - bw * 0.5, ym, cx + bw * 0.5, ym, 1.6, [255, 255, 255]));
+        }
     } else {
-        // 每个系列按自己的图型画；柱/条系列按柱系列序号并排
-        let bar_slots: Vec<usize> = ch
-            .series
+        // 标准笛卡尔系：簇状/堆积/百分比堆积柱条、折线、面积、散点、气泡、组合图
+        let bar_slots: Vec<usize> = vis_series
             .iter()
-            .enumerate()
             .filter(|(_, s)| {
                 let k = series_kind(s, ch.kind);
-                matches!(k, ChartKind::Column | ChartKind::Bar | ChartKind::BarStacked)
+                matches!(
+                    k,
+                    ChartKind::Column
+                        | ChartKind::ColumnStacked
+                        | ChartKind::ColumnStacked100
+                        | ChartKind::Bar
+                        | ChartKind::BarStacked
+                        | ChartKind::BarStacked100
+                )
             })
-            .map(|(i, _)| i)
+            .map(|(i, _)| *i)
             .collect();
         let slot_count = bar_slots.len().max(1);
         let groups = n.max(1);
         let gw = pw / groups as f32;
         let bw = (gw * 0.7 / slot_count as f32).max(1.5);
-        for (si, se) in ch.series.iter().enumerate() {
+        for &(si, se) in &vis_series {
             let color = se.color.unwrap_or(CHART_COLORS[si % CHART_COLORS.len()]);
             let scale = if se.secondary { max_sub } else { max_main };
             match series_kind(se, ch.kind) {
-                ChartKind::Line | ChartKind::Scatter => {
-                    let use_x = matches!(series_kind(se, ch.kind), ChartKind::Scatter)
-                        && se.xv.len() == se.vals.len()
-                        && !se.xv.is_empty();
+                ChartKind::Line | ChartKind::LineStacked | ChartKind::Scatter | ChartKind::Bubble => {
+                    let sk = series_kind(se, ch.kind);
+                    let is_scatter = matches!(sk, ChartKind::Scatter | ChartKind::Bubble);
+                    let use_x = is_scatter && se.xv.len() == se.vals.len() && !se.xv.is_empty();
                     let (xmin, xspan) = if use_x {
-                        let lo = se.xv.iter().cloned().fold(f64::MAX, f64::min);
-                        let hi = se.xv.iter().cloned().fold(f64::MIN, f64::max);
+                        let lo = se.xv.iter().copied().fold(f64::MAX, f64::min);
+                        let hi = se.xv.iter().copied().fold(f64::MIN, f64::max);
                         (lo, (hi - lo).max(1e-9))
                     } else {
                         (0.0, (se.vals.len().saturating_sub(1)).max(1) as f64)
@@ -884,13 +1025,19 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                         })
                         .filter(|p| p.0.is_finite() && p.1.is_finite())
                         .collect();
-                    if pts.len() >= 2 {
-                        out.polys.push((pts, color));
-                    } else if let Some(p) = pts.first() {
-                        out.rects.push((p.0 - 1.5, p.1 - 1.5, 3.0, 3.0, color));
+                    if !is_scatter && pts.len() >= 2 {
+                        for seg in pts.windows(2) {
+                            out.lines.push((seg[0].0, seg[0].1, seg[1].0, seg[1].1, 1.4, color));
+                        }
+                    }
+                    if is_scatter || pts.len() <= 60 {
+                        let r = if is_scatter { 2.0 } else { 1.5 };
+                        for p in &pts {
+                            out.rects.push((p.0 - r, p.1 - r, r * 2.0, r * 2.0, color));
+                        }
                     }
                 }
-                ChartKind::Area => {
+                ChartKind::Area | ChartKind::AreaStacked | ChartKind::AreaStacked100 => {
                     let step = if se.vals.len() > 1 {
                         pw / (se.vals.len() as f32 - 1.0)
                     } else {
@@ -898,7 +1045,9 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                     };
                     let mut pts = vec![(px0, py0)];
                     for (i, v) in se.vals.iter().enumerate() {
-                        pts.push((px0 + step * i as f32, py0 + ph * (*v / scale) as f32));
+                        if v.is_finite() {
+                            pts.push((px0 + step * i as f32, py0 + ph * (*v / scale) as f32));
+                        }
                     }
                     pts.push((px0 + step * (se.vals.len().saturating_sub(1)) as f32, py0));
                     out.polys.push((pts, color));
@@ -915,6 +1064,27 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
                     }
                 }
             }
+            // 趋势线 PDF 输出
+            for tl in &se.trendlines {
+                let raw: Vec<(f64, f64)> = se.vals.iter().enumerate().map(|(i, &v)| (i as f64, v)).collect();
+                if let Some(comp) = crate::chart_engine::compute_trendline(&raw, tl) {
+                    let tcol = tl.color.unwrap_or(color);
+                    let denom = se.vals.len().max(1) as f64;
+                    let tpts: Vec<(f32, f32)> = comp
+                        .points
+                        .iter()
+                        .map(|&(tx, ty)| {
+                            (
+                                px0 + pw * ((tx + 0.5) / denom) as f32,
+                                py0 + ph * (ty / scale) as f32,
+                            )
+                        })
+                        .collect();
+                    for seg in tpts.windows(2) {
+                        out.lines.push((seg[0].0, seg[0].1, seg[1].0, seg[1].1, 1.0, tcol));
+                    }
+                }
+            }
         }
     }
     if has_sub {
@@ -922,18 +1092,20 @@ fn draw_chart(sheet: &Sheet, ch: &crate::charts::Chart, sx: f32, sy: f32, px: f3
     }
     if legend_w > 0.0 {
         let mut ly = y + h - 18.0;
-        for (i, se) in ch.series.iter().enumerate().take(6) {
+        for &(i, se) in vis_series.iter().take(6) {
             let color = se.color.unwrap_or(CHART_COLORS[i % CHART_COLORS.len()]);
             out.rects.push((x + w - legend_w + 4.0, ly, 8.0, 8.0, color));
             chart_text(out, x + w - legend_w + 16.0, ly + 7.0, 7.5, &se.name, [60, 60, 60]);
             ly -= 12.0;
         }
     }
-    if !ch.axis_y.is_empty() {
-        chart_text(out, x + 2.0, y + h - 16.0, 7.5, &ch.axis_y, [80, 80, 80]);
+    let ax_y = ch.effective_y_axis().title;
+    let ax_x = ch.effective_x_axis().title;
+    if !ax_y.is_empty() {
+        chart_text(out, x + 2.0, y + h - 16.0, 7.5, &ax_y, [80, 80, 80]);
     }
-    if !ch.axis_x.is_empty() {
-        chart_text(out, x + w / 2.0 - 10.0, y + 10.0, 7.5, &ch.axis_x, [80, 80, 80]);
+    if !ax_x.is_empty() {
+        chart_text(out, x + w / 2.0 - 10.0, y + 10.0, 7.5, &ax_x, [80, 80, 80]);
     }
 }
 

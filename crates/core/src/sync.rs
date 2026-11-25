@@ -2698,21 +2698,12 @@ mod tests {
         sh0.charts.push(crate::charts::Chart {
             kind: crate::charts::ChartKind::Column,
             title: "预算柱状图".into(),
-            series: Vec::new(),
             legend: true,
             anchor: (0, 3, 10, 8),
             legend_pos: "r".into(),
             part: "xl/charts/chart1.xml".into(),
             drawing: "xl/drawings/drawing1.xml".into(),
-            show_labels: false,
-            label_opts: Default::default(),
-            radar_style: String::new(),
-            ref_fixes: Vec::new(),
-            axis_x: String::new(),
-            axis_y: String::new(),
-            y_fmt: String::new(),
-            y_min: None,
-            y_max: None,
+            ..Default::default()
         });
         sh0.edited = false;
         sh0.styles_dirty = false;

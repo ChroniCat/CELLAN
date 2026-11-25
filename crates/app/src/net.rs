@@ -9862,21 +9862,12 @@ mod integrity_tests {
             guest_wb.sheets[0].charts.push(sheetcore::charts::Chart {
                 kind: sheetcore::charts::ChartKind::Line,
                 title: "趋势图".into(),
-                series: Vec::new(),
                 legend: true,
                 anchor: (0, 4, 12, 10),
                 legend_pos: "r".into(),
                 part: "xl/charts/chart1.xml".into(),
                 drawing: "xl/drawings/drawing1.xml".into(),
-                show_labels: false,
-                label_opts: Default::default(),
-                radar_style: String::new(),
-                ref_fixes: Vec::new(),
-                axis_x: String::new(),
-                axis_y: String::new(),
-                y_fmt: String::new(),
-                y_min: None,
-                y_max: None,
+                ..Default::default()
             });
             guest_wb.sheets[0].merge_range(5, 0, 6, 1); // 原文件基础合并格（宿主未动，必须保留）
             guest_wb.sheets[0].merge_range(8, 0, 9, 1); // 原文件基础合并格（宿主已拆并，必须移除）

@@ -1375,21 +1375,8 @@ fn chart_selection_exposes_the_chart_tools_tab() {
     let ch = sheetcore::charts::Chart {
         kind: sheetcore::charts::ChartKind::Column,
         title: "测试图".into(),
-        series: Vec::new(),
-        legend: false,
         anchor: (1, 4, 10, 9),
-        legend_pos: String::new(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: sheetcore::charts::LabelOpts::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
-        axis_x: String::new(),
-        axis_y: String::new(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        ..Default::default()
     };
     app.wb.sheet_mut(0).charts.push(ch);
     assert!(app.chart_at_sel().is_none(), "没选中时没有图表工具");
@@ -1432,21 +1419,8 @@ fn dragging_a_chart_moves_its_anchor_and_marks_dirty() {
     let ch = sheetcore::charts::Chart {
         kind: sheetcore::charts::ChartKind::Column,
         title: "拖动测试".into(),
-        series: Vec::new(),
-        legend: false,
         anchor: (1, 2, 8, 6),
-        legend_pos: String::new(),
-        part: String::new(),
-        drawing: String::new(),
-        show_labels: false,
-        label_opts: sheetcore::charts::LabelOpts::default(),
-        radar_style: String::new(),
-        ref_fixes: Vec::new(),
-        axis_x: String::new(),
-        axis_y: String::new(),
-        y_fmt: String::new(),
-        y_min: None,
-        y_max: None,
+        ..Default::default()
     };
     app.wb.sheet_mut(0).charts.push(ch);
     let start = egui::pos2(HEAD_W + 2.0 * 72.0 + 40.0, HEAD_H + 19.0 + 30.0);
