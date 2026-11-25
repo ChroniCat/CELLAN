@@ -1003,7 +1003,7 @@ fn sorting_rebuilds_dependencies_for_edit_undo_and_redo() {
         app.deps = sheetcore::formula::deps::Deps::build(&app.wb).into();
         app.sel_end = (1, 1);
         if multi {
-            app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into(), sort_mode: 0, custom: String::new(), merge_consecutive: false, quote: false, detect_types: false, sort_by_row: false, split_fixed: false, widths: String::new(), col_modes: String::new() });
+            app.run_sort(&DataDlg { tab: 0, keys: vec![(0, true, true)], header: false, delim: ",".into(), sort_mode: 0, custom: String::new(), merge_consecutive: false, quote: false, detect_types: false, sort_by_row: false, split_fixed: false, widths: String::new(), col_modes: String::new(), ..Default::default() });
         } else {
             app.do_sort(0, true);
         }
@@ -1341,6 +1341,7 @@ fn table_design_tab_is_offered_inside_a_table_range() {
         columns: vec!["A".into(), "B".into(), "C".into()],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     app.sel = (2, 1);
     app.sel_end = (2, 1);
@@ -1363,6 +1364,7 @@ fn table_fill_calculated_column_is_a_real_command_entry() {
             column_ids: vec![1, 2, 3],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         sh.set(0, 0, sheetcore::model::Cell { value: sheetcore::model::Value::Text("Amount".into()), formula: None });
         sh.set(0, 1, sheetcore::model::Cell { value: sheetcore::model::Value::Text("Tax".into()), formula: None });
@@ -4923,6 +4925,7 @@ fn every_write_entry_is_blocked_by_one_remote_lock() {
                     split_fixed: false,
                     widths: String::new(),
                     col_modes: String::new(),
+                    ..Default::default()
                 })
             }),
         ),
@@ -7762,6 +7765,7 @@ fn split_preview_confirms_overwrite_and_undo_restores_expanded_region() {
         split_fixed: false,
         widths: String::new(),
         col_modes: String::new(),
+        ..Default::default()
     };
     app.run_split(&dlg);
     assert!(app.status.contains("覆盖"), "第一次应只预览：{}", app.status);
@@ -7835,6 +7839,7 @@ fn multi_level_sort_respects_level_order_and_selection_range() {
         split_fixed: false,
         widths: String::new(),
         col_modes: String::new(),
+        ..Default::default()
     };
     app.run_sort(&dlg);
     let order: Vec<String> = (1..=4)
@@ -7945,6 +7950,7 @@ fn editing_a_table_header_renames_the_column_and_fixes_formulas() {
             column_ids: vec![1, 2, 3],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         for (c, h) in ["Amount", "Tax", "Total"].iter().enumerate() {
             sh.set(0, c as u32, sheetcore::model::Cell {
@@ -11064,6 +11070,7 @@ fn run_split_fixed_width_writes_columns() {
         split_fixed: true,
         widths: "2,2".into(),
         col_modes: String::new(),
+        ..Default::default()
     });
     // 第一段落回原列，后续列往右写；断点之后的剩余部分并入最后一列（Excel 语义）
     assert_eq!(a.wb.sheets[0].value(0, 0).display(), "AB");
@@ -11092,6 +11099,7 @@ fn run_split_fixed_width_rejects_bad_widths() {
         split_fixed: true,
         widths: "2,0".into(),
         col_modes: String::new(),
+        ..Default::default()
     });
     assert!(a.status.contains("正整数"), "应提示宽度非法：{}", a.status);
     assert_eq!(a.wb.sheets[0].value(0, 0).display(), "ABCDEF", "非法宽度不改数据");
@@ -11128,6 +11136,7 @@ fn run_sort_by_row_reorders_columns() {
         split_fixed: false,
         widths: String::new(),
         col_modes: String::new(),
+        ..Default::default()
     });
     let row2: Vec<String> = (0..4)
         .map(|c| a.wb.sheets[0].value(2, c).display())
@@ -11170,6 +11179,7 @@ fn run_split_skips_column_and_shifts_left() {
         split_fixed: false,
         widths: String::new(),
         col_modes: "常规,跳过,常规".into(),
+        ..Default::default()
     });
     assert_eq!(a.wb.sheets[0].value(0, 0).display(), "甲");
     assert_eq!(a.wb.sheets[0].value(0, 1).display(), "丙", "跳过的列不占位，后面的列左移");

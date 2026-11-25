@@ -147,6 +147,7 @@ fn structured_references_share_evaluation_normalization() {
                 column_ids: Vec::new(),
         name: "Sales".into(), display: "Sales".into(), range: (0, 0, 2, 0),
         columns: vec!["Amount".into()], header_row: true, totals_row: false,
+        ..Default::default()
     });
     set(&mut wb, 1, 0, 1.0);
     set(&mut wb, 2, 0, 2.0);

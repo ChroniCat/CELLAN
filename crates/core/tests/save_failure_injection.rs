@@ -158,6 +158,7 @@ fn injected_failures_in_conditional_steps_abort_the_save() {
         columns: vec!["金额".into(), "数量".into()],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     wb.sheets[0].dv.push(sheetcore::dv::DataValidation {
         ranges: vec![(1, 0, 1, 0)],

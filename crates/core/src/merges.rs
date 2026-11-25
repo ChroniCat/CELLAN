@@ -213,6 +213,11 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
         std::collections::HashMap::new();
     let mut af_color_filters: std::collections::HashMap<u32, crate::sort_filter::ColorFilter> =
         std::collections::HashMap::new();
+    let mut af_top_filters: std::collections::HashMap<u32, crate::sort_filter::TopFilter> =
+        std::collections::HashMap::new();
+    let mut af_dynamic_filters: std::collections::HashMap<u32, crate::sort_filter::DynamicFilter> =
+        std::collections::HashMap::new();
+    let mut cur_custom_and = false;
     let mut freeze_y = 0u32;
     let mut freeze_x = 0u32;
     let mut saw_pane = false;
@@ -404,9 +409,47 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                         }
                     }
                 } else if name.ends_with("filterColumn") {
+                    cur_custom_and = false;
                     for a in e.attributes().flatten() {
                         if a.key.as_ref().ends_with("colId") {
                             cur_col = crate::model::xml_unescape(&a.value.to_string()).parse().ok();
+                        }
+                    }
+                } else if name.ends_with("customFilters") {
+                    cur_custom_and = false;
+                    for a in e.attributes().flatten() {
+                        if a.key.as_ref().ends_with("and") {
+                            let v = crate::model::xml_unescape(&a.value.to_string());
+                            cur_custom_and = v == "1" || v.eq_ignore_ascii_case("true");
+                        }
+                    }
+                } else if name.ends_with("top10") {
+                    if let (Some(col), Some(range)) = (cur_col, af_range) {
+                        let mut top = true;
+                        let mut percent = false;
+                        let mut count = 10u32;
+                        for a in e.attributes().flatten() {
+                            let k = a.key.as_ref();
+                            let v = crate::model::xml_unescape(&a.value.to_string());
+                            if k.ends_with("top") {
+                                top = v != "0" && !v.eq_ignore_ascii_case("false");
+                            } else if k.ends_with("percent") {
+                                percent = v == "1" || v.eq_ignore_ascii_case("true");
+                            } else if k.ends_with("val") {
+                                count = v.parse::<f64>().map(|x| x.round().max(1.0) as u32).unwrap_or(10);
+                            }
+                        }
+                        af_top_filters.insert(range.1 + col, crate::sort_filter::TopFilter { top, count, percent });
+                    }
+                } else if name.ends_with("dynamicFilter") {
+                    if let (Some(col), Some(range)) = (cur_col, af_range) {
+                        for a in e.attributes().flatten() {
+                            if a.key.as_ref().ends_with("type") {
+                                let v = crate::model::xml_unescape(&a.value.to_string());
+                                if let Some(df) = crate::sort_filter::DynamicFilter::from_ooxml(&v) {
+                                    af_dynamic_filters.insert(range.1 + col, df);
+                                }
+                            }
                         }
                     }
                 } else if name.ends_with("customFilter") {
@@ -493,7 +536,8 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                                 Some(c)
                                     if c.op == crate::sort_filter::CmpOp::Ge
                                         && op == crate::sort_filter::CmpOp::Le
-                                        && c.val2.is_none() =>
+                                        && c.val2.is_none()
+                                        && cur_custom_and =>
                                 {
                                     c.op = crate::sort_filter::CmpOp::Between;
                                     c.val2 = Some(val);
@@ -501,7 +545,8 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                                 Some(c)
                                     if c.op == crate::sort_filter::CmpOp::Le
                                         && op == crate::sort_filter::CmpOp::Ge
-                                        && c.val2.is_none() =>
+                                        && c.val2.is_none()
+                                        && cur_custom_and =>
                                 {
                                     let hi = std::mem::replace(&mut c.val, val);
                                     c.op = crate::sort_filter::CmpOp::Between;
@@ -513,12 +558,16 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                                 {
                                     c.val2 = Some(val);
                                 }
+                                Some(c) if c.second.is_none() => {
+                                    c.second = Some((cur_custom_and, op, val));
+                                }
                                 Some(_) => {}
                                 None => {
                                     let c = crate::sort_filter::Criterion {
                                         op,
                                         val,
                                         val2: None,
+                                        second: None,
                                     };
                                     af_criteria.insert(key, c);
                                 }
@@ -628,6 +677,8 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
         f.criteria = af_criteria;
         f.date_groups = af_date_groups;
         f.color_filters = af_color_filters;
+        f.top_filters = af_top_filters;
+        f.dynamic_filters = af_dynamic_filters;
         out.filter = Some(f);
     }
     out

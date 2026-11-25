@@ -13,6 +13,14 @@ pub struct SearchOpts {
     pub whole_cell: bool,
     /// 在公式文本里找，而不是在显示值里找
     pub in_formula: bool,
+    /// 启用 Excel 通配符（`*` 任意串、`?` 单字符、`~` 转义）
+    pub use_wildcards: bool,
+    /// 在单元格批注（notes）中查找
+    pub in_comments: bool,
+    /// 按格式筛选：匹配单元格填充色（`Some(Some(rgb))` = 指定色，`Some(None)` = 无填充，`None` = 不限）
+    pub match_fill: Option<Option<[u8; 3]>>,
+    /// 按格式筛选：匹配加粗状态（`Some(true/false)` = 必须匹配，`None` = 不限）
+    pub match_bold: Option<bool>,
 }
 
 /// 搜索推进顺序：行优先（默认）或列优先。
@@ -62,6 +70,82 @@ fn is_general_format(fmt: &str) -> bool {
     fmt.is_empty() || fmt.eq_ignore_ascii_case("General")
 }
 
+fn wildcard_match(text: &str, pattern: &str, match_case: bool) -> bool {
+    let t: Vec<char> = if match_case {
+        text.chars().collect()
+    } else {
+        text.to_lowercase().chars().collect()
+    };
+    let p_str = if match_case {
+        pattern.to_string()
+    } else {
+        pattern.to_lowercase()
+    };
+    #[derive(Clone, Copy)]
+    enum Tok {
+        Star,
+        Any,
+        Lit(char),
+    }
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut it = p_str.chars();
+    while let Some(ch) = it.next() {
+        match ch {
+            '~' => {
+                if let Some(next) = it.next() {
+                    toks.push(Tok::Lit(next));
+                } else {
+                    toks.push(Tok::Lit('~'));
+                }
+            }
+            '*' => {
+                if !matches!(toks.last(), Some(Tok::Star)) {
+                    toks.push(Tok::Star);
+                }
+            }
+            '?' => toks.push(Tok::Any),
+            other => toks.push(Tok::Lit(other)),
+        }
+    }
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < t.len() {
+        if pi < toks.len() {
+            match toks[pi] {
+                Tok::Star => {
+                    star_pi = Some(pi);
+                    star_ti = ti;
+                    pi += 1;
+                    continue;
+                }
+                Tok::Any => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                Tok::Lit(c) if c == t[ti] => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if let Some(sp) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = sp + 1;
+        } else {
+            return false;
+        }
+    }
+    while pi < toks.len() && matches!(toks[pi], Tok::Star) {
+        pi += 1;
+    }
+    pi == toks.len()
+}
+
 impl<'a> PreparedSearch<'a> {
     fn new(needle: &'a str, opts: &'a SearchOpts) -> Self {
         let ascii_ci = !opts.match_case && needle.is_ascii();
@@ -81,9 +165,43 @@ impl<'a> PreparedSearch<'a> {
     }
 
     #[inline]
+    fn has_format_filter(&self) -> bool {
+        self.opts.match_fill.is_some() || self.opts.match_bold.is_some()
+    }
+
+    #[inline]
+    fn matches_format(&self, wb: &Workbook, sh: &crate::model::Sheet, row: u32, col: u32) -> bool {
+        if !self.has_format_filter() {
+            return true;
+        }
+        let st = wb.styles.get(sh.style_of(row, col));
+        if let Some(want_fill) = self.opts.match_fill
+            && st.fill != want_fill
+        {
+            return false;
+        }
+        if let Some(want_bold) = self.opts.match_bold
+            && st.bold != want_bold
+        {
+            return false;
+        }
+        true
+    }
+
+    #[inline]
     fn matches_str(&self, text: &str) -> bool {
         if self.needle.is_empty() {
-            return false;
+            return self.has_format_filter();
+        }
+        if self.opts.use_wildcards
+            && (self.needle.contains('*') || self.needle.contains('?') || self.needle.contains('~'))
+        {
+            return if self.opts.whole_cell {
+                wildcard_match(text, self.needle, self.opts.match_case)
+            } else {
+                let pat = format!("*{}*", self.needle);
+                wildcard_match(text, &pat, self.opts.match_case)
+            };
         }
         if self.opts.match_case || self.uncased_utf8_needle {
             return if self.opts.whole_cell {
@@ -100,10 +218,11 @@ impl<'a> PreparedSearch<'a> {
             };
         }
         let hay = text.to_lowercase();
+        let needle_low = self.needle.to_lowercase();
         if self.opts.whole_cell {
-            hay == self.needle
+            hay == needle_low
         } else {
-            hay.contains(self.needle)
+            hay.contains(&needle_low)
         }
     }
 
@@ -118,6 +237,9 @@ impl<'a> PreparedSearch<'a> {
         col: u32,
         cell: crate::store::CellView<'_>,
     ) -> bool {
+        if !self.matches_format(wb, sh, row, col) {
+            return false;
+        }
         if self.opts.in_formula {
             let Some(f) = cell.formula() else {
                 return false;
@@ -191,6 +313,7 @@ fn scan_slab_in_range(
     // Fast path for unstyled DictText columns: evaluate `matches_str` at most once per unique
     // dictionary entry (<= 128) instead of 256 per-row lookups!
     if !prep.opts.in_formula
+        && !prep.has_format_filter()
         && !has_any_styles
         && style0_general
         && let crate::store::ColSlab::Values(vs) = slab
@@ -524,13 +647,33 @@ pub fn scoped_hits(
     needle: &str, opts: &SearchOpts, order: SearchOrder,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Vec<Hit> {
-    if needle.is_empty() {
+    let has_fmt = opts.match_fill.is_some() || opts.match_bold.is_some();
+    if needle.is_empty() && !has_fmt {
         return Vec::new();
     }
     let prep = PreparedSearch::new(needle, opts);
     let mut hits = Vec::new();
     for (si, sh) in wb.sheets.iter().enumerate() {
         if sheet.is_some_and(|only| only != si) { continue; }
+        if opts.in_comments {
+            for (k, note) in sh.notes.iter() {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Vec::new();
+                }
+                if !rects.is_empty()
+                    && !rects.iter().any(|&(r1, c1, r2, c2)| {
+                        let (a, b, c, d) = (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2));
+                        k.row >= a && k.row <= c && k.col >= b && k.col <= d
+                    })
+                {
+                    continue;
+                }
+                if prep.matches_format(wb, sh, k.row, k.col) && prep.matches_str(&note.text) {
+                    hits.push(Hit { sheet: si, row: k.row, col: k.col });
+                }
+            }
+            continue;
+        }
         let sheet_hits = if rects.is_empty() {
             search_sheet_pages_parallel(wb, si, sh, &prep, Some(cancelled))
         } else {

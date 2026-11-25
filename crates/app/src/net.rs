@@ -9858,6 +9858,7 @@ mod integrity_tests {
                 column_ids: vec![1, 2, 3],
                 header_row: true,
                 totals_row: false,
+                ..Default::default()
             });
             guest_wb.sheets[0].charts.push(sheetcore::charts::Chart {
                 kind: sheetcore::charts::ChartKind::Line,

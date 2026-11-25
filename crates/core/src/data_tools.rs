@@ -23,6 +23,10 @@ pub enum SortMode {
     Stroke,
     /// 自定义序列（高/中/低）：列表里靠前的排前面，不在列表里的按拼音排在后面
     Custom(Vec<String>),
+    /// 按单元格填充色置顶/置底排序
+    FillColor(Option<[u8; 3]>),
+    /// 按字体颜色置顶/置底排序
+    FontColor([u8; 3]),
 }
 
 /// 一个排序键
@@ -1515,8 +1519,178 @@ pub fn plan_large_sort_multi(sheet: &Sheet, index: usize, region: (u32,u32,u32,u
 
 pub fn plan_sort_multi(sheet: &Sheet, index: usize, region: (u32,u32,u32,u32),
                        keys: &[SortKey], header: bool) -> Result<RowChanges,String> {
-    Ok(multi_sort_order(sheet,region,keys,header)?.map_or_else(RowChanges::default, |(rect,horizontal,order)|
-        reorder_lines(sheet,index,rect,order,horizontal,false)))
+    plan_sort_multi_with_styles(sheet, None, index, region, keys, header, false)
+}
+
+/// 完整多级排序规划：支持填充色/字体色排序、区分大小写、中文拼音/笔画/自定义序列、以及按行（水平）多级排序！
+pub fn plan_sort_multi_with_styles(
+    sheet: &Sheet,
+    styles: Option<&crate::style::StyleTable>,
+    index: usize,
+    region: (u32, u32, u32, u32),
+    keys: &[SortKey],
+    header: bool,
+    horizontal: bool,
+) -> Result<RowChanges, String> {
+    let needs_color_or_horiz = horizontal
+        || keys.iter().any(|k| matches!(k.mode, SortMode::FillColor(_) | SortMode::FontColor(_)));
+    if !needs_color_or_horiz {
+        return Ok(multi_sort_order(sheet, region, keys, header)?.map_or_else(
+            RowChanges::default,
+            |(rect, horiz, order)| reorder_lines(sheet, index, rect, order, horiz, false),
+        ));
+    }
+    let (mut r1, mut c1, r2, c2) = region;
+    if horizontal {
+        if header {
+            c1 = c1.saturating_add(1);
+        }
+        if c2 <= c1 || r2 < r1 || keys.is_empty() {
+            return Ok(RowChanges::default());
+        }
+        crate::sort_filter::validate_sort_region(sheet, (r1, c1, r2, c2))?;
+        let active: Vec<&SortKey> = keys.iter().filter(|k| (r1..=r2).contains(&k.col)).collect();
+        if active.is_empty() {
+            return Ok(RowChanges::default());
+        }
+        let mut order: Vec<u32> = (c1..=c2).collect();
+        let mut key_cache = crate::collate::SortKeyCache::new();
+        // 为每列构建多级键
+        let col_keys: Vec<Vec<(u8, u32, u64, String)>> = order
+            .iter()
+            .map(|&col| {
+                active
+                    .iter()
+                    .map(|k| eval_cell_sort_tuple(sheet, styles, k.col, col, k, &mut key_cache))
+                    .collect()
+            })
+            .collect();
+        let mut idxs: Vec<usize> = (0..order.len()).collect();
+        idxs.sort_by(|&a, &b| {
+            for (ki, k) in active.iter().enumerate() {
+                let ord = cmp_sort_tuple(&col_keys[a][ki], &col_keys[b][ki], k.asc);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            Ordering::Equal
+        });
+        order = idxs.into_iter().map(|i| order[i]).collect();
+        return Ok(reorder_lines(sheet, index, (r1, c1, r2, c2), order, true, false));
+    }
+    // 垂直排序（含颜色排序键）
+    if header {
+        r1 = r1.saturating_add(1);
+    }
+    if r2 <= r1 || c2 < c1 || keys.is_empty() {
+        return Ok(RowChanges::default());
+    }
+    crate::sort_filter::validate_sort_region(sheet, (r1, c1, r2, c2))?;
+    let active: Vec<&SortKey> = keys.iter().filter(|k| (c1..=c2).contains(&k.col)).collect();
+    if active.is_empty() {
+        return Ok(RowChanges::default());
+    }
+    let mut order: Vec<u32> = (r1..=r2).collect();
+    let mut key_cache = crate::collate::SortKeyCache::new();
+    let row_keys: Vec<Vec<(u8, u32, u64, String)>> = order
+        .iter()
+        .map(|&row| {
+            active
+                .iter()
+                .map(|k| eval_cell_sort_tuple(sheet, styles, row, k.col, k, &mut key_cache))
+                .collect()
+        })
+        .collect();
+    let mut idxs: Vec<usize> = (0..order.len()).collect();
+    idxs.sort_by(|&a, &b| {
+        for (ki, k) in active.iter().enumerate() {
+            let ord = cmp_sort_tuple(&row_keys[a][ki], &row_keys[b][ki], k.asc);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+    order = idxs.into_iter().map(|i| order[i]).collect();
+    Ok(reorder_lines(sheet, index, (r1, c1, r2, c2), order, false, false))
+}
+
+/// 返回 `(kind: 0=color_match/num, 1=bool, 2=text, 3=empty/color_miss, custom_rank, num_bits, collate_hex)`
+fn eval_cell_sort_tuple(
+    sheet: &Sheet,
+    styles: Option<&crate::style::StyleTable>,
+    r: u32,
+    c: u32,
+    spec: &SortKey,
+    key_cache: &mut crate::collate::SortKeyCache,
+) -> (u8, u32, u64, String) {
+    match &spec.mode {
+        SortMode::FillColor(target) => {
+            let hit = styles.is_some_and(|st| st.get(sheet.style_of(r, c)).fill == *target);
+            // 置顶(asc=true): 命中=0, 未命中=1；置底(asc=false): 反转时未命中在前
+            return (0, if hit { 0 } else { 1 }, 0, String::new());
+        }
+        SortMode::FontColor(target) => {
+            let hit = styles.is_some_and(|st| st.get(sheet.style_of(r, c)).color == *target);
+            return (0, if hit { 0 } else { 1 }, 0, String::new());
+        }
+        _ => {}
+    }
+    let v = sheet.value_ref(r, c);
+    match v.as_ref() {
+        Value::Empty => (3, u32::MAX, 0, String::new()),
+        Value::Number(n) => (0, u32::MAX, n.to_bits(), String::new()),
+        Value::Bool(b) => (1, u32::MAX, u64::from(*b), String::new()),
+        Value::Text(t) => {
+            let norm = if spec.ignore_case { t.to_lowercase() } else { t.to_string() };
+            let custom = if let SortMode::Custom(list) = &spec.mode {
+                list.iter()
+                    .position(|x| x.trim().eq_ignore_ascii_case(norm.trim()))
+                    .map_or(u32::MAX, |i| i as u32)
+            } else {
+                u32::MAX
+            };
+            let s = match &spec.mode {
+                SortMode::Default => norm,
+                SortMode::Stroke => {
+                    let mut out = String::new();
+                    for ch in norm.chars() {
+                        if let Some(rk) = crate::collate::stroke_rank(ch) {
+                            out.push_str(&format!("{rk:05x}"));
+                        } else {
+                            out.push_str("fffff");
+                        }
+                    }
+                    out
+                }
+                _ => {
+                    let bytes = key_cache.get_or_compute(&norm);
+                    bytes.iter().map(|b| format!("{b:02x}")).collect()
+                }
+            };
+            (2, custom, 0, s)
+        }
+        Value::Error(e) => (2, u32::MAX, 0, e.text().to_string()),
+    }
+}
+
+fn cmp_sort_tuple(
+    a: &(u8, u32, u64, String),
+    b: &(u8, u32, u64, String),
+    asc: bool,
+) -> Ordering {
+    if a.0 == 3 || b.0 == 3 {
+        return (a.0 == 3).cmp(&(b.0 == 3));
+    }
+    let ord = a.0.cmp(&b.0).then_with(|| match a.0 {
+        0 if a.1 != u32::MAX || b.1 != u32::MAX => a.1.cmp(&b.1),
+        0 => f64::from_bits(a.2)
+            .partial_cmp(&f64::from_bits(b.2))
+            .unwrap_or(Ordering::Equal),
+        1 => a.2.cmp(&b.2),
+        _ => a.1.cmp(&b.1).then_with(|| a.3.cmp(&b.3)),
+    });
+    if asc { ord } else { ord.reverse() }
 }
 
 fn multi_sort_order(sheet: &Sheet, region: (u32,u32,u32,u32), keys: &[SortKey], header: bool)
@@ -1893,6 +2067,8 @@ pub fn remove_duplicates(sheet: &mut Sheet, region: (u32, u32, u32, u32), cols: 
 #[derive(Clone, Debug)]
 pub struct SplitOpts {
     pub delim: char,
+    /// 额外分隔符集合（支持同时勾选逗号/分号/制表符/空格等）
+    pub extra_delims: Vec<char>,
     /// 连续分隔符当一个（“a,,b” 或 “a   b” 不产生空列）
     pub merge_consecutive: bool,
     /// 双引号包起来的字段里不拆，`""` 表示一个引号
@@ -1904,6 +2080,8 @@ pub struct SplitOpts {
     pub fixed_widths: Option<Vec<usize>>,
     /// 逐列格式（Excel「列数据格式」）：None = 全部走 detect_types
     pub col_modes: Option<Vec<ColMode>>,
+    /// 目标起始位置（Excel 分列第 3 步“目标区域”）；None = 原地覆盖
+    pub destination: Option<(u32, u32)>,
 }
 
 /// 分列的逐列格式
@@ -1923,12 +2101,14 @@ impl Default for SplitOpts {
     fn default() -> Self {
         Self {
             delim: ',',
+            extra_delims: Vec::new(),
             merge_consecutive: false,
             quote: true,
             detect_types: true,
             date_system: crate::model::DateSystem::D1900,
             fixed_widths: None,
             col_modes: None,
+            destination: None,
         }
     }
 }
@@ -1965,7 +2145,7 @@ pub fn split_fields(line: &str, opts: &SplitOpts) -> Vec<String> {
             }
             continue;
         }
-        if !in_quote && ch == opts.delim {
+        if !in_quote && (ch == opts.delim || opts.extra_delims.contains(&ch)) {
             if opts.merge_consecutive && cur.trim().is_empty() {
                 cur.clear();
                 continue;
@@ -2055,13 +2235,17 @@ pub fn text_to_columns_ex(
         report.width = report.width.max(kept);
         rows.push((k.row, fields));
     }
+    let (dst_r0, dst_c0) = opts.destination.unwrap_or((r1, c1));
+    let in_place = opts.destination.is_none() || opts.destination == Some((r1, c1));
     let shift = report.width.saturating_sub(1) as u32;
     if dry_run {
         for (r, fields) in &rows {
-            for (i, _) in fields.iter().enumerate().skip(1) {
-                let c = c1 + i as u32;
+            let dr = dst_r0 + (*r - r1);
+            let skip_n = if in_place { 1 } else { 0 };
+            for (i, _) in fields.iter().enumerate().skip(skip_n) {
+                let c = dst_c0 + i as u32;
                 let occupied = sheet
-                    .get_view(*r, c)
+                    .get_view(dr, c)
                     .is_some_and(|x| x.value().with_display_str(|s| !s.is_empty()));
                 if occupied {
                     report.overwritten += 1;
@@ -2070,8 +2254,8 @@ pub fn text_to_columns_ex(
         }
         return report;
     }
-    // 右侧被推开的列：仅稀疏提取实际非空格，按列从最右往左写回（消除远端列导致的稠密空扫）
-    if shift > 0 {
+    // 仅原地拆分时把右侧原有列整体右移腾位置；指定了独立目标单元格时直接写目标区域
+    if in_place && shift > 0 {
         let last = sheet.used_bounds().map(|b| b.3).unwrap_or(c2).max(c2);
         if c1 + 1 <= last {
             let mut to_shift: Vec<(u32, u32, Cell, u16)> = sheet
@@ -2086,7 +2270,8 @@ pub fn text_to_columns_ex(
         }
     }
     for (r, fields) in &rows {
-        let mut out_c = c1;
+        let dr = dst_r0 + (*r - r1);
+        let mut out_c = dst_c0;
         for (i, f) in fields.iter().enumerate() {
             let mode = opts
                 .col_modes
@@ -2109,9 +2294,9 @@ pub fn text_to_columns_ex(
                 _ => detect_value(f, opts),
             };
             if is_date {
-                report.date_cells.push((*r, out_c));
+                report.date_cells.push((dr, out_c));
             }
-            sheet.set(*r, out_c, Cell { value: v, formula: None });
+            sheet.set(dr, out_c, Cell { value: v, formula: None });
             report.written += 1;
             out_c += 1;
         }
@@ -2123,12 +2308,14 @@ pub fn text_to_columns_ex(
 pub fn text_to_columns(sheet: &mut Sheet, region: (u32, u32, u32, u32), delim: char) -> usize {
     let opts = SplitOpts {
         delim,
+        extra_delims: Vec::new(),
         merge_consecutive: false,
         quote: false,
         detect_types: false,
         date_system: crate::model::DateSystem::D1900,
         fixed_widths: None,
         col_modes: None,
+        destination: None,
     };
     text_to_columns_ex(sheet, region, &opts, false).width
 }

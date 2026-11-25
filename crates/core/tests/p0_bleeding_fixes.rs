@@ -545,6 +545,7 @@ fn p0_31_structural_shifts_merges_objects_page_rich_filter_and_tables() {
         column_ids: vec![1, 2, 3],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
 
     apply_structural_wb(&mut wb, 0, &Structural::DeleteRows { at: 2, n: 1 });

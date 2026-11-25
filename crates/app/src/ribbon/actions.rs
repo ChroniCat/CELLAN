@@ -456,6 +456,13 @@ impl SheetApp {
                     st.visible = false;
                 }
             }
+            "TableStyleChip" => {
+                if let Some(t) = self.table_at_sel() {
+                    st.text = Some(t.style_name.clone());
+                } else {
+                    st.visible = false;
+                }
+            }
             _ => {}
         }
         if crate::debug_flags::ribbon_state_matches(id) {
@@ -1001,6 +1008,9 @@ impl SheetApp {
             "FilterReapply" => {
                 self.reapply_filter();
             }
+            "FilterAdvanced" => {
+                self.open_adv_filter_dialog();
+            }
             "HeaderFooter" => self.hf_dlg = true,
             // ---------------------------------------------------- 文本框
             "InsertTextBox" => {
@@ -1086,6 +1096,8 @@ impl SheetApp {
             "GroupSelection" => self.group_selection(),
             "UngroupSelection" => self.ungroup_selection(),
             "OutlineSettings" => self.outline_set_dlg = true,
+            "OutlineAuto" => self.auto_outline(),
+            "OutlineClear" => self.clear_outline(),
             "HideDetail" => self.toggle_detail(true),
             "ShowDetail" => self.toggle_detail(false),
             "ImportCsv" => self.import_csv(),
@@ -1128,6 +1140,8 @@ impl SheetApp {
                 self.fc_dlg = Some(crate::ForecastDlg {
                     range,
                     periods: 6,
+                    season_len: 0,
+                    confidence: 95,
                     msg: String::new(),
                 });
             }
@@ -1149,6 +1163,8 @@ impl SheetApp {
                     } else {
                         String::new()
                     },
+                    replace_existing: true,
+                    page_break_between_groups: false,
                     msg: String::new(),
                 });
             }
@@ -1463,6 +1479,11 @@ impl SheetApp {
             "ToggleTotals" => {
                 if let Some(t) = self.table_at_sel() {
                     self.toggle_totals_row(&t.name);
+                }
+            }
+            a if a.starts_with("TableTotalsFn:") => {
+                if let Some(fn_name) = a.strip_prefix("TableTotalsFn:") {
+                    self.set_table_totals_fn(fn_name);
                 }
             }
 

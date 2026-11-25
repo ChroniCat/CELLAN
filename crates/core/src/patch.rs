@@ -1153,6 +1153,8 @@ pub fn auto_filter_xml_with_dxfs(
         .keys()
         .chain(f.date_groups.keys())
         .chain(f.color_filters.keys())
+        .chain(f.top_filters.keys())
+        .chain(f.dynamic_filters.keys())
     {
         if !cols.contains(c) {
             cols.push(*c);
@@ -1164,6 +1166,22 @@ pub fn auto_filter_xml_with_dxfs(
             continue;
         }
         let col_id = col - c1;
+        if let Some(tf) = f.top_filters.get(&col) {
+            out.push_str(&format!(
+                "<filterColumn colId=\"{col_id}\"><top10 top=\"{}\" percent=\"{}\" val=\"{}\"/></filterColumn>",
+                if tf.top { 1 } else { 0 },
+                if tf.percent { 1 } else { 0 },
+                tf.count.max(1)
+            ));
+            continue;
+        }
+        if let Some(df) = f.dynamic_filters.get(&col) {
+            out.push_str(&format!(
+                "<filterColumn colId=\"{col_id}\"><dynamicFilter type=\"{}\"/></filterColumn>",
+                df.as_ooxml()
+            ));
+            continue;
+        }
         if let Some(cf) = f.color_filters.get(&col) {
             match cf {
                 crate::sort_filter::ColorFilter::Fill(None) => {
@@ -1210,54 +1228,51 @@ pub fn auto_filter_xml_with_dxfs(
                 }
                 out
             };
+            let write_one_custom = |out: &mut String, op: crate::sort_filter::CmpOp, val: &str| {
+                match op {
+                    crate::sort_filter::CmpOp::Contains => {
+                        let pat = format!("*{}*", esc_wild(val));
+                        out.push_str(&format!("<customFilter operator=\"equal\" val=\"{}\"/>", esc(&pat)));
+                    }
+                    crate::sort_filter::CmpOp::NotContains => {
+                        let pat = format!("*{}*", esc_wild(val));
+                        out.push_str(&format!("<customFilter operator=\"notEqual\" val=\"{}\"/>", esc(&pat)));
+                    }
+                    crate::sort_filter::CmpOp::Begins => {
+                        let pat = format!("{}*", esc_wild(val));
+                        out.push_str(&format!("<customFilter operator=\"equal\" val=\"{}\"/>", esc(&pat)));
+                    }
+                    crate::sort_filter::CmpOp::Ends => {
+                        let pat = format!("*{}", esc_wild(val));
+                        out.push_str(&format!("<customFilter operator=\"equal\" val=\"{}\"/>", esc(&pat)));
+                    }
+                    other => out.push_str(&format!(
+                        "<customFilter operator=\"{}\" val=\"{}\"/>",
+                        other.xml_operator(),
+                        esc(val)
+                    )),
+                }
+            };
+            let is_and = crit.second.as_ref().map(|(a, _, _)| *a).unwrap_or(true);
+            let and_attr = if is_and { " and=\"1\"" } else { "" };
             out.push_str(&format!(
-                "<filterColumn colId=\"{col_id}\"><customFilters and=\"1\">"
+                "<filterColumn colId=\"{col_id}\"><customFilters{and_attr}>"
             ));
-            match crit.op {
-                crate::sort_filter::CmpOp::Between => {
-                    let hi = crit.val2.clone().unwrap_or_default();
-                    out.push_str(&format!(
-                        "<customFilter operator=\"greaterThanOrEqual\" val=\"{}\"/>",
-                        esc(&crit.val)
-                    ));
-                    out.push_str(&format!(
-                        "<customFilter operator=\"lessThanOrEqual\" val=\"{}\"/>",
-                        esc(&hi)
-                    ));
-                }
-                crate::sort_filter::CmpOp::Contains => {
-                    let pat = format!("*{}*", esc_wild(&crit.val));
-                    out.push_str(&format!(
-                        "<customFilter operator=\"equal\" val=\"{}\"/>",
-                        esc(&pat)
-                    ));
-                }
-                crate::sort_filter::CmpOp::NotContains => {
-                    let pat = format!("*{}*", esc_wild(&crit.val));
-                    out.push_str(&format!(
-                        "<customFilter operator=\"notEqual\" val=\"{}\"/>",
-                        esc(&pat)
-                    ));
-                }
-                crate::sort_filter::CmpOp::Begins => {
-                    let pat = format!("{}*", esc_wild(&crit.val));
-                    out.push_str(&format!(
-                        "<customFilter operator=\"equal\" val=\"{}\"/>",
-                        esc(&pat)
-                    ));
-                }
-                crate::sort_filter::CmpOp::Ends => {
-                    let pat = format!("*{}", esc_wild(&crit.val));
-                    out.push_str(&format!(
-                        "<customFilter operator=\"equal\" val=\"{}\"/>",
-                        esc(&pat)
-                    ));
-                }
-                op => out.push_str(&format!(
-                    "<customFilter operator=\"{}\" val=\"{}\"/>",
-                    op.xml_operator(),
+            if crit.op == crate::sort_filter::CmpOp::Between {
+                let hi = crit.val2.clone().unwrap_or_default();
+                out.push_str(&format!(
+                    "<customFilter operator=\"greaterThanOrEqual\" val=\"{}\"/>",
                     esc(&crit.val)
-                )),
+                ));
+                out.push_str(&format!(
+                    "<customFilter operator=\"lessThanOrEqual\" val=\"{}\"/>",
+                    esc(&hi)
+                ));
+            } else {
+                write_one_custom(&mut out, crit.op, &crit.val);
+                if let Some((_, op2, val2)) = &crit.second {
+                    write_one_custom(&mut out, *op2, val2);
+                }
             }
             out.push_str("</customFilters></filterColumn>");
             continue;

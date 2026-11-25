@@ -350,17 +350,25 @@ struct DedupDlg {
     preview: Option<std::sync::mpsc::Receiver<((bool, Vec<bool>, u64, u64), usize)>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct DataDlg {
     tab: u8,
     /// (列, 是否升序, 是否启用)
     keys: Vec<(u32, bool, bool)>,
     header: bool,
     delim: String,
-    /// 0 = 默认（字典序），1 = 拼音，2 = 自定义序列
+    /// 0 = 默认（字典序），1 = 拼音，2 = 自定义序列，3 = 笔画，4 = 按填充色，5 = 按字体色
     sort_mode: u8,
     /// 自定义序列，顿号/逗号分隔
     custom: String,
+    /// 排序：区分大小写
+    case_sensitive: bool,
+    /// 按颜色排序时指定的 RGB（None = 无填充/自动色）
+    sort_color_rgb: Option<[u8; 3]>,
+    /// 分列：额外分隔符（支持同时启用多种分隔符，如 ";\t "）
+    extra_delims: String,
+    /// 分列：目标输出起点单元格（空 = 原位覆盖）
+    destination: String,
     /// 分列：连续分隔符当一个
     merge_consecutive: bool,
     /// 分列：引号内不拆
@@ -385,6 +393,12 @@ struct FindState {
     replace: String,
     match_case: bool,
     whole_cell: bool,
+    /// 启用 Excel 通配符（`*`、`?`、`~`）
+    use_wildcards: bool,
+    /// 在批注中查找
+    in_comments: bool,
+    /// 仅匹配加粗格式单元格
+    match_bold: bool,
     /// 0 = 当前工作表，1 = 整个工作簿，2 = 当前选区
     scope: u8,
     /// false = 行优先，true = 列优先
@@ -1818,11 +1832,15 @@ impl Default for ProtectDlg {
 }
 
 /// 图表拖动/缩放的状态
-/// 预测工作表对话框
+/// 预测工作表对话框（Holt-Winters ETS 季节性预测 + 置信区间）
 #[derive(Clone)]
 struct ForecastDlg {
     range: String,
     periods: u32,
+    /// 季节周期（0 = 自动检测）
+    season_len: usize,
+    /// 置信水平百分比（如 95）
+    confidence: u8,
     msg: String,
 }
 
@@ -1833,6 +1851,19 @@ struct SubtotalDlg {
     key_col: String,
     funcs: sheetcore::subtotal::SubFn,
     value_cols: String,
+    replace_existing: bool,
+    page_break_between_groups: bool,
+    msg: String,
+}
+
+/// 高级筛选对话框
+#[derive(Clone)]
+struct AdvFilterDlg {
+    list_range: String,
+    criteria_range: String,
+    copy_to: String,
+    in_place: bool,
+    unique_only: bool,
     msg: String,
 }
 
@@ -1965,8 +1996,15 @@ struct FilterPopup {
     search: String,
     /// 面板左上角（表头按钮正下方）
     anchor: egui::Pos2,
-    /// 文本/数字筛选对话框：Some((条件, 输入框1, 输入框2, 是否新开))
+    /// 文本/数字筛选对话框：Some((条件, 输入框1, 输入框2))
     crit_dlg: Option<(sheetcore::sort_filter::CmpOp, String, String)>,
+    /// 自定义自动筛选第二条件逻辑（true=与 AND，false=或 OR）
+    crit_and: bool,
+    /// 自定义自动筛选第二条件运算符与值
+    crit_op2: Option<sheetcore::sort_filter::CmpOp>,
+    crit_val2: String,
+    /// 前/后 N 项筛选对话框：Some((top, percent, count))
+    top_dlg: Option<(bool, bool, u32)>,
     /// 「文本筛选 ▸」的二级面板是否展开，以及它的锚点
     ops_open: bool,
     ops_anchor: egui::Pos2,
@@ -1980,6 +2018,8 @@ struct FilterPopup {
     date_mode: bool,
     /// 是否展开「按颜色筛选」区块
     color_open: bool,
+    /// 是否使用级联格式化选项模式
+    use_cascading: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2745,6 +2785,12 @@ struct SheetApp {
     selected_sheets: std::collections::BTreeSet<usize>,
     /// 筛选对话框日期树展开年份集合
     filter_expanded_years: std::collections::HashSet<i32>,
+    /// 筛选对话框日期树展开 (年, 月) 集合（用于展开到日级勾选）
+    filter_expanded_months: std::collections::HashSet<(i32, u32)>,
+    /// 高级筛选对话框
+    adv_filter_dlg: Option<AdvFilterDlg>,
+    /// 单变量求解预览状态：(sheet, vr, vc, 原始单元格, 求解新值, 目标达成值)
+    goal_preview: Option<(usize, u32, u32, Option<sheetcore::model::Cell>, f64, f64)>,
     /// 最近一次记忆的窗口几何（用于落盘防抖）
     last_saved_win_geom: Option<(i32, i32, i32, i32, bool)>,
     /// 窗口几何变更的防抖计时起点（拖动结束 400ms 后或退出时才写盘，绝不每帧写盘）
@@ -4227,6 +4273,9 @@ impl SheetApp {
             error_badge_open: false,
             selected_sheets: std::collections::BTreeSet::new(),
             filter_expanded_years: std::collections::HashSet::new(),
+            filter_expanded_months: std::collections::HashSet::new(),
+            adv_filter_dlg: None,
+            goal_preview: None,
             last_saved_win_geom: None,
             win_geom_dirty_at: None,
             update_ready_restart: false,
@@ -5745,6 +5794,7 @@ impl SheetApp {
                                         op,
                                         val: v1,
                                         val2: v2,
+                                        second: None,
                                     };
                                     {
                                         let sh = self.wb.sheet_mut(self.sheet_idx);
@@ -7942,6 +7992,7 @@ impl SheetApp {
             col_modes: String::new(),
                 quote: true,
                 detect_types: true,
+                ..Default::default()
             };
             self.run_sort(&dlg);
             let order: Vec<String> = (1..=5)
@@ -7969,6 +8020,7 @@ impl SheetApp {
             col_modes: String::new(),
                 quote: true,
                 detect_types: true,
+                ..Default::default()
             };
             self.run_split(&dlg);
             let a = self.wb.sheet(self.sheet_idx).get(0, 3).map(|c| c.value.display()).unwrap_or_default();
@@ -11540,9 +11592,24 @@ impl SheetApp {
 
     fn open_data_dlg(&mut self, tab: u8) {
         let raw = self.sel_rect();
-        let (r1, c1, r2, c2) = self
-            .clamp_rect_to_used(raw)
-            .unwrap_or((raw.0, raw.1, raw.0, raw.3.min(raw.1 + 255)));
+        let (r1, c1, r2, c2) =
+            if tab == 0 && raw.0 == raw.2 && raw.1 == raw.3 {
+                let reg = sheetcore::sort_filter::current_region(
+                    self.wb.sheet(self.sheet_idx),
+                    raw.0,
+                    raw.1,
+                );
+                if reg.2 > reg.0 || reg.3 > reg.1 {
+                    self.sel = (reg.0, reg.1);
+                    self.sel_end = (reg.2, reg.3);
+                    reg
+                } else {
+                    raw
+                }
+            } else {
+                self.clamp_rect_to_used(raw)
+                    .unwrap_or((raw.0, raw.1, raw.0, raw.3.min(raw.1 + 255)))
+            };
         let c2_ui = c2.min(c1 + 255);
         let header = sheetcore::sort_filter::has_header(self.wb.sheet(self.sheet_idx), r1, c1, r2, c2_ui);
         let keys = (c1..=c2_ui).map(|c| (c, true, c == c1)).collect();
@@ -11553,6 +11620,10 @@ impl SheetApp {
             delim: ",".into(),
             sort_mode: 1,
             custom: "高,中,低".into(),
+            case_sensitive: false,
+            sort_color_rgb: None,
+            extra_delims: String::new(),
+            destination: String::new(),
             merge_consecutive: true,
             sort_by_row: false,
             split_fixed: false,
@@ -11569,10 +11640,50 @@ impl SheetApp {
             return;
         };
         let rect = (r1, c1, r2, c2);
+        let sort_mode_val = || -> sheetcore::data_tools::SortMode {
+            match dlg.sort_mode {
+                1 => sheetcore::data_tools::SortMode::Pinyin,
+                3 => sheetcore::data_tools::SortMode::Stroke,
+                4 => sheetcore::data_tools::SortMode::FillColor(dlg.sort_color_rgb),
+                5 => sheetcore::data_tools::SortMode::FontColor(dlg.sort_color_rgb.unwrap_or([0, 0, 0])),
+                2 => sheetcore::data_tools::SortMode::Custom(
+                    dlg.custom
+                        .split(['，', ',', '、', ';'])
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect(),
+                ),
+                _ => sheetcore::data_tools::SortMode::Default,
+            }
+        };
+        let needs_styles = matches!(dlg.sort_mode, 4 | 5);
+        let styles_arc = needs_styles.then(|| std::sync::Arc::new(self.wb.styles.clone()));
         if dlg.sort_by_row {
             let row = self.sel.0.clamp(r1, r2);
             let asc = dlg.keys.first().map(|(_, a, _)| *a).unwrap_or(true);
-            self.run_reorder(rect, data_reorder::Operation::Columns { row, asc });
+            let header_col = dlg.header
+                || sheetcore::sort_filter::has_header_col(
+                    self.wb.sheet(self.sheet_idx),
+                    r1,
+                    c1,
+                    r2,
+                    c2,
+                );
+            let row_keys = vec![sheetcore::data_tools::SortKey {
+                col: row,
+                asc,
+                ignore_case: !dlg.case_sensitive,
+                mode: sort_mode_val(),
+            }];
+            self.run_reorder(
+                rect,
+                data_reorder::Operation::Multi {
+                    keys: row_keys,
+                    header: header_col,
+                    horizontal: true,
+                    styles: styles_arc,
+                },
+            );
             return;
         }
         let keys: Vec<sheetcore::data_tools::SortKey> = dlg
@@ -11582,26 +11693,23 @@ impl SheetApp {
             .map(|(c, asc, _)| sheetcore::data_tools::SortKey {
                 col: *c,
                 asc: *asc,
-                ignore_case: true,
-                mode: match dlg.sort_mode {
-                    1 => sheetcore::data_tools::SortMode::Pinyin,
-                    3 => sheetcore::data_tools::SortMode::Stroke,
-                    2 => sheetcore::data_tools::SortMode::Custom(
-                        dlg.custom
-                            .split(['，', ',', '、', ';'])
-                            .map(|x| x.trim().to_string())
-                            .filter(|x| !x.is_empty())
-                            .collect(),
-                    ),
-                    _ => sheetcore::data_tools::SortMode::Default,
-                },
+                ignore_case: !dlg.case_sensitive,
+                mode: sort_mode_val(),
             })
             .collect();
         if keys.is_empty() {
             self.status = "至少选一列排序".into();
             return;
         }
-        self.run_reorder(rect, data_reorder::Operation::Multi { keys, header: dlg.header });
+        self.run_reorder(
+            rect,
+            data_reorder::Operation::Multi {
+                keys,
+                header: dlg.header,
+                horizontal: false,
+                styles: styles_arc,
+            },
+        );
     }
 
     /// 删除重复（旧入口/探针用）：全列比较、无对话框。
@@ -11614,12 +11722,28 @@ impl SheetApp {
         self.apply_dedup((r1, c1, r2, c2), header, &[]);
     }
 
-    /// UI-17.2：打开去重对话框（选列 + 实时预览）。
+    /// UI-17.2：打开去重对话框（单格自动扩选当前区域 + 选列 + 实时预览）。
     fn open_dedup_dialog(&mut self) {
         let raw = self.sel_rect();
+        let expanded = if raw.0 == raw.2 && raw.1 == raw.3 {
+            let reg = sheetcore::sort_filter::current_region(
+                self.wb.sheet(self.sheet_idx),
+                raw.0,
+                raw.1,
+            );
+            if reg.2 > reg.0 || reg.3 > reg.1 {
+                self.sel = (reg.0, reg.1);
+                self.sel_end = (reg.2, reg.3);
+                reg
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
         let rect = self
-            .clamp_rect_to_used(raw)
-            .unwrap_or((raw.0, raw.1, raw.0, raw.3.min(raw.1 + 255)));
+            .clamp_rect_to_used(expanded)
+            .unwrap_or((expanded.0, expanded.1, expanded.0, expanded.3.min(expanded.1 + 255)));
         let c2_clamped = rect.3.min(rect.1 + 511);
         let rect = (rect.0, rect.1, rect.2, c2_clamped);
         let header = sheetcore::sort_filter::has_header(
@@ -11645,7 +11769,15 @@ impl SheetApp {
             self.status = "没有重复行".into();
             return;
         };
-        self.run_reorder((r1, c1, r2, c2), data_reorder::Operation::Dedup { cols: cols.to_vec(), header });
+        let total_data_rows = (r2.saturating_sub(r1) + 1).saturating_sub(u32::from(header)) as usize;
+        self.run_reorder(
+            (r1, c1, r2, c2),
+            data_reorder::Operation::Dedup {
+                cols: cols.to_vec(),
+                header,
+                total_data_rows,
+            },
+        );
     }
 
     /// UI-22：Ctrl+Q 命令搜索（数据来自 ribbon 控件，执行走同一 ribbon_action）。
@@ -12011,8 +12143,22 @@ impl SheetApp {
         } else {
             None
         };
+        let destination = if dlg.destination.trim().is_empty() {
+            None
+        } else {
+            match Self::parse_addr(dlg.destination.trim()) {
+                Some(rc) => Some(rc),
+                None => {
+                    self.status = format!("目标区域「{}」无效，请写成如 D1", dlg.destination.trim());
+                    return;
+                }
+            }
+        };
+        let extra_delims: Vec<char> = dlg.extra_delims.chars().collect();
         let opts = sheetcore::data_tools::SplitOpts {
             delim: dlg.delim.chars().next().unwrap_or(','),
+            extra_delims,
+            destination,
             merge_consecutive: dlg.merge_consecutive && fixed.is_none(),
             quote: dlg.quote && fixed.is_none(),
             detect_types: dlg.detect_types,
@@ -12026,13 +12172,15 @@ impl SheetApp {
             &opts,
             true,
         );
-        // 分列会向右写出 width 列：权限门禁和撤销都必须覆盖扩展后的区域
-        let c2w = (c2 + dry.width.max(1) as u32 - 1).min(16_383);
-        if (r2 - r1 + 1) as u64 * (c2w - c1 + 1) as u64 > 200_000 {
+        // 分列会向右写出 width 列：权限门禁和撤销都必须覆盖目标展开后的区域
+        let (dst_r1, dst_c1) = destination.unwrap_or((r1, c1));
+        let dst_r2 = (dst_r1 + (r2 - r1)).min(1_048_575);
+        let dst_c2 = (dst_c1 + dry.width.max(1) as u32 - 1).min(16_383);
+        if (dst_r2 - dst_r1 + 1) as u64 * (dst_c2 - dst_c1 + 1) as u64 > 200_000 {
             self.status = "分列展开后超过 20 万格，请分批处理".into();
             return;
         }
-        let keys = sheetcore::undo::rect_keys(r1, c1, r2, c2w);
+        let keys = sheetcore::undo::rect_keys(dst_r1, dst_c1, dst_r2, dst_c2);
         if !self.write_preflight(&keys, "分列") {
             return;
         }
@@ -13945,22 +14093,42 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
         }
         let name = format!("Table{n}");
         let t = sheetcore::table::Table {
-                column_ids: Vec::new(),
+            column_ids: (1..=names.len() as u32).collect(),
             name: name.clone(),
             display: name.clone(),
             range: (r1, c1, r2, c2),
             columns: names,
             header_row: true,
             totals_row: false,
+            style_name: "TableStyleMedium2".into(),
+            totals_fns: Vec::new(),
         };
+        let si = self.sheet_idx;
+        let before_tables = self.wb.sheet(si).tables.clone();
+        let before_filter = self.wb.sheet(si).filter.clone();
+        let before_hidden = self.wb.sheet(si).hidden_rows.clone();
         {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let sh = self.wb.sheet_mut(si);
             sh.tables.push(t);
             sh.tables_dirty = true;
             // Excel 建表默认带筛选按钮
             sh.filter = Some(sheetcore::sort_filter::Filter::new(r1, c1, r2, c2));
             sh.filter_dirty = true;
+            sh.bump_display_style_revision();
         }
+        let after_tables = self.wb.sheet(si).tables.clone();
+        let after_filter = self.wb.sheet(si).filter.clone();
+        let after_hidden = self.wb.sheet(si).hidden_rows.clone();
+        self.undo.push_meta(
+            "创建表格",
+            (si, self.sel.0, self.sel.1),
+            sheetcore::undo::MetaEdit {
+                sheet: si,
+                tables: Some((before_tables, after_tables)),
+                filter: Some((before_filter, after_filter, before_hidden, after_hidden)),
+                ..Default::default()
+            },
+        );
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已创建表格 {}（{}）", name, sheetcore::table::a1((r1, c1, r2, c2)));
@@ -14721,9 +14889,11 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                                 1 => "中文拼音",
                                 2 => "自定义序列",
                                 3 => "中文笔画",
+                                4 => "按填充色",
+                                5 => "按字体色",
                                 _ => "字典序",
                             })
-                            .width(100.0)
+                            .width(104.0)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut dlg.sort_mode, 0, "字典序");
                                 ui.selectable_value(&mut dlg.sort_mode, 1, "中文拼音");
@@ -14732,7 +14902,10 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                                     .on_hover_text(
                                         "按 Excel 笔画排序（xlStroke）的实测顺序；表外字符退回拼音序",
                                     );
+                                ui.selectable_value(&mut dlg.sort_mode, 4, "按填充色");
+                                ui.selectable_value(&mut dlg.sort_mode, 5, "按字体色");
                             });
+                        ui.checkbox(&mut dlg.case_sensitive, "区分大小写");
                     });
                     if dlg.sort_mode == 2 {
                         ui.horizontal(|ui| {
@@ -14744,6 +14917,78 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                             );
                         });
                         ui.label(egui::RichText::new("序列里的项按书写顺序排，不在序列里的排在后面").weak());
+                    } else if matches!(dlg.sort_mode, 4 | 5) {
+                        // 收集当前主排序列出现过的唯一填充色/字体色供点选置顶
+                        let primary_col = dlg
+                            .keys
+                            .iter()
+                            .find(|(_, _, on)| *on)
+                            .map(|(c, _, _)| *c)
+                            .unwrap_or(self.sel.1);
+                        let (r1, _, r2, _) = self.sel_rect();
+                        let meta = sheetcore::sort_filter::collect_column_dates_and_colors(
+                            self.wb.sheet(self.sheet_idx),
+                            &self.wb.styles,
+                            self.wb.date_system,
+                            (r1, primary_col, r2.min(r1 + 5_000), primary_col),
+                            primary_col,
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(if dlg.sort_mode == 4 { "置顶填充色" } else { "置顶字体色" });
+                            if dlg.sort_mode == 4 {
+                                for &fill in &meta.fill_colors {
+                                    let active = dlg.sort_color_rgb == fill;
+                                    let (sw, resp) = ui.allocate_exact_size(
+                                        egui::vec2(20.0, 18.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let bg = fill
+                                        .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+                                        .unwrap_or(Color32::WHITE);
+                                    ui.painter().rect_filled(sw, 2.0, bg);
+                                    ui.painter().rect_stroke(
+                                        sw,
+                                        2.0,
+                                        Stroke::new(
+                                            if active { 2.0 } else { 1.0 },
+                                            if active { ui_kit::ACCENT } else { Color32::GRAY },
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    if resp.clicked() {
+                                        dlg.sort_color_rgb = fill;
+                                    }
+                                }
+                            } else {
+                                for &fc in &meta.font_colors {
+                                    let active = dlg.sort_color_rgb == Some(fc);
+                                    let (sw, resp) = ui.allocate_exact_size(
+                                        egui::vec2(20.0, 18.0),
+                                        egui::Sense::click(),
+                                    );
+                                    ui.painter().rect_filled(sw, 2.0, Color32::WHITE);
+                                    ui.painter().text(
+                                        sw.center(),
+                                        Align2::CENTER_CENTER,
+                                        "A",
+                                        FontId::proportional(11.5),
+                                        Color32::from_rgb(fc[0], fc[1], fc[2]),
+                                    );
+                                    ui.painter().rect_stroke(
+                                        sw,
+                                        2.0,
+                                        Stroke::new(
+                                            if active { 2.0 } else { 1.0 },
+                                            if active { ui_kit::ACCENT } else { Color32::GRAY },
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    if resp.clicked() {
+                                        dlg.sort_color_rgb = Some(fc);
+                                    }
+                                }
+                            }
+                        });
                     }
                 } else {
                     ui.horizontal(|ui| {
@@ -14762,17 +15007,43 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                         ui.label(egui::RichText::new("从选中列左边开始按字符数切，剩余部分留在最后一列").weak());
                     } else {
                         ui.horizontal(|ui| {
-                            ui.label("分隔符");
-                            ui.add(egui::TextEdit::singleline(&mut dlg.delim).desired_width(60.0));
+                            ui.label("主分隔符");
+                            ui.add(egui::TextEdit::singleline(&mut dlg.delim).desired_width(48.0));
+                            ui.label("附加分隔符");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dlg.extra_delims)
+                                    .desired_width(90.0)
+                                    .hint_text("如 ;|空格"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            for (lbl, ch) in [("制表符", '\t'), ("分号", ';'), ("逗号", ','), ("空格", ' ')] {
+                                let mut on = dlg.delim.contains(ch) || dlg.extra_delims.contains(ch);
+                                if ui.checkbox(&mut on, lbl).changed() {
+                                    if on {
+                                        if !dlg.delim.contains(ch) && !dlg.extra_delims.contains(ch) {
+                                            dlg.extra_delims.push(ch);
+                                        }
+                                    } else {
+                                        dlg.extra_delims.retain(|c| c != ch);
+                                    }
+                                }
+                            }
                         });
                         ui.checkbox(&mut dlg.quote, "引号内的分隔符不拆（\"\" 表示一个引号）");
                         ui.checkbox(&mut dlg.merge_consecutive, "连续分隔符当一个（多个空格不产生空列）");
                     }
                     ui.horizontal(|ui| {
+                        ui.label("目标区域");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.destination)
+                                .desired_width(90.0)
+                                .hint_text("留空=原位"),
+                        );
                         ui.label("列格式");
                         ui.add(
                             egui::TextEdit::singleline(&mut dlg.col_modes)
-                                .desired_width(180.0)
+                                .desired_width(140.0)
                                 .hint_text("常规,文本,日期,跳过"),
                         );
                     });
@@ -14793,6 +15064,8 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                         };
                         let opts = sheetcore::data_tools::SplitOpts {
                             delim: dlg.delim.chars().next().unwrap_or(','),
+                            extra_delims: dlg.extra_delims.chars().collect(),
+                            destination: Self::parse_addr(dlg.destination.trim()),
                             merge_consecutive: dlg.merge_consecutive && fixed.is_none(),
                             quote: dlg.quote && fixed.is_none(),
                             detect_types: dlg.detect_types,
@@ -14830,6 +15103,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             match_case: self.find.match_case,
             whole_cell: self.find.whole_cell,
             in_formula: self.find.in_formula,
+            use_wildcards: self.find.use_wildcards,
+            in_comments: self.find.in_comments,
+            match_fill: None,
+            match_bold: self.find.match_bold.then_some(true),
         }
     }
 
@@ -16558,6 +16835,54 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             }
             for &si in &extra_sheets {
                 touched_keys.push((si, r, c));
+            }
+            // 表格计算列自动填充：在表格数据区首次输入公式时，自动填满该列空白数据行（与 Excel 一致）
+            if self.wb.sheet(self.sheet_idx).formula_of(r, c).is_some() {
+                let target_tbl = self
+                    .wb
+                    .sheet(self.sheet_idx)
+                    .tables
+                    .iter()
+                    .find(|t| {
+                        let data_r1 = if t.header_row { t.range.0 + 1 } else { t.range.0 };
+                        let data_r2 = if t.totals_row { t.range.2.saturating_sub(1) } else { t.range.2 };
+                        r >= data_r1 && r <= data_r2 && c >= t.range.1 && c <= t.range.3 && data_r2 > data_r1
+                    })
+                    .cloned();
+                if let Some(tb) = target_tbl {
+                    let data_r1 = if tb.header_row { tb.range.0 + 1 } else { tb.range.0 };
+                    let data_r2 = if tb.totals_row { tb.range.2.saturating_sub(1) } else { tb.range.2 };
+                    let col_idx = (c - tb.range.1) as usize;
+                    let others_empty = (data_r1..=data_r2).all(|rr| {
+                        rr == r
+                            || self
+                                .wb
+                                .sheet(self.sheet_idx)
+                                .get(rr, c)
+                                .is_none_or(|x| x.is_blank())
+                    });
+                    if others_empty
+                        && let Some(col_name) = tb.columns.get(col_idx)
+                    {
+                        let fill_keys: Vec<(u32, u32)> =
+                            (data_r1..=data_r2).filter(|&rr| rr != r).map(|rr| (rr, c)).collect();
+                        let fill_txn = self.txn_begin(&fill_keys);
+                        let filled = sheetcore::table::fill_calculated_column(
+                            self.wb.sheet_mut(self.sheet_idx),
+                            &tb.name,
+                            col_name,
+                        );
+                        if filled > 0 {
+                            self.txn_end("自动填充表格计算列", fill_txn);
+                            for rr in data_r1..=data_r2 {
+                                if rr != r {
+                                    touched_keys.push((self.sheet_idx, rr, c));
+                                }
+                            }
+                            self.status = format!("已自动填充表格计算列「{col_name}」（{filled} 行）");
+                        }
+                    }
+                }
             }
             self.doc_gen = self.doc_gen.wrapping_add(1);
             self.set_repeat_action(RepeatAction::CommitText(ed.buf.clone()));
@@ -18900,10 +19225,12 @@ fn clear_values(&mut self) {
         }
         let keys = sheetcore::undo::rect_keys(r2, c1, (r2 + 1).min(1_048_575), c2);
         let txn = self.txn_begin(&keys);
+        let si = self.sheet_idx;
+        let before_tables = self.wb.sheet(si).tables.clone();
         if t.totals_row {
             // 去掉：清掉汇总行，范围收回
             {
-                let sh = self.wb.sheet_mut(self.sheet_idx);
+                let sh = self.wb.sheet_mut(si);
                 for c in c1..=c2 {
                     sh.remove(r2, c);
                 }
@@ -18912,6 +19239,7 @@ fn clear_values(&mut self) {
                     tb.range.2 = r2.saturating_sub(1);
                 }
                 sh.tables_dirty = true;
+                sh.bump_display_style_revision();
                 if let Some(f) = sh.filter.as_mut() {
                     if f.range.0 == r1 && f.range.1 == c1 {
                         f.range.2 = r2.saturating_sub(1);
@@ -18922,7 +19250,7 @@ fn clear_values(&mut self) {
         } else {
             let row = r2 + 1;
             {
-                let sh = self.wb.sheet_mut(self.sheet_idx);
+                let sh = self.wb.sheet_mut(si);
                 sh.set(
                     row,
                     c1,
@@ -18931,23 +19259,37 @@ fn clear_values(&mut self) {
                         formula: None,
                     },
                 );
+                let width = (c2 - c1 + 1) as usize;
+                let mut fns = vec!["none".to_string(); width];
                 for c in (c1 + 1)..=c2 {
-                    let a = sheetcore::model::cell_name(r1 + 1, c);
-                    let b = sheetcore::model::cell_name(r2, c);
-                    sh.set(
-                        row,
-                        c,
-                        sheetcore::model::Cell {
-                            value: sheetcore::model::Value::Empty,
-                            formula: Some(format!("SUBTOTAL(109,{a}:{b})").into()),
-                        },
-                    );
+                    let col_i = (c - c1) as usize;
+                    let fn_name = t
+                        .totals_fns
+                        .get(col_i)
+                        .filter(|s| !s.is_empty() && s.as_str() != "none")
+                        .map(|s| s.as_str())
+                        .unwrap_or("sum");
+                    fns[col_i] = fn_name.to_string();
+                    if let Some(code) = sheetcore::table::totals_fn_code(fn_name) {
+                        let a = sheetcore::model::cell_name(r1 + 1, c);
+                        let b = sheetcore::model::cell_name(r2, c);
+                        sh.set(
+                            row,
+                            c,
+                            sheetcore::model::Cell {
+                                value: sheetcore::model::Value::Empty,
+                                formula: Some(format!("=SUBTOTAL({code},{a}:{b})").into()),
+                            },
+                        );
+                    }
                 }
                 if let Some(tb) = sh.tables.iter_mut().find(|x| x.name == table_name) {
                     tb.totals_row = true;
                     tb.range.2 = row;
+                    tb.totals_fns = fns;
                 }
                 sh.tables_dirty = true;
+                sh.bump_display_style_revision();
                 if let Some(f) = sh.filter.as_mut() {
                     if f.range.0 == r1 && f.range.1 == c1 {
                         f.range.2 = r2;
@@ -18956,10 +19298,97 @@ fn clear_values(&mut self) {
             }
             self.status = "已加汇总行（SUBTOTAL 109，忽略筛选掉的行）".into();
         }
+        let after_tables = self.wb.sheet(si).tables.clone();
         self.recalc_all_and_deps_adaptive();
         self.txn_end("表格汇总行", txn);
+        if before_tables != after_tables {
+            self.undo.push_meta(
+                "表格汇总行",
+                (si, self.sel.0, self.sel.1),
+                sheetcore::undo::MetaEdit {
+                    sheet: si,
+                    tables: Some((before_tables, after_tables)),
+                    ..Default::default()
+                },
+            );
+        }
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;
+    }
+
+    /// 切换表格汇总行当前列的 SUBTOTAL 聚合函数（sum / average / count / countNums / max / min / stdDev / var / none）
+    fn set_table_totals_fn(&mut self, fn_name: &str) {
+        if self.edit_blocked() {
+            return;
+        }
+        let Some(t) = self.table_at_sel() else {
+            self.status = "请先将光标放在表格内".into();
+            return;
+        };
+        if !t.totals_row {
+            self.toggle_totals_row(&t.name);
+        }
+        let Some(t) = self.table_at_sel() else {
+            return;
+        };
+        let (r1, c1, r2, c2) = t.range;
+        let col = self.sel.1.clamp(c1, c2);
+        let col_i = (col - c1) as usize;
+        let data_r1 = if t.header_row { r1 + 1 } else { r1 };
+        let data_r2 = r2.saturating_sub(1);
+        if data_r2 < data_r1 {
+            return;
+        }
+        let si = self.sheet_idx;
+        let before_tables = self.wb.sheet(si).tables.clone();
+        let txn = self.txn_begin(&[(r2, col)]);
+        {
+            let sh = self.wb.sheet_mut(si);
+            if fn_name == "none" {
+                sh.remove(r2, col);
+            } else if let Some(code) = sheetcore::table::totals_fn_code(fn_name) {
+                let a = sheetcore::model::cell_name(data_r1, col);
+                let b = sheetcore::model::cell_name(data_r2, col);
+                sh.set(
+                    r2,
+                    col,
+                    sheetcore::model::Cell {
+                        value: sheetcore::model::Value::Empty,
+                        formula: Some(format!("=SUBTOTAL({code},{a}:{b})").into()),
+                    },
+                );
+            }
+            if let Some(tb) = sh.tables.iter_mut().find(|x| x.name == t.name) {
+                let width = (c2 - c1 + 1) as usize;
+                if tb.totals_fns.len() < width {
+                    tb.totals_fns.resize(width, "none".into());
+                }
+                tb.totals_fns[col_i] = fn_name.to_string();
+            }
+            sh.tables_dirty = true;
+        }
+        let after_tables = self.wb.sheet(si).tables.clone();
+        self.recalc_all_and_deps_adaptive();
+        self.txn_end("更改表格汇总函数", txn);
+        if before_tables != after_tables {
+            self.undo.push_meta(
+                "更改表格汇总函数",
+                (si, r2, col),
+                sheetcore::undo::MetaEdit {
+                    sheet: si,
+                    tables: Some((before_tables, after_tables)),
+                    ..Default::default()
+                },
+            );
+        }
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        let lbl = sheetcore::table::TOTALS_FN_OPTIONS
+            .iter()
+            .find(|(k, _)| *k == fn_name)
+            .map(|(_, l)| *l)
+            .unwrap_or(fn_name);
+        self.status = format!("{} 列汇总行已切换为「{lbl}」", col_label(col));
     }
 
     /// 拖动选区移动（dr/dc 可正可负）：值、样式、批注、富文本、超链接一起搬
@@ -20036,11 +20465,29 @@ fn clear_values(&mut self) {
                 changed |= ui.radio_value(&mut right, false, "明细数据在左侧").changed();
                 ui.add_space(6.0);
                 changed |= ui.checkbox(&mut symbols, "显示分级符号（+ / -）").changed();
+                ui.add_space(6.0);
+                ui.separator();
+                let mut do_auto = false;
+                let mut do_clear = false;
+                ui.horizontal(|ui| {
+                    if ui_kit::secondary_button(ui, "自动建立分级显示").clicked() {
+                        do_auto = true;
+                    }
+                    if ui_kit::secondary_button(ui, "清除全部分级显示").clicked() {
+                        do_clear = true;
+                    }
+                });
                 ui_kit::footer(ui, |ui| {
                     if ui_kit::primary_button(ui, "确定").clicked() {
                         self.outline_set_dlg = false;
                     }
                 });
+                if do_auto {
+                    self.auto_outline();
+                }
+                if do_clear {
+                    self.clear_outline();
+                }
             });
         if changed {
             {
@@ -23450,7 +23897,10 @@ fn clear_selection(&mut self) {
         }
         let mut open = true;
         let mut solve = false;
-        ui_kit::window(ctx, "单变量求解", 420.0)
+        let mut accept_preview = false;
+        let mut revert_preview = false;
+        let has_preview = self.goal_preview.is_some();
+        ui_kit::window(ctx, "单变量求解", 430.0)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -23470,14 +23920,63 @@ fn clear_selection(&mut self) {
                     ui.label(egui::RichText::new(&self.goal_msg).size(11.5));
                 }
                 ui_kit::footer(ui, |ui| {
-                    if ui_kit::primary_button(ui, "求解").clicked() {
-                        solve = true;
-                    }
-                    if ui_kit::secondary_button(ui, "取消").clicked() {
-                        self.goal_dlg = false;
+                    if has_preview {
+                        if ui_kit::primary_button(ui, "接受结果").clicked() {
+                            accept_preview = true;
+                        }
+                        if ui_kit::secondary_button(ui, "还原原值").clicked() {
+                            revert_preview = true;
+                        }
+                    } else {
+                        if ui_kit::primary_button(ui, "求解").clicked() {
+                            solve = true;
+                        }
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            self.goal_dlg = false;
+                        }
                     }
                 });
             });
+        if accept_preview {
+            if let Some((si, vr, vc, orig, found_x, _)) = self.goal_preview.take() {
+                let after = self.wb.sheet(si).get(vr, vc).map(|c| c.into_owned()).unwrap_or_default();
+                let st_id = self.wb.sheet(si).style_of(vr, vc);
+                let delta = sheetcore::undo::CellDelta {
+                    sheet: si,
+                    row: vr,
+                    col: vc,
+                    before: orig.unwrap_or_default(),
+                    after,
+                    before_style: st_id,
+                    after_style: st_id,
+                };
+                self.record_deltas("单变量求解", vec![delta]);
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.status = format!("已接受单变量求解：{} = {:.6}", sheetcore::model::cell_name(vr, vc), found_x);
+                self.goal_dlg = false;
+            }
+            return;
+        }
+        if revert_preview || (!open && self.goal_preview.is_some()) {
+            if let Some((si, vr, vc, orig, _, _)) = self.goal_preview.take() {
+                let sh = self.wb.sheet_mut(si);
+                match orig {
+                    Some(c) => sh.set(vr, vc, c),
+                    None => {
+                        sh.remove(vr, vc);
+                    }
+                }
+                self.recalc_all_and_deps_adaptive();
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.goal_msg = "已还原可变单元格原值".into();
+                self.status = "单变量求解已取消并还原原值".into();
+            }
+            if !open {
+                self.goal_dlg = false;
+            }
+            return;
+        }
         if solve {
             let t = Self::parse_addr(&self.goal_target);
             let v = Self::parse_addr(&self.goal_input);
@@ -23580,20 +24079,24 @@ fn clear_selection(&mut self) {
                             wake.request_repaint();
                         });
                     } else {
-                        let txn_keys = [(vr, vc)];
-                        let txn = self.txn_begin(&txn_keys.into_iter().map(|(r, c)| (r, c)).collect::<Vec<_>>());
+                        let si = self.sheet_idx;
+                        let orig_cell = self.wb.sheet(si).get(vr, vc).map(|c| c.into_owned());
                         match self.goal_seek_run(tr, tc, g, vr, vc) {
                             Ok(x) => {
+                                let achieved = match self.wb.sheet(si).value(tr, tc) {
+                                    Value::Number(v) => v,
+                                    _ => g,
+                                };
+                                self.goal_preview = Some((si, vr, vc, orig_cell, x, achieved));
                                 self.goal_msg = format!(
-                                    "求解成功：{}{} = {:.6}",
+                                    "求解预览：{} = {:.6}（目标值 {:.6}，当前值 {:.6}）。请点击「接受结果」或「还原原值」。",
                                     sheetcore::model::cell_name(vr, vc),
-                                    "，",
-                                    x
+                                    x,
+                                    g,
+                                    achieved
                                 );
-                                self.txn_end("单变量求解", txn);
-                                self.wb.dirty = true;
                                 self.doc_gen = self.doc_gen.wrapping_add(1);
-                                self.status = format!("单变量求解：{}{} = {:.6}", sheetcore::model::cell_name(vr, vc), "", x);
+                                self.status = format!("单变量求解预览：{} = {:.6}", sheetcore::model::cell_name(vr, vc), x);
                             }
                             Err(e) => self.goal_msg = e,
                         }
@@ -23691,62 +24194,77 @@ fn clear_selection(&mut self) {
         if results_src.iter().all(|(_, _, rv, cv)| rv.is_none() && cv.is_none()) {
             return Err("选区里没有可用的输入值".into());
         }
-        let deps = sheetcore::formula::deps::Deps::build(&self.wb);
-        let orig_row_cell = row_in.map(|(r, c)| {
-            self.wb.sheet(self.sheet_idx).get(r, c).map(|x| x.into_owned())
-        });
-        let orig_col_cell = col_in.map(|(r, c)| {
-            self.wb.sheet(self.sheet_idx).get(r, c).map(|x| x.into_owned())
-        });
+        // 写入动态 `{=TABLE(row_in, col_in)}` 公式并登记到 `sheet.arrays`，支持输入/源公式变更后自动重算！
+        let (out_rect, table_formula) = match mode {
+            "two" => {
+                let r_ref = row_in.map(|(r, c)| cell_name(r, c)).unwrap_or_default();
+                let c_ref = col_in.map(|(r, c)| cell_name(r, c)).unwrap_or_default();
+                ((r1 + 1, c1 + 1, r2, c2), format!("=TABLE({r_ref},{c_ref})"))
+            }
+            "col" => {
+                let c_ref = col_in.map(|(r, c)| cell_name(r, c)).unwrap_or_default();
+                ((r1, c1 + 1, r2, c2), format!("=TABLE(,{c_ref})"))
+            }
+            _ => {
+                let r_ref = row_in.map(|(r, c)| cell_name(r, c)).unwrap_or_default();
+                ((r1 + 1, c1 + 1, r2, c2), format!("=TABLE({r_ref},)"))
+            }
+        };
+        let (or1, oc1, or2, oc2) = out_rect;
+        let si = self.sheet_idx;
+        let out_keys = sheetcore::undo::rect_keys(or1, oc1, or2, oc2);
+        let before_cells = sheetcore::undo::capture(self.wb.sheet(si), si, &out_keys);
+        let before_arrays = self.wb.sheet(si).arrays.clone();
         let mut done = 0usize;
-        for (r, c, rv, cv) in results_src {
-            if let (Some((ri, ci)), Some(v)) = (row_in, rv) {
-                self.poke_cell(&deps, ri, ci, v);
-            }
-            if let (Some((ci2, cj2)), Some(v)) = (col_in, cv) {
-                self.poke_cell(&deps, ci2, cj2, v);
-            }
-            let out = self
-                .wb
-                .sheet(self.sheet_idx)
-                .get(fcell.0, fcell.1)
-                .map(|x| x.value.clone())
-                .unwrap_or_default();
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            let mut cell = sh.get(r, c).map(|c| c.into_owned()).unwrap_or_default();
-            cell.value = out;
-            cell.formula = None;
-            sh.set(r, c, cell);
-            done += 1;
-        }
-        let mut restored_keys = Vec::new();
-        if let (Some((ri, ci)), Some(orig)) = (row_in, orig_row_cell) {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            match orig {
-                Some(cell) => sh.set(ri, ci, cell),
-                None => {
-                    sh.remove(ri, ci);
+        let f_arc: std::sync::Arc<str> = table_formula.into();
+        {
+            let sh = self.wb.sheet_mut(si);
+            for r in or1..=or2 {
+                for c in oc1..=oc2 {
+                    sh.set(
+                        r,
+                        c,
+                        Cell {
+                            value: Value::Empty,
+                            formula: Some(f_arc.clone()),
+                        },
+                    );
+                    done += 1;
                 }
             }
-            restored_keys.push((self.sheet_idx, ri, ci));
+            let anchor = sheetcore::model::CellRef::new(or1, oc1);
+            sh.arrays.retain(|(a, _)| *a != anchor);
+            sh.arrays.push((anchor, out_rect));
         }
-        if let (Some((ci2, cj2)), Some(orig)) = (col_in, orig_col_cell) {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            match orig {
-                Some(cell) => sh.set(ci2, cj2, cell),
-                None => {
-                    sh.remove(ci2, cj2);
-                }
-            }
-            restored_keys.push((self.sheet_idx, ci2, cj2));
-        }
-        if !restored_keys.is_empty() {
-            sheetcore::formula::recalc_dirty(&mut self.wb, &deps, &restored_keys);
-        }
+        sheetcore::formula::eval_data_tables_in_workbook(&mut self.wb, None);
+        let after_arrays = self.wb.sheet(si).arrays.clone();
+        let deltas = sheetcore::undo::finish(before_cells, self.wb.sheet(si));
+        self.undo.push_with_arrays(
+            sheetcore::undo::Action {
+                label: "模拟运算表".into(),
+                merges: None,
+                deltas,
+                focus: (si, or1, oc1),
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                pictures: None,
+                shapes: None,
+                refresh_sizes: None,
+            },
+            Some(sheetcore::undo::ArrayEdit {
+                sheet: si,
+                before: before_arrays,
+                after: after_arrays,
+            }),
+        );
+        self.deps = sheetcore::formula::deps::Deps::build_after_recalc(&self.wb).into();
+        self.deps_built = true;
+        let _ = (fcell, results_src);
         let label = match mode {
-            "two" => "双变量",
-            "col" => "单变量（列）",
-            _ => "单变量（行）",
+            "two" => "双变量动态模拟运算表",
+            "col" => "单变量（列）动态模拟运算表",
+            _ => "单变量（行）动态模拟运算表",
         };
         Ok((label.to_string(), done))
     }
@@ -26323,39 +26841,93 @@ fn clear_selection(&mut self) {
 
     // ---------------------------------------------------------------- 数据工具
 
-    /// 预测工作表：线性回归 + 新建「预测」工作表
+    /// 预测工作表：Holt-Winters ETS（含自动季节性检测 + 置信上下界 + 日期时间轴外推）
     fn forecast_run(&mut self, range: &str, periods: u32) -> Result<String, String> {
+        self.forecast_run_opts(range, periods, 0, 95)
+    }
+
+    fn forecast_run_opts(
+        &mut self,
+        range: &str,
+        periods: u32,
+        season_len: usize,
+        confidence_pct: u8,
+    ) -> Result<String, String> {
         let Some(raw_rect) = Self::parse_rect(range) else {
             return Err(format!("区域「{range}」看不懂，写成 A1:B13 或 A1:A13"));
         };
         let Some((r1, c1, r2, c2)) = self.clamp_rect_to_used(raw_rect) else {
             return Err("选区内没有数据".into());
         };
-        // 数据列：取第一个至少有两个数字的列
-        let mut col = None;
+        // 若选区有 >=2 列且第一列是日期/递增序号轴，则第一列作时间轴、第二列作数值列；否则取第一个数值列
+        let sh_src = self.wb.sheet(self.sheet_idx);
+        let mut date_col: Option<u32> = None;
+        let mut val_col: Option<u32> = None;
+        let mut num_cols: Vec<u32> = Vec::new();
         for c in c1..=c2 {
             let n = (r1..=r2)
-                .filter(|r| matches!(self.wb.sheet(self.sheet_idx).value(*r, c), Value::Number(_)))
+                .filter(|r| matches!(sh_src.value(*r, c), Value::Number(_)))
                 .count();
             if n >= 2 {
-                col = Some(c);
-                break;
+                num_cols.push(c);
             }
         }
-        let Some(c) = col else {
+        if num_cols.len() >= 2 {
+            let c0 = num_cols[0];
+            let looks_date = (r1..=r2).any(|r| {
+                matches!(sh_src.value(r, c0), Value::Number(_))
+                    && sheetcore::style::is_date_format(&self.wb.styles.get(sh_src.style_of(r, c0)).format)
+            });
+            if looks_date {
+                date_col = Some(c0);
+                val_col = Some(num_cols[1]);
+            } else {
+                date_col = Some(c0);
+                val_col = Some(num_cols[1]);
+            }
+        } else if let Some(&c) = num_cols.first() {
+            val_col = Some(c);
+        }
+        let Some(vc) = val_col else {
             return Err("选区内没有至少两个数字的列".into());
         };
         let mut xs: Vec<f64> = Vec::new();
         let mut ys: Vec<f64> = Vec::new();
-        for (i, r) in (r1..=r2).enumerate() {
-            if let Value::Number(n) = self.wb.sheet(self.sheet_idx).value(r, c) {
-                xs.push(i as f64 + 1.0);
-                ys.push(n);
+        let mut date_fmt: Option<String> = None;
+        for r in r1..=r2 {
+            if let Value::Number(y) = sh_src.value(r, vc) {
+                let x = if let Some(dc) = date_col {
+                    if date_fmt.is_none() {
+                        let f = &self.wb.styles.get(sh_src.style_of(r, dc)).format;
+                        if sheetcore::style::is_date_format(f) {
+                            date_fmt = Some(f.clone());
+                        }
+                    }
+                    match sh_src.value(r, dc) {
+                        Value::Number(xv) => xv,
+                        _ => xs.len() as f64 + 1.0,
+                    }
+                } else {
+                    xs.len() as f64 + 1.0
+                };
+                xs.push(x);
+                ys.push(y);
             }
         }
-        let Some(f) = sheetcore::forecast::linear(&xs, &ys, periods as usize) else {
-            return Err("数据太少或横轴没有变化，算不出回归".into());
+        let conf = (confidence_pct.clamp(50, 99) as f64) / 100.0;
+        let forced_season = (season_len >= 2).then_some(season_len);
+        let Some(ets) = sheetcore::forecast::ets(&ys, periods as usize, forced_season, conf) else {
+            return Err("数据太少，至少需要 2 个数值点才能预测".into());
         };
+        let x_step = if xs.len() >= 2 {
+            let mut diffs: Vec<f64> = xs.windows(2).map(|w| w[1] - w[0]).filter(|d| d.is_finite() && *d > 0.0).collect();
+            diffs.sort_by(|a, b| a.total_cmp(b));
+            diffs.get(diffs.len() / 2).copied().unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        let last_x = xs.last().copied().unwrap_or(0.0);
+
         // 新建工作表
         let mut name = "预测".to_string();
         let mut k = 2;
@@ -26364,35 +26936,52 @@ fn clear_selection(&mut self) {
             k += 1;
         }
         let mut sh = sheetcore::Sheet::new(name.clone());
-        sh.set(0, 0, Cell { value: Value::Text("期".into()), formula: None });
+        let date_sid = date_fmt.as_ref().map(|fmt| {
+            let mut st = sheetcore::style::CellStyle::default();
+            st.format = fmt.clone();
+            self.wb.styles.intern(st)
+        });
+        let pct_lbl = confidence_pct.clamp(50, 99);
+        sh.set(0, 0, Cell { value: Value::Text(if date_fmt.is_some() { "时间" } else { "期" }.into()), formula: None });
         sh.set(0, 1, Cell { value: Value::Text("原值".into()), formula: None });
-        sh.set(0, 2, Cell { value: Value::Text("拟合值".into()), formula: None });
+        sh.set(0, 2, Cell { value: Value::Text("ETS拟合值".into()), formula: None });
         sh.set(0, 3, Cell { value: Value::Text("预测值".into()), formula: None });
+        sh.set(0, 4, Cell { value: Value::Text(format!("{pct_lbl}%置信下界").into()), formula: None });
+        sh.set(0, 5, Cell { value: Value::Text(format!("{pct_lbl}%置信上界").into()), formula: None });
         for i in 0..ys.len() {
             let r = i as u32 + 1;
-            sh.set(r, 0, Cell { value: Value::Number(i as f64 + 1.0), formula: None });
+            sh.set(r, 0, Cell { value: Value::Number(xs[i]), formula: None });
+            if let Some(sid) = date_sid {
+                sh.set_style(r, 0, sid);
+            }
             sh.set(r, 1, Cell { value: Value::Number(ys[i]), formula: None });
-            sh.set(r, 2, Cell { value: Value::Number(f.fitted[i]), formula: None });
+            sh.set(r, 2, Cell { value: Value::Number(ets.fitted[i]), formula: None });
         }
         let n = ys.len() as u32;
-        for (k, v) in f.future.iter().enumerate() {
+        for k in 0..ets.future.len() {
             let r = n + 1 + k as u32;
-            sh.set(r, 0, Cell { value: Value::Number((n + 1 + k as u32) as f64), formula: None });
-            sh.set(r, 3, Cell { value: Value::Number(*v), formula: None });
+            sh.set(r, 0, Cell { value: Value::Number(last_x + x_step * (k as f64 + 1.0)), formula: None });
+            if let Some(sid) = date_sid {
+                sh.set_style(r, 0, sid);
+            }
+            sh.set(r, 3, Cell { value: Value::Number(ets.future[k]), formula: None });
+            sh.set(r, 4, Cell { value: Value::Number(ets.lower[k]), formula: None });
+            sh.set(r, 5, Cell { value: Value::Number(ets.upper[k]), formula: None });
         }
-        // 参数与拟合质量写在右侧，方便核对
         let info = [
-            ("斜率 b", f.b),
-            ("截距 a", f.a),
-            ("R²", f.r2),
-            ("残差标准差 σ", f.sigma),
-            ("95% 区间半宽", 1.96 * f.sigma),
+            ("水平平滑 α", ets.alpha),
+            ("趋势平滑 β", ets.beta),
+            ("季节平滑 γ", ets.gamma),
+            ("季节周期", ets.season_len as f64),
+            ("均方根误差 RMSE", ets.rmse),
+            ("平均绝对误差 MAE", ets.mae),
+            ("拟合优度 R²", ets.r2),
         ];
-        sh.set(0, 5, Cell { value: Value::Text("回归参数".into()), formula: None });
+        sh.set(0, 7, Cell { value: Value::Text("ETS 模型参数".into()), formula: None });
         for (i, (k2, v)) in info.iter().enumerate() {
             let r = i as u32 + 1;
-            sh.set(r, 5, Cell { value: Value::Text((*k2).into()), formula: None });
-            sh.set(r, 6, Cell { value: Value::Number(*v), formula: None });
+            sh.set(r, 7, Cell { value: Value::Text((*k2).into()), formula: None });
+            sh.set(r, 8, Cell { value: Value::Number(*v), formula: None });
         }
         self.wb.sheets.push(sh);
         self.wb.dirty = true;
@@ -26402,10 +26991,10 @@ fn clear_selection(&mut self) {
         self.sel = (0, 0);
         self.sel_end = (0, 0);
         self.status = format!(
-            "已生成「{name}」：y = {:.4} + {:.4}·x，R²={:.3}，外推 {} 期",
-            f.a,
-            f.b,
-            f.r2,
+            "已生成 ETS 预测表「{name}」：季节周期={}，RMSE={:.4}，R²={:.3}，外推 {} 期（{pct_lbl}% 置信区间）",
+            ets.season_len,
+            ets.rmse,
+            ets.r2,
             periods
         );
         Ok(self.status.clone())
@@ -26418,6 +27007,27 @@ fn clear_selection(&mut self) {
         key: &str,
         value_cols: &str,
         f: sheetcore::subtotal::SubFn,
+    ) -> Result<String, String> {
+        self.subtotal_run_opts(
+            range,
+            key,
+            value_cols,
+            f,
+            sheetcore::subtotal::SubtotalOpts {
+                replace_existing: false,
+                page_break_between_groups: false,
+                summary_below: true,
+            },
+        )
+    }
+
+    fn subtotal_run_opts(
+        &mut self,
+        range: &str,
+        key: &str,
+        value_cols: &str,
+        f: sheetcore::subtotal::SubFn,
+        opts: sheetcore::subtotal::SubtotalOpts,
     ) -> Result<String, String> {
         let Some(raw_rect) = Self::parse_rect(range) else {
             return Err(format!("区域「{range}」看不懂"));
@@ -26446,11 +27056,17 @@ fn clear_selection(&mut self) {
             return Err(self.status.clone());
         }
         let idx = self.sheet_idx;
-        // All summary rows are inserted after the first detail row. Capture the
-        // union of reference locations that any of the insertions could change.
-        let earliest = sheetcore::structural::Structural::InsertRows { at: rect.0 + 2, n: 1 };
+        let earliest = sheetcore::structural::Structural::InsertRows { at: rect.0 + 1, n: 1 };
         let before = sheetcore::undo::snapshot_structure(&self.wb, idx, &earliest);
-        let rep = sheetcore::subtotal::try_subtotal_workbook(&mut self.wb, idx, rect, key_col, &cols, f)?;
+        let rep = sheetcore::subtotal::try_subtotal_workbook_opts(
+            &mut self.wb,
+            idx,
+            rect,
+            key_col,
+            &cols,
+            f,
+            opts,
+        )?;
         if rep.groups == 0 {
             return Err("选区内没有可分组的行".into());
         }
@@ -26598,15 +27214,15 @@ fn clear_selection(&mut self) {
         let Some(mut d) = self.fc_dlg.clone() else { return };
         let mut open = true;
         let mut ok = false;
-        ui_kit::window(ctx, "线性预测工作表", 430.0)
+        ui_kit::window(ctx, "ETS 预测工作表", 450.0)
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
                 ui_kit::field(ui, "数据区域", |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut d.range)
-                            .desired_width(280.0)
-                            .hint_text("A1:A13（含数值列）"),
+                            .desired_width(290.0)
+                            .hint_text("A1:B13（时间列+数值列）或 A1:A13"),
                     );
                 });
                 ui_kit::field(ui, "预测期数", |ui| {
@@ -26615,8 +27231,22 @@ fn clear_selection(&mut self) {
                         d.periods = v as u32;
                     }
                 });
+                ui_kit::field(ui, "季节周期", |ui| {
+                    let mut sv = d.season_len as f64;
+                    if ui_kit::spin(ui, &mut sv, 0.0, 52.0, 1.0, 70.0) {
+                        d.season_len = sv as usize;
+                    }
+                    ui.label(egui::RichText::new("0 = 自动检测周期（如 4 季度 / 12 月）").size(10.5).weak());
+                });
+                ui_kit::field(ui, "置信区间", |ui| {
+                    let mut cv = d.confidence as f64;
+                    if ui_kit::spin(ui, &mut cv, 50.0, 99.0, 1.0, 70.0) {
+                        d.confidence = cv as u8;
+                    }
+                    ui.label("%");
+                });
                 ui.label(
-                    egui::RichText::new("用最小二乘线性回归外推；结果写到新工作表（期/原值/拟合值/预测值 + 回归参数）。这是线性回归，不是 Excel 的 ETS/季节性预测。")
+                    egui::RichText::new("采用 Holt-Winters 指数平滑（ETS）模型，自动估计水平/趋势/季节性并输出置信上下界与模型评估指标。")
                         .size(10.5)
                         .weak(),
                 );
@@ -26637,7 +27267,7 @@ fn clear_selection(&mut self) {
                 });
             });
         if ok {
-            match self.forecast_run(&d.range, d.periods.max(1)) {
+            match self.forecast_run_opts(&d.range, d.periods.max(1), d.season_len, d.confidence) {
                 Ok(_) => self.fc_dlg = None,
                 Err(e) => {
                     d.msg = e;
@@ -26654,7 +27284,7 @@ fn clear_selection(&mut self) {
         let Some(mut d) = self.st_dlg.clone() else { return };
         let mut open = true;
         let mut ok = false;
-        ui_kit::window(ctx, "分类汇总", 440.0)
+        ui_kit::window(ctx, "分类汇总", 450.0)
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
@@ -26697,8 +27327,10 @@ fn clear_selection(&mut self) {
                             .hint_text("B,C"),
                     );
                 });
+                ui.checkbox(&mut d.replace_existing, "替换当前分类汇总（取消勾选以支持多级嵌套汇总）");
+                ui.checkbox(&mut d.page_break_between_groups, "每组数据分页（自动在组间插入打印分页符）");
                 ui.label(
-                    egui::RichText::new("同值必须相邻（先按分组列排序）；小计用 SUBTOTAL，明细自动打 1 级")
+                    egui::RichText::new("同值必须相邻（先按分组列排序）；汇总标签写入分组列，明细自动分级")
                         .size(10.5)
                         .weak(),
                 );
@@ -26719,7 +27351,12 @@ fn clear_selection(&mut self) {
                 });
             });
         if ok {
-            match self.subtotal_run(&d.range, &d.key_col, &d.value_cols, d.funcs) {
+            let opts = sheetcore::subtotal::SubtotalOpts {
+                replace_existing: d.replace_existing,
+                page_break_between_groups: d.page_break_between_groups,
+                summary_below: true,
+            };
+            match self.subtotal_run_opts(&d.range, &d.key_col, &d.value_cols, d.funcs, opts) {
                 Ok(_) => self.st_dlg = None,
                 Err(e) => {
                     d.msg = e;
@@ -30086,29 +30723,35 @@ impl SheetApp {
         let ov = rc.cf_map.get(&(r, c));
         let sid = sh.style_of(r, c);
         let st = rc.wb.styles.get(sid);
-        let (table_header, table_band) = if sh.tables.is_empty() {
-            (false, false)
+        let (table_header, table_fill) = if sh.tables.is_empty() {
+            (false, None)
         } else if let Some(t) = sh
             .tables
             .iter()
             .find(|t| r >= t.range.0 && r <= t.range.2 && c >= t.range.1 && c <= t.range.3)
         {
+            let (hdr_rgb, _, stripe_even, stripe_odd, _) =
+                sheetcore::table::table_style_palette(&t.style_name);
             let th = t.header_row && r == t.range.0;
-            let tb = !th && t.header_row && (r - t.range.0 - 1) % 2 == 1;
-            (th, tb)
-        } else {
-            (false, false)
-        };
-        let table_fill = if st.fill.is_none() {
-            if table_header {
-                Some(Color32::from_rgb(33, 122, 76))
-            } else if table_band {
-                Some(Color32::from_rgb(226, 240, 231))
+            let fill = if st.fill.is_none() {
+                if th {
+                    Some(Color32::from_rgb(hdr_rgb[0], hdr_rgb[1], hdr_rgb[2]))
+                } else if t.header_row {
+                    let row_rgb = if (r - t.range.0 - 1) % 2 == 1 {
+                        stripe_even
+                    } else {
+                        stripe_odd
+                    };
+                    row_rgb.map(|rgb| Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
+                } else {
+                    None
+                }
             } else {
                 None
-            }
+            };
+            (th, fill)
         } else {
-            None
+            (false, None)
         };
         let bg_fill = ov
             .and_then(|o| o.fill)
@@ -31217,14 +31860,82 @@ impl SheetApp {
         f.allows.clear();
         f.criteria.clear();
         f.date_groups.clear();
-        f.color_filters.clear();
-        self.wb.sheet_mut(self.sheet_idx).filter_dirty = true;
+        let si = self.sheet_idx;
+        let before_filter = self.wb.sheet(si).filter.clone();
+        let before_hidden = self.wb.sheet(si).hidden_rows.clone();
+        if let Some(f) = self.wb.sheet_mut(si).filter.as_mut() {
+            f.color_filters.clear();
+            f.top_filters.clear();
+            f.dynamic_filters.clear();
+        }
+        self.wb.sheet_mut(si).filter_dirty = true;
         self.recalc_filter_hidden();
+        let after_filter = self.wb.sheet(si).filter.clone();
+        let after_hidden = self.wb.sheet(si).hidden_rows.clone();
+        if before_filter != after_filter || before_hidden != after_hidden {
+            self.undo.push_meta(
+                "清除筛选条件",
+                (si, self.sel.0, self.sel.1),
+                sheetcore::undo::MetaEdit {
+                    sheet: si,
+                    filter: Some((before_filter, after_filter, before_hidden, after_hidden)),
+                    ..Default::default()
+                },
+            );
+        }
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.tasks.last_edit = Some(std::time::Instant::now());
         self.status = "已清除筛选条件（筛选箭头保留）".into();
         true
+    }
+
+    /// 统一可撤销筛选事务：记录 `MetaEdit::filter` 供 Ctrl+Z 恢复筛选条件与隐藏行。
+    fn record_filter_undo(
+        &mut self,
+        label: &str,
+        before_filter: Option<sheetcore::sort_filter::Filter>,
+        before_hidden: sheetcore::layout::HiddenIndices,
+    ) {
+        let si = self.sheet_idx;
+        let after_filter = self.wb.sheet(si).filter.clone();
+        let after_hidden = self.wb.sheet(si).hidden_rows.clone();
+        if before_filter != after_filter || before_hidden != after_hidden {
+            self.undo.push_meta(
+                label,
+                (si, self.sel.0, self.sel.1),
+                sheetcore::undo::MetaEdit {
+                    sheet: si,
+                    filter: Some((before_filter, after_filter, before_hidden, after_hidden)),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// 格式化当前筛选统计：「已筛选：找到 X / Y 条记录」
+    fn filter_match_summary(&self) -> Option<String> {
+        let sh = self.wb.sheet(self.sheet_idx);
+        let f = sh.filter.as_ref()?;
+        if !f.has_any_active() {
+            return None;
+        }
+        let (r1, _, r2, _) = f.range;
+        let used_r2 = sh.used_bounds().map(|(_, _, ur2, _)| ur2).unwrap_or(r1);
+        let eff_r2 = if r2 > used_r2.saturating_add(64) {
+            used_r2.min(r2)
+        } else {
+            r2
+        };
+        if eff_r2 <= r1 {
+            return None;
+        }
+        let total = (eff_r2 - r1) as usize;
+        let hidden = ((r1 + 1)..=eff_r2)
+            .filter(|r| sh.hidden_rows.contains(r))
+            .count();
+        let shown = total.saturating_sub(hidden);
+        Some(format!("已筛选：找到 {shown} / {total} 条记录"))
     }
 
     /// 关闭筛选：移除筛选器和箭头，只恢复筛选隐藏行，不动手动隐藏行。
@@ -31233,12 +31944,181 @@ impl SheetApp {
             self.status = "当前工作表没有筛选".into();
             return false;
         }
+        let before_filter = self.wb.sheet(self.sheet_idx).filter.clone();
+        let before_hidden = self.wb.sheet(self.sheet_idx).hidden_rows.clone();
         self.wb.sheet_mut(self.sheet_idx).filter = None;
         self.recalc_filter_hidden();
+        self.record_filter_undo("关闭筛选", before_filter, before_hidden);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = "已关闭筛选（箭头已移除）".into();
         true
+    }
+
+    /// 打开高级筛选对话框
+    fn open_adv_filter_dialog(&mut self) {
+        let (r1, c1, r2, c2) = self.sel_rect();
+        let list = if r1 == r2 && c1 == c2 {
+            let reg = sheetcore::sort_filter::current_region(
+                self.wb.sheet(self.sheet_idx),
+                r1,
+                c1,
+            );
+            format!("{}:{}", cell_name(reg.0, reg.1), cell_name(reg.2, reg.3))
+        } else {
+            format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+        };
+        self.adv_filter_dlg = Some(AdvFilterDlg {
+            list_range: list,
+            criteria_range: String::new(),
+            copy_to: String::new(),
+            in_place: true,
+            unique_only: false,
+            msg: String::new(),
+        });
+    }
+
+    /// 高级筛选对话框（支持条件区域 AND/OR/通配符、原地筛选或复制到其他位置、选择不重复记录）
+    fn adv_filter_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.adv_filter_dlg.clone() else { return };
+        let mut open = true;
+        let mut ok = false;
+        ui_kit::window(ctx, "高级筛选", 460.0)
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut d.in_place, true, "在原有区域显示筛选结果");
+                    ui.radio_value(&mut d.in_place, false, "将筛选结果复制到其他位置");
+                });
+                ui.add_space(4.0);
+                ui_kit::field(ui, "列表区域", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.list_range)
+                            .desired_width(290.0)
+                            .hint_text("如 A1:D20（含表头）"),
+                    );
+                });
+                ui_kit::field(ui, "条件区域", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.criteria_range)
+                            .desired_width(290.0)
+                            .hint_text("可留空（仅去重）或填如 F1:G3（同行AND，多行OR）"),
+                    );
+                });
+                if !d.in_place {
+                    ui_kit::field(ui, "复制到", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.copy_to)
+                                .desired_width(140.0)
+                                .hint_text("目标起点，如 I1"),
+                        );
+                    });
+                }
+                ui.checkbox(&mut d.unique_only, "选择不重复的记录");
+                ui.label(
+                    egui::RichText::new("条件区域支持 >、>=、<、<=、<>、= 以及 * / ? 通配符；同行条件为「且」，多行条件为「或」。")
+                        .size(10.5)
+                        .weak(),
+                );
+                if !d.msg.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&d.msg)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(192, 0, 0)),
+                    );
+                }
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        open = false;
+                    }
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        ok = true;
+                    }
+                });
+            });
+        if ok {
+            let res: Result<String, String> = (|| {
+                let list_rect = Self::parse_rect(&d.list_range)
+                    .ok_or_else(|| format!("列表区域「{}」格式无效", d.list_range))?;
+                let crit_rect = if d.criteria_range.trim().is_empty() {
+                    None
+                } else {
+                    Some(
+                        Self::parse_rect(&d.criteria_range)
+                            .ok_or_else(|| format!("条件区域「{}」格式无效", d.criteria_range))?,
+                    )
+                };
+                let copy_to = if d.in_place {
+                    None
+                } else {
+                    Some(
+                        Self::parse_addr(d.copy_to.trim())
+                            .ok_or_else(|| format!("目标位置「{}」格式无效，请写成如 I1", d.copy_to))?,
+                    )
+                };
+                let si = self.sheet_idx;
+                if let Some((dr, dc)) = copy_to {
+                    let h = list_rect.2.saturating_sub(list_rect.0) + 1;
+                    let w = list_rect.3.saturating_sub(list_rect.1) + 1;
+                    let keys = sheetcore::undo::rect_keys(
+                        dr,
+                        dc,
+                        (dr + h - 1).min(1_048_575),
+                        (dc + w - 1).min(16_383),
+                    );
+                    if !self.write_preflight(&keys, "高级筛选") {
+                        return Err(self.status.clone());
+                    }
+                    let txn = self.txn_begin(&keys);
+                    let rep = sheetcore::sort_filter::advanced_filter(
+                        self.wb.sheet_mut(si),
+                        list_rect,
+                        crit_rect,
+                        Some((dr, dc)),
+                        d.unique_only,
+                    )?;
+                    self.txn_end("高级筛选（复制到新位置）", txn);
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                    Ok(format!(
+                        "高级筛选完成：匹配 {} / {} 条记录，已复制到 {}",
+                        rep.matched,
+                        rep.total,
+                        cell_name(dr, dc)
+                    ))
+                } else {
+                    let before_filter = self.wb.sheet(si).filter.clone();
+                    let before_hidden = self.wb.sheet(si).hidden_rows.clone();
+                    let rep = sheetcore::sort_filter::advanced_filter(
+                        self.wb.sheet_mut(si),
+                        list_rect,
+                        crit_rect,
+                        None,
+                        d.unique_only,
+                    )?;
+                    self.record_filter_undo("高级筛选", before_filter, before_hidden);
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                    Ok(format!(
+                        "高级筛选完成：已筛选，找到 {} / {} 条记录",
+                        rep.matched, rep.total
+                    ))
+                }
+            })();
+            match res {
+                Ok(msg) => {
+                    self.status = msg;
+                    self.adv_filter_dlg = None;
+                }
+                Err(e) => {
+                    d.msg = e;
+                    self.adv_filter_dlg = Some(d);
+                }
+            }
+        } else {
+            self.adv_filter_dlg = if open { Some(d) } else { None };
+        }
     }
 
     /// 按当前条件重新计算筛选隐藏行，不动手动隐藏行。
@@ -31283,9 +32163,12 @@ impl SheetApp {
             self.status = "区域太小，无法筛选".into();
             return;
         }
+        let before_filter = self.wb.sheet(self.sheet_idx).filter.clone();
+        let before_hidden = self.wb.sheet(self.sheet_idx).hidden_rows.clone();
         let sheet = self.wb.sheet_mut(self.sheet_idx);
         sheet.filter = Some(sheetcore::sort_filter::Filter::new(r1, c1, r2, c2));
         sheet.filter_dirty = true;
+        self.record_filter_undo("启用自动筛选", before_filter, before_hidden);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = "已启用筛选：点表头的箭头选择要显示的值".into();
@@ -31345,6 +32228,20 @@ impl SheetApp {
             .filter
             .as_ref()
             .map(|f| f.color_filters.contains_key(&col))
+            .unwrap_or(false);
+        let has_top_flt = self
+            .wb
+            .sheet(self.sheet_idx)
+            .filter
+            .as_ref()
+            .map(|f| f.top_filters.contains_key(&col))
+            .unwrap_or(false);
+        let has_dyn_flt = self
+            .wb
+            .sheet(self.sheet_idx)
+            .filter
+            .as_ref()
+            .map(|f| f.dynamic_filters.contains_key(&col))
             .unwrap_or(false);
         // 懒扫描日期层级树与单元格填充/字体色元数据
         if st.meta.is_none() {
@@ -31412,7 +32309,10 @@ impl SheetApp {
         let mut clear_req = false;
         let mut crit_req: Option<Option<sheetcore::sort_filter::Criterion>> = None;
         let mut color_req: Option<Option<sheetcore::sort_filter::ColorFilter>> = None;
+        let mut top_req: Option<sheetcore::sort_filter::TopFilter> = None;
+        let mut dyn_req: Option<sheetcore::sort_filter::DynamicFilter> = None;
         let mut open_crit: Option<sheetcore::sort_filter::CmpOp> = None;
+        let mut open_top = false;
         let has_dates = st.meta.as_ref().is_some_and(|m| !m.dates.is_empty());
         let has_colors = st.meta.as_ref().is_some_and(|m| {
             m.fill_colors.len() > 1
@@ -31484,7 +32384,7 @@ impl SheetApp {
                     if menu_row(
                         ui,
                         &format!("从“{col_name}”中清除筛选器"),
-                        has_crit || has_allows || has_date_grp || has_color_flt,
+                        has_crit || has_allows || has_date_grp || has_color_flt || has_top_flt || has_dyn_flt,
                     ) {
                         clear_req = true;
                     }
@@ -31775,8 +32675,19 @@ impl SheetApp {
                                             let mut m_on = m_days
                                                 .iter()
                                                 .all(|k| st.date_selected.contains(k));
+                                            let m_exp = self.filter_expanded_months.contains(&(year, month));
                                             ui.horizontal(|ui| {
-                                                ui.add_space(20.0);
+                                                ui.add_space(16.0);
+                                                if ui
+                                                    .small_button(if m_exp { "▼" } else { "▶" })
+                                                    .clicked()
+                                                {
+                                                    if m_exp {
+                                                        self.filter_expanded_months.remove(&(year, month));
+                                                    } else {
+                                                        self.filter_expanded_months.insert((year, month));
+                                                    }
+                                                }
                                                 if ui
                                                     .checkbox(&mut m_on, format!("{month}月 ({}天)", days.len()))
                                                     .changed()
@@ -31790,6 +32701,22 @@ impl SheetApp {
                                                     }
                                                 }
                                             });
+                                            if m_exp {
+                                                for &day in days {
+                                                    let key = (year, month, day);
+                                                    let mut d_on = st.date_selected.contains(&key);
+                                                    ui.horizontal(|ui| {
+                                                        ui.add_space(40.0);
+                                                        if ui.checkbox(&mut d_on, format!("{day}日")).changed() {
+                                                            if d_on {
+                                                                st.date_selected.insert(key);
+                                                            } else {
+                                                                st.date_selected.remove(&key);
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -31885,6 +32812,70 @@ impl SheetApp {
                                     open_crit = Some(*op);
                                 }
                             }
+                            if numeric {
+                                ui.separator();
+                                let mut dyn_row = |ui: &mut egui::Ui, lbl: &str| -> bool {
+                                    let (r, resp) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 22.0),
+                                        egui::Sense::click(),
+                                    );
+                                    if resp.hovered() {
+                                        ui.painter().rect_filled(r, 0.0, egui::Color32::from_rgb(229, 241, 251));
+                                    }
+                                    ui.painter().text(
+                                        egui::pos2(r.left() + 8.0, r.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        lbl,
+                                        egui::FontId::proportional(12.0),
+                                        ui_kit::TEXT,
+                                    );
+                                    resp.clicked()
+                                };
+                                if dyn_row(ui, "前 10 项…") {
+                                    open_top = true;
+                                }
+                                if dyn_row(ui, "高于平均值") {
+                                    dyn_req = Some(sheetcore::sort_filter::DynamicFilter::AboveAverage);
+                                }
+                                if dyn_row(ui, "低于平均值") {
+                                    dyn_req = Some(sheetcore::sort_filter::DynamicFilter::BelowAverage);
+                                }
+                            }
+                            if has_dates {
+                                ui.separator();
+                                for df in [
+                                    sheetcore::sort_filter::DynamicFilter::Today,
+                                    sheetcore::sort_filter::DynamicFilter::Yesterday,
+                                    sheetcore::sort_filter::DynamicFilter::Tomorrow,
+                                    sheetcore::sort_filter::DynamicFilter::ThisWeek,
+                                    sheetcore::sort_filter::DynamicFilter::LastWeek,
+                                    sheetcore::sort_filter::DynamicFilter::NextWeek,
+                                    sheetcore::sort_filter::DynamicFilter::ThisMonth,
+                                    sheetcore::sort_filter::DynamicFilter::LastMonth,
+                                    sheetcore::sort_filter::DynamicFilter::NextMonth,
+                                    sheetcore::sort_filter::DynamicFilter::ThisYear,
+                                    sheetcore::sort_filter::DynamicFilter::LastYear,
+                                    sheetcore::sort_filter::DynamicFilter::NextYear,
+                                ] {
+                                    let (r, resp) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 21.0),
+                                        egui::Sense::click(),
+                                    );
+                                    if resp.hovered() {
+                                        ui.painter().rect_filled(r, 0.0, egui::Color32::from_rgb(229, 241, 251));
+                                    }
+                                    ui.painter().text(
+                                        egui::pos2(r.left() + 8.0, r.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        df.label(),
+                                        egui::FontId::proportional(11.5),
+                                        ui_kit::TEXT,
+                                    );
+                                    if resp.clicked() {
+                                        dyn_req = Some(df);
+                                    }
+                                }
+                            }
                         });
                 });
             ops_rect = ar.response.rect;
@@ -31898,14 +32889,80 @@ impl SheetApp {
                 if !resp.response.rect.contains(p)
                     && !ops_rect.contains(p)
                     && st.crit_dlg.is_none()
+                    && st.top_dlg.is_none()
                     && open_crit.is_none()
+                    && !open_top
                 {
                     cancel = true;
                 }
             }
         }
 
-        // 文本/数字筛选的输入框
+        if open_top {
+            let old = self
+                .wb
+                .sheet(self.sheet_idx)
+                .filter
+                .as_ref()
+                .and_then(|f| f.top_filters.get(&col))
+                .copied();
+            st.top_dlg = Some(match old {
+                Some(tf) => (tf.top, tf.percent, tf.count),
+                None => (true, false, 10),
+            });
+            st.ops_open = false;
+        }
+        if let Some((mut is_top, mut is_pct, mut count_v)) = st.top_dlg {
+            let mut top_open = true;
+            let mut top_ok = false;
+            let mut top_cancel = false;
+            ui_kit::window(ctx, "自动筛选前 10 个", 340.0)
+                .open(&mut top_open)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("top_dir")
+                            .width(80.0)
+                            .selected_text(if is_top { "最大" } else { "最小" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut is_top, true, "最大");
+                                ui.selectable_value(&mut is_top, false, "最小");
+                            });
+                        let mut n = count_v as f64;
+                        if ui_kit::spin(ui, &mut n, 1.0, 500.0, 1.0, 64.0) {
+                            count_v = n as u32;
+                        }
+                        egui::ComboBox::from_id_salt("top_unit")
+                            .width(80.0)
+                            .selected_text(if is_pct { "百分比" } else { "项" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut is_pct, false, "项");
+                                ui.selectable_value(&mut is_pct, true, "百分比");
+                            });
+                    });
+                    ui_kit::footer(ui, |ui| {
+                        if ui_kit::primary_button(ui, "确定").clicked() {
+                            top_ok = true;
+                        }
+                        if ui_kit::secondary_button(ui, "取消").clicked() {
+                            top_cancel = true;
+                        }
+                    });
+                });
+            if top_ok {
+                top_req = Some(sheetcore::sort_filter::TopFilter {
+                    top: is_top,
+                    percent: is_pct,
+                    count: count_v.max(1),
+                });
+                st.top_dlg = None;
+            } else if top_cancel || !top_open {
+                st.top_dlg = None;
+            } else {
+                st.top_dlg = Some((is_top, is_pct, count_v));
+            }
+        }
+
+        // 文本/数字筛选的输入框（支持复合 AND / OR 第二条件 + 通配符提示）
         if let Some(op) = open_crit {
             let old = self
                 .wb
@@ -31915,10 +32972,23 @@ impl SheetApp {
                 .and_then(|f| f.criteria.get(&col))
                 .filter(|c| c.op == op)
                 .cloned();
-            st.crit_dlg = Some(match old {
-                Some(c) => (op, c.val, c.val2.unwrap_or_default()),
-                None => (op, String::new(), String::new()),
-            });
+            if let Some(c) = old {
+                st.crit_dlg = Some((op, c.val, c.val2.unwrap_or_default()));
+                if let Some((is_and, op2, val2)) = c.second {
+                    st.crit_and = is_and;
+                    st.crit_op2 = Some(op2);
+                    st.crit_val2 = val2;
+                } else {
+                    st.crit_and = true;
+                    st.crit_op2 = None;
+                    st.crit_val2.clear();
+                }
+            } else {
+                st.crit_dlg = Some((op, String::new(), String::new()));
+                st.crit_and = true;
+                st.crit_op2 = None;
+                st.crit_val2.clear();
+            }
         }
         let mut crit_close = false;
         let mut crit_open = true;
@@ -31926,7 +32996,7 @@ impl SheetApp {
             let mut a = v1.clone();
             let mut b = v2.clone();
             let mut ok = false;
-            ui_kit::window(ctx, "自定义自动筛选方式", 360.0).open(&mut crit_open).show(ctx, |ui| {
+            ui_kit::window(ctx, "自定义自动筛选方式", 400.0).open(&mut crit_open).show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new(format!("显示行：{}", op.label()))
                         .size(12.0),
@@ -31934,18 +33004,59 @@ impl SheetApp {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut a)
-                            .desired_width(150.0)
+                            .desired_width(160.0)
                             .font(egui::FontId::proportional(12.0)),
                     );
                     if op == sheetcore::sort_filter::CmpOp::Between {
                         ui.label("与");
                         ui.add(
                             egui::TextEdit::singleline(&mut b)
-                                .desired_width(150.0)
+                                .desired_width(160.0)
                                 .font(egui::FontId::proportional(12.0)),
                         );
                     }
                 });
+                if op != sheetcore::sort_filter::CmpOp::Between {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut st.crit_and, true, "与 (AND)");
+                        ui.radio_value(&mut st.crit_and, false, "或 (OR)");
+                    });
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("crit_op2")
+                            .width(120.0)
+                            .selected_text(st.crit_op2.map(|o| o.label()).unwrap_or("（无第二条件）"))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut st.crit_op2, None, "（无第二条件）");
+                                for cand in [
+                                    sheetcore::sort_filter::CmpOp::Eq,
+                                    sheetcore::sort_filter::CmpOp::Ne,
+                                    sheetcore::sort_filter::CmpOp::Gt,
+                                    sheetcore::sort_filter::CmpOp::Ge,
+                                    sheetcore::sort_filter::CmpOp::Lt,
+                                    sheetcore::sort_filter::CmpOp::Le,
+                                    sheetcore::sort_filter::CmpOp::Contains,
+                                    sheetcore::sort_filter::CmpOp::NotContains,
+                                    sheetcore::sort_filter::CmpOp::Begins,
+                                    sheetcore::sort_filter::CmpOp::Ends,
+                                ] {
+                                    ui.selectable_value(&mut st.crit_op2, Some(cand), cand.label());
+                                }
+                            });
+                        if st.crit_op2.is_some() {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut st.crit_val2)
+                                    .desired_width(160.0)
+                                    .font(egui::FontId::proportional(12.0)),
+                            );
+                        }
+                    });
+                }
+                ui.label(
+                    egui::RichText::new("提示：使用 ? 代表单个字符，* 代表任意字符序列，~* 匹配字面星号。")
+                        .size(10.5)
+                        .weak(),
+                );
                 ui_kit::footer(ui, |ui| {
                     if ui_kit::primary_button(ui, "确定").clicked() {
                         ok = true;
@@ -31956,11 +33067,14 @@ impl SheetApp {
                 });
             });
             if ok {
-                let crit = if op == sheetcore::sort_filter::CmpOp::Between {
+                let mut crit = if op == sheetcore::sort_filter::CmpOp::Between {
                     sheetcore::sort_filter::Criterion::between(a.clone(), b.clone())
                 } else {
                     sheetcore::sort_filter::Criterion::new(op, a.clone())
                 };
+                if let Some(op2) = st.crit_op2 {
+                    crit.second = Some((st.crit_and, op2, st.crit_val2.clone()));
+                }
                 crit_req = Some(Some(crit));
             } else {
                 st.crit_dlg = Some((op, a, b));
@@ -31976,6 +33090,8 @@ impl SheetApp {
             return;
         }
         if clear_req {
+            let before_filter = self.wb.sheet(self.sheet_idx).filter.clone();
+            let before_hidden = self.wb.sheet(self.sheet_idx).hidden_rows.clone();
             {
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 if let Some(f) = sh.filter.as_mut() {
@@ -31983,15 +33099,58 @@ impl SheetApp {
                     f.criteria.remove(&col);
                     f.date_groups.remove(&col);
                     f.color_filters.remove(&col);
+                    f.top_filters.remove(&col);
+                    f.dynamic_filters.remove(&col);
                 }
             }
             self.recalc_filter_hidden();
+            self.record_filter_undo("清除列筛选", before_filter, before_hidden);
             self.wb.dirty = true;
-            self.status = format!("已清除 {} 列的筛选", cell_name(0, col));
+            self.status = self
+                .filter_match_summary()
+                .unwrap_or_else(|| format!("已清除 {} 列的筛选", cell_name(0, col)));
+            self.filter_popup = None;
+            return;
+        }
+        if let Some(tf) = top_req {
+            let before_filter = self.wb.sheet(self.sheet_idx).filter.clone();
+            let before_hidden = self.wb.sheet(self.sheet_idx).hidden_rows.clone();
+            if let Some(f) = self.wb.sheet_mut(self.sheet_idx).filter.as_mut() {
+                f.top_filters.insert(col, tf);
+                f.allows.remove(&col);
+                f.criteria.remove(&col);
+                f.dynamic_filters.remove(&col);
+            }
+            self.recalc_filter_hidden();
+            self.record_filter_undo("前N项筛选", before_filter, before_hidden);
+            self.wb.dirty = true;
+            self.status = self
+                .filter_match_summary()
+                .unwrap_or_else(|| format!("{} 列已按前/后 {} 筛选", cell_name(0, col), tf.count));
+            self.filter_popup = None;
+            return;
+        }
+        if let Some(df) = dyn_req {
+            let before_filter = self.wb.sheet(self.sheet_idx).filter.clone();
+            let before_hidden = self.wb.sheet(self.sheet_idx).hidden_rows.clone();
+            if let Some(f) = self.wb.sheet_mut(self.sheet_idx).filter.as_mut() {
+                f.dynamic_filters.insert(col, df);
+                f.allows.remove(&col);
+                f.criteria.remove(&col);
+                f.top_filters.remove(&col);
+            }
+            self.recalc_filter_hidden();
+            self.record_filter_undo("动态筛选", before_filter, before_hidden);
+            self.wb.dirty = true;
+            self.status = self
+                .filter_match_summary()
+                .unwrap_or_else(|| format!("{} 列已按「{}」筛选", cell_name(0, col), df.label()));
             self.filter_popup = None;
             return;
         }
         if let Some(cf_opt) = color_req {
+            let before_filter = self.wb.sheet(self.sheet_idx).filter.clone();
+            let before_hidden = self.wb.sheet(self.sheet_idx).hidden_rows.clone();
             {
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 if let Some(f) = sh.filter.as_mut() {
@@ -32006,16 +33165,21 @@ impl SheetApp {
                 }
             }
             self.recalc_filter_hidden();
+            self.record_filter_undo("按颜色筛选", before_filter, before_hidden);
             self.wb.dirty = true;
-            self.status = if cf_opt.is_some() {
-                format!("{} 列已按颜色筛选", cell_name(0, col))
-            } else {
-                format!("{} 列已清除颜色筛选", cell_name(0, col))
-            };
+            self.status = self.filter_match_summary().unwrap_or_else(|| {
+                if cf_opt.is_some() {
+                    format!("{} 列已按颜色筛选", cell_name(0, col))
+                } else {
+                    format!("{} 列已清除颜色筛选", cell_name(0, col))
+                }
+            });
             self.filter_popup = None;
             return;
         }
         if let Some(c) = crit_req {
+            let before_filter = self.wb.sheet(self.sheet_idx).filter.clone();
+            let before_hidden = self.wb.sheet(self.sheet_idx).hidden_rows.clone();
             {
                 let sh = self.wb.sheet_mut(self.sheet_idx);
                 if let Some(f) = sh.filter.as_mut() {
@@ -32023,6 +33187,8 @@ impl SheetApp {
                         Some(crit) => {
                             f.criteria.insert(col, crit);
                             f.allows.remove(&col);
+                            f.top_filters.remove(&col);
+                            f.dynamic_filters.remove(&col);
                         }
                         None => {
                             f.criteria.remove(&col);
@@ -32031,12 +33197,17 @@ impl SheetApp {
                 }
             }
             self.recalc_filter_hidden();
+            self.record_filter_undo("自定义筛选", before_filter, before_hidden);
             self.wb.dirty = true;
-            self.status = format!("{} 列已按条件筛选", cell_name(0, col));
+            self.status = self
+                .filter_match_summary()
+                .unwrap_or_else(|| format!("{} 列已按条件筛选", cell_name(0, col)));
             self.filter_popup = None;
             return;
         }
         if apply {
+            let before_filter = self.wb.sheet(self.sheet_idx).filter.clone();
+            let before_hidden = self.wb.sheet(self.sheet_idx).hidden_rows.clone();
             if st.date_mode && has_dates {
                 let total_days: usize = st
                     .meta
@@ -32048,6 +33219,8 @@ impl SheetApp {
                 if let Some(f) = self.wb.sheet_mut(self.sheet_idx).filter.as_mut() {
                     changed |= f.criteria.remove(&col).is_some();
                     changed |= f.allows.remove(&col).is_some();
+                    changed |= f.top_filters.remove(&col).is_some();
+                    changed |= f.dynamic_filters.remove(&col).is_some();
                     if all_on {
                         changed |= f.date_groups.remove(&col).is_some();
                     } else {
@@ -32069,13 +33242,16 @@ impl SheetApp {
                 }
                 if changed {
                     self.recalc_filter_hidden();
+                    self.record_filter_undo("日期筛选", before_filter, before_hidden);
                     self.wb.dirty = true;
                 }
-                self.status = if all_on {
-                    format!("{} 列已取消日期筛选", cell_name(0, col))
-                } else {
-                    format!("{} 列已按日期筛选（保留 {} 个日期）", cell_name(0, col), st.date_selected.len())
-                };
+                self.status = self.filter_match_summary().unwrap_or_else(|| {
+                    if all_on {
+                        format!("{} 列已取消日期筛选", cell_name(0, col))
+                    } else {
+                        format!("{} 列已按日期筛选（保留 {} 个日期）", cell_name(0, col), st.date_selected.len())
+                    }
+                });
                 return;
             }
             let count = st.list.checked_total;
@@ -32084,6 +33260,8 @@ impl SheetApp {
             if let Some(f) = self.wb.sheet_mut(self.sheet_idx).filter.as_mut() {
                 changed |= f.criteria.remove(&col).is_some();
                 changed |= f.date_groups.remove(&col).is_some();
+                changed |= f.top_filters.remove(&col).is_some();
+                changed |= f.dynamic_filters.remove(&col).is_some();
                 if all_on {
                     changed |= f.allows.remove(&col).is_some();
                 } else {
@@ -32096,13 +33274,16 @@ impl SheetApp {
             }
             if changed {
                 self.recalc_filter_hidden();
+                self.record_filter_undo("自动筛选", before_filter, before_hidden);
                 self.wb.dirty = true;
             }
-            self.status = if all_on {
-                format!("{} 列已取消筛选", cell_name(0, col))
-            } else {
-                format!("{} 列已筛选（保留 {} 个值）", cell_name(0, col), count)
-            };
+            self.status = self.filter_match_summary().unwrap_or_else(|| {
+                if all_on {
+                    format!("{} 列已取消筛选", cell_name(0, col))
+                } else {
+                    format!("{} 列已筛选（保留 {} 个值）", cell_name(0, col), count)
+                }
+            });
             return;
         }
         if cancel {
@@ -32136,7 +33317,17 @@ impl SheetApp {
             .filter
             .as_ref()
             .map(|f| {
-                if f.date_groups.is_empty() && f.color_filters.is_empty() {
+                let needs_rich = !f.date_groups.is_empty()
+                    || !f.color_filters.is_empty()
+                    || !f.top_filters.is_empty()
+                    || !f.dynamic_filters.is_empty()
+                    || f.criteria.values().any(|c| {
+                        c.second.is_some()
+                            || c.val.contains('*')
+                            || c.val.contains('?')
+                            || c.val.contains('~')
+                    });
+                if !needs_rich {
                     filter_choices::compute_filter_hidden_fast(sheet, f)
                 } else {
                     f.hidden_row_intervals_with_styles(
@@ -33661,6 +34852,15 @@ impl SheetApp {
                     ui.checkbox(&mut self.find.match_case, "区分大小写");
                     ui.add_space(6.0);
                     ui.checkbox(&mut self.find.whole_cell, "单元格完全匹配");
+                    ui.add_space(6.0);
+                    ui.checkbox(&mut self.find.use_wildcards, "通配符 (* / ?)")
+                        .on_hover_text("支持 * 任意字符、? 单字符、~ 转义");
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(72.0);
+                    ui.checkbox(&mut self.find.in_comments, "含批注");
+                    ui.add_space(6.0);
+                    ui.checkbox(&mut self.find.match_bold, "仅加粗格式");
                     if self.find.tab == 1 {
                         ui.add_space(6.0);
                         ui.checkbox(&mut self.find.replace_formula_results, "替换公式结果")
@@ -33812,13 +35012,28 @@ impl SheetApp {
                 }
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     for (i, h) in all.iter().take(500).enumerate() {
-                        let sheet = self
+                        let (sheet, preview) = self
                             .wb
                             .sheets
                             .get(h.sheet)
-                            .map(|s| s.name.as_str())
-                            .unwrap_or("?");
-                        let label = format!("{}. {}!{}", i + 1, sheet, cell_name(h.row, h.col));
+                            .map(|s| {
+                                let val = s.value(h.row, h.col).display();
+                                let fml = s.formula_of(h.row, h.col);
+                                let note = s.notes.get(&sheetcore::model::CellRef::new(h.row, h.col));
+                                let p = match (fml, note) {
+                                    (Some(f), _) => format!("{val}  ({f})"),
+                                    (None, Some(n)) if val.is_empty() => format!("[批注] {}", n.text),
+                                    _ => val,
+                                };
+                                let clipped: String = p.chars().take(48).collect();
+                                (s.name.as_str(), clipped)
+                            })
+                            .unwrap_or(("?", String::new()));
+                        let label = if preview.is_empty() {
+                            format!("{}. {}!{}", i + 1, sheet, cell_name(h.row, h.col))
+                        } else {
+                            format!("{}. {}!{}  —  {}", i + 1, sheet, cell_name(h.row, h.col), preview)
+                        };
                         if ui.selectable_label(false, label).clicked() {
                             pick = Some(*h);
                         }
@@ -35292,10 +36507,146 @@ impl SheetApp {
         groups
     }
 
-    /// 选区是不是「整列」（点列标选出来的）：行跨度很大就当整列
+    /// 选区是不是「整列」（点列标选出来的：从第 1 行贯穿到末行且非全表）
     fn selection_is_columns(&self) -> bool {
-        let (r1, _, r2, _) = self.sel_rect();
-        r2 - r1 > 1000
+        let (r1, c1, r2, c2) = self.sel_rect();
+        r1 == 0 && r2 >= 1_048_000 && !(c1 == 0 && c2 >= 16_380)
+    }
+
+    fn record_outline_undo(
+        &mut self,
+        label: &str,
+        before_rows: std::collections::HashMap<u32, u8>,
+        before_cols: std::collections::HashMap<u32, u8>,
+    ) {
+        let si = self.sheet_idx;
+        let after_rows = self.wb.sheet(si).row_levels.clone();
+        let after_cols = self.wb.sheet(si).col_levels.clone();
+        if before_rows != after_rows || before_cols != after_cols {
+            self.undo.push_meta(
+                label,
+                (si, self.sel.0, self.sel.1),
+                sheetcore::undo::MetaEdit {
+                    sheet: si,
+                    outline: Some((before_rows, after_rows, before_cols, after_cols)),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// 自动分级显示：扫描当前区域内的 SUBTOTAL/SUM 汇总行与汇总列，自动建立行/列分级大纲。
+    fn auto_outline(&mut self) {
+        if self.edit_blocked() {
+            return;
+        }
+        let si = self.sheet_idx;
+        let before_rows = self.wb.sheet(si).row_levels.clone();
+        let before_cols = self.wb.sheet(si).col_levels.clone();
+        let Some((r1, c1, r2, c2)) = self.wb.sheet(si).used_bounds() else {
+            self.status = "当前工作表没有可分级的数据".into();
+            return;
+        };
+        let r2 = r2.min(r1 + 50_000);
+        let c2 = c2.min(c1 + 500);
+        let mut new_rows = self.wb.sheet(si).row_levels.clone();
+        let mut new_cols = self.wb.sheet(si).col_levels.clone();
+        let mut groups_added = 0usize;
+        {
+            let sh = self.wb.sheet(si);
+            let mut detail_start: Option<u32> = None;
+            for r in r1..=r2 {
+                let is_sum_row = (c1..=c2).any(|c| {
+                    sh.formula_of(r, c).is_some_and(|f| {
+                        let u = f.to_ascii_uppercase();
+                        u.contains("SUBTOTAL(") || u.contains("SUM(")
+                    })
+                });
+                if is_sum_row {
+                    if let Some(s) = detail_start.take() {
+                        if r > s {
+                            for rr in s..r {
+                                let lv = new_rows.get(&rr).copied().unwrap_or(0).saturating_add(1).min(7);
+                                new_rows.insert(rr, lv);
+                            }
+                            groups_added += 1;
+                        }
+                    }
+                } else if (c1..=c2).any(|c| !matches!(sh.value(r, c), Value::Empty)) {
+                    if detail_start.is_none() {
+                        detail_start = Some(r);
+                    }
+                }
+            }
+            let mut col_start: Option<u32> = None;
+            for c in c1..=c2 {
+                let is_sum_col = (r1..=r2).any(|r| {
+                    sh.formula_of(r, c).is_some_and(|f| {
+                        let u = f.to_ascii_uppercase();
+                        u.contains("SUBTOTAL(") || u.contains("SUM(")
+                    })
+                });
+                if is_sum_col {
+                    if let Some(s) = col_start.take() {
+                        if c > s {
+                            for cc in s..c {
+                                let lv = new_cols.get(&cc).copied().unwrap_or(0).saturating_add(1).min(7);
+                                new_cols.insert(cc, lv);
+                            }
+                            groups_added += 1;
+                        }
+                    }
+                } else if (r1..=r2).any(|r| !matches!(sh.value(r, c), Value::Empty)) {
+                    if col_start.is_none() {
+                        col_start = Some(c);
+                    }
+                }
+            }
+        }
+        if groups_added == 0 {
+            self.status = "未检测到包含 SUM / SUBTOTAL 的汇总行或汇总列，无法自动分级".into();
+            return;
+        }
+        {
+            let sh = self.wb.sheet_mut(si);
+            sh.row_levels = new_rows;
+            sh.col_levels = new_cols;
+            sh.layout_dirty = true;
+        }
+        self.record_outline_undo("自动分级显示", before_rows, before_cols);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = format!("已自动建立 {groups_added} 组分级显示");
+    }
+
+    /// 清除工作表全部分级显示（支持 Ctrl+Z 撤销）
+    fn clear_outline(&mut self) {
+        if self.edit_blocked() {
+            return;
+        }
+        let si = self.sheet_idx;
+        let before_rows = self.wb.sheet(si).row_levels.clone();
+        let before_cols = self.wb.sheet(si).col_levels.clone();
+        if before_rows.is_empty() && before_cols.is_empty() {
+            self.status = "当前工作表没有分级显示".into();
+            return;
+        }
+        {
+            let sh = self.wb.sheet_mut(si);
+            for r in before_rows.keys() {
+                sh.hidden_rows_user.remove(r);
+            }
+            for c in before_cols.keys() {
+                sh.hidden_cols.remove(c);
+            }
+            sh.row_levels.clear();
+            sh.col_levels.clear();
+            sh.layout_dirty = true;
+        }
+        self.record_outline_undo("清除分级显示", before_rows, before_cols);
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.status = "已清除全部分级显示".into();
     }
 
     /// 组合：整列选区组合列，其余组合行
@@ -35320,8 +36671,11 @@ impl SheetApp {
             return;
         }
         let (_r1, c1, _r2, c2) = self.sel_rect();
+        let si = self.sheet_idx;
+        let before_rows = self.wb.sheet(si).row_levels.clone();
+        let before_cols = self.wb.sheet(si).col_levels.clone();
         {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let sh = self.wb.sheet_mut(si);
             let mut base = 0u8;
             for probe in [c1.saturating_sub(1), c2 + 1, c1, c2] {
                 if let Some(l) = sh.col_levels.get(&probe) {
@@ -35334,6 +36688,7 @@ impl SheetApp {
             }
             sh.layout_dirty = true;
         }
+        self.record_outline_undo("组合列", before_rows, before_cols);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已组合 {}~{} 列", col_label(c1), col_label(c2));
@@ -35344,8 +36699,11 @@ impl SheetApp {
             return;
         }
         let (_r1, c1, _r2, c2) = self.sel_rect();
+        let si = self.sheet_idx;
+        let before_rows = self.wb.sheet(si).row_levels.clone();
+        let before_cols = self.wb.sheet(si).col_levels.clone();
         {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let sh = self.wb.sheet_mut(si);
             for c in c1..=c2 {
                 if let Some(l) = sh.col_levels.get(&c).copied() {
                     if l <= 1 {
@@ -35357,6 +36715,7 @@ impl SheetApp {
             }
             sh.layout_dirty = true;
         }
+        self.record_outline_undo("取消组合列", before_rows, before_cols);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已取消组合 {}~{} 列", col_label(c1), col_label(c2));
@@ -35368,8 +36727,15 @@ impl SheetApp {
             return;
         }
         let (r1, _c1, r2, _c2) = self.sel_rect();
+        if r2 - r1 > 100_000 {
+            self.status = "单次组合行数上限为 10 万行，请缩小选区范围".into();
+            return;
+        }
+        let si = self.sheet_idx;
+        let before_rows = self.wb.sheet(si).row_levels.clone();
+        let before_cols = self.wb.sheet(si).col_levels.clone();
         {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let sh = self.wb.sheet_mut(si);
             // 选区边界已有的级别决定新级别
             let mut base = 0u8;
             for probe in [r1.saturating_sub(1), r2 + 1, r1, r2] {
@@ -35377,16 +36743,13 @@ impl SheetApp {
                     base = base.max(*l);
                 }
             }
-            if r2 - r1 > 100_000 {
-                self.status = "单次组合行数上限为 10 万行，请缩小选区范围".into();
-                return;
-            }
             let lv = (base + 1).min(7);
             for r in r1..=r2 {
                 sh.row_levels.insert(r, lv);
             }
             sh.layout_dirty = true;
         }
+        self.record_outline_undo("组合行", before_rows, before_cols);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已组合第 {}~{} 行", r1 + 1, r2 + 1);
@@ -35398,8 +36761,11 @@ impl SheetApp {
             return;
         }
         let (r1, _c1, r2, _c2) = self.sel_rect();
+        let si = self.sheet_idx;
+        let before_rows = self.wb.sheet(si).row_levels.clone();
+        let before_cols = self.wb.sheet(si).col_levels.clone();
         {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
+            let sh = self.wb.sheet_mut(si);
             for r in r1..=r2 {
                 if let Some(l) = sh.row_levels.get(&r).copied() {
                     if l <= 1 {
@@ -35411,6 +36777,7 @@ impl SheetApp {
             }
             sh.layout_dirty = true;
         }
+        self.record_outline_undo("取消组合行", before_rows, before_cols);
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已取消组合第 {}~{} 行", r1 + 1, r2 + 1);
@@ -36296,21 +37663,7 @@ impl SheetApp {
             CtxAct::SortAsc => self.do_sort(self.sel.1, true),
             CtxAct::SortDesc => self.do_sort(self.sel.1, false),
             CtxAct::SortCustom => {
-                self.data_dlg = Some(DataDlg {
-                    tab: 0,
-                    keys: vec![(self.sel.1, true, true)],
-                    header: true,
-                    delim: ",".into(),
-                    sort_mode: 1,
-                    custom: "高,中,低".into(),
-                    merge_consecutive: false,
-                    sort_by_row: false,
-            split_fixed: false,
-                    widths: String::new(),
-            col_modes: String::new(),
-                    quote: true,
-                    detect_types: true,
-                });
+                self.open_data_dlg(0);
             }
             CtxAct::FormatCells => self.open_format_dialog(),
             CtxAct::Hyperlink => {
@@ -38326,8 +39679,10 @@ impl SheetApp {
             }
         }
         if let Some((col, anchor)) = pending_filter.take() {
-            self.filter_popup = FilterPopup::open_with_ctx(
+            self.filter_popup = FilterPopup::open_with_styles(
                 self.wb.sheet(self.sheet_idx),
+                &self.wb.styles,
+                self.wb.date_system,
                 self.doc_gen,
                 col,
                 anchor,
@@ -48059,6 +49414,7 @@ impl eframe::App for SheetApp {
         self.ec_options_window(ctx);
         self.goal_window(ctx);
         self.dtable_window(ctx);
+        self.adv_filter_dialog(ctx);
         self.scenario_window(ctx);
         self.name_manager_window(ctx);
         self.protect_dialog(ctx);

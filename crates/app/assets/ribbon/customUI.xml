@@ -809,11 +809,12 @@
           <box boxStyle="vertical" paddingTop="0" gap="2">
             <button id="GroupSelection" label="组合" imageMso="GroupRows" screentip="整列选区组合列，其余组合行" onAction="GroupSelection" sizeString="88"/>
             <button id="UngroupSelection" label="取消组合" imageMso="UngroupRows" screentip="整列选区拆列，其余拆行" onAction="UngroupSelection" sizeString="88"/>
-            <button id="OutlineSettings" label="分级设置" imageMso="OutlineLevels" screentip="明细在下方/右侧、显示分级符号" onAction="OutlineSettings" sizeString="88"/>
+            <button id="OutlineSettings" label="分级设置" imageMso="OutlineLevels" screentip="明细在下方/右侧、自动分级与清除分级" onAction="OutlineSettings" sizeString="88"/>
           </box>
-          <box boxStyle="vertical" paddingTop="10" gap="6">
+          <box boxStyle="vertical" paddingTop="0" gap="2">
             <button id="HideDetail" label="隐藏明细" imageMso="HideDetail" onAction="HideDetail" sizeString="84"/>
             <button id="ShowDetail" label="显示明细" imageMso="ShowDetail" onAction="ShowDetail" sizeString="84"/>
+            <button id="OutlineAuto" label="自动分级" imageMso="OutlineLevels" screentip="按表内 SUBTOTAL/SUM 汇总自动生成分级" onAction="OutlineAuto" sizeString="84"/>
           </box>
         </group>
         <group id="GroupGetData" label="获取数据">
@@ -836,9 +837,10 @@
             <toggleButton id="DataFilter" label="筛选" imageMso="Filter" keytip="F" screentip="按当前区域启用筛选" onAction="Filter" sizeString="78"/>
             <button id="MultiSort" label="排序..." imageMso="SortDialog" onAction="MultiSort" sizeString="78" keytip="SS"/>
           </box>
-          <box boxStyle="vertical" paddingTop="10" gap="6">
+          <box boxStyle="vertical" paddingTop="0" gap="2">
             <button id="FilterClear" label="清除" imageMso="Eraser" onAction="FilterClear" sizeString="84" keytip="C"/>
             <button id="FilterReapply" label="重新应用" imageMso="FilterReapply" onAction="FilterReapply" sizeString="84" keytip="Y"/>
+            <button id="FilterAdvanced" label="高级筛选" imageMso="Filter" screentip="按条件区域原地筛选或复制到其他位置（支持唯一记录）" onAction="FilterAdvanced" sizeString="84" keytip="Q"/>
           </box>
         </group>
         <group id="GroupDataTools" label="数据工具">
@@ -1027,6 +1029,17 @@
             <box boxStyle="vertical">
               <button id="TableFilter" label="筛选" imageMso="Filter" screentip="在表格标题行上加筛选" onAction="Filter" sizeString="100"/>
               <toggleButton id="TableTotals" label="汇总行" imageMso="Sum" screentip="在表格底部加/去汇总行" onAction="ToggleTotals" sizeString="100"/>
+              <menu id="TableTotalsFnMenu" label="汇总函数" imageMso="Sum" sizeString="100">
+                <button id="TableTotSum" label="求和 (SUBTOTAL 109)" onAction="TableTotalsFn:sum"/>
+                <button id="TableTotAvg" label="平均值 (SUBTOTAL 101)" onAction="TableTotalsFn:average"/>
+                <button id="TableTotCnt" label="计数 (SUBTOTAL 103)" onAction="TableTotalsFn:count"/>
+                <button id="TableTotCntNum" label="数值计数 (SUBTOTAL 102)" onAction="TableTotalsFn:countNums"/>
+                <button id="TableTotMax" label="最大值 (SUBTOTAL 104)" onAction="TableTotalsFn:max"/>
+                <button id="TableTotMin" label="最小值 (SUBTOTAL 105)" onAction="TableTotalsFn:min"/>
+                <button id="TableTotStd" label="标准偏差 (SUBTOTAL 107)" onAction="TableTotalsFn:stdDev"/>
+                <button id="TableTotVar" label="方差 (SUBTOTAL 110)" onAction="TableTotalsFn:var"/>
+                <button id="TableTotNone" label="无" onAction="TableTotalsFn:none"/>
+              </menu>
             </box>
           </group>
           <group id="GroupTableStyle" label="表格样式">

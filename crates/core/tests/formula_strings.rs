@@ -37,6 +37,7 @@ fn book_with_table_named(name: &str) -> Workbook {
         columns: vec!["Amount".into()],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     wb
 }

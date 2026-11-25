@@ -4159,6 +4159,14 @@ impl<'a> Calc<'a> {
                 }
                 FValue::Array(std::sync::Arc::new(value::Array::new(rows, cols, out_data)))
             }
+        } else if name.eq_ignore_ascii_case("TABLE") {
+            // 动态模拟运算表 `{=TABLE(row_in, col_in)}` 由 `eval_data_tables_in_workbook` 统一求值；
+            // 普通求值阶段保留当前缓存值，避免闪现 `#NAME?`。
+            self.wb
+                .sheets
+                .get(self.cur_sheet)
+                .map(|sh| to_fvalue(&sh.value(self.cur.0, self.cur.1)))
+                .unwrap_or(FValue::Empty)
         } else {
             functions::call_by_id_in(self.ctx, id, name.as_str(), &args, &mut || {
                 if bound.is_some() { FValue::Error(ErrKind::Value) }
@@ -8022,6 +8030,29 @@ fn recalc_dirty_impl(
             eprintln!("  [edit] {n:<12} {c:>7} 次  {t:>7.3}s");
         }
     }
+    if wb.sheets.iter().any(|sh| {
+        sh.arrays.iter().any(|&(anchor, _)| {
+            sh.formula_of(anchor.row, anchor.col).is_some_and(is_table_formula)
+        })
+    }) {
+        let dt_changed = eval_data_tables_in_workbook(wb, None);
+        if !dt_changed.is_empty() {
+            let downstream = deps.closure(&dt_changed);
+            if !downstream.is_empty() {
+                let mut down_order: Vec<deps::CellKey> = downstream.iter().copied().collect();
+                down_order.sort_unstable();
+                let mut calc = Calc::new(wb);
+                calc.scope = Some(&downstream);
+                let mut down_res = Vec::with_capacity(down_order.len());
+                for &(si, r, c) in &down_order {
+                    let v = calc.cell_value(si, r, c);
+                    down_res.push((si, r, c, v));
+                }
+                drop(calc);
+                let _ = apply_dirty_results_local(wb, deps, down_res);
+            }
+        }
+    }
     functions::set_now_snapshot(prev_now);
     wb.mark_recalc_synced();
     Some(total_evaluated)
@@ -8767,6 +8798,26 @@ fn recalc_selected(
             }
         }
     }
+    // 动态模拟运算表 `{=TABLE(row_in, col_in)}` 原生实时求值：修改输入或源公式后自动重算结果表！
+    let dt_changed = eval_data_tables_in_workbook(wb, selected);
+    if !dt_changed.is_empty() {
+        // 若有下游公式依赖模拟运算表结果格，顺手再算一遍这些下游格
+        let g = deps::Deps::build_filtered(wb, selected);
+        let downstream = g.closure(&dt_changed);
+        if !downstream.is_empty() {
+            let mut down_order: Vec<deps::CellKey> = downstream.iter().copied().collect();
+            down_order.sort_unstable();
+            let mut calc = Calc::new(wb);
+            calc.scope = Some(&downstream);
+            let mut down_res = Vec::with_capacity(down_order.len());
+            for &(si, r, c) in &down_order {
+                let v = calc.cell_value(si, r, c);
+                down_res.push((si, r, c, v));
+            }
+            drop(calc);
+            write_back(wb, down_res);
+        }
+    }
     mark!("结束");
     let _ = t_phase;
     if phase {
@@ -8784,6 +8835,260 @@ fn recalc_selected(
         wb.mark_recalc_synced();
     }
     true
+}
+
+/// 快速判断公式文本是否为动态模拟运算表 `=TABLE(...)` / `{=TABLE(...)}`。
+pub fn is_table_formula(f: &str) -> bool {
+    let s = f.trim();
+    let s = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')).unwrap_or(s).trim();
+    let s = s.strip_prefix('=').unwrap_or(s).trim();
+    s.len() >= 7 && s[..6].eq_ignore_ascii_case("TABLE(") && s.ends_with(')')
+}
+
+/// 解析 `=TABLE(row_in, col_in)` 的输入单元格引用。
+pub fn parse_table_formula(f: &str) -> Option<(Option<(u32, u32)>, Option<(u32, u32)>)> {
+    let s = f.trim();
+    let s = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')).unwrap_or(s).trim();
+    let s = s.strip_prefix('=').unwrap_or(s).trim();
+    if s.len() < 7 || !s[..6].eq_ignore_ascii_case("TABLE(") || !s.ends_with(')') {
+        return None;
+    }
+    let inner = &s[6..s.len() - 1];
+    let (lhs, rhs) = match inner.split_once(',') {
+        Some((a, b)) => (a.trim(), b.trim()),
+        None => (inner.trim(), ""),
+    };
+    let parse_ref = |tok: &str| -> Option<Option<(u32, u32)>> {
+        if tok.is_empty() {
+            return Some(None);
+        }
+        let clean: String = tok.chars().filter(|&ch| ch != '$').collect();
+        let bytes = clean.as_bytes();
+        let mut i = 0usize;
+        let mut col = 0u32;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            col = col.checked_mul(26)?.checked_add((bytes[i].to_ascii_uppercase() - b'A') as u32 + 1)?;
+            i += 1;
+        }
+        if i == 0 || i >= bytes.len() || col == 0 || col > 16_384 {
+            return None;
+        }
+        let row: u32 = clean[i..].parse().ok()?;
+        if row == 0 || row > 1_048_576 {
+            return None;
+        }
+        Some(Some((row - 1, col - 1)))
+    };
+    let row_in = parse_ref(lhs)?;
+    let col_in = parse_ref(rhs)?;
+    if row_in.is_none() && col_in.is_none() {
+        return None;
+    }
+    Some((row_in, col_in))
+}
+
+/// 扫描并动态重算工作簿内所有 `{=TABLE(row_in, col_in)}` 模拟运算表区域。
+/// 返回值发生变化的单元格列表，便于调用方刷新下游依赖。
+pub fn eval_data_tables_in_workbook(
+    wb: &mut Workbook,
+    selected: Option<&[bool]>,
+) -> Vec<deps::CellKey> {
+    type TableSpec = (Option<(u32, u32)>, Option<(u32, u32)>);
+    let mut changed: Vec<deps::CellKey> = Vec::new();
+    let n_sheets = wb.sheets.len();
+    for si in 0..n_sheets {
+        if let Some(mask) = selected
+            && !mask.get(si).copied().unwrap_or(false)
+        {
+            continue;
+        }
+        // 1) 优先收集 `sheet.arrays` 中登记的 TABLE 区域，再补扫未登记的相邻 `=TABLE(...)` 单元格。
+        let mut blocks: Vec<((u32, u32, u32, u32), TableSpec)> = Vec::new();
+        let mut covered: HashSet<(u32, u32)> = HashSet::new();
+        {
+            let sh = &wb.sheets[si];
+            for &(anchor, (r1, c1, r2, c2)) in &sh.arrays {
+                if let Some(f) = sh.formula_of(anchor.row, anchor.col)
+                    && let Some(spec) = parse_table_formula(f)
+                {
+                    blocks.push(((r1, c1, r2, c2), spec));
+                    for r in r1..=r2 {
+                        for c in c1..=c2 {
+                            covered.insert((r, c));
+                        }
+                    }
+                }
+            }
+            // 扫描散落未在 sheet.arrays 登记的 `=TABLE(...)` 单元格并按签名聚合矩形
+            let mut loose: HashMap<TableSpec, Vec<(u32, u32)>> = HashMap::new();
+            for (cr, cell) in sh.formula_cells() {
+                let (r, c) = (cr.row, cr.col);
+                if covered.contains(&(r, c)) {
+                    continue;
+                }
+                if let Some(f) = cell.formula.as_deref()
+                    && let Some(spec) = parse_table_formula(f)
+                {
+                    loose.entry(spec).or_default().push((r, c));
+                }
+            }
+            for (spec, pts) in loose {
+                // 按连通分量（4 邻域）分组，防止同表两个独立运算表误合并
+                let pt_set: HashSet<(u32, u32)> = pts.iter().copied().collect();
+                let mut seen: HashSet<(u32, u32)> = HashSet::new();
+                for start in pts {
+                    if !seen.insert(start) {
+                        continue;
+                    }
+                    let mut stack = vec![start];
+                    let (mut r1, mut c1, mut r2, mut c2) = (start.0, start.1, start.0, start.1);
+                    while let Some((cr, cc)) = stack.pop() {
+                        r1 = r1.min(cr);
+                        c1 = c1.min(cc);
+                        r2 = r2.max(cr);
+                        c2 = c2.max(cc);
+                        for (nr, nc) in [
+                            (cr.wrapping_sub(1), cc),
+                            (cr + 1, cc),
+                            (cr, cc.wrapping_sub(1)),
+                            (cr, cc + 1),
+                        ] {
+                            if pt_set.contains(&(nr, nc)) && seen.insert((nr, nc)) {
+                                stack.push((nr, nc));
+                            }
+                        }
+                    }
+                    blocks.push(((r1, c1, r2, c2), spec));
+                }
+            }
+        }
+        if blocks.is_empty() {
+            continue;
+        }
+        for ((r1, c1, r2, c2), (row_in, col_in)) in blocks {
+            let cells_count =
+                (r2.saturating_sub(r1) as u64 + 1) * (c2.saturating_sub(c1) as u64 + 1);
+            if cells_count > 10_000 {
+                continue;
+            }
+            // 读取输入值表头与原始输入单元格（用于求值后无损恢复）
+            let orig_row = row_in.map(|(r, c)| wb.sheets[si].get(r, c).map(|x| x.into_owned()));
+            let orig_col = col_in.map(|(r, c)| wb.sheets[si].get(r, c).map(|x| x.into_owned()));
+            let mut computed: Vec<(u32, u32, crate::model::Value)> =
+                Vec::with_capacity(cells_count as usize);
+
+            match (row_in, col_in) {
+                (Some((rr_in, rc_in)), Some((cr_in, cc_in))) => {
+                    // 双变量模拟运算表：主公式在 (r1-1, c1-1)，行输入值在 (r1-1, c)，列输入值在 (r, c1-1)
+                    if r1 == 0 || c1 == 0 {
+                        continue;
+                    }
+                    let master = (r1 - 1, c1 - 1);
+                    let row_vals: Vec<crate::model::Value> =
+                        (c1..=c2).map(|c| wb.sheets[si].value(r1 - 1, c)).collect();
+                    let col_vals: Vec<crate::model::Value> =
+                        (r1..=r2).map(|r| wb.sheets[si].value(r, c1 - 1)).collect();
+                    for (ri, r) in (r1..=r2).enumerate() {
+                        for (ci, c) in (c1..=c2).enumerate() {
+                            if !wb.sheets[si].formula_of(r, c).is_some_and(is_table_formula) {
+                                continue;
+                            }
+                            wb.sheets[si].set(
+                                rr_in,
+                                rc_in,
+                                Cell { value: row_vals[ci].clone(), formula: None },
+                            );
+                            wb.sheets[si].set(
+                                cr_in,
+                                cc_in,
+                                Cell { value: col_vals[ri].clone(), formula: None },
+                            );
+                            let mut calc = Calc::new(wb);
+                            let v = from_fvalue(&calc.cell_value(si, master.0, master.1));
+                            computed.push((r, c, v));
+                        }
+                    }
+                }
+                (None, Some((cr_in, cc_in))) => {
+                    // 列式单变量：列输入值在 (r, c1-1)，各输出列主公式在 (r1-1, c)
+                    if r1 == 0 || c1 == 0 {
+                        continue;
+                    }
+                    let col_vals: Vec<crate::model::Value> =
+                        (r1..=r2).map(|r| wb.sheets[si].value(r, c1 - 1)).collect();
+                    for (ri, r) in (r1..=r2).enumerate() {
+                        wb.sheets[si].set(
+                            cr_in,
+                            cc_in,
+                            Cell { value: col_vals[ri].clone(), formula: None },
+                        );
+                        let mut calc = Calc::new(wb);
+                        for c in c1..=c2 {
+                            if !wb.sheets[si].formula_of(r, c).is_some_and(is_table_formula) {
+                                continue;
+                            }
+                            let v = from_fvalue(&calc.cell_value(si, r1 - 1, c));
+                            computed.push((r, c, v));
+                        }
+                    }
+                }
+                (Some((rr_in, rc_in)), None) => {
+                    // 行式单变量：行输入值在 (r1-1, c)，各输出行主公式在 (r, c1-1)
+                    if r1 == 0 || c1 == 0 {
+                        continue;
+                    }
+                    let row_vals: Vec<crate::model::Value> =
+                        (c1..=c2).map(|c| wb.sheets[si].value(r1 - 1, c)).collect();
+                    for (ci, c) in (c1..=c2).enumerate() {
+                        wb.sheets[si].set(
+                            rr_in,
+                            rc_in,
+                            Cell { value: row_vals[ci].clone(), formula: None },
+                        );
+                        let mut calc = Calc::new(wb);
+                        for r in r1..=r2 {
+                            if !wb.sheets[si].formula_of(r, c).is_some_and(is_table_formula) {
+                                continue;
+                            }
+                            let v = from_fvalue(&calc.cell_value(si, r, c1 - 1));
+                            computed.push((r, c, v));
+                        }
+                    }
+                }
+                (None, None) => {}
+            }
+
+            // 无损恢复输入单元格（含公式/空单元格）
+            if let (Some((r, c)), Some(orig)) = (row_in, orig_row) {
+                match orig {
+                    Some(cell) => wb.sheets[si].set(r, c, cell),
+                    None => {
+                        wb.sheets[si].remove(r, c);
+                    }
+                }
+            }
+            if let (Some((r, c)), Some(orig)) = (col_in, orig_col) {
+                match orig {
+                    Some(cell) => wb.sheets[si].set(r, c, cell),
+                    None => {
+                        wb.sheets[si].remove(r, c);
+                    }
+                }
+            }
+
+            // 写回结果值，同时保留 `=TABLE(...)` 公式
+            for (r, c, v) in computed {
+                let prev = wb.sheets[si].value(r, c);
+                if prev != v {
+                    changed.push((si, r, c));
+                }
+                if let Some(f) = wb.sheets[si].formula_arc_of(r, c).cloned() {
+                    wb.sheets[si].set(r, c, Cell { value: v, formula: Some(f) });
+                }
+            }
+        }
+    }
+    changed
 }
 
 /// 求单个单元格的值（测试与 UI 用）

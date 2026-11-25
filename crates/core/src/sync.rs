@@ -2694,6 +2694,7 @@ mod tests {
             column_ids: vec![1, 2],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         sh0.charts.push(crate::charts::Chart {
             kind: crate::charts::ChartKind::Column,

@@ -187,6 +187,7 @@ mod tests {
             columns: vec!["姓名".into(), "金额".into()],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         wb.sheets[0].set(0, 0, Cell { value: Value::Text("姓名".into()), formula: None });
         wb.sheets[0].set(1, 0, Cell { value: Value::Text("甲".into()), formula: None });

@@ -4366,6 +4366,7 @@ mod tests {
                 columns: vec!["h0".into(), "h1".into()],
                 header_row: true,
                 totals_row: false,
+                ..Default::default()
             });
             sh.tables_dirty = true;
             sh.filter = Some(crate::sort_filter::Filter::new(0, 0, 2, 1));

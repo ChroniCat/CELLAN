@@ -1204,6 +1204,8 @@ pub(crate) fn tables_fingerprint(tables: &[sheetcore::table::Table]) -> u64 {
         t.range.hash(&mut h);
         t.header_row.hash(&mut h);
         t.totals_row.hash(&mut h);
+        t.style_name.hash(&mut h);
+        t.totals_fns.hash(&mut h);
     }
     h.finish()
 }
@@ -1221,6 +1223,26 @@ pub(crate) fn filter_fingerprint(
     for &c in f.criteria.keys() {
         let mut x = (u64::from(c) << 1) | 2;
         x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        acc ^= x;
+    }
+    for &c in f.date_groups.keys() {
+        let mut x = (u64::from(c) << 2) | 3;
+        x = (x ^ (x >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        acc ^= x;
+    }
+    for &c in f.color_filters.keys() {
+        let mut x = (u64::from(c) << 3) | 5;
+        x = (x ^ (x >> 28)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        acc ^= x;
+    }
+    for &c in f.top_filters.keys() {
+        let mut x = (u64::from(c) << 4) | 7;
+        x = (x ^ (x >> 26)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        acc ^= x;
+    }
+    for &c in f.dynamic_filters.keys() {
+        let mut x = (u64::from(c) << 5) | 11;
+        x = (x ^ (x >> 25)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         acc ^= x;
     }
     Some((f.range, acc))
@@ -1860,6 +1882,7 @@ mod tests {
             column_ids: vec![1, 2],
             header_row: true,
             totals_row: false,
+            ..Default::default()
         });
         let run_frame = |app: &mut SheetApp| {
             let raw = egui::RawInput {

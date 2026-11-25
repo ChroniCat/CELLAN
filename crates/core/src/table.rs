@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Table {
     /// 程序用的名字（不能有空格），公式里写这个
     pub name: String,
@@ -24,7 +24,78 @@ pub struct Table {
     pub header_row: bool,
     /// 末行是不是汇总行
     pub totals_row: bool,
+    /// 表格样式名（OOXML tableStyleInfo/@name，默认 TableStyleMedium2）
+    pub style_name: String,
+    /// 汇总行逐列函数名（OOXML tableColumn/@totalsRowFunction："sum"/"average"/"count"/"countNums"/"max"/"min"/"stdDev"/"var"/"none"）
+    pub totals_fns: Vec<String>,
 }
+
+impl Default for Table {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            display: String::new(),
+            range: (0, 0, 0, 0),
+            columns: Vec::new(),
+            column_ids: Vec::new(),
+            header_row: true,
+            totals_row: false,
+            style_name: "TableStyleMedium2".to_string(),
+            totals_fns: Vec::new(),
+        }
+    }
+}
+
+/// 根据 OOXML TableStyle 名返回 `(表头填充, 表头字色, 偶数条纹, 奇数条纹, 边框色)`
+pub fn table_style_palette(style_name: &str) -> ([u8; 3], [u8; 3], Option<[u8; 3]>, Option<[u8; 3]>, [u8; 3]) {
+    match style_name {
+        "TableStyleMedium7" | "TableStyleMedium14" => (
+            [33, 115, 70], [255, 255, 255], Some([226, 239, 218]), Some([255, 255, 255]), [169, 208, 142],
+        ),
+        "TableStyleMedium3" | "TableStyleMedium10" => (
+            [237, 125, 49], [255, 255, 255], Some([252, 228, 214]), Some([255, 255, 255]), [244, 176, 132],
+        ),
+        "TableStyleMedium1" | "TableStyleLight1" => (
+            [128, 128, 128], [255, 255, 255], Some([242, 242, 242]), Some([255, 255, 255]), [191, 191, 191],
+        ),
+        "TableStyleMedium9" | "TableStyleDark2" => (
+            [31, 56, 100], [255, 255, 255], Some([217, 225, 242]), Some([248, 250, 252]), [142, 169, 219],
+        ),
+        "TableStyleDark4" | "TableStyleMedium4" => (
+            [21, 96, 58], [255, 255, 255], Some([237, 247, 241]), Some([255, 255, 255]), [140, 196, 164],
+        ),
+        _ => (
+            [68, 114, 196], [255, 255, 255], Some([217, 225, 242]), Some([255, 255, 255]), [142, 169, 219],
+        ),
+    }
+}
+
+/// 汇总行函数名映射到 SUBTOTAL 101-110 函数编号
+pub fn totals_fn_code(name: &str) -> Option<u8> {
+    Some(match name {
+        "average" => 101,
+        "countNums" => 102,
+        "count" => 103,
+        "max" => 104,
+        "min" => 105,
+        "stdDev" => 107,
+        "sum" => 109,
+        "var" => 110,
+        _ => return None,
+    })
+}
+
+pub const TOTALS_FN_OPTIONS: &[(&str, &str)] = &[
+    ("none", "无"),
+    ("sum", "求和 (109)"),
+    ("average", "平均值 (101)"),
+    ("count", "计数 (103)"),
+    ("countNums", "数值计数 (102)"),
+    ("max", "最大值 (104)"),
+    ("min", "最小值 (105)"),
+    ("stdDev", "标准偏差 (107)"),
+    ("var", "方差 (110)"),
+];
 
 fn col_label(mut c: u32) -> String {
     let mut s = String::new();
@@ -120,6 +191,19 @@ pub fn parse_table_xml(xml: &str) -> Option<Table> {
         let end = rest.find('"')?;
         Some(unescape(&rest[..end]))
     };
+    let style_name = xml
+        .find("<tableStyleInfo")
+        .and_then(|pos| {
+            let sub = &xml[pos..];
+            let end = sub.find('>')?;
+            let tag = &sub[..end];
+            let npos = tag.find(" name=\"")?;
+            let v = &tag[npos + 7..];
+            let q = v.find('"')?;
+            Some(unescape(&v[..q]))
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "TableStyleMedium2".to_string());
     let mut t = Table {
         name: attr("name").unwrap_or_default(),
         display: attr("displayName").unwrap_or_default(),
@@ -128,15 +212,21 @@ pub fn parse_table_xml(xml: &str) -> Option<Table> {
         column_ids: Vec::new(),
         header_row: attr("headerRowCount").map(|v| v != "0").unwrap_or(true),
         totals_row: attr("totalsRowCount").map(|v| v != "0").unwrap_or(false),
+        style_name,
+        totals_fns: Vec::new(),
     };
     if t.display.is_empty() {
         t.display = t.name.clone();
     }
-    // 列名：<tableColumn ... name="xxx"/> 里的 name，注意 id 在前面
+    // 列名：<tableColumn ... name="xxx" totalsRowFunction="..."/>
     let mut rest = xml;
     while let Some(pos) = rest.find("<tableColumn") {
         let tag_end = rest[pos..].find('>')?;
         let tag = &rest[pos..pos + tag_end];
+        rest = &rest[pos + tag_end..];
+        if tag.starts_with("<tableColumns") {
+            continue;
+        }
         if let Some(npos) = tag.find(" name=\"") {
             let v = &tag[npos + 7..];
             if let Some(q) = v.find('"') {
@@ -150,7 +240,19 @@ pub fn parse_table_xml(xml: &str) -> Option<Table> {
                 t.column_ids.push(id);
             }
         }
-        rest = &rest[pos + tag_end..];
+        let tf = tag
+            .find(" totalsRowFunction=\"")
+            .and_then(|fpos| {
+                let v = &tag[fpos + 20..];
+                let q = v.find('"')?;
+                Some(unescape(&v[..q]))
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "none".to_string());
+        t.totals_fns.push(tf);
+    }
+    if t.totals_fns.iter().all(|s| s == "none") && !t.totals_row {
+        t.totals_fns.clear();
     }
     Some(t)
 }
@@ -230,17 +332,22 @@ pub fn table_xml(t: &Table, id: u32) -> String {
     for (i, name) in t.columns.iter().enumerate() {
         let id = t.column_ids.get(i).copied().unwrap_or(i as u32 + 1);
         if t.totals_row {
-            if i == 0 {
+            let custom_fn = t.totals_fns.get(i).map(|s| s.as_str()).unwrap_or("");
+            if i == 0 && (custom_fn.is_empty() || custom_fn == "none") {
                 cols.push_str(&format!(
                     "<tableColumn id=\"{}\" name=\"{}\" totalsRowLabel=\"总计\"/>",
                     id,
                     esc(name)
                 ));
+            } else if custom_fn == "none" {
+                cols.push_str(&format!("<tableColumn id=\"{}\" name=\"{}\"/>", id, esc(name)));
             } else {
+                let fn_name = if custom_fn.is_empty() { "sum" } else { custom_fn };
                 cols.push_str(&format!(
-                    "<tableColumn id=\"{}\" name=\"{}\" totalsRowFunction=\"sum\"/>",
+                    "<tableColumn id=\"{}\" name=\"{}\" totalsRowFunction=\"{}\"/>",
                     id,
-                    esc(name)
+                    esc(name),
+                    esc(fn_name)
                 ));
             }
         } else {
@@ -257,12 +364,13 @@ pub fn table_xml(t: &Table, id: u32) -> String {
     } else {
         raw_display
     };
+    let style_name = if t.style_name.is_empty() { "TableStyleMedium2" } else { t.style_name.as_str() };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
 <table xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" id=\"{id}\" \
 name=\"{name}\" displayName=\"{display}\" ref=\"{range}\" totalsRowShown=\"{totals}\"{totals_count}>\
 <autoFilter ref=\"{filter_range}\"/><tableColumns count=\"{count}\">{cols}</tableColumns>\
-<tableStyleInfo name=\"TableStyleMedium2\" showFirstColumn=\"0\" showLastColumn=\"0\" \
+<tableStyleInfo name=\"{style}\" showFirstColumn=\"0\" showLastColumn=\"0\" \
 showRowStripes=\"1\" showColumnStripes=\"0\"/></table>",
         name = esc(&t.name),
         totals = if t.totals_row { 1 } else { 0 },
@@ -275,7 +383,8 @@ showRowStripes=\"1\" showColumnStripes=\"0\"/></table>",
         display = esc(&display_fixed),
         range = a1(t.range),
         count = count,
-        cols = cols
+        cols = cols,
+        style = esc(style_name)
     )
 }
 
@@ -1650,6 +1759,7 @@ mod sync_tests {
             column_ids: Vec::new(),
             header_row: true,
             totals_row: false,
+            ..Default::default()
         };
         attach(&path, &wb.sheets[0].name, std::slice::from_ref(&t)).unwrap();
         assert!(!zip_has(&path, "xl/tables/table").is_empty(), "attach 后应有 table 部件");
@@ -1687,6 +1797,7 @@ fn table_display_name_looking_like_a_cell_reference_gets_underscore() {
         column_ids: Vec::new(),
         header_row: true,
         totals_row: false,
+        ..Default::default()
     };
     let xml = crate::table::table_xml(&t, 1);
     assert!(
@@ -1706,6 +1817,7 @@ fn table_display_name_that_is_not_a_cell_reference_is_kept() {
         column_ids: Vec::new(),
         header_row: true,
         totals_row: false,
+        ..Default::default()
     };
     let xml = crate::table::table_xml(&t, 1);
     assert!(xml.contains("displayName=\"Sales\""), "{xml}");
@@ -1736,6 +1848,7 @@ fn wave5_rename_table_column_keeps_numeric_slabs_unpromoted_and_rewrites_structu
         column_ids: vec![1, 2],
         header_row: true,
         totals_row: false,
+        ..Default::default()
     });
     let mut summary = crate::model::Sheet::new("汇总");
     summary.set(

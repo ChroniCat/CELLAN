@@ -373,6 +373,19 @@ pub struct MetaEdit {
     pub notes: Vec<((u32, u32), Option<crate::notes::Note>, Option<crate::notes::Note>)>,
     pub ignored_errors: Vec<((u32, u32), bool, bool)>,
     pub cf: Option<(crate::cf::CfSheet, crate::cf::CfSheet)>,
+    pub filter: Option<(
+        Option<crate::sort_filter::Filter>,
+        Option<crate::sort_filter::Filter>,
+        crate::layout::HiddenIndices,
+        crate::layout::HiddenIndices,
+    )>,
+    pub tables: Option<(Vec<crate::table::Table>, Vec<crate::table::Table>)>,
+    pub outline: Option<(
+        std::collections::HashMap<u32, u8>,
+        std::collections::HashMap<u32, u8>,
+        std::collections::HashMap<u32, u8>,
+        std::collections::HashMap<u32, u8>,
+    )>,
 }
 
 impl MetaEdit {
@@ -384,6 +397,9 @@ impl MetaEdit {
             && self.notes.is_empty()
             && self.ignored_errors.is_empty()
             && self.cf.is_none()
+            && self.filter.is_none()
+            && self.tables.is_none()
+            && self.outline.is_none()
     }
 
     fn apply(&self, sheets: &mut [Sheet], redo: bool) {
@@ -462,6 +478,24 @@ impl MetaEdit {
         if let Some((before, after)) = &self.cf {
             sh.cf = if redo { after.clone() } else { before.clone() };
             sh.cf_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if let Some((fb, fa, hb, ha)) = &self.filter {
+            sh.filter = if redo { fa.clone() } else { fb.clone() };
+            sh.hidden_rows = if redo { ha.clone() } else { hb.clone() };
+            sh.filter_dirty = true;
+            sh.layout_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if let Some((tb, ta)) = &self.tables {
+            sh.tables = if redo { ta.clone() } else { tb.clone() };
+            sh.tables_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if let Some((rb, ra, cb, ca)) = &self.outline {
+            sh.row_levels = if redo { ra.clone() } else { rb.clone() };
+            sh.col_levels = if redo { ca.clone() } else { cb.clone() };
+            sh.layout_dirty = true;
             sh.bump_display_style_revision();
         }
     }

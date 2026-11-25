@@ -81,35 +81,134 @@ pub fn subtotal_workbook(
     try_subtotal_workbook(wb, sheet_idx, region, key_col, value_cols, f).unwrap_or_default()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubtotalOpts {
+    /// 替换当前分类汇总（删掉已有 SUBTOTAL 汇总行后再重算）
+    pub replace_existing: bool,
+    /// 每组数据分页（在每条小计行后插入手动水平分页符）
+    pub page_break_between_groups: bool,
+    /// 汇总结果显示在数据下方（默认 true）
+    pub summary_below: bool,
+}
+
+impl Default for SubtotalOpts {
+    fn default() -> Self {
+        Self {
+            replace_existing: true,
+            page_break_between_groups: false,
+            summary_below: true,
+        }
+    }
+}
+
+fn is_subtotal_summary_row(sheet: &Sheet, r: u32, c1: u32, c2: u32) -> bool {
+    (c1..=c2).any(|c| {
+        sheet.formula_of(r, c)
+            .is_some_and(|f| f.to_ascii_uppercase().contains("SUBTOTAL("))
+    })
+}
+
 pub fn try_subtotal_workbook(
     wb: &mut Workbook, sheet_idx: usize, region: (u32, u32, u32, u32),
     key_col: u32, value_cols: &[u32], f: SubFn,
 ) -> Result<SubtotalReport, &'static str> {
+    try_subtotal_workbook_opts(wb, sheet_idx, region, key_col, value_cols, f, SubtotalOpts {
+        replace_existing: false,
+        page_break_between_groups: false,
+        summary_below: true,
+    })
+}
+
+pub fn try_subtotal_workbook_opts(
+    wb: &mut Workbook,
+    sheet_idx: usize,
+    mut region: (u32, u32, u32, u32),
+    key_col: u32,
+    value_cols: &[u32],
+    f: SubFn,
+    opts: SubtotalOpts,
+) -> Result<SubtotalReport, &'static str> {
     let Some(sheet) = wb.sheets.get(sheet_idx) else { return Ok(SubtotalReport::default()) };
-    let (r1, c1, r2, c2) = region;
+    let (r1, c1, mut r2, c2) = region;
     if r2 <= r1 || key_col < c1 || key_col > c2 {
         return Ok(SubtotalReport::default());
     }
     const LAST_ROW: u32 = 1_048_575;
     const OVERFLOW: &str = "分类汇总会将数据或格式移出工作表的最后一行";
     if r2 >= LAST_ROW { return Err(OVERFLOW); }
-    // 扫描分组（原始坐标）
-    let mut groups: Vec<(u32, u32)> = Vec::new();
-    let mut start = r1 + 1;
-    let mut cur = sheet.value(r1 + 1, key_col).display();
-    for r in (r1 + 2)..=r2 {
-        let v = sheet.value(r, key_col).display();
-        if v != cur {
-            groups.push((start, r - 1));
-            start = r;
-            cur = v;
+
+    // 替换当前分类汇总：先移除区域内已有的 SUBTOTAL 汇总行并重置行分级
+    if opts.replace_existing {
+        let mut old_rows: Vec<u32> = ((r1 + 1)..=r2)
+            .filter(|&r| is_subtotal_summary_row(sheet, r, c1, c2))
+            .collect();
+        if !old_rows.is_empty() {
+            old_rows.sort_unstable();
+            for &rr in old_rows.iter().rev() {
+                crate::structural::apply_structural_wb(
+                    wb,
+                    sheet_idx,
+                    &crate::structural::Structural::DeleteRows { at: rr, n: 1 },
+                );
+                r2 = r2.saturating_sub(1);
+            }
+            if let Some(sh) = wb.sheets.get_mut(sheet_idx) {
+                for r in (r1 + 1)..=r2 {
+                    sh.row_levels.remove(&r);
+                }
+            }
+            region.2 = r2;
+            if r2 <= r1 {
+                return Ok(SubtotalReport::default());
+            }
         }
     }
-    groups.push((start, r2));
+
+    let sheet = &wb.sheets[sheet_idx];
+    let has_existing_levels = !opts.replace_existing
+        && ((r1 + 1)..=r2).any(|r| sheet.row_levels.contains_key(&r));
+
+    // 扫描分组（原始坐标）；嵌套模式下跳过已有 SUBTOTAL 汇总行
+    let mut groups: Vec<(u32, u32)> = Vec::new();
+    let mut cur_start: Option<u32> = None;
+    let mut cur_val = String::new();
+    let mut last_detail = r1;
+    for r in (r1 + 1)..=r2 {
+        if has_existing_levels && is_subtotal_summary_row(sheet, r, c1, c2) {
+            if let Some(st) = cur_start.take() {
+                groups.push((st, last_detail));
+            }
+            continue;
+        }
+        let v = sheet.value(r, key_col).display();
+        match cur_start {
+            None => {
+                cur_start = Some(r);
+                cur_val = v;
+                last_detail = r;
+            }
+            Some(st) => {
+                if v != cur_val {
+                    groups.push((st, last_detail));
+                    cur_start = Some(r);
+                    cur_val = v;
+                }
+                last_detail = r;
+            }
+        }
+    }
+    if let Some(st) = cur_start {
+        groups.push((st, last_detail));
+    }
+    if groups.is_empty() {
+        return Ok(SubtotalReport::default());
+    }
     let n = groups.len();
     let mut insertions: Vec<_> = groups.iter().map(|&(_, end)| end + 1).collect();
-    insertions.push(r2 + 1);
-    let total_at = r2 + n as u32 + 1;
+    if !has_existing_levels {
+        insertions.push(r2 + 1);
+    }
+    let total_at = r2 + insertions.len() as u32;
     if total_at > LAST_ROW { return Err(OVERFLOW); }
     let last_safe = LAST_ROW - insertions.len() as u32;
     if tail_occupied(sheet, last_safe)
@@ -122,15 +221,17 @@ pub fn try_subtotal_workbook(
     }
     crate::structural::insert_subtotal_rows(wb, sheet_idx, &insertions);
     let sheet = &mut wb.sheets[sheet_idx];
+    let mut added_breaks: Vec<u32> = Vec::new();
     for (i, (gs, ge)) in groups.iter().enumerate() {
         let shift = i as u32;
         let fgs = gs + shift;
         let fge = ge + shift;
         let sub_row = fge + 1;
         let name = sheet.value(fgs, key_col).display();
+        // 写入分组列 `key_col`，绝不覆写无关首列 `c1`！
         sheet.set(
             sub_row,
-            c1,
+            key_col,
             Cell {
                 value: Value::Text(format!("{name} 汇总").into()),
                 formula: None,
@@ -161,34 +262,54 @@ pub fn try_subtotal_workbook(
                 },
             );
         }
-        // 明细打 1 级（Excel 的 summaryBelow 约定：汇总行在明细下方）
+        // 明细分级：嵌套汇总时保留原有层级并递增 1（上限 7），避免抹掉外层分组
         for r in fgs..=fge {
-            sheet.row_levels.insert(r, 1);
+            let cur_lv = sheet.row_levels.get(&r).copied().unwrap_or(0);
+            let next_lv = if has_existing_levels { (cur_lv + 1).min(7) } else { 1 };
+            sheet.row_levels.insert(r, next_lv);
+        }
+        if has_existing_levels {
+            let cur_lv = sheet.row_levels.get(&sub_row).copied().unwrap_or(0);
+            sheet.row_levels.insert(sub_row, cur_lv.max(1));
+        }
+        if opts.page_break_between_groups && i + 1 < n {
+            added_breaks.push(sub_row + 1);
         }
     }
-    // 总计行
-    sheet.set(
-        total_at,
-        c1,
-        Cell {
-            value: Value::Text("总计".into()),
-            formula: None,
-        },
-    );
-    for c in value_cols.iter().copied() {
-        if c < c1 || c > c2 {
-            continue;
+    if !added_breaks.is_empty() {
+        for br in added_breaks {
+            if !sheet.page.row_breaks.contains(&br) {
+                sheet.page.row_breaks.push(br);
+            }
         }
-        let col = crate::model::col_label(c);
-        let formula = format!("=SUBTOTAL({},{col}{}:{col}{total_at})", f.code(), r1 + 2);
+        sheet.page.row_breaks.sort_unstable();
+        sheet.page_dirty = true;
+    }
+    // 非嵌套时添加总计行
+    if !has_existing_levels {
         sheet.set(
             total_at,
-            c,
+            key_col,
             Cell {
-                value: Value::Empty,
-                formula: Some(formula.into()),
+                value: Value::Text("总计".into()),
+                formula: None,
             },
         );
+        for c in value_cols.iter().copied() {
+            if c < c1 || c > c2 {
+                continue;
+            }
+            let col = crate::model::col_label(c);
+            let formula = format!("=SUBTOTAL({},{col}{}:{col}{total_at})", f.code(), r1 + 2);
+            sheet.set(
+                total_at,
+                c,
+                Cell {
+                    value: Value::Empty,
+                    formula: Some(formula.into()),
+                },
+            );
+        }
     }
     sheet.edited = true;
     sheet.layout_dirty = true;

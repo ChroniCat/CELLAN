@@ -70,6 +70,189 @@ pub fn linear(xs: &[f64], ys: &[f64], periods: usize) -> Option<Forecast> {
     })
 }
 
+/// Holt-Winters 加法 ETS（指数平滑 + 趋势 + 自动/指定季节周期 + 置信区间上下界）
+#[derive(Clone, Debug, Default)]
+pub struct EtsForecast {
+    pub fitted: Vec<f64>,
+    pub future: Vec<f64>,
+    pub lower: Vec<f64>,
+    pub upper: Vec<f64>,
+    pub alpha: f64,
+    pub beta: f64,
+    pub gamma: f64,
+    /// 检测或指定的季节周期（1 = 无季节性，走 Holt 双指数平滑）
+    pub season_len: usize,
+    pub sigma: f64,
+    pub rmse: f64,
+    pub mae: f64,
+    pub r2: f64,
+}
+
+/// 通过自相关自动探测季节周期（如 4 季度、7 天、12 个月）
+pub fn detect_seasonality(ys: &[f64]) -> usize {
+    let n = ys.len();
+    if n < 8 {
+        return 1;
+    }
+    let mean = ys.iter().sum::<f64>() / n as f64;
+    // 去线性趋势后计算自相关
+    let xs: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let detrended: Vec<f64> = if let Some(lin) = linear(&xs, ys, 0) {
+        ys.iter().zip(&lin.fitted).map(|(y, f)| y - f).collect()
+    } else {
+        ys.iter().map(|y| y - mean).collect()
+    };
+    let denom: f64 = detrended.iter().map(|v| v * v).sum();
+    if denom <= 1e-12 {
+        return 1;
+    }
+    let max_lag = (n / 2).min(24);
+    let mut best_lag = 1usize;
+    let mut best_acf = 0.35f64;
+    for lag in 2..=max_lag {
+        let mut num = 0.0;
+        for i in 0..(n - lag) {
+            num += detrended[i] * detrended[i + lag];
+        }
+        let acf = num / denom;
+        if acf > best_acf {
+            best_acf = acf;
+            best_lag = lag;
+        }
+    }
+    best_lag
+}
+
+fn eval_hw_additive(
+    ys: &[f64],
+    alpha: f64,
+    beta: f64,
+    gamma: f64,
+    season: usize,
+    periods: usize,
+) -> (Vec<f64>, Vec<f64>, f64, f64) {
+    let n = ys.len();
+    let mut fitted = Vec::with_capacity(n);
+    if season <= 1 || n < season * 2 {
+        // Holt 双指数平滑 (level + trend)
+        let mut level = ys[0];
+        let mut trend = if n >= 2 { ys[1] - ys[0] } else { 0.0 };
+        fitted.push(ys[0]);
+        let mut sse = 0.0;
+        let mut sae = 0.0;
+        for &y in &ys[1..] {
+            let pred = level + trend;
+            fitted.push(pred);
+            let err = y - pred;
+            sse += err * err;
+            sae += err.abs();
+            let prev_level = level;
+            level = alpha * y + (1.0 - alpha) * pred;
+            trend = beta * (level - prev_level) + (1.0 - beta) * trend;
+        }
+        let future = (1..=periods).map(|h| level + trend * h as f64).collect();
+        return (fitted, future, sse, sae);
+    }
+    // Holt-Winters 加法季节性初始化
+    let m = season;
+    let avg1 = ys[..m].iter().sum::<f64>() / m as f64;
+    let avg2 = ys[m..2 * m].iter().sum::<f64>() / m as f64;
+    let mut level = avg1;
+    let mut trend = (avg2 - avg1) / m as f64;
+    let mut seasonal: Vec<f64> = (0..m).map(|i| ys[i] - avg1).collect();
+    let mut sse = 0.0;
+    let mut sae = 0.0;
+    for (t, &y) in ys.iter().enumerate() {
+        let s_idx = t % m;
+        let pred = level + trend + seasonal[s_idx];
+        fitted.push(pred);
+        let err = y - pred;
+        if t >= m {
+            sse += err * err;
+            sae += err.abs();
+        }
+        let prev_level = level;
+        level = alpha * (y - seasonal[s_idx]) + (1.0 - alpha) * (level + trend);
+        trend = beta * (level - prev_level) + (1.0 - beta) * trend;
+        seasonal[s_idx] = gamma * (y - level) + (1.0 - gamma) * seasonal[s_idx];
+    }
+    let future = (1..=periods)
+        .map(|h| level + trend * h as f64 + seasonal[(n + h - 1) % m])
+        .collect();
+    (fitted, future, sse, sae)
+}
+
+/// 执行 Holt-Winters / ETS 时间序列预测（自动选择最优平滑参数与季节周期，并给出置信上下界）。
+pub fn ets(ys: &[f64], periods: usize, season_len: Option<usize>, confidence: f64) -> Option<EtsForecast> {
+    let n = ys.len();
+    if n < 2 {
+        return None;
+    }
+    let season = match season_len {
+        Some(0) => detect_seasonality(ys),
+        Some(s) if s <= 1 || n < s * 2 => 1,
+        Some(s) => s,
+        None => detect_seasonality(ys),
+    };
+    let mut best = (f64::INFINITY, 0.3, 0.1, 0.1);
+    let alphas = [0.1, 0.25, 0.4, 0.6, 0.8];
+    let betas = [0.0, 0.1, 0.25, 0.5];
+    let gammas: &[f64] = if season > 1 { &[0.05, 0.2, 0.4, 0.6] } else { &[0.0] };
+    for &a in &alphas {
+        for &b in &betas {
+            for &g in gammas {
+                let (_, _, sse, _) = eval_hw_additive(ys, a, b, g, season, 0);
+                if sse.is_finite() && sse < best.0 {
+                    best = (sse, a, b, g);
+                }
+            }
+        }
+    }
+    let (_, alpha, beta, gamma) = best;
+    let (fitted, future, sse, sae) = eval_hw_additive(ys, alpha, beta, gamma, season, periods);
+    let eval_n = if season > 1 && n > season { n - season } else { n.saturating_sub(1).max(1) };
+    let rmse = (sse / eval_n as f64).sqrt();
+    let mae = sae / eval_n as f64;
+    let dof = eval_n.saturating_sub(2).max(1) as f64;
+    let sigma = (sse / dof).sqrt();
+    let mean = ys.iter().sum::<f64>() / n as f64;
+    let ss_tot: f64 = ys.iter().map(|y| (y - mean) * (y - mean)).sum();
+    let ss_all: f64 = ys.iter().zip(&fitted).map(|(y, f)| (y - f) * (y - f)).sum();
+    let r2 = if ss_tot.abs() < f64::EPSILON { 1.0 } else { (1.0 - ss_all / ss_tot).clamp(-1.0, 1.0) };
+    let z = if confidence >= 0.99 {
+        2.576
+    } else if confidence >= 0.95 {
+        1.96
+    } else if confidence >= 0.90 {
+        1.645
+    } else {
+        1.282
+    };
+    let mut lower = Vec::with_capacity(periods);
+    let mut upper = Vec::with_capacity(periods);
+    for (i, &val) in future.iter().enumerate() {
+        let h = (i + 1) as f64;
+        // 多步预测误差随步长扩展
+        let half = z * sigma * (1.0 + (h - 1.0) * (alpha * alpha + beta * beta)).sqrt();
+        lower.push(val - half);
+        upper.push(val + half);
+    }
+    Some(EtsForecast {
+        fitted,
+        future,
+        lower,
+        upper,
+        alpha,
+        beta,
+        gamma,
+        season_len: season,
+        sigma,
+        rmse,
+        mae,
+        r2,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -268,7 +268,7 @@ fn dense_multi_sort_uses_the_stable_multi_key_permutation_for_undo() {
     let (_,_,order) = compact.permutation();
     assert_eq!(&order[..3], &[4,14,24]);
     drop(compact);
-    app.run_reorder(rect,Operation::Multi { keys,header:false });
+    app.run_reorder(rect,Operation::Multi { keys,header:false,horizontal:false,styles:None });
     let start = std::time::Instant::now();
     while app.tasks.reorder.is_some() {
         app.poll_reorder();
@@ -365,10 +365,13 @@ pub(super) enum Operation {
     Multi {
         keys: Vec<data_tools::SortKey>,
         header: bool,
+        horizontal: bool,
+        styles: Option<std::sync::Arc<sheetcore::style::StyleTable>>,
     },
     Dedup {
         cols: Vec<u32>,
         header: bool,
+        total_data_rows: usize,
     },
 }
 
@@ -413,11 +416,19 @@ impl Operation {
                     true,
                 )
             }
-            Self::Multi { keys, header } => {
+            Self::Multi { keys, header, horizontal, styles } => {
                 sort_filter::validate_sort_region(sheet, rect)?;
-                data_tools::plan_sort_multi(sheet, index, rect, keys, *header)
+                data_tools::plan_sort_multi_with_styles(
+                    sheet,
+                    styles.as_deref(),
+                    index,
+                    rect,
+                    keys,
+                    *header,
+                    *horizontal,
+                )
             }
-            Self::Dedup { cols, header } => Ok(data_tools::plan_remove_duplicates(
+            Self::Dedup { cols, header, .. } => Ok(data_tools::plan_remove_duplicates(
                 sheet, index, rect, cols, *header,
             )),
         }
@@ -431,9 +442,18 @@ impl Operation {
                 if *asc { "升序" } else { "降序" }
             ),
             Self::Columns { row, .. } => format!("已按第 {} 行排序（重排列）", row + 1),
-            Self::Multi { keys, .. } => format!("已按 {} 个键排序（{} 行移动）", keys.len(), count),
+            Self::Multi { keys, horizontal, .. } => {
+                if *horizontal {
+                    format!("已按 {} 个行键水平排序（{} 列移动）", keys.len(), count)
+                } else {
+                    format!("已按 {} 个键排序（{} 行移动）", keys.len(), count)
+                }
+            }
             Self::Dedup { .. } if count == 0 => "没有重复行".into(),
-            Self::Dedup { .. } => format!("删除了 {count} 行重复"),
+            Self::Dedup { total_data_rows, .. } => {
+                let kept = total_data_rows.saturating_sub(count);
+                format!("找到并删除了 {count} 个重复值，保留了 {kept} 个唯一值")
+            }
         }
     }
 }
@@ -778,8 +798,31 @@ impl SheetApp {
                         let header = sort_filter::has_header_col(&snapshot,r1,c1,r2,c2);
                         data_tools::CompactSort::plan(&snapshot,index,(r1,c1 + u32::from(header),r2,c2),*row,*asc,true)?
                     }
-                    Operation::Multi { keys, header } => {
-                        sort_filter::validate_sort_region(&snapshot,rect)?;
+                    Operation::Multi { keys, header, horizontal, styles } => {
+                        sort_filter::validate_sort_region(&snapshot, rect)?;
+                        let needs_rich = *horizontal
+                            || styles.is_some()
+                            || keys.iter().any(|k| {
+                                !k.ignore_case
+                                    || matches!(
+                                        k.mode,
+                                        data_tools::SortMode::FillColor(_)
+                                            | data_tools::SortMode::FontColor(_)
+                                    )
+                            });
+                        if needs_rich {
+                            let changes = data_tools::plan_sort_multi_with_styles(
+                                &snapshot,
+                                styles.as_deref(),
+                                index,
+                                rect,
+                                keys,
+                                *header,
+                                *horizontal,
+                            )?;
+                            changes.apply(&mut prepared);
+                            return Ok((snapshot, prepared, PreparedChanges::Cells(changes)));
+                        }
                         match data_tools::plan_large_sort_multi(&snapshot,index,rect,keys,*header)? {
                             data_tools::MultiSortPlan::Compact(order) => Some(order),
                             data_tools::MultiSortPlan::Cells(changes) => {

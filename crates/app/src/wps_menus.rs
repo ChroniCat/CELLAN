@@ -89,6 +89,11 @@ pub(crate) struct GotoDlgState {
     pub tab: u8, // 0 = 定位，1 = 定位条件
     pub target_ref: String,
     pub special: SpecialTarget,
+    /// 公式/常量子类型过滤（数字/文本/逻辑值/错误值）
+    pub sub_numbers: bool,
+    pub sub_text: bool,
+    pub sub_bools: bool,
+    pub sub_errors: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2168,10 +2173,22 @@ impl SheetApp {
             tab,
             target_ref: cell_name(self.sel.0, self.sel.1),
             special: SpecialTarget::Blanks,
+            sub_numbers: true,
+            sub_text: true,
+            sub_bools: true,
+            sub_errors: true,
         });
     }
 
     pub(crate) fn select_special(&mut self, target: SpecialTarget) {
+        self.select_special_with_subtypes(target, (true, true, true, true));
+    }
+
+    pub(crate) fn select_special_with_subtypes(
+        &mut self,
+        target: SpecialTarget,
+        subs: (bool, bool, bool, bool),
+    ) {
         self.commit_edit(None);
         self.nav_rect = None;
         let si = self.sheet_idx;
@@ -2283,10 +2300,35 @@ impl SheetApp {
             .iter()
             .map(|&(r1, c1, r2, c2)| u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1))
             .fold(0u64, u64::saturating_add);
-        if target != SpecialTarget::VisibleCells && total_area > 500_000 {
+        let supports_sparse = matches!(
+            target,
+            SpecialTarget::VisibleCells
+                | SpecialTarget::Formulas
+                | SpecialTarget::Constants
+                | SpecialTarget::Errors
+                | SpecialTarget::Comments
+                | SpecialTarget::CondFormats
+                | SpecialTarget::DataValidation
+        );
+        if !supports_sparse && total_area > 500_000 {
             self.status = "搜索范围超过 50 万格，请先框选需要定位的区域".into();
             return;
         }
+        let in_search = |r: u32, c: u32| -> bool {
+            search_rects
+                .iter()
+                .any(|&(r1, c1, r2, c2)| r >= r1 && r <= r2 && c >= c1 && c <= c2)
+        };
+        let (sub_num, sub_txt, sub_bool, sub_err) = subs;
+        let matches_sub = |v: &Value| -> bool {
+            match v {
+                Value::Number(_) => sub_num,
+                Value::Text(_) => sub_txt,
+                Value::Bool(_) => sub_bool,
+                Value::Error(_) => sub_err,
+                Value::Empty => sub_num && sub_txt && sub_bool && sub_err,
+            }
+        };
 
         let in_cf = |r: u32, c: u32| -> bool {
             sh.cf.blocks.iter().any(|blk| {
@@ -2307,6 +2349,19 @@ impl SheetApp {
 
         let mut count = 0usize;
         let mut rects: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let pack_points = |pts: &mut Vec<(u32, u32)>, out: &mut Vec<(u32, u32, u32, u32)>| {
+            pts.sort_unstable();
+            pts.dedup();
+            for &(r, c) in pts.iter() {
+                if let Some(last) = out.last_mut() {
+                    if last.0 == r && last.2 == r && last.3.saturating_add(1) == c {
+                        last.3 = c;
+                        continue;
+                    }
+                }
+                out.push((r, c, r, c));
+            }
+        };
         if target == SpecialTarget::VisibleCells {
             for &(r1, c1, r2, c2) in &search_rects {
                 // 同时跳过筛选隐藏行、手动隐藏行与隐藏列
@@ -2349,26 +2404,91 @@ impl SheetApp {
                     }
                 }
             }
+        } else if matches!(
+            target,
+            SpecialTarget::Formulas
+                | SpecialTarget::Constants
+                | SpecialTarget::Errors
+                | SpecialTarget::Comments
+        ) {
+            let mut pts: Vec<(u32, u32)> = Vec::new();
+            match target {
+                SpecialTarget::Formulas => {
+                    for (cr, cell) in sh.formula_cells() {
+                        if in_search(cr.row, cr.col) && matches_sub(&cell.value) {
+                            pts.push((cr.row, cr.col));
+                        }
+                    }
+                }
+                SpecialTarget::Constants => {
+                    for (cr, cell) in sh.iter() {
+                        if cell.formula.is_none()
+                            && !matches!(cell.value, Value::Empty)
+                            && in_search(cr.row, cr.col)
+                            && matches_sub(&cell.value)
+                        {
+                            pts.push((cr.row, cr.col));
+                        }
+                    }
+                }
+                SpecialTarget::Errors => {
+                    for (cr, cell) in sh.iter() {
+                        if matches!(cell.value, Value::Error(_)) && in_search(cr.row, cr.col) {
+                            pts.push((cr.row, cr.col));
+                        }
+                    }
+                }
+                SpecialTarget::Comments => {
+                    for cr in sh.notes.keys() {
+                        if in_search(cr.row, cr.col) {
+                            pts.push((cr.row, cr.col));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            count = pts.len();
+            pack_points(&mut pts, &mut rects);
+        } else if matches!(target, SpecialTarget::CondFormats | SpecialTarget::DataValidation) {
+            let mut raw_rects: Vec<(u32, u32, u32, u32)> = Vec::new();
+            let iter_rects: Vec<(u32, u32, u32, u32)> = if target == SpecialTarget::CondFormats {
+                sh.cf
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.ranges.iter().copied())
+                    .collect()
+            } else {
+                sh.dv
+                    .iter()
+                    .flat_map(|d| d.ranges.iter().copied())
+                    .collect()
+            };
+            for (a1, b1, a2, b2) in iter_rects {
+                for &(sr1, sc1, sr2, sc2) in &search_rects {
+                    let ir1 = a1.max(sr1);
+                    let ic1 = b1.max(sc1);
+                    let ir2 = a2.min(sr2);
+                    let ic2 = b2.min(sc2);
+                    if ir1 <= ir2 && ic1 <= ic2 {
+                        raw_rects.push((ir1, ic1, ir2, ic2));
+                        count = count.saturating_add(
+                            (ir2 - ir1 + 1) as usize * (ic2 - ic1 + 1) as usize,
+                        );
+                    }
+                }
+            }
+            rects = raw_rects;
         } else {
+            let _ = (&in_cf, &in_dv);
             for &(r1, c1, r2, c2) in &search_rects {
                 for r in r1..=r2 {
                     let mut run_start: Option<u32> = None;
                     for c in c1..=c2 {
                         let cell = sh.get(r, c);
                         let hit = match target {
-                            SpecialTarget::Formulas => cell.is_some_and(|x| x.formula.is_some()),
-                            SpecialTarget::Constants => cell.is_some_and(|x| {
-                                x.formula.is_none() && !matches!(x.value, Value::Empty)
-                            }),
                             SpecialTarget::Blanks => cell.is_none_or(|x| {
                                 x.formula.is_none() && matches!(x.value, Value::Empty)
                             }),
-                            SpecialTarget::Errors => {
-                                cell.is_some_and(|x| matches!(x.value, Value::Error(_)))
-                            }
-                            SpecialTarget::Comments => sh.notes.contains_key(&CellRef::new(r, c)),
-                            SpecialTarget::CondFormats => in_cf(r, c),
-                            SpecialTarget::DataValidation => in_dv(r, c),
                             SpecialTarget::RowDifferences => {
                                 let base = sh.value(r, active_c);
                                 sh.value(r, c) != base
@@ -2483,6 +2603,17 @@ impl SheetApp {
                         cols[1].radio_value(&mut st.special, t, t.label());
                     }
                 });
+                if matches!(st.special, SpecialTarget::Formulas | SpecialTarget::Constants) {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("子类型:").size(11.5).color(ui_kit::TEXT_WEAK));
+                        ui.checkbox(&mut st.sub_numbers, "数字");
+                        ui.checkbox(&mut st.sub_text, "文本");
+                        ui.checkbox(&mut st.sub_bools, "逻辑值");
+                        ui.checkbox(&mut st.sub_errors, "错误值");
+                    });
+                }
             }
             ui_kit::footer(ui, |ui| {
                 if ui_kit::primary_button(ui, "确定").clicked() {
@@ -2503,7 +2634,10 @@ impl SheetApp {
             self.goto_name();
             close = true;
         } else if let Some(sp) = exec_special {
-            self.select_special(sp);
+            self.select_special_with_subtypes(
+                sp,
+                (st.sub_numbers, st.sub_text, st.sub_bools, st.sub_errors),
+            );
             close = true;
         }
         if open && !close {
@@ -3107,51 +3241,37 @@ impl SheetApp {
             return;
         };
         let (r1, c1, r2, c2) = t.range;
-        let (hdr_fill, hdr_fg, stripe_even, stripe_odd, border_col) = match theme {
-            "TableThemeGreen" => (
-                [33u8, 115u8, 70u8],
-                [255u8, 255, 255],
-                Some([226u8, 239, 218]),
-                Some([255u8, 255, 255]),
-                [169u8, 208, 142],
-            ),
-            "TableThemeOrange" => (
-                [237u8, 125u8, 49u8],
-                [255u8, 255, 255],
-                Some([252u8, 228, 214]),
-                Some([255u8, 255, 255]),
-                [244u8, 176, 132],
-            ),
-            "TableThemeGray" => (
-                [128u8, 128u8, 128u8],
-                [255u8, 255, 255],
-                Some([242u8, 242, 242]),
-                Some([255u8, 255, 255]),
-                [191u8, 191, 191],
-            ),
-            "TableThemeNavy" => (
-                [31u8, 56u8, 100u8],
-                [255u8, 255, 255],
-                Some([217u8, 225, 242]),
-                Some([248u8, 250, 252]),
-                [142u8, 169, 219],
-            ),
-            "TableThemeForest" => (
-                [21u8, 96u8, 58u8],
-                [255u8, 255, 255],
-                Some([237u8, 247, 241]),
-                Some([255u8, 255, 255]),
-                [140u8, 196, 164],
-            ),
-            _ => (
-                // TableThemeBlue (商务蓝)
-                [68u8, 114u8, 196u8],
-                [255u8, 255, 255],
-                Some([217u8, 225, 242]),
-                Some([255u8, 255, 255]),
-                [180u8, 198, 231],
-            ),
+        let style_name = match theme {
+            "TableThemeGreen" => "TableStyleMedium7",
+            "TableThemeOrange" => "TableStyleMedium3",
+            "TableThemeGray" => "TableStyleMedium1",
+            "TableThemeNavy" => "TableStyleMedium9",
+            "TableThemeForest" => "TableStyleDark4",
+            _ => "TableStyleMedium2",
         };
+        let (hdr_fill, hdr_fg, stripe_even, stripe_odd, border_col) =
+            sheetcore::table::table_style_palette(style_name);
+        {
+            let si = self.sheet_idx;
+            let before_tables = self.wb.sheet(si).tables.clone();
+            if let Some(tb) = self.wb.sheet_mut(si).tables.iter_mut().find(|x| x.name == t.name) {
+                tb.style_name = style_name.to_string();
+            }
+            self.wb.sheet_mut(si).tables_dirty = true;
+            self.wb.sheet_mut(si).bump_display_style_revision();
+            let after_tables = self.wb.sheet(si).tables.clone();
+            if before_tables != after_tables {
+                self.undo.push_meta(
+                    "套用表格样式",
+                    (si, self.sel.0, self.sel.1),
+                    sheetcore::undo::MetaEdit {
+                        sheet: si,
+                        tables: Some((before_tables, after_tables)),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
         let prev_sel = (self.sel, self.sel_end);
         self.sel = (r1, c1);
         self.sel_end = (r2, c2);
@@ -3178,7 +3298,7 @@ impl SheetApp {
         });
         self.sel = prev_sel.0;
         self.sel_end = prev_sel.1;
-        self.status = "已套用表格样式".into();
+        self.status = format!("已套用表格样式（{style_name}）");
     }
 
     pub(crate) fn apply_wps_cell_style(&mut self, id: &str) {
