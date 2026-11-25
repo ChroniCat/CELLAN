@@ -32,7 +32,7 @@ fn print_ops_draw_both_series_types_with_secondary_scale() {
     assert!(out.rects.len() >= 4, "柱形要画出来：{}", out.rects.len());
     assert!(out.polys.is_empty(), "折线系列不应画成闭合填充多边形");
     assert!(
-        out.lines.iter().any(|(_, _, _, _, lw, _)| *lw > 1.0),
+        !out.stroke_polys.is_empty() || out.lines.iter().any(|(_, _, _, _, lw, _)| *lw > 1.0),
         "折线系列要画出来"
     );
     // 次轴按自己的量级缩放：增长率 1.22 不应压到顶部以外，折线点都在绘图区内

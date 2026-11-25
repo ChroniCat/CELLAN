@@ -612,6 +612,7 @@
             <menu id="PageBreaksMenu" label="分隔符" imageMso="PageBreak" sizeString="82" screentip="插入或删除分页符" keytip="B">
               <button id="InsertPageBreak" label="插入分页符" onAction="PageBreakInsert"/>
               <button id="RemovePageBreak" label="删除分页符" onAction="PageBreakRemove"/>
+              <button id="ResetAllPageBreaks" label="重置所有分页符" onAction="PageBreakResetAll"/>
             </menu>
           </box>
         </group>
@@ -672,6 +673,7 @@
         </group>
         <group id="GroupPrintPage" label="打印">
           <button id="PagePrintPreview" label="打印预览" size="large" imageMso="Print" onAction="PrintPreview"/>
+          <button id="PageExportWorkbookPdf" label="整簿 PDF" size="large" imageMso="PdfExport" screentip="导出整本工作簿（含各表侧边栏书签目录）为 PDF" onAction="ExportWorkbookPdf"/>
         </group>
       </tab>
 

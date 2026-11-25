@@ -538,6 +538,7 @@ impl SheetApp {
                 self.print_preview = true;
             }
             "ExportPdf" => self.export_pdf_dialog(),
+            "ExportWorkbookPdf" => self.export_workbook_pdf_dialog(),
             "Undo" => self.do_undo(false),
             "Redo" => self.do_undo(true),
             "NewTab" => self.open_in_new_tab(std::path::PathBuf::new()),
@@ -1384,6 +1385,14 @@ impl SheetApp {
                 sh.page_dirty = true;
                 self.wb.dirty = true;
                 self.status = format!("已删除第 {} 行、第 {} 列的分页符", r + 1, c + 1);
+            }
+            "PageBreakResetAll" => {
+                let sh = self.wb.sheet_mut(self.sheet_idx);
+                sh.page.row_breaks.clear();
+                sh.page.col_breaks.clear();
+                sh.page_dirty = true;
+                self.wb.dirty = true;
+                self.status = "已重置当前工作表的所有手动分页符".into();
             }
             "ZoomToSelection" => {
                 let (r1, c1, r2, c2) = self.sel_rect();

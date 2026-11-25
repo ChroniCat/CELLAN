@@ -28,6 +28,8 @@ mod wps_tools;
 mod wps_menus;
 mod pivot_ui;
 mod chart_ui;
+mod native_print;
+mod print_studio;
 
 use document_tasks::{CalculatedSnapshot, DocumentTasks};
 use error_opts::ErrorCheckOptions;
@@ -1699,32 +1701,6 @@ fn edge_point(x0: f32, y0: f32, x1: f32, y1: f32, tx: f32, ty: f32) -> (f32, f32
     (cx + dx * k, cy + dy * k)
 }
 
-fn strip_hf(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '&' {
-            match chars.peek() {
-                Some('"') => {
-                    chars.next();
-                    for c2 in chars.by_ref() {
-                        if c2 == '"' {
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {
-                    chars.next();
-                }
-                None => out.push('&'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out.trim().to_string()
-}
-
 /// 把 "A1"/"$B$2" 解析成 0 基 (行, 列)
 fn parse_a1_ref(s: &str) -> Option<(u32, u32)> {
     let t: String = s.chars().filter(|c| *c != '$').collect();
@@ -1971,8 +1947,6 @@ struct PageGeo {
     pages_y: usize,
     total_w: f32,
     total_h: f32,
-    header: String,
-    footer: String,
     /// 页面缩放（打印比例/调整为 1 页）
     scale: f32,
 }
@@ -2571,6 +2545,8 @@ struct SheetApp {
     print_preview: bool,
     /// 预览第几页（0 起）
     preview_page: usize,
+    /// 一体化打印与出版工作室状态
+    print_studio: print_studio::PrintStudioState,
     /// 图片纹理缓存（有界 LRU，最多保留 64 张纹理 + 后台异步读 ZIP 与解码）
     img_cache: ImgCache,
     /// 成员列表窗口
@@ -4211,6 +4187,7 @@ impl SheetApp {
             fmt_border_style: 1,
             fmt_border_color: [0, 0, 0],
             preview_zoom: 1.0,
+            print_studio: print_studio::PrintStudioState::default(),
             ai: ai_agent::AiState::default(),
             ps_skip_blanks: false,
             clip_pic: None,
@@ -12117,94 +12094,9 @@ impl SheetApp {
         }
     }
 
-    /// 真打印：先按页码范围在后台导出 PDF，再按份数交给所选打印机，打印完毕自动清理临时 PDF 与脚本，绝不阻塞 UI 线程。
+    /// 原生硬件矢量打印：直接通过 Win32 GDI 驱动发送高分辨率矢量页（零 PowerShell / 零光栅降质），绝不阻塞 UI 线程。
     fn print_to_printer(&mut self) {
-        let total = sheetcore::print::paginate(
-            self.wb.sheet(self.sheet_idx),
-            &self.wb.sheet(self.sheet_idx).page,
-        )
-        .pages
-        .len()
-        .max(1);
-        let pages = self.print_page_span(total);
-        let path = std::env::temp_dir().join(format!(
-            "sheetcore-print-{}-{}.pdf",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        ));
-        let copies = self.print_copies.clamp(1, 99);
-        let printer = self.page_setup_printer.clone();
-        let wb_snap = self.wb.clone();
-        let si = self.sheet_idx;
-        let run_print = move || -> Result<String, String> {
-            let regular = sheetcore::pdf::Font::parse_static(FONT_SANS)
-                .map_err(|e| format!("生成打印文件失败：{e:#}"))?;
-            let bold = sheetcore::pdf::Font::parse_static(FONT_SANS_BOLD).ok();
-            let n = sheetcore::print::export_pdf_pages_with_fonts(
-                &wb_snap,
-                si,
-                &path,
-                regular,
-                bold,
-                wb_snap.path.as_deref(),
-                pages,
-            )
-            .map_err(|e| format!("生成打印文件失败：{e:#}"))?;
-            const PRINT_HELPER: &str = include_str!("../../../scripts/print_pdf.ps1");
-            let helper = path.with_extension("ps1");
-            let submitted = std::fs::write(&helper, PRINT_HELPER).and_then(|_| {
-                let mut cmd = hidden_console_cmd("powershell");
-                cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-                    .arg(&helper)
-                    .arg("-Path")
-                    .arg(&path)
-                    .arg("-Printer")
-                    .arg(&printer)
-                    .arg("-Copies")
-                    .arg(copies.to_string());
-                cmd.output()
-            });
-            let _ = std::fs::remove_file(&helper);
-            let _ = std::fs::remove_file(&path);
-            match submitted {
-                Ok(out) if out.status.success() => {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    let line = text
-                        .lines()
-                        .find(|l| l.starts_with("PRINTED=1"))
-                        .unwrap_or("PRINTED=1");
-                    let target = if printer.is_empty() {
-                        "系统默认打印机".to_string()
-                    } else {
-                        printer
-                    };
-                    Ok(format!(
-                        "已提交 1 个打印任务（{copies} 份，{n} 页）到 {target}（{line}）"
-                    ))
-                }
-                Ok(out) => {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    Err(err.lines().last().unwrap_or("打印助手失败").to_string())
-                }
-                Err(e) => Err(e.to_string()),
-            }
-        };
-        if cfg!(test) || std::env::var_os("SC_PRINT_EXIT").is_some() {
-            match run_print() {
-                Ok(msg) => self.status = msg,
-                Err(err) => self.status = format!("打印失败：{err}"),
-            }
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.bg_print_rx = Some(rx);
-        self.status = "正在后台生成并提交打印任务…".into();
-        std::thread::spawn(move || {
-            let _ = tx.send(run_print());
-        });
+        self.print_to_printer_native();
     }
 
     fn export_pdf_dialog(&mut self) {
@@ -12218,14 +12110,10 @@ impl SheetApp {
         self.export_pdf_to(&path);
     }
 
-    /// 导出当前工作表为 PDF（对话框与 SC_EXPORT_PDF 共用同一条路径；大表交互导出走后台线程）
+    /// 导出当前工作表为 PDF（内嵌常规/粗体 + Windows `.ttc` CJK 回退链零豆腐块；大表交互导出走后台线程）
     fn export_pdf_to(&mut self, path: &std::path::Path) {
-        // PDF 用内嵌 SIL OFL 字体的常规+粗体两套（全局 OnceLock 零拷贝缓存解析结果）：
-        // 粗体走 /F2 的真 700 字形，随包可分发。
-        let regular = sheetcore::pdf::Font::parse_static(FONT_SANS);
-        let bold = sheetcore::pdf::Font::parse_static(FONT_SANS_BOLD).ok();
-        match (regular, bold) {
-            (Ok(regular), bold) => {
+        match print_studio::build_pdf_font_pack() {
+            Ok(pack) => {
                 let async_eligible = !cfg!(test)
                     && std::env::var_os("SC_EXPORT_PDF").is_none()
                     && std::env::var_os("SC_EXPORT_PDF_EXIT").is_none()
@@ -12237,15 +12125,15 @@ impl SheetApp {
                     let snapshot = self.wb.clone();
                     let out_path = path.to_path_buf();
                     self.status = format!("正在后台导出 {}…", out_path.display());
-                    self.tasks.start_pdf_export(snapshot, self.sheet_idx, out_path, regular, bold);
+                    self.tasks
+                        .start_pdf_export_pack(snapshot, self.sheet_idx, out_path, pack, None);
                     return;
                 }
-                match sheetcore::print::export_pdf_pages_with_fonts(
+                match sheetcore::print::export_pdf_sheet_with_pack(
                     &self.wb,
                     self.sheet_idx,
                     path,
-                    regular,
-                    bold,
+                    pack,
                     self.wb.path.as_deref(),
                     None,
                 ) {
@@ -12259,7 +12147,7 @@ impl SheetApp {
                     }
                 }
             }
-            (Err(e), _) => {
+            Err(e) => {
                 self.status = format!("导出失败：内嵌字体解析失败 {e:#}");
                 eprintln!("[pdf] 内嵌字体解析失败 {e:#}");
             }
@@ -25082,17 +24970,9 @@ fn clear_selection(&mut self) {
                         let paper = draft.paper_label().to_string();
                         egui::ComboBox::from_id_salt("page_paper")
                             .selected_text(paper)
-                            .width(120.0)
+                            .width(196.0)
                             .show_ui(ui, |ui| {
-                                for (code, name) in [
-                                    (9u16, "A4"),
-                                    (8, "A3"),
-                                    (10, "A5"),
-                                    (1, "Letter"),
-                                    (4, "Legal"),
-                                    (3, "Tabloid"),
-                                    (5, "Statement"),
-                                ] {
+                                for &(code, name) in sheetcore::page::PAPER_SIZES {
                                     ui.selectable_value(&mut draft.paper, code, name);
                                 }
                             });
@@ -25137,6 +25017,26 @@ fn clear_selection(&mut self) {
                         ui.checkbox(&mut draft.center_v, "垂直居中");
                         ui.checkbox(&mut draft.gridlines, "打印网格线");
                         ui.checkbox(&mut draft.headings, "打印行号列标");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut draft.black_and_white, "黑白单色");
+                        ui.checkbox(&mut draft.draft, "草稿模式");
+                        ui.separator();
+                        ui.label("页序：");
+                        ui.selectable_value(&mut draft.page_order_over_then_down, false, "先列后行");
+                        ui.selectable_value(&mut draft.page_order_over_then_down, true, "先行后列");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("批注：");
+                        ui.selectable_value(&mut draft.print_comments, 0, "无");
+                        ui.selectable_value(&mut draft.print_comments, 1, "末尾汇总");
+                        ui.selectable_value(&mut draft.print_comments, 2, "原位角标");
+                        ui.separator();
+                        ui.label("错误值：");
+                        ui.selectable_value(&mut draft.print_errors, 0, "显示");
+                        ui.selectable_value(&mut draft.print_errors, 1, "空白");
+                        ui.selectable_value(&mut draft.print_errors, 2, "--");
+                        ui.selectable_value(&mut draft.print_errors, 3, "#N/A");
                     });
 
                     dlg_section(ui, "缩放");
@@ -25340,54 +25240,7 @@ fn clear_selection(&mut self) {
     }
 
     fn header_footer_dialog(&mut self, ctx: &egui::Context) {
-        if !self.hf_dlg {
-            return;
-        }
-        let mut open = true;
-        let mut ok = false;
-        let mut header = self.wb.sheet(self.sheet_idx).page.header.clone();
-        let mut footer = self.wb.sheet(self.sheet_idx).page.footer.clone();
-        ui_kit::window(ctx, "页眉和页脚", 420.0)
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                dlg_section(ui, "页眉");
-                ui.add(
-                    egui::TextEdit::singleline(&mut header)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("例如：&L左&中&R右"),
-                );
-                dlg_section(ui, "页脚");
-                ui.add(
-                    egui::TextEdit::singleline(&mut footer)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("例如：第 &P 页，共 &N 页"),
-                );
-                ui.label(
-                    egui::RichText::new("可用代码：&L 左、&C 中、&R 右、&P 页码、&N 总页数、&D 日期")
-                        .size(10.5)
-                        .weak(),
-                );
-                ui_kit::footer(ui, |ui| {
-                    if ui_kit::secondary_button(ui, "取消").clicked() {
-                        open = false;
-                    }
-                    if ui_kit::primary_button(ui, "确定").clicked() {
-                        ok = true;
-                    }
-                });
-            });
-        if ok {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            sh.page.header = header;
-            sh.page.footer = footer;
-            sh.page_dirty = true;
-            self.wb.dirty = true;
-            self.hf_dlg = false;
-            self.status = "已更新页眉页脚".into();
-        } else if !open {
-            self.hf_dlg = false;
-        }
+        self.draw_modern_header_footer_dialog(ctx);
     }
 
     // ---------------------------------------------------------------- 迷你图
@@ -36727,8 +36580,6 @@ impl SheetApp {
                     pages_y,
                     total_w,
                     total_h,
-                    header: ps.header.clone(),
-                    footer: ps.footer.clone(),
                     scale,
                 });
                 self.page_geometry = Some((key, ps, geometry.clone()));
@@ -36985,29 +36836,63 @@ impl SheetApp {
                         pp.rect_stroke(
                             r,
                             0.0,
-                            Stroke::new(1.0, Color32::from_rgb(70, 110, 180)),
+                            Stroke::new(1.5, Color32::from_rgb(37, 99, 235)),
                             egui::StrokeKind::Inside,
                         );
                     }
-                    let hf = strip_hf(&g.header);
-                    if !hf.is_empty() {
-                        pp.text(
-                            egui::pos2(left + g.ml, top + g.mt / 2.0),
-                            Align2::LEFT_CENTER,
-                            hf,
-                            FontId::proportional(9.5),
-                            Color32::from_rgb(120, 120, 120),
-                        );
-                    }
-                    let ft = strip_hf(&g.footer);
-                    if !ft.is_empty() {
-                        pp.text(
-                            egui::pos2(left + g.ml, top + g.paper_h - g.mb / 2.0),
-                            Align2::LEFT_CENTER,
-                            ft,
-                            FontId::proportional(9.5),
-                            Color32::from_rgb(120, 120, 120),
-                        );
+                    if self.view_mode == 1 {
+                        let sh = self.wb.sheet(self.sheet_idx);
+                        let total_pg = (g.pages_x * g.pages_y).max(1);
+                        let p_idx_1 = if sh.page.page_order_over_then_down {
+                            j * g.pages_x + k + 1
+                        } else {
+                            k * g.pages_y + j + 1
+                        };
+                        let disp_no = sh
+                            .page
+                            .first_page_number
+                            .map(|f| f.saturating_sub(1) as usize + p_idx_1)
+                            .unwrap_or(p_idx_1);
+                        let (hdr_tpl, ftr_tpl) = sh.page.header_footer_for_page(p_idx_1);
+                        let hctx = print_studio::make_header_ctx(&self.wb, self.sheet_idx);
+                        let hf_col = Color32::from_rgb(100, 116, 139);
+                        let hf_font = FontId::proportional(9.5);
+                        if !hdr_tpl.is_empty() {
+                            let (hl, hc, hr) = sheetcore::print::header_parts_with_ctx(
+                                hdr_tpl,
+                                disp_no,
+                                total_pg,
+                                Some(&hctx),
+                            );
+                            let hy = top + g.mt * 0.5;
+                            if !hl.is_empty() {
+                                pp.text(egui::pos2(left + g.ml, hy), Align2::LEFT_CENTER, hl, hf_font.clone(), hf_col);
+                            }
+                            if !hc.is_empty() {
+                                pp.text(egui::pos2(left + g.paper_w * 0.5, hy), Align2::CENTER_CENTER, hc, hf_font.clone(), hf_col);
+                            }
+                            if !hr.is_empty() {
+                                pp.text(egui::pos2(left + g.paper_w - g.mr, hy), Align2::RIGHT_CENTER, hr, hf_font.clone(), hf_col);
+                            }
+                        }
+                        if !ftr_tpl.is_empty() {
+                            let (fl, fc, fr) = sheetcore::print::header_parts_with_ctx(
+                                ftr_tpl,
+                                disp_no,
+                                total_pg,
+                                Some(&hctx),
+                            );
+                            let fy = top + g.paper_h - g.mb * 0.5;
+                            if !fl.is_empty() {
+                                pp.text(egui::pos2(left + g.ml, fy), Align2::LEFT_CENTER, fl, hf_font.clone(), hf_col);
+                            }
+                            if !fc.is_empty() {
+                                pp.text(egui::pos2(left + g.paper_w * 0.5, fy), Align2::CENTER_CENTER, fc, hf_font.clone(), hf_col);
+                            }
+                            if !fr.is_empty() {
+                                pp.text(egui::pos2(left + g.paper_w - g.mr, fy), Align2::RIGHT_CENTER, fr, hf_font, hf_col);
+                            }
+                        }
                     }
                 }
             }
@@ -39267,45 +39152,69 @@ impl SheetApp {
                 }
             }
             let _ = (pr2, pc2, x_off, y_off);
-            // 拖分页线：把最接近指针的行/列记成手动分页
+            // 拖分页线：仅更新当前被拖拽的分页符（保留其余手动分页符），并给出双箭头光标提示
             if !readonly {
                 for (i, x) in xs.iter().enumerate() {
                     let px = gx(pc1) + x;
+                    let orig_col = cols.index_at((cols.pos(pc1) + x).max(0.0)).max(1);
                     let strip = Rect::from_min_size(
-                        egui::pos2(px - 3.0, origin.y + hh),
-                        Vec2::new(6.0, (origin.y + avail.y - origin.y - hh).max(4.0)),
+                        egui::pos2(px - 3.5, origin.y + hh),
+                        Vec2::new(7.0, (origin.y + avail.y - origin.y - hh).max(4.0)),
                     );
                     let r = ui.interact(
                         strip,
                         egui::Id::new(("pbx", self.sheet_idx, i)),
                         Sense::drag(),
                     );
+                    if r.hovered() || r.dragged() {
+                        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
                     if r.dragged() {
                         if let Some(p) = r.interact_pointer_pos() {
                             let content = off_x + p.x - (origin.x + head_w);
                             let c = cols.index_at(content.max(0.0)).max(1);
-                            self.set_page(move |ps| ps.col_breaks = vec![c]);
-                            self.status = format!("分页：第 {} 列前", c + 1);
+                            self.set_page(move |ps| {
+                                if let Some(pos) = ps.col_breaks.iter().position(|&b| b == orig_col) {
+                                    ps.col_breaks[pos] = c;
+                                } else {
+                                    ps.col_breaks.push(c);
+                                }
+                                ps.col_breaks.sort_unstable();
+                                ps.col_breaks.dedup();
+                            });
+                            self.status = format!("垂直分页：第 {} 列前", c + 1);
                         }
                     }
                 }
                 for (i, y) in ys.iter().enumerate() {
                     let py = gy(pr1) + y;
+                    let orig_row = rows.index_at((rows.pos(pr1) + y).max(0.0)).max(1);
                     let strip = Rect::from_min_size(
-                        egui::pos2(origin.x + head_w, py - 3.0),
-                        Vec2::new((origin.x + avail.x - origin.x - head_w).max(4.0), 6.0),
+                        egui::pos2(origin.x + head_w, py - 3.5),
+                        Vec2::new((origin.x + avail.x - origin.x - head_w).max(4.0), 7.0),
                     );
                     let r = ui.interact(
                         strip,
                         egui::Id::new(("pby", self.sheet_idx, i)),
                         Sense::drag(),
                     );
+                    if r.hovered() || r.dragged() {
+                        ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
                     if r.dragged() {
                         if let Some(p) = r.interact_pointer_pos() {
                             let content = off_y + p.y - (origin.y + hh);
                             let rr = rows.index_at(content.max(0.0)).max(1);
-                            self.set_page(move |ps| ps.row_breaks = vec![rr]);
-                            self.status = format!("分页：第 {} 行前", rr + 1);
+                            self.set_page(move |ps| {
+                                if let Some(pos) = ps.row_breaks.iter().position(|&b| b == orig_row) {
+                                    ps.row_breaks[pos] = rr;
+                                } else {
+                                    ps.row_breaks.push(rr);
+                                }
+                                ps.row_breaks.sort_unstable();
+                                ps.row_breaks.dedup();
+                            });
+                            self.status = format!("水平分页：第 {} 行前", rr + 1);
                         }
                     }
                 }
@@ -41926,6 +41835,8 @@ impl SheetApp {
                 );
             }
             if self.view_mode == 2 {
+                let over_then_down = self.wb.sheet(self.sheet_idx).page.page_order_over_then_down;
+                let first_no = self.wb.sheet(self.sheet_idx).page.first_page_number;
                 for k in 0..g.pages_x {
                     let left = body_x + PAGE_PAD + k as f32 * (g.paper_w + PAGE_GAP) - off_x;
                     for j in 0..g.pages_y {
@@ -41935,12 +41846,30 @@ impl SheetApp {
                             Vec2::new(g.paper_w, g.paper_h),
                         );
                         if r.intersects(body_clip) {
+                            let idx_1 = if over_then_down {
+                                j * g.pages_x + k + 1
+                            } else {
+                                k * g.pages_y + j + 1
+                            };
+                            let pg_no = first_no
+                                .map(|f| f.saturating_sub(1) as usize + idx_1)
+                                .unwrap_or(idx_1);
+                            let label = format!("第 {} 页", pg_no);
+                            // 居中半透明大水印（Excel/WPS 级分页预览标识）
+                            pp.text(
+                                r.center(),
+                                Align2::CENTER_CENTER,
+                                &label,
+                                FontId::new(34.0, family_named("default-bold")),
+                                Color32::from_rgba_unmultiplied(37, 99, 235, 42),
+                            );
+                            // 页眉小标签
                             pp.text(
                                 egui::pos2(r.center().x, r.top() - 8.0),
                                 Align2::CENTER_CENTER,
-                                format!("第 {} 页", j * g.pages_x + k + 1),
+                                label,
                                 FontId::proportional(11.0),
-                                Color32::from_rgb(70, 110, 180),
+                                Color32::from_rgb(37, 99, 235),
                             );
                         }
                     }

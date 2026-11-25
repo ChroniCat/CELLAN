@@ -1628,86 +1628,124 @@ fn strip_tag(xml: &str, tag: &str) -> String {
     let mut out = String::with_capacity(xml.len());
     let mut rest = xml;
     while let Some(i) = rest.find(&open) {
+        let after = rest.as_bytes().get(i + open.len()).copied();
+        if !matches!(after, Some(b' ' | b'>' | b'/' | b'\t' | b'\r' | b'\n')) {
+            out.push_str(&rest[..i + open.len()]);
+            rest = &rest[i + open.len()..];
+            continue;
+        }
         out.push_str(&rest[..i]);
-        if let Some(e) = rest[i..].find(&close) {
-            rest = &rest[i + e + close.len()..];
-        } else if let Some(e) = rest[i..].find("/>") {
-            rest = &rest[i + e + 2..];
-        } else {
+        let tail = &rest[i..];
+        let Some(gt) = tail.find('>') else {
             rest = "";
+            break;
+        };
+        if tail[..gt].ends_with('/') {
+            rest = &tail[gt + 1..];
+        } else if let Some(e) = tail[gt + 1..].find(&close) {
+            rest = &tail[gt + 1 + e + close.len()..];
+        } else {
+            rest = &tail[gt + 1..];
         }
     }
     out.push_str(rest);
     out
 }
 
-/// 改工作表里的页面设置：四段一起重写，插在 </worksheet> 前（顺序按 schema）
-pub fn set_page_xml(xml: &str, ps: &crate::page::PageSetup) -> String {
-    let mut x = xml.to_string();
-    for t in ["printOptions", "pageMargins", "pageSetup", "headerFooter"] {
-        x = strip_tag(&x, t);
+/// 序列化 `<headerFooter>` 元素（含首页不同 / 奇偶页不同）
+fn header_footer_xml(ps: &crate::page::PageSetup) -> String {
+    let any = !ps.header.is_empty()
+        || !ps.footer.is_empty()
+        || (ps.different_first_page && (!ps.first_header.is_empty() || !ps.first_footer.is_empty()))
+        || (ps.different_odd_even && (!ps.even_header.is_empty() || !ps.even_footer.is_empty()));
+    if !any {
+        return String::new();
     }
-    let mut body = String::new();
-    if ps.gridlines || ps.headings || ps.center_h || ps.center_v {
-        body.push_str(&format!(
-            "<printOptions gridLines=\"{}\" headings=\"{}\" horizontalCentered=\"{}\" verticalCentered=\"{}\"/>",
-            if ps.gridlines { 1 } else { 0 },
-            if ps.headings { 1 } else { 0 },
-            if ps.center_h { 1 } else { 0 },
-            if ps.center_v { 1 } else { 0 }
+    let mut out = String::from("<headerFooter");
+    if ps.different_first_page {
+        out.push_str(" differentFirst=\"1\"");
+    }
+    if ps.different_odd_even {
+        out.push_str(" differentOddEven=\"1\"");
+    }
+    out.push('>');
+    if !ps.header.is_empty() {
+        out.push_str(&format!("<oddHeader>{}</oddHeader>", esc(&ps.header)));
+    }
+    if !ps.footer.is_empty() {
+        out.push_str(&format!("<oddFooter>{}</oddFooter>", esc(&ps.footer)));
+    }
+    if ps.different_odd_even {
+        if !ps.even_header.is_empty() {
+            out.push_str(&format!("<evenHeader>{}</evenHeader>", esc(&ps.even_header)));
+        }
+        if !ps.even_footer.is_empty() {
+            out.push_str(&format!("<evenFooter>{}</evenFooter>", esc(&ps.even_footer)));
+        }
+    }
+    if ps.different_first_page {
+        if !ps.first_header.is_empty() {
+            out.push_str(&format!("<firstHeader>{}</firstHeader>", esc(&ps.first_header)));
+        }
+        if !ps.first_footer.is_empty() {
+            out.push_str(&format!("<firstFooter>{}</firstFooter>", esc(&ps.first_footer)));
+        }
+    }
+    out.push_str("</headerFooter>");
+    out
+}
+
+/// 序列化 `<pageSetup .../>` 完整属性（含分页顺序、黑白/草稿、起始页码、批注与错误打印策略）
+fn page_setup_attrs_xml(p: &crate::page::PageSetup) -> String {
+    let landscape = if p.landscape { "landscape" } else { "portrait" };
+    let fit = if p.fit_to_page {
+        format!(
+            " fitToWidth=\"{}\" fitToHeight=\"{}\"",
+            p.fit_width, p.fit_height
+        )
+    } else {
+        String::new()
+    };
+    let scale = if p.fit_to_page {
+        String::new()
+    } else {
+        format!(" scale=\"{}\"", p.scale.clamp(10, 400))
+    };
+    let mut extra = String::new();
+    if p.page_order_over_then_down {
+        extra.push_str(" pageOrder=\"overThenDown\"");
+    }
+    if p.black_and_white {
+        extra.push_str(" blackAndWhite=\"1\"");
+    }
+    if p.draft {
+        extra.push_str(" draft=\"1\"");
+    }
+    if let Some(fpn) = p.first_page_number {
+        extra.push_str(&format!(
+            " useFirstPageNumber=\"1\" firstPageNumber=\"{fpn}\""
         ));
     }
-    body.push_str(&format!(
-        "<pageMargins left=\"{}\" right=\"{}\" top=\"{}\" bottom=\"{}\" header=\"{}\" footer=\"{}\"/>",
-        ps.margins[0], ps.margins[1], ps.margins[2], ps.margins[3], ps.margins[4], ps.margins[5]
-    ));
-    body.push_str(&format!(
-        "<pageSetup paperSize=\"{}\" orientation=\"{}\" {} fitToWidth=\"{}\" fitToHeight=\"{}\" scale=\"{}\"/>",
-        ps.paper,
-        if ps.landscape { "landscape" } else { "portrait" },
-        "",
-        if ps.fit_to_page { ps.fit_width } else { 0 },
-        if ps.fit_to_page { ps.fit_height } else { 0 },
-        if ps.fit_to_page { 100 } else { ps.scale }
-    ));
-    if !ps.header.is_empty() || !ps.footer.is_empty() {
-        body.push_str("<headerFooter>");
-        if !ps.header.is_empty() {
-            body.push_str(&format!("<oddHeader>{}</oddHeader>", esc(&ps.header)));
-        }
-        if !ps.footer.is_empty() {
-            body.push_str(&format!("<oddFooter>{}</oddFooter>", esc(&ps.footer)));
-        }
-        body.push_str("</headerFooter>");
+    match p.print_comments {
+        1 => extra.push_str(" cellComments=\"atEnd\""),
+        2 => extra.push_str(" cellComments=\"asDisplayed\""),
+        _ => {}
     }
-    const AFTER_PAGE: [&str; 16] = [
-        "<rowBreaks",
-        "<colBreaks",
-        "<customProperties",
-        "<cellWatches",
-        "<ignoredErrors",
-        "<smartTags",
-        "<drawing",
-        "<legacyDrawing",
-        "<drawingHF",
-        "<picture",
-        "<oleObjects",
-        "<controls",
-        "<webPublishItems",
-        "<tableParts",
-        "<extLst",
-        "</worksheet>",
-    ];
-    let at = AFTER_PAGE
-        .iter()
-        .filter_map(|m| x.find(m))
-        .min()
-        .unwrap_or(x.len());
-    let mut out = String::with_capacity(x.len() + body.len());
-    out.push_str(&x[..at]);
-    out.push_str(&body);
-    out.push_str(&x[at..]);
-    out
+    match p.print_errors {
+        1 => extra.push_str(" errors=\"blank\""),
+        2 => extra.push_str(" errors=\"dash\""),
+        3 => extra.push_str(" errors=\"NA\""),
+        _ => {}
+    }
+    format!(
+        "<pageSetup paperSize=\"{}\" orientation=\"{landscape}\"{scale}{fit}{extra}/>",
+        p.paper
+    )
+}
+
+/// 改工作表里的页面设置：严格按 ISO/IEC 29500 Schema 顺序插在 `<drawing>/<tableParts>/<extLst>/</worksheet>` 之前
+pub fn set_page_xml(xml: &str, ps: &crate::page::PageSetup) -> String {
+    set_page_setup(xml, ps)
 }
 
 /// 更新 workbook.xml 里某张表的 Print_Area / Print_Titles
@@ -3020,72 +3058,51 @@ pub fn apply_protection(path: &std::path::Path, wb: &crate::model::Workbook) -> 
     rewrite_sheet_metadata(path, &map, |xml, p| Ok(set_sheet_protection(xml, p.as_ref())))
 }
 
-/// 页面设置写回：printOptions / pageMargins / pageSetup 三个元素
+/// 页面设置写回：严格按 OOXML Schema 顺序写回 printOptions / pageMargins / pageSetup / headerFooter / rowBreaks / colBreaks
 pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
     let mut x = xml.to_string();
-    for tag in ["printOptions", "pageMargins", "pageSetup"] {
-        while let Some(i) = x.find(&format!("<{tag}")) {
-            if let Some(gt) = x[i..].find('>') {
-                x.replace_range(i..i + gt + 1, "");
-            } else {
-                break;
-            }
-        }
+    for tag in ["printOptions", "pageMargins", "pageSetup", "headerFooter", "rowBreaks", "colBreaks"] {
+        x = strip_tag(&x, tag);
     }
-    let landscape = if p.landscape { "landscape" } else { "portrait" };
-    let fit = if p.fit_to_page {
-        format!(
-            " fitToWidth=\"{}\" fitToHeight=\"{}\"",
-            p.fit_width, p.fit_height
-        )
-    } else {
-        String::new()
-    };
-    let scale = if p.fit_to_page {
-        String::new()
-    } else {
-        format!(" scale=\"{}\"", p.scale.clamp(10, 400))
-    };
-    let block = format!(
+    let page_setup_el = page_setup_attrs_xml(p);
+    let hf_el = header_footer_xml(p);
+    let mut block = format!(
         "<printOptions gridLines=\"{}\" headings=\"{}\" horizontalCentered=\"{}\" verticalCentered=\"{}\"/>\
 <pageMargins left=\"{}\" right=\"{}\" top=\"{}\" bottom=\"{}\" header=\"{}\" footer=\"{}\"/>\
-<pageSetup paperSize=\"{}\" orientation=\"{landscape}\"{scale}{fit}/>",
+{page_setup_el}{hf_el}",
         if p.gridlines { 1 } else { 0 },
         if p.headings { 1 } else { 0 },
         if p.center_h { 1 } else { 0 },
         if p.center_v { 1 } else { 0 },
         p.margins[0], p.margins[1], p.margins[2], p.margins[3], p.margins[4], p.margins[5],
-        p.paper,
     );
-    let mut breaks = String::new();
     if !p.row_breaks.is_empty() {
-        breaks.push_str(&format!(
+        block.push_str(&format!(
             "<rowBreaks count=\"{}\" manualBreakCount=\"{}\">",
             p.row_breaks.len(),
             p.row_breaks.len()
         ));
         for r in &p.row_breaks {
-            breaks.push_str(&format!("<brk id=\"{r}\" max=\"16383\" man=\"1\"/>"));
+            block.push_str(&format!("<brk id=\"{r}\" max=\"16383\" man=\"1\"/>"));
         }
-        breaks.push_str("</rowBreaks>");
+        block.push_str("</rowBreaks>");
     }
     if !p.col_breaks.is_empty() {
-        breaks.push_str(&format!(
+        block.push_str(&format!(
             "<colBreaks count=\"{}\" manualBreakCount=\"{}\">",
             p.col_breaks.len(),
             p.col_breaks.len()
         ));
         for c in &p.col_breaks {
-            breaks.push_str(&format!("<brk id=\"{c}\" max=\"1048575\" man=\"1\"/>"));
+            block.push_str(&format!("<brk id=\"{c}\" max=\"1048575\" man=\"1\"/>"));
         }
-        breaks.push_str("</colBreaks>");
+        block.push_str("</colBreaks>");
     }
     // fitToPage 由 sheetPr/pageSetUpPr 控制；不关掉的话 Excel 会忽略 scale
     let fit_flag = if p.fit_to_page { "1" } else { "0" };
     if let Some(sp) = x.find("<sheetPr") {
         let end = x[sp..].find('>').map(|e| sp + e + 1).unwrap_or(sp);
         if x[sp..end].ends_with("/>") {
-            // <sheetPr/> 自闭合：展开成带 pageSetUpPr 的形式
             let inner = format!("<pageSetUpPr fitToPage=\"{fit_flag}\"/>");
             let open = x[sp..end].replace("/>", ">");
             x.replace_range(sp..end, &format!("{open}{inner}</sheetPr>"));
@@ -3100,12 +3117,14 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
                 let v1 = tag[v0..].find('"').map(|q| v0 + q).unwrap_or(v0);
                 newtag.replace_range(v0..v1, fit_flag);
             } else {
-                newtag = newtag.replacen("<pageSetUpPr", &format!("<pageSetUpPr fitToPage=\"{fit_flag}\" "), 1);
+                newtag = newtag.replacen(
+                    "<pageSetUpPr",
+                    &format!("<pageSetUpPr fitToPage=\"{fit_flag}\" "),
+                    1,
+                );
             }
             x.replace_range(at..=pe, &newtag);
         } else {
-            // schema 顺序：tabColor → outlinePr → pageSetUpPr。不能紧贴
-            // <sheetPr> 开标签插入，否则会跑到已有的 outlinePr 前面。
             fn after_child(xml: &str, start: usize, tag: &str) -> Option<usize> {
                 let rel = xml.get(start..)?.find(&format!("<{tag}"))?;
                 let at = start + rel;
@@ -3124,33 +3143,26 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
                 .unwrap_or(end);
             x.insert_str(at, &format!("<pageSetUpPr fitToPage=\"{fit_flag}\"/>"));
         }
-    } else {
-        // 没有 sheetPr：作为 worksheet 的第一个子元素插入（不能插到 XML 声明后面）
-        if let Some(ws) = x.find("<worksheet") {
-            if let Some(gt) = x[ws..].find('>') {
-                let at = ws + gt + 1;
-                x.insert_str(
-                    at,
-                    &format!("<sheetPr><pageSetUpPr fitToPage=\"{fit_flag}\"/></sheetPr>"),
-                );
-            }
-        }
-    }
-    // 旧的分页符先清掉，避免重复
-    for tag in ["rowBreaks", "colBreaks"] {
-        while let Some(i) = x.find(&format!("<{tag}")) {
-            let Some(rel) = x[i..].find(&format!("</{tag}>")) else { break };
-            let end = i + rel + format!("</{tag}>").len();
-            x.replace_range(i..end, "");
-        }
+    } else if let Some(ws) = x.find("<worksheet")
+        && let Some(gt) = x[ws..].find('>')
+    {
+        let at = ws + gt + 1;
+        x.insert_str(
+            at,
+            &format!("<sheetPr><pageSetUpPr fitToPage=\"{fit_flag}\"/></sheetPr>"),
+        );
     }
     let markers = [
-        "<headerFooter",
-        "<rowBreaks",
-        "<colBreaks",
         "<customProperties",
+        "<cellWatches",
+        "<ignoredErrors",
+        "<smartTags",
         "<drawing",
         "<legacyDrawing",
+        "<picture",
+        "<oleObjects",
+        "<controls",
+        "<webPublishItems",
         "<tableParts",
         "<extLst",
         "</worksheet>",
@@ -3161,36 +3173,6 @@ pub fn set_page_setup(xml: &str, p: &crate::page::PageSetup) -> String {
         .min()
         .unwrap_or(x.len());
     x.insert_str(at, &block);
-    if !breaks.is_empty() {
-        // schema：rowBreaks/colBreaks 在 headerFooter 之后、customProperties/drawing/tableParts/extLst 之前
-        const AFTER_BREAKS: [&str; 14] = [
-            "<customProperties",
-            "<cellWatches",
-            "<ignoredErrors",
-            "<smartTags",
-            "<drawing",
-            "<legacyDrawing",
-            "<drawingHF",
-            "<picture",
-            "<oleObjects",
-            "<controls",
-            "<webPublishItems",
-            "<tableParts",
-            "<extLst",
-            "</worksheet>",
-        ];
-        let after = x
-            .find("</headerFooter>")
-            .map(|e| e + "</headerFooter>".len())
-            .unwrap_or_else(|| {
-                AFTER_BREAKS
-                    .iter()
-                    .filter_map(|m| x.find(m))
-                    .min()
-                    .unwrap_or(x.len())
-            });
-        x.insert_str(after, &breaks);
-    }
     x
 }
 
