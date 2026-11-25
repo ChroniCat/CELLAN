@@ -609,6 +609,9 @@ impl SheetApp {
                     return;
                 }
                 let mut styles = Vec::with_capacity((r2 - r1 + 1) as usize);
+                let mut merges = Vec::new();
+                let mut cf_blocks = Vec::new();
+                let mut cf_dxfs = Vec::new();
                 {
                     let sheet = self.wb.sheet(self.sheet_idx);
                     for r in r1..=r2 {
@@ -618,12 +621,41 @@ impl SheetApp {
                         }
                         styles.push(row);
                     }
+                    for &(mr1, mc1, mr2, mc2) in sheet.merges.iter() {
+                        if mr1 >= r1 && mc1 >= c1 && mr2 <= r2 && mc2 <= c2 {
+                            merges.push((mr1 - r1, mc1 - c1, mr2 - r1, mc2 - c1));
+                        }
+                    }
+                    for blk in &sheet.cf.blocks {
+                        let mut rel_ranges = Vec::new();
+                        for &(cr1, cc1, cr2, cc2) in &blk.ranges {
+                            let ir1 = cr1.max(r1);
+                            let ic1 = cc1.max(c1);
+                            let ir2 = cr2.min(r2);
+                            let ic2 = cc2.min(c2);
+                            if ir1 <= ir2 && ic1 <= ic2 {
+                                rel_ranges.push((ir1 - r1, ic1 - c1, ir2 - r1, ic2 - c1));
+                            }
+                        }
+                        if !rel_ranges.is_empty() {
+                            cf_blocks.push(sheetcore::cf::CfBlock {
+                                ranges: rel_ranges,
+                                rules: blk.rules.clone(),
+                            });
+                        }
+                    }
+                    if !cf_blocks.is_empty() {
+                        cf_dxfs = sheet.cf.dxfs.clone();
+                    }
                 }
                 let continuous = self.painter_double;
                 self.painter_double = false;
                 self.format_painter = Some(FormatPainter {
                     rect: (r1, c1, r2, c2),
                     styles,
+                    merges,
+                    cf_blocks,
+                    cf_dxfs,
                     continuous,
                     wb_epoch: self.wb_epoch,
                     sheet: self.sheet_idx,

@@ -6408,6 +6408,9 @@ fn format_painter_is_rejected_after_document_switch_even_with_same_style_id() {
     app.format_painter = Some(FormatPainter {
         rect: (0, 0, 0, 0),
         styles: vec![vec![a_sid]],
+        merges: Vec::new(),
+        cf_blocks: Vec::new(),
+        cf_dxfs: Vec::new(),
         continuous: false,
         wb_epoch: app.wb_epoch,
         sheet: 0,

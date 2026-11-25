@@ -424,6 +424,11 @@ struct FormatPainter {
     rect: (u32, u32, u32, u32),
     /// 按源区域行列保存的样式号
     styles: Vec<Vec<u16>>,
+    /// 源区域内的相对合并范围 `(dr1, dc1, dr2, dc2)`
+    merges: Vec<(u32, u32, u32, u32)>,
+    /// 命中源区域的条件格式块与差异格式表（区域已裁剪并平移为相对坐标 `(0, 0)`）
+    cf_blocks: Vec<sheetcore::cf::CfBlock>,
+    cf_dxfs: Vec<sheetcore::cf::Dxf>,
     /// 双击进入连续模式，Esc 结束
     continuous: bool,
     /// 取样式时所在文档身份；换文档后样式号不可跨簿解释，必须取消
@@ -21969,13 +21974,13 @@ fn clear_selection(&mut self) {
         }
     }
 
-    /// 格式刷：把源区域样式按行列重复铺到当前选区，一次撤销。
+    /// 格式刷：把源区域样式（含同簿跨表、合并格与条件格式）按行列重复铺到当前选区，支持撤销。
     fn apply_format_painter(&mut self) {
         let Some(p) = self.format_painter.clone() else { return };
-        if p.wb_epoch != self.wb_epoch || p.sheet != self.sheet_idx {
+        if p.wb_epoch != self.wb_epoch {
             self.format_painter = None;
             self.painter_double = false;
-            self.status = "文档或工作表已切换，格式刷已取消".into();
+            self.status = "文档已切换，格式刷已取消".into();
             return;
         }
         if self.edit_blocked() {
@@ -22041,24 +22046,141 @@ fn clear_selection(&mut self) {
         }
         let mut changes = Vec::new();
         let mut wire = Vec::new();
-        let sheet = &mut self.wb.sheets[si];
-        for (row, col) in keys {
-            let sid = p.styles[((row - tr1) % sh) as usize][((col - tc1) % sw) as usize];
-            let before_style = sheet.style_of(row, col);
-            if before_style != sid {
-                let value = sheet.get(row, col).map(|c| c.into_owned()).unwrap_or_default();
-                changes.push(sheetcore::undo::CellDelta { sheet: si, row, col,
-                    before: value.clone(), after: value, before_style, after_style: sid });
+        let before_merges = self.wb.sheet(si).merges.to_vec();
+        let before_cf = (!p.cf_blocks.is_empty()).then(|| self.wb.sheet(si).cf.clone());
+        {
+            let sheet = &mut self.wb.sheets[si];
+            for (row, col) in keys {
+                let sid = p.styles[((row - tr1) % sh) as usize][((col - tc1) % sw) as usize];
+                let before_style = sheet.style_of(row, col);
+                if before_style != sid {
+                    let value = sheet.get(row, col).map(|c| c.into_owned()).unwrap_or_default();
+                    changes.push(sheetcore::undo::CellDelta {
+                        sheet: si,
+                        row,
+                        col,
+                        before: value.clone(),
+                        after: value,
+                        before_style,
+                        after_style: sid,
+                    });
+                }
+                sheet.set_style(row, col, sid);
+                if self.net.is_some() && before_style != sid {
+                    wire.push((row, col, self.wb.styles.get(sid).clone()));
+                }
             }
-            sheet.set_style(row, col, sid);
-            if self.net.is_some() && before_style != sid {
-                wire.push((row, col, self.wb.styles.get(sid).clone()));
+            // 复制源区域内的相对合并格（按 tile 平铺到目标区，跳过与现有合并冲突的范围）
+            if !p.merges.is_empty() {
+                let mut tr_off = 0u32;
+                while tr1 + tr_off <= tr2 {
+                    let mut tc_off = 0u32;
+                    while tc1 + tc_off <= tc2 {
+                        for &(dr1, dc1, dr2, dc2) in &p.merges {
+                            let nr1 = tr1 + tr_off + dr1;
+                            let nc1 = tc1 + tc_off + dc1;
+                            let nr2 = tr1 + tr_off + dr2;
+                            let nc2 = tc1 + tc_off + dc2;
+                            if nr2 <= tr2
+                                && nc2 <= tc2
+                                && !sheet.merges.iter().any(|&(a, b, c, d)| {
+                                    a <= nr2 && nr1 <= c && b <= nc2 && nc1 <= d
+                                })
+                            {
+                                sheet.merges.push((nr1, nc1, nr2, nc2));
+                                sheet.merges_dirty = true;
+                            }
+                        }
+                        tc_off = tc_off.saturating_add(sw);
+                    }
+                    tr_off = tr_off.saturating_add(sh);
+                }
+            }
+            // 复制命中源区域的条件格式块到目标区域（跨表自动迁移并重映射 dxf 索引）
+            if !p.cf_blocks.is_empty() {
+                let mut dxf_map = Vec::with_capacity(p.cf_dxfs.len());
+                for dxf in &p.cf_dxfs {
+                    if let Some(pos) = sheet.cf.dxfs.iter().position(|x| x == dxf) {
+                        dxf_map.push(pos);
+                    } else {
+                        dxf_map.push(sheet.cf.dxfs.len());
+                        sheet.cf.dxfs.push(dxf.clone());
+                    }
+                }
+                for blk in &p.cf_blocks {
+                    let mut tiled_ranges = Vec::new();
+                    let mut tr_off = 0u32;
+                    while tr1 + tr_off <= tr2 {
+                        let mut tc_off = 0u32;
+                        while tc1 + tc_off <= tc2 {
+                            for &(dr1, dc1, dr2, dc2) in &blk.ranges {
+                                let nr1 = tr1 + tr_off + dr1;
+                                let nc1 = tc1 + tc_off + dc1;
+                                let nr2 = (tr1 + tr_off + dr2).min(tr2);
+                                let nc2 = (tc1 + tc_off + dc2).min(tc2);
+                                if nr1 <= nr2 && nc1 <= nc2 {
+                                    tiled_ranges.push((nr1, nc1, nr2, nc2));
+                                }
+                            }
+                            tc_off = tc_off.saturating_add(sw);
+                        }
+                        tr_off = tr_off.saturating_add(sh);
+                    }
+                    if !tiled_ranges.is_empty() {
+                        let mut rules = blk.rules.clone();
+                        for r_item in &mut rules {
+                            r_item.kind.remap_dxf(&dxf_map);
+                        }
+                        sheet.cf.blocks.push(sheetcore::cf::CfBlock {
+                            ranges: tiled_ranges,
+                            rules,
+                        });
+                        sheet.cf_dirty = true;
+                    }
+                }
             }
         }
+        let after_merges = self.wb.sheet(si).merges.to_vec();
+        let merge_edit = sheetcore::undo::MergeEdit::between(si, &before_merges, &after_merges);
         if let Some(net) = self.net.as_ref() {
             net.broadcast_style(si, wire);
+            if merge_edit.is_some() {
+                let before_set: std::collections::HashSet<_> = before_merges.iter().copied().collect();
+                for &m in &after_merges {
+                    if !before_set.contains(&m) {
+                        net.broadcast_merge(si, m, true);
+                    }
+                }
+            }
         }
-        self.record_deltas("格式刷", changes);
+        if !changes.is_empty() || merge_edit.is_some() {
+            self.undo.push(sheetcore::undo::Action {
+                label: "格式刷".into(),
+                deltas: changes,
+                focus: (si, self.sel.0, self.sel.1),
+                snap_before: None,
+                snap_after: None,
+                by_site: self.undo.site,
+                shapes: None,
+                pictures: None,
+                merges: merge_edit,
+                refresh_sizes: None,
+            });
+        }
+        if let Some(cf_before) = before_cf {
+            let cf_after = self.wb.sheet(si).cf.clone();
+            if cf_after != cf_before {
+                self.undo.push_meta(
+                    "格式刷（条件格式）",
+                    (si, self.sel.0, self.sel.1),
+                    sheetcore::undo::MetaEdit {
+                        sheet: si,
+                        cf: Some((cf_before, cf_after)),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         if p.continuous {
@@ -22074,18 +22196,18 @@ fn clear_selection(&mut self) {
 
     /// Excel 的「文件」后台视图：左侧一列导航，右侧整块内容。
     /// 打开时盖住功能区和表格，标题栏保留。
-    /// 富文本：选中文字后加粗/改色/改字号
+    /// 富文本：选中文字后加粗/斜体/下划线/删除线/上下标/改色/改字号，带实时预览、保护守卫与撤销
     fn rich_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.rich_dlg.take() else { return };
         let mut open = true;
         let mut apply = false;
-        ui_kit::window(ctx, "富文本", 420.0).open(&mut open).show(ctx, |ui| {
+        ui_kit::window(ctx, "富文本", 480.0).open(&mut open).show(ctx, |ui| {
             ui.label("先选中文字，再点下面的按钮；不选表示整格");
             let text = sheetcore::richtext::runs_text(&d.runs);
             let mut buf = text.clone();
             let out = egui::TextEdit::multiline(&mut buf)
                 .desired_rows(4)
-                .desired_width(380.0)
+                .desired_width(440.0)
                 .show(ui);
             if let Some(range) = out.cursor_range {
                 let a = range.primary.ccursor.index;
@@ -22100,7 +22222,7 @@ fn clear_selection(&mut self) {
             } else {
                 d.sel
             };
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("加粗").clicked() {
                     sheetcore::richtext::apply_range(&mut d.runs, start, end, &|r| {
                         r.bold = !r.bold
@@ -22109,6 +22231,26 @@ fn clear_selection(&mut self) {
                 if ui.button("斜体").clicked() {
                     sheetcore::richtext::apply_range(&mut d.runs, start, end, &|r| {
                         r.italic = !r.italic
+                    });
+                }
+                if ui.button("下划线").clicked() {
+                    sheetcore::richtext::apply_range(&mut d.runs, start, end, &|r| {
+                        r.underline = !r.underline
+                    });
+                }
+                if ui.button("删除线").clicked() {
+                    sheetcore::richtext::apply_range(&mut d.runs, start, end, &|r| {
+                        r.strikethrough = !r.strikethrough
+                    });
+                }
+                if ui.button("上标").clicked() {
+                    sheetcore::richtext::apply_range(&mut d.runs, start, end, &|r| {
+                        r.vert_align = if r.vert_align == 1 { 0 } else { 1 };
+                    });
+                }
+                if ui.button("下标").clicked() {
+                    sheetcore::richtext::apply_range(&mut d.runs, start, end, &|r| {
+                        r.vert_align = if r.vert_align == 2 { 0 } else { 2 };
                     });
                 }
                 for (name, c) in [("红", [192, 0, 0]), ("蓝", [0, 70, 180]), ("绿", [16, 124, 65])] {
@@ -22122,6 +22264,9 @@ fn clear_selection(&mut self) {
                     sheetcore::richtext::apply_range(&mut d.runs, start, end, &|r| {
                         r.bold = false;
                         r.italic = false;
+                        r.underline = false;
+                        r.strikethrough = false;
+                        r.vert_align = 0;
                         r.color = None;
                         r.size = None;
                         r.font = None;
@@ -22141,6 +22286,56 @@ fn clear_selection(&mut self) {
                     });
                 }
             });
+            // 实时分段样式预览
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(430.0);
+                let mut job = egui::text::LayoutJob::default();
+                let def_col = ui.visuals().text_color();
+                for run in &d.runs {
+                    let base_sz = run.size.unwrap_or(11.0) * 4.0 / 3.0;
+                    let eff_sz = if run.vert_align != 0 {
+                        (base_sz * 0.70).max(7.0)
+                    } else {
+                        base_sz
+                    };
+                    let rname = run.font.as_deref().unwrap_or("");
+                    let (fam, fsz, _) = if run.bold {
+                        bold_font(rname, eff_sz)
+                    } else {
+                        (cell_family(rname), eff_sz, false)
+                    };
+                    let col = run
+                        .color
+                        .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
+                        .unwrap_or(def_col);
+                    job.append(
+                        &run.text,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: FontId::new(fsz, fam),
+                            color: col,
+                            italics: run.italic,
+                            underline: if run.underline {
+                                Stroke::new(1.0, col)
+                            } else {
+                                Stroke::NONE
+                            },
+                            strikethrough: if run.strikethrough {
+                                Stroke::new(1.0, col)
+                            } else {
+                                Stroke::NONE
+                            },
+                            valign: match run.vert_align {
+                                1 => egui::Align::TOP,
+                                2 => egui::Align::BOTTOM,
+                                _ => egui::Align::Center,
+                            },
+                            ..Default::default()
+                        },
+                    );
+                }
+                ui.label(job);
+            });
             ui_kit::footer(ui, |ui| {
                 if ui_kit::primary_button(ui, "确定").clicked() {
                     apply = true;
@@ -22151,25 +22346,55 @@ fn clear_selection(&mut self) {
             });
         });
         if apply {
+            if self.edit_blocked() || !self.write_preflight(&[(d.r, d.c)], "富文本") {
+                return;
+            }
+            let si = self.sheet_idx;
+            let key = (d.r, d.c);
             let runs = std::mem::take(&mut d.runs);
             let text = sheetcore::richtext::runs_text(&runs);
-            let key = (d.r, d.c);
+            let before_cell = self
+                .wb
+                .sheet(si)
+                .get(d.r, d.c)
+                .map(|c| c.into_owned())
+                .unwrap_or_default();
+            let before_rich = self.wb.sheet(si).rich.get(&key).cloned();
+            let after_cell = sheetcore::model::Cell {
+                value: sheetcore::model::Value::Text(text.into()),
+                formula: None,
+            };
+            let after_rich = if runs.iter().all(|r| r.is_plain()) {
+                None
+            } else {
+                Some(runs)
+            };
             {
-                let sheet = self.wb.sheet_mut(self.sheet_idx);
-                sheet.rich.insert(key, runs);
+                let sheet = self.wb.sheet_mut(si);
+                sheet.set(d.r, d.c, after_cell.clone());
+                match &after_rich {
+                    Some(r_vec) => {
+                        sheet.rich.insert(key, r_vec.clone());
+                    }
+                    None => {
+                        sheet.rich.remove(&key);
+                    }
+                }
                 sheet.rich_dirty = true;
-                sheet.set(
-                    d.r,
-                    d.c,
-                    sheetcore::model::Cell {
-                        value: sheetcore::model::Value::Text(text.into()),
-                        formula: None,
-                    },
-                );
             }
+            self.undo.push_meta(
+                "富文本",
+                (si, d.r, d.c),
+                sheetcore::undo::MetaEdit {
+                    sheet: si,
+                    rich: vec![(key, before_cell, after_cell, before_rich, after_rich)],
+                    ..Default::default()
+                },
+            );
+            self.recalc_and_broadcast(&[(si, d.r, d.c)]);
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.status = "富文本已应用（保存后 Excel 里能看到分段格式）".into();
+            self.status = "富文本已应用（支持 Ctrl+Z 撤销，保存后 Excel 完整显示）".into();
             open = false;
         }
         if open {
@@ -30332,7 +30557,7 @@ fn clear_selection(&mut self) {
                         }
                     }
                     let w = g.size().x;
-                    // 跨列居中 (halign == 4)：向右探测连续空白带同格式的邻列并扩展 span_rect
+                    // 跨列居中 (halign == 4)：仅跨越右侧同为跨列居中且为空的邻列（不吞并常规对齐空白格）
                     let span_rect = if st.halign == 4 {
                         let sh = self.wb.sheet(self.sheet_idx);
                         let mut end_x = rect.max.x;
@@ -30340,7 +30565,7 @@ fn clear_selection(&mut self) {
                         for nc in (c + 1)..=col_limit {
                             let blank = sh.get(r, nc).is_none_or(|x| x.is_blank());
                             let nst = self.wb.styles.get(sh.style_of(r, nc));
-                            if blank && (nst.halign == 4 || nst.halign == 0) {
+                            if blank && nst.halign == 4 {
                                 end_x += sh.cols.size(nc) * self.zoom * self.paint_scale;
                             } else {
                                 break;
@@ -30712,6 +30937,123 @@ impl SheetApp {
         (left_extra, right_extra)
     }
 
+    #[inline]
+    fn layout_cell_galley(
+        painter: &egui::Painter,
+        text: String,
+        mut font: FontId,
+        color: Color32,
+        italic: bool,
+        vert_align: u8,
+        max_w: Option<f32>,
+        halign: egui::Align,
+    ) -> std::sync::Arc<egui::Galley> {
+        if !italic && vert_align == 0 && max_w.is_none() {
+            return painter.layout_no_wrap(text, font, color);
+        }
+        if vert_align != 0 {
+            font.size = (font.size * 0.70).max(5.0);
+        }
+        let mut job = egui::text::LayoutJob::default();
+        job.halign = halign;
+        job.wrap.max_width = max_w.unwrap_or(f32::INFINITY);
+        job.append(
+            &text,
+            0.0,
+            egui::TextFormat {
+                font_id: font,
+                color,
+                italics: italic,
+                valign: match vert_align {
+                    1 => egui::Align::TOP,
+                    2 => egui::Align::BOTTOM,
+                    _ => egui::Align::Center,
+                },
+                ..Default::default()
+            },
+        );
+        painter.layout_job(job)
+    }
+
+    fn append_pattern_to_mesh(
+        mesh: &mut egui::Mesh,
+        rect: Rect,
+        pat: &sheetcore::style_ext::FillPattern,
+    ) {
+        let kind = pat.kind.as_str();
+        if kind == "solid" || kind == "none" || kind.is_empty() || rect.width() < 2.0 || rect.height() < 2.0 {
+            return;
+        }
+        let fg = pat.fg.unwrap_or([120, 128, 138]);
+        let col = Color32::from_rgba_unmultiplied(fg[0], fg[1], fg[2], 170);
+        let step = 5.0f32;
+        let horiz = kind.contains("Horizontal") || kind.contains("Grid");
+        let vert = kind.contains("Vertical") || kind.contains("Grid");
+        let diag_up = kind.contains("Up") || kind.contains("Trellis");
+        let diag_dn = kind.contains("Down") || kind.contains("Trellis");
+        if horiz {
+            let mut y = rect.min.y + step * 0.5;
+            while y < rect.max.y {
+                mesh.add_colored_rect(
+                    Rect::from_min_max(egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, (y + 0.8).min(rect.max.y))),
+                    col,
+                );
+                y += step;
+            }
+        }
+        if vert {
+            let mut x = rect.min.x + step * 0.5;
+            while x < rect.max.x {
+                mesh.add_colored_rect(
+                    Rect::from_min_max(egui::pos2(x, rect.min.y), egui::pos2((x + 0.8).min(rect.max.x), rect.max.y)),
+                    col,
+                );
+                x += step;
+            }
+        }
+        if diag_up || diag_dn {
+            let dstep = step * 1.4;
+            let cw = rect.width();
+            let ch = rect.height();
+            let span = cw + ch;
+            let mut d = 0.0f32;
+            while d < span {
+                if diag_up {
+                    let p1 = egui::pos2(rect.min.x + (d - ch).max(0.0), rect.min.y + d.min(ch));
+                    let p2 = egui::pos2(rect.min.x + d.min(cw), rect.min.y + (d - cw).max(0.0));
+                    if p1.distance_sq(p2) > 0.25 {
+                        border_lines::append_to_mesh(mesh, p1, p2, 7, col, 1.0);
+                    }
+                }
+                if diag_dn {
+                    let p1 = egui::pos2(rect.min.x + (d - ch).max(0.0), rect.max.y - d.min(ch));
+                    let p2 = egui::pos2(rect.min.x + d.min(cw), rect.max.y - (d - cw).max(0.0));
+                    if p1.distance_sq(p2) > 0.25 {
+                        border_lines::append_to_mesh(mesh, p1, p2, 7, col, 1.0);
+                    }
+                }
+                d += dstep;
+            }
+        }
+        if !horiz && !vert && !diag_up && !diag_dn {
+            let dot_step = if kind.contains("0625") { 6.0f32 } else { 4.0f32 };
+            let mut row = 0usize;
+            let mut y = rect.min.y + 1.5;
+            while y < rect.max.y - 1.0 {
+                let mut x = rect.min.x + if row % 2 == 0 { 1.5 } else { 1.5 + dot_step * 0.5 };
+                while x < rect.max.x - 1.0 {
+                    mesh.add_colored_rect(
+                        Rect::from_min_size(egui::pos2(x, y), egui::vec2(1.1, 1.1)),
+                        col,
+                    );
+                    x += dot_step;
+                }
+                y += dot_step;
+                row += 1;
+            }
+        }
+    }
+
     fn build_prepared_cell(
         rc: &CellRenderCtx<'_>,
         caches: &mut grid_render_cache::Rules,
@@ -30723,6 +31065,7 @@ impl SheetApp {
         let ov = rc.cf_map.get(&(r, c));
         let sid = sh.style_of(r, c);
         let st = rc.wb.styles.get(sid);
+        let pattern = rc.wb.styles.pattern_of(sid).cloned();
         let (table_header, table_fill) = if sh.tables.is_empty() {
             (false, None)
         } else if let Some(t) = sh
@@ -30835,6 +31178,7 @@ impl SheetApp {
                 grid_render_cache::PreparedText::Empty
             } else {
                 let cf_bold = ov.map(|o| o.bold).unwrap_or(false);
+                let cf_italic = ov.map(|o| o.italic).unwrap_or(false);
                 let fmt_color = sheetcore::style::format_color(&cell.value, &st.format);
                 let mut base_color = ov.and_then(|o| o.color).or(fmt_color).unwrap_or(st.color);
                 if table_header && ov.is_none() {
@@ -30842,6 +31186,7 @@ impl SheetApp {
                 }
                 let font_name = ov.and_then(|o| o.font.as_deref()).unwrap_or(st.font.as_str());
                 let bold = st.bold || cf_bold || table_header;
+                let italic = st.italic || cf_italic;
                 let fs = (st.size * 4.0 / 3.0 * rc.paint_scale * rc.font_zoom).max(5.0);
                 let (family, fs_bold, _) = if bold {
                     bold_font(font_name, fs)
@@ -30864,68 +31209,218 @@ impl SheetApp {
                     Color32::from_rgb(base_color[0], base_color[1], base_color[2])
                 };
                 let align = cell_text_align(st.halign, &cell.value);
+                let job_halign = match align {
+                    Align2::CENTER_CENTER => egui::Align::Center,
+                    Align2::RIGHT_CENTER => egui::Align::Max,
+                    _ => egui::Align::Min,
+                };
                 let icon_shift = if ov.and_then(|o| o.icon.as_ref()).is_some() { 18.0 } else { 0.0 };
+                let indent_px = st.indent as f32 * st.size * (4.0 / 3.0) * 2.0;
                 let tx = match align {
                     Align2::CENTER_CENTER => w_rect * 0.5 + icon_shift * 0.5,
                     Align2::RIGHT_CENTER => w_rect - 6.0,
-                    _ => 6.0 + icon_shift + st.indent as f32 * st.size * (4.0 / 3.0) * 2.0,
+                    _ => 6.0 + icon_shift + indent_px,
                 };
                 let multiline = st.wrap || txt.contains('\n');
-                let rich_runs = (has_rich && !multiline && !st.vertical_text)
+                let rich_runs = (has_rich && !st.vertical_text && st.rotation == 0)
                     .then(|| sh.rich.get(&(r, c)))
                     .flatten();
+                let acct_split = if !showing_formula
+                    && !multiline
+                    && !st.vertical_text
+                    && st.rotation == 0
+                    && rich_runs.is_none()
+                    && st.format.contains('*')
+                {
+                    sheetcore::style::format_accounting_split(
+                        rc.wb.date_system,
+                        &cell.value,
+                        &st.format,
+                    )
+                } else {
+                    None
+                };
 
                 if let Some(runs) = rich_runs {
-                    let mut built: Vec<(FontId, Color32, std::sync::Arc<egui::Galley>)> =
-                        Vec::with_capacity(runs.len());
-                    let mut total = 0.0f32;
+                    let max_w = (w_rect - 12.0 - icon_shift - indent_px).max(8.0);
+                    let mut job = egui::text::LayoutJob::default();
+                    job.halign = job_halign;
+                    job.wrap.max_width = if multiline { max_w } else { f32::INFINITY };
                     for run in runs {
-                        let rsz = (run.size.unwrap_or(st.size) * 4.0 / 3.0 * rc.paint_scale * rc.font_zoom).max(5.0);
+                        let base_rsz = (run.size.unwrap_or(st.size) * 4.0 / 3.0 * rc.paint_scale * rc.font_zoom).max(5.0);
+                        let rsz = if run.vert_align != 0 {
+                            (base_rsz * 0.70).max(5.0)
+                        } else {
+                            base_rsz
+                        };
                         let run_name = run.font.as_deref().unwrap_or(font_name);
                         let rb = run.bold || st.bold;
+                        let ri = run.italic || italic;
                         let (rfam, rfsz, _) = if rb { bold_font(run_name, rsz) } else { (cell_family(run_name), rsz, false) };
-                        let rf = FontId::new(rfsz, rfam);
                         let rc_col = run.color.map(|c| Color32::from_rgb(c[0], c[1], c[2])).unwrap_or(color);
-                        let g = rc.painter.layout_no_wrap(run.text.clone(), rf.clone(), rc_col);
-                        total += g.size().x;
-                        built.push((rf, rc_col, g));
+                        job.append(
+                            &run.text,
+                            0.0,
+                            egui::TextFormat {
+                                font_id: FontId::new(rfsz, rfam),
+                                color: rc_col,
+                                italics: ri,
+                                underline: if run.underline {
+                                    Stroke::new(1.0, rc_col)
+                                } else {
+                                    Stroke::NONE
+                                },
+                                strikethrough: if run.strikethrough {
+                                    Stroke::new(1.0, rc_col)
+                                } else {
+                                    Stroke::NONE
+                                },
+                                valign: match run.vert_align {
+                                    1 => egui::Align::TOP,
+                                    2 => egui::Align::BOTTOM,
+                                    _ => egui::Align::Center,
+                                },
+                                ..Default::default()
+                            },
+                        );
                     }
-                    let mut x = match align {
-                        Align2::CENTER_CENTER => w_rect * 0.5 - total * 0.5,
-                        Align2::RIGHT_CENTER => w_rect - 6.0 - total,
-                        _ => 6.0 + icon_shift + st.indent as f32 * st.size * (4.0 / 3.0) * 2.0,
+                    let galley = rc.painter.layout_job(job);
+                    let gh = galley.size().y;
+                    let grect = galley.rect;
+                    let x = match align {
+                        Align2::CENTER_CENTER => w_rect * 0.5 + icon_shift * 0.5 - (grect.min.x + grect.width() * 0.5),
+                        Align2::RIGHT_CENTER => w_rect - 6.0 - grect.max.x,
+                        _ => 6.0 + icon_shift + indent_px - grect.min.x,
                     };
-                    let mut run_out = Vec::with_capacity(built.len());
-                    for (_, rc_col, g) in built {
-                        let rw = g.size().x;
-                        let gh = g.size().y;
-                        let y = if st.valign == 1 {
-                            3.0
-                        } else if st.valign == 3 {
-                            h_rect - 3.0 - gh
-                        } else {
-                            h_rect * 0.5 - gh * 0.5
-                        };
-                        run_out.push((x, y, g, rc_col));
-                        x += rw;
-                    }
-                    let spill_lr = if rc.text_spill {
+                    let y = if st.valign == 1 {
+                        3.0
+                    } else if st.valign == 3 {
+                        (h_rect - 3.0 - gh).max(if multiline { 2.0 } else { -1e4 })
+                    } else {
+                        let c_y = h_rect * 0.5 - gh * 0.5;
+                        if multiline { c_y.max(2.0) } else { c_y }
+                    };
+                    let fits = underline_code == 0
+                        && !st.strikethrough
+                        && local_rect
+                            .shrink(1.0)
+                            .contains_rect(galley.mesh_bounds.translate(egui::vec2(x, y)));
+                    let spill_lr = if !multiline && !fits && rc.text_spill {
                         depends_on_row_neighbors = true;
                         Self::compute_spill_lr(sh, caches, r, c, align, zoom_scale)
                     } else {
                         (0.0, 0.0)
                     };
                     grid_render_cache::PreparedText::Rich {
-                        runs: run_out.into(),
+                        galley,
+                        offset: egui::vec2(x, y),
+                        color,
+                        fits,
                         spill_lr,
                         underline: underline_code,
+                        strikethrough: st.strikethrough,
+                        multiline,
+                    }
+                } else if let Some((left_txt, rep_ch, right_txt)) = acct_split {
+                    let left_g = (!left_txt.is_empty()).then(|| {
+                        Self::layout_cell_galley(
+                            rc.painter,
+                            left_txt,
+                            font.clone(),
+                            color,
+                            italic,
+                            st.vert_align,
+                            None,
+                            egui::Align::Min,
+                        )
+                    });
+                    let right_g = (!right_txt.is_empty()).then(|| {
+                        Self::layout_cell_galley(
+                            rc.painter,
+                            right_txt,
+                            font.clone(),
+                            color,
+                            italic,
+                            st.vert_align,
+                            None,
+                            egui::Align::Min,
+                        )
+                    });
+                    let lw = left_g.as_ref().map_or(0.0, |g| g.size().x);
+                    let rw = right_g.as_ref().map_or(0.0, |g| g.size().x);
+                    let gh = left_g
+                        .as_ref()
+                        .map_or(0.0, |g| g.size().y)
+                        .max(right_g.as_ref().map_or(0.0, |g| g.size().y));
+                    let left_x = 6.0 + icon_shift + indent_px;
+                    let right_x = (w_rect - 6.0 - rw).max(left_x + lw);
+                    let fill_g = if rep_ch != ' ' {
+                        let gap = (right_x - (left_x + lw)).max(0.0);
+                        let rep_w = Self::layout_cell_galley(
+                            rc.painter,
+                            rep_ch.to_string(),
+                            font.clone(),
+                            color,
+                            italic,
+                            st.vert_align,
+                            None,
+                            egui::Align::Min,
+                        )
+                        .size()
+                        .x
+                        .max(2.0);
+                        let cnt = (gap / rep_w).floor() as usize;
+                        (cnt > 0).then(|| {
+                            let s: String = std::iter::repeat_n(rep_ch, cnt.min(256)).collect();
+                            (
+                                left_x + lw,
+                                Self::layout_cell_galley(
+                                    rc.painter,
+                                    s,
+                                    font.clone(),
+                                    color,
+                                    italic,
+                                    st.vert_align,
+                                    None,
+                                    egui::Align::Min,
+                                ),
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    let y = if st.valign == 1 {
+                        4.0
+                    } else if st.valign == 3 {
+                        h_rect - 4.0 - gh
+                    } else {
+                        h_rect * 0.5 - gh * 0.5
+                    };
+                    grid_render_cache::PreparedText::Accounting {
+                        left: left_g,
+                        fill: fill_g,
+                        right: right_g,
+                        left_x,
+                        right_x,
+                        y,
                         color,
+                        underline: underline_code,
+                        strikethrough: st.strikethrough,
                     }
                 } else if multiline && !st.vertical_text {
-                    let max_w = (w_rect - 12.0).max(8.0);
-                    let galley = rc.painter.layout(txt, font, color, max_w);
+                    let max_w = (w_rect - 12.0 - icon_shift - indent_px).max(8.0);
+                    let galley = Self::layout_cell_galley(
+                        rc.painter,
+                        txt,
+                        font,
+                        color,
+                        italic,
+                        st.vert_align,
+                        Some(max_w),
+                        job_halign,
+                    );
                     let gh = galley.size().y;
-                    let gw = galley.size().x;
+                    let grect = galley.rect;
                     let top = if st.valign == 1 {
                         3.0
                     } else if st.valign == 3 {
@@ -30934,9 +31429,9 @@ impl SheetApp {
                         (h_rect * 0.5 - gh * 0.5).max(2.0)
                     };
                     let x = match align {
-                        Align2::CENTER_CENTER => w_rect * 0.5 - gw * 0.5,
-                        Align2::RIGHT_CENTER => w_rect - 6.0 - gw,
-                        _ => 6.0 + st.indent as f32 * st.size * (4.0 / 3.0) * 2.0,
+                        Align2::CENTER_CENTER => w_rect * 0.5 + icon_shift * 0.5 - (grect.min.x + grect.width() * 0.5),
+                        Align2::RIGHT_CENTER => w_rect - 6.0 - grect.max.x,
+                        _ => 6.0 + icon_shift + indent_px - grect.min.x,
                     };
                     let fits = underline_code == 0
                         && !st.strikethrough
@@ -30951,13 +31446,31 @@ impl SheetApp {
                     }
                 } else {
                     let mut eff_font = font.clone();
-                    let mut g = rc.painter.layout_no_wrap(txt.clone(), eff_font.clone(), color);
+                    let mut g = Self::layout_cell_galley(
+                        rc.painter,
+                        txt.clone(),
+                        eff_font.clone(),
+                        color,
+                        italic,
+                        st.vert_align,
+                        None,
+                        egui::Align::Min,
+                    );
                     let is_num_display = matches!(cell.value, Value::Number(_)) && !showing_formula;
                     if st.shrink_to_fit && !st.vertical_text && st.rotation == 0 && w_rect > 8.0 {
                         let avail_w = (w_rect - 8.0).max(4.0);
                         if g.size().x > avail_w && g.size().x > 1.0 {
                             eff_font.size = (eff_font.size * avail_w / g.size().x).max(5.0);
-                            g = rc.painter.layout_no_wrap(txt.clone(), eff_font.clone(), color);
+                            g = Self::layout_cell_galley(
+                                rc.painter,
+                                txt.clone(),
+                                eff_font.clone(),
+                                color,
+                                italic,
+                                st.vert_align,
+                                None,
+                                egui::Align::Min,
+                            );
                         }
                     } else if is_num_display && !st.vertical_text && st.rotation == 0 && st.halign != 4 {
                         let avail_w = (w_rect - 4.0 - icon_shift).max(4.0);
@@ -30983,7 +31496,7 @@ impl SheetApp {
                         for nc in (c + 1)..=col_limit {
                             let blank = !caches.grid.row_has_cell(sh, r, nc);
                             let nst = rc.wb.styles.get(sh.style_of(r, nc));
-                            if blank && (nst.halign == 4 || nst.halign == 0) {
+                            if blank && nst.halign == 4 {
                                 span_extra_w += sh.cols.size(nc) * zoom_scale;
                             } else {
                                 break;
@@ -30999,13 +31512,18 @@ impl SheetApp {
                             _ => tx,
                         }
                     };
-                    let y0 = if st.valign == 1 {
+                    let dy_va = match st.vert_align {
+                        1 => -eff_font.size * 0.16,
+                        2 => eff_font.size * 0.16,
+                        _ => 0.0,
+                    };
+                    let y0 = (if st.valign == 1 {
                         4.0
                     } else if st.valign == 3 {
                         h_rect - 4.0 - gh
                     } else {
                         h_rect * 0.5 - gh * 0.5
-                    };
+                    }) + dy_va;
                     if st.vertical_text {
                         let char_count = txt.chars().count();
                         let line_h = eff_font.size * 1.35;
@@ -31121,6 +31639,7 @@ impl SheetApp {
             has_rich,
             depends_on_row_neighbors,
             bg_fill,
+            pattern,
             cf_bar,
             cf_borders,
             diagonal,
@@ -31222,6 +31741,9 @@ impl SheetApp {
     ) {
         if let Some(fill) = entry.bg_fill {
             fills_mesh.add_colored_rect(rect, fill);
+        }
+        if let Some(pat) = &entry.pattern {
+            Self::append_pattern_to_mesh(fills_mesh, rect, pat);
         }
         if let Some(sides) = &entry.cf_borders {
             let rr = rect.shrink(0.5);
@@ -31445,45 +31967,135 @@ impl SheetApp {
                 }
             }
             grid_render_cache::PreparedText::Rich {
-                runs,
+                galley,
+                offset,
+                color,
+                fits,
                 spill_lr,
                 underline,
-                color,
+                strikethrough,
+                multiline,
             } => {
-                let tclip = if rc.text_spill { spill_rect(*spill_lr) } else { rect.intersect(quad_clip) };
-                for (dx, dy, g, rc_col) in runs.iter() {
-                    let pos = rect.min + egui::vec2(*dx, *dy);
-                    let run_clip = if tclip != quad_clip
-                        && tclip.contains_rect(Rect::from_min_size(pos, g.size()))
-                    {
-                        quad_clip
-                    } else {
-                        tclip
-                    };
-                    text_rec.push_quadrant(quad_clip, run_clip, egui::Shape::galley(pos, g.clone(), *rc_col));
-                    if *underline > 0 {
-                        let rw = g.size().x;
-                        let gh = g.size().y;
-                        let uy = pos.y + gh - 1.0;
+                let pos = rect.min + *offset;
+                let gsize = galley.size();
+                let raw_clip = if *fits {
+                    quad_clip
+                } else if !*multiline && rc.text_spill {
+                    spill_rect(*spill_lr)
+                } else {
+                    rect.intersect(quad_clip)
+                };
+                let tclip = if raw_clip != quad_clip
+                    && raw_clip.contains_rect(Rect::from_min_size(pos, gsize))
+                {
+                    quad_clip
+                } else {
+                    raw_clip
+                };
+                text_rec.push_quadrant(
+                    quad_clip,
+                    tclip,
+                    egui::Shape::galley(pos, galley.clone(), *color),
+                );
+                let uw = gsize.x;
+                let uh = gsize.y;
+                if *underline > 0 {
+                    let uy = pos.y + uh - 1.0;
+                    text_rec.push_quadrant(
+                        quad_clip,
+                        tclip,
+                        egui::Shape::line_segment(
+                            [egui::pos2(pos.x, uy), egui::pos2(pos.x + uw, uy)],
+                            Stroke::new(1.0, *color),
+                        ),
+                    );
+                    if *underline == 2 {
                         text_rec.push_quadrant(
                             quad_clip,
-                            run_clip,
+                            tclip,
                             egui::Shape::line_segment(
-                                [egui::pos2(pos.x, uy), egui::pos2(pos.x + rw, uy)],
+                                [egui::pos2(pos.x, uy + 2.0), egui::pos2(pos.x + uw, uy + 2.0)],
                                 Stroke::new(1.0, *color),
                             ),
                         );
-                        if *underline == 2 {
-                            text_rec.push_quadrant(
-                                quad_clip,
-                                run_clip,
-                                egui::Shape::line_segment(
-                                    [egui::pos2(pos.x, uy + 2.0), egui::pos2(pos.x + rw, uy + 2.0)],
-                                    Stroke::new(1.0, *color),
-                                ),
-                            );
-                        }
                     }
+                }
+                if *strikethrough {
+                    let sy = pos.y + uh * 0.52;
+                    text_rec.push_quadrant(
+                        quad_clip,
+                        tclip,
+                        egui::Shape::line_segment(
+                            [egui::pos2(pos.x, sy), egui::pos2(pos.x + uw, sy)],
+                            Stroke::new(1.0, *color),
+                        ),
+                    );
+                }
+            }
+            grid_render_cache::PreparedText::Accounting {
+                left,
+                fill,
+                right,
+                left_x,
+                right_x,
+                y,
+                color,
+                underline,
+                strikethrough,
+            } => {
+                let tclip = rect.intersect(quad_clip);
+                let mut gh = 0.0f32;
+                if let Some(g) = left {
+                    gh = gh.max(g.size().y);
+                    text_rec.push_quadrant(
+                        quad_clip,
+                        tclip,
+                        egui::Shape::galley(egui::pos2(rect.min.x + *left_x, rect.min.y + *y), g.clone(), *color),
+                    );
+                }
+                if let Some((fx, g)) = fill {
+                    gh = gh.max(g.size().y);
+                    text_rec.push_quadrant(
+                        quad_clip,
+                        tclip,
+                        egui::Shape::galley(egui::pos2(rect.min.x + *fx, rect.min.y + *y), g.clone(), *color),
+                    );
+                }
+                if let Some(g) = right {
+                    gh = gh.max(g.size().y);
+                    text_rec.push_quadrant(
+                        quad_clip,
+                        tclip,
+                        egui::Shape::galley(egui::pos2(rect.min.x + *right_x, rect.min.y + *y), g.clone(), *color),
+                    );
+                }
+                let x0 = rect.min.x + *left_x;
+                let x1 = rect.min.x + *right_x + right.as_ref().map_or(0.0, |g| g.size().x);
+                if *underline > 0 && x1 > x0 {
+                    let uy = rect.min.y + *y + gh - 1.0;
+                    text_rec.push_quadrant(
+                        quad_clip,
+                        tclip,
+                        egui::Shape::line_segment([egui::pos2(x0, uy), egui::pos2(x1, uy)], Stroke::new(1.0, *color)),
+                    );
+                    if *underline == 2 {
+                        text_rec.push_quadrant(
+                            quad_clip,
+                            tclip,
+                            egui::Shape::line_segment(
+                                [egui::pos2(x0, uy + 2.0), egui::pos2(x1, uy + 2.0)],
+                                Stroke::new(1.0, *color),
+                            ),
+                        );
+                    }
+                }
+                if *strikethrough && x1 > x0 {
+                    let sy = rect.min.y + *y + gh * 0.52;
+                    text_rec.push_quadrant(
+                        quad_clip,
+                        tclip,
+                        egui::Shape::line_segment([egui::pos2(x0, sy), egui::pos2(x1, sy)], Stroke::new(1.0, *color)),
+                    );
                 }
             }
             grid_render_cache::PreparedText::Vertical {
@@ -53232,6 +53844,7 @@ mod wave5_ui_tests {
             has_rich: false,
             depends_on_row_neighbors: false,
             bg_fill: None,
+            pattern: None,
             cf_bar: None,
             cf_borders: None,
             diagonal: None,

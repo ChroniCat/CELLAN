@@ -386,6 +386,13 @@ pub struct MetaEdit {
         std::collections::HashMap<u32, u8>,
         std::collections::HashMap<u32, u8>,
     )>,
+    pub rich: Vec<(
+        (u32, u32),
+        Cell,
+        Cell,
+        Option<Vec<crate::richtext::RichRun>>,
+        Option<Vec<crate::richtext::RichRun>>,
+    )>,
 }
 
 impl MetaEdit {
@@ -400,6 +407,7 @@ impl MetaEdit {
             && self.filter.is_none()
             && self.tables.is_none()
             && self.outline.is_none()
+            && self.rich.is_empty()
     }
 
     fn apply(&self, sheets: &mut [Sheet], redo: bool) {
@@ -496,6 +504,23 @@ impl MetaEdit {
             sh.row_levels = if redo { ra.clone() } else { rb.clone() };
             sh.col_levels = if redo { ca.clone() } else { cb.clone() };
             sh.layout_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if !self.rich.is_empty() {
+            for (pos, before_cell, after_cell, before_runs, after_runs) in &self.rich {
+                let target_cell = if redo { after_cell } else { before_cell };
+                let target_runs = if redo { after_runs } else { before_runs };
+                sh.set(pos.0, pos.1, target_cell.clone());
+                match target_runs {
+                    Some(runs) if !runs.is_empty() => {
+                        sh.rich.insert(*pos, runs.clone());
+                    }
+                    _ => {
+                        sh.rich.remove(pos);
+                    }
+                }
+            }
+            sh.rich_dirty = true;
             sh.bump_display_style_revision();
         }
     }

@@ -1162,10 +1162,22 @@ impl Sheet {
         // 溢出写回自己是先 set 再 insert，顺序不受影响。
         self.spilled.remove_if_present(&key);
         if cell.is_blank() {
+            if !self.loading && !self.rich.is_empty() && self.rich.remove(&(r, c)).is_some() {
+                self.rich_dirty = true;
+            }
             if self.cells.remove(r, c).is_some() {
                 self.cleared.insert(key);
             }
             return;
+        }
+        if !self.loading && !self.rich.is_empty() {
+            let keep_rich = match (&cell.value, &cell.formula, self.rich.get(&(r, c))) {
+                (Value::Text(t), None, Some(runs)) => crate::richtext::runs_text(runs) == t.as_ref(),
+                _ => false,
+            };
+            if !keep_rich && self.rich.remove(&(r, c)).is_some() {
+                self.rich_dirty = true;
+            }
         }
         self.cleared.remove_if_present(&key);
         self.cells.set(r, c, cell);
@@ -1174,6 +1186,9 @@ impl Sheet {
     pub fn remove(&mut self, r: u32, c: u32) -> Option<Cell> {
         if !self.loading {
             self.edited = true;
+            if !self.rich.is_empty() && self.rich.remove(&(r, c)).is_some() {
+                self.rich_dirty = true;
+            }
         }
         let key = CellRef::new(r, c);
         let out = self.cells.remove(r, c);

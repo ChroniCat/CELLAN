@@ -690,6 +690,7 @@ pub fn cell_style_hash(s: &crate::style::CellStyle) -> u64 {
     s.double_underline.hash(&mut h);
     s.vertical_text.hash(&mut h);
     s.strikethrough.hash(&mut h);
+    s.vert_align.hash(&mut h);
     s.rotation.hash(&mut h);
     s.font.hash(&mut h);
     s.size.to_bits().hash(&mut h);

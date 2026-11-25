@@ -19,6 +19,8 @@ pub struct CellView {
     pub strikethrough: bool,
     pub vertical_text: bool,
     pub shrink_to_fit: bool,
+    /// 0 正常，1 上标，2 下标
+    pub vert_align: u8,
     pub size: f32,
     /// 0 左 1 中 2 右（General 已按值类型解析）
     pub halign: u8,
@@ -31,6 +33,10 @@ pub struct CellView {
     /// 合并范围（含锚点自身）；None = 单格
     pub merge: Option<(u32, u32, u32, u32)>,
     pub fill: Option<[u8; 3]>,
+    /// 图案填充（斜纹/网格/点阵）
+    pub pattern: Option<crate::style_ext::FillPattern>,
+    /// 会计/重复填充拆分（`*<ch>` -> (左侧文本, 填充字符, 右侧文本)）
+    pub accounting: Option<(String, char, String)>,
     /// 数据条：比例 0..1 与颜色
     pub bar: Option<(f32, [u8; 3])>,
     /// 增强数据条（正负双向/零轴/隐藏数值）
@@ -121,8 +127,11 @@ pub(crate) fn view_with_merge(
     merge: Option<(u32, u32, u32, u32)>,
 ) -> Option<CellView> {
     let cell = sheet.get(r, c);
-    let st: &CellStyle = wb.styles.get(sheet.style_of(r, c));
+    let sid = sheet.style_of(r, c);
+    let st: &CellStyle = wb.styles.get(sid);
+    let pattern = wb.styles.pattern_of(sid).cloned();
     let has_style = st.fill.is_some()
+        || pattern.is_some()
         || st.border.iter().any(|b| b.style != 0)
         || st.diagonal.is_some()
         || !st.format.is_empty()
@@ -196,6 +205,11 @@ pub(crate) fn view_with_merge(
             text.clear();
         }
     }
+    let accounting = if rich_runs.is_none() && !matches!(value, Value::Empty) && !text.is_empty() {
+        crate::style::format_accounting_split(wb.date_system, &value, &st.format)
+    } else {
+        None
+    };
     Some(CellView {
         text,
         color,
@@ -206,6 +220,7 @@ pub(crate) fn view_with_merge(
         strikethrough: st.strikethrough,
         vertical_text: st.vertical_text,
         shrink_to_fit: st.shrink_to_fit,
+        vert_align: st.vert_align,
         size: if st.size > 0.0 { st.size } else { 11.0 },
         halign,
         valign,
@@ -214,6 +229,8 @@ pub(crate) fn view_with_merge(
         indent: st.indent,
         merge,
         fill,
+        pattern,
+        accounting,
         bar,
         bar_ext,
         icon,

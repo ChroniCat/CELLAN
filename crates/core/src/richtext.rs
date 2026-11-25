@@ -8,6 +8,10 @@ pub struct RichRun {
     pub text: String,
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+    /// 0 = 正常, 1 = 上标 (superscript), 2 = 下标 (subscript)
+    pub vert_align: u8,
     pub color: Option<[u8; 3]>,
     pub size: Option<f32>,
     pub font: Option<String>,
@@ -19,6 +23,9 @@ impl RichRun {
             text: text.into(),
             bold: false,
             italic: false,
+            underline: false,
+            strikethrough: false,
+            vert_align: 0,
             color: None,
             size: None,
             font: None,
@@ -26,7 +33,14 @@ impl RichRun {
     }
 
     pub fn is_plain(&self) -> bool {
-        !self.bold && !self.italic && self.color.is_none() && self.size.is_none() && self.font.is_none()
+        !self.bold
+            && !self.italic
+            && !self.underline
+            && !self.strikethrough
+            && self.vert_align == 0
+            && self.color.is_none()
+            && self.size.is_none()
+            && self.font.is_none()
     }
 }
 
@@ -55,6 +69,17 @@ pub fn runs_to_inline(runs: &[RichRun]) -> String {
         }
         if r.italic {
             props.push_str("<i/>");
+        }
+        if r.underline {
+            props.push_str("<u/>");
+        }
+        if r.strikethrough {
+            props.push_str("<strike/>");
+        }
+        match r.vert_align {
+            1 => props.push_str("<vertAlign val=\"superscript\"/>"),
+            2 => props.push_str("<vertAlign val=\"subscript\"/>"),
+            _ => {}
         }
         if let Some(c) = r.color {
             props.push_str(&format!("<color rgb=\"{}\"/>", color_hex(c)));
@@ -92,7 +117,7 @@ pub fn parse_inline(xml: &str) -> Option<Vec<RichRun>> {
         };
         let seg = &body[i..j];
         let props = seg.find("<rPr>").and_then(|p| seg[p..].find("</rPr>").map(|e| (p, p + e)));
-        let (bold, italic, color, size, font) = match props {
+        let (bold, italic, underline, strikethrough, vert_align, color, size, font) = match props {
             Some((a, b)) => {
                 let pr = &seg[a..b];
                 let color = pr
@@ -121,15 +146,28 @@ pub fn parse_inline(xml: &str) -> Option<Vec<RichRun>> {
                     let q = rest.find('"')?;
                     Some(unescape(&rest[..q]))
                 });
+                let underline = pr.contains("<u/>")
+                    || (pr.contains("<u ") && !pr.contains("<u val=\"none\""));
+                let strikethrough = pr.contains("<strike/>") || pr.contains("<strike val=\"1\"");
+                let vert_align = if pr.contains("<vertAlign val=\"superscript\"") {
+                    1u8
+                } else if pr.contains("<vertAlign val=\"subscript\"") {
+                    2u8
+                } else {
+                    0u8
+                };
                 (
                     pr.contains("<b/>") || pr.contains("<b val=\"1\""),
                     pr.contains("<i/>") || pr.contains("<i val=\"1\""),
+                    underline,
+                    strikethrough,
+                    vert_align,
                     color,
                     size,
                     font,
                 )
             }
-            None => (false, false, None, None, None),
+            None => (false, false, false, false, 0, None, None, None),
         };
         let text = seg
             .find("<t")
@@ -144,6 +182,9 @@ pub fn parse_inline(xml: &str) -> Option<Vec<RichRun>> {
                 text,
                 bold,
                 italic,
+                underline,
+                strikethrough,
+                vert_align,
                 color,
                 size,
                 font,
@@ -290,6 +331,9 @@ mod tests {
                 text: "Hello ".into(),
                 bold: true,
                 italic: false,
+                underline: false,
+                strikethrough: false,
+                vert_align: 0,
                 color: Some([255, 0, 0]),
                 size: Some(14.0),
                 font: None,
@@ -412,6 +456,9 @@ pub fn apply_range(runs: &mut Vec<RichRun>, start: usize, end: usize, f: &dyn Fn
         if let Some(last) = merged.last_mut() {
             let same = last.bold == r.bold
                 && last.italic == r.italic
+                && last.underline == r.underline
+                && last.strikethrough == r.strikethrough
+                && last.vert_align == r.vert_align
                 && last.color == r.color
                 && last.size == r.size
                 && last.font == r.font;

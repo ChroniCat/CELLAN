@@ -1276,12 +1276,14 @@ fn draw_view(
     let bw = setup.black_and_white;
     let draft = setup.draft;
 
-    // 1. 背景色（黑白或草稿模式跳过浅色填充，保证激光打印极高可读性）
-    if !bw
-        && !draft
-        && let Some(fill) = view.fill
-    {
-        out.rects.push((x, top, cw, ch, fill));
+    // 1. 背景色与图案填充（黑白或草稿模式跳过浅色填充，保证激光打印极高可读性）
+    if !bw && !draft {
+        if let Some(fill) = view.fill {
+            out.rects.push((x, top, cw, ch, fill));
+        }
+        if let Some(pat) = &view.pattern {
+            draw_fill_pattern(pat, x, top, cw, ch, scale, out);
+        }
     }
 
     // 2. 条件格式数据条（支持正负双向与零轴线）
@@ -1451,42 +1453,33 @@ fn draw_view(
     let need_clip = view.wrap || right_occupied || view.halign != 0 || view.rotation != 0;
     let clip_box = need_clip.then_some([x, top, cw, ch]);
 
-    // 富文本逐段渲染（单行或无换行时保留每段独立粗/斜/色/字号）
-    if let Some(runs) = &view.rich_runs
+    // 会计/重复填充拆分（`*<ch>`：左段靠左、右段靠右、中间用重复字符填满）
+    if let Some((left, rep, right)) = &view.accounting
         && !view.is_error
         && !view.wrap
         && view.rotation == 0
-        && !runs.iter().any(|rr| rr.text.contains('\n'))
+        && view.rich_runs.is_none()
     {
-        let total_w: f32 = runs
-            .iter()
-            .map(|rr| {
-                let rsz = (rr.size.unwrap_or(view.size) * scale).max(3.0);
-                out.tw(&rr.text, rsz)
-            })
-            .sum();
-        let ty = cell_baseline(view.valign, top, ch, line_h, line_h, asc, desc);
-        let mut cur_x = match view.halign {
-            1 => x + icon_gutter + (cw - icon_gutter - total_w) * 0.5,
-            2 => x + cw - pad - total_w,
-            _ => x + pad + indent + icon_gutter,
+        let (eff_sz, dy_va) = match view.vert_align {
+            1 => (size * 0.68, size * 0.34),
+            2 => (size * 0.68, -size * 0.14),
+            _ => (size, 0.0),
         };
-        for rr in runs {
-            if rr.text.is_empty() {
-                continue;
-            }
-            let rsz = (rr.size.unwrap_or(view.size) * scale).max(3.0);
-            let rw = out.tw(&rr.text, rsz);
-            let rc = bw_color(rr.color.unwrap_or(view.color), bw);
+        let ty = cell_baseline(view.valign, top, ch, line_h, line_h, asc, desc) + dy_va;
+        let lx = x + pad + indent + icon_gutter;
+        let lw = out.tw(left, eff_sz);
+        let rw = out.tw(right, eff_sz);
+        let rx = (x + cw - pad - rw).max(lx + lw);
+        if !left.is_empty() {
             emit_text_with_decorations(
-                cur_x,
+                lx,
                 ty,
-                rsz,
-                rw,
-                rr.text.clone(),
-                rc,
-                rr.bold || view.bold,
-                rr.italic || view.italic,
+                eff_sz,
+                lw,
+                left.clone(),
+                text_color,
+                view.bold,
+                view.italic,
                 0.0,
                 view.underline,
                 view.double_underline,
@@ -1494,13 +1487,159 @@ fn draw_view(
                 clip_box,
                 out,
             );
-            cur_x += rw;
+        }
+        if *rep != ' ' {
+            let gap = (rx - (lx + lw)).max(0.0);
+            let rep_s = rep.to_string();
+            let cw_rep = out.tw(&rep_s, eff_sz).max(2.0);
+            let cnt = (gap / cw_rep).floor() as usize;
+            if cnt > 0 {
+                let fill_str: String = std::iter::repeat_n(*rep, cnt.min(256)).collect();
+                let fw = out.tw(&fill_str, eff_sz);
+                emit_text_with_decorations(
+                    lx + lw,
+                    ty,
+                    eff_sz,
+                    fw,
+                    fill_str,
+                    text_color,
+                    view.bold,
+                    view.italic,
+                    0.0,
+                    view.underline,
+                    view.double_underline,
+                    view.strikethrough,
+                    clip_box,
+                    out,
+                );
+            }
+        }
+        if !right.is_empty() {
+            emit_text_with_decorations(
+                rx,
+                ty,
+                eff_sz,
+                rw,
+                right.clone(),
+                text_color,
+                view.bold,
+                view.italic,
+                0.0,
+                view.underline,
+                view.double_underline,
+                view.strikethrough,
+                clip_box,
+                out,
+            );
         }
         return;
     }
 
+    // 富文本逐段渲染（支持单行、显式 \n 多行及自动换行，保留每段独立粗/斜/下划线/删除线/上下标/色/字号）
+    if let Some(runs) = &view.rich_runs
+        && !view.is_error
+        && view.rotation == 0
+    {
+        // 按 \n 和（启用 wrap 时）按可用宽度切分为视觉行，每行含若干 (text, run_ref, eff_sz, width)
+        type RichSeg<'a> = (String, &'a crate::richtext::RichRun, f32, f32);
+        let mut rich_lines: Vec<Vec<RichSeg<'_>>> = vec![Vec::new()];
+        let mut cur_w = 0.0f32;
+        for rr in runs {
+            let base_rsz = (rr.size.unwrap_or(view.size) * scale).max(3.0);
+            let eff_rsz = if rr.vert_align != 0 {
+                (base_rsz * 0.68).max(2.5)
+            } else {
+                base_rsz
+            };
+            for (pi, part) in rr.text.split('\n').enumerate() {
+                if pi > 0 {
+                    rich_lines.push(Vec::new());
+                    cur_w = 0.0;
+                }
+                if part.is_empty() {
+                    continue;
+                }
+                if !view.wrap {
+                    let pw = out.tw(part, eff_rsz);
+                    rich_lines.last_mut().unwrap().push((part.to_string(), rr, eff_rsz, pw));
+                    cur_w += pw;
+                } else {
+                    let mut seg = String::new();
+                    let mut seg_w = 0.0f32;
+                    for ch_c in part.chars() {
+                        let ch_s = ch_c.to_string();
+                        let ch_w = out.tw(&ch_s, eff_rsz);
+                        if cur_w + seg_w + ch_w > avail_w && (!seg.is_empty() || cur_w > 0.0) {
+                            if !seg.is_empty() {
+                                rich_lines
+                                    .last_mut()
+                                    .unwrap()
+                                    .push((std::mem::take(&mut seg), rr, eff_rsz, seg_w));
+                            }
+                            rich_lines.push(Vec::new());
+                            cur_w = 0.0;
+                            seg_w = 0.0;
+                        }
+                        seg.push(ch_c);
+                        seg_w += ch_w;
+                    }
+                    if !seg.is_empty() {
+                        rich_lines.last_mut().unwrap().push((seg, rr, eff_rsz, seg_w));
+                        cur_w += seg_w;
+                    }
+                }
+            }
+        }
+        let fit = ((ch / line_h).floor() as usize).max(1);
+        if rich_lines.len() > fit {
+            rich_lines.truncate(fit);
+        }
+        let total_h = line_h * rich_lines.len() as f32;
+        let mut ty = cell_baseline(view.valign, top, ch, total_h, line_h, asc, desc);
+        for line_segs in rich_lines {
+            let line_w: f32 = line_segs.iter().map(|s| s.3).sum();
+            let mut cur_x = match view.halign {
+                1 => x + icon_gutter + (cw - icon_gutter - line_w) * 0.5,
+                2 => x + cw - pad - line_w,
+                _ => x + pad + indent + icon_gutter,
+            };
+            for (seg_txt, rr, eff_rsz, rw) in line_segs {
+                let rc = bw_color(rr.color.unwrap_or(view.color), bw);
+                let dy_va = match rr.vert_align {
+                    1 => eff_rsz * 0.48,
+                    2 => -eff_rsz * 0.20,
+                    _ => 0.0,
+                };
+                emit_text_with_decorations(
+                    cur_x,
+                    ty + dy_va,
+                    eff_rsz,
+                    rw,
+                    seg_txt,
+                    rc,
+                    rr.bold || view.bold,
+                    rr.italic || view.italic,
+                    0.0,
+                    rr.underline || view.underline,
+                    view.double_underline,
+                    rr.strikethrough || view.strikethrough,
+                    clip_box,
+                    out,
+                );
+                cur_x += rw;
+            }
+            ty -= line_h;
+        }
+        return;
+    }
+
+    let (eff_size, dy_va) = match view.vert_align {
+        1 => ((size * 0.68).max(2.5), size * 0.34),
+        2 => ((size * 0.68).max(2.5), -size * 0.14),
+        _ => (size, 0.0),
+    };
     let mut lines_txt = if view.wrap {
-        display::wrap_lines_excel(&effective_text, avail_w, size, out.metric.as_deref())
+        display::wrap_lines_excel(&effective_text, avail_w, eff_size, out.metric.as_deref())
     } else {
         effective_text.split('\n').map(|s| s.to_string()).collect()
     };
@@ -1511,22 +1650,22 @@ fn draw_view(
     let total_h = line_h * lines_txt.len() as f32;
     let mut ty = cell_baseline(view.valign, top, ch, total_h, line_h, asc, desc);
     for line in &lines_txt {
-        let tw = out.tw(line, size);
+        let tw = out.tw(line, eff_size);
         let (tx, base_y) = if view.rotation != 0 {
             // 旋转文字锚在单元格中心附近，避免飞出格框
-            (x + cw * 0.5 - tw * 0.25 * (view.rotation as f32).to_radians().cos(), top + ch * 0.5 - size * 0.25)
+            (x + cw * 0.5 - tw * 0.25 * (view.rotation as f32).to_radians().cos(), top + ch * 0.5 - eff_size * 0.25)
         } else {
             let lx = match view.halign {
                 1 => x + icon_gutter + (cw - icon_gutter - tw) * 0.5,
                 2 => x + cw - pad - tw,
                 _ => x + pad + indent + icon_gutter,
             };
-            (lx, ty)
+            (lx, ty + dy_va)
         };
         emit_text_with_decorations(
             tx,
             base_y,
-            size,
+            eff_size,
             tw,
             line.to_string(),
             text_color,
@@ -1540,6 +1679,85 @@ fn draw_view(
             out,
         );
         ty -= line_h;
+    }
+}
+
+/// 矢量绘制单元格图案填充（点阵 / 横竖条纹 / 斜纹 / 网格 / 菱格）
+fn draw_fill_pattern(
+    pat: &crate::style_ext::FillPattern,
+    x: f32,
+    top: f32,
+    cw: f32,
+    ch: f32,
+    scale: f32,
+    out: &mut Out,
+) {
+    let kind = pat.kind.as_str();
+    if kind == "solid" || kind == "none" || kind.is_empty() || cw < 2.0 || ch < 2.0 {
+        return;
+    }
+    let col = pat.fg.unwrap_or([120, 128, 138]);
+    let step = (4.0 * scale).clamp(2.5, 8.0);
+    let lw = (0.45 * scale).clamp(0.3, 1.0);
+    let horiz = kind.contains("Horizontal") || kind.contains("Grid");
+    let vert = kind.contains("Vertical") || kind.contains("Grid");
+    let diag_up = kind.contains("Up") || kind.contains("Trellis");
+    let diag_dn = kind.contains("Down") || kind.contains("Trellis");
+    if horiz {
+        let mut y = top + step * 0.5;
+        while y < top + ch {
+            out.lines.push((x, y, x + cw, y, lw, col));
+            y += step;
+        }
+    }
+    if vert {
+        let mut xx = x + step * 0.5;
+        while xx < x + cw {
+            out.lines.push((xx, top, xx, top + ch, lw, col));
+            xx += step;
+        }
+    }
+    if diag_up || diag_dn {
+        let dstep = step * 1.35;
+        let span = cw + ch;
+        let mut d = 0.0f32;
+        while d < span {
+            if diag_up {
+                let x1 = x + (d - ch).max(0.0);
+                let y1 = top + (ch - d).max(0.0);
+                let x2 = x + d.min(cw);
+                let y2 = top + (ch - (d - cw).max(0.0)).min(ch);
+                if (x2 - x1).abs() > 0.2 || (y2 - y1).abs() > 0.2 {
+                    out.lines.push((x1, y1, x2, y2, lw, col));
+                }
+            }
+            if diag_dn {
+                let x1 = x + (d - ch).max(0.0);
+                let y1 = top + d.min(ch);
+                let x2 = x + d.min(cw);
+                let y2 = top + (d - cw).max(0.0);
+                if (x2 - x1).abs() > 0.2 || (y2 - y1).abs() > 0.2 {
+                    out.lines.push((x1, y1, x2, y2, lw, col));
+                }
+            }
+            d += dstep;
+        }
+    }
+    if !horiz && !vert && !diag_up && !diag_dn {
+        // gray125 / gray0625 / darkGray / mediumGray / lightGray 等点阵
+        let dot_step = if kind.contains("0625") { step * 1.5 } else { step };
+        let dot_sz = (lw * 1.4).max(0.55);
+        let mut row = 0usize;
+        let mut y = top + dot_step * 0.5;
+        while y < top + ch - dot_sz {
+            let mut xx = x + if row % 2 == 0 { dot_step * 0.25 } else { dot_step * 0.75 };
+            while xx < x + cw - dot_sz {
+                out.rects.push((xx, y, dot_sz, dot_sz, col));
+                xx += dot_step;
+            }
+            y += dot_step;
+            row += 1;
+        }
     }
 }
 
