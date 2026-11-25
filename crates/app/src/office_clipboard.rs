@@ -111,14 +111,21 @@ pub struct OfficeCell {
     pub text: String,
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
     pub fill: Option<[u8; 3]>,
     pub color: Option<[u8; 3]>,
     /// 0 常规 1 左 2 中 3 右
     pub halign: u8,
+    /// 0 下 1 中 2 上
+    pub valign: u8,
+    pub wrap: bool,
     pub colspan: u32,
     pub rowspan: u32,
-    /// 有边框（简化为细实线，颜色取解析到的或黑）
+    /// 有边框（整体简化回退色）
     pub border: Option<[u8; 3]>,
+    /// 四边独立边框颜色：[Top, Bottom, Left, Right]
+    pub borders: [Option<[u8; 3]>; 4],
     /// 公式（A1 形式、带 `=`）；来自 XML Spreadsheet 那条路径
     pub formula: Option<String>,
     /// 缓存值类型：0 数字 1 文本 2 布尔 3 日期
@@ -520,9 +527,59 @@ pub fn parse_html(html: &str) -> OfficeBlock {
     if !row.is_empty() {
         block.rows.push(row);
     }
-    // 丢掉全空的行（Excel 的 HTML 有时带一行空表头）
-    block.rows.retain(|r| !r.iter().all(|c| c.text.is_empty()));
+    // 仅裁掉首尾全空行（Excel/WPS HTML 常见首尾占位行），完整保留选区中间空行
+    let row_blank = |r: &Vec<OfficeCell>| {
+        r.iter()
+            .all(|c| c.text.is_empty() && c.fill.is_none() && c.border.is_none() && c.borders.iter().all(|b| b.is_none()))
+    };
+    while block.rows.first().is_some_and(row_blank) {
+        block.rows.remove(0);
+    }
+    while block.rows.last().is_some_and(row_blank) {
+        block.rows.pop();
+    }
     block
+}
+
+fn css_border_color(style: &str, prop: &str) -> Option<Option<[u8; 3]>> {
+    let v = style_value(style, prop)?;
+    let low = v.trim().to_ascii_lowercase();
+    if low.is_empty() || low.starts_with("none") || low.starts_with("0px") || low == "0" {
+        return Some(None);
+    }
+    for tok in low.split_whitespace() {
+        if let Some(rgb) = parse_css_color_token(tok) {
+            return Some(Some(rgb));
+        }
+    }
+    Some(Some([0, 0, 0]))
+}
+
+fn parse_css_color_token(v: &str) -> Option<[u8; 3]> {
+    if let Some(hex) = v.strip_prefix('#') {
+        let hex = hex.trim();
+        if hex.len() >= 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some([r, g, b]);
+        } else if hex.len() == 3 {
+            let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+            let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+            let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+            return Some([r, g, b]);
+        }
+    }
+    match v {
+        "red" => Some([255, 0, 0]),
+        "black" | "windowtext" => Some([0, 0, 0]),
+        "white" => Some([255, 255, 255]),
+        "yellow" => Some([255, 255, 0]),
+        "green" => Some([0, 128, 0]),
+        "blue" => Some([0, 0, 255]),
+        "gray" | "grey" => Some([128, 128, 128]),
+        _ => None,
+    }
 }
 
 fn parse_cell(attrs: &str, inner: &str, classes: &HashMap<String, String>) -> OfficeCell {
@@ -548,6 +605,8 @@ fn parse_cell(attrs: &str, inner: &str, classes: &HashMap<String, String>) -> Of
         || style.contains("font-weight: 700")
         || style.contains("font-weight: bold");
     cell.italic = style.contains("font-style:italic") || style.contains("font-style: italic");
+    cell.underline = style.contains("text-decoration:underline") || style.contains("text-decoration: underline");
+    cell.strike = style.contains("line-through");
     cell.fill = style_color(&style, "background-color").or_else(|| style_color(&style, "background"));
     cell.color = style_color(&style, "color");
     cell.halign = if style.contains("text-align:center") || style.contains("text-align: center") {
@@ -559,7 +618,34 @@ fn parse_cell(attrs: &str, inner: &str, classes: &HashMap<String, String>) -> Of
     } else {
         0
     };
-    if style.contains("border") && !style.contains("border:none") && !style.contains("border: none") {
+    cell.valign = if style.contains("vertical-align:top") || style.contains("vertical-align: top") {
+        2
+    } else if style.contains("vertical-align:middle") || style.contains("vertical-align: middle") {
+        1
+    } else {
+        0
+    };
+    cell.wrap = style.contains("white-space:normal")
+        || style.contains("white-space: normal")
+        || style.contains("white-space:pre-wrap")
+        || style.contains("white-space: pre-wrap");
+    if let Some(Some(bc)) = css_border_color(&style, "border") {
+        cell.borders = [Some(bc); 4];
+        cell.border = Some(bc);
+    }
+    for (idx, prop) in [(0, "border-top"), (1, "border-bottom"), (2, "border-left"), (3, "border-right")] {
+        if let Some(side) = css_border_color(&style, prop) {
+            cell.borders[idx] = side;
+            if let Some(c) = side {
+                cell.border.get_or_insert(c);
+            }
+        }
+    }
+    if cell.borders.iter().all(|b| b.is_none())
+        && style.contains("border")
+        && !style.contains("border:none")
+        && !style.contains("border: none")
+    {
         cell.border = Some(style_color(&style, "border-color").unwrap_or([0, 0, 0]));
     }
     if let Some(nf) = style_value(&style, "mso-number-format") {
@@ -780,12 +866,17 @@ pub(crate) fn convert_block(b: sheetcore::clipboard_xmlss::Block) -> OfficeBlock
                 text: c.text,
                 bold: c.style.bold,
                 italic: c.style.italic,
+                underline: c.style.underline,
+                strike: c.style.strike,
                 fill: c.style.fill,
                 color: c.style.color,
                 halign: c.style.halign,
+                valign: c.style.valign,
+                wrap: c.style.wrap,
                 colspan: c.colspan.max(1),
                 rowspan: c.rowspan.max(1),
                 border: c.style.border,
+                borders: c.style.borders,
                 formula: c.formula,
                 kind,
                 font: c.style.font,
@@ -974,10 +1065,15 @@ fn write_office_clipboard_native(xmlss: &str, html: &str, text: &str) -> bool {
     }
 }
 
-/// 把选区写成 XML Spreadsheet 文本（公式转 R1C1，日期写 DateTime，文本保前导零）。
+/// 把选区写成 XML Spreadsheet 文本（公式转 R1C1，日期写 DateTime 含毫秒精度，完整输出对齐/换行/四边独立边框/文本保前导零）。
 pub fn selection_xmlss(wb: &sheetcore::Workbook, si: usize, rect: (u32, u32, u32, u32)) -> String {
-    build_xmlss_rows(wb, si, rect, None, &|st| format!("{}|{}|{}|{}|{:?}|{:?}|{}",
-        st.font, st.size, st.bold, st.italic, st.color, st.fill, st.format))
+    build_xmlss_rows(wb, si, rect, None, &|st| {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{:?}|{:?}|{}|{}|{}|{:?}|{}",
+            st.font, st.size, st.bold, st.italic, st.underline, st.strikethrough,
+            st.color, st.fill, st.halign, st.valign, st.wrap, st.border, st.format
+        )
+    })
 }
 
 /// 把筛选态可见行压紧写成稀疏 XML Spreadsheet 文本（保留公式、样式、数字格式与前导零）。
@@ -987,8 +1083,13 @@ pub fn selection_xmlss_filtered(
     rect: (u32, u32, u32, u32),
     visible_rows: &[u32],
 ) -> String {
-    build_xmlss_rows(wb, si, rect, Some(visible_rows), &|st| format!("{}|{}|{}|{}|{:?}|{:?}|{}",
-        st.font, st.size, st.bold, st.italic, st.color, st.fill, st.format))
+    build_xmlss_rows(wb, si, rect, Some(visible_rows), &|st| {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{:?}|{:?}|{}|{}|{}|{:?}|{}",
+            st.font, st.size, st.bold, st.italic, st.underline, st.strikethrough,
+            st.color, st.fill, st.halign, st.valign, st.wrap, st.border, st.format
+        )
+    })
 }
 
 pub(crate) use sheetcore::clipboard_xmlss::sparse_column_xmlss;
@@ -1043,12 +1144,57 @@ pub fn build_xmlss_rows(
             let size = if st.size > 0.0 { st.size } else { 11.0 };
             let bold = if st.bold { " ss:Bold=\"1\"" } else { "" };
             let italic = if st.italic { " ss:Italic=\"1\"" } else { "" };
+            let underline = if st.underline { " ss:Underline=\"Single\"" } else { "" };
+            let strike = if st.strikethrough { " ss:StrikeThrough=\"1\"" } else { "" };
+            let halign = match st.halign {
+                1 => " ss:Horizontal=\"Left\"",
+                2 => " ss:Horizontal=\"Center\"",
+                3 => " ss:Horizontal=\"Right\"",
+                _ => "",
+            };
+            let valign = match st.valign {
+                1 => "Top",
+                3 => "Bottom",
+                _ => "Center",
+            };
+            let wrap = if st.wrap { " ss:WrapText=\"1\"" } else { "" };
             let c = st.color;
-            let _ = write!(style_xml, "<Style ss:ID=\"sc{i}\"><Alignment ss:Vertical=\"Center\"/><Font ss:FontName=\"");
+            let _ = write!(
+                style_xml,
+                "<Style ss:ID=\"sc{i}\"><Alignment{halign} ss:Vertical=\"{valign}\"{wrap}/>"
+            );
+            // 四边独立边框：CellStyle.border 顺序为 [Left, Right, Top, Bottom]
+            if st.border.iter().any(|b| b.style != 0) {
+                style_xml.push_str("<Borders>");
+                for (pos_name, side) in [
+                    ("Left", st.border[0]),
+                    ("Right", st.border[1]),
+                    ("Top", st.border[2]),
+                    ("Bottom", st.border[3]),
+                ] {
+                    if side.style != 0 {
+                        let (line_style, weight) = match side.style {
+                            2 => ("Continuous", 2),
+                            3 => ("Continuous", 3),
+                            4 => ("Dash", 1),
+                            5 => ("Dot", 1),
+                            6 => ("Double", 3),
+                            _ => ("Continuous", 1),
+                        };
+                        let _ = write!(
+                            style_xml,
+                            "<Border ss:Position=\"{pos_name}\" ss:LineStyle=\"{line_style}\" ss:Weight=\"{weight}\" ss:Color=\"#{:02X}{:02X}{:02X}\"/>",
+                            side.color[0], side.color[1], side.color[2]
+                        );
+                    }
+                }
+                style_xml.push_str("</Borders>");
+            }
+            style_xml.push_str("<Font ss:FontName=\"");
             xml_escape_into(&mut style_xml, font);
             let _ = write!(
                 style_xml,
-                "\" ss:Size=\"{size}\"{bold}{italic} ss:Color=\"#{:02X}{:02X}{:02X}\"/>",
+                "\" ss:Size=\"{size}\"{bold}{italic}{underline}{strike} ss:Color=\"#{:02X}{:02X}{:02X}\"/>",
                 c[0], c[1], c[2]
             );
             if let Some(f) = st.fill {
@@ -1192,10 +1338,10 @@ pub fn build_xmlss_rows(
                         b.push_str("</Data></Cell>");
                     };
                     if is_date_style(style) {
-                        if let Some((y, m, d)) = wb.serial_to_date(*n) {
+                        if let Some(iso) = sheetcore::clipboard_xmlss::serial_to_iso(wb.date_system, *n) {
                             let _ = write!(
                                 body,
-                                "><Data ss:Type=\"DateTime\">{y:04}-{m:02}-{d:02}T00:00:00.000</Data></Cell>"
+                                "><Data ss:Type=\"DateTime\">{iso}</Data></Cell>"
                             );
                         } else {
                             push_num(&mut body, *n);

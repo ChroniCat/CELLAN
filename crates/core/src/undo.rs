@@ -251,6 +251,10 @@ pub struct UndoStack {
     pub limit: usize,
     /// 我是谁（协作站点号）；0 表示单人。撤销只退自己的动作
     pub site: u32,
+    /// 最近一次 MetaEdit 撤销/重做产出的协作元数据广播载荷
+    last_meta_sync: Vec<(usize, crate::sync::SheetMetaKind)>,
+    /// 最近一次撤销/重做涉及定义名称等需触发重算的簿级变更
+    last_needs_recalc: bool,
 }
 
 /// 撤销/重做实际改了哪些格子
@@ -393,6 +397,17 @@ pub struct MetaEdit {
         Option<Vec<crate::richtext::RichRun>>,
         Option<Vec<crate::richtext::RichRun>>,
     )>,
+    pub dv: Option<(Vec<crate::dv::DataValidation>, Vec<crate::dv::DataValidation>)>,
+    pub hyperlinks: Vec<(
+        (u32, u32),
+        Option<crate::hyperlinks::Hyperlink>,
+        Option<crate::hyperlinks::Hyperlink>,
+    )>,
+    pub sparklines: Option<(Vec<crate::sparkline::Sparkline>, Vec<crate::sparkline::Sparkline>)>,
+    pub names: Option<(
+        Vec<(String, Option<usize>, String)>,
+        Vec<(String, Option<usize>, String)>,
+    )>,
 }
 
 impl MetaEdit {
@@ -408,31 +423,46 @@ impl MetaEdit {
             && self.tables.is_none()
             && self.outline.is_none()
             && self.rich.is_empty()
+            && self.dv.is_none()
+            && self.hyperlinks.is_empty()
+            && self.sparklines.is_none()
+            && self.names.is_none()
     }
 
-    fn apply(&self, sheets: &mut [Sheet], redo: bool) {
+    fn apply(&self, sheets: &mut [Sheet], redo: bool) -> Vec<(usize, crate::sync::SheetMetaKind)> {
+        use crate::sync::SheetMetaKind;
+        let mut syncs = Vec::new();
         let Some(sh) = sheets.get_mut(self.sheet) else {
-            return;
+            return syncs;
         };
         if !self.col_widths.is_empty() {
             let def = sh.cols.default_size();
+            let mut items = Vec::with_capacity(self.col_widths.len());
             for &(c, before, after) in &self.col_widths {
                 let target = if redo { after } else { before };
-                sh.cols.set(c, target.unwrap_or(def));
+                let w = target.unwrap_or(def);
+                sh.cols.set(c, w);
+                items.push((c, w));
             }
             sh.layout_dirty = true;
             sh.bump_display_style_revision();
+            syncs.push((self.sheet, SheetMetaKind::ColWidths(items)));
         }
         if !self.row_heights.is_empty() {
             let def = sh.rows.default_size();
+            let mut items = Vec::with_capacity(self.row_heights.len());
             for &(r, before, after) in &self.row_heights {
                 let target = if redo { after } else { before };
-                sh.rows.set(r, target.unwrap_or(def));
+                let h = target.unwrap_or(def);
+                sh.rows.set(r, h);
+                items.push((r, h));
             }
             sh.layout_dirty = true;
             sh.bump_display_style_revision();
+            syncs.push((self.sheet, SheetMetaKind::RowHeights(items)));
         }
         if !self.hidden_rows_user.is_empty() {
+            let mut items = Vec::with_capacity(self.hidden_rows_user.len());
             for &(r, before, after) in &self.hidden_rows_user {
                 let hide = if redo { after } else { before };
                 if hide {
@@ -440,11 +470,14 @@ impl MetaEdit {
                 } else {
                     sh.hidden_rows_user.remove(&r);
                 }
+                items.push((r, hide));
             }
             sh.layout_dirty = true;
             sh.bump_display_style_revision();
+            syncs.push((self.sheet, SheetMetaKind::HiddenRows(items)));
         }
         if !self.hidden_cols.is_empty() {
+            let mut items = Vec::with_capacity(self.hidden_cols.len());
             for &(c, before, after) in &self.hidden_cols {
                 let hide = if redo { after } else { before };
                 if hide {
@@ -452,9 +485,11 @@ impl MetaEdit {
                 } else {
                     sh.hidden_cols.remove(&c);
                 }
+                items.push((c, hide));
             }
             sh.layout_dirty = true;
             sh.bump_display_style_revision();
+            syncs.push((self.sheet, SheetMetaKind::HiddenCols(items)));
         }
         if !self.notes.is_empty() {
             for (pos, before, after) in &self.notes {
@@ -463,9 +498,27 @@ impl MetaEdit {
                 match target {
                     Some(n) => {
                         sh.notes.insert(cref, n.clone());
+                        syncs.push((
+                            self.sheet,
+                            SheetMetaKind::Note {
+                                row: pos.0,
+                                col: pos.1,
+                                author: n.author.clone(),
+                                text: Some(n.text.clone()),
+                            },
+                        ));
                     }
                     None => {
                         sh.notes.remove(&cref);
+                        syncs.push((
+                            self.sheet,
+                            SheetMetaKind::Note {
+                                row: pos.0,
+                                col: pos.1,
+                                author: String::new(),
+                                text: None,
+                            },
+                        ));
                     }
                 }
             }
@@ -494,6 +547,12 @@ impl MetaEdit {
             sh.filter_dirty = true;
             sh.layout_dirty = true;
             sh.bump_display_style_revision();
+            syncs.push((
+                self.sheet,
+                SheetMetaKind::AutoFilter {
+                    range: sh.filter.as_ref().map(|f| f.range),
+                },
+            ));
         }
         if let Some((tb, ta)) = &self.tables {
             sh.tables = if redo { ta.clone() } else { tb.clone() };
@@ -523,6 +582,57 @@ impl MetaEdit {
             sh.rich_dirty = true;
             sh.bump_display_style_revision();
         }
+        if let Some((before, after)) = &self.dv {
+            sh.dv = if redo { after.clone() } else { before.clone() };
+            sh.dv_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if !self.hyperlinks.is_empty() {
+            for (pos, before, after) in &self.hyperlinks {
+                let target = if redo { after } else { before };
+                match target {
+                    Some(link) => {
+                        sh.hyperlinks.insert(*pos, link.clone());
+                        let url = if !link.target.is_empty() {
+                            link.target.clone()
+                        } else if !link.location.is_empty() {
+                            format!("#{}", link.location)
+                        } else {
+                            String::new()
+                        };
+                        syncs.push((
+                            self.sheet,
+                            SheetMetaKind::Hyperlink {
+                                row: pos.0,
+                                col: pos.1,
+                                target: Some(url),
+                                tooltip: link.tooltip.clone(),
+                            },
+                        ));
+                    }
+                    None => {
+                        sh.hyperlinks.remove(pos);
+                        syncs.push((
+                            self.sheet,
+                            SheetMetaKind::Hyperlink {
+                                row: pos.0,
+                                col: pos.1,
+                                target: None,
+                                tooltip: String::new(),
+                            },
+                        ));
+                    }
+                }
+            }
+            sh.hyperlinks_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if let Some((before, after)) = &self.sparklines {
+            sh.sparklines = if redo { after.clone() } else { before.clone() };
+            sh.sparklines_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        syncs
     }
 }
 
@@ -2055,13 +2165,29 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
 
 impl Default for UndoStack {
     fn default() -> Self {
-        Self { done: Vec::new(), undone: Vec::new(), pending_compaction: false, limit: 200, site: 0 }
+        Self {
+            done: Vec::new(),
+            undone: Vec::new(),
+            pending_compaction: false,
+            limit: 200,
+            site: 0,
+            last_meta_sync: Vec::new(),
+            last_needs_recalc: false,
+        }
     }
 }
 
 impl UndoStack {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn take_meta_sync(&mut self) -> Vec<(usize, crate::sync::SheetMetaKind)> {
+        std::mem::take(&mut self.last_meta_sync)
+    }
+
+    pub fn take_needs_recalc(&mut self) -> bool {
+        std::mem::take(&mut self.last_needs_recalc)
     }
 
     /// 记一步。相同格子在一步里只记第一次（后写的 after 覆盖）
@@ -2542,7 +2668,20 @@ impl UndoStack {
 
     pub fn undo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
         self.settle_before_replay();
-        if !self.undo_is_structure() { return self.undo(&mut wb.sheets, guard); }
+        self.last_meta_sync.clear();
+        self.last_needs_recalc = false;
+        if !self.undo_is_structure() {
+            if let Some(Entry::Meta(_, action)) = self.done.last() {
+                if action.by_site == 0 || self.site == 0 || action.by_site == self.site {
+                    if let Some((before_names, _)) = &action.edit.names {
+                        wb.names = before_names.clone();
+                        wb.names_dirty = true;
+                        self.last_needs_recalc = true;
+                    }
+                }
+            }
+            return self.undo(&mut wb.sheets, guard);
+        }
         if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::SheetTab(_, action)) = self.done.last_mut() {
             let applied = action.apply(wb, false)?;
@@ -2570,7 +2709,20 @@ impl UndoStack {
 
     pub fn redo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
         self.settle_before_replay();
-        if !self.redo_is_structure() { return self.redo(&mut wb.sheets, guard); }
+        self.last_meta_sync.clear();
+        self.last_needs_recalc = false;
+        if !self.redo_is_structure() {
+            if let Some(Entry::Meta(_, action)) = self.undone.last() {
+                if action.by_site == 0 || self.site == 0 || action.by_site == self.site {
+                    if let Some((_, after_names)) = &action.edit.names {
+                        wb.names = after_names.clone();
+                        wb.names_dirty = true;
+                        self.last_needs_recalc = true;
+                    }
+                }
+            }
+            return self.redo(&mut wb.sheets, guard);
+        }
         if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::SheetTab(_, action)) = self.undone.last_mut() {
             let applied = action.apply(wb, true)?;
@@ -2615,7 +2767,7 @@ impl UndoStack {
         }
         let site = self.site;
         if let Some(Entry::Meta(_, action)) = self.done.last() {
-            action.edit.apply(sheets, false);
+            let syncs = action.edit.apply(sheets, false);
             let applied = Applied {
                 touched: Vec::new(),
                 label: action.label.clone(),
@@ -2628,6 +2780,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
+            self.last_meta_sync = syncs;
             let entry = self.done.pop()?;
             self.undone.push(entry);
             return Some(applied);
@@ -2774,7 +2927,7 @@ impl UndoStack {
         }
         let site = self.site;
         if let Some(Entry::Meta(_, action)) = self.undone.last() {
-            action.edit.apply(sheets, true);
+            let syncs = action.edit.apply(sheets, true);
             let applied = Applied {
                 touched: Vec::new(),
                 label: action.label.clone(),
@@ -2787,6 +2940,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
+            self.last_meta_sync = syncs;
             let entry = self.undone.pop()?;
             self.done.push(entry);
             return Some(applied);

@@ -321,7 +321,9 @@ impl SheetApp {
         );
         let top_left = cell_name(r1, c1);
         let formula = format!("=COUNTIF({abs_range},{top_left})<=1");
-        let sh = self.wb.sheet_mut(self.sheet_idx);
+        let si = self.sheet_idx;
+        let before_dv = self.wb.sheet(si).dv.clone();
+        let sh = self.wb.sheet_mut(si);
         sh.dv.push(sheetcore::dv::DataValidation {
             ranges: vec![(r1, c1, r2, c2)],
             kind: sheetcore::dv::DvKind::Custom,
@@ -339,6 +341,16 @@ impl SheetApp {
             prompt_msg: String::new(),
         });
         sh.dv_dirty = true;
+        let after_dv = sh.dv.clone();
+        self.undo.push_meta(
+            "拒绝录入重复项",
+            (si, r1, c1),
+            sheetcore::undo::MetaEdit {
+                sheet: si,
+                dv: Some((before_dv, after_dv)),
+                ..Default::default()
+            },
+        );
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已设置 {}:{} 拒绝录入重复值", cell_name(r1, c1), cell_name(r2, c2));
@@ -768,13 +780,36 @@ impl SheetApp {
                     let gen_cell = if mode == FillMode::CopyCells {
                         scell.clone()
                     } else if let Some(ref nv) = nums {
-                        let val = if nv.len() >= 2 {
-                            let d = nv[1] - nv[0];
-                            nv[nv.len() - 1] + d * (step_k as f64)
-                        } else if mode == FillMode::FillSeries || is_date {
-                            nv[0] + (dir_sign as f64) * (step_k as f64)
-                        } else {
-                            nv[0]
+                        let val = match mode {
+                            FillMode::Weekdays | FillMode::Months | FillMode::Years => {
+                                fill_seq::next_date_serial(
+                                    *nv.last().unwrap(),
+                                    mode,
+                                    dir_sign,
+                                    step_k,
+                                    self.wb.date_system,
+                                )
+                            }
+                            FillMode::LinearTrend => {
+                                if nv.len() >= 2 {
+                                    fill_seq::fit_linear_trend(nv, step_k)
+                                } else {
+                                    nv[0] + (dir_sign as f64) * (step_k as f64)
+                                }
+                            }
+                            FillMode::GrowthTrend => {
+                                fill_seq::fit_growth_trend(nv, step_k)
+                                    .unwrap_or_else(|| fill_seq::fit_linear_trend(nv, step_k))
+                            }
+                            _ => {
+                                if nv.len() >= 2 {
+                                    fill_seq::fit_linear_trend(nv, step_k)
+                                } else if mode == FillMode::FillSeries || is_date {
+                                    nv[0] + (dir_sign as f64) * (step_k as f64)
+                                } else {
+                                    nv[0]
+                                }
+                            }
                         };
                         Some(Cell { value: Value::Number(val), formula: None })
                     } else if let Some(refs) = &text_samples {
@@ -846,13 +881,36 @@ impl SheetApp {
                     let gen_cell = if mode == FillMode::CopyCells {
                         scell.clone()
                     } else if let Some(ref nv) = nums {
-                        let val = if nv.len() >= 2 {
-                            let d = nv[1] - nv[0];
-                            nv[nv.len() - 1] + d * (step_k as f64)
-                        } else if mode == FillMode::FillSeries || is_date {
-                            nv[0] + (dir_sign as f64) * (step_k as f64)
-                        } else {
-                            nv[0]
+                        let val = match mode {
+                            FillMode::Weekdays | FillMode::Months | FillMode::Years => {
+                                fill_seq::next_date_serial(
+                                    *nv.last().unwrap(),
+                                    mode,
+                                    dir_sign,
+                                    step_k,
+                                    self.wb.date_system,
+                                )
+                            }
+                            FillMode::LinearTrend => {
+                                if nv.len() >= 2 {
+                                    fill_seq::fit_linear_trend(nv, step_k)
+                                } else {
+                                    nv[0] + (dir_sign as f64) * (step_k as f64)
+                                }
+                            }
+                            FillMode::GrowthTrend => {
+                                fill_seq::fit_growth_trend(nv, step_k)
+                                    .unwrap_or_else(|| fill_seq::fit_linear_trend(nv, step_k))
+                            }
+                            _ => {
+                                if nv.len() >= 2 {
+                                    fill_seq::fit_linear_trend(nv, step_k)
+                                } else if mode == FillMode::FillSeries || is_date {
+                                    nv[0] + (dir_sign as f64) * (step_k as f64)
+                                } else {
+                                    nv[0]
+                                }
+                            }
                         };
                         Some(Cell { value: Value::Number(val), formula: None })
                     } else if let Some(refs) = &text_samples {

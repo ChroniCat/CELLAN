@@ -1201,20 +1201,7 @@ impl SheetApp {
                 });
             }
             "FlashFill" => {
-                let (r1, c1, mut r2, mut c2) = self.sel_rect();
-                if (r2 - r1 + 1) as u64 > 200_000 {
-                    if let Some((_, _, ur2, uc2)) = self.wb.sheet(self.sheet_idx).used_bounds() {
-                        r2 = r2.min(ur2.max(r1));
-                        c2 = c2.min(uc2.max(c1));
-                    }
-                }
-                self.ff_dlg = Some(crate::FlashDlg {
-                    range: format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2)),
-                    src_col: col_label(c1),
-                    dst_col: col_label(c1 + 1),
-                    aux_col: if c2 > c1 + 1 { col_label(c2) } else { String::new() },
-                    msg: String::new(),
-                });
+                self.flash_fill_instant_or_dialog();
             }
             "Consolidate" => {
                 self.cs_dlg = Some(crate::ConsDlg {

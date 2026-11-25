@@ -377,16 +377,21 @@ impl SheetApp {
                         })
                         .inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
-                            ui.set_width(136.0);
+                            ui.set_width(148.0);
                             for (lbl, mode) in [
                                 ("智能填充（默认）", FillMode::Smart),
                                 ("复制单元格", FillMode::CopyCells),
                                 ("填充序列", FillMode::FillSeries),
                                 ("仅填充格式", FillMode::FormatsOnly),
                                 ("不带格式填充", FillMode::ValuesOnly),
+                                ("按工作日填充", FillMode::Weekdays),
+                                ("按月填充", FillMode::Months),
+                                ("按年填充", FillMode::Years),
+                                ("线性趋势", FillMode::LinearTrend),
+                                ("增长趋势", FillMode::GrowthTrend),
                             ] {
                                 let mark = if cur_mode == mode { format!("√ {lbl}") } else { format!("   {lbl}") };
-                                if ui_kit::popup_item(ui, &mark, true, 134.0).clicked() {
+                                if ui_kit::popup_item(ui, &mark, true, 146.0).clicked() {
                                     pick_mode = Some(mode);
                                 }
                             }

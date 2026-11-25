@@ -1254,16 +1254,66 @@ impl SheetApp {
         }
         let si = self.sheet_idx;
         let src_sheet_name = self.wb.sheet(source_sheet).name.clone();
-        let keys = sheetcore::undo::rect_keys(r0, c0, r0 + rows - 1, c0 + cols - 1);
+        // 支持选区平铺粘贴链接（当目标选区尺寸为源尺寸整数倍时自动平铺）
+        let (sr1, sc1_dst, sr2, sc2_dst) = self.sel_rect();
+        let sel_h = sr2 - sr1 + 1;
+        let sel_w = sc2_dst - sc1_dst + 1;
+        let (tile_r, tile_c) = if (sel_h > rows || sel_w > cols)
+            && sel_h % rows == 0
+            && sel_w % cols == 0
+            && (sel_h as u64) * (sel_w as u64) <= 200_000
+        {
+            (sel_h / rows, sel_w / cols)
+        } else {
+            (1, 1)
+        };
+        let total_rows = rows * tile_r;
+        let total_cols = cols * tile_c;
+        let (r0, c0) = if tile_r > 1 || tile_c > 1 { (sr1, sc1_dst) } else { (r0, c0) };
+        if r0.saturating_add(total_rows - 1) > 1_048_575 || c0.saturating_add(total_cols - 1) > 16_383 {
+            self.status = "粘贴链接超出工作表边界".into();
+            return;
+        }
+        // 筛选态下粘贴链接：自动跳过被筛选隐藏的目标行，防止覆写隐藏行
+        let dst_row_list: Vec<u32> = {
+            let sh = self.wb.sheet(si);
+            let has_hidden = !sh.hidden_rows.is_empty()
+                && (r0..r0.saturating_add(total_rows)).any(|rr| sh.hidden_rows.contains(&rr));
+            if has_hidden {
+                let mut out = Vec::with_capacity(total_rows as usize);
+                let mut cur = r0;
+                while out.len() < total_rows as usize {
+                    if cur > 1_048_575 {
+                        self.status = "粘贴链接超出工作表边界".into();
+                        return;
+                    }
+                    if !sh.hidden_rows.contains(&cur) && !sh.hidden_rows_user.contains(&cur) {
+                        out.push(cur);
+                    }
+                    cur = cur.saturating_add(1);
+                }
+                out
+            } else {
+                (0..total_rows).map(|i| r0 + i).collect()
+            }
+        };
+        let mut keys = Vec::with_capacity((total_rows as usize) * (total_cols as usize));
+        for &dr in &dst_row_list {
+            for j in 0..total_cols {
+                keys.push((dr, c0 + j));
+            }
+        }
         if !self.write_preflight(&keys, "粘贴链接") {
             return;
         }
         let txn = self.txn_begin(&keys);
-        let mut touched = Vec::new();
-        for i in 0..rows {
-            for j in 0..cols {
+        let mut touched = Vec::with_capacity(keys.len());
+        for (ti, &dr) in dst_row_list.iter().enumerate() {
+            let i = (ti as u32) % rows;
+            for tj in 0..total_cols {
+                let j = tj % cols;
                 let (sr, sc) = (clip.source_row(i as usize), sc1 + j);
-                let (dr, dc) = (r0 + i, c0 + j);
+                let dc = c0 + tj;
                 let target_ref = if source_sheet == si {
                     format!("={}", cell_name(sr, sc))
                 } else {
@@ -1763,7 +1813,27 @@ impl SheetApp {
     fn apply_fill_series(&mut self, cfg: &FillSeriesDlgState) {
         self.commit_edit(None);
         let step = cfg.step.trim().parse::<f64>().unwrap_or(1.0);
-        let stop = cfg.stop.trim().parse::<f64>().ok();
+        let is_date = cfg.kind == 2;
+        let date_sys = self.wb.date_system;
+        let parse_val = |raw: &str| -> Option<f64> {
+            let t = raw.trim();
+            if t.is_empty() {
+                return None;
+            }
+            if let Ok(n) = t.parse::<f64>() {
+                return Some(n);
+            }
+            if is_date {
+                let p = sheetcore::input_parse::parse_cell_input(t, "", date_sys);
+                if let Value::Number(serial) = p.value {
+                    if p.auto_format.is_some() {
+                        return Some(serial);
+                    }
+                }
+            }
+            None
+        };
+        let stop = parse_val(&cfg.stop);
         let (r1, c1, mut r2, mut c2) = self.sel_rect();
         let start_val = self
             .wb
@@ -1771,10 +1841,67 @@ impl SheetApp {
             .get(r1, c1)
             .and_then(|c| match c.value {
                 Value::Number(n) => Some(n),
-                Value::Text(ref t) => t.trim().parse::<f64>().ok(),
+                Value::Text(ref t) => parse_val(t),
                 _ => None,
             })
-            .unwrap_or_else(|| if cfg.kind == 2 { 45658.0 } else { 1.0 });
+            .unwrap_or_else(|| if is_date { 45658.0 } else { 1.0 });
+
+        let step_i = step.round() as i64;
+        let advance_serial = |idx: u32, base: f64| -> f64 {
+            if !is_date {
+                match cfg.kind {
+                    1 => base * step.powi(idx as i32),
+                    _ => base + step * idx as f64,
+                }
+            } else {
+                match cfg.date_unit {
+                    1 => {
+                        let dir = if step_i >= 0 { 1 } else { -1 };
+                        let total = (idx as i64) * step_i.abs();
+                        if total == 0 {
+                            base
+                        } else {
+                            crate::fill_seq::next_date_serial(
+                                base,
+                                crate::fill_seq::FillMode::Weekdays,
+                                dir,
+                                total,
+                                date_sys,
+                            )
+                        }
+                    }
+                    2 => {
+                        if idx == 0 || step_i == 0 {
+                            base
+                        } else {
+                            let dir = if step_i >= 0 { 1 } else { -1 };
+                            crate::fill_seq::next_date_serial(
+                                base,
+                                crate::fill_seq::FillMode::Months,
+                                dir,
+                                (idx as i64) * step_i.abs(),
+                                date_sys,
+                            )
+                        }
+                    }
+                    3 => {
+                        if idx == 0 || step_i == 0 {
+                            base
+                        } else {
+                            let dir = if step_i >= 0 { 1 } else { -1 };
+                            crate::fill_seq::next_date_serial(
+                                base,
+                                crate::fill_seq::FillMode::Years,
+                                dir,
+                                (idx as i64) * step_i.abs(),
+                                date_sys,
+                            )
+                        }
+                    }
+                    _ => base + step * idx as f64,
+                }
+            }
+        };
 
         if r1 == r2 && c1 == c2 {
             if let Some(lim) = stop {
@@ -1787,7 +1914,18 @@ impl SheetApp {
                 } else {
                     5_000
                 };
-                let count = if cfg.kind == 1 {
+                let count = if is_date {
+                    // 按实际日期单元精确递增，避免月/年/工作日序列用天数近似产生越界或截断
+                    let mut k = 1u32;
+                    while k < cap && step_i != 0 {
+                        let nxt = advance_serial(k, start_val);
+                        if (step_i > 0 && nxt > lim + 1e-9) || (step_i < 0 && nxt < lim - 1e-9) {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    k
+                } else if cfg.kind == 1 {
                     let mut cur = start_val;
                     let mut k = 1u32;
                     while k < cap {
@@ -1819,40 +1957,6 @@ impl SheetApp {
             self.status = "序列填充区域超过 20 万格，请缩小选区或指定终止值".into();
             return;
         }
-        let is_date = cfg.kind == 2;
-        let step_i = step.round() as i64;
-        let advance_serial = |idx: u32, base: f64| -> f64 {
-            if !is_date {
-                match cfg.kind {
-                    1 => base * step.powi(idx as i32),
-                    _ => base + step * idx as f64,
-                }
-            } else {
-                match cfg.date_unit {
-                    1 => {
-                        let mut cur = base.round() as i64;
-                        let dir = if step_i >= 0 { 1 } else { -1 };
-                        let total = (idx as i64) * step_i.abs();
-                        if total > 0 {
-                            let full_weeks = (total - 1) / 5;
-                            let mut rem = total - full_weeks * 5;
-                            cur += dir * full_weeks * 7;
-                            while rem > 0 {
-                                cur += dir;
-                                let wd = cur.rem_euclid(7);
-                                if wd != 0 && wd != 1 {
-                                    rem -= 1;
-                                }
-                            }
-                        }
-                        cur as f64
-                    }
-                    2 => advance_months_serial(base, (idx as i64) * step_i),
-                    3 => advance_months_serial(base, (idx as i64) * step_i * 12),
-                    _ => base + step * idx as f64,
-                }
-            }
-        };
 
         let si = self.sheet_idx;
         let has_hidden = !self.wb.sheet(si).hidden_rows.is_empty()

@@ -452,7 +452,7 @@ impl Operation {
             Self::Dedup { .. } if count == 0 => "没有重复行".into(),
             Self::Dedup { total_data_rows, .. } => {
                 let kept = total_data_rows.saturating_sub(count);
-                format!("找到并删除了 {count} 个重复值，保留了 {kept} 个唯一值")
+                format!("已删除了 {count} 行重复，保留了 {kept} 个唯一值")
             }
         }
     }

@@ -4131,6 +4131,7 @@ fn pasting_an_excel_error_cell_keeps_it_an_error_value() {
         size: 0.0,
         num_format: String::new(),
         raw: None,
+        ..Default::default()
     };
     // 真正走一遍 XMLSS 解析：Excel 的 ss:Type="Error" 必须映射成 kind=4
     let xml = r#"<?xml version="1.0"?>

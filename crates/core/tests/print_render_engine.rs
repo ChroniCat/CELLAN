@@ -300,8 +300,8 @@ fn all_13_border_styles_diagonals_and_rich_decorations_icons_sparklines() {
     wb.sheets[0].rich.insert(
         (0, 1),
         vec![
-            RichRun { text: "红字".into(), bold: true, italic: false, color: Some([220, 20, 20]), size: None, font: None },
-            RichRun { text: "蓝斜".into(), bold: false, italic: true, color: Some([20, 60, 200]), size: None, font: None },
+            RichRun { text: "红字".into(), bold: true, italic: false, color: Some([220, 20, 20]), size: None, font: None, underline: false, strikethrough: false, vert_align: 0 },
+            RichRun { text: "蓝斜".into(), bold: false, italic: true, color: Some([20, 60, 200]), size: None, font: None, underline: false, strikethrough: false, vert_align: 0 },
         ],
     );
     let mut st_dec = CellStyle::default();
