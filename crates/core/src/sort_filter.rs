@@ -600,34 +600,54 @@ pub fn sort_region(sheet: &mut Sheet, region: (u32, u32, u32, u32), col: u32, as
 }
 
 /// 以 (r, c) 为中心找出连续的数据区域（Excel 的「当前区域」）。
-/// 使用 `Store` 页级 `row_mask` 与 `col_nonempty` 位图检测空行/空列，跳过百万空行无需逐格查询。
+/// 采用逐轮 1 格边界扩展：使用 `Store` 页级 `row_mask` 与 `col_nonempty` 位图，
+/// 既可在微秒级跳过百万空行，又严格止步于空白分隔行/列，绝不误串隔空表。
 pub fn current_region(sheet: &Sheet, r: u32, c: u32) -> (u32, u32, u32, u32) {
     let Some((ur1, uc1, ur2, uc2)) = sheet.used_bounds() else {
         return (r, c, r, c);
     };
+    if r > ur2.saturating_add(1)
+        || r.saturating_add(1) < ur1
+        || c > uc2.saturating_add(1)
+        || c.saturating_add(1) < uc1
+    {
+        return (r, c, r, c);
+    }
     let min_r = ur1.min(r);
     let max_r = ur2.max(r);
     let min_c = uc1.min(c);
     let max_c = uc2.max(c);
     let cells = sheet.cells();
-    let is_blank_row = |rr: u32| !cells.row_has_any_in(rr, min_c, max_c);
-    let is_blank_col = |cc: u32| !cells.col_has_any_in(cc, min_r, max_r);
 
     let mut r1 = r;
-    while r1 > min_r && !is_blank_row(r1 - 1) {
-        r1 -= 1;
-    }
     let mut r2 = r;
-    while r2 < max_r && !is_blank_row(r2 + 1) {
-        r2 += 1;
-    }
     let mut c1 = c;
-    while c1 > min_c && !is_blank_col(c1 - 1) {
-        c1 -= 1;
-    }
     let mut c2 = c;
-    while c2 < max_c && !is_blank_col(c2 + 1) {
-        c2 += 1;
+    loop {
+        let mut changed = false;
+        let c_lo = c1.saturating_sub(1).max(min_c);
+        let c_hi = c2.saturating_add(1).min(max_c);
+        while r1 > min_r && cells.row_has_any_in(r1 - 1, c_lo, c_hi) {
+            r1 -= 1;
+            changed = true;
+        }
+        while r2 < max_r && cells.row_has_any_in(r2 + 1, c_lo, c_hi) {
+            r2 += 1;
+            changed = true;
+        }
+        let r_lo = r1.saturating_sub(1).max(min_r);
+        let r_hi = r2.saturating_add(1).min(max_r);
+        while c1 > min_c && cells.col_has_any_in(c1 - 1, r_lo, r_hi) {
+            c1 -= 1;
+            changed = true;
+        }
+        while c2 < max_c && cells.col_has_any_in(c2 + 1, r_lo, r_hi) {
+            c2 += 1;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
     }
     (r1, c1, r2, c2)
 }

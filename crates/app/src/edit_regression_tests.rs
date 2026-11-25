@@ -1824,11 +1824,11 @@ fn shift_arrows_extend_selection_and_plain_arrow_collapses() {
     app.sel = (0, 0);
     app.sel_end = (0, 0);
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowRight, true)]);
-    assert_eq!((app.sel, app.sel_end), ((0, 1), (0, 0)), "Shift+→ 应从 A1 扩到 B1");
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (0, 1)), "Excel 语义：Shift+→ 活动格留在 A1，尾角扩到 B1");
     run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, true)]);
-    assert_eq!((app.sel, app.sel_end), ((1, 1), (0, 0)), "继续 Shift+↓ 应扩到 B2");
-    run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowLeft, false)]);
-    assert_eq!((app.sel, app.sel_end), ((1, 0), (1, 0)), "普通方向键应收起选区");
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (1, 1)), "继续 Shift+↓ 尾角扩到 B2，活动格仍是 A1");
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::ArrowRight, false)]);
+    assert_eq!((app.sel, app.sel_end), ((0, 1), (0, 1)), "普通方向键从活动格移动并收起选区");
 }
 
 #[test]
@@ -11532,3 +11532,129 @@ fn scenario_show_after_row_delete_preserves_the_next_formula_and_is_undoable() {
     app.do_undo(true);
     assert_eq!(app.wb.sheet(0).value(1,0), Value::Number(8.));
 }
+
+#[test]
+fn gap9_cursor_aware_formula_assist_skips_strings_and_preserves_tail() {
+    // 1) ref_byte_spans 必须跳过字符串字面量里的 "B2"
+    let f = r#"=IF(A1="B2",C3,0)"#;
+    let spans: Vec<&str> = ref_byte_spans(f).into_iter().map(|(s, e, _)| &f[s..e]).collect();
+    assert_eq!(spans, vec!["A1", "C3"], "字符串里的 \"B2\" 绝不能当引用着色");
+
+    // 2) cycle_formula_ref_at 按光标定位：光标在 A1 上只循环 A1，不误改末尾 B2，且跳过字符串
+    let mut s1 = "=A1+B2".to_string();
+    let c1 = cycle_formula_ref_at(&mut s1, 3).expect("光标在 A1 末尾应循环 A1");
+    assert_eq!(s1, "=$A$1+B2");
+    assert_eq!(c1, 5);
+    let mut s_str = "=IF(A1=\"C3\",1,0)".to_string();
+    assert_eq!(cycle_formula_ref_at(&mut s_str, 10), None, "字符串内部不能触发 F4 循环");
+    assert_eq!(s_str, "=IF(A1=\"C3\",1,0)");
+
+    // 3) formula_help_at 按光标计算 active_arg 且忽略字符串内逗号/括号
+    let f2 = r#"=IF(A1="a,b(c", B1, C1)"#;
+    let h_arg1 = formula_help_at(f2, 16).expect("逗号后应在第 2 个参数");
+    assert_eq!(h_arg1.active_arg, Some(1));
+    let h_arg2 = formula_help_at(f2, 20).expect("第二个逗号后应在第 3 个参数");
+    assert_eq!(h_arg2.active_arg, Some(2));
+    // 光标在字符串内部不弹函数补全
+    let h_in_str = formula_help_at(r#"=IF(A1="SU"#, 10);
+    assert!(h_in_str.as_ref().is_none_or(|h| h.suggestions.is_empty()));
+
+    // 4) 公式中间接受自动补全：替换光标所在 token 且保留后半截公式
+    let mut ed = EditState::new("=SU+B1".into());
+    ed.caret = 3; // 光标在 SU 后、+B1 前
+    let help = formula_help_at(&ed.buf, ed.caret).expect("中间应弹出 SUM 补全");
+    let sum_idx = help.suggestions.iter().position(|(n, _)| n == "SUM").unwrap();
+    apply_formula_pick(&mut ed, &help, sum_idx);
+    assert_eq!(ed.buf, "=SUM(+B1", "补全不能吞掉光标后的 +B1");
+    assert_eq!(ed.caret, 5, "光标应落在左括号之后");
+}
+
+#[test]
+fn gap9_fn_wizard_prefills_existing_formula_and_name_box_full_features() {
+    let _env = crate::test_env::TestEnv::new("gap9-wiz-namebox");
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::Sheet::new("Sheet 2"));
+
+    // 1) 函数向导回填已有公式
+    app.wb.sheet_mut(0).set(
+        0,
+        0,
+        Cell {
+            value: Value::Empty,
+            formula: Some("=VLOOKUP(A2, B1:D10, 3, FALSE)".into()),
+        },
+    );
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.open_fn_wizard();
+    let wiz = app.fn_wizard.as_ref().expect("向导应打开");
+    assert_eq!(wiz.name, "VLOOKUP");
+    assert_eq!(wiz.args, vec!["A2", "B1:D10", "3", "FALSE"]);
+    app.fn_wizard = None;
+
+    // 2) 名称框支持 $A$1、跨表 'Sheet 2'!$B$2:$D$4、整列 A:C、整行 2:4
+    app.name_buf = "$C$5".into();
+    app.goto_name();
+    assert_eq!((app.sel, app.sel_end), ((4, 2), (4, 2)));
+
+    app.name_buf = "A:C".into();
+    app.goto_name();
+    assert_eq!((app.sel, app.sel_end), ((0, 0), (1_048_575, 2)));
+
+    app.name_buf = "2:4".into();
+    app.goto_name();
+    assert_eq!((app.sel, app.sel_end), ((1, 0), (3, 16_383)));
+
+    app.name_buf = "'Sheet 2'!$B$2:$C$4".into();
+    app.goto_name();
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!((app.sel, app.sel_end), ((1, 1), (3, 2)));
+
+    // 3) 名称框输入合法新标识符 -> 创建定义名称 + 反显 + 撤销
+    app.name_buf = "Q1_Sales".into();
+    app.goto_name();
+    assert_eq!(app.matching_defined_name_for_sel().as_deref(), Some("Q1_Sales"));
+    assert!(app.wb.names.iter().any(|(n, _, _)| n == "Q1_Sales"));
+    app.do_undo(false);
+    assert!(app.matching_defined_name_for_sel().is_none());
+    assert!(!app.wb.names.iter().any(|(n, _, _)| n == "Q1_Sales"));
+}
+
+#[test]
+fn gap9_commit_normalizes_plus_formula_closes_parens_and_wraps_multiline() {
+    let _env = crate::test_env::TestEnv::new("gap9-commit-norm");
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, number(10.0));
+    app.wb.sheet_mut(0).set(0, 1, number(25.0));
+
+    // +A1+B1 -> =A1+B1
+    app.sel = (0, 2);
+    app.sel_end = (0, 2);
+    app.begin_edit(Some("+A1+B1".into()));
+    assert!(app.commit_edit(None));
+    assert_eq!(app.wb.sheet(0).formula_of(0, 2), Some("=A1+B1"));
+    assert_eq!(app.wb.sheet(0).value(0, 2), Value::Number(35.0));
+
+    // 缺右括号自动补全
+    app.sel = (0, 3);
+    app.sel_end = (0, 3);
+    app.begin_edit(Some("=SUM(A1:B1".into()));
+    assert!(app.commit_edit(None));
+    assert_eq!(app.wb.sheet(0).formula_of(0, 3), Some("=SUM(A1:B1)"));
+    assert_eq!(app.wb.sheet(0).value(0, 3), Value::Number(35.0));
+
+    // Alt+Enter 多行文本自动开换行并撑高行高
+    app.sel = (2, 0);
+    app.sel_end = (2, 0);
+    let h_before = app.wb.sheet(0).rows.size(2);
+    app.begin_edit(Some("第一行\n第二行\n第三行".into()));
+    assert!(app.commit_edit(None));
+    let sid = app.wb.sheet(0).style_of(2, 0);
+    assert!(app.wb.styles.get(sid).wrap, "含换行的多行输入必须自动开启自动换行");
+    assert!(
+        app.wb.sheet(0).rows.size(2) > h_before + 10.0,
+        "三行文本必须自动撑高行高: before={h_before}, after={}",
+        app.wb.sheet(0).rows.size(2)
+    );
+}
+

@@ -689,13 +689,16 @@ fn fn_formula_from_args(name: &str, args: &[String]) -> String {
     format!("={name}({inner})")
 }
 
-/// 公式自动补全/参数提示。`start` 是当前标识符在缓冲里的字节位置。
+/// 公式自动补全/参数提示。`start..end` 是光标所在标识符在缓冲里的字节区间。
 #[derive(Clone, Default)]
 struct FormulaHelp {
     start: usize,
+    end: usize,
     token: String,
     suggestions: Vec<(String, String)>,
     signature: Option<String>,
+    /// 当前光标位于最内层未闭合函数的第几个参数（0 起）；用于参数提示加粗高亮。
+    active_arg: Option<usize>,
 }
 
 impl FormulaHelp {
@@ -704,79 +707,76 @@ impl FormulaHelp {
     }
 }
 
+/// 将字符下标安全转换为 UTF-8 字节偏移。
+fn byte_index_of_char(s: &str, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
+/// 判断字节位置 `byte_pos` 是否落在公式的双引号字符串字面量内部（正确处理 `""` 转义）。
+fn is_inside_string_literal(buf: &str, byte_pos: usize) -> bool {
+    let limit = byte_pos.min(buf.len());
+    let bytes = buf.as_bytes();
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < limit {
+        if bytes[i] == b'"' {
+            if in_str && i + 1 < limit && bytes[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            in_str = !in_str;
+        }
+        i += 1;
+    }
+    in_str
+}
+
 fn formula_signature(name: &str) -> String {
-    let n = name.to_ascii_uppercase();
-    let sig = match n.as_str() {
-        "SUM" => "SUM(number1,[number2],…)",
-        "SUMIF" => "SUMIF(range,criteria,[sum_range])",
-        "SUMIFS" => "SUMIFS(sum_range,criteria_range1,criteria1,…)",
-        "AVERAGE" => "AVERAGE(number1,[number2],…)",
-        "COUNT" => "COUNT(value1,[value2],…)",
-        "COUNTA" => "COUNTA(value1,[value2],…)",
-        "IF" => "IF(logical_test,[value_if_true],[value_if_false])",
-        "IFS" => "IFS(test1,value1,[test2,value2],…)",
-        "VLOOKUP" => "VLOOKUP(lookup_value,table_array,col_index_num,[range_lookup])",
-        "XLOOKUP" => "XLOOKUP(lookup_value,lookup_array,return_array,[if_not_found],[match_mode],[search_mode])",
-        "INDEX" => "INDEX(array,row_num,[column_num])",
-        "MATCH" => "MATCH(lookup_value,lookup_array,[match_type])",
-        "TEXT" => "TEXT(value,format_text)",
-        "ROUND" => "ROUND(number,num_digits)",
-        "DATE" => "DATE(year,month,day)",
-        "FILTER" => "FILTER(array,include,[if_empty])",
-        "UNIQUE" => "UNIQUE(array,[by_col],[exactly_once])",
-        "SORT" => "SORT(array,[sort_index],[sort_order],[by_col])",
-        "LET" => "LET(name1,value1,[name2,value2],…,calculation)",
-        _ => return format!("{n}(参数…)"),
-    };
-    sig.to_string()
+    sheetcore::formula::fncat::signature(name)
 }
 
 fn function_desc(name: &str) -> &'static str {
-    match name {
-        "SUM" => "求和",
-        "SUMIF" => "条件求和",
-        "SUMIFS" => "多条件求和",
-        "AVERAGE" => "平均值",
-        "COUNT" => "数字计数",
-        "COUNTA" => "非空计数",
-        "IF" => "条件判断",
-        "IFS" => "多条件判断",
-        "VLOOKUP" => "纵向查找",
-        "XLOOKUP" => "查找",
-        "INDEX" => "索引取值",
-        "MATCH" => "定位",
-        "TEXT" => "格式化文本",
-        "ROUND" => "四舍五入",
-        "DATE" => "日期",
-        "FILTER" => "筛选",
-        "UNIQUE" => "去重",
-        "SORT" => "排序",
-        "LET" => "定义局部名称",
-        "NOW" => "当前时间",
-        "TODAY" => "今天",
-        "MAX" => "最大值",
-        "MIN" => "最小值",
-        _ => "函数",
-    }
+    sheetcore::formula::fncat::description(name)
 }
 
-/// 取 `=` 后正在输入的函数名前缀；不是公式、没有标识符或前缀是数字时返回 None。
-fn formula_token_start(buf: &str) -> Option<usize> {
+/// 取 `=` 后位于 `caret_chars` 处正在输入的函数名前缀字节区间 `(start, end)`；
+/// 跳过双引号字符串字面量，数字开头或前导非运算符/分隔符返回 None。
+fn formula_token_span_at(buf: &str, caret_chars: usize) -> Option<(usize, usize)> {
     if !buf.starts_with('=') {
         return None;
     }
-    let mut start = buf.len();
-    for (i, ch) in buf.char_indices().rev() {
+    let caret = byte_index_of_char(buf, caret_chars);
+    if is_inside_string_literal(buf, caret) {
+        return None;
+    }
+    let prefix = &buf[..caret];
+    let mut start = caret;
+    for (i, ch) in prefix.char_indices().rev() {
         if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' {
             start = i;
         } else {
             break;
         }
     }
-    if start == buf.len() {
+    if start == caret {
         return None;
     }
-    let token = &buf[start..];
+    // 若光标后紧跟字母/数字/下划线且没有括号，说明正在编辑中间标识符，扩展 end 到标识符尾部
+    let mut end = caret;
+    for (i, ch) in buf[caret..].char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' {
+            end = caret + i + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let token = &buf[start..caret];
     if token.chars().next()?.is_ascii_digit() {
         return None;
     }
@@ -785,53 +785,73 @@ fn formula_token_start(buf: &str) -> Option<usize> {
         prev,
         None | Some('=') | Some('(') | Some(',') | Some('+') | Some('-') | Some('*')
             | Some('/') | Some('^') | Some('&') | Some('<') | Some('>') | Some(':')
-            | Some(';') | Some('{')
+            | Some(';') | Some('{') | Some(' ')
     );
     if !ok {
         return None;
     }
-    Some(start)
+    Some((start, end))
 }
 
-/// 当前最内层未闭合函数的签名（只对已实现函数显示）。
-fn formula_open_signature(buf: &str) -> Option<String> {
+/// 当前光标位置最内层未闭合函数的签名与当前参数索引（跳过 `"..."` 字符串字面量）。
+fn formula_open_signature_at(buf: &str, caret_chars: usize) -> Option<(String, usize)> {
     if !buf.starts_with('=') {
         return None;
     }
-    let mut depth = 0i32;
-    let mut open = None;
-    for (i, ch) in buf.char_indices().rev() {
-        match ch {
-            ')' => depth += 1,
-            '(' => {
-                if depth == 0 {
-                    open = Some(i);
-                    break;
+    let caret = byte_index_of_char(buf, caret_chars);
+    let bytes = buf.as_bytes();
+    let mut i = 0usize;
+    let mut in_str = false;
+    // 栈帧：(左括号字节偏移, 该层已见逗号数)
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    while i < caret {
+        let b = bytes[i];
+        if in_str {
+            if b == b'"' {
+                if i + 1 < caret && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
                 }
-                depth -= 1;
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'(' => stack.push((i, 0)),
+            b')' => {
+                let _ = stack.pop();
+            }
+            b',' => {
+                if let Some(top) = stack.last_mut() {
+                    top.1 += 1;
+                }
             }
             _ => {}
         }
+        i += 1;
     }
-    let open = open?;
-    let mut start = open;
-    while start > 0 {
-        let ch = buf[..start].chars().next_back()?;
-        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' {
-            start -= ch.len_utf8();
-        } else {
-            break;
+    // 从最内层向上找最近一个带合法函数名的左括号（跳过纯分组括号 `(a+b)`）
+    for &(open, arg_idx) in stack.iter().rev() {
+        let mut start = open;
+        while start > 0 {
+            let Some(ch) = buf[..start].chars().next_back() else { break };
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' {
+                start -= ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if start == open {
+            continue;
+        }
+        let name = buf[start..open].to_ascii_uppercase();
+        if sheetcore::formula::functions::implemented().iter().any(|f| *f == name) {
+            return Some((formula_signature(&name), arg_idx));
         }
     }
-    if start == open {
-        return None;
-    }
-    let name = buf[start..open].to_ascii_uppercase();
-    if sheetcore::formula::functions::implemented().iter().any(|f| *f == name) {
-        Some(formula_signature(&name))
-    } else {
-        None
-    }
+    None
 }
 
 /// 函数名匹配分级：前缀 0、词内连续 1、子序列 2（如 VLO → VLOOKUP），不匹配返回 None
@@ -849,10 +869,11 @@ fn func_match_tier(name: &str, token_upper: &str) -> Option<u8> {
     None
 }
 
-fn formula_help(buf: &str) -> Option<FormulaHelp> {
+fn formula_help_at(buf: &str, caret_chars: usize) -> Option<FormulaHelp> {
     let mut out = FormulaHelp::default();
-    if let Some(start) = formula_token_start(buf) {
-        let token = &buf[start..];
+    if let Some((start, end)) = formula_token_span_at(buf, caret_chars) {
+        let caret = byte_index_of_char(buf, caret_chars);
+        let token = &buf[start..caret];
         if token.chars().count() >= 2 {
             let up = token.to_ascii_uppercase();
             let mut ranked: Vec<(u8, &'static str)> = Vec::new();
@@ -872,15 +893,23 @@ fn formula_help(buf: &str) -> Option<FormulaHelp> {
             }
             out.suggestions.truncate(8);
             out.start = start;
+            out.end = end;
             out.token = token.to_string();
         }
     }
-    out.signature = formula_open_signature(buf);
+    if let Some((sig, arg_idx)) = formula_open_signature_at(buf, caret_chars) {
+        out.signature = Some(sig);
+        out.active_arg = Some(arg_idx);
+    }
     if out.suggestions.is_empty() && out.signature.is_none() {
         None
     } else {
         Some(out)
     }
+}
+
+fn formula_help(buf: &str) -> Option<FormulaHelp> {
+    formula_help_at(buf, buf.chars().count())
 }
 
 /// 候选列表的键盘选择：↑↓ 改变高亮，Enter/Tab 接受；返回要接受的索引。
@@ -1012,20 +1041,28 @@ fn apply_formula_pick(ed: &mut EditState, help: &FormulaHelp, idx: usize) {
     let Some(name) = help.selected(idx).map(str::to_string) else {
         return;
     };
+    let end = help.end.max(help.start).min(ed.buf.len());
     if ed.buf.len() < help.start {
         return;
     }
     if debug_flags::formula_log() {
         eprintln!(
-            "[formula] pick idx={} start={} token={:?} name={:?} before={:?}",
-            idx, help.start, help.token, name, ed.buf
+            "[formula] pick idx={} start={} end={} token={:?} name={:?} before={:?}",
+            idx, help.start, end, help.token, name, ed.buf
         );
     }
-    ed.buf.replace_range(help.start.., &name);
-    // Excel 选中函数后补左括号，紧接着显示参数签名
-    if !ed.buf.ends_with('(') {
-        ed.buf.push('(');
-    }
+    let already_has_paren = ed.buf[end..].starts_with('(');
+    let insert = if already_has_paren {
+        name.clone()
+    } else {
+        format!("{name}(")
+    };
+    ed.buf.replace_range(help.start..end, &insert);
+    let new_caret = ed.buf[..help.start].chars().count()
+        + insert.chars().count()
+        + usize::from(already_has_paren);
+    ed.caret = new_caret.min(ed.buf.chars().count());
+    ed.caret_override = Some(ed.caret);
     ed.complete_idx = 0;
 }
 
@@ -1283,13 +1320,31 @@ fn is_ref_ident_char(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '_' | '$' | '.' | '\'')
 }
 
-/// O(L) 字节级引用扫描（零 `Vec<char>`、零 `byte_of: Vec<usize>`、零单片段 `String` 分配，`HashMap<&str, usize>` O(1) 配对）。
+/// O(L) 字节级引用扫描（跳过 `"..."` 字符串字面量，零 `Vec<char>` 分配，`HashMap<&str, usize>` O(1) 配对）。
 pub(crate) fn ref_byte_spans(buf: &str) -> Vec<(usize, usize, usize)> {
     let mut out: Vec<(usize, usize, usize)> = Vec::new();
     let mut seen: HashMap<&str, usize> = HashMap::new();
+    let bytes = buf.as_bytes();
     let mut i = 0usize;
     let mut prev_ident = false;
     while i < buf.len() {
+        if bytes[i] == b'"' {
+            // 跳过整个字符串字面量（含 `""` 转义），绝不把 `"B2"` 当作单元格引用着色
+            i += 1;
+            while i < buf.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < buf.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            prev_ident = false;
+            continue;
+        }
         let ch = buf[i..].chars().next().unwrap();
         if !prev_ident {
             if let Some(end) = parse_ref_token_bytes(buf, i) {
@@ -1476,30 +1531,98 @@ fn draw_formula_help(
                     if !help.suggestions.is_empty() {
                         ui.separator();
                     }
-                    ui.label(
-                        egui::RichText::new(sig)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(90, 90, 90)),
-                    );
+                    let pal = theme::palette();
+                    let normal_fmt = egui::TextFormat {
+                        font_id: egui::FontId::proportional(11.0),
+                        color: pal.text_muted,
+                        ..Default::default()
+                    };
+                    let active_fmt = egui::TextFormat {
+                        font_id: egui::FontId::proportional(11.5),
+                        color: pal.accent,
+                        ..Default::default()
+                    };
+                    let mut job = egui::text::LayoutJob::default();
+                    if let (Some(arg_idx), Some(open), Some(close)) =
+                        (help.active_arg, sig.find('('), sig.rfind(')'))
+                    {
+                        let inner = &sig[open + 1..close];
+                        let parts: Vec<&str> = if inner.is_empty() {
+                            Vec::new()
+                        } else {
+                            inner.split(',').collect()
+                        };
+                        let has_ellipsis = parts.iter().any(|p| p.trim() == "…");
+                        let target_idx = if parts.is_empty() {
+                            None
+                        } else if arg_idx < parts.len() && parts[arg_idx].trim() != "…" {
+                            Some(arg_idx)
+                        } else if has_ellipsis {
+                            // 可变长参数（如 SUM(number1,[number2],…)）：高亮最后一个实际参数位
+                            parts.iter().rposition(|p| p.trim() != "…")
+                        } else {
+                            None
+                        };
+                        job.append(&sig[..=open], 0.0, normal_fmt.clone());
+                        for (idx, p) in parts.iter().enumerate() {
+                            if idx > 0 {
+                                job.append(",", 0.0, normal_fmt.clone());
+                            }
+                            if target_idx == Some(idx) {
+                                job.append(p, 0.0, active_fmt.clone());
+                            } else {
+                                job.append(p, 0.0, normal_fmt.clone());
+                            }
+                        }
+                        job.append(&sig[close..], 0.0, normal_fmt);
+                    } else {
+                        job.append(sig, 0.0, normal_fmt);
+                    }
+                    ui.label(job);
                 }
             });
         });
 }
 
-
-/// F4 循环当前末尾的 A1 引用：A1 → $A$1 → A$1 → $A1 → A1。
-fn cycle_formula_ref(buf: &mut String) -> bool {
+/// F4 按光标位置循环所在 A1 引用的绝对/相对形式（跳过字符串字面量）：
+/// `A1 → $A$1 → A$1 → $A1 → A1`。返回更新后的光标字符下标。
+fn cycle_formula_ref_at(buf: &mut String, caret_chars: usize) -> Option<usize> {
+    let caret = byte_index_of_char(buf, caret_chars);
+    if is_inside_string_literal(buf, caret) {
+        return None;
+    }
     let bytes = buf.as_bytes();
-    let mut end = bytes.len();
-    while end > 0 && !(bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'$') {
-        end -= 1;
-    }
-    if end == 0 {
-        return false;
-    }
-    let mut start = end;
-    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'$') {
-        start -= 1;
+    let is_ref_b = |b: u8| b.is_ascii_alphanumeric() || b == b'$';
+    // 1) 优先定位直接包含或紧邻光标的 A1 token
+    let (mut start, mut end) = if caret < bytes.len() && is_ref_b(bytes[caret])
+        || (caret > 0 && is_ref_b(bytes[caret - 1]))
+    {
+        let mut s = caret;
+        while s > 0 && is_ref_b(bytes[s - 1]) {
+            s -= 1;
+        }
+        let mut e = caret;
+        while e < bytes.len() && is_ref_b(bytes[e]) {
+            e += 1;
+        }
+        (s, e)
+    } else {
+        // 2) 若光标在运算符/右括号后，向左跳过非引用字符找最近一个不在字符串内的 A1 token
+        let mut e = caret;
+        while e > 0 && !is_ref_b(bytes[e - 1]) {
+            e -= 1;
+        }
+        if e == 0 || is_inside_string_literal(buf, e) {
+            return None;
+        }
+        let mut s = e;
+        while s > 0 && is_ref_b(bytes[s - 1]) {
+            s -= 1;
+        }
+        (s, e)
+    };
+    if start >= end || is_inside_string_literal(buf, start) {
+        return None;
     }
     // 排除函数名/数字，只接受 [A-Za-z$]{1,3}[0-9]+ 且前后不是标识符
     let token = &buf[start..end];
@@ -1513,21 +1636,27 @@ fn cycle_formula_ref(buf: &mut String) -> bool {
         tpos += 1;
     }
     let rest: String = tchars[tpos..].iter().collect();
-    if letters.is_empty() || letters.len() > 3 || rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
-        return false;
+    if letters.is_empty()
+        || letters.len() > 3
+        || rest.is_empty()
+        || rest.starts_with('0')
+        || !rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
     }
     if start > 0 {
         let prev = buf[..start].chars().next_back().unwrap_or(' ');
         if prev.is_ascii_alphanumeric() || prev == '_' || prev == '.' {
-            return false;
+            return None;
         }
     }
     if end < buf.len() {
         let next = buf[end..].chars().next().unwrap_or(' ');
-        if next.is_ascii_alphanumeric() || next == '_' {
-            return false;
+        if next.is_ascii_alphanumeric() || next == '_' || next == '(' {
+            return None;
         }
     }
+    let _ = (&mut start, &mut end);
     // 解析当前 $ 状态；A1→$A$1→A$1→$A1→A1
     let chars: Vec<char> = token.chars().collect();
     let mut ci = 0;
@@ -1560,8 +1689,15 @@ fn cycle_formula_ref(buf: &mut String) -> bool {
         out.push('$');
     }
     out.push_str(&row);
+    let prefix_chars = buf[..start].chars().count();
+    let new_caret = prefix_chars + out.chars().count();
     buf.replace_range(start..end, &out);
-    true
+    Some(new_caret)
+}
+
+/// F4 循环当前末尾的 A1 引用（兼容旧单参调用）。
+fn cycle_formula_ref(buf: &mut String) -> bool {
+    cycle_formula_ref_at(buf, buf.chars().count()).is_some()
 }
 
 
@@ -1622,12 +1758,94 @@ fn formula_expects_ref_at_caret(buf: &str, caret: usize) -> bool {
     if !buf.starts_with('=') {
         return false;
     }
-    let before: String = buf.chars().take(caret).collect();
-    let trimmed = before.trim_end();
+    let bpos = byte_index_of_char(buf, caret);
+    if is_inside_string_literal(buf, bpos) {
+        return false;
+    }
+    let trimmed = buf[..bpos].trim_end();
     matches!(
         trimmed.chars().last(),
         Some('=' | '+' | '-' | '*' | '/' | '^' | '&' | '(' | ',' | ';' | ':' | '<' | '>')
     )
+}
+
+/// 解析外层公式调用 `=FUNC(arg1, arg2, ...)` 用于函数向导回填（正确跳过引号与嵌套括号）。
+fn parse_outer_formula_call(raw: &str) -> Option<(String, Vec<String>)> {
+    let t = raw.trim();
+    let body = t.strip_prefix('=')?.trim();
+    let open = body.find('(')?;
+    let name = body[..open].trim().to_ascii_uppercase();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+    {
+        return None;
+    }
+    if !sheetcore::formula::functions::implemented()
+        .iter()
+        .any(|f| *f == name)
+    {
+        return None;
+    }
+    let bytes = body.as_bytes();
+    let mut i = open + 1;
+    let mut depth = 1i32;
+    let mut brace = 0i32;
+    let mut in_str = false;
+    let mut arg_start = i;
+    let mut args = Vec::new();
+    let mut close_pos = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    args.push(body[arg_start..i].trim().to_string());
+                    close_pos = Some(i);
+                    break;
+                }
+            }
+            b'{' => brace += 1,
+            b'}' => brace -= 1,
+            b',' if depth == 1 && brace == 0 => {
+                args.push(body[arg_start..i].trim().to_string());
+                arg_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some(cp) = close_pos {
+        // 确保外层是单一函数调用而非 `=SUM(A1)+SUM(B1)`
+        if !body[cp + 1..].trim().is_empty() {
+            return None;
+        }
+    } else {
+        // 未闭合括号也尽量回填已输入参数
+        let tail = body[arg_start..].trim();
+        if !tail.is_empty() || !args.is_empty() {
+            args.push(tail.to_string());
+        }
+    }
+    if args.len() == 1 && args[0].is_empty() {
+        args.clear();
+    }
+    Some((name, args))
 }
 
 /// 去掉页眉页脚里的 OOXML 控制码（&L/&C/&R/&B 等），只留文字
@@ -16163,9 +16381,14 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     /// Ctrl+方向：沿方向跳过空白，停在连续数据块的边缘（Excel 语义，跳过隐藏行列且无 4096 行截断）
     fn jump_edge(&self, dr: i64, dc: i64) -> (u32, u32) {
+        self.jump_edge_from(self.sel, dr, dc)
+    }
+
+    /// 从任意起点 `(r, c)` 执行 Ctrl+方向跳边（支持 Ctrl+Shift+方向从 `sel_end` 扩选）。
+    fn jump_edge_from(&self, from: (u32, u32), dr: i64, dc: i64) -> (u32, u32) {
         let sheet = self.wb.sheet(self.sheet_idx);
         let (cols, rows) = self.view_axes();
-        let (mut r, mut c) = self.sel;
+        let (mut r, mut c) = from;
         let occupied = |rr: u32, cc: u32| -> bool {
             sheet.get(rr, cc).is_some_and(|x| !x.is_blank())
         };
@@ -16674,7 +16897,111 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         extra.is_none() && a.is_some() && b.is_some()
     }
 
-    /// 名称框：支持 A1、A1:B2、以及定义名称
+    /// 解析名称框或定义名称目标：`Sheet2!$A$1:$C$5`、`'My Sheet'!B2`、`$A$1`、`A:C`、`1:5`。
+    fn parse_goto_target(&self, raw: &str) -> Option<(Option<usize>, (u32, u32), (u32, u32))> {
+        let body = raw.trim().trim_start_matches('=').trim();
+        if body.is_empty() {
+            return None;
+        }
+        let (sheet_idx, range_part) = if let Some((s, r)) = body.rsplit_once('!') {
+            let nm = s.trim();
+            let unquoted = if nm.starts_with('\'') && nm.ends_with('\'') && nm.len() >= 2 {
+                nm[1..nm.len() - 1].replace("''", "'")
+            } else {
+                nm.to_string()
+            };
+            let idx = self
+                .wb
+                .sheets
+                .iter()
+                .position(|sh| sh.name.eq_ignore_ascii_case(&unquoted))?;
+            (Some(idx), r.trim())
+        } else {
+            (None, body)
+        };
+        let clean: String = range_part
+            .chars()
+            .filter(|&ch| ch != '$' && !ch.is_whitespace())
+            .collect();
+        if clean.is_empty() {
+            return None;
+        }
+        let parse_col_only = |tok: &str| -> Option<u32> {
+            if tok.is_empty() || tok.len() > 3 || !tok.bytes().all(|b| b.is_ascii_alphabetic()) {
+                return None;
+            }
+            let (r, c) = sheetcore::sparse::parse_ref(&format!("{}1", tok.to_ascii_uppercase()))?;
+            (r == 0 && c < 16_384).then_some(c)
+        };
+        let parse_row_only = |tok: &str| -> Option<u32> {
+            if tok.is_empty() || tok.len() > 7 || !tok.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let r1: u32 = tok.parse().ok()?;
+            (1..=1_048_576).contains(&r1).then_some(r1 - 1)
+        };
+        let up = clean.to_ascii_uppercase();
+        let parts: Vec<&str> = up.split(':').collect();
+        if parts.len() == 2 {
+            if let (Some(a), Some(b)) = (
+                sheetcore::sparse::parse_ref(parts[0]),
+                sheetcore::sparse::parse_ref(parts[1]),
+            ) {
+                return Some((sheet_idx, a, b));
+            }
+            if let (Some(c1), Some(c2)) = (parse_col_only(parts[0]), parse_col_only(parts[1])) {
+                return Some((sheet_idx, (0, c1.min(c2)), (1_048_575, c1.max(c2))));
+            }
+            if let (Some(r1), Some(r2)) = (parse_row_only(parts[0]), parse_row_only(parts[1])) {
+                return Some((sheet_idx, (r1.min(r2), 0), (r1.max(r2), 16_383)));
+            }
+            return None;
+        }
+        if parts.len() == 1 {
+            if let Some(a) = sheetcore::sparse::parse_ref(parts[0]) {
+                return Some((sheet_idx, a, a));
+            }
+        }
+        None
+    }
+
+    /// 若当前选区恰好等于某个已定义名称（本表局部优先于工作簿全局），返回该名称供名称框反显。
+    fn matching_defined_name_for_sel(&self) -> Option<String> {
+        if self.wb.names.is_empty() {
+            return None;
+        }
+        let cur = self.sel_rect();
+        let mut global_hit: Option<String> = None;
+        for (n, sh, body) in &self.wb.names {
+            let scope_ok = match *sh {
+                Some(si) => si == self.sheet_idx,
+                None => true,
+            };
+            if !scope_ok {
+                continue;
+            }
+            let Some((target_sh, a, b)) = self.parse_goto_target(body) else {
+                continue;
+            };
+            let resolved_sh = target_sh.or(*sh).unwrap_or(self.sheet_idx);
+            if resolved_sh != self.sheet_idx {
+                continue;
+            }
+            let rect = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
+            if rect == cur {
+                if sh.is_some() {
+                    return Some(n.clone());
+                }
+                if global_hit.is_none() {
+                    global_hit = Some(n.clone());
+                }
+            }
+        }
+        global_hit
+    }
+
+    /// 名称框：支持 `$A$1`、`$A$1:$B$2`、`Sheet2!A1`、`A:C`、`1:5`、已有定义名称，
+    /// 以及输入合法新标识符时直接为当前选区新建工作簿定义名称（支持撤销）。
     fn goto_name(&mut self) {
         let text = self.name_buf.trim().to_string();
         if text.is_empty() {
@@ -16684,31 +17011,20 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if !self.finish_pending_edit() {
             return;
         }
-        let up = text.to_ascii_uppercase();
-        let parts: Vec<&str> = up.split(':').collect();
-        if parts.len() == 2 {
-            if let (Some(a), Some(b)) = (
-                sheetcore::sparse::parse_ref(parts[0]),
-                sheetcore::sparse::parse_ref(parts[1]),
-            ) {
-                self.commit_edit(None);
-                if self.rect_sel_blocked(a, b) {
-                    self.block_selection();
+        if let Some((sheet_opt, a, b)) = self.parse_goto_target(&text) {
+            if let Some(idx) = sheet_opt {
+                if idx != self.sheet_idx && !self.switch_sheet_view(idx) {
                     return;
                 }
-                self.sel = a;
-                self.sel_end = b;
-                self.ensure_visible();
-                return;
             }
-        } else if let Some(a) = sheetcore::sparse::parse_ref(parts[0]) {
             self.commit_edit(None);
-            if self.sel_blocked_at(a.0, a.1) {
+            if self.rect_sel_blocked(a, b) {
                 self.block_selection();
                 return;
             }
             self.sel = a;
-            self.sel_end = a;
+            self.sel_end = b;
+            self.extra_sel.clear();
             self.ensure_visible();
             return;
         }
@@ -16730,48 +17046,49 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         let hit = local.or(global);
         if let Some((_sh, body)) = hit {
-            let body = body.trim_start_matches('=').trim();
-            // 名称体可以是单格或区域：`Sheet1!$A$1:$B$3`、`$A$1:$B$3`、`A1`。
-            let (sheet_part, range_part) = match body.rsplit_once('!') {
-                Some((s, r)) => (Some(s), r),
-                None => (None, body),
-            };
-            let clean = range_part.replace('$', "");
-            let mut pieces = clean.split(':');
-            let first = pieces.next();
-            let second = pieces.next();
-            let extra = pieces.next();
-            let a = first.and_then(sheetcore::sparse::parse_ref);
-            let b = match second {
-                Some(s) => sheetcore::sparse::parse_ref(s),
-                None => a,
-            };
-            if extra.is_none() {
-                if let (Some(a), Some(b)) = (a, b) {
-                    if let Some(sheet) = sheet_part {
-                        let nm = sheet.trim_matches(|c| c == '\'');
-                        if let Some(idx) = self
-                            .wb
-                            .sheets
-                            .iter()
-                            .position(|s| s.name.eq_ignore_ascii_case(nm))
-                        {
-                            if idx != self.sheet_idx && !self.switch_sheet_view(idx) {
-                                return;
-                            }
-                        }
-                    }
-                    self.commit_edit(None);
-                    if self.rect_sel_blocked(a, b) {
-                        self.block_selection();
+            if let Some((sheet_opt, a, b)) = self.parse_goto_target(&body) {
+                if let Some(idx) = sheet_opt {
+                    if idx != self.sheet_idx && !self.switch_sheet_view(idx) {
                         return;
                     }
-                    self.sel = a;
-                    self.sel_end = b;
-                    self.ensure_visible();
+                }
+                self.commit_edit(None);
+                if self.rect_sel_blocked(a, b) {
+                    self.block_selection();
                     return;
                 }
+                self.sel = a;
+                self.sel_end = b;
+                self.extra_sel.clear();
+                self.ensure_visible();
+                return;
             }
+        }
+        // 非法引用但属于合法新定义名称标识符：按 Excel 习惯直接为当前选区新建工作簿名称（可撤销）
+        if Self::valid_defined_name(&text) {
+            let (r1, c1, r2, c2) = self.sel_rect();
+            let sref = sheet_ref_name(&self.wb.sheet(self.sheet_idx).name);
+            let abs_cell = |rr: u32, cc: u32| format!("${}${}", col_label(cc), rr + 1);
+            let refers = if (r1, c1) == (r2, c2) {
+                format!("{sref}!{}", abs_cell(r1, c1))
+            } else {
+                format!("{sref}!{}:{}", abs_cell(r1, c1), abs_cell(r2, c2))
+            };
+            let before = self.wb.names.clone();
+            self.wb.names.push((text.clone(), None, refers.clone()));
+            let after = self.wb.names.clone();
+            self.undo.push_meta(
+                format!("定义名称 {text}"),
+                (self.sheet_idx, r1, c1),
+                sheetcore::undo::MetaEdit {
+                    sheet: self.sheet_idx,
+                    names: Some((before, after)),
+                    ..Default::default()
+                },
+            );
+            self.wb.dirty = true;
+            self.status = format!("已定义名称：{text} = {refers}");
+            return;
         }
         self.status = format!("找不到名称：{text}");
     }
@@ -17030,7 +17347,12 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             }
             let old_sid_for_fmt = self.wb.sheet(self.sheet_idx).style_of(r, c);
             let is_text_fmt = self.wb.styles.get(old_sid_for_fmt).format.trim() == "@";
-            let is_cse = !is_text_fmt && self.cse_pending && ed.buf.starts_with('=');
+            let normalized_formula = if is_text_fmt {
+                None
+            } else {
+                sheetcore::input_parse::normalize_formula_input(&ed.buf)
+            };
+            let is_cse = !is_text_fmt && self.cse_pending && normalized_formula.is_some();
             self.cse_pending = false;
             let (cse_r1, cse_c1, cse_r2, cse_c2) = self.sel_rect();
             let extra_sheets: Vec<usize> = if !is_cse
@@ -17061,10 +17383,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 }
             }
             let mut style_update: Option<(u16, sheetcore::style::CellStyle)> = None;
-            let cell = if !is_text_fmt && ed.buf.starts_with('=') {
+            let cell = if let Some(mut text) = normalized_formula {
                 // 手输的 [预算.xlsx]Sheet!A1：先把工作簿登记成链接（能读到就带缓存），
                 // 再折回 Excel 认的 [N] 形式
-                let mut text = ed.buf.trim().to_string();
                 if sheetcore::xlinks::is_external_formula(&text) {
                     let added = sheetcore::xlinks::absorb_formula(&mut self.wb, &text);
                     if added > 0 {
@@ -17083,7 +17404,24 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 }
                 Cell { value: Value::Text(text.as_str().into()), formula: Some(text.as_str().into()) }
             } else {
-                let (val, st_upd) = self.parse_input_for_cell(self.sheet_idx, r, c, &ed.buf);
+                let (val, mut st_upd) = self.parse_input_for_cell(self.sheet_idx, r, c, &ed.buf);
+                // Alt+Enter 多行文本自动开启自动换行（随后自动撑高行高）
+                if ed.buf.contains('\n') {
+                    let cur_sid = st_upd
+                        .as_ref()
+                        .map(|(sid, _)| *sid)
+                        .unwrap_or_else(|| self.wb.sheet(self.sheet_idx).style_of(r, c));
+                    let cur_quote = self.wb.styles.quote_of(cur_sid);
+                    let mut st = st_upd
+                        .as_ref()
+                        .map(|(_, s)| s.clone())
+                        .unwrap_or_else(|| self.wb.styles.get(cur_sid).clone());
+                    if !st.wrap {
+                        st.wrap = true;
+                        let new_sid = self.wb.styles.intern_with_quote(st.clone(), cur_quote);
+                        st_upd = Some((new_sid, st));
+                    }
+                }
                 style_update = st_upd;
                 Cell { value: val, formula: None }
             };
@@ -17453,9 +17791,20 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         let (ar, ac) = self.sel;
         let si = self.sheet_idx;
-        let is_formula = ed.buf.starts_with('=');
-        let mut base_formula = if is_formula {
-            let mut text = ed.buf.trim().to_string();
+        let anchor_is_text = self
+            .wb
+            .styles
+            .get(self.wb.sheet(si).style_of(ar, ac))
+            .format
+            .trim()
+            == "@";
+        let normalized_formula = if anchor_is_text {
+            None
+        } else {
+            sheetcore::input_parse::normalize_formula_input(&ed.buf)
+        };
+        let is_formula = normalized_formula.is_some();
+        let mut base_formula = if let Some(mut text) = normalized_formula {
             if sheetcore::xlinks::is_external_formula(&text) {
                 let _ = sheetcore::xlinks::absorb_formula(&mut self.wb, &text);
                 text = sheetcore::xlinks::raw_formula(&self.wb, &text);
@@ -17469,8 +17818,16 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         let txn = self.txn_begin(&keys);
         let mut touched = Vec::with_capacity(keys.len());
         let mut style_wire: Vec<(u32, u32, sheetcore::style::CellStyle)> = Vec::new();
+        let mut wrap_rows = std::collections::BTreeSet::new();
         for &(r, c) in &keys {
-            if is_formula {
+            let cell_is_text = self
+                .wb
+                .styles
+                .get(self.wb.sheet(si).style_of(r, c))
+                .format
+                .trim()
+                == "@";
+            if is_formula && !cell_is_text {
                 let dr = i64::from(r) - i64::from(ar);
                 let dc = i64::from(c) - i64::from(ac);
                 let ftxt = if dr == 0 && dc == 0 {
@@ -17484,7 +17841,24 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 };
                 self.wb.sheet_mut(si).set(r, c, cell);
             } else {
-                let (val, st_upd) = self.parse_input_for_cell(si, r, c, &ed.buf);
+                let (val, mut st_upd) = self.parse_input_for_cell(si, r, c, &ed.buf);
+                if ed.buf.contains('\n') {
+                    let cur_sid = st_upd
+                        .as_ref()
+                        .map(|(sid, _)| *sid)
+                        .unwrap_or_else(|| self.wb.sheet(si).style_of(r, c));
+                    let cur_quote = self.wb.styles.quote_of(cur_sid);
+                    let mut st = st_upd
+                        .as_ref()
+                        .map(|(_, s)| s.clone())
+                        .unwrap_or_else(|| self.wb.styles.get(cur_sid).clone());
+                    if !st.wrap {
+                        st.wrap = true;
+                        let new_sid = self.wb.styles.intern_with_quote(st.clone(), cur_quote);
+                        st_upd = Some((new_sid, st));
+                    }
+                    wrap_rows.insert(r);
+                }
                 self.wb.sheet_mut(si).set(r, c, Cell { value: val, formula: None });
                 if let Some((sid, st)) = st_upd {
                     self.wb.sheet_mut(si).set_style(r, c, sid);
@@ -17492,6 +17866,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 }
             }
             touched.push((si, r, c));
+        }
+        for wr in wrap_rows {
+            self.autofit_row_for_wrap(wr);
         }
         let _ = &mut base_formula;
         self.cf_inputs.grid.mark_cells_dirty(keys.iter().copied());
@@ -17858,10 +18235,15 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         );
     }
 
-    /// 让选区留在可视范围内（列宽行高不统一，只能按实际位置算）
+    /// 让活动格留在可视范围内（列宽行高不统一，只能按实际位置算）
     fn ensure_visible(&mut self) {
-        self.scroll_target = None;
         let (r, c) = self.sel;
+        self.ensure_cell_visible(r, c);
+    }
+
+    /// 让指定单元格 `(r, c)` 留在可视范围内（Shift+方向扩选时追踪 `sel_end`）。
+    fn ensure_cell_visible(&mut self, r: u32, c: u32) {
+        self.scroll_target = None;
         let (cols, rows) = self.view_axes();
         let view_w = (self.last_view.x - HEAD_W).max(64.0);
         let view_h = (self.last_view.y - HEAD_H).max(44.0);
@@ -18385,11 +18767,13 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F1)) {
             self.ribbon_collapsed = !self.ribbon_collapsed;
         }
-        // F4：编辑公式时循环末尾引用的绝对/相对形式；非编辑态重复上一步操作（Excel 同款）
+        // F4：编辑公式时按光标位置循环所在引用的绝对/相对形式；非编辑态重复上一步操作（Excel 同款）
         if ctx.input(|i| i.key_pressed(Key::F4)) {
             if self.editing.is_some() {
                 if let Some(ed) = self.editing.as_mut() {
-                    if cycle_formula_ref(&mut ed.buf) {
+                    if let Some(new_caret) = cycle_formula_ref_at(&mut ed.buf, ed.caret) {
+                        ed.caret = new_caret;
+                        ed.caret_override = Some(new_caret);
                         return;
                     }
                 }
@@ -18937,20 +19321,41 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             } else {
                 self.used_end()
             };
-            self.sel = (r, c);
-            if !shift {
+            if shift {
+                if self.rect_sel_blocked(self.sel, (r, c)) {
+                    self.block_selection();
+                } else {
+                    self.sel_end = (r, c);
+                    self.ensure_cell_visible(r, c);
+                }
+            } else if self.sel_blocked_at(r, c) {
+                self.block_selection();
+            } else {
+                self.sel = (r, c);
                 self.sel_end = (r, c);
+                self.extra_sel.clear();
+                self.ensure_visible();
             }
-            self.ensure_visible();
             return;
         }
         if !ctrl && home {
-            // Excel 的 Home：回到本行 A 列
+            // Excel 的 Home：回到本行 A 列（Shift+Home 保持活动格锚点扩选到 A 列）
             self.commit_edit(None);
-            let r = self.sel.0;
-            self.sel = (r, 0);
-            self.sel_end = (r, 0);
-            self.ensure_visible();
+            let shift = ctx.input(|i| i.modifiers.shift);
+            let r = if shift { self.sel_end.0 } else { self.sel.0 };
+            if shift {
+                if self.rect_sel_blocked(self.sel, (r, 0)) {
+                    self.block_selection();
+                } else {
+                    self.sel_end = (r, 0);
+                    self.ensure_cell_visible(r, 0);
+                }
+            } else {
+                self.sel = (r, 0);
+                self.sel_end = (r, 0);
+                self.extra_sel.clear();
+                self.ensure_visible();
+            }
             return;
         }
         if ctrl && (pgup || pgdn) {
@@ -18974,13 +19379,24 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 )
             });
             self.commit_edit(None);
-            let (r, c) = self.jump_edge(dr, dc);
             let shift = ctx.input(|i| i.modifiers.shift);
-            self.sel = (r, c);
-            if !shift {
+            let from = if shift { self.sel_end } else { self.sel };
+            let (r, c) = self.jump_edge_from(from, dr, dc);
+            if shift {
+                if self.rect_sel_blocked(self.sel, (r, c)) {
+                    self.block_selection();
+                } else {
+                    self.sel_end = (r, c);
+                    self.ensure_cell_visible(r, c);
+                }
+            } else if self.sel_blocked_at(r, c) {
+                self.block_selection();
+            } else {
+                self.sel = (r, c);
                 self.sel_end = (r, c);
+                self.extra_sel.clear();
+                self.ensure_visible();
             }
-            self.ensure_visible();
             return;
         }
         if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::Num1)) {
@@ -19043,45 +19459,49 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             } else {
                 self.nav_rect = None;
                 let extend = ctx.input(|i| i.modifiers.shift);
-                let cur_merge = (!extend).then(|| self.merge_rect_at(self.sel.0, self.sel.1)).flatten();
+                let origin_cell = if extend { self.sel_end } else { self.sel };
+                let cur_merge = (!extend)
+                    .then(|| self.merge_rect_at(origin_cell.0, origin_cell.1))
+                    .flatten();
                 let mut nr = if dr > 0 {
-                    let base = cur_merge.map_or(self.sel.0, |(_, _, mr2, _)| mr2);
+                    let base = cur_merge.map_or(origin_cell.0, |(_, _, mr2, _)| mr2);
                     self.next_visible_row(base, true)
                 } else if dr < 0 {
-                    let base = cur_merge.map_or(self.sel.0, |(mr1, _, _, _)| mr1);
+                    let base = cur_merge.map_or(origin_cell.0, |(mr1, _, _, _)| mr1);
                     self.next_visible_row(base, false)
                 } else {
-                    self.sel.0
+                    origin_cell.0
                 };
                 let mut nc = if dc > 0 {
-                    let base = cur_merge.map_or(self.sel.1, |(_, _, _, mc2)| mc2);
+                    let base = cur_merge.map_or(origin_cell.1, |(_, _, _, mc2)| mc2);
                     self.next_visible_col(base, true)
                 } else if dc < 0 {
-                    let base = cur_merge.map_or(self.sel.1, |(_, mc1, _, _)| mc1);
+                    let base = cur_merge.map_or(origin_cell.1, |(_, mc1, _, _)| mc1);
                     self.next_visible_col(base, false)
                 } else {
-                    self.sel.1
+                    origin_cell.1
                 };
                 if !extend {
                     (nr, nc) = self.merge_anchor_at(nr, nc);
                 }
                 let blocked = if extend {
-                    // Shift+方向键也是整块扩选，中间有禁选格就不能扩
-                    self.rect_sel_blocked(self.sel_end, (nr, nc))
+                    // Shift+方向键整块扩选，中间有禁选格就不能扩
+                    self.rect_sel_blocked(self.sel, (nr, nc))
                 } else {
                     self.sel_blocked_at(nr, nc)
                 };
                 if blocked {
                     self.block_selection();
                 } else if extend {
-                    // Shift+方向：锚点留在 sel_end，只移动活动格
-                    self.sel = (nr, nc);
+                    // Excel 语义：活动格锚点留在 self.sel，仅移动选区尾角 self.sel_end
+                    self.sel_end = (nr, nc);
+                    self.ensure_cell_visible(nr, nc);
                 } else {
                     self.sel = (nr, nc);
                     self.sel_end = (nr, nc);
                     self.extra_sel.clear();
+                    self.ensure_visible();
                 }
-                self.ensure_visible();
             }
         }
         if start_edit {
@@ -35831,11 +36251,36 @@ impl SheetApp {
     }
 
     /// UI-11.4：功能区「插入函数」与编辑栏 fx 共用同一个入口。
+    /// 若当前编辑缓冲或活动单元格已包含公式（如 `=VLOOKUP(A1,B1:D10,2,FALSE)`），自动回填函数名与参数列表。
     fn open_fn_wizard(&mut self) {
+        let existing_src = if let Some(ed) = self.editing.as_ref() {
+            Some(ed.buf.clone())
+        } else {
+            let (r, c) = self.sel;
+            let sh = self.wb.sheet(self.sheet_idx);
+            let hidden = sh.protection.is_some()
+                && self.wb.styles.get(sh.style_of(r, c)).hidden;
+            if hidden {
+                None
+            } else {
+                sh.formula_of(r, c).map(str::to_string)
+            }
+        };
+        let (name, args) = existing_src
+            .as_deref()
+            .and_then(parse_outer_formula_call)
+            .map(|(n, mut a)| {
+                let labels = fn_arg_names(&n);
+                if !labels.is_empty() && a.len() < labels.len() {
+                    a.resize(labels.len(), String::new());
+                }
+                (n, a)
+            })
+            .unwrap_or_else(|| ("SUM".into(), Vec::new()));
         self.fn_wizard = Some(FnWizard {
             query: String::new(),
-            name: "SUM".into(),
-            args: Vec::new(),
+            name,
+            args,
             scrolled: false,
             editing: self.editing.is_some(),
             cat: String::new(),
@@ -44818,15 +45263,23 @@ impl SheetApp {
                 )
             });
             // 持久追踪输入法组字态：在中文输入法用 ↑/↓ 选候选词的帧里不会产生 Preedit 事件，
-            // 仅靠单帧 Preedit 判断会误把 ↑/↓ 当成提交拼音。
-            let mut ime_active = self.editing.as_ref().is_some_and(|ed| ed.ime_composing);
+            // 仅靠单帧 Preedit 判断会误把 ↑/↓ 当成提交拼音；同时保留 `was_composing` 以拦截
+            // Windows IME 取消拼音时同帧发出的 `Preedit("") + Key::Escape`，防止 Esc 误毁整格草稿。
+            let was_composing = self.editing.as_ref().is_some_and(|ed| ed.ime_composing);
+            let mut ime_active = was_composing;
             if let Some(ed) = self.editing.as_mut() {
                 for ie in &ime_events {
                     match ie {
                         egui::ImeEvent::Preedit(s) => {
-                            ed.ime_composing = !s.is_empty();
                             if !s.is_empty() {
+                                ed.ime_composing = true;
                                 ime_active = true;
+                            } else {
+                                // 若刚从组字态退出（例如按 Esc 取消拼音），本帧仍需拦截 Esc/Enter
+                                if ed.ime_composing {
+                                    ime_active = true;
+                                }
+                                ed.ime_composing = false;
                             }
                         }
                         egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => {
@@ -44847,8 +45300,11 @@ impl SheetApp {
                     };
                 }
             }
-            // 编辑前先处理自动补全的键盘选择，避免 Enter/Tab 被 TextEdit 先吃掉
-            let help0 = self.editing.as_ref().and_then(|ed| formula_help(&ed.buf));
+            // 编辑前先处理自动补全的键盘选择（按光标位置词法分析），避免 Enter/Tab 被 TextEdit 先吃掉
+            let help0 = self
+                .editing
+                .as_ref()
+                .and_then(|ed| formula_help_at(&ed.buf, ed.caret));
             let has_suggestions = help0.as_ref().is_some_and(|h| !h.suggestions.is_empty());
             let mut pick = None;
             if let Some(h) = &help0 {
@@ -45031,25 +45487,27 @@ impl SheetApp {
                     ed.focus_requested = false;
                 }
                 if picked {
-                    // 补全替换了整段尾串，TextEdit 的旧光标还停在原位置；
-                    // 不搬到最后会让后续输入插进函数名中间。
+                    // 补全替换了光标所在标识符，TextEdit 的旧光标还停在原位置；搬到 `ed.caret`（函数名后括号处）。
+                    let target = ed.caret_override.take().unwrap_or(ed.caret).min(ed.buf.chars().count());
                     let mut st = out.state.clone();
                     st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-                        egui::text::CCursor::new(ed.buf.chars().count()),
+                        egui::text::CCursor::new(target),
                     )));
                     st.store(ctx, egui::Id::new("grid_edit"));
-                    ed.caret = ed.buf.chars().count();
+                    ed.caret = target;
                     clear_pick = true;
                     if debug_flags::formula_log() {
-                        eprintln!("[formula] caret set id={:?} len={} out_id={:?}", egui::Id::new("grid_edit"), ed.buf.chars().count(), out.response.id);
+                        eprintln!("[formula] caret set id={:?} caret={} out_id={:?}", egui::Id::new("grid_edit"), target, out.response.id);
                     }
                 } else if let Some(pos) = ed.caret_override.take() {
-                    // 点选单元格插入引用后，把光标搬到引用后面
+                    // 点选单元格插入引用或 F4 切换绝对引用后，把光标搬到指定位置
+                    let target = pos.min(ed.buf.chars().count());
                     let mut st = out.state.clone();
                     st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-                        egui::text::CCursor::new(pos.min(ed.buf.chars().count())),
+                        egui::text::CCursor::new(target),
                     )));
                     st.store(ctx, egui::Id::new("grid_edit"));
+                    ed.caret = target;
                 } else if let Some(r) = out.cursor_range {
                     ed.caret = r.primary.ccursor.index;
                 }
@@ -45060,7 +45518,9 @@ impl SheetApp {
                     if ed.mode == EditMode::Point {
                         ed.mode = EditMode::Enter;
                     }
-                    if cur_len > prev_len && !ime_active {
+                    // 仅在真正处于拼音组字中（ime_composing）才暂缓 AutoComplete；
+                    // 中文候选词 Commit 后 ime_composing=false，立即触发同列记忆式键入！
+                    if cur_len > prev_len && !ed.ime_composing {
                         buf_grew_for_ac = Some(ed.buf.clone());
                     } else {
                         clear_ac = true;
@@ -45178,7 +45638,11 @@ impl SheetApp {
                 }
             }
             if self.editing.as_ref().is_some_and(|ed| ed.spot == EditSpot::Grid) {
-                if let Some(h) = self.editing.as_ref().and_then(|ed| formula_help(&ed.buf)) {
+                if let Some(h) = self
+                    .editing
+                    .as_ref()
+                    .and_then(|ed| formula_help_at(&ed.buf, ed.caret))
+                {
                     let selected = self.editing.as_ref().map(|ed| ed.complete_idx).unwrap_or(0);
                     let above = rect.bottom() + 170.0 > ctx.screen_rect().bottom();
                     draw_formula_help(
@@ -52084,12 +52548,16 @@ impl eframe::App for SheetApp {
                 );
                 let (r, c) = self.sel;
                 if !self.name_edit {
-                    let (r1, c1, r2, c2) = self.sel_rect();
-                    self.name_buf = if (r1, c1) == (r2, c2) {
-                        cell_name(r, c)
+                    if let Some(def_name) = self.matching_defined_name_for_sel() {
+                        self.name_buf = def_name;
                     } else {
-                        format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
-                    };
+                        let (r1, c1, r2, c2) = self.sel_rect();
+                        self.name_buf = if (r1, c1) == (r2, c2) {
+                            cell_name(r, c)
+                        } else {
+                            format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+                        };
+                    }
                 }
                 // 名称框（冷调浅板岩底，与功能区下拉框视觉一致）
                 let nb = Rect::from_min_size(
@@ -52210,6 +52678,7 @@ impl eframe::App for SheetApp {
                 );
                 let fx_left = rect.left() + 120.0;
                 let mut commit = false;
+                let mut commit_adv: Option<(i32, i32)> = Some((1, 0));
                 let mut commit_fill_sel = false;
                 let mut cancel = false;
                 let mut fx_click = false;
@@ -52410,16 +52879,82 @@ impl eframe::App for SheetApp {
                     // accesskit 会把「已聚焦但不在节点表里的 id」当成致命错误。
                     // 下一帧 TextEdit 绘制时会自己 request_focus（见 ed.spot == FormulaBar 分支）。
                 }
-                if self.editing.is_some() {
-                    let formula_active = self
+                if self.editing.as_ref().is_some_and(|ed| ed.spot == EditSpot::Grid) {
+                    // 严格隔离光标所有权：格内编辑时编辑栏仅作实时只读彩色预览，不渲染第二个 TextEdit，
+                    // 避免双 TextEdit 抢焦点与 IME 上下文；点击预览条立即无缝切换至编辑栏编辑。
+                    let preview_buf = self
                         .editing
                         .as_ref()
-                        .is_some_and(|ed| ed.spot == EditSpot::FormulaBar);
-                    let help0 = if formula_active {
-                        self.editing.as_ref().and_then(|ed| formula_help(&ed.buf))
-                    } else {
-                        None
-                    };
+                        .map(|ed| ed.buf.clone())
+                        .unwrap_or_default();
+                    let mut child = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(ed_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    let font = egui::TextStyle::Body.resolve(child.style());
+                    let job = formula_layout_job(&preview_buf, font, ui_kit::TEXT);
+                    let resp = child
+                        .add(egui::Label::new(job).truncate().sense(egui::Sense::click()))
+                        .interact(egui::Sense::click());
+                    let a11y_val = preview_buf.clone();
+                    let _ = ui.ctx().accesskit_node_builder(resp.id, move |node| {
+                        node.set_role(egui::accesskit::Role::TextInput);
+                        node.set_label("编辑栏".to_string());
+                        node.set_value(a11y_val);
+                    });
+                    if resp.clicked() || row_resp.clicked() {
+                        if let Some(ed) = self.editing.as_mut() {
+                            ed.spot = EditSpot::FormulaBar;
+                            ed.focus_requested = true;
+                            ed.caret_override = Some(ed.caret);
+                        }
+                    }
+                } else if self.editing.as_ref().is_some_and(|ed| ed.spot == EditSpot::FormulaBar) {
+                    // 编辑栏获得焦点：补齐 IME 组字态、Alt+Enter 换行、Tab 提交、Esc 取消与方向键点选引用
+                    let (alt_enter, shift, ctrl, ime_events) = ui.ctx().input(|i| {
+                        let mut evs = Vec::new();
+                        for e in &i.events {
+                            if let egui::Event::Ime(ie) = e {
+                                evs.push(ie.clone());
+                            }
+                        }
+                        (
+                            i.modifiers.alt && i.key_pressed(Key::Enter),
+                            i.modifiers.shift,
+                            i.modifiers.command,
+                            evs,
+                        )
+                    });
+                    let was_composing = self.editing.as_ref().is_some_and(|ed| ed.ime_composing);
+                    let mut ime_active = was_composing;
+                    if let Some(ed) = self.editing.as_mut() {
+                        for ie in &ime_events {
+                            match ie {
+                                egui::ImeEvent::Preedit(s) => {
+                                    if !s.is_empty() {
+                                        ed.ime_composing = true;
+                                        ime_active = true;
+                                    } else {
+                                        if ed.ime_composing {
+                                            ime_active = true;
+                                        }
+                                        ed.ime_composing = false;
+                                    }
+                                }
+                                egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => {
+                                    ed.ime_composing = false;
+                                    ime_active = true;
+                                }
+                                egui::ImeEvent::Enabled => {}
+                            }
+                        }
+                    }
+                    let help0 = self
+                        .editing
+                        .as_ref()
+                        .and_then(|ed| formula_help_at(&ed.buf, ed.caret));
+                    let has_suggestions = help0.as_ref().is_some_and(|h| !h.suggestions.is_empty());
                     let mut pick = None;
                     if let Some(h) = &help0 {
                         if let Some(ed) = self.editing.as_mut() {
@@ -52430,6 +52965,62 @@ impl eframe::App for SheetApp {
                     if let (Some(h), Some(idx), Some(ed)) = (&help0, pick, self.editing.as_mut()) {
                         apply_formula_pick(ed, h, idx);
                     }
+                    // 公式编辑栏方向键点选引用（在 TextEdit 消费方向键前拦截）
+                    if !has_suggestions && !ime_active {
+                        let arrow = ui.ctx().input(|i| {
+                            if i.key_pressed(Key::ArrowDown) {
+                                Some((1i32, 0i32))
+                            } else if i.key_pressed(Key::ArrowUp) {
+                                Some((-1, 0))
+                            } else if i.key_pressed(Key::ArrowRight) {
+                                Some((0, 1))
+                            } else if i.key_pressed(Key::ArrowLeft) {
+                                Some((0, -1))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((dr, dc)) = arrow {
+                            let should_point = self.editing.as_ref().is_some_and(|ed| {
+                                ed.buf.starts_with('=')
+                                    && (ed.mode == EditMode::Point
+                                        || (ed.mode == EditMode::Enter
+                                            && formula_expects_ref_at_caret(&ed.buf, ed.caret)))
+                            });
+                            if should_point {
+                                self.step_formula_point_ref(dr, dc, shift, ctrl);
+                                ui.ctx().input_mut(|i| {
+                                    i.events.retain(|e| {
+                                        !matches!(
+                                            e,
+                                            egui::Event::Key {
+                                                key: Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight,
+                                                ..
+                                            }
+                                        )
+                                    });
+                                });
+                            }
+                        }
+                    }
+                    // Alt+Enter：在光标处插入换行并自动展开多行编辑栏
+                    if alt_enter && !ime_active {
+                        if let Some(ed) = self.editing.as_mut() {
+                            let pass = ui.ctx().cumulative_pass_nr();
+                            if ed.alt_frame != pass {
+                                let bpos = byte_index_of_char(&ed.buf, ed.caret);
+                                ed.buf.insert(bpos, '\n');
+                                ed.caret += 1;
+                                ed.caret_override = Some(ed.caret);
+                                ed.alt_frame = pass;
+                                self.fx_expanded = true;
+                            }
+                        }
+                        ui.ctx().input_mut(|i| {
+                            i.consume_key(egui::Modifiers::ALT, Key::Enter);
+                        });
+                    }
+                    let mut clear_pick = false;
                     if let Some(ed) = self.editing.as_mut() {
                         let mut child = ui.new_child(
                             egui::UiBuilder::new()
@@ -52453,7 +53044,8 @@ impl eframe::App for SheetApp {
                                 Some((text.to_owned(), f_bits, w_bits, g.clone()));
                             g
                         };
-                        let te = if self.fx_expanded {
+                        let use_multiline = self.fx_expanded || ed.buf.contains('\n');
+                        let te = if use_multiline {
                             child.add_sized(
                                 Vec2::new(ed_rect.width(), ed_rect.height()),
                                 egui::TextEdit::multiline(&mut ed.buf)
@@ -52475,51 +53067,72 @@ impl eframe::App for SheetApp {
                         let _ = ui.ctx().accesskit_node_builder(te.id, |node| {
                             node.set_label("编辑栏".to_string());
                         });
-                        // 补全/点选引用后把光标搬到指定位置；否则每帧记录真实光标（仅编辑栏激活时，避免与格内编辑抢光标）
+                        if te.changed() {
+                            clear_pick = true;
+                            if ed.mode == EditMode::Point {
+                                ed.mode = EditMode::Enter;
+                            }
+                        }
                         let fx_id = egui::Id::new("fx_edit");
-                        if ed.spot == EditSpot::FormulaBar {
-                            if picked || ed.caret_override.is_some() {
-                                let target = ed
-                                    .caret_override
-                                    .take()
-                                    .unwrap_or_else(|| ed.buf.chars().count());
-                                let target = target.min(ed.buf.chars().count());
-                                if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), fx_id) {
-                                    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-                                        egui::text::CCursor::new(target),
-                                    )));
-                                    egui::TextEdit::store_state(ui.ctx(), fx_id, st);
-                                }
-                                ed.caret = target;
-                                ed.focus_requested = true;
-                            } else if let Some(st) = egui::TextEdit::load_state(ui.ctx(), fx_id) {
-                                if let Some(r) = st.cursor.char_range() {
-                                    ed.caret = r.primary.index;
-                                }
+                        if picked || ed.caret_override.is_some() {
+                            let target = ed
+                                .caret_override
+                                .take()
+                                .unwrap_or(ed.caret)
+                                .min(ed.buf.chars().count());
+                            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), fx_id) {
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(target),
+                                )));
+                                egui::TextEdit::store_state(ui.ctx(), fx_id, st);
                             }
-                            if ed.focus_requested {
-                                te.request_focus();
-                                ed.focus_requested = false;
+                            ed.caret = target;
+                            ed.focus_requested = true;
+                        } else if let Some(st) = egui::TextEdit::load_state(ui.ctx(), fx_id) {
+                            if let Some(r) = st.cursor.char_range() {
+                                ed.caret = r.primary.index;
                             }
-                            // 编辑栏自己判 Enter：单行 TextEdit 在 Enter 时先失去焦点，
-                            // 用 lost_focus 判断会和每帧 request_focus 互相打架（永远不提交）。
-                            if (te.has_focus() || te.lost_focus())
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+                        }
+                        if ed.focus_requested {
+                            te.request_focus();
+                            ed.focus_requested = false;
+                        }
+                        // 编辑栏键控：仅在非 IME 组字态下响应 Enter / Tab / Escape
+                        if !alt_enter && !ime_active && (te.has_focus() || te.lost_focus()) {
+                            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                // 多行 TextEdit 可能会先插入一个尾随换行；去掉因非 Alt+Enter 产生的多余换行
+                                if use_multiline && ed.buf.ends_with('\n') && ed.caret == ed.buf.chars().count() {
+                                    ed.buf.pop();
+                                }
                                 if ctrl && shift {
                                     self.cse_pending = true;
                                     commit = true;
+                                    commit_adv = None;
                                 } else if ctrl {
                                     commit_fill_sel = true;
                                 } else {
                                     commit = true;
+                                    commit_adv = Some((if shift { -1 } else { 1 }, 0));
                                 }
+                            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                cancel = true;
+                            } else if !has_suggestions && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                                commit = true;
+                                commit_adv = Some((0, if shift { -1 } else { 1 }));
                             }
                         }
                     }
+                    if clear_pick {
+                        self.pick_span = None;
+                        self.pick_anchor = None;
+                        self.pick_rect = None;
+                    }
                     if self.editing.as_ref().is_some_and(|ed| ed.spot == EditSpot::FormulaBar) {
-                        if let Some(h) = self.editing.as_ref().and_then(|ed| formula_help(&ed.buf)) {
+                        if let Some(h) = self
+                            .editing
+                            .as_ref()
+                            .and_then(|ed| formula_help_at(&ed.buf, ed.caret))
+                        {
                             let selected = self.editing.as_ref().map(|ed| ed.complete_idx).unwrap_or(0);
                             draw_formula_help(
                                 ui.ctx(),
@@ -52597,7 +53210,7 @@ impl eframe::App for SheetApp {
                         }
                     }
                 } else if commit {
-                    self.commit_edit(Some((1, 0)));
+                    self.commit_edit(commit_adv);
                     if self.editing.is_none() {
                         let fid = egui::Id::new("fx_edit");
                         if ctx.memory(|m| m.has_focus(fid)) {
@@ -52606,6 +53219,10 @@ impl eframe::App for SheetApp {
                     }
                 } else if cancel {
                     self.cancel_edit();
+                    let fid = egui::Id::new("fx_edit");
+                    if ctx.memory(|m| m.has_focus(fid)) {
+                        ctx.memory_mut(|m| m.surrender_focus(fid));
+                    }
                 } else if fx_click {
                     // Excel 的 fx 打开插入函数向导；不在这里直接抢编辑栏焦点。
                     self.open_fn_wizard();
