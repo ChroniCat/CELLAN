@@ -30,7 +30,10 @@ fn print_ops_draw_both_series_types_with_secondary_scale() {
     let out = sheetcore::print::page_ops_with(&wb, 0, &layout, 0, Some(&fixture()));
     // 柱系列 4 根 + 折线折点，至少有 4 个色块和一段折线
     assert!(out.rects.len() >= 4, "柱形要画出来：{}", out.rects.len());
-    assert!(!out.polys.is_empty(), "折线系列要画出来");
+    assert!(
+        !out.stroke_polys.is_empty() || !out.polys.is_empty(),
+        "折线系列要画出来"
+    );
     // 次轴按自己的量级缩放：增长率 1.22 不应压到顶部以外，折线点都在绘图区内
     let (_, _, _, h, _) = out.rects[0];
     assert!(h > 0.0);

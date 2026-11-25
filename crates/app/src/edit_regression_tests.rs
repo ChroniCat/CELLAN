@@ -9351,7 +9351,8 @@ const CLICK_MATRIX_SKIP: &[&str] = &[
     "FileOpen",       // rfd 打开对话框
     "FileSaveAs",     // rfd 保存对话框
     "FileSave",       // 无路径时转「另存为」对话框
-    "ExportPdf",      // rfd 选 PDF 路径
+    "ExportPdf",         // rfd 选 PDF 路径
+    "ExportWorkbookPdf", // rfd 选整簿 PDF 路径
     "CompareBooks",   // rfd 选比较文件
     "MacroExport",    // rfd 选导出路径（有宏时）
     "InsertPicture",  // rfd 选图片

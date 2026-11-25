@@ -14,6 +14,11 @@ pub struct CellView {
     pub color: [u8; 3],
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
+    pub double_underline: bool,
+    pub strikethrough: bool,
+    pub vertical_text: bool,
+    pub shrink_to_fit: bool,
     pub size: f32,
     /// 0 左 1 中 2 右（General 已按值类型解析）
     pub halign: u8,
@@ -28,6 +33,14 @@ pub struct CellView {
     pub fill: Option<[u8; 3]>,
     /// 数据条：比例 0..1 与颜色
     pub bar: Option<(f32, [u8; 3])>,
+    /// 条件格式图标集标记
+    pub icon: Option<crate::cf::IconMark>,
+    /// 条件格式差异边框
+    pub cf_border: Option<crate::cf::DxfBorder>,
+    /// 富文本多段运行（打印与预览原生逐段着色与加粗斜体）
+    pub rich_runs: Option<Vec<crate::richtext::RichRun>>,
+    /// 原始值是否为错误值（供打印错误替换策略使用）
+    pub is_error: bool,
 }
 
 impl CellView {
@@ -112,7 +125,10 @@ pub(crate) fn view_with_merge(
         || st.diagonal.is_some()
         || !st.format.is_empty()
         || st.bold
-        || st.italic;
+        || st.italic
+        || st.underline
+        || st.double_underline
+        || st.strikethrough;
     if cell.is_none() && !has_style && overlay.is_none() {
         return None;
     }
@@ -120,6 +136,7 @@ pub(crate) fn view_with_merge(
         .cloned()
         .or_else(|| cell.map(|x| x.value.clone()))
         .unwrap_or(Value::Empty);
+    let is_error = matches!(value, Value::Error(_));
     let text = if matches!(value, Value::Empty) {
         String::new()
     } else {
@@ -128,10 +145,14 @@ pub(crate) fn view_with_merge(
             None => format_value(wb.date_system, &value, st),
         }
     };
-    // 富文本用纯文本兜底：逐段字体是屏幕层的富文本路径，打印暂不拆段
-    let text = match sheet.rich.get(&(r, c)) {
-        Some(runs) if !runs.is_empty() => runs.iter().map(|x| x.text.as_str()).collect::<String>(),
-        _ => text,
+    let rich_runs = sheet
+        .rich
+        .get(&(r, c))
+        .filter(|runs| !runs.is_empty())
+        .cloned();
+    let text = match &rich_runs {
+        Some(runs) => runs.iter().map(|x| x.text.as_str()).collect::<String>(),
+        None => text,
     };
     let halign = match st.halign {
         1 => 0,
@@ -147,9 +168,11 @@ pub(crate) fn view_with_merge(
     };
     let mut color = crate::style::format_color(&value, &st.format).unwrap_or(st.color);
     let mut bold = st.bold;
-    let mut italic = st.italic;
+    let italic = st.italic;
     let mut fill = st.fill;
     let mut bar = None;
+    let mut icon = None;
+    let mut cf_border = None;
     if let Some(ov) = overlay {
         if let Some(c2) = ov.color {
             color = c2;
@@ -159,12 +182,19 @@ pub(crate) fn view_with_merge(
             fill = ov.fill;
         }
         bar = ov.bar;
+        icon = ov.icon.clone();
+        cf_border = ov.border.clone();
     }
     Some(CellView {
         text,
         color,
         bold,
         italic,
+        underline: st.underline,
+        double_underline: st.double_underline,
+        strikethrough: st.strikethrough,
+        vertical_text: st.vertical_text,
+        shrink_to_fit: st.shrink_to_fit,
         size: if st.size > 0.0 { st.size } else { 11.0 },
         halign,
         valign,
@@ -174,6 +204,10 @@ pub(crate) fn view_with_merge(
         merge,
         fill,
         bar,
+        icon,
+        cf_border,
+        rich_runs,
+        is_error,
     })
 }
 

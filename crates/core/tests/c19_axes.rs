@@ -47,9 +47,10 @@ fn scatter_points_follow_x_scale_not_index() {
     let layout = sheetcore::print::paginate(sh, &sh.page);
     let out = sheetcore::print::page_ops_with(&wb, 1, &layout, 0, Some(&fixture()));
     let pts: Vec<(f32, f32)> = out
-        .polys
+        .stroke_polys
         .iter()
-        .flat_map(|(p, _)| p.clone())
+        .flat_map(|sp| sp.pts.clone())
+        .chain(out.polys.iter().flat_map(|(p, _)| p.clone()))
         .collect();
     assert!(pts.len() >= 5, "散点要画出来：{:?}", pts.len());
     // 非等距：相邻点的水平间距不相等（1→2 近，2→10 远）

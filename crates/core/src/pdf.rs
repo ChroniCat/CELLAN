@@ -1,12 +1,12 @@
-//! 最小 PDF 生成器：够画表格就行。
-//!
-//! - 中文字体走 TrueType 嵌入（CIDFontType2 + Identity-H），文字用字形号下发，
-//!   所以不依赖阅读器里有没有装字体。字体文件整份嵌入（不做子集），实现简单、
-//!   不会出现「某些字突然变方框」。
-//! - 内容流用路径（矩形/线）与文字两种原语，够画网格、填色、单元格文字、页眉页脚。
+//! 出版级矢量 PDF 1.7 生成器：
+//! - TrueType 单体字体 + **纯 Rust `.ttc` TrueType Collection 无损拆包器**（直接支持 Windows 微软雅黑 / 宋体 / Cambria 等系统字体集合）；
+//! - **多字体 Unicode 回退链**（`/F1` 常规、`/F2` 真粗体、`/F3` 系统 CJK 常规回退、`/F4` 系统 CJK 粗体回退）：
+//!   生僻汉字、繁日韩、财务与统计符号自动无缝路由到系统全字库并按实有字形精准裁剪，彻底消除豆腐块；
+//! - 完整矢量路径原语：裁剪区（`W n`）、13 种 Excel 边框虚实线型（`d`）、半透明填充与水印（`ExtGState`）、
+//!   描边/填充多边形、斜体/旋转文本、PDF 文档元信息（`/Info`）与多工作表侧边栏书签目录（`/Outlines`）。
 
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,9 +28,7 @@ impl std::ops::Deref for FontBytes {
 
 struct FontInner {
     data: FontBytes,
-    /// 字符 → 字形号
     cmap: HashMap<char, u16>,
-    /// 字形号 → 宽度（1/1000 em）
     widths: Vec<u16>,
     ascender: i16,
     descender: i16,
@@ -56,11 +54,87 @@ fn bei16(b: &[u8], off: usize) -> i16 {
 
 static STATIC_FONT_CACHE: OnceLock<Mutex<HashMap<(usize, usize), Font>>> = OnceLock::new();
 
+/// 纯 Rust TrueType Collection (`.ttc`) 无损拆包：把第 `face_index` 号字体重新打包成合法单体 TTF，
+/// 供 PDF 嵌入与 `font_subset::subset` 裁剪复用。
+pub fn extract_ttc_face(data: &[u8], face_index: u32) -> Result<Vec<u8>> {
+    anyhow::ensure!(data.len() >= 16 && &data[0..4] == b"ttcf", "不是 TTC 字体集合");
+    let num_fonts = be32(data, 8);
+    anyhow::ensure!(num_fonts > 0, "TTC 集合为空");
+    let idx = face_index.min(num_fonts - 1) as usize;
+    let offset_pos = 12 + idx * 4;
+    anyhow::ensure!(offset_pos + 4 <= data.len(), "TTC 偏移表越界");
+    let font_off = be32(data, offset_pos) as usize;
+    anyhow::ensure!(font_off + 12 <= data.len(), "TTC 子字体头越界");
+    let sfnt_tag = &data[font_off..font_off + 4];
+    anyhow::ensure!(
+        sfnt_tag == b"\x00\x01\x00\x00" || sfnt_tag == b"true",
+        "TTC 第 {idx} 号子字体不是 TrueType 轮廓（不支持 CFF/OTTO）"
+    );
+    let n_tables = be16(data, font_off + 4) as usize;
+    anyhow::ensure!(font_off + 12 + n_tables * 16 <= data.len(), "TTC 表目录越界");
+
+    let mut recs: Vec<([u8; 4], u32, usize, usize)> = Vec::with_capacity(n_tables);
+    let mut total_body = 0usize;
+    for i in 0..n_tables {
+        let p = font_off + 12 + i * 16;
+        let tag = [data[p], data[p + 1], data[p + 2], data[p + 3]];
+        let csum = be32(data, p + 4);
+        let toff = be32(data, p + 8) as usize;
+        let tlen = be32(data, p + 12) as usize;
+        anyhow::ensure!(
+            toff.checked_add(tlen).is_some_and(|e| e <= data.len()),
+            "TTC 子表 {:?} 越界",
+            std::str::from_utf8(&tag).unwrap_or("????")
+        );
+        recs.push((tag, csum, toff, tlen));
+        total_body += (tlen + 3) & !3;
+    }
+
+    let count = recs.len() as u16;
+    let mut pow2 = 1u16;
+    let mut log2 = 0u16;
+    while pow2 * 2 <= count {
+        pow2 *= 2;
+        log2 += 1;
+    }
+    let search_range = pow2 * 16;
+    let range_shift = count * 16 - search_range;
+
+    let dir_end = 12 + recs.len() * 16;
+    let mut out = Vec::with_capacity(dir_end + total_body);
+    out.extend_from_slice(sfnt_tag);
+    out.extend_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(&search_range.to_be_bytes());
+    out.extend_from_slice(&log2.to_be_bytes());
+    out.extend_from_slice(&range_shift.to_be_bytes());
+
+    let mut cur_off = dir_end;
+    for &(tag, csum, _, tlen) in &recs {
+        out.extend_from_slice(&tag);
+        out.extend_from_slice(&csum.to_be_bytes());
+        out.extend_from_slice(&(cur_off as u32).to_be_bytes());
+        out.extend_from_slice(&(tlen as u32).to_be_bytes());
+        cur_off += (tlen + 3) & !3;
+    }
+    for &(_, _, toff, tlen) in &recs {
+        out.extend_from_slice(&data[toff..toff + tlen]);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+    Ok(out)
+}
+
 impl Font {
-    /// 从 TTF 读出来（不支持 TTC 集合，调用方传单体字体）
+    /// 从 TTF 或 TTC 文件加载（若是 `.ttc` 集合自动拆出第 0 号字面）
     pub fn load(path: &Path) -> Result<Font> {
+        Self::load_face(path, 0)
+    }
+
+    /// 从 TTF 或 TTC 文件加载指定索引的子字面
+    pub fn load_face(path: &Path, face_index: u32) -> Result<Font> {
         let data = std::fs::read(path).with_context(|| format!("读字体失败 {}", path.display()))?;
-        Font::parse(data)
+        Self::parse_collection(data, face_index)
     }
 
     /// 从静态内嵌 TTF 字节零拷贝解析并全局缓存，重复导出 PDF / 打印时 0 分配复用。
@@ -72,15 +146,29 @@ impl Font {
                 return Ok(cached.clone());
             }
         }
-        let parsed = Self::parse_bytes(FontBytes::Static(data))?;
+        let parsed = if data.len() >= 4 && &data[0..4] == b"ttcf" {
+            let unpacked = extract_ttc_face(data, 0)?;
+            Self::parse_bytes(FontBytes::Owned(unpacked))?
+        } else {
+            Self::parse_bytes(FontBytes::Static(data))?
+        };
         if let Ok(mut guard) = cache.lock() {
             guard.insert(key, parsed.clone());
         }
         Ok(parsed)
     }
 
-    /// 从内存里的 TTF 字节解析（内嵌子集字体走这条）
+    /// 从内存里的 TTF/TTC 字节解析（若是 TTC 自动拆出第 0 号字面）
     pub fn parse(data: Vec<u8>) -> Result<Font> {
+        Self::parse_collection(data, 0)
+    }
+
+    /// 从内存里的 TTF/TTC 字节解析指定字面
+    pub fn parse_collection(data: Vec<u8>, face_index: u32) -> Result<Font> {
+        if data.len() >= 4 && &data[0..4] == b"ttcf" {
+            let unpacked = extract_ttc_face(&data, face_index)?;
+            return Self::parse_bytes(FontBytes::Owned(unpacked));
+        }
         Self::parse_bytes(FontBytes::Owned(data))
     }
 
@@ -88,7 +176,7 @@ impl Font {
         anyhow::ensure!(data.len() > 12, "字体文件太小");
         anyhow::ensure!(
             &data[0..4] == b"\x00\x01\x00\x00" || &data[0..4] == b"true",
-            "不是 TrueType 单体字体（TTC 请先拆开）"
+            "不是 TrueType 字体"
         );
         let n_tables = be16(&data, 4) as usize;
         let mut tables: HashMap<[u8; 4], (usize, usize)> = HashMap::with_capacity(n_tables);
@@ -121,8 +209,10 @@ impl Font {
         let mut widths = vec![0u16; n_glyphs];
         for gid in 0..n_glyphs {
             let idx = gid.min(n_hmetrics.saturating_sub(1));
-            let adv = be16(&data, hmtx + idx * 4);
-            widths[gid] = ((adv as u32 * 1000) / units_per_em.max(1) as u32) as u16;
+            if hmtx + idx * 4 + 2 <= data.len() {
+                let adv = be16(&data, hmtx + idx * 4);
+                widths[gid] = ((adv as u32 * 1000) / units_per_em.max(1) as u32) as u16;
+            }
         }
 
         let cmap = parse_cmap(&data, cmap_off);
@@ -139,15 +229,20 @@ impl Font {
         })
     }
 
-    /// 字体自身的纵向度量（in em）：ascender、descender（都取正值）。
-    /// 行高/基线要按它算，不能拿「字号 × 常数」估。
     pub fn em_metrics(&self) -> (f32, f32) {
         let upm = self.units_per_em.max(1) as f32;
-        (self.inner.ascender as f32 / upm, (-self.inner.descender as f32) / upm)
+        (
+            self.inner.ascender as f32 / upm,
+            (-self.inner.descender as f32) / upm,
+        )
     }
 
     pub fn gid(&self, ch: char) -> u16 {
         self.inner.cmap.get(&ch).copied().unwrap_or(0)
+    }
+
+    pub fn has_char(&self, ch: char) -> bool {
+        self.gid(ch) != 0
     }
 
     pub fn width_of(&self, ch: char, size: f32) -> f32 {
@@ -160,7 +255,6 @@ impl Font {
         s.chars().map(|c| self.width_of(c, size)).sum()
     }
 
-    /// 字形宽度（em 的千分比）；字体里没有这个字返回 None
     pub fn advance(&self, ch: char) -> Option<f32> {
         let g = *self.inner.cmap.get(&ch)? as usize;
         if g == 0 {
@@ -173,7 +267,6 @@ impl Font {
         Some(w / 1000.0)
     }
 
-    /// 把 cmap/hmtx 摘出来做成可共享的度量闭包（打印排版用，O(1) 共享内部 Arc）
     pub fn metric(&self) -> std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync> {
         let inner = self.inner.clone();
         std::sync::Arc::new(move |ch: char, size: f32| {
@@ -186,16 +279,24 @@ impl Font {
 
 fn parse_cmap(data: &[u8], cmap_off: usize) -> HashMap<char, u16> {
     let mut map = HashMap::new();
+    if cmap_off + 4 > data.len() {
+        return map;
+    }
     let n = be16(data, cmap_off + 2) as usize;
     let mut best: Option<usize> = None;
     let mut best_score = 0;
     for i in 0..n {
         let rec = cmap_off + 4 + i * 8;
+        if rec + 8 > data.len() {
+            break;
+        }
         let platform = be16(data, rec);
         let encoding = be16(data, rec + 2);
         let sub = cmap_off + be32(data, rec + 4) as usize;
+        if sub + 2 > data.len() {
+            continue;
+        }
         let format = be16(data, sub);
-        // 优先 Windows BMP / Unicode BMP；format 12 覆盖更广
         let score = match (platform, encoding, format) {
             (3, 10, 12) => 5,
             (3, 1, 4) => 4,
@@ -213,13 +314,18 @@ fn parse_cmap(data: &[u8], cmap_off: usize) -> HashMap<char, u16> {
     let Some(sub) = best else { return map };
     match be16(data, sub) {
         4 => {
-            // format 4：BMP 分段映射
+            if sub + 14 > data.len() {
+                return map;
+            }
             let seg_x2 = be16(data, sub + 6) as usize;
             let seg = seg_x2 / 2;
             let end_base = sub + 14;
             let start_base = end_base + seg_x2 + 2;
             let delta_base = start_base + seg_x2;
             let range_base = delta_base + seg_x2;
+            if range_base + seg_x2 > data.len() {
+                return map;
+            }
             for i in 0..seg {
                 let end = be16(data, end_base + i * 2) as u32;
                 let start = be16(data, start_base + i * 2) as u32;
@@ -243,16 +349,18 @@ fn parse_cmap(data: &[u8], cmap_off: usize) -> HashMap<char, u16> {
                             (g as i32 + delta as i32) as u16
                         }
                     };
-                    if gid != 0 {
-                        if let Some(ch) = char::from_u32(c) {
-                            map.insert(ch, gid);
-                        }
+                    if gid != 0
+                        && let Some(ch) = char::from_u32(c)
+                    {
+                        map.insert(ch, gid);
                     }
                 }
             }
         }
         12 => {
-            // format 12：分组
+            if sub + 16 > data.len() {
+                return map;
+            }
             let n_groups = be32(data, sub + 12) as usize;
             for i in 0..n_groups {
                 let g = sub + 16 + i * 12;
@@ -263,8 +371,11 @@ fn parse_cmap(data: &[u8], cmap_off: usize) -> HashMap<char, u16> {
                 let end = be32(data, g + 4);
                 let start_gid = be32(data, g + 8);
                 for c in start..=end.min(start + 0xffff) {
-                    if let Some(ch) = char::from_u32(c) {
-                        map.insert(ch, (start_gid + (c - start)) as u16);
+                    let gid = start_gid + (c - start);
+                    if gid <= u16::MAX as u32
+                        && let Some(ch) = char::from_u32(c)
+                    {
+                        map.insert(ch, gid as u16);
                     }
                 }
             }
@@ -279,9 +390,12 @@ pub struct Page {
     pub width: f32,
     pub height: f32,
     pub ops: String,
-    /// 本页用到的常规/粗体字形号（写 PDF 时按它裁字体）
     used: HashSet<u16>,
     used_bold: HashSet<u16>,
+    used_fb: HashSet<u16>,
+    used_fb_bold: HashSet<u16>,
+    /// 本页使用的透明度状态（百分比 1..=99 -> 资源名 `/GSaXX`）
+    alphas: BTreeMap<u8, f32>,
 }
 
 #[inline]
@@ -294,7 +408,6 @@ fn hex_nibble(b: u8) -> Option<u16> {
     }
 }
 
-/// 内容流里的字形号是 4 位十六进制一串；记下来供字体裁剪
 fn note_glyphs(hex: &str, set: &mut HashSet<u16>) {
     let b = hex.as_bytes();
     let mut i = 0;
@@ -311,20 +424,17 @@ fn note_glyphs(hex: &str, set: &mut HashSet<u16>) {
     }
 }
 
-/// Flate 压缩（PDF 流）；压缩失败就原样返回，导出不能因此失败
 fn compress_stream(data: &[u8]) -> (Vec<u8>, bool) {
     use std::io::Write;
     let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    if enc.write_all(data).is_ok() {
-        if let Ok(v) = enc.finish() {
-            return (v, true);
-        }
+    if enc.write_all(data).is_ok()
+        && let Ok(v) = enc.finish()
+    {
+        return (v, true);
     }
     (data.to_vec(), false)
 }
 
-/// 生成按实际使用字形裁剪的 ToUnicode CMap：消除全量 2 万字 CJK 映射的数百 KB 拼接开销，
-/// 同时保留 pdftotext / 辅助技术提取全文所需的精确映射。
 fn tounicode_cmap(font: &Font, used: &HashSet<u16>) -> String {
     let mut gid_to_char: Vec<(u16, char)> = if used.is_empty() {
         font.inner
@@ -368,7 +478,6 @@ fn tounicode_cmap(font: &Font, used: &HashSet<u16>) -> String {
     cmap
 }
 
-/// 按实际使用字形生成紧凑的 `/W` 宽度数组（连续 gid 自动合并区间），避免每份 PDF 格式化 2 万个宽度。
 fn build_widths_array(widths: &[u16], used: &HashSet<u16>) -> String {
     if used.is_empty() {
         let w0 = widths.first().copied().unwrap_or(1000);
@@ -397,6 +506,17 @@ fn build_widths_array(widths: &[u16], used: &HashSet<u16>) -> String {
     out
 }
 
+/// 将 UTF-8 文本编码为带 UTF-16BE BOM 的 PDF 十六进制字符串（书签与元信息支持完整中文）
+fn pdf_utf16be_hex(s: &str) -> String {
+    let mut out = String::with_capacity(6 + s.len() * 4);
+    out.push_str("<FEFF");
+    for u in s.encode_utf16() {
+        let _ = write!(out, "{u:04X}");
+    }
+    out.push('>');
+    out
+}
+
 impl Page {
     pub fn new(width: f32, height: f32) -> Self {
         Self {
@@ -405,21 +525,62 @@ impl Page {
             ops: String::with_capacity(4096),
             used: HashSet::new(),
             used_bold: HashSet::new(),
+            used_fb: HashSet::new(),
+            used_fb_bold: HashSet::new(),
+            alphas: BTreeMap::new(),
         }
+    }
+
+    fn note_face(&mut self, face: &str, hex: &str) {
+        let set = match face {
+            "F2" => &mut self.used_bold,
+            "F3" => &mut self.used_fb,
+            "F4" => &mut self.used_fb_bold,
+            _ => &mut self.used,
+        };
+        note_glyphs(hex, set);
+    }
+
+    fn alpha_state(&mut self, alpha: f32) -> Option<u8> {
+        let a = alpha.clamp(0.01, 1.0);
+        if a >= 0.995 {
+            return None;
+        }
+        let key = (a * 100.0).round().clamp(1.0, 99.0) as u8;
+        self.alphas.entry(key).or_insert(key as f32 / 100.0);
+        Some(key)
+    }
+
+    pub fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let _ = writeln!(self.ops, "q {x:.2} {y:.2} {w:.2} {h:.2} re W n");
+    }
+
+    pub fn pop_clip(&mut self) {
+        self.ops.push_str("Q\n");
     }
 
     pub fn rect_fill(&mut self, x: f32, y: f32, w: f32, h: f32, rgb: [u8; 3]) {
         let _ = writeln!(
             self.ops,
-            "{:.3} {:.3} {:.3} rg {:.2} {:.2} {:.2} {:.2} re f",
+            "{:.3} {:.3} {:.3} rg {x:.2} {y:.2} {w:.2} {h:.2} re f",
             rgb[0] as f32 / 255.0,
             rgb[1] as f32 / 255.0,
             rgb[2] as f32 / 255.0,
-            x,
-            y,
-            w,
-            h
         );
+    }
+
+    pub fn rect_fill_alpha(&mut self, x: f32, y: f32, w: f32, h: f32, rgb: [u8; 3], alpha: f32) {
+        if let Some(k) = self.alpha_state(alpha) {
+            let _ = writeln!(
+                self.ops,
+                "q /GSa{k} gs {:.3} {:.3} {:.3} rg {x:.2} {y:.2} {w:.2} {h:.2} re f Q",
+                rgb[0] as f32 / 255.0,
+                rgb[1] as f32 / 255.0,
+                rgb[2] as f32 / 255.0,
+            );
+        } else {
+            self.rect_fill(x, y, w, h, rgb);
+        }
     }
 
     pub fn line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, w: f32, rgb: [u8; 3]) {
@@ -432,7 +593,37 @@ impl Page {
         );
     }
 
-    /// 文字：`hex` 是各字符字形号的 2 字节大端拼接
+    /// 带虚实线型的矢量直线（`dash` 为空表示实线；支持全部 13 种 Excel 边框样式）
+    pub fn line_styled(
+        &mut self,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        w: f32,
+        rgb: [u8; 3],
+        dash: &[f32],
+    ) {
+        if dash.is_empty() {
+            self.line(x1, y1, x2, y2, w, rgb);
+            return;
+        }
+        let _ = write!(self.ops, "q [");
+        for (i, d) in dash.iter().enumerate() {
+            if i > 0 {
+                self.ops.push(' ');
+            }
+            let _ = write!(self.ops, "{d:.2}");
+        }
+        let _ = writeln!(
+            self.ops,
+            "] 0 d {:.3} {:.3} {:.3} RG {w:.2} w {x1:.2} {y1:.2} m {x2:.2} {y2:.2} l S Q",
+            rgb[0] as f32 / 255.0,
+            rgb[1] as f32 / 255.0,
+            rgb[2] as f32 / 255.0
+        );
+    }
+
     pub fn text(&mut self, x: f32, baseline: f32, size: f32, hex: &str, rgb: [u8; 3]) {
         note_glyphs(hex, &mut self.used);
         let _ = writeln!(
@@ -444,8 +635,6 @@ impl Page {
         );
     }
 
-    /// 带样式的文字：斜体是文本矩阵错切，rotation 为逆时针角度。
-    /// `face` 是字体资源名（"F1" 常规 / "F2" 真粗体）。
     pub fn text_styled_face(
         &mut self,
         face: &str,
@@ -457,7 +646,23 @@ impl Page {
         italic: bool,
         rotation: f32,
     ) {
-        note_glyphs(hex, if face == "F2" { &mut self.used_bold } else { &mut self.used });
+        self.text_styled_face_alpha(face, x, baseline, size, hex, rgb, italic, rotation, 1.0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_styled_face_alpha(
+        &mut self,
+        face: &str,
+        x: f32,
+        baseline: f32,
+        size: f32,
+        hex: &str,
+        rgb: [u8; 3],
+        italic: bool,
+        rotation: f32,
+        alpha: f32,
+    ) {
+        self.note_face(face, hex);
         let rad = rotation.to_radians();
         let (sin, cos) = (rad.sin(), rad.cos());
         let skew = if italic { 0.21 } else { 0.0 };
@@ -465,17 +670,25 @@ impl Page {
         let b = sin;
         let c = -sin + skew * cos;
         let d = cos;
-        let _ = writeln!(
+        let gs = self.alpha_state(alpha);
+        if let Some(k) = gs {
+            let _ = write!(self.ops, "q /GSa{k} gs ");
+        }
+        let _ = write!(
             self.ops,
             "BT {:.3} {:.3} {:.3} rg /{face} {size:.2} Tf {a:.4} {b:.4} {c:.4} {d:.4} {x:.2} {baseline:.2} Tm <{hex}> Tj ET",
             rgb[0] as f32 / 255.0,
             rgb[1] as f32 / 255.0,
             rgb[2] as f32 / 255.0
         );
+        if gs.is_some() {
+            self.ops.push_str(" Q\n");
+        } else {
+            self.ops.push('\n');
+        }
     }
 
-    /// 带样式的文字：斜体是文本矩阵错切，rotation 为逆时针角度。
-    /// 兼容入口：粗体仍走描边（没有第二条字体时的退化路径）。
+    #[allow(clippy::too_many_arguments)]
     pub fn text_styled(
         &mut self,
         x: f32,
@@ -487,7 +700,24 @@ impl Page {
         italic: bool,
         rotation: f32,
     ) {
-        note_glyphs(hex, &mut self.used);
+        self.text_styled_on("F1", x, baseline, size, hex, rgb, bold, italic, rotation, 1.0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_styled_on(
+        &mut self,
+        face: &str,
+        x: f32,
+        baseline: f32,
+        size: f32,
+        hex: &str,
+        rgb: [u8; 3],
+        synthetic_bold: bool,
+        italic: bool,
+        rotation: f32,
+        alpha: f32,
+    ) {
+        self.note_face(face, hex);
         let rad = rotation.to_radians();
         let (sin, cos) = (rad.sin(), rad.cos());
         let skew = if italic { 0.21 } else { 0.0 };
@@ -500,42 +730,93 @@ impl Page {
             rgb[1] as f32 / 255.0,
             rgb[2] as f32 / 255.0,
         );
-        let _ = write!(self.ops, "BT {r0:.3} {g0:.3} {b0:.3} rg ");
-        if bold {
-            let _ = write!(self.ops, "{r0:.3} {g0:.3} {b0:.3} RG {:.3} w 2 Tr ", size * 0.035);
+        let gs = self.alpha_state(alpha);
+        if let Some(k) = gs {
+            let _ = write!(self.ops, "q /GSa{k} gs ");
         }
-        let _ = writeln!(
+        let _ = write!(self.ops, "BT {r0:.3} {g0:.3} {b0:.3} rg ");
+        if synthetic_bold {
+            let _ = write!(
+                self.ops,
+                "{r0:.3} {g0:.3} {b0:.3} RG {:.3} w 2 Tr ",
+                size * 0.035
+            );
+        }
+        let _ = write!(
             self.ops,
-            "/F1 {size:.2} Tf {a:.4} {b:.4} {c:.4} {d:.4} {x:.2} {baseline:.2} Tm <{hex}> Tj ET"
+            "/{face} {size:.2} Tf {a:.4} {b:.4} {c:.4} {d:.4} {x:.2} {baseline:.2} Tm <{hex}> Tj ET"
         );
+        if gs.is_some() {
+            self.ops.push_str(" Q\n");
+        } else {
+            self.ops.push('\n');
+        }
     }
 
-    /// 画一张已注册的图（名字来自 `Doc::add_image`）
     pub fn image(&mut self, name: &str, x: f32, y: f32, w: f32, h: f32) {
         let _ = writeln!(self.ops, "q {w:.2} 0 0 {h:.2} {x:.2} {y:.2} cm /{name} Do Q");
     }
 
-    /// 任意折线/多边形：闭合时用于饼图扇区填充
+    /// 任意折线/多边形：填充时用 `rg + h f`，描边时用 `RG + S`（修复旧版描边写死黑色 bug）
     pub fn poly(&mut self, pts: &[(f32, f32)], rgb: [u8; 3], fill: bool) {
+        self.poly_styled(pts, 1.2, rgb, &[], fill, 1.0);
+    }
+
+    pub fn poly_styled(
+        &mut self,
+        pts: &[(f32, f32)],
+        lw: f32,
+        rgb: [u8; 3],
+        dash: &[f32],
+        fill: bool,
+        alpha: f32,
+    ) {
         if pts.len() < 2 {
             return;
         }
-        let _ = write!(
-            self.ops,
-            "{:.3} {:.3} {:.3} rg 0 0 0 RG {:.2} {:.2} m ",
+        let gs = self.alpha_state(alpha);
+        let wrap = gs.is_some() || !dash.is_empty();
+        if wrap {
+            self.ops.push_str("q ");
+            if let Some(k) = gs {
+                let _ = write!(self.ops, "/GSa{k} gs ");
+            }
+            if !dash.is_empty() && !fill {
+                self.ops.push('[');
+                for (i, d) in dash.iter().enumerate() {
+                    if i > 0 {
+                        self.ops.push(' ');
+                    }
+                    let _ = write!(self.ops, "{d:.2}");
+                }
+                self.ops.push_str("] 0 d ");
+            }
+        }
+        let (r, g, b) = (
             rgb[0] as f32 / 255.0,
             rgb[1] as f32 / 255.0,
             rgb[2] as f32 / 255.0,
-            pts[0].0,
-            pts[0].1
         );
+        if fill {
+            let _ = write!(self.ops, "{r:.3} {g:.3} {b:.3} rg {:.2} {:.2} m ", pts[0].0, pts[0].1);
+        } else {
+            let _ = write!(
+                self.ops,
+                "{r:.3} {g:.3} {b:.3} RG {lw:.2} w 1 J 1 j {:.2} {:.2} m ",
+                pts[0].0, pts[0].1
+            );
+        }
         for p in &pts[1..] {
             let _ = write!(self.ops, "{:.2} {:.2} l ", p.0, p.1);
         }
-        self.ops.push_str(if fill { "h f\n" } else { "S\n" });
+        self.ops.push_str(if fill { "h f" } else { "S" });
+        if wrap {
+            self.ops.push_str(" Q\n");
+        } else {
+            self.ops.push('\n');
+        }
     }
 
-    /// 把字符串转成字形号 hex（零 format! 堆分配）
     pub fn glyph_hex(font: &Font, s: &str) -> String {
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         let mut out = Vec::with_capacity(s.len() * 4);
@@ -551,44 +832,93 @@ impl Page {
     }
 }
 
-/// 一份 PDF
+#[derive(Clone, Debug, Default)]
+pub struct DocMeta {
+    pub title: String,
+    pub author: String,
+    pub subject: String,
+    pub creator: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Bookmark {
+    pub title: String,
+    pub page_index: usize,
+}
+
+/// 一份 PDF 文档（支持常规/粗体 + 系统 CJK 回退字体链 + 书签目录 + 元信息 + 透明度）
 pub struct Doc {
     pub pages: Vec<Page>,
     font: Font,
-    /// 真粗体字体（可选）。没有时 `text_styled` 仍用描边模拟。
     bold: Option<Font>,
-    /// 已注册的图片：名字 → 要写进 PDF 的 XObject
+    fallback: Option<Font>,
+    fallback_bold: Option<Font>,
     pub images: Vec<PdfImage>,
+    pub meta: DocMeta,
+    pub bookmarks: Vec<Bookmark>,
 }
 
-/// 一张要嵌进 PDF 的位图
 #[derive(Clone, Debug)]
 pub struct PdfImage {
     pub name: String,
     pub width: u32,
     pub height: u32,
-    /// 1 = 灰度，3 = RGB
     pub colors: u8,
-    /// DCT（JPEG 原始字节）或 Flate（压缩后的 RGB 原始字节）
     pub dct: bool,
     pub data: Vec<u8>,
 }
 
 impl Doc {
     pub fn new(font: Font) -> Self {
-        Self { pages: Vec::new(), font, bold: None, images: Vec::new() }
+        Self {
+            pages: Vec::new(),
+            font,
+            bold: None,
+            fallback: None,
+            fallback_bold: None,
+            images: Vec::new(),
+            meta: DocMeta {
+                creator: "CELLAN Spreadsheet Engine".into(),
+                ..Default::default()
+            },
+            bookmarks: Vec::new(),
+        }
     }
 
-    /// 挂上真粗体字体：粗体文字改用 /F2 的真 700 字形，不再描边。
     pub fn set_bold_font(&mut self, font: Font) {
         self.bold = Some(font);
+    }
+
+    pub fn set_fallback_font(&mut self, font: Font) {
+        self.fallback = Some(font);
+    }
+
+    pub fn set_fallback_bold_font(&mut self, font: Font) {
+        self.fallback_bold = Some(font);
+    }
+
+    pub fn set_metadata(
+        &mut self,
+        title: impl Into<String>,
+        author: impl Into<String>,
+        subject: impl Into<String>,
+    ) {
+        self.meta.title = title.into();
+        self.meta.author = author.into();
+        self.meta.subject = subject.into();
+    }
+
+    pub fn add_bookmark(&mut self, title: impl Into<String>, page_index: usize) {
+        self.bookmarks.push(Bookmark {
+            title: title.into(),
+            page_index,
+        });
     }
 
     pub fn bold_font(&self) -> Option<&Font> {
         self.bold.as_ref()
     }
 
-    /// 取实际下发字形号用的字体（粗体且挂了真粗体时用 bold）
     pub fn font_for(&self, bold: bool) -> &Font {
         match (bold, self.bold.as_ref()) {
             (true, Some(f)) => f,
@@ -596,10 +926,89 @@ impl Doc {
         }
     }
 
-    /// 注册一张图，返回内容流里用的名字（同名只注册一次）
+    /// 智能多字体回退分段绘制：对主字体缺失的生僻字/繁日韩/符号自动路由至系统 CJK 回退字库，
+    /// 旋转与斜体文本按精确旋转向量步进，杜绝豆腐块。
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_auto(
+        &mut self,
+        x: f32,
+        baseline: f32,
+        size: f32,
+        text: &str,
+        rgb: [u8; 3],
+        bold: bool,
+        italic: bool,
+        rotation: f32,
+        alpha: f32,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let has_bold = self.bold.is_some();
+        let has_fb = self.fallback.is_some();
+        let has_fb_bold = self.fallback_bold.is_some();
+
+        // 决定每个字符走哪条字体槽（0=F1, 1=F2, 2=F3, 3=F4）及是否需要描边模拟粗体
+        let mut runs: Vec<(u8, bool, String, f32)> = Vec::new();
+        for ch in text.chars() {
+            let (slot, synth_bold, adv) = if bold {
+                if has_bold && self.bold.as_ref().unwrap().has_char(ch) {
+                    (1u8, false, self.bold.as_ref().unwrap().width_of(ch, size))
+                } else if !has_bold && self.font.has_char(ch) {
+                    (0u8, true, self.font.width_of(ch, size))
+                } else if has_fb_bold && self.fallback_bold.as_ref().unwrap().has_char(ch) {
+                    (3u8, false, self.fallback_bold.as_ref().unwrap().width_of(ch, size))
+                } else if has_fb && self.fallback.as_ref().unwrap().has_char(ch) {
+                    (2u8, true, self.fallback.as_ref().unwrap().width_of(ch, size))
+                } else if has_bold {
+                    (1u8, false, self.bold.as_ref().unwrap().width_of(ch, size))
+                } else {
+                    (0u8, true, self.font.width_of(ch, size))
+                }
+            } else if self.font.has_char(ch) {
+                (0u8, false, self.font.width_of(ch, size))
+            } else if has_fb && self.fallback.as_ref().unwrap().has_char(ch) {
+                (2u8, false, self.fallback.as_ref().unwrap().width_of(ch, size))
+            } else {
+                (0u8, false, self.font.width_of(ch, size))
+            };
+            if let Some(last) = runs.last_mut()
+                && last.0 == slot
+                && last.1 == synth_bold
+            {
+                last.2.push(ch);
+                last.3 += adv;
+            } else {
+                let mut s = String::new();
+                s.push(ch);
+                runs.push((slot, synth_bold, s, adv));
+            }
+        }
+
+        let rad = rotation.to_radians();
+        let (dx_u, dy_u) = (rad.cos(), rad.sin());
+        let mut pen = 0.0f32;
+        for (slot, synth_bold, seg, adv) in runs {
+            let (face, hex) = match slot {
+                1 => ("F2", Page::glyph_hex(self.bold.as_ref().unwrap(), &seg)),
+                2 => ("F3", Page::glyph_hex(self.fallback.as_ref().unwrap(), &seg)),
+                3 => ("F4", Page::glyph_hex(self.fallback_bold.as_ref().unwrap(), &seg)),
+                _ => ("F1", Page::glyph_hex(&self.font, &seg)),
+            };
+            let rx = x + pen * dx_u;
+            let ry = baseline + pen * dy_u;
+            let page = self.pages.last_mut().expect("先 add_page");
+            if synth_bold {
+                page.text_styled_on(face, rx, ry, size, &hex, rgb, true, italic, rotation, alpha);
+            } else {
+                page.text_styled_face_alpha(face, rx, ry, size, &hex, rgb, italic, rotation, alpha);
+            }
+            pen += adv;
+        }
+    }
+
     pub fn add_image(&mut self, img: PdfImage) -> String {
-        if let Some(old) = self.images.iter().find(|x| x.name == img.name) {
-            let _ = old;
+        if self.images.iter().any(|x| x.name == img.name) {
             return img.name;
         }
         let name = img.name.clone();
@@ -620,33 +1029,49 @@ impl Doc {
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
-        // 按实际用到的字形裁字体（gid 不变）。
         let mut used: HashSet<u16> = HashSet::new();
         let mut used_bold: HashSet<u16> = HashSet::new();
+        let mut used_fb: HashSet<u16> = HashSet::new();
+        let mut used_fb_bold: HashSet<u16> = HashSet::new();
+        let mut all_alphas: BTreeMap<u8, f32> = BTreeMap::new();
         for p in &self.pages {
             used.extend(p.used.iter().copied());
             used_bold.extend(p.used_bold.iter().copied());
+            used_fb.extend(p.used_fb.iter().copied());
+            used_fb_bold.extend(p.used_fb_bold.iter().copied());
+            for (&k, &v) in &p.alphas {
+                all_alphas.insert(k, v);
+            }
         }
+
         let reg_bytes: &[u8] = &self.font.inner.data;
-        let regular_sub = crate::font_subset::subset(reg_bytes, &used)
-            .filter(|v| v.len() < reg_bytes.len());
+        let regular_sub =
+            crate::font_subset::subset(reg_bytes, &used).filter(|v| v.len() < reg_bytes.len());
         let regular_slice: &[u8] = regular_sub.as_deref().unwrap_or(reg_bytes);
-        let bold_sub = self.bold.as_ref().and_then(|bf| {
-            let b_bytes: &[u8] = &bf.inner.data;
-            crate::font_subset::subset(b_bytes, &used_bold).filter(|v| v.len() < b_bytes.len())
-        });
+
+        let emit_fb = self.fallback.is_some() && !used_fb.is_empty();
+        let emit_fb_bold = self.fallback_bold.is_some() && !used_fb_bold.is_empty();
+
         let mut out: Vec<u8> = Vec::with_capacity(65_536 + self.pages.len() * 4096);
         out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
-        let mut offsets: Vec<usize> = Vec::with_capacity(16 + self.pages.len() * 2 + self.images.len());
-        let mut obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
+        let mut offsets: Vec<usize> = Vec::with_capacity(24 + self.pages.len() * 2 + self.images.len());
+        let obj = |out: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
             offsets.push(out.len());
             let _ = std::io::Write::write_fmt(out, format_args!("{} 0 obj\n", offsets.len()));
             out.extend_from_slice(body);
             out.extend_from_slice(b"\nendobj\n");
         };
 
-        // 1 catalog, 2 pages, 3 Type0, 4 CIDFont, 5 descriptor, 6 fontfile,
-        // 7 ToUnicode；页面对象从 8 开始。
+        // 对象编号规划（严格保持 1..7 兼容已有结构测试）：
+        // 1 Catalog, 2 Pages, 3..7 F1 Regular,
+        // 8..8+2*n_pages-1 Pages & Contents (或空页 1 个占位),
+        // image_base.. images,
+        // bold_base.. F2 (5 objs if present),
+        // fb_base.. F3 (5 objs if emit_fb),
+        // fb_bold_base.. F4 (5 objs if emit_fb_bold),
+        // gs_base.. ExtGState (1 per alpha key),
+        // outlines_base.. Outlines (1 root + N items if bookmarks non-empty),
+        // info_id Info dict
         let n_pages = self.pages.len().max(1);
         let page_ids: Vec<usize> = (0..n_pages).map(|i| 8 + i * 2).collect();
         let mut kids = String::with_capacity(n_pages * 8);
@@ -657,73 +1082,105 @@ impl Doc {
             let _ = write!(kids, "{id} 0 R");
         }
 
-        obj(
-            &mut out,
-            &mut offsets,
-            b"<< /Type /Catalog /Pages 2 0 R >>",
-        );
+        let blank_page = usize::from(self.pages.is_empty());
+        let image_base = 8 + self.pages.len() * 2 + blank_page;
+        let bold_base = image_base + self.images.len();
+        let fb_base = bold_base + if self.bold.is_some() { 5 } else { 0 };
+        let fb_bold_base = fb_base + if emit_fb { 5 } else { 0 };
+        let gs_base = fb_bold_base + if emit_fb_bold { 5 } else { 0 };
+        let gs_keys: Vec<u8> = all_alphas.keys().copied().collect();
+        let outlines_base = gs_base + gs_keys.len();
+        let valid_bms: Vec<&Bookmark> = self
+            .bookmarks
+            .iter()
+            .filter(|b| b.page_index < self.pages.len())
+            .collect();
+        let has_outlines = !valid_bms.is_empty();
+        let info_id = outlines_base + if has_outlines { 1 + valid_bms.len() } else { 0 };
+
+        // 1: Catalog
+        let catalog = if has_outlines {
+            format!("<< /Type /Catalog /Pages 2 0 R /Outlines {outlines_base} 0 R /PageMode /UseOutlines >>")
+        } else {
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string()
+        };
+        obj(&mut out, &mut offsets, catalog.as_bytes());
+
+        // 2: Pages
         obj(
             &mut out,
             &mut offsets,
             format!("<< /Type /Pages /Count {n_pages} /Kids [{kids}] >>").as_bytes(),
         );
-        let upm = self.font.units_per_em.max(1) as f32;
-        obj(
-            &mut out,
-            &mut offsets,
-            b"<< /Type /Font /Subtype /Type0 /BaseFont /Embedded /Encoding /Identity-H /DescendantFonts [4 0 R] /ToUnicode 7 0 R >>",
-        );
-        let w = build_widths_array(&self.font.inner.widths, &used);
-        obj(
-            &mut out,
-            &mut offsets,
-            format!(
-                "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Embedded /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 5 0 R /DW 1000 /W {w} /CIDToGIDMap /Identity >>"
-            )
-            .as_bytes(),
-        );
-        obj(
-            &mut out,
-            &mut offsets,
-            format!(
-                "<< /Type /FontDescriptor /FontName /Embedded /Flags 4 /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {:.0} /Descent {:.0} /CapHeight {:.0} /StemV 80 /FontFile2 6 0 R >>",
-                self.font.inner.bbox[0] as f32 * 1000.0 / upm,
-                self.font.inner.bbox[1] as f32 * 1000.0 / upm,
-                self.font.inner.bbox[2] as f32 * 1000.0 / upm,
-                self.font.inner.bbox[3] as f32 * 1000.0 / upm,
-                self.font.inner.ascender as f32 * 1000.0 / upm,
-                self.font.inner.descender as f32 * 1000.0 / upm,
-                self.font.inner.ascender as f32 * 1000.0 / upm * 0.7,
-            )
-            .as_bytes(),
-        );
-        {
-            let (packed, _) = compress_stream(regular_slice);
+
+        // 3..7: F1 Regular
+        let emit_font_objs = |out: &mut Vec<u8>,
+                              offsets: &mut Vec<usize>,
+                              id0: usize,
+                              base_name: &str,
+                              stem_v: u32,
+                              f: &Font,
+                              f_used: &HashSet<u16>,
+                              f_slice: &[u8]| {
+            let upm = f.units_per_em.max(1) as f32;
+            obj(
+                out,
+                offsets,
+                format!(
+                    "<< /Type /Font /Subtype /Type0 /BaseFont /{base_name} /Encoding /Identity-H /DescendantFonts [{} 0 R] /ToUnicode {} 0 R >>",
+                    id0 + 1,
+                    id0 + 4
+                )
+                .as_bytes(),
+            );
+            let w = build_widths_array(&f.inner.widths, f_used);
+            obj(
+                out,
+                offsets,
+                format!(
+                    "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{base_name} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {} 0 R /DW 1000 /W {w} /CIDToGIDMap /Identity >>",
+                    id0 + 2
+                )
+                .as_bytes(),
+            );
+            obj(
+                out,
+                offsets,
+                format!(
+                    "<< /Type /FontDescriptor /FontName /{base_name} /Flags 4 /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {:.0} /Descent {:.0} /CapHeight {:.0} /StemV {stem_v} /FontFile2 {} 0 R >>",
+                    f.inner.bbox[0] as f32 * 1000.0 / upm,
+                    f.inner.bbox[1] as f32 * 1000.0 / upm,
+                    f.inner.bbox[2] as f32 * 1000.0 / upm,
+                    f.inner.bbox[3] as f32 * 1000.0 / upm,
+                    f.inner.ascender as f32 * 1000.0 / upm,
+                    f.inner.descender as f32 * 1000.0 / upm,
+                    f.inner.ascender as f32 * 1000.0 / upm * 0.7,
+                    id0 + 3
+                )
+                .as_bytes(),
+            );
+            let (packed, _) = compress_stream(f_slice);
             let mut body: Vec<u8> = format!(
                 "<< /Length {} /Length1 {} /Filter /FlateDecode >>\nstream\n",
                 packed.len(),
-                regular_slice.len()
+                f_slice.len()
             )
             .into_bytes();
             body.extend_from_slice(&packed);
             body.extend_from_slice(b"\nendstream");
-            obj(&mut out, &mut offsets, &body);
-        }
+            obj(out, offsets, &body);
 
-        let cmap = tounicode_cmap(&self.font, &used);
-        {
-            let mut body = format!("<< /Length {} >>\nstream\n", cmap.len()).into_bytes();
-            body.extend_from_slice(cmap.as_bytes());
-            body.extend_from_slice(b"endstream");
-            obj(&mut out, &mut offsets, &body);
-        }
+            let cmap = tounicode_cmap(f, f_used);
+            let mut cbody = format!("<< /Length {} >>\nstream\n", cmap.len()).into_bytes();
+            cbody.extend_from_slice(cmap.as_bytes());
+            cbody.extend_from_slice(b"endstream");
+            obj(out, offsets, &cbody);
+        };
 
-        let image_base = 8 + n_pages * 2;
-        // 粗体字体对象排在页面与图片之后；页面资源要提前知道它的对象号。
-        // 常规字体固定占 1..7，每页 2 个对象，图片各 1 个，空文档还有 1 个占位页对象。
-        let blank_page = usize::from(self.pages.is_empty());
-        let bold_base = image_base + self.images.len() + blank_page;
-        let xobjects: String = if self.images.is_empty() {
+        emit_font_objs(&mut out, &mut offsets, 3, "Embedded", 80, &self.font, &used, regular_slice);
+
+        // 资源字典片段
+        let xobjects = if self.images.is_empty() {
             String::new()
         } else {
             let items: Vec<String> = self
@@ -734,21 +1191,37 @@ impl Doc {
                 .collect();
             format!(" /XObject << {} >>", items.join(" "))
         };
-        let fonts_res = if self.bold.is_some() {
-            format!("/Font << /F1 3 0 R /F2 {bold_base} 0 R >>")
+        let ext_gstates = if gs_keys.is_empty() {
+            String::new()
         } else {
-            "/Font << /F1 3 0 R >>".to_string()
+            let items: Vec<String> = gs_keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| format!("/GSa{k} {} 0 R", gs_base + i))
+                .collect();
+            format!(" /ExtGState << {} >>", items.join(" "))
         };
+        let mut fonts_res = String::from("/Font << /F1 3 0 R");
+        if self.bold.is_some() {
+            let _ = write!(fonts_res, " /F2 {bold_base} 0 R");
+        }
+        if emit_fb {
+            let _ = write!(fonts_res, " /F3 {fb_base} 0 R");
+        }
+        if emit_fb_bold {
+            let _ = write!(fonts_res, " /F4 {fb_bold_base} 0 R");
+        }
+        fonts_res.push_str(" >>");
+
+        // Pages & Contents
         for (i, p) in self.pages.iter().enumerate() {
             let content_id = page_ids[i] + 1;
             let body = format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << {fonts_res}{xobjects} >> /Contents {content_id} 0 R >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << {fonts_res}{xobjects}{ext_gstates} >> /Contents {content_id} 0 R >>",
                 p.width, p.height
             );
             obj(&mut out, &mut offsets, body.as_bytes());
             let stream = p.ops.as_bytes();
-            // 大页内容流（>= 32KB）启用 Flate 压缩显著缩减多页大表导出体积与写盘耗时；
-            // 小型单页保留明文流以兼容结构测试与快速直写。
             if stream.len() >= 32 * 1024 {
                 let (packed, ok) = compress_stream(stream);
                 if ok && packed.len() < stream.len() {
@@ -769,18 +1242,22 @@ impl Doc {
             obj(&mut out, &mut offsets, &c);
         }
         if self.pages.is_empty() {
-            // 至少给一张空白页，避免生成非法 PDF
             let body = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> >>";
             obj(&mut out, &mut offsets, body);
         }
 
-        for im in self.images.iter() {
+        // Images
+        for im in &self.images {
             let filter = if im.dct {
                 "/Filter /DCTDecode"
             } else {
                 "/Filter /FlateDecode"
             };
-            let cs = if im.colors == 1 { "/DeviceGray" } else { "/DeviceRGB" };
+            let cs = if im.colors == 1 {
+                "/DeviceGray"
+            } else {
+                "/DeviceRGB"
+            };
             let mut body = format!(
                 "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace {cs} /BitsPerComponent 8 {filter} /Length {} >>\nstream\n",
                 im.width,
@@ -793,73 +1270,130 @@ impl Doc {
             obj(&mut out, &mut offsets, &body);
         }
 
-        // 真粗体字体：与常规字体同样的 5 个对象（Type0 / CIDFont / 描述符 / FontFile2 / ToUnicode）
+        // F2 Bold
         if let Some(bf) = &self.bold {
-            let id0 = bold_base;
-            let upm = bf.units_per_em.max(1) as f32;
-            obj(
+            let b_bytes: &[u8] = &bf.inner.data;
+            let b_sub = crate::font_subset::subset(b_bytes, &used_bold)
+                .filter(|v| v.len() < b_bytes.len());
+            let b_slice: &[u8] = b_sub.as_deref().unwrap_or(b_bytes);
+            emit_font_objs(
                 &mut out,
                 &mut offsets,
-                format!(
-                    "<< /Type /Font /Subtype /Type0 /BaseFont /EmbeddedBold /Encoding /Identity-H /DescendantFonts [{} 0 R] /ToUnicode {} 0 R >>",
-                    id0 + 1,
-                    id0 + 4
-                )
-                .as_bytes(),
+                bold_base,
+                "EmbeddedBold",
+                140,
+                bf,
+                &used_bold,
+                b_slice,
             );
-            let w = build_widths_array(&bf.inner.widths, &used_bold);
-            obj(
-                &mut out,
-                &mut offsets,
-                format!(
-                    "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /EmbeddedBold /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {} 0 R /DW 1000 /W {w} /CIDToGIDMap /Identity >>",
-                    id0 + 2
-                )
-                .as_bytes(),
-            );
-            obj(
-                &mut out,
-                &mut offsets,
-                format!(
-                    "<< /Type /FontDescriptor /FontName /EmbeddedBold /Flags 4 /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent {:.0} /Descent {:.0} /CapHeight {:.0} /StemV 140 /FontFile2 {} 0 R >>",
-                    bf.inner.bbox[0] as f32 * 1000.0 / upm,
-                    bf.inner.bbox[1] as f32 * 1000.0 / upm,
-                    bf.inner.bbox[2] as f32 * 1000.0 / upm,
-                    bf.inner.bbox[3] as f32 * 1000.0 / upm,
-                    bf.inner.ascender as f32 * 1000.0 / upm,
-                    bf.inner.descender as f32 * 1000.0 / upm,
-                    bf.inner.ascender as f32 * 1000.0 / upm * 0.7,
-                    id0 + 3
-                )
-                .as_bytes(),
-            );
-            let bold_slice: &[u8] = bold_sub.as_deref().unwrap_or(&bf.inner.data);
-            let (packed, _) = compress_stream(bold_slice);
-            let mut body: Vec<u8> = format!(
-                "<< /Length {} /Length1 {} /Filter /FlateDecode >>\nstream\n",
-                packed.len(),
-                bold_slice.len()
-            )
-            .into_bytes();
-            body.extend_from_slice(&packed);
-            body.extend_from_slice(b"\nendstream");
-            obj(&mut out, &mut offsets, &body);
-            let cmap = tounicode_cmap(bf, &used_bold);
-            let mut body = format!("<< /Length {} >>\nstream\n", cmap.len()).into_bytes();
-            body.extend_from_slice(cmap.as_bytes());
-            body.extend_from_slice(b"endstream");
-            obj(&mut out, &mut offsets, &body);
         }
+
+        // F3 Fallback Regular
+        if emit_fb && let Some(fb) = &self.fallback {
+            let fb_bytes: &[u8] = &fb.inner.data;
+            let fb_sub = crate::font_subset::subset(fb_bytes, &used_fb)
+                .filter(|v| v.len() < fb_bytes.len());
+            let fb_slice: &[u8] = fb_sub.as_deref().unwrap_or(fb_bytes);
+            emit_font_objs(
+                &mut out,
+                &mut offsets,
+                fb_base,
+                "EmbeddedFallback",
+                80,
+                fb,
+                &used_fb,
+                fb_slice,
+            );
+        }
+
+        // F4 Fallback Bold
+        if emit_fb_bold && let Some(fbb) = &self.fallback_bold {
+            let fbb_bytes: &[u8] = &fbb.inner.data;
+            let fbb_sub = crate::font_subset::subset(fbb_bytes, &used_fb_bold)
+                .filter(|v| v.len() < fbb_bytes.len());
+            let fbb_slice: &[u8] = fbb_sub.as_deref().unwrap_or(fbb_bytes);
+            emit_font_objs(
+                &mut out,
+                &mut offsets,
+                fb_bold_base,
+                "EmbeddedFallbackBold",
+                140,
+                fbb,
+                &used_fb_bold,
+                fbb_slice,
+            );
+        }
+
+        // ExtGState 透明度字典
+        for &k in &gs_keys {
+            let a = all_alphas[&k];
+            let body = format!("<< /Type /ExtGState /ca {a:.2} /CA {a:.2} >>");
+            obj(&mut out, &mut offsets, body.as_bytes());
+        }
+
+        // PDF 书签目录 Outlines
+        if has_outlines {
+            let first_item = outlines_base + 1;
+            let last_item = outlines_base + valid_bms.len();
+            let root = format!(
+                "<< /Type /Outlines /First {first_item} 0 R /Last {last_item} 0 R /Count {} >>",
+                valid_bms.len()
+            );
+            obj(&mut out, &mut offsets, root.as_bytes());
+            for (i, bm) in valid_bms.iter().enumerate() {
+                let item_id = first_item + i;
+                let dest_page = page_ids[bm.page_index];
+                let mut dict = format!(
+                    "<< /Title {} /Parent {outlines_base} 0 R /Dest [{dest_page} 0 R /Fit]",
+                    pdf_utf16be_hex(&bm.title)
+                );
+                if i > 0 {
+                    let _ = write!(dict, " /Prev {} 0 R", item_id - 1);
+                }
+                if i + 1 < valid_bms.len() {
+                    let _ = write!(dict, " /Next {} 0 R", item_id + 1);
+                }
+                dict.push_str(" >>");
+                obj(&mut out, &mut offsets, dict.as_bytes());
+            }
+        }
+
+        // Info 元信息字典
+        let mut info = String::from("<< /Producer ");
+        info.push_str(&pdf_utf16be_hex("CELLAN Vector PDF Engine"));
+        if !self.meta.creator.is_empty() {
+            info.push_str(" /Creator ");
+            info.push_str(&pdf_utf16be_hex(&self.meta.creator));
+        }
+        if !self.meta.title.is_empty() {
+            info.push_str(" /Title ");
+            info.push_str(&pdf_utf16be_hex(&self.meta.title));
+        }
+        if !self.meta.author.is_empty() {
+            info.push_str(" /Author ");
+            info.push_str(&pdf_utf16be_hex(&self.meta.author));
+        }
+        if !self.meta.subject.is_empty() {
+            info.push_str(" /Subject ");
+            info.push_str(&pdf_utf16be_hex(&self.meta.subject));
+        }
+        info.push_str(" >>");
+        obj(&mut out, &mut offsets, info.as_bytes());
 
         let xref_at = out.len();
         let count = offsets.len() + 1;
-        let _ = std::io::Write::write_fmt(&mut out, format_args!("xref\n0 {count}\n0000000000 65535 f \n"));
+        let _ = std::io::Write::write_fmt(
+            &mut out,
+            format_args!("xref\n0 {count}\n0000000000 65535 f \n"),
+        );
         for off in offsets.iter() {
             let _ = std::io::Write::write_fmt(&mut out, format_args!("{off:010} 00000 n \n"));
         }
         let _ = std::io::Write::write_fmt(
             &mut out,
-            format_args!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n"),
+            format_args!(
+                "trailer\n<< /Size {count} /Root 1 0 R /Info {info_id} 0 R >>\nstartxref\n{xref_at}\n%%EOF\n"
+            ),
         );
         std::fs::write(path, out)?;
         Ok(())
