@@ -1877,6 +1877,39 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
     }
 }
 
+/// 侧边栏/浮层纯矢量关闭按钮（24×24 圆角热区 + 自绘交叉线，避免依赖字体中可能缺失的 ✕ 符号）
+pub fn close_icon_button(ui: &mut egui::Ui, tip: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    if resp.is_pointer_button_down_on() {
+        ui.painter().rect_filled(rect, 5.0, PRESSED);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 5.0, HOVER);
+    }
+    let col = if resp.hovered() { TEXT } else { TEXT_WEAK };
+    let k = 4.0;
+    let st = Stroke::new(1.25_f32, col);
+    ui.painter().line_segment(
+        [
+            rect.center() + egui::vec2(-k, -k),
+            rect.center() + egui::vec2(k, k),
+        ],
+        st,
+    );
+    ui.painter().line_segment(
+        [
+            rect.center() + egui::vec2(k, -k),
+            rect.center() + egui::vec2(-k, k),
+        ],
+        st,
+    );
+    a11y_name(&resp, if tip.is_empty() { "关闭" } else { tip }, true, None);
+    if !tip.is_empty() {
+        resp.on_hover_text(tip)
+    } else {
+        resp
+    }
+}
+
 /// 工作表标签：Excel 365 —— 32 高，活动页白底 + 底部 2px 绿线
 pub fn sheet_tab(
     ui: &mut egui::Ui,

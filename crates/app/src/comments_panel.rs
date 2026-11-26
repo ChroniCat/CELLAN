@@ -1436,18 +1436,7 @@ impl SheetApp {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        egui::RichText::new("✕")
-                                                            .size(12.0)
-                                                            .color(ui_kit::TEXT_WEAK),
-                                                    )
-                                                    .frame(false),
-                                                )
-                                                .on_hover_text("关闭批注面板")
-                                                .clicked()
-                                            {
+                                            if ui_kit::close_icon_button(ui, "关闭批注面板").clicked() {
                                                 actions.push(PanelAction::Close);
                                             }
                                             if !edit_blocked
@@ -1520,19 +1509,26 @@ impl SheetApp {
 
                                 // 搜索框
                                 ui.horizontal(|ui| {
-                                    let q_empty = self.comments_panel.query.is_empty();
-                                    let q_w = (ui.available_width() - if q_empty { 0.0 } else { 28.0 })
-                                        .max(120.0);
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.comments_panel.query)
-                                            .desired_width(q_w)
-                                            .hint_text("搜索批注内容、作者或单元格…"),
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if !self.comments_panel.query.is_empty()
+                                                && ui
+                                                    .small_button("清")
+                                                    .on_hover_text("清空搜索")
+                                                    .clicked()
+                                            {
+                                                self.comments_panel.query.clear();
+                                            }
+                                            ui.add(
+                                                egui::TextEdit::singleline(
+                                                    &mut self.comments_panel.query,
+                                                )
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("搜索批注内容、作者或单元格…"),
+                                            );
+                                        },
                                     );
-                                    if !self.comments_panel.query.is_empty()
-                                        && ui.small_button("清").on_hover_text("清空搜索").clicked()
-                                    {
-                                        self.comments_panel.query.clear();
-                                    }
                                 });
 
                                 // 状态过滤芯片
@@ -1876,31 +1872,51 @@ impl SheetApp {
                                                     {
                                                         ui.add_space(4.0);
                                                         ui.horizontal(|ui| {
-                                                            let r_resp = ui.add(
-                                                                egui::TextEdit::singleline(
-                                                                    &mut self.comments_panel.reply_draft,
-                                                                )
-                                                                .desired_width(
-                                                                    (ui.available_width() - 50.0).max(110.0),
-                                                                )
-                                                                .hint_text("输入回复，Enter 发送…"),
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    let send_clicked =
+                                                                        ui.small_button("发送").clicked();
+                                                                    let r_resp = ui.add(
+                                                                        egui::TextEdit::singleline(
+                                                                            &mut self.comments_panel.reply_draft,
+                                                                        )
+                                                                        .desired_width(f32::INFINITY)
+                                                                        .hint_text("输入回复，Enter 发送…"),
+                                                                    );
+                                                                    let enter_send = r_resp.lost_focus()
+                                                                        && ui.input(|i| {
+                                                                            i.key_pressed(
+                                                                                egui::Key::Enter,
+                                                                            )
+                                                                        });
+                                                                    if (send_clicked || enter_send)
+                                                                        && !self
+                                                                            .comments_panel
+                                                                            .reply_draft
+                                                                            .trim()
+                                                                            .is_empty()
+                                                                    {
+                                                                        let draft = std::mem::take(
+                                                                            &mut self
+                                                                                .comments_panel
+                                                                                .reply_draft,
+                                                                        );
+                                                                        self.comments_panel
+                                                                            .reply_target = None;
+                                                                        actions.push(
+                                                                            PanelAction::SendReply(
+                                                                                item.sheet_idx,
+                                                                                item.row,
+                                                                                item.col,
+                                                                                draft,
+                                                                            ),
+                                                                        );
+                                                                    }
+                                                                },
                                                             );
-                                                            let enter_send = r_resp.lost_focus()
-                                                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                                            if (ui.small_button("发送").clicked() || enter_send)
-                                                                && !self.comments_panel.reply_draft.trim().is_empty()
-                                                            {
-                                                                let draft = std::mem::take(
-                                                                    &mut self.comments_panel.reply_draft,
-                                                                );
-                                                                self.comments_panel.reply_target = None;
-                                                                actions.push(PanelAction::SendReply(
-                                                                    item.sheet_idx,
-                                                                    item.row,
-                                                                    item.col,
-                                                                    draft,
-                                                                ));
-                                                            }
                                                         });
                                                     }
                                                 });
