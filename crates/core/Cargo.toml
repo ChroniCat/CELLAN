@@ -3,6 +3,7 @@ name = "sheetcore"
 version = "1.82.0"
 edition = "2024"
 license = "MIT"
+repository.workspace = true
 description = "CELLAN Core Spreadsheet & Peer Sync Engine"
 
 [lib]
