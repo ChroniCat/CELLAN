@@ -1084,7 +1084,7 @@ impl SheetApp {
         let name = call.name.as_str();
         // Search without a sheet covers the workbook. An explicitly empty name means
         // the active sheet; bind it to the view the model was given.
-        let search_active = name == "search_cells"
+        let search_active = matches!(name, "search_cells" | "inspect_comments")
             && call.arguments["sheet"].as_str().is_some_and(|s| s.trim().is_empty());
         let takes_sheet = matches!(
             name,
@@ -1095,6 +1095,7 @@ impl SheetApp {
                 | "fill_formula_range"
                 | "style_range"
                 | "data_operation"
+                | "manage_comments"
         );
         let Some(args) = call.arguments.as_object_mut().filter(|_| takes_sheet || search_active) else {
             return Ok(());
@@ -1506,6 +1507,10 @@ impl SheetApp {
             };
             return Some(h);
         }
+        if read.call.name == "inspect_comments" {
+            let (_, result) = self.tool_inspect_comments(&read.call.arguments);
+            return Some(read_hash(&result));
+        }
         let wb = self.ai_calculated_workbook()?;
         match read.call.name.as_str() {
             "search_cells" => self.ai_search_hash_incremental(read, wb),
@@ -1638,6 +1643,7 @@ impl SheetApp {
                 let what = match read.call.name.as_str() {
                     "search_cells" => "搜索结果",
                     "inspect_workbook" => "工作簿概览",
+                    "inspect_comments" => "批注列表",
                     _ => "公式试算结果",
                 };
                 return Some(format!("{what}在 AI 处理期间发生了变化或有待重算"));
@@ -1713,7 +1719,10 @@ impl SheetApp {
         let sheet = self.ai_read_sheet(&call.spec);
         if let Some(turn) = self.ai.active_round.as_mut() {
             turn.awaiting_write_results = false;
-            if matches!(call.spec.name.as_str(), "search_cells" | "eval_preview" | "inspect_workbook") {
+            if matches!(
+                call.spec.name.as_str(),
+                "search_cells" | "eval_preview" | "inspect_workbook" | "inspect_comments"
+            ) {
                 let hash = Some(read_hash(&result));
                 if let Some(read) = turn.reads.iter_mut().find(|r| {
                     r.call.name == call.spec.name && r.call.arguments == call.spec.arguments

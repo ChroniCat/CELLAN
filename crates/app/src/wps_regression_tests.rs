@@ -2644,3 +2644,315 @@ fn comments_phase1_frozen_pane_callout_no_drift_and_no_bleed() {
         "已滚入冻结窗格下方的正文格 B2 不得穿模继续显示浮签"
     );
 }
+
+#[test]
+fn comments_phase2_sidebar_filter_reply_batch_ops_and_render() {
+    use sheetcore::model::{Cell, CellRef, Value};
+    use sheetcore::notes::Note;
+
+    let _env = crate::test_env::TestEnv::new("comments_p2_sidebar");
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    let mut app = wps_app(&ctx);
+    let mut frame = eframe::Frame::_new_kittest();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, Cell { value: Value::Number(500.0), formula: None });
+        sh.notes.insert(
+            CellRef::new(0, 0),
+            Note { r: 0, c: 0, text: "A1往来差异".into(), author: "财务甲".into() },
+        );
+        sh.threads.insert(CellRef::new(2, 1), mk_test_thread(2, 1, "审计乙", "B3需补发票"));
+    }
+
+    // 通过 Ribbon 按钮打开批注管理侧边栏并渲染验证
+    assert!(!app.ctl_state("CommentsPanel").checked);
+    app.ribbon_action("CommentsPanel", &ctx);
+    assert!(app.comments_panel.open);
+    assert!(app.ctl_state("CommentsPanel").checked);
+
+    let out = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1440.0, 900.0))),
+            ..Default::default()
+        },
+        |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+    );
+    let mut items = Vec::new();
+    for cs in &out.shapes {
+        collect_shape_texts_with_pos(std::slice::from_ref(&cs.shape), &mut items);
+    }
+    let joined: String = items.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join("\n");
+    assert!(joined.contains("批注管理 (2)"), "侧边栏应显示批注总数:\n{joined}");
+    assert!(joined.contains("A1往来差异") && joined.contains("B3需补发票"), "侧边栏应列出全部批注与线程:\n{joined}");
+
+    // 行内快速回复（将传统批注平滑升级为线程）+ 单步撤销
+    let cnt = app.reply_comment_cell(0, 0, 0, "已联系客户核对", Some("财务甲")).unwrap();
+    assert_eq!(cnt, 2);
+    assert!(app.wb.sheet(0).threads.contains_key(&CellRef::new(0, 0)));
+    assert!(app.apply_undo(false));
+    assert!(!app.wb.sheet(0).threads.contains_key(&CellRef::new(0, 0)));
+
+    // 批量标记已解决 + 单步撤销
+    let changed = app.batch_set_comments_resolved(&[(0, 0, 0), (0, 2, 1)], true);
+    assert_eq!(changed, 2);
+    assert!(app.wb.sheet(0).threads.get(&CellRef::new(0, 0)).unwrap().resolved);
+    assert!(app.wb.sheet(0).threads.get(&CellRef::new(2, 1)).unwrap().resolved);
+    assert!(app.apply_undo(false));
+    assert!(!app.wb.sheet(0).threads.get(&CellRef::new(2, 1)).unwrap().resolved);
+
+    // 批量删除 + 单步撤销
+    let deleted = app.batch_delete_comments(&[(0, 0, 0), (0, 2, 1)], "批量删除批注");
+    assert_eq!(deleted, 2);
+    assert!(app.wb.sheet(0).notes.is_empty() && app.wb.sheet(0).threads.is_empty());
+    assert!(app.apply_undo(false));
+    assert_eq!(app.wb.sheet(0).notes.len(), 1);
+    assert_eq!(app.wb.sheet(0).threads.len(), 1);
+}
+
+#[test]
+fn comments_phase2_find_and_replace_in_comments_with_undo() {
+    use sheetcore::model::CellRef;
+    use sheetcore::notes::Note;
+
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.notes.insert(
+            CellRef::new(0, 0),
+            Note { r: 0, c: 0, text: "旧口径金额待核对".into(), author: "张会计".into() },
+        );
+        sh.threads.insert(CellRef::new(1, 2), mk_test_thread(1, 2, "李经理", "按旧口径入账"));
+    }
+
+    app.find.in_comments = true;
+    app.find.find = "旧口径".into();
+    app.find.replace = "新口径".into();
+    let hits = app.find_hits();
+    assert_eq!(hits.len(), 2, "搜批注必须同时命中传统批注 A1 与线程批注 C2");
+
+    // 单格替换 A1
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.replace_current();
+    assert_eq!(
+        app.wb.sheet(0).notes.get(&CellRef::new(0, 0)).map(|n| n.text.as_str()),
+        Some("新口径金额待核对")
+    );
+
+    // 全部替换剩余的线程批注 C2，且可单步撤销
+    app.replace_all();
+    assert_eq!(
+        app.wb.sheet(0).threads.get(&CellRef::new(1, 2)).unwrap().entries[0].text,
+        "按新口径入账"
+    );
+    assert!(app.apply_undo(false));
+    assert_eq!(
+        app.wb.sheet(0).threads.get(&CellRef::new(1, 2)).unwrap().entries[0].text,
+        "按旧口径入账"
+    );
+}
+
+#[test]
+fn comments_phase2_editor_timestamp_and_custom_phrases_persistence() {
+    use sheetcore::model::CellRef;
+
+    let _env = crate::test_env::TestEnv::new("comments_p2_phrases");
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    let mut app = wps_app(&ctx);
+    app.my_name = "王财务".into();
+
+    // 自定义常用语持久化（完全隔离在 TestEnv 的 LOCALAPPDATA 内）
+    assert!(app.comments_panel.add_custom_phrase("已附电子回单"));
+    assert!(!app.comments_panel.add_custom_phrase("已附电子回单"), "重复短语应去重");
+    let mut fresh = crate::comments_panel::CommentsPanelState::default();
+    fresh.ensure_phrases_loaded();
+    assert_eq!(fresh.custom_phrases, vec!["已附电子回单".to_string()]);
+    assert!(fresh.remove_custom_phrase(0));
+    let mut fresh2 = crate::comments_panel::CommentsPanelState::default();
+    fresh2.ensure_phrases_loaded();
+    assert!(fresh2.custom_phrases.is_empty());
+
+    // 在 B2 打开批注编辑器，按 Ctrl+; 插入时间戳，再按 Ctrl+Enter 保存
+    app.sel = (1, 1);
+    app.sel_end = (1, 1);
+    app.open_note_editor(Some(&ctx));
+    wps_frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
+
+    let ctrl_mod = egui::Modifiers {
+        ctrl: true,
+        command: true,
+        ..Default::default()
+    };
+    wps_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::Key {
+            key: egui::Key::Semicolon,
+            physical_key: Some(egui::Key::Semicolon),
+            pressed: true,
+            repeat: false,
+            modifiers: ctrl_mod,
+        }],
+        ctrl_mod,
+    );
+    wps_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: ctrl_mod,
+        }],
+        ctrl_mod,
+    );
+    let saved = app.wb.sheet(0).notes.get(&CellRef::new(1, 1)).expect("应保存含时间戳的批注");
+    assert!(
+        saved.text.contains("王财务") && saved.text.starts_with('[') && saved.text.contains(':'),
+        "Ctrl+; 必须插入含日期时间与用户名的时间戳前缀，实际：{:?}",
+        saved.text
+    );
+}
+
+#[test]
+fn comments_phase2_export_comments_summary_sheet_with_hyperlinks_and_undo() {
+    use sheetcore::model::{Cell, CellRef, Value};
+    use sheetcore::notes::Note;
+
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    app.add_sheet();
+    assert_eq!(app.wb.sheets.len(), 2);
+    {
+        let s0 = app.wb.sheet_mut(0);
+        s0.set(1, 1, Cell { value: Value::Number(888.0), formula: None });
+        s0.notes.insert(
+            CellRef::new(1, 1),
+            Note { r: 1, c: 1, text: "表1应收核对".into(), author: "财务甲".into() },
+        );
+        let s1 = app.wb.sheet_mut(1);
+        let mut tc = mk_test_thread(2, 2, "审计乙", "表2已确认结案");
+        tc.resolved = true;
+        s1.threads.insert(CellRef::new(2, 2), tc);
+    }
+
+    app.sheet_idx = 0;
+    app.sel = (1, 1);
+    app.ribbon_action("ExportCommentsSheet", &ctx);
+    assert_eq!(app.wb.sheets.len(), 3, "应新增「批注汇总」工作表");
+    assert_eq!(app.sheet_idx, 2);
+    {
+        let sum = app.wb.sheet(2);
+        assert_eq!(sum.name, "批注汇总");
+        assert_eq!(sum.freeze, Some((1, 0)));
+        assert!(sum.filter.is_some());
+        assert_eq!(sum.value(1, 2).display(), "B2");
+        assert_eq!(sum.value(1, 3).display(), "888");
+        assert_eq!(sum.value(1, 4).display(), "传统批注");
+        assert_eq!(sum.value(1, 8).display(), "表1应收核对");
+        assert_eq!(sum.hyperlinks.get(&(1, 2)).map(|h| h.location.as_str()), Some("Sheet1!B2"));
+
+        assert_eq!(sum.value(2, 2).display(), "C3");
+        assert_eq!(sum.value(2, 4).display(), "线程批注");
+        assert_eq!(sum.value(2, 5).display(), "已解决");
+        assert_eq!(sum.hyperlinks.get(&(2, 2)).map(|h| h.location.as_str()), Some("Sheet2!C3"));
+    }
+
+    // 单步撤销应移除新建的「批注汇总」工作表
+    assert!(app.apply_undo(false));
+    assert_eq!(app.wb.sheets.len(), 2);
+}
+
+#[test]
+fn comments_phase2_ai_agent_inspect_and_manage_comments_with_confirmation_and_undo() {
+    use serde_json::json;
+    use sheetcore::model::CellRef;
+    use sheetcore::notes::Note;
+
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    app.ai.bound_doc_uid = Some(app.doc_uid);
+    app.ai.messages.push(crate::ai_agent::AiMessage {
+        role: crate::ai_agent::AiRole::Assistant,
+        content: String::new(),
+        reasoning: String::new(),
+        reasoning_open: false,
+        tool_logs: Vec::new(),
+        error: None,
+        undo_ids: Vec::new(),
+    });
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.notes.insert(
+            CellRef::new(0, 0),
+            Note { r: 0, c: 0, text: "A1初始批注".into(), author: "张会计".into() },
+        );
+        sh.threads.insert(CellRef::new(1, 1), mk_test_thread(1, 1, "李经理", "B2待处理"));
+    }
+
+    // 1) AI 读取工具 inspect_comments（按状态筛选未解决）
+    let inspect = crate::ai_agent::ToolCallSpec {
+        name: "inspect_comments".into(),
+        arguments: json!({"status": "open"}),
+    };
+    let crate::ai_agent::AiToolOutput::Ready(_, res) = app.execute_ai_tool(&inspect, &ctx) else {
+        panic!("expected immediate inspect_comments result");
+    };
+    assert_eq!(res["ok"], json!(true));
+    assert_eq!(res["total"], json!(2));
+
+    // 2) AI 批量管理工具 manage_comments：同时新建 C3、回复 A1、标记 B2 已解决（原子撤销步）
+    let manage = crate::ai_agent::ToolCallSpec {
+        name: "manage_comments".into(),
+        arguments: json!({
+            "sheet": "Sheet1",
+            "ops": [
+                {"action": "set", "cell": "C3", "text": "AI自动复核标记", "author": "AI助手"},
+                {"action": "reply", "cell": "A1", "text": "已核验凭证号 #2026-01", "author": "AI助手"},
+                {"action": "resolve", "cell": "B2"}
+            ]
+        }),
+    };
+    assert!(
+        app.stage_ai_confirmation(&mut manage.clone()).unwrap().is_none(),
+        "非删除批注操作无需阻断式确认"
+    );
+    let crate::ai_agent::AiToolOutput::Ready(_, mres) = app.execute_ai_tool(&manage, &ctx) else {
+        panic!("expected immediate manage_comments result");
+    };
+    assert_eq!(mres["ok"], json!(true));
+    assert_eq!(mres["applied"], json!(3));
+    assert_eq!(
+        app.wb.sheet(0).notes.get(&CellRef::new(2, 2)).map(|n| n.text.as_str()),
+        Some("AI自动复核标记")
+    );
+    assert_eq!(
+        app.wb.sheet(0).threads.get(&CellRef::new(0, 0)).map(|t| t.entries.len()),
+        Some(2)
+    );
+    assert!(app.wb.sheet(0).threads.get(&CellRef::new(1, 1)).unwrap().resolved);
+
+    // 3) 一键「撤销上次 AI 操作」必须完整回滚整批 3 项批注改动
+    app.undo_last_ai_change();
+    assert!(app.wb.sheet(0).notes.get(&CellRef::new(2, 2)).is_none());
+    assert!(app.wb.sheet(0).threads.get(&CellRef::new(0, 0)).is_none());
+    assert!(!app.wb.sheet(0).threads.get(&CellRef::new(1, 1)).unwrap().resolved);
+
+    // 4) 删除已有批注必须触发待确认提示
+    let mut del_call = crate::ai_agent::ToolCallSpec {
+        name: "manage_comments".into(),
+        arguments: json!({
+            "sheet": "Sheet1",
+            "ops": [{"action": "delete", "cell": "A1"}]
+        }),
+    };
+    let confirm = app.stage_ai_confirmation(&mut del_call).unwrap();
+    assert!(
+        confirm.as_deref().is_some_and(|s| s.contains("删除") && s.contains("A1")),
+        "AI 删除已有批注必须请求用户确认: {confirm:?}"
+    );
+}

@@ -213,6 +213,18 @@ impl SheetApp {
             "TextSpill" => st.checked = self.text_spill,
             "ShowFormulas" => st.checked = self.show_formulas,
             "ShowAllComments" => st.checked = self.show_all_comments,
+            "CommentsPanel" => st.checked = self.comments_panel.open,
+            "ExportCommentsSheet" => {
+                let has_any = self
+                    .wb
+                    .sheets
+                    .iter()
+                    .any(|s| !s.notes.is_empty() || !s.threads.is_empty());
+                st.enabled = has_any;
+                if !has_any {
+                    st.tip = Some("当前工作簿没有批注可导出".into());
+                }
+            }
             "DataFilter" => {
                 st.checked = self.wb.sheet(self.sheet_idx).filter.is_some();
                 if st.checked {
@@ -1356,6 +1368,10 @@ impl SheetApp {
                 } else {
                     "已隐藏全部批注（悬停或选中单元格时自动展开）".into()
                 };
+            }
+            "CommentsPanel" => self.toggle_comments_panel(),
+            "ExportCommentsSheet" => {
+                self.export_comments_summary_sheet(true);
             }
             "A11yChecker" => {
                 self.a11y_scan();

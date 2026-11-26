@@ -367,3 +367,128 @@ fn meta_edit_and_sheet_snapshot_undo_threads_and_emit_sync() {
     assert!(restored.notes_dirty);
     assert!(restored.threads_dirty);
 }
+
+#[test]
+fn search_comments_matches_notes_threads_and_authors_across_all_apis() {
+    use sheetcore::model::{CellRef, Workbook};
+    use sheetcore::notes::Note;
+    use sheetcore::search::{self, Hit, SearchOpts, SearchOrder};
+    use std::sync::atomic::AtomicBool;
+
+    let mut wb = Workbook::new_blank();
+    {
+        let sh = wb.sheet_mut(0);
+        sh.notes.insert(
+            CellRef::new(1, 1),
+            Note {
+                r: 1,
+                c: 1,
+                text: "差额复核待确认".into(),
+                author: "王财务".into(),
+            },
+        );
+        sh.threads.insert(
+            CellRef::new(3, 2),
+            mk_thread(3, 2, "李总监", "同意跨期调整", true),
+        );
+    }
+    let cancel = AtomicBool::new(false);
+    let opts = SearchOpts {
+        in_comments: true,
+        use_wildcards: true,
+        ..Default::default()
+    };
+
+    // 1) 搜索线程回复正文（含通配符）
+    let h_scoped = search::scoped_hits(&wb, Some(0), &[], "*跨期*", &opts, SearchOrder::RowMajor, &cancel);
+    assert_eq!(h_scoped, vec![Hit { sheet: 0, row: 3, col: 2 }]);
+    assert_eq!(
+        search::hits_in_sheet(&wb, 0, "跨期", &opts, SearchOrder::RowMajor),
+        vec![Hit { sheet: 0, row: 3, col: 2 }]
+    );
+    assert_eq!(
+        search::hits_in_rect(&wb, 0, (0, 0, 5, 5), "复核员", &opts, SearchOrder::RowMajor),
+        vec![Hit { sheet: 0, row: 3, col: 2 }],
+        "按线程回复作者搜索必须命中"
+    );
+    assert!(search::cell_matches(&wb, 0, 3, 2, "已复核", &opts));
+
+    // 2) 按传统批注作者与正文搜索
+    assert_eq!(
+        search::hits(&wb, None, "王财务", &opts, SearchOrder::RowMajor),
+        vec![Hit { sheet: 0, row: 1, col: 1 }]
+    );
+    assert!(search::cell_matches(&wb, 0, 1, 1, "差额", &opts));
+    assert!(!search::cell_matches(&wb, 0, 0, 0, "差额", &opts));
+}
+
+#[test]
+fn pdf_comment_printing_supports_threads_at_end_and_as_displayed() {
+    use sheetcore::model::{Cell, CellRef, Value, Workbook};
+    use sheetcore::notes::Note;
+    use sheetcore::print::{SheetPageRenderer, comment_summary_pages, paginate};
+
+    let mut wb = Workbook::new_blank();
+    {
+        let sh = wb.sheet_mut(0);
+        sh.set(1, 1, Cell { value: Value::Number(1234.5), formula: None });
+        sh.set(3, 3, Cell { value: Value::Text("跨期项".into()), formula: None });
+        sh.notes.insert(
+            CellRef::new(1, 1),
+            Note {
+                r: 1,
+                c: 1,
+                text: "传统批注打印测试".into(),
+                author: "财务甲".into(),
+            },
+        );
+        sh.threads.insert(
+            CellRef::new(3, 3),
+            mk_thread(3, 3, "审阅乙", "线程批注打印内容", true),
+        );
+    }
+
+    // 1) AtEnd (print_comments == 1)：工作表末尾附页必须同时输出传统批注、线程全部回复与已解决标记
+    wb.sheet_mut(0).page.print_comments = 1;
+    let layout_end = paginate(wb.sheet(0), &wb.sheet(0).page);
+    let summary_pages = comment_summary_pages(&wb, 0, &layout_end);
+    assert!(!summary_pages.is_empty(), "AtEnd 模式必须生成批注汇总附页");
+    let joined_end: String = summary_pages
+        .iter()
+        .flat_map(|p| p.texts.iter().map(|t| t.text.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined_end.contains("B2") && joined_end.contains("传统批注打印测试"), "附页缺传统批注:\n{joined_end}");
+    assert!(joined_end.contains("1234.5"), "附页应附带单元格当前值:\n{joined_end}");
+    assert!(
+        joined_end.contains("D4")
+            && joined_end.contains("已解决")
+            && joined_end.contains("线程批注打印内容")
+            && joined_end.contains("线程批注打印内容-已复核"),
+        "附页必须完整输出线程批注与全部回复:\n{joined_end}"
+    );
+
+    // 2) AsDisplayed (print_comments == 2)：正文页绘制红/紫角标及原位批注浮签
+    wb.sheet_mut(0).page.print_comments = 2;
+    let layout_disp = paginate(wb.sheet(0), &wb.sheet(0).page);
+    let mut renderer = SheetPageRenderer::new(&wb, 0);
+    let page0 = renderer.page_ops(&layout_disp, 0, None);
+    assert!(
+        page0.polys.iter().any(|(_, col)| *col == [217, 45, 32]),
+        "AsDisplayed 应为传统批注绘制红色角标"
+    );
+    assert!(
+        page0.polys.iter().any(|(_, col)| *col == [99, 102, 241]),
+        "AsDisplayed 应为线程批注绘制紫蓝色角标"
+    );
+    let joined_disp: String = page0
+        .texts
+        .iter()
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined_disp.contains("传统批注打印测试") && joined_disp.contains("线程批注打印内容"),
+        "AsDisplayed 模式应在页面绘制可见原位批注浮签内容:\n{joined_disp}"
+    );
+}

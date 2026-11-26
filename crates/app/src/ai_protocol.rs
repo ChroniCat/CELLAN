@@ -128,6 +128,40 @@ fn tool_definitions() -> Vec<JsonValue> {
             "enum":["sort_asc","sort_desc","highlight_duplicates","deduplicate","merge_same","clear_contents"]}}),
             vec!["op", "range"],
         ),
+        (
+            "inspect_comments",
+            "读取工作表或整个工作簿的传统批注与线程会话，可按状态、作者或关键词筛选",
+            json!({
+                "sheet": string,
+                "status": {"type": "string", "enum": ["all", "open", "resolved", "threaded", "legacy"]},
+                "author": string,
+                "query": string,
+                "limit": {"type": "integer"}
+            }),
+            vec![],
+        ),
+        (
+            "manage_comments",
+            "批量新建、修改、回复、标记已解决/重新打开或删除单元格批注与线程会话（支持单步撤销与协作同步）",
+            json!({
+                "sheet": string,
+                "ops": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["set", "reply", "resolve", "reopen", "delete"]},
+                            "cell": string,
+                            "text": string,
+                            "author": string,
+                            "threaded": boolean
+                        },
+                        "required": ["action", "cell"]
+                    }
+                }
+            }),
+            vec!["ops"],
+        ),
     ];
     functions
         .into_iter()

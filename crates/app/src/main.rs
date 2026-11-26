@@ -21,6 +21,7 @@ mod diagnostic_cache;
 mod filter_choices;
 mod fill_seq;
 mod ai_agent;
+mod comments_panel;
 mod wps_chrome;
 mod wps_dialogs;
 mod format_borders;
@@ -2442,6 +2443,8 @@ struct SheetApp {
     clip_notes: Vec<(u32, u32, sheetcore::notes::Note)>,
     clip_threads: Vec<(u32, u32, sheetcore::notes::ThreadedComment)>,
     clip_notes_captured: bool,
+    /// 右侧批注管理侧边栏与财务常用语模板状态
+    comments_panel: comments_panel::CommentsPanelState,
     /// 跨表取数对话框：输入文本
     link_dlg: Option<String>,
     /// 运行宏对话框：宏名
@@ -4236,6 +4239,7 @@ impl SheetApp {
             clip_notes: Vec::new(),
             clip_threads: Vec::new(),
             clip_notes_captured: false,
+            comments_panel: comments_panel::CommentsPanelState::default(),
             link_dlg: None,
             macro_run_dlg: None,
             macro_ran: false,
@@ -16613,6 +16617,29 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     fn replace_current(&mut self) {
         let si = self.sheet_idx;
         let (r, c) = self.sel;
+        if self.find.in_comments {
+            let needle = self.find.find.clone();
+            let replace = self.find.replace.clone();
+            match self.replace_comment_text_at(
+                si,
+                r,
+                c,
+                &needle,
+                &replace,
+                self.find.whole_cell,
+                self.find.match_case,
+            ) {
+                Ok(true) => {
+                    self.status = format!("已替换 {} 的批注", cell_name(r, c));
+                    self.find_next(false);
+                }
+                Ok(false) => {
+                    self.find_next(false);
+                }
+                Err(_) => {}
+            }
+            return;
+        }
         let Some(cell) = self.wb.sheet(si).get(r, c).map(|c| c.into_owned()) else {
             self.find_next(false);
             return;
@@ -16648,6 +16675,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     }
 
     fn replace_all(&mut self) {
+        if self.find.in_comments {
+            self.replace_all_comments();
+            return;
+        }
         // 后台查找完成后在当前文档一次提交，生成单个撤销步骤。
         self.start_scan(1);
     }
@@ -33962,6 +33993,10 @@ fn clear_selection(&mut self) {
         let mut step_dir: Option<bool> = None; // Some(false)=prev, Some(true)=next
         let mut send_reply = false;
         let mut toggle_resolved = false;
+        let mut open_sidebar = false;
+        self.comments_panel.ensure_phrases_loaded();
+        let default_author_for_stamp = self.comment_author_default();
+        let mut inserted_snippet = false;
         let want_focus = self.note_focus_requested;
         let title = format!("批注 {}  ·  {}", cell_name(r, c), existing_author);
         let te_id = egui::Id::new("note_dialog_text");
@@ -34017,6 +34052,14 @@ fn clear_selection(&mut self) {
                 }) {
                     apply = true;
                 }
+                if ui.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::Semicolon)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::Semicolon)
+                }) {
+                    let stamp = comments_panel::format_comment_timestamp(&default_author_for_stamp);
+                    comments_panel::append_comment_snippet(&mut text, &stamp);
+                    inserted_snippet = true;
+                }
                 if has_nav {
                     if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowUp)) {
                         step_dir = Some(false);
@@ -34026,11 +34069,18 @@ fn clear_selection(&mut self) {
                 }
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Ctrl+Enter 保存 · Esc 取消")
-                            .size(11.0)
+                        egui::RichText::new("Ctrl+Enter 保存 · Ctrl+; 时间戳 · Esc 取消")
+                            .size(10.5)
                             .weak(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("面板").size(10.5)).frame(false))
+                            .on_hover_text("打开右侧批注管理面板")
+                            .clicked()
+                        {
+                            open_sidebar = true;
+                        }
                         if has_nav {
                             if ui
                                 .add(egui::Button::new(egui::RichText::new("下一条 ▶").size(11.0)).frame(false))
@@ -34055,7 +34105,89 @@ fn clear_selection(&mut self) {
                     .desired_width(f32::INFINITY)
                     .hint_text("输入批注内容…")
                     .show(ui);
-                if want_focus {
+                // 快捷时间戳与高频财务常用语芯片条
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 3.0);
+                    if ui
+                        .small_button("时间戳")
+                        .on_hover_text("插入当前日期时间与用户名 (Ctrl+;)")
+                        .clicked()
+                    {
+                        let stamp =
+                            comments_panel::format_comment_timestamp(&default_author_for_stamp);
+                        comments_panel::append_comment_snippet(&mut text, &stamp);
+                        inserted_snippet = true;
+                    }
+                    for &phrase in comments_panel::BUILTIN_COMMENT_PHRASES {
+                        if ui.small_button(phrase).clicked() {
+                            comments_panel::append_comment_snippet(&mut text, phrase);
+                            inserted_snippet = true;
+                        }
+                    }
+                    let custom_copy = self.comments_panel.custom_phrases.clone();
+                    for phrase in &custom_copy {
+                        if ui.small_button(phrase.as_str()).clicked() {
+                            comments_panel::append_comment_snippet(&mut text, phrase);
+                            inserted_snippet = true;
+                        }
+                    }
+                    let mgr_lbl = if self.comments_panel.phrases_manage_open {
+                        "收起常用语"
+                    } else {
+                        "自定义…"
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new(mgr_lbl).size(10.5).weak())
+                                .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.comments_panel.phrases_manage_open =
+                            !self.comments_panel.phrases_manage_open;
+                    }
+                });
+                if self.comments_panel.phrases_manage_open {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.comments_panel.new_phrase_buf)
+                                .desired_width((ui.available_width() - 96.0).max(120.0))
+                                .hint_text("添加自定义财务常用语…"),
+                        );
+                        if ui.small_button("添加").clicked() {
+                            let val = std::mem::take(&mut self.comments_panel.new_phrase_buf);
+                            let _ = self.comments_panel.add_custom_phrase(&val);
+                        }
+                        if !text.trim().is_empty()
+                            && ui
+                                .small_button("存当前")
+                                .on_hover_text("把当前批注正文存为自定义常用语")
+                                .clicked()
+                        {
+                            let _ = self.comments_panel.add_custom_phrase(text.trim());
+                        }
+                    });
+                    if !self.comments_panel.custom_phrases.is_empty() {
+                        let mut del_idx = None;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
+                            for (pi, p) in self.comments_panel.custom_phrases.iter().enumerate() {
+                                if ui
+                                    .small_button(format!("{p} ×"))
+                                    .on_hover_text("点击移除此自定义常用语")
+                                    .clicked()
+                                {
+                                    del_idx = Some(pi);
+                                }
+                            }
+                        });
+                        if let Some(di) = del_idx {
+                            self.comments_panel.remove_custom_phrase(di);
+                        }
+                    }
+                }
+                if want_focus || inserted_snippet {
                     out.response.request_focus();
                     let end = egui::text::CCursor::new(text.chars().count());
                     let mut state = out.state;
@@ -34177,6 +34309,9 @@ fn clear_selection(&mut self) {
                 .unwrap_or_else(|| text.clone());
             ctx.copy_text(copy_txt);
             self.status = format!("已复制 {} 的批注", cell_name(r, c));
+        }
+        if open_sidebar {
+            self.comments_panel.open = true;
         }
 
         let default_author = if self.my_name.trim().is_empty() {
@@ -40026,7 +40161,8 @@ impl SheetApp {
                 });
                 ui.horizontal(|ui| {
                     ui.add_space(72.0);
-                    ui.checkbox(&mut self.find.in_comments, "含批注");
+                    ui.checkbox(&mut self.find.in_comments, "搜批注")
+                        .on_hover_text("在传统批注、线程批注及作者中查找，并支持对批注正文进行替换/全部替换");
                     ui.add_space(6.0);
                     ui.checkbox(&mut self.find.match_bold, "仅加粗格式");
                     if self.find.tab == 1 {
@@ -40187,11 +40323,28 @@ impl SheetApp {
                             .map(|s| {
                                 let val = s.value(h.row, h.col).display();
                                 let fml = s.formula_of(h.row, h.col);
-                                let note = s.notes.get(&sheetcore::model::CellRef::new(h.row, h.col));
-                                let p = match (fml, note) {
-                                    (Some(f), _) => format!("{val}  ({f})"),
-                                    (None, Some(n)) if val.is_empty() => format!("[批注] {}", n.text),
-                                    _ => val,
+                                let ckey = sheetcore::model::CellRef::new(h.row, h.col);
+                                let thread = s.threads.get(&ckey);
+                                let note = s.notes.get(&ckey);
+                                let p = if self.find.in_comments {
+                                    if let Some(tc) = thread {
+                                        format!("[线程] {}", tc.summary_text().replace('\n', " "))
+                                    } else if let Some(n) = note {
+                                        format!("[批注] {}", n.text.replace('\n', " "))
+                                    } else {
+                                        val
+                                    }
+                                } else {
+                                    match (fml, thread, note) {
+                                        (Some(f), _, _) => format!("{val}  ({f})"),
+                                        (None, Some(tc), _) if val.is_empty() => {
+                                            format!("[线程] {}", tc.summary_text().replace('\n', " "))
+                                        }
+                                        (None, None, Some(n)) if val.is_empty() => {
+                                            format!("[批注] {}", n.text.replace('\n', " "))
+                                        }
+                                        _ => val,
+                                    }
                                 };
                                 let clipped: String = p.chars().take(48).collect();
                                 (s.name.as_str(), clipped)
@@ -56092,16 +56245,26 @@ impl eframe::App for SheetApp {
                             self.start_host();
                             self.members_open = true;
                         }
-                        if ui_kit::labeled_w(
+                        let cmt_bg = ui.painter().add(egui::Shape::Noop);
+                        let cmt_resp = ui_kit::labeled_w(
                             ui,
                             Icon::Comment,
                             "批注",
                             54.0,
-                            "新建或编辑批注",
-                        )
-                        .clicked()
-                        {
-                            self.open_note_editor(Some(ctx));
+                            "打开/关闭批注管理面板（Shift+F2 直接编辑当前格批注）",
+                        );
+                        if self.comments_panel.open {
+                            ui.painter().set(
+                                cmt_bg,
+                                egui::Shape::rect_filled(
+                                    cmt_resp.rect,
+                                    4.0,
+                                    Color32::from_rgba_unmultiplied(30, 64, 175, 22),
+                                ),
+                            );
+                        }
+                        if cmt_resp.clicked() {
+                            self.toggle_comments_panel();
                         }
                         let ai_bg = ui.painter().add(egui::Shape::Noop);
                         let ai_resp = ui_kit::labeled_tint(
@@ -57370,6 +57533,9 @@ impl eframe::App for SheetApp {
         }
         if !self.show_start && !self.backstage && self.ai.open {
             self.draw_ai_panel(ctx);
+        }
+        if !self.show_start && !self.backstage && self.comments_panel.open {
+            self.draw_comments_panel(ctx);
         }
         if !self.show_start && !self.backstage {
             self.draw_pivot_sidebar(ctx);
