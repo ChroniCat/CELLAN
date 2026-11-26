@@ -321,6 +321,30 @@ impl SheetApp {
         items
     }
 
+    pub(crate) fn validate_thread_limits(
+        total_entries: usize,
+        texts: &[&str],
+        authors: &[&str],
+    ) -> Result<(), String> {
+        if total_entries > sheetcore::sync::MAX_THREAD_ENTRIES {
+            return Err(format!(
+                "单格批注线程最多支持 {} 条发言，无法继续添加",
+                sheetcore::sync::MAX_THREAD_ENTRIES
+            ));
+        }
+        for &t in texts {
+            if t.len() > sheetcore::sync::MAX_THREAD_ENTRY_TEXT_BYTES {
+                return Err("单条批注内容超过 64 KB 上限，无法保存".into());
+            }
+        }
+        for &a in authors {
+            if a.len() > sheetcore::sync::MAX_SHORT_TEXT {
+                return Err("批注作者名称过长，无法保存".into());
+            }
+        }
+        Ok(())
+    }
+
     /// 写入/更新单元格批注（统一撤销 + 协作广播；供侧边栏、查找替换与 AI 工具复用）
     pub(crate) fn set_comment_cell(
         &mut self,
@@ -396,6 +420,14 @@ impl SheetApp {
             None
         };
 
+        let projected_entries = new_thread.as_ref().map_or(0, |tc| tc.entries.len());
+        if let Err(err) =
+            Self::validate_thread_limits(projected_entries, &[cleaned.as_str()], &[author.as_str()])
+        {
+            self.status = err.clone();
+            return Err(err);
+        }
+
         let effective_text = new_thread
             .as_ref()
             .map(|tc| tc.summary_text())
@@ -421,9 +453,33 @@ impl SheetApp {
             }
             sh.bump_display_style_revision();
         }
-        self.broadcast_note_meta(sheet, r, c, Some(&new_note));
-        if changed_thread {
-            self.broadcast_thread_meta(sheet, r, c, new_thread.as_ref());
+        let synced = if changed_thread {
+            self.broadcast_thread_meta(sheet, r, c, new_thread.as_ref())
+        } else {
+            self.broadcast_note_meta(sheet, r, c, Some(&new_note))
+        };
+        if !synced {
+            let sh = self.wb.sheet_mut(sheet);
+            match old_note {
+                Some(n) => {
+                    sh.notes.insert(key, n);
+                }
+                None => {
+                    sh.notes.remove(&key);
+                }
+            }
+            match old_thread {
+                Some(tc) => {
+                    sh.threads.insert(key, tc);
+                }
+                None => {
+                    sh.threads.remove(&key);
+                }
+            }
+            sh.bump_display_style_revision();
+            let err = format!("{} 的批注未能同步到协作成员，已撤回本地修改", cell_name(r, c));
+            self.status = err.clone();
+            return Err(err);
         }
         self.undo.push_meta(
             if old_note.is_some() || old_thread.is_some() {
@@ -485,23 +541,53 @@ impl SheetApp {
             .unwrap_or_else(|| self.comment_author_default());
         let ts = iso_utc_now();
 
+        let seed_root = if old_thread.is_none() {
+            old_note.as_ref().and_then(|on| {
+                (!on.text.trim().is_empty()).then(|| ThreadEntry {
+                    id: new_ooxml_guid(),
+                    author: if on.author.trim().is_empty() {
+                        author.clone()
+                    } else {
+                        on.author.trim().to_string()
+                    },
+                    timestamp: ts.clone(),
+                    text: on.text.clone(),
+                })
+            })
+        } else {
+            None
+        };
+        let projected_len = old_thread
+            .as_ref()
+            .map(|tc| tc.entries.len())
+            .unwrap_or_else(|| usize::from(seed_root.is_some()))
+            + 1;
+        let mut check_texts: Vec<&str> = vec![reply_clean];
+        let mut check_authors: Vec<&str> = vec![author.as_str()];
+        if let Some(ref root) = seed_root {
+            check_texts.push(root.text.as_str());
+            check_authors.push(root.author.as_str());
+        }
+        if let Err(err) =
+            Self::validate_thread_limits(projected_len, &check_texts, &check_authors)
+        {
+            self.status = err.clone();
+            return Err(err);
+        }
+
+        let new_entry = ThreadEntry {
+            id: new_ooxml_guid(),
+            author,
+            timestamp: ts,
+            text: reply_clean.to_string(),
+        };
+
         let (new_note, new_tc) = {
             let sh = self.wb.sheet_mut(sheet);
             let tc = sh.threads.entry(key).or_insert_with(|| {
                 let mut entries = Vec::new();
-                if let Some(ref on) = old_note
-                    && !on.text.trim().is_empty()
-                {
-                    entries.push(ThreadEntry {
-                        id: new_ooxml_guid(),
-                        author: if on.author.trim().is_empty() {
-                            author.clone()
-                        } else {
-                            on.author.trim().to_string()
-                        },
-                        timestamp: ts.clone(),
-                        text: on.text.clone(),
-                    });
+                if let Some(ref root) = seed_root {
+                    entries.push(root.clone());
                 }
                 ThreadedComment {
                     r,
@@ -510,12 +596,7 @@ impl SheetApp {
                     entries,
                 }
             });
-            tc.entries.push(ThreadEntry {
-                id: new_ooxml_guid(),
-                author,
-                timestamp: ts,
-                text: reply_clean.to_string(),
-            });
+            tc.entries.push(new_entry.clone());
             let new_tc = tc.clone();
             sh.threads_dirty = true;
             let n = Note {
@@ -529,9 +610,34 @@ impl SheetApp {
             sh.bump_display_style_revision();
             (n, new_tc)
         };
+        if !self.broadcast_thread_reply_meta(sheet, r, c, seed_root, new_entry) {
+            let sh = self.wb.sheet_mut(sheet);
+            match old_note {
+                Some(n) => {
+                    sh.notes.insert(key, n);
+                }
+                None => {
+                    sh.notes.remove(&key);
+                }
+            }
+            match old_thread {
+                Some(tc) => {
+                    sh.threads.insert(key, tc);
+                }
+                None => {
+                    sh.threads.remove(&key);
+                }
+            }
+            sh.bump_display_style_revision();
+            let err = format!(
+                "{} 的线程回复未能同步（可能已达 {} 条上限或连接已断开），已撤回本地修改",
+                cell_name(r, c),
+                sheetcore::sync::MAX_THREAD_ENTRIES
+            );
+            self.status = err.clone();
+            return Err(err);
+        }
         let count = new_tc.entries.len();
-        self.broadcast_note_meta(sheet, r, c, Some(&new_note));
-        self.broadcast_thread_meta(sheet, r, c, Some(&new_tc));
         self.undo.push_meta(
             "回复批注线程",
             (sheet, r, c),
@@ -581,25 +687,35 @@ impl SheetApp {
             return Ok(false);
         }
         let default_author = self.comment_author_default();
+        let seed_root = if old_thread.is_none() {
+            old_note.as_ref().map(|n| ThreadEntry {
+                id: new_ooxml_guid(),
+                author: if n.author.trim().is_empty() {
+                    default_author.clone()
+                } else {
+                    n.author.trim().to_string()
+                },
+                timestamp: iso_utc_now(),
+                text: n.text.clone(),
+            })
+        } else {
+            None
+        };
+        if let Some(ref root) = seed_root {
+            if let Err(err) =
+                Self::validate_thread_limits(1, &[root.text.as_str()], &[root.author.as_str()])
+            {
+                self.status = err.clone();
+                return Err(err);
+            }
+        }
         let (new_note, new_tc) = {
             let sh = self.wb.sheet_mut(sheet);
-            let tc = sh.threads.entry(key).or_insert_with(|| {
-                let n = old_note.as_ref().unwrap();
-                ThreadedComment {
-                    r,
-                    c,
-                    resolved,
-                    entries: vec![ThreadEntry {
-                        id: new_ooxml_guid(),
-                        author: if n.author.trim().is_empty() {
-                            default_author.clone()
-                        } else {
-                            n.author.trim().to_string()
-                        },
-                        timestamp: iso_utc_now(),
-                        text: n.text.clone(),
-                    }],
-                }
+            let tc = sh.threads.entry(key).or_insert_with(|| ThreadedComment {
+                r,
+                c,
+                resolved,
+                entries: seed_root.clone().into_iter().collect(),
             });
             tc.resolved = resolved;
             let new_tc = tc.clone();
@@ -615,8 +731,29 @@ impl SheetApp {
             sh.bump_display_style_revision();
             (n, new_tc)
         };
-        self.broadcast_note_meta(sheet, r, c, Some(&new_note));
-        self.broadcast_thread_meta(sheet, r, c, Some(&new_tc));
+        if !self.broadcast_thread_resolve_meta(sheet, r, c, seed_root, resolved) {
+            let sh = self.wb.sheet_mut(sheet);
+            match old_note {
+                Some(n) => {
+                    sh.notes.insert(key, n);
+                }
+                None => {
+                    sh.notes.remove(&key);
+                }
+            }
+            match old_thread {
+                Some(tc) => {
+                    sh.threads.insert(key, tc);
+                }
+                None => {
+                    sh.threads.remove(&key);
+                }
+            }
+            sh.bump_display_style_revision();
+            let err = format!("{} 的批注状态未能同步到协作成员，已撤回本地修改", cell_name(r, c));
+            self.status = err.clone();
+            return Err(err);
+        }
         self.undo.push_meta(
             if resolved {
                 "标记批注已解决"
@@ -671,8 +808,7 @@ impl SheetApp {
             }
             let mut note_diffs = Vec::new();
             let mut thread_diffs = Vec::new();
-            let mut bcast_notes = Vec::new();
-            let mut bcast_threads = Vec::new();
+            let mut bcast_resolves: Vec<(u32, u32, Option<ThreadEntry>)> = Vec::new();
             let ts = iso_utc_now();
             {
                 let sh = self.wb.sheet_mut(si);
@@ -688,23 +824,26 @@ impl SheetApp {
                     {
                         continue;
                     }
-                    let tc = sh.threads.entry(key).or_insert_with(|| {
+                    let seed_root = if old_thread.is_none() {
                         let n = old_note.as_ref().unwrap();
-                        ThreadedComment {
-                            r,
-                            c,
-                            resolved,
-                            entries: vec![ThreadEntry {
-                                id: new_ooxml_guid(),
-                                author: if n.author.trim().is_empty() {
-                                    default_author.clone()
-                                } else {
-                                    n.author.trim().to_string()
-                                },
-                                timestamp: ts.clone(),
-                                text: n.text.clone(),
-                            }],
-                        }
+                        Some(ThreadEntry {
+                            id: new_ooxml_guid(),
+                            author: if n.author.trim().is_empty() {
+                                default_author.clone()
+                            } else {
+                                n.author.trim().to_string()
+                            },
+                            timestamp: ts.clone(),
+                            text: n.text.clone(),
+                        })
+                    } else {
+                        None
+                    };
+                    let tc = sh.threads.entry(key).or_insert_with(|| ThreadedComment {
+                        r,
+                        c,
+                        resolved,
+                        entries: seed_root.clone().into_iter().collect(),
                     });
                     tc.resolved = resolved;
                     let new_tc = tc.clone();
@@ -715,10 +854,9 @@ impl SheetApp {
                         author: new_tc.root_author().to_string(),
                     };
                     sh.notes.insert(key, new_note.clone());
-                    note_diffs.push(((r, c), old_note, Some(new_note.clone())));
-                    thread_diffs.push(((r, c), old_thread, Some(new_tc.clone())));
-                    bcast_notes.push((r, c, new_note));
-                    bcast_threads.push((r, c, new_tc));
+                    note_diffs.push(((r, c), old_note, Some(new_note)));
+                    thread_diffs.push(((r, c), old_thread, Some(new_tc)));
+                    bcast_resolves.push((r, c, seed_root));
                 }
                 if !thread_diffs.is_empty() {
                     sh.notes_dirty = true;
@@ -729,11 +867,8 @@ impl SheetApp {
             if !thread_diffs.is_empty() {
                 total_changed += thread_diffs.len();
                 let focus = (si, coords[0].0, coords[0].1);
-                for (r, c, n) in &bcast_notes {
-                    self.broadcast_note_meta(si, *r, *c, Some(n));
-                }
-                for (r, c, tc) in &bcast_threads {
-                    self.broadcast_thread_meta(si, *r, *c, Some(tc));
+                for (r, c, seed_root) in bcast_resolves {
+                    let _ = self.broadcast_thread_resolve_meta(si, r, c, seed_root, resolved);
                 }
                 self.undo.push_meta(
                     if resolved {
@@ -923,6 +1058,19 @@ impl SheetApp {
         if !note_changed && !thread_changed {
             return Ok(false);
         }
+        if let Some(ref tc) = new_thread {
+            let texts: Vec<&str> = tc.entries.iter().map(|e| e.text.as_str()).collect();
+            let authors: Vec<&str> = tc.entries.iter().map(|e| e.author.as_str()).collect();
+            if let Err(err) = Self::validate_thread_limits(tc.entries.len(), &texts, &authors) {
+                self.status = err.clone();
+                return Err(err);
+            }
+        } else if let Some(ref n) = new_note {
+            if let Err(err) = Self::validate_thread_limits(0, &[n.text.as_str()], &[n.author.as_str()]) {
+                self.status = err.clone();
+                return Err(err);
+            }
+        }
         if !self.write_preflight_on(sheet, &[(r, c)], "替换批注") {
             return Err(self.status.clone());
         }
@@ -942,11 +1090,35 @@ impl SheetApp {
             }
             sh.bump_display_style_revision();
         }
-        if note_changed {
-            self.broadcast_note_meta(sheet, r, c, new_note.as_ref());
-        }
-        if thread_changed {
-            self.broadcast_thread_meta(sheet, r, c, new_thread.as_ref());
+        let synced = if thread_changed {
+            self.broadcast_thread_meta(sheet, r, c, new_thread.as_ref())
+        } else if note_changed {
+            self.broadcast_note_meta(sheet, r, c, new_note.as_ref())
+        } else {
+            true
+        };
+        if !synced {
+            let sh = self.wb.sheet_mut(sheet);
+            match old_note {
+                Some(n) => {
+                    sh.notes.insert(key, n);
+                }
+                None => {
+                    sh.notes.remove(&key);
+                }
+            }
+            match old_thread {
+                Some(tc) => {
+                    sh.threads.insert(key, tc);
+                }
+                None => {
+                    sh.threads.remove(&key);
+                }
+            }
+            sh.bump_display_style_revision();
+            let err = format!("{} 的批注替换未能同步到协作成员，已撤回本地修改", cell_name(r, c));
+            self.status = err.clone();
+            return Err(err);
         }
         self.undo.push_meta(
             "替换批注",

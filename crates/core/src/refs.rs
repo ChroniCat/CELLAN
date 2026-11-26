@@ -130,7 +130,72 @@ impl MappedShift<'_> {
         let (first, last) = self.map_range(a, b)?;
         (first <= self.last_index()).then_some((first, last.min(self.last_index())))
     }
+}
 
+/// 内部轴映射器：统一支持普通结构位移、批量插入，以及整行/整列移动的区间置换。
+enum AxisMapper<'a> {
+    Mapped(&'a MappedShift<'a>),
+    Permute {
+        shift: &'a Shift,
+        from: u32,
+        n: u32,
+        at: u32,
+    },
+}
+
+fn permute_index(pos: u32, from: u32, n: u32, at: u32) -> u32 {
+    let lo = from.min(at);
+    let hi = (from + n).max(at + n);
+    if pos < lo || pos >= hi {
+        pos
+    } else if pos >= from && pos < from + n {
+        at + (pos - from)
+    } else if at > from {
+        pos - n
+    } else {
+        pos + n
+    }
+}
+
+impl std::ops::Deref for AxisMapper<'_> {
+    type Target = Shift;
+    fn deref(&self) -> &Shift {
+        match self {
+            AxisMapper::Mapped(ms) => ms.shift,
+            AxisMapper::Permute { shift, .. } => shift,
+        }
+    }
+}
+
+impl AxisMapper<'_> {
+    fn map_reference(&self, index: u32) -> Option<u32> {
+        match self {
+            AxisMapper::Mapped(ms) => ms.map_reference(index),
+            AxisMapper::Permute { from, n, at, .. } => Some(permute_index(index, *from, *n, *at)),
+        }
+    }
+
+    fn map_reference_range(&self, a: u32, b: u32) -> Option<(u32, u32)> {
+        match self {
+            AxisMapper::Mapped(ms) => ms.map_reference_range(a, b),
+            AxisMapper::Permute { from, n, at, .. } => {
+                let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                let lo = (*from).min(*at);
+                let hi = (*from + *n).max(*at + *n);
+                if b < lo || a >= hi {
+                    // 完全落在置换区间外：保持不动
+                    return Some((a, b));
+                }
+                if a <= lo && b >= hi - 1 {
+                    // 完整覆盖整个置换区间：包含的行列集合不变
+                    return Some((a, b));
+                }
+                let na = permute_index(a, *from, *n, *at);
+                let nb = permute_index(b, *from, *n, *at);
+                Some((na.min(nb), na.max(nb)))
+            }
+        }
+    }
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -178,7 +243,7 @@ fn translated_axis(value: u32, offset: i64, absolute: bool, limit: i64) -> Optio
 }
 
 /// 整行引用也保留每一端自己的锁定标记；列方向偏移不影响它。
-fn parse_row_ref(b: &[u8], start: usize, sh: &MappedShift, qualified: Option<&str>) -> Option<Ref> {
+fn parse_row_ref(b: &[u8], start: usize, sh: &AxisMapper, qualified: Option<&str>) -> Option<Ref> {
     let mut i = start;
     let abs1 = b.get(i) == Some(&b'$');
     i += usize::from(abs1);
@@ -220,7 +285,7 @@ fn parse_row_ref(b: &[u8], start: usize, sh: &MappedShift, qualified: Option<&st
 }
 
 /// 解析一个单元格引用或区域；识别但不需改动的引用也返回原文，以消费表名限定符。
-fn parse_ref(b: &[u8], start: usize, sh: &MappedShift, qualified_sheet: Option<&str>) -> Option<Ref> {
+fn parse_ref(b: &[u8], start: usize, sh: &AxisMapper, qualified_sheet: Option<&str>) -> Option<Ref> {
     let mut i = start;
     let d1 = if b.get(i) == Some(&b'$') {
         i += 1;
@@ -394,7 +459,7 @@ fn allowed(sh: &Shift, r: u32, c: u32) -> bool {
         && sh.col_filter.is_none_or(|(a, b)| c >= a && c <= b)
 }
 
-fn apply(sh: &MappedShift, r: u32, c: u32, row_absolute: bool, col_absolute: bool) -> (Option<u32>, Option<u32>) {
+fn apply(sh: &AxisMapper, r: u32, c: u32, row_absolute: bool, col_absolute: bool) -> (Option<u32>, Option<u32>) {
     if let Some((dr, dc)) = sh.translate {
         return (
             translated_axis(r, dr, row_absolute, 1_048_576),
@@ -423,6 +488,36 @@ pub fn translate(formula: &str, dr: i64, dc: i64, _sheet: &str) -> String {
     // Copy shifts apply equally to qualified references, regardless of sheet name.
     let sh = Shift { translate: Some((dr, dc)), ..Default::default() };
     rewrite(formula, &sh)
+}
+
+/// 整行/整列移动（把 `[from, from+n)` 移至最终起始下标 `at`）时，按真实坐标置换重写公式中
+/// 指向 `target_sheet` 的单元格与区域引用：
+/// - 落在置换带 `[min(from,at), max(from+n,at+n))` 之外及指向其他工作表的引用保持原目标；
+/// - 指向被移动行/列或被挤动行/列的引用（含绝对/混合引用）随真实坐标置换更新。
+pub fn permute_axis(
+    formula: &str,
+    axis: Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+    target_sheet: &str,
+    own_sheet: &str,
+) -> String {
+    if n == 0 || from == at {
+        return formula.to_string();
+    }
+    let lo = from.min(at);
+    let hi = (from + n).max(at + n);
+    let sh = Shift {
+        axis,
+        at: lo,
+        n: hi - lo,
+        delete: false,
+        target_sheet: target_sheet.to_string(),
+        own_sheet: own_sheet.to_string(),
+        ..Default::default()
+    };
+    rewrite_with(formula, &AxisMapper::Permute { shift: &sh, from, n, at })
 }
 
 struct CopyReference {
@@ -833,6 +928,10 @@ pub fn rewrite(formula: &str, sh: &Shift) -> String {
 }
 
 pub(crate) fn rewrite_mapped(formula: &str, sh: &MappedShift) -> String {
+    rewrite_with(formula, &AxisMapper::Mapped(sh))
+}
+
+fn rewrite_with(formula: &str, sh: &AxisMapper) -> String {
     let b = formula.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(formula.len() + 8);
     let mut i = 0usize;
@@ -1121,12 +1220,12 @@ pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
                 let mut j = after_bang;
                 if b[j..].starts_with(b"#REF!") {
                     j += 5;
-                } else if let Some(reference) = parse_ref(b, j, &MappedShift { shift: &identity, insertions: &[] }, None) {
+                } else if let Some(reference) = parse_ref(b, j, &AxisMapper::Mapped(&MappedShift { shift: &identity, insertions: &[] }), None) {
                     j = reference.end;
                     // 三维引用也可能是 A1:B2/整行区间；吞掉第二个端点，
                     // 否则会留下 `#REF!:B2` 这种不可解析的残片。
                     if b.get(j) == Some(&b':') {
-                        if let Some(second) = parse_ref(b, j + 1, &MappedShift { shift: &identity, insertions: &[] }, None) {
+                        if let Some(second) = parse_ref(b, j + 1, &AxisMapper::Mapped(&MappedShift { shift: &identity, insertions: &[] }), None) {
                             j = second.end;
                         }
                     }
@@ -1177,7 +1276,7 @@ pub fn rewrite_sheet(formula: &str, old: &str, new: Option<&str>) -> String {
                 // and columns), or a sheet-scoped name after the qualifier.
                 if b[i..].starts_with(b"#REF!") {
                     i += 5;
-                } else if let Some(reference) = parse_ref(b, i, &MappedShift { shift: &identity, insertions: &[] }, None) {
+                } else if let Some(reference) = parse_ref(b, i, &AxisMapper::Mapped(&MappedShift { shift: &identity, insertions: &[] }), None) {
                     i = reference.end;
                 } else {
                     while b.get(i).is_some_and(|c| is_ident_byte(*c) || *c == b'$') { i += 1; }
@@ -1362,10 +1461,10 @@ fn consume_ref_after(b: &[u8], mut j: usize, identity: &Shift) -> usize {
     if b[j..].starts_with(b"#REF!") {
         return j + 5;
     }
-    if let Some(reference) = parse_ref(b, j, &MappedShift { shift: identity, insertions: &[] }, None) {
+    if let Some(reference) = parse_ref(b, j, &AxisMapper::Mapped(&MappedShift { shift: identity, insertions: &[] }), None) {
         j = reference.end;
         if b.get(j) == Some(&b':') {
-            if let Some(second) = parse_ref(b, j + 1, &MappedShift { shift: identity, insertions: &[] }, None) {
+            if let Some(second) = parse_ref(b, j + 1, &AxisMapper::Mapped(&MappedShift { shift: identity, insertions: &[] }), None) {
                 j = second.end;
             }
         }

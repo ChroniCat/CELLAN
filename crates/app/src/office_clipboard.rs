@@ -220,9 +220,33 @@ pub fn has_rich_table_format() -> bool {
     }
 }
 
+/// 剪贴板 HTML 解析触发的体量/单元格数上限
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HtmlLimitKind {
+    InputBytes { actual: usize, limit: usize },
+    CellCount { limit: usize },
+}
+
+impl HtmlLimitKind {
+    pub fn user_message(self) -> String {
+        match self {
+            Self::InputBytes { actual, limit } => format!(
+                "剪贴板 HTML 数据过大（{:.1} MB，上限 {} MB），已中止粘贴以避免静默截断；请分批复制或改用「粘贴数值」(Ctrl+Shift+V)",
+                actual as f64 / (1024.0 * 1024.0),
+                limit / (1024 * 1024)
+            ),
+            Self::CellCount { limit } => format!(
+                "剪贴板 HTML 单元格数量超过上限（最多 {} 格），已中止粘贴以避免静默截断；请分批复制或改用「粘贴数值」(Ctrl+Shift+V)",
+                limit
+            ),
+        }
+    }
+}
+
 pub enum RichClipboard {
     Block(OfficeBlock),
     Sparse(sheetcore::clipboard_xmlss::SparseBlock),
+    HtmlTruncated(HtmlLimitKind),
 }
 
 /// 单次读取系统剪贴板富格式：优先一次性读取 `"XML Spreadsheet"` 并直接走流式稀疏解析
@@ -266,7 +290,10 @@ pub fn read_rich_table_ext(values_only: bool) -> Option<RichClipboard> {
                 }
             }
         }
-        read_html_table().map(RichClipboard::Block)
+        read_html_table().map(|res| match res {
+            Ok(block) => RichClipboard::Block(block),
+            Err(limit) => RichClipboard::HtmlTruncated(limit),
+        })
     }
 }
 
@@ -288,7 +315,7 @@ pub fn read_raw_xmlss() -> Option<Vec<u8>> {
 }
 
 #[cfg(not(test))]
-unsafe fn read_html_table() -> Option<OfficeBlock> {
+unsafe fn read_html_table() -> Option<Result<OfficeBlock, HtmlLimitKind>> {
     unsafe {
         let fmt = RegisterClipboardFormatW(wide("HTML Format").as_ptr());
         if fmt == 0 || IsClipboardFormatAvailable(fmt) == 0 {
@@ -300,8 +327,10 @@ unsafe fn read_html_table() -> Option<OfficeBlock> {
             (Some(a), Some(b)) if b > a => &text[a..b],
             _ => text.as_ref(),
         };
-        let block = parse_html(html);
-        (!block.is_empty()).then_some(block)
+        match parse_html_checked(html) {
+            Ok(block) => (!block.is_empty()).then_some(Ok(block)),
+            Err(limit) => Some(Err(limit)),
+        }
     }
 }
 
@@ -342,7 +371,7 @@ pub fn read_table() -> Option<OfficeBlock> {
                 return Some(b);
             }
         }
-        unsafe { read_html_table() }
+        unsafe { read_html_table().and_then(Result::ok) }
     }
 }
 
@@ -484,8 +513,8 @@ fn decode_entities(s: &str) -> String {
 }
 
 /// 剪贴板 HTML 最大输入字节上限（32 MiB）与单元格解析上限（200,000 格）
-const MAX_HTML_INPUT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_HTML_CELLS: usize = 200_000;
+pub const MAX_HTML_INPUT_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_HTML_CELLS: usize = 200_000;
 
 /// 在 `slice` 中查找最近的单元格结束边界（`</td`、`</th` 或下一个 `<td`/`<th`/`<tr`/`</tr`/`</table`）。
 /// 返回 `(boundary_offset, advance_bytes)`：闭合标签跳过至 `>` 之后，隐式结束标签停在其 `<` 处。
@@ -519,23 +548,22 @@ fn find_html_cell_end(slice: &str) -> (usize, usize) {
     (b.len(), 0)
 }
 
-pub fn parse_html(html: &str) -> OfficeBlock {
+/// 显式带上限检查的 HTML 表格解析：超过 `MAX_HTML_INPUT_BYTES` 或 `MAX_HTML_CELLS` 时返回 `Err(HtmlLimitKind)`，
+/// 绝不静默截断为残缺表格。
+pub fn parse_html_checked(html: &str) -> Result<OfficeBlock, HtmlLimitKind> {
+    if html.len() > MAX_HTML_INPUT_BYTES {
+        return Err(HtmlLimitKind::InputBytes {
+            actual: html.len(),
+            limit: MAX_HTML_INPUT_BYTES,
+        });
+    }
     let mut block = OfficeBlock::default();
-    let html = if html.len() > MAX_HTML_INPUT_BYTES {
-        let mut end = MAX_HTML_INPUT_BYTES;
-        while end > 0 && !html.is_char_boundary(end) {
-            end -= 1;
-        }
-        &html[..end]
-    } else {
-        html
-    };
     let classes = parse_style_classes(html);
     let mut row: Vec<OfficeCell> = Vec::new();
     let mut total_cells = 0usize;
     let mut i = 0usize;
     let bytes = html.as_bytes();
-    while i < bytes.len() && total_cells < MAX_HTML_CELLS {
+    while i < bytes.len() {
         let Some(rel) = bytes[i..].iter().position(|&b| b == b'<') else {
             break;
         };
@@ -558,6 +586,11 @@ pub fn parse_html(html: &str) -> OfficeBlock {
             let Some(tail) = html.get(body_start..) else {
                 break;
             };
+            if total_cells >= MAX_HTML_CELLS {
+                return Err(HtmlLimitKind::CellCount {
+                    limit: MAX_HTML_CELLS,
+                });
+            }
             let (end_rel, adv) = find_html_cell_end(tail);
             let inner = tail.get(..end_rel).unwrap_or("");
             row.push(parse_cell(attrs, inner, &classes));
@@ -583,7 +616,11 @@ pub fn parse_html(html: &str) -> OfficeBlock {
     while block.rows.last().is_some_and(row_blank) {
         block.rows.pop();
     }
-    block
+    Ok(block)
+}
+
+pub fn parse_html(html: &str) -> OfficeBlock {
+    parse_html_checked(html).unwrap_or_default()
 }
 
 fn css_border_color(style: &str, prop: &str) -> Option<Option<[u8; 3]>> {
@@ -1526,5 +1563,63 @@ mod audit_regression_tests {
         assert!(t0.elapsed().as_millis() < 500, "omitted close tags took {:?}", t0.elapsed());
         assert_eq!(big.rows.len(), 1);
         assert_eq!(big.rows[0].len(), 4000);
+    }
+
+    #[test]
+    fn issue_11_parse_html_checked_rejects_cell_count_and_byte_overflow_without_silent_truncation() {
+        // 1) 刚好 200,000 格允许通过（4000 行 x 50 列）
+        let row50: String = "<tr>".to_string() + &"<td>1</td>".repeat(50) + "</tr>";
+        let mut exact = String::with_capacity(row50.len() * 4000 + 32);
+        exact.push_str("<table>");
+        for _ in 0..4000 {
+            exact.push_str(&row50);
+        }
+        exact.push_str("</table>");
+        let ok = parse_html_checked(&exact).expect("exactly MAX_HTML_CELLS must succeed");
+        assert_eq!(ok.rows.len(), 4000);
+        assert_eq!(ok.rows[0].len(), 50);
+        assert_eq!(ok.rows[3999].len(), 50);
+
+        // 2) 200,001 格（第 4001 行第 1 格 / 或跨行中途越界）必须明确报错，绝不静默截断
+        let mut over_one = String::with_capacity(exact.len() + 32);
+        over_one.push_str(&exact[..exact.len() - "</table>".len()]);
+        over_one.push_str("<tr><td>extra</td></tr></table>");
+        assert_eq!(
+            parse_html_checked(&over_one).unwrap_err(),
+            HtmlLimitKind::CellCount {
+                limit: MAX_HTML_CELLS
+            }
+        );
+        // parse_html 兼容入口也不得返回被静默截断的残表
+        assert!(parse_html(&over_one).is_empty());
+
+        // 3) 5000 行 x 50 列（250,000 格，报告复现用例）必须返回 CellCount 超限错误
+        let mut five_k = String::with_capacity(row50.len() * 5000 + 32);
+        five_k.push_str("<table>");
+        for _ in 0..5000 {
+            five_k.push_str(&row50);
+        }
+        five_k.push_str("</table>");
+        assert_eq!(
+            parse_html_checked(&five_k).unwrap_err(),
+            HtmlLimitKind::CellCount {
+                limit: MAX_HTML_CELLS
+            }
+        );
+
+        // 4) 超过 32 MiB 输入字节上限必须返回 InputBytes 超限错误
+        let mut oversized = String::with_capacity(MAX_HTML_INPUT_BYTES + 64);
+        oversized.push_str("<table><tr><td>");
+        oversized.push_str(&"a".repeat(MAX_HTML_INPUT_BYTES));
+        oversized.push_str("</td></tr></table>");
+        let actual_len = oversized.len();
+        assert_eq!(
+            parse_html_checked(&oversized).unwrap_err(),
+            HtmlLimitKind::InputBytes {
+                actual: actual_len,
+                limit: MAX_HTML_INPUT_BYTES
+            }
+        );
+        assert!(parse_html(&oversized).is_empty());
     }
 }

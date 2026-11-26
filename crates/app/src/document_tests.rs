@@ -1951,3 +1951,453 @@ fn edits_made_while_disconnected_survive_the_rejoin_snapshot_and_reach_the_host(
     b.leave_session();
     host.shutdown();
 }
+
+fn review_183_start_host(name: &str, pw: &str) -> (SheetApp, u16) {
+    let mut h = app();
+    h.my_name = name.into();
+    h.room_password = pw.into();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let net = crate::net::host_on(listener, 1, name.into(), h.wb.title(), pw.into()).unwrap();
+    let mut peer = sheetcore::sync::Peer::new(1);
+    peer.seed_workbook(&h.wb);
+    net.seed_snapshot(
+        &peer,
+        &h.wb,
+        sheetcore::sync::Cursor {
+            site: 1,
+            name: name.into(),
+            color: 1,
+            sheet: 0,
+            row: 0,
+            col: 0,
+            end_row: None,
+            end_col: None,
+        },
+    );
+    h.peer = Some(peer);
+    h.net = Some(net);
+    h.joined_doc = true;
+    (h, port)
+}
+
+fn review_183_join_guest(site: u32, name: &str, port: u16, pw: &str, host: &mut SheetApp) -> SheetApp {
+    let mut g = app();
+    g.my_name = name.into();
+    g.room_password = pw.into();
+    let addr = format!("127.0.0.1:{port}");
+    g.join_addr = addr.clone();
+    let net = crate::net::join_with_base(
+        site,
+        name.into(),
+        g.wb.title(),
+        &addr,
+        pw.into(),
+        String::new(),
+    )
+    .unwrap();
+    g.peer = Some(sheetcore::sync::Peer::new(site));
+    g.peers_list = vec![(site, name.into(), (site % 7) as u8)];
+    net.enable_fast_snapshot_handoff_with_styles(&g.wb.styles);
+    g.net = Some(net);
+    g.undo.set_site(site);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !g.joined_doc && Instant::now() < deadline {
+        host.poll_net();
+        g.poll_net();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(g.joined_doc, "guest {name}#{site} failed to join");
+    g
+}
+
+fn review_183_poll_until(
+    peers: &mut [&mut SheetApp],
+    timeout_ms: u64,
+    label: &str,
+    mut pred: impl FnMut(&[&mut SheetApp]) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        for p in peers.iter_mut() {
+            p.poll_net();
+        }
+        if pred(peers) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for p in peers.iter_mut() {
+        p.poll_net();
+    }
+    assert!(pred(peers), "timed out waiting for: {label}");
+}
+
+#[test]
+fn review_183_issue_01_rejoin_outbox_drops_acked_ops_and_shifts_offline_ops_across_structural() {
+    let _env = crate::test_env::TestEnv::new("review183-issue01-rejoin");
+    let (mut host, port) = review_183_start_host("Host", "pw183");
+    let mut guest = review_183_join_guest(2, "Guest", port, "pw183", &mut host);
+
+    // 1) 在线正常提交：访客写入 A4=(3,0)=100，并等待宿主确认提交（acked_op_ts 推进）
+    let acked_cell = Cell { value: Value::Number(100.0), formula: None };
+    let acked_op = guest.peer.as_mut().unwrap().local_set(0, 3, 0, &acked_cell);
+    guest.wb.sheet_mut(0).set(3, 0, acked_cell);
+    guest.net.as_ref().unwrap().broadcast_op(acked_op.clone());
+    review_183_poll_until(&mut [&mut host, &mut guest], 5000, "host commits & acks guest edit at (3,0)", |ps| {
+        ps[0].wb.sheet(0).value(3, 0) == Value::Number(100.0)
+            && ps[1].net.as_ref().unwrap().acked_op_ts() >= acked_op.ts
+    });
+
+    // 2) 访客闪断，宿主在断线期间执行插行（at=1, n=2），原 (3,0)=100 移至 (5,0)
+    guest.net.as_ref().unwrap().disconnect_socket_for_test();
+    review_183_poll_until(&mut [&mut host, &mut guest], 5000, "guest notices disconnect", |ps| {
+        ps[1].room_lost
+    });
+
+    let ins = sheetcore::structural::Structural::InsertRows { at: 1, n: 2 };
+    sheetcore::structural::apply_structural_wb(&mut host.wb, 0, &ins);
+    host.shift_collab_coordinates(0, &ins);
+    host.net.as_ref().unwrap().broadcast_structural(0, &ins).unwrap();
+    assert_eq!(host.wb.sheet(0).value(5, 0), Value::Number(100.0));
+    assert_eq!(host.wb.sheet(0).value(3, 0), Value::Empty);
+
+    // 3) 访客自动水位增量重连：已确认的旧 (3,0)=100 绝不能被错位重放回 (3,0)
+    review_183_poll_until(&mut [&mut host, &mut guest], 8000, "guest delta reconnects after insert", |ps| {
+        ps[1].joined_doc && !ps[1].room_lost && !ps[1].in_snapshot
+    });
+    // 再多轮询 150ms 确认没有滞后重放帧把 (3,0) 污染
+    for _ in 0..15 {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(guest.wb.sheet(0).value(5, 0), Value::Number(100.0), "访客 (5,0) 应保留平移后的 100");
+    assert_eq!(guest.wb.sheet(0).value(3, 0), Value::Empty, "已确认旧 op 绝不能被重放回旧坐标 (3,0)");
+    assert_eq!(host.wb.sheet(0).value(5, 0), Value::Number(100.0), "宿主 (5,0) 应保持 100");
+    assert_eq!(host.wb.sheet(0).value(3, 0), Value::Empty, "宿主 (3,0) 绝不能被访客旧 op 污染");
+
+    // 4) 删行防复活测试：访客在线写 (2,0)=200 并确认；宿主写 (3,0)=999；访客断线；宿主删第 2 行
+    let del_target = Cell { value: Value::Number(200.0), formula: None };
+    let op_del = guest.peer.as_mut().unwrap().local_set(0, 2, 0, &del_target);
+    guest.wb.sheet_mut(0).set(2, 0, del_target);
+    guest.net.as_ref().unwrap().broadcast_op(op_del.clone());
+    let below_cell = Cell { value: Value::Number(999.0), formula: None };
+    let op_below = host.peer.as_mut().unwrap().local_set(0, 3, 0, &below_cell);
+    host.wb.sheet_mut(0).set(3, 0, below_cell);
+    host.net.as_ref().unwrap().broadcast_op(op_below);
+    review_183_poll_until(&mut [&mut host, &mut guest], 5000, "both (2,0)=200 and (3,0)=999 synced", |ps| {
+        ps[0].wb.sheet(0).value(2, 0) == Value::Number(200.0)
+            && ps[1].wb.sheet(0).value(3, 0) == Value::Number(999.0)
+            && ps[1].net.as_ref().unwrap().acked_op_ts() >= op_del.ts
+    });
+
+    guest.net.as_ref().unwrap().disconnect_socket_for_test();
+    review_183_poll_until(&mut [&mut host, &mut guest], 5000, "guest disconnects before delete", |ps| {
+        ps[1].room_lost
+    });
+
+    // 同时测试真正的断线未确认编辑：
+    // - (1,0)=666 将被宿主删除（应丢弃，不得复活）
+    // - (4,0)=555 将随插行/删行平移
+    // - (6,0)= "=A5+1"（引用 (4,0)）将随结构改动同步平移并改写公式
+    let off_del = Cell { value: Value::Number(666.0), formula: None };
+    let _ = guest.peer.as_mut().unwrap().local_set(0, 1, 0, &off_del);
+    guest.wb.sheet_mut(0).set(1, 0, off_del);
+
+    let off_keep = Cell { value: Value::Number(555.0), formula: None };
+    let _ = guest.peer.as_mut().unwrap().local_set(0, 4, 0, &off_keep);
+    guest.wb.sheet_mut(0).set(4, 0, off_keep);
+
+    let off_formula = Cell { value: Value::Number(556.0), formula: Some("=A5+1".into()) };
+    let _ = guest.peer.as_mut().unwrap().local_set(0, 6, 0, &off_formula);
+    guest.wb.sheet_mut(0).set(6, 0, off_formula);
+
+    // 宿主删掉第 1 行和第 2 行（删除 (1,0)=666 和 (2,0)=200，原 (3,0)=999 上移至 (1,0)，原 (4,0) 上移至 (2,0)，原 (6,0) 上移至 (4,0)）
+    let del2 = sheetcore::structural::Structural::DeleteRows { at: 1, n: 2 };
+    sheetcore::structural::apply_structural_wb(&mut host.wb, 0, &del2);
+    host.shift_collab_coordinates(0, &del2);
+    host.net.as_ref().unwrap().broadcast_structural(0, &del2).unwrap();
+
+    // 访客重连并收敛
+    review_183_poll_until(&mut [&mut host, &mut guest], 8000, "guest reconnects & replays shifted offline edits", |ps| {
+        ps[1].joined_doc
+            && !ps[1].room_lost
+            && !ps[1].in_snapshot
+            && ps[0].wb.sheet(0).value(2, 0) == Value::Number(555.0)
+            && ps[0].wb.sheet(0).formula_of(4, 0) == Some("=A3+1")
+    });
+    assert_eq!(host.wb.sheet(0).value(1, 0), Value::Number(999.0), "被删行上的 200/666 绝不能复活覆盖上移的 999");
+    assert_eq!(guest.wb.sheet(0).value(1, 0), Value::Number(999.0), "访客 (1,0) 必须是上移的 999");
+    assert_eq!(guest.wb.sheet(0).value(2, 0), Value::Number(555.0), "访客离线编辑 (4,0) 应平移至 (2,0)");
+    assert_eq!(guest.wb.sheet(0).formula_of(4, 0), Some("=A3+1"), "访客离线公式应平移并改写引用为 =A3+1");
+    assert_eq!(host.wb.sheet(0).value(4, 0), Value::Number(556.0), "宿主应正确重算平移后的离线公式");
+    assert_eq!(host.wb.sheet(0).value(4, 0), guest.wb.sheet(0).value(4, 0));
+
+    guest.leave_session();
+    host.leave_session();
+}
+
+#[test]
+fn review_183_issue_04_axis_style_lease_preflight_and_inflight_rollback() {
+    let _env = crate::test_env::TestEnv::new("review183-issue04-axis-rollback");
+    let (mut host, port) = review_183_start_host("Host", "pw183");
+    let mut guest_a = review_183_join_guest(2, "GuestA", port, "pw183", &mut host);
+    let mut guest_b = review_183_join_guest(3, "GuestB", port, "pw183", &mut host);
+
+    // 先由 GuestA 给整列 C（col=2）设置底色为黄色并收敛到全员（作为后续回滚的权威旧样式）
+    guest_a.sel = (0, 2);
+    guest_a.sel_end = (1_048_575, 2);
+    assert!(guest_a.apply_style_xy(|st, _, _| st.fill = Some([255, 255, 0])));
+    review_183_poll_until(&mut [&mut host, &mut guest_a, &mut guest_b], 5000, "initial yellow col 2 axis style", |ps| {
+        let host_col = ps[0].wb.sheet(0).col_styles.get(&2).copied().unwrap_or(0);
+        let b_col = ps[2].wb.sheet(0).col_styles.get(&2).copied().unwrap_or(0);
+        host_col != 0
+            && ps[0].wb.styles.get(host_col).fill == Some([255, 255, 0])
+            && b_col != 0
+            && ps[2].wb.styles.get(b_col).fill == Some([255, 255, 0])
+    });
+
+    // GuestB 正常进入单元格 (5, 2) 的编辑状态并持有编辑租约（该格是默认样式格，不在 sh.styles 显式表中！）
+    guest_b.sel = (5, 2);
+    guest_b.sel_end = (5, 2);
+    guest_b.requested_lock = Some((0, 5, 2));
+    guest_b.pending_edit = Some(String::new());
+    guest_b.net.as_ref().unwrap().request_lock(0, 5, 2, "GuestB");
+    review_183_poll_until(&mut [&mut host, &mut guest_a, &mut guest_b], 5000, "GuestB holds lock on (5,2)", |ps| {
+        ps[1].locks.is_locked_by_other(0, 5, 2, 2) && ps[2].my_lock == Some((0, 5, 2)) && ps[2].editing.is_some()
+    });
+
+    // 1) 本地预检：GuestA 已知 GuestB 持锁 (5,2)，对整列 C 或整行 5 刷格式必须在本地直接拦截
+    guest_a.sel = (0, 2);
+    guest_a.sel_end = (1_048_575, 2);
+    assert!(
+        !guest_a.apply_style_xy(|st, _, _| st.fill = Some([0, 0, 255])),
+        "整列选区与已知编辑租约 (5,2) 冲突时，本地预检必须直接拒绝"
+    );
+    let col2_id = guest_a.wb.sheet(0).col_styles.get(&2).copied().unwrap_or(0);
+    assert_eq!(guest_a.wb.styles.get(col2_id).fill, Some([255, 255, 0]));
+
+    guest_a.sel = (5, 0);
+    guest_a.sel_end = (5, 16_383);
+    assert!(
+        !guest_a.apply_style_xy(|st, _, _| st.bold = true),
+        "整行选区与已知编辑租约 (5,2) 冲突时，本地预检必须直接拒绝"
+    );
+    assert_eq!(guest_a.wb.sheet(0).row_styles.get(&5).copied().unwrap_or(0), 0);
+
+    // 2) 在途竞态回滚：清空 GuestA 本地 locks 模拟 LockOk 尚未到达前的并发 AxisStyleOp
+    guest_a.locks = sheetcore::sync::LockTable::default();
+    guest_a.sel = (0, 2);
+    guest_a.sel_end = (1_048_575, 2);
+    assert!(guest_a.apply_style_xy(|st, _, _| st.fill = Some([0, 0, 255])));
+    // 乐观写入瞬间本地为蓝色
+    let optimistic_id = guest_a.wb.sheet(0).col_styles.get(&2).copied().unwrap_or(0);
+    assert_eq!(guest_a.wb.styles.get(optimistic_id).fill, Some([0, 0, 255]));
+    // 宿主驳回并返回权威 revert_axis_styles -> GuestA 必须真正回滚为黄色！
+    review_183_poll_until(&mut [&mut host, &mut guest_a, &mut guest_b], 5000, "GuestA col_styles rolls back to yellow", |ps| {
+        let id = ps[1].wb.sheet(0).col_styles.get(&2).copied().unwrap_or(0);
+        id != 0
+            && ps[1].wb.styles.get(id).fill == Some([255, 255, 0])
+            && ps[1].status.contains("驳回并回滚")
+    });
+    let host_col2 = host.wb.sheet(0).col_styles.get(&2).copied().unwrap_or(0);
+    assert_eq!(host.wb.styles.get(host_col2).fill, Some([255, 255, 0]));
+
+    // 同样测试原本无样式的整行 5 在途竞态回滚为 0（默认样式）
+    guest_a.locks = sheetcore::sync::LockTable::default();
+    guest_a.sel = (5, 0);
+    guest_a.sel_end = (5, 16_383);
+    assert!(guest_a.apply_style_xy(|st, _, _| st.bold = true));
+    assert_ne!(guest_a.wb.sheet(0).row_styles.get(&5).copied().unwrap_or(0), 0);
+    review_183_poll_until(&mut [&mut host, &mut guest_a, &mut guest_b], 5000, "GuestA row_styles rolls back to default", |ps| {
+        ps[1].wb.sheet(0).row_styles.get(&5).copied().unwrap_or(0) == 0
+    });
+    assert_eq!(host.wb.sheet(0).row_styles.get(&5).copied().unwrap_or(0), 0);
+
+    // 3) 宿主侧同样检查本地预检：宿主对包含 GuestB 持锁格 (5,2) 的整列 C 刷格式必须被拦截
+    host.sel = (0, 2);
+    host.sel_end = (1_048_575, 2);
+    assert!(
+        !host.apply_style_xy(|st, _, _| st.fill = Some([0, 255, 0])),
+        "宿主对他人持锁列刷轴样式必须在预检阶段直接拦截"
+    );
+    let host_col2_after = host.wb.sheet(0).col_styles.get(&2).copied().unwrap_or(0);
+    assert_eq!(host.wb.styles.get(host_col2_after).fill, Some([255, 255, 0]));
+
+    // 4) 宿主侧直接调用 broadcast_axis_styles 触发 WriteRejected 时也必须带回权威 revert_axis_styles 并回滚
+    let green_id = host.wb.styles.intern(sheetcore::style::CellStyle {
+        fill: Some([0, 255, 0]),
+        ..Default::default()
+    });
+    host.wb.sheet_mut(0).set_col_style(2, green_id);
+    host.net.as_ref().unwrap().broadcast_axis_styles(
+        0,
+        sheetcore::sync::AxisStylePatch {
+            rows: Vec::new(),
+            cols: vec![(2, Some(host.wb.styles.get(green_id).clone()))],
+        },
+    );
+    review_183_poll_until(&mut [&mut host, &mut guest_a, &mut guest_b], 5000, "Host broadcast_axis_styles rollback", |ps| {
+        let id = ps[0].wb.sheet(0).col_styles.get(&2).copied().unwrap_or(0);
+        id != 0 && ps[0].wb.styles.get(id).fill == Some([255, 255, 0])
+    });
+
+    guest_a.leave_session();
+    guest_b.leave_session();
+    host.leave_session();
+}
+
+#[test]
+fn review_183_issue_11_html_truncated_paste_aborts_without_mutating_sheet() {
+    let _env = crate::test_env::TestEnv::new("review183-issue11-html-limit");
+    let mut a = app();
+    let ctx = egui::Context::default();
+    a.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Text("keep".into()), formula: None });
+    a.sel = (0, 0);
+    a.sel_end = (0, 0);
+
+    a.paste_special_apply_rich(
+        &ctx,
+        None,
+        Some(crate::office_clipboard::RichClipboard::HtmlTruncated(
+            crate::office_clipboard::HtmlLimitKind::CellCount {
+                limit: crate::office_clipboard::MAX_HTML_CELLS,
+            },
+        )),
+    );
+    assert_eq!(a.wb.sheet(0).value(0, 0), Value::Text("keep".into()), "超限 HTML 粘贴不得改写任何单元格");
+    assert!(a.status.contains("中止粘贴"), "应明确提示已中止粘贴: {}", a.status);
+    assert!(
+        a.notice.as_ref().is_some_and(|n| n.level == NoticeLevel::Warn && n.tag == Some("clipboard_html_limit")),
+        "应弹出告警横幅提醒用户避免静默截断"
+    );
+
+    a.notice = None;
+    a.status.clear();
+    a.apply_wps_paste_variant_rich(
+        crate::wps_menus::PasteMode::All,
+        None,
+        Some(crate::office_clipboard::RichClipboard::HtmlTruncated(
+            crate::office_clipboard::HtmlLimitKind::InputBytes {
+                actual: crate::office_clipboard::MAX_HTML_INPUT_BYTES + 1024,
+                limit: crate::office_clipboard::MAX_HTML_INPUT_BYTES,
+            },
+        )),
+    );
+    assert_eq!(a.wb.sheet(0).value(0, 0), Value::Text("keep".into()));
+    assert!(a.status.contains("中止粘贴"), "字节超限时应提示已中止粘贴: {}", a.status);
+}
+
+#[test]
+fn review_183_issue_12_concurrent_comment_thread_replies_preserve_all_and_converge() {
+    let _env = crate::test_env::TestEnv::new("review183-issue12-concurrent-threads");
+    let (mut host, port) = review_183_start_host("Host", "pw183");
+    let mut guest_a = review_183_join_guest(2, "GuestA", port, "pw183", &mut host);
+    let mut guest_b = review_183_join_guest(3, "GuestB", port, "pw183", &mut host);
+
+    // 1) 宿主创建根批注线程并同步到两位访客
+    assert!(host.set_comment_cell(0, 1, 1, "初始问题", Some("Host"), true).unwrap());
+    let key = sheetcore::CellRef::new(1, 1);
+    review_183_poll_until(&mut [&mut host, &mut guest_a, &mut guest_b], 5000, "root thread synced to A and B", |ps| {
+        ps.iter().all(|p| p.wb.sheet(0).threads.get(&key).is_some_and(|tc| tc.entries.len() == 1))
+    });
+
+    // 2) GuestA 与 GuestB 在彼此消息到达前同时追加回复（真实并发竞态）
+    assert_eq!(guest_a.reply_comment_cell(0, 1, 1, "来自 A 的回复", Some("GuestA")).unwrap(), 2);
+    assert_eq!(guest_b.reply_comment_cell(0, 1, 1, "来自 B 的回复", Some("GuestB")).unwrap(), 2);
+
+    // 3) 轮询收敛后：宿主、GuestA、GuestB 三端必须全部保留 3 条发言且顺序与摘要完全一致！
+    review_183_poll_until(&mut [&mut host, &mut guest_a, &mut guest_b], 5000, "all 3 replicas converge with both replies", |ps| {
+        let Some(ht) = ps[0].wb.sheet(0).threads.get(&key) else { return false };
+        let Some(at) = ps[1].wb.sheet(0).threads.get(&key) else { return false };
+        let Some(bt) = ps[2].wb.sheet(0).threads.get(&key) else { return false };
+        ht.entries.len() == 3 && ht == at && ht == bt
+    });
+    let final_tc = host.wb.sheet(0).threads.get(&key).unwrap();
+    let texts: Vec<&str> = final_tc.entries.iter().map(|e| e.text.as_str()).collect();
+    assert!(texts.contains(&"初始问题"));
+    assert!(texts.contains(&"来自 A 的回复"));
+    assert!(texts.contains(&"来自 B 的回复"));
+    assert_eq!(host.wb.sheet(0).notes.get(&key), guest_a.wb.sheet(0).notes.get(&key));
+    assert_eq!(host.wb.sheet(0).notes.get(&key), guest_b.wb.sheet(0).notes.get(&key));
+
+    // 4) 并发回复 + 并发标记已解决也必须全部保留且三端完全收敛
+    assert_eq!(guest_a.reply_comment_cell(0, 1, 1, "A 补充结论", Some("GuestA")).unwrap(), 4);
+    assert!(guest_b.set_comment_resolved(0, 1, 1, true).unwrap());
+    review_183_poll_until(&mut [&mut host, &mut guest_a, &mut guest_b], 5000, "concurrent reply + resolve converge", |ps| {
+        let Some(ht) = ps[0].wb.sheet(0).threads.get(&key) else { return false };
+        let Some(at) = ps[1].wb.sheet(0).threads.get(&key) else { return false };
+        let Some(bt) = ps[2].wb.sheet(0).threads.get(&key) else { return false };
+        ht.entries.len() == 4 && ht.resolved && ht == at && ht == bt
+    });
+
+    guest_a.leave_session();
+    guest_b.leave_session();
+    host.leave_session();
+}
+
+#[test]
+fn review_183_issue_15_comment_thread_257th_entry_rejected_without_local_divergence() {
+    let _env = crate::test_env::TestEnv::new("review183-issue15-thread-cap");
+    let (mut host, port) = review_183_start_host("Host", "pw183");
+    let mut guest_a = review_183_join_guest(2, "GuestA", port, "pw183", &mut host);
+    let mut guest_b = review_183_join_guest(3, "GuestB", port, "pw183", &mut host);
+
+    let key = sheetcore::CellRef::new(0, 0);
+    // 构造 255 条发言的线程并同步至全员
+    let mut entries = Vec::with_capacity(255);
+    for i in 0..255 {
+        entries.push(sheetcore::notes::ThreadEntry {
+            id: sheetcore::notes::new_ooxml_guid(),
+            author: "Host".into(),
+            timestamp: "2026-11-26T00:00:00Z".into(),
+            text: format!("entry-{i}"),
+        });
+    }
+    let tc255 = sheetcore::notes::ThreadedComment {
+        r: 0,
+        c: 0,
+        resolved: false,
+        entries,
+    };
+    host.wb.sheet_mut(0).threads.insert(key, tc255.clone());
+    host.wb.sheet_mut(0).notes.insert(
+        key,
+        sheetcore::notes::Note {
+            r: 0,
+            c: 0,
+            text: tc255.summary_text(),
+            author: tc255.root_author().to_string(),
+        },
+    );
+    assert!(host.broadcast_thread_meta(0, 0, 0, Some(&tc255)));
+    review_183_poll_until(&mut [&mut host, &mut guest_a, &mut guest_b], 5000, "255-entry thread synced", |ps| {
+        ps.iter().all(|p| p.wb.sheet(0).threads.get(&key).is_some_and(|t| t.entries.len() == 255))
+    });
+
+    // 1) 并发到达上限边界：A 和 B 同时发送第 256 条回复 -> 宿主接收 1 条、拒掉第 257 条并全员收敛回相同的 256 条
+    assert_eq!(guest_a.reply_comment_cell(0, 0, 0, "race-A", Some("GuestA")).unwrap(), 256);
+    assert_eq!(guest_b.reply_comment_cell(0, 0, 0, "race-B", Some("GuestB")).unwrap(), 256);
+    review_183_poll_until(&mut [&mut host, &mut guest_a, &mut guest_b], 5000, "256-entry cap converges identically", |ps| {
+        let Some(ht) = ps[0].wb.sheet(0).threads.get(&key) else { return false };
+        let Some(at) = ps[1].wb.sheet(0).threads.get(&key) else { return false };
+        let Some(bt) = ps[2].wb.sheet(0).threads.get(&key) else { return false };
+        ht.entries.len() == 256 && ht == at && ht == bt
+    });
+
+    // 2) 已达 256 条上限时再添加第 257 条：本地必须直接返回 Err 且不改写本地线程/批注/撤销栈
+    let before_thread = guest_a.wb.sheet(0).threads.get(&key).cloned();
+    let before_note = guest_a.wb.sheet(0).notes.get(&key).cloned();
+    let err = guest_a
+        .reply_comment_cell(0, 0, 0, "overflow-257", Some("GuestA"))
+        .expect_err("257th reply must fail instead of silently diverging");
+    assert!(err.contains("256"), "错误提示应说明 256 条上限: {err}");
+    assert_eq!(guest_a.wb.sheet(0).threads.get(&key), before_thread.as_ref());
+    assert_eq!(guest_a.wb.sheet(0).notes.get(&key), before_note.as_ref());
+    assert_eq!(host.wb.sheet(0).threads.get(&key), before_thread.as_ref());
+
+    guest_a.leave_session();
+    guest_b.leave_session();
+    host.leave_session();
+}

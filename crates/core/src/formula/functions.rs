@@ -261,9 +261,6 @@ pub(super) fn networkdays_core(
     mask: &[bool; 7],
     holidays: &[i64],
 ) -> Result<f64, ErrKind> {
-    if mask.iter().all(|&w| w) {
-        return Err(ErrKind::Value);
-    }
     let a = checked_date_serial(sys, start_f)?;
     let b = checked_date_serial(sys, end_f)?;
     let date_off = if sys.is_1904() { 1462 } else { 0 };
@@ -294,7 +291,7 @@ pub(super) fn networkdays_core(
             }
         }
     }
-    Ok(sign * count as f64)
+    Ok(if count == 0 { 0.0 } else { sign * count as f64 })
 }
 
 /// O(1 + H log H) 计算从 `start` 增减 `days` 个工作日后的日期序列号。
@@ -1837,11 +1834,37 @@ pub(super) fn call_by_id_in(
         FuncId::Sum => r(|| {
             let mut s = 0.0;
             for a in args {
-                for v in a.slice() {
-                    match v {
-                        FValue::Number(n) => s += n,
+                match a {
+                    Arg::Val(FValue::Array(arr)) => {
+                        for v in arr.data.iter() {
+                            match v {
+                                FValue::Number(n) => s += n,
+                                FValue::Error(e) => return Err(*e),
+                                _ => {}
+                            }
+                        }
+                    }
+                    Arg::Val(v) => match v {
+                        FValue::Number(n) => s += *n,
+                        FValue::Bool(b) => {
+                            if *b {
+                                s += 1.0;
+                            }
+                        }
+                        FValue::Text(_) => s += v.to_number()?,
                         FValue::Error(e) => return Err(*e),
-                        _ => {}
+                        FValue::Empty => {}
+                        FValue::Lambda(_) => return Err(ErrKind::Value),
+                        FValue::Array(_) => unreachable!(),
+                    },
+                    Arg::Range { values, .. } => {
+                        for v in values.iter() {
+                            match v {
+                                FValue::Number(n) => s += n,
+                                FValue::Error(e) => return Err(*e),
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -1856,7 +1879,10 @@ pub(super) fn call_by_id_in(
             }
         }),
         FuncId::Abs => r(|| Ok(FValue::number(num(args, 0)?.abs()))),
-        FuncId::Sign => r(|| Ok(FValue::number(num(args, 0)?.signum()))),
+        FuncId::Sign => r(|| {
+            let n = num(args, 0)?;
+            Ok(FValue::number(if n == 0.0 { 0.0 } else { n.signum() }))
+        }),
         FuncId::Int => r(|| Ok(FValue::number(num(args, 0)?.floor()))),
         FuncId::Trunc => r(|| {
             let n = num(args, 0)?;
@@ -1956,7 +1982,14 @@ pub(super) fn call_by_id_in(
         FuncId::Asin => r(|| Ok(FValue::number(num(args, 0)?.asin()))),
         FuncId::Acos => r(|| Ok(FValue::number(num(args, 0)?.acos()))),
         FuncId::Atan => r(|| Ok(FValue::number(num(args, 0)?.atan()))),
-        FuncId::Atan2 => r(|| Ok(FValue::number(num(args, 0)?.atan2(num(args, 1)?)))),
+        FuncId::Atan2 => r(|| {
+            let x = num(args, 0)?;
+            let y = num(args, 1)?;
+            if x == 0.0 && y == 0.0 {
+                return Err(ErrKind::Div0);
+            }
+            Ok(FValue::number(y.atan2(x)))
+        }),
         FuncId::Sinh => r(|| Ok(FValue::number(num(args, 0)?.sinh()))),
         FuncId::Cosh => r(|| Ok(FValue::number(num(args, 0)?.cosh()))),
         FuncId::Tanh => r(|| Ok(FValue::number(num(args, 0)?.tanh()))),
@@ -2191,19 +2224,84 @@ pub(super) fn call_by_id_in(
             Ok(FValue::number(s / n as f64))
         }),
         FuncId::AverageA => r(|| {
-            let vals = flatten_values(args, 0);
-            if vals.is_empty() {
+            let mut s = 0.0;
+            let mut count = 0usize;
+            for a in args {
+                match a {
+                    Arg::Range { values, .. } => {
+                        for v in values.iter() {
+                            match v {
+                                FValue::Error(e) => return Err(*e),
+                                FValue::Empty => {}
+                                FValue::Number(n) => {
+                                    s += *n;
+                                    count += 1;
+                                }
+                                FValue::Bool(b) => {
+                                    if *b {
+                                        s += 1.0;
+                                    }
+                                    count += 1;
+                                }
+                                FValue::Text(_) => {
+                                    count += 1;
+                                }
+                                FValue::Lambda(_) => return Err(ErrKind::Value),
+                                FValue::Array(_) => {}
+                            }
+                        }
+                    }
+                    Arg::Val(FValue::Array(arr)) => {
+                        for v in arr.data.iter() {
+                            match v {
+                                FValue::Error(e) => return Err(*e),
+                                FValue::Empty => {}
+                                FValue::Number(n) => {
+                                    s += *n;
+                                    count += 1;
+                                }
+                                FValue::Bool(b) => {
+                                    if *b {
+                                        s += 1.0;
+                                    }
+                                    count += 1;
+                                }
+                                FValue::Text(_) => {
+                                    count += 1;
+                                }
+                                FValue::Lambda(_) => return Err(ErrKind::Value),
+                                FValue::Array(_) => {}
+                            }
+                        }
+                    }
+                    Arg::Val(v) => match v {
+                        FValue::Error(e) => return Err(*e),
+                        FValue::Empty => {
+                            count += 1;
+                        }
+                        FValue::Number(n) => {
+                            s += *n;
+                            count += 1;
+                        }
+                        FValue::Bool(b) => {
+                            if *b {
+                                s += 1.0;
+                            }
+                            count += 1;
+                        }
+                        FValue::Text(_) => {
+                            s += v.to_number()?;
+                            count += 1;
+                        }
+                        FValue::Lambda(_) => return Err(ErrKind::Value),
+                        FValue::Array(_) => unreachable!(),
+                    },
+                }
+            }
+            if count == 0 {
                 return Err(ErrKind::Div0);
             }
-            let mut s = 0.0;
-            for v in &vals {
-                s += match v {
-                    FValue::Text(_) => 0.0,
-                    FValue::Bool(b) => if *b { 1.0 } else { 0.0 },
-                    _ => v.to_number().unwrap_or(0.0),
-                };
-            }
-            Ok(FValue::number(s / vals.len() as f64))
+            Ok(FValue::number(s / count as f64))
         }),
         FuncId::Count => r(|| {
             let mut n = 0usize;
@@ -2329,17 +2427,53 @@ pub(super) fn call_by_id_in(
             Ok(FValue::number(if any { m } else { 0.0 }))
         }),
         FuncId::MaxA | FuncId::MinA => r(|| {
-            let vals = flatten_values(args, 0);
-            let mut best = if name == "MAXA" { f64::NEG_INFINITY } else { f64::INFINITY };
-            for v in vals {
-                let x = match &v {
-                    FValue::Bool(b) => if *b { 1.0 } else { 0.0 },
-                    FValue::Text(_) => 0.0,
-                    other => other.to_number().unwrap_or(0.0),
-                };
-                best = if name == "MAXA" { best.max(x) } else { best.min(x) };
+            let is_max = id == FuncId::MaxA;
+            let mut best = if is_max { f64::NEG_INFINITY } else { f64::INFINITY };
+            let mut any = false;
+            let mut push = |x: f64| {
+                any = true;
+                best = if is_max { best.max(x) } else { best.min(x) };
+            };
+            for a in args {
+                match a {
+                    Arg::Range { values, .. } => {
+                        for v in values.iter() {
+                            match v {
+                                FValue::Error(e) => return Err(*e),
+                                FValue::Empty => {}
+                                FValue::Number(n) => push(*n),
+                                FValue::Bool(b) => push(if *b { 1.0 } else { 0.0 }),
+                                FValue::Text(_) => push(0.0),
+                                FValue::Lambda(_) => return Err(ErrKind::Value),
+                                FValue::Array(_) => {}
+                            }
+                        }
+                    }
+                    Arg::Val(FValue::Array(arr)) => {
+                        for v in arr.data.iter() {
+                            match v {
+                                FValue::Error(e) => return Err(*e),
+                                FValue::Empty => {}
+                                FValue::Number(n) => push(*n),
+                                FValue::Bool(b) => push(if *b { 1.0 } else { 0.0 }),
+                                FValue::Text(_) => push(0.0),
+                                FValue::Lambda(_) => return Err(ErrKind::Value),
+                                FValue::Array(_) => {}
+                            }
+                        }
+                    }
+                    Arg::Val(v) => match v {
+                        FValue::Error(e) => return Err(*e),
+                        FValue::Empty => push(0.0),
+                        FValue::Number(n) => push(*n),
+                        FValue::Bool(b) => push(if *b { 1.0 } else { 0.0 }),
+                        FValue::Text(_) => push(v.to_number()?),
+                        FValue::Lambda(_) => return Err(ErrKind::Value),
+                        FValue::Array(_) => unreachable!(),
+                    },
+                }
             }
-            Ok(FValue::number(if best.is_infinite() { 0.0 } else { best }))
+            Ok(FValue::number(if any { best } else { 0.0 }))
         }),
         FuncId::Median => r(|| {
             let mut v = numbers(args, 0)?;

@@ -31,7 +31,7 @@ use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-pub const AUDIT_FORMAT_VERSION: u16 = 1;
+pub const AUDIT_FORMAT_VERSION: u16 = 2;
 pub const AUDIT_XML_NS: &str = "urn:cellan:audit:v1";
 pub const AUDIT_CUSTOM_XML_PART: &str = "customXml/cellanAudit.xml";
 pub const AUDIT_CUSTOM_XML_PROPS_PART: &str = "customXml/cellanAuditProps.xml";
@@ -603,7 +603,7 @@ impl AuditSnap {
         match self {
             Self::Empty => "(空)".into(),
             Self::Num(n) => crate::model::format_number(*n),
-            Self::Text(s) => s.clone(),
+            Self::Text(s) => format_snap_text_summary(s),
             Self::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
             Self::Err(e) => e.clone(),
             Self::Formula(f) => f.clone(),
@@ -997,6 +997,7 @@ pub enum AuditIssueKind {
     IdentityKeyChanged,
     HistoricalExternalGap,
     UnattestedCollabEdits,
+    LegacyStateHashFormat,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1070,7 +1071,85 @@ pub fn canonical_defined_name_formula(f: &str) -> &str {
 ///
 /// 覆盖：日期体系、工作簿保护、自定义名称（不含内部 `_sc_*`）、工作表顺序/名称/可见性/保护/合并区、
 /// 所有非空单元格（含公式文本或值，不含易变的公式缓存计算结果与 UI/样式表内部索引）。
-pub fn workbook_state_hash(wb: &Workbook) -> String {
+/// 无损写入单个单元格的规范化审计字节（长文本直接哈希完整正文，绝不截断；
+/// `<= MAX_SNAP_TEXT_LEN` 的短文本与旧版 v1 字节流保持完全一致）。
+fn write_cell_view_canonical(v: CellView<'_>, h: &mut Sha256) -> bool {
+    if let Some(f) = v.formula() {
+        let norm = normalize_formula_for_audit(f);
+        h.update(b"F:");
+        h.update((norm.len() as u32).to_le_bytes());
+        h.update(norm.as_bytes());
+        h.update(b";");
+        return true;
+    }
+    match v.value().as_ref() {
+        Value::Empty => false,
+        Value::Number(n) => {
+            let norm = if *n == 0.0 { 0.0 } else { *n };
+            h.update(b"N:");
+            h.update(canonical_f64_bits(norm).to_le_bytes());
+            h.update(b";");
+            true
+        }
+        Value::Bool(b) => {
+            h.update(if *b { b"B:1;" } else { b"B:0;" });
+            true
+        }
+        Value::Error(e) => {
+            let txt = e.text();
+            h.update(b"X:");
+            h.update((txt.len() as u32).to_le_bytes());
+            h.update(txt.as_bytes());
+            h.update(b";");
+            true
+        }
+        Value::Text(s) => {
+            let norm = normalize_text_for_audit(s);
+            if norm.is_empty() {
+                return false;
+            }
+            if norm.len() <= MAX_SNAP_TEXT_LEN {
+                h.update(b"S:");
+                h.update((norm.len() as u32).to_le_bytes());
+                h.update(norm.as_bytes());
+                h.update(b";");
+            } else {
+                h.update(b"L:");
+                h.update((norm.len() as u64).to_le_bytes());
+                h.update(norm.as_bytes());
+                h.update(b";");
+            }
+            true
+        }
+    }
+}
+
+/// 精确比较两个单元格视图在完整规范化语义下是否等价（不经由有损截断快照，确保长文本改动必被识别）。
+fn cells_audit_equal(a: CellView<'_>, b: CellView<'_>) -> bool {
+    match (a.formula(), b.formula()) {
+        (Some(fa), Some(fb)) => normalize_formula_for_audit(fa) == normalize_formula_for_audit(fb),
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => match (a.value().as_ref(), b.value().as_ref()) {
+            (Value::Empty, Value::Empty) => true,
+            (Value::Number(na), Value::Number(nb)) => {
+                let na = if *na == 0.0 { 0.0 } else { *na };
+                let nb = if *nb == 0.0 { 0.0 } else { *nb };
+                canonical_f64_bits(na) == canonical_f64_bits(nb)
+            }
+            (Value::Bool(ba), Value::Bool(bb)) => ba == bb,
+            (Value::Error(ea), Value::Error(eb)) => ea.text() == eb.text(),
+            (Value::Text(sa), Value::Text(sb)) => {
+                normalize_text_for_audit(sa) == normalize_text_for_audit(sb)
+            }
+            (Value::Text(s), Value::Empty) | (Value::Empty, Value::Text(s)) => {
+                normalize_text_for_audit(s).is_empty()
+            }
+            _ => false,
+        },
+    }
+}
+
+fn workbook_state_hash_inner(wb: &Workbook, legacy_v1_lossy: bool) -> String {
     let mut h = Sha256::new();
     h.update(b"CELLAN-WB-STATE-V1\n");
     h.update(if wb.date_system.is_1904() { b"D1904" } else { b"D1900" });
@@ -1134,19 +1213,76 @@ pub fn workbook_state_hash(wb: &Workbook) -> String {
         // 单元格（iter_views 严格按 (row, col) 升序）
         let mut cell_count = 0u64;
         for (cref, view) in sheet.iter_views() {
-            let snap = AuditSnap::from_cell_view(Some(view));
-            if matches!(snap, AuditSnap::Empty) {
-                continue;
+            if legacy_v1_lossy {
+                let snap = audit_snap_from_cell_view_v1_legacy(view);
+                if matches!(snap, AuditSnap::Empty) {
+                    continue;
+                }
+                cell_count += 1;
+                h.update(cref.row.to_le_bytes());
+                h.update(cref.col.to_le_bytes());
+                snap.write_canonical(&mut h);
+            } else {
+                // 先跳过逻辑空格（避免提前写入坐标）
+                if view.formula().is_none()
+                    && match view.value().as_ref() {
+                        Value::Empty => true,
+                        Value::Text(s) => normalize_text_for_audit(s).is_empty(),
+                        _ => false,
+                    }
+                {
+                    continue;
+                }
+                cell_count += 1;
+                h.update(cref.row.to_le_bytes());
+                h.update(cref.col.to_le_bytes());
+                let wrote = write_cell_view_canonical(view, &mut h);
+                debug_assert!(wrote);
             }
-            cell_count += 1;
-            h.update(cref.row.to_le_bytes());
-            h.update(cref.col.to_le_bytes());
-            snap.write_canonical(&mut h);
         }
         h.update(cell_count.to_le_bytes());
     }
 
     hex_encode(&h.finalize())
+}
+
+fn audit_snap_from_cell_view_v1_legacy(v: CellView<'_>) -> AuditSnap {
+    if let Some(f) = v.formula() {
+        return AuditSnap::Formula(normalize_formula_for_audit(f));
+    }
+    match v.value().as_ref() {
+        Value::Empty => AuditSnap::Empty,
+        Value::Number(n) => AuditSnap::Num(if *n == 0.0 { 0.0 } else { *n }),
+        Value::Bool(b) => AuditSnap::Bool(*b),
+        Value::Error(e) => AuditSnap::Err(e.text().to_string()),
+        Value::Text(s) => {
+            let norm = normalize_text_for_audit(s);
+            if norm.is_empty() {
+                AuditSnap::Empty
+            } else if norm.len() <= MAX_SNAP_TEXT_LEN {
+                AuditSnap::Text(norm)
+            } else {
+                let mut end = MAX_SNAP_TEXT_LEN;
+                while end > 0 && !norm.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let d = Sha256::digest(norm.as_bytes());
+                AuditSnap::Text(format!(
+                    "{}…[len={},sha={:02x}{:02x}{:02x}{:02x}]",
+                    &norm[..end],
+                    norm.len(),
+                    d[0],
+                    d[1],
+                    d[2],
+                    d[3]
+                ))
+            }
+        }
+    }
+}
+
+pub fn workbook_state_hash(wb: &Workbook) -> String {
+    workbook_state_hash_inner(wb, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,9 +1585,9 @@ pub fn compute_net_diff_full(
                     (Some((rb, _)), Some((rc, _))) if rb == rc => {
                         let (cref, vb) = it_b.next().unwrap();
                         let (_, vc) = it_c.next().unwrap();
-                        let sb = AuditSnap::from_cell_view(Some(vb));
-                        let sc = AuditSnap::from_cell_view(Some(vc));
-                        if sb != sc {
+                        if !cells_audit_equal(vb, vc) {
+                            let sb = AuditSnap::from_cell_view(Some(vb));
+                            let sc = AuditSnap::from_cell_view(Some(vc));
                             let author = cell_attributions
                                 .get(&(csh.identity, cref.row, cref.col))
                                 .unwrap_or(default_author)
@@ -1903,6 +2039,7 @@ impl AuditLog {
     ) -> Result<&AuditCommit> {
         let prev_hash = self.head_hash().to_string();
         let seq = self.head_seq().saturating_add(1);
+        self.version = AUDIT_FORMAT_VERSION;
         let committer_idx = self.intern_author(committer.clone());
 
         // 1. 刷新存活工作表持久槽位映射（重命名继承旧槽位，新建同名表分配全新槽位）
@@ -2518,20 +2655,36 @@ impl AuditLog {
         // 3. 核对当前工作簿正文状态哈希与最新提交是否一致（抓出 Excel/WPS 静默改数！）
         if let Some(expected_st) = self.head_state_hash() {
             if expected_st != current_state_hash {
-                let last_who = self
-                    .head()
-                    .and_then(|c| self.author_of(c.committer_idx))
-                    .map(|a| a.short_label())
-                    .unwrap_or_else(|| "未知".into());
-                res.push_issue(AuditIssue {
-                    severity: AuditSeverity::Tampered,
-                    kind: AuditIssueKind::ExternalModification,
-                    seq: Some(self.head_seq()),
-                    message: format!(
-                        "检测到绕过审计的外部修改：当前表格数据与最新合规提交 #{}（{last_who}）不一致（可能曾用 Excel/WPS 修改或被直接篡改）",
-                        self.head_seq()
-                    ),
-                });
+                let legacy_match = self.version < AUDIT_FORMAT_VERSION
+                    && expected_st == workbook_state_hash_inner(wb, true);
+                if legacy_match {
+                    res.push_issue(AuditIssue {
+                        severity: AuditSeverity::Warning,
+                        kind: AuditIssueKind::LegacyStateHashFormat,
+                        seq: Some(self.head_seq()),
+                        message: format!(
+                            "提交 #{} 使用旧版 v{} 有损长文本状态哈希，建议重新保存以升级至 v{} 完整正文校验",
+                            self.head_seq(),
+                            self.version,
+                            AUDIT_FORMAT_VERSION
+                        ),
+                    });
+                } else {
+                    let last_who = self
+                        .head()
+                        .and_then(|c| self.author_of(c.committer_idx))
+                        .map(|a| a.short_label())
+                        .unwrap_or_else(|| "未知".into());
+                    res.push_issue(AuditIssue {
+                        severity: AuditSeverity::Tampered,
+                        kind: AuditIssueKind::ExternalModification,
+                        seq: Some(self.head_seq()),
+                        message: format!(
+                            "检测到绕过审计的外部修改：当前表格数据与最新合规提交 #{}（{last_who}）不一致（可能曾用 Excel/WPS 修改或被直接篡改）",
+                            self.head_seq()
+                        ),
+                    });
+                }
             }
         }
 
@@ -3201,7 +3354,18 @@ fn truncate_snap_text(s: &str) -> String {
         end -= 1;
     }
     let d = Sha256::digest(s.as_bytes());
-    format!("{}…[len={},sha={:02x}{:02x}{:02x}{:02x}]", &s[..end], s.len(), d[0], d[1], d[2], d[3])
+    format!("{}…[len={},sha256={}]", &s[..end], s.len(), hex_encode(&d))
+}
+
+/// 界面展示用摘要：对完整 256-bit `sha256=` 后缀折叠为 8 位短摘要，底层 `AuditSnap` 仍保持完整抗碰撞身份。
+fn format_snap_text_summary(s: &str) -> String {
+    if let Some(idx) = s.rfind(",sha256=") {
+        let rest = &s[idx + ",sha256=".len()..];
+        if rest.len() == 65 && rest.ends_with(']') && rest[..64].bytes().all(|b| b.is_ascii_hexdigit()) {
+            return format!("{},sha={}]", &s[..idx], &rest[..8]);
+        }
+    }
+    s.to_string()
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {

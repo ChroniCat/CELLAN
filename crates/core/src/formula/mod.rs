@@ -5500,14 +5500,34 @@ impl<'a> Calc<'a> {
                         min_v = min_v.min(n);
                         max_v = max_v.max(n);
                     }
-                    FValue::Bool(_) => {
+                    FValue::Bool(b) => {
                         non_empty += 1;
                         if id == FuncId::Count {
                             num_count += 1;
+                        } else if id == FuncId::Sum {
+                            let n = if b { 1.0 } else { 0.0 };
+                            num_count += 1;
+                            sum += n;
+                            min_v = min_v.min(n);
+                            max_v = max_v.max(n);
                         }
                     }
                     FValue::Text(_) => {
                         non_empty += 1;
+                        if id == FuncId::Sum {
+                            match v.to_number() {
+                                Ok(n) => {
+                                    num_count += 1;
+                                    sum += n;
+                                    min_v = min_v.min(n);
+                                    max_v = max_v.max(n);
+                                }
+                                Err(e) => {
+                                    self.range_reads += reads;
+                                    return Some(FValue::Error(e));
+                                }
+                            }
+                        }
                     }
                     FValue::Error(e) => {
                         if id == FuncId::CountA {
@@ -7188,6 +7208,18 @@ impl<'a> Calc<'a> {
                 FuncId::Aggregate if i > 1 && matches!(args[1].first().to_number(), Ok(5.0 | 6.0)) => Some(true),
                 _ => None,
             };
+            let preserve_cell_ref = visibility.is_some()
+                || matches!(
+                    id,
+                    FuncId::Sum
+                        | FuncId::Average
+                        | FuncId::AverageA
+                        | FuncId::Max
+                        | FuncId::MaxA
+                        | FuncId::Min
+                        | FuncId::MinA
+                        | FuncId::Count
+                );
             let refs = match n {
                 Node::Range(a, b) => Some((a, b)),
                 Node::Ref(a) if visibility.is_some() => Some((a, a)),
@@ -7203,6 +7235,18 @@ impl<'a> Calc<'a> {
                             match self.range_values(a, b, si) {
                                 Ok(arg) => args.push(arg),
                                 Err(e) => args.push(Arg::Val(FValue::Error(e))),
+                            }
+                        }
+                        Node::Ref(_) if preserve_cell_ref => {
+                            let v = self.eval_node(part, si);
+                            if matches!(v, FValue::Array(_)) {
+                                args.push(Arg::Val(v));
+                            } else {
+                                args.push(Arg::Range {
+                                    values: std::sync::Arc::new(vec![v]),
+                                    rows: 1,
+                                    cols: 1,
+                                });
                             }
                         }
                         _ => args.push(Arg::Val(self.eval_node(part, si))),
@@ -7226,6 +7270,21 @@ impl<'a> Calc<'a> {
                         args.push(arg);
                     }
                     Err(error) => args.push(Arg::Val(FValue::Error(error))),
+                }
+            } else if preserve_cell_ref
+                && (matches!(n, Node::Ref(_) | Node::Spill(_))
+                    || (matches!(n, Node::Name(_) | Node::ScopedName { .. })
+                        && self.resolve_range_node(n, si).is_some()))
+            {
+                let v = self.eval_node(n, si);
+                if matches!(v, FValue::Array(_)) {
+                    args.push(Arg::Val(v));
+                } else {
+                    args.push(Arg::Range {
+                        values: std::sync::Arc::new(vec![v]),
+                        rows: 1,
+                        cols: 1,
+                    });
                 }
             } else {
                 args.push(Arg::Val(self.eval_node(n, si)));

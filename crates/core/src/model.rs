@@ -2090,6 +2090,43 @@ impl DateSystem {
     }
 }
 
+/// 独立于用户保存目标 `Workbook::path` 的 OOXML 保真基准包来源（例如崩溃恢复副本）。
+///
+/// 通过 `Arc` 在主线程工作簿与后台保存/自动恢复快照之间共享；当最后一个引用释放且
+/// `owned_temp` 为真时，自动清理其占用的私有临时副本与宿主临时目录。
+#[derive(Debug)]
+pub struct BasePackage {
+    pub path: PathBuf,
+    owned_temp: bool,
+}
+
+impl BasePackage {
+    pub fn retained_temp(path: PathBuf) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { path, owned_temp: true })
+    }
+
+    pub fn borrowed(path: PathBuf) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { path, owned_temp: false })
+    }
+}
+
+impl Drop for BasePackage {
+    fn drop(&mut self) {
+        if self.owned_temp {
+            let _ = std::fs::remove_file(&self.path);
+            if let Some(parent) = self.path.parent() {
+                if parent
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.starts_with("cellan-workbook-"))
+                {
+                    let _ = std::fs::remove_dir_all(parent);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Workbook {
     /// 打开时有关键部件没读全（C14）。这类簿子不能用原文件当保存基准，
@@ -2135,6 +2172,8 @@ pub struct Workbook {
     pub styles: crate::style::StyleTable,
     pub sheets: Vec<Sheet>,
     pub path: Option<PathBuf>,
+    /// 独立于 `path` 的只读 OOXML 保真基准包（如文档恢复打开为未保存副本时保留原 VBA/图表/部件来源）
+    pub base_package: Option<std::sync::Arc<BasePackage>>,
     /// 原文件有打开密码时：解密到临时文件的路径（保存时当基准）
     pub decrypted: Option<PathBuf>,
     /// 日期体系（workbookPr/@date1904）
@@ -2187,6 +2226,7 @@ impl Workbook {
             pivots_removed_parts: Vec::new(),
             sheets: vec![Sheet::new("Sheet1")],
             path: None,
+            base_package: None,
             decrypted: None,
             encryption: None,
             source_encryption: None,
