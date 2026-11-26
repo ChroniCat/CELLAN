@@ -328,6 +328,10 @@ impl StyleTable {
             }
         }
         let inner = std::sync::Arc::make_mut(&mut self.0);
+        // 保留 u16::MAX (65535) 作为流式加载器 AtomicU16 未初始化哨兵，避免 id 回绕污染索引
+        if inner.styles.len() >= u16::MAX as usize {
+            return inner.styles.len().saturating_sub(1).min((u16::MAX - 1) as usize) as u16;
+        }
         let id = inner.styles.len() as u16;
         inner.styles.push(s);
         inner.themes.push(crate::style_theme::XfTheme::default());
@@ -361,6 +365,9 @@ impl StyleTable {
             }
         }
         let inner = std::sync::Arc::make_mut(&mut self.0);
+        if inner.styles.len() >= u16::MAX as usize {
+            return inner.styles.len().saturating_sub(1).min((u16::MAX - 1) as usize) as u16;
+        }
         let id = inner.styles.len() as u16;
         inner.styles.push(s);
         inner.themes.push(theme);
@@ -457,6 +464,9 @@ impl StyleTable {
                 }
             }
             let inner = std::sync::Arc::make_mut(&mut self.0);
+            if inner.styles.len() >= u16::MAX as usize {
+                return inner.styles.len().saturating_sub(1).min((u16::MAX - 1) as usize) as u16;
+            }
             let id = inner.styles.len() as u16;
             inner.styles.push(s);
             inner.themes.push(crate::style_theme::XfTheme::default());
@@ -476,6 +486,9 @@ impl StyleTable {
             }
         }
         let inner = std::sync::Arc::make_mut(&mut self.0);
+        if inner.styles.len() >= u16::MAX as usize {
+            return inner.styles.len().saturating_sub(1).min((u16::MAX - 1) as usize) as u16;
+        }
         let id = inner.styles.len() as u16;
         inner.styles.push(s);
         inner.themes.push(crate::style_theme::XfTheme::default());

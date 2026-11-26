@@ -1460,6 +1460,194 @@ pub fn load_link_snapshot_filtered(
     Ok((sheets, vals, dnames))
 }
 
+/// 判断外部链接路径是否包含 UNC / 远程 URL（未经用户显式信任前不得静默探测，防 NTLM 凭据泄露与 SSRF）
+pub fn is_network_or_remote_target(raw: &str) -> bool {
+    let t = raw.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with(r"\\") || t.starts_with("//") {
+        return true;
+    }
+    let low = t.to_ascii_lowercase();
+    low.starts_with("http://")
+        || low.starts_with("https://")
+        || low.starts_with("ftp://")
+        || low.starts_with("dav://")
+        || low.starts_with("file:////")
+        || low.starts_with(r"file:\\\\")
+        || (low.starts_with("file://") && !low.starts_with("file:///"))
+}
+
+fn has_external_path_syntax(raw: &str) -> bool {
+    let t = raw.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if is_network_or_remote_target(t) {
+        return true;
+    }
+    let low = t.to_ascii_lowercase();
+    if low.starts_with("file:") {
+        return true;
+    }
+    let p = Path::new(t);
+    if p.is_absolute() {
+        return true;
+    }
+    let b = t.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return true;
+    }
+    t.starts_with('/')
+        || t.starts_with('\\')
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)))
+}
+
+/// 仅在当前工作簿目录子树内安全解析本地外部链接（不触发 UNC / 远程网络访问，也不越界读取目录外文件）。
+pub fn resolve_safe_local_path(link: &ExternalBook, base: &Path) -> Option<PathBuf> {
+    if is_network_or_remote_target(&link.target)
+        || link.abs.as_deref().is_some_and(is_network_or_remote_target)
+    {
+        return None;
+    }
+    if base.as_os_str().is_empty()
+        || base.parent().is_none()
+        || is_network_or_remote_target(&base.to_string_lossy())
+    {
+        return None;
+    }
+    let canon_base = std::fs::canonicalize(base).ok()?;
+    let verify_inside = |cand: PathBuf| -> Option<PathBuf> {
+        if is_network_or_remote_target(&cand.to_string_lossy()) || !cand.is_file() {
+            return None;
+        }
+        let canon = std::fs::canonicalize(&cand).ok()?;
+        canon.starts_with(&canon_base).then_some(cand)
+    };
+
+    // 1) 相对路径（禁止 ..、盘符与根路径）
+    let raw_target = link.target.trim();
+    if !raw_target.is_empty() && !has_external_path_syntax(raw_target) {
+        let rel = raw_target.replace('\\', "/");
+        if let Some(found) = verify_inside(base.join(&rel)) {
+            return Some(found);
+        }
+    }
+
+    let fname = link.file_name();
+    if fname.is_empty() || has_external_path_syntax(&fname) {
+        return None;
+    }
+    // 2) 同目录同名
+    if let Some(found) = verify_inside(base.join(&fname)) {
+        return Some(found);
+    }
+    // 3) 当前工作簿目录的一级子文件夹（如 `./分表/xxx.xlsx`）
+    if let Ok(rd) = std::fs::read_dir(base) {
+        for entry in rd.flatten().take(40) {
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                if let Some(found) = verify_inside(entry.path().join(&fname)) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 工作簿是否存在需要用户显式信任才允许访问磁盘/网络的外部链接（UNC / URL / 越界路径）
+pub fn has_untrusted_auto_links(wb: &Workbook) -> bool {
+    let base = wb
+        .path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let filters = build_book_filters(wb);
+    for (i, link) in wb.links.iter().enumerate() {
+        let Some(bf) = filters.get(i) else { continue };
+        if !bf.any_ref {
+            continue;
+        }
+        if is_network_or_remote_target(&link.target)
+            || link.abs.as_deref().is_some_and(is_network_or_remote_target)
+        {
+            return true;
+        }
+        if resolve_safe_local_path(link, &base).is_none()
+            && (has_external_path_syntax(&link.target)
+                || link.abs.as_deref().is_some_and(has_external_path_syntax))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 打开工作簿时的安全自动刷新：仅自动读取位于当前工作簿目录子树内的本地链接，
+/// 对 UNC 共享路径、远程 URL 或指向目录外的绝对/父级路径跳过静默读取（保留内嵌缓存），并返回跳过数量。
+pub fn refresh_auto_safe(wb: &mut Workbook) -> (RefreshReport, Vec<String>, usize) {
+    let base = wb
+        .path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let filters = build_book_filters(wb);
+    let mut rep = RefreshReport {
+        ok: 0,
+        failed: Vec::new(),
+    };
+    let mut changed = Vec::new();
+    let mut skipped_untrusted = 0usize;
+    for (i, link) in wb.links.iter_mut().enumerate() {
+        let Some(bf) = filters.get(i) else { continue };
+        if !bf.any_ref {
+            continue;
+        }
+        let Some(path) = resolve_safe_local_path(link, &base) else {
+            if is_network_or_remote_target(&link.target)
+                || link.abs.as_deref().is_some_and(is_network_or_remote_target)
+                || has_external_path_syntax(&link.target)
+                || link.abs.as_deref().is_some_and(has_external_path_syntax)
+            {
+                skipped_untrusted += 1;
+            } else {
+                rep.failed.push((label(link), "找不到本地文件".into()));
+            }
+            continue;
+        };
+        let mut new_sheets = link.sheets.clone();
+        match load_sheet_values_filtered(&path, &mut new_sheets, Some(bf)) {
+            Ok((vals, dnames)) => {
+                let diff = link_differs_on_filter(link, bf, &new_sheets, &vals, &dnames);
+                link.sheets = new_sheets;
+                if diff {
+                    let lbl = label(link);
+                    link.cache = ExternalCache::from_map(vals);
+                    if !dnames.is_empty() {
+                        link.defined_names = dnames;
+                    }
+                    link.refreshed = true;
+                    changed.push(lbl);
+                } else {
+                    if link.cache.len() > vals.len() {
+                        link.cache = ExternalCache::from_map(vals);
+                    }
+                    if link.defined_names.is_empty() && !dnames.is_empty() {
+                        link.defined_names = dnames;
+                    }
+                }
+                rep.ok += 1;
+            }
+            Err(e) => rep.failed.push((label(link), format!("{e:#}"))),
+        }
+    }
+    (rep, changed, skipped_untrusted)
+}
+
 /// 带候选提示刷新外部链接，并返回 `(报告, 实际数据发生变化的链接名列表)`。
 /// 仅对比当前工作簿实际引用的单元格/表名/名称：若被引用内容与现有内嵌缓存完全一致，
 /// 则不置 `refreshed = true`，避免误标脏数据或将整本外部工作簿塞进包内。
@@ -1701,23 +1889,22 @@ fn load_sheet_values_filtered(
         let Some(name) = live_names.iter().find(|n| n.eq_ignore_ascii_case(want)) else {
             continue;
         };
-        // 防止外部工作簿因角落残留格式/单元格（如 XFD1048576）触发 calamine 稠密网格数 GB OOM
+        // OOXML 外部工作簿统一走流式稀疏读取，不依赖可能缺失或伪造的 `<dimension>` 标签，
+        // 避免 A1 + XFD1048576 触发 calamine 稠密网格数 GB OOM。
         if is_ooxml {
             if let Some(part) = targets.get(name) {
-                if crate::sparse::declared_area_of(path, part) > crate::sparse::DENSE_LIMIT {
-                    let ss = shared_ss.get_or_insert_with(|| crate::sparse::shared_strings(path));
-                    if let Ok(cells) = crate::sparse::read_sheet(path, part, ss) {
-                        for ((r, c), cell) in cells {
-                            if !cell.value.is_empty()
-                                && resolved
-                                    .as_ref()
-                                    .is_none_or(|rf| rf.includes_cell(sid, r, c))
-                            {
-                                out.insert((sid, r, c), cell.value);
-                            }
+                let ss = shared_ss.get_or_insert_with(|| crate::sparse::shared_strings(path));
+                if let Ok(cells) = crate::sparse::read_sheet(path, part, ss) {
+                    for ((r, c), cell) in cells {
+                        if !cell.value.is_empty()
+                            && resolved
+                                .as_ref()
+                                .is_none_or(|rf| rf.includes_cell(sid, r, c))
+                        {
+                            out.insert((sid, r, c), cell.value);
                         }
-                        continue;
                     }
+                    continue;
                 }
             }
         }

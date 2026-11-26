@@ -1270,16 +1270,18 @@ pub(super) fn parse_styles_from_zip<R: Read + Seek>(
     zip: &mut zip::ZipArchive<R>,
 ) -> Result<ParsedStylesBook> {
     let theme_xml = if let Some(idx) = zip.index_for_name("xl/theme/theme1.xml") {
-        let mut s = String::new();
-        zip.by_index(idx).ok().and_then(|mut f| f.read_to_string(&mut s).ok().map(|_| s))
+        zip.by_index(idx).ok().and_then(|mut f| {
+            crate::fixups::read_zip_entry_string_limited(&mut f, crate::fixups::MAX_META_PART_BYTES).ok()
+        })
     } else {
         let alt_name = zip
             .file_names()
             .find(|n| n.starts_with("xl/theme/") && n.ends_with(".xml"))
             .map(str::to_owned);
         alt_name.and_then(|name| {
-            let mut s = String::new();
-            zip.by_name(&name).ok().and_then(|mut f| f.read_to_string(&mut s).ok().map(|_| s))
+            zip.by_name(&name).ok().and_then(|mut f| {
+                crate::fixups::read_zip_entry_string_limited(&mut f, crate::fixups::MAX_META_PART_BYTES).ok()
+            })
         })
     };
     let styles_xml = if zip.index_for_name("xl/styles.xml").is_some() {
@@ -1309,8 +1311,8 @@ pub(super) fn workbook_metadata<R: Read + Seek>(
 ) -> Result<WorkbookMetadata> {
     let read = |zip: &mut zip::ZipArchive<R>, name: &str| -> Result<Option<Vec<u8>>> {
         let Some(index) = zip.index_for_name(name) else { return Ok(None) };
-        let mut bytes = Vec::new();
-        zip.by_index(index)?.read_to_end(&mut bytes)?;
+        let mut entry = zip.by_index(index)?;
+        let bytes = crate::fixups::read_zip_entry_limited(&mut entry, crate::fixups::MAX_META_PART_BYTES)?;
         Ok(Some(bytes))
     };
     let Some(bytes) = read(src, "xl/workbook.xml")? else {
@@ -1780,8 +1782,12 @@ pub(super) fn xml_part<R: Read + Seek>(
     let mut entry = zip
         .by_name(part)
         .with_context(|| format!("缺少部件 {part}"))?;
-    let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes)?;
+    let cap = if part.starts_with("xl/worksheets/") || part == "xl/sharedStrings.xml" {
+        crate::fixups::MAX_SHEET_PART_BYTES
+    } else {
+        crate::fixups::MAX_META_PART_BYTES
+    };
+    let bytes = crate::fixups::read_zip_entry_limited(&mut entry, cap)?;
     decode_xml_part(bytes, part)
 }
 

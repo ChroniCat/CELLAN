@@ -1,6 +1,6 @@
 [package]
 name = "sheetcore"
-version = "1.82.0"
+version = "1.83.0"
 edition = "2024"
 license = "MIT"
 repository.workspace = true

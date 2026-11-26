@@ -270,7 +270,9 @@ fn encode_rk(n: f64) -> Option<u32> {
     None
 }
 
-/// BIFF8 共享字符串表（仅收录出现 >= 2 次且单条序列化不超过 8216 字节的字符串，按完整字符串边界切 CONTINUE）。
+/// BIFF8 共享字符串表：
+/// - 收录出现 >= 2 次的字符串，以及所有超过 BIFF8 `LABEL` 255 字符上限的文本；
+/// - 严格遵守每条 `SST`/`CONTINUE` 记录体 <= 8224 字节，支持跨 `CONTINUE` 续接超长字符串（首字节携带续接 grbit）。
 #[derive(Default)]
 struct XlsSst<'a> {
     map: HashMap<&'a str, u32>,
@@ -279,11 +281,11 @@ struct XlsSst<'a> {
 }
 
 impl<'a> XlsSst<'a> {
-    fn encoded_len(s: &str) -> usize {
+    fn char_len(s: &str) -> usize {
         if s.is_ascii() {
-            3 + s.len().min(u16::MAX as usize)
+            s.len()
         } else {
-            3 + s.encode_utf16().take(u16::MAX as usize).count() * 2
+            s.encode_utf16().count()
         }
     }
 
@@ -299,10 +301,7 @@ impl<'a> XlsSst<'a> {
                     },
                     _ => continue,
                 };
-                // 单条 XLUnicodeString <= 8216 字节保证一定能整条放进首条 SST(8224-8) 或单条 CONTINUE(8224)
-                if s.len() <= 8213 {
-                    *counts.entry(s).or_insert(0) += 1;
-                }
+                *counts.entry(s).or_insert(0) += 1;
             }
         }
         let mut sst = Self::default();
@@ -317,7 +316,8 @@ impl<'a> XlsSst<'a> {
                     _ => continue,
                 };
                 if let Some(&cnt) = counts.get(s) {
-                    if cnt >= 2 && Self::encoded_len(s) <= 8216 {
+                    // 出现 >= 2 次，或超过 BIFF8 LABEL 255 字符上限时全部走 SST+CONTINUE
+                    if cnt >= 2 || Self::char_len(s) > 255 {
                         if !sst.map.contains_key(s) {
                             let idx = sst.entries.len() as u32;
                             sst.map.insert(s, idx);
@@ -344,17 +344,111 @@ impl<'a> XlsSst<'a> {
         let mut rec_start = begin_rec(out, SST);
         push_u32(out, self.total_refs);
         push_u32(out, self.entries.len() as u32);
-        let mut scratch = Vec::with_capacity(128);
         for &s in &self.entries {
-            scratch.clear();
-            push_unicode_str(&mut scratch, s);
-            if (out.len() - rec_start) + scratch.len() > MAX_REC_BODY {
-                end_rec(out, rec_start);
-                rec_start = begin_rec(out, CONTINUE);
+            if s.is_ascii() {
+                let bytes = &s.as_bytes()[..s.len().min(u16::MAX as usize)];
+                let full_len = 3 + bytes.len();
+                let cur_len = out.len() - rec_start;
+                if full_len <= MAX_REC_BODY {
+                    if cur_len + full_len > MAX_REC_BODY {
+                        end_rec(out, rec_start);
+                        rec_start = begin_rec(out, CONTINUE);
+                    }
+                    push_u16(out, bytes.len() as u16);
+                    out.push(0); // compressed 8-bit
+                    out.extend_from_slice(bytes);
+                } else {
+                    if cur_len + 4 > MAX_REC_BODY {
+                        end_rec(out, rec_start);
+                        rec_start = begin_rec(out, CONTINUE);
+                    }
+                    push_u16(out, bytes.len() as u16);
+                    out.push(0); // compressed 8-bit
+                    let mut off = 0usize;
+                    while off < bytes.len() {
+                        let avail = MAX_REC_BODY.saturating_sub(out.len() - rec_start);
+                        if avail == 0 {
+                            end_rec(out, rec_start);
+                            rec_start = begin_rec(out, CONTINUE);
+                            out.push(0); // continuation grbit: 8-bit
+                            continue;
+                        }
+                        let take = avail.min(bytes.len() - off);
+                        out.extend_from_slice(&bytes[off..off + take]);
+                        off += take;
+                    }
+                }
+            } else {
+                let units: Vec<u16> = s.encode_utf16().take(u16::MAX as usize).collect();
+                let full_len = 3 + units.len() * 2;
+                let cur_len = out.len() - rec_start;
+                if full_len <= MAX_REC_BODY {
+                    if cur_len + full_len > MAX_REC_BODY {
+                        end_rec(out, rec_start);
+                        rec_start = begin_rec(out, CONTINUE);
+                    }
+                    push_u16(out, units.len() as u16);
+                    out.push(1); // UTF-16LE
+                    for &u in &units {
+                        push_u16(out, u);
+                    }
+                } else {
+                    if cur_len + 5 > MAX_REC_BODY {
+                        end_rec(out, rec_start);
+                        rec_start = begin_rec(out, CONTINUE);
+                    }
+                    push_u16(out, units.len() as u16);
+                    out.push(1); // UTF-16LE
+                    let mut off = 0usize;
+                    while off < units.len() {
+                        let avail = MAX_REC_BODY.saturating_sub(out.len() - rec_start);
+                        let max_units = avail / 2;
+                        if max_units == 0 {
+                            end_rec(out, rec_start);
+                            rec_start = begin_rec(out, CONTINUE);
+                            out.push(1); // continuation grbit: UTF-16LE
+                            continue;
+                        }
+                        let take = max_units.min(units.len() - off);
+                        for &u in &units[off..off + take] {
+                            push_u16(out, u);
+                        }
+                        off += take;
+                    }
+                }
             }
-            out.extend_from_slice(&scratch);
         }
         end_rec(out, rec_start);
+    }
+}
+
+/// 写 BIFF8 `STRING` 记录（公式缓存文本），超 8224 字节时自动按 BIFF8 规范拆分为 `CONTINUE`。
+fn write_biff_string_rec(out: &mut Vec<u8>, sr: &[u8]) {
+    const MAX_REC_BODY: usize = 8224;
+    if sr.len() <= MAX_REC_BODY {
+        rec(out, STRING, sr);
+        return;
+    }
+    if sr.len() < 3 {
+        rec(out, STRING, sr);
+        return;
+    }
+    let grbit = sr[2];
+    let char_w = if (grbit & 1) != 0 { 2usize } else { 1usize };
+    let payload = &sr[3..];
+    let first_take = ((MAX_REC_BODY - 3) / char_w) * char_w;
+    let first_take = first_take.min(payload.len());
+    let s = begin_rec(out, STRING);
+    out.extend_from_slice(&sr[..3 + first_take]);
+    end_rec(out, s);
+    let mut off = first_take;
+    while off < payload.len() {
+        let take = (((MAX_REC_BODY - 1) / char_w) * char_w).min(payload.len() - off);
+        let c = begin_rec(out, CONTINUE);
+        out.push(grbit & 1);
+        out.extend_from_slice(&payload[off..off + take]);
+        end_rec(out, c);
+        off += take;
     }
 }
 
@@ -758,7 +852,7 @@ fn sheet_stream(
             out.extend_from_slice(&comp.extra);
             end_rec(&mut out, s);
             if let Some(sr) = follow {
-                rec(&mut out, STRING, &sr);
+                write_biff_string_rec(&mut out, &sr);
             }
             continue;
         }

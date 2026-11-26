@@ -72,7 +72,7 @@ pub(crate) struct PrintPreviewCache {
         Option<std::path::PathBuf>,
     ),
     pub layout: Arc<sheetcore::print::Layout>,
-    pub page_ops: Option<(usize, Arc<sheetcore::print::Out>)>,
+    pub page_ops: HashMap<usize, Arc<sheetcore::print::Out>>,
 }
 
 pub(crate) struct Pivot2BaseItemsCache {

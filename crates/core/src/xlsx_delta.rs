@@ -2300,13 +2300,12 @@ pub(super) fn write_with_style_receipt(
     if !wb.names_dirty && zip.index_for_name("xl/workbook.xml").is_some() {
         let wb_bytes = match parts.get("xl/workbook.xml") {
             Some(b) => Some(b.clone()),
-            None => {
-                let mut b = Vec::new();
-                use std::io::Read;
-                zip.by_name("xl/workbook.xml")
-                    .ok()
-                    .and_then(|mut e| e.read_to_end(&mut b).ok().map(|_| b))
-            }
+            None => zip
+                .by_name("xl/workbook.xml")
+                .ok()
+                .and_then(|mut e| {
+                    crate::fixups::read_zip_entry_limited(&mut e, crate::fixups::MAX_META_PART_BYTES).ok()
+                }),
         };
         if let Some(wb_bytes) = wb_bytes
             && let Ok(wb_xml) = String::from_utf8(wb_bytes.clone())

@@ -300,6 +300,7 @@ fn within_grid(at: (u32, u32), rows: usize, cols: usize) -> bool {
 
 struct Registration {
     file: PathBuf,
+    target_sheet: usize,
     at: (u32, u32),
     size: (u32, u32),
     delim: char,
@@ -310,17 +311,21 @@ struct Registration {
 fn store_source(wb: &mut Workbook, registration: Registration) {
     let Registration {
         file,
+        target_sheet,
         at,
         size,
         delim,
         header,
         opts,
     } = registration;
+    let target_sheet_name = wb.sheets.get(target_sheet).map(|s| s.name.clone());
     let stored = external::store_path(wb, &file);
     let sources = &mut wb.sources;
-    let existing = sources
-        .iter()
-        .position(|s| s.at == at && matches!(&s.kind, Kind::Csv { path, .. } if path == &stored));
+    let existing = sources.iter().position(|s| {
+        s.at == at
+            && s.target_sheet.as_deref() == target_sheet_name.as_deref()
+            && matches!(&s.kind, Kind::Csv { path, .. } if path == &stored)
+    });
     let name = existing
         .map(|i| sources[i].name.clone())
         .unwrap_or_else(|| {
@@ -338,6 +343,7 @@ fn store_source(wb: &mut Workbook, registration: Registration) {
             header,
         },
         at,
+        target_sheet: target_sheet_name,
         rows: size.0,
         cols: size.1,
         csv_opts: Some(opts),
@@ -464,6 +470,7 @@ fn prepare(
             let size = (rows, cols);
             registration = Some(Registration {
                 file: path,
+                target_sheet: target.sheet,
                 at: target.at,
                 size,
                 delim: actual_delim,
@@ -474,9 +481,16 @@ fn prepare(
         }
         Input::Refresh => {
             let old_sizes = sizes(&sources);
+            let mut matched = 0usize;
             let mut ok = 0;
             let mut failures = Vec::new();
             for src in &mut sources {
+                if let Some(target_name) = src.target_sheet.as_deref()
+                    && !target_name.eq_ignore_ascii_case(&before.name)
+                {
+                    continue;
+                }
+                matched += 1;
                 check_cancelled(cancel)?;
                 let size = (|| match &src.kind {
                     Kind::Csv {
@@ -519,10 +533,14 @@ fn prepare(
                         sheet,
                         rect: (r, c, end_r, end_c),
                     } => {
-                        let sh = internal
-                            .iter()
-                            .find(|s| &s.name == sheet)
-                            .ok_or("找不到其他来源表")?;
+                        let sh = if sheet == &before.name {
+                            &before
+                        } else {
+                            internal
+                                .iter()
+                                .find(|s| &s.name == sheet)
+                                .ok_or("找不到其他来源表")?
+                        };
                         if end_r < r
                             || end_c < c
                             || *end_r >= sheetcore::sync::MAX_ROWS
@@ -574,6 +592,9 @@ fn prepare(
                     }
                     Err(e) => failures.push(e),
                 }
+            }
+            if matched == 0 {
+                return Err("当前工作表没有可刷新的数据源".into());
             }
             if ok == 0 {
                 return Err(format!(
@@ -1248,6 +1269,7 @@ mod tests {
                 rect: (0, 0, 0, 0),
             },
             at: (1, 0),
+            target_sheet: None,
             rows: 1,
             cols: 1,
             csv_opts: None,
@@ -1299,6 +1321,7 @@ mod tests {
                 rect: (0, 0, 0, 0),
             },
             at: (0, 0),
+            target_sheet: None,
             rows: 1,
             cols: 1,
             csv_opts: None,

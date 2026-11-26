@@ -1706,6 +1706,27 @@ impl SheetApp {
             .flatten()
             .map(|(prepared, sheets)| ReadCache::Search { prepared, sheets });
         self.note_ai_footprint(&call.spec, &result);
+        if call.spec.name == "manage_sheet"
+            && result["ok"] == true
+            && call.spec.arguments["op"].as_str() == Some("rename")
+            && let Some(new_name) = result["sheet"].as_str()
+        {
+            let renamed_id = self
+                .resolve_sheet_index(Some(new_name))
+                .map(|i| self.wb.sheet(i).identity);
+            if let Some(turn) = self.ai.active_round.as_mut() {
+                for read in &mut turn.reads {
+                    if let Some(rid) = renamed_id
+                        && read.sheet == Some(rid)
+                        && read.call.arguments.get("sheet").is_some()
+                    {
+                        read.call.arguments["sheet"] = json!(new_name);
+                    }
+                    *read.cache.borrow_mut() = ReadCache::None;
+                    read.hash = None;
+                }
+            }
+        }
         let moved_view = call.spec.name == "manage_sheet"
             && result["ok"] == true
             && matches!(call.spec.arguments["op"].as_str(), Some("create" | "switch"));

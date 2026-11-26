@@ -72,12 +72,10 @@ pub fn needs_password_bytes(bytes: &[u8]) -> bool {
     if !bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
         return false;
     }
-    // CFB 目录项名是 UTF-16LE
-    let needle: Vec<u8> = "EncryptedPackage"
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect();
-    find_bytes(bytes, &needle).is_some()
+    if let Ok(cf) = cfb::CompoundFile::open(std::io::Cursor::new(bytes)) {
+        return cf.exists("EncryptedPackage");
+    }
+    false
 }
 
 fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -963,6 +961,13 @@ fn verify_and_extract_key(info: &[u8], password: &str) -> Result<AgileKeyMateria
     }
     let salt_pkg = b64(&xml.salt_data)?;
     let salt = b64(&xml.salt_key)?;
+    if !matches!(xml.key_bits, 128 | 192 | 256) || !matches!(xml.enc_key_bits, 128 | 192 | 256) {
+        bail!("不支持的 AES 密钥位数（keyBits={}, encKeyBits={}）", xml.key_bits, xml.enc_key_bits);
+    }
+    const MAX_SPIN_COUNT: u32 = 10_000_000;
+    if xml.spin_count > MAX_SPIN_COUNT {
+        bail!("加密迭代次数超出安全上限（spinCount={}）", xml.spin_count);
+    }
     let key_bytes = (xml.key_bits / 8) as usize;
     let enc_key_bytes = (xml.enc_key_bits / 8) as usize;
     let h = hash_final_alg(key_alg, password, &salt, xml.spin_count.max(1));
@@ -1035,8 +1040,12 @@ pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
         let mut s = cf
             .open_stream("EncryptionInfo")
             .map_err(|e| anyhow!("缺少 EncryptionInfo：{e}"))?;
-        info.reserve(s.len() as usize);
-        s.read_to_end(&mut info)?;
+        let cap = (s.len() as usize).min(bytes.len()).min(1024 * 1024);
+        info.reserve(cap);
+        s.take(1024 * 1024 + 1).read_to_end(&mut info)?;
+        if info.len() > 1024 * 1024 {
+            bail!("EncryptionInfo 流体积异常");
+        }
     }
 
     // 分支 1：Excel 2007 Standard Encryption（AES-128/192/256-ECB + SHA-1）
@@ -1049,11 +1058,15 @@ pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
         if pkg.len() < 8 {
             bail!("EncryptedPackage 太短");
         }
-        let size = u64::from_le_bytes(pkg[..8].try_into().unwrap()) as usize;
+        let size_u64 = u64::from_le_bytes(pkg[..8].try_into().unwrap());
         let payload = &pkg[8..];
-        if payload.is_empty() || size == 0 {
+        if payload.is_empty() || size_u64 == 0 {
             return Ok(Vec::new());
         }
+        if size_u64 > payload.len() as u64 {
+            bail!("EncryptedPackage 声明大小超出密文长度");
+        }
+        let size = size_u64 as usize;
         let mut out = aes_ecb_decrypt_any(&key, payload)?;
         out.truncate(size);
         return Ok(out);
@@ -1066,7 +1079,8 @@ pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
             let mut st = cf
                 .open_stream("EncryptedPackage")
                 .map_err(|e| anyhow!("缺少 EncryptedPackage：{e}"))?;
-            let mut buf = Vec::with_capacity(st.len() as usize);
+            let cap = (st.len() as usize).min(bytes.len());
+            let mut buf = Vec::with_capacity(cap);
             st.read_to_end(&mut buf)?;
             Ok(buf)
         })();
@@ -1100,15 +1114,19 @@ pub fn decrypt_bytes(bytes: &[u8], password: &str) -> Result<Vec<u8>> {
 
     let mut size_bytes = [0u8; 8];
     size_bytes.copy_from_slice(&pkg[..8]);
-    let size = u64::from_le_bytes(size_bytes) as usize;
+    let size_u64 = u64::from_le_bytes(size_bytes);
     let payload = &pkg[8..];
-    if payload.is_empty() || size == 0 {
+    if payload.is_empty() || size_u64 == 0 {
         return Ok(Vec::new());
     }
+    if size_u64 > payload.len() as u64 {
+        bail!("EncryptedPackage 声明大小超出密文长度");
+    }
+    let size = size_u64 as usize;
 
     // 非 AES-256 或非 SHA-512 路径（Excel 2010/2013 AES-128 + SHA-1/SHA-256 等）
     if mat.key_bytes != 32 || mat.data_hash_alg != HashAlg::Sha512 {
-        let mut out = Vec::with_capacity(size.saturating_add(16));
+        let mut out = Vec::with_capacity(size.min(payload.len()).saturating_add(16));
         for (i, seg) in payload.chunks(SEGMENT).enumerate() {
             let iv = derive_iv_alg(mat.data_hash_alg, &mat.salt_pkg, &(i as u32).to_le_bytes());
             let pt = aes_cbc_decrypt_any(&mat.key, &iv, seg)?;
@@ -1479,10 +1497,12 @@ encryptedVerifierHashValue=\"{evh}\" encryptedKeyValue=\"{ekv}\"/>\
         let total_len = cfb_bytes.len() as u64;
         staged.as_file_mut().write_all(&cfb_bytes)?;
         staged.as_file_mut().flush()?;
+        staged.as_file().sync_all()?;
         Some((total_len, fp))
     } else {
         write_cfb(staged.as_file_mut())?;
         staged.as_file_mut().flush()?;
+        staged.as_file().sync_all()?;
         None
     };
     staged.persist(path).with_context(|| format!("写入 {} 失败", path.display()))?;

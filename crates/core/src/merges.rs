@@ -423,10 +423,14 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                                 if let Some((r1, c1, r2, c2)) = parse_range(tok) {
                                     // 大区域只取左上角，避免整列忽略把内存撑爆
                                     out.ignored_errors.push((r1, c1));
-                                    if (r2 - r1) * (c2 - c1) < 4096 {
+                                    let area = (r2 as u64 - r1 as u64 + 1)
+                                        .saturating_mul(c2 as u64 - c1 as u64 + 1);
+                                    if area <= 4096 {
                                         for r in r1..=r2 {
                                             for c in c1..=c2 {
-                                                out.ignored_errors.push((r, c));
+                                                if (r, c) != (r1, c1) {
+                                                    out.ignored_errors.push((r, c));
+                                                }
                                             }
                                         }
                                     }
@@ -476,7 +480,9 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                                 count = v.parse::<f64>().map(|x| x.round().max(1.0) as u32).unwrap_or(10);
                             }
                         }
-                        af_top_filters.insert(range.1 + col, crate::sort_filter::TopFilter { top, count, percent });
+                        if let Some(key) = range.1.checked_add(col).filter(|&k| k < 16_384) {
+                            af_top_filters.insert(key, crate::sort_filter::TopFilter { top, count, percent });
+                        }
                     }
                 } else if name.ends_with("dynamicFilter") {
                     if let (Some(col), Some(range)) = (cur_col, af_range) {
@@ -484,14 +490,18 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                             if a.key.as_ref().ends_with("type") {
                                 let v = crate::model::xml_unescape(&a.value.to_string());
                                 if let Some(df) = crate::sort_filter::DynamicFilter::from_ooxml(&v) {
-                                    af_dynamic_filters.insert(range.1 + col, df);
+                                    if let Some(key) = range.1.checked_add(col).filter(|&k| k < 16_384) {
+                                        af_dynamic_filters.insert(key, df);
+                                    }
                                 }
                             }
                         }
                     }
                 } else if name.ends_with("customFilter") {
                     // OOXML 标准：文本筛选使用 equal/notEqual + *通配符；Between 为 Ge + Le 两条 and="1"
-                    if let (Some(col), Some(range)) = (cur_col, af_range) {
+                    if let (Some(col), Some(range)) = (cur_col, af_range)
+                        && let Some(key) = range.1.checked_add(col).filter(|&k| k < 16_384)
+                    {
                         let mut op_s = String::new();
                         let mut val = String::new();
                         for a in e.attributes().flatten() {
@@ -503,7 +513,6 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                                 val = v;
                             }
                         }
-                        let key = range.1 + col;
                         let op_key = if op_s.is_empty() { "equal" } else { op_s.as_str() };
                         if let Some(raw_op) = crate::sort_filter::CmpOp::from_xml(op_key) {
                             let unesc_wild = |s: &str| -> String {
@@ -612,19 +621,23 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                         }
                     }
                 } else if name == "filter" || name.ends_with(":filter") {
-                    if let (Some(col), Some(range)) = (cur_col, af_range) {
+                    if let (Some(col), Some(range)) = (cur_col, af_range)
+                        && let Some(key) = range.1.checked_add(col).filter(|&k| k < 16_384)
+                    {
                         for a in e.attributes().flatten() {
                             if a.key.as_ref().ends_with("val") {
                                 let v = crate::model::xml_unescape(&a.value.to_string());
                                 af_allows
-                                    .entry(range.1 + col)
+                                    .entry(key)
                                     .or_default()
                                     .insert(v);
                             }
                         }
                     }
                 } else if name.ends_with("dateGroupItem") {
-                    if let (Some(col), Some(range)) = (cur_col, af_range) {
+                    if let (Some(col), Some(range)) = (cur_col, af_range)
+                        && let Some(key) = range.1.checked_add(col).filter(|&k| k < 16_384)
+                    {
                         let mut year: Option<i32> = None;
                         let mut month: Option<u32> = None;
                         let mut day: Option<u32> = None;
@@ -648,11 +661,13 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                                 "month" => crate::sort_filter::DateGroupItem { year: y, month, day: None },
                                 _ => crate::sort_filter::DateGroupItem { year: y, month, day },
                             };
-                            af_date_groups.entry(range.1 + col).or_default().push(item);
+                            af_date_groups.entry(key).or_default().push(item);
                         }
                     }
                 } else if name.ends_with("colorFilter") {
-                    if let (Some(col), Some(range)) = (cur_col, af_range) {
+                    if let (Some(col), Some(range)) = (cur_col, af_range)
+                        && let Some(key) = range.1.checked_add(col).filter(|&k| k < 16_384)
+                    {
                         let mut dxf_id: Option<usize> = None;
                         let mut cell_color = true;
                         for a in e.attributes().flatten() {
@@ -664,7 +679,6 @@ fn parse_layout_with_dxfs(xml: &str, dxfs: &[crate::cf::Dxf]) -> SheetLayout {
                                 cell_color = v != "0" && !v.eq_ignore_ascii_case("false");
                             }
                         }
-                        let key = range.1 + col;
                         if cell_color {
                             match dxf_id.and_then(|id| dxfs.get(id)) {
                                 Some(dxf) if dxf.fill.is_some() => {
@@ -756,21 +770,30 @@ pub(crate) fn parse_cell(s: &str) -> Option<(u32, u32)> {
     let cleaned: String = s.trim().chars().filter(|c| *c != '$').collect();
     let s = cleaned.as_str();
     let mut col = 0u32;
-    let mut row = String::new();
+    let mut row = 0u32;
+    let mut letter_count = 0usize;
+    let mut seen_digit = false;
     for ch in s.chars() {
-        if ch.is_ascii_alphabetic() {
-            col = col * 26 + (ch.to_ascii_uppercase() as u32 - 'A' as u32 + 1);
+        if ch.is_ascii_alphabetic() && !seen_digit {
+            letter_count += 1;
+            if letter_count > 3 {
+                return None;
+            }
+            col = col.checked_mul(26)?.checked_add(ch.to_ascii_uppercase() as u32 - 'A' as u32 + 1)?;
         } else if ch.is_ascii_digit() {
-            row.push(ch);
+            seen_digit = true;
+            row = row.checked_mul(10)?.checked_add(ch as u32 - '0' as u32)?;
+            if row > 1_048_576 {
+                return None;
+            }
         } else {
             return None;
         }
     }
-    if col == 0 || row.is_empty() {
+    if col == 0 || col > 16_384 || row == 0 {
         return None;
     }
-    let r: u32 = row.parse().ok()?;
-    Some((r.saturating_sub(1), col - 1))
+    Some((row - 1, col - 1))
 }
 
 #[cfg(test)]

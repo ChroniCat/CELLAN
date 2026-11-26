@@ -2695,21 +2695,29 @@ pub fn parse_sqref(s: &str) -> Vec<(u32, u32, u32, u32)> {
 }
 
 fn parse_a1(s: &str) -> Option<(u32, u32)> {
-    let clean: String = s.chars().filter(|c| *c != '$').collect();
+    let clean: String = s.trim().chars().filter(|c| *c != '$').collect();
     let mut col = 0u32;
     let mut row = 0u32;
+    let mut letter_count = 0usize;
     let mut seen_digit = false;
     for ch in clean.chars() {
         if ch.is_ascii_alphabetic() && !seen_digit {
-            col = col * 26 + (ch.to_ascii_uppercase() as u32 - 'A' as u32 + 1);
+            letter_count += 1;
+            if letter_count > 3 {
+                return None;
+            }
+            col = col.checked_mul(26)?.checked_add(ch.to_ascii_uppercase() as u32 - 'A' as u32 + 1)?;
         } else if ch.is_ascii_digit() {
             seen_digit = true;
-            row = row * 10 + (ch as u32 - '0' as u32);
+            row = row.checked_mul(10)?.checked_add(ch as u32 - '0' as u32)?;
+            if row > 1_048_576 {
+                return None;
+            }
         } else {
             return None;
         }
     }
-    if col == 0 || row == 0 {
+    if col == 0 || col > 16_384 || row == 0 {
         return None;
     }
     Some((row - 1, col - 1))

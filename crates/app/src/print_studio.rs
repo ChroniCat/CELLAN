@@ -553,7 +553,7 @@ impl SheetApp {
                 Some(crate::grid_render_cache::PrintPreviewCache {
                     key: cache_key,
                     layout: built,
-                    page_ops: None,
+                    page_ops: std::collections::HashMap::new(),
                 });
         }
         let layout = self
@@ -565,30 +565,38 @@ impl SheetApp {
             .clone();
         let total = layout.pages.len().max(1);
         let page_no = req_page.min(total - 1);
-        let cached_ops = self
+        let ops = self.cached_preview_page_ops(&layout, page_no);
+        (layout, ops, total)
+    }
+
+    fn cached_preview_page_ops(
+        &mut self,
+        layout: &Layout,
+        page_no: usize,
+    ) -> std::sync::Arc<Out> {
+        if let Some(ops) = self
             .normal_page_breaks
             .print_preview
             .as_ref()
-            .and_then(|c| c.page_ops.as_ref())
-            .filter(|(p, _)| *p == page_no)
-            .map(|(_, ops)| ops.clone());
-        let ops = match cached_ops {
-            Some(o) => o,
-            None => {
-                let built = std::sync::Arc::new(page_ops_with(
-                    &self.wb,
-                    self.sheet_idx,
-                    &layout,
-                    page_no,
-                    self.wb.path.as_deref(),
-                ));
-                if let Some(cache) = self.normal_page_breaks.print_preview.as_mut() {
-                    cache.page_ops = Some((page_no, built.clone()));
-                }
-                built
+            .and_then(|c| c.page_ops.get(&page_no))
+            .cloned()
+        {
+            return ops;
+        }
+        let built = std::sync::Arc::new(page_ops_with(
+            &self.wb,
+            self.sheet_idx,
+            layout,
+            page_no,
+            self.wb.path.as_deref(),
+        ));
+        if let Some(cache) = self.normal_page_breaks.print_preview.as_mut() {
+            if cache.page_ops.len() >= 64 {
+                cache.page_ops.clear();
             }
-        };
-        (layout, ops, total)
+            cache.page_ops.insert(page_no, built.clone());
+        }
+        built
     }
 
     /// 原生 Windows GDI 硬件矢量打印（支持当前工作表 / 整个工作簿 / 选区 + 非连续页码 + 双面/逐份/黑白）
@@ -888,22 +896,30 @@ impl SheetApp {
         let (pw, ph) = layout.page_size;
         let margins = eff_setup.margins;
 
-        // 双页对开时准备下一页绘制指令
-        let ops_next: Option<(usize, Out)> = if self.print_studio.facing_pages && page_no + 1 < total {
-            let next_i = page_no + 1;
-            Some((
-                next_i,
-                page_ops_with(
-                    &self.wb,
-                    self.sheet_idx,
-                    &layout,
-                    next_i,
-                    self.wb.path.as_deref(),
-                ),
-            ))
-        } else {
-            None
-        };
+        // 双页对开时准备下一页绘制指令（命中 PrintPreviewCache 缓存，不每帧重算）
+        let ops_next: Option<(usize, std::sync::Arc<Out>)> =
+            if self.print_studio.facing_pages && page_no + 1 < total {
+                let next_i = page_no + 1;
+                Some((next_i, self.cached_preview_page_ops(&layout, next_i)))
+            } else {
+                None
+            };
+        // 预取缩略图绘制指令（最多 24 页，全部命中 PrintPreviewCache 缓存）
+        let thumb_ops: Vec<std::sync::Arc<Out>> =
+            if self.print_studio.show_thumbnails && total > 1 {
+                let max_show = total.min(24);
+                (0..max_show)
+                    .map(|ti| {
+                        if ti == page_no {
+                            ops_cur.clone()
+                        } else {
+                            self.cached_preview_page_ops(&layout, ti)
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         let visible_sheets_count = self.wb.sheets.iter().filter(|s| !s.hidden).count().max(1);
         let mut margin_edit: Option<(usize, f32)> = None;
@@ -1485,19 +1501,9 @@ impl SheetApp {
                                                         Sense::click(),
                                                     );
                                                     p.rect_filled(r.rect, 2.0, Color32::WHITE);
-                                                    let t_ops = if ti == page_no {
-                                                        None
-                                                    } else {
-                                                        Some(page_ops_with(
-                                                            &self.wb,
-                                                            self.sheet_idx,
-                                                            &layout,
-                                                            ti,
-                                                            self.wb.path.as_deref(),
-                                                        ))
-                                                    };
-                                                    let ops_ref: &Out = t_ops
-                                                        .as_ref()
+                                                    let ops_ref: &Out = thumb_ops
+                                                        .get(ti)
+                                                        .map(|o| o.as_ref())
                                                         .unwrap_or_else(|| ops_cur.as_ref());
                                                     paint_out_on_egui(
                                                         ctx,

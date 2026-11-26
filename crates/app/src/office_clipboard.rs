@@ -483,13 +483,59 @@ fn decode_entities(s: &str) -> String {
     out
 }
 
+/// 剪贴板 HTML 最大输入字节上限（32 MiB）与单元格解析上限（200,000 格）
+const MAX_HTML_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HTML_CELLS: usize = 200_000;
+
+/// 在 `slice` 中查找最近的单元格结束边界（`</td`、`</th` 或下一个 `<td`/`<th`/`<tr`/`</tr`/`</table`）。
+/// 返回 `(boundary_offset, advance_bytes)`：闭合标签跳过至 `>` 之后，隐式结束标签停在其 `<` 处。
+fn find_html_cell_end(slice: &str) -> (usize, usize) {
+    let b = slice.as_bytes();
+    let mut pos = 0usize;
+    while pos < b.len() {
+        let Some(rel) = b[pos..].iter().position(|&ch| ch == b'<') else {
+            return (b.len(), 0);
+        };
+        let at = pos + rel;
+        let rest = &b[at..];
+        if starts_with_ascii_ci(rest, b"</td") || starts_with_ascii_ci(rest, b"</th") {
+            let adv = rest
+                .iter()
+                .position(|&ch| ch == b'>')
+                .map(|p| p + 1)
+                .unwrap_or(rest.len());
+            return (at, adv);
+        }
+        if starts_with_ascii_ci(rest, b"<td")
+            || starts_with_ascii_ci(rest, b"<th")
+            || starts_with_ascii_ci(rest, b"<tr")
+            || starts_with_ascii_ci(rest, b"</tr")
+            || starts_with_ascii_ci(rest, b"</table")
+        {
+            return (at, 0);
+        }
+        pos = at + 1;
+    }
+    (b.len(), 0)
+}
+
 pub fn parse_html(html: &str) -> OfficeBlock {
     let mut block = OfficeBlock::default();
+    let html = if html.len() > MAX_HTML_INPUT_BYTES {
+        let mut end = MAX_HTML_INPUT_BYTES;
+        while end > 0 && !html.is_char_boundary(end) {
+            end -= 1;
+        }
+        &html[..end]
+    } else {
+        html
+    };
     let classes = parse_style_classes(html);
     let mut row: Vec<OfficeCell> = Vec::new();
+    let mut total_cells = 0usize;
     let mut i = 0usize;
     let bytes = html.as_bytes();
-    while i < bytes.len() {
+    while i < bytes.len() && total_cells < MAX_HTML_CELLS {
         let Some(rel) = bytes[i..].iter().position(|&b| b == b'<') else {
             break;
         };
@@ -501,23 +547,22 @@ pub fn parse_html(html: &str) -> OfficeBlock {
             }
             i += 3;
         } else if starts_with_ascii_ci(rest, b"<td") || starts_with_ascii_ci(rest, b"<th") {
-            let tag_end = bytes[i..]
-                .iter()
-                .position(|&b| b == b'>')
-                .map(|p| i + p)
-                .unwrap_or(bytes.len().saturating_sub(1));
-            let attrs = &html[i..tag_end];
-            let close = find_ascii_ci(&html[tag_end..], b"</td")
-                .or_else(|| find_ascii_ci(&html[tag_end..], b"</th"))
-                .map(|p| tag_end + p)
-                .unwrap_or_else(|| html.len().min(tag_end + 1));
-            let inner = if close > tag_end {
-                &html[tag_end + 1..close]
-            } else {
-                ""
+            let Some(rel_end) = bytes[i..].iter().position(|&b| b == b'>') else {
+                break;
             };
+            let tag_end = i + rel_end;
+            let Some(attrs) = html.get(i..tag_end) else {
+                break;
+            };
+            let body_start = tag_end + 1;
+            let Some(tail) = html.get(body_start..) else {
+                break;
+            };
+            let (end_rel, adv) = find_html_cell_end(tail);
+            let inner = tail.get(..end_rel).unwrap_or("");
             row.push(parse_cell(attrs, inner, &classes));
-            i = (close + 5).min(bytes.len());
+            total_cells += 1;
+            i = (body_start + end_rel + adv).min(bytes.len());
         } else if starts_with_ascii_ci(rest, b"</table") {
             break;
         } else {
@@ -555,19 +600,28 @@ fn css_border_color(style: &str, prop: &str) -> Option<Option<[u8; 3]>> {
     Some(Some([0, 0, 0]))
 }
 
+fn parse_hex_color_safe(hex: &str, allow_short3: bool) -> Option<[u8; 3]> {
+    let hex = hex.trim();
+    let b = hex.as_bytes();
+    if b.len() >= 6 && b[..6].iter().all(u8::is_ascii_hexdigit) {
+        let r = u8::from_str_radix(hex.get(0..2)?, 16).ok()?;
+        let g = u8::from_str_radix(hex.get(2..4)?, 16).ok()?;
+        let b_val = u8::from_str_radix(hex.get(4..6)?, 16).ok()?;
+        return Some([r, g, b_val]);
+    }
+    if allow_short3 && b.len() == 3 && b.iter().all(u8::is_ascii_hexdigit) {
+        let r = u8::from_str_radix(hex.get(0..1)?, 16).ok()? * 17;
+        let g = u8::from_str_radix(hex.get(1..2)?, 16).ok()? * 17;
+        let b_val = u8::from_str_radix(hex.get(2..3)?, 16).ok()? * 17;
+        return Some([r, g, b_val]);
+    }
+    None
+}
+
 fn parse_css_color_token(v: &str) -> Option<[u8; 3]> {
     if let Some(hex) = v.strip_prefix('#') {
-        let hex = hex.trim();
-        if hex.len() >= 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            return Some([r, g, b]);
-        } else if hex.len() == 3 {
-            let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
-            let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
-            let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
-            return Some([r, g, b]);
+        if let Some(rgb) = parse_hex_color_safe(hex, true) {
+            return Some(rgb);
         }
     }
     match v {
@@ -693,12 +747,8 @@ fn style_color(style: &str, prop: &str) -> Option<[u8; 3]> {
     let value: String = rest.chars().take_while(|c| *c != ';').collect();
     let v = value.trim();
     if let Some(hex) = v.strip_prefix('#') {
-        let hex = hex.trim();
-        if hex.len() >= 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            return Some([r, g, b]);
+        if let Some(rgb) = parse_hex_color_safe(hex, false) {
+            return Some(rgb);
         }
     }
     if let Some(inner) = v.strip_prefix("rgb(") {
@@ -1438,4 +1488,43 @@ fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     xml_escape_into(&mut out, s);
     out
+}
+
+#[cfg(test)]
+mod audit_regression_tests {
+    use super::*;
+
+    #[test]
+    fn html_utf8_unclosed_tag_and_non_ascii_hex_color_never_panic() {
+        let block = parse_html("<table><tr><td style=\"color:#中文颜色;border:1px solid #红绿蓝\">值</td><td 中文");
+        assert_eq!(block.rows.len(), 1);
+        assert_eq!(block.rows[0].len(), 1);
+        assert_eq!(block.rows[0][0].text, "值");
+        assert_eq!(block.rows[0][0].color, None);
+    }
+
+    #[test]
+    fn html_th_td_mismatch_and_omitted_close_tags_parse_linearly() {
+        let block = parse_html("<table><tr><th>头1</td><td>值1</th></tr><tr><td>A<td>B<td>C</table>");
+        assert_eq!(block.rows.len(), 2);
+        assert_eq!(block.rows[0].len(), 2);
+        assert_eq!(block.rows[0][0].text, "头1");
+        assert_eq!(block.rows[0][1].text, "值1");
+        assert_eq!(block.rows[1].len(), 3);
+        assert_eq!(block.rows[1][0].text, "A");
+        assert_eq!(block.rows[1][1].text, "B");
+        assert_eq!(block.rows[1][2].text, "C");
+
+        // Many cells with omitted </td> must complete in linear time (previously O(n^2))
+        let mut many = String::from("<table><tr>");
+        for i in 0..4000 {
+            many.push_str(&format!("<td>{i}"));
+        }
+        many.push_str("</tr></table>");
+        let t0 = std::time::Instant::now();
+        let big = parse_html(&many);
+        assert!(t0.elapsed().as_millis() < 500, "omitted close tags took {:?}", t0.elapsed());
+        assert_eq!(big.rows.len(), 1);
+        assert_eq!(big.rows[0].len(), 4000);
+    }
 }

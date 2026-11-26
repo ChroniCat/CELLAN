@@ -65,7 +65,9 @@ fn tool_definitions() -> Vec<JsonValue> {
     let string = json!({"type": "string"});
     let boolean = json!({"type": "boolean"});
     let edits = json!({"type":"array","items":{"type":"object","properties":{
-        "cell":string,"value":{},"formula":string,"format":string,
+        "cell":string,
+        "value":{"description":"单元格原始值：JSON 数字写入数值，布尔写入逻辑值，字符串按纯文本原样写入，null 清空"},
+        "formula":string,"format":string,
         "fill_hex":string,"font_hex":string,"bold":boolean
     },"required":["cell"]}});
     let functions = [
@@ -200,12 +202,79 @@ enum TextState {
     Tool,
 }
 
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ACCUMULATED_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOL_CALLS_PER_ROUND: usize = 32;
+
+#[derive(Default)]
+struct JsonScanState {
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    started_compound: bool,
+    closed_compound: bool,
+    malformed: bool,
+}
+
+impl JsonScanState {
+    fn feed(&mut self, s: &str) {
+        for b in s.bytes() {
+            if self.malformed {
+                return;
+            }
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if b == b'\\' {
+                    self.escaped = true;
+                } else if b == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            if self.closed_compound {
+                if !b.is_ascii_whitespace() {
+                    self.malformed = true;
+                }
+                continue;
+            }
+            match b {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => {
+                    if self.depth == 0 {
+                        self.started_compound = true;
+                    }
+                    self.depth += 1;
+                }
+                b'}' | b']' => {
+                    if self.depth == 0 {
+                        self.malformed = true;
+                    } else {
+                        self.depth -= 1;
+                        if self.depth == 0 && self.started_compound {
+                            self.closed_compound = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn is_complete_compound(&self) -> bool {
+        self.started_compound && self.closed_compound && !self.in_string && !self.malformed
+    }
+}
+
 pub(super) struct StreamAssembler {
     line_buf: Vec<u8>,
     line_pos: usize,
+    line_scan_pos: usize,
     event: String,
     has_event_fields: bool,
     data: String,
+    data_json: JsonScanState,
     pending: String,
     state: TextState,
     visible: String,
@@ -224,9 +293,11 @@ impl StreamAssembler {
         Self {
             line_buf: Vec::new(),
             line_pos: 0,
+            line_scan_pos: 0,
             event: String::new(),
             has_event_fields: false,
             data: String::new(),
+            data_json: JsonScanState::default(),
             pending: String::new(),
             state: TextState::Visible,
             visible: String::new(),
@@ -266,9 +337,14 @@ impl StreamAssembler {
         self.line_buf.extend_from_slice(chunk);
         let mut buf = std::mem::take(&mut self.line_buf);
         let mut pos = self.line_pos;
+        let mut scan_pos = self.line_scan_pos.max(pos);
         let mut outcome: Result<bool, String> = Ok(false);
-        while let Some(rel) = buf[pos..].iter().position(|&b| b == b'\n') {
-            let end = pos + rel;
+        while let Some(rel) = buf[scan_pos..].iter().position(|&b| b == b'\n') {
+            let end = scan_pos + rel;
+            if end - pos > MAX_SSE_LINE_BYTES {
+                outcome = Err("模型流单行内容超出大小上限".into());
+                break;
+            }
             let line = match std::str::from_utf8(&buf[pos..end]) {
                 Ok(s) => s.trim_end_matches('\r'),
                 Err(_) => {
@@ -277,6 +353,7 @@ impl StreamAssembler {
                 }
             };
             pos = end + 1;
+            scan_pos = pos;
             if let Err(err) = self.read_line(line, tx) {
                 outcome = Err(err);
                 break;
@@ -286,15 +363,24 @@ impl StreamAssembler {
                 break;
             }
         }
+        if outcome.is_ok() && !self.saw_done {
+            scan_pos = buf.len();
+            if buf.len().saturating_sub(pos) > MAX_SSE_LINE_BYTES {
+                outcome = Err("模型流单行内容超出大小上限".into());
+            }
+        }
         if pos == buf.len() {
             buf.clear();
             pos = 0;
+            scan_pos = 0;
         } else if pos >= 4096 {
             buf.drain(..pos);
+            scan_pos = scan_pos.saturating_sub(pos);
             pos = 0;
         }
         self.line_buf = buf;
         self.line_pos = pos;
+        self.line_scan_pos = scan_pos;
         if outcome? {
             return Ok(true);
         }
@@ -354,25 +440,35 @@ impl StreamAssembler {
 
     fn read_line(&mut self, line: &str, tx: &Sender<StreamMsg>) -> Result<(), String> {
         if let Some(value) = line.strip_prefix("data:") {
+            let payload = value.strip_prefix(' ').unwrap_or(value);
             if !self.data.is_empty() {
                 // Legacy streams put independent JSON objects on adjacent data lines.
                 // A complete first object followed by more JSON cannot be a multiline object.
                 if !value.trim().is_empty()
                     && (self.data.trim() == "[DONE]"
-                        || serde_json::from_str::<JsonValue>(&self.data).is_ok())
+                        || (self.data_json.is_complete_compound()
+                            && serde_json::from_str::<JsonValue>(&self.data).is_ok()))
                 {
                     self.dispatch(tx)?;
                 } else {
+                    if self.data.len().saturating_add(1) > MAX_SSE_EVENT_BYTES {
+                        return Err("模型流单个事件超出大小上限".into());
+                    }
                     self.data.push('\n');
+                    self.data_json.feed("\n");
                 }
             }
-            self.data.push_str(value.strip_prefix(' ').unwrap_or(value));
+            if self.data.len().saturating_add(payload.len()) > MAX_SSE_EVENT_BYTES {
+                return Err("模型流单个事件超出大小上限".into());
+            }
+            self.data.push_str(payload);
+            self.data_json.feed(payload);
         } else if line.is_empty() {
             self.dispatch(tx)?;
         } else {
             self.has_event_fields = true;
             if let Some(event) = line.strip_prefix("event:") {
-                self.event = event.trim().to_owned();
+                self.event = event.trim().chars().take(128).collect();
             }
         }
         Ok(())
@@ -380,6 +476,7 @@ impl StreamAssembler {
 
     fn dispatch(&mut self, tx: &Sender<StreamMsg>) -> Result<(), String> {
         let data = std::mem::take(&mut self.data);
+        self.data_json = JsonScanState::default();
         let event = std::mem::take(&mut self.event);
         self.has_event_fields = false;
         if event == "error" {
@@ -422,26 +519,39 @@ impl StreamAssembler {
         };
         if let Some(delta) = choice.get("delta").or_else(|| choice.get("message")) {
             if let Some(reasoning) = delta["reasoning_content"].as_str() {
-                self.native_reasoning
-                    .get_or_insert_with(String::new)
-                    .push_str(reasoning);
+                let slot = self.native_reasoning.get_or_insert_with(String::new);
+                if slot.len().saturating_add(reasoning.len()) > MAX_ACCUMULATED_TEXT_BYTES {
+                    return Err("模型思考内容超出大小上限".into());
+                }
+                slot.push_str(reasoning);
                 if !reasoning.is_empty() {
                     self.send_delta(tx, StreamMsg::ReasoningDelta(reasoning.to_owned()));
                 }
             }
             if let Some(content) = delta["content"].as_str() {
                 self.pending.push_str(content);
-                self.scan(false, tx);
+                self.scan(false, tx)?;
             }
             if let Some(calls) = delta["tool_calls"].as_array() {
                 for (position, call) in calls.iter().enumerate() {
                     let idx = call["index"].as_u64().map_or(position, |n| n as usize);
+                    if !self.native_calls.contains_key(&idx)
+                        && self.native_calls.len() >= MAX_TOOL_CALLS_PER_ROUND
+                    {
+                        return Err(format!(
+                            "单轮工具调用数量超过上限（最多 {MAX_TOOL_CALLS_PER_ROUND} 个）"
+                        ));
+                    }
                     let parts = self.native_calls.entry(idx).or_default();
                     merge_identifier(&mut parts.id, call["id"].as_str());
                     merge_identifier(&mut parts.name, call["function"]["name"].as_str());
-                    parts
-                        .arguments
-                        .push_str(call["function"]["arguments"].as_str().unwrap_or_default());
+                    let arg_piece = call["function"]["arguments"].as_str().unwrap_or_default();
+                    if parts.arguments.len().saturating_add(arg_piece.len())
+                        > MAX_ACCUMULATED_TEXT_BYTES
+                    {
+                        return Err("工具调用参数超出大小上限".into());
+                    }
+                    parts.arguments.push_str(arg_piece);
                 }
             }
         }
@@ -460,7 +570,7 @@ impl StreamAssembler {
 
     // Only a tool tag opened in visible text may reach the tool parser. Buffer partial tags
     // across deltas, including nested think sections and tag fragments split inside UTF-8 frames.
-    fn scan(&mut self, flush: bool, tx: &Sender<StreamMsg>) {
+    fn scan(&mut self, flush: bool, tx: &Sender<StreamMsg>) -> Result<(), String> {
         let mut consumed = 0;
         let mut out_deltas: Vec<(bool, String)> = Vec::new();
         while consumed < self.pending.len() {
@@ -488,13 +598,25 @@ impl StreamAssembler {
             if !piece.is_empty() {
                 match self.state {
                     TextState::Visible => {
+                        if self.visible.len().saturating_add(piece.len())
+                            > MAX_ACCUMULATED_TEXT_BYTES
+                        {
+                            return Err("模型回复正文超出大小上限".into());
+                        }
                         self.visible.push_str(piece);
                         out_deltas.push((true, piece.to_owned()));
                     }
                     TextState::Thinking(_) => {
                         out_deltas.push((false, piece.to_owned()));
                     }
-                    TextState::Tool => self.tool_text.push_str(piece),
+                    TextState::Tool => {
+                        if self.tool_text.len().saturating_add(piece.len())
+                            > MAX_ACCUMULATED_TEXT_BYTES
+                        {
+                            return Err("模型工具标签内容超出大小上限".into());
+                        }
+                        self.tool_text.push_str(piece);
+                    }
                 }
             }
             consumed += end;
@@ -508,6 +630,11 @@ impl StreamAssembler {
                 (_, "<think>") => TextState::Thinking(1),
                 (_, "<tool_call>") => TextState::Tool,
                 (_, "</tool_call>") => {
+                    if self.tagged_calls.len() >= MAX_TOOL_CALLS_PER_ROUND {
+                        return Err(format!(
+                            "单轮工具调用数量超过上限（最多 {MAX_TOOL_CALLS_PER_ROUND} 个）"
+                        ));
+                    }
                     self.tagged_calls.push(parse_tagged_call(&self.tool_text));
                     self.tool_text.clear();
                     TextState::Visible
@@ -528,12 +655,17 @@ impl StreamAssembler {
             };
             self.send_delta(tx, msg);
         }
+        Ok(())
     }
 
     pub(super) fn finish(&mut self, tx: &Sender<StreamMsg>) -> Result<(), String> {
         if !self.saw_done {
             let bytes = std::mem::take(&mut self.line_buf);
             let pos = std::mem::replace(&mut self.line_pos, 0);
+            self.line_scan_pos = 0;
+            if bytes.len().saturating_sub(pos) > MAX_SSE_LINE_BYTES {
+                return Err("模型流单行内容超出大小上限".into());
+            }
             let line = std::str::from_utf8(&bytes[pos..]).map_err(|_| "模型流包含无效 UTF-8")?;
             if !line.is_empty() {
                 self.read_line(line.trim_end_matches('\r'), tx)?;
@@ -543,7 +675,7 @@ impl StreamAssembler {
         if !self.saw_done && self.finish_reason.is_none() {
             return Err("模型连接在返回完成标记前断开，已保留收到的正文，本轮工具未执行".into());
         }
-        self.scan(true, tx);
+        self.scan(true, tx)?;
         // Nesting is counted so a tag merely mentioned while thinking cannot end the section
         // early and expose drafted tool calls. The price is that an unbalanced reply stays in
         // the thinking section; say so instead of reporting an empty answer.
@@ -589,11 +721,20 @@ impl StreamAssembler {
             })
             .collect::<Result<_, _>>()?;
         for parts in std::mem::take(&mut self.native_calls).into_values() {
-            let args = serde_json::from_str(&parts.arguments)
-                .map_err(|e| format!("工具参数 JSON 格式错误：{e}"))?;
+            let args = if parts.arguments.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&parts.arguments)
+                    .map_err(|e| format!("工具参数 JSON 格式错误：{e}"))?
+            };
             let spec = tool_spec(&parts.name, args)?;
             if !parts.id.is_empty() && calls.iter().any(|c| c.id == parts.id) {
                 return Err("工具调用 ID 重复".into());
+            }
+            if calls.len() >= MAX_TOOL_CALLS_PER_ROUND {
+                return Err(format!(
+                    "单轮工具调用数量超过上限（最多 {MAX_TOOL_CALLS_PER_ROUND} 个）"
+                ));
             }
             calls.push(WireToolCall { id: parts.id, spec });
         }
@@ -980,5 +1121,33 @@ mod tests {
             let events: Vec<_> = rx.try_iter().collect();
             assert!(matches!(events.as_slice(), [StreamMsg::ContentDelta(s)] if s == "正文"));
         }
+    }
+
+    #[test]
+    fn ai_protocol_accepts_empty_tool_args_and_enforces_call_and_line_caps() {
+        // 1) Empty native tool arguments ("") must default to {} instead of failing the batch
+        let empty_args = frame(
+            json!({"tool_calls":[{"index":0,"id":"c1","function":{"name":"inspect_workbook","arguments":""}}]}),
+            json!("tool_calls"),
+        ) + "data: [DONE]\n\n";
+        let events = collect(&empty_args).unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(StreamMsg::RoundDone { tool_calls: Ok(calls), .. })
+            if calls.len() == 1 && calls[0].spec.name == "inspect_workbook" && calls[0].spec.arguments == json!({})
+        ));
+
+        // 2) Exceeding MAX_TOOL_CALLS_PER_ROUND must fail cleanly
+        let too_many: Vec<_> = (0..=MAX_TOOL_CALLS_PER_ROUND)
+            .map(|i| json!({"index": i, "id": format!("c{i}"), "function": {"name": "inspect_workbook", "arguments": "{}"}}))
+            .collect();
+        let over_calls = frame(json!({"tool_calls": too_many}), json!("tool_calls")) + "data: [DONE]\n\n";
+        assert!(collect(&over_calls).is_err(), "too many tool calls must be rejected");
+
+        // 3) Single SSE line exceeding MAX_SSE_LINE_BYTES must fail cleanly
+        let (tx, _) = mpsc::channel();
+        let mut stream = StreamAssembler::new(None);
+        let huge = vec![b'a'; MAX_SSE_LINE_BYTES + 16];
+        assert!(stream.feed_bytes(&huge, &tx).is_err(), "overlong SSE line must be rejected");
     }
 }

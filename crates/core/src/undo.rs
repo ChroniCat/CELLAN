@@ -65,7 +65,14 @@ pub fn snapshot_sheet(sheet: &Sheet, idx: usize) -> SheetSnapshot {
         sheet: idx,
         cells: sheet
             .iter_views()
-            .map(|(k, c)| (k.row, k.col, c.to_cell(), sheet.style_of(k.row, k.col)))
+            .map(|(k, c)| {
+                (
+                    k.row,
+                    k.col,
+                    c.to_cell(),
+                    sheet.explicit_style_of(k.row, k.col).unwrap_or(0),
+                )
+            })
             .collect(),
         merges: sheet.merges.to_vec(),
         notes: sheet.notes.iter().map(|(k, v)| ((k.row, k.col), v.clone())).collect(),
@@ -74,10 +81,20 @@ pub fn snapshot_sheet(sheet: &Sheet, idx: usize) -> SheetSnapshot {
 }
 
 pub fn restore_sheet(sheet: &mut Sheet, snap: &SheetSnapshot) {
+    let old_keys: Vec<CellRef> = sheet.iter_views().map(|(k, _)| k).collect();
+    let old_styles: Vec<CellRef> = sheet.styles.iter().map(|(k, _)| k).collect();
     sheet.clear();
+    for k in old_keys {
+        sheet.cleared.insert(k);
+    }
+    for k in old_styles {
+        sheet.set_style(k.row, k.col, 0);
+    }
     for (r, c, cell, st) in snap.cells.iter() {
         sheet.set(*r, *c, cell.clone());
-        sheet.set_style(*r, *c, *st);
+        if *st != 0 {
+            sheet.set_style(*r, *c, *st);
+        }
     }
     sheet.merges = snap.merges.clone().into();
     sheet.merges_dirty = true;
@@ -2217,6 +2234,8 @@ struct ForeignReferences {
 
 type PendingPivot = (usize, crate::pivot::PivotSpec, crate::pivot::PivotResult,
     (u32, u32, u32, u32), String);
+type PendingPivot2 = (usize, crate::pivot_multi::PivotSpec2, crate::pivot_multi::PivotGrid,
+    (u32, u32, u32, u32));
 
 /// A structural edit owns one complete sheet, plus only the foreign formulas
 /// and reference metadata that the edit changes. Unrelated sheets' value cells
@@ -2232,6 +2251,9 @@ pub struct StructureSnapshot {
     names: Vec<(String, Option<usize>, String)>,
     pivot_shifts: Vec<(String, u8, u32, u32, bool)>,
     pending_pivots: Vec<PendingPivot>,
+    pending_pivots2: Vec<PendingPivot2>,
+    pivots: Vec<crate::pivot_engine::PivotTableModel>,
+    pivots_removed_parts: Vec<String>,
 }
 
 pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::Structural) -> StructureSnapshot {
@@ -2248,6 +2270,9 @@ pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::S
         names: wb.names.clone(),
         pivot_shifts: wb.pivot_shifts.clone(),
         pending_pivots: wb.pivots_pending.clone(),
+        pending_pivots2: wb.pivots_pending2.clone(),
+        pivots: wb.pivots.clone(),
+        pivots_removed_parts: wb.pivots_removed_parts.clone(),
     }
 }
 
@@ -2284,6 +2309,9 @@ impl StructureSnapshot {
             names: wb.names.clone(),
             pivot_shifts: wb.pivot_shifts.clone(),
             pending_pivots: wb.pivots_pending.clone(),
+            pending_pivots2: wb.pivots_pending2.clone(),
+            pivots: wb.pivots.clone(),
+            pivots_removed_parts: wb.pivots_removed_parts.clone(),
         }
     }
 }
@@ -2372,6 +2400,10 @@ impl StructureSnapshot {
                 |history| history.matches(s,&self.target)))
             && (self.pivot_shifts == desired.pivot_shifts || wb.pivot_shifts == self.pivot_shifts)
             && (self.pending_pivots == desired.pending_pivots || wb.pivots_pending == self.pending_pivots)
+            && (self.pending_pivots2 == desired.pending_pivots2 || wb.pivots_pending2 == self.pending_pivots2)
+            && (self.pivots == desired.pivots || wb.pivots == self.pivots)
+            && (self.pivots_removed_parts == desired.pivots_removed_parts
+                || wb.pivots_removed_parts == self.pivots_removed_parts)
             && self.foreign.iter().all(|expected| {
                 let Some(sheet) = wb.sheets.get(expected.sheet) else { return false };
                 sheet.identity == expected.identity
@@ -2564,6 +2596,15 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     // the full entry on undo; save keeps this session-owned list authoritative.
     if expected.pending_pivots != snap.pending_pivots {
         wb.pivots_pending.clone_from(&snap.pending_pivots);
+    }
+    if expected.pending_pivots2 != snap.pending_pivots2 {
+        wb.pivots_pending2.clone_from(&snap.pending_pivots2);
+    }
+    if expected.pivots != snap.pivots {
+        wb.pivots.clone_from(&snap.pivots);
+    }
+    if expected.pivots_removed_parts != snap.pivots_removed_parts {
+        wb.pivots_removed_parts.clone_from(&snap.pivots_removed_parts);
     }
     wb.dirty = true;
     touched.sort_unstable();

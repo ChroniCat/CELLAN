@@ -980,7 +980,7 @@ fn parse_a1_bytes(b: &[u8]) -> Option<(u32, u32)> {
         return None;
     }
     let row = parse_u32_ascii(&b[i..])?;
-    if row == 0 || col == 0 {
+    if row == 0 || row > 1_048_576 || col == 0 || col > 16_384 {
         return None;
     }
     Some((row - 1, col - 1))

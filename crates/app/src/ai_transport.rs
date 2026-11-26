@@ -9,6 +9,8 @@ use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BUFFER_BYTES: usize = 8192;
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ROUND_DURATION: Duration = Duration::from_secs(600);
 // A few gateways leave their text-only final data line without an SSE separator or EOF.
 const UNFRAMED_TERMINAL_GRACE: Duration = Duration::from_secs(1);
 
@@ -161,6 +163,9 @@ fn receive_body(
             trace.first_byte_ms = Some(trace.elapsed());
         }
         trace.bytes += n;
+        if trace.bytes > MAX_RESPONSE_BYTES {
+            return Err("模型响应正文超出安全大小上限".into());
+        }
         if success {
             trace.stage = "sse";
             let complete = assembler.feed_bytes(&buf[..n], tx);
@@ -476,6 +481,18 @@ mod platform {
             },
             "构造 HTTP 请求失败",
         )?;
+        let redirect_policy: u32 = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        if unsafe {
+            WinHttpSetOption(
+                req.0,
+                WINHTTP_OPTION_REDIRECT_POLICY,
+                (&raw const redirect_policy).cast(),
+                size_of::<u32>() as u32,
+            )
+        } == 0
+        {
+            return Err(win_error("设置重定向策略失败", unsafe { GetLastError() }));
+        }
 
         let (events, rx) = mpsc::channel();
         cancel.register({
@@ -526,20 +543,37 @@ mod platform {
             return Err(err);
         }
         // The final callback now owns the context and both I/O buffers.
+        let round_deadline = Instant::now() + MAX_ROUND_DURATION;
         let wait_for = |ok: i32, expected: u32, unframed_terminal: bool| -> Result<u32, u32> {
             if ok == 0 {
                 return Err(unsafe { GetLastError() });
             }
+            let Some(remaining) = round_deadline.checked_duration_since(Instant::now()) else {
+                return Err(ERROR_WINHTTP_TIMEOUT);
+            };
+            if remaining.is_zero() {
+                return Err(ERROR_WINHTTP_TIMEOUT);
+            }
             let event = if unframed_terminal {
                 // Only used for QueryDataAvailable after a text-only terminal line.
                 // On idle, receive_body finishes and drops the outstanding request.
-                match rx.recv_timeout(UNFRAMED_TERMINAL_GRACE) {
+                let wait_dur = remaining.min(UNFRAMED_TERMINAL_GRACE);
+                match rx.recv_timeout(wait_dur) {
                     Ok(event) => event,
-                    Err(mpsc::RecvTimeoutError::Timeout) => return Ok(0),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if Instant::now() >= round_deadline {
+                            return Err(ERROR_WINHTTP_TIMEOUT);
+                        }
+                        return Ok(0);
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Err(12004),
                 }
             } else {
-                rx.recv().map_err(|_| 12004u32)?
+                match rx.recv_timeout(remaining) {
+                    Ok(event) => event,
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Err(ERROR_WINHTTP_TIMEOUT),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(12004),
+                }
             };
             match event {
                 Event::Complete { status, size } if status == expected => Ok(size),
@@ -702,11 +736,15 @@ mod platform {
         } else {
             format!("Authorization: Bearer {}\r\n", api_key.trim())
         };
+        let host_hdr = if ep.host.contains(':') && !ep.host.starts_with('[') {
+            format!("[{}]:{}", ep.host, ep.port)
+        } else {
+            format!("{}:{}", ep.host, ep.port)
+        };
         let headers = format!(
-            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n{}\r\n",
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n{}\r\n",
             ep.base_path,
-            ep.host,
-            ep.port,
+            host_hdr,
             body.len(),
             auth
         );

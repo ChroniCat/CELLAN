@@ -20,36 +20,48 @@ fn sort_key_cmp(a: &FValue, b: &FValue) -> std::cmp::Ordering {
 pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
     let v = match name {
         "SEQUENCE" => r(|| {
-            let rows = int_arg(args, 0)?.max(1) as usize;
-            let cols = match args.get(1) {
-                Some(_) => int_arg(args, 1)?.max(1) as usize,
+            let rows_i = int_arg(args, 0)?;
+            let cols_i = match args.get(1) {
+                Some(_) => int_arg(args, 1)?,
                 None => 1,
             };
+            if rows_i <= 0 || cols_i <= 0 {
+                return Err(ErrKind::Calc);
+            }
+            let rows = usize::try_from(rows_i).map_err(|_| ErrKind::Num)?;
+            let cols = usize::try_from(cols_i).map_err(|_| ErrKind::Num)?;
+            let total = super::checked_array_len(rows, cols, super::MAX_ARRAY_CELLS)?;
             let start = opt_num(args, 2, 1.0)?;
             let step = opt_num(args, 3, 1.0)?;
-            let mut data = Vec::with_capacity(rows * cols);
-            for i in 0..rows * cols {
+            let mut data = Vec::with_capacity(total);
+            for i in 0..total {
                 data.push(FValue::number(start + step * i as f64));
             }
             Ok(arr(Array::new(rows, cols, data)))
         }),
         "RANDARRAY" => r(|| {
-            let rows = match args.first() {
-                Some(_) => int_arg(args, 0)?.max(1) as usize,
+            let rows_i = match args.first() {
+                Some(_) => int_arg(args, 0)?,
                 None => 1,
             };
-            let cols = match args.get(1) {
-                Some(_) => int_arg(args, 1)?.max(1) as usize,
+            let cols_i = match args.get(1) {
+                Some(_) => int_arg(args, 1)?,
                 None => 1,
             };
+            if rows_i <= 0 || cols_i <= 0 {
+                return Err(ErrKind::Calc);
+            }
+            let rows = usize::try_from(rows_i).map_err(|_| ErrKind::Num)?;
+            let cols = usize::try_from(cols_i).map_err(|_| ErrKind::Num)?;
+            let total = super::checked_array_len(rows, cols, super::MAX_ARRAY_CELLS)?;
             let min = opt_num(args, 2, 0.0)?;
             let max = opt_num(args, 3, 1.0)?;
             let whole = args.get(4).map(|a| a.first().to_bool().unwrap_or(false)).unwrap_or(false);
             if min > max {
                 return Err(ErrKind::Value);
             }
-            let mut data = Vec::with_capacity(rows * cols);
-            for _ in 0..rows * cols {
+            let mut data = Vec::with_capacity(total);
+            for _ in 0..total {
                 let t = pseudo_random();
                 let val = if whole {
                     let lo = min.ceil();
@@ -67,7 +79,11 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
         }),
         "TRANSPOSE" => r(|| {
             let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
-            let mut out = vec![FValue::Empty; rows * cols];
+            let total = super::checked_array_len(rows, cols, super::MAX_ARRAY_CELLS)?;
+            if data.len() < total {
+                return Err(ErrKind::Value);
+            }
+            let mut out = vec![FValue::Empty; total];
             for r0 in 0..rows {
                 for c0 in 0..cols {
                     out[c0 * rows + r0] = data[r0 * cols + c0].clone();
@@ -523,13 +539,19 @@ pub fn call_array(name: &str, args: &[Arg]) -> Option<FValue> {
         }),
         "EXPAND" => r(|| {
             let (rows, cols, data) = args.first().ok_or(ErrKind::Value)?.grid_slice();
-            let new_rows = int_arg(args, 1)?.max(rows as i64) as usize;
-            let new_cols = match args.get(2) {
-                Some(_) => int_arg(args, 2)?.max(cols as i64) as usize,
-                None => cols,
+            let req_rows = int_arg(args, 1)?;
+            let req_cols = match args.get(2) {
+                Some(_) => int_arg(args, 2)?,
+                None => cols as i64,
             };
+            if req_rows < rows as i64 || req_cols < cols as i64 || req_rows <= 0 || req_cols <= 0 {
+                return Err(ErrKind::Value);
+            }
+            let new_rows = usize::try_from(req_rows).map_err(|_| ErrKind::Num)?;
+            let new_cols = usize::try_from(req_cols).map_err(|_| ErrKind::Num)?;
+            let total = super::checked_array_len(new_rows, new_cols, super::MAX_ARRAY_CELLS)?;
             let pad = args.get(3).map(|a| a.first()).unwrap_or(FValue::Error(ErrKind::Na));
-            let mut out = vec![pad; new_rows * new_cols];
+            let mut out = vec![pad; total];
             for i in 0..rows {
                 out[i * new_cols..i * new_cols + cols]
                     .clone_from_slice(&data[i * cols..(i + 1) * cols]);

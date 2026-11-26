@@ -1226,6 +1226,9 @@ impl Sheet {
     }
 
     pub fn set(&mut self, r: u32, c: u32, cell: Cell) {
+        if r >= crate::sync::MAX_ROWS || c >= crate::sync::MAX_COLS {
+            return;
+        }
         if !self.loading {
             self.edited = true;
         }

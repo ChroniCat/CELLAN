@@ -42,7 +42,7 @@ fn literal(
     dc: i64,
 ) -> Option<f64> {
     match node {
-        Node::Number(value) => Some(*value),
+        Node::Number(value) => value.is_finite().then_some(*value),
         Node::Ref(reference)
             if reference.sheet.is_none()
                 && reference.sheet2.is_none()
@@ -224,7 +224,7 @@ fn evaluate_cell<'a>(
             super::compiled::eval_projected_scalar(node, dr, dc, &mut |_, r, c| {
                 match wb.sheet(sheet).get_view(r, c) {
                     None => Some(FValue::Empty),
-                    Some(crate::store::CellView::Number(n)) => Some(FValue::Number(n)),
+                    Some(crate::store::CellView::Number(n)) => Some(FValue::number(n)),
                     Some(crate::store::CellView::Value(v)) => Some(super::to_fvalue(v)),
                     Some(crate::store::CellView::Cell(cell)) => {
                         if cell.formula.is_some()
@@ -250,7 +250,7 @@ fn evaluate_cell<'a>(
                 };
                 match wb.sheet(target_si).get_view(r, c) {
                     None => Some(FValue::Empty),
-                    Some(crate::store::CellView::Number(n)) => Some(FValue::Number(n)),
+                    Some(crate::store::CellView::Number(n)) => Some(FValue::number(n)),
                     Some(crate::store::CellView::Value(v)) => Some(super::to_fvalue(v)),
                     Some(crate::store::CellView::Cell(cell)) => {
                         if cell.formula.is_some()

@@ -25,7 +25,10 @@ const DEFAULT_BASE_URL: &str = "https://deepseek.hollantex.net/v1";
 const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
 const MAX_TOOL_ROUNDS: usize = 64;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+const AI_KEY_DPAPI_ENTROPY: &[u8] = b"CELLAN-AI-CONFIG-V1";
+const AI_KEY_DPAPI_PREFIX: &str = "dpapi:";
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct AiConfig {
     pub provider_id: String,
     pub display_name: String,
@@ -35,6 +38,27 @@ pub struct AiConfig {
     pub model: String,
     pub native_tools: bool,
     pub allow_unframed_text: bool,
+}
+
+impl std::fmt::Debug for AiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiConfig")
+            .field("provider_id", &self.provider_id)
+            .field("display_name", &self.display_name)
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                if self.api_key.is_empty() {
+                    &""
+                } else {
+                    &"<redacted>"
+                },
+            )
+            .field("model", &self.model)
+            .field("native_tools", &self.native_tools)
+            .field("allow_unframed_text", &self.allow_unframed_text)
+            .finish()
+    }
 }
 
 impl Default for AiConfig {
@@ -74,8 +98,22 @@ impl AiConfig {
                 "provider_id" if !v.is_empty() => cfg.provider_id = v.to_string(),
                 "display_name" if !v.is_empty() => cfg.display_name = v.to_string(),
                 "base_url" if !v.is_empty() => cfg.base_url = v.to_string(),
-                // 旧版本用这个占位符指代随程序分发的密钥。
-                "api_key" => cfg.api_key = if v == "@builtin" { String::new() } else { v.into() },
+                // 旧版本用这个占位符指代随程序分发的密钥；新版使用 DPAPI 加密落盘。
+                "api_key" => {
+                    cfg.api_key = if v == "@builtin" || v.is_empty() {
+                        String::new()
+                    } else if let Some(hex_blob) = v.strip_prefix(AI_KEY_DPAPI_PREFIX) {
+                        hex::decode(hex_blob)
+                            .ok()
+                            .and_then(|blob| {
+                                sheetcore::audit::dpapi_unprotect(&blob, AI_KEY_DPAPI_ENTROPY).ok()
+                            })
+                            .and_then(|plain| String::from_utf8(plain).ok())
+                            .unwrap_or_default()
+                    } else {
+                        v.into()
+                    };
+                }
                 "model" if !v.is_empty() => cfg.model = v.to_string(),
                 "native_tools" => cfg.native_tools = v != "0",
                 "allow_unframed_text" => cfg.allow_unframed_text = v == "1",
@@ -92,27 +130,63 @@ impl AiConfig {
         }
     }
 
-    pub fn save_to(&self, path: &Path) {
+    pub fn try_save_to(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建配置目录失败：{e}"))?;
         }
+        let clean_line = |s: &str| s.replace(['\r', '\n'], " ").trim().to_string();
+        let raw_key = clean_line(&self.api_key);
+        let stored_key = if raw_key.is_empty() {
+            String::new()
+        } else {
+            let enc = sheetcore::audit::dpapi_protect(raw_key.as_bytes(), AI_KEY_DPAPI_ENTROPY)
+                .map_err(|e| format!("加密保存 API Key 失败：{e}"))?;
+            format!("{AI_KEY_DPAPI_PREFIX}{}", hex::encode(enc))
+        };
         let body = format!(
             "provider_id={}\ndisplay_name={}\nbase_url={}\napi_key={}\nmodel={}\nnative_tools={}\nallow_unframed_text={}\n",
-            self.provider_id.trim(),
-            self.display_name.trim(),
-            self.base_url.trim(),
-            self.api_key.trim(),
-            self.model.trim(),
+            clean_line(&self.provider_id),
+            clean_line(&self.display_name),
+            clean_line(&self.base_url),
+            stored_key,
+            clean_line(&self.model),
             u8::from(self.native_tools),
             u8::from(self.allow_unframed_text),
         );
-        let _ = std::fs::write(path, body);
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "ai.ini".into());
+        let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| format!("创建临时配置文件失败：{e}"))?;
+            f.write_all(body.as_bytes())
+                .and_then(|_| f.sync_all())
+                .map_err(|e| format!("写入配置文件失败：{e}"))?;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("替换配置文件失败：{e}"));
+        }
+        Ok(())
+    }
+
+    pub fn save_to(&self, path: &Path) {
+        let _ = self.try_save_to(path);
+    }
+
+    pub fn try_save(&self) -> Result<(), String> {
+        let Some(p) = config_path() else {
+            return Err("无法定位配置目录".into());
+        };
+        self.try_save_to(&p)
     }
 
     pub fn save(&self) {
-        if let Some(p) = config_path() {
-            self.save_to(&p);
-        }
+        let _ = self.try_save();
     }
 }
 
@@ -239,40 +313,77 @@ struct ParsedUrl {
 }
 
 fn parse_endpoint(base_url: &str) -> Result<ParsedUrl, String> {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    let (https, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
+    let trimmed = base_url.trim();
+    let without_frag = trimmed.split('#').next().unwrap_or(trimmed).trim();
+    let (https, rest) = if let Some(r) = without_frag.strip_prefix("https://") {
         (true, r)
-    } else if let Some(r) = trimmed.strip_prefix("http://") {
+    } else if let Some(r) = without_frag.strip_prefix("http://") {
         (false, r)
     } else {
         return Err("接口地址需以 https:// 或 http:// 开头".into());
     };
-    let (host_port, path_part) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, ""),
+    let (before_query, query_part) = match rest.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (rest, None),
     };
+    let (host_port, raw_path) = match before_query.find('/') {
+        Some(idx) => (&before_query[..idx], &before_query[idx..]),
+        None => (before_query, ""),
+    };
+    let path_part = raw_path.trim_end_matches('/');
     if host_port.is_empty() {
         return Err("接口地址缺少主机名".into());
     }
-    let (host, port) = if let Some((h, p)) = host_port.rsplit_once(':') {
+    let default_port = if https { 443 } else { 80 };
+    let (host, port) = if let Some(after_bracket) = host_port.strip_prefix('[') {
+        let end = after_bracket
+            .find(']')
+            .ok_or_else(|| "IPv6 主机地址缺少右括号".to_string())?;
+        let h = &after_bracket[..end];
+        if h.is_empty() {
+            return Err("接口地址缺少主机名".into());
+        }
+        let tail = &after_bracket[end + 1..];
+        let p = if tail.is_empty() {
+            default_port
+        } else if let Some(ps) = tail.strip_prefix(':') {
+            ps.parse::<u16>()
+                .map_err(|_| format!("接口端口无效：{ps}"))?
+        } else {
+            return Err(format!("接口主机格式无效：{host_port}"));
+        };
+        (h.to_string(), p)
+    } else if let Some((h, p)) = host_port.rsplit_once(':') {
+        if h.contains(':') {
+            return Err("IPv6 地址请使用方括号包裹，例如 http://[::1]:8080/v1".into());
+        }
         let parsed = p
             .parse::<u16>()
             .map_err(|_| format!("接口端口无效：{p}"))?;
         (h.to_string(), parsed)
     } else {
-        (host_port.to_string(), if https { 443 } else { 80 })
+        (host_port.to_string(), default_port)
     };
+    if host.is_empty() || port == 0 {
+        return Err("接口地址主机或端口无效".into());
+    }
     // 明文 http 会把 Bearer 密钥和表格内容裸奔在网络上：只允许本机回环
     if !https && !is_loopback_host(&host) {
         return Err("出于安全考虑，非本机地址必须使用 https://（http:// 仅限 localhost / 127.0.0.1）".into());
     }
-    let completions_path = if path_part.ends_with("/chat/completions") {
+    let mut completions_path = if path_part.ends_with("/chat/completions") {
         path_part.to_string()
     } else if path_part.is_empty() {
         "/v1/chat/completions".to_string()
     } else {
         format!("{path_part}/chat/completions")
     };
+    if let Some(q) = query_part
+        && !q.is_empty()
+    {
+        completions_path.push('?');
+        completions_path.push_str(q);
+    }
     Ok(ParsedUrl {
         https,
         host,
@@ -543,9 +654,48 @@ fn json_to_cell_value(v: &JsonValue) -> Value {
     match v {
         JsonValue::Null => Value::Empty,
         JsonValue::Bool(b) => Value::Bool(*b),
-        JsonValue::Number(n) => Value::Number(n.as_f64().unwrap_or(0.0)),
-        JsonValue::String(s) => Value::parse_input(s),
+        JsonValue::Number(n) => n
+            .as_f64()
+            .filter(|x| x.is_finite())
+            .map(Value::Number)
+            .unwrap_or_else(|| Value::Text(n.to_string().into())),
+        JsonValue::String(s) => {
+            if s.is_empty() {
+                Value::Empty
+            } else {
+                Value::Text(s.as_str().into())
+            }
+        }
         other => Value::Text(other.to_string().into()),
+    }
+}
+
+struct AiSelectionScope<'a> {
+    app: &'a mut SheetApp,
+    saved: (usize, (u32, u32), (u32, u32), Vec<(u32, u32, u32, u32)>),
+}
+
+impl<'a> AiSelectionScope<'a> {
+    fn enter(app: &'a mut SheetApp, si: usize, r1: u32, c1: u32, r2: u32, c2: u32) -> Self {
+        let saved = (
+            app.sheet_idx,
+            app.sel,
+            app.sel_end,
+            std::mem::take(&mut app.extra_sel),
+        );
+        app.sheet_idx = si;
+        app.sel = (r1, c1);
+        app.sel_end = (r2, c2);
+        Self { app, saved }
+    }
+}
+
+impl Drop for AiSelectionScope<'_> {
+    fn drop(&mut self) {
+        self.app.sheet_idx = self.saved.0;
+        self.app.sel = self.saved.1;
+        self.app.sel_end = self.saved.2;
+        self.app.extra_sel = std::mem::take(&mut self.saved.3);
     }
 }
 
@@ -1039,75 +1189,114 @@ impl SheetApp {
         let Some((r1, c1, r2, c2)) = checked_ai_range(range_str) else {
             return ("设置样式失败".into(), json!({"ok": false, "error": "range 格式无效"}));
         };
-        let saved = (self.sheet_idx, self.sel, self.sel_end, self.extra_sel.clone());
-        self.sheet_idx = si;
-        self.sel = (r1, c1);
-        self.sel_end = (r2, c2);
-        self.extra_sel.clear();
 
         let bold = args.get("bold").and_then(|v| v.as_bool());
         let italic = args.get("italic").and_then(|v| v.as_bool());
-        let fill_rgb = args
-            .get("fill_hex")
-            .and_then(|v| v.as_str())
-            .and_then(parse_hex_rgb);
-        let clear_fill = args.get("fill_hex").is_some_and(|v| v.is_null());
-        let font_rgb = args
-            .get("font_hex")
-            .and_then(|v| v.as_str())
-            .and_then(parse_hex_rgb);
-        let halign = args.get("halign").and_then(|v| v.as_str()).and_then(|s| match s {
-            "left" => Some(1u8),
-            "center" => Some(2),
-            "right" => Some(3),
-            _ => None,
-        });
+        let (clear_fill, fill_rgb) = match args.get("fill_hex") {
+            None => (false, None),
+            Some(v) if v.is_null() => (true, None),
+            Some(v) => match v.as_str().and_then(parse_hex_rgb) {
+                Some(rgb) => (false, Some(rgb)),
+                None => {
+                    return (
+                        "设置样式失败".into(),
+                        json!({"ok": false, "error": "fill_hex 格式无效，应为 #RRGGBB 或 null"}),
+                    );
+                }
+            },
+        };
+        let font_rgb = match args.get("font_hex") {
+            None => None,
+            Some(v) if v.is_null() => None,
+            Some(v) => match v.as_str().and_then(parse_hex_rgb) {
+                Some(rgb) => Some(rgb),
+                None => {
+                    return (
+                        "设置样式失败".into(),
+                        json!({"ok": false, "error": "font_hex 格式无效，应为 #RRGGBB"}),
+                    );
+                }
+            },
+        };
+        let halign = match args.get("halign") {
+            None => None,
+            Some(v) if v.is_null() => None,
+            Some(v) => match v.as_str() {
+                Some("left") => Some(1u8),
+                Some("center") => Some(2),
+                Some("right") => Some(3),
+                _ => {
+                    return (
+                        "设置样式失败".into(),
+                        json!({"ok": false, "error": "halign 无效，应为 left / center / right"}),
+                    );
+                }
+            },
+        };
         let format = args.get("format").and_then(|v| v.as_str()).map(str::to_string);
-        let borders = args.get("borders").and_then(|v| v.as_str()).map(str::to_string);
+        let borders = match args.get("borders") {
+            None => None,
+            Some(v) if v.is_null() => None,
+            Some(v) => match v.as_str() {
+                Some(m @ ("all" | "outer" | "none")) => Some(m.to_string()),
+                _ => {
+                    return (
+                        "设置样式失败".into(),
+                        json!({"ok": false, "error": "borders 无效，应为 all / outer / none"}),
+                    );
+                }
+            },
+        };
+        if borders.as_deref() == Some("outer")
+            && ((r1 == 0 && r2 >= 1_000_000) || (c1 == 0 && c2 >= 16_000))
+        {
+            return (
+                "设置样式失败".into(),
+                json!({"ok": false, "error": "整行或整列不支持 outer 边框，请指定具体单元格区域"}),
+            );
+        }
 
         let generation = self.doc_gen;
-        self.apply_style_xy(|st, r, c| {
-            if let Some(b) = bold {
-                st.bold = b;
-            }
-            if let Some(it) = italic {
-                st.italic = it;
-            }
-            if clear_fill {
-                st.fill = None;
-            } else if let Some(rgb) = fill_rgb {
-                st.fill = Some(rgb);
-            }
-            if let Some(rgb) = font_rgb {
-                st.color = rgb;
-            }
-            if let Some(ha) = halign {
-                st.halign = ha;
-            }
-            if let Some(ref fmt) = format {
-                st.format = fmt.clone();
-            }
-            if let Some(ref bmode) = borders {
-                let bd = sheetcore::style::Border { style: 1, color: [0, 0, 0] };
-                let none = sheetcore::style::Border::default();
-                match bmode.as_str() {
-                    "all" => st.border = [bd; 4],
-                    "none" => st.border = [none; 4],
-                    "outer" => {
-                        if c == c1 { st.border[0] = bd; }
-                        if c == c2 { st.border[1] = bd; }
-                        if r == r1 { st.border[2] = bd; }
-                        if r == r2 { st.border[3] = bd; }
-                    }
-                    _ => {}
+        {
+            let scoped = AiSelectionScope::enter(self, si, r1, c1, r2, c2);
+            scoped.app.apply_style_xy(|st, r, c| {
+                if let Some(b) = bold {
+                    st.bold = b;
                 }
-            }
-        });
-
-        self.sheet_idx = saved.0;
-        self.sel = saved.1;
-        self.sel_end = saved.2;
-        self.extra_sel = saved.3;
+                if let Some(it) = italic {
+                    st.italic = it;
+                }
+                if clear_fill {
+                    st.fill = None;
+                } else if let Some(rgb) = fill_rgb {
+                    st.fill = Some(rgb);
+                }
+                if let Some(rgb) = font_rgb {
+                    st.color = rgb;
+                }
+                if let Some(ha) = halign {
+                    st.halign = ha;
+                }
+                if let Some(ref fmt) = format {
+                    st.format = fmt.clone();
+                }
+                if let Some(ref bmode) = borders {
+                    let bd = sheetcore::style::Border { style: 1, color: [0, 0, 0] };
+                    let none = sheetcore::style::Border::default();
+                    match bmode.as_str() {
+                        "all" => st.border = [bd; 4],
+                        "none" => st.border = [none; 4],
+                        "outer" => {
+                            if c == c1 { st.border[0] = bd; }
+                            if c == c2 { st.border[1] = bd; }
+                            if r == r1 { st.border[2] = bd; }
+                            if r == r2 { st.border[3] = bd; }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
 
         let span = range_label((r1, c1), (r2, c2));
         if self.doc_gen == generation {
@@ -1665,51 +1854,39 @@ impl SheetApp {
         }) {
             return ("合并失败".into(), json!({"ok": false, "error": "现有合并单元格跨出指定区域"})).into();
         }
-        let saved = (self.sheet_idx, self.sel, self.sel_end, self.extra_sel.clone());
-        self.sheet_idx = si;
-        self.sel = (r1, c1);
-        self.sel_end = (r2, c2);
-        self.extra_sel.clear();
-
         let generation = self.doc_gen;
-        let label = match op {
-            "sort_asc" => {
-                self.sort_region((r1, c1, r2, c2), c1, true);
-                "升序排序"
-            }
-            "sort_desc" => {
-                self.sort_region((r1, c1, r2, c2), c1, false);
-                "降序排序"
-            }
-            "highlight_duplicates" => {
-                self.highlight_duplicates();
-                "高亮重复值"
-            }
-            "deduplicate" => {
-                self.run_dedup();
-                "删除重复行"
-            }
-            "merge_same" => {
-                self.merge_same_cells();
-                "合并相同单元格"
-            }
-            "clear_contents" => {
-                self.clear_values();
-                "清除内容"
-            }
-            _ => {
-                self.sheet_idx = saved.0;
-                self.sel = saved.1;
-                self.sel_end = saved.2;
-                self.extra_sel = saved.3;
-                return ("数据操作失败".into(), json!({"ok": false, "error": "不支持的 op"})).into();
+        let label = {
+            let scoped = AiSelectionScope::enter(self, si, r1, c1, r2, c2);
+            match op {
+                "sort_asc" => {
+                    scoped.app.sort_region((r1, c1, r2, c2), c1, true);
+                    "升序排序"
+                }
+                "sort_desc" => {
+                    scoped.app.sort_region((r1, c1, r2, c2), c1, false);
+                    "降序排序"
+                }
+                "highlight_duplicates" => {
+                    scoped.app.highlight_duplicates();
+                    "高亮重复值"
+                }
+                "deduplicate" => {
+                    scoped.app.run_dedup();
+                    "删除重复行"
+                }
+                "merge_same" => {
+                    scoped.app.merge_same_cells();
+                    "合并相同单元格"
+                }
+                "clear_contents" => {
+                    scoped.app.clear_values();
+                    "清除内容"
+                }
+                _ => {
+                    return ("数据操作失败".into(), json!({"ok": false, "error": "不支持的 op"})).into();
+                }
             }
         };
-
-        self.sheet_idx = saved.0;
-        self.sel = saved.1;
-        self.sel_end = saved.2;
-        self.extra_sel = saved.3;
 
         let span = range_label((r1, c1), (r2, c2));
         if self.tasks.reorder.is_some() {
@@ -2051,20 +2228,29 @@ impl SheetApp {
                                             }
                                             self.ai.update_retry_tool_protocol(&next);
                                             self.ai.cfg = next;
-                                            self.ai.cfg.save();
-                                            self.ai.settings_open = false;
-                                            self.ai.show_key = false;
-                                            self.ai.status_hint = "模型配置已保存".into();
+                                            match self.ai.cfg.try_save() {
+                                                Ok(()) => {
+                                                    self.ai.settings_open = false;
+                                                    self.ai.show_key = false;
+                                                    self.ai.status_hint = "模型配置已保存".into();
+                                                }
+                                                Err(e) => {
+                                                    self.ai.status_hint =
+                                                        format!("模型配置已生效，但写入磁盘失败：{e}");
+                                                }
+                                            }
                                         }
                                         if ui_kit::secondary_button(ui, "恢复默认").clicked() {
                                             self.ai.draft_cfg = AiConfig::default();
                                             self.ai.active_round = None;
                                             self.ai.wire_history.clear();
                                             self.ai.cfg = self.ai.draft_cfg.clone();
-                                            self.ai.cfg.save();
+                                            let save_res = self.ai.cfg.try_save();
                                             self.ai.show_key = false;
-                                            self.ai.status_hint =
-                                                "已恢复默认配置，请填写自己的 API Key".into();
+                                            self.ai.status_hint = match save_res {
+                                                Ok(()) => "已恢复默认配置，请填写自己的 API Key".into(),
+                                                Err(e) => format!("已恢复默认配置，但写入磁盘失败：{e}"),
+                                            };
                                         }
                                     });
                                 });
@@ -3608,5 +3794,27 @@ mod grouped_undo_tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn ai_endpoint_ipv6_query_json_string_preservation_and_style_validation() {
+        // 1) IPv6 + query + fragment URL parsing
+        let ep = parse_endpoint("http://[::1]:8080/v1/?api-version=2024#frag").unwrap();
+        assert!(!ep.https);
+        assert_eq!(ep.host, "::1");
+        assert_eq!(ep.port, 8080);
+        assert_eq!(ep.base_path, "/v1/chat/completions?api-version=2024");
+
+        // 2) JSON strings write verbatim text (preserving leading zeros), numbers write numbers
+        assert_eq!(json_to_cell_value(&json!("00123")), Value::Text("00123".into()));
+        assert_eq!(json_to_cell_value(&json!("")), Value::Empty);
+        assert_eq!(json_to_cell_value(&json!(123)), Value::Number(123.0));
+
+        // 3) tool_style_range rejects invalid hex colors and axis-wide outer borders
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        let (_, bad_hex) = app.tool_style_range(&json!({"range": "A1:B2", "fill_hex": "not-a-color"}));
+        assert_eq!(bad_hex["ok"], false);
+        let (_, bad_outer) = app.tool_style_range(&json!({"range": "A:A", "borders": "outer"}));
+        assert_eq!(bad_outer["ok"], false);
     }
 }

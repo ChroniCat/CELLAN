@@ -170,7 +170,34 @@ enum Tok {
     Percent,
 }
 
+/// 单条公式最大允许字节数（Excel 限制 8,192 字符，留出结构化引用/整行展开余量）
+const MAX_FORMULA_BYTES: usize = 65_536;
+/// 语法解析最大递归嵌套层数（防止恶意深嵌套公式爆栈）
+const MAX_PARSE_DEPTH: usize = 128;
+/// AST 最大总高度（含二元左结合链与后缀链，确保求值/遍历/析构不超主线程栈）
+const MAX_AST_HEIGHT: usize = 256;
+/// 动态数组与区域物化上限（遵循 Excel 行列边界并防 OOM）
+pub(super) const MAX_ARRAY_ROWS: usize = 1_048_576;
+pub(super) const MAX_ARRAY_COLS: usize = 16_384;
+pub(super) const MAX_ARRAY_CELLS: usize = 16_000_000;
+/// LAMBDA 调用栈槽位上限（与 Excel 一致）
+const MAX_LAMBDA_SLOTS: usize = 1024;
+
+pub(super) fn checked_array_len(rows: usize, cols: usize, max_cells: usize) -> Result<usize, ErrKind> {
+    if rows == 0 || cols == 0 || rows > MAX_ARRAY_ROWS || cols > MAX_ARRAY_COLS {
+        return Err(ErrKind::Num);
+    }
+    let total = rows.checked_mul(cols).ok_or(ErrKind::Num)?;
+    if total > max_cells {
+        return Err(ErrKind::Num);
+    }
+    Ok(total)
+}
+
 fn lex(src: &str) -> Result<Vec<Tok>, ErrKind> {
+    if src.len() > MAX_FORMULA_BYTES {
+        return Err(ErrKind::Value);
+    }
     let bytes = src.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::with_capacity((bytes.len() / 3).max(4));
@@ -426,9 +453,22 @@ fn lex(src: &str) -> Result<Vec<Tok>, ErrKind> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
+    fn enter(&mut self) -> Result<(), ErrKind> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(ErrKind::Value);
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
     }
@@ -466,11 +506,15 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Node, ErrKind> {
-        self.parse_cmp()
+        self.enter()?;
+        let res = self.parse_cmp();
+        self.leave();
+        res
     }
 
     fn parse_cmp(&mut self) -> Result<Node, ErrKind> {
         let mut left = self.parse_concat()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek() {
                 Some(Tok::Op("=")) => BinOp::Eq,
@@ -481,6 +525,10 @@ impl Parser {
                 Some(Tok::Op(">=")) => BinOp::Ge,
                 _ => break,
             };
+            chain += 1;
+            if self.depth + chain > MAX_AST_HEIGHT {
+                return Err(ErrKind::Value);
+            }
             self.pos += 1;
             let right = self.parse_concat()?;
             left = Node::Binary(op, Box::new(left), Box::new(right));
@@ -490,7 +538,12 @@ impl Parser {
 
     fn parse_concat(&mut self) -> Result<Node, ErrKind> {
         let mut left = self.parse_add()?;
+        let mut chain = 0usize;
         while matches!(self.peek(), Some(Tok::Op("&"))) {
+            chain += 1;
+            if self.depth + chain > MAX_AST_HEIGHT {
+                return Err(ErrKind::Value);
+            }
             self.pos += 1;
             let right = self.parse_add()?;
             left = Node::Binary(BinOp::Concat, Box::new(left), Box::new(right));
@@ -500,12 +553,17 @@ impl Parser {
 
     fn parse_add(&mut self) -> Result<Node, ErrKind> {
         let mut left = self.parse_mul()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek() {
                 Some(Tok::Op("+")) => BinOp::Add,
                 Some(Tok::Op("-")) => BinOp::Sub,
                 _ => break,
             };
+            chain += 1;
+            if self.depth + chain > MAX_AST_HEIGHT {
+                return Err(ErrKind::Value);
+            }
             self.pos += 1;
             let right = self.parse_mul()?;
             left = Node::Binary(op, Box::new(left), Box::new(right));
@@ -515,12 +573,17 @@ impl Parser {
 
     fn parse_mul(&mut self) -> Result<Node, ErrKind> {
         let mut left = self.parse_pow()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek() {
                 Some(Tok::Op("*")) => BinOp::Mul,
                 Some(Tok::Op("/")) => BinOp::Div,
                 _ => break,
             };
+            chain += 1;
+            if self.depth + chain > MAX_AST_HEIGHT {
+                return Err(ErrKind::Value);
+            }
             self.pos += 1;
             let right = self.parse_pow()?;
             left = Node::Binary(op, Box::new(left), Box::new(right));
@@ -530,7 +593,12 @@ impl Parser {
 
     fn parse_pow(&mut self) -> Result<Node, ErrKind> {
         let mut left = self.parse_unary()?;
+        let mut chain = 0usize;
         while matches!(self.peek(), Some(Tok::Op("^"))) {
+            chain += 1;
+            if self.depth + chain > MAX_AST_HEIGHT {
+                return Err(ErrKind::Value);
+            }
             self.pos += 1;
             let right = self.parse_unary()?;
             left = Node::Binary(BinOp::Pow, Box::new(left), Box::new(right));
@@ -539,64 +607,90 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Node, ErrKind> {
-        if self.eat(&Tok::At) {
-            let e = self.parse_unary()?;
-            return Ok(Node::Implicit(Box::new(e)));
-        }
-        if matches!(self.peek(), Some(Tok::Op("-"))) {
-            self.pos += 1;
-            let e = self.parse_unary()?;
-            return Ok(Node::Unary(true, Box::new(e)));
-        }
-        if matches!(self.peek(), Some(Tok::Op("+"))) {
-            self.pos += 1;
-            return self.parse_unary();
-        }
-        let mut node = self.parse_primary()?;
-        // A LAMBDA returned by an expression or a sheet-qualified name can be called directly.
-        if matches!(node, Node::Func(..) | Node::ScopedName { book: None, .. }) {
-            while self.eat(&Tok::LParen) {
-                let mut call = vec![node];
-                if !self.eat(&Tok::RParen) {
-                    loop {
-                        call.push(self.parse_expr()?);
-                        if self.eat(&Tok::RParen) { break; }
-                        if !self.eat(&Tok::Comma) { return Err(ErrKind::Value); }
+        self.enter()?;
+        let res = (|| -> Result<Node, ErrKind> {
+            if self.eat(&Tok::At) {
+                let e = self.parse_unary()?;
+                return Ok(Node::Implicit(Box::new(e)));
+            }
+            if matches!(self.peek(), Some(Tok::Op("-"))) {
+                self.pos += 1;
+                let e = self.parse_unary()?;
+                return Ok(Node::Unary(true, Box::new(e)));
+            }
+            if matches!(self.peek(), Some(Tok::Op("+"))) {
+                self.pos += 1;
+                return self.parse_unary();
+            }
+            let mut node = self.parse_primary()?;
+            let mut postfix_chain = 0usize;
+            // A LAMBDA returned by an expression or a sheet-qualified name can be called directly.
+            if matches!(node, Node::Func(..) | Node::ScopedName { book: None, .. }) {
+                while self.eat(&Tok::LParen) {
+                    postfix_chain += 1;
+                    if self.depth + postfix_chain > MAX_AST_HEIGHT {
+                        return Err(ErrKind::Value);
                     }
+                    let mut call = vec![node];
+                    if !self.eat(&Tok::RParen) {
+                        loop {
+                            call.push(self.parse_expr()?);
+                            if self.eat(&Tok::RParen) { break; }
+                            if !self.eat(&Tok::Comma) { return Err(ErrKind::Value); }
+                        }
+                    }
+                    node = Node::Func(FuncName::from_id(FuncId::InternalCall), call);
                 }
-                node = Node::Func(FuncName::from_id(FuncId::InternalCall), call);
             }
-        }
-        // 动态冒号运算符：`INDEX(A1:A10,2):C5` / `OFFSET(A1,1,0):B5` / `A1:INDEX(...)`
-        while self.eat(&Tok::Colon) {
-            let rhs = self.parse_primary()?;
-            node = Node::DynRange(Box::new(node), Box::new(rhs));
-        }
-        // 空格交集运算符：`A1:C5 B2:D6` / `RowName ColName`
-        if matches!(
-            node,
-            Node::Ref(_)
-                | Node::Range(..)
-                | Node::DynRange(..)
-                | Node::Name(_)
-                | Node::ScopedName { .. }
-                | Node::Func(..)
-                | Node::Union(_)
-        ) {
-            while self.starts_intersection_rhs() {
-                let mut rhs = self.parse_primary()?;
-                while self.eat(&Tok::Colon) {
-                    let tail = self.parse_primary()?;
-                    rhs = Node::DynRange(Box::new(rhs), Box::new(tail));
+            // 动态冒号运算符：`INDEX(A1:A10,2):C5` / `OFFSET(A1,1,0):B5` / `A1:INDEX(...)`
+            while self.eat(&Tok::Colon) {
+                postfix_chain += 1;
+                if self.depth + postfix_chain > MAX_AST_HEIGHT {
+                    return Err(ErrKind::Value);
                 }
-                node = Node::Intersect(Box::new(node), Box::new(rhs));
+                let rhs = self.parse_primary()?;
+                node = Node::DynRange(Box::new(node), Box::new(rhs));
             }
-        }
-        while matches!(self.peek(), Some(Tok::Percent)) {
-            self.pos += 1;
-            node = Node::Percent(Box::new(node));
-        }
-        Ok(node)
+            // 空格交集运算符：`A1:C5 B2:D6` / `RowName ColName`
+            if matches!(
+                node,
+                Node::Ref(_)
+                    | Node::Range(..)
+                    | Node::DynRange(..)
+                    | Node::Name(_)
+                    | Node::ScopedName { .. }
+                    | Node::Func(..)
+                    | Node::Union(_)
+            ) {
+                while self.starts_intersection_rhs() {
+                    postfix_chain += 1;
+                    if self.depth + postfix_chain > MAX_AST_HEIGHT {
+                        return Err(ErrKind::Value);
+                    }
+                    let mut rhs = self.parse_primary()?;
+                    while self.eat(&Tok::Colon) {
+                        postfix_chain += 1;
+                        if self.depth + postfix_chain > MAX_AST_HEIGHT {
+                            return Err(ErrKind::Value);
+                        }
+                        let tail = self.parse_primary()?;
+                        rhs = Node::DynRange(Box::new(rhs), Box::new(tail));
+                    }
+                    node = Node::Intersect(Box::new(node), Box::new(rhs));
+                }
+            }
+            while matches!(self.peek(), Some(Tok::Percent)) {
+                postfix_chain += 1;
+                if self.depth + postfix_chain > MAX_AST_HEIGHT {
+                    return Err(ErrKind::Value);
+                }
+                self.pos += 1;
+                node = Node::Percent(Box::new(node));
+            }
+            Ok(node)
+        })();
+        self.leave();
+        res
     }
 
     fn parse_primary(&mut self) -> Result<Node, ErrKind> {
@@ -903,17 +997,23 @@ pub fn parse_a1(s: &str) -> Option<RefExpr> {
     let col_abs = bytes.first() == Some(&b'$');
     let mut i = usize::from(col_abs);
     let mut col = 0_i64;
+    let mut letter_count = 0usize;
     while let Some(c) = bytes.get(i).filter(|c| c.is_ascii_alphabetic()) {
+        letter_count += 1;
+        if letter_count > 3 {
+            return None;
+        }
         col = col.checked_mul(26)?.checked_add((c.to_ascii_uppercase() - b'A' + 1) as i64)?;
         i += 1;
     }
     if col == 0 { return None; }
     let col = col - 1;
+    if col > 16_383 { return None; }
     let row_abs = bytes.get(i) == Some(&b'$');
     i += usize::from(row_abs);
     if !bytes.get(i)?.is_ascii_digit() { return None; }
     let row = s[i..].parse::<i64>().ok()?.checked_sub(1)?;
-    if row < 0 { return None; }
+    if !(0..=1_048_575).contains(&row) { return None; }
     Some(RefExpr { book: None, sheet: None, sheet2: None, row, col, row_abs, col_abs })
 }
 
@@ -1091,7 +1191,7 @@ fn single_sheet_range(node: &Node) -> Option<(RefExpr, RefExpr)> {
     (a.sheet2.is_none() && b.sheet2.is_none()).then(|| (a.clone(), b.clone()))
 }
 
-type EvalEnvironment = Vec<value::EnvFrame>;
+type EvalEnvironment = Vec<std::sync::Arc<value::EnvFrame>>;
 type EvalFrame = (deps::CellKey, EvalEnvironment);
 
 struct RangeRemainder {
@@ -1525,6 +1625,8 @@ pub struct Calc<'a> {
     visiting_overflow: FxHashSet<deps::CellKey>,
     /// LET / LAMBDA 词法环境帧栈（`<= 4` 绑定内联零堆分配）
     env_stack: EvalEnvironment,
+    /// 当前活跃 LAMBDA 调用栈槽位计数（与 Excel 1024 槽上限对齐，防自调用爆栈）
+    lambda_slots: usize,
     active_names: FxHashSet<(usize, deps::CellKey, usize)>,
     named_calls: Vec<(usize, deps::CellKey, usize, Vec<FValue>)>,
     scheduling: bool,
@@ -1733,6 +1835,7 @@ impl<'a> Calc<'a> {
             visiting: FxHashSet::default(),
             visiting_overflow: FxHashSet::default(),
             env_stack: Vec::new(),
+            lambda_slots: 0,
             cur: (0, 0),
             ref_offset: (0, 0),
             has_tables,
@@ -1929,6 +2032,7 @@ impl<'a> Calc<'a> {
         self.clear_visiting();
         self.active_names.clear();
         self.named_calls.clear();
+        self.lambda_slots = 0;
         self.env_stack.clear();
         self.remove_memo(key);
     }
@@ -2055,6 +2159,7 @@ impl<'a> Calc<'a> {
         }
         let rows = (r2 - r1 + 1) as usize;
         let cols = (c2 - c1 + 1) as usize;
+        let total = checked_array_len(rows, cols, MAX_ARRAY_CELLS)?;
         let ekey = (li, slot, r1, c1, r2, c2);
         if let Some(cached) = self.ext_range_cache.get(&ekey) {
             return Ok(Arg::Range {
@@ -2077,7 +2182,7 @@ impl<'a> Calc<'a> {
             });
         }
         let link = &self.wb.links[li];
-        let mut vals = vec![FValue::Empty; rows * cols];
+        let mut vals = vec![FValue::Empty; total];
         for (&(_, r, c), v) in link.cache.range((slot, r1, c1)..=(slot, r2, c2)) {
             if c >= c1 && c <= c2 {
                 vals[(r - r1) as usize * cols + (c - c1) as usize] = to_fvalue(v);
@@ -2553,15 +2658,27 @@ impl<'a> Calc<'a> {
         let anchor = CellRef::new(r, c);
         if let Some(&(rows, cols)) = sh.spill_shapes.get(&anchor) {
             if rows == 0 || cols == 0 { return None; }
+            let rows_u = rows as usize;
+            let cols_u = cols as usize;
+            checked_array_len(rows_u, cols_u, MAX_ARRAY_CELLS).ok()?;
+            let r_end = r.checked_add(rows - 1)?;
+            let c_end = c.checked_add(cols - 1)?;
+            if r_end >= 1_048_576 || c_end >= 16_384 {
+                return None;
+            }
             let data = (0..rows)
                 .flat_map(|rr| (0..cols).map(move |cc| to_fvalue(&sh.value(r + rr, c + cc))))
                 .collect();
-            return Some(value::Array::new(rows as usize, cols as usize, data));
+            return Some(value::Array::new(rows_u, cols_u, data));
         }
         if let Some((r1, c1, r2, c2)) = self.array_anchor_rect(si, anchor) {
             let sh = &self.wb.sheets[si];
+            if r1 > r2 || c1 > c2 || r2 >= 1_048_576 || c2 >= 16_384 {
+                return None;
+            }
             let rows = (r2 - r1 + 1) as usize;
             let cols = (c2 - c1 + 1) as usize;
+            checked_array_len(rows, cols, MAX_ARRAY_CELLS).ok()?;
             let data = (r1..=r2)
                 .flat_map(|rr| (c1..=c2).map(move |cc| to_fvalue(&sh.value(rr, cc))))
                 .collect();
@@ -2746,6 +2863,7 @@ impl<'a> Calc<'a> {
 
     fn materialize_range(&mut self, key: RangeKey, length: usize) -> Result<std::sync::Arc<Vec<FValue>>, ErrKind> {
         if self.requested.is_some() { return Err(ErrKind::Ref); }
+        if length > MAX_ARRAY_CELLS { return Err(ErrKind::Num); }
         if let Some(values) = self.cache_get(key) { return Ok(values); }
         if let Some(shared) = self.shared
             && let Some(values) = shared.get_range(key)
@@ -2827,8 +2945,9 @@ impl<'a> Calc<'a> {
         }
         let rows = (r2 - r1 + 1) as usize;
         let cols = (c2 - c1 + 1) as usize;
+        let total = checked_array_len(rows, cols, MAX_ARRAY_CELLS)?;
         let key = (si, r1 as i64, c1 as i64, r2 as i64, c2 as i64);
-        let values = self.materialize_range(key, rows * cols)?;
+        let values = self.materialize_range(key, total)?;
         Ok(Arg::Range { values, rows, cols })
     }
 
@@ -3036,7 +3155,7 @@ impl<'a> Calc<'a> {
                 }
                 FValue::Error(ErrKind::Name)
             }
-            Node::Number(n) => FValue::Number(*n),
+            Node::Number(n) => FValue::number(*n),
             Node::Text(s) => FValue::Text(s.clone()),
             Node::Bool(b) => FValue::Bool(*b),
             Node::Err(e) => FValue::Error(*e),
@@ -3333,7 +3452,7 @@ impl<'a> Calc<'a> {
             }
             // LET(x, 1, y, x+1, y*2)：使用内联小帧（<= 4 绑定零堆分配）
             FuncId::Let if nodes.len() >= 3 => {
-                self.env_stack.push(value::EnvFrame::new_small());
+                self.env_stack.push(std::sync::Arc::new(value::EnvFrame::new_small()));
                 let mut i = 0;
                 while i + 2 < nodes.len() {
                     if let Node::Name(nm) = &nodes[i] {
@@ -3347,7 +3466,8 @@ impl<'a> Calc<'a> {
                             },
                             other => self.eval_node(other, si),
                         };
-                        self.env_stack.last_mut().unwrap().insert(nm.as_str(), v);
+                        std::sync::Arc::make_mut(self.env_stack.last_mut().unwrap())
+                            .insert(nm.as_str(), v);
                     }
                     i += 2;
                 }
@@ -3591,12 +3711,29 @@ impl<'a> Calc<'a> {
                         )))
                     }
                     FuncId::MakeArray => {
-                        let rows = self.eval_node(&nodes[0], si).to_number().unwrap_or(0.0) as usize;
-                        let cols = self.eval_node(&nodes[1], si).to_number().unwrap_or(0.0) as usize;
-                        if rows == 0 || cols == 0 || rows * cols > 1_000_000 {
+                        let rows_f = match self.eval_node(&nodes[0], si).to_number() {
+                            Ok(v) => v,
+                            Err(e) => return FValue::Error(e),
+                        };
+                        let cols_f = match self.eval_node(&nodes[1], si).to_number() {
+                            Ok(v) => v,
+                            Err(e) => return FValue::Error(e),
+                        };
+                        if !rows_f.is_finite()
+                            || !cols_f.is_finite()
+                            || rows_f < 1.0
+                            || cols_f < 1.0
+                            || rows_f > MAX_ARRAY_ROWS as f64
+                            || cols_f > MAX_ARRAY_COLS as f64
+                        {
                             return FValue::Error(ErrKind::Value);
                         }
-                        let mut data = Vec::with_capacity(rows * cols);
+                        let rows = rows_f.trunc() as usize;
+                        let cols = cols_f.trunc() as usize;
+                        let Some(total) = rows.checked_mul(cols).filter(|&n| n > 0 && n <= 1_000_000) else {
+                            return FValue::Error(ErrKind::Value);
+                        };
+                        let mut data = Vec::with_capacity(total);
                         for r in 0..rows {
                             for c in 0..cols {
                                 let cv = vec![
@@ -3683,25 +3820,15 @@ impl<'a> Calc<'a> {
                 let target = self.eval_node(&nodes[0], si);
                 match target {
                     FValue::Lambda(l) => {
-                        let params = l.params.clone();
-                        let body = l.body.clone();
-                        let captured = l.env.clone();
-                        let mut bound = value::EnvFrame::new_small();
-                        for (i, p) in params.iter().enumerate() {
+                        let mut vals = Vec::with_capacity(l.params.len());
+                        for i in 0..l.params.len() {
                             let v = match nodes.get(i + 1) {
                                 Some(n) => self.eval_node(n, si),
                                 None => FValue::Empty,
                             };
-                            bound.insert(p.clone(), v);
+                            vals.push(v);
                         }
-                        let saved = std::mem::replace(&mut self.env_stack, captured);
-                        let prev_off = self.ref_offset;
-                        self.ref_offset = (0, 0);
-                        self.env_stack.push(bound);
-                        let out = self.eval_node(&body, si);
-                        self.env_stack = saved;
-                        self.ref_offset = prev_off;
-                        out
+                        self.apply_lambda_val(&l, vals, si)
                     }
                     _ => FValue::Error(ErrKind::Value),
                 }
@@ -3833,84 +3960,153 @@ impl<'a> Calc<'a> {
                     Ok((sidx, r1, c1, r2, c2)) => (sidx, r1, c1, r2 - r1 + 1, c2 - c1 + 1),
                     Err(e) => return FValue::Error(e),
                 };
-                let dr = match self.eval_node(&nodes[1], si).to_number() {
-                    Ok(v) => v.trunc() as i64,
+                let dr_f = match self.eval_node(&nodes[1], si).to_number() {
+                    Ok(v) if v.is_finite() => v.trunc(),
+                    Ok(_) => return FValue::Error(ErrKind::Ref),
                     Err(e) => return FValue::Error(e),
                 };
-                let dc = match self.eval_node(&nodes[2], si).to_number() {
-                    Ok(v) => v.trunc() as i64,
+                let dc_f = match self.eval_node(&nodes[2], si).to_number() {
+                    Ok(v) if v.is_finite() => v.trunc(),
+                    Ok(_) => return FValue::Error(ErrKind::Ref),
                     Err(e) => return FValue::Error(e),
                 };
-                let has_hw = nodes.get(3).is_some_and(|n| !matches!(n, Node::Empty))
-                    || nodes.get(4).is_some_and(|n| !matches!(n, Node::Empty));
+                if dr_f.abs() > 2_000_000.0 || dc_f.abs() > 2_000_000.0 {
+                    return FValue::Error(ErrKind::Ref);
+                }
+                let dr = dr_f as i64;
+                let dc = dc_f as i64;
                 let h = match nodes.get(3) {
                     Some(n) if !matches!(n, Node::Empty) => match self.eval_node(n, si).to_number() {
-                        Ok(v) => v.trunc() as i64,
+                        Ok(v) if v.is_finite() && v.trunc().abs() <= 2_000_000.0 => v.trunc() as i64,
+                        Ok(_) => return FValue::Error(ErrKind::Ref),
                         Err(e) => return FValue::Error(e),
                     },
                     _ => base_h,
                 };
                 let w = match nodes.get(4) {
                     Some(n) if !matches!(n, Node::Empty) => match self.eval_node(n, si).to_number() {
-                        Ok(v) => v.trunc() as i64,
+                        Ok(v) if v.is_finite() && v.trunc().abs() <= 2_000_000.0 => v.trunc() as i64,
+                        Ok(_) => return FValue::Error(ErrKind::Ref),
                         Err(e) => return FValue::Error(e),
                     },
                     _ => base_w,
                 };
-                let r0 = base_r + dr;
-                let c0 = base_c + dc;
+                let (Some(r0), Some(c0)) = (base_r.checked_add(dr), base_c.checked_add(dc)) else {
+                    return FValue::Error(ErrKind::Ref);
+                };
                 if r0 < 0 || c0 < 0 || h == 0 || w == 0 {
                     return FValue::Error(ErrKind::Ref);
                 }
-                let (r1, r2) = if h > 0 { (r0, r0 + h - 1) } else { (r0 + h + 1, r0) };
-                let (c1, c2) = if w > 0 { (c0, c0 + w - 1) } else { (c0 + w + 1, c0) };
+                let (r1, r2) = if h > 0 {
+                    let Some(end) = r0.checked_add(h).and_then(|v| v.checked_sub(1)) else {
+                        return FValue::Error(ErrKind::Ref);
+                    };
+                    (r0, end)
+                } else {
+                    let Some(start) = r0.checked_add(h).and_then(|v| v.checked_add(1)) else {
+                        return FValue::Error(ErrKind::Ref);
+                    };
+                    (start, r0)
+                };
+                let (c1, c2) = if w > 0 {
+                    let Some(end) = c0.checked_add(w).and_then(|v| v.checked_sub(1)) else {
+                        return FValue::Error(ErrKind::Ref);
+                    };
+                    (c0, end)
+                } else {
+                    let Some(start) = c0.checked_add(w).and_then(|v| v.checked_add(1)) else {
+                        return FValue::Error(ErrKind::Ref);
+                    };
+                    (start, c0)
+                };
                 if r1 < 0 || c1 < 0 || r2 > 1_048_575 || c2 > 16_383 {
                     return FValue::Error(ErrKind::Ref);
                 }
                 if let Some(dw) = self.deps_watch {
                     dw.record_dynamic_watch((self.cur_sheet, self.cur.0, self.cur.1), idx, r1, c1, r2, c2);
                 }
-                if r1 == r2 && c1 == c2 && !has_hw && base_h == 1 && base_w == 1 {
+                let has_explicit_size = nodes.get(3).is_some_and(|n| !matches!(n, Node::Empty))
+                    || nodes.get(4).is_some_and(|n| !matches!(n, Node::Empty));
+                if r1 == r2 && c1 == c2 && !has_explicit_size && base_h == 1 && base_w == 1 {
                     self.cell_value(idx, r1 as u32, c1 as u32).scalar()
                 } else {
                     match self.range_values_coords(idx, r1, c1, r2, c2) {
                         Ok(Arg::Range { values, rows, cols }) => FValue::Array(
                             std::sync::Arc::new(value::Array::from_shared(rows, cols, values)),
                         ),
+                        Err(e) => FValue::Error(e),
                         _ => FValue::Error(ErrKind::Ref),
                     }
                 }
             }
             FuncId::Address if nodes.len() >= 2 => {
-                let row = self.eval_node(&nodes[0], si).to_number().unwrap_or(0.0) as u32;
-                let col = self.eval_node(&nodes[1], si).to_number().unwrap_or(0.0) as u32;
-                let abs = if nodes.len() > 2 {
-                    self.eval_node(&nodes[2], si).to_number().unwrap_or(1.0) as i32
-                } else {
-                    1
+                let row_f = match self.eval_node(&nodes[0], si).to_number() {
+                    Ok(v) => v.trunc(),
+                    Err(e) => return FValue::Error(e),
                 };
-                let sheet = if nodes.len() > 4 {
-                    self.eval_node(&nodes[4], si).to_text().unwrap_or_default()
-                } else {
-                    String::new()
+                let col_f = match self.eval_node(&nodes[1], si).to_number() {
+                    Ok(v) => v.trunc(),
+                    Err(e) => return FValue::Error(e),
                 };
-                if row == 0 || col == 0 {
+                if !row_f.is_finite()
+                    || !col_f.is_finite()
+                    || row_f < 1.0
+                    || row_f > 1_048_576.0
+                    || col_f < 1.0
+                    || col_f > 16_384.0
+                {
                     return FValue::Error(ErrKind::Value);
                 }
-                let col_part = crate::model::col_label(col - 1);
-                let (c_abs, r_abs) = match abs {
-                    1 => (true, true),
-                    2 => (false, true),
-                    3 => (true, false),
-                    _ => (false, false),
+                let row = row_f as u32;
+                let col = col_f as u32;
+                let abs = match nodes.get(2) {
+                    Some(n) if !matches!(n, Node::Empty) => match self.eval_node(n, si).to_number() {
+                        Ok(v) if v.is_finite() => v.trunc() as i32,
+                        Ok(_) => return FValue::Error(ErrKind::Value),
+                        Err(e) => return FValue::Error(e),
+                    },
+                    _ => 1,
                 };
-                let body = format!(
-                    "{}{}{}{}",
-                    if c_abs { "$" } else { "" },
-                    col_part,
-                    if r_abs { "$" } else { "" },
-                    row
-                );
+                if !(1..=4).contains(&abs) {
+                    return FValue::Error(ErrKind::Value);
+                }
+                let a1_style = match nodes.get(3) {
+                    Some(n) if !matches!(n, Node::Empty) => match self.eval_node(n, si).to_bool() {
+                        Ok(b) => b,
+                        Err(e) => return FValue::Error(e),
+                    },
+                    _ => true,
+                };
+                let sheet = match nodes.get(4) {
+                    Some(n) if !matches!(n, Node::Empty) => match self.eval_node(n, si).to_text() {
+                        Ok(s) => s,
+                        Err(e) => return FValue::Error(e),
+                    },
+                    _ => String::new(),
+                };
+                let body = if a1_style {
+                    let col_part = crate::model::col_label(col - 1);
+                    let (c_abs, r_abs) = match abs {
+                        1 => (true, true),
+                        2 => (false, true),
+                        3 => (true, false),
+                        _ => (false, false),
+                    };
+                    format!(
+                        "{}{}{}{}",
+                        if c_abs { "$" } else { "" },
+                        col_part,
+                        if r_abs { "$" } else { "" },
+                        row
+                    )
+                } else {
+                    match abs {
+                        1 => format!("R{row}C{col}"),
+                        2 => format!("R{row}C[{col}]"),
+                        3 => format!("R[{row}]C{col}"),
+                        _ => format!("R[{row}]C[{col}]"),
+                    }
+                };
                 FValue::Text(if sheet.is_empty() {
                     body.into()
                 } else {
@@ -6917,7 +7113,10 @@ impl<'a> Calc<'a> {
         let (_, r1, c1, r2, c2) = key;
         let rows = (r2 - r1 + 1) as usize;
         let cols = (c2 - c1 + 1) as usize;
-        match self.materialize_range(key, rows * cols) {
+        let Ok(total) = checked_array_len(rows, cols, MAX_ARRAY_CELLS) else {
+            return (0, 0, Default::default());
+        };
+        match self.materialize_range(key, total) {
             Ok(values) => (rows, cols, values),
             Err(_) => (0, 0, Default::default()),
         }
@@ -7110,22 +7309,29 @@ impl<'a> Calc<'a> {
         vals: Vec<FValue>,
         si: usize,
     ) -> FValue {
+        let needed = lam.params.len().saturating_add(2);
+        if self.lambda_slots.saturating_add(needed) > MAX_LAMBDA_SLOTS {
+            return FValue::Error(ErrKind::Num);
+        }
         let mut frame = value::EnvFrame::with_capacity(lam.params.len());
         let mut vals_it = vals.into_iter();
         for p in lam.params.iter() {
             let v = vals_it.next().unwrap_or(FValue::Empty);
             frame.insert_arc(p.clone(), v);
         }
-        let base = self.env_stack.len();
-        for f in lam.env.iter() {
-            self.env_stack.push(f.clone());
-        }
-        self.env_stack.push(frame);
+        let mut next_env = Vec::with_capacity(lam.env.len() + 1);
+        next_env.extend(lam.env.iter().cloned());
+        next_env.push(std::sync::Arc::new(frame));
+        let saved_env = std::mem::replace(&mut self.env_stack, next_env);
         let prev_off = self.ref_offset;
         self.ref_offset = (0, 0);
-        let out = self.eval_node(&lam.body, si);
+        self.lambda_slots += needed;
+        let out = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+            self.eval_node(&lam.body, si)
+        });
+        self.lambda_slots -= needed;
         self.ref_offset = prev_off;
-        self.env_stack.truncate(base);
+        self.env_stack = saved_env;
         out
     }
 
@@ -7134,6 +7340,10 @@ impl<'a> Calc<'a> {
         if let Node::Func(n, parts) = lam {
             if n.id() == FuncId::Lambda && !parts.is_empty() {
                 let params = &parts[..parts.len() - 1];
+                let needed = params.len().saturating_add(2);
+                if self.lambda_slots.saturating_add(needed) > MAX_LAMBDA_SLOTS {
+                    return FValue::Error(ErrKind::Num);
+                }
                 let body = &parts[parts.len() - 1];
                 let mut frame = value::EnvFrame::with_capacity(params.len());
                 let mut vals_it = vals.into_iter();
@@ -7143,8 +7353,12 @@ impl<'a> Calc<'a> {
                         frame.insert(pn.as_str(), v);
                     }
                 }
-                self.env_stack.push(frame);
-                let out = self.eval_node(body, si);
+                self.env_stack.push(std::sync::Arc::new(frame));
+                self.lambda_slots += needed;
+                let out = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+                    self.eval_node(body, si)
+                });
+                self.lambda_slots -= needed;
                 self.env_stack.pop();
                 return out;
             }
@@ -7184,6 +7398,11 @@ impl<'a> Calc<'a> {
         let (rr, rc) = functions::range_dims(&right);
         let (lv, rv) = (left.slice(), right.slice());
         if lv.is_empty() || rv.is_empty() { return FValue::Error(ErrKind::Value); }
+        if lr.checked_mul(lc).is_none_or(|n| lv.len() < n)
+            || rr.checked_mul(rc).is_none_or(|n| rv.len() < n)
+        {
+            return FValue::Error(ErrKind::Value);
+        }
         if lr == 1 && lc == 1 && rr == 1 && rc == 1 {
             return bin_scalar(op, &lv[0], &rv[0]);
         }
@@ -7207,7 +7426,11 @@ impl<'a> Calc<'a> {
         } else {
             return FValue::Error(ErrKind::Value);
         };
-        let mut out = Vec::with_capacity(rows * cols);
+        let total = match checked_array_len(rows, cols, MAX_ARRAY_CELLS) {
+            Ok(n) => n,
+            Err(e) => return FValue::Error(e),
+        };
+        let mut out = Vec::with_capacity(total);
         for i in 0..rows {
             for j in 0..cols {
                 let li = (if lr == 1 { 0 } else { i }) * lc + (if lc == 1 { 0 } else { j });
@@ -7266,12 +7489,19 @@ impl<'a> Calc<'a> {
                 let Some(idx) = self.defined_name_index(n, si, false) else {
                     return Err(ErrKind::Name);
                 };
+                let key = (idx, (self.cur_sheet, self.cur.0, self.cur.1), si);
+                if self.active_names.len() >= 32 || !self.active_names.insert(key) {
+                    return Err(ErrKind::Name);
+                }
                 let src = self.wb.names[idx].2.trim_start_matches('=').to_string();
-                let parsed = compile_at(&src, self.cur.0, self.cur.1)?;
-                let prev_off = self.ref_offset;
-                self.ref_offset = (0, 0);
-                let res = self.resolve_node_rect(&parsed, si);
-                self.ref_offset = prev_off;
+                let res = compile_at(&src, self.cur.0, self.cur.1).and_then(|parsed| {
+                    let prev_off = self.ref_offset;
+                    self.ref_offset = (0, 0);
+                    let r = self.resolve_node_rect(&parsed, si);
+                    self.ref_offset = prev_off;
+                    r
+                });
+                self.active_names.remove(&key);
                 res
             }
             Node::ScopedName {
@@ -7283,12 +7513,19 @@ impl<'a> Calc<'a> {
                 let Some(idx) = self.defined_name_index(name, target, true) else {
                     return Err(ErrKind::Name);
                 };
+                let key = (idx, (self.cur_sheet, self.cur.0, self.cur.1), target);
+                if self.active_names.len() >= 32 || !self.active_names.insert(key) {
+                    return Err(ErrKind::Name);
+                }
                 let src = self.wb.names[idx].2.trim_start_matches('=').to_string();
-                let parsed = compile_at(&src, self.cur.0, self.cur.1)?;
-                let prev_off = self.ref_offset;
-                self.ref_offset = (0, 0);
-                let res = self.resolve_node_rect(&parsed, target);
-                self.ref_offset = prev_off;
+                let res = compile_at(&src, self.cur.0, self.cur.1).and_then(|parsed| {
+                    let prev_off = self.ref_offset;
+                    self.ref_offset = (0, 0);
+                    let r = self.resolve_node_rect(&parsed, target);
+                    self.ref_offset = prev_off;
+                    r
+                });
+                self.active_names.remove(&key);
                 res
             }
             Node::DynRange(a, b) => {
@@ -7372,23 +7609,45 @@ impl<'a> Calc<'a> {
                     let (idx, br1, bc1, br2, bc2) = self.resolve_node_rect(&fargs[0], si)?;
                     let base_h = br2 - br1 + 1;
                     let base_w = bc2 - bc1 + 1;
-                    let dr = self.eval_node(&fargs[1], si).to_number()?.trunc() as i64;
-                    let dc = self.eval_node(&fargs[2], si).to_number()?.trunc() as i64;
+                    let to_offset_i64 = |v: f64| -> Result<i64, ErrKind> {
+                        if !v.is_finite() {
+                            return Err(ErrKind::Ref);
+                        }
+                        let t = v.trunc();
+                        if !(-2_000_000.0..=2_000_000.0).contains(&t) {
+                            return Err(ErrKind::Ref);
+                        }
+                        Ok(t as i64)
+                    };
+                    let dr = to_offset_i64(self.eval_node(&fargs[1], si).to_number()?)?;
+                    let dc = to_offset_i64(self.eval_node(&fargs[2], si).to_number()?)?;
                     let h = match fargs.get(3) {
-                        Some(n) if !matches!(n, Node::Empty) => self.eval_node(n, si).to_number()?.trunc() as i64,
+                        Some(n) if !matches!(n, Node::Empty) => {
+                            to_offset_i64(self.eval_node(n, si).to_number()?)?
+                        }
                         _ => base_h,
                     };
                     let w = match fargs.get(4) {
-                        Some(n) if !matches!(n, Node::Empty) => self.eval_node(n, si).to_number()?.trunc() as i64,
+                        Some(n) if !matches!(n, Node::Empty) => {
+                            to_offset_i64(self.eval_node(n, si).to_number()?)?
+                        }
                         _ => base_w,
                     };
                     if h == 0 || w == 0 {
                         return Err(ErrKind::Ref);
                     }
-                    let r0 = br1 + dr;
-                    let c0 = bc1 + dc;
-                    let (r1, r2) = if h > 0 { (r0, r0 + h - 1) } else { (r0 + h + 1, r0) };
-                    let (c1, c2) = if w > 0 { (c0, c0 + w - 1) } else { (c0 + w + 1, c0) };
+                    let r0 = br1.checked_add(dr).ok_or(ErrKind::Ref)?;
+                    let c0 = bc1.checked_add(dc).ok_or(ErrKind::Ref)?;
+                    let (r1, r2) = if h > 0 {
+                        (r0, r0.checked_add(h - 1).ok_or(ErrKind::Ref)?)
+                    } else {
+                        (r0.checked_add(h + 1).ok_or(ErrKind::Ref)?, r0)
+                    };
+                    let (c1, c2) = if w > 0 {
+                        (c0, c0.checked_add(w - 1).ok_or(ErrKind::Ref)?)
+                    } else {
+                        (c0.checked_add(w + 1).ok_or(ErrKind::Ref)?, c0)
+                    };
                     if r1 < 0 || c1 < 0 || r2 > 1_048_575 || c2 > 16_383 {
                         return Err(ErrKind::Ref);
                     }
@@ -8073,7 +8332,19 @@ fn bin_scalar(op: BinOp, lv: &FValue, rv: &FValue) -> FValue {
                         FValue::number(a / b)
                     }
                 }
-                BinOp::Pow => FValue::number(a.powf(b)),
+                BinOp::Pow => {
+                    if a == 0.0 {
+                        if b == 0.0 {
+                            FValue::Error(ErrKind::Num)
+                        } else if b < 0.0 {
+                            FValue::Error(ErrKind::Div0)
+                        } else {
+                            FValue::number(0.0)
+                        }
+                    } else {
+                        FValue::number(a.powf(b))
+                    }
+                }
                 _ => FValue::Error(ErrKind::Value),
             }
         }
@@ -8167,7 +8438,11 @@ pub fn parse(src: &str) -> Result<Node, ErrKind> {
 
 pub(crate) fn parse_normalized(src: &str) -> Result<Node, ErrKind> {
     let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        depth: 0,
+    };
     let node = p.parse_expr()?;
     if p.pos != p.toks.len() {
         return Err(ErrKind::Value);
@@ -9274,17 +9549,16 @@ fn recalc_selected(
     }
     // 文件里带 t="array" ref 的公式，覆盖区域里存的是上次的结果值；
     // 先把这些格子登记成溢出区，否则重算时会被自己上次的结果挡住（#SPILL!）
-    for (_,sheet) in wb.sheets.iter_mut().enumerate().filter(|(i,_)| selected.is_none_or(|s| s[*i])) {
-        for (anchor, (r1, c1, r2, c2)) in sheet.arrays.clone() {
-            for r in r1..=r2 {
-                for c in c1..=c2 {
-                    let k = CellRef::new(r, c);
-                    if k != anchor && sheet.get(k.row, k.col).is_none_or(|c| c.formula.is_none()) {
-                        sheet.spilled.insert(k);
-                    }
+    for (_, sheet) in wb.sheets.iter_mut().enumerate().filter(|(i, _)| selected.is_none_or(|s| s[*i])) {
+        let mut mark_spilled = Vec::new();
+        for &(anchor, (r1, c1, r2, c2)) in &sheet.arrays {
+            for (k, view) in sheet.iter_rect_views((r1, c1, r2, c2)) {
+                if k != anchor && !view.has_formula() {
+                    mark_spilled.push(k);
                 }
             }
         }
+        sheet.spilled.extend(mark_spilled);
     }
     // 先清掉上一轮的溢出单元格
     clear_spills(wb,selected);

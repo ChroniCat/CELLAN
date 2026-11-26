@@ -152,8 +152,8 @@ pub(super) fn strip_plan(path: &Path, session: &str, extra_removed_tables: &[Str
     for name in &names {
         if name.ends_with(".rels") || name.contains("pivotCacheDefinition") || name.starts_with("xl/pivotTables/")
             || name == "xl/workbook.xml" || name == "[Content_Types].xml" {
-            let mut body = Vec::new();
-            zip.by_name(name)?.read_to_end(&mut body)?;
+            let mut entry = zip.by_name(name)?;
+            let body = crate::fixups::read_zip_entry_limited(&mut entry, crate::fixups::MAX_META_PART_BYTES)?;
             parts.insert(name.clone(), body);
         }
     }
@@ -246,8 +246,8 @@ pub(super) fn strip_plan(path: &Path, session: &str, extra_removed_tables: &[Str
             tag.local_name().as_ref() == "Relationship" && attr(tag, "Id").is_some_and(|id| removed_ids.contains(&id))
         })?);
         if part == "xl/workbook.xml" || list.iter().any(|r| r.kind.ends_with("/pivotTable") && removed_ids.contains(&r.id)) {
-            let mut body = Vec::new();
-            zip.by_name(part)?.read_to_end(&mut body)?;
+            let mut entry = zip.by_name(part)?;
+            let body = crate::fixups::read_zip_entry_limited(&mut entry, crate::fixups::MAX_SHEET_PART_BYTES)?;
             let body = filter_xml(&body, |tag| matches!(tag.local_name().as_ref(), "pivotCache" | "pivotTablePart")
                 && relationship_id(tag).is_some_and(|id| removed_ids.contains(&id)))?;
             plan.replacements.insert(part.clone(), clean_containers(&body)?);

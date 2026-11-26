@@ -67,7 +67,7 @@ pub(crate) fn flatten_values(args: &[Arg], from: usize) -> Vec<FValue> {
 // ---------------------------------------------------------------- 日期系统
 
 /// 1970-01-01 起的天数 → 公历年月日（Howard Hinnant 算法）
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
@@ -235,6 +235,154 @@ pub(crate) fn date_to_serial(y: i32, m: u32, d: u32) -> Option<f64> {
 
 pub(crate) fn serial_to_date(serial: f64) -> Option<(i32, u32, u32)> {
     serial_to_date_in(current_date_system(), serial)
+}
+
+pub(super) fn max_date_serial(sys: DateSystem) -> i64 {
+    if sys.is_1904() { 2_957_003 } else { 2_958_465 }
+}
+
+fn checked_date_serial(sys: DateSystem, v: f64) -> Result<i64, ErrKind> {
+    if !v.is_finite() {
+        return Err(ErrKind::Num);
+    }
+    let f = v.floor();
+    let max = max_date_serial(sys);
+    if f < 0.0 || f > max as f64 {
+        return Err(ErrKind::Num);
+    }
+    Ok(f as i64)
+}
+
+/// O(1 + H log H) 计算 `[start, end]` 闭区间内工作日天数（支持 1900/1904 与自定义周末掩码 `m[0..7]` = Mon..Sun）。
+pub(super) fn networkdays_core(
+    sys: DateSystem,
+    start_f: f64,
+    end_f: f64,
+    mask: &[bool; 7],
+    holidays: &[i64],
+) -> Result<f64, ErrKind> {
+    if mask.iter().all(|&w| w) {
+        return Err(ErrKind::Value);
+    }
+    let a = checked_date_serial(sys, start_f)?;
+    let b = checked_date_serial(sys, end_f)?;
+    let date_off = if sys.is_1904() { 1462 } else { 0 };
+    let (lo, hi, sign) = if a <= b { (a, b, 1.0) } else { (b, a, -1.0) };
+    let total_days = hi - lo + 1;
+    let wpw = mask.iter().filter(|&&w| !w).count() as i64;
+    let full_weeks = total_days / 7;
+    let rem = (total_days % 7) as usize;
+    let mut count = full_weeks * wpw;
+    let start_mon = ((lo + date_off + 5).rem_euclid(7)) as usize;
+    for i in 0..rem {
+        if !mask[(start_mon + i) % 7] {
+            count += 1;
+        }
+    }
+    if !holidays.is_empty() {
+        let mut uniq: Vec<i64> = holidays
+            .iter()
+            .copied()
+            .filter(|&h| h >= lo && h <= hi)
+            .collect();
+        uniq.sort_unstable();
+        uniq.dedup();
+        for h in uniq {
+            let mon = ((h + date_off + 5).rem_euclid(7)) as usize;
+            if !mask[mon] {
+                count -= 1;
+            }
+        }
+    }
+    Ok(sign * count as f64)
+}
+
+/// O(1 + H log H) 计算从 `start` 增减 `days` 个工作日后的日期序列号。
+pub(super) fn workday_core(
+    sys: DateSystem,
+    start_f: f64,
+    days_f: f64,
+    mask: &[bool; 7],
+    holidays: &[i64],
+) -> Result<f64, ErrKind> {
+    if mask.iter().all(|&w| w) {
+        return Err(ErrKind::Value);
+    }
+    let start = checked_date_serial(sys, start_f)?;
+    if !days_f.is_finite() {
+        return Err(ErrKind::Num);
+    }
+    let max_serial = max_date_serial(sys);
+    let days_trunc = days_f.trunc();
+    if days_trunc == 0.0 {
+        return Ok(start as f64);
+    }
+    if days_trunc.abs() > (max_serial as f64 + 1.0) {
+        return Err(ErrKind::Num);
+    }
+    let days = days_trunc as i64;
+    let step: i64 = if days > 0 { 1 } else { -1 };
+    let date_off = if sys.is_1904() { 1462 } else { 0 };
+    let wpw = mask.iter().filter(|&&w| !w).count() as u64;
+    let is_work_dow = |d: i64| !mask[((d + date_off + 5).rem_euclid(7)) as usize];
+    let advance = |mut d: i64, k: u64| -> Result<i64, ErrKind> {
+        if k == 0 {
+            return Ok(d);
+        }
+        let full_weeks = (k - 1) / wpw;
+        let rem = k - full_weeks * wpw;
+        let week_delta = (full_weeks as i64)
+            .checked_mul(7)
+            .and_then(|v| v.checked_mul(step))
+            .ok_or(ErrKind::Num)?;
+        d = d.checked_add(week_delta).ok_or(ErrKind::Num)?;
+        let mut left = rem;
+        while left > 0 {
+            d = d.checked_add(step).ok_or(ErrKind::Num)?;
+            if is_work_dow(d) {
+                left -= 1;
+            }
+        }
+        if d < 0 || d > max_serial {
+            return Err(ErrKind::Num);
+        }
+        Ok(d)
+    };
+
+    let mut hols: Vec<i64> = holidays
+        .iter()
+        .copied()
+        .filter(|&h| {
+            let in_dir = if step > 0 { h > start && h <= max_serial } else { h < start && h >= 0 };
+            in_dir && is_work_dow(h)
+        })
+        .collect();
+    if step > 0 {
+        hols.sort_unstable();
+    } else {
+        hols.sort_unstable_by(|a, b| b.cmp(a));
+    }
+    hols.dedup();
+
+    let mut cur = advance(start, days.unsigned_abs())?;
+    let mut idx = 0usize;
+    loop {
+        let mut hit = 0u64;
+        while idx < hols.len() {
+            let h = hols[idx];
+            if (step > 0 && h <= cur) || (step < 0 && h >= cur) {
+                hit += 1;
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        if hit == 0 {
+            break;
+        }
+        cur = advance(cur, hit)?;
+    }
+    Ok(cur as f64)
 }
 
 fn days_in_month(y: i32, m: u32) -> u32 {
@@ -1751,7 +1899,19 @@ pub(super) fn call_by_id_in(
             }
             Ok(FValue::number((a / b).trunc()))
         }),
-        FuncId::Power => r(|| Ok(FValue::number(num(args, 0)?.powf(num(args, 1)?)))),
+        FuncId::Power => r(|| {
+            let a = num(args, 0)?;
+            let b = num(args, 1)?;
+            if a == 0.0 {
+                if b == 0.0 {
+                    return Err(ErrKind::Num);
+                }
+                if b < 0.0 {
+                    return Err(ErrKind::Div0);
+                }
+            }
+            Ok(FValue::number(a.powf(b)))
+        }),
         FuncId::Sqrt => r(|| {
             let n = num(args, 0)?;
             if n < 0.0 {
@@ -2424,8 +2584,22 @@ pub(super) fn call_by_id_in(
         }),
         FuncId::Rept => r(|| {
             let s = text(args, 0)?;
-            let n = num(args, 1)?.max(0.0) as usize;
-            if s.len() * n > 32_767 {
+            let n_f = num(args, 1)?;
+            if !n_f.is_finite() || n_f < 0.0 {
+                return Err(ErrKind::Value);
+            }
+            let n_trunc = n_f.trunc();
+            if s.is_empty() || n_trunc == 0.0 {
+                return Ok(FValue::Text("".into()));
+            }
+            if n_trunc > 32_767.0 {
+                return Err(ErrKind::Value);
+            }
+            let n = n_trunc as usize;
+            let char_len = s.chars().count();
+            if char_len.checked_mul(n).is_none_or(|t| t > 32_767)
+                || s.len().checked_mul(n).is_none_or(|t| t > 32_767 * 4)
+            {
                 return Err(ErrKind::Value);
             }
             Ok(FValue::Text(s.repeat(n).into()))
@@ -2859,14 +3033,24 @@ pub(super) fn call_by_id_in(
         FuncId::Today => FValue::number(ctx.now_serial().floor()),
         FuncId::Now => FValue::number(ctx.now_serial()),
         FuncId::Date => r(|| {
-            let y = int_arg(args, 0)? as i32;
-            let m = int_arg(args, 1)? as i32;
+            let y_raw = int_arg(args, 0)?;
+            let m = int_arg(args, 1)?;
             let d = int_arg(args, 2)?;
+            if !(0..10_000).contains(&y_raw) {
+                return Err(ErrKind::Num);
+            }
+            let y = if y_raw < 1900 { y_raw + 1900 } else { y_raw };
             // 允许月份、日期溢出（Excel 行为）
-            let (y2, m2) = (y + (m - 1).div_euclid(12), (m - 1).rem_euclid(12) + 1);
-            let m2 = m2 as u32;
-            let base = date_to_serial_in(ctx.date_system, y2, m2, 1).ok_or(ErrKind::Num)?;
-            Ok(FValue::number(base + d as f64 - 1.0))
+            let y2 = y.checked_add((m - 1).div_euclid(12)).ok_or(ErrKind::Num)?;
+            let m2 = ((m - 1).rem_euclid(12) + 1) as u32;
+            let y2_i32 = i32::try_from(y2).map_err(|_| ErrKind::Num)?;
+            let base = date_to_serial_in(ctx.date_system, y2_i32, m2, 1).ok_or(ErrKind::Num)?;
+            let serial = base + d as f64 - 1.0;
+            let max_serial = max_date_serial(ctx.date_system) as f64;
+            if !serial.is_finite() || serial < 0.0 || serial > max_serial {
+                return Err(ErrKind::Num);
+            }
+            Ok(FValue::number(serial))
         }),
         FuncId::Time => r(|| {
             let h = num(args, 0)?;
@@ -2901,9 +3085,9 @@ pub(super) fn call_by_id_in(
             Ok(FValue::number(((s * 86_400.0) % 60.0).floor()))
         }),
         FuncId::Weekday => r(|| {
-            let serial = num(args, 0)?;
+            let serial = checked_date_serial(ctx.date_system, num(args, 0)?)?;
             let t = opt_num(args, 1, 1.0)?.trunc() as i64;
-            let adj = serial.floor() as i64 + if ctx.date_system.is_1904() { 1462 } else { 0 };
+            let adj = serial + if ctx.date_system.is_1904() { 1462 } else { 0 };
             let sun0 = (adj + 6).rem_euclid(7); // 0=Sunday .. 6=Saturday
             let v = match t {
                 1 | 17 => sun0 + 1,
@@ -2997,59 +3181,48 @@ pub(super) fn call_by_id_in(
             Ok(FValue::number(((serial - jan1 + offset) / 7.0).floor() + 1.0))
         }),
         FuncId::NetworkDays => r(|| {
-            let a = num(args, 0)?.floor() as i64;
-            let b = num(args, 1)?.floor() as i64;
+            let a = num(args, 0)?;
+            let b = num(args, 1)?;
             let mut holidays = Vec::new();
             if let Some(h_arg) = args.get(2) {
                 for v in h_arg.slice() {
                     match v {
                         FValue::Empty => {}
                         FValue::Error(e) => return Err(*e),
-                        _ => holidays.push(v.to_number()?.floor() as i64),
+                        _ => {
+                            let hf = v.to_number()?;
+                            if !hf.is_finite() {
+                                return Err(ErrKind::Num);
+                            }
+                            holidays.push(hf.floor() as i64);
+                        }
                     }
                 }
             }
-            let date_off = if ctx.date_system.is_1904() { 1462 } else { 0 };
-            let (lo, hi, sign) = if a <= b { (a, b, 1.0) } else { (b, a, -1.0) };
-            let mut n = 0i64;
-            for d in lo..=hi {
-                let wd = (d + date_off + 6).rem_euclid(7); // 0=周日 .. 6=周六
-                if wd != 0 && wd != 6 && !holidays.contains(&d) {
-                    n += 1;
-                }
-            }
-            Ok(FValue::number(sign * n as f64))
+            let mask = [false, false, false, false, false, true, true];
+            networkdays_core(ctx.date_system, a, b, &mask, &holidays).map(FValue::number)
         }),
         FuncId::Workday => r(|| {
-            let start = num(args, 0)?.floor() as i64;
-            let days = int_arg(args, 1)?;
+            let start = num(args, 0)?;
+            let days = num(args, 1)?;
             let mut holidays = Vec::new();
             if let Some(h_arg) = args.get(2) {
                 for v in h_arg.slice() {
                     match v {
                         FValue::Empty => {}
                         FValue::Error(e) => return Err(*e),
-                        _ => holidays.push(v.to_number()?.floor() as i64),
+                        _ => {
+                            let hf = v.to_number()?;
+                            if !hf.is_finite() {
+                                return Err(ErrKind::Num);
+                            }
+                            holidays.push(hf.floor() as i64);
+                        }
                     }
                 }
             }
-            let date_off = if ctx.date_system.is_1904() { 1462 } else { 0 };
-            let mut d = start;
-            let mut left = days.abs();
-            let step = if days >= 0 { 1 } else { -1 };
-            let mut guard = 0usize;
-            while left > 0 {
-                guard += 1;
-                if guard > 5_000_000 {
-                    return Err(ErrKind::Num);
-                }
-                d += step;
-                let wd = (d + date_off + 6).rem_euclid(7);
-                if wd != 0 && wd != 6 && !holidays.contains(&d) {
-                    left -= 1;
-                }
-            }
-            Ok(FValue::number(d as f64))
+            let mask = [false, false, false, false, false, true, true];
+            workday_core(ctx.date_system, start, days, &mask, &holidays).map(FValue::number)
         }),
         FuncId::YearFrac => r(|| {
             let start = num(args, 0)?.floor();

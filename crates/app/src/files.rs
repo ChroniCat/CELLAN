@@ -8,6 +8,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Response, Sense, S
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 
 const ROW_H: f32 = 22.0;
 const INDENT: f32 = 13.0;
@@ -18,6 +19,7 @@ const MAX_ROWS: usize = 600;
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub name: String,
+    pub name_lower: String,
     pub path: PathBuf,
     pub is_dir: bool,
 }
@@ -32,11 +34,12 @@ enum Act {
 
 pub struct FileTree {
     roots: Vec<PathBuf>,
-    children: HashMap<PathBuf, Vec<Entry>>,
+    children: HashMap<PathBuf, Arc<Vec<Entry>>>,
     expanded: HashSet<PathBuf>,
     loading: HashSet<PathBuf>,
-    tx: Sender<(PathBuf, Option<Vec<Entry>>)>,
-    rx: Receiver<(PathBuf, Option<Vec<Entry>>)>,
+    tx: Sender<(PathBuf, Option<Arc<Vec<Entry>>>)>,
+    rx: Receiver<(PathBuf, Option<Arc<Vec<Entry>>>)>,
+    quick_rx: Option<Receiver<Vec<(String, PathBuf)>>>,
     pub error: Option<String>,
     /// 用户手动输入的 UNC / 路径
     pub manual: String,
@@ -52,7 +55,7 @@ pub struct FileTree {
     started: bool,
 }
 
-fn read_dir_entries(path: &Path) -> Option<Vec<Entry>> {
+fn read_dir_entries(path: &Path) -> Option<Arc<Vec<Entry>>> {
     let mut out = Vec::new();
     {
         let rd = std::fs::read_dir(path).ok()?;
@@ -68,15 +71,21 @@ fn read_dir_entries(path: &Path) -> Option<Vec<Entry>> {
                 continue;
             }
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            out.push(Entry { name, path: p, is_dir });
+            let name_lower = name.to_lowercase();
+            out.push(Entry {
+                name,
+                name_lower,
+                path: p,
+                is_dir,
+            });
         }
     }
     out.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name_lower.cmp(&b.name_lower))
     });
-    Some(out)
+    Some(Arc::new(out))
 }
 
 fn roots_store() -> PathBuf {
@@ -131,6 +140,10 @@ fn home_quick() -> Vec<(String, PathBuf)> {
 impl FileTree {
     pub fn new() -> Self {
         let (tx, rx) = channel();
+        let (quick_tx, quick_rx) = channel();
+        std::thread::spawn(move || {
+            let _ = quick_tx.send(home_quick());
+        });
         // 不能在这里探测盘符（断开的网络盘会卡住首帧），先列字母，读取全在后台
         let mut roots: Vec<PathBuf> = (b'A'..=b'Z')
             .map(|c| PathBuf::from(format!("{}:\\", c as char)))
@@ -147,12 +160,13 @@ impl FileTree {
             loading: HashSet::new(),
             tx,
             rx,
+            quick_rx: Some(quick_rx),
             error: None,
             manual: String::new(),
             filter: String::new(),
             current: None,
             recent: Vec::new(),
-            quick: home_quick(),
+            quick: Vec::new(),
             selected: None,
             started: false,
         }
@@ -169,7 +183,7 @@ impl FileTree {
     /// 打开某个文件时把它的祖先目录展开，切过去就能看到
     pub fn locate(&mut self, path: &Path) {
         let mut dir = path.parent().map(|p| p.to_path_buf());
-        if std::env::var("SC_TREE_LOG").is_ok() {
+        if crate::debug_flags::tree_log() {
             eprintln!("[tree] locate {}", path.display());
         }
         while let Some(d) = dir {
@@ -192,7 +206,23 @@ impl FileTree {
         });
     }
 
+    fn poll_quick(&mut self) {
+        if let Some(rx) = &self.quick_rx {
+            match rx.try_recv() {
+                Ok(q) => {
+                    self.quick = q;
+                    self.quick_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.quick_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
     pub fn pump(&mut self) {
+        self.poll_quick();
         while let Ok((path, entries)) = self.rx.try_recv() {
             self.loading.remove(&path);
             match entries {
@@ -205,7 +235,7 @@ impl FileTree {
                     if is_root {
                         self.roots.retain(|r| r != &path);
                     } else {
-                        self.children.insert(path, Vec::new());
+                        self.children.insert(path, Arc::new(Vec::new()));
                     }
                 }
             }
@@ -223,15 +253,14 @@ impl FileTree {
 
     // ---------------------------------------------------------------- 过滤
 
-    fn hit(&self, e: &Entry) -> bool {
-        let f = self.filter.trim().to_lowercase();
-        if f.is_empty() {
+    fn hit(&self, e: &Entry, filter_lower: &str) -> bool {
+        if filter_lower.is_empty() {
             return true;
         }
-        if e.name.to_lowercase().contains(&f) {
+        if e.name_lower.contains(filter_lower) {
             return true;
         }
-        e.is_dir && self.subtree_hit(&e.path, &f, 0)
+        e.is_dir && self.subtree_hit(&e.path, filter_lower, 0)
     }
 
     fn subtree_hit(&self, path: &Path, f: &str, depth: usize) -> bool {
@@ -241,8 +270,8 @@ impl FileTree {
         let Some(list) = self.children.get(path) else {
             return false;
         };
-        for e in list {
-            if e.name.to_lowercase().contains(f) {
+        for e in list.iter() {
+            if e.name_lower.contains(f) {
                 return true;
             }
             if e.is_dir && self.subtree_hit(&e.path, f, depth + 1) {
@@ -259,6 +288,7 @@ impl FileTree {
     // ---------------------------------------------------------------- 绘制
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
+        self.poll_quick();
         let mut open: Option<PathBuf> = None;
 
         // 标题
@@ -363,6 +393,7 @@ impl FileTree {
         }
 
         // 树本体
+        let filter_lower = self.filter.trim().to_lowercase();
         let mut flat: Vec<(PathBuf, bool)> = Vec::new();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -371,7 +402,7 @@ impl FileTree {
                 let roots = self.roots.clone();
                 for r in roots {
                     let mut act = None;
-                    self.node_ui(ui, &r, true, 0, &mut open, &mut act, &mut flat);
+                    self.node_ui(ui, &r, true, 0, &filter_lower, &mut open, &mut act, &mut flat);
                     self.apply(ui, &r, act, &mut open, true);
                 }
                 if self.filtering() && flat.is_empty() {
@@ -476,6 +507,7 @@ impl FileTree {
         path: &Path,
         is_dir: bool,
         depth: usize,
+        filter_lower: &str,
         open: &mut Option<PathBuf>,
         act: &mut Option<Act>,
         flat: &mut Vec<(PathBuf, bool)>,
@@ -505,7 +537,7 @@ impl FileTree {
             if depth <= 1 {
                 resp.on_hover_text(format!("{}", path.display()));
             }
-            if expanded && std::env::var("SC_TREE_LOG").is_ok() {
+            if expanded && crate::debug_flags::tree_log() {
                 eprintln!(
                     "[tree] 展开 {} 子项={}",
                     path.display(),
@@ -513,10 +545,10 @@ impl FileTree {
                 );
             }
             if expanded {
-                if let Some(children) = self.children.get(path).cloned() {
+                if let Some(children) = self.children.get(path).map(Arc::clone) {
                     let mut shown = 0usize;
                     for c in children.iter() {
-                        if !self.hit(c) {
+                        if !self.hit(c, filter_lower) {
                             continue;
                         }
                         if shown == MAX_ROWS {
@@ -533,9 +565,17 @@ impl FileTree {
                         }
                         shown += 1;
                         let mut sub = None;
-                        self.node_ui(ui, &c.path, c.is_dir, depth + 1, open, &mut sub, flat);
-                        let cpath = c.path.clone();
-                        self.apply(ui, &cpath, sub, open, c.is_dir);
+                        self.node_ui(
+                            ui,
+                            &c.path,
+                            c.is_dir,
+                            depth + 1,
+                            filter_lower,
+                            open,
+                            &mut sub,
+                            flat,
+                        );
+                        self.apply(ui, &c.path, sub, open, c.is_dir);
                     }
                 }
             }
@@ -610,7 +650,7 @@ impl FileTree {
             FontId::proportional(12.5),
             v.widgets.noninteractive.fg_stroke.color,
         );
-        if std::env::var("SC_TREE_LOG").is_ok() {
+        if crate::debug_flags::tree_log() {
             let kind_tag = match &kind {
                 RowKind::Dir(o) => {
                     if *o {
@@ -795,15 +835,17 @@ mod tests {
 
         let deep = Entry {
             name: "深".into(),
+            name_lower: "深".into(),
             path: dir.join("深"),
             is_dir: true,
         };
-        assert!(t.hit(&deep), "子孙里有命中，父目录要留着");
+        assert!(t.hit(&deep, "报表"), "子孙里有命中，父目录要留着");
         let other = Entry {
             name: "readme.txt".into(),
+            name_lower: "readme.txt".into(),
             path: dir.join("readme.txt"),
             is_dir: false,
         };
-        assert!(!t.hit(&other), "不匹配的文件要滤掉");
+        assert!(!t.hit(&other, "报表"), "不匹配的文件要滤掉");
     }
 }

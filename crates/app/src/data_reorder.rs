@@ -428,9 +428,12 @@ impl Operation {
                     *horizontal,
                 )
             }
-            Self::Dedup { cols, header, .. } => Ok(data_tools::plan_remove_duplicates(
-                sheet, index, rect, cols, *header,
-            )),
+            Self::Dedup { cols, header, .. } => {
+                sort_filter::validate_sort_region(sheet, rect)?;
+                Ok(data_tools::plan_remove_duplicates(
+                    sheet, index, rect, cols, *header,
+                ))
+            }
         }
     }
 
