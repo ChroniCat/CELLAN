@@ -8749,6 +8749,25 @@ fn formula_autocomplete_and_f4_cycle_keep_editing_state() {
     assert_eq!(f, "=SUM(B2:$C$3)", "只循环末尾引用");
 }
 
+#[test]
+fn formula_edit_f4_key_cycles_reference_at_caret_without_committing() {
+    let _env = crate::test_env::TestEnv::new("formula-edit-f4-key");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let original = r#"="中"&B2&C3"#;
+    app.wb.sheet_mut(0).set(0, 0, formula(original));
+    app.begin_edit(None);
+    app.editing.as_mut().unwrap().caret = r#"="中"&B2"#.chars().count();
+
+    run_keys(&mut app, &ctx, vec![key_event(egui::Key::F4, false)]);
+
+    let ed = app.editing.as_ref().expect("F4 应保持编辑状态");
+    assert_eq!(ed.buf, r#"="中"&$B$2&C3"#);
+    assert_eq!(ed.caret, r#"="中"&$B$2"#.chars().count());
+    assert_eq!(ed.caret_override, Some(ed.caret));
+    assert_eq!(app.wb.sheet(0).formula_of(0, 0), Some(original));
+}
+
 // ===== UI-11.3：编辑公式时点选单元格建立引用 + 引用着色 =====
 
 #[test]
