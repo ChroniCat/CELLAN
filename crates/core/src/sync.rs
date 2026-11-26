@@ -171,6 +171,40 @@ pub enum SheetMetaKind {
         range: Option<(u32, u32, u32, u32)>,
     },
     SheetTab(SheetTabSync),
+    /// Conditional edit, including the traditional note restored on demotion.
+    ThreadChange {
+        row: u32,
+        col: u32,
+        before: Option<crate::notes::ThreadedComment>,
+        after: Option<crate::notes::ThreadedComment>,
+        before_note: Option<crate::notes::Note>,
+        legacy_note: Option<crate::notes::Note>,
+    },
+}
+
+/// A canonical snapshot and its surrounding encrypted JSON envelope must fit in one wire frame.
+pub fn thread_snapshots_fit<'a>(threads: impl Iterator<Item = &'a crate::notes::ThreadedComment> + Clone) -> bool {
+    // Leave room for envelope fields and two traditional notes (64 KiB each, JSON-escaped).
+    const BUDGET: usize = 47 * 1024 * 1024;
+    let max_encoded = threads.clone().map(|tc| 96 + tc.entries.iter().map(|e|
+        72 + 6 * (e.id.len() + e.author.len() + e.timestamp.len() + e.text.len())).sum::<usize>()).sum::<usize>();
+    if max_encoded <= BUDGET { return true; }
+    let mut bytes = 0usize;
+    for thread in threads {
+        bytes += 96;
+        for e in &thread.entries {
+            bytes += 72;
+            for s in [&e.id, &e.author, &e.timestamp, &e.text] {
+                bytes += s.bytes().map(|b| match b {
+                        b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+                        0..=31 => 6,
+                        _ => 1,
+                }).sum::<usize>();
+            }
+            if bytes > BUDGET { return false; }
+        }
+    }
+    true
 }
 
 impl SheetMetaKind {
@@ -200,13 +234,22 @@ impl SheetMetaKind {
                     && text.as_ref().is_none_or(|t| t.len() <= 64 * 1024)
             }
             SheetMetaKind::Thread { row, col, thread } => {
-                cell_in_bounds(sheet, *row, *col)
+                cell_in_bounds(sheet, *row, *col) && thread_snapshots_fit(thread.iter())
                     && thread.as_ref().is_none_or(|tc| {
                         tc.r == *row
                             && tc.c == *col
                             && tc.entries.len() <= MAX_THREAD_ENTRIES
                             && tc.entries.iter().all(thread_entry_valid)
                     })
+            }
+            SheetMetaKind::ThreadChange { row, col, before, after, before_note, legacy_note } => {
+                cell_in_bounds(sheet, *row, *col) && thread_snapshots_fit(before.iter().chain(after))
+                    && before.iter().chain(after).all(|tc| tc.r == *row && tc.c == *col
+                        && tc.entries.len() <= MAX_THREAD_ENTRIES && tc.entries.iter().all(thread_entry_valid))
+                    && before_note.as_ref().is_none_or(|n| before.is_none() && n.r == *row && n.c == *col
+                        && n.author.len() <= MAX_SHORT_TEXT && n.text.len() <= MAX_THREAD_ENTRY_TEXT_BYTES)
+                    && legacy_note.as_ref().is_none_or(|n| after.is_none() && n.r == *row && n.c == *col
+                        && n.author.len() <= MAX_SHORT_TEXT && n.text.len() <= MAX_THREAD_ENTRY_TEXT_BYTES)
             }
             SheetMetaKind::ThreadReply { row, col, seed_root, entry } => {
                 cell_in_bounds(sheet, *row, *col)
@@ -666,6 +709,8 @@ pub enum Msg {
         sort_permutation: bool,
         #[serde(default)]
         structural_ack: bool,
+        #[serde(default)]
+        thread_changes: bool,
         #[serde(default)]
         clock: u64,
         #[serde(default)]

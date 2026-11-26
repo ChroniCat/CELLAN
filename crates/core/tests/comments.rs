@@ -224,7 +224,7 @@ fn sort_and_dedup_move_notes_and_threads_with_undo() {
         "撤销排序必须生成 Note 协作同步消息: {sync_after_undo:?}"
     );
     assert!(
-        sync_after_undo.iter().any(|(_, k)| matches!(k, SheetMetaKind::Thread { row: 1, col: 0, thread: Some(_) })),
+        sync_after_undo.iter().any(|(_, k)| matches!(k, SheetMetaKind::ThreadChange { row: 1, col: 0, after: Some(_), .. })),
         "撤销排序必须生成 Thread 协作同步消息: {sync_after_undo:?}"
     );
     assert_eq!(wb.sheet(0).notes.get(&CellRef::new(0, 1)).map(|n| n.text.as_str()), Some("注30"));
@@ -350,13 +350,14 @@ fn meta_edit_and_sheet_snapshot_undo_threads_and_emit_sync() {
     assert!(wb.sheet(0).notes.is_empty());
     assert!(wb.sheet(0).threads.is_empty());
     let sync_undo = undo.take_meta_sync();
-    assert!(sync_undo.iter().any(|(_, k)| matches!(k, SheetMetaKind::Note { row: 2, col: 3, text: None, .. })));
-    assert!(sync_undo.iter().any(|(_, k)| matches!(k, SheetMetaKind::Thread { row: 2, col: 3, thread: None })));
+    assert!(matches!(sync_undo.as_slice(), [(0, SheetMetaKind::ThreadChange {
+        row: 2, col: 3, before: Some(before), after: None, legacy_note: None, ..
+    })] if before == &tc));
 
     undo.redo(&mut wb.sheets, |_, _, _, _| true).expect("重做线程批注");
     assert_eq!(wb.sheet(0).threads.get(&CellRef::new(2, 3)), Some(&tc));
     let sync_redo = undo.take_meta_sync();
-    assert!(sync_redo.iter().any(|(_, k)| matches!(k, SheetMetaKind::Thread { row: 2, col: 3, thread: Some(t) } if t == &tc)));
+    assert!(sync_redo.iter().any(|(_, k)| matches!(k, SheetMetaKind::ThreadChange { row: 2, col: 3, after: Some(t), .. } if t == &tc)));
 
     // SheetSnapshot 删除工作表后恢复，必须还原 notes 与 threads
     let snap = snapshot_sheet(wb.sheet(0), 0);
@@ -366,6 +367,67 @@ fn meta_edit_and_sheet_snapshot_undo_threads_and_emit_sync() {
     assert_eq!(restored.threads.get(&CellRef::new(2, 3)), Some(&tc));
     assert!(restored.notes_dirty);
     assert!(restored.threads_dirty);
+}
+
+#[test]
+fn review_183_issue_17_wire_budget_counts_escaped_text_across_both_versions() {
+    use sheetcore::sync::SheetMetaKind;
+    let mut tc = mk_thread(0, 0, "a", "x", false);
+    let mut entry = tc.entries.remove(0);
+    entry.text = "\0".repeat(65_536);
+    tc.entries = (0..80).map(|n| {
+        let mut copy = entry.clone();
+        copy.id = n.to_string();
+        copy
+    }).collect();
+    assert!(sheetcore::sync::thread_snapshots_fit(std::iter::once(&tc)));
+    let mut history = sheetcore::undo::UndoStack::new();
+    history.push_meta("编辑长批注", (0, 0, 0), sheetcore::undo::MetaEdit {
+        sheet: 0, threads: vec![((0, 0), Some(tc.clone()), Some(tc.clone()))], ..Default::default()
+    });
+    assert!(history.next_thread_sync_error(false, true).is_some());
+    assert!(!SheetMetaKind::ThreadChange {
+        row: 0, col: 0, before: Some(tc.clone()), after: Some(tc), before_note: None, legacy_note: None,
+    }.valid(0));
+}
+
+#[test]
+fn review_183_issue_17_thread_conversion_undo_redo_guards_changed_traditional_notes() {
+    use sheetcore::model::{CellRef, Workbook};
+    use sheetcore::undo::{MetaEdit, UndoStack};
+
+    let key = CellRef::new(1, 2);
+    let thread = mk_thread(key.row, key.col, "A", "讨论", false);
+    let summary = thread.summary_note();
+    let mut original = summary.clone();
+    original.text = "原传统批注".into();
+    for changed_before_undo in [false, true] {
+        let mut wb = Workbook::new_blank();
+        wb.sheet_mut(0).threads.insert(key, thread.clone());
+        wb.sheet_mut(0).notes.insert(key, summary.clone());
+        let mut history = UndoStack::new();
+        history.push_meta("升级传统批注", (0, 1, 2), MetaEdit {
+            sheet: 0,
+            notes: vec![((1, 2), Some(original.clone()), Some(summary.clone()))],
+            threads: vec![((1, 2), None, Some(thread.clone()))],
+            ..Default::default()
+        });
+        if !changed_before_undo {
+            history.undo(&mut wb.sheets, |_, _, _, _| true).unwrap();
+            assert_eq!(wb.sheet(0).notes.get(&key), Some(&original));
+            history.take_meta_sync();
+        }
+        wb.sheet_mut(0).threads.remove(&key);
+        let mut other = original.clone();
+        other.text = "其他成员更新的传统批注".into();
+        wb.sheet_mut(0).notes.insert(key, other.clone());
+        let applied = if changed_before_undo { history.undo(&mut wb.sheets, |_, _, _, _| true) }
+            else { history.redo(&mut wb.sheets, |_, _, _, _| true) }.unwrap();
+        assert_eq!(applied.skipped, 1);
+        assert!(history.take_meta_sync().is_empty());
+        assert!(!wb.sheet(0).threads.contains_key(&key));
+        assert_eq!(wb.sheet(0).notes.get(&key), Some(&other));
+    }
 }
 
 #[test]

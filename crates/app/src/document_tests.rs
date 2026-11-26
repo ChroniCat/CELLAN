@@ -2401,3 +2401,41 @@ fn review_183_issue_15_comment_thread_257th_entry_rejected_without_local_diverge
     guest_b.leave_session();
     host.leave_session();
 }
+
+#[test]
+fn review_183_issue_17_comment_edits_undo_and_redo_preserve_later_replies() {
+    let _env = crate::test_env::TestEnv::new("review183-issue17-thread-undo");
+    let (mut host, port) = review_183_start_host("Host", "pw183");
+    let mut a = review_183_join_guest(2, "A", port, "pw183", &mut host);
+    let mut b = review_183_join_guest(3, "B", port, "pw183", &mut host);
+    let key = sheetcore::CellRef::new(1, 1);
+    let wait = |h: &mut SheetApp, a: &mut SheetApp, b: &mut SheetApp, texts: &[&str]| {
+        review_183_poll_until(&mut [h, a, b], 5000, "all comment replicas and summaries converge", |peers| {
+            peers.iter().all(|app| {
+                let sh = app.wb.sheet(0);
+                sh.threads.get(&key).is_some_and(|tc| {
+                    tc.entries.iter().map(|e| e.text.as_str()).eq(texts.iter().copied())
+                        && sh.notes.get(&key).is_some_and(|n| n.text == tc.summary_text())
+                })
+            })
+        });
+    };
+    host.set_comment_cell(0, 1, 1, "R", Some("Host"), true).unwrap();
+    wait(&mut host, &mut a, &mut b, &["R"]);
+    a.reply_comment_cell(0, 1, 1, "A1", Some("A")).unwrap();
+    wait(&mut host, &mut a, &mut b, &["R", "A1"]);
+    b.reply_comment_cell(0, 1, 1, "B1", Some("B")).unwrap();
+    wait(&mut host, &mut a, &mut b, &["R", "A1", "B1"]);
+    a.do_undo(false);
+    wait(&mut host, &mut a, &mut b, &["R", "B1"]);
+    a.do_undo(true);
+    wait(&mut host, &mut a, &mut b, &["R", "A1", "B1"]);
+
+    // Host accepts this reply before A polls it. A edits the root against its older view.
+    host.reply_comment_cell(0, 1, 1, "H1", Some("Host")).unwrap();
+    assert_eq!(a.wb.sheet(0).threads[&key].entries.len(), 3);
+    a.set_comment_cell(0, 1, 1, "R edited", None, true).unwrap();
+    wait(&mut host, &mut a, &mut b, &["R edited", "A1", "B1", "H1"]);
+    a.do_undo(false);
+    wait(&mut host, &mut a, &mut b, &["R", "A1", "B1", "H1"]);
+}

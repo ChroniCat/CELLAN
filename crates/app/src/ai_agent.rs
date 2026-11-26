@@ -1483,7 +1483,16 @@ impl SheetApp {
                 op.get("threaded").and_then(JsonValue::as_bool).unwrap_or(false),
             ));
         }
-        if !self.write_preflight_on(si, &coords, "AI 批量管理批注") {
+        let touches_threads = parsed_ops.iter().any(|(action, r, c, _, _, threaded)| {
+            let key = sheetcore::model::CellRef::new(*r, *c);
+            match action.as_str() {
+                "set" => *threaded || self.wb.sheet(si).threads.contains_key(&key),
+                "delete" => self.wb.sheet(si).threads.contains_key(&key),
+                "reply" | "resolve" | "reopen" => true,
+                _ => false,
+            }
+        });
+        if !self.thread_change_allowed(touches_threads) || !self.write_preflight_on(si, &coords, "AI 批量管理批注") {
             let msg = self.status.clone();
             return (
                 format!("管理批注被拒绝：{msg}"),
@@ -1731,12 +1740,7 @@ impl SheetApp {
                 }
                 sh.bump_display_style_revision();
             }
-            for ((r, c), _, new_n) in &note_diffs {
-                self.broadcast_note_meta(si, *r, *c, new_n.as_ref());
-            }
-            for ((r, c), _, new_t) in &thread_diffs {
-                self.broadcast_thread_meta(si, *r, *c, new_t.as_ref());
-            }
+            self.broadcast_comment_diffs(si, &note_diffs, &thread_diffs);
             let focus = (si, unique_coords[0].0, unique_coords[0].1);
             self.undo.push_meta(
                 "AI 管理批注",

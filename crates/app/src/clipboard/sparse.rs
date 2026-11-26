@@ -91,6 +91,11 @@ impl SheetApp {
             return;
         }
         let target_rect = (r, c, r + h - 1, c + w - 1);
+        if !values_only && self.net.as_ref().is_some_and(|net| !net.supports_thread_changes()) {
+            let carries_threads = self.clip.as_ref().is_some_and(|clip| !self.resolve_clip_notes_for_paste(clip).1.is_empty());
+            if !self.thread_change_allowed(carries_threads) || !self.thread_rects_allowed(si, &[target_rect])
+                || (clip_cut && !self.thread_rects_allowed(clip_sheet, &[clip_rect])) { return; }
+        }
         let uncapped_cow = self.net.is_none() && !clip_cut;
         let sparse_entries = match range.sparse_entries_with_limit(
             (!uncapped_cow).then_some(sheetcore::undo::MAX_DENSE_RECT_KEYS),

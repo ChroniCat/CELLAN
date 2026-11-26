@@ -100,7 +100,74 @@ pub struct ThreadedComment {
     pub entries: Vec<ThreadEntry>,
 }
 
+/// When neither side has a thread, its traditional note distinguishes an empty cell,
+/// a restored note, and a subsequent edit to that note.
+pub fn traditional_baseline_matches(
+    live: Option<&ThreadedComment>, live_note: Option<&Note>, before: Option<&ThreadedComment>,
+    before_note: Option<&Note>, after: Option<&ThreadedComment>, after_note: Option<&Note>,
+) -> bool {
+    live.is_some() || (before.is_none() && live_note == before_note)
+        || (after.is_none() && live_note == after_note)
+}
+
+/// Applies the change between two recorded versions while preserving replies added since.
+pub fn merge_thread_change(
+    live: Option<&ThreadedComment>,
+    before: Option<&ThreadedComment>,
+    after: Option<&ThreadedComment>,
+) -> Result<Option<ThreadedComment>, &'static str> {
+    if live == before || live == after {
+        return Ok(after.cloned());
+    }
+    let conflict = "该批注已被其他成员更改";
+    let (Some(live), Some(before), Some(after)) = (live, before, after) else {
+        return Err(conflict);
+    };
+    if before.entries.first().map(|e| &e.id) != after.entries.first().map(|e| &e.id)
+        || before.entries.first().map(|e| &e.id) != live.entries.first().map(|e| &e.id)
+        || [before, after, live].iter().any(|tc| {
+            let mut ids = std::collections::HashSet::new();
+            tc.entries.iter().any(|e| e.id.is_empty() || !ids.insert(&e.id))
+        })
+    {
+        return Err(conflict);
+    }
+    let mut merged = live.clone();
+    for old in &before.entries {
+        let target = after.entries.iter().find(|e| e.id == old.id);
+        if target == Some(old) { continue; }
+        let pos = merged.entries.iter().position(|e| e.id == old.id);
+        let current = pos.map(|i| &merged.entries[i]);
+        if current == target { continue; }
+        if current != Some(old) { return Err(conflict); }
+        let i = pos.unwrap();
+        if let Some(new) = target {
+            merged.entries[i] = new.clone();
+        } else {
+            merged.entries.remove(i);
+        }
+    }
+    for (index, new) in after.entries.iter().enumerate() {
+        if before.entries.iter().any(|e| e.id == new.id) { continue; }
+        if let Some(current) = merged.entries.iter().find(|e| e.id == new.id) {
+            if current != new { return Err(conflict); }
+            continue;
+        }
+        let pos = after.entries[..index].iter().rev()
+            .find_map(|prior| merged.entries.iter().position(|e| e.id == prior.id))
+            .map_or(0, |i| i + 1);
+        merged.entries.insert(pos, new.clone());
+    }
+    if merged.entries.len() > crate::sync::MAX_THREAD_ENTRIES { return Err(conflict); }
+    if before.resolved != after.resolved { merged.resolved = after.resolved; }
+    Ok(Some(merged))
+}
+
 impl ThreadedComment {
+    pub fn summary_note(&self) -> Note {
+        Note { r: self.r, c: self.c, text: self.summary_text(), author: self.root_author().to_owned() }
+    }
+
     /// 供旧版只读摘要与悬浮预览展示的纯文本汇总。
     pub fn summary_text(&self) -> String {
         let mut lines = Vec::with_capacity(self.entries.len());

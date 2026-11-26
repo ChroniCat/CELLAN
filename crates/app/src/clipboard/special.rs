@@ -389,6 +389,18 @@ impl SheetApp {
             } else {
                 None
             };
+        if self.ps_kind == 8 && self.net.as_ref().is_some_and(|net| !net.supports_thread_changes()) {
+            let sh = self.wb.sheet(si_cur);
+            let touches_thread = matrix.iter().enumerate().any(|(i, row)| row.iter().enumerate().any(|(j, (cell, _))| {
+                if self.ps_skip_blanks && cell.is_blank() { return false; }
+                if src_threads_snap.as_ref().is_some_and(|g| g.get(i).and_then(|row| row.get(j)).is_some_and(Option::is_some)) { return true; }
+                let r = dst_rows.as_ref().map_or(r0 + i as u32, |vr| vr[i]);
+                let c = c0 + j as u32;
+                let (ar, ac) = sh.merge_at(r, c).map(|m| (m.0, m.1)).unwrap_or((r, c));
+                src_notes_snap.as_ref().is_some_and(|g| g.get(i).and_then(|row| row.get(j)).is_some_and(Option::is_some)) && sh.threads.contains_key(&sheetcore::model::CellRef::new(ar, ac))
+            }));
+            if !self.thread_change_allowed(touches_thread) { return; }
+        }
         let src_dv_snap: Option<Vec<Vec<Option<sheetcore::dv::DataValidation>>>> =
             if self.ps_kind == 9 {
                 if let (Some(co), Some(ssi)) = (&coords, src_sheet_idx) {
@@ -445,6 +457,10 @@ impl SheetApp {
                             sh.notes.insert(cref, n.clone());
                             sh.notes_dirty = true;
                             note_undo.push(((ar, ac), before_n, Some(n)));
+                            if src_thread.is_none() && let Some(before) = sh.threads.remove(&cref) {
+                                sh.threads_dirty = true;
+                                thread_undo.push(((ar, ac), Some(before), None));
+                            }
                         }
                         if let Some(mut tc) = src_thread {
                             let before_tc = sh.threads.get(&cref).cloned();
@@ -639,31 +655,7 @@ impl SheetApp {
         }
         if self.ps_kind == 8 {
             if !note_undo.is_empty() || !thread_undo.is_empty() {
-                if let Some(net) = self.net.as_ref() {
-                    for ((ar, ac), _, after_n) in &note_undo {
-                        if let Some(n) = after_n {
-                            net.broadcast_sheet_meta(
-                                si_cur,
-                                sheetcore::sync::SheetMetaKind::Note {
-                                    row: *ar,
-                                    col: *ac,
-                                    author: n.author.clone(),
-                                    text: Some(n.text.clone()),
-                                },
-                            );
-                        }
-                    }
-                    for ((ar, ac), _, after_tc) in &thread_undo {
-                        net.broadcast_sheet_meta(
-                            si_cur,
-                            sheetcore::sync::SheetMetaKind::Thread {
-                                row: *ar,
-                                col: *ac,
-                                thread: after_tc.clone(),
-                            },
-                        );
-                    }
-                }
+                self.broadcast_comment_diffs(si_cur, &note_undo, &thread_undo);
                 self.undo.push_meta(
                     "粘贴批注",
                     (si_cur, r0, c0),

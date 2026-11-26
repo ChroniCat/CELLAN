@@ -12315,6 +12315,11 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if self.editing.is_some() {
             return false;
         }
+        if let Some(net) = &self.net
+            && let Some(reason) = self.undo.next_thread_sync_error(redo, net.supports_thread_changes()) {
+            self.status = reason.into();
+            return false;
+        }
         let structural = if redo { self.undo.redo_is_structure() } else { self.undo.undo_is_structure() };
         if self.net.is_some() && structural {
             self.status = "协作期间不能撤销或重做整表结构，请先断开协作".into();
@@ -16217,6 +16222,8 @@ fn clear_values(&mut self) {
         } else {
             Vec::new()
         };
+        if part == ClearPart::All && std::iter::once(self.sheet_idx).chain(extra_sheets.iter().copied())
+            .any(|sheet| !self.thread_rects_allowed(sheet, &rects)) { return; }
         if !self.write_preflight(&keys, what) {
             return;
         }
@@ -16752,6 +16759,7 @@ fn clear_values(&mut self) {
         if (nr1, nc1) == (r1, c1) {
             return;
         }
+        if !self.thread_rects_allowed(self.sheet_idx, &[(r1, c1, r2, c2), (nr1, nc1, nr2, nc2)]) { return; }
         let area = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
         if area > 200_000 {
             self.status = "移动范围过大（单次最多支持 20 万个单元格）".into();
@@ -17210,6 +17218,7 @@ fn clear_values(&mut self) {
             self.status = "复制范围过大（单次最多支持 20 万个单元格）".into();
             return;
         }
+        if !self.thread_rects_allowed(self.sheet_idx, &[(r1, c1, r2, c2), (nr1, nc1, nr2, nc2)]) { return; }
         let dst_keys = sheetcore::undo::rect_keys(nr1, nc1, nr2, nc2);
         if !self.write_preflight(&dst_keys, "复制单元格") {
             return;
@@ -24083,6 +24092,7 @@ fn clear_selection(&mut self) {
         net.broadcast_sheet_meta(sheet, kind)
     }
 
+    #[cfg(test)]
     fn broadcast_thread_meta(
         &self,
         sheet: usize,
@@ -24158,6 +24168,7 @@ fn clear_selection(&mut self) {
             self.status = "所选区域没有批注".into();
             return;
         }
+        if !self.thread_change_allowed(targets.iter().any(|key| self.wb.sheet(self.sheet_idx).threads.contains_key(key))) { return; }
         let gate: Vec<(u32, u32)> = targets.iter().map(|k| (k.row, k.col)).collect();
         if !self.write_preflight(&gate, label) {
             return;
@@ -24195,12 +24206,7 @@ fn clear_selection(&mut self) {
             .collect();
         let removed = removed_cells.len();
         if removed > 0 {
-            for &(pos, _, _) in &note_diffs {
-                self.broadcast_note_meta(si, pos.0, pos.1, None);
-            }
-            for &(pos, _, _) in &thread_diffs {
-                self.broadcast_thread_meta(si, pos.0, pos.1, None);
-            }
+            self.broadcast_comment_diffs(si, &note_diffs, &thread_diffs);
             self.undo.push_meta(
                 label,
                 (si, self.sel.0, self.sel.1),
@@ -27836,7 +27842,8 @@ fn clear_selection(&mut self) {
             self.note_focus_requested = false;
             self.note_reply_buf.clear();
             self.note_edit_anchor = None;
-            if self.write_preflight_on(target_sheet, &[(r, c)], "删除批注") {
+            if self.thread_change_allowed(self.wb.sheet(target_sheet).threads.contains_key(&key))
+                && self.write_preflight_on(target_sheet, &[(r, c)], "删除批注") {
                 let sheet_id = self.wb.sheet(target_sheet).identity;
                 let old_note = self.wb.sheet_mut(target_sheet).notes.remove(&key);
                 let old_thread = self.wb.sheet_mut(target_sheet).threads.remove(&key);
@@ -27857,12 +27864,7 @@ fn clear_selection(&mut self) {
                     let thread_diffs = old_thread
                         .map(|tc| vec![((r, c), Some(tc), None)])
                         .unwrap_or_default();
-                    if !note_diffs.is_empty() {
-                        self.broadcast_note_meta(target_sheet, r, c, None);
-                    }
-                    if !thread_diffs.is_empty() {
-                        self.broadcast_thread_meta(target_sheet, r, c, None);
-                    }
+                    self.broadcast_comment_diffs(target_sheet, &note_diffs, &thread_diffs);
                     self.undo.push_meta(
                         "删除批注",
                         (target_sheet, r, c),
@@ -27887,7 +27889,8 @@ fn clear_selection(&mut self) {
         if commit_current {
             self.note_focus_requested = false;
             self.note_reply_buf.clear();
-            if self.write_preflight_on(target_sheet, &[(r, c)], "编辑批注") {
+            if self.thread_change_allowed(self.wb.sheet(target_sheet).threads.contains_key(&key))
+                && self.write_preflight_on(target_sheet, &[(r, c)], "编辑批注") {
                 let old_note = self.wb.sheet(target_sheet).notes.get(&key).cloned();
                 let old_thread = self.wb.sheet(target_sheet).threads.get(&key).cloned();
                 let cleaned = text.trim_end_matches(&['\r', '\n'][..]).to_string();
@@ -27906,11 +27909,10 @@ fn clear_selection(&mut self) {
                             sh.threads_dirty = true;
                         }
                         sh.bump_display_style_revision();
-                        if rm_note {
-                            self.broadcast_note_meta(target_sheet, r, c, None);
-                        }
                         if rm_thread {
-                            self.broadcast_thread_meta(target_sheet, r, c, None);
+                            self.broadcast_thread_change(target_sheet, r, c, old_thread.as_ref(), None, None, None);
+                        } else {
+                            self.broadcast_note_meta(target_sheet, r, c, None);
                         }
                         self.undo.push_meta(
                             "删除批注",
@@ -27968,9 +27970,10 @@ fn clear_selection(&mut self) {
                             sheet.threads_dirty = true;
                         }
                         sheet.bump_display_style_revision();
-                        self.broadcast_note_meta(target_sheet, r, c, Some(&new_note));
                         if changed_thread {
-                            self.broadcast_thread_meta(target_sheet, r, c, new_thread.as_ref());
+                            self.broadcast_thread_change(target_sheet, r, c, old_thread.as_ref(), new_thread.as_ref(), old_note.as_ref(), None);
+                        } else {
+                            self.broadcast_note_meta(target_sheet, r, c, Some(&new_note));
                         }
                         self.undo.push_meta(
                             if old_note.is_some() || old_thread.is_some() { "编辑批注" } else { "新建批注" },
@@ -43352,6 +43355,23 @@ impl SheetApp {
                             sh.threads.remove(&k);
                         }
                     }
+                    sh.threads_dirty = true;
+                    changed = true;
+                }
+            }
+            SheetMetaKind::ThreadChange { row, col, after, legacy_note, .. } => {
+                // The host emits this form to restore a traditional note or remove a thread
+                // atomically. A live thread is broadcast as an authoritative Thread snapshot.
+                if let Some(sh) = self.wb.sheets.get_mut(sheet) {
+                    let key = sheetcore::CellRef::new(row, col);
+                    if let Some(tc) = after {
+                        sh.notes.insert(key, tc.summary_note());
+                        sh.threads.insert(key, tc);
+                    } else {
+                        sh.threads.remove(&key);
+                        if let Some(note) = legacy_note { sh.notes.insert(key, note); } else { sh.notes.remove(&key); }
+                    }
+                    sh.notes_dirty = true;
                     sh.threads_dirty = true;
                     changed = true;
                 }

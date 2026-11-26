@@ -544,31 +544,23 @@ impl NoteUndoEdit {
     pub fn to_meta_sync(&self, redo: bool) -> Vec<(usize, crate::sync::SheetMetaKind)> {
         use crate::sync::SheetMetaKind;
         let mut syncs = Vec::with_capacity(self.notes.len() + self.threads.len());
+        let thread_cells: std::collections::HashSet<_> = self.threads.iter()
+            .map(|(sheet, pos, _, _)| (*sheet, *pos)).collect();
+        let mut note_targets = std::collections::HashMap::new();
         let note_iter: Box<dyn Iterator<Item = _>> = if redo {
             Box::new(self.notes.iter())
         } else {
             Box::new(self.notes.iter().rev())
         };
-        for &(si, (r, c), ref before, ref after) in note_iter {
-            match if redo { after } else { before } {
-                Some(n) => syncs.push((
-                    si,
-                    SheetMetaKind::Note {
-                        row: r,
-                        col: c,
-                        author: n.author.clone(),
-                        text: Some(n.text.clone()),
-                    },
-                )),
-                None => syncs.push((
-                    si,
-                    SheetMetaKind::Note {
-                        row: r,
-                        col: c,
-                        author: String::new(),
-                        text: None,
-                    },
-                )),
+        for &(sheet, (row, col), ref before, ref after) in note_iter {
+            let note = if redo { after } else { before };
+            if thread_cells.contains(&(sheet, (row, col))) {
+                note_targets.insert((sheet, (row, col)), (if redo { before } else { after }, note));
+            } else {
+                syncs.push((sheet, SheetMetaKind::Note { row, col,
+                    author: note.as_ref().map_or_else(String::new, |n| n.author.clone()),
+                    text: note.as_ref().map(|n| n.text.clone()),
+                }));
             }
         }
         let thread_iter: Box<dyn Iterator<Item = _>> = if redo {
@@ -576,95 +568,94 @@ impl NoteUndoEdit {
         } else {
             Box::new(self.threads.iter().rev())
         };
-        for &(si, (r, c), ref before, ref after) in thread_iter {
-            let tc = if redo { after.clone() } else { before.clone() };
-            syncs.push((si, SheetMetaKind::Thread { row: r, col: c, thread: tc }));
+        for &(sheet, (row, col), ref before, ref after) in thread_iter {
+            let (before, after) = if redo { (before, after) } else { (after, before) };
+            let notes = note_targets.get(&(sheet, (row, col)));
+            let before_note = before.is_none().then(|| notes.and_then(|(n, _)| n.as_ref()).cloned()).flatten();
+            let legacy_note = after.is_none().then(|| notes.and_then(|(_, n)| n.as_ref()).cloned()).flatten();
+            syncs.push((sheet, SheetMetaKind::ThreadChange { row, col,
+                before: before.clone(), after: after.clone(), before_note, legacy_note,
+            }));
         }
         syncs
     }
 
     pub fn apply(&self, sheets: &mut [Sheet], redo: bool) -> Vec<(usize, crate::sync::SheetMetaKind)> {
         use crate::sync::SheetMetaKind;
-        let mut syncs = Vec::with_capacity(self.notes.len() + self.threads.len());
-        let mut dirty_notes = std::collections::HashSet::new();
-        let mut dirty_threads = std::collections::HashSet::new();
-        let note_iter: Box<dyn Iterator<Item = _>> = if redo {
-            Box::new(self.notes.iter())
-        } else {
-            Box::new(self.notes.iter().rev())
-        };
-        for &(si, (r, c), ref before, ref after) in note_iter {
-            let Some(sh) = sheets.get_mut(si) else { continue };
-            let k = CellRef::new(r, c);
-            match if redo { after } else { before } {
-                Some(n) => {
-                    sh.notes.insert(k, n.clone());
-                    syncs.push((
-                        si,
-                        SheetMetaKind::Note {
-                            row: r,
-                            col: c,
-                            author: n.author.clone(),
-                            text: Some(n.text.clone()),
-                        },
-                    ));
+        let mut syncs = self.to_meta_sync(redo);
+        let notes: std::collections::HashMap<_, _> = self.notes.iter().map(|(si, pos, before, after)|
+            ((*si, *pos), if redo { after.is_some() } else { before.is_some() })).collect();
+        let mut dirty = std::collections::HashSet::new();
+        syncs.retain(|(si, kind)| {
+            let Some(sh) = sheets.get_mut(*si) else { return false };
+            match kind {
+                SheetMetaKind::Note { row, col, author, text } => {
+                    let key = CellRef::new(*row, *col);
+                    if sh.threads.contains_key(&key) { return false; }
+                    if let Some(text) = text {
+                        sh.notes.insert(key, crate::notes::Note { r: *row, c: *col, author: author.clone(), text: text.clone() });
+                    } else {
+                        sh.notes.remove(&key);
+                    }
+                    sh.notes_dirty = true;
                 }
-                None => {
-                    sh.notes.remove(&k);
-                    syncs.push((
-                        si,
-                        SheetMetaKind::Note {
-                            row: r,
-                            col: c,
-                            author: String::new(),
-                            text: None,
-                        },
-                    ));
+                SheetMetaKind::ThreadChange { row, col, before, after, before_note, legacy_note } => {
+                    let key = CellRef::new(*row, *col);
+                    let summary = notes.get(&(*si, (*row, *col))).copied().unwrap_or_else(|| sh.notes.contains_key(&key));
+                    if !apply_thread_change(sh, key, before.as_ref(), before_note.as_ref(), after.as_ref(), legacy_note.as_ref(), summary) { return false; }
                 }
+                _ => unreachable!(),
             }
-            dirty_notes.insert(si);
-        }
-        let thread_iter: Box<dyn Iterator<Item = _>> = if redo {
-            Box::new(self.threads.iter())
-        } else {
-            Box::new(self.threads.iter().rev())
-        };
-        for &(si, (r, c), ref before, ref after) in thread_iter {
-            let Some(sh) = sheets.get_mut(si) else { continue };
-            let k = CellRef::new(r, c);
-            let target = if redo { after } else { before };
-            match target {
-                Some(tc) => {
-                    sh.threads.insert(k, tc.clone());
-                }
-                None => {
-                    sh.threads.remove(&k);
-                }
-            }
-            syncs.push((
-                si,
-                SheetMetaKind::Thread {
-                    row: r,
-                    col: c,
-                    thread: target.clone(),
-                },
-            ));
-            dirty_threads.insert(si);
-        }
-        for si in dirty_notes {
-            if let Some(sh) = sheets.get_mut(si) {
-                sh.notes_dirty = true;
-                sh.bump_display_style_revision();
-            }
-        }
-        for si in dirty_threads {
-            if let Some(sh) = sheets.get_mut(si) {
-                sh.threads_dirty = true;
-                sh.bump_display_style_revision();
-            }
-        }
+            dirty.insert(*si);
+            true
+        });
+        for si in dirty { sheets[si].bump_display_style_revision(); }
         syncs
     }
+
+    fn apply_history(&mut self, sheets: &mut [Sheet], redo: bool, skipped: &mut usize) -> Vec<(usize, crate::sync::SheetMetaKind)> {
+        use crate::sync::SheetMetaKind;
+        let syncs = self.apply(sheets, redo);
+        let applied: std::collections::HashSet<_> = syncs.iter().filter_map(|(sheet, kind)| match kind {
+            SheetMetaKind::Note { row, col, .. } | SheetMetaKind::ThreadChange { row, col, .. } => Some((*sheet, (*row, *col))),
+            _ => None,
+        }).collect();
+        let mut conflicts = std::collections::HashSet::new();
+        let mut keep = |sheet, pos| {
+            if applied.contains(&(sheet, pos)) { return true; }
+            conflicts.insert((sheet, pos));
+            false
+        };
+        self.threads.retain(|(sheet, pos, _, _)| keep(*sheet, *pos));
+        self.notes.retain(|(sheet, pos, _, _)| keep(*sheet, *pos));
+        *skipped += conflicts.len();
+        syncs
+    }
+}
+
+fn apply_thread_change(
+    sh: &mut Sheet, key: CellRef, before: Option<&crate::notes::ThreadedComment>,
+    before_note: Option<&crate::notes::Note>, after: Option<&crate::notes::ThreadedComment>, legacy_note: Option<&crate::notes::Note>,
+    target_has_summary: bool,
+) -> bool {
+    if !crate::notes::traditional_baseline_matches(sh.threads.get(&key), sh.notes.get(&key), before, before_note, after, legacy_note) {
+        return false;
+    }
+    let Ok(merged) = crate::notes::merge_thread_change(sh.threads.get(&key), before, after) else { return false; };
+    if let Some(tc) = merged {
+        // Imported threads may have no traditional summary. Restore that representation on
+        // exact replay, but derive a fresh summary whenever a concurrent reply was retained.
+        if target_has_summary || Some(&tc) != after { sh.notes.insert(key, tc.summary_note()); }
+        else { sh.notes.remove(&key); }
+        sh.threads.insert(key, tc);
+    } else {
+        sh.threads.remove(&key);
+        if let Some(note) = legacy_note { sh.notes.insert(key, note.clone()); } else { sh.notes.remove(&key); }
+    }
+    sh.notes_dirty = true;
+    sh.threads_dirty = true;
+    true
+
 }
 
 /// 轻量级工作表元数据改动（列宽/行高/隐藏行列/批注/线程批注/忽略错误/条件格式）：无需整表快照，支持单人及协作模式一键撤销。
@@ -737,7 +728,7 @@ impl MetaEdit {
     }
 
     fn apply(
-        &self,
+        &mut self,
         sheets: &mut [Sheet],
         redo: bool,
         guard: &mut impl FnMut(usize, u32, u32, &Cell) -> bool,
@@ -745,13 +736,14 @@ impl MetaEdit {
         Vec<(usize, crate::sync::SheetMetaKind)>,
         Vec<(usize, u32, u32)>,
         std::collections::HashSet<usize>,
+        usize,
     ) {
         use crate::sync::SheetMetaKind;
         let mut syncs = Vec::new();
         let mut rich_touched = Vec::new();
         let mut rich_skipped = std::collections::HashSet::new();
         let Some(sh) = sheets.get_mut(self.sheet) else {
-            return (syncs, rich_touched, rich_skipped);
+            return (syncs, rich_touched, rich_skipped, 0);
         };
         if !self.col_widths.is_empty() {
             let def = sh.cols.default_size();
@@ -809,8 +801,16 @@ impl MetaEdit {
             sh.bump_display_style_revision();
             syncs.push((self.sheet, SheetMetaKind::HiddenCols(items)));
         }
+        let thread_cells: std::collections::HashSet<_> = self.threads.iter().map(|(pos, _, _)| *pos).collect();
+        let mut conflicted = std::collections::HashSet::new();
         if !self.notes.is_empty() {
             for (pos, before, after) in &self.notes {
+                // A threaded comment and its legacy summary must change together.
+                if thread_cells.contains(pos) { continue; }
+                if sh.threads.contains_key(&CellRef::new(pos.0, pos.1)) {
+                    conflicted.insert(*pos);
+                    continue;
+                }
                 let target = if redo { after } else { before };
                 let cref = CellRef::new(pos.0, pos.1);
                 match target {
@@ -844,36 +844,28 @@ impl MetaEdit {
             sh.bump_display_style_revision();
         }
         if !self.threads.is_empty() {
+            let note_targets: std::collections::HashMap<_, _> = self.notes.iter()
+                .map(|(pos, before, after)| (*pos, if redo { (before, after) } else { (after, before) })).collect();
             for (pos, before, after) in &self.threads {
-                let target = if redo { after } else { before };
-                let cref = CellRef::new(pos.0, pos.1);
-                match target {
-                    Some(tc) => {
-                        sh.threads.insert(cref, tc.clone());
-                        syncs.push((
-                            self.sheet,
-                            SheetMetaKind::Thread {
-                                row: pos.0,
-                                col: pos.1,
-                                thread: Some(tc.clone()),
-                            },
-                        ));
-                    }
-                    None => {
-                        sh.threads.remove(&cref);
-                        syncs.push((
-                            self.sheet,
-                            SheetMetaKind::Thread {
-                                row: pos.0,
-                                col: pos.1,
-                                thread: None,
-                            },
-                        ));
-                    }
+                let (source, target) = if redo { (before, after) } else { (after, before) };
+                let key = CellRef::new(pos.0, pos.1);
+                let notes = note_targets.get(pos);
+                let before_note = source.is_none().then(|| notes.and_then(|(n, _)| n.as_ref()).cloned()).flatten();
+                let legacy_note = target.is_none().then(|| notes.and_then(|(_, n)| n.as_ref()).cloned()).flatten();
+                let summary = notes.map_or_else(|| sh.notes.contains_key(&key), |(_, n)| n.is_some());
+                if !apply_thread_change(sh, key, source.as_ref(), before_note.as_ref(), target.as_ref(), legacy_note.as_ref(), summary) {
+                    conflicted.insert(*pos);
+                    continue;
                 }
+                sh.bump_display_style_revision();
+                syncs.push((self.sheet, SheetMetaKind::ThreadChange {
+                    row: pos.0, col: pos.1, before: source.clone(), after: target.clone(), before_note, legacy_note,
+                }));
             }
-            sh.threads_dirty = true;
-            sh.bump_display_style_revision();
+        }
+        if !conflicted.is_empty() {
+            self.threads.retain(|(pos, _, _)| !conflicted.contains(pos));
+            self.notes.retain(|(pos, _, _)| !conflicted.contains(pos));
         }
         if !self.ignored_errors.is_empty() {
             for &(pos, before, after) in &self.ignored_errors {
@@ -995,7 +987,7 @@ impl MetaEdit {
             sh.sparklines_dirty = true;
             sh.bump_display_style_revision();
         }
-        (syncs, rich_touched, rich_skipped)
+        (syncs, rich_touched, rich_skipped, conflicted.len())
     }
 }
 
@@ -1799,8 +1791,8 @@ impl CowBatchAction {
                 sheet.cf_dirty = true;
                 sheet.bump_display_style_revision();
             }
-            let meta_sync = if let Some(ref note_edit) = self.notes {
-                note_edit.apply(sheets, redo)
+            let meta_sync = if let Some(ref mut note_edit) = self.notes {
+                note_edit.apply_history(sheets, redo, &mut applied.skipped)
             } else {
                 Vec::new()
             };
@@ -2034,9 +2026,9 @@ impl CowBatchAction {
             sheet.cf_dirty = true;
             sheet.bump_display_style_revision();
         }
-        let meta_sync = if let Some(ref note_edit) = self.notes {
+        let meta_sync = if let Some(ref mut note_edit) = self.notes {
             if applied.skipped == 0 || !applied.touched.is_empty() || self.all_mask.is_empty() {
-                note_edit.apply(sheets, redo)
+                note_edit.apply_history(sheets, redo, &mut applied.skipped)
             } else {
                 Vec::new()
             }
@@ -2103,8 +2095,8 @@ impl NumericSortAction {
             else { self.sort.deltas().rev().for_each(apply); }
         }
         let meta_sync = if applied.skipped == 0 {
-            if let Some(ref note_edit) = self.notes {
-                note_edit.apply(sheets, redo)
+            if let Some(ref mut note_edit) = self.notes {
+                note_edit.apply_history(sheets, redo, &mut applied.skipped)
             } else {
                 Vec::new()
             }
@@ -3090,6 +3082,24 @@ impl UndoStack {
         }
     }
 
+    /// Check a collaborative undo before applying any cell or metadata in the entry.
+    pub fn next_thread_sync_error(&self, redo: bool, supports_changes: bool) -> Option<&'static str> {
+        let check = |before: &Option<crate::notes::ThreadedComment>, after: &Option<crate::notes::ThreadedComment>| {
+            if !supports_changes { Some("此操作会更改批注会话，请先升级协作宿主再重试") }
+            else if !crate::sync::thread_snapshots_fit(before.iter().chain(after)) { Some("批注会话过长，本次更改超出协作同步上限") }
+            else { None }
+        };
+        let entry = if redo { self.undone.last()? } else { self.done.last()? };
+        let notes = match entry {
+            Entry::Cells(_, _, _, _, notes) => notes,
+            Entry::CowBatch(_, action) => &action.notes,
+            Entry::NumericSort(_, action) => &action.notes,
+            Entry::Meta(_, action) => return action.edit.threads.iter().find_map(|(_, before, after)| check(before, after)),
+            _ => return None,
+        };
+        notes.as_ref()?.threads.iter().find_map(|(_, _, before, after)| check(before, after))
+    }
+
     pub fn next_sort_permutation(&self, redo: bool) -> Option<crate::data_tools::LinePermutation> {
         let entry = if redo { self.undone.last()? } else { self.done.last()? };
         let (region, horizontal, mut order) = match entry {
@@ -3348,8 +3358,8 @@ impl UndoStack {
         if let Some(Entry::Meta(_, _)) = self.done.last() {
             let mut entry = self.done.pop()?;
             let Entry::Meta(_, ref mut action) = entry else { unreachable!() };
-            let (syncs, touched, rich_skipped) = action.edit.apply(sheets, false, &mut guard);
-            let skipped = rich_skipped.len();
+            let (syncs, touched, rich_skipped, thread_conflicts) = action.edit.apply(sheets, false, &mut guard);
+            let skipped = rich_skipped.len() + thread_conflicts;
             if skipped > 0 {
                 let mut i = 0usize;
                 action.edit.rich.retain(|_| {
@@ -3397,7 +3407,7 @@ impl UndoStack {
             if keep { self.undone.push(entry); }
             return Some(applied);
         }
-        let Entry::Cells(id, mut action, mut permutation, arrays, notes) = self.done.pop()? else { unreachable!() };
+        let Entry::Cells(id, mut action, mut permutation, arrays, mut notes) = self.done.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
@@ -3485,9 +3495,9 @@ impl UndoStack {
             arr.apply(sheets, false, &mut touched);
         }
         skipped = excluded.len();
-        if let Some(ref note_edit) = notes {
+        if let Some(ref mut note_edit) = notes {
             if skipped == 0 || !touched.is_empty() || action.deltas.is_empty() {
-                self.last_meta_sync = note_edit.apply(sheets, false);
+                self.last_meta_sync = note_edit.apply_history(sheets, false, &mut skipped);
             }
         }
         if skipped != 0 {
@@ -3531,8 +3541,8 @@ impl UndoStack {
         if let Some(Entry::Meta(_, _)) = self.undone.last() {
             let mut entry = self.undone.pop()?;
             let Entry::Meta(_, ref mut action) = entry else { unreachable!() };
-            let (syncs, touched, rich_skipped) = action.edit.apply(sheets, true, &mut guard);
-            let skipped = rich_skipped.len();
+            let (syncs, touched, rich_skipped, thread_conflicts) = action.edit.apply(sheets, true, &mut guard);
+            let skipped = rich_skipped.len() + thread_conflicts;
             if skipped > 0 {
                 let mut i = 0usize;
                 action.edit.rich.retain(|_| {
@@ -3580,7 +3590,7 @@ impl UndoStack {
             if keep { self.done.push(entry); }
             return Some(applied);
         }
-        let Entry::Cells(id, mut action, mut permutation, arrays, notes) = self.undone.pop()? else { unreachable!() };
+        let Entry::Cells(id, mut action, mut permutation, arrays, mut notes) = self.undone.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
@@ -3668,9 +3678,9 @@ impl UndoStack {
             arr.apply(sheets, true, &mut touched);
         }
         skipped = excluded.len();
-        if let Some(ref note_edit) = notes {
+        if let Some(ref mut note_edit) = notes {
             if skipped == 0 || !touched.is_empty() || action.deltas.is_empty() {
-                self.last_meta_sync = note_edit.apply(sheets, true);
+                self.last_meta_sync = note_edit.apply_history(sheets, true, &mut skipped);
             }
         }
         if skipped != 0 {

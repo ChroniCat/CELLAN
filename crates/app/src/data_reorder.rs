@@ -982,6 +982,7 @@ impl SheetApp {
                 PreparedChanges::Permutation { order, note_edit, total, sample, collab } => {
                     let operation = &pending.operation;
                     self.status = operation.completed(order.moved_lines());
+                    if !self.thread_change_allowed(!note_edit.threads.is_empty()) { return; }
                     if total == 0 && note_edit.is_empty() { return; }
                     self.wb.sheet_mut(pending.sheet).take_row_changes(&mut prepared);
                     self.wb.dirty = true;
@@ -1044,6 +1045,7 @@ impl SheetApp {
             }
             Ok(changes) => changes,
         };
+        if !self.thread_change_allowed(!changes.notes.threads.is_empty()) { return; }
         let message = operation.completed(changes.count);
         if !changes.deltas.is_empty() || !changes.notes.is_empty() {
             let sheet = self.wb.sheet_mut(focus.0);

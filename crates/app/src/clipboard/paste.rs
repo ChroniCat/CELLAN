@@ -566,6 +566,18 @@ impl SheetApp {
             .filter(|(sheet, _, _)| *sheet == si)
             .map(|(_, rr, cc)| (*rr, *cc))
             .collect();
+        if !values_only && !tsv_paste && self.net.as_ref().is_some_and(|net| !net.supports_thread_changes()) {
+            let target_rows = dst_rows.as_deref();
+            let contains = |sheet: usize, rect: (u32, u32, u32, u32), rows: Option<&[u32]>| {
+                self.wb.sheet(sheet).threads.keys().any(|k|
+                    (rect.0..=rect.2).contains(&k.row) && (rect.1..=rect.3).contains(&k.col)
+                        && rows.is_none_or(|rows| rows.binary_search(&k.row).is_ok()))
+            };
+            let affects_threads = !pasted_clip_threads.is_empty()
+                || contains(si, (r, c, target_last_row, c.saturating_add(w.saturating_sub(1))), target_rows)
+                || cut_note_src.as_ref().is_some_and(|(sheet, rect, rows)| contains(*sheet, *rect, rows.as_deref()));
+            if !self.thread_change_allowed(affects_threads) { return; }
+        }
         if !self.write_preflight(&target_keys, "粘贴") {
             return;
         }

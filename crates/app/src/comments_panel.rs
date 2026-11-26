@@ -345,6 +345,59 @@ impl SheetApp {
         Ok(())
     }
 
+    pub(super) fn thread_change_allowed(&mut self, needed: bool) -> bool {
+        if needed && self.net.as_ref().is_some_and(|net| !net.supports_thread_changes()) {
+            self.status = "此操作会更改批注会话，请先升级协作宿主再重试".into();
+            return false;
+        }
+        true
+    }
+
+    fn thread_edit_fits(&mut self, before: Option<&ThreadedComment>, after: Option<&ThreadedComment>) -> bool {
+        if self.net.is_some() && !sheetcore::sync::thread_snapshots_fit(before.into_iter().chain(after)) {
+            self.status = "批注会话过长，本次更改超出协作同步上限".into();
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn thread_rects_allowed(&mut self, sheet: usize, rects: &[(u32, u32, u32, u32)]) -> bool {
+        if self.net.as_ref().is_none_or(|net| net.supports_thread_changes()) { return true; }
+        let sh = self.wb.sheet(sheet);
+        let touched = sh.threads.keys().any(|key| {
+            let (top, left, bottom, right) = sh.merge_at(key.row, key.col)
+                .unwrap_or((key.row, key.col, key.row, key.col));
+            rects.iter().any(|&(r1, c1, r2, c2)| top <= r2 && bottom >= r1 && left <= c2 && right >= c1)
+        });
+        self.thread_change_allowed(touched)
+    }
+
+    pub(super) fn broadcast_thread_change(
+        &self, sheet: usize, row: u32, col: u32, before: Option<&ThreadedComment>,
+        after: Option<&ThreadedComment>, before_note: Option<&Note>, legacy_note: Option<&Note>,
+    ) -> bool {
+        self.net.as_ref().is_none_or(|net| net.broadcast_sheet_meta(sheet, sheetcore::sync::SheetMetaKind::ThreadChange {
+            row, col, before: before.cloned(), after: after.cloned(), before_note: before.is_none().then(|| before_note.cloned()).flatten(), legacy_note: legacy_note.cloned(),
+        }))
+    }
+
+    pub(super) fn broadcast_comment_diffs(
+        &self, sheet: usize, notes: &[((u32, u32), Option<Note>, Option<Note>)],
+        threads: &[((u32, u32), Option<ThreadedComment>, Option<ThreadedComment>)],
+    ) {
+        if self.net.is_none() { return; }
+        let note_targets: std::collections::HashMap<_, _> = notes.iter().map(|(pos, b, a)| (*pos, (b.as_ref(), a.as_ref()))).collect();
+        let thread_cells: std::collections::HashSet<_> = threads.iter().map(|(pos, _, _)| *pos).collect();
+        for &(pos, _, ref note) in notes {
+            if !thread_cells.contains(&pos) { self.broadcast_note_meta(sheet, pos.0, pos.1, note.as_ref()); }
+        }
+        for &(pos, ref before, ref after) in threads {
+            let (old, new) = note_targets.get(&pos).copied().unwrap_or_default();
+            let legacy = if after.is_none() { new } else { None };
+            self.broadcast_thread_change(sheet, pos.0, pos.1, before.as_ref(), after.as_ref(), old, legacy);
+        }
+    }
+
     /// 写入/更新单元格批注（统一撤销 + 协作广播；供侧边栏、查找替换与 AI 工具复用）
     pub(crate) fn set_comment_cell(
         &mut self,
@@ -440,6 +493,7 @@ impl SheetApp {
         };
         let changed_note = old_note.as_ref() != Some(&new_note);
         let changed_thread = old_thread != new_thread;
+        if changed_thread && (!self.thread_change_allowed(true) || !self.thread_edit_fits(old_thread.as_ref(), new_thread.as_ref())) { return Err(self.status.clone()); }
         if !changed_note && !changed_thread {
             return Ok(false);
         }
@@ -454,7 +508,7 @@ impl SheetApp {
             sh.bump_display_style_revision();
         }
         let synced = if changed_thread {
-            self.broadcast_thread_meta(sheet, r, c, new_thread.as_ref())
+            self.broadcast_thread_change(sheet, r, c, old_thread.as_ref(), new_thread.as_ref(), old_note.as_ref(), None)
         } else {
             self.broadcast_note_meta(sheet, r, c, Some(&new_note))
         };
@@ -917,6 +971,9 @@ impl SheetApp {
                 by_sheet.entry(si).or_default().push((nr, nc));
             }
         }
+        let changes_thread = by_sheet.iter().any(|(&si, coords)| coords.iter().any(|&(r, c)|
+            self.wb.sheet(si).threads.contains_key(&CellRef::new(r, c))));
+        if !self.thread_change_allowed(changes_thread) { return 0; }
         let mut total_deleted = 0usize;
         for (si, mut coords) in by_sheet {
             coords.sort_unstable();
@@ -956,12 +1013,7 @@ impl SheetApp {
                 }
             }
             if !note_diffs.is_empty() || !thread_diffs.is_empty() {
-                for ((r, c), _, _) in &note_diffs {
-                    self.broadcast_note_meta(si, *r, *c, None);
-                }
-                for ((r, c), _, _) in &thread_diffs {
-                    self.broadcast_thread_meta(si, *r, *c, None);
-                }
+                self.broadcast_comment_diffs(si, &note_diffs, &thread_diffs);
                 let focus = (si, coords[0].0, coords[0].1);
                 self.undo.push_meta(
                     label,
@@ -1055,6 +1107,7 @@ impl SheetApp {
             }
         }
 
+        if thread_changed && (!self.thread_change_allowed(true) || !self.thread_edit_fits(old_thread.as_ref(), new_thread.as_ref())) { return Err(self.status.clone()); }
         if !note_changed && !thread_changed {
             return Ok(false);
         }
@@ -1091,7 +1144,7 @@ impl SheetApp {
             sh.bump_display_style_revision();
         }
         let synced = if thread_changed {
-            self.broadcast_thread_meta(sheet, r, c, new_thread.as_ref())
+            self.broadcast_thread_change(sheet, r, c, old_thread.as_ref(), new_thread.as_ref(), old_note.as_ref(), None)
         } else if note_changed {
             self.broadcast_note_meta(sheet, r, c, new_note.as_ref())
         } else {
@@ -1180,6 +1233,10 @@ impl SheetApp {
             }
         };
 
+        let changes_thread = by_sheet.iter().any(|(&si, coords)| coords.iter().any(|&(r, c)|
+            self.wb.sheet(si).threads.get(&CellRef::new(r, c)).is_some_and(|tc|
+                tc.entries.iter().any(|entry| replace_one(&entry.text) != entry.text))));
+        if !self.thread_change_allowed(changes_thread) { return 0; }
         let mut total = 0usize;
         for (si, mut coords) in by_sheet {
             coords.sort_unstable();
@@ -1189,8 +1246,7 @@ impl SheetApp {
             }
             let mut note_diffs = Vec::new();
             let mut thread_diffs = Vec::new();
-            let mut bcast_notes = Vec::new();
-            let mut bcast_threads = Vec::new();
+
             {
                 let sh = self.wb.sheet_mut(si);
                 for &(r, c) in &coords {
@@ -1235,12 +1291,10 @@ impl SheetApp {
                         if n_changed && let Some(ref n) = new_note {
                             sh.notes.insert(key, n.clone());
                             note_diffs.push(((r, c), old_note, Some(n.clone())));
-                            bcast_notes.push((r, c, n.clone()));
                         }
                         if tc_changed && let Some(ref tc) = new_thread {
                             sh.threads.insert(key, tc.clone());
                             thread_diffs.push(((r, c), old_thread, Some(tc.clone())));
-                            bcast_threads.push((r, c, tc.clone()));
                         }
                     }
                 }
@@ -1255,12 +1309,7 @@ impl SheetApp {
                 }
             }
             if !note_diffs.is_empty() || !thread_diffs.is_empty() {
-                for (r, c, n) in &bcast_notes {
-                    self.broadcast_note_meta(si, *r, *c, Some(n));
-                }
-                for (r, c, tc) in &bcast_threads {
-                    self.broadcast_thread_meta(si, *r, *c, Some(tc));
-                }
+                self.broadcast_comment_diffs(si, &note_diffs, &thread_diffs);
                 let focus = (si, coords[0].0, coords[0].1);
                 self.undo.push_meta(
                     "全部替换批注",

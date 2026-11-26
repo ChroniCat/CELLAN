@@ -1664,7 +1664,34 @@ impl HostWatermark {
     }
 }
 
-type HostThreads = Arc<Mutex<HashMap<(usize, u32, u32), sheetcore::notes::ThreadedComment>>>;
+#[cfg(test)]
+#[path = "net_thread_compat_tests.rs"]
+mod thread_compat_tests;
+
+enum HostComment {
+    Thread(sheetcore::notes::ThreadedComment),
+    Note(sheetcore::notes::Note),
+}
+
+type HostThreads = Arc<Mutex<HashMap<(usize, u32, u32), HostComment>>>;
+
+/// Full and incremental replays use the same legacy-compatible authoritative frames.
+fn comment_frames(kind: sheetcore::sync::SheetMetaKind) -> impl Iterator<Item = sheetcore::sync::SheetMetaKind> {
+    use sheetcore::sync::SheetMetaKind;
+    let (first, next) = match kind {
+        SheetMetaKind::ThreadChange { row, col, after: None, legacy_note, .. } => {
+            let note = SheetMetaKind::Note { row, col,
+                author: legacy_note.as_ref().map_or_else(String::new, |n| n.author.clone()),
+                text: legacy_note.as_ref().map(|n| n.text.clone()),
+            };
+            if legacy_note.is_some() {
+                (SheetMetaKind::Thread { row, col, thread: None }, Some(note))
+            } else { (note, None) }
+        }
+        other => (other, None),
+    };
+    std::iter::once(first).chain(next)
+}
 
 /// 在宿主权威线程状态上应用 `SheetMetaKind`：
 /// - `ThreadReply`：幂等按 `entry.id` 合并，超过 256 条上限时返回 `Err(authoritative_thread)`；
@@ -1675,26 +1702,66 @@ fn apply_host_thread_meta(
     host_threads: &HostThreads,
     sheet: usize,
     kind: sheetcore::sync::SheetMetaKind,
+    from_guest: bool,
 ) -> Result<(sheetcore::sync::SheetMetaKind, bool), sheetcore::sync::SheetMetaKind> {
     use sheetcore::sync::{MAX_THREAD_ENTRIES, SheetMetaKind, SheetTabSync};
     match kind {
+        SheetMetaKind::ThreadChange { row, col, before, after, before_note, legacy_note } => {
+            let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (sheet, row, col);
+            let current = map.get(&key);
+            let live = match current { Some(HostComment::Thread(tc)) => Some(tc), _ => None };
+            let live_note = match current { Some(HostComment::Note(n)) => Some(n), _ => None };
+            let merged = if sheetcore::notes::traditional_baseline_matches(live, live_note, before.as_ref(), before_note.as_ref(), after.as_ref(), legacy_note.as_ref()) {
+                sheetcore::notes::merge_thread_change(live, before.as_ref(), after.as_ref())
+            } else { Err("传统批注已更新") };
+            let merged = merged.and_then(|tc| {
+                if sheetcore::sync::thread_snapshots_fit(tc.iter()) { Ok(tc) } else { Err("批注会话超过同步帧上限") }
+            });
+            match merged {
+                Ok(Some(tc)) => {
+                    map.insert(key, HostComment::Thread(tc.clone()));
+                    Ok((SheetMetaKind::Thread { row, col, thread: Some(tc) }, true))
+                }
+                Ok(None) => {
+                    if let Some(n) = &legacy_note {
+                        map.insert(key, HostComment::Note(n.clone()));
+                    } else {
+                        map.remove(&key);
+                    }
+                    Ok((SheetMetaKind::ThreadChange { row, col, before: None, after: None, before_note: None, legacy_note }, true))
+                }
+                Err(_) => Err(match current {
+                    Some(HostComment::Thread(tc)) => SheetMetaKind::Thread { row, col, thread: Some(tc.clone()) },
+                    other => SheetMetaKind::ThreadChange { row, col, before: None, after: None, before_note: None,
+                        legacy_note: match other { Some(HostComment::Note(n)) => Some(n.clone()), _ => None } },
+                }),
+            }
+        }
         SheetMetaKind::ThreadReply { row, col, seed_root, entry } => {
             let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
             let key = (sheet, row, col);
-            let tc = map.entry(key).or_insert_with(|| {
+            if let Some(HostComment::Note(note)) = map.get(&key)
+                && !seed_root.as_ref().is_some_and(|root| root.text == note.text
+                    && (note.author.trim().is_empty() || root.author.trim() == note.author.trim())) {
+                return Err(SheetMetaKind::ThreadChange { row, col, before: None, after: None,
+                    before_note: None, legacy_note: Some(note.clone()) });
+            }
+            if !matches!(map.get(&key), Some(HostComment::Thread(_))) {
                 let mut entries = Vec::new();
                 if let Some(root) = seed_root {
                     if root.id != entry.id {
                         entries.push(root);
                     }
                 }
-                sheetcore::notes::ThreadedComment {
+                map.insert(key, HostComment::Thread(sheetcore::notes::ThreadedComment {
                     r: row,
                     c: col,
                     resolved: false,
                     entries,
-                }
-            });
+                }));
+            }
+            let Some(HostComment::Thread(tc)) = map.get_mut(&key) else { unreachable!() };
             if !tc.entries.iter().any(|e| e.id == entry.id) {
                 if tc.entries.len() >= MAX_THREAD_ENTRIES {
                     return Err(SheetMetaKind::Thread {
@@ -1704,6 +1771,10 @@ fn apply_host_thread_meta(
                     });
                 }
                 tc.entries.push(entry);
+                if !sheetcore::sync::thread_snapshots_fit(std::iter::once(&*tc)) {
+                    tc.entries.pop();
+                    return Err(SheetMetaKind::Thread { row, col, thread: Some(tc.clone()) });
+                }
             }
             Ok((
                 SheetMetaKind::Thread {
@@ -1717,12 +1788,18 @@ fn apply_host_thread_meta(
         SheetMetaKind::ThreadResolve { row, col, seed_root, resolved } => {
             let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
             let key = (sheet, row, col);
+            if let Some(HostComment::Note(note)) = map.get(&key)
+                && !seed_root.as_ref().is_some_and(|root| root.text == note.text
+                    && (note.author.trim().is_empty() || root.author.trim() == note.author.trim())) {
+                return Err(SheetMetaKind::ThreadChange { row, col, before: None, after: None,
+                    before_note: None, legacy_note: Some(note.clone()) });
+            }
             let tc = match map.get_mut(&key) {
-                Some(existing) => {
+                Some(HostComment::Thread(existing)) => {
                     existing.resolved = resolved;
                     existing.clone()
                 }
-                None => {
+                _ => {
                     let Some(root) = seed_root else {
                         return Err(SheetMetaKind::Thread {
                             row,
@@ -1736,7 +1813,7 @@ fn apply_host_thread_meta(
                         resolved,
                         entries: vec![root],
                     };
-                    map.insert(key, created.clone());
+                    map.insert(key, HostComment::Thread(created.clone()));
                     created
                 }
             };
@@ -1752,9 +1829,22 @@ fn apply_host_thread_meta(
         SheetMetaKind::Thread { row, col, thread } => {
             let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
             let key = (sheet, row, col);
+            if from_guest && let Some(HostComment::Note(note)) = map.get(&key) {
+                if !thread.as_ref().is_some_and(|tc| tc.summary_note() == *note) {
+                    return Err(SheetMetaKind::ThreadChange { row, col, before: None, after: None,
+                        before_note: None, legacy_note: Some(note.clone()) });
+                }
+            }
+            if from_guest && let Some(HostComment::Thread(live)) = map.get(&key) {
+                // Older clients send snapshots without a baseline. They can append to an
+                // unchanged prefix, but cannot discard, edit, or resolve existing entries.
+                if !thread.as_ref().is_some_and(|tc| tc.resolved == live.resolved && tc.entries.starts_with(&live.entries)) {
+                    return Err(SheetMetaKind::Thread { row, col, thread: Some(live.clone()) });
+                }
+            }
             match &thread {
                 Some(tc) => {
-                    map.insert(key, tc.clone());
+                    map.insert(key, HostComment::Thread(tc.clone()));
                 }
                 None => {
                     map.remove(&key);
@@ -1762,11 +1852,25 @@ fn apply_host_thread_meta(
             }
             Ok((SheetMetaKind::Thread { row, col, thread }, false))
         }
+        SheetMetaKind::Note { row, col, text: Some(text), author } => {
+            let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (sheet, row, col);
+            if let Some(HostComment::Thread(live)) = map.get(&key) {
+                return Err(SheetMetaKind::Thread { row, col, thread: Some(live.clone()) });
+            }
+            if !matches!(map.get(&key), Some(HostComment::Thread(_))) {
+                map.insert(key, HostComment::Note(sheetcore::notes::Note {
+                    r: row, c: col, text: text.clone(), author: author.clone(),
+                }));
+            }
+            Ok((SheetMetaKind::Note { row, col, text: Some(text), author }, false))
+        }
         SheetMetaKind::Note { row, col, text: None, author } => {
-            host_threads
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&(sheet, row, col));
+            let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(HostComment::Thread(live)) = map.get(&(sheet, row, col)) {
+                return Err(SheetMetaKind::Thread { row, col, thread: Some(live.clone()) });
+            }
+            map.remove(&(sheet, row, col));
             Ok((SheetMetaKind::Note { row, col, text: None, author }, false))
         }
         SheetMetaKind::SheetTab(tab) => {
@@ -1819,8 +1923,10 @@ fn shift_host_threads(
     for ((sh, r, c), mut tc) in old {
         if sh == sheet {
             if let Some((nr, nc)) = sheetcore::sync::shift_structural_coord(r, c, op) {
-                tc.r = nr;
-                tc.c = nc;
+                match &mut tc {
+                    HostComment::Thread(thread) => { thread.r = nr; thread.c = nc; }
+                    HostComment::Note(note) => { note.r = nr; note.c = nc; }
+                }
                 map.insert((sh, nr, nc), tc);
             }
         } else {
@@ -1835,6 +1941,7 @@ pub struct Net {
     sheet_names: Arc<Mutex<Vec<String>>>,
     structural_ack: Arc<AtomicBool>,
     palette_styles_cap: Arc<AtomicBool>,
+    thread_changes_cap: Arc<AtomicBool>,
     connection_generation: Arc<AtomicU64>,
     pending_structure: Arc<AtomicBool>,
     #[cfg(test)]
@@ -3307,8 +3414,13 @@ impl Net {
             let mut map = ht.lock().unwrap_or_else(|e| e.into_inner());
             map.clear();
             for (si, sh) in workbook.sheets.iter().enumerate() {
+                for (k, note) in &sh.notes {
+                    if !sh.threads.contains_key(k) {
+                        map.insert((si, k.row, k.col), HostComment::Note(note.clone()));
+                    }
+                }
                 for (k, tc) in &sh.threads {
-                    map.insert((si, k.row, k.col), tc.clone());
+                    map.insert((si, k.row, k.col), HostComment::Thread(tc.clone()));
                 }
             }
         }
@@ -3669,6 +3781,8 @@ impl Net {
             let _ = self.cmd.send(Cmd::SharedCells(ops));
         }
     }
+
+    pub fn supports_thread_changes(&self) -> bool { self.thread_changes_cap.load(Ordering::Acquire) }
 
     pub fn pending_structure(&self) -> bool { self.pending_structure.load(Ordering::Acquire) }
     pub fn finish_structure(&self) { self.pending_structure.store(false, Ordering::Release); }
@@ -4462,12 +4576,26 @@ impl Net {
     /// 广播工作表高频非单元格元数据变更（列宽/行高/隐藏/冻结/批注/超链接/筛选/工作表标签）。
     /// 返回 `true` 表示载荷合法并已提交发送队列；超限或非法载荷返回 `false`（调用方不得误标为已同步）。
     pub fn broadcast_sheet_meta(&self, sheet: usize, kind: sheetcore::sync::SheetMetaKind) -> bool {
-        if !kind.valid(sheet) || !self.alive.load(Ordering::Acquire) {
+        if matches!(kind, sheetcore::sync::SheetMetaKind::ThreadChange { .. }) && !self.supports_thread_changes() {
+            let _ = self.evt_tx.send(NetEvent::Error("请先升级协作宿主，当前操作包含需保护的批注会话更改".into()));
             return false;
         }
+        if !kind.valid(sheet) {
+            // Some callers commit a mixed undo step locally before queuing its metadata.
+            // Restore the rejected cell and surface the failure just as for a host-side conflict.
+            if let sheetcore::sync::SheetMetaKind::ThreadChange { row, col, before, before_note, .. } = kind {
+                let correction = sheetcore::sync::SheetMetaKind::ThreadChange {
+                    row, col, before: None, after: before, before_note: None, legacy_note: before_note,
+                };
+                let _ = self.evt_tx.send(NetEvent::SheetMeta { site: 0, sheet, kind: correction, snapshot: false });
+                let _ = self.evt_tx.send(NetEvent::Error("批注会话超出协作同步上限，已保留原批注".into()));
+            }
+            return false;
+        }
+        if !self.alive.load(Ordering::Acquire) { return false; }
         let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         let (kind, echo_host_ui) = if let Some(threads) = &self.host_threads {
-            match apply_host_thread_meta(threads, sheet, kind) {
+            match apply_host_thread_meta(threads, sheet, kind, false) {
                 Ok(pair) => pair,
                 Err(auth_kind) => {
                     let _ = self.evt_tx.send(NetEvent::SheetMeta {
@@ -4482,46 +4610,31 @@ impl Net {
         } else {
             (kind, false)
         };
-        if let Some(log) = &self.host_meta_log {
-            let mut g = log.lock().unwrap_or_else(|e| e.into_inner());
-            if g.len() >= 10_000 {
-                g.remove(0);
-            }
-            g.push((sheet, kind.clone()));
-        }
-        let msg = Msg::SheetMetaOp {
-            site: self.site,
-            sheet,
-            ts: 0,
-            kind: kind.clone(),
-        };
         if let Some(roster) = &self.host_roster {
-            let wm_seq = self
-                .host_watermark
-                .as_ref()
-                .map(|wm| wm.lock().unwrap_or_else(|e| e.into_inner()).record_sheet_meta(sheet, kind.clone()));
-            let struct_rev = self
-                .host_structs
-                .as_ref()
-                .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
-            queue_room_change(&self.cmd, roster, None, RoomChange::Message(msg));
-            if let Some(seq) = wm_seq {
-                emit_room_watermark(&self.cmd, roster, seq, struct_rev);
+            let struct_rev = self.host_structs.as_ref().map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
+            let mut wm_seq = None;
+            for kind in comment_frames(kind) {
+                if let Some(log) = &self.host_meta_log {
+                    let mut g = log.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.len() >= 10_000 { g.remove(0); }
+                    g.push((sheet, kind.clone()));
+                }
+                wm_seq = self.host_watermark.as_ref()
+                    .map(|wm| wm.lock().unwrap_or_else(|e| e.into_inner()).record_sheet_meta(sheet, kind.clone()));
+                let msg = Msg::SheetMetaOp { site: self.site, sheet, ts: 0, kind: kind.clone() };
+                queue_room_change(&self.cmd, roster, None, RoomChange::Message(msg));
+                if echo_host_ui {
+                    let _ = self.evt_tx.send(NetEvent::SheetMeta { site: self.site, sheet, kind, snapshot: false });
+                }
             }
-            if echo_host_ui {
-                let _ = self.evt_tx.send(NetEvent::SheetMeta {
-                    site: self.site,
-                    sheet,
-                    kind,
-                    snapshot: false,
-                });
-            }
+            if let Some(seq) = wm_seq { emit_room_watermark(&self.cmd, roster, seq, struct_rev); }
             true
-        } else if let Ok(s) = serde_json::to_string(&msg) {
-            self.note_local_watermark_edit();
-            self.cmd.send(Cmd::Broadcast(s)).is_ok()
         } else {
-            false
+            let msg = Msg::SheetMetaOp { site: self.site, sheet, ts: 0, kind };
+            let Ok(line) = serde_json::to_string(&msg) else { return false };
+            if line.len() > MAX_PLAIN_LINE { return false; }
+            self.note_local_watermark_edit();
+            self.cmd.send(Cmd::Broadcast(line)).is_ok()
         }
     }
 
@@ -5760,6 +5873,7 @@ fn host_initialized(
                                         batch_ops: true,
                                         sort_permutation: true,
                                         structural_ack: true,
+                                        thread_changes: true,
                                         palette_styles: true,
                                         room_id: room_session_id.clone(),
                                         watermark: current_wm,
@@ -6718,52 +6832,31 @@ fn host_initialized(
                                 }
                                 let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 let (kind, include_sender) =
-                                    match apply_host_thread_meta(&host_threads, sheet, kind) {
+                                    match apply_host_thread_meta(&host_threads, sheet, kind, true) {
                                         Ok(pair) => pair,
                                         Err(auth_kind) => {
-                                            let _ = cmd.send(Cmd::Deliver(
-                                                vec![tx.clone()],
-                                                RoomChange::Message(Msg::SheetMetaOp {
-                                                    site: 0,
-                                                    sheet,
-                                                    ts: 0,
-                                                    kind: auth_kind,
-                                                }),
-                                            ));
+                                            for kind in comment_frames(auth_kind) {
+                                                let msg = Msg::SheetMetaOp { site: 0, sheet, ts: 0, kind };
+                                                let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(msg)));
+                                            }
                                             continue;
                                         }
                                     };
-                                {
-                                    let mut g = meta_log.lock().unwrap_or_else(|e| e.into_inner());
-                                    if g.len() >= 10_000 {
-                                        g.remove(0);
-                                    }
-                                    g.push((sheet, kind.clone()));
-                                }
-                                let seq = host_watermark
-                                    .lock()
-                                    .unwrap()
-                                    .record_sheet_meta(sheet, kind.clone());
                                 let struct_rev = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
-                                let exclude = (!include_sender).then_some(conn_site);
-                                queue_room_change(
-                                    &cmd,
-                                    &roster,
-                                    exclude,
-                                    RoomChange::Message(Msg::SheetMetaOp {
-                                        site: conn_site,
-                                        sheet,
-                                        ts,
-                                        kind: kind.clone(),
-                                    }),
-                                );
-                                emit_room_watermark(&cmd, &roster, seq, struct_rev);
-                                let _ = evt_tx.send(NetEvent::SheetMeta {
-                                    site: conn_site,
-                                    sheet,
-                                    kind,
-                                    snapshot: false,
-                                });
+                                let mut seq = None;
+                                for kind in comment_frames(kind) {
+                                    {
+                                        let mut g = meta_log.lock().unwrap_or_else(|e| e.into_inner());
+                                        if g.len() >= 10_000 { g.remove(0); }
+                                        g.push((sheet, kind.clone()));
+                                    }
+                                    seq = Some(host_watermark.lock().unwrap().record_sheet_meta(sheet, kind.clone()));
+                                    let exclude = (!include_sender).then_some(conn_site);
+                                    let msg = Msg::SheetMetaOp { site: conn_site, sheet, ts, kind: kind.clone() };
+                                    queue_room_change(&cmd, &roster, exclude, RoomChange::Message(msg));
+                                    let _ = evt_tx.send(NetEvent::SheetMeta { site: conn_site, sheet, kind, snapshot: false });
+                                }
+                                if let Some(seq) = seq { emit_room_watermark(&cmd, &roster, seq, struct_rev); }
                             }
                             Msg::LockReq { site, name: _, sheet, row, col } => {
                                 let Some(conn_site) = hello_site else { break };
@@ -7216,6 +7309,7 @@ fn host_initialized(
         connected_room_id: Default::default(),
         structural_ack: Default::default(),
         palette_styles_cap: Arc::new(AtomicBool::new(true)),
+        thread_changes_cap: Arc::new(AtomicBool::new(true)),
         connection_generation: Default::default(),
         sheet_names,
         structure_seen: Default::default(),
@@ -7598,6 +7692,8 @@ fn join_session(
     let ack_for_reader = structural_ack.clone();
     let palette_styles_cap = Arc::new(AtomicBool::new(false));
     let palette_for_reader = palette_styles_cap.clone();
+    let thread_changes_cap = Arc::new(AtomicBool::new(false));
+    let thread_changes_for_reader = thread_changes_cap.clone();
     let connection_generation = Arc::new(AtomicU64::new(0));
     let writer_generation = connection_generation.clone();
     let reader_generation = connection_generation.clone();
@@ -8030,6 +8126,7 @@ fn join_session(
                             batch_ops,
                             sort_permutation,
                             structural_ack,
+                            thread_changes,
                             palette_styles,
                             room_id,
                             watermark,
@@ -8061,6 +8158,7 @@ fn join_session(
                             host_compact_flag.store(use_compact, Ordering::Release);
                             reader_generation.fetch_add(1,Ordering::AcqRel);
                             ack_for_reader.store(structural_ack,Ordering::Release);
+                            thread_changes_for_reader.store(thread_changes, Ordering::Release);
                             palette_for_reader.store(palette_styles, Ordering::Release);
                             got_welcome = true;
                             in_initial_snapshot = true;
@@ -8656,6 +8754,7 @@ fn join_session(
         connected_room_id,
         structural_ack,
         palette_styles_cap,
+        thread_changes_cap,
         connection_generation,
         pending_sorts: pending_for_net,
         local_sort_ranges: Default::default(),
