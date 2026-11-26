@@ -8523,6 +8523,33 @@ fn page_setup_cancel_restores_everything() {
     assert!(!app.page_setup_open);
 }
 
+#[test]
+fn page_setup_switching_sheets_discards_the_open_draft_without_dirtying_either_sheet() {
+    let _env = crate::test_env::TestEnv::new("page-setup-switch-sheets");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let mut other = sheetcore::Sheet::new("Other");
+    other.page.scale = 80;
+    app.wb.sheets.push(other);
+    app.page_setup_printers.push("Test printer".into());
+    let first_page = app.wb.sheet(0).page.clone();
+    let second_page = app.wb.sheet(1).page.clone();
+
+    app.ribbon_action("PageSetup", &ctx);
+    assert!(app.page_setup_open);
+    app.page_setup_draft.scale = 125;
+    assert!(app.switch_sheet_view(1));
+    ui_frame(&mut app, &ctx, vec![]);
+
+    assert!(!app.page_setup_open);
+    assert_eq!(app.wb.sheet(0).page, first_page);
+    assert_eq!(app.wb.sheet(1).page, second_page);
+    assert!(!app.wb.sheet(0).page_dirty && !app.wb.sheet(1).page_dirty);
+    assert!(!app.wb.dirty);
+    app.ribbon_action("PageSetup", &ctx);
+    assert_eq!(app.page_setup_draft, second_page);
+}
+
 /// UI-26：A4 横向、左右 10mm、首行重复、宽 1 页高自动 + 横纵分页符能一起生效。
 #[test]
 fn page_setup_accepts_excel_style_fields() {
@@ -10782,30 +10809,34 @@ fn every_dialog_primary_action_uses_the_default_button_helper() {
     // 默认按钮（Enter 触发）只在 ui_kit::primary_button 里实现。任何对话框的主按钮
     // 写成 ui.button(...) 就会丢掉 Enter，也不会画焦点圈。
     // 这条用例扫源码，把「对话框里剩下的裸主按钮」钉死。
-    let src = include_str!("main.rs");
+    let sources = [
+        ("main.rs", include_str!("main.rs")),
+        ("page_setup.rs", include_str!("page_setup.rs")),
+    ];
     let mut bad = Vec::new();
     // 功能区下拉里的行内「应用」是菜单项（点完即关闭菜单），不是对话框默认按钮，
     // 不在本规则的管辖范围内。
     const MENU_FNS: [&str; 1] = ["toolbar_cf_items"];
-    let mut cur_fn = "";
-    for (n, line) in src.lines().enumerate() {
-        if line.starts_with("    fn ") {
-            cur_fn = line
-                .trim_start_matches("    fn ")
-                .split(['(', '<'])
-                .next()
-                .unwrap_or("");
-        }
-        if MENU_FNS.contains(&cur_fn) {
-            continue;
-        }
-        let t = line.trim();
-        if !t.starts_with("if ui.button(") && !t.starts_with("if ui.add(egui::Button::new(") {
-            continue;
-        }
-        for label in ["确定", "执行", "应用", "完成", "下一步", "导入"] {
-            if t.contains(&format!("\"{label}\"")) {
-                bad.push(format!("main.rs:{} {}", n + 1, t));
+    for (file, src) in sources {
+        let mut cur_fn = "";
+        for (n, line) in src.lines().enumerate() {
+            let t = line.trim();
+            if let Some(decl) = ["fn ", "pub(super) fn ", "pub(crate) fn ", "pub fn "]
+                .into_iter()
+                .find_map(|prefix| t.strip_prefix(prefix))
+            {
+                cur_fn = decl.split(['(', '<']).next().unwrap_or("");
+            }
+            if MENU_FNS.contains(&cur_fn) {
+                continue;
+            }
+            if !t.starts_with("if ui.button(") && !t.starts_with("if ui.add(egui::Button::new(") {
+                continue;
+            }
+            for label in ["确定", "执行", "应用", "完成", "下一步", "导入"] {
+                if t.contains(&format!("\"{label}\"")) {
+                    bad.push(format!("{file}:{} {}", n + 1, t));
+                }
             }
         }
     }
