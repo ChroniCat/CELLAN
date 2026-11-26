@@ -10865,6 +10865,156 @@ mod integrity_tests {
         assert!(got_col, "水位增量重连后必须收到断线期间的列宽修改");
         assert!(got_row, "水位增量重连后必须收到断线期间的行高修改");
     }
+
+    #[test]
+    fn comments_phase1_sheet_meta_thread_live_and_watermark_delta_sync() {
+        let _env = crate::test_env::TestEnv::new("comments_p1_thread_sync");
+        let (host, port) = host_for_test(1, "Host", "thread-sync-doc", "pw");
+        let mut wb = sheetcore::Workbook::new_blank();
+        let mut peer = sheetcore::sync::Peer::new(1);
+        wb.sheet_mut(0).set(
+            0,
+            0,
+            sheetcore::Cell {
+                value: sheetcore::Value::Number(1.0),
+                formula: None,
+            },
+        );
+        peer.seed_workbook(&wb);
+        host.seed_snapshot(
+            &peer,
+            &wb,
+            Cursor {
+                site: 1,
+                name: "Host".into(),
+                color: 1,
+                sheet: 0,
+                row: 0,
+                col: 0,
+                end_row: None,
+                end_col: None,
+            },
+        );
+
+        let guest = join(
+            2,
+            "Guest".into(),
+            "thread-sync-doc".into(),
+            &format!("127.0.0.1:{port}"),
+            "pw".into(),
+        )
+        .unwrap();
+        assert!(matches!(
+            wait_event(&guest, 5000, |e| matches!(e, NetEvent::Welcome { .. })),
+            Some(NetEvent::Welcome { delta_sync: false, .. })
+        ));
+        assert!(wait_event(&guest, 5000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+
+        // 1) 在线实时同步 Thread 创建与删除
+        let live_tc = sheetcore::notes::ThreadedComment {
+            r: 1,
+            c: 2,
+            resolved: false,
+            entries: vec![sheetcore::notes::ThreadEntry {
+                id: sheetcore::notes::new_ooxml_guid(),
+                author: "Host".into(),
+                timestamp: "2026-11-26T08:00:00Z".into(),
+                text: "在线线程批注".into(),
+            }],
+        };
+        assert!(host.broadcast_sheet_meta(
+            0,
+            sheetcore::sync::SheetMetaKind::Thread {
+                row: 1,
+                col: 2,
+                thread: Some(live_tc.clone()),
+            },
+        ));
+        let got_live = wait_event(&guest, 5000, |e| {
+            matches!(
+                e,
+                NetEvent::SheetMeta {
+                    sheet: 0,
+                    kind: sheetcore::sync::SheetMetaKind::Thread {
+                        row: 1,
+                        col: 2,
+                        thread: Some(tc)
+                    },
+                    ..
+                } if tc == &live_tc
+            )
+        });
+        assert!(got_live.is_some(), "访客必须实时收到 Thread 批注广播");
+
+        assert!(host.broadcast_sheet_meta(
+            0,
+            sheetcore::sync::SheetMetaKind::Thread {
+                row: 1,
+                col: 2,
+                thread: None,
+            },
+        ));
+        let got_del = wait_event(&guest, 5000, |e| {
+            matches!(
+                e,
+                NetEvent::SheetMeta {
+                    sheet: 0,
+                    kind: sheetcore::sync::SheetMetaKind::Thread {
+                        row: 1,
+                        col: 2,
+                        thread: None
+                    },
+                    ..
+                }
+            )
+        });
+        assert!(got_del.is_some(), "访客必须实时收到 Thread 删除广播");
+
+        // 2) 短暂断线期间新增线程批注，水位增量重连必须补发
+        guest.disconnect_socket_for_test();
+        assert!(wait_event(&guest, 5000, |e| matches!(e, NetEvent::Disconnected(_))).is_some());
+
+        let offline_tc = sheetcore::notes::ThreadedComment {
+            r: 4,
+            c: 1,
+            resolved: true,
+            entries: vec![sheetcore::notes::ThreadEntry {
+                id: sheetcore::notes::new_ooxml_guid(),
+                author: "Host".into(),
+                timestamp: "2026-11-26T08:10:00Z".into(),
+                text: "断线补发线程".into(),
+            }],
+        };
+        assert!(host.broadcast_sheet_meta(
+            0,
+            sheetcore::sync::SheetMetaKind::Thread {
+                row: 4,
+                col: 1,
+                thread: Some(offline_tc.clone()),
+            },
+        ));
+
+        let second_welcome = wait_event(&guest, 8000, |e| matches!(e, NetEvent::Welcome { .. }));
+        assert!(
+            matches!(second_welcome, Some(NetEvent::Welcome { delta_sync: true, .. })),
+            "短断线重连应走水位增量同步: {second_welcome:?}"
+        );
+        let got_replayed = wait_event(&guest, 6000, |e| {
+            matches!(
+                e,
+                NetEvent::SheetMeta {
+                    sheet: 0,
+                    kind: sheetcore::sync::SheetMetaKind::Thread {
+                        row: 4,
+                        col: 1,
+                        thread: Some(tc)
+                    },
+                    ..
+                } if tc == &offline_tc
+            )
+        });
+        assert!(got_replayed.is_some(), "水位增量重连后必须补发断线期间的 Thread 批注");
+    }
 }
 
 #[cfg(test)]

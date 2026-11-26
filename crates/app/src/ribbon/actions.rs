@@ -168,11 +168,28 @@ impl SheetApp {
                     st.tip = Some("所选区域没有批注".into());
                 }
             }
-            "PrevComment" | "NextComment" | "ShowShowCommentBtn" | "ShowComment"
-            | "SelectComments" => {
-                st.enabled = !self.wb.sheet(self.sheet_idx).notes.is_empty();
+            "PrevComment" | "NextComment" | "SelectComments" => {
+                let sh = self.wb.sheet(self.sheet_idx);
+                st.enabled = !sh.notes.is_empty() || !sh.threads.is_empty();
                 if !st.enabled {
                     st.tip = Some("当前工作表没有批注".into());
+                }
+            }
+            "ShowShowCommentBtn" | "ShowComment" => {
+                let sh = self.wb.sheet(self.sheet_idx);
+                st.enabled = !sh.notes.is_empty() || !sh.threads.is_empty();
+                if !st.enabled {
+                    st.tip = Some("当前工作表没有批注".into());
+                } else {
+                    let (ar, ac) = self.note_anchor(self.sel.0, self.sel.1);
+                    let key = sheetcore::model::CellRef::new(ar, ac);
+                    st.checked = self.show_all_comments
+                        || self.pinned_comments.contains(&(sh.identity, key));
+                    st.tip = Some(if st.checked {
+                        "当前批注已固定显示：再点一次取消固定".into()
+                    } else {
+                        "固定常显当前单元格批注（若当前格无批注则定位并固定第一条）".into()
+                    });
                 }
             }
             "FillColor" => {

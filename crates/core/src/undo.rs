@@ -56,6 +56,8 @@ pub struct SheetSnapshot {
     pub sheet: usize,
     pub cells: Vec<(u32, u32, Cell, u16)>,
     pub merges: Vec<(u32, u32, u32, u32)>,
+    pub notes: Vec<((u32, u32), crate::notes::Note)>,
+    pub threads: Vec<((u32, u32), crate::notes::ThreadedComment)>,
 }
 
 pub fn snapshot_sheet(sheet: &Sheet, idx: usize) -> SheetSnapshot {
@@ -66,6 +68,8 @@ pub fn snapshot_sheet(sheet: &Sheet, idx: usize) -> SheetSnapshot {
             .map(|(k, c)| (k.row, k.col, c.to_cell(), sheet.style_of(k.row, k.col)))
             .collect(),
         merges: sheet.merges.to_vec(),
+        notes: sheet.notes.iter().map(|(k, v)| ((k.row, k.col), v.clone())).collect(),
+        threads: sheet.threads.iter().map(|(k, v)| ((k.row, k.col), v.clone())).collect(),
     }
 }
 
@@ -77,6 +81,16 @@ pub fn restore_sheet(sheet: &mut Sheet, snap: &SheetSnapshot) {
     }
     sheet.merges = snap.merges.clone().into();
     sheet.merges_dirty = true;
+    sheet.notes.clear();
+    for &((r, c), ref n) in &snap.notes {
+        sheet.notes.insert(CellRef::new(r, c), n.clone());
+    }
+    sheet.notes_dirty = true;
+    sheet.threads.clear();
+    for &((r, c), ref tc) in &snap.threads {
+        sheet.threads.insert(CellRef::new(r, c), tc.clone());
+    }
+    sheet.threads_dirty = true;
 }
 
 /// 形状（文本框）改动的前后快照：文本框不在格子模型里，靠整组前后状态回退
@@ -366,7 +380,277 @@ impl Action {
 }
 
 
-/// 轻量级工作表元数据改动（列宽/行高/隐藏行列/批注/忽略错误/条件格式）：无需整表快照，支持单人及协作模式一键撤销。
+/// 多表批注与线程会话变更记录：可附着在单元格批量动作（复制/剪切/清除/排序/拖动）上，
+/// 与 `CellDelta` 同步单步原子撤销/重做，并自动产出协作广播载荷。
+#[derive(Clone, Debug, Default)]
+pub struct NoteUndoEdit {
+    pub notes: Vec<(usize, (u32, u32), Option<crate::notes::Note>, Option<crate::notes::Note>)>,
+    pub threads: Vec<(
+        usize,
+        (u32, u32),
+        Option<crate::notes::ThreadedComment>,
+        Option<crate::notes::ThreadedComment>,
+    )>,
+}
+
+impl NoteUndoEdit {
+    pub fn is_empty(&self) -> bool {
+        self.notes.is_empty() && self.threads.is_empty()
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        let note_b: usize = self
+            .notes
+            .iter()
+            .map(|(_, _, b, a)| {
+                std::mem::size_of::<(usize, (u32, u32), Option<crate::notes::Note>, Option<crate::notes::Note>)>()
+                    + b.as_ref().map_or(0, |n| n.text.len() + n.author.len())
+                    + a.as_ref().map_or(0, |n| n.text.len() + n.author.len())
+            })
+            .sum();
+        let thread_b: usize = self
+            .threads
+            .iter()
+            .map(|(_, _, b, a)| {
+                let sz = |opt: &Option<crate::notes::ThreadedComment>| -> usize {
+                    opt.as_ref().map_or(0, |tc| {
+                        tc.entries
+                            .iter()
+                            .map(|e| e.id.len() + e.author.len() + e.timestamp.len() + e.text.len() + 96)
+                            .sum()
+                    })
+                };
+                64 + sz(b) + sz(a)
+            })
+            .sum();
+        note_b + thread_b
+    }
+
+    pub fn extend(&mut self, other: NoteUndoEdit) {
+        self.notes.extend(other.notes);
+        self.threads.extend(other.threads);
+    }
+
+    pub fn between_sheet(sheet_idx: usize, before: &Sheet, after: &Sheet) -> Option<Self> {
+        if before.notes == after.notes && before.threads == after.threads {
+            return None;
+        }
+        let mut out = Self::default();
+        if before.notes != after.notes {
+            let mut keys: Vec<CellRef> = before
+                .notes
+                .keys()
+                .chain(after.notes.keys())
+                .copied()
+                .collect();
+            keys.sort_unstable_by_key(|k| (k.row, k.col));
+            keys.dedup();
+            for k in keys {
+                let b = before.notes.get(&k).cloned();
+                let a = after.notes.get(&k).cloned();
+                if b != a {
+                    out.notes.push((sheet_idx, (k.row, k.col), b, a));
+                }
+            }
+        }
+        if before.threads != after.threads {
+            let mut keys: Vec<CellRef> = before
+                .threads
+                .keys()
+                .chain(after.threads.keys())
+                .copied()
+                .collect();
+            keys.sort_unstable_by_key(|k| (k.row, k.col));
+            keys.dedup();
+            for k in keys {
+                let b = before.threads.get(&k).cloned();
+                let a = after.threads.get(&k).cloned();
+                if b != a {
+                    out.threads.push((sheet_idx, (k.row, k.col), b, a));
+                }
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    pub fn apply_on_sheet(&self, sheet: &mut Sheet, redo: bool) {
+        if !self.notes.is_empty() {
+            let mut any = false;
+            let iter: Box<dyn Iterator<Item = _>> = if redo {
+                Box::new(self.notes.iter())
+            } else {
+                Box::new(self.notes.iter().rev())
+            };
+            for &(_, (r, c), ref before, ref after) in iter {
+                let k = CellRef::new(r, c);
+                match if redo { after } else { before } {
+                    Some(n) => {
+                        sheet.notes.insert(k, n.clone());
+                    }
+                    None => {
+                        sheet.notes.remove(&k);
+                    }
+                }
+                any = true;
+            }
+            if any {
+                sheet.notes_dirty = true;
+                sheet.bump_display_style_revision();
+            }
+        }
+        if !self.threads.is_empty() {
+            let mut any = false;
+            let iter: Box<dyn Iterator<Item = _>> = if redo {
+                Box::new(self.threads.iter())
+            } else {
+                Box::new(self.threads.iter().rev())
+            };
+            for &(_, (r, c), ref before, ref after) in iter {
+                let k = CellRef::new(r, c);
+                match if redo { after } else { before } {
+                    Some(tc) => {
+                        sheet.threads.insert(k, tc.clone());
+                    }
+                    None => {
+                        sheet.threads.remove(&k);
+                    }
+                }
+                any = true;
+            }
+            if any {
+                sheet.threads_dirty = true;
+                sheet.bump_display_style_revision();
+            }
+        }
+    }
+
+    pub fn to_meta_sync(&self, redo: bool) -> Vec<(usize, crate::sync::SheetMetaKind)> {
+        use crate::sync::SheetMetaKind;
+        let mut syncs = Vec::with_capacity(self.notes.len() + self.threads.len());
+        let note_iter: Box<dyn Iterator<Item = _>> = if redo {
+            Box::new(self.notes.iter())
+        } else {
+            Box::new(self.notes.iter().rev())
+        };
+        for &(si, (r, c), ref before, ref after) in note_iter {
+            match if redo { after } else { before } {
+                Some(n) => syncs.push((
+                    si,
+                    SheetMetaKind::Note {
+                        row: r,
+                        col: c,
+                        author: n.author.clone(),
+                        text: Some(n.text.clone()),
+                    },
+                )),
+                None => syncs.push((
+                    si,
+                    SheetMetaKind::Note {
+                        row: r,
+                        col: c,
+                        author: String::new(),
+                        text: None,
+                    },
+                )),
+            }
+        }
+        let thread_iter: Box<dyn Iterator<Item = _>> = if redo {
+            Box::new(self.threads.iter())
+        } else {
+            Box::new(self.threads.iter().rev())
+        };
+        for &(si, (r, c), ref before, ref after) in thread_iter {
+            let tc = if redo { after.clone() } else { before.clone() };
+            syncs.push((si, SheetMetaKind::Thread { row: r, col: c, thread: tc }));
+        }
+        syncs
+    }
+
+    pub fn apply(&self, sheets: &mut [Sheet], redo: bool) -> Vec<(usize, crate::sync::SheetMetaKind)> {
+        use crate::sync::SheetMetaKind;
+        let mut syncs = Vec::with_capacity(self.notes.len() + self.threads.len());
+        let mut dirty_notes = std::collections::HashSet::new();
+        let mut dirty_threads = std::collections::HashSet::new();
+        let note_iter: Box<dyn Iterator<Item = _>> = if redo {
+            Box::new(self.notes.iter())
+        } else {
+            Box::new(self.notes.iter().rev())
+        };
+        for &(si, (r, c), ref before, ref after) in note_iter {
+            let Some(sh) = sheets.get_mut(si) else { continue };
+            let k = CellRef::new(r, c);
+            match if redo { after } else { before } {
+                Some(n) => {
+                    sh.notes.insert(k, n.clone());
+                    syncs.push((
+                        si,
+                        SheetMetaKind::Note {
+                            row: r,
+                            col: c,
+                            author: n.author.clone(),
+                            text: Some(n.text.clone()),
+                        },
+                    ));
+                }
+                None => {
+                    sh.notes.remove(&k);
+                    syncs.push((
+                        si,
+                        SheetMetaKind::Note {
+                            row: r,
+                            col: c,
+                            author: String::new(),
+                            text: None,
+                        },
+                    ));
+                }
+            }
+            dirty_notes.insert(si);
+        }
+        let thread_iter: Box<dyn Iterator<Item = _>> = if redo {
+            Box::new(self.threads.iter())
+        } else {
+            Box::new(self.threads.iter().rev())
+        };
+        for &(si, (r, c), ref before, ref after) in thread_iter {
+            let Some(sh) = sheets.get_mut(si) else { continue };
+            let k = CellRef::new(r, c);
+            let target = if redo { after } else { before };
+            match target {
+                Some(tc) => {
+                    sh.threads.insert(k, tc.clone());
+                }
+                None => {
+                    sh.threads.remove(&k);
+                }
+            }
+            syncs.push((
+                si,
+                SheetMetaKind::Thread {
+                    row: r,
+                    col: c,
+                    thread: target.clone(),
+                },
+            ));
+            dirty_threads.insert(si);
+        }
+        for si in dirty_notes {
+            if let Some(sh) = sheets.get_mut(si) {
+                sh.notes_dirty = true;
+                sh.bump_display_style_revision();
+            }
+        }
+        for si in dirty_threads {
+            if let Some(sh) = sheets.get_mut(si) {
+                sh.threads_dirty = true;
+                sh.bump_display_style_revision();
+            }
+        }
+        syncs
+    }
+}
+
+/// 轻量级工作表元数据改动（列宽/行高/隐藏行列/批注/线程批注/忽略错误/条件格式）：无需整表快照，支持单人及协作模式一键撤销。
 #[derive(Clone, Debug, Default)]
 pub struct MetaEdit {
     pub sheet: usize,
@@ -375,6 +659,11 @@ pub struct MetaEdit {
     pub hidden_rows_user: Vec<(u32, bool, bool)>,
     pub hidden_cols: Vec<(u32, bool, bool)>,
     pub notes: Vec<((u32, u32), Option<crate::notes::Note>, Option<crate::notes::Note>)>,
+    pub threads: Vec<(
+        (u32, u32),
+        Option<crate::notes::ThreadedComment>,
+        Option<crate::notes::ThreadedComment>,
+    )>,
     pub ignored_errors: Vec<((u32, u32), bool, bool)>,
     pub cf: Option<(crate::cf::CfSheet, crate::cf::CfSheet)>,
     pub filter: Option<(
@@ -417,6 +706,7 @@ impl MetaEdit {
             && self.hidden_rows_user.is_empty()
             && self.hidden_cols.is_empty()
             && self.notes.is_empty()
+            && self.threads.is_empty()
             && self.ignored_errors.is_empty()
             && self.cf.is_none()
             && self.filter.is_none()
@@ -534,6 +824,38 @@ impl MetaEdit {
                 }
             }
             sh.notes_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        if !self.threads.is_empty() {
+            for (pos, before, after) in &self.threads {
+                let target = if redo { after } else { before };
+                let cref = CellRef::new(pos.0, pos.1);
+                match target {
+                    Some(tc) => {
+                        sh.threads.insert(cref, tc.clone());
+                        syncs.push((
+                            self.sheet,
+                            SheetMetaKind::Thread {
+                                row: pos.0,
+                                col: pos.1,
+                                thread: Some(tc.clone()),
+                            },
+                        ));
+                    }
+                    None => {
+                        sh.threads.remove(&cref);
+                        syncs.push((
+                            self.sheet,
+                            SheetMetaKind::Thread {
+                                row: pos.0,
+                                col: pos.1,
+                                thread: None,
+                            },
+                        ));
+                    }
+                }
+            }
+            sh.threads_dirty = true;
             sh.bump_display_style_revision();
         }
         if !self.ignored_errors.is_empty() {
@@ -865,7 +1187,7 @@ impl ChartUndoAction {
 }
 
 enum Entry {
-    Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>, Option<ArrayEdit>),
+    Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>, Option<ArrayEdit>, Option<NoteUndoEdit>),
     CowBatch(EntryStamp, Box<CowBatchAction>),
     NumericSort(EntryStamp, NumericSortAction),
     Structure(EntryStamp, StructureAction),
@@ -880,7 +1202,7 @@ impl Entry {
 
     fn stamp(&self) -> EntryStamp {
         match self {
-            Self::Cells(s, _, _, _)
+            Self::Cells(s, _, _, _, _)
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
@@ -893,7 +1215,7 @@ impl Entry {
 
     fn stamp_mut(&mut self) -> &mut EntryStamp {
         match self {
-            Self::Cells(s, _, _, _)
+            Self::Cells(s, _, _, _, _)
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
@@ -906,13 +1228,14 @@ impl Entry {
 
     fn simple_cells(&self) -> Option<Box<dyn Iterator<Item = (usize, u32, u32)> + '_>> {
         match self {
-            Self::Cells(_, a, _, None) if a.snap_before.is_none() && a.snap_after.is_none()
+            Self::Cells(_, a, _, None, None) if a.snap_before.is_none() && a.snap_after.is_none()
                 && a.merges.is_none() && a.shapes.is_none() && a.pictures.is_none()
                 && a.refresh_sizes.is_none() => Some(Box::new(a.deltas.iter().map(|d| (d.sheet, d.row, d.col)))),
             Self::CowBatch(_, a)
                 if a.row_style_deltas.is_empty()
                     && a.col_style_deltas.is_empty()
                     && a.merges.is_none()
+                    && a.notes.is_none()
                     && a.refresh_sizes.is_none() =>
             {
                 let sheet = a.sheet;
@@ -923,14 +1246,14 @@ impl Entry {
                         .map(move |k| (sheet, k.row, k.col)),
                 ))
             }
-            Self::NumericSort(_, a) => Some(Box::new(a.sort.deltas().map(|d| (d.sheet, d.row, d.col)))),
+            Self::NumericSort(_, a) if a.notes.is_none() => Some(Box::new(a.sort.deltas().map(|d| (d.sheet, d.row, d.col)))),
             _ => None,
         }
     }
 
     fn label(&self) -> &str {
         match self {
-            Self::Cells(_, a, _, _) => &a.label,
+            Self::Cells(_, a, _, _, _) => &a.label,
             Self::CowBatch(_, a) => &a.label,
             Self::NumericSort(_, a) => &a.label,
             Self::Structure(_, a) => &a.label,
@@ -942,7 +1265,7 @@ impl Entry {
     }
     fn by_site(&self) -> u32 {
         match self {
-            Self::Cells(_, a, _, _) => a.by_site,
+            Self::Cells(_, a, _, _, _) => a.by_site,
             Self::CowBatch(_, a) => a.by_site,
             Self::NumericSort(_, a) => a.by_site,
             Self::Structure(_, a) => a.by_site,
@@ -1050,6 +1373,7 @@ struct CowBatchAction {
     excluded: crate::model::CellJournal,
     merges: Option<MergeEdit>,
     cf: Option<(crate::cf::CfSheet, crate::cf::CfSheet)>,
+    notes: Option<NoteUndoEdit>,
     refresh_sizes: Option<(Vec<(String, u32, u32)>, Vec<(String, u32, u32)>)>,
     label: String,
     focus: (usize, u32, u32),
@@ -1059,6 +1383,10 @@ struct CowBatchAction {
 
 impl CowBatchAction {
     fn from_action(action: &Action) -> Option<(Self, usize)> {
+        Self::from_action_with_notes(action, None)
+    }
+
+    fn from_action_with_notes(action: &Action, notes: Option<NoteUndoEdit>) -> Option<(Self, usize)> {
         if action.deltas.len() <= COW_BATCH_THRESHOLD
             || action.snap_before.is_some()
             || action.snap_after.is_some()
@@ -1072,6 +1400,11 @@ impl CowBatchAction {
         let sheet = action.deltas.first()?.sheet;
         if action.deltas.iter().any(|d| d.sheet != sheet) {
             return None;
+        }
+        if let Some(ref n) = notes {
+            if n.notes.iter().any(|&(s, ..)| s != sheet) || n.threads.iter().any(|&(s, ..)| s != sheet) {
+                return None;
+            }
         }
         let mut before_cells = crate::store::Store::default();
         let mut after_cells = crate::store::Store::default();
@@ -1112,6 +1445,7 @@ impl CowBatchAction {
         if all_mask.is_empty() {
             return None;
         }
+        let notes_bytes = notes.as_ref().map_or(0, NoteUndoEdit::payload_bytes);
         let payload = before_cells.unique_payload_bytes()
             + after_cells.unique_payload_bytes()
             + before_styles.payload_bytes()
@@ -1119,7 +1453,8 @@ impl CowBatchAction {
             + cell_mask.payload_bytes()
             + style_mask.payload_bytes()
             + all_mask.payload_bytes()
-            + heap_text_bytes;
+            + heap_text_bytes
+            + notes_bytes;
         Some((
             Self {
                 sheet,
@@ -1140,6 +1475,7 @@ impl CowBatchAction {
                 excluded: Default::default(),
                 merges: None,
                 cf: None,
+                notes,
                 refresh_sizes: None,
                 label: action.label.clone(),
                 focus: action.focus,
@@ -1208,6 +1544,7 @@ impl CowBatchAction {
             None
         };
         let cf = (before.cf != after.cf).then(|| (before.cf.clone(), after.cf.clone()));
+        let notes = NoteUndoEdit::between_sheet(sheet_idx, before, after);
         let mut all_mask = cell_mask.clone();
         all_mask.union_from(&style_mask);
         if all_mask.is_empty()
@@ -1215,6 +1552,7 @@ impl CowBatchAction {
             && col_style_deltas.is_empty()
             && merges.is_none()
             && cf.is_none()
+            && notes.is_none()
             && refresh_sizes.is_none()
         {
             return None;
@@ -1267,6 +1605,7 @@ impl CowBatchAction {
             (b.capacity() + a.capacity()) * std::mem::size_of::<(String, u32, u32)>()
                 + b.iter().chain(a).map(|(s, _, _)| s.capacity()).sum::<usize>()
         });
+        let notes_bytes = notes.as_ref().map_or(0, NoteUndoEdit::payload_bytes);
         let payload = forked_cell_bytes
             + diff_heap
             + forked_style_bytes
@@ -1276,6 +1615,7 @@ impl CowBatchAction {
             + style_mask.payload_bytes()
             + all_mask.payload_bytes()
             + merges_bytes
+            + notes_bytes
             + refresh_bytes;
         Some((
             Self {
@@ -1297,6 +1637,7 @@ impl CowBatchAction {
                 excluded: Default::default(),
                 merges,
                 cf,
+                notes,
                 refresh_sizes,
                 label,
                 focus,
@@ -1314,7 +1655,7 @@ impl CowBatchAction {
         sheets: &mut [Sheet],
         redo: bool,
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
-    ) -> (Applied, bool) {
+    ) -> (Applied, bool, Vec<(usize, crate::sync::SheetMetaKind)>) {
         let prev_excl_bytes = self.excluded.payload_bytes();
         let mut applied = Applied {
             touched: Vec::new(),
@@ -1330,7 +1671,7 @@ impl CowBatchAction {
         };
         let Some(sheet) = sheets.get(self.sheet) else {
             applied.skipped = self.all_mask.len().saturating_sub(self.excluded.len());
-            return (applied, false);
+            return (applied, false, Vec::new());
         };
         let (
             exp_cells,
@@ -1382,12 +1723,12 @@ impl CowBatchAction {
             if let Some(merge_edit) = &self.merges {
                 let Some(changes) = merge_edit.apply(sheets, redo) else {
                     applied.merge_conflict = true;
-                    return (applied, true);
+                    return (applied, true, Vec::new());
                 };
                 applied.merge_changes = changes;
             }
             let Some(sheet) = sheets.get_mut(self.sheet) else {
-                return (applied, false);
+                return (applied, false, Vec::new());
             };
             if !self.cell_mask.is_empty() {
                 *sheet.cells_mut() = tgt_cells.clone();
@@ -1441,6 +1782,11 @@ impl CowBatchAction {
                 sheet.cf_dirty = true;
                 sheet.bump_display_style_revision();
             }
+            let meta_sync = if let Some(ref note_edit) = self.notes {
+                note_edit.apply(sheets, redo)
+            } else {
+                Vec::new()
+            };
             let total = self.all_mask.len();
             applied.total_touched = total;
             let cap = total.min(2_001);
@@ -1452,7 +1798,7 @@ impl CowBatchAction {
                 .refresh_sizes
                 .clone()
                 .map(|(b, a)| if redo { a } else { b });
-            return (applied, true);
+            return (applied, true, meta_sync);
         }
 
         let blank = Cell::default();
@@ -1481,7 +1827,7 @@ impl CowBatchAction {
             if !ok_cell || !ok_style || !guard(self.sheet, k.row, k.col, current) {
                 if self.merges.is_some() {
                     applied.merge_conflict = true;
-                    return (applied, true);
+                    return (applied, true, Vec::new());
                 }
                 newly_excluded.push(k);
                 continue;
@@ -1500,11 +1846,11 @@ impl CowBatchAction {
             });
             if !axis_ok {
                 applied.merge_conflict = true;
-                return (applied, true);
+                return (applied, true, Vec::new());
             }
             let Some(changes) = merge_edit.apply(sheets, redo) else {
                 applied.merge_conflict = true;
-                return (applied, true);
+                return (applied, true, Vec::new());
             };
             applied.merge_changes = changes;
         }
@@ -1516,7 +1862,7 @@ impl CowBatchAction {
         }
 
         let Some(sheet) = sheets.get_mut(self.sheet) else {
-            return (applied, false);
+            return (applied, false, Vec::new());
         };
 
         // 2) Replay inherited row/column styles first so explicit `set_style(r, c, 0)` overrides behave identically.
@@ -1671,6 +2017,15 @@ impl CowBatchAction {
             sheet.cf_dirty = true;
             sheet.bump_display_style_revision();
         }
+        let meta_sync = if let Some(ref note_edit) = self.notes {
+            if applied.skipped == 0 || !applied.touched.is_empty() || self.all_mask.is_empty() {
+                note_edit.apply(sheets, redo)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         applied.refresh_sizes = self
             .refresh_sizes
             .clone()
@@ -1683,8 +2038,9 @@ impl CowBatchAction {
             || !self.col_style_deltas.is_empty()
             || self.merges.is_some()
             || self.cf.is_some()
+            || self.notes.is_some()
             || self.refresh_sizes.is_some();
-        (applied, keep)
+        (applied, keep, meta_sync)
     }
 }
 
@@ -1700,13 +2056,14 @@ struct SheetTabAction {
 struct NumericSortAction {
     excluded: std::collections::HashSet<(u32,u32)>,
     sort: crate::data_tools::CompactSort,
+    notes: Option<NoteUndoEdit>,
     label: String,
     focus: (usize, u32, u32),
     by_site: u32,
 }
 
 impl NumericSortAction {
-    fn apply(&mut self, stamp: &mut EntryStamp, sheets: &mut [Sheet], redo: bool, mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Applied {
+    fn apply(&mut self, stamp: &mut EntryStamp, sheets: &mut [Sheet], redo: bool, mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> (Applied, Vec<(usize, crate::sync::SheetMetaKind)>) {
         let previous_capacity = self.excluded.capacity();
         let mut applied = Applied {
             touched: Vec::new(), style_changes: Vec::new(), label: self.label.clone(), focus: self.focus,
@@ -1728,9 +2085,18 @@ impl NumericSortAction {
             if redo { self.sort.deltas().for_each(&mut apply); }
             else { self.sort.deltas().rev().for_each(apply); }
         }
+        let meta_sync = if applied.skipped == 0 {
+            if let Some(ref note_edit) = self.notes {
+                note_edit.apply(sheets, redo)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         applied.total_touched = applied.touched.len();
         stamp.payload_bytes += (self.excluded.capacity() - previous_capacity) * (size_of::<(u32,u32)>() + 1);
-        applied
+        (applied, meta_sync)
     }
 }
 
@@ -2251,8 +2617,56 @@ impl UndoStack {
             action.by_site = self.site;
         }
         let bytes = action.payload_bytes();
-        self.done.push(Entry::Cells(next_entry(bytes), action, None, arrays));
+        self.done.push(Entry::Cells(next_entry(bytes), action, None, arrays, None));
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
+    pub fn push_with_notes(&mut self, mut action: Action, notes: Option<NoteUndoEdit>) {
+        let notes = notes.filter(|n| !n.is_empty());
+        if action.is_empty() && notes.is_none() {
+            return;
+        }
+        if action.by_site == 0 {
+            action.by_site = self.site;
+        }
+        if let Some((cow, cow_bytes)) = CowBatchAction::from_action_with_notes(&action, notes.clone()) {
+            self.done.push(Entry::CowBatch(next_entry(cow_bytes), Box::new(cow)));
+        } else {
+            let bytes = action.payload_bytes() + notes.as_ref().map_or(0, NoteUndoEdit::payload_bytes);
+            self.done.push(Entry::Cells(next_entry(bytes), action, None, None, notes));
+        }
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
+    pub fn attach_notes_to_last(&mut self, edit: NoteUndoEdit) {
+        if edit.is_empty() {
+            return;
+        }
+        let add_bytes = edit.payload_bytes();
+        match self.done.last_mut() {
+            Some(Entry::Cells(stamp, _, _, _, slot)) => {
+                stamp.payload_bytes += add_bytes;
+                match slot {
+                    Some(existing) => existing.extend(edit),
+                    None => *slot = Some(edit),
+                }
+            }
+            Some(Entry::CowBatch(stamp, action)) => {
+                stamp.payload_bytes += add_bytes;
+                match &mut action.notes {
+                    Some(existing) => existing.extend(edit),
+                    None => action.notes = Some(edit),
+                }
+            }
+            Some(Entry::NumericSort(stamp, action)) => {
+                stamp.payload_bytes += add_bytes;
+                match &mut action.notes {
+                    Some(existing) => existing.extend(edit),
+                    None => action.notes = Some(edit),
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn push_prepared(&mut self, PreparedAction(action, bytes): PreparedAction) {
@@ -2267,7 +2681,7 @@ impl UndoStack {
         if let Some((cow, cow_bytes)) = CowBatchAction::from_action(&action) {
             self.done.push(Entry::CowBatch(next_entry(cow_bytes), Box::new(cow)));
         } else {
-            self.done.push(Entry::Cells(next_entry(bytes), action, None, None));
+            self.done.push(Entry::Cells(next_entry(bytes), action, None, None, None));
         }
         // 新动作让「重做」失效
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
@@ -2429,7 +2843,7 @@ impl UndoStack {
         if extra.is_empty() {
             return;
         }
-        if let Some(Entry::Cells(stamp, action, _, _)) = self.done.last_mut() {
+        if let Some(Entry::Cells(stamp, action, _, _, _)) = self.done.last_mut() {
             let add_bytes: usize = extra.len() * std::mem::size_of::<CellDelta>()
                 + extra
                     .iter()
@@ -2551,7 +2965,7 @@ impl UndoStack {
     /// Called immediately after recording the nonempty cell action for a sort.
     pub fn tag_sorted_cells(&mut self, order: crate::data_tools::LinePermutation) {
         match self.done.last_mut() {
-            Some(Entry::Cells(stamp, _, slot, _)) => {
+            Some(Entry::Cells(stamp, _, slot, _, _)) => {
                 stamp.payload_bytes += order.2.capacity() * size_of::<u32>();
                 *slot = Some(order);
                 self.trim_history(HISTORY_PAYLOAD_BUDGET);
@@ -2568,7 +2982,7 @@ impl UndoStack {
     pub fn next_sort_permutation(&self, redo: bool) -> Option<crate::data_tools::LinePermutation> {
         let entry = if redo { self.undone.last()? } else { self.done.last()? };
         let (region, horizontal, mut order) = match entry {
-            Entry::Cells(_, _, Some(p), _) => p.clone(),
+            Entry::Cells(_, _, Some(p), _, _) => p.clone(),
             Entry::CowBatch(_, a) if a.excluded.is_empty() => a.permutation.clone()?,
             Entry::NumericSort(_, a) if a.excluded.is_empty() => a.sort.permutation(),
             _ => return None,
@@ -2702,9 +3116,20 @@ impl UndoStack {
     }
 
     pub fn push_compact_sort(&mut self, label: &str, sort: crate::data_tools::CompactSort, focus: (usize, u32, u32)) {
-        let stamp = next_entry(sort.bytes());
+        self.push_compact_sort_with_notes(label, sort, None, focus);
+    }
+
+    pub fn push_compact_sort_with_notes(
+        &mut self,
+        label: &str,
+        sort: crate::data_tools::CompactSort,
+        notes: Option<NoteUndoEdit>,
+        focus: (usize, u32, u32),
+    ) {
+        let notes = notes.filter(|n| !n.is_empty());
+        let stamp = next_entry(sort.bytes() + notes.as_ref().map_or(0, NoteUndoEdit::payload_bytes));
         self.done.push(Entry::NumericSort(stamp, NumericSortAction {
-            sort, label: label.into(), focus, by_site: self.site, excluded: Default::default(),
+            sort, notes, label: label.into(), focus, by_site: self.site, excluded: Default::default(),
         }));
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
@@ -2845,21 +3270,23 @@ impl UndoStack {
             return Some(applied);
         }
         if let Some(Entry::NumericSort(stamp, action)) = self.done.last_mut() {
-            let applied = action.apply(stamp, sheets, false, guard);
+            let (applied, meta_sync) = action.apply(stamp, sheets, false, guard);
+            self.last_meta_sync = meta_sync;
             let entry = self.done.pop()?;
-            if !applied.touched.is_empty() { self.undone.push(entry); }
+            if !applied.touched.is_empty() || !self.last_meta_sync.is_empty() { self.undone.push(entry); }
             return Some(applied);
         }
         if let Some(Entry::CowBatch(stamp, action)) = self.done.last_mut() {
-            let (applied, keep) = action.apply(site, stamp, sheets, false, guard);
+            let (applied, keep, meta_sync) = action.apply(site, stamp, sheets, false, guard);
             if applied.merge_conflict {
                 return Some(applied);
             }
+            self.last_meta_sync = meta_sync;
             let entry = self.done.pop()?;
             if keep { self.undone.push(entry); }
             return Some(applied);
         }
-        let Entry::Cells(id, mut action, mut permutation, arrays) = self.done.pop()? else { unreachable!() };
+        let Entry::Cells(id, mut action, mut permutation, arrays, notes) = self.done.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
@@ -2880,7 +3307,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
-            self.undone.push(Entry::Cells(id, action, permutation, arrays));
+            self.undone.push(Entry::Cells(id, action, permutation, arrays, notes));
             return Some(applied);
         }
         if let Some(sh) = action.shapes.clone() {
@@ -2899,7 +3326,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
-            self.undone.push(Entry::Cells(id, action, permutation, arrays));
+            self.undone.push(Entry::Cells(id, action, permutation, arrays, notes));
             return Some(applied);
         }
         let merged = action.merges.as_ref().map(|edit| {
@@ -2910,7 +3337,7 @@ impl UndoStack {
         if merge_conflict {
             let label = action.label.clone();
             let focus = action.focus;
-            self.done.push(Entry::Cells(id, action, permutation, arrays));
+            self.done.push(Entry::Cells(id, action, permutation, arrays, notes));
             return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true, total_touched: 0 });
         }
         if let Some(snap) = action.snap_before.clone() {
@@ -2930,7 +3357,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched,
             };
-            self.undone.push(Entry::Cells(id, action, permutation, arrays));
+            self.undone.push(Entry::Cells(id, action, permutation, arrays, notes));
             return Some(applied);
         }
         let mut excluded = std::collections::HashSet::new();
@@ -2947,6 +3374,11 @@ impl UndoStack {
             arr.apply(sheets, false, &mut touched);
         }
         skipped = excluded.len();
+        if let Some(ref note_edit) = notes {
+            if skipped == 0 || !touched.is_empty() || action.deltas.is_empty() {
+                self.last_meta_sync = note_edit.apply(sheets, false);
+            }
+        }
         if skipped != 0 {
             let mut i = 0;
             action.deltas.retain(|_| { let keep = !excluded.contains(&i); i += 1; keep });
@@ -2964,7 +3396,7 @@ impl UndoStack {
             merge_conflict: false,
             total_touched,
         };
-        if !action.is_empty() || arrays.is_some() { self.undone.push(Entry::Cells(id, action, permutation, arrays)); }
+        if !action.is_empty() || arrays.is_some() || notes.is_some() { self.undone.push(Entry::Cells(id, action, permutation, arrays, notes)); }
         Some(applied)
     }
 
@@ -3021,21 +3453,23 @@ impl UndoStack {
             return Some(applied);
         }
         if let Some(Entry::NumericSort(stamp, action)) = self.undone.last_mut() {
-            let applied = action.apply(stamp, sheets, true, guard);
+            let (applied, meta_sync) = action.apply(stamp, sheets, true, guard);
+            self.last_meta_sync = meta_sync;
             let entry = self.undone.pop()?;
-            if !applied.touched.is_empty() { self.done.push(entry); }
+            if !applied.touched.is_empty() || !self.last_meta_sync.is_empty() { self.done.push(entry); }
             return Some(applied);
         }
         if let Some(Entry::CowBatch(stamp, action)) = self.undone.last_mut() {
-            let (applied, keep) = action.apply(site, stamp, sheets, true, guard);
+            let (applied, keep, meta_sync) = action.apply(site, stamp, sheets, true, guard);
             if applied.merge_conflict {
                 return Some(applied);
             }
+            self.last_meta_sync = meta_sync;
             let entry = self.undone.pop()?;
             if keep { self.done.push(entry); }
             return Some(applied);
         }
-        let Entry::Cells(id, mut action, mut permutation, arrays) = self.undone.pop()? else { unreachable!() };
+        let Entry::Cells(id, mut action, mut permutation, arrays, notes) = self.undone.pop()? else { unreachable!() };
         let mut touched = Vec::new();
         let mut skipped = 0;
         let mut merge_changes = Vec::new();
@@ -3056,7 +3490,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
-            self.done.push(Entry::Cells(id, action, permutation, arrays));
+            self.done.push(Entry::Cells(id, action, permutation, arrays, notes));
             return Some(applied);
         }
         if let Some(sh) = action.shapes.clone() {
@@ -3075,7 +3509,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched: 0,
             };
-            self.done.push(Entry::Cells(id, action, permutation, arrays));
+            self.done.push(Entry::Cells(id, action, permutation, arrays, notes));
             return Some(applied);
         }
         let merged = action.merges.as_ref().map(|edit| {
@@ -3086,7 +3520,7 @@ impl UndoStack {
         if merge_conflict {
             let label = action.label.clone();
             let focus = action.focus;
-            self.undone.push(Entry::Cells(id, action, permutation, arrays));
+            self.undone.push(Entry::Cells(id, action, permutation, arrays, notes));
             return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true, total_touched: 0 });
         }
         if let Some(snap) = action.snap_after.clone() {
@@ -3106,7 +3540,7 @@ impl UndoStack {
                 merge_conflict: false,
                 total_touched,
             };
-            self.done.push(Entry::Cells(id, action, permutation, arrays));
+            self.done.push(Entry::Cells(id, action, permutation, arrays, notes));
             return Some(applied);
         }
         let mut excluded = std::collections::HashSet::new();
@@ -3123,6 +3557,11 @@ impl UndoStack {
             arr.apply(sheets, true, &mut touched);
         }
         skipped = excluded.len();
+        if let Some(ref note_edit) = notes {
+            if skipped == 0 || !touched.is_empty() || action.deltas.is_empty() {
+                self.last_meta_sync = note_edit.apply(sheets, true);
+            }
+        }
         if skipped != 0 {
             let mut i = 0;
             action.deltas.retain(|_| { let keep = !excluded.contains(&i); i += 1; keep });
@@ -3140,7 +3579,7 @@ impl UndoStack {
             merge_conflict: false,
             total_touched,
         };
-        if !action.is_empty() || arrays.is_some() { self.done.push(Entry::Cells(id, action, permutation, arrays)); }
+        if !action.is_empty() || arrays.is_some() || notes.is_some() { self.done.push(Entry::Cells(id, action, permutation, arrays, notes)); }
         Some(applied)
     }
 

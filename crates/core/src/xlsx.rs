@@ -3974,9 +3974,11 @@ fn save_plain_at(
     // 批注：原生写入 commentsN.xml + vmlDrawingN.vml，删空时清掉旧部件；
     // 已由 xlsx_delta 就地补丁的表不再整份覆写，避免毁掉线程批注与 VML 控件。
     for sheet in &wb.sheets {
+        let mut cleared_sheet_notes = false;
         if !delta_summary.handled_note_sheets.contains(&sheet.identity) {
             if sheet.notes_dirty && sheet.notes.is_empty() {
                 must_save!("notes-clear", crate::notes::clear_sheet_notes(path, &sheet.name));
+                cleared_sheet_notes = true;
             } else if (sheet.notes_dirty || sheet.source_part.is_none()) && !sheet.notes.is_empty() {
                 must_save!(
                     "notes-write",
@@ -3984,8 +3986,11 @@ fn save_plain_at(
                 );
             }
         }
-        // Excel 365 原生线程批注（write_sheet_notes 若先执行，后写 threadedComments 保证不互相覆盖）
-        if sheet.threads_dirty || (sheet.source_part.is_none() && !sheet.threads.is_empty()) {
+        // Excel 365 原生线程批注：
+        // - 显式改动过线程、或新表带线程、或同表刚执行过 notes 写/清且仍存在线程时，都重写 threadedComments 保证绝不静默丢弃。
+        if sheet.threads_dirty
+            || ((sheet.source_part.is_none() || sheet.notes_dirty || cleared_sheet_notes) && !sheet.threads.is_empty())
+        {
             must_save!(
                 "threaded-comments-write",
                 crate::notes::write_sheet_threaded_comments(path, &sheet.name, &sheet.threads)

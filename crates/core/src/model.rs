@@ -1433,6 +1433,8 @@ impl Sheet {
         snapshot.merges = self.merges.clone();
         snapshot.arrays = self.arrays.clone();
         snapshot.spilled = self.spilled.clone();
+        snapshot.notes = self.notes.clone();
+        snapshot.threads = self.threads.clone();
         snapshot
     }
 
@@ -1441,6 +1443,7 @@ impl Sheet {
             && self.name == source.name && self.styles == source.styles
             && self.row_styles == source.row_styles && self.col_styles == source.col_styles
             && self.merges == source.merges && self.arrays == source.arrays && self.spilled == source.spilled
+            && self.notes == source.notes && self.threads == source.threads
     }
 
     /// CSV writes cells, while a sort also depends on cached values and formats.
@@ -1538,6 +1541,30 @@ impl Sheet {
                 prepared.styles.remove(&k);
             }
         }
+        if prepared.notes_dirty && self.notes != before.notes {
+            for (k, v) in &self.notes {
+                if !in_target(*k) && before.notes.get(k) != Some(v) {
+                    prepared.notes.insert(*k, v.clone());
+                }
+            }
+            for k in before.notes.keys() {
+                if !in_target(*k) && !self.notes.contains_key(k) {
+                    prepared.notes.remove(k);
+                }
+            }
+        }
+        if prepared.threads_dirty && self.threads != before.threads {
+            for (k, v) in &self.threads {
+                if !in_target(*k) && before.threads.get(k) != Some(v) {
+                    prepared.threads.insert(*k, v.clone());
+                }
+            }
+            for k in before.threads.keys() {
+                if !in_target(*k) && !self.threads.contains_key(k) {
+                    prepared.threads.remove(k);
+                }
+            }
+        }
     }
 
     /// Merge concurrent edits into staged replacement pages. Changed target values
@@ -1603,6 +1630,14 @@ impl Sheet {
                 result.style_edits.clear();
             }
         }
+        if result.notes_dirty {
+            std::mem::swap(&mut self.notes, &mut result.notes);
+            self.notes_dirty = true;
+        }
+        if result.threads_dirty {
+            std::mem::swap(&mut self.threads, &mut result.threads);
+            self.threads_dirty = true;
+        }
         self.edited = true;
     }
 
@@ -1659,6 +1694,7 @@ impl Sheet {
         self.cf_dirty = true;
         self.dv_dirty = true;
         self.notes_dirty = true;
+        self.threads_dirty = true;
         self.freeze_dirty = true;
         self.layout_dirty = true;
         self.scenarios_dirty = true;
