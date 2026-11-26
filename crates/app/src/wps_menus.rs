@@ -3540,34 +3540,7 @@ impl SheetApp {
     // ========================================================================
 
     pub(crate) fn clear_comments_in_sel(&mut self) {
-        if self.edit_blocked() {
-            return;
-        }
-        let targets = self.comment_keys_in_sel();
-        if targets.is_empty() {
-            self.status = "所选区域没有批注".into();
-            return;
-        }
-        let gate: Vec<(u32, u32)> = targets.iter().map(|k| (k.row, k.col)).collect();
-        if !self.write_preflight(&gate, "清除批注") {
-            return;
-        }
-        let sh = self.wb.sheet_mut(self.sheet_idx);
-        let mut removed = 0usize;
-        for k in targets {
-            if sh.notes.remove(&k).is_some() {
-                removed += 1;
-            }
-        }
-        if removed > 0 {
-            sh.notes_dirty = true;
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
-            self.status = format!("已清除 {removed} 条批注");
-        } else {
-            self.status = "所选区域没有批注".into();
-        }
+        self.delete_comments_in_selection("清除批注");
     }
 
     pub(crate) fn clear_hyperlinks_in_sel(&mut self) {

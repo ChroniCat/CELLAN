@@ -140,6 +140,11 @@ pub enum SheetMetaKind {
         text: Option<String>,
         author: String,
     },
+    Thread {
+        row: u32,
+        col: u32,
+        thread: Option<crate::notes::ThreadedComment>,
+    },
     Hyperlink {
         row: u32,
         col: u32,
@@ -177,6 +182,20 @@ impl SheetMetaKind {
                 cell_in_bounds(sheet, *row, *col)
                     && author.len() <= MAX_SHORT_TEXT
                     && text.as_ref().is_none_or(|t| t.len() <= 64 * 1024)
+            }
+            SheetMetaKind::Thread { row, col, thread } => {
+                cell_in_bounds(sheet, *row, *col)
+                    && thread.as_ref().is_none_or(|tc| {
+                        tc.r == *row
+                            && tc.c == *col
+                            && tc.entries.len() <= 256
+                            && tc.entries.iter().all(|e| {
+                                e.id.len() <= 64
+                                    && e.author.len() <= MAX_SHORT_TEXT
+                                    && e.timestamp.len() <= 64
+                                    && e.text.len() <= 64 * 1024
+                            })
+                    })
             }
             SheetMetaKind::Hyperlink { row, col, target, tooltip } => {
                 cell_in_bounds(sheet, *row, *col)

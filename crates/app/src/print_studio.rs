@@ -1280,7 +1280,7 @@ impl SheetApp {
                                     ui.label("批注：");
                                     let c_lbl = match base_setup.print_comments {
                                         1 => "工作表末尾汇总",
-                                        2 => "原位角标",
+                                        2 => "如工作表所示",
                                         _ => "不打印",
                                     };
                                     egui::ComboBox::from_id_salt("studio_comments")
@@ -1290,7 +1290,7 @@ impl SheetApp {
                                             for (v, t) in [
                                                 (0u8, "不打印"),
                                                 (1, "工作表末尾汇总"),
-                                                (2, "原位角标"),
+                                                (2, "如工作表所示"),
                                             ] {
                                                 if ui
                                                     .selectable_label(base_setup.print_comments == v, t)

@@ -153,7 +153,7 @@ fn edited_comments(xml: &str, live: &HashMap<CellRef, Note>) -> Option<String> {
         let after = live.get(&key)?;
         if before.author != after.author {
             let author = if after.author.is_empty() {
-                "Hermes"
+                "CELLAN"
             } else {
                 &after.author
             };

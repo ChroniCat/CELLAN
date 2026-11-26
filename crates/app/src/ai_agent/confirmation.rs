@@ -9,7 +9,7 @@ impl SheetApp {
     ) -> Result<Option<String>, String> {
         if !matches!(
             call.name.as_str(),
-            "data_operation" | "set_cells" | "fill_formula_range"
+            "data_operation" | "set_cells" | "fill_formula_range" | "manage_comments"
         ) {
             return Ok(None);
         }
@@ -57,6 +57,50 @@ impl SheetApp {
                     "覆盖「{}」中已有内容的 {} 个单元格：{cells}",
                     sheet.name,
                     overwritten.len()
+                )
+            }
+            "manage_comments" => {
+                let ops = args
+                    .get("ops")
+                    .and_then(JsonValue::as_array)
+                    .ok_or("缺少 ops 数组")?;
+                if ops.is_empty() || ops.len() > 500 {
+                    return Err("单次 ops 数量需在 1..=500 之间".into());
+                }
+                let mut deleting = BTreeSet::new();
+                for op in ops {
+                    if op.get("action").and_then(JsonValue::as_str) != Some("delete") {
+                        continue;
+                    }
+                    let addr = op
+                        .get("cell")
+                        .and_then(JsonValue::as_str)
+                        .ok_or("缺少单元格地址")?;
+                    let (r, c) = checked_address(addr).ok_or("单元格地址无效")?;
+                    let (nr, nc) = sheet
+                        .merge_at(r, c)
+                        .map(|(mr1, mc1, _, _)| (mr1, mc1))
+                        .unwrap_or((r, c));
+                    let key = sheetcore::model::CellRef::new(nr, nc);
+                    if sheet.notes.contains_key(&key) || sheet.threads.contains_key(&key) {
+                        deleting.insert((nr, nc));
+                    }
+                }
+                if deleting.is_empty() {
+                    return Ok(None);
+                }
+                let cells = deleting
+                    .iter()
+                    .take(12)
+                    .map(|&(r, c)| cell_name(r, c))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                format!(
+                    "删除「{}」中已有的 {} 条批注：{}{}",
+                    sheet.name,
+                    deleting.len(),
+                    cells,
+                    if deleting.len() > 12 { "…" } else { "" }
                 )
             }
             name => {

@@ -4,7 +4,7 @@ use sheetcore::Workbook;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
-pub(super) enum AiToolOutput {
+pub(crate) enum AiToolOutput {
     Ready(String, JsonValue),
     Calculating(AiToolCalculation),
     Reordering {

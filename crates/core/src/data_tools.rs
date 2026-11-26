@@ -267,7 +267,106 @@ pub type LinePermutation = ((u32,u32,u32,u32), bool, Vec<u32>);
 pub struct RowChanges {
     pub permutation: Option<LinePermutation>,
     pub deltas: Vec<CellDelta>,
+    pub notes: crate::undo::NoteUndoEdit,
     pub count: usize,
+}
+
+/// 规划排序/去重期间矩形区内批注（`notes`）与线程会话（`threads`）的坐标重排差异。
+/// 仅在工作表存在批注或线程时扫描，空表零开销。
+pub fn plan_reorder_notes(
+    sheet: &Sheet,
+    sheet_idx: usize,
+    rect: (u32, u32, u32, u32),
+    order: &[u32],
+    horizontal: bool,
+) -> crate::undo::NoteUndoEdit {
+    let mut out = crate::undo::NoteUndoEdit::default();
+    if sheet.notes.is_empty() && sheet.threads.is_empty() {
+        return out;
+    }
+    let (r1, c1, r2, c2) = rect;
+    if r1 > r2 || c1 > c2 {
+        return out;
+    }
+    let (first, last) = if horizontal { (c1, c2) } else { (r1, r2) };
+    let in_rect = |k: &crate::model::CellRef| {
+        k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2
+    };
+    let has_note_in_rect = sheet.notes.keys().any(in_rect);
+    let has_thread_in_rect = sheet.threads.keys().any(in_rect);
+    if !has_note_in_rect && !has_thread_in_rect {
+        return out;
+    }
+    let mut inverse: HashMap<u32, u32> = HashMap::with_capacity(order.len());
+    for (i, &src) in order.iter().enumerate() {
+        let dst = first + i as u32;
+        inverse.insert(src, dst);
+    }
+    let collect_coords = |keys: Vec<crate::model::CellRef>| -> Vec<(u32, u32)> {
+        let mut coords = Vec::with_capacity(keys.len() * 2);
+        for k in keys {
+            coords.push((k.row, k.col));
+            let line = if horizontal { k.col } else { k.row };
+            if let Some(&dst_line) = inverse.get(&line) {
+                if dst_line <= last {
+                    let dst = if horizontal { (k.row, dst_line) } else { (dst_line, k.col) };
+                    coords.push(dst);
+                }
+            }
+        }
+        coords.sort_unstable();
+        coords.dedup();
+        coords
+    };
+    if has_note_in_rect {
+        let keys: Vec<_> = sheet.notes.keys().copied().filter(in_rect).collect();
+        for (dst_r, dst_c) in collect_coords(keys) {
+            let dst_key = crate::model::CellRef::new(dst_r, dst_c);
+            let before = sheet.notes.get(&dst_key).cloned();
+            let dst_line = if horizontal { dst_c } else { dst_r };
+            let src_line = order.get((dst_line - first) as usize).copied();
+            let after = src_line.and_then(|sl| {
+                let src_key = if horizontal {
+                    crate::model::CellRef::new(dst_r, sl)
+                } else {
+                    crate::model::CellRef::new(sl, dst_c)
+                };
+                sheet.notes.get(&src_key).cloned().map(|mut n| {
+                    n.r = dst_r;
+                    n.c = dst_c;
+                    n
+                })
+            });
+            if before != after {
+                out.notes.push((sheet_idx, (dst_r, dst_c), before, after));
+            }
+        }
+    }
+    if has_thread_in_rect {
+        let keys: Vec<_> = sheet.threads.keys().copied().filter(in_rect).collect();
+        for (dst_r, dst_c) in collect_coords(keys) {
+            let dst_key = crate::model::CellRef::new(dst_r, dst_c);
+            let before = sheet.threads.get(&dst_key).cloned();
+            let dst_line = if horizontal { dst_c } else { dst_r };
+            let src_line = order.get((dst_line - first) as usize).copied();
+            let after = src_line.and_then(|sl| {
+                let src_key = if horizontal {
+                    crate::model::CellRef::new(dst_r, sl)
+                } else {
+                    crate::model::CellRef::new(sl, dst_c)
+                };
+                sheet.threads.get(&src_key).cloned().map(|mut tc| {
+                    tc.r = dst_r;
+                    tc.c = dst_c;
+                    tc
+                })
+            });
+            if before != after {
+                out.threads.push((sheet_idx, (dst_r, dst_c), before, after));
+            }
+        }
+    }
+    out
 }
 
 /// Dense numeric sorts retain one row-major value snapshot and the permutation.
@@ -730,6 +829,19 @@ impl NumericSort {
                 sheet.styles_dirty = true;
             }
         }
+        if !sheet.notes.is_empty() || !sheet.threads.is_empty() {
+            let abs_order: Vec<u32> = self.order.iter().map(|&line| self.first_row + line).collect();
+            let rect = (
+                self.first_row,
+                self.first_col,
+                self.first_row + self.order.len() as u32 - 1,
+                self.first_col + self.width as u32 - 1,
+            );
+            let note_edit = plan_reorder_notes(sheet, self.sheet, rect, &abs_order, false);
+            if !note_edit.is_empty() {
+                note_edit.apply_on_sheet(sheet, true);
+            }
+        }
         if total_changed > 0 && !sheet.loading {
             sheet.edited = true;
         }
@@ -812,7 +924,14 @@ impl CompactSort {
                     return 0;
                 }
                 if *horizontal {
-                    return apply_horizontal_gather(source, sheet, *region, order);
+                    let changed = apply_horizontal_gather(source, sheet, *region, order);
+                    if !sheet.notes.is_empty() || !sheet.threads.is_empty() {
+                        let note_edit = plan_reorder_notes(sheet, self.sheet(), *region, order, true);
+                        if !note_edit.is_empty() {
+                            note_edit.apply_on_sheet(sheet, true);
+                        }
+                    }
+                    return changed;
                 }
                 let (cells, cleared) = sheet.cells_and_cleared_mut();
                 let cell_changed = cells.gather_rows(
@@ -937,6 +1056,12 @@ impl CompactSort {
                         }
                     }
                 }
+                if !sheet.notes.is_empty() || !sheet.threads.is_empty() {
+                    let note_edit = plan_reorder_notes(sheet, self.sheet(), *region, order, false);
+                    if !note_edit.is_empty() {
+                        note_edit.apply_on_sheet(sheet, true);
+                    }
+                }
                 let total = cell_changed + style_only_changed;
                 if total > 0 && !sheet.loading {
                     sheet.edited = true;
@@ -960,6 +1085,12 @@ impl CompactSort {
         };
         let changed = self.apply_to_sheet(sheet);
         (changed, sample)
+    }
+
+    /// 规划本次大表排序涉及的批注/线程重排差异（供撤销栈与协作广播复用）。
+    pub fn plan_notes(&self, sheet: &Sheet) -> crate::undo::NoteUndoEdit {
+        let (region, horizontal, order) = self.permutation();
+        plan_reorder_notes(sheet, self.sheet(), region, &order, horizontal)
     }
 
     /// Absolute source line for each destination, in the same order as deltas().
@@ -1386,6 +1517,9 @@ impl RowChanges {
                 sheet.set_style(d.row, d.col, d.after_style);
             }
         }
+        if !self.notes.is_empty() {
+            self.notes.apply_on_sheet(sheet, true);
+        }
     }
 }
 
@@ -1495,6 +1629,7 @@ pub(crate) fn reorder_lines(
             }
         }
     }
+    changes.notes = plan_reorder_notes(sheet, sheet_idx, rect, &order, horizontal);
     if !dedup { changes.permutation = Some((rect, horizontal, order)); }
     changes
 }

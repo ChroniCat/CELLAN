@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Note {
     pub r: u32,
     pub c: u32,
@@ -83,7 +83,7 @@ fn deterministic_ooxml_guid(namespace: &[u8], seed: &str) -> String {
 }
 
 /// Excel 365 原生线程批注中的单条发言（主贴或回复）。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadEntry {
     pub id: String,
     pub author: String,
@@ -92,7 +92,7 @@ pub struct ThreadEntry {
 }
 
 /// Excel 365 原生线程批注会话（绑定到单元格，支持多轮回复与已解决/重新打开状态）。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadedComment {
     pub r: u32,
     pub c: u32,
@@ -1561,12 +1561,6 @@ pub fn write_sheet_notes(
                     } else {
                         extra_removed.push(resolved);
                     }
-                }
-                continue;
-            }
-            if !external && ty.ends_with("/threadedComment") {
-                if let Some(t) = node.attribute("Target") {
-                    extra_removed.push(resolve(dir, t));
                 }
                 continue;
             }

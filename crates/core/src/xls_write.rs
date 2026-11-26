@@ -971,7 +971,7 @@ pub fn compatibility_warnings(wb: &Workbook) -> Vec<String> {
         has_charts |= !sh.charts.is_empty();
         has_pics |= !sh.pictures.is_empty();
         has_tbs |= !sh.textboxes.is_empty();
-        has_notes |= !sh.notes.is_empty();
+        has_notes |= !sh.notes.is_empty() || !sh.threads.is_empty();
         has_spills |= !sh.spilled.is_empty();
     }
     if over_bounds {
