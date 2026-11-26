@@ -1,8 +1,8 @@
 //! 插入/删除单元格（下方右移 / 右侧右移 / 上移 / 左移）。
 //!
 //! 只在当前已用区域里挪格子：值、样式、批注、富文本、超链接一起走，
-//! 合并区域整块在受影响列/行内时跟着挪。公式引用不做改写（Excel 会改写；
-//! 这里是已知限制，插删行列请走 structural）。
+//! 合并区域整块在受影响列/行内时跟着挪。工作簿级操作使用
+//! `structural::CellShift` 同步更新各工作表的公式引用和外部来源。
 
 use crate::model::{CellRef, Sheet};
 
@@ -27,7 +27,7 @@ fn used(sheet: &Sheet) -> Option<(u32, u32)> {
     if let Some((r2, c2)) = sheet.styles.max_coords() {
         bump(r2, c2);
     }
-    for k in sheet.notes.keys() {
+    for k in sheet.notes.keys().chain(sheet.threads.keys()) {
         bump(k.row, k.col);
     }
     for &(r, c) in sheet.rich.keys() {
@@ -74,6 +74,26 @@ fn shift_ray_metadata(
             for (nk, note) in moved {
                 sheet.notes.insert(nk, note);
             }
+        }
+    }
+
+    if !sheet.threads.is_empty() {
+        let keys: Vec<_> = sheet.threads.keys()
+            .filter(|k| (r1..=r2).contains(&k.row) && (c1..=c2).contains(&k.col))
+            .copied().collect();
+        if !keys.is_empty() {
+            sheet.threads_dirty = true;
+            let mut moved = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some(mut thread) = sheet.threads.remove(&key)
+                    && let Some((r, c)) = map_coord(key.row, key.col)
+                {
+                    thread.r = r;
+                    thread.c = c;
+                    moved.push((CellRef::new(r, c), thread));
+                }
+            }
+            sheet.threads.extend(moved);
         }
     }
 
@@ -166,22 +186,49 @@ fn shift_sparse_ray(
 
 /// 在 rect 覆盖的列/行里插入 n 格
 pub fn insert(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u32) {
-    if n == 0 {
-        return;
-    }
+    try_insert(sheet, rect, shift, n);
+}
+
+fn in_grid(rect: (u32, u32, u32, u32), shift: Shift, n: u32) -> bool {
+    let (r1, c1, r2, c2) = rect;
+    r1 <= r2 && c1 <= c2 && r2 < crate::sync::MAX_ROWS && c2 < crate::sync::MAX_COLS
+        && n > 0 && n <= match shift {
+            Shift::Vertical => crate::sync::MAX_ROWS - r1,
+            Shift::Horizontal => crate::sync::MAX_COLS - c1,
+        }
+}
+
+/// Only cells in the last n rows/columns of the selected band can leave the grid.
+pub(crate) fn insert_would_overflow(sheet: &Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u32) -> bool {
+    if !in_grid(rect, shift, n) { return true; }
+    let (r1, c1, r2, c2) = rect;
+    let tail = match shift {
+        Shift::Vertical => ((crate::sync::MAX_ROWS - n).max(r1), c1, crate::sync::MAX_ROWS - 1, c2),
+        Shift::Horizontal => (r1, (crate::sync::MAX_COLS - n).max(c1), r2, crate::sync::MAX_COLS - 1),
+    };
+    let inside = |r, c| (tail.0..=tail.2).contains(&r) && (tail.1..=tail.3).contains(&c);
+    sheet.iter_rect_views(tail).next().is_some()
+        || sheet.styles.iter_rect(tail).next().is_some()
+        || sheet.notes.keys().chain(sheet.threads.keys()).any(|k| inside(k.row, k.col))
+        || sheet.rich.keys().chain(sheet.hyperlinks.keys()).any(|&(r, c)| inside(r, c))
+        || sheet.merges.iter().any(|&(mr1, mc1, mr2, mc2)| match shift {
+            Shift::Vertical => mr1 >= r1 && c1 <= mc1 && mc2 <= c2 && mr2 >= tail.0,
+            Shift::Horizontal => mc1 >= c1 && r1 <= mr1 && mr2 <= r2 && mc2 >= tail.1,
+        })
+}
+
+pub(crate) fn try_insert(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u32) -> bool {
+    if insert_would_overflow(sheet, rect, shift, n) { return false; }
     let Some((used_r2, used_c2)) = used(sheet) else {
-        return;
+        return true;
     };
     let (r1, c1, r2, c2) = rect;
     match shift {
         Shift::Vertical => {
             if c1 > used_c2 {
-                return;
+                return true;
             }
             let c2_eff = c2.min(used_c2);
-            if c1 > c2_eff {
-                return;
-            }
             if used_r2 >= r1 {
                 sheet.shift_col_band_rows(c1, c2_eff, r1, n, false);
                 shift_ray_metadata(sheet, (r1, c1, used_r2, c2_eff), |r, c| Some((r + n, c)));
@@ -201,12 +248,9 @@ pub fn insert(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u3
         }
         Shift::Horizontal => {
             if r1 > used_r2 {
-                return;
+                return true;
             }
             let r2_eff = r2.min(used_r2);
-            if r1 > r2_eff {
-                return;
-            }
             if used_c2 >= c1 {
                 shift_sparse_ray(sheet, (r1, c1, r2_eff, used_c2), |r, c| Some((r, c + n)));
             }
@@ -225,11 +269,12 @@ pub fn insert(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u3
         }
     }
     sheet.edited = true;
+    true
 }
 
 /// 删除 rect 里的 n 格：Vertical=下方上移，Horizontal=右侧左移
 pub fn delete(sheet: &mut Sheet, rect: (u32, u32, u32, u32), shift: Shift, n: u32) {
-    if n == 0 {
+    if !in_grid(rect, shift, n) {
         return;
     }
     let Some((used_r2, used_c2)) = used(sheet) else {
@@ -374,5 +419,98 @@ mod tests {
         delete(&mut sh, (1, 0, 1, 0), Shift::Vertical, 1);
         assert!(sh.notes.is_empty(), "删除含批注单元格后批注不得残留");
         assert!(sh.notes_dirty);
+    }
+
+    #[test]
+    fn cell_shift_rejects_grid_overflow_only_in_the_moving_band() {
+        use crate::structural::CellShift;
+        for direction in [Shift::Vertical, Shift::Horizontal] {
+            let mut wb = crate::Workbook::new_blank();
+            let (rect, last, near, adjacent, merge) = match direction {
+                Shift::Vertical => {
+                    let end = crate::sync::MAX_ROWS - 1;
+                    ((1, 1, 2, 1), (end, 1), (end - 2, 1), (end, 2), (end - 2, 1, end - 1, 1))
+                }
+                Shift::Horizontal => {
+                    let end = crate::sync::MAX_COLS - 1;
+                    ((1, 1, 1, 2), (1, end), (1, end - 2), (2, end), (1, end - 2, 1, end - 1))
+                }
+            };
+            let op = CellShift::new(rect, direction, true);
+            let marker = Cell { value: Value::Number(7.0), formula: None };
+            wb.sheet_mut(0).set(adjacent.0, adjacent.1, marker.clone());
+            wb.sheet_mut(0).set(near.0, near.1, marker.clone());
+            assert!(!op.would_overflow(wb.sheet(0)));
+            wb.sheet_mut(0).merges.push(merge);
+            assert!(op.would_overflow(wb.sheet(0)));
+            wb.sheet_mut(0).merges.clear();
+            wb.sheet_mut(0).set_style(last.0, last.1, 7);
+            let revision = wb.sheet(0).coordinate_revision();
+            assert!(!op.apply(&mut wb, 0));
+            assert_eq!(wb.sheet(0).coordinate_revision(), revision);
+            assert_eq!(wb.sheet(0).value(near.0, near.1), marker.value);
+            wb.sheet_mut(0).set_style(last.0, last.1, 0);
+            assert!(op.apply(&mut wb, 0));
+            assert_eq!(wb.sheet(0).value(last.0, last.1), marker.value);
+            assert_eq!(wb.sheet(0).value(adjacent.0, adjacent.1), marker.value);
+            assert!(op.would_overflow(wb.sheet(0)));
+            assert!(!op.apply(&mut wb, 0));
+        }
+    }
+
+    #[test]
+    fn cell_shift_uses_the_selection_size_for_data_and_foreign_references() {
+        use crate::structural::CellShift;
+        let mut wb = crate::Workbook::new_blank();
+        wb.sheets[0].name = "Data".into();
+        wb.sheets.push(Sheet::new("Summary"));
+        wb.sheet_mut(0).set(3, 3, Cell { value: Value::Number(5.), formula: None });
+        wb.sheet_mut(1).set(0, 0, Cell {
+            value: Value::Empty, formula: Some("Data!D4+Data!A1".into()),
+        });
+        for (direction, dest, formula) in [
+            (Shift::Vertical, (5, 3), "Data!D6+Data!A1"),
+            (Shift::Horizontal, (3, 6), "Data!G4+Data!A1"),
+        ] {
+            let rect = (2, 1, 3, 3);
+            assert!(CellShift::new(rect, direction, true).apply(&mut wb, 0));
+            assert_eq!(wb.sheet(0).value(dest.0, dest.1), Value::Number(5.));
+            assert_eq!(wb.sheet(1).formula_of(0, 0), Some(formula));
+            assert!(CellShift::new(rect, direction, false).apply(&mut wb, 0));
+            assert_eq!(wb.sheet(0).value(3, 3), Value::Number(5.));
+            assert_eq!(wb.sheet(1).formula_of(0, 0), Some("Data!D4+Data!A1"));
+        }
+    }
+
+    #[test]
+    fn cell_shift_moves_and_deletes_thread_only_cells_with_their_coordinates() {
+        use crate::notes::{ThreadEntry, ThreadedComment};
+        use crate::structural::CellShift;
+        for direction in [Shift::Vertical, Shift::Horizontal] {
+            let mut wb = crate::Workbook::new_blank();
+            let start = CellRef::new(4, 4);
+            let original = ThreadedComment {
+                r: start.row, c: start.col, resolved: true,
+                entries: vec![ThreadEntry {
+                    id: "thread-id".into(), author: "A".into(), timestamp: "2026-11-27".into(), text: "reply".into(),
+                }],
+            };
+            wb.sheet_mut(0).threads.insert(start, original.clone());
+            let rect = (1, 1, 4, 4);
+            assert!(CellShift::new(rect, direction, true).apply(&mut wb, 0));
+            let dest = match direction { Shift::Vertical => CellRef::new(8, 4), Shift::Horizontal => CellRef::new(4, 8) };
+            let thread = &wb.sheet(0).threads[&dest];
+            assert_eq!((thread.r, thread.c), (dest.row, dest.col));
+            assert_eq!(thread.entries, original.entries);
+            assert!(thread.resolved && wb.sheet(0).threads_dirty);
+            assert!(!wb.sheet(0).threads.contains_key(&start));
+            wb.sheet_mut(0).threads_dirty = false;
+            assert!(CellShift::new(rect, direction, false).apply(&mut wb, 0));
+            assert_eq!(wb.sheet(0).threads[&start], original);
+            assert!(wb.sheet(0).threads_dirty);
+            wb.sheet_mut(0).threads_dirty = false;
+            assert!(CellShift::new(rect, direction, false).apply(&mut wb, 0));
+            assert!(wb.sheet(0).threads.is_empty() && wb.sheet(0).threads_dirty);
+        }
     }
 }

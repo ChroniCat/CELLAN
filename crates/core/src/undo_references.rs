@@ -310,10 +310,9 @@ fn visit(
             }
             None if shift.row_filter.is_some() || shift.col_filter.is_some() => {
                 let (r1, c1, r2, c2) = rect;
-                let cells = Shift { n: 1, ..shift.clone() };
                 shift.row_filter.is_none_or(|(lo,hi)| r1 <= hi && lo <= r2)
                     && shift.col_filter.is_none_or(|(lo,hi)| c1 <= hi && lo <= c2)
-                    && rect_moves(&cells, rect)
+                    && rect_moves(&shift, rect)
             }
             None => rect_moves(&shift, rect),
         };

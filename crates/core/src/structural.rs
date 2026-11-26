@@ -1893,40 +1893,113 @@ impl crate::layout::Axis {
     }
 }
 
-/// 整个工作簿层面的结构改动：搬格子 + 改写所有表里的公式引用
-/// 插入/删除单元格（局部区域）：按区域改写公式引用。
-/// horizontal=true 表示右移/左移（列位移），false 表示下移/上移（行位移）。
-pub(crate) fn cell_reference_shift(rect: (u32, u32, u32, u32), horizontal: bool, insert: bool) -> crate::refs::Shift {
-    let (r1, c1, r2, c2) = rect;
-    let (axis, at, n) = if horizontal {
-        (crate::refs::Axis::Col, c1, c2.saturating_sub(c1) + 1)
-    } else {
-        (crate::refs::Axis::Row, r1, r2.saturating_sub(r1) + 1)
-    };
-    crate::refs::Shift {
-        axis, at, n, delete: !insert,
-        row_filter: horizontal.then_some((r1, r2)),
-        col_filter: (!horizontal).then_some((c1, c2)),
-        ..Default::default()
+/// A local shift moves the selected rows or columns by the width or height of
+/// the selection. The same geometry drives cell storage, references and bindings.
+#[derive(Clone, Copy, Debug)]
+pub struct CellShift {
+    rect: (u32, u32, u32, u32),
+    direction: crate::cells::Shift,
+    insert: bool,
+}
+
+impl CellShift {
+    pub fn new(rect: (u32, u32, u32, u32), direction: crate::cells::Shift, insert: bool) -> Self {
+        Self { rect, direction, insert }
+    }
+
+    pub fn count(&self) -> u32 {
+        let (r1, c1, r2, c2) = self.rect;
+        if r1 > r2 || c1 > c2 || r2 >= crate::sync::MAX_ROWS || c2 >= crate::sync::MAX_COLS {
+            return 0;
+        }
+        match self.direction {
+            crate::cells::Shift::Vertical => r2 - r1 + 1,
+            crate::cells::Shift::Horizontal => c2 - c1 + 1,
+        }
+    }
+
+    pub(crate) fn reference_shift(&self) -> crate::refs::Shift {
+        let (r1, c1, r2, c2) = self.rect;
+        let (axis, at, row_filter, col_filter) = match self.direction {
+            crate::cells::Shift::Vertical => (crate::refs::Axis::Row, r1, None, Some((c1, c2))),
+            crate::cells::Shift::Horizontal => (crate::refs::Axis::Col, c1, Some((r1, r2)), None),
+        };
+        crate::refs::Shift {
+            axis,
+            at,
+            n: self.count(),
+            delete: !self.insert,
+            row_filter,
+            col_filter,
+            ..Default::default()
+        }
+    }
+
+    /// Positions whose formula text this edit rewrites, including references outside the moved band.
+    pub fn affected_formula_positions(&self, sheet: &Sheet, target_name: &str) -> Vec<(u32, u32)> {
+        let mut mapping = self.reference_shift();
+        mapping.target_sheet = target_name.to_owned();
+        mapping.own_sheet.clone_from(&sheet.name);
+        let shift = MappedShift { shift: &mapping, insertions: &[] };
+        let affected = |(key, cell): (CellRef, &Cell)| {
+            let formula = cell.formula.as_deref()?;
+            (formula_may_be_affected(formula, &shift) && crate::refs::rewrite_mapped(formula, &shift) != formula)
+                .then_some((key.row, key.col))
+        };
+        if sheet.name.eq_ignore_ascii_case(target_name) {
+            sheet.formula_cells().filter_map(affected).collect()
+        } else {
+            sheet.foreign_formula_cells(target_name).filter_map(affected).collect()
+        }
+    }
+
+    /// Whether the edit would push occupied cells or their metadata outside the grid.
+    pub fn would_overflow(&self, sheet: &Sheet) -> bool {
+        let n = self.count();
+        n == 0 || (self.insert && crate::cells::insert_would_overflow(sheet, self.rect, self.direction, n))
+    }
+
+    /// Returns false without changing the workbook for an invalid target or overflowing insertion.
+    pub fn apply(&self, wb: &mut crate::Workbook, sheet_idx: usize) -> bool {
+        let Some(sheet) = wb.sheets.get_mut(sheet_idx) else { return false };
+        let n = self.count();
+        if n == 0 {
+            return false;
+        }
+        if self.insert {
+            if !crate::cells::try_insert(sheet, self.rect, self.direction, n) {
+                return false;
+            }
+        } else {
+            crate::cells::delete(sheet, self.rect, self.direction, n);
+        }
+        self.update_references(wb, sheet_idx);
+        true
+    }
+
+    fn update_references(&self, wb: &mut crate::Workbook, sheet_idx: usize) {
+        let Some(target) = wb.sheets.get_mut(sheet_idx) else { return };
+        if self.count() == 0 { return; }
+        target.coordinates_shifted();
+        let mut shift = self.reference_shift();
+        shift.target_sheet.clone_from(&target.name);
+        crate::external::remap_sources(wb, sheet_idx, shift.axis, shift.row_filter.or(shift.col_filter), |a, b| {
+            shift.map_range(a, b)
+        });
+        for sheet in &mut wb.sheets {
+            shift.own_sheet.clone_from(&sheet.name);
+            sheet.rewrite_references(&shift);
+        }
     }
 }
 
+/// Update references and bindings after the caller has already moved the cells.
 pub fn apply_cell_shift_wb(
     wb: &mut crate::model::Workbook, sheet_idx: usize, rect: (u32, u32, u32, u32),
     horizontal: bool, insert: bool,
 ) {
-    let Some(target) = wb.sheets.get_mut(sheet_idx) else { return };
-    target.coordinates_shifted();
-    let name = target.name.clone();
-    let mut shift = cell_reference_shift(rect, horizontal, insert);
-    shift.target_sheet.clone_from(&name);
-    // The UI shifts the cells by one position, including for multi-cell selections.
-    let cells = crate::refs::Shift { n: 1, ..shift.clone() };
-    crate::external::remap_sources(wb, sheet_idx, cells.axis, cells.row_filter.or(cells.col_filter), |a, b| cells.map_range(a, b));
-    for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
-        shift.own_sheet.clone_from(if idx == sheet_idx { &name } else { &sheet.name });
-        sheet.rewrite_references(&shift);
-    }
+    let direction = if horizontal { crate::cells::Shift::Horizontal } else { crate::cells::Shift::Vertical };
+    CellShift::new(rect, direction, insert).update_references(wb, sheet_idx);
 }
 
 pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op: &Structural) {

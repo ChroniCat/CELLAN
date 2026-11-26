@@ -1197,6 +1197,7 @@ impl ChartUndoAction {
 
 enum Entry {
     Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>, Option<ArrayEdit>, Option<NoteUndoEdit>),
+    CellShift(EntryStamp, CellShiftAction),
     CowBatch(EntryStamp, Box<CowBatchAction>),
     NumericSort(EntryStamp, NumericSortAction),
     Structure(EntryStamp, StructureAction),
@@ -1212,6 +1213,7 @@ impl Entry {
     fn stamp(&self) -> EntryStamp {
         match self {
             Self::Cells(s, _, _, _, _)
+            | Self::CellShift(s, _)
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
@@ -1225,6 +1227,7 @@ impl Entry {
     fn stamp_mut(&mut self) -> &mut EntryStamp {
         match self {
             Self::Cells(s, _, _, _, _)
+            | Self::CellShift(s, _)
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
@@ -1262,6 +1265,7 @@ impl Entry {
 
     fn label(&self) -> &str {
         match self {
+            Self::CellShift(_, a) => &a.label,
             Self::Cells(_, a, _, _, _) => &a.label,
             Self::CowBatch(_, a) => &a.label,
             Self::NumericSort(_, a) => &a.label,
@@ -1274,6 +1278,7 @@ impl Entry {
     }
     fn by_site(&self) -> u32 {
         match self {
+            Self::CellShift(_, a) => a.by_site,
             Self::Cells(_, a, _, _, _) => a.by_site,
             Self::CowBatch(_, a) => a.by_site,
             Self::NumericSort(_, a) => a.by_site,
@@ -1283,6 +1288,37 @@ impl Entry {
             Self::Pivot(_, a) => a.by_site,
             Self::Chart(_, a) => a.by_site,
         }
+    }
+}
+
+struct CellShiftAction {
+    label: String,
+    deltas: Vec<CellDelta>,
+    sheet_ids: Vec<(usize, u64)>,
+    focus: (usize, u32, u32),
+    by_site: u32,
+}
+
+impl CellShiftAction {
+    /// Clearing one end of a move while skipping the other can destroy data.
+    /// Check all cells and rewritten formulas before replaying either end.
+    fn apply(&self, sheets: &mut [Sheet], redo: bool, mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Applied {
+        let mut applied = Applied {
+            touched: Vec::new(), label: self.label.clone(), focus: self.focus, skipped: 0,
+            structural: false, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(),
+            merge_conflict: false, total_touched: 0,
+        };
+        if self.sheet_ids.iter().any(|&(idx, id)| sheets.get(idx).is_none_or(|sheet| sheet.identity != id))
+            || self.deltas.iter().any(|d| !d.can_replay(&sheets[d.sheet], redo, &mut guard)) {
+            applied.skipped = self.deltas.len();
+            return applied;
+        }
+        for delta in &self.deltas {
+            delta.replay(&mut sheets[delta.sheet], redo, &mut applied.style_changes);
+            applied.touched.push((delta.sheet, delta.row, delta.col));
+        }
+        sheets[self.focus.0].coordinates_shifted();
+        applied
     }
 }
 
@@ -2254,6 +2290,21 @@ pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::S
     snapshot_with_mapping(wb, sheet, op.reference_shift(), None)
 }
 
+/// Capture the formulas and metadata affected by this partial row or column shift.
+pub fn snapshot_cell_shift(wb: &Workbook, sheet: usize, op: &crate::structural::CellShift) -> StructureSnapshot {
+    snapshot_with_mapping(wb, sheet, op.reference_shift(), None)
+}
+
+/// Ordinary cell/formula/style edits need only sparse cell deltas. Avoid cloning
+/// sheet and workbook state when none of the metadata a partial shift can change exists.
+pub fn snapshot_cell_shift_if_metadata(wb: &Workbook, sheet: usize, op: &crate::structural::CellShift) -> Option<StructureSnapshot> {
+    let target = &wb.sheets[sheet];
+    let has_metadata = !target.notes.is_empty() || !target.threads.is_empty() || !target.merges.is_empty()
+        || !target.rich.is_empty() || !target.hyperlinks.is_empty() || !wb.sources.is_empty()
+        || wb.sheets.iter().any(|sh| !sh.cf.blocks.is_empty() || !sh.dv.is_empty());
+    has_metadata.then(|| snapshot_cell_shift(wb, sheet, op))
+}
+
 /// Shared cell history can also restore workbook bindings when a local ray moves them.
 pub fn snapshot_cell_shift_if_bound(wb: &Workbook, sheet: usize, rect: (u32,u32,u32,u32), horizontal: bool, insert: bool) -> Option<StructureSnapshot> {
     let name = &wb.sheets.get(sheet)?.name;
@@ -2266,7 +2317,10 @@ pub fn snapshot_cell_shift_if_bound(wb: &Workbook, sheet: usize, rect: (u32,u32,
         !matches!(source.kind, crate::external::Kind::Unbound(_)) &&
         (source.target_sheet.as_ref().is_none_or(|s| s.eq_ignore_ascii_case(name)) && overlaps_ray(source.destination_rect())
             || matches!(&source.kind, crate::external::Kind::Internal { sheet, rect } if sheet.eq_ignore_ascii_case(name) && overlaps_ray(*rect)))
-    }).then(|| snapshot_with_mapping(wb, sheet, crate::structural::cell_reference_shift(rect,horizontal,insert), None))
+    }).then(|| {
+        let direction = if horizontal { crate::cells::Shift::Horizontal } else { crate::cells::Shift::Vertical };
+        snapshot_cell_shift(wb, sheet, &crate::structural::CellShift::new(rect, direction, insert))
+    })
 }
 
 /// The drop line uses the original grid coordinates, just like move_rows_wb / move_cols_wb.
@@ -2300,6 +2354,28 @@ fn snapshot_with_mapping(wb: &Workbook, sheet: usize, shift: crate::refs::Shift,
 }
 
 impl StructureSnapshot {
+    /// The original positions include formulas whose new text contains only #REF!.
+    pub fn foreign_formula_positions(&self) -> impl Iterator<Item = (usize, Vec<(u32, u32)>)> + '_ {
+        self.foreign.iter().filter(|scope| !scope.cells.is_empty()).map(|scope| {
+            (scope.sheet, scope.cells.iter().map(|(key, _)| (key.row, key.col)).collect())
+        })
+    }
+
+    /// Cell deltas already cover values, formulas and styles. A partial shift
+    /// needs structural history only if it also changed other workbook state.
+    pub fn cell_shift_changed_metadata(&self, wb: &Workbook) -> bool {
+        let old = &self.target;
+        let new = &wb.sheets[self.sheet];
+        self.sources != wb.sources || old.merges != new.merges || old.notes != new.notes
+            || old.threads != new.threads || old.rich != new.rich || old.hyperlinks != new.hyperlinks
+            || old.cf != new.cf || old.dv != new.dv
+            || self.foreign.iter().any(|scope| {
+                let sheet = &wb.sheets[scope.sheet];
+                scope.cf.as_ref().is_some_and(|cf| *cf != sheet.cf)
+                    || scope.dv.as_ref().is_some_and(|dv| *dv != sheet.dv)
+            })
+    }
+
     pub fn detached_source(&self, wb: &Workbook) -> bool {
         self.sources.iter().zip(&wb.sources).any(|(old, new)| {
             !matches!(old.kind, crate::external::Kind::Unbound(_))
@@ -2311,7 +2387,9 @@ impl StructureSnapshot {
         // The cell-store compressor models complete axes. A band shift is stored
         // as exceptions at the original coordinates, keeping cells outside the band intact.
         if self.shift.row_filter.is_some() || self.shift.col_filter.is_some() {
-            return Default::default();
+            // An identity mapping starts past the grid, so the compressor can skip
+            // shared unchanged pages and restoration need not remap their cells.
+            return crate::refs::Shift { at: crate::sync::MAX_ROWS, ..Default::default() };
         }
         self.shift.clone()
     }
@@ -2424,7 +2502,7 @@ fn target_matches(a: &Sheet, b: &Sheet) -> bool {
         && a.tables == b.tables && a.pictures == b.pictures && a.merges == b.merges
         && a.cols == b.cols && a.rows == b.rows && a.styles == b.styles
         && a.col_styles == b.col_styles && a.row_styles == b.row_styles
-        && a.cf == b.cf && a.dv == b.dv && a.notes == b.notes && a.freeze == b.freeze
+        && a.cf == b.cf && a.dv == b.dv && a.freeze == b.freeze
         && a.filter == b.filter && a.hidden_rows == b.hidden_rows && a.hidden_rows_user == b.hidden_rows_user
         && a.hidden_cols == b.hidden_cols && a.scenarios == b.scenarios && a.scenario_settings == b.scenario_settings && a.ignored_errors == b.ignored_errors
         && a.outline_summary_below == b.outline_summary_below && a.outline_summary_right == b.outline_summary_right
@@ -2502,6 +2580,31 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     let names = changed_names(&wb.names, &expected.names, &snap.names)?;
     let current = wb.sheets.get(snap.sheet)?;
     let mut target = snap.target.clone();
+    // Comments may arrive independently of undo history. Compare the thread and
+    // its traditional note together, including coordinates vacated by this edit.
+    let recorded = &expected.target;
+    if current.notes != recorded.notes || current.threads != recorded.threads {
+        let comment_keys: HashSet<_> = current.notes.keys().chain(recorded.notes.keys())
+            .chain(current.threads.keys()).chain(recorded.threads.keys()).copied().collect();
+        let shift = &expected.shift;
+        for key in comment_keys {
+            let live = (current.notes.get(&key), current.threads.get(&key));
+            let before = (recorded.notes.get(&key), recorded.threads.get(&key));
+            if live == before { continue; }
+            let index = if shift.axis == crate::refs::Axis::Row { key.row } else { key.col };
+            let moves = shift.row_filter.is_none_or(|(lo, hi)| (lo..=hi).contains(&key.row))
+                && shift.col_filter.is_none_or(|(lo, hi)| (lo..=hi).contains(&key.col))
+                && expected.movement.map_or_else(|| shift.map(index) != Some(index),
+                    |mv| mv.contiguous_range(index, index) != Some((index, index)));
+            if moves || before != (target.notes.get(&key), target.threads.get(&key)) {
+                return None;
+            }
+            if let Some(note) = live.0 { target.notes.insert(key, note.clone()); }
+            else { target.notes.remove(&key); }
+            if let Some(thread) = live.1 { target.threads.insert(key, thread.clone()); }
+            else { target.threads.remove(&key); }
+        }
+    }
     if let Some(history) = &snap.compact {
         target.replace_cell_store(history.restore(current,&expected.storage_shift())?);
     }
@@ -2509,6 +2612,11 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     // Saving may have assigned a part to a previously new sheet. Undo changes
     // its content, not its identity or the current save baseline.
     target.identity = current.identity;
+    if target.coordinate_revision() != current.coordinate_revision()
+        || target.coordinate_revision() != recorded.coordinate_revision()
+    {
+        target.coordinates_shifted();
+    }
     target.source_part = current.source_part.clone();
     target.saved_cells.clone_from(&current.saved_cells);
     target.source_cells.clone_from(&current.source_cells);
@@ -2610,6 +2718,7 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     target.cf_dirty = true;
     target.dv_dirty = true;
     target.notes_dirty = true;
+    target.threads_dirty |= current.threads_dirty || target.threads != current.threads;
     target.freeze_dirty = true;
     target.filter_dirty = true;
     target.page_dirty = true;
@@ -2700,6 +2809,22 @@ impl UndoStack {
 
     pub fn push(&mut self, action: Action) {
         self.push_prepared(action.prepare());
+    }
+
+    /// One partial shift may span sheets, but it must replay as a single move.
+    pub fn push_cell_shift(&mut self, label: &str, deltas: Vec<CellDelta>, focus: (usize, u32, u32), sheets: &[Sheet]) {
+        if deltas.is_empty() { return; }
+        let mut indices: Vec<_> = deltas.chunk_by(|a, b| a.sheet == b.sheet).map(|group| group[0].sheet).collect();
+        indices.push(focus.0);
+        indices.sort_unstable();
+        indices.dedup();
+        let sheet_ids = indices.into_iter().map(|idx| (idx, sheets[idx].identity)).collect();
+        let bytes = deltas.capacity() * std::mem::size_of::<CellDelta>()
+            + deltas.iter().map(|d| cell_heap_bytes(&d.before) + cell_heap_bytes(&d.after)).sum::<usize>();
+        self.done.push(Entry::CellShift(next_entry(bytes), CellShiftAction {
+            label: label.to_owned(), deltas, sheet_ids, focus, by_site: self.site,
+        }));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
     pub fn push_with_arrays(&mut self, mut action: Action, arrays: Option<ArrayEdit>) {
@@ -2964,6 +3089,10 @@ impl UndoStack {
             .take(limit)
             .map(|e| e.label().to_string())
             .collect()
+    }
+
+    pub fn next_is_cell_shift(&self, redo: bool) -> bool {
+        matches!(if redo { self.undone.last() } else { self.done.last() }, Some(Entry::CellShift(..)))
     }
 
     pub fn redo_labels(&self, limit: usize) -> Vec<String> {
@@ -3355,6 +3484,11 @@ impl UndoStack {
             return None;
         }
         let site = self.site;
+        if let Some(Entry::CellShift(_, action)) = self.done.last() {
+            let applied = action.apply(sheets, false, guard);
+            if applied.skipped == 0 { self.undone.push(self.done.pop()?); }
+            return Some(applied);
+        }
         if let Some(Entry::Meta(_, _)) = self.done.last() {
             let mut entry = self.done.pop()?;
             let Entry::Meta(_, ref mut action) = entry else { unreachable!() };
@@ -3538,6 +3672,11 @@ impl UndoStack {
             return None;
         }
         let site = self.site;
+        if let Some(Entry::CellShift(_, action)) = self.undone.last() {
+            let applied = action.apply(sheets, true, guard);
+            if applied.skipped == 0 { self.done.push(self.undone.pop()?); }
+            return Some(applied);
+        }
         if let Some(Entry::Meta(_, _)) = self.undone.last() {
             let mut entry = self.undone.pop()?;
             let Entry::Meta(_, ref mut action) = entry else { unreachable!() };

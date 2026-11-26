@@ -1372,24 +1372,25 @@ mod tests {
         let pending = Target::current(&app, (4, 1));
         app.shift_cells(true, false);
         assert!(!pending.valid(&app));
-        assert_eq!(app.wb.sources[0].at, (5, 1));
-        assert_eq!(app.wb.sheet(0).value(5, 1), Value::Number(1.));
+        assert_eq!(app.wb.sources[0].at, (6, 1));
+        assert_eq!(app.wb.sheet(0).value(6, 1), Value::Number(1.));
+        assert_eq!(app.wb.sheet(0).value(5, 1), Value::Empty);
         assert_eq!(app.undo.depth().0, depth.0 + 1);
         app.do_undo(false);
         assert_eq!(app.wb.sources[0], source);
         assert_eq!(app.wb.sheet(0).value(4, 2), Value::Number(2.));
         app.do_undo(true);
-        assert_eq!(app.wb.sources[0].at, (5, 1));
+        assert_eq!(app.wb.sources[0].at, (6, 1));
         app.sel = (1, 1);
         app.sel_end = app.sel;
         app.shift_cells(false, false);
         assert!(matches!(app.wb.sources[0].kind, Kind::Unbound(_)));
         assert!(app.status.contains("重新选择区域"), "{}", app.status);
         app.do_undo(false);
-        assert_eq!(app.wb.sources[0].at, (5, 1));
+        assert_eq!(app.wb.sources[0].at, (6, 1));
         assert!(matches!(app.wb.sources[0].kind, Kind::Csv { .. }));
-        assert_eq!(app.wb.sheet(0).value(5, 1), Value::Number(1.));
-        assert_eq!(app.wb.sheet(0).value(5, 2), Value::Number(2.));
+        assert_eq!(app.wb.sheet(0).value(6, 1), Value::Number(1.));
+        assert_eq!(app.wb.sheet(0).value(6, 2), Value::Number(2.));
     }
 
     #[test]

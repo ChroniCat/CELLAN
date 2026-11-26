@@ -3118,6 +3118,244 @@ fn insert_cells_rewrites_formula_refs() {
     assert_eq!(f.as_deref(), Some("A3+1"));
 }
 
+fn check_two_cell_shift(horizontal: bool, insert: bool) {
+    let _env = crate::test_env::TestEnv::new("two-cell-shift-dialog");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    // B2:B3 shifts one column vertically. B2:C2 shifts one row horizontally.
+    let lane = |offset| if horizontal { (1, 1 + offset) } else { (1 + offset, 1) };
+    for (offset, value) in [11.0, 22.0, 33.0, 44.0].into_iter().enumerate() {
+        let (r, c) = lane(offset as u32);
+        app.wb.sheet_mut(0).set(r, c, number(value));
+    }
+    app.wb.sheet_mut(0).set(2, 2, number(77.0));
+    let original = if horizontal { "=E2*2" } else { "=B5*2" };
+    app.wb.sheet_mut(0).set(7, 7, formula(original));
+    sheetcore::formula::recalc_all(&mut app.wb);
+
+    let check = |app: &SheetApp, expected: [Option<f64>; 6], reference: &str| {
+        let sh = app.wb.sheet(0);
+        for (offset, value) in expected.into_iter().enumerate() {
+            let (r, c) = lane(offset as u32);
+            assert_eq!(sh.value(r, c), value.map_or(Value::Empty, Value::Number),
+                "horizontal={horizontal}, insert={insert}, offset={offset}");
+        }
+        assert_eq!(sh.value(2, 2), Value::Number(77.0), "C3 is outside either shift");
+        assert_eq!(sh.get(7, 7).unwrap().formula.as_deref(), Some(reference));
+        assert_eq!(sh.value(7, 7), Value::Number(88.0));
+    };
+    let before = [Some(11.0), Some(22.0), Some(33.0), Some(44.0), None, None];
+    let after = if insert {
+        [None, None, Some(11.0), Some(22.0), Some(33.0), Some(44.0)]
+    } else {
+        [Some(33.0), Some(44.0), None, None, None, None]
+    };
+    let shifted = match (horizontal, insert) {
+        (false, true) => "=B7*2",
+        (false, false) => "=B3*2",
+        (true, true) => "=G2*2",
+        (true, false) => "=C2*2",
+    };
+    app.sel = lane(0);
+    app.sel_end = lane(1);
+    app.shift_cells_dlg = Some(ShiftCellsDlg { insert, choice: if horizontal { 0 } else { 1 } });
+    let input = egui::RawInput { events: vec![key_event(egui::Key::Enter, false)], ..Default::default() };
+    let original_revision = app.wb.sheet(0).coordinate_revision();
+    let _ = ctx.run(input, |ctx| app.shift_cells_dialog(ctx));
+    assert!(app.shift_cells_dlg.is_none());
+    let shifted_revision = app.wb.sheet(0).coordinate_revision();
+    assert_ne!(shifted_revision, original_revision);
+    assert_eq!(app.undo.depth(), (1, 0));
+    check(&app, after, shifted);
+    app.do_undo(false);
+    let undone_revision = app.wb.sheet(0).coordinate_revision();
+    assert_ne!(undone_revision, shifted_revision);
+    assert_eq!(app.undo.depth(), (0, 1));
+    check(&app, before, original);
+    app.do_undo(true);
+    assert_ne!(app.wb.sheet(0).coordinate_revision(), undone_revision);
+    check(&app, after, shifted);
+}
+
+#[test]
+fn issue_22_two_cell_shift_vertical_insert() { check_two_cell_shift(false, true); }
+
+#[test]
+fn issue_22_two_cell_shift_vertical_delete() { check_two_cell_shift(false, false); }
+
+#[test]
+fn issue_22_two_cell_shift_horizontal_insert() { check_two_cell_shift(true, true); }
+
+#[test]
+fn issue_22_two_cell_shift_horizontal_delete() { check_two_cell_shift(true, false); }
+
+#[test]
+fn issue_22_shift_size_limit_uses_the_selected_band_and_includes_style_only_cells() {
+    let _env = crate::test_env::TestEnv::new("shift-band-bounds");
+    let mut app = app();
+    let mut style = sheetcore::style::CellStyle::default();
+    style.italic = true;
+    let id = app.wb.styles.intern(style);
+    let sh = app.wb.sheet_mut(0);
+    sh.set(2, 1, number(14.0));
+    sh.set_style(5, 1, id);
+    sh.set(250_000, 8, number(99.0));
+    app.sel = (1, 1);
+    app.sel_end = (2, 1);
+    app.shift_cells(true, false);
+    assert_eq!(app.wb.sheet(0).value(4, 1), Value::Number(14.0));
+    assert_eq!(app.wb.sheet(0).style_of(7, 1), id);
+    assert_eq!(app.wb.sheet(0).value(250_000, 8), Value::Number(99.0));
+    assert_eq!(app.undo.depth(), (1, 0));
+
+    app.wb.sheet_mut(0).set_style(250_000, 1, id);
+    let revision = app.wb.sheet(0).coordinate_revision();
+    app.shift_cells(true, false);
+    assert!(app.status.contains("影响范围过大"), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).value(4, 1), Value::Number(14.0));
+    assert_eq!(app.wb.sheet(0).style_of(250_000, 1), id);
+    assert_eq!(app.wb.sheet(0).coordinate_revision(), revision);
+    assert_eq!(app.undo.depth(), (1, 0));
+}
+
+#[test]
+fn issue_23_multi_cell_shift_records_each_worksheet_in_its_own_revision() {
+    let env = crate::test_env::TestEnv::new("cell-shift-worksheet-revisions");
+    let mut app = app();
+    app.wb.path = Some(env.path("shift.xlsx"));
+    let source = app.wb.sheet_mut(0);
+    source.name = "S".into();
+    source.set(3, 0, number(11.0));
+    source.set(4, 0, number(22.0));
+    let mut other = sheetcore::Sheet::new("Other");
+    other.set(0, 0, formula("=S!A4"));
+    app.wb.sheets.push(other);
+    sheetcore::formula::recalc_all(&mut app.wb);
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+    app.shift_cells(true, false);
+
+    assert_eq!(app.wb.sheet(0).value(5, 0), Value::Number(11.0));
+    assert_eq!(app.wb.sheet(0).value(6, 0), Value::Number(22.0));
+    assert_eq!(app.wb.sheet(1).get(0, 0).unwrap().formula.as_deref(), Some("=S!A6"));
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(11.0));
+    let entries: Vec<_> = app.rev.iter().filter(|e| e.label == "插入单元格").collect();
+    assert_eq!(entries.len(), 2);
+    let source = entries.iter().find(|e| e.sheet == "S").unwrap();
+    assert_eq!(source.cells.len(), 4);
+    for (row, before, after) in [
+        (3, Value::Number(11.0), Value::Empty),
+        (4, Value::Number(22.0), Value::Empty),
+        (5, Value::Empty, Value::Number(11.0)),
+        (6, Value::Empty, Value::Number(22.0)),
+    ] {
+        let change = source.cells.iter().find(|c| (c.r, c.c) == (row, 0)).unwrap();
+        assert_eq!(change.before.to_cell().value, before);
+        assert_eq!(change.after.to_cell().value, after);
+    }
+    let report = entries.iter().find(|e| e.sheet == "Other").unwrap();
+    assert_eq!(report.cells.len(), 1);
+    let change = &report.cells[0];
+    assert_eq!((change.r, change.c), (0, 0));
+    assert_eq!(change.before.f.as_deref(), Some("=S!A4"));
+    assert_eq!(change.after.f.as_deref(), Some("=S!A6"));
+    assert_eq!(app.undo.depth(), (1, 0));
+    app.do_undo(false);
+    assert_eq!(app.undo.depth(), (0, 1));
+    assert_eq!(app.wb.sheet(0).value(3, 0), Value::Number(11.0));
+    assert_eq!(app.wb.sheet(0).value(4, 0), Value::Number(22.0));
+    assert_eq!(app.wb.sheet(1).get(0, 0).unwrap().formula.as_deref(), Some("=S!A4"));
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(11.0));
+}
+
+fn check_unbound_single_cell_shift(insert: bool) {
+    let _env = crate::test_env::TestEnv::new("unbound-shift-cross-sheet");
+    let mut app = app();
+    assert!(app.wb.sources.is_empty());
+    for (index, value) in [10.0, 19.0, 31.0].into_iter().enumerate() {
+        app.wb.sheet_mut(0).set(1 + index as u32, 1, number(value));
+    }
+    let mut report = sheetcore::Sheet::new("Report");
+    report.protection = Some(sheetcore::protection::SheetProtection::default());
+    report.set(2, 1, number(88.0));
+    report.set(0, 0, formula("=Sheet1!B3+B3"));
+    app.wb.sheets.push(report);
+    sheetcore::formula::recalc_all(&mut app.wb);
+    let check = |app: &SheetApp, row: u32, reference: &str| {
+        assert_eq!(app.wb.sheet(0).value(row, 1), Value::Number(19.0));
+        let report = app.wb.sheet(1);
+        assert_eq!(report.get(0, 0).unwrap().formula.as_deref(), Some(reference));
+        assert_eq!(report.value(0, 0), Value::Number(107.0));
+    };
+    let (row, shifted) = if insert { (3, "=Sheet1!B4+B3") } else { (1, "=Sheet1!B2+B3") };
+    app.sel = (1, 1);
+    app.sel_end = app.sel;
+    app.shift_cells(insert, false);
+    assert_eq!(app.undo.depth(), (1, 0));
+    check(&app, row, shifted);
+    app.do_undo(false);
+    assert_eq!(app.undo.depth(), (0, 1));
+    check(&app, 2, "=Sheet1!B3+B3");
+    app.do_undo(true);
+    assert_eq!(app.undo.depth(), (1, 0));
+    check(&app, row, shifted);
+}
+
+#[test]
+fn issue_23_unbound_single_cell_insert_undo_redo_preserves_cross_sheet_reference() {
+    check_unbound_single_cell_shift(true);
+}
+
+#[test]
+fn issue_23_unbound_single_cell_delete_undo_redo_preserves_cross_sheet_reference() {
+    check_unbound_single_cell_shift(false);
+}
+
+
+#[test]
+fn issue_23_unbound_deleted_reference_undo_redo_preserves_unrelated_changes() {
+    let _env = crate::test_env::TestEnv::new("deleted-reference-undo");
+    let mut app = app();
+    assert!(app.wb.sources.is_empty());
+    app.wb.sheet_mut(0).set(1, 1, number(13.0));
+    app.wb.sheet_mut(0).set(2, 1, number(71.0));
+    let mut other = sheetcore::Sheet::new("Other");
+    other.set(0, 0, formula("=Sheet1!$B$2"));
+    other.set(0, 1, number(3.0));
+    other.set(0, 2, formula("=B1+1"));
+    app.wb.sheets.push(other);
+    sheetcore::formula::recalc_all(&mut app.wb);
+    let check_deleted = |app: &SheetApp| {
+        let other = app.wb.sheet(1);
+        assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(71.0));
+        assert!(other.get(0, 0).unwrap().formula.as_deref().unwrap().contains("#REF!"));
+        assert_eq!(other.value(0, 0), Value::Error(sheetcore::formula::ErrKind::Ref));
+    };
+    let check_independent = |app: &SheetApp| {
+        let other = app.wb.sheet(1);
+        assert_eq!(other.value(0, 1), Value::Number(40.0));
+        assert_eq!(other.get(0, 2).unwrap().formula.as_deref(), Some("=B1+2"));
+        assert_eq!(other.value(0, 2), Value::Number(42.0));
+    };
+
+    app.sel = (1, 1);
+    app.sel_end = app.sel;
+    app.shift_cells(false, false);
+    check_deleted(&app);
+    // A separate writer changes two unrelated cells without adding to this user's history.
+    app.wb.sheet_mut(1).set(0, 1, number(40.0));
+    app.wb.sheet_mut(1).set(0, 2, formula("=B1+2"));
+    sheetcore::formula::recalc_all(&mut app.wb);
+    assert!(app.apply_undo(false));
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(13.0));
+    assert_eq!(app.wb.sheet(1).get(0, 0).unwrap().formula.as_deref(), Some("=Sheet1!$B$2"));
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(13.0));
+    check_independent(&app);
+    assert!(app.apply_undo(true));
+    check_deleted(&app);
+    check_independent(&app);
+}
+
 // ---------------------------------------------------------------- 右键菜单
 
 #[test]

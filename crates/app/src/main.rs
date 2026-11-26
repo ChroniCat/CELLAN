@@ -12321,6 +12321,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return false;
         }
         let structural = if redo { self.undo.redo_is_structure() } else { self.undo.undo_is_structure() };
+        let cell_shift = self.undo.next_is_cell_shift(redo);
         if self.net.is_some() && structural {
             self.status = "协作期间不能撤销或重做整表结构，请先断开协作".into();
             return false;
@@ -12368,7 +12369,11 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return false;
         }
         if applied.skipped > 0 && applied.touched_count() == 0 && applied.refresh_sizes.is_none() {
-            self.status = format!("{}：{} 格已被其他用户修改，已跳过", applied.label, applied.skipped);
+            self.status = if cell_shift {
+                format!("关联单元格已更改或被锁定，无法整体{}，已保留历史记录", if redo { "重做" } else { "撤销" })
+            } else {
+                format!("{}：{} 格已被其他用户修改，已跳过", applied.label, applied.skipped)
+            };
             return false;
         }
         if let Some(eid) = undo_entry_id {
@@ -17446,65 +17451,94 @@ fn clear_values(&mut self) {
             });
             return;
         }
-        let used = self.wb.sheet(self.sheet_idx).used_bounds();
-        let extra_r = if insert && !horizontal { rect.2 - rect.0 + 1 } else { 0 };
-        let extra_c = if insert && horizontal { rect.3 - rect.1 + 1 } else { 0 };
-        let (kr1, kc1, kr2, kc2) = match used {
-            Some((_, _, r2, c2)) => (
-                rect.0,
-                rect.1,
-                r2.max(rect.2).saturating_add(extra_r).min(1_048_575),
-                c2.max(rect.3).saturating_add(extra_c).min(16_383),
-            ),
-            None => (
-                rect.0,
-                rect.1,
-                rect.2.saturating_add(extra_r).min(1_048_575),
-                rect.3.saturating_add(extra_c).min(16_383),
-            ),
+        let si = self.sheet_idx;
+        let direction = if horizontal { sheetcore::cells::Shift::Horizontal } else { sheetcore::cells::Shift::Vertical };
+        let op = sheetcore::structural::CellShift::new(rect, direction, insert);
+        let sh = self.wb.sheet(si);
+        if op.would_overflow(sh) {
+            self.status = "插入/删除区域超出工作表边界，无法移动单元格".into();
+            return;
+        }
+
+        // Only content and metadata in the selected band contribute to its movable extent.
+        let (r1, c1, r2, c2) = rect;
+        let ray = if horizontal { (r1, c1, r2, sheetcore::sync::MAX_COLS - 1) }
+            else { (r1, c1, sheetcore::sync::MAX_ROWS - 1, c2) };
+        let mut last = if horizontal { c2 } else { r2 };
+        let distance = if insert { op.count() } else { 0 };
+        let mut include = |r, c| {
+            if (ray.0..=ray.2).contains(&r) && (ray.1..=ray.3).contains(&c) {
+                last = last.max((if horizontal { c } else { r }) + distance);
+            }
         };
-        let area = (kr2 - kr1 + 1) as u64 * (kc2 - kc1 + 1) as u64;
+        for (key, _) in sh.iter_rect_views(ray) { include(key.row, key.col); }
+        for (key, _) in sh.styles.iter_rect(ray) { include(key.row, key.col); }
+        for key in sh.notes.keys().chain(sh.threads.keys()) { include(key.row, key.col); }
+        for &(r, c) in sh.rich.keys().chain(sh.hyperlinks.keys()) { include(r, c); }
+        for &(top, left, bottom, right) in &sh.merges {
+            if (horizontal && r1 <= top && bottom <= r2 && left >= c1)
+                || (!horizontal && c1 <= left && right <= c2 && top >= r1) {
+                include(bottom, right);
+            }
+        }
+        let (last_row, last_col) = if horizontal { (r2, last) } else { (last, c2) };
+        let area = u64::from(last_row - r1 + 1) * u64::from(last_col - c1 + 1);
         if area > 200_000 {
             self.status = "插入/删除单元格影响范围过大，请改用整行或整列插入/删除".into();
             return;
         }
-        let mut keys = sheetcore::undo::rect_keys(kr1, kc1, kr2, kc2);
-        // 公式引用可能被改到选区外，撤销要能一起还原
-        for (cref, cell) in self.wb.sheet(self.sheet_idx).iter() {
-            if cell.formula.is_some() {
-                keys.push((cref.row, cref.col));
+        let mut keys = sheetcore::undo::rect_keys(r1, c1, last_row, last_col);
+        keys.extend(op.affected_formula_positions(sh, &sh.name));
+        keys.sort_unstable();
+        keys.dedup();
+        let before = sheetcore::undo::snapshot_cell_shift_if_metadata(&self.wb, si, &op);
+        let mut affected = vec![(si, keys)];
+        if let Some(snapshot) = &before {
+            affected.extend(snapshot.foreign_formula_positions());
+        } else {
+            for (idx, other) in self.wb.sheets.iter().enumerate() {
+                if idx == si { continue; }
+                let keys = op.affected_formula_positions(other, &sh.name);
+                if !keys.is_empty() { affected.push((idx, keys)); }
             }
         }
-        if !self.write_preflight(&keys, if insert { "插入单元格" } else { "删除单元格" }) {
+        let label = if insert { "插入单元格" } else { "删除单元格" };
+        for (idx, keys) in &affected {
+            // Offline, formula references on protected reports follow edits to their source sheet.
+            if (*idx == si || self.net.is_some()) && !self.write_preflight_on(*idx, keys, label) { return; }
+        }
+        let captured: Vec<_> = affected.into_iter().map(|(idx, keys)|
+            (idx, sheetcore::undo::capture(self.wb.sheet(idx), idx, &keys))).collect();
+        if let Some(snapshot) = before.as_ref().filter(|_| self.net.is_some()) {
+            let mut prepared = self.wb.clone();
+            if !op.apply(&mut prepared, si) { return; }
+            if snapshot.cell_shift_changed_metadata(&prepared) {
+                self.status = "此次移动会更改协作无法同步的批注、绑定或其他工作表设置，请先断开协作".into();
+                return;
+            }
+            self.wb = prepared;
+        } else if !op.apply(&mut self.wb, si) {
             return;
         }
-        let sources_before = sheetcore::undo::snapshot_cell_shift_if_bound(&self.wb, self.sheet_idx, rect, horizontal, insert);
-        let txn = self.txn_begin(&keys);
-        {
-            let sh = self.wb.sheet_mut(self.sheet_idx);
-            let shift = if horizontal {
-                sheetcore::cells::Shift::Horizontal
-            } else {
-                sheetcore::cells::Shift::Vertical
-            };
-            if insert {
-                sheetcore::cells::insert(sh, rect, shift, 1);
-            } else {
-                sheetcore::cells::delete(sh, rect, shift, 1);
-            }
-        }
-        sheetcore::structural::apply_cell_shift_wb(&mut self.wb, self.sheet_idx, rect, horizontal, insert);
-        let label = if insert { "插入单元格" } else { "删除单元格" };
-        let detached_source = sources_before.as_ref().is_some_and(|s| s.detached_source(&self.wb));
-        if let Some(before) = sources_before {
-            let deltas = sheetcore::undo::finish(txn, self.wb.sheet(self.sheet_idx));
-            self.record_revision(label, &deltas);
-            let after = before.capture_after(&self.wb);
-            self.undo.push_structure(label, before, after, (self.sheet_idx, self.sel.0, self.sel.1));
-        } else {
-            self.txn_end(label, txn);
-        }
+        let deltas: Vec<_> = captured.into_iter().flat_map(|(idx, cells)|
+            sheetcore::undo::finish(cells, self.wb.sheet(idx))).collect();
+        let focus = (si, self.sel.0, self.sel.1);
+        let detached_source = before.as_ref().is_some_and(|snapshot| snapshot.detached_source(&self.wb));
+        let structure = before.filter(|s| s.cell_shift_changed_metadata(&self.wb)).map(|snapshot| {
+            let after = snapshot.capture_after(&self.wb);
+            (snapshot, after)
+        });
         self.recalc_all_and_deps_adaptive();
+        for group in deltas.chunk_by(|a, b| a.sheet == b.sheet) {
+            self.record_revision(label, group);
+            self.broadcast_sheet_deltas(group[0].sheet, group);
+        }
+        if let Some((before, after)) = structure {
+            if deltas.is_empty() { self.record_revision(label, &[]); }
+            self.undo.push_structure(label, before, after, focus);
+        } else if !deltas.is_empty() {
+            self.undo.push_cell_shift(label, deltas, focus, &self.wb.sheets);
+        }
         self.tasks.last_edit = Some(std::time::Instant::now());
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;

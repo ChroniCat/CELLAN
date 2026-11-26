@@ -108,6 +108,62 @@ fn csv(wb: &Workbook, path: &std::path::Path) -> Source {
 }
 
 #[test]
+fn band_insert_replays_only_foreign_conditional_formatting_and_validation() {
+    use sheetcore::{cells::Shift, structural::CellShift, undo::snapshot_cell_shift_if_metadata};
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Data".into();
+    let mut rules = Sheet::new("Rules");
+    let cf_range = (5, 3, 8, 4);
+    let dv_range = (1, 1, 6, 2);
+    rules.cf.blocks.push(CfBlock {
+        ranges: vec![cf_range],
+        rules: vec![CfRule {
+            kind: CfKind::Expr {
+                formula: "Data!A3>0".into(),
+                dxf: 0,
+            },
+            stop: false,
+            priority: 1,
+        }],
+    });
+    rules.dv.push(DataValidation {
+        ranges: vec![dv_range],
+        f1: "Data!A3".into(),
+        f2: "Data!B7".into(),
+        ..Default::default()
+    });
+    wb.sheets.push(rules);
+    let check = |wb: &Workbook, reference: &str| {
+        assert!(wb.sources.is_empty() && wb.sheets.iter().all(Sheet::is_empty));
+        let cf = &wb.sheet(1).cf.blocks[0];
+        assert_eq!(cf.ranges, [cf_range]);
+        let CfKind::Expr { formula, .. } = &cf.rules[0].kind else {
+            panic!("expected expression")
+        };
+        assert_eq!(formula, &format!("{reference}>0"));
+        let dv = &wb.sheet(1).dv[0];
+        assert_eq!(dv.ranges, [dv_range]);
+        assert_eq!(dv.f1, reference);
+        assert_eq!(dv.f2, "Data!B7");
+    };
+    check(&wb, "Data!A3");
+    let op = CellShift::new((1, 0, 2, 0), Shift::Vertical, true);
+    let before = snapshot_cell_shift_if_metadata(&wb, 0, &op).unwrap();
+    assert!(op.apply(&mut wb, 0));
+    check(&wb, "Data!A5");
+    assert!(before.cell_shift_changed_metadata(&wb));
+    let after = before.capture_after(&wb);
+    let mut undo = UndoStack::new();
+    undo.push_structure("insert", before, after, (0, 1, 0));
+    let undone = undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+    assert!(undone.structural && undone.touched.is_empty());
+    check(&wb, "Data!A3");
+    let redone = undo.redo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+    assert!(redone.structural && redone.touched.is_empty());
+    check(&wb, "Data!A5");
+}
+
+#[test]
 fn csv_binding_follows_row_and_column_edits_and_refresh_after_save() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("data.csv");
@@ -238,8 +294,64 @@ fn structural_undo_refuses_a_later_binding_in_the_affected_rows() {
 }
 
 #[test]
+fn cell_shift_undo_with_only_a_foreign_delta_requires_the_original_source_sheet() {
+    use sheetcore::{
+        cells::Shift,
+        formula::ErrKind,
+        structural::CellShift,
+        undo::{capture, finish},
+    };
+    let mut wb = Workbook::new_blank();
+    wb.sheets.push(Sheet::new("Data"));
+    let formula = "=7+Data!A1";
+    wb.sheet_mut(0).set(
+        0,
+        0,
+        Cell {
+            value: Value::Empty,
+            formula: Some(formula.into()),
+        },
+    );
+    recalc_all_force(&mut wb);
+    assert_eq!(wb.sheet(0).value(0, 0), Value::Number(7.));
+    let foreign = capture(wb.sheet(0), 0, &[(0, 0)]);
+    let source = capture(wb.sheet(1), 1, &[(0, 0)]);
+    assert!(CellShift::new((0, 0, 0, 0), Shift::Vertical, false).apply(&mut wb, 1));
+    assert!(finish(source, wb.sheet(1)).is_empty());
+    let deltas = finish(foreign, wb.sheet(0));
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].sheet, 0);
+    let deleted = deltas[0].after.formula.clone().unwrap();
+    assert!(deleted.contains("#REF!"));
+    let mut undo = UndoStack::new();
+    undo.push_cell_shift("delete", deltas, (1, 0, 0), &wb.sheets);
+    recalc_all_force(&mut wb);
+    let original = wb.sheets.pop().unwrap();
+    for replacement in [None, Some(Sheet::new("Data"))] {
+        if let Some(other) = replacement {
+            assert_ne!(other.identity, original.identity);
+            wb.sheets.push(other);
+        }
+        let blocked = undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+        assert_eq!(blocked.skipped, 1);
+        assert!(blocked.touched.is_empty());
+        assert_eq!(undo.depth(), (1, 0));
+        assert_eq!(wb.sheet(0).formula_of(0, 0), Some(deleted.as_ref()));
+        assert_eq!(wb.sheet(0).value(0, 0), Value::Error(ErrKind::Ref));
+    }
+    wb.sheets[1] = original;
+    let applied = undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+    assert_eq!(applied.skipped, 0);
+    assert_eq!(applied.touched, [(0, 0, 0)]);
+    assert_eq!(undo.depth(), (0, 1));
+    recalc_all_force(&mut wb);
+    assert_eq!(wb.sheet(0).formula_of(0, 0), Some(formula));
+    assert_eq!(wb.sheet(0).value(0, 0), Value::Number(7.));
+}
+
+#[test]
 fn cell_shift_snapshot_restores_split_source_and_leaves_other_sheet_coordinates_alone() {
-    use sheetcore::{cells, structural::apply_cell_shift_wb, undo::snapshot_cell_shift_if_bound};
+    use sheetcore::{cells::Shift, structural::CellShift, undo::snapshot_cell_shift};
     let mut wb = Workbook::new_blank();
     wb.sheets.push(Sheet::new("Other"));
     let coords = wb.sheet(0).coordinate_revision();
@@ -248,21 +360,109 @@ fn cell_shift_snapshot_restores_split_source_and_leaves_other_sheet_coordinates_
     source.cols = 2;
     wb.sources.push(source.clone());
     wb.sheet_mut(0).set(4, 2, number(42.));
-    let rect = (0, 2, 1, 2);
-    assert!(snapshot_cell_shift_if_bound(&wb, 0, (0, 5, 1, 5), false, true).is_none());
-    let before = snapshot_cell_shift_if_bound(&wb, 0, rect, false, true).unwrap();
-    cells::insert(wb.sheet_mut(0), rect, cells::Shift::Vertical, 1);
-    apply_cell_shift_wb(&mut wb, 0, rect, false, true);
-    assert_ne!(coords, wb.sheet(0).coordinate_revision());
+    let op = CellShift::new((0, 2, 1, 2), Shift::Vertical, true);
+    let before = snapshot_cell_shift(&wb, 0, &op);
+    assert!(op.apply(&mut wb, 0));
+    let moved = wb.sheet(0).coordinate_revision();
+    assert_ne!(coords, moved);
+    assert_eq!(wb.sheet(0).value(6, 2), Value::Number(42.));
     assert_eq!(other_coords, wb.sheet(1).coordinate_revision());
     assert!(before.detached_source(&wb));
     let after = before.capture_after(&wb);
     let mut undo = UndoStack::new();
     undo.push_structure("shift", before, after, (0, 0, 2));
     undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+    let restored = wb.sheet(0).coordinate_revision();
+    assert!(![coords, moved].contains(&restored));
     assert_eq!(wb.sources[0], source);
     assert_eq!(wb.sheet(0).value(4, 2), Value::Number(42.));
     undo.redo_workbook(&mut wb, |_, _, _, _| true).unwrap();
     assert!(matches!(wb.sources[0].kind, Kind::Unbound(_)));
-    assert_eq!(wb.sheet(0).value(5, 2), Value::Number(42.));
+    assert_eq!(wb.sheet(0).value(6, 2), Value::Number(42.));
+    assert!(![coords, moved, restored].contains(&wb.sheet(0).coordinate_revision()));
+    assert_eq!(wb.sheet(1).coordinate_revision(), other_coords);
+}
+
+#[test]
+fn band_undo_guards_changed_replies_and_preserves_later_unrelated_threads() {
+    use sheetcore::{
+        CellRef,
+        cells::Shift,
+        notes::{Note, ThreadEntry, ThreadedComment},
+        structural::CellShift,
+        undo::snapshot_cell_shift,
+    };
+    let entry = |text: &str| ThreadEntry {
+        id: sheetcore::notes::new_ooxml_guid(),
+        text: text.into(),
+        author: "test".into(),
+        timestamp: "2026-11-27T00:00:00Z".into(),
+    };
+    let mut wb = Workbook::new_blank();
+    let key = CellRef::new(1, 0);
+    let dest = CellRef::new(3, 0);
+    let original = ThreadedComment {
+        r: key.row,
+        c: key.col,
+        resolved: false,
+        entries: vec![entry("root")],
+    };
+    wb.sheet_mut(0).threads.insert(key, original.clone());
+    let op = CellShift::new((0, 0, 1, 0), Shift::Vertical, true);
+    let before = snapshot_cell_shift(&wb, 0, &op);
+    assert!(op.apply(&mut wb, 0));
+    let after = before.capture_after(&wb);
+    let mut undo = UndoStack::new();
+    undo.push_structure("shift", before, after, (0, 0, 0));
+    wb.sheet_mut(0)
+        .threads
+        .get_mut(&dest)
+        .unwrap()
+        .entries
+        .push(entry("reply"));
+    assert!(undo.undo_workbook(&mut wb, |_, _, _, _| true).is_none());
+    assert_eq!(undo.depth(), (1, 0));
+    assert_eq!(wb.sheet(0).threads[&dest].entries.len(), 2);
+    wb.sheet_mut(0)
+        .threads
+        .get_mut(&dest)
+        .unwrap()
+        .entries
+        .pop();
+    let elsewhere = CellRef::new(8, 2);
+    let other = ThreadedComment {
+        r: elsewhere.row,
+        c: elsewhere.col,
+        resolved: true,
+        entries: vec![entry("later")],
+    };
+    let note = Note {
+        r: elsewhere.row,
+        c: elsewhere.col,
+        text: "later".into(),
+        author: "test".into(),
+    };
+    wb.sheet_mut(0).threads.insert(elsewhere, other.clone());
+    wb.sheet_mut(0).notes.insert(elsewhere, note.clone());
+    wb.sheet_mut(0).notes_dirty = true;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("comments.xlsx");
+    xlsx::save_atomic_with_receipt(&path, &wb)
+        .unwrap()
+        .apply_to(&mut wb);
+    wb.sheet_mut(0).threads_dirty = false;
+    undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+    assert_eq!(wb.sheet(0).threads[&key], original);
+    assert!(wb.sheet(0).threads_dirty);
+    assert_eq!(wb.sheet(0).threads[&elsewhere], other);
+    assert_eq!(wb.sheet(0).notes[&elsewhere], note);
+    xlsx::save_atomic(&path, &wb).unwrap();
+    let reopened = xlsx::load(&path).unwrap();
+    assert_eq!(reopened.sheet(0).threads[&key].entries, original.entries);
+    assert_eq!(reopened.sheet(0).threads[&elsewhere].entries, other.entries);
+    assert!(!reopened.sheet(0).threads.contains_key(&dest));
+    undo.redo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+    assert_eq!(wb.sheet(0).threads[&dest].entries, original.entries);
+    assert_eq!(wb.sheet(0).threads[&elsewhere], other);
+    assert_eq!(wb.sheet(0).notes[&elsewhere], note);
 }

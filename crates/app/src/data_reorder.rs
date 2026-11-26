@@ -183,6 +183,108 @@ fn sort_ready_and_optimistic_style_follow_host_order_on_the_writing_guest() {
 }
 
 #[test]
+fn issue_23_guest_partial_cell_insert_and_undo_sync_cross_sheet_formula() {
+    use sheetcore::{Cell, Value};
+    let env = crate::test_env::TestEnv::new("cell-shift-room");
+    let (mut host, mut guest) = sort_apps(&env);
+    // Supply the same empty second worksheet that both copies of the document would contain.
+    for app in [&mut host, &mut guest] {
+        app.wb.sheets.push(Sheet::new("Other"));
+        assert!(app.wb.sources.is_empty());
+    }
+    host.wb.sheet_mut(1).set(0, 0, Cell {
+        value: Value::Empty, formula: Some("=Sheet1!A2+40".into()),
+    });
+    host.recalc_and_broadcast(&[(1, 0, 0)]);
+    let mut style = sheetcore::style::CellStyle::default();
+    style.italic = true;
+    let id = host.wb.styles.intern(style);
+    host.wb.sheet_mut(0).set_style(3, 0, id); // A4 has only a format.
+    host.broadcast_cell_styles(&[(0, 3, 0)]);
+    let matches = |app: &SheetApp, shifted: bool| {
+        let (occupied, empty, reference) = if shifted { (2, 1, "=Sheet1!A3+40") } else { (1, 2, "=Sheet1!A2+40") };
+        let source = app.wb.sheet(0);
+        let other = app.wb.sheet(1);
+        source.value(0, 0) == Value::Number(2.0)
+            && source.value(occupied, 0) == Value::Number(1.0)
+            && source.value(empty, 0) == Value::Empty
+            && app.wb.styles.get(source.style_of(3, 0)).italic != shifted
+            && app.wb.styles.get(source.style_of(4, 0)).italic == shifted
+            && other.get(0, 0).is_some_and(|cell| cell.formula.as_deref() == Some(reference))
+            && other.value(0, 0) == Value::Number(41.0)
+    };
+    until(&mut host, &mut guest, |h, g| matches(h, false) && matches(g, false));
+    let depth = guest.undo.depth();
+    guest.sel = (1, 0);
+    guest.sel_end = guest.sel;
+    guest.shift_cells(true, false);
+    assert_eq!(guest.undo.depth(), (depth.0 + 1, 0));
+    until(&mut host, &mut guest, |h, g| matches(h, true) && matches(g, true));
+    assert!(guest.apply_undo(false), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| matches(h, false) && matches(g, false));
+    assert!(guest.apply_undo(true), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| matches(h, true) && matches(g, true));
+
+    let number = |v| Cell { value: Value::Number(v), formula: None };
+    host.wb.sheet_mut(0).set(2, 0, number(77.0));
+    host.recalc_and_broadcast(&[(0, 2, 0)]);
+    let conflict = |app: &SheetApp| {
+        let other = app.wb.sheet(1);
+        app.wb.sheet(0).value(1, 0) == Value::Empty
+            && app.wb.sheet(0).value(2, 0) == Value::Number(77.0)
+            && other.get(0, 0).unwrap().formula.as_deref() == Some("=Sheet1!A3+40")
+            && other.value(0, 0) == Value::Number(117.0)
+    };
+    until(&mut host, &mut guest, |h, g| conflict(h) && conflict(g));
+    let history = guest.undo.depth();
+    let revision = guest.wb.sheet(0).coordinate_revision();
+    assert!(!guest.apply_undo(false));
+    assert!(guest.status.contains("已保留历史记录"), "{}", guest.status);
+    assert_eq!(guest.undo.depth(), history);
+    assert_eq!(guest.wb.sheet(0).coordinate_revision(), revision);
+    // Once a later ordinary message arrives, any preceding partial undo would also be visible.
+    guest.wb.sheet_mut(0).set(4, 2, number(9.0));
+    guest.broadcast_cells(&[(0, 4, 2)]);
+    until(&mut host, &mut guest, |h, _| h.wb.sheet(0).value(4, 2) == Value::Number(9.0));
+    assert!(conflict(&host) && conflict(&guest));
+
+    // Restore the expected value under the guest's site, then retry the original history entry.
+    guest.wb.sheet_mut(0).set(2, 0, number(1.0));
+    guest.recalc_and_broadcast(&[(0, 2, 0)]);
+    until(&mut host, &mut guest, |h, g| matches(h, true) && matches(g, true));
+    assert!(guest.apply_undo(false), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| matches(h, false) && matches(g, false));
+    assert_eq!(guest.undo.depth(), (depth.0, 1));
+}
+
+#[test]
+fn partial_cell_insert_in_a_room_rejects_moving_a_note_before_writing() {
+    use sheetcore::{CellRef, Value};
+    let env = crate::test_env::TestEnv::new("cell-shift-room-note-preflight");
+    let (mut host, mut guest) = sort_apps(&env);
+    host.set_comment_cell(0, 1, 0, "keep note", None, false).unwrap();
+    let intact = |app: &SheetApp| {
+        let sh = app.wb.sheet(0);
+        sh.notes.get(&CellRef::new(1, 0)).is_some_and(|note| note.text == "keep note")
+            && !sh.notes.contains_key(&CellRef::new(2, 0))
+            && sh.value(1, 0) == Value::Number(1.0) && sh.value(2, 0) == Value::Empty
+    };
+    until(&mut host, &mut guest, |h, g| intact(h) && intact(g));
+    let history = guest.undo.depth();
+    let coordinate_revision = guest.wb.sheet(0).coordinate_revision();
+    guest.sel = (1, 0);
+    guest.sel_end = guest.sel;
+    guest.shift_cells(true, false);
+    assert!(guest.status.contains("先断开协作"), "{}", guest.status);
+    assert_eq!(guest.undo.depth(), history);
+    assert_eq!(guest.wb.sheet(0).coordinate_revision(), coordinate_revision);
+    guest.wb.sheet_mut(0).set(3, 1, sheetcore::Cell { value: Value::Number(9.0), formula: None });
+    guest.broadcast_cells(&[(0, 3, 1)]);
+    until(&mut host, &mut guest, |h, _| h.wb.sheet(0).value(3, 1) == Value::Number(9.0));
+    assert!(intact(&host) && intact(&guest));
+}
+
+#[test]
 fn negotiated_sort_and_guarded_undo_converge_through_both_apps() {
     use sheetcore::{Cell,Value};
     let env = crate::test_env::TestEnv::new("sort_app_roundtrip");
