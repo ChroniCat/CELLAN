@@ -2120,6 +2120,8 @@ pub struct Workbook {
     pub dirty: bool,
     /// 用户在应用里改过图表的部件名（保存时不要按基准还原这些部件）
     pub chart_edits: Vec<String>,
+    /// 内嵌防篡改审计日志状态（`Arc` 克隆零开销）
+    pub audit: crate::audit::WorkbookAudit,
 }
 
 impl Workbook {
@@ -2156,6 +2158,7 @@ impl Workbook {
             recalc_cell_revs: Vec::new(),
             dirty: false,
             chart_edits: Vec::new(),
+            audit: crate::audit::WorkbookAudit::default(),
             styles: crate::style::StyleTable::new(),
         }
     }

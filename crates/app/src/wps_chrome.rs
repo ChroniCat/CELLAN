@@ -238,6 +238,8 @@ enum FileMenuAction {
     SaveAs,
     PrintPreview,
     ExportPdf,
+    ExportCleanCopy,
+    AuditLog,
     Encrypt,
     Protect,
     Share,
@@ -381,9 +383,15 @@ impl SheetApp {
                         if row(ui, Icon::PdfExport, "导出为 PDF…", "", false, false).clicked() {
                             act = Some(FileMenuAction::ExportPdf);
                         }
+                        if row(ui, Icon::SaveAs, "导出对外干净副本 (.xlsx)…", "", false, false).clicked() {
+                            act = Some(FileMenuAction::ExportCleanCopy);
+                        }
 
                         menu_sep_line(ui);
 
+                        if row(ui, Icon::Lock, "防篡改审计记录…", "", false, false).clicked() {
+                            act = Some(FileMenuAction::AuditLog);
+                        }
                         if row(ui, Icon::Lock, "加密文档", "", false, false).clicked() {
                             act = Some(FileMenuAction::Encrypt);
                         }
@@ -533,6 +541,8 @@ impl SheetApp {
                     self.print_preview = true;
                 }
                 FileMenuAction::ExportPdf => self.export_pdf_dialog(),
+                FileMenuAction::ExportCleanCopy => self.export_clean_copy_dialog(),
+                FileMenuAction::AuditLog => self.open_audit_panel(),
                 FileMenuAction::Encrypt => {
                     self.enc_dlg = Some((String::new(), String::new(), String::new()));
                 }

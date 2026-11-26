@@ -762,6 +762,32 @@ pub enum Msg {
         raw_data: Vec<u8>,
         done: bool,
     },
+    /// 成员宣告并签名自己的防篡改审计身份（Windows账户/机器名/ECDSA P-256 公钥 + 签名证明）
+    AuditIdentity {
+        site: u32,
+        name: String,
+        #[serde(default)]
+        os_user: String,
+        #[serde(default)]
+        machine: String,
+        pubkey_hex: String,
+        sig_hex: String,
+    },
+    /// 协作者对自己本轮变更摘要的独立 ECDSA P-256 联署证明（供宿主写入多人协作提交）
+    AuditAttest {
+        site: u32,
+        doc_id: String,
+        base_seq: u64,
+        changes_digest: String,
+        pubkey_hex: String,
+        sig_hex: String,
+    },
+    /// 宿主向全员同步最新的内嵌防篡改审计日志（用于访客查看完整审计链与刷新本机防回滚水印）
+    AuditSync {
+        doc_id: String,
+        head_seq: u64,
+        payload_b64: String,
+    },
     Bye { site: u32 },
 }
 
@@ -1079,6 +1105,37 @@ impl Msg {
                             && data_b64.len() <= 512 * 1024
                             && raw_data.len() <= 384 * 1024))
             }
+            Msg::AuditIdentity {
+                name,
+                os_user,
+                machine,
+                pubkey_hex,
+                sig_hex,
+                ..
+            } => {
+                name.len() <= 256
+                    && os_user.len() <= 256
+                    && machine.len() <= 256
+                    && pubkey_hex.len() == 128
+                    && sig_hex.len() == 128
+            }
+            Msg::AuditAttest {
+                doc_id,
+                changes_digest,
+                pubkey_hex,
+                sig_hex,
+                ..
+            } => {
+                doc_id.len() <= 64
+                    && changes_digest.len() == 64
+                    && pubkey_hex.len() == 128
+                    && sig_hex.len() == 128
+            }
+            Msg::AuditSync {
+                doc_id,
+                payload_b64,
+                ..
+            } => doc_id.len() <= 64 && payload_b64.len() <= 1024 * 1024,
             Msg::Challenge { .. }
             | Msg::ChallengeSalt { .. }
             | Msg::Denied { .. }
