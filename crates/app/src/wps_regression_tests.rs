@@ -3000,3 +3000,162 @@ fn comments_phase2_ai_agent_inspect_and_manage_comments_with_confirmation_and_un
         "AI 删除已有批注必须请求用户确认: {confirm:?}"
     );
 }
+
+#[test]
+fn comments_editor_window_width_stable_and_sidebar_close_no_tofu() {
+    use sheetcore::model::CellRef;
+    use sheetcore::notes::{Note, ThreadEntry};
+
+    let _env = crate::test_env::TestEnv::new("comments_ui_width_and_close");
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    let mut app = wps_app(&ctx);
+    let mut frame = eframe::Frame::_new_kittest();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.notes.insert(
+            CellRef::new(0, 0),
+            Note { r: 0, c: 0, text: "A1 传统批注".into(), author: "财务甲".into() },
+        );
+        let mut tc = mk_test_thread(
+            20,
+            11,
+            "Administrator@设计部-AI",
+            "34分批退火炉\newfrgwe\nrfegtew\n[2026-11-26 18:55 Administrator@设计部-AI]",
+        );
+        tc.entries.push(ThreadEntry {
+            id: sheetcore::notes::new_ooxml_guid(),
+            author: "Administrator@设计部-AI".into(),
+            timestamp: "2026-11-26T10:55:54Z".into(),
+            text: "2未归口".into(),
+        });
+        tc.resolved = true;
+        sh.threads.insert(CellRef::new(20, 11), tc);
+    }
+
+    let run_frame = |app: &mut SheetApp, ctx: &egui::Context, frame: &mut eframe::Frame, events: Vec<egui::Event>| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1440.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| eframe::App::update(app, ctx, frame),
+        )
+    };
+
+    // 1) 打开 L21 线程批注编辑窗口，连续渲染 20 帧，宽度不得自行递增漂移
+    app.sel = (20, 11);
+    app.sel_end = (20, 11);
+    app.open_note_editor(Some(&ctx));
+    let win_id = egui::Id::new(("note_sticky_editor", 0usize, 20u32, 11u32));
+    let mut widths = Vec::new();
+    for _ in 0..20 {
+        let _ = run_frame(&mut app, &ctx, &mut frame, vec![]);
+        let w = ctx
+            .memory(|m| m.area_rect(win_id))
+            .expect("批注窗口应有有效布局矩形")
+            .width();
+        widths.push(w);
+    }
+    let w_settled = widths[3];
+    let w_last = *widths.last().unwrap();
+    assert!(
+        w_last <= 480.0,
+        "批注编辑窗口不应无限变宽: widths={widths:?}"
+    );
+    assert!(
+        (w_last - w_settled).abs() < 1.0,
+        "批注编辑窗口稳定后多帧不得继续变长: w3={w_settled}, w_last={w_last}, widths={widths:?}"
+    );
+
+    // 2) 展开「自定义常用语」管理行，再连续渲染 20 帧，宽度仍不得自行递增
+    app.comments_panel.phrases_manage_open = true;
+    let mut mgr_widths = Vec::new();
+    for _ in 0..20 {
+        let _ = run_frame(&mut app, &ctx, &mut frame, vec![]);
+        let w = ctx
+            .memory(|m| m.area_rect(win_id))
+            .expect("批注窗口应保持可见")
+            .width();
+        mgr_widths.push(w);
+    }
+    let mw_settled = mgr_widths[3];
+    let mw_last = *mgr_widths.last().unwrap();
+    assert!(
+        mw_last <= 480.0 && (mw_last - mw_settled).abs() < 1.0,
+        "展开自定义常用语后批注窗口仍不得自行变宽: mw3={mw_settled}, mw_last={mw_last}, mgr_widths={mgr_widths:?}"
+    );
+
+    // 3) 关闭批注窗口并打开右侧批注管理侧边栏：不得渲染缺字方框字符 ✕，且矢量关闭按钮可点击关闭
+    app.note_edit = None;
+    app.comments_panel.open = true;
+    let _ = run_frame(&mut app, &ctx, &mut frame, vec![]);
+    let out = run_frame(&mut app, &ctx, &mut frame, vec![]);
+    let mut items = Vec::new();
+    for cs in &out.shapes {
+        collect_shape_texts_with_pos(std::slice::from_ref(&cs.shape), &mut items);
+    }
+    assert!(
+        !items.iter().any(|(t, _)| t.contains('✕')),
+        "批注侧边栏不得使用易缺字呈方框的 ✕ 文本符号"
+    );
+
+    // 验证批注窗口导航箭头等字符在当前字体下是否存在缺字（与 U+FFFD 替换符对比）
+    let tofu_uv = ctx.fonts(|f| {
+        let g = f.layout_no_wrap("\u{FFFD}".into(), egui::FontId::proportional(11.0), Color32::BLACK);
+        g.rows.first().and_then(|r| r.glyphs.first()).map(|gl| gl.uv_rect)
+    });
+    for ch in ['×', '◀', '▶'] {
+        let ch_uv = ctx.fonts(|f| {
+            let g = f.layout_no_wrap(ch.to_string(), egui::FontId::proportional(11.0), Color32::BLACK);
+            g.rows.first().and_then(|r| r.glyphs.first()).map(|gl| gl.uv_rect)
+        });
+        assert_ne!(
+            ch_uv, tofu_uv,
+            "字符 {ch:?} (U+{:04X}) 在当前 UI 字体中缺失（会渲染成方框）",
+            ch as u32
+        );
+    }
+
+    // 定位标题「批注管理 (2)」同行最右侧的关闭按钮并点击验证可关闭面板
+    let hdr_pos = items
+        .iter()
+        .find(|(t, _)| t.contains("批注管理 (2)"))
+        .map(|(_, p)| *p)
+        .expect("侧边栏标题应可见");
+    // 面板贴屏幕右侧（right margin=8，header inner_margin.x=12，24×24 按钮中心在 1440 - 8 - 12 - 12 = 1408）
+    let close_pt = egui::pos2(1408.0, hdr_pos.y + 8.0);
+    let _ = run_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![
+            egui::Event::PointerMoved(close_pt),
+            egui::Event::PointerButton {
+                pos: close_pt,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    let _ = run_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![
+            egui::Event::PointerMoved(close_pt),
+            egui::Event::PointerButton {
+                pos: close_pt,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(!app.comments_panel.open, "点击批注侧边栏矢量关闭按钮应关闭面板");
+}

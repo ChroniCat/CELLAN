@@ -34326,6 +34326,8 @@ fn clear_selection(&mut self) {
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::symmetric(12, 10));
 
+        let max_w = (screen.width() - 24.0).max(init_w);
+        let max_h = (screen.height() - 48.0).max(260.0);
         let win_resp = egui::Window::new(title)
             .id(win_id)
             .frame(sticky_frame)
@@ -34333,6 +34335,8 @@ fn clear_selection(&mut self) {
             .resizable(true)
             .default_width(init_w)
             .min_width(300.0)
+            .max_width(max_w)
+            .max_height(max_h)
             .default_pos(default_pos)
             .open(&mut open)
             .show(ctx, |ui| {
@@ -34443,23 +34447,25 @@ fn clear_selection(&mut self) {
                 });
                 if self.comments_panel.phrases_manage_open {
                     ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.comments_panel.new_phrase_buf)
-                                .desired_width((ui.available_width() - 96.0).max(120.0))
-                                .hint_text("添加自定义财务常用语…"),
-                        );
-                        if ui.small_button("添加").clicked() {
-                            let val = std::mem::take(&mut self.comments_panel.new_phrase_buf);
-                            let _ = self.comments_panel.add_custom_phrase(&val);
-                        }
-                        if !text.trim().is_empty()
-                            && ui
-                                .small_button("存当前")
-                                .on_hover_text("把当前批注正文存为自定义常用语")
-                                .clicked()
-                        {
-                            let _ = self.comments_panel.add_custom_phrase(text.trim());
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if !text.trim().is_empty()
+                                && ui
+                                    .small_button("存当前")
+                                    .on_hover_text("把当前批注正文存为自定义常用语")
+                                    .clicked()
+                            {
+                                let _ = self.comments_panel.add_custom_phrase(text.trim());
+                            }
+                            if ui.small_button("添加").clicked() {
+                                let val = std::mem::take(&mut self.comments_panel.new_phrase_buf);
+                                let _ = self.comments_panel.add_custom_phrase(&val);
+                            }
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.comments_panel.new_phrase_buf)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("添加自定义财务常用语…"),
+                            );
+                        });
                     });
                     if !self.comments_panel.custom_phrases.is_empty() {
                         let mut del_idx = None;
@@ -34528,21 +34534,30 @@ fn clear_selection(&mut self) {
                     });
                 }
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let r_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.note_reply_buf)
-                            .id(reply_id)
-                            .desired_width((ui.available_width() - 62.0).max(160.0))
-                            .hint_text("添加线程回复（Enter 发送）…"),
-                    );
-                    let enter_in_reply = r_resp.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.ctrl && !i.modifiers.command);
-                    if (ui_kit::secondary_button(ui, "回复").clicked() || enter_in_reply)
-                        && !self.note_reply_buf.trim().is_empty()
-                    {
-                        send_reply = true;
-                    }
-                });
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), 32.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let reply_clicked = ui_kit::secondary_button(ui, "回复").clicked();
+                        let r_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.note_reply_buf)
+                                .id(reply_id)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("添加线程回复（Enter 发送）…"),
+                        );
+                        let enter_in_reply = r_resp.lost_focus()
+                            && ui.input(|i| {
+                                i.key_pressed(egui::Key::Enter)
+                                    && !i.modifiers.ctrl
+                                    && !i.modifiers.command
+                            });
+                        if (reply_clicked || enter_in_reply)
+                            && !self.note_reply_buf.trim().is_empty()
+                        {
+                            send_reply = true;
+                        }
+                    },
+                );
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.show_all_comments, "显示全部批注");
