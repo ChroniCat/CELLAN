@@ -2373,6 +2373,16 @@ impl UndoStack {
         !self.undone.is_empty()
     }
 
+    /// 当前撤销栈顶条目的全局唯一 ID（用于审计未提交结构/格式事件与 Ctrl+Z/Ctrl+Y 精确同步）
+    pub fn top_undo_id(&self) -> Option<u64> {
+        self.done.last().map(Entry::id)
+    }
+
+    /// 当前重做栈顶条目的全局唯一 ID
+    pub fn top_redo_id(&self) -> Option<u64> {
+        self.undone.last().map(Entry::id)
+    }
+
     pub fn push_meta(
         &mut self,
         label: impl Into<String>,

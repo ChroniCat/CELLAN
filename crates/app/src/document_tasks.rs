@@ -30,14 +30,33 @@ impl StructuralCalculation {
 
 #[derive(Clone)]
 pub(crate) struct AuditSaveContext {
-    pub baseline: Box<Workbook>,
+    pub baseline: Option<Box<Workbook>>,
     pub committer: sheetcore::audit::AuditAuthor,
     pub keypair: sheetcore::audit::AuditKeyPair,
     pub action: String,
     pub cell_attributions: std::collections::HashMap<(u64, u32, u32), sheetcore::audit::AuditAuthor>,
+    pub merge_attributions: std::collections::HashMap<(u64, (u32, u32, u32, u32)), sheetcore::audit::AuditAuthor>,
     pub bulk_ops: Vec<(String, sheetcore::audit::AuditAuthor, String, String)>,
+    pub structural_ops: Vec<(String, sheetcore::audit::AuditAuthor, sheetcore::structural::Structural)>,
     pub co_signers: Vec<sheetcore::audit::PeerAttestationInput>,
     pub external_gap_hash: Option<String>,
+    /// 本次保存快照捕获的事件游标，供保存完成回执精准消费而不清除飞行期间并发新增的事件
+    pub committed_bulk_seq: u64,
+    pub committed_structural_seq: u64,
+    pub committed_merge_seqs: std::collections::HashMap<(u64, (u32, u32, u32, u32)), u64>,
+    pub committed_attest_seqs: std::collections::HashMap<u32, u64>,
+    pub had_external_gap: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct AuditSaveReceipt {
+    pub baseline: Box<Workbook>,
+    pub committed_bulk_seq: u64,
+    pub committed_structural_seq: u64,
+    pub committed_merge_seqs: std::collections::HashMap<(u64, (u32, u32, u32, u32)), u64>,
+    pub committed_attest_seqs: std::collections::HashMap<u32, u64>,
+    pub consumed_external_gap: bool,
+    pub cleared_for_xls: bool,
 }
 
 #[derive(Default)]
@@ -82,10 +101,10 @@ pub(crate) struct DocumentTasks {
     pub pdf_export: Option<Receiver<Result<(PathBuf, usize), String>>>,
     /// 下一次保存时自动附加防篡改审计提交所需的基线与署名上下文（由 `start_save_checked` 消费）
     pub next_audit_ctx: Option<AuditSaveContext>,
-    /// 后台保存线程回传的新审计基线通道（不改动 `PendingSave` 签名，兼容既有单测）
-    audit_baseline_rx: Option<Receiver<Box<Workbook>>>,
-    /// 最近一次审计保存完成后的新基线快照（供 `main.rs` 推进 `audit_baseline` 与广播 `AuditSync`）
-    pub last_audit_saved_baseline: Option<Box<Workbook>>,
+    /// 后台保存线程回传的新审计基线与消费游标通道（不改动 `PendingSave` 签名，兼容既有单测）
+    audit_baseline_rx: Option<Receiver<AuditSaveReceipt>>,
+    /// 最近一次审计保存完成后的回执快照（供 `main.rs` 精准推进基线、清理已提交事件并广播 `AuditSync`）
+    pub last_audit_saved_receipt: Option<AuditSaveReceipt>,
 }
 
 pub(crate) struct PendingSave {
@@ -529,30 +548,83 @@ impl DocumentTasks {
             let is_xls = target
                 .extension()
                 .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("xls"));
-            let mut audit_committed_baseline: Option<Box<Workbook>> = None;
-            if !is_xls && let Some(ctx) = audit_ctx && let Some(existing_log) = snapshot.audit.log.as_ref() {
-                let delta = sheetcore::audit::compute_net_diff(
-                    &ctx.baseline,
-                    &snapshot,
-                    &ctx.committer,
-                    &ctx.cell_attributions,
-                    &ctx.bulk_ops,
-                );
+            let mut audit_saved_receipt: Option<AuditSaveReceipt> = None;
+            if is_xls {
+                if let Some(ctx) = audit_ctx {
+                    audit_saved_receipt = Some(AuditSaveReceipt {
+                        baseline: Box::new(snapshot.clone()),
+                        committed_bulk_seq: ctx.committed_bulk_seq,
+                        committed_structural_seq: ctx.committed_structural_seq,
+                        committed_merge_seqs: ctx.committed_merge_seqs,
+                        committed_attest_seqs: ctx.committed_attest_seqs,
+                        consumed_external_gap: ctx.had_external_gap,
+                        cleared_for_xls: true,
+                    });
+                }
+            } else if let Some(ctx) = audit_ctx && let Some(existing_log) = snapshot.audit.log.as_ref() {
                 let cur_state_hash = sheetcore::audit::workbook_state_hash(&snapshot);
                 let state_changed = existing_log.head_state_hash() != Some(cur_state_hash.as_str());
-                if !delta.is_empty() || state_changed || ctx.external_gap_hash.is_some() {
-                    let mut next_log = (**existing_log).clone();
-                    match next_log.append_commit(
+                let mut effective_gap = ctx.external_gap_hash.clone();
+                let mut delta = if let Some(base) = ctx.baseline.as_deref() {
+                    sheetcore::audit::compute_net_diff_full(
+                        base,
                         &snapshot,
+                        &ctx.committer,
+                        &ctx.cell_attributions,
+                        &ctx.merge_attributions,
+                        &ctx.bulk_ops,
+                        &ctx.structural_ops,
+                    )
+                } else {
+                    // 防御性兜底：若基线意外缺失且正文状态已变更，绝不允许静默签出“0 格修改 / 核验通过”
+                    let mut d = sheetcore::audit::PendingAuditDelta::default();
+                    for (sheet_name, author, kind, summary) in &ctx.bulk_ops {
+                        d.bulk_ops.push((
+                            sheet_name.clone(),
+                            author.clone(),
+                            kind.clone(),
+                            summary.clone(),
+                            String::new(),
+                        ));
+                    }
+                    d.structural_ops.extend(ctx.structural_ops.iter().cloned());
+                    for sh in &snapshot.sheets {
+                        d.sheet_bindings.push(sheetcore::audit::SheetAuditBinding {
+                            identity: sh.identity,
+                            audit_slot_hint: sh.audit_sheet_idx,
+                            old_name: sh.audit_sheet_idx.map(|_| sh.name.clone()),
+                            new_name: sh.name.clone(),
+                        });
+                    }
+                    if state_changed {
+                        if effective_gap.is_none() {
+                            effective_gap = Some(cur_state_hash.clone());
+                        }
+                        d.bulk_ops.push((
+                            "(工作簿)".into(),
+                            ctx.committer.clone(),
+                            "恢复缺口".into(),
+                            "保存前缺少原已签名基线，本次状态变更无法逐格回溯（已记录状态缺口）".into(),
+                            String::new(),
+                        ));
+                    }
+                    d
+                };
+                if !delta.is_empty() || state_changed || effective_gap.is_some() {
+                    let mut next_log = (**existing_log).clone();
+                    match next_log.append_commit_with_state_hash(
+                        &snapshot,
+                        cur_state_hash,
                         ctx.committer,
                         &ctx.keypair,
                         &ctx.action,
                         &delta,
                         &ctx.co_signers,
-                        ctx.external_gap_hash,
+                        effective_gap,
                         sheetcore::revision::now_ms(),
                     ) {
                         Ok(_) => {
+                            next_log.bind_workbook_sheets(&mut snapshot);
                             snapshot.audit.log = Some(std::sync::Arc::new(next_log));
                             snapshot.audit.stripped_marker = None;
                             snapshot.audit.parse_error = None;
@@ -563,7 +635,16 @@ impl DocumentTasks {
                         }
                     }
                 }
-                audit_committed_baseline = Some(Box::new(snapshot.clone()));
+                let _ = &mut delta;
+                audit_saved_receipt = Some(AuditSaveReceipt {
+                    baseline: Box::new(snapshot.clone()),
+                    committed_bulk_seq: ctx.committed_bulk_seq,
+                    committed_structural_seq: ctx.committed_structural_seq,
+                    committed_merge_seqs: ctx.committed_merge_seqs,
+                    committed_attest_seqs: ctx.committed_attest_seqs,
+                    consumed_external_gap: ctx.had_external_gap,
+                    cleared_for_xls: false,
+                });
             }
             // The core owns the temporary write, history, and atomic replacement.
             if let Some(error) = check_target(&target) {
@@ -572,8 +653,8 @@ impl DocumentTasks {
             }
             let result = sheetcore::xlsx::save_snapshot_with_receipt(&target, snapshot)
                 .map(|(receipt, snapshot)| {
-                    if let (Some(atx), Some(base)) = (audit_base_tx, audit_committed_baseline) {
-                        let _ = atx.send(base);
+                    if let (Some(atx), Some(audit_rcpt)) = (audit_base_tx, audit_saved_receipt) {
+                        let _ = atx.send(audit_rcpt);
                     }
                     (receipt, revisions.map(|revisions| CalculatedSnapshot {
                         revisions, workbook: Box::new(snapshot),
@@ -613,8 +694,8 @@ impl DocumentTasks {
                     self.dirty_recalc_seeds.clear();
                 }
                 receipt.adopt_document(wb, &pending.target, !calculated_on_save || applied);
-                if let Some(base) = audit_rx.and_then(|rx| rx.try_recv().ok()) {
-                    self.last_audit_saved_baseline = Some(base);
+                if let Some(audit_rcpt) = audit_rx.and_then(|rx| rx.try_recv().ok()) {
+                    self.last_audit_saved_receipt = Some(audit_rcpt);
                 }
                 Ok((pending.target, applied))
             }

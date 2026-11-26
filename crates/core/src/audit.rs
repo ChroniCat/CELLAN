@@ -26,7 +26,7 @@ use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -843,6 +843,8 @@ pub struct BlameView {
     pub author: AuditAuthor,
     pub seq: u64,
     pub ts_ms: u64,
+    /// `true` 表示该记录仅来自开启审计时的创世基线（#1），开启审计后尚未发生实际修改
+    pub is_baseline: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -908,6 +910,8 @@ pub struct AuditLog {
     pub max_detailed_commits: u32,
     pub author_dict: Vec<AuditAuthor>,
     pub sheet_dict: Vec<String>,
+    /// 当前存活工作表名称 -> 持久化审计槽位 `sheet_idx`（跨重命名、新建同名表、保存与重开精确识别同一张表）
+    pub live_sheet_slots: Vec<(String, u16)>,
     pub rollups: Vec<AuditRollup>,
     pub commits: Vec<AuditCommit>,
     /// 按 `(sheet_idx, row, col)` 严格升序排列的单元格最后修改溯源表
@@ -935,10 +939,21 @@ struct AuditLogHeader {
     author_dict: Vec<AuditAuthor>,
     #[serde(rename = "sd")]
     sheet_dict: Vec<String>,
+    #[serde(rename = "ls", default, skip_serializing_if = "Vec::is_empty")]
+    live_sheet_slots: Vec<(String, u16)>,
     #[serde(rename = "ro", default, skip_serializing_if = "Vec::is_empty")]
     rollups: Vec<AuditRollup>,
     #[serde(rename = "cm", default, skip_serializing_if = "Vec::is_empty")]
     commits: Vec<AuditCommit>,
+}
+
+/// 当前工作簿单张表相对上次已提交基线的持久槽位绑定信息
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SheetAuditBinding {
+    pub identity: u64,
+    pub audit_slot_hint: Option<u16>,
+    pub old_name: Option<String>,
+    pub new_name: String,
 }
 
 /// 本次保存相比上次已落盘基线的净变更集
@@ -948,11 +963,15 @@ pub struct PendingAuditDelta {
     pub cells: Vec<(String, u32, u32, AuditSnap, AuditSnap, AuditAuthor)>,
     /// `(sheet_name, author, kind, summary, range_digest)`
     pub bulk_ops: Vec<(String, AuditAuthor, String, String, String)>,
+    /// 当前工作簿所有存活表的槽位继承/新建描述（用于重命名与新建同名表防串号）
+    pub sheet_bindings: Vec<SheetAuditBinding>,
+    /// 本次保存前最终留存（未被撤销）的插删行列结构操作：`(sheet_name, author, Structural)`
+    pub structural_ops: Vec<(String, AuditAuthor, crate::structural::Structural)>,
 }
 
 impl PendingAuditDelta {
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty() && self.bulk_ops.is_empty()
+        self.cells.is_empty() && self.bulk_ops.is_empty() && self.structural_ops.is_empty()
     }
 }
 
@@ -1040,6 +1059,13 @@ pub struct ColdArchiveVerifyResult {
 // 规范化业务数据状态哈希（State Root）
 // ---------------------------------------------------------------------------
 
+/// 规范化自定义名称公式正文：与 `patch::write_user_names` 对齐，剥离首尾空白及前导 `=`，
+/// 避免内存带 `=`（如 `=0.05`）而写入 OOXML 后不带 `=`（`0.05`）导致 CELLAN 保存后重开误报外部修改。
+#[inline]
+pub fn canonical_defined_name_formula(f: &str) -> &str {
+    f.trim().trim_start_matches('=').trim()
+}
+
 /// 计算整本工作簿业务数据的规范化 SHA-256 哈希。
 ///
 /// 覆盖：日期体系、工作簿保护、自定义名称（不含内部 `_sc_*`）、工作表顺序/名称/可见性/保护/合并区、
@@ -1059,12 +1085,18 @@ pub fn workbook_state_hash(wb: &Workbook) -> String {
         None => h.update([0u8]),
     }
 
-    // 自定义名称（过滤内部保留前缀 _sc_ 与 _xlnm._FilterDatabase 等易变项）
+    // 自定义名称（过滤内部保留前缀 _sc_ 与 _xlnm._FilterDatabase 等易变项，与 OOXML 规范对齐剥离前导 '='）
     let mut names: Vec<(&str, i32, &str)> = wb
         .names
         .iter()
         .filter(|(n, _, _)| !n.starts_with("_sc_") && !n.eq_ignore_ascii_case("_xlnm._FilterDatabase"))
-        .map(|(n, scope, f)| (n.as_str(), scope.map(|i| i as i32).unwrap_or(-1), f.trim()))
+        .map(|(n, scope, f)| {
+            (
+                n.as_str(),
+                scope.map(|i| i as i32).unwrap_or(-1),
+                canonical_defined_name_formula(f),
+            )
+        })
         .collect();
     names.sort_unstable();
     h.update((names.len() as u32).to_le_bytes());
@@ -1133,6 +1165,28 @@ pub fn compute_net_diff(
     cell_attributions: &HashMap<(u64, u32, u32), AuditAuthor>,
     extra_bulk_ops: &[(String, AuditAuthor, String, String)],
 ) -> PendingAuditDelta {
+    compute_net_diff_full(
+        baseline,
+        current,
+        default_author,
+        cell_attributions,
+        &HashMap::new(),
+        extra_bulk_ops,
+        &[],
+    )
+}
+
+/// 完整版净差计算：额外支持按合并区域精确归属作者（协作访客合并不再误归宿主）以及携带待落盘结构操作。
+#[allow(clippy::too_many_arguments)]
+pub fn compute_net_diff_full(
+    baseline: &Workbook,
+    current: &Workbook,
+    default_author: &AuditAuthor,
+    cell_attributions: &HashMap<(u64, u32, u32), AuditAuthor>,
+    merge_attributions: &HashMap<(u64, (u32, u32, u32, u32)), AuditAuthor>,
+    extra_bulk_ops: &[(String, AuditAuthor, String, String)],
+    structural_ops: &[(String, AuditAuthor, crate::structural::Structural)],
+) -> PendingAuditDelta {
     let mut delta = PendingAuditDelta::default();
     for (sheet_name, author, kind, summary) in extra_bulk_ops {
         delta.bulk_ops.push((
@@ -1143,10 +1197,22 @@ pub fn compute_net_diff(
             String::new(),
         ));
     }
+    delta.structural_ops.extend(structural_ops.iter().cloned());
 
     // 按 identity 匹配基准表
     let base_by_id: HashMap<u64, &Sheet> = baseline.sheets.iter().map(|s| (s.identity, s)).collect();
     let cur_ids: HashSet<u64> = current.sheets.iter().map(|s| s.identity).collect();
+
+    // 记录当前所有存活表的槽位绑定（供 append_commit 精确区分重命名与新建同名表）
+    for csh in &current.sheets {
+        let base_sh = base_by_id.get(&csh.identity).copied();
+        delta.sheet_bindings.push(SheetAuditBinding {
+            identity: csh.identity,
+            audit_slot_hint: csh.audit_sheet_idx.or_else(|| base_sh.and_then(|b| b.audit_sheet_idx)),
+            old_name: base_sh.map(|b| b.name.clone()),
+            new_name: csh.name.clone(),
+        });
+    }
 
     // 删除的工作表
     for bsh in &baseline.sheets {
@@ -1159,6 +1225,58 @@ pub fn compute_net_diff(
                 String::new(),
             ));
         }
+    }
+
+    // 自定义名称变更（与 workbook_state_hash 使用同一套规范化规则）
+    let canon_names = |wb: &Workbook| -> BTreeMap<(String, Option<usize>), String> {
+        wb.names
+            .iter()
+            .filter(|(n, _, _)| !n.starts_with("_sc_") && !n.eq_ignore_ascii_case("_xlnm._FilterDatabase"))
+            .map(|(n, sc, f)| ((n.clone(), *sc), canonical_defined_name_formula(f).to_string()))
+            .collect()
+    };
+    let b_names = canon_names(baseline);
+    let c_names = canon_names(current);
+    if b_names != c_names {
+        let mut added = 0usize;
+        let mut changed = 0usize;
+        let mut removed = 0usize;
+        let mut sample = Vec::new();
+        for (k, v) in &c_names {
+            match b_names.get(k) {
+                None => {
+                    added += 1;
+                    if sample.len() < 3 {
+                        sample.push(format!("+{}", k.0));
+                    }
+                }
+                Some(old_v) if old_v != v => {
+                    changed += 1;
+                    if sample.len() < 3 {
+                        sample.push(format!("~{}", k.0));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for k in b_names.keys() {
+            if !c_names.contains_key(k) {
+                removed += 1;
+                if sample.len() < 3 {
+                    sample.push(format!("-{}", k.0));
+                }
+            }
+        }
+        delta.bulk_ops.push((
+            "(工作簿)".into(),
+            default_author.clone(),
+            "名称变更".into(),
+            format!(
+                "自定义名称变更（新增 {added} / 修改 {changed} / 删除 {removed}：{}）",
+                sample.join("、")
+            ),
+            String::new(),
+        ));
     }
 
     // 工作簿保护/加密变更
@@ -1246,21 +1364,63 @@ pub fn compute_net_diff(
             ));
         }
 
-        // 合并区变更
+        // 合并区变更：逐块对比并按真实操作者（支持协作访客归属）分组记录
         if bsh.merges.len() != csh.merges.len()
             || bsh.merges.iter().ne(csh.merges.iter())
         {
-            delta.bulk_ops.push((
-                csh.name.clone(),
-                default_author.clone(),
-                "结构变更".into(),
-                format!(
-                    "合并区域变更（{} → {} 处）",
-                    bsh.merges.len(),
-                    csh.merges.len()
-                ),
-                String::new(),
-            ));
+            let b_set: BTreeSet<(u32, u32, u32, u32)> = bsh.merges.iter().copied().collect();
+            let c_set: BTreeSet<(u32, u32, u32, u32)> = csh.merges.iter().copied().collect();
+            let mut per_author_merges: Vec<(AuditAuthor, Vec<String>)> = Vec::new();
+            let mut push_merge = |author: AuditAuthor, desc: String| {
+                if let Some((_, list)) = per_author_merges.iter_mut().find(|(a, _)| *a == author) {
+                    list.push(desc);
+                } else {
+                    per_author_merges.push((author, vec![desc]));
+                }
+            };
+            for &rect in c_set.difference(&b_set) {
+                let au = merge_attributions
+                    .get(&(csh.identity, rect))
+                    .unwrap_or(default_author)
+                    .clone();
+                let desc = format!(
+                    "合并 {}:{}",
+                    crate::model::cell_name(rect.0, rect.1),
+                    crate::model::cell_name(rect.2, rect.3)
+                );
+                push_merge(au, desc);
+            }
+            for &rect in b_set.difference(&c_set) {
+                let au = merge_attributions
+                    .get(&(csh.identity, rect))
+                    .unwrap_or(default_author)
+                    .clone();
+                let desc = format!(
+                    "取消合并 {}:{}",
+                    crate::model::cell_name(rect.0, rect.1),
+                    crate::model::cell_name(rect.2, rect.3)
+                );
+                push_merge(au, desc);
+            }
+            for (au, items) in per_author_merges {
+                let preview = if items.len() <= 3 {
+                    items.join("、")
+                } else {
+                    format!("{} 等 {} 处", items[..3].join("、"), items.len())
+                };
+                delta.bulk_ops.push((
+                    csh.name.clone(),
+                    au,
+                    "结构变更".into(),
+                    format!(
+                        "合并区域变更（{} → {} 处：{}）",
+                        bsh.merges.len(),
+                        csh.merges.len(),
+                        preview
+                    ),
+                    String::new(),
+                ));
+            }
         }
 
         // 页级跳过（CoW O(1) 比对！）
@@ -1428,6 +1588,7 @@ impl AuditLog {
             max_detailed_commits: DEFAULT_MAX_DETAILED_COMMITS,
             author_dict: Vec::new(),
             sheet_dict: Vec::new(),
+            live_sheet_slots: Vec::new(),
             rollups: Vec::new(),
             commits: Vec::new(),
             blame: Vec::new(),
@@ -1469,10 +1630,15 @@ impl AuditLog {
         commit.sig_hex = keypair.sign_digest(&digest)?;
         log.commits.push(commit);
 
-        // 为现有非空单元格建立初始基线 Blame（若不超过上限）
+        // 为现有每张工作表分配独立持久化槽位，再为非空单元格建立初始基线 Blame（若不超过上限）
         let mut blame = Vec::new();
-        'outer: for sh in &wb.sheets {
-            let si = log.intern_sheet(&sh.name);
+        let mut sheet_slots = Vec::with_capacity(wb.sheets.len());
+        for sh in &wb.sheets {
+            let si = log.alloc_new_sheet_slot(&sh.name);
+            log.live_sheet_slots.push((sh.name.clone(), si));
+            sheet_slots.push(si);
+        }
+        'outer: for (sh, &si) in wb.sheets.iter().zip(&sheet_slots) {
             for (cref, view) in sh.iter_views() {
                 if matches!(AuditSnap::from_cell_view(Some(view)), AuditSnap::Empty) {
                     continue;
@@ -1538,9 +1704,16 @@ impl AuditLog {
     }
 
     pub fn intern_sheet(&mut self, name: &str) -> u16 {
+        if let Some((_, si)) = self.live_sheet_slots.iter().find(|(n, _)| n == name) {
+            return *si;
+        }
         if let Some(pos) = self.sheet_dict.iter().position(|s| s == name) {
             return pos as u16;
         }
+        self.alloc_new_sheet_slot(name)
+    }
+
+    fn alloc_new_sheet_slot(&mut self, name: &str) -> u16 {
         let idx = self.sheet_dict.len().min(u16::MAX as usize) as u16;
         if self.sheet_dict.len() < u16::MAX as usize {
             self.sheet_dict.push(name.to_string());
@@ -1548,23 +1721,61 @@ impl AuditLog {
         idx
     }
 
+    /// 将当前已提交日志中的存活工作表槽位绑定回 `wb.sheets[*].audit_sheet_idx`，
+    /// 使工作表即使在内存中被重命名、重排，也能始终追踪同一逻辑表。
+    pub fn bind_workbook_sheets(&self, wb: &mut Workbook) {
+        for sh in &mut wb.sheets {
+            sh.audit_sheet_idx = self.resolve_sheet_slot_by_name(&sh.name);
+        }
+    }
+
+    /// 按当前存活工作表名解析持久槽位（严格区分重命名旧表与新建同名表）。
+    pub fn resolve_sheet_slot_by_name(&self, name: &str) -> Option<u16> {
+        if !self.live_sheet_slots.is_empty() {
+            return self
+                .live_sheet_slots
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, si)| *si);
+        }
+        self.sheet_dict
+            .iter()
+            .position(|s| s == name)
+            .map(|i| i as u16)
+    }
+
+    /// 在活动工作簿中解析某张 `Sheet` 的持久槽位（支持未保存前刚改名/新建同名表的实时查询）。
+    pub fn resolve_sheet_slot_in_wb(&self, wb: &Workbook, sheet: &Sheet) -> Option<u16> {
+        if let Some(si) = sheet.audit_sheet_idx {
+            return Some(si);
+        }
+        let cand = self.resolve_sheet_slot_by_name(&sheet.name)?;
+        if wb
+            .sheets
+            .iter()
+            .any(|other| other.identity != sheet.identity && other.audit_sheet_idx == Some(cand))
+        {
+            return None;
+        }
+        Some(cand)
+    }
+
     pub fn author_of(&self, idx: u16) -> Option<&AuditAuthor> {
         self.author_dict.get(idx as usize)
     }
 
     pub fn sheet_of(&self, idx: u16) -> &str {
+        if let Some((cur_name, _)) = self.live_sheet_slots.iter().find(|(_, s)| *s == idx) {
+            return cur_name.as_str();
+        }
         self.sheet_dict
             .get(idx as usize)
             .map(|s| s.as_str())
             .unwrap_or("?")
     }
 
-    /// 结构体（插删行列）同步平移 Blame 坐标，确保行插入后单元格溯源仍对准真实数据
-    pub fn apply_structural_shift(&mut self, sheet_name: &str, op: &crate::structural::Structural) {
-        let Some(si) = self.sheet_dict.iter().position(|s| s == sheet_name) else {
-            return;
-        };
-        let si = si as u16;
+    /// 按持久槽位同步平移 Blame 坐标，确保插删行列后单元格溯源仍对准真实数据
+    pub fn apply_structural_shift_slot(&mut self, si: u16, op: &crate::structural::Structural) {
         let mut next = Vec::with_capacity(self.blame.len());
         for mut b in std::mem::take(&mut self.blame) {
             if b.sheet_idx == si {
@@ -1581,6 +1792,74 @@ impl AuditLog {
         self.blame = next;
     }
 
+    /// 按表名同步平移 Blame 坐标（兼容旧调用方）
+    pub fn apply_structural_shift(&mut self, sheet_name: &str, op: &crate::structural::Structural) {
+        let Some(si) = self.resolve_sheet_slot_by_name(sheet_name) else {
+            return;
+        };
+        self.apply_structural_shift_slot(si, op);
+    }
+
+    /// 根据本次提交的 `sheet_bindings` 与 `wb.sheets` 刷新 `live_sheet_slots`，
+    /// 返回 `(当前表名 -> 持久槽位, 变动前旧表名 -> 持久槽位)`。
+    fn reconcile_sheet_slots(
+        &mut self,
+        wb: &Workbook,
+        bindings: &[SheetAuditBinding],
+    ) -> (HashMap<String, u16>, HashMap<String, u16>) {
+        // 兼容旧版 v1.82 日志（live_sheet_slots 为空时从 sheet_dict 反推）
+        let prev_live: HashMap<String, u16> = if !self.live_sheet_slots.is_empty() {
+            self.live_sheet_slots.iter().cloned().collect()
+        } else {
+            self.sheet_dict
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.as_str() != "(工作簿)")
+                .map(|(i, n)| (n.clone(), i as u16))
+                .collect()
+        };
+
+        let mut used_slots: HashSet<u16> = HashSet::new();
+        let mut new_live: Vec<(String, u16)> = Vec::with_capacity(wb.sheets.len());
+        let mut live_by_name: HashMap<String, u16> = HashMap::with_capacity(wb.sheets.len());
+
+        // 第一遍：先保留已绑定旧槽位的存活表（包括重命名后的旧表），确保新表绝不会抢占旧槽位
+        let mut resolved: Vec<Option<u16>> = vec![None; wb.sheets.len()];
+        for (i, sh) in wb.sheets.iter().enumerate() {
+            let bind = bindings.iter().find(|b| b.identity == sh.identity);
+            let existing = if let Some(b) = bind {
+                if b.old_name.is_some() {
+                    b.audit_slot_hint
+                        .or_else(|| b.old_name.as_deref().and_then(|o| prev_live.get(o).copied()))
+                } else {
+                    // 明确为新建/复制表：绝不继承任何旧槽位
+                    None
+                }
+            } else {
+                sh.audit_sheet_idx
+                    .or_else(|| prev_live.get(&sh.name).copied())
+            };
+            if let Some(si) = existing {
+                if used_slots.insert(si) {
+                    resolved[i] = Some(si);
+                }
+            }
+        }
+
+        // 第二遍：为所有新建表分配全新的 sheet_dict 槽位
+        for (i, sh) in wb.sheets.iter().enumerate() {
+            let si = match resolved[i] {
+                Some(si) => si,
+                None => self.alloc_new_sheet_slot(&sh.name),
+            };
+            new_live.push((sh.name.clone(), si));
+            live_by_name.insert(sh.name.clone(), si);
+        }
+
+        self.live_sheet_slots = new_live;
+        (live_by_name, prev_live)
+    }
+
     /// 追加一条经 ECDSA P-256 签名的防篡改提交，并自动维护 Blame 与滚动压缩上限。
     #[allow(clippy::too_many_arguments)]
     pub fn append_commit(
@@ -1595,9 +1874,54 @@ impl AuditLog {
         ts_ms: u64,
     ) -> Result<&AuditCommit> {
         let state_hash = workbook_state_hash(wb);
+        self.append_commit_with_state_hash(
+            wb,
+            state_hash,
+            committer,
+            keypair,
+            action,
+            delta,
+            co_signers_in,
+            external_gap_hash,
+            ts_ms,
+        )
+    }
+
+    /// 同 `append_commit`，但复用调用方已计算的 `state_hash`，避免保存路径对大工作簿重复全量哈希扫描。
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_commit_with_state_hash(
+        &mut self,
+        wb: &Workbook,
+        state_hash: String,
+        committer: AuditAuthor,
+        keypair: &AuditKeyPair,
+        action: &str,
+        delta: &PendingAuditDelta,
+        co_signers_in: &[PeerAttestationInput],
+        external_gap_hash: Option<String>,
+        ts_ms: u64,
+    ) -> Result<&AuditCommit> {
         let prev_hash = self.head_hash().to_string();
         let seq = self.head_seq().saturating_add(1);
         let committer_idx = self.intern_author(committer.clone());
+
+        // 1. 刷新存活工作表持久槽位映射（重命名继承旧槽位，新建同名表分配全新槽位）
+        let (live_by_name, prev_live) = self.reconcile_sheet_slots(wb, &delta.sheet_bindings);
+        let resolve_slot = |log: &mut AuditLog, name: &str| -> u16 {
+            if let Some(&si) = live_by_name.get(name) {
+                return si;
+            }
+            if let Some(&si) = prev_live.get(name) {
+                return si;
+            }
+            log.intern_sheet(name)
+        };
+
+        // 2. 仅在落盘签名时将留存（未被撤销）的插删行列操作应用到 Blame 坐标
+        for (sheet_name, _, op) in &delta.structural_ops {
+            let si = resolve_slot(self, sheet_name);
+            self.apply_structural_shift_slot(si, op);
+        }
 
         let total_cell_changes = delta.cells.len() as u32;
         let mut kept_cells = Vec::with_capacity(delta.cells.len().min(MAX_COMMIT_CELLS));
@@ -1607,11 +1931,12 @@ impl AuditLog {
             h
         });
 
-        // 统计每位非提交者作者的单元格数
+        // 统计每位非提交者作者的单元格数与批量事件
         let mut per_author_counts: HashMap<u16, u32> = HashMap::new();
         let mut per_author_cells: HashMap<u16, Vec<(String, u32, u32, AuditSnap, AuditSnap)>> = HashMap::new();
+        let mut per_author_has_bulk: HashSet<u16> = HashSet::new();
 
-        // 更新 Blame 映射
+        // 更新 Blame 映射（所有本次真实修改无条件写入，超限时优先淘汰最老基线 #1）
         let mut blame_map: BTreeMap<(u16, u32, u32), (u16, u64, u64)> = self
             .blame
             .iter()
@@ -1619,7 +1944,7 @@ impl AuditLog {
             .collect();
 
         for (idx, (sheet_name, row, col, before, after, author)) in delta.cells.iter().enumerate() {
-            let si = self.intern_sheet(sheet_name);
+            let si = resolve_slot(self, sheet_name);
             let au = self.intern_author(author.clone());
             if au != committer_idx {
                 *per_author_counts.entry(au).or_insert(0) += 1;
@@ -1631,9 +1956,7 @@ impl AuditLog {
                     after.clone(),
                 ));
             }
-            if blame_map.len() < MAX_BLAME_ENTRIES || blame_map.contains_key(&(si, *row, *col)) {
-                blame_map.insert((si, *row, *col), (au, seq, ts_ms));
-            }
+            blame_map.insert((si, *row, *col), (au, seq, ts_ms));
             if idx < MAX_COMMIT_CELLS {
                 kept_cells.push(AuditCellChange {
                     sheet_idx: si,
@@ -1657,12 +1980,28 @@ impl AuditLog {
             .map(|h| hex_encode(&h.finalize()))
             .unwrap_or_default();
 
-        let mut bulk_ops = Vec::with_capacity(delta.bulk_ops.len() + 1);
-        for (sheet_name, author, kind, summary, range_digest) in &delta.bulk_ops {
-            let si = self.intern_sheet(sheet_name);
+        let mut bulk_ops = Vec::with_capacity(delta.bulk_ops.len() + delta.structural_ops.len() + 1);
+        for (sheet_name, author, op) in &delta.structural_ops {
+            let si = resolve_slot(self, sheet_name);
             let au = self.intern_author(author.clone());
             if au != committer_idx {
                 per_author_counts.entry(au).or_insert(0);
+                per_author_has_bulk.insert(au);
+            }
+            bulk_ops.push(AuditBulkOp {
+                author_idx: au,
+                sheet_idx: si,
+                kind: "结构变更".into(),
+                summary: op.label(),
+                range_digest: String::new(),
+            });
+        }
+        for (sheet_name, author, kind, summary, range_digest) in &delta.bulk_ops {
+            let si = resolve_slot(self, sheet_name);
+            let au = self.intern_author(author.clone());
+            if au != committer_idx {
+                per_author_counts.entry(au).or_insert(0);
+                per_author_has_bulk.insert(au);
             }
             bulk_ops.push(AuditBulkOp {
                 author_idx: au,
@@ -1688,38 +2027,59 @@ impl AuditLog {
             });
         }
 
-        // 组装协作联署记录
-        let mut co_signers = Vec::new();
-        let mut handled_authors: HashSet<u16> = HashSet::new();
+        // 3. 严格核对并组装协作联署记录：
+        // 仅当远端联署摘要与该作者最终落盘的单元格集合完全一致且 ECDSA 验签通过时，才标记 `attested_by_peer = true`；
+        // 若期间有他人覆写导致最终集合变化，则如实降级为宿主代签并写入真实集合摘要，避免“已联署”与最终修改集失配。
+        let mut attest_by_pubkey: HashMap<String, &PeerAttestationInput> = HashMap::new();
         for inp in co_signers_in {
-            let au = self.intern_author(inp.author.clone());
-            if au == committer_idx || !handled_authors.insert(au) {
-                continue;
+            if !inp.author.pubkey_hex.is_empty() {
+                attest_by_pubkey.insert(inp.author.pubkey_hex.to_ascii_lowercase(), inp);
             }
-            let cnt = per_author_counts.get(&au).copied().unwrap_or(0);
-            co_signers.push(CoSignerAttestation {
-                author_idx: au,
-                change_count: cnt,
-                changes_digest: inp.changes_digest.clone(),
-                sig_hex: inp.sig_hex.clone(),
-                attested_by_peer: inp.attested_by_peer,
-            });
         }
+        let mut co_signers = Vec::new();
         for (au, cnt) in per_author_counts {
-            if au == committer_idx || !handled_authors.insert(au) {
+            if au == committer_idx {
                 continue;
             }
-            let digest_bytes = per_author_cells
+            if cnt == 0 && !per_author_has_bulk.contains(&au) {
+                continue;
+            }
+            let expected_digest_bytes = per_author_cells
                 .get(&au)
+                .filter(|c| !c.is_empty())
                 .map(|c| author_contribution_digest(&self.doc_id, seq.saturating_sub(1), c))
                 .unwrap_or([0u8; 32]);
-            co_signers.push(CoSignerAttestation {
-                author_idx: au,
-                change_count: cnt,
-                changes_digest: hex_encode(&digest_bytes),
-                sig_hex: String::new(),
-                attested_by_peer: false,
-            });
+            let expected_digest_hex = hex_encode(&expected_digest_bytes);
+            let author_pk = self
+                .author_of(au)
+                .map(|a| a.pubkey_hex.to_ascii_lowercase())
+                .unwrap_or_default();
+            let matched_attest = if cnt > 0 && !author_pk.is_empty() {
+                attest_by_pubkey.get(&author_pk).copied().filter(|inp| {
+                    inp.attested_by_peer
+                        && inp.changes_digest.eq_ignore_ascii_case(&expected_digest_hex)
+                        && verify_digest_hex(&author_pk, &expected_digest_bytes, &inp.sig_hex)
+                })
+            } else {
+                None
+            };
+            if let Some(inp) = matched_attest {
+                co_signers.push(CoSignerAttestation {
+                    author_idx: au,
+                    change_count: cnt,
+                    changes_digest: expected_digest_hex,
+                    sig_hex: inp.sig_hex.clone(),
+                    attested_by_peer: true,
+                });
+            } else {
+                co_signers.push(CoSignerAttestation {
+                    author_idx: au,
+                    change_count: cnt,
+                    changes_digest: expected_digest_hex,
+                    sig_hex: String::new(),
+                    attested_by_peer: false,
+                });
+            }
         }
         co_signers.sort_by_key(|c| c.author_idx);
 
@@ -1744,8 +2104,8 @@ impl AuditLog {
         commit.sig_hex = keypair.sign_digest(&digest)?;
         self.commits.push(commit);
 
-        // 重建有序 Blame
-        self.blame = blame_map
+        // 4. 重建有序 Blame；若超过 MAX_BLAME_ENTRIES，优先淘汰最老的 (seq, ts_ms)（例如 #1 创世基线），确保最新真实修改不丢失
+        let mut next_blame: Vec<BlameRecord> = blame_map
             .into_iter()
             .map(|((sheet_idx, row, col), (author_idx, seq, ts_ms))| BlameRecord {
                 sheet_idx,
@@ -1756,6 +2116,20 @@ impl AuditLog {
                 ts_ms,
             })
             .collect();
+        if next_blame.len() > MAX_BLAME_ENTRIES {
+            let excess = next_blame.len() - MAX_BLAME_ENTRIES;
+            let mut by_age: Vec<usize> = (0..next_blame.len()).collect();
+            by_age.sort_unstable_by_key(|&i| (next_blame[i].seq, next_blame[i].ts_ms));
+            let drop_set: HashSet<usize> = by_age.into_iter().take(excess).collect();
+            let mut kept = Vec::with_capacity(MAX_BLAME_ENTRIES);
+            for (i, rec) in next_blame.into_iter().enumerate() {
+                if !drop_set.contains(&i) {
+                    kept.push(rec);
+                }
+            }
+            next_blame = kept;
+        }
+        self.blame = next_blame;
 
         // 若超限，自动执行滚动折叠（保留链条连续性，同时产生可导出冷归档包）
         self.compact_if_needed(committer_idx, keypair, ts_ms)?;
@@ -1860,28 +2234,60 @@ impl AuditLog {
         Ok(compacted_any)
     }
 
-    /// O(log N) 查询某格最后修改人（即使原明细早已滚动折叠也能精准回答）
-    pub fn lookup_blame(&self, sheet_name: &str, row: u32, col: u32) -> Option<BlameView> {
-        let si = self.sheet_dict.iter().position(|s| s == sheet_name)? as u16;
-        let idx = self
+    /// 按持久槽位 O(log N) 查询某格最后修改人；若超出 Blame 索引上限被裁剪，则自动回退检索近期详细提交窗口
+    pub fn lookup_blame_by_slot(&self, si: u16, row: u32, col: u32) -> Option<BlameView> {
+        if let Ok(idx) = self
             .blame
             .binary_search_by_key(&(si, row, col), |b| (b.sheet_idx, b.row, b.col))
-            .ok()?;
-        let rec = self.blame[idx];
-        let author = self.author_of(rec.author_idx)?.clone();
-        Some(BlameView {
-            author,
-            seq: rec.seq,
-            ts_ms: rec.ts_ms,
-        })
+        {
+            let rec = self.blame[idx];
+            if let Some(author) = self.author_of(rec.author_idx) {
+                return Some(BlameView {
+                    author: author.clone(),
+                    seq: rec.seq,
+                    ts_ms: rec.ts_ms,
+                    is_baseline: rec.seq == 1,
+                });
+            }
+        }
+        // 回退补查近期详细提交窗口（防止超过 10 万格 Blame 上限时近期修改查不到作者）
+        for c in self.commits.iter().rev() {
+            for ch in &c.cells {
+                if ch.sheet_idx == si && ch.row == row && ch.col == col {
+                    if let Some(author) = self.author_of(ch.author_idx) {
+                        return Some(BlameView {
+                            author: author.clone(),
+                            seq: c.seq,
+                            ts_ms: c.ts_ms,
+                            is_baseline: c.seq == 1,
+                        });
+                    }
+                }
+            }
+        }
+        None
     }
 
-    /// 查询当前内嵌明细窗口中所有涉及 `(sheet_name, row, col)` 的修改历史（新在前）
-    pub fn cell_history(&self, sheet_name: &str, row: u32, col: u32) -> Vec<CellHistoryHit> {
-        let Some(si) = self.sheet_dict.iter().position(|s| s == sheet_name) else {
-            return Vec::new();
-        };
-        let si = si as u16;
+    /// O(log N) 查询某格最后修改人（优先按 `live_sheet_slots` 解析当前工作表槽位，不与已改名/已删除旧表串号）
+    pub fn lookup_blame(&self, sheet_name: &str, row: u32, col: u32) -> Option<BlameView> {
+        let si = self.resolve_sheet_slot_by_name(sheet_name)?;
+        self.lookup_blame_by_slot(si, row, col)
+    }
+
+    /// 在活动工作簿上下文中查询某格最后修改人（即使工作表刚改名尚未保存也能精准命中）
+    pub fn lookup_blame_for_sheet(
+        &self,
+        wb: &Workbook,
+        sheet: &Sheet,
+        row: u32,
+        col: u32,
+    ) -> Option<BlameView> {
+        let si = self.resolve_sheet_slot_in_wb(wb, sheet)?;
+        self.lookup_blame_by_slot(si, row, col)
+    }
+
+    /// 按持久槽位查询当前内嵌明细窗口中所有涉及 `(si, row, col)` 的修改历史（新在前）
+    pub fn cell_history_by_slot(&self, si: u16, row: u32, col: u32) -> Vec<CellHistoryHit> {
         let mut out = Vec::new();
         for c in self.commits.iter().rev() {
             for ch in &c.cells {
@@ -1900,6 +2306,28 @@ impl AuditLog {
             }
         }
         out
+    }
+
+    /// 查询当前内嵌明细窗口中所有涉及 `(sheet_name, row, col)` 的修改历史（新在前）
+    pub fn cell_history(&self, sheet_name: &str, row: u32, col: u32) -> Vec<CellHistoryHit> {
+        let Some(si) = self.resolve_sheet_slot_by_name(sheet_name) else {
+            return Vec::new();
+        };
+        self.cell_history_by_slot(si, row, col)
+    }
+
+    /// 在活动工作簿上下文中查询某格修改历史（跨重命名/新建同名表不串号）
+    pub fn cell_history_for_sheet(
+        &self,
+        wb: &Workbook,
+        sheet: &Sheet,
+        row: u32,
+        col: u32,
+    ) -> Vec<CellHistoryHit> {
+        let Some(si) = self.resolve_sheet_slot_in_wb(wb, sheet) else {
+            return Vec::new();
+        };
+        self.cell_history_by_slot(si, row, col)
     }
 
     /// 全量密码学校验：哈希链 + ECDSA P-256 签名 + Rollup 锚点 + 协作联署 + 时钟顺序 + 工作簿业务状态根
@@ -2318,6 +2746,7 @@ impl AuditLog {
             max_detailed_commits: self.max_detailed_commits,
             author_dict: self.author_dict.clone(),
             sheet_dict: self.sheet_dict.clone(),
+            live_sheet_slots: self.live_sheet_slots.clone(),
             rollups: self.rollups.clone(),
             commits: self.commits.clone(),
         };
@@ -2368,6 +2797,7 @@ impl AuditLog {
             max_detailed_commits: header.max_detailed_commits,
             author_dict: header.author_dict,
             sheet_dict: header.sheet_dict,
+            live_sheet_slots: header.live_sheet_slots,
             rollups: header.rollups,
             commits: header.commits,
             blame,
@@ -3596,5 +4026,232 @@ mod tests {
             !zip_parts.iter().any(|p| p.to_ascii_lowercase().starts_with("customxml/")),
             "干净副本不得残留任何 customXml 审计部件: {zip_parts:?}"
         );
+    }
+
+    fn make_author(name: &str, kp: &AuditKeyPair) -> AuditAuthor {
+        AuditAuthor {
+            display_name: name.to_string(),
+            os_user: "testuser".into(),
+            machine: "TEST-PC".into(),
+            pubkey_hex: kp.pubkey_hex.clone(),
+        }
+    }
+
+    #[test]
+    fn review_182_defined_name_leading_equals_roundtrip_has_no_false_external_mod() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names_audit.xlsx");
+        let kp = generate_keypair().unwrap();
+        let alice = make_author("李会计", &kp);
+
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Number(100.0), formula: None });
+        let mut log = AuditLog::enable(&wb, alice.clone(), &kp, 1_700_000_000_000).unwrap();
+        log.bind_workbook_sheets(&mut wb);
+        wb.audit.log = Some(Arc::new(log.clone()));
+
+        let base = wb.clone();
+        // 按内存约定新增带前导 '=' 的名称常量（写入 OOXML 时 patch::write_user_names 会去掉前导 '='）
+        wb.names.push(("LedgerRate".into(), None, "=0.05".into()));
+        wb.names_dirty = true;
+        let delta = compute_net_diff(&base, &wb, &alice, &HashMap::new(), &[]);
+        assert!(
+            delta.bulk_ops.iter().any(|b| b.2 == "名称变更"),
+            "新增名称常量应记录名称变更摘要"
+        );
+        log.append_commit(&wb, alice, &kp, "保存修改", &delta, &[], None, 1_700_000_060_000)
+            .unwrap();
+        wb.audit.log = Some(Arc::new(log));
+
+        crate::xlsx::save_atomic(&path, &wb).unwrap();
+        let reopened = crate::xlsx::load(&path).unwrap();
+        let ver = verify_workbook_audit(&reopened).expect("重开后应含审计日志");
+        assert_eq!(
+            ver.severity,
+            AuditSeverity::Verified,
+            "保存带前导 '=' 名称常量后重开绝不能误报外部修改: {:?}",
+            ver.issues
+        );
+    }
+
+    #[test]
+    fn review_182_sheet_rename_and_new_sheet_with_old_name_keeps_blame_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rename_audit.xlsx");
+        let kp = generate_keypair().unwrap();
+        let alice = make_author("张三", &kp);
+
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Number(100.0), formula: None });
+        let mut log = AuditLog::enable(&wb, alice.clone(), &kp, 1_700_000_000_000).unwrap();
+        log.bind_workbook_sheets(&mut wb);
+        wb.audit.log = Some(Arc::new(log.clone()));
+
+        // #2 修改 Sheet1!A1 = 250
+        let base1 = wb.clone();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Number(250.0), formula: None });
+        let d2 = compute_net_diff(&base1, &wb, &alice, &HashMap::new(), &[]);
+        log.append_commit(&wb, alice.clone(), &kp, "保存修改", &d2, &[], None, 1_700_000_060_000)
+            .unwrap();
+        log.bind_workbook_sheets(&mut wb);
+        wb.audit.log = Some(Arc::new(log.clone()));
+
+        // 把 Sheet1 改名为 Revenue，并新建一张名为 Sheet1 的空表
+        let base2 = wb.clone();
+        wb.sheets[0].name = "Revenue".into();
+        wb.sheets.push(Sheet::new("Sheet1"));
+
+        // 保存前实时查询也必须正确隔离
+        let pre_rev = log.lookup_blame_for_sheet(&wb, &wb.sheets[0], 0, 0).expect("改名后保存前原表应保留 Blame");
+        assert_eq!(pre_rev.seq, 2);
+        assert!(
+            log.lookup_blame_for_sheet(&wb, &wb.sheets[1], 0, 0).is_none(),
+            "新建的同名空表在保存前绝不能串用旧表 Blame"
+        );
+
+        let d3 = compute_net_diff(&base2, &wb, &alice, &HashMap::new(), &[]);
+        log.append_commit(&wb, alice, &kp, "保存修改", &d3, &[], None, 1_700_000_120_000)
+            .unwrap();
+        wb.audit.log = Some(Arc::new(log));
+
+        // 写盘并重开后核验
+        crate::xlsx::save_atomic(&path, &wb).unwrap();
+        let reopened = crate::xlsx::load(&path).unwrap();
+        let ver = verify_workbook_audit(&reopened).unwrap();
+        assert_eq!(ver.severity, AuditSeverity::Verified, "{:?}", ver.issues);
+        let rlog = reopened.audit.log.as_ref().unwrap();
+
+        let rev_blame = rlog.lookup_blame("Revenue", 0, 0).expect("重开后 Revenue!A1 必须保留原作者");
+        assert_eq!(rev_blame.seq, 2);
+        assert!(!rev_blame.is_baseline);
+        let rev_hist = rlog.cell_history("Revenue", 0, 0);
+        assert_eq!(rev_hist.len(), 1);
+        assert_eq!(rev_hist[0].after, AuditSnap::Num(250.0));
+
+        assert!(
+            rlog.lookup_blame("Sheet1", 0, 0).is_none(),
+            "重开后新建同名空表 Sheet1!A1 不得显示旧表作者"
+        );
+        assert!(
+            rlog.cell_history("Sheet1", 0, 0).is_empty(),
+            "重开后新建同名空表 Sheet1!A1 修改历史必须为空"
+        );
+    }
+
+    #[test]
+    fn review_182_cosigner_mismatch_downgrades_and_merge_attributes_to_guest() {
+        let host_kp = generate_keypair().unwrap();
+        let guest_kp = generate_keypair().unwrap();
+        let host = make_author("宿主", &host_kp);
+        let guest = make_author("访客", &guest_kp);
+
+        let mut wb = Workbook::new_blank();
+        let mut log = AuditLog::enable(&wb, host.clone(), &host_kp, 1_700_000_000_000).unwrap();
+        log.bind_workbook_sheets(&mut wb);
+        let base = wb.clone();
+
+        // 访客先改了 B1=10 与 B2=20 并对两格联署；随后宿主覆写了 B2=99，访客又合并了 C1:D1
+        let stale_guest_cells = vec![
+            ("Sheet1".to_string(), 0, 1, AuditSnap::Empty, AuditSnap::Num(10.0)),
+            ("Sheet1".to_string(), 1, 1, AuditSnap::Empty, AuditSnap::Num(20.0)),
+        ];
+        let stale_digest = author_contribution_digest(&log.doc_id, 1, &stale_guest_cells);
+        let stale_sig = guest_kp.sign_digest(&stale_digest).unwrap();
+        let stale_att = PeerAttestationInput {
+            author: guest.clone(),
+            changes_digest: hex_encode(&stale_digest),
+            sig_hex: stale_sig,
+            attested_by_peer: true,
+        };
+
+        wb.sheets[0].set(0, 1, Cell { value: Value::Number(10.0), formula: None });
+        wb.sheets[0].set(1, 1, Cell { value: Value::Number(99.0), formula: None });
+        wb.sheets[0].merge_range(0, 2, 0, 3);
+        let sid = wb.sheets[0].identity;
+
+        let mut cell_attr = HashMap::new();
+        cell_attr.insert((sid, 0, 1), guest.clone());
+        cell_attr.insert((sid, 1, 1), host.clone());
+        let mut merge_attr = HashMap::new();
+        merge_attr.insert((sid, (0, 2, 0, 3)), guest.clone());
+
+        let delta = compute_net_diff_full(&base, &wb, &host, &cell_attr, &merge_attr, &[], &[]);
+        let merge_op = delta
+            .bulk_ops
+            .iter()
+            .find(|b| b.2 == "结构变更" && b.3.contains("合并"))
+            .expect("应生成合并结构摘要");
+        assert_eq!(merge_op.1.pubkey_hex, guest.pubkey_hex, "访客合并空白区域必须归属访客而非宿主");
+
+        let commit = log
+            .append_commit(&wb, host.clone(), &host_kp, "协作保存", &delta, &[stale_att], None, 1_700_000_060_000)
+            .unwrap()
+            .clone();
+        assert_eq!(commit.co_signers.len(), 1);
+        assert_eq!(commit.co_signers[0].change_count, 1);
+        assert!(
+            !commit.co_signers[0].attested_by_peer,
+            "联署摘要与最终落盘集合不一致时绝不能继续标为已联署"
+        );
+        let expected_single = author_contribution_digest(
+            &log.doc_id,
+            1,
+            &[("Sheet1".to_string(), 0, 1, AuditSnap::Empty, AuditSnap::Num(10.0))],
+        );
+        assert_eq!(commit.co_signers[0].changes_digest, hex_encode(&expected_single));
+        let ver = log.verify_against_workbook(&wb);
+        assert_eq!(ver.severity, AuditSeverity::Warning);
+        assert!(ver.issues.iter().any(|i| i.kind == AuditIssueKind::UnattestedCollabEdits));
+    }
+
+    #[test]
+    fn review_182_blame_baseline_distinction_and_over_100k_cap_fallback() {
+        let kp = generate_keypair().unwrap();
+        let alice = make_author("开启人", &kp);
+        let bob_kp = generate_keypair().unwrap();
+        let bob = make_author("编辑人", &bob_kp);
+
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Number(100.0), formula: None });
+        let mut log = AuditLog::enable(&wb, alice.clone(), &kp, 1_700_000_000_000).unwrap();
+        let base_blame = log.lookup_blame("Sheet1", 0, 0).unwrap();
+        assert!(base_blame.is_baseline, "开启审计时已有单元格必须标记为基线登记人而非最后修改人");
+
+        // 人为填满 MAX_BLAME_ENTRIES 条 seq=1 基线记录，模拟 10 万格大表
+        let si = log.resolve_sheet_slot_by_name("Sheet1").unwrap();
+        log.blame.clear();
+        log.blame.reserve(MAX_BLAME_ENTRIES);
+        for i in 0..MAX_BLAME_ENTRIES {
+            log.blame.push(BlameRecord {
+                sheet_idx: si,
+                row: (i / 100) as u32,
+                col: (i % 100) as u32,
+                author_idx: 0,
+                seq: 1,
+                ts_ms: 1_700_000_000_000,
+            });
+        }
+        log.blame.sort_unstable_by_key(|b| (b.sheet_idx, b.row, b.col));
+
+        // 超过 10 万格后再新填一个单元格 (2000, 5)
+        let base = wb.clone();
+        wb.sheets[0].set(2000, 5, Cell { value: Value::Number(777.0), formula: None });
+        let mut attr = HashMap::new();
+        attr.insert((wb.sheets[0].identity, 2000, 5), bob.clone());
+        let d2 = compute_net_diff(&base, &wb, &bob, &attr, &[]);
+        log.append_commit(&wb, bob.clone(), &bob_kp, "保存修改", &d2, &[], None, 1_700_000_060_000)
+            .unwrap();
+        assert!(log.blame.len() <= MAX_BLAME_ENTRIES);
+
+        let b_new = log.lookup_blame("Sheet1", 2000, 5).expect("超过 10 万格后新编辑格必须查得到最后修改人");
+        assert_eq!(b_new.seq, 2);
+        assert!(!b_new.is_baseline);
+        assert_eq!(b_new.author.pubkey_hex, bob.pubkey_hex);
+
+        // 即使从 blame 索引中移除，也应通过近期提交明细窗口补查命中
+        log.blame.retain(|r| !(r.sheet_idx == si && r.row == 2000 && r.col == 5));
+        let b_fallback = log.lookup_blame("Sheet1", 2000, 5).expect("Blame 裁剪后应从近期明细回退命中");
+        assert_eq!(b_fallback.seq, 2);
+        assert_eq!(b_fallback.author.pubkey_hex, bob.pubkey_hex);
     }
 }

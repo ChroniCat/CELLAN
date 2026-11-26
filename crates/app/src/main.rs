@@ -6596,6 +6596,12 @@ impl SheetApp {
                         }
                     } else {
                         self.apply_recalculated_workbook(*wb);
+                        if let Some(log) = self.wb.audit.log.clone() {
+                            log.bind_workbook_sheets(&mut self.wb);
+                        }
+                        if !self.wb.dirty {
+                            self.audit_state.baseline = Some(Box::new(self.wb.clone()));
+                        }
                     }
                     self.wb.mark_recalc_synced();
                     self.xlink_last_check = None;
@@ -6663,6 +6669,14 @@ impl SheetApp {
             self.tasks.open_recalc_revs.clear();
         }
         // 轮询后台挂起标签的打开/重算进度，避免切去别的标签页时加载停滞
+        let parked_has_open_msgs = self.tabs.iter().any(|t| {
+            matches!(t, TabSlot::Parked(doc) if doc.tasks.open_rx.is_some())
+        });
+        let parked_audit_pk = if parked_has_open_msgs {
+            self.ensure_audit_keypair().ok().map(|k| k.pubkey_hex)
+        } else {
+            None
+        };
         for tab in &mut self.tabs {
             let TabSlot::Parked(doc) = tab else { continue };
             let mut parked_msgs = Vec::new();
@@ -6692,6 +6706,17 @@ impl SheetApp {
                             .and_then(|p| p.file_name())
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "未命名".into());
+                        let p_path = doc.wb.path.clone();
+                        let (audit_st, audit_banner) = audit_ui::init_audit_state_for_loaded(
+                            &mut doc.wb,
+                            p_path.as_deref(),
+                            parked_audit_pk.as_deref(),
+                            doc.doc_uid,
+                        );
+                        doc.audit_state = audit_st;
+                        if let Some(b) = audit_banner {
+                            doc.notice = Some(b);
+                        }
                     }
                     OpenMsg::DepsReady(deps) => {
                         doc.deps = deps.into();
@@ -6703,6 +6728,24 @@ impl SheetApp {
                         let revs = std::mem::take(&mut doc.tasks.open_recalc_revs);
                         let applied = if doc.doc_gen == 0 {
                             doc.wb = *wb;
+                            if let Some(log) = doc.wb.audit.log.clone() {
+                                log.bind_workbook_sheets(&mut doc.wb);
+                            }
+                            if doc.audit_state.baseline.is_some() {
+                                doc.audit_state.baseline = Some(Box::new(doc.wb.clone()));
+                            } else {
+                                let p_path = doc.wb.path.clone();
+                                let (audit_st, audit_banner) = audit_ui::init_audit_state_for_loaded(
+                                    &mut doc.wb,
+                                    p_path.as_deref(),
+                                    parked_audit_pk.as_deref(),
+                                    doc.doc_uid,
+                                );
+                                doc.audit_state = audit_st;
+                                if let Some(b) = audit_banner {
+                                    doc.notice = Some(b);
+                                }
+                            }
                             true
                         } else if !revs.is_empty() {
                             (CalculatedSnapshot {
@@ -7108,7 +7151,7 @@ impl SheetApp {
                         self.close_confirmed_uids.remove(&self.doc_uid);
                     }
                     let my_pk = self.audit_keypair.as_ref().map(|k| k.pubkey_hex.clone());
-                    let audit_note = Self::on_audit_save_completed_for(
+                    let (audit_note, xls_dropped_audit) = Self::on_audit_save_completed_for(
                         &self.wb,
                         &mut self.audit_state,
                         &mut self.tasks,
@@ -7116,6 +7159,16 @@ impl SheetApp {
                         &path,
                         my_pk.as_deref(),
                     );
+                    if xls_dropped_audit {
+                        self.set_notice(NoticeBanner {
+                            level: NoticeLevel::Warn,
+                            title: "另存为 .xls 已停止防篡改审计".into(),
+                            detail: "旧版 .xls 格式不支持内嵌防篡改审计记录，新保存的文件不含审计链；如需保留审计链请另存为 .xlsx。".into(),
+                            actions: Vec::new(),
+                            tag: Some("audit_xls_loss"),
+                            target_doc_uid: Some(self.doc_uid),
+                        });
+                    }
                     if !quiet {
                         self.status = if let Some(note) = audit_note {
                             note
@@ -7174,7 +7227,7 @@ impl SheetApp {
                             self.close_confirmed_uids.remove(&doc.doc_uid);
                         }
                         let my_pk = self.audit_keypair.as_ref().map(|k| k.pubkey_hex.clone());
-                        let _ = Self::on_audit_save_completed_for(
+                        let (_note, xls_dropped_audit) = Self::on_audit_save_completed_for(
                             &doc.wb,
                             &mut doc.audit_state,
                             &mut doc.tasks,
@@ -7182,6 +7235,16 @@ impl SheetApp {
                             &path,
                             my_pk.as_deref(),
                         );
+                        if xls_dropped_audit {
+                            doc.notice = Some(NoticeBanner {
+                                level: NoticeLevel::Warn,
+                                title: "另存为 .xls 已停止防篡改审计".into(),
+                                detail: "旧版 .xls 格式不支持内嵌防篡改审计记录，新保存的文件不含审计链；如需保留审计链请另存为 .xlsx。".into(),
+                                actions: Vec::new(),
+                                tag: Some("audit_xls_loss"),
+                                target_doc_uid: Some(doc.doc_uid),
+                            });
+                        }
                     }
                     Err(error) => {
                         if self.save_all_before_exit || self.pending_tab_closes.contains(&doc.doc_uid) {
@@ -7828,6 +7891,7 @@ impl SheetApp {
                     self.wb = wb;
                     self.wb_epoch = self.wb_epoch.wrapping_add(1);
                     self.doc_gen = self.doc_gen.wrapping_add(1);
+                    self.on_workbook_recovered_audit(entry.original_path.as_deref());
                     self.recalc_all_and_deps_adaptive();
                     self.set_notice(NoticeBanner {
                         level: NoticeLevel::Info,
@@ -16859,6 +16923,11 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             }
             site.is_none() || owner.and_then(|p| p.cells.get(&(sheet,row,col))).is_some_and(|op| op.site == my_site)
         };
+        let undo_entry_id = if redo {
+            self.undo.top_redo_id()
+        } else {
+            self.undo.top_undo_id()
+        };
         let applied = if redo {
             self.undo.redo_workbook(&mut self.wb, guard)
         } else {
@@ -16881,6 +16950,13 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if applied.skipped > 0 && applied.touched_count() == 0 && applied.refresh_sizes.is_none() {
             self.status = format!("{}：{} 格已被其他用户修改，已跳过", applied.label, applied.skipped);
             return false;
+        }
+        if let Some(eid) = undo_entry_id {
+            if redo {
+                self.audit_on_redo(eid);
+            } else {
+                self.audit_on_undo(eid);
+            }
         }
         // 刷新类动作撤销/重做时把外源源尺寸一起还原
         if let Some(sizes) = &applied.refresh_sizes {
@@ -20630,6 +20706,9 @@ fn clear_values(&mut self) {
                 self.wb.sheet(si),
                 (si, self.sel.0, self.sel.1),
             );
+            if part == ClearPart::Formats {
+                self.audit_note_style_rects(what, si, &rects, self.undo.top_undo_id());
+            }
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
             self.set_repeat_action(RepeatAction::Clear(part));
@@ -22686,6 +22765,7 @@ fn clear_selection(&mut self) {
                 self.wb.sheet(si),
                 (si, self.sel.0, self.sel.1),
             );
+            self.audit_note_style_rects("设置格式", si, &rects, self.undo.top_undo_id());
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
             self.tasks.last_edit = Some(std::time::Instant::now());
@@ -22816,6 +22896,9 @@ fn clear_selection(&mut self) {
                 }
             }
             self.txn_end("设置格式", txn);
+            if sparse_keys.is_empty() {
+                self.audit_note_style_rects("设置整行/整列格式", self.sheet_idx, &rects, self.undo.top_undo_id());
+            }
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
             return true;
@@ -22865,6 +22948,7 @@ fn clear_selection(&mut self) {
                 self.wb.sheet(si),
                 (si, self.sel.0, self.sel.1),
             );
+            self.audit_note_style_rects("设置格式", si, &rects, self.undo.top_undo_id());
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
             self.tasks.last_edit = Some(std::time::Instant::now());
@@ -23913,6 +23997,7 @@ fn clear_selection(&mut self) {
                 self.wb.sheet(si),
                 (si, self.sel.0, self.sel.1),
             );
+            self.audit_note_style_rects("格式刷", si, &[(tr1, tc1, tr2, tc2)], self.undo.top_undo_id());
             self.cf_stats_gen = u64::MAX;
             self.wb.dirty = true;
             self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -37499,7 +37584,7 @@ impl SheetApp {
         self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
         self.recalc_after_structural(updates);
         self.shift_collab_coordinates(idx, &op);
-        self.audit_note_structural(None, idx, &op);
+        self.audit_note_structural(None, idx, &op, self.undo.top_undo_id());
         self.status = if self.net.is_some() {
             format!("{label}（已提交协作队列）")
         } else {
@@ -52119,7 +52204,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
                         self.recalc_after_structural(updates);
-                        self.audit_note_structural(Some(site), sheet, &op);
+                        self.audit_note_structural(Some(site), sheet, &op, None);
                         self.record_remote_note_revision(site, "远端结构改动", sheet, label.clone());
                         let who = self.peer_display_name(site);
                         self.status = if site != 0 {
@@ -52155,11 +52240,13 @@ fn elide(s: &str, max_chars: usize) -> String {
                         self.tasks.last_edit = Some(std::time::Instant::now());
                         self.wb.dirty = true;
                         if let Some(sh) = first_sheet {
+                            let summary = format!("格式变更（{count} 格）");
+                            self.audit_note_remote_bulk(site, sh, "格式变更", summary.clone());
                             self.record_remote_note_revision(
                                 site,
                                 "远端格式变更",
                                 sh,
-                                format!("格式变更（{count} 格）"),
+                                summary,
                             );
                         }
                     }
@@ -52190,11 +52277,13 @@ fn elide(s: &str, max_chars: usize) -> String {
                         if !snapshot {
                             self.tasks.last_edit = Some(std::time::Instant::now());
                             self.wb.dirty = true;
+                            let summary = format!("整行/整列格式变更（{axis_count} 项）");
+                            self.audit_note_remote_bulk(site, sheet, "格式变更", summary.clone());
                             self.record_remote_note_revision(
                                 site,
                                 "远端格式变更",
                                 sheet,
-                                format!("整行/整列格式变更（{axis_count} 项）"),
+                                summary,
                             );
                         }
                         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -52210,6 +52299,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                         }
                         self.tasks.last_edit = Some(std::time::Instant::now());
                         self.wb.dirty = true;
+                        self.audit_note_merge(Some(site), sheet, rect);
                         let note = format!(
                             "{} {}:{}{}",
                             if on { "合并" } else { "取消合并" },
@@ -52475,8 +52565,9 @@ fn elide(s: &str, max_chars: usize) -> String {
                     for (sh, r, c) in held {
                         self.locks.release(sh, r, c, site);
                     }
+                    // 保留已收到的 `peer_attestations` 直到宿主完成本轮保存提交，
+                    // 避免访客提交有效独立联署后正常离线导致宿主把有效联署删掉。
                     self.audit_state.peer_identities.remove(&site);
-                    self.audit_state.peer_attestations.remove(&site);
                     self.status = format!("成员离开，当前在线 {} 人", self.peers_list.len());
                 }
                 net::NetEvent::Ops(ops) => {
@@ -52726,7 +52817,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                                 machine: String::new(),
                                 pubkey_hex: pubkey_hex.clone(),
                             });
-                        self.audit_state.peer_attestations.insert(
+                        self.audit_state.record_peer_attestation(
                             site,
                             sheetcore::audit::PeerAttestationInput {
                                 author,

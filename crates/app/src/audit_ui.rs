@@ -19,6 +19,30 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// 未落盘的样式/保护/恢复缺口等批量摘要事件（带单调序号与可选撤销 ID，确保保存并发安全且支持 Ctrl+Z 还原）
+#[derive(Clone)]
+pub(crate) struct PendingBulkOp {
+    pub seq: u64,
+    pub undo_id: Option<u64>,
+    pub sheet_name: String,
+    pub author: AuditAuthor,
+    pub kind: String,
+    pub summary: String,
+}
+
+/// 未落盘的插删行列结构操作（不直接改写内存 `wb.audit.log.blame`，仅在落盘签名时提交；支持 Ctrl+Z/Ctrl+Y 精确回滚）
+#[derive(Clone)]
+pub(crate) struct PendingStructuralOp {
+    pub seq: u64,
+    pub undo_id: Option<u64>,
+    pub sheet_id: u64,
+    pub sheet_name: String,
+    pub author: AuditAuthor,
+    pub op: sheetcore::structural::Structural,
+    pub prev_dirty_cell_authors: Option<HashMap<(u64, u32, u32), AuditAuthor>>,
+    pub post_dirty_cell_authors: Option<HashMap<(u64, u32, u32), AuditAuthor>>,
+}
+
 /// 单份文档标签页专属的审计运行态（与 `ParkedDoc` 一同停放/恢复）
 #[derive(Clone, Default)]
 pub(crate) struct DocAuditState {
@@ -26,18 +50,171 @@ pub(crate) struct DocAuditState {
     pub baseline: Option<Box<Workbook>>,
     /// 最近一次完整核验结果（哈希链 + 签名 + 状态根 + 本机水印 + TOFU）
     pub verification: Option<AuditVerification>,
-    /// 打开时若检测到绕过审计的外部修改，暂存当时观察到的正文哈希，下次合规保存永久写入链中
+    /// 打开或恢复时若检测到绕过审计的外部修改/基线缺口，暂存当时观察到的正文哈希，下次合规保存永久写入链中
     pub pending_external_gap: Option<String>,
     /// 本轮未保存期间每个单元格的真实修改者归属：(sheet_identity, row, col) -> AuditAuthor
     pub dirty_cell_authors: HashMap<(u64, u32, u32), AuditAuthor>,
-    /// 本轮未保存期间的结构/样式/保护等摘要事件：(sheet_name, author, kind, summary)
-    pub dirty_bulk_ops: Vec<(String, AuditAuthor, String, String)>,
+    /// 本轮未保存期间每个合并区域的真实操作者归属：(sheet_identity, rect) -> (seq, AuditAuthor)
+    pub dirty_merge_authors: HashMap<(u64, (u32, u32, u32, u32)), (u64, AuditAuthor)>,
+    /// 本轮未保存期间的结构/样式/保护等摘要事件（带单调 seq 与可选 undo_id）
+    pub dirty_bulk_ops: Vec<PendingBulkOp>,
+    /// 被 Ctrl+Z 撤销的摘要事件（供 Ctrl+Y 重做恢复）
+    pub redo_bulk_ops: Vec<PendingBulkOp>,
+    /// 本轮未保存期间的插删行列结构操作（落盘前绝不直接改写 `wb.audit.log.blame`）
+    pub pending_structural_ops: Vec<PendingStructuralOp>,
+    /// 被 Ctrl+Z 撤销的结构操作（供 Ctrl+Y 重做恢复）
+    pub redo_structural_ops: Vec<PendingStructuralOp>,
     /// 本协作会话中已通过 ECDSA 验签的在线成员身份：site -> AuditAuthor
     pub peer_identities: HashMap<u32, AuditAuthor>,
-    /// 本轮已收到的远端协作者独立联署证明：site -> PeerAttestationInput
-    pub peer_attestations: HashMap<u32, PeerAttestationInput>,
+    /// 本轮已收到的远端协作者独立联署证明：site -> (seq, PeerAttestationInput)
+    pub peer_attestations: HashMap<u32, (u64, PeerAttestationInput)>,
+    /// 单调事件序号（用于保存完成回执精准消费快照内事件，保留保存飞行期间并发新增事件）
+    pub next_event_seq: u64,
     /// 已导入并通过 Merkle/签名验真的冷归档包（供在审计面板中展开查阅历史明细）
     pub verified_cold_archive: Option<(ColdArchiveVerifyResult, AuditColdArchive)>,
+}
+
+impl DocAuditState {
+    pub(crate) fn alloc_seq(&mut self) -> u64 {
+        self.next_event_seq = self.next_event_seq.saturating_add(1);
+        self.next_event_seq
+    }
+
+    pub(crate) fn push_bulk_op(
+        &mut self,
+        undo_id: Option<u64>,
+        sheet_name: String,
+        author: AuditAuthor,
+        kind: impl Into<String>,
+        summary: impl Into<String>,
+    ) {
+        let seq = self.alloc_seq();
+        if undo_id.is_some() {
+            self.redo_bulk_ops.clear();
+        }
+        self.dirty_bulk_ops.push(PendingBulkOp {
+            seq,
+            undo_id,
+            sheet_name,
+            author,
+            kind: kind.into(),
+            summary: summary.into(),
+        });
+    }
+
+    pub(crate) fn record_peer_attestation(&mut self, site: u32, attest: PeerAttestationInput) {
+        let seq = self.alloc_seq();
+        self.peer_attestations.insert(site, (seq, attest));
+    }
+
+    pub(crate) fn record_merge_author(
+        &mut self,
+        sheet_id: u64,
+        rect: (u32, u32, u32, u32),
+        author: AuditAuthor,
+    ) {
+        let seq = self.alloc_seq();
+        self.dirty_merge_authors.insert((sheet_id, rect), (seq, author));
+    }
+}
+
+fn invert_structural_coord(
+    row: u32,
+    col: u32,
+    op: &sheetcore::structural::Structural,
+) -> Option<(u32, u32)> {
+    use sheetcore::structural::Structural;
+    match *op {
+        Structural::InsertRows { at, n } => {
+            if row < at {
+                Some((row, col))
+            } else if row < at.saturating_add(n) {
+                None
+            } else {
+                Some((row - n, col))
+            }
+        }
+        Structural::DeleteRows { at, n } => {
+            if row < at {
+                Some((row, col))
+            } else {
+                Some((row.saturating_add(n), col))
+            }
+        }
+        Structural::InsertCols { at, n } => {
+            if col < at {
+                Some((row, col))
+            } else if col < at.saturating_add(n) {
+                None
+            } else {
+                Some((row, col - n))
+            }
+        }
+        Structural::DeleteCols { at, n } => {
+            if col < at {
+                Some((row, col))
+            } else {
+                Some((row, col.saturating_add(n)))
+            }
+        }
+    }
+}
+
+/// 独立初始化已加载工作簿的防篡改审计运行态与告警横幅（同时用于前台标签与后台停放标签 `ParkedDoc`）
+pub(crate) fn init_audit_state_for_loaded(
+    wb: &mut Workbook,
+    path: Option<&Path>,
+    my_pk: Option<&str>,
+    doc_uid: u64,
+) -> (DocAuditState, Option<NoticeBanner>) {
+    if let Some(log) = wb.audit.log.as_ref().cloned() {
+        log.bind_workbook_sheets(wb);
+    }
+    let mut state = DocAuditState::default();
+    state.baseline = Some(Box::new(wb.clone()));
+
+    let ver = audit_store::verify_workbook_full(path, wb, my_pk);
+    let mut banner = None;
+    if let Some(ref v) = ver {
+        if v.has_external_gap() {
+            state.pending_external_gap = Some(v.current_state_hash.clone());
+        }
+        match v.severity {
+            AuditSeverity::Tampered => {
+                let first_msg = v
+                    .issues
+                    .first()
+                    .map(|i| i.message.clone())
+                    .unwrap_or_else(|| "内嵌审计记录校验未通过".into());
+                banner = Some(NoticeBanner {
+                    level: NoticeLevel::Error,
+                    title: "防篡改审计异常警告".into(),
+                    detail: first_msg,
+                    actions: vec![("查看审计记录".into(), NoticeAction::OpenAudit)],
+                    tag: Some("audit_tamper"),
+                    target_doc_uid: Some(doc_uid),
+                });
+            }
+            AuditSeverity::Warning => {
+                let first_msg = v
+                    .issues
+                    .first()
+                    .map(|i| i.message.clone())
+                    .unwrap_or_else(|| "存在审计提醒事项".into());
+                banner = Some(NoticeBanner {
+                    level: NoticeLevel::Warn,
+                    title: "防篡改审计提醒".into(),
+                    detail: first_msg,
+                    actions: vec![("查看审计记录".into(), NoticeAction::OpenAudit)],
+                    tag: Some("audit_warn"),
+                    target_doc_uid: Some(doc_uid),
+                });
+            }
+            AuditSeverity::Verified => {}
+        }
+    }
+    state.verification = ver;
+    (state, banner)
 }
 
 impl SheetApp {
@@ -66,55 +243,94 @@ impl SheetApp {
 
     /// 打开工作簿完成后执行完整防篡改核验，并建立 CoW 基线与告警横幅
     pub(crate) fn on_workbook_loaded_audit(&mut self) {
-        self.audit_state = DocAuditState::default();
         self.audit_expanded_seq = None;
         self.audit_archive_msg = None;
-        self.audit_state.baseline = Some(Box::new(self.wb.clone()));
 
         let my_pk = self
             .ensure_audit_keypair()
             .ok()
             .map(|k| k.pubkey_hex);
         let path = self.wb.path.clone();
-        let ver = audit_store::verify_workbook_full(path.as_deref(), &self.wb, my_pk.as_deref());
-        if let Some(ref v) = ver {
-            if v.has_external_gap() {
-                self.audit_state.pending_external_gap = Some(v.current_state_hash.clone());
-            }
+        let (state, banner) = init_audit_state_for_loaded(
+            &mut self.wb,
+            path.as_deref(),
+            my_pk.as_deref(),
+            self.doc_uid,
+        );
+        if state.verification.is_some() {
             self.rev_tab = 0;
-            match v.severity {
-                AuditSeverity::Tampered => {
-                    let first_msg = v
-                        .issues
-                        .first()
-                        .map(|i| i.message.clone())
-                        .unwrap_or_else(|| "内嵌审计记录校验未通过".into());
-                    self.set_notice(NoticeBanner {
-                        level: NoticeLevel::Error,
-                        title: "防篡改审计异常警告".into(),
-                        detail: first_msg,
-                        actions: vec![("查看审计记录".into(), NoticeAction::OpenAudit)],
-                        tag: Some("audit_tamper"),
-                        target_doc_uid: Some(self.doc_uid),
-                    });
+        }
+        if let Some(b) = banner {
+            self.set_notice(b);
+        }
+        self.audit_state = state;
+    }
+
+    /// 异常退出恢复草稿后初始化审计基线：
+    /// - 若原磁盘文件可读且状态根与草稿所携审计链头一致，直接以其作为精确基线，另存时完整记录逐格净变更；
+    /// - 否则（原文件不可得或已偏离）以当前草稿为后续基线，并显式标记「恢复缺口」与 `pending_external_gap`，
+    ///   杜绝另存后签出“0 格修改 / 核验通过”的失真提交。
+    pub(crate) fn on_workbook_recovered_audit(&mut self, original_path: Option<&str>) {
+        self.audit_state = DocAuditState::default();
+        self.audit_expanded_seq = None;
+        self.audit_archive_msg = None;
+
+        let Some(log) = self.wb.audit.log.as_ref().cloned() else {
+            return;
+        };
+        log.bind_workbook_sheets(&mut self.wb);
+        let expected_hash = log.head_state_hash().map(|s| s.to_string());
+        let cur_hash = sheetcore::audit::workbook_state_hash(&self.wb);
+
+        // 1. 尝试从原文件加载与审计链头精确匹配的已签名基线
+        let mut recovered_base: Option<Workbook> = None;
+        if let (Some(orig_str), Some(exp)) = (original_path, expected_hash.as_deref()) {
+            let orig_path = Path::new(orig_str);
+            if orig_path.is_file() && !sheetcore::crypto::needs_password(orig_path) {
+                if let Ok(mut orig_wb) = sheetcore::xlsx::load(orig_path) {
+                    let same_doc = orig_wb
+                        .audit
+                        .log
+                        .as_ref()
+                        .is_some_and(|l| l.doc_id == log.doc_id && l.head_seq() == log.head_seq());
+                    if same_doc && sheetcore::audit::workbook_state_hash(&orig_wb) == exp {
+                        // 对齐两份独立加载工作簿的运行时 `Sheet.identity`，使 CoW 净差按逻辑表匹配
+                        for osh in &mut orig_wb.sheets {
+                            if let Some(csh) = self.wb.sheets.iter().find(|c| {
+                                (osh.audit_sheet_idx.is_some() && c.audit_sheet_idx == osh.audit_sheet_idx)
+                                    || c.name == osh.name
+                            }) {
+                                osh.identity = csh.identity;
+                            }
+                        }
+                        recovered_base = Some(orig_wb);
+                    }
                 }
-                AuditSeverity::Warning => {
-                    let first_msg = v
-                        .issues
-                        .first()
-                        .map(|i| i.message.clone())
-                        .unwrap_or_else(|| "存在审计提醒事项".into());
-                    self.set_notice(NoticeBanner {
-                        level: NoticeLevel::Warn,
-                        title: "防篡改审计提醒".into(),
-                        detail: first_msg,
-                        actions: vec![("查看审计记录".into(), NoticeAction::OpenAudit)],
-                        tag: Some("audit_warn"),
-                        target_doc_uid: Some(self.doc_uid),
-                    });
-                }
-                AuditSeverity::Verified => {}
             }
+        }
+
+        if let Some(orig_base) = recovered_base {
+            self.audit_state.baseline = Some(Box::new(orig_base));
+            self.audit_state.verification = sheetcore::audit::verify_workbook_audit(&self.wb);
+            return;
+        }
+
+        // 2. 无法取得原已签名基线：以当前恢复草稿作为后续编辑基线；若与上次签名状态不同，显式钉下恢复缺口
+        self.audit_state.baseline = Some(Box::new(self.wb.clone()));
+        let ver = sheetcore::audit::verify_workbook_audit(&self.wb);
+        if expected_hash.as_deref() != Some(cur_hash.as_str()) {
+            self.audit_state.pending_external_gap = Some(cur_hash);
+            let author = self.my_audit_author().unwrap_or_else(|| AuditAuthor {
+                display_name: self.my_name.clone(),
+                ..Default::default()
+            });
+            self.audit_state.push_bulk_op(
+                None,
+                "(工作簿)".into(),
+                author,
+                "恢复缺口",
+                "从异常退出恢复草稿另存：崩溃前未落盘的改动无法取得原签名基线逐格回溯，已永久标记状态缺口",
+            );
         }
         self.audit_state.verification = ver;
     }
@@ -171,6 +387,7 @@ impl SheetApp {
         match AuditLog::enable(&self.wb, author, &kp, sheetcore::revision::now_ms()) {
             Ok(log) => {
                 let arc = Arc::new(log);
+                arc.bind_workbook_sheets(&mut self.wb);
                 self.wb.audit.log = Some(arc.clone());
                 self.wb.audit.stripped_marker = None;
                 self.wb.audit.parse_error = None;
@@ -178,7 +395,11 @@ impl SheetApp {
                 self.wb.dirty = true;
                 self.audit_state.baseline = Some(Box::new(self.wb.clone()));
                 self.audit_state.dirty_cell_authors.clear();
+                self.audit_state.dirty_merge_authors.clear();
                 self.audit_state.dirty_bulk_ops.clear();
+                self.audit_state.redo_bulk_ops.clear();
+                self.audit_state.pending_structural_ops.clear();
+                self.audit_state.redo_structural_ops.clear();
                 self.audit_state.pending_external_gap = None;
                 self.audit_state.verification = Some(arc.verify_against_workbook(&self.wb));
                 if let Some(net) = self.net.as_ref().filter(|n| n.hosting) {
@@ -236,16 +457,109 @@ impl SheetApp {
                     sheetcore::model::cell_name(r2, c2)
                 )
             };
-            self.audit_state.dirty_bulk_ops.push((
+            let undo_id = self.undo.top_undo_id();
+            self.audit_state.push_bulk_op(
+                undo_id,
                 sheet_name,
                 author,
-                "格式变更".into(),
+                "格式变更",
                 format!("{label} {range}（{} 格）", deltas.len()),
-            ));
+            );
         } else if self.net.as_ref().is_some_and(|n| !n.hosting) {
             // 协作访客每次完成单元格编辑后立即刷新独立 ECDSA 联署，确保无论访客还是宿主保存均带有效联署
             self.guest_send_audit_attest_before_save();
         }
+    }
+
+    /// 本地批量 CoW 样式操作（如 `A1:A1025` 大选区改百分比、整行整列格式、格式刷、清除格式）登记审计摘要
+    pub(crate) fn audit_note_style_rects(
+        &mut self,
+        label: &str,
+        sheet_idx: usize,
+        rects: &[(u32, u32, u32, u32)],
+        undo_id: Option<u64>,
+    ) {
+        if self.wb.audit.log.is_none() || rects.is_empty() {
+            return;
+        }
+        let Some(sh) = self.wb.sheets.get(sheet_idx) else {
+            return;
+        };
+        let sheet_name = sh.name.clone();
+        let Some(author) = self.my_audit_author() else {
+            return;
+        };
+        let (mut r1, mut c1, mut r2, mut c2) = rects[0];
+        let mut total_cells: u64 = 0;
+        for &(a, b, c, d) in rects {
+            r1 = r1.min(a);
+            c1 = c1.min(b);
+            r2 = r2.max(c);
+            c2 = c2.max(d);
+            total_cells = total_cells.saturating_add(
+                (c.saturating_sub(a) as u64 + 1).saturating_mul(d.saturating_sub(b) as u64 + 1),
+            );
+        }
+        let range = if (r1, c1) == (r2, c2) {
+            sheetcore::model::cell_name(r1, c1)
+        } else {
+            format!(
+                "{}:{}",
+                sheetcore::model::cell_name(r1, c1),
+                sheetcore::model::cell_name(r2, c2)
+            )
+        };
+        self.audit_state.push_bulk_op(
+            undo_id,
+            sheet_name,
+            author,
+            "格式变更",
+            format!("{label} {range}（{total_cells} 格）"),
+        );
+    }
+
+    /// 远端协作样式/轴样式等批量操作登记审计摘要（精确归属协作访客，不再漏记）
+    pub(crate) fn audit_note_remote_bulk(
+        &mut self,
+        site: u32,
+        sheet_idx: usize,
+        kind: &str,
+        summary: String,
+    ) {
+        if self.wb.audit.log.is_none() {
+            return;
+        }
+        let Some(sh) = self.wb.sheets.get(sheet_idx) else {
+            return;
+        };
+        let sheet_name = sh.name.clone();
+        let author = self.audit_author_for_site(site);
+        self.audit_state
+            .push_bulk_op(None, sheet_name, author, kind, summary);
+    }
+
+    /// 本地或远端协作合并/取消合并操作归属登记（使净差中的合并变更精确归属真实操作者）
+    pub(crate) fn audit_note_merge(
+        &mut self,
+        site: Option<u32>,
+        sheet_idx: usize,
+        rect: (u32, u32, u32, u32),
+    ) {
+        if self.wb.audit.log.is_none() {
+            return;
+        }
+        let Some(sh) = self.wb.sheets.get(sheet_idx) else {
+            return;
+        };
+        let sheet_id = sh.identity;
+        let author = match site {
+            Some(s) => self.audit_author_for_site(s),
+            None => self.my_audit_author().unwrap_or_else(|| AuditAuthor {
+                display_name: self.my_name.clone(),
+                ..Default::default()
+            }),
+        };
+        self.audit_state.record_merge_author(sheet_id, rect, author);
     }
 
     /// 远端协作单元格编辑归属登记
@@ -264,12 +578,15 @@ impl SheetApp {
         }
     }
 
-    /// 远端或本地结构变动（插删行列）同步平移 Blame 与未落盘单元格归属坐标
+    /// 远端或本地结构变动（插删行列）登记：
+    /// 不再提前改写内存中的 `wb.audit.log.blame`，改为记录在 `pending_structural_ops` 中，
+    /// 支持 Ctrl+Z / Ctrl+Y 完整回滚，并在保存签名时仅对最终留存的结构变更平移 Blame 与写入摘要。
     pub(crate) fn audit_note_structural(
         &mut self,
         site: Option<u32>,
         sheet_idx: usize,
         op: &sheetcore::structural::Structural,
+        undo_id: Option<u64>,
     ) {
         if self.wb.audit.log.is_none() {
             return;
@@ -286,6 +603,7 @@ impl SheetApp {
                 ..Default::default()
             }),
         };
+        let prev_authors = undo_id.map(|_| self.audit_state.dirty_cell_authors.clone());
         // 平移未落盘单元格归属坐标
         let old = std::mem::take(&mut self.audit_state.dirty_cell_authors);
         for ((sid, r, c), au) in old {
@@ -297,16 +615,83 @@ impl SheetApp {
                 self.audit_state.dirty_cell_authors.insert((sid, r, c), au);
             }
         }
-        // 同步平移 Blame 坐标
-        if let Some(log_arc) = self.wb.audit.log.as_mut() {
-            Arc::make_mut(log_arc).apply_structural_shift(&sheet_name, op);
+        let post_authors = undo_id.map(|_| self.audit_state.dirty_cell_authors.clone());
+        let seq = self.audit_state.alloc_seq();
+        if undo_id.is_some() {
+            self.audit_state.redo_structural_ops.clear();
         }
-        self.audit_state.dirty_bulk_ops.push((
+        self.audit_state.pending_structural_ops.push(PendingStructuralOp {
+            seq,
+            undo_id,
+            sheet_id,
             sheet_name,
             author,
-            "结构变更".into(),
-            op.label(),
-        ));
+            op: op.clone(),
+            prev_dirty_cell_authors: prev_authors,
+            post_dirty_cell_authors: post_authors,
+        });
+    }
+
+    /// 撤销（Ctrl+Z）后同步回滚关联的未落盘结构位移与格式摘要，防止撤销后仍留幽灵结构日志或 Blame 错位
+    pub(crate) fn audit_on_undo(&mut self, undone_id: u64) {
+        if self.wb.audit.log.is_none() {
+            return;
+        }
+        if self
+            .audit_state
+            .pending_structural_ops
+            .last()
+            .is_some_and(|e| e.undo_id == Some(undone_id))
+        {
+            if let Some(entry) = self.audit_state.pending_structural_ops.pop() {
+                if let Some(prev) = entry.prev_dirty_cell_authors.clone() {
+                    self.audit_state.dirty_cell_authors = prev;
+                }
+                self.audit_state.redo_structural_ops.push(entry);
+            }
+        }
+        while self
+            .audit_state
+            .dirty_bulk_ops
+            .last()
+            .is_some_and(|e| e.undo_id == Some(undone_id))
+        {
+            if let Some(entry) = self.audit_state.dirty_bulk_ops.pop() {
+                self.audit_state.redo_bulk_ops.push(entry);
+            }
+        }
+    }
+
+    /// 重做（Ctrl+Y）后同步恢复关联的未落盘结构位移与格式摘要
+    pub(crate) fn audit_on_redo(&mut self, redone_id: u64) {
+        if self.wb.audit.log.is_none() {
+            return;
+        }
+        if self
+            .audit_state
+            .redo_structural_ops
+            .last()
+            .is_some_and(|e| e.undo_id == Some(redone_id))
+        {
+            if let Some(mut entry) = self.audit_state.redo_structural_ops.pop() {
+                if let Some(post) = entry.post_dirty_cell_authors.clone() {
+                    self.audit_state.dirty_cell_authors = post;
+                }
+                entry.seq = self.audit_state.alloc_seq();
+                self.audit_state.pending_structural_ops.push(entry);
+            }
+        }
+        while self
+            .audit_state
+            .redo_bulk_ops
+            .last()
+            .is_some_and(|e| e.undo_id == Some(redone_id))
+        {
+            if let Some(mut entry) = self.audit_state.redo_bulk_ops.pop() {
+                entry.seq = self.audit_state.alloc_seq();
+                self.audit_state.dirty_bulk_ops.push(entry);
+            }
+        }
     }
 
     pub(crate) fn audit_author_for_site(&self, site: u32) -> AuditAuthor {
@@ -391,37 +776,99 @@ impl SheetApp {
         let has_other_authors = audit_state
             .dirty_cell_authors
             .values()
-            .any(|a| !a.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex));
+            .any(|a| !a.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex))
+            || audit_state
+                .dirty_bulk_ops
+                .iter()
+                .any(|b| !b.author.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex))
+            || audit_state
+                .dirty_merge_authors
+                .values()
+                .any(|(_, a)| !a.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex))
+            || audit_state
+                .pending_structural_ops
+                .iter()
+                .any(|s| !s.author.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex));
         let action = if net.is_some() && (has_other_authors || !audit_state.peer_attestations.is_empty()) {
             "协作保存".to_string()
-        } else if log.head_seq() == 1 && audit_state.dirty_cell_authors.is_empty() && audit_state.dirty_bulk_ops.is_empty() {
+        } else if log.head_seq() == 1
+            && audit_state.dirty_cell_authors.is_empty()
+            && audit_state.dirty_bulk_ops.is_empty()
+            && audit_state.pending_structural_ops.is_empty()
+            && audit_state.dirty_merge_authors.is_empty()
+        {
             "启用防篡改审计".to_string()
         } else {
             "保存修改".to_string()
         };
-        let baseline = audit_state
-            .baseline
-            .clone()
-            .unwrap_or_else(|| Box::new(wb.clone()));
+        let committed_bulk_seq = audit_state.dirty_bulk_ops.last().map(|b| b.seq).unwrap_or(0);
+        let committed_structural_seq = audit_state
+            .pending_structural_ops
+            .last()
+            .map(|s| s.seq)
+            .unwrap_or(0);
+        let bulk_ops: Vec<(String, AuditAuthor, String, String)> = audit_state
+            .dirty_bulk_ops
+            .iter()
+            .map(|b| (b.sheet_name.clone(), b.author.clone(), b.kind.clone(), b.summary.clone()))
+            .collect();
+        let structural_ops: Vec<(String, AuditAuthor, sheetcore::structural::Structural)> = audit_state
+            .pending_structural_ops
+            .iter()
+            .map(|s| {
+                // 使用当前最新表名（若在插行后又重命名了工作表）
+                let cur_name = wb
+                    .sheets
+                    .iter()
+                    .find(|sh| sh.identity == s.sheet_id)
+                    .map(|sh| sh.name.clone())
+                    .unwrap_or_else(|| s.sheet_name.clone());
+                (cur_name, s.author.clone(), s.op.clone())
+            })
+            .collect();
+        let merge_attributions: HashMap<(u64, (u32, u32, u32, u32)), AuditAuthor> = audit_state
+            .dirty_merge_authors
+            .iter()
+            .map(|(&k, (_, au))| (k, au.clone()))
+            .collect();
+        let committed_merge_seqs: HashMap<(u64, (u32, u32, u32, u32)), u64> = audit_state
+            .dirty_merge_authors
+            .iter()
+            .map(|(&k, (seq, _))| (k, *seq))
+            .collect();
         let co_signers: Vec<PeerAttestationInput> = audit_state
             .peer_attestations
             .values()
-            .cloned()
+            .map(|(_, att)| att.clone())
+            .collect();
+        let committed_attest_seqs: HashMap<u32, u64> = audit_state
+            .peer_attestations
+            .iter()
+            .map(|(&site, (seq, _))| (site, *seq))
             .collect();
 
         tasks.next_audit_ctx = Some(AuditSaveContext {
-            baseline,
+            baseline: audit_state.baseline.clone(),
             committer,
             keypair: kp,
             action,
             cell_attributions: audit_state.dirty_cell_authors.clone(),
-            bulk_ops: audit_state.dirty_bulk_ops.clone(),
+            merge_attributions,
+            bulk_ops,
+            structural_ops,
             co_signers,
             external_gap_hash: audit_state.pending_external_gap.clone(),
+            committed_bulk_seq,
+            committed_structural_seq,
+            committed_merge_seqs,
+            committed_attest_seqs,
+            had_external_gap: audit_state.pending_external_gap.is_some(),
         });
     }
 
-    /// 后台保存成功回包后推进基线、刷新本机防回滚水印，并在宿主侧广播 `AuditSync` 给全体协作者
+    /// 后台保存成功回包后推进基线、精准消费已提交事件（保留保存飞行期间并发新增事件）、
+    /// 处理另存 `.xls` 审计丢失清理、刷新本机防回滚水印，并在宿主侧广播 `AuditSync`。
+    /// 返回 `(状态提示文案, 是否因另存 .xls 丢失了审计链)`。
     pub(crate) fn on_audit_save_completed_for(
         wb: &Workbook,
         audit_state: &mut DocAuditState,
@@ -429,13 +876,62 @@ impl SheetApp {
         net: Option<&net::Net>,
         saved_path: &Path,
         my_pubkey: Option<&str>,
-    ) -> Option<String> {
+    ) -> (Option<String>, bool) {
         let mut extra_note = None;
-        if let Some(new_base) = tasks.last_audit_saved_baseline.take() {
-            audit_state.baseline = Some(new_base);
-        } else if wb.audit.log.is_some() && !wb.dirty {
-            audit_state.baseline = Some(Box::new(wb.clone()));
+        let audit_rcpt = tasks.last_audit_saved_receipt.take();
+        let is_xls = saved_path
+            .extension()
+            .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("xls"));
+
+        if is_xls || audit_rcpt.as_ref().is_some_and(|r| r.cleared_for_xls) || wb.audit.log.is_none() {
+            let had_audit = audit_rcpt.as_ref().is_some_and(|r| r.cleared_for_xls)
+                || audit_state.verification.is_some()
+                || audit_state.baseline.is_some();
+            *audit_state = DocAuditState::default();
+            if is_xls && had_audit {
+                return (
+                    Some("已另存为 .xls：旧版格式不支持内嵌防篡改审计，当前文档审计链已停止并清零".into()),
+                    true,
+                );
+            }
+            return (None, false);
         }
+
+        if let Some(rcpt) = audit_rcpt {
+            audit_state.baseline = Some(rcpt.baseline);
+            // 仅消费本次保存快照覆盖到的事件，严禁误删保存飞行期间并发产生的样式/结构/合并/联署事件！
+            audit_state
+                .dirty_bulk_ops
+                .retain(|b| b.seq > rcpt.committed_bulk_seq);
+            audit_state.redo_bulk_ops.clear();
+            audit_state
+                .pending_structural_ops
+                .retain(|s| s.seq > rcpt.committed_structural_seq);
+            audit_state.redo_structural_ops.clear();
+            audit_state.dirty_merge_authors.retain(|k, (seq, _)| {
+                rcpt.committed_merge_seqs
+                    .get(k)
+                    .is_none_or(|&cseq| *seq > cseq)
+            });
+            audit_state.peer_attestations.retain(|site, (seq, _)| {
+                rcpt.committed_attest_seqs
+                    .get(site)
+                    .is_none_or(|&cseq| *seq > cseq)
+            });
+            if rcpt.consumed_external_gap {
+                audit_state.pending_external_gap = None;
+            }
+        } else {
+            if !wb.dirty {
+                audit_state.baseline = Some(Box::new(wb.clone()));
+            }
+            audit_state.dirty_bulk_ops.clear();
+            audit_state.pending_structural_ops.clear();
+            audit_state.dirty_merge_authors.clear();
+            audit_state.peer_attestations.clear();
+            audit_state.pending_external_gap = None;
+        }
+
         if !wb.dirty {
             audit_state.dirty_cell_authors.clear();
         } else if let Some(base) = audit_state.baseline.as_deref() {
@@ -453,9 +949,6 @@ impl SheetApp {
                 before != after
             });
         }
-        audit_state.dirty_bulk_ops.clear();
-        audit_state.peer_attestations.clear();
-        audit_state.pending_external_gap = None;
 
         if let Some(log) = wb.audit.log.as_ref() {
             audit_store::record_verified_watermark(Some(saved_path), log);
@@ -473,7 +966,7 @@ impl SheetApp {
                 ));
             }
         }
-        extra_note
+        (extra_note, false)
     }
 
     /// 收到宿主广播的 `AuditSync`：访客更新本地可见审计链、基线，并刷新本机防回滚水印（P2P 见证！）
@@ -497,12 +990,17 @@ impl SheetApp {
             self.status = "收到异常审计同步包（哈希链或签名校验失败），已拒绝".into();
             return;
         }
+        arc.bind_workbook_sheets(&mut self.wb);
         self.wb.audit.log = Some(arc.clone());
         self.wb.audit.stripped_marker = None;
         self.wb.audit.parse_error = None;
         self.audit_state.baseline = Some(Box::new(self.wb.clone()));
         self.audit_state.dirty_cell_authors.clear();
+        self.audit_state.dirty_merge_authors.clear();
         self.audit_state.dirty_bulk_ops.clear();
+        self.audit_state.redo_bulk_ops.clear();
+        self.audit_state.pending_structural_ops.clear();
+        self.audit_state.redo_structural_ops.clear();
         audit_store::record_verified_watermark(self.wb.path.as_deref(), &arc);
         self.audit_state.verification =
             audit_store::verify_workbook_full(self.wb.path.as_deref(), &self.wb, my_pk.as_deref());
@@ -1276,7 +1774,25 @@ impl SheetApp {
                     ui.label(RichText::new(format!("当前内容：{cur_summary}")).strong().size(12.5));
                     ui.add_space(6.0);
                     if let Some(log) = self.wb.audit.log.as_ref() {
-                        if let Some(blame) = log.lookup_blame(&sheet_name, row, col) {
+                        let live_sheet = self.wb.sheets.iter().find(|s| s.name == sheet_name);
+                        // 若存在未落盘的插删行列操作，将当前坐标逆映射回已提交坐标查询 Blame
+                        let committed_coord = live_sheet.and_then(|sh| {
+                            let mut cur = Some((row, col));
+                            for sop in self.audit_state.pending_structural_ops.iter().rev() {
+                                if sop.sheet_id == sh.identity {
+                                    cur = cur.and_then(|(r, c)| invert_structural_coord(r, c, &sop.op));
+                                }
+                            }
+                            cur
+                        });
+                        let blame_opt = match (live_sheet, committed_coord) {
+                            (Some(sh), Some((cr, cc))) => {
+                                log.lookup_blame_for_sheet(&self.wb, sh, cr, cc)
+                            }
+                            (None, _) => log.lookup_blame(&sheet_name, row, col),
+                            _ => None,
+                        };
+                        if let Some(blame) = blame_opt {
                             let badge = audit_store::trust_badge_for_author(&blame.author, my_pk.as_deref());
                             let (bt, bc) = match badge {
                                 AuthorTrustBadge::SelfDevice => ("本机签名", Color32::from_rgb(16, 124, 65)),
@@ -1284,14 +1800,19 @@ impl SheetApp {
                                 AuthorTrustBadge::FirstSeen => ("首次见设备", Color32::from_rgb(90, 96, 106)),
                                 AuthorTrustBadge::KeyChanged => ("⚠ 身份指纹变化", Color32::from_rgb(196, 43, 28)),
                             };
+                            let (role_title, who_prefix) = if blame.is_baseline {
+                                ("基线登记人（开启审计时已存在，尚未发生审计后修改）", "登记人")
+                            } else {
+                                ("最后修改人（持久 Blame 溯源）", "作者")
+                            };
                             egui::Frame::NONE
                                 .fill(Color32::from_rgba_unmultiplied(16, 124, 65, 14))
                                 .corner_radius(6.0)
                                 .inner_margin(egui::Margin::symmetric(10, 8))
                                 .show(ui, |ui| {
-                                    ui.label(RichText::new("最后修改人（持久 Blame 溯源）").strong().size(12.0));
+                                    ui.label(RichText::new(role_title).strong().size(12.0));
                                     ui.label(format!(
-                                        "作者：{}（Windows 账户：{} · 设备：{}）",
+                                        "{who_prefix}：{}（Windows 账户：{} · 设备：{}）",
                                         blame.author.display_name,
                                         if blame.author.os_user.is_empty() { "-" } else { &blame.author.os_user },
                                         if blame.author.machine.is_empty() { "-" } else { &blame.author.machine },
@@ -1309,7 +1830,13 @@ impl SheetApp {
                         }
 
                         ui.add_space(8.0);
-                        let history = log.cell_history(&sheet_name, row, col);
+                        let history = match (live_sheet, committed_coord) {
+                            (Some(sh), Some((cr, cc))) => {
+                                log.cell_history_for_sheet(&self.wb, sh, cr, cc)
+                            }
+                            (None, _) => log.cell_history(&sheet_name, row, col),
+                            _ => Vec::new(),
+                        };
                         ui.label(RichText::new(format!("近期详细修改记录（{} 条）", history.len())).strong().size(12.0));
                         ui.separator();
                         if history.is_empty() {
@@ -1492,7 +2019,7 @@ mod tests {
             (host_wb.sheets[0].identity, 0, 1),
             verified_guest.clone(),
         );
-        host_audit_state.peer_attestations.insert(
+        host_audit_state.record_peer_attestation(
             2,
             PeerAttestationInput {
                 author: guest_author.clone(),
@@ -1694,5 +2221,395 @@ mod tests {
         assert!(app_clean.wb.audit.stripped_marker.is_none());
         assert!(app_clean.audit_state.verification.is_none());
         assert!(app2.wb.audit.log.is_some(), "导出干净副本绝不能影响原活文档的审计状态");
+    }
+
+    #[test]
+    fn review_182_parked_tab_load_initializes_baseline_and_records_first_edit() {
+        let env = crate::test_env::TestEnv::new("audit-parked-load");
+        let ledger = env.root().join("parked_ledger.xlsx");
+
+        let kp = generate_keypair().unwrap();
+        let alice = audit_store::current_author("王会计", &kp);
+        let mut init_wb = Workbook::new_blank();
+        init_wb.sheets[0].set(0, 0, Cell { value: Value::Number(100.0), formula: None });
+        let log1 = AuditLog::enable(&init_wb, alice, &kp, 1_700_000_000_000).unwrap();
+        init_wb.audit.log = Some(Arc::new(log1));
+        sheetcore::xlsx::save_atomic(&ledger, &init_wb).unwrap();
+
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.my_name = "王会计".into();
+        app.has_open_workbook = true;
+        // 发起打开后立刻切到新建标签，使账本在后台 Parked 状态完成加载
+        app.open_path(ledger.clone());
+        app.open_in_new_tab(PathBuf::new());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll_open();
+            let loaded = matches!(
+                app.tabs.first(),
+                Some(crate::TabSlot::Parked(doc)) if doc.tasks.open_rx.is_none() && doc.wb.audit.log.is_some()
+            );
+            if loaded {
+                break;
+            }
+            assert!(Instant::now() < deadline, "后台标签加载超时");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 切回账本标签页，把 A1 从 100 改成 275 并保存
+        app.switch_tab(0);
+        assert!(app.audit_state.baseline.is_some(), "后台加载完成后必须建立审计基线");
+        app.wb.sheets[0].set(0, 0, Cell { value: Value::Number(275.0), formula: None });
+        app.wb.dirty = true;
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.has_pending_save());
+
+        let reopened = sheetcore::xlsx::load(&ledger).unwrap();
+        let ver = verify_workbook_audit(&reopened).unwrap();
+        assert_eq!(ver.severity, AuditSeverity::Verified, "{:?}", ver.issues);
+        let rlog = reopened.audit.log.as_ref().unwrap();
+        assert_eq!(rlog.head_seq(), 2);
+        assert_eq!(rlog.commits[1].total_cell_changes, 1, "后台加载切回后首次编辑必须记录 1 格改动而非 0 格");
+        assert_eq!(rlog.commits[1].cells[0].before, AuditSnap::Num(100.0));
+        assert_eq!(rlog.commits[1].cells[0].after, AuditSnap::Num(275.0));
+    }
+
+    #[test]
+    fn review_182_crash_recovery_marks_gap_without_baseline_and_diffs_with_baseline() {
+        let env = crate::test_env::TestEnv::new("audit-crash-recovery");
+        let orig_path = env.root().join("orig_ledger.xlsx");
+        let missing_path = env.root().join("deleted_orig.xlsx");
+        let save_a = env.root().join("recovered_no_base.xlsx");
+        let save_b = env.root().join("recovered_with_base.xlsx");
+
+        let kp = generate_keypair().unwrap();
+        let alice = audit_store::current_author("财务甲", &kp);
+        let mut orig_wb = Workbook::new_blank();
+        orig_wb.sheets[0].set(0, 0, Cell { value: Value::Number(10.0), formula: None });
+        let log1 = AuditLog::enable(&orig_wb, alice, &kp, 1_700_000_000_000).unwrap();
+        orig_wb.audit.log = Some(Arc::new(log1.clone()));
+        sheetcore::xlsx::save_atomic(&orig_path, &orig_wb).unwrap();
+
+        // 模拟崩溃草稿：正文 A1 已改为 20，内嵌审计日志仍停在 #1（A1=10）
+        let mut draft_wb = orig_wb.clone();
+        draft_wb.sheets[0].set(0, 0, Cell { value: Value::Number(20.0), formula: None });
+        draft_wb.path = None;
+        draft_wb.dirty = true;
+
+        // 情况 A：原文件不可得 -> 另存必须记录恢复缺口与 HistoricalExternalGap，绝不签出“核验通过 + 0 格修改”
+        let mut app_a = SheetApp::new_with_context(&egui::Context::default(), None);
+        app_a.my_name = "财务甲".into();
+        app_a.wb = draft_wb.clone();
+        app_a.on_workbook_recovered_audit(Some(missing_path.to_string_lossy().as_ref()));
+        assert!(app_a.audit_state.pending_external_gap.is_some());
+        app_a.wb.path = Some(save_a.clone());
+        app_a.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app_a.has_pending_save() && Instant::now() < deadline {
+            app_a.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let reopened_a = sheetcore::xlsx::load(&save_a).unwrap();
+        let ver_a = verify_workbook_audit(&reopened_a).unwrap();
+        assert_eq!(ver_a.severity, AuditSeverity::Warning);
+        assert!(ver_a.issues.iter().any(|i| i.kind == AuditIssueKind::HistoricalExternalGap));
+        assert!(reopened_a.audit.log.as_ref().unwrap().commits[1]
+            .bulk_ops
+            .iter()
+            .any(|b| b.kind == "恢复缺口"));
+
+        // 情况 B：原文件在磁盘完好且匹配 #1 哈希 -> 自动恢复精确基线，另存记录 A1: 10 -> 20
+        let mut app_b = SheetApp::new_with_context(&egui::Context::default(), None);
+        app_b.my_name = "财务甲".into();
+        app_b.wb = draft_wb;
+        app_b.on_workbook_recovered_audit(Some(orig_path.to_string_lossy().as_ref()));
+        assert!(app_b.audit_state.pending_external_gap.is_none());
+        app_b.wb.path = Some(save_b.clone());
+        app_b.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app_b.has_pending_save() && Instant::now() < deadline {
+            app_b.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let reopened_b = sheetcore::xlsx::load(&save_b).unwrap();
+        let ver_b = verify_workbook_audit(&reopened_b).unwrap();
+        assert_eq!(ver_b.severity, AuditSeverity::Verified, "{:?}", ver_b.issues);
+        let log_b = reopened_b.audit.log.as_ref().unwrap();
+        assert_eq!(log_b.commits[1].total_cell_changes, 1);
+        assert_eq!(log_b.commits[1].cells[0].before, AuditSnap::Num(10.0));
+        assert_eq!(log_b.commits[1].cells[0].after, AuditSnap::Num(20.0));
+    }
+
+    #[test]
+    fn review_182_insert_row_then_ctrl_z_restores_blame_and_clears_structural_log() {
+        let env = crate::test_env::TestEnv::new("audit-insert-undo");
+        let ledger = env.root().join("undo_row.xlsx");
+
+        let mut init_wb = Workbook::new_blank();
+        init_wb.sheets[0].set(0, 0, Cell { value: Value::Number(500.0), formula: None });
+        sheetcore::xlsx::save_atomic(&ledger, &init_wb).unwrap();
+
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.my_name = "李出纳".into();
+        app.open_path(ledger.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.tasks.open_rx.is_some() && Instant::now() < deadline {
+            app.poll_open();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.enable_audit_for_current_workbook();
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 在 A1 前插入 1 行，再立即 Ctrl+Z 撤销，然后保存
+        app.apply_local_structural(0, sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+        assert_eq!(app.audit_state.pending_structural_ops.len(), 1);
+        assert!(app.apply_undo(false), "Ctrl+Z 撤销插行应成功");
+        assert!(app.audit_state.pending_structural_ops.is_empty(), "撤销插行后待提交结构列表必须清空");
+        assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(500.0));
+
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let reopened = sheetcore::xlsx::load(&ledger).unwrap();
+        let log = reopened.audit.log.as_ref().unwrap();
+        assert_eq!(log.head_seq(), 1, "插行后撤销再保存不得产生幽灵「插入 1 行」提交");
+        assert!(log.lookup_blame("Sheet1", 0, 0).is_some(), "A1 必须保留原 Blame 归属");
+        assert!(log.lookup_blame("Sheet1", 1, 0).is_none(), "空白 A2 不得残留错位 Blame");
+    }
+
+    #[test]
+    fn review_182_save_as_xls_warns_clears_audit_and_does_not_poison_watermark() {
+        let env = crate::test_env::TestEnv::new("audit-save-xls");
+        let xlsx_path = env.root().join("audited.xlsx");
+        let xls_path = env.root().join("downgraded.xls");
+
+        let mut init_wb = Workbook::new_blank();
+        init_wb.sheets[0].set(0, 0, Cell { value: Value::Number(88.0), formula: None });
+        sheetcore::xlsx::save_atomic(&xlsx_path, &init_wb).unwrap();
+
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.my_name = "周经理".into();
+        app.open_path(xlsx_path.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.tasks.open_rx.is_some() && Instant::now() < deadline {
+            app.poll_open();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.enable_audit_for_current_workbook();
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 1. 兼容警告必须明确指出 .xls 将丢失审计链
+        let warns = sheetcore::xls_write::compatibility_warnings(&app.wb);
+        assert!(
+            warns.iter().any(|w| w.contains("审计")),
+            "另存为 .xls 兼容提示不能为空且须提醒审计链丢失: {warns:?}"
+        );
+
+        // 2. 真实另存为 .xls
+        app.wb.path = Some(xls_path.clone());
+        app.wb.dirty = true;
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.wb.audit.log.is_none(), "另存为 .xls 后内存工作簿不得继续残留启用态");
+        assert!(app.audit_state.verification.is_none(), "另存为 .xls 后界面核验态必须清空");
+        assert!(
+            app.notice.as_ref().is_some_and(|n| n.tag == Some("audit_xls_loss")),
+            "另存为 .xls 后必须弹出审计丢失警告横幅"
+        );
+
+        // 3. 同机重新打开该 .xls，绝不能误触发路径水印回滚告警
+        let mut app2 = SheetApp::new_with_context(&egui::Context::default(), None);
+        app2.open_path(xls_path.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app2.tasks.open_rx.is_some() && Instant::now() < deadline {
+            app2.poll_open();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app2.audit_state.verification.is_none(),
+            "重开另存出的 .xls 不得命中路径水印回滚告警: {:?}",
+            app2.audit_state.verification
+        );
+    }
+
+    #[test]
+    fn review_182_bulk_style_over_1024_and_concurrent_style_during_save_are_recorded() {
+        let env = crate::test_env::TestEnv::new("audit-style-paths");
+        let ledger = env.root().join("styles.xlsx");
+
+        let mut init_wb = Workbook::new_blank();
+        init_wb.sheets[0].set(0, 0, Cell { value: Value::Number(0.25), formula: None });
+        sheetcore::xlsx::save_atomic(&ledger, &init_wb).unwrap();
+
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.my_name = "孙会计".into();
+        app.open_path(ledger.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.tasks.open_rx.is_some() && Instant::now() < deadline {
+            app.poll_open();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.enable_audit_for_current_workbook();
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 路径 A：一次性给 A1:A1025（>1024 格，走 CoW 批量路径）设置百分比格式
+        app.sel = (0, 0);
+        app.sel_end = (1024, 0);
+        app.apply_style(|st| st.format = "0.00%".into());
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let log2 = app.wb.audit.log.as_ref().unwrap();
+        assert_eq!(log2.head_seq(), 2, "超过 1024 格的纯格式批量设置必须记入审计日志");
+        assert!(log2.commits[1].bulk_ops.iter().any(|b| b.kind == "格式变更"));
+
+        // 路径 B：修改金额并启动后台保存，在保存完成回执到达前设置 B1 百分比格式，随后再保存一次
+        app.wb.sheets[0].set(0, 0, Cell { value: Value::Number(0.5), formula: None });
+        app.wb.dirty = true;
+        app.save(false);
+        // 在 poll_save 之前（模拟后台写盘飞行期间）追加新格式改动
+        app.sel = (0, 1);
+        app.sel_end = (0, 1);
+        app.apply_style(|st| st.format = "0.00%".into());
+        assert!(!app.audit_state.dirty_bulk_ops.is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !app.audit_state.dirty_bulk_ops.is_empty(),
+            "上一轮保存回执到达时绝不能清空飞行期间新增的格式事件"
+        );
+
+        // 第二次保存必须把飞行期间新增的格式事件记为第 #4 版
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let log4 = app.wb.audit.log.as_ref().unwrap();
+        assert_eq!(log4.head_seq(), 4, "并发新增的纯格式事件必须在下一次保存落账");
+        assert!(log4.commits[3].bulk_ops.iter().any(|b| b.kind == "格式变更"));
+    }
+
+    #[test]
+    fn review_182_collab_guest_style_and_peer_left_preserve_attestation() {
+        let env = crate::test_env::TestEnv::new("audit-collab-regress");
+        let ledger = env.root().join("collab_reg.xlsx");
+
+        let host_kp = generate_keypair().unwrap();
+        let guest_kp = generate_keypair().unwrap();
+        let host_author = audit_store::current_author("宿主", &host_kp);
+        let guest_author = audit_store::current_author("访客", &guest_kp);
+
+        let mut host_wb = Workbook::new_blank();
+        host_wb.sheets[0].set(0, 0, Cell { value: Value::Number(100.0), formula: None });
+        let log1 = AuditLog::enable(&host_wb, host_author, &host_kp, 1_700_000_000_000).unwrap();
+        host_wb.audit.log = Some(Arc::new(log1.clone()));
+        sheetcore::xlsx::save_atomic(&ledger, &host_wb).unwrap();
+
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.my_name = "宿主".into();
+        app.audit_keypair = Some(host_kp.clone());
+        app.open_path(ledger.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.tasks.open_rx.is_some() && Instant::now() < deadline {
+            app.poll_open();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 1. 访客仅对已有单元格加粗（纯样式操作）
+        app.audit_state.peer_identities.insert(2, guest_author.clone());
+        app.audit_note_remote_bulk(2, 0, "格式变更", "格式变更（1 格）".into());
+        app.wb.dirty = true;
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let log2 = app.wb.audit.log.as_ref().unwrap();
+        assert_eq!(log2.head_seq(), 2, "访客纯格式修改必须产生审计提交");
+        let bold_op = log2.commits[1]
+            .bulk_ops
+            .iter()
+            .find(|b| b.kind == "格式变更")
+            .expect("应包含访客格式变更摘要");
+        assert_eq!(
+            log2.author_of(bold_op.author_idx).unwrap().pubkey_hex,
+            guest_kp.pubkey_hex
+        );
+
+        // 2. 访客编辑 B1=300 并提交独立联署，随后离线（移除 peer_identities 但保留 peer_attestations）
+        app.audit_state.peer_identities.insert(2, guest_author.clone());
+        let g_cells = vec![("Sheet1".to_string(), 0, 1, AuditSnap::Empty, AuditSnap::Num(300.0))];
+        let g_dig = author_contribution_digest(&log2.doc_id, 2, &g_cells);
+        let g_sig = guest_kp.sign_digest(&g_dig).unwrap();
+        app.audit_state.dirty_cell_authors.insert(
+            (app.wb.sheets[0].identity, 0, 1),
+            guest_author.clone(),
+        );
+        app.audit_state.record_peer_attestation(
+            2,
+            PeerAttestationInput {
+                author: guest_author.clone(),
+                changes_digest: sheetcore::audit::hex_encode(&g_dig),
+                sig_hex: g_sig,
+                attested_by_peer: true,
+            },
+        );
+        app.wb.sheets[0].set(0, 1, Cell { value: Value::Number(300.0), formula: None });
+        app.wb.dirty = true;
+        // 模拟访客正常离线（只移除在线身份表，不删已收到的联署证明）
+        app.audit_state.peer_identities.remove(&2);
+
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let log3 = app.wb.audit.log.as_ref().unwrap();
+        assert_eq!(log3.head_seq(), 3);
+        assert_eq!(log3.commits[2].co_signers.len(), 1);
+        assert!(
+            log3.commits[2].co_signers[0].attested_by_peer,
+            "访客提交联署后离线，宿主保存时必须保留其有效独立联署"
+        );
     }
 }
