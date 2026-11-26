@@ -128,7 +128,7 @@ pub enum NetEvent {
     /// 协作者请求宿主将权威状态写回原文件
     SaveRequested { site: u32, name: String },
     /// 宿主已完成原文件保存，通知在线成员清除脏状态
-    Saved { clock: u64 },
+    Saved { clock: u64, watermark_seq: Option<u64> },
     /// 房间内有成员持有经过官方公钥校验的新版本可执行文件
     PeerUpdateOffer {
         peer_site: u32,
@@ -1578,6 +1578,8 @@ pub struct Net {
     pending_structure: Arc<AtomicBool>,
     #[cfg(test)]
     unconfirmed_styles: Arc<AtomicU64>,
+    last_watermark_seq: Arc<AtomicU64>,
+    min_saved_watermark: Arc<AtomicU64>,
     pending_sorts: Arc<Mutex<std::collections::BTreeMap<u64,Arc<SortBatch>>>>,
     local_sort_ranges: Mutex<Vec<(u64,u64)>>,
     cmd: Sender<Cmd>,
@@ -3506,6 +3508,54 @@ impl Net {
         }
     }
 
+    /// 获取宿主当前权威房间水位 `(wm_seq, struct_rev)`（无未保存改动时直接回执用）。
+    pub fn current_watermark_cursor(&self) -> Option<(u64, usize)> {
+        if !self.hosting {
+            return None;
+        }
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let wm_seq = self.host_watermark.as_ref()?.lock().unwrap().seq;
+        let srev = self
+            .host_structs
+            .as_ref()
+            .map_or(0, |h| h.lock().unwrap().len());
+        Some((wm_seq, srev))
+    }
+
+    fn note_local_watermark_edit(&self) {
+        if self.hosting {
+            return;
+        }
+        let cur_wm = self.last_watermark_seq.load(Ordering::Acquire);
+        let _ = self.min_saved_watermark.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |prev| Some(prev.max(cur_wm).saturating_add(1)),
+        );
+    }
+
+    /// 检查宿主发来的保存回执是否覆盖了本访客自上次保存以来发出的所有非单元格水位变更（列宽/行高/样式/合并等）。
+    pub fn save_watermark_satisfied(&self, saved_wm: Option<u64>) -> bool {
+        let min_needed = self.min_saved_watermark.load(Ordering::Acquire);
+        if min_needed == 0 {
+            return true;
+        }
+        let cur_wm = self.last_watermark_seq.load(Ordering::Acquire);
+        saved_wm.is_some_and(|wm| wm >= min_needed && wm >= cur_wm)
+    }
+
+    /// 当宿主保存回执确认覆盖当前水位后，清理已落盘的最低水位要求（并发新编辑推进更高水位时自动保留）。
+    pub fn clear_saved_watermark(&self, saved_wm: Option<u64>) {
+        let Some(wm) = saved_wm else {
+            return;
+        };
+        let _ = self.min_saved_watermark.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |cur| if cur <= wm { Some(0) } else { Some(cur) },
+        );
+    }
+
     /// 在发起后台保存（拍摄 `Workbook` 快照）的同一时刻捕获权威房间水位 `(wm_seq, struct_rev)`，
     /// 杜绝写盘期间新编辑推进水位导致检查点超前；既可传给 `broadcast_saved_with_cursor`，也会自动暂存供同 `clock` 的 `broadcast_saved` 消费。
     #[allow(dead_code)]
@@ -3605,7 +3655,12 @@ impl Net {
                 wm_guard.record_checkpoint(hash, saved_seq, saved_srev);
             });
         }
-        let msg = Msg::Saved { site: self.site, clock };
+        let watermark_seq = cursor.map(|(seq, _)| seq);
+        let msg = Msg::Saved {
+            site: self.site,
+            clock,
+            watermark_seq,
+        };
         if let Ok(s) = serde_json::to_string(&msg) {
             let _ = self.cmd.send(Cmd::Broadcast(s));
         }
@@ -3744,6 +3799,7 @@ impl Net {
                     items,
                 }
             };
+            self.note_local_watermark_edit();
             let _ = self.cmd.send(Cmd::Style(msg));
         }
     }
@@ -3800,6 +3856,7 @@ impl Net {
                 emit_room_watermark(&self.cmd, roster, seq, struct_rev);
             }
         } else {
+            self.note_local_watermark_edit();
             let _ = self.cmd.send(Cmd::Style(msg));
         }
     }
@@ -3847,14 +3904,16 @@ impl Net {
                 emit_room_watermark(&self.cmd, roster, seq, struct_rev);
             }
         } else if let Ok(s) = serde_json::to_string(&msg) {
+            self.note_local_watermark_edit();
             let _ = self.cmd.send(Cmd::Broadcast(s));
         }
     }
 
-    /// 广播工作表高频非单元格元数据变更（列宽/行高/隐藏/冻结/批注/超链接/筛选/工作表标签）
-    pub fn broadcast_sheet_meta(&self, sheet: usize, kind: sheetcore::sync::SheetMetaKind) {
-        if !kind.valid(sheet) {
-            return;
+    /// 广播工作表高频非单元格元数据变更（列宽/行高/隐藏/冻结/批注/超链接/筛选/工作表标签）。
+    /// 返回 `true` 表示载荷合法并已提交发送队列；超限或非法载荷返回 `false`（调用方不得误标为已同步）。
+    pub fn broadcast_sheet_meta(&self, sheet: usize, kind: sheetcore::sync::SheetMetaKind) -> bool {
+        if !kind.valid(sheet) || !self.alive.load(Ordering::Acquire) {
+            return false;
         }
         let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
         if let Some(log) = &self.host_meta_log {
@@ -3883,8 +3942,12 @@ impl Net {
             if let Some(seq) = wm_seq {
                 emit_room_watermark(&self.cmd, roster, seq, struct_rev);
             }
+            true
         } else if let Ok(s) = serde_json::to_string(&msg) {
-            let _ = self.cmd.send(Cmd::Broadcast(s));
+            self.note_local_watermark_edit();
+            self.cmd.send(Cmd::Broadcast(s)).is_ok()
+        } else {
+            false
         }
     }
 
@@ -6333,6 +6396,8 @@ fn host_initialized(
         pending_structure: Default::default(),
         #[cfg(test)]
         unconfirmed_styles: Default::default(),
+        last_watermark_seq: Default::default(),
+        min_saved_watermark: Default::default(),
         structural_ack: Default::default(),
         palette_styles_cap: Arc::new(AtomicBool::new(true)),
         connection_generation: Default::default(),
@@ -6754,6 +6819,10 @@ fn join_session(
     let unconfirmed_styles = Arc::new(AtomicU64::new(0));
     let unconfirmed_styles_for_writer = unconfirmed_styles.clone();
     let unconfirmed_styles_for_reader = unconfirmed_styles.clone();
+    let last_watermark_seq = Arc::new(AtomicU64::new(0));
+    let last_wm_for_reader = last_watermark_seq.clone();
+    let min_saved_watermark = Arc::new(AtomicU64::new(0));
+    let min_saved_wm_for_reader = min_saved_watermark.clone();
     // 写线程
     {
         let writer = writer.clone();
@@ -7152,6 +7221,7 @@ fn join_session(
                             conn_room_id = room_id;
                             conn_welcome_wm = watermark;
                             conn_welcome_srev = structure_revision;
+                            last_wm_for_reader.fetch_max(watermark, Ordering::AcqRel);
                             if !delta_sync {
                                 resume_state = None;
                             }
@@ -7298,6 +7368,7 @@ fn join_session(
                             let _ = evt_tx.send(NetEvent::SnapshotDone);
                         }
                         Msg::Watermark { seq, structure_revision } => {
+                            last_wm_for_reader.fetch_max(seq, Ordering::AcqRel);
                             if synced_once && !conn_room_id.is_empty() {
                                 resume_state =
                                     Some((conn_room_id.clone(), seq, structure_revision));
@@ -7307,9 +7378,23 @@ fn join_session(
                             }
                         }
                         Msg::Op(op) => {
+                            if !in_initial_snapshot
+                                && op.site != site
+                                && min_saved_wm_for_reader.load(Ordering::Acquire)
+                                    > last_wm_for_reader.load(Ordering::Acquire)
+                            {
+                                min_saved_wm_for_reader.fetch_add(1, Ordering::AcqRel);
+                            }
                             let _ = evt_tx.send(NetEvent::Ops(vec![op]));
                         }
                         Msg::Ops { ops } => {
+                            if !in_initial_snapshot
+                                && ops.iter().any(|o| o.site != site)
+                                && min_saved_wm_for_reader.load(Ordering::Acquire)
+                                    > last_wm_for_reader.load(Ordering::Acquire)
+                            {
+                                min_saved_wm_for_reader.fetch_add(1, Ordering::AcqRel);
+                            }
                             let _ = evt_tx.send(NetEvent::Ops(ops));
                         }
                         Msg::StructureRevision { revision } => {
@@ -7426,6 +7511,13 @@ fn join_session(
                             }
                         }
                         Msg::SheetMetaOp { site: msite, sheet, ts: _, kind } => {
+                            if !in_initial_snapshot
+                                && msite != site
+                                && min_saved_wm_for_reader.load(Ordering::Acquire)
+                                    > last_wm_for_reader.load(Ordering::Acquire)
+                            {
+                                min_saved_wm_for_reader.fetch_add(1, Ordering::AcqRel);
+                            }
                             let _ = evt_tx.send(NetEvent::SheetMeta {
                                 site: msite,
                                 sheet,
@@ -7479,8 +7571,8 @@ fn join_session(
                         Msg::LockRelease { site, sheet, row, col } => {
                             let _ = evt_tx.send(NetEvent::LockRelease { site, sheet, row, col });
                         }
-                        Msg::Saved { clock, .. } => {
-                            let _ = evt_tx.send(NetEvent::Saved { clock });
+                        Msg::Saved { clock, watermark_seq, .. } => {
+                            let _ = evt_tx.send(NetEvent::Saved { clock, watermark_seq });
                         }
                         Msg::CursorMsg(c) => {
                             let _ = evt_tx.send_cursor(NetEvent::Cursor(c));
@@ -7663,6 +7755,8 @@ fn join_session(
         pending_structure,
         #[cfg(test)]
         unconfirmed_styles,
+        last_watermark_seq,
+        min_saved_watermark,
         structural_ack,
         palette_styles_cap,
         connection_generation,

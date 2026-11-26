@@ -18,6 +18,70 @@ pub struct Note {
     pub author: String,
 }
 
+/// 校验字符串是否为合法的 OOXML `ST_Guid`（`{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`）。
+pub fn is_valid_ooxml_guid(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 38 || b[0] != b'{' || b[37] != b'}' {
+        return false;
+    }
+    for (i, &ch) in b[1..37].iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if ch != b'-' {
+                return false;
+            }
+        } else if !ch.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn format_ooxml_guid(mut bytes: [u8; 16], version: u8) -> String {
+    bytes[6] = (bytes[6] & 0x0F) | ((version & 0x0F) << 4);
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    format!(
+        "{{{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5],
+        bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    )
+}
+
+/// 生成符合 MS-XLSX `ST_Guid` 规范的随机 RFC 4122 v4 GUID（大写十六进制、花括号包裹）。
+pub fn new_ooxml_guid() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        use sha2::{Digest, Sha256};
+        static FALLBACK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let seq = FALLBACK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut h = Sha256::new();
+        h.update(b"CELLAN-GUID-FALLBACK-V1");
+        h.update(now.to_le_bytes());
+        h.update(seq.to_le_bytes());
+        h.update(std::process::id().to_le_bytes());
+        bytes.copy_from_slice(&h.finalize()[..16]);
+    }
+    format_ooxml_guid(bytes, 4)
+}
+
+/// 基于确定性种子派生符合 `ST_Guid` 规范的 RFC 4122 v5 风格 GUID（同一作者在同簿内稳定复用）。
+fn deterministic_ooxml_guid(namespace: &[u8], seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(namespace);
+    h.update(seed.as_bytes());
+    let digest = h.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    format_ooxml_guid(bytes, 5)
+}
+
 /// Excel 365 原生线程批注中的单条发言（主贴或回复）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadEntry {
@@ -332,11 +396,15 @@ pub fn write_sheet_threaded_comments(
     let person_part = "xl/persons/person.xml".to_string();
     let mut person_by_name: HashMap<String, String> = HashMap::new();
     let mut person_list: Vec<(String, String)> = Vec::new();
+    let mut used_person_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(raw_p) = crate::fixups::read_part(path, &person_part) {
         if let Ok(px) = crate::xlsx::patch_xml_text(&raw_p, &person_part) {
             for (id, disp) in parse_persons(&px) {
-                person_by_name.insert(disp.clone(), id.clone());
-                person_list.push((id, disp));
+                if is_valid_ooxml_guid(&id) {
+                    used_person_ids.insert(id.to_ascii_uppercase());
+                    person_by_name.insert(disp.clone(), id.clone());
+                    person_list.push((id, disp));
+                }
             }
         }
     }
@@ -345,8 +413,10 @@ pub fn write_sheet_threaded_comments(
         if let Some(id) = person_by_name.get(disp) {
             return id.clone();
         }
-        let idx = person_list.len() + 1;
-        let id = format!("{{CELLAN-PERSON-{idx:012}}}",);
+        let mut id = deterministic_ooxml_guid(b"CELLAN-OOXML-PERSON-V1:", disp);
+        while !used_person_ids.insert(id.to_ascii_uppercase()) {
+            id = new_ooxml_guid();
+        }
         person_by_name.insert(disp.to_string(), id.clone());
         person_list.push((id.clone(), disp.to_string()));
         id
@@ -361,18 +431,23 @@ pub fn write_sheet_threaded_comments(
     let mut tc_xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><ThreadedComments xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments\">",
     );
-    let mut seq = 1usize;
+    let mut used_comment_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for &(r, c, tc) in &items {
         let coord = crate::model::cell_name(r, c);
         let mut root_id = String::new();
         for (i, entry) in tc.entries.iter().enumerate() {
             let pid = ensure_person(&entry.author);
-            let eid = if entry.id.trim().is_empty() {
-                let g = format!("{{CELLAN-TC-{r}-{c}-{seq}}}");
-                seq += 1;
-                g
+            let trimmed_id = entry.id.trim();
+            let eid = if is_valid_ooxml_guid(trimmed_id)
+                && used_comment_ids.insert(trimmed_id.to_ascii_uppercase())
+            {
+                trimmed_id.to_ascii_uppercase()
             } else {
-                entry.id.clone()
+                let mut g = new_ooxml_guid();
+                while !used_comment_ids.insert(g.to_ascii_uppercase()) {
+                    g = new_ooxml_guid();
+                }
+                g
             };
             if i == 0 {
                 root_id = eid.clone();

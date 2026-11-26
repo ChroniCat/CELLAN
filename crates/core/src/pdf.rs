@@ -757,6 +757,61 @@ impl Page {
         let _ = writeln!(self.ops, "q {w:.2} 0 0 {h:.2} {x:.2} {y:.2} cm /{name} Do Q");
     }
 
+    /// 绘制带可选裁剪（对未在像素层裁切的流如 JPEG）与顺时针旋转角度（度）的图片。
+    pub fn image_transformed(
+        &mut self,
+        name: &str,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        crop: Option<[f32; 4]>,
+        rot_deg: f32,
+    ) {
+        let rot = rot_deg.rem_euclid(360.0);
+        let has_rot = rot > 0.01 && (360.0 - rot) > 0.01;
+        if crop.is_none() && !has_rot {
+            self.image(name, x, y, w, h);
+            return;
+        }
+        let cx = x + w * 0.5;
+        let cy = y + h * 0.5;
+        // 屏幕/OOXML 顺时针角度对应 PDF（y 向上）负角度
+        let theta = -rot.to_radians();
+        let (raw_s, raw_c) = theta.sin_cos();
+        let clean = |v: f32| if v.abs() < 1e-5 { 0.0 } else { v };
+        let s = clean(raw_s);
+        let c = clean(raw_c);
+        if let Some(cr) = crop {
+            let u0 = cr[0].clamp(0.0, 0.9);
+            let v0 = cr[1].clamp(0.0, 0.9);
+            let u1 = (1.0 - cr[2]).clamp((u0 + 0.02).min(1.0), 1.0);
+            let v1 = (1.0 - cr[3]).clamp((v0 + 0.02).min(1.0), 1.0);
+            let full_w = w / (u1 - u0);
+            let full_h = h / (v1 - v0);
+            let ox = -u0 * full_w;
+            let oy = -(1.0 - v1) * full_h;
+            let tx = cx - 0.5 * w * c + 0.5 * h * s;
+            let ty = cy - 0.5 * w * s - 0.5 * h * c;
+            let _ = writeln!(
+                self.ops,
+                "q {c:.5} {s:.5} {:.5} {c:.5} {tx:.2} {ty:.2} cm 0 0 {w:.2} {h:.2} re W n {full_w:.2} 0 0 {full_h:.2} {ox:.2} {oy:.2} cm /{name} Do Q",
+                clean(-s),
+            );
+        } else {
+            let a = clean(w * c);
+            let b = clean(w * s);
+            let cm_c = clean(-h * s);
+            let d = clean(h * c);
+            let e = cx - 0.5 * a - 0.5 * cm_c;
+            let f = cy - 0.5 * b - 0.5 * d;
+            let _ = writeln!(
+                self.ops,
+                "q {a:.4} {b:.4} {cm_c:.4} {d:.4} {e:.2} {f:.2} cm /{name} Do Q"
+            );
+        }
+    }
+
     /// 任意折线/多边形：填充时用 `rg + h f`，描边时用 `RG + S`（修复旧版描边写死黑色 bug）
     pub fn poly(&mut self, pts: &[(f32, f32)], rgb: [u8; 3], fill: bool) {
         self.poly_styled(pts, 1.2, rgb, &[], fill, 1.0);

@@ -8040,7 +8040,12 @@ fn bin_scalar(op: BinOp, lv: &FValue, rv: &FValue) -> FValue {
                 BinOp::Add => {
                     let s = a + b;
                     let scale = a.abs().max(b.abs());
-                    if scale > 0.0 && s.abs() <= scale * 1e-15 {
+                    let both_exact_int = a.fract() == 0.0 && b.fract() == 0.0;
+                    if s == 0.0
+                        || (!both_exact_int
+                            && scale > 0.0
+                            && s.abs() <= scale * (2.0 * f64::EPSILON))
+                    {
                         FValue::number(0.0)
                     } else {
                         FValue::number(s)
@@ -8049,7 +8054,12 @@ fn bin_scalar(op: BinOp, lv: &FValue, rv: &FValue) -> FValue {
                 BinOp::Sub => {
                     let s = a - b;
                     let scale = a.abs().max(b.abs());
-                    if scale > 0.0 && s.abs() <= scale * 1e-15 {
+                    let both_exact_int = a.fract() == 0.0 && b.fract() == 0.0;
+                    if s == 0.0
+                        || (!both_exact_int
+                            && scale > 0.0
+                            && s.abs() <= scale * (2.0 * f64::EPSILON))
+                    {
                         FValue::number(0.0)
                     } else {
                         FValue::number(s)

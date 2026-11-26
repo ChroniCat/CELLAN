@@ -260,8 +260,13 @@ pub(crate) fn paint_out_on_egui(
         painter.add(egui::Shape::mesh(mesh));
     }
 
-    // 4. 真实图片（按内容指纹缓存 TextureHandle）
-    for (x, y, w, h, name, bytes, _ext) in &ops.images {
+    // 4. 真实图片（按内容指纹缓存 TextureHandle，完整还原裁剪比例与顺时针旋转角度）
+    for (idx, (x, y, w, h, name, bytes, _ext)) in ops.images.iter().enumerate() {
+        let (crop, rot_deg) = ops
+            .image_transforms
+            .get(idx)
+            .copied()
+            .unwrap_or(([0.0; 4], 0.0));
         let key = format!("print_img:{name}:{}", bytes.len());
         if !textures.contains_key(&key) {
             if textures.len() > 48 {
@@ -277,12 +282,32 @@ pub(crate) fn paint_out_on_egui(
         }
         let dest = Rect::from_min_max(to_xy(*x, *y + *h), to_xy(*x + *w, *y));
         if let Some(tex) = textures.get(&key) {
-            painter.image(
-                tex.id(),
-                dest,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            let u0 = crop[0].clamp(0.0, 0.9);
+            let v0 = crop[1].clamp(0.0, 0.9);
+            let u1 = (1.0 - crop[2]).clamp((u0 + 0.02).min(1.0), 1.0);
+            let v1 = (1.0 - crop[3]).clamp((v0 + 0.02).min(1.0), 1.0);
+            let uv = Rect::from_min_max(Pos2::new(u0, v0), Pos2::new(u1, v1));
+            let rot = rot_deg.rem_euclid(360.0);
+            if rot > 0.01 && (360.0 - rot) > 0.01 {
+                let rad = rot.to_radians();
+                let (sin_a, cos_a) = rad.sin_cos();
+                let c = dest.center();
+                let rot_pt = |pt: Pos2| -> Pos2 {
+                    let dx = pt.x - c.x;
+                    let dy = pt.y - c.y;
+                    Pos2::new(c.x + dx * cos_a - dy * sin_a, c.y + dx * sin_a + dy * cos_a)
+                };
+                let mut mesh = egui::Mesh::with_texture(tex.id());
+                mesh.vertices.push(egui::epaint::Vertex { pos: rot_pt(dest.left_top()), uv: uv.left_top(), color: Color32::WHITE });
+                mesh.vertices.push(egui::epaint::Vertex { pos: rot_pt(dest.right_top()), uv: uv.right_top(), color: Color32::WHITE });
+                mesh.vertices.push(egui::epaint::Vertex { pos: rot_pt(dest.right_bottom()), uv: uv.right_bottom(), color: Color32::WHITE });
+                mesh.vertices.push(egui::epaint::Vertex { pos: rot_pt(dest.left_bottom()), uv: uv.left_bottom(), color: Color32::WHITE });
+                mesh.add_triangle(0, 1, 2);
+                mesh.add_triangle(0, 2, 3);
+                painter.add(egui::Shape::mesh(mesh));
+            } else {
+                painter.image(tex.id(), dest, uv, Color32::WHITE);
+            }
         } else {
             painter.rect_stroke(
                 dest,
@@ -623,8 +648,10 @@ impl SheetApp {
                         layout.pages.len().max(1)
                     ));
                 }
+                let mut sheet_renderer =
+                    sheetcore::print::SheetPageRenderer::new(&wb_snap, idx);
                 for pi in page_list {
-                    let out = page_ops_with(&wb_snap, idx, &layout, pi, source);
+                    let out = sheet_renderer.page_ops(&layout, pi, source);
                     rendered.push((pw, ph, setup.paper, setup.landscape, out));
                 }
                 if scope == 1 || print_range == 0 {

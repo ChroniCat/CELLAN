@@ -634,19 +634,35 @@ impl SheetApp {
                     }
                     for blk in &sheet.cf.blocks {
                         let mut rel_ranges = Vec::new();
+                        let mut first_abs: Option<(u32, u32)> = None;
                         for &(cr1, cc1, cr2, cc2) in &blk.ranges {
                             let ir1 = cr1.max(r1);
                             let ic1 = cc1.max(c1);
                             let ir2 = cr2.min(r2);
                             let ic2 = cc2.min(c2);
                             if ir1 <= ir2 && ic1 <= ic2 {
+                                if first_abs.is_none() {
+                                    first_abs = Some((ir1, ic1));
+                                }
                                 rel_ranges.push((ir1 - r1, ic1 - c1, ir2 - r1, ic2 - c1));
                             }
                         }
                         if !rel_ranges.is_empty() {
+                            let mut rules = blk.rules.clone();
+                            // 将规则内的相对引用归一化到裁剪后首个命中格 (first_abs)，
+                            // 以便格式刷贴到任意目标位置时按目标锚点精确平移。
+                            if let (Some((orig_ar, orig_ac)), Some((cur_ar, cur_ac))) =
+                                (blk.ranges.first().map(|&(a, b, _, _)| (a, b)), first_abs)
+                            {
+                                let dr = i64::from(cur_ar) - i64::from(orig_ar);
+                                let dc = i64::from(cur_ac) - i64::from(orig_ac);
+                                if dr != 0 || dc != 0 {
+                                    SheetApp::translate_cf_rules(&mut rules, dr, dc, &sheet.name);
+                                }
+                            }
                             cf_blocks.push(sheetcore::cf::CfBlock {
                                 ranges: rel_ranges,
-                                rules: blk.rules.clone(),
+                                rules,
                             });
                         }
                     }

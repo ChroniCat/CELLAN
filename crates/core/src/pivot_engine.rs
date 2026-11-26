@@ -2236,8 +2236,54 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
     // 为 ShowAs（占行/列/总计/父级百分比与索引）保留真实聚合分母，
     // 避免 Average / Min / Max / StdDev / DistinctCount 等非可加聚合被错误地对明细行求和。
     let mut true_row_totals: Vec<Vec<Option<f64>>> = Vec::new();
-    let mut true_parent_row_totals: HashMap<(String, usize), f64> = HashMap::new();
+    let mut true_parent_row_totals: HashMap<(Vec<String>, usize), f64> = HashMap::new();
+    let mut true_parent_col_totals: Vec<HashMap<(Vec<String>, usize), f64>> = Vec::new();
     let mut grand_total_row: Option<usize> = None;
+
+    let need_parent_col = spec
+        .values
+        .iter()
+        .any(|v| v.show_as == ShowAs::PercentOfParentCol);
+    // 收集所有列路径的非空真前缀（用于任意深度的「占父列汇总%」）
+    let col_parent_prefixes: Vec<Vec<String>> = if need_parent_col && spec.cols.len() >= 2 {
+        let mut seen: HashSet<Vec<String>> = HashSet::new();
+        let mut prefs = Vec::new();
+        for cp in col_paths_by_grid_col.iter().flatten() {
+            for len in 1..cp.len() {
+                let p = cp[..len].to_vec();
+                if seen.insert(p.clone()) {
+                    prefs.push(p);
+                }
+            }
+        }
+        prefs
+    } else {
+        Vec::new()
+    };
+
+    let eval_parent_col_totals_for_cm =
+        |cols_map: &BTreeMap<Vec<String>, CellBucket>| -> HashMap<(Vec<String>, usize), f64> {
+            let mut out = HashMap::new();
+            if col_parent_prefixes.is_empty() {
+                return out;
+            }
+            for pref in &col_parent_prefixes {
+                let mut merged = make_bucket();
+                for (cp, b) in cols_map {
+                    if cp.starts_with(pref) {
+                        merge_bucket(&mut merged, b);
+                    }
+                }
+                for vi in 0..total_val_count {
+                    if let Value::Number(n) = finish_slot(&merged, vi)
+                        && n.is_finite()
+                    {
+                        out.insert((pref.clone(), vi), n);
+                    }
+                }
+            }
+            out
+        };
 
     let eval_row_totals_for_cm = |cols_map: &BTreeMap<Vec<String>, CellBucket>| -> Vec<Option<f64>> {
         let mut row_all = make_bucket();
@@ -2325,6 +2371,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
             row_indents_data.push(0);
             row_paths_data.push(Some(Vec::new()));
             true_row_totals.push(eval_row_totals_for_cm(&all_cm));
+            true_parent_col_totals.push(eval_parent_col_totals_for_cm(&all_cm));
         }
     } else if spec.rows.len() == 1 {
         for rp in &row_paths {
@@ -2339,8 +2386,35 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
             row_indents_data.push(0);
             row_paths_data.push(Some(rp.clone()));
             true_row_totals.push(eval_row_totals_for_cm(&data[rp]));
+            true_parent_col_totals.push(eval_parent_col_totals_for_cm(&data[rp]));
         }
     } else {
+        // 预计算多级行路径所有非空真前缀（1..rp.len()）的真实聚合分母，供任意层级「占父行汇总%」使用
+        if spec.values.iter().any(|v| v.show_as == ShowAs::PercentOfParentRow) {
+            let mut prefix_cms: HashMap<Vec<String>, BTreeMap<Vec<String>, CellBucket>> =
+                HashMap::new();
+            for rp in &row_paths {
+                let Some(cm) = data.get(rp) else { continue };
+                for depth in 1..rp.len() {
+                    let pref = rp[..depth].to_vec();
+                    let acc = prefix_cms.entry(pref).or_default();
+                    for (cp, b) in cm {
+                        let entry = acc.entry(cp.clone()).or_insert_with(make_bucket);
+                        merge_bucket(entry, b);
+                    }
+                }
+            }
+            for (pref, cm) in &prefix_cms {
+                let vals = eval_row_values(cm);
+                for (vi, v) in vals.iter().enumerate() {
+                    if let Value::Number(n) = v
+                        && n.is_finite()
+                    {
+                        true_parent_row_totals.insert((pref.clone(), row_label_cols + vi), *n);
+                    }
+                }
+            }
+        }
         // 多级行字段：按顶层分组，支持折叠/展开与 Top/Bottom/Off 小计 + Compact/Outline/Tabular 布局
         let show_top_sub = opts.subtotal_pos != SubtotalPos::Off
             && opts.row_ext.first().map(|e| e.show_subtotal).unwrap_or(true);
@@ -2360,10 +2434,11 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
                 if let Value::Number(n) = v
                     && n.is_finite()
                 {
-                    true_parent_row_totals.insert((top.clone(), row_label_cols + vi), *n);
+                    true_parent_row_totals.insert((top_pref.clone(), row_label_cols + vi), *n);
                 }
             }
             let group_row_tot = eval_row_totals_for_cm(&group_cm);
+            let group_parent_col = eval_parent_col_totals_for_cm(&group_cm);
 
             if is_collapsed {
                 // 折叠态：一行展示父组 + [+] 按钮 + 汇总数值
@@ -2385,6 +2460,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
                 row_indents_data.push(0);
                 row_paths_data.push(Some(top_pref));
                 true_row_totals.push(group_row_tot);
+                true_parent_col_totals.push(group_parent_col);
                 prev_labels.fill(String::new());
                 continue;
             }
@@ -2417,6 +2493,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
                 row_indents_data.push(0);
                 row_paths_data.push(Some(top_pref.clone()));
                 true_row_totals.push(group_row_tot.clone());
+                true_parent_col_totals.push(group_parent_col.clone());
             }
 
             for (gi, rp) in group_paths.iter().enumerate() {
@@ -2467,6 +2544,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
                 row_indents_data.push(indent);
                 row_paths_data.push(Some(rp.clone()));
                 true_row_totals.push(eval_row_totals_for_cm(&data[rp]));
+                true_parent_col_totals.push(eval_parent_col_totals_for_cm(&data[rp]));
             }
 
             if show_top_sub && opts.subtotal_pos == SubtotalPos::Bottom {
@@ -2480,6 +2558,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
                 row_indents_data.push(0);
                 row_paths_data.push(Some(top_pref));
                 true_row_totals.push(group_row_tot);
+                true_parent_col_totals.push(group_parent_col);
             }
             prev_labels.fill(String::new());
         }
@@ -2509,6 +2588,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
         row_indents_data.push(0);
         row_paths_data.push(Some(Vec::new()));
         true_row_totals.push(true_grand_totals.clone());
+        true_parent_col_totals.push(eval_parent_col_totals_for_cm(&all_cm_total));
     }
 
     // 9. 构造 PivotGrid 并应用 13 种 ShowAs
@@ -2532,6 +2612,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
         spec,
         &row_kinds_data,
         &row_paths_data,
+        &col_paths_by_grid_col,
         &col_value_idx,
         &col_is_grand_total,
         &col_is_subtotal,
@@ -2540,6 +2621,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
         &true_grand_totals,
         &true_row_totals,
         &true_parent_row_totals,
+        &true_parent_col_totals,
     );
 
     // 10. 多个计算项
@@ -2682,6 +2764,7 @@ fn apply_rich_show_as(
     spec: &PivotSpec2,
     row_kinds: &[PivotRowKind],
     row_paths: &[Option<Vec<String>>],
+    col_paths_by_grid_col: &[Option<Vec<String>>],
     col_value_idx: &[Option<usize>],
     col_is_grand: &[bool],
     col_is_sub: &[bool],
@@ -2689,7 +2772,8 @@ fn apply_rich_show_as(
     true_col_totals: &HashMap<usize, f64>,
     true_grand_totals: &[Option<f64>],
     true_row_totals: &[Vec<Option<f64>>],
-    true_parent_row_totals: &HashMap<(String, usize), f64>,
+    true_parent_row_totals: &HashMap<(Vec<String>, usize), f64>,
+    true_parent_col_totals: &[HashMap<(Vec<String>, usize), f64>],
 ) {
     if total_val_count == 0 || grid.rows.is_empty() {
         return;
@@ -2753,23 +2837,26 @@ fn apply_rich_show_as(
                     .sum()
             });
 
-        // 父行分组总计（用于 PercentOfParentRow）：优先取真实分组聚合桶
-        let mut parent_row_tot: HashMap<(String, usize), f64> = HashMap::new();
+        // 父行分组总计（用于 PercentOfParentRow）：按直接父前缀 rp[..len-1] 聚合，优先取真实分组聚合桶
+        let mut parent_row_tot: HashMap<(Vec<String>, usize), f64> = HashMap::new();
         for r in 0..orig.len() {
             if row_kinds.get(r) != Some(&PivotRowKind::Detail) {
                 continue;
             }
-            let top = row_paths
-                .get(r)
-                .and_then(|o| o.as_ref())
-                .and_then(|p| p.first())
-                .cloned()
-                .unwrap_or_default();
-            for &c in &all_cols {
-                if let Some(&true_p) = true_parent_row_totals.get(&(top.clone(), c)) {
-                    parent_row_tot.insert((top.clone(), c), true_p);
-                } else if let Some(v) = num_at(r, c) {
-                    *parent_row_tot.entry((top.clone(), c)).or_insert(0.0) += v;
+            let Some(rp) = row_paths.get(r).and_then(|o| o.as_ref()) else {
+                continue;
+            };
+            if rp.len() < 2 {
+                continue;
+            }
+            for depth in 1..rp.len() {
+                let pref = rp[..depth].to_vec();
+                for &c in &all_cols {
+                    if let Some(&true_p) = true_parent_row_totals.get(&(pref.clone(), c)) {
+                        parent_row_tot.insert((pref.clone(), c), true_p);
+                    } else if let Some(v) = num_at(r, c) {
+                        *parent_row_tot.entry((pref.clone(), c)).or_insert(0.0) += v;
+                    }
                 }
             }
         }
@@ -2822,12 +2909,11 @@ fn apply_rich_show_as(
                 .copied()
                 .flatten()
                 .unwrap_or_else(|| leaf_cols.iter().filter_map(|&c| num_at(r, c)).sum());
-            let top_key = row_paths
+            let parent_row_key: Option<Vec<String>> = row_paths
                 .get(r)
                 .and_then(|o| o.as_ref())
-                .and_then(|p| p.first())
-                .cloned()
-                .unwrap_or_default();
+                .filter(|p| p.len() >= 2)
+                .map(|p| p[..p.len() - 1].to_vec());
             let mut prev_in_row: Option<f64> = None;
 
             for &c in &all_cols {
@@ -2842,13 +2928,26 @@ fn apply_rich_show_as(
                     ShowAs::PercentOfColumn => ratio(v, ctot),
                     ShowAs::PercentOfTotal => ratio(v, grand_total),
                     ShowAs::PercentOfParentRow => {
-                        let p = parent_row_tot
-                            .get(&(top_key.clone(), c))
-                            .copied()
+                        let p = parent_row_key
+                            .as_ref()
+                            .and_then(|pk| parent_row_tot.get(&(pk.clone(), c)).copied())
                             .unwrap_or(ctot);
                         ratio(v, p)
                     }
-                    ShowAs::PercentOfParentCol => ratio(v, row_sum),
+                    ShowAs::PercentOfParentCol => {
+                        let p = col_paths_by_grid_col
+                            .get(c)
+                            .and_then(|o| o.as_ref())
+                            .filter(|cp| cp.len() >= 2 && !col_is_grand[c])
+                            .and_then(|cp| {
+                                let pk = cp[..cp.len() - 1].to_vec();
+                                true_parent_col_totals
+                                    .get(r)
+                                    .and_then(|m| m.get(&(pk, vi)).copied())
+                            })
+                            .unwrap_or(row_sum);
+                        ratio(v, p)
+                    }
                     ShowAs::RunningTotal => {
                         if rk == PivotRowKind::Detail {
                             let acc = running_acc.entry(c).or_insert(0.0);

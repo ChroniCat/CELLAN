@@ -75,8 +75,9 @@ pub(crate) struct PendingSave {
     pub rx: Receiver<Result<(SaveReceipt, Option<CalculatedSnapshot>), String>>,
     pub quiet: bool,
     pub used_dirty_graph: bool,
-    /// Host session and collaboration clock represented by this original-file snapshot.
-    pub host: Option<(String, u64)>,
+    /// Host session, collaboration clock, and optional room watermark cursor `(wm_seq, struct_rev)`
+    /// represented by this original-file snapshot.
+    pub host: Option<(String, u64, Option<(u64, usize)>)>,
 }
 
 #[derive(Debug)]

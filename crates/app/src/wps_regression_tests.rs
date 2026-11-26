@@ -660,6 +660,7 @@ fn menu_enrichment_paste_suite() {
     app.sel_end = (0, 0);
     app.clip = Some(Clip { deferred: None,
         source_rows: None,
+        source_cols: None,
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().into_owned(), src_sid)]],
@@ -726,6 +727,7 @@ fn menu_enrichment_paste_suite() {
     app.wb.sheet_mut(0).set(2, 0, Cell { value: Value::Text("保留原字".into()), formula: None });
     app.clip = Some(Clip { deferred: None,
         source_rows: None,
+        source_cols: None,
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(Cell::default(), 0)]],

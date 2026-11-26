@@ -701,8 +701,41 @@ pub struct LabelOpts {
     pub num_fmt: String,
 }
 
+/// 运行期图表实例标识：克隆快照与活文档共享同一标识，用于后台保存回执精准匹配新建图表；
+/// 不参与内容相等性比较（`PartialEq` 恒真），避免影响已有按内容比较图表的逻辑与单测。
+#[derive(Clone, Copy, Debug)]
+pub struct ChartUid(u64);
+
+impl ChartUid {
+    pub fn next() -> Self {
+        static NEXT_CHART_UID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT_CHART_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for ChartUid {
+    fn default() -> Self {
+        Self::next()
+    }
+}
+
+impl PartialEq for ChartUid {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ChartUid {}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Chart {
+    /// 运行期唯一标识（跨快照克隆保持不变，供后台保存回执精准关联新建图表）
+    pub uid: ChartUid,
     pub kind: ChartKind,
     pub title: String,
     pub series: Vec<Series>,
@@ -755,6 +788,7 @@ pub struct Chart {
 impl Default for Chart {
     fn default() -> Self {
         Self {
+            uid: ChartUid::next(),
             kind: ChartKind::Column,
             title: String::new(),
             series: Vec::new(),

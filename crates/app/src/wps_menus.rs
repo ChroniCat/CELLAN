@@ -898,6 +898,7 @@ impl SheetApp {
         self.clip_copied_at = Some(std::time::Instant::now());
         self.clip = Some(Clip { deferred: None,
             source_rows: None,
+            source_cols: None,
             sheet: self.sheet_idx,
             rect: (r1, c1, r2, c2),
             cells,

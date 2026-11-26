@@ -1510,6 +1510,7 @@ mod tests {
             cells: vec![],
             merges: vec![],
             source_rows: None,
+            source_cols: None,
             cut: false,
         });
         app.wb.sheets[0].cols.set(1, 160.0);

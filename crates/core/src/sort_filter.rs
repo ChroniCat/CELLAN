@@ -1807,8 +1807,21 @@ pub fn advanced_filter(
     }
 
     if let Some((dr, dc)) = copy_to {
-        // 先完整快照表头与命中行，避免 copy_to 与源区重叠时读到刚覆写的新值
+        // 先校验完整输出范围（含表头行）是否落在工作表最大行列上限内，绝不写入越界坐标或留下半截结果
         let width = lc2 - lc1 + 1;
+        let total_rows = matched_rows.len() as u64 + 1;
+        let end_r_u64 = u64::from(dr) + total_rows - 1;
+        let end_c_u64 = u64::from(dc) + u64::from(width) - 1;
+        if end_r_u64 >= u64::from(crate::sync::MAX_ROWS)
+            || end_c_u64 >= u64::from(crate::sync::MAX_COLS)
+        {
+            return Err(format!(
+                "高级筛选复制目标超出工作表行列上限（需写入 {total_rows} 行 × {width} 列，超出最大行 {} / 最大列 {}）",
+                crate::sync::MAX_ROWS,
+                crate::sync::MAX_COLS
+            ));
+        }
+        // 先完整快照表头与命中行，避免 copy_to 与源区重叠时读到刚覆写的新值
         let mut snapshot: Vec<Vec<(crate::model::Cell, u16)>> = Vec::with_capacity(matched_rows.len() + 1);
         let header_row: Vec<(crate::model::Cell, u16)> = (0..width)
             .map(|off| {
