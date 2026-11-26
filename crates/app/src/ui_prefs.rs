@@ -260,7 +260,7 @@ impl UiPrefs {
         let Ok(text) = std::fs::read_to_string(p) else {
             return me;
         };
-        for line in text.lines() {
+        for line in text.trim_start_matches('\u{FEFF}').lines() {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };

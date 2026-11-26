@@ -72,9 +72,46 @@ pub(crate) struct DocAuditState {
     pub next_event_seq: u64,
     /// 已导入并通过 Merkle/签名验真的冷归档包（供在审计面板中展开查阅历史明细）
     pub verified_cold_archive: Option<(ColdArchiveVerifyResult, AuditColdArchive)>,
+    /// 为 `true` 时禁用保存时自动开启防篡改审计（如 `.xls` 文件、检测到审计剥离/损坏/回滚异常的文档）
+    pub auto_enable_disabled: bool,
+    /// 上次打开或保存落盘时的 `self.rev.len()` 游标，用于在统一面板中仅把「尚未落盘的新编辑」标为待保存
+    pub rev_count_at_last_save: usize,
 }
 
 impl DocAuditState {
+    /// 为新建空白工作簿初始化默认开启防篡改审计的运行态（零磁盘 I/O，首次保存 `.xlsx` 时自动生成签名基线）
+    pub(crate) fn new_for_blank(wb: &Workbook) -> Self {
+        Self {
+            baseline: Some(Box::new(wb.clone())),
+            auto_enable_disabled: false,
+            ..Self::default()
+        }
+    }
+
+    /// 当前工作簿是否处于「默认开启、待保存自动写入审计链」状态
+    pub(crate) fn auto_enable_active(&self, wb: &Workbook) -> bool {
+        if self.auto_enable_disabled || wb.audit.log.is_some() || wb.audit.has_anomaly() {
+            return false;
+        }
+        if self
+            .verification
+            .as_ref()
+            .is_some_and(|v| v.severity == AuditSeverity::Tampered)
+        {
+            return false;
+        }
+        let is_xls = wb
+            .path
+            .as_deref()
+            .is_some_and(|p| p.extension().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("xls")));
+        !is_xls
+    }
+
+    /// 是否需要跟踪本轮未保存的归属/样式/结构事件（已落盘审计链或默认开启待落盘）
+    pub(crate) fn tracking_active(&self, wb: &Workbook) -> bool {
+        wb.audit.log.is_some() || self.auto_enable_active(wb)
+    }
+
     pub(crate) fn alloc_seq(&mut self) -> u64 {
         self.next_event_seq = self.next_event_seq.saturating_add(1);
         self.next_event_seq
@@ -213,6 +250,15 @@ pub(crate) fn init_audit_state_for_loaded(
             AuditSeverity::Verified => {}
         }
     }
+    let is_xls = path.is_some_and(|p| {
+        p.extension()
+            .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("xls"))
+    });
+    state.auto_enable_disabled = is_xls
+        || wb.audit.has_anomaly()
+        || ver
+            .as_ref()
+            .is_some_and(|v| v.severity == AuditSeverity::Tampered);
     state.verification = ver;
     (state, banner)
 }
@@ -243,7 +289,6 @@ impl SheetApp {
 
     /// 打开工作簿完成后执行完整防篡改核验，并建立 CoW 基线与告警横幅
     pub(crate) fn on_workbook_loaded_audit(&mut self) {
-        self.audit_expanded_seq = None;
         self.audit_archive_msg = None;
 
         let my_pk = self
@@ -257,13 +302,15 @@ impl SheetApp {
             my_pk.as_deref(),
             self.doc_uid,
         );
-        if state.verification.is_some() {
-            self.rev_tab = 0;
-        }
         if let Some(b) = banner {
             self.set_notice(b);
         }
         self.audit_state = state;
+        self.audit_state.rev_count_at_last_save = if self.wb.audit.log.is_some() {
+            self.rev.len()
+        } else {
+            0
+        };
     }
 
     /// 异常退出恢复草稿后初始化审计基线：
@@ -272,10 +319,17 @@ impl SheetApp {
     ///   杜绝另存后签出“0 格修改 / 核验通过”的失真提交。
     pub(crate) fn on_workbook_recovered_audit(&mut self, original_path: Option<&str>) {
         self.audit_state = DocAuditState::default();
-        self.audit_expanded_seq = None;
         self.audit_archive_msg = None;
 
         let Some(log) = self.wb.audit.log.as_ref().cloned() else {
+            let is_xls = original_path.is_some_and(|p| {
+                Path::new(p)
+                    .extension()
+                    .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("xls"))
+            });
+            self.audit_state.baseline = Some(Box::new(self.wb.clone()));
+            self.audit_state.auto_enable_disabled = is_xls || self.wb.audit.has_anomaly();
+            self.audit_state.rev_count_at_last_save = 0;
             return;
         };
         log.bind_workbook_sheets(&mut self.wb);
@@ -312,6 +366,7 @@ impl SheetApp {
         if let Some(orig_base) = recovered_base {
             self.audit_state.baseline = Some(Box::new(orig_base));
             self.audit_state.verification = sheetcore::audit::verify_workbook_audit(&self.wb);
+            self.audit_state.rev_count_at_last_save = self.rev.len();
             return;
         }
 
@@ -333,12 +388,12 @@ impl SheetApp {
             );
         }
         self.audit_state.verification = ver;
+        self.audit_state.rev_count_at_last_save = self.rev.len();
     }
 
-    /// 打开「修订与审计记录」窗口并定位到审计页签
+    /// 打开「编辑与防篡改记录」统一面板
     pub(crate) fn open_audit_panel(&mut self) {
         self.rev_open = true;
-        self.rev_tab = 0;
         self.refresh_audit_verification_now();
     }
 
@@ -356,7 +411,8 @@ impl SheetApp {
         }
     }
 
-    /// 为当前工作簿启用防篡改审计记录（不可关闭，写入创世提交 #1）
+    /// 为当前工作簿显式写入创世提交 #1（供单测与显式立即初始化场景使用；常规用户已默认自动开启）
+    #[cfg(test)]
     pub(crate) fn enable_audit_for_current_workbook(&mut self) {
         if self.wb.audit.log.is_some() {
             self.status = "当前工作簿已开启防篡改审计记录（开启后不可关闭）".into();
@@ -407,7 +463,6 @@ impl SheetApp {
                 }
                 self.status = "已开启防篡改审计记录（创世基线 #1 已生成，请按 Ctrl+S 保存生效）".into();
                 self.rev_open = true;
-                self.rev_tab = 0;
             }
             Err(e) => {
                 self.status = format!("开启防篡改审计失败：{e:#}");
@@ -415,12 +470,27 @@ impl SheetApp {
         }
     }
 
-    /// 本地单元格编辑归属登记（零开销：未开启审计时直接返回）
+    /// 轻量获取当前本机作者：若密钥尚未加载且工作簿处于默认开启待首次保存态，
+    /// 先返回占位作者（避免纯内存编辑触发 DPAPI 盘读写），保存前由 `prepare_audit_save_ctx_for` 补全真实公钥与签名。
+    fn local_audit_author_lightweight(&mut self) -> Option<AuditAuthor> {
+        if self.wb.audit.log.is_some() {
+            return self.my_audit_author();
+        }
+        if let Some(kp) = self.audit_keypair.as_ref() {
+            return Some(audit_store::current_author(&self.my_name, kp));
+        }
+        Some(AuditAuthor {
+            display_name: self.my_name.clone(),
+            ..Default::default()
+        })
+    }
+
+    /// 本地单元格编辑归属登记（默认开启时亦跟踪纯格式变更与协作联署）
     pub(crate) fn audit_note_local_deltas(&mut self, label: &str, deltas: &[sheetcore::undo::CellDelta]) {
-        if self.wb.audit.log.is_none() || deltas.is_empty() {
+        if !self.audit_state.tracking_active(&self.wb) || deltas.is_empty() {
             return;
         }
-        let Some(author) = self.my_audit_author() else {
+        let Some(author) = self.local_audit_author_lightweight() else {
             return;
         };
         let mut only_style = true;
@@ -479,14 +549,14 @@ impl SheetApp {
         rects: &[(u32, u32, u32, u32)],
         undo_id: Option<u64>,
     ) {
-        if self.wb.audit.log.is_none() || rects.is_empty() {
+        if !self.audit_state.tracking_active(&self.wb) || rects.is_empty() {
             return;
         }
         let Some(sh) = self.wb.sheets.get(sheet_idx) else {
             return;
         };
         let sheet_name = sh.name.clone();
-        let Some(author) = self.my_audit_author() else {
+        let Some(author) = self.local_audit_author_lightweight() else {
             return;
         };
         let (mut r1, mut c1, mut r2, mut c2) = rects[0];
@@ -526,7 +596,7 @@ impl SheetApp {
         kind: &str,
         summary: String,
     ) {
-        if self.wb.audit.log.is_none() {
+        if !self.audit_state.tracking_active(&self.wb) {
             return;
         }
         let Some(sh) = self.wb.sheets.get(sheet_idx) else {
@@ -545,7 +615,7 @@ impl SheetApp {
         sheet_idx: usize,
         rect: (u32, u32, u32, u32),
     ) {
-        if self.wb.audit.log.is_none() {
+        if !self.audit_state.tracking_active(&self.wb) {
             return;
         }
         let Some(sh) = self.wb.sheets.get(sheet_idx) else {
@@ -554,7 +624,7 @@ impl SheetApp {
         let sheet_id = sh.identity;
         let author = match site {
             Some(s) => self.audit_author_for_site(s),
-            None => self.my_audit_author().unwrap_or_else(|| AuditAuthor {
+            None => self.local_audit_author_lightweight().unwrap_or_else(|| AuditAuthor {
                 display_name: self.my_name.clone(),
                 ..Default::default()
             }),
@@ -564,7 +634,7 @@ impl SheetApp {
 
     /// 远端协作单元格编辑归属登记
     pub(crate) fn audit_note_remote_ops(&mut self, ops: &[sheetcore::sync::Op]) {
-        if self.wb.audit.log.is_none() || ops.is_empty() {
+        if !self.audit_state.tracking_active(&self.wb) || ops.is_empty() {
             return;
         }
         for op in ops {
@@ -588,7 +658,7 @@ impl SheetApp {
         op: &sheetcore::structural::Structural,
         undo_id: Option<u64>,
     ) {
-        if self.wb.audit.log.is_none() {
+        if !self.audit_state.tracking_active(&self.wb) {
             return;
         }
         let Some(sh) = self.wb.sheets.get(sheet_idx) else {
@@ -598,7 +668,7 @@ impl SheetApp {
         let sheet_name = sh.name.clone();
         let author = match site {
             Some(s) => self.audit_author_for_site(s),
-            None => self.my_audit_author().unwrap_or_else(|| AuditAuthor {
+            None => self.local_audit_author_lightweight().unwrap_or_else(|| AuditAuthor {
                 display_name: self.my_name.clone(),
                 ..Default::default()
             }),
@@ -634,7 +704,7 @@ impl SheetApp {
 
     /// 撤销（Ctrl+Z）后同步回滚关联的未落盘结构位移与格式摘要，防止撤销后仍留幽灵结构日志或 Blame 错位
     pub(crate) fn audit_on_undo(&mut self, undone_id: u64) {
-        if self.wb.audit.log.is_none() {
+        if !self.audit_state.tracking_active(&self.wb) {
             return;
         }
         if self
@@ -664,7 +734,7 @@ impl SheetApp {
 
     /// 重做（Ctrl+Y）后同步恢复关联的未落盘结构位移与格式摘要
     pub(crate) fn audit_on_redo(&mut self, redone_id: u64) {
-        if self.wb.audit.log.is_none() {
+        if !self.audit_state.tracking_active(&self.wb) {
             return;
         }
         if self
@@ -750,7 +820,8 @@ impl SheetApp {
         }
     }
 
-    /// 在发起保存前组装防篡改审计提交上下文（同时支持活动标签页与后台停放标签页）
+    /// 在发起保存前组装防篡改审计提交上下文（同时支持活动标签页与后台停放标签页；
+    /// 对新建工作簿与首次在 CELLAN 编辑保存的旧 `.xlsx` 默认自动启用审计链）
     pub(crate) fn prepare_audit_save_ctx_for(
         wb: &Workbook,
         audit_state: &DocAuditState,
@@ -758,11 +829,13 @@ impl SheetApp {
         net: Option<&net::Net>,
         my_name: &str,
         keypair_cache: &mut Option<sheetcore::audit::AuditKeyPair>,
+        rev_len: usize,
     ) {
-        let Some(log) = wb.audit.log.as_ref() else {
+        let auto_enable = wb.audit.log.is_none() && audit_state.auto_enable_active(wb);
+        if wb.audit.log.is_none() && !auto_enable {
             tasks.next_audit_ctx = None;
             return;
-        };
+        }
         let kp = if let Some(k) = keypair_cache.clone() {
             k
         } else if let Ok(k) = audit_store::load_or_create_device_keypair() {
@@ -773,29 +846,68 @@ impl SheetApp {
             return;
         };
         let committer = audit_store::current_author(my_name, &kp);
-        let has_other_authors = audit_state
+        let normalize_author = |au: &AuditAuthor| -> AuditAuthor {
+            if au.pubkey_hex.is_empty() && au.display_name == committer.display_name {
+                committer.clone()
+            } else {
+                au.clone()
+            }
+        };
+        let cell_attributions: HashMap<(u64, u32, u32), AuditAuthor> = audit_state
             .dirty_cell_authors
+            .iter()
+            .map(|(&k, au)| (k, normalize_author(au)))
+            .collect();
+        let bulk_ops: Vec<(String, AuditAuthor, String, String)> = audit_state
+            .dirty_bulk_ops
+            .iter()
+            .map(|b| {
+                (
+                    b.sheet_name.clone(),
+                    normalize_author(&b.author),
+                    b.kind.clone(),
+                    b.summary.clone(),
+                )
+            })
+            .collect();
+        let structural_ops: Vec<(String, AuditAuthor, sheetcore::structural::Structural)> = audit_state
+            .pending_structural_ops
+            .iter()
+            .map(|s| {
+                let cur_name = wb
+                    .sheets
+                    .iter()
+                    .find(|sh| sh.identity == s.sheet_id)
+                    .map(|sh| sh.name.clone())
+                    .unwrap_or_else(|| s.sheet_name.clone());
+                (cur_name, normalize_author(&s.author), s.op.clone())
+            })
+            .collect();
+        let merge_attributions: HashMap<(u64, (u32, u32, u32, u32)), AuditAuthor> = audit_state
+            .dirty_merge_authors
+            .iter()
+            .map(|(&k, (_, au))| (k, normalize_author(au)))
+            .collect();
+        let has_other_authors = cell_attributions
             .values()
             .any(|a| !a.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex))
-            || audit_state
-                .dirty_bulk_ops
+            || bulk_ops
                 .iter()
-                .any(|b| !b.author.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex))
-            || audit_state
-                .dirty_merge_authors
+                .any(|(_, a, _, _)| !a.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex))
+            || merge_attributions
                 .values()
-                .any(|(_, a)| !a.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex))
-            || audit_state
-                .pending_structural_ops
+                .any(|a| !a.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex))
+            || structural_ops
                 .iter()
-                .any(|s| !s.author.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex));
+                .any(|(_, a, _)| !a.pubkey_hex.eq_ignore_ascii_case(&committer.pubkey_hex));
+        let head_seq = wb.audit.log.as_ref().map(|l| l.head_seq()).unwrap_or(0);
         let action = if net.is_some() && (has_other_authors || !audit_state.peer_attestations.is_empty()) {
             "协作保存".to_string()
-        } else if log.head_seq() == 1
-            && audit_state.dirty_cell_authors.is_empty()
-            && audit_state.dirty_bulk_ops.is_empty()
-            && audit_state.pending_structural_ops.is_empty()
-            && audit_state.dirty_merge_authors.is_empty()
+        } else if head_seq == 1
+            && cell_attributions.is_empty()
+            && bulk_ops.is_empty()
+            && structural_ops.is_empty()
+            && merge_attributions.is_empty()
         {
             "启用防篡改审计".to_string()
         } else {
@@ -807,30 +919,6 @@ impl SheetApp {
             .last()
             .map(|s| s.seq)
             .unwrap_or(0);
-        let bulk_ops: Vec<(String, AuditAuthor, String, String)> = audit_state
-            .dirty_bulk_ops
-            .iter()
-            .map(|b| (b.sheet_name.clone(), b.author.clone(), b.kind.clone(), b.summary.clone()))
-            .collect();
-        let structural_ops: Vec<(String, AuditAuthor, sheetcore::structural::Structural)> = audit_state
-            .pending_structural_ops
-            .iter()
-            .map(|s| {
-                // 使用当前最新表名（若在插行后又重命名了工作表）
-                let cur_name = wb
-                    .sheets
-                    .iter()
-                    .find(|sh| sh.identity == s.sheet_id)
-                    .map(|sh| sh.name.clone())
-                    .unwrap_or_else(|| s.sheet_name.clone());
-                (cur_name, s.author.clone(), s.op.clone())
-            })
-            .collect();
-        let merge_attributions: HashMap<(u64, (u32, u32, u32, u32)), AuditAuthor> = audit_state
-            .dirty_merge_authors
-            .iter()
-            .map(|(&k, (_, au))| (k, au.clone()))
-            .collect();
         let committed_merge_seqs: HashMap<(u64, (u32, u32, u32, u32)), u64> = audit_state
             .dirty_merge_authors
             .iter()
@@ -849,10 +937,11 @@ impl SheetApp {
 
         tasks.next_audit_ctx = Some(AuditSaveContext {
             baseline: audit_state.baseline.clone(),
+            auto_enable,
             committer,
             keypair: kp,
             action,
-            cell_attributions: audit_state.dirty_cell_authors.clone(),
+            cell_attributions,
             merge_attributions,
             bulk_ops,
             structural_ops,
@@ -863,6 +952,7 @@ impl SheetApp {
             committed_merge_seqs,
             committed_attest_seqs,
             had_external_gap: audit_state.pending_external_gap.is_some(),
+            committed_rev_len: rev_len,
         });
     }
 
@@ -885,9 +975,11 @@ impl SheetApp {
 
         if is_xls || audit_rcpt.as_ref().is_some_and(|r| r.cleared_for_xls) || wb.audit.log.is_none() {
             let had_audit = audit_rcpt.as_ref().is_some_and(|r| r.cleared_for_xls)
-                || audit_state.verification.is_some()
-                || audit_state.baseline.is_some();
+                || audit_state.verification.is_some();
             *audit_state = DocAuditState::default();
+            if is_xls {
+                audit_state.auto_enable_disabled = true;
+            }
             if is_xls && had_audit {
                 return (
                     Some("已另存为 .xls：旧版格式不支持内嵌防篡改审计，当前文档审计链已停止并清零".into()),
@@ -921,6 +1013,8 @@ impl SheetApp {
             if rcpt.consumed_external_gap {
                 audit_state.pending_external_gap = None;
             }
+            audit_state.rev_count_at_last_save =
+                audit_state.rev_count_at_last_save.max(rcpt.committed_rev_len);
         } else {
             if !wb.dirty {
                 audit_state.baseline = Some(Box::new(wb.clone()));
@@ -1004,6 +1098,9 @@ impl SheetApp {
         audit_store::record_verified_watermark(self.wb.path.as_deref(), &arc);
         self.audit_state.verification =
             audit_store::verify_workbook_full(self.wb.path.as_deref(), &self.wb, my_pk.as_deref());
+        if !self.wb.dirty {
+            self.audit_state.rev_count_at_last_save = self.rev.len();
+        }
     }
 
     /// 导出不含任何审计日志与标记的「干净副本」`.xlsx`（用于安全发给外部客户/甲方/供应商）
@@ -1141,42 +1238,276 @@ impl SheetApp {
     }
 
     // -----------------------------------------------------------------------
-    // UI 渲染：状态栏徽章、审计主面板、启用确认弹窗、单元格 Blame 溯源弹窗
+    // 统一面板数据模型与 UI 渲染：状态栏徽章、Backstage、单页融合记录窗口、Blame 溯源弹窗
     // -----------------------------------------------------------------------
 
-    /// 底部状态栏右侧防篡改审计状态徽章（点击直达审计面板）
-    pub(crate) fn draw_audit_status_pill(&mut self, ui: &mut egui::Ui) {
-        let Some(ver) = self.audit_state.verification.as_ref() else {
-            return;
+    /// 组装统一「编辑与防篡改记录」面板的展示行（最新在前）：
+    /// 1. 尚未保存落盘的本次编辑（`self.rev[rev_count_at_last_save..]`，标记为待保存，本地格改支持「撤回」）；
+    /// 2. 已签名落盘的防篡改审计提交明细（单元格净变更、批量/结构/样式/恢复缺口摘要、非创世状态变更）。
+    ///    纯空创世快照 `#1` 展示于顶部核验横幅，不重复计入用户修改记录条数，使动态用户筛选下拉计数与表格行严格一致。
+    pub(crate) fn build_unified_audit_rows(&self) -> Vec<UnifiedAuditRow> {
+        let mut rows = Vec::new();
+
+        // 1. 尚未签名落盘的本地/协作会话修订（最新在前）
+        let pending_start = if self.wb.audit.log.is_some() {
+            self.audit_state.rev_count_at_last_save.min(self.rev.len())
+        } else {
+            0
         };
-        let (label, fg, bg, tip) = match ver.severity {
-            AuditSeverity::Verified => (
-                format!("审计完整 #{}", ver.head_seq),
-                Color32::from_rgb(16, 124, 65),
-                Color32::from_rgba_unmultiplied(16, 124, 65, 22),
-                format!(
-                    "防篡改审计链完整（共 {} 版，{} KB）· 点击查看详情",
-                    ver.head_seq,
-                    ver.embedded_bytes / 1024
+        for idx in (pending_start..self.rev.len()).rev() {
+            let e = &self.rev[idx];
+            let user_name = normalize_user_name(&e.who);
+            let loc = if e.sheet.is_empty() {
+                "(工作簿)".to_string()
+            } else {
+                format!("{}!{}", e.sheet, e.range())
+            };
+            let jump = e
+                .cells
+                .first()
+                .map(|ch| (e.sheet.clone(), ch.r, ch.c));
+            let detail = e.delta_text();
+            let action = if self.wb.audit.log.is_some() || self.audit_state.auto_enable_active(&self.wb) {
+                format!("待保存·{}", e.label)
+            } else {
+                e.label.clone()
+            };
+            let hover_tip = if self.wb.audit.log.is_some() || self.audit_state.auto_enable_active(&self.wb) {
+                "尚未保存落盘的编辑记录；按 Ctrl+S 保存 .xlsx 后将自动计算净变更并用 ECDSA P-256 私钥签名上链。".to_string()
+            } else {
+                "本次会话编辑记录（当前 .xls 格式不支持内嵌防篡改审计链）".to_string()
+            };
+            let search_haystack = format!(
+                "{} {} {} {} {}",
+                action, loc, detail, user_name, e.note
+            )
+            .to_lowercase();
+            rows.push(UnifiedAuditRow {
+                ts_ms: e.ts,
+                pending: true,
+                commit_seq: None,
+                user_name,
+                author: None,
+                action,
+                location: loc,
+                jump,
+                detail,
+                hover_tip,
+                revert_rev_idx: (!e.remote && !e.cells.is_empty()).then_some(idx),
+                badge_text: Some("待保存".into()),
+                badge_is_warn: false,
+                search_haystack,
+            });
+        }
+
+        // 2. 已签名落盘的不可篡改审计链提交（最新在前）
+        if let Some(log) = self.wb.audit.log.as_ref() {
+            for commit in log.commits.iter().rev() {
+                // 纯创世基线提交（#1 仅含「启用审计」初始化记录、无任何格改与缺口）由顶部核验横幅展示，
+                // 不计入用户修改记录条数，保证「动态用户筛选下拉」仅显示实际编辑修改过的用户及准确条数。
+                let is_pure_genesis = commit.seq == 1
+                    && commit.cells.is_empty()
+                    && commit.external_gap_hash.is_none()
+                    && commit.bulk_ops.iter().all(|b| b.kind == "启用审计");
+                if is_pure_genesis {
+                    continue;
+                }
+                let committer = log.author_of(commit.committer_idx);
+                let committer_name = committer
+                    .map(|a| normalize_user_name(&a.display_name))
+                    .unwrap_or_else(|| "未知用户".into());
+
+                let mut tip_lines = vec![
+                    format!(
+                        "防篡改提交 #{} · 时间：{}",
+                        commit.seq,
+                        sheetcore::audit::format_local_ms(commit.ts_ms)
+                    ),
+                    format!(
+                        "提交签名人：{}",
+                        committer
+                            .map(|a| format!("{}（指纹 {}）", a.short_label(), a.fingerprint()))
+                            .unwrap_or_else(|| committer_name.clone())
+                    ),
+                    format!(
+                        "提交哈希：{}…  |  状态根：{}…",
+                        &commit.commit_hash[..commit.commit_hash.len().min(16)],
+                        &commit.state_hash[..commit.state_hash.len().min(16)],
+                    ),
+                ];
+                for co in &commit.co_signers {
+                    let cname = log
+                        .author_of(co.author_idx)
+                        .map(|a| a.short_label())
+                        .unwrap_or_else(|| "未知".into());
+                    let ctag = if co.attested_by_peer {
+                        "✓ 协作者独立私钥联署已验签"
+                    } else {
+                        "△ 宿主代签"
+                    };
+                    tip_lines.push(format!("协作参与：{cname}（{} 格 · {ctag}）", co.change_count));
+                }
+                if commit.external_gap_hash.is_some() {
+                    tip_lines.push("⚠ 本次提交记录了绕过审计的外部修改/恢复状态缺口".into());
+                }
+                let hover_tip = tip_lines.join("\n");
+
+                let (badge_text, badge_is_warn) = if commit.external_gap_hash.is_some() {
+                    (Some("⚠缺口".into()), true)
+                } else if !commit.co_signers.is_empty() {
+                    let attested = commit.co_signers.iter().filter(|c| c.attested_by_peer).count();
+                    (Some(format!("联署{attested}/{}", commit.co_signers.len())), false)
+                } else {
+                    (Some("已签名".into()), false)
+                };
+
+                // 2a. 逐格净变更明细
+                for ch in &commit.cells {
+                    let sh = log.sheet_of(ch.sheet_idx);
+                    let loc = format!("{sh}!{}", sheetcore::model::cell_name(ch.row, ch.col));
+                    let ch_author = log.author_of(ch.author_idx).or(committer).cloned();
+                    let user_name = ch_author
+                        .as_ref()
+                        .map(|a| normalize_user_name(&a.display_name))
+                        .unwrap_or_else(|| committer_name.clone());
+                    let action = format!("#{} {}", commit.seq, commit.action);
+                    let detail = format!("{} → {}", ch.before.summary(), ch.after.summary());
+                    let search_haystack = format!(
+                        "#{} {} {} {} {}",
+                        commit.seq, action, loc, detail, user_name
+                    )
+                    .to_lowercase();
+                    rows.push(UnifiedAuditRow {
+                        ts_ms: commit.ts_ms,
+                        pending: false,
+                        commit_seq: Some(commit.seq),
+                        user_name,
+                        author: ch_author,
+                        action,
+                        location: loc,
+                        jump: Some((sh.to_string(), ch.row, ch.col)),
+                        detail,
+                        hover_tip: hover_tip.clone(),
+                        revert_rev_idx: None,
+                        badge_text: badge_text.clone(),
+                        badge_is_warn,
+                        search_haystack,
+                    });
+                }
+
+                // 2b. 批量/结构/样式/合并/恢复缺口摘要
+                for bo in &commit.bulk_ops {
+                    let sh = log.sheet_of(bo.sheet_idx).to_string();
+                    let bo_author = log.author_of(bo.author_idx).or(committer).cloned();
+                    let user_name = bo_author
+                        .as_ref()
+                        .map(|a| normalize_user_name(&a.display_name))
+                        .unwrap_or_else(|| committer_name.clone());
+                    let action = format!("#{} {}", commit.seq, bo.kind);
+                    let detail = bo.summary.clone();
+                    let search_haystack = format!(
+                        "#{} {} {} {} {} {}",
+                        commit.seq, action, sh, detail, user_name, commit.action
+                    )
+                    .to_lowercase();
+                    rows.push(UnifiedAuditRow {
+                        ts_ms: commit.ts_ms,
+                        pending: false,
+                        commit_seq: Some(commit.seq),
+                        user_name,
+                        author: bo_author,
+                        action,
+                        location: sh,
+                        jump: None,
+                        detail,
+                        hover_tip: hover_tip.clone(),
+                        revert_rev_idx: None,
+                        badge_text: badge_text.clone(),
+                        badge_is_warn: badge_is_warn || bo.kind.contains("缺口"),
+                        search_haystack,
+                    });
+                }
+
+                // 2c. 工作簿级变更（例如公式名称/表属性改动或带缺口提交，无逐格与批量摘要时保底展示）
+                if commit.cells.is_empty() && commit.bulk_ops.is_empty() {
+                    let action = format!("#{} {}", commit.seq, commit.action);
+                    let detail = if commit.external_gap_hash.is_some() {
+                        "检测到绕过审计的外部修改/恢复状态缺口".to_string()
+                    } else if commit.total_cell_changes > 0 {
+                        format!("{} 格改动（明细已折叠）", commit.total_cell_changes)
+                    } else {
+                        "工作簿结构/名称或元数据变更".to_string()
+                    };
+                    let search_haystack = format!(
+                        "#{} {} {} {}",
+                        commit.seq, action, detail, committer_name
+                    )
+                    .to_lowercase();
+                    rows.push(UnifiedAuditRow {
+                        ts_ms: commit.ts_ms,
+                        pending: false,
+                        commit_seq: Some(commit.seq),
+                        user_name: committer_name,
+                        author: committer.cloned(),
+                        action,
+                        location: "(工作簿)".into(),
+                        jump: None,
+                        detail,
+                        hover_tip,
+                        revert_rev_idx: None,
+                        badge_text,
+                        badge_is_warn,
+                        search_haystack,
+                    });
+                }
+            }
+        }
+
+        rows
+    }
+
+    /// 底部状态栏右侧防篡改审计状态徽章（点击直达统一编辑与防篡改记录面板）
+    pub(crate) fn draw_audit_status_pill(&mut self, ui: &mut egui::Ui) {
+        let pal = crate::theme::palette();
+        let (label, fg, bg, tip) = if let Some(ver) = self.audit_state.verification.as_ref() {
+            match ver.severity {
+                AuditSeverity::Verified => (
+                    format!("防篡改完整 #{}", ver.head_seq),
+                    pal.accent,
+                    pal.accent_tint,
+                    format!(
+                        "防篡改审计链完整（共 {} 版，{:.1} KB）· 点击查看记录",
+                        ver.head_seq,
+                        ver.embedded_bytes as f64 / 1024.0
+                    ),
                 ),
-            ),
-            AuditSeverity::Warning => (
-                format!("审计提醒 #{}", ver.head_seq),
-                Color32::from_rgb(168, 108, 12),
-                Color32::from_rgba_unmultiplied(196, 130, 14, 26),
-                format!("存在 {} 项审计提醒（如时钟异常或身份指纹变更）· 点击查看", ver.issues.len()),
-            ),
-            AuditSeverity::Tampered => (
-                "⚠ 审计异常".to_string(),
-                Color32::from_rgb(196, 43, 28),
-                Color32::from_rgba_unmultiplied(196, 43, 28, 28),
-                format!("检测到 {} 项防篡改高危异常（外部修改/篡改/回退）· 立即点击查看", ver.issues.len()),
-            ),
+                AuditSeverity::Warning => (
+                    format!("防篡改提醒 #{}", ver.head_seq),
+                    pal.warn_fg,
+                    pal.warn_bg,
+                    format!("存在 {} 项审计提醒（如时钟异常或身份指纹变更）· 点击查看", ver.issues.len()),
+                ),
+                AuditSeverity::Tampered => (
+                    "⚠ 防篡改异常".to_string(),
+                    pal.err_fg,
+                    pal.err_bg,
+                    format!("检测到 {} 项防篡改高危异常（外部修改/篡改/回退）· 立即点击查看", ver.issues.len()),
+                ),
+            }
+        } else if self.audit_state.auto_enable_active(&self.wb) {
+            (
+                "防篡改已开".to_string(),
+                pal.accent,
+                pal.accent_tint,
+                "防篡改编辑记录已默认开启：保存 .xlsx 时自动生成 ECDSA P-256 签名链 · 点击查看记录".to_string(),
+            )
+        } else {
+            return;
         };
         ui.add_space(6.0);
         let btn = egui::Button::new(RichText::new(label).size(11.0).strong().color(fg))
             .fill(bg)
-            .stroke(egui::Stroke::new(1.0_f32, fg.gamma_multiply(0.45)))
+            .stroke(egui::Stroke::new(1.0_f32, fg.gamma_multiply(0.55)))
             .corner_radius(4.0);
         if ui.add(btn).on_hover_text(tip).clicked() {
             self.open_audit_panel();
@@ -1185,16 +1516,17 @@ impl SheetApp {
 
     /// Backstage「文件 → 信息」中的防篡改审计状态卡片
     pub(crate) fn draw_backstage_audit_section(&mut self, ui: &mut egui::Ui, close: &mut bool) {
+        let pal = crate::theme::palette();
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(6.0);
-        ui.label(RichText::new("不可篡改编辑记录（防篡改审计）").strong().size(13.0));
+        ui.label(RichText::new("编辑与防篡改记录").strong().size(13.0));
         ui.add_space(4.0);
         if let Some(ver) = self.audit_state.verification.clone() {
             let (badge, col) = match ver.severity {
-                AuditSeverity::Verified => ("已开启 · 密码学核验完整", Color32::from_rgb(16, 124, 65)),
-                AuditSeverity::Warning => ("已开启 · 存在提醒事项", Color32::from_rgb(168, 108, 12)),
-                AuditSeverity::Tampered => ("⚠ 检测到疑似篡改 / 外部修改 / 回退", Color32::from_rgb(196, 43, 28)),
+                AuditSeverity::Verified => ("已保护 · 密码学核验完整", pal.accent),
+                AuditSeverity::Warning => ("已保护 · 存在提醒事项", pal.warn_fg),
+                AuditSeverity::Tampered => ("⚠ 检测到疑似篡改 / 外部修改 / 回退", pal.err_fg),
             };
             ui.label(RichText::new(badge).size(12.5).strong().color(col));
             if let Some(log) = self.wb.audit.log.as_ref() {
@@ -1214,7 +1546,7 @@ impl SheetApp {
             }
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                if ui_kit::primary_button(ui, "查看防篡改审计记录").clicked() {
+                if ui_kit::primary_button(ui, "查看编辑与防篡改记录").clicked() {
                     self.open_audit_panel();
                     *close = true;
                 }
@@ -1223,27 +1555,45 @@ impl SheetApp {
                     self.export_clean_copy_dialog();
                 }
             });
-        } else {
+        } else if self.audit_state.auto_enable_active(&self.wb) {
             ui.label(
-                RichText::new("未开启：开启后将随 .xlsx 文件内嵌经 ECDSA P-256 签名的哈希链编辑记录与单元格溯源，所有查看文件的人均可核验。")
+                RichText::new("已默认开启 · 首次保存 .xlsx 时自动生成防篡改签名链")
+                    .size(12.5)
+                    .strong()
+                    .color(pal.accent),
+            );
+            ui.label(
+                RichText::new("新建工作簿与在 CELLAN 中编辑保存的 .xlsx 默认开启去中心化防篡改审计，随文件内嵌 ECDSA P-256 签名链与单元格溯源（纯只读查看旧文件不会修改原文件）。")
                     .size(11.5)
                     .weak(),
             );
             ui.add_space(4.0);
-            if ui_kit::secondary_button(ui, "开启防篡改审计记录…").clicked() {
-                self.audit_enable_confirm = true;
+            if ui_kit::primary_button(ui, "查看编辑与防篡改记录").clicked() {
+                self.open_audit_panel();
+                *close = true;
+            }
+        } else {
+            ui.label(
+                RichText::new("当前文件格式（.xls）不支持内嵌防篡改签名链；如需开启请先另存为 .xlsx。")
+                    .size(11.5)
+                    .weak(),
+            );
+            ui.add_space(4.0);
+            if ui_kit::secondary_button(ui, "查看本次编辑记录").clicked() {
+                self.open_audit_panel();
                 *close = true;
             }
         }
     }
 
-    /// 修订记录窗口内的「不可篡改审计记录」主标签页
-    pub(crate) fn draw_audit_tab(
+    /// 统一的「编辑与防篡改记录」单页列表面板（融合 P2 表格体验、动态用户下拉筛选、防篡改验真与导出）
+    pub(crate) fn draw_unified_audit_panel(
         &mut self,
         ui: &mut egui::Ui,
         jump: &mut Option<(String, u32, u32)>,
+        revert: &mut Option<usize>,
     ) {
-        let mut do_enable_prompt = false;
+        let pal = crate::theme::palette();
         let mut do_export_csv = false;
         let mut do_export_clean = false;
         let mut do_export_archive = false;
@@ -1253,425 +1603,431 @@ impl SheetApp {
         let log_opt = self.wb.audit.log.clone();
         let ver_opt = self.audit_state.verification.clone();
 
-        if log_opt.is_none() && ver_opt.is_none() {
-            ui.add_space(16.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("此工作簿尚未开启「不可篡改审计记录」").strong().size(15.0));
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(
-                        "• 随 .xlsx 文件内嵌保存，无需任何服务器，所有查看文件的人都能直接看到并验真\n\
-                         • 按保存合并净变更 + 紧凑压缩 + 自动滚动归档（体积硬上限 512 KB，绝不会无限膨胀）\n\
-                         • ECDSA P-256 签名 + 哈希链 + 正文状态根 + 本地防回滚水印：改日志、Excel 偷改数、旧备份覆盖必露馅\n\
-                         • 对外发给客户时可使用「导出干净副本」一键脱敏，绝不泄露内部修改史",
-                    )
-                    .size(12.0)
-                    .weak(),
-                );
-                ui.add_space(14.0);
-                if ui_kit::primary_button(ui, "为此工作簿开启防篡改审计记录…").clicked() {
-                    do_enable_prompt = true;
-                }
-            });
-            ui.add_space(16.0);
-            if do_enable_prompt {
-                self.audit_enable_confirm = true;
-            }
-            return;
-        }
-
-        // 1. 顶部核验结果横幅
+        // 1. 顶部紧凑防篡改状态横幅
         if let Some(ref ver) = ver_opt {
             let (title, fg, bg) = match ver.severity {
                 AuditSeverity::Verified => (
-                    format!("✓ 密码学核验完整（共 #{} 版）", ver.head_seq),
-                    Color32::from_rgb(16, 124, 65),
-                    Color32::from_rgba_unmultiplied(16, 124, 65, 16),
+                    format!("✓ 防篡改核验完整（共 #{} 版）", ver.head_seq),
+                    pal.accent,
+                    pal.accent_tint,
                 ),
                 AuditSeverity::Warning => (
                     format!("⚠ 核验通过但有 {} 项提醒（共 #{} 版）", ver.issues.len(), ver.head_seq),
-                    Color32::from_rgb(168, 108, 12),
-                    Color32::from_rgba_unmultiplied(196, 130, 14, 20),
+                    pal.warn_fg,
+                    pal.warn_bg,
                 ),
                 AuditSeverity::Tampered => (
-                    format!("✕ 检测到 {} 项高危审计异常！", ver.issues.len()),
-                    Color32::from_rgb(196, 43, 28),
-                    Color32::from_rgba_unmultiplied(196, 43, 28, 22),
+                    format!("✕ 检测到 {} 项高危防篡改异常！", ver.issues.len()),
+                    pal.err_fg,
+                    pal.err_bg,
                 ),
             };
             egui::Frame::NONE
                 .fill(bg)
-                .stroke(egui::Stroke::new(1.0_f32, fg.gamma_multiply(0.4)))
+                .stroke(egui::Stroke::new(1.0_f32, fg.gamma_multiply(0.45)))
                 .corner_radius(6.0)
-                .inner_margin(egui::Margin::symmetric(10, 8))
+                .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(title).strong().size(12.5).color(fg));
+                        ui.label(RichText::new(title).strong().size(12.0).color(fg));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("重新核验").clicked() {
                                 do_reverify = true;
                             }
                             if let Some(ref log) = log_opt {
+                                let genesis_who = log
+                                    .commits
+                                    .first()
+                                    .and_then(|c| log.author_of(c.committer_idx))
+                                    .map(|a| a.display_name.as_str())
+                                    .unwrap_or("");
+                                let genesis_hint = if genesis_who.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("基线:{genesis_who} · ")
+                                };
                                 ui.label(
                                     RichText::new(format!(
-                                        "ID:{} · {:.1}/{}KB · Blame {}格",
+                                        "{genesis_hint}ID:{} · {:.1}/{}KB · 溯源 {}格",
                                         &log.doc_id[..log.doc_id.len().min(8)],
                                         ver.embedded_bytes as f64 / 1024.0,
                                         log.max_embedded_bytes / 1024,
                                         ver.blame_count
                                     ))
                                     .size(10.5)
-                                    .weak(),
+                                    .color(pal.text_weak),
                                 );
                             }
                         });
                     });
                     if !ver.issues.is_empty() {
-                        ui.add_space(4.0);
+                        ui.add_space(3.0);
                         for issue in &ver.issues {
                             let icol = match issue.severity {
-                                AuditSeverity::Tampered => Color32::from_rgb(196, 43, 28),
-                                AuditSeverity::Warning => Color32::from_rgb(168, 108, 12),
-                                AuditSeverity::Verified => Color32::from_rgb(16, 124, 65),
+                                AuditSeverity::Tampered => pal.err_fg,
+                                AuditSeverity::Warning => pal.warn_fg,
+                                AuditSeverity::Verified => pal.accent,
                             };
-                            ui.label(RichText::new(format!("• {}", issue.message)).size(11.5).color(icol));
+                            ui.label(RichText::new(format!("• {}", issue.message)).size(11.0).color(icol));
                         }
                     }
-                    if self.wb.dirty {
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new("提示：当前有尚未保存的本地改动，按 Ctrl+S 保存后将自动签名追加新提交。")
-                                .size(11.0)
-                                .weak(),
-                        );
-                    }
+                });
+        } else if self.audit_state.auto_enable_active(&self.wb) {
+            egui::Frame::NONE
+                .fill(pal.accent_tint)
+                .stroke(egui::Stroke::new(1.0_f32, pal.accent.gamma_multiply(0.45)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("✓ 防篡改保护已默认开启 · 保存 .xlsx 时将自动生成 ECDSA P-256 不可篡改签名链")
+                            .size(11.5)
+                            .color(pal.accent),
+                    );
+                });
+        } else {
+            egui::Frame::NONE
+                .fill(pal.warn_bg)
+                .stroke(egui::Stroke::new(1.0_f32, pal.warn_fg.gamma_multiply(0.45)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("ℹ 当前格式（.xls）不支持内嵌防篡改签名链，仅展示会话修订；另存为 .xlsx 后将自动开启防篡改保护。")
+                            .size(11.5)
+                            .color(pal.warn_fg),
+                    );
                 });
         }
 
         ui.add_space(6.0);
 
-        // 2. 操作工具栏
+        // 2. 组装统一记录行 & 动态用户下拉选项（仅显示编辑修改过的用户，含记录数并按记录数降序排列）
+        let all_rows = self.build_unified_audit_rows();
+        let user_counts = collect_user_filter_counts(&all_rows);
+        if !self.rev_filter_who.is_empty()
+            && !user_counts.iter().any(|(u, _)| u == &self.rev_filter_who)
+        {
+            self.rev_filter_who.clear();
+        }
+        let kw_q = self.rev_filter_kw.trim().to_lowercase();
+        let filtered_indices: Vec<usize> = all_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                if !self.rev_filter_who.is_empty() && r.user_name != self.rev_filter_who {
+                    return false;
+                }
+                if !kw_q.is_empty() && !r.search_haystack.contains(&kw_q) {
+                    return false;
+                }
+                true
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        // 3. 统一筛选与导出工具栏（动态用户下拉框 + 关键词搜索 + 导出功能）
+        let selected_user_text = if self.rev_filter_who.is_empty() {
+            format!("全部用户 ({})", all_rows.len())
+        } else {
+            let cnt = user_counts
+                .iter()
+                .find(|(u, _)| u == &self.rev_filter_who)
+                .map(|(_, c)| *c)
+                .unwrap_or(0);
+            format!("{} ({cnt})", self.rev_filter_who)
+        };
+
         ui.horizontal_wrapped(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.rev_filter_who)
-                    .hint_text("按作者/设备筛选")
-                    .desired_width(115.0),
+            ui.label(
+                RichText::new(format!(
+                    "显示 {} / {} 条",
+                    filtered_indices.len(),
+                    all_rows.len()
+                ))
+                .strong(),
             );
+            egui::ComboBox::from_id_salt("audit_user_filter_combo")
+                .width(152.0)
+                .selected_text(selected_user_text)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.rev_filter_who,
+                        String::new(),
+                        format!("全部用户 ({})", all_rows.len()),
+                    );
+                    if !user_counts.is_empty() {
+                        ui.separator();
+                        for (uname, cnt) in &user_counts {
+                            ui.selectable_value(
+                                &mut self.rev_filter_who,
+                                uname.clone(),
+                                format!("{uname} ({cnt})"),
+                            );
+                        }
+                    }
+                });
             ui.add(
                 egui::TextEdit::singleline(&mut self.rev_filter_kw)
-                    .hint_text("按表/单元格/内容筛选")
-                    .desired_width(145.0),
+                    .hint_text("按表/位置/内容筛选")
+                    .desired_width(155.0),
             );
+            if ui.small_button("导出 CSV…").clicked() {
+                do_export_csv = true;
+            }
             if log_opt.is_some() {
-                if ui.small_button("导出审计 CSV…").clicked() {
-                    do_export_csv = true;
-                }
-                if ui.small_button("导出对外干净副本…").on_hover_text("生成不含审计记录的脱敏 .xlsx，用于发给外部客户/供应商").clicked() {
+                if ui
+                    .small_button("导出干净副本…")
+                    .on_hover_text("生成不含审计记录的脱敏 .xlsx，用于发给外部客户/供应商")
+                    .clicked()
+                {
                     do_export_clean = true;
                 }
-                if ui.small_button("验证冷归档包…").on_hover_text("导入历史折叠导出的 .cellan-audit 归档包并核验 Merkle 根").clicked() {
+                if ui
+                    .small_button("验证冷归档…")
+                    .on_hover_text("导入历史折叠导出的 .cellan-audit 归档包并核验 Merkle 根")
+                    .clicked()
+                {
                     do_verify_archive = true;
                 }
                 if log_opt.as_ref().is_some_and(|l| l.last_compacted.is_some())
-                    && ui.small_button("导出刚折叠冷归档…").clicked()
+                    && ui.small_button("导出冷归档…").clicked()
                 {
                     do_export_archive = true;
                 }
             }
         });
 
-        if let Some((ok, ref msg)) = self.audit_archive_msg {
-            ui.add_space(4.0);
+        if !self.rev_msg.is_empty() {
+            let ok = self.rev_msg.starts_with("已撤回") || self.rev_msg.starts_with("已导出");
+            ui.add_space(3.0);
             ui.label(
-                RichText::new(msg).size(11.5).color(if ok {
-                    Color32::from_rgb(16, 124, 65)
-                } else {
-                    Color32::from_rgb(196, 43, 28)
-                }),
+                RichText::new(&self.rev_msg)
+                    .size(11.5)
+                    .color(if ok { pal.accent } else { pal.err_fg }),
+            );
+        }
+        if let Some((ok, ref msg)) = self.audit_archive_msg {
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new(msg)
+                    .size(11.5)
+                    .color(if ok { pal.accent } else { pal.err_fg }),
             );
         }
 
         ui.add_space(4.0);
+
+        // 4. P2 风格 5 列表头
+        ui.horizontal(|ui| {
+            crate::dlg_col(ui, 98.0, |ui| {
+                ui.label(RichText::new("时间").size(10.5).weak());
+            });
+            crate::dlg_col(ui, 112.0, |ui| {
+                ui.label(RichText::new("用户").size(10.5).weak());
+            });
+            crate::dlg_col(ui, 108.0, |ui| {
+                ui.label(RichText::new("动作").size(10.5).weak());
+            });
+            crate::dlg_col(ui, 126.0, |ui| {
+                ui.label(RichText::new("位置").size(10.5).weak());
+            });
+            crate::dlg_col(ui, 250.0, |ui| {
+                ui.label(RichText::new("改动").size(10.5).weak());
+            });
+            ui.label(RichText::new("状态").size(10.5).weak());
+        });
         ui.separator();
 
-        // 3. 提交链与归档节点时间线
-        let Some(log) = log_opt else {
-            if do_reverify {
-                self.refresh_audit_verification_now();
-            }
-            return;
-        };
-
-        let who_q = self.rev_filter_who.trim().to_lowercase();
-        let kw_q = self.rev_filter_kw.trim().to_lowercase();
         let my_pk = self.my_audit_pubkey().map(|s| s.to_string());
 
+        if filtered_indices.is_empty() && log_opt.as_ref().is_none_or(|l| l.rollups.is_empty()) {
+            ui.add_space(12.0);
+            let empty_txt = if all_rows.is_empty() {
+                "尚无编辑修改记录。修改单元格后会实时记录，按 Ctrl+S 保存 .xlsx 时自动签名保护。"
+            } else {
+                "没有匹配的编辑记录。"
+            };
+            ui.label(RichText::new(empty_txt).weak());
+            ui.add_space(12.0);
+        }
+
+        // 5. 统一记录滚动表 + 底部历史冷归档节点
         egui::ScrollArea::vertical()
-            .id_salt("audit_commit_scroll")
-            .max_height(370.0)
+            .id_salt("unified_audit_scroll")
+            .max_height(390.0)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                // 最新提交在前
-                for commit in log.commits.iter().rev() {
-                    let committer = log.author_of(commit.committer_idx);
-                    let who_label = committer
-                        .map(|a| a.short_label())
-                        .unwrap_or_else(|| "未知作者".into());
-                    if !who_q.is_empty() {
-                        let hit_who = who_label.to_lowercase().contains(&who_q)
-                            || commit.co_signers.iter().any(|co| {
-                                log.author_of(co.author_idx)
-                                    .is_some_and(|a| a.short_label().to_lowercase().contains(&who_q))
-                            });
-                        if !hit_who {
-                            continue;
-                        }
-                    }
-                    if !kw_q.is_empty() {
-                        let hit_kw = commit.action.to_lowercase().contains(&kw_q)
-                            || format!("#{}", commit.seq).contains(&kw_q)
-                            || commit.cells.iter().any(|ch| {
-                                let sh = log.sheet_of(ch.sheet_idx).to_lowercase();
-                                let pos = sheetcore::model::cell_name(ch.row, ch.col).to_lowercase();
-                                sh.contains(&kw_q)
-                                    || pos.contains(&kw_q)
-                                    || ch.before.summary().to_lowercase().contains(&kw_q)
-                                    || ch.after.summary().to_lowercase().contains(&kw_q)
-                            })
-                            || commit.bulk_ops.iter().any(|b| {
-                                b.summary.to_lowercase().contains(&kw_q)
-                                    || b.kind.to_lowercase().contains(&kw_q)
-                            });
-                        if !hit_kw {
-                            continue;
-                        }
-                    }
-
-                    let expanded = self.audit_expanded_seq == Some(commit.seq);
+                for &idx in &filtered_indices {
+                    let row = &all_rows[idx];
                     ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("#{}", commit.seq))
-                                .strong()
-                                .size(12.0)
-                                .color(ui_kit::ACCENT),
-                        );
-                        ui.label(
-                            RichText::new(sheetcore::audit::format_local_ms(commit.ts_ms))
-                                .size(11.0)
-                                .weak(),
-                        );
-                        ui.label(RichText::new(&who_label).strong().size(12.0));
-                        if let Some(au) = committer {
-                            let badge = audit_store::trust_badge_for_author(au, my_pk.as_deref());
-                            let (bt, bc) = match badge {
-                                AuthorTrustBadge::SelfDevice => ("本机", Color32::from_rgb(16, 124, 65)),
-                                AuthorTrustBadge::KnownTrusted => ("已信任", Color32::from_rgb(16, 124, 65)),
-                                AuthorTrustBadge::FirstSeen => ("首次见", Color32::from_rgb(90, 96, 106)),
-                                AuthorTrustBadge::KeyChanged => ("⚠密钥变化", Color32::from_rgb(196, 43, 28)),
-                            };
-                            ui.label(
-                                RichText::new(format!("[{bt} · {}]", &au.fingerprint()[..9]))
-                                    .size(10.5)
-                                    .color(bc),
-                            );
-                        }
-                        ui.label(RichText::new(&commit.action).size(11.5));
-                        if !commit.co_signers.is_empty() {
-                            let attested = commit.co_signers.iter().filter(|c| c.attested_by_peer).count();
-                            ui.label(
-                                RichText::new(format!(
-                                    "联署 {attested}/{}",
-                                    commit.co_signers.len()
-                                ))
-                                .size(10.5)
-                                .color(Color32::from_rgb(16, 124, 65)),
-                            );
-                        }
-                        if commit.external_gap_hash.is_some() {
-                            ui.label(
-                                RichText::new("⚠含外部修改缺口")
-                                    .size(10.5)
-                                    .color(Color32::from_rgb(168, 108, 12)),
-                            );
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button(if expanded { "收起" } else { "详情" })
-                                .clicked()
-                            {
-                                self.audit_expanded_seq = if expanded { None } else { Some(commit.seq) };
-                            }
-                            let count_txt = if commit.total_cell_changes > 0 {
-                                format!("{} 格改动", commit.total_cell_changes)
-                            } else if !commit.bulk_ops.is_empty() {
-                                commit.bulk_ops[0].summary.clone()
+                        crate::dlg_col(ui, 98.0, |ui| {
+                            let ts_txt = if row.pending {
+                                crate::rel_time(row.ts_ms)
                             } else {
-                                "基线快照".into()
+                                let full = sheetcore::audit::format_local_ms(row.ts_ms);
+                                full.get(5..16).unwrap_or(&full).to_string()
                             };
-                            ui.label(RichText::new(count_txt).size(11.0).weak());
+                            let lbl = ui.label(RichText::new(ts_txt).size(11.0).weak());
+                            if !row.hover_tip.is_empty() {
+                                lbl.on_hover_text(&row.hover_tip);
+                            }
                         });
+                        crate::dlg_col(ui, 112.0, |ui| {
+                            let mut name_text = row.user_name.clone();
+                            let mut name_color: Option<Color32> = None;
+                            let mut author_tip = String::new();
+                            if let Some(ref au) = row.author {
+                                let badge = audit_store::trust_badge_for_author(au, my_pk.as_deref());
+                                let bt = match badge {
+                                    AuthorTrustBadge::SelfDevice => "本机签名",
+                                    AuthorTrustBadge::KnownTrusted => "已信任设备",
+                                    AuthorTrustBadge::FirstSeen => "首次见设备",
+                                    AuthorTrustBadge::KeyChanged => {
+                                        name_text = format!("⚠ {}", row.user_name);
+                                        name_color = Some(pal.err_fg);
+                                        "⚠ 身份密钥发生变化"
+                                    }
+                                };
+                                author_tip = format!(
+                                    "{}（Windows：{} · 设备：{}）\n信任状态：{bt} · 指纹：{}",
+                                    au.display_name,
+                                    if au.os_user.is_empty() { "-" } else { &au.os_user },
+                                    if au.machine.is_empty() { "-" } else { &au.machine },
+                                    au.fingerprint(),
+                                );
+                            }
+                            let mut rt = RichText::new(name_text).strong().size(11.5);
+                            if let Some(c) = name_color {
+                                rt = rt.color(c);
+                            }
+                            let lbl = ui.add(egui::Label::new(rt).truncate());
+                            if !author_tip.is_empty() {
+                                lbl.on_hover_text(author_tip);
+                            }
+                        });
+                        crate::dlg_col(ui, 108.0, |ui| {
+                            let rt = if row.pending {
+                                RichText::new(&row.action).size(11.0).color(pal.warn_fg)
+                            } else {
+                                RichText::new(&row.action).size(11.5)
+                            };
+                            let lbl = ui.add(egui::Label::new(rt).truncate());
+                            if !row.hover_tip.is_empty() {
+                                lbl.on_hover_text(&row.hover_tip);
+                            }
+                        });
+                        crate::dlg_col(ui, 126.0, |ui| {
+                            if let Some((ref sh, r, c)) = row.jump {
+                                if ui.link(&row.location).clicked() {
+                                    *jump = Some((sh.clone(), r, c));
+                                }
+                            } else {
+                                ui.add(
+                                    egui::Label::new(RichText::new(&row.location).size(11.0).weak())
+                                        .truncate(),
+                                );
+                            }
+                        });
+                        crate::dlg_col(ui, 250.0, |ui| {
+                            let lbl = ui.add(
+                                egui::Label::new(RichText::new(&row.detail).size(11.0))
+                                    .truncate(),
+                            );
+                            if !row.hover_tip.is_empty() {
+                                lbl.on_hover_text(format!("{}\n\n{}", row.detail, row.hover_tip));
+                            } else {
+                                lbl.on_hover_text(&row.detail);
+                            }
+                        });
+                        if let Some(rev_idx) = row.revert_rev_idx {
+                            if ui.small_button("撤回").clicked() {
+                                *revert = Some(rev_idx);
+                            }
+                        } else if let Some(ref btxt) = row.badge_text {
+                            let col = if row.badge_is_warn {
+                                pal.err_fg
+                            } else if row.pending {
+                                pal.warn_fg
+                            } else {
+                                pal.accent
+                            };
+                            let lbl = ui.label(RichText::new(btxt).size(10.5).color(col));
+                            if !row.hover_tip.is_empty() {
+                                lbl.on_hover_text(&row.hover_tip);
+                            }
+                        }
                     });
-
-                    // 默认展示前 2 条细胞级改动预览，展开后显示全部明细与签名哈希
-                    let preview_limit = if expanded { commit.cells.len() } else { 2 };
-                    for ch in commit.cells.iter().take(preview_limit) {
-                        let sh = log.sheet_of(ch.sheet_idx);
-                        let pos = format!("{sh}!{}", sheetcore::model::cell_name(ch.row, ch.col));
-                        let ch_who = log
-                            .author_of(ch.author_idx)
-                            .map(|a| a.display_name.as_str())
-                            .unwrap_or("");
-                        ui.horizontal(|ui| {
-                            ui.add_space(18.0);
-                            if ui.link(&pos).clicked() {
-                                *jump = Some((sh.to_string(), ch.row, ch.col));
-                            }
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} → {}",
-                                    ch.before.summary(),
-                                    ch.after.summary()
-                                ))
-                                .size(11.5),
-                            );
-                            if ch.author_idx != commit.committer_idx && !ch_who.is_empty() {
-                                ui.label(
-                                    RichText::new(format!("（由 {ch_who} 修改）"))
-                                        .size(10.5)
-                                        .weak(),
-                                );
-                            }
-                        });
-                    }
-                    if !expanded && commit.cells.len() > 2 {
-                        ui.horizontal(|ui| {
-                            ui.add_space(18.0);
-                            ui.label(
-                                RichText::new(format!(
-                                    "…其余 {} 条明细，点击右侧「详情」展开",
-                                    commit.cells.len() - 2
-                                ))
-                                .size(10.5)
-                                .weak(),
-                            );
-                        });
-                    }
-                    if expanded {
-                        for bo in &commit.bulk_ops {
-                            ui.horizontal(|ui| {
-                                ui.add_space(18.0);
-                                ui.label(
-                                    RichText::new(format!(
-                                        "[{}] {}：{}",
-                                        bo.kind,
-                                        log.sheet_of(bo.sheet_idx),
-                                        bo.summary
-                                    ))
-                                    .size(11.0)
-                                    .weak(),
-                                );
-                            });
-                        }
-                        for co in &commit.co_signers {
-                            let name = log
-                                .author_of(co.author_idx)
-                                .map(|a| a.short_label())
-                                .unwrap_or_else(|| "未知".into());
-                            let tag = if co.attested_by_peer {
-                                "✓ 协作者私钥独立联署已验签"
-                            } else {
-                                "△ 宿主代签"
-                            };
-                            ui.horizontal(|ui| {
-                                ui.add_space(18.0);
-                                ui.label(
-                                    RichText::new(format!("协作参与：{name}（{} 格 · {tag}）", co.change_count))
-                                        .size(10.5)
-                                        .weak(),
-                                );
-                            });
-                        }
-                        ui.horizontal(|ui| {
-                            ui.add_space(18.0);
-                            ui.label(
-                                RichText::new(format!(
-                                    "提交哈希：{}…  |  状态根：{}…",
-                                    &commit.commit_hash[..commit.commit_hash.len().min(16)],
-                                    &commit.state_hash[..commit.state_hash.len().min(16)],
-                                ))
-                                .size(10.0)
-                                .weak(),
-                            );
-                        });
-                    }
                     ui.separator();
                 }
 
                 // 历史滚动折叠归档节点
-                for (ridx, rollup) in log.rollups.iter().enumerate().rev() {
-                    let authors_txt: String = rollup
-                        .author_counts
-                        .iter()
-                        .filter_map(|&(au, cnt)| {
-                            log.author_of(au).map(|a| format!("{}({cnt}次)", a.display_name))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("、");
-                    egui::Frame::NONE
-                        .fill(Color32::from_rgba_unmultiplied(120, 130, 145, 16))
-                        .corner_radius(5.0)
-                        .inner_margin(egui::Margin::symmetric(8, 6))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "📦 历史归档折叠 #{}..#{}（{} ~ {}）",
-                                    rollup.from_seq,
-                                    rollup.to_seq,
-                                    sheetcore::audit::format_local_ms(rollup.from_ts_ms),
-                                    sheetcore::audit::format_local_ms(rollup.to_ts_ms),
-                                ))
-                                .strong()
-                                .size(11.5),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "参与人：{authors_txt} · 累计 {} 格改动 · Merkle根：{}…（可导入 .cellan-audit 归档包验真）",
-                                    rollup.total_cell_changes,
-                                    &rollup.commit_merkle_root[..rollup.commit_merkle_root.len().min(14)],
-                                ))
-                                .size(10.5)
-                                .weak(),
-                            );
-                            if let Some((ref res, ref arch)) = self.audit_state.verified_cold_archive
-                                && res.matched_rollup_idx == Some(ridx)
-                            {
-                                ui.add_space(4.0);
+                if let Some(ref log) = log_opt {
+                    for (ridx, rollup) in log.rollups.iter().enumerate().rev() {
+                        let authors_txt: String = rollup
+                            .author_counts
+                            .iter()
+                            .filter_map(|&(au, cnt)| {
+                                log.author_of(au).map(|a| format!("{}({cnt}次)", a.display_name))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("、");
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgba_unmultiplied(120, 130, 145, 16))
+                            .corner_radius(5.0)
+                            .inner_margin(egui::Margin::symmetric(8, 6))
+                            .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new(format!("✓ 已加载冷归档包：{}", res.summary))
-                                        .size(11.0)
-                                        .color(Color32::from_rgb(16, 124, 65)),
+                                    RichText::new(format!(
+                                        "📦 历史归档折叠 #{}..#{}（{} ~ {}）",
+                                        rollup.from_seq,
+                                        rollup.to_seq,
+                                        sheetcore::audit::format_local_ms(rollup.from_ts_ms),
+                                        sheetcore::audit::format_local_ms(rollup.to_ts_ms),
+                                    ))
+                                    .strong()
+                                    .size(11.5),
                                 );
-                                for hc in arch.commits.iter().rev().take(30) {
-                                    let who = arch
-                                        .author_dict
-                                        .get(hc.committer_idx as usize)
-                                        .map(|a| a.display_name.as_str())
-                                        .unwrap_or("?");
+                                ui.label(
+                                    RichText::new(format!(
+                                        "参与人：{authors_txt} · 累计 {} 格改动 · Merkle根：{}…（可导入 .cellan-audit 归档包验真）",
+                                        rollup.total_cell_changes,
+                                        &rollup.commit_merkle_root[..rollup.commit_merkle_root.len().min(14)],
+                                    ))
+                                    .size(10.5)
+                                    .weak(),
+                                );
+                                if let Some((ref res, ref arch)) = self.audit_state.verified_cold_archive
+                                    && res.matched_rollup_idx == Some(ridx)
+                                {
+                                    ui.add_space(4.0);
                                     ui.label(
-                                        RichText::new(format!(
-                                            "  #{} {} · {} · {}（{} 格）",
-                                            hc.seq,
-                                            sheetcore::audit::format_local_ms(hc.ts_ms),
-                                            who,
-                                            hc.action,
-                                            hc.total_cell_changes
-                                        ))
-                                        .size(10.5),
+                                        RichText::new(format!("✓ 已加载冷归档包：{}", res.summary))
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(16, 124, 65)),
                                     );
+                                    for hc in arch.commits.iter().rev().take(30) {
+                                        let who = arch
+                                            .author_dict
+                                            .get(hc.committer_idx as usize)
+                                            .map(|a| a.display_name.as_str())
+                                            .unwrap_or("?");
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "  #{} {} · {} · {}（{} 格）",
+                                                hc.seq,
+                                                sheetcore::audit::format_local_ms(hc.ts_ms),
+                                                who,
+                                                hc.action,
+                                                hc.total_cell_changes
+                                            ))
+                                            .size(10.5),
+                                        );
+                                    }
                                 }
-                            }
-                        });
-                    ui.add_space(4.0);
+                            });
+                        ui.add_space(4.0);
+                    }
                 }
             });
 
@@ -1679,16 +2035,20 @@ impl SheetApp {
             self.refresh_audit_verification_now();
         }
         if do_export_csv {
+            let rows_to_export: Vec<&UnifiedAuditRow> =
+                filtered_indices.iter().map(|&i| &all_rows[i]).collect();
             if let Some(dest) = rfd::FileDialog::new()
-                .set_file_name("防篡改审计记录.csv")
+                .set_file_name("编辑与防篡改记录.csv")
                 .add_filter("CSV 表格", &["csv"])
                 .save_file()
             {
-                let csv = log.export_csv();
+                let csv = export_unified_rows_csv(&rows_to_export);
                 match std::fs::write(&dest, csv.as_bytes()) {
                     Ok(_) => {
-                        self.audit_archive_msg =
-                            Some((true, format!("已导出防篡改审计报告至 {}", dest.display())));
+                        self.audit_archive_msg = Some((
+                            true,
+                            format!("已导出 {} 条记录至 {}", rows_to_export.len(), dest.display()),
+                        ));
                     }
                     Err(e) => {
                         self.audit_archive_msg = Some((false, format!("导出失败：{e}")));
@@ -1707,54 +2067,11 @@ impl SheetApp {
         }
     }
 
-    /// 渲染审计相关弹窗：启用确认弹窗 + 单元格最后修改溯源（Blame）弹窗
+    /// 渲染单元格最后修改溯源（Blame）弹窗
     pub(crate) fn draw_audit_dialogs(&mut self, ctx: &egui::Context) {
-        // 1. 启用防篡改审计确认弹窗
-        if self.audit_enable_confirm {
-            let mut open = true;
-            let mut confirm = false;
-            let mut cancel = false;
-            ui_kit::window(ctx, "开启不可篡改编辑记录", 440.0)
-                .open(&mut open)
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
-                .show(ctx, |ui| {
-                    ui.label(
-                        RichText::new("开启后，本工作簿将启用去中心化防篡改审计：")
-                            .strong()
-                            .size(13.0),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(
-                        "1. 每次保存会自动计算净变更、用本机 ECDSA P-256 私钥签名并链式内嵌进 .xlsx 文件；\n\
-                         2. 开启后不可在原文件上关闭，以防止编辑者先关闭再偷偷改数；\n\
-                         3. 若有人绕过 CELLAN 用 Excel/WPS 修改或拿旧备份覆盖，所有查看者打开都会立刻收到异常警告；\n\
-                         4. 体积自动受控（硬上限 512 KB，超限自动滚动折叠归档不断链）；\n\
-                         5. 如需发给外部客户/供应商，请使用「文件 → 导出对外干净副本」脱敏发送。",
-                    );
-                    ui.add_space(10.0);
-                    ui_kit::footer(ui, |ui| {
-                        if ui_kit::primary_button(ui, "确认开启").clicked() {
-                            confirm = true;
-                        }
-                        if ui_kit::secondary_button(ui, "取消").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-            if confirm {
-                self.audit_enable_confirm = false;
-                self.enable_audit_for_current_workbook();
-            } else if cancel || !open {
-                self.audit_enable_confirm = false;
-            }
-        }
-
-        // 2. 单元格右键「查看修改溯源 (Blame)」弹窗
         if let Some((sheet_name, row, col)) = self.audit_blame_popup.clone() {
             let mut open = true;
             let mut open_full_audit = false;
-            let mut enable_now = false;
             let cell_coord = format!("{sheet_name}!{}", sheetcore::model::cell_name(row, col));
             let cur_summary = self
                 .wb
@@ -1793,12 +2110,13 @@ impl SheetApp {
                             _ => None,
                         };
                         if let Some(blame) = blame_opt {
+                            let pal = crate::theme::palette();
                             let badge = audit_store::trust_badge_for_author(&blame.author, my_pk.as_deref());
                             let (bt, bc) = match badge {
-                                AuthorTrustBadge::SelfDevice => ("本机签名", Color32::from_rgb(16, 124, 65)),
-                                AuthorTrustBadge::KnownTrusted => ("已信任设备", Color32::from_rgb(16, 124, 65)),
-                                AuthorTrustBadge::FirstSeen => ("首次见设备", Color32::from_rgb(90, 96, 106)),
-                                AuthorTrustBadge::KeyChanged => ("⚠ 身份指纹变化", Color32::from_rgb(196, 43, 28)),
+                                AuthorTrustBadge::SelfDevice => ("本机签名", pal.accent),
+                                AuthorTrustBadge::KnownTrusted => ("已信任设备", pal.accent),
+                                AuthorTrustBadge::FirstSeen => ("首次见设备", pal.text_weak),
+                                AuthorTrustBadge::KeyChanged => ("⚠ 身份指纹变化", pal.err_fg),
                             };
                             let (role_title, who_prefix) = if blame.is_baseline {
                                 ("基线登记人（开启审计时已存在，尚未发生审计后修改）", "登记人")
@@ -1806,7 +2124,8 @@ impl SheetApp {
                                 ("最后修改人（持久 Blame 溯源）", "作者")
                             };
                             egui::Frame::NONE
-                                .fill(Color32::from_rgba_unmultiplied(16, 124, 65, 14))
+                                .fill(pal.accent_tint)
+                                .stroke(egui::Stroke::new(1.0, pal.accent.gamma_multiply(0.35)))
                                 .corner_radius(6.0)
                                 .inner_margin(egui::Margin::symmetric(10, 8))
                                 .show(ui, |ui| {
@@ -1855,7 +2174,18 @@ impl SheetApp {
                         }
                         ui.add_space(8.0);
                         ui_kit::footer(ui, |ui| {
-                            if ui_kit::primary_button(ui, "查看整本审计记录").clicked() {
+                            if ui_kit::primary_button(ui, "查看全部编辑与防篡改记录").clicked() {
+                                open_full_audit = true;
+                            }
+                            if ui_kit::secondary_button(ui, "关闭").clicked() {
+                                open = false;
+                            }
+                        });
+                    } else if self.audit_state.auto_enable_active(&self.wb) {
+                        ui.label("防篡改编辑记录已默认开启。按 Ctrl+S 保存为 .xlsx 后，将自动生成签名审计链并可查看该单元格的修改人与历史记录。");
+                        ui.add_space(8.0);
+                        ui_kit::footer(ui, |ui| {
+                            if ui_kit::primary_button(ui, "查看编辑与防篡改记录").clicked() {
                                 open_full_audit = true;
                             }
                             if ui_kit::secondary_button(ui, "关闭").clicked() {
@@ -1863,11 +2193,11 @@ impl SheetApp {
                             }
                         });
                     } else {
-                        ui.label("当前工作簿尚未开启「不可篡改审计记录」。开启后每次保存将自动记录每个单元格的修改人与完整变更史。");
+                        ui.label("当前文档为 .xls 格式或存在审计异常，暂无可用的已签名单元格溯源记录；另存为 .xlsx 后将自动开启防篡改审计。");
                         ui.add_space(8.0);
                         ui_kit::footer(ui, |ui| {
-                            if ui_kit::primary_button(ui, "立即开启防篡改审计…").clicked() {
-                                enable_now = true;
+                            if ui_kit::primary_button(ui, "查看编辑记录").clicked() {
+                                open_full_audit = true;
                             }
                             if ui_kit::secondary_button(ui, "关闭").clicked() {
                                 open = false;
@@ -1878,14 +2208,81 @@ impl SheetApp {
             if open_full_audit {
                 self.audit_blame_popup = None;
                 self.open_audit_panel();
-            } else if enable_now {
-                self.audit_blame_popup = None;
-                self.audit_enable_confirm = true;
             } else if !open {
                 self.audit_blame_popup = None;
             }
         }
     }
+}
+
+/// 统一「编辑与防篡改记录」面板的单行展示结构
+#[derive(Clone, Debug)]
+pub(crate) struct UnifiedAuditRow {
+    pub ts_ms: u64,
+    pub pending: bool,
+    pub commit_seq: Option<u64>,
+    pub user_name: String,
+    pub author: Option<AuditAuthor>,
+    pub action: String,
+    pub location: String,
+    pub jump: Option<(String, u32, u32)>,
+    pub detail: String,
+    pub hover_tip: String,
+    pub revert_rev_idx: Option<usize>,
+    pub badge_text: Option<String>,
+    pub badge_is_warn: bool,
+    pub search_haystack: String,
+}
+
+fn normalize_user_name(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        "未知用户".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// 动态汇总编辑修改过该工作簿的用户及其记录数，严格按记录数降序排列（同数按用户名升序）
+pub(crate) fn collect_user_filter_counts(rows: &[UnifiedAuditRow]) -> Vec<(String, usize)> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for r in rows {
+        *counts.entry(normalize_user_name(&r.user_name)).or_insert(0) += 1;
+    }
+    let mut list: Vec<(String, usize)> = counts.into_iter().collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    list
+}
+
+fn csv_escape_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+pub(crate) fn export_unified_rows_csv(rows: &[&UnifiedAuditRow]) -> String {
+    let mut out = String::from("\u{FEFF}状态,版本,时间,用户,动作,位置,改动\r\n");
+    for r in rows {
+        let status = if r.pending { "待保存" } else { "已签名" };
+        let seq = r
+            .commit_seq
+            .map(|s| format!("#{s}"))
+            .unwrap_or_else(|| "-".into());
+        let ts = sheetcore::audit::format_local_ms(r.ts_ms);
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{}\r\n",
+            csv_escape_field(status),
+            csv_escape_field(&seq),
+            csv_escape_field(&ts),
+            csv_escape_field(&r.user_name),
+            csv_escape_field(&r.action),
+            csv_escape_field(&r.location),
+            csv_escape_field(&r.detail),
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2040,6 +2437,7 @@ mod tests {
             Some(&host_net),
             "宿主张三",
             &mut kp_cache,
+            0,
         );
         tasks.start_save(&mut host_wb, shared_file.clone());
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -2610,6 +3008,218 @@ mod tests {
         assert!(
             log3.commits[2].co_signers[0].attested_by_peer,
             "访客提交联署后离线，宿主保存时必须保留其有效独立联署"
+        );
+    }
+
+    #[test]
+    fn ux_default_on_new_blank_workbook_auto_enables_audit_on_first_save() {
+        let env = crate::test_env::TestEnv::new("audit-default-on-blank");
+        let target = env.root().join("brand_new.xlsx");
+
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.my_name = "陈会计".into();
+        assert!(
+            app.audit_state.auto_enable_active(&app.wb),
+            "新建空白工作簿默认应处于防篡改自动开启状态"
+        );
+        assert!(app.audit_state.baseline.is_some(), "新建空白工作簿应立即持有基线");
+
+        // 未手动点击任何“开启审计”按钮，直接编辑 A1=123 并保存
+        app.wb.sheets[0].set(0, 0, Cell { value: Value::Number(123.0), formula: None });
+        app.wb.path = Some(target.clone());
+        app.wb.dirty = true;
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.has_pending_save());
+
+        let reopened = sheetcore::xlsx::load(&target).unwrap();
+        let ver = verify_workbook_audit(&reopened).unwrap();
+        assert_eq!(ver.severity, AuditSeverity::Verified, "{:?}", ver.issues);
+        let log = reopened.audit.log.as_ref().expect("新建工作簿首次保存必须自动内嵌防篡改审计链");
+        assert_eq!(log.head_seq(), 2, "应自动写入创世基线 #1 + 首轮改动 #2");
+        assert_eq!(log.commits[1].total_cell_changes, 1);
+        assert_eq!(log.commits[1].cells[0].before, AuditSnap::Empty);
+        assert_eq!(log.commits[1].cells[0].after, AuditSnap::Num(123.0));
+        let blame = log.lookup_blame("Sheet1", 0, 0).expect("A1 应有 Blame 溯源");
+        assert_eq!(blame.author.display_name, "陈会计");
+        assert!(!blame.is_baseline);
+    }
+
+    #[test]
+    fn ux_default_on_legacy_xlsx_untouched_on_read_and_auto_enables_on_edit_save() {
+        let env = crate::test_env::TestEnv::new("audit-default-on-legacy");
+        let legacy = env.root().join("legacy_book.xlsx");
+
+        let mut raw_wb = Workbook::new_blank();
+        raw_wb.sheets[0].set(0, 0, Cell { value: Value::Number(100.0), formula: None });
+        raw_wb.sheets[0].set(0, 1, Cell { value: Value::Number(50.0), formula: None });
+        sheetcore::xlsx::save_atomic(&legacy, &raw_wb).unwrap();
+        let orig_bytes = std::fs::read(&legacy).unwrap();
+
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.my_name = "林审核".into();
+        app.open_path(legacy.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.tasks.open_rx.is_some() && Instant::now() < deadline {
+            app.poll_open();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 纯只读打开：既不改写磁盘原文件，也不在内存中强行变脏，但处于默认自动开启就绪态
+        assert!(app.wb.audit.log.is_none());
+        assert!(!app.wb.dirty);
+        assert!(app.audit_state.auto_enable_active(&app.wb));
+        assert_eq!(std::fs::read(&legacy).unwrap(), orig_bytes, "只读查看旧文件绝不能改动原文件");
+
+        // 首次编辑 A1: 100 -> 260 并保存：自动生成 #1 基线 + #2 精准净变更，未改动的 B1 标为基线登记
+        app.wb.sheets[0].set(0, 0, Cell { value: Value::Number(260.0), formula: None });
+        app.wb.dirty = true;
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let reopened = sheetcore::xlsx::load(&legacy).unwrap();
+        let ver = verify_workbook_audit(&reopened).unwrap();
+        assert_eq!(ver.severity, AuditSeverity::Verified, "{:?}", ver.issues);
+        let log = reopened.audit.log.as_ref().expect("旧文件首次编辑保存后应自动开启防篡改审计");
+        assert_eq!(log.head_seq(), 2);
+        assert_eq!(log.commits[1].total_cell_changes, 1);
+        assert_eq!(log.commits[1].cells[0].before, AuditSnap::Num(100.0));
+        assert_eq!(log.commits[1].cells[0].after, AuditSnap::Num(260.0));
+        assert!(
+            log.lookup_blame("Sheet1", 0, 1).unwrap().is_baseline,
+            "旧文件中未编辑过的 B1 应标为基线登记人"
+        );
+        assert!(
+            !log.lookup_blame("Sheet1", 0, 0).unwrap().is_baseline,
+            "本次编辑过的 A1 应标为修改作者"
+        );
+    }
+
+    #[test]
+    fn ux_unified_rows_and_dynamic_user_dropdown_sorted_by_count_desc() {
+        let env = crate::test_env::TestEnv::new("audit-unified-user-dropdown");
+        let ledger = env.root().join("multi_user.xlsx");
+
+        let kp_alice = generate_keypair().unwrap();
+        let kp_bob = generate_keypair().unwrap();
+        let kp_carol = generate_keypair().unwrap();
+        let alice = audit_store::current_author("张三", &kp_alice);
+        let bob = audit_store::current_author("李四", &kp_bob);
+        let carol = audit_store::current_author("王五", &kp_carol);
+
+        // 构造多用户真实签名审计链：张三改 1 格，李四改 3 格，王五改 2 格
+        let mut wb = Workbook::new_blank();
+        let mut log = AuditLog::enable(&wb, alice.clone(), &kp_alice, 1_700_000_000_000).unwrap();
+
+        let base1 = wb.clone();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Number(1.0), formula: None });
+        let d2 = sheetcore::audit::compute_net_diff(&base1, &wb, &alice, &HashMap::new(), &[]);
+        log.append_commit(&wb, alice.clone(), &kp_alice, "保存修改", &d2, &[], None, 1_700_000_010_000)
+            .unwrap();
+
+        let base2 = wb.clone();
+        wb.sheets[0].set(1, 0, Cell { value: Value::Number(2.0), formula: None });
+        wb.sheets[0].set(2, 0, Cell { value: Value::Number(3.0), formula: None });
+        wb.sheets[0].set(3, 0, Cell { value: Value::Number(4.0), formula: None });
+        let d3 = sheetcore::audit::compute_net_diff(&base2, &wb, &bob, &HashMap::new(), &[]);
+        log.append_commit(&wb, bob.clone(), &kp_bob, "保存修改", &d3, &[], None, 1_700_000_020_000)
+            .unwrap();
+
+        let base3 = wb.clone();
+        wb.sheets[0].set(4, 0, Cell { value: Value::Number(5.0), formula: None });
+        wb.sheets[0].set(5, 0, Cell { value: Value::Number(6.0), formula: None });
+        let d4 = sheetcore::audit::compute_net_diff(&base3, &wb, &carol, &HashMap::new(), &[]);
+        log.append_commit(&wb, carol.clone(), &kp_carol, "保存修改", &d4, &[], None, 1_700_000_030_000)
+            .unwrap();
+
+        wb.audit.log = Some(Arc::new(log));
+        sheetcore::xlsx::save_atomic(&ledger, &wb).unwrap();
+
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.my_name = "张三".into();
+        app.open_path(ledger.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.tasks.open_rx.is_some() && Instant::now() < deadline {
+            app.poll_open();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 1. 刚打开：只有 3 位编辑过的用户，下拉列表严格按记录数降序：李四(3) > 王五(2) > 张三(1)
+        let rows = app.build_unified_audit_rows();
+        assert_eq!(rows.len(), 6, "空创世 #1 不应计入修改行，总修改行应为 1+3+2=6");
+        let counts = collect_user_filter_counts(&rows);
+        assert_eq!(
+            counts,
+            vec![
+                ("李四".to_string(), 3),
+                ("王五".to_string(), 2),
+                ("张三".to_string(), 1),
+            ],
+            "动态用户下拉框必须仅含修改过的用户且按记录数降序排列"
+        );
+
+        // 2. 张三继续在会话内未保存修改 3 格 -> 待保存行自动并入同一列表，张三跃升至第一：张三(4) > 李四(3) > 王五(2)
+        for r in 10..13u32 {
+            let new_cell = Cell { value: Value::Number(f64::from(r)), formula: None };
+            app.rev.push(sheetcore::revision::Entry {
+                ts: 1_700_000_040_000 + u64::from(r),
+                who: "张三".into(),
+                site: 0,
+                remote: false,
+                label: "输入".into(),
+                sheet: "Sheet1".into(),
+                cells: vec![sheetcore::revision::Change {
+                    r,
+                    c: 0,
+                    before: sheetcore::revision::Snap::default(),
+                    after: sheetcore::revision::Snap::from_cell(&new_cell),
+                    before_style: None,
+                    after_style: None,
+                }],
+                note: String::new(),
+            });
+            app.wb.sheets[0].set(r, 0, new_cell);
+        }
+        app.wb.dirty = true;
+
+        let rows_pending = app.build_unified_audit_rows();
+        assert_eq!(rows_pending.len(), 9);
+        assert!(rows_pending[0].pending && rows_pending[0].revert_rev_idx.is_some());
+        let counts_pending = collect_user_filter_counts(&rows_pending);
+        assert_eq!(
+            counts_pending,
+            vec![
+                ("张三".to_string(), 4),
+                ("李四".to_string(), 3),
+                ("王五".to_string(), 2),
+            ]
+        );
+
+        // 3. 保存落盘后，待保存记录无缝转为已签名记录，不重复计数（仍为 4+3+2=9 条）
+        app.save(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.has_pending_save() && Instant::now() < deadline {
+            app.poll_save();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let rows_after = app.build_unified_audit_rows();
+        assert_eq!(rows_after.len(), 9, "保存后待保存项应无缝转为已签名项且绝不重复");
+        assert!(rows_after.iter().all(|r| !r.pending));
+        assert_eq!(
+            collect_user_filter_counts(&rows_after),
+            vec![
+                ("张三".to_string(), 4),
+                ("李四".to_string(), 3),
+                ("王五".to_string(), 2),
+            ]
         );
     }
 }

@@ -1296,16 +1296,12 @@ impl SheetApp {
             }
             "ProtectSheet" => self.open_protect_sheet_dialog(),
             "TrackChanges" => {
-                self.rev_open = true;
-                self.rev_tab = if self.wb.audit.log.is_some() || self.audit_state.verification.is_some() { 0 } else { 1 };
-                self.refresh_audit_verification_now();
+                self.open_audit_panel();
             }
-            // 审阅：显示更改（复用修订与审计日志）、批注导航、辅助功能检查器
+            // 审阅：显示更改（统一打开编辑与防篡改记录）、批注导航、辅助功能检查器
             "ShowChanges" => {
-                self.rev_open = true;
-                self.rev_tab = if self.wb.audit.log.is_some() || self.audit_state.verification.is_some() { 0 } else { 1 };
-                self.refresh_audit_verification_now();
-                self.status = "修订与防篡改审计记录已打开".into();
+                self.open_audit_panel();
+                self.status = "编辑与防篡改记录已打开".into();
             }
             // UI-30：宏的三个入口从旧「审阅」菜单搬进 Ribbon（查看只读、运行走临时副本）
             "MacroView" => {

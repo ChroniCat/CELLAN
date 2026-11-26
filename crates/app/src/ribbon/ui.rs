@@ -45,7 +45,7 @@ pub fn tab_file(app: &mut SheetApp, ui: &mut egui::Ui) {
     ui_kit::caret(
         ui,
         egui::pos2(resp.rect.right() - 11.0, resp.rect.center().y + 0.5),
-        ui_kit::ACCENT,
+        crate::theme::palette().accent,
     );
     if let Some(ch) = keytip_ch {
         let r = resp.rect;
@@ -994,7 +994,7 @@ fn split_a11y(
                             ui_kit::arrow_glyph_button(
                                 ui,
                                 Vec2::new(aw, 24.0),
-                                Color32::from_rgb(68, 68, 68),
+                                crate::theme::palette().text_weak,
                             )
                         })
                         .inner;
@@ -1097,7 +1097,7 @@ fn menu_a11y(
             ui_kit::caret(
                 ui,
                 egui::pos2(r.rect.right() - 7.0, r.rect.center().y + 0.5),
-                if enabled { Color32::from_rgb(100, 116, 139) } else { ui_kit::DISABLED },
+                if enabled { crate::theme::palette().text_weak } else { ui_kit::DISABLED },
             );
             attach_lazy_tip(r, st.tip.as_deref(), ctl)
         } else {
@@ -1651,17 +1651,18 @@ fn paste_visual_grid(
                     Vec2::new(38.0, 32.0),
                     if paste_on { Sense::click() } else { Sense::hover() },
                 );
+                let pal = crate::theme::palette();
                 let fill = if paste_on && resp.is_pointer_button_down_on() {
-                    ui_kit::PRESSED
+                    pal.pressed
                 } else if paste_on && resp.hovered() {
-                    ui_kit::HOVER
+                    pal.hover
                 } else {
-                    Color32::from_rgb(248, 250, 252)
+                    pal.card_bg
                 };
                 let stroke_col = if paste_on && resp.hovered() {
-                    ui_kit::ACCENT
+                    pal.accent
                 } else {
-                    Color32::from_rgb(226, 232, 240)
+                    pal.card_border
                 };
                 ui.painter().rect(
                     tr,

@@ -303,7 +303,28 @@ impl Pen<'_> {
         v * self.s
     }
     fn col(&self, c: Color32) -> Color32 {
-        self.mono.unwrap_or(c)
+        if let Some(m) = self.mono {
+            return m;
+        }
+        let pal = crate::theme::palette();
+        if !pal.theme.is_dark() {
+            return c;
+        }
+        if c == INK {
+            pal.text
+        } else if c == GRAY_D {
+            pal.text_weak
+        } else if c == BLUE_D {
+            pal.info_fg
+        } else if c == GREEN_D {
+            pal.accent
+        } else if c == RED {
+            pal.err_fg
+        } else if c == BROWN_D {
+            Color32::from_rgb(232, 184, 132)
+        } else {
+            c
+        }
     }
     fn filled(&self) -> bool {
         self.mono.is_none()
@@ -376,7 +397,7 @@ impl Pen<'_> {
             }
             return;
         }
-        self.p.rect_filled(self.rect_of(x, y, w, h), 0.0, c);
+        self.p.rect_filled(self.rect_of(x, y, w, h), 0.0, self.col(c));
     }
 
     fn dot(&self, x: f32, y: f32, rad: f32, c: Color32) {
@@ -385,7 +406,7 @@ impl Pen<'_> {
             self.ring(x, y, rad, 1.2, c);
             return;
         }
-        self.p.circle_filled(self.xy(x, y), self.px(rad), c);
+        self.p.circle_filled(self.xy(x, y), self.px(rad), self.col(c));
     }
 
     fn ring(&self, x: f32, y: f32, rad: f32, w: f32, c: Color32) {
@@ -448,7 +469,7 @@ impl Pen<'_> {
                     tip.1 - uy * size - py * size * 0.62,
                 ),
             ],
-            c,
+            self.col(c),
             Stroke::NONE,
         ));
     }
