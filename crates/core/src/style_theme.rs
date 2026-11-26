@@ -10,13 +10,13 @@ use quick_xml::Reader;
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ThemeRef {
     pub idx: u8,
     pub tint: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct XfTheme {
     pub font: Option<ThemeRef>,
     pub fill: Option<ThemeRef>,

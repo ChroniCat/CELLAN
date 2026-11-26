@@ -1198,6 +1198,7 @@ impl ChartUndoAction {
 enum Entry {
     Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>, Option<ArrayEdit>, Option<NoteUndoEdit>),
     CellShift(EntryStamp, CellShiftAction),
+    RoomCellShift(EntryStamp, RoomCellShiftAction),
     CowBatch(EntryStamp, Box<CowBatchAction>),
     NumericSort(EntryStamp, NumericSortAction),
     Structure(EntryStamp, StructureAction),
@@ -1214,6 +1215,7 @@ impl Entry {
         match self {
             Self::Cells(s, _, _, _, _)
             | Self::CellShift(s, _)
+            | Self::RoomCellShift(s, _)
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
@@ -1228,6 +1230,7 @@ impl Entry {
         match self {
             Self::Cells(s, _, _, _, _)
             | Self::CellShift(s, _)
+            | Self::RoomCellShift(s, _)
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
             | Self::Structure(s, _)
@@ -1266,6 +1269,7 @@ impl Entry {
     fn label(&self) -> &str {
         match self {
             Self::CellShift(_, a) => &a.label,
+            Self::RoomCellShift(_, a) => a.label(),
             Self::Cells(_, a, _, _, _) => &a.label,
             Self::CowBatch(_, a) => &a.label,
             Self::NumericSort(_, a) => &a.label,
@@ -1279,6 +1283,7 @@ impl Entry {
     fn by_site(&self) -> u32 {
         match self {
             Self::CellShift(_, a) => a.by_site,
+            Self::RoomCellShift(_, a) => a.site,
             Self::Cells(_, a, _, _, _) => a.by_site,
             Self::CowBatch(_, a) => a.by_site,
             Self::NumericSort(_, a) => a.by_site,
@@ -1288,6 +1293,30 @@ impl Entry {
             Self::Pivot(_, a) => a.by_site,
             Self::Chart(_, a) => a.by_site,
         }
+    }
+}
+
+struct RoomCellShiftAction {
+    transaction: u64,
+    patch: std::sync::Arc<crate::cell_shift_patch::CellShiftPatch>,
+    sheet_ids: Vec<(usize, u64)>,
+    ownership_conflict: bool,
+    site: u32,
+}
+
+/// Measure a shared wire patch for the history budget without materializing another JSON copy.
+struct CountBytes(usize);
+impl std::io::Write for CountBytes {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+impl RoomCellShiftAction {
+    fn label(&self) -> &str {
+        if self.patch.insert { "插入单元格" } else { "删除单元格" }
     }
 }
 
@@ -3095,6 +3124,49 @@ impl UndoStack {
         matches!(if redo { self.undone.last() } else { self.done.last() }, Some(Entry::CellShift(..)))
     }
 
+    /// Room history advances only after the host commits a replay of this exact transaction.
+    pub fn push_room_cell_shift(&mut self, transaction: u64, patch: std::sync::Arc<crate::cell_shift_patch::CellShiftPatch>, wb: &Workbook) {
+        let mut bytes = CountBytes(0);
+        let _ = serde_json::to_writer(&mut bytes, &*patch);
+        let indices: std::collections::BTreeSet<_> = std::iter::once(patch.target_sheet())
+            .chain(patch.cells.iter().map(|c| c.sheet)).collect();
+        let sheet_ids = indices.into_iter().map(|i| (i, wb.sheets[i].identity)).collect();
+        self.done.push(Entry::RoomCellShift(next_entry(bytes.0), RoomCellShiftAction {
+            transaction, patch, sheet_ids, ownership_conflict: false, site: self.site,
+        }));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
+    pub fn next_room_cell_shift(&self, redo: bool) -> Option<(u64, std::sync::Arc<crate::cell_shift_patch::CellShiftPatch>)> {
+        let entry = if redo { self.undone.last() } else { self.done.last() };
+        let Entry::RoomCellShift(_, action) = entry? else { return None };
+        Some((action.transaction, action.patch.clone()))
+    }
+
+    pub fn room_shift_history_matches(&self, wb: &Workbook, redo: bool, offline: bool) -> bool {
+        let entry = if redo { self.undone.last() } else { self.done.last() };
+        matches!(entry, Some(Entry::RoomCellShift(_, action)) if (!offline || !action.ownership_conflict) && action.sheet_ids.iter().all(|&(i,id)|
+            wb.sheets.get(i).is_some_and(|s| s.identity == id)))
+    }
+
+    /// The replica's authorship map is discarded on leaving a room. Keep the
+    /// conflict decision with its local history, including same-value writes.
+    pub fn preserve_room_shift_ownership(&mut self, peer: &crate::sync::Peer) {
+        for entry in self.done.iter_mut().chain(&mut self.undone) {
+            if let Entry::RoomCellShift(_, action) = entry {
+                action.ownership_conflict = action.patch.cells.iter().any(|c|
+                    peer.cells.get(&(c.sheet, c.row, c.col)).is_some_and(|op| op.site != action.site));
+            }
+        }
+    }
+
+    pub fn confirm_room_cell_shift(&mut self, transaction: u64, redo: bool) -> bool {
+        let (from, to) = if redo { (&mut self.undone, &mut self.done) } else { (&mut self.done, &mut self.undone) };
+        if !matches!(from.last(), Some(Entry::RoomCellShift(_, a)) if a.transaction == transaction) { return false; }
+        to.push(from.pop().expect("verified history entry"));
+        true
+    }
+
     pub fn redo_labels(&self, limit: usize) -> Vec<String> {
         self.undone
             .iter()
@@ -3473,7 +3545,7 @@ impl UndoStack {
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<Applied> {
         self.settle_before_replay();
-        if self.undo_is_structure() { return None; }
+        if self.undo_is_structure() || matches!(self.done.last(), Some(Entry::RoomCellShift(..))) { return None; }
         // 只撤自己的：栈顶不是我的动作就不动（也不丢，免得误删历史）
         if self
             .done
@@ -3662,7 +3734,7 @@ impl UndoStack {
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<Applied> {
         self.settle_before_replay();
-        if self.redo_is_structure() { return None; }
+        if self.redo_is_structure() || matches!(self.undone.last(), Some(Entry::RoomCellShift(..))) { return None; }
         if self
             .undone
             .last()

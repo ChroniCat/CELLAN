@@ -7,7 +7,7 @@
 use crate::style::StyleTable;
 use std::path::Path;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FillPattern {
     /// `patternType` 原值：gray125、lightGrid、darkTrellis…
     pub kind: String,

@@ -1897,9 +1897,9 @@ impl crate::layout::Axis {
 /// the selection. The same geometry drives cell storage, references and bindings.
 #[derive(Clone, Copy, Debug)]
 pub struct CellShift {
-    rect: (u32, u32, u32, u32),
-    direction: crate::cells::Shift,
-    insert: bool,
+    pub(crate) rect: (u32, u32, u32, u32),
+    pub(crate) direction: crate::cells::Shift,
+    pub(crate) insert: bool,
 }
 
 impl CellShift {

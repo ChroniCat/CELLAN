@@ -5,7 +5,7 @@ use sheetcore::sync::SheetMetaKind;
 
 /// A v1.83.0 text-frame client. Its Hello and comment operations deliberately
 /// bypass the current Msg and SheetMetaKind serializers.
-struct LegacyPeer {
+pub(super) struct LegacyPeer {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
     session: sheetcore::wire::Session,
@@ -13,6 +13,12 @@ struct LegacyPeer {
 
 impl LegacyPeer {
     fn connect(port: u16, site: u32, room_id: &str, watermark: u64) -> (Self, Value) {
+        let (peer, welcome) = Self::handshake(port, site, room_id, watermark);
+        assert_eq!(welcome["t"], "Welcome", "{welcome}");
+        (peer, welcome)
+    }
+
+    pub(super) fn handshake(port: u16, site: u32, room_id: &str, watermark: u64) -> (Self, Value) {
         let writer = TcpStream::connect(("127.0.0.1", port)).unwrap();
         writer
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -39,12 +45,11 @@ impl LegacyPeer {
             "resume_room": room_id, "resume_watermark": watermark, "resume_struct_rev": 0,
             "binary_v3": false, "compact_v3": false
         }));
-        let welcome = peer.read();
-        assert_eq!(welcome["t"], "Welcome", "{welcome}");
-        (peer, welcome)
+        let response = peer.read();
+        (peer, response)
     }
 
-    fn send(&mut self, value: Value) {
+    pub(super) fn send(&mut self, value: Value) {
         write_line(&mut self.writer, &self.session.seal(&value.to_string())).unwrap();
     }
 

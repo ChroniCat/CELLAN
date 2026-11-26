@@ -13,7 +13,7 @@ pub(crate) struct BackgroundPaste {
 }
 
 impl SheetApp {
-    pub(super) fn begin_background_paste(&mut self, values_only: bool) -> mpsc::Sender<ParsedPaste> {
+    pub(crate) fn begin_background_paste(&mut self, values_only: bool) -> mpsc::Sender<ParsedPaste> {
         let (tx, result) = mpsc::channel();
         self.bg_paste = Some(BackgroundPaste {
             target: SheetEditTarget::current(self, self.sel),
@@ -34,10 +34,15 @@ impl SheetApp {
                 return;
             }
         };
-        let valid = self.sheet_idx == paste.target.sheet && paste.target.valid(self);
+        // A room commit and a parser completion can arrive between two UI polls.
+        // Consume queued coordinate changes before validating the saved anchor.
+        let paste = self.bg_paste.take().unwrap();
+        if self.net.is_some() { self.poll_net(); }
+        let valid = self.sheet_idx == paste.target.sheet && paste.target.valid(self) && !self.in_snapshot
+            && self.net.as_ref().is_none_or(|net| net.is_live())
+            && !self.net.as_ref().is_some_and(crate::net::Net::pending_structure);
         let anchor = paste.target.at;
         let values_only = paste.values_only;
-        self.bg_paste = None;
         if !valid {
             self.status = "目标工作表或行列结构已改变，已取消后台粘贴".into();
             return;
@@ -46,8 +51,11 @@ impl SheetApp {
             Ok(sparse) => {
                 let saved = self.sel;
                 self.sel = anchor;
+                let prior_clock = self.peer.as_ref().map(|p| p.clock);
                 if !self.paste_sparse_xmlss_ext(&sparse, values_only) {
                     self.sel = saved;
+                } else if let (Some(first), Some(peer)) = (prior_clock, self.peer.as_ref()) {
+                    self.track_deferred_paste(first, peer.clock);
                 }
             }
             Err(e) => self.status = format!("粘贴解析失败：{e}"),

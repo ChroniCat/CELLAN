@@ -3,7 +3,7 @@
 //! 存储用 inlineStr（`<is><r>…</r></is>`）：不必动 sharedStrings 索引，
 //! Excel 能正常读；缺点是 Excel 自己写的 sharedStrings 富文本目前只按纯文本读入。
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RichRun {
     pub text: String,
     pub bold: bool,

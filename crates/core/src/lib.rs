@@ -36,6 +36,7 @@ pub mod image_embed;
 pub mod print;
 pub mod protection;
 pub mod cells;
+pub mod cell_shift_patch;
 pub mod search;
 pub mod crypto;
 pub mod hyperlinks;

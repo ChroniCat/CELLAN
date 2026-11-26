@@ -58,8 +58,13 @@ pub(crate) fn remap_sources(
     wb: &mut crate::Workbook, sheet_idx: usize, axis: crate::refs::Axis,
     band: Option<(u32, u32)>, map: impl Fn(u32, u32) -> Option<(u32, u32)>,
 ) {
-    let target = &wb.sheets[sheet_idx].name;
-    let one_sheet = wb.sheets.len() == 1;
+    remap_source_slice(&mut wb.sources, &wb.sheets[sheet_idx].name, wb.sheets.len() == 1, axis, band, map);
+}
+
+pub(crate) fn remap_source_slice(
+    sources: &mut [Source], target: &str, one_sheet: bool, axis: crate::refs::Axis,
+    band: Option<(u32, u32)>, map: impl Fn(u32, u32) -> Option<(u32, u32)>,
+) {
     let remap = |rect: (u32, u32, u32, u32)| {
         let (a, b, cross_a, cross_b, limit) = match axis {
             crate::refs::Axis::Row => (rect.0, rect.2, rect.1, rect.3, MAX_SRC_ROWS),
@@ -76,7 +81,7 @@ pub(crate) fn remap_sources(
             crate::refs::Axis::Col => (rect.0, lo, rect.2, hi),
         })
     };
-    for source in &mut wb.sources {
+    for source in sources {
         if matches!(source.kind, Kind::Unbound(_)) { continue; }
         if source.target_sheet.as_ref().is_none_or(|name| name.eq_ignore_ascii_case(target)) {
             let (r, c) = source.at;
@@ -87,7 +92,7 @@ pub(crate) fn remap_sources(
                     Some((r1, c1, r2, c2)) if r2 - r1 == rect.2 - r && c2 - c1 == rect.3 - c
                         && (source.target_sheet.is_some() || one_sheet) => {
                         source.at = (r1, c1);
-                        source.target_sheet.get_or_insert_with(|| target.clone());
+                        source.target_sheet.get_or_insert_with(|| target.to_owned());
                     }
                     _ => { source.kind = Kind::Unbound(Box::new(source.kind.clone())); continue; }
                 }

@@ -1160,6 +1160,16 @@ impl ConflictIndex {
     }
 }
 
+pub(crate) fn groups_overlap(
+    existing: impl Iterator<Item = MergeRect>, mut incoming: impl Iterator<Item = MergeRect>,
+) -> bool {
+    let mut existing = existing.peekable();
+    if existing.peek().is_none() { return false; }
+    let mut index = ConflictIndex::default();
+    for rect in existing { index.insert(rect); }
+    incoming.any(|rect| index.overlaps_any(rect))
+}
+
 #[derive(Debug)]
 struct MergesInner {
     rects: Vec<MergeRect>,

@@ -13,6 +13,12 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+#[path = "net_cell_shift.rs"]
+mod cell_shift;
+pub(crate) use cell_shift::cell_shift_ops;
+use cell_shift::{CellShiftHost, ShiftPending, finish_shift_snapshot, reject_pending_shift, structural_anchor};
+use sheetcore::cell_shift_patch::{CellShiftOverlay, CellShiftPatch};
+use sheetcore::sync::CellShiftPhase;
 pub const DEFAULT_PORT: u16 = 7878;
 
 /// 实际监听的端口：`SC_NET_PORT` 可覆盖（同机多实例、端口被占时用）
@@ -85,6 +91,10 @@ pub enum NetEvent {
     /// 结构改动历史（加入时补）
     StructuralHistory(Vec<(usize, sheetcore::structural::Structural)>),
     StructuralRejected(String),
+    CheckCellShift { site: u32, id: u64, phase: CellShiftPhase, patch: Arc<CellShiftPatch>, reply: Sender<Result<Arc<CellShiftPatch>, String>> },
+    CellShiftCommitted { site: u32, id: u64, phase: CellShiftPhase, patch: Arc<CellShiftPatch>, first_ts: u64, seq: u64, snapshot: bool },
+    CaptureCellShiftOverlay(Sender<CellShiftOverlay>),
+    CellShiftOverlay { overlay: Arc<CellShiftOverlay>, seq: u64 },
     StructureRevision(usize),
     /// 远端结构性改动（带已认证站点号）
     Structural { site: u32, sheet: usize, op: sheetcore::structural::Structural },
@@ -596,6 +606,7 @@ struct RoomRoster {
     connecting: HashMap<u32, (u64, Weak<TcpStream>)>,
     names: HashMap<u32, (String, u8)>,
     auth_hashes: HashMap<u32, [u8; 32]>,
+    shift_members: HashMap<u32, u64>,
 }
 
 fn sha256_bytes(input: &[u8]) -> [u8; 32] {
@@ -635,6 +646,7 @@ impl RoomRoster {
             connecting: HashMap::new(),
             names,
             auth_hashes: HashMap::new(),
+            shift_members: HashMap::new(),
         }
     }
 
@@ -1667,6 +1679,12 @@ impl HostWatermark {
 #[cfg(test)]
 #[path = "net_thread_compat_tests.rs"]
 mod thread_compat_tests;
+#[cfg(test)]
+#[path = "net_cell_shift_transport_tests.rs"]
+mod cell_shift_transport_tests;
+#[cfg(test)]
+#[path = "net_cell_shift_fence_tests.rs"]
+mod cell_shift_fence_tests;
 
 enum HostComment {
     Thread(sheetcore::notes::ThreadedComment),
@@ -1942,6 +1960,10 @@ pub struct Net {
     structural_ack: Arc<AtomicBool>,
     palette_styles_cap: Arc<AtomicBool>,
     thread_changes_cap: Arc<AtomicBool>,
+    cell_shift_cap: Arc<AtomicBool>,
+    shift_host: Option<Arc<CellShiftHost>>,
+    shift_pending: ShiftPending,
+    force_full: Arc<AtomicBool>,
     connection_generation: Arc<AtomicU64>,
     pending_structure: Arc<AtomicBool>,
     #[cfg(test)]
@@ -3281,12 +3303,17 @@ fn latest_cell_style(
     baseline: Option<&SharedBaseline>,
     axis_styles: Option<&AxisStylesMap>,
     styles: &SharedStyles,
+    delta: Option<&SharedStyles>,
     sheet: usize,
     row: u32,
     col: u32,
 ) -> Option<sheetcore::style::CellStyle> {
     if let Some(st) = styles.lock().unwrap_or_else(|e| e.into_inner()).get(&(sheet, row, col)) {
         return Some(st.as_ref().clone());
+    }
+    // A delta marker without a live entry is an explicit style cleared by a cell shift.
+    if delta.is_some_and(|d| lock_unpoison(d).get(&(sheet, row, col)).is_some()) {
+        return None;
     }
     if let Some(st) = baseline
         .and_then(|b| b.lock().unwrap_or_else(|e| e.into_inner()).clone())
@@ -3361,6 +3388,9 @@ impl Net {
     ) {
         let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         *self.sheet_names.lock().unwrap_or_else(|e| e.into_inner()) = workbook.sheets.iter().map(|s| s.name.clone()).collect();
+        if let Some(host)=&self.shift_host {
+            *lock_unpoison(&host.seed)= Some((lock_unpoison(&host.wm).seq, Arc::new(CellShiftOverlay::capture(workbook))));
+        }
         if let Some(hb) = &self.host_baseline {
             let base = peer
                 .cells
@@ -3556,8 +3586,9 @@ impl Net {
         sheet: usize,
         keys: &[(u32, u32)],
     ) -> Option<(u32, String, u32, u32)> {
-        if keys.is_empty() {
-            return None;
+        if keys.is_empty() {return None;}
+        if self.host_shift_pending_ack() {
+            return Some((0,"工作表位置正在更新".into(),keys[0].0,keys[0].1));
         }
         let locks = self.host_locks.as_ref()?;
         self.expire_host_locks();
@@ -3587,6 +3618,7 @@ impl Net {
         sheet: usize,
         rect: (u32, u32, u32, u32),
     ) -> Option<(u32, String, u32, u32)> {
+        if self.host_shift_pending_ack() {return Some((0,"工作表位置正在更新".into(),rect.0,rect.1));}
         let locks = self.host_locks.as_ref()?;
         self.expire_host_locks();
         let now = self.host_now_ms();
@@ -3600,6 +3632,10 @@ impl Net {
         sheet: usize,
         op: &sheetcore::structural::Structural,
     ) -> Option<(u32, String, u32, u32)> {
+        if self.host_shift_pending_ack() {
+            let (row, col) = structural_anchor(op);
+            return Some((0, "工作表位置正在更新".into(), row, col));
+        }
         let locks = self.host_locks.as_ref()?;
         self.expire_host_locks();
         let now = self.host_now_ms();
@@ -3636,6 +3672,15 @@ impl Net {
             return;
         }
         let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        if self.host_shift_pending_ack() {
+            for op in &ops {
+                let prev=self.state.as_ref().and_then(|st| latest_cell_op(self.host_baseline.as_ref(),st,op.sheet,op.row,op.col));
+                let _=self.evt_tx.send(NetEvent::WriteRejected {holder:0,holder_name:"工作表位置正在更新".into(),
+                    sheet:op.sheet,row:op.row,col:op.col,revert_ops:vec![(op.row,op.col,prev)],revert_styles:Vec::new(),
+                    revert_axis_styles:None,revert_merge:None});
+            }
+            return;
+        }
         let now = self.host_now_ms();
         let has_expired = self.host_locks.as_ref().is_some_and(|table| {
             let lt = table.lock().unwrap_or_else(|e| e.into_inner());
@@ -3694,6 +3739,15 @@ impl Net {
             return;
         }
         let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        if self.host_shift_pending_ack() {
+            for op in &ops {
+                let prev=self.state.as_ref().and_then(|st| latest_cell_op(self.host_baseline.as_ref(),st,op.sheet,op.row,op.col));
+                let _=self.evt_tx.send(NetEvent::WriteRejected {holder:0,holder_name:"工作表位置正在更新".into(),
+                    sheet:op.sheet,row:op.row,col:op.col,revert_ops:vec![(op.row,op.col,prev)],revert_styles:Vec::new(),
+                    revert_axis_styles:None,revert_merge:None});
+            }
+            return;
+        }
         let now = self.host_now_ms();
         let has_expired = self.host_locks.as_ref().is_some_and(|table| {
             let lt = table.lock().unwrap_or_else(|e| e.into_inner());
@@ -3785,7 +3839,10 @@ impl Net {
     pub fn supports_thread_changes(&self) -> bool { self.thread_changes_cap.load(Ordering::Acquire) }
 
     pub fn pending_structure(&self) -> bool { self.pending_structure.load(Ordering::Acquire) }
-    pub fn finish_structure(&self) { self.pending_structure.store(false, Ordering::Release); }
+    pub fn finish_structure(&self) {
+        *lock_unpoison(&self.shift_pending) = None;
+        self.pending_structure.store(false, Ordering::Release);
+    }
 
     pub fn structure_seen(&self) -> usize { self.structure_seen.lock().unwrap_or_else(|e| e.into_inner()).seen }
     pub fn note_structure(&self, count: usize) { self.structure_seen.lock().unwrap_or_else(|e| e.into_inner()).consume(count); }
@@ -4376,6 +4433,7 @@ impl Net {
                                 self.host_baseline.as_ref(),
                                 axis_snap.as_ref(),
                                 st,
+                                self.delta_styles.as_ref(),
                                 sheet,
                                 *r,
                                 *c,
@@ -4923,8 +4981,15 @@ impl Net {
         *self.update_seed_override.lock().unwrap_or_else(|e| e.into_inner()) = Some((exe_path, manifest));
     }
 
+    pub(crate) fn request_snapshot_resync(&self) {
+        if self.hosting { return; }
+        self.force_full.store(true,Ordering::Release);
+        self.disconnect_socket();
+    }
     #[cfg(test)]
-    pub(crate) fn disconnect_socket_for_test(&self) {
+    pub(crate) fn disconnect_socket_for_test(&self) { self.disconnect_socket(); }
+
+    fn disconnect_socket(&self) {
         for s in self.sockets.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade) {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
@@ -5258,6 +5323,14 @@ fn host_initialized(
     let host_acked_ts_for_self = host_acked_ts.clone();
     let evt_tx_self = evt_tx.clone();
     let t0 = std::time::Instant::now();
+    let shift_host = Arc::new(CellShiftHost {
+        order: room_order.clone(), roster: roster.clone(), events: evt_tx.clone(), cmd: cmd_tx.clone(),
+        wm: host_watermark.clone(), clock: host_max_clock.clone(), structs: structs.clone(), locks: locks.clone(),
+        state: state.clone(), delta: delta_ops.clone(), formula_keys: formula_keys.clone(), styles: styles.clone(),
+        delta_styles: delta_styles.clone(), threads: host_threads.clone(), merges: delta_merges.clone(),
+        transactions: Default::default(), seed: Default::default(), has_app: Default::default(), t0,
+    });
+    let shift_host_for_self = shift_host.clone();
     let now_ms = {
         let t0 = t0;
         move || t0.elapsed().as_millis() as u64
@@ -5386,6 +5459,7 @@ fn host_initialized(
                 let roster = roster.clone();
                 let sheet_names = sheet_names.clone();
                 let room_order = room_order.clone();
+                let shift_host = shift_host.clone();
                 #[cfg(test)]
                 let after_snapshot = after_snapshot.clone();
                 #[cfg(test)]
@@ -5707,6 +5781,7 @@ fn host_initialized(
                                 doc: _,
                                 auth,
                                 base_hash: client_hash,
+                                cell_shifts,
                                 sort_permutation,
                                 palette_styles,
                                 resume_room,
@@ -5730,6 +5805,13 @@ fn host_initialized(
                                     break;
                                 }
                                 let order = lock_unpoison(&room_order);
+                                let (order, shift_intro) = match shift_host.capture_intro(order, site, cell_shifts) {
+                                    Ok(pair) => pair,
+                                    Err(reason) => {
+                                        let _ = tx.send(IntroFrame::Line(serde_json::to_string(&Msg::Denied { reason }).unwrap()));
+                                        break;
+                                    }
+                                };
                                 let admitted =
                                     lock_unpoison(&roster).admit(site, &name, &auth, &stream);
                                 let (conn_id, canonical_name, known, evicted_stream) =
@@ -5750,6 +5832,7 @@ fn host_initialized(
                                 }
                                 hello_site = Some(site);
                                 hello_conn_id = conn_id;
+                                if cell_shifts { lock_unpoison(&roster).shift_members.insert(site, conn_id); }
                                 // 已认证成员可以长时间不说话（只看不改），取消认证前的读超时
                                 let _ = stream.set_read_timeout(None);
                                 let color = (site % 7) as u8;
@@ -5871,6 +5954,7 @@ fn host_initialized(
                                         delta_sync: is_delta,
                                         clock: host_clock,
                                         batch_ops: true,
+                                        cell_shifts: true,
                                         sort_permutation: true,
                                         structural_ack: true,
                                         thread_changes: true,
@@ -6118,6 +6202,7 @@ fn host_initialized(
                                     if !ops_ok || !send_snapshot_chunk_refs(&op_refs, use_compact_v3, &tx) {
                                         break;
                                     }
+                                    if !shift_intro.send(&tx) { break; }
                                     let end_ok = if use_compact_v3 {
                                         tx.send(IntroFrame::Compact(
                                             sheetcore::sync::encode_snapshot_ref_compact(&[]),
@@ -6175,6 +6260,7 @@ fn host_initialized(
                                     ) {
                                         break;
                                     }
+                                    if !shift_intro.send(&tx) { break; }
                                     let end_ok = if use_compact_v3 {
                                         tx.send(IntroFrame::Compact(
                                             sheetcore::sync::encode_snapshot_ref_compact(&[]),
@@ -6260,6 +6346,7 @@ fn host_initialized(
                                     proof: String::new(),
                                     auth: String::new(),
                                     base_hash: String::new(),
+                                    cell_shifts: true,
                                     sort_permutation: false,
                                     palette_styles: false,
                                     resume_room: String::new(),
@@ -6270,6 +6357,17 @@ fn host_initialized(
                                 })
                                 .unwrap();
                                 broadcast_line_to(&other_peers, hello);
+                            }
+                            Msg::CellShiftAck {site,seq} => {
+                                if hello_site!=Some(site) {break;}
+                                let _order=lock_unpoison(&room_order);
+                                shift_host.ack(site,hello_conn_id,seq);
+                            }
+                            Msg::CellShiftRequest { site, id, phase, revision, patch } => {
+                                if hello_site != Some(site) { break; }
+                                if let Err(reason) = shift_host.validate_and_commit(site,id,phase,revision,patch,Some(hello_conn_id)) {
+                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::CellShiftRejected {id,phase,reason})));
+                                }
                             }
                             Msg::SortReply { first_ts, outcome } if can_sort.load(Ordering::Acquire) => {
                                 let _ = ack_tx.send((first_ts,outcome));
@@ -6307,7 +6405,8 @@ fn host_initialized(
                                     let later = history.get(batch.plan.structural_revision..);
                                     let leases = locks.lock().unwrap_or_else(|e| e.into_inner());
                                     let sheet = batch.plan.sheet;
-                                    let allowed = later.is_some_and(|edits| edits.iter().all(|(s,_)| *s!=sheet))
+                                    let allowed = !shift_host.needs_ack(batch.plan.site, hello_conn_id)
+                                        && later.is_some_and(|edits| edits.iter().all(|(s,_)| *s!=sheet))
                                         && leases.conflicts_rect(sheet,r1,c1,r2,c2,batch.plan.site,now_ms()).is_none();
                                     if allowed && current.publish(&next,&state,&delta_ops,&styles,&delta_styles) {
                                         commit_sort(batch.clone(), history.len());
@@ -6351,7 +6450,7 @@ fn host_initialized(
                                 let order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 let history = structs.lock().unwrap_or_else(|e| e.into_inner());
                                 let leases = locks.lock().unwrap_or_else(|e| e.into_inner());
-                                let allowed = history.get(plan.structural_revision..)
+                                let allowed = !shift_host.needs_ack(site, hello_conn_id) && history.get(plan.structural_revision..)
                                     .is_some_and(|later| !later.iter().any(|(s,_)| *s==plan.sheet))
                                     && leases.conflicts_rect(plan.sheet,r1,c1,r2,c2,site,now_ms()).is_none();
                                 let outcome = if !allowed {
@@ -6388,13 +6487,17 @@ fn host_initialized(
                                 let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 expire_and_broadcast();
                                 let lt = locks.lock().unwrap_or_else(|e| e.into_inner());
-                                if !lt.is_empty() {
+                                let stale=shift_host.needs_ack(conn_site,hello_conn_id);
+                                let received_ts=ops.iter().map(|op|op.ts).max().unwrap_or(0);
+                                if !lt.is_empty() || stale {
                                     let now = now_ms();
                                     ops.retain(|op| {
-                                        let Some(h) = lt.holder_other(op.sheet, op.row, op.col, conn_site, now) else { return true };
+                                        let holder = lt.holder_other(op.sheet, op.row, op.col, conn_site, now);
+                                        if !stale && holder.is_none() {return true;}
                                         let prev = latest_cell_op(Some(&host_baseline), &state, op.sheet, op.row, op.col);
                                         let deny = Msg::WriteDeny {
-                                            holder: h.site, holder_name: h.name.clone(),
+                                            holder: holder.map_or(0,|h|h.site),
+                                            holder_name: holder.map_or_else(||"工作表位置已变更".to_string(),|h|h.name.clone()),
                                             sheet: op.sheet, row: op.row, col: op.col,
                                             revert_ops: vec![(op.row, op.col, prev)],
                                             revert_styles: Vec::new(), revert_axis_styles: None, revert_merge: None,
@@ -6404,7 +6507,14 @@ fn host_initialized(
                                     });
                                 }
                                 drop(lt);
-                                if ops.is_empty() { continue; }
+                                if ops.is_empty() {
+                                    if stale && received_ts>0 {
+                                        let mut acks=lock_unpoison(&host_acked_ts);
+                                        let entry=acks.entry(conn_site).or_insert(0); *entry=(*entry).max(received_ts);
+                                        emit_room_watermark_ack(&cmd,&roster,lock_unpoison(&host_watermark).seq,lock_unpoison(&structs).len(),conn_site,received_ts);
+                                    }
+                                    continue;
+                                }
                                 let ack_max_ts = ops.iter().map(|o| o.ts).max().unwrap_or(0);
                                 if ack_max_ts > 0 {
                                     let mut acks = lock_unpoison(&host_acked_ts);
@@ -6498,9 +6608,14 @@ fn host_initialized(
                                     .unwrap()
                                     .conflicts_structural(sheet, &op, conn_site, now_ms())
                                     .map(|((r, c), h)| (h.site, h.name.clone(), r, c));
+                                let conflict = conflict.or_else(|| shift_host.needs_ack(conn_site, hello_conn_id).then(|| {
+                                    let (row, col) = structural_anchor(&op);
+                                    (0, "工作表位置已变更".into(), row, col)
+                                }));
                                 if let Some((holder, holder_name, row, col)) = conflict {
                                     if revision.is_some() {
-                                        let reason = format!("{holder_name} 正在编辑 {}，宿主未执行{}",sheetcore::model::cell_name(row,col),op.label());
+                                        let reason = if holder == 0 { format!("{holder_name}，请重新执行{}", op.label()) }
+                                            else { format!("{holder_name} 正在编辑 {}，宿主未执行{}",sheetcore::model::cell_name(row,col),op.label()) };
                                         let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::StructuralRejected { reason })));
                                         continue;
                                     }
@@ -6563,6 +6678,10 @@ fn host_initialized(
                                         })
                                     }
                                 };
+                                let conflict = conflict.or_else(|| shift_host.needs_ack(conn_site, hello_conn_id).then(|| {
+                                    let (row, col) = items.first().map(|&(r, c, _)| (r, c)).unwrap_or_default();
+                                    (0, "工作表位置已变更".into(), row, col)
+                                }));
                                 if let Some((holder, holder_name, row, col)) = conflict {
                                     let axis_snap = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot();
                                     let revert_styles: Vec<_> = items
@@ -6572,12 +6691,8 @@ fn host_initialized(
                                                 *r,
                                                 *c,
                                                 latest_cell_style(
-                                                    Some(&host_baseline),
-                                                    Some(&axis_snap),
-                                                    &styles,
-                                                    sheet,
-                                                    *r,
-                                                    *c,
+                                                    Some(&host_baseline), Some(&axis_snap),
+                                                    &styles, Some(&delta_styles), sheet, *r, *c,
                                                 ),
                                             )
                                         })
@@ -6646,6 +6761,10 @@ fn host_initialized(
                                         })
                                     }
                                 };
+                                let conflict = conflict.or_else(|| shift_host.needs_ack(conn_site, hello_conn_id).then(|| {
+                                    let (row, col) = items.first().map(|&(r, c, _)| (r, c)).unwrap_or_default();
+                                    (0, "工作表位置已变更".into(), row, col)
+                                }));
                                 if let Some((holder, holder_name, row, col)) = conflict {
                                     let axis_snap = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot();
                                     let revert_styles: Vec<_> = items
@@ -6655,12 +6774,8 @@ fn host_initialized(
                                                 *r,
                                                 *c,
                                                 latest_cell_style(
-                                                    Some(&host_baseline),
-                                                    Some(&axis_snap),
-                                                    &styles,
-                                                    sheet,
-                                                    *r,
-                                                    *c,
+                                                    Some(&host_baseline), Some(&axis_snap),
+                                                    &styles, Some(&delta_styles), sheet, *r, *c,
                                                 ),
                                             )
                                         })
@@ -6727,6 +6842,10 @@ fn host_initialized(
                                         (hit_row || hit_col).then(|| (h.site, h.name.clone(), r, c))
                                     })
                                 };
+                                let conflict = conflict.or_else(|| shift_host.needs_ack(conn_site, hello_conn_id).then(|| {
+                                    let (row, col) = patch.rows.first().map(|(r, _)| (*r, 0)).or_else(|| patch.cols.first().map(|(c, _)| (0, *c))).unwrap_or_default();
+                                    (0, "工作表位置已变更".into(), row, col)
+                                }));
                                 if let Some((holder, holder_name, row, col)) = conflict {
                                     let revert_axis_styles = Some(
                                         host_watermark
@@ -6784,6 +6903,12 @@ fn host_initialized(
                                     .unwrap()
                                     .conflicts_rect(sheet, r1, c1, r2, c2, conn_site, now_ms())
                                     .map(|((r, c), h)| (h.site, h.name.clone(), r, c));
+                                // Toggling this rectangle cannot undo an optimistic change after its
+                                // original merge moved. Restore the guest from the current room state.
+                                if shift_host.needs_ack(conn_site, hello_conn_id) {
+                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(Msg::CellShiftResync)));
+                                    continue;
+                                }
                                 if let Some((holder, holder_name, row, col)) = conflict {
                                     let _ = cmd.send(Cmd::Deliver(
                                         vec![tx.clone()],
@@ -6831,6 +6956,10 @@ fn host_initialized(
                                     continue;
                                 }
                                 let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
+                                if shift_host.needs_ack(conn_site, hello_conn_id) {
+                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(Msg::CellShiftResync)));
+                                    continue;
+                                }
                                 let (kind, include_sender) =
                                     match apply_host_thread_meta(&host_threads, sheet, kind, true) {
                                         Ok(pair) => pair,
@@ -6865,6 +6994,11 @@ fn host_initialized(
                                 }
                                 let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 expire_and_broadcast();
+                                if shift_host.needs_ack(conn_site, hello_conn_id) {
+                                    let denial = Msg::LockDeny { site:conn_site, sheet,row,col,holder:0,holder_name:"工作表位置已变更".into() };
+                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(denial)));
+                                    continue;
+                                }
                                 let auth_name = roster.lock().unwrap_or_else(|e| e.into_inner()).name_of(conn_site);
                                 let (outcome, evicted) = {
                                     let mut lt = locks.lock().unwrap_or_else(|e| e.into_inner());
@@ -7310,6 +7444,8 @@ fn host_initialized(
         structural_ack: Default::default(),
         palette_styles_cap: Arc::new(AtomicBool::new(true)),
         thread_changes_cap: Arc::new(AtomicBool::new(true)),
+        cell_shift_cap: Arc::new(AtomicBool::new(true)),
+        shift_host: Some(shift_host_for_self), shift_pending: Default::default(), force_full: Default::default(),
         connection_generation: Default::default(),
         sheet_names,
         structure_seen: Default::default(),
@@ -7694,6 +7830,12 @@ fn join_session(
     let palette_for_reader = palette_styles_cap.clone();
     let thread_changes_cap = Arc::new(AtomicBool::new(false));
     let thread_changes_for_reader = thread_changes_cap.clone();
+    let cell_shift_cap = Arc::new(AtomicBool::new(false));
+    let shift_cap_reader = cell_shift_cap.clone();
+    let shift_pending: ShiftPending = Default::default();
+    let shift_pending_reader = shift_pending.clone();
+    let force_full = Arc::new(AtomicBool::new(false));
+    let full_reader = force_full.clone();
     let connection_generation = Arc::new(AtomicU64::new(0));
     let writer_generation = connection_generation.clone();
     let reader_generation = connection_generation.clone();
@@ -7984,6 +8126,11 @@ fn join_session(
                 let mut denied = false;
                 let mut got_welcome = false;
                 let mut in_initial_snapshot = false;
+                let mut shift_overlay = Vec::new();
+                let mut shift_parts = 0;
+                let mut shift_seq = 0;
+                let mut shift_receipt = false;
+                let mut overlay_complete = false;
                 let mut pending_snap_ops: Vec<Op> = Vec::new();
                 let mut snap_builder: Option<PreparedGuestSnapshotBuilder> = None;
                 let mut conn_room_id = String::new();
@@ -8086,6 +8233,8 @@ fn join_session(
                             {
                                 resume_state = None;
                             }
+                            let force_snapshot = full_reader.swap(false,Ordering::AcqRel);
+                            if force_snapshot { resume_state = None; }
                             let (resume_room, resume_watermark, resume_struct_rev) =
                                 resume_state.clone().unwrap_or_default();
                             let hello = Msg::Hello {
@@ -8094,6 +8243,7 @@ fn join_session(
                                 doc: doc.clone(),
                                 proof: room_key.proof(nonce),
                                 auth: client_auth.clone(),
+                                cell_shifts: true,
                                 sort_permutation: true,
                                 palette_styles: true,
                                 resume_room,
@@ -8101,7 +8251,7 @@ fn join_session(
                                 resume_struct_rev,
                                 binary_v3: true,
                                 compact_v3: true,
-                                base_hash: if synced_once {
+                                base_hash: if synced_once || force_snapshot {
                                     String::new()
                                 } else {
                                     initial_base_hash.clone()
@@ -8124,6 +8274,7 @@ fn join_session(
                             delta_sync,
                             clock,
                             batch_ops,
+                            cell_shifts,
                             sort_permutation,
                             structural_ack,
                             thread_changes,
@@ -8158,6 +8309,7 @@ fn join_session(
                             host_compact_flag.store(use_compact, Ordering::Release);
                             reader_generation.fetch_add(1,Ordering::AcqRel);
                             ack_for_reader.store(structural_ack,Ordering::Release);
+                            shift_cap_reader.store(cell_shifts, Ordering::Release);
                             thread_changes_for_reader.store(thread_changes, Ordering::Release);
                             palette_for_reader.store(palette_styles, Ordering::Release);
                             got_welcome = true;
@@ -8247,6 +8399,7 @@ fn join_session(
                             });
                         }
                         Msg::SnapshotChunk { ops, last } => {
+                            if last && shift_parts != 0 && !overlay_complete { break; }
                             if in_initial_snapshot {
                                 if let Some(b) = snap_builder.as_mut() {
                                     if !ops.is_empty() {
@@ -8278,7 +8431,7 @@ fn join_session(
                                             conn_welcome_srev,
                                         ));
                                     }
-                                    let _ = evt_tx.send(NetEvent::SnapshotDone);
+                                    finish_shift_snapshot(&evt_tx, &shift_pending_reader, shift_receipt);
                                 }
                             } else {
                                 if !ops.is_empty() {
@@ -8293,11 +8446,12 @@ fn join_session(
                                             conn_welcome_srev,
                                         ));
                                     }
-                                    let _ = evt_tx.send(NetEvent::SnapshotDone);
+                                    finish_shift_snapshot(&evt_tx, &shift_pending_reader, shift_receipt);
                                 }
                             }
                         }
                         Msg::Snapshot { ops } => {
+                            if shift_parts != 0 && !overlay_complete { break; }
                             in_initial_snapshot = false;
                             if let Some(mut b) = snap_builder.take() {
                                 if !ops.is_empty() {
@@ -8322,7 +8476,7 @@ fn join_session(
                                     conn_welcome_srev,
                                 ));
                             }
-                            let _ = evt_tx.send(NetEvent::SnapshotDone);
+                            finish_shift_snapshot(&evt_tx, &shift_pending_reader, shift_receipt);
                         }
                         Msg::Watermark { seq, structure_revision, ack_site, ack_ts } => {
                             if ack_site == site && ack_ts > 0 {
@@ -8356,6 +8510,43 @@ fn join_session(
                                 min_saved_wm_for_reader.fetch_add(1, Ordering::AcqRel);
                             }
                             let _ = evt_tx.send(NetEvent::Ops(ops));
+                        }
+                        Msg::CellShiftRejected {id,phase,reason} if shift_cap_reader.load(Ordering::Acquire) => {
+                            reject_pending_shift(&evt_tx, &shift_pending_reader, id, phase, reason);
+                        }
+                        Msg::CellShiftResync if shift_cap_reader.load(Ordering::Acquire) => {
+                            full_reader.store(true, Ordering::Release);
+                            let _ = evt_tx.send(NetEvent::Error("工作表位置已变更，此次更改未执行，正在同步最新工作表".into()));
+                            break;
+                        }
+                        Msg::CellShiftCommitted { site, id, phase, first_ts, seq, patch } => {
+                            if in_initial_snapshot || !shift_cap_reader.load(Ordering::Acquire) { break; }
+                            if seq > shift_seq {
+                                shift_seq = seq;
+                                let _ = evt_tx.send(NetEvent::CellShiftCommitted {site,id,phase,first_ts,seq,patch,snapshot:false});
+                            }
+                        }
+                        Msg::CellShiftOverlayPart { seq, index, last, data } => {
+                            if !shift_cap_reader.load(Ordering::Acquire) || !in_initial_snapshot || overlay_complete || index != shift_parts || index>0 && seq!=shift_seq { break; }
+                            let Ok(bytes)=hex::decode(data) else {break};
+                            shift_overlay.extend(bytes);
+                            shift_parts += 1;
+                            shift_seq = seq;
+                            if last {
+                                let Ok(overlay)=serde_json::from_slice::<CellShiftOverlay>(&shift_overlay) else {break};
+                                if !overlay.wire_valid() {break;}
+                                shift_overlay=Vec::new();
+                                overlay_complete = true;
+                                let _ = evt_tx.send(NetEvent::CellShiftOverlay {overlay:Arc::new(overlay),seq});
+                            }
+                        }
+                        Msg::CellShiftReceipt {site:author,id,phase,first_ts,seq,patch} => {
+                            if !in_initial_snapshot || author!=site {break;}
+                            let pending=lock_unpoison(&shift_pending_reader);
+                            if pending.as_ref().is_some_and(|(tid,p,_)|*tid==id && *p==phase) {
+                                shift_receipt=true;
+                                let _=evt_tx.send(NetEvent::CellShiftCommitted {site,id,phase,first_ts,seq,patch,snapshot:true});
+                            }
                         }
                         Msg::StructureRevision { revision } => {
                             let _ = evt_tx.send(NetEvent::StructureRevision(revision));
@@ -8755,6 +8946,7 @@ fn join_session(
         structural_ack,
         palette_styles_cap,
         thread_changes_cap,
+        cell_shift_cap, shift_host: None, shift_pending, force_full,
         connection_generation,
         pending_sorts: pending_for_net,
         local_sort_ranges: Default::default(),
@@ -9242,6 +9434,7 @@ mod integrity_tests {
             proof: room.proof(nonce),
             auth: auth.into(),
             base_hash: String::new(),
+            cell_shifts: true,
             sort_permutation: false,
             palette_styles: false,
             resume_room: String::new(),
@@ -10381,6 +10574,7 @@ mod integrity_tests {
             proof: room.proof(nonce),
             auth: auth.into(),
             base_hash: String::new(),
+            cell_shifts: true,
             sort_permutation: false,
             palette_styles: true,
             resume_room: String::new(),

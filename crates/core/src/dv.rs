@@ -5,7 +5,7 @@
 
 use crate::model::{Sheet, Value};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DvKind {
     Any,
     Whole,
@@ -56,7 +56,7 @@ impl DvKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DvOp {
     Between,
     NotBetween,
@@ -110,7 +110,7 @@ impl DvOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DvStyle {
     Stop,
     Warning,
@@ -152,7 +152,7 @@ pub enum DvVerdict {
     InformThenAccept,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DataValidation {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub kind: DvKind,

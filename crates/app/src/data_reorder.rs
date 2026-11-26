@@ -7,6 +7,14 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 #[cfg(test)]
 fn sort_apps(env: &crate::test_env::TestEnv) -> (SheetApp,SheetApp) {
+    sort_apps_with_baseline(env, |_| {})
+}
+
+#[cfg(test)]
+fn sort_apps_with_baseline(
+    env: &crate::test_env::TestEnv,
+    baseline: impl Fn(&mut sheetcore::Workbook),
+) -> (SheetApp, SheetApp) {
     use sheetcore::{Cell,Value};
     use sheetcore::sync::{Peer,Cursor};
     let mut host = SheetApp::new_with_context(&eframe::egui::Context::default(),None);
@@ -24,6 +32,8 @@ fn sort_apps(env: &crate::test_env::TestEnv) -> (SheetApp,SheetApp) {
     fmt.bold = true;
     let bold = host.wb.styles.intern(fmt);
     host.wb.sheet_mut(0).set_style(0,0,bold);
+    baseline(&mut host.wb);
+    baseline(&mut guest.wb);
     net.seed_snapshot(&peer,&host.wb,Cursor { site:1, name:"H".into(), color:1, sheet:0, row:0, col:0, end_row: None, end_col: None });
     host.peer = Some(peer);
     host.net = Some(net);
@@ -186,12 +196,10 @@ fn sort_ready_and_optimistic_style_follow_host_order_on_the_writing_guest() {
 fn issue_23_guest_partial_cell_insert_and_undo_sync_cross_sheet_formula() {
     use sheetcore::{Cell, Value};
     let env = crate::test_env::TestEnv::new("cell-shift-room");
-    let (mut host, mut guest) = sort_apps(&env);
-    // Supply the same empty second worksheet that both copies of the document would contain.
-    for app in [&mut host, &mut guest] {
-        app.wb.sheets.push(Sheet::new("Other"));
-        assert!(app.wb.sources.is_empty());
-    }
+    let (mut host, mut guest) = sort_apps_with_baseline(&env, |wb| {
+        wb.sheets.push(Sheet::new("Other"));
+        assert!(wb.sources.is_empty());
+    });
     host.wb.sheet_mut(1).set(0, 0, Cell {
         value: Value::Empty, formula: Some("=Sheet1!A2+40".into()),
     });
@@ -218,8 +226,8 @@ fn issue_23_guest_partial_cell_insert_and_undo_sync_cross_sheet_formula() {
     guest.sel = (1, 0);
     guest.sel_end = guest.sel;
     guest.shift_cells(true, false);
-    assert_eq!(guest.undo.depth(), (depth.0 + 1, 0));
     until(&mut host, &mut guest, |h, g| matches(h, true) && matches(g, true));
+    assert_eq!(guest.undo.depth(), (depth.0 + 1, 0));
     assert!(guest.apply_undo(false), "{}", guest.status);
     until(&mut host, &mut guest, |h, g| matches(h, false) && matches(g, false));
     assert!(guest.apply_undo(true), "{}", guest.status);
@@ -257,32 +265,9 @@ fn issue_23_guest_partial_cell_insert_and_undo_sync_cross_sheet_formula() {
     assert_eq!(guest.undo.depth(), (depth.0, 1));
 }
 
-#[test]
-fn partial_cell_insert_in_a_room_rejects_moving_a_note_before_writing() {
-    use sheetcore::{CellRef, Value};
-    let env = crate::test_env::TestEnv::new("cell-shift-room-note-preflight");
-    let (mut host, mut guest) = sort_apps(&env);
-    host.set_comment_cell(0, 1, 0, "keep note", None, false).unwrap();
-    let intact = |app: &SheetApp| {
-        let sh = app.wb.sheet(0);
-        sh.notes.get(&CellRef::new(1, 0)).is_some_and(|note| note.text == "keep note")
-            && !sh.notes.contains_key(&CellRef::new(2, 0))
-            && sh.value(1, 0) == Value::Number(1.0) && sh.value(2, 0) == Value::Empty
-    };
-    until(&mut host, &mut guest, |h, g| intact(h) && intact(g));
-    let history = guest.undo.depth();
-    let coordinate_revision = guest.wb.sheet(0).coordinate_revision();
-    guest.sel = (1, 0);
-    guest.sel_end = guest.sel;
-    guest.shift_cells(true, false);
-    assert!(guest.status.contains("先断开协作"), "{}", guest.status);
-    assert_eq!(guest.undo.depth(), history);
-    assert_eq!(guest.wb.sheet(0).coordinate_revision(), coordinate_revision);
-    guest.wb.sheet_mut(0).set(3, 1, sheetcore::Cell { value: Value::Number(9.0), formula: None });
-    guest.broadcast_cells(&[(0, 3, 1)]);
-    until(&mut host, &mut guest, |h, _| h.wb.sheet(0).value(3, 1) == Value::Number(9.0));
-    assert!(intact(&host) && intact(&guest));
-}
+#[cfg(test)]
+#[path = "cell_shift_room_tests.rs"]
+mod cell_shift_room_tests;
 
 #[test]
 fn negotiated_sort_and_guarded_undo_converge_through_both_apps() {

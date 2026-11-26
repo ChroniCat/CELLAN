@@ -7,7 +7,7 @@ use crate::model::{Sheet, Value};
 use std::collections::HashMap;
 
 /// 差异格式（styles.xml 里的 <dxf>）
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Dxf {
     pub bold: bool,
     pub italic: bool,
@@ -22,13 +22,13 @@ pub struct Dxf {
 }
 
 /// dxf 里的差异边框：左、右、上、下各边独立（Excel 允许四边不同 style/颜色）。
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DxfBorder {
     /// 0=左 1=右 2=上 3=下；`(style, color)`，color 缺省按黑色
     pub sides: [Option<(String, [u8; 3])>; 4],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CfOp {
     Less,
     LessEq,
@@ -69,7 +69,7 @@ impl CfOp {
 }
 
 /// 条件格式阈值类型（OOXML cfvo/@type）
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CfvoKind {
     Min,
     Max,
@@ -80,7 +80,7 @@ pub enum CfvoKind {
 }
 
 /// 一个阈值：类型 + 数值（公式型把原文放在 formula）
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Cfvo {
     pub kind: CfvoKind,
     pub val: f64,
@@ -161,7 +161,7 @@ pub fn percentile_inc(sorted: &[f64], p: f64) -> f64 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TextOp {
     Contains,
     NotContains,
@@ -206,7 +206,7 @@ impl TextOp {
 }
 
 /// 发生日期条件（OOXML cfRule type="timePeriod" @timePeriod）
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TimePeriod {
     Today,
     Yesterday,
@@ -371,7 +371,7 @@ pub struct BarOverlay {
     pub show_value: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CfKind {
     CellIs { op: CfOp, a: String, b: String, dxf: usize },
     Text { contains: String, dxf: usize },
@@ -585,7 +585,7 @@ impl IconMark {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CfRule {
     pub kind: CfKind,
     pub stop: bool,
@@ -593,13 +593,13 @@ pub struct CfRule {
     pub priority: u32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CfBlock {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub rules: Vec<CfRule>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CfSheet {
     pub blocks: Vec<CfBlock>,
     pub dxfs: Vec<Dxf>,

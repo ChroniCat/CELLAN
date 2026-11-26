@@ -1976,6 +1976,22 @@ impl CellStyles {
         })
     }
 
+    /// Visit sparse entries individually and uniform column pages in one run.
+    pub(crate) fn visit_column_style_runs(&self, mut visit: impl FnMut(u32, u32, u32, u16)) {
+        for (pi, page) in self.iter_pages() {
+            for (col, slab) in page.cols.iter_entries() {
+                match slab.as_ref() {
+                    StyleColumn::Uniform(id) => visit(col, pi * PAGE_ROWS, (pi + 1) * PAGE_ROWS - 1, *id),
+                    sparse => {
+                        for (key, &id) in sparse.iter_entries_in(pi, col, 0, PAGE_ROWS - 1) {
+                            visit(col, key.row, key.row, id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, &u16)> {
         self.iter_from(true, 0)
     }

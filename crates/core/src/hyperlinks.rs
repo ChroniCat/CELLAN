@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Hyperlink {
     /// 外部地址（http(s)://、mailto:、相对文件路径…）
     pub target: String,

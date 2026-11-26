@@ -656,6 +656,9 @@ pub struct SnapshotChunkRef<'a> {
     pub last: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CellShiftPhase { Forward, Undo, Redo }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Msg {
@@ -681,6 +684,8 @@ pub enum Msg {
         #[serde(default)]
         base_hash: String,
         #[serde(default)]
+        cell_shifts: bool,
+        #[serde(default)]
         sort_permutation: bool,
         #[serde(default)]
         palette_styles: bool,
@@ -705,6 +710,8 @@ pub enum Msg {
         delta_sync: bool,
         #[serde(default)]
         batch_ops: bool,
+        #[serde(default)]
+        cell_shifts: bool,
         #[serde(default)]
         sort_permutation: bool,
         #[serde(default)]
@@ -913,6 +920,16 @@ pub enum Msg {
         payload_b64: String,
     },
     Bye { site: u32 },
+    CellShiftRequest { site: u32, id: u64, phase: CellShiftPhase, revision: usize,
+        patch: Arc<crate::cell_shift_patch::CellShiftPatch> },
+    CellShiftCommitted { site: u32, id: u64, phase: CellShiftPhase, first_ts: u64, seq: u64,
+        patch: Arc<crate::cell_shift_patch::CellShiftPatch> },
+    CellShiftOverlayPart { seq: u64, index: u32, last: bool, data: String },
+    CellShiftReceipt { site: u32, id: u64, phase: CellShiftPhase, first_ts: u64, seq: u64,
+        patch: Arc<crate::cell_shift_patch::CellShiftPatch> },
+    CellShiftAck { site: u32, seq: u64 },
+    CellShiftResync,
+    CellShiftRejected {id:u64,phase:CellShiftPhase,reason:String},
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,6 +1202,16 @@ impl Msg {
             Msg::Structural { sheet, op, .. } | Msg::StructuralRequest { sheet, op, .. } => structural_ok(*sheet, op),
             Msg::StructureRevision { revision } => u64::try_from(*revision).is_ok_and(ts_ok),
             Msg::StructuralRejected { reason } => reason.len() <= MAX_SHORT_TEXT,
+            Msg::CellShiftRequest { id, revision, patch, .. } =>
+                *id > 0 && *revision <= MAX_LOGICAL_TS as usize && patch.wire_valid(),
+            Msg::CellShiftCommitted { id, first_ts, seq, patch, .. } =>
+                *id > 0 && ts_ok(*seq) && first_ts.checked_add(patch.cells.len() as u64).is_some_and(ts_ok)
+                    && patch.wire_valid(),
+            Msg::CellShiftOverlayPart { index, seq, data, .. } => ts_ok(*seq) && *index < 4096 && data.len() <= 1024 * 1024,
+            Msg::CellShiftReceipt { id, first_ts, seq, patch, .. } => *id > 0 && ts_ok(*seq) && ts_ok(*first_ts) && patch.wire_valid(),
+            Msg::CellShiftAck {seq, ..} => ts_ok(*seq),
+            Msg::CellShiftResync => true,
+            Msg::CellShiftRejected {id, reason, ..} => *id>0 && reason.len()<=MAX_SHORT_TEXT,
             Msg::LockReq { sheet, row, col, name, .. } | Msg::LockOk { sheet, row, col, name, .. } => {
                 cell_in_bounds(*sheet, *row, *col) && name.len() <= MAX_SHORT_TEXT
             }

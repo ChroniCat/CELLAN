@@ -157,6 +157,9 @@ fn shift_sparse_ray(
         .iter_rect_views(ray)
         .map(|(k, c)| (k, c.to_cell()))
         .collect();
+    // Ordinary cell writes invalidate rich text. Keep runs with their old
+    // coordinates until the metadata pass remaps them along with the cells.
+    let rich = std::mem::take(&mut sheet.rich);
     for (k, _) in &cells {
         sheet.remove(k.row, k.col);
     }
@@ -166,6 +169,7 @@ fn shift_sparse_ray(
         }
     }
 
+    sheet.rich = rich;
     let styles: Vec<(CellRef, u16)> = sheet.styles.iter_rect(ray).collect();
     if !styles.is_empty() {
         for &(k, _) in &styles {
