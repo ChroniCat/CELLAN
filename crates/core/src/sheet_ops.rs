@@ -456,6 +456,9 @@ fn visit_references(wb: &mut Workbook, mut update: impl FnMut(ReferenceField, &s
         if let crate::external::Kind::Internal { sheet, .. } = &mut source.kind {
             if let Some(new) = update(ReferenceField::Source(i), sheet) { *sheet = new; }
         }
+        if let Some(target) = source.target_sheet.as_mut() {
+            if let Some(new) = update(ReferenceField::Source(i), target) { *target = new; }
+        }
     }
     for (i, (sheet, ..)) in wb.pivot_shifts.iter_mut().enumerate() {
         if let Some(new) = update(ReferenceField::Pivot(i), sheet) { *sheet = new; }

@@ -2117,3 +2117,47 @@ fn top_left_home_and_tab_close_preserve_edits_and_save_silently() {
     );
     drop(env);
 }
+
+#[test]
+fn audit_fixes_ai_config_dpapi_redaction_and_html_rowspan_paste() {
+    let env = crate::test_env::TestEnv::new("audit_app_fixes");
+    let cfg_path = env.path("ai.ini");
+    let cfg = ai_agent::AiConfig {
+        provider_id: "p".into(),
+        display_name: "Test".into(),
+        base_url: "http://[::1]:8080/v1?api-version=2024#frag".into(),
+        api_key: "sk-super-secret-value-12345".into(),
+        model: "m".into(),
+        native_tools: true,
+        allow_unframed_text: false,
+    };
+    cfg.try_save_to(&cfg_path).expect("atomic save must succeed");
+    let raw_disk = std::fs::read_to_string(&cfg_path).unwrap();
+    #[cfg(windows)]
+    assert!(
+        !raw_disk.contains("sk-super-secret-value-12345") && raw_disk.contains("api_key=dpapi:"),
+        "api_key must be DPAPI-encrypted on disk, got: {raw_disk}"
+    );
+    assert!(
+        !format!("{cfg:?}").contains("sk-super-secret-value-12345"),
+        "Debug output must redact api_key"
+    );
+    let loaded = ai_agent::AiConfig::load_from(&cfg_path);
+    assert_eq!(loaded, cfg);
+
+    // HTML rowspan="2" paste must shift the second row's cell to col B instead of overwriting col A
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    let block = crate::office_clipboard::parse_html(
+        "<table><tr><td rowspan=\"2\">MergedA</td><td>B1</td></tr><tr><td>B2</td></tr></table>",
+    );
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    assert!(app.paste_office_block(&block));
+    assert_eq!(app.wb.sheet(0).value(0, 0).display(), "MergedA");
+    assert_eq!(app.wb.sheet(0).value(0, 1).display(), "B1");
+    assert_eq!(app.wb.sheet(0).value(1, 0).display(), "");
+    assert_eq!(app.wb.sheet(0).value(1, 1).display(), "B2");
+    assert!(app.wb.sheet(0).merges.contains(&(0, 0, 1, 0)));
+    drop(env);
+}

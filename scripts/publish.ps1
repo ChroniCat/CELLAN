@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Position = 0)]
     [string]$Version = "",
     [Parameter(Position = 1)]
@@ -28,6 +28,22 @@ function Write-Utf8Text([string]$Path, [string]$Content) {
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
 
+function Write-Utf8TextAtomic([string]$Path, [string]$Content) {
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $tmp = "$Path.tmp.$([Guid]::NewGuid().ToString('N'))"
+    try {
+        [System.IO.File]::WriteAllText($tmp, $Content, $utf8NoBom)
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+    } finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Normalize-Notes([string]$Raw) {
     if ([string]::IsNullOrWhiteSpace($Raw)) {
         return ""
@@ -38,13 +54,23 @@ function Normalize-Notes([string]$Raw) {
         Where-Object { $_.Length -gt 0 }
     $joined = [string]::Join($sep, $lines)
     $sb = New-Object System.Text.StringBuilder
-    foreach ($ch in $joined.ToCharArray()) {
-        if (-not [char]::IsControl($ch)) {
+    $scalars = 0
+    for ($i = 0; $i -lt $joined.Length; $i++) {
+        $ch = $joined[$i]
+        if ([char]::IsHighSurrogate($ch) -and ($i + 1) -lt $joined.Length -and [char]::IsLowSurrogate($joined[$i + 1])) {
             [void]$sb.Append($ch)
-            if ($sb.Length -ge 500) { break }
+            [void]$sb.Append($joined[$i + 1])
+            $i++
+            $scalars++
+        } elseif ([char]::IsSurrogate($ch)) {
+            continue
+        } elseif (-not [char]::IsControl($ch)) {
+            [void]$sb.Append($ch)
+            $scalars++
         }
+        if ($scalars -ge 500) { break }
     }
-    return $sb.ToString()
+    return $sb.ToString().Trim()
 }
 
 function Get-PrimaryLanIPv4 {
@@ -107,6 +133,11 @@ $keyDir = Join-Path $env:USERPROFILE ".cellan-release"
 $privKeyPath = Join-Path $keyDir "signing-key.blob"
 if (-not (Test-Path $keyDir)) {
     New-Item -ItemType Directory -Path $keyDir -Force | Out-Null
+    try {
+        # 收紧私钥目录 ACL 为仅当前用户 + SYSTEM + Administrators 可访问（非破坏性，不影响已有密钥内容）
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        & icacls $keyDir /inheritance:r /grant:r "${me}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+    } catch {}
 }
 
 if (-not (Test-Path $privKeyPath)) {
@@ -158,24 +189,26 @@ Write-Host "[publish] Version: v$shortVer (Cargo $cargoVer)" -ForegroundColor Cy
 Write-Host "[publish] Default Update URL: $UpdateUrl" -ForegroundColor Cyan
 
 # 3. Synchronize version numbers & embedded public key across workspace
-$updateRs = [regex]::Replace(
+$plannedUpdates = [ordered]@{}
+
+$nextUpdateRs = [regex]::Replace(
     $updateRs,
     'pub const VERSION:\s*&str\s*=\s*"[^"]*";',
     "pub const VERSION: &str = `"$shortVer`";"
 )
-$updateRs = [regex]::Replace(
-    $updateRs,
+$nextUpdateRs = [regex]::Replace(
+    $nextUpdateRs,
     'pub const DEFAULT_PUBKEY_HEX:\s*&str\s*=\s*"[^"]*";',
     "pub const DEFAULT_PUBKEY_HEX: &str = `"$pubHex`";"
 )
-Write-Utf8Text $updateRsPath $updateRs
+$plannedUpdates[$updateRsPath] = $nextUpdateRs
 
 foreach ($relToml in @("Cargo.toml", "crates\core\Cargo.toml", "crates\app\Cargo.toml")) {
     $p = Join-Path $repoRoot $relToml
     $txt = Read-Utf8Text $p
     $txt = [regex]::Replace($txt, '(?m)^version\s*=\s*"[0-9]+\.[0-9]+\.[0-9]+"', "version = `"$cargoVer`"")
     $txt = [regex]::Replace($txt, 'sheetcore\s*=\s*\{\s*version\s*=\s*"[0-9]+\.[0-9]+\.[0-9]+"', "sheetcore = { version = `"$cargoVer`"")
-    Write-Utf8Text $p $txt
+    $plannedUpdates[$p] = $txt
 }
 
 $manualPath = Join-Path $repoRoot "packaging\$([char]0x4F7F)$([char]0x7528)$([char]0x8BF4)$([char]0x660E).txt"
@@ -183,14 +216,18 @@ if (Test-Path $manualPath) {
     $mTxt = Read-Utf8Text $manualPath
     $verPrefix = "$([char]0x7248)$([char]0x672C)$([char]0xFF1A)"
     $mTxt = [regex]::Replace($mTxt, "(?m)^$([regex]::Escape($verPrefix))[^\r\n]*", "${verPrefix}${shortVer}")
-    Write-Utf8Text $manualPath $mTxt
+    $plannedUpdates[$manualPath] = $mTxt
 }
 
 $lockPath = Join-Path $repoRoot "Cargo.lock"
 $lock = Read-Utf8Text $lockPath
 $lock = [regex]::Replace($lock, '(?m)^(name = "(?:app|sheetcore)"\r?\nversion = ")[^"]+(")', ('${1}' + $cargoVer + '$2'))
-Write-Utf8Text $lockPath $lock
+$plannedUpdates[$lockPath] = $lock
+
 if ($PrepareOnly) {
+    foreach ($entry in $plannedUpdates.GetEnumerator()) {
+        Write-Utf8Text $entry.Key $entry.Value
+    }
     $ec.Dispose()
     $cngKey.Dispose()
     Write-Host "[prepare] Version and public key are ready for review and commit."
@@ -203,7 +240,16 @@ if ($LASTEXITCODE -ne 0 -or $releaseCommit -notmatch '^[0-9a-f]{40,64}$') {
 }
 $pending = git status --porcelain
 if ($LASTEXITCODE -ne 0 -or $pending) {
-    throw "Release sources must be clean. Review and commit the prepared version and public key before building."
+    throw "Release sources must be clean. Review and commit pending changes before building."
+}
+$unsyncedFiles = @()
+foreach ($entry in $plannedUpdates.GetEnumerator()) {
+    if (-not [System.IO.File]::Exists($entry.Key) -or (Read-Utf8Text $entry.Key) -cne $entry.Value) {
+        $unsyncedFiles += $entry.Key
+    }
+}
+if ($unsyncedFiles.Count -gt 0) {
+    throw ("Release version/public key files are not synchronized in HEAD (" + ($unsyncedFiles -join ", ") + "). Run with -PrepareOnly, review, and commit before building.")
 }
 
 # 4. Build static single-file release executable with embedded update endpoint (x86-64-v3 + optional/auto PGO)
@@ -378,7 +424,7 @@ if (-not $NoServe) {
     $tmpServeExe = Join-Path $serveDir "CELLAN.exe.tmp"
     Copy-Item $distExe $tmpServeExe -Force
     Move-Item $tmpServeExe (Join-Path $serveDir "CELLAN.exe") -Force
-    Write-Utf8Text (Join-Path $serveDir "manifest.txt") $manifestText
+    Write-Utf8TextAtomic (Join-Path $serveDir "manifest.txt") $manifestText
 
     # Ensure inbound firewall rule when running elevated so LAN peers can connect without block
     try {

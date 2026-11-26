@@ -32,11 +32,11 @@ pub(crate) struct SortVote {
 impl SortVote {
     pub fn send(&self, value: bool) -> Result<(), ()> {
         let _connection = self.connection.upgrade().ok_or(())?;
-        self.sender.lock().unwrap().take().ok_or(())?.send(value).map_err(|_| ())
+        self.sender.lock().unwrap_or_else(|e| e.into_inner()).take().ok_or(())?.send(value).map_err(|_| ())
     }
 
     pub fn pending(&self) -> bool {
-        self.connection.strong_count() != 0 && self.sender.lock().unwrap().is_some()
+        self.connection.strong_count() != 0 && self.sender.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     /// The UI and deadline compete for a single vote. When it times out, ordinary
@@ -46,7 +46,7 @@ impl SortVote {
             Ok(value) => value,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Some(sender) = sender.upgrade()
-                    && let Some(tx) = sender.lock().unwrap().take() {
+                    && let Some(tx) = sender.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     let _ = tx.send(false);
                 }
                 rx.recv().unwrap_or(false)
@@ -195,7 +195,7 @@ enum RoomChange {
 }
 
 fn queue_room_change(cmd: &Sender<Cmd>, roster: &Mutex<RoomRoster>, except: Option<u32>, change: RoomChange) -> bool {
-    let peers = roster.lock().unwrap().other_senders(except);
+    let peers = roster.lock().unwrap_or_else(|e| e.into_inner()).other_senders(except);
     peers.is_empty() || cmd.send(Cmd::Deliver(peers, change)).is_ok()
 }
 
@@ -374,9 +374,9 @@ impl LiveSender {
     /// 低优先级投递 P2P 自更新分片：队列上限 `LOW_PRIO_UPDATE_CAP` 背压限流，且写线程始终优先排空实时协作帧。
     fn send_update_slice(&self, payload: Arc<sheetcore::wire::PreparedPayload>) -> Result<(), ()> {
         let (lock, cvar) = &*self.low_prio_update;
-        let mut guard = lock.lock().unwrap();
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         while guard.0.len() >= LOW_PRIO_UPDATE_CAP && !guard.1 {
-            guard = cvar.wait(guard).unwrap();
+            guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
         if guard.1 {
             return Err(());
@@ -487,10 +487,10 @@ impl SortCorrection {
     ) -> Arc<Self> {
         Arc::new(Self {
             batch,
-            baseline: baseline.lock().unwrap().clone(),
+            baseline: baseline.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             axis_styles,
-            cells: cells.lock().unwrap().clone(),
-            styles: styles.lock().unwrap().clone(),
+            cells: cells.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            styles: styles.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             edits: edits.to_vec(),
         })
     }
@@ -590,8 +590,9 @@ fn send_sort(batch: &SortBatch, capable: bool, to_host: bool, batched: bool,
 
 struct RoomRoster {
     host_site: u32,
-    peers: HashMap<u32, LiveSender>,
-    connecting: std::collections::HashSet<u32>,
+    next_conn_id: u64,
+    peers: HashMap<u32, (u64, LiveSender, Weak<TcpStream>)>,
+    connecting: HashMap<u32, (u64, Weak<TcpStream>)>,
     names: HashMap<u32, (String, u8)>,
     auth_hashes: HashMap<u32, [u8; 32]>,
 }
@@ -628,8 +629,9 @@ impl RoomRoster {
         names.insert(host_site, (canonical, (host_site % 7) as u8));
         Self {
             host_site,
+            next_conn_id: 0,
             peers: HashMap::new(),
-            connecting: std::collections::HashSet::new(),
+            connecting: HashMap::new(),
             names,
             auth_hashes: HashMap::new(),
         }
@@ -671,18 +673,31 @@ impl RoomRoster {
         site: u32,
         raw_name: &str,
         auth: &str,
-    ) -> Result<(String, Vec<(u32, String, u8)>), &'static str> {
-        if site == 0
-            || site == self.host_site
-            || self.peers.contains_key(&site)
-            || self.connecting.contains(&site)
-        {
+        stream: &Arc<TcpStream>,
+    ) -> Result<(u64, String, Vec<(u32, String, u8)>, Option<Arc<TcpStream>>), &'static str> {
+        if site == 0 || site == self.host_site {
             return Err("站点标识冲突，请重新加入协作会话");
         }
         let auth_hash = (!auth.trim().is_empty()).then(|| sha256_bytes(auth.as_bytes()));
         if let Some(expected) = self.auth_hashes.get(&site) {
             if auth_hash != Some(*expected) {
                 return Err("历史站点标识已被绑定，不能冒用其他成员身份");
+            }
+        }
+        let mut evicted_stream = None;
+        if self.peers.contains_key(&site) || self.connecting.contains_key(&site) {
+            let can_evict_stale = auth_hash.is_some()
+                && self.auth_hashes.get(&site).copied() == auth_hash;
+            if !can_evict_stale {
+                return Err("站点标识冲突，请重新加入协作会话");
+            }
+            if let Some((_, _, old_w)) = self.peers.remove(&site) {
+                evicted_stream = old_w.upgrade();
+            }
+            if let Some((_, old_w)) = self.connecting.remove(&site)
+                && evicted_stream.is_none()
+            {
+                evicted_stream = old_w.upgrade();
             }
         } else if let Some(h) = auth_hash {
             self.auth_hashes.insert(site, h);
@@ -694,18 +709,28 @@ impl RoomRoster {
             .collect();
         let canonical = self.unique_name_for(site, raw_name);
         let color = (site % 7) as u8;
-        self.connecting.insert(site);
+        self.next_conn_id = self.next_conn_id.wrapping_add(1).max(1);
+        let conn_id = self.next_conn_id;
+        self.connecting.insert(site, (conn_id, Arc::downgrade(stream)));
         self.names.insert(site, (canonical.clone(), color));
-        Ok((canonical, known))
+        Ok((conn_id, canonical, known, evicted_stream))
     }
 
-    fn finish_admit(&mut self, site: u32, tx: LiveSender) -> Vec<LiveSender> {
-        self.connecting.remove(&site);
-        self.peers.insert(site, tx);
+    fn finish_admit(
+        &mut self,
+        site: u32,
+        conn_id: u64,
+        tx: LiveSender,
+        stream: &Arc<TcpStream>,
+    ) -> Vec<LiveSender> {
+        if self.connecting.get(&site).is_some_and(|(id, _)| *id == conn_id) {
+            self.connecting.remove(&site);
+            self.peers.insert(site, (conn_id, tx, Arc::downgrade(stream)));
+        }
         self.peers
             .iter()
             .filter(|(s, _)| **s != site)
-            .map(|(_, ptx)| ptx.clone())
+            .map(|(_, (_, ptx, _))| ptx.clone())
             .collect()
     }
 
@@ -716,29 +741,41 @@ impl RoomRoster {
         canonical
     }
 
-    fn remove_member(&mut self, site: u32) -> Vec<LiveSender> {
-        self.connecting.remove(&site);
+    fn remove_member(&mut self, site: u32, conn_id: u64) -> Option<Vec<LiveSender>> {
+        let matched_connecting = self
+            .connecting
+            .get(&site)
+            .is_some_and(|(id, _)| *id == conn_id);
+        let matched_peer = self.peers.get(&site).is_some_and(|(id, ..)| *id == conn_id);
+        if !matched_connecting && !matched_peer {
+            return None;
+        }
+        if matched_connecting {
+            self.connecting.remove(&site);
+        }
         if site != self.host_site {
-            self.peers.remove(&site);
+            if matched_peer {
+                self.peers.remove(&site);
+            }
             self.names.remove(&site);
         }
-        self.peers.values().cloned().collect()
+        Some(self.peers.values().map(|(_, ptx, _)| ptx.clone()).collect())
     }
 
     fn other_senders(&self, exclude: Option<u32>) -> Vec<LiveSender> {
         self.peers
             .iter()
             .filter(|(s, _)| Some(**s) != exclude)
-            .map(|(_, ptx)| ptx.clone())
+            .map(|(_, (_, ptx, _))| ptx.clone())
             .collect()
     }
 
     fn all_senders(&self) -> Vec<LiveSender> {
-        self.peers.values().cloned().collect()
+        self.peers.values().map(|(_, ptx, _)| ptx.clone()).collect()
     }
 
     fn sender_of(&self, site: u32) -> Option<LiveSender> {
-        self.peers.get(&site).cloned()
+        self.peers.get(&site).map(|(_, ptx, _)| ptx.clone())
     }
 }
 
@@ -825,7 +862,7 @@ fn make_update_slice_payload(
 impl UpdateSeederQueue {
     fn enqueue(&self, job: UpdateSeedJob) {
         let (lock, cvar) = &*self.inner;
-        let mut g = lock.lock().unwrap();
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         if g.stopped {
             return;
         }
@@ -860,7 +897,7 @@ impl UpdateSeederQueue {
                 let mut buf = vec![0u8; UPDATE_SLICE_RAW_BYTES];
                 loop {
                     let job = {
-                        let mut g = lock.lock().unwrap();
+                        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                         if g.stopped {
                             g.queue.clear();
                             g.worker_running = false;
@@ -896,7 +933,7 @@ impl UpdateSeederQueue {
 
     fn shutdown(&self) {
         let (lock, cvar) = &*self.inner;
-        let mut g = lock.lock().unwrap();
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         g.stopped = true;
         g.queue.clear();
         cvar.notify_all();
@@ -965,7 +1002,7 @@ fn accept_incoming_update_slice(
     done: bool,
 ) {
     if total == 0 && done {
-        let mut g = dl_slot.lock().unwrap();
+        let mut g = dl_slot.lock().unwrap_or_else(|e| e.into_inner());
         if g.as_ref()
             .is_some_and(|dl| dl.peer_site == from_site && dl.manifest.version == version)
             && let Some(dl) = g.take()
@@ -983,8 +1020,12 @@ fn accept_incoming_update_slice(
         raw_data
     } else {
         let Some(bytes) = sheetcore::wire::b64_decode(data_b64) else {
-            let mut g = dl_slot.lock().unwrap();
-            if let Some(dl) = g.take() {
+            let mut g = lock_unpoison(dl_slot);
+            if g.as_ref()
+                .is_some_and(|dl| dl.peer_site == from_site && dl.manifest.version == version)
+                && let Some(dl) = g.take()
+            {
+                drop(dl.file);
                 let _ = std::fs::remove_file(&dl.part_path);
                 let _ = evt_tx.send(NetEvent::PeerUpdateFailed("更新分片解码失败".into()));
             }
@@ -995,7 +1036,7 @@ fn accept_incoming_update_slice(
     };
 
     let finished = {
-        let mut g = dl_slot.lock().unwrap();
+        let mut g = dl_slot.lock().unwrap_or_else(|e| e.into_inner());
         let Some(dl) = g.as_mut() else {
             return;
         };
@@ -1540,7 +1581,10 @@ impl HostWatermark {
                     if let Some(rm) = Arc::make_mut(&mut self.axis_rows).get_mut(&sheet) {
                         let moved: Vec<_> = rm
                             .extract_if(at.., |_, _| true)
-                            .map(|(r, v)| (r.saturating_add(n), v))
+                            .filter_map(|(r, v)| {
+                                let nr = r.checked_add(n)?;
+                                (nr < sheetcore::sync::MAX_ROWS).then_some((nr, v))
+                            })
                             .collect();
                         rm.extend(moved);
                     }
@@ -1562,7 +1606,10 @@ impl HostWatermark {
                     if let Some(cm) = Arc::make_mut(&mut self.axis_cols).get_mut(&sheet) {
                         let moved: Vec<_> = cm
                             .extract_if(at.., |_, _| true)
-                            .map(|(c, v)| (c.saturating_add(n), v))
+                            .filter_map(|(c, v)| {
+                                let nc = c.checked_add(n)?;
+                                (nc < sheetcore::sync::MAX_COLS).then_some((nc, v))
+                            })
                             .collect();
                         cm.extend(moved);
                     }
@@ -1676,7 +1723,7 @@ struct CursorSendThrottle {
 impl CursorSendThrottle {
     fn send_throttled(&self, cur: Cursor, cmd: &Sender<Cmd>, alive: &Arc<AtomicBool>) {
         let (lock, _) = &*self.inner;
-        let mut g = lock.lock().unwrap();
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         if g.stopped {
             return;
         }
@@ -1701,7 +1748,7 @@ impl CursorSendThrottle {
             let alive = alive.clone();
             std::thread::spawn(move || {
                 let (lock, cvar) = &*runner;
-                let mut g = lock.lock().unwrap();
+                let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
                     if g.stopped || !alive.load(Ordering::Acquire) {
                         g.pending = None;
@@ -1727,12 +1774,12 @@ impl CursorSendThrottle {
                     g.last_sent = Some(std::time::Instant::now());
                     drop(g);
                     if cmd.send(Cmd::BroadcastMsg(Msg::CursorMsg(latest))).is_err() {
-                        let mut g_err = lock.lock().unwrap();
+                        let mut g_err = lock.lock().unwrap_or_else(|e| e.into_inner());
                         g_err.pending = None;
                         g_err.worker_armed = false;
                         return;
                     }
-                    g = lock.lock().unwrap();
+                    g = lock.lock().unwrap_or_else(|e| e.into_inner());
                     if g.pending.is_none() {
                         g.worker_armed = false;
                         return;
@@ -1744,7 +1791,7 @@ impl CursorSendThrottle {
 
     fn rename_pending(&self, canonical: &str) {
         let (lock, _) = &*self.inner;
-        let mut g = lock.lock().unwrap();
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cur) = g.pending.as_mut() {
             cur.name = canonical.to_string();
         }
@@ -1752,7 +1799,7 @@ impl CursorSendThrottle {
 
     fn shutdown(&self) {
         let (lock, cvar) = &*self.inner;
-        let mut g = lock.lock().unwrap();
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         g.stopped = true;
         g.pending = None;
         cvar.notify_all();
@@ -1765,10 +1812,67 @@ impl Drop for Net {
     }
 }
 
+#[inline]
+fn lock_unpoison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn enable_tcp_keepalive(stream: &TcpStream) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        #[repr(C)]
+        struct TcpKeepalive {
+            onoff: u32,
+            keepalivetime: u32,
+            keepaliveinterval: u32,
+        }
+        const SIO_KEEPALIVE_VALS: u32 = 0x9800_0004;
+        #[link(name = "ws2_32")]
+        unsafe extern "system" {
+            fn WSAIoctl(
+                s: usize,
+                dw_io_control_code: u32,
+                lpv_in_buffer: *const core::ffi::c_void,
+                cb_in_buffer: u32,
+                lpv_out_buffer: *mut core::ffi::c_void,
+                cb_out_buffer: u32,
+                lpcb_bytes_returned: *mut u32,
+                lp_overlapped: *mut core::ffi::c_void,
+                lp_completion_routine: *const core::ffi::c_void,
+            ) -> i32;
+        }
+        let ka = TcpKeepalive {
+            onoff: 1,
+            keepalivetime: 15_000,
+            keepaliveinterval: 3_000,
+        };
+        let mut bytes_returned = 0u32;
+        unsafe {
+            let _ = WSAIoctl(
+                stream.as_raw_socket() as usize,
+                SIO_KEEPALIVE_VALS,
+                (&raw const ka).cast(),
+                core::mem::size_of::<TcpKeepalive>() as u32,
+                core::ptr::null_mut(),
+                0,
+                &raw mut bytes_returned,
+                core::ptr::null_mut(),
+                core::ptr::null(),
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = stream;
+    }
+}
+
 fn track_socket(
     stream: TcpStream, sockets: &Mutex<Vec<Weak<TcpStream>>>, alive: &AtomicBool,
 ) -> Option<Arc<TcpStream>> {
-    let mut active = sockets.lock().unwrap();
+    enable_tcp_keepalive(&stream);
+    let mut active = lock_unpoison(sockets);
     if !alive.load(Ordering::SeqCst) {
         return None;
     }
@@ -2049,9 +2153,11 @@ impl GuestSend {
 /// 认证前单行上限：挑战与 Hello 报文都很短，局域网里的陌生连接不该让宿主攒内存
 const MAX_PREAUTH_LINE: usize = 64 * 1024;
 /// 认证后单行上限（整表快照分片、批量样式等大报文也在其内）
-const MAX_LINE: usize = 256 * 1024 * 1024;
+const MAX_LINE: usize = 64 * 1024 * 1024;
 /// 宿主同时保持的连接数上限（含未认证的）
 const MAX_CONNECTIONS: usize = 64;
+/// 单个非回环来源 IP 同时允许的未认证握手连接数上限
+const MAX_PREAUTH_PER_IP: usize = 8;
 /// 建连后多久不完成 Hello 就断开
 const PREAUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -2118,6 +2224,48 @@ impl Drop for ConnSlot {
     }
 }
 
+/// 单 IP 未认证握手名额守卫：完成 Hello 或断开时自动归还
+struct PreauthIpSlot {
+    counts: Arc<Mutex<HashMap<std::net::IpAddr, usize>>>,
+    ip: std::net::IpAddr,
+}
+
+impl PreauthIpSlot {
+    fn try_take(
+        counts: &Arc<Mutex<HashMap<std::net::IpAddr, usize>>>,
+        ip: std::net::IpAddr,
+    ) -> Option<Self> {
+        let limit = if ip.is_loopback() {
+            MAX_CONNECTIONS
+        } else {
+            MAX_PREAUTH_PER_IP
+        };
+        let mut map = lock_unpoison(counts);
+        let cnt = map.entry(ip).or_insert(0);
+        if *cnt >= limit {
+            return None;
+        }
+        *cnt += 1;
+        Some(Self {
+            counts: counts.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for PreauthIpSlot {
+    fn drop(&mut self) {
+        let mut map = lock_unpoison(&self.counts);
+        if let Some(cnt) = map.get_mut(&self.ip) {
+            if *cnt <= 1 {
+                map.remove(&self.ip);
+            } else {
+                *cnt -= 1;
+            }
+        }
+    }
+}
+
 /// 结构改动后，宿主的操作日志、样式表、租约表与光标表都要同步平移坐标，
 /// 否则后来加入的人或在线持锁者会停留在旧坐标。
 fn update_host_ops(
@@ -2143,9 +2291,9 @@ fn update_host_shared_ops(
     max_clock: &AtomicU64,
     ops: impl IntoIterator<Item = Arc<Op>>,
 ) {
-    let mut state = state.lock().unwrap();
-    let mut delta = delta.lock().unwrap();
-    let mut fk = formula_keys.lock().unwrap();
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut delta = delta.lock().unwrap_or_else(|e| e.into_inner());
+    let mut fk = formula_keys.lock().unwrap_or_else(|e| e.into_inner());
     let state = Arc::make_mut(&mut state);
     let delta = Arc::make_mut(&mut delta);
     let mut batch_max_ts = 0u64;
@@ -2173,7 +2321,7 @@ fn update_formula_keys_for_sort(
     formula_keys: &Mutex<BTreeSet<(usize, u32, u32)>>,
     ops: &[Arc<Op>],
 ) {
-    let mut fk = formula_keys.lock().unwrap();
+    let mut fk = formula_keys.lock().unwrap_or_else(|e| e.into_inner());
     for op in ops {
         let key = (op.sheet, op.row, op.col);
         if op.formula.is_some() {
@@ -2186,8 +2334,8 @@ fn update_formula_keys_for_sort(
 
 fn update_host_styles(state: &SharedStyles, delta: &SharedStyles, sheet: usize,
                       items: &[(u32, u32, sheetcore::style::CellStyle)]) {
-    let mut state = state.lock().unwrap();
-    let mut delta = delta.lock().unwrap();
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut delta = delta.lock().unwrap_or_else(|e| e.into_inner());
     let state = Arc::make_mut(&mut state);
     let delta = Arc::make_mut(&mut delta);
     let mut shared_by_hash: HashMap<u64, Vec<Arc<sheetcore::style::CellStyle>>> = HashMap::new();
@@ -2217,8 +2365,8 @@ fn update_host_palette_styles(
 ) {
     let shared_palette: Vec<Arc<sheetcore::style::CellStyle>> =
         palette.iter().cloned().map(Arc::new).collect();
-    let mut state = state.lock().unwrap();
-    let mut delta = delta.lock().unwrap();
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut delta = delta.lock().unwrap_or_else(|e| e.into_inner());
     let state = Arc::make_mut(&mut state);
     let delta = Arc::make_mut(&mut delta);
     for &(row, col, idx) in items {
@@ -2246,16 +2394,16 @@ fn shift_state(
     op: &sheetcore::structural::Structural,
 ) {
     let map = |r: u32, c: u32| sheetcore::sync::shift_structural_coord(r, c, op);
-    base_hash.lock().unwrap().clear();
+    base_hash.lock().unwrap_or_else(|e| e.into_inner()).clear();
     {
-        let mut base_guard = baseline.lock().unwrap();
+        let mut base_guard = baseline.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(base_arc) = base_guard.as_mut() {
             Arc::make_mut(base_arc).shift_structural(sheet, op);
         }
     }
     let shifts = sheetcore::sync::structural_reference_shifts(names, sheet, op);
     let active_formulas: Vec<(usize, u32, u32)> = {
-        let mut fk = formula_keys.lock().unwrap();
+        let mut fk = formula_keys.lock().unwrap_or_else(|e| e.into_inner());
         sheetcore::sync::shift_coord_set(&mut fk, sheet, op);
         fk.iter().copied().collect()
     };
@@ -2266,7 +2414,7 @@ fn shift_state(
             cell.col = col;
         });
         if !active_formulas.is_empty() {
-            let mut grid = cells.lock().unwrap();
+            let mut grid = cells.lock().unwrap_or_else(|e| e.into_inner());
             let mut updates = Vec::new();
             for &key in &active_formulas {
                 if let Some(cell) = grid.get(&key) {
@@ -2286,9 +2434,9 @@ fn shift_state(
         }
     }
     for styles in [styles, delta_styles] { shift_grid(styles, sheet, op, |_,_,_| {}); }
-    locks.lock().unwrap().shift_structural(sheet, op);
+    locks.lock().unwrap_or_else(|e| e.into_inner()).shift_structural(sheet, op);
     {
-        let mut cm = cursors.lock().unwrap();
+        let mut cm = cursors.lock().unwrap_or_else(|e| e.into_inner());
         for cur in cm.values_mut() {
             if cur.sheet == sheet {
                 if let Some((nr, nc)) = map(cur.row, cur.col) {
@@ -2765,11 +2913,11 @@ fn latest_cell_op(
     row: u32,
     col: u32,
 ) -> Option<Op> {
-    if let Some(op) = state.lock().unwrap().get(&(sheet, row, col)) {
+    if let Some(op) = state.lock().unwrap_or_else(|e| e.into_inner()).get(&(sheet, row, col)) {
         return Some(op.as_ref().clone());
     }
     baseline
-        .and_then(|b| b.lock().unwrap().clone())
+        .and_then(|b| b.lock().unwrap_or_else(|e| e.into_inner()).clone())
         .and_then(|b| b.cell_op(sheet, row, col))
 }
 
@@ -2781,11 +2929,11 @@ fn latest_cell_style(
     row: u32,
     col: u32,
 ) -> Option<sheetcore::style::CellStyle> {
-    if let Some(st) = styles.lock().unwrap().get(&(sheet, row, col)) {
+    if let Some(st) = styles.lock().unwrap_or_else(|e| e.into_inner()).get(&(sheet, row, col)) {
         return Some(st.as_ref().clone());
     }
     if let Some(st) = baseline
-        .and_then(|b| b.lock().unwrap().clone())
+        .and_then(|b| b.lock().unwrap_or_else(|e| e.into_inner()).clone())
         .and_then(|b| b.cell_style(sheet, row, col))
     {
         return Some(st);
@@ -2842,19 +2990,19 @@ impl Net {
         workbook: &sheetcore::Workbook,
         mut host_cursor: Cursor,
     ) {
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
-        *self.sheet_names.lock().unwrap() = workbook.sheets.iter().map(|s| s.name.clone()).collect();
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        *self.sheet_names.lock().unwrap_or_else(|e| e.into_inner()) = workbook.sheets.iter().map(|s| s.name.clone()).collect();
         if let Some(hb) = &self.host_baseline {
             let base = peer
                 .cells
                 .baseline()
                 .cloned()
                 .unwrap_or_else(|| BaselineBook::from_workbook(self.site, workbook));
-            *hb.lock().unwrap() = Some(Arc::new(base));
+            *hb.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(base));
         }
         let mut seed_max_ts = 1u64;
         if let Some(st) = &self.state {
-            let mut map = st.lock().unwrap();
+            let mut map = st.lock().unwrap_or_else(|e| e.into_inner());
             *map = Arc::new(
                 peer.cells
                     .iter()
@@ -2869,7 +3017,7 @@ impl Net {
             mc.store(seed_max_ts.max(1), Ordering::Release);
         }
         if let Some(fk) = &self.formula_keys {
-            let mut set = fk.lock().unwrap();
+            let mut set = fk.lock().unwrap_or_else(|e| e.into_inner());
             set.clear();
             for (&k, op) in peer.cells.iter() {
                 if op.formula.is_some() {
@@ -2878,28 +3026,28 @@ impl Net {
             }
         }
         if let Some(d) = &self.delta_ops {
-            *d.lock().unwrap() = Default::default();
+            *d.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         }
         if let Some(ds) = &self.delta_styles {
-            *ds.lock().unwrap() = Default::default();
+            *ds.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         }
         if let Some(dm) = &self.delta_merges {
-            dm.lock().unwrap().clear();
+            dm.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
         if let Some(hs) = &self.host_styles {
             // 基准显式样式保留在只读 CoW `BaselineBook` 中，`host_styles` 仅存储建房后的增量改动
-            *hs.lock().unwrap() = Default::default();
+            *hs.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         }
         if let Some(hp) = &self.host_file_path {
-            *hp.lock().unwrap() = workbook.path.clone();
+            *hp.lock().unwrap_or_else(|e| e.into_inner()) = workbook.path.clone();
         }
-        *self.staged_save_cursor.lock().unwrap() = None;
+        *self.staged_save_cursor.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if let Some(wm) = &self.host_watermark {
-            let mut w_guard = wm.lock().unwrap();
+            let mut w_guard = wm.lock().unwrap_or_else(|e| e.into_inner());
             let w = &mut *w_guard;
             w.reset();
             if let Some(bh) = &self.host_base_hash {
-                let initial_hash = bh.lock().unwrap().clone();
+                let initial_hash = bh.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 if !initial_hash.is_empty() {
                     w.record_checkpoint(initial_hash, 1, 0);
                 }
@@ -2928,10 +3076,10 @@ impl Net {
         host_cursor.site = self.site;
         host_cursor.color = (self.site % 7) as u8;
         if let Some(roster) = &self.host_roster {
-            host_cursor.name = roster.lock().unwrap().name_of(self.site);
+            host_cursor.name = roster.lock().unwrap_or_else(|e| e.into_inner()).name_of(self.site);
         }
         if let Some(hc) = &self.host_cursors {
-            hc.lock().unwrap().insert(host_cursor.site, host_cursor);
+            hc.lock().unwrap_or_else(|e| e.into_inner()).insert(host_cursor.site, host_cursor);
         }
     }
 
@@ -2942,13 +3090,13 @@ impl Net {
             let srev = self
                 .host_structs
                 .as_ref()
-                .map_or(0, |h| h.lock().unwrap().len());
-            let mut w = wm.lock().unwrap();
+                .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
+            let mut w = wm.lock().unwrap_or_else(|e| e.into_inner());
             let seq = w.seq;
             w.record_checkpoint(hash.clone(), seq, srev);
         }
         if let Some(bh) = &self.host_base_hash {
-            *bh.lock().unwrap() = hash;
+            *bh.lock().unwrap_or_else(|e| e.into_inner()) = hash;
         }
     }
 
@@ -2956,7 +3104,7 @@ impl Net {
     #[allow(dead_code)]
     pub fn set_host_file_path(&self, path: Option<std::path::PathBuf>) {
         if let Some(hp) = &self.host_file_path {
-            *hp.lock().unwrap() = path;
+            *hp.lock().unwrap_or_else(|e| e.into_inner()) = path;
         }
     }
 
@@ -2966,13 +3114,13 @@ impl Net {
         if !self.hosting || file_hash.is_empty() {
             return;
         }
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         let srev = self
             .host_structs
             .as_ref()
-            .map_or(0, |h| h.lock().unwrap().len());
+            .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
         if let Some(wm) = &self.host_watermark {
-            let mut w = wm.lock().unwrap();
+            let mut w = wm.lock().unwrap_or_else(|e| e.into_inner());
             let seq = w.seq;
             w.record_checkpoint(file_hash, seq, srev);
         }
@@ -2991,14 +3139,14 @@ impl Net {
         &self,
         base_styles: &sheetcore::style::StyleTable,
     ) {
-        *self.seed_styles.lock().unwrap() = Some(base_styles.clone());
+        *self.seed_styles.lock().unwrap_or_else(|e| e.into_inner()) = Some(base_styles.clone());
         self.fast_snapshot_handoff.store(true, Ordering::Release);
     }
 
     /// 在收到 `NetEvent::SnapshotDone` 时取走后台已组装完毕的列式工作簿快照。
     #[allow(dead_code)]
     pub fn take_prepared_snapshot(&self) -> Option<PreparedGuestSnapshot> {
-        self.ready_snapshot.lock().unwrap().take()
+        self.ready_snapshot.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     fn host_now_ms(&self) -> u64 {
@@ -3007,7 +3155,7 @@ impl Net {
 
     fn expire_host_locks(&self) {
         let Some(locks) = &self.host_locks else { return };
-        let dead = locks.lock().unwrap().expire(self.host_now_ms());
+        let dead = locks.lock().unwrap_or_else(|e| e.into_inner()).expire(self.host_now_ms());
         for (sheet, row, col, site) in dead {
             if let Ok(s) = serde_json::to_string(&Msg::LockRelease { site, sheet, row, col }) {
                 let _ = self.cmd.send(Cmd::Broadcast(s));
@@ -3028,7 +3176,7 @@ impl Net {
         let locks = self.host_locks.as_ref()?;
         self.expire_host_locks();
         let now = self.host_now_ms();
-        let lt = locks.lock().unwrap();
+        let lt = locks.lock().unwrap_or_else(|e| e.into_inner());
         if lt.is_empty() {
             return None;
         }
@@ -3056,7 +3204,7 @@ impl Net {
         let locks = self.host_locks.as_ref()?;
         self.expire_host_locks();
         let now = self.host_now_ms();
-        let lt = locks.lock().unwrap();
+        let lt = locks.lock().unwrap_or_else(|e| e.into_inner());
         lt.conflicts_rect(sheet, rect.0, rect.1, rect.2, rect.3, self.site, now)
             .map(|((r, c), h)| (h.site, h.name.clone(), r, c))
     }
@@ -3069,7 +3217,7 @@ impl Net {
         let locks = self.host_locks.as_ref()?;
         self.expire_host_locks();
         let now = self.host_now_ms();
-        let lt = locks.lock().unwrap();
+        let lt = locks.lock().unwrap_or_else(|e| e.into_inner());
         lt.conflicts_structural(sheet, op, self.site, now)
             .map(|((r, c), h)| (h.site, h.name.clone(), r, c))
     }
@@ -3088,16 +3236,16 @@ impl Net {
         if ops.is_empty() {
             return;
         }
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         let now = self.host_now_ms();
         let has_expired = self.host_locks.as_ref().is_some_and(|table| {
-            let lt = table.lock().unwrap();
+            let lt = table.lock().unwrap_or_else(|e| e.into_inner());
             !lt.is_empty() && lt.iter().any(|(_, h)| now.saturating_sub(h.at_ms) >= lt.ttl_ms)
         });
         if has_expired {
             self.expire_host_locks();
         }
-        let locks = self.host_locks.as_ref().map(|table| table.lock().unwrap());
+        let locks = self.host_locks.as_ref().map(|table| table.lock().unwrap_or_else(|e| e.into_inner()));
         let has_other_locks = locks.as_ref().is_some_and(|lt| {
             !lt.is_empty()
                 && lt
@@ -3145,16 +3293,16 @@ impl Net {
         if ops.is_empty() {
             return;
         }
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         let now = self.host_now_ms();
         let has_expired = self.host_locks.as_ref().is_some_and(|table| {
-            let lt = table.lock().unwrap();
+            let lt = table.lock().unwrap_or_else(|e| e.into_inner());
             !lt.is_empty() && lt.iter().any(|(_, h)| now.saturating_sub(h.at_ms) >= lt.ttl_ms)
         });
         if has_expired {
             self.expire_host_locks();
         }
-        let locks = self.host_locks.as_ref().map(|table| table.lock().unwrap());
+        let locks = self.host_locks.as_ref().map(|table| table.lock().unwrap_or_else(|e| e.into_inner()));
         let has_other_locks = locks.as_ref().is_some_and(|lt| {
             !lt.is_empty()
                 && lt
@@ -3219,11 +3367,11 @@ impl Net {
             let wm_seq = self
                 .host_watermark
                 .as_ref()
-                .map(|wm| wm.lock().unwrap().record_ops(ops.iter().map(Arc::as_ref)));
+                .map(|wm| wm.lock().unwrap_or_else(|e| e.into_inner()).record_ops(ops.iter().map(Arc::as_ref)));
             let struct_rev = self
                 .host_structs
                 .as_ref()
-                .map_or(0, |h| h.lock().unwrap().len());
+                .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
             queue_room_change(&self.cmd, roster, None, RoomChange::SharedCells(ops));
             if let Some(seq) = wm_seq {
                 emit_room_watermark(&self.cmd, roster, seq, struct_rev);
@@ -3236,24 +3384,24 @@ impl Net {
     pub fn pending_structure(&self) -> bool { self.pending_structure.load(Ordering::Acquire) }
     pub fn finish_structure(&self) { self.pending_structure.store(false, Ordering::Release); }
 
-    pub fn structure_seen(&self) -> usize { self.structure_seen.lock().unwrap().seen }
-    pub fn note_structure(&self, count: usize) { self.structure_seen.lock().unwrap().consume(count); }
+    pub fn structure_seen(&self) -> usize { self.structure_seen.lock().unwrap_or_else(|e| e.into_inner()).seen }
+    pub fn note_structure(&self, count: usize) { self.structure_seen.lock().unwrap_or_else(|e| e.into_inner()).consume(count); }
     pub fn set_structure_revision(&self, revision: usize) {
-        *self.structure_seen.lock().unwrap() = StructureProgress { seen:revision,..Default::default() };
+        *self.structure_seen.lock().unwrap_or_else(|e| e.into_inner()) = StructureProgress { seen:revision,..Default::default() };
     }
     pub fn reset_structure(&self) { self.set_structure_revision(0); }
 
-    pub fn sort_clock_ranges(&self) -> Vec<(u64,u64)> { self.local_sort_ranges.lock().unwrap().clone() }
+    pub fn sort_clock_ranges(&self) -> Vec<(u64,u64)> { self.local_sort_ranges.lock().unwrap_or_else(|e| e.into_inner()).clone() }
 
     #[cfg(test)]
     pub fn pending_sort_ranges(&self) -> Vec<(u64,u64)> {
-        self.pending_sorts.lock().unwrap().iter().map(|(&first,b)| (first,first + b.ops.len() as u64)).collect()
+        self.pending_sorts.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(&first,b)| (first,first + b.ops.len() as u64)).collect()
     }
 
-    pub fn finish_sort(&self, first_ts: u64) { self.pending_sorts.lock().unwrap().remove(&first_ts); }
+    pub fn finish_sort(&self, first_ts: u64) { self.pending_sorts.lock().unwrap_or_else(|e| e.into_inner()).remove(&first_ts); }
 
     pub fn discard_pending_sorts(&self) -> Vec<u64> {
-        std::mem::take(&mut *self.pending_sorts.lock().unwrap()).into_keys().collect()
+        std::mem::take(&mut *self.pending_sorts.lock().unwrap_or_else(|e| e.into_inner())).into_keys().collect()
     }
 
     pub(crate) fn check_sort(&self, target: crate::net_sort::SortTarget, plan: sheetcore::sync::SortPermutation, sheet: sheetcore::Sheet,
@@ -3308,13 +3456,13 @@ impl Net {
                                     site: u32,
                                     t0: std::time::Instant| {
                 for attempt in 0..3 {
-                    let axis_snap = wm.lock().unwrap().axis_styles_snapshot();
+                    let axis_snap = wm.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot();
                     let current = RoomGrids::capture(baseline, axis_snap, state, delta, styles, delta_styles);
                     let next = current.apply(&batch);
-                    let _order = order.lock().unwrap();
-                    let leases = host_locks.lock().unwrap();
+                    let _order = order.lock().unwrap_or_else(|e| e.into_inner());
+                    let leases = host_locks.lock().unwrap_or_else(|e| e.into_inner());
                     let (r1, c1, r2, c2) = batch.plan.region;
-                    let history = host_structs.lock().unwrap();
+                    let history = host_structs.lock().unwrap_or_else(|e| e.into_inner());
                     let later = history.get(batch.plan.structural_revision..);
                     let now = t0.elapsed().as_millis() as u64;
                     let allowed = later
@@ -3327,7 +3475,7 @@ impl Net {
                             max_clock.fetch_max(m, Ordering::AcqRel);
                         }
                         update_formula_keys_for_sort(fk, &batch.ops);
-                        let seq = wm.lock().unwrap().record_sort(&batch);
+                        let seq = wm.lock().unwrap_or_else(|e| e.into_inner()).record_sort(&batch);
                         let struct_rev = history.len();
                         if !batch.styles.is_empty() {
                             let _ = evt_tx.send(NetEvent::CommittedSortStyles(batch.clone()));
@@ -3337,7 +3485,7 @@ impl Net {
                         return;
                     }
                     if !allowed || attempt == 2 {
-                        let axis_now = wm.lock().unwrap().axis_styles_snapshot();
+                        let axis_now = wm.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot();
                         let correction = SortCorrection::capture(
                             batch,
                             baseline,
@@ -3418,11 +3566,11 @@ impl Net {
         } else {
             let first = batch.plan.first_ts;
             let end = first + batch.ops.len() as u64;
-            let mut ranges = self.local_sort_ranges.lock().unwrap();
+            let mut ranges = self.local_sort_ranges.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(last) = ranges.last_mut() && last.1 == first { last.1 = end; }
             else { ranges.push((first,end)); }
             drop(ranges);
-            self.pending_sorts.lock().unwrap().insert(first,batch.clone());
+            self.pending_sorts.lock().unwrap_or_else(|e| e.into_inner()).insert(first,batch.clone());
             let generation = self.connection_generation.load(Ordering::Acquire);
             let _ = self.cmd.send(Cmd::Sort(generation,batch));
         }
@@ -3436,11 +3584,11 @@ impl Net {
             let auth_name = self
                 .host_roster
                 .as_ref()
-                .map(|r| r.lock().unwrap().name_of(self.site))
+                .map(|r| r.lock().unwrap_or_else(|e| e.into_inner()).name_of(self.site))
                 .unwrap_or_else(|| clean_member_name(name, self.site));
             let now = self.host_now_ms();
             let (outcome, evicted) = {
-                let mut lt = locks.lock().unwrap();
+                let mut lt = locks.lock().unwrap_or_else(|e| e.into_inner());
                 let outcome = lt.request(sheet, row, col, self.site, &auth_name, now);
                 let evicted = match outcome {
                     sheetcore::sync::LockOutcome::Denied { .. } => Vec::new(),
@@ -3510,7 +3658,7 @@ impl Net {
 
     pub fn release_lock(&self, sheet: usize, row: u32, col: u32) {
         if let Some(locks) = &self.host_locks {
-            if !locks.lock().unwrap().release(sheet, row, col, self.site) {
+            if !locks.lock().unwrap_or_else(|e| e.into_inner()).release(sheet, row, col, self.site) {
                 return;
             }
         }
@@ -3536,12 +3684,12 @@ impl Net {
         if !self.hosting {
             return None;
         }
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
-        let wm_seq = self.host_watermark.as_ref()?.lock().unwrap().seq;
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        let wm_seq = self.host_watermark.as_ref()?.lock().unwrap_or_else(|e| e.into_inner()).seq;
         let srev = self
             .host_structs
             .as_ref()
-            .map_or(0, |h| h.lock().unwrap().len());
+            .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
         Some((wm_seq, srev))
     }
 
@@ -3595,7 +3743,7 @@ impl Net {
             return;
         };
         if let Some(ids) = &self.host_audit_identities {
-            ids.lock().unwrap().insert(self.site, author.clone());
+            ids.lock().unwrap_or_else(|e| e.into_inner()).insert(self.site, author.clone());
         }
         let msg = Msg::AuditIdentity {
             site: self.site,
@@ -3648,7 +3796,7 @@ impl Net {
         let doc_id = log.doc_id.clone();
         let head_seq = log.head_seq();
         if let Some(slot) = &self.host_audit_sync {
-            *slot.lock().unwrap() = Some((doc_id.clone(), head_seq, payload_b64.clone()));
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((doc_id.clone(), head_seq, payload_b64.clone()));
         }
         let msg = Msg::AuditSync {
             doc_id,
@@ -3667,13 +3815,13 @@ impl Net {
         if !self.hosting {
             return None;
         }
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
-        let wm_seq = self.host_watermark.as_ref()?.lock().unwrap().seq;
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        let wm_seq = self.host_watermark.as_ref()?.lock().unwrap_or_else(|e| e.into_inner()).seq;
         let srev = self
             .host_structs
             .as_ref()
-            .map_or(0, |h| h.lock().unwrap().len());
-        *self.staged_save_cursor.lock().unwrap() = Some((clock, wm_seq, srev));
+            .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
+        *self.staged_save_cursor.lock().unwrap_or_else(|e| e.into_inner()) = Some((clock, wm_seq, srev));
         Some((wm_seq, srev))
     }
 
@@ -3693,14 +3841,14 @@ impl Net {
             return;
         }
         {
-            let mut staged = self.staged_save_cursor.lock().unwrap();
+            let mut staged = self.staged_save_cursor.lock().unwrap_or_else(|e| e.into_inner());
             if staged.is_some_and(|(c, _, _)| c <= clock) {
                 *staged = None;
             }
         }
         if let (Some((saved_seq, saved_srev)), Some(hp), Some(wm)) =
             (cursor, &self.host_file_path, &self.host_watermark)
-            && let Some(path) = hp.lock().unwrap().clone()
+            && let Some(path) = hp.lock().unwrap_or_else(|e| e.into_inner()).clone()
         {
             let wm_clone = wm.clone();
             let hs_clone = self.host_structs.clone();
@@ -3751,8 +3899,8 @@ impl Net {
                     return;
                 }
                 let hash = hex::encode(hasher.finalize());
-                let cur_srev = hs_clone.as_ref().map_or(0, |h| h.lock().unwrap().len());
-                let mut wm_guard = wm_clone.lock().unwrap();
+                let cur_srev = hs_clone.as_ref().map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
+                let mut wm_guard = wm_clone.lock().unwrap_or_else(|e| e.into_inner());
                 if !explicit_cursor && (wm_guard.seq != saved_seq || cur_srev != saved_srev) {
                     return;
                 }
@@ -3775,7 +3923,7 @@ impl Net {
             return;
         }
         let staged = {
-            let mut guard = self.staged_save_cursor.lock().unwrap();
+            let mut guard = self.staged_save_cursor.lock().unwrap_or_else(|e| e.into_inner());
             if guard.is_some_and(|(c, _, _)| c == clock) {
                 guard.take().map(|(_, seq, srev)| (seq, srev))
             } else {
@@ -3787,16 +3935,16 @@ impl Net {
             return;
         }
         let cursor = (|| {
-            let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+            let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
             let max_clk = self
                 .host_max_clock
                 .as_ref()
                 .map_or(0, |c| c.load(Ordering::Acquire));
-            let wm_seq = self.host_watermark.as_ref()?.lock().unwrap().seq;
+            let wm_seq = self.host_watermark.as_ref()?.lock().unwrap_or_else(|e| e.into_inner()).seq;
             let srev = self
                 .host_structs
                 .as_ref()
-                .map_or(0, |h| h.lock().unwrap().len());
+                .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
             // 未显式调 `note_save_snapshot` 时，仅在写盘期间逻辑时钟与房间水位均未越过快照时刻 `clock` 时才登记检查点
             (max_clk <= clock && wm_seq <= clock.max(1)).then_some((wm_seq, srev))
         })();
@@ -3805,7 +3953,7 @@ impl Net {
 
     /// 广播格式变更（自动启用调色板字典编码，消除数十万格重复序列化 `CellStyle`）
     pub fn broadcast_style(&self, sheet: usize, items: Vec<(u32, u32, sheetcore::style::CellStyle)>) {
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         if items.is_empty() {
             return;
         }
@@ -3814,7 +3962,7 @@ impl Net {
             let axis_snap = self
                 .host_watermark
                 .as_ref()
-                .map(|wm| wm.lock().unwrap().axis_styles_snapshot());
+                .map(|wm| wm.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot());
             let revert_styles = if let Some(st) = &self.host_styles {
                 keys.iter()
                     .map(|(r, c)| {
@@ -3859,11 +4007,11 @@ impl Net {
             let wm_seq = self
                 .host_watermark
                 .as_ref()
-                .map(|wm| wm.lock().unwrap().record_styles(sheet, &items));
+                .map(|wm| wm.lock().unwrap_or_else(|e| e.into_inner()).record_styles(sheet, &items));
             let struct_rev = self
                 .host_structs
                 .as_ref()
-                .map_or(0, |h| h.lock().unwrap().len());
+                .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
             let msg = if use_palette && items.len() > 1 {
                 let (palette, encoded) = sheetcore::sync::encode_style_palette(&items);
                 Msg::StylePaletteOp {
@@ -3913,11 +4061,11 @@ impl Net {
         if patch.is_empty() {
             return;
         }
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some(locks) = &self.host_locks {
             self.expire_host_locks();
             let now = self.host_now_ms();
-            let lt = locks.lock().unwrap();
+            let lt = locks.lock().unwrap_or_else(|e| e.into_inner());
             let conflict = lt.iter().find_map(|((sh, r, c), h)| {
                 if sh != sheet || h.site == self.site || now.saturating_sub(h.at_ms) >= lt.ttl_ms {
                     return None;
@@ -3950,11 +4098,11 @@ impl Net {
             let wm_seq = self
                 .host_watermark
                 .as_ref()
-                .map(|wm| wm.lock().unwrap().record_axis(sheet, &patch));
+                .map(|wm| wm.lock().unwrap_or_else(|e| e.into_inner()).record_axis(sheet, &patch));
             let struct_rev = self
                 .host_structs
                 .as_ref()
-                .map_or(0, |h| h.lock().unwrap().len());
+                .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
             queue_room_change(&self.cmd, roster, None, RoomChange::Message(msg));
             if let Some(seq) = wm_seq {
                 emit_room_watermark(&self.cmd, roster, seq, struct_rev);
@@ -3967,7 +4115,7 @@ impl Net {
 
     /// 广播合并/取消合并
     pub fn broadcast_merge(&self, sheet: usize, rect: (u32, u32, u32, u32), on: bool) {
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some((holder, holder_name, row, col)) = self.host_lock_conflict_rect(sheet, rect) {
             let _ = self.evt_tx.send(NetEvent::WriteRejected {
                 holder,
@@ -3982,7 +4130,7 @@ impl Net {
             return;
         }
         if let Some(dm) = &self.delta_merges {
-            dm.lock().unwrap().push((sheet, rect.0, rect.1, rect.2, rect.3, on));
+            dm.lock().unwrap_or_else(|e| e.into_inner()).push((sheet, rect.0, rect.1, rect.2, rect.3, on));
         }
         let msg = Msg::MergeOp {
             site: self.site,
@@ -3998,11 +4146,11 @@ impl Net {
             let wm_seq = self
                 .host_watermark
                 .as_ref()
-                .map(|wm| wm.lock().unwrap().record_merge(sheet, rect, on));
+                .map(|wm| wm.lock().unwrap_or_else(|e| e.into_inner()).record_merge(sheet, rect, on));
             let struct_rev = self
                 .host_structs
                 .as_ref()
-                .map_or(0, |h| h.lock().unwrap().len());
+                .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
             queue_room_change(&self.cmd, roster, None, RoomChange::Message(msg));
             if let Some(seq) = wm_seq {
                 emit_room_watermark(&self.cmd, roster, seq, struct_rev);
@@ -4019,9 +4167,9 @@ impl Net {
         if !kind.valid(sheet) || !self.alive.load(Ordering::Acquire) {
             return false;
         }
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some(log) = &self.host_meta_log {
-            let mut g = log.lock().unwrap();
+            let mut g = log.lock().unwrap_or_else(|e| e.into_inner());
             if g.len() >= 10_000 {
                 g.remove(0);
             }
@@ -4037,11 +4185,11 @@ impl Net {
             let wm_seq = self
                 .host_watermark
                 .as_ref()
-                .map(|wm| wm.lock().unwrap().record_sheet_meta(sheet, kind));
+                .map(|wm| wm.lock().unwrap_or_else(|e| e.into_inner()).record_sheet_meta(sheet, kind));
             let struct_rev = self
                 .host_structs
                 .as_ref()
-                .map_or(0, |h| h.lock().unwrap().len());
+                .map_or(0, |h| h.lock().unwrap_or_else(|e| e.into_inner()).len());
             queue_room_change(&self.cmd, roster, None, RoomChange::Message(msg));
             if let Some(seq) = wm_seq {
                 emit_room_watermark(&self.cmd, roster, seq, struct_rev);
@@ -4060,10 +4208,10 @@ impl Net {
         let message = Msg::Structural { site: self.site, sheet, op: op.clone() };
         if !message.is_within_limits() { return Err("插删区域超出工作表范围".into()); }
         let generation = self.connection_generation.load(Ordering::Acquire);
-        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some(history) = &self.host_structs {
-            let history = history.lock().unwrap();
-            let progress = self.structure_seen.lock().unwrap();
+            let history = history.lock().unwrap_or_else(|e| e.into_inner());
+            let progress = self.structure_seen.lock().unwrap_or_else(|e| e.into_inner());
             if history.get(progress.seen..).is_none_or(|later| later.iter().enumerate().any(|(i,(s,_))|
                 *s == sheet && !progress.applied_out_of_order.contains(&(progress.seen+i)))) {
                 return Err("正在同步工作表结构，请稍后重新执行插删操作".into());
@@ -4122,23 +4270,23 @@ impl Net {
                 ds,
                 locks,
                 cursors,
-                &self.sheet_names.lock().unwrap(),
+                &self.sheet_names.lock().unwrap_or_else(|e| e.into_inner()),
                 sheet,
                 op,
             );
         }
         let mut struct_rev = 0usize;
         if let Some(h) = &self.host_structs {
-            let mut history = h.lock().unwrap();
+            let mut history = h.lock().unwrap_or_else(|e| e.into_inner());
             let index = history.len();
             history.push((sheet, op.clone()));
             struct_rev = history.len();
-            let mut progress = self.structure_seen.lock().unwrap();
+            let mut progress = self.structure_seen.lock().unwrap_or_else(|e| e.into_inner());
             progress.applied_out_of_order.insert(index);
             progress.consume(0);
         }
         if let (Some(wm), Some(roster)) = (&self.host_watermark, &self.host_roster) {
-            let seq = wm.lock().unwrap().shift_structural(sheet, op);
+            let seq = wm.lock().unwrap_or_else(|e| e.into_inner()).shift_structural(sheet, op);
             emit_room_watermark(&self.cmd, roster, seq, struct_rev);
         }
         Ok(())
@@ -4148,10 +4296,10 @@ impl Net {
         cur.site = self.site;
         cur.color = (self.site % 7) as u8;
         if let Some(roster) = &self.host_roster {
-            cur.name = roster.lock().unwrap().name_of(self.site);
+            cur.name = roster.lock().unwrap_or_else(|e| e.into_inner()).name_of(self.site);
         }
         if let Some(hc) = &self.host_cursors {
-            hc.lock().unwrap().insert(cur.site, cur.clone());
+            hc.lock().unwrap_or_else(|e| e.into_inner()).insert(cur.site, cur.clone());
         }
         self.cursor_throttle
             .send_throttled(cur, &self.cmd, &self.alive);
@@ -4161,15 +4309,15 @@ impl Net {
     /// 本机也收一条事件让成员列表立刻更新。协议不改变 site，已有连接不需要重连。
     pub fn rename(&self, name: &str) {
         let canonical = if let Some(roster) = &self.host_roster {
-            roster.lock().unwrap().rename_member(self.site, name)
+            roster.lock().unwrap_or_else(|e| e.into_inner()).rename_member(self.site, name)
         } else {
             clean_member_name(name, self.site)
         };
         if let Some(locks) = &self.host_locks {
-            locks.lock().unwrap().rename_site(self.site, &canonical);
+            locks.lock().unwrap_or_else(|e| e.into_inner()).rename_site(self.site, &canonical);
         }
         if let Some(hc) = &self.host_cursors {
-            if let Some(cur) = hc.lock().unwrap().get_mut(&self.site) {
+            if let Some(cur) = hc.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&self.site) {
                 cur.name = canonical.clone();
             }
         }
@@ -4284,6 +4432,13 @@ impl Net {
         if peer_site == 0 || peer_site == self.site {
             return Err("无效的协作更新节点".into());
         }
+        if !crate::update::is_newer(&manifest.version, crate::update::VERSION) {
+            return Err(format!(
+                "目标版本（v{}）不高于当前版本（v{}），已拒绝拉取",
+                manifest.version,
+                crate::update::VERSION
+            ));
+        }
         if !crate::update::verify_manifest_sig(manifest) {
             return Err("更新清单签名无效，已拒绝请求".into());
         }
@@ -4294,7 +4449,7 @@ impl Net {
         let file = std::fs::File::create(&part_path)
             .map_err(|e| format!("无法创建临时更新文件：{e}"))?;
         {
-            let mut g = self.peer_update_dl.lock().unwrap();
+            let mut g = self.peer_update_dl.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(prev) = g.take() {
                 drop(prev.file);
                 let _ = std::fs::remove_file(&prev.part_path);
@@ -4327,12 +4482,12 @@ impl Net {
         exe_path: std::path::PathBuf,
         manifest: crate::update::SignedManifest,
     ) {
-        *self.update_seed_override.lock().unwrap() = Some((exe_path, manifest));
+        *self.update_seed_override.lock().unwrap_or_else(|e| e.into_inner()) = Some((exe_path, manifest));
     }
 
     #[cfg(test)]
     pub(crate) fn disconnect_socket_for_test(&self) {
-        for s in self.sockets.lock().unwrap().iter().filter_map(Weak::upgrade) {
+        for s in self.sockets.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade) {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
     }
@@ -4345,13 +4500,13 @@ impl Net {
             // 唤醒阻塞在 accept() 的宿主监听线程，避免 40ms 轮询且确保端口即时释放
             let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(100));
         }
-        for socket in self.sockets.lock().unwrap().drain(..).filter_map(|s| s.upgrade()) {
+        for socket in self.sockets.lock().unwrap_or_else(|e| e.into_inner()).drain(..).filter_map(|s| s.upgrade()) {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
         self.seeder_queue.shutdown();
         self.cursor_throttle.shutdown();
         self.finish_structure();
-        self.pending_sorts.lock().unwrap().clear();
+        self.pending_sorts.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let _ = self.cmd.send(Cmd::Stop);
     }
 }
@@ -4531,18 +4686,18 @@ fn host_initialized(
                 }
                 match cmd {
                     Cmd::Cells(ops) => {
-                        let senders = roster.lock().unwrap().all_senders();
+                        let senders = roster.lock().unwrap_or_else(|e| e.into_inner()).all_senders();
                         if !senders.is_empty() {
                             let shared: Vec<Arc<Op>> = ops.into_iter().map(Arc::new).collect();
                             shared_cell_frames_to_peers(&shared, &senders);
                         }
                     }
                     Cmd::SharedCells(ops) => {
-                        let senders = roster.lock().unwrap().all_senders();
+                        let senders = roster.lock().unwrap_or_else(|e| e.into_inner()).all_senders();
                         shared_cell_frames_to_peers(&ops, &senders);
                     }
                     Cmd::BroadcastMsg(msg) => {
-                        let senders = roster.lock().unwrap().all_senders();
+                        let senders = roster.lock().unwrap_or_else(|e| e.into_inner()).all_senders();
                         broadcast_msg_to(&senders, &msg);
                     }
                     Cmd::GuestStructure(..) | Cmd::Sort(..) | Cmd::PumpUpdate => {
@@ -4615,17 +4770,17 @@ fn host_initialized(
                         }
                     }
                     Cmd::Broadcast(s) => {
-                        let senders = roster.lock().unwrap().all_senders();
+                        let senders = roster.lock().unwrap_or_else(|e| e.into_inner()).all_senders();
                         broadcast_line_to(&senders, s);
                     }
                     Cmd::SendTo(target_site, s) => {
-                        let target = roster.lock().unwrap().sender_of(target_site);
+                        let target = roster.lock().unwrap_or_else(|e| e.into_inner()).sender_of(target_site);
                         if let Some(tx) = target {
                             let _ = tx.send(s);
                         }
                     }
                     Cmd::SendPrepared(target_site, prepared) => {
-                        let target = roster.lock().unwrap().sender_of(target_site);
+                        let target = roster.lock().unwrap_or_else(|e| e.into_inner()).sender_of(target_site);
                         if let Some(tx) = target {
                             let _ = tx.send_prepared(prepared);
                         }
@@ -4678,11 +4833,11 @@ fn host_initialized(
             if !alive.load(Ordering::SeqCst) {
                 break;
             }
-            let dead = locks.lock().unwrap().expire(now_ms());
+            let dead = locks.lock().unwrap_or_else(|e| e.into_inner()).expire(now_ms());
             if dead.is_empty() {
                 continue;
             }
-            let senders = roster.lock().unwrap().all_senders();
+            let senders = roster.lock().unwrap_or_else(|e| e.into_inner()).all_senders();
             for (sheet, row, col, site) in dead {
                 let line = serde_json::to_string(&Msg::LockRelease { site, sheet, row, col })
                     .unwrap();
@@ -4752,11 +4907,18 @@ fn host_initialized(
             drop(password);
             if initialized.recv().is_err() { return; }
             let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let preauth_per_ip = Arc::new(Mutex::new(HashMap::<std::net::IpAddr, usize>::new()));
             while alive.load(Ordering::SeqCst) {
-                let stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
+                let (stream, peer_addr) = match listener.accept() {
+                    Ok(pair) => pair,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
+                    Err(_) => {
+                        if !alive.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
                 };
                 if !alive.load(Ordering::SeqCst) {
                     drop(stream);
@@ -4764,6 +4926,11 @@ fn host_initialized(
                 }
                 // 连接数封顶：每条连接两个线程，局域网里的扫描器不能把宿主线程耗尽
                 let Some(slot) = ConnSlot::try_take(&active_conns) else {
+                    drop(stream);
+                    continue;
+                };
+                let Some(mut preauth_slot) = PreauthIpSlot::try_take(&preauth_per_ip, peer_addr.ip())
+                else {
                     drop(stream);
                     continue;
                 };
@@ -4815,8 +4982,10 @@ fn host_initialized(
                     };
                     let _ = write_raw.set_write_timeout(Some(Duration::from_secs(10)));
                     let mut write_half = BufWriter::with_capacity(128 * 1024, write_raw);
-                    // 未认证连接限时：建连后 10 秒内不完成 Hello 就断开
+                    // 未认证连接总截止时间：建连后 10 秒内必须完成 Hello，防慢速垃圾包重置读超时
+                    let preauth_deadline = std::time::Instant::now() + PREAUTH_TIMEOUT;
                     let _ = stream.set_read_timeout(Some(PREAUTH_TIMEOUT));
+                    let mut preauth_slot = Some(preauth_slot);
                     let mut salt = [0u8; 16];
                     let Ok(nonce) = getrandom::u64() else { return };
                     if getrandom::fill(&mut salt).is_err() {
@@ -4844,7 +5013,7 @@ fn host_initialized(
                     let write_out = output.clone();
                     std::thread::spawn(move || {
                         let send_line_opt = |s: String, flush: bool| -> bool {
-                            let mut out = write_out.lock().unwrap();
+                            let mut out = write_out.lock().unwrap_or_else(|e| e.into_inner());
                             if s == CTRL_ENABLE_BINARY_V3 {
                                 out.binary_v3 = true;
                                 return !flush || out.writer.flush().is_ok();
@@ -4869,7 +5038,7 @@ fn host_initialized(
                             let ok = match item {
                                 IntroFrame::Line(s) => send_line_opt(s, flush_now),
                                 IntroFrame::Compact(raw) => {
-                                    let mut out = write_out.lock().unwrap();
+                                    let mut out = write_out.lock().unwrap_or_else(|e| e.into_inner());
                                     out.write_compact_opt(&raw, flush_now).is_ok()
                                 }
                             };
@@ -4888,15 +5057,15 @@ fn host_initialized(
                                 while let Some(frame) = cur.take() {
                                     let peek = rx.try_recv().ok();
                                     let flush_now = peek.is_none()
-                                        && low_prio_q.0.lock().unwrap().0.is_empty();
+                                        && low_prio_q.0.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty();
                                     let ok = match frame {
                                         LiveFrame::Line(line) => send_line_opt(line, flush_now),
                                         LiveFrame::Compact(raw) => {
-                                            let mut out = write_out.lock().unwrap();
+                                            let mut out = write_out.lock().unwrap_or_else(|e| e.into_inner());
                                             out.write_compact_opt(&raw, flush_now).is_ok()
                                         }
                                         LiveFrame::Prepared(prepared) => {
-                                            let mut out = write_out.lock().unwrap();
+                                            let mut out = write_out.lock().unwrap_or_else(|e| e.into_inner());
                                             out.write_prepared_opt(&prepared, flush_now).is_ok()
                                         }
                                         LiveFrame::Correction(correction) => {
@@ -4925,7 +5094,7 @@ fn host_initialized(
                                     }
                                     let popped = {
                                         let (lock, cvar) = &*low_prio_q;
-                                        let mut g = lock.lock().unwrap();
+                                        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                                         let item = g.0.pop_front();
                                         let empty = g.0.is_empty();
                                         if item.is_some() {
@@ -4934,11 +5103,11 @@ fn host_initialized(
                                         (item, empty)
                                     };
                                     let (Some(slice), queue_empty) = popped else {
-                                        let _ = write_out.lock().unwrap().writer.flush();
+                                        let _ = write_out.lock().unwrap_or_else(|e| e.into_inner()).writer.flush();
                                         break;
                                     };
                                     let ok = {
-                                        let mut out = write_out.lock().unwrap();
+                                        let mut out = write_out.lock().unwrap_or_else(|e| e.into_inner());
                                         out.write_prepared_opt(&slice, queue_empty).is_ok()
                                     };
                                     if !ok {
@@ -4959,34 +5128,33 @@ fn host_initialized(
                         }
                         {
                             let (lock, cvar) = &*low_prio_q;
-                            let mut g = lock.lock().unwrap();
+                            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                             g.0.clear();
                             g.1 = true;
                             cvar.notify_all();
                         }
-                        let _ = write_out.lock().unwrap().writer.get_ref().shutdown(std::net::Shutdown::Both);
+                        let _ = write_out.lock().unwrap_or_else(|e| e.into_inner()).writer.get_ref().shutdown(std::net::Shutdown::Both);
                     });
 
                     let expire_and_broadcast = || {
-                        if locks.lock().unwrap().is_empty() {
+                        if lock_unpoison(&locks).is_empty() {
                             return;
                         }
-                        let dead = locks.lock().unwrap().expire(now_ms());
+                        let dead = lock_unpoison(&locks).expire(now_ms());
                         if dead.is_empty() {
                             return;
                         }
-                        let senders = roster.lock().unwrap().all_senders();
+                        let senders = lock_unpoison(&roster).all_senders();
                         for (sheet, row, col, lsite) in dead {
-                            let line = serde_json::to_string(&Msg::LockRelease {
-                                site: lsite,
-                                sheet,
-                                row,
-                                col,
-                            })
-                            .unwrap();
-                            for ptx in &senders {
-                                let _ = ptx.send(line.clone());
-                            }
+                            let _ = cmd.send(Cmd::Deliver(
+                                senders.clone(),
+                                RoomChange::Message(Msg::LockRelease {
+                                    site: lsite,
+                                    sheet,
+                                    row,
+                                    col,
+                                }),
+                            ));
                             let _ = evt_tx.send(NetEvent::LockRelease {
                                 site: lsite,
                                 sheet,
@@ -5001,7 +5169,7 @@ fn host_initialized(
                             host_max_clock.fetch_max(m, Ordering::AcqRel);
                         }
                         update_formula_keys_for_sort(&formula_keys, &batch.ops);
-                        let seq = host_watermark.lock().unwrap().record_sort(&batch);
+                        let seq = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).record_sort(&batch);
                         let site = batch.plan.site;
                         queue_room_change(&cmd,&roster,Some(site),RoomChange::Sort(batch.clone()));
                         let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(
@@ -5011,9 +5179,21 @@ fn host_initialized(
                     };
                     let mut fallback: Option<SortBatch> = None;
                     let mut hello_site: Option<u32> = None;
+                    let mut hello_conn_id: u64 = 0;
                     let mut reader = reader;
                     loop {
                         let allow_binary = hello_site.is_some();
+                        if !allow_binary {
+                            let Some(rem) =
+                                preauth_deadline.checked_duration_since(std::time::Instant::now())
+                            else {
+                                break;
+                            };
+                            if rem.is_zero() {
+                                break;
+                            }
+                            let _ = stream.set_read_timeout(Some(rem));
+                        }
                         let limit = if allow_binary { MAX_LINE } else { MAX_PREAUTH_LINE };
                         let Ok(Some(frame)) = read_wire_frame(&mut reader, limit, allow_binary) else { break };
                         let mut raw_json_line: Option<String> = None;
@@ -5050,7 +5230,7 @@ fn host_initialized(
                                         && to_s != host_site_id
                                         && bytes.len() <= 390_000
                                     {
-                                        if let Some(target_tx) = roster.lock().unwrap().sender_of(to_s)
+                                        if let Some(target_tx) = roster.lock().unwrap_or_else(|e| e.into_inner()).sender_of(to_s)
                                             && target_tx.is_compact_v3()
                                         {
                                             let _ = target_tx.send_update_slice(
@@ -5103,27 +5283,33 @@ fn host_initialized(
                                     ));
                                     break;
                                 }
-                                let order = room_order.lock().unwrap();
-                                let admitted = roster.lock().unwrap().admit(site, &name, &auth);
-                                let (canonical_name, known) = match admitted {
-                                    Ok(pair) => pair,
-                                    Err(reason) => {
-                                        let _ = tx.send(IntroFrame::Line(
-                                            serde_json::to_string(&Msg::Denied {
-                                                reason: reason.into(),
-                                            })
-                                            .unwrap(),
-                                        ));
-                                        break;
-                                    }
-                                };
+                                let order = lock_unpoison(&room_order);
+                                let admitted =
+                                    lock_unpoison(&roster).admit(site, &name, &auth, &stream);
+                                let (conn_id, canonical_name, known, evicted_stream) =
+                                    match admitted {
+                                        Ok(quad) => quad,
+                                        Err(reason) => {
+                                            let _ = tx.send(IntroFrame::Line(
+                                                serde_json::to_string(&Msg::Denied {
+                                                    reason: reason.into(),
+                                                })
+                                                .unwrap(),
+                                            ));
+                                            break;
+                                        }
+                                    };
+                                if let Some(stale) = evicted_stream {
+                                    let _ = stale.shutdown(std::net::Shutdown::Both);
+                                }
                                 hello_site = Some(site);
+                                hello_conn_id = conn_id;
                                 // 已认证成员可以长时间不说话（只看不改），取消认证前的读超时
                                 let _ = stream.set_read_timeout(None);
                                 let color = (site % 7) as u8;
-                                let hist = structs.lock().unwrap().clone();
+                                let hist = structs.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 let struct_rev = hist.len();
-                                let wm_snapshot = host_watermark.lock().unwrap().clone();
+                                let wm_snapshot = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 let current_wm = wm_snapshot.seq;
                                 let can_resume = !resume_room.is_empty()
                                     && resume_room == room_session_id
@@ -5163,7 +5349,7 @@ fn host_initialized(
                                     && !can_checkpoint_delta
                                     && !client_hash.is_empty()
                                     && hist.is_empty()
-                                    && *host_base_hash.lock().unwrap() == client_hash;
+                                    && *host_base_hash.lock().unwrap_or_else(|e| e.into_inner()) == client_hash;
                                 let is_wm_delta = can_resume || can_checkpoint_delta;
                                 let (delta_wm, delta_srev) = if can_resume {
                                     (resume_watermark, resume_struct_rev)
@@ -5178,39 +5364,55 @@ fn host_initialized(
                                 let base_arc = if is_delta {
                                     None
                                 } else {
-                                    host_baseline.lock().unwrap().clone()
+                                    host_baseline.lock().unwrap_or_else(|e| e.into_inner()).clone()
                                 };
                                 let ops_grid = if can_legacy_hash_delta {
-                                    delta_ops.lock().unwrap().clone()
+                                    delta_ops.lock().unwrap_or_else(|e| e.into_inner()).clone()
                                 } else {
-                                    state.lock().unwrap().clone()
+                                    state.lock().unwrap_or_else(|e| e.into_inner()).clone()
                                 };
                                 let styles_grid = if can_legacy_hash_delta {
-                                    delta_styles.lock().unwrap().clone()
+                                    delta_styles.lock().unwrap_or_else(|e| e.into_inner()).clone()
                                 } else {
-                                    styles.lock().unwrap().clone()
+                                    styles.lock().unwrap_or_else(|e| e.into_inner()).clone()
                                 };
                                 let host_clock = host_max_clock.load(Ordering::Acquire).max(1);
                                 let merges = if is_wm_delta {
                                     Vec::new()
                                 } else {
-                                    delta_merges.lock().unwrap().clone()
+                                    lock_unpoison(&delta_merges).clone()
                                 };
+                                let meta_items_snap = if is_wm_delta {
+                                    Vec::new()
+                                } else {
+                                    lock_unpoison(&meta_log).clone()
+                                };
+                                let known_ids_snap: Vec<(u32, sheetcore::audit::AuditAuthor)> =
+                                    lock_unpoison(&audit_ids)
+                                        .iter()
+                                        .map(|(&s, a)| (s, a.clone()))
+                                        .collect();
+                                let audit_sync_snap = lock_unpoison(&audit_sync).clone();
                                 expire_and_broadcast();
-                                let active_locks: Vec<(usize, u32, u32, u32, String)> = locks
-                                    .lock()
-                                    .unwrap()
-                                    .iter()
-                                    .map(|((sh, r, c), h)| (sh, r, c, h.site, h.name.clone()))
-                                    .collect();
+                                let active_locks: Vec<(usize, u32, u32, u32, String)> =
+                                    lock_unpoison(&locks)
+                                        .iter()
+                                        .map(|((sh, r, c), h)| (sh, r, c, h.site, h.name.clone()))
+                                        .collect();
                                 let active_cursors: Vec<Cursor> =
-                                    cursors.lock().unwrap().values().cloned().collect();
-                                let other_peers = roster.lock().unwrap().finish_admit(site, live_tx);
+                                    lock_unpoison(&cursors).values().cloned().collect();
+                                let other_peers = lock_unpoison(&roster).finish_admit(
+                                    site,
+                                    hello_conn_id,
+                                    live_tx,
+                                    &stream,
+                                );
                                 drop(order);
+                                preauth_slot.take();
 
                                 #[cfg(test)]
                                 {
-                                    let hook = after_snapshot.lock().unwrap().take();
+                                    let hook = after_snapshot.lock().unwrap_or_else(|e| e.into_inner()).take();
                                     if let Some(run) = hook { run(); }
                                 }
                                 let _ = tx.send(IntroFrame::Line(
@@ -5507,11 +5709,10 @@ fn host_initialized(
                                             .unwrap(),
                                         ));
                                     }
-                                    let meta_items = meta_log.lock().unwrap().clone();
-                                    if !meta_items.is_empty() {
+                                    if !meta_items_snap.is_empty() {
                                         let _ = tx.send(IntroFrame::Line(
                                             serde_json::to_string(&Msg::SheetMetaSnapshot {
-                                                items: meta_items,
+                                                items: meta_items_snap,
                                             })
                                             .unwrap(),
                                         ));
@@ -5573,13 +5774,7 @@ fn host_initialized(
                                 }
                                 // 补发房间内既有成员的已验证审计身份 + 当前最新防篡改审计日志
                                 {
-                                    let known_ids: Vec<(u32, sheetcore::audit::AuditAuthor)> = audit_ids
-                                        .lock()
-                                        .unwrap()
-                                        .iter()
-                                        .map(|(&s, a)| (s, a.clone()))
-                                        .collect();
-                                    for (psite, au) in known_ids {
+                                    for (psite, au) in known_ids_snap {
                                         let id_msg = Msg::AuditIdentity {
                                             site: psite,
                                             name: au.display_name,
@@ -5592,9 +5787,7 @@ fn host_initialized(
                                             let _ = tx.send(IntroFrame::Line(line));
                                         }
                                     }
-                                    if let Some((doc_id, head_seq, payload_b64)) =
-                                        audit_sync.lock().unwrap().clone()
-                                    {
+                                    if let Some((doc_id, head_seq, payload_b64)) = audit_sync_snap {
                                         let sync_msg = Msg::AuditSync {
                                             doc_id,
                                             head_seq,
@@ -5632,7 +5825,7 @@ fn host_initialized(
                                 let _ = ack_tx.send((first_ts,outcome));
                             }
                             Msg::SortRepairDone { first_ts } if can_sort.load(Ordering::Acquire) => {
-                                let _order = room_order.lock().unwrap();
+                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::SortRepairDone { first_ts })));
                             }
                             Msg::SortData { first_ts, items } if can_sort.load(Ordering::Acquire) => {
@@ -5656,13 +5849,13 @@ fn host_initialized(
                                 if batch.offer().digest != batch.plan.digest { break; }
                                 let batch = Arc::new(batch);
                                 for attempt in 0..3 {
-                                    let axis_snap = host_watermark.lock().unwrap().axis_styles_snapshot();
+                                    let axis_snap = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot();
                                     let current = RoomGrids::capture(&host_baseline,axis_snap,&state,&delta_ops,&styles,&delta_styles);
                                     let next = current.apply(&batch);
-                                    let _order = room_order.lock().unwrap();
-                                    let history = structs.lock().unwrap();
+                                    let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
+                                    let history = structs.lock().unwrap_or_else(|e| e.into_inner());
                                     let later = history.get(batch.plan.structural_revision..);
-                                    let leases = locks.lock().unwrap();
+                                    let leases = locks.lock().unwrap_or_else(|e| e.into_inner());
                                     let sheet = batch.plan.sheet;
                                     let allowed = later.is_some_and(|edits| edits.iter().all(|(s,_)| *s!=sheet))
                                         && leases.conflicts_rect(sheet,r1,c1,r2,c2,batch.plan.site,now_ms()).is_none();
@@ -5671,7 +5864,7 @@ fn host_initialized(
                                         break;
                                     }
                                     if !allowed || attempt == 2 {
-                                        let axis_now = host_watermark.lock().unwrap().axis_styles_snapshot();
+                                        let axis_now = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot();
                                         let correction = SortCorrection::capture(batch.clone(),&host_baseline,axis_now,&state,&styles,later.unwrap_or_default());
                                         let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Correction(correction)));
                                         break;
@@ -5679,35 +5872,35 @@ fn host_initialized(
                                 }
                             }
                             Msg::SortRepairRequest { sheet, first_ts, structural_revision, keys } if can_sort.load(Ordering::Acquire) => {
-                                let _order = room_order.lock().unwrap();
-                                let history = structs.lock().unwrap();
+                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
+                                let history = structs.lock().unwrap_or_else(|e| e.into_inner());
                                 let edits = history.get(structural_revision..).unwrap_or_default();
                                 if structural_revision > history.len() {
                                     let msg = Msg::StructureRevision { revision: history.len() };
                                     let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(msg)));
                                 }
-                                let base_arc = host_baseline.lock().unwrap().clone();
-                                let axis_snap = host_watermark.lock().unwrap().axis_styles_snapshot();
-                                let items = sort_repairs(base_arc.as_deref(),&axis_snap,&state.lock().unwrap(),&styles.lock().unwrap(),sheet,first_ts,keys,edits);
+                                let base_arc = host_baseline.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                let axis_snap = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot();
+                                let items = sort_repairs(base_arc.as_deref(),&axis_snap,&state.lock().unwrap_or_else(|e| e.into_inner()),&styles.lock().unwrap_or_else(|e| e.into_inner()),sheet,first_ts,keys,edits);
                                 let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::SortRepairs {sheet,first_ts,items})));
                             }
                             Msg::SortPermutation(plan) if can_sort.load(Ordering::Acquire) => {
                                 let Some(site) = hello_site else { break };
                                 if plan.site != site { break; }
                                 let (r1,c1,r2,c2) = plan.region;
-                                let axis_snap = host_watermark.lock().unwrap().axis_styles_snapshot();
+                                let axis_snap = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot();
                                 let current = RoomGrids::capture(&host_baseline,axis_snap,&state,&delta_ops,&styles,&delta_styles);
-                                let same_frame = structs.lock().unwrap().get(plan.structural_revision..)
+                                let same_frame = structs.lock().unwrap_or_else(|e| e.into_inner()).get(plan.structural_revision..)
                                     .is_some_and(|later| later.iter().all(|(s,_)| *s != plan.sheet));
-                                let permitted = same_frame && locks.lock().unwrap()
+                                let permitted = same_frame && locks.lock().unwrap_or_else(|e| e.into_inner())
                                     .conflicts_rect(plan.sheet,r1,c1,r2,c2,site,now_ms()).is_none();
                                 let candidate = permitted.then(|| current.expand(&plan)).flatten().map(Arc::new);
                                 let next = candidate.as_ref().map(|batch| current.apply(batch));
                                 #[cfg(test)]
-                                if let Some(hook) = before_sort_commit.lock().unwrap().take() { hook(); }
-                                let order = room_order.lock().unwrap();
-                                let history = structs.lock().unwrap();
-                                let leases = locks.lock().unwrap();
+                                if let Some(hook) = before_sort_commit.lock().unwrap_or_else(|e| e.into_inner()).take() { hook(); }
+                                let order = room_order.lock().unwrap_or_else(|e| e.into_inner());
+                                let history = structs.lock().unwrap_or_else(|e| e.into_inner());
+                                let leases = locks.lock().unwrap_or_else(|e| e.into_inner());
                                 let allowed = history.get(plan.structural_revision..)
                                     .is_some_and(|later| !later.iter().any(|(s,_)| *s==plan.sheet))
                                     && leases.conflicts_rect(plan.sheet,r1,c1,r2,c2,site,now_ms()).is_none();
@@ -5729,9 +5922,9 @@ fn host_initialized(
                                 drop(history);
                                 drop(order);
                                 #[cfg(test)]
-                                if let Some(hook) = before_sort_reply.lock().unwrap().take() { hook(); }
+                                if let Some(hook) = before_sort_reply.lock().unwrap_or_else(|e| e.into_inner()).take() { hook(); }
                                 let reply = serde_json::to_string(&Msg::SortReply { first_ts: plan.first_ts, outcome }).unwrap();
-                                let mut out = output.lock().unwrap();
+                                let mut out = output.lock().unwrap_or_else(|e| e.into_inner());
                                 if out.write_plain(&reply).is_err() { break; }
                             }
                             message @ (Msg::Op(_) | Msg::Ops { .. }) => {
@@ -5742,9 +5935,9 @@ fn host_initialized(
                                     _ => unreachable!(),
                                 };
                                 if ops.iter().any(|op| op.site != conn_site) { continue; }
-                                let _order = room_order.lock().unwrap();
+                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 expire_and_broadcast();
-                                let lt = locks.lock().unwrap();
+                                let lt = locks.lock().unwrap_or_else(|e| e.into_inner());
                                 if !lt.is_empty() {
                                     let now = now_ms();
                                     ops.retain(|op| {
@@ -5756,7 +5949,7 @@ fn host_initialized(
                                             revert_ops: vec![(op.row, op.col, prev)],
                                             revert_styles: Vec::new(), revert_merge: None,
                                         };
-                                        let _ = tx.send(serde_json::to_string(&deny).unwrap());
+                                        let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(deny)));
                                         false
                                     });
                                 }
@@ -5764,8 +5957,8 @@ fn host_initialized(
                                 if ops.is_empty() { continue; }
                                 let shared: Vec<Arc<Op>> = ops.iter().cloned().map(Arc::new).collect();
                                 update_host_shared_ops(&state, &delta_ops, &formula_keys, &host_max_clock, shared.iter().cloned());
-                                let seq = host_watermark.lock().unwrap().record_ops(shared.iter().map(Arc::as_ref));
-                                let struct_rev = structs.lock().unwrap().len();
+                                let seq = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).record_ops(shared.iter().map(Arc::as_ref));
+                                let struct_rev = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
                                 queue_room_change(&cmd, &roster, Some(conn_site), RoomChange::SharedCells(shared));
                                 emit_room_watermark(&cmd, &roster, seq, struct_rev);
                                 let _ = evt_tx.send(NetEvent::Ops(ops));
@@ -5775,12 +5968,17 @@ fn host_initialized(
                                 if c.site != conn_site {
                                     continue;
                                 }
+                                let _order = lock_unpoison(&room_order);
                                 c.site = conn_site;
                                 c.color = (conn_site % 7) as u8;
-                                c.name = roster.lock().unwrap().name_of(conn_site);
-                                cursors.lock().unwrap().insert(conn_site, c.clone());
-                                let others = roster.lock().unwrap().other_senders(Some(conn_site));
-                                broadcast_msg_to(&others, &Msg::CursorMsg(c.clone()));
+                                c.name = lock_unpoison(&roster).name_of(conn_site);
+                                lock_unpoison(&cursors).insert(conn_site, c.clone());
+                                queue_room_change(
+                                    &cmd,
+                                    &roster,
+                                    Some(conn_site),
+                                    RoomChange::Message(Msg::CursorMsg(c.clone())),
+                                );
                                 let _ = evt_tx.send_cursor(NetEvent::Cursor(c));
                             }
                             Msg::Rename { site, name } => {
@@ -5788,26 +5986,30 @@ fn host_initialized(
                                 if site != conn_site {
                                     continue;
                                 }
+                                let _order = lock_unpoison(&room_order);
                                 let (canonical, others) = {
-                                    let mut r = roster.lock().unwrap();
+                                    let mut r = lock_unpoison(&roster);
                                     let canonical = r.rename_member(conn_site, &name);
                                     let others = r.other_senders(Some(conn_site));
                                     (canonical, others)
                                 };
-                                locks.lock().unwrap().rename_site(conn_site, &canonical);
-                                if let Some(cur) = cursors.lock().unwrap().get_mut(&conn_site) {
+                                lock_unpoison(&locks).rename_site(conn_site, &canonical);
+                                if let Some(cur) = lock_unpoison(&cursors).get_mut(&conn_site) {
                                     cur.name = canonical.clone();
                                 }
-                                let line = serde_json::to_string(&Msg::Rename {
+                                let rename_msg = Msg::Rename {
                                     site: conn_site,
                                     name: canonical.clone(),
-                                })
-                                .unwrap();
-                                for ptx in others {
-                                    let _ = ptx.send(line.clone());
-                                }
+                                };
+                                let mut targets = others;
                                 if canonical != name {
-                                    let _ = tx.send(line);
+                                    targets.push(tx.clone());
+                                }
+                                if !targets.is_empty() {
+                                    let _ = cmd.send(Cmd::Deliver(
+                                        targets,
+                                        RoomChange::Message(rename_msg),
+                                    ));
                                 }
                                 let _ = evt_tx.send(NetEvent::PeerRenamed(conn_site, canonical));
                             }
@@ -5821,12 +6023,12 @@ fn host_initialized(
                                 if site != conn_site {
                                     continue;
                                 }
-                                let _order = room_order.lock().unwrap();
+                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 if revision.is_some_and(|rev| {
-                                    structs.lock().unwrap().get(rev..)
+                                    structs.lock().unwrap_or_else(|e| e.into_inner()).get(rev..)
                                         .is_none_or(|later| later.iter().any(|(s,_)| *s==sheet))
                                 }) {
-                                    let revision = structs.lock().unwrap().len();
+                                    let revision = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
                                     let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::StructureRevision { revision })));
                                     let msg = Msg::StructuralRejected { reason: "工作表结构已变更，请重新执行插删操作".into() };
                                     let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(msg)));
@@ -5844,25 +6046,26 @@ fn host_initialized(
                                         let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::StructuralRejected { reason })));
                                         continue;
                                     }
-                                    let deny = serde_json::to_string(&Msg::LockDeny {
-                                        site: conn_site,
-                                        sheet,
-                                        row,
-                                        col,
-                                        holder,
-                                        holder_name,
-                                    })
-                                    .unwrap();
-                                    let _ = tx.send(deny);
+                                    let _ = cmd.send(Cmd::Deliver(
+                                        vec![tx.clone()],
+                                        RoomChange::Message(Msg::LockDeny {
+                                            site: conn_site,
+                                            sheet,
+                                            row,
+                                            col,
+                                            holder,
+                                            holder_name,
+                                        }),
+                                    ));
                                     continue;
                                 }
-                                shift_state(&host_baseline, &formula_keys, &state, &delta_ops, &host_base_hash, &styles, &delta_styles, &locks, &cursors, &sheet_names.lock().unwrap(), sheet, &op);
+                                shift_state(&host_baseline, &formula_keys, &state, &delta_ops, &host_base_hash, &styles, &delta_styles, &locks, &cursors, &sheet_names.lock().unwrap_or_else(|e| e.into_inner()), sheet, &op);
                                 let struct_rev = {
-                                    let mut h = structs.lock().unwrap();
+                                    let mut h = structs.lock().unwrap_or_else(|e| e.into_inner());
                                     h.push((sheet, op.clone()));
                                     h.len()
                                 };
-                                let seq = host_watermark.lock().unwrap().shift_structural(sheet, &op);
+                                let seq = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).shift_structural(sheet, &op);
                                 queue_room_change(&cmd, &roster, revision.is_none().then_some(conn_site), RoomChange::Message(Msg::Structural {
                                     site: conn_site,
                                     sheet,
@@ -5880,11 +6083,11 @@ fn host_initialized(
                                 if site != conn_site {
                                     continue;
                                 }
-                                let _order = room_order.lock().unwrap();
+                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 expire_and_broadcast();
                                 let conflict = {
                                     let now = now_ms();
-                                    let lt = locks.lock().unwrap();
+                                    let lt = locks.lock().unwrap_or_else(|e| e.into_inner());
                                     if lt.is_empty()
                                         || (items.len() > lt.len().saturating_mul(4)
                                             && !lt.iter().any(|((sh, _, _), h)| {
@@ -5902,7 +6105,7 @@ fn host_initialized(
                                     }
                                 };
                                 if let Some((holder, holder_name, row, col)) = conflict {
-                                    let axis_snap = host_watermark.lock().unwrap().axis_styles_snapshot();
+                                    let axis_snap = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot();
                                     let revert_styles: Vec<_> = items
                                         .iter()
                                         .map(|(r, c, _)| {
@@ -5924,7 +6127,7 @@ fn host_initialized(
                                         holder, holder_name, sheet, row, col,
                                         revert_ops: Vec::new(), revert_styles, revert_merge: None,
                                     };
-                                    if !send_room_message(deny, MAX_PLAIN_LINE, |line| tx.send(line).is_ok(), || {}) { break; }
+                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(deny)));
                                     continue;
                                 }
                                 // 直接按调色板写入宿主共享样式并原样透传 `StylePaletteOp`，彻底消除 decode -> re-encode 与逐格哈希！
@@ -5933,7 +6136,7 @@ fn host_initialized(
                                     .lock()
                                     .unwrap()
                                     .record_style_coords(sheet, items.iter().map(|&(r, c, _)| (r, c)));
-                                let struct_rev = structs.lock().unwrap().len();
+                                let struct_rev = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
                                 let exclude = (!can_sort.load(Ordering::Acquire)).then_some(conn_site);
                                 let ev: Vec<(usize, u32, u32, sheetcore::style::CellStyle)> = items
                                     .iter()
@@ -5963,11 +6166,11 @@ fn host_initialized(
                                 if site != conn_site {
                                     continue;
                                 }
-                                let _order = room_order.lock().unwrap();
+                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 expire_and_broadcast();
                                 let conflict = {
                                     let now = now_ms();
-                                    let lt = locks.lock().unwrap();
+                                    let lt = locks.lock().unwrap_or_else(|e| e.into_inner());
                                     if lt.is_empty()
                                         || (items.len() > lt.len().saturating_mul(4)
                                             && !lt.iter().any(|((sh, _, _), h)| {
@@ -5985,7 +6188,7 @@ fn host_initialized(
                                     }
                                 };
                                 if let Some((holder, holder_name, row, col)) = conflict {
-                                    let axis_snap = host_watermark.lock().unwrap().axis_styles_snapshot();
+                                    let axis_snap = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).axis_styles_snapshot();
                                     let revert_styles: Vec<_> = items
                                         .iter()
                                         .map(|(r, c, _)| {
@@ -6009,12 +6212,12 @@ fn host_initialized(
                                         holder, holder_name, sheet, row, col,
                                         revert_ops: Vec::new(), revert_styles, revert_merge: None,
                                     };
-                                    if !send_room_message(deny, MAX_PLAIN_LINE, |line| tx.send(line).is_ok(), || {}) { break; }
+                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(deny)));
                                     continue;
                                 }
                                 update_host_styles(&styles, &delta_styles, sheet, &items);
-                                let seq = host_watermark.lock().unwrap().record_styles(sheet, &items);
-                                let struct_rev = structs.lock().unwrap().len();
+                                let seq = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).record_styles(sheet, &items);
+                                let struct_rev = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
                                 let exclude = (!can_sort.load(Ordering::Acquire)).then_some(conn_site);
                                 let fwd_msg = if items.len() > 1 {
                                     let (palette, encoded) = sheetcore::sync::encode_style_palette(&items);
@@ -6048,11 +6251,11 @@ fn host_initialized(
                                 if site != conn_site || patch.is_empty() {
                                     continue;
                                 }
-                                let _order = room_order.lock().unwrap();
+                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 expire_and_broadcast();
                                 let conflict = {
                                     let now = now_ms();
-                                    let lt = locks.lock().unwrap();
+                                    let lt = locks.lock().unwrap_or_else(|e| e.into_inner());
                                     lt.iter().find_map(|((sh, r, c), h)| {
                                         if sh != sheet
                                             || h.site == conn_site
@@ -6066,22 +6269,23 @@ fn host_initialized(
                                     })
                                 };
                                 if let Some((holder, holder_name, row, col)) = conflict {
-                                    let deny = serde_json::to_string(&Msg::WriteDeny {
-                                        holder,
-                                        holder_name,
-                                        sheet,
-                                        row,
-                                        col,
-                                        revert_ops: Vec::new(),
-                                        revert_styles: Vec::new(),
-                                        revert_merge: None,
-                                    })
-                                    .unwrap();
-                                    let _ = tx.send(deny);
+                                    let _ = cmd.send(Cmd::Deliver(
+                                        vec![tx.clone()],
+                                        RoomChange::Message(Msg::WriteDeny {
+                                            holder,
+                                            holder_name,
+                                            sheet,
+                                            row,
+                                            col,
+                                            revert_ops: Vec::new(),
+                                            revert_styles: Vec::new(),
+                                            revert_merge: None,
+                                        }),
+                                    ));
                                     continue;
                                 }
-                                let seq = host_watermark.lock().unwrap().record_axis(sheet, &patch);
-                                let struct_rev = structs.lock().unwrap().len();
+                                let seq = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).record_axis(sheet, &patch);
+                                let struct_rev = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
                                 let exclude = (!can_sort.load(Ordering::Acquire)).then_some(conn_site);
                                 queue_room_change(
                                     &cmd,
@@ -6107,7 +6311,7 @@ fn host_initialized(
                                 if site != conn_site {
                                     continue;
                                 }
-                                let _order = room_order.lock().unwrap();
+                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 expire_and_broadcast();
                                 let conflict = locks
                                     .lock()
@@ -6115,26 +6319,27 @@ fn host_initialized(
                                     .conflicts_rect(sheet, r1, c1, r2, c2, conn_site, now_ms())
                                     .map(|((r, c), h)| (h.site, h.name.clone(), r, c));
                                 if let Some((holder, holder_name, row, col)) = conflict {
-                                    let deny = serde_json::to_string(&Msg::WriteDeny {
-                                        holder,
-                                        holder_name,
-                                        sheet,
-                                        row,
-                                        col,
-                                        revert_ops: Vec::new(),
-                                        revert_styles: Vec::new(),
-                                        revert_merge: Some((r1, c1, r2, c2, !on)),
-                                    })
-                                    .unwrap();
-                                    let _ = tx.send(deny);
+                                    let _ = cmd.send(Cmd::Deliver(
+                                        vec![tx.clone()],
+                                        RoomChange::Message(Msg::WriteDeny {
+                                            holder,
+                                            holder_name,
+                                            sheet,
+                                            row,
+                                            col,
+                                            revert_ops: Vec::new(),
+                                            revert_styles: Vec::new(),
+                                            revert_merge: Some((r1, c1, r2, c2, !on)),
+                                        }),
+                                    ));
                                     continue;
                                 }
-                                delta_merges.lock().unwrap().push((sheet, r1, c1, r2, c2, on));
+                                delta_merges.lock().unwrap_or_else(|e| e.into_inner()).push((sheet, r1, c1, r2, c2, on));
                                 let seq = host_watermark
                                     .lock()
                                     .unwrap()
                                     .record_merge(sheet, (r1, c1, r2, c2), on);
-                                let struct_rev = structs.lock().unwrap().len();
+                                let struct_rev = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
                                 queue_room_change(&cmd, &roster, Some(conn_site), RoomChange::Message(Msg::MergeOp {
                                     site: conn_site,
                                     sheet,
@@ -6158,9 +6363,9 @@ fn host_initialized(
                                 if site != conn_site || !kind.valid(sheet) {
                                     continue;
                                 }
-                                let _order = room_order.lock().unwrap();
+                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 {
-                                    let mut g = meta_log.lock().unwrap();
+                                    let mut g = meta_log.lock().unwrap_or_else(|e| e.into_inner());
                                     if g.len() >= 10_000 {
                                         g.remove(0);
                                     }
@@ -6170,7 +6375,7 @@ fn host_initialized(
                                     .lock()
                                     .unwrap()
                                     .record_sheet_meta(sheet, kind.clone());
-                                let struct_rev = structs.lock().unwrap().len();
+                                let struct_rev = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
                                 queue_room_change(
                                     &cmd,
                                     &roster,
@@ -6195,11 +6400,11 @@ fn host_initialized(
                                 if site != conn_site {
                                     continue;
                                 }
-                                let _order = room_order.lock().unwrap();
+                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
                                 expire_and_broadcast();
-                                let auth_name = roster.lock().unwrap().name_of(conn_site);
+                                let auth_name = roster.lock().unwrap_or_else(|e| e.into_inner()).name_of(conn_site);
                                 let (outcome, evicted) = {
-                                    let mut lt = locks.lock().unwrap();
+                                    let mut lt = locks.lock().unwrap_or_else(|e| e.into_inner());
                                     let outcome = lt.request(
                                         sheet,
                                         row,
@@ -6215,18 +6420,17 @@ fn host_initialized(
                                     (outcome, evicted)
                                 };
                                 if !evicted.is_empty() {
-                                    let all = roster.lock().unwrap().all_senders();
+                                    let all = lock_unpoison(&roster).all_senders();
                                     for (psh, pr, pc) in evicted {
-                                        let rel = serde_json::to_string(&Msg::LockRelease {
-                                            site: conn_site,
-                                            sheet: psh,
-                                            row: pr,
-                                            col: pc,
-                                        })
-                                        .unwrap();
-                                        for ptx in &all {
-                                            let _ = ptx.send(rel.clone());
-                                        }
+                                        let _ = cmd.send(Cmd::Deliver(
+                                            all.clone(),
+                                            RoomChange::Message(Msg::LockRelease {
+                                                site: conn_site,
+                                                sheet: psh,
+                                                row: pr,
+                                                col: pc,
+                                            }),
+                                        ));
                                         let _ = evt_tx.send(NetEvent::LockRelease {
                                             site: conn_site,
                                             sheet: psh,
@@ -6237,32 +6441,32 @@ fn host_initialized(
                                 }
                                 match outcome {
                                     sheetcore::sync::LockOutcome::Denied { holder, name: hn } => {
-                                        let line = serde_json::to_string(&Msg::LockDeny {
-                                            site: conn_site,
-                                            sheet,
-                                            row,
-                                            col,
-                                            holder,
-                                            holder_name: hn,
-                                        })
-                                        .unwrap();
-                                        let _ = tx.send(line);
+                                        let _ = cmd.send(Cmd::Deliver(
+                                            vec![tx.clone()],
+                                            RoomChange::Message(Msg::LockDeny {
+                                                site: conn_site,
+                                                sheet,
+                                                row,
+                                                col,
+                                                holder,
+                                                holder_name: hn,
+                                            }),
+                                        ));
                                     }
                                     _ => {
-                                        let line = serde_json::to_string(&Msg::LockOk {
-                                            site: conn_site,
-                                            name: auth_name.clone(),
-                                            sheet,
-                                            row,
-                                            col,
-                                        })
-                                        .unwrap();
-                                        let others =
-                                            roster.lock().unwrap().other_senders(Some(conn_site));
-                                        for ptx in others {
-                                            let _ = ptx.send(line.clone());
-                                        }
-                                        let _ = tx.send(line);
+                                        let mut targets =
+                                            lock_unpoison(&roster).other_senders(Some(conn_site));
+                                        targets.push(tx.clone());
+                                        let _ = cmd.send(Cmd::Deliver(
+                                            targets,
+                                            RoomChange::Message(Msg::LockOk {
+                                                site: conn_site,
+                                                name: auth_name.clone(),
+                                                sheet,
+                                                row,
+                                                col,
+                                            }),
+                                        ));
                                         let _ = evt_tx.send(NetEvent::LockOk {
                                             site: conn_site,
                                             name: auth_name,
@@ -6279,20 +6483,20 @@ fn host_initialized(
                                 if site != conn_site {
                                     continue;
                                 }
-                                let ok = locks.lock().unwrap().release(sheet, row, col, conn_site);
+                                let _order = lock_unpoison(&room_order);
+                                let ok = lock_unpoison(&locks).release(sheet, row, col, conn_site);
                                 if ok {
-                                    let line = serde_json::to_string(&Msg::LockRelease {
-                                        site: conn_site,
-                                        sheet,
-                                        row,
-                                        col,
-                                    })
-                                    .unwrap();
-                                    let others =
-                                        roster.lock().unwrap().other_senders(Some(conn_site));
-                                    for ptx in others {
-                                        let _ = ptx.send(line.clone());
-                                    }
+                                    queue_room_change(
+                                        &cmd,
+                                        &roster,
+                                        Some(conn_site),
+                                        RoomChange::Message(Msg::LockRelease {
+                                            site: conn_site,
+                                            sheet,
+                                            row,
+                                            col,
+                                        }),
+                                    );
                                     let _ = evt_tx.send(NetEvent::LockRelease {
                                         site: conn_site,
                                         sheet,
@@ -6306,7 +6510,7 @@ fn host_initialized(
                                 if site != conn_site {
                                     continue;
                                 }
-                                let who = roster.lock().unwrap().name_of(conn_site);
+                                let who = roster.lock().unwrap_or_else(|e| e.into_inner()).name_of(conn_site);
                                 let _ = evt_tx.send(NetEvent::SaveRequested {
                                     site: conn_site,
                                     name: who,
@@ -6337,7 +6541,7 @@ fn host_initialized(
                                     continue;
                                 }
                                 let (who, others) = {
-                                    let r = roster.lock().unwrap();
+                                    let r = roster.lock().unwrap_or_else(|e| e.into_inner());
                                     (r.name_of(conn_site), r.other_senders(Some(conn_site)))
                                 };
                                 let fwd = serde_json::to_string(&Msg::UpdateAnnounce {
@@ -6385,7 +6589,7 @@ fn host_initialized(
                                         }),
                                     });
                                 } else if let Some(target_tx) =
-                                    roster.lock().unwrap().sender_of(to_site)
+                                    roster.lock().unwrap_or_else(|e| e.into_inner()).sender_of(to_site)
                                 {
                                     if let Ok(fwd) = serde_json::to_string(&Msg::UpdatePull {
                                         from_site: conn_site,
@@ -6423,7 +6627,7 @@ fn host_initialized(
                                         done,
                                     );
                                 } else if let Some(target_tx) =
-                                    roster.lock().unwrap().sender_of(to_site)
+                                    roster.lock().unwrap_or_else(|e| e.into_inner()).sender_of(to_site)
                                 {
                                     let target_compact = target_tx.is_compact_v3();
                                     if !target_compact
@@ -6482,14 +6686,14 @@ fn host_initialized(
                                 ) {
                                     continue;
                                 }
-                                let canonical = roster.lock().unwrap().name_of(conn_site);
+                                let canonical = roster.lock().unwrap_or_else(|e| e.into_inner()).name_of(conn_site);
                                 let author = sheetcore::audit::AuditAuthor {
                                     display_name: if canonical.is_empty() { name.clone() } else { canonical },
                                     os_user: os_user.clone(),
                                     machine: machine.clone(),
                                     pubkey_hex: pubkey_hex.clone(),
                                 };
-                                audit_ids.lock().unwrap().insert(conn_site, author.clone());
+                                audit_ids.lock().unwrap_or_else(|e| e.into_inner()).insert(conn_site, author.clone());
                                 let _ = evt_tx.send(NetEvent::PeerAuditIdentity {
                                     site: conn_site,
                                     author: author.clone(),
@@ -6503,7 +6707,7 @@ fn host_initialized(
                                     sig_hex,
                                 })
                                 .unwrap();
-                                let others = roster.lock().unwrap().other_senders(Some(conn_site));
+                                let others = roster.lock().unwrap_or_else(|e| e.into_inner()).other_senders(Some(conn_site));
                                 broadcast_line_to(&others, fwd);
                             }
                             Msg::AuditAttest {
@@ -6552,33 +6756,42 @@ fn host_initialized(
                     }
                     drop(ack_tx); // Wake this socket's writer even if its sort never got a reply.
                     if let Some(site) = hello_site {
-                        let remaining = roster.lock().unwrap().remove_member(site);
-                        cursors.lock().unwrap().remove(&site);
-                        audit_ids.lock().unwrap().remove(&site);
-                        // 人走了，锁必须放掉并通知宿主与其他全部客户端，绝不残留幽灵锁或幽灵光标
-                        let mine: Vec<(usize, u32, u32)> = locks
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .filter(|(_, h)| h.site == site)
-                            .map(|(k, _)| k)
-                            .collect();
-                        for (sheet, row, col) in mine {
-                            locks.lock().unwrap().release(sheet, row, col, site);
-                            let line = serde_json::to_string(&Msg::LockRelease {
-                                site, sheet, row, col,
-                            })
-                            .unwrap();
-                            for ptx in &remaining {
-                                let _ = ptx.send(line.clone());
+                        let _order = lock_unpoison(&room_order);
+                        if let Some(remaining) =
+                            lock_unpoison(&roster).remove_member(site, hello_conn_id)
+                        {
+                            lock_unpoison(&cursors).remove(&site);
+                            lock_unpoison(&audit_ids).remove(&site);
+                            // 人走了，锁必须放掉并通知宿主与其他全部客户端，绝不残留幽灵锁或幽灵光标
+                            let mine: Vec<(usize, u32, u32)> = lock_unpoison(&locks)
+                                .iter()
+                                .filter(|(_, h)| h.site == site)
+                                .map(|(k, _)| k)
+                                .collect();
+                            for (sheet, row, col) in mine {
+                                lock_unpoison(&locks).release(sheet, row, col, site);
+                                let _ = cmd.send(Cmd::Deliver(
+                                    remaining.clone(),
+                                    RoomChange::Message(Msg::LockRelease {
+                                        site,
+                                        sheet,
+                                        row,
+                                        col,
+                                    }),
+                                ));
+                                let _ = evt_tx.send(NetEvent::LockRelease {
+                                    site,
+                                    sheet,
+                                    row,
+                                    col,
+                                });
                             }
-                            let _ = evt_tx.send(NetEvent::LockRelease { site, sheet, row, col });
+                            let _ = cmd.send(Cmd::Deliver(
+                                remaining,
+                                RoomChange::Message(Msg::Bye { site }),
+                            ));
+                            let _ = evt_tx.send(NetEvent::PeerLeft(site));
                         }
-                        let bye = serde_json::to_string(&Msg::Bye { site }).unwrap();
-                        for ptx in &remaining {
-                            let _ = ptx.send(bye.clone());
-                        }
-                        let _ = evt_tx.send(NetEvent::PeerLeft(site));
                     }
                 });
             }
@@ -7072,11 +7285,11 @@ fn join_session(
                 while let Some(cmd) = cur.take() {
                     let peek = cmd_rx.try_recv().ok();
                     let flush_now = peek.is_none()
-                        && guest_low_prio_for_writer.0.lock().unwrap().0.is_empty();
+                        && guest_low_prio_for_writer.0.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty();
                     match cmd {
                         Cmd::Cells(ops) => {
-                            let mut session = send_sess.lock().unwrap();
-                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            let mut session = send_sess.lock().unwrap_or_else(|e| e.into_inner());
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut()) {
                                 let batch = gs.batch_ops;
                                 cell_frames_msg(ops, true, batch, |msg| {
                                     let _ = gs.write_msg_opt(w, &msg, false);
@@ -7087,20 +7300,20 @@ fn join_session(
                             }
                         }
                         Cmd::SharedCells(ops) => {
-                            let mut session = send_sess.lock().unwrap();
-                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            let mut session = send_sess.lock().unwrap_or_else(|e| e.into_inner());
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut()) {
                                 send_guest_shared_ops(gs, w, &ops);
                             }
                         }
                         Cmd::BroadcastMsg(msg) => {
-                            let mut session = send_sess.lock().unwrap();
-                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            let mut session = send_sess.lock().unwrap_or_else(|e| e.into_inner());
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut()) {
                                 let _ = gs.write_msg_opt(w, &msg, flush_now);
                             }
                         }
                         Cmd::Style(msg) => {
-                            let mut session = send_sess.lock().unwrap();
-                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            let mut session = send_sess.lock().unwrap_or_else(|e| e.into_inner());
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut()) {
                                 let mut handled_compact = false;
                                 if gs.binary_v3
                                     && gs.compact_v3
@@ -7153,24 +7366,24 @@ fn join_session(
                             }
                         }
                         Cmd::Sort(generation,batch) => {
-                            let current = send_sess.lock().unwrap().as_ref()
+                            let current = send_sess.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
                                 .filter(|_| writer_generation.load(Ordering::Acquire) == generation)
                                 .map(|gs| (gs.batch_ops, gs.sort_permutation, gs.acks.clone()));
                             if let Some((batched, capable, acks)) = current {
-                                let ok = send_sort(&batch, capable, true, batched, &acks.lock().unwrap(), |line| {
-                                    let mut session = send_sess.lock().unwrap();
-                                    let mut writer = writer.lock().unwrap();
+                                let ok = send_sort(&batch, capable, true, batched, &acks.lock().unwrap_or_else(|e| e.into_inner()), |line| {
+                                    let mut session = send_sess.lock().unwrap_or_else(|e| e.into_inner());
+                                    let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
                                     let (Some(gs), Some(w)) = (session.as_mut(), writer.as_mut()) else { return false };
                                     Arc::ptr_eq(&gs.acks, &acks) && gs.write_plain(w, &line).is_ok()
                                 });
-                                if ok && !capable { pending_for_writer.lock().unwrap().remove(&batch.plan.first_ts); }
-                                if !ok && send_sess.lock().unwrap().as_ref().is_some_and(|gs| Arc::ptr_eq(&gs.acks, &acks))
-                                    && let Some(w) = writer.lock().unwrap().as_ref() { let _ = w.get_ref().shutdown(std::net::Shutdown::Both); }
+                                if ok && !capable { pending_for_writer.lock().unwrap_or_else(|e| e.into_inner()).remove(&batch.plan.first_ts); }
+                                if !ok && send_sess.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|gs| Arc::ptr_eq(&gs.acks, &acks))
+                                    && let Some(w) = writer.lock().unwrap_or_else(|e| e.into_inner()).as_ref() { let _ = w.get_ref().shutdown(std::net::Shutdown::Both); }
                             }
                         }
                         Cmd::GuestStructure(generation,msg) => {
-                            let mut session = send_sess.lock().unwrap();
-                            let mut writer = writer.lock().unwrap();
+                            let mut session = send_sess.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
                             if writer_generation.load(Ordering::Acquire) == generation
                                 && let (Some(gs), Some(w)) = (session.as_mut(), writer.as_mut()) {
                                 let result = gs.write_plain(w, &serde_json::to_string(&msg).unwrap());
@@ -7179,14 +7392,14 @@ fn join_session(
                         }
                         Cmd::Deliver(_, _) => unreachable!("room dispatch is host-only"),
                         Cmd::Broadcast(s) | Cmd::SendTo(_, s) => {
-                            let mut session = send_sess.lock().unwrap();
-                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            let mut session = send_sess.lock().unwrap_or_else(|e| e.into_inner());
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut()) {
                                 let _ = gs.write_plain_opt(w, &s, flush_now);
                             }
                         }
                         Cmd::SendPrepared(_, prepared) => {
-                            let mut session = send_sess.lock().unwrap();
-                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                            let mut session = send_sess.lock().unwrap_or_else(|e| e.into_inner());
+                            if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut()) {
                                 let _ = gs.write_prepared_opt(w, &prepared, flush_now);
                             }
                         }
@@ -7209,7 +7422,7 @@ fn join_session(
                     }
                     let popped = {
                         let (lock, cvar) = &*guest_low_prio_for_writer;
-                        let mut g = lock.lock().unwrap();
+                        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                         let item = g.0.pop_front();
                         let empty = g.0.is_empty();
                         if item.is_some() {
@@ -7218,18 +7431,18 @@ fn join_session(
                         (item, empty)
                     };
                     let (Some(slice), queue_empty) = popped else {
-                        if let Some(w) = writer.lock().unwrap().as_mut() {
+                        if let Some(w) = writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                             let _ = w.flush();
                         }
                         break;
                     };
                     {
-                        let mut session = send_sess.lock().unwrap();
-                        if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap().as_mut()) {
+                        let mut session = send_sess.lock().unwrap_or_else(|e| e.into_inner());
+                        if let (Some(gs), Some(w)) = (session.as_mut(), writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut()) {
                             let _ = gs.write_prepared_opt(w, &slice, queue_empty);
                         } else {
                             let (lock, cvar) = &*guest_low_prio_for_writer;
-                            let mut g = lock.lock().unwrap();
+                            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                             g.0.clear();
                             cvar.notify_all();
                             break;
@@ -7244,7 +7457,7 @@ fn join_session(
                 }
             }
             let (lock, cvar) = &*guest_low_prio_for_writer;
-            let mut g = lock.lock().unwrap();
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
             g.0.clear();
             g.1 = true;
             cvar.notify_all();
@@ -7313,6 +7526,7 @@ fn join_session(
                 loop {
                     let allow_binary = got_welcome && recv_sess.is_some();
                     let Ok(Some(frame)) = read_wire_frame(&mut reader, MAX_LINE, allow_binary) else { break };
+                    let mut plaintext_denied = false;
                     let msg: Option<Msg> = match frame {
                         WireFrame::Binary(body) => {
                             let Some(se) = recv_sess.as_mut() else { break };
@@ -7331,25 +7545,38 @@ fn join_session(
                                 match se.open(&line) {
                                     Some(plain) => serde_json::from_str::<Msg>(&plain).ok(),
                                     None => match serde_json::from_str::<Msg>(&line) {
-                                        Ok(msg @ Msg::Denied { .. }) if !got_welcome => Some(msg),
+                                        Ok(msg @ Msg::Denied { .. }) if !got_welcome => {
+                                            plaintext_denied = true;
+                                            Some(msg)
+                                        }
                                         _ => break,
                                     },
                                 }
                             } else {
                                 match serde_json::from_str::<Msg>(&line) {
-                                    Ok(msg @ (Msg::ChallengeSalt { .. } | Msg::Challenge { .. } | Msg::Denied { .. })) => Some(msg),
+                                    Ok(msg @ (Msg::ChallengeSalt { .. } | Msg::Challenge { .. })) => Some(msg),
                                     _ => break,
                                 }
                             }
                         }
                     };
-                    let msg = match msg {
+                    let mut msg = match msg {
                         Some(m) => m,
                         // 入房后认不出的报文（例如更新版本宿主的新消息类型）跳过即可，
                         // 断开只会换来无限重连；握手阶段认不出才断开
                         None if got_welcome => continue,
                         None => break,
                     };
+                    // 初始快照分片按条过滤越界坐标，避免单条越界记录吞掉 SnapshotChunk{last:true}/Snapshot 导致永远不触发 SnapshotDone
+                    match &mut msg {
+                        Msg::SnapshotChunk { ops, .. } | Msg::Snapshot { ops } => {
+                            ops.retain(|o| {
+                                o.row < sheetcore::sync::MAX_ROWS
+                                    && o.col < sheetcore::sync::MAX_COLS
+                            });
+                        }
+                        _ => {}
+                    }
                     if !msg.is_within_limits() {
                         continue;
                     }
@@ -7379,7 +7606,7 @@ fn join_session(
                             let client_sess = sheetcore::wire::Session::client_side(&room_key, &raw);
                             let mut sender_sess = client_sess.fork_sender();
                             recv_sess = Some(client_sess);
-                            if !pending_sorts.lock().unwrap().is_empty()
+                            if !pending_sorts.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
                                 || pending_structure_for_reader.load(Ordering::Acquire)
                                 || unconfirmed_styles_for_reader.swap(0, Ordering::AcqRel) > 0
                             {
@@ -7446,12 +7673,12 @@ fn join_session(
                             got_welcome = true;
                             in_initial_snapshot = true;
                             pending_snap_ops.clear();
-                            *ready_snapshot_for_reader.lock().unwrap() = None;
+                            *ready_snapshot_for_reader.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             snap_builder = (!delta_sync
                                 && fast_handoff_for_reader.load(Ordering::Acquire))
                             .then(|| {
                                 PreparedGuestSnapshotBuilder::new(
-                                    seed_styles_for_reader.lock().unwrap().clone(),
+                                    seed_styles_for_reader.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                                 )
                             });
                             conn_room_id = room_id;
@@ -7462,7 +7689,7 @@ fn join_session(
                                 resume_state = None;
                             }
                             if let Some(se) = pending_sender.take() {
-                                *send_sess.lock().unwrap() = Some(GuestSend {
+                                *send_sess.lock().unwrap_or_else(|e| e.into_inner()) = Some(GuestSend {
                                     sess: se,
                                     batch_ops,
                                     sort_permutation,
@@ -7474,13 +7701,17 @@ fn join_session(
                             }
                             if let Ok(clone) = connected.try_clone() {
                                 let _ = clone.set_write_timeout(Some(Duration::from_secs(10)));
-                                *writer.lock().unwrap() = Some(BufWriter::with_capacity(128 * 1024, clone));
+                                *writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(BufWriter::with_capacity(128 * 1024, clone));
                             }
                             connected_flag.store(true, Ordering::SeqCst);
                             let _ = evt_tx.send(NetEvent::Connected);
                             let _ = evt_tx.send(NetEvent::Welcome { peers, delta_sync, clock });
                         }
                         Msg::Denied { reason } => {
+                            if plaintext_denied && synced_once {
+                                // 已认证会话断线重连期间收到未认证明文 Denied（可能是中间人伪造）：按断线退避重试，不永久终止重连
+                                break;
+                            }
                             let _ = evt_tx.send(NetEvent::Denied(reason));
                             denied = true;
                             break;
@@ -7488,7 +7719,7 @@ fn join_session(
                         Msg::SortReply { first_ts, outcome } => { let _ = sort_ack.send((first_ts,outcome)); }
                         Msg::SortRepairDone { first_ts } => { let _ = evt_tx.send(NetEvent::SortRepairDone(first_ts)); }
                         Msg::SortCommitted { first_ts } => {
-                            if let Some(batch) = pending_sorts.lock().unwrap().remove(&first_ts) {
+                            if let Some(batch) = pending_sorts.lock().unwrap_or_else(|e| e.into_inner()).remove(&first_ts) {
                                 if !batch.styles.is_empty() { let _ = evt_tx.send(NetEvent::CommittedSortStyles(batch)); }
                             }
                         }
@@ -7496,7 +7727,7 @@ fn join_session(
                             let _ = evt_tx.send(NetEvent::SortRepairs { sheet,first_ts,items });
                         }
                         Msg::SortPermutation(plan) => {
-                            if active_vote.upgrade().is_some_and(|v| v.lock().unwrap().is_some()) { break; }
+                            if active_vote.upgrade().is_some_and(|v| v.lock().unwrap_or_else(|e| e.into_inner()).is_some()) { break; }
                             let first_ts = plan.first_ts;
                             let (tx,rx) = channel();
                             let vote = SortVote { sender: Arc::new(Mutex::new(Some(tx))), connection: Arc::downgrade(&connection) };
@@ -7515,7 +7746,7 @@ fn join_session(
                                 // The one-shot vote prevents late work from applying twice.
                                 let accepted = SortVote::wait(rx,deadline_vote,Duration::from_secs(15));
                                 if connected_to_offer.upgrade().is_none() { return; }
-                                let mut session = session.lock().unwrap();
+                                let mut session = session.lock().unwrap_or_else(|e| e.into_inner());
                                 let Some(gs) = session.as_mut() else { return };
                                 if !gs.sort_permutation || !Arc::ptr_eq(&gs.acks, &current_replies) { return; }
                                 let outcome = if accepted { SortResponse::Accepted } else { SortResponse::NeedCells };
@@ -7542,7 +7773,7 @@ fn join_session(
                                 if last {
                                     in_initial_snapshot = false;
                                     if let Some(b) = snap_builder.take() {
-                                        *ready_snapshot_for_reader.lock().unwrap() =
+                                        *ready_snapshot_for_reader.lock().unwrap_or_else(|e| e.into_inner()) =
                                             Some(b.finish());
                                     } else if !pending_snap_ops.is_empty() {
                                         let _ = evt_tx.send(NetEvent::Ops(std::mem::take(
@@ -7582,7 +7813,7 @@ fn join_session(
                                 if !ops.is_empty() {
                                     b.apply_ops(ops);
                                 }
-                                *ready_snapshot_for_reader.lock().unwrap() = Some(b.finish());
+                                *ready_snapshot_for_reader.lock().unwrap_or_else(|e| e.into_inner()) = Some(b.finish());
                             } else {
                                 if !ops.is_empty() {
                                     pending_snap_ops.extend(ops);
@@ -7868,7 +8099,7 @@ fn join_session(
                                     use_compact_bin,
                                     send_slice: Box::new(move |payload| {
                                         let (lock, cvar) = &*low_q;
-                                        let mut g = lock.lock().unwrap();
+                                        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                                         while g.0.len() >= LOW_PRIO_UPDATE_CAP && !g.1 {
                                             g = cvar.wait(g).unwrap();
                                         }
@@ -7943,21 +8174,21 @@ fn join_session(
                 }
                 drop(connection);
                 if let Some(vote) = active_vote.upgrade() {
-                    vote.lock().unwrap().take();
+                    vote.lock().unwrap_or_else(|e| e.into_inner()).take();
                 }
                 drop(sort_ack);
-                if !pending_sorts.lock().unwrap().is_empty()
+                if !pending_sorts.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
                     || pending_structure_for_reader.load(Ordering::Acquire)
                     || unconfirmed_styles_for_reader.swap(0, Ordering::AcqRel) > 0
                 {
                     resume_state = None;
                 }
                 connected_flag.store(false, Ordering::SeqCst);
-                *writer.lock().unwrap() = None;
-                *send_sess.lock().unwrap() = None;
+                *writer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *send_sess.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 {
                     let (lock, cvar) = &*guest_low_prio_for_reader;
-                    let mut g = lock.lock().unwrap();
+                    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                     g.0.clear();
                     cvar.notify_all();
                 }
@@ -10864,6 +11095,77 @@ mod integrity_tests {
         assert!(got_note, "水位增量重连后必须收到断线期间的批注");
         assert!(got_col, "水位增量重连后必须收到断线期间的列宽修改");
         assert!(got_row, "水位增量重连后必须收到断线期间的行高修改");
+    }
+
+    #[test]
+    fn unrelated_peer_bad_base64_update_slice_cannot_abort_active_download() {
+        let env = crate::test_env::TestEnv::new("net_slice_hijack");
+        let part_path = env.path("dl.part");
+        let file = std::fs::File::create(&part_path).unwrap();
+        let dl_slot = Arc::new(Mutex::new(Some(ActivePeerDownload {
+            peer_site: 2,
+            manifest: crate::update::SignedManifest {
+                version: "99.1".into(),
+                exe: "CELLAN.exe".into(),
+                size: 16,
+                sha256: "0".repeat(64),
+                sig: "0".repeat(128),
+                notes: String::new(),
+            },
+            file,
+            part_path: part_path.clone(),
+            prefix_hash: crate::update::PrefixSha256::new(16),
+            written: 0,
+            last_pct: 0,
+        })));
+        let (tx, rx) = channel();
+        let (evt_tx, _wake) = EvtTx::new(tx);
+        // Site 3 sends invalid base64 claiming version "99.1": must NOT abort site 2's download!
+        accept_incoming_update_slice(&dl_slot, &evt_tx, 3, "99.1", 0, 16, "!!!bad!!!", &[], false);
+        assert!(dl_slot.lock().unwrap().is_some(), "unrelated peer must not abort active download");
+        assert!(rx.try_recv().is_err());
+        assert!(part_path.exists());
+        // Clean up handle before env drops
+        dl_slot.lock().unwrap().take();
+    }
+
+    #[test]
+    fn same_site_reconnect_with_matching_auth_evicts_stale_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s1_client = TcpStream::connect(addr).unwrap();
+        let (s1_srv, _) = listener.accept().unwrap();
+        let s2_client = TcpStream::connect(addr).unwrap();
+        let (s2_srv, _) = listener.accept().unwrap();
+        let s1 = Arc::new(s1_srv);
+        let s2 = Arc::new(s2_srv);
+        let (ltx1, _lrx1) = channel();
+        let (tx1, _) = LiveSender::new(ltx1, Arc::new(AtomicBool::new(false)));
+        let (ltx2, _lrx2) = channel();
+        let (tx2, _) = LiveSender::new(ltx2, Arc::new(AtomicBool::new(false)));
+
+        let mut roster = RoomRoster::new(1, "Host".into());
+        let (cid1, _, _, evicted1) = roster.admit(2, "Alice", "secret-token", &s1).unwrap();
+        assert!(evicted1.is_none());
+        roster.finish_admit(2, cid1, tx1, &s1);
+
+        // Wrong auth for same site must still be rejected
+        assert!(roster.admit(2, "Mallory", "wrong-token", &s2).is_err());
+
+        // Same site with matching auth must evict stale socket cleanly
+        let (cid2, _, _, evicted2) = roster.admit(2, "Alice", "secret-token", &s2).unwrap();
+        assert!(evicted2.is_some());
+        assert_ne!(cid1, cid2);
+        roster.finish_admit(2, cid2, tx2, &s2);
+
+        // Stale reader thread calling remove_member(2, cid1) must NOT remove the new connection!
+        assert!(roster.remove_member(2, cid1).is_none());
+        assert!(roster.sender_of(2).is_some());
+
+        // Current connection calling remove_member(2, cid2) removes cleanly
+        assert!(roster.remove_member(2, cid2).is_some());
+        assert!(roster.sender_of(2).is_none());
+        drop((s1_client, s2_client));
     }
 }
 

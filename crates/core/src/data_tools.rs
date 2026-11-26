@@ -1344,7 +1344,6 @@ fn reorder_delta_cached(
     let translated = source
         .as_deref()
         .and_then(|cell| cell.formula.as_deref())
-        .filter(|_| !dedup)
         .map(|formula| {
             let shift = i64::from(dst) - i64::from(src.unwrap());
             let dr = if horizontal { 0 } else { shift };

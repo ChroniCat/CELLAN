@@ -16,22 +16,23 @@ pub struct ArrayFml {
     pub anchor: (u32, u32),
 }
 
+const MAX_EXCEL_ROW: u32 = 1_048_576;
+const MAX_EXCEL_COL: u32 = 16_383;
+
 fn col_num(s: &str) -> Option<u32> {
+    if s.is_empty() || s.len() > 3 {
+        return None;
+    }
     let mut n: u32 = 0;
-    let mut any = false;
     for ch in s.chars() {
         let d = ch.to_ascii_uppercase();
         if !d.is_ascii_uppercase() {
-            break;
+            return None;
         }
-        n = n * 26 + (d as u32 - 'A' as u32 + 1);
-        any = true;
+        n = n.checked_mul(26)?.checked_add(d as u32 - 'A' as u32 + 1)?;
     }
-    if any {
-        Some(n - 1)
-    } else {
-        None
-    }
+    let col = n.checked_sub(1)?;
+    (col <= MAX_EXCEL_COL).then_some(col)
 }
 
 /// "B2:D5" → (1,1,4,3)
@@ -42,19 +43,18 @@ pub fn parse_a1_range(s: &str) -> Option<(u32, u32, u32, u32)> {
         None => (s, s),
     };
     let parse = |t: &str| -> Option<(u32, u32)> {
-        let t: String = t.chars().filter(|c| *c != '$').collect();
-        let letters: String = t.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
-        let digits: String = t
-            .chars()
-            .skip(letters.len())
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if digits.is_empty() || letters.is_empty() {
+        let t: String = t.trim().chars().filter(|c| *c != '$').collect();
+        let split = t.bytes().take_while(u8::is_ascii_alphabetic).count();
+        let (letters, digits) = t.split_at(split);
+        if letters.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        let col = col_num(&letters)?;
+        let col = col_num(letters)?;
         let row: u32 = digits.parse().ok()?;
-        Some((row.saturating_sub(1), col))
+        if row == 0 || row > MAX_EXCEL_ROW {
+            return None;
+        }
+        Some((row - 1, col))
     };
     let (r1, c1) = parse(a)?;
     let (r2, c2) = parse(b)?;

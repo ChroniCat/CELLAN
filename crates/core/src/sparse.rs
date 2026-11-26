@@ -18,30 +18,37 @@ use crate::model::{Cell, Value};
 /// 声明区域超过这个格数就走稀疏通道
 pub const DENSE_LIMIT: u64 = 2_000_000;
 
+const MAX_EXCEL_ROW: u32 = 1_048_576;
+const MAX_EXCEL_COL: u32 = 16_383;
+
 fn col_of(letters: &str) -> Option<u32> {
+    if letters.is_empty() || letters.len() > 3 {
+        return None;
+    }
     let mut n: u32 = 0;
-    let mut any = false;
     for ch in letters.chars() {
         let d = ch.to_ascii_uppercase();
         if !d.is_ascii_uppercase() {
             return None;
         }
         n = n.checked_mul(26)?.checked_add(d as u32 - 'A' as u32 + 1)?;
-        any = true;
     }
-    if any {
-        Some(n - 1)
-    } else {
-        None
-    }
+    let col = n.checked_sub(1)?;
+    (col <= MAX_EXCEL_COL).then_some(col)
 }
 
 /// "B12" → (11, 1)
 pub fn parse_ref(s: &str) -> Option<(u32, u32)> {
     let i = s.bytes().take_while(u8::is_ascii_alphabetic).count();
     let (letters, digits) = s.split_at(i);
+    if letters.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let row: u32 = digits.parse().ok()?;
-    Some((row.checked_sub(1)?, col_of(letters)?))
+    if row == 0 || row > MAX_EXCEL_ROW {
+        return None;
+    }
+    Some((row - 1, col_of(letters)?))
 }
 
 /// 直接从 zip 里读某个部件的声明区域（只读开头一小段）
@@ -76,7 +83,9 @@ pub fn declared_area(xml_head: &str) -> u64 {
     let (Some((r1, c1)), Some((r2, c2))) = (parse_ref(a), parse_ref(b)) else {
         return 0;
     };
-    (r2 as u64 - r1 as u64 + 1) * (c2 as u64 - c1 as u64 + 1)
+    let (r_lo, r_hi) = (r1.min(r2) as u64, r1.max(r2) as u64);
+    let (c_lo, c_hi) = (c1.min(c2) as u64, c1.max(c2) as u64);
+    (r_hi - r_lo + 1).saturating_mul(c_hi - c_lo + 1)
 }
 
 /// 读共享字符串表
@@ -91,8 +100,7 @@ pub fn shared_strings_checked(path: &Path) -> Result<Vec<String>> {
     let file = std::fs::File::open(path)?;
     let mut zip = zip::ZipArchive::new(file)?;
     let mut f = zip.by_name("xl/sharedStrings.xml")?;
-    let mut xml = String::new();
-    f.read_to_string(&mut xml)?;
+    let xml = crate::fixups::read_zip_entry_string_limited(&mut f, crate::fixups::MAX_SHEET_PART_BYTES)?;
     let mut reader = Reader::from_str(&xml);
     reader.config_mut().trim_text(false);
     let mut in_si = false;
@@ -141,8 +149,7 @@ pub fn read_sheet(path: &Path, part: &str, ss: &[String]) -> Result<HashMap<(u32
     let file = std::fs::File::open(path)?;
     let mut zip = zip::ZipArchive::new(file)?;
     let mut f = zip.by_name(part)?;
-    let mut xml = String::new();
-    f.read_to_string(&mut xml)?;
+    let xml = crate::fixups::read_zip_entry_string_limited(&mut f, crate::fixups::MAX_SHEET_PART_BYTES)?;
     let cells = parse_sheet_xml(&xml, ss)?;
     Ok(cells)
 }
@@ -156,8 +163,7 @@ pub fn read_sheet_arc(
     let file = std::fs::File::open(path)?;
     let mut zip = zip::ZipArchive::new(file)?;
     let mut f = zip.by_name(part)?;
-    let mut xml = String::new();
-    f.read_to_string(&mut xml)?;
+    let xml = crate::fixups::read_zip_entry_string_limited(&mut f, crate::fixups::MAX_SHEET_PART_BYTES)?;
     parse_sheet_xml_arc(&xml, ss)
 }
 

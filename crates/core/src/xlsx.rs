@@ -1683,6 +1683,43 @@ fn verify_saved_package_against(
                 anyhow::bail!("保存产物加密流长度异常（EncryptionInfo={info_len}, EncryptedPackage={pkg_len}）");
             }
         }
+        // 校验 .xls 的 BIFF8 记录流：每条记录长度不得超过 8224 字节且不得截断
+        file.rewind()?;
+        if let Ok(mut cf) = cfb::CompoundFile::open(&mut file) {
+            let stream_name = if cf.exists("Workbook") {
+                Some("Workbook")
+            } else if cf.exists("Book") {
+                Some("Book")
+            } else {
+                None
+            };
+            if let Some(sname) = stream_name {
+                let mut wb_stream = Vec::new();
+                if let Ok(mut st) = cf.open_stream(sname) {
+                    let _ = st.read_to_end(&mut wb_stream);
+                }
+                let mut off = 0usize;
+                let mut seen_eof = false;
+                while off < wb_stream.len() {
+                    if seen_eof && wb_stream[off..].iter().all(|&b| b == 0) {
+                        break;
+                    }
+                    if off + 4 > wb_stream.len() {
+                        anyhow::bail!("保存产物 XLS BIFF 记录头被截断（偏移 {off}）");
+                    }
+                    let rec_id = u16::from_le_bytes([wb_stream[off], wb_stream[off + 1]]);
+                    let rec_len = u16::from_le_bytes([wb_stream[off + 2], wb_stream[off + 3]]) as usize;
+                    if rec_len > 8224 {
+                        anyhow::bail!("保存产物 XLS 含超长 BIFF 记录（{rec_len} > 8224 字节）");
+                    }
+                    if off + 4 + rec_len > wb_stream.len() {
+                        anyhow::bail!("保存产物 XLS BIFF 记录体被截断（偏移 {off}，长度 {rec_len}）");
+                    }
+                    seen_eof = rec_id == 0x000A;
+                    off += 4 + rec_len;
+                }
+            }
+        }
         if crate::xls_read::load(path).is_ok() {
             return Ok(());
         }
@@ -2288,6 +2325,10 @@ fn save_atomic_model(path: &Path, wb: &mut Cow<'_, Workbook>) -> Result<SaveRece
         let _ = std::fs::remove_file(&tmp);
         return Err(anyhow::Error::new(e).context(format!("写入 {} 失败", path.display())));
     }
+    // 替换原文件前刷盘，降低断电导致目录项已改名但数据未落盘的风险
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
+        let _ = f.sync_all();
+    }
     // 立即清理隐藏暂存目录，保证进入替换窗口（含 SC_SAVE_PAUSE_MS）及函数退出前零残留
     drop(build_scratch);
     #[cfg(windows)]
@@ -2489,7 +2530,8 @@ fn private_workbook_dir() -> Result<tempfile::TempDir> {
     let base_tmp = std::env::temp_dir();
     let _ = std::fs::create_dir_all(&base_tmp);
     let mut builder = tempfile::Builder::new();
-    builder.prefix("cellan-workbook-");
+    let prefix = format!("cellan-workbook-{}-", std::process::id());
+    builder.prefix(&prefix);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2502,6 +2544,68 @@ fn private_workbook_dir() -> Result<tempfile::TempDir> {
             builder.tempdir()
         })
         .context("无法创建本机工作簿临时目录")
+}
+
+/// 进程启动时清理上次异常退出/崩溃遗留在 `%TEMP%` 的 `cellan-workbook-*` 临时明文目录。
+/// 仅清理已退出进程或超过 1 小时的无 PID 旧目录，不影响其他正在运行的 CELLAN 实例。
+pub fn cleanup_stale_workbook_temp_dirs() {
+    let base_tmp = std::env::temp_dir();
+    let Ok(rd) = std::fs::read_dir(&base_tmp) else {
+        return;
+    };
+    let my_pid = std::process::id();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix("cellan-workbook-") else {
+            continue;
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let pid_opt = rest
+            .split_once('-')
+            .and_then(|(p, _)| p.parse::<u32>().ok());
+        let stale = match pid_opt {
+            Some(pid) if pid == my_pid => false,
+            Some(pid) => !is_process_alive(pid),
+            None => std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(3600)),
+        };
+        if stale {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn GetExitCodeProcess(handle: *mut core::ffi::c_void, code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code) != 0;
+        CloseHandle(h);
+        ok && code == STILL_ACTIVE
+    }
+}
+
+#[cfg(not(windows))]
+fn is_process_alive(_pid: u32) -> bool {
+    false
 }
 
 /// 有界解密明文包会话缓存：保存加密文件时免去再次对未变动的源文件跑 10 万轮 SHA-512 解密。
@@ -5596,14 +5700,8 @@ fn convert_style(st: &calamine::Style) -> crate::style::CellStyle {
 /// 只读 OOXML 包里的一个部件，不解压整本工作簿。
 /// 开始页用它取 `docProps/thumbnail.jpeg`；文件没有这个部件时返回 None。
 pub fn read_part(path: &Path, name: &str) -> Option<Vec<u8>> {
-    use std::io::Read;
     let file = std::fs::File::open(path).ok()?;
     let mut zip = zip::ZipArchive::new(file).ok()?;
     let mut entry = zip.by_name(name).ok()?;
-    if entry.size() > 4 * 1024 * 1024 {
-        return None;
-    }
-    let mut buf = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut buf).ok()?;
-    Some(buf)
+    crate::fixups::read_zip_entry_limited(&mut entry, 4 * 1024 * 1024).ok()
 }

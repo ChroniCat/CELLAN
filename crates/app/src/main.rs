@@ -87,6 +87,7 @@ pub(crate) enum NoticeAction {
     OpenRecovery,
     RestartForUpdate,
     OpenAudit,
+    TrustExternalLinks,
 }
 
 #[derive(Clone, Debug)]
@@ -2438,7 +2439,9 @@ struct SheetApp {
     link_dlg: Option<String>,
     /// 运行宏对话框：宏名
     macro_run_dlg: Option<String>,
+    macro_run_rx: Option<std::sync::mpsc::Receiver<String>>,
     macro_ran: bool,
+    import_wb_rx: Option<std::sync::mpsc::Receiver<Result<sheetcore::model::Workbook, String>>>,
     /// 占用卡心跳时间
     lock_beat: Option<std::time::Instant>,
     /// 已经为哪个文件尝试过自动发现（避免反复重连）
@@ -2790,6 +2793,7 @@ struct SheetApp {
     xlink_resolved: std::collections::HashMap<(u64, usize), Option<PathBuf>>,
     xlink_tab_gens: std::collections::HashMap<(u64, usize), (u64, u64)>,
     xlink_bg_rx: Option<std::sync::mpsc::Receiver<XlinkWatchResult>>,
+    xlinks_trusted_docs: std::collections::HashSet<u64>,
     /// UI-11.4：函数向导（插入函数）
     fn_wizard: Option<FnWizard>,
     /// 修订记录（新的在后）
@@ -4213,7 +4217,9 @@ impl SheetApp {
             note_focus_requested: false,
             link_dlg: None,
             macro_run_dlg: None,
+            macro_run_rx: None,
             macro_ran: false,
+            import_wb_rx: None,
             lock_beat: None,
             auto_join_tried: None,
             remote_editor: None,
@@ -4450,6 +4456,7 @@ impl SheetApp {
             xlink_resolved: std::collections::HashMap::new(),
             xlink_tab_gens: std::collections::HashMap::new(),
             xlink_bg_rx: None,
+            xlinks_trusted_docs: std::collections::HashSet::new(),
             fn_wizard: None,
             rev: Vec::new(),
             rev_open: false,
@@ -5023,8 +5030,7 @@ impl SheetApp {
                     }
                     let mut wb2 = wb;
                     if !wb2.links.is_empty() {
-                        let hints = recent::load();
-                        let _ = sheetcore::xlinks::refresh_with_hints(&mut wb2, &hints);
+                        let _ = sheetcore::xlinks::refresh_auto_safe(&mut wb2);
                     }
                     let t = std::time::Instant::now();
                     if !wb2.calc_manual {
@@ -5079,12 +5085,23 @@ impl SheetApp {
         self.tasks.open_ctrl = Some(ctrl);
         self.status = format!("正在解密 {}…", path.display());
         std::thread::spawn(move || {
+            #[cfg(panic = "unwind")]
+            let tx2 = tx.clone();
+            let run_open = move || {
             match sheetcore::xlsx::load_with_password_diag_with_control(&path, &pw, Some(ctrl_bg)) {
                 Ok((wb, diag)) => {
                     let cells: usize = wb.sheets.iter().map(|s| s.len()).sum();
                     let formulas = sheetcore::xlsx::workbook_formula_count(&wb);
+                    let big_cells = std::env::var("SC_BIG_CELLS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(400_000usize);
+                    let big_formulas = std::env::var("SC_BIG_FORMULAS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30_000usize);
                     let big = std::env::var("SC_FORCE_RECALC").is_err()
-                        && (cells > 100_000 || formulas > 30_000);
+                        && (cells > big_cells || formulas > big_formulas);
                     let base_hash = if diag.is_complete() && !wb.load_incomplete {
                         session_lock::file_base_hash(&path)
                     } else {
@@ -5106,8 +5123,7 @@ impl SheetApp {
                     let _ = tx.send(OpenMsg::Loaded(Box::new(wb.clone()), false, Box::new(diag), base_hash));
                     let mut wb2 = wb;
                     if !wb2.links.is_empty() {
-                        let hints = recent::load();
-                        let _ = sheetcore::xlinks::refresh_with_hints(&mut wb2, &hints);
+                        let _ = sheetcore::xlinks::refresh_auto_safe(&mut wb2);
                     }
                     if !wb2.calc_manual {
                         sheetcore::formula::recalc_all(&mut wb2);
@@ -5123,6 +5139,20 @@ impl SheetApp {
                     }
                 }
             }
+            };
+            #[cfg(panic = "unwind")]
+            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_open)) {
+                let msg = p
+                    .downcast_ref::<&str>()
+                    .map(|x| x.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "未知 panic".to_string());
+                let _ = tx2.send(OpenMsg::Failed(format!(
+                    "打开失败：解密线程异常退出（panic）：{msg}"
+                )));
+            }
+            #[cfg(not(panic = "unwind"))]
+            run_open();
         });
     }
 
@@ -5160,6 +5190,9 @@ impl SheetApp {
         self.tasks.recalc_done = Some(done.clone());
         self.tasks.recalc_total = Some(total.clone());
         std::thread::spawn(move || {
+            #[cfg(panic = "unwind")]
+            let tx2 = tx.clone();
+            let run_recalc = move || {
             use std::sync::atomic::Ordering;
             let mut wb = wb;
             let manual = wb.calc_manual;
@@ -5187,6 +5220,20 @@ impl SheetApp {
             let deps = if sheet.is_none() { sheetcore::formula::deps::Deps::build_after_recalc(&wb) }
                 else { sheetcore::formula::deps::Deps::build(&wb) };
             let _ = tx.send(OpenMsg::RecalcedWb(Box::new(wb), Box::new(deps), epoch, doc_gen, sheet.is_none()));
+            };
+            #[cfg(panic = "unwind")]
+            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_recalc)) {
+                let msg = p
+                    .downcast_ref::<&str>()
+                    .map(|x| x.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "未知 panic".to_string());
+                let _ = tx2.send(OpenMsg::Failed(format!(
+                    "后台重算异常退出（panic）：{msg}"
+                )));
+            }
+            #[cfg(not(panic = "unwind"))]
+            run_recalc();
         });
     }
 
@@ -5391,11 +5438,20 @@ impl SheetApp {
     /// 处理后台打开/重算的结果
     fn poll_open(&mut self) {
         let mut msgs: Vec<OpenMsg> = Vec::new();
+        let mut disconnected = false;
         if let Some(rx) = &self.tasks.open_rx {
-            while let Ok(m) = rx.try_recv() {
-                msgs.push(m);
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => msgs.push(m),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
             }
         }
+        let had_msgs = !msgs.is_empty();
         let mut finished = false;
         for msg in msgs {
             match msg {
@@ -6536,6 +6592,7 @@ impl SheetApp {
                     }
                     self.deps_pending = false;
                     self.tasks.busy = false;
+                    self.maybe_show_untrusted_xlink_banner();
                     if !self.joined_doc {
                         self.status = "已打开大文件（显示文件里的缓存值；公式→重算全部 可强制重算）".into();
                     }
@@ -6600,6 +6657,7 @@ impl SheetApp {
                     }
                     self.wb.mark_recalc_synced();
                     self.xlink_last_check = None;
+                    self.maybe_show_untrusted_xlink_banner();
                     self.manual_calc = self.wb.calc_manual;
                     self.deps = deps.into();
                     self.deps_built = true;
@@ -6655,7 +6713,16 @@ impl SheetApp {
                 }
             }
         }
-        if finished {
+        if finished || disconnected {
+            if disconnected && !finished {
+                self.tasks.busy = false;
+                self.tasks.recalc_cancel = None;
+                self.tasks.recalc_done = None;
+                self.tasks.recalc_total = None;
+                if !had_msgs {
+                    self.status = "后台打开/重算任务意外中止".into();
+                }
+            }
             self.tasks.open_rx = None;
             self.tasks.open_label = None;
             self.tasks.open_started = None;
@@ -6675,15 +6742,35 @@ impl SheetApp {
         for tab in &mut self.tabs {
             let TabSlot::Parked(doc) = tab else { continue };
             let mut parked_msgs = Vec::new();
+            let mut parked_disconnected = false;
             if let Some(rx) = &doc.tasks.open_rx {
-                while let Ok(m) = rx.try_recv() {
-                    parked_msgs.push(m);
+                loop {
+                    match rx.try_recv() {
+                        Ok(m) => parked_msgs.push(m),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            parked_disconnected = true;
+                            break;
+                        }
+                    }
                 }
             }
             if parked_msgs.is_empty() {
+                if parked_disconnected {
+                    doc.tasks.busy = false;
+                    doc.tasks.open_rx = None;
+                    doc.tasks.open_label = None;
+                    doc.tasks.open_started = None;
+                    doc.tasks.open_path = None;
+                    doc.tasks.open_ctrl = None;
+                    doc.tasks.recalc_cancel = None;
+                    doc.tasks.recalc_done = None;
+                    doc.tasks.recalc_total = None;
+                    doc.tasks.open_recalc_revs.clear();
+                }
                 continue;
             }
-            let mut parked_done = false;
+            let mut parked_done = parked_disconnected;
             for msg in parked_msgs {
                 match msg {
                     OpenMsg::Loaded(wb, _, diag, _) => {
@@ -8063,6 +8150,11 @@ impl SheetApp {
                 NoticeAction::OpenAudit => {
                     if switch_to_target(self) {
                         self.open_audit_panel();
+                    }
+                }
+                NoticeAction::TrustExternalLinks => {
+                    if switch_to_target(self) {
+                        self.trust_and_refresh_xlinks(ctx);
                     }
                 }
             }
@@ -11099,18 +11191,24 @@ impl SheetApp {
             self.cancel_silent_recalc();
         }
         if let Some(rx) = &self.bg_deps_rx {
-            if let Ok((uid, epoch, _generation, mut deps)) = rx.try_recv() {
-                if uid == self.doc_uid && epoch == self.wb_epoch {
-                    // 即使期间有小批量编辑或改格式，只增量更新并发改动过的单元，绝不丢弃整份依赖图
-                    for &k in &self.bg_recalc_concurrent_edits {
-                        if deps.cell_needs_update(&self.wb, k) {
-                            deps.update_cell(&self.wb, k);
+            match rx.try_recv() {
+                Ok((uid, epoch, _generation, mut deps)) => {
+                    if uid == self.doc_uid && epoch == self.wb_epoch {
+                        // 即使期间有小批量编辑或改格式，只增量更新并发改动过的单元，绝不丢弃整份依赖图
+                        for &k in &self.bg_recalc_concurrent_edits {
+                            if deps.cell_needs_update(&self.wb, k) {
+                                deps.update_cell(&self.wb, k);
+                            }
                         }
+                        self.deps = deps.into();
+                        self.deps_built = true;
                     }
-                    self.deps = deps.into();
-                    self.deps_built = true;
+                    self.bg_deps_rx = None;
                 }
-                self.bg_deps_rx = None;
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.bg_deps_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
         if let Some(rx) = &self.bg_recalc_rx {
@@ -13574,21 +13672,38 @@ impl SheetApp {
         }
         match std::fs::read(p) {
             Ok(bytes) => {
-                let dims = match image::load_from_memory(&bytes) {
-                    Ok(img) => (img.width(), img.height()),
-                    Err(_) => {
+                const MAX_IMAGE_DIM: u32 = 16_384;
+                const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+                let dims = match image::ImageReader::new(std::io::Cursor::new(&bytes))
+                    .with_guessed_format()
+                    .ok()
+                    .and_then(|r| r.into_dimensions().ok())
+                {
+                    Some(d) => d,
+                    None => {
                         self.status = "这张图无法解码（文件可能损坏）".into();
                         return;
                     }
                 };
                 let (w, h) = dims;
+                if w == 0
+                    || h == 0
+                    || w > MAX_IMAGE_DIM
+                    || h > MAX_IMAGE_DIM
+                    || u64::from(w).saturating_mul(u64::from(h)) > MAX_IMAGE_PIXELS
+                {
+                    self.status = format!("图片尺寸超出安全上限（{w}×{h}），已拒绝插入");
+                    return;
+                }
                 let cols = ((w + 63) / 64).max(2);
                 let rows = ((h + 19) / 20).max(2);
                 let (r, c) = self.sel;
+                let r2 = r.saturating_add(rows).min(1_048_575);
+                let c2 = c.saturating_add(cols).min(16_383);
                 let before = self.wb.sheet(self.sheet_idx).pictures.clone();
                 let name = format!("图片 {}", before.len() + 1);
                 self.wb.sheet_mut(self.sheet_idx).pictures.push(sheetcore::pic::Picture {
-                    rect: (r, c, r + rows, c + cols),
+                    rect: (r, c, r2, c2),
                     off: [0; 4],
                     part: sheetcore::pic_write::memory_part(&bytes, &ext),
                     data: Some(std::sync::Arc::new(bytes)),
@@ -13957,25 +14072,36 @@ impl SheetApp {
         }
     }
 
-    /// 选一个工作簿，把它的每张表复制到当前工作簿末尾（值 + 公式 + 样式重映射 + 图表/表格保真）
+    /// 选一个工作簿，把它的每张表复制到当前工作簿末尾（后台读取不冻结界面，值 + 公式 + 样式重映射 + 图表/表格保真）
     fn import_workbook(&mut self) {
+        if self.import_wb_rx.is_some() {
+            self.status = "正在导入外部工作簿，请稍候…".into();
+            return;
+        }
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Excel 工作簿", &["xlsx", "xlsm", "xls"])
             .pick_file()
         else {
             return;
         };
-        if sheetcore::crypto::needs_password(&path) {
-            self.status = "导入失败：源文件已加密，请先单独打开并解除打开密码后再导入".into();
-            return;
-        }
-        let other = match sheetcore::xlsx::load(&path) {
-            Ok(w) => w,
-            Err(e) => {
-                self.status = format!("打开失败：{e:#}");
-                return;
-            }
-        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.import_wb_rx = Some(rx);
+        self.status = format!("正在后台读取要导入的工作簿 {}…", path.display());
+        std::thread::spawn(move || {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                if sheetcore::crypto::needs_password(&path) {
+                    return Err(
+                        "导入失败：源文件已加密，请先单独打开并解除打开密码后再导入".to_string(),
+                    );
+                }
+                sheetcore::xlsx::load(&path).map_err(|e| format!("打开失败：{e:#}"))
+            }))
+            .unwrap_or_else(|_| Err("导入工作簿时后台解析线程异常退出".to_string()));
+            let _ = tx.send(res);
+        });
+    }
+
+    fn finish_import_workbook(&mut self, other: sheetcore::model::Workbook) {
         let mut added: Vec<String> = Vec::new();
         let mut style_map: std::collections::HashMap<u16, u16> = std::collections::HashMap::new();
         let mut map_sid = |dst_styles: &mut sheetcore::style::StyleTable, sid: u16| -> u16 {
@@ -14055,6 +14181,46 @@ impl SheetApp {
         } else {
             format!("已导入 {n} 张表：{}", added.join("、"))
         };
+    }
+
+    fn poll_bg_import_and_macro(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.import_wb_rx {
+            match rx.try_recv() {
+                Ok(Ok(other)) => {
+                    self.import_wb_rx = None;
+                    self.finish_import_workbook(other);
+                    ctx.request_repaint();
+                }
+                Ok(Err(e)) => {
+                    self.import_wb_rx = None;
+                    self.status = e;
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.import_wb_rx = None;
+                    self.status = "导入工作簿任务意外中断".into();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        if let Some(rx) = &self.macro_run_rx {
+            match rx.try_recv() {
+                Ok(status) => {
+                    self.macro_run_rx = None;
+                    self.status = status;
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.macro_run_rx = None;
+                    self.status = "宏执行后台线程意外中断".into();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(120));
+                }
+            }
+        }
     }
 
     /// C09：选文件后先打开选项对话框（编码/引号/表头/文本列 + 真实预览）
@@ -14215,11 +14381,52 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
             return false;
         }
         let (r0, c0) = self.sel;
-        // Spans count toward the write footprint, including otherwise empty merged cells.
-        let cols = block.rows.iter().map(|row| row.iter().map(|c| u64::from(c.colspan.max(1))).sum::<u64>()).max().unwrap_or(0);
-        let rows = block.rows.iter().enumerate().map(|(i, row)| {
-            i as u64 + u64::from(row.iter().map(|c| c.rowspan.max(1)).max().unwrap_or(1))
-        }).max().unwrap_or(0);
+        // 统一按 HTML 表格占位规则计算每格的真实 (rel_r, rel_c)，确保 rowspan 覆盖的下方列自动右移，不左偏覆盖
+        let mut occupied: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        let mut placements: Vec<(usize, usize, u32, u32)> =
+            Vec::with_capacity(block.rows.iter().map(Vec::len).sum());
+        let mut max_rows: u64 = 0;
+        let mut max_cols: u64 = 0;
+        let mut incoming = Vec::new();
+        for (ri, row) in block.rows.iter().enumerate() {
+            let rel_r = ri as u32;
+            let mut rel_c = 0u32;
+            for (ci, cell) in row.iter().enumerate() {
+                while occupied.contains(&(rel_r, rel_c)) {
+                    rel_c = rel_c.saturating_add(1);
+                }
+                let rs = cell.rowspan.max(1);
+                let cs = cell.colspan.max(1);
+                let end_r = u64::from(rel_r).saturating_add(u64::from(rs));
+                let end_c = u64::from(rel_c).saturating_add(u64::from(cs));
+                if u64::from(r0).saturating_add(end_r) > 1_048_576
+                    || u64::from(c0).saturating_add(end_c) > 16_384
+                {
+                    self.status = "粘贴区域超过工作表边界或单次 50 万格上限".into();
+                    return true;
+                }
+                max_rows = max_rows.max(end_r);
+                max_cols = max_cols.max(end_c);
+                placements.push((ri, ci, rel_r, rel_c));
+                if rs > 1 || cs > 1 {
+                    let abs_r = r0 + rel_r;
+                    let abs_c = c0 + rel_c;
+                    incoming.push((abs_r, abs_c, abs_r + rs - 1, abs_c + cs - 1));
+                    // 仅需把后续行（dr >= 1）的占位写入 occupied；同行右侧由 rel_c += cs 直接跳过
+                    for dr in 1..rs {
+                        for dc in 0..cs {
+                            occupied.insert((rel_r + dr, rel_c + dc));
+                        }
+                    }
+                }
+                rel_c = rel_c.saturating_add(cs);
+            }
+        }
+        let rows = max_rows;
+        let cols = max_cols;
+        if rows == 0 || cols == 0 {
+            return false;
+        }
         let area = rows.saturating_mul(cols);
         if (self.net.is_some() && area > sheetcore::undo::MAX_DENSE_RECT_KEYS as u64)
             || u64::from(r0) + rows > 1_048_576
@@ -14244,17 +14451,6 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
             }
             keys
         };
-        let mut incoming = Vec::new();
-        for (ri, row) in block.rows.iter().enumerate() {
-            let r = r0 + ri as u32;
-            let mut c = c0;
-            for cell in row {
-                if cell.colspan > 1 || cell.rowspan > 1 {
-                    incoming.push((r, c, r + cell.rowspan.max(1) - 1, c + cell.colspan.max(1) - 1));
-                }
-                c += cell.colspan.max(1);
-            }
-        }
         let merge_edit = match self.paste_merge_edit(target_rect, &incoming, None) {
             Ok(edit) => edit,
             Err(message) => { self.status = message.into(); return true; }
@@ -14302,14 +14498,13 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                 s.parse::<f64>()
             }
         };
-        for (ri, row) in block.rows.iter().enumerate() {
-            let mut ci: u32 = 0;
-            for cell in row {
-                let r = r0 + ri as u32;
-                let c = c0 + ci;
-                if !use_cow {
-                    touched.push((si, r, c));
-                }
+        for &(ri, ci, rel_r, rel_c) in &placements {
+            let cell = &block.rows[ri][ci];
+            let r = r0 + rel_r;
+            let c = c0 + rel_c;
+            if !use_cow {
+                touched.push((si, r, c));
+            }
                 // 值：带公式的按缓存值类型走，之后统一重算
                 let text = cell.text.trim();
                 let value = if cell.formula.is_some() {
@@ -14486,9 +14681,6 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                 if let Some(id) = resolved_id {
                     self.wb.sheet_mut(si).set_style(r, c, id);
                 }
-
-                ci += cell.colspan.max(1);
-            }
         }
 
         // Constants are precedents too. Replacing a formula also removes its old edges.
@@ -35535,6 +35727,7 @@ impl SheetApp {
                     let rect = (r1c1.0, r1c1.1, r2c2.0, r2c2.1);
                     let at = self.sel;
                     let n = self.wb.sources.len() + 1;
+                    let idx = self.sheet_idx;
                     let src = sheetcore::external::Source {
                         name: format!("_sc_src_{n}"),
                         kind: sheetcore::external::Kind::Internal {
@@ -35542,11 +35735,11 @@ impl SheetApp {
                             rect,
                         },
                         at,
+                        target_sheet: Some(self.wb.sheet(idx).name.clone()),
                         rows: 0,
                         cols: 0,
                         csv_opts: None,
                     };
-                    let idx = self.sheet_idx;
                     match sheetcore::external::refresh(&mut self.wb, idx, &src) {
                         Ok((rows, cols)) => {
                             self.wb.sources.push(sheetcore::external::Source {
@@ -35582,11 +35775,16 @@ impl SheetApp {
     /// 我们不做 VBA 解释器（那是一个编译器的工程量），但用户的宏本来就在 Excel 里
     /// 能跑：这里把文件交给本机 Excel 的 COM 接口执行，跑完把结果存回同一个文件。
     fn run_macro_via_excel(&mut self, macro_name: &str) {
+        if self.macro_run_rx.is_some() {
+            self.status = "上一个宏仍在后台执行中，请稍候…".into();
+            return;
+        }
         let Some(path) = self.wb.path.clone() else {
             self.status = "先保存文件，再运行宏".into();
             return;
         };
-        if macro_name.trim().is_empty() {
+        let macro_trimmed = macro_name.trim().to_string();
+        if macro_trimmed.is_empty() {
             self.status = "宏名不能为空（形如 Module1.MyMacro）".into();
             return;
         }
@@ -35607,38 +35805,70 @@ impl SheetApp {
             return;
         }
         let ps = format!(
-            "$ErrorActionPreference='Stop'; $xl=New-Object -ComObject Excel.Application;              $xl.Visible=$false; $xl.DisplayAlerts=$false;              try {{ $wb=$xl.Workbooks.Open('{p}'); $xl.Run('{m}'); $wb.Save(); $wb.Close($false);              Write-Output 'OK' }} finally {{ $xl.Quit() }}",
+            "$ErrorActionPreference='Stop'; $xl=New-Object -ComObject Excel.Application; $xl.Visible=$false; $xl.DisplayAlerts=$false; try {{ $wb=$xl.Workbooks.Open('{p}'); $xl.Run('{m}'); $wb.Save(); $wb.Close($false); Write-Output 'OK' }} finally {{ $xl.Quit() }}",
             p = copy.to_string_lossy().replace('\'', "''"),
-            m = macro_name.replace('\'', "''")
+            m = macro_trimmed.replace('\'', "''")
         );
-        match hidden_console_cmd("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-            .output()
-        {
-            Ok(out) => {
-                let text = String::from_utf8_lossy(&out.stdout).to_string();
-                if text.contains("OK") {
-                    self.status = format!(
-                        "宏 {macro_name} 已在隔离副本上执行完毕，原文件未改动：{}",
-                        copy.display()
-                    );
-                } else {
-                    let err = String::from_utf8_lossy(&out.stderr).to_string();
-                    let low = err.to_lowercase();
-                    // COM 起不来通常是没装 Excel：给一句能懂的话，别丢一串 HRESULT
-                    let no_excel = low.contains("80040154")
-                        || low.contains("class not registered")
-                        || err.contains("无法创建")
-                        || err.contains("ActiveX");
-                    self.status = if no_excel {
-                        "本机未安装 Microsoft Excel，无法直接运行宏（可导出宏代码至安装 Excel 的设备上执行）".into()
-                    } else {
-                        format!("宏执行失败：{}", err.lines().next().unwrap_or("未知错误"))
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.macro_run_rx = Some(rx);
+        self.status = format!("正在后台隔离副本中执行宏 {macro_trimmed}（最长等待 60 秒）…");
+        std::thread::spawn(move || {
+            let msg = match hidden_console_cmd("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-InputFormat", "None", "-Command", &ps])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    let timed_out = loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break false,
+                            Ok(None) => {
+                                if std::time::Instant::now() >= deadline {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    break true;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            Err(_) => break false,
+                        }
                     };
+                    if timed_out {
+                        format!(
+                            "宏 {macro_trimmed} 执行超过 60 秒已强制中止（原文件未改动，隔离副本位于 {}）",
+                            copy.display()
+                        )
+                    } else if let Ok(out) = child.wait_with_output() {
+                        let text = String::from_utf8_lossy(&out.stdout).to_string();
+                        if text.contains("OK") {
+                            format!(
+                                "宏 {macro_trimmed} 已在隔离副本上执行完毕，原文件未改动：{}",
+                                copy.display()
+                            )
+                        } else {
+                            let err = String::from_utf8_lossy(&out.stderr).to_string();
+                            let low = err.to_lowercase();
+                            let no_excel = low.contains("80040154")
+                                || low.contains("class not registered")
+                                || err.contains("无法创建")
+                                || err.contains("ActiveX");
+                            if no_excel {
+                                "本机未安装 Microsoft Excel，无法直接运行宏（可导出宏代码至安装 Excel 的设备上执行）".into()
+                            } else {
+                                format!("宏执行失败：{}", err.lines().next().unwrap_or("未知错误"))
+                            }
+                        }
+                    } else {
+                        "读取宏执行输出失败".into()
+                    }
                 }
-            }
-            Err(e) => self.status = format!("无法启动 PowerShell：{e}"),
-        }
+                Err(e) => format!("无法启动 PowerShell：{e}"),
+            };
+            let _ = tx.send(msg);
+        });
     }
 
     /// 运行宏的输入框
@@ -35646,14 +35876,19 @@ impl SheetApp {
         let Some(mut text) = self.macro_run_dlg.take() else { return };
         let mut open = true;
         let mut apply = false;
-        ui_kit::window(ctx, "用本机 Excel 执行宏", 360.0)
+        ui_kit::window(ctx, "用本机 Excel 执行宏", 380.0)
             .collapsible(false)
             .resizable(false)
-            .default_width(320.0)
+            .default_width(360.0)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(
-                    egui::RichText::new("本应用不内置宏引擎，只把宏名转交本机 Excel 执行；不认识的宏不会自动运行。")
+                    egui::RichText::new("安全提示：VBA 宏可访问本机文件与系统接口，请仅运行来自可信来源的工作簿宏。")
+                        .size(11.0)
+                        .color(Color32::from_rgb(180, 83, 9)),
+                );
+                ui.label(
+                    egui::RichText::new("本应用不内置宏引擎，只把宏名转交本机 Excel 在隔离副本中后台执行（60 秒超时保护）。")
                         .size(10.5)
                         .weak(),
                 );
@@ -38245,9 +38480,71 @@ impl SheetApp {
     /// 1) 优先同步同窗口已打开的源工作簿标签页（内存级零延迟）；
     /// 2) 每 1.5 秒在后台线程检测磁盘/共享盘源文件（含同目录、子目录、最近打开路径）的修改时间与大小，
     ///    仅按被引用区域重读外部数据并触发静默重算，不读入未引用数据、不误标未编辑文档为脏。
+    fn maybe_show_untrusted_xlink_banner(&mut self) {
+        if self.wb.links.is_empty() || self.xlinks_trusted_docs.contains(&self.doc_uid) {
+            return;
+        }
+        if !sheetcore::xlinks::has_untrusted_auto_links(&self.wb) {
+            return;
+        }
+        let has_net = self.wb.links.iter().any(|l| {
+            sheetcore::xlinks::is_network_or_remote_target(&l.target)
+                || l.abs
+                    .as_deref()
+                    .is_some_and(sheetcore::xlinks::is_network_or_remote_target)
+        });
+        let title = if has_net {
+            "已暂停自动读取网络/共享路径外部链接".to_string()
+        } else {
+            "已暂停自动读取目录外外部链接".to_string()
+        };
+        let detail = if has_net {
+            "此工作簿包含指向网络/UNC 共享路径的外部链接。为防止未经授权的网络访问或凭据泄露，默认仅显示内嵌缓存值；确认来源可信后再启用。"
+        } else {
+            "此工作簿包含指向当前项目目录之外的外部链接。默认仅显示内嵌缓存值；确认来源可信后再启用自动更新。"
+        };
+        self.set_notice(NoticeBanner {
+            level: NoticeLevel::Warn,
+            title,
+            detail: detail.into(),
+            actions: vec![("信任并更新外部链接".into(), NoticeAction::TrustExternalLinks)],
+            tag: Some("xlink_trust"),
+            target_doc_uid: Some(self.doc_uid),
+        });
+    }
+
+    fn trust_and_refresh_xlinks(&mut self, ctx: &egui::Context) {
+        self.xlinks_trusted_docs.insert(self.doc_uid);
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|n| n.tag == Some("xlink_trust"))
+        {
+            self.notice = None;
+        }
+        let hints = self.xlink_hint_paths();
+        let tab_synced = self.sync_xlinks_from_open_tabs(Some(ctx));
+        let (rep, _) = sheetcore::xlinks::refresh_with_hints(&mut self.wb, &hints);
+        self.xlink_last_check = None;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.cf_stats_gen = u64::MAX;
+        self.tasks.last_edit = None;
+        self.request_silent_bg_recalc();
+        self.status = if rep.failed.is_empty() {
+            format!("已启用并同步 {} 个外部链接", rep.ok.max(tab_synced.len()))
+        } else {
+            format!(
+                "已启用外部链接：成功 {} 个，未找到 {} 个",
+                rep.ok,
+                rep.failed.len()
+            )
+        };
+    }
+
     pub(crate) fn poll_auto_xlinks(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.xlink_bg_rx {
-            if let Ok(res) = rx.try_recv() {
+            match rx.try_recv() {
+                Ok(res) => {
                 self.xlink_bg_rx = None;
                 if res.doc_uid == self.doc_uid {
                     let uid = self.doc_uid;
@@ -38302,6 +38599,11 @@ impl SheetApp {
                         ctx.request_repaint();
                     }
                 }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.xlink_bg_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
 
@@ -38332,6 +38634,7 @@ impl SheetApp {
         }
 
         let uid = self.doc_uid;
+        let trusted = self.xlinks_trusted_docs.contains(&uid);
         let base = self
             .wb
             .path
@@ -38339,7 +38642,11 @@ impl SheetApp {
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf())
             .unwrap_or_default();
-        let hints = self.xlink_hint_paths();
+        let hints = if trusted {
+            self.xlink_hint_paths()
+        } else {
+            Vec::new()
+        };
         let filters = sheetcore::xlinks::build_book_filters(&self.wb);
         // 仅克隆轻量元数据与被引用范围（不克隆大体积 cache），每 1.5s 轮询开销接近零
         let metas: Vec<(
@@ -38380,7 +38687,11 @@ impl SheetApp {
             let now = std::time::SystemTime::now();
 
             for (link_idx, slim, bf, prev_stamp, prev_res) in metas {
-                let found = sheetcore::xlinks::resolve_path_with_hints(&slim, &base, &hints);
+                let found = if trusted {
+                    sheetcore::xlinks::resolve_path_with_hints(&slim, &base, &hints)
+                } else {
+                    sheetcore::xlinks::resolve_safe_local_path(&slim, &base)
+                };
                 if found != prev_res {
                     any_res_diff = true;
                 }
@@ -38583,6 +38894,7 @@ impl SheetApp {
                         l.cache.clear();
                         l.refreshed = false;
                     }
+                    self.xlinks_trusted_docs.insert(uid);
                     self.xlink_stamps.remove(&(uid, link_idx));
                     self.xlink_resolved.insert((uid, link_idx), Some(p));
                     let new_hints = self.xlink_hint_paths();
@@ -38619,6 +38931,14 @@ impl SheetApp {
             }
         }
         if do_refresh {
+            self.xlinks_trusted_docs.insert(uid);
+            if self
+                .notice
+                .as_ref()
+                .is_some_and(|n| n.tag == Some("xlink_trust"))
+            {
+                self.notice = None;
+            }
             let tab_synced = self.sync_xlinks_from_open_tabs(Some(ctx));
             let (rep, _) = sheetcore::xlinks::refresh_with_hints(&mut self.wb, &hints);
             for l in &mut self.wb.links {
@@ -50934,7 +51254,10 @@ fn elide(s: &str, max_chars: usize) -> String {
         let (tx, rx) = std::sync::mpsc::channel();
         self.update_ui.rx = Some(rx);
         std::thread::spawn(move || {
-            let result = update::probe_all_sources();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                update::probe_all_sources,
+            ))
+            .unwrap_or_else(|_| Err("检查更新后台线程异常退出".into()));
             let _ = tx.send(UpdateWorkerMsg::CheckDone { manual, result });
             if let Some(ctx) = wake {
                 ctx.request_repaint();
@@ -50980,18 +51303,21 @@ fn elide(s: &str, max_chars: usize) -> String {
             let tx_prog = tx.clone();
             let wake_prog = wake.clone();
             let mut last_pct = 0u64;
-            let res = update::download_and_verify(&avail, |done, total| {
-                let pct = (done.saturating_mul(100)) / total.max(1);
-                if done == total || pct >= last_pct.saturating_add(2) {
-                    last_pct = pct;
-                    let _ = tx_prog.send(UpdateWorkerMsg::Progress {
-                        received: done,
-                        total,
-                    });
-                    wake_prog.request_repaint();
-                }
-            })
-            .and_then(|verified_path| update::install_in_place(&verified_path));
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                update::download_and_verify(&avail, |done, total| {
+                    let pct = (done.saturating_mul(100)) / total.max(1);
+                    if done == total || pct >= last_pct.saturating_add(2) {
+                        last_pct = pct;
+                        let _ = tx_prog.send(UpdateWorkerMsg::Progress {
+                            received: done,
+                            total,
+                        });
+                        wake_prog.request_repaint();
+                    }
+                })
+                .and_then(|verified_path| update::install_in_place(&verified_path))
+            }))
+            .unwrap_or_else(|_| Err("安装更新后台线程异常退出".into()));
 
             match res {
                 Ok(_) => {
@@ -51131,7 +51457,10 @@ fn elide(s: &str, max_chars: usize) -> String {
             let force_probe = debug_flags::is_set("SC_UPDATE_CHECK");
             if force_probe || (!is_headless_probe_env() && !cfg!(test)) {
                 self.update_done = true;
-                std::thread::spawn(update::cleanup_old_exe);
+                std::thread::spawn(|| {
+                    update::cleanup_old_exe();
+                    sheetcore::xlsx::cleanup_stale_workbook_temp_dirs();
+                });
                 if force_probe || !update::candidate_http_urls().is_empty() || update::dir().is_some()
                 {
                     self.spawn_update_check(force_probe, Some(ctx.clone()));
@@ -51142,9 +51471,26 @@ fn elide(s: &str, max_chars: usize) -> String {
         }
 
         let mut msgs = Vec::new();
+        let mut update_rx_disconnected = false;
         if let Some(rx) = &self.update_ui.rx {
-            while let Ok(m) = rx.try_recv() {
-                msgs.push(m);
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => msgs.push(m),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        update_rx_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if update_rx_disconnected {
+            self.update_ui.rx = None;
+            if msgs.is_empty() && (self.update_ui.checking || self.update_ui.downloading) {
+                self.update_ui.checking = false;
+                self.update_ui.downloading = false;
+                self.update_ui.progress = None;
+                self.update_ui.error = Some("更新后台线程意外中止".into());
             }
         }
         for msg in msgs {
@@ -52041,6 +52387,8 @@ fn elide(s: &str, max_chars: usize) -> String {
                         let label = op.label();
                         sheetcore::structural::apply_structural_wb(&mut self.wb, sheet, &op);
                         self.shift_collab_coordinates(sheet, &op);
+                        // 远端插删行/列已改变全表坐标基准，清空本地撤销栈避免旧坐标回放写错行/列
+                        self.undo.clear();
                         self.tasks.last_edit = Some(std::time::Instant::now());
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -54008,6 +54356,7 @@ impl eframe::App for SheetApp {
         self.poll_save();
         self.tick_autosave(Some(ctx));
         self.poll_auto_xlinks(ctx);
+        self.poll_bg_import_and_macro(ctx);
         // 动态引用或大范围下游公式：停手 250ms 后在独立后台静默线程中无感补算，
         // 绝不占用 tasks.busy / open_rx，彻底杜绝弹出「正在重算」模态遮罩打断连续输入！
         self.start_silent_recalc(ctx);

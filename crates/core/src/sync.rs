@@ -205,14 +205,14 @@ impl SheetMetaKind {
 /// 默认单元格编辑租约时长（毫秒）
 pub const DEFAULT_LEASE_TTL_MS: u64 = 20_000;
 
-/// 按行列增删重算单元格坐标；落入被删除行/列的坐标返回 `None`。
+/// 按行列增删重算单元格坐标；落入被删除行/列或被推出 Excel 表格边界的坐标返回 `None`。
 pub fn shift_structural_coord(
     r: u32,
     c: u32,
     op: &crate::structural::Structural,
 ) -> Option<(u32, u32)> {
     use crate::structural::Structural as S;
-    let axis = |v: u32, at: u32, n: u32, del: bool| -> Option<u32> {
+    let axis = |v: u32, at: u32, n: u32, del: bool, limit: u32| -> Option<u32> {
         if del {
             if v < at {
                 Some(v)
@@ -222,16 +222,16 @@ pub fn shift_structural_coord(
                 Some(v - n)
             }
         } else if v >= at {
-            Some(v.saturating_add(n))
+            v.checked_add(n).filter(|&nv| nv < limit)
         } else {
-            Some(v)
+            (v < limit).then_some(v)
         }
     };
     match op {
-        S::InsertRows { at, n } => axis(r, *at, *n, false).map(|nr| (nr, c)),
-        S::DeleteRows { at, n } => axis(r, *at, *n, true).map(|nr| (nr, c)),
-        S::InsertCols { at, n } => axis(c, *at, *n, false).map(|nc| (r, nc)),
-        S::DeleteCols { at, n } => axis(c, *at, *n, true).map(|nc| (r, nc)),
+        S::InsertRows { at, n } => axis(r, *at, *n, false, MAX_ROWS).map(|nr| (nr, c)),
+        S::DeleteRows { at, n } => axis(r, *at, *n, true, MAX_ROWS).map(|nr| (nr, c)),
+        S::InsertCols { at, n } => axis(c, *at, *n, false, MAX_COLS).map(|nc| (r, nc)),
+        S::DeleteCols { at, n } => axis(c, *at, *n, true, MAX_COLS).map(|nc| (r, nc)),
     }
 }
 
@@ -1970,12 +1970,16 @@ impl BaselineBook {
             match *op {
                 S::InsertRows { at, n } => {
                     sh.remap_cell_axis(true, at, |r| {
-                        Some(if r >= at { r.saturating_add(n) } else { r })
+                        if r >= at {
+                            r.checked_add(n).filter(|&nr| nr < MAX_ROWS)
+                        } else {
+                            (r < MAX_ROWS).then_some(r)
+                        }
                     });
                     let moved: Vec<_> = sh
                         .row_styles
                         .extract_if(|&r, _| r >= at)
-                        .map(|(r, id)| (r.saturating_add(n), id))
+                        .filter_map(|(r, id)| Some((r.checked_add(n).filter(|&nr| nr < MAX_ROWS)?, id)))
                         .collect();
                     sh.row_styles.extend(moved);
                 }
@@ -1998,12 +2002,16 @@ impl BaselineBook {
                 }
                 S::InsertCols { at, n } => {
                     sh.remap_cell_axis(false, at, |c| {
-                        Some(if c >= at { c.saturating_add(n) } else { c })
+                        if c >= at {
+                            c.checked_add(n).filter(|&nc| nc < MAX_COLS)
+                        } else {
+                            (c < MAX_COLS).then_some(c)
+                        }
                     });
                     let moved: Vec<_> = sh
                         .col_styles
                         .extract_if(|&c, _| c >= at)
-                        .map(|(c, id)| (c.saturating_add(n), id))
+                        .filter_map(|(c, id)| Some((c.checked_add(n).filter(|&nc| nc < MAX_COLS)?, id)))
                         .collect();
                     sh.col_styles.extend(moved);
                 }

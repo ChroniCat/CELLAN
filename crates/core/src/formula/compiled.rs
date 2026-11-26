@@ -740,7 +740,7 @@ pub(super) fn eval_projected_scalar(
     read: &mut impl FnMut(Option<&str>, u32, u32) -> Option<FValue>,
 ) -> Option<FValue> {
     Some(match node {
-        Node::Number(v) => FValue::Number(*v),
+        Node::Number(v) => FValue::number(*v),
         Node::Bool(b) => FValue::Bool(*b),
         Node::Text(s) => FValue::Text(s.clone()),
         Node::Err(e) => FValue::Error(*e),

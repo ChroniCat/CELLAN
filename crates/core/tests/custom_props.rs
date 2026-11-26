@@ -13,6 +13,7 @@ fn src(i: u32, path: &str) -> Source {
         name: format!("_sc_src_{i}"),
         kind: Kind::Csv { path: path.into(), delim: ',', header: true },
         at: (0, 0),
+        target_sheet: None,
         rows: 2,
         cols: 2,
         csv_opts: None,

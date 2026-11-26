@@ -230,6 +230,50 @@ pub fn write_session(
     write_session_with_hosts(file, host, &[], user, session, started_ms, "")
 }
 
+const MAX_LOCK_FILE_BYTES: u64 = 16 * 1024;
+
+/// 校验会话令牌：仅允许 1..=64 位单段 ASCII 安全字符，防止 `.dead-<session>` 路径穿越。
+fn is_valid_session_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// 单行锁文件字段清洗：剥离 CR/LF 防止换行注入其他键值对。
+fn sanitize_single_line(s: &str) -> String {
+    s.chars().filter(|&c| c != '\r' && c != '\n').collect()
+}
+
+/// 有界读取锁文件文本（上限 16 KiB，防止共享目录恶意超大锁文件耗尽内存）。
+fn read_bounded_text(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(MAX_LOCK_FILE_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_LOCK_FILE_BYTES {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+/// 原子回收过期锁文件：先重命名为唯一墓碑名，仅抢占成功的一方删除墓碑并继续创建新文件，
+/// 消除 `remove_file` -> `create_new` 的双宿主竞态。
+fn claim_stale_file_via_tombstone(path: &Path) -> bool {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+        return false;
+    };
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let nonce = new_session_id();
+    let tombstone = dir.join(format!("{name}.reclaim-{}-{nonce}", std::process::id()));
+    if std::fs::rename(path, &tombstone).is_ok() {
+        let _ = std::fs::remove_file(&tombstone);
+        true
+    } else {
+        false
+    }
+}
+
 pub fn write_session_with_hosts(
     file: &Path,
     host: &str,
@@ -240,26 +284,33 @@ pub fn write_session_with_hosts(
     secret: &str,
 ) -> std::io::Result<()> {
     let p = lock_path(file);
+    let fname = file
+        .file_name()
+        .map(|s| sanitize_single_line(&s.to_string_lossy()))
+        .unwrap_or_default();
     let mut info = format!(
         "version=2\nfile={}\nhost={}\nuser={}\nmachine={}\npid={}\nbeat={}\n",
-        file.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
-        host,
-        user,
-        machine_name(),
+        fname,
+        sanitize_single_line(host),
+        sanitize_single_line(user),
+        sanitize_single_line(&machine_name()),
         std::process::id(),
         now_secs()
     );
     if !hosts.is_empty() {
-        info.push_str(&format!("hosts={}\n", hosts.join(",")));
+        let clean_hosts: Vec<String> = hosts.iter().map(|h| sanitize_single_line(h)).collect();
+        info.push_str(&format!("hosts={}\n", clean_hosts.join(",")));
     }
-    if !session.is_empty() {
-        info.push_str(&format!("session={session}\n"));
+    let clean_session = sanitize_single_line(session);
+    if !clean_session.is_empty() {
+        info.push_str(&format!("session={clean_session}\n"));
     }
     if started_ms > 0 {
         info.push_str(&format!("started_ms={started_ms}\n"));
     }
-    if !secret.trim().is_empty() {
-        info.push_str(&format!("secret={}\n", secret.trim()));
+    let clean_secret = sanitize_single_line(secret.trim());
+    if !clean_secret.is_empty() {
+        info.push_str(&format!("secret={clean_secret}\n"));
     }
     atomic_write_text(&p, &info)
 }
@@ -280,7 +331,7 @@ pub fn remove_for_session(file: &Path, session: &str) {
 }
 
 pub fn read(file: &Path) -> Option<LockInfo> {
-    let text = std::fs::read_to_string(lock_path(file)).ok()?;
+    let text = read_bounded_text(&lock_path(file))?;
     let mut info = LockInfo {
         file: String::new(),
         host: String::new(),
@@ -309,7 +360,15 @@ pub fn read(file: &Path) -> Option<LockInfo> {
             "machine" => info.machine = v.trim().to_string(),
             "pid" => info.pid = v.trim().parse().unwrap_or(0),
             "beat" => info.beat = v.trim().parse().unwrap_or(0),
-            "session" => info.session = v.trim().to_string(),
+            "session" => {
+                let s = v.trim();
+                if !s.is_empty() {
+                    if !is_valid_session_id(s) {
+                        return None;
+                    }
+                    info.session = s.to_string();
+                }
+            }
             "started_ms" => info.started_ms = v.trim().parse().unwrap_or(0),
             "secret" => info.secret = v.trim().to_string(),
             _ => {}
@@ -612,18 +671,19 @@ pub fn elect_path(file: &Path) -> PathBuf {
 fn format_election(session: &str) -> String {
     let mut s = format!(
         "machine={}\npid={}\nbeat={}\n",
-        machine_name(),
+        sanitize_single_line(&machine_name()),
         std::process::id(),
         now_secs()
     );
-    if !session.is_empty() {
-        s.push_str(&format!("session={session}\n"));
+    let clean = sanitize_single_line(session);
+    if !clean.is_empty() {
+        s.push_str(&format!("session={clean}\n"));
     }
     s
 }
 
 fn read_election(file: &Path) -> Option<(String, String, u32, u64)> {
-    let text = std::fs::read_to_string(elect_path(file)).ok()?;
+    let text = read_bounded_text(&elect_path(file))?;
     let mut session = String::new();
     let mut machine = String::new();
     let mut pid = 0u32;
@@ -631,7 +691,15 @@ fn read_election(file: &Path) -> Option<(String, String, u32, u64)> {
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
         match k.trim() {
-            "session" => session = v.trim().to_string(),
+            "session" => {
+                let s = v.trim();
+                if !s.is_empty() {
+                    if !is_valid_session_id(s) {
+                        return None;
+                    }
+                    session = s.to_string();
+                }
+            }
             "machine" => machine = v.trim().to_string(),
             "pid" => pid = v.trim().parse().unwrap_or(0),
             "beat" => beat = v.trim().parse().unwrap_or(0),
@@ -670,20 +738,22 @@ fn election_is_stale(file: &Path) -> bool {
     false
 }
 
-fn dead_claim_path(file: &Path, dead_session: &str) -> PathBuf {
+fn dead_claim_path(file: &Path, dead_session: &str) -> Option<PathBuf> {
+    if !is_valid_session_id(dead_session) {
+        return None;
+    }
     let name = file
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "workbook".into());
     let dir = file.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(format!(".~sheetflow-{name}.dead-{dead_session}"))
+    Some(dir.join(format!(".~sheetflow-{name}.dead-{dead_session}")))
 }
 
 fn try_claim_dead_session(file: &Path, dead_session: &str) -> bool {
-    if dead_session.is_empty() {
+    let Some(claim) = dead_claim_path(file, dead_session) else {
         return false;
-    }
-    let claim = dead_claim_path(file, dead_session);
+    };
     if create_new_hidden(&claim).is_ok() {
         return true;
     }
@@ -694,8 +764,7 @@ fn try_claim_dead_session(file: &Path, dead_session: &str) -> bool {
             .and_then(|t| t.elapsed().ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if age > STALE_SECS {
-            let _ = std::fs::remove_file(&claim);
+        if age > STALE_SECS && claim_stale_file_via_tombstone(&claim) {
             return create_new_hidden(&claim).is_ok();
         }
     }
@@ -736,7 +805,7 @@ pub fn claim_election_takeover(
             // 原宿主异常退出或断电但选主心跳尚未满 20 秒：
             // 若其占用卡端口明确 Dead，或属于刚断开的原宿主且不可达，
             // 通过 `.dead-<esess>` 独占锁保证只有一个接任者能回收旧选主卡并当选。
-            if !esess.is_empty() {
+            if is_valid_session_id(&esess) {
                 if let Some(li) = read(file) {
                     if li.session == esess {
                         let liveness = probe_host(&li);
@@ -748,7 +817,9 @@ pub fn claim_election_takeover(
                                 let _ = std::fs::remove_file(&p);
                                 let ok = create().is_ok();
                                 if ok {
-                                    let _ = std::fs::remove_file(dead_claim_path(file, &esess));
+                                    if let Some(claim) = dead_claim_path(file, &esess) {
+                                        let _ = std::fs::remove_file(claim);
+                                    }
                                 }
                                 return ok;
                             }
@@ -759,8 +830,7 @@ pub fn claim_election_takeover(
             }
         }
     }
-    if election_is_stale(file) {
-        let _ = std::fs::remove_file(&p);
+    if election_is_stale(file) && claim_stale_file_via_tombstone(&p) {
         return create().is_ok();
     }
     false
@@ -1136,12 +1206,16 @@ fn fw_hint_path(file: &Path) -> PathBuf {
 /// 客户端发现新鲜占用卡却因 TCP 超时连不进去时，向共享目录写入一条轻量受阻提示，
 /// 让宿主机器直接在界面顶部弹出「一键放行防火墙」提示条。
 pub fn write_join_blocked_hint(file: &Path, client_user: &str) {
-    let body = format!("user={}\nbeat={}\n", client_user.trim(), now_secs());
+    let body = format!(
+        "user={}\nbeat={}\n",
+        sanitize_single_line(client_user.trim()),
+        now_secs()
+    );
     let _ = atomic_write_text(&fw_hint_path(file), &body);
 }
 
 pub fn read_join_blocked_hint(file: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(fw_hint_path(file)).ok()?;
+    let text = read_bounded_text(&fw_hint_path(file))?;
     let mut user = String::new();
     let mut beat = 0u64;
     for line in text.lines() {
@@ -1248,5 +1322,37 @@ beat={}
         assert!(is_network_path(&f), "标记了 .cellan-share 的目录必须被识别为协同目录");
         set_dir_marked_shared(&f, false).unwrap();
         assert!(!is_dir_marked_shared(&f));
+    }
+
+    #[test]
+    fn session_id_validation_blocks_path_traversal_and_crlf_injection() {
+        let dir = crate::test_env::scratch("session-lock-sec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("doc.xlsx");
+        std::fs::write(&f, b"x").unwrap();
+
+        // Malicious session id with path traversal in lock file must be rejected
+        let evil = format!(
+            "version=1\nfile=doc.xlsx\nhost=127.0.0.1:7878\nuser=evil\nmachine=M\npid=1\nbeat={}\nsession=../../outside\n",
+            now_secs()
+        );
+        std::fs::write(lock_path(&f), evil).unwrap();
+        assert!(read(&f).is_none(), "path traversal session id must be rejected");
+
+        // try_claim_dead_session with traversal session id must NOT create files outside dir
+        assert!(!try_claim_dead_session(&f, "../../outside_dead"));
+        assert!(!dir.parent().unwrap().join("outside_dead").exists());
+
+        // Oversized lock file must be rejected cleanly
+        std::fs::write(lock_path(&f), "a".repeat(32 * 1024)).unwrap();
+        assert!(read(&f).is_none(), "oversized lock file must be rejected");
+
+        // CR/LF injection in user/host must be sanitized on write
+        let _ = std::fs::remove_file(lock_path(&f));
+        write_session(&f, "127.0.0.1:7878\nhost=evil:9999", "张三\nuser=冒充", "sess_ok_1", 100).unwrap();
+        let info = read(&f).expect("sanitized lock must parse");
+        assert!(!info.host.contains('\n'));
+        assert!(!info.user.contains('\n'));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

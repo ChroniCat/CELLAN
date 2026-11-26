@@ -21,13 +21,48 @@ pub fn write_parts(path: &Path, items: &[(String, Vec<u8>)]) -> Result<()> {
     crate::patch::append_entries(path, items)
 }
 
+/// 默认元信息/关系部件的解压安全上限（64 MiB）
+pub(crate) const MAX_META_PART_BYTES: u64 = 64 * 1024 * 1024;
+/// 工作表与共享字符串等大型 XML 部件的解压安全上限（512 MiB）
+pub(crate) const MAX_SHEET_PART_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 带防 zip 炸弹上限的安全读流：先核验头部声明大小，再用 `.take(cap + 1)` 防止伪造 header。
+pub(crate) fn read_zip_entry_limited<R: Read>(
+    entry: &mut zip::read::ZipFile<'_, R>,
+    cap: u64,
+) -> std::io::Result<Vec<u8>> {
+    if entry.size() > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("ZIP 部件解压大小超出安全上限（{} > {} 字节）", entry.size(), cap),
+        ));
+    }
+    let init_cap = (entry.size() as usize).min(cap as usize).min(4 * 1024 * 1024);
+    let mut buf = Vec::with_capacity(init_cap);
+    entry.take(cap.saturating_add(1)).read_to_end(&mut buf)?;
+    if (buf.len() as u64) > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("ZIP 部件实际解压内容超出安全上限（> {} 字节）", cap),
+        ));
+    }
+    Ok(buf)
+}
+
+pub(crate) fn read_zip_entry_string_limited<R: Read>(
+    entry: &mut zip::read::ZipFile<'_, R>,
+    cap: u64,
+) -> std::io::Result<String> {
+    let bytes = read_zip_entry_limited(entry, cap)?;
+    String::from_utf8(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// 只读磁盘上的包，不看暂存（用于读"基准文件"，那是另一个文件）
 pub fn read_part_file(path: &Path, name: &str) -> Option<Vec<u8>> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
     let mut f = zip.by_name(name).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    Some(buf)
+    read_zip_entry_limited(&mut f, MAX_SHEET_PART_BYTES).ok()
 }
 
 pub fn read_part(path: &Path, name: &str) -> Option<Vec<u8>> {
@@ -36,9 +71,7 @@ pub fn read_part(path: &Path, name: &str) -> Option<Vec<u8>> {
     }
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
     let mut f = zip.by_name(name).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    Some(buf)
+    read_zip_entry_limited(&mut f, MAX_SHEET_PART_BYTES).ok()
 }
 
 /// 包内全部条目名（含暂存），供需要按后缀扫描的调用方使用

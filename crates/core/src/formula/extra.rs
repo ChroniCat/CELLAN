@@ -2197,7 +2197,7 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
         "ISOWEEKNUM" => r(|| {
             let serial = num(args, 0)?;
             let (y, m, d) = serial_to_date_in(sys, serial).ok_or(ErrKind::Num)?;
-            Ok(FValue::number(iso_week(sys, y, m, d) as f64))
+            Ok(FValue::number(iso_week(y, m, d) as f64))
         }),
 
         // ============================ 债券：票息日推算
@@ -2699,57 +2699,35 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
                 }
                 Ok(m)
             };
-            let holidays: Vec<i64> = match args.get(args.len() - 1) {
-                Some(a) if args.len() >= 4 => a
-                    .values()
-                    .iter()
-                    .filter_map(|v| v.to_number().ok())
-                    .map(|v| v.floor() as i64)
-                    .collect(),
-                _ => Vec::new(),
+            let holidays: Vec<i64> = match args.get(3) {
+                Some(a) => {
+                    let mut hs = Vec::new();
+                    for v in a.slice() {
+                        match v {
+                            FValue::Empty => {}
+                            FValue::Error(e) => return Err(*e),
+                            _ => {
+                                let hf = v.to_number()?;
+                                if !hf.is_finite() {
+                                    return Err(ErrKind::Num);
+                                }
+                                hs.push(hf.floor() as i64);
+                            }
+                        }
+                    }
+                    hs
+                }
+                None => Vec::new(),
             };
-            let date_off = if sys.is_1904() { 1462 } else { 0 };
-            let is_workday = |d: i64, m: &[bool; 7], hol: &[i64]| -> bool {
-                let wd = ((d + date_off - 1).rem_euclid(7)) as usize;
-                let mon_based = (wd + 6) % 7;
-                !m[mon_based] && !hol.contains(&d)
-            };
+            let m = weekend_mask(args.get(2))?;
             if name == "NETWORKDAYS.INTL" {
-                let start = num(args, 0)?.floor() as i64;
-                let end = num(args, 1)?.floor() as i64;
-                let m = weekend_mask(args.get(2))?;
-                let (lo, hi, sign) = if start <= end { (start, end, 1.0) } else { (end, start, -1.0) };
-                let mut count = 0i64;
-                let mut d = lo;
-                while d <= hi {
-                    if is_workday(d, &m, &holidays) {
-                        count += 1;
-                    }
-                    d += 1;
-                }
-                Ok(FValue::number(sign * count as f64))
+                let start = num(args, 0)?;
+                let end = num(args, 1)?;
+                super::functions::networkdays_core(sys, start, end, &m, &holidays).map(FValue::number)
             } else {
-                let start = num(args, 0)?.floor() as i64;
-                let days = num(args, 1)? as i64;
-                let m = weekend_mask(args.get(2))?;
-                if m.iter().all(|&w| w) {
-                    return Err(ErrKind::Value);
-                }
-                let mut d = start;
-                let step = if days >= 0 { 1 } else { -1 };
-                let mut left = days.abs();
-                let mut guard = 0usize;
-                while left > 0 {
-                    guard += 1;
-                    if guard > 5_000_000 {
-                        return Err(ErrKind::Num);
-                    }
-                    d += step;
-                    if is_workday(d, &m, &holidays) {
-                        left -= 1;
-                    }
-                }
-                Ok(FValue::number(d as f64))
+                let start = num(args, 0)?;
+                let days = num(args, 1)?;
+                super::functions::workday_core(sys, start, days, &m, &holidays).map(FValue::number)
             }
         }),
 
@@ -3364,21 +3342,14 @@ fn binom_coef(n: usize, k: usize) -> f64 {
     acc
 }
 
-/// ISO 8601 周数
-fn iso_week(sys: DateSystem, y: i32, m: u32, d: u32) -> u32 {
-    let serial = match date_to_serial_in(sys, y, m, d) {
-        Some(s) => s as i64,
-        None => return 0,
-    };
-    // Excel 序列号 1 = 1900-01-01 = 周日，所以 (serial-1)%7 就是 0=周日
-    let weekday = (serial - 1).rem_euclid(7);
-    let iso_wd = if weekday == 0 { 7 } else { weekday };
-    let thursday = serial + (4 - iso_wd);
-    let (ty, _, _) = match serial_to_date_in(sys, thursday as f64) {
-        Some(v) => v,
-        None => return 0,
-    };
-    let jan1 = date_to_serial_in(sys, ty, 1, 1).unwrap_or(0.0) as i64;
+/// ISO 8601 周数（基于纯公历日序计算，避免 1904 体系年初跨回 1903 时出现负序列号）
+fn iso_week(y: i32, m: u32, d: u32) -> u32 {
+    let days = super::functions::days_from_civil(y, m, d);
+    // 1970-01-01 (days = 0) 为周四；映射到 ISO 星期 1=周一 .. 7=周日
+    let iso_wd = (days + 3).rem_euclid(7) + 1;
+    let thursday = days + (4 - iso_wd);
+    let (ty, _, _) = super::functions::civil_from_days(thursday);
+    let jan1 = super::functions::days_from_civil(ty, 1, 1);
     ((thursday - jan1) / 7 + 1) as u32
 }
 

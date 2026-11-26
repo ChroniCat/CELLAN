@@ -174,6 +174,7 @@ fn injected_failures_in_conditional_steps_abort_the_save() {
             rect: (0, 0, 1, 1),
         },
         at: (4, 0),
+        target_sheet: None,
         rows: 2,
         cols: 2,
     csv_opts: None,

@@ -621,6 +621,9 @@ fn escape_ident(s: &str) -> String {
 }
 
 fn replace_col_token(text: &str, old: &str, new: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
     let lead = text.len() - text.trim_start().len();
     let trail = text.len() - text.trim_end().len();
     let core = &text[lead..text.len().saturating_sub(trail)];

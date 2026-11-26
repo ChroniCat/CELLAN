@@ -218,7 +218,7 @@ impl PivotSpec2 {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PivotGrid {
     /// 表头块：每行等长（行字段名占左侧，列标签在右侧）
     pub headers: Vec<Vec<String>>,

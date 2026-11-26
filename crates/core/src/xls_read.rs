@@ -350,10 +350,14 @@ pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
     Ok(out)
 }
 
-/// SST：total(4) unique(4) 然后逐条字符串；CONTINUE 记录里的字符串可能跨段，
-/// 这里按「同一段内完整」处理（我们自己写出的文件不用 SST，Excel 的分段另有兜底）。
+/// SST：total(4) unique(4) 然后逐条字符串；按 BIFF8 规范完整支持跨 CONTINUE 续接字符数据（首字节续接 grbit）。
 fn parse_sst(stream: &[u8], start: usize, len: usize) -> Vec<String> {
-    let mut body: Vec<u8> = stream[start..(start + len).min(stream.len())].to_vec();
+    let mut chunks: Vec<&[u8]> = Vec::new();
+    let end0 = (start + len).min(stream.len());
+    if start >= end0 {
+        return Vec::new();
+    }
+    chunks.push(&stream[start..end0]);
     let mut i = start + len;
     while i + 4 <= stream.len() {
         let t = u16le(stream, i).unwrap();
@@ -361,20 +365,135 @@ fn parse_sst(stream: &[u8], start: usize, len: usize) -> Vec<String> {
             break;
         }
         let l = u16le(stream, i + 2).unwrap() as usize;
-        body.extend_from_slice(&stream[(i + 4).min(stream.len())..(i + 4 + l).min(stream.len())]);
+        let s = (i + 4).min(stream.len());
+        let e = (i + 4 + l).min(stream.len());
+        chunks.push(&stream[s..e]);
         i += 4 + l;
     }
-    let mut out = Vec::new();
-    let unique = u32le(&body, 4).unwrap_or(0) as usize;
-    let mut at = 8usize;
-    while out.len() < unique && at + 3 <= body.len() {
-        match read_str(&body, at) {
-            Some((s, used)) => {
-                out.push(s);
-                at += used;
-            }
-            None => break,
+    if chunks[0].len() < 8 {
+        return Vec::new();
+    }
+    let unique = u32le(chunks[0], 4).unwrap_or(0) as usize;
+    let mut out = Vec::with_capacity(unique.min(65_536));
+    let mut ci = 0usize;
+    let mut off = 8usize;
+
+    let advance_if_end = |chunks: &[&[u8]], ci: &mut usize, off: &mut usize| -> bool {
+        while *ci < chunks.len() && *off >= chunks[*ci].len() {
+            *ci += 1;
+            *off = 0;
         }
+        *ci < chunks.len()
+    };
+
+    let read_u8_raw = |chunks: &[&[u8]], ci: &mut usize, off: &mut usize| -> Option<u8> {
+        if !advance_if_end(chunks, ci, off) {
+            return None;
+        }
+        let b = chunks[*ci][*off];
+        *off += 1;
+        Some(b)
+    };
+    let read_u16_raw = |chunks: &[&[u8]], ci: &mut usize, off: &mut usize| -> Option<u16> {
+        let b0 = read_u8_raw(chunks, ci, off)?;
+        let b1 = read_u8_raw(chunks, ci, off)?;
+        Some(u16::from_le_bytes([b0, b1]))
+    };
+    let read_u32_raw = |chunks: &[&[u8]], ci: &mut usize, off: &mut usize| -> Option<u32> {
+        let b0 = read_u8_raw(chunks, ci, off)?;
+        let b1 = read_u8_raw(chunks, ci, off)?;
+        let b2 = read_u8_raw(chunks, ci, off)?;
+        let b3 = read_u8_raw(chunks, ci, off)?;
+        Some(u32::from_le_bytes([b0, b1, b2, b3]))
+    };
+    let skip_raw = |chunks: &[&[u8]], ci: &mut usize, off: &mut usize, mut n: usize| -> bool {
+        while n > 0 {
+            if !advance_if_end(chunks, ci, off) {
+                return false;
+            }
+            let avail = chunks[*ci].len() - *off;
+            let take = avail.min(n);
+            *off += take;
+            n -= take;
+        }
+        true
+    };
+
+    while out.len() < unique {
+        if !advance_if_end(&chunks, &mut ci, &mut off) {
+            break;
+        }
+        let Some(cch) = read_u16_raw(&chunks, &mut ci, &mut off) else { break };
+        let Some(flags) = read_u8_raw(&chunks, &mut ci, &mut off) else { break };
+        let mut is_utf16 = (flags & 0x01) != 0;
+        let has_ext = (flags & 0x04) != 0;
+        let has_rich = (flags & 0x08) != 0;
+        let rich_runs = if has_rich {
+            match read_u16_raw(&chunks, &mut ci, &mut off) {
+                Some(v) => v as usize,
+                None => break,
+            }
+        } else {
+            0
+        };
+        let ext_len = if has_ext {
+            match read_u32_raw(&chunks, &mut ci, &mut off) {
+                Some(v) => v as usize,
+                None => break,
+            }
+        } else {
+            0
+        };
+
+        let mut rem = cch as usize;
+        let mut s = String::with_capacity(rem.min(4096));
+        let mut u16_buf: Vec<u16> = Vec::new();
+        let mut ok = true;
+        while rem > 0 {
+            if off >= chunks[ci].len() {
+                if !advance_if_end(&chunks, &mut ci, &mut off) {
+                    ok = false;
+                    break;
+                }
+                // BIFF8 续接字符串跨入 CONTINUE 时首字节为续接编码标志 grbit
+                let cont_flags = chunks[ci][off];
+                off += 1;
+                is_utf16 = (cont_flags & 0x01) != 0;
+                continue;
+            }
+            let avail = chunks[ci].len() - off;
+            if is_utf16 {
+                let take_chars = (avail / 2).min(rem);
+                if take_chars == 0 {
+                    ok = false;
+                    break;
+                }
+                u16_buf.clear();
+                u16_buf.reserve(take_chars);
+                for k in 0..take_chars {
+                    let p = off + k * 2;
+                    u16_buf.push(u16::from_le_bytes([chunks[ci][p], chunks[ci][p + 1]]));
+                }
+                s.push_str(&String::from_utf16_lossy(&u16_buf));
+                off += take_chars * 2;
+                rem -= take_chars;
+            } else {
+                let take_chars = avail.min(rem);
+                for &b in &chunks[ci][off..off + take_chars] {
+                    s.push(b as char);
+                }
+                off += take_chars;
+                rem -= take_chars;
+            }
+        }
+        if !ok {
+            break;
+        }
+        let extra = rich_runs.saturating_mul(4).saturating_add(ext_len);
+        if !skip_raw(&chunks, &mut ci, &mut off, extra) {
+            break;
+        }
+        out.push(s);
     }
     out
 }

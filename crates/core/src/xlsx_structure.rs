@@ -297,8 +297,7 @@ pub(super) fn prepare_base(base: &Path, output: &Path, wb: &Workbook) -> Result<
         if removed_parts.contains(&name) { continue; }
         let pivot = if name.contains("pivotCacheDefinition") && name.ends_with(".xml") {
             let mut entry = zip.by_index(i)?;
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes)?;
+            let bytes = crate::fixups::read_zip_entry_limited(&mut entry, crate::fixups::MAX_META_PART_BYTES)?;
             Some(rewrite_pivot_source(&bytes, &changes)?)
         } else { None };
         let replacement = match name.as_str() {

@@ -313,12 +313,12 @@ impl RoomGrids {
         delta_styles: &SharedGrid<CellStyle>,
     ) -> Self {
         Self {
-            baseline: baseline.lock().unwrap().clone(),
+            baseline: baseline.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             axis_styles,
-            cells: cells.lock().unwrap().clone(),
-            delta: delta.lock().unwrap().clone(),
-            styles: styles.lock().unwrap().clone(),
-            delta_styles: delta_styles.lock().unwrap().clone(),
+            cells: cells.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            delta: delta.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            styles: styles.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            delta_styles: delta_styles.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
     }
 
@@ -488,10 +488,10 @@ impl RoomGrids {
         styles: &SharedGrid<CellStyle>,
         delta_styles: &SharedGrid<CellStyle>,
     ) -> bool {
-        let mut c = cells.lock().unwrap();
-        let mut d = delta.lock().unwrap();
-        let mut s = styles.lock().unwrap();
-        let mut ds = delta_styles.lock().unwrap();
+        let mut c = cells.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = delta.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = styles.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ds = delta_styles.lock().unwrap_or_else(|e| e.into_inner());
         if !(Arc::ptr_eq(&c, &self.cells)
             && Arc::ptr_eq(&d, &self.delta)
             && Arc::ptr_eq(&s, &self.styles)
@@ -526,7 +526,7 @@ pub(crate) fn shift_grid<V>(
     mut relocate: impl FnMut(&mut Arc<V>, u32, u32),
 ) {
     use sheetcore::structural::Structural::*;
-    let mut root = grid.lock().unwrap();
+    let mut root = grid.lock().unwrap_or_else(|e| e.into_inner());
     let source = root.clone();
     let target = Arc::make_mut(&mut root);
     let mut moved = Vec::new();

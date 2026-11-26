@@ -202,7 +202,7 @@ pub struct LambdaVal {
     pub params: Vec<std::sync::Arc<str>>,
     pub body: crate::formula::Node,
     /// 定义时捕获的环境（词法闭包：内层 LAMBDA 要能看见外层的参数）
-    pub env: Vec<EnvFrame>,
+    pub env: Vec<std::sync::Arc<EnvFrame>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -283,7 +283,12 @@ impl FValue {
                 if t.is_empty() {
                     return Err(ErrKind::Value);
                 }
-                t.parse::<f64>().map_err(|_| ErrKind::Value)
+                let n = t.parse::<f64>().map_err(|_| ErrKind::Value)?;
+                if n.is_finite() {
+                    Ok(n)
+                } else {
+                    Err(ErrKind::Value)
+                }
             }
             FValue::Error(e) => Err(*e),
             FValue::Lambda(_) => Err(ErrKind::Value),

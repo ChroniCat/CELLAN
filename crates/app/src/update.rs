@@ -297,18 +297,21 @@ pub fn sanitize_notes(raw: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect();
     let single = parts.join("；");
-    single
+    let clipped: String = single
         .chars()
         .filter(|c| !c.is_control())
         .take(500)
-        .collect()
+        .collect();
+    clipped.trim().to_string()
 }
 
 pub fn is_valid_version_str(version: &str) -> bool {
     !version.is_empty()
         && version.len() <= 32
         && version.chars().all(|c| c.is_ascii_digit() || c == '.')
-        && version.split('.').all(|seg| !seg.is_empty())
+        && version
+            .split('.')
+            .all(|seg| !seg.is_empty() && seg.len() <= 9 && seg.parse::<u64>().is_ok())
 }
 
 pub fn is_safe_exe_filename(exe: &str) -> bool {
@@ -416,18 +419,31 @@ fn parse_manifest(text: &str) -> Option<(String, String, String)> {
         }
     }
     let (version, exe, sha) = (version?, exe?, sha?);
-    let version_ok = !version.is_empty()
-        && version.len() <= 32
-        && version.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let version_ok = is_valid_version_str(&version);
     let exe_ok = is_safe_exe_filename(&exe);
     let sha_ok = is_valid_hex(&sha, 64);
     (version_ok && exe_ok && sha_ok).then_some((version, exe, sha))
 }
 
-/// 版本号比较：按点分段，数值比大小（"1.10" 比 "1.9" 新）
+/// 版本号比较：按点分段，数值比大小（"1.10" 比 "1.9" 新）；任意段解析溢出或非数字时返回 false。
 pub fn is_newer(remote: &str, local: &str) -> bool {
-    let a: Vec<u64> = remote.split('.').filter_map(|x| x.parse().ok()).collect();
-    let b: Vec<u64> = local.split('.').filter_map(|x| x.parse().ok()).collect();
+    let Ok(a) = remote
+        .split('.')
+        .map(|x| x.parse::<u64>())
+        .collect::<Result<Vec<u64>, _>>()
+    else {
+        return false;
+    };
+    let Ok(b) = local
+        .split('.')
+        .map(|x| x.parse::<u64>())
+        .collect::<Result<Vec<u64>, _>>()
+    else {
+        return false;
+    };
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
     for i in 0..a.len().max(b.len()) {
         let x = a.get(i).copied().unwrap_or(0);
         let y = b.get(i).copied().unwrap_or(0);
@@ -919,6 +935,12 @@ pub fn verify_and_finalize_staged_exe_with_sha(
     expected: &SignedManifest,
     precomputed_sha256: Option<&str>,
 ) -> Result<(), String> {
+    if !is_newer(&expected.version, VERSION) {
+        return Err(format!(
+            "更新包版本（v{}）不高于当前版本（v{}），已拒绝安装",
+            expected.version, VERSION
+        ));
+    }
     if !verify_manifest_sig(expected) {
         return Err("更新包数字签名校验未通过，已拒绝安装".into());
     }
@@ -1038,25 +1060,77 @@ fn connect_http_direct(base: &ParsedHttpBase, timeout: Duration) -> Result<TcpSt
         .to_socket_addrs()
         .map_err(|e| format!("解析更新源地址失败：{e}"))?
         .collect();
-    let Some(first) = addrs.first() else {
+    if addrs.is_empty() {
         return Err("无法解析更新源地址".into());
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_err = None;
+    for (idx, addr) in addrs.iter().enumerate() {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        let left = (addrs.len() - idx) as u32;
+        let per_attempt = if left <= 1 {
+            remaining
+        } else {
+            (remaining / left)
+                .max(Duration::from_millis(500))
+                .min(remaining)
+        };
+        match TcpStream::connect_timeout(addr, per_attempt) {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(match last_err {
+        Some(e) => format!("连接更新源超时或未在线：{e}"),
+        None => "连接更新源超时或未在线".into(),
+    })
+}
+
+const MAX_HTTP_LINE_BYTES: usize = 4096;
+
+fn read_bounded_http_line(
+    reader: &mut BufReader<TcpStream>,
+    max_len: usize,
+    deadline: std::time::Instant,
+) -> Result<Option<String>, String> {
+    let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+        return Err("读取 HTTP 响应超时".into());
     };
-    let stream =
-        TcpStream::connect_timeout(first, timeout).map_err(|e| format!("连接更新源超时或未在线：{e}"))?;
-    let _ = stream.set_nodelay(true);
-    Ok(stream)
+    if remaining.is_zero() {
+        return Err("读取 HTTP 响应超时".into());
+    }
+    let _ = reader.get_ref().set_read_timeout(Some(remaining));
+    let mut buf = Vec::new();
+    let n = reader
+        .by_ref()
+        .take((max_len as u64).saturating_add(1))
+        .read_until(b'\n', &mut buf)
+        .map_err(|e| format!("读取 HTTP 数据失败：{e}"))?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > max_len {
+        return Err("HTTP 行长度超出安全上限".into());
+    }
+    let line = String::from_utf8(buf).map_err(|_| "HTTP 头部包含非法 UTF-8".to_string())?;
+    Ok(Some(line))
 }
 
 fn read_http_response_head(
     reader: &mut BufReader<TcpStream>,
+    deadline: std::time::Instant,
 ) -> Result<(u16, Option<u64>), String> {
-    let mut status_line = String::new();
-    let n = reader
-        .read_line(&mut status_line)
-        .map_err(|e| format!("读取 HTTP 响应失败：{e}"))?;
-    if n == 0 {
+    let Some(status_line) = read_bounded_http_line(reader, MAX_HTTP_LINE_BYTES, deadline)? else {
         return Err("更新服务提前关闭了连接".into());
-    }
+    };
     let mut parts = status_line.split_whitespace();
     let _http_ver = parts.next().unwrap_or("");
     let code: u16 = parts
@@ -1066,14 +1140,13 @@ fn read_http_response_head(
     let mut content_len: Option<u64> = None;
     let mut header_bytes = 0usize;
     loop {
-        let mut line = String::new();
-        let k = reader
-            .read_line(&mut line)
-            .map_err(|e| format!("读取响应头失败：{e}"))?;
-        if k == 0 || line == "\r\n" || line == "\n" {
+        let Some(line) = read_bounded_http_line(reader, MAX_HTTP_LINE_BYTES, deadline)? else {
+            break;
+        };
+        if line == "\r\n" || line == "\n" {
             break;
         }
-        header_bytes += k;
+        header_bytes += line.len();
         if header_bytes > 16 * 1024 {
             return Err("HTTP 响应头过长".into());
         }
@@ -1104,8 +1177,9 @@ fn check_http_with_pubkey(
         .and_then(|_| stream.flush())
         .map_err(|e| format!("发送更新检查请求失败：{e}"))?;
 
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
     let mut reader = BufReader::new(stream);
-    let (code, content_len) = read_http_response_head(&mut reader)?;
+    let (code, content_len) = read_http_response_head(&mut reader, deadline)?;
     if code != 200 {
         return Err(format!("更新源返回 HTTP {code}"));
     }
@@ -1115,12 +1189,25 @@ fn check_http_with_pubkey(
         }
     }
     let mut body = Vec::new();
-    reader
-        .take(MAX_MANIFEST_BYTES as u64 + 1)
-        .read_to_end(&mut body)
-        .map_err(|e| format!("读取 manifest.txt 失败：{e}"))?;
-    if body.len() > MAX_MANIFEST_BYTES {
-        return Err("远端 manifest.txt 超出长度上限".into());
+    let mut chunk = [0u8; 4096];
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Err("读取 manifest.txt 超时".into());
+        };
+        if remaining.is_zero() {
+            return Err("读取 manifest.txt 超时".into());
+        }
+        let _ = reader.get_ref().set_read_timeout(Some(remaining));
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("读取 manifest.txt 失败：{e}"))?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+        if body.len() > MAX_MANIFEST_BYTES {
+            return Err("远端 manifest.txt 超出长度上限".into());
+        }
     }
     let text = String::from_utf8(body).map_err(|_| "manifest.txt 不是合法 UTF-8".to_string())?;
     let manifest =
@@ -1316,6 +1403,12 @@ pub fn download_and_verify(
     avail: &AvailableUpdate,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf, String> {
+    if !is_newer(&avail.manifest.version, VERSION) {
+        return Err(format!(
+            "更新包版本（v{}）不高于当前版本（v{}），已拒绝安装",
+            avail.manifest.version, VERSION
+        ));
+    }
     if !verify_manifest_sig(&avail.manifest) {
         return Err("更新清单缺少有效官方签名，无法自动安装".into());
     }
@@ -1353,8 +1446,10 @@ pub fn download_and_verify(
         let _ = std::fs::remove_file(&part_path);
         return Err(e);
     }
-    std::fs::rename(&part_path, &verified_path)
-        .map_err(|e| format!("归档已验证安装包失败：{e}"))?;
+    if let Err(e) = std::fs::rename(&part_path, &verified_path) {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(format!("归档已验证安装包失败：{e}"));
+    }
     Ok(verified_path)
 }
 
@@ -1381,8 +1476,10 @@ fn download_from_http(
         .and_then(|_| stream.flush())
         .map_err(|e| format!("请求下载更新包失败：{e}"))?;
 
+    let head_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let total_deadline = std::time::Instant::now() + Duration::from_secs(300);
     let mut reader = BufReader::new(stream);
-    let (code, content_len) = read_http_response_head(&mut reader)?;
+    let (code, content_len) = read_http_response_head(&mut reader, head_deadline)?;
     if code != 200 {
         return Err(format!("下载更新包失败（HTTP {code}）"));
     }
@@ -1396,6 +1493,15 @@ fn download_from_http(
     let mut received = 0u64;
     on_progress(0, total);
     loop {
+        let Some(remaining) = total_deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Err("下载更新包总耗时超时".into());
+        };
+        if remaining.is_zero() {
+            return Err("下载更新包总耗时超时".into());
+        }
+        let _ = reader
+            .get_ref()
+            .set_read_timeout(Some(remaining.min(Duration::from_secs(30))));
         let n = reader
             .read(&mut buf)
             .map_err(|e| format!("下载中断：{e}"))?;
@@ -1413,6 +1519,7 @@ fn download_from_http(
     }
     out.flush()
         .map_err(|e| format!("刷新临时安装包失败：{e}"))?;
+    let _ = out.sync_all();
     Ok(prefix_hash.finalize_hex())
 }
 
@@ -1486,6 +1593,9 @@ pub fn install_to_target(verified_exe: &Path, target_exe: &Path) -> Result<(), S
             false
         }
     };
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&staged_same_vol) {
+        let _ = f.sync_all();
+    }
 
     let primary_old = parent.join(format!("{file_name}.old"));
     let backup_old = if !primary_old.exists() || std::fs::remove_file(&primary_old).is_ok() {
@@ -1504,11 +1614,18 @@ pub fn install_to_target(verified_exe: &Path, target_exe: &Path) -> Result<(), S
     }
 
     if let Err(e) = std::fs::rename(&staged_same_vol, target_exe) {
-        let _ = std::fs::rename(&backup_old, target_exe);
+        let rolled_back = std::fs::rename(&backup_old, target_exe).is_ok();
         if !moved_in_place || std::fs::rename(&staged_same_vol, verified_exe).is_err() {
             let _ = std::fs::remove_file(&staged_same_vol);
         }
-        return Err(format!("替换新版可执行文件失败（已回滚原版本）：{e}"));
+        return Err(if rolled_back {
+            format!("替换新版可执行文件失败（已回滚原版本）：{e}")
+        } else {
+            format!(
+                "替换新版可执行文件失败且自动回滚失败（原备份位于 {}）：{e}",
+                backup_old.display()
+            )
+        });
     }
 
     if !moved_in_place {
@@ -1539,26 +1656,56 @@ pub fn spawn_restarted_process(reopen_file: Option<&Path>) -> Result<(), String>
     Ok(())
 }
 
-/// 清理上一次原地自更新遗留的 `CELLAN.exe.old` 备份文件
+/// 清理上一次原地自更新遗留的 `CELLAN.exe.old` / `.CELLAN.exe.*.new` 与过期的 `updates/` 临时文件
 pub fn cleanup_old_exe() {
-    let Ok(current) = std::env::current_exe() else {
+    let my_pid = std::process::id();
+    if let Ok(current) = std::env::current_exe()
+        && let Some(parent) = current.parent()
+        && let Some(name) = current.file_name().map(|n| n.to_string_lossy().to_string())
+    {
+        let old_prefix = format!("{name}.");
+        let new_prefix = format!(".{name}.");
+        let own_new = format!(".{name}.{my_pid}.new");
+        if let Ok(rd) = std::fs::read_dir(parent) {
+            for entry in rd.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                let is_old = fname == format!("{name}.old")
+                    || (fname.starts_with(&old_prefix) && fname.ends_with(".old"));
+                let is_stale_new = fname != own_new
+                    && fname.starts_with(&new_prefix)
+                    && fname.ends_with(".new");
+                if is_old || is_stale_new {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    cleanup_stale_update_cache(my_pid);
+}
+
+fn cleanup_stale_update_cache(my_pid: u32) {
+    let dir = app_dir().join("updates");
+    let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    let Some(parent) = current.parent() else {
-        return;
-    };
-    let Some(name) = current.file_name().map(|n| n.to_string_lossy().to_string()) else {
-        return;
-    };
-    let prefix = format!("{name}.");
-    let Ok(rd) = std::fs::read_dir(parent) else {
-        return;
-    };
+    let own_tag = format!("-{my_pid}.");
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(600))
+        .unwrap_or(std::time::UNIX_EPOCH);
     for entry in rd.flatten() {
         let fname = entry.file_name().to_string_lossy().to_string();
-        if fname == format!("{name}.old")
-            || (fname.starts_with(&prefix) && fname.ends_with(".old"))
+        if !fname.starts_with("CELLAN-")
+            || (!fname.ends_with(".part") && !fname.ends_with(".verified.exe"))
+            || fname.contains(&own_tag)
         {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t < cutoff)
+            .unwrap_or(false);
+        if stale {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -1616,6 +1763,27 @@ pub fn wait_for_old_process_and_cleanup(old_pid: Option<u32>) {
 // ---------------------------------------------------------------------------
 
 const SERVER_MAX_CONNS: usize = 16;
+const SERVER_MAX_CONNS_PER_IP: usize = 4;
+
+struct ConnPermit {
+    active: Arc<AtomicUsize>,
+    per_ip: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        let mut map = self.per_ip.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cnt) = map.get_mut(&self.ip) {
+            if *cnt <= 1 {
+                map.remove(&self.ip);
+            } else {
+                *cnt -= 1;
+            }
+        }
+    }
+}
 
 fn is_update_server_alive(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -1661,6 +1829,9 @@ pub fn serve_updates_on_listener(
         listener.set_nonblocking(true)?;
     }
     let active = Arc::new(AtomicUsize::new(0));
+    let per_ip = Arc::new(std::sync::Mutex::new(
+        std::collections::HashMap::<std::net::IpAddr, usize>::new(),
+    ));
     let manifest_cache = Arc::new(std::sync::Mutex::new(ServerManifestCache::default()));
     loop {
         if stop_flag
@@ -1669,26 +1840,49 @@ pub fn serve_updates_on_listener(
         {
             break;
         }
-        let stream = match listener.accept() {
-            Ok((s, _)) => s,
+        let (stream, peer) = match listener.accept() {
+            Ok(pair) => pair,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(25));
                 continue;
             }
-            Err(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
         };
         if active.load(Ordering::Relaxed) >= SERVER_MAX_CONNS {
             drop(stream);
             continue;
         }
+        let ip = peer.ip();
+        let ip_limit = if ip.is_loopback() {
+            SERVER_MAX_CONNS
+        } else {
+            SERVER_MAX_CONNS_PER_IP
+        };
+        {
+            let mut map = per_ip.lock().unwrap_or_else(|e| e.into_inner());
+            let cnt = map.entry(ip).or_insert(0);
+            if *cnt >= ip_limit {
+                drop(stream);
+                continue;
+            }
+            *cnt += 1;
+        }
         active.fetch_add(1, Ordering::Relaxed);
-        let active_clone = active.clone();
+        let permit = ConnPermit {
+            active: active.clone(),
+            per_ip: per_ip.clone(),
+            ip,
+        };
         let dir_clone = dir.clone();
         let cache_clone = manifest_cache.clone();
         std::thread::spawn(move || {
+            let _permit = permit;
             let _ = stream.set_nonblocking(false);
             let _ = handle_update_http_conn(stream, &dir_clone, &cache_clone);
-            active_clone.fetch_sub(1, Ordering::Relaxed);
         });
     }
     Ok(())
@@ -1720,22 +1914,26 @@ fn handle_update_http_conn(
     dir: &Path,
     cache: &std::sync::Mutex<ServerManifestCache>,
 ) -> std::io::Result<()> {
+    let head_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let transfer_deadline = std::time::Instant::now() + Duration::from_secs(120);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(120)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut req_line = String::new();
-    if reader.read_line(&mut req_line)? == 0 {
+    let Ok(Some(req_line)) = read_bounded_http_line(&mut reader, MAX_HTTP_LINE_BYTES, head_deadline)
+    else {
         return Ok(());
-    }
-    // 消费剩余请求头
+    };
+    // 消费剩余请求头（受总字节数、单行上限与总截止时间三重约束）
     let mut hdr_bytes = 0usize;
     loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 || line == "\r\n" || line == "\n" {
+        let Ok(Some(line)) = read_bounded_http_line(&mut reader, MAX_HTTP_LINE_BYTES, head_deadline)
+        else {
+            break;
+        };
+        if line == "\r\n" || line == "\n" {
             break;
         }
-        hdr_bytes += n;
+        hdr_bytes += line.len();
         if hdr_bytes > 16 * 1024 {
             return Ok(());
         }
@@ -1793,6 +1991,20 @@ fn handle_update_http_conn(
     if method != "HEAD" {
         let mut buf = vec![0u8; IO_BUF_BYTES];
         loop {
+            let Some(remaining) = transfer_deadline.checked_duration_since(std::time::Instant::now())
+            else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "update response transfer deadline exceeded",
+                ));
+            };
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "update response transfer deadline exceeded",
+                ));
+            }
+            let _ = stream.set_write_timeout(Some(remaining.min(Duration::from_secs(30))));
             let n = f.read(&mut buf)?;
             if n == 0 {
                 break;
@@ -2126,5 +2338,28 @@ mod tests {
         assert!(
             verify_and_finalize_staged_exe_with_sha(&bad_path, &manifest, Some(&sha)).is_err()
         );
+    }
+
+    #[test]
+    fn version_overflow_is_rejected_and_downgrade_manifest_blocked() {
+        assert!(!is_valid_version_str("99999999999999999999999999.1"));
+        assert!(!is_newer("99999999999999999999999999.1", "1.82"));
+        assert!(!is_newer("1.0", VERSION));
+        assert!(!is_newer(VERSION, VERSION));
+
+        #[cfg(windows)]
+        {
+            let env = crate::test_env::TestEnv::new("update-downgrade-block");
+            let kp = cng::TestKeyPair::generate();
+            env.sc("SC_UPDATE_PUBKEY", &kp.pubkey_hex);
+            let raw = b"MZ-old-version-payload";
+            let (old_manifest, full_exe) = make_test_signed_release(&kp, "1.0", raw, "old");
+            let staged = env.path("old.part");
+            std::fs::write(&staged, &full_exe).unwrap();
+            assert!(
+                verify_and_finalize_staged_exe_with_sha(&staged, &old_manifest, None).is_err(),
+                "downgrade signed manifest must be rejected by verifier"
+            );
+        }
     }
 }

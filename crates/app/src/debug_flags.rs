@@ -25,6 +25,7 @@ pub struct DebugFlags {
     pub palette_log: bool,
     pub page_log: bool,
     pub wiz_log: bool,
+    pub tree_log: bool,
     pub auto_share_enabled: bool,
     pub auto_share_forced: bool,
     pub fnrecent_record: bool,
@@ -70,6 +71,7 @@ impl DebugFlags {
                 palette_log: false,
                 page_log: false,
                 wiz_log: false,
+                tree_log: false,
                 auto_share_enabled: true,
                 auto_share_forced: false,
                 fnrecent_record: false,
@@ -97,6 +99,7 @@ impl DebugFlags {
             palette_log: raw.contains_key("SC_PALETTE_LOG"),
             page_log: raw.contains_key("SC_PAGE_LOG"),
             wiz_log: raw.contains_key("SC_WIZ_LOG"),
+            tree_log: raw.contains_key("SC_TREE_LOG"),
             auto_share_enabled: auto_share_val != Some("0"),
             auto_share_forced: auto_share_val == Some("1"),
             fnrecent_record: raw.contains_key("SC_FNRECENT_RECORD"),
@@ -242,6 +245,11 @@ pub fn page_log() -> bool {
 #[inline]
 pub fn wiz_log() -> bool {
     with(|f| f.wiz_log)
+}
+
+#[inline]
+pub fn tree_log() -> bool {
+    with(|f| f.tree_log)
 }
 
 #[inline]

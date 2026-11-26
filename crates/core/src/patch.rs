@@ -254,11 +254,10 @@ pub(crate) fn rewrite_zip_borrowed(
                 zw.raw_copy_file(e)?;
                 continue;
             }
-            let mut buf = Vec::new();
-            {
+            let buf = {
                 let mut e = zip.by_index(i)?;
-                e.read_to_end(&mut buf)?;
-            }
+                crate::fixups::read_zip_entry_limited(&mut e, crate::fixups::MAX_SHEET_PART_BYTES)?
+            };
             if let Some(updated) = update(&name, &buf)? {
                 any_changed = true;
                 let opts = zip::write::SimpleFileOptions::default()
@@ -2342,7 +2341,10 @@ pub fn entry_size(path: &Path, name: &str) -> u64 {
 
 /// 包里有没有这个部件
 pub fn has_entry(path: &Path, name: &str) -> bool {
-    match zip::ZipArchive::new(std::fs::File::open(path).unwrap_or_else(|_| std::fs::File::open(".").unwrap())) {
+    let Ok(f) = std::fs::File::open(path) else {
+        return false;
+    };
+    match zip::ZipArchive::new(f) {
         Ok(mut z) => z.by_name(name).is_ok(),
         Err(_) => false,
     }
@@ -2479,10 +2481,13 @@ pub fn shift_pivot_caches(
     {
         let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
         for t in targets.iter() {
-            let mut s = String::new();
-            if let Ok(mut f) = zip.by_name(t) {
-                let _ = f.read_to_string(&mut s);
-            }
+            let s = zip
+                .by_name(t)
+                .ok()
+                .and_then(|mut f| {
+                    crate::fixups::read_zip_entry_string_limited(&mut f, crate::fixups::MAX_META_PART_BYTES).ok()
+                })
+                .unwrap_or_default();
             if s.is_empty() {
                 continue;
             }
@@ -2601,8 +2606,7 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
             if managed(&n) {
                 continue;
             }
-            let mut buf = Vec::new();
-            e.read_to_end(&mut buf)?;
+            let buf = crate::fixups::read_zip_entry_limited(&mut e, crate::fixups::MAX_SHEET_PART_BYTES)?;
             base_entries.push((n, buf));
         }
     }
@@ -2618,7 +2622,6 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
     // 情况特殊：umya 会写出一个「空的」drawing（只有 wsDr 壳，没有锚点），
     // 图表部件虽然找回了，但没有锚点照样显示不出来——空壳就用基准的覆盖
     {
-        use std::io::Read;
         let mut replacements: Vec<(String, Vec<u8>)> = Vec::new();
         for (name, body) in base_entries.iter() {
             if !name.starts_with("xl/drawings/") || name.ends_with(".rels") {
@@ -2632,12 +2635,15 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
             // 图表挂在 graphicFrame 里：umya 会保留锚点却把 graphicFrame 删掉，
             // 结果就是「锚点在、图没了」——这种情况也要用基准覆盖
             let base_has_frame = body.windows(12).any(|w| w == b"graphicFrame");
-            let mut cur = String::new();
-            if let Ok(mut zip) = zip::ZipArchive::new(std::fs::File::open(path)?) {
-                if let Ok(mut f) = zip.by_name(name) {
-                    let _ = f.read_to_string(&mut cur);
-                }
-            }
+            let cur = std::fs::File::open(path)
+                .ok()
+                .and_then(|f| zip::ZipArchive::new(f).ok())
+                .and_then(|mut zip| {
+                    zip.by_name(name).ok().and_then(|mut f| {
+                        crate::fixups::read_zip_entry_string_limited(&mut f, crate::fixups::MAX_META_PART_BYTES).ok()
+                    })
+                })
+                .unwrap_or_default();
             let cur_has_frame = cur.contains("graphicFrame");
             if std::env::var("SC_SAVE_PROF").is_ok() {
                 eprintln!(
@@ -2669,12 +2675,13 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
     }
     append_entries(path, &pending)?;
     if !ct_additions.is_empty() {
-        rewrite_zip_where(
+        rewrite_zip_borrowed(
             path,
             |n| n == "[Content_Types].xml",
             |_, buf| {
-                let Ok(xml) = String::from_utf8(buf.clone()) else { return buf };
-                let mut x = xml;
+                let Ok(xml) = std::str::from_utf8(buf) else { return Ok(None) };
+                let mut x = xml.to_string();
+                let mut changed = false;
                 for (part, ct) in ct_additions.iter() {
                     let marker = format!("/{part}");
                     if x.contains(&marker) {
@@ -2683,9 +2690,10 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
                     let line = format!("<Override PartName=\"{marker}\" ContentType=\"{ct}\"/>");
                     if let Some(i) = x.rfind("</Types>") {
                         x.insert_str(i, &line);
+                        changed = true;
                     }
                 }
-                x.into_bytes()
+                Ok(changed.then(|| x.into_bytes()))
             },
         )?;
     }
@@ -2693,10 +2701,9 @@ pub fn restore_missing_parts(path: &Path, base: &Path) -> Result<Vec<String>> {
 }
 
 fn content_type_of(path: &Path, part: &str) -> Option<String> {
-    use std::io::Read;
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
-    let mut xml = String::new();
-    zip.by_name("[Content_Types].xml").ok()?.read_to_string(&mut xml).ok()?;
+    let mut entry = zip.by_name("[Content_Types].xml").ok()?;
+    let xml = crate::fixups::read_zip_entry_string_limited(&mut entry, crate::fixups::MAX_META_PART_BYTES).ok()?;
     let marker = format!("PartName=\"/{part}\"");
     let i = xml.find(&marker)?;
     let head_start = xml[..i].rfind('<')?;
@@ -3048,8 +3055,10 @@ pub(crate) fn rewrite_zip_skip_where(
                 zw.raw_copy_file(zip.by_index_raw(i)?)?;
                 continue;
             }
-            let mut buf = Vec::new();
-            zip.by_index(i)?.read_to_end(&mut buf)?;
+            let buf = {
+                let mut e = zip.by_index(i)?;
+                crate::fixups::read_zip_entry_limited(&mut e, crate::fixups::MAX_SHEET_PART_BYTES)?
+            };
             let updated = f(&name, buf.clone());
             if updated == buf {
                 zw.raw_copy_file(zip.by_index_raw(i)?)?;

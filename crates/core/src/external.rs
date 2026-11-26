@@ -40,6 +40,8 @@ pub struct Source {
     pub kind: Kind,
     /// 落到哪张表的哪个位置
     pub at: (u32, u32),
+    /// 目标工作表名（老工作簿未记录时为 `None`，兼容刷入当前表）
+    pub target_sheet: Option<String>,
     /// 上次刷新写出的行列数
     pub rows: u32,
     pub cols: u32,
@@ -47,12 +49,29 @@ pub struct Source {
     pub csv_opts: Option<CsvOpts>,
 }
 
+const MAX_SRC_ROWS: u32 = crate::sync::MAX_ROWS;
+const MAX_SRC_COLS: u32 = crate::sync::MAX_COLS;
+
+fn clamp_source_bounds(at: (u32, u32), rows: u32, cols: u32) -> Option<((u32, u32), u32, u32)> {
+    if at.0 >= MAX_SRC_ROWS || at.1 >= MAX_SRC_COLS {
+        return None;
+    }
+    let max_r = MAX_SRC_ROWS - at.0;
+    let max_c = MAX_SRC_COLS - at.1;
+    Some((at, rows.min(max_r), cols.min(max_c)))
+}
+
 impl Source {
     /// 存进名称管理器的文本（不带等号，外面包一层双引号当字符串常量）
     ///
-    /// CSV|路径|分隔符|表头|行|列|上次行数|上次列数
-    /// SHEET|表名|r1,c1,r2,c2|行|列|上次行数|上次列数
+    /// CSV|路径|分隔符|表头|行|列|上次行数|上次列数|编码|文本列|引号|目标表
+    /// SHEET|表名|r1,c1,r2,c2|行|列|上次行数|上次列数|目标表
     pub fn to_name_text(&self) -> String {
+        let tgt = self
+            .target_sheet
+            .as_deref()
+            .unwrap_or("")
+            .replace('"', "\"\"");
         match &self.kind {
             Kind::Csv { path, delim, header } => {
                 let (enc, cols, quote) = match &self.csv_opts {
@@ -63,26 +82,55 @@ impl Source {
                     ),
                     None => ("auto".to_string(), String::new(), format!("q{}", '"' as u32)),
                 };
-                format!(
-                    "\"CSV|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\"",
-                    path.replace('"', "\"\""),
-                    delim,
-                    if *header { 1 } else { 0 },
-                    self.at.0,
-                    self.at.1,
-                    self.rows,
-                    self.cols,
-                    enc,
-                    cols,
-                    quote
-                )
+                if tgt.is_empty() {
+                    format!(
+                        "\"CSV|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\"",
+                        path.replace('"', "\"\""),
+                        delim,
+                        if *header { 1 } else { 0 },
+                        self.at.0,
+                        self.at.1,
+                        self.rows,
+                        self.cols,
+                        enc,
+                        cols,
+                        quote
+                    )
+                } else {
+                    format!(
+                        "\"CSV|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\"",
+                        path.replace('"', "\"\""),
+                        delim,
+                        if *header { 1 } else { 0 },
+                        self.at.0,
+                        self.at.1,
+                        self.rows,
+                        self.cols,
+                        enc,
+                        cols,
+                        quote,
+                        tgt
+                    )
+                }
             }
-            Kind::Internal { sheet, rect } => format!(
-                "\"SHEET|{}|{},{},{},{}|{}|{}|{}|{}\"",
-                sheet.replace('"', "\"\""),
-                rect.0, rect.1, rect.2, rect.3,
-                self.at.0, self.at.1, self.rows, self.cols
-            ),
+            Kind::Internal { sheet, rect } => {
+                if tgt.is_empty() {
+                    format!(
+                        "\"SHEET|{}|{},{},{},{}|{}|{}|{}|{}\"",
+                        sheet.replace('"', "\"\""),
+                        rect.0, rect.1, rect.2, rect.3,
+                        self.at.0, self.at.1, self.rows, self.cols
+                    )
+                } else {
+                    format!(
+                        "\"SHEET|{}|{},{},{},{}|{}|{}|{}|{}|{}\"",
+                        sheet.replace('"', "\"\""),
+                        rect.0, rect.1, rect.2, rect.3,
+                        self.at.0, self.at.1, self.rows, self.cols,
+                        tgt
+                    )
+                }
+            }
         }
     }
 
@@ -98,24 +146,45 @@ impl Source {
         let body = text.trim().trim_start_matches('"').trim_end_matches('"');
         let f: Vec<&str> = body.split('|').collect();
         let num = |i: usize| -> u32 { f.get(i).and_then(|x| x.parse().ok()).unwrap_or(0) };
-        let kind = match f.first().copied()? {
-            "CSV" if f.len() >= 6 => Kind::Csv {
-                path: f[1].replace("\"\"", "\""),
-                delim: f[2].chars().next().unwrap_or(','),
-                header: f[3] != "0",
-            },
-            "SHEET" if f.len() >= 6 => {
+        let (kind, raw_at, raw_rows, raw_cols, target_sheet) = match f.first().copied()? {
+            "CSV" if f.len() >= 6 => (
+                Kind::Csv {
+                    path: f[1].replace("\"\"", "\""),
+                    delim: f[2].chars().next().unwrap_or(','),
+                    header: f[3] != "0",
+                },
+                (num(4), num(5)),
+                num(6),
+                num(7),
+                f.get(11)
+                    .map(|s| s.replace("\"\"", "\""))
+                    .filter(|s| !s.is_empty()),
+            ),
+            "SHEET" if f.len() >= 5 => {
                 let r: Vec<u32> = f[2].split(',').filter_map(|x| x.parse().ok()).collect();
                 if r.len() != 4 {
                     return None;
                 }
-                Kind::Internal {
-                    sheet: f[1].replace("\"\"", "\""),
-                    rect: (r[0], r[1], r[2], r[3]),
+                let (r1, c1, r2, c2) = (r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3]));
+                if r2 >= MAX_SRC_ROWS || c2 >= MAX_SRC_COLS {
+                    return None;
                 }
+                (
+                    Kind::Internal {
+                        sheet: f[1].replace("\"\"", "\""),
+                        rect: (r1, c1, r2, c2),
+                    },
+                    (num(3), num(4)),
+                    num(5),
+                    num(6),
+                    f.get(7)
+                        .map(|s| s.replace("\"\"", "\""))
+                        .filter(|s| !s.is_empty()),
+                )
             }
             _ => return None,
         };
+        let (at, rows, cols) = clamp_source_bounds(raw_at, raw_rows, raw_cols)?;
         let csv_opts = if matches!(kind, Kind::Csv { .. }) {
             let enc = f.get(8).and_then(|x| crate::csv::Encoding::from_id(x));
             let cols: Vec<u32> = f
@@ -139,9 +208,10 @@ impl Source {
         Some(Source {
             name: name.to_string(),
             kind,
-            at: (num(4), num(5)),
-            rows: num(6),
-            cols: num(7),
+            at,
+            target_sheet,
+            rows,
+            cols,
             csv_opts,
         })
     }
@@ -1184,11 +1254,24 @@ pub fn import_csv_str_parallel(
         unpacked.push((batches, k));
     }
 
+    let Some((at, old_rows, old_cols)) = clamp_source_bounds(at, old.0, old.1) else {
+        return Err("目标起始坐标超出工作表边界".into());
+    };
+    let old = (old_rows, old_cols);
     let mut all_keys = Vec::with_capacity(total_keys);
     for r in 0..old.0 {
+        if (r & 1023) == 0 && !keep_going() {
+            return Err("已取消".into());
+        }
+        let Some(r_abs) = at.0.checked_add(r).filter(|&v| v < MAX_SRC_ROWS) else {
+            break;
+        };
         for c in (if r >= total_rows { 0 } else { max_cols.min(old.1) })..old.1 {
-            sheet.set(at.0 + r, at.1 + c, Cell::default());
-            all_keys.push((at.0 + r, at.1 + c));
+            let Some(c_abs) = at.1.checked_add(c).filter(|&v| v < MAX_SRC_COLS) else {
+                break;
+            };
+            sheet.set(r_abs, c_abs, Cell::default());
+            all_keys.push((r_abs, c_abs));
         }
     }
 
@@ -1197,7 +1280,7 @@ pub fn import_csv_str_parallel(
         for (batches, _) in &unpacked {
             for (ci, col_vec) in batches.iter().enumerate() {
                 for &(r_abs, _) in col_vec {
-                    let rel_r = (r_abs - at.0) as usize;
+                    let rel_r = (r_abs.saturating_sub(at.0)) as usize;
                     if rel_r < row_lens.len() {
                         row_lens[rel_r] = row_lens[rel_r].max((ci + 1) as u32);
                     }
@@ -1205,9 +1288,15 @@ pub fn import_csv_str_parallel(
             }
         }
         for (ri, &rlen) in row_lens.iter().enumerate() {
+            let Some(r_abs) = at.0.checked_add(ri as u32).filter(|&v| v < MAX_SRC_ROWS) else {
+                break;
+            };
             for ci in rlen..max_cols.min(old.1) {
-                sheet.set(at.0 + ri as u32, at.1 + ci, Cell::default());
-                all_keys.push((at.0 + ri as u32, at.1 + ci));
+                let Some(c_abs) = at.1.checked_add(ci).filter(|&v| v < MAX_SRC_COLS) else {
+                    break;
+                };
+                sheet.set(r_abs, c_abs, Cell::default());
+                all_keys.push((r_abs, c_abs));
             }
         }
     }
@@ -1216,11 +1305,15 @@ pub fn import_csv_str_parallel(
         if !keep_going() {
             return Err("已取消".into());
         }
-        let c_abs = at.1 + ci as u32;
+        let Some(c_abs) = at.1.checked_add(ci as u32).filter(|&v| v < MAX_SRC_COLS) else {
+            break;
+        };
         for (batches, _) in &mut unpacked {
             if let Some(col_vec) = batches.get_mut(ci) {
                 for (r_abs, cell) in col_vec.drain(..) {
-                    sheet.set(r_abs, c_abs, cell);
+                    if r_abs < MAX_SRC_ROWS {
+                        sheet.set(r_abs, c_abs, cell);
+                    }
                 }
             }
         }
@@ -1253,24 +1346,31 @@ pub fn visit_csv_records<E>(
     records: Vec<Vec<String>>, header: bool, text_cols: &[u32], old: (u32, u32), at: (u32, u32),
     mut write: impl FnMut(u32, u32, Cell) -> Result<(), E>,
 ) -> Result<(u32, u32), E> {
-    let rows = records.len() as u32;
-    let cols = records.iter().map(|r| r.len() as u32).max().unwrap_or(0);
+    let Some((at, old_rows, old_cols)) = clamp_source_bounds(at, old.0, old.1) else {
+        return Ok((0, 0));
+    };
+    let old = (old_rows, old_cols);
+    let max_r = (MAX_SRC_ROWS - at.0) as usize;
+    let max_c = (MAX_SRC_COLS - at.1) as usize;
+    let rows = records.len().min(max_r) as u32;
+    let cols = records.iter().take(max_r).map(|r| r.len().min(max_c) as u32).max().unwrap_or(0);
     // 旧区域里超出新数据的部分要清掉（只清自己上次写的那块）
     for r in 0..old.0 {
         for c in (if r >= rows { 0 } else { cols.min(old.1) })..old.1 {
             write(at.0 + r, at.1 + c, Cell::default())?;
         }
     }
-    for (ri, row) in records.into_iter().enumerate() {
+    for (ri, row) in records.into_iter().take(max_r).enumerate() {
+        let r_abs = at.0 + ri as u32;
         if (ri as u32) < old.0 {
             // 短行补齐：新矩形里这一行没有的列要清空，才能和首次导入一致
             for ci in row.len()..cols as usize {
                 if (ci as u32) < old.1 {
-                    write(at.0 + ri as u32, at.1 + ci as u32, Cell::default())?;
+                    write(r_abs, at.1 + ci as u32, Cell::default())?;
                 }
             }
         }
-        for (ci, field) in row.into_iter().enumerate() {
+        for (ci, field) in row.into_iter().take(max_c).enumerate() {
             let cell = if header && ri == 0 {
                 Cell { value: Value::Text(field.into()), formula: None }
             } else if text_cols.contains(&(ci as u32)) && !field.is_empty() {
@@ -1278,7 +1378,7 @@ pub fn visit_csv_records<E>(
             } else {
                 parse_field(&field)
             };
-            write(at.0 + ri as u32, at.1 + ci as u32, cell)?;
+            write(r_abs, at.1 + ci as u32, cell)?;
         }
     }
     Ok((rows, cols))
@@ -1314,6 +1414,15 @@ pub fn visit_source_sheet<E>(
     mut write: impl FnMut(u32, u32, Cell) -> Result<(), E>,
 ) -> Result<(u32, u32), E> {
     let (r1, c1, r2, c2) = rect;
+    if r1 > r2 || c1 > c2 || r2 >= MAX_SRC_ROWS || c2 >= MAX_SRC_COLS
+        || at.0 >= MAX_SRC_ROWS || at.1 >= MAX_SRC_COLS
+    {
+        return Ok((0, 0));
+    }
+    let max_dr = (MAX_SRC_ROWS - at.0).saturating_sub(1);
+    let max_dc = (MAX_SRC_COLS - at.1).saturating_sub(1);
+    let r2 = r2.min(r1.saturating_add(max_dr));
+    let c2 = c2.min(c1.saturating_add(max_dc));
     let mut rows = 0;
     let mut cols = 0;
     // 表名带空格或特殊字符时要加单引号，跟 Excel 一致
@@ -1323,14 +1432,12 @@ pub fn visit_source_sheet<E>(
         src.name.clone()
     };
     for r in r1..=r2 {
+        let Some(dst_r) = at.0.checked_add(r - r1) else { break };
         for c in c1..=c2 {
+            let Some(dst_c) = at.1.checked_add(c - c1) else { break };
             let formula = Some(format!("={quoted}!{}", crate::model::cell_name(r, c)).into());
             let value = src.get(r, c).map(|x| x.value.clone()).unwrap_or_default();
-            write(
-                at.0 + (r - r1),
-                at.1 + (c - c1),
-                Cell { value, formula },
-            )?;
+            write(dst_r, dst_c, Cell { value, formula })?;
             cols = cols.max(c - c1 + 1);
         }
         rows = rows.max(r - r1 + 1);
@@ -1364,6 +1471,19 @@ pub fn refresh(wb: &mut crate::model::Workbook, sheet_idx: usize, src: &Source) 
             let Some(si) = wb.sheets.iter().position(|s| &s.name == sheet) else {
                 return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "找不到来源表"));
             };
+            if si == sheet_idx {
+                let mut staged = Vec::new();
+                let copied = visit_source_sheet(&wb.sheets[si], *rect, src.at, |r, c, cell| {
+                    staged.push((r, c, cell));
+                    Ok::<_, std::convert::Infallible>(())
+                })
+                .unwrap();
+                let dst = &mut wb.sheets[sheet_idx];
+                for (r, c, cell) in staged {
+                    dst.set(r, c, cell);
+                }
+                return Ok(copied);
+            }
             let (lo, hi) = (si.min(sheet_idx), si.max(sheet_idx));
             let (left, right) = wb.sheets.split_at_mut(hi);
             let copied = if si == lo {

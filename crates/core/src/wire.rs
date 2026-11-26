@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 
 const DIR_COMPRESSED_FLAG: u8 = 0x80;
 const COMPRESS_MIN_BYTES: usize = 512;
-const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 协议 v3 二进制帧魔数首字节（非可打印 ASCII，与 v2 JSON/Base64 首字节严格不相交）
 pub const BINARY_V3_MAGIC: u8 = 0x02;
@@ -709,11 +709,40 @@ impl Session {
             | u8::from(compressed)
     }
 
+    /// 检查本会话是否还能继续安全发送下一帧而不触发 nonce 计数器回绕
+    #[inline]
+    pub fn can_seal_v2(&self) -> bool {
+        self.send_ctr < u32::MAX as u64
+    }
+
+    #[inline]
+    pub fn can_seal_v3(&self) -> bool {
+        self.send_ctr < u64::MAX
+    }
+
+    fn next_send_ctr_v2(&mut self) -> u32 {
+        let next = self
+            .send_ctr
+            .checked_add(1)
+            .filter(|&v| v <= u32::MAX as u64)
+            .expect("wire v2 send counter exhausted (rekey required)");
+        self.send_ctr = next;
+        next as u32
+    }
+
+    fn next_send_ctr_v3(&mut self) -> u64 {
+        let next = self
+            .send_ctr
+            .checked_add(1)
+            .expect("wire v3 send counter exhausted (rekey required)");
+        self.send_ctr = next;
+        next
+    }
+
     /// 使用预处理的共享负载加密一帧 v2 文本帧（与 `seal`/`open` 线缆格式 100% 兼容）
     pub fn seal_prepared(&mut self, prepared: &PreparedPayload) -> String {
         debug_assert!(!prepared.compact_bin, "v2 text frame requires UTF-8 JSON payload");
-        self.send_ctr = self.send_ctr.wrapping_add(1);
-        let ctr = self.send_ctr as u32;
+        let ctr = self.next_send_ctr_v2();
         let wire_dir = if prepared.compressed {
             self.send_dir | DIR_COMPRESSED_FLAG
         } else {
@@ -734,8 +763,7 @@ impl Session {
     /// 线缆格式：`[0x02][4B LE body_len][1B flags: bit0=compressed, bit3=compact_bin][8B LE counter][ciphertext][32B HMAC-SHA256]`。
     /// 其中 `HMAC-SHA256` 覆盖 `flags || counter || ciphertext`。
     pub fn seal_prepared_binary_into(&mut self, prepared: &PreparedPayload, out: &mut Vec<u8>) {
-        self.send_ctr = self.send_ctr.wrapping_add(1);
-        let ctr = self.send_ctr;
+        let ctr = self.next_send_ctr_v3();
         let flags = self.v3_flags(prepared.compressed, prepared.compact_bin);
         let body_len = 1 + 8 + prepared.payload.len() + 32;
         let body_len_u32 =
@@ -767,8 +795,7 @@ impl Session {
         compact_bin: bool,
         out: &mut Vec<u8>,
     ) {
-        self.send_ctr = self.send_ctr.wrapping_add(1);
-        let ctr = self.send_ctr;
+        let ctr = self.next_send_ctr_v3();
         out.clear();
         out.reserve(5 + 1 + 8 + raw_bytes.len().min(65_536) + 32);
         // 占位 14 字节：[0x02][4B LE body_len][1B flags][8B LE counter]
@@ -829,8 +856,7 @@ impl Session {
 
     /// 加密一帧，允许调用方显式控制是否尝试 deflate 压缩
     pub fn seal_with_compression(&mut self, plain: &str, compress: bool) -> String {
-        self.send_ctr = self.send_ctr.wrapping_add(1);
-        let ctr = self.send_ctr as u32;
+        let ctr = self.next_send_ctr_v2();
         let raw_bytes = plain.as_bytes();
         let mut framed = Vec::with_capacity(5 + raw_bytes.len().min(65_536) + 32);
         framed.extend_from_slice(&[0, 0, 0, 0, 0]);

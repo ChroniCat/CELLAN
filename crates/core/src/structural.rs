@@ -320,7 +320,8 @@ impl Sheet {
                 self.shift_dv(&shift);
                 self.shift_sparklines(&shift);
                 if let Some((r, c)) = self.freeze {
-                    self.freeze = Some((shift.map(r).unwrap(), c));
+                    let nr = if r > *at { r + *n } else { r };
+                    self.freeze = Some((nr, c));
                 }
                 self.layout_dirty |= self.rows.shift_axis(*at, *n, false);
                 self.shift_filter(&shift);
@@ -369,7 +370,7 @@ impl Sheet {
                 self.shift_dv(&shift);
                 self.shift_sparklines(&shift);
                 if let Some((fr, fc)) = self.freeze {
-                    if fc >= *at {
+                    if fc > *at {
                         self.freeze = Some((fr, fc + *n));
                     }
                 }
@@ -631,6 +632,7 @@ impl Sheet {
         let lo = from.min(at);
         let hi = (from + n).max(at + n);
         let r2 = from + n - 1;
+        let delta_r = at as i64 - from as i64;
         let perm = |r: u32| -> u32 {
             if r < lo || r >= hi {
                 r
@@ -649,11 +651,67 @@ impl Sheet {
             .filter(|(k, _)| k.row >= from && k.row <= r2)
             .map(|(k, v)| (k.row - from, k.col, v.clone()))
             .collect();
+        let threads: Vec<_> = self
+            .threads
+            .iter()
+            .filter(|(k, _)| k.row >= from && k.row <= r2)
+            .map(|(k, v)| (k.row - from, k.col, v.clone()))
+            .collect();
         let links: Vec<_> = self
             .hyperlinks
             .iter()
             .filter(|((r, _), _)| *r >= from && *r <= r2)
             .map(|((r, c), v)| (r - from, *c, v.clone()))
+            .collect();
+        let moved_merges: Vec<_> = self
+            .merges
+            .iter()
+            .filter(|&&(mr1, _, mr2, _)| mr1 >= from && mr2 <= r2)
+            .map(|&(mr1, mc1, mr2, mc2)| (mr1 - from, mc1, mr2 - from, mc2))
+            .collect();
+        let moved_cf: Vec<_> = self
+            .cf
+            .blocks
+            .iter()
+            .filter_map(|blk| {
+                let inside: Vec<_> = blk
+                    .ranges
+                    .iter()
+                    .filter(|&&(cr1, _, cr2, _)| cr1 >= from && cr2 <= r2)
+                    .map(|&(cr1, cc1, cr2, cc2)| (cr1 - from, cc1, cr2 - from, cc2))
+                    .collect();
+                (!inside.is_empty()).then(|| (blk.rules.clone(), inside))
+            })
+            .collect();
+        let moved_dv: Vec<_> = self
+            .dv
+            .iter()
+            .filter_map(|rule| {
+                let inside: Vec<_> = rule
+                    .ranges
+                    .iter()
+                    .filter(|&&(dr1, _, dr2, _)| dr1 >= from && dr2 <= r2)
+                    .map(|&(dr1, dc1, dr2, dc2)| (dr1 - from, dc1, dr2 - from, dc2))
+                    .collect();
+                if inside.is_empty() {
+                    return None;
+                }
+                let mut cloned = rule.clone();
+                cloned.ranges = inside;
+                Some(cloned)
+            })
+            .collect();
+        let moved_sparks: Vec<_> = self
+            .sparklines
+            .iter()
+            .filter(|sp| sp.r >= from && sp.r <= r2)
+            .cloned()
+            .collect();
+        let moved_rich: Vec<_> = self
+            .rich
+            .iter()
+            .filter(|&(&(r, _), _)| r >= from && r <= r2)
+            .map(|(&(r, c), v)| (r - from, c, v.clone()))
             .collect();
         let heights: Vec<f32> = (from..=r2).map(|r| self.rows.size(r)).collect();
         let hidden: Vec<bool> = (from..=r2)
@@ -666,39 +724,86 @@ impl Sheet {
             .map(|r| self.row_styles.get(&r).copied().unwrap_or(0))
             .collect();
 
-        if !self.rich.is_empty() {
-            let rich_keys: Vec<(u32, u32)> = self
-                .rich
-                .keys()
-                .filter(|&&(r, _)| r >= lo && r < hi)
-                .copied()
-                .collect();
-            if !rich_keys.is_empty() {
-                self.rich_dirty = true;
-                let mut moved_rich = Vec::with_capacity(rich_keys.len());
-                for pos in rich_keys {
-                    if let Some(v) = self.rich.remove(&pos) {
-                        moved_rich.push(((perm(pos.0), pos.1), v));
-                    }
-                }
-                for (dest, v) in moved_rich {
-                    self.rich.insert(dest, v);
-                }
-            }
-        }
-
         // Single-pass bounded `[lo..hi)` permutation on cells and explicit styles:
         // pages `< lo / PAGE_ROWS` and `> (hi - 1) / PAGE_ROWS` are 100% untouched.
         self.permute_cell_band(true, lo, hi, perm);
 
+        // 平移被移动行上的相对公式引用（与 Excel 行拖动/搬移一致）
+        let own_name = self.name.clone();
+        let moved_formulas: Vec<(u32, u32, String)> = self
+            .iter_rect((at, 0, at + n - 1, crate::sync::MAX_COLS - 1))
+            .filter_map(|(k, c)| {
+                let f = c.formula.as_deref()?;
+                let nf = crate::refs::translate(f, delta_r, 0, &own_name);
+                (nf != f).then_some((k.row, k.col, nf))
+            })
+            .collect();
+        for (r, c, nf) in moved_formulas {
+            if let Some(mut cell) = self.get(r, c).map(|x| x.into_owned()) {
+                cell.formula = Some(nf.into());
+                self.set(r, c, cell);
+            }
+        }
+
         self.delete_rows_inner(from, n, false);
         self.insert_rows_inner(at, n, false);
 
+        for (dr, c, v) in moved_rich {
+            self.rich.insert((at + dr, c), v);
+            self.rich_dirty = true;
+        }
+        for (dr1, mc1, dr2, mc2) in moved_merges {
+            let m = (at + dr1, mc1, at + dr2, mc2);
+            if !self.merges.contains(&m) {
+                self.merges.push(m);
+            }
+            self.merges_dirty = true;
+        }
+        for (rules, ranges) in moved_cf {
+            let shifted: Vec<_> = ranges
+                .into_iter()
+                .map(|(dr1, cc1, dr2, cc2)| (at + dr1, cc1, at + dr2, cc2))
+                .collect();
+            if let Some(blk) = self.cf.blocks.iter_mut().find(|b| b.rules == rules) {
+                for r in shifted {
+                    if !blk.ranges.contains(&r) {
+                        blk.ranges.push(r);
+                    }
+                }
+            } else {
+                self.cf.blocks.push(crate::cf::CfBlock { ranges: shifted, rules });
+            }
+            self.cf_dirty = true;
+        }
+        for mut rule in moved_dv {
+            rule.ranges = rule
+                .ranges
+                .into_iter()
+                .map(|(dr1, dc1, dr2, dc2)| (at + dr1, dc1, at + dr2, dc2))
+                .collect();
+            self.dv.push(rule);
+            self.dv_dirty = true;
+        }
+        for mut sp in moved_sparks {
+            sp.r = at + (sp.r - from);
+            if sp.source_sheet.is_none() && sp.rect.0 >= from && sp.rect.2 <= r2 {
+                sp.rect.0 = at + (sp.rect.0 - from);
+                sp.rect.2 = at + (sp.rect.2 - from);
+            }
+            self.sparklines.push(sp);
+            self.sparklines_dirty = true;
+        }
         for (dr, c, mut v) in notes {
             v.r = at + dr;
             v.c = c;
             self.notes.insert(CellRef::new(at + dr, c), v);
             self.notes_dirty = true;
+        }
+        for (dr, c, mut v) in threads {
+            v.r = at + dr;
+            v.c = c;
+            self.threads.insert(CellRef::new(at + dr, c), v);
+            self.threads_dirty = true;
         }
         for (dr, c, v) in links {
             self.hyperlinks.insert((at + dr, c), v);
@@ -738,6 +843,7 @@ impl Sheet {
         let lo = from.min(at);
         let hi = (from + n).max(at + n);
         let c2 = from + n - 1;
+        let delta_c = at as i64 - from as i64;
         let perm = |c: u32| -> u32 {
             if c < lo || c >= hi {
                 c
@@ -756,11 +862,67 @@ impl Sheet {
             .filter(|(k, _)| k.col >= from && k.col <= c2)
             .map(|(k, v)| (k.row, k.col - from, v.clone()))
             .collect();
+        let threads: Vec<_> = self
+            .threads
+            .iter()
+            .filter(|(k, _)| k.col >= from && k.col <= c2)
+            .map(|(k, v)| (k.row, k.col - from, v.clone()))
+            .collect();
         let links: Vec<_> = self
             .hyperlinks
             .iter()
             .filter(|((_, c), _)| *c >= from && *c <= c2)
             .map(|((r, c), v)| (*r, c - from, v.clone()))
+            .collect();
+        let moved_merges: Vec<_> = self
+            .merges
+            .iter()
+            .filter(|&&(_, mc1, _, mc2)| mc1 >= from && mc2 <= c2)
+            .map(|&(mr1, mc1, mr2, mc2)| (mr1, mc1 - from, mr2, mc2 - from))
+            .collect();
+        let moved_cf: Vec<_> = self
+            .cf
+            .blocks
+            .iter()
+            .filter_map(|blk| {
+                let inside: Vec<_> = blk
+                    .ranges
+                    .iter()
+                    .filter(|&&(_, cc1, _, cc2)| cc1 >= from && cc2 <= c2)
+                    .map(|&(cr1, cc1, cr2, cc2)| (cr1, cc1 - from, cr2, cc2 - from))
+                    .collect();
+                (!inside.is_empty()).then(|| (blk.rules.clone(), inside))
+            })
+            .collect();
+        let moved_dv: Vec<_> = self
+            .dv
+            .iter()
+            .filter_map(|rule| {
+                let inside: Vec<_> = rule
+                    .ranges
+                    .iter()
+                    .filter(|&&(_, dc1, _, dc2)| dc1 >= from && dc2 <= c2)
+                    .map(|&(dr1, dc1, dr2, dc2)| (dr1, dc1 - from, dr2, dc2 - from))
+                    .collect();
+                if inside.is_empty() {
+                    return None;
+                }
+                let mut cloned = rule.clone();
+                cloned.ranges = inside;
+                Some(cloned)
+            })
+            .collect();
+        let moved_sparks: Vec<_> = self
+            .sparklines
+            .iter()
+            .filter(|sp| sp.c >= from && sp.c <= c2)
+            .cloned()
+            .collect();
+        let moved_rich: Vec<_> = self
+            .rich
+            .iter()
+            .filter(|&(&(_, c), _)| c >= from && c <= c2)
+            .map(|(&(r, c), v)| (r, c - from, v.clone()))
             .collect();
         let widths: Vec<f32> = (from..=c2).map(|c| self.cols.size(c)).collect();
         let hidden: Vec<bool> = (from..=c2).map(|c| self.hidden_cols.contains(&c)).collect();
@@ -771,37 +933,83 @@ impl Sheet {
             .map(|c| self.col_styles.get(&c).copied().unwrap_or(0))
             .collect();
 
-        if !self.rich.is_empty() {
-            let rich_keys: Vec<(u32, u32)> = self
-                .rich
-                .keys()
-                .filter(|&&(_, c)| c >= lo && c < hi)
-                .copied()
-                .collect();
-            if !rich_keys.is_empty() {
-                self.rich_dirty = true;
-                let mut moved_rich = Vec::with_capacity(rich_keys.len());
-                for pos in rich_keys {
-                    if let Some(v) = self.rich.remove(&pos) {
-                        moved_rich.push(((pos.0, perm(pos.1)), v));
-                    }
-                }
-                for (dest, v) in moved_rich {
-                    self.rich.insert(dest, v);
-                }
+        self.permute_cell_band(false, lo, hi, perm);
+
+        let own_name = self.name.clone();
+        let moved_formulas: Vec<(u32, u32, String)> = self
+            .iter_rect((0, at, crate::sync::MAX_ROWS - 1, at + n - 1))
+            .filter_map(|(k, c)| {
+                let f = c.formula.as_deref()?;
+                let nf = crate::refs::translate(f, 0, delta_c, &own_name);
+                (nf != f).then_some((k.row, k.col, nf))
+            })
+            .collect();
+        for (r, c, nf) in moved_formulas {
+            if let Some(mut cell) = self.get(r, c).map(|x| x.into_owned()) {
+                cell.formula = Some(nf.into());
+                self.set(r, c, cell);
             }
         }
-
-        self.permute_cell_band(false, lo, hi, perm);
 
         self.delete_cols_inner(from, n, false);
         self.insert_cols_inner(at, n, false);
 
+        for (r, dc, v) in moved_rich {
+            self.rich.insert((r, at + dc), v);
+            self.rich_dirty = true;
+        }
+        for (mr1, dc1, mr2, dc2) in moved_merges {
+            let m = (mr1, at + dc1, mr2, at + dc2);
+            if !self.merges.contains(&m) {
+                self.merges.push(m);
+            }
+            self.merges_dirty = true;
+        }
+        for (rules, ranges) in moved_cf {
+            let shifted: Vec<_> = ranges
+                .into_iter()
+                .map(|(cr1, dc1, cr2, dc2)| (cr1, at + dc1, cr2, at + dc2))
+                .collect();
+            if let Some(blk) = self.cf.blocks.iter_mut().find(|b| b.rules == rules) {
+                for r in shifted {
+                    if !blk.ranges.contains(&r) {
+                        blk.ranges.push(r);
+                    }
+                }
+            } else {
+                self.cf.blocks.push(crate::cf::CfBlock { ranges: shifted, rules });
+            }
+            self.cf_dirty = true;
+        }
+        for mut rule in moved_dv {
+            rule.ranges = rule
+                .ranges
+                .into_iter()
+                .map(|(dr1, dc1, dr2, dc2)| (dr1, at + dc1, dr2, at + dc2))
+                .collect();
+            self.dv.push(rule);
+            self.dv_dirty = true;
+        }
+        for mut sp in moved_sparks {
+            sp.c = at + (sp.c - from);
+            if sp.source_sheet.is_none() && sp.rect.1 >= from && sp.rect.3 <= c2 {
+                sp.rect.1 = at + (sp.rect.1 - from);
+                sp.rect.3 = at + (sp.rect.3 - from);
+            }
+            self.sparklines.push(sp);
+            self.sparklines_dirty = true;
+        }
         for (r, dc, mut v) in notes {
             v.r = r;
             v.c = at + dc;
             self.notes.insert(CellRef::new(r, at + dc), v);
             self.notes_dirty = true;
+        }
+        for (r, dc, mut v) in threads {
+            v.r = r;
+            v.c = at + dc;
+            self.threads.insert(CellRef::new(r, at + dc), v);
+            self.threads_dirty = true;
         }
         for (r, dc, v) in links {
             self.hyperlinks.insert((r, at + dc), v);
@@ -959,7 +1167,14 @@ impl Sheet {
         self.shift_cf(shift);
         self.shift_dv(shift);
         self.shift_sparklines(shift);
-        if let Some((r, c)) = self.freeze { self.freeze = Some((shift.map(r).unwrap(), c)); }
+        if let Some((r, c)) = self.freeze {
+            let nr = if shift.insertions.is_empty() {
+                if r > shift.at { r + shift.n } else { r }
+            } else {
+                r + shift.insertions.partition_point(|&at| at < r) as u32
+            };
+            self.freeze = Some((nr, c));
+        }
         self.layout_dirty |= if shift.insertions.is_empty() {
             self.rows.shift_axis(shift.at, shift.n, shift.delete)
         } else {
@@ -1041,7 +1256,7 @@ impl Sheet {
         self.shift_dv(&shift);
         self.shift_sparklines(&shift);
         if let Some((fr, fc)) = self.freeze {
-            if fc >= at {
+            if fc > at {
                 self.freeze = Some((fr, fc + n));
             }
         }
@@ -1147,6 +1362,20 @@ impl Sheet {
             }
             if !f.color_filters.is_empty() {
                 f.color_filters = std::mem::take(&mut f.color_filters)
+                    .into_iter()
+                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .collect();
+                self.filter_dirty = true;
+            }
+            if !f.top_filters.is_empty() {
+                f.top_filters = std::mem::take(&mut f.top_filters)
+                    .into_iter()
+                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .collect();
+                self.filter_dirty = true;
+            }
+            if !f.dynamic_filters.is_empty() {
+                f.dynamic_filters = std::mem::take(&mut f.dynamic_filters)
                     .into_iter()
                     .filter_map(|(c, v)| Some((shift.map(c)?, v)))
                     .collect();
@@ -1811,6 +2040,57 @@ fn update_workbook_references(
         true
     });
 
+    wb.pivots_pending2.retain_mut(|(idx, spec, _, rect)| {
+        if *idx != sheet_idx {
+            return true;
+        }
+        let Some(source) = map_rect(spec.source) else {
+            return false;
+        };
+        let Some(output) = map_rect(*rect) else {
+            return false;
+        };
+        spec.source = source;
+        *rect = output;
+        if axis == crate::refs::Axis::Col {
+            spec.rows.retain_mut(|f| match sh.map(f.col) {
+                Some(nc) => {
+                    f.col = nc;
+                    true
+                }
+                None => false,
+            });
+            spec.cols.retain_mut(|f| match sh.map(f.col) {
+                Some(nc) => {
+                    f.col = nc;
+                    true
+                }
+                None => false,
+            });
+            spec.values.retain_mut(|f| match sh.map(f.col) {
+                Some(nc) => {
+                    f.col = nc;
+                    if let Some((bc, item)) = f.base.take() {
+                        f.base = sh.map(bc).map(|nbc| (nbc, item));
+                    }
+                    true
+                }
+                None => false,
+            });
+            spec.filters.retain_mut(|f| match sh.map(f.col) {
+                Some(nc) => {
+                    f.col = nc;
+                    true
+                }
+                None => false,
+            });
+            if spec.rows.is_empty() && spec.cols.is_empty() && spec.values.is_empty() {
+                return false;
+            }
+        }
+        true
+    });
+
     // 同步一等公民 PivotTableModel 的源区域（按源表名/身份）与输出区域（按目标表索引）
     let target_sid = wb.sheets[sheet_idx].identity;
     let target_sname = wb.sheets[sheet_idx].name.clone();
@@ -2205,15 +2485,39 @@ impl Sheet {
             }
             self.spill_shapes = next_shapes;
         }
-        if !self.hyperlinks.is_empty()
-            && self
-                .hyperlinks
-                .iter()
-                .any(|(&(r, _), link)| r.saturating_add(link.span.0) >= min_at)
-        {
+        let need_shift_link_keys = self
+            .hyperlinks
+            .iter()
+            .any(|(&(r, _), link)| r.saturating_add(link.span.0) >= min_at);
+        let need_shift_link_locs = self
+            .hyperlinks
+            .values()
+            .any(|link| !link.location.is_empty());
+        if !self.hyperlinks.is_empty() && (need_shift_link_keys || need_shift_link_locs) {
+            let own_name = self.name.clone();
             self.hyperlinks = std::mem::take(&mut self.hyperlinks)
                 .into_iter()
                 .filter_map(|((r, c), mut link)| {
+                    if !link.location.is_empty() {
+                        let mut updated = link.location.clone();
+                        for &(lo, hi) in del_map.intervals.iter().rev() {
+                            let sh = (Structural::DeleteRows {
+                                at: lo,
+                                n: hi - lo + 1,
+                            })
+                            .reference_shift();
+                            let ms = MappedShift { shift: &sh, insertions: &[] };
+                            if let Some(next_loc) =
+                                shift_internal_link_location(&updated, &own_name, &ms, true)
+                            {
+                                updated = next_loc;
+                            }
+                        }
+                        if updated != link.location {
+                            link.location = updated;
+                            self.hyperlinks_dirty = true;
+                        }
+                    }
                     let end = r.saturating_add(link.span.0);
                     let moved = del_map.map_range(r, end);
                     self.hyperlinks_dirty |= moved != Some((r, end));
@@ -2262,6 +2566,20 @@ impl Sheet {
                 }
             }
             self.notes = out.into();
+        }
+        if !self.threads.is_empty() && self.threads.keys().any(|k| k.row >= min_at) {
+            let old = std::mem::take(&mut self.threads);
+            let mut out = std::collections::HashMap::with_capacity(old.len());
+            self.threads_dirty = true;
+            for (k, mut v) in old {
+                if let Some(nr) = del_map.map(k.row) {
+                    let key = CellRef::new(nr, k.col);
+                    v.r = nr;
+                    v.c = k.col;
+                    out.insert(key, v);
+                }
+            }
+            self.threads = out;
         }
 
         if !self.cf.blocks.is_empty() {
@@ -2480,16 +2798,16 @@ pub fn delete_row_intervals_wb(
         }
     }
 
+    let map_rect = |(r1, c1, r2, c2): (u32, u32, u32, u32)| {
+        if r1 > r2 || c1 > c2 {
+            return None;
+        }
+        del_map.map_range(r1, r2).map(|(a, b)| (a, c1, b, c2))
+    };
     wb.pivots_pending.retain_mut(|(idx, spec, _, rect, _)| {
         if *idx != sheet_idx {
             return true;
         }
-        let map_rect = |(r1, c1, r2, c2): (u32, u32, u32, u32)| {
-            if r1 > r2 || c1 > c2 {
-                return None;
-            }
-            del_map.map_range(r1, r2).map(|(a, b)| (a, c1, b, c2))
-        };
         let Some(source) = map_rect(spec.source) else {
             return false;
         };
@@ -2498,6 +2816,53 @@ pub fn delete_row_intervals_wb(
         };
         spec.source = source;
         *rect = output;
+        true
+    });
+    wb.pivots_pending2.retain_mut(|(idx, spec, _, rect)| {
+        if *idx != sheet_idx {
+            return true;
+        }
+        let Some(source) = map_rect(spec.source) else {
+            return false;
+        };
+        let Some(output) = map_rect(*rect) else {
+            return false;
+        };
+        spec.source = source;
+        *rect = output;
+        true
+    });
+    let target_sid = wb.sheets[sheet_idx].identity;
+    wb.pivots.retain_mut(|p| {
+        let is_src = p.source_sheet_id == Some(target_sid)
+            || p.source_sheet.eq_ignore_ascii_case(&target_name);
+        if is_src {
+            let Some(new_src) = map_rect(p.spec.source) else {
+                if let Some(part) = p.imported_part.take() {
+                    wb.pivots_removed_parts.push(part);
+                }
+                return false;
+            };
+            p.spec.source = new_src;
+            if p.imported_part.is_none() {
+                p.modified = true;
+            }
+        }
+        if p.target_sheet == sheet_idx {
+            let Some(new_out) = map_rect(p.rect) else {
+                if let Some(part) = p.imported_part.take() {
+                    wb.pivots_removed_parts.push(part);
+                }
+                return false;
+            };
+            p.anchor = (new_out.0, new_out.1);
+            p.rect = new_out;
+            p.last_meta.anchor = p.anchor;
+            p.last_meta.rect = new_out;
+            if p.imported_part.is_none() {
+                p.modified = true;
+            }
+        }
         true
     });
 }
