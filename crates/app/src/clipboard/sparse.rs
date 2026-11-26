@@ -1,34 +1,56 @@
 //! Sparse and deferred range paste, including background XMLSS results.
 
-use crate::SheetApp;
+use crate::{sheet_edit_target::SheetEditTarget, SheetApp};
 use sheetcore::{Cell, Value};
+use std::sync::mpsc;
+
+type ParsedPaste = Result<sheetcore::clipboard_xmlss::SparseBlock, String>;
+
+pub(crate) struct BackgroundPaste {
+    target: SheetEditTarget,
+    values_only: bool,
+    result: mpsc::Receiver<ParsedPaste>,
+}
 
 impl SheetApp {
+    pub(super) fn begin_background_paste(&mut self, values_only: bool) -> mpsc::Sender<ParsedPaste> {
+        let (tx, result) = mpsc::channel();
+        self.bg_paste = Some(BackgroundPaste {
+            target: SheetEditTarget::current(self, self.sel),
+            values_only,
+            result,
+        });
+        tx
+    }
+
     pub(crate) fn poll_background_paste(&mut self) {
-        if let Some(rx) = &self.bg_paste_rx {
-            match rx.try_recv() {
-                Ok((uid, si, anchor, values_only, res)) => {
-                    self.bg_paste_rx = None;
-                    if uid == self.doc_uid && si == self.sheet_idx {
-                        match res {
-                            Ok(sparse) => {
-                                let saved = self.sel;
-                                self.sel = anchor;
-                                if !self.paste_sparse_xmlss_ext(&sparse, values_only) {
-                                    self.sel = saved;
-                                }
-                            }
-                            Err(e) => {
-                                self.status = format!("粘贴解析失败：{e}");
-                            }
-                        }
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.bg_paste_rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        let Some(paste) = &self.bg_paste else { return };
+        let result = match paste.result.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.bg_paste = None;
+                self.status = "后台粘贴任务已中断".into();
+                return;
             }
+        };
+        let valid = self.sheet_idx == paste.target.sheet && paste.target.valid(self);
+        let anchor = paste.target.at;
+        let values_only = paste.values_only;
+        self.bg_paste = None;
+        if !valid {
+            self.status = "目标工作表或行列结构已改变，已取消后台粘贴".into();
+            return;
+        }
+        match result {
+            Ok(sparse) => {
+                let saved = self.sel;
+                self.sel = anchor;
+                if !self.paste_sparse_xmlss_ext(&sparse, values_only) {
+                    self.sel = saved;
+                }
+            }
+            Err(e) => self.status = format!("粘贴解析失败：{e}"),
         }
     }
 
@@ -791,5 +813,79 @@ impl SheetApp {
             )
         };
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_env::TestEnv;
+
+    fn parsed_cell() -> ParsedPaste {
+        let xml = r#"<Workbook xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet><Table><Row><Cell><Data ss:Type="Number">42</Data></Cell></Row></Table></Worksheet></Workbook>"#;
+        Ok(sheetcore::clipboard_xmlss::parse_sparse_ext(xml, false).unwrap())
+    }
+
+    #[test]
+    fn background_paste_cancels_when_another_sheet_takes_the_target_index() {
+        let _env = TestEnv::new("bg-paste-deleted-sheet");
+        let mut app = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+        let mut replacement = sheetcore::Sheet::new("Keep");
+        replacement.set(0, 0, Cell { value: Value::Number(7.0), formula: None });
+        app.wb.sheets.push(replacement);
+        let tx = app.begin_background_paste(false);
+        app.delete_sheet(0);
+        assert_eq!(app.wb.sheet(0).name, "Keep");
+        let history = app.undo.depth();
+
+        tx.send(parsed_cell()).unwrap();
+        app.poll_background_paste();
+        assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(7.0));
+        assert_eq!(app.undo.depth(), history);
+        assert!(app.status.contains("已取消后台粘贴"));
+    }
+
+    #[test]
+    fn background_paste_cancels_after_cells_in_its_column_shift() {
+        let _env = TestEnv::new("bg-paste-shifted-cells");
+        let mut app = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+        app.wb.sheet_mut(0).set(1, 0, Cell { value: Value::Number(7.0), formula: None });
+        app.sel = (1, 0);
+        let tx = app.begin_background_paste(false);
+        app.sel = (0, 0);
+        app.sel_end = app.sel;
+        app.shift_cells(true, false);
+        assert_eq!(app.wb.sheet(0).value(2, 0), Value::Number(7.0));
+        let history = app.undo.depth();
+
+        tx.send(parsed_cell()).unwrap();
+        app.poll_background_paste();
+        assert_eq!(app.wb.sheet(0).value(1, 0), Value::Empty);
+        assert_eq!(app.undo.depth(), history);
+        assert!(app.status.contains("已取消后台粘贴"));
+    }
+
+    #[test]
+    fn background_paste_cancels_after_row_insertion_but_keeps_an_unchanged_anchor() {
+        let _env = TestEnv::new("bg-paste-anchor");
+        let mut app = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+        app.sel = (1, 0);
+        let stale = app.begin_background_paste(false);
+        app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+        let history = app.undo.depth();
+        stale.send(parsed_cell()).unwrap();
+        app.poll_background_paste();
+        assert_eq!(app.wb.sheet(0).value(1, 0), Value::Empty);
+        assert_eq!(app.undo.depth(), history);
+        assert!(app.status.contains("已取消后台粘贴"));
+
+        app.sel = (2, 0);
+        let current = app.begin_background_paste(true);
+        app.sel = (4, 0);
+        current.send(parsed_cell()).unwrap();
+        app.poll_background_paste();
+        assert_eq!(app.wb.sheet(0).value(2, 0), Value::Number(42.0));
+        assert_eq!(app.wb.sheet(0).value(4, 0), Value::Empty);
+        assert_eq!(app.undo.depth().0, history.0 + 1);
     }
 }

@@ -7,6 +7,8 @@ mod paste;
 mod sparse;
 mod special;
 
+pub(super) use sparse::BackgroundPaste;
+
 use crate::{SheetApp, office_clipboard};
 use sheetcore::{Cell, Workbook};
 

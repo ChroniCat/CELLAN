@@ -1866,7 +1866,7 @@ struct SheetApp {
     bg_printers_rx: Option<std::sync::mpsc::Receiver<(Vec<String>, Option<String>)>>,
     bg_goal_seek_rx: Option<std::sync::mpsc::Receiver<(u64, usize, u32, u32, u32, u32, Result<f64, String>)>>,
     bg_pivot_rx: Option<std::sync::mpsc::Receiver<BgPivotResult>>,
-    bg_paste_rx: Option<std::sync::mpsc::Receiver<(u64, usize, (u32, u32), bool, Result<sheetcore::clipboard_xmlss::SparseBlock, String>)>>,
+    bg_paste: Option<clipboard::BackgroundPaste>,
     /// 平滑滚轮目标偏移与系统滚动行数缓存
     scroll_target: Option<Vec2>,
     wheel_scroll_lines: u32,
@@ -2933,7 +2933,7 @@ impl SheetApp {
             bg_printers_rx: None,
             bg_goal_seek_rx: None,
             bg_pivot_rx: None,
-            bg_paste_rx: None,
+            bg_paste: None,
             scroll_target: None,
             wheel_scroll_lines: win_chrome::system_wheel_scroll_lines(),
             trace_sheet_idx: 0,

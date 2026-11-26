@@ -40,11 +40,7 @@ impl SheetApp {
                 if let Some(raw) = office_clipboard::read_raw_xmlss() {
                     if raw.len() > 1_000_000 {
                         let mb = raw.len() as f64 / (1024.0 * 1024.0);
-                        let uid = self.doc_uid;
-                        let si_now = self.sheet_idx;
-                        let anchor = self.sel;
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        self.bg_paste_rx = Some(rx);
+                        let tx = self.begin_background_paste(values_only);
                         self.status = format!("正在后台解析剪贴板数据（{mb:.1} MB）…");
                         std::thread::spawn(move || {
                             let res = (|| {
@@ -57,7 +53,7 @@ impl SheetApp {
                                     .filter(|s| s.rows > 0 && s.cols > 0)
                                     .ok_or_else(|| "无法解析剪贴板中的表格数据".to_string())
                             })();
-                            let _ = tx.send((uid, si_now, anchor, values_only, res));
+                            let _ = tx.send(res);
                         });
                         return;
                     }
