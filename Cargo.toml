@@ -3,7 +3,7 @@ members = ["crates/core", "crates/app"]
 resolver = "2"
 
 [workspace.package]
-version = "1.81.0"
+version = "1.82.0"
 edition = "2024"
 description = "CELLAN — Concurrent Engine for Local-first, Lock-free Async Networks"
 repository = "https://github.com/ChroniCat/finance-native-sheets"
