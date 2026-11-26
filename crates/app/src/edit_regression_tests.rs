@@ -2752,6 +2752,61 @@ fn paste_special_values_transpose_and_operations() {
     assert_eq!(app.wb.sheet(0).value(10, 1), sheetcore::model::Value::Number(12.0));
 }
 
+#[test]
+fn cross_sheet_paste_special_formulas_uses_visible_target_rows_and_undoes_once() {
+    let _env = crate::test_env::TestEnv::new("cross-sheet-filtered-formulas");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    let source_formula = "=$A2+B$1";
+    let mut style = app.wb.styles.get(0).clone();
+    style.bold = true;
+    let bold = app.wb.styles.intern(style);
+    let source = app.wb.sheet_mut(0);
+    source.set(1, 0, number(4.0));
+    source.set(0, 1, number(6.0));
+    source.set(1, 2, Cell { formula: Some(source_formula.into()), value: Value::Number(10.0) });
+    source.set_style(1, 2, bold);
+
+    let mut target = sheetcore::Sheet::new("Target");
+    target.set(0, 2, number(20.0));
+    target.set(3, 0, number(7.0));
+    target.set(5, 0, number(9.0));
+    target.set(3, 3, number(41.0));
+    target.set(4, 3, text("hidden"));
+    target.set(5, 3, number(61.0));
+    target.hidden_rows.insert(4);
+    app.wb.sheets.push(target);
+
+    app.sel = (1, 2); // C2
+    app.sel_end = app.sel;
+    app.ribbon_action("Copy", &ctx);
+    assert!(app.switch_sheet_view(1));
+    app.sel = (3, 3); // D4:D6, with D5 filtered out
+    app.sel_end = (5, 3);
+    app.ctx_menu_run(CtxAct::PasteFormulas, 0, &ctx);
+
+    let target = app.wb.sheet(1);
+    assert_eq!(target.formula_of(3, 3), Some("=$A4+C$1"));
+    assert_eq!(target.value(3, 3), Value::Number(27.0));
+    assert_eq!(target.formula_of(5, 3), Some("=$A6+C$1"));
+    assert_eq!(target.value(5, 3), Value::Number(29.0));
+    assert_eq!(target.style_of(3, 3), 0);
+    assert_eq!(target.style_of(5, 3), 0);
+    assert_eq!(target.value(4, 3), Value::Text("hidden".into()));
+    assert_eq!(app.wb.sheet(0).formula_of(1, 2), Some(source_formula));
+    assert_eq!(app.wb.sheet(0).value(1, 2), Value::Number(10.0));
+    assert_eq!(app.undo.depth(), (1, 0));
+
+    app.do_undo(false);
+    let target = app.wb.sheet(1);
+    assert_eq!(target.formula_of(3, 3), None);
+    assert_eq!(target.value(3, 3), Value::Number(41.0));
+    assert_eq!(target.formula_of(5, 3), None);
+    assert_eq!(target.value(5, 3), Value::Number(61.0));
+    assert_eq!(target.value(4, 3), Value::Text("hidden".into()));
+    assert_eq!(app.undo.depth(), (0, 1));
+}
+
 /// UI-06：公式粘贴按目标位置平移相对引用、绝对引用不变。
 /// Excel 基准：C3 的 =A1+$B$1 粘到 B2 → =#REF!+$B$1；粘到 D4 → =B2+$B$1。
 #[test]
