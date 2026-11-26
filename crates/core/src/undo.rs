@@ -2246,6 +2246,8 @@ pub struct StructureSnapshot {
     target: Sheet,
     compact: Option<structural_cells::CellHistory>,
     shift: crate::refs::Shift,
+    movement: Option<crate::refs::AxisMove>,
+    sources: Vec<crate::external::Source>,
     reference_uses: structure_refs::Uses,
     foreign: Vec<ForeignReferences>,
     names: Vec<(String, Option<usize>, String)>,
@@ -2257,14 +2259,43 @@ pub struct StructureSnapshot {
 }
 
 pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::Structural) -> StructureSnapshot {
+    snapshot_with_mapping(wb, sheet, op.reference_shift(), None)
+}
+
+/// Shared cell history can also restore workbook bindings when a local ray moves them.
+pub fn snapshot_cell_shift_if_bound(wb: &Workbook, sheet: usize, rect: (u32,u32,u32,u32), horizontal: bool, insert: bool) -> Option<StructureSnapshot> {
+    let name = &wb.sheets.get(sheet)?.name;
+    let overlaps_ray = |(r1, c1, r2, c2)| if horizontal {
+        r1 <= rect.2 && rect.0 <= r2 && rect.1 <= c2
+    } else {
+        c1 <= rect.3 && rect.1 <= c2 && rect.0 <= r2
+    };
+    wb.sources.iter().any(|source| {
+        !matches!(source.kind, crate::external::Kind::Unbound(_)) &&
+        (source.target_sheet.as_ref().is_none_or(|s| s.eq_ignore_ascii_case(name)) && overlaps_ray(source.destination_rect())
+            || matches!(&source.kind, crate::external::Kind::Internal { sheet, rect } if sheet.eq_ignore_ascii_case(name) && overlaps_ray(*rect)))
+    }).then(|| snapshot_with_mapping(wb, sheet, crate::structural::cell_reference_shift(rect,horizontal,insert), None))
+}
+
+/// The drop line uses the original grid coordinates, just like move_rows_wb / move_cols_wb.
+pub fn snapshot_axis_move(wb: &Workbook, sheet: usize, axis: crate::refs::Axis, from: u32, n: u32, drop: u32) -> Option<StructureSnapshot> {
+    wb.sheets.get(sheet)?;
+    let movement = crate::refs::AxisMove::from_drop(axis, from, n, drop)?;
+    // Compression stores cell differences against the original coordinates. Foreign
+    // references are captured using the actual forward/inverse permutation.
+    Some(snapshot_with_mapping(wb, sheet, crate::refs::Shift { axis, ..Default::default() }, Some(movement)))
+}
+
+fn snapshot_with_mapping(wb: &Workbook, sheet: usize, shift: crate::refs::Shift, movement: Option<crate::refs::AxisMove>) -> StructureSnapshot {
     let target = wb.sheets[sheet].clone();
-    let shift = op.reference_shift();
-    let (reference_uses, foreign) = structure_refs::collect_with_foreign(wb, sheet, &shift);
+    let (reference_uses, foreign) = structure_refs::collect_with_foreign(wb, sheet, &shift, movement);
     StructureSnapshot {
         sheet,
         target,
         compact: None,
         shift,
+        movement,
+        sources: wb.sources.clone(),
         reference_uses,
         foreign,
         names: wb.names.clone(),
@@ -2277,6 +2308,22 @@ pub fn snapshot_structure(wb: &Workbook, sheet: usize, op: &crate::structural::S
 }
 
 impl StructureSnapshot {
+    pub fn detached_source(&self, wb: &Workbook) -> bool {
+        self.sources.iter().zip(&wb.sources).any(|(old, new)| {
+            !matches!(old.kind, crate::external::Kind::Unbound(_))
+                && matches!(new.kind, crate::external::Kind::Unbound(_))
+        })
+    }
+
+    fn storage_shift(&self) -> crate::refs::Shift {
+        // The cell-store compressor models complete axes. A band shift is stored
+        // as exceptions at the original coordinates, keeping cells outside the band intact.
+        if self.shift.row_filter.is_some() || self.shift.col_filter.is_some() {
+            return Default::default();
+        }
+        self.shift.clone()
+    }
+
     /// Capture the same locations after applying the structural edit. In
     /// particular, a deleted reference is now #REF! and cannot be rediscovered
     /// by running the original reference matcher against the new workbook.
@@ -2288,11 +2335,14 @@ impl StructureSnapshot {
             if let Some(first) = journal.iter().map(|entry| entry.2).min() { shift.at = first; }
         }
         shift.delete = !shift.delete;
+        let movement = self.movement.map(crate::refs::AxisMove::inverse);
         Self {
             sheet: self.sheet,
             target: wb.sheets[self.sheet].clone(),
             compact: None,
-            reference_uses: structure_refs::collect(wb, self.sheet, &shift),
+            reference_uses: structure_refs::collect(wb, self.sheet, &shift, movement),
+            movement,
+            sources: wb.sources.clone(),
             shift,
             foreign: self.foreign.iter().map(|scope| {
                 let sheet = &wb.sheets[scope.sheet];
@@ -2421,7 +2471,7 @@ impl StructureSnapshot {
                 // boundary; its after snapshot knows the actual first insertion.
                 let mut shift = self.shift.clone();
                 shift.at = shift.at.max(desired.shift.at);
-                self.reference_uses.covers(wb, self.sheet, &shift)
+                self.reference_uses.covers(wb, self.sheet, &shift, self.movement)
             }
     }
 }
@@ -2450,11 +2500,18 @@ fn changed_names(current: &[DefinedName], expected: &[DefinedName], desired: &[D
 
 fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &StructureSnapshot) -> Option<Vec<(usize, u32, u32)>> {
     if !expected.matches_live(wb, snap) { return None; }
+    let mut source_indexes = Vec::with_capacity(expected.sources.len());
+    for source in &expected.sources {
+        let mut matches = wb.sources.iter().enumerate().filter(|(_, s)| s.name == source.name);
+        let (i, live) = matches.next()?;
+        if live != source || matches.next().is_some() { return None; }
+        source_indexes.push(i);
+    }
     let names = changed_names(&wb.names, &expected.names, &snap.names)?;
     let current = wb.sheets.get(snap.sheet)?;
     let mut target = snap.target.clone();
     if let Some(history) = &snap.compact {
-        target.replace_cell_store(history.restore(current,&expected.shift)?);
+        target.replace_cell_store(history.restore(current,&expected.storage_shift())?);
     }
     let mut touched = Vec::new();
     // Saving may have assigned a part to a previously new sheet. Undo changes
@@ -2588,6 +2645,9 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     wb.names_dirty |= !names.is_empty();
     for (live, restored) in names {
         wb.names[live].2.clone_from(&snap.names[restored].2);
+    }
+    for (i, desired) in source_indexes.into_iter().zip(&snap.sources) {
+        wb.sources[i].clone_from(desired);
     }
     if expected.pivot_shifts != snap.pivot_shifts {
         wb.pivot_shifts.clone_from(&snap.pivot_shifts);

@@ -15,6 +15,8 @@ pub enum Kind {
     Csv { path: String, delim: char, header: bool },
     /// 同一工作簿里的另一张表：表名 + 区间
     Internal { sheet: String, rect: (u32, u32, u32, u32) },
+    /// A structural edit destroyed the binding. Retain its definition for reimport and history.
+    Unbound(Box<Kind>),
 }
 
 /// CSV 的持久化配置：编码与“按文本保留”的列（00123、18 位账号）。
@@ -49,6 +51,61 @@ pub struct Source {
     pub csv_opts: Option<CsvOpts>,
 }
 
+/// Remap a binding on the edited sheet. Destination cells must still comprise
+/// the same footprint: refreshing a shortened or split region would overwrite
+/// neighbouring data. An internal read range can safely grow or shrink.
+pub(crate) fn remap_sources(
+    wb: &mut crate::Workbook, sheet_idx: usize, axis: crate::refs::Axis,
+    band: Option<(u32, u32)>, map: impl Fn(u32, u32) -> Option<(u32, u32)>,
+) {
+    let target = &wb.sheets[sheet_idx].name;
+    let one_sheet = wb.sheets.len() == 1;
+    let remap = |rect: (u32, u32, u32, u32)| {
+        let (a, b, cross_a, cross_b, limit) = match axis {
+            crate::refs::Axis::Row => (rect.0, rect.2, rect.1, rect.3, MAX_SRC_ROWS),
+            crate::refs::Axis::Col => (rect.1, rect.3, rect.0, rect.2, MAX_SRC_COLS),
+        };
+        if band.is_some_and(|(lo, hi)| hi < cross_a || lo > cross_b) { return Some(rect); }
+        let (lo, hi) = map(a, b)?;
+        if hi >= limit { return None; }
+        if (lo, hi) != (a, b) && band.is_some_and(|(lo, hi)| lo > cross_a || hi < cross_b) {
+            return None; // only part of this rectangle shifted
+        }
+        Some(match axis {
+            crate::refs::Axis::Row => (lo, rect.1, hi, rect.3),
+            crate::refs::Axis::Col => (rect.0, lo, rect.2, hi),
+        })
+    };
+    for source in &mut wb.sources {
+        if matches!(source.kind, Kind::Unbound(_)) { continue; }
+        if source.target_sheet.as_ref().is_none_or(|name| name.eq_ignore_ascii_case(target)) {
+            let (r, c) = source.at;
+            let rect = source.destination_rect();
+            let mapped = remap(rect);
+            if mapped != Some(rect) {
+                match mapped {
+                    Some((r1, c1, r2, c2)) if r2 - r1 == rect.2 - r && c2 - c1 == rect.3 - c
+                        && (source.target_sheet.is_some() || one_sheet) => {
+                        source.at = (r1, c1);
+                        source.target_sheet.get_or_insert_with(|| target.clone());
+                    }
+                    _ => { source.kind = Kind::Unbound(Box::new(source.kind.clone())); continue; }
+                }
+            }
+        }
+        if let Kind::Internal { sheet, rect } = &mut source.kind
+            && sheet.eq_ignore_ascii_case(target) {
+            if let Some(updated) = remap(*rect) {
+                *rect = updated;
+            } else {
+                source.kind = Kind::Unbound(Box::new(source.kind.clone()));
+            }
+        }
+    }
+}
+
+pub const UNBOUND_SOURCE: &str = "结构编辑已使数据源的绑定区域失效，请重新选择区域并导入";
+
 const MAX_SRC_ROWS: u32 = crate::sync::MAX_ROWS;
 const MAX_SRC_COLS: u32 = crate::sync::MAX_COLS;
 
@@ -68,6 +125,8 @@ fn default_wire_quote() -> char {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "k")]
 enum SourceWireKind {
+    #[serde(rename = "unbound")]
+    Unbound { source: Box<SourceWireKind> },
     #[serde(rename = "csv")]
     Csv {
         p: String,
@@ -115,7 +174,12 @@ fn parse_source_v2(name: &str, text: &str) -> Option<Source> {
     let wire: SourceWireV2 = serde_json::from_str(&json).ok()?;
     let (at, rows, cols) = clamp_source_bounds(wire.at, wire.rows, wire.cols)?;
     let target_sheet = wire.t.filter(|s| !s.is_empty());
-    let (kind, csv_opts) = match wire.kind {
+    let (wire_kind, unbound) = match wire.kind {
+        SourceWireKind::Unbound { source } => (*source, true),
+        source => (source, false),
+    };
+    let (kind, csv_opts) = match wire_kind {
+        SourceWireKind::Unbound { .. } => return None,
         SourceWireKind::Csv { p, d, h, e, tc, q } => {
             let enc = e.as_deref().and_then(crate::csv::Encoding::from_id);
             let opts = if enc.is_some() || !tc.is_empty() || q != '"' {
@@ -135,7 +199,7 @@ fn parse_source_v2(name: &str, text: &str) -> Option<Source> {
     };
     Some(Source {
         name: name.to_string(),
-        kind,
+        kind: if unbound { Kind::Unbound(Box::new(kind)) } else { kind },
         at,
         target_sheet,
         rows,
@@ -145,37 +209,45 @@ fn parse_source_v2(name: &str, text: &str) -> Option<Source> {
 }
 
 impl Source {
+    pub(crate) fn destination_rect(&self) -> (u32, u32, u32, u32) {
+        let (r, c) = self.at;
+        (r, c, r.saturating_add(self.rows.saturating_sub(1)), c.saturating_add(self.cols.saturating_sub(1)))
+    }
+
     /// 存进名称管理器 / 自定义文档属性的文本（不带等号，外面包一层双引号当字符串常量）。
     ///
     /// 使用可逆的版本化 JSON 编码（`V2:{...}`），确保含 `|`、双引号、XML 特殊字符的工作表名、
     /// 文件路径及竖线分隔符均能无损往返，同时 `from_name_text` 保留对旧版 `CSV|...`/`SHEET|...` 的读取兼容。
     pub fn to_name_text(&self) -> String {
-        let kind = match &self.kind {
-            Kind::Csv { path, delim, header } => {
-                let (e, tc, q) = match &self.csv_opts {
-                    Some(o) => (
-                        o.encoding.map(|enc| enc.id().to_string()),
-                        o.text_cols.clone(),
-                        o.quote,
-                    ),
-                    None => (None, Vec::new(), '"'),
-                };
-                SourceWireKind::Csv {
-                    p: path.clone(),
-                    d: *delim,
-                    h: *header,
-                    e,
-                    tc,
-                    q,
+        fn wire_kind(kind: &Kind, options: Option<&CsvOpts>) -> SourceWireKind {
+            match kind {
+                Kind::Unbound(source) => SourceWireKind::Unbound { source: Box::new(wire_kind(source, options)) },
+                Kind::Csv { path, delim, header } => {
+                    let (e, tc, q) = match options {
+                        Some(o) => (
+                            o.encoding.map(|enc| enc.id().to_string()),
+                            o.text_cols.clone(),
+                            o.quote,
+                        ),
+                        None => (None, Vec::new(), '"'),
+                    };
+                    SourceWireKind::Csv {
+                        p: path.clone(),
+                        d: *delim,
+                        h: *header,
+                        e,
+                        tc,
+                        q,
+                    }
                 }
+                Kind::Internal { sheet, rect } => SourceWireKind::Internal {
+                    s: sheet.clone(),
+                    r: *rect,
+                },
             }
-            Kind::Internal { sheet, rect } => SourceWireKind::Internal {
-                s: sheet.clone(),
-                r: *rect,
-            },
-        };
+        }
         let wire = SourceWireV2 {
-            kind,
+            kind: wire_kind(&self.kind, self.csv_opts.as_ref()),
             at: self.at,
             rows: self.rows,
             cols: self.cols,
@@ -1524,7 +1596,14 @@ pub fn visit_source_sheet<E>(
 
 /// 刷新一个数据源；返回写出的 (行, 列)
 pub fn refresh(wb: &mut crate::model::Workbook, sheet_idx: usize, src: &Source) -> std::io::Result<(u32, u32)> {
+    if wb.sources.iter().any(|registered| registered.name == src.name && registered != src) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "数据源绑定已更改，请重新刷新"));
+    }
+    if wb.sheets.get(sheet_idx).is_none_or(|sheet| src.target_sheet.as_ref().is_some_and(|name| !name.eq_ignore_ascii_case(&sheet.name))) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "目标工作表与数据源不符"));
+    }
     match &src.kind {
+        Kind::Unbound(_) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, UNBOUND_SOURCE)),
         Kind::Csv { path, delim, header } => {
             let real = resolve_path(wb, path);
             let (enc, cols, quote) = match &src.csv_opts {

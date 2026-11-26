@@ -320,11 +320,22 @@ fn store_source(wb: &mut Workbook, registration: Registration) {
     } = registration;
     let target_sheet_name = wb.sheets.get(target_sheet).map(|s| s.name.clone());
     let stored = external::store_path(wb, &file);
+    // A first save can turn the same absolute filename into a workbook-relative path.
+    let same_file = |path: &str| path == stored || Path::new(path) == file;
     let sources = &mut wb.sources;
     let existing = sources.iter().position(|s| {
         s.at == at
             && s.target_sheet.as_deref() == target_sheet_name.as_deref()
-            && matches!(&s.kind, Kind::Csv { path, .. } if path == &stored)
+            && matches!(&s.kind, Kind::Csv { path, .. } if same_file(path))
+    });
+    // Reimporting a detached CSV explicitly binds it to the selected target again.
+    let existing = existing.or_else(|| {
+        let mut detached = sources.iter().enumerate().filter(|(_, source)| {
+            source.target_sheet.as_deref().is_none_or(|name| Some(name) == target_sheet_name.as_deref())
+                && matches!(&source.kind, Kind::Unbound(old) if matches!(old.as_ref(), Kind::Csv { path, .. } if same_file(path)))
+        });
+        let first = detached.next()?.0;
+        detached.next().is_none().then_some(first)
     });
     let name = existing
         .map(|i| sources[i].name.clone())
@@ -493,6 +504,7 @@ fn prepare(
                 matched += 1;
                 check_cancelled(cancel)?;
                 let size = (|| match &src.kind {
+                    Kind::Unbound(_) => Err(external::UNBOUND_SOURCE.into()),
                     Kind::Csv {
                         path,
                         delim,
@@ -1295,6 +1307,89 @@ mod tests {
         assert_eq!(app.undo.depth(), depth);
         assert!(!app.wb.dirty);
         assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(3.));
+    }
+
+    #[test]
+    fn refresh_discards_an_old_binding_and_reimport_rebinds_a_detached_source() {
+        use sheetcore::structural::{apply_structural_wb, Structural};
+
+        let env = crate::test_env::TestEnv::new("csv_refresh_structural_binding");
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        let file = env.path("registered.csv");
+        std::fs::write(&file, "1\n2").unwrap();
+        app.sel = (4, 0);
+        app.import_csv_from(&file);
+        app.finish_csv_probe();
+        let name = app.wb.sources[0].name.clone();
+        app.wb.sheet_mut(0).set(3, 0, number(71.));
+        let depth = app.undo.depth();
+        std::fs::write(&file, "3").unwrap();
+        app.refresh_import();
+        apply_structural_wb(&mut app.wb, 0, &Structural::InsertRows { at: 0, n: 1 });
+        assert_eq!(app.wb.sources[0].at, (5, 0));
+        app.finish_csv_probe();
+        assert!(app.status.contains("已取消"), "{}", app.status);
+        assert_eq!(app.undo.depth(), depth);
+        assert_eq!(app.wb.sheet(0).value(4, 0), Value::Number(71.));
+        assert_eq!(app.wb.sheet(0).value(5, 0), Value::Number(1.));
+
+        apply_structural_wb(&mut app.wb, 0, &Structural::DeleteRows { at: 5, n: 1 });
+        let pkg = env.path("binding.xlsx");
+        sheetcore::xlsx::save_atomic(&pkg, &app.wb).unwrap();
+        app.wb = sheetcore::xlsx::load(&pkg).unwrap();
+        app.refresh_import();
+        app.finish_csv_probe();
+        assert!(app.status.contains(external::UNBOUND_SOURCE), "{}", app.status);
+        assert_eq!(app.undo.depth(), depth);
+        assert_eq!(app.wb.sheet(0).value(5, 0), Value::Number(2.));
+
+        app.sel = (9, 1);
+        app.import_csv_from(&file);
+        app.finish_csv_probe();
+        assert_eq!(app.wb.sources.len(), 1);
+        assert_eq!(app.wb.sources[0].name, name);
+        assert_eq!(app.wb.sources[0].at, (9, 1));
+        std::fs::write(&file, "4").unwrap();
+        app.refresh_import();
+        app.finish_csv_probe();
+        assert_eq!(app.wb.sheet(0).value(9, 1), Value::Number(4.));
+        assert_eq!(app.wb.sheet(0).value(5, 0), Value::Number(2.));
+    }
+
+    #[test]
+    fn partial_cell_shift_restores_imported_cells_and_their_binding_in_one_undo() {
+        let env = crate::test_env::TestEnv::new("csv_shift_cell_binding");
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        let file = env.path("cell-ray.csv");
+        std::fs::write(&file, "1,2").unwrap();
+        app.sel = (4, 1);
+        app.import_csv_from(&file);
+        app.finish_csv_probe();
+        let source = app.wb.sources[0].clone();
+        let depth = app.undo.depth();
+        app.sel = (1, 1);
+        app.sel_end = (2, 2);
+        let pending = Target::current(&app, (4, 1));
+        app.shift_cells(true, false);
+        assert!(!pending.valid(&app));
+        assert_eq!(app.wb.sources[0].at, (5, 1));
+        assert_eq!(app.wb.sheet(0).value(5, 1), Value::Number(1.));
+        assert_eq!(app.undo.depth().0, depth.0 + 1);
+        app.do_undo(false);
+        assert_eq!(app.wb.sources[0], source);
+        assert_eq!(app.wb.sheet(0).value(4, 2), Value::Number(2.));
+        app.do_undo(true);
+        assert_eq!(app.wb.sources[0].at, (5, 1));
+        app.sel = (1, 1);
+        app.sel_end = app.sel;
+        app.shift_cells(false, false);
+        assert!(matches!(app.wb.sources[0].kind, Kind::Unbound(_)));
+        assert!(app.status.contains("重新选择区域"), "{}", app.status);
+        app.do_undo(false);
+        assert_eq!(app.wb.sources[0].at, (5, 1));
+        assert!(matches!(app.wb.sources[0].kind, Kind::Csv { .. }));
+        assert_eq!(app.wb.sheet(0).value(5, 1), Value::Number(1.));
+        assert_eq!(app.wb.sheet(0).value(5, 2), Value::Number(2.));
     }
 
     #[test]

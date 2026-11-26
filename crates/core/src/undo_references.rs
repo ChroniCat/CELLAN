@@ -3,7 +3,7 @@
 use crate::{
     CellRef, Workbook,
     cf::{CfKind, CfvoKind},
-    refs::{Axis, Shift},
+    refs::{Axis, AxisMove, Shift},
 };
 use std::{collections::HashSet, sync::Arc};
 
@@ -17,6 +17,7 @@ enum Location {
     Hyperlink(u64, u32, u32),
     Spark(u64, u32, u32, (u32, u32, u32, u32)),
     Source((u32, u32, u32, u32)),
+    SourceDestination((u32, u32), u32, u32),
     Pivot(
         (u32, u32, u32, u32),
         (u32, u32, u32, u32),
@@ -31,9 +32,9 @@ enum Location {
 pub(super) struct Uses(HashSet<(Location, Arc<str>)>);
 
 impl Uses {
-    pub(super) fn covers(&self, wb: &Workbook, target: usize, op: &Shift) -> bool {
+    pub(super) fn covers(&self, wb: &Workbook, target: usize, op: &Shift, movement: Option<AxisMove>) -> bool {
         let mut covered = true;
-        visit(wb, target, op, None, |entry| covered &= self.0.contains(&entry));
+        visit(wb, target, op, movement, None, |entry| covered &= self.0.contains(&entry));
         covered
     }
 
@@ -90,9 +91,9 @@ fn may_mention_foreign_sheet(text: &str, target_name: &str, fast_byte_filter_ok:
     }
 }
 
-pub(super) fn collect(wb: &Workbook, target: usize, op: &Shift) -> Uses {
+pub(super) fn collect(wb: &Workbook, target: usize, op: &Shift, movement: Option<AxisMove>) -> Uses {
     let mut uses = Uses::default();
-    visit(wb, target, op, None, |entry| {
+    visit(wb, target, op, movement, None, |entry| {
         uses.0.insert(entry);
     });
     uses
@@ -104,10 +105,11 @@ pub(super) fn collect_with_foreign(
     wb: &Workbook,
     target: usize,
     op: &Shift,
+    movement: Option<AxisMove>,
 ) -> (Uses, Vec<super::ForeignReferences>) {
     let mut uses = Uses::default();
     let mut foreign = Vec::new();
-    visit(wb, target, op, Some(&mut foreign), |entry| {
+    visit(wb, target, op, movement, Some(&mut foreign), |entry| {
         uses.0.insert(entry);
     });
     (uses, foreign)
@@ -117,12 +119,17 @@ fn visit(
     wb: &Workbook,
     target: usize,
     op: &Shift,
+    movement: Option<AxisMove>,
     mut foreign_out: Option<&mut Vec<super::ForeignReferences>>,
     mut emit: impl FnMut((Location, Arc<str>)),
 ) {
     let mut shift = op.clone();
     let target_name = &wb.sheets[target].name;
     shift.target_sheet.clone_from(target_name);
+    let rewrite = |text: &str, shift: &Shift| match movement {
+        Some(mv) => mv.rewrite(text, target_name, &shift.own_sheet),
+        None => crate::refs::rewrite(text, shift),
+    };
     let fast_filter_ok = !target_name.contains('\'')
         && target_name
             .chars()
@@ -135,7 +142,7 @@ fn visit(
         let id = sheet.identity;
         let changes = |text: &str| {
             may_mention_foreign_sheet(text, target_name, fast_filter_ok)
-                && crate::refs::rewrite(text, &shift) != text
+                && rewrite(text, &shift) != text
         };
         let capture_foreign = foreign_out.is_some();
         let mut foreign_cells = Vec::new();
@@ -262,7 +269,7 @@ fn visit(
             .and_then(|i| wb.sheets.get(i))
             .map(|s| s.name.clone())
             .unwrap_or_default();
-        if crate::refs::rewrite(text, &shift) != *text {
+        if rewrite(text, &shift) != *text {
             emit((Location::Name(*scope, name.clone()), text.as_str().into()));
         }
     }
@@ -294,9 +301,30 @@ fn visit(
         }
     }
     for source in &wb.sources {
+        if matches!(source.kind, crate::external::Kind::Unbound(_)) { continue; }
+        let moved = |rect| match movement {
+            Some(mv) => {
+                let (r1,c1,r2,c2) = rect;
+                let span = if mv.axis == Axis::Row { (r1,r2) } else { (c1,c2) };
+                mv.contiguous_range(span.0, span.1) != Some(span)
+            }
+            None if shift.row_filter.is_some() || shift.col_filter.is_some() => {
+                let (r1, c1, r2, c2) = rect;
+                let cells = Shift { n: 1, ..shift.clone() };
+                shift.row_filter.is_none_or(|(lo,hi)| r1 <= hi && lo <= r2)
+                    && shift.col_filter.is_none_or(|(lo,hi)| c1 <= hi && lo <= c2)
+                    && rect_moves(&cells, rect)
+            }
+            None => rect_moves(&shift, rect),
+        };
+        if source.target_sheet.as_ref().is_none_or(|name| name.eq_ignore_ascii_case(target_name)) {
+            if moved(source.destination_rect()) {
+                emit((Location::SourceDestination(source.at, source.rows, source.cols), source.name.as_str().into()));
+            }
+        }
         if let crate::external::Kind::Internal { sheet, rect } = &source.kind
             && sheet.eq_ignore_ascii_case(target_name)
-            && rect_moves(&shift, *rect)
+            && moved(*rect)
         {
             emit((Location::Source(*rect), source.name.as_str().into()));
         }

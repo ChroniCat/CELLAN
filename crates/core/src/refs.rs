@@ -143,6 +143,47 @@ enum AxisMapper<'a> {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AxisMove {
+    pub axis: Axis,
+    pub from: u32,
+    pub n: u32,
+    pub at: u32,
+}
+
+impl AxisMove {
+    /// Convert the UI insertion line (in the original sheet) to a final coordinate.
+    pub fn from_drop(axis: Axis, from: u32, n: u32, drop: u32) -> Option<Self> {
+        let limit = match axis { Axis::Row => crate::sync::MAX_ROWS, Axis::Col => crate::sync::MAX_COLS };
+        let end = from.checked_add(n)?;
+        if n == 0 || end > limit || drop > limit || (from..=end).contains(&drop) { return None; }
+        Some(Self { axis, from, n, at: if drop > from { drop - n } else { drop } })
+    }
+
+    pub fn inverse(self) -> Self { Self { from: self.at, at: self.from, ..self } }
+
+    pub fn rewrite(self, text: &str, target: &str, owner: &str) -> String {
+        permute_axis(text, self.axis, self.from, self.n, self.at, target, owner)
+    }
+
+    /// Map the complete set, including interior breakpoints. Separated pieces cannot
+    /// serve as one rectangular external-data binding.
+    pub fn contiguous_range(self, first: u32, last: u32) -> Option<(u32, u32)> {
+        let map = |v| permute_index(v, self.from, self.n, self.at);
+        let mut lo = map(first).min(map(last));
+        let mut hi = map(first).max(map(last));
+        for edge in [self.from.min(self.at), self.from, self.from + self.n, self.from.max(self.at) + self.n] {
+            if first < edge && edge <= last {
+                for point in [map(edge - 1), map(edge)] {
+                    lo = lo.min(point);
+                    hi = hi.max(point);
+                }
+            }
+        }
+        (hi - lo == last - first).then_some((lo, hi))
+    }
+}
+
 fn permute_index(pos: u32, from: u32, n: u32, at: u32) -> u32 {
     let lo = from.min(at);
     let hi = (from + n).max(at + n);

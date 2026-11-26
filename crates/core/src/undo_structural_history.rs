@@ -13,8 +13,20 @@ pub(super) struct Snapshots {
 impl Snapshots {
     fn compact(&mut self) -> usize {
         let (before, after) = (&mut self.before, &mut self.after);
+        // Structure edits update source definitions in place. Keep only the bindings
+        // this edit changed so history can coexist with independently added sources.
+        let mut before_sources = Vec::new();
+        let mut after_sources = Vec::new();
+        for (old, new) in std::mem::take(&mut before.sources).into_iter().zip(std::mem::take(&mut after.sources)) {
+            if old != new {
+                before_sources.push(old);
+                after_sources.push(new);
+            }
+        }
+        before.sources = before_sources;
+        after.sources = after_sources;
         let (undo, redo) =
-            CellHistory::pair(&before.target, &after.target, &before.shift, &after.shift);
+            CellHistory::pair(&before.target, &after.target, &before.storage_shift(), &after.storage_shift());
         let foreign_bytes = before
             .foreign
             .iter()
@@ -32,6 +44,8 @@ impl Snapshots {
             .saturating_add(redo.bytes())
             .saturating_add(before.reference_uses.bytes())
             .saturating_add(after.reference_uses.bytes())
+            .saturating_add(std::mem::size_of_val(before.sources.as_slice()))
+            .saturating_add(std::mem::size_of_val(after.sources.as_slice()))
             .saturating_add(foreign_bytes);
         before.compact = Some(undo);
         after.compact = Some(redo);

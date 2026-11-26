@@ -17469,6 +17469,7 @@ fn clear_values(&mut self) {
         if !self.write_preflight(&keys, if insert { "插入单元格" } else { "删除单元格" }) {
             return;
         }
+        let sources_before = sheetcore::undo::snapshot_cell_shift_if_bound(&self.wb, self.sheet_idx, rect, horizontal, insert);
         let txn = self.txn_begin(&keys);
         {
             let sh = self.wb.sheet_mut(self.sheet_idx);
@@ -17484,7 +17485,16 @@ fn clear_values(&mut self) {
             }
         }
         sheetcore::structural::apply_cell_shift_wb(&mut self.wb, self.sheet_idx, rect, horizontal, insert);
-        self.txn_end(if insert { "插入单元格" } else { "删除单元格" }, txn);
+        let label = if insert { "插入单元格" } else { "删除单元格" };
+        let detached_source = sources_before.as_ref().is_some_and(|s| s.detached_source(&self.wb));
+        if let Some(before) = sources_before {
+            let deltas = sheetcore::undo::finish(txn, self.wb.sheet(self.sheet_idx));
+            self.record_revision(label, &deltas);
+            let after = before.capture_after(&self.wb);
+            self.undo.push_structure(label, before, after, (self.sheet_idx, self.sel.0, self.sel.1));
+        } else {
+            self.txn_end(label, txn);
+        }
         self.recalc_all_and_deps_adaptive();
         self.tasks.last_edit = Some(std::time::Instant::now());
         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -17496,6 +17506,9 @@ fn clear_values(&mut self) {
         } else {
             "已删除单元格（上方上移）".into()
         };
+        if detached_source {
+            self.status.push_str("；部分数据源的绑定区域已失效，请重新选择区域并导入");
+        }
     }
 
     /// 算一遍简转繁的差异（不动数据），供预览对话框显示
@@ -32253,6 +32266,7 @@ impl SheetApp {
         let before = sheetcore::undo::snapshot_structure(&self.wb, idx, &op);
         let pending_pivots_before = self.wb.pivots_pending.len();
         sheetcore::structural::apply_structural_wb(&mut self.wb, idx, &op);
+        let detached_source = before.detached_source(&self.wb);
         let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -32269,6 +32283,9 @@ impl SheetApp {
         };
         if removed_pivots > 0 {
             self.status.push_str(&format!("；已移除 {removed_pivots} 个源字段或区域被删除的透视表定义"));
+        }
+        if detached_source {
+            self.status.push_str("；部分数据源的绑定区域已失效，请重新选择区域并导入");
         }
     }
 
@@ -40697,13 +40714,9 @@ impl SheetApp {
                     if !inside {
                         // 和插入/删除一样走结构快照，撤销才有东西可回
                         let idx = self.sheet_idx;
-                        let op = if is_rows {
-                            sheetcore::structural::Structural::DeleteRows { at: from, n }
-                        } else {
-                            sheetcore::structural::Structural::DeleteCols { at: from, n }
-                        };
+                        let axis = if is_rows { sheetcore::refs::Axis::Row } else { sheetcore::refs::Axis::Col };
                         let snap = if self.wb.sheet(idx).len() <= 200_000 {
-                            Some(sheetcore::undo::snapshot_structure(&self.wb, idx, &op))
+                            sheetcore::undo::snapshot_axis_move(&self.wb, idx, axis, from, n, drop)
                         } else {
                             None
                         };

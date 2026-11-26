@@ -1896,38 +1896,35 @@ impl crate::layout::Axis {
 /// 整个工作簿层面的结构改动：搬格子 + 改写所有表里的公式引用
 /// 插入/删除单元格（局部区域）：按区域改写公式引用。
 /// horizontal=true 表示右移/左移（列位移），false 表示下移/上移（行位移）。
-pub fn apply_cell_shift_wb(
-    wb: &mut crate::model::Workbook,
-    sheet_idx: usize,
-    rect: (u32, u32, u32, u32),
-    horizontal: bool,
-    insert: bool,
-) {
-    let Some(name) = wb.sheets.get(sheet_idx).map(|s| s.name.clone()) else {
-        return;
-    };
+pub(crate) fn cell_reference_shift(rect: (u32, u32, u32, u32), horizontal: bool, insert: bool) -> crate::refs::Shift {
     let (r1, c1, r2, c2) = rect;
     let (axis, at, n) = if horizontal {
         (crate::refs::Axis::Col, c1, c2.saturating_sub(c1) + 1)
     } else {
         (crate::refs::Axis::Row, r1, r2.saturating_sub(r1) + 1)
     };
+    crate::refs::Shift {
+        axis, at, n, delete: !insert,
+        row_filter: horizontal.then_some((r1, r2)),
+        col_filter: (!horizontal).then_some((c1, c2)),
+        ..Default::default()
+    }
+}
+
+pub fn apply_cell_shift_wb(
+    wb: &mut crate::model::Workbook, sheet_idx: usize, rect: (u32, u32, u32, u32),
+    horizontal: bool, insert: bool,
+) {
+    let Some(target) = wb.sheets.get_mut(sheet_idx) else { return };
+    target.coordinates_shifted();
+    let name = target.name.clone();
+    let mut shift = cell_reference_shift(rect, horizontal, insert);
+    shift.target_sheet.clone_from(&name);
+    // The UI shifts the cells by one position, including for multi-cell selections.
+    let cells = crate::refs::Shift { n: 1, ..shift.clone() };
+    crate::external::remap_sources(wb, sheet_idx, cells.axis, cells.row_filter.or(cells.col_filter), |a, b| cells.map_range(a, b));
     for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
-        let shift = crate::refs::Shift {
-            axis,
-            at,
-            n,
-            delete: !insert,
-            target_sheet: name.clone(),
-            own_sheet: if idx == sheet_idx {
-                name.clone()
-            } else {
-                sheet.name.clone()
-            },
-            translate: None,
-            row_filter: if horizontal { Some((r1, r2)) } else { None },
-            col_filter: if horizontal { None } else { Some((c1, c2)) },
-        };
+        shift.own_sheet.clone_from(if idx == sheet_idx { &name } else { &sheet.name });
         sheet.rewrite_references(&shift);
     }
 }
@@ -1940,13 +1937,10 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
 
 /// 整工作簿级行移动：先在目标表执行 `move_rows`，再按真实行置换更新其他工作表的跨表公式与自定义名称。
 pub fn move_rows_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, from: u32, n: u32, to: u32) {
-    if n == 0 || to == from || sheet_idx >= wb.sheets.len() {
-        return;
-    }
-    let at = if to > from { to - n } else { to };
-    if at == from {
-        return;
-    }
+    let Some(mv) = crate::refs::AxisMove::from_drop(crate::refs::Axis::Row, from, n, to) else { return };
+    if sheet_idx >= wb.sheets.len() { return; }
+    let at = mv.at;
+    crate::external::remap_sources(wb, sheet_idx, mv.axis, None, |lo, hi| mv.contiguous_range(lo, hi));
     let target_name = wb.sheets[sheet_idx].name.clone();
     wb.sheets[sheet_idx].move_rows(from, n, to);
     update_workbook_permuted_references(wb, sheet_idx, crate::refs::Axis::Row, from, n, at, &target_name);
@@ -1954,13 +1948,10 @@ pub fn move_rows_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, from: u32
 
 /// 整工作簿级列移动：先在目标表执行 `move_cols`，再按真实列置换更新其他工作表的跨表公式与自定义名称。
 pub fn move_cols_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, from: u32, n: u32, to: u32) {
-    if n == 0 || to == from || sheet_idx >= wb.sheets.len() {
-        return;
-    }
-    let at = if to > from { to - n } else { to };
-    if at == from {
-        return;
-    }
+    let Some(mv) = crate::refs::AxisMove::from_drop(crate::refs::Axis::Col, from, n, to) else { return };
+    if sheet_idx >= wb.sheets.len() { return; }
+    let at = mv.at;
+    crate::external::remap_sources(wb, sheet_idx, mv.axis, None, |lo, hi| mv.contiguous_range(lo, hi));
     let target_name = wb.sheets[sheet_idx].name.clone();
     wb.sheets[sheet_idx].move_cols(from, n, to);
     update_workbook_permuted_references(wb, sheet_idx, crate::refs::Axis::Col, from, n, at, &target_name);
@@ -2044,6 +2035,8 @@ fn update_workbook_references(
     let name = wb.sheets[sheet_idx].name.clone();
     shift.target_sheet.clone_from(&name);
     let (axis, at, n, delete) = (shift.axis, shift.at, shift.n, shift.delete);
+    let mapped = MappedShift { shift: &shift, insertions };
+    crate::external::remap_sources(wb, sheet_idx, axis, None, |lo, hi| mapped.map_range(lo, hi));
     for sheet in &mut wb.sheets {
         shift.own_sheet.clone_from(&sheet.name);
         let shift = MappedShift { shift: &shift, insertions };
@@ -2873,6 +2866,7 @@ pub fn delete_row_intervals_wb(
         }
     }
 
+    crate::external::remap_sources(wb, sheet_idx, crate::refs::Axis::Row, None, |lo, hi| del_map.map_range(lo, hi));
     for &(lo, hi) in del_map.intervals.iter().rev() {
         wb.pivot_shifts
             .push((target_name.clone(), 0, lo, hi - lo + 1, true));
