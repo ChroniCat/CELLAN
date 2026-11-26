@@ -10812,6 +10812,7 @@ fn every_dialog_primary_action_uses_the_default_button_helper() {
     let sources = [
         ("main.rs", include_str!("main.rs")),
         ("page_setup.rs", include_str!("page_setup.rs")),
+        ("spark_edit.rs", include_str!("spark_edit.rs")),
     ];
     let mut bad = Vec::new();
     // 功能区下拉里的行内「应用」是菜单项（点完即关闭菜单），不是对话框默认按钮，
@@ -11877,6 +11878,46 @@ fn gap10_hyperlinks_formula_jump_and_dialog_prefill() {
         app.formula_hyperlink_target(0, 1).as_deref(),
         Some("https://example.com/docs")
     );
+}
+
+#[test]
+fn ribbon_sparkline_clear_only_removes_selected_anchors_and_undoes_once() {
+    let _env = crate::test_env::TestEnv::new("ribbon-sparkline-clear");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let sheet = app.wb.sheet_mut(0);
+    sheet.set(0, 0, number(11.0));
+    sheet.set(0, 1, number(22.0));
+    for row in 0..3 {
+        sheet.sparklines.push(sheetcore::sparkline::Sparkline {
+            r: row,
+            c: 4,
+            rect: (0, 0, 0, 1),
+            high: row == 1,
+            ..Default::default()
+        });
+    }
+    let original = sheet.sparklines.clone();
+    app.sel = (0, 4); // E1:E2
+    app.sel_end = (1, 4);
+    assert!(app.spark_at_sel().is_some());
+    assert_eq!(app.undo.depth(), (0, 0));
+
+    app.ribbon_action("SparkClear", &ctx);
+    let sheet = app.wb.sheet(0);
+    assert_eq!(sheet.sparklines.as_slice(), &original[2..]);
+    assert!(sheet.sparklines_dirty);
+    assert!(app.spark_at_sel().is_none());
+    assert_eq!(sheet.value(0, 0), Value::Number(11.0));
+    assert_eq!(sheet.value(0, 1), Value::Number(22.0));
+    assert_eq!(app.undo.depth(), (1, 0));
+
+    app.do_undo(false);
+    let sheet = app.wb.sheet(0);
+    assert_eq!(sheet.sparklines, original);
+    assert_eq!(sheet.value(0, 0), Value::Number(11.0));
+    assert_eq!(sheet.value(0, 1), Value::Number(22.0));
+    assert_eq!(app.undo.depth(), (0, 1));
 }
 
 #[test]
