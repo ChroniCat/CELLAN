@@ -253,6 +253,71 @@ impl Sheet {
         self.rewrite_mapped_references(&MappedShift { shift, insertions: &[] });
     }
 
+    /// 整行/整列移动（置换 `[min(from,at), max(from+n,at+n))` 区间）后，按真实置换关系
+    /// 重写本表所有单元格、条件格式和数据验证中指向 `target_sheet` 的公式引用。
+    pub(crate) fn rewrite_permuted_references(
+        &mut self,
+        axis: crate::refs::Axis,
+        from: u32,
+        n: u32,
+        at: u32,
+        target_sheet: &str,
+    ) {
+        if n == 0 || from == at {
+            return;
+        }
+        let own_name = self.name.clone();
+        let lo = from.min(at);
+        let hi = (from + n).max(at + n);
+        let probe_shift = crate::refs::Shift {
+            axis,
+            at: lo,
+            n: hi - lo,
+            delete: false,
+            target_sheet: target_sheet.to_string(),
+            own_sheet: own_name.clone(),
+            ..Default::default()
+        };
+        let probe_mapped = MappedShift { shift: &probe_shift, insertions: &[] };
+        let foreign_sheet = (!own_name.eq_ignore_ascii_case(target_sheet)).then_some(target_sheet);
+        let changed = self
+            .cells_mut()
+            .rewrite_formulas_parallel(foreign_sheet, |old| {
+                if !formula_may_be_affected(old, &probe_mapped) {
+                    return None;
+                }
+                let new = crate::refs::permute_axis(old, axis, from, n, at, target_sheet, &own_name);
+                (new != old).then(|| new.into())
+            });
+        self.edited |= changed;
+        for blk in self.cf.blocks.iter_mut() {
+            for rule in blk.rules.iter_mut() {
+                let mut rewrite_threshold = |formula: &mut String| {
+                    let rewritten =
+                        crate::refs::permute_axis(formula, axis, from, n, at, target_sheet, &own_name);
+                    if *formula != rewritten {
+                        *formula = rewritten;
+                        self.cf_dirty = true;
+                    }
+                };
+                match &mut rule.kind {
+                    crate::cf::CfKind::Expr { formula, .. } => rewrite_threshold(formula),
+                    crate::cf::CfKind::CellIs { a, b, .. } => {
+                        rewrite_threshold(a);
+                        rewrite_threshold(b);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for dv in self.dv.iter_mut() {
+            let f1 = crate::refs::permute_axis(&dv.f1, axis, from, n, at, target_sheet, &own_name);
+            let f2 = crate::refs::permute_axis(&dv.f2, axis, from, n, at, target_sheet, &own_name);
+            self.dv_dirty |= dv.f1 != f1 || dv.f2 != f2;
+            (dv.f1, dv.f2) = (f1, f2);
+        }
+    }
+
     fn rewrite_mapped_references(&mut self, shift: &MappedShift) {
         let foreign_sheet = (shift.translate.is_none()
             && !shift.own_sheet.eq_ignore_ascii_case(&shift.target_sheet))
@@ -632,7 +697,6 @@ impl Sheet {
         let lo = from.min(at);
         let hi = (from + n).max(at + n);
         let r2 = from + n - 1;
-        let delta_r = at as i64 - from as i64;
         let perm = |r: u32| -> u32 {
             if r < lo || r >= hi {
                 r
@@ -728,23 +792,6 @@ impl Sheet {
         // pages `< lo / PAGE_ROWS` and `> (hi - 1) / PAGE_ROWS` are 100% untouched.
         self.permute_cell_band(true, lo, hi, perm);
 
-        // 平移被移动行上的相对公式引用（与 Excel 行拖动/搬移一致）
-        let own_name = self.name.clone();
-        let moved_formulas: Vec<(u32, u32, String)> = self
-            .iter_rect((at, 0, at + n - 1, crate::sync::MAX_COLS - 1))
-            .filter_map(|(k, c)| {
-                let f = c.formula.as_deref()?;
-                let nf = crate::refs::translate(f, delta_r, 0, &own_name);
-                (nf != f).then_some((k.row, k.col, nf))
-            })
-            .collect();
-        for (r, c, nf) in moved_formulas {
-            if let Some(mut cell) = self.get(r, c).map(|x| x.into_owned()) {
-                cell.formula = Some(nf.into());
-                self.set(r, c, cell);
-            }
-        }
-
         self.delete_rows_inner(from, n, false);
         self.insert_rows_inner(at, n, false);
 
@@ -827,6 +874,9 @@ impl Sheet {
                 self.set_row_style(at + i as u32, st);
             }
         }
+        // 按真实行置换更新本表公式与条件格式/数据验证引用（不动置换区间外与跨表引用）
+        let own_name = self.name.clone();
+        self.rewrite_permuted_references(crate::refs::Axis::Row, from, n, at, &own_name);
         self.layout_dirty = true;
         self.edited = true;
     }
@@ -843,7 +893,6 @@ impl Sheet {
         let lo = from.min(at);
         let hi = (from + n).max(at + n);
         let c2 = from + n - 1;
-        let delta_c = at as i64 - from as i64;
         let perm = |c: u32| -> u32 {
             if c < lo || c >= hi {
                 c
@@ -935,22 +984,6 @@ impl Sheet {
 
         self.permute_cell_band(false, lo, hi, perm);
 
-        let own_name = self.name.clone();
-        let moved_formulas: Vec<(u32, u32, String)> = self
-            .iter_rect((0, at, crate::sync::MAX_ROWS - 1, at + n - 1))
-            .filter_map(|(k, c)| {
-                let f = c.formula.as_deref()?;
-                let nf = crate::refs::translate(f, 0, delta_c, &own_name);
-                (nf != f).then_some((k.row, k.col, nf))
-            })
-            .collect();
-        for (r, c, nf) in moved_formulas {
-            if let Some(mut cell) = self.get(r, c).map(|x| x.into_owned()) {
-                cell.formula = Some(nf.into());
-                self.set(r, c, cell);
-            }
-        }
-
         self.delete_cols_inner(from, n, false);
         self.insert_cols_inner(at, n, false);
 
@@ -1033,6 +1066,9 @@ impl Sheet {
                 self.set_col_style(at + i as u32, st);
             }
         }
+        // 按真实列置换更新本表公式与条件格式/数据验证引用（不动置换区间外与跨表引用）
+        let own_name = self.name.clone();
+        self.rewrite_permuted_references(crate::refs::Axis::Col, from, n, at, &own_name);
         self.layout_dirty = true;
         self.edited = true;
     }
@@ -1900,6 +1936,62 @@ pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op
     let Some(sheet) = wb.sheets.get_mut(sheet_idx) else { return; };
     sheet.apply_structural(op);
     update_workbook_references(wb, sheet_idx, op.reference_shift(), &[]);
+}
+
+/// 整工作簿级行移动：先在目标表执行 `move_rows`，再按真实行置换更新其他工作表的跨表公式与自定义名称。
+pub fn move_rows_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, from: u32, n: u32, to: u32) {
+    if n == 0 || to == from || sheet_idx >= wb.sheets.len() {
+        return;
+    }
+    let at = if to > from { to - n } else { to };
+    if at == from {
+        return;
+    }
+    let target_name = wb.sheets[sheet_idx].name.clone();
+    wb.sheets[sheet_idx].move_rows(from, n, to);
+    update_workbook_permuted_references(wb, sheet_idx, crate::refs::Axis::Row, from, n, at, &target_name);
+}
+
+/// 整工作簿级列移动：先在目标表执行 `move_cols`，再按真实列置换更新其他工作表的跨表公式与自定义名称。
+pub fn move_cols_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, from: u32, n: u32, to: u32) {
+    if n == 0 || to == from || sheet_idx >= wb.sheets.len() {
+        return;
+    }
+    let at = if to > from { to - n } else { to };
+    if at == from {
+        return;
+    }
+    let target_name = wb.sheets[sheet_idx].name.clone();
+    wb.sheets[sheet_idx].move_cols(from, n, to);
+    update_workbook_permuted_references(wb, sheet_idx, crate::refs::Axis::Col, from, n, at, &target_name);
+}
+
+fn update_workbook_permuted_references(
+    wb: &mut crate::model::Workbook,
+    sheet_idx: usize,
+    axis: crate::refs::Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+    target_name: &str,
+) {
+    for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
+        if idx == sheet_idx {
+            continue;
+        }
+        sheet.rewrite_permuted_references(axis, from, n, at, target_name);
+    }
+    for (_, scope, formula) in wb.names.iter_mut() {
+        let own_name = scope
+            .and_then(|i| wb.sheets.get(i))
+            .map(|s| s.name.as_str())
+            .unwrap_or("");
+        let rewritten = crate::refs::permute_axis(formula, axis, from, n, at, target_name, own_name);
+        if rewritten != *formula {
+            *formula = rewritten;
+            wb.names_dirty = true;
+        }
+    }
 }
 
 /// The final entry is the grand total and shares the last group's original

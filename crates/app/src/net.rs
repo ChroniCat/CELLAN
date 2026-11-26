@@ -121,6 +121,7 @@ pub enum NetEvent {
         col: u32,
         revert_ops: Vec<(u32, u32, Option<Op>)>,
         revert_styles: Vec<(u32, u32, Option<sheetcore::style::CellStyle>)>,
+        revert_axis_styles: Option<AxisStylePatch>,
         revert_merge: Option<(u32, u32, u32, u32, bool)>,
     },
     /// 某格释放
@@ -1552,6 +1553,34 @@ impl HostWatermark {
         seq
     }
 
+    fn authoritative_axis_revert(&self, sheet: usize, patch: &AxisStylePatch) -> AxisStylePatch {
+        let rows = patch
+            .rows
+            .iter()
+            .map(|(r, _)| {
+                let prev = self
+                    .axis_rows
+                    .get(&sheet)
+                    .and_then(|m| m.get(r))
+                    .and_then(|(st, _)| st.clone());
+                (*r, prev)
+            })
+            .collect();
+        let cols = patch
+            .cols
+            .iter()
+            .map(|(c, _)| {
+                let prev = self
+                    .axis_cols
+                    .get(&sheet)
+                    .and_then(|m| m.get(c))
+                    .and_then(|(st, _)| st.clone());
+                (*c, prev)
+            })
+            .collect();
+        AxisStylePatch { rows, cols }
+    }
+
     fn record_merge(&mut self, sheet: usize, rect: (u32, u32, u32, u32), on: bool) -> u64 {
         let seq = self.bump();
         Arc::make_mut(&mut self.merges)
@@ -1635,6 +1664,171 @@ impl HostWatermark {
     }
 }
 
+type HostThreads = Arc<Mutex<HashMap<(usize, u32, u32), sheetcore::notes::ThreadedComment>>>;
+
+/// 在宿主权威线程状态上应用 `SheetMetaKind`：
+/// - `ThreadReply`：幂等按 `entry.id` 合并，超过 256 条上限时返回 `Err(authoritative_thread)`；
+///   成功时返回 `Ok((SheetMetaKind::Thread { ... }, true))`，由宿主全员广播（含发送者与宿主 UI）。
+/// - `ThreadResolve`：仅切换 `resolved`，保留并发追加的回复，返回 `Ok((SheetMetaKind::Thread { ... }, true))`。
+/// - `Thread` / `Note { text: None }` / `SheetTab`：同步维护 `host_threads`。
+fn apply_host_thread_meta(
+    host_threads: &HostThreads,
+    sheet: usize,
+    kind: sheetcore::sync::SheetMetaKind,
+) -> Result<(sheetcore::sync::SheetMetaKind, bool), sheetcore::sync::SheetMetaKind> {
+    use sheetcore::sync::{MAX_THREAD_ENTRIES, SheetMetaKind, SheetTabSync};
+    match kind {
+        SheetMetaKind::ThreadReply { row, col, seed_root, entry } => {
+            let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (sheet, row, col);
+            let tc = map.entry(key).or_insert_with(|| {
+                let mut entries = Vec::new();
+                if let Some(root) = seed_root {
+                    if root.id != entry.id {
+                        entries.push(root);
+                    }
+                }
+                sheetcore::notes::ThreadedComment {
+                    r: row,
+                    c: col,
+                    resolved: false,
+                    entries,
+                }
+            });
+            if !tc.entries.iter().any(|e| e.id == entry.id) {
+                if tc.entries.len() >= MAX_THREAD_ENTRIES {
+                    return Err(SheetMetaKind::Thread {
+                        row,
+                        col,
+                        thread: Some(tc.clone()),
+                    });
+                }
+                tc.entries.push(entry);
+            }
+            Ok((
+                SheetMetaKind::Thread {
+                    row,
+                    col,
+                    thread: Some(tc.clone()),
+                },
+                true,
+            ))
+        }
+        SheetMetaKind::ThreadResolve { row, col, seed_root, resolved } => {
+            let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (sheet, row, col);
+            let tc = match map.get_mut(&key) {
+                Some(existing) => {
+                    existing.resolved = resolved;
+                    existing.clone()
+                }
+                None => {
+                    let Some(root) = seed_root else {
+                        return Err(SheetMetaKind::Thread {
+                            row,
+                            col,
+                            thread: None,
+                        });
+                    };
+                    let created = sheetcore::notes::ThreadedComment {
+                        r: row,
+                        c: col,
+                        resolved,
+                        entries: vec![root],
+                    };
+                    map.insert(key, created.clone());
+                    created
+                }
+            };
+            Ok((
+                SheetMetaKind::Thread {
+                    row,
+                    col,
+                    thread: Some(tc),
+                },
+                true,
+            ))
+        }
+        SheetMetaKind::Thread { row, col, thread } => {
+            let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (sheet, row, col);
+            match &thread {
+                Some(tc) => {
+                    map.insert(key, tc.clone());
+                }
+                None => {
+                    map.remove(&key);
+                }
+            }
+            Ok((SheetMetaKind::Thread { row, col, thread }, false))
+        }
+        SheetMetaKind::Note { row, col, text: None, author } => {
+            host_threads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(sheet, row, col));
+            Ok((SheetMetaKind::Note { row, col, text: None, author }, false))
+        }
+        SheetMetaKind::SheetTab(tab) => {
+            match &tab {
+                SheetTabSync::Delete { index } => {
+                    let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
+                    let old = std::mem::take(&mut *map);
+                    for ((sh, r, c), tc) in old {
+                        if sh < *index {
+                            map.insert((sh, r, c), tc);
+                        } else if sh > *index {
+                            map.insert((sh - 1, r, c), tc);
+                        }
+                    }
+                }
+                SheetTabSync::Move { from, to } if from != to => {
+                    let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
+                    let old = std::mem::take(&mut *map);
+                    for ((sh, r, c), tc) in old {
+                        let nsh = if sh == *from {
+                            *to
+                        } else if *from < *to && sh > *from && sh <= *to {
+                            sh - 1
+                        } else if *to < *from && sh >= *to && sh < *from {
+                            sh + 1
+                        } else {
+                            sh
+                        };
+                        map.insert((nsh, r, c), tc);
+                    }
+                }
+                _ => {}
+            }
+            Ok((SheetMetaKind::SheetTab(tab), false))
+        }
+        other => Ok((other, false)),
+    }
+}
+
+fn shift_host_threads(
+    host_threads: &HostThreads,
+    sheet: usize,
+    op: &sheetcore::structural::Structural,
+) {
+    let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
+    if map.is_empty() {
+        return;
+    }
+    let old = std::mem::take(&mut *map);
+    for ((sh, r, c), mut tc) in old {
+        if sh == sheet {
+            if let Some((nr, nc)) = sheetcore::sync::shift_structural_coord(r, c, op) {
+                tc.r = nr;
+                tc.c = nc;
+                map.insert((sh, nr, nc), tc);
+            }
+        } else {
+            map.insert((sh, r, c), tc);
+        }
+    }
+}
+
 pub struct Net {
     pub site: u32,
     structure_seen: Mutex<StructureProgress>,
@@ -1647,6 +1841,8 @@ pub struct Net {
     unconfirmed_styles: Arc<AtomicU64>,
     last_watermark_seq: Arc<AtomicU64>,
     min_saved_watermark: Arc<AtomicU64>,
+    acked_op_ts: Arc<AtomicU64>,
+    connected_room_id: Arc<Mutex<String>>,
     pending_sorts: Arc<Mutex<std::collections::BTreeMap<u64,Arc<SortBatch>>>>,
     local_sort_ranges: Mutex<Vec<(u64,u64)>>,
     cmd: Sender<Cmd>,
@@ -1688,6 +1884,8 @@ pub struct Net {
         Option<SharedStyles>,
     delta_merges: Option<Arc<Mutex<Vec<(usize, u32, u32, u32, u32, bool)>>>>,
     host_meta_log: Option<Arc<Mutex<Vec<(usize, sheetcore::sync::SheetMetaKind)>>>>,
+    host_threads: Option<HostThreads>,
+    host_acked_ts: Option<Arc<Mutex<HashMap<u32, u64>>>>,
     host_structs: Option<Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>>>,
     host_file_path: Option<Arc<Mutex<Option<std::path::PathBuf>>>>,
     conn_nonce: Arc<AtomicU64>,
@@ -2859,8 +3057,21 @@ fn send_room_message(msg: Msg, limit: usize, mut send: impl FnMut(String) -> boo
         Msg::SortData { items, .. } => items.len(),
         Msg::SortRepairRequest { keys, .. } => keys.len(),
         Msg::SortRepairs { items, .. } => items.len(),
-        Msg::WriteDeny { revert_styles, revert_ops, revert_merge, .. }
-            if revert_ops.is_empty() && revert_merge.is_none() => revert_styles.len(),
+        Msg::WriteDeny {
+            revert_styles,
+            revert_axis_styles,
+            revert_ops,
+            revert_merge,
+            ..
+        } if revert_ops.is_empty() && revert_merge.is_none() => {
+            if !revert_styles.is_empty() {
+                revert_styles.len()
+            } else if let Some(ax) = revert_axis_styles {
+                ax.rows.len() + ax.cols.len()
+            } else {
+                0
+            }
+        }
         _ => return serde_json::to_string(&msg).is_ok_and(send),
     };
     if count <= sheetcore::sync::MAX_BATCH_ITEMS {
@@ -2897,11 +3108,49 @@ fn send_room_message(msg: Msg, limit: usize, mut send: impl FnMut(String) -> boo
             }
             true
         }
-        Msg::WriteDeny { holder, holder_name, sheet, row, col, revert_styles, .. } =>
-            style_frames(&revert_styles, limit, |batch| serde_json::to_string(&Msg::WriteDeny {
-                holder, holder_name: holder_name.clone(), sheet, row, col,
-                revert_ops: Vec::new(), revert_styles: batch.to_vec(), revert_merge: None,
-            }), send),
+        Msg::WriteDeny {
+            holder,
+            holder_name,
+            sheet,
+            row,
+            col,
+            revert_styles,
+            revert_axis_styles,
+            ..
+        } => {
+            if !revert_styles.is_empty() {
+                style_frames(&revert_styles, limit, |batch| serde_json::to_string(&Msg::WriteDeny {
+                    holder, holder_name: holder_name.clone(), sheet, row, col,
+                    revert_ops: Vec::new(), revert_styles: batch.to_vec(),
+                    revert_axis_styles: None, revert_merge: None,
+                }), send)
+            } else if let Some(ax) = revert_axis_styles {
+                let mut ok = true;
+                if !ax.rows.is_empty() {
+                    ok = style_frames(&ax.rows, limit, |batch| serde_json::to_string(&Msg::WriteDeny {
+                        holder, holder_name: holder_name.clone(), sheet, row, col,
+                        revert_ops: Vec::new(), revert_styles: Vec::new(),
+                        revert_axis_styles: Some(AxisStylePatch { rows: batch.to_vec(), cols: Vec::new() }),
+                        revert_merge: None,
+                    }), &mut send);
+                }
+                if ok && !ax.cols.is_empty() {
+                    ok = style_frames(&ax.cols, limit, |batch| serde_json::to_string(&Msg::WriteDeny {
+                        holder, holder_name: holder_name.clone(), sheet, row, col,
+                        revert_ops: Vec::new(), revert_styles: Vec::new(),
+                        revert_axis_styles: Some(AxisStylePatch { rows: Vec::new(), cols: batch.to_vec() }),
+                        revert_merge: None,
+                    }), &mut send);
+                }
+                ok
+            } else {
+                serde_json::to_string(&Msg::WriteDeny {
+                    holder, holder_name, sheet, row, col,
+                    revert_ops: Vec::new(), revert_styles: Vec::new(),
+                    revert_axis_styles: None, revert_merge: None,
+                }).is_ok_and(send)
+            }
+        }
         _ => unreachable!(),
     }
 }
@@ -2950,6 +3199,17 @@ fn emit_room_watermark(
     seq: u64,
     structure_revision: usize,
 ) {
+    emit_room_watermark_ack(cmd, roster, seq, structure_revision, 0, 0);
+}
+
+fn emit_room_watermark_ack(
+    cmd: &Sender<Cmd>,
+    roster: &Mutex<RoomRoster>,
+    seq: u64,
+    structure_revision: usize,
+    ack_site: u32,
+    ack_ts: u64,
+) {
     queue_room_change(
         cmd,
         roster,
@@ -2957,6 +3217,8 @@ fn emit_room_watermark(
         RoomChange::Message(Msg::Watermark {
             seq,
             structure_revision,
+            ack_site,
+            ack_ts,
         }),
     );
 }
@@ -3040,6 +3302,18 @@ impl Net {
         }
         if let Some(hp) = &self.host_file_path {
             *hp.lock().unwrap_or_else(|e| e.into_inner()) = workbook.path.clone();
+        }
+        if let Some(ht) = &self.host_threads {
+            let mut map = ht.lock().unwrap_or_else(|e| e.into_inner());
+            map.clear();
+            for (si, sh) in workbook.sheets.iter().enumerate() {
+                for (k, tc) in &sh.threads {
+                    map.insert((si, k.row, k.col), tc.clone());
+                }
+            }
+        }
+        if let Some(ha) = &self.host_acked_ts {
+            ha.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
         *self.staged_save_cursor.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if let Some(wm) = &self.host_watermark {
@@ -3222,6 +3496,19 @@ impl Net {
             .map(|((r, c), h)| (h.site, h.name.clone(), r, c))
     }
 
+    /// 客户端：宿主已确认提交的本站点最大单元格逻辑时间戳（重连时用于排除已确认 op，避免结构变更后错位重放）
+    pub fn acked_op_ts(&self) -> u64 {
+        self.acked_op_ts.load(Ordering::Acquire)
+    }
+
+    /// 客户端：当前/最近一次握手成功的房间 session ID
+    pub fn connected_room_id(&self) -> String {
+        self.connected_room_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// 测试用：把一条事件塞进本连接的事件队列，模拟网络线程产生的事件（例如重连后的 Welcome）
     #[cfg(test)]
     pub(crate) fn inject_event_for_test(&self, ev: NetEvent) {
@@ -3270,6 +3557,7 @@ impl Net {
                         col: op.col,
                         revert_ops: vec![(op.row, op.col, prev)],
                         revert_styles: Vec::new(),
+                        revert_axis_styles: None,
                         revert_merge: None,
                     });
                     return false;
@@ -3334,6 +3622,7 @@ impl Net {
                         col: op_arc.col,
                         revert_ops: vec![(op_arc.row, op_arc.col, prev)],
                         revert_styles: Vec::new(),
+                        revert_axis_styles: None,
                         revert_merge: None,
                     });
                     return false;
@@ -3991,6 +4280,7 @@ impl Net {
                 col,
                 revert_ops: Vec::new(),
                 revert_styles,
+                revert_axis_styles: None,
                 revert_merge: None,
             });
             return;
@@ -4075,6 +4365,12 @@ impl Net {
                 (hit_row || hit_col).then(|| (h.site, h.name.clone(), r, c))
             });
             if let Some((holder, holder_name, row, col)) = conflict {
+                drop(lt);
+                let revert_axis_styles = self.host_watermark.as_ref().map(|wm| {
+                    wm.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .authoritative_axis_revert(sheet, &patch)
+                });
                 let _ = self.evt_tx.send(NetEvent::WriteRejected {
                     holder,
                     holder_name,
@@ -4083,6 +4379,7 @@ impl Net {
                     col,
                     revert_ops: Vec::new(),
                     revert_styles: Vec::new(),
+                    revert_axis_styles,
                     revert_merge: None,
                 });
                 return;
@@ -4125,6 +4422,7 @@ impl Net {
                 col,
                 revert_ops: Vec::new(),
                 revert_styles: Vec::new(),
+                revert_axis_styles: None,
                 revert_merge: Some((rect.0, rect.1, rect.2, rect.3, !on)),
             });
             return;
@@ -4168,6 +4466,22 @@ impl Net {
             return false;
         }
         let _order = self.room_order.as_ref().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        let (kind, echo_host_ui) = if let Some(threads) = &self.host_threads {
+            match apply_host_thread_meta(threads, sheet, kind) {
+                Ok(pair) => pair,
+                Err(auth_kind) => {
+                    let _ = self.evt_tx.send(NetEvent::SheetMeta {
+                        site: 0,
+                        sheet,
+                        kind: auth_kind,
+                        snapshot: false,
+                    });
+                    return false;
+                }
+            }
+        } else {
+            (kind, false)
+        };
         if let Some(log) = &self.host_meta_log {
             let mut g = log.lock().unwrap_or_else(|e| e.into_inner());
             if g.len() >= 10_000 {
@@ -4185,7 +4499,7 @@ impl Net {
             let wm_seq = self
                 .host_watermark
                 .as_ref()
-                .map(|wm| wm.lock().unwrap_or_else(|e| e.into_inner()).record_sheet_meta(sheet, kind));
+                .map(|wm| wm.lock().unwrap_or_else(|e| e.into_inner()).record_sheet_meta(sheet, kind.clone()));
             let struct_rev = self
                 .host_structs
                 .as_ref()
@@ -4193,6 +4507,14 @@ impl Net {
             queue_room_change(&self.cmd, roster, None, RoomChange::Message(msg));
             if let Some(seq) = wm_seq {
                 emit_room_watermark(&self.cmd, roster, seq, struct_rev);
+            }
+            if echo_host_ui {
+                let _ = self.evt_tx.send(NetEvent::SheetMeta {
+                    site: self.site,
+                    sheet,
+                    kind,
+                    snapshot: false,
+                });
             }
             true
         } else if let Ok(s) = serde_json::to_string(&msg) {
@@ -4274,6 +4596,9 @@ impl Net {
                 sheet,
                 op,
             );
+        }
+        if let Some(ht) = &self.host_threads {
+            shift_host_threads(ht, sheet, op);
         }
         let mut struct_rev = 0usize;
         if let Some(h) = &self.host_structs {
@@ -4799,6 +5124,8 @@ fn host_initialized(
         Arc::new(Mutex::new(Vec::new()));
     let meta_log: Arc<Mutex<Vec<(usize, sheetcore::sync::SheetMetaKind)>>> =
         Arc::new(Mutex::new(Vec::new()));
+    let host_threads: HostThreads = Arc::new(Mutex::new(HashMap::new()));
+    let host_acked_ts: Arc<Mutex<HashMap<u32, u64>>> = Arc::new(Mutex::new(HashMap::new()));
     let structs: Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let structs_for_self = structs.clone();
@@ -4814,6 +5141,8 @@ fn host_initialized(
     let delta_styles_for_self = delta_styles.clone();
     let delta_merges_for_self = delta_merges.clone();
     let meta_log_for_self = meta_log.clone();
+    let host_threads_for_self = host_threads.clone();
+    let host_acked_ts_for_self = host_acked_ts.clone();
     let evt_tx_self = evt_tx.clone();
     let t0 = std::time::Instant::now();
     let now_ms = {
@@ -4895,6 +5224,8 @@ fn host_initialized(
         let delta_styles_outer = delta_styles.clone();
         let delta_merges_outer = delta_merges.clone();
         let meta_log_outer = meta_log.clone();
+        let host_threads_outer = host_threads.clone();
+        let host_acked_ts_outer = host_acked_ts.clone();
         let structs_outer = structs.clone();
         let update_dl_outer = host_update_dl.clone();
         let seed_override_outer = host_seed_override.clone();
@@ -4966,6 +5297,8 @@ fn host_initialized(
                 let delta_styles = delta_styles_outer.clone();
                 let delta_merges = delta_merges_outer.clone();
                 let meta_log = meta_log_outer.clone();
+                let host_threads = host_threads_outer.clone();
+                let host_acked_ts = host_acked_ts_outer.clone();
                 let structs = structs_outer.clone();
                 let update_dl = update_dl_outer.clone();
                 let seed_override = seed_override_outer.clone();
@@ -5377,6 +5710,8 @@ fn host_initialized(
                                     styles.lock().unwrap_or_else(|e| e.into_inner()).clone()
                                 };
                                 let host_clock = host_max_clock.load(Ordering::Acquire).max(1);
+                                let site_acked_op_ts =
+                                    lock_unpoison(&host_acked_ts).get(&site).copied().unwrap_or(0);
                                 let merges = if is_wm_delta {
                                     Vec::new()
                                 } else {
@@ -5431,6 +5766,7 @@ fn host_initialized(
                                         structure_revision: struct_rev,
                                         binary_v3,
                                         compact_v3: use_compact_v3,
+                                        acked_op_ts: site_acked_op_ts,
                                     })
                                     .unwrap(),
                                 ));
@@ -5947,7 +6283,7 @@ fn host_initialized(
                                             holder: h.site, holder_name: h.name.clone(),
                                             sheet: op.sheet, row: op.row, col: op.col,
                                             revert_ops: vec![(op.row, op.col, prev)],
-                                            revert_styles: Vec::new(), revert_merge: None,
+                                            revert_styles: Vec::new(), revert_axis_styles: None, revert_merge: None,
                                         };
                                         let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(deny)));
                                         false
@@ -5955,12 +6291,20 @@ fn host_initialized(
                                 }
                                 drop(lt);
                                 if ops.is_empty() { continue; }
+                                let ack_max_ts = ops.iter().map(|o| o.ts).max().unwrap_or(0);
+                                if ack_max_ts > 0 {
+                                    let mut acks = lock_unpoison(&host_acked_ts);
+                                    let entry = acks.entry(conn_site).or_insert(0);
+                                    if ack_max_ts > *entry {
+                                        *entry = ack_max_ts;
+                                    }
+                                }
                                 let shared: Vec<Arc<Op>> = ops.iter().cloned().map(Arc::new).collect();
                                 update_host_shared_ops(&state, &delta_ops, &formula_keys, &host_max_clock, shared.iter().cloned());
                                 let seq = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).record_ops(shared.iter().map(Arc::as_ref));
                                 let struct_rev = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
                                 queue_room_change(&cmd, &roster, Some(conn_site), RoomChange::SharedCells(shared));
-                                emit_room_watermark(&cmd, &roster, seq, struct_rev);
+                                emit_room_watermark_ack(&cmd, &roster, seq, struct_rev, conn_site, ack_max_ts);
                                 let _ = evt_tx.send(NetEvent::Ops(ops));
                             }
                             Msg::CursorMsg(mut c) => {
@@ -6060,6 +6404,7 @@ fn host_initialized(
                                     continue;
                                 }
                                 shift_state(&host_baseline, &formula_keys, &state, &delta_ops, &host_base_hash, &styles, &delta_styles, &locks, &cursors, &sheet_names.lock().unwrap_or_else(|e| e.into_inner()), sheet, &op);
+                                shift_host_threads(&host_threads, sheet, &op);
                                 let struct_rev = {
                                     let mut h = structs.lock().unwrap_or_else(|e| e.into_inner());
                                     h.push((sheet, op.clone()));
@@ -6125,7 +6470,7 @@ fn host_initialized(
                                         .collect();
                                     let deny = Msg::WriteDeny {
                                         holder, holder_name, sheet, row, col,
-                                        revert_ops: Vec::new(), revert_styles, revert_merge: None,
+                                        revert_ops: Vec::new(), revert_styles, revert_axis_styles: None, revert_merge: None,
                                     };
                                     let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(deny)));
                                     continue;
@@ -6210,7 +6555,7 @@ fn host_initialized(
                                     // has rejected the entire request before sending any rollback.
                                     let deny = Msg::WriteDeny {
                                         holder, holder_name, sheet, row, col,
-                                        revert_ops: Vec::new(), revert_styles, revert_merge: None,
+                                        revert_ops: Vec::new(), revert_styles, revert_axis_styles: None, revert_merge: None,
                                     };
                                     let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(deny)));
                                     continue;
@@ -6269,6 +6614,12 @@ fn host_initialized(
                                     })
                                 };
                                 if let Some((holder, holder_name, row, col)) = conflict {
+                                    let revert_axis_styles = Some(
+                                        host_watermark
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .authoritative_axis_revert(sheet, &patch),
+                                    );
                                     let _ = cmd.send(Cmd::Deliver(
                                         vec![tx.clone()],
                                         RoomChange::Message(Msg::WriteDeny {
@@ -6279,6 +6630,7 @@ fn host_initialized(
                                             col,
                                             revert_ops: Vec::new(),
                                             revert_styles: Vec::new(),
+                                            revert_axis_styles,
                                             revert_merge: None,
                                         }),
                                     ));
@@ -6329,6 +6681,7 @@ fn host_initialized(
                                             col,
                                             revert_ops: Vec::new(),
                                             revert_styles: Vec::new(),
+                                            revert_axis_styles: None,
                                             revert_merge: Some((r1, c1, r2, c2, !on)),
                                         }),
                                     ));
@@ -6364,6 +6717,22 @@ fn host_initialized(
                                     continue;
                                 }
                                 let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
+                                let (kind, include_sender) =
+                                    match apply_host_thread_meta(&host_threads, sheet, kind) {
+                                        Ok(pair) => pair,
+                                        Err(auth_kind) => {
+                                            let _ = cmd.send(Cmd::Deliver(
+                                                vec![tx.clone()],
+                                                RoomChange::Message(Msg::SheetMetaOp {
+                                                    site: 0,
+                                                    sheet,
+                                                    ts: 0,
+                                                    kind: auth_kind,
+                                                }),
+                                            ));
+                                            continue;
+                                        }
+                                    };
                                 {
                                     let mut g = meta_log.lock().unwrap_or_else(|e| e.into_inner());
                                     if g.len() >= 10_000 {
@@ -6376,10 +6745,11 @@ fn host_initialized(
                                     .unwrap()
                                     .record_sheet_meta(sheet, kind.clone());
                                 let struct_rev = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
+                                let exclude = (!include_sender).then_some(conn_site);
                                 queue_room_change(
                                     &cmd,
                                     &roster,
-                                    Some(conn_site),
+                                    exclude,
                                     RoomChange::Message(Msg::SheetMetaOp {
                                         site: conn_site,
                                         sheet,
@@ -6835,11 +7205,15 @@ fn host_initialized(
         delta_styles: Some(delta_styles_for_self),
         delta_merges: Some(delta_merges_for_self),
         host_meta_log: Some(meta_log_for_self),
+        host_threads: Some(host_threads_for_self),
+        host_acked_ts: Some(host_acked_ts_for_self),
         pending_structure: Default::default(),
         #[cfg(test)]
         unconfirmed_styles: Default::default(),
         last_watermark_seq: Default::default(),
         min_saved_watermark: Default::default(),
+        acked_op_ts: Default::default(),
+        connected_room_id: Default::default(),
         structural_ack: Default::default(),
         palette_styles_cap: Arc::new(AtomicBool::new(true)),
         connection_generation: Default::default(),
@@ -7268,6 +7642,10 @@ fn join_session(
     let last_wm_for_reader = last_watermark_seq.clone();
     let min_saved_watermark = Arc::new(AtomicU64::new(0));
     let min_saved_wm_for_reader = min_saved_watermark.clone();
+    let acked_op_ts = Arc::new(AtomicU64::new(0));
+    let acked_op_ts_for_reader = acked_op_ts.clone();
+    let connected_room_id = Arc::new(Mutex::new(String::new()));
+    let connected_room_id_for_reader = connected_room_id.clone();
     // 写线程
     {
         let writer = writer.clone();
@@ -7658,12 +8036,26 @@ fn join_session(
                             structure_revision,
                             binary_v3,
                             compact_v3,
+                            acked_op_ts,
                             ..
                         } if !got_welcome => {
                             if require_same_document && remote_doc != doc {
                                 let _ = evt_tx.send(NetEvent::Denied("共享地址已属于另一工作簿，请刷新协作会话".into()));
                                 denied = true;
                                 break;
+                            }
+                            let same_room = {
+                                let mut rid = connected_room_id_for_reader
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                let same = !rid.is_empty() && *rid == room_id;
+                                *rid = room_id.clone();
+                                same
+                            };
+                            if same_room {
+                                acked_op_ts_for_reader.fetch_max(acked_op_ts, Ordering::AcqRel);
+                            } else {
+                                acked_op_ts_for_reader.store(acked_op_ts, Ordering::Release);
                             }
                             let use_compact = binary_v3 && compact_v3;
                             host_compact_flag.store(use_compact, Ordering::Release);
@@ -7834,7 +8226,10 @@ fn join_session(
                             }
                             let _ = evt_tx.send(NetEvent::SnapshotDone);
                         }
-                        Msg::Watermark { seq, structure_revision } => {
+                        Msg::Watermark { seq, structure_revision, ack_site, ack_ts } => {
+                            if ack_site == site && ack_ts > 0 {
+                                acked_op_ts_for_reader.fetch_max(ack_ts, Ordering::AcqRel);
+                            }
                             last_wm_for_reader.fetch_max(seq, Ordering::AcqRel);
                             if synced_once && !conn_room_id.is_empty() {
                                 resume_state =
@@ -8022,6 +8417,7 @@ fn join_session(
                             col,
                             revert_ops,
                             revert_styles,
+                            revert_axis_styles,
                             revert_merge,
                         } => {
                             let _ = evt_tx.send(NetEvent::WriteRejected {
@@ -8032,6 +8428,7 @@ fn join_session(
                                 col,
                                 revert_ops,
                                 revert_styles,
+                                revert_axis_styles,
                                 revert_merge,
                             });
                         }
@@ -8246,6 +8643,8 @@ fn join_session(
         delta_styles: None,
         delta_merges: None,
         host_meta_log: None,
+        host_threads: None,
+        host_acked_ts: None,
         sheet_names: Default::default(),
         structure_seen: Default::default(),
         pending_structure,
@@ -8253,6 +8652,8 @@ fn join_session(
         unconfirmed_styles,
         last_watermark_seq,
         min_saved_watermark,
+        acked_op_ts,
+        connected_room_id,
         structural_ack,
         palette_styles_cap,
         connection_generation,
@@ -10909,7 +11310,7 @@ mod integrity_tests {
         );
         assert!(compact_prep_compressed.is_compact_bin());
 
-        let wm_msg = Msg::Watermark { seq: 77, structure_revision: 3 };
+        let wm_msg = Msg::Watermark { seq: 77, structure_revision: 3, ack_site: 0, ack_ts: 0 };
         let compact_prep = sheetcore::wire::prepare_compact_payload(
             sheetcore::sync::encode_msg_compact(&wm_msg),
             false,
@@ -10942,7 +11343,7 @@ mod integrity_tests {
             let decoded: Msg = serde_json::from_str(&plain).unwrap();
             assert!(matches!(
                 decoded,
-                Msg::Watermark { seq: 77, structure_revision: 3 }
+                Msg::Watermark { seq: 77, structure_revision: 3, .. }
             ));
 
             // 同步验证 HostOutput::write_prepared_opt 对预压缩 compact_bin 的降级转码

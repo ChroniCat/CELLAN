@@ -514,6 +514,7 @@ pub fn load_diag_with_control(
         recalc_cell_revs: Vec::new(),
         sheets: Vec::new(),
         path: Some(path.to_path_buf()),
+        base_package: None,
         decrypted: None,
         encryption: None,
         source_encryption: None,
@@ -1410,6 +1411,7 @@ impl SaveReceipt {
     pub fn adopt_document(&self, wb: &mut Workbook, target: &Path, calculation_matches: bool) {
         self.apply_to(wb);
         wb.path = Some(target.to_owned());
+        wb.base_package = None;
         if self.cleared_audit {
             wb.audit.log = None;
             wb.audit.stripped_marker = None;
@@ -2170,12 +2172,105 @@ fn set_win_file_attrs(path: &Path, attrs: u32) {
     }
 }
 
-/// 清理同目录下因旧版本替换失败或异常中断残留的 `.~<文件名>.saving-*` 临时文件（绝不触碰刚生成的活跃临时文件）。
+/// 暂存目录过期清理阈值（跨机器/旧格式无法确认 PID 存活时，绝不按 30 秒误删活跃大文件保存）
+const FOREIGN_STAGE_ABANDON_SECS: u64 = 6 * 3600;
+
+fn local_host_tag() -> &'static str {
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let host = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "local".into());
+        let d = Sha256::digest(host.as_bytes());
+        format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3])
+    })
+}
+
+fn parse_stage_owner(fname: &str) -> Option<(&str, u32)> {
+    let rest = fname.strip_prefix(".~cellan-stage-")?;
+    let (host, after_host) = rest.split_once('-')?;
+    if host.len() != 8 || !host.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (pid_str, _) = after_host.split_once('-')?;
+    let pid = pid_str.parse::<u32>().ok()?;
+    Some((host, pid))
+}
+
+fn open_stage_active_lock(dir: &Path) -> Option<std::fs::File> {
+    let lock_path = dir.join(".active");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
+    opts.open(lock_path).ok()
+}
+
+fn is_stage_lock_busy(dir: &Path) -> bool {
+    let lock_path = dir.join(".active");
+    if !lock_path.exists() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(&lock_path)
+        {
+            Ok(_) => false,
+            Err(e) => {
+                e.kind() == std::io::ErrorKind::PermissionDenied
+                    || matches!(e.raw_os_error(), Some(5 | 32 | 33))
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn latest_dir_activity_age(dir: &Path, now: std::time::SystemTime) -> Option<std::time::Duration> {
+    let mut latest = std::fs::metadata(dir).ok().and_then(|m| m.modified().ok());
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for child in rd.flatten() {
+            if let Some(t) = child.metadata().ok().and_then(|m| m.modified().ok()) {
+                latest = Some(match latest {
+                    Some(prev) if prev >= t => prev,
+                    _ => t,
+                });
+            }
+        }
+    }
+    latest.and_then(|t| now.duration_since(t).ok())
+}
+
+struct StagingDir {
+    // 必须先释放 `.active` 独占锁，再由 `TempDir::drop` 删除目录（Windows 句柄未关时删除会失败）
+    _lock: Option<std::fs::File>,
+    dir: tempfile::TempDir,
+}
+
+impl StagingDir {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// 清理同目录下因异常中断残留的临时文件/目录（绝不触碰活跃保存任务正在使用的暂存目录）。
 fn sweep_stale_saving_files(dir: &Path, name: &str, keep_active: Option<&Path>) {
     let prefix = format!(".~{name}.saving-");
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let now = std::time::SystemTime::now();
-    let my_pid_prefix = format!("{}-", std::process::id());
+    let my_pid = std::process::id();
+    let my_pid_prefix = format!("{my_pid}-");
+    let my_host = local_host_tag();
     for entry in rd.flatten() {
         let p = entry.path();
         if keep_active.is_some_and(|k| k == p.as_path()) {
@@ -2183,13 +2278,22 @@ fn sweep_stale_saving_files(dir: &Path, name: &str, keep_active: Option<&Path>) 
         }
         let fname = entry.file_name().to_string_lossy().to_string();
         if fname.starts_with(".~cellan-stage-") {
-            let age = entry
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| now.duration_since(t).ok())
-                .unwrap_or_default();
-            if age >= std::time::Duration::from_secs(30) {
+            if !p.is_dir() {
+                continue;
+            }
+            if is_stage_lock_busy(&p) {
+                continue;
+            }
+            let safe_to_remove = match parse_stage_owner(&fname) {
+                // 本机当前进程：正常生命周期完全由 `StagingDir::drop` 负责，绝不跨保存任务误删
+                Some((host, pid)) if host == my_host && pid == my_pid => false,
+                // 本机已退出进程的崩溃残留目录：安全清理
+                Some((host, pid)) if host == my_host => !is_process_alive(pid),
+                // 其他主机（共享盘）或旧格式无属主标记目录：绝不按 30 秒删，仅超过 6 小时无活动才清理
+                _ => latest_dir_activity_age(&p, now)
+                    .is_some_and(|age| age >= std::time::Duration::from_secs(FOREIGN_STAGE_ABANDON_SECS)),
+            };
+            if safe_to_remove {
                 let _ = std::fs::remove_dir_all(&p);
             }
             continue;
@@ -2201,20 +2305,25 @@ fn sweep_stale_saving_files(dir: &Path, name: &str, keep_active: Option<&Path>) 
             .and_then(|m| m.modified().ok())
             .and_then(|t| now.duration_since(t).ok())
             .unwrap_or_default();
+        let owner_pid = rest.split_once('-').and_then(|(p_str, _)| p_str.parse::<u32>().ok());
         let is_mine = rest.starts_with(&my_pid_prefix) && age >= std::time::Duration::from_secs(5);
-        let is_stale = age >= std::time::Duration::from_secs(30);
-        if is_mine || is_stale {
+        let is_dead_other = owner_pid.is_some_and(|pid| pid != my_pid && !is_process_alive(pid))
+            && age >= std::time::Duration::from_secs(30);
+        let is_unowned_ancient =
+            owner_pid.is_none() && age >= std::time::Duration::from_secs(FOREIGN_STAGE_ABANDON_SECS);
+        if is_mine || is_dead_other || is_unowned_ancient {
             let _ = std::fs::remove_file(&p);
         }
     }
 }
 
-fn staging_workbook_dir(target_dir: &Path) -> Result<tempfile::TempDir> {
+fn staging_workbook_dir(target_dir: &Path) -> Result<StagingDir> {
     let raw = target_dir.to_string_lossy();
     let is_unc = raw.starts_with("\\\\") || raw.starts_with("//");
     if !is_unc {
         let mut builder = tempfile::Builder::new();
-        builder.prefix(".~cellan-stage-");
+        let prefix = format!(".~cellan-stage-{}-{}-", local_host_tag(), std::process::id());
+        builder.prefix(&prefix);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2223,10 +2332,13 @@ fn staging_workbook_dir(target_dir: &Path) -> Result<tempfile::TempDir> {
         if let Ok(td) = builder.tempdir_in(target_dir) {
             #[cfg(windows)]
             set_win_file_attrs(td.path(), 0x02); // FILE_ATTRIBUTE_HIDDEN
-            return Ok(td);
+            let lock = open_stage_active_lock(td.path());
+            return Ok(StagingDir { _lock: lock, dir: td });
         }
     }
-    private_workbook_dir()
+    let td = private_workbook_dir()?;
+    let lock = open_stage_active_lock(td.path());
+    Ok(StagingDir { _lock: lock, dir: td })
 }
 
 /// Build the receipt from the staged OOXML before committing the replacement.
@@ -2736,6 +2848,35 @@ fn write_ooxml(path: &Path, wb: &mut Cow<'_, Workbook>) -> Result<SaveReceipt> {
     write_ooxml_with_cache(path, wb, None, None)
 }
 
+/// 把当前已加载的 OOXML 文件分离为独立的只读保真基准包（用于文档恢复等需要清空 `wb.path` 强制另存为的场景）。
+///
+/// 复制原始包至私有临时目录 `cellan-workbook-<pid>-...` 并挂载到 `wb.base_package`，随后清空 `wb.path`，
+/// 确保在恢复草稿被清理后仍能完整保留原 VBA 宏工程及其他未建模 OOXML 部件；另存成功或关闭文档时自动回收。
+pub fn detach_as_base_package(wb: &mut Workbook, source_path: &Path) -> Result<()> {
+    if !source_path.is_file() {
+        anyhow::bail!("保真基准文件不存在：{}", source_path.display());
+    }
+    let ext = source_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .unwrap_or(if wb.has_vba { "xlsm" } else { "xlsx" });
+    let scratch = private_workbook_dir()?;
+    let copy_path = scratch.path().join(format!("recovered-base.{ext}"));
+    std::fs::copy(source_path, &copy_path)
+        .with_context(|| format!("无法保留恢复基准包 {}", source_path.display()))?;
+    // 若为加密文档，把内存解密缓存一并迁移到新基准路径键下，避免后续保存重复解密
+    if let Some(enc) = wb.source_encryption.as_ref().or(wb.encryption.as_ref()) {
+        if let Some(plain) = decrypted_cache_get(source_path, &enc.password) {
+            decrypted_cache_put(&copy_path, &enc.password, plain.to_vec());
+        }
+    }
+    let _kept_dir = scratch.keep();
+    wb.base_package = Some(crate::model::BasePackage::retained_temp(copy_path));
+    wb.path = None;
+    Ok(())
+}
+
 fn write_ooxml_with_cache(
     path: &Path,
     wb: &mut Cow<'_, Workbook>,
@@ -2754,9 +2895,13 @@ fn write_ooxml_with_cache(
     }
     let scratch = private_workbook_dir()?;
     let base = scratch.path().join("source.xlsx");
-    let encrypted_source = wb.path.as_ref().filter(|src| {
-        !wb.load_incomplete && src.is_file() && crate::crypto::needs_password(src)
-    });
+    let encrypted_source = wb
+        .path
+        .as_ref()
+        .or_else(|| wb.base_package.as_ref().map(|b| &b.path))
+        .filter(|src| {
+            !wb.load_incomplete && src.is_file() && crate::crypto::needs_password(src)
+        });
     let base_override = if let Some(src) = encrypted_source {
         let credentials = wb.source_encryption.as_ref().or(wb.encryption.as_ref())
             .context("缺少原文件的打开密码")?;
@@ -2896,6 +3041,7 @@ fn try_load_ooxml_from_memory(
         recalc_cell_revs: Vec::new(),
         sheets: Vec::new(),
         path: Some(path.to_path_buf()),
+        base_package: None,
         decrypted: None,
         encryption: None,
         source_encryption: None,
@@ -3552,6 +3698,13 @@ fn save_plain_at(
         .map(|p| p.to_path_buf())
         .or_else(|| wb.decrypted.as_ref().filter(|p| p.exists() && usable_base).cloned())
         .or_else(|| wb.path.as_ref().filter(|p| p.exists() && !wb.load_incomplete).cloned())
+        .or_else(|| {
+            wb.base_package
+                .as_ref()
+                .map(|b| &b.path)
+                .filter(|p| p.exists() && usable_base)
+                .cloned()
+        })
     {
         Some(p) => p,
         None => path.to_path_buf(),
@@ -3716,6 +3869,10 @@ fn save_plain_at(
         if fail_step_active || !crate::vba::has_macros(path) {
             must_save!("vba", crate::vba::restore_vba(path, &v));
         }
+    } else if wb.has_vba && !crate::vba::has_macros(path) {
+        anyhow::bail!(
+            "无法保留工作簿中的 VBA 宏工程（原始宏部件来源不可用），已中止保存以防静默丢失宏"
+        );
     }
 
     // 同步透视表缓存定义（仅当定义随改名/编辑有变化时回写；原包未变更的缓存已由原生重打包原样拷贝）

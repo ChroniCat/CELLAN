@@ -61,89 +61,148 @@ fn clamp_source_bounds(at: (u32, u32), rows: u32, cols: u32) -> Option<((u32, u3
     Some((at, rows.min(max_r), cols.min(max_c)))
 }
 
-impl Source {
-    /// 存进名称管理器的文本（不带等号，外面包一层双引号当字符串常量）
-    ///
-    /// CSV|路径|分隔符|表头|行|列|上次行数|上次列数|编码|文本列|引号|目标表
-    /// SHEET|表名|r1,c1,r2,c2|行|列|上次行数|上次列数|目标表
-    pub fn to_name_text(&self) -> String {
-        let tgt = self
-            .target_sheet
-            .as_deref()
-            .unwrap_or("")
-            .replace('"', "\"\"");
-        match &self.kind {
-            Kind::Csv { path, delim, header } => {
-                let (enc, cols, quote) = match &self.csv_opts {
-                    Some(o) => (
-                        o.encoding.map(|e| e.id()).unwrap_or("auto").to_string(),
-                        o.text_cols.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","),
-                        format!("q{}", o.quote as u32),
-                    ),
-                    None => ("auto".to_string(), String::new(), format!("q{}", '"' as u32)),
-                };
-                if tgt.is_empty() {
-                    format!(
-                        "\"CSV|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\"",
-                        path.replace('"', "\"\""),
-                        delim,
-                        if *header { 1 } else { 0 },
-                        self.at.0,
-                        self.at.1,
-                        self.rows,
-                        self.cols,
-                        enc,
-                        cols,
-                        quote
-                    )
-                } else {
-                    format!(
-                        "\"CSV|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\"",
-                        path.replace('"', "\"\""),
-                        delim,
-                        if *header { 1 } else { 0 },
-                        self.at.0,
-                        self.at.1,
-                        self.rows,
-                        self.cols,
-                        enc,
-                        cols,
-                        quote,
-                        tgt
-                    )
-                }
-            }
-            Kind::Internal { sheet, rect } => {
-                if tgt.is_empty() {
-                    format!(
-                        "\"SHEET|{}|{},{},{},{}|{}|{}|{}|{}\"",
-                        sheet.replace('"', "\"\""),
-                        rect.0, rect.1, rect.2, rect.3,
-                        self.at.0, self.at.1, self.rows, self.cols
-                    )
-                } else {
-                    format!(
-                        "\"SHEET|{}|{},{},{},{}|{}|{}|{}|{}|{}\"",
-                        sheet.replace('"', "\"\""),
-                        rect.0, rect.1, rect.2, rect.3,
-                        self.at.0, self.at.1, self.rows, self.cols,
-                        tgt
-                    )
-                }
-            }
+fn default_wire_quote() -> char {
+    '"'
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "k")]
+enum SourceWireKind {
+    #[serde(rename = "csv")]
+    Csv {
+        p: String,
+        d: char,
+        h: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        e: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tc: Vec<u32>,
+        #[serde(default = "default_wire_quote")]
+        q: char,
+    },
+    #[serde(rename = "sheet")]
+    Internal {
+        s: String,
+        r: (u32, u32, u32, u32),
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SourceWireV2 {
+    #[serde(flatten)]
+    kind: SourceWireKind,
+    at: (u32, u32),
+    #[serde(default)]
+    rows: u32,
+    #[serde(default)]
+    cols: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    t: Option<String>,
+}
+
+fn strip_outer_excel_quotes(text: &str) -> &str {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed)
+}
+
+fn parse_source_v2(name: &str, text: &str) -> Option<Source> {
+    let body = strip_outer_excel_quotes(text);
+    let payload = body.strip_prefix("V2:")?;
+    let json = payload.replace("\"\"", "\"");
+    let wire: SourceWireV2 = serde_json::from_str(&json).ok()?;
+    let (at, rows, cols) = clamp_source_bounds(wire.at, wire.rows, wire.cols)?;
+    let target_sheet = wire.t.filter(|s| !s.is_empty());
+    let (kind, csv_opts) = match wire.kind {
+        SourceWireKind::Csv { p, d, h, e, tc, q } => {
+            let enc = e.as_deref().and_then(crate::csv::Encoding::from_id);
+            let opts = if enc.is_some() || !tc.is_empty() || q != '"' {
+                Some(CsvOpts { encoding: enc, text_cols: tc, quote: q })
+            } else {
+                None
+            };
+            (Kind::Csv { path: p, delim: d, header: h }, opts)
         }
+        SourceWireKind::Internal { s, r: (r1, c1, r2, c2) } => {
+            let (r1, c1, r2, c2) = (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2));
+            if r2 >= MAX_SRC_ROWS || c2 >= MAX_SRC_COLS {
+                return None;
+            }
+            (Kind::Internal { sheet: s, rect: (r1, c1, r2, c2) }, None)
+        }
+    };
+    Some(Source {
+        name: name.to_string(),
+        kind,
+        at,
+        target_sheet,
+        rows,
+        cols,
+        csv_opts,
+    })
+}
+
+impl Source {
+    /// 存进名称管理器 / 自定义文档属性的文本（不带等号，外面包一层双引号当字符串常量）。
+    ///
+    /// 使用可逆的版本化 JSON 编码（`V2:{...}`），确保含 `|`、双引号、XML 特殊字符的工作表名、
+    /// 文件路径及竖线分隔符均能无损往返，同时 `from_name_text` 保留对旧版 `CSV|...`/`SHEET|...` 的读取兼容。
+    pub fn to_name_text(&self) -> String {
+        let kind = match &self.kind {
+            Kind::Csv { path, delim, header } => {
+                let (e, tc, q) = match &self.csv_opts {
+                    Some(o) => (
+                        o.encoding.map(|enc| enc.id().to_string()),
+                        o.text_cols.clone(),
+                        o.quote,
+                    ),
+                    None => (None, Vec::new(), '"'),
+                };
+                SourceWireKind::Csv {
+                    p: path.clone(),
+                    d: *delim,
+                    h: *header,
+                    e,
+                    tc,
+                    q,
+                }
+            }
+            Kind::Internal { sheet, rect } => SourceWireKind::Internal {
+                s: sheet.clone(),
+                r: *rect,
+            },
+        };
+        let wire = SourceWireV2 {
+            kind,
+            at: self.at,
+            rows: self.rows,
+            cols: self.cols,
+            t: self.target_sheet.clone().filter(|s| !s.is_empty()),
+        };
+        let json = serde_json::to_string(&wire).expect("SourceWireV2 serialization is infallible");
+        format!("\"V2:{}\"", json.replace('"', "\"\""))
     }
 
     /// 从名称文本还原；不认识的返回 None（别的软件写的名字一律忽略）
     pub fn from_name_text(name: &str, text: &str) -> Option<Source> {
-        // 名称文本是从 XML 里读出来的，实体要先还原（" 会写成 &quot;）
-        let text = text
+        // 1) 优先直接解析 V2 JSON（quick_xml 读取 custom.xml 时已解码 XML 实体，避免把字面 `&quot;` 误转破坏 JSON）
+        if let Some(src) = parse_source_v2(name, text) {
+            return Some(src);
+        }
+        // 2) 兼容来自 raw XML（如 legacy definedNames / sources.xml）的实体编码
+        let unescaped = text
             .replace("&quot;", "\"")
             .replace("&apos;", "'")
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&amp;", "&");
-        let body = text.trim().trim_start_matches('"').trim_end_matches('"');
+        if let Some(src) = parse_source_v2(name, &unescaped) {
+            return Some(src);
+        }
+        // 3) 兼容旧版竖线分隔格式（CSV|... / SHEET|...）
+        let body = strip_outer_excel_quotes(&unescaped);
         let f: Vec<&str> = body.split('|').collect();
         let num = |i: usize| -> u32 { f.get(i).and_then(|x| x.parse().ok()).unwrap_or(0) };
         let (kind, raw_at, raw_rows, raw_cols, target_sheet) = match f.first().copied()? {
@@ -709,6 +768,24 @@ fn read_all_props(xml: &str) -> Vec<(String, String)> {
             Event::Text(t) if in_value => {
                 if let Some((_, v)) = cur.as_mut() {
                     v.push_str(&t.xml10_content());
+                }
+            }
+            Event::CData(c) if in_value => {
+                if let Some((_, v)) = cur.as_mut() {
+                    v.push_str(c.as_ref());
+                }
+            }
+            Event::GeneralRef(g) if in_value => {
+                if let Some((_, v)) = cur.as_mut() {
+                    let gname = String::from_utf8_lossy(g.as_ref().as_ref());
+                    let resolved = crate::model::resolve_entity(&gname);
+                    if !resolved.is_empty() {
+                        v.push_str(&resolved);
+                    } else {
+                        v.push('&');
+                        v.push_str(&gname);
+                        v.push(';');
+                    }
                 }
             }
             Event::End(e) => {

@@ -51,9 +51,12 @@ fn formula_networkdays_workday_isoweeknum_and_date_edge_cases() {
     assert_eq!(eval_one(&mut wb, "=NETWORKDAYS(1, 100000000)"), Value::Error(ErrKind::Num));
     assert!(t1.elapsed().as_millis() < 50, "out-of-range NETWORKDAYS took too long: {:?}", t1.elapsed());
 
-    // All-weekend mask "1111111" must return #VALUE!
+    // All-weekend mask "1111111": WORKDAY.INTL returns #VALUE!, while Excel's NETWORKDAYS.INTL returns 0
     assert_eq!(eval_one(&mut wb, "=WORKDAY.INTL(45000, 5, \"1111111\")"), Value::Error(ErrKind::Value));
-    assert_eq!(eval_one(&mut wb, "=NETWORKDAYS.INTL(45000, 45010, \"1111111\")"), Value::Error(ErrKind::Value));
+    assert_eq!(eval_one(&mut wb, "=NETWORKDAYS.INTL(45000, 45010, \"1111111\")"), Value::Number(0.0));
+    assert_eq!(eval_one(&mut wb, "=NETWORKDAYS.INTL(45010, 45000, \"1111111\")"), Value::Number(0.0));
+    assert_eq!(eval_one(&mut wb, "=NETWORKDAYS.INTL(45000, 45010, \"0000011\")"), Value::Number(8.0));
+    assert_eq!(eval_one(&mut wb, "=NETWORKDAYS.INTL(45000, 100000000, \"1111111\")"), Value::Error(ErrKind::Num));
 
     // Extreme negative days must not panic on i64::MIN.abs()
     assert_eq!(eval_one(&mut wb, "=WORKDAY(45000, -1E30)"), Value::Error(ErrKind::Num));

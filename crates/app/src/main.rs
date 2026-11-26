@@ -2882,6 +2882,8 @@ struct SheetApp {
     /// 重连后的快照会覆盖本地副本；快照落定后再按「后写者胜」逐条补发，
     /// 断线期间的编辑不会被静默抹掉。
     rejoin_outbox: Option<(u64, Vec<sheetcore::sync::Op>)>,
+    /// 与 `rejoin_outbox` 配对的房间号和结构修订基线 `(doc_uid, room_id, base_struct_rev)`
+    rejoin_outbox_meta: Option<(u64, String, usize)>,
     /// 断线期间暂存的本地样式与合并变更（重连后补发）
     rejoin_style_outbox: Vec<(u64, usize, Vec<(u32, u32, sheetcore::style::CellStyle)>)>,
     rejoin_merge_outbox: Vec<(u64, usize, (u32, u32, u32, u32), bool)>,
@@ -4525,6 +4527,7 @@ impl SheetApp {
             last_import: None,
             room_lost: false,
             rejoin_outbox: None,
+            rejoin_outbox_meta: None,
             rejoin_style_outbox: Vec::new(),
             rejoin_merge_outbox: Vec::new(),
             page_setup_open: false,
@@ -8003,13 +8006,17 @@ impl SheetApp {
             };
             match loaded {
                 Ok(mut wb) => {
-                    // 仅在加载成功后才移出恢复列表并删除磁盘草稿，避免加密/临时失败丢弃副本
+                    // 把恢复快照分离为只读保真基准包（保存为正式文件或关闭标签页前保留原 VBA 及未建模 OOXML 部件），
+                    // 同时清空 wb.path 强制另存为，避免静默覆盖原文件。
+                    if let Err(e) = sheetcore::xlsx::detach_as_base_package(&mut wb, &data_path) {
+                        self.status = format!("无法保留恢复副本的原始部件来源（已保留草稿）：{e:#}");
+                        return;
+                    }
+                    // 仅在加载且保真基准分离成功后才移出恢复列表并删除磁盘草稿，避免失败丢弃副本
                     self.recovery_orphans.remove(idx);
                     if self.recovery_pw.as_ref().is_some_and(|(t, _, _)| t == &entry.token) {
                         self.recovery_pw = None;
                     }
-                    // 作为未保存副本打开，避免静默覆盖原文件，提醒用户手动另存
-                    wb.path = None;
                     wb.dirty = true;
                     self.open_in_new_tab(PathBuf::new());
                     self.wb = wb;
@@ -10518,6 +10525,10 @@ impl SheetApp {
                         return;
                     }
                 }
+                Some(office_clipboard::RichClipboard::HtmlTruncated(limit)) if !values_only => {
+                    self.report_html_clipboard_limit(limit);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -10548,6 +10559,10 @@ impl SheetApp {
                     if self.paste_office_block(&block) {
                         return;
                     }
+                }
+                Some(office_clipboard::RichClipboard::HtmlTruncated(limit)) if !values_only => {
+                    self.report_html_clipboard_limit(limit);
+                    return;
                 }
                 _ => {}
             }
@@ -23515,6 +23530,43 @@ fn clear_selection(&mut self) {
                 }
                 sparse_keys.extend(set);
             }
+            // 整行/整列/全表样式会修改默认样式格：必须按整个轴向矩形做编辑租约预检，
+            // 避免只查 `sh.styles.keys()` 时漏掉未显式设过样式但正被他人持锁的单元格。
+            {
+                let si = self.sheet_idx;
+                let my_site = self.net.as_ref().map_or(0, |n| n.site);
+                let now = self.lock_now();
+                let mut axis_rects: Vec<(u32, u32, u32, u32)> = Vec::new();
+                if full_sheet {
+                    axis_rects.push((0, 0, sheetcore::sync::MAX_ROWS - 1, sheetcore::sync::MAX_COLS - 1));
+                } else {
+                    for &(c1, c2) in &full_cols {
+                        axis_rects.push((0, c1, sheetcore::sync::MAX_ROWS - 1, c2));
+                    }
+                    for &(r1, r2) in &full_rows {
+                        axis_rects.push((r1, 0, r2, sheetcore::sync::MAX_COLS - 1));
+                    }
+                }
+                for rect in axis_rects {
+                    let conflict = self
+                        .net
+                        .as_ref()
+                        .and_then(|n| n.host_lock_conflict_rect(si, rect))
+                        .map(|(_, name, r, c)| (name, r, c))
+                        .or_else(|| {
+                            self.locks
+                                .conflicts_rect(si, rect.0, rect.1, rect.2, rect.3, my_site, now)
+                                .map(|((r, c), h)| (h.name.clone(), r, c))
+                        });
+                    if let Some((holder, lr, lc)) = conflict {
+                        self.status = format!(
+                            "{holder} 正在编辑 {}，不能设置格式",
+                            cell_name(lr, lc)
+                        );
+                        return false;
+                    }
+                }
+            }
             if !self.write_preflight_op(&sparse_keys, "设置格式", sheetcore::protection::ProtOp::FormatCells) {
                 return false;
             }
@@ -28083,7 +28135,24 @@ fn clear_selection(&mut self) {
                 }
                 Some(grid)
             }
+            office_clipboard::RichClipboard::HtmlTruncated(limit) => {
+                self.report_html_clipboard_limit(limit);
+                None
+            }
         }
+    }
+
+    fn report_html_clipboard_limit(&mut self, limit: office_clipboard::HtmlLimitKind) {
+        let msg = limit.user_message();
+        self.status = msg.clone();
+        self.set_notice(NoticeBanner {
+            level: NoticeLevel::Warn,
+            title: "剪贴板 HTML 数据超限，已中止粘贴".into(),
+            detail: msg,
+            actions: Vec::new(),
+            tag: Some("clipboard_html_limit"),
+            target_doc_uid: Some(self.doc_uid),
+        });
     }
 
     /// text 是系统剪贴板文本；None/空 表示没有可粘贴的外部文本。
@@ -30878,8 +30947,8 @@ fn clear_selection(&mut self) {
         r: u32,
         c: u32,
         note: Option<&sheetcore::notes::Note>,
-    ) {
-        let Some(net) = self.net.as_ref() else { return };
+    ) -> bool {
+        let Some(net) = self.net.as_ref() else { return true };
         let kind = match note {
             Some(n) => sheetcore::sync::SheetMetaKind::Note {
                 row: r,
@@ -30894,7 +30963,7 @@ fn clear_selection(&mut self) {
                 text: None,
             },
         };
-        net.broadcast_sheet_meta(sheet, kind);
+        net.broadcast_sheet_meta(sheet, kind)
     }
 
     fn broadcast_thread_meta(
@@ -30903,8 +30972,8 @@ fn clear_selection(&mut self) {
         r: u32,
         c: u32,
         thread: Option<&sheetcore::notes::ThreadedComment>,
-    ) {
-        let Some(net) = self.net.as_ref() else { return };
+    ) -> bool {
+        let Some(net) = self.net.as_ref() else { return true };
         net.broadcast_sheet_meta(
             sheet,
             sheetcore::sync::SheetMetaKind::Thread {
@@ -30912,7 +30981,47 @@ fn clear_selection(&mut self) {
                 col: c,
                 thread: thread.cloned(),
             },
-        );
+        )
+    }
+
+    fn broadcast_thread_reply_meta(
+        &self,
+        sheet: usize,
+        r: u32,
+        c: u32,
+        seed_root: Option<sheetcore::notes::ThreadEntry>,
+        entry: sheetcore::notes::ThreadEntry,
+    ) -> bool {
+        let Some(net) = self.net.as_ref() else { return true };
+        net.broadcast_sheet_meta(
+            sheet,
+            sheetcore::sync::SheetMetaKind::ThreadReply {
+                row: r,
+                col: c,
+                seed_root,
+                entry,
+            },
+        )
+    }
+
+    fn broadcast_thread_resolve_meta(
+        &self,
+        sheet: usize,
+        r: u32,
+        c: u32,
+        seed_root: Option<sheetcore::notes::ThreadEntry>,
+        resolved: bool,
+    ) -> bool {
+        let Some(net) = self.net.as_ref() else { return true };
+        net.broadcast_sheet_meta(
+            sheet,
+            sheetcore::sync::SheetMetaKind::ThreadResolve {
+                row: r,
+                col: c,
+                seed_root,
+                resolved,
+            },
+        )
     }
 
     pub(crate) fn broadcast_note_undo_edit(&self, edit: &sheetcore::undo::NoteUndoEdit) {
@@ -34614,46 +34723,8 @@ fn clear_selection(&mut self) {
         };
 
         if toggle_resolved {
-            if self.write_preflight_on(target_sheet, &[(r, c)], "更新批注线程状态") {
-                let old_note = self.wb.sheet(target_sheet).notes.get(&key).cloned();
-                let old_thread = self.wb.sheet(target_sheet).threads.get(&key).cloned();
-                let updated = {
-                    let sh = self.wb.sheet_mut(target_sheet);
-                    if let Some(tc) = sh.threads.get_mut(&key) {
-                        tc.resolved = !tc.resolved;
-                        let new_tc = tc.clone();
-                        sh.threads_dirty = true;
-                        let n = sheetcore::notes::Note {
-                            r,
-                            c,
-                            text: new_tc.summary_text(),
-                            author: new_tc.root_author().to_string(),
-                        };
-                        sh.notes.insert(key, n.clone());
-                        sh.notes_dirty = true;
-                        sh.bump_display_style_revision();
-                        Some((n, new_tc))
-                    } else {
-                        None
-                    }
-                };
-                if let Some((new_note, new_tc)) = updated {
-                    self.broadcast_note_meta(target_sheet, r, c, Some(&new_note));
-                    self.broadcast_thread_meta(target_sheet, r, c, Some(&new_tc));
-                    self.undo.push_meta(
-                        "切换批注解决状态",
-                        (target_sheet, r, c),
-                        sheetcore::undo::MetaEdit {
-                            sheet: target_sheet,
-                            notes: vec![((r, c), old_note, Some(new_note))],
-                            threads: vec![((r, c), old_thread, Some(new_tc))],
-                            ..Default::default()
-                        },
-                    );
-                    self.wb.dirty = true;
-                    self.doc_gen = self.doc_gen.wrapping_add(1);
-                    self.tasks.last_edit = Some(std::time::Instant::now());
-                }
+            if let Some(cur_resolved) = self.wb.sheet(target_sheet).threads.get(&key).map(|tc| tc.resolved) {
+                let _ = self.set_comment_resolved(target_sheet, r, c, !cur_resolved);
             }
             self.note_edit = Some((r, c, text));
             ctx.request_repaint();
@@ -34685,70 +34756,113 @@ fn clear_selection(&mut self) {
                     let y = y + i64::from(m <= 2);
                     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
                 };
-                let (new_note, new_tc) = {
-                    let sh = self.wb.sheet_mut(target_sheet);
-                    let tc = sh.threads.entry(key).or_insert_with(|| {
-                        let mut entries = Vec::new();
-                        let root_txt = text.trim();
-                        if !root_txt.is_empty() {
-                            entries.push(sheetcore::notes::ThreadEntry {
-                                id: sheetcore::notes::new_ooxml_guid(),
-                                author: old_note
-                                    .as_ref()
-                                    .map(|n| n.author.clone())
-                                    .filter(|a| !a.is_empty())
-                                    .unwrap_or_else(|| default_author.clone()),
-                                timestamp: ts.clone(),
-                                text: root_txt.to_string(),
-                            });
-                        }
-                        sheetcore::notes::ThreadedComment {
-                            r,
-                            c,
-                            resolved: false,
-                            entries,
-                        }
-                    });
-                    tc.entries.push(sheetcore::notes::ThreadEntry {
+                let seed_root = if old_thread.is_none() {
+                    let root_txt = text.trim();
+                    (!root_txt.is_empty()).then(|| sheetcore::notes::ThreadEntry {
+                        id: sheetcore::notes::new_ooxml_guid(),
+                        author: old_note
+                            .as_ref()
+                            .map(|n| n.author.clone())
+                            .filter(|a| !a.is_empty())
+                            .unwrap_or_else(|| default_author.clone()),
+                        timestamp: ts.clone(),
+                        text: root_txt.to_string(),
+                    })
+                } else {
+                    None
+                };
+                let projected_len = old_thread
+                    .as_ref()
+                    .map(|tc| tc.entries.len())
+                    .unwrap_or_else(|| usize::from(seed_root.is_some()))
+                    + 1;
+                let mut check_texts: Vec<&str> = vec![reply_text.as_str()];
+                let mut check_authors: Vec<&str> = vec![default_author.as_str()];
+                if let Some(ref root) = seed_root {
+                    check_texts.push(root.text.as_str());
+                    check_authors.push(root.author.as_str());
+                }
+                if let Err(err) =
+                    Self::validate_thread_limits(projected_len, &check_texts, &check_authors)
+                {
+                    self.status = err;
+                } else {
+                    let new_entry = sheetcore::notes::ThreadEntry {
                         id: sheetcore::notes::new_ooxml_guid(),
                         author: default_author.clone(),
                         timestamp: ts,
                         text: reply_text,
-                    });
-                    let new_tc = tc.clone();
-                    sh.threads_dirty = true;
-                    let n = sheetcore::notes::Note {
-                        r,
-                        c,
-                        text: new_tc.summary_text(),
-                        author: new_tc.root_author().to_string(),
                     };
-                    sh.notes.insert(key, n.clone());
-                    sh.notes_dirty = true;
-                    sh.bump_display_style_revision();
-                    (n, new_tc)
-                };
-                if text.trim().is_empty() {
-                    if let Some(first) = new_tc.entries.first() {
-                        text = first.text.clone();
+                    let (new_note, new_tc) = {
+                        let sh = self.wb.sheet_mut(target_sheet);
+                        let tc = sh.threads.entry(key).or_insert_with(|| {
+                            sheetcore::notes::ThreadedComment {
+                                r,
+                                c,
+                                resolved: false,
+                                entries: seed_root.clone().into_iter().collect(),
+                            }
+                        });
+                        tc.entries.push(new_entry.clone());
+                        let new_tc = tc.clone();
+                        sh.threads_dirty = true;
+                        let n = sheetcore::notes::Note {
+                            r,
+                            c,
+                            text: new_tc.summary_text(),
+                            author: new_tc.root_author().to_string(),
+                        };
+                        sh.notes.insert(key, n.clone());
+                        sh.notes_dirty = true;
+                        sh.bump_display_style_revision();
+                        (n, new_tc)
+                    };
+                    if !self.broadcast_thread_reply_meta(target_sheet, r, c, seed_root, new_entry) {
+                        let sh = self.wb.sheet_mut(target_sheet);
+                        match old_note {
+                            Some(n) => {
+                                sh.notes.insert(key, n);
+                            }
+                            None => {
+                                sh.notes.remove(&key);
+                            }
+                        }
+                        match old_thread {
+                            Some(tc) => {
+                                sh.threads.insert(key, tc);
+                            }
+                            None => {
+                                sh.threads.remove(&key);
+                            }
+                        }
+                        sh.bump_display_style_revision();
+                        self.status = format!(
+                            "{} 的线程回复未能同步（可能已达 {} 条上限或连接已断开），已撤回本地修改",
+                            cell_name(r, c),
+                            sheetcore::sync::MAX_THREAD_ENTRIES
+                        );
+                    } else {
+                        if text.trim().is_empty() {
+                            if let Some(first) = new_tc.entries.first() {
+                                text = first.text.clone();
+                            }
+                        }
+                        self.undo.push_meta(
+                            "回复批注线程",
+                            (target_sheet, r, c),
+                            sheetcore::undo::MetaEdit {
+                                sheet: target_sheet,
+                                notes: vec![((r, c), old_note, Some(new_note))],
+                                threads: vec![((r, c), old_thread, Some(new_tc))],
+                                ..Default::default()
+                            },
+                        );
+                        self.wb.dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.tasks.last_edit = Some(std::time::Instant::now());
+                        self.status = format!("已在 {} 添加线程回复", cell_name(r, c));
                     }
                 }
-                self.broadcast_note_meta(target_sheet, r, c, Some(&new_note));
-                self.broadcast_thread_meta(target_sheet, r, c, Some(&new_tc));
-                self.undo.push_meta(
-                    "回复批注线程",
-                    (target_sheet, r, c),
-                    sheetcore::undo::MetaEdit {
-                        sheet: target_sheet,
-                        notes: vec![((r, c), old_note, Some(new_note))],
-                        threads: vec![((r, c), old_thread, Some(new_tc))],
-                        ..Default::default()
-                    },
-                );
-                self.wb.dirty = true;
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.tasks.last_edit = Some(std::time::Instant::now());
-                self.status = format!("已在 {} 添加线程回复", cell_name(r, c));
             }
             self.note_edit = Some((r, c, text));
             ctx.request_repaint();
@@ -47645,13 +47759,10 @@ impl SheetApp {
                         } else {
                             None
                         };
-                        {
-                            let sh = self.wb.sheet_mut(idx);
-                            if is_rows {
-                                sh.move_rows(from, n, drop);
-                            } else {
-                                sh.move_cols(from, n, drop);
-                            }
+                        if is_rows {
+                            sheetcore::structural::move_rows_wb(&mut self.wb, idx, from, n, drop);
+                        } else {
+                            sheetcore::structural::move_cols_wb(&mut self.wb, idx, from, n, drop);
                         }
                         if let Some(before) = snap {
                             let after = before.capture_after(&self.wb);
@@ -49961,6 +50072,74 @@ impl SheetApp {
         None
     }
 
+    fn shift_rejoin_outboxes(
+        &mut self,
+        sheet: usize,
+        op: &sheetcore::structural::Structural,
+    ) {
+        let uid = self.doc_uid;
+        if let Some((owner, ops)) = self.rejoin_outbox.as_mut() {
+            if *owner == uid && !ops.is_empty() {
+                let names: Vec<String> = self.wb.sheets.iter().map(|s| s.name.clone()).collect();
+                let shifts = sheetcore::sync::structural_reference_shifts(&names, sheet, op);
+                let mut shifted = Vec::with_capacity(ops.len());
+                for mut item in std::mem::take(ops) {
+                    if item.sheet == sheet {
+                        let Some((nr, nc)) =
+                            sheetcore::sync::shift_structural_coord(item.row, item.col, op)
+                        else {
+                            continue;
+                        };
+                        item.row = nr;
+                        item.col = nc;
+                    }
+                    if let Some(new_formula) = item.shifted_formula(&shifts) {
+                        item.formula = Some(std::sync::Arc::from(new_formula));
+                    }
+                    shifted.push(item);
+                }
+                *ops = shifted;
+                if ops.is_empty() {
+                    self.rejoin_outbox = None;
+                    self.rejoin_outbox_meta = None;
+                }
+            }
+        }
+        if !self.rejoin_style_outbox.is_empty() {
+            let mut next_styles = Vec::with_capacity(self.rejoin_style_outbox.len());
+            for (owner, sh, items) in std::mem::take(&mut self.rejoin_style_outbox) {
+                if owner == uid && sh == sheet {
+                    let shifted: Vec<_> = items
+                        .into_iter()
+                        .filter_map(|(r, c, st)| {
+                            sheetcore::sync::shift_structural_coord(r, c, op)
+                                .map(|(nr, nc)| (nr, nc, st))
+                        })
+                        .collect();
+                    if !shifted.is_empty() {
+                        next_styles.push((owner, sh, shifted));
+                    }
+                } else {
+                    next_styles.push((owner, sh, items));
+                }
+            }
+            self.rejoin_style_outbox = next_styles;
+        }
+        if !self.rejoin_merge_outbox.is_empty() {
+            let mut next_merges = Vec::with_capacity(self.rejoin_merge_outbox.len());
+            for (owner, sh, rect, on) in std::mem::take(&mut self.rejoin_merge_outbox) {
+                if owner == uid && sh == sheet {
+                    if let Some(nrect) = sheetcore::sync::shift_structural_merge_rect(rect, op) {
+                        next_merges.push((owner, sh, nrect, on));
+                    }
+                } else {
+                    next_merges.push((owner, sh, rect, on));
+                }
+            }
+            self.rejoin_merge_outbox = next_merges;
+        }
+    }
+
     fn shift_collab_coordinates(
         &mut self,
         sheet: usize,
@@ -49970,6 +50149,12 @@ impl SheetApp {
         if let Some(peer) = self.peer.as_mut() {
             let names: Vec<_> = self.wb.sheets.iter().map(|sheet| sheet.name.clone()).collect();
             peer.shift_structural_with_formulas(&names, sheet, op);
+        }
+        self.shift_rejoin_outboxes(sheet, op);
+        if let Some((muid, _, ref mut srev)) = self.rejoin_outbox_meta {
+            if muid == self.doc_uid {
+                *srev = srev.saturating_add(1);
+            }
         }
         if let Some((ls, lr, lc)) = self.my_lock {
             if ls == sheet {
@@ -50008,19 +50193,34 @@ impl SheetApp {
         }
     }
 
-    /// 重连前暂存本副本里「我自己写的」单元格操作（只在客户端侧；宿主侧的权威状态不需要补发）。
-    /// 已送达宿主的操作补发时会被宿主按（时间戳, 站点）去重，是幂等的。
+    /// 重连前暂存本副本里「尚未被宿主确认的」单元格操作（只在客户端侧；宿主侧的权威状态不需要补发）。
+    /// 已被宿主提交确认的操作（`ts <= acked_op_ts`）绝不再入队，避免断线期间结构性插删行列后被错位重放。
     fn stash_own_ops_for_rejoin(&mut self) {
         if self.net.as_ref().is_some_and(|n| n.hosting) {
             return;
         }
+        let uid = self.doc_uid;
+        let acked_ts = self.net.as_ref().map(|n| n.acked_op_ts()).unwrap_or(0);
+        let room_id = self.net.as_ref().map(|n| n.connected_room_id()).unwrap_or_default();
+        let cur_srev = self.net.as_ref().map(|n| n.structure_seen()).unwrap_or(0);
+        if acked_ts > 0 {
+            if let Some((owner, ops)) = self.rejoin_outbox.as_mut() {
+                if *owner == uid {
+                    ops.retain(|o| o.ts > acked_ts);
+                    if ops.is_empty() {
+                        self.rejoin_outbox = None;
+                        self.rejoin_outbox_meta = None;
+                    }
+                }
+            }
+        }
         let Some(peer) = self.peer.as_ref() else { return };
-        // ts = 1 是宿主播种的磁盘基准格，不算「我的编辑」
+        // ts = 1 是宿主播种的磁盘基准格；ts <= acked_ts 已由宿主确认提交，均不属于待补发的断线编辑
         let sorts = self.net.as_ref().map(|n| n.sort_clock_ranges()).unwrap_or_default();
         let mine: Vec<sheetcore::sync::Op> = peer
             .cells
             .values()
-            .filter(|o| o.site == peer.site && o.ts > 1 && {
+            .filter(|o| o.site == peer.site && o.ts > 1 && o.ts > acked_ts && {
                 let i = sorts.partition_point(|(first,_)| *first <= o.ts);
                 i == 0 || o.ts >= sorts[i-1].1
             })
@@ -50029,7 +50229,6 @@ impl SheetApp {
         if mine.is_empty() {
             return;
         }
-        let uid = self.doc_uid;
         match self.rejoin_outbox.as_mut() {
             Some((owner, ops)) if *owner == uid => {
                 // O(M log M) BTreeMap 去重合并，消除断线期间数万格编辑触发的 O(M²) 线性查找卡死
@@ -50069,6 +50268,13 @@ impl SheetApp {
                 }
                 self.rejoin_outbox = Some((uid, by_key.into_values().collect()));
             }
+        }
+        if self
+            .rejoin_outbox_meta
+            .as_ref()
+            .is_none_or(|(muid, mroom, _)| *muid != uid || *mroom != room_id)
+        {
+            self.rejoin_outbox_meta = Some((uid, room_id, cur_srev));
         }
     }
 
@@ -50189,6 +50395,70 @@ impl SheetApp {
                     changed = true;
                 }
             }
+            SheetMetaKind::ThreadReply { row, col, seed_root, entry } => {
+                if let Some(sh) = self.wb.sheets.get_mut(sheet) {
+                    let k = sheetcore::CellRef::new(row, col);
+                    let tc = sh.threads.entry(k).or_insert_with(|| {
+                        let mut entries = Vec::new();
+                        if let Some(root) = seed_root {
+                            if root.id != entry.id {
+                                entries.push(root);
+                            }
+                        }
+                        sheetcore::notes::ThreadedComment {
+                            r: row,
+                            c: col,
+                            resolved: false,
+                            entries,
+                        }
+                    });
+                    if !tc.entries.iter().any(|e| e.id == entry.id)
+                        && tc.entries.len() < sheetcore::sync::MAX_THREAD_ENTRIES
+                    {
+                        tc.entries.push(entry);
+                    }
+                    let summary = sheetcore::notes::Note {
+                        r: row,
+                        c: col,
+                        text: tc.summary_text(),
+                        author: tc.root_author().to_string(),
+                    };
+                    sh.notes.insert(k, summary);
+                    sh.notes_dirty = true;
+                    sh.threads_dirty = true;
+                    changed = true;
+                }
+            }
+            SheetMetaKind::ThreadResolve { row, col, seed_root, resolved } => {
+                if let Some(sh) = self.wb.sheets.get_mut(sheet) {
+                    let k = sheetcore::CellRef::new(row, col);
+                    if let Some(tc) = sh.threads.get_mut(&k) {
+                        tc.resolved = resolved;
+                    } else if let Some(root) = seed_root {
+                        sh.threads.insert(
+                            k,
+                            sheetcore::notes::ThreadedComment {
+                                r: row,
+                                c: col,
+                                resolved,
+                                entries: vec![root],
+                            },
+                        );
+                    }
+                    if let Some(tc) = sh.threads.get(&k) {
+                        let summary = sheetcore::notes::Note {
+                            r: row,
+                            c: col,
+                            text: tc.summary_text(),
+                            author: tc.root_author().to_string(),
+                        };
+                        sh.notes.insert(k, summary);
+                        sh.notes_dirty = true;
+                        sh.threads_dirty = true;
+                        changed = true;
+                    }
+                }
+            }
             SheetMetaKind::Hyperlink { row, col, target, tooltip } => {
                 if let Some(sh) = self.wb.sheets.get_mut(sheet) {
                     if let Some(t) = target {
@@ -50276,12 +50546,14 @@ impl SheetApp {
     /// 本地更新的才写回表格并发给宿主；宿主上更新的（别人断线期间改过）则保留宿主版本。
     fn replay_rejoin_outbox(&mut self) {
         let uid = self.doc_uid;
+        self.rejoin_outbox_meta = None;
         if self.net.as_ref().is_none_or(|n| n.hosting) {
             self.rejoin_outbox = None;
             self.rejoin_style_outbox.retain(|(o, ..)| *o != uid);
             self.rejoin_merge_outbox.retain(|(o, ..)| *o != uid);
             return;
         }
+        let acked_ts = self.net.as_ref().map(|n| n.acked_op_ts()).unwrap_or(0);
         let mut replayed_count = 0usize;
         if let Some((owner, ops)) = self.rejoin_outbox.take() {
             if owner == uid {
@@ -50290,7 +50562,7 @@ impl SheetApp {
                     let mut to_send = Vec::new();
                     if let Some(peer) = self.peer.as_mut() {
                         for mut op in ops {
-                            if op.sheet >= self.wb.sheets.len() {
+                            if op.sheet >= self.wb.sheets.len() || op.ts <= acked_ts {
                                 continue;
                             }
                             op.site = my_site;
@@ -50517,6 +50789,7 @@ impl SheetApp {
         self.auto_probe = None;
         // 主动离开就不会再重连补发；本地表格里的修改仍在，按普通未保存修改处理
         self.rejoin_outbox = None;
+        self.rejoin_outbox_meta = None;
         self.rejoin_style_outbox.retain(|(o, ..)| *o != self.doc_uid);
         self.rejoin_merge_outbox.retain(|(o, ..)| *o != self.doc_uid);
         self.release_lock();
@@ -54163,6 +54436,28 @@ fn elide(s: &str, max_chars: usize) -> String {
                 crate::net::NetEvent::StructuralHistory(items) => {
                     // 先存着：文件还在后台读/重算，这会儿改会被随后的整份替换冲掉
                     if let Some(net) = &self.net { net.note_structure(items.len()); }
+                    // 全量重连到同一房间时，把重连暂存的未确认断线操作按断线期间新增的结构改动平移/过滤
+                    if self.in_snapshot && !self.snapshot_is_delta {
+                        let cur_room = self
+                            .net
+                            .as_ref()
+                            .map(|n| n.connected_room_id())
+                            .unwrap_or_default();
+                        if let Some((muid, mroom, base_srev)) = self.rejoin_outbox_meta.clone() {
+                            if muid == self.doc_uid
+                                && !cur_room.is_empty()
+                                && mroom == cur_room
+                                && base_srev < items.len()
+                            {
+                                for (sh, op) in &items[base_srev..] {
+                                    self.shift_rejoin_outboxes(*sh, op);
+                                }
+                                if let Some((_, _, ref mut rev)) = self.rejoin_outbox_meta {
+                                    *rev = items.len();
+                                }
+                            }
+                        }
+                    }
                     self.struct_history.extend(items);
                 }
                 crate::net::NetEvent::StructureRevision(revision) => {
@@ -54340,6 +54635,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     col,
                     revert_ops,
                     revert_styles,
+                    revert_axis_styles,
                     revert_merge,
                 } => {
                     if holder != 0 {
@@ -54370,6 +54666,22 @@ fn elide(s: &str, max_chars: usize) -> String {
                                 None => 0,
                             };
                             self.wb.sheet_mut(sheet).set_style(r, c, sid);
+                        }
+                        if let Some(axis_patch) = revert_axis_styles {
+                            for (r, auth_style) in axis_patch.rows {
+                                let sid = match auth_style {
+                                    Some(st) => self.wb.styles.intern(st),
+                                    None => 0,
+                                };
+                                self.wb.sheet_mut(sheet).set_row_style(r, sid);
+                            }
+                            for (c, auth_style) in axis_patch.cols {
+                                let sid = match auth_style {
+                                    Some(st) => self.wb.styles.intern(st),
+                                    None => 0,
+                                };
+                                self.wb.sheet_mut(sheet).set_col_style(c, sid);
+                            }
                         }
                         if let Some((r1, c1, r2, c2, on)) = revert_merge {
                             let sh = self.wb.sheet_mut(sheet);

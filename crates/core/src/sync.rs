@@ -145,6 +145,22 @@ pub enum SheetMetaKind {
         col: u32,
         thread: Option<crate::notes::ThreadedComment>,
     },
+    /// 向单元格批注线程追加单条回复（宿主按权威状态幂等合并后再全员广播最终 `Thread` 快照）
+    ThreadReply {
+        row: u32,
+        col: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed_root: Option<crate::notes::ThreadEntry>,
+        entry: crate::notes::ThreadEntry,
+    },
+    /// 单独切换批注线程的已解决/未解决状态（不覆盖并发追加的回复）
+    ThreadResolve {
+        row: u32,
+        col: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed_root: Option<crate::notes::ThreadEntry>,
+        resolved: bool,
+    },
     Hyperlink {
         row: u32,
         col: u32,
@@ -188,14 +204,19 @@ impl SheetMetaKind {
                     && thread.as_ref().is_none_or(|tc| {
                         tc.r == *row
                             && tc.c == *col
-                            && tc.entries.len() <= 256
-                            && tc.entries.iter().all(|e| {
-                                e.id.len() <= 64
-                                    && e.author.len() <= MAX_SHORT_TEXT
-                                    && e.timestamp.len() <= 64
-                                    && e.text.len() <= 64 * 1024
-                            })
+                            && tc.entries.len() <= MAX_THREAD_ENTRIES
+                            && tc.entries.iter().all(thread_entry_valid)
                     })
+            }
+            SheetMetaKind::ThreadReply { row, col, seed_root, entry } => {
+                cell_in_bounds(sheet, *row, *col)
+                    && !entry.id.is_empty()
+                    && thread_entry_valid(entry)
+                    && seed_root.as_ref().is_none_or(|r| !r.id.is_empty() && thread_entry_valid(r))
+            }
+            SheetMetaKind::ThreadResolve { row, col, seed_root, .. } => {
+                cell_in_bounds(sheet, *row, *col)
+                    && seed_root.as_ref().is_none_or(|r| !r.id.is_empty() && thread_entry_valid(r))
             }
             SheetMetaKind::Hyperlink { row, col, target, tooltip } => {
                 cell_in_bounds(sheet, *row, *col)
@@ -251,6 +272,36 @@ pub fn shift_structural_coord(
         S::DeleteRows { at, n } => axis(r, *at, *n, true, MAX_ROWS).map(|nr| (nr, c)),
         S::InsertCols { at, n } => axis(c, *at, *n, false, MAX_COLS).map(|nc| (r, nc)),
         S::DeleteCols { at, n } => axis(c, *at, *n, true, MAX_COLS).map(|nc| (r, nc)),
+    }
+}
+
+/// 按行列增删重算合并区域坐标；若被完全删除、缩退为单格或越出边界则返回 `None`。
+pub fn shift_structural_merge_rect(
+    (r1, c1, r2, c2): (u32, u32, u32, u32),
+    op: &crate::structural::Structural,
+) -> Option<(u32, u32, u32, u32)> {
+    use crate::structural::Structural as S;
+    let shift = op.reference_shift();
+    let mapped = crate::refs::MappedShift { shift: &shift, insertions: &[] };
+    match *op {
+        S::InsertRows { at, n } => {
+            let nr1 = if r1 >= at { r1.checked_add(n)? } else { r1 };
+            let nr2 = if r2 >= at { r2.checked_add(n)? } else { r2 };
+            (nr1 < MAX_ROWS && nr2 < MAX_ROWS && (nr2 > nr1 || c2 > c1)).then_some((nr1, c1, nr2, c2))
+        }
+        S::DeleteRows { .. } => {
+            let (a, b) = mapped.map_range(r1, r2)?;
+            (b > a || c2 > c1).then_some((a, c1, b, c2))
+        }
+        S::InsertCols { at, n } => {
+            let nc1 = if c1 >= at { c1.checked_add(n)? } else { c1 };
+            let nc2 = if c2 >= at { c2.checked_add(n)? } else { c2 };
+            (nc1 < MAX_COLS && nc2 < MAX_COLS && (r2 > r1 || nc2 > nc1)).then_some((r1, nc1, r2, nc2))
+        }
+        S::DeleteCols { .. } => {
+            let (a, b) = mapped.map_range(c1, c2)?;
+            (r2 > r1 || b > a).then_some((r1, a, r2, b))
+        }
     }
 }
 
@@ -629,6 +680,9 @@ pub enum Msg {
         binary_v3: bool,
         #[serde(default)]
         compact_v3: bool,
+        /// 宿主已为该站点提交的最大单元格操作逻辑时间戳（重连时防止已确认的旧 op 在结构变更后被错位重放）
+        #[serde(default)]
+        acked_op_ts: u64,
     },
     Snapshot { ops: Vec<Op> },
     /// 大文件分片下发（last=1 表示这是最后一片）
@@ -701,11 +755,15 @@ pub enum Msg {
         sheet: usize,
         patch: AxisStylePatch,
     },
-    /// 宿主单调进度水位（供客户端闪断重连增量恢复）
+    /// 宿主单调进度水位（供客户端闪断重连增量恢复；可选携带刚确认的站点与最大逻辑时间戳）
     Watermark {
         seq: u64,
         #[serde(default)]
         structure_revision: usize,
+        #[serde(default)]
+        ack_site: u32,
+        #[serde(default)]
+        ack_ts: u64,
     },
     /// 新加入的人先收到结构改动历史，把本地表格挪到位再收快照
     StructuralLog { items: Vec<(usize, crate::structural::Structural)> },
@@ -736,6 +794,8 @@ pub enum Msg {
         revert_ops: Vec<(u32, u32, Option<Op>)>,
         #[serde(default)]
         revert_styles: Vec<(u32, u32, Option<crate::style::CellStyle>)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revert_axis_styles: Option<AxisStylePatch>,
         #[serde(default)]
         revert_merge: Option<(u32, u32, u32, u32, bool)>,
     },
@@ -834,6 +894,21 @@ pub const SNAPSHOT_CHUNK_OPS: usize = 2_000;
 pub const STYLE_PALETTE_CHUNK_ITEMS: usize = 4_096;
 /// 名字、文档名等短文本的长度上限（字节）
 pub const MAX_SHORT_TEXT: usize = 256;
+/// 单格批注线程允许的最大条目数（主贴 + 回复）
+pub const MAX_THREAD_ENTRIES: usize = 256;
+/// 单条批注线程正文允许的最大字节数（64 KiB）
+pub const MAX_THREAD_ENTRY_TEXT_BYTES: usize = 64 * 1024;
+/// 单条批注线程 ID / 时间戳允许的最大字节数
+pub const MAX_THREAD_ENTRY_ID_BYTES: usize = 64;
+pub const MAX_THREAD_TIMESTAMP_BYTES: usize = 64;
+
+#[inline]
+pub fn thread_entry_valid(e: &crate::notes::ThreadEntry) -> bool {
+    e.id.len() <= MAX_THREAD_ENTRY_ID_BYTES
+        && e.author.len() <= MAX_SHORT_TEXT
+        && e.timestamp.len() <= MAX_THREAD_TIMESTAMP_BYTES
+        && e.text.len() <= MAX_THREAD_ENTRY_TEXT_BYTES
+}
 
 pub fn cell_style_hash(s: &crate::style::CellStyle) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -981,9 +1056,10 @@ impl Msg {
                     && ts_ok(*resume_watermark)
             }
             Msg::Rename { name, .. } => name.len() <= MAX_SHORT_TEXT,
-            Msg::Welcome { clock, peers, room_id, watermark, .. } => {
+            Msg::Welcome { clock, peers, room_id, watermark, acked_op_ts, .. } => {
                 ts_ok(*clock)
                     && ts_ok(*watermark)
+                    && ts_ok(*acked_op_ts)
                     && room_id.len() <= MAX_SHORT_TEXT
                     && peers.len() <= 1_024
             }
@@ -1055,8 +1131,8 @@ impl Msg {
             Msg::AxisStyleSnapshot { sheet, patch } => {
                 *sheet < MAX_SHEET_INDEX && patch.is_within_limits()
             }
-            Msg::Watermark { seq, structure_revision } => {
-                ts_ok(*seq) && u64::try_from(*structure_revision).is_ok_and(ts_ok)
+            Msg::Watermark { seq, structure_revision, ack_ts, .. } => {
+                ts_ok(*seq) && ts_ok(*ack_ts) && u64::try_from(*structure_revision).is_ok_and(ts_ok)
             }
             Msg::StructuralLog { items } => {
                 items.len() <= MAX_BATCH_ITEMS && items.iter().all(|(s, op)| structural_ok(*s, op))
@@ -1070,7 +1146,16 @@ impl Msg {
             Msg::LockDeny { sheet, row, col, .. } | Msg::LockRelease { sheet, row, col, .. } => {
                 cell_in_bounds(*sheet, *row, *col)
             }
-            Msg::WriteDeny { sheet, row, col, revert_ops, revert_styles, revert_merge, .. } => {
+            Msg::WriteDeny {
+                sheet,
+                row,
+                col,
+                revert_ops,
+                revert_styles,
+                revert_axis_styles,
+                revert_merge,
+                ..
+            } => {
                 cell_in_bounds(*sheet, *row, *col)
                     && revert_ops.len() <= MAX_BATCH_ITEMS
                     && revert_ops.iter().all(|(r, c, op)| {
@@ -1078,6 +1163,7 @@ impl Msg {
                     })
                     && revert_styles.len() <= MAX_BATCH_ITEMS
                     && revert_styles.iter().all(|(r, c, _)| cell_in_bounds(*sheet, *r, *c))
+                    && revert_axis_styles.as_ref().is_none_or(AxisStylePatch::is_within_limits)
                     && revert_merge.is_none_or(|(r1, c1, r2, c2, _)| {
                         cell_in_bounds(*sheet, r1, c1) && cell_in_bounds(*sheet, r2, c2)
                     })
@@ -1504,11 +1590,18 @@ pub fn encode_msg_compact_into(msg: &Msg, out: &mut Vec<u8>) {
         Msg::Watermark {
             seq,
             structure_revision,
+            ack_site,
+            ack_ts,
         } => {
-            out.reserve(17);
+            let has_ack = *ack_site != 0 || *ack_ts != 0;
+            out.reserve(if has_ack { 29 } else { 17 });
             out.push(COMPACT_TAG_WATERMARK);
             out.extend_from_slice(&seq.to_le_bytes());
             out.extend_from_slice(&(*structure_revision as u64).to_le_bytes());
+            if has_ack {
+                out.extend_from_slice(&ack_site.to_le_bytes());
+                out.extend_from_slice(&ack_ts.to_le_bytes());
+            }
         }
         Msg::UpdateSlice {
             from_site,
@@ -1680,9 +1773,20 @@ pub fn decode_msg_compact(bytes: &[u8]) -> Option<Msg> {
         COMPACT_TAG_WATERMARK => {
             let seq = read_u64(&mut cur)?;
             let structure_revision = usize::try_from(read_u64(&mut cur)?).ok()?;
-            cur.is_empty().then_some(Msg::Watermark {
+            let (ack_site, ack_ts) = if cur.is_empty() {
+                (0, 0)
+            } else if cur.len() == 12 {
+                let s = read_u32(&mut cur)?;
+                let t = read_u64(&mut cur)?;
+                (s, t)
+            } else {
+                return None;
+            };
+            Some(Msg::Watermark {
                 seq,
                 structure_revision,
+                ack_site,
+                ack_ts,
             })
         }
         COMPACT_TAG_UPDATE_SLICE => {
@@ -2828,10 +2932,15 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        let wm = Msg::Watermark { seq: 9876, structure_revision: 4 };
+        let wm = Msg::Watermark { seq: 9876, structure_revision: 4, ack_site: 0, ack_ts: 0 };
         assert!(matches!(
             decode_msg_compact(&encode_msg_compact(&wm)),
-            Some(Msg::Watermark { seq: 9876, structure_revision: 4 })
+            Some(Msg::Watermark { seq: 9876, structure_revision: 4, ack_site: 0, ack_ts: 0 })
+        ));
+        let wm_ack = Msg::Watermark { seq: 9877, structure_revision: 4, ack_site: 2, ack_ts: 42 };
+        assert!(matches!(
+            decode_msg_compact(&encode_msg_compact(&wm_ack)),
+            Some(Msg::Watermark { seq: 9877, structure_revision: 4, ack_site: 2, ack_ts: 42 })
         ));
 
         let cur = Msg::CursorMsg(Cursor {
