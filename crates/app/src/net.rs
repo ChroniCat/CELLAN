@@ -144,6 +144,26 @@ pub enum NetEvent {
     },
     /// 协作接力更新中断或校验未通过
     PeerUpdateFailed(String),
+    /// 成员已通过 ECDSA P-256 签名的防篡改审计身份
+    PeerAuditIdentity {
+        site: u32,
+        author: sheetcore::audit::AuditAuthor,
+    },
+    /// 协作者对自己本轮变更摘要发出的独立 ECDSA 联署证明
+    PeerAuditAttest {
+        site: u32,
+        doc_id: String,
+        base_seq: u64,
+        changes_digest: String,
+        pubkey_hex: String,
+        sig_hex: String,
+    },
+    /// 宿主下发最新防篡改审计日志（访客同步查看并刷新本机防回滚水印）
+    AuditSync {
+        doc_id: String,
+        head_seq: u64,
+        payload_b64: String,
+    },
     Disconnected(String),
     Denied(String),
     Error(String),
@@ -1621,6 +1641,9 @@ pub struct Net {
     host_meta_log: Option<Arc<Mutex<Vec<(usize, sheetcore::sync::SheetMetaKind)>>>>,
     host_structs: Option<Arc<Mutex<Vec<(usize, sheetcore::structural::Structural)>>>>,
     host_file_path: Option<Arc<Mutex<Option<std::path::PathBuf>>>>,
+    conn_nonce: Arc<AtomicU64>,
+    host_audit_identities: Option<Arc<Mutex<HashMap<u32, sheetcore::audit::AuditAuthor>>>>,
+    host_audit_sync: Option<Arc<Mutex<Option<(String, u64, String)>>>>,
     staged_save_cursor: Mutex<Option<(u64, u64, usize)>>,
     peer_update_dl: Arc<Mutex<Option<ActivePeerDownload>>>,
     update_seed_override: SharedUpdateSeed,
@@ -3506,6 +3529,87 @@ impl Net {
         }
     }
 
+    /// 宣告并签名本机防篡改审计身份（宿主缓存并广播；访客用本连接随机 nonce 签名证明持有私钥）
+    pub fn announce_audit_identity(
+        &self,
+        display_name: &str,
+        kp: &sheetcore::audit::AuditKeyPair,
+    ) {
+        let author = crate::audit_store::current_author(display_name, kp);
+        let nonce = if self.hosting {
+            0
+        } else {
+            self.conn_nonce.load(Ordering::Acquire)
+        };
+        let Ok(sig_hex) = crate::audit_store::sign_collab_hello(kp, nonce, self.site, &author.display_name) else {
+            return;
+        };
+        if let Some(ids) = &self.host_audit_identities {
+            ids.lock().unwrap().insert(self.site, author.clone());
+        }
+        let msg = Msg::AuditIdentity {
+            site: self.site,
+            name: author.display_name,
+            os_user: author.os_user,
+            machine: author.machine,
+            pubkey_hex: author.pubkey_hex,
+            sig_hex,
+        };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(s));
+        }
+    }
+
+    /// 访客对本轮自己所做变更的摘要进行 ECDSA P-256 联署并发送给宿主
+    pub fn send_audit_attest(
+        &self,
+        doc_id: &str,
+        base_seq: u64,
+        changes_digest: &[u8; 32],
+        kp: &sheetcore::audit::AuditKeyPair,
+    ) {
+        if self.hosting {
+            return;
+        }
+        let Ok(sig_hex) = kp.sign_digest(changes_digest) else {
+            return;
+        };
+        let msg = Msg::AuditAttest {
+            site: self.site,
+            doc_id: doc_id.to_string(),
+            base_seq,
+            changes_digest: sheetcore::audit::hex_encode(changes_digest),
+            pubkey_hex: kp.pubkey_hex.clone(),
+            sig_hex,
+        };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(s));
+        }
+    }
+
+    /// 宿主广播最新防篡改审计日志给全体在线成员（新入房成员亦自动补发）
+    pub fn broadcast_audit_sync(&self, log: &sheetcore::audit::AuditLog) {
+        if !self.hosting {
+            return;
+        }
+        let Ok(payload_b64) = log.encode_base64() else {
+            return;
+        };
+        let doc_id = log.doc_id.clone();
+        let head_seq = log.head_seq();
+        if let Some(slot) = &self.host_audit_sync {
+            *slot.lock().unwrap() = Some((doc_id.clone(), head_seq, payload_b64.clone()));
+        }
+        let msg = Msg::AuditSync {
+            doc_id,
+            head_seq,
+            payload_b64,
+        };
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = self.cmd.send(Cmd::Broadcast(s));
+        }
+    }
+
     /// 在发起后台保存（拍摄 `Workbook` 快照）的同一时刻捕获权威房间水位 `(wm_seq, struct_rev)`，
     /// 杜绝写盘期间新编辑推进水位导致检查点超前；既可传给 `broadcast_saved_with_cursor`，也会自动暂存供同 `clock` 的 `broadcast_saved` 消费。
     #[allow(dead_code)]
@@ -4534,6 +4638,11 @@ fn host_initialized(
     let host_seeder_queue = UpdateSeederQueue::default();
     let host_seeder_for_self = host_seeder_queue.clone();
     let host_file_path: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
+    let host_audit_identities: Arc<Mutex<HashMap<u32, sheetcore::audit::AuditAuthor>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let host_audit_identities_for_self = host_audit_identities.clone();
+    let host_audit_sync: Arc<Mutex<Option<(String, u64, String)>>> = Arc::new(Mutex::new(None));
+    let host_audit_sync_for_self = host_audit_sync.clone();
     let host_site_id = site;
 
     let (ready, initialized) = channel();
@@ -4572,6 +4681,8 @@ fn host_initialized(
         let update_dl_outer = host_update_dl.clone();
         let seed_override_outer = host_seed_override.clone();
         let seeder_queue_outer = host_seeder_queue.clone();
+        let audit_ids_outer = host_audit_identities.clone();
+        let audit_sync_outer = host_audit_sync.clone();
         let now_ms_outer = now_ms;
         std::thread::spawn(move || {
             let room_key = sheetcore::wire::RoomKey::derive(&password, &room_salt);
@@ -4629,6 +4740,8 @@ fn host_initialized(
                 let update_dl = update_dl_outer.clone();
                 let seed_override = seed_override_outer.clone();
                 let seeder_queue = seeder_queue_outer.clone();
+                let audit_ids = audit_ids_outer.clone();
+                let audit_sync = audit_sync_outer.clone();
                 let alive_conn = alive.clone();
                 let now_ms = now_ms_outer;
                 std::thread::spawn(move || {
@@ -5392,6 +5505,40 @@ fn host_initialized(
                                                     serde_json::to_string(&Msg::CursorMsg(cur)).unwrap(),
                                                 ));
                                             }
+                                        }
+                                    }
+                                }
+                                // 补发房间内既有成员的已验证审计身份 + 当前最新防篡改审计日志
+                                {
+                                    let known_ids: Vec<(u32, sheetcore::audit::AuditAuthor)> = audit_ids
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                        .map(|(&s, a)| (s, a.clone()))
+                                        .collect();
+                                    for (psite, au) in known_ids {
+                                        let id_msg = Msg::AuditIdentity {
+                                            site: psite,
+                                            name: au.display_name,
+                                            os_user: au.os_user,
+                                            machine: au.machine,
+                                            pubkey_hex: au.pubkey_hex,
+                                            sig_hex: "0".repeat(128),
+                                        };
+                                        if let Ok(line) = serde_json::to_string(&id_msg) {
+                                            let _ = tx.send(IntroFrame::Line(line));
+                                        }
+                                    }
+                                    if let Some((doc_id, head_seq, payload_b64)) =
+                                        audit_sync.lock().unwrap().clone()
+                                    {
+                                        let sync_msg = Msg::AuditSync {
+                                            doc_id,
+                                            head_seq,
+                                            payload_b64,
+                                        };
+                                        if let Ok(line) = serde_json::to_string(&sync_msg) {
+                                            let _ = tx.send(IntroFrame::Line(line));
                                         }
                                     }
                                 }
@@ -6250,6 +6397,87 @@ fn host_initialized(
                                     }
                                 }
                             }
+                            Msg::AuditIdentity {
+                                site: id_site,
+                                name,
+                                os_user,
+                                machine,
+                                pubkey_hex,
+                                sig_hex,
+                            } => {
+                                let Some(conn_site) = hello_site else { break };
+                                if id_site != conn_site {
+                                    continue;
+                                }
+                                // 宿主严格校验该成员对本连接随机 nonce 的 ECDSA P-256 签名，杜绝伪造公钥身份
+                                if !crate::audit_store::verify_collab_hello(
+                                    nonce,
+                                    conn_site,
+                                    &pubkey_hex,
+                                    &name,
+                                    &sig_hex,
+                                ) {
+                                    continue;
+                                }
+                                let canonical = roster.lock().unwrap().name_of(conn_site);
+                                let author = sheetcore::audit::AuditAuthor {
+                                    display_name: if canonical.is_empty() { name.clone() } else { canonical },
+                                    os_user: os_user.clone(),
+                                    machine: machine.clone(),
+                                    pubkey_hex: pubkey_hex.clone(),
+                                };
+                                audit_ids.lock().unwrap().insert(conn_site, author.clone());
+                                let _ = evt_tx.send(NetEvent::PeerAuditIdentity {
+                                    site: conn_site,
+                                    author: author.clone(),
+                                });
+                                let fwd = serde_json::to_string(&Msg::AuditIdentity {
+                                    site: conn_site,
+                                    name: author.display_name,
+                                    os_user,
+                                    machine,
+                                    pubkey_hex,
+                                    sig_hex,
+                                })
+                                .unwrap();
+                                let others = roster.lock().unwrap().other_senders(Some(conn_site));
+                                broadcast_line_to(&others, fwd);
+                            }
+                            Msg::AuditAttest {
+                                site: att_site,
+                                doc_id,
+                                base_seq,
+                                changes_digest,
+                                pubkey_hex,
+                                sig_hex,
+                            } => {
+                                let Some(conn_site) = hello_site else { break };
+                                if att_site != conn_site {
+                                    continue;
+                                }
+                                // 若已知该站点认证公钥，必须一致；且 ECDSA 签名必须针对 changes_digest 验证通过
+                                let key_ok = audit_ids
+                                    .lock()
+                                    .unwrap()
+                                    .get(&conn_site)
+                                    .is_none_or(|a| a.pubkey_hex.eq_ignore_ascii_case(&pubkey_hex));
+                                let digest_ok = hex::decode(&changes_digest)
+                                    .ok()
+                                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                                    .is_some_and(|d| {
+                                        sheetcore::audit::verify_digest_hex(&pubkey_hex, &d, &sig_hex)
+                                    });
+                                if key_ok && digest_ok {
+                                    let _ = evt_tx.send(NetEvent::PeerAuditAttest {
+                                        site: conn_site,
+                                        doc_id,
+                                        base_seq,
+                                        changes_digest,
+                                        pubkey_hex,
+                                        sig_hex,
+                                    });
+                                }
+                            }
                             Msg::Bye { site } => {
                                 let Some(conn_site) = hello_site else { break };
                                 if site == conn_site {
@@ -6263,6 +6491,7 @@ fn host_initialized(
                     if let Some(site) = hello_site {
                         let remaining = roster.lock().unwrap().remove_member(site);
                         cursors.lock().unwrap().remove(&site);
+                        audit_ids.lock().unwrap().remove(&site);
                         // 人走了，锁必须放掉并通知宿主与其他全部客户端，绝不残留幽灵锁或幽灵光标
                         let mine: Vec<(usize, u32, u32)> = locks
                             .lock()
@@ -6342,6 +6571,9 @@ fn host_initialized(
         local_sort_ranges: Default::default(),
         host_structs: Some(structs_for_self),
         host_file_path: Some(host_file_path),
+        conn_nonce: Arc::new(AtomicU64::new(0)),
+        host_audit_identities: Some(host_audit_identities_for_self),
+        host_audit_sync: Some(host_audit_sync_for_self),
         staged_save_cursor: Mutex::new(None),
         peer_update_dl: host_update_dl_for_self,
         update_seed_override: host_seed_override_for_self,
@@ -6951,6 +7183,8 @@ fn join_session(
     }
 
     // 监督线程：后台并行连接 → 握手 → 读循环 → 断开 → 退避重连
+    let guest_conn_nonce = Arc::new(AtomicU64::new(0));
+    let guest_conn_nonce_for_net = guest_conn_nonce.clone();
     {
         let sockets = sockets.clone();
         let targets = targets.clone();
@@ -6961,6 +7195,7 @@ fn join_session(
         let writer = writer.clone();
         let alive = alive.clone();
         let client_auth = client_auth.clone();
+        let guest_conn_nonce = guest_conn_nonce.clone();
         std::thread::spawn(move || {
             let mut backoff = 1u64;
             let mut synced_once = false;
@@ -7055,6 +7290,7 @@ fn join_session(
                     }
                     match msg {
                         Msg::ChallengeSalt { nonce, salt, room_salt } if recv_sess.is_none() => {
+                            guest_conn_nonce.store(nonce, Ordering::Release);
                             let Some(raw) = sheetcore::wire::b64_decode(&salt).filter(|s| s.len() == 16) else { break };
                             let Some(room_raw) = sheetcore::wire::b64_decode(&room_salt).filter(|s| s.len() == 16) else {
                                 let _ = evt_tx.send(NetEvent::Denied(
@@ -7578,6 +7814,35 @@ fn join_session(
                                 );
                             }
                         }
+                        Msg::AuditIdentity {
+                            site: id_site,
+                            name,
+                            os_user,
+                            machine,
+                            pubkey_hex,
+                            ..
+                        } => {
+                            let _ = evt_tx.send(NetEvent::PeerAuditIdentity {
+                                site: id_site,
+                                author: sheetcore::audit::AuditAuthor {
+                                    display_name: name,
+                                    os_user,
+                                    machine,
+                                    pubkey_hex,
+                                },
+                            });
+                        }
+                        Msg::AuditSync {
+                            doc_id,
+                            head_seq,
+                            payload_b64,
+                        } => {
+                            let _ = evt_tx.send(NetEvent::AuditSync {
+                                doc_id,
+                                head_seq,
+                                payload_b64,
+                            });
+                        }
                         Msg::Bye { site: s } => {
                             let _ = evt_tx.send(NetEvent::PeerLeft(s));
                         }
@@ -7670,6 +7935,9 @@ fn join_session(
         local_sort_ranges: Default::default(),
         host_structs: None,
         host_file_path: None,
+        conn_nonce: guest_conn_nonce_for_net,
+        host_audit_identities: None,
+        host_audit_sync: None,
         staged_save_cursor: Mutex::new(None),
         peer_update_dl: client_update_dl_for_net,
         update_seed_override: client_seed_override_for_net,

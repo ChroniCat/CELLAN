@@ -30,6 +30,8 @@ mod pivot_ui;
 mod chart_ui;
 mod native_print;
 mod print_studio;
+mod audit_store;
+mod audit_ui;
 
 use document_tasks::{CalculatedSnapshot, DocumentTasks};
 use error_opts::ErrorCheckOptions;
@@ -84,6 +86,7 @@ pub(crate) enum NoticeAction {
     ReconnectCollab,
     OpenRecovery,
     RestartForUpdate,
+    OpenAudit,
 }
 
 #[derive(Clone, Debug)]
@@ -2780,10 +2783,24 @@ struct SheetApp {
     /// 修订记录（新的在后）
     rev: Vec<sheetcore::revision::Entry>,
     rev_open: bool,
+    /// 修订与审计窗口页签：0=不可篡改审计记录，1=本次会话修订（可撤回）
+    rev_tab: u8,
     /// 修订记录窗口里的操作结果（撤回成功/失败原因），显示在窗口内
     rev_msg: String,
     rev_filter_who: String,
     rev_filter_kw: String,
+    /// 本机 ECDSA P-256 审计签名密钥（懒加载，私钥由 DPAPI 保护）
+    audit_keypair: Option<sheetcore::audit::AuditKeyPair>,
+    /// 当前活动文档的防篡改审计运行态
+    audit_state: audit_ui::DocAuditState,
+    /// 开启防篡改审计二次确认弹窗
+    audit_enable_confirm: bool,
+    /// 单元格修改溯源（Blame）弹窗目标：(sheet_name, row, col)
+    audit_blame_popup: Option<(String, u32, u32)>,
+    /// 审计面板操作回显消息：(是否成功, 文案)
+    audit_archive_msg: Option<(bool, String)>,
+    /// 当前展开详情的审计提交序号
+    audit_expanded_seq: Option<u64>,
     /// 文件列表（左侧）
     tree_open: bool,
     /// 自截图：SC_SHOT=<png>，抓自己的 framebuffer（RDP 断着也能出图）
@@ -3117,6 +3134,7 @@ struct ParkedDoc {
     cf_stats_gen: u64,
     tasks: DocumentTasks,
     revisions: Vec<sheetcore::revision::Entry>,
+    audit_state: audit_ui::DocAuditState,
     room_password: String,
     auto_share: bool,
     wb_base_hash: String,
@@ -3260,6 +3278,7 @@ enum CtxAct {
     SortCustom,
     FormatCells,
     Hyperlink,
+    CellAuditBlame,
     MergeCells,
     UnmergeCells,
     EditComment,
@@ -3494,6 +3513,8 @@ fn ctx_menu_rows(has_filter: bool) -> Vec<CtxRow> {
         CtxRow::sep(),
         CtxRow::item("设置单元格格式…", Some(crate::ui_icons::Icon::FontColor), "Ctrl+1", CtxAct::FormatCells),
         CtxRow::item("超链接…", Some(crate::ui_icons::Icon::Link), "Ctrl+K", CtxAct::Hyperlink),
+        CtxRow::sep(),
+        CtxRow::item("查看此格修改溯源 (审计)…", Some(crate::ui_icons::Icon::Lock), "", CtxAct::CellAuditBlame),
     ]
 }
 
@@ -4424,9 +4445,16 @@ impl SheetApp {
             fn_wizard: None,
             rev: Vec::new(),
             rev_open: false,
+            rev_tab: 0,
             rev_msg: String::new(),
             rev_filter_who: String::new(),
             rev_filter_kw: String::new(),
+            audit_keypair: None,
+            audit_state: audit_ui::DocAuditState::default(),
+            audit_enable_confirm: false,
+            audit_blame_popup: None,
+            audit_archive_msg: None,
+            audit_expanded_seq: None,
             tree_open: false,
             shot_path: debug_flags::var("SC_SHOT").map(PathBuf::from),
             shot_frames: 0,
@@ -5416,6 +5444,7 @@ impl SheetApp {
                     }
                     self.rev.clear();
                     self.reload_revisions();
+                    self.on_workbook_loaded_audit();
                     // 工作表视图（存在本机，按文件路径分）
                     self.views = ui_prefs::load_views(&self.views_key());
                     self.view_active = None;
@@ -6843,6 +6872,9 @@ impl SheetApp {
                     self.status = "当前工作簿含有宿主无法确认的本地改动，请使用「另存为」保留副本。".into();
                     return;
                 }
+                if self.net.is_some() {
+                    self.guest_send_audit_attest_before_save();
+                }
                 if let Some(net) = self.net.as_ref() {
                     net.request_save();
                     self.tasks.autosave_after_detach = Some(false);
@@ -6861,6 +6893,14 @@ impl SheetApp {
             other_paths.extend(self.wb.path.clone());
         }
         let host = self.save_host();
+        Self::prepare_audit_save_ctx_for(
+            &self.wb,
+            &self.audit_state,
+            &mut self.tasks,
+            self.net.as_ref(),
+            &self.my_name,
+            &mut self.audit_keypair,
+        );
         self.status = Self::start_document_save(
             &mut self.wb, &mut self.tasks, self.load_diag.as_ref(), force_dialog, &other_paths,
             host, self.doc_gen, self.deps_built.then(|| self.deps.clone()),
@@ -7039,8 +7079,19 @@ impl SheetApp {
                         self.recovery_saved_gen.remove(&self.doc_uid);
                         self.close_confirmed_uids.remove(&self.doc_uid);
                     }
+                    let my_pk = self.audit_keypair.as_ref().map(|k| k.pubkey_hex.clone());
+                    let audit_note = Self::on_audit_save_completed_for(
+                        &self.wb,
+                        &mut self.audit_state,
+                        &mut self.tasks,
+                        self.net.as_ref(),
+                        &path,
+                        my_pk.as_deref(),
+                    );
                     if !quiet {
-                        self.status = if self.wb.dirty {
+                        self.status = if let Some(note) = audit_note {
+                            note
+                        } else if self.wb.dirty {
                             "仍有新改动待保存".into()
                         } else {
                             "已保存".into()
@@ -7094,6 +7145,15 @@ impl SheetApp {
                             self.recovery_saved_gen.remove(&doc.doc_uid);
                             self.close_confirmed_uids.remove(&doc.doc_uid);
                         }
+                        let my_pk = self.audit_keypair.as_ref().map(|k| k.pubkey_hex.clone());
+                        let _ = Self::on_audit_save_completed_for(
+                            &doc.wb,
+                            &mut doc.audit_state,
+                            &mut doc.tasks,
+                            doc.net.as_ref(),
+                            &path,
+                            my_pk.as_deref(),
+                        );
                     }
                     Err(error) => {
                         if self.save_all_before_exit || self.pending_tab_closes.contains(&doc.doc_uid) {
@@ -7191,10 +7251,35 @@ impl SheetApp {
             }
             let other_paths = self.other_document_paths(index);
             let host = if active { self.save_host() } else { None };
+            let my_name = self.my_name.clone();
+            let mut kp_cache = self.audit_keypair.clone();
             let (wb, tasks, diagnostic, generation, deps) = match &mut self.tabs[index] {
-                TabSlot::Active => (&mut self.wb, &mut self.tasks, self.load_diag.as_ref(), self.doc_gen, self.deps_built.then(|| self.deps.clone())),
-                TabSlot::Parked(doc) => (&mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref(), doc.doc_gen, doc.deps_built.then(|| doc.deps.clone())),
+                TabSlot::Active => {
+                    Self::prepare_audit_save_ctx_for(
+                        &self.wb,
+                        &self.audit_state,
+                        &mut self.tasks,
+                        self.net.as_ref(),
+                        &my_name,
+                        &mut kp_cache,
+                    );
+                    (&mut self.wb, &mut self.tasks, self.load_diag.as_ref(), self.doc_gen, self.deps_built.then(|| self.deps.clone()))
+                }
+                TabSlot::Parked(doc) => {
+                    Self::prepare_audit_save_ctx_for(
+                        &doc.wb,
+                        &doc.audit_state,
+                        &mut doc.tasks,
+                        doc.net.as_ref(),
+                        &my_name,
+                        &mut kp_cache,
+                    );
+                    (&mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref(), doc.doc_gen, doc.deps_built.then(|| doc.deps.clone()))
+                }
             };
+            if self.audit_keypair.is_none() && kp_cache.is_some() {
+                self.audit_keypair = kp_cache;
+            }
             match Self::start_document_save(wb, tasks, diagnostic, false, &other_paths, host, generation, deps)
             {
                 Ok(_) => {
@@ -7875,6 +7960,11 @@ impl SheetApp {
                     self.notice = None;
                     self.restart_for_update_now(ctx);
                 }
+                NoticeAction::OpenAudit => {
+                    if switch_to_target(self) {
+                        self.open_audit_panel();
+                    }
+                }
             }
         }
     }
@@ -7986,13 +8076,36 @@ impl SheetApp {
             paths.extend(original);
         }
         let host = if idx == self.active_tab { self.save_host() } else { None };
+        let my_name = self.my_name.clone();
+        let mut kp_cache = self.audit_keypair.clone();
         let result = match &mut self.tabs[idx] {
             TabSlot::Active => {
+                Self::prepare_audit_save_ctx_for(
+                    &self.wb,
+                    &self.audit_state,
+                    &mut self.tasks,
+                    self.net.as_ref(),
+                    &my_name,
+                    &mut kp_cache,
+                );
                 Self::start_document_save(&mut self.wb, &mut self.tasks, self.load_diag.as_ref(), choose_path, &paths, host, self.doc_gen, self.deps_built.then(|| self.deps.clone()))
             }
-            TabSlot::Parked(doc) => Self::start_document_save(
-                &mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref(), choose_path, &paths, host, doc.doc_gen, doc.deps_built.then(|| doc.deps.clone())),
+            TabSlot::Parked(doc) => {
+                Self::prepare_audit_save_ctx_for(
+                    &doc.wb,
+                    &doc.audit_state,
+                    &mut doc.tasks,
+                    doc.net.as_ref(),
+                    &my_name,
+                    &mut kp_cache,
+                );
+                Self::start_document_save(
+                    &mut doc.wb, &mut doc.tasks, doc.load_diag.as_ref(), choose_path, &paths, host, doc.doc_gen, doc.deps_built.then(|| doc.deps.clone()))
+            }
         };
+        if self.audit_keypair.is_none() && kp_cache.is_some() {
+            self.audit_keypair = kp_cache;
+        }
         match result {
             Ok(_) => {
                 let tasks = match &mut self.tabs[idx] {
@@ -9312,6 +9425,7 @@ impl SheetApp {
         ops: &[sheetcore::sync::Op],
         befores: Vec<Option<sheetcore::model::Cell>>,
     ) {
+        self.audit_note_remote_ops(ops);
         let Some(path) = self.wb.path.clone() else {
             return;
         };
@@ -9400,6 +9514,7 @@ impl SheetApp {
     }
 
     fn record_revision_sample(&mut self, label: &str, deltas: &[sheetcore::undo::CellDelta], total: usize) {
+        self.audit_note_local_deltas(label, deltas);
         let Some(path) = self.wb.path.clone() else {
             return; // 没保存过的新文件还不知道日志放哪
         };
@@ -31411,6 +31526,7 @@ fn clear_selection(&mut self) {
                                 } else if ui.button("用密码加密…").clicked() {
                                     self.enc_dlg = Some((String::new(), String::new(), String::new()));
                                 }
+                                self.draw_backstage_audit_section(ui, &mut close);
 
                             }
                             1 => {
@@ -31485,10 +31601,22 @@ fn clear_selection(&mut self) {
                             4 => {
                                 ui.label(egui::RichText::new("导出").size(26.0).color(ui_kit::TEXT));
                                 ui.add_space(10.0);
-                                if ui_kit::primary_button(ui, "创建 PDF").clicked() {
-                                    self.export_pdf_dialog();
-                                    close = true;
-                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui_kit::primary_button(ui, "创建 PDF").clicked() {
+                                        self.export_pdf_dialog();
+                                        close = true;
+                                    }
+                                    if ui_kit::secondary_button(ui, "导出对外干净副本 (.xlsx)…").clicked() {
+                                        close = true;
+                                        self.export_clean_copy_dialog();
+                                    }
+                                });
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new("对外干净副本会剥离所有内嵌防篡改审计记录与历史痕迹，适合发给外部客户、甲方或供应商。")
+                                        .size(11.5)
+                                        .weak(),
+                                );
                             }
                             5 => {
                                 ui.label(egui::RichText::new("局域网实时共享").size(26.0).color(ui_kit::TEXT));
@@ -37033,6 +37161,7 @@ impl SheetApp {
         self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
         self.recalc_after_structural(updates);
         self.shift_collab_coordinates(idx, &op);
+        self.audit_note_structural(None, idx, &op);
         self.status = if self.net.is_some() {
             format!("{label}（已提交协作队列）")
         } else {
@@ -37184,13 +37313,13 @@ impl SheetApp {
             })
             .map(|(i, _)| i)
             .collect();
-        ui_kit::window(ctx, "修订记录", 720.0)
+        ui_kit::window(ctx, "修订与防篡改审计记录", 780.0)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -30.0])
-            .default_width(720.0)
-            .min_width(560.0)
+            .default_width(780.0)
+            .min_width(600.0)
             .frame(
                 egui::Frame::window(&ctx.style()).inner_margin(egui::Margin {
                     left: 14,
@@ -37200,7 +37329,34 @@ impl SheetApp {
                 }),
             )
             .show(ctx, |ui| {
-                ui.set_width(700.0);
+                ui.set_width(750.0);
+                // 顶部两页签切换：0=不可篡改审计记录，1=本次会话修订（可撤回）
+                ui.horizontal(|ui| {
+                    let audit_badge = match self.audit_state.verification.as_ref().map(|v| v.severity) {
+                        Some(sheetcore::audit::AuditSeverity::Verified) => "不可篡改审计记录 ✓",
+                        Some(sheetcore::audit::AuditSeverity::Warning) => "不可篡改审计记录 ⚠",
+                        Some(sheetcore::audit::AuditSeverity::Tampered) => "不可篡改审计记录 ✕",
+                        None => "不可篡改审计记录",
+                    };
+                    if ui.selectable_label(self.rev_tab == 0, egui::RichText::new(audit_badge).strong()).clicked() {
+                        self.rev_tab = 0;
+                        self.refresh_audit_verification_now();
+                    }
+                    if ui
+                        .selectable_label(
+                            self.rev_tab == 1,
+                            egui::RichText::new(format!("本次会话修订 ({})", entries.len())),
+                        )
+                        .clicked()
+                    {
+                        self.rev_tab = 1;
+                    }
+                });
+                ui.separator();
+                if self.rev_tab == 0 {
+                    self.draw_audit_tab(ui, &mut jump);
+                    return;
+                }
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!(
@@ -41121,6 +41277,10 @@ impl SheetApp {
             CtxAct::FormatCells => self.open_format_dialog(),
             CtxAct::Hyperlink => {
                 self.open_hyperlink_dialog();
+            }
+            CtxAct::CellAuditBlame => {
+                let sheet_name = self.wb.sheet(self.sheet_idx).name.clone();
+                self.audit_blame_popup = Some((sheet_name, self.sel.0, self.sel.1));
             }
             CtxAct::MergeCells => self.toggle_merge(true),
             CtxAct::UnmergeCells => self.toggle_merge(false),
@@ -48273,6 +48433,16 @@ impl SheetApp {
                 self.fw_blocked_peer = None;
                 self.collab_ui_cache = None;
                 self.peer = Some(peer);
+                if let Ok(kp) = self.ensure_audit_keypair() {
+                    n.announce_audit_identity(&self.my_name, &kp);
+                    self.audit_state.peer_identities.insert(
+                        site,
+                        audit_store::current_author(&self.my_name, &kp),
+                    );
+                }
+                if let Some(log) = self.wb.audit.log.as_ref() {
+                    n.broadcast_audit_sync(log);
+                }
                 self.net = Some(n);
                 self.undo.set_site(site);
                 let ips = session_lock::local_lan_ips();
@@ -50994,6 +51164,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             cf_stats_gen: self.cf_stats_gen,
             tasks: std::mem::take(&mut self.tasks),
             revisions: std::mem::take(&mut self.rev),
+            audit_state: std::mem::take(&mut self.audit_state),
             room_password: std::mem::take(&mut self.room_password),
             auto_share: std::mem::replace(&mut self.auto_share, default_auto_share()),
             wb_base_hash: std::mem::take(&mut self.wb_base_hash),
@@ -51044,6 +51215,9 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.doc_uid = doc.doc_uid;
         self.tasks = doc.tasks;
         self.rev = doc.revisions;
+        self.audit_state = doc.audit_state;
+        self.audit_expanded_seq = None;
+        self.audit_archive_msg = None;
         self.room_password = doc.room_password;
         self.auto_share = doc.auto_share;
         self.wb_base_hash = doc.wb_base_hash;
@@ -51381,6 +51555,9 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.doc_gen = 0;
         self.cf_stats_gen = u64::MAX;
         self.undo = sheetcore::undo::UndoStack::new();
+        self.audit_state = audit_ui::DocAuditState::default();
+        self.audit_expanded_seq = None;
+        self.audit_archive_msg = None;
         self.deps = sheetcore::formula::deps::Deps::empty().into();
         self.deps_built = true;
         self.bg_deps_rx = None;
@@ -51604,6 +51781,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
                         self.recalc_after_structural(updates);
+                        self.audit_note_structural(Some(site), sheet, &op);
                         self.record_remote_note_revision(site, "远端结构改动", sheet, label.clone());
                         let who = self.peer_display_name(site);
                         self.status = if site != 0 {
@@ -51838,7 +52016,16 @@ fn elide(s: &str, max_chars: usize) -> String {
                         .filter(|(s, _, _)| *s != me)
                         .collect();
                     let my_name = self.my_name.clone();
-                    self.peers_list.push((me, my_name, (me % 7) as u8));
+                    self.peers_list.push((me, my_name.clone(), (me % 7) as u8));
+                    if let Ok(kp) = self.ensure_audit_keypair() {
+                        if let Some(net) = self.net.as_ref() {
+                            net.announce_audit_identity(&my_name, &kp);
+                        }
+                        self.audit_state.peer_identities.insert(
+                            me,
+                            audit_store::current_author(&my_name, &kp),
+                        );
+                    }
                     self.status = format!("已加入，在线 {} 人", self.peers_list.len());
                 }
                 net::NetEvent::SnapshotDone => {
@@ -51950,6 +52137,8 @@ fn elide(s: &str, max_chars: usize) -> String {
                     for (sh, r, c) in held {
                         self.locks.release(sh, r, c, site);
                     }
+                    self.audit_state.peer_identities.remove(&site);
+                    self.audit_state.peer_attestations.remove(&site);
                     self.status = format!("成员离开，当前在线 {} 人", self.peers_list.len());
                 }
                 net::NetEvent::Ops(ops) => {
@@ -52129,6 +52318,14 @@ fn elide(s: &str, max_chars: usize) -> String {
                         {
                             let other_paths = self.other_document_paths(self.active_tab);
                             let host = self.save_host();
+                            Self::prepare_audit_save_ctx_for(
+                                &self.wb,
+                                &self.audit_state,
+                                &mut self.tasks,
+                                self.net.as_ref(),
+                                &self.my_name,
+                                &mut self.audit_keypair,
+                            );
                             match Self::start_document_save(
                                 &mut self.wb,
                                 &mut self.tasks,
@@ -52155,6 +52352,55 @@ fn elide(s: &str, max_chars: usize) -> String {
                     }
                 }
                 net::NetEvent::Saved { clock } => self.receive_host_save(clock),
+                net::NetEvent::PeerAuditIdentity { site, author } => {
+                    self.audit_state.peer_identities.insert(site, author);
+                }
+                net::NetEvent::PeerAuditAttest {
+                    site,
+                    doc_id,
+                    base_seq,
+                    changes_digest,
+                    pubkey_hex,
+                    sig_hex,
+                } => {
+                    if self
+                        .wb
+                        .audit
+                        .log
+                        .as_ref()
+                        .is_some_and(|l| l.doc_id == doc_id && l.head_seq() == base_seq)
+                    {
+                        let author = self
+                            .audit_state
+                            .peer_identities
+                            .get(&site)
+                            .cloned()
+                            .unwrap_or_else(|| sheetcore::audit::AuditAuthor {
+                                display_name: self.peer_display_name(site),
+                                os_user: String::new(),
+                                machine: String::new(),
+                                pubkey_hex: pubkey_hex.clone(),
+                            });
+                        self.audit_state.peer_attestations.insert(
+                            site,
+                            sheetcore::audit::PeerAttestationInput {
+                                author,
+                                changes_digest,
+                                sig_hex,
+                                attested_by_peer: true,
+                            },
+                        );
+                    }
+                }
+                net::NetEvent::AuditSync {
+                    doc_id,
+                    head_seq,
+                    payload_b64,
+                } => {
+                    if !doc_id.is_empty() && head_seq > 0 {
+                        self.on_receive_audit_sync(&payload_b64);
+                    }
+                }
                 net::NetEvent::PeerUpdateOffer {
                     peer_site,
                     peer_name,
@@ -53502,6 +53748,7 @@ impl eframe::App for SheetApp {
         self.xlink_dialog(ctx);
         self.fn_wizard_dialog(ctx);
         self.revision_panel(ctx);
+        self.draw_audit_dialogs(ctx);
         self.note_dialog(ctx);
         self.hyperlink_dialog(ctx);
         self.csv_export_dialog(ctx);
@@ -55027,6 +55274,7 @@ impl eframe::App for SheetApp {
                         if sb_resp.on_hover_text("WPS 阅读聚光灯：高亮当前行与当前列").clicked() {
                             self.toggle_spotlight();
                         }
+                        self.draw_audit_status_pill(ui);
                         if !self.wb.links.is_empty() {
                             ui.add_space(8.0);
                             if ui

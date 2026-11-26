@@ -69,6 +69,7 @@ pub mod undo;
 pub mod vba;
 pub mod clipboard_xmlss;
 pub mod revision;
+pub mod audit;
 pub mod xlinks;
 pub mod xls_layout;
 pub mod xls_style;
