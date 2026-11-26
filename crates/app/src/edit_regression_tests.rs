@@ -2697,7 +2697,7 @@ fn cut_from_a_protected_sheet_cannot_be_pasted() {
     second.protection = Some(sheetcore::protection::SheetProtection::default());
     app.wb.sheets.push(second);
     let cells = vec![vec![(Cell { value: sheetcore::model::Value::Number(7.0), formula: None }, 0)]];
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(), sheet: 1, rect: (0, 0, 0, 0), cells, cut: true });
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(), sheet: 1, rect: (0, 0, 0, 0), cells, cut: true });
     app.sheet_idx = 0;
     app.sel = (2, 2);
     let before = snapshot(&app);
@@ -2720,7 +2720,7 @@ fn paste_special_values_transpose_and_operations() {
         vec![(num(1.0), 0), (num(2.0), 0)],
         vec![(num(3.0), 0), (num(4.0), 0)],
     ];
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells,
@@ -2759,7 +2759,7 @@ fn paste_special_formula_shifts_relative_and_keeps_absolute() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     let src = Cell { value: Value::Number(5.0), formula: Some("=A1+$B$1".into()) };
-    let clip = |rect: (u32, u32, u32, u32)| Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    let clip = |rect: (u32, u32, u32, u32)| Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect,
         cells: vec![vec![(src.clone(), 0)]],
@@ -2802,7 +2802,7 @@ fn paste_special_all_carries_font_and_fill_and_undoes_once() {
         ..Default::default()
     });
     let cell = Cell { value: Value::Number(9.0), formula: None };
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(cell, sid as u16)]],
@@ -2834,7 +2834,7 @@ fn paste_special_transpose_keeps_source_coordinates() {
     let mut app = SheetApp::new_with_context(&ctx, None);
     // 源 A1:B1，两个公式分别为 =A1 与 =B1
     let f = |t: &str| (Cell { value: Value::Empty, formula: Some(t.into()) }, 0u16);
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 1),
         cells: vec![vec![f("=A1"), f("=B1")]],
@@ -2876,7 +2876,7 @@ fn paste_special_divide_by_zero_reports_error() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(8.0), formula: None });
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (5, 5, 5, 5),
         cells: vec![vec![(Cell { value: Value::Number(0.0), formula: None }, 0)]],
@@ -4949,7 +4949,7 @@ fn every_write_entry_is_blocked_by_one_remote_lock() {
         let depth = app.undo.depth();
         // 2×2 剪贴板：选择性粘贴的目标区域是锚点 + 剪贴板尺寸，这样才会覆盖被锁的 B2
         let cell = |t: &str| (Cell { value: Value::Text(t.into()), formula: None }, 0u16);
-        let clip = Clip { deferred: None, source_rows: None, merges: Vec::new(),
+        let clip = Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
             sheet: 0,
             rect: (0, 0, 1, 1),
             cells: vec![vec![cell("粘贴"), cell("粘贴")], vec![cell("粘贴"), cell("粘贴")]],
@@ -4984,7 +4984,7 @@ fn paste_cut_replace_and_dv_pick_respect_a_remote_lock() {
 
     // 普通粘贴：2×2 内部剪贴板 → 目标覆盖 B2
     let cell = |t: &str| (Cell { value: Value::Text(t.into()), formula: None }, 0u16);
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells: vec![vec![cell("P"), cell("P")], vec![cell("P"), cell("P")]],
@@ -4995,7 +4995,7 @@ fn paste_cut_replace_and_dv_pick_respect_a_remote_lock() {
     assert!(app.status.contains("戊"), "粘贴应指出锁持有人：{}", app.status);
 
     // 剪切粘贴：源块里就有被锁格
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 1),
         cells: vec![vec![cell("C"), cell("C")], vec![cell("C"), cell("C")]],
@@ -5999,7 +5999,7 @@ fn paste_special_formula_translates_negative_and_positive_offsets() {
     let mut app = SheetApp::new_with_context(&ctx, None);
     let f = |s: &str| Cell { value: Value::Number(3.0), formula: Some(s.into()) };
     app.wb.sheet_mut(0).set(2, 2, f("=A1+$B$1")); // C3
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().into_owned(), 0)]],
@@ -6039,7 +6039,7 @@ fn paste_special_transpose_keeps_original_source_coordinates() {
     let f = |s: &str| Cell { value: Value::Number(1.0), formula: Some(s.into()) };
     app.wb.sheet_mut(0).set(0, 0, f("=A2")); // A1
     app.wb.sheet_mut(0).set(1, 0, f("=A3")); // A2
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 1, 0),
         cells: vec![
@@ -6077,7 +6077,7 @@ fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
     let sid = app.wb.styles.intern(st);
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(7.0), formula: Some("=3+4".into()) });
     app.wb.sheet_mut(0).set_style(0, 0, sid);
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().into_owned(), sid)]],
@@ -6095,7 +6095,7 @@ fn paste_special_all_keeps_format_and_divide_by_zero_is_an_error() {
     // 除以 0：显示 #DIV/0!，不能静默保留原值
     app.wb.sheet_mut(0).set(10, 0, Cell { value: Value::Number(5.0), formula: None });
     app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(0.0), formula: None });
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (0, 0, 0, 0),
         cells: vec![vec![(app.wb.sheet(0).get(0, 0).unwrap().into_owned(), 0)]],
@@ -6265,7 +6265,7 @@ fn paste_special_all_translates_formula_offsets() {
     let sid = app.wb.styles.intern(st);
     app.wb.sheet_mut(0).set(2, 2, Cell { value: Value::Number(3.0), formula: Some("=A1+$B$1".into()) });
     app.wb.sheet_mut(0).set_style(2, 2, sid);
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().into_owned(), sid)]],
@@ -6297,7 +6297,7 @@ fn paste_special_transpose_negative_offset_is_ref_error() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
     app.wb.sheet_mut(0).set(2, 2, Cell { value: Value::Number(1.0), formula: Some("=A1".into()) }); // C3
-    app.clip = Some(Clip { deferred: None, source_rows: None, merges: Vec::new(),
+    app.clip = Some(Clip { deferred: None, source_rows: None, source_cols: None, merges: Vec::new(),
         sheet: 0,
         rect: (2, 2, 2, 2),
         cells: vec![vec![(app.wb.sheet(0).get(2, 2).unwrap().into_owned(), 0)]],
@@ -12408,6 +12408,517 @@ fn v180_d6_format_painter_over_cow_threshold_copies_merges_and_cf_with_undo() {
     assert_eq!(app.wb.sheet(0).cf.blocks.len(), 1, "单步撤销应还原条件格式");
     assert!(!app.wb.styles.get(app.wb.sheet(0).style_of(5000, 0)).bold);
 }
+
+// =========================================================================
+// CELLAN v1.81 (e2ce265 复测) 审阅报告客户端缺陷定向回归测试
+// =========================================================================
+
+/// 审阅项 1：筛选隐藏第 3 行（B3=99）后选中 B2:B4，把 7 选择性粘贴为数值，隐藏行 B3 不得被改写。
+#[test]
+fn v181_item1_paste_special_values_skips_filter_hidden_rows() {
+    let _env = crate::test_env::TestEnv::new("v181-item1-ps-filter");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, number(7.0)); // A1 = 7
+        sh.set(1, 1, number(10.0)); // B2
+        sh.set(2, 1, number(99.0)); // B3 (筛选隐藏)
+        sh.set(3, 1, number(30.0)); // B4
+        sh.set(4, 1, number(888.0)); // B5 (选区外)
+        sh.hidden_rows.insert(2);
+    }
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.clip_copy(false, &ctx);
+
+    app.sel = (1, 1);
+    app.sel_end = (3, 1); // 选中 B2:B4
+    app.ps_kind = 1; // 仅数值
+    app.paste_special_apply_text(&ctx, None);
+
+    let sh = app.wb.sheet(0);
+    assert_eq!(sh.value(1, 1), Value::Number(7.0), "可见格 B2 应为 7");
+    assert_eq!(sh.value(2, 1), Value::Number(99.0), "筛选隐藏格 B3 必须保持原值 99");
+    assert_eq!(sh.value(3, 1), Value::Number(7.0), "可见格 B4 应为 7");
+    assert_eq!(sh.value(4, 1), Value::Number(888.0), "选区外 B5 不得被覆写");
+}
+
+/// 审阅项 2：原地高级筛选只保留 >15 后，SUBTOTAL(9,A2:A3) 必须立即由 30 更新为 20，撤销后回到 30。
+#[test]
+fn v181_item2_in_place_advanced_filter_updates_subtotal_immediately_and_on_undo() {
+    let _env = crate::test_env::TestEnv::new("v181-item2-adv-subtotal");
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, text("金额"));
+        sh.set(1, 0, number(10.0));
+        sh.set(2, 0, number(20.0));
+        sh.set(3, 0, Cell { value: Value::Empty, formula: Some("=SUBTOTAL(9,A2:A3)".into()) });
+        // 条件区域 C1:C2：金额 >15
+        sh.set(0, 2, text("金额"));
+        sh.set(1, 2, text(">15"));
+    }
+    app.recalc_all_and_deps_adaptive();
+    assert_eq!(app.wb.sheet(0).value(3, 0), Value::Number(30.0), "筛选前合计应为 30");
+
+    let dlg = AdvFilterDlg {
+        list_range: "A1:A3".into(),
+        criteria_range: "C1:C2".into(),
+        copy_to: String::new(),
+        in_place: true,
+        unique_only: false,
+        msg: String::new(),
+    };
+    app.apply_adv_filter_dlg(&dlg).expect("in-place advanced filter");
+    assert!(app.wb.sheet(0).hidden_rows.contains(&1), "第 2 行 (10) 应被筛掉");
+    assert_eq!(
+        app.wb.sheet(0).value(3, 0),
+        Value::Number(20.0),
+        "原地高级筛选后 SUBTOTAL 必须立即更新为 20，无需手动强制重算"
+    );
+
+    // 撤销原地高级筛选后，SUBTOTAL 应立即恢复为 30
+    app.do_undo(false);
+    assert!(!app.wb.sheet(0).hidden_rows.contains(&1));
+    assert_eq!(
+        app.wb.sheet(0).value(3, 0),
+        Value::Number(30.0),
+        "撤销高级筛选后 SUBTOTAL 应恢复为 30"
+    );
+}
+
+/// 审阅项 4：Ctrl+Enter 批量写入含互相依赖的公式（B1=9, B2:B3 规则 1-10 Stop, 输入 =B1+1）必须被拒绝。
+#[test]
+fn v181_item4_ctrl_enter_stop_dv_validates_interdependent_batch_formulas() {
+    let _env = crate::test_env::TestEnv::new("v181-item4-ctrl-enter-chain-dv");
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 1, number(9.0)); // B1 = 9
+        sh.dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(1, 1, 2, 1)], // B2:B3
+            kind: sheetcore::dv::DvKind::Whole,
+            op: sheetcore::dv::DvOp::Between,
+            f1: "1".into(),
+            f2: "10".into(),
+            allow_blank: true,
+            show_error: true,
+            error_style: sheetcore::dv::DvStyle::Stop,
+            error_title: "超出范围".into(),
+            error_msg: "仅允许 1-10".into(),
+            ..Default::default()
+        });
+    }
+    app.sel = (1, 1);
+    app.sel_end = (2, 1); // 选中 B2:B3
+    app.editing = Some(EditState::new("=B1+1".into()));
+
+    let committed = app.commit_edit_fill_selection();
+    assert!(!committed, "批量提交后 B2=10、B3=11 违反 Stop 验证，整批必须拒绝");
+    assert!(app.wb.sheet(0).get(1, 1).is_none(), "拒绝后 B2 不得写入 10");
+    assert!(app.wb.sheet(0).get(2, 1).is_none(), "拒绝后 B3 不得写入 11");
+    assert!(app.editing.is_some(), "Stop 拒绝后应保持编辑态");
+}
+
+/// 审阅项 5a：Ctrl 不连续选中 A1 与 C1（C1 为 =C2），复制到 E1 粘贴后 F1 应为 =F2（而非 =G2）。
+#[test]
+fn v181_item5a_noncontiguous_multicol_copy_paste_shifts_formula_col_accurately() {
+    let _env = crate::test_env::TestEnv::new("v181-item5a-noncontig-paste");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, number(100.0)); // A1 = 100
+        sh.set(1, 2, number(222.0)); // C2 = 222
+        sh.set(0, 2, Cell { value: Value::Number(222.0), formula: Some("=C2".into()) }); // C1 = =C2
+        sh.set(1, 5, number(666.0)); // F2 = 666
+        sh.set(1, 6, number(777.0)); // G2 = 777
+    }
+    // 模拟 Ctrl 不连续选中 A1 与 C1
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.extra_sel = vec![(0, 2, 0, 2)];
+    app.clip_copy(false, &ctx);
+
+    // 普通粘贴至 E1
+    app.extra_sel.clear();
+    app.sel = (0, 4);
+    app.sel_end = (0, 4);
+    app.clip_paste(false, None);
+
+    assert_eq!(app.wb.sheet(0).value(0, 4), Value::Number(100.0), "E1 应为 100");
+    assert_eq!(
+        app.wb.sheet(0).get(0, 5).and_then(|c| c.formula.clone()).as_deref(),
+        Some("=F2"),
+        "F1 公式应由 C1(=C2) 平移 +3 列为 =F2，而非误移为 =G2"
+    );
+    assert_eq!(app.wb.sheet(0).value(0, 5), Value::Number(666.0));
+
+    // 选择性粘贴公式至 E3 也应遵循实际源列坐标
+    app.sel = (2, 4);
+    app.sel_end = (2, 4);
+    app.ps_kind = 2; // 仅公式
+    app.paste_special_apply_text(&ctx, None);
+    assert_eq!(
+        app.wb.sheet(0).get(2, 5).and_then(|c| c.formula.clone()).as_deref(),
+        Some("=F4"),
+        "选择性粘贴公式也应按源列偏移为 =F4"
+    );
+}
+
+/// 审阅项 5b：筛选隐藏第 6 行后，从右向左框选 C5:B7 粘贴公式，B5 必须按列偏移为 =B12 而非 =C12。
+#[test]
+fn v181_item5b_filtered_reverse_selection_formula_paste_shifts_column_accurately() {
+    let _env = crate::test_env::TestEnv::new("v181-item5b-reverse-filter-paste");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        // 源块 B1:C2：B1==B8, C1==C8, B2==B9, C2==C9
+        sh.set(0, 1, Cell { value: Value::Empty, formula: Some("=B8".into()) });
+        sh.set(0, 2, Cell { value: Value::Empty, formula: Some("=C8".into()) });
+        sh.set(1, 1, Cell { value: Value::Empty, formula: Some("=B9".into()) });
+        sh.set(1, 2, Cell { value: Value::Empty, formula: Some("=C9".into()) });
+        // 目标公式引用的数据：B12=900, C12=6, B14=901, C14=7
+        sh.set(11, 1, number(900.0)); // B12
+        sh.set(11, 2, number(6.0));   // C12
+        sh.set(13, 1, number(901.0)); // B14
+        sh.set(13, 2, number(7.0));   // C14
+        // 筛掉第 6 行 (0-based row 5)
+        sh.hidden_rows.insert(5);
+    }
+    app.sel = (0, 1);
+    app.sel_end = (1, 2); // 复制 B1:C2
+    app.clip_copy(false, &ctx);
+
+    // 从右向左框选 C5:B7（sel=(4,2), sel_end=(6,1)），可见行共 2 行：row 4 (第5行) 与 row 6 (第7行)
+    app.sel = (4, 2);
+    app.sel_end = (6, 1);
+    app.clip_paste(false, None);
+
+    let sh = app.wb.sheet(0);
+    assert_eq!(
+        sh.get(4, 1).and_then(|c| c.formula.clone()).as_deref(),
+        Some("=B12"),
+        "反向框选 C5:B7 粘贴后 B5 公式应为 =B12（而非 =C12）"
+    );
+    assert_eq!(sh.value(4, 1), Value::Number(900.0), "B5 金额应为 900 而非 6");
+    assert_eq!(sh.get(4, 2).and_then(|c| c.formula.clone()).as_deref(), Some("=C12"));
+    assert_eq!(sh.get(6, 1).and_then(|c| c.formula.clone()).as_deref(), Some("=B14"));
+    assert_eq!(sh.get(6, 2).and_then(|c| c.formula.clone()).as_deref(), Some("=C14"));
+    assert!(sh.get(5, 1).is_none() && sh.get(5, 2).is_none(), "隐藏第 6 行不得被写入");
+}
+
+/// 审阅项 6：工作簿已有全局常量 Rate_Month=0.05 时，在名称框输入 Rate_Month 不得再建同名区域覆盖常量。
+#[test]
+fn v181_item6_name_box_does_not_shadow_existing_global_constant() {
+    let _env = crate::test_env::TestEnv::new("v181-item6-namebox-const");
+    let mut app = app();
+    app.wb.names.push(("Rate_Month".into(), None, "0.05".into()));
+    app.wb.sheet_mut(0).set(0, 0, number(999.0)); // A1 = 999
+    app.wb.sheet_mut(0).set(
+        0,
+        1,
+        Cell { value: Value::Empty, formula: Some("=Rate_Month".into()) },
+    );
+    app.recalc_all_and_deps_adaptive();
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(0.05));
+
+    // 光标在 A1，于名称框输入已有常量名 Rate_Month
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.name_buf = "Rate_Month".into();
+    app.goto_name();
+
+    assert_eq!(app.wb.names.len(), 1, "绝不能在同作用域追加第二个同名全局定义");
+    assert_eq!(app.wb.names[0].2, "0.05", "原有常量定义不得被改写");
+    app.recalc_all_and_deps_adaptive();
+    assert_eq!(
+        app.wb.sheet(0).value(0, 1),
+        Value::Number(0.05),
+        "引用 Rate_Month 的公式仍必须读取常量 0.05 而非 A1 的 999"
+    );
+}
+
+/// 审阅项 13：选择性粘贴数据验证时，严格“停止”规则不得与已有的 show_error=false 规则错误合并而被削弱。
+#[test]
+fn v181_item13_paste_special_dv_does_not_merge_into_show_error_false_rule() {
+    let _env = crate::test_env::TestEnv::new("v181-item13-dv-merge");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        // A1 已有相同数值范围 (1-10) 但关闭错误提示 (show_error=false) 的规则
+        sh.dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(0, 0, 0, 0)],
+            kind: sheetcore::dv::DvKind::Whole,
+            op: sheetcore::dv::DvOp::Between,
+            f1: "1".into(),
+            f2: "10".into(),
+            allow_blank: true,
+            show_error: false,
+            error_style: sheetcore::dv::DvStyle::Stop,
+            ..Default::default()
+        });
+        // B1 为严格 Stop 规则 (show_error=true, 1-10)
+        sh.dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(0, 1, 0, 1)],
+            kind: sheetcore::dv::DvKind::Whole,
+            op: sheetcore::dv::DvOp::Between,
+            f1: "1".into(),
+            f2: "10".into(),
+            allow_blank: true,
+            show_error: true,
+            error_style: sheetcore::dv::DvStyle::Stop,
+            ..Default::default()
+        });
+    }
+    // 复制 B1，选择性粘贴「数据验证」到 C1
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+    app.clip_copy(false, &ctx);
+
+    app.sel = (0, 2);
+    app.sel_end = (0, 2);
+    app.ps_kind = 9; // 仅数据验证
+    app.paste_special_apply_text(&ctx, None);
+
+    let c1_dv = sheetcore::dv::find(&app.wb.sheet(0).dv, 0, 2).expect("C1 应有数据验证规则");
+    assert!(
+        c1_dv.show_error,
+        "粘贴到 C1 的严格规则必须保持 show_error=true，绝不能并入 A1 的 show_error=false 规则"
+    );
+
+    // 实测向 C1 输入 100 必须被 Stop 验证拦截
+    app.sel = (0, 2);
+    app.sel_end = (0, 2);
+    app.editing = Some(EditState::new("100".into()));
+    assert!(!app.commit_edit(None), "C1 规则为 1-10 Stop，输入 100 必须被拒绝");
+    assert!(app.wb.sheet(0).get(0, 2).is_none(), "被拒绝后 C1 不得写入 100");
+}
+
+/// 审阅项 14：格式刷复制条件格式时必须按源/目标偏移平移相对引用（A1>0 刷到 B1 应变为 B1>0）。
+#[test]
+fn v181_item14_format_painter_translates_relative_cf_references() {
+    let _env = crate::test_env::TestEnv::new("v181-item14-painter-cf-shift");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, number(5.0));
+        sh.set(0, 1, number(-3.0));
+        sh.cf.dxfs.push(sheetcore::cf::Dxf {
+            fill: Some([255, 200, 200]),
+            ..Default::default()
+        });
+        sh.cf.blocks.push(sheetcore::cf::CfBlock {
+            ranges: vec![(0, 0, 0, 0)], // A1
+            rules: vec![sheetcore::cf::CfRule {
+                priority: 1,
+                stop: false,
+                kind: sheetcore::cf::CfKind::Expr {
+                    formula: "A1>0".into(),
+                    dxf: 0,
+                },
+            }],
+        });
+    }
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.painter_double = false;
+    app.ribbon_action("FormatPainter", &ctx);
+
+    app.sel = (0, 1);
+    app.sel_end = (0, 1); // 刷到 B1
+    app.apply_format_painter();
+
+    let blocks = &app.wb.sheet(0).cf.blocks;
+    let b1_blk = blocks
+        .iter()
+        .find(|b| b.ranges.contains(&(0, 1, 0, 1)))
+        .expect("B1 应收到条件格式块");
+    match &b1_blk.rules[0].kind {
+        sheetcore::cf::CfKind::Expr { formula, .. } => {
+            assert_eq!(formula, "B1>0", "将 A1 的 A1>0 刷到 B1 后公式应平移为 B1>0");
+        }
+        other => panic!("预期 Expr 规则，实际 {other:?}"),
+    }
+}
+
+/// 审阅项 15a：协作访客一次设置 100,001 行行高超协议上限时，必须在本地改写前拒绝，不产生本地与宿主分歧。
+#[test]
+fn v181_item15a_collab_guest_rejects_over_100k_row_heights_before_mutating() {
+    let env = crate::test_env::TestEnv::new("v181-item15a-row-height-limit");
+    let path = env.path("limit.xlsx");
+    let mut base = Workbook::new_blank();
+    base.sheets[0].set(0, 0, text("A"));
+    sheetcore::xlsx::save_atomic(&path, &base).unwrap();
+
+    let (host_net, port) = crate::net::host_for_test(1, "Host", "limit.xlsx", "pw");
+    let mut host = app();
+    host.wb = sheetcore::xlsx::load(&path).unwrap();
+    let mut host_peer = sheetcore::sync::Peer::new(1);
+    host_peer.seed_workbook(&host.wb);
+    host_net.seed_snapshot(
+        &host_peer,
+        &host.wb,
+        sheetcore::sync::Cursor {
+            site: 1,
+            name: "Host".into(),
+            color: 1,
+            sheet: 0,
+            row: 0,
+            col: 0,
+            end_row: None,
+            end_col: None,
+        },
+    );
+    host.net = Some(host_net);
+    host.peer = Some(host_peer);
+    host.joined_doc = true;
+
+    let guest_net = crate::net::join(
+        2,
+        "Guest".into(),
+        "limit.xlsx".into(),
+        &format!("127.0.0.1:{port}"),
+        "pw".into(),
+    )
+    .unwrap();
+    let mut guest = app();
+    guest.wb = sheetcore::xlsx::load(&path).unwrap();
+    guest.shared_client_source = Some((guest.doc_uid, path.clone()));
+    guest.net = Some(guest_net);
+    guest.peer = Some(sheetcore::sync::Peer::new(2));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !guest.joined_doc && std::time::Instant::now() < deadline {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(guest.joined_doc);
+
+    let orig_h = guest.wb.sheet(0).rows.size(0);
+    let too_many: Vec<(u32, f32)> = (0..100_001u32).map(|r| (r, 42.0)).collect();
+    guest.apply_row_heights_undoable(too_many, "批量调行高".into());
+
+    assert_eq!(
+        guest.wb.sheet(0).rows.size(0),
+        orig_h,
+        "超 100,000 行的行高修改必须在改写本地工作表前直接拒绝"
+    );
+    assert!(!guest.wb.sheet(0).layout_dirty, "被拒绝的操作不得标脏或假标已同步");
+    assert!(
+        guest.status.contains("100,000"),
+        "状态栏应提示单次上限：{}",
+        guest.status
+    );
+}
+
+/// 审阅项 15b：宿主后台保存期间访客再次调列宽，旧保存回执不能提前清掉访客的新列宽脏标。
+#[test]
+fn v181_item15b_collab_stale_save_receipt_does_not_ack_newer_guest_col_width() {
+    let env = crate::test_env::TestEnv::new("v181-item15b-save-wm-race");
+    let path = env.path("wm_race.xlsx");
+    let mut base = Workbook::new_blank();
+    base.sheets[0].set(0, 0, text("列宽竞态"));
+    sheetcore::xlsx::save_atomic(&path, &base).unwrap();
+
+    let (host_net, port) = crate::net::host_for_test(1, "Host", "wm_race.xlsx", "pw");
+    let mut host = app();
+    host.wb = sheetcore::xlsx::load(&path).unwrap();
+    let mut host_peer = sheetcore::sync::Peer::new(1);
+    host_peer.seed_workbook(&host.wb);
+    host_net.seed_snapshot(
+        &host_peer,
+        &host.wb,
+        sheetcore::sync::Cursor {
+            site: 1,
+            name: "Host".into(),
+            color: 1,
+            sheet: 0,
+            row: 0,
+            col: 0,
+            end_row: None,
+            end_col: None,
+        },
+    );
+    host.net = Some(host_net);
+    host.peer = Some(host_peer);
+    host.joined_doc = true;
+
+    let guest_net = crate::net::join(
+        2,
+        "Guest".into(),
+        "wm_race.xlsx".into(),
+        &format!("127.0.0.1:{port}"),
+        "pw".into(),
+    )
+    .unwrap();
+    let mut guest = app();
+    guest.wb = sheetcore::xlsx::load(&path).unwrap();
+    guest.shared_client_source = Some((guest.doc_uid, path.clone()));
+    guest.net = Some(guest_net);
+    guest.peer = Some(sheetcore::sync::Peer::new(2));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !guest.joined_doc && std::time::Instant::now() < deadline {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(guest.is_delegated_collab_client());
+
+    // 模拟宿主在 T0 拍下保存快照：记录当时的 cell clock 与房间 watermark_seq
+    let t0_clock = host.peer.as_ref().unwrap().clock;
+    let t0_wm = host.net.as_ref().unwrap().note_save_snapshot(t0_clock);
+
+    // T1：在宿主 T0 保存尚未完成期间，访客调整了 A 列宽到 210
+    guest.apply_col_widths_undoable(vec![(0, 210.0)], "调整 A 列宽".into());
+    assert!(guest.wb.dirty && guest.wb.sheet(0).layout_dirty);
+
+    // 等待宿主收到访客的列宽广播（推进房间 watermark_seq）
+    let sync_dl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while (host.wb.sheet(0).cols.size(0) - 210.0).abs() > 1.0 && std::time::Instant::now() < sync_dl
+    {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!((host.wb.sheet(0).cols.size(0) - 210.0).abs() < 1.0, "宿主应收到访客列宽");
+
+    // T2：宿主 T0 的旧保存完成并广播旧回执 (t0_clock, t0_wm)
+    host.net.as_ref().unwrap().broadcast_saved_with_cursor(t0_clock, t0_wm);
+    let stale_dl = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    while std::time::Instant::now() < stale_dl {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        guest.wb.dirty && guest.wb.sheet(0).layout_dirty,
+        "T0 旧保存回执不含 T1 的列宽修改，绝不能提前把访客标成已保存！"
+    );
+
+    // T3：宿主真正把包含新列宽的工作簿落盘并广播新回执后，访客才应清脏标
+    host.save(false);
+    let save_dl = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while guest.wb.dirty && std::time::Instant::now() < save_dl {
+        host.poll_net();
+        host.poll_save();
+        guest.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!guest.wb.dirty, "包含新列宽的正式保存回执到达后访客应清脏标");
+    let reopened = sheetcore::xlsx::load(&path).unwrap();
+    assert!(
+        (reopened.sheets[0].cols.size(0) - 210.0).abs() < 2.0,
+        "最终落盘文件应包含 210 列宽"
+    );
+}
+
 
 
 

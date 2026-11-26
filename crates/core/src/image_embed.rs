@@ -32,6 +32,44 @@ pub fn make(name: &str, ext: &str, bytes: &[u8]) -> Option<PdfImage> {
     }
 }
 
+/// 按归一化裁剪比例 `[left, top, right, bottom]` 裁剪 RGB8 像素数据，物理移除被裁掉的像素。
+pub fn crop_rgb8(w: u32, h: u32, rgb: &[u8], crop: [f32; 4]) -> (u32, u32, Vec<u8>) {
+    if w == 0 || h == 0 || rgb.len() < (w as usize) * (h as usize) * 3 {
+        return (w, h, rgb.to_vec());
+    }
+    let u0 = crop[0].clamp(0.0, 0.9);
+    let v0 = crop[1].clamp(0.0, 0.9);
+    let u1 = (1.0 - crop[2]).clamp((u0 + 0.02).min(1.0), 1.0);
+    let v1 = (1.0 - crop[3]).clamp((v0 + 0.02).min(1.0), 1.0);
+    let x0 = ((u0 * w as f32).round() as u32).min(w.saturating_sub(1));
+    let x1 = ((u1 * w as f32).round() as u32).clamp(x0 + 1, w);
+    let y0 = ((v0 * h as f32).round() as u32).min(h.saturating_sub(1));
+    let y1 = ((v1 * h as f32).round() as u32).clamp(y0 + 1, h);
+    let cw = x1 - x0;
+    let ch = y1 - y0;
+    let mut out = Vec::with_capacity((cw as usize) * (ch as usize) * 3);
+    let stride = w as usize * 3;
+    let row_start = x0 as usize * 3;
+    let row_end = x1 as usize * 3;
+    for y in y0..y1 {
+        let base = y as usize * stride;
+        out.extend_from_slice(&rgb[base + row_start..base + row_end]);
+    }
+    (cw, ch, out)
+}
+
+/// 生成供 PDF 嵌入的图像对象；若带裁剪且格式可像素解码（PNG/BMP/GIF），直接物理裁掉被裁区域并返回 `baked_crop = true`。
+/// 对 JPEG 直通流返回 `baked_crop = false`，由 PDF 裁剪路径 + 变换矩阵在渲染层精确裁切。
+pub fn make_with_crop(name: &str, ext: &str, bytes: &[u8], crop: [f32; 4]) -> Option<(PdfImage, bool)> {
+    if crop.iter().any(|&v| v > 1e-4)
+        && let Some((w, h, rgb)) = decode_rgb8(ext, bytes)
+    {
+        let (cw, ch, cropped) = crop_rgb8(w, h, &rgb, crop);
+        return pack_rgb(name, cw, ch, &cropped).map(|img| (img, true));
+    }
+    make(name, ext, bytes).map(|img| (img, false))
+}
+
 /// 将任意常见图片解码为 RGB8（`w * h * 3`）供原生打印或软件渲染复用
 pub fn decode_rgb8(ext: &str, bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if bytes.len() >= 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" {

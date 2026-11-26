@@ -598,10 +598,44 @@ mod win_gdi {
                 DeleteObject(br);
             }
 
-            // 4. 嵌入图片（PNG 全色型/JPEG/BMP/GIF → 32 位 BGRA DIB → HALFTONE StretchDIBits）
+            // 4. 嵌入图片（PNG 全色型/JPEG/BMP/GIF → 裁剪/旋转 → 32 位 BGRA DIB → HALFTONE StretchDIBits）
             SetStretchBltMode(hdc, HALFTONE);
-            for (x, y, w, h, _name, bytes, _ext) in &out.images {
-                if let Ok(img) = image::load_from_memory(bytes) {
+            for (idx, (x, y, w, h, _name, bytes, _ext)) in out.images.iter().enumerate() {
+                let (crop, rot_deg) = out
+                    .image_transforms
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(([0.0; 4], 0.0));
+                if let Ok(mut img) = image::load_from_memory(bytes) {
+                    if crop.iter().any(|&v| v > 1e-4) {
+                        let (ow, oh) = (img.width(), img.height());
+                        if ow > 0 && oh > 0 {
+                            let u0 = crop[0].clamp(0.0, 0.9);
+                            let v0 = crop[1].clamp(0.0, 0.9);
+                            let u1 = (1.0 - crop[2]).clamp((u0 + 0.02).min(1.0), 1.0);
+                            let v1 = (1.0 - crop[3]).clamp((v0 + 0.02).min(1.0), 1.0);
+                            let x0 = ((u0 * ow as f32).round() as u32).min(ow.saturating_sub(1));
+                            let x1 = ((u1 * ow as f32).round() as u32).clamp(x0 + 1, ow);
+                            let y0 = ((v0 * oh as f32).round() as u32).min(oh.saturating_sub(1));
+                            let y1 = ((v1 * oh as f32).round() as u32).clamp(y0 + 1, oh);
+                            img = img.crop_imm(x0, y0, x1 - x0, y1 - y0);
+                        }
+                    }
+                    let rot = rot_deg.rem_euclid(360.0);
+                    let mut rot_quarter = ((rot / 90.0).round() as i32).rem_euclid(4);
+                    let near_ortho = (rot - (rot_quarter as f32 * 90.0)).abs() <= 0.5
+                        || (360.0 - rot).abs() <= 0.5;
+                    if (360.0 - rot).abs() <= 0.5 {
+                        rot_quarter = 0;
+                    }
+                    if near_ortho {
+                        img = match rot_quarter {
+                            1 => img.rotate90(),
+                            2 => img.rotate180(),
+                            3 => img.rotate270(),
+                            _ => img,
+                        };
+                    }
                     let rgba = img.to_rgba8();
                     let (iw, ih) = rgba.dimensions();
                     if iw == 0 || ih == 0 {
@@ -635,10 +669,17 @@ mod win_gdi {
                         },
                         bmi_colors: [0],
                     };
-                    let dx = to_x(*x);
-                    let dy = to_y(*y + *h);
-                    let dw = (to_x(*x + *w) - dx).max(1);
-                    let dh = (to_y(*y) - dy).max(1);
+                    let (rx, ry, rw, rh) = if near_ortho && (rot_quarter == 1 || rot_quarter == 3) {
+                        let cx = *x + *w * 0.5;
+                        let cy = *y + *h * 0.5;
+                        (cx - *h * 0.5, cy - *w * 0.5, *h, *w)
+                    } else {
+                        (*x, *y, *w, *h)
+                    };
+                    let dx = to_x(rx);
+                    let dy = to_y(ry + rh);
+                    let dw = (to_x(rx + rw) - dx).max(1);
+                    let dh = (to_y(ry) - dy).max(1);
                     StretchDIBits(
                         hdc,
                         dx,

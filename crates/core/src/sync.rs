@@ -725,7 +725,14 @@ pub enum Msg {
     /// 协作者请求宿主将权威合并状态及时写回共享原文件（避免多机同时写同一 SMB 文件冲突）
     SaveReq { site: u32 },
     /// 宿主已将权威状态保存到共享原文件，通知全员清除未保存标记
-    Saved { site: u32, #[serde(default)] clock: u64 },
+    Saved {
+        site: u32,
+        #[serde(default)]
+        clock: u64,
+        /// 本次保存快照覆盖的宿主权威房间水位（含列宽/行高/样式/合并等非单元格元数据）；`None` 兼容旧版宿主。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        watermark_seq: Option<u64>,
+    },
     /// 协作成员宣告自己持有经过官方公钥签名的新版可执行文件（供房间内旧版成员无感接力更新）
     UpdateAnnounce {
         site: u32,
@@ -1030,7 +1037,9 @@ impl Msg {
                         cell_in_bounds(*sheet, r1, c1) && cell_in_bounds(*sheet, r2, c2)
                     })
             }
-            Msg::Saved { clock, .. } => ts_ok(*clock),
+            Msg::Saved { clock, watermark_seq, .. } => {
+                ts_ok(*clock) && watermark_seq.is_none_or(ts_ok)
+            }
             Msg::UpdateAnnounce {
                 version,
                 size,

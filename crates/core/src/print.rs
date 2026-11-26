@@ -681,6 +681,8 @@ pub struct Out {
     pub texts: Vec<TextOp>,
     /// 图片：(x, y, w, h, 名字, 原始字节, 扩展名)
     pub images: Vec<(f32, f32, f32, f32, String, Vec<u8>, String)>,
+    /// 与 `images` 一一对应的裁剪比例 `[l, t, r, b]` 与顺时针旋转角度（度）
+    pub image_transforms: Vec<([f32; 4], f32)>,
     /// 填充多边形（饼图扇区、面积图、填充雷达、条件格式图标形状）
     pub polys: Vec<(Vec<(f32, f32)>, [u8; 3])>,
     /// 描边折线（折线图、散点连线、迷你图折线）
@@ -1969,7 +1971,37 @@ fn draw_chart(
         .enumerate()
         .filter(|(_, s)| !s.hidden)
         .collect();
+    let n = vis_series.iter().map(|(_, s)| s.vals.len()).max().unwrap_or(0);
+    let is_horizontal = ch.kind.is_horizontal();
+    let is_percent_stacked = ch.kind.is_percent_stacked();
+    let is_stacked = ch.kind.is_stacked();
     let max_of = |secondary: bool| {
+        if !secondary && is_percent_stacked {
+            return 1.0;
+        }
+        if is_stacked {
+            let mut max_sum = 0.0f64;
+            for i in 0..n {
+                let mut pos_sum = 0.0f64;
+                for &(_, s) in &vis_series {
+                    if s.secondary != secondary {
+                        continue;
+                    }
+                    let sk = series_kind(s, ch.kind);
+                    if sk.is_stacked()
+                        && let Some(&v) = s.vals.get(i)
+                        && v.is_finite()
+                        && v > 0.0
+                    {
+                        pos_sum += v;
+                    }
+                }
+                max_sum = max_sum.max(pos_sum);
+            }
+            if max_sum > 0.0 {
+                return max_sum;
+            }
+        }
         vis_series
             .iter()
             .filter(|(_, s)| s.secondary == secondary)
@@ -1978,11 +2010,44 @@ fn draw_chart(
             .fold(0.0f64, f64::max)
             .max(1e-9)
     };
-    let max_main = nice_max(max_of(false));
+    let max_main = if is_percent_stacked {
+        1.0
+    } else {
+        nice_max(max_of(false))
+    };
     let max_sub = nice_max(max_of(true));
-    let has_sub = vis_series.iter().any(|(_, s)| s.secondary);
-    let n = vis_series.iter().map(|(_, s)| s.vals.len()).max().unwrap_or(0);
-    let y_fmt = ch.effective_y_axis().num_fmt;
+    let has_sub = !is_horizontal && vis_series.iter().any(|(_, s)| s.secondary);
+    let y_fmt = if ch.effective_y_axis().num_fmt.is_empty() && is_percent_stacked {
+        "0%".to_string()
+    } else {
+        ch.effective_y_axis().num_fmt
+    };
+    // 散点图 / 气泡图全局共享横轴范围，避免多系列各自归一化导致 X 坐标错位
+    let scatter_x_bounds: Option<(f64, f64)> = {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &(_, se) in &vis_series {
+            if matches!(series_kind(se, ch.kind), ChartKind::Scatter | ChartKind::Bubble)
+                && se.xv.len() == se.vals.len()
+                && !se.xv.is_empty()
+            {
+                for &xv in &se.xv {
+                    if xv.is_finite() {
+                        lo = lo.min(xv);
+                        hi = hi.max(xv);
+                    }
+                }
+            }
+        }
+        if lo.is_finite() && hi.is_finite() {
+            let eff_lo = ch.x_axis.min.unwrap_or(lo);
+            let eff_hi = ch.x_axis.max.unwrap_or(hi);
+            let span = (eff_hi - eff_lo).max(1e-9);
+            Some((eff_lo, span))
+        } else {
+            None
+        }
+    };
     if !matches!(
         ch.kind,
         ChartKind::Pie | ChartKind::Doughnut | ChartKind::Radar | ChartKind::Funnel | ChartKind::Treemap
@@ -1995,40 +2060,75 @@ fn draw_chart(
             }
         };
         let want = if y_fmt.contains('%') { 10.0 } else { 5.0 };
-        let step = nice_step(max_main / want);
-        let n_steps = ((max_main / step).ceil() as usize).clamp(1, 12);
-        for k in 0..=n_steps {
-            let v = step * k as f64;
-            let txt = tick(v);
-            let tw = out.tw(&txt, 7.0);
-            let frac = (v / max_main) as f32;
-            chart_text(out, px0 - tw - 3.0, py0 + ph * frac - 2.5, 7.0, &txt, [90, 90, 90]);
-        }
-        if has_sub {
-            let want2 = if y_fmt.contains('%') { 10.0 } else { 5.0 };
-            let step2 = nice_step(max_sub / want2);
-            let n2 = ((max_sub / step2).ceil() as usize).clamp(1, 12);
-            for k in 0..=n2 {
-                let v = step2 * k as f64;
+        let step = if is_percent_stacked {
+            0.2
+        } else {
+            nice_step(max_main / want)
+        };
+        let n_steps = ((max_main / step).round() as usize).clamp(1, 12);
+        if is_horizontal {
+            // 条形图：数值刻度沿 X 轴，分类标签沿 Y 轴
+            for k in 0..=n_steps {
+                let v = (step * k as f64).min(max_main);
                 let txt = tick(v);
-                let frac = (v / max_sub) as f32;
-                chart_text(out, px0 + pw + 3.0, py0 + ph * frac - 2.5, 7.0, &txt, [90, 90, 90]);
+                let tw = out.tw(&txt, 7.0);
+                let frac = (v / max_main) as f32;
+                chart_text(out, px0 + pw * frac - tw / 2.0, py0 - 9.0, 7.0, &txt, [90, 90, 90]);
             }
-        }
-        let scatter = !vis_series.is_empty()
-            && vis_series
-                .iter()
-                .all(|(_, se)| matches!(series_kind(se, ch.kind), ChartKind::Scatter | ChartKind::Bubble));
-        if !scatter
-            && !matches!(ch.kind, ChartKind::Histogram | ChartKind::BoxWhisker | ChartKind::Waterfall)
-            && n > 0
-            && n <= 12
-        {
-            let gw = pw / n as f32;
-            if let Some(cats) = vis_series.iter().map(|(_, se)| &se.cats).find(|c| !c.is_empty()) {
-                for (i, c) in cats.iter().take(n).enumerate() {
-                    let tw = out.tw(c, 7.0);
-                    chart_text(out, px0 + gw * (i as f32 + 0.5) - tw / 2.0, py0 - 9.0, 7.0, c, [90, 90, 90]);
+            if n > 0 && n <= 12 {
+                let gh = ph / n as f32;
+                if let Some(cats) = vis_series.iter().map(|(_, se)| &se.cats).find(|c| !c.is_empty()) {
+                    for (i, c) in cats.iter().take(n).enumerate() {
+                        let tw = out.tw(c, 7.0);
+                        let cy = py0 + ph - gh * (i as f32 + 0.5) - 2.5;
+                        chart_text(out, (px0 - tw - 3.0).max(x + 2.0), cy, 7.0, c, [90, 90, 90]);
+                    }
+                }
+            }
+        } else {
+            for k in 0..=n_steps {
+                let v = (step * k as f64).min(max_main);
+                let txt = tick(v);
+                let tw = out.tw(&txt, 7.0);
+                let frac = (v / max_main) as f32;
+                chart_text(out, px0 - tw - 3.0, py0 + ph * frac - 2.5, 7.0, &txt, [90, 90, 90]);
+            }
+            if has_sub {
+                let want2 = if y_fmt.contains('%') { 10.0 } else { 5.0 };
+                let step2 = nice_step(max_sub / want2);
+                let n2 = ((max_sub / step2).ceil() as usize).clamp(1, 12);
+                for k in 0..=n2 {
+                    let v = step2 * k as f64;
+                    let txt = tick(v);
+                    let frac = (v / max_sub) as f32;
+                    chart_text(out, px0 + pw + 3.0, py0 + ph * frac - 2.5, 7.0, &txt, [90, 90, 90]);
+                }
+            }
+            let scatter = !vis_series.is_empty()
+                && vis_series
+                    .iter()
+                    .all(|(_, se)| matches!(series_kind(se, ch.kind), ChartKind::Scatter | ChartKind::Bubble));
+            if scatter {
+                if let Some((xmin, xspan)) = scatter_x_bounds {
+                    let x_steps = 4usize;
+                    for k in 0..=x_steps {
+                        let frac = k as f64 / x_steps as f64;
+                        let xv = xmin + xspan * frac;
+                        let txt = crate::model::format_number(xv);
+                        let tw = out.tw(&txt, 7.0);
+                        chart_text(out, px0 + pw * frac as f32 - tw / 2.0, py0 - 9.0, 7.0, &txt, [90, 90, 90]);
+                    }
+                }
+            } else if !matches!(ch.kind, ChartKind::Histogram | ChartKind::BoxWhisker | ChartKind::Waterfall)
+                && n > 0
+                && n <= 12
+            {
+                let gw = pw / n as f32;
+                if let Some(cats) = vis_series.iter().map(|(_, se)| &se.cats).find(|c| !c.is_empty()) {
+                    for (i, c) in cats.iter().take(n).enumerate() {
+                        let tw = out.tw(c, 7.0);
+                        chart_text(out, px0 + gw * (i as f32 + 0.5) - tw / 2.0, py0 - 9.0, 7.0, c, [90, 90, 90]);
+                    }
                 }
             }
         }
@@ -2214,38 +2314,62 @@ fn draw_chart(
             out.lines.push((cx - b_w * 0.5, ym, cx + b_w * 0.5, ym, 1.6, [255, 255, 255]));
         }
     } else {
-        let bar_slots: Vec<usize> = vis_series
+        let clustered_col_slots: Vec<usize> = vis_series
             .iter()
-            .filter(|(_, s)| {
-                let k = series_kind(s, ch.kind);
-                matches!(
-                    k,
-                    ChartKind::Column
-                        | ChartKind::ColumnStacked
-                        | ChartKind::ColumnStacked100
-                        | ChartKind::Bar
-                        | ChartKind::BarStacked
-                        | ChartKind::BarStacked100
-                )
-            })
+            .filter(|(_, s)| series_kind(s, ch.kind) == ChartKind::Column)
             .map(|(i, _)| *i)
             .collect();
-        let slot_count = bar_slots.len().max(1);
+        let clustered_bar_slots: Vec<usize> = vis_series
+            .iter()
+            .filter(|(_, s)| series_kind(s, ch.kind) == ChartKind::Bar)
+            .map(|(i, _)| *i)
+            .collect();
         let groups = n.max(1);
         let gw = pw / groups as f32;
-        let bw_bar = (gw * 0.7 / slot_count as f32).max(1.5);
+        let gh = ph / groups as f32;
+        let bw_col_clustered = (gw * 0.7 / clustered_col_slots.len().max(1) as f32).max(1.5);
+        let bw_col_stacked = (gw * 0.62).max(2.0);
+        let bh_bar_clustered = (gh * 0.7 / clustered_bar_slots.len().max(1) as f32).max(1.5);
+        let bh_bar_stacked = (gh * 0.62).max(2.0);
+
+        // 100% 堆积各分类绝对值总和（分别按柱/条/面积计算）
+        let cat_abs_totals = |pred: fn(ChartKind) -> bool| -> Vec<f64> {
+            let mut tot = vec![0.0f64; n];
+            for &(_, s) in &vis_series {
+                if !pred(series_kind(s, ch.kind)) {
+                    continue;
+                }
+                for (i, &v) in s.vals.iter().enumerate().take(n) {
+                    if v.is_finite() {
+                        tot[i] += v.abs();
+                    }
+                }
+            }
+            tot
+        };
+        let col100_tot = cat_abs_totals(|k| k == ChartKind::ColumnStacked100);
+        let bar100_tot = cat_abs_totals(|k| k == ChartKind::BarStacked100);
+        let area100_tot = cat_abs_totals(|k| k == ChartKind::AreaStacked100);
+
+        let mut col_stack_acc = vec![0.0f32; n];
+        let mut bar_stack_acc = vec![0.0f32; n];
+        let mut area_stack_acc = vec![0.0f32; n];
+        let mut line_stack_acc = vec![0.0f64; n];
+
         for &(si, se) in &vis_series {
             let color = gray_shade(si, se.color.unwrap_or(CHART_COLORS[si % CHART_COLORS.len()]));
             let scale = if se.secondary { max_sub } else { max_main };
-            match series_kind(se, ch.kind) {
+            let sk = series_kind(se, ch.kind);
+            match sk {
                 ChartKind::Line | ChartKind::LineStacked | ChartKind::Scatter | ChartKind::Bubble => {
-                    let sk = series_kind(se, ch.kind);
                     let is_scatter = matches!(sk, ChartKind::Scatter | ChartKind::Bubble);
                     let use_x = is_scatter && se.xv.len() == se.vals.len() && !se.xv.is_empty();
                     let (xmin, xspan) = if use_x {
-                        let lo = se.xv.iter().cloned().fold(f64::MAX, f64::min);
-                        let hi = se.xv.iter().cloned().fold(f64::MIN, f64::max);
-                        (lo, (hi - lo).max(1e-9))
+                        scatter_x_bounds.unwrap_or_else(|| {
+                            let lo = se.xv.iter().copied().filter(|v| v.is_finite()).fold(f64::MAX, f64::min);
+                            let hi = se.xv.iter().copied().filter(|v| v.is_finite()).fold(f64::MIN, f64::max);
+                            (lo, (hi - lo).max(1e-9))
+                        })
                     } else {
                         (0.0, (se.vals.len().saturating_sub(1)).max(1) as f64)
                     };
@@ -2253,15 +2377,32 @@ fn draw_chart(
                         .vals
                         .iter()
                         .enumerate()
-                        .map(|(i, v)| {
+                        .filter_map(|(i, &v)| {
+                            if !v.is_finite() {
+                                return None;
+                            }
+                            let yv = if sk == ChartKind::LineStacked {
+                                if let Some(acc) = line_stack_acc.get_mut(i) {
+                                    *acc += v;
+                                    *acc
+                                } else {
+                                    v
+                                }
+                            } else {
+                                v
+                            };
                             let fx = if use_x {
-                                (se.xv[i] - xmin) / xspan
+                                let xv = se.xv[i];
+                                if !xv.is_finite() {
+                                    return None;
+                                }
+                                (xv - xmin) / xspan
                             } else {
                                 i as f64 / xspan
                             };
-                            (px0 + pw * fx as f32, py0 + ph * (*v / scale) as f32)
+                            let pt = (px0 + pw * fx as f32, py0 + ph * (yv / scale) as f32);
+                            (pt.0.is_finite() && pt.1.is_finite()).then_some(pt)
                         })
-                        .filter(|p| p.0.is_finite() && p.1.is_finite())
                         .collect();
                     if !is_scatter && pts.len() >= 2 {
                         out.stroke_polys.push(StrokePoly {
@@ -2278,7 +2419,7 @@ fn draw_chart(
                         }
                     }
                 }
-                ChartKind::Area | ChartKind::AreaStacked | ChartKind::AreaStacked100 => {
+                ChartKind::Area => {
                     let step = if se.vals.len() > 1 {
                         pw / (se.vals.len() as f32 - 1.0)
                     } else {
@@ -2293,15 +2434,94 @@ fn draw_chart(
                     pts.push((px0 + step * (se.vals.len().saturating_sub(1)) as f32, py0));
                     out.polys.push((pts, color));
                 }
+                ChartKind::AreaStacked | ChartKind::AreaStacked100 => {
+                    let count = se.vals.len().min(n);
+                    let step = if count > 1 {
+                        pw / (count as f32 - 1.0)
+                    } else {
+                        0.0
+                    };
+                    let mut top_pts = Vec::with_capacity(count);
+                    let mut bot_pts = Vec::with_capacity(count);
+                    for i in 0..count {
+                        let v = se.vals[i];
+                        let dh = if v.is_finite() && v > 0.0 {
+                            if sk == ChartKind::AreaStacked100 {
+                                let den = area100_tot[i];
+                                if den > 0.0 { ph * (v / den) as f32 } else { 0.0 }
+                            } else {
+                                ph * (v / scale) as f32
+                            }
+                        } else {
+                            0.0
+                        };
+                        let y_bot = py0 + area_stack_acc[i];
+                        let y_top = y_bot + dh;
+                        area_stack_acc[i] += dh;
+                        let px_i = px0 + step * i as f32;
+                        top_pts.push((px_i, y_top));
+                        bot_pts.push((px_i, y_bot));
+                    }
+                    if top_pts.len() >= 2 {
+                        bot_pts.reverse();
+                        top_pts.extend(bot_pts);
+                        out.polys.push((top_pts, color));
+                    }
+                }
+                ChartKind::ColumnStacked | ChartKind::ColumnStacked100 => {
+                    for (i, &v) in se.vals.iter().enumerate().take(n) {
+                        if !v.is_finite() || v <= 0.0 {
+                            continue;
+                        }
+                        let bh = if sk == ChartKind::ColumnStacked100 {
+                            let den = col100_tot[i];
+                            if den > 0.0 { ph * (v / den) as f32 } else { 0.0 }
+                        } else {
+                            ph * (v / scale) as f32
+                        };
+                        let bx = px0 + gw * (i as f32 + 0.19);
+                        let by = py0 + col_stack_acc[i];
+                        col_stack_acc[i] += bh;
+                        out.rects.push((bx, by, bw_col_stacked, bh, color));
+                    }
+                }
+                ChartKind::BarStacked | ChartKind::BarStacked100 => {
+                    for (i, &v) in se.vals.iter().enumerate().take(n) {
+                        if !v.is_finite() || v <= 0.0 {
+                            continue;
+                        }
+                        let bw = if sk == ChartKind::BarStacked100 {
+                            let den = bar100_tot[i];
+                            if den > 0.0 { pw * (v / den) as f32 } else { 0.0 }
+                        } else {
+                            pw * (v / scale) as f32
+                        };
+                        let bx = px0 + bar_stack_acc[i];
+                        let by = py0 + ph - gh * (i as f32 + 0.81);
+                        bar_stack_acc[i] += bw;
+                        out.rects.push((bx, by, bw, bh_bar_stacked, color));
+                    }
+                }
+                ChartKind::Bar => {
+                    let slot = clustered_bar_slots.iter().position(|i| *i == si).unwrap_or(0);
+                    for (i, &v) in se.vals.iter().enumerate().take(n) {
+                        if !v.is_finite() {
+                            continue;
+                        }
+                        let bw = pw * (v / scale) as f32;
+                        let by = py0 + ph - gh * (i as f32 + 0.15) - bh_bar_clustered * (slot as f32 + 1.0);
+                        out.rects.push((px0, by, bw, bh_bar_clustered, color));
+                    }
+                }
                 _ => {
-                    let slot = bar_slots.iter().position(|i| *i == si).unwrap_or(0);
+                    let slot = clustered_col_slots.iter().position(|i| *i == si).unwrap_or(0);
                     for (i, v) in se.vals.iter().enumerate() {
                         if !v.is_finite() {
                             continue;
                         }
                         let bh = ph * (*v / scale) as f32;
-                        let bx = px0 + gw * (i as f32 + 0.15) + bw_bar * slot as f32;
-                        out.rects.push((bx, py0, bw_bar, bh, color));
+                        let bx = px0 + gw * (i as f32 + 0.15) + bw_col_clustered * slot as f32;
+                        out.rects.push((bx, py0, bw_col_clustered, bh, color));
                     }
                 }
             }
@@ -2384,13 +2604,24 @@ fn draw_objects(
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "pic".into());
-            let name: String = format!(
-                "Im{}",
-                stem.chars()
-                    .filter(|c| c.is_ascii_alphanumeric())
-                    .collect::<String>()
-            );
+            let clean_stem: String = stem
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect();
+            let has_crop = pic.crop.iter().any(|&v| v > 1e-4);
+            let name = if has_crop {
+                format!(
+                    "Im{clean_stem}c{}x{}x{}x{}",
+                    (pic.crop[0].clamp(0.0, 0.9) * 1000.0).round() as u32,
+                    (pic.crop[1].clamp(0.0, 0.9) * 1000.0).round() as u32,
+                    (pic.crop[2].clamp(0.0, 0.9) * 1000.0).round() as u32,
+                    (pic.crop[3].clamp(0.0, 0.9) * 1000.0).round() as u32,
+                )
+            } else {
+                format!("Im{clean_stem}")
+            };
             out.images.push((x, y, w, h, name, bytes, pic.ext.clone()));
+            out.image_transforms.push((pic.crop, pic.rot_deg));
         }
         for ch in &sheet.charts {
             if contains(ch.anchor.0, ch.anchor.1) {
@@ -2594,6 +2825,57 @@ pub fn comment_summary_pages(wb: &Workbook, sheet_idx: usize, layout: &Layout) -
     emit_watermarks(&layout.setup, pw, ph, &mut cur);
     pages.push(cur);
     pages
+}
+
+/// 按工作表复用的打印页面渲染器：整表共享同一份条件格式统计 `CfStats`、合并索引与公式求值上下文，
+/// 避免原生多页打印 / 批量页面渲染逐页重复扫描整表条件格式统计。
+pub struct SheetPageRenderer<'a> {
+    wb: &'a Workbook,
+    sheet_idx: usize,
+    state: PageState<'a>,
+}
+
+impl<'a> SheetPageRenderer<'a> {
+    pub fn new(wb: &'a Workbook, sheet_idx: usize) -> Self {
+        Self {
+            wb,
+            sheet_idx,
+            state: PageState::new(wb, sheet_idx),
+        }
+    }
+
+    pub fn page_ops(&mut self, layout: &Layout, page_index: usize, source: Option<&Path>) -> Out {
+        render_page(
+            self.wb,
+            self.sheet_idx,
+            layout,
+            page_index,
+            source,
+            None,
+            None,
+            &mut self.state,
+        )
+    }
+
+    pub fn page_ops_metrics(
+        &mut self,
+        layout: &Layout,
+        page_index: usize,
+        source: Option<&Path>,
+        metric: Option<std::sync::Arc<dyn Fn(char, f32) -> f32 + Send + Sync>>,
+        vmetric: Option<std::sync::Arc<dyn Fn(f32) -> (f32, f32) + Send + Sync>>,
+    ) -> Out {
+        render_page(
+            self.wb,
+            self.sheet_idx,
+            layout,
+            page_index,
+            source,
+            metric,
+            vmetric,
+            &mut self.state,
+        )
+    }
 }
 
 pub fn page_ops(wb: &Workbook, sheet_idx: usize, layout: &Layout, page_index: usize) -> Out {
@@ -2990,10 +3272,18 @@ fn emit_out_to_pdf_page(doc: &mut Doc, out: Out) {
         doc.page_mut()
             .poly_styled(&sp.pts, sp.width, sp.color, &sp.dash, false, 1.0);
     }
-    for (x, y, w, h, name, bytes, ext) in out.images {
-        if let Some(img) = crate::image_embed::make(&name, &ext, &bytes) {
+    for (idx, (x, y, w, h, name, bytes, ext)) in out.images.into_iter().enumerate() {
+        let (crop, rot_deg) = out
+            .image_transforms
+            .get(idx)
+            .copied()
+            .unwrap_or(([0.0; 4], 0.0));
+        let has_crop = crop.iter().any(|&v| v > 1e-4);
+        if let Some((img, baked_crop)) = crate::image_embed::make_with_crop(&name, &ext, &bytes, crop) {
+            let pdf_crop = (has_crop && !baked_crop).then_some(crop);
             let name = doc.add_image(img);
-            doc.page_mut().image(&name, x, y, w, h);
+            doc.page_mut()
+                .image_transformed(&name, x, y, w, h, pdf_crop, rot_deg);
         }
     }
     for t in out.texts {

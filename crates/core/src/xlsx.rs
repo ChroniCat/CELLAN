@@ -1272,6 +1272,7 @@ struct SavedSheet {
 
 #[derive(Debug)]
 struct SavedChart {
+    uid: u64,
     part: String,
     drawing: String,
     anchor: (u32, u32, u32, u32),
@@ -1284,6 +1285,8 @@ fn chart_content_matches(live: &crate::charts::Chart, saved: &crate::charts::Cha
     let mut a = live.clone();
     let mut b = saved.clone();
     a.anchor = b.anchor;
+    a.part = b.part.clone();
+    a.drawing = b.drawing.clone();
     a.ref_fixes.clear();
     b.ref_fixes.clear();
     a.content_dirty = b.content_dirty;
@@ -1300,30 +1303,51 @@ impl Drop for RestoreFile {
 impl SaveReceipt {
     pub fn apply_to(&self, wb: &mut Workbook) {
         wb.source_encryption.clone_from(&self.source_encryption);
+        let mut any_charts_still_dirty = false;
         for sheet in &mut wb.sheets {
             if let Some(saved) = self.sheets.get(&sheet.identity) {
                 sheet.source_part = Some(saved.part.clone());
             }
             if let Some((saved, saved_deleted)) = self.committed_charts.get(&sheet.identity) {
                 let mut dirty = saved.len() != sheet.charts.len();
+                let mut matched_saved = vec![false; saved.len()];
                 for (index, chart) in sheet.charts.iter_mut().enumerate() {
-                    let Some((saved_index, baseline)) = saved.iter().enumerate().find(|(i, old)| {
-                        old.part == chart.part && (!old.part.is_empty() || *i == index)
-                    }) else {
+                    let found = if !chart.part.is_empty() {
+                        saved.iter().enumerate().find(|(i, old)| {
+                            !matched_saved[*i] && old.part == chart.part
+                        })
+                    } else {
+                        saved
+                            .iter()
+                            .enumerate()
+                            .find(|(i, old)| {
+                                !matched_saved[*i]
+                                    && old.created.is_some()
+                                    && old.uid != 0
+                                    && old.uid == chart.uid.raw()
+                            })
+                            .or_else(|| {
+                                saved.iter().enumerate().find(|(i, old)| {
+                                    !matched_saved[*i] && old.part.is_empty() && *i == index
+                                })
+                            })
+                    };
+                    let Some((saved_index, baseline)) = found else {
                         dirty = true;
                         continue;
                     };
+                    matched_saved[saved_index] = true;
                     if let Some((original, part, drawing)) = &baseline.created {
-                        let anchor = std::mem::replace(&mut chart.anchor, original.anchor);
-                        let same = chart == original;
-                        chart.anchor = anchor;
-                        if !same {
-                            dirty = true;
-                            continue;
-                        }
+                        // 新图表已落盘生成真实 OOXML 部件：即使后台保存期间又发生内容编辑，
+                        // 也必须回填 part/drawing，避免下次保存重复插入第二张图；
+                        // 若期间有新编辑，保留 content_dirty=true 令下次保存原地覆盖该部件。
+                        let content_same = chart_content_matches(chart, original);
                         chart.part.clone_from(part);
                         chart.drawing.clone_from(drawing);
-                        chart.content_dirty = false;
+                        chart.content_dirty = !content_same;
+                        if !content_same {
+                            dirty = true;
+                        }
                     } else if chart.content_dirty {
                         // 仅当图表内容与本次已落盘快照完全一致时才清脏标；
                         // 后台保存期间若又发生新的图表内容编辑，保留 content_dirty 以便下次保存落盘。
@@ -1345,9 +1369,30 @@ impl SaveReceipt {
                         || chart.content_dirty;
                 }
                 sheet.deleted_charts.retain(|item| !saved_deleted.contains(item));
+                // 首次后台保存期间被用户删除的新图表：由于保存前其 part 为空，删除动作尚未登记到 deleted_charts；
+                // 现已落盘为 (drawing, part)，必须补登 deleted_charts 以便下次保存彻底清除，避免重开复活。
+                for (saved_index, baseline) in saved.iter().enumerate() {
+                    if matched_saved[saved_index] {
+                        continue;
+                    }
+                    if let Some((_, part, drawing)) = &baseline.created
+                        && !drawing.is_empty()
+                        && !part.is_empty()
+                    {
+                        let pair = (drawing.clone(), part.clone());
+                        if !sheet.deleted_charts.contains(&pair) {
+                            sheet.deleted_charts.push(pair);
+                        }
+                        dirty = true;
+                    }
+                }
                 dirty |= !sheet.deleted_charts.is_empty();
                 sheet.charts_dirty = dirty;
+                any_charts_still_dirty |= dirty;
             }
+        }
+        if any_charts_still_dirty {
+            wb.dirty = true;
         }
     }
 
@@ -1504,6 +1549,7 @@ fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveR
                 let created = write.created_charts.get(&(sheet.identity, i)).map(|(part, drawing)| (chart.clone(), part.clone(), drawing.clone()));
                 let saved_content = (created.is_none() && chart.content_dirty).then(|| chart.clone());
                 SavedChart {
+                    uid: chart.uid.raw(),
                     part: chart.part.clone(), drawing: chart.drawing.clone(),
                     anchor: chart.anchor, ref_fixes: chart.ref_fixes.clone(),
                     created,

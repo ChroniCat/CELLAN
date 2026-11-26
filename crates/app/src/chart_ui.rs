@@ -525,6 +525,7 @@ impl SheetApp {
             return;
         };
         let mut copy = orig;
+        copy.uid = sheetcore::charts::ChartUid::next();
         copy.part.clear();
         copy.drawing.clear();
         copy.is_chartex = false;

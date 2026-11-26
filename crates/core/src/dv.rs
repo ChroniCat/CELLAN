@@ -174,6 +174,39 @@ pub struct DataValidation {
 }
 
 impl DataValidation {
+    /// 判断两条数据验证规则除应用区域 `ranges` 外是否完全一致（粘贴验证合并规则时避免削弱停止/提示配置）。
+    pub fn same_rule(&self, other: &Self) -> bool {
+        let Self {
+            ranges: _,
+            kind,
+            op,
+            f1,
+            f2,
+            allow_blank,
+            show_dropdown,
+            error_style,
+            show_error,
+            show_prompt,
+            error_title,
+            error_msg,
+            prompt_title,
+            prompt_msg,
+        } = self;
+        *kind == other.kind
+            && *op == other.op
+            && *f1 == other.f1
+            && *f2 == other.f2
+            && *allow_blank == other.allow_blank
+            && *show_dropdown == other.show_dropdown
+            && *error_style == other.error_style
+            && *show_error == other.show_error
+            && *show_prompt == other.show_prompt
+            && *error_title == other.error_title
+            && *error_msg == other.error_msg
+            && *prompt_title == other.prompt_title
+            && *prompt_msg == other.prompt_msg
+    }
+
     /// 不合规值的处置。show_error=false 时静默放行（Excel 的行为），
     /// 否则按 errorStyle 分停止/警告/信息。
     pub fn verdict(&self, valid: bool) -> DvVerdict {

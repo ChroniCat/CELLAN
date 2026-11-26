@@ -429,11 +429,22 @@ impl MetaEdit {
             && self.names.is_none()
     }
 
-    fn apply(&self, sheets: &mut [Sheet], redo: bool) -> Vec<(usize, crate::sync::SheetMetaKind)> {
+    fn apply(
+        &self,
+        sheets: &mut [Sheet],
+        redo: bool,
+        guard: &mut impl FnMut(usize, u32, u32, &Cell) -> bool,
+    ) -> (
+        Vec<(usize, crate::sync::SheetMetaKind)>,
+        Vec<(usize, u32, u32)>,
+        std::collections::HashSet<usize>,
+    ) {
         use crate::sync::SheetMetaKind;
         let mut syncs = Vec::new();
+        let mut rich_touched = Vec::new();
+        let mut rich_skipped = std::collections::HashSet::new();
         let Some(sh) = sheets.get_mut(self.sheet) else {
-            return syncs;
+            return (syncs, rich_touched, rich_skipped);
         };
         if !self.col_widths.is_empty() {
             let def = sh.cols.default_size();
@@ -566,7 +577,16 @@ impl MetaEdit {
             sh.bump_display_style_revision();
         }
         if !self.rich.is_empty() {
-            for (pos, before_cell, after_cell, before_runs, after_runs) in &self.rich {
+            let mut any_rich_applied = false;
+            for (idx, (pos, before_cell, after_cell, before_runs, after_runs)) in
+                self.rich.iter().enumerate()
+            {
+                let cur = sh.get(pos.0, pos.1).map(|c| c.into_owned()).unwrap_or_default();
+                let expected_cell = if redo { before_cell } else { after_cell };
+                if !guard(self.sheet, pos.0, pos.1, &cur) || !cur.same_input(expected_cell) {
+                    rich_skipped.insert(idx);
+                    continue;
+                }
                 let target_cell = if redo { after_cell } else { before_cell };
                 let target_runs = if redo { after_runs } else { before_runs };
                 sh.set(pos.0, pos.1, target_cell.clone());
@@ -578,9 +598,13 @@ impl MetaEdit {
                         sh.rich.remove(pos);
                     }
                 }
+                rich_touched.push((self.sheet, pos.0, pos.1));
+                any_rich_applied = true;
             }
-            sh.rich_dirty = true;
-            sh.bump_display_style_revision();
+            if any_rich_applied {
+                sh.rich_dirty = true;
+                sh.bump_display_style_revision();
+            }
         }
         if let Some((before, after)) = &self.dv {
             sh.dv = if redo { after.clone() } else { before.clone() };
@@ -632,7 +656,7 @@ impl MetaEdit {
             sh.sparklines_dirty = true;
             sh.bump_display_style_revision();
         }
-        syncs
+        (syncs, rich_touched, rich_skipped)
     }
 }
 
@@ -2785,20 +2809,28 @@ impl UndoStack {
             return None;
         }
         let site = self.site;
-        if let Some(Entry::Meta(_, action)) = self.done.last() {
-            let syncs = action.edit.apply(sheets, false);
-            let touched: Vec<(usize, u32, u32)> = action
-                .edit
-                .rich
-                .iter()
-                .map(|(pos, ..)| (action.edit.sheet, pos.0, pos.1))
-                .collect();
+        if let Some(Entry::Meta(_, _)) = self.done.last() {
+            let mut entry = self.done.pop()?;
+            let Entry::Meta(_, ref mut action) = entry else { unreachable!() };
+            let (syncs, touched, rich_skipped) = action.edit.apply(sheets, false, &mut guard);
+            let skipped = rich_skipped.len();
+            if skipped > 0 {
+                let mut i = 0usize;
+                action.edit.rich.retain(|_| {
+                    let keep = !rich_skipped.contains(&i);
+                    i += 1;
+                    keep
+                });
+            }
+            if action.edit.filter.is_some() {
+                self.last_needs_recalc = true;
+            }
             let total_touched = touched.len();
             let applied = Applied {
                 touched,
                 label: action.label.clone(),
                 focus: action.focus,
-                skipped: 0,
+                skipped,
                 structural: false,
                 refresh_sizes: None,
                 style_changes: Vec::new(),
@@ -2807,8 +2839,9 @@ impl UndoStack {
                 total_touched,
             };
             self.last_meta_sync = syncs;
-            let entry = self.done.pop()?;
-            self.undone.push(entry);
+            if !action.edit.is_empty() {
+                self.undone.push(entry);
+            }
             return Some(applied);
         }
         if let Some(Entry::NumericSort(stamp, action)) = self.done.last_mut() {
@@ -2952,20 +2985,28 @@ impl UndoStack {
             return None;
         }
         let site = self.site;
-        if let Some(Entry::Meta(_, action)) = self.undone.last() {
-            let syncs = action.edit.apply(sheets, true);
-            let touched: Vec<(usize, u32, u32)> = action
-                .edit
-                .rich
-                .iter()
-                .map(|(pos, ..)| (action.edit.sheet, pos.0, pos.1))
-                .collect();
+        if let Some(Entry::Meta(_, _)) = self.undone.last() {
+            let mut entry = self.undone.pop()?;
+            let Entry::Meta(_, ref mut action) = entry else { unreachable!() };
+            let (syncs, touched, rich_skipped) = action.edit.apply(sheets, true, &mut guard);
+            let skipped = rich_skipped.len();
+            if skipped > 0 {
+                let mut i = 0usize;
+                action.edit.rich.retain(|_| {
+                    let keep = !rich_skipped.contains(&i);
+                    i += 1;
+                    keep
+                });
+            }
+            if action.edit.filter.is_some() {
+                self.last_needs_recalc = true;
+            }
             let total_touched = touched.len();
             let applied = Applied {
                 touched,
                 label: action.label.clone(),
                 focus: action.focus,
-                skipped: 0,
+                skipped,
                 structural: false,
                 refresh_sizes: None,
                 style_changes: Vec::new(),
@@ -2974,8 +3015,9 @@ impl UndoStack {
                 total_touched,
             };
             self.last_meta_sync = syncs;
-            let entry = self.undone.pop()?;
-            self.done.push(entry);
+            if !action.edit.is_empty() {
+                self.done.push(entry);
+            }
             return Some(applied);
         }
         if let Some(Entry::NumericSort(stamp, action)) = self.undone.last_mut() {
