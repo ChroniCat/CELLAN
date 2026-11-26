@@ -1661,7 +1661,7 @@ impl MatchIndexes {
     }
 
     #[inline]
-    fn finish_aggregate(function: u8, hits: usize, total: f64, best: Option<f64>) -> FValue {
+    pub(super) fn finish_aggregate(function: u8, hits: usize, total: f64, best: Option<f64>) -> FValue {
         match function {
             1 => FValue::number(hits as f64),
             2 | 3 if hits == 0 => FValue::Error(ErrKind::Div0),

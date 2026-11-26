@@ -160,6 +160,136 @@ fn grouped_conditional_aggregates_match_the_scan_across_distinct_keys() {
 }
 
 #[test]
+fn multi_criteria_errors_are_not_discarded_by_scans_or_indexes() {
+    let mut wb = Workbook::new_blank();
+    for row in 0..256 {
+        number(&mut wb, row, 0, 1.0);
+        number(&mut wb, row, 1, 10.0);
+    }
+    formula(&mut wb, 0, 3, "=1/0");
+    let mut calc = Calc::new(&wb);
+    for n in [2, 255, 256] {
+        let range = format!("A1:A{n}");
+        for name in ["COUNTIFS", "SUMIFS", "AVERAGEIFS", "MINIFS", "MAXIFS"] {
+            let amounts = if name == "COUNTIFS" { String::new() } else { format!("B1:B{n},") };
+            for tests in [["D1", "1", "1"], ["1", "1/0", "1"], ["1", "1", "D1"]] {
+                let src = format!("{name}({amounts}{range},{},{range},{},{range},{})", tests[0], tests[1], tests[2]);
+                let node = parse(&src).unwrap();
+                let Node::Func(_, args) = &node else { unreachable!() };
+                let expected = FValue::Error(ErrKind::Div0);
+                assert_eq!(calc.eval_node(&node, 0), expected, "{src}");
+                assert_eq!(calc.call_generic(name, args, 0), expected, "scan: {src}");
+            }
+        }
+    }
+    // A text criterion may legitimately search for an error in the range.
+    assert_eq!(eval_formula(&wb, 0, r##"COUNTIFS(D1:D1,"#DIV/0!")"##), FValue::number(1.0));
+    // Multiple independent defects must still produce the same error on each route.
+    let mixed = parse("SUMIFS(B1:B255,A1:A256,1,A1:A255,D1)").unwrap();
+    let Node::Func(name, args) = &mixed else { unreachable!() };
+    assert_eq!(calc.eval_node(&mixed, 0), FValue::Error(ErrKind::Div0));
+    assert_eq!(calc.call_generic(name, args, 0), FValue::Error(ErrKind::Div0));
+}
+
+#[test]
+fn multi_criteria_ranges_require_equal_declared_rows_and_columns() {
+    let mut wb = Workbook::new_blank();
+    for r in 0..257 {
+        number(&mut wb, r, 0, 1.0);
+        number(&mut wb, r, 1, 2.0);
+    }
+    let mut calc = Calc::new(&wb);
+    for n in [255, 256, 257] {
+        let same = format!("SUMIFS(B{n}:B1,A1:A{n},1)");
+        assert_eq!(calc.eval_node(&parse(&same).unwrap(), 0), FValue::number(2.0 * n as f64));
+        for src in [
+            format!("SUMIFS(B1:B{n},A{}:A1,1)", n - 1),
+            format!("COUNTIFS(A{n}:A1,1,B1:B{},2)", n + 1),
+        ] {
+            let node = parse(&src).unwrap();
+            let Node::Func(name, args) = &node else { unreachable!() };
+            assert_eq!(calc.eval_node(&node, 0), FValue::Error(ErrKind::Value), "{src}");
+            assert_eq!(calc.call_generic(name, args, 0), FValue::Error(ErrKind::Value), "scan: {src}");
+        }
+    }
+    for src in [
+        "SUMIFS(B1:B2,A1:B1,1)", "COUNTIFS(B2:B1,2,B1:A1,1)",
+        "SUMIFS(A1:A256,A1:B128,1)", "COUNTIFS(A1:B128,1,A1:A256,1)",
+        "SUMIFS(B:B,A1:A257,1)", "COUNTIFS(A:A,1,B1:B257,2)",
+        "COUNTIFS(A1:A2,1,SEQUENCE(1,2),1)",
+        "COUNTIFS(A1:A200001,1,SEQUENCE(257),1)",
+        "COUNTIFS(OFFSET(A1,0,0,200001),1,B1:B257,2)",
+        r#"SUMIFS(B1:B257,INDIRECT("A1:A200001"),1)"#,
+        "COUNTIFS(INDEX(A1:B200001,0,1),1,B1:B257,2)",
+    ] {
+        assert_eq!(calc.eval_node(&parse(src).unwrap(), 0), FValue::Error(ErrKind::Value), "{src}");
+    }
+    assert_eq!(eval_formula(&wb, 0, "SUMIF(A1:A2,1,B1)"), FValue::number(4.0));
+    let reads = calc.range_reads;
+    for src in [
+        r#"COUNTIFS(A1:Q1000000,"",SEQUENCE(1),1)"#,
+        "COUNTIFS(A:A,1,SEQUENCE(1),1)",
+        "COUNTIFS(SEQUENCE(1),1,A:A,1)",
+    ] {
+        assert_eq!(calc.eval_node(&parse(src).unwrap(), 0), FValue::Error(ErrKind::Value), "{src}");
+    }
+    assert_eq!(calc.range_reads, reads, "mismatched geometry requires no range materialization");
+}
+
+#[test]
+fn multi_criteria_indirect_recalculates_a_changed_condition_cell() {
+    let mut wb = Workbook::new_blank();
+    number(&mut wb, 0, 0, 1.0);
+    formula(&mut wb, 0, 3, r#"=COUNTIFS(INDIRECT("A1:A200001"),1)"#);
+    recalc_all_force(&mut wb);
+    assert_eq!(wb.sheets[0].value(0, 3), Value::Number(1.0));
+    let deps = deps::Deps::build(&wb);
+    for row in [1, 100_000] {
+        number(&mut wb, row, 0, 1.0);
+        assert_eq!(recalc_dirty(&mut wb, &deps, &[(0, row, 0)]), 1);
+    }
+    assert_eq!(wb.sheets[0].value(0, 3), Value::Number(3.0));
+}
+
+#[test]
+fn multi_criteria_sparse_ranges_share_offsets_across_sheets() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets.push(crate::Sheet::new("Other"));
+    number(&mut wb, 0, 0, 1.0);
+    number(&mut wb, 2, 0, 1.0);
+    // The source is 1x2 on Other and 3x1 on the first sheet after independent
+    // clipping. Matching by the flattened offset would incorrectly pair B1 and A3.
+    wb.sheets[1].set(0, 0, Cell { value: Value::Number(10.0), formula: None });
+    wb.sheets[1].set(0, 1, Cell { value: Value::Number(30.0), formula: None });
+    let mut calc = Calc::new(&wb);
+    for (src, expected) in [
+        ("SUMIFS(Other!A1:B200001,A1:B200001,1)", 10.0),
+        ("COUNTIFS(A1:B200001,1,Other!A1:B200001,30)", 0.0),
+        (r#"SUMIFS(Other!A1:B200001,A1:B200001,"")"#, 30.0),
+        (r#"COUNTIFS(A1:B200001,"",Other!A1:B200001,"")"#, 400002.0 - 3.0),
+        (r#"COUNTIFS(A1:B200002,"",Other!A1:B200002,"")"#, 400004.0 - 3.0),
+        ("SUMIFS(Other!A:A,A:A,1)", 10.0),
+    ] {
+        assert_eq!(calc.eval_node(&parse(src).unwrap(), 0), FValue::number(expected), "{src}");
+    }
+
+    let mut sparse = Workbook::new_blank();
+    sparse.sheets.push(crate::Sheet::new("Other"));
+    number(&mut sparse, 999_999, 0, 7.0);
+    sparse.sheets[1].set(0, 16, Cell { value: Value::Number(9.0), formula: None });
+    let mut calc = Calc::new(&sparse);
+    for (src, expected) in [
+        (r#"SUMIFS(A1:Q1000000,Other!A1:Q1000000,"")"#, 7.0),
+        ("SUMIFS(A1:Q1000000,Other!A1:Q1000000,9)", 0.0),
+        (r#"COUNTIFS(A1:Q1000000,"",Other!A1:Q1000000,"")"#, 16_999_998.0),
+        (r#"COUNTIFS(A1:Q1000000,7,Other!A1:Q1000000,"")"#, 1.0),
+    ] {
+        assert_eq!(calc.eval_node(&parse(src).unwrap(), 0), FValue::number(expected), "{src}");
+    }
+    assert!(calc.range_reads < 64, "sparse queries read {} cells", calc.range_reads);
+}
+
+#[test]
 fn alternating_criteria_groups_survive_other_ranges_and_remain_bounded() {
     let mut wb = Workbook::new_blank();
     for r in 0..600 {

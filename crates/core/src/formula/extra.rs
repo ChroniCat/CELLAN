@@ -470,7 +470,7 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
         }),
         "MINIFS" | "MAXIFS" => r(|| {
             let target = args.first().ok_or(ErrKind::Value)?.slice();
-            let pairs = super::functions::criteria_pairs(&args[1..]);
+            let pairs = super::functions::criteria_pairs(&args[1..], range_dims(&args[0]))?;
             let mut best: Option<f64> = None;
             for (i, v) in target.iter().enumerate() {
                 if !pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches(x))) {
@@ -1577,7 +1577,7 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
         // ============================ 条件聚合补充
         "AVERAGEIFS" => r(|| {
             let avg = args.first().ok_or(ErrKind::Value)?.slice();
-            let pairs = super::functions::criteria_pairs(&args[1..]);
+            let pairs = super::functions::criteria_pairs(&args[1..], range_dims(&args[0]))?;
             let len = pairs.iter().map(|(r, _)| r.len()).min().unwrap_or(0).min(avg.len());
             let mut sum = 0.0;
             let mut n = 0;

@@ -9,6 +9,7 @@ mod scalar_batch;
 mod dependency_batch;
 pub(crate) mod lookup_cache;
 mod conditional_index;
+mod criteria_ranges;
 mod func_id;
 mod fxhash;
 mod pool;
@@ -4441,6 +4442,9 @@ impl<'a> Calc<'a> {
                 }
                 return fast;
             }
+            if id != FuncId::AverageIf {
+                return self.call_generic_id(id, name.as_str(), nodes, si);
+            }
         }
         if bound.is_none()
             && nodes.len() == 3
@@ -6443,17 +6447,36 @@ impl<'a> Calc<'a> {
                 if self.aborted {
                     return Some(FValue::Error(ErrKind::Value));
                 }
-                key.criteria.push(cv.to_text().ok()?);
-            } else {
-                let rr = self.resolve_range_node(node, si)?;
-                if rr.is_ext() || rr.is_3d() {
-                    return None;
+                match cv.to_text() {
+                    Ok(text) => key.criteria.push(text),
+                    Err(e) => return Some(FValue::Error(e)),
                 }
-                let sheet = self.sheet_index(rr.sheet.as_deref(), si).ok()?;
-                let gk = self.grid_key_coords(sheet, rr.r1(), rr.c1(), rr.r2(), rr.c2())?;
-                key.ranges.push(gk);
+            } else {
+                let range = if id == FuncId::AverageIf {
+                    let rr = self.resolve_range_node(node, si)?;
+                    if rr.is_ext() || rr.is_3d() { return None; }
+                    let sheet = self.sheet_index(rr.sheet.as_deref(), si).ok()?;
+                    self.grid_key_coords(sheet, rr.r1(), rr.c1(), rr.r2(), rr.c2())?
+                } else {
+                    self.ifs_range_key(node, si)?
+                };
+                key.ranges.push(range);
             }
         }
+        let skipped = if id == FuncId::AverageIf { 0 } else {
+            match self.align_ifs_ranges(&mut key.ranges) {
+                Ok(n) => n,
+                Err(e) => return Some(FValue::Error(e)),
+            }
+        };
+        // Cached answers describe the materialized rectangle. Different logical
+        // ranges can share it, but COUNTIFS must also count matching blank tails.
+        let count_blanks = skipped > 0 && id == FuncId::CountIfs
+            && key.criteria.iter().all(|c| functions::Crit::parse(c).matches(&FValue::Empty));
+        let with_blank_tail = |value: FValue| match value {
+            FValue::Number(n) if count_blanks => FValue::number(n + skipped as f64),
+            value => value,
+        };
         // Per-column used-row trimming: if at least one condition column cannot match Empty,
         // no row beyond that column's last occupied row can ever satisfy all conditions!
         if key.ranges.iter().all(|r| r.2 == r.4 && r.2 >= 0) {
@@ -6490,7 +6513,7 @@ impl<'a> Calc<'a> {
         }
         if let Some(v) = self.criteria_cache.get(&key) {
             self.agg_hits += 1;
-            return Some(v.clone());
+            return Some(with_blank_tail(v.clone()));
         }
         if let Some(shared) = self.shared
             && let Some(v) = shared.get_criteria(&key)
@@ -6500,7 +6523,7 @@ impl<'a> Calc<'a> {
             }
             self.criteria_cache.insert(key, v.clone());
             self.agg_hits += 1;
-            return Some(v);
+            return Some(with_blank_tail(v));
         }
 
         // Pre-resolve single-column `SharedCondColumn`s once (supports O(1) FastScope + dirty overlay!)
@@ -6537,7 +6560,11 @@ impl<'a> Calc<'a> {
         }
 
         // 1. OrderedCriteria (<, <=, >, >=, <>)
-        let mut ans = {
+        let &(_, r1, c1, r2, c2) = key.ranges.first()?;
+        let area = ((r2 - r1 + 1) * (c2 - c1 + 1)) as usize;
+        let mut ans = if id != FuncId::AverageIf && c2 > c1 && area > 200_000 {
+            self.scan_sparse_ifs(&key, area)
+        } else {
             let mut ordered = std::mem::take(&mut self.ordered_criteria);
             let shared_ref = self.shared;
             let wb_ref = self.wb;
@@ -6742,7 +6769,14 @@ impl<'a> Calc<'a> {
         let out = match ans {
             Some(v) => v,
             None => {
-                let args = self.function_args(id, nodes, si);
+                let args = if id == FuncId::AverageIf {
+                    self.function_args(id, nodes, si)
+                } else {
+                    match self.materialize_ifs_args(&key) {
+                        Ok(args) => args,
+                        Err(e) => return Some(FValue::Error(e)),
+                    }
+                };
                 if self.requested.is_some() {
                     return Some(FValue::Error(ErrKind::Ref));
                 }
@@ -6762,7 +6796,7 @@ impl<'a> Calc<'a> {
             self.criteria_cache.insert(key, out.clone());
             self.agg_miss += 1;
         }
-        Some(out)
+        Some(with_blank_tail(out))
     }
 
     fn cache_get(&mut self, key: RangeKey) -> Option<std::sync::Arc<Vec<FValue>>> {
@@ -7294,6 +7328,12 @@ impl<'a> Calc<'a> {
     }
 
     fn call_generic_id(&mut self, id: FuncId, name: &str, nodes: &[Node], si: usize) -> FValue {
+        if matches!(id, FuncId::SumIfs | FuncId::CountIfs | FuncId::AverageIfs | FuncId::MinIfs | FuncId::MaxIfs) {
+            return match self.mixed_ifs_args(id, nodes, si) {
+                Ok(args) => functions::call_id_in(self.ctx, id, name, &args),
+                Err(e) => FValue::Error(e),
+            };
+        }
         let args = self.function_args(id, nodes, si);
         functions::call_id_in(self.ctx, id, name, &args)
     }

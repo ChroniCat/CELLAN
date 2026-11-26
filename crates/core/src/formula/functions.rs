@@ -1538,11 +1538,18 @@ pub(crate) fn match_criteria(v: &FValue, crit: &str) -> bool {
     Crit::parse(crit).matches(v)
 }
 
-pub(super) fn criteria_pairs(args: &[Arg]) -> Vec<(&[FValue], Crit)> {
-    args.chunks_exact(2).filter_map(|pair| {
-        let text = pair[1].first().to_text().ok()?;
-        Some((pair[0].slice(), Crit::parse(&text)))
-    }).collect()
+pub(super) fn criteria_pairs(args: &[Arg], shape: (usize, usize)) -> Result<Vec<(&[FValue], Crit)>, ErrKind> {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        return Err(ErrKind::Value);
+    }
+    let pairs = args.chunks_exact(2).map(|pair| {
+        let text = pair[1].first().to_text()?;
+        Ok((pair[0].slice(), Crit::parse(&text)))
+    }).collect::<Result<Vec<_>, ErrKind>>()?;
+    if args.chunks_exact(2).any(|pair| range_dims(&pair[0]) != shape) {
+        return Err(ErrKind::Value);
+    }
+    Ok(pairs)
 }
 
 // ---------------------------------------------------------------- 1-based 行列参数
@@ -2168,9 +2175,10 @@ pub(super) fn call_by_id_in(
             Ok(FValue::number(s))
         }),
         FuncId::SumIfs => r(|| {
-            let sum_range = args.first().map(|a| a.slice()).unwrap_or(&[]);
+            let amounts = args.first().ok_or(ErrKind::Value)?;
+            let pairs = criteria_pairs(&args[1..], range_dims(amounts))?;
+            let sum_range = amounts.slice();
             let mut s = 0.0;
-            let pairs = criteria_pairs(args.get(1..).unwrap_or_default());
             for (i, v) in sum_range.iter().enumerate() {
                 if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches(x))) {
                     match v {
@@ -2354,8 +2362,9 @@ pub(super) fn call_by_id_in(
         }),
         FuncId::CountIfs => r(|| {
             let mut count = 0usize;
-            let pairs = criteria_pairs(args);
-            let len = pairs.iter().map(|(r, _)| r.len()).min().unwrap_or(0);
+            let first = args.first().ok_or(ErrKind::Value)?;
+            let pairs = criteria_pairs(args, range_dims(first))?;
+            let len = first.slice().len();
             for i in 0..len {
                 if pairs.iter().all(|(rg, c)| rg.get(i).is_some_and(|x| c.matches(x))) {
                     count += 1;
