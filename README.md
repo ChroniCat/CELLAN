@@ -68,6 +68,8 @@ cargo test -p app --no-default-features --features glow
 
 ---
 
-## 许可证与第三方声明 | Notices
+## 许可证与第三方声明 | License & Notices
+
+本项目基于 [MIT License](LICENSE) 开源。
 
 内嵌字体子集遵循 SIL Open Font License 1.1；Rust 第三方依赖许可全文见 [packaging/THIRD_PARTY_NOTICES.txt](packaging/THIRD_PARTY_NOTICES.txt)。
