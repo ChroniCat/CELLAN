@@ -1320,6 +1320,10 @@ struct HostWatermark {
     axis_cols: Arc<AxisSeqTable>,
     cached_axis: Option<AxisStylesMap>,
     merges: Arc<MergeWatermarkLog>,
+    /// 带单调水位序号的工作表元数据日志（批注、行高列宽、隐藏、冻结、超链接、筛选、工作表标签），
+    /// 供水位增量重连精确补发断线期间的 `SheetMetaOp`。
+    sheet_meta: Arc<Vec<(u64, usize, sheetcore::sync::SheetMetaKind)>>,
+    meta_floor_seq: u64,
     /// 最近几次保存原文件的 `(file_sha256, watermark_seq, structure_revision)` 检查点环，
     /// 使宿主保存后打开共享文件的同事仍可直接走 `O(Δ)` 水位增量入房而非退化为全量快照。
     checkpoints: Arc<std::collections::VecDeque<(String, u64, usize)>>,
@@ -1338,6 +1342,8 @@ impl Default for HostWatermark {
             axis_cols: Arc::new(HashMap::new()),
             cached_axis: None,
             merges: Arc::new(Vec::new()),
+            sheet_meta: Arc::new(Vec::new()),
+            meta_floor_seq: 0,
             checkpoints: Arc::new(std::collections::VecDeque::new()),
         }
     }
@@ -1489,6 +1495,17 @@ impl HostWatermark {
         let seq = self.bump();
         Arc::make_mut(&mut self.merges)
             .push((seq, sheet, rect.0, rect.1, rect.2, rect.3, on));
+        seq
+    }
+
+    fn record_sheet_meta(&mut self, sheet: usize, kind: sheetcore::sync::SheetMetaKind) -> u64 {
+        let seq = self.bump();
+        let log = Arc::make_mut(&mut self.sheet_meta);
+        if log.len() >= 10_000 {
+            let evicted = log.remove(0);
+            self.meta_floor_seq = self.meta_floor_seq.max(evicted.0);
+        }
+        log.push((seq, sheet, kind));
         seq
     }
 
@@ -3839,6 +3856,7 @@ impl Net {
         if !kind.valid(sheet) {
             return;
         }
+        let _order = self.room_order.as_ref().map(|m| m.lock().unwrap());
         if let Some(log) = &self.host_meta_log {
             let mut g = log.lock().unwrap();
             if g.len() >= 10_000 {
@@ -3850,10 +3868,21 @@ impl Net {
             site: self.site,
             sheet,
             ts: 0,
-            kind,
+            kind: kind.clone(),
         };
         if let Some(roster) = &self.host_roster {
+            let wm_seq = self
+                .host_watermark
+                .as_ref()
+                .map(|wm| wm.lock().unwrap().record_sheet_meta(sheet, kind));
+            let struct_rev = self
+                .host_structs
+                .as_ref()
+                .map_or(0, |h| h.lock().unwrap().len());
             queue_room_change(&self.cmd, roster, None, RoomChange::Message(msg));
+            if let Some(seq) = wm_seq {
+                emit_room_watermark(&self.cmd, roster, seq, struct_rev);
+            }
         } else if let Ok(s) = serde_json::to_string(&msg) {
             let _ = self.cmd.send(Cmd::Broadcast(s));
         }
@@ -4923,26 +4952,36 @@ fn host_initialized(
                                 let can_resume = !resume_room.is_empty()
                                     && resume_room == room_session_id
                                     && resume_watermark >= 1
+                                    && resume_watermark >= wm_snapshot.meta_floor_seq
                                     && resume_watermark <= current_wm
                                     && resume_struct_rev <= struct_rev
                                     && (resume_struct_rev == struct_rev
-                                        || wm_snapshot
+                                        || (wm_snapshot
                                             .merges
                                             .partition_point(|(s, ..)| *s <= resume_watermark)
-                                            == wm_snapshot.merges.len());
+                                            == wm_snapshot.merges.len()
+                                            && wm_snapshot
+                                                .sheet_meta
+                                                .partition_point(|(s, ..)| *s <= resume_watermark)
+                                                == wm_snapshot.sheet_meta.len()));
                                 let checkpoint_match = (!can_resume && !client_hash.is_empty())
                                     .then(|| wm_snapshot.find_checkpoint(&client_hash))
                                     .flatten();
                                 let can_checkpoint_delta = !can_resume
                                     && checkpoint_match.is_some_and(|(cp_wm, cp_srev)| {
                                         cp_wm >= 1
+                                            && cp_wm >= wm_snapshot.meta_floor_seq
                                             && cp_wm <= current_wm
                                             && cp_srev <= struct_rev
                                             && (cp_srev == struct_rev
-                                                || wm_snapshot
+                                                || (wm_snapshot
                                                     .merges
                                                     .partition_point(|(s, ..)| *s <= cp_wm)
-                                                    == wm_snapshot.merges.len())
+                                                    == wm_snapshot.merges.len()
+                                                    && wm_snapshot
+                                                        .sheet_meta
+                                                        .partition_point(|(s, ..)| *s <= cp_wm)
+                                                        == wm_snapshot.sheet_meta.len()))
                                     });
                                 let can_legacy_hash_delta = !can_resume
                                     && !can_checkpoint_delta
@@ -5192,6 +5231,22 @@ fn host_initialized(
                                                 r2,
                                                 c2,
                                                 on,
+                                            })
+                                            .unwrap(),
+                                        ));
+                                    }
+                                    let meta_start = wm_snapshot
+                                        .sheet_meta
+                                        .partition_point(|(seq, ..)| *seq <= delta_wm);
+                                    if meta_start < wm_snapshot.sheet_meta.len() {
+                                        let meta_items: Vec<(usize, sheetcore::sync::SheetMetaKind)> =
+                                            wm_snapshot.sheet_meta[meta_start..]
+                                                .iter()
+                                                .map(|(_, msh, kind)| (*msh, kind.clone()))
+                                                .collect();
+                                        let _ = tx.send(IntroFrame::Line(
+                                            serde_json::to_string(&Msg::SheetMetaSnapshot {
+                                                items: meta_items,
                                             })
                                             .unwrap(),
                                         ));
@@ -5901,6 +5956,11 @@ fn host_initialized(
                                     }
                                     g.push((sheet, kind.clone()));
                                 }
+                                let seq = host_watermark
+                                    .lock()
+                                    .unwrap()
+                                    .record_sheet_meta(sheet, kind.clone());
+                                let struct_rev = structs.lock().unwrap().len();
                                 queue_room_change(
                                     &cmd,
                                     &roster,
@@ -5912,6 +5972,7 @@ fn host_initialized(
                                         kind: kind.clone(),
                                     }),
                                 );
+                                emit_room_watermark(&cmd, &roster, seq, struct_rev);
                                 let _ = evt_tx.send(NetEvent::SheetMeta {
                                     site: conn_site,
                                     sheet,
@@ -10317,6 +10378,130 @@ mod integrity_tests {
             let hdecoded: Msg = serde_json::from_str(&hplain).unwrap();
             assert!(matches!(hdecoded, Msg::Ops { ref ops } if ops.len() == 64));
         }
+    }
+
+    /// D3 (P1): 水位增量重连（delta_sync == true）必须补发断线期间的批注和行高/列宽等 SheetMetaOp。
+    #[test]
+    fn v180_d3_watermark_delta_reconnect_replays_offline_sheet_meta() {
+        let _env = crate::test_env::TestEnv::new("v180_d3_wm_sheet_meta");
+        let (host, port) = host_for_test(1, "Host", "meta-resume-doc", "pw");
+        let mut wb = sheetcore::Workbook::new_blank();
+        let mut peer = sheetcore::sync::Peer::new(1);
+        wb.sheet_mut(0).set(
+            0,
+            0,
+            sheetcore::Cell {
+                value: sheetcore::Value::Number(1.0),
+                formula: None,
+            },
+        );
+        peer.seed_workbook(&wb);
+        host.seed_snapshot(
+            &peer,
+            &wb,
+            Cursor {
+                site: 1,
+                name: "Host".into(),
+                color: 1,
+                sheet: 0,
+                row: 0,
+                col: 0,
+                end_row: None,
+                end_col: None,
+            },
+        );
+
+        let guest = join(
+            2,
+            "Guest".into(),
+            "meta-resume-doc".into(),
+            &format!("127.0.0.1:{port}"),
+            "pw".into(),
+        )
+        .unwrap();
+        let first_welcome = wait_event(&guest, 5000, |e| matches!(e, NetEvent::Welcome { .. }));
+        assert!(matches!(first_welcome, Some(NetEvent::Welcome { delta_sync: false, .. })));
+        assert!(wait_event(&guest, 5000, |e| matches!(e, NetEvent::SnapshotDone)).is_some());
+
+        // 断线前先同步一条单元格更新，确认水位已推进
+        host.broadcast_op(sheetcore::sync::Op {
+            sheet: 0,
+            row: 0,
+            col: 1,
+            value: sheetcore::sync::ValueWire::Number(42.0),
+            formula: None,
+            ts: 100,
+            site: 1,
+        });
+        assert!(
+            wait_event(&guest, 5000, |e| {
+                matches!(e, NetEvent::Ops(ops) if ops.iter().any(|o| o.row == 0 && o.col == 1))
+            })
+            .is_some()
+        );
+
+        // 模拟访客短暂断网
+        guest.disconnect_socket_for_test();
+        assert!(wait_event(&guest, 5000, |e| matches!(e, NetEvent::Disconnected(_))).is_some());
+
+        // 断网期间宿主新增批注并修改列宽、行高
+        host.broadcast_sheet_meta(
+            0,
+            sheetcore::sync::SheetMetaKind::Note {
+                row: 2,
+                col: 3,
+                author: "Host".into(),
+                text: Some("断线期间批注".into()),
+            },
+        );
+        host.broadcast_sheet_meta(
+            0,
+            sheetcore::sync::SheetMetaKind::ColWidths(vec![(3, 165.0)]),
+        );
+        host.broadcast_sheet_meta(
+            0,
+            sheetcore::sync::SheetMetaKind::RowHeights(vec![(2, 44.0)]),
+        );
+
+        // 访客自动水位增量重连（delta_sync == true）
+        let second_welcome = wait_event(&guest, 8000, |e| matches!(e, NetEvent::Welcome { .. }));
+        assert!(
+            matches!(second_welcome, Some(NetEvent::Welcome { delta_sync: true, .. })),
+            "短暂断线重连必须走水位增量同步: {second_welcome:?}"
+        );
+
+        let mut got_note = false;
+        let mut got_col = false;
+        let mut got_row = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        while !(got_note && got_col && got_row) && std::time::Instant::now() < deadline {
+            if let Some(ev) = wait_event(&guest, 300, |_| true) {
+                if let NetEvent::SheetMeta { sheet: 0, kind, .. } = ev {
+                    match kind {
+                        sheetcore::sync::SheetMetaKind::Note {
+                            row: 2,
+                            col: 3,
+                            text: Some(t),
+                            ..
+                        } if t == "断线期间批注" => got_note = true,
+                        sheetcore::sync::SheetMetaKind::ColWidths(items)
+                            if items.iter().any(|&(c, w)| c == 3 && (w - 165.0).abs() < 0.5) =>
+                        {
+                            got_col = true;
+                        }
+                        sheetcore::sync::SheetMetaKind::RowHeights(items)
+                            if items.iter().any(|&(r, h)| r == 2 && (h - 44.0).abs() < 0.5) =>
+                        {
+                            got_row = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(got_note, "水位增量重连后必须收到断线期间的批注");
+        assert!(got_col, "水位增量重连后必须收到断线期间的列宽修改");
+        assert!(got_row, "水位增量重连后必须收到断线期间的行高修改");
     }
 }
 

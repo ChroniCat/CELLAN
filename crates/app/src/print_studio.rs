@@ -473,9 +473,15 @@ fn selected_page_indices(
             if !range_text.trim().is_empty() {
                 parse_page_ranges(range_text, total)
             } else {
-                let a = (print_from.max(1) as usize - 1).min(total - 1);
-                let b = (print_to.max(1) as usize - 1).min(total - 1);
-                (a.min(b)..=a.max(b)).collect()
+                let lo = print_from.min(print_to) as usize;
+                let hi = print_from.max(print_to) as usize;
+                if hi < 1 || lo > total {
+                    Vec::new()
+                } else {
+                    let a = lo.max(1) - 1;
+                    let b = hi.min(total) - 1;
+                    (a..=b).collect()
+                }
             }
         }
         _ => (0..total).collect(),
@@ -611,6 +617,12 @@ impl SheetApp {
                         layout.pages.len(),
                     )
                 };
+                if scope != 1 && print_range == 2 && page_list.is_empty() {
+                    return Err(format!(
+                        "自定义页码范围无效或超出总页数（共 {} 页）",
+                        layout.pages.len().max(1)
+                    ));
+                }
                 for pi in page_list {
                     let out = page_ops_with(&wb_snap, idx, &layout, pi, source);
                     rendered.push((pw, ph, setup.paper, setup.landscape, out));
@@ -718,13 +730,14 @@ impl SheetApp {
         else {
             return;
         };
-        let pack = match build_pdf_font_pack() {
-            Ok(p) => p,
-            Err(e) => {
-                self.status = format!("导出失败：字体初始化失败 {e:#}");
-                return;
-            }
-        };
+        self.export_pdf_from_studio_to(&path);
+    }
+
+    pub(crate) fn export_pdf_from_studio_to(&mut self, path: &Path) {
+        if self.print_studio.scope == 1 {
+            self.export_workbook_pdf_to(path);
+            return;
+        }
         let mut wb_snap = self.wb.clone();
         let si = self.sheet_idx;
         if self.print_studio.scope == 2 {
@@ -737,14 +750,26 @@ impl SheetApp {
         let indices = if self.print_range == 0 {
             None
         } else {
-            Some(selected_page_indices(
+            let list = selected_page_indices(
                 self.print_range,
                 self.preview_page,
                 self.print_from,
                 self.print_to,
                 &self.print_studio.page_range_text,
                 total,
-            ))
+            );
+            if list.is_empty() {
+                self.status = format!("导出失败：自定义页码范围无效或超出总页数（共 {total} 页）");
+                return;
+            }
+            Some(list)
+        };
+        let pack = match build_pdf_font_pack() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("导出失败：字体初始化失败 {e:#}");
+                return;
+            }
         };
         let async_eligible = !cfg!(test)
             && std::env::var_os("SC_EXPORT_PDF").is_none()
@@ -752,13 +777,13 @@ impl SheetApp {
         if async_eligible {
             self.status = format!("正在后台导出 PDF {}…", path.display());
             self.tasks
-                .start_pdf_export_pack(wb_snap, si, path, pack, indices);
+                .start_pdf_export_pack(wb_snap, si, path.to_path_buf(), pack, indices);
             return;
         }
         match sheetcore::print::export_pdf_sheet_with_pack(
             &wb_snap,
             si,
-            &path,
+            path,
             pack,
             wb_snap.path.as_deref(),
             indices.as_deref(),

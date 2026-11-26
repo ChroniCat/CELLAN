@@ -2591,7 +2591,7 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
         // ============================ 债券应计利息 ACCRINT / ACCRINTM
         "ACCRINT" => r(|| {
             let issue = num(args, 0)?.floor();
-            let _first_int = num(args, 1)?.floor();
+            let first_int = num(args, 1)?.floor();
             let settlement = num(args, 2)?.floor();
             let rate = num(args, 3)?;
             let par = match args.get(4) {
@@ -2603,11 +2603,33 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
                 Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => int_arg(args, 6)? as i32,
                 _ => 0,
             };
-            if rate <= 0.0 || par <= 0.0 || !matches!(freq, 1 | 2 | 4) || !(0..=4).contains(&basis) || issue >= settlement {
+            let calc_method = match args.get(7) {
+                Some(a) if !matches!(a, Arg::Val(FValue::Empty)) => a.first().to_bool()?,
+                _ => true,
+            };
+            if issue < 0.0
+                || first_int < 0.0
+                || settlement < 0.0
+                || rate <= 0.0
+                || par <= 0.0
+                || !matches!(freq, 1 | 2 | 4)
+                || !(0..=4).contains(&basis)
+                || issue >= settlement
+            {
                 return Err(ErrKind::Num);
             }
-            let yf = super::functions::year_fraction_in(sys, issue, settlement, basis)?;
-            Ok(FValue::number(par * rate * yf))
+            let accrued = accrint_excel(
+                sys,
+                issue,
+                first_int,
+                settlement,
+                rate,
+                par,
+                freq,
+                basis,
+                calc_method,
+            )?;
+            Ok(FValue::number(accrued))
         }),
         "ACCRINTM" => r(|| {
             let issue = num(args, 0)?.floor();
@@ -3403,6 +3425,105 @@ fn months_back(y: i32, m: u32, d: u32, n: u32) -> (i32, u32, u32) {
     let nm = (total.rem_euclid(12) + 1) as u32;
     let maxd = days_in_month(ny, nm);
     (ny, nm, d.min(maxd))
+}
+
+/// 按月偏移（正数向后、负数向前），若原日期是月末则保持月末（Excel 债券准付息日规则）
+fn shift_months_eom(y: i32, m: u32, d: u32, delta_months: i64, eom: bool) -> (i32, u32, u32) {
+    let total = (y as i64) * 12 + (m as i64 - 1) + delta_months;
+    let ny = total.div_euclid(12) as i32;
+    let nm = (total.rem_euclid(12) + 1) as u32;
+    let maxd = days_in_month(ny, nm);
+    let nd = if eom { maxd } else { d.min(maxd) };
+    (ny, nm, nd)
+}
+
+/// 按 Excel / ODFF 准付息期（quasi-coupon period）规范计算 ACCRINT：
+/// `par * (rate / freq) * sum(A_i / NL_i)`。
+/// - `calc_method == false && settlement > first_int` 时仅从 `first_int` 计息至 `settlement`；
+/// - 否则从 `issue` 计息至 `settlement`（按以 `first_int` 为锚点的准付息期分段累计）。
+#[allow(clippy::too_many_arguments)]
+fn accrint_excel(
+    sys: DateSystem,
+    issue: f64,
+    first_int: f64,
+    settlement: f64,
+    rate: f64,
+    par: f64,
+    freq: i64,
+    basis: i32,
+    calc_method: bool,
+) -> Result<f64, ErrKind> {
+    let start = if !calc_method && settlement > first_int {
+        first_int
+    } else {
+        issue
+    };
+    if start >= settlement {
+        return Ok(0.0);
+    }
+    let step = (12 / freq) as i64;
+    let (fy, fm, fd) = serial_to_date_in(sys, first_int).ok_or(ErrKind::Num)?;
+    let is_eom = fd == days_in_month(fy, fm);
+    let quasi_date = |k: i64| -> Result<f64, ErrKind> {
+        let (y, m, d) = shift_months_eom(fy, fm, fd, k * step, is_eom);
+        date_to_serial_in(sys, y, m, d).ok_or(ErrKind::Num)
+    };
+
+    // 找到包含 `start` 的准付息期下标 k，满足 quasi_date(k) <= start < quasi_date(k + 1)
+    let mut k: i64 = 0;
+    if start < first_int {
+        while quasi_date(k)? > start {
+            k -= 1;
+            if k < -4000 {
+                return Err(ErrKind::Num);
+            }
+        }
+    } else {
+        while quasi_date(k + 1)? <= start {
+            k += 1;
+            if k > 4000 {
+                return Err(ErrKind::Num);
+            }
+        }
+    }
+
+    let freq_f = freq as f64;
+    let mut sum_ratio = 0.0;
+    let mut steps = 0usize;
+    loop {
+        let p_start = quasi_date(k)?;
+        let p_end = quasi_date(k + 1)?;
+        if p_end <= p_start {
+            return Err(ErrKind::Num);
+        }
+        let seg_start = start.max(p_start);
+        let seg_end = settlement.min(p_end);
+        if seg_end > seg_start {
+            let (a_days, nl_days) = match basis {
+                0 | 4 => {
+                    // US 30/360 (0) 或 Euro 30/360 (4)：直接复用 year_fraction_in 的 30/360 天数口径
+                    let days = super::functions::year_fraction_in(sys, seg_start, seg_end, basis)? * 360.0;
+                    (days, 360.0 / freq_f)
+                }
+                1 => (seg_end - seg_start, p_end - p_start),
+                2 => (seg_end - seg_start, 360.0 / freq_f),
+                3 => (seg_end - seg_start, 365.0 / freq_f),
+                _ => return Err(ErrKind::Num),
+            };
+            if nl_days > 0.0 {
+                sum_ratio += a_days / nl_days;
+            }
+        }
+        if p_end >= settlement {
+            break;
+        }
+        k += 1;
+        steps += 1;
+        if steps > 4000 {
+            return Err(ErrKind::Num);
+        }
+    }
+    Ok(par * (rate / freq_f) * sum_ratio)
 }
 
 fn days_in_month(y: i32, m: u32) -> u32 {

@@ -1006,11 +1006,36 @@ impl SheetApp {
     }
 
     fn apply_wps_paste_variant(&mut self, _ctx: &egui::Context, mode: PasteMode) {
+        let ext_text = self.system_paste_text();
+        self.apply_wps_paste_variant_impl(mode, ext_text, None, true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_wps_paste_variant_rich(
+        &mut self,
+        mode: PasteMode,
+        ext_text: Option<String>,
+        ext_rich: Option<crate::office_clipboard::RichClipboard>,
+    ) {
+        self.apply_wps_paste_variant_impl(mode, ext_text, ext_rich, false);
+    }
+
+    fn apply_wps_paste_variant_impl(
+        &mut self,
+        mode: PasteMode,
+        ext_text: Option<String>,
+        ext_rich: Option<crate::office_clipboard::RichClipboard>,
+        allow_os_rich: bool,
+    ) {
         if self.edit_blocked() {
             return;
         }
-        let ext_text = self.system_paste_text();
+        let (r0, c0) = self.sel;
         let internal = self.internal_clip_for(ext_text.as_deref(), true).cloned();
+        let values_only_rich = matches!(
+            mode,
+            PasteMode::Values | PasteMode::ValuesNumFmt | PasteMode::ValuesSourceFmt
+        );
         let (matrix, coords, src_sheet_idx, src_rect, src_col_widths) = if let Some(clip) = internal {
             if crate::office_clipboard::delayed::is_full_columns(clip.rect) {
                 if matches!(mode, PasteMode::Values) {
@@ -1033,6 +1058,15 @@ impl SheetApp {
                 Vec::new()
             };
             (clip.cells().to_vec(), Some(coords), Some(clip.sheet), Some(clip.rect), widths)
+        } else if let Some(rich) = ext_rich.or_else(|| {
+            (allow_os_rich && !cfg!(test) && crate::office_clipboard::has_rich_table_format())
+                .then(|| crate::office_clipboard::read_rich_table_ext(values_only_rich))
+                .flatten()
+        }) {
+            let Some(grid) = self.materialize_rich_clipboard_matrix(r0, c0, rich) else {
+                return;
+            };
+            (grid, None, None, None, Vec::new())
         } else if let Some(t) = ext_text {
             (Self::parse_clip_text(&t), None, None, None, Vec::new())
         } else {

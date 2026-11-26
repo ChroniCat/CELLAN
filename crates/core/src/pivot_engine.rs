@@ -2233,7 +2233,24 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
     let mut row_kinds_data: Vec<PivotRowKind> = Vec::new();
     let mut row_indents_data: Vec<u8> = Vec::new();
     let mut row_paths_data: Vec<Option<Vec<String>>> = Vec::new();
+    // 为 ShowAs（占行/列/总计/父级百分比与索引）保留真实聚合分母，
+    // 避免 Average / Min / Max / StdDev / DistinctCount 等非可加聚合被错误地对明细行求和。
+    let mut true_row_totals: Vec<Vec<Option<f64>>> = Vec::new();
+    let mut true_parent_row_totals: HashMap<(String, usize), f64> = HashMap::new();
     let mut grand_total_row: Option<usize> = None;
+
+    let eval_row_totals_for_cm = |cols_map: &BTreeMap<Vec<String>, CellBucket>| -> Vec<Option<f64>> {
+        let mut row_all = make_bucket();
+        for b in cols_map.values() {
+            merge_bucket(&mut row_all, b);
+        }
+        (0..total_val_count)
+            .map(|vi| match finish_slot(&row_all, vi) {
+                Value::Number(n) if n.is_finite() => Some(n),
+                _ => None,
+            })
+            .collect()
+    };
 
     let eval_row_values = |cols_map: &BTreeMap<Vec<String>, CellBucket>| -> Vec<Value> {
         let mut vals = vec![Value::Empty; total_cols - row_label_cols];
@@ -2307,6 +2324,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
             row_kinds_data.push(PivotRowKind::Detail);
             row_indents_data.push(0);
             row_paths_data.push(Some(Vec::new()));
+            true_row_totals.push(eval_row_totals_for_cm(&all_cm));
         }
     } else if spec.rows.len() == 1 {
         for rp in &row_paths {
@@ -2320,6 +2338,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
             row_kinds_data.push(PivotRowKind::Detail);
             row_indents_data.push(0);
             row_paths_data.push(Some(rp.clone()));
+            true_row_totals.push(eval_row_totals_for_cm(&data[rp]));
         }
     } else {
         // 多级行字段：按顶层分组，支持折叠/展开与 Top/Bottom/Off 小计 + Compact/Outline/Tabular 布局
@@ -2336,6 +2355,15 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
             let top_pref = vec![top.clone()];
             let is_collapsed = collapsed_row_set.contains(&top_pref);
             let group_cm = merge_cols_maps(group_paths);
+            let group_vals = eval_row_values(&group_cm);
+            for (vi, v) in group_vals.iter().enumerate() {
+                if let Value::Number(n) = v
+                    && n.is_finite()
+                {
+                    true_parent_row_totals.insert((top.clone(), row_label_cols + vi), *n);
+                }
+            }
+            let group_row_tot = eval_row_totals_for_cm(&group_cm);
 
             if is_collapsed {
                 // 折叠态：一行展示父组 + [+] 按钮 + 汇总数值
@@ -2349,14 +2377,14 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
                 });
                 let mut line = vec![Value::Empty; total_cols];
                 line[0] = Value::Text(top.clone().into());
-                let vals = eval_row_values(&group_cm);
-                for (vi, v) in vals.into_iter().enumerate() {
+                for (vi, v) in group_vals.into_iter().enumerate() {
                     line[row_label_cols + vi] = v;
                 }
                 rows.push(line);
                 row_kinds_data.push(PivotRowKind::Subtotal(0));
                 row_indents_data.push(0);
                 row_paths_data.push(Some(top_pref));
+                true_row_totals.push(group_row_tot);
                 prev_labels.fill(String::new());
                 continue;
             }
@@ -2376,8 +2404,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
                 let mut line = vec![Value::Empty; total_cols];
                 line[0] = Value::Text(top.clone().into());
                 if show_top_sub && opts.subtotal_pos == SubtotalPos::Top {
-                    let vals = eval_row_values(&group_cm);
-                    for (vi, v) in vals.into_iter().enumerate() {
+                    for (vi, v) in group_vals.iter().cloned().enumerate() {
                         line[row_label_cols + vi] = v;
                     }
                 }
@@ -2389,6 +2416,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
                 });
                 row_indents_data.push(0);
                 row_paths_data.push(Some(top_pref.clone()));
+                true_row_totals.push(group_row_tot.clone());
             }
 
             for (gi, rp) in group_paths.iter().enumerate() {
@@ -2438,31 +2466,41 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
                 row_kinds_data.push(PivotRowKind::Detail);
                 row_indents_data.push(indent);
                 row_paths_data.push(Some(rp.clone()));
+                true_row_totals.push(eval_row_totals_for_cm(&data[rp]));
             }
 
             if show_top_sub && opts.subtotal_pos == SubtotalPos::Bottom {
                 let mut sline = vec![Value::Empty; total_cols];
                 sline[0] = Value::Text(format!("{top} 汇总").into());
-                let vals = eval_row_values(&group_cm);
-                for (vi, v) in vals.into_iter().enumerate() {
+                for (vi, v) in group_vals.into_iter().enumerate() {
                     sline[row_label_cols + vi] = v;
                 }
                 rows.push(sline);
                 row_kinds_data.push(PivotRowKind::Subtotal(0));
                 row_indents_data.push(0);
                 row_paths_data.push(Some(top_pref));
+                true_row_totals.push(group_row_tot);
             }
             prev_labels.fill(String::new());
         }
     }
 
-    // 8. 总计行
+    // 8. 总计行与真实整表/列聚合分母（即使隐藏总计行也保持一致）
+    let all_cm_total = merge_cols_maps(&row_paths);
+    let all_col_vals = eval_row_values(&all_cm_total);
+    let true_grand_totals = eval_row_totals_for_cm(&all_cm_total);
+    let mut true_col_totals: HashMap<usize, f64> = HashMap::new();
+    for (vi, v) in all_col_vals.iter().enumerate() {
+        if let Value::Number(n) = v
+            && n.is_finite()
+        {
+            true_col_totals.insert(row_label_cols + vi, *n);
+        }
+    }
     if opts.row_grand_totals && !rows.is_empty() && total_val_count > 0 {
-        let all_cm = merge_cols_maps(&row_paths);
         let mut gline = vec![Value::Empty; total_cols];
         gline[0] = Value::Text("总计".into());
-        let vals = eval_row_values(&all_cm);
-        for (vi, v) in vals.into_iter().enumerate() {
+        for (vi, v) in all_col_vals.into_iter().enumerate() {
             gline[row_label_cols + vi] = v;
         }
         grand_total_row = Some(rows.len());
@@ -2470,6 +2508,7 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
         row_kinds_data.push(PivotRowKind::GrandTotal);
         row_indents_data.push(0);
         row_paths_data.push(Some(Vec::new()));
+        true_row_totals.push(true_grand_totals.clone());
     }
 
     // 9. 构造 PivotGrid 并应用 13 种 ShowAs
@@ -2497,6 +2536,10 @@ pub fn compute_table(source_sheet: &Sheet, model: &PivotTableModel) -> ComputedP
         &col_is_grand_total,
         &col_is_subtotal,
         total_val_count,
+        &true_col_totals,
+        &true_grand_totals,
+        &true_row_totals,
+        &true_parent_row_totals,
     );
 
     // 10. 多个计算项
@@ -2643,6 +2686,10 @@ fn apply_rich_show_as(
     col_is_grand: &[bool],
     col_is_sub: &[bool],
     total_val_count: usize,
+    true_col_totals: &HashMap<usize, f64>,
+    true_grand_totals: &[Option<f64>],
+    true_row_totals: &[Vec<Option<f64>>],
+    true_parent_row_totals: &HashMap<(String, usize), f64>,
 ) {
     if total_val_count == 0 || grid.rows.is_empty() {
         return;
@@ -2684,21 +2731,29 @@ fn apply_rich_show_as(
             continue;
         }
 
-        // 统计每列总计（仅统计 Detail 行，避免小计重复叠加）
+        // 每列总计：优先使用基于完整原始记录桶聚合出的真实列总计（支持 Average/Min/Max/StdDev 等非可加函数）
         let mut col_tot: HashMap<usize, f64> = HashMap::new();
         for &c in &all_cols {
-            let s: f64 = (0..orig.len())
-                .filter(|&r| row_kinds.get(r) == Some(&PivotRowKind::Detail))
-                .filter_map(|r| num_at(r, c))
-                .sum();
-            col_tot.insert(c, s);
+            let tot = true_col_totals.get(&c).copied().unwrap_or_else(|| {
+                (0..orig.len())
+                    .filter(|&r| row_kinds.get(r) == Some(&PivotRowKind::Detail))
+                    .filter_map(|r| num_at(r, c))
+                    .sum()
+            });
+            col_tot.insert(c, tot);
         }
-        let grand_total: f64 = leaf_cols
-            .iter()
-            .map(|c| col_tot.get(c).copied().unwrap_or(0.0))
-            .sum();
+        let grand_total: f64 = true_grand_totals
+            .get(vi)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| {
+                leaf_cols
+                    .iter()
+                    .map(|c| col_tot.get(c).copied().unwrap_or(0.0))
+                    .sum()
+            });
 
-        // 父行分组总计（用于 PercentOfParentRow）
+        // 父行分组总计（用于 PercentOfParentRow）：优先取真实分组聚合桶
         let mut parent_row_tot: HashMap<(String, usize), f64> = HashMap::new();
         for r in 0..orig.len() {
             if row_kinds.get(r) != Some(&PivotRowKind::Detail) {
@@ -2711,7 +2766,9 @@ fn apply_rich_show_as(
                 .cloned()
                 .unwrap_or_default();
             for &c in &all_cols {
-                if let Some(v) = num_at(r, c) {
+                if let Some(&true_p) = true_parent_row_totals.get(&(top.clone(), c)) {
+                    parent_row_tot.insert((top.clone(), c), true_p);
+                } else if let Some(v) = num_at(r, c) {
                     *parent_row_tot.entry((top.clone(), c)).or_insert(0.0) += v;
                 }
             }
@@ -2759,7 +2816,12 @@ fn apply_rich_show_as(
 
         for r in 0..orig.len() {
             let rk = row_kinds.get(r).copied().unwrap_or(PivotRowKind::Detail);
-            let row_sum: f64 = leaf_cols.iter().filter_map(|&c| num_at(r, c)).sum();
+            let row_sum: f64 = true_row_totals
+                .get(r)
+                .and_then(|row| row.get(vi))
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| leaf_cols.iter().filter_map(|&c| num_at(r, c)).sum());
             let top_key = row_paths
                 .get(r)
                 .and_then(|o| o.as_ref())

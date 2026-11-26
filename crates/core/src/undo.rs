@@ -1025,6 +1025,7 @@ struct CowBatchAction {
     all_mask: crate::model::CellJournal,
     excluded: crate::model::CellJournal,
     merges: Option<MergeEdit>,
+    cf: Option<(crate::cf::CfSheet, crate::cf::CfSheet)>,
     refresh_sizes: Option<(Vec<(String, u32, u32)>, Vec<(String, u32, u32)>)>,
     label: String,
     focus: (usize, u32, u32),
@@ -1114,6 +1115,7 @@ impl CowBatchAction {
                 all_mask,
                 excluded: Default::default(),
                 merges: None,
+                cf: None,
                 refresh_sizes: None,
                 label: action.label.clone(),
                 focus: action.focus,
@@ -1181,12 +1183,14 @@ impl CowBatchAction {
         } else {
             None
         };
+        let cf = (before.cf != after.cf).then(|| (before.cf.clone(), after.cf.clone()));
         let mut all_mask = cell_mask.clone();
         all_mask.union_from(&style_mask);
         if all_mask.is_empty()
             && row_style_deltas.is_empty()
             && col_style_deltas.is_empty()
             && merges.is_none()
+            && cf.is_none()
             && refresh_sizes.is_none()
         {
             return None;
@@ -1268,6 +1272,7 @@ impl CowBatchAction {
                 all_mask,
                 excluded: Default::default(),
                 merges,
+                cf,
                 refresh_sizes,
                 label,
                 focus,
@@ -1406,6 +1411,11 @@ impl CowBatchAction {
                 for k in self.style_mask.iter().take(2_001) {
                     applied.style_changes.push((self.sheet, k.row, k.col));
                 }
+            }
+            if let Some((before_cf, after_cf)) = &self.cf {
+                sheet.cf = if redo { after_cf.clone() } else { before_cf.clone() };
+                sheet.cf_dirty = true;
+                sheet.bump_display_style_revision();
             }
             let total = self.all_mask.len();
             applied.total_touched = total;
@@ -1632,6 +1642,11 @@ impl CowBatchAction {
             applied.style_changes.sort_unstable();
             applied.style_changes.dedup();
         }
+        if let Some((before_cf, after_cf)) = &self.cf {
+            sheet.cf = if redo { after_cf.clone() } else { before_cf.clone() };
+            sheet.cf_dirty = true;
+            sheet.bump_display_style_revision();
+        }
         applied.refresh_sizes = self
             .refresh_sizes
             .clone()
@@ -1643,6 +1658,7 @@ impl CowBatchAction {
             || !self.row_style_deltas.is_empty()
             || !self.col_style_deltas.is_empty()
             || self.merges.is_some()
+            || self.cf.is_some()
             || self.refresh_sizes.is_some();
         (applied, keep)
     }
@@ -1701,6 +1717,7 @@ enum SheetTabChange {
         sheet: Option<Box<Sheet>>,
         local_names: Vec<(String, Option<usize>, String)>,
         references: crate::sheet_ops::RenameReferences,
+        pivots: crate::sheet_ops::DeletedSheetPivots,
     },
     Move { from: usize, to: usize },
     Rename { before: String, after: String, references: crate::sheet_ops::RenameReferences },
@@ -1752,7 +1769,7 @@ impl SheetTabAction {
                 *removed = Some(Box::new(rec.sheet));
                 wb.calc_pending_sheets.remove(&self.index);
             }
-            SheetTabChange::Delete { sheet, local_names, references } if redo => {
+            SheetTabChange::Delete { sheet, local_names, references, pivots } if redo => {
                 if wb.sheets.len() <= 1 || self.index >= wb.sheets.len()
                     || wb.sheets[self.index].identity != self.identity
                 { return None; }
@@ -1760,11 +1777,12 @@ impl SheetTabAction {
                 *sheet = Some(Box::new(rec.sheet));
                 *local_names = rec.local_names;
                 *references = rec.references;
+                *pivots = rec.pivots;
                 focus = (self.index.min(wb.sheets.len() - 1), 0, 0);
             }
-            SheetTabChange::Delete { sheet, local_names, references } => {
+            SheetTabChange::Delete { sheet, local_names, references, pivots } => {
                 let sh = *sheet.take()?;
-                if !crate::sheet_ops::restore_deleted_sheet(wb, self.index, sh, local_names, references) {
+                if !crate::sheet_ops::restore_deleted_sheet(wb, self.index, sh, local_names, references, pivots) {
                     return None;
                 }
                 focus = (self.index, self.previous_focus.1, self.previous_focus.2);
@@ -2599,6 +2617,7 @@ impl UndoStack {
                 sheet: Some(Box::new(rec.sheet)),
                 local_names: rec.local_names,
                 references: rec.references,
+                pivots: rec.pivots,
             },
         );
         true
@@ -2768,8 +2787,15 @@ impl UndoStack {
         let site = self.site;
         if let Some(Entry::Meta(_, action)) = self.done.last() {
             let syncs = action.edit.apply(sheets, false);
+            let touched: Vec<(usize, u32, u32)> = action
+                .edit
+                .rich
+                .iter()
+                .map(|(pos, ..)| (action.edit.sheet, pos.0, pos.1))
+                .collect();
+            let total_touched = touched.len();
             let applied = Applied {
-                touched: Vec::new(),
+                touched,
                 label: action.label.clone(),
                 focus: action.focus,
                 skipped: 0,
@@ -2778,7 +2804,7 @@ impl UndoStack {
                 style_changes: Vec::new(),
                 merge_changes: Vec::new(),
                 merge_conflict: false,
-                total_touched: 0,
+                total_touched,
             };
             self.last_meta_sync = syncs;
             let entry = self.done.pop()?;
@@ -2928,8 +2954,15 @@ impl UndoStack {
         let site = self.site;
         if let Some(Entry::Meta(_, action)) = self.undone.last() {
             let syncs = action.edit.apply(sheets, true);
+            let touched: Vec<(usize, u32, u32)> = action
+                .edit
+                .rich
+                .iter()
+                .map(|(pos, ..)| (action.edit.sheet, pos.0, pos.1))
+                .collect();
+            let total_touched = touched.len();
             let applied = Applied {
-                touched: Vec::new(),
+                touched,
                 label: action.label.clone(),
                 focus: action.focus,
                 skipped: 0,
@@ -2938,7 +2971,7 @@ impl UndoStack {
                 style_changes: Vec::new(),
                 merge_changes: Vec::new(),
                 merge_conflict: false,
-                total_touched: 0,
+                total_touched,
             };
             self.last_meta_sync = syncs;
             let entry = self.undone.pop()?;

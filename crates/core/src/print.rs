@@ -50,7 +50,8 @@ impl Layout {
     }
 }
 
-/// 解析自定义页码范围串（如 `"1, 3-5, 8"`），返回去重保序的 0 基页码列表；空串表示全部页
+/// 解析自定义页码范围串（如 `"1, 3-5, 8"`），返回去重保序的 0 基页码列表；
+/// 空串表示全部页；非空串中若没有任何有效页码落在 `1..=total_pages` 内，则返回空列表而非静默回退全部页。
 pub fn parse_page_ranges(spec: &str, total_pages: usize) -> Vec<usize> {
     if total_pages == 0 {
         return Vec::new();
@@ -69,8 +70,12 @@ pub fn parse_page_ranges(spec: &str, total_pages: usize) -> Vec<usize> {
         if let Some((a, b)) = p.split_once('-').or_else(|| p.split_once('–')) {
             let Ok(lo) = a.trim().parse::<usize>() else { continue };
             let Ok(hi) = b.trim().parse::<usize>() else { continue };
-            let (lo, hi) = (lo.max(1).min(total_pages), hi.max(1).min(total_pages));
-            let (start, end) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+            let (raw_start, raw_end) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+            if raw_end < 1 || raw_start > total_pages {
+                continue;
+            }
+            let start = raw_start.max(1);
+            let end = raw_end.min(total_pages);
             for one in start..=end {
                 let idx = one - 1;
                 if seen.insert(idx) {
@@ -87,11 +92,7 @@ pub fn parse_page_ranges(spec: &str, total_pages: usize) -> Vec<usize> {
             }
         }
     }
-    if out.is_empty() {
-        (0..total_pages).collect()
-    } else {
-        out
-    }
+    out
 }
 
 fn margins_pt(setup: &PageSetup) -> (f32, f32, f32, f32) {
@@ -2502,7 +2503,25 @@ pub fn comment_summary_pages(wb: &Workbook, sheet_idx: usize, layout: &Layout) -
     if layout.setup.print_comments != 1 || sheet.notes.is_empty() {
         return Vec::new();
     }
-    let mut notes: Vec<_> = sheet.notes.iter().map(|(_, n)| n).collect();
+    let area = layout.setup.print_area;
+    let mut notes: Vec<_> = sheet
+        .notes
+        .iter()
+        .map(|(_, n)| n)
+        .filter(|n| {
+            if let Some((r1, c1, r2, c2)) = area
+                && (n.r < r1 || n.r > r2 || n.c < c1 || n.c > c2)
+            {
+                return false;
+            }
+            !sheet.hidden_rows.contains(&n.r)
+                && !sheet.hidden_rows_user.contains(&n.r)
+                && !sheet.hidden_cols.contains(&n.c)
+        })
+        .collect();
+    if notes.is_empty() {
+        return Vec::new();
+    }
     notes.sort_by_key(|n| (n.r, n.c));
     let (pw, ph) = layout.page_size;
     let (ml, mr, mt, mb) = margins_pt(&layout.setup);
@@ -3083,6 +3102,9 @@ pub fn export_pdf_sheet_with_pack(
         Some(list) => list.iter().copied().filter(|&i| i < total).collect(),
         None => (0..total).collect(),
     };
+    if indices.is_empty() {
+        anyhow::bail!("没有可导出的有效页码（共 {total} 页）");
+    }
     let (asc_em, desc_em) = pack.regular.em_metrics();
     let vmetric: Option<std::sync::Arc<dyn Fn(f32) -> (f32, f32) + Send + Sync>> = Some(
         std::sync::Arc::new(move |size: f32| (asc_em * size, desc_em * size)),

@@ -340,8 +340,11 @@ impl FValue {
         Ok(match (self, other) {
             (FValue::Error(e), _) | (_, FValue::Error(e)) => return Err(*e),
             (FValue::Number(x), FValue::Number(y)) => {
+                // 仅吸收 IEEE-754 二进制表示的 1–2 ULP 舍入噪声（如 0.1+0.2 vs 0.3，相对误差 ~1.85e-16），
+                // 容差 2*f64::EPSILON (~4.44e-16) 严格小于 15 位有效数字最小间隔 (1e-15)，
+                // 避免万亿级对账金额的一分钱差异（如 2e12 vs 2e12+0.01，相对差 5e-15）被误判相等。
                 let scale = x.abs().max(y.abs());
-                if scale > 0.0 && (x - y).abs() <= scale * 1e-14 {
+                if scale > 0.0 && (x - y).abs() <= scale * (2.0 * f64::EPSILON) {
                     Ordering::Equal
                 } else {
                     x.partial_cmp(y).unwrap_or(Ordering::Equal)

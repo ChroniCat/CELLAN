@@ -1807,26 +1807,34 @@ pub fn advanced_filter(
     }
 
     if let Some((dr, dc)) = copy_to {
-        // 复制表头 + 命中行到目标位置
+        // 先完整快照表头与命中行，避免 copy_to 与源区重叠时读到刚覆写的新值
         let width = lc2 - lc1 + 1;
-        for off in 0..width {
-            let src_c = lc1 + off;
-            if let Some(cell) = sheet.get(lr1, src_c) {
-                sheet.set(dr, dc + off, cell.into_owned());
-            }
-            let sid = sheet.style_of(lr1, src_c);
-            if sid != 0 {
-                sheet.set_style(dr, dc + off, sid);
-            }
-        }
-        for (i, &src_r) in matched_rows.iter().enumerate() {
-            let dst_r = dr + 1 + i as u32;
-            for off in 0..width {
+        let mut snapshot: Vec<Vec<(crate::model::Cell, u16)>> = Vec::with_capacity(matched_rows.len() + 1);
+        let header_row: Vec<(crate::model::Cell, u16)> = (0..width)
+            .map(|off| {
                 let src_c = lc1 + off;
-                let cell = sheet.get(src_r, src_c).map(|c| c.into_owned()).unwrap_or_default();
-                sheet.set(dst_r, dc + off, cell);
-                let sid = sheet.style_of(src_r, src_c);
-                sheet.set_style(dst_r, dc + off, sid);
+                let cell = sheet.get(lr1, src_c).map(|c| c.into_owned()).unwrap_or_default();
+                let sid = sheet.style_of(lr1, src_c);
+                (cell, sid)
+            })
+            .collect();
+        snapshot.push(header_row);
+        for &src_r in &matched_rows {
+            let row_cells: Vec<(crate::model::Cell, u16)> = (0..width)
+                .map(|off| {
+                    let src_c = lc1 + off;
+                    let cell = sheet.get(src_r, src_c).map(|c| c.into_owned()).unwrap_or_default();
+                    let sid = sheet.style_of(src_r, src_c);
+                    (cell, sid)
+                })
+                .collect();
+            snapshot.push(row_cells);
+        }
+        for (row_off, row_cells) in snapshot.into_iter().enumerate() {
+            let dst_r = dr + row_off as u32;
+            for (col_off, (cell, sid)) in row_cells.into_iter().enumerate() {
+                sheet.set(dst_r, dc + col_off as u32, cell);
+                sheet.set_style(dst_r, dc + col_off as u32, sid);
             }
         }
         let end_r = dr + matched_rows.len() as u32;

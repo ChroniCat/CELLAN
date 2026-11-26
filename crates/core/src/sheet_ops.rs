@@ -29,6 +29,9 @@ pub fn insert_sheet(wb: &mut Workbook, idx: usize, mut sheet: Sheet) -> bool {
     for (i, ..) in &mut wb.pivots_pending2 {
         if *i >= idx { *i += 1; }
     }
+    for (i, ..) in &mut wb.pivot_calc_fields {
+        if *i >= idx { *i += 1; }
+    }
     for p in &mut wb.pivots {
         if p.target_sheet >= idx {
             p.target_sheet += 1;
@@ -80,10 +83,31 @@ pub fn delete_sheet(wb: &mut Workbook, idx: usize) -> bool {
     delete_with_history(wb, idx).is_some()
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DeletedSheetPivots {
+    pub pivots: Vec<crate::pivot_engine::PivotTableModel>,
+    pub pivots_pending: Vec<(
+        usize,
+        crate::pivot::PivotSpec,
+        crate::pivot::PivotResult,
+        (u32, u32, u32, u32),
+        String,
+    )>,
+    pub pivots_pending2: Vec<(
+        usize,
+        crate::pivot_multi::PivotSpec2,
+        crate::pivot_multi::PivotGrid,
+        (u32, u32, u32, u32),
+    )>,
+    pub pivot_shifts: Vec<(String, u8, u32, u32, bool)>,
+    pub pivot_calc_fields: Vec<(usize, String, String)>,
+}
+
 pub(crate) struct DeletedSheetRecord {
     pub sheet: Sheet,
     pub local_names: Vec<(String, Option<usize>, String)>,
     pub references: RenameReferences,
+    pub pivots: DeletedSheetPivots,
 }
 
 pub(crate) fn delete_with_history(wb: &mut Workbook, idx: usize) -> Option<DeletedSheetRecord> {
@@ -111,37 +135,85 @@ pub(crate) fn delete_with_history(wb: &mut Workbook, idx: usize) -> Option<Delet
     }
     let mut references = RenameReferences::default();
     rewrite_qualifiers(wb, &old, None, Some(&order), Some(&mut references));
-    wb.pivot_shifts.retain(|(sheet, ..)| !sheet.eq_ignore_ascii_case(&old));
-    wb.pivots_pending.retain(|(sheet, ..)| *sheet != idx);
-    for (sheet, ..) in &mut wb.pivots_pending {
-        if *sheet > idx { *sheet -= 1; }
+
+    let mut deleted_shifts = Vec::new();
+    let mut kept_shifts = Vec::with_capacity(wb.pivot_shifts.len());
+    for entry in std::mem::take(&mut wb.pivot_shifts) {
+        if entry.0.eq_ignore_ascii_case(&old) {
+            deleted_shifts.push(entry);
+        } else {
+            kept_shifts.push(entry);
+        }
     }
-    wb.pivots_pending2.retain(|(sheet, ..)| *sheet != idx);
-    for (sheet, ..) in &mut wb.pivots_pending2 {
-        if *sheet > idx { *sheet -= 1; }
+    wb.pivot_shifts = kept_shifts;
+
+    let mut deleted_pending = Vec::new();
+    let mut kept_pending = Vec::with_capacity(wb.pivots_pending.len());
+    for mut entry in std::mem::take(&mut wb.pivots_pending) {
+        if entry.0 == idx {
+            deleted_pending.push(entry);
+        } else {
+            if entry.0 > idx { entry.0 -= 1; }
+            kept_pending.push(entry);
+        }
     }
+    wb.pivots_pending = kept_pending;
+
+    let mut deleted_pending2 = Vec::new();
+    let mut kept_pending2 = Vec::with_capacity(wb.pivots_pending2.len());
+    for mut entry in std::mem::take(&mut wb.pivots_pending2) {
+        if entry.0 == idx {
+            deleted_pending2.push(entry);
+        } else {
+            if entry.0 > idx { entry.0 -= 1; }
+            kept_pending2.push(entry);
+        }
+    }
+    wb.pivots_pending2 = kept_pending2;
+
+    let mut deleted_calc_fields = Vec::new();
+    let mut kept_calc_fields = Vec::with_capacity(wb.pivot_calc_fields.len());
+    for mut entry in std::mem::take(&mut wb.pivot_calc_fields) {
+        if entry.0 == idx {
+            deleted_calc_fields.push(entry);
+        } else {
+            if entry.0 > idx { entry.0 -= 1; }
+            kept_calc_fields.push(entry);
+        }
+    }
+    wb.pivot_calc_fields = kept_calc_fields;
+
+    let mut deleted_pivots = Vec::new();
     let mut removed_parts = Vec::new();
-    wb.pivots.retain(|p| {
+    let mut kept_pivots = Vec::with_capacity(wb.pivots.len());
+    for mut p in std::mem::take(&mut wb.pivots) {
         if p.target_sheet == idx {
             if let Some(part) = &p.imported_part {
                 removed_parts.push(part.clone());
             }
-            false
+            deleted_pivots.push(p);
         } else {
-            true
-        }
-    });
-    wb.pivots_removed_parts.extend(removed_parts);
-    for p in &mut wb.pivots {
-        if p.target_sheet > idx {
-            p.target_sheet -= 1;
+            if p.target_sheet > idx {
+                p.target_sheet -= 1;
+            }
+            kept_pivots.push(p);
         }
     }
+    wb.pivots = kept_pivots;
+    wb.pivots_removed_parts.extend(removed_parts.iter().cloned());
+
     wb.dirty = true;
     Some(DeletedSheetRecord {
         sheet: removed_sheet,
         local_names,
         references,
+        pivots: DeletedSheetPivots {
+            pivots: deleted_pivots,
+            pivots_pending: deleted_pending,
+            pivots_pending2: deleted_pending2,
+            pivot_shifts: deleted_shifts,
+            pivot_calc_fields: deleted_calc_fields,
+        },
     })
 }
 
@@ -151,6 +223,7 @@ pub(crate) fn restore_deleted_sheet(
     sheet: Sheet,
     local_names: &[(String, Option<usize>, String)],
     references: &RenameReferences,
+    deleted_pivots: &DeletedSheetPivots,
 ) -> bool {
     if idx > wb.sheets.len() || !valid_name(wb, None, &sheet.name) {
         return false;
@@ -187,6 +260,35 @@ pub(crate) fn restore_deleted_sheet(
         let (before, after) = remapped.get(&field)?;
         (text == after).then(|| before.clone())
     });
+
+    // Restore pivots and pivot metadata that belonged to the deleted sheet
+    for mut p in deleted_pivots.pivots.iter().cloned() {
+        p.target_sheet = idx;
+        if let Some(part) = &p.imported_part {
+            if let Some(pos) = wb.pivots_removed_parts.iter().position(|r| r == part) {
+                wb.pivots_removed_parts.remove(pos);
+            } else {
+                // If an intermediate save already stripped the imported part from disk,
+                // mark the restored pivot modified so the next save regenerates its XML.
+                p.modified = true;
+            }
+        }
+        wb.pivots.push(p);
+    }
+    for mut entry in deleted_pivots.pivots_pending.iter().cloned() {
+        entry.0 = idx;
+        wb.pivots_pending.push(entry);
+    }
+    for mut entry in deleted_pivots.pivots_pending2.iter().cloned() {
+        entry.0 = idx;
+        wb.pivots_pending2.push(entry);
+    }
+    for mut entry in deleted_pivots.pivot_calc_fields.iter().cloned() {
+        entry.0 = idx;
+        wb.pivot_calc_fields.push(entry);
+    }
+    wb.pivot_shifts.extend(deleted_pivots.pivot_shifts.iter().cloned());
+
     wb.dirty = true;
     true
 }

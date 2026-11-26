@@ -1258,7 +1258,7 @@ pub struct SaveReceipt {
     pub used_cell_delta: bool,
     sheets: std::collections::HashMap<u64, SavedSheet>,
     source_encryption: Option<crate::crypto::EncryptionSettings>,
-    committed_charts: std::collections::HashMap<u64, Vec<SavedChart>>,
+    committed_charts: std::collections::HashMap<u64, (Vec<SavedChart>, Vec<(String, String)>)>,
 }
 
 #[derive(Debug)]
@@ -1277,6 +1277,17 @@ struct SavedChart {
     anchor: (u32, u32, u32, u32),
     ref_fixes: Vec<(String, String)>,
     created: Option<(crate::charts::Chart, String, String)>,
+    saved_content: Option<crate::charts::Chart>,
+}
+
+fn chart_content_matches(live: &crate::charts::Chart, saved: &crate::charts::Chart) -> bool {
+    let mut a = live.clone();
+    let mut b = saved.clone();
+    a.anchor = b.anchor;
+    a.ref_fixes.clear();
+    b.ref_fixes.clear();
+    a.content_dirty = b.content_dirty;
+    a == b
 }
 
 struct RestoreFile(Option<std::path::PathBuf>);
@@ -1293,7 +1304,7 @@ impl SaveReceipt {
             if let Some(saved) = self.sheets.get(&sheet.identity) {
                 sheet.source_part = Some(saved.part.clone());
             }
-            if let Some(saved) = self.committed_charts.get(&sheet.identity) {
+            if let Some((saved, saved_deleted)) = self.committed_charts.get(&sheet.identity) {
                 let mut dirty = saved.len() != sheet.charts.len();
                 for (index, chart) in sheet.charts.iter_mut().enumerate() {
                     let Some((saved_index, baseline)) = saved.iter().enumerate().find(|(i, old)| {
@@ -1314,7 +1325,15 @@ impl SaveReceipt {
                         chart.drawing.clone_from(drawing);
                         chart.content_dirty = false;
                     } else if chart.content_dirty {
-                        chart.content_dirty = false;
+                        // 仅当图表内容与本次已落盘快照完全一致时才清脏标；
+                        // 后台保存期间若又发生新的图表内容编辑，保留 content_dirty 以便下次保存落盘。
+                        if baseline
+                            .saved_content
+                            .as_ref()
+                            .is_some_and(|saved_ch| chart_content_matches(chart, saved_ch))
+                        {
+                            chart.content_dirty = false;
+                        }
                     }
                     if chart.ref_fixes.starts_with(&baseline.ref_fixes) {
                         chart.ref_fixes.drain(..baseline.ref_fixes.len());
@@ -1325,7 +1344,8 @@ impl SaveReceipt {
                         || !chart.ref_fixes.is_empty()
                         || chart.content_dirty;
                 }
-                sheet.deleted_charts.clear();
+                sheet.deleted_charts.retain(|item| !saved_deleted.contains(item));
+                dirty |= !sheet.deleted_charts.is_empty();
                 sheet.charts_dirty = dirty;
             }
         }
@@ -1480,12 +1500,17 @@ fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveR
         sheets,
         source_encryption: wb.encryption.clone(),
         committed_charts: wb.sheets.iter().filter(|s| s.charts_dirty || !s.deleted_charts.is_empty() || write.created_charts.keys().any(|(id, _)| *id == s.identity)).map(|sheet| {
-            let charts = sheet.charts.iter().enumerate().map(|(i, chart)| SavedChart {
-                part: chart.part.clone(), drawing: chart.drawing.clone(),
-                anchor: chart.anchor, ref_fixes: chart.ref_fixes.clone(),
-                created: write.created_charts.get(&(sheet.identity, i)).map(|(part, drawing)| (chart.clone(), part.clone(), drawing.clone())),
+            let charts = sheet.charts.iter().enumerate().map(|(i, chart)| {
+                let created = write.created_charts.get(&(sheet.identity, i)).map(|(part, drawing)| (chart.clone(), part.clone(), drawing.clone()));
+                let saved_content = (created.is_none() && chart.content_dirty).then(|| chart.clone());
+                SavedChart {
+                    part: chart.part.clone(), drawing: chart.drawing.clone(),
+                    anchor: chart.anchor, ref_fixes: chart.ref_fixes.clone(),
+                    created,
+                    saved_content,
+                }
             }).collect();
-            (sheet.identity, charts)
+            (sheet.identity, (charts, sheet.deleted_charts.clone()))
         }).collect(),
     })
 }

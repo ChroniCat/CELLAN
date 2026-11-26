@@ -11941,4 +11941,473 @@ fn gap10_shortcuts_table_borders_general_note_and_new_sheet() {
     assert_eq!(app.wb.sheets.len(), n_before + 1, "Shift+F11 应新增工作表");
 }
 
+// =========================================================================
+// CELLAN v1.80 (641c8b4) 审阅报告 10 项客户端缺陷定向回归测试
+// =========================================================================
+
+/// A1 (P1): 筛选隐藏第 3 行后复制 7 粘贴到 B2:B4，绝不能越界覆写未选中的 B5。
+#[test]
+fn v180_a1_filtered_paste_stays_within_selection() {
+    let _env = crate::test_env::TestEnv::new("v180-a1-filter-paste");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, number(7.0)); // A1 = 7
+        sh.set(1, 1, number(10.0)); // B2
+        sh.set(2, 1, number(20.0)); // B3 (将被隐藏)
+        sh.set(3, 1, number(30.0)); // B4
+        sh.set(4, 1, number(999.0)); // B5 (选区外)
+        sh.hidden_rows.insert(2); // 隐藏第 3 行 (0-based row 2)
+    }
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.clip_copy(false, &ctx);
+
+    app.sel = (1, 1);
+    app.sel_end = (3, 1); // 选中 B2:B4
+    app.clip_paste(false, None);
+
+    let sh = app.wb.sheet(0);
+    assert_eq!(sh.value(1, 1), Value::Number(7.0), "B2 应为 7");
+    assert_eq!(sh.value(2, 1), Value::Number(20.0), "隐藏行 B3 应保持原值 20");
+    assert_eq!(sh.value(3, 1), Value::Number(7.0), "B4 应为 7");
+    assert_eq!(sh.value(4, 1), Value::Number(999.0), "未选中的 B5 绝不能被覆写");
+}
+
+/// A5 (P1): 打开已有 XLSX 后通过名称框定义新名称，保存并重开后名称必须持久化。
+#[test]
+fn v180_a5_name_box_defined_name_persists_after_xlsx_save() {
+    let env = crate::test_env::TestEnv::new("v180-a5-namebox-save");
+    let path = env.path("names_base.xlsx");
+    let mut base = Workbook::new_blank();
+    base.sheets[0].set(0, 0, number(0.05));
+    sheetcore::xlsx::save_atomic(&path, &base).unwrap();
+
+    let mut app = app();
+    app.wb = sheetcore::xlsx::load(&path).unwrap();
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.name_buf = "Rate_Month".into();
+    app.goto_name();
+
+    assert!(app.wb.names_dirty, "名称框新建名称必须置 names_dirty=true");
+    assert!(
+        app.wb.names.iter().any(|(n, _, _)| n == "Rate_Month"),
+        "内存应存在 Rate_Month"
+    );
+    sheetcore::xlsx::save_atomic(&path, &app.wb).unwrap();
+    let reopened = sheetcore::xlsx::load(&path).unwrap();
+    assert!(
+        reopened.names.iter().any(|(n, _, _)| n == "Rate_Month"),
+        "保存重开后 Rate_Month 不得消失"
+    );
+}
+
+/// A6 (P2): 重叠区域“选择性粘贴批注”（A1:A2 贴到 A2），A2 与 A3 应分别得到“甲”和“乙”。
+#[test]
+fn v180_a6_overlapping_paste_special_comments_preserves_all_notes() {
+    let _env = crate::test_env::TestEnv::new("v180-a6-overlap-notes");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, text("r1"));
+        sh.set(1, 0, text("r2"));
+        sh.notes.insert(
+            sheetcore::CellRef::new(0, 0),
+            sheetcore::notes::Note { r: 0, c: 0, author: "u".into(), text: "甲".into() },
+        );
+        sh.notes.insert(
+            sheetcore::CellRef::new(1, 0),
+            sheetcore::notes::Note { r: 1, c: 0, author: "u".into(), text: "乙".into() },
+        );
+    }
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+    app.clip_copy(false, &ctx);
+
+    app.sel = (1, 0);
+    app.sel_end = (1, 0);
+    app.ps_kind = 8; // 仅批注
+    app.paste_special_apply_text(&ctx, None);
+
+    let sh = app.wb.sheet(0);
+    assert_eq!(sh.notes.get(&sheetcore::CellRef::new(1, 0)).map(|n| n.text.as_str()), Some("甲"));
+    assert_eq!(sh.notes.get(&sheetcore::CellRef::new(2, 0)).map(|n| n.text.as_str()), Some("乙"));
+}
+
+/// B4 (P1): Ctrl+Enter 批量填充公式时，必须按每格实际偏移后的公式校验数据验证。
+#[test]
+fn v180_b4_ctrl_enter_validates_translated_formula_per_cell() {
+    let _env = crate::test_env::TestEnv::new("v180-b4-dv-ctrl-enter");
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, number(1.0));   // A1 = 1
+        sh.set(1, 0, number(100.0)); // A2 = 100
+        sh.dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(0, 1, 1, 1)], // B1:B2
+            kind: sheetcore::dv::DvKind::Whole,
+            op: sheetcore::dv::DvOp::Between,
+            f1: "1".into(),
+            f2: "10".into(),
+            allow_blank: true,
+            show_dropdown: false,
+            error_style: sheetcore::dv::DvStyle::Stop,
+            error_title: "输入受限".into(),
+            error_msg: "仅允许 1-10".into(),
+            ..Default::default()
+        });
+    }
+    app.sel = (0, 1);
+    app.sel_end = (1, 1); // B1:B2
+    app.editing = Some(EditState::new("=A1".into()));
+    let committed = app.commit_edit_fill_selection();
+    assert!(!committed, "B2 偏移后为 =A2 (=100)，必须被 Stop 验证拒绝");
+    assert!(app.wb.sheet(0).get(0, 1).is_none(), "拒绝后 B1 不应写入");
+    assert!(app.wb.sheet(0).get(1, 1).is_none(), "拒绝后 B2 不应写入");
+    assert!(app.editing.is_some(), "Stop 拒绝后应保留编辑框供重试");
+}
+
+/// B5 (P1): 确认一格的警告型验证，绝不能跳过同批其他格的停止型验证。
+#[test]
+fn v180_b5_confirming_warning_cannot_bypass_other_cell_stop_dv() {
+    let _env = crate::test_env::TestEnv::new("v180-b5-dv-stop-priority");
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(0, 1, 0, 1)], // B1: Warning 1..=10
+            kind: sheetcore::dv::DvKind::Whole,
+            op: sheetcore::dv::DvOp::Between,
+            f1: "1".into(),
+            f2: "10".into(),
+            allow_blank: true,
+            error_style: sheetcore::dv::DvStyle::Warning,
+            error_title: "警告".into(),
+            error_msg: "B1 超限".into(),
+            ..Default::default()
+        });
+        sh.dv.push(sheetcore::dv::DataValidation {
+            ranges: vec![(1, 1, 1, 1)], // B2: Stop 1..=10
+            kind: sheetcore::dv::DvKind::Whole,
+            op: sheetcore::dv::DvOp::Between,
+            f1: "1".into(),
+            f2: "10".into(),
+            allow_blank: true,
+            error_style: sheetcore::dv::DvStyle::Stop,
+            error_title: "禁止".into(),
+            error_msg: "B2 禁止超限".into(),
+            ..Default::default()
+        });
+    }
+    app.sel = (0, 1);
+    app.sel_end = (1, 1); // B1:B2
+    app.editing = Some(EditState::new("100".into()));
+    let committed = app.commit_edit_fill_selection();
+    assert!(!committed, "含 B2 Stop 规则时整批必须被直接拒绝");
+    assert!(app.dv_alert.is_none(), "存在 Stop 违例时不应弹出可强制放行的 Warning 框");
+    assert!(app.wb.sheet(0).get(1, 1).is_none(), "B2 不得写入 100");
+
+    // 即使人工置 dv_force_once=true，也不能绕过 B2 的 Stop 规则
+    app.dv_force_once = true;
+    app.editing = Some(EditState::new("100".into()));
+    assert!(!app.commit_edit_fill_selection(), "dv_force_once 也不能绕过 Stop 规则");
+    assert!(app.wb.sheet(0).get(1, 1).is_none(), "B2 仍不得写入 100");
+}
+
+/// C2 (P2): 打印工作室自定义页码全部越界时拒绝导出，不能静默导出全部页面。
+#[test]
+fn v180_c2_print_studio_rejects_out_of_range_custom_pages() {
+    let env = crate::test_env::TestEnv::new("v180-c2-print-range");
+    let mut app = app();
+    for r in 0..120u32 {
+        app.wb.sheet_mut(0).set(r, 0, number(f64::from(r + 1)));
+    }
+    let total = sheetcore::print::paginate(app.wb.sheet(0), &app.wb.sheet(0).page).pages.len();
+    assert!(total >= 2, "应分页至少 2 页，实际 {total}");
+
+    let pdf_path = env.path("out_of_range.pdf");
+    app.print_studio.scope = 0;
+    app.print_range = 2; // 自定义页码
+    app.print_studio.page_range_text = format!("{}", total + 1);
+    app.export_pdf_from_studio_to(&pdf_path);
+
+    assert!(!pdf_path.exists(), "越界自定义页码不能生成全页 PDF");
+    assert!(
+        app.status.contains("无效") || app.status.contains("超出"),
+        "状态栏应提示页码范围无效: {}",
+        app.status
+    );
+}
+
+/// D1 (P1): 客户端撤销/重做富文本编辑后，依赖公式必须自动重算。
+#[test]
+fn v180_d1_undo_rich_text_recalculates_dependent_formula() {
+    let _env = crate::test_env::TestEnv::new("v180-d1-rich-undo-recalc");
+    let mut app = app();
+    let old_c = text("旧标题");
+    let new_c = text("新版标题内容");
+    app.wb.sheet_mut(0).set(0, 0, new_c.clone());
+    app.wb.sheet_mut(0).set(0, 1, Cell { value: Value::Empty, formula: Some("=A1&\"!\"".into()) });
+    sheetcore::formula::recalc_all(&mut app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build_after_recalc(&app.wb).into();
+    app.deps_built = true;
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Text("新版标题内容!".into()));
+
+    app.undo.push_meta(
+        "富文本格式",
+        (0, 0, 0),
+        sheetcore::undo::MetaEdit {
+            sheet: 0,
+            rich: vec![((0, 0), old_c, new_c, None, None)],
+            ..Default::default()
+        },
+    );
+
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("旧标题".into()));
+    assert_eq!(
+        app.wb.sheet(0).value(0, 1),
+        Value::Text("旧标题!".into()),
+        "撤销富文本后依赖公式 B1 必须更新"
+    );
+
+    app.do_undo(true);
+    assert_eq!(
+        app.wb.sheet(0).value(0, 1),
+        Value::Text("新版标题内容!".into()),
+        "重做富文本后依赖公式 B1 必须更新"
+    );
+}
+
+/// D2 (P1): 共享原文件的协作访客调整行高/列宽后，应能委托宿主正常保存原文件并持久化。
+#[test]
+fn v180_d2_delegated_collab_guest_can_save_after_row_height_and_col_width_resize() {
+    let env = crate::test_env::TestEnv::new("v180-d2-guest-layout-save");
+    let path = env.path("shared_layout.xlsx");
+    let mut initial = Workbook::new_blank();
+    initial.sheets[0].set(0, 0, text("项目"));
+    sheetcore::xlsx::save_atomic(&path, &initial).unwrap();
+
+    // 启动真实本地 Host + Guest 协作会话
+    let (host_net, port) = crate::net::host_for_test(1, "Host", "shared_layout.xlsx", "pw");
+    let mut host = app();
+    host.wb = sheetcore::xlsx::load(&path).unwrap();
+    let mut host_peer = sheetcore::sync::Peer::new(1);
+    host_peer.seed_workbook(&host.wb);
+    host_net.seed_snapshot(
+        &host_peer,
+        &host.wb,
+        sheetcore::sync::Cursor {
+            site: 1,
+            name: "Host".into(),
+            color: 1,
+            sheet: 0,
+            row: 0,
+            col: 0,
+            end_row: None,
+            end_col: None,
+        },
+    );
+    host.net = Some(host_net);
+    host.peer = Some(host_peer);
+    host.joined_doc = true;
+
+    let guest_net = crate::net::join(
+        2,
+        "Guest".into(),
+        "shared_layout.xlsx".into(),
+        &format!("127.0.0.1:{port}"),
+        "pw".into(),
+    )
+    .unwrap();
+    let mut guest = app();
+    guest.wb = sheetcore::xlsx::load(&path).unwrap();
+    guest.shared_client_source = Some((guest.doc_uid, path.clone()));
+    guest.net = Some(guest_net);
+    guest.peer = Some(sheetcore::sync::Peer::new(2));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !guest.joined_doc && std::time::Instant::now() < deadline {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(guest.is_delegated_collab_client(), "访客应处于委托原文件协作态");
+
+    // 访客调整列宽与行高
+    guest.apply_col_widths_undoable(vec![(0, 180.0)], "调整 A 列宽".into());
+    guest.apply_row_heights_undoable(vec![(0, 48.0)], "调整第 1 行高".into());
+    assert!(
+        guest.host_receipt_covers_workbook(),
+        "已广播给宿主的行高/列宽改动不应阻断访客保存"
+    );
+
+    // 访客执行保存（委托宿主写盘并广播 Saved 回执）
+    guest.save(false);
+    assert!(
+        guest.delegated_save_pending.is_some(),
+        "访客 save(false) 应向宿主发起委托保存而非被本地拦截: status={}",
+        guest.status
+    );
+
+    let save_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while (guest.wb.dirty || guest.delegated_save_pending.is_some())
+        && std::time::Instant::now() < save_deadline
+    {
+        host.poll_net();
+        host.poll_save();
+        guest.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!guest.wb.dirty, "宿主保存回执后访客应清脏标，status={}", guest.status);
+    assert!(guest.delegated_save_pending.is_none());
+
+    let reopened = sheetcore::xlsx::load(&path).unwrap();
+    assert!(
+        (reopened.sheets[0].cols.size(0) - 180.0).abs() < 2.0,
+        "重开原文件应持久化访客调整的列宽，实际 {}",
+        reopened.sheets[0].cols.size(0)
+    );
+    assert!(
+        (reopened.sheets[0].rows.size(0) - 48.0).abs() < 2.0,
+        "重开原文件应持久化访客调整的行高，实际 {}",
+        reopened.sheets[0].rows.size(0)
+    );
+}
+
+/// D4 (P2): 外部 Excel/WPS 剪贴板同时含纯文本与富表格时，“仅格式”粘贴必须保留源格式。
+#[test]
+fn v180_d4_external_rich_clipboard_paste_formats_only_preserves_style() {
+    let _env = crate::test_env::TestEnv::new("v180-d4-ext-paste-formats");
+    let ctx = egui::Context::default();
+    let html = r#"<table><tr><td style="font-weight:bold;font-style:italic;background:#fff2cc;color:#c00000;mso-number-format:'#,##0.00'">123.45</td></tr></table>"#;
+    let make_rich = || {
+        crate::office_clipboard::RichClipboard::Block(crate::office_clipboard::parse_html(html))
+    };
+
+    // 路径 1：选择性粘贴弹窗 -> 仅格式 (ps_kind == 3)，同时存在外部纯文本 ext_text = Some("123.45")
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, text("保留原值"));
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.ps_kind = 3;
+    app.paste_special_apply_rich(&ctx, Some("123.45".into()), Some(make_rich()));
+
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("保留原值".into()), "仅格式不应覆写目标值");
+    let st = app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).clone();
+    assert!(st.bold && st.italic, "选择性粘贴仅格式应保留加粗/斜体: {st:?}");
+    assert_eq!(st.fill, Some([255, 242, 204]), "应保留底色");
+    assert_eq!(st.color, [192, 0, 0], "应保留字色");
+
+    // 路径 2：WPS 快捷菜单 -> PasteMode::Formats
+    app.wb.sheet_mut(0).set(0, 1, text("保留B1"));
+    app.sel = (0, 1);
+    app.sel_end = (0, 1);
+    app.apply_wps_paste_variant_rich(
+        crate::wps_menus::PasteMode::Formats,
+        Some("123.45".into()),
+        Some(make_rich()),
+    );
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Text("保留B1".into()));
+    let st2 = app.wb.styles.get(app.wb.sheet(0).style_of(0, 1)).clone();
+    assert!(st2.bold && st2.fill == Some([255, 242, 204]) && st2.color == [192, 0, 0]);
+}
+
+/// D5 (P2): 点击另一张工作表页签切换视图时，跨表格式刷不能被取消。
+#[test]
+fn v180_d5_switching_sheet_tab_preserves_cross_sheet_format_painter() {
+    let _env = crate::test_env::TestEnv::new("v180-d5-cross-sheet-painter");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.wb.sheets.push(sheetcore::model::Sheet::new("Sheet2"));
+    app.sel = (0, 0);
+    app.sel_end = (0, 0);
+    app.apply_style(|s| {
+        s.bold = true;
+        s.fill = Some([220, 235, 255]);
+    });
+    app.painter_double = false;
+    app.ribbon_action("FormatPainter", &ctx);
+    assert!(app.format_painter.is_some());
+
+    assert!(app.switch_sheet_view(1), "切换到 Sheet2");
+    assert!(app.format_painter.is_some(), "切换工作表页签绝不能取消跨表格式刷");
+
+    app.sel = (2, 2);
+    app.sel_end = (2, 2);
+    app.apply_format_painter();
+    let dst_st = app.wb.styles.get(app.wb.sheet(1).style_of(2, 2)).clone();
+    assert!(dst_st.bold && dst_st.fill == Some([220, 235, 255]), "跨表格式刷应正确套用到 Sheet2");
+}
+
+/// D6 (P2): 超过 16,384 格的格式刷必须同时复制条件格式和合并单元格，且支持单步撤销。
+#[test]
+fn v180_d6_format_painter_over_cow_threshold_copies_merges_and_cf_with_undo() {
+    let _env = crate::test_env::TestEnv::new("v180-d6-large-painter");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    {
+        let mut st = sheetcore::style::CellStyle::default();
+        st.bold = true;
+        let sid = app.wb.styles.intern(st);
+        let sh = app.wb.sheet_mut(0);
+        sh.set_style(0, 0, sid);
+        sh.set_style(0, 1, sid);
+        sh.merge_range(0, 0, 0, 1); // 1×2 合并格 A1:B1
+        sh.cf.dxfs.push(sheetcore::cf::Dxf {
+            bold: true,
+            fill: Some([255, 220, 220]),
+            ..Default::default()
+        });
+        sh.cf.blocks.push(sheetcore::cf::CfBlock {
+            ranges: vec![(0, 0, 0, 1)],
+            rules: vec![sheetcore::cf::CfRule {
+                priority: 1,
+                stop: false,
+                kind: sheetcore::cf::CfKind::CellIs {
+                    op: sheetcore::cf::CfOp::Greater,
+                    a: "10".into(),
+                    b: String::new(),
+                    dxf: 0,
+                },
+            }],
+        });
+    }
+    app.sel = (0, 0);
+    app.sel_end = (0, 1); // 源 1×2
+    app.painter_double = false;
+    app.ribbon_action("FormatPainter", &ctx);
+
+    // 目标 10,000 × 2 = 20,000 格 (> COW_BATCH_THRESHOLD = 16,384)
+    app.sel = (1, 0);
+    app.sel_end = (10_000, 1);
+    app.apply_format_painter();
+
+    assert_eq!(
+        app.wb.sheet(0).merges.len(),
+        1 + 10_000,
+        "超过 16,384 格格式刷应完整平铺合并单元格"
+    );
+    assert_eq!(
+        app.wb.sheet(0).cf.blocks.len(),
+        2,
+        "超过 16,384 格格式刷应复制条件格式块"
+    );
+    assert_eq!(
+        app.wb.sheet(0).cf.blocks[1].ranges,
+        vec![(1, 0, 10_000, 1)],
+        "整块覆盖的条件格式应折叠为单条紧凑范围，而非 10,000 条碎片"
+    );
+
+    // 单步撤销必须同时还原样式、合并单元格与条件格式
+    app.do_undo(false);
+    assert_eq!(app.wb.sheet(0).merges.len(), 1, "单步撤销应还原合并单元格");
+    assert_eq!(app.wb.sheet(0).cf.blocks.len(), 1, "单步撤销应还原条件格式");
+    assert!(!app.wb.styles.get(app.wb.sheet(0).style_of(5000, 0)).bold);
+}
+
+
 
