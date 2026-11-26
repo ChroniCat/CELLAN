@@ -904,6 +904,9 @@ pub fn compatibility_warnings(wb: &Workbook) -> Vec<String> {
     if has_notes {
         warns.push("批注与线程批注在旧版 .xls 写入器中不会被保留".into());
     }
+    if wb.audit.log.is_some() {
+        warns.push("不可篡改审计记录无法写入旧版 .xls，另存后将丢失审计链（如需保留请另存为 .xlsx）".into());
+    }
     if wb.date_system.is_1904() {
         warns.push("工作簿采用 1904 日期体系，请确认目标环境兼容".into());
     }

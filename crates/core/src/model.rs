@@ -829,6 +829,9 @@ pub struct Sheet {
     /// Runtime identity survives snapshots, renames and reordering. Save
     /// acknowledgements must never identify a sheet by its current index/name.
     pub identity: u64,
+    /// Persistent audit sheet slot bound to `Workbook.audit.log` across renames,
+    /// saves and reopens. Cleared on newly created or duplicated sheets.
+    pub audit_sheet_idx: Option<u16>,
     /// Immutable exact-match indexes shared by calculation snapshots of this sheet.
     pub(crate) shared_lookup: crate::formula::lookup_cache::SharedLookup,
     /// Stable worksheet part in the loaded OOXML package. Renaming/reordering a
@@ -1006,6 +1009,7 @@ impl Sheet {
         Self {
             name: name.into(),
             identity: next_sheet_identity(),
+            audit_sheet_idx: None,
             shared_lookup: Default::default(),
             source_part: None,
             source_needs_dom_repair: false,
@@ -1126,6 +1130,7 @@ impl Sheet {
     /// A copy inserted as a new sheet must not inherit the original identity.
     pub fn renew_identity(&mut self) {
         self.identity = next_sheet_identity();
+        self.audit_sheet_idx = None;
         self.source_part = None;
         self.source_needs_dom_repair = false;
         self.saved_cells = None;

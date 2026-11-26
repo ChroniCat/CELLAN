@@ -1083,6 +1083,9 @@ pub fn load_diag_with_control(
         if let Some(zip) = shared_zip.as_mut() {
             wb.pivots = crate::pivot_parse::load_pivots_from_zip(zip, &wb);
             wb.audit = crate::audit::read_from_zip(zip);
+            if let Some(log) = wb.audit.log.as_ref().cloned() {
+                log.bind_workbook_sheets(&mut wb);
+            }
         }
         if std::env::var("SC_LOAD_PROF").is_ok() {
             eprintln!("[load] 总计 {:.2}s", t_all_load.elapsed().as_secs_f64());
@@ -1263,6 +1266,8 @@ pub struct SaveReceipt {
     committed_charts: std::collections::HashMap<u64, (Vec<SavedChart>, Vec<(String, String)>)>,
     /// 本次落盘的防篡改审计日志快照（后台保存完成后回写至活动工作簿）
     pub committed_audit: Option<std::sync::Arc<crate::audit::AuditLog>>,
+    /// 本次落盘的目标格式不支持或主动剥离了审计日志（如另存为旧版 `.xls`），回写时须清空内存审计态
+    pub cleared_audit: bool,
 }
 
 #[derive(Debug)]
@@ -1405,13 +1410,22 @@ impl SaveReceipt {
     pub fn adopt_document(&self, wb: &mut Workbook, target: &Path, calculation_matches: bool) {
         self.apply_to(wb);
         wb.path = Some(target.to_owned());
-        if let Some(committed) = &self.committed_audit {
+        if self.cleared_audit {
+            wb.audit.log = None;
+            wb.audit.stripped_marker = None;
+            wb.audit.parse_error = None;
+            wb.audit.strip_on_save = false;
+            for sh in &mut wb.sheets {
+                sh.audit_sheet_idx = None;
+            }
+        } else if let Some(committed) = &self.committed_audit {
             let live_seq = wb.audit.log.as_ref().map(|l| l.head_seq()).unwrap_or(0);
             if committed.head_seq() >= live_seq {
                 wb.audit.log = Some(committed.clone());
                 wb.audit.stripped_marker = None;
                 wb.audit.parse_error = None;
                 wb.audit.strip_on_save = false;
+                committed.bind_workbook_sheets(wb);
             }
         }
         for sheet in &mut wb.sheets {
@@ -1557,7 +1571,8 @@ fn package_receipt(path: &Path, wb: &Workbook, write: CellWrite) -> Result<SaveR
         used_cell_delta: write.used_delta,
         sheets,
         source_encryption: wb.encryption.clone(),
-        committed_audit: wb.audit.log.clone(),
+        committed_audit: if wb.audit.strip_on_save { None } else { wb.audit.log.clone() },
+        cleared_audit: wb.audit.strip_on_save,
         committed_charts: wb.sheets.iter().filter(|s| s.charts_dirty || !s.deleted_charts.is_empty() || write.created_charts.keys().any(|(id, _)| *id == s.identity)).map(|sheet| {
             let charts = sheet.charts.iter().enumerate().map(|(i, chart)| {
                 let created = write.created_charts.get(&(sheet.identity, i)).map(|(part, drawing)| (chart.clone(), part.clone(), drawing.clone()));
@@ -2218,7 +2233,10 @@ fn save_atomic_model(path: &Path, wb: &mut Cow<'_, Workbook>) -> Result<SaveRece
         .then(|| collect_trusted_signatures(wb));
     let mut pending_decrypted_cache: Option<(String, Vec<u8>, Option<(u64, [u8; 32])>)> = None;
     let receipt = if is_xls {
-        crate::xls_write::write(&staged, wb).map(|_| SaveReceipt::default())?
+        crate::xls_write::write(&staged, wb).map(|_| SaveReceipt {
+            cleared_audit: true,
+            ..SaveReceipt::default()
+        })?
     } else {
         write_ooxml_with_cache(
             &staged,
@@ -3022,6 +3040,9 @@ fn try_load_ooxml_from_memory(
     });
     wb.pivots = crate::pivot_parse::load_pivots_from_zip(&mut shared_zip, &wb);
     wb.audit = crate::audit::read_from_zip(&mut shared_zip);
+    if let Some(log) = wb.audit.log.as_ref().cloned() {
+        log.bind_workbook_sheets(&mut wb);
+    }
     wb.load_incomplete = diag.has_fatal();
     for sheet in &wb.sheets {
         for (cref, cell) in sheet.formula_cells() {

@@ -663,13 +663,14 @@ pub fn launcher_at(ui: &mut egui::Ui, group_rect: Rect, id: &str) -> bool {
         size,
     );
     let resp = ui.interact(rect, egui::Id::new(("grp_launch", id)), Sense::click());
+    let pal = crate::theme::palette();
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 3.0, HOVER);
+        ui.painter().rect_filled(rect, 3.0, pal.hover);
     }
     let c = if resp.hovered() {
-        BRAND_NAVY
+        pal.accent
     } else {
-        Color32::from_rgb(148, 163, 184)
+        pal.text_weak
     };
     let p = ui.painter();
     let st = Stroke::new(1.1, c);
@@ -834,19 +835,20 @@ pub fn big_sized_split_galley(
             .min;
         ui.painter().galley(pos, g, col);
     }
+    let pal = crate::theme::palette();
     if hovered_any && enabled {
         ui.painter().line_segment(
             [
                 egui::pos2(rect.left() + 4.0, rect.bottom() - 13.5),
                 egui::pos2(rect.right() - 4.0, rect.bottom() - 13.5),
             ],
-            Stroke::new(1.0, Color32::from_rgb(203, 213, 225)),
+            Stroke::new(1.0, pal.card_border),
         );
     }
     caret(
         ui,
         egui::pos2(rect.center().x, rect.bottom() - 7.0),
-        if enabled { Color32::from_rgb(100, 116, 139) } else { DISABLED },
+        if enabled { pal.text_weak } else { pal.text_muted },
     );
     (resp, aresp)
 }
@@ -907,14 +909,20 @@ pub fn check_row(ui: &mut egui::Ui, label: &str, checked: bool, enabled: bool, w
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 2.0, bg);
     }
+    let pal = crate::theme::palette();
     let box_rect = Rect::from_center_size(
         egui::pos2(rect.left() + 14.0, rect.center().y),
         Vec2::splat(13.0),
     );
     if checked && enabled {
-        ui.painter().rect_filled(box_rect, 2.0, ACCENT);
+        ui.painter().rect_filled(box_rect, 2.0, pal.accent);
         let p = ui.painter();
-        let st = Stroke::new(1.8, Color32::WHITE);
+        let tick_col = if pal.theme == crate::theme::AppTheme::HighContrast {
+            Color32::BLACK
+        } else {
+            Color32::WHITE
+        };
+        let st = Stroke::new(1.8, tick_col);
         p.line_segment(
             [
                 egui::pos2(box_rect.left() + 3.0, box_rect.center().y),
@@ -933,8 +941,8 @@ pub fn check_row(ui: &mut egui::Ui, label: &str, checked: bool, enabled: bool, w
         ui.painter().rect(
             box_rect,
             2.0,
-            Color32::WHITE,
-            Stroke::new(1.0, if enabled { Color32::from_rgb(171, 169, 167) } else { Color32::from_rgb(210, 210, 210) }),
+            pal.card_bg,
+            Stroke::new(1.0, if enabled { pal.text_weak } else { pal.card_border }),
             egui::StrokeKind::Inside,
         );
     }
@@ -1172,7 +1180,7 @@ pub fn color_button(
         Vec2::new(12.0, 3.0),
     );
     ui.painter().rect_filled(bar, 1.0, color);
-    let ac = Color32::from_rgb(68, 68, 68);
+    let ac = crate::theme::palette().text_weak;
     ui.painter().add(egui::Shape::convex_polygon(
         vec![
             egui::pos2(rect.right() - 7.0, rect.bottom() - 6.0),
@@ -1245,10 +1253,8 @@ pub fn text_toggle(
 /// Fluent 风格功能区页签：直接浮在 PAGE_BG 上，活动页签用 2.5px 主题绿圆角短横条标记，
 /// 下方命令区独立收为完整四圆角纯白卡片，彻底告别「半灰半白双拼断层框」。
 pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Response {
-    let (dark, weak_col) = {
-        let v = ui.visuals();
-        (v.dark_mode, v.weak_text_color())
-    };
+    let pal = crate::theme::palette();
+    let dark = ui.visuals().dark_mode || pal.theme.is_dark();
     let font = if active || green {
         medium_in(ui.ctx(), 12.5)
     } else {
@@ -1263,26 +1269,38 @@ pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Respo
     if green {
         let pill = rect.shrink2(Vec2::new(2.0, 3.0));
         let fill = if resp.hovered() {
-            Color32::from_rgba_unmultiplied(33, 115, 70, 32)
+            if dark {
+                pal.pressed
+            } else {
+                Color32::from_rgba_unmultiplied(33, 115, 70, 32)
+            }
+        } else if dark {
+            pal.accent_tint
         } else {
             Color32::from_rgba_unmultiplied(33, 115, 70, 18)
         };
         ui.painter().rect_filled(pill, 5.0, fill);
+        if pal.theme == crate::theme::AppTheme::HighContrast {
+            ui.painter().rect_stroke(
+                pill,
+                5.0,
+                Stroke::new(1.0, pal.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
     } else if resp.hovered() && !active {
         ui.painter().rect_filled(
             rect.shrink2(Vec2::new(2.0, 3.0)),
             5.0,
-            HOVER_ON_PAGE,
+            pal.hover_on_page,
         );
     }
     let col = if green {
-        ACCENT
+        pal.accent
     } else if active {
-        if dark { Color32::WHITE } else { Color32::from_rgb(15, 23, 42) }
-    } else if dark {
-        weak_col
+        pal.text
     } else {
-        Color32::from_rgb(71, 85, 105)
+        pal.text_weak
     };
     let pos = Align2::CENTER_CENTER
         .anchor_size(rect.center(), galley.size())
@@ -1294,7 +1312,7 @@ pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Respo
             egui::pos2(rect.center().x, rect.bottom() - 2.0),
             Vec2::new(bar_w, 2.6),
         );
-        ui.painter().rect_filled(bar, 1.5, ACCENT);
+        ui.painter().rect_filled(bar, 1.5, pal.accent);
     }
     resp
 }
@@ -1319,7 +1337,7 @@ pub fn footer(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     let r = ui.available_rect_before_wrap();
     ui.painter().line_segment(
         [egui::pos2(r.left(), r.top()), egui::pos2(r.right(), r.top())],
-        Stroke::new(1.0, Color32::from_rgb(236, 239, 243)),
+        Stroke::new(1.0, crate::theme::palette().card_border),
     );
     ui.add_space(12.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1338,7 +1356,7 @@ pub fn footer_split(
     let r = ui.available_rect_before_wrap();
     ui.painter().line_segment(
         [egui::pos2(r.left(), r.top()), egui::pos2(r.right(), r.top())],
-        Stroke::new(1.0, Color32::from_rgb(236, 239, 243)),
+        Stroke::new(1.0, crate::theme::palette().card_border),
     );
     ui.add_space(12.0);
     ui.horizontal(|ui| {
@@ -1408,11 +1426,12 @@ pub fn a11y_role(
 
 /// UI-29.3：空/错误/警告/信息四种状态的颜色，来自 Fluent 的状态色而不是随手取的灰。
 pub fn state_color(kind: StateKind) -> Color32 {
+    let pal = crate::theme::palette();
     match kind {
-        StateKind::Empty => Color32::from_rgb(138, 136, 134),
-        StateKind::Error => Color32::from_rgb(196, 43, 28),
-        StateKind::Warn => Color32::from_rgb(157, 93, 0),
-        StateKind::Info => ACCENT,
+        StateKind::Empty => pal.text_weak,
+        StateKind::Error => pal.err_fg,
+        StateKind::Warn => pal.warn_fg,
+        StateKind::Info => pal.accent,
     }
 }
 
@@ -2473,6 +2492,7 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
 
 /// 对话框标签页（现代 Excel 365 / WPS 扁平下划线胶囊页签）
 pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
+    let pal = crate::theme::palette();
     let top = ui.cursor().top();
     let left = ui.cursor().left();
     let right = left + ui.available_width();
@@ -2482,7 +2502,7 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
             egui::pos2(left, top + tab_h - 0.5),
             egui::pos2(right, top + tab_h - 0.5),
         ],
-        Stroke::new(1.0, Color32::from_rgb(226, 232, 240)),
+        Stroke::new(1.0, pal.card_border),
     );
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
@@ -2507,26 +2527,26 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
                 ui.painter().rect_filled(
                     rect.shrink2(Vec2::new(1.0, 3.0)),
                     6.0,
-                    Color32::from_rgb(240, 247, 243),
+                    pal.accent_tint,
                 );
                 let bar = egui::Rect::from_min_size(
                     egui::pos2(rect.left() + 8.0, rect.bottom() - 2.5),
                     Vec2::new((rect.width() - 16.0).max(12.0), 2.5),
                 );
-                ui.painter().rect_filled(bar, 1.25, ACCENT);
-                ui.painter().galley_with_override_text_color(pos, galley, ACCENT);
+                ui.painter().rect_filled(bar, 1.25, pal.accent);
+                ui.painter().galley_with_override_text_color(pos, galley, pal.accent);
             } else {
                 if resp.hovered() {
                     ui.painter().rect_filled(
                         rect.shrink2(Vec2::new(1.0, 3.0)),
                         6.0,
-                        HOVER,
+                        pal.hover,
                     );
                 }
                 ui.painter().galley_with_override_text_color(
                     pos,
                     galley,
-                    if resp.hovered() { TEXT } else { TEXT_WEAK },
+                    if resp.hovered() { pal.text } else { pal.text_weak },
                 );
             }
             if resp.clicked() {
