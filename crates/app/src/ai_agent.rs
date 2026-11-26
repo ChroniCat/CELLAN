@@ -382,7 +382,8 @@ fn system_prompt() -> &'static str {
 }
 
 mod sheet_results;
-use sheet_results::{AiCalcBase, AiToolCalculation, AiToolOutput, CalcPoll, WorkbookToolView, WrittenCells};
+pub(crate) use sheet_results::AiToolOutput;
+use sheet_results::{AiCalcBase, AiToolCalculation, CalcPoll, WorkbookToolView, WrittenCells};
 
 fn checked_address(address: &str) -> Option<(u32, u32)> {
     let address = address.trim().strip_prefix('$').unwrap_or(address.trim());
@@ -419,7 +420,18 @@ fn build_workbook_context(app: &SheetApp, sheet_idx: usize, selection: (u32, u32
             .map(|(a, b, c, d)| range_label((a, b), (c, d)))
             .unwrap_or_else(|| "空表".into());
         let mark = if idx == sheet_idx { "（当前活动）" } else { "" };
-        out.push_str(&format!("- {}{}: 已用范围 {}\n", sh.name, mark, bounds));
+        let comment_total = {
+            let mut k = std::collections::HashSet::with_capacity(sh.notes.len() + sh.threads.len());
+            k.extend(sh.notes.keys().copied());
+            k.extend(sh.threads.keys().copied());
+            k.len()
+        };
+        let comment_info = if comment_total > 0 {
+            format!("，批注 {} 条（线程 {} 条）", comment_total, sh.threads.len())
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("- {}{}: 已用范围 {}{}\n", sh.name, mark, bounds, comment_info));
     }
     out.push_str(&format!(
         "\n当前活动工作表：{}，当前选区：{}（默认列宽 {:.0}px，默认行高 {:.0}px）\n",
@@ -588,7 +600,7 @@ impl SheetApp {
         WorkbookToolView { wb: &self.wb, sheet_idx: self.sheet_idx }.resolve_sheet_index(name)
     }
 
-    fn execute_ai_tool(&mut self, tc: &ToolCallSpec, ctx: &egui::Context) -> AiToolOutput {
+    pub(crate) fn execute_ai_tool(&mut self, tc: &ToolCallSpec, ctx: &egui::Context) -> AiToolOutput {
         let checkpoint = self.undo.checkpoint();
         let output = match tc.name.as_str() {
             "inspect_workbook" => {
@@ -648,6 +660,8 @@ impl SheetApp {
             "style_range" => self.tool_style_range(&tc.arguments).into(),
             "manage_sheet" => self.tool_manage_sheet(&tc.arguments).into(),
             "data_operation" => self.tool_data_operation(&tc.arguments, checkpoint, ctx),
+            "inspect_comments" => self.tool_inspect_comments(&tc.arguments).into(),
+            "manage_comments" => self.tool_manage_comments(&tc.arguments).into(),
             other => AiToolOutput::Ready(format!("未知工具：{other}"),
                 json!({"ok": false, "error": format!("不支持的工具名称: {other}")})),
         };
@@ -1100,6 +1114,468 @@ impl SheetApp {
             return (format!("设置样式 {span} 未执行"), json!({"ok": false, "error": self.status}));
         }
         (format!("设置样式 {span}"), json!({"ok": true, "range": span}))
+    }
+
+    pub(super) fn tool_inspect_comments(&self, args: &JsonValue) -> (String, JsonValue) {
+        let req_sheet = args
+            .get("sheet")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "*");
+        let target_sheet = if let Some(name) = req_sheet {
+            let Some(si) = self.resolve_sheet_index(Some(name)) else {
+                return (
+                    format!("读取批注失败：未找到工作表「{name}」"),
+                    json!({"ok": false, "error": format!("未找到工作表: {name}")}),
+                );
+            };
+            Some(si)
+        } else {
+            None
+        };
+        let status_filter = args
+            .get("status")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("all")
+            .trim()
+            .to_ascii_lowercase();
+        let author_filter = args
+            .get("author")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let query_filter = args
+            .get("query")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let limit = args
+            .get("limit")
+            .and_then(JsonValue::as_u64)
+            .map(|n| (n as usize).clamp(1, 500))
+            .unwrap_or(100);
+
+        let all = self.collect_comment_items(true);
+        let mut matched = Vec::new();
+        let mut total_matched = 0usize;
+        for item in all {
+            if let Some(only) = target_sheet
+                && item.sheet_idx != only
+            {
+                continue;
+            }
+            match status_filter.as_str() {
+                "open" if item.is_thread && item.resolved => continue,
+                "resolved" if !item.is_thread || !item.resolved => continue,
+                "threaded" if !item.is_thread => continue,
+                "legacy" if item.is_thread => continue,
+                _ => {}
+            }
+            if !author_filter.is_empty()
+                && !item.author.to_lowercase().contains(&author_filter)
+                && !item
+                    .entries
+                    .iter()
+                    .any(|e| e.author.to_lowercase().contains(&author_filter))
+            {
+                continue;
+            }
+            if !query_filter.is_empty() {
+                let hit = item.cell_addr.to_lowercase().contains(&query_filter)
+                    || item.text.to_lowercase().contains(&query_filter)
+                    || item.author.to_lowercase().contains(&query_filter)
+                    || item
+                        .entries
+                        .iter()
+                        .any(|e| e.text.to_lowercase().contains(&query_filter));
+                if !hit {
+                    continue;
+                }
+            }
+            total_matched += 1;
+            if matched.len() < limit {
+                let entries_json: Vec<JsonValue> = item
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "author": e.author,
+                            "timestamp": e.timestamp,
+                            "text": e.text,
+                        })
+                    })
+                    .collect();
+                matched.push(json!({
+                    "sheet": item.sheet_name,
+                    "cell": item.cell_addr,
+                    "cell_value": item.cell_value,
+                    "kind": if item.is_thread { "thread" } else { "note" },
+                    "resolved": item.resolved,
+                    "author": item.author,
+                    "text": item.text,
+                    "reply_count": item.reply_count,
+                    "entries": entries_json,
+                }));
+            }
+        }
+        let scope_lbl = target_sheet
+            .map(|si| self.wb.sheet(si).name.as_str())
+            .unwrap_or("全工作簿");
+        (
+            format!("读取批注（{scope_lbl}，命中 {total_matched} 条）"),
+            json!({
+                "ok": true,
+                "scope": scope_lbl,
+                "total": total_matched,
+                "truncated": total_matched > matched.len(),
+                "comments": matched,
+            }),
+        )
+    }
+
+    fn tool_manage_comments(&mut self, args: &JsonValue) -> (String, JsonValue) {
+        let sheet_name = args.get("sheet").and_then(JsonValue::as_str);
+        let Some(si) = self.resolve_sheet_index(sheet_name) else {
+            return (
+                "管理批注失败：未找到目标工作表".into(),
+                json!({"ok": false, "error": "未找到指定工作表"}),
+            );
+        };
+        let Some(ops) = args.get("ops").and_then(JsonValue::as_array) else {
+            return (
+                "管理批注失败：缺少 ops 数组".into(),
+                json!({"ok": false, "error": "缺少 ops 数组"}),
+            );
+        };
+        if ops.is_empty() || ops.len() > 500 {
+            return (
+                "管理批注失败：单次 ops 数量需在 1..=500 之间".into(),
+                json!({"ok": false, "error": "单次 ops 数量需在 1..=500 之间"}),
+            );
+        }
+
+        // 先校验全部目标坐标并执行写前保护检查
+        let mut parsed_ops = Vec::with_capacity(ops.len());
+        let mut coords = Vec::with_capacity(ops.len());
+        for (idx, op) in ops.iter().enumerate() {
+            let Some(action) = op.get("action").and_then(JsonValue::as_str) else {
+                return (
+                    format!("管理批注失败：第 {} 项缺少 action", idx + 1),
+                    json!({"ok": false, "error": format!("第 {} 项缺少 action", idx + 1)}),
+                );
+            };
+            let Some(addr) = op.get("cell").and_then(JsonValue::as_str) else {
+                return (
+                    format!("管理批注失败：第 {} 项缺少 cell", idx + 1),
+                    json!({"ok": false, "error": format!("第 {} 项缺少 cell", idx + 1)}),
+                );
+            };
+            let Some((r, c)) = checked_address(addr) else {
+                return (
+                    format!("管理批注失败：无效单元格地址 {addr}"),
+                    json!({"ok": false, "error": format!("无效单元格地址: {addr}")}),
+                );
+            };
+            let (nr, nc) = self
+                .wb
+                .sheet(si)
+                .merge_at(r, c)
+                .map(|(mr1, mc1, _, _)| (mr1, mc1))
+                .unwrap_or((r, c));
+            coords.push((nr, nc));
+            parsed_ops.push((
+                action.to_string(),
+                nr,
+                nc,
+                op.get("text").and_then(JsonValue::as_str).map(str::to_string),
+                op.get("author").and_then(JsonValue::as_str).map(str::to_string),
+                op.get("threaded").and_then(JsonValue::as_bool).unwrap_or(false),
+            ));
+        }
+        if !self.write_preflight_on(si, &coords, "AI 批量管理批注") {
+            let msg = self.status.clone();
+            return (
+                format!("管理批注被拒绝：{msg}"),
+                json!({"ok": false, "error": msg}),
+            );
+        }
+
+        // 记录操作前的原始快照，确保整批 AI 批注修改合并为单条原子 MetaEdit 撤销步
+        let mut unique_coords = coords.clone();
+        unique_coords.sort_unstable();
+        unique_coords.dedup();
+        let before_notes: std::collections::HashMap<(u32, u32), Option<sheetcore::notes::Note>> =
+            unique_coords
+                .iter()
+                .map(|&(r, c)| {
+                    (
+                        (r, c),
+                        self.wb
+                            .sheet(si)
+                            .notes
+                            .get(&sheetcore::model::CellRef::new(r, c))
+                            .cloned(),
+                    )
+                })
+                .collect();
+        let before_threads: std::collections::HashMap<
+            (u32, u32),
+            Option<sheetcore::notes::ThreadedComment>,
+        > = unique_coords
+            .iter()
+            .map(|&(r, c)| {
+                (
+                    (r, c),
+                    self.wb
+                        .sheet(si)
+                        .threads
+                        .get(&sheetcore::model::CellRef::new(r, c))
+                        .cloned(),
+                )
+            })
+            .collect();
+
+        let default_author = self.comment_author_default();
+        let ts = crate::comments_panel::iso_utc_now();
+        let sheet_id = self.wb.sheet(si).identity;
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+
+        {
+            let sh = self.wb.sheet_mut(si);
+            for (action, r, c, text_opt, author_opt, threaded) in parsed_ops {
+                let key = sheetcore::model::CellRef::new(r, c);
+                let author = author_opt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| default_author.clone());
+                match action.as_str() {
+                    "set" => {
+                        let txt = text_opt
+                            .unwrap_or_default()
+                            .trim_end_matches(&['\r', '\n'][..])
+                            .to_string();
+                        if txt.trim().is_empty() {
+                            errors.push(format!("{}: set 操作缺少非空 text", cell_name(r, c)));
+                            skipped += 1;
+                            continue;
+                        }
+                        if let Some(tc) = sh.threads.get_mut(&key) {
+                            if let Some(first) = tc.entries.first_mut() {
+                                first.text = txt.clone();
+                            } else {
+                                tc.entries.push(sheetcore::notes::ThreadEntry {
+                                    id: sheetcore::notes::new_ooxml_guid(),
+                                    author: author.clone(),
+                                    timestamp: ts.clone(),
+                                    text: txt.clone(),
+                                });
+                            }
+                            let n = sheetcore::notes::Note {
+                                r,
+                                c,
+                                text: tc.summary_text(),
+                                author: tc.root_author().to_string(),
+                            };
+                            sh.notes.insert(key, n);
+                        } else if threaded {
+                            let tc = sheetcore::notes::ThreadedComment {
+                                r,
+                                c,
+                                resolved: false,
+                                entries: vec![sheetcore::notes::ThreadEntry {
+                                    id: sheetcore::notes::new_ooxml_guid(),
+                                    author: author.clone(),
+                                    timestamp: ts.clone(),
+                                    text: txt.clone(),
+                                }],
+                            };
+                            let n = sheetcore::notes::Note {
+                                r,
+                                c,
+                                text: tc.summary_text(),
+                                author: author.clone(),
+                            };
+                            sh.threads.insert(key, tc);
+                            sh.notes.insert(key, n);
+                        } else {
+                            sh.notes.insert(
+                                key,
+                                sheetcore::notes::Note {
+                                    r,
+                                    c,
+                                    text: txt,
+                                    author,
+                                },
+                            );
+                        }
+                        applied += 1;
+                    }
+                    "reply" => {
+                        let reply_txt = text_opt.unwrap_or_default().trim().to_string();
+                        if reply_txt.is_empty() {
+                            errors.push(format!("{}: reply 操作缺少非空 text", cell_name(r, c)));
+                            skipped += 1;
+                            continue;
+                        }
+                        let existing_note = sh.notes.get(&key).cloned();
+                        let tc = sh.threads.entry(key).or_insert_with(|| {
+                            let mut entries = Vec::new();
+                            if let Some(ref on) = existing_note
+                                && !on.text.trim().is_empty()
+                            {
+                                entries.push(sheetcore::notes::ThreadEntry {
+                                    id: sheetcore::notes::new_ooxml_guid(),
+                                    author: if on.author.trim().is_empty() {
+                                        author.clone()
+                                    } else {
+                                        on.author.trim().to_string()
+                                    },
+                                    timestamp: ts.clone(),
+                                    text: on.text.clone(),
+                                });
+                            }
+                            sheetcore::notes::ThreadedComment {
+                                r,
+                                c,
+                                resolved: false,
+                                entries,
+                            }
+                        });
+                        tc.entries.push(sheetcore::notes::ThreadEntry {
+                            id: sheetcore::notes::new_ooxml_guid(),
+                            author,
+                            timestamp: ts.clone(),
+                            text: reply_txt,
+                        });
+                        let n = sheetcore::notes::Note {
+                            r,
+                            c,
+                            text: tc.summary_text(),
+                            author: tc.root_author().to_string(),
+                        };
+                        sh.notes.insert(key, n);
+                        applied += 1;
+                    }
+                    "resolve" | "reopen" => {
+                        let want_resolved = action == "resolve";
+                        let existing_note = sh.notes.get(&key).cloned();
+                        if !sh.threads.contains_key(&key) && existing_note.is_none() {
+                            skipped += 1;
+                            continue;
+                        }
+                        let tc = sh.threads.entry(key).or_insert_with(|| {
+                            let on = existing_note.as_ref().unwrap();
+                            sheetcore::notes::ThreadedComment {
+                                r,
+                                c,
+                                resolved: want_resolved,
+                                entries: vec![sheetcore::notes::ThreadEntry {
+                                    id: sheetcore::notes::new_ooxml_guid(),
+                                    author: if on.author.trim().is_empty() {
+                                        author.clone()
+                                    } else {
+                                        on.author.trim().to_string()
+                                    },
+                                    timestamp: ts.clone(),
+                                    text: on.text.clone(),
+                                }],
+                            }
+                        });
+                        tc.resolved = want_resolved;
+                        let n = sheetcore::notes::Note {
+                            r,
+                            c,
+                            text: tc.summary_text(),
+                            author: tc.root_author().to_string(),
+                        };
+                        sh.notes.insert(key, n);
+                        applied += 1;
+                    }
+                    "delete" => {
+                        let rm_n = sh.notes.remove(&key).is_some();
+                        let rm_t = sh.threads.remove(&key).is_some();
+                        if rm_n || rm_t {
+                            self.pinned_comments.remove(&(sheet_id, key));
+                            self.comment_card_offsets.remove(&(sheet_id, key));
+                            applied += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+                    other => {
+                        errors.push(format!("{}: 不支持的 action '{other}'", cell_name(r, c)));
+                        skipped += 1;
+                    }
+                }
+            }
+        }
+
+        let mut note_diffs = Vec::new();
+        let mut thread_diffs = Vec::new();
+        for &(r, c) in &unique_coords {
+            let key = sheetcore::model::CellRef::new(r, c);
+            let old_n = before_notes.get(&(r, c)).cloned().flatten();
+            let new_n = self.wb.sheet(si).notes.get(&key).cloned();
+            if old_n != new_n {
+                note_diffs.push(((r, c), old_n, new_n));
+            }
+            let old_t = before_threads.get(&(r, c)).cloned().flatten();
+            let new_t = self.wb.sheet(si).threads.get(&key).cloned();
+            if old_t != new_t {
+                thread_diffs.push(((r, c), old_t, new_t));
+            }
+        }
+        if !note_diffs.is_empty() || !thread_diffs.is_empty() {
+            {
+                let sh = self.wb.sheet_mut(si);
+                if !note_diffs.is_empty() {
+                    sh.notes_dirty = true;
+                }
+                if !thread_diffs.is_empty() {
+                    sh.threads_dirty = true;
+                }
+                sh.bump_display_style_revision();
+            }
+            for ((r, c), _, new_n) in &note_diffs {
+                self.broadcast_note_meta(si, *r, *c, new_n.as_ref());
+            }
+            for ((r, c), _, new_t) in &thread_diffs {
+                self.broadcast_thread_meta(si, *r, *c, new_t.as_ref());
+            }
+            let focus = (si, unique_coords[0].0, unique_coords[0].1);
+            self.undo.push_meta(
+                "AI 管理批注",
+                focus,
+                sheetcore::undo::MetaEdit {
+                    sheet: si,
+                    notes: note_diffs,
+                    threads: thread_diffs,
+                    ..Default::default()
+                },
+            );
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.tasks.last_edit = Some(std::time::Instant::now());
+        }
+
+        let sh_name = self.wb.sheet(si).name.clone();
+        let log = format!("管理批注：{sh_name}（生效 {applied} 项，跳过 {skipped} 项）");
+        (
+            log,
+            json!({
+                "ok": errors.is_empty() || applied > 0,
+                "sheet": sh_name,
+                "applied": applied,
+                "skipped": skipped,
+                "errors": errors,
+            }),
+        )
     }
 
     fn tool_manage_sheet(&mut self, args: &JsonValue) -> (String, JsonValue) {
@@ -2566,7 +3042,9 @@ fn classify_tool_log(log: &str) -> (Icon, bool) {
     if is_err {
         return (Icon::InvalidCircle, true);
     }
-    let icon = if log.starts_with("读取") || log.starts_with("查看") {
+    let icon = if log.contains("批注") {
+        Icon::Comment
+    } else if log.starts_with("读取") || log.starts_with("查看") {
         Icon::Sheet
     } else if log.starts_with("搜索") {
         Icon::Find

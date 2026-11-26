@@ -912,6 +912,8 @@
             <button id="ShowShowCommentBtn" label="显示批注" imageMso="ShowComment" onAction="ShowComment" sizeString="104" keytip="H1"/>
           </box>
           <toggleButton id="ShowAllComments" label="显示所有批注" size="large" imageMso="ShowComment" screentip="切换常驻显示当前工作表的全部批注与线程会话" onAction="ShowAllComments" keytip="H2"/>
+          <toggleButton id="CommentsPanel" label="批注面板" size="large" imageMso="Comment" screentip="打开右侧批注管理侧边栏：搜索、筛选、快速回复、批量处理与导出汇总表" onAction="CommentsPanel" keytip="P"/>
+          <button id="ExportCommentsSheet" label="导出汇总表" size="large" imageMso="Table" screentip="一键生成包含全部批注与线程会话的「批注汇总」工作表（带超链接回跳）" onAction="ExportCommentsSheet" keytip="E"/>
         </group>
         <group id="GroupA11y" label="辅助功能">
           <button id="A11yChecker" label="检查辅助功能" size="large" imageMso="A11y" screentip="合并单元格/空表头/缺替代文字等" onAction="A11yChecker" keytip="A"/>

@@ -487,6 +487,7 @@ enum PreparedChanges {
     },
     Permutation {
         order: data_tools::CompactSort,
+        note_edit: sheetcore::undo::NoteUndoEdit,
         total: usize,
         sample: Vec<sheetcore::undo::CellDelta>,
         collab: Option<Vec<PrebuiltSortItem>>,
@@ -841,7 +842,9 @@ impl SheetApp {
                         );
                         let moved_lines = order.moved_lines();
                         let order_perm = order.permutation();
-                        let batch = (total > 0).then(|| {
+                        let notes_changed =
+                            snapshot.notes != prepared.notes || snapshot.threads != prepared.threads;
+                        let batch = (total > 0 || notes_changed).then(|| {
                             sheetcore::undo::PreparedCowBatch::from_sheets(
                                 worker_op.label(),
                                 index,
@@ -864,6 +867,7 @@ impl SheetApp {
                             },
                         ));
                     }
+                    let note_edit = order.plan_notes(&snapshot);
                     let (total, sample) = order.apply_to_sheet_with_sample(
                         &mut prepared,
                         sheetcore::revision::MAX_CELLS,
@@ -888,7 +892,7 @@ impl SheetApp {
                             out.push((d.row, d.col, val_wire, d.after.formula, effective_st));
                         }
                     }
-                    return Ok((snapshot, prepared, PreparedChanges::Permutation { order, total, sample, collab }));
+                    return Ok((snapshot, prepared, PreparedChanges::Permutation { order, note_edit, total, sample, collab }));
                 }
                 let changes = worker_op.plan(&snapshot, index, rect)?;
                 changes.apply(&mut prepared);
@@ -955,7 +959,7 @@ impl SheetApp {
                 } => {
                     let operation = &pending.operation;
                     self.status = operation.completed(moved_lines);
-                    if total == 0 {
+                    if total == 0 && batch.is_none() {
                         std::thread::spawn(move || drop((source, prepared)));
                         return;
                     }
@@ -972,10 +976,10 @@ impl SheetApp {
                     self.tasks.last_edit = Some(std::time::Instant::now());
                     std::thread::spawn(move || drop((source, prepared)));
                 }
-                PreparedChanges::Permutation { order, total, sample, collab } => {
+                PreparedChanges::Permutation { order, note_edit, total, sample, collab } => {
                     let operation = &pending.operation;
                     self.status = operation.completed(order.moved_lines());
-                    if total == 0 { return; }
+                    if total == 0 && note_edit.is_empty() { return; }
                     self.wb.sheet_mut(pending.sheet).take_row_changes(&mut prepared);
                     self.wb.dirty = true;
                     self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -1006,8 +1010,16 @@ impl SheetApp {
                     } else {
                         None
                     };
+                    if !note_edit.is_empty() {
+                        self.broadcast_note_undo_edit(&note_edit);
+                    }
                     self.record_revision_sample(operation.label(), &sample, total);
-                    self.undo.push_compact_sort(operation.label(), order, focus);
+                    self.undo.push_compact_sort_with_notes(
+                        operation.label(),
+                        order,
+                        (!note_edit.is_empty()).then_some(note_edit),
+                        focus,
+                    );
                     if let Some(ts) = ts { self.undo.track_sort(ts,None); }
                     self.tasks.last_edit = Some(std::time::Instant::now());
                 }
@@ -1030,7 +1042,7 @@ impl SheetApp {
             Ok(changes) => changes,
         };
         let message = operation.completed(changes.count);
-        if !changes.deltas.is_empty() {
+        if !changes.deltas.is_empty() || !changes.notes.is_empty() {
             let sheet = self.wb.sheet_mut(focus.0);
             if let Some(prepared) = prepared {
                 sheet.take_row_changes(prepared);
@@ -1041,11 +1053,42 @@ impl SheetApp {
             self.doc_gen = self.doc_gen.wrapping_add(1);
             self.recalc_all_and_deps_adaptive();
             self.recalc_filter_hidden_on(focus.0);
-            let ts = if self.net.is_some() && let Some(order) = changes.permutation.clone() {
+            let ts = if self.net.is_some() && !changes.deltas.is_empty() && let Some(order) = changes.permutation.clone() {
                 self.broadcast_line_permutation(focus.0, order,
                     changes.deltas.iter().map(|d| (d.row,d.col,d.before_style != d.after_style)))
-            } else { self.broadcast_sheet_deltas(focus.0, &changes.deltas); None };
-            self.record_deltas_at(operation.label(), changes.deltas, None, focus);
+            } else {
+                if !changes.deltas.is_empty() {
+                    self.broadcast_sheet_deltas(focus.0, &changes.deltas);
+                }
+                None
+            };
+            let note_edit = std::mem::take(&mut changes.notes);
+            if !note_edit.is_empty() {
+                self.broadcast_note_undo_edit(&note_edit);
+            }
+            let had_deltas = !changes.deltas.is_empty();
+            if had_deltas {
+                self.record_deltas_at(operation.label(), changes.deltas, None, focus);
+                if !note_edit.is_empty() {
+                    self.undo.attach_notes_to_last(note_edit);
+                }
+            } else if !note_edit.is_empty() {
+                self.undo.push_with_notes(
+                    sheetcore::undo::Action {
+                        label: operation.label().to_string(),
+                        merges: None,
+                        deltas: Vec::new(),
+                        focus,
+                        snap_before: None,
+                        snap_after: None,
+                        by_site: 0,
+                        pictures: None,
+                        shapes: None,
+                        refresh_sizes: None,
+                    },
+                    Some(note_edit),
+                );
+            }
             if let Some(order) = changes.permutation.take() { self.undo.tag_sorted_cells(order); }
             if let Some(ts) = ts { self.undo.track_sort(ts,None); }
             self.tasks.last_edit = Some(std::time::Instant::now());

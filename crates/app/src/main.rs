@@ -21,6 +21,7 @@ mod diagnostic_cache;
 mod filter_choices;
 mod fill_seq;
 mod ai_agent;
+mod comments_panel;
 mod wps_chrome;
 mod wps_dialogs;
 mod format_borders;
@@ -2434,6 +2435,16 @@ struct SheetApp {
     note_edit: Option<(u32, u32, String)>,
     note_edit_sheet: usize,
     note_focus_requested: bool,
+    /// 就地便签式编辑器初始锚点屏幕坐标（打开时贴近目标单元格右上角，仍可拖拽移动）
+    note_edit_anchor: Option<egui::Pos2>,
+    /// 最近一帧当前活动单元格（归一化合并锚点）的屏幕矩形，用于就地弹出批注便签编辑器
+    last_sel_cell_rect: Option<Rect>,
+    /// 内部剪贴板附带的批注与线程会话快照（按紧凑矩阵相对坐标 `(row_idx, col_idx)` 存储）
+    clip_notes: Vec<(u32, u32, sheetcore::notes::Note)>,
+    clip_threads: Vec<(u32, u32, sheetcore::notes::ThreadedComment)>,
+    clip_notes_captured: bool,
+    /// 右侧批注管理侧边栏与财务常用语模板状态
+    comments_panel: comments_panel::CommentsPanelState,
     /// 跨表取数对话框：输入文本
     link_dlg: Option<String>,
     /// 运行宏对话框：宏名
@@ -2698,6 +2709,14 @@ struct SheetApp {
     pic_clip_obj: Option<sheetcore::pic::Picture>,
     /// 显示/隐藏全部批注浮签
     pub(crate) show_all_comments: bool,
+    /// 单格固定显示（常驻）的批注集合：`(sheet.identity, anchor CellRef)`
+    pinned_comments: std::collections::HashSet<(u64, sheetcore::model::CellRef)>,
+    /// 用户手动拖拽过的批注便签偏移量：`(sheet.identity, anchor CellRef) -> 相对默认锚点偏移`
+    comment_card_offsets: std::collections::HashMap<(u64, sheetcore::model::CellRef), egui::Vec2>,
+    /// 交互式悬停浮签的离开宽限保持：`(sheet.identity, anchor CellRef, last_seen)`
+    note_hover_hold: Option<(u64, sheetcore::model::CellRef, std::time::Instant)>,
+    /// 选中含批注单元格时是否自动展开批注浮签（默认开启，可在浮签按钮关闭免打扰）
+    pub(crate) auto_show_selected_comment: bool,
     /// 批注线程新回复输入框缓冲
     note_reply_buf: String,
     /// CSV 导出编码/分隔符对话框
@@ -3514,7 +3533,7 @@ fn ctx_menu_rows(has_filter: bool) -> Vec<CtxRow> {
         CtxRow::sep(),
         CtxRow::item("合并单元格", Some(crate::ui_icons::Icon::Merge), "", CtxAct::MergeCells),
         CtxRow::item("取消合并", None, "", CtxAct::UnmergeCells),
-        CtxRow::item("插入/编辑批注", Some(crate::ui_icons::Icon::Comment), "", CtxAct::EditComment),
+        CtxRow::item("插入/编辑批注", Some(crate::ui_icons::Icon::Comment), "Shift+F2", CtxAct::EditComment),
         CtxRow::item("删除批注", None, "", CtxAct::DeleteComment),
         CtxRow::sep(),
         CtxRow::item("设置单元格格式…", Some(crate::ui_icons::Icon::FontColor), "Ctrl+1", CtxAct::FormatCells),
@@ -4211,6 +4230,12 @@ impl SheetApp {
             note_edit: None,
             note_edit_sheet: 0,
             note_focus_requested: false,
+            note_edit_anchor: None,
+            last_sel_cell_rect: None,
+            clip_notes: Vec::new(),
+            clip_threads: Vec::new(),
+            clip_notes_captured: false,
+            comments_panel: comments_panel::CommentsPanelState::default(),
             link_dlg: None,
             macro_run_dlg: None,
             macro_ran: false,
@@ -4373,6 +4398,10 @@ impl SheetApp {
             pic_crop_dlg: None,
             pic_clip_obj: None,
             show_all_comments: false,
+            pinned_comments: std::collections::HashSet::new(),
+            comment_card_offsets: std::collections::HashMap::new(),
+            note_hover_hold: None,
+            auto_show_selected_comment: true,
             note_reply_buf: String::new(),
             csv_export_dlg: None,
             protect_dlg: None,
@@ -9914,6 +9943,71 @@ impl SheetApp {
         if let Some(owner) = self.clipboard_owner.take() {
             owner.after_replacement();
         }
+        self.clip_notes.clear();
+        self.clip_threads.clear();
+        self.clip_notes_captured = false;
+    }
+
+    fn capture_clip_notes_mapped(
+        &mut self,
+        si: usize,
+        rect: (u32, u32, u32, u32),
+        source_rows: Option<&[u32]>,
+        source_cols: Option<&[u32]>,
+    ) {
+        self.clip_notes.clear();
+        self.clip_threads.clear();
+        self.clip_notes_captured = true;
+        let sh = self.wb.sheet(si);
+        if sh.notes.is_empty() && sh.threads.is_empty() {
+            return;
+        }
+        let (r1, c1, r2, c2) = rect;
+        let row_map: Option<std::collections::HashMap<u32, u32>> = source_rows.map(|rows| {
+            rows.iter()
+                .enumerate()
+                .map(|(idx, &r)| (r, idx as u32))
+                .collect()
+        });
+        let col_map: Option<std::collections::HashMap<u32, u32>> = source_cols.map(|cols| {
+            cols.iter()
+                .enumerate()
+                .map(|(idx, &c)| (c, idx as u32))
+                .collect()
+        });
+        let map_coord = |r: u32, c: u32| -> Option<(u32, u32)> {
+            let ri = match &row_map {
+                Some(m) => *m.get(&r)?,
+                None => {
+                    if r < r1 || r > r2 {
+                        return None;
+                    }
+                    r - r1
+                }
+            };
+            let ci = match &col_map {
+                Some(m) => *m.get(&c)?,
+                None => {
+                    if c < c1 || c > c2 {
+                        return None;
+                    }
+                    c - c1
+                }
+            };
+            Some((ri, ci))
+        };
+        for (&k, n) in &sh.notes {
+            if let Some((ri, ci)) = map_coord(k.row, k.col) {
+                self.clip_notes.push((ri, ci, n.clone()));
+            }
+        }
+        for (&k, tc) in &sh.threads {
+            if let Some((ri, ci)) = map_coord(k.row, k.col) {
+                self.clip_threads.push((ri, ci, tc.clone()));
+            }
+        }
+        self.clip_notes.sort_unstable_by_key(|(r, c, _)| (*r, *c));
+        self.clip_threads.sort_unstable_by_key(|(r, c, _)| (*r, *c));
     }
 
     fn clip_copy(&mut self, cut: bool, ctx: &egui::Context) {
@@ -10009,6 +10103,12 @@ impl SheetApp {
             self.clip_pic = None;
             let r_min = rects.iter().map(|x| x.0).min().unwrap_or(0);
             let c_min = rects.iter().map(|x| x.1).min().unwrap_or(0);
+            self.capture_clip_notes_mapped(
+                si,
+                (r_min, c_min, r_min + h - 1, c_min + w - 1),
+                Some(&source_rows),
+                source_cols.as_deref(),
+            );
             self.clip = Some(Clip {
                 deferred: None,
                 sheet: si,
@@ -10119,6 +10219,7 @@ impl SheetApp {
             self.clip_copied_at = Some(std::time::Instant::now());
             self.clipboard_owner = owner;
             self.clip_pic = None;
+            self.capture_clip_notes_mapped(si, rect, source_rows.as_deref(), None);
             self.clip = Some(Clip { sheet: si, rect, deferred: Some(range), cells: Vec::new(), merges, source_rows, source_cols: None, cut });
             self.status = status_msg;
             return;
@@ -10156,6 +10257,7 @@ impl SheetApp {
             self.clip_copied_at = Some(std::time::Instant::now());
             let visible_count = visible_rows.len();
             self.clip_pic = None;
+            self.capture_clip_notes_mapped(si, (r1, c1, r2, c2), Some(&visible_rows), None);
             self.clip = Some(Clip { deferred: None,
                 sheet: si,
                 rect: (r1, c1, r2, c2),
@@ -10206,6 +10308,7 @@ impl SheetApp {
             .copied()
             .collect();
         self.clip_pic = None;
+        self.capture_clip_notes_mapped(si, (r1, c1, r2, c2), None, None);
         self.clip = Some(Clip { deferred: None, sheet: si, rect: (r1, c1, r2, c2), source_rows: None, source_cols: None, cells, merges, cut });
         self.status = format!(
             "已{} {:?}（{} 行 × {} 列）",
@@ -10372,7 +10475,10 @@ impl SheetApp {
         let mut tsv_paste = false;
         let mut rows: Vec<Vec<(sheetcore::model::Cell, u16)>> = Vec::new();
         let mut pasted_merges: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut pasted_clip_notes: Vec<(u32, u32, sheetcore::notes::Note)> = Vec::new();
+        let mut pasted_clip_threads: Vec<(u32, u32, sheetcore::notes::ThreadedComment)> = Vec::new();
         let mut cut_src: Option<(usize, Vec<(u32, u32)>)> = None;
+        let mut cut_note_src: Option<(usize, (u32, u32, u32, u32), Option<Vec<u32>>)> = None;
         let mut cut_move: Option<(usize, (u32, u32, u32, u32), i64, i64)> = None;
 
         // Borrow the previous block only when it will actually be pasted. External plain
@@ -10383,6 +10489,11 @@ impl SheetApp {
             }) {
                 self.status = "剪切源已更改，请重新剪切".into();
                 return;
+            }
+            if !values_only {
+                let (cn, ct) = self.resolve_clip_notes_for_paste(clip);
+                pasted_clip_notes = cn;
+                pasted_clip_threads = ct;
             }
             let (sr1, sc1, sr2, sc2) = clip.rect;
             let dr = r as i64 - sr1 as i64;
@@ -10446,6 +10557,7 @@ impl SheetApp {
                     (sc1..=sc2).map(move |cc| (rr, cc))
                 }).collect();
                 cut_src = Some((clip.sheet, keys));
+                cut_note_src = Some((clip.sheet, clip.rect, clip.source_rows.clone()));
                 if contiguous_cut {
                     cut_move = Some((clip.sheet, clip.rect, dr, dc));
                 }
@@ -10465,6 +10577,8 @@ impl SheetApp {
             return;
         }
 
+        let clip_base_h = rows.len() as u32;
+        let clip_base_w = rows.iter().map(|row| row.len()).max().unwrap_or(0) as u32;
         // 选区平铺粘贴（Excel 语义：当目标选区宽高均为源块宽高的整数倍且非剪切时，自动平铺源块并按格偏移公式；
         // 若选区内存在筛选隐藏行，仅按选区内的可见行计数并严格限定在选区范围内，绝不溢出覆写选区外的未选中行）
         let (r, c, tiled_dst_rows) = {
@@ -10744,6 +10858,20 @@ impl SheetApp {
                     }
                 }
             }
+            if !values_only && !tsv_paste {
+                let _ = self.apply_pasted_notes(
+                    si,
+                    (r, c),
+                    None,
+                    h,
+                    w,
+                    clip_base_h,
+                    clip_base_w,
+                    &pasted_clip_notes,
+                    &pasted_clip_threads,
+                    None,
+                );
+            }
             if !sample.is_empty() {
                 self.record_revision_sample(label, &sample, changed);
             }
@@ -10852,6 +10980,24 @@ impl SheetApp {
         if let Some((src_si, src_rect, dr, dc)) = cut_move {
             self.relocate_named_and_chart_refs_for_move(src_si, src_rect, si, dr, dc);
         }
+        let paste_note_edit = if !values_only && !tsv_paste {
+            self.apply_pasted_notes(
+                si,
+                (r, c),
+                dst_rows.as_deref(),
+                h,
+                w,
+                clip_base_h,
+                clip_base_w,
+                &pasted_clip_notes,
+                &pasted_clip_threads,
+                cut_note_src
+                    .as_ref()
+                    .map(|(src_si, rect, rows)| (*src_si, *rect, rows.as_deref())),
+            )
+        } else {
+            sheetcore::undo::NoteUndoEdit::default()
+        };
         let label = if cut_src.is_some() { "剪切粘贴" } else if values_only { "粘贴数值" } else { "粘贴" };
         let mut deltas = Vec::new();
         for (sheet, captured) in before {
@@ -10867,16 +11013,22 @@ impl SheetApp {
             self.broadcast_cell_styles(&styles);
             for (sheet, rect, on) in merge_changes { net.broadcast_merge(sheet, rect, on); }
         }
-        self.undo.push(sheetcore::undo::Action {
-            label: label.into(), deltas, focus: (si, r, c),
-            merges: merge_edit,
-            snap_before: None, snap_after: None, by_site: 0,
-            pictures: None,
-            shapes: None,
-            refresh_sizes: None,
-        });
+        if !paste_note_edit.is_empty() {
+            self.broadcast_note_undo_edit(&paste_note_edit);
+        }
+        self.undo.push_with_notes(
+            sheetcore::undo::Action {
+                label: label.into(), deltas, focus: (si, r, c),
+                merges: merge_edit,
+                snap_before: None, snap_after: None, by_site: 0,
+                pictures: None,
+                shapes: None,
+                refresh_sizes: None,
+            },
+            (!paste_note_edit.is_empty()).then_some(paste_note_edit),
+        );
         if cut_src.is_some() {
-            self.clip = None;
+            self.clear_internal_clip();
         }
         // 重算 + 广播
         self.recalc_and_broadcast(&touched);
@@ -13907,6 +14059,12 @@ impl SheetApp {
     fn prepare_cloned_sheet_objects(wb: &Workbook, sheet: &mut sheetcore::Sheet, orig_name: &str) {
         sheet.renew_identity();
         sheet.edited = true;
+        if !sheet.notes.is_empty() {
+            sheet.notes_dirty = true;
+        }
+        if !sheet.threads.is_empty() {
+            sheet.threads_dirty = true;
+        }
         // 表格对象：保留并保证表名在目标工作簿内全局唯一
         if !sheet.tables.is_empty() {
             let mut taken: std::collections::HashSet<String> = wb
@@ -14894,6 +15052,28 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
             }
         }
 
+        let deferred_note_edit = if !values_only {
+            let (cn, ct, cut_rows) = if let Some(clip) = self.clip.as_ref() {
+                let (cn, ct) = self.resolve_clip_notes_for_paste(clip);
+                (cn, ct, clip.source_rows.clone())
+            } else {
+                (Vec::new(), Vec::new(), None)
+            };
+            self.apply_pasted_notes(
+                si,
+                (r, c),
+                None,
+                h,
+                w,
+                h,
+                w,
+                &cn,
+                &ct,
+                clip_cut.then_some((clip_sheet, clip_rect, cut_rows.as_deref())),
+            )
+        } else {
+            sheetcore::undo::NoteUndoEdit::default()
+        };
         let label = if cut_keys.is_some() {
             "剪切粘贴"
         } else if values_only {
@@ -14924,20 +15104,26 @@ fn office_block_tsv(block: &office_clipboard::OfficeBlock) -> String {
                 net.broadcast_merge(sheet, rect, on);
             }
         }
-        self.undo.push(sheetcore::undo::Action {
-            label: label.into(),
-            deltas,
-            focus: (si, r, c),
-            merges: merge_edit,
-            snap_before: None,
-            snap_after: None,
-            by_site: 0,
-            pictures: None,
-            shapes: None,
-            refresh_sizes: None,
-        });
+        if !deferred_note_edit.is_empty() {
+            self.broadcast_note_undo_edit(&deferred_note_edit);
+        }
+        self.undo.push_with_notes(
+            sheetcore::undo::Action {
+                label: label.into(),
+                deltas,
+                focus: (si, r, c),
+                merges: merge_edit,
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                pictures: None,
+                shapes: None,
+                refresh_sizes: None,
+            },
+            (!deferred_note_edit.is_empty()).then_some(deferred_note_edit),
+        );
         if cut_keys.is_some() {
-            self.clip = None;
+            self.clear_internal_clip();
         }
         self.recalc_and_broadcast(&touched);
         self.last_paste = None;
@@ -16505,6 +16691,29 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     fn replace_current(&mut self) {
         let si = self.sheet_idx;
         let (r, c) = self.sel;
+        if self.find.in_comments {
+            let needle = self.find.find.clone();
+            let replace = self.find.replace.clone();
+            match self.replace_comment_text_at(
+                si,
+                r,
+                c,
+                &needle,
+                &replace,
+                self.find.whole_cell,
+                self.find.match_case,
+            ) {
+                Ok(true) => {
+                    self.status = format!("已替换 {} 的批注", cell_name(r, c));
+                    self.find_next(false);
+                }
+                Ok(false) => {
+                    self.find_next(false);
+                }
+                Err(_) => {}
+            }
+            return;
+        }
         let Some(cell) = self.wb.sheet(si).get(r, c).map(|c| c.into_owned()) else {
             self.find_next(false);
             return;
@@ -16540,6 +16749,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
     }
 
     fn replace_all(&mut self) {
+        if self.find.in_comments {
+            self.replace_all_comments();
+            return;
+        }
         // 后台查找完成后在当前文档一次提交，生成单个撤销步骤。
         self.start_scan(1);
     }
@@ -16657,7 +16870,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.tasks.last_edit = Some(std::time::Instant::now());
-        self.clip = None;
+        self.clear_internal_clip();
         self.recalc_all_and_deps_adaptive();
         self.cf_stats_gen = u64::MAX;
         self.invalid_gen = u64::MAX;
@@ -19696,6 +19909,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
 
         if self.editing.is_none()
+            && !self.dialog_modal
             && (self.format_painter.is_some()
                 || self.merge_pending.is_some()
                 || self.fmt_merge_pending.is_some())
@@ -19715,13 +19929,14 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
 
         if self.editing.is_none()
+            && !self.dialog_modal
             && (!self.extra_sel.is_empty() || self.clip.is_some())
             && ctx.input(|i| i.key_pressed(Key::Escape))
         {
             let had_clip = self.clip.is_some();
             let had_extra = !self.extra_sel.is_empty();
             if had_clip {
-                self.clip = None;
+                self.clear_internal_clip();
                 self.clip_copied_at = None;
                 self.retire_previous_clipboard();
             }
@@ -20178,7 +20393,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             if let Some(pi) = self.pic_sel {
                 if let Some(pic) = self.wb.sheet(self.sheet_idx).pictures.get(pi).cloned() {
                     self.pic_clip_obj = Some(pic);
-                    self.clip = None;
+                    self.clear_internal_clip();
                     self.status = "已复制图片（Ctrl+V 可粘贴到当前单元格）".into();
                     return;
                 }
@@ -20708,6 +20923,34 @@ fn clear_values(&mut self) {
                         sh.set_style_rect(r1, c1, r2, c2, 0);
                     }
                 }
+                if part == ClearPart::All {
+                    let hit = |sh_ref: &sheetcore::Sheet, k: &sheetcore::model::CellRef| {
+                        rects.iter().any(|&(r1, c1, r2, c2)| {
+                            (k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
+                                || sh_ref.merge_at(k.row, k.col).is_some_and(|(mr1, mc1, mr2, mc2)| {
+                                    (k.row, k.col) == (mr1, mc1)
+                                        && mr1 <= r2
+                                        && mr2 >= r1
+                                        && mc1 <= c2
+                                        && mc2 >= c1
+                                })
+                        })
+                    };
+                    let nks: Vec<_> = sh.notes.keys().copied().filter(|k| hit(sh, k)).collect();
+                    for k in &nks {
+                        sh.notes.remove(k);
+                    }
+                    if !nks.is_empty() {
+                        sh.notes_dirty = true;
+                    }
+                    let tks: Vec<_> = sh.threads.keys().copied().filter(|k| hit(sh, k)).collect();
+                    for k in &tks {
+                        sh.threads.remove(k);
+                    }
+                    if !tks.is_empty() {
+                        sh.threads_dirty = true;
+                    }
+                }
             }
             self.undo.push_cow_batch(
                 what,
@@ -20840,11 +21083,71 @@ fn clear_values(&mut self) {
                 sh.row_styles_dirty = true;
             }
         }
+        let mut clear_note_edit = sheetcore::undo::NoteUndoEdit::default();
+        if part == ClearPart::All {
+            let all_sheets_to_clear: Vec<usize> = std::iter::once(self.sheet_idx)
+                .chain(extra_sheets.iter().copied())
+                .collect();
+            for target_si in all_sheets_to_clear {
+                let sh = self.wb.sheet_mut(target_si);
+                let hit = |sh_ref: &sheetcore::Sheet, k: &sheetcore::model::CellRef| {
+                    rects.iter().any(|&(r1, c1, r2, c2)| {
+                        (k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
+                            || sh_ref.merge_at(k.row, k.col).is_some_and(|(mr1, mc1, mr2, mc2)| {
+                                (k.row, k.col) == (mr1, mc1)
+                                    && mr1 <= r2
+                                    && mr2 >= r1
+                                    && mc1 <= c2
+                                    && mc2 >= c1
+                            })
+                    })
+                };
+                let mut nks: Vec<_> = sh.notes.keys().copied().filter(|k| hit(sh, k)).collect();
+                nks.sort_unstable_by_key(|k| (k.row, k.col));
+                for k in nks {
+                    if let Some(old) = sh.notes.remove(&k) {
+                        clear_note_edit.notes.push((target_si, (k.row, k.col), Some(old), None));
+                        sh.notes_dirty = true;
+                    }
+                }
+                let mut tks: Vec<_> = sh.threads.keys().copied().filter(|k| hit(sh, k)).collect();
+                tks.sort_unstable_by_key(|k| (k.row, k.col));
+                for k in tks {
+                    if let Some(old) = sh.threads.remove(&k) {
+                        clear_note_edit.threads.push((target_si, (k.row, k.col), Some(old), None));
+                        sh.threads_dirty = true;
+                    }
+                }
+            }
+        }
         let mut all_deltas = sheetcore::undo::finish(before_main, self.wb.sheet(self.sheet_idx));
         for (osi, b) in before_extras {
             all_deltas.extend(sheetcore::undo::finish(b, self.wb.sheet(osi)));
         }
-        self.record_deltas(what, all_deltas);
+        if !all_deltas.is_empty() {
+            self.record_deltas(what, all_deltas);
+            if !clear_note_edit.is_empty() {
+                self.broadcast_note_undo_edit(&clear_note_edit);
+                self.undo.attach_notes_to_last(clear_note_edit);
+            }
+        } else if !clear_note_edit.is_empty() {
+            self.broadcast_note_undo_edit(&clear_note_edit);
+            self.undo.push_with_notes(
+                sheetcore::undo::Action {
+                    label: what.to_string(),
+                    merges: None,
+                    deltas: Vec::new(),
+                    focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                    snap_before: None,
+                    snap_after: None,
+                    by_site: 0,
+                    pictures: None,
+                    shapes: None,
+                    refresh_sizes: None,
+                },
+                Some(clear_note_edit),
+            );
+        }
         if !extra_touched.is_empty() {
             self.recalc_and_broadcast(&extra_touched);
         }
@@ -21317,6 +21620,41 @@ fn clear_values(&mut self) {
             .filter(|(k, _)| k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
             .map(|(k, v)| ((k.row - r1, k.col - c1), v.clone()))
             .collect();
+        let threads: Vec<_> = self
+            .wb
+            .sheet(si)
+            .threads
+            .iter()
+            .filter(|(k, _)| k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
+            .map(|(k, v)| ((k.row - r1, k.col - c1), v.clone()))
+            .collect();
+        let mut move_note_before: std::collections::BTreeMap<(u32, u32), Option<sheetcore::notes::Note>> =
+            std::collections::BTreeMap::new();
+        let mut move_thread_before: std::collections::BTreeMap<(u32, u32), Option<sheetcore::notes::ThreadedComment>> =
+            std::collections::BTreeMap::new();
+        {
+            let sh = self.wb.sheet(si);
+            let in_src_or_dst = |r: u32, c: u32| {
+                (r >= r1 && r <= r2 && c >= c1 && c <= c2)
+                    || (r >= nr1 && r <= nr2 && c >= nc1 && c <= nc2)
+            };
+            for (&k, n) in &sh.notes {
+                if in_src_or_dst(k.row, k.col) {
+                    move_note_before.insert((k.row, k.col), Some(n.clone()));
+                }
+            }
+            for &((dr0, dc0), _) in &notes {
+                move_note_before.entry((nr1 + dr0, nc1 + dc0)).or_insert(None);
+            }
+            for (&k, tc) in &sh.threads {
+                if in_src_or_dst(k.row, k.col) {
+                    move_thread_before.insert((k.row, k.col), Some(tc.clone()));
+                }
+            }
+            for &((dr0, dc0), _) in &threads {
+                move_thread_before.entry((nr1 + dr0, nc1 + dc0)).or_insert(None);
+            }
+        }
         let rich: Vec<_> = self
             .wb
             .sheet(si)
@@ -21341,13 +21679,21 @@ fn clear_values(&mut self) {
                     sh.styles.remove(&sheetcore::model::CellRef::new(r, c));
                 }
             }
-            // 先清掉源区域上的附属数据，再把快照写到目标（源/目标重叠也不会丢）
+            // 先清掉源区域与目标区域上的附属数据，再把快照写到目标（源/目标重叠也不会丢）
             let mut notes_changed = false;
+            let mut threads_changed = false;
+            for &(r, c) in move_note_before.keys() {
+                if sh.notes.remove(&sheetcore::model::CellRef::new(r, c)).is_some() {
+                    notes_changed = true;
+                }
+            }
+            for &(r, c) in move_thread_before.keys() {
+                if sh.threads.remove(&sheetcore::model::CellRef::new(r, c)).is_some() {
+                    threads_changed = true;
+                }
+            }
             for r in r1..=r2 {
                 for c in c1..=c2 {
-                    if sh.notes.remove(&sheetcore::model::CellRef::new(r, c)).is_some() {
-                        notes_changed = true;
-                    }
                     if sh.rich.remove(&(r, c)).is_some() {
                         sh.rich_dirty = true;
                     }
@@ -21362,8 +21708,17 @@ fn clear_values(&mut self) {
                 sh.notes.insert(sheetcore::model::CellRef::new(nr1 + r, nc1 + c), n);
                 notes_changed = true;
             }
+            for ((r, c), mut tc) in threads {
+                tc.r = nr1 + r;
+                tc.c = nc1 + c;
+                sh.threads.insert(sheetcore::model::CellRef::new(nr1 + r, nc1 + c), tc);
+                threads_changed = true;
+            }
             if notes_changed {
                 sh.notes_dirty = true;
+            }
+            if threads_changed {
+                sh.threads_dirty = true;
             }
             for ((r, c), v) in rich {
                 sh.rich.insert((nr1 + r, nc1 + c), v);
@@ -21394,6 +21749,22 @@ fn clear_values(&mut self) {
                 }
             }
         }
+        let mut move_note_edit = sheetcore::undo::NoteUndoEdit::default();
+        {
+            let sh = self.wb.sheet(si);
+            for ((r, c), before_n) in move_note_before {
+                let after_n = sh.notes.get(&sheetcore::model::CellRef::new(r, c)).cloned();
+                if before_n != after_n {
+                    move_note_edit.notes.push((si, (r, c), before_n, after_n));
+                }
+            }
+            for ((r, c), before_tc) in move_thread_before {
+                let after_tc = sh.threads.get(&sheetcore::model::CellRef::new(r, c)).cloned();
+                if before_tc != after_tc {
+                    move_note_edit.threads.push((si, (r, c), before_tc, after_tc));
+                }
+            }
+        }
         for (s, rr, cc, nf) in &ext_rewrites {
             if let Some(mut cell) = self.wb.sheet(*s).get(*rr, *cc).map(|c| c.into_owned()) {
                 cell.formula = Some(nf.as_str().into());
@@ -21401,7 +21772,30 @@ fn clear_values(&mut self) {
             }
         }
         self.relocate_named_and_chart_refs_for_move(si, (r1, c1, r2, c2), si, eff_dr, eff_dc);
+        let deltas_before_len = self.undo.depth().0;
         self.txn_end("移动单元格", txn);
+        if !move_note_edit.is_empty() {
+            self.broadcast_note_undo_edit(&move_note_edit);
+            if self.undo.depth().0 > deltas_before_len {
+                self.undo.attach_notes_to_last(move_note_edit);
+            } else {
+                self.undo.push_with_notes(
+                    sheetcore::undo::Action {
+                        label: "移动单元格".into(),
+                        merges: None,
+                        deltas: Vec::new(),
+                        focus: (si, nr1, nc1),
+                        snap_before: None,
+                        snap_after: None,
+                        by_site: 0,
+                        pictures: None,
+                        shapes: None,
+                        refresh_sizes: None,
+                    },
+                    Some(move_note_edit),
+                );
+            }
+        }
         if !cross_before.is_empty() {
             let mut extra_deltas = Vec::new();
             for (s, cap) in cross_before {
@@ -21654,6 +22048,37 @@ fn clear_values(&mut self) {
             .filter(|(k, _)| k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
             .map(|(k, v)| ((k.row - r1, k.col - c1), v.clone()))
             .collect();
+        let threads: Vec<_> = self
+            .wb
+            .sheet(self.sheet_idx)
+            .threads
+            .iter()
+            .filter(|(k, _)| k.row >= r1 && k.row <= r2 && k.col >= c1 && k.col <= c2)
+            .map(|(k, v)| ((k.row - r1, k.col - c1), v.clone()))
+            .collect();
+        let mut copy_note_before: std::collections::BTreeMap<(u32, u32), Option<sheetcore::notes::Note>> =
+            std::collections::BTreeMap::new();
+        let mut copy_thread_before: std::collections::BTreeMap<(u32, u32), Option<sheetcore::notes::ThreadedComment>> =
+            std::collections::BTreeMap::new();
+        {
+            let sh = self.wb.sheet(self.sheet_idx);
+            for (&k, n) in &sh.notes {
+                if k.row >= nr1 && k.row <= nr2 && k.col >= nc1 && k.col <= nc2 {
+                    copy_note_before.insert((k.row, k.col), Some(n.clone()));
+                }
+            }
+            for &((dr0, dc0), _) in &notes {
+                copy_note_before.entry((nr1 + dr0, nc1 + dc0)).or_insert(None);
+            }
+            for (&k, tc) in &sh.threads {
+                if k.row >= nr1 && k.row <= nr2 && k.col >= nc1 && k.col <= nc2 {
+                    copy_thread_before.insert((k.row, k.col), Some(tc.clone()));
+                }
+            }
+            for &((dr0, dc0), _) in &threads {
+                copy_thread_before.entry((nr1 + dr0, nc1 + dc0)).or_insert(None);
+            }
+        }
         let rich: Vec<_> = self
             .wb
             .sheet(self.sheet_idx)
@@ -21674,13 +22099,21 @@ fn clear_values(&mut self) {
             let sh = self.wb.sheet_mut(self.sheet_idx);
             // 目标区域先清空（Excel 复制粘贴也是覆盖）
             let mut notes_changed = false;
+            let mut threads_changed = false;
+            for &(r, c) in copy_note_before.keys() {
+                if sh.notes.remove(&sheetcore::model::CellRef::new(r, c)).is_some() {
+                    notes_changed = true;
+                }
+            }
+            for &(r, c) in copy_thread_before.keys() {
+                if sh.threads.remove(&sheetcore::model::CellRef::new(r, c)).is_some() {
+                    threads_changed = true;
+                }
+            }
             for r in nr1..=nr2 {
                 for c in nc1..=nc2 {
                     sh.remove(r, c);
                     sh.styles.remove(&sheetcore::model::CellRef::new(r, c));
-                    if sh.notes.remove(&sheetcore::model::CellRef::new(r, c)).is_some() {
-                        notes_changed = true;
-                    }
                     if sh.rich.remove(&(r, c)).is_some() {
                         sh.rich_dirty = true;
                     }
@@ -21695,8 +22128,17 @@ fn clear_values(&mut self) {
                 sh.notes.insert(sheetcore::model::CellRef::new(nr1 + r, nc1 + c), n);
                 notes_changed = true;
             }
+            for ((r, c), mut tc) in threads {
+                tc.r = nr1 + r;
+                tc.c = nc1 + c;
+                sh.threads.insert(sheetcore::model::CellRef::new(nr1 + r, nc1 + c), tc);
+                threads_changed = true;
+            }
             if notes_changed {
                 sh.notes_dirty = true;
+            }
+            if threads_changed {
+                sh.threads_dirty = true;
             }
             for ((r, c), v) in rich {
                 sh.rich.insert((nr1 + r, nc1 + c), v);
@@ -21723,10 +22165,49 @@ fn clear_values(&mut self) {
                 }
             }
         }
+        let si = self.sheet_idx;
+        let mut copy_note_edit = sheetcore::undo::NoteUndoEdit::default();
+        {
+            let sh = self.wb.sheet(si);
+            for ((r, c), before_n) in copy_note_before {
+                let after_n = sh.notes.get(&sheetcore::model::CellRef::new(r, c)).cloned();
+                if before_n != after_n {
+                    copy_note_edit.notes.push((si, (r, c), before_n, after_n));
+                }
+            }
+            for ((r, c), before_tc) in copy_thread_before {
+                let after_tc = sh.threads.get(&sheetcore::model::CellRef::new(r, c)).cloned();
+                if before_tc != after_tc {
+                    copy_note_edit.threads.push((si, (r, c), before_tc, after_tc));
+                }
+            }
+        }
+        let undo_before = self.undo.depth().0;
         self.txn_end("复制单元格", txn);
+        if !copy_note_edit.is_empty() {
+            self.broadcast_note_undo_edit(&copy_note_edit);
+            if self.undo.depth().0 > undo_before {
+                self.undo.attach_notes_to_last(copy_note_edit);
+            } else {
+                self.undo.push_with_notes(
+                    sheetcore::undo::Action {
+                        label: "复制单元格".into(),
+                        merges: None,
+                        deltas: Vec::new(),
+                        focus: (si, nr1, nc1),
+                        snap_before: None,
+                        snap_after: None,
+                        by_site: 0,
+                        pictures: None,
+                        shapes: None,
+                        refresh_sizes: None,
+                    },
+                    Some(copy_note_edit),
+                );
+            }
+        }
         self.sel = (nr1, nc1);
         self.sel_end = (nr2, nc2);
-        let si = self.sheet_idx;
         let copied_keys: Vec<(usize, u32, u32)> = dst_keys
             .into_iter()
             .map(|(r, c)| (si, r, c))
@@ -27171,6 +27652,7 @@ fn clear_selection(&mut self) {
                         "编辑与录入",
                         &[
                             ("编辑单元格 / 切换输入与编辑模式", "F2"),
+                            ("新建 / 编辑批注", "Shift+F2"),
                             ("填满当前所有选中区域", "Ctrl+Enter"),
                             ("登记旧式数组公式 (CSE)", "Ctrl+Shift+Enter"),
                             ("单元格内换行", "Alt+Enter"),
@@ -27733,7 +28215,7 @@ fn clear_selection(&mut self) {
             return;
         }
         let before_dv = (self.ps_kind == 9).then(|| self.wb.sheet(si_cur).dv.clone());
-        // 预先快照源批注与源数据验证规则，防止源区与目标区重叠时读到刚被覆写的新值
+        // 预先快照源批注、线程批注与源数据验证规则，防止源区与目标区重叠时读到刚被覆写的新值
         let src_notes_snap: Option<Vec<Vec<Option<sheetcore::notes::Note>>>> =
             if self.ps_kind == 8 {
                 if let (Some(co), Some(ssi)) = (&coords, src_sheet_idx) {
@@ -27746,6 +28228,31 @@ fn clear_selection(&mut self) {
                                     .map(|&(sr, sc)| {
                                         src_sh
                                             .notes
+                                            .get(&sheetcore::model::CellRef::new(sr, sc))
+                                            .cloned()
+                                    })
+                                    .collect()
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let src_threads_snap: Option<Vec<Vec<Option<sheetcore::notes::ThreadedComment>>>> =
+            if self.ps_kind == 8 {
+                if let (Some(co), Some(ssi)) = (&coords, src_sheet_idx) {
+                    let src_sh = self.wb.sheet(ssi);
+                    Some(
+                        co.iter()
+                            .map(|row_co| {
+                                row_co
+                                    .iter()
+                                    .map(|&(sr, sc)| {
+                                        src_sh
+                                            .threads
                                             .get(&sheetcore::model::CellRef::new(sr, sc))
                                             .cloned()
                                     })
@@ -27780,6 +28287,7 @@ fn clear_selection(&mut self) {
                 None
             };
         let mut note_undo: Vec<((u32, u32), Option<sheetcore::notes::Note>, Option<sheetcore::notes::Note>)> = Vec::new();
+        let mut thread_undo: Vec<((u32, u32), Option<sheetcore::notes::ThreadedComment>, Option<sheetcore::notes::ThreadedComment>)> = Vec::new();
         let txn = if matches!(self.ps_kind, 8 | 9) { Vec::new() } else { self.txn_begin(&keys) };
         let mut wire_styles: Vec<(u32, u32, sheetcore::style::CellStyle)> = Vec::new();
         for (i, row) in matrix.iter().enumerate() {
@@ -27793,21 +28301,36 @@ fn clear_selection(&mut self) {
                 }
                 let c = c0 + j as u32;
                 if self.ps_kind == 8 {
-                    if let Some(mut n) = src_notes_snap
+                    let src_note = src_notes_snap
                         .as_ref()
                         .and_then(|g| g.get(i))
                         .and_then(|row_n| row_n.get(j))
-                        .and_then(|opt| opt.clone())
-                    {
+                        .and_then(|opt| opt.clone());
+                    let src_thread = src_threads_snap
+                        .as_ref()
+                        .and_then(|g| g.get(i))
+                        .and_then(|row_t| row_t.get(j))
+                        .and_then(|opt| opt.clone());
+                    if src_note.is_some() || src_thread.is_some() {
                         let sh = self.wb.sheet_mut(si_cur);
                         let (ar, ac) = sh.merge_at(r, c).map(|(mr1, mc1, _, _)| (mr1, mc1)).unwrap_or((r, c));
                         let cref = sheetcore::model::CellRef::new(ar, ac);
-                        let before_n = sh.notes.get(&cref).cloned();
-                        n.r = ar;
-                        n.c = ac;
-                        sh.notes.insert(cref, n.clone());
-                        sh.notes_dirty = true;
-                        note_undo.push(((ar, ac), before_n, Some(n)));
+                        if let Some(mut n) = src_note {
+                            let before_n = sh.notes.get(&cref).cloned();
+                            n.r = ar;
+                            n.c = ac;
+                            sh.notes.insert(cref, n.clone());
+                            sh.notes_dirty = true;
+                            note_undo.push(((ar, ac), before_n, Some(n)));
+                        }
+                        if let Some(mut tc) = src_thread {
+                            let before_tc = sh.threads.get(&cref).cloned();
+                            tc.r = ar;
+                            tc.c = ac;
+                            sh.threads.insert(cref, tc.clone());
+                            sh.threads_dirty = true;
+                            thread_undo.push(((ar, ac), before_tc, Some(tc)));
+                        }
                     }
                     continue;
                 }
@@ -27992,7 +28515,7 @@ fn clear_selection(&mut self) {
             }
         }
         if self.ps_kind == 8 {
-            if !note_undo.is_empty() {
+            if !note_undo.is_empty() || !thread_undo.is_empty() {
                 if let Some(net) = self.net.as_ref() {
                     for ((ar, ac), _, after_n) in &note_undo {
                         if let Some(n) = after_n {
@@ -28007,6 +28530,16 @@ fn clear_selection(&mut self) {
                             );
                         }
                     }
+                    for ((ar, ac), _, after_tc) in &thread_undo {
+                        net.broadcast_sheet_meta(
+                            si_cur,
+                            sheetcore::sync::SheetMetaKind::Thread {
+                                row: *ar,
+                                col: *ac,
+                                thread: after_tc.clone(),
+                            },
+                        );
+                    }
                 }
                 self.undo.push_meta(
                     "粘贴批注",
@@ -28014,6 +28547,7 @@ fn clear_selection(&mut self) {
                     sheetcore::undo::MetaEdit {
                         sheet: si_cur,
                         notes: note_undo,
+                        threads: thread_undo,
                         ..Default::default()
                     },
                 );
@@ -29856,6 +30390,422 @@ fn clear_selection(&mut self) {
         self.a11y_open = open;
     }
 
+    fn resolve_clip_notes_for_paste(
+        &self,
+        clip: &Clip,
+    ) -> (
+        Vec<(u32, u32, sheetcore::notes::Note)>,
+        Vec<(u32, u32, sheetcore::notes::ThreadedComment)>,
+    ) {
+        if self.clip_notes_captured {
+            return (self.clip_notes.clone(), self.clip_threads.clone());
+        }
+        let Some(sh) = self.wb.sheets.get(clip.sheet) else {
+            return (Vec::new(), Vec::new());
+        };
+        if sh.notes.is_empty() && sh.threads.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let (r1, c1, r2, c2) = clip.rect;
+        let row_map: Option<std::collections::HashMap<u32, u32>> = clip.source_rows.as_ref().map(|rows| {
+            rows.iter()
+                .enumerate()
+                .map(|(idx, &r)| (r, idx as u32))
+                .collect()
+        });
+        let col_map: Option<std::collections::HashMap<u32, u32>> = clip.source_cols.as_ref().map(|cols| {
+            cols.iter()
+                .enumerate()
+                .map(|(idx, &c)| (c, idx as u32))
+                .collect()
+        });
+        let map_coord = |r: u32, c: u32| -> Option<(u32, u32)> {
+            let ri = match &row_map {
+                Some(m) => *m.get(&r)?,
+                None => {
+                    if r < r1 || r > r2 {
+                        return None;
+                    }
+                    r - r1
+                }
+            };
+            let ci = match &col_map {
+                Some(m) => *m.get(&c)?,
+                None => {
+                    if c < c1 || c > c2 {
+                        return None;
+                    }
+                    c - c1
+                }
+            };
+            Some((ri, ci))
+        };
+        let mut notes = Vec::new();
+        let mut threads = Vec::new();
+        for (&k, n) in &sh.notes {
+            if let Some((ri, ci)) = map_coord(k.row, k.col) {
+                notes.push((ri, ci, n.clone()));
+            }
+        }
+        for (&k, tc) in &sh.threads {
+            if let Some((ri, ci)) = map_coord(k.row, k.col) {
+                threads.push((ri, ci, tc.clone()));
+            }
+        }
+        (notes, threads)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_pasted_notes(
+        &mut self,
+        target_sheet: usize,
+        target_origin: (u32, u32),
+        target_rows: Option<&[u32]>,
+        h: u32,
+        w: u32,
+        base_h: u32,
+        base_w: u32,
+        src_notes: &[(u32, u32, sheetcore::notes::Note)],
+        src_threads: &[(u32, u32, sheetcore::notes::ThreadedComment)],
+        cut_src: Option<(usize, (u32, u32, u32, u32), Option<&[u32]>)>,
+    ) -> sheetcore::undo::NoteUndoEdit {
+        use std::collections::{BTreeMap, HashSet};
+        let mut out = sheetcore::undo::NoteUndoEdit::default();
+        if h == 0 || w == 0 || base_h == 0 || base_w == 0 {
+            return out;
+        }
+        let target_has_any = {
+            let sh = self.wb.sheet(target_sheet);
+            !sh.notes.is_empty() || !sh.threads.is_empty()
+        };
+        let cut_has_any = cut_src.is_some_and(|(src_si, ..)| {
+            let sh = self.wb.sheet(src_si);
+            !sh.notes.is_empty() || !sh.threads.is_empty()
+        });
+        if src_notes.is_empty() && src_threads.is_empty() && !target_has_any && !cut_has_any {
+            return out;
+        }
+
+        let (r0, c0) = target_origin;
+        let r_end = r0.saturating_add(h.saturating_sub(1));
+        let c_end = c0.saturating_add(w.saturating_sub(1));
+        let dst_row_set: Option<HashSet<u32>> = target_rows.map(|v| v.iter().copied().collect());
+        let in_target = |rr: u32, cc: u32| -> bool {
+            if cc < c0 || cc > c_end {
+                return false;
+            }
+            match &dst_row_set {
+                Some(set) => set.contains(&rr),
+                None => rr >= r0 && rr <= r_end,
+            }
+        };
+        let cut_row_set: Option<HashSet<u32>> =
+            cut_src.and_then(|(_, _, rows)| rows.map(|v| v.iter().copied().collect()));
+        let in_cut = |rr: u32, cc: u32, rect: (u32, u32, u32, u32)| -> bool {
+            if cc < rect.1 || cc > rect.3 {
+                return false;
+            }
+            match &cut_row_set {
+                Some(set) => set.contains(&rr),
+                None => rr >= rect.0 && rr <= rect.2,
+            }
+        };
+
+        let mut before_notes: BTreeMap<(usize, u32, u32), Option<sheetcore::notes::Note>> = BTreeMap::new();
+        let mut before_threads: BTreeMap<(usize, u32, u32), Option<sheetcore::notes::ThreadedComment>> =
+            BTreeMap::new();
+
+        // 1) 记录源剪切区受影响的现有批注与线程
+        let mut cut_note_keys: Vec<(usize, sheetcore::model::CellRef)> = Vec::new();
+        let mut cut_thread_keys: Vec<(usize, sheetcore::model::CellRef)> = Vec::new();
+        if let Some((src_si, src_rect, _)) = cut_src {
+            let sh = self.wb.sheet(src_si);
+            for (&k, n) in &sh.notes {
+                if in_cut(k.row, k.col, src_rect) {
+                    before_notes.insert((src_si, k.row, k.col), Some(n.clone()));
+                    cut_note_keys.push((src_si, k));
+                }
+            }
+            for (&k, tc) in &sh.threads {
+                if in_cut(k.row, k.col, src_rect) {
+                    before_threads.insert((src_si, k.row, k.col), Some(tc.clone()));
+                    cut_thread_keys.push((src_si, k));
+                }
+            }
+        }
+
+        // 2) 记录目标覆盖区受影响的现有批注与线程
+        let mut dst_clear_note_keys: Vec<sheetcore::model::CellRef> = Vec::new();
+        let mut dst_clear_thread_keys: Vec<sheetcore::model::CellRef> = Vec::new();
+        {
+            let sh = self.wb.sheet(target_sheet);
+            for (&k, n) in &sh.notes {
+                if in_target(k.row, k.col) {
+                    before_notes.entry((target_sheet, k.row, k.col)).or_insert_with(|| Some(n.clone()));
+                    dst_clear_note_keys.push(k);
+                }
+            }
+            for (&k, tc) in &sh.threads {
+                if in_target(k.row, k.col) {
+                    before_threads.entry((target_sheet, k.row, k.col)).or_insert_with(|| Some(tc.clone()));
+                    dst_clear_thread_keys.push(k);
+                }
+            }
+        }
+
+        // 3) 计算写入目标位置（支持平铺粘贴与合并锚点归位），并补全 before 快照
+        let tile_r = (h / base_h).max(1);
+        let tile_c = (w / base_w).max(1);
+        let mut writes_notes: Vec<(u32, u32, sheetcore::notes::Note)> = Vec::new();
+        let mut writes_threads: Vec<(u32, u32, sheetcore::notes::ThreadedComment)> = Vec::new();
+        {
+            let sh = self.wb.sheet(target_sheet);
+            for tr in 0..tile_r {
+                for tc in 0..tile_c {
+                    for (ri, ci, n) in src_notes {
+                        let out_r_idx = tr * base_h + *ri;
+                        let out_c_idx = tc * base_w + *ci;
+                        if out_r_idx >= h || out_c_idx >= w {
+                            continue;
+                        }
+                        let raw_r = target_rows
+                            .and_then(|v| v.get(out_r_idx as usize).copied())
+                            .unwrap_or(r0 + out_r_idx);
+                        let raw_c = c0 + out_c_idx;
+                        let (ar, ac) = sh
+                            .merge_at(raw_r, raw_c)
+                            .map(|(mr1, mc1, _, _)| (mr1, mc1))
+                            .unwrap_or((raw_r, raw_c));
+                        before_notes.entry((target_sheet, ar, ac)).or_insert_with(|| {
+                            sh.notes.get(&sheetcore::model::CellRef::new(ar, ac)).cloned()
+                        });
+                        let mut nn = n.clone();
+                        nn.r = ar;
+                        nn.c = ac;
+                        writes_notes.push((ar, ac, nn));
+                    }
+                    for (ri, ci, thread) in src_threads {
+                        let out_r_idx = tr * base_h + *ri;
+                        let out_c_idx = tc * base_w + *ci;
+                        if out_r_idx >= h || out_c_idx >= w {
+                            continue;
+                        }
+                        let raw_r = target_rows
+                            .and_then(|v| v.get(out_r_idx as usize).copied())
+                            .unwrap_or(r0 + out_r_idx);
+                        let raw_c = c0 + out_c_idx;
+                        let (ar, ac) = sh
+                            .merge_at(raw_r, raw_c)
+                            .map(|(mr1, mc1, _, _)| (mr1, mc1))
+                            .unwrap_or((raw_r, raw_c));
+                        before_threads.entry((target_sheet, ar, ac)).or_insert_with(|| {
+                            sh.threads.get(&sheetcore::model::CellRef::new(ar, ac)).cloned()
+                        });
+                        let mut nt = thread.clone();
+                        nt.r = ar;
+                        nt.c = ac;
+                        writes_threads.push((ar, ac, nt));
+                    }
+                }
+            }
+        }
+
+        // 4) 应用清理与写入
+        for (src_si, k) in cut_note_keys {
+            self.wb.sheet_mut(src_si).notes.remove(&k);
+        }
+        for (src_si, k) in cut_thread_keys {
+            self.wb.sheet_mut(src_si).threads.remove(&k);
+        }
+        {
+            let sh = self.wb.sheet_mut(target_sheet);
+            for k in dst_clear_note_keys {
+                sh.notes.remove(&k);
+            }
+            for k in dst_clear_thread_keys {
+                sh.threads.remove(&k);
+            }
+            for (ar, ac, n) in writes_notes {
+                sh.notes.insert(sheetcore::model::CellRef::new(ar, ac), n);
+            }
+            for (ar, ac, tc) in writes_threads {
+                sh.threads.insert(sheetcore::model::CellRef::new(ar, ac), tc);
+            }
+        }
+
+        // 5) 汇总真实 diff 与标脏
+        let mut dirty_note_sheets = HashSet::new();
+        let mut dirty_thread_sheets = HashSet::new();
+        for ((si_k, rr, cc), b_opt) in before_notes {
+            let a_opt = self
+                .wb
+                .sheet(si_k)
+                .notes
+                .get(&sheetcore::model::CellRef::new(rr, cc))
+                .cloned();
+            if b_opt != a_opt {
+                out.notes.push((si_k, (rr, cc), b_opt, a_opt));
+                dirty_note_sheets.insert(si_k);
+            }
+        }
+        for ((si_k, rr, cc), b_opt) in before_threads {
+            let a_opt = self
+                .wb
+                .sheet(si_k)
+                .threads
+                .get(&sheetcore::model::CellRef::new(rr, cc))
+                .cloned();
+            if b_opt != a_opt {
+                out.threads.push((si_k, (rr, cc), b_opt, a_opt));
+                dirty_thread_sheets.insert(si_k);
+            }
+        }
+        for s in dirty_note_sheets {
+            let sh = self.wb.sheet_mut(s);
+            sh.notes_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        for s in dirty_thread_sheets {
+            let sh = self.wb.sheet_mut(s);
+            sh.threads_dirty = true;
+            sh.bump_display_style_revision();
+        }
+        out
+    }
+
+    fn clear_internal_clip(&mut self) {
+        self.clip = None;
+        self.clip_notes.clear();
+        self.clip_threads.clear();
+        self.clip_notes_captured = false;
+    }
+
+    fn broadcast_note_meta(
+        &self,
+        sheet: usize,
+        r: u32,
+        c: u32,
+        note: Option<&sheetcore::notes::Note>,
+    ) {
+        let Some(net) = self.net.as_ref() else { return };
+        let kind = match note {
+            Some(n) => sheetcore::sync::SheetMetaKind::Note {
+                row: r,
+                col: c,
+                author: n.author.clone(),
+                text: Some(n.text.clone()),
+            },
+            None => sheetcore::sync::SheetMetaKind::Note {
+                row: r,
+                col: c,
+                author: String::new(),
+                text: None,
+            },
+        };
+        net.broadcast_sheet_meta(sheet, kind);
+    }
+
+    fn broadcast_thread_meta(
+        &self,
+        sheet: usize,
+        r: u32,
+        c: u32,
+        thread: Option<&sheetcore::notes::ThreadedComment>,
+    ) {
+        let Some(net) = self.net.as_ref() else { return };
+        net.broadcast_sheet_meta(
+            sheet,
+            sheetcore::sync::SheetMetaKind::Thread {
+                row: r,
+                col: c,
+                thread: thread.cloned(),
+            },
+        );
+    }
+
+    pub(crate) fn broadcast_note_undo_edit(&self, edit: &sheetcore::undo::NoteUndoEdit) {
+        let Some(net) = self.net.as_ref() else { return };
+        for (sheet, kind) in edit.to_meta_sync(true) {
+            net.broadcast_sheet_meta(sheet, kind);
+        }
+    }
+
+    /// 统一的删除/清除选区批注与线程会话入口（右键「删除批注」与功能区「清除批注」共用）
+    pub(crate) fn delete_comments_in_selection(&mut self, label: &str) {
+        if self.edit_blocked() {
+            return;
+        }
+        let targets = self.comment_keys_in_sel();
+        if targets.is_empty() {
+            self.status = "所选区域没有批注".into();
+            return;
+        }
+        let gate: Vec<(u32, u32)> = targets.iter().map(|k| (k.row, k.col)).collect();
+        if !self.write_preflight(&gate, label) {
+            return;
+        }
+        let si = self.sheet_idx;
+        let sheet_id = self.wb.sheet(si).identity;
+        let mut note_diffs = Vec::new();
+        let mut thread_diffs = Vec::new();
+        {
+            let sh = self.wb.sheet_mut(si);
+            for k in &targets {
+                if let Some(old) = sh.notes.remove(k) {
+                    note_diffs.push(((k.row, k.col), Some(old), None));
+                }
+                if let Some(old_tc) = sh.threads.remove(k) {
+                    thread_diffs.push(((k.row, k.col), Some(old_tc), None));
+                }
+                self.pinned_comments.remove(&(sheet_id, *k));
+                self.comment_card_offsets.remove(&(sheet_id, *k));
+            }
+            if !note_diffs.is_empty() {
+                sh.notes_dirty = true;
+            }
+            if !thread_diffs.is_empty() {
+                sh.threads_dirty = true;
+            }
+            if !note_diffs.is_empty() || !thread_diffs.is_empty() {
+                sh.bump_display_style_revision();
+            }
+        }
+        let removed_cells: std::collections::HashSet<(u32, u32)> = note_diffs
+            .iter()
+            .map(|(p, ..)| *p)
+            .chain(thread_diffs.iter().map(|(p, ..)| *p))
+            .collect();
+        let removed = removed_cells.len();
+        if removed > 0 {
+            for &(pos, _, _) in &note_diffs {
+                self.broadcast_note_meta(si, pos.0, pos.1, None);
+            }
+            for &(pos, _, _) in &thread_diffs {
+                self.broadcast_thread_meta(si, pos.0, pos.1, None);
+            }
+            self.undo.push_meta(
+                label,
+                (si, self.sel.0, self.sel.1),
+                sheetcore::undo::MetaEdit {
+                    sheet: si,
+                    notes: note_diffs,
+                    threads: thread_diffs,
+                    ..Default::default()
+                },
+            );
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.tasks.last_edit = Some(std::time::Instant::now());
+            self.status = if removed == 1 {
+                format!("已{label}")
+            } else {
+                format!("已{label} {removed} 条")
+            };
+        } else {
+            self.status = "所选区域没有批注".into();
+        }
+    }
+
     /// 合并单元格内部任意坐标统一归一化到左上角锚点（绘制与保存批注均挂在锚点上）
     pub(crate) fn note_anchor(&self, r: u32, c: u32) -> (u32, u32) {
         self.wb
@@ -29865,13 +30815,14 @@ fn clear_selection(&mut self) {
             .unwrap_or((r, c))
     }
 
-    /// 收集当前选区（含交集的合并区域锚点）内所有批注坐标
+    /// 收集当前选区（含交集的合并区域锚点）内所有批注与线程会话坐标
     pub(crate) fn comment_keys_in_sel(&self) -> Vec<sheetcore::model::CellRef> {
         let rects = self.sel_rects();
         let sh = self.wb.sheet(self.sheet_idx);
         let mut out: Vec<sheetcore::model::CellRef> = sh
             .notes
             .keys()
+            .chain(sh.threads.keys())
             .copied()
             .filter(|k| {
                 if rects
@@ -29943,9 +30894,51 @@ fn clear_selection(&mut self) {
             || crate::office_clipboard::has_pasteable()
     }
 
-    /// 统一打开批注编辑窗口（右键菜单、功能区、顶栏按钮、显示批注共用）：
-    /// 提交挂起格内编辑 -> 合并锚点归一化 -> 锁与保护门禁 -> 自动聚焦 + 请求立即重绘。
+    /// 当前工作表内所有批注/线程会话的排序坐标列表
+    pub(crate) fn sheet_comment_keys(&self, sheet_idx: usize) -> Vec<(u32, u32)> {
+        let Some(sh) = self.wb.sheets.get(sheet_idx) else {
+            return Vec::new();
+        };
+        let mut keys: Vec<(u32, u32)> = sh
+            .notes
+            .keys()
+            .chain(sh.threads.keys())
+            .map(|k| (k.row, k.col))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// 切换指定单元格批注的单格固定常显状态
+    pub(crate) fn toggle_pin_comment(&mut self, sheet_idx: usize, r: u32, c: u32) -> bool {
+        let Some(sh) = self.wb.sheets.get(sheet_idx) else {
+            return false;
+        };
+        let (ar, ac) = sh.merge_at(r, c).map(|(mr1, mc1, _, _)| (mr1, mc1)).unwrap_or((r, c));
+        let key = sheetcore::model::CellRef::new(ar, ac);
+        if !sh.notes.contains_key(&key) && !sh.threads.contains_key(&key) {
+            return false;
+        }
+        let sid = sh.identity;
+        if self.pinned_comments.remove(&(sid, key)) {
+            self.status = format!("已隐藏固定批注 {}", cell_name(ar, ac));
+            false
+        } else {
+            self.pinned_comments.insert((sid, key));
+            self.status = format!("已固定显示批注 {}", cell_name(ar, ac));
+            true
+        }
+    }
+
+    /// 统一打开批注编辑窗口（右键菜单、功能区、顶栏按钮、交互浮签共用）：
+    /// 提交挂起格内编辑 -> 合并锚点归一化 -> 锁与保护门禁 -> 锚定到目标格旁自动聚焦 + 请求立即重绘。
     pub(crate) fn open_note_editor(&mut self, ctx: Option<&egui::Context>) {
+        let anchor = self.last_sel_cell_rect.map(|rect| rect.right_top());
+        self.open_note_editor_at(ctx, anchor);
+    }
+
+    pub(crate) fn open_note_editor_at(&mut self, ctx: Option<&egui::Context>, anchor: Option<egui::Pos2>) {
         if self.edit_blocked() {
             return;
         }
@@ -29956,35 +30949,31 @@ fn clear_selection(&mut self) {
         if !self.write_preflight(&[(r, c)], "编辑批注") {
             return;
         }
-        let cur = self
-            .wb
-            .sheet(self.sheet_idx)
-            .notes
-            .get(&sheetcore::model::CellRef::new(r, c))
-            .map(|n| n.text.clone())
+        let key = sheetcore::model::CellRef::new(r, c);
+        let sh = self.wb.sheet(self.sheet_idx);
+        let cur = sh
+            .threads
+            .get(&key)
+            .and_then(|tc| tc.entries.first().map(|e| e.text.clone()))
+            .or_else(|| sh.notes.get(&key).map(|n| n.text.clone()))
             .unwrap_or_default();
         self.note_edit = Some((r, c, cur));
         self.note_edit_sheet = self.sheet_idx;
+        self.note_edit_anchor = anchor;
+        self.note_reply_buf.clear();
         self.note_focus_requested = true;
         if let Some(ctx) = ctx {
             ctx.request_repaint();
         }
     }
 
-    /// 上一条/下一条批注：按行列排序在当前表里找
+    /// 上一条/下一条批注：按行列排序在当前表里找（涵盖传统批注与线程批注）
     fn note_step(&mut self, forward: bool) {
-        let mut keys: Vec<(u32, u32)> = self
-            .wb
-            .sheet(self.sheet_idx)
-            .notes
-            .keys()
-            .map(|k| (k.row, k.col))
-            .collect();
+        let keys = self.sheet_comment_keys(self.sheet_idx);
         if keys.is_empty() {
             self.status = "当前表没有批注".into();
             return;
         }
-        keys.sort_unstable();
         let cur = self.note_anchor(self.sel.0, self.sel.1);
         let target = if forward {
             keys.iter()
@@ -30004,35 +30993,39 @@ fn clear_selection(&mut self) {
         self.status = format!("批注 {}", cell_name(target.0, target.1));
     }
 
-    /// 显示批注：有就打开编辑框，没有就提示
+    /// 显示/隐藏当前批注（Excel/WPS 原生语义）：
+    /// - 当前格有批注：切换该格的单格固定常显状态；
+    /// - 当前格无批注：跳到当前表第一条批注并固定显示。
     fn note_show(&mut self) {
+        let si = self.sheet_idx;
         let (r, c) = self.note_anchor(self.sel.0, self.sel.1);
-        let has_cur = self
-            .wb
-            .sheet(self.sheet_idx)
-            .notes
-            .contains_key(&sheetcore::model::CellRef::new(r, c));
+        let key = sheetcore::model::CellRef::new(r, c);
+        let has_cur = {
+            let sh = self.wb.sheet(si);
+            sh.notes.contains_key(&key) || sh.threads.contains_key(&key)
+        };
         if has_cur {
-            self.open_note_editor(None);
+            if self.show_all_comments {
+                self.show_all_comments = false;
+                let sid = self.wb.sheet(si).identity;
+                self.pinned_comments.remove(&(sid, key));
+                self.status = format!("已关闭全部显示并隐藏批注 {}", cell_name(r, c));
+            } else {
+                self.toggle_pin_comment(si, r, c);
+            }
         } else {
-            // 找最近的一条批注并跳过去
-            let mut keys: Vec<(u32, u32)> = self
-                .wb
-                .sheet(self.sheet_idx)
-                .notes
-                .keys()
-                .map(|k| (k.row, k.col))
-                .collect();
+            let keys = self.sheet_comment_keys(si);
             if keys.is_empty() {
                 self.status = "当前表没有批注".into();
                 return;
             }
-            keys.sort_unstable();
             let t = keys[0];
             self.sel = t;
             self.sel_end = t;
             self.ensure_visible();
-            self.open_note_editor(None);
+            let sid = self.wb.sheet(si).identity;
+            self.pinned_comments.insert((sid, sheetcore::model::CellRef::new(t.0, t.1)));
+            self.status = format!("已定位并固定显示批注 {}", cell_name(t.0, t.1));
         }
     }
 
@@ -33053,12 +34046,14 @@ fn clear_selection(&mut self) {
 
 
 
-    /// 批注与线程会话编辑窗口（支持传统批注 + Excel 365 线程回复 / 已解决状态 / 显示全部批注开关）
+    /// 就地便签式批注与线程会话编辑器（紧贴目标单元格右上角弹出，可拖拽缩放；
+    /// 支持 Esc 取消、Ctrl+Enter 快速保存、Alt+↑/↓ 连续审阅、回复框 Enter 提交、一键删除/复制、完整撤销与协作广播）
     fn note_dialog(&mut self, ctx: &egui::Context) {
         let Some((r, c, mut text)) = self.note_edit.take() else { return };
         let target_sheet = self.note_edit_sheet;
         if target_sheet >= self.wb.sheets.len() {
             self.note_focus_requested = false;
+            self.note_edit_anchor = None;
             return;
         }
         let (r, c) = self
@@ -33068,44 +34063,232 @@ fn clear_selection(&mut self) {
             .map(|(mr1, mc1, _, _)| (mr1, mc1))
             .unwrap_or((r, c));
         let key = sheetcore::model::CellRef::new(r, c);
-        let thread_snap = self.wb.sheet(target_sheet).threads.get(&key).cloned();
+        let (thread_snap, existing_author, has_existing) = {
+            let sh = self.wb.sheet(target_sheet);
+            let tc = sh.threads.get(&key).cloned();
+            let author = tc
+                .as_ref()
+                .map(|t| t.root_author().to_string())
+                .filter(|a| !a.is_empty())
+                .or_else(|| sh.notes.get(&key).map(|n| n.author.clone()).filter(|a| !a.is_empty()))
+                .unwrap_or_else(|| {
+                    if self.my_name.trim().is_empty() {
+                        "CELLAN".to_string()
+                    } else {
+                        self.my_name.trim().to_string()
+                    }
+                });
+            let exists = tc.is_some() || sh.notes.contains_key(&key);
+            (tc, author, exists)
+        };
+        let all_comment_keys = self.sheet_comment_keys(target_sheet);
+        let has_nav = !all_comment_keys.is_empty()
+            && (all_comment_keys.len() > 1 || !all_comment_keys.contains(&(r, c)));
+        let is_resolved = thread_snap.as_ref().is_some_and(|tc| tc.resolved);
+
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
+        let mut delete_now = false;
+        let mut copy_now = false;
+        let mut step_dir: Option<bool> = None; // Some(false)=prev, Some(true)=next
         let mut send_reply = false;
         let mut toggle_resolved = false;
+        let mut open_sidebar = false;
+        self.comments_panel.ensure_phrases_loaded();
+        let default_author_for_stamp = self.comment_author_default();
+        let mut inserted_snippet = false;
         let want_focus = self.note_focus_requested;
-        let name = format!("批注与会话 {}", cell_name(r, c));
+        let title = format!("批注 {}  ·  {}", cell_name(r, c), existing_author);
         let te_id = egui::Id::new("note_dialog_text");
-        ui_kit::window(ctx, name, 360.0)
+        let reply_id = egui::Id::new("note_dialog_reply");
+        let win_id = egui::Id::new(("note_sticky_editor", target_sheet, r, c));
+
+        // 优先紧贴目标单元格右上角外侧弹出便签式编辑框（屏幕放不下自动左翻/上提）
+        let screen = ctx.screen_rect();
+        let init_w = 368.0f32;
+        let est_h = if thread_snap.is_some() { 340.0f32 } else { 225.0f32 };
+        let default_pos = if let Some(anchor) = self.note_edit_anchor {
+            let mut x = anchor.x + 14.0;
+            if x + init_w > screen.right() - 12.0 {
+                x = (anchor.x - init_w - 80.0).max(screen.left() + 12.0);
+            }
+            let y = (anchor.y - 6.0)
+                .clamp(screen.top() + 36.0, (screen.bottom() - est_h - 12.0).max(screen.top() + 36.0));
+            egui::pos2(x, y)
+        } else {
+            egui::pos2(
+                (screen.center().x - init_w * 0.5).max(screen.left() + 12.0),
+                (screen.center().y - est_h * 0.5).max(screen.top() + 36.0),
+            )
+        };
+
+        let (bg_col, border_col) = if is_resolved {
+            (Color32::from_rgb(242, 251, 245), Color32::from_rgb(134, 198, 158))
+        } else {
+            (Color32::from_rgb(255, 253, 240), Color32::from_rgb(217, 191, 132))
+        };
+        let sticky_frame = egui::Frame::window(&ctx.style())
+            .fill(bg_col)
+            .stroke(Stroke::new(1.2, border_col))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 10));
+
+        let win_resp = egui::Window::new(title)
+            .id(win_id)
+            .frame(sticky_frame)
             .collapsible(false)
             .resizable(true)
-            .default_width(360.0)
+            .default_width(init_w)
+            .min_width(300.0)
+            .default_pos(default_pos)
             .open(&mut open)
             .show(ctx, |ui| {
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                    cancel = true;
+                }
                 if ui.input_mut(|i| {
                     i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)
                         || i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)
                 }) {
                     apply = true;
                 }
+                if ui.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::Semicolon)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::Semicolon)
+                }) {
+                    let stamp = comments_panel::format_comment_timestamp(&default_author_for_stamp);
+                    comments_panel::append_comment_snippet(&mut text, &stamp);
+                    inserted_snippet = true;
+                }
+                if has_nav {
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowUp)) {
+                        step_dir = Some(false);
+                    } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown)) {
+                        step_dir = Some(true);
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("主批注内容（Ctrl+Enter 快速保存）")
-                            .size(11.5)
+                        egui::RichText::new("Ctrl+Enter 保存 · Ctrl+; 时间戳 · Esc 取消")
+                            .size(10.5)
                             .weak(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.checkbox(&mut self.show_all_comments, "显示全部批注");
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("面板").size(10.5)).frame(false))
+                            .on_hover_text("打开右侧批注管理面板")
+                            .clicked()
+                        {
+                            open_sidebar = true;
+                        }
+                        if has_nav {
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new("下一条 ▶").size(11.0)).frame(false))
+                                .on_hover_text("保存并跳到下一条批注 (Alt+↓)")
+                                .clicked()
+                            {
+                                step_dir = Some(true);
+                            }
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new("◀ 上一条").size(11.0)).frame(false))
+                                .on_hover_text("保存并跳到上一条批注 (Alt+↑)")
+                                .clicked()
+                            {
+                                step_dir = Some(false);
+                            }
+                        }
                     });
                 });
                 let out = egui::TextEdit::multiline(&mut text)
                     .id(te_id)
-                    .desired_rows(4)
+                    .desired_rows(5)
                     .desired_width(f32::INFINITY)
                     .hint_text("输入批注内容…")
                     .show(ui);
-                if want_focus {
+                // 快捷时间戳与高频财务常用语芯片条
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 3.0);
+                    if ui
+                        .small_button("时间戳")
+                        .on_hover_text("插入当前日期时间与用户名 (Ctrl+;)")
+                        .clicked()
+                    {
+                        let stamp =
+                            comments_panel::format_comment_timestamp(&default_author_for_stamp);
+                        comments_panel::append_comment_snippet(&mut text, &stamp);
+                        inserted_snippet = true;
+                    }
+                    for &phrase in comments_panel::BUILTIN_COMMENT_PHRASES {
+                        if ui.small_button(phrase).clicked() {
+                            comments_panel::append_comment_snippet(&mut text, phrase);
+                            inserted_snippet = true;
+                        }
+                    }
+                    let custom_copy = self.comments_panel.custom_phrases.clone();
+                    for phrase in &custom_copy {
+                        if ui.small_button(phrase.as_str()).clicked() {
+                            comments_panel::append_comment_snippet(&mut text, phrase);
+                            inserted_snippet = true;
+                        }
+                    }
+                    let mgr_lbl = if self.comments_panel.phrases_manage_open {
+                        "收起常用语"
+                    } else {
+                        "自定义…"
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new(mgr_lbl).size(10.5).weak())
+                                .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.comments_panel.phrases_manage_open =
+                            !self.comments_panel.phrases_manage_open;
+                    }
+                });
+                if self.comments_panel.phrases_manage_open {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.comments_panel.new_phrase_buf)
+                                .desired_width((ui.available_width() - 96.0).max(120.0))
+                                .hint_text("添加自定义财务常用语…"),
+                        );
+                        if ui.small_button("添加").clicked() {
+                            let val = std::mem::take(&mut self.comments_panel.new_phrase_buf);
+                            let _ = self.comments_panel.add_custom_phrase(&val);
+                        }
+                        if !text.trim().is_empty()
+                            && ui
+                                .small_button("存当前")
+                                .on_hover_text("把当前批注正文存为自定义常用语")
+                                .clicked()
+                        {
+                            let _ = self.comments_panel.add_custom_phrase(text.trim());
+                        }
+                    });
+                    if !self.comments_panel.custom_phrases.is_empty() {
+                        let mut del_idx = None;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
+                            for (pi, p) in self.comments_panel.custom_phrases.iter().enumerate() {
+                                if ui
+                                    .small_button(format!("{p} ×"))
+                                    .on_hover_text("点击移除此自定义常用语")
+                                    .clicked()
+                                {
+                                    del_idx = Some(pi);
+                                }
+                            }
+                        });
+                        if let Some(di) = del_idx {
+                            self.comments_panel.remove_custom_phrase(di);
+                        }
+                    }
+                }
+                if want_focus || inserted_snippet {
                     out.response.request_focus();
                     let end = egui::text::CCursor::new(text.chars().count());
                     let mut state = out.state;
@@ -33143,27 +34326,51 @@ fn clear_selection(&mut self) {
                                 format!("{} · {}", entry.author, entry.timestamp)
                             };
                             ui.label(egui::RichText::new(hdr).size(10.5).weak());
-                            ui.label(egui::RichText::new(&entry.text).size(12.0));
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&entry.text).size(12.0))
+                                    .selectable(true)
+                                    .wrap(),
+                            );
                             ui.add_space(2.0);
                         }
                     });
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.add(
+                    let r_resp = ui.add(
                         egui::TextEdit::singleline(&mut self.note_reply_buf)
-                            .desired_width(230.0)
-                            .hint_text("添加线程回复…"),
+                            .id(reply_id)
+                            .desired_width((ui.available_width() - 62.0).max(160.0))
+                            .hint_text("添加线程回复（Enter 发送）…"),
                     );
-                    if ui_kit::secondary_button(ui, "回复").clicked()
+                    let enter_in_reply = r_resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.ctrl && !i.modifiers.command);
+                    if (ui_kit::secondary_button(ui, "回复").clicked() || enter_in_reply)
                         && !self.note_reply_buf.trim().is_empty()
                     {
                         send_reply = true;
                     }
                 });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.show_all_comments, "显示全部批注");
+                    ui.checkbox(&mut self.auto_show_selected_comment, "选中自动展开")
+                        .on_hover_text("关闭后仅鼠标悬停或固定时显示批注卡片，方向键扫表不遮挡");
+                });
                 ui.add_space(4.0);
                 ui.separator();
                 ui.horizontal(|ui| {
+                    if has_existing {
+                        if ui
+                            .button(egui::RichText::new("删除批注").color(Color32::from_rgb(185, 28, 28)))
+                            .clicked()
+                        {
+                            delete_now = true;
+                        }
+                    }
+                    if !text.trim().is_empty() && ui_kit::secondary_button(ui, "复制").clicked() {
+                        copy_now = true;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui_kit::secondary_button(ui, "取消").clicked() {
                             cancel = true;
@@ -33173,60 +34380,100 @@ fn clear_selection(&mut self) {
                         }
                     });
                 });
-                if apply || cancel {
-                    open = false;
-                }
             });
+        if apply || cancel || delete_now {
+            open = false;
+        }
+
+        // 从目标单元格右上角画一根轻柔引导线到便签编辑器，明确视觉归属
+        if let (Some(anchor), Some(ir)) = (self.note_edit_anchor, win_resp.as_ref()) {
+            let wr = ir.response.rect;
+            let tp = if wr.left() >= anchor.x {
+                egui::pos2(wr.left(), (wr.top() + 16.0).min(wr.bottom() - 6.0))
+            } else if wr.right() <= anchor.x {
+                egui::pos2(wr.right(), (wr.top() + 16.0).min(wr.bottom() - 6.0))
+            } else {
+                egui::pos2(wr.center().x, wr.top())
+            };
+            let lp = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("note_editor_leader_line"),
+            ));
+            lp.line_segment([anchor, tp], Stroke::new(1.2, border_col));
+            lp.circle_filled(anchor, 2.5, border_col);
+        }
+
+        if copy_now {
+            let copy_txt = thread_snap
+                .as_ref()
+                .map(|tc| tc.summary_text())
+                .unwrap_or_else(|| text.clone());
+            ctx.copy_text(copy_txt);
+            self.status = format!("已复制 {} 的批注", cell_name(r, c));
+        }
+        if open_sidebar {
+            self.comments_panel.open = true;
+        }
+
         let default_author = if self.my_name.trim().is_empty() {
             "CELLAN".to_string()
         } else {
             self.my_name.trim().to_string()
         };
+
         if toggle_resolved {
             if self.write_preflight_on(target_sheet, &[(r, c)], "更新批注线程状态") {
                 let old_note = self.wb.sheet(target_sheet).notes.get(&key).cloned();
-                let new_note_opt = {
+                let old_thread = self.wb.sheet(target_sheet).threads.get(&key).cloned();
+                let updated = {
                     let sh = self.wb.sheet_mut(target_sheet);
                     if let Some(tc) = sh.threads.get_mut(&key) {
                         tc.resolved = !tc.resolved;
+                        let new_tc = tc.clone();
                         sh.threads_dirty = true;
                         let n = sheetcore::notes::Note {
                             r,
                             c,
-                            text: tc.summary_text(),
-                            author: tc.root_author().to_string(),
+                            text: new_tc.summary_text(),
+                            author: new_tc.root_author().to_string(),
                         };
                         sh.notes.insert(key, n.clone());
                         sh.notes_dirty = true;
-                        Some(n)
+                        sh.bump_display_style_revision();
+                        Some((n, new_tc))
                     } else {
                         None
                     }
                 };
-                if let Some(new_note) = new_note_opt {
-                    text = new_note.text.clone();
+                if let Some((new_note, new_tc)) = updated {
+                    self.broadcast_note_meta(target_sheet, r, c, Some(&new_note));
+                    self.broadcast_thread_meta(target_sheet, r, c, Some(&new_tc));
                     self.undo.push_meta(
                         "切换批注解决状态",
                         (target_sheet, r, c),
                         sheetcore::undo::MetaEdit {
                             sheet: target_sheet,
                             notes: vec![((r, c), old_note, Some(new_note))],
+                            threads: vec![((r, c), old_thread, Some(new_tc))],
                             ..Default::default()
                         },
                     );
                     self.wb.dirty = true;
                     self.doc_gen = self.doc_gen.wrapping_add(1);
+                    self.tasks.last_edit = Some(std::time::Instant::now());
                 }
             }
             self.note_edit = Some((r, c, text));
             ctx.request_repaint();
             return;
         }
+
         if send_reply {
             let reply_text = self.note_reply_buf.trim().to_string();
             self.note_reply_buf.clear();
             if !reply_text.is_empty() && self.write_preflight_on(target_sheet, &[(r, c)], "回复批注") {
                 let old_note = self.wb.sheet(target_sheet).notes.get(&key).cloned();
+                let old_thread = self.wb.sheet(target_sheet).threads.get(&key).cloned();
                 let ts_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -33246,7 +34493,7 @@ fn clear_selection(&mut self) {
                     let y = y + i64::from(m <= 2);
                     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
                 };
-                let new_note = {
+                let (new_note, new_tc) = {
                     let sh = self.wb.sheet_mut(target_sheet);
                     let tc = sh.threads.entry(key).or_insert_with(|| {
                         let mut entries = Vec::new();
@@ -33276,56 +34523,84 @@ fn clear_selection(&mut self) {
                         timestamp: ts,
                         text: reply_text,
                     });
+                    let new_tc = tc.clone();
                     sh.threads_dirty = true;
                     let n = sheetcore::notes::Note {
                         r,
                         c,
-                        text: tc.summary_text(),
-                        author: tc.root_author().to_string(),
+                        text: new_tc.summary_text(),
+                        author: new_tc.root_author().to_string(),
                     };
                     sh.notes.insert(key, n.clone());
                     sh.notes_dirty = true;
-                    n
+                    sh.bump_display_style_revision();
+                    (n, new_tc)
                 };
-                text = new_note.text.clone();
+                if text.trim().is_empty() {
+                    if let Some(first) = new_tc.entries.first() {
+                        text = first.text.clone();
+                    }
+                }
+                self.broadcast_note_meta(target_sheet, r, c, Some(&new_note));
+                self.broadcast_thread_meta(target_sheet, r, c, Some(&new_tc));
                 self.undo.push_meta(
                     "回复批注线程",
                     (target_sheet, r, c),
                     sheetcore::undo::MetaEdit {
                         sheet: target_sheet,
                         notes: vec![((r, c), old_note, Some(new_note))],
+                        threads: vec![((r, c), old_thread, Some(new_tc))],
                         ..Default::default()
                     },
                 );
                 self.wb.dirty = true;
                 self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.tasks.last_edit = Some(std::time::Instant::now());
                 self.status = format!("已在 {} 添加线程回复", cell_name(r, c));
             }
             self.note_edit = Some((r, c, text));
             ctx.request_repaint();
             return;
         }
-        if apply {
+
+        if delete_now {
             self.note_focus_requested = false;
             self.note_reply_buf.clear();
-            if !self.write_preflight_on(target_sheet, &[(r, c)], "编辑批注") {
-                ctx.request_repaint();
-                return;
-            }
-            let old_note = self.wb.sheet(target_sheet).notes.get(&key).cloned();
-            let cleaned = text.trim_end_matches(&['\r', '\n'][..]).to_string();
-            if cleaned.trim().is_empty() {
-                let sh = self.wb.sheet_mut(target_sheet);
-                let removed = sh.notes.remove(&key).is_some() | sh.threads.remove(&key).is_some();
-                if removed {
-                    sh.notes_dirty = true;
-                    sh.threads_dirty = true;
+            self.note_edit_anchor = None;
+            if self.write_preflight_on(target_sheet, &[(r, c)], "删除批注") {
+                let sheet_id = self.wb.sheet(target_sheet).identity;
+                let old_note = self.wb.sheet_mut(target_sheet).notes.remove(&key);
+                let old_thread = self.wb.sheet_mut(target_sheet).threads.remove(&key);
+                self.pinned_comments.remove(&(sheet_id, key));
+                self.comment_card_offsets.remove(&(sheet_id, key));
+                if old_note.is_some() || old_thread.is_some() {
+                    let sh = self.wb.sheet_mut(target_sheet);
+                    if old_note.is_some() {
+                        sh.notes_dirty = true;
+                    }
+                    if old_thread.is_some() {
+                        sh.threads_dirty = true;
+                    }
+                    sh.bump_display_style_revision();
+                    let note_diffs = old_note
+                        .map(|n| vec![((r, c), Some(n), None)])
+                        .unwrap_or_default();
+                    let thread_diffs = old_thread
+                        .map(|tc| vec![((r, c), Some(tc), None)])
+                        .unwrap_or_default();
+                    if !note_diffs.is_empty() {
+                        self.broadcast_note_meta(target_sheet, r, c, None);
+                    }
+                    if !thread_diffs.is_empty() {
+                        self.broadcast_thread_meta(target_sheet, r, c, None);
+                    }
                     self.undo.push_meta(
                         "删除批注",
                         (target_sheet, r, c),
                         sheetcore::undo::MetaEdit {
                             sheet: target_sheet,
-                            notes: vec![((r, c), old_note, None)],
+                            notes: note_diffs,
+                            threads: thread_diffs,
                             ..Default::default()
                         },
                     );
@@ -33333,46 +34608,132 @@ fn clear_selection(&mut self) {
                     self.doc_gen = self.doc_gen.wrapping_add(1);
                     self.tasks.last_edit = Some(std::time::Instant::now());
                     self.status = format!("已删除 {} 的批注", cell_name(r, c));
-                } else {
-                    self.status = "批注内容为空，未新增批注".into();
                 }
-            } else {
-                let author = self
-                    .wb
-                    .sheet(target_sheet)
-                    .notes
-                    .get(&key)
-                    .map(|n| n.author.trim().to_string())
-                    .filter(|a| !a.is_empty())
-                    .unwrap_or(default_author);
-                let new_note = sheetcore::notes::Note {
-                    r,
-                    c,
-                    text: cleaned.clone(),
-                    author,
-                };
-                let sheet = self.wb.sheet_mut(target_sheet);
-                sheet.notes.insert(key, new_note.clone());
-                sheet.notes_dirty = true;
-                if let Some(tc) = sheet.threads.get_mut(&key) {
-                    if let Some(first) = tc.entries.first_mut() {
-                        first.text = cleaned;
-                        sheet.threads_dirty = true;
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        let commit_current = apply || step_dir.is_some();
+        if commit_current {
+            self.note_focus_requested = false;
+            self.note_reply_buf.clear();
+            if self.write_preflight_on(target_sheet, &[(r, c)], "编辑批注") {
+                let old_note = self.wb.sheet(target_sheet).notes.get(&key).cloned();
+                let old_thread = self.wb.sheet(target_sheet).threads.get(&key).cloned();
+                let cleaned = text.trim_end_matches(&['\r', '\n'][..]).to_string();
+                if cleaned.trim().is_empty() {
+                    let sheet_id = self.wb.sheet(target_sheet).identity;
+                    let sh = self.wb.sheet_mut(target_sheet);
+                    let rm_note = sh.notes.remove(&key).is_some();
+                    let rm_thread = sh.threads.remove(&key).is_some();
+                    if rm_note || rm_thread {
+                        self.pinned_comments.remove(&(sheet_id, key));
+                        self.comment_card_offsets.remove(&(sheet_id, key));
+                        if rm_note {
+                            sh.notes_dirty = true;
+                        }
+                        if rm_thread {
+                            sh.threads_dirty = true;
+                        }
+                        sh.bump_display_style_revision();
+                        if rm_note {
+                            self.broadcast_note_meta(target_sheet, r, c, None);
+                        }
+                        if rm_thread {
+                            self.broadcast_thread_meta(target_sheet, r, c, None);
+                        }
+                        self.undo.push_meta(
+                            "删除批注",
+                            (target_sheet, r, c),
+                            sheetcore::undo::MetaEdit {
+                                sheet: target_sheet,
+                                notes: old_note.map(|n| vec![((r, c), Some(n), None)]).unwrap_or_default(),
+                                threads: old_thread.map(|tc| vec![((r, c), Some(tc), None)]).unwrap_or_default(),
+                                ..Default::default()
+                            },
+                        );
+                        self.wb.dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.tasks.last_edit = Some(std::time::Instant::now());
+                        self.status = format!("已删除 {} 的批注", cell_name(r, c));
+                    } else if apply {
+                        self.status = "批注内容为空，未新增批注".into();
+                    }
+                } else {
+                    let author = old_note
+                        .as_ref()
+                        .map(|n| n.author.trim().to_string())
+                        .filter(|a| !a.is_empty())
+                        .or_else(|| {
+                            old_thread
+                                .as_ref()
+                                .map(|tc| tc.root_author().trim().to_string())
+                                .filter(|a| !a.is_empty())
+                        })
+                        .unwrap_or(default_author);
+                    let mut new_thread = old_thread.clone();
+                    if let Some(ref mut tc) = new_thread {
+                        if let Some(first) = tc.entries.first_mut() {
+                            first.text = cleaned.clone();
+                        }
+                    }
+                    let effective_note_text = new_thread
+                        .as_ref()
+                        .map(|tc| tc.summary_text())
+                        .unwrap_or_else(|| cleaned.clone());
+                    let new_note = sheetcore::notes::Note {
+                        r,
+                        c,
+                        text: effective_note_text,
+                        author,
+                    };
+                    let changed_note = old_note.as_ref() != Some(&new_note);
+                    let changed_thread = old_thread != new_thread;
+                    if changed_note || changed_thread {
+                        let sheet = self.wb.sheet_mut(target_sheet);
+                        sheet.notes.insert(key, new_note.clone());
+                        sheet.notes_dirty = true;
+                        if let Some(ref tc) = new_thread {
+                            sheet.threads.insert(key, tc.clone());
+                            sheet.threads_dirty = true;
+                        }
+                        sheet.bump_display_style_revision();
+                        self.broadcast_note_meta(target_sheet, r, c, Some(&new_note));
+                        if changed_thread {
+                            self.broadcast_thread_meta(target_sheet, r, c, new_thread.as_ref());
+                        }
+                        self.undo.push_meta(
+                            if old_note.is_some() || old_thread.is_some() { "编辑批注" } else { "新建批注" },
+                            (target_sheet, r, c),
+                            sheetcore::undo::MetaEdit {
+                                sheet: target_sheet,
+                                notes: vec![((r, c), old_note, Some(new_note))],
+                                threads: if changed_thread {
+                                    vec![((r, c), old_thread, new_thread)]
+                                } else {
+                                    Vec::new()
+                                },
+                                ..Default::default()
+                            },
+                        );
+                        self.wb.dirty = true;
+                        self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.tasks.last_edit = Some(std::time::Instant::now());
+                        self.status = format!("已保存 {} 的批注", cell_name(r, c));
                     }
                 }
-                self.undo.push_meta(
-                    if old_note.is_some() { "编辑批注" } else { "新建批注" },
-                    (target_sheet, r, c),
-                    sheetcore::undo::MetaEdit {
-                        sheet: target_sheet,
-                        notes: vec![((r, c), old_note, Some(new_note))],
-                        ..Default::default()
-                    },
-                );
-                self.wb.dirty = true;
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.tasks.last_edit = Some(std::time::Instant::now());
-                self.status = format!("已保存 {} 的批注", cell_name(r, c));
+            }
+            if let Some(forward) = step_dir {
+                if target_sheet == self.sheet_idx {
+                    self.note_step(forward);
+                    self.note_edit_anchor = None;
+                    self.open_note_editor_at(Some(ctx), None);
+                } else {
+                    self.note_edit_anchor = None;
+                }
+            } else {
+                self.note_edit_anchor = None;
             }
             ctx.request_repaint();
         } else if !cancel && open {
@@ -33380,6 +34741,7 @@ fn clear_selection(&mut self) {
         } else {
             self.note_focus_requested = false;
             self.note_reply_buf.clear();
+            self.note_edit_anchor = None;
             ctx.request_repaint();
         }
     }
@@ -38724,7 +40086,8 @@ impl SheetApp {
                 });
                 ui.horizontal(|ui| {
                     ui.add_space(72.0);
-                    ui.checkbox(&mut self.find.in_comments, "含批注");
+                    ui.checkbox(&mut self.find.in_comments, "搜批注")
+                        .on_hover_text("在传统批注、线程批注及作者中查找，并支持对批注正文进行替换/全部替换");
                     ui.add_space(6.0);
                     ui.checkbox(&mut self.find.match_bold, "仅加粗格式");
                     if self.find.tab == 1 {
@@ -38885,11 +40248,28 @@ impl SheetApp {
                             .map(|s| {
                                 let val = s.value(h.row, h.col).display();
                                 let fml = s.formula_of(h.row, h.col);
-                                let note = s.notes.get(&sheetcore::model::CellRef::new(h.row, h.col));
-                                let p = match (fml, note) {
-                                    (Some(f), _) => format!("{val}  ({f})"),
-                                    (None, Some(n)) if val.is_empty() => format!("[批注] {}", n.text),
-                                    _ => val,
+                                let ckey = sheetcore::model::CellRef::new(h.row, h.col);
+                                let thread = s.threads.get(&ckey);
+                                let note = s.notes.get(&ckey);
+                                let p = if self.find.in_comments {
+                                    if let Some(tc) = thread {
+                                        format!("[线程] {}", tc.summary_text().replace('\n', " "))
+                                    } else if let Some(n) = note {
+                                        format!("[批注] {}", n.text.replace('\n', " "))
+                                    } else {
+                                        val
+                                    }
+                                } else {
+                                    match (fml, thread, note) {
+                                        (Some(f), _, _) => format!("{val}  ({f})"),
+                                        (None, Some(tc), _) if val.is_empty() => {
+                                            format!("[线程] {}", tc.summary_text().replace('\n', " "))
+                                        }
+                                        (None, None, Some(n)) if val.is_empty() => {
+                                            format!("[批注] {}", n.text.replace('\n', " "))
+                                        }
+                                        _ => val,
+                                    }
                                 };
                                 let clipped: String = p.chars().take(48).collect();
                                 (s.name.as_str(), clipped)
@@ -41548,53 +42928,7 @@ impl SheetApp {
             CtxAct::MergeCells => self.toggle_merge(true),
             CtxAct::UnmergeCells => self.toggle_merge(false),
             CtxAct::EditComment => self.open_note_editor(Some(ctx)),
-            CtxAct::DeleteComment => {
-                if self.edit_blocked() {
-                    return;
-                }
-                let targets = self.comment_keys_in_sel();
-                if targets.is_empty() {
-                    self.status = "所选区域没有批注".into();
-                    return;
-                }
-                let gate: Vec<(u32, u32)> = targets.iter().map(|k| (k.row, k.col)).collect();
-                if !self.write_preflight(&gate, "删除批注") {
-                    return;
-                }
-                let si = self.sheet_idx;
-                let mut note_diffs = Vec::new();
-                {
-                    let sh = self.wb.sheet_mut(si);
-                    for k in targets {
-                        if let Some(old) = sh.notes.remove(&k) {
-                            note_diffs.push(((k.row, k.col), Some(old), None));
-                        }
-                    }
-                    if !note_diffs.is_empty() {
-                        sh.notes_dirty = true;
-                    }
-                }
-                let removed = note_diffs.len();
-                if removed > 0 {
-                    self.undo.push_meta(
-                        "删除批注",
-                        (si, self.sel.0, self.sel.1),
-                        sheetcore::undo::MetaEdit {
-                            sheet: si,
-                            notes: note_diffs,
-                            ..Default::default()
-                        },
-                    );
-                    self.wb.dirty = true;
-                    self.doc_gen = self.doc_gen.wrapping_add(1);
-                    self.tasks.last_edit = Some(std::time::Instant::now());
-                    self.status = if removed == 1 {
-                        "已删除批注".into()
-                    } else {
-                        format!("已删除 {removed} 条批注")
-                    };
-                }
-            }
+            CtxAct::DeleteComment => self.delete_comments_in_selection("删除批注"),
             CtxAct::FilterByCellValue => self.filter_by_cell_value(),
             CtxAct::SetRowHeight => {
                 let h = self.wb.sheet(self.sheet_idx).rows.size(self.sel.0);
@@ -47502,7 +48836,87 @@ impl SheetApp {
             });
         }
 
-        // 批注浮签展示（支持「显示全部批注」常驻展示、线程已解决徽标，以及悬停/选中自动展开，纯绘制不拦截点击）
+        // 计算任意（可能合并的）单元格在当前窗格中的精确屏幕矩形与所属窗格裁剪边界：
+        // 彻底修复冻结首行/首列末尾格调用 px_of(mc2+1)/py_of(mr2+1) 跌入滚动区导致浮签漂移或穿模的问题。
+        let cell_screen_bounds = |mr1: u32, mc1: u32, mr2: u32, mc2: u32| -> Option<(Rect, Rect)> {
+            let (left, right, clip_l, clip_r) = if pg.is_some() {
+                (px_of(mc1), px_of(mc2 + 1), origin.x + head_w, resp.rect.right())
+            } else if !is_split {
+                if mc2 < fx {
+                    (
+                        spx(mc1),
+                        spx(mc2) + cols.size(mc2),
+                        origin.x + head_w,
+                        body_x.min(resp.rect.right()),
+                    )
+                } else if mc1 >= fx {
+                    (gx(mc1), gx(mc2) + cols.size(mc2), body_x, resp.rect.right())
+                } else {
+                    (
+                        spx(mc1),
+                        (gx(mc2) + cols.size(mc2)).max(body_x),
+                        origin.x + head_w,
+                        resp.rect.right(),
+                    )
+                }
+            } else {
+                (
+                    px_of(mc1),
+                    px_of(mc2) + cols.size(mc2),
+                    origin.x + head_w,
+                    resp.rect.right(),
+                )
+            };
+            let (top, bottom, clip_t, clip_b) = if pg.is_some() {
+                (py_of(mr1), py_of(mr2 + 1), origin.y + hh, resp.rect.bottom())
+            } else if !is_split {
+                if mr2 < fy {
+                    (
+                        spy(mr1),
+                        spy(mr2) + rows.size(mr2),
+                        origin.y + hh,
+                        body_y.min(resp.rect.bottom()),
+                    )
+                } else if mr1 >= fy {
+                    (gy(mr1), gy(mr2) + rows.size(mr2), body_y, resp.rect.bottom())
+                } else {
+                    (
+                        spy(mr1),
+                        (gy(mr2) + rows.size(mr2)).max(body_y),
+                        origin.y + hh,
+                        resp.rect.bottom(),
+                    )
+                }
+            } else {
+                (
+                    py_of(mr1),
+                    py_of(mr2) + rows.size(mr2),
+                    origin.y + hh,
+                    resp.rect.bottom(),
+                )
+            };
+            if right > clip_l && left < clip_r && bottom > clip_t && top < clip_b {
+                Some((
+                    Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom)),
+                    Rect::from_min_max(egui::pos2(clip_l, clip_t), egui::pos2(clip_r, clip_b)),
+                ))
+            } else {
+                None
+            }
+        };
+
+        // 记录当前活动格（归一化合并锚点）的屏幕矩形，供就地便签式批注编辑器贴近单元格弹出
+        if !readonly {
+            let (sr1, sc1, sr2, sc2) = self
+                .wb
+                .sheet(self.sheet_idx)
+                .merge_at(self.sel.0, self.sel.1)
+                .unwrap_or((self.sel.0, self.sel.1, self.sel.0, self.sel.1));
+            self.last_sel_cell_rect = cell_screen_bounds(sr1, sc1, sr2, sc2).map(|(r, _)| r);
+        }
+
+        // 交互式批注浮签展示（支持：冻结窗格精准定位、单格固定常显、全部显示自动防重叠、
+        // 悬停 180ms 离开宽限、文本可选中/一键复制、点击直编、拖拽调位、长批注内部滚动条）
         let has_any_comments = has_notes
             || if readonly {
                 self.compare.as_ref().is_some_and(|(w, s, _)| !w.sheet(*s).threads.is_empty())
@@ -47510,7 +48924,34 @@ impl SheetApp {
                 !self.wb.sheet(self.sheet_idx).threads.is_empty()
             };
         if has_any_comments && !self.dialog_modal && self.ctx_menu.is_none() && self.note_edit.is_none() {
-            let resolve_note = |hr: u32, hc: u32| -> Option<(u32, u32, u32, u32, String, String, bool)> {
+            struct CalloutCard {
+                mr1: u32,
+                mc1: u32,
+                mr2: u32,
+                mc2: u32,
+                author: String,
+                text: String,
+                resolved: bool,
+                reply_count: usize,
+                pinned: bool,
+                ephemeral: bool,
+            }
+            enum CalloutAction {
+                Copy(u32, u32, String),
+                Edit(u32, u32, egui::Pos2),
+                TogglePin(u32, u32),
+                Delete(u32, u32),
+                DragOffset(u64, sheetcore::model::CellRef, egui::Vec2),
+                ResetOffset(u64, sheetcore::model::CellRef),
+            }
+
+            let cur_sheet_id = if readonly {
+                self.compare.as_ref().map(|(w, s, _)| w.sheet(*s).identity).unwrap_or(0)
+            } else {
+                self.wb.sheet(self.sheet_idx).identity
+            };
+
+            let resolve_card = |hr: u32, hc: u32, ephemeral: bool| -> Option<CalloutCard> {
                 let sh_ref = if readonly {
                     self.compare.as_ref().map(|(w, s, _)| w.sheet(*s))?
                 } else {
@@ -47518,127 +48959,459 @@ impl SheetApp {
                 };
                 let (mr1, mc1, mr2, mc2) = sh_ref.merge_at(hr, hc).unwrap_or((hr, hc, hr, hc));
                 let key = sheetcore::model::CellRef::new(mr1, mc1);
+                let pinned = !readonly && self.pinned_comments.contains(&(sh_ref.identity, key));
                 if let Some(tc) = sh_ref.threads.get(&key) {
-                    return Some((mr1, mc1, mr2, mc2, tc.root_author().to_string(), tc.summary_text(), tc.resolved));
+                    return Some(CalloutCard {
+                        mr1,
+                        mc1,
+                        mr2,
+                        mc2,
+                        author: tc.root_author().to_string(),
+                        text: tc.summary_text(),
+                        resolved: tc.resolved,
+                        reply_count: tc.entries.len(),
+                        pinned,
+                        ephemeral,
+                    });
                 }
                 let n = sh_ref.notes.get(&key)?;
-                Some((mr1, mc1, mr2, mc2, n.author.clone(), n.text.clone(), false))
+                Some(CalloutCard {
+                    mr1,
+                    mc1,
+                    mr2,
+                    mc2,
+                    author: n.author.clone(),
+                    text: n.text.clone(),
+                    resolved: false,
+                    reply_count: 0,
+                    pinned,
+                    ephemeral,
+                })
             };
 
-            let paint_callout = |mr1: u32, mc1: u32, mr2: u32, mc2: u32, author: String, text: String, resolved: bool| {
-                let cell_right = px_of(mc2 + 1);
-                let cell_top = py_of(mr1);
-                let cell_left = px_of(mc1);
-                let cell_bottom = py_of(mr2 + 1);
-                if !(cell_right > origin.x + head_w
-                    && cell_bottom > origin.y + hh
-                    && cell_left < resp.rect.right()
-                    && cell_top < resp.rect.bottom())
-                {
-                    return;
-                }
-                let np = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Tooltip,
-                    egui::Id::new("note_callout_layer"),
-                ));
-                let mut hdr = if author.trim().is_empty() {
-                    cell_name(mr1, mc1)
-                } else {
-                    format!("{}  ·  {}", cell_name(mr1, mc1), author.trim())
-                };
-                if resolved {
-                    hdr.push_str("  [已解决]");
-                }
-                let hdr_font = ui_kit::bold_in(ctx, 11.5);
-                let body_font = FontId::proportional(12.0);
-                let max_text_w = 236.0f32;
-                let hdr_color = if resolved {
-                    Color32::from_rgb(22, 128, 72)
-                } else {
-                    Color32::from_rgb(92, 64, 18)
-                };
-                let hdr_g = np.layout_no_wrap(hdr, hdr_font, hdr_color);
-                let body_g = np.layout(text, body_font, Color32::from_rgb(31, 41, 55), max_text_w);
-                let pad_x = 10.0f32;
-                let pad_y = 8.0f32;
-                let box_w = (hdr_g.size().x.max(body_g.size().x) + pad_x * 2.0).clamp(132.0, 264.0);
-                let box_h = (pad_y * 2.0 + hdr_g.size().y + 4.0 + body_g.size().y).max(46.0);
-                let screen = ctx.screen_rect();
-                let mut bx = cell_right + 12.0;
-                if bx + box_w > screen.right() - 8.0 {
-                    bx = (cell_left - box_w - 12.0).max(screen.left() + 8.0);
-                }
-                let by = (cell_top - 4.0)
-                    .clamp(screen.top() + 8.0, (screen.bottom() - box_h - 8.0).max(screen.top() + 8.0));
-                let box_rect = Rect::from_min_size(egui::pos2(bx, by), Vec2::new(box_w, box_h));
-                let anchor_pt = egui::pos2(
-                    cell_right.clamp(origin.x + head_w, resp.rect.right()),
-                    cell_top.clamp(origin.y + hh, resp.rect.bottom()),
-                );
-                let target_pt = if bx >= cell_right {
-                    egui::pos2(box_rect.left(), (box_rect.top() + 10.0).min(box_rect.bottom() - 4.0))
-                } else {
-                    egui::pos2(box_rect.right(), (box_rect.top() + 10.0).min(box_rect.bottom() - 4.0))
-                };
-                let (bg_col, border_col) = if resolved {
-                    (Color32::from_rgb(240, 250, 244), Color32::from_rgb(134, 198, 158))
-                } else {
-                    (Color32::from_rgb(255, 252, 235), Color32::from_rgb(217, 191, 132))
-                };
-                np.line_segment([anchor_pt, target_pt], Stroke::new(1.0, border_col));
-                np.rect_stroke(
-                    box_rect.expand(1.5),
-                    7.5,
-                    Stroke::new(3.0, Color32::from_black_alpha(16)),
-                    egui::StrokeKind::Outside,
-                );
-                np.rect_filled(box_rect, 6.0, bg_col);
-                np.rect_stroke(box_rect, 6.0, Stroke::new(1.0, border_col), egui::StrokeKind::Inside);
-                let hx = box_rect.left() + pad_x;
-                let hy = box_rect.top() + pad_y;
-                let by_text = hy + hdr_g.size().y + 4.0;
-                np.galley(egui::pos2(hx, hy), hdr_g, hdr_color);
-                np.galley(egui::pos2(hx, by_text), body_g, Color32::from_rgb(31, 41, 55));
-            };
-
+            let mut cards: Vec<CalloutCard> = Vec::new();
+            let mut seen_keys = std::collections::HashSet::new();
             if self.show_all_comments && !readonly {
-                let sh_ref = self.wb.sheet(self.sheet_idx);
-                let mut seen = std::collections::HashSet::new();
-                let mut shown = 0usize;
-                for (&k, tc) in &sh_ref.threads {
-                    if shown >= 64 {
-                        break;
+                let keys = self.sheet_comment_keys(self.sheet_idx);
+                for (kr, kc) in keys.into_iter().take(64) {
+                    if let Some(card) = resolve_card(kr, kc, false) {
+                        if seen_keys.insert((card.mr1, card.mc1)) {
+                            cards.push(card);
+                        }
                     }
-                    seen.insert(k);
-                    let (mr1, mc1, mr2, mc2) = sh_ref.merge_at(k.row, k.col).unwrap_or((k.row, k.col, k.row, k.col));
-                    paint_callout(mr1, mc1, mr2, mc2, tc.root_author().to_string(), tc.summary_text(), tc.resolved);
-                    shown += 1;
-                }
-                for (&k, n) in sh_ref.notes.iter() {
-                    if shown >= 64 {
-                        break;
-                    }
-                    if !seen.insert(k) {
-                        continue;
-                    }
-                    let (mr1, mc1, mr2, mc2) = sh_ref.merge_at(k.row, k.col).unwrap_or((k.row, k.col, k.row, k.col));
-                    paint_callout(mr1, mc1, mr2, mc2, n.author.clone(), n.text.clone(), false);
-                    shown += 1;
                 }
             } else {
-                let hovered_note = resp
+                // 1) 单格固定常显批注
+                if !readonly && !self.pinned_comments.is_empty() {
+                    let mut pin_keys: Vec<(u32, u32)> = self
+                        .pinned_comments
+                        .iter()
+                        .filter(|&&(sid, _)| sid == cur_sheet_id)
+                        .map(|&(_, k)| (k.row, k.col))
+                        .collect();
+                    pin_keys.sort_unstable();
+                    for (kr, kc) in pin_keys.into_iter().take(32) {
+                        if let Some(card) = resolve_card(kr, kc, false) {
+                            if seen_keys.insert((card.mr1, card.mc1)) {
+                                cards.push(card);
+                            }
+                        }
+                    }
+                }
+                // 2) 动态悬停（含 180ms 移出宽限，便于鼠标滑入卡片复制/点击编辑）
+                let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+                let hovered_cell_card = resp
                     .hover_pos()
                     .filter(|pos| pos.x > origin.x + head_w && pos.y > origin.y + hh)
-                    .and_then(|pos| resolve_note(row_at(pos.y), col_at(pos.x)));
+                    .and_then(|pos| resolve_card(row_at(pos.y), col_at(pos.x), true));
+                let now = std::time::Instant::now();
+                let mut dynamic_card: Option<CalloutCard> = None;
+                if let Some(hc) = hovered_cell_card {
+                    self.note_hover_hold = Some((
+                        cur_sheet_id,
+                        sheetcore::model::CellRef::new(hc.mr1, hc.mc1),
+                        now,
+                    ));
+                    dynamic_card = Some(hc);
+                } else if let Some((hold_sid, hold_key, last_at)) = self.note_hover_hold {
+                    if hold_sid == cur_sheet_id
+                        && pointer_pos.is_some()
+                        && now.saturating_duration_since(last_at)
+                            <= std::time::Duration::from_millis(180)
+                    {
+                        if let Some(hc) = resolve_card(hold_key.row, hold_key.col, true) {
+                            dynamic_card = Some(hc);
+                            ctx.request_repaint_after(std::time::Duration::from_millis(45));
+                        } else {
+                            self.note_hover_hold = None;
+                        }
+                    } else {
+                        self.note_hover_hold = None;
+                    }
+                }
+                // 3) 若无悬停批注，按偏好自动展开当前选中格批注
+                if dynamic_card.is_none()
+                    && !readonly
+                    && self.editing.is_none()
+                    && self.auto_show_selected_comment
+                {
+                    dynamic_card = resolve_card(self.sel.0, self.sel.1, true);
+                }
+                if let Some(dc) = dynamic_card {
+                    if seen_keys.insert((dc.mr1, dc.mc1)) {
+                        cards.push(dc);
+                    }
+                }
+            }
 
-                let active_note = if hovered_note.is_none() && !readonly && self.editing.is_none() {
-                    resolve_note(self.sel.0, self.sel.1)
+            let multi_mode = cards.len() > 1;
+            let screen = ctx.screen_rect();
+            let mut occupied: Vec<Rect> = Vec::with_capacity(cards.len());
+            let mut actions: Vec<CalloutAction> = Vec::new();
+            let mut hovered_card_key: Option<sheetcore::model::CellRef> = None;
+            let edit_blocked_now = readonly || self.is_edit_blocked();
+
+            for card in cards {
+                let Some((cell_rect, clip_rect)) =
+                    cell_screen_bounds(card.mr1, card.mc1, card.mr2, card.mc2)
+                else {
+                    continue;
+                };
+                let key = sheetcore::model::CellRef::new(card.mr1, card.mc1);
+                let mut hdr = if card.author.trim().is_empty() {
+                    cell_name(card.mr1, card.mc1)
                 } else {
-                    None
+                    format!("{} · {}", cell_name(card.mr1, card.mc1), card.author.trim())
+                };
+                if card.reply_count > 1 {
+                    hdr.push_str(&format!(" ({})", card.reply_count));
+                }
+                if card.resolved {
+                    hdr.push_str(" [已解决]");
+                }
+                let max_card_w = if multi_mode { 300.0f32 } else { 380.0f32 };
+                let min_card_w = if edit_blocked_now { 168.0f32 } else { 228.0f32 };
+                let measure_p = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("note_callout_leader_layer"),
+                ));
+                let body_g = measure_p.layout(
+                    card.text.clone(),
+                    FontId::proportional(12.0),
+                    Color32::from_rgb(31, 41, 55),
+                    max_card_w - 24.0,
+                );
+                let hdr_g = measure_p.layout_no_wrap(
+                    hdr.clone(),
+                    ui_kit::bold_in(ctx, 11.5),
+                    Color32::from_rgb(92, 64, 18),
+                );
+                let toolbar_extra = if edit_blocked_now { 46.0 } else { 116.0 };
+                let box_w = (hdr_g.size().x + toolbar_extra)
+                    .max(body_g.size().x + 26.0)
+                    .clamp(min_card_w, max_card_w);
+                let est_body_h = body_g.size().y.min(240.0);
+                let est_box_h = (est_body_h + 44.0).max(58.0);
+
+                let user_offset = self
+                    .comment_card_offsets
+                    .get(&(cur_sheet_id, key))
+                    .copied()
+                    .unwrap_or(Vec2::ZERO);
+                let mut bx = cell_rect.right() + 12.0;
+                if bx + box_w > screen.right() - 8.0 {
+                    bx = (cell_rect.left() - box_w - 12.0).max(screen.left() + 8.0);
+                }
+                let mut by = (cell_rect.top() - 4.0)
+                    .clamp(screen.top() + 8.0, (screen.bottom() - est_box_h - 8.0).max(screen.top() + 8.0));
+
+                if user_offset == Vec2::ZERO && !occupied.is_empty() {
+                    let mut cand = Rect::from_min_size(egui::pos2(bx, by), Vec2::new(box_w, est_box_h));
+                    for _ in 0..8 {
+                        if let Some(hit) = occupied.iter().find(|r| r.intersects(cand)) {
+                            let next_y = hit.bottom() + 8.0;
+                            if next_y + est_box_h <= screen.bottom() - 8.0 {
+                                by = next_y;
+                                cand = Rect::from_min_size(egui::pos2(bx, by), Vec2::new(box_w, est_box_h));
+                                continue;
+                            }
+                            let alt_x = (cell_rect.left() - box_w - 12.0).max(screen.left() + 8.0);
+                            if (alt_x - bx).abs() > 8.0 {
+                                bx = alt_x;
+                                cand = Rect::from_min_size(egui::pos2(bx, by), Vec2::new(box_w, est_box_h));
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                } else if user_offset != Vec2::ZERO {
+                    bx = (bx + user_offset.x).clamp(screen.left() + 8.0, (screen.right() - box_w - 8.0).max(screen.left() + 8.0));
+                    by = (by + user_offset.y).clamp(screen.top() + 8.0, (screen.bottom() - est_box_h - 8.0).max(screen.top() + 8.0));
+                }
+
+                let (bg_col, hdr_bg, border_col, hdr_color) = if card.resolved {
+                    (
+                        Color32::from_rgb(240, 250, 244),
+                        Color32::from_rgb(224, 244, 232),
+                        Color32::from_rgb(134, 198, 158),
+                        Color32::from_rgb(22, 128, 72),
+                    )
+                } else {
+                    (
+                        Color32::from_rgb(255, 252, 235),
+                        Color32::from_rgb(252, 243, 207),
+                        Color32::from_rgb(217, 191, 132),
+                        Color32::from_rgb(92, 64, 18),
+                    )
                 };
 
-                if let Some((mr1, mc1, mr2, mc2, author, text, resolved)) = hovered_note.or(active_note) {
-                    paint_callout(mr1, mc1, mr2, mc2, author, text, resolved);
+                let area_id = egui::Id::new(("note_callout_card", cur_sheet_id, card.mr1, card.mc1));
+                let area_first_frame = egui::AreaState::load(ctx, area_id).is_none();
+                let area_resp = egui::Area::new(area_id)
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(bx, by))
+                    .default_size(Vec2::new(box_w, est_box_h))
+                    .constrain(false)
+                    .fade_in(false)
+                    .interactable(true)
+                    .show(ctx, |ui| {
+                        egui::Frame::new()
+                            .fill(bg_col)
+                            .stroke(Stroke::new(1.0, border_col))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .shadow(egui::Shadow {
+                                offset: [0, 2],
+                                blur: 6,
+                                spread: 0,
+                                color: Color32::from_black_alpha(26),
+                            })
+                            .inner_margin(egui::Margin::same(0))
+                            .show(ui, |ui| {
+                                ui.set_min_width(box_w);
+                                ui.set_max_width(box_w);
+                                // 顶部便签栏（可拖拽微调位置；双击重置位置）
+                                let hdr_frame = egui::Frame::new()
+                                    .fill(hdr_bg)
+                                    .corner_radius(egui::CornerRadius {
+                                        nw: 6,
+                                        ne: 6,
+                                        sw: 0,
+                                        se: 0,
+                                    })
+                                    .inner_margin(egui::Margin::symmetric(8, 4))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            let title_resp = ui
+                                                .add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&hdr)
+                                                            .font(ui_kit::bold_in(ctx, 11.5))
+                                                            .color(hdr_color),
+                                                    )
+                                                    .truncate()
+                                                    .sense(Sense::click_and_drag()),
+                                                )
+                                                .on_hover_text("拖动可调整便签位置；双击恢复默认位置");
+                                            if title_resp.dragged() {
+                                                actions.push(CalloutAction::DragOffset(
+                                                    cur_sheet_id,
+                                                    key,
+                                                    title_resp.drag_delta(),
+                                                ));
+                                            }
+                                            if title_resp.double_clicked() {
+                                                actions.push(CalloutAction::ResetOffset(cur_sheet_id, key));
+                                            }
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.spacing_mut().item_spacing.x = 2.0;
+                                                let mini_btn = |ui: &mut egui::Ui, lbl: &str, col: Color32, tip: &str| {
+                                                    ui.add(
+                                                        egui::Button::new(egui::RichText::new(lbl).size(10.5).color(col))
+                                                            .frame(false)
+                                                            .min_size(Vec2::new(22.0, 18.0)),
+                                                    )
+                                                    .on_hover_text(tip)
+                                                };
+                                                if !edit_blocked_now {
+                                                    if mini_btn(ui, "删", Color32::from_rgb(185, 28, 28), "删除批注").clicked() {
+                                                        actions.push(CalloutAction::Delete(card.mr1, card.mc1));
+                                                    }
+                                                    let pin_lbl = if card.pinned { "取消" } else { "固定" };
+                                                    let pin_col = if card.pinned {
+                                                        Color32::from_rgb(29, 78, 216)
+                                                    } else {
+                                                        hdr_color
+                                                    };
+                                                    if mini_btn(
+                                                        ui,
+                                                        pin_lbl,
+                                                        pin_col,
+                                                        if card.pinned { "取消固定显示" } else { "固定常显此批注" },
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(CalloutAction::TogglePin(card.mr1, card.mc1));
+                                                    }
+                                                    if mini_btn(ui, "改", hdr_color, "编辑批注 (Shift+F2)").clicked() {
+                                                        actions.push(CalloutAction::Edit(
+                                                            card.mr1,
+                                                            card.mc1,
+                                                            cell_rect.right_top(),
+                                                        ));
+                                                    }
+                                                }
+                                                if mini_btn(ui, "复制", hdr_color, "复制批注全文").clicked() {
+                                                    actions.push(CalloutAction::Copy(
+                                                        card.mr1,
+                                                        card.mc1,
+                                                        card.text.clone(),
+                                                    ));
+                                                }
+                                            });
+                                        });
+                                    });
+                                let _ = hdr_frame;
+                                // 正文区：支持选中复制；超长内容启用 240px 上限的平滑滚动条
+                                egui::Frame::new()
+                                    .inner_margin(egui::Margin::symmetric(10, 7))
+                                    .show(ui, |ui| {
+                                        let mut show_body_label = |ui: &mut egui::Ui| {
+                                            let body_resp = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&card.text)
+                                                        .size(12.0)
+                                                        .color(Color32::from_rgb(31, 41, 55)),
+                                                )
+                                                .selectable(true)
+                                                .wrap(),
+                                            );
+                                            if !edit_blocked_now && body_resp.double_clicked() {
+                                                actions.push(CalloutAction::Edit(
+                                                    card.mr1,
+                                                    card.mc1,
+                                                    cell_rect.right_top(),
+                                                ));
+                                            }
+                                        };
+                                        if body_g.size().y > 240.0 {
+                                            let body_scroll_id = egui::Id::new((
+                                                "note_callout_scroll",
+                                                cur_sheet_id,
+                                                card.mr1,
+                                                card.mc1,
+                                            ));
+                                            egui::ScrollArea::vertical()
+                                                .id_salt(body_scroll_id)
+                                                .min_scrolled_height(240.0)
+                                                .max_height(240.0)
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| show_body_label(ui));
+                                        } else {
+                                            show_body_label(ui);
+                                        }
+                                    });
+                            });
+                    });
+
+                let actual_rect = area_resp.response.rect;
+                occupied.push(actual_rect);
+
+                // egui::Area 首帧会进入不可见的 sizing_pass 测量真实尺寸；
+                // 首帧直接用测得的 actual_rect 在同一前景层补绘卡片本体，彻底消除 1 帧闪烁并保证首帧即刻可见。
+                if area_first_frame {
+                    let card_p = measure_p.with_clip_rect(actual_rect.expand(2.0));
+                    card_p.rect_filled(actual_rect, 6.0, bg_col);
+                    let hdr_rect = Rect::from_min_max(
+                        actual_rect.min,
+                        egui::pos2(actual_rect.right(), (actual_rect.top() + 24.0).min(actual_rect.bottom())),
+                    );
+                    card_p.rect_filled(hdr_rect, 6.0, hdr_bg);
+                    card_p.rect_stroke(actual_rect, 6.0, Stroke::new(1.0, border_col), egui::StrokeKind::Inside);
+                    card_p.galley(
+                        egui::pos2(actual_rect.left() + 8.0, actual_rect.top() + 5.0),
+                        hdr_g,
+                        hdr_color,
+                    );
+                    let body_clip = Rect::from_min_max(
+                        egui::pos2(actual_rect.left() + 8.0, hdr_rect.bottom() + 2.0),
+                        egui::pos2(actual_rect.right() - 8.0, actual_rect.bottom() - 4.0),
+                    );
+                    if body_clip.is_positive() {
+                        measure_p.with_clip_rect(body_clip).galley(
+                            egui::pos2(actual_rect.left() + 10.0, hdr_rect.bottom() + 6.0),
+                            body_g,
+                            Color32::from_rgb(31, 41, 55),
+                        );
+                    }
+                }
+
+                if card.ephemeral {
+                    if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+                        if actual_rect.expand(4.0).contains(p) {
+                            hovered_card_key = Some(key);
+                        }
+                    }
+                }
+
+                // 绘制指向单元格右上角锚点的 1px 引导线
+                let anchor_pt = egui::pos2(
+                    cell_rect.right().clamp(clip_rect.left(), clip_rect.right()),
+                    cell_rect.top().clamp(clip_rect.top(), clip_rect.bottom()),
+                );
+                let target_pt = if actual_rect.left() >= anchor_pt.x {
+                    egui::pos2(
+                        actual_rect.left(),
+                        (actual_rect.top() + 12.0).min(actual_rect.bottom() - 4.0),
+                    )
+                } else if actual_rect.right() <= anchor_pt.x {
+                    egui::pos2(
+                        actual_rect.right(),
+                        (actual_rect.top() + 12.0).min(actual_rect.bottom() - 4.0),
+                    )
+                } else {
+                    egui::pos2(actual_rect.center().x, actual_rect.top())
+                };
+                measure_p.line_segment([anchor_pt, target_pt], Stroke::new(1.0, border_col));
+            }
+
+            if let Some(hk) = hovered_card_key {
+                self.note_hover_hold = Some((cur_sheet_id, hk, std::time::Instant::now()));
+            }
+            for act in actions {
+                match act {
+                    CalloutAction::Copy(cr, cc, txt) => {
+                        ctx.copy_text(txt);
+                        self.status = format!("已复制 {} 的批注", cell_name(cr, cc));
+                    }
+                    CalloutAction::Edit(cr, cc, anchor) => {
+                        self.sel = (cr, cc);
+                        self.sel_end = (cr, cc);
+                        self.extra_sel.clear();
+                        self.note_hover_hold = None;
+                        self.open_note_editor_at(Some(ctx), Some(anchor));
+                    }
+                    CalloutAction::TogglePin(cr, cc) => {
+                        self.toggle_pin_comment(self.sheet_idx, cr, cc);
+                        ctx.request_repaint();
+                    }
+                    CalloutAction::Delete(cr, cc) => {
+                        self.sel = (cr, cc);
+                        self.sel_end = (cr, cc);
+                        self.extra_sel.clear();
+                        self.note_hover_hold = None;
+                        self.delete_comments_in_selection("删除批注");
+                        ctx.request_repaint();
+                    }
+                    CalloutAction::DragOffset(sid, k, delta) => {
+                        let e = self.comment_card_offsets.entry((sid, k)).or_insert(Vec2::ZERO);
+                        *e += delta;
+                        ctx.request_repaint();
+                    }
+                    CalloutAction::ResetOffset(sid, k) => {
+                        self.comment_card_offsets.remove(&(sid, k));
+                        ctx.request_repaint();
+                    }
                 }
             }
         }
@@ -48063,8 +49836,36 @@ impl SheetApp {
                         );
                     } else {
                         sh.notes.remove(&k);
+                        if sh.threads.remove(&k).is_some() {
+                            sh.threads_dirty = true;
+                        }
                     }
                     sh.notes_dirty = true;
+                    changed = true;
+                }
+            }
+            SheetMetaKind::Thread { row, col, thread } => {
+                if let Some(sh) = self.wb.sheets.get_mut(sheet) {
+                    let k = sheetcore::CellRef::new(row, col);
+                    match thread {
+                        Some(mut tc) => {
+                            tc.r = row;
+                            tc.c = col;
+                            let summary = sheetcore::notes::Note {
+                                r: row,
+                                c: col,
+                                text: tc.summary_text(),
+                                author: tc.root_author().to_string(),
+                            };
+                            sh.threads.insert(k, tc);
+                            sh.notes.insert(k, summary);
+                            sh.notes_dirty = true;
+                        }
+                        None => {
+                            sh.threads.remove(&k);
+                        }
+                    }
+                    sh.threads_dirty = true;
                     changed = true;
                 }
             }
@@ -54388,16 +56189,26 @@ impl eframe::App for SheetApp {
                             self.start_host();
                             self.members_open = true;
                         }
-                        if ui_kit::labeled_w(
+                        let cmt_bg = ui.painter().add(egui::Shape::Noop);
+                        let cmt_resp = ui_kit::labeled_w(
                             ui,
                             Icon::Comment,
                             "批注",
                             54.0,
-                            "新建或编辑批注",
-                        )
-                        .clicked()
-                        {
-                            self.open_note_editor(Some(ctx));
+                            "打开/关闭批注管理面板（Shift+F2 直接编辑当前格批注）",
+                        );
+                        if self.comments_panel.open {
+                            ui.painter().set(
+                                cmt_bg,
+                                egui::Shape::rect_filled(
+                                    cmt_resp.rect,
+                                    4.0,
+                                    Color32::from_rgba_unmultiplied(30, 64, 175, 22),
+                                ),
+                            );
+                        }
+                        if cmt_resp.clicked() {
+                            self.toggle_comments_panel();
                         }
                         let ai_tint = if ribbon_dark {
                             ribbon_pal.info_fg
@@ -55689,6 +57500,9 @@ impl eframe::App for SheetApp {
         }
         if !self.show_start && !self.backstage && self.ai.open {
             self.draw_ai_panel(ctx);
+        }
+        if !self.show_start && !self.backstage && self.comments_panel.open {
+            self.draw_comments_panel(ctx);
         }
         if !self.show_start && !self.backstage {
             self.draw_pivot_sidebar(ctx);

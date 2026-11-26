@@ -277,6 +277,79 @@ impl<'a> PreparedSearch<'a> {
             }
         }
     }
+
+    #[inline]
+    fn matches_comment_at(
+        &self,
+        wb: &Workbook,
+        sh: &crate::model::Sheet,
+        row: u32,
+        col: u32,
+    ) -> bool {
+        if !self.matches_format(wb, sh, row, col) {
+            return false;
+        }
+        let key = crate::model::CellRef::new(row, col);
+        if let Some(note) = sh.notes.get(&key) {
+            if self.matches_str(&note.text)
+                || (!note.author.is_empty() && self.matches_str(&note.author))
+            {
+                return true;
+            }
+        }
+        if let Some(tc) = sh.threads.get(&key) {
+            if tc.entries.iter().any(|e| {
+                self.matches_str(&e.text)
+                    || (!e.author.is_empty() && self.matches_str(&e.author))
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn search_comments_on_sheet(
+    wb: &Workbook,
+    si: usize,
+    sh: &crate::model::Sheet,
+    rects: &[(u32, u32, u32, u32)],
+    prep: &PreparedSearch<'_>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<Vec<Hit>> {
+    if sh.notes.is_empty() && sh.threads.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut keys: Vec<crate::model::CellRef> =
+        Vec::with_capacity(sh.notes.len() + sh.threads.len());
+    keys.extend(sh.notes.keys().copied());
+    keys.extend(sh.threads.keys().copied());
+    keys.sort_unstable();
+    keys.dedup();
+    let mut out = Vec::new();
+    for (idx, k) in keys.into_iter().enumerate() {
+        if (idx & 255) == 0
+            && cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return None;
+        }
+        if !rects.is_empty()
+            && !rects.iter().any(|&(r1, c1, r2, c2)| {
+                let (a, b, c, d) = (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2));
+                k.row >= a && k.row <= c && k.col >= b && k.col <= d
+            })
+        {
+            continue;
+        }
+        if prep.matches_comment_at(wb, sh, k.row, k.col) {
+            out.push(Hit {
+                sheet: si,
+                row: k.row,
+                col: k.col,
+            });
+        }
+    }
+    Some(out)
 }
 
 #[inline]
@@ -656,22 +729,12 @@ pub fn scoped_hits(
     for (si, sh) in wb.sheets.iter().enumerate() {
         if sheet.is_some_and(|only| only != si) { continue; }
         if opts.in_comments {
-            for (k, note) in sh.notes.iter() {
-                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Vec::new();
-                }
-                if !rects.is_empty()
-                    && !rects.iter().any(|&(r1, c1, r2, c2)| {
-                        let (a, b, c, d) = (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2));
-                        k.row >= a && k.row <= c && k.col >= b && k.col <= d
-                    })
-                {
-                    continue;
-                }
-                if prep.matches_format(wb, sh, k.row, k.col) && prep.matches_str(&note.text) {
-                    hits.push(Hit { sheet: si, row: k.row, col: k.col });
-                }
-            }
+            let Some(comment_hits) =
+                search_comments_on_sheet(wb, si, sh, rects, &prep, Some(cancelled))
+            else {
+                return Vec::new();
+            };
+            hits.extend(comment_hits);
             continue;
         }
         let sheet_hits = if rects.is_empty() {
@@ -739,10 +802,18 @@ pub fn cell_matches(
     needle: &str,
     opts: &SearchOpts,
 ) -> bool {
-    if needle.is_empty() {
+    let has_fmt = opts.match_fill.is_some() || opts.match_bold.is_some();
+    if needle.is_empty() && !has_fmt {
         return false;
     }
-    let Some(cell) = wb.sheets.get(sheet).and_then(|sh| sh.get(row, col)) else {
+    let Some(sh) = wb.sheets.get(sheet) else {
+        return false;
+    };
+    if opts.in_comments {
+        let prep = PreparedSearch::new(needle, opts);
+        return prep.matches_comment_at(wb, sh, row, col);
+    }
+    let Some(cell) = sh.get(row, col) else {
         return false;
     };
     matches_at(wb, sheet, row, col, cell.as_ref(), needle, opts)
@@ -779,14 +850,19 @@ pub fn hits_in_sheet(
     opts: &SearchOpts,
     order: SearchOrder,
 ) -> Vec<Hit> {
-    if needle.is_empty() {
+    let has_fmt = opts.match_fill.is_some() || opts.match_bold.is_some();
+    if needle.is_empty() && !has_fmt {
         return Vec::new();
     }
     let Some(sh) = wb.sheets.get(sheet) else {
         return Vec::new();
     };
     let prep = PreparedSearch::new(needle, opts);
-    let mut out = search_sheet_pages_parallel(wb, sheet, sh, &prep, None).unwrap_or_default();
+    let mut out = if opts.in_comments {
+        search_comments_on_sheet(wb, sheet, sh, &[], &prep, None).unwrap_or_default()
+    } else {
+        search_sheet_pages_parallel(wb, sheet, sh, &prep, None).unwrap_or_default()
+    };
     match order {
         SearchOrder::RowMajor => out.sort_unstable(),
         SearchOrder::ColumnMajor => out.sort_unstable_by_key(|h| (h.sheet, h.col, h.row)),
@@ -803,14 +879,19 @@ pub fn hits_in_rect(
     opts: &SearchOpts,
     order: SearchOrder,
 ) -> Vec<Hit> {
-    if needle.is_empty() {
+    let has_fmt = opts.match_fill.is_some() || opts.match_bold.is_some();
+    if needle.is_empty() && !has_fmt {
         return Vec::new();
     }
     let Some(sh) = wb.sheets.get(sheet) else {
         return Vec::new();
     };
     let prep = PreparedSearch::new(needle, opts);
-    let mut out = search_rects_pages_parallel(wb, sheet, sh, &[rect], &prep, None).unwrap_or_default();
+    let mut out = if opts.in_comments {
+        search_comments_on_sheet(wb, sheet, sh, &[rect], &prep, None).unwrap_or_default()
+    } else {
+        search_rects_pages_parallel(wb, sheet, sh, &[rect], &prep, None).unwrap_or_default()
+    };
     match order {
         SearchOrder::RowMajor => out.sort_unstable(),
         SearchOrder::ColumnMajor => out.sort_unstable_by_key(|h| (h.sheet, h.col, h.row)),

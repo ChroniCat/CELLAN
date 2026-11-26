@@ -1364,14 +1364,19 @@ fn draw_view(
         icon_gutter = rad * 2.0 + 4.5 * scale;
     }
 
-    // 6. 批注角标（AsDisplayed 模式在单元格右上角画红色小三角）
-    if setup.print_comments == 2
-        && sheet
-            .notes
-            .contains_key(&crate::model::CellRef { row: r, col: c })
-    {
+    // 6. 批注角标（AsDisplayed 模式在单元格右上角画红/紫小三角，兼容传统批注与线程批注）
+    let ckey = crate::model::CellRef { row: r, col: c };
+    let has_thread = sheet.threads.contains_key(&ckey);
+    let has_note = sheet.notes.contains_key(&ckey);
+    if setup.print_comments == 2 && (has_note || has_thread) {
         let sz = (4.5 * scale).clamp(2.5, 6.0);
-        let col = if bw { [0, 0, 0] } else { [217, 45, 32] };
+        let col = if bw {
+            [0, 0, 0]
+        } else if has_thread {
+            [99, 102, 241]
+        } else {
+            [217, 45, 32]
+        };
         out.polys.push((
             vec![
                 (x + cw, top + ch),
@@ -2728,32 +2733,221 @@ fn emit_watermarks(setup: &PageSetup, pw: f32, ph: f32, out: &mut Out) {
     }
 }
 
-/// 当 `print_comments == 1 (AtEnd)` 时，生成工作表末尾的批注汇总页列表
+/// 当 `print_comments == 2 (AsDisplayed)` 时，在当前页绘制可见批注/线程的紧凑原位浮签框与引导线
+#[allow(clippy::too_many_arguments)]
+fn draw_page_comment_callouts(
+    sheet: &Sheet,
+    setup: &PageSetup,
+    span: &PageSpan,
+    sx: f32,
+    sy: f32,
+    px: f32,
+    pw: f32,
+    ph: f32,
+    out: &mut Out,
+) {
+    if setup.print_comments != 2 || (sheet.notes.is_empty() && sheet.threads.is_empty()) {
+        return;
+    }
+    let mut keys: Vec<crate::model::CellRef> =
+        Vec::with_capacity(sheet.notes.len() + sheet.threads.len());
+    keys.extend(sheet.notes.keys().copied());
+    keys.extend(sheet.threads.keys().copied());
+    keys.sort_unstable();
+    keys.dedup();
+
+    let (ml, mr, mt, mb) = margins_pt(setup);
+    let page_l = ml.max(8.0);
+    let page_r = (pw - mr).max(page_l + 60.0);
+    let page_b = mb.max(8.0);
+    let page_t = (ph - mt).max(page_b + 60.0);
+    let bw = setup.black_and_white;
+    let mut occupied: Vec<(f32, f32, f32, f32)> = Vec::new(); // (x, y_bottom, w, h)
+
+    for key in keys.into_iter().filter(|k| {
+        k.row >= span.rows.0
+            && k.row <= span.rows.1
+            && k.col >= span.cols.0
+            && k.col <= span.cols.1
+            && !sheet.hidden_rows.contains(&k.row)
+            && !sheet.hidden_rows_user.contains(&k.row)
+            && !sheet.hidden_cols.contains(&k.col)
+    }).take(24) {
+        let (hdr, body, resolved) = if let Some(tc) = sheet.threads.get(&key) {
+            let author = tc.root_author().trim();
+            let mut h = if author.is_empty() {
+                crate::model::cell_name(key.row, key.col)
+            } else {
+                format!("{} · {}", crate::model::cell_name(key.row, key.col), author)
+            };
+            if tc.entries.len() > 1 {
+                h.push_str(&format!(" ({})", tc.entries.len()));
+            }
+            if tc.resolved {
+                h.push_str(" [已解决]");
+            }
+            (h, tc.summary_text(), tc.resolved)
+        } else if let Some(n) = sheet.notes.get(&key) {
+            let author = n.author.trim();
+            let h = if author.is_empty() {
+                crate::model::cell_name(key.row, key.col)
+            } else {
+                format!("{} · {}", crate::model::cell_name(key.row, key.col), author)
+            };
+            (h, n.text.clone(), false)
+        } else {
+            continue;
+        };
+
+        let (cx, cy_bot, cw, ch) = grid_rect_in_page(
+            sheet,
+            span,
+            key.row,
+            key.col,
+            key.row.saturating_add(1),
+            key.col.saturating_add(1),
+            [0i64; 4],
+            sx,
+            sy,
+            px,
+        );
+        let anchor_x = cx + cw;
+        let anchor_y = cy_bot + ch;
+
+        let font_sz = 7.5f32;
+        let max_box_w = (page_r - page_l).min(175.0).max(88.0);
+        let mut lines =
+            display::wrap_lines_with(&body, (max_box_w - 10.0).max(40.0), font_sz, out.metric.as_deref());
+        if lines.len() > 5 {
+            lines.truncate(5);
+            if let Some(last) = lines.last_mut() {
+                last.push('…');
+            }
+        }
+        let hdr_w = out.tw(&hdr, 7.5);
+        let body_w = lines
+            .iter()
+            .map(|l| out.tw(l, font_sz))
+            .fold(0.0f32, f32::max);
+        let box_w = (hdr_w.max(body_w) + 12.0).clamp(84.0, max_box_w);
+        let line_h = 9.5f32;
+        let box_h = 13.0 + (lines.len().max(1) as f32) * line_h + 5.0;
+
+        let mut bx = anchor_x + 8.0;
+        if bx + box_w > page_r {
+            bx = (cx - box_w - 8.0).max(page_l);
+        }
+        let mut by_bot = (anchor_y - box_h + 4.0).clamp(page_b, (page_t - box_h).max(page_b));
+
+        // 简易防重叠：向下错位摆放，避免同一页多张批注框完全覆盖彼此
+        for _ in 0..8 {
+            let hit = occupied.iter().find(|&&(ox, oy, ow, oh)| {
+                bx < ox + ow && bx + box_w > ox && by_bot < oy + oh && by_bot + box_h > oy
+            });
+            if let Some(&(_, oy, _, _)) = hit {
+                let next_bot = oy - box_h - 4.0;
+                if next_bot >= page_b {
+                    by_bot = next_bot;
+                    continue;
+                }
+            }
+            break;
+        }
+        occupied.push((bx, by_bot, box_w, box_h));
+
+        let (fill_col, hdr_col, border_col, txt_col) = if bw {
+            ([255, 255, 255], [240, 240, 240], [40, 40, 40], [0, 0, 0])
+        } else if resolved {
+            ([240, 250, 244], [224, 244, 232], [120, 185, 145], [28, 44, 34])
+        } else {
+            ([255, 252, 235], [252, 243, 207], [198, 168, 102], [40, 34, 22])
+        };
+
+        // 卡片底色、顶栏与外框
+        out.rects.push((bx, by_bot, box_w, box_h, fill_col));
+        let hdr_h = 12.0f32;
+        out.rects.push((bx, by_bot + box_h - hdr_h, box_w, hdr_h, hdr_col));
+        out.lines.push((bx, by_bot, bx + box_w, by_bot, 0.5, border_col));
+        out.lines.push((bx, by_bot + box_h, bx + box_w, by_bot + box_h, 0.5, border_col));
+        out.lines.push((bx, by_bot, bx, by_bot + box_h, 0.5, border_col));
+        out.lines.push((bx + box_w, by_bot, bx + box_w, by_bot + box_h, 0.5, border_col));
+
+        // 1px 锚点引导线
+        let target_x = if bx >= anchor_x {
+            bx
+        } else if bx + box_w <= anchor_x {
+            bx + box_w
+        } else {
+            bx + box_w * 0.5
+        };
+        let target_y = by_bot + box_h - 6.0;
+        out.lines.push((anchor_x, anchor_y, target_x, target_y, 0.5, border_col));
+
+        // 标题与正文
+        out.texts.push(TextOp {
+            x: bx + 4.5,
+            baseline: by_bot + box_h - 9.0,
+            size: 7.5,
+            text: hdr,
+            color: txt_col,
+            bold: true,
+            italic: false,
+            rotation: 0.0,
+            underline: false,
+            double_underline: false,
+            strikethrough: false,
+            clip: Some([bx + 2.0, by_bot + box_h - hdr_h, box_w - 4.0, hdr_h]),
+            alpha: 1.0,
+        });
+        let mut ty = by_bot + box_h - hdr_h - 8.5;
+        for line in lines {
+            out.texts.push(TextOp {
+                x: bx + 5.0,
+                baseline: ty,
+                size: font_sz,
+                text: line,
+                color: txt_col,
+                bold: false,
+                italic: false,
+                rotation: 0.0,
+                underline: false,
+                double_underline: false,
+                strikethrough: false,
+                clip: Some([bx + 2.0, by_bot + 1.0, box_w - 4.0, box_h - hdr_h - 1.0]),
+                alpha: 1.0,
+            });
+            ty -= line_h;
+        }
+    }
+}
+
+/// 当 `print_comments == 1 (AtEnd)` 时，生成工作表末尾的批注汇总页列表（同时涵盖传统批注与 Excel 365 线程批注）
 pub fn comment_summary_pages(wb: &Workbook, sheet_idx: usize, layout: &Layout) -> Vec<Out> {
     let sheet = &wb.sheets[sheet_idx];
-    if layout.setup.print_comments != 1 || sheet.notes.is_empty() {
+    if layout.setup.print_comments != 1 || (sheet.notes.is_empty() && sheet.threads.is_empty()) {
         return Vec::new();
     }
     let area = layout.setup.print_area;
-    let mut notes: Vec<_> = sheet
-        .notes
-        .iter()
-        .map(|(_, n)| n)
-        .filter(|n| {
-            if let Some((r1, c1, r2, c2)) = area
-                && (n.r < r1 || n.r > r2 || n.c < c1 || n.c > c2)
-            {
-                return false;
-            }
-            !sheet.hidden_rows.contains(&n.r)
-                && !sheet.hidden_rows_user.contains(&n.r)
-                && !sheet.hidden_cols.contains(&n.c)
-        })
-        .collect();
-    if notes.is_empty() {
+    let mut keys: Vec<crate::model::CellRef> =
+        Vec::with_capacity(sheet.notes.len() + sheet.threads.len());
+    keys.extend(sheet.notes.keys().copied());
+    keys.extend(sheet.threads.keys().copied());
+    keys.sort_unstable();
+    keys.dedup();
+    keys.retain(|k| {
+        if let Some((r1, c1, r2, c2)) = area
+            && (k.row < r1 || k.row > r2 || k.col < c1 || k.col > c2)
+        {
+            return false;
+        }
+        !sheet.hidden_rows.contains(&k.row)
+            && !sheet.hidden_rows_user.contains(&k.row)
+            && !sheet.hidden_cols.contains(&k.col)
+    });
+    if keys.is_empty() {
         return Vec::new();
     }
-    notes.sort_by_key(|n| (n.r, n.c));
+    let total_items = keys.len();
     let (pw, ph) = layout.page_size;
     let (ml, mr, mt, mb) = margins_pt(&layout.setup);
     let avail_w = (pw - ml - mr).max(80.0);
@@ -2765,7 +2959,7 @@ pub fn comment_summary_pages(wb: &Workbook, sheet_idx: usize, layout: &Layout) -
             ml,
             y_top,
             12.0,
-            format!("{} — 批注汇总", sheet.name),
+            format!("{} — 批注汇总（共 {} 条）", sheet.name, total_items),
             [30, 41, 59],
             true,
             false,
@@ -2776,18 +2970,61 @@ pub fn comment_summary_pages(wb: &Workbook, sheet_idx: usize, layout: &Layout) -
     emit_title(&mut cur, y);
     y -= 22.0;
 
-    for note in notes {
-        let head = format!(
-            "单元格 {}{}",
-            crate::model::cell_name(note.r, note.c),
-            if note.author.is_empty() {
-                String::new()
-            } else {
-                format!("（{}）", note.author)
+    for (idx, k) in keys.into_iter().enumerate() {
+        let cell_val = sheet
+            .get(k.row, k.col)
+            .filter(|c| !matches!(c.value, crate::model::Value::Empty))
+            .map(|c| {
+                let st = wb.styles.get(sheet.style_of(k.row, k.col));
+                crate::style::format_value_in(wb.date_system, &c.value, &st.format)
+            })
+            .unwrap_or_default();
+        let val_suffix = if cell_val.is_empty() {
+            String::new()
+        } else {
+            let clipped: String = cell_val.chars().take(28).collect();
+            format!("  ·  格值: {clipped}")
+        };
+        let (head, body_lines): (String, Vec<String>) = if let Some(tc) = sheet.threads.get(&k) {
+            let status = if tc.resolved { "已解决" } else { "未解决" };
+            let head = format!(
+                "{}. 单元格 {} [线程·{} · {} 条]{}",
+                idx + 1,
+                crate::model::cell_name(k.row, k.col),
+                status,
+                tc.entries.len(),
+                val_suffix
+            );
+            let mut lines = Vec::new();
+            for entry in &tc.entries {
+                let prefix = if entry.timestamp.is_empty() {
+                    format!("{}: ", entry.author)
+                } else {
+                    format!("{} ({}): ", entry.author, entry.timestamp)
+                };
+                let full = format!("{prefix}{}", entry.text);
+                lines.extend(display::wrap_lines(&full, avail_w - 16.0, 9.5));
             }
-        );
-        let body_lines = display::wrap_lines(&note.text, avail_w - 16.0, 9.5);
-        let block_h = 15.0 + body_lines.len() as f32 * 13.0 + 10.0;
+            (head, lines)
+        } else if let Some(note) = sheet.notes.get(&k) {
+            let head = format!(
+                "{}. 单元格 {}{}{}",
+                idx + 1,
+                crate::model::cell_name(k.row, k.col),
+                if note.author.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", note.author)
+                },
+                val_suffix
+            );
+            let lines = display::wrap_lines(&note.text, avail_w - 16.0, 9.5);
+            (head, lines)
+        } else {
+            continue;
+        };
+
+        let block_h = 15.0 + body_lines.len().max(1) as f32 * 13.0 + 12.0;
         if y - block_h < mb && !cur.texts.is_empty() {
             emit_watermarks(&layout.setup, pw, ph, &mut cur);
             pages.push(cur);
@@ -2808,6 +3045,14 @@ pub fn comment_summary_pages(wb: &Workbook, sheet_idx: usize, layout: &Layout) -
         ));
         y -= 14.0;
         for line in body_lines {
+            if y < mb + 14.0 {
+                emit_watermarks(&layout.setup, pw, ph, &mut cur);
+                pages.push(cur);
+                cur = Out::default();
+                y = ph - mt - 18.0;
+                emit_title(&mut cur, y);
+                y -= 22.0;
+            }
             cur.texts.push(TextOp::simple(
                 ml + 12.0,
                 y,
@@ -2820,6 +3065,7 @@ pub fn comment_summary_pages(wb: &Workbook, sheet_idx: usize, layout: &Layout) -
             ));
             y -= 13.0;
         }
+        cur.lines.push((ml, y + 3.0, pw - mr, y + 3.0, 0.35, [226, 232, 240]));
         y -= 8.0;
     }
     emit_watermarks(&layout.setup, pw, ph, &mut cur);
@@ -3242,8 +3488,9 @@ fn render_page(
         }
     }
 
-    // 7. 浮动对象（跨页精准锚点）
+    // 7. 浮动对象（跨页精准锚点）与原位批注浮签
     draw_objects(sheet, setup, span, body_x0, y, px, source, &mut out);
+    draw_page_comment_callouts(sheet, setup, span, body_x0, y, px, pw, ph, &mut out);
 
     // 8. 矢量水印层
     emit_watermarks(setup, pw, ph, &mut out);
