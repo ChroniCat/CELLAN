@@ -21,6 +21,7 @@ use crate::transform::CoordTransform;
 use crate::undo::{CellDelta, ChartUndoEdit, MetaEdit, PivotUndoEdit, StructureSnapshot};
 
 pub use crate::cell_shift_patch::CellShiftOverlay as TxOverlay;
+pub use crate::room_tx::{AxisPermutePatch, DefinedNamesPatch, RoomTxPatch};
 
 /// Sheet-tab structural mutation intent.
 #[derive(Clone, Debug)]
@@ -385,11 +386,14 @@ pub enum SheetTabChange {
 /// Wire-compatible generalized collaborative transaction patch.
 ///
 /// Uses `#[serde(untagged)]` so `TxPatch::CellShift(p)` serializes and
-/// deserializes byte-for-byte identically to `CellShiftPatch` on the wire.
+/// deserializes byte-for-byte identically to `CellShiftPatch` on the wire,
+/// while `DefinedNames` and `AxisPermute` carry mutually disjoint JSON fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TxPatch {
     CellShift(CellShiftPatch),
+    AxisPermute(AxisPermutePatch),
+    DefinedNames(DefinedNamesPatch),
 }
 
 impl From<CellShiftPatch> for TxPatch {
@@ -398,15 +402,43 @@ impl From<CellShiftPatch> for TxPatch {
     }
 }
 
+impl From<DefinedNamesPatch> for TxPatch {
+    fn from(patch: DefinedNamesPatch) -> Self {
+        Self::DefinedNames(patch)
+    }
+}
+
+impl From<AxisPermutePatch> for TxPatch {
+    fn from(patch: AxisPermutePatch) -> Self {
+        Self::AxisPermute(patch)
+    }
+}
+
 impl TxPatch {
     /// Prepare a portable collaborative patch for a supported `TxIntent`.
     pub fn prepare(wb: &Workbook, intent: &TxIntent) -> Option<Self> {
         match intent {
-            TxIntent::Transform(tx) => {
-                let cs = tx.as_cell_shift()?;
-                CellShiftPatch::prepare(wb, tx.target_sheet(), cs).map(Self::CellShift)
+            TxIntent::Transform(tx) => match tx {
+                CoordTransform::AxisShift { band: Some(_), .. } => {
+                    let cs = tx.as_cell_shift()?;
+                    CellShiftPatch::prepare(wb, tx.target_sheet(), cs).map(Self::CellShift)
+                }
+                CoordTransform::AxisPermute {
+                    sheet_idx,
+                    axis,
+                    from,
+                    n,
+                    at,
+                } => AxisPermutePatch::prepare(wb, *sheet_idx, *axis, *from, *n, *at)
+                    .map(Self::AxisPermute),
+                CoordTransform::AxisShift { band: None, .. } | CoordTransform::MultiInsert { .. } => {
+                    None
+                }
+            },
+            TxIntent::DefinedNames(names) => {
+                DefinedNamesPatch::prepare(wb, names).map(Self::DefinedNames)
             }
-            TxIntent::SheetTab(_) | TxIntent::DefinedNames(_) | TxIntent::CellBatch(_) => None,
+            TxIntent::SheetTab(_) | TxIntent::CellBatch(_) => None,
         }
     }
 
@@ -414,69 +446,125 @@ impl TxPatch {
         Self::CellShift(patch)
     }
 
+    pub fn from_defined_names(patch: DefinedNamesPatch) -> Self {
+        Self::DefinedNames(patch)
+    }
+
+    pub fn from_axis_permute(patch: AxisPermutePatch) -> Self {
+        Self::AxisPermute(patch)
+    }
+
     pub fn into_cell_shift(self) -> Option<CellShiftPatch> {
         match self {
             Self::CellShift(p) => Some(p),
+            _ => None,
         }
     }
 
     pub fn as_cell_shift(&self) -> Option<&CellShiftPatch> {
         match self {
             Self::CellShift(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn into_defined_names(self) -> Option<DefinedNamesPatch> {
+        match self {
+            Self::DefinedNames(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn as_defined_names(&self) -> Option<&DefinedNamesPatch> {
+        match self {
+            Self::DefinedNames(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn into_axis_permute(self) -> Option<AxisPermutePatch> {
+        match self {
+            Self::AxisPermute(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn as_axis_permute(&self) -> Option<&AxisPermutePatch> {
+        match self {
+            Self::AxisPermute(p) => Some(p),
+            _ => None,
         }
     }
 
     pub fn target_sheet(&self) -> usize {
         match self {
             Self::CellShift(p) => p.target_sheet(),
+            Self::DefinedNames(p) => p.target_sheet(),
+            Self::AxisPermute(p) => p.target_sheet(),
         }
     }
 
     pub fn referenced_sheets(&self) -> Vec<usize> {
         match self {
             Self::CellShift(p) => p.referenced_sheets(),
+            Self::DefinedNames(p) => p.referenced_sheets(),
+            Self::AxisPermute(p) => p.referenced_sheets(),
         }
     }
 
     pub fn wire_valid(&self) -> bool {
         match self {
             Self::CellShift(p) => p.wire_valid(),
+            Self::DefinedNames(p) => p.wire_valid(),
+            Self::AxisPermute(p) => p.wire_valid(),
         }
     }
 
     pub fn can_install(&self, wb: &Workbook) -> bool {
         match self {
             Self::CellShift(p) => p.can_install(wb),
+            Self::DefinedNames(p) => p.can_install(wb),
+            Self::AxisPermute(p) => p.can_install(wb),
         }
     }
 
     pub fn canonical_forward(&self, wb: &Workbook) -> Option<Self> {
         match self {
             Self::CellShift(p) => p.canonical_forward(wb).map(Self::CellShift),
+            Self::DefinedNames(p) => p.canonical_forward(wb).map(Self::DefinedNames),
+            Self::AxisPermute(p) => p.canonical_forward(wb).map(Self::AxisPermute),
         }
     }
 
     pub fn matches(&self, wb: &Workbook, forward: bool) -> bool {
         match self {
             Self::CellShift(p) => p.matches(wb, forward),
+            Self::DefinedNames(p) => p.matches(wb, forward),
+            Self::AxisPermute(p) => p.matches(wb, forward),
         }
     }
 
     pub fn matches_replica(&self, wb: &Workbook, forward: bool) -> bool {
         match self {
             Self::CellShift(p) => p.matches_replica(wb, forward),
+            Self::DefinedNames(p) => p.matches_replica(wb, forward),
+            Self::AxisPermute(p) => p.matches_replica(wb, forward),
         }
     }
 
     pub fn apply(&self, wb: &mut Workbook, forward: bool) -> bool {
         match self {
             Self::CellShift(p) => p.apply(wb, forward),
+            Self::DefinedNames(p) => p.apply(wb, forward),
+            Self::AxisPermute(p) => p.apply(wb, forward),
         }
     }
 
     pub fn apply_committed(&self, wb: &mut Workbook, forward: bool) -> bool {
         match self {
             Self::CellShift(p) => p.apply_committed(wb, forward),
+            Self::DefinedNames(p) => p.apply_committed(wb, forward),
+            Self::AxisPermute(p) => p.apply_committed(wb, forward),
         }
     }
 
@@ -489,12 +577,16 @@ impl TxPatch {
                     "删除单元格"
                 }
             }
+            Self::DefinedNames(p) => p.label(),
+            Self::AxisPermute(p) => p.label(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
             Self::CellShift(p) => p.is_empty(),
+            Self::DefinedNames(p) => p.is_empty(),
+            Self::AxisPermute(p) => p.is_empty(),
         }
     }
 }

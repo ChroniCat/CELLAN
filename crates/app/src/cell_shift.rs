@@ -4,8 +4,12 @@ use super::SheetApp;
 use crate::net::CoordEpoch;
 use sheetcore::{
     cell_shift_patch::CellShiftPatch,
+    refs::Axis,
     sync::CellShiftPhase,
-    tx::{RecalcScope, TxEffects, TxError, TxIntent, TxPatch, WorkbookTx},
+    tx::{
+        AxisPermutePatch, DefinedNameIntent, DefinedNamesPatch, RecalcScope, RoomTxPatch,
+        TxEffects, TxError, TxIntent, TxPatch, WorkbookTx,
+    },
 };
 use std::sync::Arc;
 
@@ -55,6 +59,7 @@ pub(super) struct RejoinMergeEntry {
 pub(super) struct ShiftIntro {
     pub(super) overlay: Option<(u64, Arc<sheetcore::cell_shift_patch::CellShiftOverlay>)>,
     pub(super) receipt: Option<(u64, CellShiftPhase, Arc<CellShiftPatch>)>,
+    pub(super) room_tx_receipt: Option<(u64, CellShiftPhase, Arc<RoomTxPatch>)>,
     pub(super) applied_seq: u64,
     pub(super) last_struct_rev: usize,
     pub(super) room_id: String,
@@ -77,6 +82,7 @@ impl ShiftIntro {
     pub(super) fn begin_welcome(&mut self, room_id: String) {
         self.overlay = None;
         self.receipt = None;
+        self.room_tx_receipt = None;
         self.applied_seq = 0;
         self.last_struct_rev = 0;
         self.room_id = room_id;
@@ -923,6 +929,380 @@ impl SheetApp {
             self.ensure_visible();
         }
     }
+
+    pub(crate) fn request_room_defined_names(
+        &mut self,
+        intent: DefinedNameIntent,
+    ) -> Result<bool, TxError> {
+        let tx_intent = TxIntent::DefinedNames(intent.clone());
+        WorkbookTx::preflight(&self.wb, &tx_intent)?;
+        let Some(patch) = DefinedNamesPatch::prepare(&self.wb, &intent) else {
+            return Ok(false);
+        };
+        if let Err(reason) = self.request_room_tx(RoomTxPatch::DefinedNames(patch)) {
+            self.status = reason;
+            return Ok(false);
+        }
+        self.status = "正在等待宿主确认名称更改".into();
+        Ok(true)
+    }
+
+    pub(crate) fn request_room_axis_permute(
+        &mut self,
+        sheet: usize,
+        axis: Axis,
+        from: u32,
+        n: u32,
+        drop: u32,
+    ) -> Result<bool, String> {
+        let Some(intent) = TxIntent::from_axis_move(sheet, axis, from, n, drop) else {
+            return Ok(false);
+        };
+        if let Err(err) = WorkbookTx::preflight(&self.wb, &intent) {
+            return Err(err.message().into());
+        }
+        let Some(patch) = AxisPermutePatch::from_drop(&self.wb, sheet, axis, from, n, drop) else {
+            return Ok(false);
+        };
+        self.request_room_tx(RoomTxPatch::AxisPermute(patch))?;
+        self.status = if axis == Axis::Row {
+            "正在等待宿主确认移动行".into()
+        } else {
+            "正在等待宿主确认移动列".into()
+        };
+        Ok(true)
+    }
+
+    fn request_room_tx(&mut self, patch: RoomTxPatch) -> Result<(), String> {
+        let Some(net) = &self.net else {
+            return Err("当前未处于协作房间".into());
+        };
+        if !net.supports_room_tx() {
+            return Err("协作宿主版本较旧，请升级后再执行该协作操作".into());
+        }
+        self.check_room_tx(net.site, CellShiftPhase::Forward, &patch)?;
+        let Ok(id) = getrandom::u64() else {
+            return Err("无法创建本次协作操作，请重试".into());
+        };
+        net.request_room_tx(id, CellShiftPhase::Forward, Arc::new(patch))
+    }
+
+    pub(super) fn request_room_tx_replay(
+        &mut self,
+        id: u64,
+        patch: Arc<RoomTxPatch>,
+        redo: bool,
+    ) -> bool {
+        if !self
+            .undo
+            .room_shift_history_matches(&self.wb, redo, self.net.is_none())
+        {
+            self.status = "关联工作表或内容已更改，已保留历史记录".into();
+            return false;
+        }
+        let phase = if redo {
+            CellShiftPhase::Redo
+        } else {
+            CellShiftPhase::Undo
+        };
+        let Some(net) = &self.net else {
+            let label = patch.label();
+            let is_coord = matches!(*patch, RoomTxPatch::AxisPermute(_) | RoomTxPatch::CellShift(_));
+            if !patch.matches_replica(&self.wb, redo) || !patch.apply_committed(&mut self.wb, redo)
+            {
+                self.status = "关联内容已更改，已保留历史记录".into();
+                return false;
+            }
+            if is_coord {
+                self.finish_shift_edit();
+            } else {
+                let effects = TxEffects {
+                    recalc: RecalcScope::Full,
+                    invalidate_deps: true,
+                    invalidate_render_caches: true,
+                    ..TxEffects::default()
+                };
+                self.apply_tx_effects(label, &effects);
+            }
+            self.finish_room_tx_history(id, phase, Arc::new(patch.to_tx_patch()));
+            self.status = if redo {
+                format!("已重做{label}")
+            } else {
+                format!("已撤销{label}")
+            };
+            return true;
+        };
+        let site = net.site;
+        let result = self
+            .check_room_tx(site, phase, &patch)
+            .and_then(|()| self.net.as_ref().unwrap().request_room_tx(id, phase, patch));
+        if let Err(reason) = result {
+            self.status = reason;
+            return false;
+        }
+        self.status = "正在等待宿主确认协作事务".into();
+        true
+    }
+
+    pub(super) fn validate_room_tx_request(
+        &self,
+        site: u32,
+        phase: CellShiftPhase,
+        patch: Arc<RoomTxPatch>,
+    ) -> Result<Arc<RoomTxPatch>, String> {
+        let canonical = if matches!(phase, CellShiftPhase::Forward) {
+            Arc::new(
+                patch
+                    .canonical_forward(&self.wb)
+                    .ok_or("工作簿状态已变更，请重新执行操作")?,
+            )
+        } else {
+            patch
+        };
+        self.check_room_tx(site, phase, &canonical)?;
+        Ok(canonical)
+    }
+
+    fn check_room_tx(
+        &self,
+        site: u32,
+        phase: CellShiftPhase,
+        patch: &RoomTxPatch,
+    ) -> Result<(), String> {
+        if self.deps_pending {
+            return Err("工作簿正在建立依赖关系，请稍后重试".into());
+        }
+        let forward = !matches!(phase, CellShiftPhase::Undo);
+        match patch {
+            RoomTxPatch::DefinedNames(dn) => {
+                if !dn.matches(&self.wb, forward) {
+                    return Err("定义名称已由其他成员修改，请重新操作".into());
+                }
+                Ok(())
+            }
+            RoomTxPatch::AxisPermute(ap) => {
+                if !ap.can_install(&self.wb) {
+                    return Err("目标工作表已变更，无法移动行或列".into());
+                }
+                if let Some(tx) = ap.effective_transform(forward) {
+                    if let Err(err) = tx.preflight(&self.wb) {
+                        return Err(err.message().into());
+                    }
+                } else {
+                    return Err("移动范围无效".into());
+                }
+                if self.wb.sheet(ap.sheet).protection.is_some() {
+                    return Err("工作表已受保护，无法移动行或列".into());
+                }
+                let (axis, eff_from, eff_n, eff_at) = ap.effective_move(forward);
+                if let Some(((r, c), holder)) = self.locks.conflicts_axis_permute(
+                    ap.sheet,
+                    axis,
+                    eff_from,
+                    eff_n,
+                    eff_at,
+                    site,
+                    self.lock_now(),
+                ) {
+                    return Err(format!(
+                        "{} 正在编辑 {}，无法移动行或列",
+                        holder.name,
+                        sheetcore::cell_name(r, c)
+                    ));
+                }
+                Ok(())
+            }
+            RoomTxPatch::CellShift(cs) => self.check_room_cell_shift(site, phase, cs),
+        }
+    }
+
+    pub(super) fn commit_room_tx(
+        &mut self,
+        site: u32,
+        id: u64,
+        phase: CellShiftPhase,
+        patch: Arc<RoomTxPatch>,
+        seq: u64,
+        old_seq: u64,
+        pre_clock: u64,
+    ) -> bool {
+        let forward = !matches!(phase, CellShiftPhase::Undo);
+        if !patch.can_install(&self.wb) {
+            self.resync_room_cell_shift();
+            return false;
+        }
+        let local = self.net.as_ref().is_some_and(|n| n.site == site);
+        let label = patch.label();
+        match &*patch {
+            RoomTxPatch::DefinedNames(dn) => {
+                if !dn.apply_committed(&mut self.wb, forward) {
+                    self.resync_room_cell_shift();
+                    return false;
+                }
+                let effects = TxEffects {
+                    recalc: RecalcScope::Full,
+                    invalidate_deps: true,
+                    invalidate_render_caches: true,
+                    ..TxEffects::default()
+                };
+                self.apply_tx_effects(label, &effects);
+                if local {
+                    if let Some(net) = &self.net {
+                        net.finish_structure();
+                    }
+                    self.finish_room_tx_history(
+                        id,
+                        phase,
+                        Arc::new(TxPatch::DefinedNames(dn.clone())),
+                    );
+                    self.status = match phase {
+                        CellShiftPhase::Forward => "名称已保存".into(),
+                        CellShiftPhase::Undo => format!("已撤销{label}"),
+                        CellShiftPhase::Redo => format!("已重做{label}"),
+                    };
+                } else {
+                    self.record_remote_note_revision(site, "远端名称更改", 0, label.into());
+                    let who = self.peer_display_name(site);
+                    self.status = format!("{who}：{label}");
+                }
+                true
+            }
+            RoomTxPatch::AxisPermute(ap) => {
+                if !ap.apply_committed(&mut self.wb, forward) {
+                    self.resync_room_cell_shift();
+                    return false;
+                }
+                self.on_live_axis_permute_committed(ap, phase, seq, old_seq, pre_clock);
+                self.finish_shift_edit();
+                if local {
+                    if let Some(net) = &self.net {
+                        net.finish_structure();
+                    }
+                    self.finish_room_tx_history(
+                        id,
+                        phase,
+                        Arc::new(TxPatch::AxisPermute(ap.clone())),
+                    );
+                    self.status = match phase {
+                        CellShiftPhase::Forward => format!("已{label}"),
+                        CellShiftPhase::Undo => format!("已撤销{label}"),
+                        CellShiftPhase::Redo => format!("已重做{label}"),
+                    };
+                } else {
+                    self.undo.clear();
+                    self.record_remote_note_revision(site, "远端移动行列", ap.sheet, label.into());
+                    let who = self.peer_display_name(site);
+                    self.status = format!("{who}：{label}");
+                }
+                true
+            }
+            RoomTxPatch::CellShift(cs) => {
+                self.commit_room_cell_shift(site, id, phase, Arc::new(cs.clone()), 0)
+            }
+        }
+    }
+
+    fn on_live_axis_permute_committed(
+        &mut self,
+        patch: &AxisPermutePatch,
+        phase: CellShiftPhase,
+        seq: u64,
+        old_seq: u64,
+        pre_clock: u64,
+    ) {
+        let forward = !matches!(phase, CellShiftPhase::Undo);
+        let (axis, eff_from, eff_n, eff_at) = patch.effective_move(forward);
+        let sheet = patch.sheet;
+        let map = |r: u32, c: u32| {
+            sheetcore::sync::permute_axis_coord(r, c, axis, eff_from, eff_n, eff_at)
+        };
+
+        self.shift_intro
+            .record_live_shift(false, 0, 0, seq, old_seq, pre_clock);
+        if let Some(net) = self.net.as_ref() {
+            net.set_shift_seq(seq);
+        }
+
+        self.locks.permute_axis(sheet, axis, eff_from, eff_n, eff_at);
+        if let Some(peer) = self.peer.as_mut() {
+            let names: Vec<_> = self.wb.sheets.iter().map(|s| s.name.clone()).collect();
+            peer.permute_axis_with_formulas(&names, sheet, axis, eff_from, eff_n, eff_at);
+        }
+        if let Some((ls, lr, lc)) = self.my_lock {
+            if ls == sheet {
+                match map(lr, lc) {
+                    Some((nr, nc)) => self.my_lock = Some((ls, nr, nc)),
+                    None => {
+                        self.my_lock = None;
+                        self.pending_edit = None;
+                        self.editing = None;
+                    }
+                }
+            }
+        }
+        if let Some((ls, lr, lc)) = self.requested_lock {
+            if ls == sheet {
+                self.requested_lock = map(lr, lc).map(|(nr, nc)| (ls, nr, nc));
+            }
+        }
+        if self.edit_sheet == Some(sheet) {
+            if let Some((er, ec)) = self.edit_sel {
+                self.edit_sel = map(er, ec);
+            }
+        }
+        let old_remote = std::mem::take(&mut self.remote);
+        for (rsite, (rsh, rname, rcol, rr, rc, er, ec)) in old_remote {
+            if rsh == sheet {
+                if let Some((nr, nc)) = map(rr, rc) {
+                    let (ner, nec) = map(er, ec).unwrap_or((nr, nc));
+                    self.remote
+                        .insert(rsite, (rsh, rname, rcol, nr, nc, ner, nec));
+                }
+            } else {
+                self.remote
+                    .insert(rsite, (rsh, rname, rcol, rr, rc, er, ec));
+            }
+        }
+
+        let discarded = self.discard_stale_rejoin_outboxes();
+        if discarded > 0 {
+            self.shift_intro.pending_cancelled_edits = self
+                .shift_intro
+                .pending_cancelled_edits
+                .saturating_add(discarded);
+            self.shift_intro.needs_delta_resync_for_stale = true;
+        }
+    }
+
+    pub(super) fn finish_room_tx_history(
+        &mut self,
+        id: u64,
+        phase: CellShiftPhase,
+        patch: Arc<TxPatch>,
+    ) {
+        if matches!(phase, CellShiftPhase::Forward) {
+            if patch.can_install(&self.wb) {
+                self.undo.push_room_tx_patch(id, patch, &self.wb);
+            }
+            return;
+        }
+        let redo = matches!(phase, CellShiftPhase::Redo);
+        let entry = if redo {
+            self.undo.top_redo_id()
+        } else {
+            self.undo.top_undo_id()
+        };
+        if !self.undo.confirm_room_tx_patch(id, redo) {
+            return;
+        }
+        if let Some(entry) = entry {
+            if redo {
+                self.audit_on_redo(entry);
+            } else {
+                self.audit_on_undo(entry);
+            }
+        }
+    }
 }
 
 fn moved_extent(
@@ -960,6 +1340,9 @@ fn moved_extent(
         .chain(sh.ignored_errors.iter())
     {
         include(r, c);
+    }
+    for sp in &sh.sparklines {
+        include(sp.r, sp.c);
     }
     for &(top, left, bottom, right) in &sh.merges {
         if (horizontal && r1 <= top && bottom <= r2 && left >= c1)

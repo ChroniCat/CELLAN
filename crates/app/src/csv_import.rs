@@ -265,6 +265,7 @@ enum Input {
 
 pub(super) struct PendingImport {
     target: Target,
+    gate: crate::bg_gate::CoordGate,
     path: Option<PathBuf>,
     refreshing: bool,
     linking: bool,
@@ -789,6 +790,10 @@ impl SheetApp {
     }
 
     fn start_import_from(&mut self, input: Input, target: Target, before: Option<Sheet>) {
+        let Some(gate) = crate::bg_gate::CoordGate::sheet(self.doc_uid, &self.wb, target.sheet) else {
+            self.status = "目标工作表或协作状态已改变，请重新导入".into();
+            return;
+        };
         if !target.valid(self) {
             self.status = "目标工作表或协作状态已改变，请重新导入".into();
             return;
@@ -823,6 +828,7 @@ impl SheetApp {
         self.status = "正在准备外部数据…".into();
         self.csv_job = Some(PendingImport {
             target,
+            gate,
             path,
             refreshing,
             linking,
@@ -941,7 +947,8 @@ impl SheetApp {
                 .sources
                 .iter()
                 .any(|s| matches!(s.kind, Kind::Csv { .. }));
-        if !job.target.valid(self)
+        if job.gate.matches_sheet(self.doc_uid, &self.wb) != Some(job.target.sheet)
+            || !job.target.valid(self)
             || moved_source_base
             || (job.refreshing && self.wb.sources != job.sources)
         {
@@ -1563,5 +1570,52 @@ mod tests {
         dialog.wait_preview();
         assert!(dialog.err.is_some());
         assert!(dialog.preview().is_empty());
+    }
+
+    #[test]
+    fn phase5_bg_gate_csv_import_rejects_coord_epoch_advance_and_keeps_ordinary_edit() {
+        use sheetcore::structural::{Structural, apply_structural_wb};
+
+        let env = crate::test_env::TestEnv::new("phase5-bg-gate-csv-import");
+        let mut app = SheetApp::new_with_context(&egui::Context::default(), None);
+        app.wb.sheets.push(Sheet::new("Other"));
+        let path = env.path("data.csv");
+        std::fs::write(&path, "10,20\n").unwrap();
+
+        // Ordinary edit on another sheet must NOT cancel pending CSV import.
+        app.sel = (0, 0);
+        app.import_csv_from(&path);
+        app.wb.sheet_mut(1).set(3, 3, number(5.0));
+        app.doc_gen += 1;
+        app.finish_csv_probe();
+        assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(10.0));
+        assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(20.0));
+        assert_eq!(app.wb.sources.len(), 1);
+        let depth = app.undo.depth();
+
+        // Structural edit on ANOTHER sheet advances wb.coord_epoch() while leaving sheet 0's
+        // coordinate_revision() unchanged: pending CSV import must abort cleanly.
+        app.sel = (4, 0);
+        app.import_csv_from(&path);
+        let rev_before = app.wb.sheet(0).coordinate_revision();
+        apply_structural_wb(&mut app.wb, 1, &Structural::InsertRows { at: 0, n: 1 });
+        assert_eq!(app.wb.sheet(0).coordinate_revision(), rev_before);
+        app.finish_csv_probe();
+        assert!(app.status.contains("已取消"), "{}", app.status);
+        assert_eq!(app.wb.sheet(0).value(4, 0), Value::Empty);
+        assert_eq!(app.undo.depth(), depth);
+        assert_eq!(app.wb.sources.len(), 1);
+
+        // Sheet-link background import also aborts when wb.coord_epoch() advances mid-flight.
+        app.wb.sheet_mut(1).set(0, 0, number(88.0));
+        app.sel = (6, 0);
+        let link_target = Target::current(&app, (6, 0));
+        app.start_sheet_link("Other!A1", link_target);
+        apply_structural_wb(&mut app.wb, 1, &Structural::InsertCols { at: 5, n: 1 });
+        app.finish_csv_probe();
+        assert!(app.status.contains("已取消"), "{}", app.status);
+        assert_eq!(app.wb.sheet(0).value(6, 0), Value::Empty);
+        assert_eq!(app.undo.depth(), depth);
+        assert_eq!(app.wb.sources.len(), 1);
     }
 }

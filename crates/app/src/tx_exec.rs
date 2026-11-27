@@ -204,6 +204,71 @@ impl SheetApp {
         entry_id
     }
 
+    /// Commit a pre-applied `Action` (cell deltas, merges, shapes, pictures) through
+    /// the unified app commit funnel: optionally records per-sheet revision deltas,
+    /// pushes onto `self.undo`, and runs unified post-commit side effects.
+    pub(crate) fn commit_cell_action_tx(
+        &mut self,
+        action: sheetcore::undo::Action,
+        record_revision: bool,
+        recalc: RecalcScope,
+        invalidate_render_caches: bool,
+    ) -> Option<u64> {
+        if action.is_empty() {
+            return None;
+        }
+        let label = action.label.clone();
+        if record_revision && !action.deltas.is_empty() {
+            self.record_revision(&label, &action.deltas);
+        }
+        self.undo.push(action);
+        let entry_id = self.undo.top_undo_id();
+        let effects = TxEffects {
+            invalidate_deps: matches!(recalc, RecalcScope::Full),
+            recalc,
+            invalidate_render_caches,
+            ..TxEffects::default()
+        };
+        self.apply_tx_effects(&label, &effects);
+        entry_id
+    }
+
+    /// Commit a large single-sheet CoW batch (`before_sheet` vs live `self.wb.sheet(sheet_idx)`)
+    /// through the unified app commit funnel, returning the newly recorded undo entry ID if any.
+    pub(crate) fn commit_cow_batch_tx(
+        &mut self,
+        label: impl Into<String>,
+        sheet_idx: usize,
+        before_sheet: &sheetcore::Sheet,
+        focus: (usize, u32, u32),
+        recalc: RecalcScope,
+        invalidate_render_caches: bool,
+    ) -> Option<u64> {
+        let label = label.into();
+        let before_id = self.undo.top_undo_id();
+        self.undo.push_cow_batch(
+            label.clone(),
+            sheet_idx,
+            before_sheet,
+            self.wb.sheet(sheet_idx),
+            focus,
+        );
+        let after_id = self.undo.top_undo_id();
+        let effects = TxEffects {
+            invalidate_deps: matches!(recalc, RecalcScope::Full),
+            recalc,
+            invalidate_render_caches,
+            touched_sheets: vec![sheet_idx],
+            ..TxEffects::default()
+        };
+        self.apply_tx_effects(&label, &effects);
+        if after_id != before_id {
+            after_id
+        } else {
+            None
+        }
+    }
+
     /// Execute a cell/formula/style batch transaction through `WorkbookTx`,
     /// push `Entry::Tx(TxDelta::CellBatch)` onto `self.undo`, and run `apply_tx_effects`.
     #[allow(dead_code)]
@@ -363,5 +428,193 @@ impl SheetApp {
             self.drop_merge_confirmation();
             self.load_sheet_view(self.wb.sheets.len() - 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Strip line/block comments and `#[cfg(test)]` items/blocks from Rust source
+    /// so architectural guardrails inspect only production code.
+    fn strip_comments_and_cfg_tests(src: &str) -> Vec<(usize, String)> {
+        let mut cleaned: Vec<(usize, String)> = Vec::new();
+        let mut in_block_comment = false;
+        let mut pending_cfg_test = false;
+        let mut cfg_test_brace_depth: usize = 0;
+
+        for (idx, raw_line) in src.lines().enumerate() {
+            let line_no = idx + 1;
+            let bytes = raw_line.as_bytes();
+            let mut out = String::with_capacity(raw_line.len());
+            let mut i = 0usize;
+            let mut in_string = false;
+            while i < bytes.len() {
+                if in_block_comment {
+                    if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        in_block_comment = false;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if in_string {
+                    let ch = raw_line[i..].chars().next().unwrap();
+                    out.push(ch);
+                    if ch == '\\' && i + 1 < bytes.len() {
+                        let next = raw_line[i + 1..].chars().next().unwrap();
+                        out.push(next);
+                        i += 1 + next.len_utf8();
+                    } else {
+                        if ch == '"' {
+                            in_string = false;
+                        }
+                        i += ch.len_utf8();
+                    }
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                    break;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    in_block_comment = true;
+                    i += 2;
+                    continue;
+                }
+                let ch = raw_line[i..].chars().next().unwrap();
+                if ch == '"' {
+                    in_string = true;
+                }
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+
+            let trimmed = out.trim();
+            if cfg_test_brace_depth > 0 {
+                for ch in trimmed.chars() {
+                    match ch {
+                        '{' => cfg_test_brace_depth += 1,
+                        '}' => {
+                            cfg_test_brace_depth -= 1;
+                            if cfg_test_brace_depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if trimmed.starts_with("#[cfg(test)]") {
+                if trimmed.contains('{') {
+                    let opens = trimmed.matches('{').count();
+                    let closes = trimmed.matches('}').count();
+                    cfg_test_brace_depth = opens.saturating_sub(closes);
+                } else if !trimmed.ends_with(';') {
+                    pending_cfg_test = true;
+                }
+                continue;
+            }
+            if pending_cfg_test {
+                if trimmed.is_empty() || trimmed.starts_with("#[") {
+                    continue;
+                }
+                let opens = trimmed.matches('{').count();
+                let closes = trimmed.matches('}').count();
+                if opens > 0 {
+                    cfg_test_brace_depth = opens.saturating_sub(closes);
+                    pending_cfg_test = false;
+                    continue;
+                }
+                if trimmed.ends_with(';') {
+                    pending_cfg_test = false;
+                    continue;
+                }
+                continue;
+            }
+
+            cleaned.push((line_no, out));
+        }
+        cleaned
+    }
+
+    #[test]
+    fn phase5_tx_architecture_guardrail_no_bypassed_undo_or_defined_names() {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_dir, &mut files);
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "expected Rust sources under {}",
+            src_dir.display()
+        );
+
+        let forbidden_undo = [
+            ".undo.push_structure(",
+            ".undo.push_chart_edit(",
+            ".undo.push_pivot_edit(",
+            ".undo.push_meta(",
+        ];
+        let forbidden_main_names = ["wb.names.push(", "wb.names.remove("];
+        let mut violations = Vec::new();
+
+        for path in files {
+            let file_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if file_name.ends_with("_tests.rs") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&src_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            let prod_lines = strip_comments_and_cfg_tests(&content);
+
+            if rel != "tx_exec.rs" {
+                for (line_no, line) in &prod_lines {
+                    for pat in forbidden_undo {
+                        if line.contains(pat) {
+                            violations.push(format!("{rel}:{line_no}: forbidden `{pat}` outside tx_exec.rs"));
+                        }
+                    }
+                }
+            }
+            if rel == "main.rs" {
+                for (line_no, line) in &prod_lines {
+                    for pat in forbidden_main_names {
+                        if line.contains(pat) {
+                            violations.push(format!("{rel}:{line_no}: forbidden direct `{pat}` in main.rs"));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "Phase 5 transaction convergence guardrail violations:\n{}",
+            violations.join("\n")
+        );
     }
 }

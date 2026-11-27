@@ -13555,11 +13555,12 @@ fn phase2_app_shift_cells_rewrites_cfvo_with_undo_and_preflight_blocks_overlappi
     assert_eq!(min.formula, "=Data!$A$5");
     assert_eq!(max.formula, "=Data!$A$7");
 
-    // Preflight blocks shift_cells when a chart, sparkline, or protected range intersects the moving ray.
+    // Phase 5 #5: overlapping charts and wholly-in-band sparklines shift cleanly with Undo,
+    // while band-straddling sparklines and overlapping protected ranges are blocked by preflight.
     app.wb.sheets[0].set(4, 0, number(99.0));
     let before_depth = app.undo.depth();
 
-    // 1) Overlapping chart
+    // 1) Overlapping chart shifts & undoes cleanly
     app.wb.sheets[1].charts.push(Chart {
         kind: ChartKind::Column,
         series: vec![Series {
@@ -13571,12 +13572,16 @@ fn phase2_app_shift_cells_rewrites_cfvo_with_undo_and_preflight_blocks_overlappi
     app.sel = (1, 0);
     app.sel_end = (1, 0);
     app.shift_cells(true, false);
+    assert_eq!(app.wb.sheet(0).value(5, 0), Value::Number(99.0));
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$A$6:$A$7");
+    assert_eq!(app.undo.depth().0, before_depth.0 + 1);
+    assert!(app.apply_undo(false), "{}", app.status);
     assert_eq!(app.wb.sheet(0).value(4, 0), Value::Number(99.0));
-    assert_eq!(app.undo.depth(), before_depth);
-    assert!(app.status.contains("图表"), "status={}", app.status);
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$A$5:$A$6");
+    assert_eq!(app.undo.depth().0, before_depth.0);
     app.wb.sheets[1].charts.clear();
 
-    // 2) Overlapping sparkline
+    // 2) Wholly-in-band sparkline shifts & undoes cleanly; band-straddling sparkline is blocked
     app.wb.sheets[1].sparklines.push(Sparkline {
         r: 0,
         c: 0,
@@ -13584,6 +13589,15 @@ fn phase2_app_shift_cells_rewrites_cfvo_with_undo_and_preflight_blocks_overlappi
         rect: (4, 0, 5, 0),
         ..Default::default()
     });
+    app.shift_cells(true, false);
+    assert_eq!(app.wb.sheet(0).value(5, 0), Value::Number(99.0));
+    assert_eq!(app.wb.sheet(1).sparklines[0].rect, (5, 0, 6, 0));
+    assert_eq!(app.undo.depth().0, before_depth.0 + 1);
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).value(4, 0), Value::Number(99.0));
+    assert_eq!(app.wb.sheet(1).sparklines[0].rect, (4, 0, 5, 0));
+    let before_depth = app.undo.depth();
+    app.wb.sheets[1].sparklines[0].rect = (4, 0, 5, 1);
     app.shift_cells(true, false);
     assert_eq!(app.wb.sheet(0).value(4, 0), Value::Number(99.0));
     assert_eq!(app.undo.depth(), before_depth);
@@ -14458,6 +14472,137 @@ fn phase4_tx_coord_epoch_monotonic_across_local_undo_and_room_cell_shift() {
     ));
     assert_advanced(&mut app, "Room CellShiftCommitted Undo");
 }
+
+#[test]
+fn phase5_tx_solo_cell_shift_chart_and_sparkline_undo_redo_and_straddle_reject() {
+    use sheetcore::{
+        charts::{Chart, ChartKind, Series},
+        sparkline::Sparkline,
+        Cell, Value,
+    };
+    let _env = crate::test_env::TestEnv::new("p5-tx-solo-shift-chart-spark");
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        for r in 0..4u32 {
+            sh.set(r, 0, Cell { value: Value::Number((r + 1) as f64), formula: None });
+        }
+        sh.charts.push(Chart {
+            kind: ChartKind::Column,
+            title: "Sales".into(),
+            anchor: (0, 4, 8, 10),
+            source_range: "Sheet1!$A$2:$A$4".into(),
+            series: vec![Series {
+                name: "S1".into(),
+                val_ref: "Sheet1!$A$2:$A$4".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        // Wholly-in-band vertical sparkline in column A.
+        sh.sparklines.push(Sparkline {
+            r: 5,
+            c: 0,
+            rect: (1, 0, 3, 0),
+            ..Default::default()
+        });
+    }
+
+    // Insert cell at A2 shifting column A down: Chart & wholly-in-band Sparkline shift cleanly.
+    let epoch0 = app.wb.coord_epoch();
+    app.sel = (1, 0);
+    app.sel_end = (1, 0);
+    app.shift_cells(true, false);
+    assert!(app.wb.coord_epoch() > epoch0);
+    assert_eq!(
+        app.wb.sheet(0).charts[0].series[0].val_ref,
+        "Sheet1!$A$3:$A$5"
+    );
+    assert_eq!(app.wb.sheet(0).sparklines[0].r, 6);
+    assert_eq!(app.wb.sheet(0).sparklines[0].rect, (2, 0, 4, 0));
+
+    // Undo & Redo preserve Chart and Sparkline exact state.
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(
+        app.wb.sheet(0).charts[0].series[0].val_ref,
+        "Sheet1!$A$2:$A$4"
+    );
+    assert_eq!(app.wb.sheet(0).sparklines[0].r, 5);
+    assert_eq!(app.wb.sheet(0).sparklines[0].rect, (1, 0, 3, 0));
+
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(
+        app.wb.sheet(0).charts[0].series[0].val_ref,
+        "Sheet1!$A$3:$A$5"
+    );
+    assert_eq!(app.wb.sheet(0).sparklines[0].r, 6);
+    assert_eq!(app.wb.sheet(0).sparklines[0].rect, (2, 0, 4, 0));
+
+    // Straddling sparkline (A10:C10) must be rejected when shifting only column A.
+    app.wb.sheet_mut(0).sparklines.push(Sparkline {
+        r: 9,
+        c: 4,
+        rect: (9, 0, 9, 2),
+        ..Default::default()
+    });
+    let epoch_before = app.wb.coord_epoch();
+    app.sel = (8, 0);
+    app.sel_end = (8, 0);
+    app.shift_cells(true, false);
+    assert!(app.status.contains("迷你图"), "unexpected status: {}", app.status);
+    assert_eq!(app.wb.coord_epoch(), epoch_before);
+}
+
+#[test]
+fn phase5_tx_meta_and_cow_funnel_undo_redo() {
+    use sheetcore::{sparkline::Sparkline, Cell, Value};
+    let _env = crate::test_env::TestEnv::new("p5-tx-meta-cow-funnel");
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(10.0), formula: None });
+
+    // 1) Comment via commit_meta_tx + undo/redo
+    let gen0 = app.doc_gen;
+    assert!(app.set_comment_cell(0, 0, 0, "核对通过", Some("审计员"), true).unwrap());
+    assert!(app.doc_gen > gen0);
+    assert!(app.wb.dirty);
+    assert!(app.wb.sheet(0).threads.contains_key(&sheetcore::CellRef::new(0, 0)));
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert!(!app.wb.sheet(0).threads.contains_key(&sheetcore::CellRef::new(0, 0)));
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert!(app.wb.sheet(0).threads.contains_key(&sheetcore::CellRef::new(0, 0)));
+
+    // 2) Sparkline delete via commit_meta_tx + undo/redo
+    app.wb.sheet_mut(0).sparklines.push(Sparkline {
+        r: 0,
+        c: 2,
+        rect: (0, 0, 0, 1),
+        ..Default::default()
+    });
+    app.sel = (0, 2);
+    app.sel_end = (0, 2);
+    app.spark_delete_in_sel();
+    assert!(app.wb.sheet(0).sparklines.is_empty());
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).sparklines.len(), 1);
+
+    // 3) Hidden rows via commit_meta_tx + undo/redo
+    app.set_rows_hidden_undoable(2, 3, true);
+    assert!(app.wb.sheet(0).hidden_rows_user.contains(&2));
+    assert!(app.wb.sheet(0).hidden_rows_user.contains(&3));
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert!(!app.wb.sheet(0).hidden_rows_user.contains(&2));
+
+    // 4) Large CoW style batch via commit_cow_batch_tx + undo/redo (> 1024 cells)
+    app.sel = (0, 0);
+    app.sel_end = (50, 30); // 1581 cells -> CoW fast path
+    app.apply_style(|st| st.bold = true);
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(10, 10)).bold);
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert!(!app.wb.styles.get(app.wb.sheet(0).style_of(10, 10)).bold);
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(10, 10)).bold);
+}
+
 
 
 

@@ -14,20 +14,26 @@ struct Query {
     order: SearchOrder,
     sheet: Option<usize>,
     rects: Vec<Rect>,
-    document: u64,
+    gate: crate::bg_gate::CoordGate,
     revisions: Vec<(u64, sheetcore::store::CellVersion, u64, u64)>,
     dates: sheetcore::model::DateSystem,
 }
 
 impl Query {
     fn same_scope(&self, other: &Self) -> bool {
-        self.document == other.document && self.sheet == other.sheet
+        self.gate.doc_uid == other.gate.doc_uid
+            && self.sheet == other.sheet
             && self.revisions.iter().map(|v| v.0).eq(other.revisions.iter().map(|v| v.0))
     }
 
     fn same_request(&self, other: &Self) -> bool {
-        self.same_scope(other) && self.needle == other.needle && self.options == other.options
-            && self.order == other.order && self.rects == other.rects && self.dates == other.dates
+        self.same_scope(other)
+            && self.gate == other.gate
+            && self.needle == other.needle
+            && self.options == other.options
+            && self.order == other.order
+            && self.rects == other.rects
+            && self.dates == other.dates
             && self.revisions.iter().map(|v| v.3).eq(other.revisions.iter().map(|v| v.3))
     }
 
@@ -111,6 +117,7 @@ struct Pending {
 
 pub(super) struct Navigation {
     query: Arc<Query>,
+    gate: crate::bg_gate::CoordGate,
     hits: Arc<Vec<Hit>>,
     snapshot: Arc<Workbook>,
     verified: std::cell::RefCell<Option<Query>>,
@@ -122,6 +129,7 @@ pub(super) struct Navigation {
 
 pub(super) struct Replacement {
     query: Arc<Query>,
+    gate: crate::bg_gate::CoordGate,
     snapshot: Arc<Workbook>,
     text: String,
     replace_formula_results: bool,
@@ -218,6 +226,7 @@ impl ReplacementPlan {
 
 impl Navigation {
     fn current(&self, now: &Query, wb: &Workbook) -> bool {
+        if self.gate.is_stale(now.gate.doc_uid, wb) { return false; }
         if *self.query == *now || self.verified.borrow().as_ref() == Some(now) { return true; }
         if !self.query.same_request(now) { return false; }
         let matches = self.query.revisions.iter().zip(&now.revisions).enumerate().all(|(n, (a,b))| {
@@ -257,6 +266,7 @@ impl SheetApp {
         nav.summary = None;
         self.find_scan = Some(Replacement {
             snapshot,
+            gate: nav.gate,
             query: Arc::clone(&nav.query),
             text: self.find.replace.clone(),
             replace_formula_results: self.find.replace_formula_results,
@@ -337,8 +347,11 @@ impl SheetApp {
             self.status = "文档已切换，已取消扫描".into();
             return;
         }
-        if !scan.query.same_request(&current) || scan.text != self.find.replace
-            || scan.replace_formula_results != self.find.replace_formula_results {
+        if scan.gate.is_stale(self.doc_uid, &self.wb)
+            || !scan.query.same_request(&current)
+            || scan.text != self.find.replace
+            || scan.replace_formula_results != self.find.replace_formula_results
+        {
             self.cancel_find_scan();
             self.status = "工作簿或替换条件已更改，已取消替换".into();
             return;
@@ -464,13 +477,18 @@ impl SheetApp {
             .into_iter()
             .map(|(r1, c1, r2, c2)| (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)))
             .collect();
+        let gate = match sheet {
+            Some(si) => crate::bg_gate::CoordGate::sheet(self.doc_uid, &self.wb, si)
+                .unwrap_or_else(|| crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb)),
+            None => crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb),
+        };
         Query {
             needle: search::normalize_needle(&self.find.find, &options),
             order: self.search_order(),
             options,
             sheet,
             rects,
-            document: self.doc_uid,
+            gate,
             revisions: self
                 .wb
                 .sheets
@@ -556,10 +574,12 @@ impl SheetApp {
                 .filter(|(i, _)| query.sheet.is_none_or(|si| si == *i))
                 .map(|(_, sh)| sh.len())
                 .sum();
+            let gate = query.gate;
             let query = Arc::new(query);
             let snapshot = self.search_workbook(&query);
             let mut nav = Navigation {
                 query: query.clone(),
+                gate,
                 hits: Arc::default(),
                 snapshot: snapshot.clone(),
                 verified: Default::default(),
@@ -695,6 +715,9 @@ impl SheetApp {
     }
 
     fn accepts_pending_index(&self, nav: &Navigation) -> bool {
+        if nav.gate.is_stale(self.doc_uid, &self.wb) {
+            return false;
+        }
         let current = self.navigation_query();
         if self.find_scan.as_ref().is_some_and(|r| Arc::ptr_eq(&r.query, &nav.query)) {
             return nav.query.same_request(&current);
@@ -1080,5 +1103,52 @@ mod tests {
         wait_for_index(&mut app);
         assert_eq!(app.sel, cursor);
         assert_eq!(app.status, "other action");
+    }
+
+    #[test]
+    fn phase5_bg_gate_find_navigation_rejects_stale_index_and_replace_on_coord_epoch() {
+        use sheetcore::structural::{Structural, apply_structural_wb};
+
+        let _env = crate::test_env::TestEnv::new("phase5-bg-gate-find-nav");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+        for r in 0..1_500u32 {
+            app.wb.sheets[0].set(r, 0, text("old"));
+        }
+        app.find.scope = 0; // current sheet
+        app.find.find = "old".into();
+        app.find.replace = "new".into();
+
+        // 1. Ordinary edit on sheet 1 must NOT invalidate sheet-0 find navigation cache.
+        app.ensure_navigation(true);
+        let original = app.find_navigation.as_ref().unwrap().query.clone();
+        app.wb.sheets[1].set(0, 0, text("unrelated"));
+        app.doc_gen += 1;
+        app.ensure_navigation(true);
+        assert!(Arc::ptr_eq(&original, &app.find_navigation.as_ref().unwrap().query));
+
+        // 2. Pending background find index is discarded when wb.coord_epoch() advances.
+        let (tx, rx) = mpsc::channel();
+        let stale_hits = (*app.find_navigation.as_ref().unwrap().hits).clone();
+        app.find_navigation.as_mut().unwrap().receiver = Some(rx);
+        app.sel = (0, 0);
+        app.find_next(false);
+        let cursor = app.sel;
+        apply_structural_wb(&mut app.wb, 1, &Structural::InsertRows { at: 0, n: 1 });
+        tx.send(stale_hits).unwrap();
+        app.poll_navigation(&ctx);
+        assert!(app.find_navigation.is_none());
+        assert_eq!(app.sel, cursor);
+
+        // 3. Background Replace All worker is cancelled cleanly when wb.coord_epoch() advances.
+        app.start_replace_scan();
+        assert!(app.find_scan.as_ref().unwrap().worker.is_some());
+        apply_structural_wb(&mut app.wb, 1, &Structural::InsertCols { at: 0, n: 1 });
+        app.poll_find_scan();
+        assert!(app.find_scan.is_none());
+        assert!(app.status.contains("已取消替换"), "{}", app.status);
+        assert_eq!(app.wb.sheets[0].value(0, 0), Value::Text("old".into()));
+        assert_eq!(app.undo.depth(), (0, 0));
     }
 }

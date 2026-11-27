@@ -348,6 +348,84 @@ pub fn shift_structural_merge_rect(
     }
 }
 
+/// 按整行/整列块移动（`AxisPermute`：`[from, from+n) -> [at, at+n)`）重算单元格坐标。
+pub fn permute_axis_coord(
+    r: u32,
+    c: u32,
+    axis: crate::refs::Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+) -> Option<(u32, u32)> {
+    if r >= MAX_ROWS || c >= MAX_COLS || n == 0 {
+        return None;
+    }
+    let limit = match axis {
+        crate::refs::Axis::Row => MAX_ROWS,
+        crate::refs::Axis::Col => MAX_COLS,
+    };
+    if from.checked_add(n).is_none_or(|e| e > limit) || at.checked_add(n).is_none_or(|e| e > limit) {
+        return None;
+    }
+    if from == at {
+        return Some((r, c));
+    }
+    match axis {
+        crate::refs::Axis::Row => Some((crate::refs::permute_index(r, from, n, at), c)),
+        crate::refs::Axis::Col => Some((r, crate::refs::permute_index(c, from, n, at))),
+    }
+}
+
+/// 按整行/整列块移动重算合并区域坐标（与 `Sheet::move_axis_inner` 保持一致）。
+pub fn permute_axis_merge_rect(
+    (r1, c1, r2, c2): (u32, u32, u32, u32),
+    axis: crate::refs::Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if r1 > r2 || c1 > c2 || r2 >= MAX_ROWS || c2 >= MAX_COLS {
+        return None;
+    }
+    let tx = crate::transform::CoordTransform::from_axis_permute(0, axis, from, n, at)?;
+    if let Some(nm) = tx.map_rect((r1, c1, r2, c2)) {
+        return (nm.2 > nm.0 || nm.3 > nm.1).then_some(nm);
+    }
+    use crate::structural::Structural as S;
+    let rows = axis == crate::refs::Axis::Row;
+    let del_sh = (if rows {
+        S::DeleteRows { at: from, n }
+    } else {
+        S::DeleteCols { at: from, n }
+    })
+    .reference_shift();
+    let ins_sh = (if rows {
+        S::InsertRows { at, n }
+    } else {
+        S::InsertCols { at, n }
+    })
+    .reference_shift();
+    let del_ms = crate::refs::MappedShift {
+        shift: &del_sh,
+        insertions: &[],
+    };
+    let ins_ms = crate::refs::MappedShift {
+        shift: &ins_sh,
+        insertions: &[],
+    };
+    if rows {
+        let (a, b) = del_ms
+            .map_range(r1, r2)
+            .and_then(|(x, y)| ins_ms.map_range(x, y))?;
+        (b < MAX_ROWS && (b > a || c2 > c1)).then_some((a, c1, b, c2))
+    } else {
+        let (a, b) = del_ms
+            .map_range(c1, c2)
+            .and_then(|(x, y)| ins_ms.map_range(x, y))?;
+        (b < MAX_COLS && (r2 > r1 || b > a)).then_some((r1, a, r2, b))
+    }
+}
+
 /// 单元格编辑租约：同一格同一时刻只允许一个站点在编辑。
 ///
 /// 时间用毫秒（调用方传单调时钟），过期由宿主清理——断线/崩溃的人不会把格子永久锁死。
@@ -530,6 +608,64 @@ impl LockTable {
         }
     }
 
+    /// 检查整行/整列块移动是否会触及置换带 `[lo, hi)` 内其他站点持有的活跃编辑租约
+    pub fn conflicts_axis_permute(
+        &self,
+        sheet: usize,
+        axis: crate::refs::Axis,
+        from: u32,
+        n: u32,
+        at: u32,
+        site: u32,
+        now_ms: u64,
+    ) -> Option<((u32, u32), &Holder)> {
+        if n == 0 || from == at {
+            return None;
+        }
+        let lo = from.min(at);
+        let hi = from.saturating_add(n).max(at.saturating_add(n));
+        self.map
+            .iter()
+            .find(|((sh, r, c), h)| {
+                if *sh != sheet
+                    || h.site == site
+                    || now_ms.saturating_sub(h.at_ms) >= self.ttl_ms
+                {
+                    return false;
+                }
+                let coord = match axis {
+                    crate::refs::Axis::Row => *r,
+                    crate::refs::Axis::Col => *c,
+                };
+                coord >= lo && coord < hi
+            })
+            .map(|((_, r, c), h)| ((*r, *c), h))
+    }
+
+    /// 整行/整列块移动后同步双射置换租约表坐标
+    pub fn permute_axis(
+        &mut self,
+        sheet: usize,
+        axis: crate::refs::Axis,
+        from: u32,
+        n: u32,
+        at: u32,
+    ) {
+        if n == 0 || from == at {
+            return;
+        }
+        let old = std::mem::take(&mut self.map);
+        for ((sh, r, c), h) in old {
+            if sh == sheet {
+                if let Some((nr, nc)) = permute_axis_coord(r, c, axis, from, n, at) {
+                    self.map.insert((sh, nr, nc), h);
+                }
+            } else {
+                self.map.insert((sh, r, c), h);
+            }
+        }
+    }
+
     /// 释放同一站点除 `keep` 外的其余租约，防止单成员遗留或批量占满整表锁
     pub fn release_all_except(
         &mut self,
@@ -656,8 +792,8 @@ pub struct SnapshotChunkRef<'a> {
     pub last: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CellShiftPhase { Forward, Undo, Redo }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CellShiftPhase { #[default] Forward, Undo, Redo }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t")]
@@ -700,6 +836,8 @@ pub enum Msg {
         binary_v3: bool,
         #[serde(default)]
         compact_v3: bool,
+        #[serde(default)]
+        room_tx: bool,
     },
     /// 本机显示名变更（不改变 site；宿主转发给其他参与者）
     Rename { site: u32, name: String },
@@ -737,6 +875,8 @@ pub enum Msg {
         /// 宿主已为该站点提交的最大单元格操作逻辑时间戳（重连时防止已确认的旧 op 在结构变更后被错位重放）
         #[serde(default)]
         acked_op_ts: u64,
+        #[serde(default)]
+        room_tx: bool,
     },
     Snapshot { ops: Vec<Op> },
     /// 大文件分片下发（last=1 表示这是最后一片）
@@ -932,6 +1072,41 @@ pub enum Msg {
     CellShiftAck { site: u32, seq: u64 },
     CellShiftResync,
     CellShiftRejected {id:u64,phase:CellShiftPhase,reason:String},
+    /// Generalized host-sequenced room transaction (`DefinedNames`, `AxisPermute`, `CellShift`).
+    RoomTxRequest {
+        site: u32,
+        id: u64,
+        phase: CellShiftPhase,
+        revision: usize,
+        patch: Arc<crate::tx::RoomTxPatch>,
+    },
+    RoomTxCommitted {
+        site: u32,
+        id: u64,
+        phase: CellShiftPhase,
+        first_ts: u64,
+        seq: u64,
+        patch: Arc<crate::tx::RoomTxPatch>,
+    },
+    RoomTxRejected {
+        #[serde(default)]
+        id: u64,
+        #[serde(default)]
+        phase: CellShiftPhase,
+        reason: String,
+    },
+    RoomTxAck {
+        site: u32,
+        seq: u64,
+    },
+    RoomTxReceipt {
+        site: u32,
+        id: u64,
+        phase: CellShiftPhase,
+        first_ts: u64,
+        seq: u64,
+        patch: Arc<crate::tx::RoomTxPatch>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,6 +1389,22 @@ impl Msg {
             Msg::CellShiftAck {seq, ..} => ts_ok(*seq),
             Msg::CellShiftResync => true,
             Msg::CellShiftRejected {id, reason, ..} => *id>0 && reason.len()<=MAX_SHORT_TEXT,
+            Msg::RoomTxRequest { id, revision, patch, .. } => {
+                *id > 0 && *revision <= MAX_LOGICAL_TS as usize && patch.wire_valid()
+            }
+            Msg::RoomTxCommitted { id, first_ts, seq, patch, .. } => {
+                *id > 0
+                    && ts_ok(*seq)
+                    && first_ts
+                        .checked_add(patch.cell_op_count() as u64)
+                        .is_some_and(ts_ok)
+                    && patch.wire_valid()
+            }
+            Msg::RoomTxRejected { reason, .. } => reason.len() <= MAX_SHORT_TEXT,
+            Msg::RoomTxAck { seq, .. } => ts_ok(*seq),
+            Msg::RoomTxReceipt { id, first_ts, seq, patch, .. } => {
+                *id > 0 && ts_ok(*seq) && ts_ok(*first_ts) && patch.wire_valid()
+            }
             Msg::LockReq { sheet, row, col, name, .. } | Msg::LockOk { sheet, row, col, name, .. } => {
                 cell_in_bounds(*sheet, *row, *col) && name.len() <= MAX_SHORT_TEXT
             }
@@ -2239,6 +2430,51 @@ impl BaselineBook {
             }
         }
     }
+
+    pub fn permute_axis(
+        &mut self,
+        target_sheet: usize,
+        axis: crate::refs::Axis,
+        from: u32,
+        n: u32,
+        at: u32,
+    ) {
+        let Some(tx) = crate::transform::CoordTransform::from_axis_permute(
+            target_sheet,
+            axis,
+            from,
+            n,
+            at,
+        ) else {
+            return;
+        };
+        let Some(target_name) = self.sheets.get(target_sheet).map(|s| s.name.clone()) else {
+            return;
+        };
+        let rows = axis == crate::refs::Axis::Row;
+        let lo = from.min(at);
+        let hi = from.saturating_add(n).max(at.saturating_add(n));
+        let perm = |v: u32| crate::refs::permute_index(v, from, n, at);
+        if let Some(sh) = self.sheets.get_mut(target_sheet) {
+            sh.permute_cell_band(rows, lo, hi, perm);
+            let axis_styles = if rows { &mut sh.row_styles } else { &mut sh.col_styles };
+            if !axis_styles.is_empty() && axis_styles.keys().any(|&p| p >= lo && p < hi) {
+                let old = std::mem::take(axis_styles);
+                let mut out = HashMap::with_capacity(old.len());
+                for (p, st) in old {
+                    out.insert(perm(p), st);
+                }
+                if rows {
+                    sh.row_styles = out.into();
+                } else {
+                    sh.col_styles = out.into();
+                }
+            }
+        }
+        for sh in &mut self.sheets {
+            tx.rewrite_sheet_cell_formulas(sh, &target_name);
+        }
+    }
 }
 
 /// 一个副本的状态机（与网络无关，便于单元测试）
@@ -2320,6 +2556,104 @@ pub fn shift_coord_set(
     coords.extend(moved);
 }
 
+/// Bijectively permute only entries inside `[lo, hi)` on `sheet` in `O(occupied_in_band)`.
+pub fn permute_cell_map<V>(
+    cells: &mut BTreeMap<(usize, u32, u32), V>,
+    sheet: usize,
+    axis: crate::refs::Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+    mut relocate: impl FnMut(&mut V, u32, u32),
+) {
+    let limit = match axis {
+        crate::refs::Axis::Row => MAX_ROWS,
+        crate::refs::Axis::Col => MAX_COLS,
+    };
+    if n == 0
+        || from == at
+        || from.checked_add(n).is_none_or(|e| e > limit)
+        || at.checked_add(n).is_none_or(|e| e > limit)
+    {
+        return;
+    }
+    let lo = from.min(at);
+    let hi_incl = from.saturating_add(n).max(at.saturating_add(n)) - 1;
+    let mut moved = Vec::new();
+    let mut extract = |map: &mut BTreeMap<_, V>, first, last| {
+        for ((_, r, c), mut value) in map.extract_if(first..=last, |_, _| true) {
+            if let Some((row, col)) = permute_axis_coord(r, c, axis, from, n, at) {
+                relocate(&mut value, row, col);
+                moved.push(((sheet, row, col), value));
+            }
+        }
+    };
+    match axis {
+        crate::refs::Axis::Row => {
+            extract(cells, (sheet, lo, 0), (sheet, hi_incl, u32::MAX));
+        }
+        crate::refs::Axis::Col => {
+            let mut start = 0;
+            while let Some((&(_, row, _), _)) =
+                cells.range((sheet, start, 0)..=(sheet, u32::MAX, u32::MAX)).next()
+            {
+                extract(cells, (sheet, row, lo), (sheet, row, hi_incl));
+                let Some(next) = row.checked_add(1) else { break };
+                start = next;
+            }
+        }
+    }
+    cells.extend(moved);
+}
+
+/// Bijectively permute only coordinates inside `[lo, hi)` on `sheet` in `O(occupied_in_band)`.
+pub fn permute_coord_set(
+    coords: &mut BTreeSet<(usize, u32, u32)>,
+    sheet: usize,
+    axis: crate::refs::Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+) {
+    let limit = match axis {
+        crate::refs::Axis::Row => MAX_ROWS,
+        crate::refs::Axis::Col => MAX_COLS,
+    };
+    if n == 0
+        || from == at
+        || from.checked_add(n).is_none_or(|e| e > limit)
+        || at.checked_add(n).is_none_or(|e| e > limit)
+    {
+        return;
+    }
+    let lo = from.min(at);
+    let hi_incl = from.saturating_add(n).max(at.saturating_add(n)) - 1;
+    let mut moved = Vec::new();
+    let mut extract = |set: &mut BTreeSet<(usize, u32, u32)>, first, last| {
+        for (_, r, c) in set.extract_if(first..=last, |_| true) {
+            if let Some((row, col)) = permute_axis_coord(r, c, axis, from, n, at) {
+                moved.push((sheet, row, col));
+            }
+        }
+    };
+    match axis {
+        crate::refs::Axis::Row => {
+            extract(coords, (sheet, lo, 0), (sheet, hi_incl, u32::MAX));
+        }
+        crate::refs::Axis::Col => {
+            let mut start = 0;
+            while let Some(&(_, row, _)) =
+                coords.range((sheet, start, 0)..=(sheet, u32::MAX, u32::MAX)).next()
+            {
+                extract(coords, (sheet, row, lo), (sheet, row, hi_incl));
+                let Some(next) = row.checked_add(1) else { break };
+                start = next;
+            }
+        }
+    }
+    coords.extend(moved);
+}
+
 #[test]
 fn sort_permutation_validates_bounds_and_defaults_old_hello_to_legacy() {
     let mut sort = SortPermutation { structural_revision: 0, sheet: 1, name: "one".into(), region: (3,7,6,9),
@@ -2333,9 +2667,9 @@ fn sort_permutation_validates_bounds_and_defaults_old_hello_to_legacy() {
     sort.horizontal = false;
     assert!(!sort.valid());
     let hello: Msg = serde_json::from_str(r#"{"t":"Hello","site":1,"name":"a","doc":"d","proof":"p"}"#).unwrap();
-    assert!(matches!(hello,Msg::Hello { sort_permutation: false, palette_styles: false, resume_watermark: 0, binary_v3: false, .. }));
+    assert!(matches!(hello,Msg::Hello { sort_permutation: false, palette_styles: false, resume_watermark: 0, binary_v3: false, room_tx: false, .. }));
     let welcome: Msg = serde_json::from_str(r#"{"t":"Welcome","site":2,"doc":"d","peers":[]}"#).unwrap();
-    assert!(matches!(welcome, Msg::Welcome { binary_v3: false, .. }));
+    assert!(matches!(welcome, Msg::Welcome { binary_v3: false, room_tx: false, .. }));
 }
 
 #[test]
@@ -2498,6 +2832,29 @@ impl CellOps {
             }
         }
     }
+
+    /// 仅对实际含公式的覆盖单元格执行整行/整列块移动引用改写
+    pub fn rewrite_formulas_axis_permute(
+        &mut self,
+        names: &[String],
+        target_sheet: usize,
+        axis: crate::refs::Axis,
+        from: u32,
+        n: u32,
+        at: u32,
+    ) {
+        if n == 0 || from == at || names.get(target_sheet).is_none() {
+            return;
+        }
+        for &key in &self.formula_keys {
+            if let Some(cell) = self.overlay.get_mut(&key) {
+                if let Some(formula) = cell.permuted_formula(names, target_sheet, axis, from, n, at)
+                {
+                    Arc::make_mut(cell).formula = Some(Arc::from(formula));
+                }
+            }
+        }
+    }
 }
 
 impl std::ops::Index<&(usize, u32, u32)> for CellOps {
@@ -2523,6 +2880,26 @@ impl Op {
         let rewritten = crate::refs::rewrite(formula,shifts.get(self.sheet)?);
         (rewritten != formula).then_some(rewritten)
     }
+
+    pub fn permuted_formula(
+        &self,
+        names: &[String],
+        target_sheet: usize,
+        axis: crate::refs::Axis,
+        from: u32,
+        n: u32,
+        at: u32,
+    ) -> Option<String> {
+        if n == 0 || from == at {
+            return None;
+        }
+        let formula = self.formula.as_deref()?;
+        let target_name = names.get(target_sheet)?;
+        let own_name = names.get(self.sheet)?;
+        let rewritten =
+            crate::refs::permute_axis(formula, axis, from, n, at, target_name, own_name);
+        (rewritten != formula).then_some(rewritten)
+    }
 }
 
 pub fn shift_cell_ops(cells: &mut CellOps, sheet: usize, op: &crate::structural::Structural) {
@@ -2536,6 +2913,28 @@ pub fn shift_cell_ops(cells: &mut CellOps, sheet: usize, op: &crate::structural:
         shift_coord_set(&mut cells.removed_baseline, sheet, op);
         if let Some(base) = &mut cells.baseline {
             base.shift_structural(sheet, op);
+        }
+    }
+}
+
+pub fn permute_cell_ops(
+    cells: &mut CellOps,
+    sheet: usize,
+    axis: crate::refs::Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+) {
+    permute_cell_map(&mut cells.overlay, sheet, axis, from, n, at, |op, row, col| {
+        let cell = Arc::make_mut(op);
+        cell.row = row;
+        cell.col = col;
+    });
+    permute_coord_set(&mut cells.formula_keys, sheet, axis, from, n, at);
+    if cells.baseline.is_some() {
+        permute_coord_set(&mut cells.removed_baseline, sheet, axis, from, n, at);
+        if let Some(base) = &mut cells.baseline {
+            base.permute_axis(sheet, axis, from, n, at);
         }
     }
 }
@@ -2646,6 +3045,33 @@ impl Peer {
         shift_cell_ops(&mut self.cells, sheet, op);
         let shifts = structural_reference_shifts(names, sheet, op);
         self.cells.rewrite_formulas(&shifts);
+    }
+
+    /// 整行/整列块移动后同步双射置换副本状态坐标
+    pub fn permute_axis(
+        &mut self,
+        sheet: usize,
+        axis: crate::refs::Axis,
+        from: u32,
+        n: u32,
+        at: u32,
+    ) {
+        permute_cell_ops(&mut self.cells, sheet, axis, from, n, at);
+    }
+
+    /// 整行/整列块移动后双射置换副本坐标，并仅针对实际含公式的单元格改写引用
+    pub fn permute_axis_with_formulas(
+        &mut self,
+        names: &[String],
+        sheet: usize,
+        axis: crate::refs::Axis,
+        from: u32,
+        n: u32,
+        at: u32,
+    ) {
+        permute_cell_ops(&mut self.cells, sheet, axis, from, n, at);
+        self.cells
+            .rewrite_formulas_axis_permute(names, sheet, axis, from, n, at);
     }
 
     pub fn snapshot(&self) -> Vec<Op> {

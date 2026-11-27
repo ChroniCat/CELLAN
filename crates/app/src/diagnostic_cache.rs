@@ -12,8 +12,7 @@ use std::{
 
 #[derive(Clone, PartialEq)]
 struct SheetCells {
-    document: u64,
-    sheet: u64,
+    gate: crate::bg_gate::CoordGate,
     cells: CellVersion,
 }
 
@@ -184,6 +183,97 @@ mod tests {
         settle(&mut app, &ctx);
         assert!(!app.error_marks.contains(&(2, 0)));
     }
+
+    #[test]
+    fn phase5_bg_gate_diagnostic_cache_invalidates_on_coord_epoch_and_keeps_other_sheet_edit() {
+        use sheetcore::structural::{Structural, apply_structural_wb};
+
+        let _env = crate::test_env::TestEnv::new("phase5-bg-gate-diagnostics");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.wb.sheets.push(Sheet::new("Other"));
+        for r in 0..1_600u32 {
+            app.wb.sheets[0].set(
+                r,
+                0,
+                Cell {
+                    value: Value::Number(8.0),
+                    formula: None,
+                },
+            );
+        }
+        app.wb.sheets[0].set(
+            0,
+            0,
+            Cell {
+                value: Value::Number(1.0),
+                formula: Some("=Target".into()),
+            },
+        );
+        app.wb.names.push(("Target".into(), None, "A1".into()));
+        let mut style = app.wb.styles.get(0).clone();
+        style.format = "@".into();
+        let text_sid = app.wb.styles.intern(style);
+        app.wb.sheets[0].set_style(2, 0, text_sid);
+        app.ec.background = true;
+        app.ec.check_text = true;
+
+        settle(&mut app, &ctx);
+        assert_eq!(app.cycles, [(0, 0)]);
+        assert!(app.error_marks.contains(&(2, 0)));
+
+        // Ordinary non-coordinate edit on sheet 1 must NOT invalidate sheet-0 cached diagnostics.
+        app.wb.sheets[1].set(
+            5,
+            5,
+            Cell {
+                value: Value::Number(99.0),
+                formula: None,
+            },
+        );
+        app.doc_gen += 1;
+        app.refresh_diagnostics(&ctx);
+        assert_eq!(app.cycles, [(0, 0)]);
+        assert!(app.error_marks.contains(&(2, 0)));
+        assert!(app.diagnostics.pending.is_none());
+
+        // Trigger a background worker scan, hold its output, then advance wb.coord_epoch() on sheet 1.
+        app.wb.sheets[0].set(
+            3,
+            0,
+            Cell {
+                value: Value::Number(12.0),
+                formula: None,
+            },
+        );
+        app.doc_gen += 1;
+        app.refresh_diagnostics(&ctx);
+        let worker = app.diagnostics.worker.as_mut().unwrap();
+        let (deliver, temporary) = mpsc::channel();
+        let original = std::mem::replace(&mut worker.outputs, temporary);
+        let stale_out = original
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(stale_out.cycles, [(0, 0)]);
+        assert!(stale_out.marks.contains(&(2, 0)));
+
+        apply_structural_wb(&mut app.wb, 1, &Structural::InsertRows { at: 0, n: 1 });
+        deliver.send(stale_out).unwrap();
+        app.refresh_diagnostics(&ctx);
+        // Stale cache retired immediately AND stale worker result from the old coord_epoch rejected!
+        assert!(app.cycles.is_empty());
+        assert!(app.error_marks.is_empty());
+
+        // Restoring worker outputs and settling recomputes fresh diagnostics at the new coord_epoch.
+        app.diagnostics.worker.as_mut().unwrap().outputs = original;
+        settle(&mut app, &ctx);
+        assert_eq!(app.cycles, [(0, 0)]);
+        assert!(app.error_marks.contains(&(2, 0)));
+        assert_eq!(
+            app.diagnostics.marks.as_ref().unwrap().source.gate.coord_epoch,
+            app.wb.coord_epoch()
+        );
+    }
 }
 
 #[derive(PartialEq)]
@@ -349,10 +439,11 @@ impl Diagnostics {
 
 impl SheetApp {
     pub(super) fn refresh_diagnostics(&mut self, ctx: &egui::Context) {
+        let gate = crate::bg_gate::CoordGate::sheet(self.doc_uid, &self.wb, self.sheet_idx)
+            .unwrap_or_else(|| crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb));
         let sheet: &Sheet = self.wb.sheet(self.sheet_idx);
         let source = SheetCells {
-            document: self.doc_uid,
-            sheet: sheet.identity,
+            gate,
             cells: sheet.cell_version().clone(),
         };
         let styles = sheet.display_style_revision();
@@ -372,9 +463,13 @@ impl SheetApp {
             .diagnostics
             .marks
             .as_ref()
-            .is_some_and(|m| m.source.document != source.document || m.source.sheet != source.sheet)
+            .is_some_and(|m| {
+                m.source.gate.is_stale(self.doc_uid, &self.wb)
+                    || m.source.gate.sheet_idx != Some(self.sheet_idx)
+            })
             || self.diagnostics.cycles.as_ref().is_some_and(|c| {
-                c.source.document != source.document || c.source.sheet != source.sheet
+                c.source.gate.is_stale(self.doc_uid, &self.wb)
+                    || c.source.gate.sheet_idx != Some(self.sheet_idx)
             })
         {
             self.retire_diagnostics();
@@ -515,7 +610,7 @@ impl SheetApp {
         let Some((source, stop)) = &worker.active else {
             return;
         };
-        if *source != observed.source {
+        if *source != observed.source || source.gate.is_stale(self.doc_uid, &self.wb) {
             stop.store(true, Ordering::Relaxed);
         }
         let mut out = match worker.outputs.try_recv() {
@@ -529,19 +624,17 @@ impl SheetApp {
         let cancelled = stop.load(Ordering::Relaxed);
         worker.active = None;
         if !cancelled {
-            if out
-                .mark_key
-                .as_ref()
-                .is_some_and(|m| m.matches(observed, self.wb.sheet(self.sheet_idx)))
-            {
+            if out.mark_key.as_ref().is_some_and(|m| {
+                !m.source.gate.is_stale(self.doc_uid, &self.wb)
+                    && m.matches(observed, self.wb.sheet(self.sheet_idx))
+            }) {
                 std::mem::swap(&mut out.marks, &mut self.error_marks);
                 std::mem::swap(&mut out.mark_key, &mut self.diagnostics.marks);
             }
-            if out
-                .cycle_key
-                .as_ref()
-                .is_some_and(|c| c.matches(&observed.source, &self.wb))
-            {
+            if out.cycle_key.as_ref().is_some_and(|c| {
+                !c.source.gate.is_stale(self.doc_uid, &self.wb)
+                    && c.matches(&observed.source, &self.wb)
+            }) {
                 std::mem::swap(&mut out.cycles, &mut self.cycles);
                 std::mem::swap(&mut out.cycle_key, &mut self.diagnostics.cycles);
             }

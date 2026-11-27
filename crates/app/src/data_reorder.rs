@@ -177,8 +177,7 @@ fn sort_ready_and_optimistic_style_follow_host_order_on_the_writing_guest() {
         let event=guest_net.events.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         if let crate::net::NetEvent::Sort(plan,reply) = event {
             let sh=guest.wb.sheet(0);
-            let target=crate::net_sort::SortTarget { document:guest.doc_uid,sheet:0,
-                identity:sh.identity,coordinates:sh.coordinate_revision() };
+            let target=crate::net_sort::SortTarget::capture(guest.doc_uid,&guest.wb,0).unwrap();
             guest_net.check_sort(target,plan,sh.search_snapshot(),guest.wb.styles.clone(),reply);
             break;
         }
@@ -438,6 +437,49 @@ fn pending_sort_does_not_cross_room_boundaries() {
     }
 }
 
+#[test]
+fn phase5_bg_gate_data_reorder_rejects_coord_epoch_advance_and_keeps_ordinary_edit() {
+    use sheetcore::structural::{Structural, apply_structural_wb};
+
+    let _env = crate::test_env::TestEnv::new("phase5-bg-gate-reorder");
+    let mut app = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+    app.wb.sheets.push(Sheet::new("Other"));
+    let number = |n| sheetcore::Cell { value: sheetcore::Value::Number(n), formula: None };
+    app.wb.sheets[0].set(0, 0, number(2.0));
+    app.wb.sheets[0].set(1, 0, number(1.0));
+
+    // Start async reorder (> ASYNC_REORDER_CELLS), then advance wb.coord_epoch() on sheet 1.
+    app.sort_region((0, 0, 20_005, 0), 0, true);
+    assert!(app.tasks.reorder.is_some());
+    let rev_before = app.wb.sheet(0).coordinate_revision();
+    apply_structural_wb(&mut app.wb, 1, &Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(app.wb.sheet(0).coordinate_revision(), rev_before);
+    let start = std::time::Instant::now();
+    while app.tasks.reorder.is_some() {
+        app.poll_reorder();
+        assert!(start.elapsed().as_secs() < 30);
+        std::thread::yield_now();
+    }
+    assert_eq!(app.wb.sheets[0].value(0, 0), sheetcore::Value::Number(2.0));
+    assert_eq!(app.undo.depth(), (0, 0));
+    assert!(app.status.contains("已改变"), "{}", app.status);
+
+    // Ordinary non-coordinate cell edit on sheet 1 must NOT block background reorder commit.
+    app.sort_region((0, 0, 20_005, 0), 0, true);
+    assert!(app.tasks.reorder.is_some());
+    app.wb.sheets[1].set(2, 2, number(77.0));
+    app.doc_gen += 1;
+    let start = std::time::Instant::now();
+    while app.tasks.reorder.is_some() {
+        app.poll_reorder();
+        assert!(start.elapsed().as_secs() < 30);
+        std::thread::yield_now();
+    }
+    assert_eq!(app.wb.sheets[0].value(0, 0), sheetcore::Value::Number(1.0));
+    assert_eq!(app.wb.sheets[0].value(1, 0), sheetcore::Value::Number(2.0));
+    assert_eq!(app.undo.depth(), (1, 0));
+}
+
 type Rect = (u32, u32, u32, u32);
 
 pub(super) enum Operation {
@@ -561,6 +603,7 @@ type PrebuiltSortItem = (
 pub(crate) struct Pending {
     sheet: usize,
     target: super::sheet_edit_target::SheetEditTarget,
+    gate: crate::bg_gate::CoordGate,
     rect: Rect,
     operation: std::sync::Arc<Operation>,
     rx: Receiver<Result<(Sheet, Sheet, PreparedChanges), String>>,
@@ -990,9 +1033,12 @@ impl SheetApp {
             })();
             let _ = tx.send(result);
         });
+        let gate = crate::bg_gate::CoordGate::sheet(self.doc_uid, &self.wb, index)
+            .unwrap_or_else(|| crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb));
         self.tasks.reorder = Some(Pending {
             sheet: index,
             target: super::sheet_edit_target::SheetEditTarget::current(self,self.sel),
+            gate,
             rect,
             operation: op,
             rx,
@@ -1019,8 +1065,11 @@ impl SheetApp {
                 return;
             }
         };
-        if !pending.target.valid(self) {
+        if pending.gate.matches_sheet(self.doc_uid, &self.wb) != Some(pending.sheet)
+            || !pending.target.valid(self)
+        {
             self.status = "目标表或协作状态已改变，请重新执行数据操作".into();
+            std::thread::spawn(move || drop((source, prepared)));
             return;
         }
         let current = self.wb.sheet(pending.sheet);

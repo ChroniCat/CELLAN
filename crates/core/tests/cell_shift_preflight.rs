@@ -775,12 +775,15 @@ fn preflight_blocks_chart_sparkline_protected_range_scenario_and_partial_hyperli
     use sheetcore::scenarios::Scenario;
     use sheetcore::sparkline::Sparkline;
 
-    // 1. Chart data ref (target & foreign sheet) intersecting ray blocked; outside allowed
+    // 1. Chart data ref (target & foreign sheet) now transforms cleanly under CellShift
+    //    without moving floating drawing anchors.
     let mut wb_ch = Workbook::new_blank();
     wb_ch.sheets[0].name = "Data".into();
     let mut other = Sheet::new("Charts");
     other.charts.push(Chart {
         kind: ChartKind::Column,
+        anchor: (1, 1, 8, 6),
+        source_range: "Data!$B$2:$B$5".into(),
         series: vec![Series {
             val_ref: "Data!$B$2:$B$5".into(),
             ..Series::default()
@@ -788,17 +791,19 @@ fn preflight_blocks_chart_sparkline_protected_range_scenario_and_partial_hyperli
         ..Chart::default()
     });
     wb_ch.sheets.push(other);
-    assert_blocked(
-        &mut wb_ch,
-        0,
-        CellShift::new((0, 1, 0, 1), Shift::Vertical, true),
-        CellShiftConflict::Chart,
+    let ch_op = CellShift::new((0, 1, 0, 1), Shift::Vertical, true);
+    assert_eq!(ch_op.preflight(&wb_ch, 0), Ok(()));
+    assert!(ch_op.apply(&mut wb_ch, 0));
+    assert_eq!(wb_ch.sheets[1].charts[0].anchor, (1, 1, 8, 6));
+    assert_eq!(wb_ch.sheets[1].charts[0].source_range, "Data!$B$3:$B$6");
+    assert_eq!(wb_ch.sheets[1].charts[0].series[0].val_ref, "Data!$B$3:$B$6");
+    assert_eq!(
+        wb_ch.sheets[1].charts[0].ref_fixes,
+        vec![("Data!$B$2:$B$5".into(), "Data!$B$3:$B$6".into())]
     );
-    assert_blocked(
-        &mut wb_ch,
-        0,
-        CellShift::new((2, 0, 2, 0), Shift::Horizontal, false),
-        CellShiftConflict::Chart,
+    assert_eq!(
+        CellShift::new((2, 0, 2, 0), Shift::Horizontal, false).preflight(&wb_ch, 0),
+        Ok(())
     );
     assert_eq!(
         CellShift::new((0, 0, 0, 0), Shift::Vertical, true).preflight(&wb_ch, 0),
@@ -809,7 +814,8 @@ fn preflight_blocks_chart_sparkline_protected_range_scenario_and_partial_hyperli
         Ok(())
     );
 
-    // 2. Sparkline anchor & cross-sheet data rect blocked; outside allowed
+    // 2. Sparkline: anchor & wholly-in-band data rect transform cleanly;
+    //    partial band-straddling or wholly-emptied data rect is still blocked.
     let mut wb_sp = Workbook::new_blank();
     wb_sp.sheets[0].name = "Data".into();
     wb_sp.sheets[0].sparklines.push(Sparkline {
@@ -819,18 +825,31 @@ fn preflight_blocks_chart_sparkline_protected_range_scenario_and_partial_hyperli
         rect: (2, 1, 2, 2),
         ..Default::default()
     });
+    // Partial band straddle on data rect (cols B:C vs band col B) -> blocked!
     assert_blocked(
         &mut wb_sp,
         0,
-        CellShift::new((0, 4, 0, 4), Shift::Vertical, true), // hits anchor
+        CellShift::new((0, 1, 0, 1), Shift::Vertical, true),
         CellShiftConflict::Sparkline,
     );
+    // Wholly deleting data rect (B3:C3) while anchor (2,4) survives -> blocked!
     assert_blocked(
         &mut wb_sp,
         0,
-        CellShift::new((0, 1, 0, 1), Shift::Vertical, true), // hits data rect
+        CellShift::new((2, 1, 2, 2), Shift::Vertical, false),
         CellShiftConflict::Sparkline,
     );
+    // Anchor shift in moving ray -> allowed and shifts anchor from (2,4) to (3,4)
+    let sp_anchor_op = CellShift::new((0, 4, 0, 4), Shift::Vertical, true);
+    assert_eq!(sp_anchor_op.preflight(&wb_sp, 0), Ok(()));
+    assert!(sp_anchor_op.apply(&mut wb_sp, 0));
+    assert_eq!((wb_sp.sheets[0].sparklines[0].r, wb_sp.sheets[0].sparklines[0].c), (3, 4));
+    assert_eq!(wb_sp.sheets[0].sparklines[0].rect, (2, 1, 2, 2));
+    // Wholly-in-band data rect shift (cols B:C) -> allowed and shifts rect from (2,1,2,2) to (3,1,3,2)
+    let sp_data_op = CellShift::new((0, 1, 0, 2), Shift::Vertical, true);
+    assert_eq!(sp_data_op.preflight(&wb_sp, 0), Ok(()));
+    assert!(sp_data_op.apply(&mut wb_sp, 0));
+    assert_eq!(wb_sp.sheets[0].sparklines[0].rect, (3, 1, 3, 2));
     assert_eq!(
         CellShift::new((0, 0, 0, 0), Shift::Vertical, true).preflight(&wb_sp, 0),
         Ok(())

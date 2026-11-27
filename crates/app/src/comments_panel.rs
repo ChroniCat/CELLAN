@@ -535,7 +535,7 @@ impl SheetApp {
             self.status = err.clone();
             return Err(err);
         }
-        self.undo.push_meta(
+        self.commit_meta_tx(
             if old_note.is_some() || old_thread.is_some() {
                 "编辑批注"
             } else {
@@ -552,10 +552,10 @@ impl SheetApp {
                 },
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            false,
+            Vec::new(),
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.tasks.last_edit = Some(std::time::Instant::now());
         self.status = format!("已保存 {} 的批注", cell_name(r, c));
         Ok(true)
     }
@@ -692,7 +692,7 @@ impl SheetApp {
             return Err(err);
         }
         let count = new_tc.entries.len();
-        self.undo.push_meta(
+        self.commit_meta_tx(
             "回复批注线程",
             (sheet, r, c),
             sheetcore::undo::MetaEdit {
@@ -701,10 +701,10 @@ impl SheetApp {
                 threads: vec![((r, c), old_thread, Some(new_tc))],
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            false,
+            Vec::new(),
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.tasks.last_edit = Some(std::time::Instant::now());
         self.status = format!("已在 {} 添加线程回复", cell_name(r, c));
         Ok(count)
     }
@@ -808,7 +808,7 @@ impl SheetApp {
             self.status = err.clone();
             return Err(err);
         }
-        self.undo.push_meta(
+        self.commit_meta_tx(
             if resolved {
                 "标记批注已解决"
             } else {
@@ -821,10 +821,10 @@ impl SheetApp {
                 threads: vec![((r, c), old_thread, Some(new_tc))],
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            false,
+            Vec::new(),
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.tasks.last_edit = Some(std::time::Instant::now());
         self.status = format!(
             "已将 {} 批注标记为{}",
             cell_name(r, c),
@@ -924,7 +924,7 @@ impl SheetApp {
                 for (r, c, seed_root) in bcast_resolves {
                     let _ = self.broadcast_thread_resolve_meta(si, r, c, seed_root, resolved);
                 }
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     if resolved {
                         "批量标记批注已解决"
                     } else {
@@ -937,13 +937,13 @@ impl SheetApp {
                         threads: thread_diffs,
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
             }
         }
         if total_changed > 0 {
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             self.status = format!(
                 "已批量将 {total_changed} 条批注标记为{}",
                 if resolved { "已解决" } else { "未解决" }
@@ -1015,7 +1015,7 @@ impl SheetApp {
             if !note_diffs.is_empty() || !thread_diffs.is_empty() {
                 self.broadcast_comment_diffs(si, &note_diffs, &thread_diffs);
                 let focus = (si, coords[0].0, coords[0].1);
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     label,
                     focus,
                     sheetcore::undo::MetaEdit {
@@ -1024,13 +1024,13 @@ impl SheetApp {
                         threads: thread_diffs,
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
             }
         }
         if total_deleted > 0 {
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             self.status = format!("已删除 {total_deleted} 条批注");
         }
         total_deleted
@@ -1173,7 +1173,7 @@ impl SheetApp {
             self.status = err.clone();
             return Err(err);
         }
-        self.undo.push_meta(
+        self.commit_meta_tx(
             "替换批注",
             (sheet, r, c),
             sheetcore::undo::MetaEdit {
@@ -1190,10 +1190,10 @@ impl SheetApp {
                 },
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            false,
+            Vec::new(),
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.tasks.last_edit = Some(std::time::Instant::now());
         Ok(true)
     }
 
@@ -1311,7 +1311,7 @@ impl SheetApp {
             if !note_diffs.is_empty() || !thread_diffs.is_empty() {
                 self.broadcast_comment_diffs(si, &note_diffs, &thread_diffs);
                 let focus = (si, coords[0].0, coords[0].1);
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "全部替换批注",
                     focus,
                     sheetcore::undo::MetaEdit {
@@ -1320,13 +1320,13 @@ impl SheetApp {
                         threads: thread_diffs,
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
             }
         }
         if total > 0 {
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             self.status = format!("已在 {total} 条批注中完成替换");
         } else {
             self.status = format!("未在批注中找到可替换的「{needle}」");

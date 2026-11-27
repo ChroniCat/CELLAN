@@ -1099,6 +1099,42 @@ impl Sheet {
         self.hidden || self.very_hidden
     }
 
+    /// Read-only worksheet name accessor.
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Stable runtime worksheet identity accessor.
+    #[inline]
+    pub fn identity(&self) -> u64 {
+        self.identity
+    }
+
+    /// Read-only view of charts on this sheet.
+    #[inline]
+    pub fn charts(&self) -> &[crate::charts::Chart] {
+        &self.charts
+    }
+
+    /// Read-only view of sparklines on this sheet.
+    #[inline]
+    pub fn sparklines(&self) -> &[crate::sparkline::Sparkline] {
+        &self.sparklines
+    }
+
+    /// Read-only view of merged cell ranges on this sheet.
+    #[inline]
+    pub fn merges(&self) -> &[(u32, u32, u32, u32)] {
+        &self.merges
+    }
+
+    /// Read-only view of structured tables on this sheet.
+    #[inline]
+    pub fn tables(&self) -> &[crate::table::Table] {
+        &self.tables
+    }
+
     pub fn visibility(&self) -> SheetVisibility {
         if self.very_hidden {
             SheetVisibility::VeryHidden
@@ -2274,6 +2310,36 @@ impl Workbook {
     pub fn sheet_mut(&mut self, idx: usize) -> &mut Sheet {
         let i = idx.min(self.sheets.len() - 1);
         &mut self.sheets[i]
+    }
+
+    /// Number of worksheets in the workbook.
+    #[inline]
+    pub fn sheet_count(&self) -> usize {
+        self.sheets.len()
+    }
+
+    /// Checked read-only worksheet accessor.
+    #[inline]
+    pub fn sheet_opt(&self, idx: usize) -> Option<&Sheet> {
+        self.sheets.get(idx)
+    }
+
+    /// Read-only view of workbook defined names `(name, scope_sheet_idx, formula)`.
+    #[inline]
+    pub fn defined_names(&self) -> &[(String, Option<usize>, String)] {
+        &self.names
+    }
+
+    /// Read-only view of workbook external/internal data source bindings.
+    #[inline]
+    pub fn external_sources(&self) -> &[crate::external::Source] {
+        &self.sources
+    }
+
+    /// Read-only view of first-class pivot table models.
+    #[inline]
+    pub fn pivot_tables(&self) -> &[crate::pivot_engine::PivotTableModel] {
+        &self.pivots
     }
 
     pub fn title(&self) -> String {

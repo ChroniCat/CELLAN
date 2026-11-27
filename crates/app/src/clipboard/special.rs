@@ -97,7 +97,11 @@ impl SheetApp {
             sh.cols.set_many((c0..).zip(widths));
             if prior_revision != sh.cols.revision() {
                 sh.layout_dirty = true;
-                self.undo.push_meta(
+                if let Some(net) = self.net.as_ref() {
+                    let synced = net.broadcast_sheet_meta(si, sheetcore::sync::SheetMetaKind::ColWidths(sync_widths));
+                    self.mark_sheet_layout_synced(si, synced && layout_ok_before);
+                }
+                self.commit_meta_tx(
                     "粘贴列宽",
                     (si, r0, c0),
                     sheetcore::undo::MetaEdit {
@@ -105,17 +109,13 @@ impl SheetApp {
                         col_widths: before_widths,
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
-                if let Some(net) = self.net.as_ref() {
-                    let synced = net.broadcast_sheet_meta(si, sheetcore::sync::SheetMetaKind::ColWidths(sync_widths));
-                    self.mark_sheet_layout_synced(si, synced && layout_ok_before);
-                }
-                self.wb.dirty = true;
-                self.doc_gen = self.doc_gen.wrapping_add(1);
                 if was_shared_only && self.is_delegated_collab_client() {
                     self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
                 }
-                self.tasks.last_edit = Some(std::time::Instant::now());
             }
             self.status = format!("已粘贴 {width} 列宽");
             return;
@@ -656,7 +656,7 @@ impl SheetApp {
         if self.ps_kind == 8 {
             if !note_undo.is_empty() || !thread_undo.is_empty() {
                 self.broadcast_comment_diffs(si_cur, &note_undo, &thread_undo);
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "粘贴批注",
                     (si_cur, r0, c0),
                     sheetcore::undo::MetaEdit {
@@ -665,13 +665,16 @@ impl SheetApp {
                         threads: thread_undo,
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
             }
         } else if self.ps_kind == 9 {
             if let Some(before) = before_dv {
                 let after = self.wb.sheet(si_cur).dv.clone();
                 if before != after {
-                    self.undo.push_meta(
+                    self.commit_meta_tx(
                         "粘贴数据验证",
                         (si_cur, r0, c0),
                         sheetcore::undo::MetaEdit {
@@ -679,6 +682,9 @@ impl SheetApp {
                             dv: Some((before, after)),
                             ..Default::default()
                         },
+                        sheetcore::tx::RecalcScope::None,
+                        true,
+                        Vec::new(),
                     );
                 }
             }

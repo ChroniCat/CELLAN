@@ -66,6 +66,8 @@ pub mod style_theme;
 pub mod sort_filter;
 pub mod store;
 pub mod structural;
+pub mod participant;
+pub mod room_tx;
 pub mod transform;
 pub mod tx;
 pub mod undo;
