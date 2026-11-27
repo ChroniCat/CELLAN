@@ -1279,8 +1279,6 @@ struct SheetApp {
     shared_cell_generation: Option<(u64, u64)>,
     /// Per-(doc_uid, sheet.identity) layout revisions whose `layout_dirty` state was synced to the collab host.
     synced_layout_revs: std::collections::HashMap<(u64, u64), (u64, u64, u64, u64)>,
-    /// 标题栏搜索框
-    search: String,
     /// 缩放对话框（百分比）
     zoom_dlg: Option<f32>,
     /// 手动计算模式
@@ -2593,7 +2591,6 @@ impl SheetApp {
             shared_client_source: None,
             shared_cell_generation: None,
             synced_layout_revs: std::collections::HashMap::new(),
-            search: String::new(),
             zoom_dlg: None,
             manual_calc: false,
             watch_open: false,
@@ -49121,6 +49118,10 @@ impl Drop for SheetApp {
 impl SheetApp {
     /// 无边框窗口的边缘缩放：四周 5px 内按下就交给系统拖动改大小
     fn window_resize_edges(&self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        if win_chrome::handles_native_resize() {
+            return;
+        }
         if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             return;
         }
@@ -49179,7 +49180,10 @@ impl eframe::App for SheetApp {
         // 运行时主题实时同步（浅色 / 护眼 / 深色 / 高对比）；首次启动仅初始化视觉样式，不递增 doc_gen
         if self.theme_applied != Some(self.prefs.theme) {
             let switched = self.theme_applied.is_some();
-            theme::apply_app_theme(ctx, theme::AppTheme::from_u8(self.prefs.theme));
+            let app_theme = theme::AppTheme::from_u8(self.prefs.theme);
+            theme::apply_app_theme(ctx, app_theme);
+            #[cfg(windows)]
+            win_chrome::apply_frame_theme(app_theme.is_dark());
             self.theme_applied = Some(self.prefs.theme);
             if switched {
                 self.cf_inputs.grid.cells.clear();
@@ -51352,6 +51356,17 @@ impl eframe::App for SheetApp {
                         {
                             self.set_zoom(1.0);
                         }
+                        // 从右往左布局，让百分比紧邻缩放控件。
+                        if zoom_step_button(ui, true, self.zoom < 4.0).clicked() {
+                            self.set_zoom(self.zoom + 0.1);
+                        }
+                        let mut zoom = self.zoom;
+                        if zoom_bar(ui, &mut zoom) {
+                            self.set_zoom_interactive(zoom, ui.ctx());
+                        }
+                        if zoom_step_button(ui, false, self.zoom > 0.1).clicked() {
+                            self.set_zoom(self.zoom - 0.1);
+                        }
                         // 一键切换主题（浅色 / 护眼 / 深色 / 高对比）
                         let cur_theme = theme::AppTheme::from_u8(self.prefs.theme);
                         let theme_short = match cur_theme {
@@ -51378,38 +51393,6 @@ impl eframe::App for SheetApp {
                         {
                             self.prefs.theme = (self.prefs.theme + 1) % 4;
                             self.prefs.save();
-                        }
-                        // 放大 / 滑杆 / 缩小（从右往左加，视觉上是 − 滑杆 +）
-                        if ui
-                            .add_sized(
-                                [18.0, 20.0],
-                                egui::Button::new(
-                                    egui::RichText::new("+").size(12.0).color(status_pal.text),
-                                )
-                                .frame(false),
-                            )
-                            .clicked()
-                        {
-                            let z = (self.zoom + 0.1).clamp(0.5, 2.5);
-                            self.set_zoom(z);
-                        }
-                        let mut z = self.zoom;
-                        if zoom_bar(ui, &mut z) {
-                            let ctx_clone = ui.ctx().clone();
-                            self.set_zoom_interactive(z, &ctx_clone);
-                        }
-                        if ui
-                            .add_sized(
-                                [18.0, 20.0],
-                                egui::Button::new(
-                                    egui::RichText::new("−").size(12.0).color(status_pal.text),
-                                )
-                                .frame(false),
-                            )
-                            .clicked()
-                        {
-                            let z = (self.zoom - 0.1).clamp(0.5, 2.5);
-                            self.set_zoom(z);
                         }
                         ui.add_space(6.0);
                         // 三个视图按钮（紧凑 28×20，选中态采用柔和主题绿胶囊）
@@ -52135,19 +52118,6 @@ impl eframe::App for SheetApp {
         }
         self.commit_edit_before_close(ctx);
         self.advance_save_and_exit(ctx);
-        // 无系统装饰，自绘 1 物理像素外边框
-        let ppp = ctx.pixels_per_point();
-        let screen = ctx.screen_rect();
-        let p = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("app_outer_border"),
-        ));
-        p.rect_stroke(
-            screen.shrink(0.5 / ppp),
-            0.0,
-            egui::Stroke::new(1.0 / ppp, egui::Color32::from_rgb(160, 158, 156)),
-            egui::StrokeKind::Inside,
-        );
         if debug_flags::has_any_sc() {
         // QA-07.3 重算探针：装载完成后自动发起一次后台全量重算
         if debug_flags::is_set("SC_RECALC_PROBE")
@@ -52433,54 +52403,34 @@ fn paint_fitted_label(p: &egui::Painter, rect: Rect, text: &str, font: FontId, c
     p.with_clip_rect(rect.intersect(p.clip_rect())).galley(top, galley, color);
 }
 
-/// 状态栏上的缩放滑杆：Excel 是一条细轨道 + 圆钮
+fn zoom_step_button(ui: &mut egui::Ui, increase: bool, enabled: bool) -> egui::Response {
+    let (symbol, name) = if increase { ("+", "放大") } else { ("−", "缩小") };
+    let button = egui::Button::new(egui::RichText::new(symbol).size(14.0))
+        .frame(false)
+        .min_size(Vec2::new(20.0, 18.0));
+    let response = ui.add_enabled(enabled, button);
+    ui_kit::a11y_name(&response, name, enabled, None);
+    response.on_hover_text(name)
+}
+
 fn zoom_bar(ui: &mut egui::Ui, zoom: &mut f32) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(88.0, 20.0), Sense::click_and_drag());
-    // 窄窗口 + 高 DPI 时状态栏可能连 88pt 都分不出来，allocate 会给出退化的矩形；
-    // 直接按 rect 画 from_min_max(left+6, right-6) 会 min>max panic（QA-05.2 在 960×600@1.5 抓到）。
-    if rect.width() < 24.0 || rect.height() < 6.0 {
-        return false;
+    let mut percent = (*zoom * 100.0).round() as i32;
+    let response = ui.scope(|ui| {
+        ui.spacing_mut().slider_width = 88.0;
+        ui.spacing_mut().slider_rail_height = 3.0;
+        ui.visuals_mut().selection.bg_fill = theme::palette().accent;
+        ui.add(egui::Slider::new(&mut percent, 10..=400)
+            .show_value(false)
+            .trailing_fill(true)
+            .step_by(1.0))
+    }).inner;
+    ui.ctx().accesskit_node_builder(response.id, |node| node.set_label("工作表缩放百分比"));
+    let changed = response.changed();
+    response.on_hover_text(format!("工作表缩放 {percent}%"));
+    if changed {
+        *zoom = percent as f32 / 100.0;
     }
-    let pal = theme::palette();
-    let p = ui.painter();
-    let cy = rect.center().y;
-    let track = pal.card_border;
-    let track_w = rect.width() - 12.0;
-    let t = ((*zoom - 0.5) / 2.0).clamp(0.0, 1.0);
-    let x = rect.left() + 6.0 + t * track_w;
-    p.rect_filled(
-        Rect::from_min_max(egui::pos2(rect.left() + 6.0, cy - 1.0), egui::pos2(rect.right() - 6.0, cy + 1.0)),
-        1.0,
-        track,
-    );
-    p.rect_filled(
-        Rect::from_min_max(egui::pos2(rect.left() + 6.0, cy - 1.0), egui::pos2(x, cy + 1.0)),
-        1.0,
-        pal.accent,
-    );
-    let mid_x = rect.left() + 6.0 + 0.25 * track_w;
-    p.line_segment(
-        [egui::pos2(mid_x, cy - 3.5), egui::pos2(mid_x, cy + 3.5)],
-        Stroke::new(1.0, pal.text_muted),
-    );
-    let r = if resp.hovered() || resp.dragged() { 4.2 } else { 3.6 };
-    p.circle_filled(egui::pos2(x, cy), r, pal.card_bg);
-    p.circle_stroke(
-        egui::pos2(x, cy),
-        r,
-        Stroke::new(
-            if resp.hovered() || resp.dragged() { 1.4 } else { 1.2 },
-            if resp.hovered() || resp.dragged() { pal.accent } else { pal.text_weak },
-        ),
-    );
-    if resp.dragged() || resp.clicked() {
-        if let Some(pos) = ui.ctx().pointer_interact_pos() {
-            let t = ((pos.x - rect.left() - 6.0) / (rect.width() - 12.0)).clamp(0.0, 1.0);
-            *zoom = ((0.5 + t * 2.0) * 100.0).round() / 100.0;
-            return true;
-        }
-    }
-    false
+    changed
 }
 
 #[cfg(all(windows, not(debug_assertions)))]
@@ -53794,6 +53744,35 @@ mod wave5_ui_tests {
         app.ribbon_action("DeleteRow", &ctx);
         assert_eq!(app.wb.sheet(0).value(1, 0), Value::Number(200.0));
         assert_eq!(app.wb.sheet(0).value(2, 0), Value::Number(400.0));
+    }
+
+    #[test]
+    fn status_zoom_buttons_and_slider_share_the_full_sheet_range() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role};
+        let _env = crate::test_env::TestEnv::new("status-zoom-range");
+        let (mut app, ctx) = new_test_app();
+        app.new_document();
+        app.set_zoom(3.0);
+        ctx.enable_accesskit();
+        let draw = |app: &mut SheetApp, events| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1024.0, 690.0))),
+                events, ..Default::default()
+            };
+            let mut frame = eframe::Frame::_new_kittest();
+            ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame))
+        };
+        let tree = draw(&mut app, vec![]).platform_output.accesskit_update.unwrap();
+        let (plus, _) = tree.nodes.iter().find(|(_, n)| n.role() == Role::Button && n.label() == Some("放大")).unwrap();
+        let (slider, node) = tree.nodes.iter().find(|(_, n)| n.role() == Role::Slider && n.label() == Some("工作表缩放百分比")).unwrap();
+        assert_eq!((node.min_numeric_value(), node.max_numeric_value()), (Some(10.0), Some(400.0)));
+        let action = |target, action, data| egui::Event::AccessKitActionRequest(ActionRequest { target, action, data });
+        let _ = draw(&mut app, vec![action(*plus, Action::Click, None)]);
+        assert!((app.zoom - 3.1).abs() < 0.001);
+        for percent in [10.0, 100.0, 400.0] {
+            let _ = draw(&mut app, vec![action(*slider, Action::SetValue, Some(ActionData::NumericValue(percent)))]);
+            assert!((f64::from(app.zoom) * 100.0 - percent).abs() < 0.001);
+        }
     }
 
     #[test]

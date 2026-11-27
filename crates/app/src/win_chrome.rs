@@ -7,7 +7,7 @@
 use eframe::egui;
 
 #[cfg(windows)]
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 
 /// Windows 滚轮系统设置：`u32::MAX`（`WHEEL_PAGESCROLL`）表示一次滚一屏；否则表示滚动行数（默认 3）。
 pub fn system_wheel_scroll_lines() -> u32 {
@@ -136,26 +136,96 @@ static MAX_BTN_CLICK_PENDING: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
 static MAX_BTN_HOVERED: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
-static MAX_BTN_SEQ: AtomicU32 = AtomicU32::new(0);
+static RESIZE_EDGE_PX: AtomicI32 = AtomicI32::new(5);
+
+/// Let the desktop compositor draw the frame and choose the corner shape when
+/// the window is restored, snapped or maximized. Older Windows versions ignore
+/// unsupported attributes and keep their native frame.
+#[cfg(windows)]
+pub fn apply_frame_theme(dark: bool) {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_ROUND,
+    };
+    let hwnd = SUBCLASSED_HWND.load(Ordering::Acquire) as HWND;
+    if hwnd.is_null() {
+        return;
+    }
+    for (attribute, value) in [
+        (DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND),
+        (DWMWA_USE_IMMERSIVE_DARK_MODE, i32::from(dark)),
+    ] {
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd, attribute as u32, (&value as *const i32).cast(), std::mem::size_of_val(&value) as u32,
+            );
+        }
+    }
+}
 
 /// 每帧由标题栏最大化按钮上报当前逻辑矩形（转为客户区物理像素），供 `WM_NCHITTEST` 识别。
-pub fn set_maximize_button_rect(rect: Option<egui::Rect>, ppp: f32) {
+pub fn update_caption_metrics(rect: egui::Rect, ppp: f32, native_ppp: f32) {
     #[cfg(windows)]
     {
-        if let Some(r) = rect {
-            MAX_BTN_L.store((r.min.x * ppp).round() as i32, Ordering::Relaxed);
-            MAX_BTN_T.store((r.min.y * ppp).round() as i32, Ordering::Relaxed);
-            MAX_BTN_R.store((r.max.x * ppp).round() as i32, Ordering::Relaxed);
-            MAX_BTN_B.store((r.max.y * ppp).round() as i32, Ordering::Relaxed);
-            MAX_BTN_SEQ.fetch_add(1, Ordering::Relaxed);
-        } else {
-            MAX_BTN_L.store(-1, Ordering::Relaxed);
-            MAX_BTN_R.store(-1, Ordering::Relaxed);
-        }
+        MAX_BTN_L.store((rect.min.x * ppp).round() as i32, Ordering::Relaxed);
+        MAX_BTN_T.store((rect.min.y * ppp).round() as i32, Ordering::Relaxed);
+        MAX_BTN_R.store((rect.max.x * ppp).round() as i32, Ordering::Relaxed);
+        MAX_BTN_B.store((rect.max.y * ppp).round() as i32, Ordering::Relaxed);
+        RESIZE_EDGE_PX.store((5.0 * native_ppp).round().max(1.0) as i32, Ordering::Relaxed);
     }
     #[cfg(not(windows))]
     {
-        let _ = (rect, ppp);
+        let _ = (rect, ppp, native_ppp);
+    }
+}
+
+#[cfg(windows)]
+pub fn handles_native_resize() -> bool {
+    ORIG_WNDPROC.load(Ordering::Acquire) != 0
+}
+
+#[cfg(windows)]
+fn resize_hit(x: i32, y: i32, width: i32, height: i32, edge: i32) -> Option<u32> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    };
+    if !(0..width).contains(&x) || !(0..height).contains(&y) {
+        return None;
+    }
+    let left = x < edge;
+    let top = y < edge;
+    let right = x >= width - edge;
+    let bottom = y >= height - edge;
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(HTTOPLEFT),
+        (_, true, true, _) => Some(HTTOPRIGHT),
+        (true, _, _, true) => Some(HTBOTTOMLEFT),
+        (_, true, _, true) => Some(HTBOTTOMRIGHT),
+        (true, _, _, _) => Some(HTLEFT),
+        (_, true, _, _) => Some(HTRIGHT),
+        (_, _, true, _) => Some(HTTOP),
+        (_, _, _, true) => Some(HTBOTTOM),
+        _ => None,
+    }
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn window_resize_hit_reserves_only_the_edges_and_corners() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    };
+    for edge in [5, 8, 10] {
+        for (x, y, expected) in [
+            (0, 0, HTTOPLEFT), (759, 0, HTTOPRIGHT), (0, 419, HTBOTTOMLEFT), (759, 419, HTBOTTOMRIGHT),
+            (400, edge - 1, HTTOP), (400, 420 - edge, HTBOTTOM), (edge - 1, 200, HTLEFT), (760 - edge, 200, HTRIGHT),
+        ] {
+            assert_eq!(resize_hit(x, y, 760, 420, edge), Some(expected));
+        }
+        for (x, y) in [(edge, edge), (759 - edge, 419 - edge), (-1, 100), (760, 0)] {
+            assert_eq!(resize_hit(x, y, 760, 420, edge), None);
+        }
     }
 }
 
@@ -169,6 +239,13 @@ pub fn take_maximize_button_click() -> bool {
     {
         false
     }
+}
+
+pub fn maximize_button_nc_pressed() -> bool {
+    #[cfg(windows)]
+    { MAX_BTN_PRESSED.load(Ordering::Relaxed) }
+    #[cfg(not(windows))]
+    { false }
 }
 
 pub fn maximize_button_nc_hovered() -> bool {
@@ -238,28 +315,31 @@ unsafe extern "system" fn snap_wndproc(
     wparam: windows_sys::Win32::Foundation::WPARAM,
     lparam: windows_sys::Win32::Foundation::LPARAM,
 ) -> windows_sys::Win32::Foundation::LRESULT {
-    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallWindowProcW, HTMAXBUTTON, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+        CallWindowProcW, GetClientRect, IsZoomed, HTMAXBUTTON, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
         WM_NCMOUSELEAVE, WM_NCMOUSEMOVE,
     };
 
     if msg == WM_NCHITTEST {
-        let l = MAX_BTN_L.load(Ordering::Relaxed);
-        let r = MAX_BTN_R.load(Ordering::Relaxed);
-        if l >= 0 && r > l {
+        let mut pt = POINT {
+            x: (lparam & 0xFFFF) as i16 as i32,
+            y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
+        };
+        if unsafe { ScreenToClient(hwnd, &mut pt) } != 0 {
+            let mut client = RECT::default();
+            if unsafe { IsZoomed(hwnd) } == 0 && unsafe { GetClientRect(hwnd, &mut client) } != 0 {
+                if let Some(hit) = resize_hit(pt.x, pt.y, client.right, client.bottom, RESIZE_EDGE_PX.load(Ordering::Relaxed)) {
+                    MAX_BTN_HOVERED.store(false, Ordering::Relaxed);
+                    return hit as isize;
+                }
+            }
+            let l = MAX_BTN_L.load(Ordering::Relaxed);
+            let r = MAX_BTN_R.load(Ordering::Relaxed);
             let t = MAX_BTN_T.load(Ordering::Relaxed);
             let b = MAX_BTN_B.load(Ordering::Relaxed);
-            let sx = (lparam & 0xFFFF) as i16 as i32;
-            let sy = ((lparam >> 16) & 0xFFFF) as i16 as i32;
-            let mut pt = POINT { x: sx, y: sy };
-            if unsafe { ScreenToClient(hwnd, &mut pt) } != 0
-                && pt.x >= l
-                && pt.x <= r
-                && pt.y >= t
-                && pt.y <= b
-            {
+            if l >= 0 && (l..r).contains(&pt.x) && (t..b).contains(&pt.y) {
                 MAX_BTN_HOVERED.store(true, Ordering::Relaxed);
                 return HTMAXBUTTON as isize;
             }

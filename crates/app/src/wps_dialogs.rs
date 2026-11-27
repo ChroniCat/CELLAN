@@ -241,7 +241,7 @@ impl SheetApp {
                             ui.spacing_mut().item_spacing.x = 1.5;
                             // Fill color split
                             let fill_c = Color32::from_rgb(self.last_fill_color[0], self.last_fill_color[1], self.last_fill_color[2]);
-                            let fc_r = ui_kit::color_button(ui, None, Some(Icon::Fill), fill_c, "填充颜色");
+                            let fc_r = ui_kit::color_button(ui, Icon::Fill, fill_c, "填充颜色");
                             if fc_r.clicked() {
                                 apply_fill_direct = true;
                             }
@@ -252,7 +252,7 @@ impl SheetApp {
 
                             // Font color split
                             let font_c = Color32::from_rgb(self.last_font_color[0], self.last_font_color[1], self.last_font_color[2]);
-                            let fcr = ui_kit::color_button(ui, Some("A"), Some(Icon::FontColor), font_c, "字体颜色");
+                            let fcr = ui_kit::color_button(ui, Icon::FontColor, font_c, "字体颜色");
                             if fcr.clicked() {
                                 apply_font_direct = true;
                             }
@@ -596,6 +596,8 @@ impl SheetApp {
                                     ui.allocate_ui_with_layout(Vec2::new(120.0, 0.0), layout, |ui| {
                                         ui.set_min_height(248.0);
                                         ui.spacing_mut().item_spacing.y = 2.0;
+                                        ui.visuals_mut().selection.bg_fill = pal.accent_tint;
+                                        ui.visuals_mut().selection.stroke.color = pal.text;
                                         let cats = [
                                             "常规", "数值", "货币", "会计专用", "日期", "时间",
                                             "百分比", "分数", "科学记数", "文本", "特殊", "自定义",
@@ -603,6 +605,10 @@ impl SheetApp {
                                         for (idx, name) in cats.iter().enumerate() {
                                             let sel = !format_mixed && self.fmt_num_cat == idx as u8;
                                             let r = ui.selectable_label(sel, *name);
+                                            if sel {
+                                                let edge = r.rect.shrink2(Vec2::new(1.0, 4.0));
+                                                ui.painter().line_segment([edge.left_top(), edge.left_bottom()], Stroke::new(2.0, pal.accent));
+                                            }
                                             if r.clicked() {
                                                 self.fmt_num_cat = idx as u8;
                                                 let next_fmt = category_code_sample(

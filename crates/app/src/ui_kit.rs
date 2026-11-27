@@ -1135,18 +1135,14 @@ pub fn arrow_glyph_button(ui: &mut egui::Ui, size: Vec2, color: Color32) -> Resp
     resp
 }
 
-/// 字体颜色 / 填充颜色按钮：图标（或字母）+ 下方 3px 色条，Excel 的样子
+/// 颜色拆分按钮的主体：点击应用当前色，右侧独立箭头打开调色板。
 pub fn color_button(
     ui: &mut egui::Ui,
-    letter: Option<&str>,
-    icon: Option<Icon>,
+    icon: Icon,
     color: Color32,
     tip: &str,
 ) -> Response {
-    let (dark, txt_col) = {
-        let v = ui.visuals();
-        (v.dark_mode, text_color(v))
-    };
+    let pal = crate::theme::palette();
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
     let bg = state_bg(
@@ -1154,42 +1150,36 @@ pub fn color_button(
         false,
         resp.hovered(),
         resp.is_pointer_button_down_on(),
-        dark,
+        pal.theme.is_dark(),
     );
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 2.0, bg);
     }
     focus_ring(ui, &resp, rect, 2.0);
-    let fg = if enabled { txt_col } else { DISABLED };
-    let top = Rect::from_min_size(rect.min + Vec2::new(2.0, 1.0), Vec2::new(20.0, 18.0));
-    if let Some(t) = letter {
+    let fg = if enabled { pal.text } else { pal.text_muted };
+    let center = rect.center() - Vec2::new(0.0, 2.0);
+    if icon == Icon::FontColor {
         ui.painter().text(
-            egui::pos2(top.center().x, top.center().y - 1.0),
+            center,
             Align2::CENTER_CENTER,
-            t,
-            FontId::proportional(13.0),
+            "A",
+            FontId::proportional(15.0),
             fg,
         );
+    } else {
+        ui_icons::draw_mono(ui.painter(), Rect::from_center_size(center, Vec2::splat(17.0)), icon, fg);
     }
-    if let Some(ic) = icon {
-        ui_icons::draw_excel(ui.painter(), top.shrink(2.0), ic, fg, enabled);
-    }
-    // 色条左收 + 右下角小三角：Excel 的颜色按钮是「图标 + 色条 + 下拉箭头」
     let bar = Rect::from_min_size(
-        egui::pos2(rect.left() + 4.0, rect.bottom() - 4.0),
-        Vec2::new(12.0, 3.0),
+        egui::pos2(rect.left() + 4.0, rect.bottom() - 6.0),
+        Vec2::new(16.0, 4.0),
     );
-    ui.painter().rect_filled(bar, 1.0, color);
-    let ac = crate::theme::palette().text_weak;
-    ui.painter().add(egui::Shape::convex_polygon(
-        vec![
-            egui::pos2(rect.right() - 7.0, rect.bottom() - 6.0),
-            egui::pos2(rect.right() - 2.0, rect.bottom() - 6.0),
-            egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0),
-        ],
-        ac,
-        Stroke::NONE,
-    ));
+    let swatch = if enabled { color } else { pal.text_muted };
+    ui.painter().rect_filled(bar, 1.0, swatch);
+    let lum = |c: Color32| egui::Rgba::from(c).intensity() + 0.05;
+    let (a, b) = (lum(swatch), lum(pal.ribbon_bg));
+    if a.max(b) / a.min(b) < 3.0 {
+        ui.painter().rect_stroke(bar, 1.0, Stroke::new(1.0, pal.text_muted), egui::StrokeKind::Inside);
+    }
     if !tip.is_empty() && (resp.hovered() || resp.contains_pointer()) {
         resp.on_hover_text(tip)
     } else {
@@ -1703,7 +1693,14 @@ impl BtnResp {
 pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
     let pal = crate::theme::palette();
     let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
-    let fg = if pal.theme.is_dark() { Color32::BLACK } else { Color32::WHITE };
+    let enabled = ui.is_enabled();
+    let fg = if !enabled {
+        pal.text
+    } else if pal.theme.is_dark() {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    };
     let bg_idle = pal.accent;
     let bg_hov = pal.accent_hover;
     let bg_act = if is_hc {
@@ -1732,17 +1729,15 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
             )
             .corner_radius(6.0)
             .min_size(Vec2::new(84.0, 32.0));
+            let btn = if enabled {
+                btn
+            } else {
+                btn.fill(pal.page_bg).stroke(Stroke::new(1.0, pal.card_border))
+            };
             ui.add(btn)
         })
         .inner;
-    if resp.has_focus() {
-        ui.painter().rect_stroke(
-            resp.rect.expand(2.0),
-            7.5,
-            Stroke::new(1.5, pal.accent.gamma_multiply(0.55)),
-            egui::StrokeKind::Outside,
-        );
-    }
+    button_focus_ring(ui, &resp);
     let in_non_modal = CURRENT_DLG_NON_MODAL.with(|c| c.get());
     let enter = ui.is_enabled() && !in_non_modal
         && ui.input(|i| i.key_pressed(egui::Key::Enter))
@@ -1756,7 +1751,7 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
 /// 次要按钮（取消/关闭）：与主按钮严格同高同宽（84×32）、6px 圆角、随主题适配底色与文字
 pub fn secondary_button(ui: &mut egui::Ui, label: &str) -> Response {
     let pal = crate::theme::palette();
-    ui.scope(|ui| {
+    let resp = ui.scope(|ui| {
         let w = &mut ui.visuals_mut().widgets;
         w.inactive.weak_bg_fill = pal.card_bg;
         w.inactive.bg_fill = pal.card_bg;
@@ -1776,82 +1771,65 @@ pub fn secondary_button(ui: &mut egui::Ui, label: &str) -> Response {
         .min_size(Vec2::new(84.0, 32.0));
         ui.add(btn)
     })
-    .inner
+    .inner;
+    button_focus_ring(ui, &resp);
+    resp
 }
 
-/// 商用表单单行输入框：34px 舒适高度、左右 10px 内边距、随主题适配底色/文字/描边
+fn button_focus_ring(ui: &egui::Ui, resp: &Response) {
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            resp.rect.expand(1.5),
+            7.5,
+            Stroke::new(crate::tokens::stroke::FOCUS, crate::theme::palette().accent),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
+/// 单行输入框的留白、点击范围和可访问范围共用同一矩形。
 pub fn text_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> Response {
     let pal = crate::theme::palette();
-    let desired_w = ui.available_width().max(120.0);
-    let (outer, _) = ui.allocate_exact_size(Vec2::new(desired_w, 34.0), Sense::hover());
-    let bg_slot = ui.painter().add(egui::Shape::Noop);
-    let focused_id = ui.memory(|m| m.focused());
-    let inner = outer.shrink2(Vec2::new(10.0, 6.0));
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(inner)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-    );
-    let te_resp = child.add(
+    let margin = egui::Margin::symmetric(10, 4);
+    let shape = ui.painter().add(egui::Shape::Noop);
+    let mut response = ui.add(
         egui::TextEdit::singleline(buf)
             .frame(false)
-            .desired_width(inner.width())
-            .font(FontId::proportional(12.0))
+            .margin(margin)
+            .min_size(Vec2::new(0.0, 34.0))
+            .desired_width(f32::INFINITY)
+            .vertical_align(egui::Align::Center)
+            .font(FontId::proportional(T_BODY))
             .text_color(pal.text)
-            .hint_text(
-                RichText::new(hint)
-                    .size(12.0)
-                    .color(pal.text_muted),
-            ),
+            .hint_text(RichText::new(hint).size(T_BODY).color(pal.text_weak)),
     );
-    let has_focus = te_resp.has_focus() || focused_id == Some(te_resp.id);
-    let hovered = ui.rect_contains_pointer(outer);
-    let bg = if has_focus {
-        pal.grid_bg
-    } else if hovered {
-        pal.hover
-    } else {
-        pal.card_bg
-    };
-    let border = if has_focus {
-        Stroke::new(1.5, pal.accent)
-    } else if hovered {
+    // egui 0.31 在框体上处理鼠标，但返回的 rect 扣除了 TextEdit 的 margin。
+    response.rect += margin;
+    let focused = response.has_focus();
+    let border = if focused {
+        Stroke::new(crate::tokens::stroke::FOCUS, pal.accent)
+    } else if response.hovered() {
         Stroke::new(1.0, pal.text_muted)
     } else {
         Stroke::new(1.0, pal.card_border)
     };
-    ui.painter().set(
-        bg_slot,
-        egui::Shape::rect_filled(outer, egui::CornerRadius::same(6), bg),
-    );
-    let p = ui.painter();
-    if has_focus {
-        p.rect_stroke(
-            outer.expand(1.5),
-            7.5,
-            Stroke::new(2.5, pal.accent.gamma_multiply(0.22)),
-            egui::StrokeKind::Outside,
-        );
-    }
-    p.rect_stroke(outer, 6.0, border, egui::StrokeKind::Inside);
-    te_resp
+    ui.painter().set(shape, egui::epaint::RectShape::new(
+        response.rect,
+        4.0,
+        if focused { pal.grid_bg } else { pal.card_bg },
+        border,
+        egui::StrokeKind::Inside,
+    ));
+    response
 }
 
 /// 紧凑文字按钮（组里放"插入行"这种短命令）
 pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
     let enabled = ui.is_enabled();
-    let (dark, sel_bg, hov_bg, txt_col) = {
-        let v = ui.visuals();
-        (
-            v.dark_mode,
-            v.selection.bg_fill,
-            v.widgets.hovered.weak_bg_fill,
-            text_color(v),
-        )
-    };
+    let pal = crate::theme::palette();
     let font = FontId::proportional(crate::tokens::text::BODY);
-    let col = if enabled { txt_col } else { DISABLED };
-    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, col);
+    // egui 已在禁用的父 Ui 上降低透明度，避免文字二次变淡。
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, pal.text);
     let size = Vec2::new(
         galley.size().x + crate::tokens::space::XL,
         crate::tokens::size::BTN_H,
@@ -1860,9 +1838,9 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
     let bg = if !enabled {
         Color32::TRANSPARENT
     } else if resp.is_pointer_button_down_on() {
-        if dark { sel_bg } else { PRESSED }
+        pal.pressed
     } else if resp.hovered() {
-        if dark { hov_bg } else { HOVER }
+        pal.hover
     } else {
         Color32::TRANSPARENT
     };
@@ -1872,7 +1850,7 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
     let pos = Align2::CENTER_CENTER
         .anchor_size(rect.center(), galley.size())
         .min;
-    ui.painter().galley(pos, galley, col);
+    ui.painter().galley(pos, galley, pal.text);
     focus_ring(ui, &resp, rect, 3.0);
     a11y_name(&resp, label, enabled, None);
     if !tip.is_empty() && tip != label {
@@ -1888,34 +1866,23 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
     }
 }
 
-/// 侧边栏/浮层纯矢量关闭按钮（24×24 圆角热区 + 自绘交叉线，避免依赖字体中可能缺失的 ✕ 符号）
+/// 侧边栏和浮层使用相同的关闭图标、指针状态和键盘焦点。
 pub fn close_icon_button(ui: &mut egui::Ui, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    paint_close_button(ui, rect, resp, tip)
+}
+
+fn paint_close_button(ui: &egui::Ui, rect: Rect, resp: Response, tip: &str) -> Response {
     let pal = crate::theme::palette();
     if resp.is_pointer_button_down_on() {
-        ui.painter().rect_filled(rect, 5.0, pal.pressed);
+        ui.painter().rect_filled(rect, 4.0, pal.pressed);
     } else if resp.hovered() {
-        ui.painter().rect_filled(rect, 5.0, pal.hover);
+        ui.painter().rect_filled(rect, 4.0, pal.hover);
     }
-    focus_ring(ui, &resp, rect, 5.0);
-    let col = if resp.hovered() { pal.text } else { pal.text_weak };
-    let k = 4.0;
-    let st = Stroke::new(1.25_f32, col);
-    ui.painter().line_segment(
-        [
-            rect.center() + egui::vec2(-k, -k),
-            rect.center() + egui::vec2(k, k),
-        ],
-        st,
-    );
-    ui.painter().line_segment(
-        [
-            rect.center() + egui::vec2(k, -k),
-            rect.center() + egui::vec2(-k, k),
-        ],
-        st,
-    );
-    a11y_name(&resp, if tip.is_empty() { "关闭" } else { tip }, true, None);
+    focus_ring(ui, &resp, rect, 4.0);
+    let col = if resp.hovered() || resp.has_focus() { pal.text } else { pal.text_weak };
+    ui_icons::draw_mono(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(20.0)), Icon::Close, col);
+    a11y_name(&resp, if tip.is_empty() { "关闭" } else { tip }, resp.enabled(), None);
     if !tip.is_empty() {
         resp.on_hover_text(tip)
     } else {
@@ -2187,15 +2154,18 @@ impl Dlg {
             .fixed_pos(pos)
             .default_size([w, area_h])
             .show(ctx, |ui| {
+                let high_contrast = pal.theme == crate::theme::AppTheme::HighContrast;
+                let hairline = 1.0 / ctx.pixels_per_point();
+                let radius = 8;
                 let frame = egui::Frame::window(&ctx.style())
                     .fill(pal.dialog_bg)
-                    .stroke(Stroke::new(1.0, pal.card_border))
-                    .corner_radius(10.0)
+                    .stroke(Stroke::new(if high_contrast { 1.0 } else { hairline }, pal.card_border))
+                    .corner_radius(radius)
                     .shadow(egui::epaint::Shadow {
-                        offset: [0, 12],
-                        blur: 32,
+                        offset: [0, 6],
+                        blur: 20,
                         spread: 0,
-                        color: Color32::from_black_alpha(34),
+                        color: Color32::from_black_alpha(if high_contrast { 0 } else if pal.theme.is_dark() { 76 } else { 32 }),
                     })
                     .inner_margin(egui::Margin::same(0));
                 let fr = frame
@@ -2207,11 +2177,8 @@ impl Dlg {
                             drag_only_sense(),
                         );
                         ui.painter().rect_filled(
-                            egui::Rect::from_min_size(
-                                trect.min,
-                                egui::vec2(w, 44.0),
-                            ),
-                            egui::CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 },
+                            trect,
+                            egui::CornerRadius { nw: radius - 1, ne: radius - 1, sw: 0, se: 0 },
                             pal.ribbon_bg,
                         );
                         ui.painter().line_segment(
@@ -2239,31 +2206,7 @@ impl Dlg {
                             id.with("close"),
                             egui::Sense::click(),
                         );
-                        if cresp.hovered() {
-                            ui.painter().rect_filled(
-                                crect,
-                                6.0,
-                                pal.hover,
-                            );
-                        }
-                        let cc = if cresp.hovered() {
-                            pal.text
-                        } else {
-                            pal.text_weak
-                        };
-                        let k = 4.2;
-                        let st = Stroke::new(1.25, cc);
-                        ui.painter().line_segment(
-                            [crect.center() + egui::vec2(-k, -k), crect.center() + egui::vec2(k, k)],
-                            st,
-                        );
-                        ui.painter().line_segment(
-                            [crect.center() + egui::vec2(k, -k), crect.center() + egui::vec2(-k, k)],
-                            st,
-                        );
-                        focus_ring(ui, &cresp, crect, 6.0);
-                        a11y_name(&cresp, "关闭", ui.is_enabled(), None);
-                        let cresp = cresp.on_hover_text("关闭");
+                        let cresp = paint_close_button(ui, crect, cresp, "关闭");
                         if cresp.clicked() {
                             closed = true;
                         }
@@ -2438,11 +2381,12 @@ pub fn autofocus(ui: &mut egui::Ui, resp: &Response) {
     }
 }
 
-/// 带常驻上下微调箭头的现代数字步进框（28px 高、6px 圆角、双折线 V 型箭头）
+/// 数字与同排字段对齐，过长的值显示省略号，完整值可悬停查看。
 pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width: f32) -> bool {
     use egui::accesskit::Action;
     let pal = crate::theme::palette();
-    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::click());
+    let height = ui.spacing().interact_size.y.max(26.0);
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
     let step_w = 20.0;
     let arrow_left = rect.right() - step_w;
     let a = Rect::from_min_max(egui::pos2(arrow_left, rect.top()), egui::pos2(rect.right(), rect.center().y));
@@ -2486,20 +2430,20 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
     let border_col = if focused { pal.accent } else if resp.hovered() { pal.text_muted } else { pal.card_border };
     ui.painter().rect(
         rect,
-        6.0,
+        4.0,
         pal.grid_bg,
         Stroke::new(if focused { crate::tokens::stroke::FOCUS } else { 1.0 }, border_col),
         egui::StrokeKind::Inside,
     );
-    let value_rect = Rect::from_min_max(rect.min, egui::pos2(arrow_left - 1.0, rect.bottom()));
+    let value_rect = Rect::from_min_max(rect.min, egui::pos2(arrow_left, rect.bottom()))
+        .shrink2(Vec2::new(4.0, 0.0));
     let txt = egui::emath::format_with_decimals_in_range(*v, 0..=6);
-    let text_rect = ui.painter_at(value_rect).text(
-        egui::pos2(rect.left() + 5.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        &txt,
-        FontId::proportional(T_BODY),
-        pal.text,
-    );
+    let mut job = egui::text::LayoutJob::simple_singleline(txt.clone(), FontId::proportional(T_BODY), pal.text);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(value_rect.width().max(1.0));
+    let galley = ui.painter().layout_job(job);
+    let elided = galley.elided;
+    let pos = Align2::RIGHT_CENTER.anchor_size(value_rect.right_center(), galley.size()).min;
+    ui.painter_at(value_rect).galley(pos, galley, pal.text);
     ui.painter().line_segment(
         [
             egui::pos2(rect.right() - step_w, rect.top() + 3.0),
@@ -2519,20 +2463,17 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
             1.3,
             if !enabled { pal.text_muted } else if hv { pal.text } else { pal.text_weak },
         );
-        if up {
-            ui.painter().line_segment([egui::pos2(c.x - 3.2, c.y + 1.4), egui::pos2(c.x, c.y - 1.6)], st);
-            ui.painter().line_segment([egui::pos2(c.x, c.y - 1.6), egui::pos2(c.x + 3.2, c.y + 1.4)], st);
-        } else {
-            ui.painter().line_segment([egui::pos2(c.x - 3.2, c.y - 1.4), egui::pos2(c.x, c.y + 1.6)], st);
-            ui.painter().line_segment([egui::pos2(c.x, c.y + 1.6), egui::pos2(c.x + 3.2, c.y - 1.4)], st);
-        }
+        let dy = if up { 1.5 } else { -1.5 };
+        ui.painter().add(egui::Shape::line(vec![
+            c + Vec2::new(-3.0, dy), c + Vec2::new(0.0, -dy), c + Vec2::new(3.0, dy),
+        ], st));
     }
     ui.painter().line_segment(
         [egui::pos2(a.left() + 2.0, a.bottom()), egui::pos2(a.right() - 2.0, a.bottom())],
         Stroke::new(1.0, pal.card_border),
     );
     let changed = resp.changed();
-    if !value_rect.contains_rect(text_rect) {
+    if elided {
         resp.on_hover_text(txt);
     }
     changed
@@ -2726,6 +2667,70 @@ pub fn draw_padlock(painter: &egui::Painter, rect: Rect, col: Color32) {
 #[cfg(test)]
 mod state_tests {
     use super::*;
+
+    #[test]
+    fn text_input_padding_accepts_focus_and_typing_at_each_dpi() {
+        for ppp in [1.0, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut buf = String::new();
+            let mut rect = Rect::NOTHING;
+            for frame in 0..4 {
+                // 112pt 的视口扣除面板左右各 8pt，实际供字段使用 96pt。
+                let mut input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(112.0, 140.0))),
+                    ..Default::default()
+                };
+                input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(ppp);
+                if frame == 1 || frame == 2 {
+                    let pos = rect.left_bottom() + Vec2::new(2.0, -2.0);
+                    input.events.push(egui::Event::PointerMoved(pos));
+                    input.events.push(egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary,
+                        pressed: frame == 1, modifiers: egui::Modifiers::NONE,
+                    });
+                } else if frame == 3 {
+                    input.events.push(egui::Event::Text("张".to_owned()));
+                }
+                let out = ctx.run(input, |ctx| {
+                    assert_eq!(ctx.pixels_per_point(), ppp);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let response = text_input(ui, &mut buf, "提示");
+                        rect = response.rect;
+                        assert!((rect.height() - 34.0).abs() < 0.01, "{ppp}: {rect:?}");
+                        assert!(rect.width() <= 96.01, "{ppp}: {rect:?}");
+                        if frame >= 2 { assert!(response.has_focus()); }
+                    });
+                });
+                if frame == 0 {
+                    let tree = out.platform_output.accesskit_update.unwrap();
+                    let edit = tree.nodes.iter().map(|(_, n)| n)
+                        .find(|n| n.role() == egui::accesskit::Role::TextInput).unwrap();
+                    let bounds = edit.bounds().unwrap();
+                    assert_eq!([bounds.x0, bounds.y0, bounds.x1, bounds.y1],
+                        [rect.left() as f64, rect.top() as f64, rect.right() as f64, rect.bottom() as f64]);
+                }
+            }
+            assert_eq!(buf, "张");
+        }
+    }
+
+    #[test]
+    fn spin_elides_long_values_only_when_they_exceed_the_numeric_area() {
+        let ctx = egui::Context::default();
+        for (width, expected) in [(44.0, true), (110.0, false)] {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    spin(ui, &mut 123456.0, 0.0, 1e6, 1.0, width);
+                });
+            });
+            let value = out.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) if t.galley.text() == "123456" => Some(&t.galley),
+                _ => None,
+            }).expect("numeric value must be painted");
+            assert_eq!(value.elided, expected, "width {width}");
+        }
+    }
 
     #[test]
     fn closing_dialog_keeps_accesskit_focus_on_a_current_widget() {

@@ -278,7 +278,7 @@ pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
         a11y: a11y_active,
         mid: mid_tier,
     };
-    ui_kit::set_group_pad(if mid_tier { 5.0 } else { 8.0 });
+    ui_kit::set_group_pad(if mid_tier || app.ribbon_compact { 5.0 } else { 8.0 });
     let panel_log = crate::debug_flags::panel_log();
     let mut used = 0.0f32;
     let mut i = 0usize;
@@ -817,8 +817,7 @@ fn button_a11y(
             let col = st.swatch.unwrap_or(Color32::from_rgb(128, 128, 128));
             let r = ui_kit::color_button(
                 ui,
-                if c.id == "FontColor" { Some("A") } else { None },
-                if c.id == "FontColor" { None } else { icon },
+                if c.id == "FontColor" { Icon::FontColor } else { Icon::Fill },
                 col,
                 "",
             );
@@ -836,6 +835,7 @@ fn button_a11y(
             Size::Normal => {
                 if label.is_empty() {
                     let r = ui_kit::small_on(ui, icon.unwrap_or(Icon::Grid), on, "");
+                    ui_kit::focus_ring(ui, &r, r.rect, 3.0);
                     attach_lazy_tip(r, st.tip.as_deref(), c)
                 } else {
                     let galley = layout_text(ui, label, 12.0);
@@ -849,6 +849,7 @@ fn button_a11y(
                         on,
                         "",
                     );
+                    ui_kit::focus_ring(ui, &r, r.rect, 3.0);
                     attach_lazy_tip(r, st.tip.as_deref(), c)
                 }
             }
@@ -921,7 +922,9 @@ fn split_a11y(
             let galley = (!label.is_empty()).then(|| layout_text(ui, label, 12.0));
             let tw = galley.as_ref().map(|g| g.size().x).unwrap_or(0.0);
             let w = ctl.width.unwrap_or(44.0).max(tw + 14.0);
-            let (r, ar) = ui_kit::big_sized_split_galley(ui, icon, galley, Vec2::new(w, 76.0));
+            let (r, ar) = ui.add_enabled_ui(enabled, |ui| {
+                ui_kit::big_sized_split_galley(ui, icon, galley, Vec2::new(w, 76.0))
+            }).inner;
             // UI-24.2：大号拆分按钮的主体和箭头是两个点击区，各自要有名字
             if rc.a11y {
                 let a11y_lbl = a11y_full.unwrap_or(label);
@@ -940,7 +943,7 @@ fn split_a11y(
             }
         }
         Size::Normal => {
-            let aw = ctl.arrow.unwrap_or(15.0);
+            let aw = ctl.arrow.unwrap_or(24.0).max(24.0);
             let (mr, ar) = ui
                 .horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -955,8 +958,7 @@ fn split_a11y(
                                 let col = st.swatch.unwrap_or(Color32::from_rgb(128, 128, 128));
                                 ui_kit::color_button(
                                     ui,
-                                    if ctl.id == "FontColor" { Some("A") } else { None },
-                                    icon_of(if ctl.id == "FontColor" { "FontColor" } else { "Fill" }),
+                                    icon,
                                     col,
                                     "",
                                 )
@@ -969,24 +971,39 @@ fn split_a11y(
                                 ui_kit::labeled_w_on_galley(ui, icon, Some(galley), w, on, "")
                             }
                         };
+                        if !matches!(ctl.id.as_str(), "Bold" | "Italic" | "Underline" | "FillColor" | "FontColor") {
+                            ui_kit::focus_ring(ui, &r, r.rect, 3.0);
+                        }
                         attach_lazy_tip(r, st.tip.as_deref(), ctl)
                     });
                     let ar = ui
-                        .scope(|ui| {
-                            if aw <= 18.0 {
-                                ui.spacing_mut().button_padding.x = 2.0;
-                            }
-                            ui_kit::arrow_glyph_button(
+                        .add_enabled_ui(enabled, |ui| {
+                            let r = ui_kit::arrow_glyph_button(
                                 ui,
                                 Vec2::new(aw, 24.0),
                                 crate::theme::palette().text_weak,
-                            )
+                            );
+                            ui_kit::focus_ring(ui, &r, r.rect, 3.0);
+                            r
                         })
                         .inner;
                     (main.inner, ar)
                 })
                 .inner;
             keytip_rect = Some(mr.rect);
+            if rc.a11y || ar.hovered() {
+                let name = a11y_full.filter(|s| !s.is_empty())
+                    .or_else(|| (!label.is_empty()).then_some(label))
+                    .or(ctl.screentip.as_deref()).unwrap_or(ctl.action());
+                let options = format!("{name} 选项");
+                if rc.a11y {
+                    ui_kit::a11y_name(&mr, name, enabled, (ctl.id == "Underline").then_some(on));
+                    ui_kit::a11y_name(&ar, &options, enabled, None);
+                }
+                if ar.hovered() {
+                    ar.clone().on_hover_text(options);
+                }
+            }
             main_clicked = mr.clicked();
             if ar.clicked() && enabled {
                 open = true;
@@ -1048,7 +1065,9 @@ fn menu_a11y(
         let min_large = if a11y_full.is_some() { 46.0 } else { 62.0 };
         let w = ctl.width.unwrap_or(min_large).max(tw + 14.0);
         let ic = icon.unwrap_or(Icon::Grid);
-        let (r, ar) = ui_kit::big_sized_split_galley(ui, ic, galley, Vec2::new(w, 76.0));
+        let (r, ar) = ui.add_enabled_ui(enabled, |ui| {
+            ui_kit::big_sized_split_galley(ui, ic, galley, Vec2::new(w, 76.0))
+        }).inner;
         if rc.a11y {
             let a11y_lbl = a11y_full.unwrap_or(label);
             let mut main = r.rect;
@@ -2459,16 +2478,17 @@ fn gallery(
 /// 「组名 ▾」「更多 ▾」折叠按钮。内嵌字体子集里没有 U+25BE，直接写「▾」会显示成方块，
 /// 所以文字后面留空，再手画一个和「单元格样式」下拉同款的 V 形箭头。
 fn menu_chevron(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let ir = ui.menu_button(format!("{label}    "), add_contents);
+    let mut bounds = ui.available_rect_before_wrap();
+    bounds.min.y += 12.0;
+    bounds.max.y = bounds.top() + 24.0;
+    let mut row = ui.new_child(egui::UiBuilder::new().id_salt("collapsed_groups").max_rect(bounds)
+        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+    row.spacing_mut().interact_size.y = 24.0;
+    let ir = row.menu_button(format!("{label}    "), add_contents);
     let rect = ir.response.rect;
-    let col = ui.visuals().text_color();
-    let cx = rect.right() - 11.0;
-    let cy = rect.center().y;
-    let stk = egui::Stroke::new(1.1, col);
-    ui.painter()
-        .line_segment([egui::pos2(cx - 3.0, cy - 1.5), egui::pos2(cx, cy + 1.5)], stk);
-    ui.painter()
-        .line_segment([egui::pos2(cx, cy + 1.5), egui::pos2(cx + 3.0, cy - 1.5)], stk);
+    let pal = crate::theme::palette();
+    ui_kit::caret(&mut row, egui::pos2(rect.right() - 9.0, rect.center().y), pal.text_weak);
+    ui.advance_cursor_after_rect(rect);
 }
 
 /// 紧凑模式的样式库：整条 349px 的缩略图放不下时，收成与「条件格式 / 套用表格格式」同高的
@@ -2699,6 +2719,66 @@ pub fn icon_of(name: &str) -> Option<Icon> {
 #[cfg(test)]
 mod compact_tests {
     use super::*;
+
+    #[test]
+    fn ribbon_color_split_swatch_matches_main_action_and_arrow_only_opens_choices() {
+        let _env = crate::test_env::TestEnv::new("ribbon-color-split");
+        let chosen = [42, 146, 78];
+        let previous = [78, 96, 152];
+        for enabled in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut app = SheetApp::new_with_context(&ctx, None);
+            app.apply_fill_color(Some(previous));
+            app.last_fill_color = chosen;
+            let ctl = Ctl {
+                id: "FillColor".into(), image: Some("Fill".into()),
+                screentip: Some("填充颜色".into()), arrow: Some(15.0), enabled,
+                ..Default::default()
+            };
+            let menu = Menu { ctl: Ctl::default(), items: Vec::new() };
+            let frame = |app: &mut SheetApp, events| {
+                ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let cur = app.current_style();
+                        let rc = RibbonFrameCtx { cur: &cur, mid: false, a11y: true };
+                        split(app, ui, rc, &ctl, &menu);
+                    });
+                })
+            };
+            let output = frame(&mut app, vec![]);
+            if enabled {
+                let swatch = Color32::from_rgb(chosen[0], chosen[1], chosen[2]);
+                assert_eq!(output.shapes.iter().filter(|s| matches!(
+                    &s.shape, egui::Shape::Rect(r) if r.fill == swatch
+                )).count(), 1);
+            }
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let button = |name| {
+                let node = &nodes.iter().find(|(_, node)| node.label() == Some(name)).unwrap().1;
+                assert_eq!(node.is_disabled(), !enabled);
+                let b = node.bounds().unwrap();
+                Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))
+            };
+            let main = button("填充颜色");
+            let arrow = button("填充颜色 选项");
+            assert!(main.right() <= arrow.left() && arrow.width() >= 24.0 && arrow.height() >= 24.0);
+            let click = |app: &mut SheetApp, pos| {
+                for pressed in [true, false] {
+                    frame(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                        pos, pressed, button: egui::PointerButton::Primary, modifiers: egui::Modifiers::NONE,
+                    }]);
+                }
+            };
+            click(&mut app, arrow.center());
+            assert_eq!(app.color_popup, enabled.then_some(false));
+            assert_eq!(app.current_style().fill, Some(previous));
+            app.color_popup = None;
+            click(&mut app, main.center());
+            assert_eq!(app.current_style().fill, Some(if enabled { chosen } else { previous }));
+            assert!(app.color_popup.is_none());
+        }
+    }
 
     #[test]
     fn ribbon_overflow_selects_hidden_tab_and_double_click_collapses_it() {

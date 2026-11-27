@@ -326,6 +326,36 @@ mod sheet_tab_tests {
         }]
     }
 
+    #[test]
+    fn title_search_opens_from_its_icon_and_keyboard_without_stealing_tab_focus() {
+        let _env = crate::test_env::TestEnv::new("title-command-search");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.show_start = false;
+        let draw = |app: &mut SheetApp, events| {
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1024.0, 690.0))),
+                events, ..Default::default()
+            }, |ctx| app.draw_wps_title_bar(ctx));
+        };
+        draw(&mut app, vec![]);
+        let id = egui::Id::new("title_command_search");
+        let rect = ctx.read_response(id).unwrap().rect;
+        for pos in [rect.left_center() + Vec2::new(15.0, 0.0), rect.right_center() - Vec2::new(9.0, 0.0)] {
+            draw(&mut app, button_event(pos, true));
+            draw(&mut app, button_event(pos, false));
+            assert!(app.palette_open);
+            app.palette_open = false;
+        }
+        ctx.memory_mut(|m| m.request_focus(id));
+        draw(&mut app, vec![]);
+        assert!(!app.palette_open);
+        draw(&mut app, vec![egui::Event::Key {
+            key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(app.palette_open);
+    }
+
     fn text_rect(out: &egui::FullOutput, label: &str) -> Option<(Rect, Rect, bool)> {
         out.shapes.iter().find_map(|clipped| match &clipped.shape {
             egui::Shape::Text(t) if t.galley.job.text == label => {
@@ -915,7 +945,6 @@ impl SheetApp {
     /// WPS 38px 第 1 排顶栏：Logo + 单一「⌂ 主页」胶囊 + 文档标签条（+ 新建）+ 命令搜索 + 账户 + 窗口按钮
     pub(crate) fn draw_wps_title_bar(&mut self, ctx: &egui::Context) {
         let pal = crate::theme::palette();
-        let dark = pal.theme.is_dark();
         let bg = pal.title_bg;
         let fg = pal.text;
         let hover = pal.hover_on_page;
@@ -945,7 +974,7 @@ impl SheetApp {
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 let painter = ui.painter().clone();
-                let right_bg = if self.show_start && !self.has_open_workbook {
+                if self.show_start && !self.has_open_workbook {
                     let rail_w = crate::home_rail_width(rect.width());
                     let canvas_bg = pal.page_bg;
                     painter.rect_filled(
@@ -958,10 +987,7 @@ impl SheetApp {
                         0.0,
                         pal.card_border,
                     );
-                    canvas_bg
-                } else {
-                    bg
-                };
+                }
 
                 // 1. Logo + 「⌂ 主页」页签（只要有已打开工作簿，即使正在浏览主页也始终保留主页与全部文档标签！）
                 let logo_cx = if self.show_start && !self.has_open_workbook {
@@ -996,26 +1022,10 @@ impl SheetApp {
                             1.5,
                             pal.accent,
                         );
-                    } else if !dark {
-                        painter.rect(
-                            hb,
-                            6.0,
-                            if hresp.hovered() { Color32::WHITE } else { Color32::from_rgba_unmultiplied(255, 255, 255, 190) },
-                            Stroke::new(1.0, if hresp.hovered() { ui_kit::BRAND_NAVY } else { ui_kit::CARD_BORDER }),
-                            egui::StrokeKind::Inside,
-                        );
                     } else if hresp.hovered() {
-                        painter.rect_filled(hb, 6.0, hover);
+                        painter.rect_filled(hb, 4.0, if hresp.is_pointer_button_down_on() { pal.pressed } else { hover });
                     }
-                    let hic = if home_active {
-                        pal.text
-                    } else if !dark && hresp.hovered() {
-                        ui_kit::BRAND_NAVY
-                    } else if !dark {
-                        Color32::from_rgb(51, 65, 85)
-                    } else {
-                        fg
-                    };
+                    let hic = if home_active || hresp.hovered() { fg } else { pal.text_weak };
                     ui_kit::draw_clean_icon(
                         &painter,
                         Rect::from_min_size(egui::pos2(hb.left() + 8.0, hb.center().y - 7.0), Vec2::splat(14.0)),
@@ -1070,7 +1080,7 @@ impl SheetApp {
                         let galley = painter.layout_job(job);
                         let tw = (galley.size().x + padding).clamp(DOC_TAB_MIN, width_limit);
                         let tab = Rect::from_min_size(egui::pos2(cur_x, rect.top() + 6.0), Vec2::new(tw, rect.height() - 6.0));
-                        let close = Rect::from_center_size(egui::pos2(tab.right() - 12.0, tab.center().y), Vec2::splat(16.0));
+                        let close = Rect::from_center_size(egui::pos2(tab.right() - 12.0, tab.center().y), Vec2::splat(22.0));
                         let tab_hit = Rect::from_min_max(tab.min, egui::pos2(close.left() - 2.0, tab.bottom()));
                         let tr = ui.interact(tab_hit, egui::Id::new(("wps_doctab", i)), Sense::click());
                         let cr = ui.interact(close, egui::Id::new(("wps_doctabx", i)), Sense::click());
@@ -1090,8 +1100,6 @@ impl SheetApp {
                             );
                         } else if tr.hovered() || cr.hovered() {
                             painter.rect_filled(tab, rad, hover);
-                        } else if self.show_start && !dark {
-                            painter.rect_filled(tab, rad, Color32::from_rgba_unmultiplied(255, 255, 255, 150));
                         }
                         let text_pos = egui::pos2(tab.left() + 10.0, tab.center().y - galley.size().y / 2.0);
                         painter.galley(text_pos, galley, tc);
@@ -1099,7 +1107,8 @@ impl SheetApp {
                             painter.circle_filled(egui::pos2(tab.right() - 26.0, tab.center().y), 3.0, pal.warn_fg);
                         }
                         if cr.hovered() {
-                            painter.circle_filled(close.center(), 7.5, pal.pressed);
+                            let fill = if cr.is_pointer_button_down_on() { pal.pressed } else { pal.hover };
+                            painter.rect_filled(close.shrink(2.0), 4.0, fill);
                         }
                         let cc = if cr.hovered() { pal.text } else { pal.text_weak };
                         let cc0 = close.center();
@@ -1157,7 +1166,6 @@ impl SheetApp {
                     let plus = Rect::from_min_size(egui::pos2(cur_x + 2.0, rect.center().y - 11.0), Vec2::new(24.0, 22.0));
                     if plus.right() <= right_limit {
                         let pr = ui.interact(plus, egui::Id::new("wps_tab_plus"), Sense::click());
-                        ui_kit::a11y_name(&pr, "新建工作簿", true, None);
                         ui_kit::a11y_name(&pr, "新建空白工作簿", true, None);
                         if pr.hovered() {
                             painter.rect_filled(plus, 5.0, hover);
@@ -1165,7 +1173,6 @@ impl SheetApp {
                         let pc = plus.center();
                         painter.line_segment([egui::pos2(pc.x - 4.5, pc.y), egui::pos2(pc.x + 4.5, pc.y)], Stroke::new(1.3, pal.text_weak));
                         painter.line_segment([egui::pos2(pc.x, pc.y - 4.5), egui::pos2(pc.x, pc.y + 4.5)], Stroke::new(1.3, pal.text_weak));
-                        ui_kit::focus_ring(ui, &pr, plus, 5.0);
                         ui_kit::focus_ring(ui, &pr, plus, 5.0);
                         if pr.on_hover_text("新建空白标签页 (Ctrl+N)").clicked() {
                             new_tab = true;
@@ -1178,7 +1185,7 @@ impl SheetApp {
                         Align2::LEFT_CENTER,
                         &self.last_title,
                         ui_kit::ui_bold_in(ctx, 14.0),
-                        if dark { fg } else { Color32::from_rgb(15, 23, 42) },
+                        fg,
                     );
                     cur_x = rect.left() + 216.0;
                 }
@@ -1186,61 +1193,53 @@ impl SheetApp {
                 // 4. 搜索框
                 if show_search {
                     let sr = Rect::from_min_size(egui::pos2(sx, rect.center().y - 13.0), Vec2::new(search_w, 26.0));
-                    painter.rect(sr, 13.0, pal.card_bg, Stroke::new(1.0, pal.card_border), egui::StrokeKind::Inside);
-                    ui_icons::draw_excel(
+                    let search = ui.interact(sr, egui::Id::new("title_command_search"), Sense::click());
+                    let fill = if search.is_pointer_button_down_on() {
+                        pal.pressed
+                    } else if search.hovered() {
+                        pal.hover
+                    } else {
+                        pal.card_bg
+                    };
+                    painter.rect(sr, 6.0, fill, Stroke::new(1.0, pal.card_border), egui::StrokeKind::Inside);
+                    ui_icons::draw_mono(
                         &painter,
                         Rect::from_center_size(egui::pos2(sr.left() + 15.0, sr.center().y), Vec2::splat(13.0)),
                         Icon::Find,
                         pal.text_weak,
-                        true,
                     );
-                    let te_rect = Rect::from_min_max(egui::pos2(sr.left() + 28.0, sr.top() + 3.0), egui::pos2(sr.right() - 10.0, sr.bottom() - 3.0));
-                    let te = ui.put(te_rect, egui::TextEdit::singleline(&mut self.search).frame(false).hint_text("搜索命令"));
-                    let _ = ui.ctx().accesskit_node_builder(te.id, |node| node.set_label("搜索命令".to_string()));
-                    if te.gained_focus() || te.changed() {
-                        self.palette_q = self.search.clone();
+                    painter.text(sr.left_center() + Vec2::new(28.0, 0.0), Align2::LEFT_CENTER,
+                        "搜索命令", FontId::proportional(ui_kit::T_BODY), fg);
+                    painter.text(sr.right_center() - Vec2::new(9.0, 0.0), Align2::RIGHT_CENTER,
+                        "Ctrl+Q", FontId::proportional(ui_kit::T_SMALL), pal.text_weak);
+                    ui_kit::a11y_name(&search, "搜索命令", true, None);
+                    ui_kit::focus_ring(ui, &search, sr, 6.0);
+                    if search.clicked() {
+                        self.palette_q.clear();
                         self.palette_open = true;
                     }
                 }
 
                 // 5. 账户胶囊
                 let aresp = ui.interact(acc, egui::Id::new("account"), Sense::click());
-                if !dark {
-                    painter.rect(
-                        acc,
-                        12.0,
-                        if aresp.hovered() {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 195)
-                        },
-                        Stroke::new(
-                            1.0,
-                            if aresp.hovered() {
-                                ui_kit::BRAND_NAVY
-                            } else {
-                                ui_kit::CARD_BORDER
-                            },
-                        ),
-                        egui::StrokeKind::Inside,
-                    );
-                } else if aresp.hovered() {
-                    painter.rect_filled(acc, 12.0, hover);
+                if aresp.hovered() {
+                    painter.rect_filled(acc, 4.0, if aresp.is_pointer_button_down_on() { pal.pressed } else { hover });
                 }
                 let ac = egui::pos2(acc.left() + 13.0, acc.center().y);
-                painter.circle_filled(ac, 9.5, ui_kit::BRAND_NAVY);
+                painter.circle_filled(ac, 9.5, pal.info_bg);
+                painter.circle_stroke(ac, 9.5, Stroke::new(1.0, pal.info_fg));
                 painter.text(
                     ac,
                     Align2::CENTER_CENTER,
                     user.chars().next().unwrap_or('U').to_uppercase().to_string(),
                     ui_kit::ui_bold_in(ctx, ui_kit::T_SMALL),
-                    Color32::WHITE,
+                    pal.info_fg,
                 );
                 painter.galley(
                     egui::pos2(ac.x + 14.0, acc.center().y - name_galley.size().y / 2.0),
                     name_galley, fg,
                 );
-                ui_kit::focus_ring(ui, &aresp, acc, 12.0);
+                ui_kit::focus_ring(ui, &aresp, acc, 4.0);
                 if ui_kit::is_accesskit_active(ctx) {
                     ui_kit::a11y_name(&aresp, &format!("账户：{user}"), true, None);
                 }
@@ -1257,37 +1256,57 @@ impl SheetApp {
                 for (name, x) in [("close", rect.right() - bw), ("max", rect.right() - bw * 2.0), ("min", rect.right() - bw * 3.0)] {
                     let br = Rect::from_min_size(egui::pos2(x, rect.top()), Vec2::new(bw, ui_kit::TITLE_H));
                     if name == "max" {
-                        crate::win_chrome::set_maximize_button_rect(Some(br), ppp);
+                        crate::win_chrome::update_caption_metrics(br, ppp, ctx.native_pixels_per_point().unwrap_or(ppp));
                     }
                     let resp = ui.interact(br, egui::Id::new(("winbtn", name)), Sense::click());
                     let is_hovered = resp.hovered()
                         || (name == "max" && crate::win_chrome::maximize_button_nc_hovered());
+                    let pressed = resp.is_pointer_button_down_on()
+                        || (name == "max" && crate::win_chrome::maximize_button_nc_pressed());
                     if is_hovered {
-                        painter.rect_filled(br, 0.0, if name == "close" { Color32::from_rgb(196, 43, 28) } else { hover });
+                        let fill = match (name, pressed) {
+                            ("close", true) => Color32::from_rgb(157, 31, 24),
+                            ("close", false) => Color32::from_rgb(196, 43, 28),
+                            (_, true) => pal.pressed,
+                            _ => hover,
+                        };
+                        painter.rect_filled(br, 0.0, fill);
                     }
                     let col = if name == "close" && is_hovered { Color32::WHITE } else { fg };
+                    // Align outline edges to physical pixels, including fractional monitor scaling.
+                    let snap = |v: f32| (v * ppp).round() / ppp;
+                    let line = snap(1.0).max(1.0 / ppp);
+                    let size = snap(10.0);
                     let c = br.center();
+                    let glyph = Rect::from_min_size(
+                        egui::pos2(snap(c.x - size * 0.5), snap(c.y - size * 0.5)),
+                        Vec2::splat(size),
+                    );
+                    let stroke = Stroke::new(line, col);
                     match name {
                         "close" => {
-                            let d = 4.8;
-                            let st = Stroke::new(1.15, col);
-                            painter.line_segment([egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)], st);
-                            painter.line_segment([egui::pos2(c.x + d, c.y - d), egui::pos2(c.x - d, c.y + d)], st);
+                            let r = glyph.shrink(line * 0.5);
+                            painter.line_segment([r.left_top(), r.right_bottom()], stroke);
+                            painter.line_segment([r.right_top(), r.left_bottom()], stroke);
                         }
                         "min" => {
-                            painter.line_segment([egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)], Stroke::new(1.15, col));
+                            let min = egui::pos2(glyph.left(), snap(c.y - line * 0.5));
+                            painter.rect_filled(Rect::from_min_size(min, Vec2::new(size, line)), 0.0, col);
+                        }
+                        _ if maximized => {
+                            let offset = snap(2.0);
+                            let back = Rect::from_min_max(glyph.min + Vec2::new(offset, 0.0),
+                                glyph.max - Vec2::new(0.0, offset));
+                            let front = back.translate(Vec2::new(-offset, offset));
+                            let edge = back.shrink(line * 0.5);
+                            painter.add(egui::Shape::line(vec![
+                                egui::pos2(edge.left(), front.top()), edge.left_top(),
+                                edge.right_top(), edge.right_bottom(), egui::pos2(front.right(), edge.bottom()),
+                            ], stroke));
+                            painter.rect_stroke(front, 0.0, stroke, egui::StrokeKind::Inside);
                         }
                         _ => {
-                            let st = Stroke::new(1.15, col);
-                            if maximized {
-                                let a = Rect::from_min_size(egui::pos2(c.x - 3.5, c.y - 5.0), Vec2::new(8.0, 8.0));
-                                let b2 = Rect::from_min_size(egui::pos2(c.x - 5.5, c.y - 3.0), Vec2::new(8.0, 8.0));
-                                painter.rect_stroke(a, 1.0, st, egui::StrokeKind::Inside);
-                                painter.rect_filled(b2, 1.0, if is_hovered { hover } else { right_bg });
-                                painter.rect_stroke(b2, 1.0, st, egui::StrokeKind::Inside);
-                            } else {
-                                painter.rect_stroke(Rect::from_center_size(c, Vec2::new(9.6, 9.6)), 1.0, st, egui::StrokeKind::Inside);
-                            }
+                            painter.rect_stroke(glyph, 0.0, stroke, egui::StrokeKind::Inside);
                         }
                     }
                     let label = match name {
@@ -1297,7 +1316,7 @@ impl SheetApp {
                         _ => "最大化",
                     };
                     ui_kit::a11y_name(&resp, label, true, None);
-                    ui_kit::focus_ring(ui, &resp, br, 3.0);
+                    ui_kit::focus_ring(ui, &resp, br.shrink(3.0), 3.0);
                     if resp.clicked() || (name == "max" && crate::win_chrome::take_maximize_button_click()) {
                         match name {
                             "close" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),

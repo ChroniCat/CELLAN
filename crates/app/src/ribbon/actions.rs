@@ -193,7 +193,7 @@ impl SheetApp {
                 }
             }
             "FillColor" => {
-                let f = cur.fill.unwrap_or(self.last_fill_color);
+                let f = self.last_fill_color;
                 st.swatch = Some(egui::Color32::from_rgb(f[0], f[1], f[2]));
             }
             "FontColor" => {
