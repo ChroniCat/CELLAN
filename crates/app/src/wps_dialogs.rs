@@ -12,6 +12,46 @@ use crate::{ui_kit, wps_chrome, SheetApp};
 
 const MINI_SIZES: [f32; 15] = [8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 28.0, 36.0, 48.0, 72.0];
 
+/// 混合选区首次点击统一勾选；没有交互时，保留活动格草稿和各单元格原值。
+fn format_checkbox(ui: &mut egui::Ui, label: &str, value: &mut bool, mixed: bool, touched: &mut bool) {
+    let indeterminate = mixed && !*touched;
+    let mut displayed = *value && !indeterminate;
+    if ui.add(egui::Checkbox::new(&mut displayed, label).indeterminate(indeterminate)).changed() {
+        *value = displayed;
+        *touched = true;
+    }
+}
+
+#[cfg(test)]
+mod checkbox_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_checkbox_preserves_the_draft_until_the_first_click_selects_all() {
+        for original in [false, true] {
+            let ctx = egui::Context::default();
+            let mut value = original;
+            let mut touched = false;
+            for frame in 0..3 {
+                let mut input = egui::RawInput::default();
+                if frame == 2 {
+                    input.events.push(egui::Event::Key { key: Key::Space, physical_key: None,
+                        pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+                }
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let id = ui.next_auto_id();
+                        format_checkbox(ui, "锁定", &mut value, true, &mut touched);
+                        if frame == 0 { ui.memory_mut(|m| m.request_focus(id)); }
+                    });
+                });
+                assert_eq!(touched, frame == 2);
+                assert_eq!(value, original || frame == 2);
+            }
+        }
+    }
+}
+
 fn category_code_sample(cat: u8, dec: u8, sep: bool, neg: u8, sym: u8, cur_fmt: &str) -> String {
     let zeros = if dec == 0 {
         String::new()
@@ -561,7 +601,7 @@ impl SheetApp {
                                             "百分比", "分数", "科学记数", "文本", "特殊", "自定义",
                                         ];
                                         for (idx, name) in cats.iter().enumerate() {
-                                            let sel = self.fmt_num_cat == idx as u8;
+                                            let sel = !format_mixed && self.fmt_num_cat == idx as u8;
                                             let r = ui.selectable_label(sel, *name);
                                             if r.clicked() {
                                                 self.fmt_num_cat = idx as u8;
@@ -719,7 +759,8 @@ impl SheetApp {
                             crate::dlg_cell_label(ui, if halign_mixed { "水平对齐（混合）" } else { "水平对齐" });
                             ui.horizontal_wrapped(|ui| {
                                 for (lbl, v) in [("常规", 0u8), ("靠左", 1), ("居中", 2), ("靠右", 3), ("跨列居中", 4), ("分散对齐", 5)] {
-                                    if ui.selectable_value(&mut self.fmt_state.halign, v, lbl).clicked() {
+                                    if ui.selectable_label(!halign_mixed && self.fmt_state.halign == v, lbl).clicked() {
+                                        self.fmt_state.halign = v;
                                         self.fmt_touched.halign = true;
                                     }
                                 }
@@ -729,7 +770,8 @@ impl SheetApp {
                             crate::dlg_cell_label(ui, if valign_mixed { "垂直对齐（混合）" } else { "垂直对齐" });
                             ui.horizontal(|ui| {
                                 for (lbl, v) in [("常规", 0u8), ("顶端", 1), ("居中", 2), ("底端", 3)] {
-                                    if ui.selectable_value(&mut self.fmt_state.valign, v, lbl).clicked() {
+                                    if ui.selectable_label(!valign_mixed && self.fmt_state.valign == v, lbl).clicked() {
+                                        self.fmt_state.valign = v;
                                         self.fmt_touched.valign = true;
                                     }
                                 }
@@ -745,32 +787,30 @@ impl SheetApp {
 
                             crate::dlg_cell_label(ui, "文本控制");
                             ui.horizontal_wrapped(|ui| {
-                                if ui.checkbox(&mut self.fmt_state.wrap, if wrap_mixed { "自动换行（混合）" } else { "自动换行" }).changed() {
-                                    self.fmt_touched.wrap = true;
-                                }
-                                if ui.checkbox(&mut self.fmt_state.shrink_to_fit, if shrink_mixed { "缩小字体填充（混合）" } else { "缩小字体填充" }).changed() {
-                                    self.fmt_touched.shrink_to_fit = true;
-                                }
-                                if ui.checkbox(&mut self.fmt_state.vertical_text, "竖排文字").changed() {
-                                    self.fmt_touched.vertical_text = true;
-                                }
+                                format_checkbox(ui, "自动换行", &mut self.fmt_state.wrap, wrap_mixed, &mut self.fmt_touched.wrap);
+                                format_checkbox(ui, "缩小字体填充", &mut self.fmt_state.shrink_to_fit, shrink_mixed, &mut self.fmt_touched.shrink_to_fit);
+                                format_checkbox(ui, "竖排文字", &mut self.fmt_state.vertical_text, mixed.vertical_text, &mut self.fmt_touched.vertical_text);
                             });
                             ui.end_row();
 
                             crate::dlg_cell_label(ui, "方向 / 合并");
                             ui.horizontal(|ui| {
+                                let rotation_mixed = mixed.rotation && !self.fmt_touched.rotation;
+                                let rotations = [("横排（0°）", 0i16), ("斜排（45°）", 45), ("竖排（90°）", 90), ("竖排（-90°）", -90), ("斜排（-45°）", -45)];
+                                let angle = self.fmt_state.rotation;
+                                let rotation_label = if rotation_mixed {
+                                    "混合".to_owned()
+                                } else {
+                                    rotations.iter().find(|(_, v)| *v == angle)
+                                        .map_or_else(|| format!("{angle}°"), |(text, _)| (*text).to_owned())
+                                };
                                 egui::ComboBox::from_id_salt("wps_fmt_rot")
-                                    .selected_text(match self.fmt_state.rotation {
-                                        90 => "竖排（90°）",
-                                        -90 => "竖排（-90°）",
-                                        45 => "斜排（45°）",
-                                        -45 => "斜排（-45°）",
-                                        _ => "横排（0°）",
-                                    })
+                                    .selected_text(rotation_label)
                                     .width(120.0)
                                     .show_ui(ui, |ui| {
-                                        for (lbl, v) in [("横排（0°）", 0i16), ("斜排（45°）", 45), ("竖排（90°）", 90), ("竖排（-90°）", -90), ("斜排（-45°）", -45)] {
-                                            if ui.selectable_value(&mut self.fmt_state.rotation, v, lbl).clicked() {
+                                        for (lbl, v) in rotations {
+                                            if ui.selectable_label(!rotation_mixed && angle == v, lbl).clicked() {
+                                                self.fmt_state.rotation = v;
                                                 self.fmt_touched.rotation = true;
                                             }
                                         }
@@ -823,7 +863,7 @@ impl SheetApp {
                                     .show_ui(ui, |ui| {
                                         for name in sheetcore::style::FONT_CHOICES {
                                             let label = if name.is_empty() { "默认" } else { *name };
-                                            if ui.selectable_label(self.fmt_state.font == *name, label).clicked() {
+                                            if ui.selectable_label(!font_mixed && self.fmt_state.font == *name, label).clicked() {
                                                 self.fmt_state.font = name.to_string();
                                                 self.fmt_touched.font = true;
                                             }
@@ -840,30 +880,26 @@ impl SheetApp {
                             ui.end_row();
 
                             crate::dlg_cell_label(ui, "字形与效果");
+                            ui.horizontal_wrapped(|ui| {
+                                format_checkbox(ui, "加粗", &mut self.fmt_state.bold, mixed.bold, &mut self.fmt_touched.bold);
+                                format_checkbox(ui, "倾斜", &mut self.fmt_state.italic, mixed.italic, &mut self.fmt_touched.italic);
+                                format_checkbox(ui, "删除线", &mut self.fmt_state.strikethrough, mixed.strikethrough, &mut self.fmt_touched.strikethrough);
+                            });
+                            ui.end_row();
+
+                            crate::dlg_cell_label(ui, "下划线");
+                            let underline_mixed = (mixed.underline && !self.fmt_touched.underline)
+                                || (mixed.double_underline && !self.fmt_touched.double_underline);
                             ui.horizontal(|ui| {
-                                if ui_kit::text_toggle(ui, "B", self.fmt_state.bold, "加粗", true, false, false).clicked() {
-                                    self.fmt_state.bold = !self.fmt_state.bold;
-                                    self.fmt_touched.bold = true;
-                                }
-                                if ui_kit::text_toggle(ui, "I", self.fmt_state.italic, "倾斜", false, true, false).clicked() {
-                                    self.fmt_state.italic = !self.fmt_state.italic;
-                                    self.fmt_touched.italic = true;
-                                }
-                                if ui_kit::text_toggle(ui, "U", self.fmt_state.underline, "单下划线", false, false, true).clicked() {
-                                    self.fmt_state.underline = !self.fmt_state.underline;
-                                    self.fmt_touched.underline = true;
-                                }
-                                if ui_kit::text_toggle(ui, "双", self.fmt_state.double_underline, "双下划线", false, false, true).clicked() {
-                                    self.fmt_state.double_underline = !self.fmt_state.double_underline;
-                                    self.fmt_touched.double_underline = true;
-                                    if self.fmt_state.double_underline {
-                                        self.fmt_state.underline = true;
+                                for (label, single, double) in [("无", false, false), ("单下划线", true, false), ("双下划线", true, true)] {
+                                    let selected = !underline_mixed && self.fmt_state.double_underline == double
+                                        && (double || self.fmt_state.underline == single);
+                                    if ui.radio(selected, label).clicked() {
+                                        self.fmt_state.underline = single;
+                                        self.fmt_state.double_underline = double;
                                         self.fmt_touched.underline = true;
+                                        self.fmt_touched.double_underline = true;
                                     }
-                                }
-                                if ui_kit::text_toggle(ui, "S", self.fmt_state.strikethrough, "删除线", false, false, false).clicked() {
-                                    self.fmt_state.strikethrough = !self.fmt_state.strikethrough;
-                                    self.fmt_touched.strikethrough = true;
                                 }
                             });
                             ui.end_row();
@@ -898,10 +934,12 @@ impl SheetApp {
                     3 => self.format_borders_tab(ui),
                     4 => {
                         crate::dlg_section(ui, if fill_mixed { "单元格背景填充（混合）" } else { "单元格背景填充" });
-                        let mut clear = false;
+                        let mut clear = wps_chrome::palette_reset(ui, "无背景色", !fill_mixed && self.fmt_state.fill.is_none()).clicked();
+                        ui.add_space(4.0);
                         let mut picked = None;
                         let recent = self.recent_colors.clone();
-                        wps_chrome::paint_wps_color_palette(ui, self.fmt_state.fill, &recent, Some("无背景色"), &mut clear, &mut picked);
+                        let selected = if fill_mixed { None } else { self.fmt_state.fill };
+                        wps_chrome::paint_wps_color_palette(ui, selected, &recent, None, &mut clear, &mut picked);
                         if clear {
                             self.fmt_state.fill = None;
                             self.fmt_touched.fill = true;
@@ -922,12 +960,8 @@ impl SheetApp {
                     }
                     _ => {
                         crate::dlg_section(ui, "工作表保护选项");
-                        if ui.checkbox(&mut self.fmt_state.locked, if locked_mixed { "锁定（混合）" } else { "锁定" }).changed() {
-                            self.fmt_touched.locked = true;
-                        }
-                        if ui.checkbox(&mut self.fmt_state.hidden, if hidden_mixed { "隐藏公式（混合）" } else { "隐藏公式" }).changed() {
-                            self.fmt_touched.hidden = true;
-                        }
+                        format_checkbox(ui, "锁定", &mut self.fmt_state.locked, locked_mixed, &mut self.fmt_touched.locked);
+                        format_checkbox(ui, "隐藏公式", &mut self.fmt_state.hidden, hidden_mixed, &mut self.fmt_touched.hidden);
                         ui.label(egui::RichText::new("需在「审阅 → 保护工作表」启用后生效。").size(ui_kit::T_BODY).color(pal.text_weak));
                     }
                 }

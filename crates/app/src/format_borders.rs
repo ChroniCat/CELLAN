@@ -31,10 +31,11 @@ fn icon(
     edges: &[usize],
     size: f32,
     name: &str,
-    selected: bool,
+    selected: Option<bool>,
 ) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
-    let visuals = ui.style().interact_selectable(&resp, selected);
+    let pal = crate::theme::palette();
+    let visuals = ui.style().interact_selectable(&resp, selected.unwrap_or(false));
     ui.painter().rect(
         r,
         3.,
@@ -45,12 +46,14 @@ fn icon(
     let box_r = r.shrink(size * 0.22);
     for i in 0..6 {
         let [a, b] = endpoints(box_r, i);
-        crate::border_lines::paint(ui.painter(), a, b, 6, Color32::GRAY, 1.);
+        crate::border_lines::paint(ui.painter(), a, b, 6, pal.text_muted, 1.);
     }
     for &i in edges {
         let [a, b] = endpoints(box_r, i);
-        crate::border_lines::paint(ui.painter(), a, b, 1, Color32::BLACK, 1.);
+        crate::border_lines::paint(ui.painter(), a, b, 1, pal.text, 1.);
     }
+    crate::ui_kit::focus_ring(ui, &resp, r, 3.0);
+    crate::ui_kit::a11y_name(&resp, name, ui.is_enabled(), selected);
     resp.on_hover_text(name)
 }
 
@@ -141,12 +144,15 @@ impl SheetApp {
     }
     fn edge_button(&mut self, ui: &mut egui::Ui, i: usize, enabled: bool) {
         ui.add_enabled_ui(enabled, |ui| {
-            if icon(ui, &[i], 22., NAMES[i], self.fmt_lines[i].style != 0).clicked() {
+            if icon(ui, &[i], 22., NAMES[i], Some(self.fmt_lines[i].style != 0)).clicked() {
                 self.toggle_line(i);
             }
         });
     }
     pub(crate) fn format_borders_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = crate::theme::palette();
+        let [red, green, blue] = self.fmt_border_color;
+        let pen = Color32::from_rgb(red, green, blue);
         let rects = self.sel_rects();
         let h = rects.iter().any(|(t, _, b, _)| t != b);
         let v = rects.iter().any(|(_, l, _, r)| l != r);
@@ -168,32 +174,38 @@ impl SheetApp {
                                 };
                                 let (r, response) =
                                     ui.allocate_exact_size(Vec2::new(61., 19.), Sense::click());
-                                if self.fmt_border_style == style || response.hovered() {
-                                    ui.painter().rect_filled(
-                                        r,
-                                        2.,
-                                        Color32::from_rgb(222, 237, 229),
-                                    );
-                                }
+                                let selected = self.fmt_border_style == style;
+                                let surface = if selected {
+                                    ui.painter().rect(r, 3.0, pal.accent_tint, Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
+                                    pal.accent_tint
+                                } else if response.hovered() {
+                                    ui.painter().rect_filled(r, 3.0, pal.hover);
+                                    pal.hover
+                                } else { pal.dialog_bg };
                                 if style == 0 {
                                     ui.painter().text(
                                         r.center(),
                                         egui::Align2::CENTER_CENTER,
                                         "无",
                                         egui::FontId::proportional(12.),
-                                        Color32::BLACK,
+                                        pal.text,
                                     );
                                 } else {
-                                    let c = self.fmt_border_color;
+                                    // 线型目录展示可分辨的线条，旁边的单元格预览始终使用原色。
+                                    let line_lum = egui::Rgba::from(pen).intensity() + 0.05;
+                                    let surface_lum = egui::Rgba::from(surface).intensity() + 0.05;
+                                    let contrast = line_lum.max(surface_lum) / line_lum.min(surface_lum);
                                     crate::border_lines::paint(
                                         ui.painter(),
                                         r.left_center() + egui::vec2(4., 0.),
                                         r.right_center() - egui::vec2(4., 0.),
                                         style,
-                                        Color32::from_rgb(c[0], c[1], c[2]),
+                                        if contrast >= 3.0 { pen } else { pal.text },
                                         1.,
                                     );
                                 }
+                                crate::ui_kit::focus_ring(ui, &response, r, 3.0);
+                                crate::ui_kit::a11y_name(&response, name, ui.is_enabled(), Some(selected));
                                 if response.on_hover_text(name).clicked() {
                                     self.fmt_border_style = style;
                                 }
@@ -248,7 +260,7 @@ impl SheetApp {
                         ui.add_enabled_ui(!matches!(name, "内部") || h || v, |ui| {
                             ui.vertical(|ui| {
                                 ui.set_width(55.);
-                                let clicked = icon(ui, edges, 32., name, false).clicked();
+                                let clicked = icon(ui, edges, 32., name, None).clicked();
                                 if ui
                                     .add(egui::Label::new(name).sense(Sense::click()))
                                     .clicked()

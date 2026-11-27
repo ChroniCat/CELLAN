@@ -72,7 +72,45 @@ pub(crate) fn wps_theme_matrix() -> [[[u8; 3]; 10]; 6] {
     out
 }
 
-/// 绘制可复用的 WPS 主题色 + 标准色网格（供浮动调色盘与 Ctrl+1 格式对话框共用）
+/// 调色板中的“无填充”或“自动颜色”按钮。
+pub(crate) fn palette_reset(ui: &mut egui::Ui, lbl: &str, selected: bool) -> egui::Response {
+    let pal = crate::theme::palette();
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(216.0), 24.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(r, 4.0, pal.hover);
+    }
+    let sw = Rect::from_min_size(egui::pos2(r.left() + 6.0, r.center().y - 7.0), Vec2::splat(14.0));
+    ui.painter().rect(
+        sw,
+        2.0,
+        Color32::WHITE,
+        Stroke::new(1.0, pal.card_border),
+        egui::StrokeKind::Inside,
+    );
+    if lbl.contains("无") {
+        ui.painter().line_segment(
+            [sw.left_bottom(), sw.right_top()],
+            Stroke::new(1.2, Color32::from_rgb(200, 50, 50)),
+        );
+    } else {
+        ui.painter().rect_filled(sw.shrink(2.0), 1.0, Color32::BLACK);
+    }
+    ui.painter().text(
+        egui::pos2(sw.right() + 8.0, r.center().y),
+        Align2::LEFT_CENTER,
+        lbl,
+        FontId::proportional(12.0),
+        pal.text,
+    );
+    if selected {
+        ui.painter().rect_stroke(r, 4.0, Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
+    }
+    ui_kit::focus_ring(ui, &resp, r, 4.0);
+    ui_kit::a11y_name(&resp, lbl, ui.is_enabled(), Some(selected));
+    resp
+}
+
+/// 绘制可复用的 WPS 主题色、标准色与最近使用颜色。
 pub(crate) fn paint_wps_color_palette(
     ui: &mut egui::Ui,
     selected: Option<[u8; 3]>,
@@ -81,119 +119,62 @@ pub(crate) fn paint_wps_color_palette(
     clear_clicked: &mut bool,
     picked: &mut Option<[u8; 3]>,
 ) {
-    let pal = crate::theme::palette();
-    if let Some(lbl) = none_label {
-        let is_none = selected.is_none();
-        let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(216.0), 24.0), Sense::click());
-        if resp.hovered() {
-            ui.painter().rect_filled(r, 4.0, pal.hover);
-        }
-        let sw = Rect::from_min_size(egui::pos2(r.left() + 6.0, r.center().y - 7.0), Vec2::splat(14.0));
-        ui.painter().rect(
-            sw,
-            2.0,
-            Color32::WHITE,
-            Stroke::new(1.0, pal.card_border),
-            egui::StrokeKind::Inside,
-        );
-        if lbl.contains("无") {
-            ui.painter().line_segment(
-                [sw.left_bottom(), sw.right_top()],
-                Stroke::new(1.2, Color32::from_rgb(200, 50, 50)),
-            );
-        } else {
-            ui.painter().rect_filled(sw.shrink(2.0), 1.0, Color32::BLACK);
-        }
-        ui.painter().text(
-            egui::pos2(sw.right() + 8.0, r.center().y),
-            Align2::LEFT_CENTER,
-            lbl,
-            FontId::proportional(12.0),
-            pal.text,
-        );
-        if is_none && lbl.contains("无") {
-            ui.painter().rect_stroke(r, 4.0, Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
-        }
-        if resp.clicked() {
+    if let Some(label) = none_label {
+        let selected_reset = label.contains("无") && selected.is_none();
+        if palette_reset(ui, label, selected_reset).clicked() {
             *clear_clicked = true;
         }
         ui.add_space(4.0);
     }
-
-    ui.label(egui::RichText::new("主题颜色").size(11.0).color(pal.text_weak));
-    let matrix = wps_theme_matrix();
-    let cell_sz = Vec2::new(17.0, 15.0);
-    let gap = 4.0;
-    for (ri, row) in matrix.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for rgb in row {
-                let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                let (rect, resp) = ui.allocate_exact_size(cell_sz, Sense::click());
-                ui.painter().rect_filled(rect, 2.0, c);
-                let is_cur = selected == Some(*rgb);
-                let stroke = if is_cur {
-                    Stroke::new(2.0, ui_kit::BRAND_NAVY)
-                } else if resp.hovered() {
-                    Stroke::new(1.5, ui_kit::ACCENT)
-                } else {
-                    Stroke::new(0.8, Color32::from_rgb(212, 216, 224))
-                };
-                ui.painter().rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
-                if resp.clicked() {
-                    *picked = Some(*rgb);
+    let pal = crate::theme::palette();
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        ui.spacing_mut().interact_size.y = 17.0;
+        let accessible = ui_kit::is_accesskit_active(ui.ctx());
+        let mut color_row = |ui: &mut egui::Ui, colors: &[[u8; 3]]| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for &rgb in colors.iter().take(10) {
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+                    let color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                    let current = selected == Some(rgb);
+                    let border = if current || resp.has_focus() || resp.hovered() { pal.accent } else { pal.card_border };
+                    ui.painter().rect(rect, 2.0, color, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                    if current {
+                        let mark = if egui::Rgba::from(color).intensity() > 0.18 { Color32::BLACK } else { Color32::WHITE };
+                        let mid = rect.center();
+                        ui.painter().add(egui::Shape::line(vec![
+                            mid + egui::vec2(-4.0, 0.0), mid + egui::vec2(-1.0, 3.0), mid + egui::vec2(4.0, -3.0),
+                        ], Stroke::new(1.6, mark)));
+                    }
+                    if resp.has_focus() {
+                        ui.painter().rect_stroke(rect.expand(1.0), 3.0, Stroke::new(1.5, pal.accent), egui::StrokeKind::Outside);
+                    }
+                    if resp.clicked() {
+                        *picked = Some(rgb);
+                    }
+                    if resp.hovered() || accessible {
+                        let label = format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+                        ui_kit::a11y_name(&resp, &label, ui.is_enabled(), Some(current));
+                        resp.on_hover_text(label);
+                    }
                 }
-            }
-        });
-        ui.add_space(if ri == 0 { 4.0 } else { 1.5 });
-    }
-
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new("标准色").size(11.0).color(pal.text_weak));
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for rgb in WPS_STANDARD_COLORS {
-            let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-            let (rect, resp) = ui.allocate_exact_size(cell_sz, Sense::click());
-            ui.painter().rect_filled(rect, 2.0, c);
-            let is_cur = selected == Some(rgb);
-            let stroke = if is_cur {
-                Stroke::new(2.0, ui_kit::BRAND_NAVY)
-            } else if resp.hovered() {
-                Stroke::new(1.5, ui_kit::ACCENT)
-            } else {
-                Stroke::new(0.8, Color32::from_rgb(212, 216, 224))
-            };
-            ui.painter().rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
-            if resp.clicked() {
-                *picked = Some(rgb);
-            }
+            });
+        };
+        ui.label(egui::RichText::new("主题颜色").size(ui_kit::T_SMALL).color(pal.text_weak));
+        for (i, row) in wps_theme_matrix().iter().enumerate() {
+            if i == 1 { ui.add_space(3.0); }
+            color_row(ui, row);
+        }
+        ui.add_space(5.0);
+        ui.label(egui::RichText::new("标准色").size(ui_kit::T_SMALL).color(pal.text_weak));
+        color_row(ui, &WPS_STANDARD_COLORS);
+        if !recent.is_empty() {
+            ui.add_space(5.0);
+            ui.label(egui::RichText::new("最近使用").size(ui_kit::T_SMALL).color(pal.text_weak));
+            color_row(ui, recent);
         }
     });
-
-    if !recent.is_empty() {
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("最近使用").size(11.0).color(pal.text_weak));
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for rgb in recent.iter().take(10) {
-                let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                let (rect, resp) = ui.allocate_exact_size(cell_sz, Sense::click());
-                ui.painter().rect_filled(rect, 2.0, c);
-                let stroke = if selected == Some(*rgb) {
-                    Stroke::new(2.0, ui_kit::BRAND_NAVY)
-                } else if resp.hovered() {
-                    Stroke::new(1.5, ui_kit::ACCENT)
-                } else {
-                    Stroke::new(0.8, Color32::from_rgb(212, 216, 224))
-                };
-                ui.painter().rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
-                if resp.clicked() {
-                    *picked = Some(*rgb);
-                }
-            }
-        });
-    }
 }
 
 fn check_outside_dismiss(ctx: &egui::Context, pass_id: egui::Id, rects: &[Rect]) -> bool {
@@ -276,6 +257,23 @@ const DOC_TAB_MIN: f32 = 84.0;
 const DOC_TAB_GAP: f32 = 3.0;
 const DOC_ACTION_SLOT: f32 = 28.0;
 
+struct SheetTabDrag {
+    doc_uid: u64,
+    sheet_id: u64,
+}
+
+struct SheetTabLayout {
+    index: usize,
+    label: std::sync::Arc<egui::Galley>,
+    start: f32,
+}
+
+impl SheetTabLayout {
+    fn width(&self) -> f32 {
+        self.label.size().x + tokens::size::SHEET_TAB_PAD
+    }
+}
+
 /// Reserve the new-document button and, when needed, the document switcher.
 /// Keep the active tab in the visible run even when it is the last of many.
 fn document_tab_layout(count: usize, active: usize, available: f32) -> (std::ops::Range<usize>, f32) {
@@ -308,6 +306,193 @@ fn document_tabs_keep_active_workbook_and_actions_in_bounds() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sheet_tab_tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, app: &mut SheetApp, events: Vec<egui::Event>) -> egui::FullOutput {
+        ctx.run(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(760.0, 420.0))),
+            events, ..Default::default()
+        }, |ctx| app.draw_wps_bottom_bar(ctx))
+    }
+
+    fn button_event(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+            pos, pressed, button: egui::PointerButton::Primary, modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    fn text_rect(out: &egui::FullOutput, label: &str) -> Option<(Rect, Rect, bool)> {
+        out.shapes.iter().find_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(t) if t.galley.job.text == label => {
+                Some((Rect::from_min_size(t.pos, t.galley.size()), clipped.clip_rect, t.galley.elided))
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn sheet_tab_strip_reveals_active_sheet_and_keeps_overflow_controls_reachable() {
+        let _env = crate::test_env::TestEnv::new("sheet-tab-strip");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.new_document();
+        let first = frame(&ctx, &mut app, Vec::new());
+        let name = &app.wb.sheets[0].name;
+        let (first_text, _, _) = text_rect(&first, name).unwrap();
+        let plus = ctx.read_response(egui::Id::new("newsheet")).unwrap().rect;
+        assert!((0.0..=20.0).contains(&(plus.left() - first_text.right())));
+        assert!(ctx.read_response(egui::Id::new("sheet_list_button")).is_none());
+
+        for i in 1..12 {
+            app.wb.sheets.push(sheetcore::Sheet::new(&format!("长表名用于核对不同地区每月收入与支出明细归档工作表{i}")));
+        }
+        app.wb.sheets[10].hidden = true;
+        app.switch_sheet_relative(-1);
+        assert_eq!(app.sheet_idx, 11);
+        let last = frame(&ctx, &mut app, Vec::new());
+        let (text, clip, elided) = text_rect(&last, &app.wb.sheets[11].name).unwrap();
+        assert!(elided && clip.contains_rect(text));
+        assert!(app.tab_scroll > 0.0);
+        assert!(text_rect(&last, &app.wb.sheets[10].name).is_none());
+        let list = ctx.read_response(egui::Id::new("sheet_list_button")).unwrap().rect;
+        let left = ctx.read_response(egui::Id::new(("tabscroll", 0usize))).unwrap().rect.center();
+        let old_offset = app.tab_scroll;
+        frame(&ctx, &mut app, button_event(left, true));
+        frame(&ctx, &mut app, button_event(left, false));
+        frame(&ctx, &mut app, Vec::new());
+        assert!(app.tab_scroll < old_offset, "manual browsing must survive the next frame");
+        assert_eq!(app.sheet_idx, 11);
+        frame(&ctx, &mut app, button_event(list.center(), true));
+        frame(&ctx, &mut app, button_event(list.center(), false));
+        assert!(app.sheet_list_open);
+        app.sheet_list_open = false;
+        app.switch_sheet_relative(1);
+        let home = frame(&ctx, &mut app, Vec::new());
+        let (text, clip, _) = text_rect(&home, &app.wb.sheets[0].name).unwrap();
+        assert!(clip.contains_rect(text));
+        assert_eq!(app.tab_scroll, 0.0);
+        let count = app.wb.sheets.len();
+        let plus = ctx.read_response(egui::Id::new("newsheet")).unwrap().rect.center();
+        frame(&ctx, &mut app, button_event(plus, true));
+        frame(&ctx, &mut app, button_event(plus, false));
+        assert_eq!(app.wb.sheets.len(), count + 1);
+    }
+
+    #[test]
+    fn sheet_tab_list_click_preserves_formula_picking_and_plain_click_group_behavior() {
+        let env = crate::test_env::TestEnv::new("sheet-tab-list-pick");
+        env.sc("SC_AUTO_SHARE", "0");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.new_document();
+        app.wb.sheets = ["一月", "二月", "三月"].map(sheetcore::Sheet::new).into();
+        let pick = |app: &mut SheetApp, name: &str| {
+            let draw = |app: &mut SheetApp, events| {
+                ctx.run(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(760.0, 420.0))),
+                    events, ..Default::default()
+                }, |ctx| eframe::App::update(app, ctx, &mut eframe::Frame::_new_kittest()))
+            };
+            app.sheet_list_open = true;
+            draw(app, vec![]);
+            let out = draw(app, vec![]);
+            let text = out.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == name && t.pos.y < 350.0 => {
+                    Some(Rect::from_min_size(t.pos, t.galley.size()))
+                }
+                _ => None,
+            }).expect("visible dialog row");
+            // Click well past the short label, inside the row.
+            let pos = egui::pos2(text.left() + 160.0, text.center().y);
+            draw(app, button_event(pos, true));
+            draw(app, button_event(pos, false));
+            assert!(!app.sheet_list_open);
+            draw(app, vec![]);
+        };
+
+        app.selected_sheets.extend([0, 1]);
+        pick(&mut app, "二月");
+        assert_eq!(app.sheet_idx, 1);
+        assert_eq!(app.selected_sheets.len(), 2);
+        pick(&mut app, "三月");
+        assert_eq!(app.sheet_idx, 2);
+        assert!(app.selected_sheets.is_empty());
+
+        app.begin_edit(Some("=1+".into()));
+        pick(&mut app, "一月");
+        assert_eq!(app.sheet_idx, 0);
+        assert_eq!(app.edit_sheet, Some(2));
+        assert_eq!(app.editing.as_ref().unwrap().buf, "=1+");
+        assert!(app.status.contains("点选引用"));
+        app.insert_pick_reference(4, 2);
+        assert!(app.editing.as_ref().unwrap().buf.ends_with("!C5"));
+    }
+
+    #[test]
+    fn grouped_sheet_tabs_mark_the_active_sheet_separately_from_other_members() {
+        let _env = crate::test_env::TestEnv::new("sheet-tab-group");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.new_document();
+        app.wb.sheets = ["一月", "二月", "三月"].map(sheetcore::Sheet::new).into();
+        app.selected_sheets.extend([0, 1]);
+        app.wb.sheets[1].tab_color = Some([230, 81, 0]);
+        let out = frame(&ctx, &mut app, Vec::new());
+        let rect = |name| text_rect(&out, name).unwrap().0;
+        let has_fill = |text: Rect, fill, min_width| {
+            out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                if r.fill == fill && r.rect.width() >= min_width && r.rect.x_range().contains(text.center().x)))
+        };
+        let pal = crate::theme::palette();
+        assert!(has_fill(rect("一月"), pal.accent, 20.0), "active tab has the underline");
+        assert!(!has_fill(rect("二月"), pal.accent, 20.0));
+        assert!(has_fill(rect("二月"), pal.accent_tint, 20.0), "group member has its own surface");
+        assert!(!has_fill(rect("三月"), pal.accent_tint, 20.0));
+        assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+            if r.fill == Color32::from_rgb(230, 81, 0))));
+    }
+
+    #[test]
+    fn sheet_tab_drag_moves_once_on_drop_and_respects_structure_protection() {
+        let _env = crate::test_env::TestEnv::new("sheet-tab-drop");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.new_document();
+        app.wb.sheets = ["A", "B", "C", "D"].map(sheetcore::Sheet::new).into();
+        let before = frame(&ctx, &mut app, Vec::new());
+        let center = |out: &egui::FullOutput, name: &str| text_rect(out, name).unwrap().0.center();
+        let a = center(&before, "A");
+        let c = center(&before, "C");
+        let names = |app: &SheetApp| app.wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+        let drag_to_c = |app: &mut SheetApp| {
+            frame(&ctx, app, button_event(a, true));
+            frame(&ctx, app, vec![egui::Event::PointerMoved(a + Vec2::new(9.0, 0.0))]);
+            frame(&ctx, app, vec![egui::Event::PointerMoved(c)]);
+        };
+        drag_to_c(&mut app);
+        assert_eq!(names(&app), ["A", "B", "C", "D"]);
+        frame(&ctx, &mut app, button_event(egui::pos2(20.0, 60.0), false));
+        assert_eq!(names(&app), ["A", "B", "C", "D"], "drop outside the strip cancels");
+        drag_to_c(&mut app);
+        frame(&ctx, &mut app, button_event(c, false));
+        assert_eq!(names(&app), ["B", "C", "A", "D"]);
+
+        app.wb.protection = Some(sheetcore::protection::WorkbookProtection { lock_structure: true, ..Default::default() });
+        let locked = frame(&ctx, &mut app, Vec::new());
+        let from = center(&locked, "B");
+        let to = center(&locked, "A");
+        frame(&ctx, &mut app, button_event(from, true));
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(to)]);
+        frame(&ctx, &mut app, button_event(to, false));
+        let plus = ctx.read_response(egui::Id::new("newsheet")).unwrap().rect.center();
+        frame(&ctx, &mut app, button_event(plus, true));
+        frame(&ctx, &mut app, button_event(plus, false));
+        assert_eq!(names(&app), ["B", "C", "A", "D"]);
     }
 }
 
@@ -1184,6 +1369,8 @@ impl SheetApp {
                 );
                 let mut goto: Option<usize> = None;
                 let mut ren: Option<(usize, String)> = None;
+                let mut move_sheet = None;
+                let structure_unavailable = self.sheet_structure_unavailable_reason();
 
                 let split_x = (rect.left() + rect.width() * ratio)
                     .clamp(rect.left() + 180.0, (rect.right() - 160.0).max(rect.left() + 180.0));
@@ -1192,12 +1379,51 @@ impl SheetApp {
                 let hsb_right = (rect.right() - SB).max(split_x + 24.0);
                 let hsb_rect = Rect::from_min_max(egui::pos2(split_x + 4.0, rect.top()), egui::pos2(hsb_right, rect.bottom()));
 
-                // 左侧工作表标签滚动区（右边留 34px 给常驻 `+`）
+                let content_left = left_rect.left() + 8.0;
+                let content_right = left_rect.right() - 32.0;
+                let tab_space = (content_right - content_left).max(1.0);
+                let label_limit = tab_space.min(192.0);
+                let mut sheet_tabs: Vec<_> = self.wb.sheets.iter().enumerate()
+                    .filter(|(_, sheet)| !sheet.hidden)
+                    .map(|(index, sheet)| SheetTabLayout {
+                        index,
+                        label: ui_kit::sheet_tab_label(ui, &sheet.name, index == self.sheet_idx, label_limit),
+                        start: 0.0,
+                    })
+                    .collect();
+                let total: f32 = sheet_tabs.iter().map(SheetTabLayout::width).sum();
+                let overflow = total > tab_space;
+                let nav_width = if overflow { 76.0 } else { 0.0 };
                 let scroll_rect = Rect::from_min_max(
-                    egui::pos2(left_rect.left() + 70.0, left_rect.top()),
-                    egui::pos2((left_rect.right() - 34.0).max(left_rect.left() + 90.0), left_rect.bottom()),
+                    egui::pos2(content_left + nav_width, left_rect.top()),
+                    egui::pos2(content_right, left_rect.bottom()),
                 );
-                let max_tab_scroll = ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
+                let mut tab_end = 0.0;
+                for tab in &mut sheet_tabs {
+                    let sheet = &self.wb.sheets[tab.index];
+                    let active = tab.index == self.sheet_idx;
+                    if tab.width() > scroll_rect.width() {
+                        tab.label = ui_kit::sheet_tab_label(ui, &sheet.name, active, scroll_rect.width());
+                    }
+                    tab.start = tab_end;
+                    tab_end += tab.width();
+                    if active {
+                        // 仅在切表或标签几何变化时显露活动表，手动浏览其他标签时保留滚动位置。
+                        let key = (self.doc_uid, sheet.identity, tab.start.to_bits(), tab_end.to_bits(), scroll_rect.width().to_bits());
+                        let id = egui::Id::new("visible_active_sheet_tab");
+                        let reveal = ctx.data_mut(|data| {
+                            if data.get_temp(id) == Some(key) { return false; }
+                            data.insert_temp(id, key);
+                            true
+                        });
+                        if reveal {
+                            self.tab_scroll = self.tab_scroll.max(tab_end - scroll_rect.width()).min(tab.start);
+                        }
+                    }
+                }
+                let max_tab_scroll = (tab_end - scroll_rect.width()).max(0.0);
+                self.tab_scroll = self.tab_scroll.clamp(0.0, max_tab_scroll);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
                     let area = egui::ScrollArea::horizontal()
                         .id_salt("sheet_tabs")
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -1205,47 +1431,41 @@ impl SheetApp {
                         .horizontal_scroll_offset(self.tab_scroll);
                     let out = area.show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            for i in 0..self.wb.sheets.len() {
-                                if self.wb.sheets[i].hidden {
-                                    continue;
-                                }
-                                let name = self.wb.sheets[i].name.clone();
+                            for tab in &sheet_tabs {
+                                let i = tab.index;
+                                let name = &self.wb.sheets[i].name;
                                 let tab_color = self.wb.sheets[i].tab_color;
                                 let is_grouped = self.selected_sheets.len() > 1
                                     && self.selected_sheets.contains(&i);
-                                let resp = ui_kit::sheet_tab(
-                                    ui,
-                                    &name,
-                                    self.sheet_idx == i || is_grouped,
-                                    tab_color,
-                                );
-                                if is_grouped && self.sheet_idx != i {
-                                    let r = resp.rect;
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(r.left() + 4.0, r.bottom() - 1.5),
-                                            egui::pos2(r.right() - 4.0, r.bottom() - 1.5),
-                                        ],
-                                        Stroke::new(2.0, crate::theme::palette().accent),
-                                    );
+                                let resp = ui_kit::sheet_tab(ui, name, tab.label.clone(), self.sheet_idx == i, is_grouped, tab_color);
+                                if resp.gained_focus() {
+                                    resp.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
                                 }
-                                if resp.drag_started() {
-                                    self.tab_drag = Some(i);
-                                }
-                                if let Some(from) = self.tab_drag {
-                                    if from != i && resp.hovered() && ui.input(|ip| ip.pointer.any_down()) && self.swap_sheet_positions(from, i) {
-                                        self.tab_drag = Some(i);
+                                if structure_unavailable.is_none() {
+                                    if resp.drag_started_by(egui::PointerButton::Primary) {
+                                        resp.dnd_set_drag_payload(SheetTabDrag { doc_uid: self.doc_uid, sheet_id: self.wb.sheets[i].identity });
                                     }
-                                }
-                                if resp.drag_stopped() {
-                                    self.tab_drag = None;
+                                    if let Some(source) = resp.dnd_hover_payload::<SheetTabDrag>().filter(|s| s.doc_uid == self.doc_uid) {
+                                        if let Some(from) = self.wb.sheets.iter().position(|sheet| sheet.identity == source.sheet_id).filter(|&from| from != i) {
+                                            let x = if from < i { resp.rect.right() - 1.0 } else { resp.rect.left() + 1.0 };
+                                            ui.painter().line_segment(
+                                                [egui::pos2(x, resp.rect.top() + 4.0), egui::pos2(x, resp.rect.bottom() - 4.0)],
+                                                Stroke::new(2.0, pal.accent),
+                                            );
+                                            if ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
+                                                && resp.dnd_release_payload::<SheetTabDrag>().is_some() {
+                                                move_sheet = Some((from, i));
+                                            }
+                                        }
+                                    }
                                 }
                                 if resp.clicked() {
                                     let (ctrl, shift) = ui.input(|ip| (ip.modifiers.command, ip.modifiers.shift));
-                                    if self.editing.as_ref().is_some_and(|ed| ed.buf.starts_with('=')) {
-                                        self.switch_sheet_for_ref(i);
+                                    if (!ctrl && !shift) || self.editing.as_ref().is_some_and(|ed| ed.buf.starts_with('=')) {
+                                        self.activate_sheet_tab(i);
+                                    } else if !self.finish_pending_edit() {
+                                        continue;
                                     } else if ctrl {
-                                        self.commit_edit(None);
                                         if self.selected_sheets.is_empty() {
                                             self.selected_sheets.insert(self.sheet_idx);
                                         }
@@ -1270,8 +1490,7 @@ impl SheetApp {
                                         } else {
                                             self.selected_sheets.clear();
                                         }
-                                    } else if shift {
-                                        self.commit_edit(None);
+                                    } else {
                                         self.selected_sheets.clear();
                                         let lo = self.sheet_idx.min(i);
                                         let hi = self.sheet_idx.max(i);
@@ -1285,16 +1504,10 @@ impl SheetApp {
                                                 self.selected_sheets.len()
                                             );
                                         }
-                                    } else {
-                                        self.commit_edit(None);
-                                        if !self.selected_sheets.contains(&i) {
-                                            self.selected_sheets.clear();
-                                        }
-                                        goto = Some(i);
                                     }
                                 }
-                                if resp.double_clicked() {
-                                    ren = Some((i, name.clone()));
+                                if resp.double_clicked() && structure_unavailable.is_none() {
+                                    ren = Some((i, self.wb.sheets[i].name.clone()));
                                 }
                                 if resp.secondary_clicked() {
                                     if self.editing.is_some() && !self.finish_pending_edit() {
@@ -1317,46 +1530,67 @@ impl SheetApp {
                         });
                     });
                     self.tab_scroll = out.state.offset.x;
-                    (out.content_size.x - out.inner_rect.width()).max(0.0)
-                }).inner;
+                });
 
-                // 左侧 `< >` 按钮（28×31 紧凑排布）
-                for (i, (d, label)) in [(-1.0, "工作表标签左移"), (1.0, "工作表标签右移")].into_iter().enumerate() {
-                    let b = Rect::from_min_size(egui::pos2(left_rect.left() + 10.0 + i as f32 * 28.0, left_rect.top() + 1.0), Vec2::new(28.0, 31.0));
-                    let can = if d < 0.0 { self.tab_scroll > 0.5 } else { self.tab_scroll + 0.5 < max_tab_scroll };
-                    let sense = if can { Sense::click() } else { Sense::hover() };
-                    let resp = ui.interact(b, egui::Id::new(("tabscroll", i)), sense);
-                    ui_kit::a11y_name(&resp, label, can, None);
-                    if resp.hovered() && can {
-                        ui.painter().rect_filled(b.shrink(4.0), 3.0, pal.hover_on_page);
+                if overflow {
+                    for (i, (d, label)) in [(-1.0, "工作表标签左移"), (1.0, "工作表标签右移")].into_iter().enumerate() {
+                        let b = Rect::from_min_size(egui::pos2(content_left + i as f32 * 24.0, left_rect.top() + 1.0), Vec2::new(24.0, 30.0));
+                        let can = if d < 0.0 { self.tab_scroll > 0.5 } else { self.tab_scroll + 0.5 < max_tab_scroll };
+                        let sense = if can { Sense::click() } else { Sense::hover() };
+                        let resp = ui.interact(b, egui::Id::new(("tabscroll", i)), sense);
+                        ui_kit::a11y_name(&resp, label, can, None);
+                        if resp.hovered() && can {
+                            ui.painter().rect_filled(b.shrink(4.0), 3.0, pal.hover_on_page);
+                        }
+                        if resp.clicked() && can {
+                            let boundary = if d < 0.0 {
+                                sheet_tabs.iter().rev().find(|tab| tab.start < self.tab_scroll - 0.5)
+                            } else {
+                                sheet_tabs.iter().find(|tab| tab.start > self.tab_scroll + 0.5)
+                            };
+                            let edge = if d < 0.0 { 0.0 } else { max_tab_scroll };
+                            self.tab_scroll = boundary.map_or(edge, |tab| tab.start).clamp(0.0, max_tab_scroll);
+                            ctx.request_repaint();
+                        }
+                        let c = b.center();
+                        let st = Stroke::new(1.1, if can { pal.text_weak } else { pal.text_muted });
+                        if can {
+                            ui_kit::focus_ring(ui, &resp, b.shrink(3.0), 3.0);
+                            resp.on_hover_text(label);
+                        }
+                        ui.painter().line_segment([egui::pos2(c.x - d * 2.5, c.y - 4.5), egui::pos2(c.x + d * 2.5, c.y)], st);
+                        ui.painter().line_segment([egui::pos2(c.x + d * 2.5, c.y), egui::pos2(c.x - d * 2.5, c.y + 4.5)], st);
                     }
-                    if resp.clicked() && can {
-                        self.tab_scroll = (self.tab_scroll + d * 160.0).clamp(0.0, max_tab_scroll);
-                        ctx.request_repaint();
+                    let list = Rect::from_min_size(egui::pos2(content_left + 48.0, left_rect.top() + 1.0), Vec2::new(24.0, 30.0));
+                    let resp = ui.interact(list, egui::Id::new("sheet_list_button"), Sense::click());
+                    ui_kit::a11y_name(&resp, "工作表列表", true, None);
+                    if resp.hovered() {
+                        ui.painter().rect_filled(list.shrink(2.0), 4.0, pal.hover_on_page);
                     }
-                    let c = b.center();
-                    let st = Stroke::new(1.1, if can { pal.text_weak } else { pal.text_muted });
-                    if can {
-                        ui_kit::focus_ring(ui, &resp, b.shrink(3.0), 3.0);
-                        resp.on_hover_text(label);
+                    for dx in [-4.0, 0.0, 4.0] {
+                        ui.painter().circle_filled(list.center() + Vec2::new(dx, 0.0), 1.3, pal.text);
                     }
-                    ui.painter().line_segment([egui::pos2(c.x - d * 2.5, c.y - 4.5), egui::pos2(c.x + d * 2.5, c.y)], st);
-                    ui.painter().line_segment([egui::pos2(c.x + d * 2.5, c.y), egui::pos2(c.x - d * 2.5, c.y + 4.5)], st);
+                    ui_kit::focus_ring(ui, &resp, list.shrink(2.0), 4.0);
+                    if resp.on_hover_text("打开工作表列表，可搜索表名").clicked() {
+                        self.sheet_list_query.clear();
+                        self.sheet_list_open = true;
+                    }
                 }
 
-                // 常驻「+ 新建工作表」按钮（紧邻分割条左侧）
-                let nb = Rect::from_min_size(egui::pos2(left_rect.right() - 32.0, left_rect.top() + 1.0), Vec2::new(30.0, 31.0));
-                let nresp = ui.interact(nb, egui::Id::new("newsheet"), Sense::click());
-                ui_kit::a11y_name(&nresp, "新建工作表", true, None);
+                let plus_x = (scroll_rect.left() + tab_end).min(content_right);
+                let nb = Rect::from_min_size(egui::pos2(plus_x, left_rect.top() + 1.0), Vec2::new(28.0, 30.0));
+                let can_add = structure_unavailable.is_none();
+                let nresp = ui.interact(nb, egui::Id::new("newsheet"), if can_add { Sense::click() } else { Sense::hover() });
+                ui_kit::a11y_name(&nresp, "新建工作表", can_add, None);
                 ui_kit::focus_ring(ui, &nresp, nb.shrink(3.0), 3.0);
-                if nresp.hovered() {
+                if nresp.hovered() && can_add {
                     ui.painter().rect_filled(nb.shrink2(Vec2::new(2.0, 4.0)), 5.0, pal.hover_on_page);
                 }
                 let c = nb.center();
-                let st = Stroke::new(1.2, pal.text);
+                let st = Stroke::new(1.2, if can_add { pal.text } else { pal.text_muted });
                 ui.painter().line_segment([egui::pos2(c.x - 4.5, c.y), egui::pos2(c.x + 4.5, c.y)], st);
                 ui.painter().line_segment([egui::pos2(c.x, c.y - 4.5), egui::pos2(c.x, c.y + 4.5)], st);
-                if nresp.on_hover_text("新建工作表").clicked() {
+                if nresp.on_hover_text(structure_unavailable.unwrap_or("新建工作表")).clicked() && can_add {
                     self.add_sheet();
                 }
 
@@ -1406,6 +1640,9 @@ impl SheetApp {
                 crate::scrollbar(ui, "hsb", hsb_bar, true, &mut sx, total_w, view_w);
                 self.scroll.x = sx.clamp(0.0, hard_max_x);
 
+                if let Some((from, to)) = move_sheet {
+                    self.swap_sheet_positions(from, to);
+                }
                 if let Some(i) = goto {
                     if i != self.sheet_idx {
                         self.switch_sheet_view(i);

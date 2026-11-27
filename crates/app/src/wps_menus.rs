@@ -2687,9 +2687,7 @@ impl SheetApp {
         let mut close = false;
         let mut exec_ref = false;
         let mut exec_special: Option<SpecialTarget> = None;
-        let title = if st.tab == 1 { "定位条件" } else { "定位" };
-
-        ui_kit::window(ctx, title, 380.0).open(&mut open).show(ctx, |ui| {
+        ui_kit::window(ctx, "定位", 380.0).open(&mut open).show(ctx, |ui| {
             ui.set_width(350.0);
             ui_kit::dialog_tabs(ui, &mut st.tab, &["定位引用", "定位条件"]);
             ui.add_space(6.0);

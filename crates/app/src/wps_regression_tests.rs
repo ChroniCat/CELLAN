@@ -24,6 +24,80 @@ fn wps_frame(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event>, 
 }
 
 #[test]
+fn command_search_exposes_later_matches_and_executes_the_current_input() {
+    let _env = crate::test_env::TestEnv::new("command-search-results");
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    app.palette_open = true;
+    let key = |key| egui::Event::Key {
+        key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+    };
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(760.0, 420.0));
+    let frame = |app: &mut SheetApp, events| ctx.run(egui::RawInput {
+        screen_rect: Some(screen), events, ..Default::default()
+    }, |ctx| app.command_palette(ctx));
+    let mut matches = palette::filter(&palette::entries(&app), "");
+    cmdusage::rank(&mut matches, &cmdusage::load());
+    let _ = frame(&mut app, vec![]);
+    let _ = frame(&mut app, vec![]);
+    for _ in 0..43 {
+        let _ = frame(&mut app, vec![key(Key::ArrowDown)]);
+    }
+    let after = frame(&mut app, vec![]);
+    assert_eq!(app.palette_idx, 43);
+    assert!(after.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
+        if t.galley.job.text == matches[43].label && s.clip_rect.contains(t.visual_bounding_rect().center()))),
+        "选中的命令应滚入视口：{}", matches[43].label);
+
+    let _ = frame(&mut app, vec![key(Key::Enter), egui::Event::Text("冻结首行".into())]);
+    assert_eq!(app.palette_q, "冻结首行", "搜索栏应收到本帧的新查询");
+    assert_eq!(app.wb.sheet(0).freeze, Some((1, 0)), "已执行的动作：{:?}", cmdusage::load());
+    assert!(!app.palette_open);
+
+    app.palette_open = true;
+    app.palette_q.clear();
+    let _ = frame(&mut app, vec![]);
+    let _ = frame(&mut app, vec![egui::Event::Text("About".into()), key(Key::Enter)]);
+    assert!(app.about_open && !app.palette_open, "输入与 Enter 同帧应执行当前查询命令");
+}
+
+#[test]
+fn find_results_show_last_match_beyond_five_hundred_and_only_report_current_count() {
+    let _env = crate::test_env::TestEnv::new("find-results-list");
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    for row in 0..525 {
+        app.wb.sheet_mut(0).set(row, 0, Cell { value: Value::Text("同名".into()), formula: None });
+    }
+    app.find.find = "同名".into();
+    app.find_summary(true);
+    assert_eq!(app.current_find_count(), Some(525));
+    app.find.find = "其他".into();
+    assert_eq!(app.current_find_count(), None);
+    let frame = |app: &mut SheetApp, events| ctx.run(egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 700.0))),
+        events, ..Default::default()
+    }, |ctx| app.find_all_window(ctx));
+    let _ = frame(&mut app, vec![]);
+    let initial = frame(&mut app, vec![]);
+    let locate = |output: &egui::FullOutput, label: &str| output.shapes.iter().find_map(|s| match &s.shape {
+        egui::Shape::Text(t) if t.galley.job.text == label && s.clip_rect.contains_rect(t.visual_bounding_rect()) => {
+            Some(t.visual_bounding_rect().center())
+        }
+        _ => None,
+    });
+    let first = locate(&initial, "A1").expect("首条匹配应可见");
+    let mut after = frame(&mut app, vec![egui::Event::PointerMoved(first), egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -30_000.0), modifiers: egui::Modifiers::NONE,
+    }]);
+    for _ in 0..60 {
+        if locate(&after, "A525").is_some() { break; }
+        after = frame(&mut app, vec![]);
+    }
+    assert!(locate(&after, "A525").is_some(), "最后一条结果必须能滚进视口");
+}
+
+#[test]
 fn cat1_sparse_whole_col_row_sheet_styles_and_clear() {
     let ctx = egui::Context::default();
     let mut app = wps_app(&ctx);
@@ -1923,6 +1997,32 @@ fn giant_ctrl_a_and_whole_column_operations_do_not_oom_or_freeze() {
         "全套超大选区操作应在毫秒级完成，实际耗时 {:?}",
         t0.elapsed()
     );
+}
+
+#[test]
+fn frozen_grid_background_follows_theme_switches() {
+    let _env = crate::test_env::TestEnv::new("frozen-grid-theme");
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    app.new_document();
+    app.wb.sheet_mut(0).freeze = Some((1, 1));
+
+    for theme in crate::theme::AppTheme::ALL {
+        app.prefs.theme = theme as u8;
+        wps_frame(&mut app, &ctx, Vec::new(), egui::Modifiers::NONE);
+        let background = crate::theme::palette_for(theme).grid_bg;
+        let mut panels = 0;
+        for (clip, shapes) in &app.cf_inputs.grid.viewport.frozen_batches {
+            let Some(egui::Shape::Mesh(mesh)) = shapes.first() else { continue };
+            let Some(quad) = mesh.vertices.get(..4) else { continue };
+            let corners = [clip.left_top(), clip.right_top(), clip.left_bottom(), clip.right_bottom()];
+            if corners.iter().all(|corner| quad.iter().any(|v| v.pos == *corner)) {
+                assert!(quad.iter().all(|v| v.color == background), "{theme:?} {clip:?}");
+                panels += 1;
+            }
+        }
+        assert_eq!(panels, 3, "expected frozen row, column and corner in {theme:?}");
+    }
 }
 
 #[test]

@@ -659,6 +659,17 @@ impl SheetApp {
         }
     }
 
+    /// Only display a completed count for the search currently shown in the form.
+    pub(super) fn current_find_count(&self) -> Option<usize> {
+        let nav = self.find_navigation.as_ref()?;
+        if nav.receiver.is_some() || self.find.find.is_empty() {
+            return None;
+        }
+        let query = self.navigation_query();
+        let current = *nav.query == query || nav.verified.borrow().as_ref() == Some(&query);
+        current.then(|| nav.hits.len())
+    }
+
     pub(super) fn indexing_find_summary(&self) -> bool {
         self.find_navigation
             .as_ref()

@@ -1873,7 +1873,11 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
         .anchor_size(rect.center(), galley.size())
         .min;
     ui.painter().galley(pos, galley, col);
-    a11y_name(&resp, if tip.is_empty() { label } else { tip }, enabled, None);
+    focus_ring(ui, &resp, rect, 3.0);
+    a11y_name(&resp, label, enabled, None);
+    if !tip.is_empty() && tip != label {
+        let _ = ui.ctx().accesskit_node_builder(resp.id, |node| node.set_description(tip));
+    }
     if crate::debug_flags::ui_log_2() {
         eprintln!("[ui]   pill {} w={:.1} x={:.1}", label, rect.width(), rect.min.x);
     }
@@ -1919,100 +1923,62 @@ pub fn close_icon_button(ui: &mut egui::Ui, tip: &str) -> Response {
     }
 }
 
-/// 工作表标签：Excel 365 —— 32 高，活动页白底 + 底部 2px 绿线
-pub fn sheet_tab(
-    ui: &mut egui::Ui,
-    name: &str,
-    active: bool,
-    color: Option<[u8; 3]>,
-) -> Response {
-    let (dark, hov_bg, weak_col) = {
-        let v = ui.visuals();
-        (v.dark_mode, v.widgets.hovered.weak_bg_fill, v.weak_text_color())
-    };
-    let font = if active && color.is_none() {
+/// 先排版再分配标签区：用相同的字形计算滚动边界和绘制省略号。
+pub fn sheet_tab_label(ui: &egui::Ui, name: &str, active: bool, max_width: f32) -> Arc<egui::Galley> {
+    let font = if active {
         medium_in(ui.ctx(), crate::tokens::text::BODY)
     } else {
         FontId::proportional(crate::tokens::text::BODY)
     };
-    let galley = ui
-        .painter()
-        .layout_no_wrap(name.to_owned(), font, Color32::PLACEHOLDER);
-    let size = Vec2::new(
-        galley.size().x + crate::tokens::size::SHEET_TAB_PAD,
-        crate::tokens::size::SHEET_TAB_H,
-    );
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    // UI-24.2：工作表标签在 UIA 里是 Tab 页，名字就是工作表名
-    a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active));
-    // 悬浮卡片外壳：标签条是页面灰底，标签画成上下各留 3px 的圆角小卡，
-    // 和上面的网格卡片、功能区卡片同一套语言；命中区域仍是整格，不影响点击/拖动。
-    let chip = rect.shrink2(Vec2::new(1.0, 3.0));
-    let rad = egui::CornerRadius::same(5);
-    let tab_rgb = color.map(|c| Color32::from_rgb(c[0], c[1], c[2]));
-    let text_pos = Align2::CENTER_CENTER
-        .anchor_size(rect.center(), galley.size())
-        .min;
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_owned(), font, Color32::PLACEHOLDER);
+    job.wrap = egui::text::TextWrapping::truncate_at_width((max_width - crate::tokens::size::SHEET_TAB_PAD).max(1.0));
+    ui.painter().layout_job(job)
+}
+
+pub fn sheet_tab(
+    ui: &mut egui::Ui,
+    name: &str,
+    galley: Arc<egui::Galley>,
+    active: bool,
+    grouped: bool,
+    color: Option<[u8; 3]>,
+) -> Response {
     let pal = crate::theme::palette();
-    if let Some(fill) = tab_rgb {
-        // 有颜色的标签：整块铺色；深色配白字
-        ui.painter().rect_filled(chip, rad, fill);
-        if active {
-            ui.painter().rect_stroke(chip, rad, Stroke::new(1.5, pal.accent), egui::StrokeKind::Inside);
-        }
-        let lum = 0.299 * fill.r() as f32 + 0.587 * fill.g() as f32 + 0.114 * fill.b() as f32;
-        let mut color = if lum > 165.0 {
-            Color32::from_rgb(30, 30, 30)
-        } else {
-            Color32::WHITE
-        };
-        if !active {
-            color = color.gamma_multiply(0.92);
-        }
-        ui.painter().galley_with_override_text_color(text_pos, galley, color);
-        return resp;
-    }
+    let size = Vec2::new(galley.size().x + crate::tokens::size::SHEET_TAB_PAD, crate::tokens::size::SHEET_TAB_H);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active || grouped));
+    let chip = rect.shrink2(Vec2::new(1.0, 3.0));
     if active {
-        // 活动页：底色与上方表格底栏衔接，底部以 2.5px 主题强调条清晰标出当前表
-        let chip = Rect::from_min_max(
-            egui::pos2(rect.left() + 1.0, rect.top()),
-            egui::pos2(rect.right() - 1.0, rect.bottom() - 3.0),
+        ui.painter().rect(chip, 4.0, pal.card_bg, Stroke::new(1.0, pal.card_border), egui::StrokeKind::Inside);
+        let bar = Rect::from_min_max(
+            egui::pos2(chip.left() + 6.0, chip.bottom() - 2.5),
+            egui::pos2(chip.right() - 6.0, chip.bottom()),
         );
-        let active_rad = egui::CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 };
-        ui.painter().rect_filled(chip, active_rad, pal.card_bg);
-        ui.painter().line_segment(
-            [chip.left_top(), chip.left_bottom() - Vec2::new(0.0, 4.0)],
-            Stroke::new(1.0, pal.card_border),
-        );
-        ui.painter().line_segment(
-            [chip.right_top(), chip.right_bottom() - Vec2::new(0.0, 4.0)],
-            Stroke::new(1.0, pal.card_border),
-        );
-        let bar = egui::Rect::from_min_size(
-            egui::pos2(chip.left() + 8.0, chip.bottom() - 2.5),
-            Vec2::new((chip.width() - 16.0).max(4.0), 2.5),
-        );
-        ui.painter().rect_filled(bar, 1.25, pal.accent);
-        ui.painter().galley_with_override_text_color(text_pos, galley, pal.accent);
-        return resp;
+        ui.painter().rect_filled(bar, 1.0, pal.accent);
+    } else if grouped {
+        ui.painter().rect_filled(chip, 4.0, pal.accent_tint);
+        ui.painter().rect_stroke(chip, 4.0, Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
     } else if resp.hovered() {
-        let hover = if dark { hov_bg } else { pal.hover_on_page };
-        ui.painter().rect_filled(rect.shrink2(Vec2::new(2.0, 4.0)), 5.0, hover);
+        ui.painter().rect_filled(chip, 4.0, pal.hover_on_page);
     }
-    let color = if dark {
-        weak_col
+
+    let color_offset = if let Some([r, g, b]) = color {
+        let swatch = Rect::from_center_size(egui::pos2(rect.left() + 10.0, rect.center().y), Vec2::splat(8.0));
+        ui.painter().rect(swatch, 2.0, Color32::from_rgb(r, g, b), Stroke::new(1.0, pal.text_weak), egui::StrokeKind::Inside);
+        5.0
     } else {
-        pal.text_weak
+        0.0
     };
-    ui.painter().galley_with_override_text_color(text_pos, galley, color);
-    ui.painter().line_segment(
-        [
-            egui::pos2(rect.right(), rect.center().y - 6.0),
-            egui::pos2(rect.right(), rect.center().y + 6.0),
-        ],
-        Stroke::new(1.0, pal.card_border),
-    );
-    resp
+    let text_pos = Align2::CENTER_CENTER.anchor_size(rect.center() + Vec2::new(color_offset, 0.0), galley.size()).min;
+    let text_color = if active || grouped { pal.text } else { pal.text_weak };
+    let elided = galley.elided;
+    ui.painter().galley_with_override_text_color(text_pos, galley, text_color);
+    focus_ring(ui, &resp, chip, 4.0);
+    if elided {
+        resp.on_hover_text(name)
+    } else {
+        resp
+    }
 }
 
 /// 统一样式的对话框窗口：自绘标题栏（左对齐标题 + 关闭按钮 + 可拖动），
@@ -2139,16 +2105,18 @@ impl Dlg {
         }
         let id = egui::Id::new(("dlgwin", &self.title));
         // UI-24.1：记住打开前的焦点，关闭时还回去
-        let now0 = ctx.input(|i| i.time);
-        let seen = ctx.data(|d| d.get_temp::<f64>(id.with("shown"))).unwrap_or(-10.0);
-        if now0 - seen > 0.5 {
+        let pass = ctx.cumulative_pass_nr();
+        let opening = ctx.data_mut(|d| {
+            let last = d.get_temp::<u64>(id.with("shown"));
+            d.insert_temp(id.with("shown"), pass);
+            last.is_none_or(|last| pass.saturating_sub(last) > 1)
+        });
+        let now = ctx.input(|i| i.time);
+        if opening {
             let before = ctx.memory(|m| m.focused());
             ctx.data_mut(|d| {
-                if let Some(f) = before {
-                    d.insert_temp(id.with("focus_before"), f);
-                } else {
-                    d.remove::<egui::Id>(id.with("focus_before"));
-                }
+                d.insert_temp(id.with("born"), now);
+                d.insert_temp(id.with("focus_before"), before);
             });
         }
         // UI-24.2：对话框在可访问树里要有 Dialog 角色和标题
@@ -2191,19 +2159,8 @@ impl Dlg {
             .data(|d| d.get_temp::<f32>(id.with("h")))
             .unwrap_or(self.height);
         let mut closed = false;
-        let now = ctx.input(|i| i.time);
-        let last = ctx
-            .data(|d| d.get_temp::<f64>(id.with("shown")))
-            .unwrap_or(-10.0);
-        let born = if now - last > 0.5 {
-            now
-        } else {
-            ctx.data(|d| d.get_temp::<f64>(id.with("born")))
-                .unwrap_or(now)
-        };
+        let born = ctx.data(|d| d.get_temp::<f64>(id.with("born"))).unwrap_or(now);
         ctx.data_mut(|d| {
-            d.insert_temp(id.with("born"), born);
-            d.insert_temp(id.with("shown"), now);
             d.insert_temp(egui::Id::new("dlg_born"), born);
         });
         let pal = crate::theme::palette();
@@ -2329,6 +2286,13 @@ impl Dlg {
                                 ui.set_max_width(w - 40.0);
                                 ui.spacing_mut().interact_size.y = 26.0;
                                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                                // 复选框仅 14pt 宽；沿用全局 6pt 圆角会看起来像单选框。
+                                let radius = egui::CornerRadius::same(crate::tokens::radius::MD as u8);
+                                let widgets = &mut ui.visuals_mut().widgets;
+                                widgets.inactive.corner_radius = radius;
+                                widgets.hovered.corner_radius = radius;
+                                widgets.active.corner_radius = radius;
+                                widgets.open.corner_radius = radius;
                                 // 标题与外边距留在视口内，未指定高度的对话框也可滚至底部。
                                 let top_inset = ui.cursor().top() - trect.top();
                                 let limit = (screen.height() - top_inset - 18.0 - 10.0).max(1.0);
@@ -2428,12 +2392,25 @@ impl Dlg {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
             });
             ctx.data_mut(|d| d.insert_temp(dialog_blocking_mark(), true));
-            // UI-24.1：关闭后焦点回到触发它的控件
-            if let Some(f) = ctx
-                .data(|d| d.get_temp::<egui::Id>(id.with("focus_before")))
-            {
-                ctx.memory_mut(|m| m.request_focus(f));
-                ctx.data_mut(|d| d.remove::<egui::Id>(id.with("focus_before")));
+            let opener = ctx.data_mut(|d| {
+                d.remove::<u64>(id.with("shown"));
+                d.remove_temp::<Option<egui::Id>>(id.with("focus_before")).flatten()
+            });
+            let focused = ctx.memory(|m| m.focused());
+            let layer = out.response.layer_id;
+            let owns_focus = focused.and_then(|f| ctx.read_response(f)).is_some_and(|r| r.layer_id == layer);
+            if focused.is_none() || owns_focus || focused == opener {
+                // A menu item can disappear as soon as it opens the dialog. Restoring
+                // its ID would leave AccessKit pointing outside the current tree.
+                let restore = opener.filter(|id| ctx.viewport(|v| {
+                    v.this_pass.widgets.get(*id).is_some_and(|w| w.enabled && w.sense.is_focusable() && w.layer_id != layer)
+                        && v.this_pass.accesskit_state.as_ref().is_none_or(|s| s.nodes.contains_key(id))
+                }));
+                if let Some(id) = restore {
+                    ctx.memory_mut(|m| m.request_focus(id));
+                } else if let Some(id) = focused {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                }
             }
         }
         ctx.data_mut(|d| {
@@ -2563,20 +2540,42 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
 
 /// 对话框标签页（现代 Excel 365 / WPS 扁平下划线胶囊页签）
 pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
+    if tabs.is_empty() {
+        return;
+    }
     let pal = crate::theme::palette();
-    let top = ui.cursor().top();
-    let left = ui.cursor().left();
-    let right = left + ui.available_width();
+    // 当前页共用一个稳定的 Tab 焦点，方向键换页时焦点仍在页签条内。
+    let active_id = ui.next_auto_id().with("active_dialog_tab");
+    if ui.memory(|m| m.has_focus(active_id)) {
+        ui.memory_mut(|m| m.set_focus_lock_filter(active_id, egui::EventFilter {
+            horizontal_arrows: true,
+            ..Default::default()
+        }));
+        let n = tabs.len();
+        *sel = ui.input_mut(|i| {
+            let idx = usize::from(*sel).min(n - 1);
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
+                0
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::End) {
+                n - 1
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                (idx + n - 1) % n
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                (idx + 1) % n
+            } else {
+                idx
+            }
+        }) as u8;
+    }
+    let width = ui.available_width();
+    let gap = crate::tokens::space::XS;
+    // 每格向下取整，预留行末间隙，避免逐控件像素取整将末页签挤入下一行。
+    let slot = (width / tabs.len() as f32 - gap).floor();
     let tab_h = 32.0;
-    ui.painter().line_segment(
-        [
-            egui::pos2(left, top + tab_h - 0.5),
-            egui::pos2(right, top + tab_h - 0.5),
-        ],
-        Stroke::new(1.0, pal.card_border),
-    );
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+    let rule = ui.painter().add(egui::Shape::Noop);
+    let mut clicked = None;
+    let row = ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(gap, 0.0);
         for (i, t) in tabs.iter().enumerate() {
             let on = *sel as usize == i;
             let font = if on {
@@ -2589,8 +2588,13 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
                 font,
                 Color32::PLACEHOLDER,
             );
-            let w = galley.size().x + 24.0;
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, tab_h), Sense::click());
+            let w = slot.min(92.0).max(galley.size().x + 16.0);
+            let (id, rect) = ui.allocate_space(Vec2::new(w, tab_h));
+            let resp = if on {
+                ui.interact(rect, active_id, Sense::click())
+            } else {
+                ui.interact(rect, id, Sense::click() - Sense::focusable_noninteractive())
+            };
             let pos = Align2::CENTER_CENTER
                 .anchor_size(rect.center(), galley.size())
                 .min;
@@ -2623,10 +2627,19 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
             focus_ring(ui, &resp, rect.shrink2(Vec2::new(0.0, 2.0)), 6.0);
             a11y_role(&resp, t, egui::accesskit::Role::Tab, Some(on));
             if resp.clicked() {
-                *sel = i as u8;
+                clicked = Some(i as u8);
             }
         }
     });
+    if let Some(index) = clicked {
+        *sel = index;
+        ui.memory_mut(|m| m.request_focus(active_id));
+        ui.ctx().request_repaint();
+    }
+    let r = row.response.rect;
+    ui.painter().set(rule, egui::Shape::hline(
+        r.left()..=r.left() + width, r.bottom() - 0.5, Stroke::new(1.0, pal.card_border),
+    ));
     ui.add_space(6.0);
 }
 
@@ -2637,7 +2650,7 @@ pub fn field(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
             egui::Vec2::new(64.0, 22.0),
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
-                ui.label(RichText::new(label).size(12.0).weak());
+                ui.label(RichText::new(label).size(12.0).color(crate::theme::palette().text_weak));
             },
         );
         add(ui);
@@ -2713,6 +2726,87 @@ pub fn draw_padlock(painter: &egui::Painter, rect: Rect, col: Color32) {
 #[cfg(test)]
 mod state_tests {
     use super::*;
+
+    #[test]
+    fn closing_dialog_keeps_accesskit_focus_on_a_current_widget() {
+        let _env = crate::test_env::TestEnv::new("dialog-focus-restoration");
+        for focus_elsewhere in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut open = true;
+            let mut outside = None;
+            for closing in [false, true] {
+                let frame = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if !closing {
+                            ui.button("选项…").request_focus();
+                        } else if focus_elsewhere {
+                            let response = ui.push_id("other tool", |ui| ui.button("另一个工具")).inner;
+                            response.request_focus();
+                            outside = Some(response.id);
+                        }
+                    });
+                    window(ctx, "CELLAN 选项", 360.0).open(&mut open).show(ctx, |ui| {
+                        let done = ui.button("完成");
+                        if closing {
+                            if !focus_elsewhere { done.request_focus(); }
+                            open = false;
+                        }
+                    });
+                });
+                if closing {
+                    assert!(!open);
+                    let tree = frame.platform_output.accesskit_update.unwrap();
+                    assert!(tree.nodes.iter().any(|(id, _)| *id == tree.focus));
+                    assert_eq!(ctx.memory(|m| m.focused()), outside);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dialog_tabs_arrow_keys_switch_pages_and_tab_reaches_the_form() {
+        let ctx = egui::Context::default();
+        let mut selected = 1;
+        let mut field = String::new();
+        for (frame, key) in [None, None, Some(egui::Key::ArrowRight), Some(egui::Key::ArrowRight),
+            Some(egui::Key::End), Some(egui::Key::Home), Some(egui::Key::Tab)].into_iter().enumerate()
+        {
+            let mut input = egui::RawInput::default();
+            if let Some(key) = key {
+                input.events.push(egui::Event::Key {
+                    key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let active_id = ui.next_auto_id().with("active_dialog_tab");
+                    dialog_tabs(ui, &mut selected, &["数字", "对齐", "字体"]);
+                    let edit = ui.text_edit_singleline(&mut field);
+                    if frame == 0 { ui.memory_mut(|m| m.request_focus(active_id)); }
+                    if key == Some(egui::Key::Tab) { assert!(edit.has_focus()); }
+                });
+            });
+            assert_eq!(selected, [1, 1, 2, 0, 2, 0, 0][frame], "{key:?}");
+        }
+    }
+
+    #[test]
+    fn format_tabs_fit_one_row_at_dialog_width() {
+        let ctx = egui::Context::default();
+        for ppp in [1.0, 1.5, 2.0] {
+            ctx.set_pixels_per_point(ppp);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(520.0);
+                    let strip = ui.scope(|ui| {
+                        dialog_tabs(ui, &mut 0, &["数字", "对齐", "字体", "边框", "填充", "保护"]);
+                    });
+                    assert!(strip.response.rect.height() < 45.0, "{ppp}: {:?}", strip.response.rect);
+                });
+            });
+        }
+    }
 
     #[test]
     fn unsized_dialog_footer_is_reachable_on_a_short_viewport() {
