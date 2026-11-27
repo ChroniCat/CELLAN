@@ -41,7 +41,10 @@ pub fn tab_file(app: &mut SheetApp, ui: &mut egui::Ui) {
     } else {
         None
     };
-    let resp = ui_kit::tab_ex(ui, label, false, true);
+    let layout = ui_kit::layout_tab(ui, label, true);
+    let resp = ui_kit::tab_ex(ui, layout, false, true);
+    ui_kit::a11y_name(&resp, t.label.trim(), true, Some(app.file_menu_open));
+    ui_kit::focus_ring(ui, &resp, resp.rect, 4.0);
     ui_kit::caret(
         ui,
         egui::pos2(resp.rect.right() - 11.0, resp.rect.center().y + 0.5),
@@ -84,122 +87,104 @@ impl Drop for RibbonGuard<'_> {
     }
 }
 
-/// 页签行（开始…帮助）。上下文页签由调用方按需追加。
+/// Lay out ordinary and contextual tabs in the space left by the two toolbars.
 pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
     let guard = RibbonGuard::new(app);
     let ribbon = &guard.ribbon;
     let app = &mut *guard.app;
-    for (i, t) in ribbon.tabs.iter().enumerate().skip(1) {
-        let resp = ui_kit::tab_ex(ui, &t.label, app.ribbon_tab == i, false);
-        if app.keytips && app.keytip_tab.is_none() {
-            if let Some(ch) = t.keytip.chars().next() {
-                let r = resp.rect;
-                let b = Rect::from_center_size(
-                    egui::pos2(r.center().x, r.top() + 6.0),
-                    Vec2::new(13.0, 11.0),
-                );
-                ui.painter()
-                    .rect_filled(b, 2.0, Color32::from_rgb(68, 68, 68));
-                let mut buf = [0u8; 4];
-                ui.painter().text(
-                    b.center(),
-                    Align2::CENTER_CENTER,
-                    ch.encode_utf8(&mut buf),
-                    FontId::proportional(8.5),
-                    Color32::WHITE,
-                );
+    let mut tabs: Vec<_> = ribbon.tabs.iter().enumerate().skip(1).collect();
+    let pivot = app.active_pivot().is_some();
+    for (id, index, present) in [
+        ("TabSetTableTools", 100, app.table_at_sel().is_some()),
+        ("TabSetChartTools", 101, app.chart_at_sel().is_some()),
+        ("TabSetSparklineTools", 102, app.spark_at_sel().is_some()),
+        ("TabSetPivotAnalyze", 103, pivot),
+        ("TabSetPivotDesign", 104, pivot),
+    ] {
+        if present {
+            if let Some(context) = ribbon.context.iter().find(|c| c.set_id == id) {
+                tabs.push((index, &context.tab));
             }
         }
-        if resp.double_clicked() {
-            app.ribbon_collapsed = !app.ribbon_collapsed;
-            app.ribbon_popup = None;
-            app.ribbon_sub = None;
+    }
+
+    let layouts: Vec<_> = tabs.iter()
+        .map(|(index, tab)| ui_kit::layout_tab(ui, &tab.label, *index == app.ribbon_tab))
+        .collect();
+    let available = ui.available_width();
+    let overflow = layouts.iter().map(|(_, width)| width).sum::<f32>() > available;
+    let active_width = tabs.iter().position(|(i, _)| *i == app.ribbon_tab).map_or(0.0, |i| layouts[i].1);
+    let mut remaining = available - 28.0 - active_width;
+    let mut hidden = Vec::new();
+    for ((i, tab), layout) in tabs.into_iter().zip(layouts) {
+        let (_, width) = &layout;
+        let active = i == app.ribbon_tab;
+        if overflow && ((active && available < width + 28.0) || (!active && *width > remaining)) {
+            hidden.push((i, tab));
+            continue;
+        }
+        if !active {
+            remaining -= width;
+        }
+        let resp = ui.push_id(i, |ui| ui_kit::tab_ex(ui, layout, active, false)).inner;
+        ui_kit::a11y_role(&resp, &tab.label, egui::accesskit::Role::Tab, Some(active));
+        ui_kit::focus_ring(ui, &resp, resp.rect, 4.0);
+        if app.keytips && app.keytip_tab.is_none() {
+            if let Some(ch) = tab.keytip.chars().next() {
+                let b = Rect::from_center_size(egui::pos2(resp.rect.center().x, resp.rect.top() + 6.0), Vec2::new(13.0, 11.0));
+                ui.painter().rect_filled(b, 2.0, Color32::from_gray(68));
+                let mut buf = [0u8; 4];
+                ui.painter().text(b.center(), Align2::CENTER_CENTER, ch.encode_utf8(&mut buf), FontId::proportional(8.5), Color32::WHITE);
+            }
         }
         if resp.clicked() {
-            app.file_menu_open = false;
-            app.ribbon_tab = i;
-            app.ribbon_collapsed = false;
-            app.ribbon_popup = None;
-            app.ribbon_sub = None;
+            let prior = resp.id.with("collapsed_before_click");
+            let collapse = if resp.double_clicked() {
+                !ui.data(|d| d.get_temp::<bool>(prior)).unwrap_or(app.ribbon_collapsed)
+            } else {
+                ui.data_mut(|d| d.insert_temp(prior, app.ribbon_collapsed));
+                false
+            };
+            select_tab(app, i, collapse);
         }
     }
+    let menu_id = ui.make_persistent_id("tab_overflow");
+    if hidden.is_empty() {
+        if ui.memory(|m| m.is_popup_open(menu_id)) {
+            ui.memory_mut(|m| m.close_popup());
+        }
+        return;
+    }
+    let (_, rect) = ui.allocate_space(Vec2::new(28.0, 24.0));
+    let resp = ui.interact(rect, menu_id.with("button"), Sense::click());
+    let pal = crate::theme::palette();
+    let resp = resp.on_hover_text("更多选项卡");
+    ui_kit::a11y_name(&resp, "更多选项卡", true, None);
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(menu_id));
+    }
+    if resp.hovered() || ui.memory(|m| m.is_popup_open(menu_id)) {
+        ui.painter().rect_filled(rect, 4.0, pal.hover_on_page);
+    }
+    ui_kit::caret(ui, rect.center(), pal.text);
+    ui_kit::focus_ring(ui, &resp, rect, 4.0);
+    egui::popup_below_widget(ui, menu_id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+        ui.set_width(132.0);
+        for (i, tab) in hidden {
+            if ui.selectable_label(i == app.ribbon_tab, &tab.label).clicked() {
+                select_tab(app, i, false);
+                ui.memory_mut(|m| m.close_popup());
+            }
+        }
+    });
 }
 
-/// 上下文页签（表设计 / 图表工具）：选中表格或图表时才出现。
-pub fn context_tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
-    let guard = RibbonGuard::new(app);
-    let ribbon = &guard.ribbon;
-    let app = &mut *guard.app;
-    if app.table_at_sel().is_some() {
-        if let Some(c) = ribbon
-            .context
-            .iter()
-            .find(|c| c.set_id == "TabSetTableTools")
-        {
-            let r = ui_kit::tab_ex(ui, &c.tab.label, app.ribbon_tab == 100, false);
-            if r.clicked() {
-                app.ribbon_tab = 100;
-                app.ribbon_collapsed = false;
-                app.ribbon_popup = None;
-            }
-        }
-    }
-    if app.chart_at_sel().is_some() {
-        if let Some(c) = ribbon
-            .context
-            .iter()
-            .find(|c| c.set_id == "TabSetChartTools")
-        {
-            let r = ui_kit::tab_ex(ui, &c.tab.label, app.ribbon_tab == 101, false);
-            if r.clicked() {
-                app.ribbon_tab = 101;
-                app.ribbon_collapsed = false;
-                app.ribbon_popup = None;
-            }
-        }
-    }
-    // 选中带迷你图的单元格才出现「迷你图工具」
-    if app.spark_at_sel().is_some() {
-        if let Some(c) = ribbon
-            .context
-            .iter()
-            .find(|c| c.set_id == "TabSetSparklineTools")
-        {
-            let r = ui_kit::tab_ex(ui, &c.tab.label, app.ribbon_tab == 102, false);
-            if r.clicked() {
-                app.ribbon_tab = 102;
-                app.ribbon_collapsed = false;
-                app.ribbon_popup = None;
-            }
-        }
-    }
-    // 选中数据透视表时出现「透视表分析」与「透视表设计」
-    if app.active_pivot().is_some() {
-        if let Some(c) = ribbon
-            .context
-            .iter()
-            .find(|c| c.set_id == "TabSetPivotAnalyze")
-        {
-            let r = ui_kit::tab_ex(ui, &c.tab.label, app.ribbon_tab == 103, false);
-            if r.clicked() {
-                app.ribbon_tab = 103;
-                app.ribbon_collapsed = false;
-                app.ribbon_popup = None;
-            }
-        }
-        if let Some(c) = ribbon
-            .context
-            .iter()
-            .find(|c| c.set_id == "TabSetPivotDesign")
-        {
-            let r = ui_kit::tab_ex(ui, &c.tab.label, app.ribbon_tab == 104, false);
-            if r.clicked() {
-                app.ribbon_tab = 104;
-                app.ribbon_collapsed = false;
-                app.ribbon_popup = None;
-            }
-        }
-    }
+fn select_tab(app: &mut SheetApp, index: usize, collapsed: bool) {
+    app.ribbon_tab = index;
+    app.ribbon_collapsed = collapsed;
+    app.file_menu_open = false;
+    app.ribbon_popup = None;
+    app.ribbon_sub = None;
 }
 
 #[derive(Clone, Copy)]
@@ -2714,6 +2699,66 @@ pub fn icon_of(name: &str) -> Option<Icon> {
 #[cfg(test)]
 mod compact_tests {
     use super::*;
+
+    #[test]
+    fn ribbon_overflow_selects_hidden_tab_and_double_click_collapses_it() {
+        let _env = crate::test_env::TestEnv::new("ribbon-tab-overflow");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.ribbon_tab = 1;
+        let last = app.ribbon.tabs.len() - 1;
+        let last_label = app.ribbon.tabs[last].label.clone();
+        let mut menu_button = egui::Pos2::ZERO;
+        let mut time = 0.0;
+        let mut frame = |app: &mut SheetApp, click: Option<(egui::Pos2, bool)>| {
+            time += if click.is_none() { 1.0 } else { 0.016 };
+            let mut events = Vec::new();
+            if let Some((pos, pressed)) = click {
+                events.push(egui::Event::PointerMoved(pos));
+                events.push(egui::Event::PointerButton {
+                    pos, pressed, button: egui::PointerButton::Primary, modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let out = ctx.run(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(420.0, 440.0))),
+                events, time: Some(time), ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let bounds = Rect::from_min_size(ui.cursor().min, Vec2::new(156.0, ui_kit::TAB_H));
+                    let mut row = ui.new_child(egui::UiBuilder::new()
+                        .max_rect(bounds)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                    row.spacing_mut().item_spacing.x = 0.0;
+                    tabs(app, &mut row);
+                    let button_id = row.make_persistent_id("tab_overflow").with("button");
+                    let rect = ctx.read_response(button_id).expect("overflow button").rect;
+                    assert!(rect.right() <= bounds.right() + 1.0);
+                    menu_button = rect.center();
+                });
+            });
+            let label_pos = out.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == last_label => Some(t.pos + t.galley.size() / 2.0),
+                _ => None,
+            });
+            (menu_button, label_pos)
+        };
+
+        let (menu, hidden) = frame(&mut app, None);
+        assert!(hidden.is_none());
+        frame(&mut app, Some((menu, true)));
+        frame(&mut app, Some((menu, false)));
+        let (_, target) = frame(&mut app, None);
+        let target = target.expect("last tab is in the overflow popup");
+        frame(&mut app, Some((target, true)));
+        frame(&mut app, Some((target, false)));
+        assert_eq!(app.ribbon_tab, last);
+        let (_, active) = frame(&mut app, None);
+        let active = active.expect("selected tab is promoted into the visible strip");
+        for pressed in [true, false, true, false] {
+            frame(&mut app, Some((active, pressed)));
+        }
+        assert!(app.ribbon_collapsed);
+    }
 
     #[test]
     fn border_menu_pen_choices_enter_draw_mode_preserve_grid_and_exit_on_escape() {

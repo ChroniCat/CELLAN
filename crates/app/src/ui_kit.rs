@@ -892,7 +892,7 @@ pub fn focus_ring(ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, radius
         ui.painter().rect_stroke(
             rect.shrink(1.0),
             radius,
-            Stroke::new(1.5, ACCENT),
+            Stroke::new(crate::tokens::stroke::FOCUS, crate::theme::palette().accent),
             egui::StrokeKind::Inside,
         );
     }
@@ -1252,10 +1252,8 @@ pub fn text_toggle(
 
 /// Fluent 风格功能区页签：直接浮在 PAGE_BG 上，活动页签用 2.5px 主题绿圆角短横条标记，
 /// 下方命令区独立收为完整四圆角纯白卡片，彻底告别「半灰半白双拼断层框」。
-pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Response {
-    let pal = crate::theme::palette();
-    let dark = ui.visuals().dark_mode || pal.theme.is_dark();
-    let font = if active || green {
+pub fn layout_tab(ui: &egui::Ui, name: &str, emphasized: bool) -> (Arc<egui::Galley>, f32) {
+    let font = if emphasized {
         medium_in(ui.ctx(), 12.5)
     } else {
         FontId::proportional(12.5)
@@ -1263,9 +1261,16 @@ pub fn tab_ex(ui: &mut egui::Ui, name: &str, active: bool, green: bool) -> Respo
     let galley = ui
         .painter()
         .layout_no_wrap(name.to_owned(), font, Color32::PLACEHOLDER);
+    let width = galley.size().x + 20.0;
+    (galley, width)
+}
+
+pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool, green: bool) -> Response {
+    let (galley, width) = layout;
     let text_w = galley.size().x;
-    let size = Vec2::new(text_w + 20.0, TAB_H);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let pal = crate::theme::palette();
+    let dark = ui.visuals().dark_mode || pal.theme.is_dark();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, TAB_H), Sense::click());
     if green {
         let pill = rect.shrink2(Vec2::new(2.0, 3.0));
         let fill = if resp.hovered() {
@@ -1340,10 +1345,14 @@ pub fn footer(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         Stroke::new(1.0, crate::theme::palette().card_border),
     );
     ui.add_space(12.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        add(ui);
-    });
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 32.0),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            add(ui);
+        },
+    );
 }
 
 /// 对话框底部左右双栏按钮行（左侧放轻量辅助入口，右侧放主次操作按钮）
@@ -1694,7 +1703,7 @@ impl BtnResp {
 pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
     let pal = crate::theme::palette();
     let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
-    let fg = if is_hc { Color32::BLACK } else { Color32::WHITE };
+    let fg = if pal.theme.is_dark() { Color32::BLACK } else { Color32::WHITE };
     let bg_idle = pal.accent;
     let bg_hov = pal.accent_hover;
     let bg_act = if is_hc {
@@ -1735,7 +1744,7 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> BtnResp {
         );
     }
     let in_non_modal = CURRENT_DLG_NON_MODAL.with(|c| c.get());
-    let enter = !in_non_modal
+    let enter = ui.is_enabled() && !in_non_modal
         && ui.input(|i| i.key_pressed(egui::Key::Enter))
         && ui.ctx().memory(|m| m.focused().is_none())
         && !ui.ctx().memory(|m| m.any_popup_open());
@@ -1801,10 +1810,8 @@ pub fn text_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> Response {
         pal.grid_bg
     } else if hovered {
         pal.hover
-    } else if pal.theme.is_dark() {
-        pal.card_bg
     } else {
-        Color32::from_rgb(248, 249, 251)
+        pal.card_bg
     };
     let border = if has_focus {
         Stroke::new(1.5, pal.accent)
@@ -1880,12 +1887,14 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
 /// 侧边栏/浮层纯矢量关闭按钮（24×24 圆角热区 + 自绘交叉线，避免依赖字体中可能缺失的 ✕ 符号）
 pub fn close_icon_button(ui: &mut egui::Ui, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    let pal = crate::theme::palette();
     if resp.is_pointer_button_down_on() {
-        ui.painter().rect_filled(rect, 5.0, PRESSED);
+        ui.painter().rect_filled(rect, 5.0, pal.pressed);
     } else if resp.hovered() {
-        ui.painter().rect_filled(rect, 5.0, HOVER);
+        ui.painter().rect_filled(rect, 5.0, pal.hover);
     }
-    let col = if resp.hovered() { TEXT } else { TEXT_WEAK };
+    focus_ring(ui, &resp, rect, 5.0);
+    let col = if resp.hovered() { pal.text } else { pal.text_weak };
     let k = 4.0;
     let st = Stroke::new(1.25_f32, col);
     ui.painter().line_segment(
@@ -2155,19 +2164,19 @@ impl Dlg {
             }
         });
         let screen = ctx.screen_rect();
+        let measured = ctx.memory(|m| m.area_rect(id.with("area")));
         let mut pos = ctx
             .data(|d| d.get_temp::<egui::Pos2>(id.with("pos")))
             .unwrap_or_else(|| {
                 let (a, off) = self
                     .anchor
                     .unwrap_or((egui::Align2::CENTER_CENTER, [0.0, 0.0]));
-                let est_h = if self.height > 0.0 {
-                    (self.height + 80.0).min(screen.height() - 16.0)
-                } else {
-                    420.0
-                };
+                let est_h = measured.map_or_else(
+                    || if self.height > 0.0 { self.height + 80.0 } else { 420.0 },
+                    |r| r.height(),
+                ).min(screen.height() - 8.0);
                 let p = a.align_size_within_rect(
-                    egui::vec2(self.width, est_h),
+                    egui::vec2(dialog_width(self.width, screen), est_h),
                     screen,
                 );
                 p.min + egui::vec2(off[0], off[1])
@@ -2295,6 +2304,8 @@ impl Dlg {
                             [crect.center() + egui::vec2(k, -k), crect.center() + egui::vec2(-k, k)],
                             st,
                         );
+                        focus_ring(ui, &cresp, crect, 6.0);
+                        a11y_name(&cresp, "关闭", ui.is_enabled(), None);
                         let cresp = cresp.on_hover_text("关闭");
                         if cresp.clicked() {
                             closed = true;
@@ -2318,29 +2329,31 @@ impl Dlg {
                                 ui.set_max_width(w - 40.0);
                                 ui.spacing_mut().interact_size.y = 26.0;
                                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-                                if h > 0.0 {
-                                    egui::ScrollArea::vertical()
-                                        .max_height(h)
-                                        .show(ui, |ui| {
-                                            let r = add(ui);
-                                            // UI-24.1：Tab 走到滚动区外的控件时把它滚进视口，
-                                            // 否则键盘焦点会落在看不见的地方（Excel 也是自动跟随）。
-                                            if let Some(fid) = ui.memory(|m| m.focused()) {
-                                                if let Some(fr) = ui.ctx().read_response(fid) {
-                                                    if !ui.clip_rect().contains_rect(fr.rect) {
-                                                        ui.scroll_to_rect(
-                                                            fr.rect,
-                                                            Some(egui::Align::Center),
-                                                        );
-                                                    }
-                                                }
+                                // 标题与外边距留在视口内，未指定高度的对话框也可滚至底部。
+                                let top_inset = ui.cursor().top() - trect.top();
+                                let limit = (screen.height() - top_inset - 18.0 - 10.0).max(1.0);
+                                let body_height = if h > 0.0 { h.min(limit) } else { limit };
+                                ui.set_max_height(body_height);
+                                egui::ScrollArea::vertical()
+                                    .max_height(body_height)
+                                    .min_scrolled_height(0.0)
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        let r = add(ui);
+                                        if let Some(fr) = ui.memory(|m| m.focused())
+                                            .and_then(|fid| ui.ctx().read_response(fid))
+                                        {
+                                            if fr.gained_focus()
+                                                && fr.layer_id == ui.layer_id()
+                                                && ui.min_rect().intersects(fr.rect)
+                                                && !ui.clip_rect().contains_rect(fr.rect)
+                                            {
+                                                ui.scroll_to_rect(fr.rect, Some(egui::Align::Center));
                                             }
-                                            r
-                                        })
-                                        .inner
-                                } else {
-                                    add(ui)
-                                }
+                                        }
+                                        r
+                                    })
+                                    .inner
                             })
                             .inner;
                         if self.resizable {
@@ -2349,8 +2362,9 @@ impl Dlg {
                                 egui::pos2(trect.right() - 14.0, bottom - 14.0),
                                 egui::vec2(14.0, 14.0),
                             );
-                            let g = ui.interact(gr, id.with("grip"), drag_only_sense());
-                            let gc = Color32::from_rgb(160, 158, 156);
+                            let g = ui.interact(gr, id.with("grip"), drag_only_sense())
+                                .on_hover_cursor(egui::CursorIcon::ResizeNwSe);
+                            let gc = pal.text_weak;
                             for k in 0..3 {
                                 let o = 3.0 + k as f32 * 3.0;
                                 ui.painter().line_segment(
@@ -2423,7 +2437,10 @@ impl Dlg {
             }
         }
         ctx.data_mut(|d| {
-            d.insert_temp(id.with("pos"), pos);
+            // Area 首帧只测量。等真实高度可用再保存初始锚点，并保留后续拖动的位置。
+            if measured.is_some() {
+                d.insert_temp(id.with("pos"), pos);
+            }
             d.insert_temp(id.with("w"), w);
             d.insert_temp(id.with("h"), h);
         });
@@ -2446,66 +2463,84 @@ pub fn autofocus(ui: &mut egui::Ui, resp: &Response) {
 
 /// 带常驻上下微调箭头的现代数字步进框（28px 高、6px 圆角、双折线 V 型箭头）
 pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width: f32) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::click());
-    let v0 = *v;
+    use egui::accesskit::Action;
+    let pal = crate::theme::palette();
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::click());
     let step_w = 20.0;
-    let half_h = rect.height() * 0.5;
-    let a = egui::Rect::from_min_size(
-        egui::pos2(rect.right() - step_w, rect.top() + 1.0),
-        Vec2::new(step_w - 1.0, half_h - 1.0),
-    );
-    let b = egui::Rect::from_min_size(
-        egui::pos2(rect.right() - step_w, rect.top() + half_h),
-        Vec2::new(step_w - 1.0, half_h - 1.0),
-    );
-    let ar = ui.interact(a, ui.id().with(("spinup", rect.left() as i32)), Sense::click());
-    let br = ui.interact(b, ui.id().with(("spindn", rect.left() as i32)), Sense::click());
-    if ar.clicked() {
-        *v = (*v + step).min(max);
+    let arrow_left = rect.right() - step_w;
+    let a = Rect::from_min_max(egui::pos2(arrow_left, rect.top()), egui::pos2(rect.right(), rect.center().y));
+    let b = Rect::from_min_max(a.left_bottom(), rect.right_bottom());
+    let focused = resp.has_focus();
+    ui.memory_mut(|m| m.set_focus_lock_filter(resp.id, egui::EventFilter {
+        vertical_arrows: true,
+        ..Default::default()
+    }));
+    let mut ticks = ui.input_mut(|i| {
+        let mut ticks = i.num_accesskit_action_requests(resp.id, Action::Increment) as i32
+            - i.num_accesskit_action_requests(resp.id, Action::Decrement) as i32;
+        if focused {
+            ticks += i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) as i32
+                - i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) as i32;
+        }
+        ticks
+    });
+    if resp.clicked_by(egui::PointerButton::Primary) {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            if pos.x >= arrow_left {
+                ticks += if pos.y < rect.center().y { 1 } else { -1 };
+            }
+        }
     }
-    if br.clicked() {
-        *v = (*v - step).max(min);
+    if resp.enabled() && ticks != 0 {
+        let value = (*v + ticks as f64 * step).clamp(min, max);
+        if value != *v {
+            *v = value;
+            resp.mark_changed();
+        }
     }
-    let hovered = ui.rect_contains_pointer(rect);
-    let border_col = if hovered {
-        Color32::from_rgb(176, 186, 200)
-    } else {
-        CARD_BORDER
-    };
+    resp.widget_info(|| egui::WidgetInfo::drag_value(resp.enabled(), *v));
+    let _ = ui.ctx().accesskit_node_builder(resp.id, |node| {
+        node.set_min_numeric_value(min);
+        node.set_max_numeric_value(max);
+        node.set_numeric_value_step(step);
+        if resp.enabled() && *v < max { node.add_action(Action::Increment); }
+        if resp.enabled() && *v > min { node.add_action(Action::Decrement); }
+    });
+    let border_col = if focused { pal.accent } else if resp.hovered() { pal.text_muted } else { pal.card_border };
     ui.painter().rect(
         rect,
         6.0,
-        Color32::from_rgb(250, 251, 253),
-        Stroke::new(1.0, border_col),
+        pal.grid_bg,
+        Stroke::new(if focused { crate::tokens::stroke::FOCUS } else { 1.0 }, border_col),
         egui::StrokeKind::Inside,
     );
-    let txt = if (step.fract()).abs() < 1e-9 {
-        format!("{:.0}", *v)
-    } else {
-        format!("{:.1}", *v)
-    };
-    ui.painter().text(
-        egui::pos2(rect.left() + 9.0, rect.center().y),
+    let value_rect = Rect::from_min_max(rect.min, egui::pos2(arrow_left - 1.0, rect.bottom()));
+    let txt = egui::emath::format_with_decimals_in_range(*v, 0..=6);
+    let text_rect = ui.painter_at(value_rect).text(
+        egui::pos2(rect.left() + 5.0, rect.center().y),
         Align2::LEFT_CENTER,
-        txt,
-        FontId::proportional(12.0),
-        TEXT,
+        &txt,
+        FontId::proportional(T_BODY),
+        pal.text,
     );
     ui.painter().line_segment(
         [
             egui::pos2(rect.right() - step_w, rect.top() + 3.0),
             egui::pos2(rect.right() - step_w, rect.bottom() - 3.0),
         ],
-        Stroke::new(1.0, Color32::from_rgb(228, 232, 240)),
+        Stroke::new(1.0, pal.card_border),
     );
-    for (r, up, hv) in [(a, true, ar.hovered()), (b, false, br.hovered())] {
+    let pointer = resp.hover_pos();
+    for (r, up, enabled) in [(a, true, *v < max), (b, false, *v > min)] {
+        let hv = enabled && pointer.is_some_and(|pos| r.contains(pos));
         if hv {
-            ui.painter().rect_filled(r.shrink(1.0), 3.0, HOVER);
+            let fill = if resp.is_pointer_button_down_on() { pal.pressed } else { pal.hover };
+            ui.painter().rect_filled(r.shrink(1.0), 3.0, fill);
         }
         let c = r.center();
         let st = Stroke::new(
             1.3,
-            if hv { TEXT } else { Color32::from_rgb(100, 116, 139) },
+            if !enabled { pal.text_muted } else if hv { pal.text } else { pal.text_weak },
         );
         if up {
             ui.painter().line_segment([egui::pos2(c.x - 3.2, c.y + 1.4), egui::pos2(c.x, c.y - 1.6)], st);
@@ -2517,10 +2552,13 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
     }
     ui.painter().line_segment(
         [egui::pos2(a.left() + 2.0, a.bottom()), egui::pos2(a.right() - 2.0, a.bottom())],
-        Stroke::new(1.0, Color32::from_rgb(232, 236, 242)),
+        Stroke::new(1.0, pal.card_border),
     );
-    let _ = resp;
-    (*v - v0).abs() > 1e-9
+    let changed = resp.changed();
+    if !value_rect.contains_rect(text_rect) {
+        resp.on_hover_text(txt);
+    }
+    changed
 }
 
 /// 对话框标签页（现代 Excel 365 / WPS 扁平下划线胶囊页签）
@@ -2542,9 +2580,9 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
         for (i, t) in tabs.iter().enumerate() {
             let on = *sel as usize == i;
             let font = if on {
-                medium_in(ui.ctx(), 12.5)
+                medium_in(ui.ctx(), T_BODY)
             } else {
-                FontId::proportional(12.5)
+                FontId::proportional(T_BODY)
             };
             let galley = ui.painter().layout_no_wrap(
                 (*t).to_owned(),
@@ -2582,6 +2620,8 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
                     if resp.hovered() { pal.text } else { pal.text_weak },
                 );
             }
+            focus_ring(ui, &resp, rect.shrink2(Vec2::new(0.0, 2.0)), 6.0);
+            a11y_role(&resp, t, egui::accesskit::Role::Tab, Some(on));
             if resp.clicked() {
                 *sel = i as u8;
             }
@@ -2673,6 +2713,91 @@ pub fn draw_padlock(painter: &egui::Painter, rect: Rect, col: Color32) {
 #[cfg(test)]
 mod state_tests {
     use super::*;
+
+    #[test]
+    fn unsized_dialog_footer_is_reachable_on_a_short_viewport() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(760.0, 420.0));
+        let mut initially_clipped = false;
+        let mut reached = false;
+        for frame in 0..30 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(frame as f64 / 30.0),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                let dlg = window(ctx, "格式测试", 560.0).show(ctx, |ui| {
+                    for i in 0..20 {
+                        let _ = ui.button(format!("选项 {i}"));
+                    }
+                    let last = secondary_button(ui, "取消");
+                    let visible = ui.clip_rect().intersect(screen).contains_rect(last.rect);
+                    if frame == 2 {
+                        initially_clipped = !visible;
+                        last.scroll_to_me(Some(egui::Align::Max));
+                    } else if frame > 2 {
+                        reached |= visible;
+                    }
+                }).unwrap();
+                if frame > 1 {
+                    assert!(screen.contains_rect(dlg.response.rect), "{:?}", dlg.response.rect);
+                }
+            });
+        }
+        assert!(initially_clipped && reached);
+    }
+
+    #[test]
+    fn short_dialog_footer_stays_next_to_its_content() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1024.0, 768.0));
+        for frame in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                let dlg = window(ctx, "确认", 360.0).show(ctx, |ui| {
+                    let text = ui.label("保存更改？").rect;
+                    footer(ui, |ui| {
+                        let cancel = secondary_button(ui, "取消").rect;
+                        assert!(cancel.top() - text.bottom() < 48.0);
+                    });
+                }).unwrap();
+                if frame > 0 {
+                    assert!(dlg.response.rect.height() < 210.0);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn spin_steps_only_the_focused_row_and_respects_its_limit() {
+        let ctx = egui::Context::default();
+        let mut values = [1.0, 1.0];
+        for frame in 0..4 {
+            let mut input = egui::RawInput::default();
+            if frame >= 2 {
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::ArrowUp,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(!spin(ui, &mut values[0], 0.0, 2.0, 1.0, 64.0));
+                    let id = ui.next_auto_id();
+                    let changed = spin(ui, &mut values[1], 0.0, 2.0, 1.0, 64.0);
+                    if frame == 0 {
+                        ui.memory_mut(|m| m.request_focus(id));
+                    }
+                    assert_eq!(changed, frame == 2);
+                });
+            });
+        }
+        assert_eq!(values, [1.0, 2.0]);
+    }
 
     #[test]
     fn disabled_has_no_background() {

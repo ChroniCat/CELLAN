@@ -260,6 +260,57 @@ fn menu_sep_line(ui: &mut egui::Ui) {
     );
 }
 
+fn scrollable_file_menu(ui: &mut egui::Ui, width: f32, max_height: f32, content: impl FnOnce(&mut egui::Ui)) {
+    let frame = ui_kit::popup_frame(ui.style());
+    let margin = frame.total_margin().sum();
+    frame.show(ui, |ui| {
+        ui.set_width(width - margin.x);
+        egui::ScrollArea::vertical()
+            .max_height((max_height - margin.y).max(28.0))
+            .auto_shrink([false, true])
+            .show(ui, content);
+    });
+}
+
+const DOC_TAB_MIN: f32 = 84.0;
+const DOC_TAB_GAP: f32 = 3.0;
+const DOC_ACTION_SLOT: f32 = 28.0;
+
+/// Reserve the new-document button and, when needed, the document switcher.
+/// Keep the active tab in the visible run even when it is the last of many.
+fn document_tab_layout(count: usize, active: usize, available: f32) -> (std::ops::Range<usize>, f32) {
+    let mut budget = (available - DOC_ACTION_SLOT).max(0.0);
+    if count as f32 * (DOC_TAB_MIN + DOC_TAB_GAP) > budget {
+        budget = (budget - DOC_ACTION_SLOT).max(0.0);
+    }
+    let slots = count.min((budget / (DOC_TAB_MIN + DOC_TAB_GAP)) as usize);
+    if slots == 0 {
+        return (0..0, DOC_TAB_MIN);
+    }
+    let end = (active.saturating_add(1)).clamp(slots, count);
+    let max_width = if count <= 2 { 210.0 } else { 180.0 };
+    (end - slots..end, (budget / slots as f32 - DOC_TAB_GAP).clamp(DOC_TAB_MIN, max_width))
+}
+
+#[cfg(test)]
+#[test]
+fn document_tabs_keep_active_workbook_and_actions_in_bounds() {
+    for count in 1..=16 {
+        for active in 0..count {
+            for available in [90.0, 160.0, 260.0, 430.0, 960.0] {
+                let (visible, width) = document_tab_layout(count, active, available);
+                assert!(visible.is_empty() || visible.contains(&active));
+                let actions = if visible.len() < count { 2.0 } else { 1.0 };
+                let used = visible.len() as f32 * (width + DOC_TAB_GAP) + actions * DOC_ACTION_SLOT;
+                assert!(used <= available + 0.01);
+                if count as f32 * (DOC_TAB_MIN + DOC_TAB_GAP) + DOC_ACTION_SLOT <= available {
+                    assert_eq!(visible, 0..count);
+                }
+            }
+        }
+    }
+}
+
 impl SheetApp {
     /// WPS 轻量级「文件」下拉菜单（点「文件」弹出，不遮挡整窗；含文档信息入口进 Backstage）
     pub(crate) fn draw_file_menu(&mut self, ctx: &egui::Context) {
@@ -276,10 +327,9 @@ impl SheetApp {
             .file_menu_anchor
             .unwrap_or_else(|| egui::pos2(screen.left() + 12.0, ui_kit::TITLE_H + ui_kit::TAB_H));
         let menu_w = 248.0;
-        let menu_h_est = 462.0;
         let pos = egui::pos2(
             anchor.x.clamp(screen.left() + 4.0, (screen.right() - menu_w - 8.0).max(4.0)),
-            anchor.y.clamp(screen.top() + 4.0, (screen.bottom() - menu_h_est - 8.0).max(4.0)),
+            anchor.y.clamp(screen.top() + 4.0, (screen.bottom() - 56.0).max(screen.top() + 4.0)),
         );
 
         let mut act: Option<FileMenuAction> = None;
@@ -292,19 +342,7 @@ impl SheetApp {
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .show(ctx, |ui| {
-                egui::Frame::NONE
-                    .fill(pal.dialog_bg)
-                    .stroke(Stroke::new(1.0, pal.card_border))
-                    .corner_radius(8.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 6],
-                        blur: 18,
-                        spread: 0,
-                        color: Color32::from_black_alpha(32),
-                    })
-                    .inner_margin(egui::Margin::symmetric(6, 6))
-                    .show(ui, |ui| {
-                        ui.set_width(menu_w - 12.0);
+                scrollable_file_menu(ui, menu_w, screen.bottom() - pos.y - 6.0, |ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
 
                         let row = |ui: &mut egui::Ui,
@@ -332,7 +370,7 @@ impl SheetApp {
                                 egui::pos2(r.left() + 30.0, r.center().y),
                                 Align2::LEFT_CENTER,
                                 label,
-                                FontId::proportional(12.5),
+                                FontId::proportional(ui_kit::T_BODY),
                                 pal.text,
                             );
                             if !shortcut.is_empty() {
@@ -351,6 +389,8 @@ impl SheetApp {
                                     pal.text_weak,
                                 );
                             }
+                            ui_kit::focus_ring(ui, &resp, r, 5.0);
+                            ui_kit::a11y_role(&resp, label, egui::accesskit::Role::MenuItem, None);
                             resp
                         };
 
@@ -361,9 +401,12 @@ impl SheetApp {
                             act = Some(FileMenuAction::Open);
                         }
                         let rec_r = row(ui, Icon::FolderPlus, "最近打开", "", true, active_sub == 2);
+                        sub_anchor_y = rec_r.rect.top().max(ui.clip_rect().top());
                         if rec_r.hovered() || rec_r.clicked() {
                             active_sub = 2;
-                            sub_anchor_y = rec_r.rect.top();
+                        } else if !ui.is_rect_visible(rec_r.rect)
+                            || ui.rect_contains_pointer(ui.clip_rect()) && ui.ctx().pointer_hover_pos().is_some_and(|p| !rec_r.rect.y_range().contains(p.y)) {
+                            active_sub = 0;
                         }
 
                         menu_sep_line(ui);
@@ -444,30 +487,16 @@ impl SheetApp {
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(sub_x, sub_y))
                 .show(ctx, |ui| {
-                    egui::Frame::NONE
-                        .fill(pal.card_bg)
-                        .stroke(Stroke::new(1.0, pal.card_border))
-                        .corner_radius(8.0)
-                        .shadow(egui::epaint::Shadow {
-                            offset: [0, 6],
-                            blur: 16,
-                            spread: 0,
-                            color: Color32::from_black_alpha(28),
-                        })
-                        .inner_margin(egui::Margin::symmetric(6, 6))
-                        .show(ui, |ui| {
-                            ui.set_width(sub_w - 12.0);
+                    scrollable_file_menu(ui, sub_w, screen.bottom() - sub_y - 6.0, |ui| {
                             if rec_entries.is_empty() {
                                 ui.label(egui::RichText::new("暂无最近打开的文件").size(12.0).color(pal.text_weak));
                             } else {
                                 for ent in rec_entries.into_iter().take(12) {
                                     ui.horizontal(|ui| {
-                                        let label = if ent.pinned {
-                                            format!("★ {}  ({})", ent.name, ent.short_dir)
-                                        } else {
-                                            format!("{}  ({})", ent.name, ent.short_dir)
-                                        };
-                                        if ui_kit::popup_item(ui, &label, true, sub_w - 68.0).clicked() {
+                                        let label = format!("{}  ({})", ent.name, ent.short_dir);
+                                        let row_width = (ui.available_width() - 56.0).max(24.0);
+                                        let entry = egui::Button::new(label).frame(false).truncate();
+                                        if ui.add_sized([row_width, 27.0], entry).on_hover_text(ent.path.display().to_string()).clicked() {
                                             act = Some(FileMenuAction::OpenPath(ent.path.clone()));
                                         }
                                         let pin_tip = if ent.pinned { "取消固定" } else { "固定到顶部" };
@@ -721,7 +750,6 @@ impl SheetApp {
             }
         }
         let mut do_switch: Option<usize> = None;
-        let mut do_return_tab: Option<usize> = None;
         let mut do_close: Option<usize> = None;
         let mut new_tab = false;
 
@@ -732,9 +760,9 @@ impl SheetApp {
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 let painter = ui.painter().clone();
-                let right_bg = if self.show_start && !self.has_open_workbook && !dark {
-                    let rail_w = 224.0;
-                    let canvas_bg = Color32::from_rgb(248, 249, 251);
+                let right_bg = if self.show_start && !self.has_open_workbook {
+                    let rail_w = crate::home_rail_width(rect.width());
+                    let canvas_bg = pal.page_bg;
                     painter.rect_filled(
                         Rect::from_min_max(egui::pos2(rect.left() + rail_w, rect.top()), rect.right_bottom()),
                         0.0,
@@ -743,7 +771,7 @@ impl SheetApp {
                     painter.rect_filled(
                         Rect::from_min_max(egui::pos2(rect.left() + rail_w - 1.0, rect.top()), egui::pos2(rect.left() + rail_w, rect.bottom())),
                         0.0,
-                        ui_kit::CARD_BORDER,
+                        pal.card_border,
                     );
                     canvas_bg
                 } else {
@@ -768,7 +796,7 @@ impl SheetApp {
                         Rect::from_min_size(egui::pos2(rect.left() + 38.0, rect.center().y - 12.0), Vec2::new(58.0, 24.0))
                     };
                     let hresp = ui.interact(hb, egui::Id::new("title_home_btn"), Sense::click());
-                    ui_kit::a11y_name(&hresp, "主页", true, None);
+                    ui_kit::a11y_role(&hresp, "主页", egui::accesskit::Role::Tab, Some(home_active));
                     if home_active {
                         let rad = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
                         painter.rect(
@@ -809,7 +837,8 @@ impl SheetApp {
                         0,
                         hic,
                     );
-                    ui_kit::paint_medium(&painter, egui::pos2(hb.left() + 25.0, hb.center().y), Align2::LEFT_CENTER, "主页", 11.5, hic);
+                    ui_kit::paint_medium(&painter, egui::pos2(hb.left() + 25.0, hb.center().y), Align2::LEFT_CENTER, "主页", ui_kit::T_BODY, hic);
+                    ui_kit::focus_ring(ui, &hresp, hb, 5.0);
                     let tip = if home_active {
                         "返回当前已打开的工作簿"
                     } else {
@@ -826,12 +855,12 @@ impl SheetApp {
                 }
 
                 // 2. 右侧控件尺寸预计算：窗口三键 + 账户 + 搜索框
-                let user = self.my_name.clone();
-                let max_u_chars = if rect.width() >= 1200.0 { 16 } else { 10 };
-                let short_user = Self::elide(&user, max_u_chars);
-                let u_font = FontId::proportional(11.5);
-                let u_w = painter.layout_no_wrap(short_user.clone(), u_font.clone(), Color32::PLACEHOLDER).size().x;
-                let acc_w = (32.0 + u_w + 12.0).clamp(84.0, 184.0);
+                let user = &self.my_name;
+                let acc_limit = if rect.width() >= 1200.0 { 184.0 } else { 140.0 };
+                let mut name_job = egui::text::LayoutJob::simple_singleline(user.clone(), FontId::proportional(ui_kit::T_BODY), fg);
+                name_job.wrap = egui::text::TextWrapping::truncate_at_width(acc_limit - 36.0);
+                let name_galley = painter.layout_job(name_job);
+                let acc_w = (36.0 + name_galley.size().x).clamp(84.0, acc_limit);
                 let acc = Rect::from_min_size(
                     egui::pos2(rect.right() - 46.0 * 3.0 - acc_w - 12.0, rect.center().y - 12.0),
                     Vec2::new(acc_w, 24.0),
@@ -844,22 +873,17 @@ impl SheetApp {
                 // 3. 文档标签直接融入第 1 排（WPS 风格：即使切换到主页也始终保留全部已打开文档标签 + `+`）
                 let mut cur_x = left_end;
                 if self.has_open_workbook {
-                    let tab_space = (right_limit - cur_x - 34.0).max(80.0);
-                    let per_max = if tab_metas.len() <= 2 {
-                        210.0
-                    } else {
-                        ((tab_space / tab_metas.len() as f32) - 4.0).clamp(84.0, 180.0)
-                    };
-                    for (i, (title, dirty, active)) in tab_metas.iter().enumerate() {
-                        let natural_w = painter
-                            .layout_no_wrap(title.clone(), FontId::proportional(12.0), fg)
-                            .size()
-                            .x
-                            + 44.0;
-                        let tw = natural_w.clamp(84.0, per_max);
-                        if cur_x + tw + 30.0 > right_limit {
-                            break;
-                        }
+                    let (visible, width_limit) = document_tab_layout(tab_metas.len(), self.active_tab, right_limit - cur_x);
+                    let overflow = visible.len() < tab_metas.len();
+                    for i in visible {
+                        let (title, dirty, active) = &tab_metas[i];
+                        let font = if *active { ui_kit::medium_in(ctx, ui_kit::T_BODY) } else { FontId::proportional(ui_kit::T_BODY) };
+                        let tc = if *active { pal.text } else { pal.text_weak };
+                        let mut job = egui::text::LayoutJob::simple_singleline(title.clone(), font, tc);
+                        let padding = if *dirty { 42.0 } else { 34.0 };
+                        job.wrap = egui::text::TextWrapping::truncate_at_width(width_limit - padding);
+                        let galley = painter.layout_job(job);
+                        let tw = (galley.size().x + padding).clamp(DOC_TAB_MIN, width_limit);
                         let tab = Rect::from_min_size(egui::pos2(cur_x, rect.top() + 6.0), Vec2::new(tw, rect.height() - 6.0));
                         let close = Rect::from_center_size(egui::pos2(tab.right() - 12.0, tab.center().y), Vec2::splat(16.0));
                         let tab_hit = Rect::from_min_max(tab.min, egui::pos2(close.left() - 2.0, tab.bottom()));
@@ -884,17 +908,10 @@ impl SheetApp {
                         } else if self.show_start && !dark {
                             painter.rect_filled(tab, rad, Color32::from_rgba_unmultiplied(255, 255, 255, 150));
                         }
-                        let text_rect = Rect::from_min_max(egui::pos2(tab.left() + 10.0, tab.top()), egui::pos2(tab.right() - 28.0, tab.bottom()));
-                        let tc = if *active { pal.text } else { pal.text_weak };
-                        painter.with_clip_rect(text_rect).text(
-                            egui::pos2(text_rect.left(), tab.center().y),
-                            Align2::LEFT_CENTER,
-                            title,
-                            if *active { ui_kit::medium_in(ctx, 12.0) } else { FontId::proportional(12.0) },
-                            tc,
-                        );
+                        let text_pos = egui::pos2(tab.left() + 10.0, tab.center().y - galley.size().y / 2.0);
+                        painter.galley(text_pos, galley, tc);
                         if *dirty {
-                            painter.circle_filled(egui::pos2(tab.right() - 24.0, tab.center().y), 3.0, Color32::from_rgb(217, 119, 6));
+                            painter.circle_filled(egui::pos2(tab.right() - 26.0, tab.center().y), 3.0, pal.warn_fg);
                         }
                         if cr.hovered() {
                             painter.circle_filled(close.center(), 7.5, pal.pressed);
@@ -908,26 +925,63 @@ impl SheetApp {
                         } else {
                             title.clone()
                         };
+                        ui_kit::a11y_role(&tr, &tab_tip, egui::accesskit::Role::Tab, Some(*active));
+                        if ui_kit::is_accesskit_active(ctx) {
+                            ui_kit::a11y_name(&cr, &format!("关闭 {title}"), true, None);
+                        }
+                        ui_kit::focus_ring(ui, &tr, tab_hit, 5.0);
+                        ui_kit::focus_ring(ui, &cr, close, 4.0);
                         if cr.on_hover_text("关闭此文档 (Ctrl+W)").clicked() {
                             do_close = Some(i);
                         } else if tr.on_hover_text(tab_tip).clicked() {
-                            if self.show_start {
-                                do_return_tab = Some(i);
-                            } else if !*active {
-                                do_switch = Some(i);
-                            }
+                            do_switch = Some(i);
                         }
-                        cur_x += tw + 3.0;
+                        cur_x += tw + DOC_TAB_GAP;
+                    }
+                    let switcher_id = egui::Id::new("title_document_switcher");
+                    if overflow {
+                        let button = Rect::from_center_size(egui::pos2(cur_x + 12.0, rect.center().y), Vec2::splat(24.0));
+                        let resp = ui.interact(button, switcher_id.with("button"), Sense::click()).on_hover_text("切换工作簿");
+                        ui_kit::a11y_name(&resp, "切换工作簿", true, None);
+                        if resp.clicked() {
+                            ui.memory_mut(|m| m.toggle_popup(switcher_id));
+                        }
+                        if ui.memory(|m| m.is_popup_open(switcher_id)) || resp.hovered() {
+                            painter.rect_filled(button, 5.0, hover);
+                        }
+                        ui_kit::caret(ui, button.center(), fg);
+                        ui_kit::focus_ring(ui, &resp, button, 5.0);
+                        egui::popup_below_widget(ui, switcher_id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                            ui.set_width(260.0);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                                for (i, (title, dirty, active)) in tab_metas.iter().enumerate() {
+                                    let text = if *dirty { format!("{title}（未保存）") } else { title.clone() };
+                                    let row = egui::SelectableLabel::new(*active, &text);
+                                    if ui.add(row).on_hover_text(text).clicked() {
+                                        do_switch = Some(i);
+                                        ui.memory_mut(|m| m.close_popup());
+                                    }
+                                }
+                            });
+                        });
+                        cur_x += DOC_ACTION_SLOT;
+                    } else if ui.memory(|m| m.is_popup_open(switcher_id)) {
+                        ui.memory_mut(|m| m.close_popup());
                     }
                     let plus = Rect::from_min_size(egui::pos2(cur_x + 2.0, rect.center().y - 11.0), Vec2::new(24.0, 22.0));
                     if plus.right() <= right_limit {
                         let pr = ui.interact(plus, egui::Id::new("wps_tab_plus"), Sense::click());
+                        ui_kit::a11y_name(&pr, "新建工作簿", true, None);
+                        ui_kit::a11y_name(&pr, "新建空白工作簿", true, None);
                         if pr.hovered() {
                             painter.rect_filled(plus, 5.0, hover);
                         }
                         let pc = plus.center();
                         painter.line_segment([egui::pos2(pc.x - 4.5, pc.y), egui::pos2(pc.x + 4.5, pc.y)], Stroke::new(1.3, pal.text_weak));
                         painter.line_segment([egui::pos2(pc.x, pc.y - 4.5), egui::pos2(pc.x, pc.y + 4.5)], Stroke::new(1.3, pal.text_weak));
+                        ui_kit::focus_ring(ui, &pr, plus, 5.0);
+                        ui_kit::focus_ring(ui, &pr, plus, 5.0);
                         if pr.on_hover_text("新建空白标签页 (Ctrl+N)").clicked() {
                             new_tab = true;
                         }
@@ -994,17 +1048,17 @@ impl SheetApp {
                     ac,
                     Align2::CENTER_CENTER,
                     user.chars().next().unwrap_or('U').to_uppercase().to_string(),
-                    ui_kit::ui_bold_in(ctx, 10.5),
+                    ui_kit::ui_bold_in(ctx, ui_kit::T_SMALL),
                     Color32::WHITE,
                 );
-                painter.text(
-                    egui::pos2(ac.x + 14.0, acc.center().y),
-                    Align2::LEFT_CENTER,
-                    &short_user,
-                    u_font,
-                    if dark { fg } else { Color32::from_rgb(51, 65, 85) },
+                painter.galley(
+                    egui::pos2(ac.x + 14.0, acc.center().y - name_galley.size().y / 2.0),
+                    name_galley, fg,
                 );
-                let _ = ui.ctx().accesskit_node_builder(aresp.id, |node| node.set_label(format!("账户：{user}")));
+                ui_kit::focus_ring(ui, &aresp, acc, 12.0);
+                if ui_kit::is_accesskit_active(ctx) {
+                    ui_kit::a11y_name(&aresp, &format!("账户：{user}"), true, None);
+                }
                 if aresp.on_hover_text(format!("账户：{user}")).clicked() {
                     self.profile_draft = self.my_name.clone();
                     self.profile_msg.clear();
@@ -1051,6 +1105,14 @@ impl SheetApp {
                             }
                         }
                     }
+                    let label = match name {
+                        "close" => "关闭窗口",
+                        "min" => "最小化",
+                        _ if maximized => "还原窗口",
+                        _ => "最大化",
+                    };
+                    ui_kit::a11y_name(&resp, label, true, None);
+                    ui_kit::focus_ring(ui, &resp, br, 3.0);
                     if resp.clicked() || (name == "max" && crate::win_chrome::take_maximize_button_click()) {
                         match name {
                             "close" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -1076,13 +1138,8 @@ impl SheetApp {
         if let Some(i) = do_close {
             self.request_close_tab(i);
         }
-        if let Some(i) = do_return_tab {
-            self.show_start = false;
-            if i != self.active_tab {
-                self.switch_tab(i);
-            }
-        }
         if let Some(i) = do_switch {
+            self.show_start = false;
             self.switch_tab(i);
         }
         if new_tab {
@@ -1135,32 +1192,12 @@ impl SheetApp {
                 let hsb_right = (rect.right() - SB).max(split_x + 24.0);
                 let hsb_rect = Rect::from_min_max(egui::pos2(split_x + 4.0, rect.top()), egui::pos2(hsb_right, rect.bottom()));
 
-                // 左侧 `< >` 按钮（28×31 紧凑排布）
-                for (i, dir) in ["left", "right"].iter().enumerate() {
-                    let b = Rect::from_min_size(egui::pos2(left_rect.left() + 10.0 + i as f32 * 28.0, left_rect.top() + 1.0), Vec2::new(28.0, 31.0));
-                    let can = !(*dir == "left" && self.tab_scroll <= 0.0);
-                    let resp = ui.interact(b, egui::Id::new(("tabscroll", i)), Sense::click());
-                    ui_kit::a11y_name(&resp, if *dir == "left" { "工作表标签左移" } else { "工作表标签右移" }, can, None);
-                    if resp.hovered() && can {
-                        ui.painter().rect_filled(b.shrink(4.0), 3.0, pal.hover_on_page);
-                    }
-                    if resp.clicked() && can {
-                        let delta = if *dir == "left" { -160.0 } else { 160.0 };
-                        self.tab_scroll = (self.tab_scroll + delta).max(0.0);
-                    }
-                    let c = b.center();
-                    let st = Stroke::new(1.1, if can { pal.text_weak } else { pal.text_muted });
-                    let d = if *dir == "left" { -1.0 } else { 1.0 };
-                    ui.painter().line_segment([egui::pos2(c.x - d * 2.5, c.y - 4.5), egui::pos2(c.x + d * 2.5, c.y)], st);
-                    ui.painter().line_segment([egui::pos2(c.x + d * 2.5, c.y), egui::pos2(c.x - d * 2.5, c.y + 4.5)], st);
-                }
-
                 // 左侧工作表标签滚动区（右边留 34px 给常驻 `+`）
                 let scroll_rect = Rect::from_min_max(
                     egui::pos2(left_rect.left() + 70.0, left_rect.top()),
                     egui::pos2((left_rect.right() - 34.0).max(left_rect.left() + 90.0), left_rect.bottom()),
                 );
-                ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
+                let max_tab_scroll = ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
                     let area = egui::ScrollArea::horizontal()
                         .id_salt("sheet_tabs")
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -1280,11 +1317,38 @@ impl SheetApp {
                         });
                     });
                     self.tab_scroll = out.state.offset.x;
-                });
+                    (out.content_size.x - out.inner_rect.width()).max(0.0)
+                }).inner;
+
+                // 左侧 `< >` 按钮（28×31 紧凑排布）
+                for (i, (d, label)) in [(-1.0, "工作表标签左移"), (1.0, "工作表标签右移")].into_iter().enumerate() {
+                    let b = Rect::from_min_size(egui::pos2(left_rect.left() + 10.0 + i as f32 * 28.0, left_rect.top() + 1.0), Vec2::new(28.0, 31.0));
+                    let can = if d < 0.0 { self.tab_scroll > 0.5 } else { self.tab_scroll + 0.5 < max_tab_scroll };
+                    let sense = if can { Sense::click() } else { Sense::hover() };
+                    let resp = ui.interact(b, egui::Id::new(("tabscroll", i)), sense);
+                    ui_kit::a11y_name(&resp, label, can, None);
+                    if resp.hovered() && can {
+                        ui.painter().rect_filled(b.shrink(4.0), 3.0, pal.hover_on_page);
+                    }
+                    if resp.clicked() && can {
+                        self.tab_scroll = (self.tab_scroll + d * 160.0).clamp(0.0, max_tab_scroll);
+                        ctx.request_repaint();
+                    }
+                    let c = b.center();
+                    let st = Stroke::new(1.1, if can { pal.text_weak } else { pal.text_muted });
+                    if can {
+                        ui_kit::focus_ring(ui, &resp, b.shrink(3.0), 3.0);
+                        resp.on_hover_text(label);
+                    }
+                    ui.painter().line_segment([egui::pos2(c.x - d * 2.5, c.y - 4.5), egui::pos2(c.x + d * 2.5, c.y)], st);
+                    ui.painter().line_segment([egui::pos2(c.x + d * 2.5, c.y), egui::pos2(c.x - d * 2.5, c.y + 4.5)], st);
+                }
 
                 // 常驻「+ 新建工作表」按钮（紧邻分割条左侧）
                 let nb = Rect::from_min_size(egui::pos2(left_rect.right() - 32.0, left_rect.top() + 1.0), Vec2::new(30.0, 31.0));
                 let nresp = ui.interact(nb, egui::Id::new("newsheet"), Sense::click());
+                ui_kit::a11y_name(&nresp, "新建工作表", true, None);
+                ui_kit::focus_ring(ui, &nresp, nb.shrink(3.0), 3.0);
                 if nresp.hovered() {
                     ui.painter().rect_filled(nb.shrink2(Vec2::new(2.0, 4.0)), 5.0, pal.hover_on_page);
                 }
@@ -1303,9 +1367,9 @@ impl SheetApp {
                 }
                 let sc = split_rect.center();
                 let dot_col = if sresp.hovered() || sresp.dragged() {
-                    ui_kit::ACCENT
+                    pal.accent
                 } else {
-                    Color32::from_rgb(176, 182, 192)
+                    pal.text_muted
                 };
                 for dy in [-4.0f32, 0.0, 4.0] {
                     ui.painter().circle_filled(egui::pos2(sc.x, sc.y + dy), 1.3, dot_col);

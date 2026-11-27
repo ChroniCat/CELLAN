@@ -357,6 +357,23 @@ impl SparkCache {
 
 // ===== 保留式单元格排版与视口网格缓存（Tier 1: 单元级 Galley/格式；Tier 2: 整视口 Mesh/Shapes） =====
 
+/// Galley 中的字形纹理坐标只对排版当帧的图集有效。DPI 变化、字体安装和
+/// 图集装满都会使 egui 在新帧创建另一个图集，即使字体名称和工作表内容相同。
+#[derive(Clone, Default)]
+pub(crate) struct FontAtlasId(std::sync::Weak<egui::epaint::mutex::Mutex<egui::epaint::TextureAtlas>>);
+
+impl FontAtlasId {
+    pub fn current(ctx: &egui::Context) -> Self {
+        ctx.fonts(|fonts| Self(Arc::downgrade(&fonts.texture_atlas())))
+    }
+}
+
+impl PartialEq for FontAtlasId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) struct CellCacheEpoch {
     pub sheet_id: u64,
@@ -374,6 +391,7 @@ pub(crate) struct CellCacheEpoch {
     pub show_formulas: bool,
     pub text_spill: bool,
     pub fonts_gen: u64,
+    pub font_atlas: FontAtlasId,
     pub tables_fp: u64,
     pub sparklines_len: usize,
 }
@@ -395,6 +413,7 @@ impl CellCacheEpoch {
             && self.show_formulas == other.show_formulas
             && self.text_spill == other.text_spill
             && self.fonts_gen == other.fonts_gen
+            && self.font_atlas == other.font_atlas
             && self.tables_fp == other.tables_fp
             && self.sparklines_len == other.sparklines_len
     }
@@ -1027,7 +1046,7 @@ pub(super) struct Rules {
     pub(crate) grid: RetainedGridCache,
     /// 图表局部坐标系 `(0, 0, w, h)` 形状缓存，键为 `(chart_idx, [w_bits, h_bits])`，滚动时 100% 命中。
     pub(crate) charts: HashMap<(usize, [u32; 2]), Arc<[Shape]>>,
-    pub(crate) charts_epoch: Option<(u64, u64, u64, u64)>,
+    pub(crate) charts_epoch: Option<(u64, u64, u64, u64, FontAtlasId)>,
 }
 
 /// Result of `Rules::refresh_responsive`: distinguishes a full cache wipe (definitions,
@@ -1219,8 +1238,8 @@ impl Rules {
         if date_system == DateSystem::D1904 {
             fp ^= 0x9e37_79b9_7f4a_7c15;
         }
-        let epoch = (sh.identity, wb_epoch, fonts_gen, fp);
-        if self.charts_epoch != Some(epoch) {
+        let epoch = (sh.identity, wb_epoch, fonts_gen, fp, FontAtlasId::current(painter.ctx()));
+        if self.charts_epoch.as_ref() != Some(&epoch) {
             self.charts.clear();
             self.charts_epoch = Some(epoch);
         }
@@ -2233,6 +2252,42 @@ mod tests {
     }
 
     #[test]
+    fn retained_grid_uses_the_current_font_atlas_after_dpi_or_font_changes() {
+        let _env = crate::test_env::TestEnv::new("grid-font-atlas");
+        let ctx = egui::Context::default();
+        let mut app = crate::SheetApp::new_with_context(&ctx, None);
+        app.wb.sheets[0].set(1, 0, Cell { value: Value::Text("金额".into()), formula: None });
+
+        let draw = |app: &mut crate::SheetApp, ppp: f32| {
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(760.0, 420.0))),
+                ..Default::default()
+            };
+            input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(ppp);
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.draw_grid_pane(ui, ctx, false));
+            });
+            let cell = &app.cf_inputs.grid.cells[&(1, 0)];
+            let PreparedText::Single { galley, .. } = &cell.text else { panic!("expected a single text run") };
+            galley.clone()
+        };
+        let first = draw(&mut app, 1.0);
+        let scaled = draw(&mut app, 1.5);
+        assert!(!Arc::ptr_eq(&first, &scaled));
+        assert_eq!(scaled.pixels_per_point, 1.5);
+        assert!(Arc::ptr_eq(&scaled, &draw(&mut app, 1.5)));
+
+        // A new definition set also creates a new atlas at an unchanged DPI.
+        let mut definitions = ctx.fonts(|fonts| fonts.lock().fonts.definitions().clone());
+        let family = definitions.families[&egui::FontFamily::Proportional].clone();
+        definitions.families.insert(egui::FontFamily::Name("test-alias".into()), family);
+        ctx.set_fonts(definitions);
+        let reinstalled = draw(&mut app, 1.5);
+        assert!(!Arc::ptr_eq(&scaled, &reinstalled));
+        assert!(Arc::ptr_eq(&reinstalled, &draw(&mut app, 1.5)));
+    }
+
+    #[test]
     fn retained_grid_cache_preserves_unaffected_cells_across_single_cell_edit() {
         let mut sh = Sheet::new("Retained");
         sh.set(0, 0, Cell { value: Value::Number(1.0), formula: None });
@@ -2257,6 +2312,7 @@ mod tests {
             show_formulas: false,
             text_spill: true,
             fonts_gen: 0,
+            font_atlas: FontAtlasId::default(),
             tables_fp: 0,
             sparklines_len: 0,
         };

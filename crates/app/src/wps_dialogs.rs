@@ -143,7 +143,11 @@ impl SheetApp {
                                 Stroke::new(1.0, pal.card_border),
                                 egui::StrokeKind::Inside,
                             );
-                            ui.painter().with_clip_rect(fr.shrink2(Vec2::new(5.0, 2.0))).text(
+                            let font_label = Rect::from_min_max(
+                                fr.left_top() + egui::vec2(5.0, 0.0),
+                                fr.right_bottom() - egui::vec2(15.0, 0.0),
+                            );
+                            ui.painter_at(font_label).text(
                                 egui::pos2(fr.left() + 5.0, fr.center().y),
                                 Align2::LEFT_CENTER,
                                 flabel,
@@ -201,7 +205,7 @@ impl SheetApp {
                             if fc_r.clicked() {
                                 apply_fill_direct = true;
                             }
-                            let fa_r = ui_kit::arrow_glyph_button(ui, Vec2::new(11.0, 22.0), ui_kit::TEXT_WEAK);
+                            let fa_r = ui_kit::arrow_glyph_button(ui, Vec2::new(11.0, 22.0), pal.text_weak);
                             if fa_r.clicked() {
                                 open_color = Some((false, fa_r.rect.left_bottom()));
                             }
@@ -212,7 +216,7 @@ impl SheetApp {
                             if fcr.clicked() {
                                 apply_font_direct = true;
                             }
-                            let far = ui_kit::arrow_glyph_button(ui, Vec2::new(11.0, 22.0), ui_kit::TEXT_WEAK);
+                            let far = ui_kit::arrow_glyph_button(ui, Vec2::new(11.0, 22.0), pal.text_weak);
                             if far.clicked() {
                                 open_color = Some((true, far.rect.left_bottom()));
                             }
@@ -512,6 +516,7 @@ impl SheetApp {
         let mut open = self.fmt_dlg;
         let mut apply = false;
         let mut cancel = false;
+        let pal = crate::theme::palette();
         let mixed = self.fmt_mixed.clone();
         let orig = self.fmt_orig.clone();
         let font_mixed = mixed.font && !self.fmt_touched.font && self.fmt_state.font == orig.font;
@@ -532,7 +537,6 @@ impl SheetApp {
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, -16.0])
             .show(ctx, |ui| {
-                ui.set_width(520.0);
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                 ui_kit::dialog_tabs(ui, &mut self.fmt_tab, &["数字", "对齐", "字体", "边框", "填充", "保护"]);
                 ui.add_space(4.0);
@@ -540,16 +544,16 @@ impl SheetApp {
                 match self.fmt_tab {
                     0 => {
                         // WPS 两栏数字设置
-                        ui.horizontal(|ui| {
+                        ui.horizontal_top(|ui| {
                             // 左栏：12 个分类列表
                             egui::Frame::NONE
-                                .fill(Color32::from_rgb(248, 250, 252))
-                                .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                                .fill(pal.page_bg)
+                                .stroke(Stroke::new(1.0, pal.card_border))
                                 .corner_radius(6.0)
                                 .inner_margin(egui::Margin::same(6))
                                 .show(ui, |ui| {
-                                    ui.vertical(|ui| {
-                                        ui.set_width(120.0);
+                                    let layout = egui::Layout::top_down_justified(egui::Align::Min);
+                                    ui.allocate_ui_with_layout(Vec2::new(120.0, 0.0), layout, |ui| {
                                         ui.set_min_height(248.0);
                                         ui.spacing_mut().item_spacing.y = 2.0;
                                         let cats = [
@@ -578,17 +582,18 @@ impl SheetApp {
 
                             // 右栏：动态选项 + 示例
                             ui.vertical(|ui| {
-                                ui.set_width(376.0);
+                                ui.set_width(ui.available_width());
                                 let sample_box = |ui: &mut egui::Ui, preview: &str| {
                                     egui::Frame::NONE
-                                        .fill(Color32::from_rgb(248, 250, 252))
-                                        .stroke(Stroke::new(1.0, ui_kit::CARD_BORDER))
+                                        .fill(pal.header_bg)
+                                        .stroke(Stroke::new(1.0, pal.card_border))
                                         .corner_radius(6.0)
                                         .inner_margin(egui::Margin::symmetric(10, 8))
                                         .show(ui, |ui| {
                                             ui.set_width(ui.available_width());
-                                            ui.label(egui::RichText::new("示例").size(11.0).color(ui_kit::TEXT_WEAK));
-                                            ui.label(egui::RichText::new(preview).size(15.0).color(ui_kit::TEXT));
+                                            ui.label(egui::RichText::new("示例").size(ui_kit::T_SMALL).color(pal.text_weak));
+                                            ui.add(egui::Label::new(egui::RichText::new(preview).size(ui_kit::T_H2).color(pal.text)).truncate())
+                                                .on_hover_text(preview);
                                         });
                                 };
                                 let preview = if format_mixed {
@@ -602,7 +607,7 @@ impl SheetApp {
                                 let mut regen = false;
                                 match self.fmt_num_cat {
                                     0 => {
-                                        ui.label(egui::RichText::new("常规单元格格式不包含任何特定的数字格式。").size(12.0).color(ui_kit::TEXT_WEAK));
+                                        ui.label(egui::RichText::new("常规单元格格式不包含任何特定的数字格式。").size(ui_kit::T_BODY).color(pal.text_weak));
                                     }
                                     1 | 2 | 3 | 6 | 8 => {
                                         ui.horizontal(|ui| {
@@ -627,7 +632,7 @@ impl SheetApp {
                                             });
                                         }
                                         if self.fmt_num_cat == 1 || self.fmt_num_cat == 2 {
-                                            ui.label(egui::RichText::new("负数显示方式：").size(11.5).color(ui_kit::TEXT_WEAK));
+                                            ui.label(egui::RichText::new("负数显示方式：").size(ui_kit::T_BODY).color(pal.text_weak));
                                             for (idx, lbl) in [(0u8, "-1,234.10"), (1, "红色 -1,234.10"), (2, "(1,234.10)")] {
                                                 if ui.selectable_value(&mut self.fmt_num_neg, idx, lbl).clicked() {
                                                     regen = true;
@@ -670,10 +675,10 @@ impl SheetApp {
                                         }
                                     }
                                     9 => {
-                                        ui.label(egui::RichText::new("在文本单元格格式中，数字作为文本处理（@）。").size(12.0).color(ui_kit::TEXT_WEAK));
+                                        ui.label(egui::RichText::new("在文本单元格格式中，数字作为文本处理（@）。").size(ui_kit::T_BODY).color(pal.text_weak));
                                     }
                                     10 => {
-                                        ui.label(egui::RichText::new("中文特色财务与数字格式：").size(11.5).color(ui_kit::TEXT_WEAK));
+                                        ui.label(egui::RichText::new("中文特色财务与数字格式：").size(ui_kit::T_BODY).color(pal.text_weak));
                                         for (lbl, code) in [
                                             ("人民币大写（壹万贰仟叁佰元整）", "[DBNum2][$¥-804]#,##0.00"),
                                             ("中文大写数字（壹万贰仟叁佰）", "[DBNum2]G/通用格式"),
@@ -686,9 +691,9 @@ impl SheetApp {
                                         }
                                     }
                                     _ => {
-                                        ui.label(egui::RichText::new("自定义格式代码：").size(11.5).color(ui_kit::TEXT_WEAK));
+                                        ui.label(egui::RichText::new("自定义格式代码：").size(ui_kit::T_BODY).color(pal.text_weak));
                                         let mut custom = self.fmt_state.format.clone();
-                                        if ui.add(egui::TextEdit::singleline(&mut custom).desired_width(350.0).hint_text("例如 #,##0.00;[Red]-#,##0.00")).changed() {
+                                        if ui.add(egui::TextEdit::singleline(&mut custom).desired_width(ui.available_width()).hint_text("例如 #,##0.00;[Red]-#,##0.00")).changed() {
                                             self.fmt_state.format = custom;
                                             self.fmt_touched.format = true;
                                         }
@@ -729,7 +734,7 @@ impl SheetApp {
                                     }
                                 }
                                 ui.add_space(12.0);
-                                ui.label(egui::RichText::new("缩进").size(11.5).weak());
+                                ui.label(egui::RichText::new("缩进").size(ui_kit::T_BODY).color(pal.text_weak));
                                 let mut ind = self.fmt_state.indent as f64;
                                 if ui_kit::spin(ui, &mut ind, 0.0, 15.0, 1.0, 50.0) {
                                     self.fmt_state.indent = ind as u8;
@@ -825,7 +830,7 @@ impl SheetApp {
                                         }
                                     });
                                 ui.add_space(8.0);
-                                ui.label(egui::RichText::new(if size_mixed { "字号(混合)" } else { "字号" }).size(11.5).weak());
+                                ui.label(egui::RichText::new(if size_mixed { "字号（混合）" } else { "字号" }).size(ui_kit::T_BODY).color(pal.text_weak));
                                 let mut szv = self.fmt_state.size as f64;
                                 if ui_kit::spin(ui, &mut szv, 6.0, 72.0, 1.0, 56.0) {
                                     self.fmt_state.size = szv as f32;
@@ -868,9 +873,19 @@ impl SheetApp {
                                 if ui.color_edit_button_srgb(&mut self.fmt_state.color).changed() {
                                     self.fmt_touched.color = true;
                                 }
-                                for rgb in [[0u8, 0, 0], [216, 59, 1], [192, 0, 0], [16, 124, 65], [68, 114, 196]] {
-                                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-                                    ui.painter().rect_filled(r, 3.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                                for (label, rgb) in [
+                                    ("黑色", [0, 0, 0]), ("橙色", [216, 59, 1]),
+                                    ("红色", [192, 0, 0]), ("绿色", [16, 124, 65]),
+                                    ("蓝色", [68, 114, 196]),
+                                ] {
+                                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+                                    let selected = !color_mixed && self.fmt_state.color == rgb;
+                                    let border = if selected || resp.has_focus() { pal.accent }
+                                        else if resp.hovered() { pal.text_weak } else { pal.card_border };
+                                    ui.painter().rect_stroke(r, 4.0, Stroke::new(if selected { 2.0 } else { 1.0 }, border), egui::StrokeKind::Inside);
+                                    ui.painter().rect_filled(r.shrink(3.0), 2.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                                    ui_kit::a11y_name(&resp, label, ui.is_enabled(), Some(selected));
+                                    let resp = resp.on_hover_text(label);
                                     if resp.clicked() {
                                         self.fmt_state.color = rgb;
                                         self.fmt_touched.color = true;
@@ -913,21 +928,17 @@ impl SheetApp {
                         if ui.checkbox(&mut self.fmt_state.hidden, if hidden_mixed { "隐藏公式（混合）" } else { "隐藏公式" }).changed() {
                             self.fmt_touched.hidden = true;
                         }
-                        ui.label(egui::RichText::new("需在「审阅 → 保护工作表」启用后生效。").size(11.5).weak());
+                        ui.label(egui::RichText::new("需在「审阅 → 保护工作表」启用后生效。").size(ui_kit::T_BODY).color(pal.text_weak));
                     }
                 }
 
-                ui.add_space(6.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui_kit::secondary_button(ui, "取消").clicked() {
-                            cancel = true;
-                        }
-                        if ui_kit::primary_button(ui, "确定").clicked() {
-                            apply = true;
-                        }
-                    });
+                ui_kit::footer(ui, |ui| {
+                    if ui_kit::secondary_button(ui, "取消").clicked() {
+                        cancel = true;
+                    }
+                    if ui_kit::primary_button(ui, "确定").clicked() {
+                        apply = true;
+                    }
                 });
             });
 

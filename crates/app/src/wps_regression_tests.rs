@@ -1083,6 +1083,7 @@ fn ai_composer_retains_focus_and_types_even_when_cell_was_in_edit_mode() {
 
 #[test]
 fn home_page_clean_minimal_layout_without_subtitle_sidecards_or_preset_templates() {
+    let _env = crate::test_env::TestEnv::new("home-page-layout");
     fn collect_texts(shapes: &[egui::epaint::Shape], out: &mut Vec<String>) {
         for s in shapes {
             match s {
@@ -1172,6 +1173,68 @@ fn home_page_clean_minimal_layout_without_subtitle_sidecards_or_preset_templates
     // 主页保持极简（只展示『空白工作簿』+『打开本地文件』），后台「新建」内置 1 个空白 + 6 套财务模板
     assert_eq!(templates::ALL.len(), 7);
     assert_eq!(templates::ALL[0].name, "空白工作簿");
+}
+
+#[test]
+fn compact_home_keeps_recent_file_visible_and_fits_long_text_in_its_column() {
+    let _env = crate::test_env::TestEnv::new("compact-home");
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    app.show_start = true;
+    app.prefs.theme = theme::AppTheme::Dark as u8;
+    let name = format!("{}.xlsx", "跨部门年度财务计划".repeat(8));
+    let path = PathBuf::from(r"F:\一组名称很长的财务目录\新年度预算执行情况跟踪").join(&name);
+    app.recent_cache = Some(vec![HomeRecentEntry {
+        path, name: name.clone(), lower_haystack: name.to_lowercase(),
+        short_dir: String::new(), size_txt: "共享盘".into(), mtime_txt: String::new(), pinned: false,
+    }]);
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 420.0));
+    let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+    let mut frame = eframe::Frame::_new_kittest();
+    let output = ctx.run(raw, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+    let drawn_text = |label: &str| {
+        output.shapes.iter().find_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(t) if t.galley.job.text == label => Some((clipped.clip_rect, t)),
+            _ => None,
+        }).unwrap_or_else(|| panic!("缺少文字 {label}"))
+    };
+    let (clip, filename) = drawn_text(&name);
+    assert!(filename.galley.elided, "超长文件名应以省略号结尾");
+    assert!(screen.contains_rect(filename.visual_bounding_rect()), "窄窗口也必须显示最近文件的第一行");
+    assert!(clip.right() <= drawn_text("所在位置").1.pos.x + 1.0, "文件名不能占用目录列");
+    assert!(drawn_text("局域网协作").1.pos.y < filename.pos.y);
+    assert_eq!(filename.galley.job.sections[0].format.color, theme::palette_for(theme::AppTheme::Dark).text);
+}
+
+#[test]
+fn narrow_status_message_fits_between_mode_and_selection_statistics() {
+    let _env = crate::test_env::TestEnv::new("narrow-status");
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    app.wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(123.0), formula: None });
+    app.status = "已打开并重新计算完成，工作簿包含多张表格和多个非空单元格".into();
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 400.0));
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut render = || ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+        |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+    render();
+    let output = render();
+    let visible_bounds = |predicate: &dyn Fn(&str) -> bool| {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if predicate(&text.galley.job.text) => {
+                Some(text.visual_bounding_rect().intersect(shape.clip_rect))
+            }
+            _ => None,
+        }).unwrap_or_else(|| panic!("状态栏文字应可见：{:?}", output.shapes.iter().filter_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.pos.y > screen.bottom() - 26.0 => Some((&t.galley.job.text, t.pos, s.clip_rect)),
+            _ => None
+        }).collect::<Vec<_>>()))
+    };
+    let mode = visible_bounds(&|s| s == "就绪");
+    let message = visible_bounds(&|s| s == app.status);
+    let stats = visible_bounds(&|s| s.contains("计数"));
+    assert!(message.is_positive() && stats.is_positive());
+    assert!(mode.right() <= message.left() && message.right() <= stats.left());
 }
 
 #[test]
