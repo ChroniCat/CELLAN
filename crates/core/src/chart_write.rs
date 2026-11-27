@@ -1385,28 +1385,118 @@ pub fn refresh_series_from_refs(
     Ok(())
 }
 
-/// 只把 chart 部件里的引用字符串换掉，其它内容原样保留
+/// Update exact formula nodes once per batch, leaving cached values, labels and markup alone.
 pub fn replace_refs(path: &Path, chart_part: &str, pairs: &[(String, String)]) -> Result<()> {
-    if pairs.is_empty() {
-        return Ok(());
-    }
-    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    if pairs.is_empty() { return Ok(()); }
+    patch_series_refs(path, chart_part, |_, _, old| {
+        pairs.iter().find(|(from, _)| {
+            if from == old { return true; }
+            // Some spreadsheet writers omit the optional quotes around a sheet name.
+            let Some((quoted, cell)) = from.strip_prefix('\'').and_then(|f| f.rsplit_once("'!")) else {
+                return false;
+            };
+            old.rsplit_once('!').is_some_and(|(sheet, address)| {
+                cell == address && quoted.replace("''", "'") == sheet
+            })
+        }).map(|(_, to)| to.as_str())
+    })
+}
+
+/// Use the current field of each series: a sequence of edits and undos can have
+/// the same old reference in two different roles with different final values.
+pub(crate) fn write_series_refs(path: &Path, chart: &Chart) -> Result<()> {
+    patch_series_refs(path, &chart.part, |index, field, _| {
+        let series = chart.series.get(index)?;
+        let value = match field {
+            "tx" => &series.name_ref,
+            "cat" | "xVal" | "strDim" => &series.cat_ref,
+            "val" | "yVal" | "numDim" => &series.val_ref,
+            "bubbleSize" => &series.size_ref,
+            _ => return None,
+        };
+        (!value.is_empty()).then_some(value.as_str())
+    })
+}
+
+fn patch_series_refs<'a>(path: &Path, part: &str,
+    target: impl Fn(usize, &str, &str) -> Option<&'a str>,
+) -> Result<()> {
     let mut xml = String::new();
-    zip.by_name(chart_part)?.read_to_string(&mut xml)?;
-    drop(zip);
-    for (old, new) in pairs {
-        if xml.contains(old.as_str()) {
-            xml = xml.replace(old.as_str(), new.as_str());
-            continue;
+    zip::ZipArchive::new(std::fs::File::open(path)?)?.by_name(part)?.read_to_string(&mut xml)?;
+    if let Some(updated) = series_refs_xml(&xml, target)? {
+        crate::patch::append_entry(path, part, updated.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn series_refs_xml<'a>(xml: &str, target: impl Fn(usize, &str, &str) -> Option<&'a str>)
+    -> Result<Option<String>> {
+    let doc = roxmltree::Document::parse(xml)?;
+    let ns = doc.root_element().tag_name().namespace();
+    let tag = |n: roxmltree::Node, name: &str| {
+        n.is_element() && n.tag_name().name() == name && n.tag_name().namespace() == ns
+    };
+    let mut edits = Vec::new();
+    let mut patch = |index, field: &str, node: roxmltree::Node| -> Result<()> {
+        let text: String = node.children().filter(|c| c.is_text()).filter_map(|c| c.text()).collect();
+        let old = text.trim();
+        if let Some(new) = target(index, field, old).filter(|new| *new != old) {
+            // roxmltree coalesces adjacent text and CDATA. Use XML token byte spans
+            // so character entities, split CDATA and intervening comments stay valid.
+            let range = node.range();
+            let mut reader = quick_xml::Reader::from_str(&xml[range.clone()]);
+            let mut replacement = Some(esc(new));
+            loop {
+                let start = range.start + reader.buffer_position() as usize;
+                match reader.read_event()? {
+                    quick_xml::events::Event::Text(_) | quick_xml::events::Event::CData(_)
+                    | quick_xml::events::Event::GeneralRef(_) => {
+                        let end = range.start + reader.buffer_position() as usize;
+                        edits.push((start..end, replacement.take().unwrap_or_default()));
+                    }
+                    quick_xml::events::Event::Eof => break,
+                    _ => {}
+                }
+            }
         }
-        let bare = |s: &str| s.replace('\'', "");
-        let o = bare(old);
-        if o != *old && xml.contains(&o) {
-            xml = xml.replace(&o, new);
+        Ok(())
+    };
+    // Classic chart series occur in plot order, including combo charts.
+    let series = doc.descendants().filter(|n| tag(*n, "ser")
+        && n.parent_element().is_some_and(|p| p.tag_name().namespace() == ns
+            && p.tag_name().name().ends_with("Chart") && p.ancestors().any(|a| tag(a, "plotArea"))));
+    for (i, series) in series.enumerate() {
+        for field in series.children().filter(|n| n.is_element() && n.tag_name().namespace() == ns) {
+            let label = field.tag_name().name();
+            if !matches!(label, "tx" | "cat" | "xVal" | "val" | "yVal" | "bubbleSize") { continue; }
+            if let Some(f) = field.children()
+                .filter(|n| n.is_element() && n.tag_name().namespace() == ns
+                    && matches!(n.tag_name().name(), "strRef" | "numRef" | "multiLvlStrRef"))
+                .flat_map(|n| n.children())
+                .find(|n| tag(*n, "f")) {
+                patch(i, label, f)?;
+            }
         }
     }
-    crate::patch::append_entry(path, chart_part, xml.as_bytes())?;
-    Ok(())
+    // The chartEx model stores the first public formula of each data dimension.
+    for label in ["strDim", "numDim"] {
+        let f = doc.descendants().filter(|n| tag(*n, label))
+            .filter(|n| n.parent_element().is_some_and(|p| tag(p, "data")))
+            .flat_map(|n| n.children()).find(|n| tag(*n, "f")
+                && n.text().is_some_and(|t| !t.trim().starts_with("_xlchart.")));
+        if let Some(f) = f { patch(0, label, f)?; }
+    }
+    if edits.is_empty() { return Ok(None); }
+    edits.sort_unstable_by_key(|(r, _)| r.start);
+    let mut out = String::with_capacity(xml.len());
+    let mut pos = 0;
+    for (range, replacement) in edits {
+        out.push_str(&xml[pos..range.start]);
+        out.push_str(&replacement);
+        pos = range.end;
+    }
+    out.push_str(&xml[pos..]);
+    Ok(Some(out))
 }
 
 /// 换掉已有图表的内容，保留锚点与部件路径
@@ -1665,5 +1755,44 @@ mod anchor_tests {
         assert_eq!(out.matches("<xdr:twoCellAnchor").count(), 1);
         assert!(out.contains("rId1"));
         assert!(out.contains("rId2"));
+    }
+}
+
+#[cfg(test)]
+mod series_reference_tests {
+    use super::*;
+
+    #[test]
+    fn writeback_patches_each_series_field_once_and_preserves_other_xml() {
+        let xml = r#"<c:chartSpace xmlns:c="urn:chart" xmlns:e="urn:extension"><c:chart>
+<c:title>Data!A1</c:title><c:plotArea><c:lineChart>
+<c:ser><c:tx><c:strRef><c:f>Data!A10</c:f></c:strRef></c:tx>
+<c:val><c:numRef><c:f>Data!A1</c:f><c:numCache>Data!A1</c:numCache></c:numRef></c:val>
+<c:extLst><e:f>Data!A1</e:f></c:extLst></c:ser>
+<c:ser><c:val><c:numRef><c:f>Data!A2</c:f></c:numRef></c:val></c:ser>
+<c:ser><c:val><c:numRef><c:f><![CDATA[Da]]>ta!A1<!--keep--></c:f></c:numRef></c:val></c:ser>
+</c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let series = ["Data!A2", "Data!A3", "'R&D'!B1"];
+        let out = series_refs_xml(xml, |index, field, _| (field == "val").then_some(series[index]))
+            .unwrap().unwrap();
+        let expected = xml.replace("<c:f>Data!A2</c:f>", "<c:f>Data!A3</c:f>")
+            .replace("<c:f>Data!A1</c:f>", "<c:f>Data!A2</c:f>")
+            .replace("<![CDATA[Da]]>ta!A1<!--keep-->", "'R&amp;D'!B1<!--keep-->");
+        assert_eq!(out, expected);
+        assert!(roxmltree::Document::parse(&out).is_ok());
+    }
+
+    #[test]
+    fn chartex_only_changes_the_dimension_formulas_exposed_by_the_model() {
+        let xml = r#"<cx:chartSpace xmlns:cx="urn:cx"><cx:chartData><cx:data>
+<cx:strDim><cx:f>_xlchart.v1.private</cx:f></cx:strDim>
+<cx:strDim><cx:f dir="col">S!A1</cx:f></cx:strDim>
+<cx:strDim><cx:f>S!A10</cx:f></cx:strDim>
+<cx:numDim><cx:f>S!B1</cx:f></cx:numDim>
+</cx:data></cx:chartData></cx:chartSpace>"#;
+        let out = series_refs_xml(xml, |_, field, _| match field {
+            "strDim" => Some("S!C1"), "numDim" => Some("S!D1"), _ => None
+        }).unwrap().unwrap();
+        assert_eq!(out, xml.replace(">S!A1<", ">S!C1<").replace(">S!B1<", ">S!D1<"));
     }
 }

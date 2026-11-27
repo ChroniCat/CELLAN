@@ -3975,7 +3975,7 @@ fn save_plain_at(
             } else if !ch.ref_fixes.is_empty() {
                 must_save!(
                     "chart-refs",
-                    crate::chart_write::replace_refs(path, &ch.part, &ch.ref_fixes)
+                    crate::chart_write::write_series_refs(path, ch)
                 );
             }
         }
