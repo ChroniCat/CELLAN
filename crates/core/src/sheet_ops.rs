@@ -428,6 +428,28 @@ fn visit_references(wb: &mut Workbook, mut update: impl FnMut(ReferenceField, &s
                 match &mut rule.kind {
                     crate::cf::CfKind::Expr { formula, .. } => apply(0, formula),
                     crate::cf::CfKind::CellIs { a, b, .. } => { apply(0, a); apply(1, b); }
+                    crate::cf::CfKind::Scale { points } => {
+                        for (k, (v, _)) in points.iter_mut().enumerate() {
+                            if v.kind == crate::cf::CfvoKind::Formula {
+                                apply(k, &mut v.formula);
+                            }
+                        }
+                    }
+                    crate::cf::CfKind::Bar { min, max, .. } => {
+                        if min.kind == crate::cf::CfvoKind::Formula {
+                            apply(0, &mut min.formula);
+                        }
+                        if max.kind == crate::cf::CfvoKind::Formula {
+                            apply(1, &mut max.formula);
+                        }
+                    }
+                    crate::cf::CfKind::IconSet { thresholds, .. } => {
+                        for (k, v) in thresholds.iter_mut().enumerate() {
+                            if v.kind == crate::cf::CfvoKind::Formula {
+                                apply(k, &mut v.formula);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -450,12 +472,27 @@ fn visit_references(wb: &mut Workbook, mut update: impl FnMut(ReferenceField, &s
         }
         for (ci, chart) in sheet.charts.iter_mut().enumerate() {
             for (series_idx, series) in chart.series.iter_mut().enumerate() {
-                for (fi, text) in [&mut series.name_ref, &mut series.cat_ref, &mut series.val_ref].into_iter().enumerate() {
+                for (fi, text) in [
+                    &mut series.name_ref,
+                    &mut series.cat_ref,
+                    &mut series.val_ref,
+                    &mut series.size_ref,
+                ]
+                .into_iter()
+                .enumerate()
+                {
                     if let Some(new) = update(ReferenceField::Chart(si, ci, series_idx, fi), text) {
                         chart.ref_fixes.push((std::mem::replace(text, new.clone()), new));
                         sheet.charts_dirty = true;
                     }
                 }
+            }
+            if !chart.source_range.is_empty()
+                && let Some(new) =
+                    update(ReferenceField::Chart(si, ci, usize::MAX, 0), &chart.source_range)
+            {
+                chart.source_range = new;
+                sheet.charts_dirty = true;
             }
         }
     }

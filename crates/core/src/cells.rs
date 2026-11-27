@@ -33,7 +33,10 @@ fn used(sheet: &Sheet) -> Option<(u32, u32)> {
     for &(r, c) in sheet.rich.keys() {
         bump(r, c);
     }
-    for &(r, c) in sheet.hyperlinks.keys() {
+    for (&(r, c), link) in sheet.hyperlinks.iter() {
+        bump(r.saturating_add(link.span.0), c.saturating_add(link.span.1));
+    }
+    for &(r, c) in sheet.ignored_errors.iter() {
         bump(r, c);
     }
     if let (Some(mr), Some(mc)) = (sheet.max_merge_row(), sheet.max_merge_col()) {
@@ -142,6 +145,29 @@ fn shift_ray_metadata(
             }
         }
     }
+
+    if !sheet.ignored_errors.is_empty() {
+        let keys: Vec<(u32, u32)> = sheet
+            .ignored_errors
+            .iter()
+            .filter(|&&(r, c)| r >= r1 && r <= r2 && c >= c1 && c <= c2)
+            .copied()
+            .collect();
+        if !keys.is_empty() {
+            sheet.ignored_errors_dirty = true;
+            let mut moved = Vec::with_capacity(keys.len());
+            for pos in keys {
+                if sheet.ignored_errors.remove_if_present(&pos)
+                    && let Some(dest) = map_coord(pos.0, pos.1)
+                {
+                    moved.push(dest);
+                }
+            }
+            for dest in moved {
+                sheet.ignored_errors.insert(dest);
+            }
+        }
+    }
 }
 
 fn shift_sparse_ray(
@@ -214,7 +240,16 @@ pub(crate) fn insert_would_overflow(sheet: &Sheet, rect: (u32, u32, u32, u32), s
     sheet.iter_rect_views(tail).next().is_some()
         || sheet.styles.iter_rect(tail).next().is_some()
         || sheet.notes.keys().chain(sheet.threads.keys()).any(|k| inside(k.row, k.col))
-        || sheet.rich.keys().chain(sheet.hyperlinks.keys()).any(|&(r, c)| inside(r, c))
+        || sheet.rich.keys().any(|&(r, c)| inside(r, c))
+        || sheet.ignored_errors.iter().any(|&(r, c)| inside(r, c))
+        || sheet.hyperlinks.iter().any(|(&(r, c), link)| {
+            let er = r.saturating_add(link.span.0);
+            let ec = c.saturating_add(link.span.1);
+            match shift {
+                Shift::Vertical => r >= r1 && c1 <= c && ec <= c2 && er >= tail.0,
+                Shift::Horizontal => c >= c1 && r1 <= r && er <= r2 && ec >= tail.1,
+            }
+        })
         || sheet.merges.iter().any(|&(mr1, mc1, mr2, mc2)| match shift {
             Shift::Vertical => mr1 >= r1 && c1 <= mc1 && mc2 <= c2 && mr2 >= tail.0,
             Shift::Horizontal => mc1 >= c1 && r1 <= mr1 && mr2 <= r2 && mc2 >= tail.1,

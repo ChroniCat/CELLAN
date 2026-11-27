@@ -2362,7 +2362,8 @@ pub fn snapshot_cell_shift(wb: &Workbook, sheet: usize, op: &crate::structural::
 pub fn snapshot_cell_shift_if_metadata(wb: &Workbook, sheet: usize, op: &crate::structural::CellShift) -> Option<StructureSnapshot> {
     let target = wb.sheets.get(sheet)?;
     let has_metadata = !target.notes.is_empty() || !target.threads.is_empty() || !target.merges.is_empty()
-        || !target.rich.is_empty() || !target.hyperlinks.is_empty() || !wb.sources.is_empty() || !wb.names.is_empty()
+        || !target.rich.is_empty() || !target.hyperlinks.is_empty() || !target.ignored_errors.is_empty()
+        || !wb.sources.is_empty() || !wb.names.is_empty()
         || wb.sheets.iter().any(|sh| !sh.cf.blocks.is_empty() || !sh.dv.is_empty());
     has_metadata.then(|| snapshot_cell_shift(wb, sheet, op))
 }
@@ -2430,6 +2431,7 @@ impl StructureSnapshot {
         let new = &wb.sheets[self.sheet];
         self.names != wb.names || self.sources != wb.sources || old.merges != new.merges || old.notes != new.notes
             || old.threads != new.threads || old.rich != new.rich || old.hyperlinks != new.hyperlinks
+            || old.ignored_errors != new.ignored_errors
             || old.cf != new.cf || old.dv != new.dv
             || self.foreign.iter().any(|scope| {
                 let sheet = &wb.sheets[scope.sheet];
@@ -2498,27 +2500,51 @@ impl StructureSnapshot {
     }
 }
 
-fn chart_refs_match(current: &[crate::charts::Chart], expected: &[crate::charts::Chart]) -> bool {
+fn chart_refs_match(
+    current: &[crate::charts::Chart],
+    expected: &[crate::charts::Chart],
+    check_anchor: bool,
+) -> bool {
     current.len() == expected.len() && current.iter().zip(expected).all(|(a, b)| {
-        a.part == b.part && a.series.len() == b.series.len() && a.series.iter().zip(&b.series).all(|(s, t)|
-            s.name_ref == t.name_ref && s.cat_ref == t.cat_ref && s.val_ref == t.val_ref)
+        a.part == b.part
+            && (!check_anchor || a.anchor == b.anchor)
+            && a.source_range == b.source_range
+            && a.series.len() == b.series.len()
+            && a.series.iter().zip(&b.series).all(|(s, t)| {
+                s.name_ref == t.name_ref
+                    && s.cat_ref == t.cat_ref
+                    && s.val_ref == t.val_ref
+                    && s.size_ref == t.size_ref
+            })
     })
 }
 
-/// A row/column operation only changes series references. Retain the live
-/// chart's presentation, cached values and save journal when changing them back.
+/// A row/column operation only changes series references, `source_range`, and
+/// (on the target sheet) the chart anchor. Retain the live chart's presentation,
+/// cached values and save journal when changing them back.
 fn restored_charts(
     current: &crate::model::SharedList<crate::charts::Chart>,
     desired: &crate::model::SharedList<crate::charts::Chart>,
+    restore_anchor: bool,
 ) -> crate::model::SharedList<crate::charts::Chart> {
-    if current.ptr_eq(desired) || chart_refs_match(current, desired) {
+    if current.ptr_eq(desired) || chart_refs_match(current, desired, restore_anchor) {
         return current.clone();
     }
     let mut restored = current.clone();
     for (chart, desired) in restored.iter_mut().zip(desired.iter()) {
+        if restore_anchor && chart.anchor != desired.anchor {
+            chart.anchor = desired.anchor;
+        }
+        if chart.source_range != desired.source_range {
+            chart.source_range.clone_from(&desired.source_range);
+        }
         for (series, dest) in chart.series.iter_mut().zip(&desired.series) {
-            for (from, to) in [(&mut series.name_ref, &dest.name_ref),
-                (&mut series.cat_ref, &dest.cat_ref), (&mut series.val_ref, &dest.val_ref)] {
+            for (from, to) in [
+                (&mut series.name_ref, &dest.name_ref),
+                (&mut series.cat_ref, &dest.cat_ref),
+                (&mut series.val_ref, &dest.val_ref),
+                (&mut series.size_ref, &dest.size_ref),
+            ] {
                 if from != to {
                     chart.ref_fixes.push((from.clone(), to.clone()));
                     from.clone_from(to);
@@ -2569,10 +2595,11 @@ fn target_matches(a: &Sheet, b: &Sheet) -> bool {
         && a.hidden_cols == b.hidden_cols && a.scenarios == b.scenarios && a.scenario_settings == b.scenario_settings && a.ignored_errors == b.ignored_errors
         && a.outline_summary_below == b.outline_summary_below && a.outline_summary_right == b.outline_summary_right
         && a.outline_symbols == b.outline_symbols && a.row_levels == b.row_levels && a.col_levels == b.col_levels
-        && a.page == b.page && chart_refs_match(&a.charts, &b.charts) && a.tab_color == b.tab_color
-        && a.protection == b.protection && a.rich == b.rich && a.hyperlinks == b.hyperlinks
-        && a.sparklines == b.sparklines && a.textboxes == b.textboxes && a.hidden == b.hidden
-
+        && a.page == b.page && chart_refs_match(&a.charts, &b.charts, true) && a.tab_color == b.tab_color
+        && a.protection == b.protection && a.protected_ranges == b.protected_ranges
+        && a.rich == b.rich && a.hyperlinks == b.hyperlinks
+        && a.sparklines == b.sparklines && a.textboxes == b.textboxes
+        && a.hidden == b.hidden && a.very_hidden == b.very_hidden
 }
 
 impl StructureSnapshot {
@@ -2595,7 +2622,7 @@ impl StructureSnapshot {
                     })
                     && expected.cf.as_ref().is_none_or(|cf| &sheet.cf == cf)
                     && expected.dv.as_ref().is_none_or(|dv| &sheet.dv == dv)
-                    && expected.charts.as_ref().is_none_or(|ch| chart_refs_match(&sheet.charts, ch))
+                    && expected.charts.as_ref().is_none_or(|ch| chart_refs_match(&sheet.charts, ch, false))
                     && expected.sparklines.as_ref().is_none_or(|sp| &sheet.sparklines == sp)
             })
             && {
@@ -2648,16 +2675,16 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     if current.notes != recorded.notes || current.threads != recorded.threads {
         let comment_keys: HashSet<_> = current.notes.keys().chain(recorded.notes.keys())
             .chain(current.threads.keys()).chain(recorded.threads.keys()).copied().collect();
-        let shift = &expected.shift;
+        let tx = crate::transform::CoordTransform::from_shift_and_move(
+            snap.sheet,
+            &expected.shift,
+            expected.movement,
+        );
         for key in comment_keys {
             let live = (current.notes.get(&key), current.threads.get(&key));
             let before = (recorded.notes.get(&key), recorded.threads.get(&key));
             if live == before { continue; }
-            let index = if shift.axis == crate::refs::Axis::Row { key.row } else { key.col };
-            let moves = shift.row_filter.is_none_or(|(lo, hi)| (lo..=hi).contains(&key.row))
-                && shift.col_filter.is_none_or(|(lo, hi)| (lo..=hi).contains(&key.col))
-                && expected.movement.map_or_else(|| shift.map(index) != Some(index),
-                    |mv| mv.contiguous_range(index, index) != Some((index, index)));
+            let moves = tx.map_cell(key.row, key.col) != Some((key.row, key.col));
             if moves || before != (target.notes.get(&key), target.threads.get(&key)) {
                 return None;
             }
@@ -2679,9 +2706,16 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
     {
         target.coordinates_shifted();
     }
+    target.audit_sheet_idx = current.audit_sheet_idx;
     target.source_part = current.source_part.clone();
+    target.source_needs_dom_repair = current.source_needs_dom_repair;
     target.saved_cells.clone_from(&current.saved_cells);
     target.source_cells.clone_from(&current.source_cells);
+    target.deleted_charts.clone_from(&current.deleted_charts);
+    target.zoom_scale = current.zoom_scale;
+    target.show_gridlines = current.show_gridlines;
+    target.show_headings = current.show_headings;
+    target.view_dirty = current.view_dirty;
     let mut cleared = std::mem::take(&mut target.cleared);
     cleared.union_from(&current.cleared);
     current
@@ -2759,7 +2793,7 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
             }
         }
     }
-    target.charts = restored_charts(&current.charts, &target.charts);
+    target.charts = restored_charts(&current.charts, &target.charts, true);
     target.loading = false;
     target.edited = true;
     // The restored metadata must be written against today's package baseline,
@@ -2768,6 +2802,24 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
         || target.hidden_rows != current.hidden_rows || target.hidden_rows_user != current.hidden_rows_user
         || target.hidden_cols != current.hidden_cols || target.row_levels != current.row_levels
         || target.col_levels != current.col_levels;
+    target.pictures_dirty |= current.pictures_dirty || target.pictures != current.pictures;
+    target.textboxes_dirty |= current.textboxes_dirty || target.textboxes != current.textboxes;
+    target.scenarios_dirty |= current.scenarios_dirty
+        || target.scenarios != current.scenarios
+        || target.scenario_settings != current.scenario_settings;
+    target.ignored_errors_dirty |=
+        current.ignored_errors_dirty || target.ignored_errors != current.ignored_errors;
+    target.protected_ranges_dirty |=
+        current.protected_ranges_dirty || target.protected_ranges != current.protected_ranges;
+    target.outline_pr_dirty |= current.outline_pr_dirty
+        || target.outline_summary_below != current.outline_summary_below
+        || target.outline_summary_right != current.outline_summary_right
+        || target.outline_symbols != current.outline_symbols;
+    target.tab_color_dirty |= current.tab_color_dirty || target.tab_color != current.tab_color;
+    target.protect_dirty |= current.protect_dirty || target.protection != current.protection;
+    target.hidden_dirty |= current.hidden_dirty
+        || target.hidden != current.hidden
+        || target.very_hidden != current.very_hidden;
     target.rich_dirty |= current.rich_dirty || target.rich != current.rich;
     target.hyperlinks_dirty |= current.hyperlinks_dirty || target.hyperlinks != current.hyperlinks;
     target.tables_dirty |= current.tables_dirty || target.tables != current.tables;
@@ -2796,7 +2848,7 @@ fn restore_structure(wb: &mut Workbook, snap: &StructureSnapshot, expected: &Str
         if let Some(cf) = &foreign.cf { sheet.cf = cf.clone(); sheet.cf_dirty = true; }
         if let Some(dv) = &foreign.dv { sheet.dv = dv.clone(); sheet.dv_dirty = true; }
         if let Some(charts) = &foreign.charts {
-            sheet.charts = restored_charts(&sheet.charts, charts);
+            sheet.charts = restored_charts(&sheet.charts, charts, false);
             sheet.charts_dirty = true;
         }
         if let Some(sparklines) = &foreign.sparklines {

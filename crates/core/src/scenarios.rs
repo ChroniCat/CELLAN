@@ -100,6 +100,110 @@ impl ScenarioSettings {
     }
 }
 
+/// Parse all A1/range rectangles listed in `ScenarioSettings::sqref`.
+pub(crate) fn sqref_rects(sqref: &str) -> Vec<(u32, u32, u32, u32)> {
+    let mut out = Vec::new();
+    for area in sqref.split_whitespace() {
+        let (left, right) = area.split_once(':').unwrap_or((area, area));
+        if let (Some((r1, c1)), Some((r2, c2))) = (parse_cell(left), parse_cell(right)) {
+            out.push((r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)));
+        }
+    }
+    out
+}
+
+/// Transform all scenario cell coordinates and `scenario_settings.sqref` under `transform`
+/// (supporting whole-axis shift, multi-insert, and lossless axis permutation).
+pub(crate) fn transform_references(sheet: &mut Sheet, transform: &crate::transform::CoordTransform) {
+    if transform.is_noop() || (sheet.scenarios.is_empty() && sheet.scenario_settings.sqref.is_none()) {
+        return;
+    }
+    let rows = transform.axis() == crate::refs::Axis::Row;
+    let map = |(r, c)| transform.map_cell(r, c);
+    let mut removed = Vec::new();
+    for (i, sc) in sheet.scenarios.iter_mut().enumerate() {
+        if !sc.cells.iter().any(|(k, _)| map(*k) != Some(*k)) {
+            continue;
+        }
+        sc.cells.retain_mut(|(key, _)| {
+            if let Some(k) = map(*key) {
+                *key = k;
+                true
+            } else {
+                false
+            }
+        });
+        sc.input_properties = std::mem::take(&mut sc.input_properties)
+            .into_iter()
+            .filter_map(|(k, v)| Some((map(k)?, v)))
+            .collect();
+        sc.source_inputs = std::mem::take(&mut sc.source_inputs)
+            .into_iter()
+            .filter_map(|(k, v)| Some((map(k)?, v)))
+            .collect();
+        sheet.scenarios_dirty = true;
+        if sc.cells.is_empty() {
+            removed.push(i);
+        }
+    }
+    for i in removed.into_iter().rev() {
+        sheet.scenarios.remove(i);
+        sheet.scenario_settings.removed(i, sheet.scenarios.len());
+    }
+    if let Some(refs) = &sheet.scenario_settings.sqref {
+        let mut changed = false;
+        let mut refs_out = Vec::new();
+        let format_cell = |pattern: &str, (r, c)| {
+            format!(
+                "{}{}{}{}",
+                if pattern.starts_with('$') { "$" } else { "" },
+                crate::model::col_label(c),
+                if pattern.trim_start_matches('$').contains('$') {
+                    "$"
+                } else {
+                    ""
+                },
+                r + 1
+            )
+        };
+        for area in refs.split_whitespace() {
+            let (left, right) = area.split_once(':').unwrap_or((area, area));
+            let (Some((r1, c1)), Some((r2, c2))) = (parse_cell(left), parse_cell(right)) else {
+                refs_out.push(area.to_owned());
+                continue;
+            };
+            let (a, b) = if rows { (r1, r2) } else { (c1, c2) };
+            let pieces: Vec<(u32, u32)> = match *transform {
+                crate::transform::CoordTransform::AxisPermute { from, n, at, .. } => {
+                    crate::transform::permute_axis_range_split(a, b, from, n, at)
+                }
+                _ => transform.map_range(a, b).into_iter().collect(),
+            };
+            if pieces.len() == 1 && pieces[0] == (a.min(b), a.max(b)) {
+                refs_out.push(area.to_owned());
+                continue;
+            }
+            changed = true;
+            for (pa, pb) in pieces {
+                let (ka, kb) = if rows {
+                    ((pa, c1), (pb, c2))
+                } else {
+                    ((r1, pa), (r2, pb))
+                };
+                if area.contains(':') || ka != kb {
+                    refs_out.push(format!("{}:{}", format_cell(left, ka), format_cell(right, kb)));
+                } else {
+                    refs_out.push(format_cell(left, ka));
+                }
+            }
+        }
+        if changed {
+            sheet.scenario_settings.sqref = (!refs_out.is_empty()).then(|| refs_out.join(" "));
+            sheet.scenarios_dirty = true;
+        }
+    }
+}
+
 /// Shift the same sheet coordinates as the grid. An input removed by a structural edit cannot
 /// subsequently overwrite the cell that has moved into its former address.
 pub(crate) fn shift_references(sheet: &mut Sheet, shift: &crate::refs::MappedShift) {

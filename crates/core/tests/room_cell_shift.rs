@@ -148,6 +148,7 @@ fn room_shift_replays_all_metadata_styles_and_foreign_references_atomically() {
     assert_eq!(sh.notes[&CellRef::new(0, 2)].c, 2);
     assert_eq!(sh.threads[&CellRef::new(0, 2)].c, 2);
     assert!(sh.hyperlinks.contains_key(&(0, 2)));
+    assert_eq!(sh.hyperlinks[&(0, 2)].location, "Data!C1");
     assert_eq!(sh.merges.as_ref(), &[(0, 2, 1, 2)]);
     assert_eq!(host.sources[0].at, (0, 2));
     assert_eq!(host.sheets[1].dv[0].f1, "Data!C1");

@@ -353,6 +353,8 @@ pub struct CellShiftPatch {
     merge_history: MergeHistory,
     rich: Vec<ShiftPoint<Option<Vec<RichRun>>>>,
     links: Vec<ShiftPoint<Option<Hyperlink>>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ignored_errors: Vec<ShiftPoint<bool>>,
     cf: Vec<RuleChange<crate::cf::CfBlock>>,
     dv: Vec<RuleChange<DataValidation>>,
     sources: Vec<SourceChange>,
@@ -395,6 +397,7 @@ impl CellShiftPatch {
             + self.merge_history.extra_entries()
             + self.rich.len()
             + self.links.len()
+            + self.ignored_errors.len()
             + self.cf.len()
             + self.dv.len()
             + self.sources.len() + self.names.len()
@@ -424,6 +427,10 @@ impl CellShiftPatch {
             && self.merge_history.valid(self.merges.len())
             && valid_changes(&self.links, valid_link)
             && valid_changes(&self.rich, |_, _, _| true)
+            && self
+                .ignored_errors
+                .iter()
+                .all(|p| valid_point(p.row, p.col) && p.before != p.after)
             && self.cf.iter().all(|c| {
                 c.sheet < max_sheet
                     && c.before
@@ -479,6 +486,7 @@ impl CellShiftPatch {
                         copy.threads = s.threads.clone();
                         copy.rich = s.rich.clone();
                         copy.hyperlinks = s.hyperlinks.clone();
+                        copy.ignored_errors = s.ignored_errors.clone();
                         copy.spilled = s.spilled.clone();
                     }
                     copy
@@ -509,6 +517,25 @@ impl CellShiftPatch {
             }
         }
         let b = &result.sheets[sheet];
+        let ignored_errors = if a.ignored_errors == b.ignored_errors {
+            Vec::new()
+        } else {
+            let mut keys: BTreeSet<(u32, u32)> = BTreeSet::new();
+            keys.extend(a.ignored_errors.iter().copied());
+            keys.extend(b.ignored_errors.iter().copied());
+            keys.into_iter()
+                .filter_map(|(row, col)| {
+                    let before = a.ignored_errors.contains(&(row, col));
+                    let after = b.ignored_errors.contains(&(row, col));
+                    (before != after).then_some(ShiftPoint {
+                        row,
+                        col,
+                        before,
+                        after,
+                    })
+                })
+                .collect()
+        };
         let mut patch = Self {
             sheet,
             sheet_names: Vec::new(),
@@ -520,6 +547,7 @@ impl CellShiftPatch {
             threads: changes(&a.threads, &b.threads),
             rich: changes(&a.rich, &b.rich),
             links: changes(&a.hyperlinks, &b.hyperlinks),
+            ignored_errors,
             merges: if a.merges == b.merges {
                 Vec::new()
             } else {
@@ -781,7 +809,45 @@ impl CellShiftPatch {
             || !map_matches(&sheet.threads, &self.threads, forward)
             || !map_matches(&sheet.rich, &self.rich, forward)
             || !map_matches(&sheet.hyperlinks, &self.links, forward)
+            || !self.ignored_errors.iter().all(|p| {
+                sheet.ignored_errors.contains(&(p.row, p.col))
+                    == *pick(&p.before, &p.after, !forward)
+            })
         {
+            return false;
+        }
+        // Reject if a late-added target hyperlink outside `self.links` sits in the
+        // moving ray or has an internal location affected (shifted, deleted, or
+        // band-crossing) by this shift.
+        let listed_links: BTreeSet<_> = self.links.iter().map(|p| (p.row, p.col)).collect();
+        let eff_transform =
+            crate::transform::CoordTransform::from_cell_shift(self.sheet, &effective_op);
+        if sheet.hyperlinks.iter().any(|(&(r, c), link)| {
+            let link_rect = (
+                r,
+                c,
+                r.saturating_add(link.span.0),
+                c.saturating_add(link.span.1),
+            );
+            !listed_links.contains(&(r, c))
+                && (eff_transform.map_rect(link_rect) != Some(link_rect)
+                    || (!link.location.is_empty()
+                        && crate::transform::internal_link_location_affected(
+                            &link.location,
+                            &sheet.name,
+                            &eff_transform,
+                        )))
+        }) {
+            return false;
+        }
+        let listed_ignored: BTreeSet<_> = self
+            .ignored_errors
+            .iter()
+            .map(|p| (p.row, p.col))
+            .collect();
+        if sheet.ignored_errors.iter().any(|&(r, c)| {
+            !listed_ignored.contains(&(r, c)) && eff_transform.map_cell(r, c) != Some((r, c))
+        }) {
             return false;
         }
         if !self.merge_history.matches(sheet, &self.merges, forward)
@@ -922,6 +988,16 @@ impl CellShiftPatch {
         if !self.links.is_empty() {
             apply_map(&mut sh.hyperlinks, &self.links, forward);
             sh.hyperlinks_dirty = true;
+        }
+        if !self.ignored_errors.is_empty() {
+            for p in &self.ignored_errors {
+                if *pick(&p.before, &p.after, forward) {
+                    sh.ignored_errors.insert((p.row, p.col));
+                } else {
+                    sh.ignored_errors.remove_if_present(&(p.row, p.col));
+                }
+            }
+            sh.ignored_errors_dirty = true;
         }
         self.merge_history.install(sh, &self.merges, forward);
         sh.coordinates_shifted();

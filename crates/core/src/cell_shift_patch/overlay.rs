@@ -9,6 +9,8 @@ struct SheetOverlay {
     threads: Vec<((u32, u32), ThreadedComment)>,
     rich: Vec<((u32, u32), Vec<RichRun>)>,
     links: Vec<((u32, u32), Hyperlink)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ignored_errors: Vec<(u32, u32)>,
     merges: Vec<Rect>,
     cf: CfSheet,
     dv: Vec<DataValidation>,
@@ -147,6 +149,7 @@ impl CellShiftOverlay {
                     + s.threads.len()
                     + s.rich.len()
                     + s.links.len()
+                    + s.ignored_errors.len()
                     + s.merges.len()
                     + s.cf.blocks.len()
                     + s.dv.len()
@@ -190,6 +193,7 @@ impl CellShiftOverlay {
                         .iter()
                         .all(|&((r, c), ref l)| valid_point(r, c) && valid_link(r, c, l))
                     && s.rich.iter().all(|((r, c), _)| valid_point(*r, *c))
+                    && s.ignored_errors.iter().all(|&(r, c)| valid_point(r, c))
                     && s.cf.blocks.iter().flat_map(|b| &b.ranges).all(valid_rect)
                     && s.dv.iter().flat_map(|d| &d.ranges).all(valid_rect)
             })
@@ -219,6 +223,11 @@ impl CellShiftOverlay {
                     threads: entries(&s.threads),
                     rich: entries(&s.rich),
                     links: entries(&s.hyperlinks),
+                    ignored_errors: {
+                        let mut v: Vec<_> = s.ignored_errors.iter().copied().collect();
+                        v.sort_unstable();
+                        v
+                    },
                     merges: s.merges.to_vec(),
                     cf: s.cf.clone(),
                     dv: s.dv.clone(),
@@ -259,6 +268,14 @@ impl CellShiftOverlay {
             sh.threads_dirty |= replace_entries(&mut sh.threads, &overlay.threads);
             sh.rich_dirty |= replace_entries(&mut sh.rich, &overlay.rich);
             sh.hyperlinks_dirty |= replace_entries(&mut sh.hyperlinks, &overlay.links);
+            {
+                let mut cur: Vec<_> = sh.ignored_errors.iter().copied().collect();
+                cur.sort_unstable();
+                if cur != overlay.ignored_errors {
+                    sh.ignored_errors = overlay.ignored_errors.iter().copied().collect();
+                    sh.ignored_errors_dirty = true;
+                }
+            }
             if sh.merges != overlay.merges {
                 sh.merges = overlay.merges.clone().into();
                 sh.merges_dirty = true;

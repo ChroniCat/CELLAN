@@ -877,13 +877,27 @@ impl Chart {
     }
 
     pub(crate) fn rewrite_mapped_refs(&mut self, shift: &crate::refs::MappedShift) -> bool {
+        self.rewrite_refs_with(|r| crate::refs::rewrite_mapped(r, shift))
+    }
+
+    /// 按统一坐标变换改写图表所有系列引用（含 `ref_fixes`）与 `source_range`。
+    pub fn rewrite_with_transform(
+        &mut self,
+        transform: &crate::transform::CoordTransform,
+        target_sheet: &str,
+        own_sheet: &str,
+    ) -> bool {
+        self.rewrite_refs_with(|r| transform.rewrite_formula(r, target_sheet, own_sheet))
+    }
+
+    pub(crate) fn rewrite_refs_with(&mut self, mut rewrite: impl FnMut(&str) -> String) -> bool {
         let mut changed = false;
         for s in self.series.iter_mut() {
             for r in [&mut s.name_ref, &mut s.cat_ref, &mut s.val_ref, &mut s.size_ref] {
                 if r.is_empty() {
                     continue;
                 }
-                let nf = crate::refs::rewrite_mapped(r, shift);
+                let nf = rewrite(r);
                 if nf != *r {
                     self.ref_fixes.push((r.clone(), nf.clone()));
                     *r = nf;
@@ -892,7 +906,7 @@ impl Chart {
             }
         }
         if !self.source_range.is_empty() {
-            let nf = crate::refs::rewrite_mapped(&self.source_range, shift);
+            let nf = rewrite(&self.source_range);
             if nf != self.source_range {
                 self.source_range = nf;
                 changed = true;

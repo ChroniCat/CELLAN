@@ -184,7 +184,7 @@ impl AxisMove {
     }
 }
 
-fn permute_index(pos: u32, from: u32, n: u32, at: u32) -> u32 {
+pub(crate) fn permute_index(pos: u32, from: u32, n: u32, at: u32) -> u32 {
     let lo = from.min(at);
     let hi = (from + n).max(at + n);
     if pos < lo || pos >= hi {

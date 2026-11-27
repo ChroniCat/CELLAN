@@ -66,6 +66,7 @@ pub mod style_theme;
 pub mod sort_filter;
 pub mod store;
 pub mod structural;
+pub mod transform;
 pub mod undo;
 pub mod vba;
 pub mod clipboard_xmlss;

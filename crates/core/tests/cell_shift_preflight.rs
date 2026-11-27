@@ -70,6 +70,11 @@ fn preflight_conflict_messages_are_non_empty_and_display_matches() {
         CellShiftConflict::Pivot,
         CellShiftConflict::ArrayOrSpill,
         CellShiftConflict::AutoFilter,
+        CellShiftConflict::Chart,
+        CellShiftConflict::Sparkline,
+        CellShiftConflict::ProtectedRange,
+        CellShiftConflict::Scenario,
+        CellShiftConflict::PartialHyperlink,
     ];
     for c in all {
         assert!(!c.message().trim().is_empty());
@@ -760,4 +765,135 @@ fn room_shift_matches_allows_identical_merge_chains_and_outside_merges_through_u
     );
     assert!(patch_del.apply(&mut wb_del, true));
     assert_eq!(wb_del.sheets[0].merges.to_vec(), vec![(1, 0, 2, 0), (1, 5, 2, 5)]);
+}
+
+#[test]
+fn preflight_blocks_chart_sparkline_protected_range_scenario_and_partial_hyperlink() {
+    use sheetcore::charts::{Chart, ChartKind, Series};
+    use sheetcore::hyperlinks::Hyperlink;
+    use sheetcore::protection::ProtectedRange;
+    use sheetcore::scenarios::Scenario;
+    use sheetcore::sparkline::Sparkline;
+
+    // 1. Chart data ref (target & foreign sheet) intersecting ray blocked; outside allowed
+    let mut wb_ch = Workbook::new_blank();
+    wb_ch.sheets[0].name = "Data".into();
+    let mut other = Sheet::new("Charts");
+    other.charts.push(Chart {
+        kind: ChartKind::Column,
+        series: vec![Series {
+            val_ref: "Data!$B$2:$B$5".into(),
+            ..Series::default()
+        }],
+        ..Chart::default()
+    });
+    wb_ch.sheets.push(other);
+    assert_blocked(
+        &mut wb_ch,
+        0,
+        CellShift::new((0, 1, 0, 1), Shift::Vertical, true),
+        CellShiftConflict::Chart,
+    );
+    assert_blocked(
+        &mut wb_ch,
+        0,
+        CellShift::new((2, 0, 2, 0), Shift::Horizontal, false),
+        CellShiftConflict::Chart,
+    );
+    assert_eq!(
+        CellShift::new((0, 0, 0, 0), Shift::Vertical, true).preflight(&wb_ch, 0),
+        Ok(())
+    );
+    assert_eq!(
+        CellShift::new((6, 1, 6, 1), Shift::Vertical, true).preflight(&wb_ch, 0),
+        Ok(())
+    );
+
+    // 2. Sparkline anchor & cross-sheet data rect blocked; outside allowed
+    let mut wb_sp = Workbook::new_blank();
+    wb_sp.sheets[0].name = "Data".into();
+    wb_sp.sheets[0].sparklines.push(Sparkline {
+        r: 2,
+        c: 4,
+        source_sheet: None,
+        rect: (2, 1, 2, 2),
+        ..Default::default()
+    });
+    assert_blocked(
+        &mut wb_sp,
+        0,
+        CellShift::new((0, 4, 0, 4), Shift::Vertical, true), // hits anchor
+        CellShiftConflict::Sparkline,
+    );
+    assert_blocked(
+        &mut wb_sp,
+        0,
+        CellShift::new((0, 1, 0, 1), Shift::Vertical, true), // hits data rect
+        CellShiftConflict::Sparkline,
+    );
+    assert_eq!(
+        CellShift::new((0, 0, 0, 0), Shift::Vertical, true).preflight(&wb_sp, 0),
+        Ok(())
+    );
+
+    // 3. ProtectedRange intersecting ray blocked; outside allowed
+    let mut wb_pr = Workbook::new_blank();
+    wb_pr.sheets[0]
+        .protected_ranges
+        .push(ProtectedRange::new("Edit1", vec![(1, 1, 3, 2)], ""));
+    assert_blocked(
+        &mut wb_pr,
+        0,
+        CellShift::new((0, 1, 0, 1), Shift::Vertical, true),
+        CellShiftConflict::ProtectedRange,
+    );
+    assert_eq!(
+        CellShift::new((0, 0, 0, 0), Shift::Vertical, true).preflight(&wb_pr, 0),
+        Ok(())
+    );
+
+    // 4. Scenario cells & scenario_settings.sqref intersecting ray blocked; outside allowed
+    let mut wb_sc = Workbook::new_blank();
+    let mut sc = Scenario::new("S1");
+    sc.cells.push(((2, 2), "10".into()));
+    wb_sc.sheets[0].scenarios.push(sc);
+    wb_sc.sheets[0].scenario_settings.sqref = Some("$E$2:$E$3".into());
+    assert_blocked(
+        &mut wb_sc,
+        0,
+        CellShift::new((0, 2, 0, 2), Shift::Vertical, true),
+        CellShiftConflict::Scenario,
+    );
+    assert_blocked(
+        &mut wb_sc,
+        0,
+        CellShift::new((0, 4, 0, 4), Shift::Vertical, true),
+        CellShiftConflict::Scenario,
+    );
+    assert_eq!(
+        CellShift::new((0, 0, 0, 0), Shift::Vertical, true).preflight(&wb_sc, 0),
+        Ok(())
+    );
+
+    // 5. Partial multi-cell hyperlink span blocked; wholly contained allowed
+    let mut wb_hl = Workbook::new_blank();
+    wb_hl.sheets[0].hyperlinks.insert(
+        (2, 1),
+        Hyperlink {
+            target: "https://example.com".into(),
+            external: true,
+            span: (1, 1), // covers B3:C4
+            ..Default::default()
+        },
+    );
+    assert_blocked(
+        &mut wb_hl,
+        0,
+        CellShift::new((0, 1, 0, 1), Shift::Vertical, true), // crosses col C
+        CellShiftConflict::PartialHyperlink,
+    );
+    let ok_op = CellShift::new((0, 1, 0, 2), Shift::Vertical, true); // wholly contains cols B:C
+    assert_eq!(ok_op.preflight(&wb_hl, 0), Ok(()));
+    assert!(ok_op.apply(&mut wb_hl, 0));
+    assert!(wb_hl.sheets[0].hyperlinks.contains_key(&(3, 1)));
 }

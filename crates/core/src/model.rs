@@ -842,14 +842,14 @@ pub struct Sheet {
     /// dimensions that require normalization before umya reads a temporary copy.
     pub(crate) source_needs_dom_repair: bool,
     /// 分页列式存储（见 store.rs）：页内按列连续，扫描快、每格只占 40 字节
-    cells: Store,
+    pub(crate) cells: Store,
     /// Cell storage revision represented by the current OOXML source part.
     /// Recalculation can change formula caches without marking a user edit.
     pub(crate) saved_cells: Option<crate::store::CellVersion>,
     /// Copy-on-write value snapshot matching a verified worksheet ZIP entry.
     pub(crate) source_cells: Option<crate::xlsx::SourceCells>,
-    display_style_revision: u64,
-    coordinate_revision: u64,
+    pub(crate) display_style_revision: u64,
+    pub(crate) coordinate_revision: u64,
     /// 被清空过的单元格：保存时要真的从文件里删掉，否则旧值会残留
     pub cleared: CellJournal,
     /// 被动态数组公式溢出占用的单元格（重算前要清掉）

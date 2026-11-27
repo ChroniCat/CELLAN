@@ -2,8 +2,8 @@
 //! referent when an older structural snapshot restores different coordinates.
 use crate::{
     CellRef, Workbook,
-    cf::{CfKind, CfvoKind},
     refs::{Axis, AxisMove, Shift},
+    transform::CoordTransform,
 };
 use std::{collections::HashSet, sync::Arc};
 
@@ -14,6 +14,7 @@ enum Location {
     Validation(u64, usize, usize),
     Condition(u64, usize, usize, usize),
     Chart(u64, usize, usize, usize),
+    ChartSource(u64, usize),
     Hyperlink(u64, u32, u32),
     Spark(u64, u32, u32, (u32, u32, u32, u32)),
     Source((u32, u32, u32, u32)),
@@ -26,6 +27,14 @@ enum Location {
         u32,
     ),
     MultiPivot(usize, (u32, u32, u32, u32), (u32, u32, u32, u32)),
+    PivotModel {
+        id: u64,
+        target_sheet: usize,
+        anchor: (u32, u32),
+        rect: (u32, u32, u32, u32),
+        source: (u32, u32, u32, u32),
+        field_cols: Box<[u32]>,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -47,6 +56,9 @@ impl Uses {
                     text.len()
                         + match loc {
                             Location::Name(_, name) => name.len(),
+                            Location::PivotModel { field_cols, .. } => {
+                                field_cols.len() * size_of::<u32>()
+                            }
                             _ => 0,
                         }
                 })
@@ -123,26 +135,30 @@ fn visit(
     mut foreign_out: Option<&mut Vec<super::ForeignReferences>>,
     mut emit: impl FnMut((Location, Arc<str>)),
 ) {
-    let mut shift = op.clone();
+    let tx = CoordTransform::from_shift_and_move(target, op, movement);
+    if tx.is_noop() {
+        return;
+    }
     let target_name = &wb.sheets[target].name;
-    shift.target_sheet.clone_from(target_name);
-    let rewrite = |text: &str, shift: &Shift| match movement {
-        Some(mv) => mv.rewrite(text, target_name, &shift.own_sheet),
-        None => crate::refs::rewrite(text, shift),
-    };
+    let target_sid = wb.sheets[target].identity;
+    let axis = tx.axis();
+    let whole_axis_col = axis == Axis::Col && tx.band().is_none();
+    let index_changes = |pos: u32| tx.map_index(pos) != Some(pos);
     let fast_filter_ok = !target_name.contains('\'')
         && target_name
             .chars()
             .all(|c| c.is_ascii() || (!c.is_uppercase() && !c.is_lowercase()));
+
     for (index, sheet) in wb.sheets.iter().enumerate() {
         if index == target {
             continue;
         }
-        shift.own_sheet.clone_from(&sheet.name);
+        let own_name = sheet.name.as_str();
         let id = sheet.identity;
         let changes = |text: &str| {
             may_mention_foreign_sheet(text, target_name, fast_filter_ok)
-                && rewrite(text, &shift) != text
+                && tx.formula_may_be_affected(text)
+                && tx.rewrite_formula(text, target_name, own_name) != text
         };
         let capture_foreign = foreign_out.is_some();
         let mut foreign_cells = Vec::new();
@@ -168,57 +184,35 @@ fn visit(
         let mut cf_changed = false;
         for (i, block) in sheet.cf.blocks.iter().enumerate() {
             for (j, rule) in block.rules.iter().enumerate() {
-                let mut add = |slot, text: &str, capture_cf: bool| {
+                rule.kind.visit_formulas(|slot, text| {
                     if changes(text) {
                         emit((Location::Condition(id, i, j, slot), text.into()));
-                        if capture_cf {
-                            cf_changed = true;
-                        }
+                        cf_changed = true;
                     }
-                };
-                match &rule.kind {
-                    CfKind::Expr { formula, .. } => add(0, formula, true),
-                    CfKind::CellIs { a, b, .. } => {
-                        add(0, a, true);
-                        add(1, b, true);
-                    }
-                    CfKind::Scale { points } => {
-                        for (k, (v, _)) in points.iter().enumerate() {
-                            if v.kind == CfvoKind::Formula {
-                                add(k, &v.formula, false);
-                            }
-                        }
-                    }
-                    CfKind::Bar { min, max, .. } => {
-                        for (k, v) in [min, max].into_iter().enumerate() {
-                            if v.kind == CfvoKind::Formula {
-                                add(k, &v.formula, false);
-                            }
-                        }
-                    }
-                    CfKind::IconSet { thresholds, .. } => {
-                        for (k, v) in thresholds.iter().enumerate() {
-                            if v.kind == CfvoKind::Formula {
-                                add(k, &v.formula, false);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                });
             }
         }
         let mut charts_changed = false;
         for (i, chart) in sheet.charts.iter().enumerate() {
             for (j, series) in chart.series.iter().enumerate() {
-                for (k, text) in [&series.name_ref, &series.cat_ref, &series.val_ref]
-                    .into_iter()
-                    .enumerate()
+                for (k, text) in [
+                    &series.name_ref,
+                    &series.cat_ref,
+                    &series.val_ref,
+                    &series.size_ref,
+                ]
+                .into_iter()
+                .enumerate()
                 {
-                    if changes(text) {
+                    if !text.is_empty() && changes(text) {
                         emit((Location::Chart(id, i, j, k), text.as_str().into()));
                         charts_changed = true;
                     }
                 }
+            }
+            if !chart.source_range.is_empty() && changes(&chart.source_range) {
+                emit((Location::ChartSource(id, i), chart.source_range.as_str().into()));
+                charts_changed = true;
             }
         }
         for (&(row, col), link) in sheet.hyperlinks.iter() {
@@ -232,13 +226,9 @@ fn visit(
                 .source_sheet
                 .as_deref()
                 .is_some_and(|n| n.eq_ignore_ascii_case(target_name));
-            if same_source {
-                if sp.source_sheet.as_deref() == Some(target_name.as_str()) {
-                    sparklines_ref_target = true;
-                }
-                if rect_moves(&shift, sp.rect) {
-                    emit((Location::Spark(id, sp.r, sp.c, sp.rect), "".into()));
-                }
+            if same_source && tx.rect_changes(sp.rect) {
+                sparklines_ref_target = true;
+                emit((Location::Spark(id, sp.r, sp.c, sp.rect), "".into()));
             }
         }
         if let Some(out) = foreign_out.as_deref_mut() {
@@ -265,23 +255,23 @@ fn visit(
         }
     }
     for (name, scope, text) in &wb.names {
-        shift.own_sheet = scope
+        let own_name = scope
             .and_then(|i| wb.sheets.get(i))
-            .map(|s| s.name.clone())
-            .unwrap_or_default();
-        if rewrite(text, &shift) != *text {
+            .map(|s| s.name.as_str())
+            .unwrap_or("");
+        if tx.rewrite_formula(text, target_name, own_name) != *text {
             emit((Location::Name(*scope, name.clone()), text.as_str().into()));
         }
     }
     for (index, spec, _, out, label) in &wb.pivots_pending {
         if *index == target
-            && (rect_moves(&shift, spec.source)
-                || rect_moves(&shift, *out)
-                || shift.axis == Axis::Col
+            && (tx.rect_changes(spec.source)
+                || tx.rect_changes(*out)
+                || (whole_axis_col
                     && [Some(spec.row_field), spec.col_field, Some(spec.value_field)]
                         .into_iter()
                         .flatten()
-                        .any(|col| shift.map(col) != Some(col)))
+                        .any(index_changes)))
         {
             emit((
                 Location::Pivot(
@@ -296,44 +286,87 @@ fn visit(
         }
     }
     for (i, (sheet, spec, _, out)) in wb.pivots_pending2.iter().enumerate() {
-        if *sheet == target && (rect_moves(&shift, spec.source) || rect_moves(&shift, *out)) {
-            emit((Location::MultiPivot(i, spec.source, *out), "".into()));
+        if *sheet == target {
+            let col_field_changes = whole_axis_col
+                && (spec.rows.iter().any(|f| index_changes(f.col))
+                    || spec.cols.iter().any(|f| index_changes(f.col))
+                    || spec.values.iter().any(|f| {
+                        index_changes(f.col)
+                            || f.base.as_ref().is_some_and(|(bc, _)| index_changes(*bc))
+                    })
+                    || spec.filters.iter().any(|f| index_changes(f.col)));
+            if tx.rect_changes(spec.source) || tx.rect_changes(*out) || col_field_changes {
+                emit((Location::MultiPivot(i, spec.source, *out), "".into()));
+            }
+        }
+    }
+    for p in &wb.pivots {
+        let is_src = p.source_sheet_id == Some(target_sid)
+            || p.source_sheet.eq_ignore_ascii_case(target_name);
+        let is_tgt = p.target_sheet == target;
+        if !is_src && !is_tgt {
+            continue;
+        }
+        let src_changes = is_src
+            && (tx.rect_changes(p.spec.source)
+                || (whole_axis_col
+                    && (p.spec.rows.iter().any(|f| index_changes(f.col))
+                        || p.spec.cols.iter().any(|f| index_changes(f.col))
+                        || p.spec.values.iter().any(|f| {
+                            index_changes(f.col)
+                                || f.base.as_ref().is_some_and(|(bc, _)| index_changes(*bc))
+                        })
+                        || p.spec.filters.iter().any(|f| index_changes(f.col))
+                        || p.options.slicers.iter().any(|s| index_changes(s.col)))));
+        let tgt_changes = is_tgt
+            && (tx.rect_changes(p.rect) || tx.map_cell(p.anchor.0, p.anchor.1) != Some(p.anchor));
+        if src_changes || tgt_changes {
+            let mut field_cols = Vec::new();
+            if whole_axis_col && is_src {
+                field_cols.extend(p.spec.rows.iter().map(|f| f.col));
+                field_cols.extend(p.spec.cols.iter().map(|f| f.col));
+                for v in &p.spec.values {
+                    field_cols.push(v.col);
+                    if let Some((bc, _)) = &v.base {
+                        field_cols.push(*bc);
+                    }
+                }
+                field_cols.extend(p.spec.filters.iter().map(|f| f.col));
+                field_cols.extend(p.options.slicers.iter().map(|s| s.col));
+            }
+            emit((
+                Location::PivotModel {
+                    id: p.id,
+                    target_sheet: p.target_sheet,
+                    anchor: p.anchor,
+                    rect: p.rect,
+                    source: p.spec.source,
+                    field_cols: field_cols.into_boxed_slice(),
+                },
+                p.source_sheet.as_str().into(),
+            ));
         }
     }
     for source in &wb.sources {
-        if matches!(source.kind, crate::external::Kind::Unbound(_)) { continue; }
-        let moved = |rect| match movement {
-            Some(mv) => {
-                let (r1,c1,r2,c2) = rect;
-                let span = if mv.axis == Axis::Row { (r1,r2) } else { (c1,c2) };
-                mv.contiguous_range(span.0, span.1) != Some(span)
-            }
-            None if shift.row_filter.is_some() || shift.col_filter.is_some() => {
-                let (r1, c1, r2, c2) = rect;
-                shift.row_filter.is_none_or(|(lo,hi)| r1 <= hi && lo <= r2)
-                    && shift.col_filter.is_none_or(|(lo,hi)| c1 <= hi && lo <= c2)
-                    && rect_moves(&shift, rect)
-            }
-            None => rect_moves(&shift, rect),
-        };
-        if source.target_sheet.as_ref().is_none_or(|name| name.eq_ignore_ascii_case(target_name)) {
-            if moved(source.destination_rect()) {
-                emit((Location::SourceDestination(source.at, source.rows, source.cols), source.name.as_str().into()));
-            }
+        if matches!(source.kind, crate::external::Kind::Unbound(_)) {
+            continue;
+        }
+        if source
+            .target_sheet
+            .as_ref()
+            .is_none_or(|name| name.eq_ignore_ascii_case(target_name))
+            && tx.rect_changes(source.destination_rect())
+        {
+            emit((
+                Location::SourceDestination(source.at, source.rows, source.cols),
+                source.name.as_str().into(),
+            ));
         }
         if let crate::external::Kind::Internal { sheet, rect } = &source.kind
             && sheet.eq_ignore_ascii_case(target_name)
-            && moved(*rect)
+            && tx.rect_changes(*rect)
         {
             emit((Location::Source(*rect), source.name.as_str().into()));
         }
     }
-}
-
-fn rect_moves(shift: &Shift, rect: (u32, u32, u32, u32)) -> bool {
-    let bounds = match shift.axis {
-        Axis::Row => (rect.0, rect.2),
-        Axis::Col => (rect.1, rect.3),
-    };
-    shift.map_range(bounds.0, bounds.1) != Some(bounds)
 }

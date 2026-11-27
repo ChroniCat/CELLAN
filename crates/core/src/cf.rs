@@ -445,6 +445,103 @@ impl CfKind {
         }
     }
 
+    /// Rewrite every formula-bearing threshold/expression in this rule, including
+    /// `Expr`, `CellIs`, and `CfvoKind::Formula` thresholds in `Scale`, `Bar`,
+    /// and `IconSet`. Returns `true` if any formula changed.
+    pub fn rewrite_formulas(&mut self, mut rewrite: impl FnMut(&str) -> String) -> bool {
+        let mut changed = false;
+        let mut apply = |text: &mut String| {
+            if text.is_empty() {
+                return;
+            }
+            let next = rewrite(text);
+            if next != *text {
+                *text = next;
+                changed = true;
+            }
+        };
+        match self {
+            CfKind::Expr { formula, .. } => apply(formula),
+            CfKind::CellIs { a, b, .. } => {
+                apply(a);
+                apply(b);
+            }
+            CfKind::Scale { points } => {
+                for (cfvo, _) in points {
+                    if cfvo.kind == CfvoKind::Formula {
+                        apply(&mut cfvo.formula);
+                    }
+                }
+            }
+            CfKind::Bar { min, max, .. } => {
+                if min.kind == CfvoKind::Formula {
+                    apply(&mut min.formula);
+                }
+                if max.kind == CfvoKind::Formula {
+                    apply(&mut max.formula);
+                }
+            }
+            CfKind::IconSet { thresholds, .. } => {
+                for cfvo in thresholds {
+                    if cfvo.kind == CfvoKind::Formula {
+                        apply(&mut cfvo.formula);
+                    }
+                }
+            }
+            CfKind::Text { .. }
+            | CfKind::TextMatch { .. }
+            | CfKind::TimePeriod { .. }
+            | CfKind::Blanks { .. }
+            | CfKind::Errors { .. }
+            | CfKind::Dup { .. }
+            | CfKind::Top { .. }
+            | CfKind::Avg { .. } => {}
+        }
+        changed
+    }
+
+    /// Visit every formula-bearing string with its stable slot index
+    /// (`Expr`=0, `CellIs`=0/1, `Scale`=point idx, `Bar`=0/1, `IconSet`=threshold idx).
+    pub fn visit_formulas(&self, mut visit: impl FnMut(usize, &str)) {
+        match self {
+            CfKind::Expr { formula, .. } => visit(0, formula),
+            CfKind::CellIs { a, b, .. } => {
+                visit(0, a);
+                visit(1, b);
+            }
+            CfKind::Scale { points } => {
+                for (k, (cfvo, _)) in points.iter().enumerate() {
+                    if cfvo.kind == CfvoKind::Formula {
+                        visit(k, &cfvo.formula);
+                    }
+                }
+            }
+            CfKind::Bar { min, max, .. } => {
+                if min.kind == CfvoKind::Formula {
+                    visit(0, &min.formula);
+                }
+                if max.kind == CfvoKind::Formula {
+                    visit(1, &max.formula);
+                }
+            }
+            CfKind::IconSet { thresholds, .. } => {
+                for (k, cfvo) in thresholds.iter().enumerate() {
+                    if cfvo.kind == CfvoKind::Formula {
+                        visit(k, &cfvo.formula);
+                    }
+                }
+            }
+            CfKind::Text { .. }
+            | CfKind::TextMatch { .. }
+            | CfKind::TimePeriod { .. }
+            | CfKind::Blanks { .. }
+            | CfKind::Errors { .. }
+            | CfKind::Dup { .. }
+            | CfKind::Top { .. }
+            | CfKind::Avg { .. } => {}
+        }
+    }
+
     /// 管理窗口里显示的一句话说明
     pub fn describe(&self) -> String {
         match self {
