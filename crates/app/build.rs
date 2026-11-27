@@ -12,7 +12,7 @@ fn git(args: &[&str]) -> Option<String> {
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn emit_git_revision() {
+fn verify_release_commit() {
     println!("cargo:rerun-if-env-changed=CELLAN_RELEASE_COMMIT");
     let mut refs = vec!["HEAD".to_string(), "packed-refs".to_string()];
     if let Some(branch) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
@@ -30,12 +30,10 @@ fn emit_git_revision() {
     if let Ok(expected) = std::env::var("CELLAN_RELEASE_COMMIT") {
         assert_eq!(revision.as_ref(), Some(&expected), "发布提交与实际源码不符");
     }
-    let short = revision.as_deref().map(|rev| &rev[..12]).unwrap_or("unknown");
-    println!("cargo:rustc-env=CELLAN_GIT_REV={short}");
 }
 
 fn main() {
-    emit_git_revision();
+    verify_release_commit();
     println!("cargo:rerun-if-env-changed=CELLAN_DEFAULT_UPDATE_URL");
     println!("cargo:rerun-if-env-changed=CELLAN_UPDATE_PUBKEY");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());

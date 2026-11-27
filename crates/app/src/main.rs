@@ -22873,9 +22873,17 @@ fn clear_selection(&mut self) {
                     title_font,
                     pal.text,
                 );
+                let pill_font = ui_kit::medium_in(ctx, 11.0);
+                let pill_text = about_version_pill_text();
+                let pill_w = (p
+                    .layout_no_wrap(pill_text.clone(), pill_font.clone(), Color32::PLACEHOLDER)
+                    .size()
+                    .x
+                    + 18.0)
+                    .max(50.0);
                 let vpill = Rect::from_min_size(
                     egui::pos2(hero.left() + 66.0 + name_w + 10.0, hero.center().y - 10.0),
-                    Vec2::new(50.0, 20.0),
+                    Vec2::new(pill_w, 20.0),
                 );
                 p.rect(
                     vpill,
@@ -22887,16 +22895,16 @@ fn clear_selection(&mut self) {
                 p.text(
                     vpill.center(),
                     egui::Align2::CENTER_CENTER,
-                    format!("v{}", update::VERSION),
-                    ui_kit::medium_in(ctx, 11.0),
+                    pill_text,
+                    pill_font.clone(),
                     pal.info_fg,
                 );
 
                 p.text(
                     egui::pos2(vpill.right() + 12.0, vpill.center().y),
                     egui::Align2::LEFT_CENTER,
-                    format!("Git {}", env!("CELLAN_GIT_REV")),
-                    ui_kit::medium_in(ctx, 11.0),
+                    about_version_detail_text(),
+                    pill_font,
                     pal.text_weak,
                 );
 
@@ -53113,6 +53121,14 @@ pub(crate) fn is_headless_probe_env() -> bool {
         "SC_FORCE_FAIL",
     ];
     PROBE_VARS.iter().any(|k| debug_flags::is_set(k))
+}
+
+pub(crate) fn about_version_pill_text() -> String {
+    format!("v{}", update::VERSION)
+}
+
+pub(crate) fn about_version_detail_text() -> String {
+    format!("版本 {}", update::FULL_VERSION)
 }
 
 pub(crate) fn append_crash_log(kind: &str, detail: &str) -> Option<PathBuf> {

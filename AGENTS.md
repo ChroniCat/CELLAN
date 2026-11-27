@@ -52,7 +52,7 @@
 
 ### 发布前选定 main 提交
 
-1. 先将本次要交付的代码、发版脚本和“关于”显示提交号的实现合入远端 `main`，通过相关测试。构建时从 Git 取得提交号并嵌入 exe；无法取得时停止发布。
+1. 先将本次要交付的代码、发版脚本和“关于”明确版本号显示合入远端 `main`，通过相关测试。构建时从 Git 校验提交号与源码一致；无法取得时停止发布。
 2. 在主仓库目录运行 `git fetch origin main` 和 `git rev-parse origin/main`，记录完整提交号。用 `git worktree add --detach .worktrees/release-<短提交号> <完整提交号>` 在项目内部创建专用发布目录（不要建在仓库外的 `F:\` 根目录）。进入该目录，核对 `git rev-parse HEAD` 与记录一致，且 `git status --porcelain` 输出为空。
 3. 在 `.worktrees/release-<短提交号>` 根目录调用下文的脚本，使用该目录自己的 `target` 和 `dist`。脚本会在编译前同步版本号及签名公钥；正式发布应先将目标版本、对应公钥和依赖锁文件的必要变更合入 `main`，再显式传入相同版本，确保实际编译的源码与记录的提交一致。私钥始终留在仓库外。
 
@@ -117,7 +117,7 @@ powershell.exe -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Byp
 
 内网服务就绪后，还须验收实际交付的文件：
 
-1. 从发布 worktree 的 `.worktrees/release-<短提交号>/dist/CELLAN/CELLAN.exe` 启动已签名的程序，打开“关于”。产品版本须与脚本的目标版本一致，Git 短提交号须至少 7 位，并与第 2 节记录的完整提交号前缀一致。任一项缺失或不匹配时，停止交付并报告差异。验收完成后关闭该测试进程。
+1. 从发布 worktree 的 `dist/CELLAN/CELLAN.exe` 启动已签名的程序，打开“关于”。产品版本与完整版本号须与脚本的目标版本一致（不展示 Git 提交哈希），且 `版本.txt` 中的完整 Git 提交号与第 2 节记录一致。任一项缺失或不匹配时，停止交付并报告差异。验收完成后关闭该测试进程。
 2. 将验收通过的签名发布包（`dist/CELLAN/` 下完整文件，含 `CELLAN.exe`、`manifest.txt`、`版本.txt` 等）归档至**主仓库**的 `dist/<短提交号>/`，并同步更新主仓库的 `dist/CELLAN/`（同时保留内网服务路径 `%LOCALAPPDATA%\CELLAN\publish-server\`）。
 3. 确认归档完成且无进程占用后，在主仓库执行 `git worktree remove --force .worktrees/release-<短提交号>` 清理临时发布目录（仅保留主仓库 `dist/` 中的归档产物）。
 4. 交接时报告产品版本、完整 Git 提交号、主仓库归档产物路径和验证结果。

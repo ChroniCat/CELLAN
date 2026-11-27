@@ -1242,6 +1242,27 @@ fn poll_open_requests_opens_distinct_file_in_new_tab_and_switches_to_parked_dupl
 
 
 #[test]
+fn about_version_displays_explicit_version_without_git_hash() {
+    let pill = crate::about_version_pill_text();
+    let detail = crate::about_version_detail_text();
+    assert_eq!(pill, format!("v{}", crate::update::VERSION));
+    assert_eq!(detail, format!("版本 {}", crate::update::FULL_VERSION));
+    assert!(!pill.contains("Git") && !detail.contains("Git"));
+    let numeric = detail
+        .strip_prefix("版本 ")
+        .expect("about detail must have 版本 prefix");
+    assert!(
+        crate::update::is_valid_version_str(numeric),
+        "about version detail must be numeric dotted version, got: {detail}"
+    );
+    assert!(
+        numeric.starts_with(&format!("{}.", crate::update::VERSION)),
+        "about full version ({numeric}) must align with update::VERSION ({})",
+        crate::update::VERSION
+    );
+}
+
+#[test]
 fn append_crash_log_writes_version_and_diagnostic_to_app_dir() {
     let _env = crate::test_env::TestEnv::new("crash_log");
     let path = crate::append_crash_log("STARTUP_ERROR", "mock gl error")

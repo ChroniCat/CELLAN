@@ -24,7 +24,10 @@ pub const APP_NAME: &str = "CELLAN";
 pub const APP_FULL_NAME: &str = "Concurrent Engine for Local-first, Lock-free Async Networks";
 
 /// 当前版本（全应用唯一版本常量：开始页、关于窗口、检查更新、打包元数据共用）。
-pub const VERSION: &str = "1.83";
+pub const VERSION: &str = "1.84";
+
+/// 完整三段式版本号（与 Cargo.toml 及 PE FileVersion 保持一致，供关于窗口明确展示）。
+pub const FULL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 内网 HTTP 发版服务默认端口（避开常见开发端口与协作端口 7878 / 单实例端口 48765）
 pub const DEFAULT_UPDATE_PORT: u16 = 48_768;
@@ -2136,6 +2139,8 @@ mod tests {
             "Concurrent Engine for Local-first, Lock-free Async Networks"
         );
         let pkg = env!("CARGO_PKG_VERSION");
+        assert_eq!(FULL_VERSION, pkg);
+        assert!(is_valid_version_str(FULL_VERSION));
         assert!(
             pkg.starts_with(&format!("{VERSION}.")),
             "Cargo.toml version ({pkg}) 必须与 update::VERSION ({VERSION}) 对齐"
