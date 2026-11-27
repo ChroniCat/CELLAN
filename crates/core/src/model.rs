@@ -2200,6 +2200,10 @@ pub struct Workbook {
     pub chart_edits: Vec<String>,
     /// 内嵌防篡改审计日志状态（`Arc` 克隆零开销）
     pub audit: crate::audit::WorkbookAudit,
+    /// Monotonic workbook coordinate/sheet-layout epoch incremented whenever any
+    /// coordinate transform, sheet-tab change, patch/overlay install, or
+    /// coordinate-changing undo/redo executes.
+    pub(crate) coord_epoch: u64,
 }
 
 impl Workbook {
@@ -2238,8 +2242,21 @@ impl Workbook {
             dirty: false,
             chart_edits: Vec::new(),
             audit: crate::audit::WorkbookAudit::default(),
+            coord_epoch: 0,
             styles: crate::style::StyleTable::new(),
         }
+    }
+
+    /// Monotonic coordinate/sheet-layout epoch for cache invalidation and stale-work detection.
+    #[inline]
+    pub fn coord_epoch(&self) -> u64 {
+        self.coord_epoch
+    }
+
+    /// Advance the monotonic coordinate/sheet-layout epoch.
+    #[inline]
+    pub(crate) fn bump_coord_epoch(&mut self) {
+        self.coord_epoch = self.coord_epoch.wrapping_add(1);
     }
 
     /// 日期序列 ↔ 日历日期都走这里，避免各处各写一套 1462

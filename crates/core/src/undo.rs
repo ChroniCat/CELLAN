@@ -752,7 +752,7 @@ impl MetaEdit {
             && self.names.is_none()
     }
 
-    fn apply(
+    pub(crate) fn apply_with_guard(
         &mut self,
         sheets: &mut [Sheet],
         redo: bool,
@@ -1016,13 +1016,6 @@ impl MetaEdit {
     }
 }
 
-struct MetaAction {
-    label: String,
-    focus: (usize, u32, u32),
-    by_site: u32,
-    edit: MetaEdit,
-}
-
 /// 数组公式登记（Ctrl+Shift+Enter）的前后快照：用于单步撤销/重做 CSE 数组范围。
 #[derive(Clone, Debug)]
 pub struct ArrayEdit {
@@ -1081,65 +1074,63 @@ pub struct PivotUndoEdit {
     pub removed_after: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
-struct PivotUndoAction {
-    label: String,
-    focus: (usize, u32, u32),
-    by_site: u32,
-    edit: PivotUndoEdit,
-}
-
-impl PivotUndoAction {
-    fn apply(&mut self, wb: &mut Workbook, redo: bool) -> Applied {
+impl PivotUndoEdit {
+    pub(crate) fn apply(
+        &self,
+        wb: &mut Workbook,
+        label: &str,
+        focus: (usize, u32, u32),
+        redo: bool,
+    ) -> Applied {
         let mut touched = Vec::new();
         let mut style_changes = Vec::new();
-        if let Some((ins_idx, ref new_sh)) = self.edit.inserted_sheet {
+        if let Some((ins_idx, ref new_sh)) = self.inserted_sheet {
             if redo {
                 if ins_idx <= wb.sheets.len() {
                     wb.sheets.insert(ins_idx, new_sh.clone());
+                    wb.bump_coord_epoch();
                 }
             } else if ins_idx < wb.sheets.len() && wb.sheets.len() > 1 {
                 wb.sheets.remove(ins_idx);
+                wb.bump_coord_epoch();
             }
-        } else {
-            if let Some(sh) = wb.sheets.get_mut(self.edit.target_sheet) {
-                if redo {
-                    for d in &self.edit.deltas {
-                        d.replay(sh, true, &mut style_changes);
-                        touched.push((d.sheet, d.row, d.col));
-                    }
-                } else {
-                    for d in self.edit.deltas.iter().rev() {
-                        d.replay(sh, false, &mut style_changes);
-                        touched.push((d.sheet, d.row, d.col));
-                    }
+        } else if let Some(sh) = wb.sheets.get_mut(self.target_sheet) {
+            if redo {
+                for d in &self.deltas {
+                    d.replay(sh, true, &mut style_changes);
+                    touched.push((d.sheet, d.row, d.col));
                 }
-                if !self.edit.col_widths.is_empty() {
-                    let def = sh.cols.default_size();
-                    for &(c, before, after) in &self.edit.col_widths {
-                        let target = if redo { after } else { before };
-                        sh.cols.set(c, target.unwrap_or(def));
-                    }
-                    sh.layout_dirty = true;
+            } else {
+                for d in self.deltas.iter().rev() {
+                    d.replay(sh, false, &mut style_changes);
+                    touched.push((d.sheet, d.row, d.col));
                 }
-                sh.styles_dirty = true;
-                sh.bump_display_style_revision();
             }
+            if !self.col_widths.is_empty() {
+                let def = sh.cols.default_size();
+                for &(c, before, after) in &self.col_widths {
+                    let target = if redo { after } else { before };
+                    sh.cols.set(c, target.unwrap_or(def));
+                }
+                sh.layout_dirty = true;
+            }
+            sh.styles_dirty = true;
+            sh.bump_display_style_revision();
         }
         wb.pivots = if redo {
-            self.edit.pivots_after.clone()
+            self.pivots_after.clone()
         } else {
-            self.edit.pivots_before.clone()
+            self.pivots_before.clone()
         };
         wb.pivots_removed_parts = if redo {
-            self.edit.removed_after.clone()
+            self.removed_after.clone()
         } else {
-            self.edit.removed_before.clone()
+            self.removed_before.clone()
         };
         wb.dirty = true;
         let total_touched = touched.len();
         let focus = if redo {
-            if let Some((ins_idx, _)) = self.edit.inserted_sheet {
+            if let Some((ins_idx, _)) = self.inserted_sheet {
                 let anchor = wb
                     .pivots
                     .iter()
@@ -1149,19 +1140,19 @@ impl PivotUndoAction {
                     .unwrap_or((0, 0));
                 (ins_idx, anchor.0, anchor.1)
             } else {
-                self.focus
+                focus
             }
         } else {
-            self.focus
+            focus
         };
         Applied {
             touched,
             style_changes,
-            label: self.label.clone(),
+            label: label.to_owned(),
             focus,
             skipped: 0,
-            structural: self.edit.inserted_sheet.is_some(),
-            coord_changed: self.edit.inserted_sheet.is_some(),
+            structural: self.inserted_sheet.is_some(),
+            coord_changed: self.inserted_sheet.is_some(),
             refresh_sizes: None,
             merge_changes: Vec::new(),
             merge_conflict: false,
@@ -1182,26 +1173,24 @@ pub struct ChartUndoEdit {
     pub deleted_after: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug)]
-struct ChartUndoAction {
-    label: String,
-    focus: (usize, u32, u32),
-    by_site: u32,
-    edit: ChartUndoEdit,
-}
-
-impl ChartUndoAction {
-    fn apply(&mut self, wb: &mut Workbook, redo: bool) -> Applied {
-        if let Some(sh) = wb.sheets.get_mut(self.edit.sheet) {
+impl ChartUndoEdit {
+    pub(crate) fn apply(
+        &self,
+        wb: &mut Workbook,
+        label: &str,
+        focus: (usize, u32, u32),
+        redo: bool,
+    ) -> Applied {
+        if let Some(sh) = wb.sheets.get_mut(self.sheet) {
             sh.charts = if redo {
-                self.edit.charts_after.clone()
+                self.charts_after.clone()
             } else {
-                self.edit.charts_before.clone()
+                self.charts_before.clone()
             };
             sh.deleted_charts = if redo {
-                self.edit.deleted_after.clone()
+                self.deleted_after.clone()
             } else {
-                self.edit.deleted_before.clone()
+                self.deleted_before.clone()
             };
             sh.charts_dirty = true;
         }
@@ -1209,8 +1198,8 @@ impl ChartUndoAction {
         Applied {
             touched: Vec::new(),
             style_changes: Vec::new(),
-            label: self.label.clone(),
-            focus: self.focus,
+            label: label.to_owned(),
+            focus,
             skipped: 0,
             structural: false,
             coord_changed: false,
@@ -1227,9 +1216,6 @@ enum Entry {
     Tx(EntryStamp, TxAction),
     CowBatch(EntryStamp, Box<CowBatchAction>),
     NumericSort(EntryStamp, NumericSortAction),
-    Meta(EntryStamp, Box<MetaAction>),
-    Pivot(EntryStamp, Box<PivotUndoAction>),
-    Chart(EntryStamp, Box<ChartUndoAction>),
 }
 
 impl Entry {
@@ -1240,10 +1226,7 @@ impl Entry {
             Self::Cells(s, _, _, _, _)
             | Self::Tx(s, _)
             | Self::CowBatch(s, _)
-            | Self::NumericSort(s, _)
-            | Self::Meta(s, _)
-            | Self::Pivot(s, _)
-            | Self::Chart(s, _) => s,
+            | Self::NumericSort(s, _) => s,
         }
     }
 
@@ -1252,10 +1235,7 @@ impl Entry {
             Self::Cells(s, _, _, _, _)
             | Self::Tx(s, _)
             | Self::CowBatch(s, _)
-            | Self::NumericSort(s, _)
-            | Self::Meta(s, _)
-            | Self::Pivot(s, _)
-            | Self::Chart(s, _) => s,
+            | Self::NumericSort(s, _) => s,
         }
     }
 
@@ -1275,6 +1255,9 @@ impl Entry {
             Self::Cells(_, a, _, None, None) if a.snap_before.is_none() && a.snap_after.is_none()
                 && a.merges.is_none() && a.shapes.is_none() && a.pictures.is_none()
                 && a.refresh_sizes.is_none() => Some(Box::new(a.deltas.iter().map(|d| (d.sheet, d.row, d.col)))),
+            Self::Tx(_, TxAction { delta: crate::tx::TxDelta::CellBatch { deltas, .. }, .. }) => {
+                Some(Box::new(deltas.iter().map(|d| (d.sheet, d.row, d.col))))
+            }
             Self::CowBatch(_, a)
                 if a.row_style_deltas.is_empty()
                     && a.col_style_deltas.is_empty()
@@ -1301,9 +1284,6 @@ impl Entry {
             Self::Cells(_, a, _, _, _) => &a.label,
             Self::CowBatch(_, a) => &a.label,
             Self::NumericSort(_, a) => &a.label,
-            Self::Meta(_, a) => &a.label,
-            Self::Pivot(_, a) => &a.label,
-            Self::Chart(_, a) => &a.label,
         }
     }
     fn by_site(&self) -> u32 {
@@ -1312,9 +1292,6 @@ impl Entry {
             Self::Cells(_, a, _, _, _) => a.by_site,
             Self::CowBatch(_, a) => a.by_site,
             Self::NumericSort(_, a) => a.by_site,
-            Self::Meta(_, a) => a.by_site,
-            Self::Pivot(_, a) => a.by_site,
-            Self::Chart(_, a) => a.by_site,
         }
     }
 }
@@ -1389,7 +1366,116 @@ impl TxAction {
         Some(applied)
     }
 
-    fn apply_workbook(&mut self, wb: &mut Workbook, redo: bool) -> Option<Applied> {
+    fn apply_cell_batch(
+        &mut self,
+        sheets: &mut [Sheet],
+        redo: bool,
+        guard: &mut impl FnMut(usize, u32, u32, &Cell) -> bool,
+    ) -> Option<(Applied, bool)> {
+        let crate::tx::TxDelta::CellBatch { deltas, sheet_ids } = &mut self.delta else {
+            return None;
+        };
+        let mut touched = Vec::new();
+        let mut style_changes = Vec::new();
+        let mut excluded = std::collections::HashSet::new();
+        let id_matches = |sheet_idx: usize, sh: &Sheet| -> bool {
+            sheet_ids
+                .iter()
+                .find(|&&(idx, _)| idx == sheet_idx)
+                .is_none_or(|&(_, id)| sh.identity == id)
+        };
+        if redo {
+            for (i, d) in deltas.iter().enumerate() {
+                let Some(sheet) = sheets.get_mut(d.sheet) else {
+                    excluded.insert(i);
+                    continue;
+                };
+                if !id_matches(d.sheet, sheet) || !d.can_replay(sheet, true, guard) {
+                    excluded.insert(i);
+                    continue;
+                }
+                d.replay(sheet, true, &mut style_changes);
+                touched.push((d.sheet, d.row, d.col));
+            }
+        } else {
+            for (i, d) in deltas.iter().enumerate().rev() {
+                let Some(sheet) = sheets.get_mut(d.sheet) else {
+                    excluded.insert(i);
+                    continue;
+                };
+                if !id_matches(d.sheet, sheet) || !d.can_replay(sheet, false, guard) {
+                    excluded.insert(i);
+                    continue;
+                }
+                d.replay(sheet, false, &mut style_changes);
+                touched.push((d.sheet, d.row, d.col));
+            }
+        }
+        let skipped = excluded.len();
+        if skipped != 0 {
+            let mut i = 0usize;
+            deltas.retain(|_| {
+                let keep = !excluded.contains(&i);
+                i += 1;
+                keep
+            });
+        }
+        let total_touched = touched.len();
+        let applied = Applied {
+            touched,
+            style_changes,
+            label: self.label.clone(),
+            focus: self.focus,
+            skipped,
+            structural: false,
+            coord_changed: false,
+            refresh_sizes: None,
+            merge_changes: Vec::new(),
+            merge_conflict: false,
+            total_touched,
+        };
+        Some((applied, !deltas.is_empty()))
+    }
+
+    fn apply_meta(
+        &mut self,
+        sheets: &mut [Sheet],
+        redo: bool,
+        guard: &mut impl FnMut(usize, u32, u32, &Cell) -> bool,
+    ) -> Option<(Applied, bool, Vec<(usize, crate::sync::SheetMetaKind)>, bool)> {
+        let crate::tx::TxDelta::Meta(edit) = &mut self.delta else {
+            return None;
+        };
+        let (syncs, touched, rich_skipped, thread_conflicts) =
+            edit.apply_with_guard(sheets, redo, guard);
+        let skipped = rich_skipped.len() + thread_conflicts;
+        if skipped > 0 {
+            let mut i = 0usize;
+            edit.rich.retain(|_| {
+                let keep = !rich_skipped.contains(&i);
+                i += 1;
+                keep
+            });
+        }
+        let needs_recalc = edit.filter.is_some();
+        let total_touched = touched.len();
+        let applied = Applied {
+            touched,
+            label: self.label.clone(),
+            focus: self.focus,
+            skipped,
+            structural: false,
+            coord_changed: false,
+            refresh_sizes: None,
+            style_changes: Vec::new(),
+            merge_changes: Vec::new(),
+            merge_conflict: false,
+            total_touched,
+        };
+        Some((applied, !edit.is_empty(), syncs, needs_recalc))
+    }
+
+    fn apply_workbook(&mut self, wb: &mut Workbook, redo: bool) -> Option<(Applied, bool)> {
         use crate::tx::{SheetTabChange, TxDelta};
         match &mut self.delta {
             TxDelta::Structure(history) => {
@@ -1399,20 +1485,24 @@ impl TxAction {
                 } else {
                     restore_structure(wb, before, after)?
                 };
+                wb.bump_coord_epoch();
                 let total_touched = touched.len();
-                Some(Applied {
-                    touched,
-                    label: self.label.clone(),
-                    focus: self.focus,
-                    skipped: 0,
-                    structural: true,
-                    coord_changed: true,
-                    refresh_sizes: None,
-                    style_changes: Vec::new(),
-                    merge_changes: Vec::new(),
-                    merge_conflict: false,
-                    total_touched,
-                })
+                Some((
+                    Applied {
+                        touched,
+                        label: self.label.clone(),
+                        focus: self.focus,
+                        skipped: 0,
+                        structural: true,
+                        coord_changed: true,
+                        refresh_sizes: None,
+                        style_changes: Vec::new(),
+                        merge_changes: Vec::new(),
+                        merge_conflict: false,
+                        total_touched,
+                    },
+                    false,
+                ))
             }
             TxDelta::SheetTab {
                 index,
@@ -1448,6 +1538,7 @@ impl TxAction {
                             return None;
                         }
                         wb.sheets.push(*removed.take()?);
+                        wb.bump_coord_epoch();
                         focus = (*index, 0, 0);
                     }
                     SheetTabChange::Append { removed } => {
@@ -1462,6 +1553,7 @@ impl TxAction {
                         }
                         *removed = wb.sheets.pop().map(Box::new);
                         wb.calc_pending_sheets.remove(index);
+                        wb.bump_coord_epoch();
                     }
                     SheetTabChange::Insert { removed } if redo => {
                         if *index > wb.sheets.len()
@@ -1548,21 +1640,54 @@ impl TxAction {
                     }
                 }
                 wb.dirty = true;
-                Some(Applied {
-                    touched: Vec::new(),
-                    label: self.label.clone(),
-                    focus,
-                    skipped: 0,
-                    structural: true,
-                    coord_changed: true,
-                    refresh_sizes: None,
-                    style_changes: Vec::new(),
-                    merge_changes: Vec::new(),
-                    merge_conflict: false,
-                    total_touched: 0,
-                })
+                Some((
+                    Applied {
+                        touched: Vec::new(),
+                        label: self.label.clone(),
+                        focus,
+                        skipped: 0,
+                        structural: true,
+                        coord_changed: true,
+                        refresh_sizes: None,
+                        style_changes: Vec::new(),
+                        merge_changes: Vec::new(),
+                        merge_conflict: false,
+                        total_touched: 0,
+                    },
+                    false,
+                ))
             }
-            TxDelta::SparseShift { .. } | TxDelta::RoomPatch { .. } => None,
+            TxDelta::Chart(edit) => Some((edit.apply(wb, &self.label, self.focus, redo), false)),
+            TxDelta::Pivot(edit) => Some((edit.apply(wb, &self.label, self.focus, redo), false)),
+            TxDelta::DefinedNames { before, after } => {
+                let (expected, target) = if redo { (before, after) } else { (after, before) };
+                if wb.names != *expected {
+                    return None;
+                }
+                wb.names = target.clone();
+                wb.names_dirty = true;
+                wb.dirty = true;
+                Some((
+                    Applied {
+                        touched: Vec::new(),
+                        style_changes: Vec::new(),
+                        label: self.label.clone(),
+                        focus: self.focus,
+                        skipped: 0,
+                        structural: false,
+                        coord_changed: false,
+                        refresh_sizes: None,
+                        merge_changes: Vec::new(),
+                        merge_conflict: false,
+                        total_touched: 0,
+                    },
+                    true,
+                ))
+            }
+            TxDelta::SparseShift { .. }
+            | TxDelta::RoomPatch { .. }
+            | TxDelta::Meta(_)
+            | TxDelta::CellBatch { .. } => None,
         }
     }
 }
@@ -3038,7 +3163,7 @@ impl UndoStack {
     fn tx_delta_bytes(&self, delta: &crate::tx::TxDelta) -> usize {
         use crate::tx::{SheetTabChange, TxDelta};
         match delta {
-            TxDelta::SparseShift { deltas, .. } => {
+            TxDelta::SparseShift { deltas, .. } | TxDelta::CellBatch { deltas, .. } => {
                 deltas.capacity() * std::mem::size_of::<CellDelta>()
                     + deltas
                         .iter()
@@ -3067,6 +3192,30 @@ impl UndoStack {
                 | SheetTabChange::Insert { .. }
                 | SheetTabChange::Move { .. } => 0,
             },
+            TxDelta::Meta(edit) => {
+                128
+                    + edit.col_widths.len() * 16
+                    + edit.row_heights.len() * 16
+                    + edit.hidden_rows_user.len() * 8
+                    + edit.hidden_cols.len() * 8
+                    + edit.notes.len() * 96
+                    + edit.threads.len() * 128
+                    + edit.ignored_errors.len() * 12
+                    + edit.rich.len() * 64
+                    + edit.hyperlinks.len() * 96
+            }
+            TxDelta::Chart(edit) => 512 + edit.charts_after.len() * 256,
+            TxDelta::Pivot(edit) => {
+                512 + edit.deltas.len() * std::mem::size_of::<CellDelta>()
+                    + edit.col_widths.len() * 16
+            }
+            TxDelta::DefinedNames { before, after } => before
+                .iter()
+                .chain(after)
+                .map(|(n, _, f)| {
+                    std::mem::size_of::<(String, Option<usize>, String)>() + n.len() + f.len()
+                })
+                .sum(),
         }
     }
 
@@ -3336,26 +3485,7 @@ impl UndoStack {
         focus: (usize, u32, u32),
         edit: MetaEdit,
     ) {
-        if edit.is_empty() {
-            return;
-        }
-        let approx_bytes = 128
-            + edit.col_widths.len() * 16
-            + edit.row_heights.len() * 16
-            + edit.hidden_rows_user.len() * 8
-            + edit.hidden_cols.len() * 8
-            + edit.notes.len() * 96
-            + edit.ignored_errors.len() * 12;
-        self.done.push(Entry::Meta(
-            next_entry(approx_bytes),
-            Box::new(MetaAction {
-                label: label.into(),
-                focus,
-                by_site: self.site,
-                edit,
-            }),
-        ));
-        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+        self.push_tx(crate::tx::TxCommit::from_meta(label, focus, edit));
     }
 
     pub fn push_pivot_edit(
@@ -3364,20 +3494,7 @@ impl UndoStack {
         focus: (usize, u32, u32),
         edit: PivotUndoEdit,
     ) {
-        self.undone.clear();
-        let approx_bytes = 512
-            + edit.deltas.len() * std::mem::size_of::<CellDelta>()
-            + edit.col_widths.len() * 16;
-        self.done.push(Entry::Pivot(
-            next_entry(approx_bytes),
-            Box::new(PivotUndoAction {
-                label: label.into(),
-                focus,
-                by_site: self.site,
-                edit,
-            }),
-        ));
-        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+        self.push_tx(crate::tx::TxCommit::from_pivot(label, focus, edit));
     }
 
     /// 把跨表联动改写的 `CellDelta` 合并到最近一条 `Entry::Cells` 撤销记录中，
@@ -3652,7 +3769,9 @@ impl UndoStack {
             Entry::Cells(_, _, _, _, notes) => notes,
             Entry::CowBatch(_, action) => &action.notes,
             Entry::NumericSort(_, action) => &action.notes,
-            Entry::Meta(_, action) => return action.edit.threads.iter().find_map(|(_, before, after)| check(before, after)),
+            Entry::Tx(_, TxAction { delta: crate::tx::TxDelta::Meta(edit), .. }) => {
+                return edit.threads.iter().find_map(|(_, before, after)| check(before, after));
+            }
             _ => return None,
         };
         notes.as_ref()?.threads.iter().find_map(|(_, _, before, after)| check(before, after))
@@ -3685,34 +3804,15 @@ impl UndoStack {
         focus: (usize, u32, u32),
         edit: ChartUndoEdit,
     ) {
-        self.undone.clear();
-        let approx_bytes = 512 + edit.charts_after.len() * 256;
-        self.done.push(Entry::Chart(
-            next_entry(approx_bytes),
-            Box::new(ChartUndoAction {
-                label: label.into(),
-                focus,
-                by_site: self.site,
-                edit,
-            }),
-        ));
-        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+        self.push_tx(crate::tx::TxCommit::from_chart(label, focus, edit));
     }
 
     pub fn undo_is_structure(&self) -> bool {
-        match self.done.last() {
-            Some(Entry::Tx(_, action)) => action.delta.is_structural(),
-            Some(Entry::Pivot(..) | Entry::Chart(..)) => true,
-            _ => false,
-        }
+        matches!(self.done.last(), Some(Entry::Tx(_, action)) if action.delta.is_structural())
     }
 
     pub fn redo_is_structure(&self) -> bool {
-        match self.undone.last() {
-            Some(Entry::Tx(_, action)) => action.delta.is_structural(),
-            Some(Entry::Pivot(..) | Entry::Chart(..)) => true,
-            _ => false,
-        }
+        matches!(self.undone.last(), Some(Entry::Tx(_, action)) if action.delta.is_structural())
     }
 
     pub fn record_appended_sheet(&mut self, wb: &Workbook, previous_focus: (usize, u32, u32)) {
@@ -3832,10 +3932,25 @@ impl UndoStack {
         self.settle_before_replay();
         self.last_meta_sync.clear();
         self.last_needs_recalc = false;
+        if matches!(
+            self.done.last(),
+            Some(Entry::Tx(_, TxAction { delta: crate::tx::TxDelta::DefinedNames { .. }, .. }))
+        ) {
+            if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) {
+                return None;
+            }
+            let Some(Entry::Tx(_, action)) = self.done.last_mut() else { unreachable!() };
+            let (applied, needs_recalc) = action.apply_workbook(wb, false)?;
+            self.last_needs_recalc |= needs_recalc;
+            self.undone.push(self.done.pop()?);
+            return Some(applied);
+        }
         if !self.undo_is_structure() {
-            if let Some(Entry::Meta(_, action)) = self.done.last() {
+            if let Some(Entry::Tx(_, action)) = self.done.last()
+                && let crate::tx::TxDelta::Meta(edit) = &action.delta
+            {
                 if action.by_site == 0 || self.site == 0 || action.by_site == self.site {
-                    if let Some((before_names, _)) = &action.edit.names {
+                    if let Some((before_names, _)) = &edit.names {
                         wb.names = before_names.clone();
                         wb.names_dirty = true;
                         self.last_needs_recalc = true;
@@ -3847,6 +3962,9 @@ impl UndoStack {
             if !entry.can_replay_move(wb, false, &mut guard) { return None; }
             let entry_id = entry.id();
             let result = self.undo(&mut wb.sheets, guard)?;
+            if result.coord_changed && (result.skipped == 0 || !result.touched.is_empty()) {
+                wb.bump_coord_epoch();
+            }
             if let Some(entry) = self.undone.last_mut().filter(|e| e.id() == entry_id) {
                 if result.skipped == 0 && !result.merge_conflict {
                     entry.stamp().replay_link(wb, false);
@@ -3861,17 +3979,8 @@ impl UndoStack {
         }
         if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::Tx(_, action)) = self.done.last_mut() {
-            let applied = action.apply_workbook(wb, false)?;
-            self.undone.push(self.done.pop()?);
-            return Some(applied);
-        }
-        if let Some(Entry::Pivot(_, action)) = self.done.last_mut() {
-            let applied = action.apply(wb, false);
-            self.undone.push(self.done.pop()?);
-            return Some(applied);
-        }
-        if let Some(Entry::Chart(_, action)) = self.done.last_mut() {
-            let applied = action.apply(wb, false);
+            let (applied, needs_recalc) = action.apply_workbook(wb, false)?;
+            self.last_needs_recalc |= needs_recalc;
             self.undone.push(self.done.pop()?);
             return Some(applied);
         }
@@ -3882,10 +3991,25 @@ impl UndoStack {
         self.settle_before_replay();
         self.last_meta_sync.clear();
         self.last_needs_recalc = false;
+        if matches!(
+            self.undone.last(),
+            Some(Entry::Tx(_, TxAction { delta: crate::tx::TxDelta::DefinedNames { .. }, .. }))
+        ) {
+            if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) {
+                return None;
+            }
+            let Some(Entry::Tx(_, action)) = self.undone.last_mut() else { unreachable!() };
+            let (applied, needs_recalc) = action.apply_workbook(wb, true)?;
+            self.last_needs_recalc |= needs_recalc;
+            self.done.push(self.undone.pop()?);
+            return Some(applied);
+        }
         if !self.redo_is_structure() {
-            if let Some(Entry::Meta(_, action)) = self.undone.last() {
+            if let Some(Entry::Tx(_, action)) = self.undone.last()
+                && let crate::tx::TxDelta::Meta(edit) = &action.delta
+            {
                 if action.by_site == 0 || self.site == 0 || action.by_site == self.site {
-                    if let Some((_, after_names)) = &action.edit.names {
+                    if let Some((_, after_names)) = &edit.names {
                         wb.names = after_names.clone();
                         wb.names_dirty = true;
                         self.last_needs_recalc = true;
@@ -3897,6 +4021,9 @@ impl UndoStack {
             if !entry.can_replay_move(wb, true, &mut guard) { return None; }
             let entry_id = entry.id();
             let result = self.redo(&mut wb.sheets, guard)?;
+            if result.coord_changed && (result.skipped == 0 || !result.touched.is_empty()) {
+                wb.bump_coord_epoch();
+            }
             if let Some(entry) = self.done.last_mut().filter(|e| e.id() == entry_id) {
                 if result.skipped == 0 && !result.merge_conflict {
                     entry.stamp().replay_link(wb, true);
@@ -3911,17 +4038,8 @@ impl UndoStack {
         }
         if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::Tx(_, action)) = self.undone.last_mut() {
-            let applied = action.apply_workbook(wb, true)?;
-            self.done.push(self.undone.pop()?);
-            return Some(applied);
-        }
-        if let Some(Entry::Pivot(_, action)) = self.undone.last_mut() {
-            let applied = action.apply(wb, true);
-            self.done.push(self.undone.pop()?);
-            return Some(applied);
-        }
-        if let Some(Entry::Chart(_, action)) = self.undone.last_mut() {
-            let applied = action.apply(wb, true);
+            let (applied, needs_recalc) = action.apply_workbook(wb, true)?;
+            self.last_needs_recalc |= needs_recalc;
             self.done.push(self.undone.pop()?);
             return Some(applied);
         }
@@ -3938,7 +4056,14 @@ impl UndoStack {
         if self.undo_is_structure()
             || matches!(
                 self.done.last(),
-                Some(Entry::Tx(_, TxAction { delta: crate::tx::TxDelta::RoomPatch { .. }, .. }))
+                Some(Entry::Tx(
+                    _,
+                    TxAction {
+                        delta: crate::tx::TxDelta::RoomPatch { .. }
+                            | crate::tx::TxDelta::DefinedNames { .. },
+                        ..
+                    }
+                ))
             )
         {
             return None;
@@ -3954,45 +4079,37 @@ impl UndoStack {
         }
         let site = self.site;
         if let Some(Entry::Tx(_, action)) = self.done.last() {
-            let applied = action.apply_sparse_shift(sheets, false, guard)?;
-            if applied.skipped == 0 { self.undone.push(self.done.pop()?); }
-            return Some(applied);
-        }
-        if let Some(Entry::Meta(_, _)) = self.done.last() {
-            let mut entry = self.done.pop()?;
-            let Entry::Meta(_, ref mut action) = entry else { unreachable!() };
-            let (syncs, touched, rich_skipped, thread_conflicts) = action.edit.apply(sheets, false, &mut guard);
-            let skipped = rich_skipped.len() + thread_conflicts;
-            if skipped > 0 {
-                let mut i = 0usize;
-                action.edit.rich.retain(|_| {
-                    let keep = !rich_skipped.contains(&i);
-                    i += 1;
-                    keep
-                });
+            match &action.delta {
+                crate::tx::TxDelta::SparseShift { .. } => {
+                    let applied = action.apply_sparse_shift(sheets, false, guard)?;
+                    if applied.skipped == 0 {
+                        self.undone.push(self.done.pop()?);
+                    }
+                    return Some(applied);
+                }
+                crate::tx::TxDelta::CellBatch { .. } => {
+                    let mut entry = self.done.pop()?;
+                    let Entry::Tx(_, ref mut action) = entry else { unreachable!() };
+                    let (applied, keep) = action.apply_cell_batch(sheets, false, &mut guard)?;
+                    if keep {
+                        self.undone.push(entry);
+                    }
+                    return Some(applied);
+                }
+                crate::tx::TxDelta::Meta(_) => {
+                    let mut entry = self.done.pop()?;
+                    let Entry::Tx(_, ref mut action) = entry else { unreachable!() };
+                    let (applied, keep, syncs, needs_recalc) =
+                        action.apply_meta(sheets, false, &mut guard)?;
+                    self.last_needs_recalc |= needs_recalc;
+                    self.last_meta_sync = syncs;
+                    if keep {
+                        self.undone.push(entry);
+                    }
+                    return Some(applied);
+                }
+                _ => return None,
             }
-            if action.edit.filter.is_some() {
-                self.last_needs_recalc = true;
-            }
-            let total_touched = touched.len();
-            let applied = Applied {
-                touched,
-                label: action.label.clone(),
-                focus: action.focus,
-                skipped,
-                structural: false,
-                coord_changed: false,
-                refresh_sizes: None,
-                style_changes: Vec::new(),
-                merge_changes: Vec::new(),
-                merge_conflict: false,
-                total_touched,
-            };
-            self.last_meta_sync = syncs;
-            if !action.edit.is_empty() {
-                self.undone.push(entry);
-            }
-            return Some(applied);
         }
         if let Some(Entry::NumericSort(stamp, action)) = self.done.last_mut() {
             let (applied, meta_sync) = action.apply(stamp, sheets, false, guard);
@@ -4139,7 +4256,14 @@ impl UndoStack {
         if self.redo_is_structure()
             || matches!(
                 self.undone.last(),
-                Some(Entry::Tx(_, TxAction { delta: crate::tx::TxDelta::RoomPatch { .. }, .. }))
+                Some(Entry::Tx(
+                    _,
+                    TxAction {
+                        delta: crate::tx::TxDelta::RoomPatch { .. }
+                            | crate::tx::TxDelta::DefinedNames { .. },
+                        ..
+                    }
+                ))
             )
         {
             return None;
@@ -4154,45 +4278,37 @@ impl UndoStack {
         }
         let site = self.site;
         if let Some(Entry::Tx(_, action)) = self.undone.last() {
-            let applied = action.apply_sparse_shift(sheets, true, guard)?;
-            if applied.skipped == 0 { self.done.push(self.undone.pop()?); }
-            return Some(applied);
-        }
-        if let Some(Entry::Meta(_, _)) = self.undone.last() {
-            let mut entry = self.undone.pop()?;
-            let Entry::Meta(_, ref mut action) = entry else { unreachable!() };
-            let (syncs, touched, rich_skipped, thread_conflicts) = action.edit.apply(sheets, true, &mut guard);
-            let skipped = rich_skipped.len() + thread_conflicts;
-            if skipped > 0 {
-                let mut i = 0usize;
-                action.edit.rich.retain(|_| {
-                    let keep = !rich_skipped.contains(&i);
-                    i += 1;
-                    keep
-                });
+            match &action.delta {
+                crate::tx::TxDelta::SparseShift { .. } => {
+                    let applied = action.apply_sparse_shift(sheets, true, guard)?;
+                    if applied.skipped == 0 {
+                        self.done.push(self.undone.pop()?);
+                    }
+                    return Some(applied);
+                }
+                crate::tx::TxDelta::CellBatch { .. } => {
+                    let mut entry = self.undone.pop()?;
+                    let Entry::Tx(_, ref mut action) = entry else { unreachable!() };
+                    let (applied, keep) = action.apply_cell_batch(sheets, true, &mut guard)?;
+                    if keep {
+                        self.done.push(entry);
+                    }
+                    return Some(applied);
+                }
+                crate::tx::TxDelta::Meta(_) => {
+                    let mut entry = self.undone.pop()?;
+                    let Entry::Tx(_, ref mut action) = entry else { unreachable!() };
+                    let (applied, keep, syncs, needs_recalc) =
+                        action.apply_meta(sheets, true, &mut guard)?;
+                    self.last_needs_recalc |= needs_recalc;
+                    self.last_meta_sync = syncs;
+                    if keep {
+                        self.done.push(entry);
+                    }
+                    return Some(applied);
+                }
+                _ => return None,
             }
-            if action.edit.filter.is_some() {
-                self.last_needs_recalc = true;
-            }
-            let total_touched = touched.len();
-            let applied = Applied {
-                touched,
-                label: action.label.clone(),
-                focus: action.focus,
-                skipped,
-                structural: false,
-                coord_changed: false,
-                refresh_sizes: None,
-                style_changes: Vec::new(),
-                merge_changes: Vec::new(),
-                merge_conflict: false,
-                total_touched,
-            };
-            self.last_meta_sync = syncs;
-            if !action.edit.is_empty() {
-                self.done.push(entry);
-            }
-            return Some(applied);
         }
         if let Some(Entry::NumericSort(stamp, action)) = self.undone.last_mut() {
             let (applied, meta_sync) = action.apply(stamp, sheets, true, guard);

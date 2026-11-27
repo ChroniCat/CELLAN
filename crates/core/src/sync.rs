@@ -1918,6 +1918,7 @@ pub fn calc_snapshot_workbook(wb: &crate::model::Workbook) -> crate::model::Work
     out.calc_max_change = wb.calc_max_change;
     out.calc_pending = wb.calc_pending;
     out.calc_pending_sheets = wb.calc_pending_sheets.clone();
+    out.coord_epoch = wb.coord_epoch;
     out.sheets = wb
         .sheets
         .iter()
@@ -2074,6 +2075,7 @@ pub fn install_guest_snapshot_into_workbook(
             wb.sheets[sheet].unmerge_range(r1, c1, r2, c2);
         }
     }
+    wb.bump_coord_epoch();
 }
 
 /// 宿主开房时的零拷贝 CoW 基准工作簿快照（基于 `Sheet::search_snapshot` 列块共享）

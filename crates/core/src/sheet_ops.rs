@@ -38,6 +38,7 @@ pub fn insert_sheet(wb: &mut Workbook, idx: usize, mut sheet: Sheet) -> bool {
         }
     }
     wb.sheets.insert(idx, sheet);
+    wb.bump_coord_epoch();
     wb.dirty = true;
     true
 }
@@ -73,6 +74,7 @@ fn rename_impl(wb: &mut Workbook, idx: usize, name: &str, journal: Option<&mut R
         }
     }
     rewrite_qualifiers(wb, &old, Some(name), None, journal);
+    wb.bump_coord_epoch();
     wb.dirty = true;
     true
 }
@@ -214,6 +216,7 @@ pub(crate) fn delete_with_history(wb: &mut Workbook, idx: usize) -> Option<Delet
     wb.pivots = kept_pivots;
     wb.pivots_removed_parts.extend(removed_parts.iter().cloned());
 
+    wb.bump_coord_epoch();
     wb.dirty = true;
     Some(DeletedSheetRecord {
         sheet: removed_sheet,
@@ -303,6 +306,7 @@ pub(crate) fn restore_deleted_sheet(
     }
     wb.pivot_shifts.extend(deleted_pivots.pivot_shifts.iter().cloned());
 
+    wb.bump_coord_epoch();
     wb.dirty = true;
     true
 }
@@ -343,6 +347,7 @@ pub fn move_sheet(wb: &mut Workbook, from: usize, to: usize) -> bool {
     for (sheet, ..) in &mut wb.pivots_pending { *sheet = remap(*sheet); }
     for (sheet, ..) in &mut wb.pivots_pending2 { *sheet = remap(*sheet); }
     for p in &mut wb.pivots { p.target_sheet = remap(p.target_sheet); }
+    wb.bump_coord_epoch();
     wb.dirty = true;
     true
 }
@@ -394,6 +399,7 @@ impl RenameReferences {
             let (before, after) = self.0.get(&field)?;
             Some(if redo { after } else { before }.clone())
         });
+        wb.bump_coord_epoch();
         wb.dirty = true;
         true
     }

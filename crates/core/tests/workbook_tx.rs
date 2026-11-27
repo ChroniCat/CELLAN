@@ -23,9 +23,10 @@ use sheetcore::structural::{CellShift, CellShiftConflict, Structural};
 use sheetcore::table::Table;
 use sheetcore::transform::CoordTransform;
 use sheetcore::tx::{
-    RecalcScope, SheetTabIntent, TxDelta, TxError, TxIntent, TxOverlay, TxPatch, WorkbookTx,
+    CellBatchIntent, CellWrite, DefinedNameIntent, RecalcScope, SheetTabIntent, TxCommit, TxDelta,
+    TxEffects, TxError, TxIntent, TxOverlay, TxPatch, WorkbookTx,
 };
-use sheetcore::undo::UndoStack;
+use sheetcore::undo::{ChartUndoEdit, MetaEdit, PivotUndoEdit, UndoStack};
 
 fn num(v: f64) -> Cell {
     Cell {
@@ -1065,4 +1066,815 @@ fn large_structural_tx_background_compaction_and_history_limit() {
     assert!(undo.redo_workbook(&mut wb, allow_all).is_some());
     assert!(undo.redo_workbook(&mut wb, allow_all).is_some());
     assert_eq!(undo.depth(), (2, 0));
+}
+
+#[test]
+fn defined_name_intent_lifecycle_validation_and_cas_undo_redo() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Sales".into();
+    wb.sheets.push(Sheet::new("Summary"));
+    wb.dirty = false;
+    wb.names_dirty = false;
+    let epoch0 = wb.coord_epoch();
+    let mut undo = UndoStack::new();
+
+    // 1. Preflight rejections leave workbook untouched.
+    assert_eq!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_defined_names(DefinedNameIntent::Define {
+                name: "   ".into(),
+                scope: None,
+                formula: "Sales!$A$1".into(),
+            }),
+            (0, 0, 0),
+        )
+        .unwrap_err(),
+        TxError::InvalidDefinedName
+    );
+    assert_eq!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_defined_names(DefinedNameIntent::Define {
+                name: "BadScope".into(),
+                scope: Some(5),
+                formula: "Sales!$A$1".into(),
+            }),
+            (0, 0, 0),
+        )
+        .unwrap_err(),
+        TxError::InvalidSheet
+    );
+    assert_eq!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_defined_names(DefinedNameIntent::Remove { index: 0 }),
+            (0, 0, 0),
+        )
+        .unwrap_err(),
+        TxError::InvalidDefinedName
+    );
+    assert!(!wb.dirty && !wb.names_dirty && wb.names.is_empty());
+
+    // 2. Define global name and sheet-scoped name with same identifier (allowed across distinct scopes).
+    let c1 = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from(DefinedNameIntent::Define {
+            name: " Rate_Month ".into(),
+            scope: None,
+            formula: " 0.05 ".into(),
+        }),
+        (0, 0, 0),
+    )
+    .unwrap();
+    assert_eq!(c1.label, "定义名称 Rate_Month");
+    assert_eq!(c1.effects.recalc, RecalcScope::Full);
+    assert!(c1.effects.invalidate_deps);
+    assert!(c1.effects.invalidate_render_caches);
+    assert!(!c1.effects.coord_changed);
+    assert!(!c1.effects.structural);
+    assert!(wb.names_dirty && wb.dirty);
+    assert_eq!(wb.coord_epoch(), epoch0);
+    assert_eq!(
+        wb.names,
+        vec![("Rate_Month".into(), None, "0.05".into())]
+    );
+    assert!(undo.push_tx(c1) > 0);
+    assert!(!undo.undo_is_structure());
+
+    // Case-insensitive duplicate in same scope rejected with exact Chinese message.
+    let dup_err = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_defined_names(DefinedNameIntent::Define {
+            name: "rate_month".into(),
+            scope: None,
+            formula: "Sales!$A$1".into(),
+        }),
+        (0, 0, 0),
+    )
+    .unwrap_err();
+    assert_eq!(dup_err, TxError::DuplicateDefinedName);
+    assert_eq!(dup_err.message(), "名称已存在");
+
+    // Same name in local scope 0 succeeds.
+    let c2 = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_defined_names(DefinedNameIntent::Define {
+            name: "Rate_Month".into(),
+            scope: Some(0),
+            formula: "Sales!$B$1".into(),
+        }),
+        (0, 0, 1),
+    )
+    .unwrap();
+    assert!(undo.push_tx(c2) > 0);
+    assert_eq!(wb.names.len(), 2);
+
+    // 3. Update existing index keeping same name (different formula) succeeds; identical is NoOp; colliding with other index fails.
+    assert_eq!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_defined_names(DefinedNameIntent::Update {
+                index: 0,
+                name: "Rate_Month".into(),
+                scope: None,
+                formula: "0.05".into(),
+            }),
+            (0, 0, 0),
+        )
+        .unwrap_err(),
+        TxError::NoOp
+    );
+    assert_eq!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_defined_names(DefinedNameIntent::Update {
+                index: 1,
+                name: "rate_month".into(),
+                scope: None,
+                formula: "0.08".into(),
+            }),
+            (0, 0, 0),
+        )
+        .unwrap_err(),
+        TxError::DuplicateDefinedName
+    );
+    let c3 = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_defined_names(DefinedNameIntent::Update {
+            index: 0,
+            name: "Rate_Month".into(),
+            scope: None,
+            formula: "0.06".into(),
+        }),
+        (0, 0, 0),
+    )
+    .unwrap();
+    assert!(undo.push_tx(c3) > 0);
+    assert_eq!(wb.names[0], ("Rate_Month".into(), None, "0.06".into()));
+
+    // 4. Remove & ReplaceAll
+    let c4 = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_defined_names(DefinedNameIntent::Remove { index: 1 }),
+        (0, 0, 0),
+    )
+    .unwrap();
+    assert!(undo.push_tx(c4) > 0);
+    assert_eq!(wb.names.len(), 1);
+
+    // ReplaceAll rejects duplicates & NoOp.
+    assert_eq!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_defined_names(DefinedNameIntent::ReplaceAll {
+                names: vec![
+                    ("Dup".into(), None, "1".into()),
+                    ("dup".into(), None, "2".into()),
+                ],
+            }),
+            (0, 0, 0),
+        )
+        .unwrap_err(),
+        TxError::DuplicateDefinedName
+    );
+    assert_eq!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_defined_names(DefinedNameIntent::ReplaceAll {
+                names: vec![("Rate_Month".into(), None, "0.06".into())],
+            }),
+            (0, 0, 0),
+        )
+        .unwrap_err(),
+        TxError::NoOp
+    );
+    let c5 = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_defined_names(DefinedNameIntent::ReplaceAll {
+            names: vec![
+                ("Q1_Sales".into(), None, "Sales!$A$1:$A$4".into()),
+                ("LocalTax".into(), Some(1), "0.13".into()),
+            ],
+        }),
+        (0, 0, 0),
+    )
+    .unwrap();
+    assert!(undo.push_tx(c5) > 0);
+    assert_eq!(wb.names.len(), 2);
+
+    // 5. CAS guard: out-of-band modification rejects undo cleanly without losing history.
+    let saved_names = wb.names.clone();
+    wb.names.push(("Concurrent".into(), None, "99".into()));
+    assert!(undo.undo_workbook(&mut wb, allow_all).is_none());
+    assert_eq!(wb.names.len(), 3);
+    assert_eq!(undo.depth(), (5, 0));
+
+    // Restore expected live names -> all 5 undo & redo steps succeed cleanly with needs_recalc = true.
+    wb.names = saved_names;
+    wb.names_dirty = false;
+    for _ in 0..5 {
+        let applied = undo.undo_workbook(&mut wb, allow_all).unwrap();
+        assert!(!applied.structural && !applied.coord_changed);
+        assert!(undo.take_needs_recalc());
+        assert!(wb.names_dirty);
+    }
+    assert!(wb.names.is_empty());
+    assert_eq!(wb.coord_epoch(), epoch0);
+
+    for _ in 0..5 {
+        let applied = undo.redo_workbook(&mut wb, allow_all).unwrap();
+        assert!(!applied.structural && !applied.coord_changed);
+        assert!(undo.take_needs_recalc());
+    }
+    assert_eq!(
+        wb.names,
+        vec![
+            ("Q1_Sales".into(), None, "Sales!$A$1:$A$4".into()),
+            ("LocalTax".into(), Some(1), "0.13".into()),
+        ]
+    );
+    assert_eq!(wb.coord_epoch(), epoch0);
+}
+
+#[test]
+fn cell_batch_intent_values_formulas_styles_noop_and_guarded_undo_redo() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].set(0, 0, num(10.0));
+    wb.sheets[0].set(3, 0, txt("to-clear"));
+    wb.sheets[0].set_style(0, 0, 2);
+    wb.dirty = false;
+    let epoch0 = wb.coord_epoch();
+
+    // Preflight errors leave workbook untouched.
+    assert_eq!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_cell_batch(4, vec![CellWrite::cell(0, 0, num(1.0))]),
+            (0, 0, 0),
+        )
+        .unwrap_err(),
+        TxError::InvalidSheet
+    );
+    assert_eq!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_cell_batch(0, vec![CellWrite::cell(sheetcore::sync::MAX_ROWS, 0, num(1.0))]),
+            (0, 0, 0),
+        )
+        .unwrap_err(),
+        TxError::InvalidCellCoord
+    );
+    assert_eq!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_cell_batch(0, vec![CellWrite::style(0, sheetcore::sync::MAX_COLS, 1)]),
+            (0, 0, 0),
+        )
+        .unwrap_err(),
+        TxError::InvalidCellCoord
+    );
+    assert!(!wb.dirty);
+
+    let mut undo = UndoStack::new();
+
+    // Empty writes and pure no-op writes return Ok with empty delta; push_tx returns 0 and leaves dirty false.
+    let empty_commit = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from(CellBatchIntent {
+            sheet: 0,
+            writes: Vec::new(),
+        }),
+        (0, 0, 0),
+    )
+    .unwrap();
+    assert!(empty_commit.delta.is_empty());
+    assert_eq!(empty_commit.effects.recalc, RecalcScope::None);
+    assert!(empty_commit.effects.revision_deltas.is_empty());
+    assert_eq!(undo.push_tx(empty_commit), 0);
+    assert!(!wb.dirty);
+
+    let noop_commit = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_cell_batch(0, vec![CellWrite::cell_and_style(0, 0, num(10.0), 2)]),
+        (0, 0, 0),
+    )
+    .unwrap();
+    assert!(noop_commit.delta.is_empty());
+    assert_eq!(noop_commit.effects.recalc, RecalcScope::None);
+    assert_eq!(undo.push_tx(noop_commit), 0);
+    assert!(!wb.dirty);
+
+    // Mixed batch: duplicate coordinate applied in order, formula, style-only, blank removal, and unchanged cell filtered out.
+    let commit = WorkbookTx::execute_with_label(
+        &mut wb,
+        TxIntent::from_cell_batch(
+            0,
+            vec![
+                CellWrite::cell(0, 0, num(10.0)), // unchanged -> filtered
+                CellWrite::cell(1, 0, num(20.0)),
+                CellWrite::cell_and_style(1, 0, num(25.0), 5), // overrides (1,0)
+                CellWrite::cell(2, 0, fml("=A1+A2")),
+                CellWrite::style(0, 0, 7),
+                CellWrite::cell(3, 0, Cell::default()), // removes (3,0)
+            ],
+        ),
+        Some("AI 写入".into()),
+        (0, 1, 0),
+    )
+    .unwrap();
+    assert_eq!(commit.label, "AI 写入");
+    assert!(wb.dirty);
+    assert_eq!(wb.coord_epoch(), epoch0);
+    assert!(!commit.effects.structural && !commit.effects.coord_changed);
+    assert!(!commit.effects.invalidate_deps);
+    assert!(commit.effects.invalidate_render_caches);
+    assert_eq!(commit.effects.revision_deltas.len(), 4);
+    assert_eq!(
+        commit.effects.recalc,
+        RecalcScope::Cells(vec![(0, 0, 0), (0, 1, 0), (0, 2, 0), (0, 3, 0)])
+    );
+    assert_eq!(wb.sheets[0].value(1, 0), Value::Number(25.0));
+    assert_eq!(wb.sheets[0].style_of(1, 0), 5);
+    assert_eq!(wb.sheets[0].formula_of(2, 0), Some("=A1+A2"));
+    assert_eq!(wb.sheets[0].style_of(0, 0), 7);
+    assert!(wb.sheets[0].get(3, 0).is_none());
+
+    let id1 = undo.push_tx(commit);
+    assert!(id1 > 0);
+    assert!(!undo.undo_is_structure());
+
+    // Push a second non-overlapping CellBatch and verify prepare_group_undo commutes them cleanly.
+    let c2 = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_cell_batch(0, vec![CellWrite::cell(10, 2, num(99.0))]),
+        (0, 10, 2),
+    )
+    .unwrap();
+    let id2 = undo.push_tx(c2);
+    assert!(id2 > id1);
+    assert!(undo.prepare_group_undo(&[id1]));
+    assert_eq!(undo.top_undo_id(), Some(id1));
+
+    // Guarded Undo: reject (1, 0) (simulating another peer's lock/edit), allow the other 3 cells.
+    let undone = undo
+        .undo_workbook(&mut wb, |_, r, c, _| !(r == 1 && c == 0))
+        .unwrap();
+    assert_eq!(undone.skipped, 1);
+    assert_eq!(undone.touched.len(), 3);
+    assert_eq!(undone.style_changes, vec![(0, 0, 0)]);
+    assert_eq!(wb.sheets[0].value(1, 0), Value::Number(25.0)); // kept untouched
+    assert_eq!(wb.sheets[0].style_of(1, 0), 5);
+    assert_eq!(wb.sheets[0].style_of(0, 0), 2);
+    assert!(wb.sheets[0].get(2, 0).is_none());
+    assert_eq!(wb.sheets[0].value(3, 0), Value::Text("to-clear".into()));
+
+    // Redo replays only the 3 non-excluded cells.
+    let redone = undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert_eq!(redone.skipped, 0);
+    assert_eq!(redone.touched.len(), 3);
+    assert_eq!(redone.style_changes, vec![(0, 0, 0)]);
+    assert_eq!(wb.sheets[0].style_of(0, 0), 7);
+    assert_eq!(wb.sheets[0].formula_of(2, 0), Some("=A1+A2"));
+    assert!(wb.sheets[0].get(3, 0).is_none());
+    assert_eq!(wb.coord_epoch(), epoch0);
+}
+
+#[test]
+fn converged_entry_tx_meta_chart_pivot_and_from_structure_roundtrip() {
+    use sheetcore::pivot::Agg;
+    use sheetcore::pivot_engine::PivotTableModel;
+    use sheetcore::pivot_multi::{PivotSpec2, ShowAs, ValueField};
+    use sheetcore::sync::SheetMetaKind;
+
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Main".into();
+    wb.sheets[0].set(0, 0, txt("Hello"));
+    wb.sheets[0].set(0, 1, txt("KeepMe"));
+    let mut undo = UndoStack::new();
+    let epoch0 = wb.coord_epoch();
+
+    // 1. Empty MetaEdit via TxCommit::from_meta is not pushed.
+    let empty_meta = TxCommit::from_meta("noop", (0, 0, 0), MetaEdit::default());
+    assert!(empty_meta.delta.is_empty());
+    assert_eq!(undo.push_tx(empty_meta), 0);
+
+    // 2. Converged MetaEdit: col widths + filter + thread + rich text + hyperlink -> Entry::Tx.
+    let thread_before: Option<ThreadedComment> = None;
+    let thread_after = Some(ThreadedComment {
+        r: 2,
+        c: 0,
+        resolved: false,
+        entries: vec![ThreadEntry {
+            id: "e1".into(),
+            author: "Alice".into(),
+            timestamp: "2026-11-27T00:00:00Z".into(),
+            text: "initial".into(),
+        }],
+    });
+    let summary_after = thread_after.as_ref().map(ThreadedComment::summary_note);
+    wb.sheets[0].cols.set(0, 140.0);
+    wb.sheets[0].filter = Some(Filter::new(0, 0, 5, 2));
+    wb.sheets[0]
+        .threads
+        .insert(CellRef::new(2, 0), thread_after.clone().unwrap());
+    wb.sheets[0]
+        .notes
+        .insert(CellRef::new(2, 0), summary_after.clone().unwrap());
+    let bold_runs = vec![RichRun {
+        bold: true,
+        ..RichRun::plain("Hello")
+    }];
+    wb.sheets[0].rich.insert((0, 0), bold_runs.clone());
+    wb.sheets[0].rich.insert((0, 1), vec![RichRun::plain("KeepMe")]);
+    let link = Hyperlink {
+        target: "https://example.com".into(),
+        tooltip: "Example".into(),
+        ..Default::default()
+    };
+    wb.sheets[0].hyperlinks.insert((1, 0), link.clone());
+
+    let meta_edit = MetaEdit {
+        sheet: 0,
+        col_widths: vec![(0, None, Some(140.0))],
+        notes: vec![((2, 0), None, summary_after)],
+        threads: vec![((2, 0), thread_before, thread_after.clone())],
+        filter: Some((
+            None,
+            Some(Filter::new(0, 0, 5, 2)),
+            Default::default(),
+            Default::default(),
+        )),
+        rich: vec![
+            ((0, 0), txt("Hello"), txt("Hello"), None, Some(bold_runs.clone())),
+            (
+                (0, 1),
+                txt("KeepMe"),
+                txt("KeepMe"),
+                None,
+                Some(vec![RichRun::plain("KeepMe")]),
+            ),
+        ],
+        hyperlinks: vec![((1, 0), None, Some(link))],
+        ..Default::default()
+    };
+    let meta_commit = TxCommit::from_meta("元数据批量更新", (0, 0, 0), meta_edit);
+    assert_eq!(meta_commit.effects.recalc, RecalcScope::Full);
+    assert!(undo.push_tx(meta_commit) > 0);
+    assert!(!undo.undo_is_structure());
+    // next_thread_sync_error inspects TxDelta::Meta threads!
+    assert!(undo.next_thread_sync_error(false, false).is_some());
+    assert!(undo.next_thread_sync_error(false, true).is_none());
+
+    // Simulate a conflicting reply on thread (2, 0) where baseline mismatches (replaced by unrelated thread)
+    // AND guard blocks rich cell (0, 1).
+    wb.sheets[0].threads.insert(
+        CellRef::new(2, 0),
+        ThreadedComment {
+            r: 2,
+            c: 0,
+            resolved: false,
+            entries: vec![ThreadEntry {
+                id: "other-peer".into(),
+                author: "Bob".into(),
+                timestamp: "2026-11-27T01:00:00Z".into(),
+                text: "conflicting".into(),
+            }],
+        },
+    );
+    let undone_meta = undo
+        .undo_workbook(&mut wb, |_, r, c, _| !(r == 0 && c == 1))
+        .unwrap();
+    assert!(!undone_meta.structural && !undone_meta.coord_changed);
+    assert_eq!(undone_meta.skipped, 2); // 1 rich skipped + 1 thread conflict
+    assert_eq!(undone_meta.touched, vec![(0, 0, 0)]);
+    assert!(undo.take_needs_recalc()); // filter triggered recalc
+    let syncs = undo.take_meta_sync();
+    assert!(syncs.iter().any(|(_, k)| matches!(k, SheetMetaKind::ColWidths(_))));
+    assert!(syncs.iter().any(|(_, k)| matches!(k, SheetMetaKind::AutoFilter { range: None })));
+    assert!(syncs.iter().any(|(_, k)| matches!(k, SheetMetaKind::Hyperlink { target: None, .. })));
+    // Thread conflict was NOT broadcast and Bob's thread stayed intact.
+    assert!(!syncs.iter().any(|(_, k)| matches!(k, SheetMetaKind::ThreadChange { .. })));
+    assert_eq!(
+        wb.sheets[0].threads.get(&CellRef::new(2, 0)).unwrap().entries[0].id,
+        "other-peer"
+    );
+    assert!(wb.sheets[0].filter.is_none());
+    assert!(!wb.sheets[0].rich.contains_key(&(0, 0)));
+    assert!(wb.sheets[0].rich.contains_key(&(0, 1)));
+    assert!(wb.sheets[0].hyperlinks.is_empty());
+    assert_eq!(wb.coord_epoch(), epoch0);
+
+    // Redo meta restores non-conflicted items cleanly.
+    let redone_meta = undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert_eq!(redone_meta.skipped, 0);
+    assert!(wb.sheets[0].filter.is_some());
+    assert!(wb.sheets[0].rich.contains_key(&(0, 0)));
+    assert!(wb.sheets[0].hyperlinks.contains_key(&(1, 0)));
+
+    // 3. Converged Chart edit via TxCommit::from_chart.
+    let charts_before = wb.sheets[0].charts.clone();
+    let deleted_before = wb.sheets[0].deleted_charts.clone();
+    wb.sheets[0].charts.push(Chart {
+        kind: ChartKind::Column,
+        title: "Revenue".into(),
+        ..Default::default()
+    });
+    wb.sheets[0]
+        .deleted_charts
+        .push(("xl/drawings/d1.xml".into(), "xl/charts/c1.xml".into()));
+    let chart_edit = ChartUndoEdit {
+        sheet: 0,
+        charts_before,
+        charts_after: wb.sheets[0].charts.clone(),
+        deleted_before,
+        deleted_after: wb.sheets[0].deleted_charts.clone(),
+    };
+    let chart_commit = TxCommit::from_chart("插入柱形图", (0, 0, 0), chart_edit);
+    assert!(undo.push_tx(chart_commit) > 0);
+    assert!(undo.undo_is_structure());
+    let u_chart = undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert!(!u_chart.structural && !u_chart.coord_changed);
+    assert!(wb.sheets[0].charts.is_empty());
+    assert!(wb.sheets[0].deleted_charts.is_empty());
+    assert!(wb.sheets[0].charts_dirty);
+    assert_eq!(wb.coord_epoch(), epoch0);
+    let r_chart = undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert!(!r_chart.structural && !r_chart.coord_changed);
+    assert_eq!(wb.sheets[0].charts.len(), 1);
+    assert_eq!(wb.sheets[0].charts[0].title, "Revenue");
+    assert_eq!(wb.coord_epoch(), epoch0);
+
+    // 4. Converged Pivot edit: (a) in-place does NOT bump coord_epoch; (b) inserted_sheet DOES bump coord_epoch.
+    let spec = PivotSpec2 {
+        source: (0, 0, 5, 1),
+        rows: Vec::new(),
+        cols: Vec::new(),
+        values: vec![ValueField {
+            col: 1,
+            agg: Agg::Sum,
+            label: None,
+            show_as: ShowAs::Normal,
+            base: None,
+        }],
+        filters: Vec::new(),
+        layout: Default::default(),
+    };
+    let pivot_model = PivotTableModel::new(
+        "Pivot1".into(),
+        "Main".into(),
+        Some(wb.sheets[0].identity),
+        1,
+        (0, 0),
+        spec,
+    );
+    let pivots_before = wb.pivots.clone();
+    let mut pivot_sh = Sheet::new("透视表1");
+    pivot_sh.set(0, 0, txt("汇总"));
+    wb.sheets.push(pivot_sh.clone());
+    wb.pivots.push(pivot_model);
+    let pivot_insert_edit = PivotUndoEdit {
+        target_sheet: 1,
+        inserted_sheet: Some((1, pivot_sh)),
+        deltas: Vec::new(),
+        col_widths: Vec::new(),
+        pivots_before,
+        pivots_after: wb.pivots.clone(),
+        removed_before: Vec::new(),
+        removed_after: vec!["xl/pivotTables/p1.xml".into()],
+    };
+    let p_commit = TxCommit::from_pivot("创建透视表", (0, 0, 0), pivot_insert_edit);
+    assert!(p_commit.effects.structural && p_commit.effects.coord_changed);
+    assert!(undo.push_tx(p_commit) > 0);
+    assert!(undo.undo_is_structure());
+
+    let e_before_pivot_undo = wb.coord_epoch();
+    let u_pivot = undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert!(u_pivot.structural && u_pivot.coord_changed);
+    assert_eq!(wb.sheets.len(), 1);
+    assert!(wb.pivots.is_empty());
+    assert!(wb.coord_epoch() > e_before_pivot_undo);
+
+    let e_after_pivot_undo = wb.coord_epoch();
+    let r_pivot = undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert!(r_pivot.structural && r_pivot.coord_changed);
+    assert_eq!(wb.sheets.len(), 2);
+    assert_eq!(wb.pivots.len(), 1);
+    assert!(wb.coord_epoch() > e_after_pivot_undo);
+
+    // In-place pivot refresh (inserted_sheet: None) preserves coord_epoch.
+    let e_inplace = wb.coord_epoch();
+    let d_before = sheetcore::undo::capture(&wb.sheets[1], 1, &[(0, 0)]);
+    wb.sheets[1].set(0, 0, num(123.0));
+    let p_deltas = sheetcore::undo::finish(d_before, &wb.sheets[1]);
+    let inplace_edit = PivotUndoEdit {
+        target_sheet: 1,
+        inserted_sheet: None,
+        deltas: p_deltas,
+        col_widths: vec![(0, None, Some(120.0))],
+        pivots_before: wb.pivots.clone(),
+        pivots_after: wb.pivots.clone(),
+        removed_before: wb.pivots_removed_parts.clone(),
+        removed_after: wb.pivots_removed_parts.clone(),
+    };
+    let inplace_commit = TxCommit::from_pivot("刷新透视表", (1, 0, 0), inplace_edit);
+    assert!(!inplace_commit.effects.structural && !inplace_commit.effects.coord_changed);
+    assert!(undo.push_tx(inplace_commit) > 0);
+    let u_inplace = undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert!(!u_inplace.structural && !u_inplace.coord_changed);
+    assert_eq!(wb.sheets[1].value(0, 0), Value::Text("汇总".into()));
+    assert_eq!(wb.coord_epoch(), e_inplace);
+    let r_inplace = undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert!(!r_inplace.structural && !r_inplace.coord_changed);
+    assert_eq!(wb.sheets[1].value(0, 0), Value::Number(123.0));
+    assert_eq!(wb.coord_epoch(), e_inplace);
+
+    // 5. TxCommit::from_structure + with_effects helper works cleanly via push_tx.
+    let noop_struct = Structural::InsertRows { at: 0, n: 1 };
+    let snap_before = sheetcore::undo::snapshot_structure(&wb, 0, &noop_struct);
+    sheetcore::structural::apply_structural_wb(&mut wb, 0, &noop_struct);
+    let snap_after = snap_before.capture_after(&wb);
+    let s_commit = TxCommit::from_structure(
+        "自定义结构",
+        (0, 0, 0),
+        snap_before,
+        snap_after,
+        TxEffects {
+            recalc: RecalcScope::Full,
+            structural: true,
+            coord_changed: true,
+            ..Default::default()
+        },
+    )
+    .with_effects(TxEffects {
+        recalc: RecalcScope::Full,
+        invalidate_deps: true,
+        invalidate_render_caches: true,
+        structural: true,
+        coord_changed: true,
+        ..Default::default()
+    });
+    assert!(s_commit.effects.invalidate_deps);
+    assert!(undo.push_tx(s_commit) > 0);
+    let e_struct = wb.coord_epoch();
+    undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert!(wb.coord_epoch() > e_struct);
+}
+
+#[test]
+fn workbook_coord_epoch_advances_monotonically_across_all_coord_and_sheet_ops() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "S1".into();
+    for r in 0..8u32 {
+        wb.sheets[0].set(r, 0, num((r + 1) as f64));
+        wb.sheets[0].set(r, 1, num((r + 1) as f64 * 10.0));
+    }
+    assert_eq!(wb.coord_epoch(), 0);
+    let mut last_epoch = wb.coord_epoch();
+    let assert_bumped = |wb: &Workbook, last: &mut u64, ctx: &str| {
+        let now = wb.coord_epoch();
+        assert!(now > *last, "{ctx}: expected coord_epoch > {}, got {}", *last, now);
+        *last = now;
+    };
+
+    let mut undo = UndoStack::new();
+
+    // 1. Structural InsertRows + Undo + Redo
+    let c = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_structural(0, &Structural::InsertRows { at: 1, n: 2 }),
+        (0, 1, 0),
+    )
+    .unwrap();
+    assert_bumped(&wb, &mut last_epoch, "Structural InsertRows");
+    undo.push_tx(c);
+    undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert_bumped(&wb, &mut last_epoch, "Structural Undo");
+    undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert_bumped(&wb, &mut last_epoch, "Structural Redo");
+
+    // 2. Sparse CellShift + blocked Undo (must NOT bump) + clean Undo + Redo
+    let cs = CellShift::new((2, 0, 2, 0), CellShiftDir::Vertical, true);
+    let c = WorkbookTx::execute(&mut wb, TxIntent::from_cell_shift(0, &cs), (0, 2, 0)).unwrap();
+    assert_bumped(&wb, &mut last_epoch, "Sparse CellShift");
+    undo.push_tx(c);
+    let saved_cell = wb.sheets[0].get(4, 0).map(|c| c.into_owned()).unwrap();
+    wb.sheets[0].set(4, 0, num(777.0));
+    let blocked = undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert!(blocked.skipped > 0);
+    assert_eq!(wb.coord_epoch(), last_epoch, "blocked SparseShift undo must not bump coord_epoch");
+    wb.sheets[0].set(4, 0, saved_cell);
+    undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert_bumped(&wb, &mut last_epoch, "SparseShift Undo");
+    undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert_bumped(&wb, &mut last_epoch, "SparseShift Redo");
+
+    // 3. AxisPermute + Undo + Redo
+    let c = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_axis_move(0, Axis::Row, 0, 1, 4).unwrap(),
+        (0, 0, 0),
+    )
+    .unwrap();
+    assert_bumped(&wb, &mut last_epoch, "AxisPermute");
+    undo.push_tx(c);
+    undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert_bumped(&wb, &mut last_epoch, "AxisPermute Undo");
+    undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert_bumped(&wb, &mut last_epoch, "AxisPermute Redo");
+
+    // 4. MultiInsert + Undo + Redo
+    let c = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_multi_insert(0, Axis::Row, vec![1, 3]),
+        (0, 1, 0),
+    )
+    .unwrap();
+    assert_bumped(&wb, &mut last_epoch, "MultiInsert");
+    undo.push_tx(c);
+    undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert_bumped(&wb, &mut last_epoch, "MultiInsert Undo");
+    undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert_bumped(&wb, &mut last_epoch, "MultiInsert Redo");
+
+    // 5. Multi-interval delete_row_intervals_wb
+    sheetcore::structural::delete_row_intervals_wb(&mut wb, 0, &[(0, 0), (2, 2)]);
+    assert_bumped(&wb, &mut last_epoch, "delete_row_intervals_wb");
+
+    // 6. All 5 SheetTab intents + Undo + Redo
+    let tabs = vec![
+        SheetTabIntent::Append {
+            sheet: Sheet::new("S2"),
+        },
+        SheetTabIntent::Insert {
+            index: 1,
+            sheet: Sheet::new("Mid"),
+        },
+        SheetTabIntent::Rename {
+            index: 2,
+            name: "Renamed".into(),
+        },
+        SheetTabIntent::Move { from: 2, to: 0 },
+        SheetTabIntent::Delete { index: 0 },
+    ];
+    for tab in tabs {
+        let c = WorkbookTx::execute(&mut wb, TxIntent::from_sheet_tab(tab), (0, 0, 0)).unwrap();
+        assert_bumped(&wb, &mut last_epoch, "SheetTab execute");
+        undo.push_tx(c);
+        undo.undo_workbook(&mut wb, allow_all).unwrap();
+        assert_bumped(&wb, &mut last_epoch, "SheetTab undo");
+        undo.redo_workbook(&mut wb, allow_all).unwrap();
+        assert_bumped(&wb, &mut last_epoch, "SheetTab redo");
+    }
+
+    // 7. CellShiftPatch + CellShiftOverlay
+    let patch_op = CellShift::new((0, 0, 0, 0), CellShiftDir::Vertical, true);
+    let patch = CellShiftPatch::prepare(&wb, 0, patch_op).unwrap();
+    let mut replica = wb.clone();
+    let mut rep_epoch = replica.coord_epoch();
+    assert!(patch.apply(&mut wb, true));
+    assert_bumped(&wb, &mut last_epoch, "CellShiftPatch forward");
+    assert!(patch.apply(&mut wb, false));
+    assert_bumped(&wb, &mut last_epoch, "CellShiftPatch backward");
+
+    let overlay = TxOverlay::capture(&wb);
+    assert!(overlay.apply_to(&mut replica));
+    assert_bumped(&replica, &mut rep_epoch, "CellShiftOverlay apply_to");
+
+    // 8. Non-coord mutations (CellBatch, DefinedNames, failed preflight) do NOT bump coord_epoch.
+    let c_batch = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_cell_batch(0, vec![CellWrite::cell(0, 0, num(1234.0))]),
+        (0, 0, 0),
+    )
+    .unwrap();
+    assert_eq!(wb.coord_epoch(), last_epoch);
+    undo.push_tx(c_batch);
+    undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert_eq!(wb.coord_epoch(), last_epoch);
+
+    let c_name = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_defined_names(DefinedNameIntent::Define {
+            name: "Tax".into(),
+            scope: None,
+            formula: "0.1".into(),
+        }),
+        (0, 0, 0),
+    )
+    .unwrap();
+    assert_eq!(wb.coord_epoch(), last_epoch);
+    undo.push_tx(c_name);
+    undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert_eq!(wb.coord_epoch(), last_epoch);
+
+    assert!(
+        WorkbookTx::execute(
+            &mut wb,
+            TxIntent::from_structural(99, &Structural::InsertRows { at: 0, n: 1 }),
+            (0, 0, 0),
+        )
+        .is_err()
+    );
+    assert_eq!(wb.coord_epoch(), last_epoch);
 }

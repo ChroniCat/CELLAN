@@ -560,6 +560,7 @@ pub fn load_diag_with_control(
         styles: crate::style::StyleTable::new(),
         chart_edits: Vec::new(),
         audit: crate::audit::WorkbookAudit::default(),
+        coord_epoch: 0,
     };
 
     set_load_kind(if is_ooxml { LOAD_KIND_OOXML } else { LOAD_KIND_BIFF_CALAMINE });
@@ -3087,6 +3088,7 @@ fn try_load_ooxml_from_memory(
         styles: crate::style::StyleTable::new(),
         chart_edits: Vec::new(),
         audit: crate::audit::WorkbookAudit::default(),
+        coord_epoch: 0,
     };
 
     let mut page_names = std::collections::HashMap::new();

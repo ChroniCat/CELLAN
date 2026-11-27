@@ -3316,6 +3316,7 @@ pub fn delete_row_intervals_wb(
         }
         true
     });
+    wb.bump_coord_epoch();
 }
 
 

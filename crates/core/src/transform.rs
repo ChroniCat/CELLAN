@@ -258,6 +258,7 @@ pub(crate) fn verify_workbook_field_coverage(wb: &Workbook) {
         protection_dirty,
         dirty,
         chart_edits,
+        coord_epoch,
 
         // ---- CoordBound: coordinate-bearing workbook registries & sheets ----
         names,
@@ -299,6 +300,7 @@ pub(crate) fn verify_workbook_field_coverage(wb: &Workbook) {
     assert_field_policy(protection_dirty, FieldCoordPolicy::DerivedOrDirty);
     assert_field_policy(dirty, FieldCoordPolicy::DerivedOrDirty);
     assert_field_policy(chart_edits, FieldCoordPolicy::DerivedOrDirty);
+    assert_field_policy(coord_epoch, FieldCoordPolicy::DerivedOrDirty);
 
     // CoordBound
     assert_field_policy(names, FieldCoordPolicy::CoordBound);
@@ -1124,6 +1126,7 @@ impl CoordTransform {
         };
         let target_sid = wb.sheets[sheet_idx].identity;
         let is_band = self.band().is_some();
+        wb.bump_coord_epoch();
 
         // 1. External/internal data source bindings (`wb.sources`).
         crate::external::remap_sources(wb, sheet_idx, self.axis(), self.band(), |lo, hi| {

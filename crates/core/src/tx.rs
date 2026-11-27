@@ -13,12 +13,12 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::cell_shift_patch::CellShiftPatch;
-use crate::model::{CellJournal, CellRef, Sheet, Workbook};
+use crate::model::{Cell, CellJournal, CellRef, Sheet, Workbook};
 use crate::refs::{Axis, AxisMove};
 use crate::sheet_ops::{DeletedSheetPivots, RenameReferences};
 use crate::structural::{CellShift, CellShiftConflict, Structural};
 use crate::transform::CoordTransform;
-use crate::undo::{CellDelta, StructureSnapshot};
+use crate::undo::{CellDelta, ChartUndoEdit, MetaEdit, PivotUndoEdit, StructureSnapshot};
 
 pub use crate::cell_shift_patch::CellShiftOverlay as TxOverlay;
 
@@ -32,12 +32,81 @@ pub enum SheetTabIntent {
     Rename { index: usize, name: String },
 }
 
-/// Unified high-level workbook transaction intent covering all coordinate
-/// transformations and sheet-tab operations.
+/// Workbook defined-name mutation intent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DefinedNameIntent {
+    Define {
+        name: String,
+        scope: Option<usize>,
+        formula: String,
+    },
+    Update {
+        index: usize,
+        name: String,
+        scope: Option<usize>,
+        formula: String,
+    },
+    Remove {
+        index: usize,
+    },
+    ReplaceAll {
+        names: Vec<(String, Option<usize>, String)>,
+    },
+}
+
+/// Single cell value/formula and/or style write inside [`CellBatchIntent`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct CellWrite {
+    pub row: u32,
+    pub col: u32,
+    pub cell: Option<Cell>,
+    pub style: Option<u16>,
+}
+
+impl CellWrite {
+    pub fn cell(row: u32, col: u32, cell: Cell) -> Self {
+        Self {
+            row,
+            col,
+            cell: Some(cell),
+            style: None,
+        }
+    }
+
+    pub fn style(row: u32, col: u32, style: u16) -> Self {
+        Self {
+            row,
+            col,
+            cell: None,
+            style: Some(style),
+        }
+    }
+
+    pub fn cell_and_style(row: u32, col: u32, cell: Cell, style: u16) -> Self {
+        Self {
+            row,
+            col,
+            cell: Some(cell),
+            style: Some(style),
+        }
+    }
+}
+
+/// Atomic batch of cell value/formula/style writes on a single sheet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CellBatchIntent {
+    pub sheet: usize,
+    pub writes: Vec<CellWrite>,
+}
+
+/// Unified high-level workbook transaction intent covering coordinate
+/// transformations, sheet-tab operations, defined names, and cell batches.
 #[derive(Clone, Debug)]
 pub enum TxIntent {
     Transform(CoordTransform),
     SheetTab(SheetTabIntent),
+    DefinedNames(DefinedNameIntent),
+    CellBatch(CellBatchIntent),
 }
 
 impl From<CoordTransform> for TxIntent {
@@ -49,6 +118,18 @@ impl From<CoordTransform> for TxIntent {
 impl From<SheetTabIntent> for TxIntent {
     fn from(tab: SheetTabIntent) -> Self {
         Self::SheetTab(tab)
+    }
+}
+
+impl From<DefinedNameIntent> for TxIntent {
+    fn from(names: DefinedNameIntent) -> Self {
+        Self::DefinedNames(names)
+    }
+}
+
+impl From<CellBatchIntent> for TxIntent {
+    fn from(batch: CellBatchIntent) -> Self {
+        Self::CellBatch(batch)
     }
 }
 
@@ -87,6 +168,14 @@ impl TxIntent {
 
     pub fn from_sheet_tab(tab: SheetTabIntent) -> Self {
         Self::SheetTab(tab)
+    }
+
+    pub fn from_defined_names(names: DefinedNameIntent) -> Self {
+        Self::DefinedNames(names)
+    }
+
+    pub fn from_cell_batch(sheet: usize, writes: Vec<CellWrite>) -> Self {
+        Self::CellBatch(CellBatchIntent { sheet, writes })
     }
 
     /// Default Chinese user-facing undo/revision label for this transaction.
@@ -136,6 +225,13 @@ impl TxIntent {
                 SheetTabIntent::Move { .. } => "移动工作表".into(),
                 SheetTabIntent::Rename { .. } => "重命名工作表".into(),
             },
+            Self::DefinedNames(names) => match names {
+                DefinedNameIntent::Define { name, .. } => format!("定义名称 {}", name.trim()),
+                DefinedNameIntent::Update { .. } => "编辑名称".into(),
+                DefinedNameIntent::Remove { .. } => "删除名称".into(),
+                DefinedNameIntent::ReplaceAll { .. } => "更新名称".into(),
+            },
+            Self::CellBatch(_) => "批量写入".into(),
         }
     }
 }
@@ -147,6 +243,9 @@ pub enum TxError {
     InvalidSheet,
     InvalidSheetName,
     CannotDeleteLastSheet,
+    InvalidDefinedName,
+    DuplicateDefinedName,
+    InvalidCellCoord,
     NoOp,
 }
 
@@ -157,6 +256,9 @@ impl TxError {
             Self::InvalidSheet => "目标工作表无效，未执行操作",
             Self::InvalidSheetName => "工作表名称无效或已存在",
             Self::CannotDeleteLastSheet => "至少保留一张工作表",
+            Self::InvalidDefinedName => "定义名称无效或索引越界",
+            Self::DuplicateDefinedName => "名称已存在",
+            Self::InvalidCellCoord => "目标单元格坐标超出工作表范围",
             Self::NoOp => "操作未产生任何变更",
         }
     }
@@ -198,6 +300,22 @@ pub struct TxEffects {
     pub revision_deltas: Vec<CellDelta>,
     pub touched_sheets: Vec<usize>,
     pub new_focus: Option<(usize, u32, u32)>,
+}
+
+impl Default for TxEffects {
+    fn default() -> Self {
+        Self {
+            recalc: RecalcScope::None,
+            invalidate_deps: false,
+            invalidate_render_caches: false,
+            coord_changed: false,
+            structural: false,
+            detached_sources: false,
+            revision_deltas: Vec::new(),
+            touched_sheets: Vec::new(),
+            new_focus: None,
+        }
+    }
 }
 
 /// Opaque wrapper around compressed / background-compacting structural undo
@@ -288,7 +406,7 @@ impl TxPatch {
                 let cs = tx.as_cell_shift()?;
                 CellShiftPatch::prepare(wb, tx.target_sheet(), cs).map(Self::CellShift)
             }
-            TxIntent::SheetTab(_) => None,
+            TxIntent::SheetTab(_) | TxIntent::DefinedNames(_) | TxIntent::CellBatch(_) => None,
         }
     }
 
@@ -402,22 +520,42 @@ pub enum TxDelta {
         previous_focus: (usize, u32, u32),
         change: SheetTabChange,
     },
+    Meta(Box<MetaEdit>),
+    Chart(Box<ChartUndoEdit>),
+    Pivot(Box<PivotUndoEdit>),
+    DefinedNames {
+        before: Vec<(String, Option<usize>, String)>,
+        after: Vec<(String, Option<usize>, String)>,
+    },
+    CellBatch {
+        deltas: Vec<CellDelta>,
+        sheet_ids: Vec<(usize, u64)>,
+    },
 }
 
 impl TxDelta {
-    /// Returns `true` only when this delta carries no undoable change (an empty
-    /// sparse shift on an untouched band).
+    /// Returns `true` when this delta carries no undoable change (e.g. an empty
+    /// sparse shift, empty cell batch, empty metadata edit, or unchanged names).
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::SparseShift { deltas, .. } => deltas.is_empty(),
-            Self::Structure(_) | Self::RoomPatch { .. } | Self::SheetTab { .. } => false,
+            Self::SparseShift { deltas, .. } | Self::CellBatch { deltas, .. } => deltas.is_empty(),
+            Self::Meta(edit) => edit.is_empty(),
+            Self::DefinedNames { before, after } => before == after,
+            Self::Structure(_)
+            | Self::RoomPatch { .. }
+            | Self::SheetTab { .. }
+            | Self::Chart(_)
+            | Self::Pivot(_) => false,
         }
     }
 
-    /// Whether replaying this delta requires full workbook-level structural
-    /// restoration (matching `UndoStack::undo_is_structure`).
+    /// Whether replaying this delta takes the workbook-structural undo path
+    /// (matching `UndoStack::undo_is_structure` and collaboration guard rules).
     pub fn is_structural(&self) -> bool {
-        matches!(self, Self::Structure(_) | Self::SheetTab { .. })
+        matches!(
+            self,
+            Self::Structure(_) | Self::SheetTab { .. } | Self::Chart(_) | Self::Pivot(_)
+        )
     }
 }
 
@@ -430,6 +568,141 @@ pub struct TxCommit {
     pub delta: TxDelta,
     pub effects: TxEffects,
     pub by_site: u32,
+}
+
+impl TxCommit {
+    /// Wrap a pre-built sheet/workbook [`MetaEdit`] as a unified [`TxCommit`].
+    pub fn from_meta(
+        label: impl Into<String>,
+        focus: (usize, u32, u32),
+        edit: MetaEdit,
+    ) -> Self {
+        let recalc = if edit.names.is_some() || edit.filter.is_some() {
+            RecalcScope::Full
+        } else if !edit.rich.is_empty() {
+            RecalcScope::Cells(
+                edit.rich
+                    .iter()
+                    .map(|(pos, ..)| (edit.sheet, pos.0, pos.1))
+                    .collect(),
+            )
+        } else {
+            RecalcScope::None
+        };
+        let invalidate_deps = edit.names.is_some();
+        let invalidate_render_caches = !edit.is_empty();
+        let touched_sheets = if edit.is_empty() {
+            Vec::new()
+        } else {
+            vec![edit.sheet]
+        };
+        Self {
+            label: label.into(),
+            focus,
+            delta: TxDelta::Meta(Box::new(edit)),
+            effects: TxEffects {
+                recalc,
+                invalidate_deps,
+                invalidate_render_caches,
+                coord_changed: false,
+                structural: false,
+                detached_sources: false,
+                revision_deltas: Vec::new(),
+                touched_sheets,
+                new_focus: None,
+            },
+            by_site: 0,
+        }
+    }
+
+    /// Wrap a pre-built [`ChartUndoEdit`] as a unified [`TxCommit`].
+    pub fn from_chart(
+        label: impl Into<String>,
+        focus: (usize, u32, u32),
+        edit: ChartUndoEdit,
+    ) -> Self {
+        let sheet = edit.sheet;
+        Self {
+            label: label.into(),
+            focus,
+            delta: TxDelta::Chart(Box::new(edit)),
+            effects: TxEffects {
+                recalc: RecalcScope::None,
+                invalidate_deps: false,
+                invalidate_render_caches: true,
+                coord_changed: false,
+                structural: false,
+                detached_sources: false,
+                revision_deltas: Vec::new(),
+                touched_sheets: vec![sheet],
+                new_focus: None,
+            },
+            by_site: 0,
+        }
+    }
+
+    /// Wrap a pre-built [`PivotUndoEdit`] as a unified [`TxCommit`].
+    pub fn from_pivot(
+        label: impl Into<String>,
+        focus: (usize, u32, u32),
+        edit: PivotUndoEdit,
+    ) -> Self {
+        let has_inserted_sheet = edit.inserted_sheet.is_some();
+        let touched_cells: Vec<(usize, u32, u32)> = edit
+            .deltas
+            .iter()
+            .map(|d| (d.sheet, d.row, d.col))
+            .collect();
+        let recalc = if has_inserted_sheet {
+            RecalcScope::Full
+        } else if !touched_cells.is_empty() {
+            RecalcScope::Cells(touched_cells)
+        } else {
+            RecalcScope::None
+        };
+        let sheet = edit.target_sheet;
+        Self {
+            label: label.into(),
+            focus,
+            delta: TxDelta::Pivot(Box::new(edit)),
+            effects: TxEffects {
+                recalc,
+                invalidate_deps: has_inserted_sheet,
+                invalidate_render_caches: true,
+                coord_changed: has_inserted_sheet,
+                structural: has_inserted_sheet,
+                detached_sources: false,
+                revision_deltas: Vec::new(),
+                touched_sheets: vec![sheet],
+                new_focus: None,
+            },
+            by_site: 0,
+        }
+    }
+
+    /// Wrap pre-captured structural before/after snapshots as a unified [`TxCommit`].
+    pub fn from_structure(
+        label: impl Into<String>,
+        focus: (usize, u32, u32),
+        before: StructureSnapshot,
+        after: StructureSnapshot,
+        effects: TxEffects,
+    ) -> Self {
+        let history = StructureHistory::record(before, after);
+        Self {
+            label: label.into(),
+            focus,
+            delta: TxDelta::Structure(history),
+            effects,
+            by_site: 0,
+        }
+    }
+
+    /// Override post-commit [`TxEffects`] on a [`TxCommit`].
+    pub fn with_effects(mut self, effects: TxEffects) -> Self {
+        self.effects = effects;
+        self
+    }
 }
 
 /// Single authoritative entry point for atomic workbook-level structural,
@@ -499,6 +772,99 @@ impl WorkbookTx {
                     Ok(())
                 }
             },
+            TxIntent::DefinedNames(names) => match names {
+                DefinedNameIntent::Define { name, scope, .. } => {
+                    let trimmed = name.trim();
+                    if trimmed.is_empty() {
+                        return Err(TxError::InvalidDefinedName);
+                    }
+                    if scope.is_some_and(|i| i >= wb.sheets.len()) {
+                        return Err(TxError::InvalidSheet);
+                    }
+                    if wb
+                        .names
+                        .iter()
+                        .any(|(n, sc, _)| *sc == *scope && n.eq_ignore_ascii_case(trimmed))
+                    {
+                        return Err(TxError::DuplicateDefinedName);
+                    }
+                    Ok(())
+                }
+                DefinedNameIntent::Update {
+                    index,
+                    name,
+                    scope,
+                    formula,
+                } => {
+                    let Some(existing) = wb.names.get(*index) else {
+                        return Err(TxError::InvalidDefinedName);
+                    };
+                    let trimmed = name.trim();
+                    if trimmed.is_empty() {
+                        return Err(TxError::InvalidDefinedName);
+                    }
+                    if scope.is_some_and(|i| i >= wb.sheets.len()) {
+                        return Err(TxError::InvalidSheet);
+                    }
+                    if wb.names.iter().enumerate().any(|(k, (n, sc, _))| {
+                        k != *index && *sc == *scope && n.eq_ignore_ascii_case(trimmed)
+                    }) {
+                        return Err(TxError::DuplicateDefinedName);
+                    }
+                    if existing.0 == trimmed
+                        && existing.1 == *scope
+                        && existing.2 == formula.trim()
+                    {
+                        return Err(TxError::NoOp);
+                    }
+                    Ok(())
+                }
+                DefinedNameIntent::Remove { index } => {
+                    if *index >= wb.names.len() {
+                        return Err(TxError::InvalidDefinedName);
+                    }
+                    Ok(())
+                }
+                DefinedNameIntent::ReplaceAll { names } => {
+                    let mut seen = std::collections::HashSet::with_capacity(names.len());
+                    for (name, scope, _) in names {
+                        let trimmed = name.trim();
+                        if trimmed.is_empty() {
+                            return Err(TxError::InvalidDefinedName);
+                        }
+                        if scope.is_some_and(|i| i >= wb.sheets.len()) {
+                            return Err(TxError::InvalidSheet);
+                        }
+                        if !seen.insert((*scope, trimmed.to_ascii_lowercase())) {
+                            return Err(TxError::DuplicateDefinedName);
+                        }
+                    }
+                    if names.len() == wb.names.len()
+                        && names
+                            .iter()
+                            .zip(&wb.names)
+                            .all(|((n, sc, f), (en, esc, ef))| {
+                                n.trim() == en && sc == esc && f == ef
+                            })
+                    {
+                        return Err(TxError::NoOp);
+                    }
+                    Ok(())
+                }
+            },
+            TxIntent::CellBatch(batch) => {
+                if wb.sheets.get(batch.sheet).is_none() {
+                    return Err(TxError::InvalidSheet);
+                }
+                if batch
+                    .writes
+                    .iter()
+                    .any(|w| w.row >= crate::sync::MAX_ROWS || w.col >= crate::sync::MAX_COLS)
+                {
+                    return Err(TxError::InvalidCellCoord);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -524,6 +890,8 @@ impl WorkbookTx {
         match intent {
             TxIntent::Transform(tx) => Self::execute_transform(wb, tx, label, focus),
             TxIntent::SheetTab(tab) => Self::execute_sheet_tab(wb, tab, label, focus),
+            TxIntent::DefinedNames(names) => Self::execute_defined_names(wb, names, label, focus),
+            TxIntent::CellBatch(batch) => Self::execute_cell_batch(wb, batch, label, focus),
         }
     }
 
@@ -1006,6 +1374,148 @@ impl WorkbookTx {
                 })
             }
         }
+    }
+
+    fn execute_defined_names(
+        wb: &mut Workbook,
+        names: DefinedNameIntent,
+        label: String,
+        focus: (usize, u32, u32),
+    ) -> Result<TxCommit, TxError> {
+        let before = wb.names.clone();
+        match names {
+            DefinedNameIntent::Define {
+                name,
+                scope,
+                formula,
+            } => {
+                wb.names
+                    .push((name.trim().to_string(), scope, formula.trim().to_string()));
+            }
+            DefinedNameIntent::Update {
+                index,
+                name,
+                scope,
+                formula,
+            } => {
+                wb.names[index] = (name.trim().to_string(), scope, formula.trim().to_string());
+            }
+            DefinedNameIntent::Remove { index } => {
+                wb.names.remove(index);
+            }
+            DefinedNameIntent::ReplaceAll { names } => {
+                wb.names = names
+                    .into_iter()
+                    .map(|(n, sc, f)| (n.trim().to_string(), sc, f))
+                    .collect();
+            }
+        }
+        let after = wb.names.clone();
+        wb.names_dirty = true;
+        wb.dirty = true;
+        let touched_sheets = (0..wb.sheets.len()).collect();
+        Ok(TxCommit {
+            label,
+            focus,
+            delta: TxDelta::DefinedNames { before, after },
+            effects: TxEffects {
+                recalc: RecalcScope::Full,
+                invalidate_deps: true,
+                invalidate_render_caches: true,
+                coord_changed: false,
+                structural: false,
+                detached_sources: false,
+                revision_deltas: Vec::new(),
+                touched_sheets,
+                new_focus: None,
+            },
+            by_site: 0,
+        })
+    }
+
+    fn execute_cell_batch(
+        wb: &mut Workbook,
+        batch: CellBatchIntent,
+        label: String,
+        focus: (usize, u32, u32),
+    ) -> Result<TxCommit, TxError> {
+        let sheet_idx = batch.sheet;
+        let mut seen = std::collections::HashSet::with_capacity(batch.writes.len());
+        let mut keys = Vec::with_capacity(batch.writes.len());
+        for w in &batch.writes {
+            if seen.insert((w.row, w.col)) {
+                keys.push((w.row, w.col));
+            }
+        }
+        let before = crate::undo::capture(&wb.sheets[sheet_idx], sheet_idx, &keys);
+        {
+            let sh = &mut wb.sheets[sheet_idx];
+            for w in batch.writes {
+                if let Some(cell) = w.cell {
+                    let changed = match sh.get(w.row, w.col) {
+                        Some(cur) => {
+                            cur.formula != cell.formula
+                                || !crate::undo::undo_values_eq(&cur.value, &cell.value)
+                        }
+                        None => !cell.is_blank(),
+                    };
+                    if changed {
+                        if cell.is_blank() {
+                            sh.remove(w.row, w.col);
+                        } else {
+                            sh.set(w.row, w.col, cell);
+                        }
+                    }
+                }
+                if let Some(style) = w.style
+                    && sh.style_of(w.row, w.col) != style
+                {
+                    sh.set_style(w.row, w.col, style);
+                }
+            }
+        }
+        let deltas = crate::undo::finish(before, &wb.sheets[sheet_idx]);
+        let has_changes = !deltas.is_empty();
+        if has_changes {
+            wb.dirty = true;
+        }
+        let touched: Vec<(usize, u32, u32)> =
+            deltas.iter().map(|d| (d.sheet, d.row, d.col)).collect();
+        let recalc = if touched.is_empty() {
+            RecalcScope::None
+        } else {
+            RecalcScope::Cells(touched)
+        };
+        let sheet_ids = if has_changes {
+            vec![(sheet_idx, wb.sheets[sheet_idx].identity)]
+        } else {
+            Vec::new()
+        };
+        let touched_sheets = if has_changes {
+            vec![sheet_idx]
+        } else {
+            Vec::new()
+        };
+        Ok(TxCommit {
+            label,
+            focus,
+            delta: TxDelta::CellBatch {
+                deltas: deltas.clone(),
+                sheet_ids,
+            },
+            effects: TxEffects {
+                recalc,
+                invalidate_deps: false,
+                invalidate_render_caches: has_changes,
+                coord_changed: false,
+                structural: false,
+                detached_sources: false,
+                revision_deltas: deltas,
+                touched_sheets,
+                new_focus: None,
+            },
+            by_site: 0,
+        })
     }
 }
 

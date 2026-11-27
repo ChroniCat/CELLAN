@@ -1029,6 +1029,7 @@ impl CellShiftPatch {
                 pick(&s.before, &s.after, forward).write(src);
             }
         }
+        wb.bump_coord_epoch();
         wb.dirty = true;
         true
     }
