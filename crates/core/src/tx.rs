@@ -20,7 +20,7 @@ use crate::structural::{CellShift, CellShiftConflict, Structural};
 use crate::transform::CoordTransform;
 use crate::undo::{CellDelta, ChartUndoEdit, MetaEdit, PivotUndoEdit, StructureSnapshot};
 
-pub use crate::cell_shift_patch::CellShiftOverlay as TxOverlay;
+pub use crate::cell_shift_patch::{CURRENT_OVERLAY_FORMAT_VERSION, CellShiftOverlay as TxOverlay};
 pub use crate::room_tx::{AxisPermutePatch, DefinedNamesPatch, RoomTxPatch};
 
 /// Sheet-tab structural mutation intent.
@@ -591,6 +591,19 @@ impl TxPatch {
     }
 }
 
+/// Reversible rich-text (`RichRun`) delta for a single cell inside [`TxDelta::CellBatch`],
+/// carrying expected before/after [`Cell`] inputs so even rich-only edits enforce input CAS
+/// in both undo and redo directions.
+#[derive(Clone, Debug)]
+pub struct CellRichDelta {
+    pub row: u32,
+    pub col: u32,
+    pub before_cell: Cell,
+    pub after_cell: Cell,
+    pub before_runs: Option<Vec<crate::richtext::RichRun>>,
+    pub after_runs: Option<Vec<crate::richtext::RichRun>>,
+}
+
 /// Unified reversible CAS payload stored inside `UndoStack`'s `Entry::Tx`.
 #[derive(Debug)]
 pub enum TxDelta {
@@ -622,11 +635,7 @@ pub enum TxDelta {
     CellBatch {
         deltas: Vec<CellDelta>,
         sheet_ids: Vec<(usize, u64)>,
-        rich: Vec<(
-            (u32, u32),
-            Option<Vec<crate::richtext::RichRun>>,
-            Option<Vec<crate::richtext::RichRun>>,
-        )>,
+        rich: Vec<CellRichDelta>,
     },
 }
 
@@ -1546,12 +1555,17 @@ impl WorkbookTx {
             }
         }
         let before = crate::undo::capture(&wb.sheets[sheet_idx], sheet_idx, &keys);
-        let mut before_rich: Vec<((u32, u32), Option<Vec<crate::richtext::RichRun>>)> = Vec::new();
+        let mut before_rich: Vec<((u32, u32), Cell, Option<Vec<crate::richtext::RichRun>>)> =
+            Vec::new();
         if !wb.sheets[sheet_idx].rich.is_empty() {
             let sh = &wb.sheets[sheet_idx];
             for &pos in &keys {
                 if let Some(runs) = sh.rich.get(&pos) {
-                    before_rich.push((pos, Some(runs.clone())));
+                    let before_cell = sh
+                        .get(pos.0, pos.1)
+                        .map(|c| c.into_owned())
+                        .unwrap_or_default();
+                    before_rich.push((pos, before_cell, Some(runs.clone())));
                 }
             }
         }
@@ -1585,10 +1599,21 @@ impl WorkbookTx {
         let mut rich = Vec::new();
         if !before_rich.is_empty() {
             let sh = &wb.sheets[sheet_idx];
-            for (pos, prev) in before_rich {
+            for (pos, before_cell, prev) in before_rich {
                 let after = sh.rich.get(&pos).cloned();
                 if prev != after {
-                    rich.push((pos, prev, after));
+                    let after_cell = sh
+                        .get(pos.0, pos.1)
+                        .map(|c| c.into_owned())
+                        .unwrap_or_default();
+                    rich.push(CellRichDelta {
+                        row: pos.0,
+                        col: pos.1,
+                        before_cell,
+                        after_cell,
+                        before_runs: prev,
+                        after_runs: after,
+                    });
                 }
             }
         }

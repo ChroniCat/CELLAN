@@ -2,7 +2,7 @@
 mod merge_history;
 mod overlay;
 use merge_history::MergeHistory;
-pub use overlay::CellShiftOverlay;
+pub use overlay::{CURRENT_OVERLAY_FORMAT_VERSION, CellShiftOverlay};
 
 use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;

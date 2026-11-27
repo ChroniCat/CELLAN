@@ -865,6 +865,7 @@ fn sync_room_tx_messages_peer_axis_permute_and_lock_table() {
             binary_v3: true,
             compact_v3: true,
             room_tx: true,
+            full_tx_overlay: true,
         },
         Msg::Welcome {
             site: 1,
@@ -885,6 +886,7 @@ fn sync_room_tx_messages_peer_axis_permute_and_lock_table() {
             compact_v3: true,
             acked_op_ts: 0,
             room_tx: true,
+            full_tx_overlay: true,
         },
         Msg::RoomTxRequest {
             site: 2,
@@ -1463,4 +1465,163 @@ fn tx_overlay_legacy_json_preserves_baseline_and_wire_valid_bounds_new_fields() 
         "source": [0, 0, 1, 1]
     }]);
     assert!(!serde_json::from_value::<TxOverlay>(bad_piv).unwrap().wire_valid());
+}
+
+#[test]
+fn sync_full_tx_overlay_negotiation_wire_compat_and_future_overlay_version_rejected() {
+    use sheetcore::cell_shift_patch::CURRENT_OVERLAY_FORMAT_VERSION;
+    use sheetcore::table::Table;
+    use sheetcore::tx::TxOverlay;
+
+    // 1. Legacy JSON lacking `full_tx_overlay` defaults to `false` while preserving
+    //    `room_tx` and `cell_shifts` (`cell_shifts_v2`).
+    let legacy_hello: Msg = serde_json::from_str(
+        r#"{"t":"Hello","site":3,"name":"Peer","doc":"book","proof":"ok","cell_shifts_v2":true,"room_tx":true}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        legacy_hello,
+        Msg::Hello {
+            cell_shifts: true,
+            room_tx: true,
+            full_tx_overlay: false,
+            ..
+        }
+    ));
+    assert!(legacy_hello.is_within_limits());
+
+    let legacy_welcome: Msg = serde_json::from_str(
+        r#"{"t":"Welcome","site":3,"doc":"book","peers":[],"cell_shifts_v2":true,"room_tx":true}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        legacy_welcome,
+        Msg::Welcome {
+            cell_shifts: true,
+            room_tx: true,
+            full_tx_overlay: false,
+            ..
+        }
+    ));
+    assert!(legacy_welcome.is_within_limits());
+
+    // 2. New JSON carrying `full_tx_overlay: true` roundtrips cleanly.
+    let new_hello = Msg::Hello {
+        site: 4,
+        name: "NewPeer".into(),
+        doc: "book".into(),
+        proof: "ok".into(),
+        auth: String::new(),
+        base_hash: String::new(),
+        cell_shifts: true,
+        sort_permutation: true,
+        palette_styles: true,
+        resume_room: String::new(),
+        resume_watermark: 0,
+        resume_struct_rev: 0,
+        binary_v3: true,
+        compact_v3: true,
+        room_tx: true,
+        full_tx_overlay: true,
+    };
+    let hello_json = serde_json::to_string(&new_hello).unwrap();
+    let decoded_hello: Msg = serde_json::from_str(&hello_json).unwrap();
+    assert!(matches!(
+        decoded_hello,
+        Msg::Hello {
+            cell_shifts: true,
+            room_tx: true,
+            full_tx_overlay: true,
+            ..
+        }
+    ));
+    assert!(decoded_hello.is_within_limits());
+
+    let new_welcome = Msg::Welcome {
+        site: 4,
+        doc: "book".into(),
+        peers: vec![],
+        delta_sync: true,
+        batch_ops: true,
+        cell_shifts: true,
+        sort_permutation: true,
+        structural_ack: true,
+        thread_changes: true,
+        clock: 0,
+        palette_styles: true,
+        room_id: "r1".into(),
+        watermark: 0,
+        structure_revision: 0,
+        binary_v3: true,
+        compact_v3: true,
+        acked_op_ts: 0,
+        room_tx: true,
+        full_tx_overlay: true,
+    };
+    let welcome_json = serde_json::to_string(&new_welcome).unwrap();
+    let decoded_welcome: Msg = serde_json::from_str(&welcome_json).unwrap();
+    assert!(matches!(
+        decoded_welcome,
+        Msg::Welcome {
+            cell_shifts: true,
+            room_tx: true,
+            full_tx_overlay: true,
+            ..
+        }
+    ));
+    assert!(decoded_welcome.is_within_limits());
+
+    // 3. TxOverlay format_version checks:
+    //    - current version == CURRENT_OVERLAY_FORMAT_VERSION: valid & full state
+    //    - legacy version == 0: valid & NOT full state
+    //    - unknown future versions (> CURRENT_OVERLAY_FORMAT_VERSION): strictly rejected by
+    //      `wire_valid()` AND `apply_to()` without mutating `wb`.
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].tables.push(Table {
+        name: "T1".into(),
+        display: "T1".into(),
+        range: (0, 0, 2, 1),
+        columns: vec!["A".into(), "B".into()],
+        ..Table::default()
+    });
+    wb.sheets[0].rows.set(0, 60.0);
+    wb.dirty = false;
+    let epoch_before = wb.coord_epoch();
+
+    let current = TxOverlay::capture(&wb);
+    assert_eq!(current.format_version(), CURRENT_OVERLAY_FORMAT_VERSION);
+    assert!(current.is_full_state());
+    assert!(current.wire_valid());
+
+    let mut legacy_json = serde_json::to_value(&current).unwrap();
+    legacy_json.as_object_mut().unwrap().remove("format_version");
+    let legacy: TxOverlay = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(legacy.format_version(), 0);
+    assert!(!legacy.is_full_state());
+    assert!(legacy.wire_valid());
+
+    for future_ver in [
+        CURRENT_OVERLAY_FORMAT_VERSION + 1,
+        CURRENT_OVERLAY_FORMAT_VERSION.saturating_add(5),
+        u8::MAX,
+    ] {
+        let mut future_json = serde_json::to_value(&TxOverlay::capture(&Workbook::new_blank())).unwrap();
+        future_json["format_version"] = serde_json::json!(future_ver);
+        let future: TxOverlay = serde_json::from_value(future_json).unwrap();
+        assert_eq!(future.format_version(), future_ver);
+        assert!(!future.is_full_state());
+        assert!(
+            !future.wire_valid(),
+            "future format_version {future_ver} must be rejected by wire_valid()"
+        );
+        assert!(
+            !future.apply_to(&mut wb),
+            "future format_version {future_ver} must be rejected by apply_to()"
+        );
+        assert_eq!(wb.coord_epoch(), epoch_before);
+        assert!(!wb.dirty);
+        assert_eq!(wb.sheets[0].tables.len(), 1);
+        assert_eq!(wb.sheets[0].tables[0].name, "T1");
+        assert!((wb.sheets[0].rows.size(0) - 60.0).abs() < 1e-3);
+    }
 }
