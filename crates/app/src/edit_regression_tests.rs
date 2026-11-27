@@ -14070,6 +14070,396 @@ fn phase3_tx_sheet_tab_undo_redo_preserves_other_sheet_views_without_index_corru
     assert!((app.zoom - 1.75).abs() < f32::EPSILON);
 }
 
+#[test]
+fn phase4_tx_defined_names_name_box_and_manager_recalc_and_undo_redo() {
+    let _env = crate::test_env::TestEnv::new("p4-tx-defined-names");
+    let mut app = app();
+    app.wb.sheets[0].set(0, 0, number(10.0));
+    app.wb.sheets[0].set(1, 0, number(25.0));
+    app.wb.sheets[0].set(2, 0, number(100.0));
+    app.wb.sheets[0].set(0, 1, formula("=SUM(Q1_Sales)"));
+    sheetcore::formula::recalc_all(&mut app.wb);
+
+    // 1) Name Box defines Q1_Sales on A1:A2 via WorkbookTx -> names_dirty + recalc + Undo/Redo.
+    app.sel = (0, 0);
+    app.sel_end = (1, 0);
+    app.wb.names_dirty = false;
+    app.wb.dirty = false;
+    app.cf_stats_gen = 19;
+    app.invalid_gen = 19;
+    let gen0 = app.doc_gen;
+    app.name_buf = "Q1_Sales".into();
+    app.goto_name();
+    assert!(app.wb.names_dirty && app.wb.dirty);
+    assert_ne!(app.doc_gen, gen0);
+    assert_eq!(app.cf_stats_gen, u64::MAX);
+    assert_eq!(app.invalid_gen, u64::MAX);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(35.0));
+    assert_eq!(app.wb.names.len(), 1);
+    assert_eq!(app.wb.names[0].0, "Q1_Sales");
+
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert!(app.wb.names.is_empty());
+    assert_eq!(app.wb.sheet(0).value(0, 1).display(), "#NAME?");
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.wb.names.len(), 1);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(35.0));
+
+    // 2) Duplicate name rejected atomically by WorkbookTx (case-insensitive within same scope).
+    let depth_before_dup = app.undo.depth();
+    let dup_res = app.execute_local_tx(
+        sheetcore::tx::TxIntent::from_defined_names(
+            sheetcore::tx::DefinedNameIntent::Define {
+                name: "q1_sales".into(),
+                scope: None,
+                formula: "Sheet1!$A$3".into(),
+            },
+        ),
+        Some("编辑名称".into()),
+        (0, 0, 0),
+    );
+    assert_eq!(dup_res.unwrap_err(), sheetcore::tx::TxError::DuplicateDefinedName);
+    assert_eq!(app.undo.depth(), depth_before_dup);
+    assert_eq!(app.wb.names.len(), 1);
+
+    // 3) Update existing defined name (keeping same name, expanding range to A1:A3) -> recalc + Undo/Redo.
+    let update_res = app.execute_local_tx(
+        sheetcore::tx::TxIntent::from_defined_names(
+            sheetcore::tx::DefinedNameIntent::Update {
+                index: 0,
+                name: "Q1_Sales".into(),
+                scope: None,
+                formula: "Sheet1!$A$1:$A$3".into(),
+            },
+        ),
+        Some("编辑名称".into()),
+        (0, 0, 0),
+    );
+    assert!(update_res.is_ok());
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(135.0));
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(35.0));
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(135.0));
+
+    // 4) Remove defined name -> recalc to #NAME?, Undo restores 135.0.
+    let rm_res = app.execute_local_tx(
+        sheetcore::tx::TxIntent::from_defined_names(
+            sheetcore::tx::DefinedNameIntent::Remove { index: 0 },
+        ),
+        Some("删除名称".into()),
+        (0, 0, 0),
+    );
+    assert!(rm_res.is_ok());
+    assert!(app.wb.names.is_empty());
+    assert_eq!(app.wb.sheet(0).value(0, 1).display(), "#NAME?");
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.names.len(), 1);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(135.0));
+}
+
+#[test]
+fn phase4_tx_chart_pivot_validation_autofit_undo_redo_and_caches() {
+    let _env = crate::test_env::TestEnv::new("p4-tx-ui-modules");
+    let mut app = app();
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(0, 0, text("Region"));
+        sh.set(0, 1, text("Sales"));
+        sh.set(1, 0, text("East"));
+        sh.set(1, 1, number(120.0));
+        sh.set(2, 0, text("West"));
+        sh.set(2, 1, number(230.0));
+    }
+
+    // 1) chart_ui via commit_chart_tx -> dirty/doc_gen/cache invalidation + Undo/Redo.
+    app.sel = (0, 0);
+    app.sel_end = (2, 1);
+    app.open_chart_create_wizard(Some(sheetcore::charts::ChartKind::Column));
+    let wiz = app.chart_studio.wizard.take().expect("chart wizard");
+    app.wb.dirty = false;
+    app.cf_stats_gen = 51;
+    app.invalid_gen = 51;
+    let gen0 = app.doc_gen;
+    app.insert_chart_in_memory(wiz.preview_chart);
+    assert!(app.wb.dirty && app.doc_gen != gen0);
+    assert_eq!(app.cf_stats_gen, u64::MAX);
+    assert_eq!(app.invalid_gen, u64::MAX);
+    assert_eq!(app.wb.sheet(0).charts.len(), 1);
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert!(app.wb.sheet(0).charts.is_empty());
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).charts.len(), 1);
+
+    // 2) pivot_ui via commit_pivot_tx (new sheet) -> advances coord_epoch + clears popups + Undo/Redo.
+    app.sel = (0, 0);
+    app.sel_end = (2, 1);
+    app.open_pivot_create_wizard(Some((0, 0, 2, 1)));
+    let mut pwiz = app.pivot_ui.create_wizard.take().expect("pivot wizard");
+    pwiz.dest_new_sheet = true;
+    app.pivot_ui.options_pivot_id = Some(999);
+    let ep0 = app.wb.coord_epoch();
+    app.create_pivot_from_wizard(pwiz);
+    let ep1 = app.wb.coord_epoch();
+    assert!(ep1 > ep0, "creating pivot on new sheet must advance coord_epoch");
+    assert_eq!(app.last_seen_coord_epoch, ep1);
+    assert!(app.pivot_ui.options_pivot_id.is_none());
+    assert_eq!(app.wb.sheets.len(), 2);
+    assert_eq!(app.wb.pivots.len(), 1);
+    assert!(app.apply_undo(false), "{}", app.status);
+    let ep2 = app.wb.coord_epoch();
+    assert!(ep2 > ep1, "undoing pivot with inserted sheet must advance coord_epoch");
+    assert_eq!(app.last_seen_coord_epoch, ep2);
+    assert_eq!(app.wb.sheets.len(), 1);
+    assert!(app.wb.pivots.is_empty());
+    assert!(app.apply_undo(true), "{}", app.status);
+    let ep3 = app.wb.coord_epoch();
+    assert!(ep3 > ep2, "redoing pivot with inserted sheet must advance coord_epoch");
+    assert_eq!(app.last_seen_coord_epoch, ep3);
+    assert_eq!(app.wb.sheets.len(), 2);
+    assert_eq!(app.wb.pivots.len(), 1);
+
+    // 3) validation.rs & wps_tools.rs via commit_meta_tx -> dirty/doc_gen/invalid_gen + Undo/Redo.
+    app.sheet_idx = 0;
+    app.sel = (4, 0);
+    app.sel_end = (4, 0);
+    app.wb.dirty = false;
+    app.invalid_gen = 61;
+    let gen_dv = app.doc_gen;
+    assert!(app.replace_validation_rule(
+        (4, 0, 4, 0),
+        Some(sheetcore::dv::DataValidation {
+            kind: sheetcore::dv::DvKind::List,
+            f1: "\"A,B\"".into(),
+            ..Default::default()
+        }),
+    ));
+    assert!(app.wb.dirty && app.doc_gen != gen_dv);
+    assert_eq!(app.invalid_gen, u64::MAX);
+    assert_eq!(app.wb.sheet(0).dv.len(), 1);
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert!(app.wb.sheet(0).dv.is_empty());
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).dv.len(), 1);
+
+    app.sel = (5, 0);
+    app.sel_end = (6, 0);
+    app.invalid_gen = 62;
+    app.reject_duplicates();
+    assert_eq!(app.invalid_gen, u64::MAX);
+    assert_eq!(app.wb.sheet(0).dv.len(), 2);
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).dv.len(), 1);
+
+    // 4) autofit.rs wrap row-height via commit_meta_tx + Undo/Redo.
+    let wrap_sid = app.wb.styles.intern(sheetcore::style::CellStyle {
+        wrap: true,
+        ..Default::default()
+    });
+    app.wb.sheet_mut(0).set(8, 0, text("Line1\nLine2\nLine3\nLine4"));
+    app.wb.sheet_mut(0).set_style(8, 0, wrap_sid);
+    let h_before = app.wb.sheet(0).rows.size(8);
+    app.sel = (8, 0);
+    app.sel_end = (8, 0);
+    app.wb.dirty = false;
+    let gen_af = app.doc_gen;
+    app.autofit_sel_rows_for_wrap();
+    let h_after = app.wb.sheet(0).rows.size(8);
+    assert!(h_after > h_before);
+    assert!(app.wb.dirty && app.doc_gen != gen_af);
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert!((app.wb.sheet(0).rows.size(8) - h_before).abs() < 0.01);
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert!((app.wb.sheet(0).rows.size(8) - h_after).abs() < 0.01);
+}
+
+#[test]
+fn phase4_tx_ai_agent_cell_batch_and_comments_meta_undo_recalc_revision() {
+    let env = crate::test_env::TestEnv::new("p4-tx-ai-agent");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.wb.path = Some(env.path("p4_ai.xlsx"));
+    app.ai.bound_doc_uid = Some(app.doc_uid);
+    app.ai.messages.push(crate::ai_agent::AiMessage {
+        role: crate::ai_agent::AiRole::Assistant,
+        content: String::new(),
+        reasoning: String::new(),
+        reasoning_open: false,
+        tool_logs: Vec::new(),
+        error: None,
+        undo_ids: Vec::new(),
+    });
+
+    let rev0 = app.rev.len();
+    // 1) AI set_cells (values + style) via CellBatchIntent / execute_cell_batch_tx.
+    let tc1 = crate::ai_agent::ToolCallSpec {
+        name: "set_cells".into(),
+        arguments: serde_json::json!({
+            "edits": [
+                {"cell": "A1", "value": 10, "bold": true},
+                {"cell": "A2", "value": 20, "format": "#,##0.00"}
+            ]
+        }),
+    };
+    let _ = app.execute_ai_tool(&tc1, &ctx);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(10.0));
+    assert_eq!(app.wb.sheet(0).value(1, 0), Value::Number(20.0));
+    assert!(app.wb.styles.get(app.wb.sheet(0).style_of(0, 0)).bold);
+    assert_eq!(app.wb.styles.get(app.wb.sheet(0).style_of(1, 0)).format, "#,##0.00");
+    assert!(app.rev.len() > rev0, "AI set_cells must record revision deltas");
+
+    // 2) AI fill_formula_range via CellBatchIntent / execute_cell_batch_tx.
+    let rev1 = app.rev.len();
+    let tc2 = crate::ai_agent::ToolCallSpec {
+        name: "fill_formula_range".into(),
+        arguments: serde_json::json!({
+            "range": "B1:B2",
+            "top_left_formula": "=A1*3"
+        }),
+    };
+    let _ = app.execute_ai_tool(&tc2, &ctx);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(30.0));
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(60.0));
+    assert!(app.rev.len() > rev1, "AI fill_formula_range must record revision deltas");
+
+    // 3) Later non-overlapping user edit on D10: AI group undo (`prepare_group_undo`)
+    //    must still commute past D10 because `TxDelta::CellBatch` participates in `simple_cells()`.
+    app.sel = (9, 3);
+    app.sel_end = (9, 3);
+    app.begin_edit(Some("999".into()));
+    assert!(app.commit_edit(None));
+    assert_eq!(app.wb.sheet(0).value(9, 3), Value::Number(999.0));
+
+    app.undo_last_ai_change();
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(1, 0), Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Empty);
+    assert_eq!(
+        app.wb.sheet(0).value(9, 3),
+        Value::Number(999.0),
+        "non-overlapping manual edit must remain intact when commuting AI CellBatch undo"
+    );
+
+    // 4) AI manage_comments via commit_meta_tx + Undo/Redo.
+    let tc3 = crate::ai_agent::ToolCallSpec {
+        name: "manage_comments".into(),
+        arguments: serde_json::json!({
+            "ops": [
+                {"cell": "C1", "action": "set", "text": "核对口径"}
+            ]
+        }),
+    };
+    let _ = app.execute_ai_tool(&tc3, &ctx);
+    let c1 = sheetcore::CellRef::new(0, 2);
+    assert!(app.wb.sheet(0).notes.contains_key(&c1));
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert!(!app.wb.sheet(0).notes.contains_key(&c1));
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert!(app.wb.sheet(0).notes.contains_key(&c1));
+}
+
+#[test]
+fn phase4_tx_coord_epoch_monotonic_across_local_undo_and_room_cell_shift() {
+    let _env = crate::test_env::TestEnv::new("p4-tx-coord-epoch");
+    let mut app = app();
+    app.wb.sheets[0].set(1, 0, number(10.0));
+    app.wb.sheets[0].set(2, 0, number(20.0));
+    app.wb.sheets[0].set(3, 0, number(30.0));
+
+    let mut prev_epoch = app.wb.coord_epoch();
+    assert_eq!(app.last_seen_coord_epoch, prev_epoch);
+    let mut assert_advanced = |app: &mut SheetApp, step: &str| {
+        let cur = app.wb.coord_epoch();
+        assert!(
+            cur > prev_epoch,
+            "{step}: expected coord_epoch to advance monotonically ({cur} <= {prev_epoch})"
+        );
+        assert_eq!(
+            app.last_seen_coord_epoch, cur,
+            "{step}: SheetApp::last_seen_coord_epoch must stay synced"
+        );
+        assert_eq!(app.cf_stats_gen, u64::MAX, "{step}: cf_stats_gen must invalidate");
+        assert_eq!(app.invalid_gen, u64::MAX, "{step}: invalid_gen must invalidate");
+        prev_epoch = cur;
+    };
+
+    // 1) Local Structural InsertRows
+    app.cf_stats_gen = 1;
+    app.invalid_gen = 1;
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 1, n: 1 });
+    assert_advanced(&mut app, "Structural::InsertRows");
+
+    // 2) Local CellShift (insert down)
+    app.cf_stats_gen = 2;
+    app.invalid_gen = 2;
+    app.sel = (2, 0);
+    app.sel_end = (2, 0);
+    app.shift_cells(true, false);
+    assert_advanced(&mut app, "CellShift");
+
+    // 3) Local AxisPermute (move_axis_headers)
+    app.cf_stats_gen = 3;
+    app.invalid_gen = 3;
+    assert!(app.move_axis_headers(true, 3, 1, 1));
+    assert_advanced(&mut app, "AxisPermute");
+
+    // 4) Local SheetTab (add_sheet + rename)
+    app.cf_stats_gen = 4;
+    app.invalid_gen = 4;
+    app.add_sheet();
+    assert_advanced(&mut app, "SheetTab::Append");
+
+    app.cf_stats_gen = 5;
+    app.invalid_gen = 5;
+    assert!(app.set_sheet_name(1, "Summary"));
+    assert_advanced(&mut app, "SheetTab::Rename");
+
+    // 5) Undo & Redo must advance coord_epoch monotonically (never roll back)
+    app.cf_stats_gen = 6;
+    app.invalid_gen = 6;
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_advanced(&mut app, "Undo SheetTab::Rename");
+
+    app.cf_stats_gen = 7;
+    app.invalid_gen = 7;
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_advanced(&mut app, "Redo SheetTab::Rename");
+
+    // 6) Room CellShiftCommitted (Forward & Undo) via commit_room_cell_shift
+    let shift = sheetcore::structural::CellShift::new(
+        (1, 0, 1, 0),
+        sheetcore::cells::Shift::Vertical,
+        true,
+    );
+    let patch = std::sync::Arc::new(
+        sheetcore::cell_shift_patch::CellShiftPatch::prepare(&app.wb, 0, shift)
+            .expect("prepare room CellShiftPatch"),
+    );
+    app.cf_stats_gen = 8;
+    app.invalid_gen = 8;
+    assert!(app.commit_room_cell_shift(
+        2,
+        101,
+        sheetcore::sync::CellShiftPhase::Forward,
+        patch.clone(),
+        1,
+    ));
+    assert_advanced(&mut app, "Room CellShiftCommitted Forward");
+
+    app.cf_stats_gen = 9;
+    app.invalid_gen = 9;
+    assert!(app.commit_room_cell_shift(
+        2,
+        101,
+        sheetcore::sync::CellShiftPhase::Undo,
+        patch,
+        50,
+    ));
+    assert_advanced(&mut app, "Room CellShiftCommitted Undo");
+}
+
+
 
 
 

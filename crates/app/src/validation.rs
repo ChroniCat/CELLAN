@@ -257,7 +257,7 @@ impl SheetApp {
         };
         sheet.dv_dirty = true;
         let after_dv = sheet.dv.clone();
-        self.undo.push_meta(
+        self.commit_meta_tx(
             label,
             (si, rect.0, rect.1),
             sheetcore::undo::MetaEdit {
@@ -265,10 +265,10 @@ impl SheetApp {
                 dv: Some((before_dv, after_dv)),
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            true,
+            Vec::new(),
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.tasks.last_edit = Some(std::time::Instant::now());
         true
     }
 

@@ -339,7 +339,7 @@ impl SheetApp {
         let charts_after = sh.charts.clone();
         let deleted_after = sh.deleted_charts.clone();
 
-        self.undo.push_chart_edit(
+        self.commit_chart_tx(
             format!("插入{kind_label}"),
             (sh_idx, self.sel.0, self.sel.1),
             ChartUndoEdit {
@@ -350,8 +350,6 @@ impl SheetApp {
                 deleted_after,
             },
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.chart_sel = Some(new_idx);
         self.pic_sel = None;
         self.tb_sel = None;
@@ -391,20 +389,19 @@ impl SheetApp {
         if !changed {
             return false;
         }
-        let sh = &self.wb.sheets[sh_idx];
-        self.undo.push_chart_edit(
+        let charts_after = self.wb.sheets[sh_idx].charts.clone();
+        let deleted_after = self.wb.sheets[sh_idx].deleted_charts.clone();
+        self.commit_chart_tx(
             label,
             (sh_idx, self.sel.0, self.sel.1),
             ChartUndoEdit {
                 sheet: sh_idx,
                 charts_before,
-                charts_after: sh.charts.clone(),
+                charts_after,
                 deleted_before,
-                deleted_after: sh.deleted_charts.clone(),
+                deleted_after,
             },
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         true
     }
 
@@ -451,15 +448,17 @@ impl SheetApp {
         if sh.charts == charts_before && sh.deleted_charts == deleted_before {
             return;
         }
-        self.undo.push_chart_edit(
+        let charts_after = sh.charts.clone();
+        let deleted_after = sh.deleted_charts.clone();
+        self.commit_chart_tx(
             label,
             (sh_idx, self.sel.0, self.sel.1),
             ChartUndoEdit {
                 sheet: sh_idx,
                 charts_before,
-                charts_after: sh.charts.clone(),
+                charts_after,
                 deleted_before,
-                deleted_after: sh.deleted_charts.clone(),
+                deleted_after,
             },
         );
     }
@@ -483,20 +482,19 @@ impl SheetApp {
             sh.charts_dirty = true;
             ch
         };
-        let sh = &self.wb.sheets[sh_idx];
-        self.undo.push_chart_edit(
+        let charts_after = self.wb.sheets[sh_idx].charts.clone();
+        let deleted_after = self.wb.sheets[sh_idx].deleted_charts.clone();
+        self.commit_chart_tx(
             "删除图表",
             (sh_idx, self.sel.0, self.sel.1),
             ChartUndoEdit {
                 sheet: sh_idx,
                 charts_before,
-                charts_after: sh.charts.clone(),
+                charts_after,
                 deleted_before,
-                deleted_after: sh.deleted_charts.clone(),
+                deleted_after,
             },
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         if self.chart_sel == Some(idx) {
             self.chart_sel = None;
             self.chart_studio.sidebar_open = false;

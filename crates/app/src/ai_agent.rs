@@ -967,34 +967,32 @@ impl SheetApp {
             return Err(("写入被保护/锁定拒绝".into(), json!({"ok": false, "error": self.status})));
         }
 
-        let before = sheetcore::undo::capture(self.wb.sheet(si), si, &keys);
+        let mut writes = Vec::with_capacity(parsed.len());
+        let mut pending_styles: std::collections::HashMap<(u32, u32), u16> =
+            std::collections::HashMap::new();
         let mut wire_styles = Vec::new();
         for ed in &parsed {
-            if let Some(f) = &ed.formula {
-                self.wb.sheet_mut(si).set(
-                    ed.r,
-                    ed.c,
-                    Cell {
-                        value: Value::Empty,
-                        formula: Some(f.clone().into()),
-                    },
-                );
+            let cell = if let Some(f) = &ed.formula {
+                Some(Cell {
+                    value: Value::Empty,
+                    formula: Some(f.clone().into()),
+                })
             } else if let Some(v) = &ed.val {
-                if *v == Value::Empty {
-                    let _ = self.wb.sheet_mut(si).remove(ed.r, ed.c);
-                } else {
-                    self.wb.sheet_mut(si).set(
-                        ed.r,
-                        ed.c,
-                        Cell {
-                            value: v.clone(),
-                            formula: None,
-                        },
-                    );
-                }
-            }
-            if ed.format.is_some() || ed.fill.is_some() || ed.font_rgb.is_some() || ed.bold.is_some() {
-                let sid = self.wb.sheet(si).style_of(ed.r, ed.c);
+                Some(Cell {
+                    value: v.clone(),
+                    formula: None,
+                })
+            } else {
+                None
+            };
+            let style = if ed.format.is_some()
+                || ed.fill.is_some()
+                || ed.font_rgb.is_some()
+                || ed.bold.is_some()
+            {
+                let sid = *pending_styles
+                    .entry((ed.r, ed.c))
+                    .or_insert_with(|| self.wb.sheet(si).style_of(ed.r, ed.c));
                 let mut st = self.wb.styles.get(sid).clone();
                 if let Some(fmt) = &ed.format {
                     st.format = fmt.clone();
@@ -1009,39 +1007,38 @@ impl SheetApp {
                     st.bold = b;
                 }
                 let nsid = self.wb.styles.intern(st.clone());
-                self.wb.sheet_mut(si).set_style(ed.r, ed.c, nsid);
+                pending_styles.insert((ed.r, ed.c), nsid);
                 wire_styles.push((ed.r, ed.c, st));
+                Some(nsid)
+            } else {
+                None
+            };
+            if cell.is_some() || style.is_some() {
+                writes.push(sheetcore::tx::CellWrite {
+                    row: ed.r,
+                    col: ed.c,
+                    cell,
+                    style,
+                });
             }
+        }
+        let intent = sheetcore::tx::CellBatchIntent { sheet: si, writes };
+        if let Err(err) = self.execute_cell_batch_tx_opts(
+            intent,
+            Some("AI 写入".into()),
+            (si, keys[0].0, keys[0].1),
+            defer_recalc,
+            false,
+        ) {
+            return Err(("写入失败".into(), json!({"ok": false, "error": err.message()})));
         }
         if !wire_styles.is_empty()
             && let Some(net) = self.net.as_ref()
         {
             net.broadcast_style(si, wire_styles);
         }
-        let deltas = sheetcore::undo::finish(before, self.wb.sheet(si));
-        if !deltas.is_empty() {
-            self.record_revision("AI 写入", &deltas);
-            self.undo.push(sheetcore::undo::Action {
-                label: "AI 写入".into(),
-                merges: None,
-                deltas,
-                focus: (si, keys[0].0, keys[0].1),
-                snap_before: None,
-                snap_after: None,
-                by_site: 0,
-                pictures: None,
-                shapes: None,
-                refresh_sizes: None,
-            });
-        }
         let touched: Vec<_> = keys.iter().map(|&(r, c)| (si, r, c)).collect();
-        if defer_recalc {
-            self.broadcast_cells(&touched);
-        } else {
-            self.recalc_and_broadcast(&touched);
-        }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.broadcast_cells(&touched);
 
         Ok((
             WrittenCells {
@@ -1089,7 +1086,6 @@ impl SheetApp {
         }
 
         let sh_name = self.wb.sheet(si).name.clone();
-        let before = sheetcore::undo::capture(self.wb.sheet(si), si, &keys);
         let mut fill_formulas = refs::FillFormulas::default();
         let need_net_styles = fmt.is_some() && self.net.is_some();
         let mut style_cache: std::collections::HashMap<u16, (u16, sheetcore::style::CellStyle)> =
@@ -1099,6 +1095,7 @@ impl SheetApp {
         } else {
             Vec::new()
         };
+        let mut writes = Vec::with_capacity(keys.len());
         for r in r1..=r2 {
             for c in c1..=c2 {
                 let dr = r as i64 - r1 as i64;
@@ -1108,15 +1105,7 @@ impl SheetApp {
                 } else {
                     fill_formulas.translate(body, dr, dc)
                 };
-                self.wb.sheet_mut(si).set(
-                    r,
-                    c,
-                    Cell {
-                        value: Value::Empty,
-                        formula: Some(translated.into()),
-                    },
-                );
-                if let Some(ref fstr) = fmt {
+                let style = if let Some(ref fstr) = fmt {
                     let sid = self.wb.sheet(si).style_of(r, c);
                     let (nsid, cached_st) = style_cache
                         .entry(sid)
@@ -1127,12 +1116,33 @@ impl SheetApp {
                             (id, st)
                         })
                         .clone();
-                    self.wb.sheet_mut(si).set_style(r, c, nsid);
                     if need_net_styles {
                         wire_styles.push((r, c, cached_st));
                     }
-                }
+                    Some(nsid)
+                } else {
+                    None
+                };
+                writes.push(sheetcore::tx::CellWrite {
+                    row: r,
+                    col: c,
+                    cell: Some(Cell {
+                        value: Value::Empty,
+                        formula: Some(translated.into()),
+                    }),
+                    style,
+                });
             }
+        }
+        let intent = sheetcore::tx::CellBatchIntent { sheet: si, writes };
+        if let Err(err) = self.execute_cell_batch_tx_opts(
+            intent,
+            Some("AI 填充公式".into()),
+            (si, r1, c1),
+            defer_recalc,
+            false,
+        ) {
+            return Err(("填充公式失败".into(), json!({"ok": false, "error": err.message()})));
         }
         if !wire_styles.is_empty()
             && let Some(net) = self.net.as_ref()
@@ -1141,30 +1151,8 @@ impl SheetApp {
                 net.broadcast_style(si, chunk.to_vec());
             }
         }
-        let deltas = sheetcore::undo::finish(before, self.wb.sheet(si));
-        if !deltas.is_empty() {
-            self.record_revision("AI 填充公式", &deltas);
-            self.undo.push(sheetcore::undo::Action {
-                label: "AI 填充公式".into(),
-                merges: None,
-                deltas,
-                focus: (si, r1, c1),
-                snap_before: None,
-                snap_after: None,
-                by_site: 0,
-                pictures: None,
-                shapes: None,
-                refresh_sizes: None,
-            });
-        }
         let touched: Vec<_> = keys.iter().map(|&(r, c)| (si, r, c)).collect();
-        if defer_recalc {
-            self.broadcast_cells(&touched);
-        } else {
-            self.recalc_and_broadcast(&touched);
-        }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.broadcast_cells(&touched);
 
         let span = range_label((r1, c1), (r2, c2));
         Ok((
@@ -1742,7 +1730,7 @@ impl SheetApp {
             }
             self.broadcast_comment_diffs(si, &note_diffs, &thread_diffs);
             let focus = (si, unique_coords[0].0, unique_coords[0].1);
-            self.undo.push_meta(
+            self.commit_meta_tx(
                 "AI 管理批注",
                 focus,
                 sheetcore::undo::MetaEdit {
@@ -1751,10 +1739,10 @@ impl SheetApp {
                     threads: thread_diffs,
                     ..Default::default()
                 },
+                sheetcore::tx::RecalcScope::None,
+                false,
+                Vec::new(),
             );
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
         }
 
         let sh_name = self.wb.sheet(si).name.clone();

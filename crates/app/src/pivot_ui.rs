@@ -423,7 +423,7 @@ impl SheetApp {
         self.wb.pivots.push(model);
 
         let inserted_sheet = inserted_sheet_idx.map(|idx| (idx, self.wb.sheets[idx].clone()));
-        self.undo.push_pivot_edit(
+        self.commit_pivot_tx(
             format!("创建数据透视表「{pivot_name}」"),
             focus_before,
             PivotUndoEdit {
@@ -446,8 +446,6 @@ impl SheetApp {
         self.pivot_ui.sidebar_open = true;
         self.pivot_ui.sidebar_dismissed_id = None;
         self.ribbon_tab = 103; // 自动切到「透视表分析」上下文页签
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!(
             "已创建数据透视表「{pivot_name}」（可在右侧拖拽字段实时调整，支持 Ctrl+Z 撤销）"
         );
@@ -696,7 +694,7 @@ impl SheetApp {
                 full_r.1,
                 full_r.3,
             );
-            self.undo.push_pivot_edit(
+            self.commit_pivot_tx(
                 label.to_string(),
                 (self.sheet_idx, self.sel.0, self.sel.1),
                 PivotUndoEdit {
@@ -710,10 +708,15 @@ impl SheetApp {
                     removed_after: self.wb.pivots_removed_parts.clone(),
                 },
             );
+        } else {
+            let effects = sheetcore::tx::TxEffects {
+                invalidate_render_caches: true,
+                touched_sheets: vec![target_sheet],
+                ..Default::default()
+            };
+            self.apply_tx_effects(label, &effects);
         }
 
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!(
             "透视表「{name}」已更新：{} 行 × {} 列",
             new_rect.2 - new_rect.0 + 1,
@@ -752,7 +755,7 @@ impl SheetApp {
             &self.wb.sheets[target_sheet],
             rect,
         );
-        self.undo.push_pivot_edit(
+        self.commit_pivot_tx(
             format!("删除透视表「{name}」"),
             (self.sheet_idx, self.sel.0, self.sel.1),
             PivotUndoEdit {
@@ -772,8 +775,6 @@ impl SheetApp {
         }
         self.pivot_ui.field_settings = None;
         self.pivot_ui.grid_filter = None;
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已删除透视表「{name}」（可 Ctrl+Z 撤销）");
     }
 

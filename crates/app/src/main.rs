@@ -1327,6 +1327,8 @@ struct SheetApp {
     history_last_epoch: u64,
     /// 工作簿被整体替换的次数（Loaded/Recalced 各算一次）
     wb_epoch: u64,
+    /// 已同步到 UI 缓存的 `self.wb.coord_epoch()` 值（任一本地/远端/撤销坐标变更自动失效缓存）
+    pub(crate) last_seen_coord_epoch: u64,
     /// 当前活动文档的唯一身份编号（跨标签页/跨后台重算稳定，切标签切换回来保持不变，新开/关闭重置）
     pub(crate) doc_uid: u64,
     probe_at: std::time::Instant,
@@ -2613,6 +2615,7 @@ impl SheetApp {
             history_planted: 0,
             history_last_epoch: u64::MAX,
             wb_epoch: 0,
+            last_seen_coord_epoch: 0,
             doc_uid: next_doc_uid(),
             probe_at: std::time::Instant::now(),
             lock_first_at: None,
@@ -9166,22 +9169,27 @@ impl SheetApp {
             sh.cols.set_many(updates.iter().copied());
             sh.layout_dirty = true;
         }
-        if let Some(before) = before {
-            let after = before.capture_after(&self.wb);
-            self.undo.push_structure(
-                "自动调整列宽",
-                before,
-                after,
-                (idx, self.sel.0, self.sel.1),
-            );
-        }
         let was_shared_only = self.only_shared_cell_edits();
         if let Some(net) = self.net.as_ref() {
             let synced = net.broadcast_sheet_meta(idx, sheetcore::sync::SheetMetaKind::ColWidths(updates));
             self.mark_sheet_layout_synced(idx, synced && layout_ok_before);
         }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
+        let effects = sheetcore::tx::TxEffects {
+            touched_sheets: vec![idx],
+            ..Default::default()
+        };
+        if let Some(before) = before {
+            let after = before.capture_after(&self.wb);
+            self.commit_structure_tx(
+                "自动调整列宽",
+                (idx, self.sel.0, self.sel.1),
+                before,
+                after,
+                effects,
+            );
+        } else {
+            self.apply_tx_effects("自动调整列宽", &effects);
+        }
         if was_shared_only && self.is_delegated_collab_client() {
             self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
         }
@@ -9228,15 +9236,6 @@ impl SheetApp {
             sh.rows.set_many(filtered_updates.iter().copied());
             sh.layout_dirty = true;
         }
-        if let Some(before) = before {
-            let after = before.capture_after(&self.wb);
-            self.undo.push_structure(
-                "自动调整行高",
-                before,
-                after,
-                (idx, self.sel.0, self.sel.1),
-            );
-        }
         let was_shared_only = self.only_shared_cell_edits();
         if let Some(net) = self.net.as_ref() {
             let synced = net.broadcast_sheet_meta(
@@ -9245,8 +9244,22 @@ impl SheetApp {
             );
             self.mark_sheet_layout_synced(idx, synced && layout_ok_before);
         }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
+        let effects = sheetcore::tx::TxEffects {
+            touched_sheets: vec![idx],
+            ..Default::default()
+        };
+        if let Some(before) = before {
+            let after = before.capture_after(&self.wb);
+            self.commit_structure_tx(
+                "自动调整行高",
+                (idx, self.sel.0, self.sel.1),
+                before,
+                after,
+                effects,
+            );
+        } else {
+            self.apply_tx_effects("自动调整行高", &effects);
+        }
         if was_shared_only && self.is_delegated_collab_client() {
             self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
         }
@@ -12494,11 +12507,14 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 self.fast_recalc_cells(&keys);
             }
         }
-        self.cf_stats_gen = u64::MAX;
-        self.invalid_gen = u64::MAX;
-        if applied.coord_changed || applied.structural {
-            self.cf_cache = None;
-            self.cf_inputs.grid.invalidate_viewport();
+        let epoch_changed = self.sync_coord_epoch_side_effects();
+        if !epoch_changed {
+            self.cf_stats_gen = u64::MAX;
+            self.invalid_gen = u64::MAX;
+            if applied.coord_changed || applied.structural {
+                self.cf_cache = None;
+                self.cf_inputs.grid.invalidate_viewport();
+            }
         }
         self.tasks.last_edit = Some(std::time::Instant::now());
         // 协作广播
@@ -13300,24 +13316,25 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             } else {
                 format!("{sref}!{}:{}", abs_cell(r1, c1), abs_cell(r2, c2))
             };
-            let before = self.wb.names.clone();
-            self.wb.names.push((text.clone(), None, refers.clone()));
-            let after = self.wb.names.clone();
-            self.wb.names_dirty = true;
-            self.undo.push_meta(
-                format!("定义名称 {text}"),
-                (self.sheet_idx, r1, c1),
-                sheetcore::undo::MetaEdit {
-                    sheet: self.sheet_idx,
-                    names: Some((before, after)),
-                    ..Default::default()
+            let intent = sheetcore::tx::TxIntent::from_defined_names(
+                sheetcore::tx::DefinedNameIntent::Define {
+                    name: text.clone(),
+                    scope: None,
+                    formula: refers.clone(),
                 },
             );
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
-            self.recalc_all_and_deps_adaptive();
-            self.status = format!("已定义名称：{text} = {refers}");
+            match self.execute_local_tx(
+                intent,
+                Some(format!("定义名称 {text}")),
+                (self.sheet_idx, r1, c1),
+            ) {
+                Ok(_) => {
+                    self.status = format!("已定义名称：{text} = {refers}");
+                }
+                Err(err) => {
+                    self.status = err.message().into();
+                }
+            }
             return;
         }
         self.status = format!("找不到名称：{text}");
@@ -23084,23 +23101,17 @@ fn clear_selection(&mut self) {
             }
         }
         if let Some(i) = del {
-            if i < self.wb.names.len() {
-                let before_names = self.wb.names.clone();
-                self.wb.names.remove(i);
-                let after_names = self.wb.names.clone();
-                self.undo.push_meta(
-                    "删除名称",
+            let intent = sheetcore::tx::TxIntent::from_defined_names(
+                sheetcore::tx::DefinedNameIntent::Remove { index: i },
+            );
+            if self
+                .execute_local_tx(
+                    intent,
+                    Some("删除名称".into()),
                     (self.sheet_idx, self.sel.0, self.sel.1),
-                    sheetcore::undo::MetaEdit {
-                        sheet: self.sheet_idx,
-                        names: Some((before_names, after_names)),
-                        ..Default::default()
-                    },
-                );
-                self.wb.names_dirty = true;
-                self.wb.dirty = true;
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.recalc_all_and_deps_adaptive();
+                )
+                .is_ok()
+            {
                 self.status = "已删除名称".into();
             }
         }
@@ -23108,52 +23119,47 @@ fn clear_selection(&mut self) {
             let name = self.name_new.trim().to_string();
             let refers = self.name_refers.trim().to_string();
             let valid = Self::valid_defined_name(&name) && self.valid_name_refers(&refers);
-            let dup = self
-                .wb
-                .names
-                .iter()
-                .enumerate()
-                .any(|(k, (n, sh, _))| {
-                    k != self.name_edit_idx.unwrap_or(usize::MAX)
-                        && n.eq_ignore_ascii_case(&name)
-                        && *sh == if self.name_scope_local { Some(self.sheet_idx) } else { None }
-                });
             if !valid {
                 self.name_err = "名称要以字母/下划线开头且不能是 A1/R1C1；引用要写成 Sheet1!$A$1:$B$3、={...} 或 =SUM(...)".into();
-            } else if dup {
-                self.name_err = "名称已存在".into();
             } else {
-                self.name_err.clear();
-                let before_names = self.wb.names.clone();
-                match self.name_edit_idx.take() {
-                    Some(i) if i < self.wb.names.len() => {
-                        self.wb.names[i].0 = name;
-                        self.wb.names[i].1 = if self.name_scope_local { Some(self.sheet_idx) } else { None };
-                        self.wb.names[i].2 = refers;
-                    }
-                    _ => self.wb.names.push((
+                let scope = if self.name_scope_local {
+                    Some(self.sheet_idx)
+                } else {
+                    None
+                };
+                let edit_idx = self.name_edit_idx.filter(|&i| i < self.wb.names.len());
+                let intent = sheetcore::tx::TxIntent::from_defined_names(match edit_idx {
+                    Some(index) => sheetcore::tx::DefinedNameIntent::Update {
+                        index,
                         name,
-                        if self.name_scope_local { Some(self.sheet_idx) } else { None },
-                        refers,
-                    )),
-                }
-                let after_names = self.wb.names.clone();
-                self.undo.push_meta(
-                    "编辑名称",
-                    (self.sheet_idx, self.sel.0, self.sel.1),
-                    sheetcore::undo::MetaEdit {
-                        sheet: self.sheet_idx,
-                        names: Some((before_names, after_names)),
-                        ..Default::default()
+                        scope,
+                        formula: refers,
                     },
-                );
-                self.wb.names_dirty = true;
-                self.wb.dirty = true;
-                self.name_new.clear();
-                self.name_refers.clear();
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.recalc_all_and_deps_adaptive();
-                self.status = "名称已保存".into();
+                    None => sheetcore::tx::DefinedNameIntent::Define {
+                        name,
+                        scope,
+                        formula: refers,
+                    },
+                });
+                match self.execute_local_tx(
+                    intent,
+                    Some("编辑名称".into()),
+                    (self.sheet_idx, self.sel.0, self.sel.1),
+                ) {
+                    Ok(_) | Err(sheetcore::tx::TxError::NoOp) => {
+                        self.name_edit_idx = None;
+                        self.name_err.clear();
+                        self.name_new.clear();
+                        self.name_refers.clear();
+                        self.status = "名称已保存".into();
+                    }
+                    Err(sheetcore::tx::TxError::DuplicateDefinedName) => {
+                        self.name_err = "名称已存在".into();
+                    }
+                    Err(err) => {
+                        self.name_err = err.message().into();
+                    }
+                }
             }
         }
     }
@@ -24681,12 +24687,20 @@ fn clear_selection(&mut self) {
         self.deps = sheetcore::formula::deps::Deps::build_after_recalc(&self.wb).into();
         self.deps_built = true;
         let after = before.capture_after(&self.wb);
-        self.undo.push_structure("分类汇总", before, after, (idx, self.sel.0, self.sel.1));
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.cf_stats_gen = u64::MAX;
-        self.invalid_gen = u64::MAX;
-        self.tasks.last_edit = Some(std::time::Instant::now());
+        let effects = sheetcore::tx::TxEffects {
+            invalidate_render_caches: true,
+            coord_changed: true,
+            structural: true,
+            touched_sheets: vec![idx],
+            ..Default::default()
+        };
+        self.commit_structure_tx(
+            "分类汇总",
+            (idx, self.sel.0, self.sel.1),
+            before,
+            after,
+            effects,
+        );
         self.status = format!("分类汇总：{} 组，插了 {} 行（{}）", rep.groups, rep.rows, f.label());
         Ok(self.status.clone())
     }
@@ -32336,7 +32350,6 @@ impl SheetApp {
         let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
         let after = before.capture_after(&self.wb);
         let label = summary_op.label();
-        self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
         let effects = sheetcore::tx::TxEffects {
             recalc: sheetcore::tx::RecalcScope::Full,
             invalidate_deps: true,
@@ -32348,7 +32361,13 @@ impl SheetApp {
             touched_sheets: vec![idx],
             new_focus: None,
         };
-        self.apply_tx_effects(&label, &effects);
+        self.commit_structure_tx(
+            label.clone(),
+            (idx, self.sel.0, self.sel.1),
+            before,
+            after,
+            effects,
+        );
         self.shift_collab_coordinates(idx, &summary_op);
         self.status = format!("{label}（已保留筛选隐藏行，可 Ctrl+Z 撤销）");
         if removed_pivots > 0 {
@@ -39497,7 +39516,7 @@ impl SheetApp {
                     let after_charts = sh.charts.clone();
                     let after_deleted = sh.deleted_charts.clone();
                     if changed {
-                        self.undo.push_chart_edit(
+                        self.commit_chart_tx(
                             if d.mode == 0 { "移动图表" } else { "调整图表大小" },
                             (sh_idx, self.sel.0, self.sel.1),
                             sheetcore::undo::ChartUndoEdit {
@@ -39508,8 +39527,9 @@ impl SheetApp {
                                 deleted_after: after_deleted,
                             },
                         );
+                    } else {
+                        self.wb.dirty = true;
                     }
-                    self.wb.dirty = true;
                     self.status = "图表位置已更新（Ctrl+Z 可撤销，保存后写回 Excel）".into();
                 }
             }
@@ -46986,6 +47006,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.auto_join_tried = None;
         self.cf_stats_gen = doc.cf_stats_gen;
         self.wb_epoch = self.wb_epoch.wrapping_add(1);
+        self.last_seen_coord_epoch = self.wb.coord_epoch();
         self.cancel_edit();
         self.cf_stats_gen = u64::MAX;
         self.confirm_close_target = None;
@@ -47295,6 +47316,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.confirm_close_target = None;
         self.doc_gen = 0;
         self.cf_stats_gen = u64::MAX;
+        self.last_seen_coord_epoch = 0;
         self.undo = sheetcore::undo::UndoStack::new();
         self.audit_state = audit_ui::DocAuditState::default();
         self.audit_archive_msg = None;
@@ -47574,8 +47596,12 @@ fn elide(s: &str, max_chars: usize) -> String {
                         self.tasks.last_edit = Some(std::time::Instant::now());
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.cf_stats_gen = u64::MAX;
-                        self.invalid_gen = u64::MAX;
+                        if !self.sync_coord_epoch_side_effects() {
+                            self.cf_stats_gen = u64::MAX;
+                            self.invalid_gen = u64::MAX;
+                            self.cf_cache = None;
+                            self.cf_inputs.grid.invalidate_viewport();
+                        }
                         self.recalc_after_structural(updates);
                         self.audit_note_structural(Some(site), sheet, &op, None);
                         self.record_remote_note_revision(site, "远端结构改动", sheet, label.clone());
@@ -47888,6 +47914,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                             continue;
                         }
                     }
+                    self.sync_coord_epoch_side_effects();
                     if self.snapshot_is_delta {
                         let delta_keys: Vec<(usize, u32, u32)> = self
                             .peer
@@ -49612,6 +49639,7 @@ impl eframe::App for SheetApp {
         self.poll_open();
         self.poll_reorder();
         self.sync_history();
+        self.sync_coord_epoch_side_effects();
         self.poll_save();
         self.tick_autosave(Some(ctx));
         self.poll_auto_xlinks(ctx);
