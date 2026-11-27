@@ -14868,6 +14868,131 @@ fn phase6_p2b_apply_undo_shares_post_mutation_cache_and_epoch_effects() {
     assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(75.0));
 }
 
+#[test]
+fn phase7_r2_app_subtotal_replace_existing_overflow_atomic_and_success_undo_redo() {
+    use sheetcore::subtotal::{SubFn, SubtotalOpts};
+
+    let env = crate::test_env::TestEnv::new("p7-r2-app-subtotal");
+    let mut app = app();
+    app.wb.path = Some(env.path("p7_r2_subtotal.xlsx"));
+    app.wb.sheet_mut(0).name = "S".into();
+    app.wb.sheets.push(sheetcore::model::Sheet::new("Ref"));
+
+    // Exact peer-review scenario (REVIEW.zh-CN.txt R2):
+    // S!A1:B5 has 2 groups ("甲", "乙") with an existing single subtotal + grand total,
+    // plus tail occupancy S!A1048576=7 and a cross-sheet ref Ref!A1 = "=S!A1048576".
+    {
+        let s = app.wb.sheet_mut(0);
+        s.set(0, 0, Cell { value: Value::Text("类别".into()), formula: None });
+        s.set(0, 1, Cell { value: Value::Text("金额".into()), formula: None });
+        s.set(1, 0, Cell { value: Value::Text("甲".into()), formula: None });
+        s.set(1, 1, number(10.0));
+        s.set(2, 0, Cell { value: Value::Text("乙".into()), formula: None });
+        s.set(2, 1, number(20.0));
+        s.set(3, 0, Cell { value: Value::Text("甲 汇总".into()), formula: None });
+        s.set(3, 1, Cell { value: Value::Number(30.0), formula: Some("SUBTOTAL(9,B2:B3)".into()) });
+        s.set(4, 0, Cell { value: Value::Text("总计".into()), formula: None });
+        s.set(4, 1, Cell { value: Value::Number(30.0), formula: Some("SUBTOTAL(9,B2:B4)".into()) });
+        s.set(1_048_575, 0, number(7.0));
+        s.rows.set(3, 42.0);
+    }
+    app.wb.sheet_mut(1).set(
+        0,
+        0,
+        Cell {
+            value: Value::Empty,
+            formula: Some("S!A1048576".into()),
+        },
+    );
+    sheetcore::formula::recalc_all(&mut app.wb);
+    app.deps = sheetcore::formula::deps::Deps::build_after_recalc(&app.wb).into();
+    app.deps_built = true;
+    app.wb.dirty = false;
+
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(7.0));
+    let coord_epoch_before = app.wb.coord_epoch();
+    let undo_depth_before = app.undo.depth();
+    let dirty_before = app.wb.dirty;
+    let doc_gen_before = app.doc_gen;
+    let ref_formula_before = app.wb.sheet(1).formula_of(0, 0).map(str::to_string);
+
+    let replace_opts = SubtotalOpts {
+        replace_existing: true,
+        page_break_between_groups: false,
+        summary_below: true,
+    };
+
+    // 1) Overflow with replace_existing=true must return Err and leave workbook & app state 100% unchanged.
+    let err = app
+        .subtotal_run_opts("A1:B5", "A", "B", SubFn::Sum, replace_opts)
+        .expect_err("tail cell at A1048576 must cause overflow Err");
+    assert!(
+        err.contains("最后一行"),
+        "expected overflow error message, got: {err}"
+    );
+    assert_eq!(app.status, err, "app.status must report the overflow error cleanly");
+    assert_eq!(app.wb.coord_epoch(), coord_epoch_before, "coord_epoch must not advance on overflow");
+    assert_eq!(app.undo.depth(), undo_depth_before, "undo stack must remain empty on overflow");
+    assert_eq!(app.wb.dirty, dirty_before, "wb.dirty must stay false on overflow");
+    assert_eq!(app.doc_gen, doc_gen_before, "doc_gen must not advance on overflow");
+    assert_eq!(app.wb.sheet(0).value(3, 0), Value::Text("甲 汇总".into()));
+    assert_eq!(app.wb.sheet(0).formula_of(3, 1), Some("SUBTOTAL(9,B2:B3)"));
+    assert_eq!(app.wb.sheet(0).value(4, 0), Value::Text("总计".into()));
+    assert_eq!(app.wb.sheet(0).formula_of(4, 1), Some("SUBTOTAL(9,B2:B4)"));
+    assert_eq!(app.wb.sheet(0).value(1_048_575, 0), Value::Number(7.0));
+    assert!((app.wb.sheet(0).rows.size(3) - 42.0).abs() < 1e-4);
+    assert_eq!(
+        app.wb.sheet(1).formula_of(0, 0),
+        ref_formula_before.as_deref(),
+        "cross-sheet formula must remain untouched on overflow"
+    );
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(7.0));
+
+    // 2) Clear tail occupancy -> replace_existing=true succeeds and roundtrips Undo/Redo cleanly.
+    app.wb.sheet_mut(0).remove(1_048_575, 0);
+    let ok_msg = app
+        .subtotal_run_opts("A1:B5", "A", "B", SubFn::Sum, replace_opts)
+        .expect("replace_existing=true subtotal must succeed once tail is free");
+    assert!(ok_msg.contains("分类汇总"), "unexpected status: {ok_msg}");
+    assert!(app.wb.dirty);
+    assert!(app.doc_gen > doc_gen_before);
+    assert!(app.wb.coord_epoch() > coord_epoch_before);
+    assert_eq!(app.undo.depth(), (1, 0));
+
+    // After replacing old subtotals for 2 groups ("甲", "乙"):
+    // Row 1: Header, Row 2: 甲/10, Row 3: 甲 汇总 (=10), Row 4: 乙/20, Row 5: 乙 汇总 (=20), Row 6: 总计 (=30).
+    assert_eq!(app.wb.sheet(0).value(1, 0), Value::Text("甲".into()));
+    assert_eq!(app.wb.sheet(0).value(2, 0), Value::Text("甲 汇总".into()));
+    assert_eq!(app.wb.sheet(0).value(2, 1), Value::Number(10.0));
+    assert_eq!(app.wb.sheet(0).value(3, 0), Value::Text("乙".into()));
+    assert_eq!(app.wb.sheet(0).value(4, 0), Value::Text("乙 汇总".into()));
+    assert_eq!(app.wb.sheet(0).value(4, 1), Value::Number(20.0));
+    assert_eq!(app.wb.sheet(0).value(5, 0), Value::Text("总计".into()));
+    assert_eq!(app.wb.sheet(0).value(5, 1), Value::Number(30.0));
+
+    // Undo restores exact pre-replacement rows, formulas, and row height.
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.undo.depth(), (0, 1));
+    assert_eq!(app.wb.sheet(0).value(1, 0), Value::Text("甲".into()));
+    assert_eq!(app.wb.sheet(0).value(2, 0), Value::Text("乙".into()));
+    assert_eq!(app.wb.sheet(0).value(3, 0), Value::Text("甲 汇总".into()));
+    assert_eq!(app.wb.sheet(0).formula_of(3, 1), Some("SUBTOTAL(9,B2:B3)"));
+    assert_eq!(app.wb.sheet(0).value(4, 0), Value::Text("总计".into()));
+    assert_eq!(app.wb.sheet(0).value(5, 0), Value::Empty);
+    assert!((app.wb.sheet(0).rows.size(3) - 42.0).abs() < 1e-4);
+
+    // Redo reapplies exact replacement subtotals cleanly.
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.undo.depth(), (1, 0));
+    assert_eq!(app.wb.sheet(0).value(2, 0), Value::Text("甲 汇总".into()));
+    assert_eq!(app.wb.sheet(0).value(2, 1), Value::Number(10.0));
+    assert_eq!(app.wb.sheet(0).value(4, 0), Value::Text("乙 汇总".into()));
+    assert_eq!(app.wb.sheet(0).value(4, 1), Value::Number(20.0));
+    assert_eq!(app.wb.sheet(0).value(5, 0), Value::Text("总计".into()));
+    assert_eq!(app.wb.sheet(0).value(5, 1), Value::Number(30.0));
+}
+
+
 
 
 

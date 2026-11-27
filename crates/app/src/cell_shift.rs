@@ -57,19 +57,45 @@ pub(super) struct RejoinMergeEntry {
 
 pub(crate) const MAX_CANCELLED_OFFLINE_DRAFTS: usize = 10_000;
 
+/// Value-level intent recorded in a cancelled offline edit draft.
+/// Distinguishes explicit cell clearing from style/merge-only edits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CancelledDraftValue {
+    /// Style-only or merge-only edit; did not modify cell value or formula.
+    Unchanged,
+    /// Explicit cell clear (empty value and no formula).
+    Cleared,
+    /// Explicit value and/or formula write.
+    Value {
+        display: String,
+        formula: Option<String>,
+    },
+}
+
+/// Outcome of archiving one cancelled offline edit into `SheetApp::cancelled_offline_drafts`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DraftArchiveOutcome {
+    Stored,
+    Updated,
+    Truncated,
+}
+
+pub(crate) type CancelledDraftKey = (String, CoordEpoch, usize, u32, u32);
+
 /// Local recovery record for unacknowledged offline edits that were safely
 /// cancelled (rather than mis-replayed to shifted coordinates or a different room).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CancelledOfflineDraft {
     pub room_id: String,
+    pub coord_epoch: CoordEpoch,
     pub sheet: usize,
     pub sheet_name: String,
     pub row: u32,
     pub col: u32,
-    pub value_display: String,
-    pub formula: Option<String>,
+    pub value: CancelledDraftValue,
     pub style_changed: bool,
     pub merge_rect: Option<(u32, u32, u32, u32)>,
+    pub merge_on: Option<bool>,
     pub reason: String,
 }
 
@@ -89,11 +115,16 @@ pub(super) struct ShiftIntro {
     pub(super) room_tx_receipt: Option<(u64, CellShiftPhase, Arc<RoomTxPatch>)>,
     pub(super) applied_seq: u64,
     pub(super) last_struct_rev: usize,
+    /// Number of room structural ops already applied to `self.wb` before a full rejoin
+    /// into the same room (used only by the legacy non-full-overlay path).
+    pub(super) baseline_struct_rev: usize,
     pub(super) room_id: String,
     /// Local ops in `peer.cells` with `ts <= pre_shift_stale_ts` were created before
     /// a live `CellShiftCommitted` advanced `applied_seq`, so if still unacked they
     /// belong to a stale coordinate epoch and must not be replayed post-shift.
     pub(super) pre_shift_stale_ts: u64,
+    /// Shift sequence active before `pre_shift_stale_ts` became stale.
+    pub(super) pre_shift_seq: u64,
     /// Inclusive `(first, last)` logical timestamp ranges of live `CellShiftCommitted`
     /// ops authored by this site so they are never misclassified as unacked local edits.
     pub(super) committed_shift_ts_ranges: Vec<(u64, u64)>,
@@ -112,12 +143,14 @@ impl ShiftIntro {
         self.room_tx_receipt = None;
         self.applied_seq = 0;
         self.last_struct_rev = 0;
+        self.baseline_struct_rev = 0;
         self.room_id = room_id;
         self.clear_peer_shift_tracking();
     }
 
     pub(super) fn clear_peer_shift_tracking(&mut self) {
         self.pre_shift_stale_ts = 0;
+        self.pre_shift_seq = 0;
         self.committed_shift_ts_ranges.clear();
     }
 
@@ -141,6 +174,9 @@ impl ShiftIntro {
         pre_clock: u64,
     ) {
         if seq != old_seq && pre_clock > 0 {
+            if self.pre_shift_stale_ts == 0 {
+                self.pre_shift_seq = old_seq;
+            }
             self.pre_shift_stale_ts = self.pre_shift_stale_ts.max(pre_clock);
         }
         if local_author && cell_count > 0 {
@@ -294,89 +330,166 @@ impl SheetApp {
         }
     }
 
-    fn push_cancelled_offline_draft(&mut self, draft: CancelledOfflineDraft) {
-        if let Some(existing) = self.cancelled_offline_drafts.iter_mut().find(|d| {
-            d.room_id == draft.room_id
-                && d.sheet == draft.sheet
-                && d.row == draft.row
-                && d.col == draft.col
-                && d.merge_rect == draft.merge_rect
-        }) {
-            if !draft.value_display.is_empty() || draft.formula.is_some() {
-                existing.value_display = draft.value_display;
-                existing.formula = draft.formula;
+    pub(crate) fn push_cancelled_offline_draft(
+        &mut self,
+        draft: CancelledOfflineDraft,
+    ) -> DraftArchiveOutcome {
+        let key: CancelledDraftKey = (
+            draft.room_id.clone(),
+            draft.coord_epoch,
+            draft.sheet,
+            draft.row,
+            draft.col,
+        );
+        if let Some(&idx) = self.cancelled_offline_draft_index.get(&key) {
+            if let Some(existing) = self.cancelled_offline_drafts.get_mut(idx) {
+                match draft.value {
+                    CancelledDraftValue::Unchanged => {}
+                    CancelledDraftValue::Cleared | CancelledDraftValue::Value { .. } => {
+                        existing.value = draft.value;
+                    }
+                }
+                existing.style_changed |= draft.style_changed;
+                if draft.merge_rect.is_some() {
+                    existing.merge_rect = draft.merge_rect;
+                    existing.merge_on = draft.merge_on;
+                }
+                if existing.sheet_name.is_empty() {
+                    existing.sheet_name = draft.sheet_name;
+                }
+                existing.reason = draft.reason;
+                return DraftArchiveOutcome::Updated;
             }
-            existing.style_changed |= draft.style_changed;
-            if existing.sheet_name.is_empty() {
-                existing.sheet_name = draft.sheet_name;
-            }
-            existing.reason = draft.reason;
-            return;
         }
         if self.cancelled_offline_drafts.len() >= MAX_CANCELLED_OFFLINE_DRAFTS {
-            return;
+            self.cancelled_offline_drafts_dropped =
+                self.cancelled_offline_drafts_dropped.saturating_add(1);
+            return DraftArchiveOutcome::Truncated;
         }
+        let idx = self.cancelled_offline_drafts.len();
         self.cancelled_offline_drafts.push(draft);
+        self.cancelled_offline_draft_index.insert(key, idx);
+        DraftArchiveOutcome::Stored
     }
 
     pub(super) fn archive_cancelled_offline_op(
         &mut self,
         room_id: String,
+        coord_epoch: CoordEpoch,
         op: &sheetcore::sync::Op,
         reason: String,
-    ) {
+    ) -> DraftArchiveOutcome {
         let sheet_name = self.draft_sheet_name(op.sheet);
-        let value_display = sheetcore::Value::from(&op.value).display();
+        let val = sheetcore::Value::from(&op.value);
         let formula = op.formula.as_deref().map(str::to_string);
+        let value = if matches!(val, sheetcore::Value::Empty) && formula.is_none() {
+            CancelledDraftValue::Cleared
+        } else {
+            CancelledDraftValue::Value {
+                display: val.display(),
+                formula,
+            }
+        };
         self.push_cancelled_offline_draft(CancelledOfflineDraft {
             room_id,
+            coord_epoch,
             sheet: op.sheet,
             sheet_name,
             row: op.row,
             col: op.col,
-            value_display,
-            formula,
+            value,
             style_changed: false,
             merge_rect: None,
+            merge_on: None,
             reason,
-        });
+        })
     }
 
     pub(crate) fn clear_cancelled_offline_drafts(&mut self) {
         self.cancelled_offline_drafts.clear();
+        self.cancelled_offline_draft_index.clear();
+        self.cancelled_offline_drafts_dropped = 0;
+    }
+
+    pub(crate) fn conflict_drafts_button_label(&self) -> String {
+        let retained = self.cancelled_offline_drafts.len();
+        let dropped = self.cancelled_offline_drafts_dropped;
+        if dropped > 0 {
+            format!("复制冲突草稿({retained}，已丢弃{dropped})")
+        } else {
+            format!("复制冲突草稿({retained})")
+        }
+    }
+
+    pub(crate) fn format_cancelled_edits_status(&self, cancelled: usize) -> String {
+        let retained = self.cancelled_offline_drafts.len();
+        let dropped = self.cancelled_offline_drafts_dropped;
+        if dropped > 0 {
+            format!(
+                "工作表坐标已改变，已取消断线前未确认的 {cancelled} 处修改（本地冲突草稿已达上限：保留 {retained} 条，已丢弃 {dropped} 条）"
+            )
+        } else {
+            format!(
+                "工作表坐标已改变，已取消断线前未确认的 {cancelled} 处修改（已暂存至本地冲突草稿，当前 {retained} 条）"
+            )
+        }
     }
 
     pub(crate) fn export_cancelled_offline_drafts_tsv(&self) -> String {
-        if self.cancelled_offline_drafts.is_empty() {
+        if self.cancelled_offline_drafts.is_empty() && self.cancelled_offline_drafts_dropped == 0 {
             return String::new();
         }
         use std::fmt::Write as _;
-        let mut out = String::from("房间\t工作表\t单元格\t原值\t公式\t样式变更\t合并区域\t原因");
+        let mut out =
+            String::from("房间\t坐标纪元\t工作表\t单元格\t原值\t公式\t样式变更\t合并区域\t原因");
         for d in &self.cancelled_offline_drafts {
             let cell = sheetcore::cell_name(d.row, d.col);
+            let epoch = format!("s{}/m{}", d.coord_epoch.struct_rev, d.coord_epoch.shift_seq);
             let merge = d
                 .merge_rect
                 .map(|(r1, c1, r2, c2)| {
-                    format!(
+                    let span = format!(
                         "{}:{}",
                         sheetcore::cell_name(r1, c1),
                         sheetcore::cell_name(r2, c2)
-                    )
+                    );
+                    match d.merge_on {
+                        Some(true) => format!("合并 {span}"),
+                        Some(false) => format!("取消合并 {span}"),
+                        None => span,
+                    }
                 })
                 .unwrap_or_default();
             let style = if d.style_changed { "是" } else { "否" };
-            let formula = d.formula.as_deref().unwrap_or("");
+            let (value_col, formula_col) = match &d.value {
+                CancelledDraftValue::Unchanged => ("[仅样式/合并]".to_string(), String::new()),
+                CancelledDraftValue::Cleared => ("[清空]".to_string(), String::new()),
+                CancelledDraftValue::Value { display, formula } => (
+                    sanitize_tsv_field(display),
+                    sanitize_tsv_field(formula.as_deref().unwrap_or("")),
+                ),
+            };
             let _ = write!(
                 out,
-                "\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 sanitize_tsv_field(&d.room_id),
+                epoch,
                 sanitize_tsv_field(&d.sheet_name),
                 cell,
-                sanitize_tsv_field(&d.value_display),
-                sanitize_tsv_field(formula),
+                value_col,
+                formula_col,
                 style,
                 merge,
                 sanitize_tsv_field(&d.reason),
+            );
+        }
+        if self.cancelled_offline_drafts_dropped > 0 {
+            let _ = write!(
+                out,
+                "\n# 截断提示\t\t\t\t\t\t\t\t已保留 {} 条本地冲突草稿，超出上限 {} 条，已丢弃 {} 条",
+                self.cancelled_offline_drafts.len(),
+                MAX_CANCELLED_OFFLINE_DRAFTS,
+                self.cancelled_offline_drafts_dropped,
             );
         }
         out
@@ -387,23 +500,29 @@ impl SheetApp {
         if tsv.is_empty() {
             return false;
         }
+        let ok_status = if self.cancelled_offline_drafts_dropped > 0 {
+            format!(
+                "已复制 {} 条本地冲突草稿到剪贴板（TSV；另有 {} 条超出上限已丢弃）",
+                self.cancelled_offline_drafts.len(),
+                self.cancelled_offline_drafts_dropped,
+            )
+        } else {
+            format!(
+                "已复制 {} 条本地冲突草稿到剪贴板（TSV）",
+                self.cancelled_offline_drafts.len()
+            )
+        };
         #[cfg(test)]
         {
             crate::clipboard::set_test_clipboard(&tsv);
-            self.status = format!(
-                "已复制 {} 条本地冲突草稿到剪贴板（TSV）",
-                self.cancelled_offline_drafts.len()
-            );
+            self.status = ok_status;
             true
         }
         #[cfg(not(test))]
         {
             match arboard::Clipboard::new().and_then(|mut c| c.set_text(tsv)) {
                 Ok(()) => {
-                    self.status = format!(
-                        "已复制 {} 条本地冲突草稿到剪贴板（TSV）",
-                        self.cancelled_offline_drafts.len()
-                    );
+                    self.status = ok_status;
                     true
                 }
                 Err(_) => {
@@ -429,25 +548,26 @@ impl SheetApp {
         let mut discarded = 0usize;
 
         // 1. Check ordinary cell outbox against its bound room & unified CoordEpoch.
-        let (ops_stale, ops_room, ops_reason) = match (&self.rejoin_outbox, &self.rejoin_outbox_meta)
-        {
-            (Some((owner, _)), Some(meta)) if *owner == uid && meta.doc_uid == uid => {
-                let stale = meta.coord.is_stale(&cur_room, cur_epoch);
-                let room = if meta.coord.room_id.is_empty() {
-                    cur_room.clone()
-                } else {
-                    meta.coord.room_id.clone()
-                };
-                let reason = Self::cancellation_reason(&meta.coord, &cur_room);
-                (stale, room, reason)
-            }
-            (Some((owner, _)), None) if *owner == uid => (
-                cur_epoch.shift_seq != 0,
-                cur_room.clone(),
-                "工作表坐标已改变".to_string(),
-            ),
-            _ => (false, String::new(), String::new()),
-        };
+        let (ops_stale, ops_room, ops_epoch, ops_reason) =
+            match (&self.rejoin_outbox, &self.rejoin_outbox_meta) {
+                (Some((owner, _)), Some(meta)) if *owner == uid && meta.doc_uid == uid => {
+                    let stale = meta.coord.is_stale(&cur_room, cur_epoch);
+                    let room = if meta.coord.room_id.is_empty() {
+                        cur_room.clone()
+                    } else {
+                        meta.coord.room_id.clone()
+                    };
+                    let reason = Self::cancellation_reason(&meta.coord, &cur_room);
+                    (stale, room, meta.coord.epoch, reason)
+                }
+                (Some((owner, _)), None) if *owner == uid => (
+                    cur_epoch.shift_seq != 0,
+                    cur_room.clone(),
+                    CoordEpoch::default(),
+                    "工作表坐标已改变".to_string(),
+                ),
+                _ => (false, String::new(), CoordEpoch::default(), String::new()),
+            };
         if ops_stale {
             if let Some((_, ops)) = self.rejoin_outbox.take() {
                 for op in ops {
@@ -455,6 +575,7 @@ impl SheetApp {
                         discarded += 1;
                         self.archive_cancelled_offline_op(
                             ops_room.clone(),
+                            ops_epoch,
                             &op,
                             ops_reason.clone(),
                         );
@@ -482,7 +603,7 @@ impl SheetApp {
                     p.coord.room_id.clone()
                 };
                 let reason = Self::cancellation_reason(&p.coord, &cur_room);
-                (p.first_exclusive, p.through, room, reason)
+                (p.first_exclusive, p.through, room, p.coord.epoch, reason)
             })
             .collect();
         pastes.retain(|p| !p.coord.is_stale(&cur_room, cur_epoch) && p.through > acked);
@@ -492,13 +613,13 @@ impl SheetApp {
                 if *owner == uid {
                     let mut keep = Vec::with_capacity(ops.len());
                     for op in ops.drain(..) {
-                        if let Some((_, _, room, reason)) = stale_pastes
+                        if let Some((_, _, room, epoch, reason)) = stale_pastes
                             .iter()
-                            .find(|(prior, last, _, _)| *prior < op.ts && op.ts <= *last)
+                            .find(|(prior, last, _, _, _)| *prior < op.ts && op.ts <= *last)
                         {
                             discarded += 1;
                             if op.ts > acked {
-                                removed_paste_ops.push((room.clone(), op, reason.clone()));
+                                removed_paste_ops.push((room.clone(), *epoch, op, reason.clone()));
                             }
                         } else {
                             keep.push(op);
@@ -511,8 +632,8 @@ impl SheetApp {
                     }
                 }
             }
-            for (room, op, reason) in removed_paste_ops {
-                self.archive_cancelled_offline_op(room, &op, reason);
+            for (room, epoch, op, reason) in removed_paste_ops {
+                self.archive_cancelled_offline_op(room, epoch, &op, reason);
             }
         }
 
@@ -529,25 +650,26 @@ impl SheetApp {
                         entry.coord.room_id.clone()
                     };
                     let reason = Self::cancellation_reason(&entry.coord, &cur_room);
-                    archived.push((room, entry.sheet, entry.items, reason));
+                    archived.push((room, entry.coord.epoch, entry.sheet, entry.items, reason));
                 } else {
                     keep.push(entry);
                 }
             }
             self.rejoin_style_outbox = keep;
-            for (room, sheet, items, reason) in archived {
+            for (room, epoch, sheet, items, reason) in archived {
                 let sheet_name = self.draft_sheet_name(sheet);
                 for (row, col, _) in items {
                     self.push_cancelled_offline_draft(CancelledOfflineDraft {
                         room_id: room.clone(),
+                        coord_epoch: epoch,
                         sheet,
                         sheet_name: sheet_name.clone(),
                         row,
                         col,
-                        value_display: String::new(),
-                        formula: None,
+                        value: CancelledDraftValue::Unchanged,
                         style_changed: true,
                         merge_rect: None,
+                        merge_on: None,
                         reason: reason.clone(),
                     });
                 }
@@ -567,28 +689,32 @@ impl SheetApp {
                         entry.coord.room_id.clone()
                     };
                     let reason = Self::cancellation_reason(&entry.coord, &cur_room);
-                    archived.push((room, entry.sheet, entry.rect, entry.on, reason));
+                    archived.push((
+                        room,
+                        entry.coord.epoch,
+                        entry.sheet,
+                        entry.rect,
+                        entry.on,
+                        reason,
+                    ));
                 } else {
                     keep.push(entry);
                 }
             }
             self.rejoin_merge_outbox = keep;
-            for (room, sheet, rect, on, reason) in archived {
+            for (room, epoch, sheet, rect, on, reason) in archived {
                 let sheet_name = self.draft_sheet_name(sheet);
                 self.push_cancelled_offline_draft(CancelledOfflineDraft {
                     room_id: room,
+                    coord_epoch: epoch,
                     sheet,
                     sheet_name,
                     row: rect.0,
                     col: rect.1,
-                    value_display: if on {
-                        "合并单元格".into()
-                    } else {
-                        "取消合并".into()
-                    },
-                    formula: None,
+                    value: CancelledDraftValue::Unchanged,
                     style_changed: false,
                     merge_rect: Some(rect),
+                    merge_on: Some(on),
                     reason,
                 });
             }
@@ -1235,6 +1361,9 @@ impl SheetApp {
         };
         if !net.supports_room_tx() {
             return Err("协作宿主版本较旧，请升级后再执行该协作操作".into());
+        }
+        if matches!(patch, RoomTxPatch::AxisPermute(_)) && !net.supports_full_tx_overlay() {
+            return Err("协作宿主版本较旧，不支持完整元数据快照，请升级宿主后再移动行或列".into());
         }
         self.check_room_tx(net.site, CellShiftPhase::Forward, &patch)?;
         let Ok(id) = getrandom::u64() else {

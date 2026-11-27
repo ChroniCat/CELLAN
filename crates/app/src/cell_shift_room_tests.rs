@@ -2323,6 +2323,7 @@ fn phase6_p2a_cancelled_offline_edits_preserved_in_local_conflict_draft() {
 
     // 2) Cancelled offline edits are preserved & deduplicated in `cancelled_offline_drafts`.
     assert_eq!(guest.cancelled_offline_drafts.len(), 3);
+    assert_eq!(guest.cancelled_offline_drafts_dropped, 0);
     let b7 = guest
         .cancelled_offline_drafts
         .iter()
@@ -2330,8 +2331,13 @@ fn phase6_p2a_cancelled_offline_edits_preserved_in_local_conflict_draft() {
         .expect("missing B7 value+style draft");
     assert_eq!(b7.room_id, room_id);
     assert_eq!(b7.sheet_name, "Sheet1");
-    assert_eq!(b7.value_display, "77");
-    assert_eq!(b7.formula, None);
+    assert_eq!(
+        b7.value,
+        crate::cell_shift::CancelledDraftValue::Value {
+            display: "77".into(),
+            formula: None,
+        }
+    );
     assert!(b7.style_changed);
 
     let c7 = guest
@@ -2340,7 +2346,13 @@ fn phase6_p2a_cancelled_offline_edits_preserved_in_local_conflict_draft() {
         .find(|d| (d.sheet, d.row, d.col, d.merge_rect) == (0, 6, 2, None))
         .expect("missing C7 formula draft");
     assert_eq!(c7.sheet_name, "Sheet1");
-    assert_eq!(c7.formula.as_deref(), Some("=A1*2"));
+    assert_eq!(
+        c7.value,
+        crate::cell_shift::CancelledDraftValue::Value {
+            display: "4".into(),
+            formula: Some("=A1*2".into()),
+        }
+    );
     assert!(!c7.style_changed);
 
     let m = guest
@@ -2349,6 +2361,8 @@ fn phase6_p2a_cancelled_offline_edits_preserved_in_local_conflict_draft() {
         .find(|d| d.merge_rect == Some((7, 1, 7, 2)))
         .expect("missing B8:C8 merge draft");
     assert_eq!((m.sheet, m.row, m.col), (0, 7, 1));
+    assert_eq!(m.value, crate::cell_shift::CancelledDraftValue::Unchanged);
+    assert_eq!(m.merge_on, Some(true));
 
     // 3) TSV export & clipboard copy work cleanly.
     let tsv = guest.export_cancelled_offline_drafts_tsv();
@@ -2366,8 +2380,1209 @@ fn phase6_p2a_cancelled_offline_edits_preserved_in_local_conflict_draft() {
     // 4) Switching / opening a new document tab clears cancelled_offline_drafts.
     guest.open_in_new_tab(std::path::PathBuf::new());
     assert!(guest.cancelled_offline_drafts.is_empty());
+    assert_eq!(guest.cancelled_offline_drafts_dropped, 0);
     assert!(guest.export_cancelled_offline_drafts_tsv().is_empty());
 }
+
+fn tick_ui_frame(app: &mut SheetApp) {
+    app.poll_net();
+    app.poll_open();
+    app.poll_reorder();
+    app.sync_history();
+    app.sync_coord_epoch_side_effects();
+}
+
+fn until_ui_frame(
+    h: &mut SheetApp,
+    g: &mut SheetApp,
+    mut done: impl FnMut(&SheetApp, &SheetApp) -> bool,
+) {
+    let start = std::time::Instant::now();
+    while !done(h, g) {
+        tick_ui_frame(h);
+        tick_ui_frame(g);
+        assert!(start.elapsed().as_secs() < 10, "H={} G={}", h.status, g.status);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+fn seed_phase7_r1_baseline(wb: &mut sheetcore::Workbook) {
+    use sheetcore::{model::CellRef, table::Table, Cell, Value};
+    let sh = wb.sheet_mut(0);
+    sh.set(
+        0,
+        0,
+        Cell {
+            value: Value::Text("Header".into()),
+            formula: None,
+        },
+    );
+    sh.set(
+        0,
+        1,
+        Cell {
+            value: Value::Text("Amount".into()),
+            formula: None,
+        },
+    );
+    sh.set(
+        1,
+        0,
+        Cell {
+            value: Value::Text("Item1".into()),
+            formula: None,
+        },
+    );
+    sh.set(
+        1,
+        1,
+        Cell {
+            value: Value::Number(100.0),
+            formula: None,
+        },
+    );
+    sh.set(
+        0,
+        3,
+        Cell {
+            value: Value::Text("Header".into()),
+            formula: Some("A1:B2".into()),
+        },
+    );
+    sh.set(
+        0,
+        4,
+        Cell {
+            value: Value::Text("Amount".into()),
+            formula: None,
+        },
+    );
+    sh.set(
+        1,
+        3,
+        Cell {
+            value: Value::Text("Item1".into()),
+            formula: None,
+        },
+    );
+    sh.set(
+        1,
+        4,
+        Cell {
+            value: Value::Number(100.0),
+            formula: None,
+        },
+    );
+    sh.arrays.push((CellRef { row: 0, col: 3 }, (0, 3, 1, 4)));
+    sh.spilled.insert(CellRef { row: 0, col: 4 });
+    sh.spilled.insert(CellRef { row: 1, col: 3 });
+    sh.spilled.insert(CellRef { row: 1, col: 4 });
+    sh.spill_shapes.insert(CellRef { row: 0, col: 3 }, (2, 2));
+    sh.rows.set(0, 60.0);
+    sh.tables.push(Table {
+        name: "Table1".into(),
+        display: "Table1".into(),
+        range: (0, 0, 1, 1),
+        header_row: true,
+        totals_row: false,
+        style_name: "TableStyleMedium2".into(),
+        columns: vec!["Header".into(), "Amount".into()],
+        column_ids: vec![1, 2],
+        ..Default::default()
+    });
+}
+
+fn spawn_silent_listener() -> (u16, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            drop(stream);
+        }
+    });
+    (port, handle)
+}
+
+fn ops_from_workbook(wb: &sheetcore::Workbook, site: u32) -> Vec<sheetcore::sync::Op> {
+    let mut ops = Vec::new();
+    let mut ts = 1u64;
+    for (si, sh) in wb.sheets.iter().enumerate() {
+        for (k, cell) in sh.iter_views() {
+            let val = cell.value();
+            ops.push(sheetcore::sync::Op {
+                site,
+                sheet: si,
+                row: k.row,
+                col: k.col,
+                ts,
+                value: val.as_ref().into(),
+                formula: cell.formula().map(std::sync::Arc::from),
+            });
+            ts += 1;
+        }
+    }
+    ops
+}
+
+fn array_rect_at(sh: &sheetcore::Sheet, row: u32, col: u32) -> Option<(u32, u32, u32, u32)> {
+    sh.arrays
+        .iter()
+        .find(|(k, _)| k.row == row && k.col == col)
+        .map(|(_, rect)| *rect)
+}
+
+#[test]
+fn phase7_r1_same_batch_full_snapshot_with_structural_history_and_v1_overlay_no_double_shift() {
+    use sheetcore::{
+        cell_shift_patch::CellShiftOverlay,
+        layout::DEFAULT_ROW_H,
+        structural::Structural,
+        sync::Peer,
+        Value,
+    };
+    use std::sync::Arc;
+
+    let env = crate::test_env::TestEnv::new("p7-r1-same-batch");
+
+    // --- Part 1: Deterministic single-batch event drain + real UI frame sequence ---
+    let mut host_wb = sheetcore::Workbook::new_blank();
+    seed_phase7_r1_baseline(&mut host_wb);
+    let op = Structural::InsertRows { at: 0, n: 1 };
+    sheetcore::structural::apply_structural_wb(&mut host_wb, 0, &op);
+    sheetcore::formula::recalc_all(&mut host_wb);
+    assert_eq!(host_wb.sheet(0).tables[0].range, (1, 0, 2, 1));
+    assert!((host_wb.sheet(0).rows.size(1) - 60.0).abs() < 1e-4);
+    assert_eq!(array_rect_at(host_wb.sheet(0), 1, 3), Some((1, 3, 2, 4)));
+
+    let v1_overlay = Arc::new(CellShiftOverlay::capture(&host_wb));
+    assert!(v1_overlay.is_full_state());
+    assert_eq!(
+        v1_overlay.format_version(),
+        sheetcore::cell_shift_patch::CURRENT_OVERLAY_FORMAT_VERSION
+    );
+
+    let (port, _srv) = spawn_silent_listener();
+    let mut guest = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+    guest.wb.path = Some(env.path("r1_same_batch_guest.xlsx"));
+    seed_phase7_r1_baseline(&mut guest.wb);
+    guest.net = Some(
+        crate::net::join(
+            2,
+            "Guest".into(),
+            "doc".into(),
+            &format!("127.0.0.1:{port}"),
+            "pw".into(),
+        )
+        .unwrap(),
+    );
+    guest.peer = Some(Peer::new(2));
+    guest.undo.set_site(2);
+
+    // Enqueue Welcome + StructuralHistory + Ops + v1 TxOverlay + SnapshotDone in ONE poll_net batch.
+    {
+        let net = guest.net.as_ref().unwrap();
+        net.inject_event_for_test(crate::net::NetEvent::Welcome {
+            peers: vec![(1, "Host".into(), 1)],
+            delta_sync: false,
+            clock: 10,
+        });
+        net.inject_event_for_test(crate::net::NetEvent::StructuralHistory(vec![(0, op.clone())]));
+        net.inject_event_for_test(crate::net::NetEvent::Ops(ops_from_workbook(&host_wb, 1)));
+        net.inject_event_for_test(crate::net::NetEvent::CellShiftOverlay {
+            overlay: v1_overlay.clone(),
+            seq: 0,
+        });
+        net.inject_event_for_test(crate::net::NetEvent::SnapshotDone);
+    }
+
+    // Run the EXACT real UI frame order: poll_net -> poll_open -> poll_reorder -> sync_history.
+    tick_ui_frame(&mut guest);
+    assert!(guest.joined_doc && !guest.in_snapshot);
+    assert_eq!(guest.wb.sheet(0).tables[0].range, (1, 0, 2, 1), "Table1 must stay at A2:B3, not double-shift to A3:B4");
+    assert!((guest.wb.sheet(0).rows.size(1) - 60.0).abs() < 1e-4, "row 1 height must stay 60");
+    assert!((guest.wb.sheet(0).rows.size(0) - DEFAULT_ROW_H).abs() < 1e-4);
+    assert!((guest.wb.sheet(0).rows.size(2) - DEFAULT_ROW_H).abs() < 1e-4, "row 2 height must NOT receive double-shifted 60");
+    assert_eq!(guest.wb.sheet(0).value(1, 0), Value::Text("Header".into()));
+    assert_eq!(guest.wb.sheet(0).value(2, 1), Value::Number(100.0));
+    assert_eq!(array_rect_at(guest.wb.sheet(0), 1, 3), Some((1, 3, 2, 4)));
+    assert!(guest.wb.sheet(0).spilled.contains(&sheetcore::model::CellRef { row: 2, col: 4 }));
+    assert_eq!(guest.history_planted, guest.struct_history.len());
+    assert_eq!(guest.history_last_epoch, guest.wb_epoch);
+
+    // Additional UI frames must remain completely idempotent.
+    for _ in 0..3 {
+        tick_ui_frame(&mut guest);
+    }
+    assert_eq!(guest.wb.sheet(0).tables[0].range, (1, 0, 2, 1));
+    assert!((guest.wb.sheet(0).rows.size(1) - 60.0).abs() < 1e-4);
+
+    // --- Part 2: Real TCP host + unsaved InsertRows + late join under real UI frame ticks ---
+    let (mut host, guest_seed) = sort_apps_with_baseline(&env, seed_phase7_r1_baseline);
+    host.structural(Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(host.wb.sheet(0).tables[0].range, (1, 0, 2, 1));
+    assert!((host.wb.sheet(0).rows.size(1) - 60.0).abs() < 1e-4);
+
+    let mut late = late_join(&env, &guest_seed, seed_phase7_r1_baseline);
+    // Let host serve CaptureCellShiftOverlay and enqueue all intro frames before late's UI frame.
+    let wait_start = std::time::Instant::now();
+    while !late.net.as_ref().unwrap().is_live() {
+        host.poll_net();
+        assert!(wait_start.elapsed().as_secs() < 5);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    for _ in 0..15 {
+        host.poll_net();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    until_ui_frame(&mut host, &mut late, |_, l| l.joined_doc && !l.in_snapshot);
+    for _ in 0..3 {
+        tick_ui_frame(&mut late);
+    }
+    assert!(!late.snapshot_is_delta);
+    assert_eq!(late.wb.sheet(0).tables[0].range, (1, 0, 2, 1));
+    assert!((late.wb.sheet(0).rows.size(1) - 60.0).abs() < 1e-4);
+    assert!((late.wb.sheet(0).rows.size(2) - DEFAULT_ROW_H).abs() < 1e-4);
+    assert_eq!(late.wb.sheet(0).arrays, host.wb.sheet(0).arrays);
+    assert_eq!(late.wb.sheet(0).spilled, host.wb.sheet(0).spilled);
+    assert_eq!(late.wb.sheet(0).value(2, 1), Value::Number(100.0));
+}
+
+#[test]
+fn phase7_r1_cross_frame_structural_history_and_legacy_v0_overlay_ordering() {
+    use sheetcore::{
+        cell_shift_patch::CellShiftOverlay,
+        layout::DEFAULT_ROW_H,
+        structural::Structural,
+        sync::Peer,
+        Value,
+    };
+    use std::sync::Arc;
+
+    let env = crate::test_env::TestEnv::new("p7-r1-cross-frame");
+    let mut host_wb = sheetcore::Workbook::new_blank();
+    seed_phase7_r1_baseline(&mut host_wb);
+    let op = Structural::InsertRows { at: 0, n: 1 };
+    sheetcore::structural::apply_structural_wb(&mut host_wb, 0, &op);
+    sheetcore::formula::recalc_all(&mut host_wb);
+
+    let v1_overlay = Arc::new(CellShiftOverlay::capture(&host_wb));
+    let legacy_v0_overlay: Arc<CellShiftOverlay> = {
+        let mut val = serde_json::to_value(&*v1_overlay).unwrap();
+        let obj = val.as_object_mut().unwrap();
+        obj.remove("format_version");
+        if let Some(sheets) = obj.get_mut("sheets").and_then(|s| s.as_array_mut()) {
+            for sh in sheets {
+                if let Some(so) = sh.as_object_mut() {
+                    so.remove("tables");
+                    so.remove("layout");
+                    so.remove("arrays");
+                    so.remove("spilled");
+                    so.remove("spill_shapes");
+                    so.remove("filter");
+                }
+            }
+        }
+        let ov: CellShiftOverlay = serde_json::from_value(val).unwrap();
+        assert_eq!(ov.format_version(), 0);
+        assert!(!ov.is_full_state());
+        assert!(ov.wire_valid());
+        Arc::new(ov)
+    };
+
+    // Test all three snapshot modes across frames:
+    // 1) v1 full overlay, 2) legacy v0 partial overlay, 3) no overlay at all.
+    let modes: [(&str, Option<Arc<CellShiftOverlay>>); 3] = [
+        ("v1-full", Some(v1_overlay.clone())),
+        ("legacy-v0", Some(legacy_v0_overlay)),
+        ("no-overlay", None),
+    ];
+
+    for (label, maybe_ov) in modes {
+        let (port, _srv) = spawn_silent_listener();
+        let mut guest = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+        guest.wb.path = Some(env.path(&format!("r1_cross_{label}.xlsx")));
+        seed_phase7_r1_baseline(&mut guest.wb);
+        guest.net = Some(
+            crate::net::join(
+                2,
+                "Guest".into(),
+                "doc".into(),
+                &format!("127.0.0.1:{port}"),
+                "pw".into(),
+            )
+            .unwrap(),
+        );
+        guest.peer = Some(Peer::new(2));
+        guest.undo.set_site(2);
+
+        // Frame 1: Welcome + StructuralHistory arrive BEFORE SnapshotDone.
+        {
+            let net = guest.net.as_ref().unwrap();
+            net.inject_event_for_test(crate::net::NetEvent::Welcome {
+                peers: vec![(1, "Host".into(), 1)],
+                delta_sync: false,
+                clock: 10,
+            });
+            net.inject_event_for_test(crate::net::NetEvent::StructuralHistory(vec![(
+                0,
+                op.clone(),
+            )]));
+        }
+        tick_ui_frame(&mut guest);
+        assert!(guest.in_snapshot, "{label}: still in snapshot on frame 1");
+        assert_eq!(
+            guest.wb.sheet(0).tables[0].range,
+            (0, 0, 1, 1),
+            "{label}: sync_history must be guarded while in_snapshot"
+        );
+        assert!(
+            (guest.wb.sheet(0).rows.size(0) - 60.0).abs() < 1e-4,
+            "{label}: row height must not shift prematurely in frame 1"
+        );
+        assert_eq!(guest.history_planted, 0, "{label}: history must stay unplanted until SnapshotDone");
+
+        // Frame 2: Ops + optional overlay + SnapshotDone arrive.
+        {
+            let net = guest.net.as_ref().unwrap();
+            net.inject_event_for_test(crate::net::NetEvent::Ops(ops_from_workbook(&host_wb, 1)));
+            if let Some(ov) = maybe_ov {
+                net.inject_event_for_test(crate::net::NetEvent::CellShiftOverlay {
+                    overlay: ov,
+                    seq: 0,
+                });
+            }
+            net.inject_event_for_test(crate::net::NetEvent::SnapshotDone);
+        }
+        tick_ui_frame(&mut guest);
+        assert!(guest.joined_doc && !guest.in_snapshot, "{label}: snapshot settled");
+        assert_eq!(
+            guest.wb.sheet(0).tables[0].range,
+            (1, 0, 2, 1),
+            "{label}: Table1 must shift exactly once to A2:B3"
+        );
+        assert!(
+            (guest.wb.sheet(0).rows.size(1) - 60.0).abs() < 1e-4,
+            "{label}: row 1 height must be 60"
+        );
+        assert!(
+            (guest.wb.sheet(0).rows.size(2) - DEFAULT_ROW_H).abs() < 1e-4,
+            "{label}: row 2 must NOT double-shift"
+        );
+        assert_eq!(
+            guest.wb.sheet(0).value(2, 1),
+            Value::Number(100.0),
+            "{label}: authoritative snapshot cells must be intact"
+        );
+        assert_eq!(
+            array_rect_at(guest.wb.sheet(0), 1, 3),
+            Some((1, 3, 2, 4)),
+            "{label}: array range must shift exactly once"
+        );
+        assert_eq!(guest.history_planted, guest.struct_history.len());
+
+        // Frame 3: subsequent UI ticks must never shift again.
+        for _ in 0..3 {
+            tick_ui_frame(&mut guest);
+        }
+        assert_eq!(guest.wb.sheet(0).tables[0].range, (1, 0, 2, 1), "{label}: idempotent frame 3");
+        assert!((guest.wb.sheet(0).rows.size(1) - 60.0).abs() < 1e-4, "{label}: idempotent row height");
+    }
+}
+
+#[test]
+fn phase7_r1_full_rejoin_after_structural_and_axis_permute_plus_live_structural_op() {
+    use sheetcore::structural::Structural;
+    let env = crate::test_env::TestEnv::new("p7-r1-rejoin-live");
+    let (mut host, mut guest) =
+        sort_apps_with_baseline(&env, seed_phase6_a1_rich_metadata_baseline);
+    seed_phase6_a1_live_cells(&mut host, &mut guest);
+
+    // 1) Live InsertRows while both peers are online.
+    host.structural(Structural::InsertRows { at: 0, n: 1 });
+    until_ui_frame(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).tables[0].range == (1, 0, 2, 1)
+            && g.wb.sheet(0).tables[0].range == (1, 0, 2, 1)
+    });
+    assert_phase6_a1_metadata_matches_host(&host, &guest, "after-first-live-insert");
+
+    // 2) Force full rejoin while host performs another InsertRows + an AxisPermute.
+    guest.net.as_ref().unwrap().request_snapshot_resync();
+    until_ui_frame(&mut host, &mut guest, |_, g| g.room_lost);
+
+    host.structural(Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(host.wb.sheet(0).tables[0].range, (2, 0, 3, 1));
+    assert!((host.wb.sheet(0).rows.size(2) - 60.0).abs() < 1e-4);
+
+    assert!(host.move_axis_headers(true, 2, 2, 6), "{}", host.status);
+    until_ui_frame(&mut host, &mut guest, |h, _| {
+        h.wb.sheet(0).tables[0].range == (4, 0, 5, 1)
+            && !h.net.as_ref().unwrap().pending_structure()
+    });
+    let permute_seq = host.shift_intro.applied_seq;
+    assert!(permute_seq > 0);
+    assert!((host.wb.sheet(0).rows.size(4) - 60.0).abs() < 1e-4);
+
+    // Wait for guest's full rejoin to settle under real UI frame order.
+    until_ui_frame(&mut host, &mut guest, |_, g| {
+        g.joined_doc
+            && !g.in_snapshot
+            && !g.room_lost
+            && g.shift_intro.applied_seq >= permute_seq
+    });
+    for _ in 0..4 {
+        tick_ui_frame(&mut guest);
+    }
+    assert!(!guest.snapshot_is_delta);
+    assert_eq!(guest.wb.sheet(0).tables[0].range, (4, 0, 5, 1));
+    assert!((guest.wb.sheet(0).rows.size(4) - 60.0).abs() < 1e-4);
+    assert_eq!(guest.history_planted, guest.struct_history.len());
+    assert_phase6_a1_metadata_matches_host(&host, &guest, "after-full-rejoin-structural-and-permute");
+
+    // 3) Live Structural op AFTER SnapshotDone must shift ONCE and advance history_planted.
+    let planted_before = guest.history_planted;
+    host.structural(Structural::InsertRows { at: 0, n: 1 });
+    until_ui_frame(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).tables[0].range == (5, 0, 6, 1)
+            && g.wb.sheet(0).tables[0].range == (5, 0, 6, 1)
+    });
+    for _ in 0..4 {
+        tick_ui_frame(&mut guest);
+    }
+    assert_eq!(guest.wb.sheet(0).tables[0].range, (5, 0, 6, 1));
+    assert!((guest.wb.sheet(0).rows.size(5) - 60.0).abs() < 1e-4);
+    assert_eq!(guest.history_planted, planted_before + 1);
+    assert_eq!(guest.history_planted, guest.struct_history.len());
+    assert_phase6_a1_metadata_matches_host(&host, &guest, "after-post-rejoin-live-insert");
+}
+
+#[test]
+fn phase7_r4_conflict_drafts_clear_style_cross_epoch_and_10001_truncation() {
+    use crate::cell_shift::{
+        CancelledDraftValue, CancelledOfflineDraft, DraftArchiveOutcome,
+        MAX_CANCELLED_OFFLINE_DRAFTS,
+    };
+    use crate::net::CoordEpoch;
+    use sheetcore::{sync::Op, Value};
+
+    let _env = crate::test_env::TestEnv::new("p7-r4-conflict-drafts");
+    let mut app = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+    let ep1 = CoordEpoch {
+        struct_rev: 0,
+        shift_seq: 1,
+    };
+    let ep2 = CoordEpoch {
+        struct_rev: 1,
+        shift_seq: 1,
+    };
+    let ep3 = CoordEpoch {
+        struct_rev: 1,
+        shift_seq: 2,
+    };
+
+    // 1) Explicit clear overwrites prior drafted value at the same (room, coord_epoch, sheet, row, col).
+    let op_write = Op {
+        site: 2,
+        sheet: 0,
+        row: 0,
+        col: 0,
+        ts: 10,
+        value: (&Value::Text("old edit".into())).into(),
+        formula: None,
+    };
+    assert_eq!(
+        app.archive_cancelled_offline_op("room-1".into(), ep1, &op_write, "工作表坐标已改变".into()),
+        DraftArchiveOutcome::Stored
+    );
+    let op_clear = Op {
+        site: 2,
+        sheet: 0,
+        row: 0,
+        col: 0,
+        ts: 11,
+        value: (&Value::Empty).into(),
+        formula: None,
+    };
+    assert_eq!(
+        app.archive_cancelled_offline_op("room-1".into(), ep1, &op_clear, "工作表坐标已改变".into()),
+        DraftArchiveOutcome::Updated
+    );
+    assert_eq!(app.cancelled_offline_drafts.len(), 1);
+    assert_eq!(
+        app.cancelled_offline_drafts[0].value,
+        CancelledDraftValue::Cleared
+    );
+
+    // 2) Style-only (`Unchanged`) preserves prior `Cleared` and prior `Value`.
+    assert_eq!(
+        app.push_cancelled_offline_draft(CancelledOfflineDraft {
+            room_id: "room-1".into(),
+            coord_epoch: ep1,
+            sheet: 0,
+            sheet_name: "Sheet1".into(),
+            row: 0,
+            col: 0,
+            value: CancelledDraftValue::Unchanged,
+            style_changed: true,
+            merge_rect: None,
+            merge_on: None,
+            reason: "工作表坐标已改变".into(),
+        }),
+        DraftArchiveOutcome::Updated
+    );
+    assert_eq!(
+        app.cancelled_offline_drafts[0].value,
+        CancelledDraftValue::Cleared
+    );
+    assert!(app.cancelled_offline_drafts[0].style_changed);
+
+    assert_eq!(
+        app.push_cancelled_offline_draft(CancelledOfflineDraft {
+            room_id: "room-1".into(),
+            coord_epoch: ep1,
+            sheet: 0,
+            sheet_name: "Sheet1".into(),
+            row: 1,
+            col: 0,
+            value: CancelledDraftValue::Value {
+                display: "42".into(),
+                formula: Some("=21*2".into()),
+            },
+            style_changed: false,
+            merge_rect: None,
+            merge_on: None,
+            reason: "工作表坐标已改变".into(),
+        }),
+        DraftArchiveOutcome::Stored
+    );
+    assert_eq!(
+        app.push_cancelled_offline_draft(CancelledOfflineDraft {
+            room_id: "room-1".into(),
+            coord_epoch: ep1,
+            sheet: 0,
+            sheet_name: "Sheet1".into(),
+            row: 1,
+            col: 0,
+            value: CancelledDraftValue::Unchanged,
+            style_changed: true,
+            merge_rect: Some((1, 0, 1, 1)),
+            merge_on: Some(true),
+            reason: "工作表坐标已改变".into(),
+        }),
+        DraftArchiveOutcome::Updated
+    );
+    assert_eq!(
+        app.cancelled_offline_drafts[1].value,
+        CancelledDraftValue::Value {
+            display: "42".into(),
+            formula: Some("=21*2".into()),
+        }
+    );
+    assert!(app.cancelled_offline_drafts[1].style_changed);
+    assert_eq!(
+        app.cancelled_offline_drafts[1].merge_rect,
+        Some((1, 0, 1, 1))
+    );
+
+    // Pure style-only draft displays as `[仅样式/合并]`.
+    assert_eq!(
+        app.push_cancelled_offline_draft(CancelledOfflineDraft {
+            room_id: "room-1".into(),
+            coord_epoch: ep1,
+            sheet: 0,
+            sheet_name: "Sheet1".into(),
+            row: 2,
+            col: 0,
+            value: CancelledDraftValue::Unchanged,
+            style_changed: true,
+            merge_rect: None,
+            merge_on: None,
+            reason: "工作表坐标已改变".into(),
+        }),
+        DraftArchiveOutcome::Stored
+    );
+
+    // 3) Cross-epoch separation at the same coordinate A1 (`(0, 0)`).
+    assert_eq!(
+        app.push_cancelled_offline_draft(CancelledOfflineDraft {
+            room_id: "room-1".into(),
+            coord_epoch: ep2,
+            sheet: 0,
+            sheet_name: "Sheet1".into(),
+            row: 0,
+            col: 0,
+            value: CancelledDraftValue::Value {
+                display: "epoch2-edit".into(),
+                formula: None,
+            },
+            style_changed: false,
+            merge_rect: None,
+            merge_on: None,
+            reason: "工作表坐标已改变".into(),
+        }),
+        DraftArchiveOutcome::Stored
+    );
+    assert_eq!(
+        app.push_cancelled_offline_draft(CancelledOfflineDraft {
+            room_id: "room-1".into(),
+            coord_epoch: ep3,
+            sheet: 0,
+            sheet_name: "Sheet1".into(),
+            row: 0,
+            col: 0,
+            value: CancelledDraftValue::Cleared,
+            style_changed: false,
+            merge_rect: None,
+            merge_on: None,
+            reason: "工作表坐标已改变".into(),
+        }),
+        DraftArchiveOutcome::Stored
+    );
+    assert_eq!(app.cancelled_offline_drafts.len(), 5);
+    assert_eq!(app.cancelled_offline_drafts_dropped, 0);
+
+    let tsv = app.export_cancelled_offline_drafts_tsv();
+    assert!(tsv.contains("坐标纪元"), "TSV header must include coord_epoch column: {tsv}");
+    assert!(tsv.contains("s0/m1\tSheet1\tA1\t[清空]\t\t是"), "{tsv}");
+    assert!(tsv.contains("s0/m1\tSheet1\tA2\t42\t=21*2\t是\t合并 A2:B2"), "{tsv}");
+    assert!(tsv.contains("s0/m1\tSheet1\tA3\t[仅样式/合并]\t\t是"), "{tsv}");
+    assert!(tsv.contains("s1/m1\tSheet1\tA1\tepoch2-edit"), "{tsv}");
+    assert!(tsv.contains("s1/m2\tSheet1\tA1\t[清空]"), "{tsv}");
+    assert!(!tsv.contains("old edit"), "overwritten value must not remain after explicit clear");
+
+    // 4) 10,001 distinct drafts: 10,000 retained + 1 dropped/truncated surfaced in UI & TSV.
+    app.clear_cancelled_offline_drafts();
+    assert!(app.cancelled_offline_drafts.is_empty());
+    assert_eq!(app.cancelled_offline_drafts_dropped, 0);
+
+    for i in 0..(MAX_CANCELLED_OFFLINE_DRAFTS + 1) {
+        let outcome = app.push_cancelled_offline_draft(CancelledOfflineDraft {
+            room_id: "room-cap".into(),
+            coord_epoch: ep1,
+            sheet: 0,
+            sheet_name: "Sheet1".into(),
+            row: (i / 100) as u32,
+            col: (i % 100) as u32,
+            value: CancelledDraftValue::Value {
+                display: format!("v{i}"),
+                formula: None,
+            },
+            style_changed: false,
+            merge_rect: None,
+            merge_on: None,
+            reason: "工作表坐标已改变".into(),
+        });
+        if i < MAX_CANCELLED_OFFLINE_DRAFTS {
+            assert_eq!(outcome, DraftArchiveOutcome::Stored);
+        } else {
+            assert_eq!(outcome, DraftArchiveOutcome::Truncated);
+        }
+    }
+    assert_eq!(app.cancelled_offline_drafts.len(), MAX_CANCELLED_OFFLINE_DRAFTS);
+    assert_eq!(app.cancelled_offline_drafts_dropped, 1);
+
+    // Updating an already-retained coordinate while at capacity succeeds without incrementing dropped.
+    assert_eq!(
+        app.push_cancelled_offline_draft(CancelledOfflineDraft {
+            room_id: "room-cap".into(),
+            coord_epoch: ep1,
+            sheet: 0,
+            sheet_name: "Sheet1".into(),
+            row: 0,
+            col: 0,
+            value: CancelledDraftValue::Cleared,
+            style_changed: false,
+            merge_rect: None,
+            merge_on: None,
+            reason: "工作表坐标已改变".into(),
+        }),
+        DraftArchiveOutcome::Updated
+    );
+    assert_eq!(app.cancelled_offline_drafts.len(), MAX_CANCELLED_OFFLINE_DRAFTS);
+    assert_eq!(app.cancelled_offline_drafts_dropped, 1);
+    assert_eq!(
+        app.cancelled_offline_drafts[0].value,
+        CancelledDraftValue::Cleared
+    );
+
+    let btn_label = app.conflict_drafts_button_label();
+    assert!(
+        btn_label.contains("10000") && btn_label.contains("已丢弃1"),
+        "unexpected button label: {btn_label}"
+    );
+    let status_msg = app.format_cancelled_edits_status(MAX_CANCELLED_OFFLINE_DRAFTS + 1);
+    assert!(
+        status_msg.contains("保留 10000") && status_msg.contains("已丢弃 1"),
+        "unexpected status message: {status_msg}"
+    );
+    let truncated_tsv = app.export_cancelled_offline_drafts_tsv();
+    assert!(
+        truncated_tsv.contains("已保留 10000") && truncated_tsv.contains("已丢弃 1"),
+        "TSV must surface truncation summary"
+    );
+
+    crate::clipboard::clear_test_clipboard();
+    assert!(app.copy_cancelled_offline_drafts_to_clipboard());
+    assert!(
+        app.status.contains("10000") && app.status.contains("1") && app.status.contains("丢弃"),
+        "clipboard status must surface dropped count: {}",
+        app.status
+    );
+
+    app.clear_cancelled_offline_drafts();
+    assert!(app.cancelled_offline_drafts.is_empty());
+    assert_eq!(app.cancelled_offline_drafts_dropped, 0);
+}
+
+#[test]
+fn phase7_f2_new_guest_against_legacy_host_gates_axis_permute_and_handles_v0_snapshot() {
+    use serde_json::json;
+    use sheetcore::{
+        cell_shift_patch::CellShiftOverlay,
+        layout::DEFAULT_ROW_H,
+        structural::Structural,
+        sync::{Msg, Peer},
+        Value,
+    };
+    use std::io::{BufRead, BufReader, Write};
+
+    let env = crate::test_env::TestEnv::new("p7-f2-legacy-host");
+    let mut host_wb = sheetcore::Workbook::new_blank();
+    seed_phase7_r1_baseline(&mut host_wb);
+    let op = Structural::InsertRows { at: 0, n: 1 };
+    sheetcore::structural::apply_structural_wb(&mut host_wb, 0, &op);
+    sheetcore::formula::recalc_all(&mut host_wb);
+
+    // Add a legacy-covered metadata change (a note at A2) to prove the v0 overlay is actually applied.
+    host_wb.sheet_mut(0).notes.insert(
+        sheetcore::model::CellRef { row: 1, col: 0 },
+        sheetcore::notes::Note {
+            r: 1,
+            c: 0,
+            text: "legacy-v0-note".into(),
+            author: "LegacyHost".into(),
+        },
+    );
+
+    // Strip format_version + v1-only metadata to simulate a 1c84f4f host payload.
+    let v0_bytes = {
+        let mut val = serde_json::to_value(CellShiftOverlay::capture(&host_wb)).unwrap();
+        let obj = val.as_object_mut().unwrap();
+        obj.remove("format_version");
+        if let Some(sheets) = obj.get_mut("sheets").and_then(|s| s.as_array_mut()) {
+            for sh in sheets {
+                if let Some(so) = sh.as_object_mut() {
+                    so.remove("tables");
+                    so.remove("layout");
+                    so.remove("arrays");
+                    so.remove("spilled");
+                    so.remove("spill_shapes");
+                    so.remove("filter");
+                }
+            }
+        }
+        serde_json::to_vec(&val).unwrap()
+    };
+    let snap_ops = ops_from_workbook(&host_wb, 1);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let salt = [7u8; 16];
+        let room_salt = [9u8; 16];
+        let room_key = sheetcore::wire::RoomKey::derive("pw", &room_salt);
+        let nonce = 4242u64;
+        let challenge = Msg::ChallengeSalt {
+            nonce,
+            salt: sheetcore::wire::b64_encode(&salt),
+            room_salt: sheetcore::wire::b64_encode(&room_salt),
+        };
+        let mut line = serde_json::to_string(&challenge).unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        let mut sess = sheetcore::wire::Session::host_side(&room_key, &salt);
+        let mut hello_line = String::new();
+        reader.read_line(&mut hello_line).unwrap();
+        let hello_plain = sess.open(hello_line.trim()).expect("open Hello");
+        let hello_val: serde_json::Value = serde_json::from_str(&hello_plain).unwrap();
+        assert_eq!(hello_val["t"], "Hello");
+        assert_eq!(hello_val["full_tx_overlay"], json!(true));
+
+        // Legacy 1c84f4f Welcome: room_tx=true, cell_shifts=true, NO full_tx_overlay field.
+        let mut send_json = |v: serde_json::Value| {
+            let mut f = sess.seal(&v.to_string());
+            f.push('\n');
+            stream.write_all(f.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        };
+        send_json(json!({
+            "t": "Welcome",
+            "site": 2,
+            "doc": "doc",
+            "peers": [[1, "LegacyHost", 1]],
+            "delta_sync": false,
+            "clock": 10,
+            "batch_ops": true,
+            "cell_shifts_v2": true,
+            "room_tx": true,
+            "sort_permutation": true,
+            "structural_ack": true,
+            "thread_changes": true,
+            "palette_styles": true,
+            "room_id": "legacy-room",
+            "watermark": 1,
+            "structure_revision": 1,
+            "binary_v3": false,
+            "compact_v3": false,
+            "acked_op_ts": 0
+        }));
+        send_json(serde_json::to_value(Msg::StructuralLog { items: vec![(0, op)] }).unwrap());
+        send_json(
+            serde_json::to_value(Msg::SnapshotChunk {
+                ops: snap_ops,
+                last: false,
+            })
+            .unwrap(),
+        );
+        send_json(
+            serde_json::to_value(Msg::CellShiftOverlayPart {
+                seq: 0,
+                index: 0,
+                last: true,
+                data: hex::encode(&v0_bytes),
+            })
+            .unwrap(),
+        );
+        send_json(serde_json::to_value(Msg::Snapshot { ops: Vec::new() }).unwrap());
+        // Keep the connection open until guest shuts down so guest stays live for the AxisPermute gate check.
+        let mut eof = String::new();
+        let _ = reader.read_line(&mut eof);
+    });
+
+    let mut guest = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+    guest.wb.path = Some(env.path("f2_new_guest.xlsx"));
+    seed_phase7_r1_baseline(&mut guest.wb);
+    guest.net = Some(
+        crate::net::join(
+            2,
+            "NewGuest".into(),
+            "doc".into(),
+            &format!("127.0.0.1:{port}"),
+            "pw".into(),
+        )
+        .unwrap(),
+    );
+    guest.peer = Some(Peer::new(2));
+    guest.undo.set_site(2);
+
+    let start = std::time::Instant::now();
+    while !(guest.joined_doc && !guest.in_snapshot) {
+        tick_ui_frame(&mut guest);
+        assert!(start.elapsed().as_secs() < 5, "status={}", guest.status);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for _ in 0..3 {
+        tick_ui_frame(&mut guest);
+    }
+
+    // 1) Legacy v0 snapshot + StructuralLog settled cleanly ONCE (no double shift),
+    //    and legacy-covered metadata (note from v0 overlay) was applied.
+    assert!(guest.net.as_ref().unwrap().supports_room_tx());
+    assert!(!guest.net.as_ref().unwrap().supports_full_tx_overlay());
+    assert_eq!(guest.wb.sheet(0).tables[0].range, (1, 0, 2, 1));
+    assert!((guest.wb.sheet(0).rows.size(1) - 60.0).abs() < 1e-4);
+    assert!((guest.wb.sheet(0).rows.size(2) - DEFAULT_ROW_H).abs() < 1e-4);
+    assert_eq!(guest.wb.sheet(0).value(2, 1), Value::Number(100.0));
+    assert_eq!(
+        guest
+            .wb
+            .sheet(0)
+            .notes
+            .get(&sheetcore::model::CellRef { row: 1, col: 0 })
+            .map(|n| n.text.as_str()),
+        Some("legacy-v0-note"),
+        "legacy v0 overlay metadata must actually be installed"
+    );
+
+    // 2) Local AxisPermute initiation against the legacy host must be blocked with upgrade notice.
+    let moved = guest.move_axis_headers(true, 1, 2, 5);
+    assert!(!moved, "AxisPermute must be gated against legacy full_tx_overlay=false host");
+    assert!(
+        guest.status.contains("升级") && guest.status.contains("完整元数据快照"),
+        "unexpected gate status: {}",
+        guest.status
+    );
+    assert!(
+        !guest.net.as_ref().unwrap().pending_structure(),
+        "blocked AxisPermute must not enter pending_structure"
+    );
+    assert_eq!(guest.wb.sheet(0).tables[0].range, (1, 0, 2, 1));
+
+    guest.net.take().unwrap().shutdown();
+    let _ = server.join();
+}
+
+#[test]
+fn phase7_r3_app_ai_rich_only_cell_batch_remote_edit_leave_session_undo_skips_cleanly() {
+    use sheetcore::{richtext::RichRun, Cell, Value};
+
+    let env = crate::test_env::TestEnv::new("p7-r3-ai-rich-only-leave");
+    let ctx = eframe::egui::Context::default();
+
+    let make_runs = || {
+        let mut bold = RichRun::plain("total");
+        bold.bold = true;
+        vec![RichRun::plain("Revenue "), bold]
+    };
+
+    // Test all 4 peer replacement types from peer-review R3: text, number, formula, blank.
+    let replacements: [(&str, Cell); 4] = [
+        (
+            "text",
+            Cell {
+                value: Value::Text("Peer replacement".into()),
+                formula: None,
+            },
+        ),
+        (
+            "number",
+            Cell {
+                value: Value::Number(123.0),
+                formula: None,
+            },
+        ),
+        (
+            "formula",
+            Cell {
+                value: Value::Number(4.0),
+                formula: Some("2+2".into()),
+            },
+        ),
+        (
+            "blank",
+            Cell {
+                value: Value::Empty,
+                formula: None,
+            },
+        ),
+    ];
+
+    for (label, peer_cell) in replacements {
+        let (mut host, mut guest) = sort_apps(&env);
+        let a1_runs = make_runs();
+        let initial = Cell {
+            value: Value::Text("Revenue total".into()),
+            formula: None,
+        };
+        for app in [&mut host, &mut guest] {
+            let sh = app.wb.sheet_mut(0);
+            sh.set(0, 0, initial.clone());
+            sh.rich.insert((0, 0), a1_runs.clone());
+            if let Some(peer) = app.peer.as_mut() {
+                peer.seed_cell(0, 0, 0, &initial);
+            }
+        }
+        guest.ai.bound_doc_uid = Some(guest.doc_uid);
+        guest.ai.messages.push(crate::ai_agent::AiMessage {
+            role: crate::ai_agent::AiRole::Assistant,
+            content: String::new(),
+            reasoning: String::new(),
+            reasoning_open: false,
+            tool_logs: Vec::new(),
+            error: None,
+            undo_ids: Vec::new(),
+        });
+
+        // 1) AI set_cells duplicate-coordinate write strips RichRuns with zero net input/style diff.
+        let tc = crate::ai_agent::ToolCallSpec {
+            name: "set_cells".into(),
+            arguments: serde_json::json!({
+                "edits": [
+                    {"cell": "A1", "value": 99},
+                    {"cell": "A1", "value": "Revenue total"}
+                ]
+            }),
+        };
+        let _ = guest.execute_ai_tool(&tc, &ctx);
+        assert_eq!(
+            guest.wb.sheet(0).value(0, 0),
+            Value::Text("Revenue total".into()),
+            "{label}: duplicate AI write returns plain text"
+        );
+        assert!(
+            !guest.wb.sheet(0).rich.contains_key(&(0, 0)),
+            "{label}: intermediate numeric write strips RichRuns"
+        );
+        assert_eq!(guest.undo.depth().0, 1, "{label}: rich-only CellBatch recorded");
+
+        // Let host observe guest's AI write so host's LWW clock advances past guest's op.
+        let guest_ts = guest.peer.as_ref().unwrap().clock;
+        until(&mut host, &mut guest, |h, _| {
+            h.peer.as_ref().unwrap().clock >= guest_ts
+        });
+
+        // 2) Remote peer (host) edits A1 to `peer_cell` and broadcasts it to guest.
+        host.wb.sheet_mut(0).set(0, 0, peer_cell.clone());
+        host.wb.sheet_mut(0).rich.remove(&(0, 0));
+        host.broadcast_cells(&[(0, 0, 0)]);
+        until(&mut host, &mut guest, |_, g| {
+            g.wb.sheet(0)
+                .get(0, 0)
+                .map_or_else(|| peer_cell.is_blank(), |cur| cur.same_input(&peer_cell))
+        });
+        assert!(!guest.wb.sheet(0).rich.contains_key(&(0, 0)));
+        assert_eq!(guest.undo.depth().0, 1, "{label}: remote edit does not enter local undo stack");
+
+        // 3) Local user executes "断开协作" (`leave_session`) — removes net/locks, keeps local CellBatch.
+        guest.leave_session();
+        assert!(guest.net.is_none());
+        assert_eq!(guest.undo.depth().0, 1);
+
+        // 4) Local user executes `apply_undo(false)` -> must skip cleanly without attaching stale RichRuns!
+        let _ = guest.apply_undo(false);
+        assert!(
+            guest
+                .wb
+                .sheet(0)
+                .get(0, 0)
+                .map_or_else(|| peer_cell.is_blank(), |cur| cur.same_input(&peer_cell)),
+            "{label}: peer cell input must remain intact"
+        );
+        assert!(
+            !guest.wb.sheet(0).rich.contains_key(&(0, 0)),
+            "{label}: stale RichRuns must NOT be attached onto peer's replacement cell"
+        );
+    }
+
+    // 5) Unconflicted rich-only AI CellBatch after leave_session still roundtrips Undo/Redo cleanly.
+    let (_host, mut guest) = sort_apps(&env);
+    let a1_runs = make_runs();
+    let initial = Cell {
+        value: Value::Text("Revenue total".into()),
+        formula: None,
+    };
+    guest.wb.sheet_mut(0).set(0, 0, initial.clone());
+    guest.wb.sheet_mut(0).rich.insert((0, 0), a1_runs.clone());
+    guest.ai.bound_doc_uid = Some(guest.doc_uid);
+    guest.ai.messages.push(crate::ai_agent::AiMessage {
+        role: crate::ai_agent::AiRole::Assistant,
+        content: String::new(),
+        reasoning: String::new(),
+        reasoning_open: false,
+        tool_logs: Vec::new(),
+        error: None,
+        undo_ids: Vec::new(),
+    });
+    let tc = crate::ai_agent::ToolCallSpec {
+        name: "set_cells".into(),
+        arguments: serde_json::json!({
+            "edits": [
+                {"cell": "A1", "value": 99},
+                {"cell": "A1", "value": "Revenue total"}
+            ]
+        }),
+    };
+    let _ = guest.execute_ai_tool(&tc, &ctx);
+    assert!(!guest.wb.sheet(0).rich.contains_key(&(0, 0)));
+    guest.leave_session();
+    assert!(guest.apply_undo(false), "{}", guest.status);
+    assert_eq!(guest.wb.sheet(0).rich.get(&(0, 0)), Some(&a1_runs));
+    assert!(guest.apply_undo(true), "{}", guest.status);
+    assert!(!guest.wb.sheet(0).rich.contains_key(&(0, 0)));
+}
+
+#[test]
+fn phase7_r1_aborted_snapshot_denied_or_disconnected_clears_struct_history() {
+    use sheetcore::{
+        cell_shift_patch::CellShiftOverlay,
+        structural::Structural,
+        sync::Peer,
+    };
+    use std::sync::Arc;
+
+    let env = crate::test_env::TestEnv::new("p7-r1-aborted-snapshot");
+    let op = Structural::InsertRows { at: 0, n: 1 };
+
+    for abort_kind in ["denied", "disconnected"] {
+        let (port, _srv) = spawn_silent_listener();
+        let mut guest = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+        guest.wb.path = Some(env.path(&format!("r1_abort_{abort_kind}.xlsx")));
+        seed_phase7_r1_baseline(&mut guest.wb);
+        let dummy_overlay = Arc::new(CellShiftOverlay::capture(&guest.wb));
+        guest.net = Some(
+            crate::net::join(
+                2,
+                "Guest".into(),
+                "doc".into(),
+                &format!("127.0.0.1:{port}"),
+                "pw".into(),
+            )
+            .unwrap(),
+        );
+        guest.peer = Some(Peer::new(2));
+        guest.undo.set_site(2);
+
+        // Enqueue Welcome -> StructuralHistory -> CellShiftOverlay -> abort (Denied or Disconnected)
+        // WITHOUT SnapshotDone, then run real UI frame order.
+        {
+            let net = guest.net.as_ref().unwrap();
+            net.inject_event_for_test(crate::net::NetEvent::Welcome {
+                peers: vec![(1, "Host".into(), 1)],
+                delta_sync: false,
+                clock: 5,
+            });
+            net.inject_event_for_test(crate::net::NetEvent::StructuralHistory(vec![(
+                0,
+                op.clone(),
+            )]));
+            net.inject_event_for_test(crate::net::NetEvent::CellShiftOverlay {
+                overlay: dummy_overlay,
+                seq: 1,
+            });
+            if abort_kind == "denied" {
+                net.inject_event_for_test(crate::net::NetEvent::Denied("宿主拒绝连接".into()));
+            } else {
+                net.inject_event_for_test(crate::net::NetEvent::Disconnected("连接中断".into()));
+            }
+        }
+
+        tick_ui_frame(&mut guest);
+        assert!(!guest.in_snapshot, "{abort_kind}: in_snapshot must clear");
+        assert!(!guest.joined_doc, "{abort_kind}: joined_doc must stay false");
+        assert!(
+            guest.struct_history.is_empty(),
+            "{abort_kind}: aborted snapshot must clear struct_history"
+        );
+        assert_eq!(guest.history_planted, 0);
+        assert!(guest.shift_intro.overlay.is_none());
+        assert_eq!(guest.shift_intro.baseline_struct_rev, 0);
+        assert_eq!(
+            guest.wb.sheet(0).tables[0].range,
+            (0, 0, 1, 1),
+            "{abort_kind}: aborted room StructuralHistory must NOT shift local Table1"
+        );
+        assert!(
+            (guest.wb.sheet(0).rows.size(0) - 60.0).abs() < 1e-4,
+            "{abort_kind}: aborted room StructuralHistory must NOT shift local row height"
+        );
+
+        // Additional UI frames must also leave local metadata untouched.
+        for _ in 0..3 {
+            tick_ui_frame(&mut guest);
+        }
+        assert_eq!(guest.wb.sheet(0).tables[0].range, (0, 0, 1, 1));
+        assert!((guest.wb.sheet(0).rows.size(0) - 60.0).abs() < 1e-4);
+    }
+}
+
+
 
 
 
