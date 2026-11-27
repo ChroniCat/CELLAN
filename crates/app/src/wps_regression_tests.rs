@@ -1431,6 +1431,32 @@ fn compact_home_keeps_recent_file_visible_and_fits_long_text_in_its_column() {
 }
 
 #[test]
+fn workbook_chrome_exposes_formula_controls_and_the_active_view_at_high_dpi() {
+    use egui::accesskit::{Role, Toggled};
+    let _env = crate::test_env::TestEnv::new("workbook-chrome");
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut app = wps_app(&ctx);
+    let mut frame = eframe::Frame::_new_kittest();
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(640.0, 400.0));
+    let mut render = || {
+        let mut input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(1.5);
+        ctx.run(input, |ctx| eframe::App::update(&mut app, ctx, &mut frame))
+    };
+    render();
+    let output = render();
+    for label in ["名称列表", "插入函数", "展开编辑栏", "切换主题"] {
+        assert!(screen.contains_rect(dialog_control(&output, Role::Button, label)), "{label}");
+    }
+    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+    let view = |label| tree.nodes.iter().map(|(_, n)| n)
+        .find(|n| n.role() == Role::Button && n.label() == Some(label)).unwrap();
+    assert_eq!(view("普通").toggled(), Some(Toggled::True));
+    assert_eq!(view("分页预览").toggled(), Some(Toggled::False));
+}
+
+#[test]
 fn narrow_status_message_fits_between_mode_and_selection_statistics() {
     let _env = crate::test_env::TestEnv::new("narrow-status");
     let ctx = egui::Context::default();
@@ -1813,11 +1839,10 @@ fn bottom_horizontal_scrollbar_mouse_wheel_moves_scroll_and_thumb() {
         let mut candidates = Vec::new();
         for cs in shapes {
             if let egui::epaint::Shape::Rect(r) = &cs.shape {
-                // 底栏 y ∈ [846, 878]，滑块高 6.5~8.5px，宽 >= 24px 且小于轨道总宽
+                // 滑块位于底栏内；空闲时 5 点，悬停时 8 点。
                 if r.rect.top() >= 850.0
                     && r.rect.bottom() <= 876.0
-                    && r.rect.height() >= 6.0
-                    && r.rect.height() <= 9.5
+                    && (r.rect.height() == 5.0 || r.rect.height() == 8.0)
                     && r.rect.width() >= 24.0
                     && r.rect.width() < 520.0
                     && r.rect.left() > 700.0
@@ -2172,6 +2197,59 @@ fn frozen_grid_background_follows_theme_switches() {
             }
         }
         assert_eq!(panels, 3, "expected frozen row, column and corner in {theme:?}");
+    }
+}
+
+#[test]
+fn grid_rulers_use_physical_pixel_lines_and_selected_range_tracks_the_theme() {
+    let _env = crate::test_env::TestEnv::new("sheet-grid-chrome");
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    app.new_document();
+    app.wb.sheet_mut(0).freeze = Some((1, 1));
+    app.sel = (1, 1);
+    app.sel_end = (3, 2);
+    for theme in crate::theme::AppTheme::ALL {
+        app.prefs.theme = theme as u8;
+        let pal = crate::theme::palette_for(theme);
+        let line = if theme == crate::theme::AppTheme::HighContrast {
+            pal.grid_line
+        } else {
+            pal.grid_bg.lerp_to_gamma(pal.grid_line, 0.82)
+        };
+        for ppp in [1.0_f32, 1.5] {
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(720.0, 440.0))),
+                ..Default::default()
+            };
+            input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(ppp);
+            let mut frame = eframe::Frame::_new_kittest();
+            let output = ctx.run(input, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+            assert!(output.shapes.iter().any(|s| matches!(
+                &s.shape, egui::Shape::Rect(r) if r.fill == pal.accent.gamma_multiply(0.13)
+            )), "missing range fill in {theme:?}");
+            assert!(output.shapes.iter().any(|s| matches!(
+                &s.shape, egui::Shape::Rect(r) if r.stroke == Stroke::new(2.0, pal.accent)
+            )), "missing selection border in {theme:?}");
+            let mut saw_row = false;
+            let mut saw_col = false;
+            for shape in &output.shapes {
+                let egui::Shape::Mesh(mesh) = &shape.shape else { continue };
+                for quad in mesh.vertices.chunks_exact(4) {
+                    if !quad.iter().all(|v| v.color == line) { continue; }
+                    let size = quad[3].pos - quad[0].pos;
+                    let edge = if size.x < size.y { &mut saw_col } else { &mut saw_row };
+                    let width = size.x.min(size.y);
+                    assert!((width * ppp - 1.0).abs() < 0.001, "{theme:?} @{ppp} {width}");
+                    let start = if size.x < size.y { quad[0].pos.x } else { quad[0].pos.y };
+                    assert!((start * ppp - (start * ppp).round()).abs() < 0.001);
+                    *edge = true;
+                }
+            }
+            assert!(saw_row && saw_col, "{theme:?} @{ppp}");
+            let viewport = app.cf_inputs.grid.viewport.key.as_ref().unwrap();
+            assert_eq!(viewport.pixels_per_point_bits, ppp.to_bits());
+        }
     }
 }
 

@@ -536,6 +536,7 @@ pub(crate) struct PreparedCell {
 #[derive(Clone, PartialEq)]
 pub(crate) struct ViewportCacheKey {
     pub cell_epoch: CellCacheEpoch,
+    pub pixels_per_point_bits: u32,
     pub scroll_x_bits: u32,
     pub scroll_y_bits: u32,
     pub is_split: bool,

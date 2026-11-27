@@ -1469,6 +1469,8 @@ impl SheetApp {
     /// 底部状态栏右侧防篡改审计状态徽章（点击直达统一编辑与防篡改记录面板）
     pub(crate) fn draw_audit_status_pill(&mut self, ui: &mut egui::Ui) {
         let pal = crate::theme::palette();
+        let normal = self.audit_state.verification.as_ref()
+            .is_none_or(|verification| matches!(verification.severity, AuditSeverity::Verified));
         let (label, fg, bg, tip) = if let Some(ver) = self.audit_state.verification.as_ref() {
             match ver.severity {
                 AuditSeverity::Verified => (
@@ -1505,11 +1507,13 @@ impl SheetApp {
             return;
         };
         ui.add_space(6.0);
-        let btn = egui::Button::new(RichText::new(label).size(11.0).strong().color(fg))
-            .fill(bg)
-            .stroke(egui::Stroke::new(1.0_f32, fg.gamma_multiply(0.55)))
-            .corner_radius(4.0);
-        if ui.add(btn).on_hover_text(tip).clicked() {
+        let btn = egui::Button::new(RichText::new(label).size(11.0).color(if normal { pal.text_weak } else { fg }))
+            .fill(if normal { egui::Color32::TRANSPARENT } else { bg })
+            .stroke(if normal { egui::Stroke::NONE } else { egui::Stroke::new(1.0, fg.gamma_multiply(0.55)) })
+            .corner_radius(3.0);
+        let response = ui.add(btn);
+        crate::ui_kit::focus_ring(ui, &response, response.rect, 3.0);
+        if response.on_hover_text(tip).clicked() {
             self.open_audit_panel();
         }
     }

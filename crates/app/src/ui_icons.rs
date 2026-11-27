@@ -265,6 +265,7 @@ struct Pen<'a> {
     w: f32,
     /// Some(颜色) = 单色模式：不铺填充，所有线条都用这个颜色
     mono: Option<Color32>,
+    ribbon_palette: Option<crate::theme::ThemePalette>,
     /// 设备像素比：图标要按物理像素对齐，否则 1px 线会跨两像素发虚
     ppp: f32,
 }
@@ -329,6 +330,21 @@ impl Pen<'_> {
     fn filled(&self) -> bool {
         self.mono.is_none()
     }
+
+    fn surface(&self, color: Color32) -> Color32 {
+        let Some(pal) = self.ribbon_palette.filter(|p| p.theme.is_dark()) else { return color };
+        if color == WHITE {
+            pal.card_bg
+        } else if color == BLUE_L || color == BLUE_XL {
+            pal.info_bg
+        } else if color == GREEN_L {
+            pal.accent_tint
+        } else if color == Color32::from_rgb(254, 226, 226) {
+            pal.err_bg
+        } else {
+            color
+        }
+    }
     fn rect_of(&self, x: f32, y: f32, w: f32, h: f32) -> Rect {
         Rect::from_min_max(self.xy(x, y), self.xy(x + w, y + h))
     }
@@ -357,7 +373,7 @@ impl Pen<'_> {
         let rect = self.rect_of(x, y, w, h);
         let cr = self.px(rad);
         if self.filled() {
-            self.p.rect_filled(rect, cr, fill);
+            self.p.rect_filled(rect, cr, self.surface(fill));
             // Fluent 2 是平涂：不再加顶部高光条。
             // 高光 + 渐变会让 32px 图标在浅色功能区里显脏，也是一眼「旧 Office」的来源。
         }
@@ -450,7 +466,7 @@ impl Pen<'_> {
 
     /// 实心三角箭头：tip 是尖端，dir 指向射方向，size 是长度
     fn arrow(&self, tip: (f32, f32), dir: (f32, f32), size: f32, c: Color32) {
-        if !self.filled() {
+        if !self.filled() && self.ribbon_palette.is_none() {
             return;
         }
         let (dx, dy) = dir;
@@ -572,6 +588,27 @@ pub fn draw_excel(p: &Painter, rect: Rect, icon: Icon, color: Color32, enabled: 
     paint(p, r, icon, if enabled { None } else { Some(color) });
 }
 
+pub(crate) const RIBBON_COMMANDS: &str = "cellan_ribbon_commands";
+
+/// Inside the ribbon, reserve color for commands whose color carries information about their result.
+pub(crate) fn draw_control(ui: &egui::Ui, rect: Rect, icon: Icon, color: Color32, enabled: bool) {
+    let pal = crate::theme::palette();
+    if !enabled || pal.theme == crate::theme::AppTheme::HighContrast ||
+        !ui.stack().iter().any(|node| node.tags().contains(RIBBON_COMMANDS)) {
+        draw_excel(ui.painter(), rect, icon, color, enabled);
+        return;
+    }
+    #[cfg(feature = "legacy_png_icons")]
+    if use_bitmap() && crate::ui_png::draw(ui.painter(), rect, icon, enabled) {
+        return;
+    }
+    use Icon::*;
+    let use_color = matches!(icon, FontColor | Fill | Chart | Image | Cf | CellStyle |
+        InsertCell | DeleteCell | ErrorCheck | InvalidCircle | A11y | PdfExport);
+    paint_icon(ui.painter(), rect.expand(rect.width() * 0.04), icon,
+        (!use_color).then_some(color), Some(pal));
+}
+
 /// 单色绘制：忽略图标内置配色，整枚用 `color`。
 /// 给标签条/标题栏这类「只用中性灰」的场景，别再用 `enabled=false` 冒充。
 pub fn draw_mono(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -579,6 +616,10 @@ pub fn draw_mono(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
 }
 
 fn paint(p: &Painter, rect: Rect, icon: Icon, mono: Option<Color32>) {
+    paint_icon(p, rect, icon, mono, None);
+}
+
+fn paint_icon(p: &Painter, rect: Rect, icon: Icon, mono: Option<Color32>, ribbon_palette: Option<crate::theme::ThemePalette>) {
     let s = rect.width() / 24.0;
     let pen = Pen {
         p,
@@ -586,6 +627,7 @@ fn paint(p: &Painter, rect: Rect, icon: Icon, mono: Option<Color32>) {
         s,
         w: (1.6 * s).max(1.0),
         mono,
+        ribbon_palette,
         ppp: p.pixels_per_point().max(1.0),
     };
     draw_one(&pen, icon);

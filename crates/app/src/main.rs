@@ -1156,6 +1156,7 @@ struct SheetApp {
     sel_end: (u32, u32),
     /// 上一帧表格可视尺寸，供 ensure_visible 用
     last_view: Vec2,
+    reveal_probe_selection: bool,
     /// 网格面板在窗口里的左上角（命中测试/回归用，随每帧绘制刷新）
     last_pane: egui::Pos2,
     /// 只 dump 一帧
@@ -2481,6 +2482,7 @@ impl SheetApp {
                 se
             },
             last_view: Vec2::new(800.0, 600.0),
+            reveal_probe_selection: false,
             last_pane: egui::Pos2::ZERO,
             dump_once: true,
             dump_accum: String::new(),
@@ -3841,7 +3843,7 @@ impl SheetApp {
                     if std::env::var("SC_SEL").is_err() && std::env::var("SC_SEL_STEP").is_err() {
                         self.sel = (0, 0);
                     } else {
-                        self.ensure_visible();
+                        self.reveal_probe_selection = std::env::var("SC_SCROLL_Y").is_err();
                     }
                     self.scroll = Vec2::ZERO;
                     self.cancel_edit();
@@ -28921,18 +28923,18 @@ impl SheetApp {
     }
 
     fn record_filter_funnel(rec: &mut grid_render_cache::BatchRecorder, clip: Rect, rect: Rect) {
-        let btn = Rect::from_center_size(
+        let pal = theme::palette();
+        let button = Rect::from_center_size(
             egui::pos2(rect.right() - 8.0, rect.center().y),
             Vec2::new(14.0, 14.0),
         );
-        rec.push_overlay(clip, egui::Shape::rect_filled(btn, 2.0, Color32::from_rgb(236, 239, 244)));
-        let fc = btn.center();
-        let fs = Stroke::new(1.0, Color32::from_rgb(60, 60, 60));
-        rec.push_overlay(clip, egui::Shape::line_segment([egui::pos2(fc.x - 4.5, fc.y - 3.5), egui::pos2(fc.x + 4.5, fc.y - 3.5)], fs));
-        rec.push_overlay(clip, egui::Shape::line_segment([egui::pos2(fc.x - 4.0, fc.y - 3.0), egui::pos2(fc.x - 1.2, fc.y + 0.8)], fs));
-        rec.push_overlay(clip, egui::Shape::line_segment([egui::pos2(fc.x + 4.0, fc.y - 3.0), egui::pos2(fc.x + 1.2, fc.y + 0.8)], fs));
-        rec.push_overlay(clip, egui::Shape::line_segment([egui::pos2(fc.x - 1.2, fc.y + 0.8), egui::pos2(fc.x + 1.2, fc.y + 0.8)], fs));
-        rec.push_overlay(clip, egui::Shape::line_segment([egui::pos2(fc.x, fc.y + 0.8), egui::pos2(fc.x, fc.y + 3.8)], fs));
+        let c = button.center();
+        rec.push_overlay(clip, egui::Shape::rect_filled(button, 2.0, pal.header_bg));
+        rec.push_overlay(clip, egui::Shape::line(vec![
+            c + Vec2::new(-4.0, -3.0), c + Vec2::new(4.0, -3.0),
+            c + Vec2::new(1.0, 0.5), c + Vec2::new(1.0, 3.5),
+            c + Vec2::new(-1.0, 2.5), c + Vec2::new(-1.0, 0.5), c + Vec2::new(-4.0, -3.0),
+        ], Stroke::new(1.0, pal.header_text)));
     }
 
     /// 计算单元格向左/向右可跨列溢出的额外像素跨度 `(left_extra_px, right_extra_px)`，
@@ -36348,7 +36350,21 @@ impl SheetApp {
 
     fn draw_grid_pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, readonly: bool) {
         let avail = ui.available_size();
+        let previous_view = self.last_view;
         self.last_view = avail;
+        if self.reveal_probe_selection && !readonly && !self.show_start {
+            // SC_PPP takes effect on the following frame. Wait for the real pane before
+            // revealing the requested cell, including when the workbook opens on the first frame.
+            let dpi_ready = debug_flags::var("SC_PPP")
+                .and_then(|v| v.parse::<f32>().ok())
+                .is_none_or(|ppp| (ctx.pixels_per_point() - ppp).abs() < 0.001);
+            if dpi_ready && avail == previous_view && avail.x > HEAD_W && avail.y > HEAD_H {
+                self.ensure_visible();
+                self.reveal_probe_selection = false;
+            } else {
+                ctx.request_repaint();
+            }
+        }
         if self.dialog_modal {
             self.grid_press = None;
         }
@@ -36883,13 +36899,15 @@ impl SheetApp {
             dump.push(format!("avail={:?} scroll=({:.0},{:.0}) first=({},{}) sel={:?} dv={} cf={}", avail, off_x, off_y, first_col, first_row, self.sel, self.wb.sheet(self.sheet_idx).dv.len(), self.wb.sheet(self.sheet_idx).cf.blocks.len()));
         }
 
-        // 清透现代网格线 / 表头底色（随当前主题调色板实时切换）
-        let grid_line = grid_pal.grid_line;
-        let grid_stroke = if self.show_gridlines {
-            Stroke::new(1.0, grid_line)
+        // 对齐到一个设备像素，避免 150% 缩放时线条粗细交替。
+        let pixel = 1.0 / painter.pixels_per_point();
+        let (grid_line, header_line) = if grid_pal.theme == theme::AppTheme::HighContrast {
+            (grid_pal.grid_line, grid_pal.card_border)
         } else {
-            Stroke::NONE
+            (grid_pal.grid_bg.lerp_to_gamma(grid_pal.grid_line, 0.82),
+             grid_pal.header_bg.lerp_to_gamma(grid_pal.header_text, 0.19))
         };
+        let grid_stroke = if self.show_gridlines { Stroke::new(pixel, grid_line) } else { Stroke::NONE };
         let head_bg = grid_pal.header_bg;
         let head_fg = grid_pal.header_text;
         let head_sel = grid_pal.header_sel;
@@ -36898,16 +36916,18 @@ impl SheetApp {
         let mut grid_mesh = egui::Mesh::default();
         let mesh_vline = |m: &mut egui::Mesh, x: f32, y0: f32, y1: f32, col: Color32| {
             if y1 > y0 {
+                let left = painter.round_to_pixel(x - pixel * 0.5);
                 m.add_colored_rect(
-                    Rect::from_min_max(egui::pos2(x - 0.5, y0), egui::pos2(x + 0.5, y1)),
+                    Rect::from_min_max(egui::pos2(left, y0), egui::pos2(left + pixel, y1)),
                     col,
                 );
             }
         };
         let mesh_hline = |m: &mut egui::Mesh, x0: f32, x1: f32, y: f32, col: Color32| {
             if x1 > x0 {
+                let top = painter.round_to_pixel(y - pixel * 0.5);
                 m.add_colored_rect(
-                    Rect::from_min_max(egui::pos2(x0, y - 0.5), egui::pos2(x1, y + 0.5)),
+                    Rect::from_min_max(egui::pos2(x0, top), egui::pos2(x1, top + pixel)),
                     col,
                 );
             }
@@ -36922,7 +36942,7 @@ impl SheetApp {
         let row_num_fg = |r: u32| -> Color32 {
             if let Some((r1, r2)) = filter_rows {
                 if r >= r1 && r <= r2 {
-                    return Color32::from_rgb(0, 102, 182);
+                    return grid_pal.info_fg;
                 }
             }
             head_fg
@@ -36993,7 +37013,7 @@ impl SheetApp {
                 );
             }
             if x >= origin.x + head_w {
-                mesh_vline(&mut grid_mesh, x, origin.y, origin.y + hh, ui_kit::HEAD_LINE);
+                mesh_vline(&mut grid_mesh, x, origin.y, origin.y + hh, header_line);
                 if self.show_gridlines {
                     mesh_vline(&mut grid_mesh, x, origin.y + hh, origin.y + hh + avail.y, grid_line);
                 }
@@ -37056,7 +37076,7 @@ impl SheetApp {
                         &mut pending_col_toggle,
                     );
                 }
-                mesh_vline(&mut grid_mesh, x, origin.y, origin.y + hh, ui_kit::HEAD_LINE);
+                mesh_vline(&mut grid_mesh, x, origin.y, origin.y + hh, header_line);
                 if self.show_gridlines {
                     mesh_vline(&mut grid_mesh, x, origin.y + hh, origin.y + hh + avail.y, grid_line);
                 }
@@ -37094,7 +37114,7 @@ impl SheetApp {
                 );
             }
             if y >= origin.y + hh {
-                mesh_hline(&mut grid_mesh, origin.x, origin.x + head_w, y, ui_kit::HEAD_LINE);
+                mesh_hline(&mut grid_mesh, origin.x, origin.x + head_w, y, header_line);
                 if self.show_gridlines {
                     mesh_hline(&mut grid_mesh, origin.x + head_w, origin.x + avail.x, y, grid_line);
                 }
@@ -37109,16 +37129,12 @@ impl SheetApp {
             let mut draw_btn = |rect: Rect, n: u8, key: (&'static str, bool, u8)| {
                 let id = egui::Id::new(("ol_lvl", key.1, key.2));
                 let resp = ui.interact(rect, id, Sense::click());
-                let bg = if resp.hovered() {
-                    ui_kit::HOVER
-                } else {
-                    egui::Color32::WHITE
-                };
+                let bg = if resp.hovered() { grid_pal.hover } else { head_bg };
                 painter.rect_filled(rect, 1.0, bg);
                 painter.rect_stroke(
                     rect,
                     1.0,
-                    Stroke::new(1.0, ui_kit::HEAD_LINE),
+                    Stroke::new(1.0, header_line),
                     egui::StrokeKind::Inside,
                 );
                 painter.text(
@@ -37126,7 +37142,7 @@ impl SheetApp {
                     egui::Align2::CENTER_CENTER,
                     n.to_string(),
                     egui::FontId::proportional(9.5),
-                    ui_kit::TEXT,
+                    head_fg,
                 );
                 if resp.clicked() {
                     hit = Some((key.1, key.2));
@@ -37171,7 +37187,7 @@ impl SheetApp {
                     egui::pos2(x2, y2),
                     egui::pos2(x2 - 7.5, y2),
                 ],
-                Color32::from_rgb(176, 174, 172),
+                grid_pal.text_muted,
                 Stroke::NONE,
             ));
         }
@@ -37256,11 +37272,11 @@ impl SheetApp {
                             egui::Id::new(("outline_btn", *gs, *ge)),
                             Sense::click(),
                         );
-                        painter.rect_filled(brect, 1.0, Color32::WHITE);
+                        painter.rect_filled(brect, 1.0, if br.hovered() { grid_pal.hover } else { head_bg });
                         painter.rect_stroke(
                             brect,
                             1.0,
-                            Stroke::new(1.0, Color32::from_rgb(120, 120, 120)),
+                            Stroke::new(pixel, header_line),
                             egui::StrokeKind::Inside,
                         );
                         let c = brect.center();
@@ -37269,7 +37285,7 @@ impl SheetApp {
                                 egui::pos2(c.x - 2.5, c.y),
                                 egui::pos2(c.x + 2.5, c.y),
                             ],
-                            Stroke::new(1.2, Color32::from_rgb(60, 60, 60)),
+                            Stroke::new(1.2, head_fg),
                         );
                         if hidden {
                             painter.line_segment(
@@ -37277,7 +37293,7 @@ impl SheetApp {
                                     egui::pos2(c.x, c.y - 2.5),
                                     egui::pos2(c.x, c.y + 2.5),
                                 ],
-                                Stroke::new(1.2, Color32::from_rgb(60, 60, 60)),
+                                Stroke::new(1.2, head_fg),
                             );
                         }
                         if br.clicked() {
@@ -37287,15 +37303,15 @@ impl SheetApp {
                 }
                 // 这一行被滚到冻结带里时，线要压在冻结带下沿，不能画进冻结行
                 let ly = y.max(origin.y + hh + frozen_h);
-                mesh_hline(&mut grid_mesh, origin.x, origin.x + head_w, ly, ui_kit::HEAD_LINE);
+                mesh_hline(&mut grid_mesh, origin.x, origin.x + head_w, ly, header_line);
                 if self.show_gridlines {
                     mesh_hline(&mut grid_mesh, origin.x + head_w, origin.x + avail.x, ly, grid_line);
                 }
             }
         }
-        // 行号列与表格之间的分界线（Excel 实测 #ABABAB，比控件边框深）
-        mesh_vline(&mut grid_mesh, origin.x + head_w, origin.y, origin.y + avail.y, ui_kit::HEAD_LINE);
-        mesh_hline(&mut grid_mesh, origin.x, origin.x + avail.x, origin.y + hh, ui_kit::HEAD_LINE);
+        // 行列标头与表体沿用标头分隔线，跨主题保持相同的边界层级。
+        mesh_vline(&mut grid_mesh, origin.x + head_w, origin.y, origin.y + avail.y, header_line);
+        mesh_hline(&mut grid_mesh, origin.x, origin.x + avail.x, origin.y + hh, header_line);
         if !grid_mesh.is_empty() {
             painter.add(egui::Shape::mesh(grid_mesh));
         }
@@ -37347,7 +37363,7 @@ impl SheetApp {
                         egui::pos2(x1, origin.y + hh),
                     ),
                     0.0,
-                    ui_kit::ACCENT,
+                    grid_pal.accent,
                 );
             }
             let y_min = if sr1 < fy { origin.y + hh } else { body_y };
@@ -37360,7 +37376,7 @@ impl SheetApp {
                         egui::pos2(origin.x + head_w, y1),
                     ),
                     0.0,
-                    ui_kit::ACCENT,
+                    grid_pal.accent,
                 );
             }
         }
@@ -37607,7 +37623,7 @@ impl SheetApp {
             }
         }
         let has_notes = !self.wb.sheet(self.sheet_idx).notes.is_empty();
-        // 选区底色：Excel 365 是「范围铺一层 22% 黑（白底上约 #C7C7C7），活动格所在合并块留白」。
+        // 选区用主题色轻染，活动格所在合并块保持原有底色。
         // 画在格子之前，文字才不会被压暗；冻结带用固定坐标，正文用滚动坐标。
         {
             let (qr1, qc1, qr2, qc2) = self.sel_rect();
@@ -37617,7 +37633,7 @@ impl SheetApp {
                 .at(self.sel.0, self.sel.1)
                 .unwrap_or((self.sel.0, self.sel.1, self.sel.0, self.sel.1));
             if (qr1, qc1) != (qr2, qc2) || (ar1, ac1, ar2, ac2) != (qr1, qc1, qr2, qc2) {
-                let tint = Color32::from_rgba_unmultiplied(0, 0, 0, 55);
+                let tint = grid_pal.accent.gamma_multiply(0.13);
                 let grid_area = Rect::from_min_max(
                     egui::pos2(origin.x + head_w, origin.y + hh),
                     resp.rect.max,
@@ -37729,6 +37745,7 @@ impl SheetApp {
             let sh = self.wb.sheet(si);
             grid_render_cache::ViewportCacheKey {
                 cell_epoch: cell_epoch.clone(),
+                pixels_per_point_bits: ctx.pixels_per_point().to_bits(),
                 scroll_x_bits: off_x.to_bits(),
                 scroll_y_bits: off_y.to_bits(),
                 is_split,
@@ -38163,7 +38180,7 @@ impl SheetApp {
                         r.left_bottom(),
                         r.left_top(),
                     ],
-                    Stroke::new(1.0, ui_kit::ACCENT),
+                    Stroke::new(1.0, grid_pal.accent),
                     4.0,
                     3.0,
                 ));
@@ -38185,7 +38202,7 @@ impl SheetApp {
                     painter.rect_stroke(
                         Rect::from_center_size(p, Vec2::splat(6.0)),
                         0.0,
-                        Stroke::new(1.0, ui_kit::ACCENT),
+                        Stroke::new(1.0, grid_pal.accent),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -38637,8 +38654,8 @@ impl SheetApp {
             }
             // 冻结线 vs 拆分窗格双实线（拆分窗格可拖动 / 双击取消）
             if is_split {
-                let bar_fill = Color32::from_rgb(203, 213, 225);
-                let bar_edge = Color32::from_rgb(100, 116, 139);
+                let bar_fill = grid_pal.header_bg;
+                let bar_edge = grid_pal.text_muted;
                 if fx > 0 {
                     let bx = body_x - 2.5;
                     let vbar = Rect::from_min_max(egui::pos2(bx, origin.y + hh), egui::pos2(bx + 5.0, origin.y + avail.y));
@@ -38692,7 +38709,7 @@ impl SheetApp {
                     }
                 }
             } else {
-                let edge = Color32::from_rgb(160, 160, 160);
+                let edge = grid_pal.text_muted;
                 if fx > 0 {
                     painter.line_segment(
                         [
@@ -39429,11 +39446,11 @@ impl SheetApp {
             let w = cols.pos(ec2 + 1) - cols.pos(ec1);
             let h = rows.pos(er2 + 1) - rows.pos(er1);
             let r = Rect::from_min_size(egui::pos2(x0, y0), Vec2::new(w, h));
-            painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(16, 124, 65, 22));
+            painter.rect_filled(r, 0.0, grid_pal.accent.gamma_multiply(0.12));
             painter.rect_stroke(
                 r,
                 0.0,
-                Stroke::new(1.5, ui_kit::ACCENT),
+                Stroke::new(1.5, grid_pal.accent),
                 egui::StrokeKind::Inside,
             );
         }
@@ -39669,7 +39686,7 @@ impl SheetApp {
                         0.0
                     };
                     let mut ants_mesh = egui::Mesh::default();
-                    let accent = Color32::from_rgb(33, 115, 70);
+                    let accent = grid_pal.accent;
                     let vis_pad = grid_vis.expand(12.0);
                     let hx0 = cx0.max(vis_pad.left());
                     let hx1 = cx1.min(vis_pad.right());
@@ -39767,7 +39784,7 @@ impl SheetApp {
                 sel_painter.rect_stroke(
                     Rect::from_min_size(egui::pos2(sx, sy), Vec2::new(sw, sh)),
                     0.0,
-                    Stroke::new(2.0, Color32::from_rgb(33, 115, 70)),
+                    Stroke::new(2.0, grid_pal.accent),
                     egui::StrokeKind::Inside,
                 );
                 // 若选中格含批注，在 2px 选区框内侧补绘清晰的右上角批注红三角，防止被选区边框吃掉
@@ -39871,7 +39888,8 @@ impl SheetApp {
             let hy = sy + sh;
             if hx > origin.x + head_w && hy > origin.y + hh {
                 let handle = Rect::from_min_size(egui::pos2(hx - 3.0, hy - 3.0), Vec2::splat(6.0));
-                painter.rect_filled(handle, 0.0, ui_kit::ACCENT);
+                painter.rect_filled(handle.expand(pixel), 0.0, grid_pal.grid_bg);
+                painter.rect_filled(handle, 0.0, grid_pal.accent);
                 let grab = Rect::from_min_size(egui::pos2(hx - 7.0, hy - 7.0), Vec2::splat(14.0));
                 let resp_h = ui.interact(
                     grab,
@@ -46956,7 +46974,9 @@ fn elide(s: &str, max_chars: usize) -> String {
             let (a, b) = v.split_once(',')?;
             Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
         };
-        let sel = rc("SC_SEL").unwrap_or((0, 0));
+        let requested_sel = rc("SC_SEL");
+        self.reveal_probe_selection = requested_sel.is_some() && std::env::var("SC_SCROLL_Y").is_err();
+        let sel = requested_sel.unwrap_or((0, 0));
         self.sel = sel;
         self.sel_end = rc("SC_SEL2").unwrap_or(sel);
         self.nav_rect = None;
@@ -48785,7 +48805,7 @@ impl eframe::App for SheetApp {
             }
         }
         }
-        system_fonts::begin_frame();
+        system_fonts::begin_frame(ctx);
         if std::mem::take(&mut self.clip_seq_pending_sync) {
             self.clip_seq = current_os_clipboard_seq();
         }
@@ -48924,7 +48944,6 @@ impl eframe::App for SheetApp {
         // 避免新开工作簿或切换新字体后等待最多 30 帧才触发异步装载。
         if system_fonts::take_ready() {
             install_fonts(ctx);
-            system_fonts::bump_generation();
         }
         {
             let scan_key = (self.doc_uid, self.wb.styles.len());
@@ -49914,14 +49933,8 @@ impl eframe::App for SheetApp {
                 if !self.ribbon_collapsed {
                     egui::Frame::NONE
                         .fill(ribbon_pal.ribbon_bg)
-                        .stroke(egui::Stroke::new(1.0, ribbon_pal.card_border))
-                        .corner_radius(8.0)
-                        .shadow(egui::epaint::Shadow {
-                            offset: [0, 2],
-                            blur: 8,
-                            spread: 0,
-                            color: Color32::from_black_alpha(if ribbon_dark { 48 } else { 14 }),
-                        })
+                        .stroke(egui::Stroke::new(1.0, ribbon_pal.chrome_separator()))
+                        .corner_radius(6.0)
                         .outer_margin(egui::Margin {
                             left: 8,
                             right: 8,
@@ -50012,14 +50025,6 @@ impl eframe::App for SheetApp {
                 let avail = ui.max_rect();
                 let rect = Rect::from_min_size(avail.min, Vec2::new(avail.width(), fx_card_h));
                 let painter = ui.painter().clone();
-                painter.line_segment(
-                    [rect.left_top(), rect.right_top()],
-                    Stroke::new(1.0, fx_pal.card_border),
-                );
-                painter.line_segment(
-                    [rect.left_bottom(), rect.right_bottom()],
-                    Stroke::new(1.0, fx_pal.card_border),
-                );
                 let (r, c) = self.sel;
                 if !self.name_edit {
                     if let Some(def_name) = self.matching_defined_name_for_sel() {
@@ -50033,26 +50038,19 @@ impl eframe::App for SheetApp {
                         };
                     }
                 }
-                // 名称框（随主题切换底色与边框）
+                // Keep the name field quiet until it is being edited; the chevron remains visible at rest.
                 let nb = Rect::from_min_size(
-                    egui::pos2(rect.left() + 10.0, rect.top() + 5.0),
+                    egui::pos2(rect.left() + 8.0, rect.top() + 5.0),
                     Vec2::new(96.0, 24.0),
                 );
-                let nb_fill = if fx_pal.theme == theme::AppTheme::Light {
-                    Color32::from_rgb(248, 250, 252)
-                } else {
-                    fx_pal.page_bg
-                };
-                painter.rect(
-                    nb,
-                    5.0,
-                    nb_fill,
-                    Stroke::new(1.0, fx_pal.card_border),
-                    egui::StrokeKind::Inside,
-                );
+                let name_hot = ui.rect_contains_pointer(nb);
+                if name_hot || self.name_edit || self.name_dropdown || fx_pal.theme == theme::AppTheme::HighContrast {
+                    let stroke = if self.name_edit { fx_pal.accent } else { fx_pal.card_border };
+                    painter.rect(nb, 4.0, fx_pal.card_bg, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+                }
                 let inner = Rect::from_min_max(
                     nb.min + Vec2::new(6.0, 2.0),
-                    egui::pos2(nb.right() - 18.0, nb.bottom() - 2.0),
+                    egui::pos2(nb.right() - 20.0, nb.bottom() - 2.0),
                 );
                 let mut child = ui.new_child(
                     egui::UiBuilder::new()
@@ -50098,11 +50096,13 @@ impl eframe::App for SheetApp {
                     caret,
                 );
                 let caret_btn = Rect::from_min_max(
-                    egui::pos2(nb.right() - 18.0, nb.top()),
+                    egui::pos2(nb.right() - 20.0, nb.top()),
                     nb.right_bottom(),
                 );
                 let cresp = ui.interact(caret_btn, egui::Id::new("name_caret"), Sense::click());
-                if cresp.clicked() {
+                ui_kit::a11y_name(&cresp, "名称列表", true, Some(self.name_dropdown));
+                ui_kit::focus_ring(ui, &cresp, caret_btn, 3.0);
+                if cresp.clone().on_hover_text("名称列表").clicked() {
                     self.name_dropdown = !self.name_dropdown;
                 }
                 if self.name_dropdown {
@@ -50148,14 +50148,7 @@ impl eframe::App for SheetApp {
                 }
 
                 // × ✓ fx（常驻三键，居中对齐 34px 通栏）
-                painter.line_segment(
-                    [
-                        egui::pos2(rect.left() + 114.0, rect.top() + 8.0),
-                        egui::pos2(rect.left() + 114.0, rect.bottom() - 8.0),
-                    ],
-                    Stroke::new(1.0, fx_pal.card_border),
-                );
-                let fx_left = rect.left() + 120.0;
+                let fx_left = rect.left() + 118.0;
                 let mut commit = false;
                 let mut commit_adv: Option<(i32, i32)> = Some((1, 0));
                 let mut commit_fill_sel = false;
@@ -50185,52 +50178,28 @@ impl eframe::App for SheetApp {
                     if resp.hovered() && active {
                         painter.rect_filled(b, 4.0, fx_pal.hover);
                     }
-                    let col = if !active {
-                        fx_pal.text_muted
-                    } else if resp.hovered() && *kind == "cancel" {
-                        fx_pal.err_fg
-                    } else if resp.hovered() && *kind == "ok" {
-                        fx_pal.accent
-                    } else if *kind == "fx" {
-                        if fx_dark { fx_pal.info_fg } else { ui_kit::BRAND_NAVY }
-                    } else {
-                        fx_pal.text
-                    };
+                    let col = if !active { fx_pal.text_muted }
+                        else if resp.hovered() && *kind == "cancel" { fx_pal.err_fg }
+                        else if resp.hovered() { fx_pal.accent } else { fx_pal.text_weak };
                     let cc = b.center();
+                    let st = Stroke::new(1.2, col);
                     match *kind {
                         "cancel" => {
-                            let d = 4.5;
-                            let st = Stroke::new(1.3, col);
-                            painter.line_segment(
-                                [egui::pos2(cc.x - d, cc.y - d), egui::pos2(cc.x + d, cc.y + d)],
-                                st,
-                            );
-                            painter.line_segment(
-                                [egui::pos2(cc.x + d, cc.y - d), egui::pos2(cc.x - d, cc.y + d)],
-                                st,
-                            );
+                            let d = 3.5;
+                            painter.line_segment([cc - Vec2::splat(d), cc + Vec2::splat(d)], st);
+                            painter.line_segment([cc + Vec2::new(-d, d), cc + Vec2::new(d, -d)], st);
                         }
                         "ok" => {
-                            let st = Stroke::new(1.6, col);
-                            painter.line_segment(
-                                [egui::pos2(cc.x - 5.0, cc.y), egui::pos2(cc.x - 1.0, cc.y + 4.0)],
-                                st,
-                            );
-                            painter.line_segment(
-                                [egui::pos2(cc.x - 1.0, cc.y + 4.0), egui::pos2(cc.x + 5.5, cc.y - 4.0)],
-                                st,
-                            );
+                            painter.add(egui::Shape::line(
+                                vec![cc + Vec2::new(-4.5, 0.0), cc + Vec2::new(-1.0, 3.5), cc + Vec2::new(5.0, -3.5)], st,
+                            ));
                         }
-                        _ => {
-                            painter.text(
-                                cc,
-                                egui::Align2::CENTER_CENTER,
-                                "fx",
-                                FontId::proportional(12.0),
-                                col,
-                            );
-                        }
+                        _ => ui_icons::draw_mono(&painter, Rect::from_center_size(cc, Vec2::splat(20.0)), Icon::Fx, col),
                     }
+                    let label = match *kind { "cancel" => "取消输入", "ok" => "确认输入", _ => "插入函数" };
+                    ui_kit::a11y_name(&resp, label, active, None);
+                    ui_kit::focus_ring(ui, &resp, b, 3.0);
+                    resp.clone().on_hover_text(label);
                     if resp.clicked() {
                         match *kind {
                             "cancel" => cancel = true,
@@ -50239,18 +50208,10 @@ impl eframe::App for SheetApp {
                         }
                     }
                 }
-                painter.line_segment(
-                    [
-                        egui::pos2(fx_left + 80.0, rect.top() + 8.0),
-                        egui::pos2(fx_left + 80.0, rect.bottom() - 8.0),
-                    ],
-                    Stroke::new(1.0, fx_pal.card_border),
-                );
-
                 // 右侧展开箭头（Excel 的编辑栏折叠/展开）
                 let chev = Rect::from_min_size(
-                    egui::pos2(rect.right() - 24.0, rect.top() + 5.0),
-                    Vec2::new(18.0, 24.0),
+                    egui::pos2(rect.right() - 27.0, rect.top() + 5.0),
+                    Vec2::new(24.0, 24.0),
                 );
                 let cresp = ui.interact(chev, egui::Id::new("fx_expand"), Sense::click());
                 if cresp.hovered() {
@@ -50265,7 +50226,10 @@ impl eframe::App for SheetApp {
                     painter.line_segment([egui::pos2(cc.x - 4.0, cc.y - 2.0), egui::pos2(cc.x, cc.y + 2.0)], cst);
                     painter.line_segment([egui::pos2(cc.x, cc.y + 2.0), egui::pos2(cc.x + 4.0, cc.y - 2.0)], cst);
                 }
-                if cresp.on_hover_text("展开编辑栏").clicked() {
+                let expand_tip = if self.fx_expanded { "折叠编辑栏" } else { "展开编辑栏" };
+                ui_kit::a11y_name(&cresp, expand_tip, true, Some(self.fx_expanded));
+                ui_kit::focus_ring(ui, &cresp, chev, 3.0);
+                if cresp.on_hover_text(expand_tip).clicked() {
                     self.fx_expanded = !self.fx_expanded;
                 }
 
@@ -50274,6 +50238,10 @@ impl eframe::App for SheetApp {
                     egui::pos2(fx_left + 88.0, rect.top() + 4.0),
                     egui::pos2(rect.right() - 28.0, rect.bottom() - 4.0),
                 );
+                if locked_by_other.is_none() && self.editing.as_ref().is_some_and(|ed| ed.spot == EditSpot::FormulaBar) {
+                    painter.hline(ed_rect.x_range(), ed_rect.bottom(),
+                        Stroke::new(if fx_pal.theme == theme::AppTheme::HighContrast { 2.0 } else { 1.5 }, fx_pal.accent));
+                }
                 if let Some(holder) = &locked_by_other {
                     painter.rect(
                         ed_rect,
@@ -50729,10 +50697,9 @@ impl eframe::App for SheetApp {
                     return;
                 }
                 let bar = ui.max_rect();
-                ui.painter().line_segment(
-                    [bar.left_top(), bar.right_top()],
-                    Stroke::new(1.0, status_pal.card_border),
-                );
+                if status_pal.theme == theme::AppTheme::HighContrast {
+                    ui.painter().hline(bar.x_range(), bar.top(), Stroke::new(1.0, status_pal.card_border));
+                }
                 let rects = self.sel_rects();
                 let area: u64 = rects
                     .iter()
@@ -50810,50 +50777,34 @@ impl eframe::App for SheetApp {
                             theme::AppTheme::Dark => "深色",
                             theme::AppTheme::HighContrast => "高对比",
                         };
-                        if ui
-                            .add_sized(
-                                [42.0, 18.0],
-                                egui::Button::new(
-                                    egui::RichText::new(theme_short)
-                                        .size(11.0)
-                                        .color(status_pal.text_weak),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text(format!(
-                                "当前主题：{}（点击切换下一主题，或在「文件 → 选项」中设置）",
-                                cur_theme.label()
-                            ))
-                            .clicked()
-                        {
+                        let theme_response = ui.add_sized(
+                            [40.0, 18.0],
+                            egui::Button::new(egui::RichText::new(theme_short).size(11.0).color(status_pal.text_weak)).frame(false),
+                        );
+                        ui_kit::a11y_name(&theme_response, "切换主题", true, None);
+                        ui_kit::focus_ring(ui, &theme_response, theme_response.rect, 3.0);
+                        if theme_response.on_hover_text(format!(
+                            "当前主题：{}（点击切换下一主题，或在「文件 → 选项」中设置）", cur_theme.label()
+                        )).clicked() {
                             self.prefs.theme = (self.prefs.theme + 1) % 4;
                             self.prefs.save();
                         }
                         ui.add_space(6.0);
                         // 三个视图按钮（紧凑 28×20，选中态采用柔和主题绿胶囊）
-                        let (vr, _) = ui.allocate_exact_size(Vec2::new(84.0, 20.0), Sense::hover());
+                        let (vr, _) = ui.allocate_exact_size(Vec2::new(78.0, 20.0), Sense::hover());
                         for (i, tip) in ["普通", "页面布局", "分页预览"].iter().enumerate() {
                             let b = Rect::from_min_size(
-                                egui::pos2(vr.left() + i as f32 * 28.0, vr.top()),
-                                Vec2::new(28.0, 20.0),
+                                egui::pos2(vr.left() + i as f32 * 26.0, vr.top()),
+                                Vec2::new(26.0, 20.0),
                             );
                             let resp = ui.interact(b, egui::Id::new(("viewbtn", i)), Sense::click());
                             let on = self.view_mode == i as u8;
-                            if on {
-                                ui.painter().rect_filled(
-                                    b.shrink(1.0),
-                                    4.0,
-                                    status_pal.accent_tint,
-                                );
-                            } else if resp.hovered() {
-                                ui.painter().rect_filled(b.shrink(1.0), 4.0, status_pal.hover_on_page);
+                            if on || resp.hovered() {
+                                let fill = if on { status_pal.accent_tint } else { status_pal.hover_on_page };
+                                ui.painter().rect_filled(b.shrink2(Vec2::new(1.0, 2.0)), 3.0, fill);
                             }
-                            let col = if on {
-                                status_pal.accent
-                            } else {
-                                status_pal.text_weak
-                            };
-                            let st = Stroke::new(1.0, col);
+                            let col = if on { status_pal.accent } else { status_pal.text_weak };
+                            let st = Stroke::new(1.2, col);
                             // Excel 的三个视图图标：普通（行头竖条）、页面布局（页边距）、
                             // 分页预览（右三分之一填色）
                             let inner = Rect::from_center_size(b.center(), Vec2::new(13.0, 11.0));
@@ -50893,6 +50844,8 @@ impl eframe::App for SheetApp {
                                     );
                                 }
                             }
+                            ui_kit::a11y_name(&resp, tip, true, Some(on));
+                            ui_kit::focus_ring(ui, &resp, b, 3.0);
                             let resp = resp.on_hover_text(*tip);
                             if resp.clicked() {
                                 match i {
@@ -51022,7 +50975,7 @@ impl eframe::App for SheetApp {
                     // Excel 的状态栏左边只写「就绪 / 输入 / 编辑」，不写「单元格模式」这种
                     // UIA 名称；模式文字本身也是统计菜单的右键入口。
                     let mode = if self.editing.is_some() { "输入" } else { "就绪" };
-                    ui.label(egui::RichText::new(mode).size(11.0).color(status_pal.text))
+                    ui.label(egui::RichText::new(mode).size(11.0).color(status_pal.text_weak))
                         .on_hover_text(if self.status.is_empty() { "就绪" } else { &self.status })
                         .context_menu(|ui| stats_mask_menu(ui, &mut stat_mask, &stat));
                     if !self.cancelled_offline_drafts.is_empty()
@@ -51666,10 +51619,10 @@ fn scrollbar(
     let latch_id = sb_id.with("latch");
     let resp = ui.interact(rect, sb_id, Sense::click_and_drag());
     let pal = theme::palette();
-    let track_bg = pal.header_bg;
+    let track_bg = if pal.theme == theme::AppTheme::HighContrast { pal.header_bg } else { pal.page_bg };
     let p = ui.painter();
     p.rect_filled(rect, if horizontal { 6.0 } else { 0.0 }, track_bg);
-    if !horizontal {
+    if !horizontal && pal.theme == theme::AppTheme::HighContrast {
         p.line_segment([rect.left_top(), rect.left_bottom()], Stroke::new(1.0, pal.card_border));
     }
     // 两端箭头按钮（细线 V 形，替代生硬的实心黑三角）
@@ -51740,7 +51693,7 @@ fn scrollbar(
     } else {
         0.0
     };
-    let thick = (if resp.hovered() || resp.dragged() { 8.5_f32 } else { 6.5_f32 })
+    let thick = (if resp.hovered() || resp.dragged() { 8.0_f32 } else { 5.0_f32 })
         .min(if horizontal { inner.height() } else { inner.width() }.max(4.0));
     let base = if horizontal { inner.left() } else { inner.top() };
     let pos = base + t * (span - thumb_len);
@@ -52218,7 +52171,7 @@ fn cell_text_align(halign: u8, value: &Value) -> egui::Align2 {
 fn install_fonts(ctx: &egui::Context) {
     let mut defs = font_defs();
     install_ui_system_fonts(&mut defs, ctx);
-    ctx.set_fonts(defs);
+    system_fonts::install(ctx, defs);
     ui_kit::notify_fonts_changed();
 }
 

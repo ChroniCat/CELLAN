@@ -291,10 +291,6 @@ pub(crate) fn request_ui_cjk_async(ctx: &egui::Context) {
     });
 }
 
-pub(crate) fn bump_generation() {
-    ACTIVE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
-}
-
 pub fn load(name: &str) -> Option<(&'static [u8], u32)> {
     load_from(&file_candidates(name), name)
 }
@@ -319,22 +315,30 @@ struct Loaded {
 }
 
 static LOADED: OnceLock<Mutex<HashMap<String, Loaded>>> = OnceLock::new();
-/// 已写入 FontDefinitions 但 egui 要到下一帧才生效的字体。
 static BOLD_LOADED: OnceLock<Mutex<HashMap<String, Loaded>>> = OnceLock::new();
-static PENDING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-/// 当前帧真正可用的系统字体（egui 已装载）。
-static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static READY_TO_INSTALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRIED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static ASYNC_LOADER: OnceLock<std::sync::mpsc::Sender<(Vec<String>, egui::Context)>> = OnceLock::new();
 
 fn loaded() -> &'static Mutex<HashMap<String, Loaded>> {
     LOADED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Default)]
+struct ActiveFonts {
+    revision: u64,
+    pixels_per_point: u32,
+    generation: u64,
+    regular: HashSet<String>,
+    bold: HashSet<String>,
+}
+
+thread_local! {
+    static ACTIVE: std::cell::RefCell<ActiveFonts> = Default::default();
+}
+
 pub fn is_bold_loaded(name: &str) -> bool {
-    ACTIVE
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .map(|m| m.contains(&format!("bold:{}", norm(name))))
-        .unwrap_or(false)
+    ACTIVE.with(|state| state.borrow().bold.contains(&norm(name)))
 }
 
 pub fn bold_family_key(name: &str) -> String {
@@ -342,24 +346,55 @@ pub fn bold_family_key(name: &str) -> String {
 }
 
 pub fn is_loaded(name: &str) -> bool {
-    ACTIVE
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .map(|m| m.contains(&norm(name)))
-        .unwrap_or(false)
+    ACTIVE.with(|state| state.borrow().regular.contains(&norm(name)))
 }
 
-/// 每帧开头调用：上一帧 `set_fonts` 的字体在这一帧真正可用。
-fn pending() -> &'static Mutex<HashSet<String>> {
-    PENDING.get_or_init(|| Mutex::new(HashSet::new()))
+pub fn generation() -> u64 {
+    ACTIVE.with(|state| state.borrow().generation)
 }
 
-static ACTIVE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static READY_TO_INSTALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static TRIED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static ASYNC_LOADER: OnceLock<std::sync::mpsc::Sender<(Vec<String>, egui::Context)>> = OnceLock::new();
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
-pub fn generation() -> u64 { ACTIVE_GENERATION.load(std::sync::atomic::Ordering::Acquire) }
+fn revision_id() -> egui::Id {
+    egui::Id::new("cellan_system_font_definitions")
+}
+
+pub fn install(ctx: &egui::Context, definitions: egui::FontDefinitions) {
+    ctx.set_fonts(definitions);
+    ctx.data_mut(|data| data.insert_temp(revision_id(), next_generation()));
+}
+
+/// set_fonts 在下一次绘制才生效。以当前 Context 实际接受的字体族为准，
+/// 后台只负责缓存字节，不能使其他窗口或正在绘制的帧提前使用新字体。
+pub fn begin_frame(ctx: &egui::Context) {
+    let revision = ctx.data_mut(|data| {
+        *data.get_temp_mut_or_insert_with(revision_id(), next_generation)
+    });
+    let pixels_per_point = ctx.pixels_per_point().to_bits();
+    ACTIVE.with(|slot| {
+        let mut active = slot.borrow_mut();
+        if active.revision == revision && active.pixels_per_point == pixels_per_point {
+            return;
+        }
+        active.regular.clear();
+        active.bold.clear();
+        for family in ctx.fonts(|fonts| fonts.families()) {
+            if let egui::FontFamily::Name(name) = family {
+                if let Some(font) = name.strip_prefix("sys:") {
+                    active.regular.insert(font.to_owned());
+                } else if let Some(font) = name.strip_prefix("sysbold:") {
+                    active.bold.insert(font.to_owned());
+                }
+            }
+        }
+        active.revision = revision;
+        active.pixels_per_point = pixels_per_point;
+        active.generation = next_generation();
+    });
+}
 
 /// 后台异步加载工作簿引用的系统字体（避免在 UI 主线程同步读盘 20MB+ `.ttc`/`.ttf`）。
 /// 已尝试过的字体（含不存在的系统字体）记入 `TRIED`，避免每 30 帧重复触发文件 I/O。
@@ -405,15 +440,6 @@ pub fn request_async(names: &[String], ctx: &egui::Context) {
 /// 检查后台线程是否已完成新字体字节加载并等待挂载到 `egui::Context`。
 pub fn take_ready() -> bool {
     READY_TO_INSTALL.swap(false, std::sync::atomic::Ordering::AcqRel)
-}
-
-pub fn begin_frame() {
-    let active = ACTIVE.get_or_init(|| Mutex::new(HashSet::new()));
-    let pending = PENDING.get_or_init(|| Mutex::new(HashSet::new()));
-    let (Ok(mut a), Ok(mut p)) = (active.lock(), pending.lock()) else { return };
-    let mut changed = false;
-    for k in p.drain() { changed |= a.insert(k); }
-    if changed { ACTIVE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release); }
 }
 
 /// 返回是否新增了字体（调用方需要重设 FontDefinitions）。
@@ -468,9 +494,6 @@ pub fn ensure(names: &[String]) -> bool {
                 if !b.contains_key(&key) {
                     b.insert(key.clone(), bold_face);
                     changed = true;
-                    if let Ok(mut fonts) = pending().lock() {
-                        fonts.insert(format!("bold:{key}"));
-                    }
                 }
             }
         }
@@ -510,7 +533,6 @@ pub fn apply(fonts: &mut egui::FontDefinitions) {
         fonts
             .families
             .insert(egui::FontFamily::Name(key.clone().into()), chain);
-        let _ = pending().lock().map(|mut p| p.insert(name.clone()));
     }
     if let Ok(bold) = BOLD_LOADED.get_or_init(|| Mutex::new(HashMap::new())).lock() {
         for (name, f) in bold.iter() {
@@ -528,7 +550,6 @@ pub fn apply(fonts: &mut egui::FontDefinitions) {
             fonts
                 .families
                 .insert(egui::FontFamily::Name(key.clone().into()), chain);
-            let _ = pending().lock().map(|mut p| p.insert(format!("bold:{name}")));
         }
     }
 }
@@ -563,12 +584,33 @@ mod tests {
 
     #[test]
     fn ensure_is_idempotent() {
-        assert!(ensure(&["宋体".to_string()]));
-        let mut d = egui::FontDefinitions::default();
-        apply(&mut d);
-        begin_frame();
-        assert!(is_loaded("宋体"));
+        let _ = ensure(&["宋体".to_string()]);
+        let mut defs = egui::FontDefinitions::default();
+        apply(&mut defs);
+        assert!(defs.families.contains_key(&egui::FontFamily::Name("sys:宋体".into())));
         assert!(!ensure(&["宋体".to_string()]));
+    }
+
+    #[test]
+    fn workbook_font_becomes_available_only_in_the_context_that_installed_it() {
+        let _ = ensure(&["微软雅黑".into()]);
+        let mut defs = egui::FontDefinitions::default();
+        apply(&mut defs);
+        let ctx = egui::Context::default();
+        install(&ctx, defs);
+        let _ = ctx.run(Default::default(), |ctx| {
+            begin_frame(ctx);
+            assert!(is_bold_loaded("微软雅黑"));
+        });
+        let bare = egui::Context::default();
+        let _ = bare.run(Default::default(), |ctx| {
+            begin_frame(ctx);
+            assert!(!is_bold_loaded("微软雅黑"));
+        });
+        let _ = ctx.run(Default::default(), |ctx| {
+            begin_frame(ctx);
+            assert!(is_bold_loaded("微软雅黑"));
+        });
     }
 
     #[test]

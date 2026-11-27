@@ -94,6 +94,17 @@ pub struct ThemePalette {
     pub info_fg: Color32,
 }
 
+impl ThemePalette {
+    /// Subtle separators for application chrome. High contrast keeps the full theme stroke.
+    pub fn chrome_separator(self) -> Color32 {
+        if self.theme == AppTheme::HighContrast {
+            self.card_border
+        } else {
+            self.page_bg.lerp_to_gamma(self.card_border, 0.6)
+        }
+    }
+}
+
 #[cfg(not(test))]
 static ACTIVE_THEME: AtomicU8 = AtomicU8::new(0);
 

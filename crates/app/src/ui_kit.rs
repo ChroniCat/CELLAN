@@ -587,21 +587,11 @@ pub fn popup_item(ui: &mut egui::Ui, label: &str, enabled: bool, min_w: f32) -> 
 pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) -> Rect {
     let first = GROUP_FIRST.with(|c| c.replace(false));
     if !first {
-        // 分隔线画在两组交界处，上下收进卡片内留出呼吸感
-        let x = ui.cursor().left();
-        let y = ui.cursor().top();
-        let dark = ui.visuals().dark_mode;
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(
-                egui::pos2(x, y + 10.0),
-                Vec2::new(crate::tokens::stroke::HAIR, RIBBON_BODY_H - 20.0),
-            ),
-            0.0,
-            if dark {
-                Color32::from_rgb(58, 64, 74)
-            } else {
-                SEP
-            },
+        let pal = crate::theme::palette();
+        let center = ui.cursor().top() + RIBBON_BODY_H * 0.5;
+        ui.painter().vline(
+            ui.cursor().left(), (center - 17.0)..=(center + 17.0),
+            Stroke::new(crate::tokens::stroke::HAIR, pal.chrome_separator()),
         );
     }
     let out = ui
@@ -620,11 +610,7 @@ pub fn group(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) ->
             // 6(顶) + 76(命令) + 4(间隙) + 16(组名居中行) = 102，距 110 高卡片底边留足 8px 白边！
             ui.add_space(4.0);
             let (lbl_rect, _) = ui.allocate_exact_size(Vec2::new(w, GROUP_LABEL_H), Sense::hover());
-            let c = if ui.visuals().dark_mode {
-                ui.visuals().weak_text_color()
-            } else {
-                Color32::from_rgb(100, 116, 139)
-            };
+            let c = crate::theme::palette().text_weak;
             ui.painter().text(
                 lbl_rect.center(),
                 Align2::CENTER_CENTER,
@@ -752,7 +738,7 @@ pub fn big_sized_galley(
         egui::pos2(rect.center().x, rect.top() + 7.0 + icon_size / 2.0),
         Vec2::splat(icon_size),
     );
-    ui_icons::draw_excel(ui.painter(), icon_rect, icon, col, enabled);
+    ui_icons::draw_control(ui, icon_rect, icon, col, enabled);
     if let Some(g) = galley {
         let pos = Align2::CENTER_CENTER
             .anchor_size(egui::pos2(rect.center().x, rect.bottom() - 12.0), g.size())
@@ -828,7 +814,7 @@ pub fn big_sized_split_galley(
         egui::pos2(rect.center().x, rect.top() + 6.0 + icon_size / 2.0),
         Vec2::splat(icon_size),
     );
-    ui_icons::draw_excel(ui.painter(), icon_rect, icon, col, enabled);
+    ui_icons::draw_control(ui, icon_rect, icon, col, enabled);
     if let Some(g) = galley {
         let pos = Align2::CENTER_CENTER
             .anchor_size(egui::pos2(rect.center().x, rect.bottom() - 21.0), g.size())
@@ -877,7 +863,7 @@ pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response 
         ui.painter().rect_filled(rect, 3.0, bg);
     }
     let col = if !enabled { DISABLED } else { txt_col };
-    ui_icons::draw_excel(ui.painter(), rect.shrink(4.0), icon, col, enabled);
+    ui_icons::draw_control(ui, rect.shrink(4.0), icon, col, enabled);
     if !tip.is_empty() && (resp.hovered() || resp.contains_pointer()) {
         resp.on_hover_text(tip)
     } else {
@@ -1025,7 +1011,7 @@ pub fn labeled_w_on_galley(
         egui::pos2(rect.left() + 4.0, rect.center().y - 8.0),
         Vec2::splat(16.0),
     );
-    ui_icons::draw_excel(ui.painter(), ir, icon, col, enabled);
+    ui_icons::draw_control(ui, ir, icon, col, enabled);
     if let Some(g) = galley {
         let pos = Align2::LEFT_CENTER
             .anchor_size(egui::pos2(rect.left() + 24.0, rect.center().y), g.size())
@@ -1916,7 +1902,10 @@ pub fn sheet_tab(
     a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active || grouped));
     let chip = rect.shrink2(Vec2::new(1.0, 3.0));
     if active {
-        ui.painter().rect(chip, 4.0, pal.card_bg, Stroke::new(1.0, pal.card_border), egui::StrokeKind::Inside);
+        ui.painter().rect_filled(chip, 4.0, pal.card_bg);
+        if pal.theme == crate::theme::AppTheme::HighContrast {
+            ui.painter().rect_stroke(chip, 4.0, Stroke::new(1.0, pal.card_border), egui::StrokeKind::Inside);
+        }
         let bar = Rect::from_min_max(
             egui::pos2(chip.left() + 6.0, chip.bottom() - 2.5),
             egui::pos2(chip.right() - 6.0, chip.bottom()),

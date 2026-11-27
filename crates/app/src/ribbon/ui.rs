@@ -196,6 +196,11 @@ struct RibbonFrameCtx<'a> {
 
 /// 当前页签的功能区主体。
 pub fn body(app: &mut SheetApp, ui: &mut egui::Ui) {
+    let commands = egui::UiStackInfo::default().with_tag(crate::ui_icons::RIBBON_COMMANDS);
+    ui.scope_builder(egui::UiBuilder::new().ui_stack_info(commands), |ui| command_groups(app, ui));
+}
+
+fn command_groups(app: &mut SheetApp, ui: &mut egui::Ui) {
     // 上下文页签的宿主对象没了就退回「开始」（和 Excel 一样）
     // 文件还在后台打开时，选区/表格都还没就位，先别把上下文页签踢掉
     if app.tasks.open_rx.is_none() {
@@ -1096,41 +1101,31 @@ fn menu_a11y(
             (tw + 24.0).max(28.0)
         };
         let w = ctl.width.unwrap_or(min_w).max(min_w);
-        if let Some(ic) = icon {
-            let r = ui_kit::labeled_w_on_galley(ui, ic, galley, w, false, "");
-            ui_kit::caret(
-                ui,
-                egui::pos2(r.rect.right() - 7.0, r.rect.center().y + 0.5),
-                if enabled { crate::theme::palette().text_weak } else { ui_kit::DISABLED },
-            );
-            attach_lazy_tip(r, st.tip.as_deref(), ctl)
-        } else {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::click());
-            let bg = ui_kit::state_bg(
-                enabled,
-                false,
-                resp.hovered(),
-                resp.is_pointer_button_down_on(),
-                ui.visuals().dark_mode,
-            );
-            if bg != Color32::TRANSPARENT {
-                ui.painter().rect_filled(rect, 4.0, bg);
-            }
-            let pal = crate::theme::palette();
-            let fg = if enabled { pal.text } else { ui_kit::DISABLED };
-            if let Some(g) = galley {
-                let pos = Align2::LEFT_CENTER
-                    .anchor_size(egui::pos2(rect.left() + 8.0, rect.center().y), g.size())
-                    .min;
-                ui.painter().galley(pos, g, fg);
-            }
-            ui_kit::caret(
-                ui,
-                egui::pos2(rect.right() - 8.0, rect.center().y + 0.5),
-                if enabled { pal.text_weak } else { ui_kit::DISABLED },
-            );
-            attach_lazy_tip(resp, st.tip.as_deref(), ctl)
+        let (rect, r) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::click());
+        let pal = crate::theme::palette();
+        let bg = ui_kit::state_bg(enabled, false, r.hovered(), r.is_pointer_button_down_on(), pal.theme.is_dark());
+        if bg != Color32::TRANSPARENT {
+            ui.painter().rect_filled(rect, 4.0, bg);
         }
+        let ink = if enabled { pal.text } else { pal.text_muted };
+        let mut content = rect.shrink2(Vec2::new(if icon.is_some() { 6.0 } else { 8.0 }, 0.0));
+        content.max.x = rect.right() - 14.0;
+        if let Some(ic) = icon {
+            let glyph = if galley.is_some() {
+                Rect::from_center_size(content.left_center() + Vec2::new(8.0, 0.0), Vec2::splat(16.0))
+            } else {
+                Rect::from_center_size(content.center(), Vec2::splat(14.0))
+            };
+            crate::ui_icons::draw_control(ui, glyph, ic, ink, enabled);
+            content.min.x = glyph.right() + 5.0;
+        }
+        if let Some(galley) = galley {
+            let pos = Align2::LEFT_CENTER.anchor_size(content.left_center(), galley.size()).min;
+            ui.painter_at(content).galley(pos, galley, ink);
+        }
+        ui_kit::caret(ui, egui::pos2(rect.right() - 7.0, rect.center().y + 0.5),
+            if enabled { pal.text_weak } else { pal.text_muted });
+        attach_lazy_tip(r, st.tip.as_deref(), ctl)
     });
     if rc.a11y {
         let name = a11y_full.or_else(|| (!label.is_empty()).then_some(label))
@@ -1146,6 +1141,26 @@ fn menu_a11y(
             opened_at: ui.input(|i| i.time),
         });
     }
+}
+
+/// Value choices share the ribbon surface at rest. High contrast retains its control outline.
+fn paint_value_selector(ui: &egui::Ui, resp: &egui::Response, popup: Option<&Popup>) {
+    let rect = resp.rect;
+    let open = popup.is_some_and(|p| matches!(p.kind, PopupKind::Items(_)) && p.pos.distance_sq(rect.left_bottom()) < 1.0);
+    let pal = crate::theme::palette();
+    let bg = if open || resp.is_pointer_button_down_on() {
+        pal.pressed
+    } else if resp.hovered() {
+        pal.hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    let stroke = if pal.theme == crate::theme::AppTheme::HighContrast {
+        egui::Stroke::new(1.0, pal.card_border)
+    } else {
+        egui::Stroke::NONE
+    };
+    ui.painter().rect(rect, 4.0, bg, stroke, egui::StrokeKind::Inside);
 }
 
 fn dropdown(
@@ -1174,29 +1189,7 @@ fn dropdown(
         let (rect, r) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
         let enabled = ui.is_enabled();
         let pal = crate::theme::palette();
-        let hover = r.hovered() && enabled;
-        ui.painter().rect(
-            rect,
-            5.0,
-            if !enabled {
-                pal.hover
-            } else if hover {
-                pal.hover
-            } else {
-                pal.card_bg
-            },
-            egui::Stroke::new(
-                1.0,
-                if !enabled {
-                    pal.card_border
-                } else if hover {
-                    pal.accent
-                } else {
-                    pal.card_border
-                },
-            ),
-            egui::StrokeKind::Inside,
-        );
+        paint_value_selector(ui, &r, app.ribbon_popup.as_ref());
         let pos = Align2::LEFT_CENTER
             .anchor_size(egui::pos2(rect.left() + 7.0, rect.center().y), galley.size())
             .min;
@@ -1210,6 +1203,7 @@ fn dropdown(
             egui::pos2(rect.right() - 8.0, rect.center().y),
             if enabled { pal.text_weak } else { ui_kit::DISABLED },
         );
+        ui_kit::focus_ring(ui, &r, rect, 4.0);
         attach_lazy_tip(r, st.tip.as_deref(), c)
     });
     // UI-24.2：自绘下拉在 UIA 里要有名字（当前值 + 说明）
@@ -1260,29 +1254,7 @@ fn combo(
         let w = c.width.unwrap_or(width).max(52.0);
         let (rect, r) = ui.allocate_exact_size(Vec2::new(w, 22.0), Sense::click());
         let pal = crate::theme::palette();
-        let hover = r.hovered() && enabled;
-        ui.painter().rect(
-            rect,
-            5.0,
-            if !enabled {
-                pal.hover
-            } else if hover {
-                pal.hover
-            } else {
-                pal.card_bg
-            },
-            egui::Stroke::new(
-                1.0,
-                if !enabled {
-                    pal.card_border
-                } else if hover {
-                    pal.accent
-                } else {
-                    pal.card_border
-                },
-            ),
-            egui::StrokeKind::Inside,
-        );
+        paint_value_selector(ui, &r, app.ribbon_popup.as_ref());
         ui.painter().text(
             egui::pos2(rect.left() + 7.0, rect.center().y),
             Align2::LEFT_CENTER,
@@ -1295,6 +1267,7 @@ fn combo(
             egui::pos2(rect.right() - 8.0, rect.center().y),
             if enabled { pal.text_weak } else { ui_kit::DISABLED },
         );
+        ui_kit::focus_ring(ui, &r, rect, 4.0);
         attach_lazy_tip(r, st.tip.as_deref(), c)
     });
     if rc.a11y {
@@ -2467,9 +2440,15 @@ fn menu_chevron(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut e
     let mut row = ui.new_child(egui::UiBuilder::new().id_salt("collapsed_groups").max_rect(bounds)
         .layout(egui::Layout::left_to_right(egui::Align::Center)));
     row.spacing_mut().interact_size.y = 24.0;
-    let ir = row.menu_button(format!("{label}    "), add_contents);
-    let rect = ir.response.rect;
     let pal = crate::theme::palette();
+    if pal.theme != crate::theme::AppTheme::HighContrast {
+        let inactive = &mut row.visuals_mut().widgets.inactive;
+        inactive.weak_bg_fill = Color32::TRANSPARENT;
+        inactive.bg_stroke = egui::Stroke::NONE;
+    }
+    let response = row.menu_button(format!("{label}    "), add_contents).response;
+    let rect = response.rect;
+    ui_kit::focus_ring(&row, &response, rect, 4.0);
     ui_kit::caret(&mut row, egui::pos2(rect.right() - 9.0, rect.center().y), pal.text_weak);
     ui.advance_cursor_after_rect(rect);
 }
@@ -2702,6 +2681,38 @@ pub fn icon_of(name: &str) -> Option<Icon> {
 #[cfg(test)]
 mod compact_tests {
     use super::*;
+
+    #[test]
+    fn value_selector_distinguishes_idle_open_and_high_contrast() {
+        use crate::theme::{palette_for, set_current_theme, AppTheme};
+        let original = crate::theme::current_theme();
+        for theme in [AppTheme::Light, AppTheme::Dark, AppTheme::HighContrast] {
+            set_current_theme(theme);
+            let pal = palette_for(theme);
+            let ctx = egui::Context::default();
+            for open in [false, true] {
+                let mut selector = Rect::NOTHING;
+                let frame = ctx.run(Default::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let (rect, response) = ui.allocate_exact_size(Vec2::new(96.0, 24.0), Sense::click());
+                        selector = rect;
+                        let popup = open.then(|| Popup {
+                            kind: PopupKind::Items(Vec::new()), pos: rect.left_bottom(), opened_at: 0.0,
+                        });
+                        paint_value_selector(ui, &response, popup.as_ref());
+                    });
+                });
+                let face = frame.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(face) if face.rect == selector => Some(face),
+                    _ => None,
+                });
+                let fill = face.map_or(Color32::TRANSPARENT, |f| f.fill);
+                assert_eq!(fill, if open { pal.pressed } else { Color32::TRANSPARENT });
+                assert_eq!(face.is_some_and(|f| !f.stroke.is_empty()), theme == AppTheme::HighContrast);
+            }
+        }
+        set_current_theme(original);
+    }
 
     #[test]
     fn ribbon_watch_and_calculated_column_are_clickable_above_the_group_caption() {
