@@ -4,7 +4,7 @@
 
 use crate::{model::{Sheet, Workbook}, refs::rewrite_sheet};
 
-fn valid_name(wb: &Workbook, except: Option<usize>, name: &str) -> bool {
+pub(crate) fn valid_name(wb: &Workbook, except: Option<usize>, name: &str) -> bool {
     !name.is_empty() && name.chars().count() <= 31
         && !name.chars().any(|c| c.is_control() || "[]:*?/\\".contains(c))
         && !name.starts_with('\'') && !name.ends_with('\'')
@@ -84,23 +84,35 @@ pub fn delete_sheet(wb: &mut Workbook, idx: usize) -> bool {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct DeletedSheetPivots {
-    pub pivots: Vec<crate::pivot_engine::PivotTableModel>,
-    pub pivots_pending: Vec<(
+pub struct DeletedSheetPivots {
+    pub(crate) pivots: Vec<crate::pivot_engine::PivotTableModel>,
+    pub(crate) pivots_pending: Vec<(
         usize,
         crate::pivot::PivotSpec,
         crate::pivot::PivotResult,
         (u32, u32, u32, u32),
         String,
     )>,
-    pub pivots_pending2: Vec<(
+    pub(crate) pivots_pending2: Vec<(
         usize,
         crate::pivot_multi::PivotSpec2,
         crate::pivot_multi::PivotGrid,
         (u32, u32, u32, u32),
     )>,
-    pub pivot_shifts: Vec<(String, u8, u32, u32, bool)>,
-    pub pivot_calc_fields: Vec<(usize, String, String)>,
+    pub(crate) pivot_shifts: Vec<(String, u8, u32, u32, bool)>,
+    pub(crate) pivot_calc_fields: Vec<(usize, String, String)>,
+}
+
+impl std::fmt::Debug for DeletedSheetPivots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeletedSheetPivots")
+            .field("pivots", &self.pivots.len())
+            .field("pivots_pending", &self.pivots_pending.len())
+            .field("pivots_pending2", &self.pivots_pending2.len())
+            .field("pivot_shifts", &self.pivot_shifts.len())
+            .field("pivot_calc_fields", &self.pivot_calc_fields.len())
+            .finish()
+    }
 }
 
 pub(crate) struct DeletedSheetRecord {
@@ -349,7 +361,15 @@ enum ReferenceField {
 }
 
 #[derive(Default)]
-pub(crate) struct RenameReferences(std::collections::HashMap<ReferenceField, (String, String)>);
+pub struct RenameReferences(std::collections::HashMap<ReferenceField, (String, String)>);
+
+impl std::fmt::Debug for RenameReferences {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenameReferences")
+            .field("entries", &self.0.len())
+            .finish()
+    }
+}
 
 impl RenameReferences {
     pub(crate) fn payload_bytes(&self) -> usize {

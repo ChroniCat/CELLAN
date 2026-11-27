@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 
 const ASYNC_CELLS: usize = 16_384;
 
-pub(super) struct Snapshots {
+pub(crate) struct Snapshots {
     before: StructureSnapshot,
     after: StructureSnapshot,
 }
@@ -59,7 +59,7 @@ impl Snapshots {
     }
 }
 
-pub(super) struct Job {
+pub(crate) struct Job {
     snapshots: Mutex<Option<Box<Snapshots>>>,
     bytes: OnceLock<usize>,
     finished: Condvar,
@@ -92,7 +92,7 @@ impl Job {
     }
 }
 
-pub(super) enum History {
+pub(crate) enum History {
     Ready(Box<Snapshots>),
     Pending(Arc<Job>),
 }

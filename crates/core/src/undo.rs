@@ -12,7 +12,7 @@ mod structural_cells;
 mod move_refs;
 pub use move_refs::MoveReferences;
 #[path = "undo_structural_history.rs"]
-mod structural_history;
+pub(crate) mod structural_history;
 use crate::model::{Cell, CellRef, Sheet, Workbook};
 use std::collections::HashSet;
 #[path = "undo_references.rs"]
@@ -304,6 +304,9 @@ pub struct Applied {
     /// Structural restoration changes coordinates and references across sheets.
     /// Rebuild dependencies and recalculate the workbook after applying it.
     pub structural: bool,
+    /// True when grid coordinates or sheet indices changed (structural, sheet-tab,
+    /// or sparse partial cell-shift replay).
+    pub coord_changed: bool,
     /// 撤销/重做后要写回的外源源尺寸（名字, 行, 列）
     pub refresh_sizes: Option<Vec<(String, u32, u32)>>,
     /// 撤销/重做实际发生的合并结构变化：(表, 矩形, 是否新增)
@@ -1158,6 +1161,7 @@ impl PivotUndoAction {
             focus,
             skipped: 0,
             structural: self.edit.inserted_sheet.is_some(),
+            coord_changed: self.edit.inserted_sheet.is_some(),
             refresh_sizes: None,
             merge_changes: Vec::new(),
             merge_conflict: false,
@@ -1209,6 +1213,7 @@ impl ChartUndoAction {
             focus: self.focus,
             skipped: 0,
             structural: false,
+            coord_changed: false,
             refresh_sizes: None,
             merge_changes: Vec::new(),
             merge_conflict: false,
@@ -1219,12 +1224,9 @@ impl ChartUndoAction {
 
 enum Entry {
     Cells(EntryStamp, Action, Option<crate::data_tools::LinePermutation>, Option<ArrayEdit>, Option<NoteUndoEdit>),
-    CellShift(EntryStamp, CellShiftAction),
-    RoomCellShift(EntryStamp, RoomCellShiftAction),
+    Tx(EntryStamp, TxAction),
     CowBatch(EntryStamp, Box<CowBatchAction>),
     NumericSort(EntryStamp, NumericSortAction),
-    Structure(EntryStamp, StructureAction),
-    SheetTab(EntryStamp, SheetTabAction),
     Meta(EntryStamp, Box<MetaAction>),
     Pivot(EntryStamp, Box<PivotUndoAction>),
     Chart(EntryStamp, Box<ChartUndoAction>),
@@ -1236,12 +1238,9 @@ impl Entry {
     fn stamp(&self) -> &EntryStamp {
         match self {
             Self::Cells(s, _, _, _, _)
-            | Self::CellShift(s, _)
-            | Self::RoomCellShift(s, _)
+            | Self::Tx(s, _)
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
-            | Self::Structure(s, _)
-            | Self::SheetTab(s, _)
             | Self::Meta(s, _)
             | Self::Pivot(s, _)
             | Self::Chart(s, _) => s,
@@ -1251,12 +1250,9 @@ impl Entry {
     fn stamp_mut(&mut self) -> &mut EntryStamp {
         match self {
             Self::Cells(s, _, _, _, _)
-            | Self::CellShift(s, _)
-            | Self::RoomCellShift(s, _)
+            | Self::Tx(s, _)
             | Self::CowBatch(s, _)
             | Self::NumericSort(s, _)
-            | Self::Structure(s, _)
-            | Self::SheetTab(s, _)
             | Self::Meta(s, _)
             | Self::Pivot(s, _)
             | Self::Chart(s, _) => s,
@@ -1301,13 +1297,10 @@ impl Entry {
 
     fn label(&self) -> &str {
         match self {
-            Self::CellShift(_, a) => &a.label,
-            Self::RoomCellShift(_, a) => a.label(),
+            Self::Tx(_, a) => &a.label,
             Self::Cells(_, a, _, _, _) => &a.label,
             Self::CowBatch(_, a) => &a.label,
             Self::NumericSort(_, a) => &a.label,
-            Self::Structure(_, a) => &a.label,
-            Self::SheetTab(_, a) => &a.label,
             Self::Meta(_, a) => &a.label,
             Self::Pivot(_, a) => &a.label,
             Self::Chart(_, a) => &a.label,
@@ -1315,26 +1308,15 @@ impl Entry {
     }
     fn by_site(&self) -> u32 {
         match self {
-            Self::CellShift(_, a) => a.by_site,
-            Self::RoomCellShift(_, a) => a.site,
+            Self::Tx(_, a) => a.by_site,
             Self::Cells(_, a, _, _, _) => a.by_site,
             Self::CowBatch(_, a) => a.by_site,
             Self::NumericSort(_, a) => a.by_site,
-            Self::Structure(_, a) => a.by_site,
-            Self::SheetTab(_, a) => a.by_site,
             Self::Meta(_, a) => a.by_site,
             Self::Pivot(_, a) => a.by_site,
             Self::Chart(_, a) => a.by_site,
         }
     }
-}
-
-struct RoomCellShiftAction {
-    transaction: u64,
-    patch: std::sync::Arc<crate::cell_shift_patch::CellShiftPatch>,
-    sheet_ids: Vec<(usize, u64)>,
-    ownership_conflict: bool,
-    site: u32,
 }
 
 /// Measure a shared wire patch for the history budget without materializing another JSON copy.
@@ -1347,45 +1329,246 @@ impl std::io::Write for CountBytes {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-impl RoomCellShiftAction {
-    fn label(&self) -> &str {
-        if self.patch.insert { "插入单元格" } else { "删除单元格" }
-    }
-}
-
-struct CellShiftAction {
+/// Unified reversible transaction undo entry backing sparse shifts, compressed
+/// structural history, collaborative room patches, and sheet-tab operations.
+struct TxAction {
     label: String,
-    deltas: Vec<CellDelta>,
-    sheet_ids: Vec<(usize, u64)>,
     focus: (usize, u32, u32),
     by_site: u32,
+    delta: crate::tx::TxDelta,
 }
 
-impl CellShiftAction {
-    /// Clearing one end of a move while skipping the other can destroy data.
+impl TxAction {
+    /// Clearing one end of a sparse shift while skipping the other can destroy data.
     /// Check all cells and rewritten formulas before replaying either end.
-    fn apply(&self, sheets: &mut [Sheet], redo: bool, mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Applied {
-        let mut applied = Applied {
-            touched: Vec::new(), label: self.label.clone(), focus: self.focus, skipped: 0,
-            structural: false, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(),
-            merge_conflict: false, total_touched: 0,
+    fn apply_sparse_shift(
+        &self,
+        sheets: &mut [Sheet],
+        redo: bool,
+        mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
+    ) -> Option<Applied> {
+        let crate::tx::TxDelta::SparseShift {
+            deltas,
+            sheet_ids,
+            focus_sheet,
+        } = &self.delta
+        else {
+            return None;
         };
-        if self.sheet_ids.iter().any(|&(idx, id)| sheets.get(idx).is_none_or(|sheet| sheet.identity != id))
-            || self.deltas.iter().any(|d| !d.can_replay(&sheets[d.sheet], redo, &mut guard)) {
-            applied.skipped = self.deltas.len();
-            return applied;
+        let mut applied = Applied {
+            touched: Vec::new(),
+            label: self.label.clone(),
+            focus: self.focus,
+            skipped: 0,
+            structural: false,
+            coord_changed: true,
+            refresh_sizes: None,
+            style_changes: Vec::new(),
+            merge_changes: Vec::new(),
+            merge_conflict: false,
+            total_touched: 0,
+        };
+        if sheet_ids
+            .iter()
+            .any(|&(idx, id)| sheets.get(idx).is_none_or(|sheet| sheet.identity != id))
+            || deltas
+                .iter()
+                .any(|d| !d.can_replay(&sheets[d.sheet], redo, &mut guard))
+        {
+            applied.skipped = deltas.len();
+            return Some(applied);
         }
-        for delta in &self.deltas {
+        for delta in deltas {
             delta.replay(&mut sheets[delta.sheet], redo, &mut applied.style_changes);
             applied.touched.push((delta.sheet, delta.row, delta.col));
         }
-        sheets[self.focus.0].coordinates_shifted();
-        applied
+        applied.total_touched = applied.touched.len();
+        if let Some(sh) = sheets.get_mut(*focus_sheet) {
+            sh.coordinates_shifted();
+        }
+        Some(applied)
+    }
+
+    fn apply_workbook(&mut self, wb: &mut Workbook, redo: bool) -> Option<Applied> {
+        use crate::tx::{SheetTabChange, TxDelta};
+        match &mut self.delta {
+            TxDelta::Structure(history) => {
+                let (before, after) = history.snapshots()?;
+                let touched = if redo {
+                    restore_structure(wb, after, before)?
+                } else {
+                    restore_structure(wb, before, after)?
+                };
+                let total_touched = touched.len();
+                Some(Applied {
+                    touched,
+                    label: self.label.clone(),
+                    focus: self.focus,
+                    skipped: 0,
+                    structural: true,
+                    coord_changed: true,
+                    refresh_sizes: None,
+                    style_changes: Vec::new(),
+                    merge_changes: Vec::new(),
+                    merge_conflict: false,
+                    total_touched,
+                })
+            }
+            TxDelta::SheetTab {
+                index,
+                identity,
+                previous_focus,
+                change,
+            } => {
+                let mut focus = *previous_focus;
+                match change {
+                    SheetTabChange::Rename {
+                        before,
+                        after,
+                        references,
+                    } => {
+                        let (expected, restored) = if redo { (before, after) } else { (after, before) };
+                        let sheet = wb.sheets.get(*index)?;
+                        if sheet.identity != *identity
+                            || sheet.name != *expected
+                            || !references.restore(wb, *index, restored, redo)
+                        {
+                            return None;
+                        }
+                    }
+                    SheetTabChange::Append { removed } if redo => {
+                        if wb.sheets.len() != *index
+                            || wb.sheets.iter().any(|s| {
+                                s.identity == *identity
+                                    || removed
+                                        .as_ref()
+                                        .is_some_and(|r| r.name.eq_ignore_ascii_case(&s.name))
+                            })
+                        {
+                            return None;
+                        }
+                        wb.sheets.push(*removed.take()?);
+                        focus = (*index, 0, 0);
+                    }
+                    SheetTabChange::Append { removed } => {
+                        if *index == 0
+                            || wb.sheets.len() != *index + 1
+                            || wb.sheets[*index].identity != *identity
+                            || wb.names.iter().any(|(_, scope, _)| *scope == Some(*index))
+                            || wb.pivots_pending.iter().any(|(sheet, ..)| *sheet == *index)
+                            || wb.pivots_pending2.iter().any(|(sheet, ..)| *sheet == *index)
+                        {
+                            return None;
+                        }
+                        *removed = wb.sheets.pop().map(Box::new);
+                        wb.calc_pending_sheets.remove(index);
+                    }
+                    SheetTabChange::Insert { removed } if redo => {
+                        if *index > wb.sheets.len()
+                            || !removed
+                                .as_ref()
+                                .is_some_and(|sh| crate::sheet_ops::valid_name(wb, None, &sh.name))
+                        {
+                            return None;
+                        }
+                        let sh = *removed.take()?;
+                        if !crate::sheet_ops::insert_sheet(wb, *index, sh) {
+                            return None;
+                        }
+                        focus = (*index, 0, 0);
+                    }
+                    SheetTabChange::Insert { removed } => {
+                        if wb.sheets.len() <= 1
+                            || *index >= wb.sheets.len()
+                            || wb.sheets[*index].identity != *identity
+                        {
+                            return None;
+                        }
+                        let rec = crate::sheet_ops::delete_with_history(wb, *index)?;
+                        *removed = Some(Box::new(rec.sheet));
+                        wb.calc_pending_sheets.remove(index);
+                    }
+                    SheetTabChange::Delete {
+                        sheet,
+                        local_names,
+                        references,
+                        pivots,
+                    } if redo => {
+                        if wb.sheets.len() <= 1
+                            || *index >= wb.sheets.len()
+                            || wb.sheets[*index].identity != *identity
+                        {
+                            return None;
+                        }
+                        let rec = crate::sheet_ops::delete_with_history(wb, *index)?;
+                        *sheet = Some(Box::new(rec.sheet));
+                        *local_names = rec.local_names;
+                        *references = rec.references;
+                        *pivots = rec.pivots;
+                        focus = ((*index).min(wb.sheets.len() - 1), 0, 0);
+                    }
+                    SheetTabChange::Delete {
+                        sheet,
+                        local_names,
+                        references,
+                        pivots,
+                    } => {
+                        if *index > wb.sheets.len()
+                            || !sheet
+                                .as_ref()
+                                .is_some_and(|sh| crate::sheet_ops::valid_name(wb, None, &sh.name))
+                        {
+                            return None;
+                        }
+                        let sh = *sheet.take()?;
+                        if !crate::sheet_ops::restore_deleted_sheet(
+                            wb,
+                            *index,
+                            sh,
+                            local_names,
+                            references,
+                            pivots,
+                        ) {
+                            return None;
+                        }
+                        focus = (*index, previous_focus.1, previous_focus.2);
+                    }
+                    SheetTabChange::Move { from, to } => {
+                        let (src, dst) = if redo { (*from, *to) } else { (*to, *from) };
+                        if src >= wb.sheets.len()
+                            || dst >= wb.sheets.len()
+                            || wb.sheets[src].identity != *identity
+                        {
+                            return None;
+                        }
+                        if !crate::sheet_ops::reorder_sheet(wb, src, dst) {
+                            return None;
+                        }
+                        focus = (dst, previous_focus.1, previous_focus.2);
+                    }
+                }
+                wb.dirty = true;
+                Some(Applied {
+                    touched: Vec::new(),
+                    label: self.label.clone(),
+                    focus,
+                    skipped: 0,
+                    structural: true,
+                    coord_changed: true,
+                    refresh_sizes: None,
+                    style_changes: Vec::new(),
+                    merge_changes: Vec::new(),
+                    merge_conflict: false,
+                    total_touched: 0,
+                })
+            }
+            TxDelta::SparseShift { .. } | TxDelta::RoomPatch { .. } => None,
+        }
     }
 }
 
 #[inline]
-fn effective_snapshot_style(
+pub(crate) fn effective_snapshot_style(
     styles: &crate::store::CellStyles,
     row_styles: &crate::model::CellMetadata<u32, u16>,
     col_styles: &crate::model::CellMetadata<u32, u16>,
@@ -1771,6 +1954,7 @@ impl CowBatchAction {
             focus: self.focus,
             skipped: 0,
             structural: false,
+            coord_changed: false,
             refresh_sizes: None,
             merge_changes: Vec::new(),
             merge_conflict: false,
@@ -2151,15 +2335,6 @@ impl CowBatchAction {
     }
 }
 
-struct SheetTabAction {
-    label: String,
-    index: usize,
-    identity: u64,
-    previous_focus: (usize, u32, u32),
-    change: SheetTabChange,
-    by_site: u32,
-}
-
 struct NumericSortAction {
     excluded: std::collections::HashSet<(u32,u32)>,
     sort: crate::data_tools::CompactSort,
@@ -2174,7 +2349,7 @@ impl NumericSortAction {
         let previous_capacity = self.excluded.capacity();
         let mut applied = Applied {
             touched: Vec::new(), style_changes: Vec::new(), label: self.label.clone(), focus: self.focus,
-            skipped: 0, structural: false, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false,
+            skipped: 0, structural: false, coord_changed: false, refresh_sizes: None, merge_changes: Vec::new(), merge_conflict: false,
             total_touched: 0,
         };
         if let Some(sheet) = sheets.get_mut(self.sort.sheet()) {
@@ -2205,110 +2380,6 @@ impl NumericSortAction {
         stamp.payload_bytes += (self.excluded.capacity() - previous_capacity) * (size_of::<(u32,u32)>() + 1);
         (applied, meta_sync)
     }
-}
-
-enum SheetTabChange {
-    Append { removed: Option<Box<Sheet>> },
-    Insert { removed: Option<Box<Sheet>> },
-    Delete {
-        sheet: Option<Box<Sheet>>,
-        local_names: Vec<(String, Option<usize>, String)>,
-        references: crate::sheet_ops::RenameReferences,
-        pivots: crate::sheet_ops::DeletedSheetPivots,
-    },
-    Move { from: usize, to: usize },
-    Rename { before: String, after: String, references: crate::sheet_ops::RenameReferences },
-}
-
-impl SheetTabAction {
-    fn apply(&mut self, wb: &mut Workbook, redo: bool) -> Option<Applied> {
-        let mut focus = self.previous_focus;
-        match &mut self.change {
-            SheetTabChange::Rename { before, after, references } => {
-                let (expected, restored) = if redo { (before, after) } else { (after, before) };
-                let sheet = wb.sheets.get(self.index)?;
-                if sheet.identity != self.identity || sheet.name != *expected
-                    || !references.restore(wb, self.index, restored, redo)
-                {
-                    return None;
-                }
-            }
-            SheetTabChange::Append { removed } if redo => {
-                if wb.sheets.len() != self.index || wb.sheets.iter().any(|s| {
-                    s.identity == self.identity || removed.as_ref().is_some_and(|r| r.name.eq_ignore_ascii_case(&s.name))
-                }) { return None; }
-                wb.sheets.push(*removed.take()?);
-                focus = (self.index, 0, 0);
-            }
-            SheetTabChange::Append { removed } => {
-                if self.index == 0 || wb.sheets.len() != self.index + 1
-                    || wb.sheets[self.index].identity != self.identity
-                    || wb.names.iter().any(|(_, scope, _)| *scope == Some(self.index))
-                    || wb.pivots_pending.iter().any(|(sheet, ..)| *sheet == self.index)
-                    || wb.pivots_pending2.iter().any(|(sheet, ..)| *sheet == self.index)
-                { return None; }
-                *removed = wb.sheets.pop().map(Box::new);
-                wb.calc_pending_sheets.remove(&self.index);
-            }
-            SheetTabChange::Insert { removed } if redo => {
-                if self.index > wb.sheets.len() { return None; }
-                let sh = *removed.take()?;
-                if !crate::sheet_ops::insert_sheet(wb, self.index, sh) {
-                    return None;
-                }
-                focus = (self.index, 0, 0);
-            }
-            SheetTabChange::Insert { removed } => {
-                if wb.sheets.len() <= 1 || self.index >= wb.sheets.len()
-                    || wb.sheets[self.index].identity != self.identity
-                { return None; }
-                let rec = crate::sheet_ops::delete_with_history(wb, self.index)?;
-                *removed = Some(Box::new(rec.sheet));
-                wb.calc_pending_sheets.remove(&self.index);
-            }
-            SheetTabChange::Delete { sheet, local_names, references, pivots } if redo => {
-                if wb.sheets.len() <= 1 || self.index >= wb.sheets.len()
-                    || wb.sheets[self.index].identity != self.identity
-                { return None; }
-                let rec = crate::sheet_ops::delete_with_history(wb, self.index)?;
-                *sheet = Some(Box::new(rec.sheet));
-                *local_names = rec.local_names;
-                *references = rec.references;
-                *pivots = rec.pivots;
-                focus = (self.index.min(wb.sheets.len() - 1), 0, 0);
-            }
-            SheetTabChange::Delete { sheet, local_names, references, pivots } => {
-                let sh = *sheet.take()?;
-                if !crate::sheet_ops::restore_deleted_sheet(wb, self.index, sh, local_names, references, pivots) {
-                    return None;
-                }
-                focus = (self.index, self.previous_focus.1, self.previous_focus.2);
-            }
-            SheetTabChange::Move { from, to } => {
-                let (src, dst) = if redo { (*from, *to) } else { (*to, *from) };
-                if src >= wb.sheets.len() || dst >= wb.sheets.len()
-                    || wb.sheets[src].identity != self.identity
-                { return None; }
-                if !crate::sheet_ops::reorder_sheet(wb, src, dst) {
-                    return None;
-                }
-                focus = (dst, self.previous_focus.1, self.previous_focus.2);
-            }
-        }
-        wb.dirty = true;
-        Some(Applied {
-            touched: Vec::new(), label: self.label.clone(), focus, skipped: 0,
-            structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false,
-            total_touched: 0,
-        })
-    }
-}
-
-struct StructureAction {
-    label: String,
-    history: structural_history::History,
-    focus: (usize, u32, u32),
-    by_site: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -2390,9 +2461,13 @@ pub fn snapshot_cell_shift_if_bound(wb: &Workbook, sheet: usize, rect: (u32,u32,
 pub fn snapshot_axis_move(wb: &Workbook, sheet: usize, axis: crate::refs::Axis, from: u32, n: u32, drop: u32) -> Option<StructureSnapshot> {
     wb.sheets.get(sheet)?;
     let movement = crate::refs::AxisMove::from_drop(axis, from, n, drop)?;
+    Some(snapshot_axis_permute(wb, sheet, movement))
+}
+
+pub(crate) fn snapshot_axis_permute(wb: &Workbook, sheet: usize, movement: crate::refs::AxisMove) -> StructureSnapshot {
     // Compression stores cell differences against the original coordinates. Foreign
     // references are captured using the actual forward/inverse permutation.
-    Some(snapshot_with_mapping(wb, sheet, crate::refs::Shift { axis, ..Default::default() }, Some(movement)))
+    snapshot_with_mapping(wb, sheet, crate::refs::Shift { axis: movement.axis, ..Default::default() }, Some(movement))
 }
 
 fn snapshot_with_mapping(wb: &Workbook, sheet: usize, shift: crate::refs::Shift, movement: Option<crate::refs::AxisMove>) -> StructureSnapshot {
@@ -2422,6 +2497,10 @@ impl StructureSnapshot {
         self.foreign.iter().filter(|scope| !scope.cells.is_empty()).map(|scope| {
             (scope.sheet, scope.cells.iter().map(|(key, _)| (key.row, key.col)).collect())
         })
+    }
+
+    pub(crate) fn foreign_sheets(&self) -> Vec<usize> {
+        self.foreign.iter().map(|scope| scope.sheet).collect()
     }
 
     /// Cell deltas already cover values, formulas and styles. A partial shift
@@ -2925,6 +3004,98 @@ impl UndoStack {
         self.push_prepared(action.prepare());
     }
 
+    /// Push a unified transaction commit into history as `Entry::Tx`.
+    ///
+    /// Returns `0` without mutating the stack when `commit.delta.is_empty()`
+    /// (e.g. a partial cell shift on an untouched band); otherwise returns the
+    /// newly assigned non-zero entry ID (`>= 1`).
+    pub fn push_tx(&mut self, mut commit: crate::tx::TxCommit) -> u64 {
+        if commit.delta.is_empty() {
+            return 0;
+        }
+        if commit.by_site == 0 {
+            commit.by_site = self.site;
+        }
+        let bytes = self.tx_delta_bytes(&commit.delta);
+        if let crate::tx::TxDelta::Structure(history) = &commit.delta {
+            self.pending_compaction |= history.is_pending();
+        }
+        let stamp = next_entry(bytes);
+        let id = stamp.id;
+        self.done.push(Entry::Tx(
+            stamp,
+            TxAction {
+                label: commit.label,
+                focus: commit.focus,
+                by_site: commit.by_site,
+                delta: commit.delta,
+            },
+        ));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+        id
+    }
+
+    fn tx_delta_bytes(&self, delta: &crate::tx::TxDelta) -> usize {
+        use crate::tx::{SheetTabChange, TxDelta};
+        match delta {
+            TxDelta::SparseShift { deltas, .. } => {
+                deltas.capacity() * std::mem::size_of::<CellDelta>()
+                    + deltas
+                        .iter()
+                        .map(|d| cell_heap_bytes(&d.before) + cell_heap_bytes(&d.after))
+                        .sum::<usize>()
+            }
+            TxDelta::Structure(history) => history.initial_bytes,
+            TxDelta::RoomPatch { patch, .. } => {
+                let mut bytes = CountBytes(0);
+                let _ = serde_json::to_writer(&mut bytes, &**patch);
+                bytes.0
+            }
+            TxDelta::SheetTab { change, .. } => match change {
+                SheetTabChange::Rename {
+                    before,
+                    after,
+                    references,
+                } => before.len() + after.len() + references.payload_bytes(),
+                SheetTabChange::Delete {
+                    sheet, references, ..
+                } => {
+                    sheet.as_ref().map_or(0, |s| s.allocated_bytes() + 1024)
+                        + references.payload_bytes()
+                }
+                SheetTabChange::Append { .. }
+                | SheetTabChange::Insert { .. }
+                | SheetTabChange::Move { .. } => 0,
+            },
+        }
+    }
+
+    fn push_tx_delta(
+        &mut self,
+        label: String,
+        focus: (usize, u32, u32),
+        delta: crate::tx::TxDelta,
+    ) -> u64 {
+        let structural = delta.is_structural();
+        self.push_tx(crate::tx::TxCommit {
+            label,
+            focus,
+            delta,
+            effects: crate::tx::TxEffects {
+                recalc: crate::tx::RecalcScope::Full,
+                invalidate_deps: true,
+                invalidate_render_caches: true,
+                coord_changed: true,
+                structural,
+                detached_sources: false,
+                revision_deltas: Vec::new(),
+                touched_sheets: Vec::new(),
+                new_focus: None,
+            },
+            by_site: self.site,
+        })
+    }
+
     /// One partial shift may span sheets, but it must replay as a single move.
     pub fn push_cell_shift(&mut self, label: &str, deltas: Vec<CellDelta>, focus: (usize, u32, u32), sheets: &[Sheet]) {
         if deltas.is_empty() { return; }
@@ -2933,12 +3104,15 @@ impl UndoStack {
         indices.sort_unstable();
         indices.dedup();
         let sheet_ids = indices.into_iter().map(|idx| (idx, sheets[idx].identity)).collect();
-        let bytes = deltas.capacity() * std::mem::size_of::<CellDelta>()
-            + deltas.iter().map(|d| cell_heap_bytes(&d.before) + cell_heap_bytes(&d.after)).sum::<usize>();
-        self.done.push(Entry::CellShift(next_entry(bytes), CellShiftAction {
-            label: label.to_owned(), deltas, sheet_ids, focus, by_site: self.site,
-        }));
-        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+        self.push_tx_delta(
+            label.to_owned(),
+            focus,
+            crate::tx::TxDelta::SparseShift {
+                deltas,
+                sheet_ids,
+                focus_sheet: focus.0,
+            },
+        );
     }
 
     pub fn push_with_arrays(&mut self, mut action: Action, arrays: Option<ArrayEdit>) {
@@ -3108,12 +3282,14 @@ impl UndoStack {
         self.pending_compaction = false;
         let mut completed = false;
         for entry in &mut self.done {
-            if let Entry::Structure(stamp, action) = entry {
-                if let Some(bytes) = action.history.settle(wait) {
+            if let Entry::Tx(stamp, action) = entry
+                && let crate::tx::TxDelta::Structure(history) = &mut action.delta
+            {
+                if let Some(bytes) = history.settle(wait) {
                     stamp.payload_bytes = bytes;
                     completed = true;
                 }
-                self.pending_compaction |= action.history.pending();
+                self.pending_compaction |= history.is_pending();
             }
         }
         completed
@@ -3231,50 +3407,119 @@ impl UndoStack {
     }
 
     pub fn next_is_cell_shift(&self, redo: bool) -> bool {
-        matches!(if redo { self.undone.last() } else { self.done.last() }, Some(Entry::CellShift(..)))
+        matches!(
+            if redo { self.undone.last() } else { self.done.last() },
+            Some(Entry::Tx(_, TxAction { delta: crate::tx::TxDelta::SparseShift { .. }, .. }))
+        )
     }
 
     /// Room history advances only after the host commits a replay of this exact transaction.
     pub fn push_room_cell_shift(&mut self, transaction: u64, patch: std::sync::Arc<crate::cell_shift_patch::CellShiftPatch>, wb: &Workbook) {
-        let mut bytes = CountBytes(0);
-        let _ = serde_json::to_writer(&mut bytes, &*patch);
+        let tx_patch = std::sync::Arc::new(crate::tx::TxPatch::from_cell_shift((*patch).clone()));
+        self.push_room_tx_patch(transaction, tx_patch, wb);
+    }
+
+    /// Push a generalized collaborative `TxPatch` into unified `Entry::Tx` room history.
+    pub fn push_room_tx_patch(
+        &mut self,
+        transaction: u64,
+        patch: std::sync::Arc<crate::tx::TxPatch>,
+        wb: &Workbook,
+    ) -> u64 {
         let sheet_ids = patch
             .referenced_sheets()
             .into_iter()
             .filter_map(|i| wb.sheets.get(i).map(|s| (i, s.identity)))
             .collect();
-        self.done.push(Entry::RoomCellShift(next_entry(bytes.0), RoomCellShiftAction {
-            transaction, patch, sheet_ids, ownership_conflict: false, site: self.site,
-        }));
-        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+        let label = patch.label().to_owned();
+        let focus = patch
+            .as_cell_shift()
+            .map_or((patch.target_sheet(), 0, 0), |p| (p.target_sheet(), p.rect.0, p.rect.1));
+        self.push_tx_delta(
+            label,
+            focus,
+            crate::tx::TxDelta::RoomPatch {
+                transaction,
+                patch,
+                sheet_ids,
+                ownership_conflict: false,
+            },
+        )
     }
 
     pub fn next_room_cell_shift(&self, redo: bool) -> Option<(u64, std::sync::Arc<crate::cell_shift_patch::CellShiftPatch>)> {
+        let (tx, patch) = self.next_room_tx_patch(redo)?;
+        let cs = patch.as_cell_shift()?;
+        Some((tx, std::sync::Arc::new(cs.clone())))
+    }
+
+    pub fn peek_room_cell_shift(&self, redo: bool) -> Option<(u64, std::sync::Arc<crate::cell_shift_patch::CellShiftPatch>)> {
+        self.next_room_cell_shift(redo)
+    }
+
+    pub fn next_room_tx_patch(&self, redo: bool) -> Option<(u64, std::sync::Arc<crate::tx::TxPatch>)> {
         let entry = if redo { self.undone.last() } else { self.done.last() };
-        let Entry::RoomCellShift(_, action) = entry? else { return None };
-        Some((action.transaction, action.patch.clone()))
+        let Entry::Tx(_, TxAction { delta: crate::tx::TxDelta::RoomPatch { transaction, patch, .. }, .. }) = entry? else {
+            return None;
+        };
+        Some((*transaction, patch.clone()))
+    }
+
+    pub fn peek_room_tx_patch(&self, redo: bool) -> Option<(u64, std::sync::Arc<crate::tx::TxPatch>)> {
+        self.next_room_tx_patch(redo)
     }
 
     pub fn room_shift_history_matches(&self, wb: &Workbook, redo: bool, offline: bool) -> bool {
         let entry = if redo { self.undone.last() } else { self.done.last() };
-        matches!(entry, Some(Entry::RoomCellShift(_, action)) if (!offline || !action.ownership_conflict) && action.sheet_ids.iter().all(|&(i,id)|
-            wb.sheets.get(i).is_some_and(|s| s.identity == id)))
+        matches!(
+            entry,
+            Some(Entry::Tx(
+                _,
+                TxAction {
+                    delta: crate::tx::TxDelta::RoomPatch {
+                        sheet_ids,
+                        ownership_conflict,
+                        ..
+                    },
+                    ..
+                }
+            )) if (!offline || !*ownership_conflict)
+                && sheet_ids
+                    .iter()
+                    .all(|&(i, id)| wb.sheets.get(i).is_some_and(|s| s.identity == id))
+        )
     }
 
     /// The replica's authorship map is discarded on leaving a room. Keep the
     /// conflict decision with its local history, including same-value writes.
     pub fn preserve_room_shift_ownership(&mut self, peer: &crate::sync::Peer) {
         for entry in self.done.iter_mut().chain(&mut self.undone) {
-            if let Entry::RoomCellShift(_, action) = entry {
-                action.ownership_conflict = action.patch.cells.iter().any(|c|
-                    peer.cells.get(&(c.sheet, c.row, c.col)).is_some_and(|op| op.site != action.site));
+            if let Entry::Tx(_, action) = entry
+                && let crate::tx::TxDelta::RoomPatch {
+                    patch,
+                    ownership_conflict,
+                    ..
+                } = &mut action.delta
+                && let Some(cs) = patch.as_cell_shift()
+            {
+                let site = action.by_site;
+                *ownership_conflict = cs.cells.iter().any(|c| {
+                    peer.cells
+                        .get(&(c.sheet, c.row, c.col))
+                        .is_some_and(|op| op.site != site)
+                });
             }
         }
     }
 
     pub fn confirm_room_cell_shift(&mut self, transaction: u64, redo: bool) -> bool {
         let (from, to) = if redo { (&mut self.undone, &mut self.done) } else { (&mut self.done, &mut self.undone) };
-        if !matches!(from.last(), Some(Entry::RoomCellShift(_, a)) if a.transaction == transaction) { return false; }
+        if !matches!(
+            from.last(),
+            Some(Entry::Tx(_, TxAction { delta: crate::tx::TxDelta::RoomPatch { transaction: tx, .. }, .. })) if *tx == transaction
+        ) {
+            return false;
+        }
         to.push(from.pop().expect("verified history entry"));
         true
     }
@@ -3455,23 +3700,31 @@ impl UndoStack {
     }
 
     pub fn undo_is_structure(&self) -> bool {
-        matches!(self.done.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..) | Entry::Chart(..)))
+        match self.done.last() {
+            Some(Entry::Tx(_, action)) => action.delta.is_structural(),
+            Some(Entry::Pivot(..) | Entry::Chart(..)) => true,
+            _ => false,
+        }
     }
 
     pub fn redo_is_structure(&self) -> bool {
-        matches!(self.undone.last(), Some(Entry::Structure(..) | Entry::SheetTab(..) | Entry::Pivot(..) | Entry::Chart(..)))
+        match self.undone.last() {
+            Some(Entry::Tx(_, action)) => action.delta.is_structural(),
+            Some(Entry::Pivot(..) | Entry::Chart(..)) => true,
+            _ => false,
+        }
     }
 
     pub fn record_appended_sheet(&mut self, wb: &Workbook, previous_focus: (usize, u32, u32)) {
         let index = wb.sheets.len() - 1;
         self.push_sheet_tab(index, wb.sheets[index].identity, previous_focus, "新建工作表",
-            SheetTabChange::Append { removed: None });
+            crate::tx::SheetTabChange::Append { removed: None });
     }
 
     pub fn record_inserted_sheet(&mut self, wb: &Workbook, index: usize, label: &str, previous_focus: (usize, u32, u32)) {
         if let Some(sh) = wb.sheets.get(index) {
             self.push_sheet_tab(index, sh.identity, previous_focus, label,
-                SheetTabChange::Insert { removed: None });
+                crate::tx::SheetTabChange::Insert { removed: None });
         }
     }
 
@@ -3485,7 +3738,7 @@ impl UndoStack {
             identity,
             previous_focus,
             "删除工作表",
-            SheetTabChange::Delete {
+            crate::tx::SheetTabChange::Delete {
                 sheet: Some(Box::new(rec.sheet)),
                 local_names: rec.local_names,
                 references: rec.references,
@@ -3507,7 +3760,7 @@ impl UndoStack {
             identity,
             previous_focus,
             "移动工作表",
-            SheetTabChange::Move { from, to },
+            crate::tx::SheetTabChange::Move { from, to },
         );
         true
     }
@@ -3518,31 +3771,33 @@ impl UndoStack {
         let identity = sheet.identity;
         let Some(references) = crate::sheet_ops::rename_with_history(wb, index, name) else { return false };
         self.push_sheet_tab(index, identity, focus, "重命名工作表",
-            SheetTabChange::Rename { before, after: wb.sheets[index].name.clone(), references });
+            crate::tx::SheetTabChange::Rename { before, after: wb.sheets[index].name.clone(), references });
         true
     }
 
-    fn push_sheet_tab(&mut self, index: usize, identity: u64, previous_focus: (usize, u32, u32),
-                      label: &str, change: SheetTabChange) {
-        let bytes = match &change {
-            SheetTabChange::Rename { before, after, references } => before.len() + after.len() + references.payload_bytes(),
-            SheetTabChange::Delete { sheet, references, .. } => {
-                sheet.as_ref().map_or(0, |s| s.allocated_bytes() + 1024) + references.payload_bytes()
-            }
-            SheetTabChange::Append { .. } | SheetTabChange::Insert { .. } | SheetTabChange::Move { .. } => 0,
-        };
-        self.undone.clear();
-        self.done.push(Entry::SheetTab(next_entry(bytes), SheetTabAction {
-            label: label.into(), index, identity, previous_focus, change, by_site: self.site,
-        }));
-        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    fn push_sheet_tab(
+        &mut self,
+        index: usize,
+        identity: u64,
+        previous_focus: (usize, u32, u32),
+        label: &str,
+        change: crate::tx::SheetTabChange,
+    ) {
+        self.push_tx_delta(
+            label.into(),
+            previous_focus,
+            crate::tx::TxDelta::SheetTab {
+                index,
+                identity,
+                previous_focus,
+                change,
+            },
+        );
     }
 
     pub fn push_structure(&mut self, label: impl Into<String>, before: StructureSnapshot, after: StructureSnapshot, focus: (usize, u32, u32)) {
-        let (history, bytes) = structural_history::History::record(before, after);
-        self.pending_compaction |= history.pending();
-        self.done.push(Entry::Structure(next_entry(bytes), StructureAction { label: label.into(), history, focus, by_site: self.site }));
-        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+        let history = crate::tx::StructureHistory::record(before, after);
+        self.push_tx_delta(label.into(), focus, crate::tx::TxDelta::Structure(history));
     }
 
     pub fn push_numeric_sort(&mut self, label: &str, sort: crate::data_tools::NumericSort, focus: (usize, u32, u32)) {
@@ -3605,8 +3860,8 @@ impl UndoStack {
             return Some(result);
         }
         if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
-        if let Some(Entry::SheetTab(_, action)) = self.done.last_mut() {
-            let applied = action.apply(wb, false)?;
+        if let Some(Entry::Tx(_, action)) = self.done.last_mut() {
+            let applied = action.apply_workbook(wb, false)?;
             self.undone.push(self.done.pop()?);
             return Some(applied);
         }
@@ -3620,13 +3875,7 @@ impl UndoStack {
             self.undone.push(self.done.pop()?);
             return Some(applied);
         }
-        let Entry::Structure(_, action) = self.done.last()? else { unreachable!() };
-        let (before, after) = action.history.snapshots()?;
-        let touched = restore_structure(wb, before, after)?;
-        let total_touched = touched.len();
-        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false, total_touched };
-        self.undone.push(self.done.pop()?);
-        Some(applied)
+        None
     }
 
     pub fn redo_workbook(&mut self, wb: &mut Workbook, mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
@@ -3661,8 +3910,8 @@ impl UndoStack {
             return Some(result);
         }
         if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
-        if let Some(Entry::SheetTab(_, action)) = self.undone.last_mut() {
-            let applied = action.apply(wb, true)?;
+        if let Some(Entry::Tx(_, action)) = self.undone.last_mut() {
+            let applied = action.apply_workbook(wb, true)?;
             self.done.push(self.undone.pop()?);
             return Some(applied);
         }
@@ -3676,13 +3925,7 @@ impl UndoStack {
             self.done.push(self.undone.pop()?);
             return Some(applied);
         }
-        let Entry::Structure(_, action) = self.undone.last()? else { unreachable!() };
-        let (before, after) = action.history.snapshots()?;
-        let touched = restore_structure(wb, after, before)?;
-        let total_touched = touched.len();
-        let applied = Applied { touched, label: action.label.clone(), focus: action.focus, skipped: 0, structural: true, refresh_sizes: None, style_changes: Vec::new(), merge_changes: Vec::new(), merge_conflict: false, total_touched };
-        self.done.push(self.undone.pop()?);
-        Some(applied)
+        None
     }
 
     /// 撤销一步。`guard` 返回 false 的格子会被跳过（协作时不覆盖别人的新改动）。
@@ -3692,7 +3935,14 @@ impl UndoStack {
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<Applied> {
         self.settle_before_replay();
-        if self.undo_is_structure() || matches!(self.done.last(), Some(Entry::RoomCellShift(..))) { return None; }
+        if self.undo_is_structure()
+            || matches!(
+                self.done.last(),
+                Some(Entry::Tx(_, TxAction { delta: crate::tx::TxDelta::RoomPatch { .. }, .. }))
+            )
+        {
+            return None;
+        }
         // 只撤自己的：栈顶不是我的动作就不动（也不丢，免得误删历史）
         if self
             .done
@@ -3703,8 +3953,8 @@ impl UndoStack {
             return None;
         }
         let site = self.site;
-        if let Some(Entry::CellShift(_, action)) = self.done.last() {
-            let applied = action.apply(sheets, false, guard);
+        if let Some(Entry::Tx(_, action)) = self.done.last() {
+            let applied = action.apply_sparse_shift(sheets, false, guard)?;
             if applied.skipped == 0 { self.undone.push(self.done.pop()?); }
             return Some(applied);
         }
@@ -3731,6 +3981,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped,
                 structural: false,
+                coord_changed: false,
                 refresh_sizes: None,
                 style_changes: Vec::new(),
                 merge_changes: Vec::new(),
@@ -3776,6 +4027,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped: 0,
                 structural: false,
+                coord_changed: false,
                 refresh_sizes: None,
                 style_changes, merge_changes,
                 merge_conflict: false,
@@ -3795,6 +4047,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped: 0,
                 structural: false,
+                coord_changed: false,
                 refresh_sizes: None,
                 style_changes, merge_changes,
                 merge_conflict: false,
@@ -3812,7 +4065,7 @@ impl UndoStack {
             let label = action.label.clone();
             let focus = action.focus;
             self.done.push(Entry::Cells(id, action, permutation, arrays, notes));
-            return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true, total_touched: 0 });
+            return Some(Applied { touched, label, focus, skipped: 0, structural: false, coord_changed: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true, total_touched: 0 });
         }
         if let Some(snap) = action.snap_before.clone() {
             if let Some(sheet) = sheets.get_mut(snap.sheet) {
@@ -3826,6 +4079,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped,
                 structural: true,
+                coord_changed: true,
                 refresh_sizes: action.refresh_sizes.clone().map(|(b, _)| b),
                 style_changes, merge_changes,
                 merge_conflict: false,
@@ -3865,6 +4119,7 @@ impl UndoStack {
             focus: action.focus,
             skipped,
             structural: false,
+            coord_changed: false,
             refresh_sizes: action.refresh_sizes.clone().map(|(b, _)| b),
             style_changes, merge_changes,
             merge_conflict: false,
@@ -3881,7 +4136,14 @@ impl UndoStack {
         mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<Applied> {
         self.settle_before_replay();
-        if self.redo_is_structure() || matches!(self.undone.last(), Some(Entry::RoomCellShift(..))) { return None; }
+        if self.redo_is_structure()
+            || matches!(
+                self.undone.last(),
+                Some(Entry::Tx(_, TxAction { delta: crate::tx::TxDelta::RoomPatch { .. }, .. }))
+            )
+        {
+            return None;
+        }
         if self
             .undone
             .last()
@@ -3891,8 +4153,8 @@ impl UndoStack {
             return None;
         }
         let site = self.site;
-        if let Some(Entry::CellShift(_, action)) = self.undone.last() {
-            let applied = action.apply(sheets, true, guard);
+        if let Some(Entry::Tx(_, action)) = self.undone.last() {
+            let applied = action.apply_sparse_shift(sheets, true, guard)?;
             if applied.skipped == 0 { self.done.push(self.undone.pop()?); }
             return Some(applied);
         }
@@ -3919,6 +4181,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped,
                 structural: false,
+                coord_changed: false,
                 refresh_sizes: None,
                 style_changes: Vec::new(),
                 merge_changes: Vec::new(),
@@ -3964,6 +4227,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped: 0,
                 structural: false,
+                coord_changed: false,
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
                 style_changes, merge_changes,
                 merge_conflict: false,
@@ -3983,6 +4247,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped: 0,
                 structural: false,
+                coord_changed: false,
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
                 style_changes, merge_changes,
                 merge_conflict: false,
@@ -4000,7 +4265,7 @@ impl UndoStack {
             let label = action.label.clone();
             let focus = action.focus;
             self.undone.push(Entry::Cells(id, action, permutation, arrays, notes));
-            return Some(Applied { touched, label, focus, skipped: 0, structural: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true, total_touched: 0 });
+            return Some(Applied { touched, label, focus, skipped: 0, structural: false, coord_changed: false, refresh_sizes: None, style_changes, merge_changes, merge_conflict: true, total_touched: 0 });
         }
         if let Some(snap) = action.snap_after.clone() {
             if let Some(sheet) = sheets.get_mut(snap.sheet) {
@@ -4014,6 +4279,7 @@ impl UndoStack {
                 focus: action.focus,
                 skipped,
                 structural: true,
+                coord_changed: true,
                 refresh_sizes: action.refresh_sizes.clone().map(|(_, a)| a),
                 style_changes, merge_changes,
                 merge_conflict: false,
@@ -4053,6 +4319,7 @@ impl UndoStack {
             focus: action.focus,
             skipped,
             structural: false,
+            coord_changed: false,
             refresh_sizes: action.refresh_sizes.clone().map(|(_, after)| after),
             style_changes, merge_changes,
             merge_conflict: false,
@@ -4404,7 +4671,7 @@ mod tests {
     }
 }
 
-fn undo_values_eq(a: &crate::model::Value, b: &crate::model::Value) -> bool {
+pub(crate) fn undo_values_eq(a: &crate::model::Value, b: &crate::model::Value) -> bool {
     use crate::model::Value;
     match (a, b) {
         (Value::Empty, Value::Empty) => true,
