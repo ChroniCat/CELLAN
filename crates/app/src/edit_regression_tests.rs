@@ -13303,6 +13303,307 @@ fn v181_item15b_collab_stale_save_receipt_does_not_ack_newer_guest_col_width() {
     );
 }
 
+#[test]
+fn phase2_app_move_axis_headers_updates_charts_cfvo_pivots_sparklines_invalidates_caches_and_undoes() {
+    use sheetcore::{
+        cf::{CfBlock, CfKind, CfRule, Cfvo, CfvoKind},
+        charts::{Chart, ChartKind, Series},
+        pivot::Agg,
+        pivot_engine::PivotTableModel,
+        pivot_multi::{AxisField, PivotLayout, PivotSpec2, ShowAs, ValueField},
+        sparkline::Sparkline,
+    };
+    let _env = crate::test_env::TestEnv::new("p2-app-move-axis");
+    let mut app = app();
+    app.wb.sheets[0].name = "Data".into();
+    let data_id = app.wb.sheets[0].identity;
+    for r in 0..6u32 {
+        app.wb.sheets[0].set(r, 0, number(f64::from(r + 1)));
+        app.wb.sheets[0].set(r, 1, number(f64::from((r + 1) * 10)));
+    }
+    app.wb.sheets[0].charts.push(Chart {
+        kind: ChartKind::Column,
+        title: "Local".into(),
+        anchor: (1, 4, 3, 8),
+        source_range: "Data!$A$2:$B$3".into(),
+        series: vec![Series {
+            name_ref: "Data!$A$2".into(),
+            cat_ref: "Data!$A$2:$A$3".into(),
+            val_ref: "Data!$B$2:$B$3".into(),
+            size_ref: "Data!$C$2:$C$3".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let mut dash = sheetcore::Sheet::new("Dash");
+    dash.set(0, 0, formula("=SUM(Data!B2:B3)"));
+    dash.cf.blocks.push(CfBlock {
+        ranges: vec![(0, 0, 2, 0)],
+        rules: vec![CfRule {
+            kind: CfKind::Scale {
+                points: vec![
+                    (
+                        Cfvo {
+                            kind: CfvoKind::Formula,
+                            val: 0.0,
+                            formula: "=Data!$B$2".into(),
+                        },
+                        [255, 0, 0],
+                    ),
+                    (
+                        Cfvo {
+                            kind: CfvoKind::Formula,
+                            val: 0.0,
+                            formula: "=Data!$B$3".into(),
+                        },
+                        [0, 255, 0],
+                    ),
+                ],
+            },
+            stop: false,
+            priority: 1,
+        }],
+    });
+    dash.charts.push(Chart {
+        kind: ChartKind::Column,
+        title: "Foreign".into(),
+        anchor: (0, 2, 6, 7),
+        source_range: "Data!$A$2:$B$3".into(),
+        series: vec![Series {
+            cat_ref: "Data!$A$2:$A$3".into(),
+            val_ref: "Data!$B$2:$B$3".into(),
+            size_ref: "Data!$C$2:$C$3".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    dash.sparklines.push(Sparkline {
+        r: 0,
+        c: 1,
+        source_sheet: Some("data".into()),
+        rect: (1, 1, 2, 1),
+        ..Default::default()
+    });
+    app.wb.sheets.push(dash);
+
+    let mut pivot = PivotTableModel::new(
+        "P1".into(),
+        "Data".into(),
+        Some(data_id),
+        1,
+        (8, 0),
+        PivotSpec2 {
+            source: (1, 0, 2, 1),
+            rows: vec![AxisField::plain(0)],
+            cols: Vec::new(),
+            values: vec![ValueField {
+                col: 1,
+                agg: Agg::Sum,
+                label: None,
+                show_as: ShowAs::Normal,
+                base: None,
+            }],
+            filters: Vec::new(),
+            layout: PivotLayout::default(),
+        },
+    );
+    pivot.rect = (8, 0, 10, 1);
+    app.wb.pivots.push(pivot);
+
+    // Prime CF/validation generations to verify move_axis_headers invalidates them.
+    app.cf_stats_gen = 77;
+    app.invalid_gen = 77;
+    let gen0 = app.doc_gen;
+    assert!(app.move_axis_headers(true, 1, 2, 5));
+    assert_eq!(app.cf_stats_gen, u64::MAX, "move_axis_headers must invalidate cf_stats_gen");
+    assert_eq!(app.invalid_gen, u64::MAX, "move_axis_headers must invalidate invalid_gen");
+    assert!(app.wb.dirty && app.doc_gen != gen0);
+
+    // Rows 1..=2 moved to rows 3..=4 (1-based 4:5).
+    assert_eq!(app.wb.sheet(0).charts[0].series[0].val_ref, "Data!$B$4:$B$5");
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$B$4:$B$5");
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].size_ref, "Data!$C$4:$C$5");
+    assert_eq!(app.wb.sheet(1).sparklines[0].rect, (3, 1, 4, 1));
+    assert_eq!(
+        crate::spark_view::values(&app.wb, 1, &app.wb.sheet(1).sparklines[0]),
+        vec![Some(20.0), Some(30.0)],
+        "case-insensitive cross-sheet sparkline values must follow moved rows"
+    );
+    assert_eq!(app.wb.pivots[0].spec.source, (3, 0, 4, 1));
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(50.0));
+    let CfKind::Scale { points } = &app.wb.sheet(1).cf.blocks[0].rules[0].kind else {
+        panic!("expected scale rule");
+    };
+    assert_eq!(points[0].0.formula, "=Data!$B$4");
+    assert_eq!(points[1].0.formula, "=Data!$B$5");
+
+    // Verify grid_render_cache Rules picks up CFVO formula rules for cross-sheet invalidation.
+    let mut rules_cache = crate::grid_render_cache::Rules::default();
+    let mut cf_stats = sheetcore::cf::CfStats::default();
+    assert!(rules_cache.refresh(
+        app.wb.sheet(1),
+        app.wb.date_system,
+        (1, 0),
+        true,
+        &mut cf_stats,
+    ));
+    assert!(
+        rules_cache.refresh(
+            app.wb.sheet(1),
+            app.wb.date_system,
+            (2, 0),
+            false,
+            &mut cf_stats,
+        ),
+        "cross-sheet CFVO formula must mark Rules dirty when doc_gen advances"
+    );
+
+    // Undo and Redo through SheetApp::apply_undo
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).charts[0].series[0].val_ref, "Data!$B$2:$B$3");
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$B$2:$B$3");
+    assert_eq!(app.wb.sheet(1).sparklines[0].rect, (1, 1, 2, 1));
+    assert_eq!(app.wb.pivots[0].spec.source, (1, 0, 2, 1));
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(50.0));
+    let CfKind::Scale { points } = &app.wb.sheet(1).cf.blocks[0].rules[0].kind else {
+        panic!("expected scale rule");
+    };
+    assert_eq!(points[0].0.formula, "=Data!$B$2");
+    assert_eq!(points[1].0.formula, "=Data!$B$3");
+
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$B$4:$B$5");
+    assert_eq!(app.wb.sheet(1).sparklines[0].rect, (3, 1, 4, 1));
+    assert_eq!(app.wb.pivots[0].spec.source, (3, 0, 4, 1));
+    let CfKind::Scale { points } = &app.wb.sheet(1).cf.blocks[0].rules[0].kind else {
+        panic!("expected scale rule");
+    };
+    assert_eq!(points[0].0.formula, "=Data!$B$4");
+    assert_eq!(points[1].0.formula, "=Data!$B$5");
+
+    // Column move + Undo
+    assert!(app.move_axis_headers(false, 0, 2, 4));
+    assert_eq!(app.wb.pivots[0].spec.source, (3, 2, 4, 3));
+    assert_eq!(app.wb.pivots[0].spec.rows[0].col, 2);
+    assert_eq!(app.wb.pivots[0].spec.values[0].col, 3);
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.pivots[0].spec.source, (3, 0, 4, 1));
+    assert_eq!(app.wb.pivots[0].spec.rows[0].col, 0);
+    assert_eq!(app.wb.pivots[0].spec.values[0].col, 1);
+}
+
+#[test]
+fn phase2_app_shift_cells_rewrites_cfvo_with_undo_and_preflight_blocks_overlapping_objects() {
+    use sheetcore::{
+        cf::{CfBlock, CfKind, CfRule, Cfvo, CfvoKind},
+        charts::{Chart, ChartKind, Series},
+        protection::ProtectedRange,
+        sparkline::Sparkline,
+    };
+    let _env = crate::test_env::TestEnv::new("p2-app-shift-cells-cfvo");
+    let mut app = app();
+    app.wb.sheets[0].name = "Data".into();
+    let mut rules = sheetcore::Sheet::new("Rules");
+    rules.cf.blocks.push(CfBlock {
+        ranges: vec![(0, 0, 3, 0)],
+        rules: vec![CfRule {
+            kind: CfKind::bar_default(
+                [0, 120, 215],
+                Cfvo {
+                    kind: CfvoKind::Formula,
+                    val: 0.0,
+                    formula: "=Data!$A$3".into(),
+                },
+                Cfvo {
+                    kind: CfvoKind::Formula,
+                    val: 0.0,
+                    formula: "=Data!$A$5".into(),
+                },
+            ),
+            stop: false,
+            priority: 1,
+        }],
+    });
+    app.wb.sheets.push(rules);
+
+    // Local shift_cells on empty Data!A2:A3 (shift down) must rewrite foreign Bar CFVO and undo/redo cleanly.
+    app.cf_stats_gen = 55;
+    app.invalid_gen = 55;
+    app.sel = (1, 0);
+    app.sel_end = (2, 0);
+    app.shift_cells(true, false);
+    assert_eq!(app.cf_stats_gen, u64::MAX);
+    assert_eq!(app.invalid_gen, u64::MAX);
+    let CfKind::Bar { min, max, .. } = &app.wb.sheet(1).cf.blocks[0].rules[0].kind else {
+        panic!("expected bar rule");
+    };
+    assert_eq!(min.formula, "=Data!$A$5");
+    assert_eq!(max.formula, "=Data!$A$7");
+
+    assert!(app.apply_undo(false), "{}", app.status);
+    let CfKind::Bar { min, max, .. } = &app.wb.sheet(1).cf.blocks[0].rules[0].kind else {
+        panic!("expected bar rule");
+    };
+    assert_eq!(min.formula, "=Data!$A$3");
+    assert_eq!(max.formula, "=Data!$A$5");
+
+    assert!(app.apply_undo(true), "{}", app.status);
+    let CfKind::Bar { min, max, .. } = &app.wb.sheet(1).cf.blocks[0].rules[0].kind else {
+        panic!("expected bar rule");
+    };
+    assert_eq!(min.formula, "=Data!$A$5");
+    assert_eq!(max.formula, "=Data!$A$7");
+
+    // Preflight blocks shift_cells when a chart, sparkline, or protected range intersects the moving ray.
+    app.wb.sheets[0].set(4, 0, number(99.0));
+    let before_depth = app.undo.depth();
+
+    // 1) Overlapping chart
+    app.wb.sheets[1].charts.push(Chart {
+        kind: ChartKind::Column,
+        series: vec![Series {
+            val_ref: "Data!$A$5:$A$6".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    app.sel = (1, 0);
+    app.sel_end = (1, 0);
+    app.shift_cells(true, false);
+    assert_eq!(app.wb.sheet(0).value(4, 0), Value::Number(99.0));
+    assert_eq!(app.undo.depth(), before_depth);
+    assert!(app.status.contains("图表"), "status={}", app.status);
+    app.wb.sheets[1].charts.clear();
+
+    // 2) Overlapping sparkline
+    app.wb.sheets[1].sparklines.push(Sparkline {
+        r: 0,
+        c: 0,
+        source_sheet: Some("data".into()),
+        rect: (4, 0, 5, 0),
+        ..Default::default()
+    });
+    app.shift_cells(true, false);
+    assert_eq!(app.wb.sheet(0).value(4, 0), Value::Number(99.0));
+    assert_eq!(app.undo.depth(), before_depth);
+    assert!(app.status.contains("迷你图"), "status={}", app.status);
+    app.wb.sheets[1].sparklines.clear();
+
+    // 3) Overlapping protected_range
+    app.wb.sheets[0]
+        .protected_ranges
+        .push(ProtectedRange::new("Edit", vec![(4, 0, 6, 0)], ""));
+    app.shift_cells(true, false);
+    assert_eq!(app.wb.sheet(0).value(4, 0), Value::Number(99.0));
+    assert_eq!(app.undo.depth(), before_depth);
+    assert!(
+        app.status.contains("保护") || app.status.contains("允许编辑"),
+        "status={}",
+        app.status
+    );
+}
+
 
 
 

@@ -595,6 +595,8 @@ impl SheetApp {
         }
         self.tasks.last_edit = Some(std::time::Instant::now());
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.cf_stats_gen = u64::MAX;
+        self.invalid_gen = u64::MAX;
         self.wb.dirty = true;
         self.status = if insert {
             if horizontal {
@@ -981,7 +983,12 @@ fn moved_extent(
     for key in sh.notes.keys().chain(sh.threads.keys()) {
         include(key.row, key.col);
     }
-    for &(r, c) in sh.rich.keys().chain(sh.hyperlinks.keys()) {
+    for &(r, c) in sh
+        .rich
+        .keys()
+        .chain(sh.hyperlinks.keys())
+        .chain(sh.ignored_errors.iter())
+    {
         include(r, c);
     }
     for &(top, left, bottom, right) in &sh.merges {

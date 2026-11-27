@@ -17279,6 +17279,9 @@ fn clear_values(&mut self) {
                 .push_structure(label.to_string(), before, after, (idx, self.sel.0, self.sel.1));
         }
         self.recalc_all_and_deps_adaptive();
+        self.cf_stats_gen = u64::MAX;
+        self.invalid_gen = u64::MAX;
+        self.tasks.last_edit = Some(std::time::Instant::now());
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;
         self.sel = (dst_r1, dst_c1);
@@ -24668,6 +24671,9 @@ fn clear_selection(&mut self) {
         self.undo.push_structure("分类汇总", before, after, (idx, self.sel.0, self.sel.1));
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.cf_stats_gen = u64::MAX;
+        self.invalid_gen = u64::MAX;
+        self.tasks.last_edit = Some(std::time::Instant::now());
         self.status = format!("分类汇总：{} 组，插了 {} 行（{}）", rep.groups, rep.rows, f.label());
         Ok(self.status.clone())
     }
@@ -32214,11 +32220,18 @@ impl SheetApp {
         let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.cf_stats_gen = u64::MAX;
+        self.invalid_gen = u64::MAX;
+        self.tasks.last_edit = Some(std::time::Instant::now());
         let after = before.capture_after(&self.wb);
         let label = op.label();
         self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
         self.recalc_after_structural(updates);
         self.shift_collab_coordinates(idx, &op);
+        self.pivot_ui.field_settings = None;
+        self.pivot_ui.grid_filter = None;
+        self.pivot_ui.options_pivot_id = None;
+        self.sync_pivot_sidebar_selection();
         if let Some(net) = &self.net {
             self.shift_intro.sync_struct_rev(net.structure_seen());
         }
@@ -32311,17 +32324,110 @@ impl SheetApp {
         let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
         self.wb.dirty = true;
         self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.cf_stats_gen = u64::MAX;
+        self.invalid_gen = u64::MAX;
+        self.tasks.last_edit = Some(std::time::Instant::now());
         let after = before.capture_after(&self.wb);
         let label = summary_op.label();
         self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
         self.recalc_after_structural(StructuralRecalc::Full);
         self.shift_collab_coordinates(idx, &summary_op);
+        self.pivot_ui.field_settings = None;
+        self.pivot_ui.grid_filter = None;
+        self.pivot_ui.options_pivot_id = None;
+        self.sync_pivot_sidebar_selection();
         self.status = format!("{label}（已保留筛选隐藏行，可 Ctrl+Z 撤销）");
         if removed_pivots > 0 {
             self.status.push_str(&format!(
                 "；已移除 {removed_pivots} 个源字段或区域被删除的透视表定义"
             ));
         }
+    }
+
+    /// 整行/整列拖拽移动（统一走结构快照、全簿重算与渲染/验证缓存失效）。
+    pub(crate) fn move_axis_headers(
+        &mut self,
+        is_rows: bool,
+        from: u32,
+        n: u32,
+        drop: u32,
+    ) -> bool {
+        if self.edit_blocked() {
+            return false;
+        }
+        if self.deps_pending {
+            self.status = "大型工作簿正在后台构建依赖图，请稍候再操作".into();
+            return false;
+        }
+        if !self.finish_pending_edit() {
+            return false;
+        }
+        // 落在被拖动块内部或数量为 0 = 不动
+        if n == 0 || (drop >= from && drop <= from.saturating_add(n)) {
+            return false;
+        }
+        let idx = self.sheet_idx;
+        let axis = if is_rows {
+            sheetcore::refs::Axis::Row
+        } else {
+            sheetcore::refs::Axis::Col
+        };
+        let snap = if self.wb.sheet(idx).len() <= 200_000 {
+            sheetcore::undo::snapshot_axis_move(&self.wb, idx, axis, from, n, drop)
+        } else {
+            None
+        };
+        let pending_pivots_before = self.wb.pivots_pending.len();
+        if is_rows {
+            sheetcore::structural::move_rows_wb(&mut self.wb, idx, from, n, drop);
+        } else {
+            sheetcore::structural::move_cols_wb(&mut self.wb, idx, from, n, drop);
+        }
+        let detached_source = snap
+            .as_ref()
+            .is_some_and(|before| before.detached_source(&self.wb));
+        let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
+        if let Some(before) = snap {
+            let after = before.capture_after(&self.wb);
+            let label = if is_rows { "移动行" } else { "移动列" };
+            self.undo.push_structure(
+                label.to_string(),
+                before,
+                after,
+                (idx, self.sel.0, self.sel.1),
+            );
+        }
+        self.wb.calc_manual |= self.manual_calc;
+        self.recalc_all_and_deps_adaptive();
+        self.cf_stats_gen = u64::MAX;
+        self.invalid_gen = u64::MAX;
+        self.tasks.last_edit = Some(std::time::Instant::now());
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.wb.dirty = true;
+        self.pivot_ui.field_settings = None;
+        self.pivot_ui.grid_filter = None;
+        self.pivot_ui.options_pivot_id = None;
+        self.sync_pivot_sidebar_selection();
+        self.status = if is_rows {
+            format!("已把第 {}–{} 行移动到第 {} 行前", from + 1, from + n, drop + 1)
+        } else {
+            format!(
+                "已把 {}–{} 列移动到 {} 列前",
+                sheetcore::model::col_label(from),
+                sheetcore::model::col_label(from + n - 1),
+                sheetcore::model::col_label(drop)
+            )
+        };
+        if removed_pivots > 0 {
+            self.status.push_str(&format!(
+                "；已移除 {removed_pivots} 个源字段或区域被破坏的透视表定义"
+            ));
+        }
+        if detached_source {
+            self.status
+                .push_str("；部分数据源的绑定区域已失效，请重新选择区域并导入");
+        }
+        true
     }
 
     /// 读宏代码，开窗口
@@ -40656,47 +40762,7 @@ impl SheetApp {
                 painter.rect_filled(line, 0.0, Color32::from_rgb(26, 115, 232));
                 if resp.drag_stopped() {
                     self.header_move = None;
-                    // 落在被拖动块内部 = 不动
-                    let inside = drop >= from && drop <= from + n;
-                    if !inside {
-                        // 和插入/删除一样走结构快照，撤销才有东西可回
-                        let idx = self.sheet_idx;
-                        let axis = if is_rows { sheetcore::refs::Axis::Row } else { sheetcore::refs::Axis::Col };
-                        let snap = if self.wb.sheet(idx).len() <= 200_000 {
-                            sheetcore::undo::snapshot_axis_move(&self.wb, idx, axis, from, n, drop)
-                        } else {
-                            None
-                        };
-                        if is_rows {
-                            sheetcore::structural::move_rows_wb(&mut self.wb, idx, from, n, drop);
-                        } else {
-                            sheetcore::structural::move_cols_wb(&mut self.wb, idx, from, n, drop);
-                        }
-                        if let Some(before) = snap {
-                            let after = before.capture_after(&self.wb);
-                            let label = if is_rows { "移动行" } else { "移动列" };
-                            self.undo.push_structure(
-                                label.to_string(),
-                                before,
-                                after,
-                                (idx, self.sel.0, self.sel.1),
-                            );
-                        }
-                        self.wb.calc_manual |= self.manual_calc;
-                        self.recalc_all_and_deps_adaptive();
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.wb.dirty = true;
-                        self.status = if is_rows {
-                            format!("已把第 {}–{} 行移动到第 {} 行前", from + 1, from + n, drop + 1)
-                        } else {
-                            format!(
-                                "已把 {}–{} 列移动到 {} 列前",
-                                sheetcore::model::col_label(from),
-                                sheetcore::model::col_label(from + n - 1),
-                                sheetcore::model::col_label(drop)
-                            )
-                        };
-                    }
+                    self.move_axis_headers(is_rows, from, n, drop);
                 }
             }
         } else if resp.drag_stopped() {
@@ -47516,6 +47582,8 @@ fn elide(s: &str, max_chars: usize) -> String {
                         self.tasks.last_edit = Some(std::time::Instant::now());
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
+                        self.cf_stats_gen = u64::MAX;
+                        self.invalid_gen = u64::MAX;
                         self.recalc_after_structural(updates);
                         self.audit_note_structural(Some(site), sheet, &op, None);
                         self.record_remote_note_revision(site, "远端结构改动", sheet, label.clone());
