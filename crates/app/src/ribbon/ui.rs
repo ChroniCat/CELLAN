@@ -465,28 +465,29 @@ fn node_mid(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, n: &N
 }
 
 fn node_narrow(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, n: &Node) {
+    let icon_only = |c: &Ctl| {
+        let mut compact = c.clone();
+        let label = compact.label.take();
+        if compact.screentip.is_none() {
+            compact.screentip = label;
+        }
+        compact.width = Some(24.0);
+        compact
+    };
     match n {
         Node::Button(c) | Node::Toggle(c)
             if c.size != Size::Large && c.label.is_some() && c.image.is_some() =>
         {
-            let mut c2 = c.clone();
-            c2.label = None;
-            c2.width = Some(24.0);
             let toggle = matches!(n, Node::Toggle(_));
-            button(app, ui, rc, &c2, toggle);
+            button_a11y(app, ui, rc, &icon_only(c), toggle, c.label.as_deref());
         }
         Node::Split { ctl, menu } if ctl.size != Size::Large && ctl.image.is_some() => {
-            let mut c2 = ctl.clone();
-            c2.label = None;
-            c2.width = Some(24.0);
-            c2.arrow = Some(15.0);
-            split(app, ui, rc, &c2, menu);
+            let mut c2 = icon_only(ctl);
+            c2.arrow = Some(24.0);
+            split_a11y(app, ui, rc, &c2, menu, ctl.label.as_deref());
         }
         Node::Menu(m) if m.ctl.size != Size::Large && m.ctl.image.is_some() => {
-            let mut c2 = m.ctl.clone();
-            c2.label = None;
-            c2.width = Some(24.0);
-            menu_a11y(app, ui, rc, &c2, m, None);
+            menu_a11y(app, ui, rc, &icon_only(&m.ctl), m, m.ctl.label.as_deref());
         }
         // 样式库整条 349px，1440 下必须收成「单元格样式 ▾」下拉
         Node::Gallery { ctl, items, .. } => gallery_compact(app, ui, rc, ctl, items),
@@ -858,17 +859,16 @@ fn button_a11y(
     // UI-24.2：功能区按钮在 UIA 里要有名字/角色/禁用状态（未启用 AccessKit 时零分配跳过）
     if rc.a11y {
         let tip = st.tip.as_deref().map(str::to_owned).unwrap_or_else(|| tip_of(c));
-        let name: &str = if tip.is_empty() {
-            a11y_full.unwrap_or(label)
-        } else {
-            &tip
-        };
+        let name = a11y_full.or_else(|| (!label.is_empty()).then_some(label)).unwrap_or(&tip);
         ui_kit::a11y_name(
             &resp.inner,
             name,
             enabled,
             if toggle { Some(on) } else { None },
         );
+        if !tip.is_empty() && name != tip {
+            let _ = ui.ctx().accesskit_node_builder(resp.inner.id, |node| node.set_description(tip));
+        }
     }
     if app.keytips && app.keytip_tab.is_some() && enabled {
         if let Some(k) = &c.keytip {
@@ -1129,13 +1129,15 @@ fn menu_a11y(
                 egui::pos2(rect.right() - 8.0, rect.center().y + 0.5),
                 if enabled { pal.text_weak } else { ui_kit::DISABLED },
             );
-            if rc.a11y {
-                let tip = tip_of(ctl);
-                ui_kit::a11y_name(&resp, if tip.is_empty() { label } else { &tip }, enabled, None);
-            }
             attach_lazy_tip(resp, st.tip.as_deref(), ctl)
         }
     });
+    if rc.a11y {
+        let name = a11y_full.or_else(|| (!label.is_empty()).then_some(label))
+            .or(ctl.screentip.as_deref()).unwrap_or(ctl.action());
+        ui_kit::a11y_name(&clicked.inner, name, enabled, None);
+    }
+    ui_kit::focus_ring(ui, &clicked.inner, clicked.inner.rect, 4.0);
     if clicked.inner.clicked() {
         app.ribbon_sub = None;
         app.ribbon_popup = Some(Popup {
@@ -1553,24 +1555,28 @@ fn popup_menu_row(
     row_w: f32,
     icon_gutter: bool,
 ) -> egui::Response {
-    let label_g = layout_text(ui, label, 12.0);
-    let sc_g = (!shortcut.is_empty()).then(|| layout_text(ui, shortcut, 11.0));
+    let pal = crate::theme::palette();
+    let ink = if enabled { pal.text } else { pal.text_muted };
+    let secondary = if enabled { pal.text_weak } else { pal.text_muted };
+    let sc_g = (!shortcut.is_empty()).then(|| ui.painter().layout_no_wrap(
+        shortcut.to_owned(), FontId::proportional(11.0), secondary,
+    ));
     let sc_w = sc_g.as_ref().map(|g| g.size().x + 16.0).unwrap_or(0.0);
     let left_pad = if icon_gutter { 30.0 } else { 10.0 };
     let right_pad = if has_sub { 24.0 } else { 12.0 };
-    let w = (left_pad + label_g.size().x + sc_w + right_pad).max(row_w);
+    let mut job = egui::text::LayoutJob::simple_singleline(label.to_owned(), FontId::proportional(12.0), ink);
+    job.wrap = egui::text::TextWrapping::truncate_at_width((row_w - left_pad - right_pad - sc_w).max(1.0));
+    let label_g = ui.fonts(|f| f.layout_job(job));
+    let clipped = label_g.elided;
     let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 27.0), sense);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, 27.0), sense);
     if enabled && resp.is_pointer_button_down_on() {
-        ui.painter().rect_filled(rect, 5.0, ui_kit::PRESSED);
-    } else if enabled && (resp.hovered() || active_sub) {
-        ui.painter().rect_filled(rect, 5.0, ui_kit::HOVER);
+        ui.painter().rect_filled(rect, 4.0, pal.pressed);
+    } else if active_sub && enabled {
+        ui.painter().rect_filled(rect, 4.0, pal.accent_tint);
+    } else if enabled && resp.hovered() {
+        ui.painter().rect_filled(rect, 4.0, pal.hover);
     }
-    let col = if !enabled {
-        ui_kit::DISABLED
-    } else {
-        ui.visuals().text_color()
-    };
     if icon_gutter {
         if let Some(rgb) = swatch {
             let sw = Rect::from_center_size(
@@ -1589,27 +1595,29 @@ fn popup_menu_row(
                 egui::pos2(rect.left() + 15.0, rect.center().y),
                 Vec2::splat(16.0),
             );
-            crate::ui_icons::draw_excel(ui.painter(), ir, ic, ui_kit::DISABLED, enabled);
+            crate::ui_icons::draw_excel(ui.painter(), ir, ic, pal.text_muted, enabled);
         }
     }
     let lpos = Align2::LEFT_CENTER
         .anchor_size(egui::pos2(rect.left() + left_pad, rect.center().y), label_g.size())
         .min;
-    ui.painter().galley(lpos, label_g, col);
+    ui.painter().galley(lpos, label_g, ink);
     if has_sub {
         ui_kit::caret_right(
             ui,
             egui::pos2(rect.right() - 10.0, rect.center().y),
-            Color32::from_rgb(100, 116, 139),
+            secondary,
         );
     } else if let Some(sg) = sc_g {
         let spos = Align2::RIGHT_CENTER
             .anchor_size(egui::pos2(rect.right() - 10.0, rect.center().y), sg.size())
             .min;
-        ui.painter().galley(spos, sg, Color32::from_rgb(130, 142, 158));
+        ui.painter().galley(spos, sg, secondary);
     }
     ui_kit::a11y_name(&resp, label, enabled, None);
-    resp
+    ui_kit::focus_ring(ui, &resp, rect, 4.0);
+    if resp.gained_focus() { resp.scroll_to_me(None); }
+    if clipped { resp.on_hover_text(label) } else { resp }
 }
 
 fn paste_visual_grid(
@@ -1652,7 +1660,7 @@ fn paste_visual_grid(
             ui.spacing_mut().item_spacing.x = 4.0;
             for (ic, act, tip) in row {
                 let (tr, resp) = ui.allocate_exact_size(
-                    Vec2::new(38.0, 32.0),
+                    Vec2::new(((row_w - 22.0) / 5.0).clamp(1.0, 38.0), 32.0),
                     if paste_on { Sense::click() } else { Sense::hover() },
                 );
                 let pal = crate::theme::palette();
@@ -1692,13 +1700,13 @@ fn paste_visual_grid(
         ui.add_space(3.0);
     }
     ui.add_space(2.0);
-    let (sr, _) = ui.allocate_exact_size(Vec2::new(row_w.max(206.0), 1.0), Sense::hover());
+    let (sr, _) = ui.allocate_exact_size(Vec2::new(row_w, 1.0), Sense::hover());
     ui.painter().line_segment(
         [
             egui::pos2(sr.left() + 6.0, sr.center().y),
             egui::pos2(sr.right() - 6.0, sr.center().y),
         ],
-        egui::Stroke::new(1.0, Color32::from_rgb(232, 236, 242)),
+        egui::Stroke::new(1.0, crate::theme::palette().card_border),
     );
     ui.add_space(2.0);
 }
@@ -1756,11 +1764,20 @@ fn draw_menu_nodes(
         return;
     }
     if menu_id == "BorderLineMenu" {
+        let pal = crate::theme::palette();
+        let color = Color32::from_rgb(app.last_border_color[0], app.last_border_color[1], app.last_border_color[2]);
         for &(id, label) in crate::border_lines::STYLES {
             let row = popup_menu_row(ui, label, None, None, "", false, id == app.border_brush_style, true, min_w, false);
-            let end = egui::pos2(row.rect.right() - 9.0, row.rect.center().y);
-            crate::border_lines::paint(ui.painter(), end - Vec2::new(68.0, 0.0), end, id,
-                Color32::from_rgb(app.last_border_color[0],app.last_border_color[1],app.last_border_color[2]), 1.0);
+            let end = egui::pos2(row.rect.right() - 13.0, row.rect.center().y);
+            let start = end - Vec2::new(62.0, 0.0);
+            let preview = Rect::from_two_pos(start, end).expand2(Vec2::new(4.0, 6.0));
+            let background = if egui::Rgba::from(color).intensity() > 0.25 {
+                Color32::from_gray(45)
+            } else {
+                Color32::from_gray(246)
+            };
+            ui.painter().rect(preview, 2.0, background, egui::Stroke::new(1.0, pal.card_border), egui::StrokeKind::Inside);
+            crate::border_lines::paint(ui.painter(), start, end, id, color, 1.0);
             if row.clicked() {
                 app.border_brush_style = id;
                 activate_border_pen(app);
@@ -1793,7 +1810,7 @@ fn draw_menu_nodes(
                         egui::pos2(sr.left() + 6.0, sr.center().y),
                         egui::pos2(sr.right() - 6.0, sr.center().y),
                     ],
-                    egui::Stroke::new(1.0, Color32::from_rgb(232, 236, 242)),
+                    egui::Stroke::new(1.0, crate::theme::palette().card_border),
                 );
                 ui.add_space(2.0);
             }
@@ -1811,14 +1828,15 @@ fn draw_menu_nodes(
                     ("BorderDraw", Some(crate::BorderBrush::Outline))
                     | ("BorderDrawGrid", Some(crate::BorderBrush::Grid))
                     | ("BorderErase", Some(crate::BorderBrush::Erase)));
-                let r = popup_menu_row(ui, &label, icon, sw, sc, false, checked, st.enabled, min_w, icon_gutter);
+                let enabled = on_enabled(c, &st);
+                let r = popup_menu_row(ui, &label, icon, sw, sc, false, checked, enabled, min_w, icon_gutter);
                 if menu_id == "BordersMenu" && c.image.is_none() {
                     border_preset_icon(ui, r.rect, c.action());
                 }
                 if r.hovered() {
                     *hover_non_sub = true;
                 }
-                if r.clicked() && st.enabled {
+                if r.clicked() && enabled {
                     *fire = Some(c.action().to_string());
                     *close = true;
                 }
@@ -1829,21 +1847,27 @@ fn draw_menu_nodes(
                     continue;
                 }
                 let label = st.label.clone().or_else(|| c.label.clone()).unwrap_or_default();
-                let r = ui_kit::check_row(ui, &label, st.checked, st.enabled, min_w);
+                let enabled = on_enabled(c, &st);
+                let r = ui_kit::check_row(ui, &label, st.checked, enabled, min_w);
                 if r.hovered() {
                     *hover_non_sub = true;
                 }
-                if r.clicked() && st.enabled {
+                if r.clicked() && enabled {
                     *fire = Some(c.action().to_string());
                     *close = true;
                 }
             }
             MenuNode::Menu(sub) => {
-                let label = sub.ctl.label.clone().unwrap_or_default();
+                let st = app.ctl_state(&sub.ctl.id);
+                if !st.visible {
+                    continue;
+                }
+                let label = st.label.as_deref().or(sub.ctl.label.as_deref()).unwrap_or("");
                 let icon = sub.ctl.image.as_deref().and_then(icon_of);
                 let is_open = active_sub_id == Some(sub.ctl.id.as_str());
-                let r = popup_menu_row(ui, &label, icon, None, "", true, is_open, true, min_w, icon_gutter);
-                if r.hovered() || r.clicked() {
+                let enabled = on_enabled(&sub.ctl, &st);
+                let r = popup_menu_row(ui, label, icon, None, "", true, is_open, enabled, min_w, icon_gutter);
+                if enabled && (r.hovered() || r.clicked()) {
                     *want_sub = Some((
                         menu_id.to_string(),
                         sub.clone(),
@@ -1862,40 +1886,20 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
     };
     let ctx = ui.ctx().clone();
     let screen = ctx.screen_rect();
-    let mut pos = p.pos;
-    let (inner_w, has_scroll, est_h) = match &p.kind {
+    let mut bounds = screen.shrink(5.0);
+    bounds.min.y = (screen.top() + 28.0).min(bounds.bottom());
+    let frame = ui_kit::popup_frame(ui.style());
+    let margin = frame.total_margin().sum();
+    let max_width = (bounds.width() - margin.x).max(1.0);
+    let max_height = (bounds.height() - margin.y).clamp(1.0, 390.0);
+    let (width, scroll_key) = match &p.kind {
         PopupKind::Menu(m) => {
-            let gutter = menu_has_gutter(m);
-            let min_w = if m.ctl.id == "PasteMenu" {
-                216.0
-            } else if gutter {
-                192.0
-            } else {
-                176.0
-            };
-            let w = measure_menu_width(app, ui, m, min_w);
-            if m.ctl.id == "BordersMenu" {
-                let needed = m.items.iter().map(|it| if matches!(it, MenuNode::Separator) { 7.0 } else { 29.0 }).sum::<f32>() + 64.0;
-                let available = (screen.height() - 42.0).max(80.0);
-                (w, needed > available, needed.min(available))
-            } else {
-                let scroll = m.items.len() > 13;
-                let extra = if m.ctl.id == "PasteMenu" { 104.0 } else { 0.0 };
-                let h = (m.items.len() as f32 * 28.0 + 18.0 + extra).min(460.0);
-                (w, scroll, h)
-            }
+            let min_w = if m.ctl.id == "PasteMenu" { 216.0 } else if menu_has_gutter(m) { 192.0 } else { 176.0 };
+            (measure_menu_width(app, ui, m, min_w), m.ctl.id.as_str())
         }
-        PopupKind::Items(items) => {
-            let w = measure_items_width(ui, items);
-            let scroll = items.len() > 10;
-            let h = (items.len() as f32 * 28.0 + 16.0).min(360.0);
-            (w, scroll, h)
-        }
+        PopupKind::Items(items) => (measure_items_width(ui, items), items.first().map_or("", |i| i.id.as_str())),
     };
-    let frame_inner_w = inner_w + if has_scroll { 14.0 } else { 0.0 };
-    let est_w = frame_inner_w + 12.0;
-    pos.x = pos.x.clamp(4.0, (screen.right() - est_w - 6.0).max(4.0));
-    pos.y = pos.y.clamp(28.0, (screen.bottom() - est_h - 6.0).max(28.0));
+    let frame_width = width.min(max_width);
 
     let mut close = false;
     let mut fire: Option<String> = None;
@@ -1904,20 +1908,22 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
     let active_sub_id = app.ribbon_sub.as_ref().map(|(_, s, _)| s.ctl.id.clone());
 
     let area = egui::Area::new(egui::Id::new("ribbon_popup"))
-        .fixed_pos(pos)
+        .fixed_pos(p.pos)
+        .constrain_to(bounds)
         .order(egui::Order::Foreground)
         .show(&ctx, |ui| {
-            ui_kit::popup_frame(ui.style()).show(ui, |ui| {
-                ui.set_min_width(frame_inner_w);
-                ui.set_max_width(frame_inner_w);
+            frame.show(ui, |ui| {
+                ui.set_width(frame_width);
+                ui.set_max_height(max_height);
                 ui.spacing_mut().item_spacing.y = 2.0;
-                match &p.kind {
-                    PopupKind::Menu(m) => {
-                        let gutter = menu_has_gutter(m);
-                        if m.ctl.id == "PasteMenu" {
-                            paste_visual_grid(app, ui, inner_w, &mut fire, &mut close);
-                        }
-                        let mut show_rows = |ui: &mut egui::Ui| {
+                egui::ScrollArea::vertical().id_salt(scroll_key).max_height(max_height).show(ui, |ui| {
+                    let inner_w = ui.available_width().min(frame_width);
+                    match &p.kind {
+                        PopupKind::Menu(m) => {
+                            let gutter = menu_has_gutter(m);
+                            if m.ctl.id == "PasteMenu" {
+                                paste_visual_grid(app, ui, inner_w, &mut fire, &mut close);
+                            }
                             draw_menu_nodes(
                                 app,
                                 ui,
@@ -1931,25 +1937,18 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                                 &mut want_sub,
                                 &mut hover_non_sub,
                             );
-                        };
-                        if has_scroll {
-                            egui::ScrollArea::vertical().max_height(if m.ctl.id == "BordersMenu" { est_h - 14.0 } else { 390.0 }).show(ui, show_rows);
-                        } else {
-                            show_rows(ui);
                         }
-                    }
-                    PopupKind::Items(items) => {
-                        let is_styles = items.first().is_some_and(|i| i.id.starts_with("Style"));
-                        let mut show_items = |ui: &mut egui::Ui| {
+                        PopupKind::Items(items) => {
+                            let is_styles = items.first().is_some_and(|i| i.id.starts_with("Style"));
                             for it in items {
                                 if is_styles {
                                     let (bg, fg, bold) = style_preview(&it.id);
                                     let (rect, r) =
                                         ui.allocate_exact_size(Vec2::new(inner_w, 27.0), Sense::click());
                                     if r.is_pointer_button_down_on() {
-                                        ui.painter().rect_filled(rect, 5.0, ui_kit::PRESSED);
+                                        ui.painter().rect_filled(rect, 4.0, crate::theme::palette().pressed);
                                     } else if r.hovered() {
-                                        ui.painter().rect_filled(rect, 5.0, ui_kit::HOVER);
+                                        ui.painter().rect_filled(rect, 4.0, crate::theme::palette().hover);
                                     }
                                     let sw = Rect::from_center_size(
                                         egui::pos2(rect.left() + 20.0, rect.center().y),
@@ -1989,14 +1988,9 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                                     }
                                 }
                             }
-                        };
-                        if has_scroll {
-                            egui::ScrollArea::vertical().max_height(340.0).show(ui, show_items);
-                        } else {
-                            show_items(ui);
                         }
                     }
-                }
+                });
             });
         });
     let rect = area.response.rect;
@@ -2008,16 +2002,10 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
     let mut sub_rect: Option<Rect> = None;
     if let Some((pid, sub, mut spos)) = app.ribbon_sub.clone() {
         let sub_gutter = menu_has_gutter(&sub);
-        let sub_inner_w = if sub.ctl.id == "BorderColorMenu" { 218.0 } else { measure_menu_width(app, ui, &sub, if sub_gutter { 186.0 } else { 170.0 }) };
-        let desired_h = match sub.ctl.id.as_str() {
-            "BorderLineMenu" => 29.0 * crate::border_lines::STYLES.len() as f32 + 14.0,
-            "BorderColorMenu" => 238.0,
-            _ => (sub.items.len() as f32 * 28.0 + 16.0).min(390.0),
-        };
-        let sub_h = desired_h.min((screen.height() - 42.0).max(80.0));
-        let sub_scroll = sub.items.len() > 13 || desired_h > sub_h;
-        let sub_frame_w = sub_inner_w + if sub_scroll { 14.0 } else { 0.0 };
-        let sub_outer_w = sub_frame_w + 12.0;
+        let width = if sub.ctl.id == "BorderColorMenu" { 218.0 } else {
+            measure_menu_width(app, ui, &sub, if sub_gutter { 186.0 } else { 170.0 })
+        }.min(max_width);
+        let sub_outer_w = width + margin.x;
         if p.opened_at == 0.0 {
             spos = egui::pos2(rect.right() + 2.0, rect.top() + 58.0);
         }
@@ -2030,19 +2018,19 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
         } else if spos.x + sub_outer_w > screen.right() - 6.0 {
             spos.x = (rect.left() - sub_outer_w - 2.0).max(4.0);
         }
-        spos.x = spos.x.clamp(4.0, (screen.right() - sub_outer_w - 4.0).max(4.0));
-        spos.y = spos.y.clamp(28.0, (screen.bottom() - sub_h - 6.0).max(28.0));
         let mut dummy_sub: Option<(String, Menu, egui::Pos2)> = None;
         let mut dummy_hover = false;
         let sub_area = egui::Area::new(egui::Id::new("ribbon_sub_popup"))
             .fixed_pos(spos)
+            .constrain_to(bounds)
             .order(egui::Order::Foreground)
             .show(&ctx, |ui| {
-                ui_kit::popup_frame(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(sub_frame_w);
-                    ui.set_max_width(sub_frame_w);
+                frame.show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.set_max_height(max_height);
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    let mut show_sub = |ui: &mut egui::Ui| {
+                    egui::ScrollArea::vertical().id_salt(&sub.ctl.id).max_height(max_height).show(ui, |ui| {
+                        let sub_inner_w = ui.available_width().min(width);
                         draw_menu_nodes(
                             app,
                             ui,
@@ -2056,12 +2044,7 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                             &mut dummy_sub,
                             &mut dummy_hover,
                         );
-                    };
-                    if sub_scroll {
-                        egui::ScrollArea::vertical().max_height(sub_h - 16.0).show(ui, show_sub);
-                    } else {
-                        show_sub(ui);
-                    }
+                    });
                 });
             });
         sub_rect = Some(sub_area.response.rect);
@@ -2719,6 +2702,124 @@ pub fn icon_of(name: &str) -> Option<Icon> {
 #[cfg(test)]
 mod compact_tests {
     use super::*;
+
+    #[test]
+    fn ribbon_watch_and_calculated_column_are_clickable_above_the_group_caption() {
+        let _env = crate::test_env::TestEnv::new("ribbon-command-columns");
+        for (tab, command, caption) in [(4, "监视窗口", "公式审核"), (100, "填充计算列", "工具")] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut app = SheetApp::new_with_context(&ctx, None);
+            app.show_start = false;
+            app.ribbon_tab = tab;
+            if tab == 100 {
+                let sheet = app.wb.sheet_mut(0);
+                sheet.tables.push(sheetcore::table::Table {
+                    name: "Sales".into(), display: "Sales".into(), range: (0, 0, 2, 0),
+                    columns: vec!["Total".into()], column_ids: vec![1], header_row: true, ..Default::default()
+                });
+                sheet.set(1, 0, sheetcore::model::Cell {
+                    value: sheetcore::model::Value::Number(3.0), formula: Some("=1+2".into()),
+                });
+                app.sel = (1, 0);
+                app.sel_end = app.sel;
+            }
+            let mut frame = eframe::Frame::_new_kittest();
+            let mut advance = |app: &mut SheetApp, events| {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1440.0, 850.0))),
+                    events, ..Default::default()
+                };
+                ctx.run(input, |ctx| eframe::App::update(app, ctx, &mut frame))
+            };
+            let mut hit = None;
+            let mut caption_top = None;
+            for _ in 0..4 {
+                let out = advance(&mut app, vec![]);
+                for (_, node) in out.platform_output.accesskit_update.unwrap().nodes {
+                    if node.label() == Some(command) { hit = node.bounds(); }
+                }
+                caption_top = out.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.job.text == caption => Some(t.pos.y),
+                    _ => None,
+                });
+            }
+            let hit = hit.expect("command needs a named hit region");
+            assert!(hit.y1 as f32 <= caption_top.expect("group caption") && hit.y1 - hit.y0 >= 23.0);
+            let pos = egui::pos2((hit.x0 + hit.x1) as f32 / 2.0, (hit.y0 + hit.y1) as f32 / 2.0);
+            for pressed in [true, false] {
+                advance(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos, pressed, button: egui::PointerButton::Primary, modifiers: egui::Modifiers::NONE,
+                }]);
+            }
+            if tab == 4 { assert!(app.watch_open); }
+            else { assert_eq!(app.wb.sheet(0).formula_of(2, 0), Some("=1+2")); }
+        }
+    }
+
+    #[test]
+    fn short_window_ribbon_popups_scroll_to_the_last_command_inside_the_frame() {
+        let _env = crate::test_env::TestEnv::new("ribbon-short-popup");
+        for items in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = SheetApp::new_with_context(&ctx, None);
+            let target;
+            let mut number_code = None;
+            let kind = if items {
+                let options = app.ribbon.find_dropdown("NumberFormat").unwrap();
+                let last = options.last().unwrap();
+                target = last.label.clone();
+                number_code = Some(last.id.strip_prefix("fmt:").unwrap().to_owned());
+                PopupKind::Items(options)
+            } else {
+                let menu = app.ribbon.find_menu("PasteMenu").unwrap();
+                target = "选择性粘贴…".to_owned();
+                let cell = sheetcore::model::Cell { value: sheetcore::model::Value::Number(1.0), formula: None };
+                app.clip = Some(crate::Clip {
+                    deferred: None, sheet: 0, rect: (0, 0, 0, 0), cells: vec![vec![(cell, 0)]],
+                    merges: vec![], cut: false, source_rows: None, source_cols: None,
+                });
+                PopupKind::Menu(menu)
+            };
+            let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(506.0, 320.0));
+            app.ribbon_popup = Some(Popup { kind, pos: screen.right_bottom(), opened_at: 0.0 });
+            let mut time = 0.0;
+            let mut render = |app: &mut SheetApp, events| {
+                time += 1.0 / 30.0;
+                ctx.run(egui::RawInput { time: Some(time), screen_rect: Some(screen), events, ..Default::default() }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| popup(app, ui));
+                })
+            };
+            let position = |out: &egui::FullOutput| out.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == target => {
+                    let pos = t.pos + t.galley.size() * 0.5;
+                    s.clip_rect.contains(pos).then_some(pos)
+                }
+                _ => None,
+            });
+            for _ in 0..4 { render(&mut app, vec![]); }
+            let area = ctx.memory(|m| m.area_rect(egui::Id::new("ribbon_popup"))).unwrap();
+            assert!(screen.shrink(4.0).contains_rect(area), "popup clipped: {area:?}");
+            assert!(position(&render(&mut app, vec![])).is_none(), "last row should initially be below the scroll viewport");
+            let pos = area.center();
+            render(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -850.0), modifiers: egui::Modifiers::NONE,
+            }]);
+            for _ in 0..16 { render(&mut app, vec![]); }
+            let last = position(&render(&mut app, vec![])).expect("last command must scroll into view");
+            for pressed in [true, false] {
+                render(&mut app, vec![egui::Event::PointerMoved(last), egui::Event::PointerButton {
+                    pos: last, pressed, button: egui::PointerButton::Primary, modifiers: egui::Modifiers::NONE,
+                }]);
+            }
+            assert!(app.ribbon_popup.is_none());
+            if let Some(code) = number_code {
+                assert_eq!(app.current_style().format, code);
+            } else {
+                assert!(app.paste_special);
+            }
+        }
+    }
 
     #[test]
     fn ribbon_color_split_swatch_matches_main_action_and_arrow_only_opens_choices() {

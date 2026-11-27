@@ -51,6 +51,7 @@ use selection_stats::{StatsAcc, collect_stats_values, status_stats_rects, status
 mod fill_seq;
 mod ai_agent;
 mod comments_panel;
+mod context_menu;
 mod wps_chrome;
 mod wps_dialogs;
 mod format_borders;
@@ -2242,11 +2243,7 @@ fn ctx_head_rows(is_col: bool) -> Vec<CtxRow> {
 
 /// 工作表标签菜单
 fn ctx_tab_rows() -> Vec<CtxRow> {
-    let mut colors: Vec<CtxRow> = vec![{
-        let mut r = CtxRow::item("无颜色", None, "", CtxAct::TabColor(None));
-        r.swatch = Some([255, 255, 255]);
-        r
-    }];
+    let mut colors = vec![CtxRow::item("无颜色", None, "", CtxAct::TabColor(None))];
     for (name, rgb) in TAB_COLORS.iter() {
         let mut r = CtxRow::item(name, None, "", CtxAct::TabColor(Some(*rgb)));
         r.swatch = Some(*rgb);
@@ -2359,11 +2356,11 @@ fn ctx_menu_height(rows: &[CtxRow]) -> f32 {
 
 fn ctx_row_focusable(rows: &[CtxRow], i: usize) -> bool {
     rows.get(i)
-        .map(|r| !r.is_sep() && !r.strip && (r.act.is_some() || !r.children.is_empty()))
+        .map(|r| r.enabled && !r.is_sep() && !r.strip && (r.act.is_some() || !r.children.is_empty()))
         .unwrap_or(false)
 }
 
-/// 上下移动键盘焦点；跳过分隔线和粘贴图标条，首尾循环。
+/// 上下移动键盘焦点，跳过禁用项、分隔线和粘贴图标条，首尾循环。
 fn next_ctx_row(rows: &[CtxRow], from: usize, dir: i32) -> Option<usize> {
     let n = rows.len();
     if n == 0 {
@@ -2379,6 +2376,7 @@ fn next_ctx_row(rows: &[CtxRow], from: usize, dir: i32) -> Option<usize> {
     None
 }
 
+#[cfg(test)]
 fn ctx_row_top(rows: &[CtxRow], idx: usize, start: f32) -> f32 {
     let mut y = start;
     for r in rows.iter().take(idx) {
@@ -11435,14 +11433,15 @@ impl SheetApp {
             .open(&mut open)
             .default_width(560.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui_kit::primary_button(ui, "+ 新建规则").clicked() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().interact_size.y = 32.0;
+                    if ui_kit::primary_button(ui, "新建规则").clicked() {
                         want_new = true;
                     }
-                    if ui.button("清除选区规则").clicked() {
+                    if ui.add_enabled(!blocks.is_empty(), egui::Button::new("清除选区规则")).clicked() {
                         want_clear_sel = true;
                     }
-                    if ui.button("清除整表规则").clicked() {
+                    if ui.add_enabled(!blocks.is_empty(), egui::Button::new("清除整表规则")).clicked() {
                         want_clear_all = true;
                     }
                 });
@@ -11452,7 +11451,7 @@ impl SheetApp {
                         egui::RichText::new(
                             "注意：差异格式含未建模的边框方向（对角/内部/起止边），保存会丢掉这些边，无法无损编辑。",
                         )
-                        .color(egui::Color32::from_rgb(180, 95, 6)),
+                        .color(theme::palette().warn_fg),
                     );
                     ui.separator();
                 }
@@ -11461,12 +11460,12 @@ impl SheetApp {
                         egui::RichText::new(
                             "注意：此表含本应用未建模的扩展条件格式（x14），保存会丢掉该扩展，无法无损编辑。",
                         )
-                        .color(egui::Color32::from_rgb(180, 95, 6)),
+                        .color(theme::palette().warn_fg),
                     );
                     ui.separator();
                 }
                 if blocks.is_empty() {
-                    ui.label("这张表还没有条件格式规则，点击上方「+ 新建规则」创建。");
+                    ui.label("当前工作表没有条件格式规则。");
                 }
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                     for (bi, blk) in blocks.iter().enumerate() {
@@ -11484,48 +11483,48 @@ impl SheetApp {
                             })
                             .collect::<Vec<_>>()
                             .join(" ");
-                        let mem_id = egui::Id::new(("cf_mgr_sqref", sh_id, bi, range_text.len()));
+                        let mem_id = egui::Id::new(("cf_mgr_sqref", sh_id, bi, &range_text));
                         let mut edit_sqref: String = ui.memory_mut(|m| {
                             m.data
                                 .get_temp_mut_or_insert_with(mem_id, || range_text.clone())
                                 .clone()
                         });
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("应用于:").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            let label = ui.label(egui::RichText::new("应用于").color(theme::palette().text_weak));
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut edit_sqref).desired_width(170.0),
-                            );
+                            ).labelled_by(label.id);
                             if resp.changed() {
                                 ui.memory_mut(|m| m.data.insert_temp(mem_id, edit_sqref.clone()));
                             }
                             if edit_sqref.trim() != range_text
-                                && ui.small_button("应用区域").clicked()
+                                && ui.button("应用区域").clicked()
                             {
                                 range_apply = Some((bi, edit_sqref.clone()));
                             }
-                            if ui.small_button("定位").clicked() {
+                            if ui.button("定位").clicked() {
                                 if let Some(r) = blk.ranges.first() {
                                     goto = Some(*r);
                                 }
                             }
-                            if ui.small_button("上移").clicked() {
+                            if ui.add_enabled(bi > 0, egui::Button::new("上移")).clicked() {
                                 up = Some(bi);
                             }
-                            if ui.small_button("下移").clicked() {
+                            if ui.add_enabled(bi + 1 < blocks.len(), egui::Button::new("下移")).clicked() {
                                 down = Some(bi);
                             }
                         });
                         for (ri, rule) in blk.rules.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("  · [{}] {}", rule.priority, rule.kind.describe()));
+                            ui.add(egui::Label::new(format!("[{}] {}", rule.priority, rule.kind.describe())).wrap());
+                            ui.horizontal_wrapped(|ui| {
                                 let mut stop_v = rule.stop;
                                 if ui.checkbox(&mut stop_v, "命中即停").changed() {
                                     toggle_stop = Some((bi, ri, stop_v));
                                 }
-                                if ui.small_button("编辑").clicked() {
+                                if ui.button("编辑").clicked() {
                                     edit_req = Some((bi, ri));
                                 }
-                                if ui.small_button("删除").clicked() {
+                                if ui.button("删除").clicked() {
                                     del = Some((bi, ri));
                                 }
                             });
@@ -27340,6 +27339,7 @@ fn clear_selection(&mut self) {
     /// 数据验证对话框
     fn dv_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut draft) = self.dv_edit.take() else { return };
+        let tab_id = egui::Id::new("data_validation_tab");
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
@@ -27348,146 +27348,67 @@ fn clear_selection(&mut self) {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                dlg_section(ui, "验证条件");
-                egui::Grid::new("dv_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("允许");
-                    egui::ComboBox::from_id_salt("dv_kind")
-                        .selected_text(draft.kind.label())
-                        .show_ui(ui, |ui| {
-                            for k in [
-                                sheetcore::dv::DvKind::Any,
-                                sheetcore::dv::DvKind::Whole,
-                                sheetcore::dv::DvKind::Decimal,
-                                sheetcore::dv::DvKind::List,
-                                sheetcore::dv::DvKind::Date,
-                                sheetcore::dv::DvKind::Time,
-                                sheetcore::dv::DvKind::TextLength,
-                                sheetcore::dv::DvKind::Custom,
-                            ] {
-                                if ui.selectable_label(draft.kind == k, k.label()).clicked() {
-                                    draft.kind = k;
+                let mut tab = ctx.data(|d| d.get_temp::<u8>(tab_id)).unwrap_or_default();
+                ui_kit::dialog_tabs(ui, &mut tab, &["设置", "输入提示", "出错警告"]);
+                ctx.data_mut(|d| d.insert_temp(tab_id, tab));
+                ui.vertical(|ui| {
+                    ui.set_min_height(176.0);
+                    match tab {
+                        0 => {
+                            use sheetcore::dv::{DvKind, DvOp};
+                            dv_choice(ui, "允许", &mut draft.kind, &[
+                                DvKind::Any, DvKind::Whole, DvKind::Decimal, DvKind::List,
+                                DvKind::Date, DvKind::Time, DvKind::TextLength, DvKind::Custom,
+                            ], DvKind::label);
+                            match draft.kind {
+                                DvKind::Whole | DvKind::Decimal | DvKind::Date | DvKind::Time | DvKind::TextLength => {
+                                    dv_choice(ui, "数据", &mut draft.op, &[
+                                        DvOp::Between, DvOp::NotBetween, DvOp::Equal, DvOp::NotEqual,
+                                        DvOp::Greater, DvOp::Less, DvOp::GreaterEq, DvOp::LessEq,
+                                    ], DvOp::label);
+                                    let paired = draft.op.needs_pair();
+                                    dv_text(ui, if paired { "最小值" } else { "值" }, &mut draft.f1, "");
+                                    if paired {
+                                        dv_text(ui, "最大值", &mut draft.f2, "");
+                                    }
                                 }
+                                DvKind::List => {
+                                    dv_text(ui, "来源", &mut draft.f1, "甲,乙,丙 或 $A$1:$A$5");
+                                    ui.checkbox(&mut draft.show_dropdown, "显示下拉箭头");
+                                }
+                                DvKind::Custom => {
+                                    dv_text(ui, "公式", &mut draft.f1, "例如 MOD(A1,2)=0");
+                                }
+                                DvKind::Any => {}
                             }
-                        });
-                    ui.end_row();
-
-                    if matches!(
-                        draft.kind,
-                        sheetcore::dv::DvKind::Whole
-                            | sheetcore::dv::DvKind::Decimal
-                            | sheetcore::dv::DvKind::Date
-                            | sheetcore::dv::DvKind::Time
-                            | sheetcore::dv::DvKind::TextLength
-                    ) {
-                        ui.label("数据");
-                        egui::ComboBox::from_id_salt("dv_op")
-                            .selected_text(draft.op.label())
-                            .show_ui(ui, |ui| {
-                                for op in [
-                                    sheetcore::dv::DvOp::Between,
-                                    sheetcore::dv::DvOp::NotBetween,
-                                    sheetcore::dv::DvOp::Equal,
-                                    sheetcore::dv::DvOp::NotEqual,
-                                    sheetcore::dv::DvOp::Greater,
-                                    sheetcore::dv::DvOp::Less,
-                                    sheetcore::dv::DvOp::GreaterEq,
-                                    sheetcore::dv::DvOp::LessEq,
-                                ] {
-                                    if ui.selectable_label(draft.op == op, op.label()).clicked() {
-                                        draft.op = op;
-                                    }
-                                }
-                            });
-                        ui.end_row();
-                        ui.label(if draft.op.needs_pair() { "最小值" } else { "值" });
-                        ui.add(egui::TextEdit::singleline(&mut draft.f1).desired_width(160.0));
-                        ui.end_row();
-                        if draft.op.needs_pair() {
-                            ui.label("最大值");
-                            ui.add(egui::TextEdit::singleline(&mut draft.f2).desired_width(160.0));
-                            ui.end_row();
+                            ui.checkbox(&mut draft.allow_blank, "忽略空值");
                         }
-                    } else if draft.kind == sheetcore::dv::DvKind::List {
-                        ui.label("来源");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut draft.f1)
-                                .hint_text("甲,乙,丙 或 $A$1:$A$5")
-                                .desired_width(220.0),
-                        );
-                        ui.end_row();
-                        ui.label("");
-                        ui.checkbox(&mut draft.show_dropdown, "显示下拉箭头");
-                        ui.end_row();
-                    } else if draft.kind == sheetcore::dv::DvKind::Custom {
-                        ui.label("公式");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut draft.f1)
-                                .hint_text("例如 MOD(A1,2)=0")
-                                .desired_width(220.0),
-                        );
-                        ui.end_row();
+                        1 => {
+                            ui.checkbox(&mut draft.show_prompt, "显示输入提示");
+                            dv_text(ui, "提示标题", &mut draft.prompt_title, "");
+                            dv_text(ui, "提示内容", &mut draft.prompt_msg, "");
+                        }
+                        _ => {
+                            use sheetcore::dv::DvStyle;
+                            ui.checkbox(&mut draft.show_error, "显示错误警告");
+                            ui.add_enabled_ui(draft.show_error, |ui| {
+                                dv_choice(ui, "样式", &mut draft.error_style, &[
+                                    DvStyle::Stop, DvStyle::Warning, DvStyle::Information,
+                                ], DvStyle::label);
+                            });
+                            dv_text(ui, "出错标题", &mut draft.error_title, "");
+                            dv_text(ui, "出错说明", &mut draft.error_msg, "");
+                        }
                     }
-
-                    ui.label("忽略空值");
-                    ui.checkbox(&mut draft.allow_blank, "");
-                    ui.end_row();
                 });
-                dlg_section(ui, "出错警告");
-                egui::Grid::new("dv_err").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("出错标题");
-                    ui.add(egui::TextEdit::singleline(&mut draft.error_title).desired_width(220.0));
-                    ui.end_row();
-                    ui.label("出错说明");
-                    ui.add(egui::TextEdit::singleline(&mut draft.error_msg).desired_width(220.0));
-                    ui.end_row();
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut draft.show_error, "显示错误警告");
-                    ui.add_enabled_ui(draft.show_error, |ui| {
-                        egui::ComboBox::from_id_salt("dv_style")
-                            .selected_text(draft.error_style.label())
-                            .show_ui(ui, |ui| {
-                                for st in [
-                                    sheetcore::dv::DvStyle::Stop,
-                                    sheetcore::dv::DvStyle::Warning,
-                                    sheetcore::dv::DvStyle::Information,
-                                ] {
-                                    if ui
-                                        .selectable_label(draft.error_style == st, st.label())
-                                        .clicked()
-                                    {
-                                        draft.error_style = st;
-                                    }
-                                }
-                            });
-                    });
-                });
-                dlg_section(ui, "输入提示");
-                egui::Grid::new("dv_prompt").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("显示输入提示");
-                    ui.checkbox(&mut draft.show_prompt, "");
-                    ui.end_row();
-                    ui.label("提示标题");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.prompt_title).desired_width(220.0),
-                    );
-                    ui.end_row();
-                    ui.label("提示内容");
-                    ui.add(egui::TextEdit::singleline(&mut draft.prompt_msg).desired_width(220.0));
-                    ui.end_row();
-                });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui_kit::secondary_button(ui, "取消").clicked() {
-                            cancel = true;
-                        }
-                        if ui_kit::primary_button(ui, "确定").clicked() {
-                            apply = true;
-                        }
-                    });
+                ui_kit::footer(ui, |ui| {
+                    cancel = ui_kit::secondary_button(ui, "取消").clicked();
+                    apply = ui_kit::primary_button(ui, "确定").clicked();
                 });
             });
+        if apply || cancel || !open {
+            ctx.data_mut(|d| d.remove::<u8>(tab_id));
+        }
         if apply {
             if draft.kind == sheetcore::dv::DvKind::List {
                 let t = draft.f1.trim();
@@ -30961,6 +30882,12 @@ impl SheetApp {
         let Some(mut st) = self.filter_popup.take() else {
             return;
         };
+        let bounds = ctx.screen_rect().shrink(4.0);
+        let pal = theme::palette();
+        let width = 250.0_f32.min((bounds.width() - 2.0).max(1.0));
+        let sub_width = 156.0_f32.min(bounds.width());
+        let parent_right = (st.anchor.x.max(bounds.left()) + width + 2.0).min(bounds.right());
+        let opens_right = parent_right + 2.0 + sub_width <= bounds.right();
         let col = st.col;
         let filter_range = self
             .wb
@@ -31069,9 +30996,9 @@ impl SheetApp {
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     let panel = egui::Area::new(egui::Id::new("filter_dd"))
-                        .fixed_pos(st.anchor).order(egui::Order::Foreground).show(ctx, |ui| {
-                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                ui.set_width(226.0);
+                        .fixed_pos(st.anchor).constrain_to(bounds).order(egui::Order::Foreground).show(ctx, |ui| {
+                            ui_kit::popup_frame(ui.style()).show(ui, |ui| {
+                                ui.set_width((width - 12.0).max(1.0));
                                 ui.horizontal(|ui| { ui.spinner(); ui.label("正在读取筛选值…"); });
                             });
                         });
@@ -31108,18 +31035,60 @@ impl SheetApp {
             .as_ref()
             .and_then(|f| f.color_filters.get(&col).copied());
 
+        let menu_row = |ui: &mut egui::Ui, label: &str, enabled: bool, icon: Option<Icon>, arrow: Option<egui::Direction>, active: bool| {
+            let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 25.0), sense);
+            let fg = if enabled { pal.text } else { pal.text_muted };
+            if enabled && (resp.hovered() || active || resp.is_pointer_button_down_on()) {
+                let bg = if resp.is_pointer_button_down_on() { pal.pressed } else { pal.hover };
+                ui.painter().rect_filled(rect.shrink2(egui::vec2(3.0, 1.0)), 4.0, bg);
+            }
+            let start = if let Some(icon) = icon {
+                let ic = Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), egui::vec2(15.0, 15.0));
+                ui_icons::draw_mono(ui.painter(), ic, icon, if enabled { pal.text_weak } else { fg });
+                rect.left() + 31.0
+            } else {
+                rect.left() + 10.0
+            };
+            let right = rect.right() - if arrow.is_some() { 24.0 } else { 8.0 };
+            let text: egui::WidgetText = egui::RichText::new(label).size(12.0).color(fg).into();
+            let galley = text.into_galley(ui, Some(egui::TextWrapMode::Truncate), (right - start).max(1.0), egui::TextStyle::Button);
+            let clipped = galley.elided;
+            ui.painter().galley(egui::pos2(start, rect.center().y - galley.size().y / 2.0), galley, fg);
+            if let Some(direction) = arrow {
+                let c = egui::pos2(rect.right() - 13.0, rect.center().y);
+                if direction == egui::Direction::TopDown {
+                    ui_kit::caret(ui, c, pal.text_weak);
+                } else if direction == egui::Direction::RightToLeft {
+                    ui.painter().add(egui::Shape::line(vec![
+                        c + Vec2::new(1.5, -2.5), c + Vec2::new(-1.5, 0.0), c + Vec2::new(1.5, 2.5),
+                    ], Stroke::new(1.0, pal.text_weak)));
+                } else {
+                    ui_kit::caret_right(ui, c, pal.text_weak);
+                }
+            }
+            ui_kit::a11y_name(&resp, label, enabled, None);
+            let _ = ui.ctx().accesskit_node_builder(resp.id, |node| {
+                node.set_role(egui::accesskit::Role::MenuItem);
+                if arrow.is_some() { node.set_expanded(active); }
+            });
+            ui_kit::focus_ring(ui, &resp, rect.shrink(2.0), 4.0);
+            if resp.gained_focus() { resp.scroll_to_me(None); }
+            if clipped { resp.on_hover_text(label) } else { resp }
+        };
         let area = egui::Area::new(egui::Id::new("filter_dd"))
             .fixed_pos(st.anchor)
+            .constrain_to(bounds)
             .order(egui::Order::Foreground);
         let resp = area.show(ctx, |ui| {
-            let pal = theme::palette();
-            egui::Frame::popup(ui.style())
-                .fill(pal.dialog_bg)
-                .stroke(egui::Stroke::new(1.0, pal.card_border))
-                .inner_margin(egui::Margin::same(0))
+            ui_kit::popup_frame(ui.style())
+                .inner_margin(egui::Margin::ZERO)
                 .show(ui, |ui| {
-                    ui.set_width(250.0);
-                    let row_h = 24.0;
+                    ui.set_width(width);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    egui::ScrollArea::vertical().id_salt("filter_controls")
+                        .min_scrolled_height(0.0).max_height((bounds.height() - 47.0).max(1.0))
+                        .auto_shrink([false, true]).show(ui, |ui| {
                     let sep_row = |ui: &mut egui::Ui| {
                         let (r, _) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), 7.0),
@@ -31134,32 +31103,10 @@ impl SheetApp {
                             pal.card_border,
                         );
                     };
-                    let mut menu_row = |ui: &mut egui::Ui, label: &str, enabled: bool| -> bool {
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), row_h),
-                            egui::Sense::click(),
-                        );
-                        let hot = enabled && resp.hovered();
-                        if hot {
-                            ui.painter().rect_filled(
-                                rect.shrink2(egui::vec2(2.0, 0.0)),
-                                0.0,
-                                pal.hover,
-                            );
-                        }
-                        ui.painter().text(
-                            egui::pos2(rect.left() + 10.0, rect.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            label,
-                            egui::FontId::proportional(12.0),
-                            if enabled { pal.text } else { pal.text_muted },
-                        );
-                        enabled && resp.clicked()
-                    };
-                    if menu_row(ui, "升序", true) {
+                    if menu_row(ui, "升序", true, Some(Icon::SortAsc), None, false).clicked() {
                         sort_req = Some(true);
                     }
-                    if menu_row(ui, "降序", true) {
+                    if menu_row(ui, "降序", true, Some(Icon::SortDesc), None, false).clicked() {
                         sort_req = Some(false);
                     }
                     sep_row(ui);
@@ -31167,16 +31114,17 @@ impl SheetApp {
                         ui,
                         &format!("从“{col_name}”中清除筛选器"),
                         has_crit || has_allows || has_date_grp || has_color_flt || has_top_flt || has_dyn_flt,
-                    ) {
+                        Some(Icon::Eraser), None, false,
+                    ).clicked() {
                         clear_req = true;
                     }
                     // 按颜色筛选（出现多种填充色或字体色时展示）
                     if has_colors {
                         if menu_row(
                             ui,
-                            if st.color_open { "按颜色筛选 ▾" } else { "按颜色筛选 ▸" },
-                            true,
-                        ) {
+                            "按颜色筛选", true, Some(Icon::Fill),
+                            Some(if st.color_open { egui::Direction::TopDown } else { egui::Direction::LeftToRight }), st.color_open,
+                        ).clicked() {
                             st.color_open = !st.color_open;
                         }
                         if st.color_open {
@@ -31205,7 +31153,7 @@ impl SheetApp {
                                             2.0,
                                             Stroke::new(
                                                 if active { 2.0 } else { 1.0 },
-                                                if active { ui_kit::ACCENT } else { Color32::from_rgb(140, 140, 140) },
+                                                if active { pal.accent } else { pal.text_muted },
                                             ),
                                             egui::StrokeKind::Inside,
                                         );
@@ -31238,7 +31186,7 @@ impl SheetApp {
                                                 2.0,
                                                 Stroke::new(
                                                     if active { 2.0 } else { 1.0 },
-                                                    if active { ui_kit::ACCENT } else { Color32::from_rgb(140, 140, 140) },
+                                                    if active { pal.accent } else { pal.text_muted },
                                                 ),
                                                 egui::StrokeKind::Inside,
                                             );
@@ -31264,40 +31212,18 @@ impl SheetApp {
                         }
                     }
                     // 文本筛选 / 数字筛选：点开是二级面板
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), row_h),
-                        egui::Sense::click(),
-                    );
-                    if resp.hovered() {
-                        ui.painter().rect_filled(
-                            rect.shrink2(egui::vec2(2.0, 0.0)),
-                            0.0,
-                            pal.hover,
-                        );
-                    }
-                    ui.painter().text(
-                        egui::pos2(rect.left() + 10.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        if numeric { "数字筛选" } else { "文本筛选" },
-                        egui::FontId::proportional(12.0),
-                        pal.text,
-                    );
-                    // 右箭头自己画（字体里没 ▸ 的字形，画三角形更稳）
-                    {
-                        let c = egui::pos2(rect.right() - 12.0, rect.center().y);
-                        ui.painter().add(egui::Shape::convex_polygon(
-                            vec![
-                                egui::pos2(c.x - 2.0, c.y - 3.5),
-                                egui::pos2(c.x + 2.5, c.y),
-                                egui::pos2(c.x - 2.0, c.y + 3.5),
-                            ],
-                            pal.text_weak,
-                            egui::Stroke::NONE,
-                        ));
-                    }
-                    if resp.clicked() {
+                    let condition_label = if has_dates && st.date_mode {
+                        "日期筛选"
+                    } else if numeric {
+                        "数字筛选"
+                    } else {
+                        "文本筛选"
+                    };
+                    let condition = menu_row(ui, condition_label, true, Some(Icon::Filter),
+                        Some(if opens_right { egui::Direction::LeftToRight } else { egui::Direction::RightToLeft }), st.ops_open);
+                    st.ops_anchor = condition.rect.right_top();
+                    if condition.clicked() {
                         st.ops_open = !st.ops_open;
-                        st.ops_anchor = egui::pos2(rect.right() + 2.0, rect.top());
                     }
                     sep_row(ui);
 
@@ -31305,11 +31231,15 @@ impl SheetApp {
                     if has_dates {
                         ui.horizontal(|ui| {
                             ui.add_space(6.0);
-                            if ui.selectable_label(st.date_mode, "按年/月日期").clicked() {
-                                st.date_mode = true;
-                            }
-                            if ui.selectable_label(!st.date_mode, "按原始值").clicked() {
-                                st.date_mode = false;
+                            ui.visuals_mut().selection.bg_fill = pal.accent_tint;
+                            ui.visuals_mut().selection.stroke.color = pal.text;
+                            for (mode, label) in [(true, "按年/月日期"), (false, "按原始值")] {
+                                let selected = mode == st.date_mode;
+                                let button = ui.selectable_label(selected, egui::RichText::new(label)
+                                    .color(if selected { pal.text } else { pal.text_weak }));
+                                ui_kit::a11y_role(&button, label, egui::accesskit::Role::RadioButton, Some(selected));
+                                ui_kit::focus_ring(ui, &button, button.rect, 4.0);
+                                if button.clicked() { st.date_mode = mode; }
                             }
                         });
                     }
@@ -31319,44 +31249,15 @@ impl SheetApp {
                     let w = ui.available_width() - 12.0;
                     ui.horizontal(|ui| {
                         ui.add_space(6.0);
-                        let (r, _) = ui.allocate_exact_size(
-                            egui::vec2(w, 22.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().rect_filled(r, 0.0, pal.grid_bg);
-                        ui.painter().rect_stroke(
-                            r,
-                            0.0,
-                            egui::Stroke::new(1.0, pal.card_border),
-                            egui::StrokeKind::Inside,
-                        );
-                        let inner = r.shrink2(egui::vec2(4.0, 2.0));
-                        if st.search.is_empty() {
-                            ui.painter().text(
-                                egui::pos2(inner.left() + 2.0, inner.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                "搜索",
-                                egui::FontId::proportional(12.0),
-                                pal.text_muted,
-                            );
-                        }
-                        let te = ui.put(
-                            inner,
-                            egui::TextEdit::singleline(&mut st.search)
-                                .frame(false)
-                                .margin(egui::Margin::symmetric(2, 0))
-                                .font(egui::FontId::proportional(12.0)),
-                        );
+                        let field = ui.allocate_ui_with_layout(egui::vec2(w, 34.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui_kit::text_input(ui, &mut st.search, "搜索")
+                        });
+                        let te = field.inner;
+                        let _ = te.ctx.accesskit_node_builder(te.id, |node| node.set_label("搜索筛选值"));
                         if std::env::var("SC_FILTER_Q").is_ok() {
-                            eprintln!(
-                                "[fdd] search={:?} te=({:.0},{:.0},{:.0},{:.0}) clip={:?}",
-                                st.search,
-                                te.rect.min.x,
-                                te.rect.min.y,
-                                te.rect.width(),
-                                te.rect.height(),
-                                ui.clip_rect()
-                            );
+                            eprintln!("[fdd] search={:?} te=({:.0},{:.0},{:.0},{:.0}) clip={:?}",
+                                st.search, te.rect.min.x, te.rect.min.y, te.rect.width(),
+                                te.rect.height(), ui.clip_rect());
                         }
                         if std::env::var("SC_FILTER_Q").is_ok() && !st.search.is_empty() {
                             // 无界面验收时不要抢焦点，免得截图里没有光标
@@ -31369,7 +31270,7 @@ impl SheetApp {
                     ui.add_space(6.0);
 
                     // 值列表（带边框，Excel 里是一个列表框）
-                    let list_h = 168.0;
+                    let list_h = (bounds.height() - 250.0).clamp(64.0, 168.0);
                     let mut list_rect = None;
                     ui.horizontal(|ui| {
                         ui.add_space(6.0);
@@ -31381,7 +31282,7 @@ impl SheetApp {
                         ui.painter().rect_stroke(
                             r,
                             0.0,
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(171, 171, 171)),
+                            egui::Stroke::new(1.0, pal.card_border),
                             egui::StrokeKind::Inside,
                         );
                         let mut child = ui.new_child(
@@ -31389,7 +31290,7 @@ impl SheetApp {
                                 .max_rect(r.shrink(1.0))
                                 .layout(egui::Layout::top_down(egui::Align::LEFT)),
                         );
-                        child.set_clip_rect(r.shrink(1.0));
+                        child.set_clip_rect(r.shrink(1.0).intersect(ui.clip_rect()));
                         if st.date_mode && has_dates {
                             let dates = st.meta.as_ref().map(|m| m.dates.clone()).unwrap_or_default();
                             let query = st.search.trim().to_lowercase();
@@ -31507,35 +31408,16 @@ impl SheetApp {
                             st.list.draw(&mut child, list_h - 2.0, &st.search, &mut st.changed_choices);
                         }
                     }
-                    sep_row(ui);
-                    ui.add_space(4.0);
+                    });
+                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(8.0);
-                            if ui
-                                .add_sized(
-                                    egui::vec2(64.0, 22.0),
-                                    egui::Button::new(egui::RichText::new("取消").size(12.0)),
-                                )
-                                .clicked()
-                            {
-                                cancel = true;
-                            }
-                            if ui
-                                .add_sized(
-                                    egui::vec2(64.0, 22.0),
-                                    egui::Button::new(
-                                        egui::RichText::new("确定").size(12.0).strong(),
-                                    )
-                                    .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(90, 90, 90))),
-                                )
-                                .clicked()
-                            {
-                                apply = true;
-                            }
+                            ui.add_space(6.0);
+                            if ui_kit::secondary_button(ui, "取消").clicked() { cancel = true; }
+                            if ui_kit::primary_button(ui, "确定").clicked() { apply = true; }
                         });
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                 });
         });
         // 「文本筛选 / 数字筛选」的二级面板
@@ -31561,65 +31443,35 @@ impl SheetApp {
                     sheetcore::sort_filter::CmpOp::Ends,
                 ]
             };
+            let parent = resp.response.rect;
+            let x = if opens_right {
+                parent.right() + 2.0
+            } else {
+                (parent.left() - 2.0 - sub_width).max(bounds.left())
+            };
             let ar = egui::Area::new(egui::Id::new("filter_ops"))
-                .fixed_pos(st.ops_anchor)
+                .fixed_pos(egui::pos2(x, st.ops_anchor.y))
+                .constrain_to(bounds)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style())
-                        .fill(egui::Color32::WHITE)
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(171, 171, 171)))
-                        .inner_margin(egui::Margin::same(2))
-                        .show(ui, |ui| {
-                            ui.set_width(150.0);
+                    ui_kit::popup_frame(ui.style()).inner_margin(egui::Margin::same(3)).show(ui, |ui| {
+                        ui.set_width((sub_width - 8.0).max(1.0));
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        egui::ScrollArea::vertical().id_salt("filter_conditions").min_scrolled_height(0.0)
+                            .max_height((bounds.height() - 8.0).max(1.0)).auto_shrink([false, true]).show(ui, |ui| {
+                            let action_row = |ui: &mut egui::Ui, label: &str| menu_row(ui, label, true, None, None, false).clicked();
                             for op in ops {
-                                let (r, resp) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), 22.0),
-                                    egui::Sense::click(),
-                                );
-                                if resp.hovered() {
-                                    ui.painter().rect_filled(
-                                        r,
-                                        0.0,
-                                        egui::Color32::from_rgb(229, 241, 251),
-                                    );
-                                }
-                                ui.painter().text(
-                                    egui::pos2(r.left() + 8.0, r.center().y),
-                                    egui::Align2::LEFT_CENTER,
-                                    format!("{}…", op.label()),
-                                    egui::FontId::proportional(12.0),
-                                    ui_kit::TEXT,
-                                );
-                                if resp.clicked() {
-                                    open_crit = Some(*op);
-                                }
+                                if action_row(ui, &format!("{}…", op.label())) { open_crit = Some(*op); }
                             }
                             if numeric {
                                 ui.separator();
-                                let mut dyn_row = |ui: &mut egui::Ui, lbl: &str| -> bool {
-                                    let (r, resp) = ui.allocate_exact_size(
-                                        egui::vec2(ui.available_width(), 22.0),
-                                        egui::Sense::click(),
-                                    );
-                                    if resp.hovered() {
-                                        ui.painter().rect_filled(r, 0.0, egui::Color32::from_rgb(229, 241, 251));
-                                    }
-                                    ui.painter().text(
-                                        egui::pos2(r.left() + 8.0, r.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        lbl,
-                                        egui::FontId::proportional(12.0),
-                                        ui_kit::TEXT,
-                                    );
-                                    resp.clicked()
-                                };
-                                if dyn_row(ui, "前 10 项…") {
+                                if action_row(ui, "前 10 项…") {
                                     open_top = true;
                                 }
-                                if dyn_row(ui, "高于平均值") {
+                                if action_row(ui, "高于平均值") {
                                     dyn_req = Some(sheetcore::sort_filter::DynamicFilter::AboveAverage);
                                 }
-                                if dyn_row(ui, "低于平均值") {
+                                if action_row(ui, "低于平均值") {
                                     dyn_req = Some(sheetcore::sort_filter::DynamicFilter::BelowAverage);
                                 }
                             }
@@ -31639,31 +31491,26 @@ impl SheetApp {
                                     sheetcore::sort_filter::DynamicFilter::LastYear,
                                     sheetcore::sort_filter::DynamicFilter::NextYear,
                                 ] {
-                                    let (r, resp) = ui.allocate_exact_size(
-                                        egui::vec2(ui.available_width(), 21.0),
-                                        egui::Sense::click(),
-                                    );
-                                    if resp.hovered() {
-                                        ui.painter().rect_filled(r, 0.0, egui::Color32::from_rgb(229, 241, 251));
-                                    }
-                                    ui.painter().text(
-                                        egui::pos2(r.left() + 8.0, r.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        df.label(),
-                                        egui::FontId::proportional(11.5),
-                                        ui_kit::TEXT,
-                                    );
-                                    if resp.clicked() {
+                                    if action_row(ui, df.label()) {
                                         dyn_req = Some(df);
                                     }
                                 }
                             }
                         });
+                    });
                 });
             ops_rect = ar.response.rect;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            cancel = true;
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if st.crit_dlg.is_some() {
+                st.crit_dlg = None;
+            } else if st.top_dlg.is_some() {
+                st.top_dlg = None;
+            } else if st.ops_open {
+                st.ops_open = false;
+            } else {
+                cancel = true;
+            }
         }
         // 点面板外面 = 取消
         if ctx.input(|i| i.pointer.any_click()) {
@@ -31681,6 +31528,7 @@ impl SheetApp {
         }
 
         if open_top {
+            st.ops_open = false;
             let old = self
                 .wb
                 .sheet(self.sheet_idx)
@@ -31746,6 +31594,7 @@ impl SheetApp {
 
         // 文本/数字筛选的输入框（支持复合 AND / OR 第二条件 + 通配符提示）
         if let Some(op) = open_crit {
+            st.ops_open = false;
             let old = self
                 .wb
                 .sheet(self.sheet_idx)
@@ -36139,420 +35988,6 @@ impl SheetApp {
             }
         }
         rows
-    }
-
-    /// 自绘单元格右键菜单（照本机 Excel 365 的条目、分组、行高与图标位）
-    fn ctx_menu_window(&mut self, ctx: &egui::Context) {
-        self.ctx_rects.clear();
-        let Some(m0) = self.ctx_menu.as_ref() else { return };
-        let (pos0, opened_frame, mut sub, kind0, idx0) = (m0.pos, m0.frame, m0.sub, m0.kind, m0.idx);
-        let (mut key, mut sub_key) = (m0.key, m0.sub_key);
-        let rows = match kind0 {
-            CtxKind::Cell => self.cell_ctx_menu_rows(),
-            CtxKind::Rows => self.head_ctx_menu_rows(false),
-            CtxKind::Cols => self.head_ctx_menu_rows(true),
-            CtxKind::Tab => self.tab_ctx_menu_rows(idx0),
-        };
-        let total_h = ctx_menu_height(&rows);
-        // 菜单不能超出窗口：Excel 在屏幕边缘会整体内移，项不被裁掉
-        let screen = ctx.screen_rect();
-        let pos = egui::pos2(
-            pos0.x.min(screen.right() - CTX_W - 4.0).max(screen.left() + 4.0),
-            pos0.y.min(screen.bottom() - total_h - 4.0).max(screen.top() + 4.0),
-        );
-        if !ctx_row_focusable(&rows, key) {
-            key = next_ctx_row(&rows, 0, 1).unwrap_or(0);
-        }
-        let mut key_action: Option<CtxAct> = None;
-        let mut close_menu = false;
-        let mut suppress_sub = false;
-        let (k_up, k_down, k_left, k_right, k_enter, k_esc) = ctx.input(|i| {
-            (
-                i.key_pressed(Key::ArrowUp),
-                i.key_pressed(Key::ArrowDown),
-                i.key_pressed(Key::ArrowLeft),
-                i.key_pressed(Key::ArrowRight),
-                i.key_pressed(Key::Enter),
-                i.key_pressed(Key::Escape),
-            )
-        });
-        if let Some(si) = sub {
-            let kids = rows.get(si).map(|r| r.children.as_slice()).unwrap_or(&[]);
-            if k_up && !kids.is_empty() {
-                if let Some(i) = next_ctx_row(kids, sub_key, -1) {
-                    sub_key = i;
-                }
-            } else if k_down && !kids.is_empty() {
-                if let Some(i) = next_ctx_row(kids, sub_key, 1) {
-                    sub_key = i;
-                }
-            } else if k_enter {
-                if let Some(kid) = kids.get(sub_key) {
-                    if kid.enabled {
-                        key_action = kid.act;
-                    }
-                }
-            } else if k_esc || k_left {
-                sub = None;
-                suppress_sub = true;
-            }
-        } else if k_down {
-            if let Some(i) = next_ctx_row(&rows, key, 1) {
-                key = i;
-            }
-        } else if k_up {
-            if let Some(i) = next_ctx_row(&rows, key, -1) {
-                key = i;
-            }
-        } else if k_enter || k_right {
-            if let Some(row) = rows.get(key) {
-                if row.enabled {
-                    if !row.children.is_empty() {
-                        sub = Some(key);
-                        sub_key = next_ctx_row(&row.children, row.children.len().saturating_sub(1), 1).unwrap_or(0);
-                    } else if k_enter {
-                        key_action = row.act;
-                    }
-                }
-            }
-        } else if k_esc {
-            close_menu = true;
-        }
-        if close_menu {
-            self.ctx_menu = None;
-            ctx.request_repaint();
-            return;
-        }
-        if let Some(a) = key_action {
-            self.ctx_menu = None;
-            self.ctx_menu_run(a, idx0, ctx);
-            ctx.request_repaint();
-            return;
-        }
-        let mut action: Option<CtxAct> = None;
-        let mut sub_req: Option<(usize, f32)> = None;
-        let mut rects: Vec<egui::Rect> = Vec::new();
-        let fg = ui_kit::TEXT;
-        let grey = ui_kit::TEXT_WEAK;
-        let disabled_fg = ui_kit::DISABLED;
-        let ink = egui::Color32::from_rgb(51, 65, 85);
-        let hover_bg = ui_kit::HOVER;
-
-        egui::Area::new(egui::Id::new("ctx_menu_area"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(pos)
-            .default_size([CTX_W, total_h])
-            .show(ctx, |ui| {
-                let rect = egui::Rect::from_min_size(pos, egui::vec2(CTX_W, total_h));
-                rects.push(rect);
-                ui.allocate_rect(rect, egui::Sense::hover());
-                let p = ui.painter().clone();
-                // 现代 Excel 365 / WPS 悬浮右键菜单：柔和弥散阴影 + 8px 圆角纯白卡 + 1px CARD_BORDER
-                p.rect_stroke(
-                    rect.expand(1.5),
-                    9.5,
-                    egui::Stroke::new(3.0, egui::Color32::from_black_alpha(12)),
-                    egui::StrokeKind::Outside,
-                );
-                p.rect_filled(rect, 8.0, egui::Color32::WHITE);
-                p.rect_stroke(
-                    rect,
-                    8.0,
-                    egui::Stroke::new(1.0, ui_kit::CARD_BORDER),
-                    egui::StrokeKind::Inside,
-                );
-                let mut y = pos.y + 4.0;
-                for (i, row) in rows.iter().enumerate() {
-                    if row.is_sep() {
-                        p.line_segment(
-                            [
-                                egui::pos2(pos.x + 10.0, y + 3.5),
-                                egui::pos2(pos.x + CTX_W - 10.0, y + 3.5),
-                            ],
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(232, 236, 242)),
-                        );
-                        y += 8.0;
-                        continue;
-                    }
-                    if row.strip {
-                        // 粘贴选项快捷图标条
-                        let strip_on = row.enabled;
-                        let strip = egui::Rect::from_min_size(
-                            egui::pos2(pos.x, y),
-                            egui::vec2(CTX_W, CTX_STRIP_H),
-                        );
-                        p.rect_filled(
-                            strip.shrink2(egui::vec2(6.0, 2.0)),
-                            5.0,
-                            egui::Color32::from_rgb(246, 248, 252),
-                        );
-                        let icons = [
-                            (CtxAct::Paste, crate::ui_icons::Icon::Paste),
-                            (CtxAct::PasteValues, crate::ui_icons::Icon::PasteValues123),
-                            (CtxAct::PasteFormulas, crate::ui_icons::Icon::Fx),
-                            (CtxAct::PasteTranspose, crate::ui_icons::Icon::Transpose),
-                            (CtxAct::PasteFormats, crate::ui_icons::Icon::Brush),
-                            (CtxAct::PasteAsPicture, crate::ui_icons::Icon::PastePic),
-                        ];
-                        for (k, (a, ic)) in icons.iter().enumerate() {
-                            let br = egui::Rect::from_min_size(
-                                egui::pos2(strip.left() + 8.0 + k as f32 * 38.5, strip.top() + 5.0),
-                                egui::vec2(34.0, 24.0),
-                            );
-                            let r = ui.interact(
-                                br,
-                                egui::Id::new(("ctx_paste", k)),
-                                if strip_on { egui::Sense::click() } else { egui::Sense::hover() },
-                            );
-                            if strip_on && r.hovered() {
-                                p.rect_filled(br, 4.0, ui_kit::HOVER);
-                            }
-                            ui_icons::draw(
-                                &p,
-                                br.shrink(6.0),
-                                *ic,
-                                if strip_on { ink } else { disabled_fg },
-                            );
-                            // UI-24.2：右键菜单里的粘贴图标也要有名字 + 中文悬停提示
-                            let pname = match a {
-                                CtxAct::Paste => "全部粘贴",
-                                CtxAct::PasteValues => "仅粘贴数值 (123)",
-                                CtxAct::PasteFormulas => "仅粘贴公式",
-                                CtxAct::PasteTranspose => "转置粘贴 (行列互换)",
-                                CtxAct::PasteFormats => "仅粘贴格式",
-                                CtxAct::PasteAsPicture => "粘贴为图片",
-                                _ => "粘贴选项",
-                            };
-                            ui_kit::a11y_name(&r, pname, strip_on, None);
-                            if r.on_hover_text(pname).clicked() && strip_on {
-                                action = Some(*a);
-                            }
-                        }
-                        y += CTX_STRIP_H;
-                        continue;
-                    }
-                    let enabled = row.enabled;
-                    let rr = egui::Rect::from_min_size(
-                        egui::pos2(pos.x, y),
-                        egui::vec2(CTX_W, CTX_ROW_H),
-                    );
-                    let r = ui.interact(
-                        rr,
-                        egui::Id::new(("ctx_row", i)),
-                        if enabled { egui::Sense::click() } else { egui::Sense::hover() },
-                    );
-                    // UI-24.2：右键菜单行发布成 MenuItem（名字带快捷键与子菜单提示）
-                    {
-                        let mut nm = row.label.to_string();
-                        if !row.shortcut.is_empty() {
-                            nm.push_str("，");
-                            nm.push_str(row.shortcut);
-                        }
-                        if !row.children.is_empty() {
-                            nm.push_str("，有子菜单");
-                        }
-                        if !enabled {
-                            nm.push_str("，不可用");
-                        }
-                        ui_kit::a11y_role(
-                            &r,
-                            &nm,
-                            egui::accesskit::Role::MenuItem,
-                            None,
-                        );
-                    }
-                    let active = enabled && (matches!(sub, Some(s) if s == i) || (sub.is_none() && key == i));
-                    if enabled && (r.hovered() || active) {
-                        p.rect_filled(
-                            rr.shrink2(egui::vec2(5.0, 1.0)),
-                            5.0,
-                            hover_bg,
-                        );
-                    }
-                    if let Some(ic) = row.icon {
-                        ui_icons::draw(
-                            &p,
-                            egui::Rect::from_min_size(
-                                egui::pos2(pos.x + 12.0, y + 5.0),
-                                egui::vec2(16.0, 16.0),
-                            ),
-                            ic,
-                            if enabled { ink } else { disabled_fg },
-                        );
-                    }
-                    p.text(
-                        egui::pos2(pos.x + 36.0, y + CTX_ROW_H / 2.0),
-                        egui::Align2::LEFT_CENTER,
-                        row.label,
-                        egui::FontId::proportional(12.0),
-                        if enabled { fg } else { disabled_fg },
-                    );
-                    let has_children = !row.children.is_empty();
-                    if !row.shortcut.is_empty() {
-                        p.text(
-                            egui::pos2(
-                                pos.x + CTX_W - 12.0 - if has_children { 14.0 } else { 0.0 },
-                                y + CTX_ROW_H / 2.0,
-                            ),
-                            egui::Align2::RIGHT_CENTER,
-                            row.shortcut,
-                            egui::FontId::proportional(11.0),
-                            if enabled { grey } else { disabled_fg },
-                        );
-                    }
-                    if has_children {
-                        ui_kit::caret_right(
-                            ui,
-                            egui::pos2(pos.x + CTX_W - 13.0, y + CTX_ROW_H / 2.0),
-                            if enabled {
-                                egui::Color32::from_rgb(100, 116, 139)
-                            } else {
-                                disabled_fg
-                            },
-                        );
-                        if enabled && (r.hovered() || matches!(sub, Some(s) if s == i)) {
-                            sub_req = Some((i, rr.top()));
-                        }
-                    }
-                    if enabled && r.clicked() {
-                        if let Some(a) = row.act {
-                            action = Some(a);
-                        }
-                    }
-                    y += CTX_ROW_H;
-                }
-            });
-
-        // 子菜单（鼠标悬停或键盘 →/Enter 打开；键盘焦点优先）
-        let sub_show = sub_req.or_else(|| {
-            sub.filter(|&i| rows.get(i).is_some_and(|r| r.enabled && !r.children.is_empty()))
-                .map(|i| (i, ctx_row_top(&rows, i, pos.y + 4.0)))
-        });
-        if let Some((idx, top)) = sub_show {
-            let kids = &rows[idx].children;
-            let w = 172.0;
-            let hh = kids.len() as f32 * CTX_ROW_H + 8.0;
-            let mut sp = egui::pos2(pos.x + CTX_W - 2.0, top - 3.0);
-            if sp.x + w > screen.right() - 4.0 {
-                sp.x = (pos.x - w).max(screen.left() + 4.0);
-            }
-            if sp.y + hh > screen.bottom() - 4.0 {
-                // 下方放不下时放到父项上方，避免盖住父菜单的可点击行
-                sp.y = (top - hh + 3.0).max(screen.top() + 4.0);
-            }
-            if sub.is_none() {
-                sub = Some(idx);
-            }
-            if !ctx_row_focusable(kids, sub_key) {
-                sub_key = next_ctx_row(kids, kids.len().saturating_sub(1), 1).unwrap_or(0);
-            }
-            egui::Area::new(egui::Id::new("ctx_sub_area"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(sp)
-                .show(ctx, |ui| {
-                    let rect = egui::Rect::from_min_size(sp, egui::vec2(w, hh));
-                    rects.push(rect);
-                    ui.allocate_rect(rect, egui::Sense::hover());
-                    let p = ui.painter().clone();
-                    p.rect_stroke(
-                        rect.expand(1.5),
-                        9.5,
-                        egui::Stroke::new(3.0, egui::Color32::from_black_alpha(12)),
-                        egui::StrokeKind::Outside,
-                    );
-                    p.rect_filled(rect, 8.0, egui::Color32::WHITE);
-                    p.rect_stroke(
-                        rect,
-                        8.0,
-                        egui::Stroke::new(1.0, ui_kit::CARD_BORDER),
-                        egui::StrokeKind::Inside,
-                    );
-                    let mut y = sp.y + 4.0;
-                    for (k, kid) in kids.iter().enumerate() {
-                        let ken = kid.enabled;
-                        let rr = egui::Rect::from_min_size(
-                            egui::pos2(sp.x, y),
-                            egui::vec2(w, CTX_ROW_H),
-                        );
-                        let r = ui.interact(
-                            rr,
-                            egui::Id::new(("ctx_sub_row", k)),
-                            if ken { egui::Sense::click() } else { egui::Sense::hover() },
-                        );
-                        if ken && (r.hovered() || sub_key == k) {
-                            p.rect_filled(rr.shrink2(egui::vec2(5.0, 1.0)), 5.0, hover_bg);
-                        }
-                        let mut text_x = sp.x + 14.0;
-                        if let Some(rgb) = kid.swatch {
-                            let sw = egui::Rect::from_min_size(
-                                egui::pos2(sp.x + 12.0, y + 6.0),
-                                egui::vec2(14.0, 14.0),
-                            );
-                            p.rect_filled(sw, 1.0, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
-                            p.rect_stroke(
-                                sw,
-                                1.0,
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 150, 150)),
-                                egui::StrokeKind::Inside,
-                            );
-                            text_x = sp.x + 34.0;
-                        }
-                        p.text(
-                            egui::pos2(text_x, y + CTX_ROW_H / 2.0),
-                            egui::Align2::LEFT_CENTER,
-                            kid.label,
-                            egui::FontId::proportional(12.0),
-                            if ken { fg } else { disabled_fg },
-                        );
-                        if ken && r.clicked() {
-                            if let Some(a) = kid.act {
-                                action = Some(a);
-                            }
-                        }
-                        y += CTX_ROW_H;
-                    }
-                });
-        }
-
-        self.ctx_rects = rects;
-        if kind0 == CtxKind::Cell {
-            let menu_rect = egui::Rect::from_min_size(pos, egui::vec2(CTX_W, total_h));
-            self.draw_mini_toolbar(ctx, menu_rect);
-        }
-        if let Some(a) = action {
-            self.ctx_menu = None;
-            self.ctx_menu_run(a, idx0, ctx);
-            ctx.request_repaint();
-            return;
-        }
-        // 点到菜单外面（打开那一帧的点击不算）；键盘 Esc 已在上面逐级处理
-        let now_frame = ctx.cumulative_pass_nr();
-        let click_out = ctx.input(|i| {
-            i.pointer.any_click()
-                && i.pointer
-                    .interact_pos()
-                    .map(|p| !self.ctx_rects.iter().any(|r| r.contains(p)))
-                    .unwrap_or(false)
-        });
-        if (click_out && now_frame != opened_frame) || now_frame > opened_frame + 1 && click_out {
-            self.ctx_menu = None;
-            ctx.request_repaint();
-        }
-        // 子菜单：鼠标悬停优先；键盘打开的子菜单保持，Esc/← 后不因指针仍在父项而重开
-        if let Some(m) = self.ctx_menu.as_mut() {
-            if !suppress_sub {
-                if let Some((i, _)) = sub_req {
-                    sub = Some(i);
-                    sub_key = rows
-                        .get(i)
-                        .and_then(|r| next_ctx_row(&r.children, r.children.len().saturating_sub(1), 1))
-                        .unwrap_or(0);
-                }
-            }
-            m.sub = sub;
-            m.key = key;
-            m.sub_key = sub_key;
-        }
     }
 
     /// 执行右键菜单动作
@@ -52607,6 +52042,35 @@ pub(crate) fn dlg_col(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui)
             add(ui);
         },
     );
+}
+
+fn dv_text(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+    ui_kit::field(ui, label, |ui| {
+        let edit = ui_kit::text_input(ui, value, hint);
+        let _ = ui.ctx().accesskit_node_builder(edit.id, |node| node.set_label(label));
+    });
+}
+
+fn dv_choice<T: Copy + PartialEq>(
+    ui: &mut egui::Ui, label: &str, value: &mut T, choices: &[T], name: fn(&T) -> &'static str,
+) {
+    ui_kit::field(ui, label, |ui| {
+        let combo = egui::ComboBox::from_id_salt(label)
+            .selected_text(name(value))
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                let pal = theme::palette();
+                ui.visuals_mut().selection.bg_fill = pal.accent_tint;
+                ui.visuals_mut().selection.stroke.color = pal.text;
+                for choice in choices {
+                    ui.selectable_value(value, *choice, name(choice));
+                }
+            });
+        let _ = ui.ctx().accesskit_node_builder(combo.response.id, |node| {
+            node.set_label(label);
+            node.set_value(name(value));
+        });
+    });
 }
 
 /// 对话框的小节标题（细线 + 强调色小字）

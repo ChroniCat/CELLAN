@@ -776,6 +776,8 @@
           <box boxStyle="vertical" paddingTop="0" gap="2">
             <toggleButton id="ShowFormulas" label="显示公式" imageMso="FormulaView" screentip="Ctrl+` 切换公式/结果" onAction="ShowFormulas" sizeString="96" keytip="H"/>
             <button id="ErrorChecking" label="错误检查" imageMso="ErrorCheck" screentip="扫 #DIV/0! 之类的错误" onAction="ErrorChecking" sizeString="96"/>
+          </box>
+          <box boxStyle="vertical">
             <button id="EvaluateFormula" label="公式求值" imageMso="Calc" screentip="逐步查看公式计算过程" onAction="EvaluateFormula" sizeString="96"/>
             <button id="WatchWindow" label="监视窗口" imageMso="WatchPane" onAction="WatchWindow" sizeString="96" keytip="W"/>
           </box>
@@ -1036,6 +1038,8 @@
             <box boxStyle="vertical">
               <button id="TableSelect" label="选择表格" imageMso="Table" screentip="选中整个表格区域" onAction="TableSelect" sizeString="100"/>
               <button id="TablePivot" label="数据透视表" imageMso="Pivot" screentip="按这个表格新建透视表" onAction="TablePivot" sizeString="100"/>
+            </box>
+            <box boxStyle="vertical">
               <button id="TableToRange" label="转换为区域" imageMso="TableToRange" screentip="保留单元格内容，去掉表格对象" onAction="TableToRange" sizeString="100"/>
               <button id="TableFillCalculated" label="填充计算列" imageMso="Fill" screentip="把该列已有的计算列公式填到其余数据行" onAction="TableFillCalculated" sizeString="100"/>
             </box>

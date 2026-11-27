@@ -1479,6 +1479,15 @@ pub fn error_text(dv: &DataValidation) -> String {
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+fn validation_attribute(key: &str, raw: &str) -> String {
+    if matches!(key, "promptTitle" | "prompt" | "errorTitle" | "error") {
+        if let Ok(text) = quick_xml::escape::unescape(raw) {
+            return text.into_owned();
+        }
+    }
+    crate::model::xml_unescape(raw)
+}
+
 pub fn parse_validations(xml: &str) -> Vec<DataValidation> {
     let mut out: Vec<DataValidation> = Vec::new();
     let mut r = Reader::from_str(xml);
@@ -1494,7 +1503,7 @@ pub fn parse_validations(xml: &str) -> Vec<DataValidation> {
                 let mut show_dropdown_attr: Option<bool> = None;
                 for a in e.attributes().flatten() {
                     let k = a.key.as_ref().to_string();
-                    let v = crate::model::xml_unescape(&a.value.to_string());
+                    let v = validation_attribute(&k, a.value.as_ref());
                     match k.as_str() {
                         "type" => dv.kind = DvKind::from_xml(&v),
                         "operator" => dv.op = DvOp::from_xml(&v),
@@ -1525,7 +1534,7 @@ pub fn parse_validations(xml: &str) -> Vec<DataValidation> {
                 let mut show_dropdown_attr: Option<bool> = None;
                 for a in e.attributes().flatten() {
                     let k = a.key.as_ref().to_string();
-                    let v = crate::model::xml_unescape(&a.value.to_string());
+                    let v = validation_attribute(&k, a.value.as_ref());
                     match k.as_str() {
                         "type" => dv.kind = DvKind::from_xml(&v),
                         "operator" => dv.op = DvOp::from_xml(&v),
@@ -1872,6 +1881,29 @@ mod tests {
         let mut ev2 = |_: &str, _: u32, _: u32| crate::formula::FValue::Bool(true);
         assert!(validate_wb(&wb, 0, &rel, &Value::Number(30.0), 2, 2, &mut ev2));
         assert!(!validate_wb(&wb, 0, &rel, &Value::Number(10.0), 2, 2, &mut ev2));
+    }
+
+    #[test]
+    fn prompt_and_error_text_preserve_numeric_references_and_literal_ampersands() {
+        let attributes = r#"type="whole" sqref="A1" promptTitle="&#24405;&#x5165;" prompt="&amp;#65; &#x1F4CA;" errorTitle="&#x8D85;&#20986;" error="A&amp;B&#10;&quot;C&quot;&#13;&#9;&amp;#x42;""#;
+        let xml = format!(
+            "<dataValidations><dataValidation {attributes}/><dataValidation {attributes}><formula1>1</formula1></dataValidation></dataValidations>"
+        );
+        let rules = parse_validations(&xml);
+        assert_eq!(rules.len(), 2);
+        for rule in &rules {
+            assert_eq!(rule.prompt_title, "录入");
+            assert_eq!(rule.prompt_msg, "&#65; 📊");
+            assert_eq!(rule.error_title, "超出");
+            assert_eq!(rule.error_msg, "A&B\n\"C\"\r\t&#x42;");
+        }
+        let saved = crate::patch::dv_xml(&rules);
+        let doc = roxmltree::Document::parse(&saved).unwrap();
+        for node in doc.descendants().filter(|node| node.has_tag_name("dataValidation")) {
+            assert_eq!(node.attribute("error"), Some(rules[0].error_msg.as_str()));
+            assert_eq!(node.attribute("prompt"), Some("&#65; 📊"));
+        }
+        assert_eq!(parse_validations(&saved), rules);
     }
 
     #[test]

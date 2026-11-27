@@ -1524,6 +1524,33 @@ fn pivot_refresh_recomputes_in_place() {
 }
 
 #[test]
+fn column_filter_flyout_fits_short_viewport_and_escape_closes_one_level() {
+    let _env = test_env::TestEnv::new("column-filter-flyout");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let sheet = app.wb.sheet_mut(0);
+    sheet.set(0, 0, sheetcore::model::Cell { value: Value::Text("金额".into()), formula: None });
+    sheet.set(1, 0, sheetcore::model::Cell { value: Value::Number(50.0), formula: None });
+    app.start_filter();
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(533.0, 320.0));
+    app.filter_popup = FilterPopup::open(app.wb.sheet(0), app.doc_gen, 0, screen.right_bottom());
+    app.filter_popup.as_mut().unwrap().ops_open = true;
+    let frame = |app: &mut SheetApp, events| {
+        let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+        let _ = ctx.run(input, |ctx| app.filter_dialog(ctx));
+    };
+    for _ in 0..4 { frame(&mut app, vec![]); }
+    let parent = ctx.memory(|m| m.area_rect(egui::Id::new("filter_dd"))).unwrap();
+    let child = ctx.memory(|m| m.area_rect(egui::Id::new("filter_ops"))).unwrap();
+    assert!(screen.contains_rect(parent) && screen.contains_rect(child), "{parent:?} {child:?}");
+    assert!(child.right() <= parent.left(), "{parent:?} {child:?}");
+    frame(&mut app, vec![esc_event()]);
+    assert!(!app.filter_popup.as_ref().unwrap().ops_open);
+    frame(&mut app, vec![esc_event()]);
+    assert!(app.filter_popup.is_none());
+}
+
+#[test]
 fn plain_range_filter_opens_from_header_arrow() {
     let ctx = egui::Context::default();
     let mut app = SheetApp::new_with_context(&ctx, None);
@@ -3367,9 +3394,9 @@ fn ctx_menu_rows_match_excel_cell_menu() {
         [
             "剪切", "复制", "粘贴", "选择性粘贴…", "插入", "删除", "清除内容",
             "筛选", "排序", "合并单元格", "取消合并", "插入/编辑批注", "删除批注",
-            "设置单元格格式…", "超链接…"
+            "设置单元格格式…", "超链接…", "查看此格修改溯源 (审计)…"
         ],
-        "条目与顺序按 WPS 单元格右键菜单（含合并与批注）"
+        "条目包含标准操作与 CELLAN 的修改溯源入口"
     );
     // 四个子菜单
     let parents: Vec<&str> = rows.iter().filter(|r| !r.children.is_empty()).map(|r| r.label).collect();
@@ -3381,7 +3408,7 @@ fn ctx_menu_rows_match_excel_cell_menu() {
     // 高度：246 宽、行高 26
     assert_eq!(CTX_W, 246.0);
     assert_eq!(CTX_ROW_H, 26.0);
-    assert!(ctx_menu_height(&rows) > 300.0 && ctx_menu_height(&rows) < 480.0);
+    assert_eq!(ctx_menu_height(&rows), 506.0);
 }
 
 #[test]
@@ -8963,6 +8990,7 @@ fn run_ctx_menu(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event
 /// UI-23：Shift+F10 打开菜单；方向键/Enter 执行；Esc 逐级退回；边缘菜单不出窗。
 #[test]
 fn shift_f10_menu_supports_keyboard_and_window_edges() {
+    let _env = crate::test_env::TestEnv::new("cell-menu-keyboard-edges");
     let ctx = egui::Context::default();
     let mut app = app();
     app.wb.sheet_mut(0).set(0, 0, text("甲"));
@@ -8999,7 +9027,7 @@ fn shift_f10_menu_supports_keyboard_and_window_edges() {
         assert!(r.right() <= 800.0 && r.bottom() <= 600.0, "子菜单越右/下界: {r:?}");
     }
     let parent = app.ctx_rects[0];
-    let submenu = *app.ctx_rects.last().unwrap();
+    let submenu = app.ctx_rects[1];
     assert!(
         parent.intersect(submenu).area() <= 0.0,
         "子菜单不能盖住父菜单可点击区域: parent={parent:?} sub={submenu:?}"
@@ -9009,10 +9037,14 @@ fn shift_f10_menu_supports_keyboard_and_window_edges() {
         m.key = 0;
     }
 
-    // 从 Cut 走 6 次 Down 到“清除内容”，Enter 执行
-    for _ in 0..6 {
+    let rows = app.cell_ctx_menu_rows();
+    // 剪贴板为空时跳过不可用的粘贴命令，直接到达可操作的插入、删除和清除项。
+    let mut visited = Vec::new();
+    for _ in 0..4 {
         run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, false)]);
+        visited.push(rows[app.ctx_menu.as_ref().unwrap().key].label);
     }
+    assert_eq!(visited, ["复制", "插入", "删除", "清除内容"]);
     run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::Enter, false)]);
     assert!(app.ctx_menu.is_none(), "Enter 执行后菜单关闭");
     assert!(
@@ -9024,6 +9056,7 @@ fn shift_f10_menu_supports_keyboard_and_window_edges() {
 /// UI-23：子菜单 Right 展开、Esc 只退一级，再次 Esc 关闭整个菜单。
 #[test]
 fn context_submenu_escape_steps_back_one_level() {
+    let _env = crate::test_env::TestEnv::new("cell-submenu-escape");
     let ctx = egui::Context::default();
     let mut app = app();
     app.ctx_menu = Some(CtxMenuState {
@@ -9035,8 +9068,8 @@ fn context_submenu_escape_steps_back_one_level() {
         key: 0,
         sub_key: 0,
     });
-    // Cut→Copy→Paste→选择性粘贴→插入（父项，索引 7）
-    for _ in 0..4 {
+    // 空剪贴板时 Cut→Copy→插入（父项，索引 7）
+    for _ in 0..2 {
         run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::ArrowDown, false)]);
     }
     run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::ArrowRight, false)]);
@@ -9046,6 +9079,60 @@ fn context_submenu_escape_steps_back_one_level() {
     assert!(m.sub.is_none(), "第一次 Esc 只收起子菜单");
     run_ctx_menu(&mut app, &ctx, vec![key_event(egui::Key::Escape, false)]);
     assert!(app.ctx_menu.is_none(), "第二次 Esc 关闭菜单");
+}
+
+#[test]
+fn context_menu_scrolls_to_end_and_keeps_child_selection_on_idle_frames() {
+    let _env = crate::test_env::TestEnv::new("context-menu-compact-keys");
+    let ctx = egui::Context::default();
+    let mut app = SheetApp::new_with_context(&ctx, None);
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(590.0, 330.0));
+    app.ctx_menu = Some(CtxMenuState {
+        pos: screen.max, frame: 0, sub: None, kind: CtxKind::Cell, idx: 0, key: 0, sub_key: 0,
+    });
+    let render = |app: &mut SheetApp, events| ctx.run(
+        egui::RawInput { screen_rect: Some(screen), events, ..Default::default() },
+        |ctx| app.ctx_menu_window(ctx),
+    );
+    render(&mut app, vec![]);
+    render(&mut app, vec![key_event(egui::Key::End, false)]);
+    // ScrollArea resolves the request after layout, then uses the new offset on the next pass.
+    render(&mut app, vec![]);
+    let output = render(&mut app, vec![]);
+    let rows = app.cell_ctx_menu_rows();
+    let last = rows.last().unwrap().label;
+    assert_eq!(rows[app.ctx_menu.as_ref().unwrap().key].label, last);
+    let painted = output.shapes.iter().filter_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text == last => {
+            Some((text.visual_bounding_rect(), shape.clip_rect))
+        }
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert!(painted.iter().any(|(rect, clip)| rect.is_positive() && clip.contains_rect(*rect) && screen.contains_rect(*rect)),
+        "End should reveal the entire last label: {painted:?}, last={last:?}");
+
+    render(&mut app, vec![key_event(egui::Key::Home, false)]);
+    let insert = rows.iter().position(|r| r.children.len() > 1 && r.enabled).unwrap();
+    for _ in 0..rows.len() {
+        if app.ctx_menu.as_ref().unwrap().key == insert { break; }
+        render(&mut app, vec![key_event(egui::Key::ArrowDown, false)]);
+    }
+    assert_eq!(app.ctx_menu.as_ref().unwrap().key, insert);
+    render(&mut app, vec![key_event(egui::Key::ArrowRight, false)]);
+    render(&mut app, vec![key_event(egui::Key::ArrowDown, false)]);
+    render(&mut app, vec![]);
+    render(&mut app, vec![]);
+    let menu = app.ctx_menu.as_ref().unwrap();
+    assert_eq!((menu.sub, menu.sub_key), (Some(insert), 1));
+    assert!(app.ctx_rects.len() >= 2);
+    for (i, panel) in app.ctx_rects.iter().enumerate() {
+        assert!(screen.contains_rect(*panel));
+        assert!(app.ctx_rects[..i].iter().all(|other| !panel.intersect(*other).is_positive()),
+            "菜单内面板不能重叠：{:?}", app.ctx_rects);
+    }
+    render(&mut app, vec![key_event(egui::Key::Escape, false)]);
+    render(&mut app, vec![]);
+    assert!(app.ctx_menu.as_ref().unwrap().sub.is_none());
 }
 
 #[test]

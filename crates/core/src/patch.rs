@@ -871,17 +871,17 @@ pub fn dv_xml(list: &[crate::dv::DataValidation]) -> String {
         if d.error_style != crate::dv::DvStyle::Stop {
             out.push_str(&format!(" errorStyle=\"{}\"", d.error_style.to_xml()));
         }
-        if !d.error_title.is_empty() {
-            out.push_str(&format!(" errorTitle=\"{}\"", esc(&d.error_title)));
-        }
-        if !d.error_msg.is_empty() {
-            out.push_str(&format!(" error=\"{}\"", esc(&d.error_msg)));
-        }
-        if !d.prompt_title.is_empty() {
-            out.push_str(&format!(" promptTitle=\"{}\"", esc(&d.prompt_title)));
-        }
-        if !d.prompt_msg.is_empty() {
-            out.push_str(&format!(" prompt=\"{}\"", esc(&d.prompt_msg)));
+        for (name, text) in [
+            ("errorTitle", &d.error_title),
+            ("error", &d.error_msg),
+            ("promptTitle", &d.prompt_title),
+            ("prompt", &d.prompt_msg),
+        ] {
+            if !text.is_empty() {
+                // XML 属性中的字面换行和制表符会在读取时折叠为空格。
+                let value = esc(text).replace('\n', "&#10;").replace('\r', "&#13;").replace('\t', "&#9;");
+                out.push_str(&format!(" {name}=\"{value}\""));
+            }
         }
         let f1 = match d.kind {
             DvKind::List => {

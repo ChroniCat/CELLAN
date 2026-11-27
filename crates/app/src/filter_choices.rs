@@ -298,25 +298,36 @@ impl Choices {
 fn checkbox(ui: &mut egui::Ui, label: &str, checked: bool, mixed: bool) -> bool {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+    let pal = theme::palette();
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, checked, label));
+    if mixed {
+        let _ = ui.ctx().accesskit_node_builder(resp.id, |node| node.set_toggled(egui::accesskit::Toggled::Mixed));
+    }
+    if mixed {
+        let _ = ui.ctx().accesskit_node_builder(resp.id, |node| node.set_toggled(egui::accesskit::Toggled::Mixed));
+    }
     let p = ui.painter();
-    if resp.hovered() {
-        p.rect_filled(rect, 0.0, egui::Color32::from_rgb(229, 241, 251));
+    if resp.hovered() || resp.is_pointer_button_down_on() {
+        let bg = if resp.is_pointer_button_down_on() { pal.pressed } else { pal.hover };
+        p.rect_filled(rect.shrink2(egui::vec2(2.0, 0.0)), 3.0, bg);
     }
     let boxr = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 6.0, rect.center().y - 6.0),
         egui::vec2(12.0, 12.0),
     );
-    p.rect_filled(boxr, 0.0, egui::Color32::WHITE);
+    let selected = checked || mixed;
+    let ink = if pal.theme.is_dark() { egui::Color32::BLACK } else { egui::Color32::WHITE };
+    p.rect_filled(boxr, 2.0, if selected { pal.accent } else { pal.card_bg });
     p.rect_stroke(
         boxr,
-        0.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 120, 120)),
+        2.0,
+        egui::Stroke::new(1.0, if selected { pal.accent } else { pal.text_muted }),
         egui::StrokeKind::Inside,
     );
     if mixed {
-        p.rect_filled(boxr.shrink(3.0), 0.0, ui_kit::TEXT);
+        p.rect_filled(egui::Rect::from_center_size(boxr.center(), egui::vec2(7.0, 1.5)), 0.0, ink);
     } else if checked {
-        let stroke = egui::Stroke::new(1.6, ui_kit::TEXT);
+        let stroke = egui::Stroke::new(1.6, ink);
         let mid = egui::pos2(boxr.left() + 5.0, boxr.bottom() - 3.0);
         p.line_segment(
             [egui::pos2(boxr.left() + 2.5, boxr.center().y), mid],
@@ -332,8 +343,12 @@ fn checkbox(ui: &mut egui::Ui, label: &str, checked: bool, mixed: bool) -> bool 
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(12.0),
-        ui_kit::TEXT,
+        pal.text,
     );
+    ui_kit::focus_ring(ui, &resp, rect.shrink(1.0), 3.0);
+    if resp.gained_focus() {
+        resp.scroll_to_me(None);
+    }
     resp.clicked()
 }
 

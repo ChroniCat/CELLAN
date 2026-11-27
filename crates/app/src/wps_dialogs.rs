@@ -118,31 +118,37 @@ impl SheetApp {
         let screen = ctx.screen_rect();
         let w = 268.0f32;
         let h = 64.0f32;
-        let mut x = menu_rect
-            .left()
-            .clamp(screen.left() + 6.0, (screen.right() - w - 6.0).max(screen.left() + 6.0));
-        let y = if menu_rect.top() - h - 8.0 >= screen.top() + 6.0 {
-            menu_rect.top() - h - 8.0
-        } else if menu_rect.bottom() + h + 8.0 <= screen.bottom() - 6.0 {
-            menu_rect.bottom() + 8.0
-        } else {
-            // 窗口较矮导致上下均放不下时，避让到右键菜单右/左侧，绝不遮盖菜单底部的批注/合并条目
-            if menu_rect.right() + w + 8.0 <= screen.right() - 6.0 {
-                x = menu_rect.right() + 8.0;
-            } else if menu_rect.left() - w - 8.0 >= screen.left() + 6.0 {
-                x = menu_rect.left() - w - 8.0;
-            }
-            menu_rect
-                .top()
-                .clamp(screen.top() + 6.0, (screen.bottom() - h - 6.0).max(screen.top() + 6.0))
+        let size = Vec2::new(w, h);
+        let bounds = screen.shrink(6.0);
+        if bounds.width() < w || bounds.height() < h {
+            return;
+        }
+        let x = menu_rect.left().clamp(bounds.left(), bounds.right() - w);
+        let y = menu_rect.top().clamp(bounds.top(), bounds.bottom() - h);
+        let right = menu_rect.right() + 8.0;
+        let left = menu_rect.left() - w - 8.0;
+        let positions = [
+            egui::pos2(x, menu_rect.top() - h - 8.0),
+            egui::pos2(x, menu_rect.bottom() + 8.0),
+            egui::pos2(right, y),
+            egui::pos2(left, y),
+            egui::pos2(right, bounds.bottom() - h),
+            egui::pos2(left, bounds.bottom() - h),
+        ];
+        let Some(mini_rect) = positions.into_iter().map(|p| Rect::from_min_size(p, size)).find(|r| {
+            bounds.contains_rect(*r) && !r.intersects(menu_rect)
+                && !self.ctx_rects.iter().any(|visible| r.intersects(*visible))
+        }) else {
+            return;
         };
-        let mini_rect = Rect::from_min_size(egui::pos2(x, y), Vec2::new(w, h));
         self.ctx_rects.push(mini_rect);
 
         let cur = self.current_style();
+        let session = self.ctx_menu.as_ref().map(|m| m.frame);
         let font_pop_id = egui::Id::new("wps_mini_font_pop");
-        let size_pop_id = egui::Id::new("wps_mini_size_pop");
-        let mut pop_mode = ctx.data_mut(|d| d.get_temp::<u8>(font_pop_id).unwrap_or(0));
+        let size_pop_id = font_pop_id.with("choices");
+        let mut pop_mode = ctx.data_mut(|d| d.get_temp::<(Option<u64>, u8)>(font_pop_id))
+            .filter(|(opened, _)| *opened == session).map_or(0, |(_, mode)| mode);
 
         let mut act: Option<String> = None;
         let mut set_font: Option<String> = None;
@@ -156,19 +162,10 @@ impl SheetApp {
             .order(egui::Order::Foreground)
             .fixed_pos(mini_rect.min)
             .show(ctx, |ui| {
-                egui::Frame::NONE
-                    .fill(pal.card_bg)
-                    .stroke(Stroke::new(1.0, pal.card_border))
-                    .corner_radius(8.0)
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 4],
-                        blur: 14,
-                        spread: 0,
-                        color: Color32::from_black_alpha(26),
-                    })
+                ui_kit::popup_frame(ui.style())
                     .inner_margin(egui::Margin::symmetric(6, 5))
                     .show(ui, |ui| {
-                        ui.set_min_size(Vec2::new(w - 12.0, h - 10.0));
+                        ui.set_min_size(Vec2::new(w - 14.0, h - 12.0));
                         ui.spacing_mut().item_spacing = Vec2::new(2.0, 4.0);
 
                         // Row 1: 字体(74) + 字号(40) + A+(21) + A-(21) + B(22) + I(22) + U(22) = 222 + 12 = 234
@@ -298,16 +295,7 @@ impl SheetApp {
                 .order(egui::Order::Foreground)
                 .fixed_pos(pop_pos)
                 .show(ctx, |ui| {
-                    egui::Frame::NONE
-                        .fill(pal.card_bg)
-                        .stroke(Stroke::new(1.0, pal.card_border))
-                        .corner_radius(6.0)
-                        .shadow(egui::epaint::Shadow {
-                            offset: [0, 4],
-                            blur: 12,
-                            spread: 0,
-                            color: Color32::from_black_alpha(28),
-                        })
+                    ui_kit::popup_frame(ui.style())
                         .inner_margin(egui::Margin::same(4))
                         .show(ui, |ui| {
                             ui.set_width(pop_w);
@@ -335,7 +323,7 @@ impl SheetApp {
             self.ctx_rects.push(pr.response.rect);
         }
 
-        ctx.data_mut(|d| d.insert_temp::<u8>(font_pop_id, pop_mode));
+        ctx.data_mut(|d| d.insert_temp(font_pop_id, (session, pop_mode)));
 
         if let Some(a) = act {
             self.ribbon_action(&a, ctx);

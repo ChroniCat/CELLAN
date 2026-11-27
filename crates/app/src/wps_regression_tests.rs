@@ -9,6 +9,156 @@ fn wps_app(ctx: &egui::Context) -> SheetApp {
     app
 }
 
+fn compact_dialog_frame(
+    app: &mut SheetApp, ctx: &egui::Context, dialog: fn(&mut SheetApp, &egui::Context),
+    screen: Rect, events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    let mut input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+    input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(1.5);
+    ctx.run(input, |ctx| dialog(app, ctx))
+}
+
+fn dialog_control(out: &egui::FullOutput, role: egui::accesskit::Role, label: &str) -> Rect {
+    let update = out.platform_output.accesskit_update.as_ref().unwrap();
+    let node = update.nodes.iter().map(|(_, n)| n).find(|n| n.role() == role && n.label() == Some(label))
+        .unwrap_or_else(|| panic!("找不到 {role:?} 控件 {label}"));
+    let b = node.bounds().unwrap();
+    Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))
+}
+
+#[test]
+fn compact_validation_pages_preserve_the_draft_and_cancel_resets_the_next_session() {
+    use egui::accesskit::Role;
+    let _env = crate::test_env::TestEnv::new("validation-dialog-pages");
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    ctx.enable_accesskit();
+    let rule = sheetcore::dv::DataValidation {
+        kind: sheetcore::dv::DvKind::Whole, f1: "1".into(), f2: "100".into(),
+        prompt_title: "提示".into(), error_msg: "超出范围".into(), ..Default::default()
+    };
+    app.dv_edit = Some(rule.clone());
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(600.0, 420.0));
+    let frame = |app: &mut SheetApp, events| compact_dialog_frame(app, &ctx, SheetApp::dv_dialog, screen, events);
+    let click = |app: &mut SheetApp, rect: Rect| {
+        let pos = rect.center();
+        for pressed in [true, false] {
+            let _ = frame(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        frame(app, vec![])
+    };
+    let _ = frame(&mut app, vec![]);
+    let mut out = frame(&mut app, vec![]);
+    let mut expected = rule.clone();
+    assert!(screen.contains_rect(dialog_control(&out, Role::TextInput, "最大值")));
+    for (page, field) in [("输入提示", "提示内容"), ("出错警告", "出错说明")] {
+        out = click(&mut app, dialog_control(&out, Role::Tab, page));
+        let input = dialog_control(&out, Role::TextInput, field);
+        assert!(screen.contains_rect(input));
+        if page == "输入提示" {
+            let _ = click(&mut app, input);
+            out = frame(&mut app, vec![egui::Event::Text("新提示".into())]);
+            expected.prompt_msg = "新提示".into();
+        }
+        assert!(screen.contains_rect(dialog_control(&out, Role::Button, "确定")));
+        assert_eq!(app.dv_edit.as_ref().unwrap(), &expected);
+    }
+    let _ = click(&mut app, dialog_control(&out, Role::Button, "取消"));
+    assert!(app.dv_edit.is_none());
+    assert!(app.wb.sheet(0).dv.is_empty());
+    app.dv_edit = Some(rule);
+    let _ = frame(&mut app, vec![]);
+    let out = frame(&mut app, vec![]);
+    assert!(screen.contains_rect(dialog_control(&out, Role::TextInput, "最小值")));
+}
+
+#[test]
+fn compact_cf_manager_keeps_long_formulas_and_rule_actions_inside_the_window() {
+    use egui::accesskit::Role;
+    use sheetcore::cf::{CfBlock, CfKind, CfRule};
+    let _env = crate::test_env::TestEnv::new("cf-manager-long-formula");
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    ctx.enable_accesskit();
+    let formula = format!("AND({})", ["A1>AVERAGE($A$1:$D$20)"; 6].join(","));
+    app.wb.sheet_mut(0).cf.blocks = vec![CfBlock {
+        ranges: vec![(0, 0, 2, 2)],
+        rules: vec![CfRule { kind: CfKind::Expr { formula, dxf: 0 }, stop: false, priority: 1 }],
+    }];
+    app.cf_mgr = true;
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(520.0, 380.0));
+    let _ = compact_dialog_frame(&mut app, &ctx, SheetApp::cf_manager, screen, vec![]);
+    let out = compact_dialog_frame(&mut app, &ctx, SheetApp::cf_manager, screen, vec![]);
+    let formula = out.shapes.iter().find_map(|s| match &s.shape {
+        egui::Shape::Text(t) if t.galley.text().contains("AVERAGE") => Some(t),
+        _ => None,
+    }).expect("条件公式应可见");
+    assert!(formula.galley.rows.len() > 1 && !formula.galley.elided);
+    assert!(screen.contains_rect(formula.visual_bounding_rect()));
+    for label in ["新建规则", "编辑", "删除"] {
+        let rect = dialog_control(&out, Role::Button, label);
+        assert!(screen.contains_rect(rect), "{label}: {rect:?}");
+    }
+    let tree = out.platform_output.accesskit_update.unwrap();
+    for label in ["上移", "下移"] {
+        let node = tree.nodes.iter().map(|(_, n)| n).find(|n| n.label() == Some(label)).unwrap();
+        assert!(node.is_disabled(), "仅一块规则时应禁用{label}");
+    }
+}
+
+#[test]
+fn compact_right_click_opens_the_row_column_and_sheet_menus_at_native_scale() {
+    let _env = crate::test_env::TestEnv::new("compact-context-menu-pointers");
+    let ctx = egui::Context::default();
+    let mut app = wps_app(&ctx);
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(600.0, 580.0 / 1.5));
+    let mut host = eframe::Frame::_new_kittest();
+    let mut render = |app: &mut SheetApp, events| {
+        let mut input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(1.5);
+        ctx.run(input, |ctx| eframe::App::update(app, ctx, &mut host))
+    };
+    let _ = render(&mut app, vec![]);
+    let out = render(&mut app, vec![]);
+    let center_of = |text: &str| out.shapes.iter().find_map(|s| match &s.shape {
+        egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect().center()),
+        _ => None,
+    }).unwrap_or_else(|| panic!("未绘制 {text}"));
+    let sheet = center_of(&app.wb.sheet(0).name);
+    for (pos, expected) in [(center_of("2"), CtxKind::Rows), (center_of("F"), CtxKind::Cols), (sheet, CtxKind::Tab)] {
+        let _ = render(&mut app, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            let _ = render(&mut app, vec![egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        let _ = render(&mut app, vec![]);
+        let menu = app.ctx_menu.as_ref().expect("右键应打开菜单");
+        assert_eq!(menu.kind, expected);
+        assert!(app.ctx_rects.iter().all(|rect| screen.contains_rect(*rect)));
+        assert_eq!(app.ctx_rects.len(), 1, "行、列和工作表菜单不应附加迷你工具栏");
+        if expected == CtxKind::Tab {
+            for key in [egui::Key::End, egui::Key::ArrowUp, egui::Key::ArrowRight, egui::Key::Escape] {
+                let _ = render(&mut app, vec![egui::Event::Key {
+                    key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                }]);
+                let menu = app.ctx_menu.as_ref().expect("离开颜色子菜单后仍应显示工作表菜单");
+                let rows = ctx_tab_rows();
+                if key == egui::Key::End {
+                    assert_eq!(menu.key, rows.len() - 1);
+                } else {
+                    assert_eq!(rows[menu.key].label, "工作表标签颜色");
+                    assert_eq!(menu.sub.is_some(), key == egui::Key::ArrowRight);
+                }
+            }
+        }
+        app.ctx_menu = None;
+        let _ = render(&mut app, vec![]);
+    }
+}
+
 fn wps_frame(app: &mut SheetApp, ctx: &egui::Context, events: Vec<egui::Event>, modifiers: egui::Modifiers) {
     let raw = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
