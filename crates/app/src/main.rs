@@ -20,6 +20,7 @@ mod border_brush;
 use border_brush::{BorderBrush, BorderHit};
 mod data_reorder;
 mod cell_shift;
+mod tx_exec;
 mod validation;
 mod find_navigation;
 mod formula_edit;
@@ -12147,18 +12148,28 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if !self.can_change_sheets() {
             return false;
         }
-        if self.wb.sheets.get(idx).is_some_and(|sheet| sheet.name == name) {
+        let trimmed = name.trim();
+        if self.wb.sheets.get(idx).is_some_and(|sheet| sheet.name == trimmed) {
             return true;
         }
         let focus = (self.sheet_idx, self.sel.0, self.sel.1);
-        if !self.undo.rename_sheet(&mut self.wb, idx, name, focus) {
-            self.status = "工作表名称无效或已存在".into();
-            return false;
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Rename {
+                index: idx,
+                name: name.to_string(),
+            },
+        );
+        match self.execute_local_tx(intent, None, focus) {
+            Ok(_) => {
+                self.status = format!("已重命名为 {trimmed}");
+                true
+            }
+            Err(sheetcore::tx::TxError::NoOp) => true,
+            Err(_) => {
+                self.status = "工作表名称无效或已存在".into();
+                false
+            }
         }
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
-        self.status = format!("已重命名为 {name}");
-        true
     }
 
     fn add_sheet(&mut self) {
@@ -12173,15 +12184,15 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             k += 1;
             name = format!("Sheet{k}");
         }
-        let index = self.wb.sheets.len();
-        if !sheetcore::sheet_ops::insert_sheet(&mut self.wb, index, sheetcore::model::Sheet::new(&name)) {
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Append {
+                sheet: sheetcore::model::Sheet::new(&name),
+            },
+        );
+        if self.execute_local_tx(intent, None, prev_focus).is_err() {
             self.status = "无法创建工作表：名称无效或已存在".into();
             return;
         }
-        self.undo.record_appended_sheet(&self.wb, prev_focus);
-        self.switch_sheet_view(index);
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
         self.status = format!("已新建 {name}");
     }
 
@@ -12194,25 +12205,13 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return;
         }
         let name = self.wb.sheets[idx].name.clone();
-        let deleted_id = self.wb.sheet(idx).identity;
         let prev_focus = (self.sheet_idx, self.sel.0, self.sel.1);
-        let was_current = self.sheet_idx == idx;
-        if was_current {
-            self.remember_sheet_view();
-        }
-        if !self.undo.delete_sheet(&mut self.wb, idx, prev_focus) {
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Delete { index: idx },
+        );
+        if self.execute_local_tx(intent, None, prev_focus).is_err() {
             return;
         }
-        self.sheet_views.remove(&deleted_id);
-        if self.sheet_idx > idx {
-            self.sheet_idx -= 1;
-        }
-        self.sheet_idx = self.sheet_idx.min(self.wb.sheets.len() - 1);
-        if was_current {
-            self.load_sheet_view(self.sheet_idx);
-        }
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
         self.status = format!("已删除 {name}（可 Ctrl+Z 撤销）");
     }
 
@@ -12233,16 +12232,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return false;
         }
         let prev_focus = (self.sheet_idx, self.sel.0, self.sel.1);
-        let active_id = self.wb.sheet(self.sheet_idx).identity;
-        if !self.undo.move_sheet(&mut self.wb, from, to, prev_focus) {
-            return false;
-        }
-        if let Some(new_idx) = self.wb.sheets.iter().position(|s| s.identity == active_id) {
-            self.sheet_idx = new_idx;
-        }
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
-        true
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Move { from, to },
+        );
+        self.execute_local_tx(intent, None, prev_focus).is_ok()
     }
 
     /// 撤销 / 重做
@@ -12436,6 +12429,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         } else {
             self.undo.top_undo_id()
         };
+        let prev_sheet_id = self.wb.sheets.get(self.sheet_idx).map(|s| s.identity);
         let applied = if redo {
             self.undo.redo_workbook(&mut self.wb, guard)
         } else {
@@ -12502,6 +12496,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         }
         self.cf_stats_gen = u64::MAX;
         self.invalid_gen = u64::MAX;
+        if applied.coord_changed || applied.structural {
+            self.cf_cache = None;
+            self.cf_inputs.grid.invalidate_viewport();
+        }
         self.tasks.last_edit = Some(std::time::Instant::now());
         // 协作广播
         if applied.skipped == 0 && let Some(order) = permutation {
@@ -12529,8 +12527,26 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         // 回到出事的格
         let (sheet, row, col) = applied.focus;
         let target = sheet.min(self.wb.sheets.len().saturating_sub(1));
-        if target != self.sheet_idx {
-            self.switch_sheet_view(target);
+        let cur_sheet_id = self.wb.sheets.get(target).map(|s| s.identity);
+        let idx_still_prev = prev_sheet_id.is_some()
+            && self.wb.sheets.get(self.sheet_idx).map(|s| s.identity) == prev_sheet_id;
+        if idx_still_prev {
+            if target != self.sheet_idx {
+                self.switch_sheet_view(target);
+            }
+        } else if prev_sheet_id.is_some() && cur_sheet_id == prev_sheet_id {
+            // 原活动表因撤销/重做移动了索引但仍是同一张表：保留其活动视图，仅同步索引。
+            self.sheet_idx = target;
+        } else {
+            // 当前 `self.sheet_idx` 上已换成了其他表或越界：若原活动表仍在工作簿中，
+            // 必须按其自身 `prev_sheet_id` 保存视图，不能借 `switch_sheet_view` 误写到新占位的表上。
+            if let Some(prev_id) = prev_sheet_id {
+                if self.wb.sheets.iter().any(|s| s.identity == prev_id) {
+                    self.remember_sheet_view_for(prev_id);
+                }
+            }
+            self.drop_merge_confirmation();
+            self.load_sheet_view(target);
         }
         // 目标表自己的多选区不能带进这次撤销的落点；否则后续清除/格式会误伤远端区域。
         self.extra_sel.clear();
@@ -14722,10 +14738,13 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     /// UI-16：把当前表的选区/滚动/缩放存到该表的 identity 下。
     fn remember_sheet_view(&mut self) {
-        let Some(sh) = self.wb.sheets.get(self.sheet_idx) else {
+        let Some(id) = self.wb.sheets.get(self.sheet_idx).map(|sh| sh.identity) else {
             return;
         };
-        let id = sh.identity;
+        self.remember_sheet_view_for(id);
+    }
+
+    fn remember_sheet_view_for(&mut self, id: u64) {
         self.sheet_views.insert(
             id,
             SheetViewState {
@@ -23550,21 +23569,18 @@ fn clear_selection(&mut self) {
         if !self.can_change_sheets() {
             return false;
         }
-        let active_id = self.wb.sheet(self.sheet_idx).identity;
         let prev_focus = (self.sheet_idx, self.sel.0, self.sel.1);
         let mut dest = if target > from { target - 1 } else { target };
         dest = dest.min(len - 1);
         if dest == from {
             return false;
         }
-        if !self.undo.move_sheet(&mut self.wb, from, dest, prev_focus) {
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Move { from, to: dest },
+        );
+        if self.execute_local_tx(intent, None, prev_focus).is_err() {
             return false;
         }
-        if let Some(new_idx) = self.wb.sheets.iter().position(|s| s.identity == active_id) {
-            self.sheet_idx = new_idx;
-        }
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
         self.status = format!(
             "已移动「{}」到第 {} 位（可 Ctrl+Z 撤销）",
             self.wb.sheet(dest).name,
@@ -23583,8 +23599,6 @@ fn clear_selection(&mut self) {
             return false;
         }
         let prev_focus = (self.sheet_idx, self.sel.0, self.sel.1);
-        let active_id = self.wb.sheet(self.sheet_idx).identity;
-        self.remember_sheet_view();
         let mut copy = self.wb.sheets[from].clone();
         let base = copy.name.clone();
         let mut n = 2;
@@ -23606,20 +23620,19 @@ fn clear_selection(&mut self) {
         copy.hidden = false;
         copy.very_hidden = false;
         let at = target.min(self.wb.sheets.len());
-        if !sheetcore::sheet_ops::insert_sheet(&mut self.wb, at, copy) {
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Insert {
+                index: at,
+                sheet: copy,
+            },
+        );
+        if self
+            .execute_local_tx(intent, Some("复制工作表".into()), prev_focus)
+            .is_err()
+        {
             self.status = "复制工作表失败：名称无效或已存在".into();
             return false;
         }
-        self.undo.record_inserted_sheet(&self.wb, at, "复制工作表", prev_focus);
-        self.sheet_idx = self
-            .wb
-            .sheets
-            .iter()
-            .position(|s| s.identity == active_id)
-            .unwrap_or(at);
-        self.switch_sheet_view(at);
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
         self.status = format!("已复制为「{name}」（可 Ctrl+Z 撤销）");
         true
     }
@@ -32213,29 +32226,28 @@ impl SheetApp {
 
     fn apply_local_structural(&mut self, idx: usize, op: sheetcore::structural::Structural) {
         let updates = self.structural_updates(idx, &op);
-        let before = sheetcore::undo::snapshot_structure(&self.wb, idx, &op);
         let pending_pivots_before = self.wb.pivots_pending.len();
-        sheetcore::structural::apply_structural_wb(&mut self.wb, idx, &op);
-        let detached_source = before.detached_source(&self.wb);
-        let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.cf_stats_gen = u64::MAX;
-        self.invalid_gen = u64::MAX;
-        self.tasks.last_edit = Some(std::time::Instant::now());
-        let after = before.capture_after(&self.wb);
         let label = op.label();
-        self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
-        self.recalc_after_structural(updates);
+        let intent = sheetcore::tx::TxIntent::from_structural(idx, &op);
+        let (entry_id, effects) = match self.execute_local_tx_with_recalc(
+            intent,
+            Some(label.clone()),
+            (idx, self.sel.0, self.sel.1),
+            Some(updates),
+        ) {
+            Ok(ok) => ok,
+            Err(sheetcore::tx::TxError::NoOp) => return,
+            Err(err) => {
+                self.status = err.message().into();
+                return;
+            }
+        };
+        let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
         self.shift_collab_coordinates(idx, &op);
-        self.pivot_ui.field_settings = None;
-        self.pivot_ui.grid_filter = None;
-        self.pivot_ui.options_pivot_id = None;
-        self.sync_pivot_sidebar_selection();
         if let Some(net) = &self.net {
             self.shift_intro.sync_struct_rev(net.structure_seen());
         }
-        self.audit_note_structural(None, idx, &op, self.undo.top_undo_id());
+        self.audit_note_structural(None, idx, &op, (entry_id != 0).then_some(entry_id));
         self.status = if self.net.is_some() {
             format!("{label}（已提交协作队列）")
         } else {
@@ -32244,7 +32256,7 @@ impl SheetApp {
         if removed_pivots > 0 {
             self.status.push_str(&format!("；已移除 {removed_pivots} 个源字段或区域被删除的透视表定义"));
         }
-        if detached_source {
+        if effects.detached_sources {
             self.status.push_str("；部分数据源的绑定区域已失效，请重新选择区域并导入");
         }
     }
@@ -32322,20 +32334,22 @@ impl SheetApp {
         let pending_pivots_before = self.wb.pivots_pending.len();
         apply_delete_row_intervals_wb(&mut self.wb, idx, &intervals);
         let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.cf_stats_gen = u64::MAX;
-        self.invalid_gen = u64::MAX;
-        self.tasks.last_edit = Some(std::time::Instant::now());
         let after = before.capture_after(&self.wb);
         let label = summary_op.label();
         self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
-        self.recalc_after_structural(StructuralRecalc::Full);
+        let effects = sheetcore::tx::TxEffects {
+            recalc: sheetcore::tx::RecalcScope::Full,
+            invalidate_deps: true,
+            invalidate_render_caches: true,
+            coord_changed: true,
+            structural: true,
+            detached_sources: false,
+            revision_deltas: Vec::new(),
+            touched_sheets: vec![idx],
+            new_focus: None,
+        };
+        self.apply_tx_effects(&label, &effects);
         self.shift_collab_coordinates(idx, &summary_op);
-        self.pivot_ui.field_settings = None;
-        self.pivot_ui.grid_filter = None;
-        self.pivot_ui.options_pivot_id = None;
-        self.sync_pivot_sidebar_selection();
         self.status = format!("{label}（已保留筛选隐藏行，可 Ctrl+Z 撤销）");
         if removed_pivots > 0 {
             self.status.push_str(&format!(
@@ -32362,52 +32376,30 @@ impl SheetApp {
         if !self.finish_pending_edit() {
             return false;
         }
-        // 落在被拖动块内部或数量为 0 = 不动
-        if n == 0 || (drop >= from && drop <= from.saturating_add(n)) {
-            return false;
-        }
         let idx = self.sheet_idx;
         let axis = if is_rows {
             sheetcore::refs::Axis::Row
         } else {
             sheetcore::refs::Axis::Col
         };
-        let snap = if self.wb.sheet(idx).len() <= 200_000 {
-            sheetcore::undo::snapshot_axis_move(&self.wb, idx, axis, from, n, drop)
-        } else {
-            None
+        let Some(intent) = sheetcore::tx::TxIntent::from_axis_move(idx, axis, from, n, drop) else {
+            return false;
         };
+        let label = if is_rows { "移动行" } else { "移动列" };
         let pending_pivots_before = self.wb.pivots_pending.len();
-        if is_rows {
-            sheetcore::structural::move_rows_wb(&mut self.wb, idx, from, n, drop);
-        } else {
-            sheetcore::structural::move_cols_wb(&mut self.wb, idx, from, n, drop);
-        }
-        let detached_source = snap
-            .as_ref()
-            .is_some_and(|before| before.detached_source(&self.wb));
+        let (_entry_id, effects) = match self.execute_local_tx(
+            intent,
+            Some(label.to_string()),
+            (idx, self.sel.0, self.sel.1),
+        ) {
+            Ok(ok) => ok,
+            Err(sheetcore::tx::TxError::NoOp) => return false,
+            Err(err) => {
+                self.status = err.message().into();
+                return false;
+            }
+        };
         let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
-        if let Some(before) = snap {
-            let after = before.capture_after(&self.wb);
-            let label = if is_rows { "移动行" } else { "移动列" };
-            self.undo.push_structure(
-                label.to_string(),
-                before,
-                after,
-                (idx, self.sel.0, self.sel.1),
-            );
-        }
-        self.wb.calc_manual |= self.manual_calc;
-        self.recalc_all_and_deps_adaptive();
-        self.cf_stats_gen = u64::MAX;
-        self.invalid_gen = u64::MAX;
-        self.tasks.last_edit = Some(std::time::Instant::now());
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.wb.dirty = true;
-        self.pivot_ui.field_settings = None;
-        self.pivot_ui.grid_filter = None;
-        self.pivot_ui.options_pivot_id = None;
-        self.sync_pivot_sidebar_selection();
         self.status = if is_rows {
             format!("已把第 {}–{} 行移动到第 {} 行前", from + 1, from + n, drop + 1)
         } else {
@@ -32423,7 +32415,7 @@ impl SheetApp {
                 "；已移除 {removed_pivots} 个源字段或区域被破坏的透视表定义"
             ));
         }
-        if detached_source {
+        if effects.detached_sources {
             self.status
                 .push_str("；部分数据源的绑定区域已失效，请重新选择区域并导入");
         }

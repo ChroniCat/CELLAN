@@ -2,7 +2,11 @@
 
 use super::SheetApp;
 use crate::net::CoordEpoch;
-use sheetcore::{cell_shift_patch::CellShiftPatch, sync::CellShiftPhase};
+use sheetcore::{
+    cell_shift_patch::CellShiftPatch,
+    sync::CellShiftPhase,
+    tx::{RecalcScope, TxEffects, TxError, TxIntent, TxPatch, WorkbookTx},
+};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -510,8 +514,9 @@ impl SheetApp {
             sheetcore::cells::Shift::Vertical
         };
         let op = sheetcore::structural::CellShift::new(rect, direction, insert);
-        if let Err(conflict) = op.preflight(&self.wb, si) {
-            self.status = conflict.message().into();
+        let intent = TxIntent::from_cell_shift(si, &op);
+        if let Err(err) = WorkbookTx::preflight(&self.wb, &intent) {
+            self.status = err.message().into();
             return;
         }
         let sh = self.wb.sheet(si);
@@ -539,65 +544,15 @@ impl SheetApp {
             self.request_room_shift(si, op);
             return;
         }
-        let before = sheetcore::undo::snapshot_cell_shift_if_metadata(&self.wb, si, &op);
-        let mut affected = vec![(si, keys)];
-        if let Some(snapshot) = &before {
-            affected.extend(snapshot.foreign_formula_positions());
-        } else {
-            for (idx, other) in self.wb.sheets.iter().enumerate() {
-                if idx == si {
-                    continue;
-                }
-                let keys = op.affected_formula_positions(other, &self.wb.sheet(si).name);
-                if !keys.is_empty() {
-                    affected.push((idx, keys));
-                }
-            }
-        }
-        let captured: Vec<_> = affected
-            .into_iter()
-            .map(|(idx, keys)| {
-                (
-                    idx,
-                    sheetcore::undo::capture(self.wb.sheet(idx), idx, &keys),
-                )
-            })
-            .collect();
-        if !op.apply(&mut self.wb, si) {
-            return;
-        }
-        let deltas: Vec<_> = captured
-            .into_iter()
-            .flat_map(|(idx, cells)| sheetcore::undo::finish(cells, self.wb.sheet(idx)))
-            .collect();
         let focus = (si, self.sel.0, self.sel.1);
-        let detached_source = before
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.detached_source(&self.wb));
-        let structure = before
-            .filter(|s| s.cell_shift_changed_metadata(&self.wb))
-            .map(|snapshot| {
-                let after = snapshot.capture_after(&self.wb);
-                (snapshot, after)
-            });
-        self.recalc_all_and_deps_adaptive();
-        for group in deltas.chunk_by(|a, b| a.sheet == b.sheet) {
-            self.record_revision(label, group);
-        }
-        if let Some((before, after)) = structure {
-            if deltas.is_empty() {
-                self.record_revision(label, &[]);
+        let (_entry_id, effects) = match self.execute_local_tx(intent, Some(label.to_string()), focus) {
+            Ok(ok) => ok,
+            Err(TxError::NoOp) => return,
+            Err(err) => {
+                self.status = err.message().into();
+                return;
             }
-            self.undo.push_structure(label, before, after, focus);
-        } else if !deltas.is_empty() {
-            self.undo
-                .push_cell_shift(label, deltas, focus, &self.wb.sheets);
-        }
-        self.tasks.last_edit = Some(std::time::Instant::now());
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.cf_stats_gen = u64::MAX;
-        self.invalid_gen = u64::MAX;
-        self.wb.dirty = true;
+        };
         self.status = if insert {
             if horizontal {
                 "已插入单元格（右侧右移）"
@@ -610,18 +565,19 @@ impl SheetApp {
         } else {
             "已删除单元格（上方上移）".into()
         };
-        if detached_source {
+        if effects.detached_sources {
             self.status
                 .push_str("；部分数据源的绑定区域已失效，请重新选择区域并导入");
         }
     }
 
     fn request_room_shift(&mut self, sheet: usize, op: sheetcore::structural::CellShift) {
-        if let Err(conflict) = op.preflight(&self.wb, sheet) {
-            self.status = conflict.message().into();
+        let intent = TxIntent::from_cell_shift(sheet, &op);
+        if let Err(err) = WorkbookTx::preflight(&self.wb, &intent) {
+            self.status = err.message().into();
             return;
         }
-        let Some(patch) = CellShiftPatch::prepare(&self.wb, sheet, op) else {
+        let Some(patch) = TxPatch::prepare(&self.wb, &intent).and_then(TxPatch::into_cell_shift) else {
             self.status = "单元格位移范围无效，未执行操作".into();
             return;
         };
@@ -676,11 +632,16 @@ impl SheetApp {
                 },
                 patch.insert == redo,
             );
-            if let Err(conflict) = effective_op.preflight(&self.wb, patch.target_sheet()) {
-                self.status = conflict.message().into();
+            if let Err(err) = WorkbookTx::preflight(
+                &self.wb,
+                &TxIntent::from_cell_shift(patch.target_sheet(), &effective_op),
+            ) {
+                self.status = err.message().into();
                 return false;
             }
-            if !patch.matches_replica(&self.wb, redo) || !patch.apply_committed(&mut self.wb, redo)
+            let tx_patch = TxPatch::from_cell_shift((*patch).clone());
+            if !tx_patch.matches_replica(&self.wb, redo)
+                || !tx_patch.apply_committed(&mut self.wb, redo)
             {
                 self.status = "关联单元格、批注或数据源已更改，已保留历史记录".into();
                 return false;
@@ -719,8 +680,9 @@ impl SheetApp {
         patch: Arc<CellShiftPatch>,
     ) -> Result<Arc<CellShiftPatch>, String> {
         if matches!(phase, CellShiftPhase::Forward) {
-            if let Err(conflict) = patch.operation().preflight(&self.wb, patch.target_sheet()) {
-                return Err(conflict.message().into());
+            let intent = TxIntent::from_cell_shift(patch.target_sheet(), &patch.operation());
+            if let Err(err) = WorkbookTx::preflight(&self.wb, &intent) {
+                return Err(err.message().into());
             }
         }
         let canonical = if matches!(phase, CellShiftPhase::Forward) {
@@ -761,8 +723,10 @@ impl SheetApp {
             },
             patch.insert == forward,
         );
-        if let Err(conflict) = effective_op.preflight(&self.wb, sheet) {
-            return Err(conflict.message().into());
+        if let Err(err) =
+            WorkbookTx::preflight(&self.wb, &TxIntent::from_cell_shift(sheet, &effective_op))
+        {
+            return Err(err.message().into());
         }
         if !matches!(phase, CellShiftPhase::Forward) {
             let matches = if self.net.as_ref().is_some_and(|net| net.hosting) {
@@ -900,12 +864,18 @@ impl SheetApp {
     }
 
     fn finish_shift_edit(&mut self) {
-        self.recalc_all_and_deps_adaptive();
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.cf_stats_gen = u64::MAX;
-        self.invalid_gen = u64::MAX;
-        self.tasks.last_edit = Some(std::time::Instant::now());
+        let effects = TxEffects {
+            recalc: RecalcScope::Full,
+            invalidate_deps: true,
+            invalidate_render_caches: true,
+            coord_changed: true,
+            structural: false,
+            detached_sources: false,
+            revision_deltas: Vec::new(),
+            touched_sheets: Vec::new(),
+            new_focus: None,
+        };
+        self.apply_tx_effects("", &effects);
     }
 
     pub(super) fn discard_room_peer(&mut self) {

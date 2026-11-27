@@ -1782,18 +1782,15 @@ impl SheetApp {
                 if !self.can_change_sheets() {
                     return ("工作簿结构受保护".into(), json!({"ok": false, "error": self.status}));
                 }
-                let index = self.wb.sheets.len();
                 let previous_focus = (self.sheet_idx, self.sel.0, self.sel.1);
-                if !sheetcore::sheet_ops::insert_sheet(
-                    &mut self.wb,
-                    index,
-                    sheetcore::model::Sheet::new(name),
-                ) {
+                let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+                    sheetcore::tx::SheetTabIntent::Append {
+                        sheet: sheetcore::model::Sheet::new(name),
+                    },
+                );
+                if self.execute_local_tx(intent, None, previous_focus).is_err() {
                     return ("新建工作表失败".into(), json!({"ok": false, "error": "名称无效或已存在"}));
                 }
-                self.switch_sheet_view(index);
-                self.undo.record_appended_sheet(&self.wb, previous_focus);
-                self.refresh_after_sheet_change();
                 (format!("新建工作表「{name}」"), json!({"ok": true, "sheet": name}))
             }
             "switch" => {
@@ -1813,10 +1810,15 @@ impl SheetApp {
                     return ("重命名失败".into(), json!({"ok": false, "error": "未找到工作表"}));
                 };
                 let focus = (self.sheet_idx, self.sel.0, self.sel.1);
-                if !self.undo.rename_sheet(&mut self.wb, i, new_name, focus) {
+                let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+                    sheetcore::tx::SheetTabIntent::Rename {
+                        index: i,
+                        name: new_name.to_string(),
+                    },
+                );
+                if self.execute_local_tx(intent, None, focus).is_err() {
                     return ("重命名失败".into(), json!({"ok": false, "error": "目标名称无效或重名"}));
                 }
-                self.refresh_after_sheet_change();
                 (
                     format!("重命名「{name}」→「{new_name}」"),
                     json!({"ok": true, "sheet": new_name}),

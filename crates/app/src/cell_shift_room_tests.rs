@@ -1113,3 +1113,109 @@ fn guest_authored_cell_shift_repeated_disconnect_without_offline_edits_creates_n
         }
     }
 }
+
+#[test]
+fn phase3_tx_room_cell_shift_tx_patch_wire_compat_undo_redo_and_conflict_guard() {
+    use sheetcore::{
+        cell_shift_patch::CellShiftPatch,
+        cells::Shift,
+        structural::CellShift,
+        tx::{TxIntent, TxPatch},
+        Cell, CellRef, Value,
+    };
+    let env = crate::test_env::TestEnv::new("p3-tx-room-shift");
+    let (mut host, mut guest) = sort_apps(&env);
+
+    // Put a formula referencing the shifted cell and verify TxPatch JSON wire parity.
+    host.wb.sheet_mut(0).set(
+        0,
+        2,
+        Cell {
+            value: Value::Empty,
+            formula: Some("=A2*10".into()),
+        },
+    );
+    host.recalc_and_broadcast(&[(0, 0, 2)]);
+    host.set_comment_cell(0, 1, 0, "tx note", Some("Host"), false)
+        .unwrap();
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).value(0, 2) == Value::Number(10.0)
+            && g.wb.sheet(0).value(0, 2) == Value::Number(10.0)
+            && g.wb.sheet(0).notes.contains_key(&CellRef::new(1, 0))
+    });
+
+    // Wire parity check: TxPatch::prepare serializes identically to CellShiftPatch.
+    let op = CellShift::new((1, 0, 1, 0), Shift::Vertical, true);
+    let tx_patch = TxPatch::prepare(&guest.wb, &TxIntent::from_cell_shift(0, &op))
+        .expect("TxPatch::prepare must succeed");
+    let tx_json = serde_json::to_string(&tx_patch).unwrap();
+    let legacy_patch: CellShiftPatch =
+        serde_json::from_str(&tx_json).expect("TxPatch wire JSON must deserialize as CellShiftPatch");
+    assert_eq!(tx_patch.as_cell_shift(), Some(&legacy_patch));
+    let roundtrip: TxPatch = serde_json::from_str(&tx_json).unwrap();
+    assert_eq!(roundtrip, tx_patch);
+
+    // Guest executes room CellShift (goes through WorkbookTx::preflight + TxPatch::prepare + apply_tx_effects).
+    guest.cf_stats_gen = 64;
+    guest.invalid_gen = 64;
+    host.cf_stats_gen = 64;
+    host.invalid_gen = 64;
+    guest.sel = (1, 0);
+    guest.sel_end = (1, 0);
+    guest.shift_cells(true, false);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).value(2, 0) == Value::Number(1.0)
+            && g.wb.sheet(0).value(2, 0) == Value::Number(1.0)
+            && g.undo.depth() == (1, 0)
+    });
+    assert_eq!(guest.cf_stats_gen, u64::MAX);
+    assert_eq!(guest.invalid_gen, u64::MAX);
+    assert_eq!(host.cf_stats_gen, u64::MAX);
+    assert_eq!(host.invalid_gen, u64::MAX);
+    for peer in [&host, &guest] {
+        let sh = peer.wb.sheet(0);
+        assert_eq!(sh.value(1, 0), Value::Empty);
+        assert_eq!(sh.value(2, 0), Value::Number(1.0));
+        assert_eq!(sh.get(0, 2).unwrap().formula.as_deref(), Some("=A3*10"));
+        assert_eq!(sh.value(0, 2), Value::Number(10.0));
+        assert!(sh.notes.contains_key(&CellRef::new(2, 0)));
+    }
+
+    // Undo and Redo via unified Entry::Tx(TxDelta::RoomPatch).
+    assert!(guest.apply_undo(false), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).value(1, 0) == Value::Number(1.0)
+            && g.wb.sheet(0).value(1, 0) == Value::Number(1.0)
+            && g.undo.depth() == (0, 1)
+    });
+    assert_eq!(
+        host.wb.sheet(0).get(0, 2).unwrap().formula.as_deref(),
+        Some("=A2*10")
+    );
+    assert!(host.wb.sheet(0).notes.contains_key(&CellRef::new(1, 0)));
+
+    assert!(guest.apply_undo(true), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).value(2, 0) == Value::Number(1.0)
+            && g.wb.sheet(0).value(2, 0) == Value::Number(1.0)
+            && g.undo.depth() == (1, 0)
+    });
+
+    // Host modifies a shifted cell -> guest Undo must be blocked by conflict guard & preserve history.
+    host.wb.sheet_mut(0).set(
+        2,
+        0,
+        Cell {
+            value: Value::Number(99.0),
+            formula: None,
+        },
+    );
+    host.recalc_and_broadcast(&[(0, 2, 0)]);
+    until(&mut host, &mut guest, |_, g| {
+        g.wb.sheet(0).value(2, 0) == Value::Number(99.0)
+    });
+    assert!(!guest.apply_undo(false));
+    assert_eq!(guest.undo.depth(), (1, 0), "conflicting undo must retain room shift history");
+    assert_eq!(guest.wb.sheet(0).value(2, 0), Value::Number(99.0));
+}
+

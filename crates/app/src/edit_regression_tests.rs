@@ -13604,6 +13604,474 @@ fn phase2_app_shift_cells_rewrites_cfvo_with_undo_and_preflight_blocks_overlappi
     );
 }
 
+#[test]
+fn phase3_tx_shift_cells_sparse_and_metadata_detached_source_revisions_and_caches() {
+    use sheetcore::{
+        external::{Kind, Source},
+        notes::Note,
+        CellRef,
+    };
+    let env = crate::test_env::TestEnv::new("p3-tx-shift-cells");
+    let mut app = app();
+    app.wb.path = Some(env.path("p3_shift.xlsx"));
+    app.wb.sheets[0].name = "Data".into();
+    app.wb.sheets[0].set(1, 0, number(10.0));
+    app.wb.sheets[0].set(2, 0, number(20.0));
+    let mut sum = sheetcore::Sheet::new("Sum");
+    sum.set(0, 0, formula("=Data!A2+Data!A3"));
+    app.wb.sheets.push(sum);
+    sheetcore::formula::recalc_all(&mut app.wb);
+
+    // 1) Sparse-only shift_cells via WorkbookTx + revision log + cache invalidation + Undo/Redo.
+    app.cf_stats_gen = 42;
+    app.invalid_gen = 42;
+    let gen0 = app.doc_gen;
+    app.sel = (1, 0);
+    app.sel_end = (1, 0);
+    app.shift_cells(true, false);
+    assert_eq!(app.cf_stats_gen, u64::MAX);
+    assert_eq!(app.invalid_gen, u64::MAX);
+    assert!(app.cf_cache.is_none());
+    assert!(app.wb.dirty && app.doc_gen != gen0);
+    assert_eq!(app.wb.sheet(0).value(1, 0), Value::Empty);
+    assert_eq!(app.wb.sheet(0).value(2, 0), Value::Number(10.0));
+    assert_eq!(app.wb.sheet(0).value(3, 0), Value::Number(20.0));
+    assert_eq!(
+        app.wb.sheet(1).get(0, 0).unwrap().formula.as_deref(),
+        Some("=Data!A3+Data!A4")
+    );
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(30.0));
+    let rev_entries: Vec<_> = app.rev.iter().filter(|e| e.label == "插入单元格").collect();
+    assert_eq!(rev_entries.len(), 2, "must record one revision per affected sheet");
+    assert_eq!(app.undo.depth(), (1, 0));
+
+    app.cf_stats_gen = 88;
+    app.invalid_gen = 88;
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.cf_stats_gen, u64::MAX);
+    assert_eq!(app.invalid_gen, u64::MAX);
+    assert_eq!(app.wb.sheet(0).value(1, 0), Value::Number(10.0));
+    assert_eq!(app.wb.sheet(0).value(2, 0), Value::Number(20.0));
+    assert_eq!(
+        app.wb.sheet(1).get(0, 0).unwrap().formula.as_deref(),
+        Some("=Data!A2+Data!A3")
+    );
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(30.0));
+
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).value(2, 0), Value::Number(10.0));
+    assert_eq!(
+        app.wb.sheet(1).get(0, 0).unwrap().formula.as_deref(),
+        Some("=Data!A3+Data!A4")
+    );
+
+    // 2) Metadata-bearing shift_cells (note + defined name + external source split => detached warning).
+    app.wb.sheets[0].notes.insert(
+        CellRef::new(2, 1),
+        Note {
+            r: 2,
+            c: 1,
+            author: "Tester".into(),
+            text: "Track me".into(),
+        },
+    );
+    app.wb.names.push(("Tracked".into(), None, "Data!$B$3".into()));
+    app.wb.sources.push(Source {
+        name: "SalesCsv".into(),
+        kind: Kind::Csv {
+            path: "sales.csv".into(),
+            delim: ',',
+            header: true,
+        },
+        at: (2, 1),
+        target_sheet: Some("Data".into()),
+        rows: 3,
+        cols: 2,
+        csv_opts: None,
+    });
+    let rev_before = app.rev.len();
+    app.cf_stats_gen = 99;
+    app.invalid_gen = 99;
+    app.sel = (1, 1);
+    app.sel_end = (1, 1);
+    app.shift_cells(true, false);
+    assert_eq!(app.cf_stats_gen, u64::MAX);
+    assert_eq!(app.invalid_gen, u64::MAX);
+    assert!(
+        app.status.contains("部分数据源的绑定区域已失效"),
+        "expected detached-source suffix, got: {}",
+        app.status
+    );
+    assert!(matches!(app.wb.sources[0].kind, Kind::Unbound(_)));
+    assert!(app.wb.sheet(0).notes.contains_key(&CellRef::new(3, 1)));
+    assert!(!app.wb.sheet(0).notes.contains_key(&CellRef::new(2, 1)));
+    assert_eq!(app.wb.names[0].2, "Data!$B$4");
+    assert!(
+        app.rev.len() > rev_before,
+        "metadata-only structural cell shift must still emit a revision entry"
+    );
+    assert_eq!(app.undo.depth(), (2, 0));
+
+    // Undo restores note, defined name, and bound external source; Redo detaches/shifts again.
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert!(matches!(app.wb.sources[0].kind, Kind::Csv { .. }));
+    assert!(app.wb.sheet(0).notes.contains_key(&CellRef::new(2, 1)));
+    assert_eq!(app.wb.names[0].2, "Data!$B$3");
+
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert!(matches!(app.wb.sources[0].kind, Kind::Unbound(_)));
+    assert!(app.wb.sheet(0).notes.contains_key(&CellRef::new(3, 1)));
+    assert_eq!(app.wb.names[0].2, "Data!$B$4");
+}
+
+#[test]
+fn phase3_tx_structural_and_move_axis_headers_undo_redo_objects_and_caches() {
+    use sheetcore::{
+        cf::{CfBlock, CfKind, CfRule, Cfvo, CfvoKind},
+        charts::{Chart, ChartKind, Series},
+        pivot::Agg,
+        pivot_engine::PivotTableModel,
+        pivot_multi::{AxisField, PivotLayout, PivotSpec2, ShowAs, ValueField},
+        sparkline::Sparkline,
+        structural::Structural,
+    };
+    let _env = crate::test_env::TestEnv::new("p3-tx-structural-move");
+    let mut app = app();
+    app.wb.sheets[0].name = "Data".into();
+    let data_id = app.wb.sheets[0].identity;
+    for r in 0..6u32 {
+        app.wb.sheets[0].set(r, 0, number(f64::from(r + 1)));
+        app.wb.sheets[0].set(r, 1, number(f64::from((r + 1) * 10)));
+    }
+    let mut dash = sheetcore::Sheet::new("Dash");
+    dash.set(0, 0, formula("=SUM(Data!B2:B3)"));
+    dash.cf.blocks.push(CfBlock {
+        ranges: vec![(0, 0, 1, 0)],
+        rules: vec![CfRule {
+            kind: CfKind::Scale {
+                points: vec![
+                    (
+                        Cfvo {
+                            kind: CfvoKind::Formula,
+                            val: 0.0,
+                            formula: "=Data!$B$2".into(),
+                        },
+                        [255, 0, 0],
+                    ),
+                    (
+                        Cfvo {
+                            kind: CfvoKind::Formula,
+                            val: 0.0,
+                            formula: "=Data!$B$3".into(),
+                        },
+                        [0, 255, 0],
+                    ),
+                ],
+            },
+            stop: false,
+            priority: 1,
+        }],
+    });
+    dash.charts.push(Chart {
+        kind: ChartKind::Column,
+        title: "Summary".into(),
+        anchor: (0, 2, 5, 6),
+        source_range: "Data!$A$2:$B$3".into(),
+        series: vec![Series {
+            cat_ref: "Data!$A$2:$A$3".into(),
+            val_ref: "Data!$B$2:$B$3".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    dash.sparklines.push(Sparkline {
+        r: 0,
+        c: 1,
+        source_sheet: Some("Data".into()),
+        rect: (1, 1, 2, 1),
+        ..Default::default()
+    });
+    app.wb.sheets.push(dash);
+    let mut pivot = PivotTableModel::new(
+        "P1".into(),
+        "Data".into(),
+        Some(data_id),
+        1,
+        (8, 0),
+        PivotSpec2 {
+            source: (1, 0, 2, 1),
+            rows: vec![AxisField::plain(0)],
+            cols: Vec::new(),
+            values: vec![ValueField {
+                col: 1,
+                agg: Agg::Sum,
+                label: None,
+                show_as: ShowAs::Normal,
+                base: None,
+            }],
+            filters: Vec::new(),
+            layout: PivotLayout::default(),
+        },
+    );
+    pivot.rect = (8, 0, 10, 1);
+    app.wb.pivots.push(pivot);
+    sheetcore::formula::recalc_all(&mut app.wb);
+
+    // 1) Structural InsertRows via WorkbookTx
+    app.cf_stats_gen = 11;
+    app.invalid_gen = 11;
+    app.structural(Structural::InsertRows { at: 1, n: 2 });
+    assert_eq!(app.cf_stats_gen, u64::MAX);
+    assert_eq!(app.invalid_gen, u64::MAX);
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(50.0));
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$B$4:$B$5");
+    assert_eq!(app.wb.sheet(1).sparklines[0].rect, (3, 1, 4, 1));
+    assert_eq!(app.wb.pivots[0].spec.source, (3, 0, 4, 1));
+    let CfKind::Scale { points } = &app.wb.sheet(1).cf.blocks[0].rules[0].kind else {
+        panic!("expected scale rule");
+    };
+    assert_eq!(points[0].0.formula, "=Data!$B$4");
+    assert_eq!(points[1].0.formula, "=Data!$B$5");
+
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$B$2:$B$3");
+    assert_eq!(app.wb.sheet(1).sparklines[0].rect, (1, 1, 2, 1));
+    assert_eq!(app.wb.pivots[0].spec.source, (1, 0, 2, 1));
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(50.0));
+
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$B$4:$B$5");
+
+    // 2) Structural DeleteCols + Undo
+    app.structural(Structural::DeleteCols { at: 0, n: 1 });
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$A$4:$A$5");
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$B$4:$B$5");
+
+    // 3) move_axis_headers (rows & cols) via WorkbookTx + Undo/Redo
+    app.cf_stats_gen = 22;
+    app.invalid_gen = 22;
+    assert!(app.move_axis_headers(true, 3, 2, 1));
+    assert_eq!(app.cf_stats_gen, u64::MAX);
+    assert_eq!(app.invalid_gen, u64::MAX);
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$B$2:$B$3");
+    assert_eq!(app.wb.sheet(1).sparklines[0].rect, (1, 1, 2, 1));
+    assert_eq!(app.wb.pivots[0].spec.source, (1, 0, 2, 1));
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(50.0));
+
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$B$4:$B$5");
+    assert_eq!(app.wb.sheet(1).sparklines[0].rect, (3, 1, 4, 1));
+    assert_eq!(app.wb.pivots[0].spec.source, (3, 0, 4, 1));
+
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.wb.sheet(1).charts[0].series[0].val_ref, "Data!$B$2:$B$3");
+    assert_eq!(app.wb.sheet(1).sparklines[0].rect, (1, 1, 2, 1));
+}
+
+#[test]
+fn phase3_tx_sheet_tab_rename_move_copy_delete_undo_redo_preserves_views_and_formulas() {
+    let _env = crate::test_env::TestEnv::new("p3-tx-sheet-tabs");
+    let mut app = app();
+    app.wb.sheets[0].set(0, 0, number(42.0));
+    app.sel = (3, 2);
+    app.sel_end = (3, 2);
+    let s1_id = app.wb.sheets[0].identity;
+
+    // 1) Append Sheet2
+    app.add_sheet();
+    assert_eq!(app.wb.sheets.len(), 2);
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!(app.wb.sheet(1).name, "Sheet2");
+    assert_eq!(app.sheet_views.get(&s1_id).map(|v| v.sel), Some((3, 2)));
+    let s2_id = app.wb.sheets[1].identity;
+
+    app.wb.sheets[1].set(0, 0, formula("=Sheet1!A1*2"));
+    sheetcore::formula::recalc_all(&mut app.wb);
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(84.0));
+    app.sel = (5, 1);
+    app.sel_end = (5, 1);
+
+    // 2) Invalid rename fails atomically without touching workbook or undo stack.
+    let depth_before_bad = app.undo.depth();
+    assert!(!app.set_sheet_name(0, "Bad/Name"));
+    assert_eq!(app.wb.sheet(0).name, "Sheet1");
+    assert_eq!(app.undo.depth(), depth_before_bad);
+
+    // 3) Valid rename rewrites formula qualifier and invalidates caches.
+    app.cf_stats_gen = 33;
+    app.invalid_gen = 33;
+    assert!(app.set_sheet_name(0, "Sales"));
+    assert_eq!(app.cf_stats_gen, u64::MAX);
+    assert_eq!(app.invalid_gen, u64::MAX);
+    assert_eq!(
+        app.wb.sheet(1).get(0, 0).unwrap().formula.as_deref(),
+        Some("='Sales'!A1*2")
+    );
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(84.0));
+
+    // 4) Move sheet while preserving active Sheet2 identity & live selection.
+    assert!(app.swap_sheet_positions(0, 1));
+    assert_eq!(app.sheet_idx, 0);
+    assert_eq!(app.wb.sheet(0).identity, s2_id);
+    assert_eq!(app.wb.sheet(1).identity, s1_id);
+    assert_eq!(app.sel, (5, 1));
+
+    // 5) Copy sheet to index 0; switches to copy while preserving Sheet2's view.
+    assert!(app.copy_sheet_to(1, 0));
+    assert_eq!(app.wb.sheets.len(), 3);
+    assert_eq!(app.sheet_idx, 0);
+    assert_eq!(app.wb.sheet(0).name, "Sales (2)");
+    assert_eq!(app.sheet_views.get(&s2_id).map(|v| v.sel), Some((5, 1)));
+
+    // 6) Delete "Sales" (index 2); Sheet2 formula becomes #REF!.
+    app.delete_sheet(2);
+    assert_eq!(app.wb.sheets.len(), 2);
+    assert_eq!(app.wb.sheet(1).identity, s2_id);
+    assert_eq!(app.wb.sheet(1).value(0, 0).display(), "#REF!");
+
+    // Undo Delete -> Sales restored, Sheet2 formula & value restored.
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheets.len(), 3);
+    assert_eq!(app.wb.sheet(2).name, "Sales");
+    assert_eq!(
+        app.wb.sheet(1).get(0, 0).unwrap().formula.as_deref(),
+        Some("='Sales'!A1*2")
+    );
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(84.0));
+
+    // Undo Copy -> Sales (2) removed.
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheets.len(), 2);
+    assert_eq!(app.wb.sheet(0).name, "Sheet2");
+    assert_eq!(app.wb.sheet(1).name, "Sales");
+
+    // Undo Move -> Sales back at 0, Sheet2 back at 1.
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).name, "Sales");
+    assert_eq!(app.wb.sheet(1).name, "Sheet2");
+
+    // Undo Rename -> Sheet1 restored, formula back to =Sheet1!A1*2.
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).name, "Sheet1");
+    assert_eq!(
+        app.wb.sheet(1).get(0, 0).unwrap().formula.as_deref(),
+        Some("=Sheet1!A1*2")
+    );
+    assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(84.0));
+
+    // Undo Append -> back to single sheet, sheet_idx clamped to 0.
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheets.len(), 1);
+    assert_eq!(app.sheet_idx, 0);
+
+    // Redo full chain (Append -> Rename -> Move -> Copy -> Delete).
+    for step in 0..5 {
+        assert!(app.apply_undo(true), "redo step {step} failed: {}", app.status);
+    }
+    assert_eq!(app.wb.sheets.len(), 2);
+    assert_eq!(app.wb.sheet(0).name, "Sales (2)");
+    assert_eq!(app.wb.sheet(1).name, "Sheet2");
+    assert_eq!(app.wb.sheet(1).value(0, 0).display(), "#REF!");
+}
+
+#[test]
+fn phase3_tx_sheet_tab_undo_redo_preserves_other_sheet_views_without_index_corruption() {
+    let _env = crate::test_env::TestEnv::new("p3-tx-sheet-undo-views");
+    let mut app = app();
+    assert!(sheetcore::sheet_ops::insert_sheet(
+        &mut app.wb,
+        1,
+        sheetcore::model::Sheet::new("B")
+    ));
+    assert!(sheetcore::sheet_ops::insert_sheet(
+        &mut app.wb,
+        2,
+        sheetcore::model::Sheet::new("C")
+    ));
+    let a_id = app.wb.sheet(0).identity;
+    let b_id = app.wb.sheet(1).identity;
+    let c_id = app.wb.sheet(2).identity;
+
+    // Seed distinct views on A, B, and C.
+    app.sel = (2, 1);
+    app.sel_end = (2, 1);
+    app.scroll = egui::vec2(3.0, 4.0);
+    app.zoom = 1.1;
+    assert!(app.switch_sheet_view(1));
+    app.sel = (7, 2);
+    app.sel_end = (7, 2);
+    app.scroll = egui::vec2(11.0, 12.0);
+    app.zoom = 1.4;
+    assert!(app.switch_sheet_view(2));
+    app.sel = (99, 25);
+    app.sel_end = (99, 25);
+    app.scroll = egui::vec2(13.0, 14.0);
+    app.zoom = 1.5;
+
+    // 1) Delete A (index 0) while active on C (index 2 -> 1), then Undo -> [A, B, C].
+    //    `B` now sits at index 1; Undo must NOT overwrite B's saved view with C's live view.
+    app.delete_sheet(0);
+    assert_eq!(app.wb.sheets.len(), 2);
+    assert_eq!(app.sheet_idx, 1);
+    assert_eq!(app.wb.sheet(app.sheet_idx).identity, c_id);
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheets.len(), 3);
+    assert_eq!(app.wb.sheet(0).identity, a_id);
+    assert_eq!(app.wb.sheet(1).identity, b_id);
+    assert_eq!(app.wb.sheet(2).identity, c_id);
+    let b_view = app.sheet_views.get(&b_id).expect("B view must survive");
+    assert_eq!(b_view.scroll, egui::vec2(11.0, 12.0));
+    assert!((b_view.zoom - 1.4).abs() < f32::EPSILON);
+    // Verify C's live/saved view was not lost either.
+    assert!(app.switch_sheet_view(2));
+    assert_eq!(app.scroll, egui::vec2(13.0, 14.0));
+    assert!((app.zoom - 1.5).abs() < f32::EPSILON);
+
+    // 2) Move B (index 1) to index 0 while active on B, then Undo -> [A, B, C].
+    //    `A` now sits at index 0; Undo must NOT corrupt A's saved view with B's live view.
+    assert!(app.switch_sheet_view(0));
+    app.sel = (2, 1);
+    app.sel_end = (2, 1);
+    app.scroll = egui::vec2(3.0, 4.0);
+    app.zoom = 1.1;
+    assert!(app.switch_sheet_view(1));
+    assert_eq!(app.scroll, egui::vec2(11.0, 12.0));
+    assert!((app.zoom - 1.4).abs() < f32::EPSILON);
+    assert!(app.swap_sheet_positions(1, 0));
+    assert_eq!(app.sheet_idx, 0);
+    assert_eq!(app.wb.sheet(0).identity, b_id);
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).identity, a_id);
+    assert_eq!(app.wb.sheet(1).identity, b_id);
+    let a_view = app.sheet_views.get(&a_id).expect("A view must survive");
+    assert_eq!(a_view.scroll, egui::vec2(3.0, 4.0));
+    assert!((a_view.zoom - 1.1).abs() < f32::EPSILON);
+    assert!(app.switch_sheet_view(1));
+    assert_eq!(app.scroll, egui::vec2(11.0, 12.0));
+    assert!((app.zoom - 1.4).abs() < f32::EPSILON);
+
+    // 3) Delete active sheet A -> lands on B, user scrolls B, then Undo restores A at index 0.
+    //    B's updated live scroll/zoom must be saved under b_id (not lost or written to a_id).
+    assert!(app.switch_sheet_view(0));
+    app.delete_sheet(0);
+    assert_eq!(app.sheet_idx, 0);
+    assert_eq!(app.wb.sheet(0).identity, b_id);
+    app.scroll = egui::vec2(44.0, 55.0);
+    app.zoom = 1.75;
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).identity, a_id);
+    assert_eq!(app.wb.sheet(1).identity, b_id);
+    let b_after = app.sheet_views.get(&b_id).expect("B view must be saved under b_id");
+    assert_eq!(b_after.scroll, egui::vec2(44.0, 55.0));
+    assert!((b_after.zoom - 1.75).abs() < f32::EPSILON);
+    assert!(app.switch_sheet_view(1));
+    assert_eq!(app.scroll, egui::vec2(44.0, 55.0));
+    assert!((app.zoom - 1.75).abs() < f32::EPSILON);
+}
+
+
+
 
 
 
