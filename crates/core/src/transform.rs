@@ -12,6 +12,8 @@ use crate::model::{Sheet, Workbook};
 use crate::refs::{Axis, AxisMove, MappedShift, Shift, permute_index};
 use crate::structural::{CellShift, CellShiftConflict, Structural};
 
+pub use crate::participant::{CellShiftMode, CoordParticipant};
+
 /// Compile-time classification of every field on `Sheet` and `Workbook`.
 ///
 /// Used exclusively by `verify_sheet_field_coverage` and
@@ -33,6 +35,9 @@ pub enum FieldCoordPolicy {
 
 #[inline]
 fn assert_field_policy<T>(_field: &T, _policy: FieldCoordPolicy) {}
+
+#[inline]
+fn assert_field_participant<T>(_field: &T, _participant: CoordParticipant) {}
 
 /// Compile-time exhaustive field-coverage guard for `crate::model::Sheet`.
 /// Adding a field to `Sheet` without classifying it here is a hard compile error.
@@ -187,40 +192,73 @@ pub(crate) fn verify_sheet_field_coverage(sheet: &Sheet) {
     assert_field_policy(hidden_dirty, FieldCoordPolicy::DerivedOrDirty);
     assert_field_policy(view_dirty, FieldCoordPolicy::DerivedOrDirty);
 
-    // CoordBound
+    // CoordBound (every coordinate-bound field explicitly bound to its CoordParticipant)
     assert_field_policy(cells, FieldCoordPolicy::CoordBound);
+    assert_field_participant(cells, CoordParticipant::CellsAndStyles);
     assert_field_policy(spilled, FieldCoordPolicy::CoordBound);
+    assert_field_participant(spilled, CoordParticipant::ArraysAndSpills);
     assert_field_policy(spill_shapes, FieldCoordPolicy::CoordBound);
+    assert_field_participant(spill_shapes, CoordParticipant::ArraysAndSpills);
     assert_field_policy(arrays, FieldCoordPolicy::CoordBound);
+    assert_field_participant(arrays, CoordParticipant::ArraysAndSpills);
     assert_field_policy(tables, FieldCoordPolicy::CoordBound);
+    assert_field_participant(tables, CoordParticipant::Tables);
     assert_field_policy(pictures, FieldCoordPolicy::CoordBound);
+    assert_field_participant(pictures, CoordParticipant::LayoutAndPage);
     assert_field_policy(merges, FieldCoordPolicy::CoordBound);
+    assert_field_participant(merges, CoordParticipant::Merges);
     assert_field_policy(cols, FieldCoordPolicy::CoordBound);
+    assert_field_participant(cols, CoordParticipant::LayoutAndPage);
     assert_field_policy(rows, FieldCoordPolicy::CoordBound);
+    assert_field_participant(rows, CoordParticipant::LayoutAndPage);
     assert_field_policy(styles, FieldCoordPolicy::CoordBound);
+    assert_field_participant(styles, CoordParticipant::CellsAndStyles);
     assert_field_policy(col_styles, FieldCoordPolicy::CoordBound);
+    assert_field_participant(col_styles, CoordParticipant::CellsAndStyles);
     assert_field_policy(row_styles, FieldCoordPolicy::CoordBound);
+    assert_field_participant(row_styles, CoordParticipant::CellsAndStyles);
     assert_field_policy(cf, FieldCoordPolicy::CoordBound);
+    assert_field_participant(cf, CoordParticipant::ConditionalAndValidation);
     assert_field_policy(dv, FieldCoordPolicy::CoordBound);
+    assert_field_participant(dv, CoordParticipant::ConditionalAndValidation);
     assert_field_policy(notes, FieldCoordPolicy::CoordBound);
+    assert_field_participant(notes, CoordParticipant::CellNotesAndThreads);
     assert_field_policy(threads, FieldCoordPolicy::CoordBound);
+    assert_field_participant(threads, CoordParticipant::CellNotesAndThreads);
     assert_field_policy(freeze, FieldCoordPolicy::CoordBound);
+    assert_field_participant(freeze, CoordParticipant::LayoutAndPage);
     assert_field_policy(filter, FieldCoordPolicy::CoordBound);
+    assert_field_participant(filter, CoordParticipant::AutoFilter);
     assert_field_policy(hidden_rows, FieldCoordPolicy::CoordBound);
+    assert_field_participant(hidden_rows, CoordParticipant::LayoutAndPage);
     assert_field_policy(hidden_rows_user, FieldCoordPolicy::CoordBound);
+    assert_field_participant(hidden_rows_user, CoordParticipant::LayoutAndPage);
     assert_field_policy(hidden_cols, FieldCoordPolicy::CoordBound);
+    assert_field_participant(hidden_cols, CoordParticipant::LayoutAndPage);
     assert_field_policy(scenarios, FieldCoordPolicy::CoordBound);
+    assert_field_participant(scenarios, CoordParticipant::ScenariosAndProtectedRanges);
     assert_field_policy(scenario_settings, FieldCoordPolicy::CoordBound);
+    assert_field_participant(scenario_settings, CoordParticipant::ScenariosAndProtectedRanges);
     assert_field_policy(ignored_errors, FieldCoordPolicy::CoordBound);
+    assert_field_participant(ignored_errors, CoordParticipant::IgnoredErrors);
     assert_field_policy(row_levels, FieldCoordPolicy::CoordBound);
+    assert_field_participant(row_levels, CoordParticipant::LayoutAndPage);
     assert_field_policy(col_levels, FieldCoordPolicy::CoordBound);
+    assert_field_participant(col_levels, CoordParticipant::LayoutAndPage);
     assert_field_policy(page, FieldCoordPolicy::CoordBound);
+    assert_field_participant(page, CoordParticipant::LayoutAndPage);
     assert_field_policy(charts, FieldCoordPolicy::CoordBound);
+    assert_field_participant(charts, CoordParticipant::Charts);
     assert_field_policy(protected_ranges, FieldCoordPolicy::CoordBound);
+    assert_field_participant(protected_ranges, CoordParticipant::ScenariosAndProtectedRanges);
     assert_field_policy(rich, FieldCoordPolicy::CoordBound);
+    assert_field_participant(rich, CoordParticipant::RichAndHyperlinks);
     assert_field_policy(hyperlinks, FieldCoordPolicy::CoordBound);
+    assert_field_participant(hyperlinks, CoordParticipant::RichAndHyperlinks);
     assert_field_policy(sparklines, FieldCoordPolicy::CoordBound);
+    assert_field_participant(sparklines, CoordParticipant::Sparklines);
     assert_field_policy(textboxes, FieldCoordPolicy::CoordBound);
+    assert_field_participant(textboxes, CoordParticipant::LayoutAndPage);
 }
 
 /// Compile-time exhaustive field-coverage guard for `crate::model::Workbook`.
@@ -302,14 +340,21 @@ pub(crate) fn verify_workbook_field_coverage(wb: &Workbook) {
     assert_field_policy(chart_edits, FieldCoordPolicy::DerivedOrDirty);
     assert_field_policy(coord_epoch, FieldCoordPolicy::DerivedOrDirty);
 
-    // CoordBound
+    // CoordBound (every workbook-level coordinate-bound field bound to its CoordParticipant)
     assert_field_policy(names, FieldCoordPolicy::CoordBound);
+    assert_field_participant(names, CoordParticipant::DefinedNames);
     assert_field_policy(sources, FieldCoordPolicy::CoordBound);
+    assert_field_participant(sources, CoordParticipant::ExternalSources);
     assert_field_policy(pivot_shifts, FieldCoordPolicy::CoordBound);
+    assert_field_participant(pivot_shifts, CoordParticipant::Pivots);
     assert_field_policy(pivots_pending, FieldCoordPolicy::CoordBound);
+    assert_field_participant(pivots_pending, CoordParticipant::Pivots);
     assert_field_policy(pivots_pending2, FieldCoordPolicy::CoordBound);
+    assert_field_participant(pivots_pending2, CoordParticipant::Pivots);
     assert_field_policy(pivots, FieldCoordPolicy::CoordBound);
+    assert_field_participant(pivots, CoordParticipant::Pivots);
     assert_field_policy(sheets, FieldCoordPolicy::CoordBound);
+    assert_field_participant(sheets, CoordParticipant::CellsAndStyles);
 }
 
 /// Unified coordinate transformation geometry covering every workbook
@@ -851,60 +896,7 @@ impl CoordTransform {
 
     /// Validate whether this transform can safely execute on `wb`.
     pub fn preflight(&self, wb: &Workbook) -> Result<(), CellShiftConflict> {
-        let sheet_idx = self.target_sheet();
-        if wb.sheets.get(sheet_idx).is_none() {
-            return Err(CellShiftConflict::InvalidTarget);
-        }
-        let limit = self.axis_limit();
-        match self {
-            Self::AxisShift {
-                band: Some(_), ..
-            } => {
-                let Some(cs) = self.as_cell_shift() else {
-                    return Err(CellShiftConflict::InvalidTarget);
-                };
-                cs.preflight(wb, sheet_idx)
-            }
-            Self::AxisShift {
-                at,
-                n,
-                delete,
-                band: None,
-                ..
-            } => {
-                if *at >= limit {
-                    return Err(CellShiftConflict::InvalidTarget);
-                }
-                if !*delete && *n > limit - *at {
-                    return Err(CellShiftConflict::Overflow);
-                }
-                Ok(())
-            }
-            Self::AxisPermute { from, n, at, .. } => {
-                if *n == 0 || *from == *at {
-                    return Err(CellShiftConflict::InvalidTarget);
-                }
-                let Some(from_end) = from.checked_add(*n) else {
-                    return Err(CellShiftConflict::Overflow);
-                };
-                let Some(at_end) = at.checked_add(*n) else {
-                    return Err(CellShiftConflict::Overflow);
-                };
-                if from_end > limit || at_end > limit {
-                    return Err(CellShiftConflict::Overflow);
-                }
-                Ok(())
-            }
-            Self::MultiInsert { positions, .. } => {
-                if positions.len() >= limit as usize {
-                    return Err(CellShiftConflict::Overflow);
-                }
-                if positions.iter().any(|&p| p >= limit) {
-                    return Err(CellShiftConflict::InvalidTarget);
-                }
-                Ok(())
-            }
-        }
+        CoordParticipant::preflight_all(wb, self)
     }
 
     /// Build a `Shift` + `&[u32]` pair for `AxisShift` / `MultiInsert` callers
@@ -977,13 +969,8 @@ impl CoordTransform {
         }
     }
 
-    /// Rewrite all formulas, CF rules (including `Scale`/`Bar`/`IconSet` CFVO
-    /// `Formula` thresholds), and DV formulas on `sheet` referencing `target_sheet`.
-    pub(crate) fn rewrite_sheet_formulas_cf_dv(
-        &self,
-        sheet: &mut Sheet,
-        target_sheet: &str,
-    ) {
+    /// Rewrite all cell formulas on `sheet` referencing `target_sheet`.
+    pub(crate) fn rewrite_sheet_cell_formulas(&self, sheet: &mut Sheet, target_sheet: &str) {
         if self.is_noop() {
             return;
         }
@@ -1006,8 +993,15 @@ impl CoordTransform {
                         if !formula_may_be_affected_from(old, axis, min_at) {
                             return None;
                         }
-                        let new =
-                            crate::refs::permute_axis(old, axis, from, n, at, target_sheet, &own_name);
+                        let new = crate::refs::permute_axis(
+                            old,
+                            axis,
+                            from,
+                            n,
+                            at,
+                            target_sheet,
+                            &own_name,
+                        );
                         (new != old).then(|| new.into())
                     })
             }
@@ -1035,7 +1029,15 @@ impl CoordTransform {
             }
         };
         sheet.edited |= changed;
+    }
 
+    /// Rewrite CF rules (including `Scale`/`Bar`/`IconSet` CFVO `Formula`
+    /// thresholds) and DV formulas on `sheet` referencing `target_sheet`.
+    pub(crate) fn rewrite_sheet_cf_dv(&self, sheet: &mut Sheet, target_sheet: &str) {
+        if self.is_noop() {
+            return;
+        }
+        let own_name = sheet.name.clone();
         for blk in sheet.cf.blocks.iter_mut() {
             for rule in blk.rules.iter_mut() {
                 if rule
@@ -1053,6 +1055,43 @@ impl CoordTransform {
                 dv.f1 = f1;
                 dv.f2 = f2;
                 sheet.dv_dirty = true;
+            }
+        }
+    }
+
+    /// Update sparkline data rects across ALL sheets for a partial-band `CellShift`.
+    /// Target-sheet sparkline anchors were already moved/dropped by `cells::try_insert`/`delete`;
+    /// here we remap every surviving sparkline's `rect` (both target-sheet `source_sheet == None`
+    /// and any sheet's explicit `source_sheet` matching `target_sheet` case-insensitively).
+    pub(crate) fn remap_band_sparklines(
+        &self,
+        wb: &mut Workbook,
+        sheet_idx: usize,
+        target_sheet: &str,
+    ) {
+        if self.is_noop() {
+            return;
+        }
+        for (si, sheet) in wb.sheets.iter_mut().enumerate() {
+            if sheet.sparklines.is_empty() {
+                continue;
+            }
+            for sp in sheet.sparklines.iter_mut() {
+                let targets_sheet = (si == sheet_idx && sp.source_sheet.is_none())
+                    || sp
+                        .source_sheet
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(target_sheet));
+                if !targets_sheet {
+                    continue;
+                }
+                let norm = crate::participant::norm_rect(sp.rect);
+                if let Some(next) = self.map_rect(norm)
+                    && next != norm
+                {
+                    sp.rect = next;
+                    sheet.sparklines_dirty = true;
+                }
             }
         }
     }
@@ -1076,9 +1115,10 @@ impl CoordTransform {
             {
                 continue;
             }
-            match self.map_rect(sp.rect) {
+            let norm = crate::participant::norm_rect(sp.rect);
+            match self.map_rect(norm) {
                 Some(next) => {
-                    if next != sp.rect {
+                    if next != norm {
                         sp.rect = next;
                         sheet.sparklines_dirty = true;
                     }
@@ -1090,7 +1130,7 @@ impl CoordTransform {
                         delete: true,
                         ..
                     } => {
-                        let (r1, c1, r2, c2) = sp.rect;
+                        let (r1, c1, r2, c2) = norm;
                         let clamped = match axis {
                             Axis::Row => (at, c1, at, c2),
                             Axis::Col => (r1, at, r2, at),
@@ -1117,65 +1157,10 @@ impl CoordTransform {
     /// points: `apply_structural_wb`, `move_rows_wb`/`move_cols_wb`,
     /// `CellShift::apply`/`apply_cell_shift_wb`, and `insert_subtotal_rows`.
     pub(crate) fn apply_workbook_references(&self, wb: &mut Workbook) {
-        if self.is_noop() {
-            return;
-        }
-        let sheet_idx = self.target_sheet();
-        let Some(target_name) = wb.sheets.get(sheet_idx).map(|s| s.name.clone()) else {
-            return;
-        };
-        let target_sid = wb.sheets[sheet_idx].identity;
-        let is_band = self.band().is_some();
-        wb.bump_coord_epoch();
-
-        // 1. External/internal data source bindings (`wb.sources`).
-        crate::external::remap_sources(wb, sheet_idx, self.axis(), self.band(), |lo, hi| {
-            self.map_range(lo, hi)
-        });
-
-        // 2. For band shifts (`CellShift`), rewrite target-sheet internal hyperlink `location`
-        //    (whole-axis / permute / multi-insert rewrite target hyperlinks during sheet mutation).
-        if is_band {
-            let target = &mut wb.sheets[sheet_idx];
-            rewrite_target_hyperlink_locations(target, self);
-        }
-
-        // 3. Per-sheet reference-bearing subsystems across ALL sheets (`wb.sheets`).
-        for sheet in &mut wb.sheets {
-            let own_name = sheet.name.clone();
-            self.rewrite_sheet_formulas_cf_dv(sheet, &target_name);
-            if !is_band {
-                for ch in sheet.charts.iter_mut() {
-                    if ch.rewrite_with_transform(self, &target_name, &own_name) {
-                        sheet.charts_dirty = true;
-                    }
-                }
-                self.remap_sheet_qualified_sparklines(sheet, &target_name);
-            }
-        }
-
-        // 4. Workbook defined names (`wb.names`).
-        for (_, scope, text) in &mut wb.names {
-            let own_name = scope
-                .and_then(|i| wb.sheets.get(i))
-                .map(|s| s.name.as_str())
-                .unwrap_or("");
-            let rewritten = self.rewrite_formula(text, &target_name, own_name);
-            if rewritten != *text {
-                *text = rewritten;
-                wb.names_dirty = true;
-            }
-        }
-
-        // 5. Workbook pivot cache shift journal & pivot models (whole-axis / permute / multi-insert).
-        //    For band shifts, `CellShift::preflight` already blocks overlapping pivots.
-        if !is_band {
-            self.record_pivot_shifts(wb, &target_name);
-            self.remap_pivots(wb, sheet_idx, target_sid, &target_name);
-        }
+        CoordParticipant::apply_all_workbook_refs(wb, self);
     }
 
-    fn record_pivot_shifts(&self, wb: &mut Workbook, target_name: &str) {
+    pub(crate) fn record_pivot_shifts(&self, wb: &mut Workbook, target_name: &str) {
         match self {
             Self::AxisShift {
                 axis,
@@ -1208,7 +1193,7 @@ impl CoordTransform {
         }
     }
 
-    fn remap_pivots(
+    pub(crate) fn remap_pivots(
         &self,
         wb: &mut Workbook,
         sheet_idx: usize,
@@ -1738,60 +1723,4 @@ pub(crate) fn rewrite_target_hyperlink_locations(sheet: &mut Sheet, transform: &
         }
         sheet.hyperlinks_dirty = true;
     }
-}
-
-/// Check whether a chart series reference or `source_range` references cells
-/// intersecting `ray` on `target_name` (or would be rewritten by `transform`).
-pub(crate) fn chart_ref_intersects_ray(
-    ref_str: &str,
-    own_is_target: bool,
-    own_name: &str,
-    target_name: &str,
-    ray: (u32, u32, u32, u32),
-    transform: &CoordTransform,
-) -> bool {
-    let trimmed = ref_str.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let inner = trimmed
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .unwrap_or(trimmed);
-    // Split multi-area chart refs like `(Sheet1!$A$1:$A$3,Sheet1!$C$1:$C$3)` outside quotes.
-    let mut start = 0usize;
-    let mut in_quote = false;
-    let bytes = inner.as_bytes();
-    let mut i = 0usize;
-    while i <= bytes.len() {
-        let at_sep = if i == bytes.len() {
-            true
-        } else {
-            if bytes[i] == b'\'' {
-                in_quote = !in_quote;
-            }
-            !in_quote && bytes[i] == b','
-        };
-        if at_sep {
-            let part = inner[start..i].trim();
-            if let Some((sheet_opt, rect)) = crate::charts::parse_ref_rect(part) {
-                let hits_sheet = match sheet_opt {
-                    Some(name) => name.eq_ignore_ascii_case(target_name),
-                    None => own_is_target,
-                };
-                if hits_sheet
-                    && rect.0 <= ray.2
-                    && ray.0 <= rect.2
-                    && rect.1 <= ray.3
-                    && ray.1 <= rect.3
-                {
-                    return true;
-                }
-            }
-            start = i + 1;
-        }
-        i += 1;
-    }
-    transform.formula_may_be_affected(trimmed)
-        && transform.rewrite_formula(trimmed, target_name, own_name) != trimmed
 }

@@ -14,6 +14,10 @@ struct SheetOverlay {
     merges: Vec<Rect>,
     cf: CfSheet,
     dv: Vec<DataValidation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    chart_refs: Vec<ChartRefsSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sparklines: Vec<crate::sparkline::Sparkline>,
 }
 
 /// Current metadata of the authoritative workbook. Captured at join time, so
@@ -153,6 +157,8 @@ impl CellShiftOverlay {
                     + s.merges.len()
                     + s.cf.blocks.len()
                     + s.dv.len()
+                    + s.chart_refs.len()
+                    + s.sparklines.len()
                     + s.styles.rows.len()
                     + s.styles.cols.len()
                     + s.styles.runs.len()
@@ -196,6 +202,8 @@ impl CellShiftOverlay {
                     && s.ignored_errors.iter().all(|&(r, c)| valid_point(r, c))
                     && s.cf.blocks.iter().flat_map(|b| &b.ranges).all(valid_rect)
                     && s.dv.iter().flat_map(|d| &d.ranges).all(valid_rect)
+                    && s.chart_refs.iter().all(ChartRefsSnapshot::valid)
+                    && s.sparklines.iter().all(valid_sparkline)
             })
             && self
                 .sources
@@ -204,46 +212,128 @@ impl CellShiftOverlay {
     }
 
     pub fn capture(wb: &Workbook) -> Self {
-        let mut palette = Vec::new();
-        let mut ids = HashMap::new();
-        Self {
+        use crate::participant::CoordParticipant;
+
+        let mut overlay = Self {
             sheets: wb
                 .sheets
                 .iter()
                 .map(|s| SheetOverlay {
                     name: s.name.clone(),
-                    styles: OverlayStyles::capture(s, |id| {
-                        *ids.entry(id).or_insert_with(|| {
-                            let i = palette.len() as u16;
-                            palette.push((wb.styles.get(id).clone(), StyleExtras::read(wb, id)));
-                            i
-                        })
-                    }),
-                    notes: entries(&s.notes),
-                    threads: entries(&s.threads),
-                    rich: entries(&s.rich),
-                    links: entries(&s.hyperlinks),
-                    ignored_errors: {
-                        let mut v: Vec<_> = s.ignored_errors.iter().copied().collect();
-                        v.sort_unstable();
-                        v
-                    },
-                    merges: s.merges.to_vec(),
-                    cf: s.cf.clone(),
-                    dv: s.dv.clone(),
+                    styles: OverlayStyles::default(),
+                    notes: Vec::new(),
+                    threads: Vec::new(),
+                    rich: Vec::new(),
+                    links: Vec::new(),
+                    ignored_errors: Vec::new(),
+                    merges: Vec::new(),
+                    cf: CfSheet::default(),
+                    dv: Vec::new(),
+                    chart_refs: Vec::new(),
+                    sparklines: Vec::new(),
                 })
                 .collect(),
-            palette,
-            names: wb.names.iter().filter(|(n, _, _)| shared_name(n)).cloned().collect(),
-            sources: wb
-                .sources
-                .iter()
-                .map(|s| (s.name.clone(), SourceGeometry::read(s)))
-                .collect(),
+            palette: Vec::new(),
+            sources: Vec::new(),
+            names: Vec::new(),
+        };
+        let mut ids = HashMap::new();
+        for participant in CoordParticipant::ALL {
+            overlay.capture_participant(participant, wb, &mut ids);
+        }
+        overlay
+    }
+
+    /// Exhaustive per-participant snapshot capture driven by `CoordParticipant::ALL`.
+    fn capture_participant(
+        &mut self,
+        participant: crate::participant::CoordParticipant,
+        wb: &Workbook,
+        ids: &mut HashMap<u16, u16>,
+    ) {
+        use crate::participant::CoordParticipant as P;
+        match participant {
+            P::CellsAndStyles => {
+                for (dst, s) in self.sheets.iter_mut().zip(&wb.sheets) {
+                    dst.styles = OverlayStyles::capture(s, |id| {
+                        *ids.entry(id).or_insert_with(|| {
+                            let i = self.palette.len() as u16;
+                            self.palette
+                                .push((wb.styles.get(id).clone(), StyleExtras::read(wb, id)));
+                            i
+                        })
+                    });
+                }
+            }
+            P::CellNotesAndThreads => {
+                for (dst, s) in self.sheets.iter_mut().zip(&wb.sheets) {
+                    dst.notes = entries(&s.notes);
+                    dst.threads = entries(&s.threads);
+                }
+            }
+            P::RichAndHyperlinks => {
+                for (dst, s) in self.sheets.iter_mut().zip(&wb.sheets) {
+                    dst.rich = entries(&s.rich);
+                    dst.links = entries(&s.hyperlinks);
+                }
+            }
+            P::Merges => {
+                for (dst, s) in self.sheets.iter_mut().zip(&wb.sheets) {
+                    dst.merges = s.merges.to_vec();
+                }
+            }
+            P::ConditionalAndValidation => {
+                for (dst, s) in self.sheets.iter_mut().zip(&wb.sheets) {
+                    dst.cf = s.cf.clone();
+                    dst.dv = s.dv.clone();
+                }
+            }
+            P::Charts => {
+                for (dst, s) in self.sheets.iter_mut().zip(&wb.sheets) {
+                    dst.chart_refs = s.charts.iter().map(ChartRefsSnapshot::read).collect();
+                }
+            }
+            P::Sparklines => {
+                for (dst, s) in self.sheets.iter_mut().zip(&wb.sheets) {
+                    let mut v = s.sparklines.clone();
+                    v.sort_by_key(|sp| (sp.r, sp.c));
+                    dst.sparklines = v;
+                }
+            }
+            P::DefinedNames => {
+                self.names = wb
+                    .names
+                    .iter()
+                    .filter(|(n, _, _)| shared_name(n))
+                    .cloned()
+                    .collect();
+            }
+            P::ExternalSources => {
+                self.sources = wb
+                    .sources
+                    .iter()
+                    .map(|s| (s.name.clone(), SourceGeometry::read(s)))
+                    .collect();
+            }
+            P::IgnoredErrors => {
+                for (dst, s) in self.sheets.iter_mut().zip(&wb.sheets) {
+                    let mut v: Vec<_> = s.ignored_errors.iter().copied().collect();
+                    v.sort_unstable();
+                    dst.ignored_errors = v;
+                }
+            }
+            P::Tables
+            | P::Pivots
+            | P::ArraysAndSpills
+            | P::AutoFilter
+            | P::ScenariosAndProtectedRanges
+            | P::LayoutAndPage => {}
         }
     }
 
     pub fn apply_to(&self, wb: &mut Workbook) -> bool {
+        use crate::participant::CoordParticipant;
+
         if !self.wire_valid()
             || self.sheets.len() != wb.sheets.len()
             || self
@@ -262,46 +352,120 @@ impl CellShiftOverlay {
                     .intern_with_ext(s.clone(), e.theme, e.pattern.clone(), e.quote)
             })
             .collect();
-        for (overlay, sh) in self.sheets.iter().zip(&mut wb.sheets) {
-            overlay.styles.apply(sh, &palette);
-            sh.notes_dirty |= replace_entries(&mut sh.notes, &overlay.notes);
-            sh.threads_dirty |= replace_entries(&mut sh.threads, &overlay.threads);
-            sh.rich_dirty |= replace_entries(&mut sh.rich, &overlay.rich);
-            sh.hyperlinks_dirty |= replace_entries(&mut sh.hyperlinks, &overlay.links);
-            {
-                let mut cur: Vec<_> = sh.ignored_errors.iter().copied().collect();
-                cur.sort_unstable();
-                if cur != overlay.ignored_errors {
-                    sh.ignored_errors = overlay.ignored_errors.iter().copied().collect();
-                    sh.ignored_errors_dirty = true;
-                }
-            }
-            if sh.merges != overlay.merges {
-                sh.merges = overlay.merges.clone().into();
-                sh.merges_dirty = true;
-            }
-            if sh.cf != overlay.cf {
-                sh.cf.clone_from(&overlay.cf);
-                sh.cf_dirty = true;
-            }
-            if sh.dv != overlay.dv {
-                sh.dv.clone_from(&overlay.dv);
-                sh.dv_dirty = true;
-            }
+        for participant in CoordParticipant::ALL {
+            self.apply_participant(participant, wb, &palette);
+        }
+        for sh in &mut wb.sheets {
             sh.coordinates_shifted();
-        }
-        if !wb.names.iter().filter(|(n, _, _)| shared_name(n)).eq(&self.names) {
-            wb.names.retain(|(n, _, _)| !shared_name(n));
-            wb.names.extend_from_slice(&self.names);
-            wb.names_dirty = true;
-        }
-        for (name, geo) in &self.sources {
-            if let Some(src) = wb.sources.iter_mut().find(|local| local.name == *name) {
-                geo.write(src);
-            }
         }
         wb.bump_coord_epoch();
         wb.dirty = true;
         true
+    }
+
+    /// Exhaustive per-participant overlay application driven by `CoordParticipant::ALL`.
+    fn apply_participant(
+        &self,
+        participant: crate::participant::CoordParticipant,
+        wb: &mut Workbook,
+        palette: &[u16],
+    ) {
+        use crate::participant::CoordParticipant as P;
+        match participant {
+            P::CellsAndStyles => {
+                for (overlay, sh) in self.sheets.iter().zip(&mut wb.sheets) {
+                    overlay.styles.apply(sh, palette);
+                }
+            }
+            P::CellNotesAndThreads => {
+                for (overlay, sh) in self.sheets.iter().zip(&mut wb.sheets) {
+                    sh.notes_dirty |= replace_entries(&mut sh.notes, &overlay.notes);
+                    sh.threads_dirty |= replace_entries(&mut sh.threads, &overlay.threads);
+                }
+            }
+            P::RichAndHyperlinks => {
+                for (overlay, sh) in self.sheets.iter().zip(&mut wb.sheets) {
+                    sh.rich_dirty |= replace_entries(&mut sh.rich, &overlay.rich);
+                    sh.hyperlinks_dirty |= replace_entries(&mut sh.hyperlinks, &overlay.links);
+                }
+            }
+            P::Merges => {
+                for (overlay, sh) in self.sheets.iter().zip(&mut wb.sheets) {
+                    if sh.merges != overlay.merges {
+                        sh.merges = overlay.merges.clone().into();
+                        sh.merges_dirty = true;
+                    }
+                }
+            }
+            P::ConditionalAndValidation => {
+                for (overlay, sh) in self.sheets.iter().zip(&mut wb.sheets) {
+                    if sh.cf != overlay.cf {
+                        sh.cf.clone_from(&overlay.cf);
+                        sh.cf_dirty = true;
+                    }
+                    if sh.dv != overlay.dv {
+                        sh.dv.clone_from(&overlay.dv);
+                        sh.dv_dirty = true;
+                    }
+                }
+            }
+            P::Charts => {
+                for (overlay, sh) in self.sheets.iter().zip(&mut wb.sheets) {
+                    if !overlay.chart_refs.is_empty() && sh.charts.len() == overlay.chart_refs.len()
+                    {
+                        let mut changed = false;
+                        for (snap, ch) in overlay.chart_refs.iter().zip(sh.charts.iter_mut()) {
+                            changed |= snap.apply_to_chart(ch);
+                        }
+                        sh.charts_dirty |= changed;
+                    }
+                }
+            }
+            P::Sparklines => {
+                for (overlay, sh) in self.sheets.iter().zip(&mut wb.sheets) {
+                    let mut cur = sh.sparklines.clone();
+                    cur.sort_by_key(|sp| (sp.r, sp.c));
+                    if cur != overlay.sparklines {
+                        sh.sparklines.clone_from(&overlay.sparklines);
+                        sh.sparklines_dirty = true;
+                    }
+                }
+            }
+            P::DefinedNames => {
+                if !wb
+                    .names
+                    .iter()
+                    .filter(|(n, _, _)| shared_name(n))
+                    .eq(&self.names)
+                {
+                    wb.names.retain(|(n, _, _)| !shared_name(n));
+                    wb.names.extend_from_slice(&self.names);
+                    wb.names_dirty = true;
+                }
+            }
+            P::ExternalSources => {
+                for (name, geo) in &self.sources {
+                    if let Some(src) = wb.sources.iter_mut().find(|local| local.name == *name) {
+                        geo.write(src);
+                    }
+                }
+            }
+            P::IgnoredErrors => {
+                for (overlay, sh) in self.sheets.iter().zip(&mut wb.sheets) {
+                    let mut cur: Vec<_> = sh.ignored_errors.iter().copied().collect();
+                    cur.sort_unstable();
+                    if cur != overlay.ignored_errors {
+                        sh.ignored_errors = overlay.ignored_errors.iter().copied().collect();
+                        sh.ignored_errors_dirty = true;
+                    }
+                }
+            }
+            P::Tables
+            | P::Pivots
+            | P::ArraysAndSpills
+            | P::AutoFilter
+            | P::ScenariosAndProtectedRanges
+            | P::LayoutAndPage => {}
+        }
     }
 }

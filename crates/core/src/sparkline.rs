@@ -16,7 +16,7 @@
 use std::path::Path;
 
 /// 迷你图类型
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SparkKind {
     #[default]
     Line,
@@ -36,7 +36,7 @@ impl SparkKind {
 }
 
 /// 空单元格怎么处理（对应 `displayEmptyCellsAs`）
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum EmptyAs {
     /// 断开（gap）
     #[default]
@@ -72,7 +72,7 @@ impl EmptyAs {
 }
 
 /// 一条迷你图
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Sparkline {
     /// 锚点格（0-based）
     pub r: u32,

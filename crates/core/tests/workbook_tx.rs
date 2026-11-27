@@ -833,25 +833,12 @@ fn preflight_errors_leave_workbook_and_undo_untouched() {
     );
     wb.sheets[0].filter = None;
 
-    wb.sheets[0].charts.push(Chart {
-        kind: ChartKind::Column,
-        series: vec![Series {
-            val_ref: "S1!$A$2:$A$4".into(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    });
-    assert_eq!(
-        WorkbookTx::execute(&mut wb, intent.clone(), (0, 1, 0)).unwrap_err(),
-        TxError::Conflict(CellShiftConflict::Chart)
-    );
-    wb.sheets[0].charts.clear();
-
     wb.sheets[0].sparklines.push(Sparkline {
-        r: 2,
-        c: 0,
+        r: 0,
+        c: 5,
         source_sheet: None,
-        rect: (0, 1, 0, 3),
+        // Straddles the col-A moving band (A3:B3) -> still blocked by preflight
+        rect: (2, 0, 2, 1),
         ..Default::default()
     });
     assert_eq!(

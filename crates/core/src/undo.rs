@@ -2556,12 +2556,8 @@ pub fn snapshot_cell_shift(wb: &Workbook, sheet: usize, op: &crate::structural::
 /// Ordinary cell/formula/style edits need only sparse cell deltas. Avoid cloning
 /// sheet and workbook state when none of the metadata a partial shift can change exists.
 pub fn snapshot_cell_shift_if_metadata(wb: &Workbook, sheet: usize, op: &crate::structural::CellShift) -> Option<StructureSnapshot> {
-    let target = wb.sheets.get(sheet)?;
-    let has_metadata = !target.notes.is_empty() || !target.threads.is_empty() || !target.merges.is_empty()
-        || !target.rich.is_empty() || !target.hyperlinks.is_empty() || !target.ignored_errors.is_empty()
-        || !wb.sources.is_empty() || !wb.names.is_empty()
-        || wb.sheets.iter().any(|sh| !sh.cf.blocks.is_empty() || !sh.dv.is_empty());
-    has_metadata.then(|| snapshot_cell_shift(wb, sheet, op))
+    crate::participant::CoordParticipant::any_cell_shift_metadata(wb, sheet)
+        .then(|| snapshot_cell_shift(wb, sheet, op))
 }
 
 /// Shared cell history can also restore workbook bindings when a local ray moves them.
@@ -2631,17 +2627,35 @@ impl StructureSnapshot {
     /// Cell deltas already cover values, formulas and styles. A partial shift
     /// needs structural history only if it also changed other workbook state.
     pub fn cell_shift_changed_metadata(&self, wb: &Workbook) -> bool {
-        let old = &self.target;
-        let new = &wb.sheets[self.sheet];
-        self.names != wb.names || self.sources != wb.sources || old.merges != new.merges || old.notes != new.notes
-            || old.threads != new.threads || old.rich != new.rich || old.hyperlinks != new.hyperlinks
-            || old.ignored_errors != new.ignored_errors
-            || old.cf != new.cf || old.dv != new.dv
-            || self.foreign.iter().any(|scope| {
-                let sheet = &wb.sheets[scope.sheet];
-                scope.cf.as_ref().is_some_and(|cf| *cf != sheet.cf)
-                    || scope.dv.as_ref().is_some_and(|dv| *dv != sheet.dv)
-            })
+        let mut foreign_cf_changed = false;
+        let mut foreign_dv_changed = false;
+        let mut foreign_charts_changed = false;
+        let mut foreign_sparklines_changed = false;
+        for scope in &self.foreign {
+            let sheet = &wb.sheets[scope.sheet];
+            foreign_cf_changed |= scope.cf.as_ref().is_some_and(|cf| *cf != sheet.cf);
+            foreign_dv_changed |= scope.dv.as_ref().is_some_and(|dv| *dv != sheet.dv);
+            foreign_charts_changed |= scope
+                .charts
+                .as_ref()
+                .is_some_and(|ch| !crate::participant::chart_refs_match(&sheet.charts, ch, false));
+            foreign_sparklines_changed |= scope
+                .sparklines
+                .as_ref()
+                .is_some_and(|sp| *sp != sheet.sparklines);
+        }
+        let view = crate::participant::CellShiftMetaDiffView {
+            target_before: &self.target,
+            target_after: &wb.sheets[self.sheet],
+            names_before: &self.names,
+            sources_before: &self.sources,
+            wb_after: wb,
+            foreign_cf_changed,
+            foreign_dv_changed,
+            foreign_charts_changed,
+            foreign_sparklines_changed,
+        };
+        crate::participant::CoordParticipant::any_cell_shift_metadata_changed(&view)
     }
 
     pub fn detached_source(&self, wb: &Workbook) -> bool {
@@ -2709,18 +2723,7 @@ fn chart_refs_match(
     expected: &[crate::charts::Chart],
     check_anchor: bool,
 ) -> bool {
-    current.len() == expected.len() && current.iter().zip(expected).all(|(a, b)| {
-        a.part == b.part
-            && (!check_anchor || a.anchor == b.anchor)
-            && a.source_range == b.source_range
-            && a.series.len() == b.series.len()
-            && a.series.iter().zip(&b.series).all(|(s, t)| {
-                s.name_ref == t.name_ref
-                    && s.cat_ref == t.cat_ref
-                    && s.val_ref == t.val_ref
-                    && s.size_ref == t.size_ref
-            })
-    })
+    crate::participant::chart_refs_match(current, expected, check_anchor)
 }
 
 /// A row/column operation only changes series references, `source_range`, and
@@ -3549,9 +3552,17 @@ impl UndoStack {
             .filter_map(|i| wb.sheets.get(i).map(|s| (i, s.identity)))
             .collect();
         let label = patch.label().to_owned();
-        let focus = patch
-            .as_cell_shift()
-            .map_or((patch.target_sheet(), 0, 0), |p| (p.target_sheet(), p.rect.0, p.rect.1));
+        let focus = match &*patch {
+            crate::tx::TxPatch::CellShift(p) => (p.target_sheet(), p.rect.0, p.rect.1),
+            crate::tx::TxPatch::AxisPermute(p) => {
+                if p.horizontal {
+                    (p.sheet, 0, p.at)
+                } else {
+                    (p.sheet, p.at, 0)
+                }
+            }
+            crate::tx::TxPatch::DefinedNames(p) => (p.target_sheet(), 0, 0),
+        };
         self.push_tx_delta(
             label,
             focus,
@@ -3630,6 +3641,10 @@ impl UndoStack {
     }
 
     pub fn confirm_room_cell_shift(&mut self, transaction: u64, redo: bool) -> bool {
+        self.confirm_room_tx_patch(transaction, redo)
+    }
+
+    pub fn confirm_room_tx_patch(&mut self, transaction: u64, redo: bool) -> bool {
         let (from, to) = if redo { (&mut self.undone, &mut self.done) } else { (&mut self.done, &mut self.undone) };
         if !matches!(
             from.last(),

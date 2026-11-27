@@ -43,6 +43,14 @@ fn valid_thread(r: u32, c: u32, t: &ThreadedComment) -> bool {
 fn valid_link(r: u32, c: u32, l: &Hyperlink) -> bool {
     l.span.0 < crate::sync::MAX_ROWS - r && l.span.1 < crate::sync::MAX_COLS - c
 }
+fn valid_sparkline(sp: &crate::sparkline::Sparkline) -> bool {
+    valid_point(sp.r, sp.c)
+        && valid_rect(&sp.rect)
+        && sp
+            .source_sheet
+            .as_ref()
+            .is_none_or(|n| n.len() <= crate::sync::MAX_SHORT_TEXT)
+}
 fn valid_changes<T>(
     points: &[ShiftPoint<Option<T>>],
     valid: impl Fn(u32, u32, &T) -> bool,
@@ -339,6 +347,122 @@ struct RuleChange<T> {
     after: T,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartSeriesRefs {
+    pub name_ref: String,
+    pub cat_ref: String,
+    pub val_ref: String,
+    pub size_ref: String,
+}
+
+impl ChartSeriesRefs {
+    fn valid(&self) -> bool {
+        let max = crate::sync::MAX_THREAD_ENTRY_TEXT_BYTES;
+        self.name_ref.len() <= max
+            && self.cat_ref.len() <= max
+            && self.val_ref.len() <= max
+            && self.size_ref.len() <= max
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartRefsSnapshot {
+    pub part: String,
+    pub source_range: String,
+    pub series: Vec<ChartSeriesRefs>,
+}
+
+impl ChartRefsSnapshot {
+    pub(crate) fn read(ch: &crate::charts::Chart) -> Self {
+        Self {
+            part: ch.part.clone(),
+            source_range: ch.source_range.clone(),
+            series: ch
+                .series
+                .iter()
+                .map(|s| ChartSeriesRefs {
+                    name_ref: s.name_ref.clone(),
+                    cat_ref: s.cat_ref.clone(),
+                    val_ref: s.val_ref.clone(),
+                    size_ref: s.size_ref.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        self.part.len() <= crate::sync::MAX_SHORT_TEXT
+            && self.source_range.len() <= crate::sync::MAX_THREAD_ENTRY_TEXT_BYTES
+            && self.series.len() <= 4_096
+            && self.series.iter().all(ChartSeriesRefs::valid)
+    }
+
+    pub(crate) fn matches_chart(&self, ch: &crate::charts::Chart) -> bool {
+        self.part == ch.part
+            && self.source_range == ch.source_range
+            && self.series.len() == ch.series.len()
+            && self.series.iter().zip(&ch.series).all(|(a, b)| {
+                a.name_ref == b.name_ref
+                    && a.cat_ref == b.cat_ref
+                    && a.val_ref == b.val_ref
+                    && a.size_ref == b.size_ref
+            })
+    }
+
+    pub(crate) fn apply_to_chart(&self, ch: &mut crate::charts::Chart) -> bool {
+        if self.part != ch.part || self.series.len() != ch.series.len() {
+            return false;
+        }
+        let mut changed = false;
+        if ch.source_range != self.source_range {
+            ch.source_range.clone_from(&self.source_range);
+            changed = true;
+        }
+        for (series, dest) in ch.series.iter_mut().zip(&self.series) {
+            for (from, to) in [
+                (&mut series.name_ref, &dest.name_ref),
+                (&mut series.cat_ref, &dest.cat_ref),
+                (&mut series.val_ref, &dest.val_ref),
+                (&mut series.size_ref, &dest.size_ref),
+            ] {
+                if from != to {
+                    ch.ref_fixes.push((from.clone(), to.clone()));
+                    from.clone_from(to);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartRefChange {
+    pub sheet: usize,
+    pub index: usize,
+    pub before: ChartRefsSnapshot,
+    pub after: ChartRefsSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SparklinePointChange {
+    pub sheet: usize,
+    pub row: u32,
+    pub col: u32,
+    pub before: Option<crate::sparkline::Sparkline>,
+    pub after: Option<crate::sparkline::Sparkline>,
+}
+
+fn sparkline_map(sheet: &Sheet) -> Option<HashMap<(u32, u32), crate::sparkline::Sparkline>> {
+    let mut map = HashMap::with_capacity(sheet.sparklines.len());
+    for sp in &sheet.sparklines {
+        if map.insert((sp.r, sp.c), sp.clone()).is_some() {
+            return None;
+        }
+    }
+    Some(map)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CellShiftPatch {
     sheet: usize,
@@ -357,6 +481,10 @@ pub struct CellShiftPatch {
     ignored_errors: Vec<ShiftPoint<bool>>,
     cf: Vec<RuleChange<crate::cf::CfBlock>>,
     dv: Vec<RuleChange<DataValidation>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub charts: Vec<ChartRefChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sparklines: Vec<SparklinePointChange>,
     sources: Vec<SourceChange>,
     names: Vec<NameChange>,
 }
@@ -381,6 +509,8 @@ impl CellShiftPatch {
         sheets.extend(self.cells.iter().map(|c| c.sheet));
         sheets.extend(self.cf.iter().map(|c| c.sheet));
         sheets.extend(self.dv.iter().map(|c| c.sheet));
+        sheets.extend(self.charts.iter().map(|c| c.sheet));
+        sheets.extend(self.sparklines.iter().map(|s| s.sheet));
         sheets.extend(self.names.iter().filter_map(|n| n.scope));
         sheets.into_iter().collect()
     }
@@ -400,7 +530,10 @@ impl CellShiftPatch {
             + self.ignored_errors.len()
             + self.cf.len()
             + self.dv.len()
-            + self.sources.len() + self.names.len()
+            + self.charts.len()
+            + self.sparklines.len()
+            + self.sources.len()
+            + self.names.len()
     }
 
     pub fn wire_valid(&self) -> bool {
@@ -448,6 +581,31 @@ impl CellShiftPatch {
                         .all(valid_rect)
             })
             && {
+                let mut seen = std::collections::HashSet::with_capacity(self.charts.len());
+                self.charts.iter().all(|c| {
+                    c.sheet < max_sheet
+                        && c.before != c.after
+                        && c.before.part == c.after.part
+                        && c.before.series.len() == c.after.series.len()
+                        && c.before.valid()
+                        && c.after.valid()
+                        && seen.insert((c.sheet, c.index))
+                })
+            }
+            && {
+                let mut seen = std::collections::HashSet::with_capacity(self.sparklines.len());
+                self.sparklines.iter().all(|p| {
+                    p.sheet < max_sheet
+                        && valid_point(p.row, p.col)
+                        && p.before != p.after
+                        && p.before
+                            .iter()
+                            .chain(&p.after)
+                            .all(|sp| (sp.r, sp.c) == (p.row, p.col) && valid_sparkline(sp))
+                        && seen.insert((p.sheet, p.row, p.col))
+                })
+            }
+            && {
                 let mut seen = std::collections::HashSet::with_capacity(self.names.len());
                 self.names.iter().all(|n| {
                     valid_defined_name(&n.name, n.scope)
@@ -464,78 +622,21 @@ impl CellShiftPatch {
     }
 
     pub fn prepare(wb: &Workbook, sheet: usize, op: CellShift) -> Option<Self> {
+        use crate::participant::CoordParticipant;
+
         op.preflight(wb, sheet).ok()?;
-        let a = &wb.sheets[sheet];
-        // Only the target has moving cell metadata. Formula rewriting on other
-        // sheets needs their shared cell storage and conditional/validation rules.
-        let mut result = Workbook {
-            styles: wb.styles.clone(),
-            names: wb.names.clone(),
-            sources: wb.sources.clone(),
-            sheets: wb
-                .sheets
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    let mut copy = s.search_snapshot();
-                    copy.cf = s.cf.clone();
-                    copy.dv = s.dv.clone();
-                    if i == sheet {
-                        copy.merges = s.merges.clone();
-                        copy.notes = s.notes.clone();
-                        copy.threads = s.threads.clone();
-                        copy.rich = s.rich.clone();
-                        copy.hyperlinks = s.hyperlinks.clone();
-                        copy.ignored_errors = s.ignored_errors.clone();
-                        copy.spilled = s.spilled.clone();
-                    }
-                    copy
-                })
-                .collect(),
-            ..Default::default()
-        };
+        // Clone every `CoordParticipant` subsystem needed to dry-run `CellShift`.
+        let mut result = CoordParticipant::clone_workbook_for_cell_shift_dry_run(wb, sheet);
         if !op.apply(&mut result, sheet) {
             return None;
         }
-        let mut name_counts: HashMap<(Option<usize>, &str), usize> =
-            HashMap::with_capacity(wb.names.len());
-        for (name, scope, _) in &wb.names {
-            *name_counts.entry((*scope, name.as_str())).or_insert(0) += 1;
-        }
-        let mut names = Vec::new();
-        for ((name, scope, before), (_, _, after)) in wb.names.iter().zip(&result.names) {
-            if shared_name(name) && before != after {
-                if name_counts.get(&(*scope, name.as_str())).copied().unwrap_or(0) != 1 {
-                    return None;
-                }
-                names.push(NameChange {
-                    name: name.clone(),
-                    scope: *scope,
-                    before: before.clone(),
-                    after: after.clone(),
-                });
-            }
-        }
-        let b = &result.sheets[sheet];
-        let ignored_errors = if a.ignored_errors == b.ignored_errors {
-            Vec::new()
-        } else {
-            let mut keys: BTreeSet<(u32, u32)> = BTreeSet::new();
-            keys.extend(a.ignored_errors.iter().copied());
-            keys.extend(b.ignored_errors.iter().copied());
-            keys.into_iter()
-                .filter_map(|(row, col)| {
-                    let before = a.ignored_errors.contains(&(row, col));
-                    let after = b.ignored_errors.contains(&(row, col));
-                    (before != after).then_some(ShiftPoint {
-                        row,
-                        col,
-                        before,
-                        after,
-                    })
-                })
-                .collect()
-        };
+        let rich = changes(&wb.sheets[sheet].rich, &result.sheets[sheet].rich);
+        // A shift can replace only the runs of two equal text values. Carry
+        // their cell clocks as well so an optimistic later edit wins on replicas.
+        let rich_keys: BTreeSet<_> = rich
+            .iter()
+            .map(|p| CellRef::new(p.row, p.col))
+            .collect();
         let mut patch = Self {
             sheet,
             sheet_names: Vec::new(),
@@ -543,114 +644,221 @@ impl CellShiftPatch {
             horizontal: op.direction == crate::cells::Shift::Horizontal,
             insert: op.insert,
             cells: Vec::new(),
-            notes: changes(&a.notes, &b.notes),
-            threads: changes(&a.threads, &b.threads),
-            rich: changes(&a.rich, &b.rich),
-            links: changes(&a.hyperlinks, &b.hyperlinks),
-            ignored_errors,
-            merges: if a.merges == b.merges {
-                Vec::new()
-            } else {
-                changes(&merge_map(a), &merge_map(b))
-            },
+            notes: Vec::new(),
+            threads: Vec::new(),
+            rich,
+            links: Vec::new(),
+            ignored_errors: Vec::new(),
+            merges: Vec::new(),
             cf: Vec::new(),
             dv: Vec::new(),
+            charts: Vec::new(),
+            sparklines: Vec::new(),
             sources: Vec::new(),
-            names,
+            names: Vec::new(),
             merge_history: MergeHistory::default(),
         };
-        if a.merges != b.merges {
-            patch.merge_history = MergeHistory::capture(&a.merges, &b.merges, &patch.merges);
+        for participant in CoordParticipant::ALL {
+            patch.diff_participant(participant, wb, &result, sheet, &rich_keys)?;
         }
-        // A shift can replace only the runs of two equal text values. Carry
-        // their cell clocks as well so an optimistic later edit wins on replicas.
-        let rich_keys: BTreeSet<_> = patch
-            .rich
-            .iter()
-            .map(|p| CellRef::new(p.row, p.col))
+        patch.sheet_names = patch
+            .referenced_sheets()
+            .into_iter()
+            .map(|idx| (idx, wb.sheets[idx].name.clone()))
             .collect();
-        for (idx, (a, b)) in wb.sheets.iter().zip(&result.sheets).enumerate() {
-            let prior_entries = patch.entries();
-            let mut touched = CellJournal::default();
-            a.cells().diff_into_journal(b.cells(), &mut touched);
-            a.styles.diff_into_journal(&b.styles, &mut touched);
-            if idx == sheet {
-                for &key in &rich_keys {
-                    touched.insert(key);
-                }
-            }
-            if touched.len() > MAX_ENTRIES {
-                return None;
-            }
-            let mut coords: Vec<_> = touched.iter().collect();
-            coords.sort_unstable();
-            for key in coords {
-                let (row, col) = (key.row, key.col);
-                let (before, after) =
-                    (ShiftValue::read(a, row, col), ShiftValue::read(b, row, col));
-                let (old_id, new_id) =
-                    (a.explicit_style_of(row, col), b.explicit_style_of(row, col));
-                if before == after
-                    && old_id == new_id
-                    && !(idx == sheet && rich_keys.contains(&key))
-                {
-                    continue;
-                }
-                let old_style = old_id.map(|id| wb.styles.get(id).clone());
-                let new_style = new_id.map(|id| result.styles.get(id).clone());
-                let extras = |wb: &Workbook, id: Option<u16>| {
-                    id.map(|id| StyleExtras::read(wb, id))
-                        .filter(|e| *e != StyleExtras::default())
-                };
-                patch.cells.push(ShiftCell {
-                    sheet: idx,
-                    row,
-                    col,
-                    before,
-                    after,
-                    before_style: old_style,
-                    after_style: new_style,
-                    before_extras: extras(wb, old_id),
-                    after_extras: extras(&result, new_id),
-                });
-            }
-            for (index, (old, new)) in a.cf.blocks.iter().zip(&b.cf.blocks).enumerate() {
-                if old != new {
-                    patch.cf.push(RuleChange {
-                        sheet: idx,
-                        index,
-                        before: old.clone(),
-                        after: new.clone(),
-                    });
-                }
-            }
-            for (index, (old, new)) in a.dv.iter().zip(&b.dv).enumerate() {
-                if old != new {
-                    patch.dv.push(RuleChange {
-                        sheet: idx,
-                        index,
-                        before: old.clone(),
-                        after: new.clone(),
-                    });
-                }
-            }
-            if idx == sheet
-                || patch.entries() != prior_entries
-                || patch.names.iter().any(|n| n.scope == Some(idx))
-            {
-                patch.sheet_names.push((idx, a.name.clone()));
-            }
-        }
-        for (old, new) in wb.sources.iter().zip(&result.sources) {
-            if old != new {
-                patch.sources.push(SourceChange {
-                    name: old.name.clone(),
-                    before: SourceGeometry::read(old),
-                    after: SourceGeometry::read(new),
-                });
-            }
-        }
         patch.can_install(wb).then_some(patch)
+    }
+
+    /// Exhaustive per-participant diff builder invoked by [`Self::prepare`].
+    fn diff_participant(
+        &mut self,
+        participant: crate::participant::CoordParticipant,
+        wb: &Workbook,
+        result: &Workbook,
+        sheet: usize,
+        rich_keys: &BTreeSet<CellRef>,
+    ) -> Option<()> {
+        use crate::participant::CoordParticipant as P;
+        let (a_target, b_target) = (&wb.sheets[sheet], &result.sheets[sheet]);
+        match participant {
+            P::CellsAndStyles => {
+                for (idx, (a, b)) in wb.sheets.iter().zip(&result.sheets).enumerate() {
+                    let mut touched = CellJournal::default();
+                    a.cells().diff_into_journal(b.cells(), &mut touched);
+                    a.styles.diff_into_journal(&b.styles, &mut touched);
+                    if idx == sheet {
+                        for &key in rich_keys {
+                            touched.insert(key);
+                        }
+                    }
+                    if touched.len() > MAX_ENTRIES {
+                        return None;
+                    }
+                    let mut coords: Vec<_> = touched.iter().collect();
+                    coords.sort_unstable();
+                    for key in coords {
+                        let (row, col) = (key.row, key.col);
+                        let (before, after) =
+                            (ShiftValue::read(a, row, col), ShiftValue::read(b, row, col));
+                        let (old_id, new_id) =
+                            (a.explicit_style_of(row, col), b.explicit_style_of(row, col));
+                        if before == after
+                            && old_id == new_id
+                            && !(idx == sheet && rich_keys.contains(&key))
+                        {
+                            continue;
+                        }
+                        let old_style = old_id.map(|id| wb.styles.get(id).clone());
+                        let new_style = new_id.map(|id| result.styles.get(id).clone());
+                        let extras = |book: &Workbook, id: Option<u16>| {
+                            id.map(|id| StyleExtras::read(book, id))
+                                .filter(|e| *e != StyleExtras::default())
+                        };
+                        self.cells.push(ShiftCell {
+                            sheet: idx,
+                            row,
+                            col,
+                            before,
+                            after,
+                            before_style: old_style,
+                            after_style: new_style,
+                            before_extras: extras(wb, old_id),
+                            after_extras: extras(result, new_id),
+                        });
+                    }
+                }
+            }
+            P::CellNotesAndThreads => {
+                self.notes = changes(&a_target.notes, &b_target.notes);
+                self.threads = changes(&a_target.threads, &b_target.threads);
+            }
+            P::RichAndHyperlinks => {
+                // `self.rich` was pre-diffed so `CellsAndStyles` can carry cell clocks for rich-only diffs.
+                self.links = changes(&a_target.hyperlinks, &b_target.hyperlinks);
+            }
+            P::Merges => {
+                if a_target.merges != b_target.merges {
+                    self.merges = changes(&merge_map(a_target), &merge_map(b_target));
+                    self.merge_history =
+                        MergeHistory::capture(&a_target.merges, &b_target.merges, &self.merges);
+                }
+            }
+            P::ConditionalAndValidation => {
+                for (idx, (a, b)) in wb.sheets.iter().zip(&result.sheets).enumerate() {
+                    for (index, (old, new)) in a.cf.blocks.iter().zip(&b.cf.blocks).enumerate() {
+                        if old != new {
+                            self.cf.push(RuleChange {
+                                sheet: idx,
+                                index,
+                                before: old.clone(),
+                                after: new.clone(),
+                            });
+                        }
+                    }
+                    for (index, (old, new)) in a.dv.iter().zip(&b.dv).enumerate() {
+                        if old != new {
+                            self.dv.push(RuleChange {
+                                sheet: idx,
+                                index,
+                                before: old.clone(),
+                                after: new.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            P::Charts => {
+                for (idx, (a, b)) in wb.sheets.iter().zip(&result.sheets).enumerate() {
+                    for (index, (old, new)) in a.charts.iter().zip(b.charts.iter()).enumerate() {
+                        let before = ChartRefsSnapshot::read(old);
+                        let after = ChartRefsSnapshot::read(new);
+                        if before != after {
+                            self.charts.push(ChartRefChange {
+                                sheet: idx,
+                                index,
+                                before,
+                                after,
+                            });
+                        }
+                    }
+                }
+            }
+            P::Sparklines => {
+                for (idx, (a, b)) in wb.sheets.iter().zip(&result.sheets).enumerate() {
+                    if a.sparklines != b.sparklines {
+                        let before_map = sparkline_map(a)?;
+                        let after_map = sparkline_map(b)?;
+                        for pt in changes(&before_map, &after_map) {
+                            self.sparklines.push(SparklinePointChange {
+                                sheet: idx,
+                                row: pt.row,
+                                col: pt.col,
+                                before: pt.before,
+                                after: pt.after,
+                            });
+                        }
+                    }
+                }
+            }
+            P::DefinedNames => {
+                let mut name_counts: HashMap<(Option<usize>, &str), usize> =
+                    HashMap::with_capacity(wb.names.len());
+                for (name, scope, _) in &wb.names {
+                    *name_counts.entry((*scope, name.as_str())).or_insert(0) += 1;
+                }
+                for ((name, scope, before), (_, _, after)) in wb.names.iter().zip(&result.names) {
+                    if shared_name(name) && before != after {
+                        if name_counts.get(&(*scope, name.as_str())).copied().unwrap_or(0) != 1 {
+                            return None;
+                        }
+                        self.names.push(NameChange {
+                            name: name.clone(),
+                            scope: *scope,
+                            before: before.clone(),
+                            after: after.clone(),
+                        });
+                    }
+                }
+            }
+            P::ExternalSources => {
+                for (old, new) in wb.sources.iter().zip(&result.sources) {
+                    if old != new {
+                        self.sources.push(SourceChange {
+                            name: old.name.clone(),
+                            before: SourceGeometry::read(old),
+                            after: SourceGeometry::read(new),
+                        });
+                    }
+                }
+            }
+            P::IgnoredErrors => {
+                if a_target.ignored_errors != b_target.ignored_errors {
+                    let mut keys: BTreeSet<(u32, u32)> = BTreeSet::new();
+                    keys.extend(a_target.ignored_errors.iter().copied());
+                    keys.extend(b_target.ignored_errors.iter().copied());
+                    self.ignored_errors = keys
+                        .into_iter()
+                        .filter_map(|(row, col)| {
+                            let before = a_target.ignored_errors.contains(&(row, col));
+                            let after = b_target.ignored_errors.contains(&(row, col));
+                            (before != after).then_some(ShiftPoint {
+                                row,
+                                col,
+                                before,
+                                after,
+                            })
+                        })
+                        .collect();
+                }
+            }
+            P::Tables
+            | P::Pivots
+            | P::ArraysAndSpills
+            | P::AutoFilter
+            | P::ScenariosAndProtectedRanges
+            | P::LayoutAndPage => {}
+        }
+        Some(())
     }
 
     /// Recompute on the authoritative document before accepting a guest's first request.
@@ -658,8 +866,8 @@ impl CellShiftPatch {
         self.canonical_forward(wb).is_some()
     }
 
-    /// A guest may lack the host's private source configuration. Derive those
-    /// binding changes on the host, and verify every other field byte-for-byte.
+    /// A guest may lack the host's private source configuration, names, or base-file charts.
+    /// Derive those changes on the host, and verify every other field byte-for-byte.
     pub fn canonical_forward(&self, wb: &Workbook) -> Option<Self> {
         if !self.wire_valid() {
             return None;
@@ -674,7 +882,7 @@ impl CellShiftPatch {
         {
             return None;
         }
-        // A guest joining without the base file may only know a subset of names.
+        // A guest joining without the base file may only know a subset of names or charts.
         let host_names: HashMap<_, _> = canonical
             .names
             .iter()
@@ -688,6 +896,19 @@ impl CellShiftPatch {
         {
             return None;
         }
+        let host_charts: HashMap<_, _> = canonical
+            .charts
+            .iter()
+            .map(|c| ((c.sheet, c.index), c))
+            .collect();
+        if self.charts.len() > host_charts.len()
+            || self
+                .charts
+                .iter()
+                .any(|c| host_charts.get(&(c.sheet, c.index)) != Some(&c))
+        {
+            return None;
+        }
         let expected_sheet_names = self
             .referenced_sheets()
             .into_iter()
@@ -696,12 +917,14 @@ impl CellShiftPatch {
         let sheet_names = std::mem::replace(&mut canonical.sheet_names, expected_sheet_names);
         let names = std::mem::replace(&mut canonical.names, self.names.clone());
         let sources = std::mem::replace(&mut canonical.sources, self.sources.clone());
+        let charts = std::mem::replace(&mut canonical.charts, self.charts.clone());
         if canonical != *self {
             return None;
         }
         canonical.sheet_names = sheet_names;
         canonical.sources = sources;
         canonical.names = names;
+        canonical.charts = charts;
         Some(canonical)
     }
 
@@ -730,6 +953,17 @@ impl CellShiftPatch {
                     .and_then(|s| s.dv.get(c.index))
                     .is_some()
             })
+            && self.charts.iter().all(|c| {
+                wb.sheets.get(c.sheet).is_some_and(|s| {
+                    s.charts.get(c.index).is_none_or(|ch| {
+                        ch.part == c.before.part && ch.series.len() == c.before.series.len()
+                    })
+                })
+            })
+            && self
+                .sparklines
+                .iter()
+                .all(|p| wb.sheets.get(p.sheet).is_some())
     }
 
     pub fn matches(&self, wb: &Workbook, forward: bool) -> bool {
@@ -778,6 +1012,8 @@ impl CellShiftPatch {
     }
 
     fn matches_document(&self, wb: &Workbook, forward: bool, allow_missing_sources: bool) -> bool {
+        use crate::participant::CoordParticipant;
+
         if !self.can_install(wb) {
             return false;
         }
@@ -789,81 +1025,215 @@ impl CellShiftPatch {
             return false;
         }
         let rich_changes: BTreeSet<_> = self.rich.iter().map(|p| (p.row, p.col)).collect();
-        let cells_match = self.cells.iter().all(|c| {
-            let sh = &wb.sheets[c.sheet];
-            let id = sh.explicit_style_of(c.row, c.col);
-            let extras = id
-                .map(|id| StyleExtras::read(wb, id))
-                .filter(|e| *e != StyleExtras::default());
-            let new_rich = c.before != c.after
-                && sh.rich.contains_key(&(c.row, c.col))
-                && (c.sheet != self.sheet || !rich_changes.contains(&(c.row, c.col)));
-            !new_rich
-                && ShiftValue::read(sh, c.row, c.col) == *pick(&c.before, &c.after, !forward)
-                && id.map(|i| wb.styles.get(i))
-                    == pick(&c.before_style, &c.after_style, !forward).as_ref()
-                && extras == *pick(&c.before_extras, &c.after_extras, !forward)
-        });
-        if !cells_match
-            || !map_matches(&sheet.notes, &self.notes, forward)
-            || !map_matches(&sheet.threads, &self.threads, forward)
-            || !map_matches(&sheet.rich, &self.rich, forward)
-            || !map_matches(&sheet.hyperlinks, &self.links, forward)
-            || !self.ignored_errors.iter().all(|p| {
-                sheet.ignored_errors.contains(&(p.row, p.col))
-                    == *pick(&p.before, &p.after, !forward)
-            })
-        {
-            return false;
-        }
-        // Reject if a late-added target hyperlink outside `self.links` sits in the
-        // moving ray or has an internal location affected (shifted, deleted, or
-        // band-crossing) by this shift.
-        let listed_links: BTreeSet<_> = self.links.iter().map(|p| (p.row, p.col)).collect();
         let eff_transform =
             crate::transform::CoordTransform::from_cell_shift(self.sheet, &effective_op);
-        if sheet.hyperlinks.iter().any(|(&(r, c), link)| {
-            let link_rect = (
-                r,
-                c,
-                r.saturating_add(link.span.0),
-                c.saturating_add(link.span.1),
-            );
-            !listed_links.contains(&(r, c))
-                && (eff_transform.map_rect(link_rect) != Some(link_rect)
-                    || (!link.location.is_empty()
-                        && crate::transform::internal_link_location_affected(
-                            &link.location,
-                            &sheet.name,
-                            &eff_transform,
-                        )))
-        }) {
-            return false;
+        CoordParticipant::ALL.iter().all(|&participant| {
+            self.verify_participant(
+                participant,
+                wb,
+                forward,
+                allow_missing_sources,
+                &eff_transform,
+                effective_op,
+                &rich_changes,
+            )
+        })
+    }
+
+    /// Exhaustive per-participant CAS check invoked by [`Self::matches_document`].
+    #[allow(clippy::too_many_arguments)]
+    fn verify_participant(
+        &self,
+        participant: crate::participant::CoordParticipant,
+        wb: &Workbook,
+        forward: bool,
+        allow_missing_sources: bool,
+        eff_transform: &crate::transform::CoordTransform,
+        effective_op: CellShift,
+        rich_changes: &BTreeSet<(u32, u32)>,
+    ) -> bool {
+        use crate::participant::CoordParticipant as P;
+        let sheet = &wb.sheets[self.sheet];
+        match participant {
+            P::CellsAndStyles => self.cells.iter().all(|c| {
+                let sh = &wb.sheets[c.sheet];
+                let id = sh.explicit_style_of(c.row, c.col);
+                let extras = id
+                    .map(|id| StyleExtras::read(wb, id))
+                    .filter(|e| *e != StyleExtras::default());
+                let new_rich = c.before != c.after
+                    && sh.rich.contains_key(&(c.row, c.col))
+                    && (c.sheet != self.sheet || !rich_changes.contains(&(c.row, c.col)));
+                !new_rich
+                    && ShiftValue::read(sh, c.row, c.col) == *pick(&c.before, &c.after, !forward)
+                    && id.map(|i| wb.styles.get(i))
+                        == pick(&c.before_style, &c.after_style, !forward).as_ref()
+                    && extras == *pick(&c.before_extras, &c.after_extras, !forward)
+            }),
+            P::CellNotesAndThreads => {
+                map_matches(&sheet.notes, &self.notes, forward)
+                    && map_matches(&sheet.threads, &self.threads, forward)
+            }
+            P::RichAndHyperlinks => {
+                if !map_matches(&sheet.rich, &self.rich, forward)
+                    || !map_matches(&sheet.hyperlinks, &self.links, forward)
+                {
+                    return false;
+                }
+                // Reject if a late-added target hyperlink outside `self.links` sits in the
+                // moving ray or has an internal location affected (shifted, deleted, or
+                // band-crossing) by this shift.
+                let listed_links: BTreeSet<_> = self.links.iter().map(|p| (p.row, p.col)).collect();
+                !sheet.hyperlinks.iter().any(|(&(r, c), link)| {
+                    let link_rect = (
+                        r,
+                        c,
+                        r.saturating_add(link.span.0),
+                        c.saturating_add(link.span.1),
+                    );
+                    !listed_links.contains(&(r, c))
+                        && (eff_transform.map_rect(link_rect) != Some(link_rect)
+                            || (!link.location.is_empty()
+                                && crate::transform::internal_link_location_affected(
+                                    &link.location,
+                                    &sheet.name,
+                                    eff_transform,
+                                )))
+                })
+            }
+            P::Merges => {
+                self.merge_history.matches(sheet, &self.merges, forward)
+                    && self.merges_complete(sheet, effective_op, forward)
+            }
+            P::ConditionalAndValidation => {
+                self.cf.iter().all(|c| {
+                    wb.sheets[c.sheet].cf.blocks[c.index] == *pick(&c.before, &c.after, !forward)
+                }) && self.dv.iter().all(|c| {
+                    wb.sheets[c.sheet].dv[c.index] == *pick(&c.before, &c.after, !forward)
+                })
+            }
+            P::Charts => self.charts_match(wb, forward, allow_missing_sources, eff_transform),
+            P::Sparklines => self.sparklines_match(wb, forward, eff_transform),
+            P::DefinedNames => self.names_match(wb, forward, allow_missing_sources),
+            P::ExternalSources => self.source_baseline_matches(wb, forward, allow_missing_sources),
+            P::IgnoredErrors => {
+                if !self.ignored_errors.iter().all(|p| {
+                    sheet.ignored_errors.contains(&(p.row, p.col))
+                        == *pick(&p.before, &p.after, !forward)
+                }) {
+                    return false;
+                }
+                let listed_ignored: BTreeSet<_> = self
+                    .ignored_errors
+                    .iter()
+                    .map(|p| (p.row, p.col))
+                    .collect();
+                !sheet.ignored_errors.iter().any(|&(r, c)| {
+                    !listed_ignored.contains(&(r, c)) && eff_transform.map_cell(r, c) != Some((r, c))
+                })
+            }
+            P::Tables
+            | P::Pivots
+            | P::ArraysAndSpills
+            | P::AutoFilter
+            | P::ScenariosAndProtectedRanges
+            | P::LayoutAndPage => true,
         }
-        let listed_ignored: BTreeSet<_> = self
-            .ignored_errors
-            .iter()
-            .map(|p| (p.row, p.col))
-            .collect();
-        if sheet.ignored_errors.iter().any(|&(r, c)| {
-            !listed_ignored.contains(&(r, c)) && eff_transform.map_cell(r, c) != Some((r, c))
-        }) {
-            return false;
+    }
+
+    fn charts_match(
+        &self,
+        wb: &Workbook,
+        forward: bool,
+        allow_missing: bool,
+        eff_transform: &crate::transform::CoordTransform,
+    ) -> bool {
+        let target_name = wb.sheets[self.sheet].name.as_str();
+        for c in &self.charts {
+            let expected = pick(&c.before, &c.after, !forward);
+            match wb.sheets[c.sheet].charts.get(c.index) {
+                Some(ch) => {
+                    if !expected.matches_chart(ch) {
+                        return false;
+                    }
+                }
+                None => {
+                    if !allow_missing {
+                        return false;
+                    }
+                }
+            }
         }
-        if !self.merge_history.matches(sheet, &self.merges, forward)
-            || !self.merges_complete(sheet, effective_op, forward)
-        {
-            return false;
+        let listed_charts: BTreeSet<_> = self.charts.iter().map(|c| (c.sheet, c.index)).collect();
+        for (si, sh) in wb.sheets.iter().enumerate() {
+            let own_name = sh.name.as_str();
+            for (ci, ch) in sh.charts.iter().enumerate() {
+                if listed_charts.contains(&(si, ci)) {
+                    continue;
+                }
+                let ref_changes = |r: &str| {
+                    !r.is_empty()
+                        && eff_transform.formula_may_be_affected(r)
+                        && eff_transform.rewrite_formula(r, target_name, own_name) != r
+                };
+                if ref_changes(&ch.source_range)
+                    || ch.series.iter().any(|s| {
+                        [&s.name_ref, &s.cat_ref, &s.val_ref, &s.size_ref]
+                            .into_iter()
+                            .any(|r| ref_changes(r))
+                    })
+                {
+                    return false;
+                }
+            }
         }
-        self.cf
-            .iter()
-            .all(|c| wb.sheets[c.sheet].cf.blocks[c.index] == *pick(&c.before, &c.after, !forward))
-            && self
-                .dv
+        true
+    }
+
+    fn sparklines_match(
+        &self,
+        wb: &Workbook,
+        forward: bool,
+        eff_transform: &crate::transform::CoordTransform,
+    ) -> bool {
+        let target_name = wb.sheets[self.sheet].name.as_str();
+        for p in &self.sparklines {
+            let expected = pick(&p.before, &p.after, !forward);
+            let mut matches = wb.sheets[p.sheet]
+                .sparklines
                 .iter()
-                .all(|c| wb.sheets[c.sheet].dv[c.index] == *pick(&c.before, &c.after, !forward))
-            && self.source_baseline_matches(wb, forward, allow_missing_sources)
-            && self.names_match(wb, forward, allow_missing_sources)
+                .filter(|sp| (sp.r, sp.c) == (p.row, p.col));
+            let first = matches.next();
+            if matches.next().is_some() || first != expected.as_ref() {
+                return false;
+            }
+        }
+        let listed: BTreeSet<_> = self
+            .sparklines
+            .iter()
+            .map(|p| (p.sheet, p.row, p.col))
+            .collect();
+        for (si, sh) in wb.sheets.iter().enumerate() {
+            for sp in &sh.sparklines {
+                if listed.contains(&(si, sp.r, sp.c)) {
+                    continue;
+                }
+                if si == self.sheet && eff_transform.map_cell(sp.r, sp.c) != Some((sp.r, sp.c)) {
+                    return false;
+                }
+                let targets_sheet = (si == self.sheet && sp.source_sheet.is_none())
+                    || sp
+                        .source_sheet
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(target_name));
+                if targets_sheet
+                    && eff_transform.rect_changes(crate::participant::norm_rect(sp.rect))
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn names_match(&self, wb: &Workbook, forward: bool, allow_missing: bool) -> bool {
@@ -969,68 +1339,160 @@ impl CellShiftPatch {
         forward: bool,
         accepts_rich: impl Fn(u32, u32) -> bool,
     ) -> bool {
+        use crate::participant::CoordParticipant;
+
         if !self.can_install(wb) {
             return false;
         }
-        let sh = &mut wb.sheets[self.sheet];
-        if !self.notes.is_empty() {
-            apply_map(&mut sh.notes, &self.notes, forward);
-            sh.notes_dirty = true;
+        for participant in CoordParticipant::ALL {
+            self.replay_participant_metadata(participant, wb, forward, &accepts_rich);
         }
-        if !self.threads.is_empty() {
-            apply_map(&mut sh.threads, &self.threads, forward);
-            sh.threads_dirty = true;
-        }
-        for p in self.rich.iter().filter(|p| accepts_rich(p.row, p.col)) {
-            apply_map(&mut sh.rich, std::slice::from_ref(p), forward);
-            sh.rich_dirty = true;
-        }
-        if !self.links.is_empty() {
-            apply_map(&mut sh.hyperlinks, &self.links, forward);
-            sh.hyperlinks_dirty = true;
-        }
-        if !self.ignored_errors.is_empty() {
-            for p in &self.ignored_errors {
-                if *pick(&p.before, &p.after, forward) {
-                    sh.ignored_errors.insert((p.row, p.col));
-                } else {
-                    sh.ignored_errors.remove_if_present(&(p.row, p.col));
-                }
-            }
-            sh.ignored_errors_dirty = true;
-        }
-        self.merge_history.install(sh, &self.merges, forward);
-        sh.coordinates_shifted();
-        for c in &self.cf {
-            let sh = &mut wb.sheets[c.sheet];
-            sh.cf.blocks[c.index].clone_from(pick(&c.before, &c.after, forward));
-            sh.cf_dirty = true;
-        }
-        for c in &self.dv {
-            let sh = &mut wb.sheets[c.sheet];
-            sh.dv[c.index].clone_from(pick(&c.before, &c.after, forward));
-            sh.dv_dirty = true;
-        }
-        if !self.names.is_empty() {
-            let positions: HashMap<_, _> = wb.names.iter().enumerate()
-                .map(|(i, (name, scope, _))| ((*scope, name.clone()), i)).collect();
-            for change in &self.names {
-                let formula = pick(&change.before, &change.after, forward);
-                if let Some(&i) = positions.get(&(change.scope, change.name.clone())) {
-                    wb.names[i].2.clone_from(formula);
-                } else {
-                    wb.names.push((change.name.clone(), change.scope, formula.clone()));
-                }
-            }
-            wb.names_dirty = true;
-        }
-        for s in &self.sources {
-            if let Some(src) = wb.sources.iter_mut().find(|local| local.name == s.name) {
-                pick(&s.before, &s.after, forward).write(src);
-            }
-        }
+        wb.sheets[self.sheet].coordinates_shifted();
         wb.bump_coord_epoch();
         wb.dirty = true;
         true
+    }
+
+    /// Exhaustive per-participant metadata replay invoked by [`Self::replay_metadata_for_cells`].
+    fn replay_participant_metadata(
+        &self,
+        participant: crate::participant::CoordParticipant,
+        wb: &mut Workbook,
+        forward: bool,
+        accepts_rich: &impl Fn(u32, u32) -> bool,
+    ) {
+        use crate::participant::CoordParticipant as P;
+        match participant {
+            // Cell values and styles are applied by `apply_committed` (or live LWW clocks on replicas).
+            P::CellsAndStyles => {}
+            P::CellNotesAndThreads => {
+                let sh = &mut wb.sheets[self.sheet];
+                if !self.notes.is_empty() {
+                    apply_map(&mut sh.notes, &self.notes, forward);
+                    sh.notes_dirty = true;
+                }
+                if !self.threads.is_empty() {
+                    apply_map(&mut sh.threads, &self.threads, forward);
+                    sh.threads_dirty = true;
+                }
+            }
+            P::RichAndHyperlinks => {
+                let sh = &mut wb.sheets[self.sheet];
+                for p in self.rich.iter().filter(|p| accepts_rich(p.row, p.col)) {
+                    apply_map(&mut sh.rich, std::slice::from_ref(p), forward);
+                    sh.rich_dirty = true;
+                }
+                if !self.links.is_empty() {
+                    apply_map(&mut sh.hyperlinks, &self.links, forward);
+                    sh.hyperlinks_dirty = true;
+                }
+            }
+            P::Merges => {
+                let sh = &mut wb.sheets[self.sheet];
+                self.merge_history.install(sh, &self.merges, forward);
+            }
+            P::ConditionalAndValidation => {
+                for c in &self.cf {
+                    let sh = &mut wb.sheets[c.sheet];
+                    sh.cf.blocks[c.index].clone_from(pick(&c.before, &c.after, forward));
+                    sh.cf_dirty = true;
+                }
+                for c in &self.dv {
+                    let sh = &mut wb.sheets[c.sheet];
+                    sh.dv[c.index].clone_from(pick(&c.before, &c.after, forward));
+                    sh.dv_dirty = true;
+                }
+            }
+            P::Charts => {
+                for c in &self.charts {
+                    if let Some(sh) = wb.sheets.get_mut(c.sheet)
+                        && let Some(ch) = sh.charts.get_mut(c.index)
+                    {
+                        let target = pick(&c.before, &c.after, forward);
+                        if target.apply_to_chart(ch) {
+                            sh.charts_dirty = true;
+                        }
+                    }
+                }
+            }
+            P::Sparklines => {
+                if !self.sparklines.is_empty() {
+                    for p in &self.sparklines {
+                        if pick(&p.before, &p.after, forward).is_none() {
+                            let sh = &mut wb.sheets[p.sheet];
+                            let before_len = sh.sparklines.len();
+                            sh.sparklines.retain(|sp| (sp.r, sp.c) != (p.row, p.col));
+                            if sh.sparklines.len() != before_len {
+                                sh.sparklines_dirty = true;
+                            }
+                        }
+                    }
+                    for p in &self.sparklines {
+                        if let Some(desired) = pick(&p.before, &p.after, forward) {
+                            let sh = &mut wb.sheets[p.sheet];
+                            if let Some(existing) = sh
+                                .sparklines
+                                .iter_mut()
+                                .find(|sp| (sp.r, sp.c) == (p.row, p.col))
+                            {
+                                if existing != desired {
+                                    existing.clone_from(desired);
+                                    sh.sparklines_dirty = true;
+                                }
+                            } else {
+                                sh.sparklines.push(desired.clone());
+                                sh.sparklines_dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+            P::DefinedNames => {
+                if !self.names.is_empty() {
+                    let positions: HashMap<_, _> = wb
+                        .names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (name, scope, _))| ((*scope, name.clone()), i))
+                        .collect();
+                    for change in &self.names {
+                        let formula = pick(&change.before, &change.after, forward);
+                        if let Some(&i) = positions.get(&(change.scope, change.name.clone())) {
+                            wb.names[i].2.clone_from(formula);
+                        } else {
+                            wb.names
+                                .push((change.name.clone(), change.scope, formula.clone()));
+                        }
+                    }
+                    wb.names_dirty = true;
+                }
+            }
+            P::ExternalSources => {
+                for s in &self.sources {
+                    if let Some(src) = wb.sources.iter_mut().find(|local| local.name == s.name) {
+                        pick(&s.before, &s.after, forward).write(src);
+                    }
+                }
+            }
+            P::IgnoredErrors => {
+                let sh = &mut wb.sheets[self.sheet];
+                if !self.ignored_errors.is_empty() {
+                    for p in &self.ignored_errors {
+                        if *pick(&p.before, &p.after, forward) {
+                            sh.ignored_errors.insert((p.row, p.col));
+                        } else {
+                            sh.ignored_errors.remove_if_present(&(p.row, p.col));
+                        }
+                    }
+                    sh.ignored_errors_dirty = true;
+                }
+            }
+            P::Tables
+            | P::Pivots
+            | P::ArraysAndSpills
+            | P::AutoFilter
+            | P::ScenariosAndProtectedRanges
+            | P::LayoutAndPage => {}
+        }
     }
 }

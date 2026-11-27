@@ -1270,7 +1270,8 @@ impl Sheet {
         //     `move_rows_wb`/`move_cols_wb` delegates all sheets to `CoordTransform::apply_workbook_references`.
         if rewrite_own_refs {
             let own_name = self.name.clone();
-            transform.rewrite_sheet_formulas_cf_dv(self, &own_name);
+            transform.rewrite_sheet_cell_formulas(self, &own_name);
+            transform.rewrite_sheet_cf_dv(self, &own_name);
             for ch in self.charts.iter_mut() {
                 if ch.rewrite_with_transform(&transform, &own_name, &own_name) {
                     self.charts_dirty = true;
@@ -2130,7 +2131,7 @@ impl CellShiftConflict {
             Self::ArrayOrSpill => "位移区域涉及数组公式或动态数组溢出区，无法部分移动单元格",
             Self::AutoFilter => "位移区域与自动筛选区域相交，请先关闭筛选或改用整行/整列插入删除",
             Self::Chart => "位移区域涉及图表数据源，无法部分移动单元格，请改用整行/整列插入删除",
-            Self::Sparkline => "位移区域涉及迷你图或迷你图数据源，无法部分移动单元格，请改用整行/整列插入删除",
+            Self::Sparkline => "位移区域与迷你图数据源部分交叉或将导致数据源失效，请改用整行/整列插入删除",
             Self::ProtectedRange => "位移区域与允许编辑区域相交，请改用整行/整列插入删除",
             Self::Scenario => "位移区域涉及方案管理器可变单元格，无法部分移动单元格，请改用整行/整列插入删除",
             Self::PartialHyperlink => "位移区域与多格超链接区域部分交叉，请改用整行/整列插入删除",
@@ -2142,21 +2143,6 @@ impl std::fmt::Display for CellShiftConflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.message())
     }
-}
-
-#[inline]
-fn norm_rect((r1, c1, r2, c2): (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
-    (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2))
-}
-
-#[inline]
-fn rects_intersect(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> bool {
-    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
-}
-
-#[inline]
-fn point_in_rect((r, c): (u32, u32), rect: (u32, u32, u32, u32)) -> bool {
-    r >= rect.0 && r <= rect.2 && c >= rect.1 && c <= rect.3
 }
 
 /// A local shift moves the selected rows or columns by the width or height of
@@ -2184,7 +2170,7 @@ impl CellShift {
         }
     }
 
-    fn moving_ray(&self) -> Option<(u32, u32, u32, u32)> {
+    pub(crate) fn moving_ray(&self) -> Option<(u32, u32, u32, u32)> {
         if self.count() == 0 {
             return None;
         }
@@ -2200,207 +2186,11 @@ impl CellShift {
         wb: &crate::Workbook,
         sheet_idx: usize,
     ) -> Result<(), CellShiftConflict> {
-        let Some(sheet) = wb.sheets.get(sheet_idx) else {
-            return Err(CellShiftConflict::InvalidTarget);
-        };
-        let Some(ray) = self.moving_ray() else {
-            return Err(CellShiftConflict::InvalidTarget);
-        };
-        if sheet.tables.iter().any(|t| rects_intersect(norm_rect(t.range), ray)) {
-            return Err(CellShiftConflict::Table);
-        }
-        let target_sid = sheet.identity;
-        let target_name = sheet.name.as_str();
-        let pivot_hit = wb.pivots.iter().any(|p| {
-            let is_src = p.source_sheet_id == Some(target_sid)
-                || p.source_sheet.eq_ignore_ascii_case(target_name);
-            (is_src && rects_intersect(norm_rect(p.spec.source), ray))
-                || (p.target_sheet == sheet_idx
-                    && (rects_intersect(norm_rect(p.rect), ray) || point_in_rect(p.anchor, ray)))
-        }) || wb.pivots_pending.iter().any(|(idx, spec, _, out, _)| {
-            *idx == sheet_idx
-                && (rects_intersect(norm_rect(spec.source), ray)
-                    || rects_intersect(norm_rect(*out), ray))
-        }) || wb.pivots_pending2.iter().any(|(idx, spec, _, out)| {
-            *idx == sheet_idx
-                && (rects_intersect(norm_rect(spec.source), ray)
-                    || rects_intersect(norm_rect(*out), ray))
-        });
-        if pivot_hit {
-            return Err(CellShiftConflict::Pivot);
-        }
-        let array_or_spill_hit = sheet.arrays.iter().any(|&(anchor, rect)| {
-            point_in_rect((anchor.row, anchor.col), ray) || rects_intersect(norm_rect(rect), ray)
-        }) || sheet.spill_shapes.iter().any(|(&anchor, &(h, w))| {
-            let spill_rect = (
-                anchor.row,
-                anchor.col,
-                anchor.row.saturating_add(h.saturating_sub(1)),
-                anchor.col.saturating_add(w.saturating_sub(1)),
-            );
-            rects_intersect(spill_rect, ray)
-        }) || sheet.spilled.iter().any(|k| point_in_rect((k.row, k.col), ray))
-            || (!sheet.spilled.is_empty()
-                && sheet.spill_shapes.is_empty()
-                && sheet.formula_cells().any(|(k, _)| {
-                    point_in_rect((k.row, k.col), ray)
-                        && (k
-                            .row
-                            .checked_add(1)
-                            .is_some_and(|r| sheet.spilled.contains(&CellRef::new(r, k.col)))
-                            || k.col
-                                .checked_add(1)
-                                .is_some_and(|c| sheet.spilled.contains(&CellRef::new(k.row, c))))
-                }));
-        if array_or_spill_hit {
-            return Err(CellShiftConflict::ArrayOrSpill);
-        }
-        if sheet
-            .filter
-            .as_ref()
-            .is_some_and(|f| rects_intersect(norm_rect(f.range), ray))
-        {
-            return Err(CellShiftConflict::AutoFilter);
-        }
-        // Guard chart data references (target & foreign sheets) referencing the moving ray.
-        let transform = crate::transform::CoordTransform::from_cell_shift(sheet_idx, self);
-        let chart_hit = wb.sheets.iter().enumerate().any(|(si, sh)| {
-            let own_is_target = si == sheet_idx;
-            sh.charts.iter().any(|ch| {
-                crate::transform::chart_ref_intersects_ray(
-                    &ch.source_range,
-                    own_is_target,
-                    &sh.name,
-                    target_name,
-                    ray,
-                    &transform,
-                ) || ch.series.iter().any(|s| {
-                    [&s.name_ref, &s.cat_ref, &s.val_ref, &s.size_ref]
-                        .into_iter()
-                        .any(|r| {
-                            crate::transform::chart_ref_intersects_ray(
-                                r,
-                                own_is_target,
-                                &sh.name,
-                                target_name,
-                                ray,
-                                &transform,
-                            )
-                        })
-                })
-            })
-        });
-        if chart_hit {
-            return Err(CellShiftConflict::Chart);
-        }
-        // Guard sparklines whose anchor sits in the ray or whose data rect targets the ray.
-        let sparkline_hit = sheet.sparklines.iter().any(|sp| point_in_rect((sp.r, sp.c), ray))
-            || wb.sheets.iter().enumerate().any(|(si, sh)| {
-                sh.sparklines.iter().any(|sp| {
-                    let targets_sheet = (si == sheet_idx && sp.source_sheet.is_none())
-                        || sp
-                            .source_sheet
-                            .as_deref()
-                            .is_some_and(|n| n.eq_ignore_ascii_case(target_name));
-                    targets_sheet && rects_intersect(norm_rect(sp.rect), ray)
-                })
-            });
-        if sparkline_hit {
-            return Err(CellShiftConflict::Sparkline);
-        }
-        // Guard protected ranges intersecting the moving ray.
-        if sheet
-            .protected_ranges
-            .iter()
-            .any(|pr| pr.sqref.iter().any(|&sq| rects_intersect(norm_rect(sq), ray)))
-        {
-            return Err(CellShiftConflict::ProtectedRange);
-        }
-        // Guard scenarios & scenario_settings.sqref intersecting the moving ray.
-        let scenario_hit = sheet
-            .scenarios
-            .iter()
-            .any(|sc| sc.cells.iter().any(|&(pos, _)| point_in_rect(pos, ray)))
-            || sheet.scenario_settings.sqref.as_deref().is_some_and(|sq| {
-                crate::scenarios::sqref_rects(sq)
-                    .into_iter()
-                    .any(|r| rects_intersect(r, ray))
-            });
-        if scenario_hit {
-            return Err(CellShiftConflict::Scenario);
-        }
-        // Guard multi-cell hyperlinks (`span != (0, 0)`) partially crossing the band/boundary.
-        let (r1, c1, r2, c2) = self.rect;
-        for (&(hr, hc), link) in sheet.hyperlinks.iter() {
-            if link.span == (0, 0) {
-                continue;
-            }
-            let rect = (hr, hc, hr.saturating_add(link.span.0), hc.saturating_add(link.span.1));
-            if !rects_intersect(rect, ray) {
-                continue;
-            }
-            let supported = match self.direction {
-                crate::cells::Shift::Vertical => {
-                    rect.1 >= c1
-                        && rect.3 <= c2
-                        && if self.insert {
-                            rect.0 >= r1
-                        } else {
-                            (rect.0 >= r1 && rect.2 <= r2) || rect.0 > r2
-                        }
-                }
-                crate::cells::Shift::Horizontal => {
-                    rect.0 >= r1
-                        && rect.2 <= r2
-                        && if self.insert {
-                            rect.1 >= c1
-                        } else {
-                            (rect.1 >= c1 && rect.3 <= c2) || rect.1 > c2
-                        }
-                }
-            };
-            if !supported {
-                return Err(CellShiftConflict::PartialHyperlink);
-            }
-        }
-        Ok(())
+        crate::participant::CoordParticipant::preflight_cell_shift_objects(wb, sheet_idx, self)
     }
 
     pub(crate) fn preflight_merges(&self, sheet: &Sheet) -> Result<(), CellShiftConflict> {
-        let Some(ray) = self.moving_ray() else {
-            return Err(CellShiftConflict::InvalidTarget);
-        };
-        let (r1, c1, r2, c2) = self.rect;
-        for &raw in sheet.merges.iter() {
-            let m = norm_rect(raw);
-            if !rects_intersect(m, ray) {
-                continue;
-            }
-            let supported = match self.direction {
-                crate::cells::Shift::Vertical => {
-                    m.1 >= c1
-                        && m.3 <= c2
-                        && if self.insert {
-                            m.0 >= r1
-                        } else {
-                            (m.0 >= r1 && m.2 <= r2) || m.0 > r2
-                        }
-                }
-                crate::cells::Shift::Horizontal => {
-                    m.0 >= r1
-                        && m.2 <= r2
-                        && if self.insert {
-                            m.1 >= c1
-                        } else {
-                            (m.1 >= c1 && m.3 <= c2) || m.1 > c2
-                        }
-                }
-            };
-            if !supported {
-                return Err(CellShiftConflict::PartialMerge);
-            }
-        }
-        Ok(())
+        crate::participant::CoordParticipant::preflight_cell_shift_merges(sheet, self)
     }
 
     pub(crate) fn shifted_merges(
@@ -2472,18 +2262,8 @@ impl CellShift {
         wb: &crate::Workbook,
         sheet_idx: usize,
     ) -> Result<(), CellShiftConflict> {
-        let Some(sheet) = wb.sheets.get(sheet_idx) else {
-            return Err(CellShiftConflict::InvalidTarget);
-        };
-        let n = self.count();
-        if n == 0 {
-            return Err(CellShiftConflict::InvalidTarget);
-        }
-        if self.insert && crate::cells::insert_would_overflow(sheet, self.rect, self.direction, n) {
-            return Err(CellShiftConflict::Overflow);
-        }
-        self.preflight_merges(sheet)?;
-        self.preflight_objects(wb, sheet_idx)
+        let tx = crate::transform::CoordTransform::from_cell_shift(sheet_idx, self);
+        crate::participant::CoordParticipant::preflight_all(wb, &tx)
     }
 
     pub(crate) fn reference_shift(&self) -> crate::refs::Shift {

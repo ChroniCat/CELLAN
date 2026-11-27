@@ -39,6 +39,9 @@ fn used(sheet: &Sheet) -> Option<(u32, u32)> {
     for &(r, c) in sheet.ignored_errors.iter() {
         bump(r, c);
     }
+    for sp in &sheet.sparklines {
+        bump(sp.r, sp.c);
+    }
     if let (Some(mr), Some(mc)) = (sheet.max_merge_row(), sheet.max_merge_col()) {
         bump(mr, mc);
     }
@@ -168,6 +171,30 @@ fn shift_ray_metadata(
             }
         }
     }
+
+    if !sheet.sparklines.is_empty() {
+        let mut changed = false;
+        let old = std::mem::take(&mut sheet.sparklines);
+        let mut next = Vec::with_capacity(old.len());
+        for mut sp in old {
+            if sp.r >= r1 && sp.r <= r2 && sp.c >= c1 && sp.c <= c2 {
+                if let Some((nr, nc)) = map_coord(sp.r, sp.c) {
+                    if (nr, nc) != (sp.r, sp.c) {
+                        sp.r = nr;
+                        sp.c = nc;
+                        changed = true;
+                    }
+                    next.push(sp);
+                } else {
+                    changed = true;
+                }
+            } else {
+                next.push(sp);
+            }
+        }
+        sheet.sparklines = next;
+        sheet.sparklines_dirty |= changed;
+    }
 }
 
 fn shift_sparse_ray(
@@ -242,6 +269,7 @@ pub(crate) fn insert_would_overflow(sheet: &Sheet, rect: (u32, u32, u32, u32), s
         || sheet.notes.keys().chain(sheet.threads.keys()).any(|k| inside(k.row, k.col))
         || sheet.rich.keys().any(|&(r, c)| inside(r, c))
         || sheet.ignored_errors.iter().any(|&(r, c)| inside(r, c))
+        || sheet.sparklines.iter().any(|sp| inside(sp.r, sp.c))
         || sheet.hyperlinks.iter().any(|(&(r, c), link)| {
             let er = r.saturating_add(link.span.0);
             let ec = c.saturating_add(link.span.1);
