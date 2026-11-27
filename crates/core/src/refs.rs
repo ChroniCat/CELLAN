@@ -734,8 +734,17 @@ pub fn relocate_moved_rect(
     dr: i64,
     dc: i64,
 ) -> String {
+    relocate_moved_rows(formula, own_sheet, src_sheet, src_rect, dst_sheet, dr, dc, None, false)
+}
+
+/// A filtered cut compacts its sorted, visible source rows into contiguous destination rows.
+/// Rewrite each token once so overlapping source and destination addresses cannot cascade.
+pub fn relocate_moved_rows(
+    formula: &str, own_sheet: &str, src_sheet: &str, src_rect: (u32,u32,u32,u32),
+    dst_sheet: &str, dr: i64, dc: i64, rows: Option<&[u32]>, formula_moves: bool,
+) -> String {
     let same_sheet = src_sheet.eq_ignore_ascii_case(dst_sheet);
-    if same_sheet && dr == 0 && dc == 0 {
+    if rows.is_none() && same_sheet && dr == 0 && dc == 0 {
         return formula.to_string();
     }
     let (sr1, sc1, sr2, sc2) = (
@@ -744,9 +753,20 @@ pub fn relocate_moved_rect(
         src_rect.0.max(src_rect.2),
         src_rect.1.max(src_rect.3),
     );
-    let in_rect = |r: u32, c: u32| r >= sr1 && r <= sr2 && c >= sc1 && c <= sc2;
+    let in_rect = |r: u32, c: u32| r >= sr1 && r <= sr2 && c >= sc1 && c <= sc2
+        && rows.is_none_or(|visible| visible.binary_search(&r).is_ok());
+    let whole_range_moved = |a: u32, b: u32| rows.is_none_or(|visible| {
+        let lo = a.min(b);
+        let hi = a.max(b);
+        visible.partition_point(|&r| r <= hi) - visible.partition_point(|&r| r < lo)
+            == (hi - lo + 1) as usize
+    });
     let map_pt = |r: u32, c: u32| -> Option<(u32, u32)> {
-        let nr = (r as i64).checked_add(dr)?;
+        let offset_row = match rows {
+            Some(visible) => sr1 + visible.binary_search(&r).ok()? as u32,
+            None => r,
+        };
+        let nr = i64::from(offset_row).checked_add(dr)?;
         let nc = (c as i64).checked_add(dc)?;
         if (0..1_048_576).contains(&nr) && (0..16_384).contains(&nc) {
             Some((nr as u32, nc as u32))
@@ -899,12 +919,12 @@ pub fn relocate_moved_rect(
                             && !b.get(q).is_some_and(|x| *x == b'(' || is_ident_byte(*x) || *x == b'$')
                             && let (Some(c2), Some(r2)) = (col_index(letters2), row_index(digits2))
                         {
-                            if targets_src && in_rect(r1, c1) && in_rect(r2, c2) {
+                            if targets_src && in_rect(r1, c1) && in_rect(r2, c2) && whole_range_moved(r1, r2) {
                                 if !same_sheet {
                                     if let Some((_, qstart)) = qual.take() {
                                         out.truncate(qstart);
                                     }
-                                    if !own_sheet.eq_ignore_ascii_case(dst_sheet) {
+                                    if !formula_moves && !own_sheet.eq_ignore_ascii_case(dst_sheet) {
                                         out.extend_from_slice(fmt_qual(dst_sheet).as_bytes());
                                     }
                                 }
@@ -920,6 +940,9 @@ pub fn relocate_moved_rect(
                                 };
                                 out.extend_from_slice(txt.as_bytes());
                             } else {
+                                if formula_moves && !same_sheet && qual.is_none() {
+                                    out.extend_from_slice(fmt_qual(src_sheet).as_bytes());
+                                }
                                 out.extend_from_slice(&b[i..q]);
                             }
                             i = q;
@@ -932,7 +955,7 @@ pub fn relocate_moved_rect(
                             if let Some((_, qstart)) = qual.take() {
                                 out.truncate(qstart);
                             }
-                            if !own_sheet.eq_ignore_ascii_case(dst_sheet) {
+                            if !formula_moves && !own_sheet.eq_ignore_ascii_case(dst_sheet) {
                                 out.extend_from_slice(fmt_qual(dst_sheet).as_bytes());
                             }
                         }
@@ -946,6 +969,9 @@ pub fn relocate_moved_rect(
                         };
                         out.extend_from_slice(txt.as_bytes());
                     } else {
+                        if formula_moves && !same_sheet && qual.is_none() {
+                            out.extend_from_slice(fmt_qual(src_sheet).as_bytes());
+                        }
                         out.extend_from_slice(&b[i..p]);
                     }
                     i = p;

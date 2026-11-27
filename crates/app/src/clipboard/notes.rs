@@ -3,6 +3,27 @@
 use super::Clip;
 use crate::SheetApp;
 
+#[derive(Clone, Copy)]
+pub(super) enum NoteRows<'a> {
+    Explicit(&'a [u32]),
+    Sparse(&'a super::sparse::PasteRows),
+}
+
+impl NoteRows<'_> {
+    fn contains(self, row: u32) -> bool {
+        match self {
+            Self::Explicit(rows) => rows.binary_search(&row).is_ok(),
+            Self::Sparse(rows) => rows.contains(row),
+        }
+    }
+    fn at(self, offset: u32) -> u32 {
+        match self {
+            Self::Explicit(rows) => rows[offset as usize],
+            Self::Sparse(rows) => rows.at(offset),
+        }
+    }
+}
+
 impl SheetApp {
     pub(super) fn capture_clip_notes_mapped(
         &mut self,
@@ -137,7 +158,7 @@ impl SheetApp {
         &mut self,
         target_sheet: usize,
         target_origin: (u32, u32),
-        target_rows: Option<&[u32]>,
+        target_rows: Option<NoteRows<'_>>,
         h: u32,
         w: u32,
         base_h: u32,
@@ -166,13 +187,12 @@ impl SheetApp {
         let (r0, c0) = target_origin;
         let r_end = r0.saturating_add(h.saturating_sub(1));
         let c_end = c0.saturating_add(w.saturating_sub(1));
-        let dst_row_set: Option<HashSet<u32>> = target_rows.map(|v| v.iter().copied().collect());
         let in_target = |rr: u32, cc: u32| -> bool {
             if cc < c0 || cc > c_end {
                 return false;
             }
-            match &dst_row_set {
-                Some(set) => set.contains(&rr),
+            match target_rows {
+                Some(rows) => rows.contains(rr),
                 None => rr >= r0 && rr <= r_end,
             }
         };
@@ -246,7 +266,7 @@ impl SheetApp {
                             continue;
                         }
                         let raw_r = target_rows
-                            .and_then(|v| v.get(out_r_idx as usize).copied())
+                            .map(|rows| rows.at(out_r_idx))
                             .unwrap_or(r0 + out_r_idx);
                         let raw_c = c0 + out_c_idx;
                         let (ar, ac) = sh
@@ -268,7 +288,7 @@ impl SheetApp {
                             continue;
                         }
                         let raw_r = target_rows
-                            .and_then(|v| v.get(out_r_idx as usize).copied())
+                            .map(|rows| rows.at(out_r_idx))
                             .unwrap_or(r0 + out_r_idx);
                         let raw_c = c0 + out_c_idx;
                         let (ar, ac) = sh

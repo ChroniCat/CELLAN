@@ -190,8 +190,8 @@ fn plan(
     {
         return Err("整列区域含合并单元格或数组公式，请改选具体范围");
     }
-    if !source.hidden_rows.is_empty() {
-        return Err("整列区域含筛选隐藏行，请改选具体范围复制可见行");
+    if !source.hidden_rows.is_empty() || !target.hidden_rows.is_empty() {
+        return Err("整列区域含筛选隐藏行，请改选具体范围粘贴可见行");
     }
     let mut style_rows = vec![Vec::new(); width as usize];
     let mut row_defaults = Vec::new();

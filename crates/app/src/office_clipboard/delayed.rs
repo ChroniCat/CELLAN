@@ -133,7 +133,12 @@ impl Range {
             }
         }
         let same_cell = |r: u32, c: u32| {
-            source.get(r, c) == live.get(r, c)
+            let same_input = match (source.get(r,c), live.get(r,c)) {
+                (Some(a),Some(b)) => a.same_input(&b),
+                (None,None) => true,
+                _ => false,
+            };
+            same_input
                 && source.style_of(r, c) == live.style_of(r, c)
                 && source.explicit_style_of(r, c) == live.explicit_style_of(r, c)
         };

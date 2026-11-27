@@ -8,6 +8,9 @@
 
 #[path = "undo_structural_cells.rs"]
 mod structural_cells;
+#[path = "undo_move_refs.rs"]
+mod move_refs;
+pub use move_refs::MoveReferences;
 #[path = "undo_structural_history.rs"]
 mod structural_history;
 use crate::model::{Cell, CellRef, Sheet, Workbook};
@@ -323,8 +326,8 @@ const HISTORY_PAYLOAD_BUDGET: usize = 256 * 1024 * 1024;
 
 static NEXT_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-#[derive(Clone, Copy)]
 struct EntryStamp {
+    move_refs: Option<Box<MoveReferences>>,
     sort_created: Option<u64>,
     sort_replay: Option<(u64, bool, Option<u64>)>,
     id: u64,
@@ -332,7 +335,7 @@ struct EntryStamp {
 }
 
 fn next_entry(payload_bytes: usize) -> EntryStamp {
-    EntryStamp { sort_created: None, sort_replay: None, id: NEXT_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed), payload_bytes }
+    EntryStamp { move_refs: None, sort_created: None, sort_replay: None, id: NEXT_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed), payload_bytes }
 }
 
 pub(crate) fn cell_heap_bytes(cell: &Cell) -> usize {
@@ -1211,7 +1214,7 @@ enum Entry {
 impl Entry {
     fn id(&self) -> u64 { self.stamp().id }
 
-    fn stamp(&self) -> EntryStamp {
+    fn stamp(&self) -> &EntryStamp {
         match self {
             Self::Cells(s, _, _, _, _)
             | Self::CellShift(s, _)
@@ -1222,7 +1225,7 @@ impl Entry {
             | Self::SheetTab(s, _)
             | Self::Meta(s, _)
             | Self::Pivot(s, _)
-            | Self::Chart(s, _) => *s,
+            | Self::Chart(s, _) => s,
         }
     }
 
@@ -1241,7 +1244,17 @@ impl Entry {
         }
     }
 
+    /// Moving workbook references and their cells is one edit. Check the entire
+    /// input before undoing the first cell or removing the history entry.
+    fn can_replay_move(&self, wb: &Workbook, redo: bool, guard: &mut impl FnMut(usize,u32,u32,&Cell) -> bool) -> bool {
+        let Some(refs) = &self.stamp().move_refs else { return true };
+        let Self::Cells(_, action, ..) = self else { return false };
+        refs.matches(wb, redo) && action.deltas.iter().all(|d|
+            wb.sheets.get(d.sheet).is_some_and(|sh| d.can_replay(sh,redo,guard)))
+    }
+
     fn simple_cells(&self) -> Option<Box<dyn Iterator<Item = (usize, u32, u32)> + '_>> {
+        if self.stamp().move_refs.is_some() { return None; }
         match self {
             Self::Cells(_, a, _, None, None) if a.snap_before.is_none() && a.snap_after.is_none()
                 && a.merges.is_none() && a.shapes.is_none() && a.pictures.is_none()
@@ -2868,19 +2881,28 @@ impl UndoStack {
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
-    pub fn push_with_notes(&mut self, mut action: Action, notes: Option<NoteUndoEdit>) {
+    pub fn push_with_notes(&mut self, action: Action, notes: Option<NoteUndoEdit>) {
+        self.push_with_move_references(action, notes, MoveReferences::default());
+    }
+
+    pub fn push_with_move_references(&mut self, mut action: Action, notes: Option<NoteUndoEdit>, refs: MoveReferences) {
         let notes = notes.filter(|n| !n.is_empty());
-        if action.is_empty() && notes.is_none() {
+        if action.is_empty() && notes.is_none() && refs.is_empty() {
             return;
         }
         if action.by_site == 0 {
             action.by_site = self.site;
         }
-        if let Some((cow, cow_bytes)) = CowBatchAction::from_action_with_notes(&action, notes.clone()) {
+        if refs.is_empty() && let Some((cow, cow_bytes)) = CowBatchAction::from_action_with_notes(&action, notes.clone()) {
             self.done.push(Entry::CowBatch(next_entry(cow_bytes), Box::new(cow)));
         } else {
             let bytes = action.payload_bytes() + notes.as_ref().map_or(0, NoteUndoEdit::payload_bytes);
             self.done.push(Entry::Cells(next_entry(bytes), action, None, None, notes));
+        }
+        if !refs.is_empty() {
+            let stamp = self.done.last_mut().unwrap().stamp_mut();
+            stamp.payload_bytes += refs.bytes();
+            stamp.move_refs = Some(Box::new(refs));
         }
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
@@ -3456,7 +3478,12 @@ impl UndoStack {
         self.trim_history(HISTORY_PAYLOAD_BUDGET);
     }
 
-    pub fn undo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
+    pub fn next_moves_references(&self, redo: bool) -> bool {
+        (if redo { self.undone.last() } else { self.done.last() })
+            .is_some_and(|entry| entry.stamp().move_refs.is_some())
+    }
+
+    pub fn undo_workbook(&mut self, wb: &mut Workbook, mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
         self.settle_before_replay();
         self.last_meta_sync.clear();
         self.last_needs_recalc = false;
@@ -3470,7 +3497,16 @@ impl UndoStack {
                     }
                 }
             }
-            return self.undo(&mut wb.sheets, guard);
+            let entry = self.done.last()?;
+            if !entry.can_replay_move(wb, false, &mut guard) { return None; }
+            let entry_id = entry.id();
+            let result = self.undo(&mut wb.sheets, guard)?;
+            if let Some(entry) = self.undone.last_mut().filter(|e| e.id() == entry_id) {
+                if !result.merge_conflict && let Some(refs) = &mut entry.stamp_mut().move_refs {
+                    self.last_needs_recalc |= refs.replay(wb, false);
+                }
+            }
+            return Some(result);
         }
         if self.done.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::SheetTab(_, action)) = self.done.last_mut() {
@@ -3497,7 +3533,7 @@ impl UndoStack {
         Some(applied)
     }
 
-    pub fn redo_workbook(&mut self, wb: &mut Workbook, guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
+    pub fn redo_workbook(&mut self, wb: &mut Workbook, mut guard: impl FnMut(usize, u32, u32, &Cell) -> bool) -> Option<Applied> {
         self.settle_before_replay();
         self.last_meta_sync.clear();
         self.last_needs_recalc = false;
@@ -3511,7 +3547,16 @@ impl UndoStack {
                     }
                 }
             }
-            return self.redo(&mut wb.sheets, guard);
+            let entry = self.undone.last()?;
+            if !entry.can_replay_move(wb, true, &mut guard) { return None; }
+            let entry_id = entry.id();
+            let result = self.redo(&mut wb.sheets, guard)?;
+            if let Some(entry) = self.done.last_mut().filter(|e| e.id() == entry_id) {
+                if !result.merge_conflict && let Some(refs) = &mut entry.stamp_mut().move_refs {
+                    self.last_needs_recalc |= refs.replay(wb, true);
+                }
+            }
+            return Some(result);
         }
         if self.undone.last().is_some_and(|a| a.by_site() != 0 && self.site != 0 && a.by_site() != self.site) { return None; }
         if let Some(Entry::SheetTab(_, action)) = self.undone.last_mut() {
@@ -3723,7 +3768,7 @@ impl UndoStack {
             merge_conflict: false,
             total_touched,
         };
-        if !action.is_empty() || arrays.is_some() || notes.is_some() { self.undone.push(Entry::Cells(id, action, permutation, arrays, notes)); }
+        if !action.is_empty() || arrays.is_some() || notes.is_some() || id.move_refs.is_some() { self.undone.push(Entry::Cells(id, action, permutation, arrays, notes)); }
         Some(applied)
     }
 
@@ -3911,7 +3956,7 @@ impl UndoStack {
             merge_conflict: false,
             total_touched,
         };
-        if !action.is_empty() || arrays.is_some() || notes.is_some() { self.done.push(Entry::Cells(id, action, permutation, arrays, notes)); }
+        if !action.is_empty() || arrays.is_some() || notes.is_some() || id.move_refs.is_some() { self.done.push(Entry::Cells(id, action, permutation, arrays, notes)); }
         Some(applied)
     }
 

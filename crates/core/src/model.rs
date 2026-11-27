@@ -1892,40 +1892,35 @@ impl Sheet {
     pub fn set_style_rect(&mut self, r1: u32, c1: u32, r2: u32, c2: u32, id: u16) {
         let (r1, r2) = (r1.min(r2), r1.max(r2));
         let (c1, c2) = (c1.min(c2), c1.max(c2));
-        self.display_style_revision = next_sheet_identity();
-        if !self.loading {
-            self.edited = true;
-            self.styles_dirty = true;
+        if id == 0 {
+            self.clear_styles_in_row_runs(c1, c2, &[(r1,r2)]);
+            return;
         }
-        if id != 0 {
-            self.styles.insert_rect(r1, c1, r2, c2, id);
-            self.style_edits.insert_rect(r1, c1, r2, c2);
-        } else {
-            self.styles
-                .remove_rect_recording(r1, c1, r2, c2, &mut self.style_edits);
-            if !self.row_styles.is_empty() {
-                let hit_rows: Vec<u32> = self
-                    .row_styles
-                    .keys()
-                    .copied()
-                    .filter(|&r| r >= r1 && r <= r2)
-                    .collect();
-                for r in hit_rows {
-                    self.styles.insert_rect(r, c1, r, c2, 0);
-                    self.style_edits.insert_rect(r, c1, r, c2);
-                }
+        self.display_style_revision = next_sheet_identity();
+        if !self.loading { self.edited = true; self.styles_dirty = true; }
+        self.styles.insert_rect(r1, c1, r2, c2, id);
+        self.style_edits.insert_rect(r1, c1, r2, c2);
+    }
+
+    /// Clear explicit formats in sorted, disjoint inclusive row runs. When a row or
+    /// column supplies an inherited format, retain an explicit default in those cells.
+    pub fn clear_styles_in_row_runs(&mut self, c1: u32, c2: u32, runs: &[(u32,u32)]) {
+        if runs.is_empty() { return; }
+        self.display_style_revision = next_sheet_identity();
+        if !self.loading { self.edited = true; self.styles_dirty = true; }
+        let cols: Vec<_> = self.col_styles.keys().copied().filter(|c| (c1..=c2).contains(c)).collect();
+        for &(first,last) in runs {
+            self.styles.remove_rect_recording(first,c1,last,c2,&mut self.style_edits);
+            for &col in &cols {
+                self.styles.insert_rect(first,col,last,col,0);
+                self.style_edits.insert_rect(first,col,last,col);
             }
-            if !self.col_styles.is_empty() {
-                let hit_cols: Vec<u32> = self
-                    .col_styles
-                    .keys()
-                    .copied()
-                    .filter(|&c| c >= c1 && c <= c2)
-                    .collect();
-                for c in hit_cols {
-                    self.styles.insert_rect(r1, c, r2, c, 0);
-                    self.style_edits.insert_rect(r1, c, r2, c);
-                }
+        }
+        for &row in self.row_styles.keys() {
+            let i = runs.partition_point(|&(first,_)| first <= row);
+            if i > 0 && row <= runs[i-1].1 {
+                self.styles.insert_rect(row,c1,row,c2,0);
+                self.style_edits.insert_rect(row,c1,row,c2);
             }
         }
     }

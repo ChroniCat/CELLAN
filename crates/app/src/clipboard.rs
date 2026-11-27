@@ -1,11 +1,14 @@
 //! Internal clipboard snapshots, ownership and source selection.
 
 mod copy;
+mod cut;
 mod notes;
 mod office;
 mod paste;
 mod sparse;
 mod special;
+#[cfg(test)]
+mod regression_tests;
 
 pub(super) use sparse::BackgroundPaste;
 
@@ -141,6 +144,27 @@ impl SheetApp {
         self.clip_notes.clear();
         self.clip_threads.clear();
         self.clip_notes_captured = false;
+        self.eager_cut_source = None;
+    }
+
+    /// All cuts retain an input snapshot, even when the OS clipboard is published eagerly.
+    /// Comments are compared separately because their current contents will also be cleared.
+    fn cut_source_matches(&self, clip: &Clip) -> bool {
+        let Some(live) = self.wb.sheets.get(clip.sheet) else { return false };
+        let snapshot = clip.deferred.as_deref().or(self.eager_cut_source.as_deref());
+        if snapshot.is_some_and(|source| !source.matches_cut_source(live)) { return false; }
+        if !self.clip_notes_captured { return true; }
+        let (top,left,bottom,right) = clip.rect;
+        let inside = |k: &sheetcore::CellRef| {
+            (top..=bottom).contains(&k.row) && (left..=right).contains(&k.col)
+                && clip.source_rows.as_ref().is_none_or(|rows| rows.binary_search(&k.row).is_ok())
+        };
+        let source_key = |row:u32, col:u32| sheetcore::CellRef::new(
+            clip.source_row(row as usize),clip.source_col(col as usize));
+        self.clip_notes.len() == live.notes.keys().filter(|k| inside(k)).count()
+            && self.clip_threads.len() == live.threads.keys().filter(|k| inside(k)).count()
+            && self.clip_notes.iter().all(|(r,c,n)| live.notes.get(&source_key(*r,*c)) == Some(n))
+            && self.clip_threads.iter().all(|(r,c,t)| live.threads.get(&source_key(*r,*c)) == Some(t))
     }
 
     #[inline]
@@ -213,6 +237,7 @@ impl SheetApp {
         self.clip_notes.clear();
         self.clip_threads.clear();
         self.clip_notes_captured = false;
+        self.eager_cut_source = None;
     }
 
     pub(crate) fn has_pasteable_clip(&self) -> bool {

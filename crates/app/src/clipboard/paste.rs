@@ -131,14 +131,12 @@ impl SheetApp {
         let mut pasted_clip_threads: Vec<(u32, u32, sheetcore::notes::ThreadedComment)> = Vec::new();
         let mut cut_src: Option<(usize, Vec<(u32, u32)>)> = None;
         let mut cut_note_src: Option<(usize, (u32, u32, u32, u32), Option<Vec<u32>>)> = None;
-        let mut cut_move: Option<(usize, (u32, u32, u32, u32), i64, i64)> = None;
+        let mut cut_move = None;
 
         // Borrow the previous block only when it will actually be pasted. External plain
         // text must not copy or reformat the last internal selection.
         if let Some(clip) = self.clip.as_ref().filter(|_| use_internal) {
-            if clip.cut && clip.deferred.as_ref().is_some_and(|range| {
-                !self.wb.sheets.get(clip.sheet).is_some_and(|sh| range.matches_cut_source(sh))
-            }) {
+            if clip.cut && !self.cut_source_matches(clip) {
                 self.status = "剪切源已更改，请重新剪切".into();
                 return;
             }
@@ -150,11 +148,8 @@ impl SheetApp {
             let (sr1, sc1, sr2, sc2) = clip.rect;
             let dr = r as i64 - sr1 as i64;
             let dc = c as i64 - sc1 as i64;
-            let src_sheet_name = self.wb.sheet(clip.sheet).name.clone();
+            cut_move = clip.cut.then(|| super::cut::CutRange::new(clip, &self.wb, si, (r,c)));
             let target_sheet_name = self.wb.sheet(si).name.clone();
-            let contiguous_cut = clip.cut
-                && clip.cells().len() == (sr2 - sr1 + 1) as usize
-                && (0..clip.cells().len()).all(|idx| clip.source_row(idx) == sr1 + idx as u32);
             for (index, row) in clip.cells().iter().enumerate() {
                 let row_shift = r as i64 + index as i64 - clip.source_row(index) as i64;
                 let mut out = Vec::new();
@@ -163,20 +158,8 @@ impl SheetApp {
                     let mut cell = cell.clone();
                     if !values_only {
                         if let Some(f) = &cell.formula {
-                            if clip.cut {
-                                // Excel 剪切粘贴语义：不平移源块外部引用，仅同步块内自引用（含跨表剪切）
-                                if contiguous_cut {
-                                    let nf = sheetcore::refs::relocate_moved_rect(
-                                        f,
-                                        &src_sheet_name,
-                                        &src_sheet_name,
-                                        clip.rect,
-                                        &target_sheet_name,
-                                        dr,
-                                        dc,
-                                    );
-                                    cell.formula = Some(nf.into());
-                                }
+                            if let Some(movement) = &cut_move {
+                                cell.formula = Some(movement.moved_formula(f).into());
                             } else {
                                 let nf = sheetcore::refs::translate(f, row_shift, col_shift, &target_sheet_name);
                                 cell.formula = Some(nf.into());
@@ -210,9 +193,6 @@ impl SheetApp {
                 }).collect();
                 cut_src = Some((clip.sheet, keys));
                 cut_note_src = Some((clip.sheet, clip.rect, clip.source_rows.clone()));
-                if contiguous_cut {
-                    cut_move = Some((clip.sheet, clip.rect, dr, dc));
-                }
             }
         } else if let Some(t) = text {
             rows = Self::parse_tsv(&t);
@@ -549,12 +529,14 @@ impl SheetApp {
             touched.sort_unstable();
             touched.dedup();
         }
-        let cut_rewrites: Vec<(usize, u32, u32, String)> = if let Some((src_si, src_rect, dr, dc)) = cut_move {
-            let dst_rect = (r, c, r + h.saturating_sub(1), c + w.saturating_sub(1));
-            self.collect_move_formula_rewrites(src_si, src_rect, si, dr, dc, Some((si, dst_rect)))
-        } else {
-            Vec::new()
-        };
+        let cut_rewrites = cut_move.as_ref().map_or_else(Vec::new, |movement| {
+            movement.external_formulas(&self.wb, si, (target_last_row, c + w - 1))
+        });
+        let mut move_refs = cut_move.as_ref().map_or_else(Default::default, |m| m.workbook_references(&self.wb));
+        if self.net.is_some() && !move_refs.is_empty() {
+            self.status = "当前协作协议不能同步名称或图表引用，请断开协作后再剪切粘贴".into();
+            return;
+        }
         if !cut_rewrites.is_empty() {
             touched.extend(cut_rewrites.iter().map(|&(s, rr, cc, _)| (s, rr, cc)));
             touched.sort_unstable();
@@ -589,6 +571,9 @@ impl SheetApp {
         let mut transactions = std::collections::BTreeMap::new();
         for &(sheet, rr, cc) in &touched {
             transactions.entry(sheet).or_insert_with(Vec::new).push((rr, cc));
+        }
+        for (&sheet, keys) in &transactions {
+            if sheet != si && !self.write_preflight_on(sheet, keys, "剪切") { return; }
         }
         let merge_edit = if values_only || tsv_paste || dst_rows.is_some() {
             None
@@ -641,14 +626,12 @@ impl SheetApp {
                 }
             }
         }
-        if let Some((src_si, src_rect, dr, dc)) = cut_move {
-            self.relocate_named_and_chart_refs_for_move(src_si, src_rect, si, dr, dc);
-        }
+        let names_changed = move_refs.replay(&mut self.wb, true);
         let paste_note_edit = if !values_only && !tsv_paste {
             self.apply_pasted_notes(
                 si,
                 (r, c),
-                dst_rows.as_deref(),
+                dst_rows.as_deref().map(super::notes::NoteRows::Explicit),
                 h,
                 w,
                 clip_base_h,
@@ -680,7 +663,7 @@ impl SheetApp {
         if !paste_note_edit.is_empty() {
             self.broadcast_note_undo_edit(&paste_note_edit);
         }
-        self.undo.push_with_notes(
+        self.undo.push_with_move_references(
             sheetcore::undo::Action {
                 label: label.into(), deltas, focus: (si, r, c),
                 merges: merge_edit,
@@ -689,13 +672,18 @@ impl SheetApp {
                 shapes: None,
                 refresh_sizes: None,
             },
-            (!paste_note_edit.is_empty()).then_some(paste_note_edit),
+            (!paste_note_edit.is_empty()).then_some(paste_note_edit), move_refs,
         );
         if cut_src.is_some() {
             self.clear_internal_clip();
         }
         // 重算 + 广播
-        self.recalc_and_broadcast(&touched);
+        if names_changed {
+            self.recalc_all_and_deps_adaptive();
+            self.broadcast_cells(&touched);
+        } else {
+            self.recalc_and_broadcast(&touched);
+        }
         if cut_src.is_none() && h > 0 && w > 0 {
             self.last_paste = Some(LastPasteState {
                 sheet_idx: si,

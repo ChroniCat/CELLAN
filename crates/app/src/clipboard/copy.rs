@@ -522,6 +522,9 @@ impl SheetApp {
             self.clip_copied_at = Some(std::time::Instant::now());
             let visible_count = visible_rows.len();
             self.clip_pic = None;
+            self.eager_cut_source = cut.then(|| Box::new(office_clipboard::delayed::Range::new_filtered(
+                &self.wb, si, rect, visible_rows.clone(),
+            )));
             self.capture_clip_notes_mapped(si, (r1, c1, r2, c2), Some(&visible_rows), None);
             self.clip = Some(Clip { deferred: None,
                 sheet: si,
@@ -573,6 +576,7 @@ impl SheetApp {
             .copied()
             .collect();
         self.clip_pic = None;
+        self.eager_cut_source = cut.then(|| Box::new(office_clipboard::delayed::Range::new(&self.wb, si, rect)));
         self.capture_clip_notes_mapped(si, (r1, c1, r2, c2), None, None);
         self.clip = Some(Clip { deferred: None, sheet: si, rect: (r1, c1, r2, c2), source_rows: None, source_cols: None, cells, merges, cut });
         self.status = format!(

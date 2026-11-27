@@ -1231,6 +1231,7 @@ struct SheetApp {
     clip_notes: Vec<(u32, u32, sheetcore::notes::Note)>,
     clip_threads: Vec<(u32, u32, sheetcore::notes::ThreadedComment)>,
     clip_notes_captured: bool,
+    eager_cut_source: Option<Box<office_clipboard::delayed::Range>>,
     /// 右侧批注管理侧边栏与财务常用语模板状态
     comments_panel: comments_panel::CommentsPanelState,
     /// 跨表取数对话框：输入文本
@@ -2547,6 +2548,7 @@ impl SheetApp {
             clip_notes: Vec::new(),
             clip_threads: Vec::new(),
             clip_notes_captured: false,
+            eager_cut_source: None,
             comments_panel: comments_panel::CommentsPanelState::default(),
             link_dlg: None,
             macro_run_dlg: None,
@@ -12331,6 +12333,11 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if let Some((id, patch)) = self.undo.next_room_cell_shift(redo) {
             return self.request_room_shift_replay(id, patch, redo);
         }
+        let moves_references = self.undo.next_moves_references(redo);
+        if moves_references && self.net.is_some() {
+            self.status = "当前协作协议不能同步名称或图表引用，请断开协作后再撤销或重做剪切".into();
+            return false;
+        }
         let structural = if redo { self.undo.redo_is_structure() } else { self.undo.undo_is_structure() };
         let cell_shift = self.undo.next_is_cell_shift(redo);
         if self.net.is_some() && structural {
@@ -12366,7 +12373,9 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.undo.undo_workbook(&mut self.wb, guard)
         };
         let Some(applied) = applied else {
-            self.status = if structural {
+            self.status = if moves_references {
+                "剪切涉及的单元格、名称或图表引用已变更，已保留历史记录".into()
+            } else if structural {
                 format!("无法{}结构操作：工作表或相关引用已变更，已保留当前内容和历史记录",
                     if redo { "重做" } else { "撤销" })
             } else if redo { "没有可重做的操作".into() } else { "没有可撤销的操作".into() };
