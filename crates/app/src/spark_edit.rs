@@ -180,7 +180,7 @@ impl SheetApp {
         }
         let after = sh.sparklines.clone();
         sh.sparklines_dirty = true;
-        self.undo.push_meta(
+        self.commit_meta_tx(
             "修改迷你图",
             (si, self.sel.0, self.sel.1),
             sheetcore::undo::MetaEdit {
@@ -188,10 +188,10 @@ impl SheetApp {
                 sparklines: Some((before, after)),
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            false,
+            Vec::new(),
         );
-        self.wb.dirty = true;
-        // 装载期的后台重算会整份替换 wb：改过模型必须同时推进 doc_gen
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已修改 {} 条迷你图", anchors.len());
     }
 
@@ -209,7 +209,7 @@ impl SheetApp {
         sh.sparklines.retain(|s| !anchors.contains(&(s.r, s.c)));
         let after = sh.sparklines.clone();
         sh.sparklines_dirty = true;
-        self.undo.push_meta(
+        self.commit_meta_tx(
             "清除迷你图",
             (si, self.sel.0, self.sel.1),
             sheetcore::undo::MetaEdit {
@@ -217,9 +217,10 @@ impl SheetApp {
                 sparklines: Some((before, after)),
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            false,
+            Vec::new(),
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已清除 {n} 条迷你图");
     }
 
@@ -302,7 +303,7 @@ impl SheetApp {
             }
             if updated > 0 {
                 let after_sparks = self.wb.sheet(si).sparklines.clone();
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "批量修改迷你图",
                     (si, self.sel.0, self.sel.1),
                     sheetcore::undo::MetaEdit {
@@ -310,9 +311,10 @@ impl SheetApp {
                         sparklines: Some((before_sparks, after_sparks)),
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.wb.dirty = true;
                 self.status = format!("已批量更新 {updated} 条迷你图的样式属性");
                 return Ok(updated);
             }
@@ -363,7 +365,7 @@ impl SheetApp {
         sh.sparklines_dirty = true;
         let after_sparks = sh.sparklines.clone();
         let first = sh.sparklines.iter().find(|s| s.c == loc.1 && s.r >= loc.0).map(|s| (s.r, s.c));
-        self.undo.push_meta(
+        self.commit_meta_tx(
             "创建迷你图",
             (si, loc.0, loc.1),
             sheetcore::undo::MetaEdit {
@@ -371,9 +373,10 @@ impl SheetApp {
                 sparklines: Some((before_sparks, after_sparks)),
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            false,
+            Vec::new(),
         );
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.wb.dirty = true;
         if let Some((r, c)) = first {
             self.sel = (r, c);
             self.sel_end = (r, c);

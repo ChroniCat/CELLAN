@@ -16,9 +16,13 @@ use std::time::Duration;
 #[path = "net_cell_shift.rs"]
 mod cell_shift;
 pub(crate) use cell_shift::cell_shift_ops;
-use cell_shift::{CellShiftHost, ShiftPending, finish_shift_snapshot, reject_pending_shift, structural_anchor};
+use cell_shift::{
+    CellShiftHost, RoomTxPending, ShiftPending, finish_shift_snapshot, reject_pending_room_tx,
+    reject_pending_shift, structural_anchor,
+};
 use sheetcore::cell_shift_patch::{CellShiftOverlay, CellShiftPatch};
 use sheetcore::sync::CellShiftPhase;
+use sheetcore::tx::RoomTxPatch;
 pub const DEFAULT_PORT: u16 = 7878;
 
 /// 实际监听的端口：`SC_NET_PORT` 可覆盖（同机多实例、端口被占时用）
@@ -93,6 +97,8 @@ pub enum NetEvent {
     StructuralRejected(String),
     CheckCellShift { site: u32, id: u64, phase: CellShiftPhase, patch: Arc<CellShiftPatch>, reply: Sender<Result<Arc<CellShiftPatch>, String>> },
     CellShiftCommitted { site: u32, id: u64, phase: CellShiftPhase, patch: Arc<CellShiftPatch>, first_ts: u64, seq: u64, snapshot: bool },
+    CheckRoomTx { site: u32, phase: CellShiftPhase, patch: Arc<RoomTxPatch>, reply: Sender<Result<Arc<RoomTxPatch>, String>> },
+    RoomTxCommitted { site: u32, id: u64, phase: CellShiftPhase, patch: Arc<RoomTxPatch>, seq: u64, snapshot: bool },
     CaptureCellShiftOverlay(Sender<CellShiftOverlay>),
     CellShiftOverlay { overlay: Arc<CellShiftOverlay>, seq: u64 },
     StructureRevision(usize),
@@ -607,6 +613,7 @@ struct RoomRoster {
     names: HashMap<u32, (String, u8)>,
     auth_hashes: HashMap<u32, [u8; 32]>,
     shift_members: HashMap<u32, u64>,
+    room_tx_members: HashMap<u32, u64>,
 }
 
 fn sha256_bytes(input: &[u8]) -> [u8; 32] {
@@ -647,6 +654,7 @@ impl RoomRoster {
             names,
             auth_hashes: HashMap::new(),
             shift_members: HashMap::new(),
+            room_tx_members: HashMap::new(),
         }
     }
 
@@ -769,6 +777,8 @@ impl RoomRoster {
         if site != self.host_site {
             if matched_peer {
                 self.peers.remove(&site);
+                self.shift_members.remove(&site);
+                self.room_tx_members.remove(&site);
             }
             self.names.remove(&site);
         }
@@ -1345,6 +1355,50 @@ fn shift_seq_map(map: &mut SeqMap, sheet: usize, op: &sheetcore::structural::Str
     }
 }
 
+fn permute_seq_map(
+    map: &mut SeqMap,
+    sheet: usize,
+    axis: sheetcore::refs::Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+) {
+    let lo = from.min(at);
+    let hi = from
+        .saturating_add(n)
+        .max(at.saturating_add(n))
+        .saturating_sub(1);
+    let source = map.clone();
+    let mut moved = Vec::new();
+    let mut permute = |first, last| {
+        for (&key, &seq) in source.range(first..=last) {
+            map.remove_cow(&key);
+            if let Some((r, c)) =
+                sheetcore::sync::permute_axis_coord(key.1, key.2, axis, from, n, at)
+            {
+                moved.push(((sheet, r, c), seq));
+            }
+        }
+    };
+    match axis {
+        sheetcore::refs::Axis::Row => permute((sheet, lo, 0), (sheet, hi, u32::MAX)),
+        sheetcore::refs::Axis::Col => {
+            let last = (sheet, u32::MAX, u32::MAX);
+            let mut row_from = 0u32;
+            while let Some((&(_, row, _), _)) = source.range((sheet, row_from, 0)..=last).next() {
+                permute((sheet, row, lo), (sheet, row, hi));
+                let Some(next) = row.checked_add(1) else {
+                    break;
+                };
+                row_from = next;
+            }
+        }
+    }
+    for (key, seq) in moved {
+        map.insert_cow(key, seq);
+    }
+}
+
 const MAX_SAVE_CHECKPOINTS: usize = 8;
 
 /// 后台在加入者监督线程中直接组装完成的列式工作簿快照，
@@ -1674,6 +1728,80 @@ impl HostWatermark {
         self.style_log.clear();
         seq
     }
+
+    fn permute_axis(
+        &mut self,
+        sheet: usize,
+        axis: sheetcore::refs::Axis,
+        from: u32,
+        n: u32,
+        at: u32,
+    ) -> u64 {
+        self.cached_axis = None;
+        permute_seq_map(&mut self.op_seqs, sheet, axis, from, n, at);
+        permute_seq_map(&mut self.style_seqs, sheet, axis, from, n, at);
+        let lo = from.min(at);
+        let hi = from
+            .saturating_add(n)
+            .max(at.saturating_add(n))
+            .saturating_sub(1);
+        match axis {
+            sheetcore::refs::Axis::Row => {
+                if self.axis_rows.contains_key(&sheet) {
+                    if let Some(rm) = Arc::make_mut(&mut self.axis_rows).get_mut(&sheet) {
+                        let moved: Vec<_> = rm
+                            .extract_if(lo..=hi, |_, _| true)
+                            .filter_map(|(r, v)| {
+                                sheetcore::sync::permute_axis_coord(r, 0, axis, from, n, at)
+                                    .map(|(nr, _)| (nr, v))
+                            })
+                            .collect();
+                        rm.extend(moved);
+                    }
+                }
+            }
+            sheetcore::refs::Axis::Col => {
+                if self.axis_cols.contains_key(&sheet) {
+                    if let Some(cm) = Arc::make_mut(&mut self.axis_cols).get_mut(&sheet) {
+                        let moved: Vec<_> = cm
+                            .extract_if(lo..=hi, |_, _| true)
+                            .filter_map(|(c, v)| {
+                                sheetcore::sync::permute_axis_coord(0, c, axis, from, n, at)
+                                    .map(|(_, nc)| (nc, v))
+                            })
+                            .collect();
+                        cm.extend(moved);
+                    }
+                }
+            }
+        }
+        if !self.merges.is_empty() {
+            let merges = Arc::make_mut(&mut self.merges);
+            let mut next = Vec::with_capacity(merges.len());
+            for (seq, msh, r1, c1, r2, c2, on) in merges.drain(..) {
+                if msh == sheet {
+                    if let Some((nr1, nc1, nr2, nc2)) = sheetcore::sync::permute_axis_merge_rect(
+                        (r1, c1, r2, c2),
+                        axis,
+                        from,
+                        n,
+                        at,
+                    ) {
+                        next.push((seq, msh, nr1, nc1, nr2, nc2, on));
+                    }
+                } else {
+                    next.push((seq, msh, r1, c1, r2, c2, on));
+                }
+            }
+            *merges = next;
+        }
+        let seq = self.bump();
+        self.log_floor_seq = seq;
+        self.meta_floor_seq = self.meta_floor_seq.max(seq);
+        self.op_log.clear();
+        self.style_log.clear();
+        seq
+    }
 }
 
 #[cfg(test)]
@@ -1953,8 +2081,42 @@ fn shift_host_threads(
     }
 }
 
+fn permute_host_threads(
+    host_threads: &HostThreads,
+    sheet: usize,
+    axis: sheetcore::refs::Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+) {
+    let mut map = host_threads.lock().unwrap_or_else(|e| e.into_inner());
+    if map.is_empty() {
+        return;
+    }
+    let old = std::mem::take(&mut *map);
+    for ((sh, r, c), mut tc) in old {
+        if sh == sheet {
+            if let Some((nr, nc)) = sheetcore::sync::permute_axis_coord(r, c, axis, from, n, at) {
+                match &mut tc {
+                    HostComment::Thread(thread) => {
+                        thread.r = nr;
+                        thread.c = nc;
+                    }
+                    HostComment::Note(note) => {
+                        note.r = nr;
+                        note.c = nc;
+                    }
+                }
+                map.insert((sh, nr, nc), tc);
+            }
+        } else {
+            map.insert((sh, r, c), tc);
+        }
+    }
+}
+
 /// Unified collaboration coordinate epoch across whole-row/col `Structural`
-/// operations (`struct_rev`) and partial `CellShift` operations (`shift_seq`).
+/// operations (`struct_rev`) and partial `CellShift` / `AxisPermute` operations (`shift_seq`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CoordEpoch {
     pub struct_rev: usize,
@@ -1970,8 +2132,10 @@ pub struct Net {
     palette_styles_cap: Arc<AtomicBool>,
     thread_changes_cap: Arc<AtomicBool>,
     cell_shift_cap: Arc<AtomicBool>,
+    room_tx_cap: Arc<AtomicBool>,
     shift_host: Option<Arc<CellShiftHost>>,
     shift_pending: ShiftPending,
+    room_tx_pending: RoomTxPending,
     force_full: Arc<AtomicBool>,
     connection_generation: Arc<AtomicU64>,
     pending_structure: Arc<AtomicBool>,
@@ -2780,6 +2944,163 @@ fn shift_state(
                     cur.col = nc;
                 }
             }
+        }
+    }
+}
+
+fn permute_grid<T: Clone>(
+    grid: &SharedGrid<T>,
+    sheet: usize,
+    axis: sheetcore::refs::Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+    mut relocate: impl FnMut(&mut Arc<T>, u32, u32),
+) {
+    let lo = from.min(at);
+    let hi = from
+        .saturating_add(n)
+        .max(at.saturating_add(n))
+        .saturating_sub(1);
+    let mut guard = grid.lock().unwrap_or_else(|e| e.into_inner());
+    let source = guard.clone();
+    let mut moved = Vec::new();
+    let target = Arc::make_mut(&mut guard);
+    let mut permute = |first, last| {
+        for (&key, val) in source.range(first..=last) {
+            target.remove_cow(&key);
+            if let Some((r, c)) =
+                sheetcore::sync::permute_axis_coord(key.1, key.2, axis, from, n, at)
+            {
+                let mut next = val.clone();
+                relocate(&mut next, r, c);
+                moved.push(((sheet, r, c), next));
+            }
+        }
+    };
+    match axis {
+        sheetcore::refs::Axis::Row => permute((sheet, lo, 0), (sheet, hi, u32::MAX)),
+        sheetcore::refs::Axis::Col => {
+            let last = (sheet, u32::MAX, u32::MAX);
+            let mut row_from = 0u32;
+            while let Some((&(_, row, _), _)) = source.range((sheet, row_from, 0)..=last).next() {
+                permute((sheet, row, lo), (sheet, row, hi));
+                let Some(next) = row.checked_add(1) else {
+                    break;
+                };
+                row_from = next;
+            }
+        }
+    }
+    for (key, val) in moved {
+        target.insert_cow(key, val);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn permute_state(
+    baseline: &SharedBaseline,
+    formula_keys: &Mutex<BTreeSet<(usize, u32, u32)>>,
+    state: &SharedGrid<Op>,
+    delta_ops: &SharedGrid<Op>,
+    base_hash: &Arc<Mutex<String>>,
+    styles: &SharedStyles,
+    delta_styles: &SharedStyles,
+    locks: &Arc<Mutex<sheetcore::sync::LockTable>>,
+    cursors: &Arc<Mutex<HashMap<u32, Cursor>>>,
+    threads: &HostThreads,
+    merges: &Arc<Mutex<Vec<(usize, u32, u32, u32, u32, bool)>>>,
+    names: &[String],
+    sheet: usize,
+    axis: sheetcore::refs::Axis,
+    from: u32,
+    n: u32,
+    at: u32,
+) {
+    let map = |r: u32, c: u32| sheetcore::sync::permute_axis_coord(r, c, axis, from, n, at);
+    base_hash.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    {
+        let mut base_guard = baseline.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(base_arc) = base_guard.as_mut() {
+            Arc::make_mut(base_arc).permute_axis(sheet, axis, from, n, at);
+        }
+    }
+    let active_formulas: Vec<(usize, u32, u32)> = {
+        let mut fk = formula_keys.lock().unwrap_or_else(|e| e.into_inner());
+        sheetcore::sync::permute_coord_set(&mut fk, sheet, axis, from, n, at);
+        fk.iter().copied().collect()
+    };
+    for cells in [state, delta_ops] {
+        permute_grid(cells, sheet, axis, from, n, at, |value, row, col| {
+            let cell = Arc::make_mut(value);
+            cell.row = row;
+            cell.col = col;
+        });
+        if !active_formulas.is_empty() {
+            let mut grid = cells.lock().unwrap_or_else(|e| e.into_inner());
+            let mut updates = Vec::new();
+            for &key in &active_formulas {
+                if let Some(cell) = grid.get(&key) {
+                    if let Some(formula) = cell.permuted_formula(names, sheet, axis, from, n, at) {
+                        let mut changed = (**cell).clone();
+                        changed.formula = Some(Arc::from(formula));
+                        updates.push((key, Arc::new(changed)));
+                    }
+                }
+            }
+            if !updates.is_empty() {
+                let target = Arc::make_mut(&mut grid);
+                for (key, changed) in updates {
+                    target.insert_cow(key, changed);
+                }
+            }
+        }
+    }
+    for st in [styles, delta_styles] {
+        permute_grid(st, sheet, axis, from, n, at, |_, _, _| {});
+    }
+    locks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .permute_axis(sheet, axis, from, n, at);
+    {
+        let mut cm = cursors.lock().unwrap_or_else(|e| e.into_inner());
+        for cur in cm.values_mut() {
+            if cur.sheet == sheet {
+                if let Some((nr, nc)) = map(cur.row, cur.col) {
+                    cur.row = nr;
+                    cur.col = nc;
+                }
+                if let (Some(er), Some(ec)) = (cur.end_row, cur.end_col) {
+                    if let Some((ner, nec)) = map(er, ec) {
+                        cur.end_row = Some(ner);
+                        cur.end_col = Some(nec);
+                    }
+                }
+            }
+        }
+    }
+    permute_host_threads(threads, sheet, axis, from, n, at);
+    {
+        let mut m = merges.lock().unwrap_or_else(|e| e.into_inner());
+        if !m.is_empty() {
+            let mut next = Vec::with_capacity(m.len());
+            for (msh, r1, c1, r2, c2, on) in m.drain(..) {
+                if msh == sheet {
+                    if let Some((nr1, nc1, nr2, nc2)) = sheetcore::sync::permute_axis_merge_rect(
+                        (r1, c1, r2, c2),
+                        axis,
+                        from,
+                        n,
+                        at,
+                    ) {
+                        next.push((msh, nr1, nc1, nr2, nc2, on));
+                    }
+                } else {
+                    next.push((msh, r1, c1, r2, c2, on));
+                }
+            }
+            *m = next;
         }
     }
 }
@@ -3846,11 +4167,23 @@ impl Net {
     }
 
     pub fn supports_thread_changes(&self) -> bool { self.thread_changes_cap.load(Ordering::Acquire) }
+    pub(crate) fn supports_room_tx(&self) -> bool { self.room_tx_cap.load(Ordering::Acquire) }
 
     pub fn pending_structure(&self) -> bool { self.pending_structure.load(Ordering::Acquire) }
     pub fn finish_structure(&self) {
         *lock_unpoison(&self.shift_pending) = None;
+        *lock_unpoison(&self.room_tx_pending) = None;
         self.pending_structure.store(false, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub(crate) fn arm_room_tx_pending_for_test(
+        &self,
+        id: u64,
+        phase: CellShiftPhase,
+        patch: Arc<RoomTxPatch>,
+    ) {
+        *lock_unpoison(&self.room_tx_pending) = Some((id, phase, patch));
+        self.pending_structure.store(true, Ordering::Release);
     }
 
     pub fn structure_seen(&self) -> usize { self.structure_seen.lock().unwrap_or_else(|e| e.into_inner()).seen }
@@ -5347,6 +5680,8 @@ fn host_initialized(
     let shift_host = Arc::new(CellShiftHost {
         order: room_order.clone(), roster: roster.clone(), events: evt_tx.clone(), cmd: cmd_tx.clone(),
         wm: host_watermark.clone(), clock: host_max_clock.clone(), structs: structs.clone(), locks: locks.clone(),
+        baseline: host_baseline.clone(), base_hash: host_base_hash.clone(), cursors: cursors.clone(),
+        sheet_names: sheet_names.clone(),
         state: state.clone(), delta: delta_ops.clone(), formula_keys: formula_keys.clone(), styles: styles.clone(),
         delta_styles: delta_styles.clone(), threads: host_threads.clone(), merges: delta_merges.clone(),
         acked_ts: host_acked_ts.clone(),
@@ -5804,6 +6139,7 @@ fn host_initialized(
                                 auth,
                                 base_hash: client_hash,
                                 cell_shifts,
+                                room_tx,
                                 sort_permutation,
                                 palette_styles,
                                 resume_room,
@@ -5827,7 +6163,7 @@ fn host_initialized(
                                     break;
                                 }
                                 let order = lock_unpoison(&room_order);
-                                let (order, shift_intro) = match shift_host.capture_intro(order, site, cell_shifts) {
+                                let (order, shift_intro) = match shift_host.capture_intro(order, site, cell_shifts, room_tx) {
                                     Ok(pair) => pair,
                                     Err(reason) => {
                                         let _ = tx.send(IntroFrame::Line(serde_json::to_string(&Msg::Denied { reason }).unwrap()));
@@ -5854,7 +6190,11 @@ fn host_initialized(
                                 }
                                 hello_site = Some(site);
                                 hello_conn_id = conn_id;
-                                if cell_shifts { lock_unpoison(&roster).shift_members.insert(site, conn_id); }
+                                {
+                                    let mut r = lock_unpoison(&roster);
+                                    if cell_shifts { r.shift_members.insert(site, conn_id); }
+                                    if room_tx { r.room_tx_members.insert(site, conn_id); }
+                                }
                                 // 已认证成员可以长时间不说话（只看不改），取消认证前的读超时
                                 let _ = stream.set_read_timeout(None);
                                 let color = (site % 7) as u8;
@@ -5977,6 +6317,7 @@ fn host_initialized(
                                         clock: host_clock,
                                         batch_ops: true,
                                         cell_shifts: true,
+                                        room_tx: true,
                                         sort_permutation: true,
                                         structural_ack: true,
                                         thread_changes: true,
@@ -6369,6 +6710,7 @@ fn host_initialized(
                                     auth: String::new(),
                                     base_hash: String::new(),
                                     cell_shifts: true,
+                                    room_tx: true,
                                     sort_permutation: false,
                                     palette_styles: false,
                                     resume_room: String::new(),
@@ -6389,6 +6731,17 @@ fn host_initialized(
                                 if hello_site != Some(site) { break; }
                                 if let Err(reason) = shift_host.validate_and_commit(site,id,phase,revision,patch,Some(hello_conn_id)) {
                                     let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::CellShiftRejected {id,phase,reason})));
+                                }
+                            }
+                            Msg::RoomTxAck { site, seq } => {
+                                if hello_site != Some(site) { break; }
+                                let _order = lock_unpoison(&room_order);
+                                shift_host.ack(site, hello_conn_id, seq);
+                            }
+                            Msg::RoomTxRequest { site, id, phase, revision, patch } => {
+                                if hello_site != Some(site) { break; }
+                                if let Err(reason) = shift_host.validate_and_commit_room_tx(site, id, phase, revision, patch, Some(hello_conn_id)) {
+                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(Msg::RoomTxRejected { id, phase, reason })));
                                 }
                             }
                             Msg::SortReply { first_ts, outcome } if can_sort.load(Ordering::Acquire) => {
@@ -7467,7 +7820,8 @@ fn host_initialized(
         palette_styles_cap: Arc::new(AtomicBool::new(true)),
         thread_changes_cap: Arc::new(AtomicBool::new(true)),
         cell_shift_cap: Arc::new(AtomicBool::new(true)),
-        shift_host: Some(shift_host_for_self), shift_pending: Default::default(), force_full: Default::default(),
+        room_tx_cap: Arc::new(AtomicBool::new(true)),
+        shift_host: Some(shift_host_for_self), shift_pending: Default::default(), room_tx_pending: Default::default(), force_full: Default::default(),
         connection_generation: Default::default(),
         sheet_names,
         structure_seen: Default::default(),
@@ -7855,8 +8209,12 @@ fn join_session(
     let thread_changes_for_reader = thread_changes_cap.clone();
     let cell_shift_cap = Arc::new(AtomicBool::new(false));
     let shift_cap_reader = cell_shift_cap.clone();
+    let room_tx_cap = Arc::new(AtomicBool::new(false));
+    let room_tx_cap_reader = room_tx_cap.clone();
     let shift_pending: ShiftPending = Default::default();
     let shift_pending_reader = shift_pending.clone();
+    let room_tx_pending: RoomTxPending = Default::default();
+    let room_tx_pending_reader = room_tx_pending.clone();
     let force_full = Arc::new(AtomicBool::new(false));
     let full_reader = force_full.clone();
     let connection_generation = Arc::new(AtomicU64::new(0));
@@ -8152,6 +8510,7 @@ fn join_session(
                 let mut shift_overlay = Vec::new();
                 let mut shift_parts = 0;
                 let mut shift_seq = 0;
+                let mut room_tx_seq = 0;
                 let mut shift_receipt = false;
                 let mut overlay_complete = false;
                 let mut pending_snap_ops: Vec<Op> = Vec::new();
@@ -8267,6 +8626,7 @@ fn join_session(
                                 proof: room_key.proof(nonce),
                                 auth: client_auth.clone(),
                                 cell_shifts: true,
+                                room_tx: true,
                                 sort_permutation: true,
                                 palette_styles: true,
                                 resume_room,
@@ -8298,6 +8658,7 @@ fn join_session(
                             clock,
                             batch_ops,
                             cell_shifts,
+                            room_tx,
                             sort_permutation,
                             structural_ack,
                             thread_changes,
@@ -8333,6 +8694,7 @@ fn join_session(
                             reader_generation.fetch_add(1,Ordering::AcqRel);
                             ack_for_reader.store(structural_ack,Ordering::Release);
                             shift_cap_reader.store(cell_shifts, Ordering::Release);
+                            room_tx_cap_reader.store(room_tx, Ordering::Release);
                             thread_changes_for_reader.store(thread_changes, Ordering::Release);
                             palette_for_reader.store(palette_styles, Ordering::Release);
                             got_welcome = true;
@@ -8454,7 +8816,7 @@ fn join_session(
                                             conn_welcome_srev,
                                         ));
                                     }
-                                    finish_shift_snapshot(&evt_tx, &shift_pending_reader, shift_receipt);
+                                    finish_shift_snapshot(&evt_tx, &shift_pending_reader, &room_tx_pending_reader, shift_receipt);
                                 }
                             } else {
                                 if !ops.is_empty() {
@@ -8469,7 +8831,7 @@ fn join_session(
                                             conn_welcome_srev,
                                         ));
                                     }
-                                    finish_shift_snapshot(&evt_tx, &shift_pending_reader, shift_receipt);
+                                    finish_shift_snapshot(&evt_tx, &shift_pending_reader, &room_tx_pending_reader, shift_receipt);
                                 }
                             }
                         }
@@ -8499,7 +8861,7 @@ fn join_session(
                                     conn_welcome_srev,
                                 ));
                             }
-                            finish_shift_snapshot(&evt_tx, &shift_pending_reader, shift_receipt);
+                            finish_shift_snapshot(&evt_tx, &shift_pending_reader, &room_tx_pending_reader, shift_receipt);
                         }
                         Msg::Watermark { seq, structure_revision, ack_site, ack_ts } => {
                             if ack_site == site && ack_ts > 0 {
@@ -8569,6 +8931,27 @@ fn join_session(
                             if pending.as_ref().is_some_and(|(tid,p,_)|*tid==id && *p==phase) {
                                 shift_receipt=true;
                                 let _=evt_tx.send(NetEvent::CellShiftCommitted {site,id,phase,first_ts,seq,patch,snapshot:true});
+                            }
+                        }
+                        Msg::RoomTxRejected { id, phase, reason } if room_tx_cap_reader.load(Ordering::Acquire) => {
+                            reject_pending_room_tx(&evt_tx, &room_tx_pending_reader, id, phase, reason);
+                        }
+                        Msg::RoomTxCommitted { site, id, phase, first_ts: _, seq, patch } => {
+                            if in_initial_snapshot || !room_tx_cap_reader.load(Ordering::Acquire) { break; }
+                            if seq > room_tx_seq {
+                                room_tx_seq = seq;
+                                if matches!(*patch, RoomTxPatch::AxisPermute(_) | RoomTxPatch::CellShift(_)) {
+                                    shift_seq = shift_seq.max(seq);
+                                }
+                                let _ = evt_tx.send(NetEvent::RoomTxCommitted { site, id, phase, seq, patch, snapshot: false });
+                            }
+                        }
+                        Msg::RoomTxReceipt { site: author, id, phase, first_ts: _, seq, patch } => {
+                            if !in_initial_snapshot || author != site { break; }
+                            let pending = lock_unpoison(&room_tx_pending_reader);
+                            if pending.as_ref().is_some_and(|(tid, p, _)| *tid == id && *p == phase) {
+                                shift_receipt = true;
+                                let _ = evt_tx.send(NetEvent::RoomTxCommitted { site, id, phase, seq, patch, snapshot: true });
                             }
                         }
                         Msg::StructureRevision { revision } => {
@@ -8970,7 +9353,7 @@ fn join_session(
         structural_ack,
         palette_styles_cap,
         thread_changes_cap,
-        cell_shift_cap, shift_host: None, shift_pending, force_full,
+        cell_shift_cap, room_tx_cap, shift_host: None, shift_pending, room_tx_pending, force_full,
         connection_generation,
         pending_sorts: pending_for_net,
         local_sort_ranges: Default::default(),
@@ -9459,6 +9842,7 @@ mod integrity_tests {
             auth: auth.into(),
             base_hash: String::new(),
             cell_shifts: true,
+            room_tx: false,
             sort_permutation: false,
             palette_styles: false,
             resume_room: String::new(),
@@ -10599,6 +10983,7 @@ mod integrity_tests {
             auth: auth.into(),
             base_hash: String::new(),
             cell_shifts: true,
+            room_tx: false,
             sort_permutation: false,
             palette_styles: true,
             resume_room: String::new(),
@@ -12034,6 +12419,74 @@ mod integrity_tests {
             )
         });
         assert!(got_replayed.is_some(), "水位增量重连后必须补发断线期间的 Thread 批注");
+    }
+
+    #[test]
+    fn phase5_tx_room_tx_legacy_peer_rejected_until_upgrade() {
+        let _env = crate::test_env::TestEnv::new("p5-room-tx-legacy");
+        let (host, port) = host_for_test(1, "Host", "doc", "test-pw");
+        let wb = sheetcore::Workbook::new_blank();
+        let peer = sheetcore::sync::Peer::new(host.site);
+        host.seed_snapshot(
+            &peer,
+            &wb,
+            Cursor {
+                site: host.site,
+                name: "Host".into(),
+                color: 1,
+                sheet: 0,
+                row: 0,
+                col: 0,
+                end_row: None,
+                end_col: None,
+            },
+        );
+        // Connect a legacy peer (missing `room_tx` capability).
+        let (legacy, welcome) = thread_compat_tests::LegacyPeer::handshake(port, 2, "", 0);
+        assert_eq!(welcome["t"], "Welcome");
+        assert_eq!(welcome["room_tx"], serde_json::json!(true));
+
+        let patch = Arc::new(RoomTxPatch::DefinedNames(
+            sheetcore::tx::DefinedNamesPatch::prepare(
+                &wb,
+                &sheetcore::tx::DefinedNameIntent::Define {
+                    name: "Rate".into(),
+                    scope: None,
+                    formula: "0.13".into(),
+                },
+            )
+            .expect("prepare DefinedNamesPatch"),
+        ));
+
+        // While legacy peer is present, RoomTx must be rejected gracefully.
+        host.request_room_tx(7, CellShiftPhase::Forward, patch.clone())
+            .unwrap();
+        let rejected = wait_event(&host, 5000, |e| {
+            matches!(e, NetEvent::StructuralRejected(msg) if msg.contains("旧版本"))
+        });
+        assert!(rejected.is_some(), "expected legacy-peer rejection for RoomTx");
+        host.finish_structure();
+
+        // Once legacy peer leaves, RoomTx succeeds and late legacy joiners are denied.
+        drop(legacy);
+        assert!(wait_event(&host, 5000, |e| matches!(e, NetEvent::PeerLeft(2))).is_some());
+
+        host.request_room_tx(8, CellShiftPhase::Forward, patch.clone())
+            .unwrap();
+        let Some(NetEvent::CheckRoomTx { reply, .. }) =
+            wait_event(&host, 5000, |e| matches!(e, NetEvent::CheckRoomTx { .. }))
+        else {
+            panic!("expected CheckRoomTx event");
+        };
+        reply.send(Ok(patch)).unwrap();
+        let committed = wait_event(&host, 5000, |e| {
+            matches!(e, NetEvent::RoomTxCommitted { id: 8, .. })
+        });
+        assert!(committed.is_some(), "expected RoomTxCommitted");
+
+        let (_, refusal) = thread_compat_tests::LegacyPeer::handshake(port, 2, "", 0);
+        assert_eq!(refusal["t"], "Denied");
+        assert!(refusal["reason"].as_str().unwrap_or("").contains("升级"));
     }
 }
 

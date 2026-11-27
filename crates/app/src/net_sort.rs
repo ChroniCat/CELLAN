@@ -6,20 +6,39 @@ use sheetcore::style::CellStyle;
 use sheetcore::sync::{Op, SortPermutation, ValueWire};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SortTarget {
     pub document: u64,
     pub sheet: usize,
     pub identity: u64,
     pub coordinates: u64,
+    pub coord_epoch: u64,
 }
 
 impl SortTarget {
+    pub fn capture(document: u64, workbook: &sheetcore::Workbook, sheet: usize) -> Option<Self> {
+        let gate = crate::bg_gate::CoordGate::sheet(document, workbook, sheet)?;
+        Some(Self {
+            document: gate.doc_uid,
+            sheet,
+            identity: gate.sheet_identity?,
+            coordinates: gate.sheet_coord_rev?,
+            coord_epoch: gate.coord_epoch,
+        })
+    }
+
+    pub fn gate(&self) -> crate::bg_gate::CoordGate {
+        crate::bg_gate::CoordGate {
+            doc_uid: self.document,
+            coord_epoch: self.coord_epoch,
+            sheet_idx: Some(self.sheet),
+            sheet_identity: Some(self.identity),
+            sheet_coord_rev: Some(self.coordinates),
+        }
+    }
+
     pub fn valid(&self, document: u64, workbook: &sheetcore::Workbook) -> bool {
-        self.document == document
-            && workbook.sheets.get(self.sheet).is_some_and(|sheet| {
-                self.identity == sheet.identity && self.coordinates == sheet.coordinate_revision()
-            })
+        self.gate().matches_sheet(document, workbook) == Some(self.sheet)
     }
 }
 
@@ -557,5 +576,50 @@ pub(crate) fn shift_grid<V>(
     }
     for (key, value) in moved {
         target.insert_cow(key, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SortTarget;
+    use sheetcore::{
+        Cell, Sheet, Value, Workbook,
+        sheet_ops,
+        structural::{Structural, apply_structural_wb},
+    };
+
+    #[test]
+    fn phase5_bg_gate_net_sort_target_fences_coord_epoch_advance() {
+        let _env = crate::test_env::TestEnv::new("phase5-bg-gate-net-sort");
+        let mut wb = Workbook::new_blank();
+        wb.sheets.push(Sheet::new("Other"));
+        let doc = 77;
+        let target = SortTarget::capture(doc, &wb, 0).expect("sheet 0 target");
+        assert!(target.valid(doc, &wb));
+
+        // Ordinary cell edits must NOT invalidate SortTarget.
+        wb.sheet_mut(0).set(0, 0, Cell { value: Value::Number(3.0), formula: None });
+        wb.sheet_mut(1).set(1, 1, Cell { value: Value::Number(9.0), formula: None });
+        assert!(target.valid(doc, &wb));
+
+        // Different doc_uid invalidates SortTarget.
+        assert!(!target.valid(doc + 1, &wb));
+
+        // Cross-sheet structural mutation advances wb.coord_epoch() without changing sheet 0's
+        // coordinate_revision(); SortTarget must reject stale sort batches.
+        let rev_before = wb.sheet(0).coordinate_revision();
+        apply_structural_wb(&mut wb, 1, &Structural::InsertRows { at: 0, n: 1 });
+        assert_eq!(wb.sheet(0).coordinate_revision(), rev_before);
+        assert!(!target.valid(doc, &wb));
+
+        // Sheet tab rename/move also advances wb.coord_epoch() and invalidates SortTarget.
+        let target2 = SortTarget::capture(doc, &wb, 0).unwrap();
+        assert!(sheet_ops::rename_sheet(&mut wb, 1, "Renamed"));
+        assert!(!target2.valid(doc, &wb));
+
+        // Direct sheet-level structural mutation still fences via sheet coordinate_revision().
+        let target3 = SortTarget::capture(doc, &wb, 0).unwrap();
+        wb.sheet_mut(0).apply_structural(&Structural::InsertCols { at: 0, n: 1 });
+        assert!(!target3.valid(doc, &wb));
     }
 }

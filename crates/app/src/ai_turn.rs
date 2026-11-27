@@ -97,12 +97,22 @@ struct ReadObservation {
 }
 
 enum PendingCalculation {
-    Tool { call: WireToolCall, sheet: Option<u64>, job: AiToolCalculation },
-    WriteBatch { calls: Vec<(WireToolCall, Option<u64>)>, job: AiToolCalculation },
+    Tool {
+        call: WireToolCall,
+        sheet: Option<u64>,
+        sheet_revs: Vec<(u64, String, u64)>,
+        job: AiToolCalculation,
+    },
+    WriteBatch {
+        calls: Vec<(WireToolCall, Option<u64>)>,
+        sheet_revs: Vec<(u64, String, u64)>,
+        job: AiToolCalculation,
+    },
     Validate { action: TurnAction, job: AiToolCalculation },
     Reorder {
         call: WireToolCall,
         sheet_id: u64,
+        gate: crate::bg_gate::CoordGate,
         op_desc: String,
         range_lbl: String,
         undo_checkpoint: u64,
@@ -126,9 +136,11 @@ pub(super) struct ActiveTurn {
     footprint: Vec<Footprint>,
     reads: Vec<ReadObservation>,
     awaiting_write_results: bool,
-    retry_check: std::cell::Cell<Option<((u64, u64), bool)>>,
+    retry_check: std::cell::Cell<Option<((u64, u64, u64), bool)>>,
     // Workbook revision at which `footprint` was last verified.
     revision: (u64, u64),
+    // Unified `(doc_uid, wb.coord_epoch())` gate captured for this turn.
+    gate: crate::bg_gate::CoordGate,
     // On retry, replace just the streamed text from the failed completion.
     content_start: usize,
     reasoning_start: usize,
@@ -327,6 +339,7 @@ impl SheetApp {
             && let Some(turn) = &self.ai.active_round
             && turn.awaiting_write_results
             && turn.revision == (previous_gen, self.wb_epoch)
+            && turn.gate.matches_workbook(self.doc_uid, &self.wb)
         {
             self.refresh_ai_baseline();
         }
@@ -341,6 +354,41 @@ impl SheetApp {
 
     fn ai_sheet_by_identity(&self, identity: u64) -> Option<usize> {
         self.wb.sheets.iter().position(|s| s.identity == identity)
+    }
+
+    fn ai_sheet_revs_now(&self) -> Vec<(u64, String, u64)> {
+        self.wb
+            .sheets
+            .iter()
+            .map(|s| (s.identity, s.name.clone(), s.coordinate_revision()))
+            .collect()
+    }
+
+    fn ai_is_pure_tab_reorder(&self, before: &[(u64, String, u64)]) -> bool {
+        self.wb.sheets.len() == before.len()
+            && self.wb.sheets.iter().all(|s| {
+                before.iter().any(|(id, name, rev)| {
+                    *id == s.identity && name == &s.name && *rev == s.coordinate_revision()
+                })
+            })
+    }
+
+    /// A pure tab reorder (`move_sheet`) while a first read or write-result readback
+    /// calculation is running does not shift cell coordinates or invalidate any prior read.
+    fn ai_adopt_pure_tab_reorder_if_allowed(&mut self, sheet_revs: &[(u64, String, u64)]) {
+        let allow = self.ai.active_round.as_ref().is_some_and(|turn| {
+            turn.gate.doc_uid == self.doc_uid
+                && turn.revision.1 == self.wb_epoch
+                && !turn.gate.matches_workbook(self.doc_uid, &self.wb)
+                && turn.reads.is_empty()
+                && (turn.footprint.is_empty() || turn.awaiting_write_results)
+        }) && self.ai_is_pure_tab_reorder(sheet_revs);
+        if allow {
+            let gate = crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb);
+            if let Some(turn) = self.ai.active_round.as_mut() {
+                turn.gate = gate;
+            }
+        }
     }
 
     pub(crate) fn start_ai_prompt(&mut self, user_text: String) {
@@ -382,6 +430,7 @@ impl SheetApp {
             awaiting_write_results: false,
             retry_check: Default::default(),
             revision: (self.doc_gen, self.wb_epoch),
+            gate: crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb),
             content_start: 0,
             reasoning_start: 0,
         });
@@ -427,6 +476,7 @@ impl SheetApp {
 
     fn launch_ai_round(&mut self) {
         let revision = (self.doc_gen, self.wb_epoch);
+        let gate = crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb);
         let Some(turn) = self.ai.active_round.as_mut() else {
             return;
         };
@@ -436,6 +486,7 @@ impl SheetApp {
         turn.content_start = last.content.len();
         turn.reasoning_start = last.reasoning.len();
         turn.revision = revision;
+        turn.gate = gate;
         let cancel = Arc::new(RequestCancel::default());
         let rx = spawn_completion_round(
             turn.cfg.clone(),
@@ -455,7 +506,7 @@ impl SheetApp {
                 if turn.cfg != self.ai.cfg {
                     return false;
                 }
-                let revision = (self.doc_gen, self.wb_epoch);
+                let revision = (self.doc_gen, self.wb_epoch, self.wb.coord_epoch());
                 if let Some((checked, valid)) = turn.retry_check.get()
                     && checked == revision
                 {
@@ -472,14 +523,17 @@ impl SheetApp {
         !self.ai.busy
             && self.ai.bound_doc_uid == Some(self.doc_uid)
             && self.ai.active_round.as_ref().is_some_and(|turn| {
-                if turn.cfg != self.ai.cfg || turn.revision.1 != self.wb_epoch {
+                if turn.cfg != self.ai.cfg
+                    || turn.revision.1 != self.wb_epoch
+                    || !turn.gate.matches_workbook(self.doc_uid, &self.wb)
+                {
                     return false;
                 }
                 if self.ai_sheet_by_identity(turn.view.sheet).is_none() {
                     return false;
                 }
-                let revision = (self.doc_gen, self.wb_epoch);
-                if turn.revision == revision {
+                let revision = (self.doc_gen, self.wb_epoch, self.wb.coord_epoch());
+                if turn.revision == (revision.0, revision.1) {
                     return true;
                 }
                 if let Some((checked, valid)) = turn.retry_check.get()
@@ -568,14 +622,20 @@ impl SheetApp {
             if let PendingCalculation::Reorder {
                 call,
                 sheet_id,
+                gate,
                 op_desc,
                 range_lbl,
                 undo_checkpoint,
                 before_gen,
             } = calculation
             {
-                if self.ai_sheet_by_identity(sheet_id).is_none() {
-                    self.fail_ai_round("数据操作期间目标工作表已删除，本轮已终止。".into(), false);
+                if gate.is_stale(self.doc_uid, &self.wb)
+                    || self.ai_sheet_by_identity(sheet_id).is_none()
+                {
+                    self.fail_ai_round(
+                        "数据操作期间工作簿结构或目标工作表已变化，本轮已终止。".into(),
+                        false,
+                    );
                     return;
                 }
                 self.poll_reorder();
@@ -585,6 +645,7 @@ impl SheetApp {
                         turn.calculation = Some(PendingCalculation::Reorder {
                             call,
                             sheet_id,
+                            gate,
                             op_desc,
                             range_lbl,
                             undo_checkpoint,
@@ -628,11 +689,13 @@ impl SheetApp {
                     ) {
                         self.note_ai_footprint(&call.spec, &JsonValue::Null);
                         self.refresh_ai_baseline();
+                        let sheet_revs = self.ai_sheet_revs_now();
                         if let Some(turn) = self.ai.active_round.as_mut() {
                             turn.awaiting_write_results = true;
                             turn.calculation = Some(PendingCalculation::Tool {
                                 call,
                                 sheet: Some(sheet_id),
+                                sheet_revs,
                                 job,
                             });
                         }
@@ -645,14 +708,14 @@ impl SheetApp {
                 return;
             }
             let job = match &mut calculation {
-                PendingCalculation::Tool { call, sheet, job } => {
+                PendingCalculation::Tool { call, sheet, job, .. } => {
                     if self.ai_read_sheet(&call.spec) != *sheet {
                         self.fail_ai_round("核对期间工具的目标工作表已变化，本轮已终止。".into(), false);
                         return;
                     }
                     job
                 }
-                PendingCalculation::WriteBatch { calls, job } => {
+                PendingCalculation::WriteBatch { calls, job, .. } => {
                     if calls.iter().any(|(c, sh)| self.ai_read_sheet(&c.spec) != *sh) {
                         self.fail_ai_round("核对期间工具的目标工作表已变化，本轮已终止。".into(), false);
                         return;
@@ -678,8 +741,9 @@ impl SheetApp {
                 CalcPoll::Failed(error) => self.fail_ai_round(format!("{error}，本轮已终止。"), false),
                 CalcPoll::Ready(label, result) => match calculation {
                     PendingCalculation::Validate { action, .. } => self.validate_ai_action(action, ctx),
-                    PendingCalculation::Tool { call, .. } => {
+                    PendingCalculation::Tool { call, sheet_revs, .. } => {
                         // poll_ai_calculation only returns observations from a current calculated view.
+                        self.ai_adopt_pure_tab_reorder_if_allowed(&sheet_revs);
                         if let Err(conflict) = self.ai_turn_still_valid() {
                             self.fail_ai_round(format!("{conflict}，本轮已终止。"), false);
                         } else {
@@ -687,7 +751,8 @@ impl SheetApp {
                             self.continue_ai_tools(ctx, false);
                         }
                     }
-                    PendingCalculation::WriteBatch { calls, .. } => {
+                    PendingCalculation::WriteBatch { calls, sheet_revs, .. } => {
+                        self.ai_adopt_pure_tab_reorder_if_allowed(&sheet_revs);
                         if let Err(conflict) = self.ai_turn_still_valid() {
                             self.fail_ai_round(format!("{conflict}，本轮已终止。"), false);
                         } else {
@@ -748,6 +813,7 @@ impl SheetApp {
 
     fn ai_validation_needs_calculation(&self, turn: &ActiveTurn) -> bool {
         turn.revision.1 == self.wb_epoch
+            && turn.gate.matches_workbook(self.doc_uid, &self.wb)
             && turn.revision.0 != self.doc_gen
             && self.ai_calculated_workbook().is_none()
             && (turn.reads.iter().any(|r| r.call.name != "inspect_workbook")
@@ -974,12 +1040,14 @@ impl SheetApp {
                         AiToolOutput::Calculating(calculation) => {
                             self.note_ai_footprint(&call.spec, &JsonValue::Null);
                             self.refresh_ai_baseline();
+                            let sheet_revs = self.ai_sheet_revs_now();
                             if let Some(turn) = self.ai.active_round.as_mut() {
                                 turn.awaiting_write_results = true;
                                 turn.calculation = Some(PendingCalculation::Tool {
                                     call,
                                     job: calculation,
                                     sheet,
+                                    sheet_revs,
                                 });
                             }
                             self.ai.status_hint = "正在核对表格计算结果…".into();
@@ -1016,10 +1084,12 @@ impl SheetApp {
                                 self.note_ai_footprint(&c.spec, &JsonValue::Null);
                             }
                             self.refresh_ai_baseline();
+                            let sheet_revs = self.ai_sheet_revs_now();
                             if let Some(turn) = self.ai.active_round.as_mut() {
                                 turn.awaiting_write_results = true;
                                 turn.calculation = Some(PendingCalculation::WriteBatch {
                                     calls,
+                                    sheet_revs,
                                     job: calculation,
                                 });
                             }
@@ -1044,9 +1114,15 @@ impl SheetApp {
                         self.note_ai_footprint(&call.spec, &JsonValue::Null);
                         self.refresh_ai_baseline();
                     }
+                    let sheet_revs = self.ai_sheet_revs_now();
                     if let Some(turn) = self.ai.active_round.as_mut() {
                         turn.awaiting_write_results = wrote_cells;
-                        turn.calculation = Some(PendingCalculation::Tool { call, job: calculation, sheet });
+                        turn.calculation = Some(PendingCalculation::Tool {
+                            call,
+                            job: calculation,
+                            sheet,
+                            sheet_revs,
+                        });
                     }
                     self.ai.status_hint = "正在核对表格计算结果…".into();
                     return;
@@ -1061,10 +1137,15 @@ impl SheetApp {
                     // Guard observed footprint prior to reorder; poll_ai will refresh baseline once poll_reorder finishes.
                     self.note_ai_footprint(&call.spec, &JsonValue::Null);
                     self.refresh_ai_baseline();
+                    let gate = self
+                        .ai_sheet_by_identity(sheet_id)
+                        .and_then(|si| crate::bg_gate::CoordGate::sheet(self.doc_uid, &self.wb, si))
+                        .unwrap_or_else(|| crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb));
                     if let Some(turn) = self.ai.active_round.as_mut() {
                         turn.calculation = Some(PendingCalculation::Reorder {
                             call,
                             sheet_id,
+                            gate,
                             op_desc: op_desc.clone(),
                             range_lbl,
                             undo_checkpoint,
@@ -1592,7 +1673,8 @@ impl SheetApp {
             return;
         };
         let revision = (self.doc_gen, self.wb_epoch);
-        let updated = turn.revision != revision || turn.awaiting_write_results;
+        let gate = crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb);
+        let updated = turn.revision != revision || turn.gate != gate || turn.awaiting_write_results;
         let mut shared_snaps = std::collections::HashMap::new();
         let hashes: Vec<_> = turn
             .footprint
@@ -1621,13 +1703,17 @@ impl SheetApp {
             }
             turn.retry_check.set(None);
             turn.revision = revision;
+            turn.gate = gate;
         }
     }
 
     /// Why the workbook no longer matches what this turn observed or prepared, if it doesn't.
     fn ai_turn_conflict(&self, turn: &ActiveTurn) -> Option<String> {
-        if turn.revision.1 != self.wb_epoch {
+        if turn.gate.doc_uid != self.doc_uid || turn.revision.1 != self.wb_epoch {
             return Some("工作簿在 AI 处理期间已重新载入".into());
+        }
+        if !turn.gate.matches_workbook(self.doc_uid, &self.wb) {
+            return Some("工作簿的行列或工作表结构在 AI 处理期间发生了变化".into());
         }
         if turn.revision.0 == self.doc_gen {
             return None;
@@ -1668,8 +1754,10 @@ impl SheetApp {
             return Err(conflict);
         }
         let revision = (self.doc_gen, self.wb_epoch);
+        let gate = crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb);
         if let Some(turn) = self.ai.active_round.as_mut() {
             turn.revision = revision;
+            turn.gate = gate;
         }
         Ok(())
     }
@@ -1823,6 +1911,7 @@ mod tests {
             awaiting_write_results: false,
             retry_check: Default::default(),
             revision: (app.doc_gen, app.wb_epoch),
+            gate: crate::bg_gate::CoordGate::workbook(app.doc_uid, &app.wb),
             content_start: 0,
             reasoning_start: 0,
         });
@@ -1984,6 +2073,7 @@ mod tests {
         let mut app = pending_app(&ctx);
         let original = app.wb.sheet(0).name.clone();
         app.add_sheet();
+        app.refresh_ai_baseline();
         let other = app.sheet_idx;
         app.wb.sheet_mut(0).set(0, 0, number(10.0));
         app.wb.sheet_mut(other).set(0, 0, number(80.0));
@@ -2137,6 +2227,7 @@ mod tests {
             let target = app.sheet_idx;
             let name = app.wb.sheet(target).name.clone();
             app.add_sheet();
+            app.refresh_ai_baseline();
             let replacement = app.sheet_idx;
             let args = json!({"sheet":name, "query":"unmatched invoice", "formula":"=1"});
             app.finish_ai_round(String::new(), None, Ok(vec![call("read", tool, args)]), &ctx);
@@ -2156,6 +2247,7 @@ mod tests {
             let ctx = egui::Context::default();
             let mut app = pending_app(&ctx);
             app.add_sheet();
+            app.refresh_ai_baseline();
             let other = app.sheet_idx;
             let original = app.wb.sheet(0).name.clone();
             app.wb.sheet_mut(0).set(0, 0, number(4.0));
@@ -2196,6 +2288,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = pending_app(&ctx);
         app.add_sheet();
+        app.refresh_ai_baseline();
         let other = app.sheet_idx;
         let observed = app.wb.sheet(0).name.clone();
         app.sheet_idx = 0;
@@ -2321,7 +2414,8 @@ mod tests {
                 panic!("pending values need calculation")
             };
             let sheet = app.ai_read_sheet(&read.spec);
-            app.ai.active_round.as_mut().unwrap().calculation = Some(PendingCalculation::Tool { call: read, job, sheet });
+            let sheet_revs = app.ai_sheet_revs_now();
+            app.ai.active_round.as_mut().unwrap().calculation = Some(PendingCalculation::Tool { call: read, job, sheet, sheet_revs });
             app.sel = (8, 8);
             app.sel_end = app.sel;
             if observed_cell_changed {
@@ -2416,6 +2510,68 @@ mod tests {
         );
         app.stop_ai_generation();
     }
+
+    #[test]
+    fn phase5_bg_gate_ai_turn_invalidates_on_coord_epoch_and_keeps_unrelated_cell_edit() {
+        use sheetcore::structural::{Structural, apply_structural_wb};
+
+        let _env = crate::test_env::TestEnv::new("phase5-bg-gate-ai-turn");
+        let ctx = egui::Context::default();
+        let mut app = pending_app(&ctx);
+        app.add_sheet();
+        app.refresh_ai_baseline();
+        app.wb.sheet_mut(0).set(0, 0, number(10.0));
+        app.finish_ai_round(
+            String::new(),
+            None,
+            Ok(vec![call("read", "inspect_sheet", json!({"range": "A1"}))]),
+            &ctx,
+        );
+        assert_eq!(app.ai.messages.last().unwrap().tool_logs.len(), 1);
+
+        // Ordinary non-coordinate cell edit on another sheet must NOT invalidate the turn.
+        app.wb.sheet_mut(1).set(4, 4, number(99.0));
+        app.doc_gen += 1;
+        assert!(app.ai_turn_still_valid().is_ok());
+
+        // Cross-sheet structural mutation advances wb.coord_epoch() (even without bumping doc_gen).
+        apply_structural_wb(&mut app.wb, 1, &Structural::InsertRows { at: 0, n: 1 });
+        app.ai.busy = false;
+        assert!(!app.can_retry_ai_round());
+        assert!(!app.can_retry_ai_round_ui());
+        app.ai.busy = true;
+        app.finish_ai_round(
+            String::new(),
+            None,
+            Ok(vec![call("w", "set_cells", json!({"edits": [{"cell": "B1", "value": 7}]}))]),
+            &ctx,
+        );
+        assert!(!app.ai.busy);
+        assert_eq!(app.wb.sheet(0).value(0, 1), Value::Empty);
+        let err = app.ai.messages.last().unwrap().error.as_deref().unwrap();
+        assert!(err.contains("结构") || err.contains("变化"), "{err}");
+
+        // Confirmation card also rejects when wb.coord_epoch() advances while awaiting approval.
+        let mut app2 = pending_app(&ctx);
+        app2.add_sheet();
+        app2.refresh_ai_baseline();
+        app2.wb.sheet_mut(0).set(0, 0, number(55.0));
+        app2.finish_ai_round(
+            String::new(),
+            None,
+            Ok(vec![call(
+                "clr",
+                "data_operation",
+                json!({"op": "clear_contents", "range": "A1"}),
+            )]),
+            &ctx,
+        );
+        assert!(app2.ai.confirmation_label.is_some());
+        apply_structural_wb(&mut app2.wb, 1, &Structural::InsertCols { at: 0, n: 1 });
+        app2.answer_ai_confirmation(true, &ctx);
+        assert!(app2.ai.messages.last().unwrap().error.is_some());
+        assert_eq!(app2.wb.sheet(0).value(0, 0), Value::Number(55.0));
+    }
 }
 
 #[cfg(test)]
@@ -2441,6 +2597,7 @@ impl SheetApp {
             awaiting_write_results: false,
             retry_check: Default::default(),
             revision: (self.doc_gen, self.wb_epoch),
+            gate: crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb),
             content_start: 0,
             reasoning_start: 0,
         });

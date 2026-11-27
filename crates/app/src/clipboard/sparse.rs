@@ -8,6 +8,7 @@ type ParsedPaste = Result<sheetcore::clipboard_xmlss::SparseBlock, String>;
 
 pub(crate) struct BackgroundPaste {
     target: SheetEditTarget,
+    gate: crate::bg_gate::CoordGate,
     values_only: bool,
     result: mpsc::Receiver<ParsedPaste>,
 }
@@ -101,8 +102,11 @@ impl PasteRows {
 impl SheetApp {
     pub(crate) fn begin_background_paste(&mut self, values_only: bool) -> mpsc::Sender<ParsedPaste> {
         let (tx, result) = mpsc::channel();
+        let gate = crate::bg_gate::CoordGate::sheet(self.doc_uid, &self.wb, self.sheet_idx)
+            .unwrap_or_else(|| crate::bg_gate::CoordGate::workbook(self.doc_uid, &self.wb));
         self.bg_paste = Some(BackgroundPaste {
             target: SheetEditTarget::current(self, self.sel),
+            gate,
             values_only,
             result,
         });
@@ -124,7 +128,10 @@ impl SheetApp {
         // Consume queued coordinate changes before validating the saved anchor.
         let paste = self.bg_paste.take().unwrap();
         if self.net.is_some() { self.poll_net(); }
-        let valid = self.sheet_idx == paste.target.sheet && paste.target.valid(self) && !self.in_snapshot
+        let valid = paste.gate.matches_sheet(self.doc_uid, &self.wb) == Some(self.sheet_idx)
+            && self.sheet_idx == paste.target.sheet
+            && paste.target.valid(self)
+            && !self.in_snapshot
             && self.net.as_ref().is_none_or(|net| net.is_live())
             && !self.net.as_ref().is_some_and(crate::net::Net::pending_structure);
         let anchor = paste.target.at;
@@ -1018,5 +1025,39 @@ mod tests {
         assert_eq!(app.wb.sheet(0).value(2, 0), Value::Number(42.0));
         assert_eq!(app.wb.sheet(0).value(4, 0), Value::Empty);
         assert_eq!(app.undo.depth().0, history.0 + 1);
+    }
+
+    #[test]
+    fn phase5_bg_gate_background_paste_rejects_cross_sheet_coord_epoch_and_keeps_ordinary_edit() {
+        use sheetcore::structural::{Structural, apply_structural_wb};
+
+        let _env = TestEnv::new("phase5-bg-gate-paste");
+        let mut app = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+        app.wb.sheets.push(sheetcore::Sheet::new("Other"));
+        app.sel = (1, 0);
+
+        // Ordinary non-coordinate cell edit on another sheet must NOT cancel background paste.
+        let ok_tx = app.begin_background_paste(false);
+        app.wb.sheet_mut(1).set(0, 0, Cell { value: Value::Number(9.0), formula: None });
+        app.doc_gen += 1;
+        let history = app.undo.depth();
+        ok_tx.send(parsed_cell()).unwrap();
+        app.poll_background_paste();
+        assert_eq!(app.wb.sheet(0).value(1, 0), Value::Number(42.0));
+        assert_eq!(app.undo.depth().0, history.0 + 1);
+
+        // Structural edit on ANOTHER sheet advances wb.coord_epoch() while leaving sheet 0's
+        // coordinate_revision() unchanged: CoordGate must still cancel the stale paste cleanly.
+        app.sel = (3, 0);
+        let stale_tx = app.begin_background_paste(false);
+        let rev_before = app.wb.sheet(0).coordinate_revision();
+        apply_structural_wb(&mut app.wb, 1, &Structural::InsertRows { at: 0, n: 1 });
+        assert_eq!(app.wb.sheet(0).coordinate_revision(), rev_before);
+        let history_before = app.undo.depth();
+        stale_tx.send(parsed_cell()).unwrap();
+        app.poll_background_paste();
+        assert_eq!(app.wb.sheet(0).value(3, 0), Value::Empty);
+        assert_eq!(app.undo.depth(), history_before);
+        assert!(app.status.contains("已取消后台粘贴"), "{}", app.status);
     }
 }

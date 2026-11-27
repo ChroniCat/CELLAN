@@ -6,6 +6,7 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod files;
 mod csv_import;
+mod bg_gate;
 mod sheet_edit_target;
 use csv_import::CsvDlg;
 mod document_tasks;
@@ -7777,19 +7778,23 @@ impl SheetApp {
     fn record_deltas_at(&mut self, label: &str, deltas: Vec<sheetcore::undo::CellDelta>,
         merges: Option<sheetcore::undo::MergeEdit>, focus: (usize,u32,u32)) {
         if deltas.is_empty() && merges.is_none() { return; }
-        self.record_revision(label, &deltas);
-        self.undo.push(sheetcore::undo::Action {
-            label: label.to_string(),
-            merges,
-            deltas,
-            focus,
-            snap_before: None,
-            snap_after: None,
-            by_site: 0,
-            pictures: None,
-            shapes: None,
-            refresh_sizes: None,
-        });
+        self.commit_cell_action_tx(
+            sheetcore::undo::Action {
+                label: label.to_string(),
+                merges,
+                deltas,
+                focus,
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                pictures: None,
+                shapes: None,
+                refresh_sizes: None,
+            },
+            true,
+            sheetcore::tx::RecalcScope::None,
+            false,
+        );
     }
 
 
@@ -8839,21 +8844,21 @@ impl SheetApp {
             }
             if changed > 0 {
                 self.record_revision_sample(label, &sample, changed);
-                self.undo.push_cow_batch(
+                self.wb.calc_manual |= self.manual_calc;
+                let recalc = if has_formula || !self.deps.is_empty() {
+                    sheetcore::tx::RecalcScope::Full
+                } else {
+                    sheetcore::tx::RecalcScope::None
+                };
+                self.commit_cow_batch_tx(
                     label,
                     si,
                     &before_sheet,
-                    self.wb.sheet(si),
                     (si, self.sel.0, self.sel.1),
+                    recalc,
+                    false,
                 );
-                self.wb.calc_manual |= self.manual_calc;
-                if has_formula || !self.deps.is_empty() {
-                    self.recalc_all_and_deps_adaptive();
-                }
-                self.doc_gen = self.doc_gen.wrapping_add(1);
                 self.set_repeat_action(if down { RepeatAction::FillDown } else { RepeatAction::FillRight });
-                self.wb.dirty = true;
-                self.tasks.last_edit = Some(std::time::Instant::now());
             }
             std::thread::spawn(move || drop(before_sheet));
             self.status = if down {
@@ -10007,24 +10012,27 @@ impl SheetApp {
             return;
         }
         self.wb.sheet_mut(self.sheet_idx).pictures_dirty = true;
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.undo.push(sheetcore::undo::Action {
-            label: label.into(),
-            merges: None,
-            deltas: Vec::new(),
-            focus: (self.sheet_idx, self.sel.0, self.sel.1),
-            snap_before: None,
-            snap_after: None,
-            by_site: 0,
-            pictures: Some(sheetcore::undo::PictureEdit {
-                sheet: self.sheet_idx,
-                before,
-                after,
-            }),
-            shapes: None,
-            refresh_sizes: None,
-        });
+        self.commit_cell_action_tx(
+            sheetcore::undo::Action {
+                label: label.into(),
+                merges: None,
+                deltas: Vec::new(),
+                focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                pictures: Some(sheetcore::undo::PictureEdit {
+                    sheet: self.sheet_idx,
+                    before,
+                    after,
+                }),
+                shapes: None,
+                refresh_sizes: None,
+            },
+            false,
+            sheetcore::tx::RecalcScope::None,
+            false,
+        );
     }
 
     /// 从文件读一张图，放进内存模型（不写盘；保存时才写回）
@@ -10869,7 +10877,7 @@ impl SheetApp {
         let after_tables = self.wb.sheet(si).tables.clone();
         let after_filter = self.wb.sheet(si).filter.clone();
         let after_hidden = self.wb.sheet(si).hidden_rows.clone();
-        self.undo.push_meta(
+        self.commit_meta_tx(
             "创建表格",
             (si, self.sel.0, self.sel.1),
             sheetcore::undo::MetaEdit {
@@ -10878,9 +10886,10 @@ impl SheetApp {
                 filter: Some((before_filter, after_filter, before_hidden, after_hidden)),
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            false,
+            Vec::new(),
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已创建表格 {}（{}）", name, sheetcore::table::a1((r1, c1, r2, c2)));
     }
 
@@ -11316,7 +11325,7 @@ impl SheetApp {
             return false;
         }
         let after = self.wb.sheet(si).cf.clone();
-        self.undo.push_meta(
+        self.commit_meta_tx(
             label,
             (si, self.sel.0, self.sel.1),
             sheetcore::undo::MetaEdit {
@@ -11324,10 +11333,10 @@ impl SheetApp {
                 cf: Some((before, after)),
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            true,
+            Vec::new(),
         );
-        self.wb.dirty = true;
-        self.cf_stats_gen = u64::MAX;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         true
     }
 
@@ -12405,8 +12414,17 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             self.status = "正在等待宿主确认上一项插删操作".into();
             return false;
         }
-        if let Some((id, patch)) = self.undo.next_room_cell_shift(redo) {
-            return self.request_room_shift_replay(id, patch, redo);
+        if let Some((id, patch)) = self.undo.next_room_tx_patch(redo) {
+            return match patch.as_ref() {
+                sheetcore::tx::TxPatch::CellShift(cs) => {
+                    self.request_room_shift_replay(id, std::sync::Arc::new(cs.clone()), redo)
+                }
+                other => self.request_room_tx_replay(
+                    id,
+                    std::sync::Arc::new(sheetcore::tx::RoomTxPatch::from(other.clone())),
+                    redo,
+                ),
+            };
         }
         let moves_references = self.undo.next_moves_references(redo);
         if moves_references && self.net.is_some() {
@@ -13316,21 +13334,20 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             } else {
                 format!("{sref}!{}:{}", abs_cell(r1, c1), abs_cell(r2, c2))
             };
-            let intent = sheetcore::tx::TxIntent::from_defined_names(
-                sheetcore::tx::DefinedNameIntent::Define {
-                    name: text.clone(),
-                    scope: None,
-                    formula: refers.clone(),
-                },
-            );
-            match self.execute_local_tx(
+            let intent = sheetcore::tx::DefinedNameIntent::Define {
+                name: text.clone(),
+                scope: None,
+                formula: refers.clone(),
+            };
+            match self.submit_defined_name_intent(
                 intent,
-                Some(format!("定义名称 {text}")),
+                &format!("定义名称 {text}"),
                 (self.sheet_idx, r1, c1),
             ) {
-                Ok(_) => {
+                Ok(true) if self.net.is_none() => {
                     self.status = format!("已定义名称：{text} = {refers}");
                 }
+                Ok(_) => {}
                 Err(err) => {
                     self.status = err.message().into();
                 }
@@ -16279,24 +16296,23 @@ fn clear_values(&mut self) {
                     }
                 }
             }
-            self.undo.push_cow_batch(
+            let recalc = if part != ClearPart::Formats && cells_removed > 0 {
+                sheetcore::tx::RecalcScope::Full
+            } else {
+                sheetcore::tx::RecalcScope::None
+            };
+            self.commit_cow_batch_tx(
                 what,
                 si,
                 &before_sheet,
-                self.wb.sheet(si),
                 (si, self.sel.0, self.sel.1),
+                recalc,
+                false,
             );
             if part == ClearPart::Formats {
                 self.audit_note_style_rects(what, si, &rects, self.undo.top_undo_id());
             }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             self.set_repeat_action(RepeatAction::Clear(part));
-            self.tasks.last_edit = Some(std::time::Instant::now());
-            if part != ClearPart::Formats && cells_removed > 0 {
-                self.wb.calc_manual |= self.manual_calc;
-                self.recalc_all_and_deps_adaptive();
-            }
             std::thread::spawn(move || drop(before_sheet));
             self.status = format!("已{what}");
             return;
@@ -16697,7 +16713,7 @@ fn clear_values(&mut self) {
         self.recalc_all_and_deps_adaptive();
         self.txn_end("表格汇总行", txn);
         if before_tables != after_tables {
-            self.undo.push_meta(
+            self.commit_meta_tx(
                 "表格汇总行",
                 (si, self.sel.0, self.sel.1),
                 sheetcore::undo::MetaEdit {
@@ -16705,10 +16721,14 @@ fn clear_values(&mut self) {
                     tables: Some((before_tables, after_tables)),
                     ..Default::default()
                 },
+                sheetcore::tx::RecalcScope::None,
+                false,
+                Vec::new(),
             );
+        } else {
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.wb.dirty = true;
         }
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.wb.dirty = true;
     }
 
     /// 切换表格汇总行当前列的 SUBTOTAL 聚合函数（sum / average / count / countNums / max / min / stdDev / var / none）
@@ -16766,7 +16786,7 @@ fn clear_values(&mut self) {
         self.recalc_all_and_deps_adaptive();
         self.txn_end("更改表格汇总函数", txn);
         if before_tables != after_tables {
-            self.undo.push_meta(
+            self.commit_meta_tx(
                 "更改表格汇总函数",
                 (si, r2, col),
                 sheetcore::undo::MetaEdit {
@@ -16774,10 +16794,14 @@ fn clear_values(&mut self) {
                     tables: Some((before_tables, after_tables)),
                     ..Default::default()
                 },
+                sheetcore::tx::RecalcScope::None,
+                false,
+                Vec::new(),
             );
+        } else {
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
         }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         let lbl = sheetcore::table::TOTALS_FN_OPTIONS
             .iter()
             .find(|(k, _)| *k == fn_name)
@@ -18496,17 +18520,15 @@ fn clear_selection(&mut self) {
                     }
                 }
             }
-            self.undo.push_cow_batch(
+            self.commit_cow_batch_tx(
                 "设置格式",
                 si,
                 &before_sheet,
-                self.wb.sheet(si),
                 (si, self.sel.0, self.sel.1),
+                sheetcore::tx::RecalcScope::None,
+                false,
             );
             self.audit_note_style_rects("设置格式", si, &rects, self.undo.top_undo_id());
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             std::thread::spawn(move || drop(before_sheet));
             return;
         }
@@ -18716,17 +18738,15 @@ fn clear_selection(&mut self) {
                     }
                 }
             }
-            self.undo.push_cow_batch(
+            self.commit_cow_batch_tx(
                 "设置格式",
                 si,
                 &before_sheet,
-                self.wb.sheet(si),
                 (si, self.sel.0, self.sel.1),
+                sheetcore::tx::RecalcScope::None,
+                false,
             );
             self.audit_note_style_rects("设置格式", si, &rects, self.undo.top_undo_id());
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             std::thread::spawn(move || drop(before_sheet));
             return true;
         }
@@ -18905,22 +18925,27 @@ fn clear_selection(&mut self) {
             }
             let after_merges = self.wb.sheet(self.sheet_idx).merges.clone();
             if before_merges != after_merges {
-                self.undo.push(sheetcore::undo::Action {
-                    label: "取消合并".into(),
-                    merges: sheetcore::undo::MergeEdit::between(
-                        self.sheet_idx,
-                        &before_merges,
-                        &after_merges,
-                    ),
-                    deltas: Vec::new(),
-                    focus: (self.sheet_idx, self.sel.0, self.sel.1),
-                    snap_before: None,
-                    snap_after: None,
-                    by_site: 0,
-                    pictures: None,
-                    shapes: None,
-                    refresh_sizes: None,
-                });
+                self.commit_cell_action_tx(
+                    sheetcore::undo::Action {
+                        label: "取消合并".into(),
+                        merges: sheetcore::undo::MergeEdit::between(
+                            self.sheet_idx,
+                            &before_merges,
+                            &after_merges,
+                        ),
+                        deltas: Vec::new(),
+                        focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                        snap_before: None,
+                        snap_after: None,
+                        by_site: 0,
+                        pictures: None,
+                        shapes: None,
+                        refresh_sizes: None,
+                    },
+                    false,
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                );
                 if let Some((mr1, mc1, mr2, mc2)) = single_anchor_merge {
                     self.sel = (mr1, mc1);
                     self.sel_end = (mr2, mc2);
@@ -18929,9 +18954,6 @@ fn clear_selection(&mut self) {
                     self.queue_or_broadcast_merge(self.sheet_idx, (sr1, sc1, sr2, sc2), false);
                 }
                 // 取消合并完全不修改任何单元格的值或公式：绝不触发同步 Deps::build 与全表 recalc_all
-                self.wb.dirty = true;
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.tasks.last_edit = Some(std::time::Instant::now());
                 self.status = "已取消合并".into();
             } else {
                 self.status = "所选区域没有合并单元格".into();
@@ -19054,22 +19076,27 @@ fn clear_selection(&mut self) {
         let deltas = sheetcore::undo::finish(deltas, self.wb.sheet(self.sheet_idx));
         let changed = before_merges != after_merges || !deltas.is_empty();
         if changed {
-            self.undo.push(sheetcore::undo::Action {
-                label: "合并单元格".into(),
-                merges: sheetcore::undo::MergeEdit::between(
-                    self.sheet_idx,
-                    &before_merges,
-                    &after_merges,
-                ),
-                deltas,
-                focus: (self.sheet_idx, self.sel.0, self.sel.1),
-                snap_before: None,
-                snap_after: None,
-                by_site: 0,
-                pictures: None,
-                shapes: None,
-                refresh_sizes: None,
-            });
+            self.commit_cell_action_tx(
+                sheetcore::undo::Action {
+                    label: "合并单元格".into(),
+                    merges: sheetcore::undo::MergeEdit::between(
+                        self.sheet_idx,
+                        &before_merges,
+                        &after_merges,
+                    ),
+                    deltas,
+                    focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                    snap_before: None,
+                    snap_after: None,
+                    by_site: 0,
+                    pictures: None,
+                    shapes: None,
+                    refresh_sizes: None,
+                },
+                false,
+                sheetcore::tx::RecalcScope::None,
+                false,
+            );
         }
         if let Some(peer) = self.peer.as_mut() {
             let live_net = self.net.as_ref().filter(|n| n.is_live() && !self.room_lost);
@@ -19200,22 +19227,27 @@ fn clear_selection(&mut self) {
         let deltas = sheetcore::undo::finish(deltas, self.wb.sheet(self.sheet_idx));
         let changed = before_merges != after_merges || !deltas.is_empty();
         if changed {
-            self.undo.push(sheetcore::undo::Action {
-                label: "跨越合并".into(),
-                merges: sheetcore::undo::MergeEdit::between(
-                    self.sheet_idx,
-                    &before_merges,
-                    &after_merges,
-                ),
-                deltas,
-                focus: (self.sheet_idx, self.sel.0, self.sel.1),
-                snap_before: None,
-                snap_after: None,
-                by_site: 0,
-                pictures: None,
-                shapes: None,
-                refresh_sizes: None,
-            });
+            self.commit_cell_action_tx(
+                sheetcore::undo::Action {
+                    label: "跨越合并".into(),
+                    merges: sheetcore::undo::MergeEdit::between(
+                        self.sheet_idx,
+                        &before_merges,
+                        &after_merges,
+                    ),
+                    deltas,
+                    focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                    snap_before: None,
+                    snap_after: None,
+                    by_site: 0,
+                    pictures: None,
+                    shapes: None,
+                    refresh_sizes: None,
+                },
+                false,
+                sheetcore::tx::RecalcScope::None,
+                false,
+            );
             if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
                 for &(r, c) in &cleared_keys {
                     let cell = self
@@ -19239,10 +19271,7 @@ fn clear_selection(&mut self) {
                     .collect();
                 self.fast_recalc_cells(&touched);
             }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             self.set_repeat_action(RepeatAction::MergeAcross);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             self.status = format!("已跨越合并 {} 行", r2 - r1 + 1);
         }
     }
@@ -19329,22 +19358,27 @@ fn clear_selection(&mut self) {
         let after_merges = self.wb.sheet(self.sheet_idx).merges.clone();
         let deltas = sheetcore::undo::finish(deltas, self.wb.sheet(self.sheet_idx));
         if before_merges != after_merges || !deltas.is_empty() {
-            self.undo.push(sheetcore::undo::Action {
-                label: "合并内容".into(),
-                merges: sheetcore::undo::MergeEdit::between(
-                    self.sheet_idx,
-                    &before_merges,
-                    &after_merges,
-                ),
-                deltas,
-                focus: (self.sheet_idx, self.sel.0, self.sel.1),
-                snap_before: None,
-                snap_after: None,
-                by_site: 0,
-                pictures: None,
-                shapes: None,
-                refresh_sizes: None,
-            });
+            self.commit_cell_action_tx(
+                sheetcore::undo::Action {
+                    label: "合并内容".into(),
+                    merges: sheetcore::undo::MergeEdit::between(
+                        self.sheet_idx,
+                        &before_merges,
+                        &after_merges,
+                    ),
+                    deltas,
+                    focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                    snap_before: None,
+                    snap_after: None,
+                    by_site: 0,
+                    pictures: None,
+                    shapes: None,
+                    refresh_sizes: None,
+                },
+                false,
+                sheetcore::tx::RecalcScope::None,
+                false,
+            );
             if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
                 for &(r, c) in &changed_cells {
                     let cell = self
@@ -19365,10 +19399,7 @@ fn clear_selection(&mut self) {
                     .collect();
                 self.fast_recalc_cells(&touched);
             }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             self.set_repeat_action(RepeatAction::MergeContents);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             self.status = "已合并单元格并保留全部内容".into();
         }
     }
@@ -19453,22 +19484,27 @@ fn clear_selection(&mut self) {
         let after_merges = self.wb.sheet(self.sheet_idx).merges.clone();
         let deltas = sheetcore::undo::finish(deltas, self.wb.sheet(self.sheet_idx));
         if before_merges != after_merges || !deltas.is_empty() {
-            self.undo.push(sheetcore::undo::Action {
-                label: "拆分并填充内容".into(),
-                merges: sheetcore::undo::MergeEdit::between(
-                    self.sheet_idx,
-                    &before_merges,
-                    &after_merges,
-                ),
-                deltas,
-                focus: (self.sheet_idx, self.sel.0, self.sel.1),
-                snap_before: None,
-                snap_after: None,
-                by_site: 0,
-                pictures: None,
-                shapes: None,
-                refresh_sizes: None,
-            });
+            self.commit_cell_action_tx(
+                sheetcore::undo::Action {
+                    label: "拆分并填充内容".into(),
+                    merges: sheetcore::undo::MergeEdit::between(
+                        self.sheet_idx,
+                        &before_merges,
+                        &after_merges,
+                    ),
+                    deltas,
+                    focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                    snap_before: None,
+                    snap_after: None,
+                    by_site: 0,
+                    pictures: None,
+                    shapes: None,
+                    refresh_sizes: None,
+                },
+                false,
+                sheetcore::tx::RecalcScope::None,
+                false,
+            );
             if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
                 for &(mr1, mc1, mr2, mc2) in &matching_merges {
                     net.broadcast_merge(self.sheet_idx, (mr1, mc1, mr2, mc2), false);
@@ -19754,18 +19790,15 @@ fn clear_selection(&mut self) {
                 }
                 Self::apply_painter_merges_and_cf(sheet, &p, (tr1, tc1, tr2, tc2), sh, sw);
             }
-            self.undo.push_cow_batch(
+            self.commit_cow_batch_tx(
                 "格式刷",
                 si,
                 &before_sheet,
-                self.wb.sheet(si),
                 (si, self.sel.0, self.sel.1),
+                sheetcore::tx::RecalcScope::None,
+                true,
             );
             self.audit_note_style_rects("格式刷", si, &[(tr1, tc1, tr2, tc2)], self.undo.top_undo_id());
-            self.cf_stats_gen = u64::MAX;
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             std::thread::spawn(move || drop(before_sheet));
             if p.continuous {
                 self.status = "格式刷（连续）：继续选择目标区域，Esc 结束".into();
@@ -19821,23 +19854,28 @@ fn clear_selection(&mut self) {
             }
         }
         if !changes.is_empty() || merge_edit.is_some() {
-            self.undo.push(sheetcore::undo::Action {
-                label: "格式刷".into(),
-                deltas: changes,
-                focus: (si, self.sel.0, self.sel.1),
-                snap_before: None,
-                snap_after: None,
-                by_site: self.undo.site,
-                shapes: None,
-                pictures: None,
-                merges: merge_edit,
-                refresh_sizes: None,
-            });
+            self.commit_cell_action_tx(
+                sheetcore::undo::Action {
+                    label: "格式刷".into(),
+                    deltas: changes,
+                    focus: (si, self.sel.0, self.sel.1),
+                    snap_before: None,
+                    snap_after: None,
+                    by_site: self.undo.site,
+                    shapes: None,
+                    pictures: None,
+                    merges: merge_edit,
+                    refresh_sizes: None,
+                },
+                false,
+                sheetcore::tx::RecalcScope::None,
+                false,
+            );
         }
         if let Some(cf_before) = before_cf {
             let cf_after = self.wb.sheet(si).cf.clone();
             if cf_after != cf_before {
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "格式刷（条件格式）",
                     (si, self.sel.0, self.sel.1),
                     sheetcore::undo::MetaEdit {
@@ -19845,6 +19883,9 @@ fn clear_selection(&mut self) {
                         cf: Some((cf_before, cf_after)),
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    true,
+                    Vec::new(),
                 );
             }
         }
@@ -20049,7 +20090,7 @@ fn clear_selection(&mut self) {
                 }
                 sheet.rich_dirty = true;
             }
-            self.undo.push_meta(
+            self.commit_meta_tx(
                 "富文本",
                 (si, d.r, d.c),
                 sheetcore::undo::MetaEdit {
@@ -20057,10 +20098,11 @@ fn clear_selection(&mut self) {
                     rich: vec![(key, before_cell, after_cell, before_rich, after_rich)],
                     ..Default::default()
                 },
+                sheetcore::tx::RecalcScope::None,
+                false,
+                Vec::new(),
             );
             self.recalc_and_broadcast(&[(si, d.r, d.c)]);
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             self.status = "富文本已应用（支持 Ctrl+Z 撤销，保存后 Excel 完整显示）".into();
             open = false;
         }
@@ -20238,7 +20280,7 @@ fn clear_selection(&mut self) {
             if self.write_preflight(&[(r, c)], "移除超链接") {
                 if let Some(old_link) = self.wb.sheet_mut(si).hyperlinks.remove(&(r, c)) {
                     self.wb.sheet_mut(si).hyperlinks_dirty = true;
-                    self.undo.push_meta(
+                    self.commit_meta_tx(
                         "移除超链接",
                         (si, r, c),
                         sheetcore::undo::MetaEdit {
@@ -20246,9 +20288,9 @@ fn clear_selection(&mut self) {
                             hyperlinks: vec![((r, c), Some(old_link), None)],
                             ..Default::default()
                         },
-                    );
-                    if let Some(net) = self.net.as_ref() {
-                        net.broadcast_sheet_meta(
+                        sheetcore::tx::RecalcScope::None,
+                        false,
+                        vec![(
                             si,
                             sheetcore::sync::SheetMetaKind::Hyperlink {
                                 row: r,
@@ -20256,10 +20298,8 @@ fn clear_selection(&mut self) {
                                 target: None,
                                 tooltip: String::new(),
                             },
-                        );
-                    }
-                    self.wb.dirty = true;
-                    self.doc_gen = self.doc_gen.wrapping_add(1);
+                        )],
+                    );
                     self.status = format!("已移除 {} 的超链接", cell_name(r, c));
                 }
             }
@@ -20305,7 +20345,7 @@ fn clear_selection(&mut self) {
                     sh.hyperlinks_dirty = true;
                 }
                 self.txn_end("插入超链接文本", txn);
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "插入超链接",
                     (si, r, c),
                     sheetcore::undo::MetaEdit {
@@ -20313,9 +20353,9 @@ fn clear_selection(&mut self) {
                         hyperlinks: vec![((r, c), before_link, Some(new_link))],
                         ..Default::default()
                     },
-                );
-                if let Some(net) = self.net.as_ref() {
-                    net.broadcast_sheet_meta(
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    vec![(
                         si,
                         sheetcore::sync::SheetMetaKind::Hyperlink {
                             row: r,
@@ -20323,11 +20363,9 @@ fn clear_selection(&mut self) {
                             target: Some(url.clone()),
                             tooltip: tip,
                         },
-                    );
-                }
+                    )],
+                );
                 self.recalc_and_broadcast(&[(si, r, c)]);
-                self.wb.dirty = true;
-                self.doc_gen = self.doc_gen.wrapping_add(1);
                 self.status = format!("已插入超链接 {}", url);
                 self.hyper_dlg = None;
                 self.link_err.clear();
@@ -20612,7 +20650,7 @@ fn clear_selection(&mut self) {
                 let sh = self.wb.sheet_mut(si);
                 sh.ignored_errors.insert((r, c));
                 sh.ignored_errors_dirty = true;
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "忽略错误",
                     (si, r, c),
                     sheetcore::undo::MetaEdit {
@@ -20620,9 +20658,10 @@ fn clear_selection(&mut self) {
                         ignored_errors: vec![((r, c), false, true)],
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
-                self.wb.dirty = true;
-                self.doc_gen = self.doc_gen.wrapping_add(1);
             }
             self.error_marks.remove(&(r, c));
             self.error_list = self.scan_issues();
@@ -20644,7 +20683,7 @@ fn clear_selection(&mut self) {
                 }
             }
             if !diffs.is_empty() {
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "忽略全部错误",
                     (si, self.sel.0, self.sel.1),
                     sheetcore::undo::MetaEdit {
@@ -20652,10 +20691,14 @@ fn clear_selection(&mut self) {
                         ignored_errors: diffs,
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
+            } else {
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
             }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             let n = all.len();
             self.error_marks.clear();
             self.error_list.clear();
@@ -20679,7 +20722,7 @@ fn clear_selection(&mut self) {
                 sh.ignored_errors_dirty = true;
             }
             if !prev.is_empty() {
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "重置忽略错误",
                     (si, self.sel.0, self.sel.1),
                     sheetcore::undo::MetaEdit {
@@ -20687,10 +20730,14 @@ fn clear_selection(&mut self) {
                         ignored_errors: prev,
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
+            } else {
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
             }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             self.error_list = self.scan_issues();
             self.status = "已重置忽略的错误".into();
         }
@@ -20954,7 +21001,7 @@ fn clear_selection(&mut self) {
                 if !diffs.is_empty() {
                     self.wb.sheet_mut(si).ignored_errors_dirty = true;
                     let n = diffs.len();
-                    self.undo.push_meta(
+                    self.commit_meta_tx(
                         "忽略错误",
                         (si, self.sel.0, self.sel.1),
                         sheetcore::undo::MetaEdit {
@@ -20962,9 +21009,10 @@ fn clear_selection(&mut self) {
                             ignored_errors: diffs,
                             ..Default::default()
                         },
+                        sheetcore::tx::RecalcScope::None,
+                        false,
+                        Vec::new(),
                     );
-                    self.wb.dirty = true;
-                    self.doc_gen = self.doc_gen.wrapping_add(1);
                     self.status = format!("已忽略 {n} 处错误");
                 }
                 self.error_badge_open = false;
@@ -21046,7 +21094,7 @@ fn clear_selection(&mut self) {
                 }
             }
             if !diffs.is_empty() {
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "隐藏行",
                     (si, self.sel.0, self.sel.1),
                     sheetcore::undo::MetaEdit {
@@ -21054,14 +21102,18 @@ fn clear_selection(&mut self) {
                         hidden_rows_user: diffs,
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
+            } else {
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.tasks.last_edit = Some(std::time::Instant::now());
             }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             if was_shared_only && self.is_delegated_collab_client() {
                 self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
             }
-            self.tasks.last_edit = Some(std::time::Instant::now());
             self.status = format!("已隐藏 {} 行", r2 - r1 + 1);
         } else {
             let mut removed_rows: Vec<u32> = Vec::new();
@@ -21112,7 +21164,7 @@ fn clear_selection(&mut self) {
             }
             let n = removed_rows.len();
             if n <= 200_000 {
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "取消隐藏行",
                     (si, self.sel.0, self.sel.1),
                     sheetcore::undo::MetaEdit {
@@ -21120,14 +21172,18 @@ fn clear_selection(&mut self) {
                         hidden_rows_user: removed_rows.into_iter().map(|r| (r, true, false)).collect(),
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
+            } else {
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.tasks.last_edit = Some(std::time::Instant::now());
             }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             if was_shared_only && self.is_delegated_collab_client() {
                 self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
             }
-            self.tasks.last_edit = Some(std::time::Instant::now());
             self.status = format!("已取消隐藏 {n} 行");
         }
     }
@@ -21188,7 +21244,7 @@ fn clear_selection(&mut self) {
                 }
             }
             if !diffs.is_empty() {
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "隐藏列",
                     (si, self.sel.0, self.sel.1),
                     sheetcore::undo::MetaEdit {
@@ -21196,14 +21252,18 @@ fn clear_selection(&mut self) {
                         hidden_cols: diffs,
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
+            } else {
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
+                self.tasks.last_edit = Some(std::time::Instant::now());
             }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             if was_shared_only && self.is_delegated_collab_client() {
                 self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
             }
-            self.tasks.last_edit = Some(std::time::Instant::now());
             self.status = format!("已隐藏 {} 列", c2 - c1 + 1);
         } else {
             let mut removed_cols: Vec<u32> = Vec::new();
@@ -21249,7 +21309,7 @@ fn clear_selection(&mut self) {
                 self.mark_sheet_layout_synced(si, synced && layout_ok_before);
             }
             let n = removed_cols.len();
-            self.undo.push_meta(
+            self.commit_meta_tx(
                 "取消隐藏列",
                 (si, self.sel.0, self.sel.1),
                 sheetcore::undo::MetaEdit {
@@ -21257,13 +21317,13 @@ fn clear_selection(&mut self) {
                     hidden_cols: removed_cols.into_iter().map(|c| (c, true, false)).collect(),
                     ..Default::default()
                 },
+                sheetcore::tx::RecalcScope::None,
+                false,
+                Vec::new(),
             );
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             if was_shared_only && self.is_delegated_collab_client() {
                 self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
             }
-            self.tasks.last_edit = Some(std::time::Instant::now());
             self.status = format!("已取消隐藏 {n} 列");
         }
     }
@@ -23022,6 +23082,28 @@ fn clear_selection(&mut self) {
             self.about_open = true;
         }
     }
+    /// Submit a workbook defined-name edit (Define / Update / Remove / ReplaceAll),
+    /// executing locally when solo or via host-sequenced `RoomTx` when collaborating.
+    pub(crate) fn submit_defined_name_intent(
+        &mut self,
+        intent: sheetcore::tx::DefinedNameIntent,
+        label: &str,
+        focus: (usize, u32, u32),
+    ) -> Result<bool, sheetcore::tx::TxError> {
+        if self.net.is_some() {
+            return self.request_room_defined_names(intent);
+        }
+        match self.execute_local_tx(
+            sheetcore::tx::TxIntent::from_defined_names(intent),
+            Some(label.to_string()),
+            focus,
+        ) {
+            Ok(_) => Ok(true),
+            Err(sheetcore::tx::TxError::NoOp) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     /// 名称管理器：列出/新建/修改/删除定义名称
     fn name_manager_window(&mut self, ctx: &egui::Context) {
         if !self.name_mgr {
@@ -23101,16 +23183,11 @@ fn clear_selection(&mut self) {
             }
         }
         if let Some(i) = del {
-            let intent = sheetcore::tx::TxIntent::from_defined_names(
-                sheetcore::tx::DefinedNameIntent::Remove { index: i },
-            );
+            let intent = sheetcore::tx::DefinedNameIntent::Remove { index: i };
             if self
-                .execute_local_tx(
-                    intent,
-                    Some("删除名称".into()),
-                    (self.sheet_idx, self.sel.0, self.sel.1),
-                )
-                .is_ok()
+                .submit_defined_name_intent(intent, "删除名称", (self.sheet_idx, self.sel.0, self.sel.1))
+                .is_ok_and(|changed| changed)
+                && self.net.is_none()
             {
                 self.status = "已删除名称".into();
             }
@@ -23128,7 +23205,7 @@ fn clear_selection(&mut self) {
                     None
                 };
                 let edit_idx = self.name_edit_idx.filter(|&i| i < self.wb.names.len());
-                let intent = sheetcore::tx::TxIntent::from_defined_names(match edit_idx {
+                let intent = match edit_idx {
                     Some(index) => sheetcore::tx::DefinedNameIntent::Update {
                         index,
                         name,
@@ -23140,18 +23217,24 @@ fn clear_selection(&mut self) {
                         scope,
                         formula: refers,
                     },
-                });
-                match self.execute_local_tx(
+                };
+                match self.submit_defined_name_intent(
                     intent,
-                    Some("编辑名称".into()),
+                    "编辑名称",
                     (self.sheet_idx, self.sel.0, self.sel.1),
                 ) {
-                    Ok(_) | Err(sheetcore::tx::TxError::NoOp) => {
-                        self.name_edit_idx = None;
-                        self.name_err.clear();
-                        self.name_new.clear();
-                        self.name_refers.clear();
-                        self.status = "名称已保存".into();
+                    Ok(changed) => {
+                        if changed || self.net.is_none() {
+                            self.name_edit_idx = None;
+                            self.name_err.clear();
+                            self.name_new.clear();
+                            self.name_refers.clear();
+                            if self.net.is_none() {
+                                self.status = "名称已保存".into();
+                            }
+                        } else {
+                            self.name_err = self.status.clone();
+                        }
                     }
                     Err(sheetcore::tx::TxError::DuplicateDefinedName) => {
                         self.name_err = "名称已存在".into();
@@ -24212,7 +24295,7 @@ fn clear_selection(&mut self) {
         let removed = removed_cells.len();
         if removed > 0 {
             self.broadcast_comment_diffs(si, &note_diffs, &thread_diffs);
-            self.undo.push_meta(
+            self.commit_meta_tx(
                 label,
                 (si, self.sel.0, self.sel.1),
                 sheetcore::undo::MetaEdit {
@@ -24221,10 +24304,10 @@ fn clear_selection(&mut self) {
                     threads: thread_diffs,
                     ..Default::default()
                 },
+                sheetcore::tx::RecalcScope::None,
+                false,
+                Vec::new(),
             );
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             self.status = if removed == 1 {
                 format!("已{label}")
             } else {
@@ -25394,24 +25477,27 @@ fn clear_selection(&mut self) {
         sh.textboxes_dirty = true;
         let idx = sh.textboxes.len() - 1;
         let after = sh.textboxes.clone();
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.undo.push(sheetcore::undo::Action {
-            label: format!("插入{}", kind.label()),
-            merges: None,
-            deltas: Vec::new(),
-            focus: (self.sheet_idx, self.sel.0, self.sel.1),
-            snap_before: None,
-            snap_after: None,
-            by_site: 0,
-            pictures: None,
-            shapes: Some(sheetcore::undo::ShapeEdit {
-                sheet: self.sheet_idx,
-                before,
-                after,
-            }),
-            refresh_sizes: None,
-        });
+        self.commit_cell_action_tx(
+            sheetcore::undo::Action {
+                label: format!("插入{}", kind.label()),
+                merges: None,
+                deltas: Vec::new(),
+                focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                pictures: None,
+                shapes: Some(sheetcore::undo::ShapeEdit {
+                    sheet: self.sheet_idx,
+                    before,
+                    after,
+                }),
+                refresh_sizes: None,
+            },
+            false,
+            sheetcore::tx::RecalcScope::None,
+            false,
+        );
         self.tb_sel = Some(idx);
         self.status = format!("已插入{}：可在对话框中编辑文字与样式", kind.label());
     }
@@ -25441,24 +25527,27 @@ fn clear_selection(&mut self) {
             return;
         }
         let after = self.wb.sheet(self.sheet_idx).textboxes.clone();
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.undo.push(sheetcore::undo::Action {
-            label: "修改文本框".into(),
-            merges: None,
-            deltas: Vec::new(),
-            focus: (self.sheet_idx, self.sel.0, self.sel.1),
-            snap_before: None,
-            snap_after: None,
-            by_site: 0,
-            pictures: None,
-            shapes: Some(sheetcore::undo::ShapeEdit {
-                sheet: self.sheet_idx,
-                before,
-                after,
-            }),
-            refresh_sizes: None,
-        });
+        self.commit_cell_action_tx(
+            sheetcore::undo::Action {
+                label: "修改文本框".into(),
+                merges: None,
+                deltas: Vec::new(),
+                focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                pictures: None,
+                shapes: Some(sheetcore::undo::ShapeEdit {
+                    sheet: self.sheet_idx,
+                    before,
+                    after,
+                }),
+                refresh_sizes: None,
+            },
+            false,
+            sheetcore::tx::RecalcScope::None,
+            false,
+        );
         self.status = "文本框已更新".into();
     }
 
@@ -25590,24 +25679,27 @@ fn clear_selection(&mut self) {
         let after = self.wb.sheet(self.sheet_idx).textboxes.clone();
         if after != d.before {
             let label = if d.mode == 0 { "移动文本框" } else { "调整文本框大小" };
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.undo.push(sheetcore::undo::Action {
-                label: label.into(),
-                merges: None,
-                deltas: Vec::new(),
-                focus: (self.sheet_idx, self.sel.0, self.sel.1),
-                snap_before: None,
-                snap_after: None,
-                by_site: 0,
-                pictures: None,
-                shapes: Some(sheetcore::undo::ShapeEdit {
-                sheet: self.sheet_idx,
-                    before: d.before,
-                    after,
-                }),
-                refresh_sizes: None,
-            });
+            self.commit_cell_action_tx(
+                sheetcore::undo::Action {
+                    label: label.into(),
+                    merges: None,
+                    deltas: Vec::new(),
+                    focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                    snap_before: None,
+                    snap_after: None,
+                    by_site: 0,
+                    pictures: None,
+                    shapes: Some(sheetcore::undo::ShapeEdit {
+                        sheet: self.sheet_idx,
+                        before: d.before,
+                        after,
+                    }),
+                    refresh_sizes: None,
+                },
+                false,
+                sheetcore::tx::RecalcScope::None,
+                false,
+            );
             self.status = format!("{label}（保存后写回 Excel）");
         }
         if self.tb_insert {
@@ -25631,24 +25723,27 @@ fn clear_selection(&mut self) {
             sh.textboxes_dirty = true;
         }
         let after = self.wb.sheet(self.sheet_idx).textboxes.clone();
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.undo.push(sheetcore::undo::Action {
-            label: "删除文本框".into(),
-            merges: None,
-            deltas: Vec::new(),
-            focus: (self.sheet_idx, self.sel.0, self.sel.1),
-            snap_before: None,
-            snap_after: None,
-            by_site: 0,
-            pictures: None,
-            shapes: Some(sheetcore::undo::ShapeEdit {
-                sheet: self.sheet_idx,
-                before,
-                after,
-            }),
-            refresh_sizes: None,
-        });
+        self.commit_cell_action_tx(
+            sheetcore::undo::Action {
+                label: "删除文本框".into(),
+                merges: None,
+                deltas: Vec::new(),
+                focus: (self.sheet_idx, self.sel.0, self.sel.1),
+                snap_before: None,
+                snap_after: None,
+                by_site: 0,
+                pictures: None,
+                shapes: Some(sheetcore::undo::ShapeEdit {
+                    sheet: self.sheet_idx,
+                    before,
+                    after,
+                }),
+                refresh_sizes: None,
+            },
+            false,
+            sheetcore::tx::RecalcScope::None,
+            false,
+        );
         self.tb_sel = None;
         self.status = "已删除文本框".into();
     }
@@ -25928,7 +26023,7 @@ fn clear_selection(&mut self) {
                         );
                         self.mark_sheet_layout_synced(si, synced && layout_ok_before);
                     }
-                    self.undo.push_meta(
+                    self.commit_meta_tx(
                         "调整列宽",
                         (si, self.sel.0, self.sel.1),
                         sheetcore::undo::MetaEdit {
@@ -25936,7 +26031,13 @@ fn clear_selection(&mut self) {
                             col_widths: diffs,
                             ..Default::default()
                         },
+                        sheetcore::tx::RecalcScope::None,
+                        false,
+                        Vec::new(),
                     );
+                } else {
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
                 }
                 self.status = format!("列宽 {:.0} 像素", value);
             } else {
@@ -25977,7 +26078,7 @@ fn clear_selection(&mut self) {
                         );
                         self.mark_sheet_layout_synced(si, synced && layout_ok_before);
                     }
-                    self.undo.push_meta(
+                    self.commit_meta_tx(
                         "调整行高",
                         (si, self.sel.0, self.sel.1),
                         sheetcore::undo::MetaEdit {
@@ -25985,12 +26086,16 @@ fn clear_selection(&mut self) {
                             row_heights: diffs,
                             ..Default::default()
                         },
+                        sheetcore::tx::RecalcScope::None,
+                        false,
+                        Vec::new(),
                     );
+                } else {
+                    self.wb.dirty = true;
+                    self.doc_gen = self.doc_gen.wrapping_add(1);
                 }
                 self.status = format!("行高 {:.0} 像素", value);
             }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             if was_shared_only && self.is_delegated_collab_client() {
                 self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
             }
@@ -27832,7 +27937,7 @@ fn clear_selection(&mut self) {
                                 text = first.text.clone();
                             }
                         }
-                        self.undo.push_meta(
+                        self.commit_meta_tx(
                             "回复批注线程",
                             (target_sheet, r, c),
                             sheetcore::undo::MetaEdit {
@@ -27841,10 +27946,10 @@ fn clear_selection(&mut self) {
                                 threads: vec![((r, c), old_thread, Some(new_tc))],
                                 ..Default::default()
                             },
+                            sheetcore::tx::RecalcScope::None,
+                            false,
+                            Vec::new(),
                         );
-                        self.wb.dirty = true;
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.tasks.last_edit = Some(std::time::Instant::now());
                         self.status = format!("已在 {} 添加线程回复", cell_name(r, c));
                     }
                 }
@@ -27881,7 +27986,7 @@ fn clear_selection(&mut self) {
                         .map(|tc| vec![((r, c), Some(tc), None)])
                         .unwrap_or_default();
                     self.broadcast_comment_diffs(target_sheet, &note_diffs, &thread_diffs);
-                    self.undo.push_meta(
+                    self.commit_meta_tx(
                         "删除批注",
                         (target_sheet, r, c),
                         sheetcore::undo::MetaEdit {
@@ -27890,10 +27995,10 @@ fn clear_selection(&mut self) {
                             threads: thread_diffs,
                             ..Default::default()
                         },
+                        sheetcore::tx::RecalcScope::None,
+                        false,
+                        Vec::new(),
                     );
-                    self.wb.dirty = true;
-                    self.doc_gen = self.doc_gen.wrapping_add(1);
-                    self.tasks.last_edit = Some(std::time::Instant::now());
                     self.status = format!("已删除 {} 的批注", cell_name(r, c));
                 }
             }
@@ -27930,7 +28035,7 @@ fn clear_selection(&mut self) {
                         } else {
                             self.broadcast_note_meta(target_sheet, r, c, None);
                         }
-                        self.undo.push_meta(
+                        self.commit_meta_tx(
                             "删除批注",
                             (target_sheet, r, c),
                             sheetcore::undo::MetaEdit {
@@ -27939,10 +28044,10 @@ fn clear_selection(&mut self) {
                                 threads: old_thread.map(|tc| vec![((r, c), Some(tc), None)]).unwrap_or_default(),
                                 ..Default::default()
                             },
+                            sheetcore::tx::RecalcScope::None,
+                            false,
+                            Vec::new(),
                         );
-                        self.wb.dirty = true;
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.tasks.last_edit = Some(std::time::Instant::now());
                         self.status = format!("已删除 {} 的批注", cell_name(r, c));
                     } else if apply {
                         self.status = "批注内容为空，未新增批注".into();
@@ -27991,7 +28096,7 @@ fn clear_selection(&mut self) {
                         } else {
                             self.broadcast_note_meta(target_sheet, r, c, Some(&new_note));
                         }
-                        self.undo.push_meta(
+                        self.commit_meta_tx(
                             if old_note.is_some() || old_thread.is_some() { "编辑批注" } else { "新建批注" },
                             (target_sheet, r, c),
                             sheetcore::undo::MetaEdit {
@@ -28004,10 +28109,10 @@ fn clear_selection(&mut self) {
                                 },
                                 ..Default::default()
                             },
+                            sheetcore::tx::RecalcScope::None,
+                            false,
+                            Vec::new(),
                         );
-                        self.wb.dirty = true;
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.tasks.last_edit = Some(std::time::Instant::now());
                         self.status = format!("已保存 {} 的批注", cell_name(r, c));
                     }
                 }
@@ -30432,7 +30537,7 @@ impl SheetApp {
         let after_filter = self.wb.sheet(si).filter.clone();
         let after_hidden = self.wb.sheet(si).hidden_rows.clone();
         if before_filter != after_filter || before_hidden != after_hidden {
-            self.undo.push_meta(
+            self.commit_meta_tx(
                 "清除筛选条件",
                 (si, self.sel.0, self.sel.1),
                 sheetcore::undo::MetaEdit {
@@ -30440,11 +30545,15 @@ impl SheetApp {
                     filter: Some((before_filter, after_filter, before_hidden, after_hidden)),
                     ..Default::default()
                 },
+                sheetcore::tx::RecalcScope::None,
+                false,
+                Vec::new(),
             );
+        } else {
+            self.wb.dirty = true;
+            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.tasks.last_edit = Some(std::time::Instant::now());
         }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.tasks.last_edit = Some(std::time::Instant::now());
         self.status = "已清除筛选条件（筛选箭头保留）".into();
         true
     }
@@ -30460,7 +30569,7 @@ impl SheetApp {
         let after_filter = self.wb.sheet(si).filter.clone();
         let after_hidden = self.wb.sheet(si).hidden_rows.clone();
         if before_filter != after_filter || before_hidden != after_hidden {
-            self.undo.push_meta(
+            self.commit_meta_tx(
                 label,
                 (si, self.sel.0, self.sel.1),
                 sheetcore::undo::MetaEdit {
@@ -30468,6 +30577,9 @@ impl SheetApp {
                     filter: Some((before_filter, after_filter, before_hidden, after_hidden)),
                     ..Default::default()
                 },
+                sheetcore::tx::RecalcScope::None,
+                false,
+                Vec::new(),
             );
         }
     }
@@ -32404,6 +32516,15 @@ impl SheetApp {
         let Some(intent) = sheetcore::tx::TxIntent::from_axis_move(idx, axis, from, n, drop) else {
             return false;
         };
+        if self.net.is_some() {
+            match self.request_room_axis_permute(idx, axis, from, n, drop) {
+                Ok(submitted) => return submitted,
+                Err(reason) => {
+                    self.status = reason;
+                    return false;
+                }
+            }
+        }
         let label = if is_rows { "移动行" } else { "移动列" };
         let pending_pivots_before = self.wb.pivots_pending.len();
         let (_entry_id, effects) = match self.execute_local_tx(
@@ -35234,7 +35355,7 @@ impl SheetApp {
         let after_rows = self.wb.sheet(si).row_levels.clone();
         let after_cols = self.wb.sheet(si).col_levels.clone();
         if before_rows != after_rows || before_cols != after_cols {
-            self.undo.push_meta(
+            self.commit_meta_tx(
                 label,
                 (si, self.sel.0, self.sel.1),
                 sheetcore::undo::MetaEdit {
@@ -35242,6 +35363,9 @@ impl SheetApp {
                     outline: Some((before_rows, after_rows, before_cols, after_cols)),
                     ..Default::default()
                 },
+                sheetcore::tx::RecalcScope::None,
+                false,
+                Vec::new(),
             );
         }
     }
@@ -41109,7 +41233,7 @@ impl SheetApp {
                             );
                             self.mark_sheet_layout_synced(si, synced);
                         }
-                        self.undo.push_meta(
+                        self.commit_meta_tx(
                             "调整列宽",
                             (si, self.sel.0, drag.anchor),
                             sheetcore::undo::MetaEdit {
@@ -41117,8 +41241,10 @@ impl SheetApp {
                                 col_widths: diffs,
                                 ..Default::default()
                             },
+                            sheetcore::tx::RecalcScope::None,
+                            false,
+                            Vec::new(),
                         );
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
                         if was_shared_only && self.is_delegated_collab_client() {
                             self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
                         }
@@ -41178,7 +41304,7 @@ impl SheetApp {
                             );
                             self.mark_sheet_layout_synced(si, synced);
                         }
-                        self.undo.push_meta(
+                        self.commit_meta_tx(
                             "调整行高",
                             (si, drag.anchor, self.sel.1),
                             sheetcore::undo::MetaEdit {
@@ -41186,8 +41312,10 @@ impl SheetApp {
                                 row_heights: diffs,
                                 ..Default::default()
                             },
+                            sheetcore::tx::RecalcScope::None,
+                            false,
+                            Vec::new(),
                         );
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
                         if was_shared_only && self.is_delegated_collab_client() {
                             self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
                         }
@@ -47460,11 +47588,36 @@ fn elide(s: &str, max_chars: usize) -> String {
                         }
                     }
                 }
+                net::NetEvent::CheckRoomTx { site, phase, patch, reply } => {
+                    let _ = reply.send(self.validate_room_tx_request(site, phase, patch));
+                }
+                net::NetEvent::RoomTxCommitted { site, id, phase, patch, snapshot, seq } => {
+                    if snapshot {
+                        self.shift_intro.room_tx_receipt = Some((id, phase, patch));
+                    } else {
+                        let pre_clock = self.peer.as_ref().map(|p| p.clock).unwrap_or(0);
+                        let old_seq = self.shift_intro.applied_seq;
+                        let needs_ack = matches!(
+                            *patch,
+                            sheetcore::tx::RoomTxPatch::AxisPermute(_)
+                                | sheetcore::tx::RoomTxPatch::CellShift(_)
+                        );
+                        if self.commit_room_tx(site, id, phase, patch, seq, old_seq, pre_clock)
+                            && needs_ack
+                        {
+                            if let Some(net) = &self.net {
+                                net.ack_room_tx(seq);
+                            }
+                        }
+                    }
+                }
                 net::NetEvent::Sort(plan, reply) => {
                     if !reply.pending() { continue; }
-                    if let (Some(net),Some(sheet)) = (&self.net,self.wb.sheets.get(plan.sheet)) {
-                        let target = crate::net_sort::SortTarget { document: self.doc_uid, sheet: plan.sheet,
-                            identity: sheet.identity, coordinates: sheet.coordinate_revision() };
+                    if let (Some(net), Some(target)) = (
+                        &self.net,
+                        crate::net_sort::SortTarget::capture(self.doc_uid, &self.wb, plan.sheet),
+                    ) {
+                        let sheet = self.wb.sheet(plan.sheet);
                         net.check_sort(target, plan, sheet.search_snapshot(), self.wb.styles.clone(), reply);
                     } else { let _ = reply.send(false); }
                 }
@@ -47902,8 +48055,11 @@ fn elide(s: &str, max_chars: usize) -> String {
                             peer.apply_all_to_workbook(&mut self.wb);
                         }
                     }
+                    let mut overlay_changed_names = false;
                     if let Some((seq, overlay)) = self.shift_intro.overlay.take() {
+                        let names_before = self.wb.names.clone();
                         if overlay.apply_to(&mut self.wb) {
+                            overlay_changed_names = self.wb.names != names_before;
                             self.shift_intro.applied_seq = seq;
                             if let Some(net) = &self.net {
                                 net.set_shift_seq(seq);
@@ -47925,8 +48081,16 @@ fn elide(s: &str, max_chars: usize) -> String {
                             if let Some(peer) = self.peer.as_ref() {
                                 peer.apply_list_to_workbook(&mut self.wb, &delta_keys);
                             }
-                            self.fast_recalc_cells(&delta_keys);
+                            if overlay_changed_names {
+                                self.wb.calc_manual |= self.manual_calc;
+                                self.recalc_all_and_deps_adaptive();
+                            } else {
+                                self.fast_recalc_cells(&delta_keys);
+                            }
                             self.wb.dirty = true;
+                        } else if overlay_changed_names {
+                            self.wb.calc_manual |= self.manual_calc;
+                            self.recalc_all_and_deps_adaptive();
                         } else {
                             self.ensure_deps_ready_or_bg();
                         }
@@ -47955,7 +48119,20 @@ fn elide(s: &str, max_chars: usize) -> String {
                         }
                     }
                     if let Some((id, phase, patch)) = self.shift_intro.receipt.take() {
+                        if let Some(net) = &self.net {
+                            net.finish_structure();
+                        }
                         self.finish_room_shift_history(id, phase, patch);
+                    }
+                    if let Some((id, phase, patch)) = self.shift_intro.room_tx_receipt.take() {
+                        if let Some(net) = &self.net {
+                            net.finish_structure();
+                        }
+                        self.finish_room_tx_history(
+                            id,
+                            phase,
+                            std::sync::Arc::new(patch.to_tx_patch()),
+                        );
                     }
                     let stale_discarded = self.discard_stale_rejoin_outboxes();
                     if stale_discarded > 0 {

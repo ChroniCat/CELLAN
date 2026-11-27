@@ -1219,3 +1219,474 @@ fn phase3_tx_room_cell_shift_tx_patch_wire_compat_undo_redo_and_conflict_guard()
     assert_eq!(guest.wb.sheet(0).value(2, 0), Value::Number(99.0));
 }
 
+#[test]
+fn phase5_tx_room_defined_names_add_edit_delete_undo_and_late_join() {
+    use sheetcore::{tx::DefinedNameIntent, Cell, Value};
+    let env = crate::test_env::TestEnv::new("p5-tx-room-names");
+    let (mut host, mut guest) = sort_apps(&env);
+
+    host.wb.sheet_mut(0).set(
+        0,
+        3,
+        Cell {
+            value: Value::Empty,
+            formula: Some("=TaxRate*100".into()),
+        },
+    );
+    host.recalc_and_broadcast(&[(0, 0, 3)]);
+    until(&mut host, &mut guest, |_, g| {
+        g.wb.sheet(0)
+            .get(0, 3)
+            .is_some_and(|c| c.formula.as_deref() == Some("=TaxRate*100"))
+    });
+
+    // 1) Guest adds DefinedName via RoomTx -> both converge & recalc formula to 20.
+    assert!(
+        guest
+            .submit_defined_name_intent(
+                DefinedNameIntent::Define {
+                    name: "TaxRate".into(),
+                    scope: None,
+                    formula: "0.2".into(),
+                },
+                "定义名称 TaxRate",
+                (0, 0, 0),
+            )
+            .unwrap()
+    );
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.names.iter().any(|(n, _, f)| n == "TaxRate" && f == "0.2")
+            && g.wb.names.iter().any(|(n, _, f)| n == "TaxRate" && f == "0.2")
+            && h.wb.sheet(0).value(0, 3) == Value::Number(20.0)
+            && g.wb.sheet(0).value(0, 3) == Value::Number(20.0)
+            && !g.net.as_ref().unwrap().pending_structure()
+    });
+    assert_eq!(guest.undo.depth(), (1, 0));
+
+    // 2) Host updates DefinedName to 0.5 -> both converge & recalc to 50.
+    let idx = host
+        .wb
+        .names
+        .iter()
+        .position(|(n, _, _)| n == "TaxRate")
+        .unwrap();
+    assert!(
+        host.submit_defined_name_intent(
+            DefinedNameIntent::Update {
+                index: idx,
+                name: "TaxRate".into(),
+                scope: None,
+                formula: "0.5".into(),
+            },
+            "编辑名称",
+            (0, 0, 0),
+        )
+        .unwrap()
+    );
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.names.iter().any(|(n, _, f)| n == "TaxRate" && f == "0.5")
+            && g.wb.names.iter().any(|(n, _, f)| n == "TaxRate" && f == "0.5")
+            && h.wb.sheet(0).value(0, 3) == Value::Number(50.0)
+            && g.wb.sheet(0).value(0, 3) == Value::Number(50.0)
+            && !h.net.as_ref().unwrap().pending_structure()
+    });
+
+    // 3) Late joiner receives updated DefinedNames via CellShiftOverlay and evaluates formula to 50.
+    let mut late = late_join(&env, &guest, |_| {});
+    until(&mut host, &mut late, |_, l| {
+        l.joined_doc
+            && !l.in_snapshot
+            && l.wb.names.iter().any(|(n, _, f)| n == "TaxRate" && f == "0.5")
+            && l.wb.sheet(0).value(0, 3) == Value::Number(50.0)
+    });
+
+    // 4) Host Undo -> reverts to 0.2 (20.0) on all peers; Redo -> back to 0.5 (50.0).
+    assert!(host.apply_undo(false), "{}", host.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).value(0, 3) == Value::Number(20.0)
+            && g.wb.sheet(0).value(0, 3) == Value::Number(20.0)
+    });
+    until(&mut host, &mut late, |_, l| {
+        l.wb.sheet(0).value(0, 3) == Value::Number(20.0)
+    });
+
+    assert!(host.apply_undo(true), "{}", host.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).value(0, 3) == Value::Number(50.0)
+            && g.wb.sheet(0).value(0, 3) == Value::Number(50.0)
+    });
+
+    // 5) Guest deletes DefinedName -> converges across host and guest.
+    let del_idx = guest
+        .wb
+        .names
+        .iter()
+        .position(|(n, _, _)| n == "TaxRate")
+        .unwrap();
+    assert!(
+        guest
+            .submit_defined_name_intent(
+                DefinedNameIntent::Remove { index: del_idx },
+                "删除名称",
+                (0, 0, 0),
+            )
+            .unwrap()
+    );
+    until(&mut host, &mut guest, |h, g| {
+        !h.wb.names.iter().any(|(n, _, _)| n == "TaxRate")
+            && !g.wb.names.iter().any(|(n, _, _)| n == "TaxRate")
+    });
+}
+
+#[test]
+fn phase5_tx_room_axis_permute_converges_and_fences_locks_and_rejoin_outbox() {
+    use sheetcore::{
+        charts::{Chart, ChartKind, Series},
+        sparkline::Sparkline,
+        Cell, Value,
+    };
+    let env = crate::test_env::TestEnv::new("p5-tx-room-axis-permute");
+    let baseline = |wb: &mut sheetcore::Workbook| {
+        let sh = wb.sheet_mut(0);
+        sh.charts.push(Chart {
+            kind: ChartKind::Column,
+            title: "MoveChart".into(),
+            anchor: (0, 5, 8, 10),
+            source_range: "Sheet1!$A$1:$A$2".into(),
+            series: vec![Series {
+                name: "S1".into(),
+                val_ref: "Sheet1!$A$1:$A$2".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        sh.sparklines.push(Sparkline {
+            r: 0,
+            c: 3,
+            rect: (0, 0, 0, 1),
+            ..Default::default()
+        });
+    };
+    let (mut host, mut guest) = sort_apps_with_baseline(&env, baseline);
+    // sort_apps_with_baseline seeds A1=2 (bold), A2=1; add A3=3 and B4='=A1*10+A2' (=21).
+    host.wb.sheet_mut(0).set(2, 0, Cell { value: Value::Number(3.0), formula: None });
+    host.wb.sheet_mut(0).set(
+        3,
+        1,
+        Cell {
+            value: Value::Empty,
+            formula: Some("=A1*10+A2".into()),
+        },
+    );
+    host.recalc_and_broadcast(&[(0, 2, 0), (0, 3, 1)]);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).value(3, 1) == Value::Number(21.0)
+            && g.wb.sheet(0).value(2, 0) == Value::Number(3.0)
+            && g.wb.sheet(0).value(3, 1) == Value::Number(21.0)
+    });
+
+    // 1) Host holds an active cell lock on row 0 -> guest AxisPermute across row 0 must be rejected!
+    host.sel = (0, 0);
+    host.sel_end = (0, 0);
+    host.edit_sheet = Some(0);
+    host.edit_sel = Some((0, 0));
+    host.pending_edit = Some("2".into());
+    host.net.as_ref().unwrap().request_lock(0, 0, 0, "H");
+    until(&mut host, &mut guest, |h, g| {
+        h.my_lock == Some((0, 0, 0)) && g.locks.is_locked_by_other(0, 0, 0, 2)
+    });
+    assert!(!guest.move_axis_headers(true, 0, 1, 3));
+    assert!(
+        guest.status.contains("正在编辑"),
+        "expected lock conflict rejection, got: {}",
+        guest.status
+    );
+    host.editing = None;
+    host.pending_edit = None;
+    host.edit_sel = None;
+    host.edit_sheet = None;
+    host.my_lock = None;
+    host.locks.release(0, 0, 0, 1);
+    host.net.as_ref().unwrap().release_lock(0, 0, 0);
+    until(&mut host, &mut guest, |h, g| {
+        !h.locks.is_locked_by_other(0, 0, 0, 2) && !g.locks.is_locked_by_other(0, 0, 0, 2)
+    });
+
+    // Place a remote cursor on row 0 from host so we verify cursor permutation too.
+    host.net.as_ref().unwrap().broadcast_cursor(sheetcore::sync::Cursor {
+        site: 1,
+        name: "H".into(),
+        color: 1,
+        sheet: 0,
+        row: 0,
+        col: 0,
+        end_row: Some(0),
+        end_col: Some(0),
+    });
+    until(&mut host, &mut guest, |_, g| {
+        g.remote.get(&1).is_some_and(|c| c.3 == 0 && c.4 == 0)
+    });
+
+    // 2) Guest executes move_axis_headers (move row 0 before drop=3 -> ends up at row 2!).
+    let host_epoch_before = host.wb.coord_epoch();
+    let guest_epoch_before = guest.wb.coord_epoch();
+    assert!(guest.move_axis_headers(true, 0, 1, 3), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).value(2, 0) == Value::Number(2.0)
+            && g.wb.sheet(0).value(2, 0) == Value::Number(2.0)
+            && !g.net.as_ref().unwrap().pending_structure()
+    });
+    assert!(host.wb.coord_epoch() > host_epoch_before);
+    assert!(guest.wb.coord_epoch() > guest_epoch_before);
+    assert!(guest.shift_intro.applied_seq > 0);
+    assert!(host.shift_intro.applied_seq > 0);
+    // Remote cursor on row 0 moved to row 2 on guest.
+    assert_eq!(guest.remote.get(&1).map(|c| (c.3, c.4)), Some((2, 0)));
+
+    for peer in [&host, &guest] {
+        let sh = peer.wb.sheet(0);
+        assert_eq!(sh.value(0, 0), Value::Number(1.0));
+        assert_eq!(sh.value(1, 0), Value::Number(3.0));
+        assert_eq!(sh.value(2, 0), Value::Number(2.0));
+        // Bold style followed row 0 -> row 2.
+        assert!(peer.wb.styles.get(sh.style_of(2, 0)).bold);
+        assert!(!peer.wb.styles.get(sh.style_of(0, 0)).bold);
+        // Formula =A1*10+A2 rewrote to =A3*10+A1 -> 2*10+1 = 21!
+        assert_eq!(sh.get(3, 1).unwrap().formula.as_deref(), Some("=A3*10+A1"));
+        assert_eq!(sh.value(3, 1), Value::Number(21.0));
+        // Sparkline anchor & rect moved from row 0 to row 2.
+        assert_eq!(sh.sparklines.len(), 1);
+        assert_eq!((sh.sparklines[0].r, sh.sparklines[0].c), (2, 3));
+        assert_eq!(sh.sparklines[0].rect, (2, 0, 2, 1));
+    }
+
+    // 3) Stale rejoin outbox captured at old shift_seq (0) is fenced & discarded cleanly.
+    let stale_coord = crate::cell_shift::OutboxCoord {
+        room_id: guest.net.as_ref().unwrap().connected_room_id(),
+        epoch: crate::net::CoordEpoch {
+            struct_rev: 0,
+            shift_seq: 0,
+        },
+    };
+    guest.rejoin_outbox = Some((
+        guest.doc_uid,
+        vec![sheetcore::sync::Op {
+            site: 2,
+            sheet: 0,
+            row: 0,
+            col: 0,
+            ts: 9999,
+            value: sheetcore::sync::ValueWire::Number(777.0),
+            formula: None,
+        }],
+    ));
+    guest.rejoin_outbox_meta = Some(crate::cell_shift::RejoinOutboxMeta {
+        doc_uid: guest.doc_uid,
+        coord: stale_coord,
+    });
+    assert_eq!(guest.discard_stale_rejoin_outboxes(), 1);
+    assert!(guest.rejoin_outbox.is_none());
+
+    // 4) Late joiner receives full authoritative post-permute state.
+    let mut late = late_join(&env, &guest, baseline);
+    until(&mut host, &mut late, |_, l| {
+        l.joined_doc
+            && !l.in_snapshot
+            && l.wb.sheet(0).value(2, 0) == Value::Number(2.0)
+            && l.wb.sheet(0).value(3, 1) == Value::Number(21.0)
+            && l.wb.sheet(0).sparklines.first().is_some_and(|sp| sp.r == 2)
+    });
+
+    // 5) Guest Undo -> reverts row 2 back to row 0 across host and guest; Redo -> back to row 2.
+    assert!(guest.apply_undo(false), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).value(0, 0) == Value::Number(2.0)
+            && g.wb.sheet(0).value(0, 0) == Value::Number(2.0)
+            && h.wb.sheet(0).sparklines.first().is_some_and(|sp| sp.r == 0)
+            && g.wb.sheet(0).sparklines.first().is_some_and(|sp| sp.r == 0)
+    });
+    assert!(guest.apply_undo(true), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).value(2, 0) == Value::Number(2.0)
+            && g.wb.sheet(0).value(2, 0) == Value::Number(2.0)
+            && h.wb.sheet(0).sparklines.first().is_some_and(|sp| sp.r == 2)
+            && g.wb.sheet(0).sparklines.first().is_some_and(|sp| sp.r == 2)
+    });
+}
+
+#[test]
+fn phase5_tx_room_cell_shift_updates_chart_and_sparkline_and_rejects_straddling_sparkline() {
+    use sheetcore::{
+        charts::{Chart, ChartKind, Series},
+        sparkline::Sparkline,
+        Cell, Value,
+    };
+    let env = crate::test_env::TestEnv::new("p5-tx-room-shift-chart-spark");
+    let baseline = |wb: &mut sheetcore::Workbook| {
+        let sh = wb.sheet_mut(0);
+        // Chart referencing column A rows 2..4 (0-based 1..=3)
+        sh.charts.push(Chart {
+            kind: ChartKind::Line,
+            title: "Trend".into(),
+            anchor: (0, 4, 8, 10),
+            source_range: "Sheet1!$A$2:$A$4".into(),
+            series: vec![Series {
+                name: "Values".into(),
+                val_ref: "Sheet1!$A$2:$A$4".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        // Wholly-in-band vertical sparkline in column A (anchor at A6, data A2:A4)
+        sh.sparklines.push(Sparkline {
+            r: 5,
+            c: 0,
+            rect: (1, 0, 3, 0),
+            ..Default::default()
+        });
+    };
+    let (mut host, mut guest) = sort_apps_with_baseline(&env, baseline);
+    host.wb.sheet_mut(0).set(2, 0, Cell { value: Value::Number(30.0), formula: None });
+    host.wb.sheet_mut(0).set(3, 0, Cell { value: Value::Number(40.0), formula: None });
+    host.recalc_and_broadcast(&[(0, 2, 0), (0, 3, 0)]);
+    until(&mut host, &mut guest, |_, g| {
+        g.wb.sheet(0).value(2, 0) == Value::Number(30.0)
+            && g.wb.sheet(0).value(3, 0) == Value::Number(40.0)
+    });
+
+    // 1) Guest inserts a cell at A2 (shift down in column A): Chart val_ref -> $A$3:$A$5, Sparkline -> anchor (6,0), rect (2,0,4,0).
+    guest.sel = (1, 0);
+    guest.sel_end = (1, 0);
+    guest.shift_cells(true, false);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).charts[0].series[0].val_ref == "Sheet1!$A$3:$A$5"
+            && g.wb.sheet(0).charts[0].series[0].val_ref == "Sheet1!$A$3:$A$5"
+            && h.wb.sheet(0).sparklines[0].r == 6
+            && g.wb.sheet(0).sparklines[0].r == 6
+            && h.wb.sheet(0).sparklines[0].rect == (2, 0, 4, 0)
+            && g.wb.sheet(0).sparklines[0].rect == (2, 0, 4, 0)
+            && !g.net.as_ref().unwrap().pending_structure()
+    });
+
+    // Late joiner sees updated chart ref and shifted sparkline via CellShiftOverlay.
+    let mut late = late_join(&env, &guest, baseline);
+    until(&mut host, &mut late, |_, l| {
+        l.joined_doc
+            && !l.in_snapshot
+            && l.wb.sheet(0).charts[0].series[0].val_ref == "Sheet1!$A$3:$A$5"
+            && l.wb.sheet(0).sparklines[0].r == 6
+            && l.wb.sheet(0).sparklines[0].rect == (2, 0, 4, 0)
+    });
+
+    // 2) Undo & Redo restore chart series ref and sparkline identically across host & guest.
+    assert!(guest.apply_undo(false), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).charts[0].series[0].val_ref == "Sheet1!$A$2:$A$4"
+            && g.wb.sheet(0).charts[0].series[0].val_ref == "Sheet1!$A$2:$A$4"
+            && h.wb.sheet(0).sparklines[0].r == 5
+            && g.wb.sheet(0).sparklines[0].r == 5
+            && h.wb.sheet(0).sparklines[0].rect == (1, 0, 3, 0)
+            && g.wb.sheet(0).sparklines[0].rect == (1, 0, 3, 0)
+    });
+    assert!(guest.apply_undo(true), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).charts[0].series[0].val_ref == "Sheet1!$A$3:$A$5"
+            && g.wb.sheet(0).charts[0].series[0].val_ref == "Sheet1!$A$3:$A$5"
+            && h.wb.sheet(0).sparklines[0].r == 6
+            && g.wb.sheet(0).sparklines[0].r == 6
+    });
+
+    // 3) Band-straddling horizontal sparkline (A10:C10) with vertical shift in column A only -> rejected cleanly!
+    host.wb.sheet_mut(0).sparklines.push(Sparkline {
+        r: 9,
+        c: 4,
+        rect: (9, 0, 9, 2),
+        ..Default::default()
+    });
+    let epoch_before = host.wb.coord_epoch();
+    host.sel = (8, 0);
+    host.sel_end = (8, 0);
+    host.shift_cells(true, false);
+    assert!(
+        host.status.contains("迷你图"),
+        "straddling sparkline must reject with Chinese status: {}",
+        host.status
+    );
+    assert_eq!(host.wb.coord_epoch(), epoch_before);
+}
+
+#[test]
+fn phase5_tx_room_tx_reconnect_receipt_clears_pending_structure() {
+    use sheetcore::sync::CellShiftPhase;
+    use sheetcore::tx::{DefinedNameIntent, DefinedNamesPatch, RoomTxPatch};
+    use std::sync::Arc;
+
+    let env = crate::test_env::TestEnv::new("phase5-room-tx-receipt");
+    let (mut host, mut guest) = sort_apps(&env);
+
+    // Commit a guest-authored DefinedNames RoomTx with a known transaction id so host's
+    // journal records it as guest's latest receipt.
+    let intent = DefinedNameIntent::Define {
+        name: "ReceiptRate".into(),
+        scope: None,
+        formula: "0.25".into(),
+    };
+    let patch = Arc::new(RoomTxPatch::DefinedNames(
+        DefinedNamesPatch::prepare(&guest.wb, &intent).expect("prepare DefinedNamesPatch"),
+    ));
+    let tx_id = 0x5152_5354u64;
+    guest
+        .net
+        .as_ref()
+        .unwrap()
+        .request_room_tx(tx_id, CellShiftPhase::Forward, patch.clone())
+        .expect("send RoomTxRequest");
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.names.iter().any(|(n, _, _)| n == "ReceiptRate")
+            && g.wb.names.iter().any(|(n, _, _)| n == "ReceiptRate")
+            && !g.net.as_ref().unwrap().pending_structure()
+    });
+
+    // Simulate guest having missed the live RoomTxCommitted before reconnecting:
+    // clear undo history, re-arm room_tx_pending + pending_structure for tx_id, and
+    // trigger a real snapshot resync so host delivers Msg::RoomTxReceipt.
+    guest.undo.clear();
+    guest
+        .net
+        .as_ref()
+        .unwrap()
+        .arm_room_tx_pending_for_test(tx_id, CellShiftPhase::Forward, patch);
+    assert!(guest.net.as_ref().unwrap().pending_structure());
+    guest.net.as_ref().unwrap().request_snapshot_resync();
+    until(&mut host, &mut guest, |_, g| g.room_lost);
+    until(&mut host, &mut guest, |_, g| {
+        g.joined_doc
+            && !g.in_snapshot
+            && !g.room_lost
+            && g.undo.depth() == (1, 0)
+            && !g.net.as_ref().unwrap().pending_structure()
+    });
+
+    // Subsequent RoomTx from guest must NOT be stuck behind pending_structure.
+    assert!(
+        guest
+            .submit_defined_name_intent(
+                DefinedNameIntent::Define {
+                    name: "AfterReceipt".into(),
+                    scope: None,
+                    formula: "0.5".into(),
+                },
+                "定义名称 AfterReceipt",
+                (0, 0, 0),
+            )
+            .unwrap()
+    );
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.names.iter().any(|(n, _, _)| n == "AfterReceipt")
+            && g.wb.names.iter().any(|(n, _, _)| n == "AfterReceipt")
+            && !g.net.as_ref().unwrap().pending_structure()
+    });
+}
+
+
+

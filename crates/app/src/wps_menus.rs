@@ -1573,21 +1573,21 @@ impl SheetApp {
                 }
             }
             self.record_revision_sample("向上填充", &sample, changed.max(1));
-            self.undo.push_cow_batch(
+            self.wb.calc_manual |= self.manual_calc;
+            let recalc = if has_formula || !self.deps.is_empty() {
+                sheetcore::tx::RecalcScope::Full
+            } else {
+                sheetcore::tx::RecalcScope::None
+            };
+            self.commit_cow_batch_tx(
                 "向上填充",
                 si,
                 &before_sheet,
-                self.wb.sheet(si),
                 (si, self.sel.0, self.sel.1),
+                recalc,
+                false,
             );
-            self.wb.calc_manual |= self.manual_calc;
-            if has_formula || !self.deps.is_empty() {
-                self.recalc_all_and_deps_adaptive();
-            }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             self.set_repeat_action(crate::RepeatAction::FillUp);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             std::thread::spawn(move || drop(before_sheet));
             self.status = format!("已用底行向上填充 {}-{} 行", r1 + 1, r2 + 1);
             return;
@@ -1732,21 +1732,21 @@ impl SheetApp {
                 }
             }
             self.record_revision_sample("向左填充", &sample, changed.max(1));
-            self.undo.push_cow_batch(
+            self.wb.calc_manual |= self.manual_calc;
+            let recalc = if has_formula || !self.deps.is_empty() {
+                sheetcore::tx::RecalcScope::Full
+            } else {
+                sheetcore::tx::RecalcScope::None
+            };
+            self.commit_cow_batch_tx(
                 "向左填充",
                 si,
                 &before_sheet,
-                self.wb.sheet(si),
                 (si, self.sel.0, self.sel.1),
+                recalc,
+                false,
             );
-            self.wb.calc_manual |= self.manual_calc;
-            if has_formula || !self.deps.is_empty() {
-                self.recalc_all_and_deps_adaptive();
-            }
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             self.set_repeat_action(crate::RepeatAction::FillLeft);
-            self.tasks.last_edit = Some(std::time::Instant::now());
             std::thread::spawn(move || drop(before_sheet));
             self.status = format!("已用最右列向左填充至 {} 列", col_label(c1));
             return;
@@ -2126,23 +2126,26 @@ impl SheetApp {
             }
             if written > 0 {
                 self.record_revision_sample("序列填充", &sample, written);
-                self.undo.push_cow_batch(
+                self.wb.calc_manual |= self.manual_calc;
+                let recalc = if !self.deps.is_empty() {
+                    sheetcore::tx::RecalcScope::Full
+                } else {
+                    sheetcore::tx::RecalcScope::None
+                };
+                self.commit_cow_batch_tx(
                     "序列填充",
                     si,
                     &before_sheet,
-                    self.wb.sheet(si),
                     (si, self.sel.0, self.sel.1),
+                    recalc,
+                    false,
                 );
-                self.wb.calc_manual |= self.manual_calc;
-                if !self.deps.is_empty() {
-                    self.recalc_all_and_deps_adaptive();
-                }
-                self.tasks.last_edit = Some(std::time::Instant::now());
+            } else {
+                self.wb.dirty = true;
+                self.doc_gen = self.doc_gen.wrapping_add(1);
             }
             std::thread::spawn(move || drop(before_sheet));
             self.sel_end = (r2, c2);
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
             self.status = format!("已完成序列填充（{written} 格）");
             return;
         }
@@ -3401,7 +3404,7 @@ impl SheetApp {
             self.wb.sheet_mut(si).bump_display_style_revision();
             let after_tables = self.wb.sheet(si).tables.clone();
             if before_tables != after_tables {
-                self.undo.push_meta(
+                self.commit_meta_tx(
                     "套用表格样式",
                     (si, self.sel.0, self.sel.1),
                     sheetcore::undo::MetaEdit {
@@ -3409,6 +3412,9 @@ impl SheetApp {
                         tables: Some((before_tables, after_tables)),
                         ..Default::default()
                     },
+                    sheetcore::tx::RecalcScope::None,
+                    false,
+                    Vec::new(),
                 );
             }
         }
